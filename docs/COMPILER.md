@@ -170,16 +170,21 @@ compiler relies on:
      `#%` constructors) AND in operator position. Special forms
      are reserved: they are recognized regardless of lexical
      bindings.
-  2. **Inlined intrinsic** — `+` and `<` with exactly two
-     operands lower to `math:add` / `cmp:lt` directly when the
-     operator means `nexis.core`'s Var: it is not lexically bound
+  2. **Inlined core fn** — a call of `+`, `-`, `*`, `/`,
+     `quot`, `mod`, `<`, `<=`, `>`, `>=` or `==` with two
+     operands, of `-` or `abs` with one, or of `inc` / `dec`
+     (`+` / `-` with a constant 1) lowers to one `math` or `cmp`
+     instruction (`Tiny.prim`), which runs the numeric-tower
+     helper the fn itself runs (VM.md §10), so results and errors
+     are the fn's. It does so when the operator means
+     `nexis.core`'s Var: it is not lexically bound
      (`LowerEnv`), the namespace resolves it to `nexis.core`'s Var
      rather than one it defines or refers to, and (outside
      `nexis.core`) the file or REPL line being compiled does not
      define it (`DeclaredNames`), so `(do (def + f) (+ 1 2))` calls
      `f`, as Clojure does. Otherwise the call goes through the Var
-     like any other. The qualified `nexis.core/+` and
-     `nexis.core/<` with two operands inline unconditionally: a
+     like any other, as does any other arity. A qualified
+     `nexis.core/+` and the like inline unconditionally: a
      qualified head is never a local, and host macros emit them
      (`MACROEXPAND.md` §5).
   3. **Lexical local** — innermost binding from `let*`, `fn*`,
@@ -281,6 +286,13 @@ compiler relies on:
     hazard: `(let* [x 1, f (g), h (fn [] x)] h)` — if `x`'s cell
     slot were allocated inside the call block for `(g)`, the
     subsequent `closure:make` for `h` would read garbage.
+  - Operands in place: a `math` or `cmp` instruction,
+    `jump:if-false`, `var:store-var` and `ctrl:throw` read a
+    literal (as a constant), a local held directly in its slot,
+    an upvalue or a Var where it is, instead of copying it into a
+    slot first. Evaluation stays left to right: the left operand
+    of a two-operand instruction reads a Var in place only when
+    the right one is a literal or a symbol, which run no code.
   - Literal lifting: nil, booleans and fixnums have dedicated
     `mov:*` loads or inline `Tiny` variants; every other literal
     (symbols, keywords, quoted compound collections) is a
@@ -375,11 +387,12 @@ variants are codegen details.
 
 #### 5.2 `(if test then else?)`
 
-- Lower `test` into a slot.
-- `jump:if-false` to `else-label` if the result slot is
-  `false-or-nil`.
+- Lower `test` into an operand, read in place when it can be
+  (§4.4).
+- `jump:if-false` to `else-label` if the test is `false-or-nil`.
 - Emit `then` code, leaving result in the result slot.
-- `jump:jmp` to `end-label`.
+- `jump:jmp` to `end-label`, unless every path through `then`
+  ends in `recur` or `throw`.
 - `else-label`: emit `else` code (or `mov:load-nil` if
   `else` is absent).
 - `end-label`: continuation.
@@ -463,13 +476,17 @@ code; hand-written bytecode that violates this surfaces
 #### 5.6 `(recur args...)`
 
 **Common skeleton** (both captured and non-captured cases):
-- Lower each `arg` into a fresh temporary slot.
-- Move temporaries into the target's binding slots using
-  **parallel-assignment semantics** (a naive sequential move
-  corrupts arguments when the target slots alias an earlier
-  source — e.g., `(loop* [a b, b a] (recur b a))`). Evaluating
-  every argument into its own temporary before any move is what
-  provides this.
+- The arguments rebind the target's bindings with
+  **parallel-assignment semantics**: every argument sees the
+  bindings as they were before the `recur` (a naive sequential
+  move corrupts `(loop* [a 1 b 2] (recur b a))`).
+- An argument for a non-captured binding that no other argument
+  mentions is computed straight into the binding's slot: nothing
+  evaluated after it can observe the change.
+- Every other argument is read in place when it is a constant,
+  an upvalue or a slot no rebinding overwrites, and is computed
+  into a fresh temporary otherwise; the moves into the binding
+  slots follow once every argument is computed.
 - Emit `jump:jmp` to the target's entry label.
 - **Invariant**: no `call` opcode is emitted. Constant-stack
   guaranteed per PLAN §11.3.
@@ -498,14 +515,10 @@ lexical binding semantics.
 Lowering for a captured loop binding's recur step:
 
 ```
-; compute new value into a temp slot
-math:add        s_new_value, ...
-; allocate a fresh initialized cell holding the new value
-mov:move        s_tmp, s_new_value
-closure:box-local s_tmp                ; s_tmp := fresh cell
-mov:move        s_binding_slot, s_tmp  ; install fresh cell
-                                       ;   into binding slot
-jump:jmp        L_loop
+math:add          s_tmp, ...           ; the new value, in a fresh slot
+closure:box-local s_tmp                ; s_tmp := fresh cell holding it
+mov:move          s_binding_slot, s_tmp  ; install the fresh cell
+jump:jmp          L_loop
 ```
 
 The fresh cell is heap-allocated; this iteration cost is
@@ -513,8 +526,8 @@ The fresh cell is heap-allocated; this iteration cost is
 guarantee applies only to non-captured bindings. See `VM.md §11`
 for the runtime-side phrasing.
 
-`recur` does NOT use the U-store path (`store(u:N, ...)` is
-`:unsupported-write` per `VM.md §6`). The fresh-cell pattern
+`recur` does NOT use the U-store path (a store to `u:N` is
+`UnimplementedOpcode`, `VM.md §6`). The fresh-cell pattern
 above is the only mechanism.
 
 `recur` inside a `fn*` body with no enclosing `loop*` targets
@@ -668,8 +681,9 @@ boxing decision sound.
     kind on existing opcodes — e.g., `mov:move s0, u:0`,
     `math:add s0, u:0, c:1`. `resolve(u:N)` dereferences the
     cell automatically.
-  - **Writes are forbidden** for captured locals. There is no
-    `set!`. The U-store path returns `:unsupported-write`; the
+  - **Writes are forbidden** for captured locals: `set!` applies
+    to dynamic Vars only, and a store to a `u:N` operand is
+    `UnimplementedOpcode`; the
     only mechanism by which a captured loop-binding cell
     "changes" across iterations is the fresh-cell-per-iteration
     pattern documented in §5.6 — which allocates a NEW cell

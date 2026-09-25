@@ -162,6 +162,13 @@ const cases = [_]Case{
     .{ .src = "(do (defn f [] (g)) (defn g [] 42) (f))", .out = "42" },
     .{ .src = "(do (defn f [] 1) (defn f [] 2) (f))", .out = "2" },
     .{ .src = "(do (defn first-of [a & r] a) (first-of 7 99 100))", .out = "7" },
+    // The inlined core ops agree with the fns they stand for.
+    .{ .src = "(let* [a 7 b 2] [(+ a b) (- a b) (* a b) (/ a b) (quot a b) (mod a b) (- a) (abs (- a)) (inc a) (dec a)])", .out = "[9 5 14 3.5 3 1 -7 7 8 6]" },
+    .{ .src = "(let* [a -7 b 2] [(quot a b) (mod a b) (/ 6 b) (/ a 2.0)])", .out = "[-3 1 3 -3.5]" },
+    .{ .src = "(let* [a 1 b 2] [(< a b) (<= a b) (> a b) (>= a b) (== a b) (== a 1.0) (<= b b) (>= a a)])", .out = "[true true false false false true true true]" },
+    .{ .src = "(let* [big 140737488355327] [(inc big) (dec (- big)) (* big 2)])", .out = "[140737488355328 -140737488355328 281474976710654]" },
+    .{ .src = "(let* [x 1.5] [(+ x 1) (* x 2) (< x 2) (inc x)])", .out = "[2.5 3.0 true 2.5]" },
+    .{ .src = "(try (inc :a) (catch any e :caught))", .out = ":caught" },
     // Lexical names shadow the inlined operators; special forms stay.
     .{ .src = "(let* [+ (fn* [a b] 42)] (+ 1 2))", .out = "42" },
     .{ .src = "(let* [< (fn* [a b] false)] (if (< 1 2) 1 0))", .out = "0" },
@@ -272,6 +279,8 @@ const failures = [_]Failure{
     .{ .src = "never-bound", .err = error.UnboundVar },
     .{ .src = "(do (defn f [] (g)) (f))", .err = error.UnboundVar },
     .{ .src = "(throw 13)", .err = error.UncaughtThrow },
+    .{ .src = "(let* [z 0] (quot 1 z))", .err = error.DivideByZero },
+    .{ .src = "(let* [k :a] (- k 1))", .err = error.KindMismatch },
     .{ .src = "(try (throw :a) (catch any e (throw :b)))", .err = error.UncaughtThrow },
     .{ .src = "(do (try 1 (catch any e 2)) (throw :x))", .err = error.UncaughtThrow },
 };
@@ -527,4 +536,46 @@ test "inlining: an operator inlines only when it names nexis.core's Var" {
         \\(ns bar)
         \\(+ 1 2)
     , "3");
+}
+
+/// Compile the one form of `src` the way `program` compiles a form,
+/// without running it.
+fn compileIn(program: *harness.Program, src: []const u8) !nx.compile.Compiled {
+    const reader_mod = nx.reader;
+    var parsed = try reader_mod.parser.parseForm(program.arena.allocator(), src);
+    defer parsed.parser.deinit();
+    var rdr = reader_mod.Reader.init(program.arena.allocator(), src);
+    defer rdr.deinit();
+    const form = try rdr.readOneForm(parsed.sexp);
+    return nx.compile.compileFormWith(program.arena.allocator(), form, .{
+        .namespace = program.registry.current,
+        .interner = program.interner,
+        .host_macros = &program.host_macros,
+        .persistent_allocator = program.v.runtime_arena.allocator(),
+        .registry = program.registry,
+    });
+}
+
+test "inlining: core arithmetic and comparison run as one instruction each" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const ops = [_][]const u8{ "(+ a b)", "(- a b)", "(* a b)", "(/ a b)", "(quot a b)", "(mod a b)", "(< a b)", "(<= a b)", "(> a b)", "(>= a b)", "(== a b)", "(- a)", "(abs a)", "(inc a)", "(dec a)" };
+    for (ops) |op| {
+        const src = try std.fmt.allocPrint(testing.allocator, "(fn* [a b] {s})", .{op});
+        defer testing.allocator.free(src);
+        const compiled = try compileIn(&program, src);
+        const body = for (compiled.consts) |k| {
+            if (k == .routine) break k.routine;
+        } else return error.TestFailed;
+        testing.expectEqual(@as(usize, 0), body.var_table.len) catch |err| {
+            std.debug.print("\n  {s} calls through a Var\n", .{op});
+            return err;
+        };
+        // The op, then the return of its result.
+        try testing.expectEqual(@as(usize, 2), body.code.len);
+    }
+    // Every other arity is a call.
+    const call = try compileIn(&program, "(fn* [a b c] (+ a b c))");
+    for (call.consts) |k| if (k == .routine) try testing.expectEqual(@as(usize, 1), k.routine.var_table.len);
 }

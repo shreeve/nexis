@@ -15,10 +15,12 @@
 //!                               →  `Tiny.literal` (a const-pool Value;
 //!                                  keywords and symbols need an
 //!                                  Interner, strings a Heap)
-//!   - `(+ a b)` / `(< a b)`     →  `math:add` / `cmp:lt` when the
-//!                                  operator names `nexis.core`'s Var;
-//!                                  a literal-pair peephole emits
-//!                                  constant operands directly
+//!   - `(+ a b)`, `(< a b)`, `(inc a)` and the other core numeric
+//!     fns at the arity they inline at (`inlined_ops`)
+//!                               →  one `math` / `cmp` instruction
+//!                                  when the operator names
+//!                                  `nexis.core`'s Var, operands read
+//!                                  in place where they can be
 //!   - `(if <test> <then> <else?>)` → `jump:if-false` over then,
 //!                                  unconditional `jump:jmp` past else,
 //!                                  with PC back-patching; an absent
@@ -185,16 +187,13 @@ pub const Tiny = union(enum) {
     /// returns from this opcode (it either jumps to a catch
     /// PC or raises VmError.UncaughtThrow).
     throw_: *const Tiny,
-    /// `(+ lhs rhs)`. Sub-expressions are recursive.
-    add: struct {
+    /// A call of a core arithmetic or comparison fn that the VM
+    /// runs as one `math` or `cmp` instruction (COMPILER.md §4.3
+    /// rule 2); `rhs` is null for the unary ops.
+    prim: struct {
+        op: PrimOp,
         lhs: *const Tiny,
-        rhs: *const Tiny,
-    },
-    /// `(< lhs rhs)` — fixnum less-than. Lowers to `cmp:lt` per
-    /// VM.md §10.
-    lt: struct {
-        lhs: *const Tiny,
-        rhs: *const Tiny,
+        rhs: ?*const Tiny = null,
     },
     /// `(if test then else?)`. else_ is optional; absent else
     /// synthesizes nil per PLAN §6.1.
@@ -210,10 +209,7 @@ pub const Tiny = union(enum) {
     /// each binding's RHS sees previous bindings only, NOT
     /// itself. Body sees all bindings. Bindings exit scope at
     /// the end of `body`.
-    let_star: struct {
-        bindings: []const Binding,
-        body: *const Tiny,
-    },
+    let_star: Scope,
     /// `(do e1 e2 ... eN)` per PLAN §6.1.
     /// Sequential evaluation; yields the value of `eN`. Empty
     /// `(do)` yields nil. Each let_star / fn_star / loop_star
@@ -255,10 +251,7 @@ pub const Tiny = union(enum) {
     /// visibility, captured-binding cells); the loop body
     /// installs a `RecurTarget` so `(recur args...)` inside the
     /// body rebinds and jumps to the entry label.
-    loop_star: struct {
-        bindings: []const Binding,
-        body: *const Tiny,
-    },
+    loop_star: Scope,
     /// `(recur arg1 arg2 ...)` per PLAN §6.1 + COMPILER.md §5.6.
     /// Re-enters the nearest enclosing `loop*` or `fn*` with the
     /// given arguments. Must be in tail
@@ -324,6 +317,65 @@ pub const Tiny = union(enum) {
     },
 };
 
+/// The operation of a `Tiny.prim`: the VM's `math` and `cmp`
+/// variants that run the same numeric-tower helpers as the core
+/// fns they stand for (VM.md §10).
+pub const PrimOp = enum {
+    add,
+    sub,
+    mul,
+    div,
+    quot,
+    mod,
+    neg,
+    abs,
+    lt,
+    lte,
+    gt,
+    gte,
+    num_eq,
+
+    fn inst(op: PrimOp, dst: u12, lhs: Operand, rhs: Operand) Inst {
+        const d = Operand.slot(dst);
+        return switch (op) {
+            .add => Inst.primary(.math, vm.Math.add, d, lhs, rhs),
+            .sub => Inst.primary(.math, vm.Math.sub, d, lhs, rhs),
+            .mul => Inst.primary(.math, vm.Math.mul, d, lhs, rhs),
+            .div => Inst.primary(.math, vm.Math.div, d, lhs, rhs),
+            .quot => Inst.primary(.math, vm.Math.idiv, d, lhs, rhs),
+            .mod => Inst.primary(.math, vm.Math.mod, d, lhs, rhs),
+            .neg => Inst.primary(.math, vm.Math.neg, d, lhs, rhs),
+            .abs => Inst.primary(.math, vm.Math.abs, d, lhs, rhs),
+            .lt => Inst.primary(.cmp, vm.Cmp.lt, d, lhs, rhs),
+            .lte => Inst.primary(.cmp, vm.Cmp.lte, d, lhs, rhs),
+            .gt => Inst.primary(.cmp, vm.Cmp.gt, d, lhs, rhs),
+            .gte => Inst.primary(.cmp, vm.Cmp.gte, d, lhs, rhs),
+            .num_eq => Inst.primary(.cmp, vm.Cmp.eq_num, d, lhs, rhs),
+        };
+    }
+};
+
+/// The core fns inlined as a `Tiny.prim`, at the one arity each
+/// inlines at; `inc` and `dec` are `+` and `-` with a constant 1.
+/// Every other arity is an ordinary call.
+const inlined_ops = [_]struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false }{
+    .{ .name = "+", .argc = 2, .op = .add },
+    .{ .name = "-", .argc = 2, .op = .sub },
+    .{ .name = "*", .argc = 2, .op = .mul },
+    .{ .name = "/", .argc = 2, .op = .div },
+    .{ .name = "quot", .argc = 2, .op = .quot },
+    .{ .name = "mod", .argc = 2, .op = .mod },
+    .{ .name = "<", .argc = 2, .op = .lt },
+    .{ .name = "<=", .argc = 2, .op = .lte },
+    .{ .name = ">", .argc = 2, .op = .gt },
+    .{ .name = ">=", .argc = 2, .op = .gte },
+    .{ .name = "==", .argc = 2, .op = .num_eq },
+    .{ .name = "-", .argc = 1, .op = .neg },
+    .{ .name = "abs", .argc = 1, .op = .abs },
+    .{ .name = "inc", .argc = 1, .op = .add, .one = true },
+    .{ .name = "dec", .argc = 1, .op = .sub, .one = true },
+};
+
 /// One binding in a `letfn*` form. Each is a function
 /// definition (mutually visible across the binding group).
 pub const FnBinding = struct {
@@ -331,6 +383,12 @@ pub const FnBinding = struct {
     params: []const []const u8,
     /// `& rest` binding name, when the fn is variadic.
     rest_param: ?[]const u8 = null,
+    body: *const Tiny,
+};
+
+/// The sequential bindings and body of a `let*` or `loop*`.
+pub const Scope = struct {
+    bindings: []const Binding,
     body: *const Tiny,
 };
 
@@ -408,10 +466,10 @@ pub const RecurTarget = struct {
     /// `mov:move` (direct) for each binding (per VM.md §11
     /// + COMPILER.md §5.6 captured-recur semantics).
     captured_mask: []const bool,
-    kind: RecurTargetKind,
+    /// The bindings' names, so `recur` can tell which arguments
+    /// read which bindings.
+    names: []const []const u8,
 };
-
-pub const RecurTargetKind = enum { loop_star, fn_star };
 
 // =============================================================================
 // Errors
@@ -1089,7 +1147,7 @@ pub fn compileTinyWithSpans(
 // directly to bytecode" path.
 //
 // Lowering covers literals, symbols, list dispatch (ordinary calls,
-// special forms, the `+` / `<` intrinsics when not lexically shadowed),
+// special forms, the inlined core fns when not shadowed),
 // binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
 // (def, defn, var), try/throw, quote, and collection literals. The
 // lowering env (`LowerEnv`) tracks lexical-name shadowing for
@@ -1495,20 +1553,15 @@ fn lowerList(
         if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
         if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
-        // -- Inlineable intrinsics (shadowable) --
-        if (std.mem.eql(u8, name, "+") and items.len == 3 and namesCore(ctx, name)) {
-            return try lowerAdd(allocator, items[1], items[2], ctx);
+        // -- Inlineable core fns (shadowable) --
+        if (try lowerPrim(allocator, name, items[1..], ctx)) |t| {
+            if (namesCore(ctx, name)) return t;
         }
-        if (std.mem.eql(u8, name, "<") and items.len == 3 and namesCore(ctx, name)) {
-            return try lowerLt(allocator, items[1], items[2], ctx);
-        }
-    } else if (items[0].datum == .symbol and items.len == 3 and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
-        // The qualified intrinsics `nexis.core/+` and `nexis.core/<`:
-        // a qualified head is never a lexical local, so these inline
-        // unconditionally. Host macros emit them (MACROEXPAND.md §5).
-        const name = items[0].datum.symbol.name;
-        if (std.mem.eql(u8, name, "+")) return try lowerAdd(allocator, items[1], items[2], ctx);
-        if (std.mem.eql(u8, name, "<")) return try lowerLt(allocator, items[1], items[2], ctx);
+    } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
+        // A qualified head is never a lexical local, so `nexis.core/+`
+        // inlines unconditionally. Host macros emit these
+        // (MACROEXPAND.md §5).
+        if (try lowerPrim(allocator, items[0].datum.symbol.name, items[1..], ctx)) |t| return t;
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
@@ -1769,29 +1822,27 @@ fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) Co
     return allocTiny(allocator, .{ .literal = v });
 }
 
-/// `(+ a b)`. Caller has already verified arity (3 list items)
-/// and unshadowed status.
-fn lowerAdd(
+/// `(name args...)` as a `Tiny.prim` when `name` is an inlined core
+/// fn at this arity, else null. The caller decides whether the name
+/// means the core fn; lowering the operands first is harmless, as
+/// an ordinary call lowers them the same way.
+fn lowerPrim(
     allocator: std.mem.Allocator,
-    lhs: *const reader_mod.Form,
-    rhs: *const reader_mod.Form,
+    name: []const u8,
+    args: []const *reader_mod.Form,
     ctx: LowerCtx,
-) CompileError!*Tiny {
-    const t_lhs = try lowerFormEnv(allocator, lhs, ctx);
-    const t_rhs = try lowerFormEnv(allocator, rhs, ctx);
-    return try allocTiny(allocator, .{ .add = .{ .lhs = t_lhs, .rhs = t_rhs } });
-}
-
-/// `(< a b)`. Caller has already verified arity and unshadowed.
-fn lowerLt(
-    allocator: std.mem.Allocator,
-    lhs: *const reader_mod.Form,
-    rhs: *const reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    const t_lhs = try lowerFormEnv(allocator, lhs, ctx);
-    const t_rhs = try lowerFormEnv(allocator, rhs, ctx);
-    return try allocTiny(allocator, .{ .lt = .{ .lhs = t_lhs, .rhs = t_rhs } });
+) CompileError!?*Tiny {
+    const in = for (inlined_ops) |in| {
+        if (in.argc == args.len and std.mem.eql(u8, in.name, name)) break in;
+    } else return null;
+    const lhs = try lowerFormEnv(allocator, args[0], ctx);
+    const rhs: ?*const Tiny = if (in.one)
+        try allocTiny(allocator, .{ .int = 1 })
+    else if (args.len == 2)
+        try lowerFormEnv(allocator, args[1], ctx)
+    else
+        null;
+    return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs } });
 }
 
 /// Ordinary function call `(callee args...)`. Lowers head as
@@ -3011,13 +3062,9 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
         // Qualified symbols resolve through the
         // namespace registry — never lexically captured.
         .qualified_symbol => {},
-        .add => |a| {
-            try freeVars(allocator, a.lhs, env, out);
-            try freeVars(allocator, a.rhs, env, out);
-        },
-        .lt => |a| {
-            try freeVars(allocator, a.lhs, env, out);
-            try freeVars(allocator, a.rhs, env, out);
+        .prim => |p| {
+            try freeVars(allocator, p.lhs, env, out);
+            if (p.rhs) |r| try freeVars(allocator, r, env, out);
         },
         .if_ => |i| {
             try freeVars(allocator, i.test_, env, out);
@@ -3161,13 +3208,9 @@ fn capturedByDescendantFns(
     try stack.check();
     switch (form.*) {
         .nil, .bool, .int, .symbol, .qualified_symbol => {},
-        .add => |a| {
-            try capturedByDescendantFns(allocator, a.lhs, env, out);
-            try capturedByDescendantFns(allocator, a.rhs, env, out);
-        },
-        .lt => |a| {
-            try capturedByDescendantFns(allocator, a.lhs, env, out);
-            try capturedByDescendantFns(allocator, a.rhs, env, out);
+        .prim => |p| {
+            try capturedByDescendantFns(allocator, p.lhs, env, out);
+            if (p.rhs) |r| try capturedByDescendantFns(allocator, r, env, out);
         },
         .if_ => |i| {
             try capturedByDescendantFns(allocator, i.test_, env, out);
@@ -3358,9 +3401,8 @@ fn compileExpr(
         .map_construct => |items| try compileMapConstruct(e, items, dst),
         .set_construct => |items| try compileSetConstruct(e, items, dst),
         .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, dst),
-        .throw_ => |value| try compileThrow(e, value, dst),
-        .add => |a| try compileAdd(e, a.lhs, a.rhs, dst),
-        .lt => |a| try compileLt(e, a.lhs, a.rhs, dst),
+        .throw_ => |value| try compileThrow(e, value),
+        .prim => |p| try compilePrim(e, p.op, p.lhs, p.rhs, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst, recur_target),
         .do_ => |exprs| try compileDo(e, exprs, dst, recur_target),
@@ -3502,51 +3544,62 @@ fn compileSetConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) Compil
     try e.emit(vm.asm_.collSet(arg_base, argc, dst));
 }
 
-fn compileAdd(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
-    // Literal-pair peephole: if both
-    // operands are integer literals, emit math:add with constant
-    // operands directly — no prelude moves, two instructions
-    // total (math:add + the eventual return). For non-literal
-    // operands, fall back to prelude-style: compile each into a
-    // fresh temp slot, then math:add slot/slot/slot.
-    if (lhs.* == .int and rhs.* == .int) {
-        const v_lhs = value_mod.fromFixnum(lhs.int) orelse
-            return CompileError.IntegerOutOfFixnumRange;
-        const v_rhs = value_mod.fromFixnum(rhs.int) orelse
-            return CompileError.IntegerOutOfFixnumRange;
-        const c_lhs = try e.addValueConst(v_lhs);
-        const c_rhs = try e.addValueConst(v_rhs);
-        try e.emit(vm.asm_.mathAdd(dst, Operand.constant(c_lhs), Operand.constant(c_rhs)));
-        return;
-    }
-    // Non-literal operands: stage into temp slots first. Operands
-    // are non-tail (recur invalid inside arithmetic args).
-    const t_lhs = try e.allocSlot();
-    try compileExpr(e, lhs, t_lhs, null);
-    const t_rhs = try e.allocSlot();
-    try compileExpr(e, rhs, t_rhs, null);
-    try e.emit(vm.asm_.mathAdd(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
+/// `op` over its operands, read in place where they allow it
+/// (`compileOperand`). The left operand is evaluated first, as a
+/// call's arguments are; it reads a Var in place only when computing
+/// the right one runs no code that could change the Var.
+fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst: u12) CompileError!void {
+    const a = try compileOperand(e, lhs, rhs == null or isLeaf(rhs.?));
+    const b = if (rhs) |r| try compileOperand(e, r, true) else Operand.none;
+    try e.emit(op.inst(dst, a, b));
 }
 
-/// Lower `(< lhs rhs)` to `cmp:lt`. Same literal-pair peephole
-/// shape as `compileAdd`.
-fn compileLt(e: *Emitter, lhs: *const Tiny, rhs: *const Tiny, dst: u12) CompileError!void {
-    if (lhs.* == .int and rhs.* == .int) {
-        const v_lhs = value_mod.fromFixnum(lhs.int) orelse
-            return CompileError.IntegerOutOfFixnumRange;
-        const v_rhs = value_mod.fromFixnum(rhs.int) orelse
-            return CompileError.IntegerOutOfFixnumRange;
-        const c_lhs = try e.addValueConst(v_lhs);
-        const c_rhs = try e.addValueConst(v_rhs);
-        try e.emit(vm.asm_.cmpLt(dst, Operand.constant(c_lhs), Operand.constant(c_rhs)));
-        return;
+/// A node that evaluates without running code: a literal or a
+/// symbol.
+fn isLeaf(t: *const Tiny) bool {
+    return switch (t.*) {
+        .nil, .bool, .int, .literal, .symbol, .qualified_symbol => true,
+        else => false,
+    };
+}
+
+/// The operand an instruction reads `t` through: a constant, a local
+/// held directly in its slot, an upvalue, or (when `allow_var`) a
+/// Var, each read in place; anything else is computed into a fresh
+/// slot first.
+fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Operand {
+    if (try directOperand(e, t, allow_var)) |op| return op;
+    const tmp = try e.allocSlot();
+    try compileExpr(e, t, tmp, null);
+    return Operand.slot(tmp);
+}
+
+/// `t` as an operand read in place, or null when it needs code.
+fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Operand {
+    switch (t.*) {
+        .nil => return Operand.constant(try e.addValueConst(value_mod.nilValue())),
+        .bool => |b| return Operand.constant(try e.addValueConst(value_mod.fromBool(b))),
+        .int => |n| {
+            const v = value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange;
+            return Operand.constant(try e.addValueConst(v));
+        },
+        .literal => |v| return Operand.constant(try e.addValueConst(v)),
+        .symbol => |name| {
+            const ref = e.resolveOrCapture(name) catch |err| switch (err) {
+                CompileError.UnresolvedSymbol => {
+                    if (!allow_var or e.namespace == null) return null;
+                    return Operand.varRef(try e.addVarRef(name));
+                },
+                else => return err,
+            };
+            return switch (ref) {
+                .direct_slot => |slot| Operand.slot(slot),
+                .upvalue => |u| Operand.upvalue(u),
+                .cell_slot => null,
+            };
+        },
+        else => return null,
     }
-    // Operands are non-tail (recur invalid inside comparison args).
-    const t_lhs = try e.allocSlot();
-    try compileExpr(e, lhs, t_lhs, null);
-    const t_rhs = try e.allocSlot();
-    try compileExpr(e, rhs, t_rhs, null);
-    try e.emit(vm.asm_.cmpLt(dst, Operand.slot(t_lhs), Operand.slot(t_rhs)));
 }
 
 /// Resolve `prefix/name` through the namespace
@@ -3665,9 +3718,8 @@ fn compileDef(
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
     const idx = try e.addVarLocal(name);
     if (value) |val| {
-        const t = try e.allocSlot();
-        try compileExpr(e, val, t, null); // RHS is non-tail
-        try e.emit(vm.asm_.varStoreVar(dst, idx, vm.Operand.slot(t)));
+        // RHS is non-tail.
+        try e.emit(vm.asm_.varStoreVar(dst, idx, try compileOperand(e, val, true)));
     } else {
         // Declare-only: emit var:var-object so dst gets the
         // Var object. Bound state unchanged (still unbound on
@@ -3892,9 +3944,8 @@ fn compileTry(
 /// fresh slot (we use `dst` since the throw never returns
 /// normally — the dst slot's prior contents don't matter),
 /// then emit `ctrl:throw <dst>`.
-fn compileThrow(e: *Emitter, value: *const Tiny, dst: u12) CompileError!void {
-    try compileExpr(e, value, dst, null);
-    try e.emit(vm.asm_.throwOp(vm.Operand.slot(dst)));
+fn compileThrow(e: *Emitter, value: *const Tiny) CompileError!void {
+    try e.emit(vm.asm_.throwOp(try compileOperand(e, value, true)));
 }
 
 /// Lower `(loop* [b1 v1 b2 v2 ...] body)` per COMPILER.md §5.7
@@ -3963,11 +4014,14 @@ fn compileLoopStar(
 
     // 4. Mark entry PC (AFTER box-local prelude).
     const entry_pc = try e.nextPc();
+    const names = try e.allocator.alloc([]const u8, bindings.len);
+    defer e.allocator.free(names);
+    for (bindings, names) |b, *n| n.* = b.name;
     const loop_target = RecurTarget{
         .entry_pc = entry_pc,
         .binding_slots = binding_slots,
         .captured_mask = captured_mask,
-        .kind = .loop_star,
+        .names = names,
     };
 
     // 5. Compile body with the loop target installed. The
@@ -3977,29 +4031,21 @@ fn compileLoopStar(
     try compileExpr(e, body, dst, &loop_target);
 }
 
-/// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11.
+/// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11:
+/// rebind the target's bindings to the arguments as one parallel
+/// assignment, then `jump:jmp` to the target's entry. No `call` is
+/// emitted and `dst` is never written.
 ///
-/// `recur_target` is the nearest enclosing `loop*` or `fn*`'s
-/// target, threaded from compileExpr. If `null`, the `recur`
-/// is in non-tail position and we raise `RecurOutsideTail`.
-/// Arity is checked against `target.binding_slots.len` before
-/// any code is emitted.
-///
-/// Lowering (parallel-assignment via fresh temps, then move +
-/// optional fresh-cell install per captured_mask):
-///   compile each arg into a fresh temp slot (non-tail)
-///   for each binding i in order:
-///     if captured_mask[i]:
-///       closure:box-local temp[i]              ; temp[i] := fresh cell
-///       mov:move binding_slot[i], temp[i]       ; install fresh cell
-///     else:
-///       mov:move binding_slot[i], temp[i]
-///   jump:jmp entry_pc
-///
-/// `dst` is never written: `recur` jumps unconditionally before
-/// reaching any code that would consume dst. Surrounding control
-/// flow (e.g., `if`'s end-jmp) may emit unreachable code after
-/// the recur — harmless dead code.
+/// An argument no other argument reads the binding of, for a
+/// binding no closure captures, is computed straight into the
+/// binding's slot: nothing evaluated after it can observe the
+/// change. Every other argument is read in place when it is a
+/// constant, an upvalue or a slot no rebinding overwrites, and is
+/// computed into a fresh slot otherwise; the moves into the
+/// bindings follow, a captured binding getting a fresh cell per
+/// iteration (the value is boxed in its fresh slot, then
+/// installed), since mutating the shared cell would change what
+/// earlier closures see.
 fn compileRecur(
     e: *Emitter,
     args: []const *const Tiny,
@@ -4008,33 +4054,80 @@ fn compileRecur(
     const target = recur_target orelse return CompileError.RecurOutsideTail;
     if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
 
-    // Evaluate each arg into a fresh temp slot. Using temps
-    // (not the target slots directly) makes parallel-assignment
-    // correct for aliasing cases like `(loop* [a 1 b 2] (recur b a))`.
-    const temps = try e.allocator.alloc(u12, args.len);
-    defer e.allocator.free(temps);
+    const pending = try e.allocator.alloc(?Operand, args.len);
+    defer e.allocator.free(pending);
     for (args, 0..) |arg, i| {
-        temps[i] = try e.allocSlot();
+        const slot = target.binding_slots[i];
+        var read_elsewhere = false;
+        for (args, 0..) |other, j| {
+            if (j != i and try readsName(other, target.names[i])) read_elsewhere = true;
+        }
         // Recur args are non-tail (any nested recur would target
         // the wrong scope; PLAN §11.3).
-        try compileExpr(e, arg, temps[i], null);
-    }
-
-    // Install into target slots. For captured bindings, allocate
-    // a fresh cell per iteration (per VM.md §11 — mutating the
-    // shared cell would break immutable lexical binding
-    // semantics; canonical hazard documented in COMPILER.md
-    // §5.6 captured-recur).
-    for (target.binding_slots, 0..) |target_slot, i| {
-        if (target.captured_mask[i]) {
-            try e.emit(vm.asm_.closureBoxLocal(temps[i]));
-            try e.emit(vm.asm_.move(target_slot, temps[i]));
+        if (!read_elsewhere and !target.captured_mask[i]) {
+            try compileExpr(e, arg, slot, null);
+            pending[i] = null;
+            continue;
+        }
+        const direct = try directOperand(e, arg, false);
+        const in_place = if (direct) |op|
+            !target.captured_mask[i] and !(op.kind == .slot and isRecurSlot(target, op.index))
+        else
+            false;
+        if (in_place) {
+            pending[i] = direct;
         } else {
-            try e.emit(vm.asm_.move(target_slot, temps[i]));
+            const tmp = try e.allocSlot();
+            try compileExpr(e, arg, tmp, null);
+            pending[i] = Operand.slot(tmp);
         }
     }
-
+    for (pending, 0..) |maybe_op, i| {
+        const op = maybe_op orelse continue;
+        const slot = target.binding_slots[i];
+        if (target.captured_mask[i]) try e.emit(vm.asm_.closureBoxLocal(op.index));
+        if (op.kind == .slot and op.index == slot) continue;
+        try e.emit(vm.asm_.moveFrom(slot, op));
+    }
     try e.emit(vm.asm_.jumpJmp(target.entry_pc));
+}
+
+fn isRecurSlot(target: *const RecurTarget, slot: u12) bool {
+    return std.mem.indexOfScalar(u12, target.binding_slots, slot) != null;
+}
+
+/// Whether `t` mentions the symbol `name` anywhere, closures and
+/// shadowing bindings included: a conservative "might read it".
+fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
+    try stack.check();
+    const any = struct {
+        fn of(items: []const *const Tiny, n: []const u8) CompileError!bool {
+            for (items) |item| if (try readsName(item, n)) return true;
+            return false;
+        }
+    }.of;
+    return switch (t.*) {
+        .nil, .bool, .int, .literal, .qualified_symbol, .var_ref => false,
+        .symbol => |sym| std.mem.eql(u8, sym, name),
+        .list_construct, .concat, .vector_construct, .map_construct, .set_construct, .do_ => |items| any(items, name),
+        .recur => |r| any(r.args, name),
+        .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false),
+        .if_ => |i| try readsName(i.test_, name) or try readsName(i.then, name) or (if (i.else_) |x| try readsName(x, name) else false),
+        .let_star, .loop_star => |l| blk: {
+            for (l.bindings) |b| if (try readsName(b.value, name)) break :blk true;
+            break :blk try readsName(l.body, name);
+        },
+        .letfn_star => |l| blk: {
+            for (l.bindings) |b| if (try readsName(b.body, name)) break :blk true;
+            break :blk try readsName(l.body, name);
+        },
+        .fn_star => |f| try readsName(f.body, name),
+        .defn => |d| try readsName(d.body, name),
+        .call => |c| try readsName(c.callee, name) or try any(c.args, name),
+        .try_ => |x| try readsName(x.body, name) or try readsName(x.handler, name) or (if (x.finally_) |f| try readsName(f, name) else false),
+        .throw_ => |v| try readsName(v, name),
+        .def => |d| if (d.value) |v| try readsName(v, name) else false,
+    };
 }
 
 fn compileDo(
@@ -4234,20 +4327,24 @@ fn compileFn(
     defer parent.allocator.free(param_slots);
     const captured_mask = try parent.allocator.alloc(bool, binding_count);
     defer parent.allocator.free(captured_mask);
+    const names = try parent.allocator.alloc([]const u8, binding_count);
+    defer parent.allocator.free(names);
     for (params, 0..) |p, i| {
         param_slots[i] = @intCast(i); // fixed params live at slots 0..fixed_arity-1
         captured_mask[i] = captured_in_body.contains(p);
+        names[i] = p;
     }
     if (rest_param) |rp| {
         param_slots[params.len] = @intCast(params.len);
         captured_mask[params.len] = captured_in_body.contains(rp);
+        names[params.len] = rp;
     }
     const fn_entry_pc = try child.nextPc();
     const fn_target = RecurTarget{
         .entry_pc = fn_entry_pc,
         .binding_slots = param_slots,
         .captured_mask = captured_mask,
-        .kind = .fn_star,
+        .names = names,
     };
 
     // Allocate a fresh result slot for the body so a self-move
@@ -4453,39 +4550,34 @@ fn compileIf(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // Lower the test into a fresh temp slot; we can't reuse `dst`
-    // because the test value would be overwritten by either arm.
-    // Test is NON-tail.
-    const t_test = try e.allocSlot();
-    try compileExpr(e, test_form, t_test, null);
-
-    // Emit `jump:if-false PLACEHOLDER, t_test`. Remember its PC
-    // for back-patching once the else-label is known.
-    const if_false_pc = try e.emitJumpIfFalsePlaceholder(Operand.slot(t_test));
-
-    // Then-arm: compile into dst. Tail position INHERITED.
+    // The test is non-tail and read in place where it can be.
+    const test_op = try compileOperand(e, test_form, true);
+    const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
+    // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
-
-    // Emit `jump:jmp PLACEHOLDER` to skip past the else-arm.
-    // Remember its PC for back-patching to end-label.
-    // (If then_form was a recur, this jump is unreachable but
-    // harmless dead code.)
-    const end_jmp_pc = try e.emitJumpPlaceholder();
-
-    // Else-label is at the current PC.
+    // An arm that always jumps away (recur, throw) needs no jump
+    // past the else arm.
+    const end_jmp_pc: ?usize = if (neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
     try e.patchJumpHere(if_false_pc);
-
-    // Else-arm: compile into dst (or synthesize nil if absent).
-    // Tail position INHERITED.
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
     } else {
         try e.emit(vm.asm_.loadNil(dst));
     }
+    if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+}
 
-    // End-label is at the current PC; patch the unconditional
-    // jump from the end of the then-arm.
-    try e.patchJumpHere(end_jmp_pc);
+/// Whether control never reaches the end of `t`'s code: every path
+/// through it ends in `recur` or `throw`.
+fn neverFallsThrough(t: *const Tiny) bool {
+    return switch (t.*) {
+        .recur, .throw_ => true,
+        .if_ => |i| neverFallsThrough(i.then) and (if (i.else_) |x| neverFallsThrough(x) else false),
+        .do_ => |items| items.len > 0 and neverFallsThrough(items[items.len - 1]),
+        .let_star => |l| neverFallsThrough(l.body),
+        .letfn_star => |l| neverFallsThrough(l.body),
+        else => false,
+    };
 }
 
 // =============================================================================
@@ -4552,7 +4644,7 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(let* [x x] x)", .err = CompileError.UnresolvedSymbol },
         .{ .src = "(do missing 1)", .err = CompileError.UnresolvedSymbol },
         .{ .src = "(let* [x 5] ((fn* [] z)))", .err = CompileError.UnresolvedSymbol },
-        .{ .src = "(inc 5)", .err = CompileError.UnresolvedSymbol },
+        .{ .src = "(foo 5)", .err = CompileError.UnresolvedSymbol },
         .{ .src = "(def x 5)", .err = CompileError.UnresolvedSymbol },
         .{ .src = "(quote foo)", .err = CompileError.UnsupportedFeature },
         .{ .src = "'foo", .err = CompileError.UnsupportedFeature },
