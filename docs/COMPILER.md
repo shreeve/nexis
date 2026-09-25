@@ -39,7 +39,7 @@ here.
   current namespace and the namespace registry; `(require ...)`
   file loading lives in `src/loader.zig`.
 - Primitive core: `quote`, `if`, `do`, `let*`, `fn*`, `letfn*`,
-  `recur`, `loop*`, `def`, `defn`, `var`, `try`/`catch`/`finally`,
+  `recur`, `loop*`, `def`, `var`, `try`/`catch`/`finally`,
   `throw`, plus the internal constructors `#%list`, `#%concat`,
   `#%vector`, `#%map`, `#%set` that syntax-quote and quoted
   compound literals lower to.
@@ -170,7 +170,7 @@ compiler relies on:
 - **Symbol classification (priority order)**:
   1. **Special form** — if the symbol is a primitive-core name
      (`quote`, `if`, `do`, `let*`, `fn*`, `letfn*`, `recur`,
-     `loop*`, `def`, `defn`, `var`, `try`, `throw`, and the
+     `loop*`, `def`, `var`, `try`, `throw`, and the
      `#%` constructors) AND in operator position. Special forms
      are reserved: they are recognized regardless of lexical
      bindings.
@@ -623,14 +623,11 @@ is `UnsupportedFeature`.
 - Emit `var:store-var` V#(name), result-slot. The instruction
   sets the Var's root, marks it bound and yields the Var object.
 
-#### 5.8b `(defn name [params...] body...)`
-
-Sugar for `(def name (fn* name [params...] body...))`: the
-function carries its own name as the self-name, so the body can
-recurse through the lexical name without going through the Var,
-and the Var binding makes the function reachable from outside
-the form. Forward references between `defn`s work because each
-`defn` interns its Var at compile time and call-time resolution
+`defn` is not a primitive: the host macro rewrites it to
+`(def name (fn* name [params...] body...))` (MACROEXPAND.md), so
+the body can recurse through the self-name without going through
+the Var. Forward references between definitions work because each
+`def` interns its Var at compile time and call-time resolution
 through the var table picks up whatever is bound by then.
 
 #### 5.9 `(var name)`
@@ -913,7 +910,7 @@ routines compiled from it.
 - Lowering allocates every Tiny node as a `TinyNode{span, tiny}`
   and `lowerFormEnv` stamps the node with its Form's span; a
   node lowering synthesizes without a Form (the `do` around a
-  body, the `fn*` a `defn` stands for) has none and inherits the
+  body, the constant 1 of an inlined `inc`) has none and inherits the
   span of the form enclosing it. A hand-built `&Tiny{...}` tree
   compiles without spans (`compileTiny`).
 - The Emitter attributes every instruction it emits to the span
@@ -932,8 +929,9 @@ routines compiled from it.
   expansion resolve to the call. `Routine.spanAt(pc)` is a
   binary search; nothing reads the table while instructions
   execute (VM.md §5).
-- A `defn` routine is named after its Var (the name copied onto
-  the compile allocator), an anonymous closure `fn`.
+- A named `fn*` routine, which is what `defn` produces, carries
+  its name (copied onto the compile allocator); an anonymous
+  closure is `fn`.
 
 ---
 

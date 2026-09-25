@@ -44,7 +44,7 @@
 //!                                  pre-analyzed and boxed in
 //!                                  straight-line prelude code
 //!   - `(letfn* ...)`, `(loop* ...)`, `(recur ...)`, `(def ...)`,
-//!     `(defn ...)`, `(var name)`
+//!     `(var name)`
 //!   - `(try body (catch any e handler) (finally ...)?)`, `(throw v)`
 //!   - `#%list` / `#%concat` / `#%vector` / `#%map` / `#%set` and bare
 //!     `[...]` / `{...}` / `#{...}` literals → `coll:*` opcodes
@@ -260,22 +260,6 @@ pub const Tiny = union(enum) {
     /// reference to a declared-but-unbound Var is legal.
     var_ref: struct {
         name: []const u8,
-    },
-    /// `(defn name [params...] body)` per PLAN §6.1.
-    /// Sugar for `(def name (fn* name [params...] body))` —
-    /// the function carries its own name as the self-name (so
-    /// the body can recurse via the lexical name without going
-    /// through the Var, just like a named `fn*`). The
-    /// Var binding makes the function reachable from outside
-    /// the form. Together: forward references between defns
-    /// work because each `defn` interns its Var (possibly
-    /// unbound at compile time), and call-time resolution via
-    /// the Var-table picks up whatever's bound by then.
-    defn: struct {
-        name: []const u8,
-        params: []const []const u8,
-        rest_param: ?[]const u8 = null,
-        body: *const Tiny,
     },
     /// `(letfn* [(name1 params1 body1) (name2 params2 body2) ...] body)`
     /// per PLAN §6.1 + COMPILER.md §5.6b.
@@ -1134,7 +1118,7 @@ pub fn compileTinyWithSpans(
 // Lowering covers literals, symbols, list dispatch (ordinary calls,
 // special forms, the inlined core fns when not shadowed),
 // binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
-// (def, defn, var), try/throw, quote, and collection literals. The
+// (def, var), try/throw, quote, and collection literals. The
 // lowering env (`LowerEnv`) tracks lexical-name shadowing for
 // intrinsic dispatch.
 
@@ -1273,7 +1257,7 @@ pub const DeclaredNames = struct {
 ///   (let* [if 1] (if true 2 3))          ;; STILL special form `if`
 ///
 /// Special forms (`if`, `do`, `let*`, `fn*`, `letfn*`, `loop*`,
-/// `recur`, `quote`, `def`, `defn`, `var`) are RESERVED in operator
+/// `recur`, `quote`, `def`, `var`) are RESERVED in operator
 /// position — they're recognized regardless of lexical bindings.
 /// Only the inlineable core fns (`+`, `<`) check the env
 /// (`namesCore`).
@@ -1503,7 +1487,6 @@ fn lowerList(
         if (std.mem.eql(u8, name, "letfn*")) return try lowerLetFnStar(allocator, items[1..], ctx);
         // Var forms.
         if (std.mem.eql(u8, name, "def")) return try lowerDef(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "defn")) return try lowerDefn(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "var")) return try lowerVarRef(allocator, items[1..]);
         if (std.mem.eql(u8, name, "try")) return try lowerTry(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "throw")) return try lowerThrow(allocator, items[1..], ctx);
@@ -1821,7 +1804,7 @@ fn expectVector(form: *const reader_mod.Form) CompileError![]const *reader_mod.F
     };
 }
 
-/// Parsed param vector for `fn*`/`defn`: split fixed params from
+/// Parsed param vector for `fn*`: split fixed params from
 /// optional `& rest`.
 const ParsedParams = struct {
     params: []const []const u8,
@@ -2032,7 +2015,7 @@ fn lowerLetFnStar(
 // Form var-form lowering
 // =============================================================================
 //
-// `def`, `defn`, `(var x)`. The backend (Tiny.def, Tiny.defn,
+// `def`, `(var x)`. The backend (Tiny.def,
 // Tiny.var_ref) handles forward references, identity-stable
 // rebind, and the named-fn placeholder pattern. This layer is
 // purely Form-side dispatch + structural validation.
@@ -2054,36 +2037,6 @@ fn lowerDef(
     else
         null;
     return try allocTiny(allocator, .{ .def = .{ .name = name, .value = value } });
-}
-
-/// `(defn name [params... & rest?] body...)`. Sugar for
-/// `(def name (fn* name [params...] body))`, but we lower
-/// directly to `Tiny.defn` which has the same compileDefn path.
-fn lowerDefn(
-    allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    if (args.len < 2) return CompileError.MalformedForm;
-    const name = try expectUnqualifiedSymbol(args[0]);
-    const param_vec = try expectVector(args[1]);
-    const parsed = try parseParams(allocator, param_vec);
-
-    // Body env: outer env + params + rest + self-name (defn's
-    // name IS its self-name per Tiny.defn lowering).
-    var body_env = LowerEnv{ .parent = ctx.env };
-    defer body_env.deinit(allocator);
-    for (parsed.params) |p| try body_env.lexical_names.put(allocator, p);
-    if (parsed.rest_param) |rp| try body_env.lexical_names.put(allocator, rp);
-    try body_env.lexical_names.put(allocator, name);
-
-    const body = try lowerBody(allocator, args[2..], ctx.withEnv(&body_env));
-    return try allocTiny(allocator, .{ .defn = .{
-        .name = name,
-        .params = parsed.params,
-        .rest_param = parsed.rest_param,
-        .body = body,
-    } });
 }
 
 /// `(var name)` → returns the Var object (NOT its value). Does
@@ -3070,19 +3023,6 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             if (d.value) |val| try freeVars(allocator, val, env, out);
         },
         .var_ref => {}, // leaf: no sub-expressions, no free vars
-        .defn => |d| {
-            // defn lowers to (def name (fn* name ...)).
-            // For free-var analysis, treat the body's env as
-            // outer env + params + rest_param + name (the
-            // self-name is bound inside the fn body).
-            var fn_env: NameSet = .{};
-            defer fn_env.deinit(allocator);
-            try fn_env.unionWith(allocator, env);
-            for (d.params) |p| try fn_env.put(allocator, p);
-            if (d.rest_param) |rp| try fn_env.put(allocator, rp);
-            try fn_env.put(allocator, d.name);
-            try freeVars(allocator, d.body, &fn_env, out);
-        },
     }
 }
 
@@ -3235,22 +3175,6 @@ fn capturedByDescendantFns(
             if (d.value) |val| try capturedByDescendantFns(allocator, val, env, out);
         },
         .var_ref => {}, // leaf
-        .defn => |d| {
-            // Mirror the fn_star arm: body env = params +
-            // rest_param + self-name; report names in `env`
-            // that the body actually references.
-            var params_env: NameSet = .{};
-            defer params_env.deinit(allocator);
-            for (d.params) |p| try params_env.put(allocator, p);
-            if (d.rest_param) |rp| try params_env.put(allocator, rp);
-            try params_env.put(allocator, d.name);
-            var fn_free: NameSet = .{};
-            defer fn_free.deinit(allocator);
-            try freeVars(allocator, d.body, &params_env, &fn_free);
-            for (fn_free.items.items) |fname| {
-                if (env.contains(fname)) try out.put(allocator, fname);
-            }
-        },
     }
 }
 
@@ -3314,7 +3238,6 @@ fn compileExpr(
         .recur => |r| try compileRecur(e, r.args, recur_target),
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.name, dst),
-        .defn => |d| try compileDefn(e, d.name, d.params, d.rest_param, d.body, dst),
     }
 }
 
@@ -3537,42 +3460,6 @@ fn compileVarRef(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
     const idx = try e.addVarRef(name);
     try e.emit(vm.asm_.varVarObject(dst, idx));
-}
-
-/// Lower `(defn name [params...] body)` as sugar for
-/// `(def name (fn* name [params...] body))`. The fn* carries
-/// `name` as its self-name so the body can self-recurse via
-/// the lexical name (handled by the named-fn placeholder
-/// pattern, no Var indirection). The outer `def` binds the
-/// Var so the function is callable from outside.
-///
-/// Forward references work because compileDef interns the Var
-/// possibly unbound; a sibling `defn` referencing this name
-/// emits `var:load-var` against the same Var. The trap fires
-/// only if the function is INVOKED before the Var is bound.
-///
-/// Requires a Namespace (inherits the constraint from compileDef).
-fn compileDefn(
-    e: *Emitter,
-    name: []const u8,
-    params: []const []const u8,
-    rest_param: ?[]const u8,
-    body: *const Tiny,
-    dst: u12,
-) CompileError!void {
-    // Build the equivalent `(fn* name [params...] body)` and
-    // dispatch through compileDef. The node lives on the Zig
-    // stack frame; compileDef and compileFn complete
-    // synchronously, so the pointer remains valid. It is a
-    // `TinyNode` without a span so a spanned compile reads the
-    // enclosing `defn`'s span for it.
-    var fn_node: TinyNode = .{ .tiny = .{ .fn_star = .{
-        .name = name,
-        .params = params,
-        .rest_param = rest_param,
-        .body = body,
-    } } };
-    try compileDef(e, name, &fn_node.tiny, dst);
 }
 
 fn compileLetStar(
@@ -3924,7 +3811,6 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
             break :blk try readsName(l.body, name);
         },
         .fn_star => |f| try readsName(f.body, name),
-        .defn => |d| try readsName(d.body, name),
         .call => |c| try readsName(c.callee, name) or try any(c.args, name),
         .try_ => |x| try readsName(x.body, name) or try readsName(x.handler, name) or (if (x.finally_) |f| try readsName(f, name) else false),
         .throw_ => |v| try readsName(v, name),
@@ -4432,7 +4318,6 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(fn* (x) x)", .err = CompileError.ExpectedVector },
         .{ .src = "(def)", .err = CompileError.MalformedForm },
         .{ .src = "(def 42 5)", .err = CompileError.ExpectedSymbol },
-        .{ .src = "(defn f)", .err = CompileError.MalformedForm },
         .{ .src = "(var)", .err = CompileError.MalformedForm },
         .{ .src = "(fn* [x x] x)", .err = CompileError.DuplicateParam },
         .{ .src = "(fn* [a & a] a)", .err = CompileError.DuplicateParam },
@@ -4587,9 +4472,9 @@ test "bytecode: forms compile and run in a bare namespace" {
     var v = try vm.VM.init(testing.allocator, &stub_routine);
     defer v.deinit();
     const a = arena.allocator();
-    try testing.expectEqual(@as(i64, 6), (try runBare(a, &v, "(do (defn add1 [n] (+ n 1)) (add1 5))")).asFixnum());
-    try testing.expectEqual(@as(i64, 0), (try runBare(a, &v, "(do (defn down [n] (if (< n 1) n (recur (+ n -1)))) (down 5))")).asFixnum());
-    try testing.expectEqual(@as(i64, 42), (try runBare(a, &v, "(do (defn f [] (g)) (defn g [] 42) (f))")).asFixnum());
+    try testing.expectEqual(@as(i64, 6), (try runBare(a, &v, "(do (def add1 (fn* [n] (+ n 1))) (add1 5))")).asFixnum());
+    try testing.expectEqual(@as(i64, 0), (try runBare(a, &v, "(do (def down (fn* down [n] (if (< n 1) n (recur (+ n -1))))) (down 5))")).asFixnum());
+    try testing.expectEqual(@as(i64, 42), (try runBare(a, &v, "(do (def f (fn* [] (g))) (def g (fn* [] 42)) (f))")).asFixnum());
     const var_obj = try runBare(a, &v, "(var unbound-yet)");
     try testing.expect(var_obj.kind() == .var_);
     try testing.expect(!vm.VM.asVar(var_obj).bound);
@@ -4816,7 +4701,7 @@ test "span table: a nested routine carries its own table, origin and name" {
     var v = try vm.VM.init(testing.allocator, &stub_routine);
     defer v.deinit();
     const ns = v.ensureNamespace();
-    const src = "(defn sq [x]\n  (* x x))";
+    const src = "(def sq (fn* sq [x]\n  (* x x)))";
     const compiled = try compileSourceWith(arena.allocator(), src, .{ .namespace = ns, .interner = v.ensureInterner() });
     var child: ?*const vm.Routine = null;
     for (compiled.consts) |c| if (c == .routine) {
@@ -4826,7 +4711,7 @@ test "span table: a nested routine carries its own table, origin and name" {
     try testing.expectEqualStrings("sq", r.name);
     try testing.expect(r.spans.len > 0);
     const origin = r.origin orelse return error.TestFailed;
-    try testing.expectEqualStrings("(defn sq [x]\n  (* x x))", src[origin.pos .. origin.pos + origin.len]);
+    try testing.expectEqualStrings("(fn* sq [x]\n  (* x x))", src[origin.pos .. origin.pos + origin.len]);
     // The body's call carries the span of `(* x x)`; the return
     // after it carries the fn's.
     const last = r.spanAt(@intCast(r.code.len - 2)) orelse return error.TestFailed;
