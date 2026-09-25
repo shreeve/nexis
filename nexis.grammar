@@ -13,10 +13,13 @@
 #     `anon_fn` datum and rejects nested anon-fns.
 #   - `` `x `` emits `(syntax-quote ` x)`; expansion (auto-qualify, auto-gensym,
 #     unquote handling) is the macroexpander's job.
-#   - `#_ x` emits `(discard #_ x)`; the reader drops it.
 #   - `nil`, `true`, `false` arrive as symbols; the reader converts them.
 #   - Duplicate literal keys, odd map counts, nested anon-fns and bare
 #     unquotes are the reader's to reject.
+#
+# `#_ x` discards the next form wherever a form may stand, and leaves nothing
+# in the tree: a list skips it, and a prefix (`'`, `@`, `^`, ...) reads the
+# form after it, as Clojure's reader does. `#_ #_ a b` discards two forms.
 
 @lexer
 
@@ -55,13 +58,19 @@ tokens
 
 # Start symbols:
 #   program — a whole file (zero or more top-level forms)
-#   form    — exactly one form (REPL line, read-string)
+#   form    — exactly one form (REPL line, read-string), discards around it
 program! = forms                                 → (program ...1)
-form!    = datum                                 → 1
+form!    = gap datum gap                         → 2
 
 # Left recursion: each form appends to the list in place.
 forms    = forms datum                           → (...1 2)
+         | forms discard                         → 1
          |                                       → ()
+
+gap      = gap discard                           → _
+         |                                       → _
+
+discard  = HASH_DISCARD gap datum                → _
 
 # Compound and prefix forms keep their delimiter tokens as children, so a
 # form's span covers them.
@@ -76,10 +85,9 @@ datum    = INTEGER                               → (int 1)
          | LBRACE forms RBRACE                   → (map 1 ...2 3)
          | HASH_LBRACE forms RBRACE              → (set 1 ...2 3)
          | HASH_LPAREN forms RPAREN              → (anon-fn 1 ...2 3)
-         | QUOTE_TOK datum                       → (quote 1 2)
-         | SYNTAX_QUOTE_TOK datum                → (syntax-quote 1 2)
-         | UNQUOTE_TOK datum                     → (unquote 1 2)
-         | UNQUOTE_SPLICING_TOK datum            → (unquote-splicing 1 2)
-         | DEREF_TOK datum                       → (deref 1 2)
-         | HASH_DISCARD datum                    → (discard 1 2)
-         | CARET datum datum                     → (with-meta-raw 1 3 2)
+         | QUOTE_TOK gap datum                   → (quote 1 3)
+         | SYNTAX_QUOTE_TOK gap datum            → (syntax-quote 1 3)
+         | UNQUOTE_TOK gap datum                 → (unquote 1 3)
+         | UNQUOTE_SPLICING_TOK gap datum        → (unquote-splicing 1 3)
+         | DEREF_TOK gap datum                   → (deref 1 3)
+         | CARET gap datum gap datum             → (with-meta-raw 1 5 3)

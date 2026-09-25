@@ -21,7 +21,6 @@
 //!       * `:bad-number-literal`
 //!   - Merge stacked metadata (rightmost wins on duplicate keys).
 //!   - Lower `(anon-fn body)` → `(#%anon-fn body)` (reserved symbol).
-//!   - Drop `(discard x)` forms from their enclosing `forms` list.
 //!
 //! Scope boundary (PLAN §14.2 / FORMS.md §4): `(syntax-quote x)` is emitted
 //! as a structural tag only. Auto-qualification, auto-gensym, and
@@ -219,38 +218,15 @@ pub const Reader = struct {
             .@"unquote-splicing" => try self.readUnquote(.@"unquote-splicing", args, srcSpan(s)),
             .deref => try self.readReaderMacro(.deref, args, srcSpan(s)),
             .@"anon-fn" => try self.readAnonFn(args, srcSpan(s)),
-            .discard => self.fail(.unknown_reader_construct, srcSpan(s), "discard at single-form context — must appear inside a forms list"),
             .@"with-meta-raw" => try self.readWithMetaRaw(args, srcSpan(s)),
             .program => self.fail(.unknown_reader_construct, srcSpan(s), "nested (program ...) not allowed"),
         };
     }
 
-    /// Read a `forms` list, skipping `(discard X)` entries per Clojure's
-    /// sequential reader semantics.
-    ///
-    /// Stacked `#_` is subtle. Source `#_ #_ x y z` means "discard x, then
-    /// discard y, keep z" — two source forms consumed. Our LALR grammar
-    /// parses it as `[(discard (discard x)), y, z]`, which bundles `x`
-    /// inside the compound. A naive "drop any discard compound" pass drops
-    /// just the compound, keeping `y` incorrectly. The fix: a discard
-    /// chain of nesting depth N consumed N source forms; exactly one of
-    /// those is captured inside the compound (the innermost non-discard
-    /// payload), so (N−1) additional siblings must also be dropped from
-    /// the current iteration.
     fn readFormsList(self: *Reader, items: []const Sexp) ReaderError![]const *Form {
-        var out: std.ArrayList(*Form) = .empty;
-        var i: usize = 0;
-        while (i < items.len) : (i += 1) {
-            const item = items[i];
-            if (self.isCompoundWithTag(item, .discard)) {
-                const extra_siblings = discardChainDepth(item) - 1;
-                i += extra_siblings;
-                continue;
-            }
-            const f = try self.readForm(item);
-            try out.append(self.allocator(), f);
-        }
-        return try out.toOwnedSlice(self.allocator());
+        const out = try self.allocator().alloc(*Form, items.len);
+        for (items, out) |item, *f| f.* = try self.readForm(item);
+        return out;
     }
 
     // -------------------------------------------------------------------------
@@ -659,24 +635,6 @@ pub const Reader = struct {
 // -----------------------------------------------------------------------------
 // Pure helpers (no Reader state)
 // -----------------------------------------------------------------------------
-
-/// How many nested `(discard ...)` layers wrap this sexp (at least 1 when
-/// called on a discard compound). Equal to the number of source forms the
-/// original `#_` chain consumed.
-fn discardChainDepth(s: Sexp) usize {
-    var depth: usize = 0;
-    var cur = s;
-    while (true) {
-        if (cur != .list) break;
-        const it = cur.list.items();
-        if (it.len < 2 or it[0] != .tag or it[0].tag != .discard) break;
-        const payload = withoutDelimiters(it[1..]);
-        if (payload.len == 0) break;
-        depth += 1;
-        cur = payload[0];
-    }
-    return depth;
-}
 
 /// A compound's children without the delimiter tokens the grammar
 /// keeps at either end (`(` `)`, `[` `]`, `'`, `^`, ...): every real
@@ -1239,10 +1197,8 @@ test "char literal parsing" {
 
 test "discard applies uniformly across aggregator contexts" {
     const allocator = std.testing.allocator;
-    // Discard consumes its next form INCLUDING any attached reader sugar
-    // (metadata, deref, quote, anon-fn). The grammar treats the prefixed
-    // form as a single child, so the reader's drop logic handles this
-    // without special casing.
+    // Discard consumes its next form including any reader sugar attached
+    // to it (metadata, deref, quote, anon-fn): the prefixed form is one form.
     const cases = [_]struct { src: []const u8, expected_len: usize }{
         .{ .src = "#_ ^:m x y", .expected_len = 1 }, // ^:m x is one form
         .{ .src = "#_ @a b", .expected_len = 1 }, // @a is one form
@@ -1279,9 +1235,9 @@ test "discard inside a map affects key/value arity" {
 }
 
 test "stacked discard drops siblings in source order" {
-    // `#_ #_ x y z` must yield `[z]` at top level (drops x and y) per
-    // Clojure's procedural reader semantics. Depth-N discard chain consumes
-    // N source forms.
+    // `#_ #_ x y z` yields `[z]` (drops x and y), as Clojure's reader
+    // does: each `#_` consumes one form, and the form it consumes may
+    // itself begin with `#_`.
     const allocator = std.testing.allocator;
     const cases = [_]struct { src: []const u8, expected_count: usize, first_atom: ?[]const u8 }{
         .{ .src = "#_ x y", .expected_count = 1, .first_atom = "y" },
@@ -1302,6 +1258,50 @@ test "stacked discard drops siblings in source order" {
             try std.testing.expect(forms[0].datum == .symbol);
             try std.testing.expectEqualStrings(name, forms[0].datum.symbol.name);
         }
+    }
+}
+
+/// `src` read as a program, each form printed as the goldens print it.
+fn expectReads(src: []const u8, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    const forms = try rd.readProgram(try p.parseProgram());
+    var al: std.Io.Writer.Allocating = .init(allocator);
+    defer al.deinit();
+    for (forms) |f| {
+        try writeForm(f, &al.writer);
+        try al.writer.writeByte('\n');
+    }
+    try std.testing.expectEqualStrings(expected, al.written());
+}
+
+test "discard: #_ drops the next form wherever a form may stand" {
+    // A prefix reads the form after the discarded one, as Clojure's
+    // reader does.
+    try expectReads("'#_ x y", "(quote (symbol y))\n");
+    try expectReads("@#_ #_ x y z", "(deref (symbol z))\n");
+    try expectReads("^:m #_ x y", "(with-meta\n  (symbol y)\n  (map (keyword :m) (bool true)))\n");
+    try expectReads("^#_ x :m y", "(with-meta\n  (symbol y)\n  (map (keyword :m) (bool true)))\n");
+    try expectReads("(a #_ b) #_ c", "(list (symbol a))\n");
+    try expectReads("#_ x", "");
+    // A discard with no form to discard is a parse error.
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "(+ #_ #_ 1)", "#_", "'#_ x", "[#_]" }) |src| {
+        var p = parser.Parser.init(allocator, src);
+        defer p.deinit();
+        try std.testing.expectError(error.ParseError, p.parseProgram());
+    }
+    // One form, with discards on either side of it.
+    for ([_][]const u8{ "x #_ y", "#_ y x", "#_ #_ a b x #_ c" }) |src| {
+        var p = parser.Parser.init(allocator, src);
+        defer p.deinit();
+        var rd = Reader.init(allocator, src);
+        defer rd.deinit();
+        const f = try rd.readOneForm(try p.parseForm());
+        try std.testing.expectEqualStrings("x", f.datum.symbol.name);
     }
 }
 

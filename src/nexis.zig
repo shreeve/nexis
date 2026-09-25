@@ -41,7 +41,6 @@ pub const Tag = enum(u8) {
 
     // Internal reader-stage tags consumed and rewritten by src/reader.zig
     @"anon-fn",
-    discard,
     @"with-meta-raw",
 };
 

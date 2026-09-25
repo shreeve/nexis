@@ -97,6 +97,8 @@ see. Mirrors PLAN §28.3 exactly.
 | `^sym x` | `(with-meta x {:tag sym})` |
 | `^:a ^:b x` | `(with-meta x {:a true, :b true})` — right-to-left merge; duplicate keys: rightmost wins |
 | `#_ x y` | the `x` form is discarded; only `y` appears in output |
+| `'#_ x y`, `^:m #_ x y` | a prefix reads the form after the discarded one: `(quote y)`, `(with-meta y {:m true})` |
+| `#_ #_ x y z` | each `#_` consumes one form, which may itself begin with `#_`: only `z` remains |
 | `#(body)` | `(#%anon-fn body)` — `%`/`%1`/`%2`/`%&` left as ordinary symbols; resolved by macroexpander |
 | `` `x `` | `(syntax-quote x)` — **no expansion here**; the macroexpander does the Clojure-style rewrite |
 | `{:a 1 :a 2}` | **reader error**: `:duplicate-literal-key` |
@@ -152,8 +154,8 @@ boundaries.
 
 | Stage | Input | Output | Responsibilities |
 |---|---|---|---|
-| **Parser** (`src/parser.zig`, generated) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. No semantic validation beyond grammar. No normalization. |
-| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Discards `#_`. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
+| **Parser** (`src/parser.zig`, generated; scanner `src/nexis.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. Drops `#_` and the form it discards. No semantic validation beyond grammar. No normalization. |
+| **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
 | **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. Passes `&form` and `&env`. |
 | **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var / special form. Errors on unbound. |
 
@@ -242,7 +244,7 @@ range that produced it. Policy:
 
 - **Atoms** carry the span of the token that produced them.
 - **Compounds** carry the span from the opening punctuation (`(`, `[`, `{`,
-  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#_`, `#(`) to the matching close.
+  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`) to the matching close.
 - **Reader-introduced constructs** (`with-meta`, `syntax-quote`, `quote`,
   `#%anon-fn`) cover the full source extent of their origin sugar.
 - `None` appears only for Forms synthesized by macros; the reader never
