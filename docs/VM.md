@@ -726,8 +726,9 @@ once per level of nested input does: reading, expanding and lowering
 forms, equality, hashing and comparison, printing, the codec, pull,
 transaction expansion, query parsing and rule expansion, and every
 native that re-enters the VM through `callValue`. `src/stack.zig`
-guards all of it with one address, the lowest frame address a guarded
-function may run at:
+guards all of it with one address per thread (a `threadlocal`), the
+lowest frame address a guarded function may run at on that thread's
+stack, so a VM created on any thread checks against its own stack:
 
 - `stack.check()` is the first statement of every such function and
   fails with `error.StackOverflow` once the caller's frame lies below

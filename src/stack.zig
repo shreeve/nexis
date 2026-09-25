@@ -8,11 +8,12 @@
 //! budget fails with `error.StackOverflow` instead of faulting
 //! (docs/VM.md §13.1).
 //!
-//! The guard is one address: the lowest frame address a guarded function
-//! may run at. `VM.init` arms it for a default 8 MiB main-thread stack
-//! unless the host armed it first; the CLI runs the runtime on a thread
-//! with a large stack and arms it at that thread's entry. The runtime is
-//! single-threaded, so the address is a plain global.
+//! The guard is one address per thread: the lowest frame address a
+//! guarded function may run at on that thread's stack. `VM.init` arms
+//! it for a default 8 MiB main-thread stack unless the host armed it
+//! first on the same thread; the CLI runs the runtime on a thread with
+//! a large stack and arms it at that thread's entry. A VM runs on one
+//! thread; a host that creates VMs on several threads arms each.
 
 const std = @import("std");
 
@@ -23,8 +24,9 @@ pub const Error = error{StackOverflow};
 /// and for the unguarded leaf calls under the deepest guarded frame.
 pub const main_thread_budget = 6 << 20;
 
-/// Lowest permitted frame address; 0 leaves the guard unarmed.
-var limit: usize = 0;
+/// Lowest permitted frame address on this thread's stack; 0 leaves
+/// the guard unarmed.
+threadlocal var limit: usize = 0;
 
 /// Arm the guard `budget` bytes below the caller's frame.
 pub fn arm(budget: usize) void {
@@ -67,4 +69,18 @@ test "an unarmed guard never fails, and armIfUnarmed keeps an armed limit" {
     const armed = limit;
     armIfUnarmed(1);
     try std.testing.expectEqual(armed, limit);
+}
+
+test "the guard is per thread: a thread the host armed nothing on starts unarmed" {
+    const saved = limit;
+    defer limit = saved;
+    arm(1 << 20);
+    var seen: usize = 1;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(out: *usize) void {
+            out.* = limit;
+        }
+    }.run, .{&seen});
+    thread.join();
+    try std.testing.expectEqual(@as(usize, 0), seen);
 }
