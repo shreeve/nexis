@@ -651,3 +651,271 @@ test "eval: a form's lowering is freed once its routine is compiled" {
         return err;
     };
 }
+
+// =============================================================================
+// Differential: random programs against a reference evaluator
+// =============================================================================
+//
+// Random programs over integer literals, + - * inc, if on <, let*
+// (new names and names that shadow), fn* called in place or bound
+// and called twice (closures over outer names), and a counting loop*
+// whose second binding's recur argument reads both bindings
+// (parallel assignment), sometimes through a closure. Each program
+// is built as a tree, printed as source and evaluated directly; the
+// compiled program must agree. The reference computes in i128 and
+// the VM promotes past the fixnum range, so both print the same
+// decimal.
+
+const diff_prng_seed: u64 = 0x6469_6666_6572_656E; // "differen"
+
+const Expr = union(enum) {
+    lit: i64,
+    ref: u8,
+    arith: struct { op: u8, a: *const Expr, b: *const Expr },
+    inc: *const Expr,
+    if_lt: struct { a: *const Expr, b: *const Expr, then: *const Expr, other: *const Expr },
+    let: struct { name: u8, value: *const Expr, body: *const Expr },
+    /// ((fn* [param] body) arg)
+    apply: struct { param: u8, body: *const Expr, arg: *const Expr },
+    /// (let* [f (fn* [param] body)] (+ (f a1) (f a2)))
+    twice: struct { f: u8, param: u8, body: *const Expr, a1: *const Expr, a2: *const Expr },
+    /// (loop* [i 0 j init] (if (< i k) (recur (inc i) (+ j (* i step))) j)),
+    /// the step inside ((fn* [] step)) when `closure`.
+    loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool },
+};
+
+const Names = struct {
+    items: [24]u8 = undefined,
+    len: usize = 0,
+
+    fn with(self: Names, name: u8) Names {
+        var n = self;
+        n.items[n.len] = name;
+        n.len += 1;
+        return n;
+    }
+
+    fn pick(self: *const Names, rand: std.Random) ?u8 {
+        if (self.len == 0) return null;
+        return self.items[rand.uintLessThan(usize, self.len)];
+    }
+
+    /// A name not in scope, or (sometimes) one to shadow.
+    fn binder(self: *const Names, rand: std.Random) u8 {
+        if (rand.uintLessThan(u8, 3) == 0) {
+            if (self.pick(rand)) |n| return n;
+        }
+        return @intCast(self.len + 30);
+    }
+};
+
+fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*const Expr {
+    const e = try a.create(Expr);
+    if (depth == 0 or rand.uintLessThan(u8, 5) == 0) {
+        if (names.pick(rand)) |n| {
+            if (rand.boolean()) {
+                e.* = .{ .ref = n };
+                return e;
+            }
+        }
+        e.* = .{ .lit = rand.intRangeAtMost(i8, -9, 9) };
+        return e;
+    }
+    const d = depth - 1;
+    e.* = switch (rand.uintLessThan(u8, 9)) {
+        0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
+        2 => .{ .inc = try genExpr(a, rand, names, d) },
+        3 => .{ .if_lt = .{
+            .a = try genExpr(a, rand, names, d),
+            .b = try genExpr(a, rand, names, d),
+            .then = try genExpr(a, rand, names, d),
+            .other = try genExpr(a, rand, names, d),
+        } },
+        4, 5 => blk: {
+            const n = names.binder(rand);
+            break :blk .{ .let = .{ .name = n, .value = try genExpr(a, rand, names, d), .body = try genExpr(a, rand, names.with(n), d) } };
+        },
+        6 => blk: {
+            const p = names.binder(rand);
+            break :blk .{ .apply = .{ .param = p, .body = try genExpr(a, rand, names.with(p), d), .arg = try genExpr(a, rand, names, d) } };
+        },
+        7 => blk: {
+            // `f` is fresh, and never referred to as a number.
+            const f: u8 = @intCast(names.len + 90);
+            const p = names.binder(rand);
+            break :blk .{ .twice = .{
+                .f = f,
+                .param = p,
+                .body = try genExpr(a, rand, names.with(p), d),
+                .a1 = try genExpr(a, rand, names, d),
+                .a2 = try genExpr(a, rand, names, d),
+            } };
+        },
+        else => blk: {
+            const i = names.binder(rand);
+            const j: u8 = @intCast(names.len + 60);
+            break :blk .{
+                .loop = .{
+                    .i = i,
+                    .j = j,
+                    .k = rand.uintLessThan(u8, 4),
+                    // Bindings are sequential: `init` sees `i`.
+                    .init = try genExpr(a, rand, names.with(i), d),
+                    .step = try genExpr(a, rand, names.with(i).with(j), d),
+                    .closure = rand.boolean(),
+                },
+            };
+        },
+    };
+    return e;
+}
+
+fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
+    switch (e.*) {
+        .lit => |n| try w.print("{d}", .{n}),
+        .ref => |n| try w.print("v{d}", .{n}),
+        .arith => |x| {
+            try w.print("({c} ", .{x.op});
+            try printExpr(x.a, w);
+            try w.writeAll(" ");
+            try printExpr(x.b, w);
+            try w.writeAll(")");
+        },
+        .inc => |x| {
+            try w.writeAll("(inc ");
+            try printExpr(x, w);
+            try w.writeAll(")");
+        },
+        .if_lt => |x| {
+            try w.writeAll("(if (< ");
+            try printExpr(x.a, w);
+            try w.writeAll(" ");
+            try printExpr(x.b, w);
+            try w.writeAll(") ");
+            try printExpr(x.then, w);
+            try w.writeAll(" ");
+            try printExpr(x.other, w);
+            try w.writeAll(")");
+        },
+        .let => |x| {
+            try w.print("(let* [v{d} ", .{x.name});
+            try printExpr(x.value, w);
+            try w.writeAll("] ");
+            try printExpr(x.body, w);
+            try w.writeAll(")");
+        },
+        .apply => |x| {
+            try w.print("((fn* [v{d}] ", .{x.param});
+            try printExpr(x.body, w);
+            try w.writeAll(") ");
+            try printExpr(x.arg, w);
+            try w.writeAll(")");
+        },
+        .twice => |x| {
+            try w.print("(let* [v{d} (fn* [v{d}] ", .{ x.f, x.param });
+            try printExpr(x.body, w);
+            try w.print(")] (+ (v{d} ", .{x.f});
+            try printExpr(x.a1, w);
+            try w.print(") (v{d} ", .{x.f});
+            try printExpr(x.a2, w);
+            try w.writeAll(")))");
+        },
+        .loop => |x| {
+            try w.print("(loop* [v{d} 0 v{d} ", .{ x.i, x.j });
+            try printExpr(x.init, w);
+            try w.print("] (if (< v{d} {d}) (recur (inc v{d}) (+ v{d} (* v{d} ", .{ x.i, x.k, x.i, x.j, x.i });
+            if (x.closure) try w.writeAll("((fn* [] ");
+            try printExpr(x.step, w);
+            if (x.closure) try w.writeAll("))");
+            try w.print("))) v{d}))", .{x.j});
+        },
+    }
+}
+
+/// Lexical bindings, innermost last; a closure is the environment it
+/// was made in.
+const RefEnv = struct {
+    names: []const u8 = &.{},
+    values: []const i128 = &.{},
+
+    fn lookup(self: RefEnv, name: u8) i128 {
+        var i = self.names.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.names[i] == name) return self.values[i];
+        }
+        unreachable;
+    }
+
+    fn with(self: RefEnv, a: std.mem.Allocator, name: u8, value: i128) !RefEnv {
+        const names = try a.alloc(u8, self.names.len + 1);
+        const values = try a.alloc(i128, self.values.len + 1);
+        @memcpy(names[0..self.names.len], self.names);
+        @memcpy(values[0..self.values.len], self.values);
+        names[self.names.len] = name;
+        values[self.values.len] = value;
+        return .{ .names = names, .values = values };
+    }
+};
+
+fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
+    return switch (e.*) {
+        .lit => |n| n,
+        .ref => |n| env.lookup(n),
+        .arith => |x| blk: {
+            const l = try evalExpr(a, x.a, env);
+            const r = try evalExpr(a, x.b, env);
+            break :blk switch (x.op) {
+                '+' => l + r,
+                '-' => l - r,
+                else => l * r,
+            };
+        },
+        .inc => |x| try evalExpr(a, x, env) + 1,
+        .if_lt => |x| if (try evalExpr(a, x.a, env) < try evalExpr(a, x.b, env))
+            try evalExpr(a, x.then, env)
+        else
+            try evalExpr(a, x.other, env),
+        .let => |x| try evalExpr(a, x.body, try env.with(a, x.name, try evalExpr(a, x.value, env))),
+        .apply => |x| try evalExpr(a, x.body, try env.with(a, x.param, try evalExpr(a, x.arg, env))),
+        .twice => |x| blk: {
+            // The fn closes over `env`; `f` is fresh, so the
+            // arguments see `env` as it is.
+            const r1 = try evalExpr(a, x.body, try env.with(a, x.param, try evalExpr(a, x.a1, env)));
+            const r2 = try evalExpr(a, x.body, try env.with(a, x.param, try evalExpr(a, x.a2, env)));
+            break :blk r1 + r2;
+        },
+        .loop => |x| blk: {
+            var i: i128 = 0;
+            var j = try evalExpr(a, x.init, try env.with(a, x.i, 0));
+            while (i < x.k) {
+                const step = try evalExpr(a, x.step, try (try env.with(a, x.i, i)).with(a, x.j, j));
+                j = j + i * step;
+                i += 1;
+            }
+            break :blk j;
+        },
+    };
+}
+
+test "prop differential: compiled random programs agree with a reference evaluator" {
+    var prng = std.Random.DefaultPrng.init(diff_prng_seed);
+    const rand = prng.random();
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    for (0..400) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const e = try genExpr(a, rand, .{}, 5);
+        var src: std.Io.Writer.Allocating = .init(a);
+        try printExpr(e, &src.writer);
+        const want = try std.fmt.allocPrint(a, "{d}", .{try evalExpr(a, e, .{})});
+        const got = program.run(src.written()) catch |err| {
+            std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ src.written(), @errorName(err) });
+            return err;
+        };
+        try harness.expectResult(&program, src.written(), got, want);
+    }
+}

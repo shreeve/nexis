@@ -955,7 +955,11 @@ Three layers:
   macros the compiler relies on; source and error for compile and
   run failures — and randomized programs through the full
   pipeline: closure capture at nesting depth up to 10,
-  syntax-quote output structurally equal to hand-built Forms.
+  syntax-quote output structurally equal to hand-built Forms,
+  and random programs over arithmetic, `if`, shadowing `let*`,
+  closures called in place and twice, and counting `loop*`s whose
+  `recur` reads every binding (sometimes through a closure),
+  whose compiled result must equal a reference evaluator's.
 
 #### 9.3 Integration tests
 
