@@ -337,6 +337,9 @@ equality:
 - V1. `fromSlice` + `nth(i)` round-trip byte-exact over 200 random sizes.
 - V2. `conj` preserves the sequence: `fromSlice(&elems)` equals
   `elems.reduce(conj, empty)` by structure and hash.
+- V2b. Random `conj` / `assoc` / `pop` walks against a model, each
+  starting just below a trie boundary (32, 1056, 32800) and crossing
+  it both ways.
 - V3. Cross-kind: 2000 random element sequences produce `=` and
   `hashValue`-equal list and vector Values.
 - V4. Equivalence laws on vectors: reflexive, symmetric, transitive
