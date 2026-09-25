@@ -1330,6 +1330,7 @@ test "a full cache replaces its least recently used unpinned parse and marks wha
         }
     };
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     collector.host = .{ .ctx = @ptrCast(&cache), .roots = &Walk.roots, .trace = &Walk.trace };
     try testing.expect(collector.collect(&.{}) > 0);
     try testing.expect(pinned == try cache.acquire(&interner, queryOf(b, 0), &diag));
