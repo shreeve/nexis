@@ -19,8 +19,8 @@ instructions once the heap has allocated a threshold of bytes since
 the last one (§7). No stack scanning, no generational or concurrent
 phases, no write barriers, no finalizers (§9).
 
-A VM with a borrowed heap (the compile-time sub-VMs of `evalClosure`
-and the `defmacro` evaluation, which allocate on the heap of the VM
+A VM with a borrowed heap (the compile-time sub-VMs the expander runs
+user macros and `defmacro` bodies on, which allocate on the heap of the VM
 whose Vars they use) never collects: it cannot enumerate the owner's
 roots. The collector is also driven directly, over a bare heap with
 explicit roots, by `src/gc.zig`'s inline tests, `test/prop/gc.zig`

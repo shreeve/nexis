@@ -1388,7 +1388,7 @@ pub const VM = struct {
     /// so programs that never construct a value pay nothing.
     heap: ?heap_mod.Heap = null,
     /// A heap this VM allocates on instead of its own: the
-    /// compile-time sub-VMs (`evalClosure`, the `defmacro`
+    /// compile-time sub-VMs (the expander's macro calls, the `defmacro`
     /// evaluation) share the heap of the VM whose Vars they read
     /// and write, so a value a macro stores into a Var outlives the
     /// sub-VM. Not owned; never freed here. A VM with a borrowed
@@ -2053,43 +2053,6 @@ pub const VM = struct {
         return @constCast(body.upvalues);
     }
 
-    /// Invoke `closure_v` with `args` in a fresh sub-VM, `out_vm`,
-    /// returning the result. The expander evaluates a macro this
-    /// way: a sub-VM needs no save and restore of the calling VM's
-    /// frames, handlers and finally stack. The closure's routine
-    /// carries its `var_table` (pointers into the caller's
-    /// namespaces) and its literal pool, so the sub-VM needs no
-    /// namespace of its own; `interner`, when given, is shared so the
-    /// ids in the arguments resolve.
-    ///
-    /// **Heap**: with `shared_heap` given, the sub-VM allocates on it
-    /// (the calling VM's heap), so whatever the macro stores into a
-    /// Var stays valid after the sub-VM is gone; without one the
-    /// sub-VM's own heap holds its values until `deinit`. A sub-VM
-    /// never collects: the values it reads through Vars and
-    /// arguments live on heaps whose roots it cannot enumerate.
-    ///
-    /// **Lifetime**: on success the caller owns `out_vm` and must
-    /// convert the result out of the sub-VM's heap (when none was
-    /// shared) before calling its `deinit`. On failure `out_vm` is
-    /// already released.
-    pub fn evalClosure(
-        allocator: std.mem.Allocator,
-        closure_v: Value,
-        args: []const Value,
-        out_vm: *VM,
-        interner: ?*intern_mod.Interner,
-        shared_heap: ?*heap_mod.Heap,
-    ) !Value {
-        if (closure_v.kind() != .function) return error.NotCallable;
-        out_vm.* = try VM.init(allocator, &idle_routine);
-        errdefer out_vm.deinit();
-        out_vm.borrowed_interner = interner;
-        out_vm.borrowed_heap = shared_heap;
-        out_vm.gc_enabled = false;
-        return out_vm.callValue(closure_v, args);
-    }
-
     /// Call `callee` with `args` from host code running inside the
     /// VM: how natives (`map`, `reduce`, `apply`, `swap!`, ...) call
     /// the functions they are given. Any callable works: a closure,
@@ -2184,7 +2147,7 @@ pub const VM = struct {
 
     /// Enter `callee`, a closure whose `argc` arguments sit in
     /// `stack[base..base + argc]`, the one entry path for `call:call`,
-    /// `callValue` and `evalClosure`: check the arity and the
+    /// `callValue`: check the arity and the
     /// routine's shape, grow the stack over the callee's window, pack
     /// the arguments past the fixed ones into the rest list (nil when
     /// there are none, as in Clojure), nil every other slot the window

@@ -591,9 +591,7 @@ callable from Zig (used by `map`, `reduce`, `swap!`, `apply`, ...):
 a closure by copying the arguments to the top of the stack, entering
 it exactly as `call:call` does and running the VM to its return; a
 native, a protocol fn or a lookup by calling it directly with its
-arguments rooted. `call:call`, `callValue` and `VM.evalClosure`
-(which runs a closure in a fresh sub-VM; the macroexpander uses it
-for `defmacro` bodies) share one closure entry and one direct call,
+arguments rooted. `call:call` and `callValue` share one closure entry and one direct call,
 so a protocol fn passed to `map` or `apply` behaves as it does in
 call position.
 
@@ -748,7 +746,7 @@ inside one instruction needs no rooting; a native that keeps a
 callback's result across a further call back into the VM roots it
 on a `VM.RootScope`, and `callValue` roots a native callee's
 arguments for the call (`docs/GC.md` §3, §11.5). A VM over a
-borrowed heap (`evalClosure`, the `defmacro` evaluation) has
+borrowed heap (the expander's macro sub-VMs) has
 `gc_enabled = false` and never collects. `VM.collectGarbage` runs
 one cycle from a safe point and sizes the next window; `gc_cycles`
 counts them.
