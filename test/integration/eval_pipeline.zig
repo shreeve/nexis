@@ -1296,6 +1296,7 @@ test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, s
 
 test "integration: core.nx maps: update-vals, update-keys; atoms: reset-vals!, volatile!" {
     try expectOutput("[(update-vals {:a 1 :b 2} inc) (update-keys {1 :a} str)]", "[{:a 2, :b 3} {1 :a}]");
+    try expectOutputProgram("(defrecord R [x]) [(meta (update-vals (with-meta {:a 1} {:m 1}) inc)) (meta (update-keys (with-meta {1 :a} {:m 2}) str)) (update-vals (->R 1) inc) (update-vals {} inc)]", "[{:m 1} {:m 2} {:x 2} {}]");
     try expectOutput("(let [a (atom 1)] [(reset-vals! a 2) @a])", "[[1 2] 2]");
     try expectOutput("(let [v (volatile! 1)] [(vswap! v + 2) (vreset! v 9) @v (volatile? v)])", "[3 9 9 true]");
 }
