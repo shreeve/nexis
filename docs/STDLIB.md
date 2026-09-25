@@ -103,7 +103,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part | `:kind-mismatch` |
+| `int`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int` only Java's 32-bit `int` range, as Clojure's cast checks | `:kind-mismatch`, `:invalid-argument` (NaN, an infinity; for `int`, out of range) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |

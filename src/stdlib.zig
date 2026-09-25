@@ -185,7 +185,7 @@ const core_natives = table("", .{
     .{ "inc", 1, 1, &fnInc },
     .{ "dec", 1, 1, &fnDec },
     .{ "long", 1, 1, &fnLong },
-    .{ "int", 1, 1, &fnLong },
+    .{ "int", 1, 1, &fnInt },
     .{ "char", 1, 1, &fnChar },
     .{ "parse-long", 1, 1, &fnParseLong },
     .{ "parse-double", 1, 1, &fnParseDouble },
@@ -874,11 +874,22 @@ fn fnDec(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-/// `(long x)` / `(int x)`: a number as an integer, a float by its
-/// integer part, a char as its code point.
+/// `(long x)`: a number as an integer of any size, a float by its
+/// integer part, a char as its code point (SEMANTICS.md §2.2).
 fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .char) return value_mod.fromFixnum(args[0].asChar()).?;
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
+}
+
+/// `(int x)`: as `long`, within Java's 32-bit `int` range, else
+/// `:invalid-argument`, as Clojure's cast checks.
+fn fnInt(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const min = std.math.minInt(i32);
+    const max = std.math.maxInt(i32);
+    if (x.isFloat() and !(x.asFloat() >= min and x.asFloat() <= max)) return VmError.InvalidArgument;
+    const r = try fnLong(vm, args);
+    return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
 }
 
 /// `(char n)`: the char with code point `n`; a char is itself. A

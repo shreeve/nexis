@@ -647,10 +647,12 @@
 (defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
 (defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
 (defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
-(defn int? [x] (integer? x))
-(defn pos-int? [x] (and (integer? x) (pos? x)))
-(defn nat-int? [x] (and (integer? x) (not (neg? x))))
-(defn neg-int? [x] (and (integer? x) (neg? x)))
+; int? and its kin: an integer in Java's long range, as Clojure's are
+; true of a Long and not a BigInt.
+(defn int? [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
+(defn pos-int? [x] (and (int? x) (pos? x)))
+(defn nat-int? [x] (and (int? x) (not (neg? x))))
+(defn neg-int? [x] (and (int? x) (neg? x)))
 (defn double? [x] (float? x))
 (defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
 (defn counted? [x] (or (coll? x) (typed-vector? x)))
