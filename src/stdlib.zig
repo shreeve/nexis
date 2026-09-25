@@ -147,6 +147,11 @@ const core_natives = table("", .{
     .{ "cons", 2, 2, &fnCons },
     .{ "first", 1, 1, &fnFirst },
     .{ "rest", 1, 1, &fnRest },
+    .{ "second", 1, 1, &fnSecond },
+    .{ "third", 1, 1, &fnThird },
+    .{ "take", 2, 2, &fnTake },
+    .{ "some", 2, 2, &fnSome },
+    .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
     .{ "nth", 2, 3, &fnNth },
     .{ "empty?", 1, 1, &fnEmptyQ },
@@ -507,6 +512,56 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
             break :blk try buildListFromSlice(vm, items.items[1..]);
         },
     };
+}
+
+/// The element at position `i` of any seqable, nil past its end;
+/// walks only as far as `i`.
+fn nthOfSeq(vm: *VM, coll: Value, i: usize) VmError!Value {
+    var it = try makeSeqIter(vm, coll);
+    for (0..i) |_| _ = (try it.next()) orelse return value_mod.nilValue();
+    return (try it.next()) orelse value_mod.nilValue();
+}
+
+fn fnSecond(vm: *VM, args: []const Value) VmError!Value {
+    return nthOfSeq(vm, args[0], 1);
+}
+
+fn fnThird(vm: *VM, args: []const Value) VmError!Value {
+    return nthOfSeq(vm, args[0], 2);
+}
+
+/// `(take n coll)` → a list of the first `n` elements, all of them
+/// when there are fewer; walks no further than `n`.
+fn fnTake(vm: *VM, args: []const Value) VmError!Value {
+    const n = try requireCount(args[0]);
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    var it = try makeSeqIter(vm, args[1]);
+    while (items.items.len < n) {
+        const x = (try it.next()) orelse break;
+        items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `(some pred coll)` → the first truthy `(pred x)`, else nil;
+/// `(every? pred coll)` → whether `(pred x)` is truthy for every x.
+/// Both stop at the first element that decides.
+fn fnSome(vm: *VM, args: []const Value) VmError!Value {
+    var it = try makeSeqIter(vm, args[1]);
+    while (try it.next()) |x| {
+        const r = try vm.callValue(args[0], &.{x});
+        if (r.isTruthy()) return r;
+    }
+    return value_mod.nilValue();
+}
+
+fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
+    var it = try makeSeqIter(vm, args[1]);
+    while (try it.next()) |x| {
+        if (!(try vm.callValue(args[0], &.{x})).isTruthy()) return value_mod.fromBool(false);
+    }
+    return value_mod.fromBool(true);
 }
 
 /// `(next s)` → `(seq (rest s))`: nil when nothing follows.

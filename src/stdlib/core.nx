@@ -13,9 +13,11 @@
 (defn true?  [x] (= x true))
 (defn false? [x] (= x false))
 
-; second / nthrest / last — basic seq access.
-(defn second [s] (first (rest s)))
-(defn third  [s] (first (rest (rest s))))
+; second, third, take, some and every? are natives that walk no
+; further than they must.
+(defn ffirst [x] (first (first x)))
+(defn fnext [x] (second x))
+(defn nnext [x] (next (next x)))
 
 (defn last [s]
   ; Walk by reducing; the reduce fn keeps only the latest x.
@@ -29,17 +31,12 @@
   ; reduce + cons builds the list in reverse order naturally.
   (reduce (fn* [acc x] (cons x acc)) (list) s))
 
-(defn take [n s]
-  ; Return up to n elements of s as a list.
-  (loop* [i 0 rem s acc (list)]
-    (if (< i n)
-      (if (empty? rem)
-        (reverse acc)
-        (recur (inc i) (rest rem) (cons (first rem) acc)))
-      (reverse acc))))
-
 (defn drop [n s]
   (nthrest s n))
+
+; (nthnext coll n) → the elements after the first n, nil when none.
+(defn nthnext [coll n]
+  (seq (nthrest coll n)))
 
 ; ============================================================
 ; Conditional macros
@@ -272,28 +269,10 @@
 
 ; ---- short-circuiting predicates over sequences ----
 
-; (every? pred coll) → true iff pred is truthy for every elt.
-; Empty coll → true (vacuous). Stops on first falsy result.
-(defn every? [pred coll]
-  (loop* [s coll]
-    (if (empty? s)
-      true
-      (if (pred (first s))
-        (recur (rest s))
-        false))))
-
 ; (not-every? pred coll) → true iff pred is falsy for at
 ; least one elt. (Inverse of every?.)
 (defn not-every? [pred coll]
   (not (every? pred coll)))
-
-; (some pred coll) → first truthy (pred x) result, or nil.
-(defn some [pred coll]
-  (loop* [s coll]
-    (if (empty? s)
-      nil
-      (let* [r (pred (first s))]
-        (if r r (recur (rest s)))))))
 
 ; (not-any? pred coll) → true iff pred is falsy for all elts.
 (defn not-any? [pred coll]
