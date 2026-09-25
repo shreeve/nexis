@@ -3,11 +3,11 @@
 // =============================================================================
 //
 // Host-Zig functions exposed as first-class `Value`s of kind
-// `.native_fn`. Each has a static `NativeFn` descriptor (no heap
-// allocation, immortal) that the install functions bind as Vars
-// in `nexis.core`, `db`, `nexis.string`, `nexis.internal` and
-// `nextomic` at VM startup. The rest of nexis.core is written in
-// nexis itself (`stdlib/core.nx`, embedded below) on top of these.
+// `.native_fn`, one table per namespace (`core_natives`,
+// `db_natives`, `string_natives`, `math_natives`, `internal_natives`,
+// `simd_natives`; Nextomic's are in src/nextomic/natives.zig). The
+// rest of the library is written in nexis (`src/stdlib/*.nx`,
+// embedded below) on top of these.
 //
 // Every native declares its arity in its descriptor and the VM
 // enforces it; a native never indexes `args` past its declared
@@ -55,45 +55,50 @@ const VmError = vm_mod.VmError;
 // =============================================================================
 // Installation
 // =============================================================================
+//
+// One table per namespace: each native's name, arity and function,
+// once. `table` turns it into static descriptors (immortal, so a
+// `.native_fn` Value can point at one); a descriptor outside
+// nexis.core is named `ns/name` for traces and printing.
 
-/// Install the core natives into `ns`. Idempotent: re-installing
-/// replaces the root without disturbing the Var's `.macro` flag.
-///
-/// Native fn NAMES are string literals (`.rodata`, immortal),
-/// so the Namespace's existing `intern(name)` overload (which
-/// borrows the name slice into the Var) is safe — no separate
-/// name allocator needed.
-pub fn installCore(ns: *Namespace) !void {
-    for (core_fns) |entry| {
-        const v = try ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
+fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]NativeFn {
+    var out: [entries.len]NativeFn = undefined;
+    inline for (entries, 0..) |e, i| out[i] = .{
+        .name = if (ns.len == 0) e[0] else ns ++ "/" ++ e[0],
+        .min_arity = e[1],
+        .max_arity = e[2],
+        .call = e[3],
+    };
+    return out;
+}
+
+/// Bind every native of `natives` as a Var of `ns` under its name
+/// without the namespace prefix. Re-installing replaces the root and
+/// leaves the Var's flags alone.
+fn installTable(ns: *Namespace, natives: []const NativeFn) !void {
+    for (natives) |*d| {
+        const qualified = ns.name.len > 0 and d.name.len > ns.name.len and d.name[ns.name.len] == '/' and std.mem.startsWith(u8, d.name, ns.name);
+        const bare = if (qualified)
+            d.name[ns.name.len + 1 ..]
+        else
+            d.name;
+        const v = try ns.intern(bare);
+        v.root = vm_mod.nativeFnValue(d);
         v.bound = true;
-        // Native fns are NOT macros (Var.macro stays false).
-    }
-    // The `nexis.simd` kernels (docs/TYPED_VECTOR.md §7.2) install
-    // beside core into the registry that owns `ns`; a Namespace
-    // without a registry (the single-namespace test form) has no
-    // sibling namespaces to install into.
-    if (ns.registry) |registry| {
-        const simd_ns = try registry.getOrCreate("nexis.simd", ns);
-        for (simd_fns) |entry| {
-            const v = try simd_ns.intern(entry.name);
-            v.root = vm_mod.nativeFnValue(entry.descriptor);
-            v.bound = true;
-        }
     }
 }
 
-/// Install db primitives into the `db` namespace
-/// so `(db/open path)` resolves through the registry's
-/// qualified-symbol path. CLI calls this AFTER `installCore`
-/// + after the registry has a "db" namespace registered.
+/// Install the nexis.core natives into `ns`, and the `nexis.simd`
+/// kernels (docs/TYPED_VECTOR.md §7.2) into the registry that owns
+/// `ns`, if any.
+pub fn installCore(ns: *Namespace) !void {
+    try installTable(ns, &core_natives);
+    if (ns.registry) |registry| try installTable(try registry.getOrCreate("nexis.simd", ns), &simd_natives);
+}
+
+/// `db/*`: durable refs and explicit transactions (docs/DB.md).
 pub fn installDb(db_ns: *Namespace) !void {
-    for (db_fns) |entry| {
-        const v = try db_ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
-        v.bound = true;
-    }
+    try installTable(db_ns, &db_natives);
 }
 
 /// Install the `nextomic/*` natives (docs/NEXTOMIC.md §6) into the
@@ -102,117 +107,295 @@ pub fn installNextomic(nextomic_ns: *Namespace) !void {
     try nextomic_mod.natives.install(nextomic_ns);
 }
 
-/// Install `nexis.string/*` into the `nexis.string` namespace. Not
-/// auto-referred (like Clojure's `clojure.string`): users call
-/// `(nexis.string/lower-case ...)`. Installed before core.nx is
-/// bootstrapped so composite definitions may refer to it.
+/// `nexis.string/*`: not auto-referred, like Clojure's
+/// `clojure.string`. Installed before core.nx is bootstrapped so
+/// composite definitions may refer to it.
 pub fn installString(string_ns: *Namespace) !void {
-    for (string_fns) |entry| {
-        const v = try string_ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
-        v.bound = true;
-    }
+    try installTable(string_ns, &string_natives);
 }
 
-/// Install `nexis.math/*` (docs/TOOLING.md §4) into the `nexis.math`
-/// namespace; `MATH_NX_SOURCE` adds the constants. Not auto-referred.
+/// `nexis.math/*` (docs/TOOLING.md §4); `MATH_NX_SOURCE` adds the
+/// constants.
 pub fn installMath(math_ns: *Namespace) !void {
-    for (math_fns) |entry| {
-        const v = try math_ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
-        v.bound = true;
-    }
+    try installTable(math_ns, &math_natives);
 }
 
-/// Install the `#%`-prefixed helpers into the `nexis.internal`
-/// namespace. Not auto-referred: the `defrecord`/`defprotocol`
-/// macros emit qualified calls (`nexis.internal/#%register-record-type`
-/// etc.); user code does not call these directly.
+/// The `#%` helpers the `defrecord`, `defprotocol`, `try` and
+/// destructuring expansions call qualified; not for user code.
 pub fn installInternal(internal_ns: *Namespace) !void {
-    for (internal_fns) |entry| {
-        const v = try internal_ns.intern(entry.name);
-        v.root = vm_mod.nativeFnValue(entry.descriptor);
-        v.bound = true;
-    }
+    try installTable(internal_ns, &internal_natives);
 }
 
-const db_fns = [_]CoreEntry{
+const core_natives = table("", .{
+    // Sequence primitives.
+    .{ "list", 0, null, &fnList },
+    .{ "list*", 1, null, &fnListStar },
+    .{ "cons", 2, 2, &fnCons },
+    .{ "first", 1, 1, &fnFirst },
+    .{ "rest", 1, 1, &fnRest },
+    .{ "count", 1, 1, &fnCount },
+    .{ "nth", 2, 3, &fnNth },
+    .{ "empty?", 1, 1, &fnEmptyQ },
+    .{ "identity", 1, 1, &fnIdentity },
+    .{ "nil?", 1, 1, &fnNilQ },
+    .{ "some?", 1, 1, &fnSomeQ },
+    // First-class arithmetic + comparison Vars.
+    // Required so `(reduce + 0 xs)` resolves `+` as a Var.
+    // `(+ x y)` at the call head is still inlined by the
+    // compiler; the Var is only reached through non-head uses.
+    .{ "+", 0, null, &fnAdd },
+    .{ "-", 1, null, &fnSub },
+    .{ "*", 0, null, &fnMul },
+    .{ "/", 1, null, &fnDiv },
+    .{ "quot", 2, 2, &fnQuot },
+    .{ "rem", 2, 2, &fnRem },
+    .{ "mod", 2, 2, &fnMod },
+    .{ "<", 0, null, &fnLt },
+    .{ "<=", 0, null, &fnLte },
+    .{ ">", 0, null, &fnGt },
+    .{ ">=", 0, null, &fnGte },
+    .{ "==", 0, null, &fnNumEq },
+    .{ "=", 0, null, &fnEq },
+    .{ "not=", 1, null, &fnNotEq },
+    .{ "inc", 1, 1, &fnInc },
+    .{ "dec", 1, 1, &fnDec },
+    .{ "long", 1, 1, &fnLong },
+    .{ "double", 1, 1, &fnDouble },
+    .{ "max", 1, null, &fnMax },
+    .{ "min", 1, null, &fnMin },
+    .{ "abs", 1, 1, &fnAbs },
+    .{ "number?", 1, 1, &fnNumberQ },
+    .{ "integer?", 1, 1, &fnIntegerQ },
+    .{ "float?", 1, 1, &fnFloatQ },
+    .{ "NaN?", 1, 1, &fnNanQ },
+    .{ "infinite?", 1, 1, &fnInfiniteQ },
+    .{ "not", 1, 1, &fnNot },
+    .{ "zero?", 1, 1, &fnZeroQ },
+    .{ "pos?", 1, 1, &fnPosQ },
+    .{ "neg?", 1, 1, &fnNegQ },
+    .{ "odd?", 1, 1, &fnOddQ },
+    .{ "even?", 1, 1, &fnEvenQ },
+    // apply + HOFs.
+    .{ "apply", 2, null, &fnApply },
+    .{ "map", 2, null, &fnMap },
+    .{ "reduce", 2, 3, &fnReduce },
+    .{ "reduce-kv", 3, 3, &fnReduceKv },
+    .{ "filter", 2, 2, &fnFilter },
+    .{ "remove", 2, 2, &fnRemove },
+    .{ "keep", 2, 2, &fnKeep },
+    .{ "seq", 1, 1, &fnSeq },
+    .{ "next", 1, 1, &fnNext },
+    .{ "range", 1, 3, &fnRange },
+    .{ "concat", 0, null, &fnConcat },
+    .{ "mapcat", 2, null, &fnMapcat },
+    .{ "into", 2, 2, &fnInto },
+    .{ "mapv", 2, null, &fnMapv },
+    .{ "filterv", 2, 2, &fnFilterv },
+    .{ "map-indexed", 2, 2, &fnMapIndexed },
+    .{ "keep-indexed", 2, 2, &fnKeepIndexed },
+    .{ "distinct", 1, 1, &fnDistinct },
+    .{ "partition", 2, 4, &fnPartition },
+    .{ "partition-all", 2, 3, &fnPartitionAll },
+    .{ "interleave", 0, null, &fnInterleave },
+    .{ "zipmap", 2, 2, &fnZipmap },
+    .{ "take-while", 2, 2, &fnTakeWhile },
+    .{ "drop-while", 2, 2, &fnDropWhile },
+    .{ "butlast", 1, 1, &fnButlast },
+    .{ "nthrest", 2, 2, &fnNthrest },
+    .{ "split-at", 2, 2, &fnSplitAt },
+    .{ "take-last", 2, 2, &fnTakeLast },
+    .{ "drop-last", 2, 2, &fnDropLast },
+    .{ "flatten", 1, 1, &fnFlatten },
+    .{ "reductions", 2, 3, &fnReductions },
+    .{ "repeat", 2, 2, &fnRepeat },
+    .{ "repeatedly", 2, 2, &fnRepeatedly },
+    .{ "iterate", 3, 3, &fnIterate },
+    .{ "max-key", 2, null, &fnMaxKey },
+    .{ "min-key", 2, null, &fnMinKey },
+    .{ "select-keys", 2, 2, &fnSelectKeys },
+    .{ "find", 2, 2, &fnFind },
+    .{ "key", 1, 1, &fnKey },
+    .{ "val", 1, 1, &fnVal },
+    .{ "peek", 1, 1, &fnPeek },
+    .{ "pop", 1, 1, &fnPop },
+    .{ "empty", 1, 1, &fnEmpty },
+    .{ "not-empty", 1, 1, &fnNotEmpty },
+    .{ "disj", 1, null, &fnDisj },
+    .{ "compare", 2, 2, &fnCompare },
+    .{ "sort", 1, 2, &fnSort },
+    .{ "sort-by", 2, 3, &fnSortBy },
+    .{ "hash", 1, 1, &fnHash },
+    .{ "name", 1, 1, &fnName },
+    .{ "namespace", 1, 1, &fnNamespace },
+    .{ "keyword", 1, 2, &fnKeyword },
+    .{ "symbol", 1, 2, &fnSymbol },
+    .{ "gensym", 0, 1, &fnGensym },
+    // Exceptions as maps (PLAN Amendment Log, exceptions are values).
+    .{ "ex-info", 2, 3, &fnExInfo },
+    .{ "ex-data", 1, 1, &fnExData },
+    .{ "ex-message", 1, 1, &fnExMessage },
+    // Early exit from a fold.
+    .{ "reduced", 1, 1, &fnReduced },
+    .{ "reduced?", 1, 1, &fnReducedQ },
+    // The compiler at run time.
+    .{ "macroexpand-1", 1, 1, &fnMacroexpand1 },
+    .{ "macroexpand", 1, 1, &fnMacroexpand },
+    .{ "read-string", 1, 1, &fnReadString },
+    .{ "eval", 1, 1, &fnEval },
+    // Metadata (PLAN §8.5).
+    .{ "meta", 1, 1, &fnMeta },
+    .{ "with-meta", 2, 2, &fnWithMeta },
+    .{ "reset-meta!", 2, 2, &fnResetMeta },
+    .{ "alter-meta!", 2, null, &fnAlterMeta },
+    // Dynamic bindings (VM.md §6.5); `binding` and `set!` in
+    // core.nx expand to these.
+    .{ "push-thread-bindings", 1, 1, &fnPushThreadBindings },
+    .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings },
+    .{ "var-set", 2, 2, &fnVarSet },
+    .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
+    .{ "boolean", 1, 1, &fnBoolean },
+    .{ "list?", 1, 1, kindPredicate(isList) },
+    .{ "seq?", 1, 1, kindPredicate(isList) },
+    .{ "vector?", 1, 1, kindPredicate(isVector) },
+    .{ "map?", 1, 1, kindPredicate(isMap) },
+    .{ "set?", 1, 1, kindPredicate(isSet) },
+    .{ "keyword?", 1, 1, kindPredicate(isKeyword) },
+    .{ "symbol?", 1, 1, kindPredicate(isSymbol) },
+    .{ "char?", 1, 1, kindPredicate(isChar) },
+    .{ "boolean?", 1, 1, kindPredicate(isBoolean) },
+    .{ "coll?", 1, 1, kindPredicate(isColl) },
+    .{ "sequential?", 1, 1, kindPredicate(isSequential) },
+    .{ "associative?", 1, 1, kindPredicate(isAssociative) },
+    .{ "fn?", 1, 1, kindPredicate(isFn) },
+    .{ "ifn?", 1, 1, kindPredicate(isIfn) },
+    // Collection construction + access.
+    .{ "vector", 0, null, &fnVector },
+    .{ "vec", 1, 1, &fnVec },
+    .{ "hash-map", 0, null, &fnHashMap },
+    .{ "hash-set", 0, null, &fnHashSet },
+    .{ "set", 1, 1, &fnSet },
+    .{ "subvec", 2, 3, &fnSubvec },
+    .{ "identical?", 2, 2, &fnIdenticalQ },
+    .{ "assoc", 3, null, &fnAssoc },
+    .{ "dissoc", 1, null, &fnDissoc },
+    .{ "get", 2, 3, &fnGet },
+    .{ "contains?", 2, 2, &fnContainsQ },
+    .{ "keys", 1, 1, &fnKeys },
+    .{ "vals", 1, 1, &fnVals },
+    .{ "conj", 1, null, &fnConj },
+    // Typed vectors (docs/TYPED_VECTOR.md §7.1).
+    .{ "i64-vector", 1, 1, &fnI64Vector },
+    .{ "f64-vector", 1, 1, &fnF64Vector },
+    .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector) },
+    .{ "typed-vector-type", 1, 1, &fnTypedVectorType },
+    // Atom primitives.
+    // Identity-valued in-memory mutable cells. `deref` is
+    // installed above (`&native_db_deref` aliased in
+    // db_fns; we also expose it as bare `deref` here so
+    // `(deref atom-or-var-or-durable-ref)` resolves without the
+    // `db/` prefix). See `docs/ATOM.md`.
+    .{ "deref", 1, 1, &fnDbDeref },
+    .{ "atom", 1, 1, &fnAtom },
+    .{ "atom?", 1, 1, &fnAtomQ },
+    .{ "reset!", 2, 2, &fnResetBang },
+    .{ "swap!", 2, null, &fnSwapBang },
+    .{ "swap-vals!", 2, null, &fnSwapValsBang },
+    .{ "compare-and-set!", 3, 3, &fnCompareAndSetBang },
+    // satisfies? predicate.
+    .{ "satisfies?", 2, 2, &fnSatisfiesQ },
+    // Core string ops. Indexing semantics are by Unicode scalar
+    // (codepoint), NOT byte; see `docs/STRING.md` §7.
+    .{ "str", 0, null, &fnStr },
+    .{ "string?", 1, 1, &fnStringQ },
+    .{ "subs", 2, 3, &fnSubs },
+    // Printing + I/O.
+    .{ "print", 0, null, &fnPrint },
+    .{ "println", 0, null, &fnPrintln },
+    .{ "prn", 0, null, &fnPrn },
+    .{ "pr-str", 0, null, &fnPrStr },
+    .{ "slurp", 1, 1, &fnSlurp },
+    .{ "spit", 2, 2, &fnSpit },
+    // db primitives live in the `db` namespace
+    // (installed separately via `installDb`) so they appear as
+    // qualified `(db/open ...)` calls.
+});
+
+const db_natives = table("db", .{
     // Connection + ref + auto-ephemeral primitives.
-    .{ .name = "open", .descriptor = &native_db_open },
-    .{ .name = "close", .descriptor = &native_db_close },
-    .{ .name = "ref", .descriptor = &native_db_ref },
-    .{ .name = "ref?", .descriptor = &native_db_ref_q },
-    .{ .name = "put-key!", .descriptor = &native_db_put_key },
-    .{ .name = "get-key", .descriptor = &native_db_get_key },
-    .{ .name = "delete-key!", .descriptor = &native_db_delete_key },
-    .{ .name = "present?", .descriptor = &native_db_present_q },
+    .{ "open", 1, 1, &fnDbOpen },
+    .{ "close", 1, 1, &fnDbClose },
+    .{ "ref", 3, 3, &fnDbRef },
+    .{ "ref?", 1, 1, &fnDbRefQ },
+    .{ "put-key!", 2, 2, &fnDbPutKey },
+    .{ "get-key", 1, 2, &fnDbGetKey },
+    .{ "delete-key!", 1, 1, &fnDbDeleteKey },
+    .{ "present?", 1, 1, &fnDbPresentQ },
     // Explicit-tx primitives.
-    .{ .name = "begin-write", .descriptor = &native_db_begin_write },
-    .{ .name = "begin-read", .descriptor = &native_db_begin_read },
-    .{ .name = "commit!", .descriptor = &native_db_commit },
-    .{ .name = "abort-write!", .descriptor = &native_db_abort_write },
-    .{ .name = "abort-read!", .descriptor = &native_db_abort_read },
-    .{ .name = "put!", .descriptor = &native_db_put },
-    .{ .name = "get", .descriptor = &native_db_get },
-    .{ .name = "delete!", .descriptor = &native_db_delete },
+    .{ "begin-write", 1, 1, &fnDbBeginWrite },
+    .{ "begin-read", 1, 1, &fnDbBeginRead },
+    .{ "commit!", 1, 1, &fnDbCommit },
+    .{ "abort-write!", 1, 1, &fnDbAbortWrite },
+    .{ "abort-read!", 1, 1, &fnDbAbortRead },
+    .{ "put!", 3, 3, &fnDbPut },
+    .{ "get", 2, 3, &fnDbGet },
+    .{ "delete!", 2, 2, &fnDbDelete },
     // Deref + alter.
-    .{ .name = "deref", .descriptor = &native_db_deref },
-    .{ .name = "alter!", .descriptor = &native_db_alter },
+    .{ "deref", 1, 1, &fnDbDeref },
+    .{ "alter!", 3, null, &fnDbAlter },
     // Tree traversal.
-    .{ .name = "scan", .descriptor = &native_db_scan },
-    .{ .name = "reduce-tree", .descriptor = &native_db_reduce_tree },
+    .{ "scan", 2, 4, &fnDbScan },
+    .{ "reduce-tree", 4, 4, &fnDbReduceTree },
     // Snapshot aliases (PLAN.md §15.7 vocabulary).
-    .{ .name = "snapshot", .descriptor = &native_db_snapshot },
-    .{ .name = "release-snapshot!", .descriptor = &native_db_release_snapshot },
-    .{ .name = "snapshot?", .descriptor = &native_db_snapshot_q },
-};
+    .{ "snapshot", 1, 1, &fnDbBeginRead },
+    .{ "release-snapshot!", 1, 1, &fnDbAbortRead },
+    .{ "snapshot?", 1, 1, &fnDbSnapshotQ },
+});
 
-/// `nexis.string` namespace entries.
-/// Installed into `registry.string` via `installString`. NOT
-/// auto-referred — users call qualified `nexis.string/lower-case`.
-const string_fns = [_]CoreEntry{
-    .{ .name = "lower-case", .descriptor = &native_string_lower_case },
-    .{ .name = "upper-case", .descriptor = &native_string_upper_case },
-    .{ .name = "trim", .descriptor = &native_string_trim },
-    .{ .name = "split", .descriptor = &native_string_split },
-    .{ .name = "join", .descriptor = &native_string_join },
-    .{ .name = "replace", .descriptor = &native_string_replace },
-};
+const string_natives = table("nexis.string", .{
+    .{ "lower-case", 1, 1, &fnStringLowerCase },
+    .{ "upper-case", 1, 1, &fnStringUpperCase },
+    .{ "trim", 1, 1, &fnStringTrim },
+    .{ "split", 2, 2, &fnStringSplit },
+    .{ "join", 1, 2, &fnStringJoin },
+    .{ "replace", 3, 3, &fnStringReplace },
+});
 
-/// `nexis.internal` namespace entries. Installed via
-/// `installInternal`. NOT auto-referred; macros emit qualified
-/// calls.
-const internal_fns = [_]CoreEntry{
+const math_natives = table("nexis.math", .{
+    .{ "sqrt", 1, 1, &fnMathSqrt },
+    .{ "pow", 2, 2, &fnMathPow },
+    .{ "floor", 1, 1, &fnMathFloor },
+    .{ "ceil", 1, 1, &fnMathCeil },
+    .{ "round", 1, 1, &fnMathRound },
+});
+
+const internal_natives = table("nexis.internal", .{
     // Records.
-    .{ .name = "#%register-record-type", .descriptor = &native_register_record_type },
-    .{ .name = "#%make-record", .descriptor = &native_make_record },
-    .{ .name = "#%record?", .descriptor = &native_record_q },
-    .{ .name = "#%record-type-id", .descriptor = &native_record_type_id },
+    .{ "#%register-record-type", 2, 2, &fnRegisterRecordType },
+    .{ "#%make-record", 2, 2, &fnMakeRecord },
+    .{ "#%record?", 1, 1, &fnRecordQ },
+    .{ "#%record-type-id", 1, 1, &fnRecordTypeId },
     // Protocols.
-    .{ .name = "#%register-protocol", .descriptor = &native_register_protocol },
-    .{ .name = "#%protocol-fn", .descriptor = &native_protocol_fn },
+    .{ "#%register-protocol", 2, 2, &fnRegisterProtocol },
+    .{ "#%protocol-fn", 2, 2, &fnProtocolFn },
     // defrecord inline protocol impls.
-    .{ .name = "#%extend-record-impl", .descriptor = &native_extend_record_impl },
+    .{ "#%extend-record-impl", 4, 4, &fnExtendRecordImpl },
     // extend-protocol / extend-type / satisfies?.
-    .{ .name = "#%extend-builtin-impl", .descriptor = &native_extend_builtin_impl },
-    .{ .name = "#%extend-default-impl", .descriptor = &native_extend_default_impl },
+    .{ "#%extend-builtin-impl", 4, 4, &fnExtendBuiltinImpl },
+    .{ "#%extend-default-impl", 3, 3, &fnExtendDefaultImpl },
     // try: the keyword-matcher test the expander emits.
-    .{ .name = "#%catch-matches?", .descriptor = &native_catch_matches },
+    .{ "#%catch-matches?", 2, 2, &fnCatchMatches },
     // `& {:keys ...}`: the rest seq as a map.
-    .{ .name = "#%kwargs", .descriptor = &native_kwargs },
+    .{ "#%kwargs", 1, 1, &fnKwargs },
     // deftest and run-tests: the name of the current namespace.
-    .{ .name = "#%current-ns", .descriptor = &native_current_ns },
-};
+    .{ "#%current-ns", 0, 0, &fnCurrentNs },
+});
 
-/// `nexis.math` namespace entries (docs/TOOLING.md §4). `abs` is in
-/// `nexis.core`; `PI` and `E` come from `math.nx`.
-const math_fns = [_]CoreEntry{
-    .{ .name = "sqrt", .descriptor = &native_math_sqrt },
-    .{ .name = "pow", .descriptor = &native_math_pow },
-    .{ .name = "floor", .descriptor = &native_math_floor },
-    .{ .name = "ceil", .descriptor = &native_math_ceil },
-    .{ .name = "round", .descriptor = &native_math_round },
-};
+const simd_natives = table("nexis.simd", .{
+    .{ "sum", 1, 1, &fnSimdSum },
+    .{ "dot", 2, 2, &fnSimdDot },
+    .{ "scale", 2, 2, &fnSimdScale },
+    .{ "map", 2, 2, &fnSimdMap },
+});
 
 /// The part of nexis.core written in nexis itself, embedded at
 /// compile time. Evaluated after `installCore` so its definitions
@@ -233,499 +416,6 @@ pub const TEST_NX_SOURCE: []const u8 = @embedFile("stdlib/test.nx");
 pub const PPRINT_NX_SOURCE: []const u8 = @embedFile("stdlib/pprint.nx");
 /// The constants of `nexis.math`, bootstrapped after `installMath`.
 pub const MATH_NX_SOURCE: []const u8 = @embedFile("stdlib/math.nx");
-
-const CoreEntry = struct {
-    name: []const u8,
-    descriptor: *const NativeFn,
-};
-
-const core_fns = [_]CoreEntry{
-    // Sequence primitives.
-    .{ .name = "list", .descriptor = &native_list },
-    .{ .name = "list*", .descriptor = &native_list_star },
-    .{ .name = "cons", .descriptor = &native_cons },
-    .{ .name = "first", .descriptor = &native_first },
-    .{ .name = "rest", .descriptor = &native_rest },
-    .{ .name = "count", .descriptor = &native_count },
-    .{ .name = "nth", .descriptor = &native_nth },
-    .{ .name = "empty?", .descriptor = &native_empty_q },
-    .{ .name = "identity", .descriptor = &native_identity },
-    .{ .name = "nil?", .descriptor = &native_nil_q },
-    .{ .name = "some?", .descriptor = &native_some_q },
-    // First-class arithmetic + comparison Vars.
-    // Required so `(reduce + 0 xs)` resolves `+` as a Var.
-    // `(+ x y)` at the call head is still inlined by the
-    // compiler; the Var is only reached through non-head uses.
-    .{ .name = "+", .descriptor = &native_add },
-    .{ .name = "-", .descriptor = &native_sub },
-    .{ .name = "*", .descriptor = &native_mul },
-    .{ .name = "/", .descriptor = &native_div },
-    .{ .name = "quot", .descriptor = &native_quot },
-    .{ .name = "rem", .descriptor = &native_rem },
-    .{ .name = "mod", .descriptor = &native_mod },
-    .{ .name = "<", .descriptor = &native_lt },
-    .{ .name = "<=", .descriptor = &native_lte },
-    .{ .name = ">", .descriptor = &native_gt },
-    .{ .name = ">=", .descriptor = &native_gte },
-    .{ .name = "==", .descriptor = &native_num_eq },
-    .{ .name = "=", .descriptor = &native_eq },
-    .{ .name = "not=", .descriptor = &native_not_eq },
-    .{ .name = "inc", .descriptor = &native_inc },
-    .{ .name = "dec", .descriptor = &native_dec },
-    .{ .name = "long", .descriptor = &native_long },
-    .{ .name = "double", .descriptor = &native_double },
-    .{ .name = "max", .descriptor = &native_max },
-    .{ .name = "min", .descriptor = &native_min },
-    .{ .name = "abs", .descriptor = &native_abs },
-    .{ .name = "number?", .descriptor = &native_number_q },
-    .{ .name = "integer?", .descriptor = &native_integer_q },
-    .{ .name = "float?", .descriptor = &native_float_q },
-    .{ .name = "NaN?", .descriptor = &native_nan_q },
-    .{ .name = "infinite?", .descriptor = &native_infinite_q },
-    .{ .name = "not", .descriptor = &native_not },
-    .{ .name = "zero?", .descriptor = &native_zero_q },
-    .{ .name = "pos?", .descriptor = &native_pos_q },
-    .{ .name = "neg?", .descriptor = &native_neg_q },
-    .{ .name = "odd?", .descriptor = &native_odd_q },
-    .{ .name = "even?", .descriptor = &native_even_q },
-    // apply + HOFs.
-    .{ .name = "apply", .descriptor = &native_apply },
-    .{ .name = "map", .descriptor = &native_map },
-    .{ .name = "reduce", .descriptor = &native_reduce },
-    .{ .name = "reduce-kv", .descriptor = &native_reduce_kv },
-    .{ .name = "filter", .descriptor = &native_filter },
-    .{ .name = "remove", .descriptor = &native_remove },
-    .{ .name = "keep", .descriptor = &native_keep },
-    .{ .name = "seq", .descriptor = &native_seq },
-    .{ .name = "next", .descriptor = &native_next },
-    .{ .name = "range", .descriptor = &native_range },
-    .{ .name = "concat", .descriptor = &native_concat },
-    .{ .name = "mapcat", .descriptor = &native_mapcat },
-    .{ .name = "into", .descriptor = &native_into },
-    .{ .name = "mapv", .descriptor = &native_mapv },
-    .{ .name = "filterv", .descriptor = &native_filterv },
-    .{ .name = "map-indexed", .descriptor = &native_map_indexed },
-    .{ .name = "keep-indexed", .descriptor = &native_keep_indexed },
-    .{ .name = "distinct", .descriptor = &native_distinct },
-    .{ .name = "partition", .descriptor = &native_partition },
-    .{ .name = "partition-all", .descriptor = &native_partition_all },
-    .{ .name = "interleave", .descriptor = &native_interleave },
-    .{ .name = "zipmap", .descriptor = &native_zipmap },
-    .{ .name = "take-while", .descriptor = &native_take_while },
-    .{ .name = "drop-while", .descriptor = &native_drop_while },
-    .{ .name = "butlast", .descriptor = &native_butlast },
-    .{ .name = "nthrest", .descriptor = &native_nthrest },
-    .{ .name = "split-at", .descriptor = &native_split_at },
-    .{ .name = "take-last", .descriptor = &native_take_last },
-    .{ .name = "drop-last", .descriptor = &native_drop_last },
-    .{ .name = "flatten", .descriptor = &native_flatten },
-    .{ .name = "reductions", .descriptor = &native_reductions },
-    .{ .name = "repeat", .descriptor = &native_repeat },
-    .{ .name = "repeatedly", .descriptor = &native_repeatedly },
-    .{ .name = "iterate", .descriptor = &native_iterate },
-    .{ .name = "max-key", .descriptor = &native_max_key },
-    .{ .name = "min-key", .descriptor = &native_min_key },
-    .{ .name = "select-keys", .descriptor = &native_select_keys },
-    .{ .name = "find", .descriptor = &native_find },
-    .{ .name = "key", .descriptor = &native_key },
-    .{ .name = "val", .descriptor = &native_val },
-    .{ .name = "peek", .descriptor = &native_peek },
-    .{ .name = "pop", .descriptor = &native_pop },
-    .{ .name = "empty", .descriptor = &native_empty },
-    .{ .name = "not-empty", .descriptor = &native_not_empty },
-    .{ .name = "disj", .descriptor = &native_disj },
-    .{ .name = "compare", .descriptor = &native_compare },
-    .{ .name = "sort", .descriptor = &native_sort },
-    .{ .name = "sort-by", .descriptor = &native_sort_by },
-    .{ .name = "hash", .descriptor = &native_hash },
-    .{ .name = "name", .descriptor = &native_name },
-    .{ .name = "namespace", .descriptor = &native_namespace },
-    .{ .name = "keyword", .descriptor = &native_keyword },
-    .{ .name = "symbol", .descriptor = &native_symbol },
-    .{ .name = "gensym", .descriptor = &native_gensym },
-    // Exceptions as maps (PLAN Amendment Log, exceptions are values).
-    .{ .name = "ex-info", .descriptor = &native_ex_info },
-    .{ .name = "ex-data", .descriptor = &native_ex_data },
-    .{ .name = "ex-message", .descriptor = &native_ex_message },
-    // Early exit from a fold.
-    .{ .name = "reduced", .descriptor = &native_reduced },
-    .{ .name = "reduced?", .descriptor = &native_reduced_q },
-    // The compiler at run time.
-    .{ .name = "macroexpand-1", .descriptor = &native_macroexpand_1 },
-    .{ .name = "macroexpand", .descriptor = &native_macroexpand },
-    .{ .name = "read-string", .descriptor = &native_read_string },
-    .{ .name = "eval", .descriptor = &native_eval },
-    // Metadata (PLAN §8.5).
-    .{ .name = "meta", .descriptor = &native_meta },
-    .{ .name = "with-meta", .descriptor = &native_with_meta },
-    .{ .name = "reset-meta!", .descriptor = &native_reset_meta },
-    .{ .name = "alter-meta!", .descriptor = &native_alter_meta },
-    // Dynamic bindings (VM.md §6.5); `binding` and `set!` in
-    // core.nx expand to these.
-    .{ .name = "push-thread-bindings", .descriptor = &native_push_thread_bindings },
-    .{ .name = "pop-thread-bindings", .descriptor = &native_pop_thread_bindings },
-    .{ .name = "var-set", .descriptor = &native_var_set },
-    .{ .name = "thread-bound?", .descriptor = &native_thread_bound_q },
-    .{ .name = "boolean", .descriptor = &native_boolean },
-    .{ .name = "list?", .descriptor = &native_list_q },
-    .{ .name = "seq?", .descriptor = &native_seq_q },
-    .{ .name = "vector?", .descriptor = &native_vector_q },
-    .{ .name = "map?", .descriptor = &native_map_q },
-    .{ .name = "set?", .descriptor = &native_set_q },
-    .{ .name = "keyword?", .descriptor = &native_keyword_q },
-    .{ .name = "symbol?", .descriptor = &native_symbol_q },
-    .{ .name = "char?", .descriptor = &native_char_q },
-    .{ .name = "boolean?", .descriptor = &native_boolean_q },
-    .{ .name = "coll?", .descriptor = &native_coll_q },
-    .{ .name = "sequential?", .descriptor = &native_sequential_q },
-    .{ .name = "associative?", .descriptor = &native_associative_q },
-    .{ .name = "fn?", .descriptor = &native_fn_q },
-    .{ .name = "ifn?", .descriptor = &native_ifn_q },
-    // Collection construction + access.
-    .{ .name = "vector", .descriptor = &native_vector },
-    .{ .name = "vec", .descriptor = &native_vec },
-    .{ .name = "hash-map", .descriptor = &native_hash_map },
-    .{ .name = "hash-set", .descriptor = &native_hash_set },
-    .{ .name = "set", .descriptor = &native_set },
-    .{ .name = "subvec", .descriptor = &native_subvec },
-    .{ .name = "identical?", .descriptor = &native_identical_q },
-    .{ .name = "assoc", .descriptor = &native_assoc },
-    .{ .name = "dissoc", .descriptor = &native_dissoc },
-    .{ .name = "get", .descriptor = &native_get },
-    .{ .name = "contains?", .descriptor = &native_contains_q },
-    .{ .name = "keys", .descriptor = &native_keys },
-    .{ .name = "vals", .descriptor = &native_vals },
-    .{ .name = "conj", .descriptor = &native_conj },
-    // Typed vectors (docs/TYPED_VECTOR.md §7.1).
-    .{ .name = "i64-vector", .descriptor = &native_i64_vector },
-    .{ .name = "f64-vector", .descriptor = &native_f64_vector },
-    .{ .name = "typed-vector?", .descriptor = &native_typed_vector_q },
-    .{ .name = "typed-vector-type", .descriptor = &native_typed_vector_type },
-    // Atom primitives.
-    // Identity-valued in-memory mutable cells. `deref` is
-    // installed above (`&native_db_deref` aliased in
-    // db_fns; we also expose it as bare `deref` here so
-    // `(deref atom-or-var-or-durable-ref)` resolves without the
-    // `db/` prefix). See `docs/ATOM.md`.
-    .{ .name = "deref", .descriptor = &native_db_deref },
-    .{ .name = "atom", .descriptor = &native_atom },
-    .{ .name = "atom?", .descriptor = &native_atom_q },
-    .{ .name = "reset!", .descriptor = &native_reset_bang },
-    .{ .name = "swap!", .descriptor = &native_swap_bang },
-    .{ .name = "swap-vals!", .descriptor = &native_swap_vals_bang },
-    .{ .name = "compare-and-set!", .descriptor = &native_compare_and_set_bang },
-    // satisfies? predicate.
-    .{ .name = "satisfies?", .descriptor = &native_satisfies_q },
-    // Core string ops. Indexing semantics are by Unicode scalar
-    // (codepoint), NOT byte; see `docs/STRING.md` §7.
-    .{ .name = "str", .descriptor = &native_str },
-    .{ .name = "string?", .descriptor = &native_string_q },
-    .{ .name = "subs", .descriptor = &native_subs },
-    // Printing + I/O.
-    .{ .name = "print", .descriptor = &native_print },
-    .{ .name = "println", .descriptor = &native_println },
-    .{ .name = "prn", .descriptor = &native_prn },
-    .{ .name = "pr-str", .descriptor = &native_pr_str },
-    .{ .name = "slurp", .descriptor = &native_slurp },
-    .{ .name = "spit", .descriptor = &native_spit },
-    // db primitives live in the `db` namespace
-    // (installed separately via `installDb`) so they appear as
-    // qualified `(db/open ...)` calls.
-};
-
-// =============================================================================
-// Static descriptors
-// =============================================================================
-
-const native_list = NativeFn{
-    .name = "list",
-    .min_arity = 0,
-    .max_arity = null,
-    .call = &fnList,
-};
-
-const native_cons = NativeFn{
-    .name = "cons",
-    .min_arity = 2,
-    .max_arity = 2,
-    .call = &fnCons,
-};
-
-const native_first = NativeFn{
-    .name = "first",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnFirst,
-};
-
-const native_rest = NativeFn{
-    .name = "rest",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnRest,
-};
-
-const native_count = NativeFn{
-    .name = "count",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnCount,
-};
-
-const native_nth = NativeFn{
-    .name = "nth",
-    .min_arity = 2,
-    .max_arity = 3,
-    .call = &fnNth,
-};
-
-const native_empty_q = NativeFn{
-    .name = "empty?",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnEmptyQ,
-};
-
-const native_identity = NativeFn{
-    .name = "identity",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnIdentity,
-};
-
-const native_nil_q = NativeFn{
-    .name = "nil?",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnNilQ,
-};
-
-const native_some_q = NativeFn{
-    .name = "some?",
-    .min_arity = 1,
-    .max_arity = 1,
-    .call = &fnSomeQ,
-};
-
-// Arithmetic + comparison.
-const native_add = NativeFn{ .name = "+", .min_arity = 0, .max_arity = null, .call = &fnAdd };
-const native_sub = NativeFn{ .name = "-", .min_arity = 1, .max_arity = null, .call = &fnSub };
-const native_mul = NativeFn{ .name = "*", .min_arity = 0, .max_arity = null, .call = &fnMul };
-const native_div = NativeFn{ .name = "/", .min_arity = 1, .max_arity = null, .call = &fnDiv };
-const native_quot = NativeFn{ .name = "quot", .min_arity = 2, .max_arity = 2, .call = &fnQuot };
-const native_rem = NativeFn{ .name = "rem", .min_arity = 2, .max_arity = 2, .call = &fnRem };
-const native_mod = NativeFn{ .name = "mod", .min_arity = 2, .max_arity = 2, .call = &fnMod };
-const native_lt = NativeFn{ .name = "<", .min_arity = 0, .max_arity = null, .call = &fnLt };
-const native_lte = NativeFn{ .name = "<=", .min_arity = 0, .max_arity = null, .call = &fnLte };
-const native_gt = NativeFn{ .name = ">", .min_arity = 0, .max_arity = null, .call = &fnGt };
-const native_gte = NativeFn{ .name = ">=", .min_arity = 0, .max_arity = null, .call = &fnGte };
-const native_num_eq = NativeFn{ .name = "==", .min_arity = 0, .max_arity = null, .call = &fnNumEq };
-const native_eq = NativeFn{ .name = "=", .min_arity = 0, .max_arity = null, .call = &fnEq };
-const native_not_eq = NativeFn{ .name = "not=", .min_arity = 1, .max_arity = null, .call = &fnNotEq };
-const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &fnInc };
-const native_long = NativeFn{ .name = "long", .min_arity = 1, .max_arity = 1, .call = &fnLong };
-const native_double = NativeFn{ .name = "double", .min_arity = 1, .max_arity = 1, .call = &fnDouble };
-const native_dec = NativeFn{ .name = "dec", .min_arity = 1, .max_arity = 1, .call = &fnDec };
-const native_max = NativeFn{ .name = "max", .min_arity = 1, .max_arity = null, .call = &fnMax };
-const native_min = NativeFn{ .name = "min", .min_arity = 1, .max_arity = null, .call = &fnMin };
-const native_abs = NativeFn{ .name = "abs", .min_arity = 1, .max_arity = 1, .call = &fnAbs };
-const native_number_q = NativeFn{ .name = "number?", .min_arity = 1, .max_arity = 1, .call = &fnNumberQ };
-const native_integer_q = NativeFn{ .name = "integer?", .min_arity = 1, .max_arity = 1, .call = &fnIntegerQ };
-const native_float_q = NativeFn{ .name = "float?", .min_arity = 1, .max_arity = 1, .call = &fnFloatQ };
-const native_nan_q = NativeFn{ .name = "NaN?", .min_arity = 1, .max_arity = 1, .call = &fnNanQ };
-const native_infinite_q = NativeFn{ .name = "infinite?", .min_arity = 1, .max_arity = 1, .call = &fnInfiniteQ };
-const native_not = NativeFn{ .name = "not", .min_arity = 1, .max_arity = 1, .call = &fnNot };
-const native_zero_q = NativeFn{ .name = "zero?", .min_arity = 1, .max_arity = 1, .call = &fnZeroQ };
-const native_pos_q = NativeFn{ .name = "pos?", .min_arity = 1, .max_arity = 1, .call = &fnPosQ };
-const native_neg_q = NativeFn{ .name = "neg?", .min_arity = 1, .max_arity = 1, .call = &fnNegQ };
-const native_odd_q = NativeFn{ .name = "odd?", .min_arity = 1, .max_arity = 1, .call = &fnOddQ };
-const native_even_q = NativeFn{ .name = "even?", .min_arity = 1, .max_arity = 1, .call = &fnEvenQ };
-
-// apply + HOFs.
-const native_apply = NativeFn{ .name = "apply", .min_arity = 2, .max_arity = null, .call = &fnApply };
-const native_map = NativeFn{ .name = "map", .min_arity = 2, .max_arity = null, .call = &fnMap };
-const native_reduce = NativeFn{ .name = "reduce", .min_arity = 2, .max_arity = 3, .call = &fnReduce };
-const native_reduce_kv = NativeFn{ .name = "reduce-kv", .min_arity = 3, .max_arity = 3, .call = &fnReduceKv };
-const native_filter = NativeFn{ .name = "filter", .min_arity = 2, .max_arity = 2, .call = &fnFilter };
-const native_remove = NativeFn{ .name = "remove", .min_arity = 2, .max_arity = 2, .call = &fnRemove };
-const native_keep = NativeFn{ .name = "keep", .min_arity = 2, .max_arity = 2, .call = &fnKeep };
-const native_seq = NativeFn{ .name = "seq", .min_arity = 1, .max_arity = 1, .call = &fnSeq };
-const native_next = NativeFn{ .name = "next", .min_arity = 1, .max_arity = 1, .call = &fnNext };
-const native_range = NativeFn{ .name = "range", .min_arity = 1, .max_arity = 3, .call = &fnRange };
-const native_concat = NativeFn{ .name = "concat", .min_arity = 0, .max_arity = null, .call = &fnConcat };
-const native_mapcat = NativeFn{ .name = "mapcat", .min_arity = 2, .max_arity = null, .call = &fnMapcat };
-const native_into = NativeFn{ .name = "into", .min_arity = 2, .max_arity = 2, .call = &fnInto };
-const native_mapv = NativeFn{ .name = "mapv", .min_arity = 2, .max_arity = null, .call = &fnMapv };
-const native_filterv = NativeFn{ .name = "filterv", .min_arity = 2, .max_arity = 2, .call = &fnFilterv };
-const native_map_indexed = NativeFn{ .name = "map-indexed", .min_arity = 2, .max_arity = 2, .call = &fnMapIndexed };
-const native_keep_indexed = NativeFn{ .name = "keep-indexed", .min_arity = 2, .max_arity = 2, .call = &fnKeepIndexed };
-const native_distinct = NativeFn{ .name = "distinct", .min_arity = 1, .max_arity = 1, .call = &fnDistinct };
-const native_partition = NativeFn{ .name = "partition", .min_arity = 2, .max_arity = 4, .call = &fnPartition };
-const native_partition_all = NativeFn{ .name = "partition-all", .min_arity = 2, .max_arity = 3, .call = &fnPartitionAll };
-const native_interleave = NativeFn{ .name = "interleave", .min_arity = 0, .max_arity = null, .call = &fnInterleave };
-const native_zipmap = NativeFn{ .name = "zipmap", .min_arity = 2, .max_arity = 2, .call = &fnZipmap };
-const native_take_while = NativeFn{ .name = "take-while", .min_arity = 2, .max_arity = 2, .call = &fnTakeWhile };
-const native_drop_while = NativeFn{ .name = "drop-while", .min_arity = 2, .max_arity = 2, .call = &fnDropWhile };
-const native_butlast = NativeFn{ .name = "butlast", .min_arity = 1, .max_arity = 1, .call = &fnButlast };
-const native_nthrest = NativeFn{ .name = "nthrest", .min_arity = 2, .max_arity = 2, .call = &fnNthrest };
-const native_split_at = NativeFn{ .name = "split-at", .min_arity = 2, .max_arity = 2, .call = &fnSplitAt };
-const native_take_last = NativeFn{ .name = "take-last", .min_arity = 2, .max_arity = 2, .call = &fnTakeLast };
-const native_drop_last = NativeFn{ .name = "drop-last", .min_arity = 2, .max_arity = 2, .call = &fnDropLast };
-const native_flatten = NativeFn{ .name = "flatten", .min_arity = 1, .max_arity = 1, .call = &fnFlatten };
-const native_reductions = NativeFn{ .name = "reductions", .min_arity = 2, .max_arity = 3, .call = &fnReductions };
-const native_repeat = NativeFn{ .name = "repeat", .min_arity = 2, .max_arity = 2, .call = &fnRepeat };
-const native_repeatedly = NativeFn{ .name = "repeatedly", .min_arity = 2, .max_arity = 2, .call = &fnRepeatedly };
-const native_iterate = NativeFn{ .name = "iterate", .min_arity = 3, .max_arity = 3, .call = &fnIterate };
-const native_max_key = NativeFn{ .name = "max-key", .min_arity = 2, .max_arity = null, .call = &fnMaxKey };
-const native_min_key = NativeFn{ .name = "min-key", .min_arity = 2, .max_arity = null, .call = &fnMinKey };
-const native_select_keys = NativeFn{ .name = "select-keys", .min_arity = 2, .max_arity = 2, .call = &fnSelectKeys };
-const native_find = NativeFn{ .name = "find", .min_arity = 2, .max_arity = 2, .call = &fnFind };
-const native_key = NativeFn{ .name = "key", .min_arity = 1, .max_arity = 1, .call = &fnKey };
-const native_val = NativeFn{ .name = "val", .min_arity = 1, .max_arity = 1, .call = &fnVal };
-const native_peek = NativeFn{ .name = "peek", .min_arity = 1, .max_arity = 1, .call = &fnPeek };
-const native_pop = NativeFn{ .name = "pop", .min_arity = 1, .max_arity = 1, .call = &fnPop };
-const native_empty = NativeFn{ .name = "empty", .min_arity = 1, .max_arity = 1, .call = &fnEmpty };
-const native_not_empty = NativeFn{ .name = "not-empty", .min_arity = 1, .max_arity = 1, .call = &fnNotEmpty };
-const native_disj = NativeFn{ .name = "disj", .min_arity = 1, .max_arity = null, .call = &fnDisj };
-const native_compare = NativeFn{ .name = "compare", .min_arity = 2, .max_arity = 2, .call = &fnCompare };
-const native_sort = NativeFn{ .name = "sort", .min_arity = 1, .max_arity = 2, .call = &fnSort };
-const native_sort_by = NativeFn{ .name = "sort-by", .min_arity = 2, .max_arity = 3, .call = &fnSortBy };
-const native_hash = NativeFn{ .name = "hash", .min_arity = 1, .max_arity = 1, .call = &fnHash };
-const native_name = NativeFn{ .name = "name", .min_arity = 1, .max_arity = 1, .call = &fnName };
-const native_namespace = NativeFn{ .name = "namespace", .min_arity = 1, .max_arity = 1, .call = &fnNamespace };
-const native_keyword = NativeFn{ .name = "keyword", .min_arity = 1, .max_arity = 2, .call = &fnKeyword };
-const native_symbol = NativeFn{ .name = "symbol", .min_arity = 1, .max_arity = 2, .call = &fnSymbol };
-const native_gensym = NativeFn{ .name = "gensym", .min_arity = 0, .max_arity = 1, .call = &fnGensym };
-const native_ex_info = NativeFn{ .name = "ex-info", .min_arity = 2, .max_arity = 3, .call = &fnExInfo };
-const native_ex_data = NativeFn{ .name = "ex-data", .min_arity = 1, .max_arity = 1, .call = &fnExData };
-const native_ex_message = NativeFn{ .name = "ex-message", .min_arity = 1, .max_arity = 1, .call = &fnExMessage };
-const native_reduced = NativeFn{ .name = "reduced", .min_arity = 1, .max_arity = 1, .call = &fnReduced };
-const native_reduced_q = NativeFn{ .name = "reduced?", .min_arity = 1, .max_arity = 1, .call = &fnReducedQ };
-const native_macroexpand_1 = NativeFn{ .name = "macroexpand-1", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand1 };
-const native_macroexpand = NativeFn{ .name = "macroexpand", .min_arity = 1, .max_arity = 1, .call = &fnMacroexpand };
-const native_read_string = NativeFn{ .name = "read-string", .min_arity = 1, .max_arity = 1, .call = &fnReadString };
-const native_eval = NativeFn{ .name = "eval", .min_arity = 1, .max_arity = 1, .call = &fnEval };
-const native_list_star = NativeFn{ .name = "list*", .min_arity = 1, .max_arity = null, .call = &fnListStar };
-const native_meta = NativeFn{ .name = "meta", .min_arity = 1, .max_arity = 1, .call = &fnMeta };
-const native_with_meta = NativeFn{ .name = "with-meta", .min_arity = 2, .max_arity = 2, .call = &fnWithMeta };
-const native_reset_meta = NativeFn{ .name = "reset-meta!", .min_arity = 2, .max_arity = 2, .call = &fnResetMeta };
-const native_alter_meta = NativeFn{ .name = "alter-meta!", .min_arity = 2, .max_arity = null, .call = &fnAlterMeta };
-const native_push_thread_bindings = NativeFn{ .name = "push-thread-bindings", .min_arity = 1, .max_arity = 1, .call = &fnPushThreadBindings };
-const native_pop_thread_bindings = NativeFn{ .name = "pop-thread-bindings", .min_arity = 0, .max_arity = 0, .call = &fnPopThreadBindings };
-const native_var_set = NativeFn{ .name = "var-set", .min_arity = 2, .max_arity = 2, .call = &fnVarSet };
-const native_thread_bound_q = NativeFn{ .name = "thread-bound?", .min_arity = 1, .max_arity = 1, .call = &fnThreadBoundQ };
-const native_boolean = NativeFn{ .name = "boolean", .min_arity = 1, .max_arity = 1, .call = &fnBoolean };
-const native_list_q = NativeFn{ .name = "list?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
-const native_seq_q = NativeFn{ .name = "seq?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isList) };
-const native_vector_q = NativeFn{ .name = "vector?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isVector) };
-const native_map_q = NativeFn{ .name = "map?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isMap) };
-const native_set_q = NativeFn{ .name = "set?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSet) };
-const native_keyword_q = NativeFn{ .name = "keyword?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isKeyword) };
-const native_symbol_q = NativeFn{ .name = "symbol?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSymbol) };
-const native_char_q = NativeFn{ .name = "char?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isChar) };
-const native_boolean_q = NativeFn{ .name = "boolean?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isBoolean) };
-const native_coll_q = NativeFn{ .name = "coll?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isColl) };
-const native_sequential_q = NativeFn{ .name = "sequential?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isSequential) };
-const native_associative_q = NativeFn{ .name = "associative?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isAssociative) };
-const native_fn_q = NativeFn{ .name = "fn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isFn) };
-const native_ifn_q = NativeFn{ .name = "ifn?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isIfn) };
-
-// Collection utilities.
-const native_vector = NativeFn{ .name = "vector", .min_arity = 0, .max_arity = null, .call = &fnVector };
-const native_vec = NativeFn{ .name = "vec", .min_arity = 1, .max_arity = 1, .call = &fnVec };
-const native_hash_map = NativeFn{ .name = "hash-map", .min_arity = 0, .max_arity = null, .call = &fnHashMap };
-const native_hash_set = NativeFn{ .name = "hash-set", .min_arity = 0, .max_arity = null, .call = &fnHashSet };
-const native_set = NativeFn{ .name = "set", .min_arity = 1, .max_arity = 1, .call = &fnSet };
-const native_subvec = NativeFn{ .name = "subvec", .min_arity = 2, .max_arity = 3, .call = &fnSubvec };
-const native_identical_q = NativeFn{ .name = "identical?", .min_arity = 2, .max_arity = 2, .call = &fnIdenticalQ };
-const native_assoc = NativeFn{ .name = "assoc", .min_arity = 3, .max_arity = null, .call = &fnAssoc };
-const native_dissoc = NativeFn{ .name = "dissoc", .min_arity = 1, .max_arity = null, .call = &fnDissoc };
-const native_get = NativeFn{ .name = "get", .min_arity = 2, .max_arity = 3, .call = &fnGet };
-const native_contains_q = NativeFn{ .name = "contains?", .min_arity = 2, .max_arity = 2, .call = &fnContainsQ };
-const native_keys = NativeFn{ .name = "keys", .min_arity = 1, .max_arity = 1, .call = &fnKeys };
-const native_vals = NativeFn{ .name = "vals", .min_arity = 1, .max_arity = 1, .call = &fnVals };
-const native_conj = NativeFn{ .name = "conj", .min_arity = 1, .max_arity = null, .call = &fnConj };
-
-// db primitives.
-const native_db_open = NativeFn{ .name = "db/open", .min_arity = 1, .max_arity = 1, .call = &fnDbOpen };
-const native_db_close = NativeFn{ .name = "db/close", .min_arity = 1, .max_arity = 1, .call = &fnDbClose };
-const native_db_ref = NativeFn{ .name = "db/ref", .min_arity = 3, .max_arity = 3, .call = &fnDbRef };
-const native_db_ref_q = NativeFn{ .name = "db/ref?", .min_arity = 1, .max_arity = 1, .call = &fnDbRefQ };
-const native_db_put_key = NativeFn{ .name = "db/put-key!", .min_arity = 2, .max_arity = 2, .call = &fnDbPutKey };
-const native_db_get_key = NativeFn{ .name = "db/get-key", .min_arity = 1, .max_arity = 2, .call = &fnDbGetKey };
-const native_db_delete_key = NativeFn{ .name = "db/delete-key!", .min_arity = 1, .max_arity = 1, .call = &fnDbDeleteKey };
-const native_db_present_q = NativeFn{ .name = "db/present?", .min_arity = 1, .max_arity = 1, .call = &fnDbPresentQ };
-// Explicit tx primitives.
-const native_db_begin_write = NativeFn{ .name = "db/begin-write", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginWrite };
-const native_db_begin_read = NativeFn{ .name = "db/begin-read", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginRead };
-const native_db_commit = NativeFn{ .name = "db/commit!", .min_arity = 1, .max_arity = 1, .call = &fnDbCommit };
-const native_db_abort_write = NativeFn{ .name = "db/abort-write!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortWrite };
-const native_db_abort_read = NativeFn{ .name = "db/abort-read!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortRead };
-const native_db_put = NativeFn{ .name = "db/put!", .min_arity = 3, .max_arity = 3, .call = &fnDbPut };
-const native_db_get = NativeFn{ .name = "db/get", .min_arity = 2, .max_arity = 3, .call = &fnDbGet };
-const native_db_delete = NativeFn{ .name = "db/delete!", .min_arity = 2, .max_arity = 2, .call = &fnDbDelete };
-// deref + alter.
-const native_db_deref = NativeFn{ .name = "deref", .min_arity = 1, .max_arity = 1, .call = &fnDbDeref };
-
-// Atoms.
-const native_atom = NativeFn{ .name = "atom", .min_arity = 1, .max_arity = 1, .call = &fnAtom };
-const native_atom_q = NativeFn{ .name = "atom?", .min_arity = 1, .max_arity = 1, .call = &fnAtomQ };
-const native_reset_bang = NativeFn{ .name = "reset!", .min_arity = 2, .max_arity = 2, .call = &fnResetBang };
-const native_swap_bang = NativeFn{ .name = "swap!", .min_arity = 2, .max_arity = null, .call = &fnSwapBang };
-const native_swap_vals_bang = NativeFn{ .name = "swap-vals!", .min_arity = 2, .max_arity = null, .call = &fnSwapValsBang };
-const native_compare_and_set_bang = NativeFn{ .name = "compare-and-set!", .min_arity = 3, .max_arity = 3, .call = &fnCompareAndSetBang };
-
-// Core string ops.
-const native_str = NativeFn{ .name = "str", .min_arity = 0, .max_arity = null, .call = &fnStr };
-const native_string_q = NativeFn{ .name = "string?", .min_arity = 1, .max_arity = 1, .call = &fnStringQ };
-const native_subs = NativeFn{ .name = "subs", .min_arity = 2, .max_arity = 3, .call = &fnSubs };
-
-// Printing + I/O.
-const native_print = NativeFn{ .name = "print", .min_arity = 0, .max_arity = null, .call = &fnPrint };
-const native_println = NativeFn{ .name = "println", .min_arity = 0, .max_arity = null, .call = &fnPrintln };
-const native_prn = NativeFn{ .name = "prn", .min_arity = 0, .max_arity = null, .call = &fnPrn };
-const native_pr_str = NativeFn{ .name = "pr-str", .min_arity = 0, .max_arity = null, .call = &fnPrStr };
-const native_slurp = NativeFn{ .name = "slurp", .min_arity = 1, .max_arity = 1, .call = &fnSlurp };
-const native_spit = NativeFn{ .name = "spit", .min_arity = 2, .max_arity = 2, .call = &fnSpit };
-
-// Record internals. All four
-// install into `nexis.internal`; macros emit qualified calls.
-const native_register_record_type = NativeFn{ .name = "#%register-record-type", .min_arity = 2, .max_arity = 2, .call = &fnRegisterRecordType };
-const native_make_record = NativeFn{ .name = "#%make-record", .min_arity = 2, .max_arity = 2, .call = &fnMakeRecord };
-const native_record_q = NativeFn{ .name = "#%record?", .min_arity = 1, .max_arity = 1, .call = &fnRecordQ };
-const native_current_ns = NativeFn{ .name = "#%current-ns", .min_arity = 0, .max_arity = 0, .call = &fnCurrentNs };
-const native_record_type_id = NativeFn{ .name = "#%record-type-id", .min_arity = 1, .max_arity = 1, .call = &fnRecordTypeId };
-
-// Protocol internals.
-const native_register_protocol = NativeFn{ .name = "#%register-protocol", .min_arity = 2, .max_arity = 2, .call = &fnRegisterProtocol };
-const native_protocol_fn = NativeFn{ .name = "#%protocol-fn", .min_arity = 2, .max_arity = 2, .call = &fnProtocolFn };
-// defrecord inline protocol impls.
-const native_extend_record_impl = NativeFn{ .name = "#%extend-record-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendRecordImpl };
-// extend-protocol over built-in kinds + Any default + satisfies?.
-const native_extend_builtin_impl = NativeFn{ .name = "#%extend-builtin-impl", .min_arity = 4, .max_arity = 4, .call = &fnExtendBuiltinImpl };
-const native_extend_default_impl = NativeFn{ .name = "#%extend-default-impl", .min_arity = 3, .max_arity = 3, .call = &fnExtendDefaultImpl };
-const native_kwargs = NativeFn{ .name = "#%kwargs", .min_arity = 1, .max_arity = 1, .call = &fnKwargs };
-const native_catch_matches = NativeFn{ .name = "#%catch-matches?", .min_arity = 2, .max_arity = 2, .call = &fnCatchMatches };
-const native_satisfies_q = NativeFn{ .name = "satisfies?", .min_arity = 2, .max_arity = 2, .call = &fnSatisfiesQ };
-
-// nexis.string namespace.
-const native_string_lower_case = NativeFn{ .name = "nexis.string/lower-case", .min_arity = 1, .max_arity = 1, .call = &fnStringLowerCase };
-const native_string_upper_case = NativeFn{ .name = "nexis.string/upper-case", .min_arity = 1, .max_arity = 1, .call = &fnStringUpperCase };
-const native_string_trim = NativeFn{ .name = "nexis.string/trim", .min_arity = 1, .max_arity = 1, .call = &fnStringTrim };
-const native_string_split = NativeFn{ .name = "nexis.string/split", .min_arity = 2, .max_arity = 2, .call = &fnStringSplit };
-const native_string_join = NativeFn{ .name = "nexis.string/join", .min_arity = 1, .max_arity = 2, .call = &fnStringJoin };
-const native_string_replace = NativeFn{ .name = "nexis.string/replace", .min_arity = 3, .max_arity = 3, .call = &fnStringReplace };
-const native_db_alter = NativeFn{ .name = "db/alter!", .min_arity = 3, .max_arity = null, .call = &fnDbAlter };
-// scan + reduce-tree.
-const native_db_scan = NativeFn{ .name = "db/scan", .min_arity = 2, .max_arity = 4, .call = &fnDbScan };
-const native_db_reduce_tree = NativeFn{ .name = "db/reduce-tree", .min_arity = 4, .max_arity = 4, .call = &fnDbReduceTree };
-// Snapshot aliases. emdb read transactions ARE
-// snapshots (pinned to the commit generation at begin time).
-// These names give users PLAN.md §15.7 vocabulary without
-// duplicating the underlying mechanism.
-const native_db_snapshot = NativeFn{ .name = "db/snapshot", .min_arity = 1, .max_arity = 1, .call = &fnDbBeginRead };
-const native_db_release_snapshot = NativeFn{ .name = "db/release-snapshot!", .min_arity = 1, .max_arity = 1, .call = &fnDbAbortRead };
-const native_db_snapshot_q = NativeFn{ .name = "db/snapshot?", .min_arity = 1, .max_arity = 1, .call = &fnDbSnapshotQ };
 
 // =============================================================================
 // Implementations
@@ -1125,12 +815,6 @@ fn fnAbs(vm: *VM, args: []const Value) VmError!Value {
 // `round` return an integer unchanged, `floor` and `ceil` of a
 // float the float they name, `round` of a float the nearest integer
 // (halves up, `Math/round`) as a fixnum or bignum.
-
-const native_math_sqrt = NativeFn{ .name = "nexis.math/sqrt", .min_arity = 1, .max_arity = 1, .call = &fnMathSqrt };
-const native_math_pow = NativeFn{ .name = "nexis.math/pow", .min_arity = 2, .max_arity = 2, .call = &fnMathPow };
-const native_math_floor = NativeFn{ .name = "nexis.math/floor", .min_arity = 1, .max_arity = 1, .call = &fnMathFloor };
-const native_math_ceil = NativeFn{ .name = "nexis.math/ceil", .min_arity = 1, .max_arity = 1, .call = &fnMathCeil };
-const native_math_round = NativeFn{ .name = "nexis.math/round", .min_arity = 1, .max_arity = 1, .call = &fnMathRound };
 
 fn asDouble(v: Value) VmError!f64 {
     return (try vm_mod.numDouble(v)).asFloat();
@@ -4335,22 +4019,6 @@ fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
 // `makeSeqIter`, so every generic sequence native works on it.
 // =============================================================================
 
-const native_i64_vector = NativeFn{ .name = "i64-vector", .min_arity = 1, .max_arity = 1, .call = &fnI64Vector };
-const native_f64_vector = NativeFn{ .name = "f64-vector", .min_arity = 1, .max_arity = 1, .call = &fnF64Vector };
-const native_typed_vector_q = NativeFn{ .name = "typed-vector?", .min_arity = 1, .max_arity = 1, .call = kindPredicate(isTypedVector) };
-const native_typed_vector_type = NativeFn{ .name = "typed-vector-type", .min_arity = 1, .max_arity = 1, .call = &fnTypedVectorType };
-const native_simd_sum = NativeFn{ .name = "nexis.simd/sum", .min_arity = 1, .max_arity = 1, .call = &fnSimdSum };
-const native_simd_dot = NativeFn{ .name = "nexis.simd/dot", .min_arity = 2, .max_arity = 2, .call = &fnSimdDot };
-const native_simd_scale = NativeFn{ .name = "nexis.simd/scale", .min_arity = 2, .max_arity = 2, .call = &fnSimdScale };
-const native_simd_map = NativeFn{ .name = "nexis.simd/map", .min_arity = 2, .max_arity = 2, .call = &fnSimdMap };
-
-const simd_fns = [_]CoreEntry{
-    .{ .name = "sum", .descriptor = &native_simd_sum },
-    .{ .name = "dot", .descriptor = &native_simd_dot },
-    .{ .name = "scale", .descriptor = &native_simd_scale },
-    .{ .name = "map", .descriptor = &native_simd_map },
-};
-
 fn isTypedVector(k: Kind) bool {
     return k == .typed_vector;
 }
@@ -4578,7 +4246,7 @@ fn coerceToList(vm: *VM, v: Value) VmError!Value {
 
 const testing = std.testing;
 
-test "stdlib: installCore registers all 10 fns" {
+test "stdlib: every core native is bound in nexis.core" {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dbg.deinit();
     const ally = dbg.allocator();
@@ -4591,8 +4259,8 @@ test "stdlib: installCore registers all 10 fns" {
     var ns = Namespace.init(ally, arena.allocator());
     defer ns.deinit();
     try installCore(&ns);
-    for (core_fns) |entry| {
-        const v = ns.lookup(entry.name) orelse return error.TestFailed;
+    for (core_natives) |d| {
+        const v = ns.lookup(d.name) orelse return error.TestFailed;
         try testing.expect(v.bound);
         try testing.expectEqual(Kind.native_fn, v.root.kind());
         try testing.expect(!v.macro);
@@ -4622,7 +4290,7 @@ test "stdlib: name of a string is the string itself" {
 }
 
 test "stdlib: nativeFnValue round-trips" {
-    const v = vm_mod.nativeFnValue(&native_first);
+    const v = vm_mod.nativeFnValue(&core_natives[3]);
     try testing.expectEqual(Kind.native_fn, v.kind());
     const back = vm_mod.asNativeFn(v);
     try testing.expectEqualStrings("first", back.name);
