@@ -100,7 +100,8 @@ compiler bug, not a user error.
 
 **Invariant**: Form trees, Tiny IR and the `Compiled` routine
 records live in a compile arena owned by the caller of the
-compile entry points.
+compile entry points; `CompileOptions.routine_allocator` can put
+the routines on a longer-lived allocator than the trees.
 
 - **Lifetime, file run** (`nexis run FILE.nx`): one compile arena
   for the whole file, released together at the end.
