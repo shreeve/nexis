@@ -331,8 +331,9 @@ compiler relies on:
     `coll:set` over a slot block.
 
 - **Errors**: `RecurOutsideTail`, `RecurArityMismatch`,
-  `SlotOverflow`, `ConstantPoolOverflow` (more than 4096
-  constants), `JumpTargetOutOfRange` (a jump whose target lies
+  `SlotOverflow` (more than 4096 slots live at once, upvalues or
+  Var-table entries in a routine), `ConstantPoolOverflow` (more
+  than 4096 constants or capture descriptors), `JumpTargetOutOfRange` (a jump whose target lies
   past pc 4095: jump operands are 12-bit and there is no
   extension-instruction encoding; code past pc 4095 that nothing
   jumps to runs), `InternalCompilerBug`. Each is reported at the
@@ -1041,6 +1042,3 @@ table.
 - `docs/VALUE.md` — heap kinds; `function` is kind 24.
 - `docs/TOOLING.md` — what the §8 span table serves: located
   runtime errors and `nexis disasm`.
-- `../em/docs/architecture/PIPELINE.md` — em compiler pipeline
-  (template; nexis adapts for macros + closures + persistent
-  collections).

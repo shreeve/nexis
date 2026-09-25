@@ -453,17 +453,19 @@ pub const CompileError = error{
     /// bignum `Tiny.literal`.
     IntegerOutOfFixnumRange,
 
-    /// Routine has more constants than the 12-bit constant-pool
-    /// operand can address (4096). Hard error; there are no
-    /// extension instructions.
+    /// A routine needs more than 4096 constants or capture
+    /// descriptors: the 12-bit operands that index them cannot
+    /// address more, and there are no extension instructions.
     ConstantPoolOverflow,
 
-    /// Routine has more bytecode than the 12-bit jump target
-    /// operand can address (4096). Hard error.
+    /// A jump targets a pc past 4095, which the 12-bit jump
+    /// operand cannot address. Code past pc 4095 that nothing jumps
+    /// to runs.
     JumpTargetOutOfRange,
 
-    /// Routine has more slots than the 12-bit slot operand can
-    /// address (4096).
+    /// A routine needs more than 4096 slots live at once, upvalues
+    /// or Var-table entries: the 12-bit operands that index them
+    /// cannot address more.
     SlotOverflow,
 
     /// Symbol reference resolves to NONE of (local, upvalue,
@@ -3743,6 +3745,23 @@ test "routine limits: at most 4096 slots are live at once" {
             try testing.expectError(CompileError.SlotOverflow, compileSourceWith(a, src.items, .{ .out_span = &span }));
             // Reported at the form whose binding did not fit.
             try testing.expectEqual(@as(usize, 0), span.?.pos);
+        }
+    }
+}
+
+test "routine limits: at most 4096 constants" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]struct { n: usize, ok: bool }{ .{ .n = 4096, .ok = true }, .{ .n = 4097, .ok = false } }) |c| {
+        var src: std.ArrayList(u8) = .empty;
+        try src.appendSlice(a, "(do");
+        for (0..c.n) |i| try src.print(a, " {d}", .{i});
+        try src.appendSlice(a, ")");
+        if (c.ok) {
+            _ = try compileSourceWith(a, src.items, .{});
+        } else {
+            try testing.expectError(CompileError.ConstantPoolOverflow, compileSourceWith(a, src.items, .{}));
         }
     }
 }
