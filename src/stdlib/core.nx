@@ -321,12 +321,15 @@
            m
            ks))
   ([m ks default]
-   (loop* [acc m s (seq ks)]
-     (if (nil? s)
-       acc
-       (if (and (some? acc) (contains? acc (first s)))
-         (recur (get acc (first s)) (next s))
-         default)))))
+   ; A fresh atom is identical to no value a map holds.
+   (let* [missing (atom nil)]
+     (loop* [acc m s (seq ks)]
+       (if (nil? s)
+         acc
+         (let* [v (get acc (first s) missing)]
+           (if (identical? v missing)
+             default
+             (recur v (next s)))))))))
 
 ; (assoc-in m [k1 k2 ...] v) → m with the nested path set to v.
 (defn assoc-in [m ks v]

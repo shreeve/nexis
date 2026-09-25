@@ -202,7 +202,7 @@ const core_natives = table("", .{
     .{ "range", 1, 3, &fnRange },
     .{ "concat", 0, null, &fnConcat },
     .{ "mapcat", 2, null, &fnMapcat },
-    .{ "into", 2, 2, &fnInto },
+    .{ "into", 0, 2, &fnInto },
     .{ "mapv", 2, null, &fnMapv },
     .{ "filterv", 2, 2, &fnFilterv },
     .{ "map-indexed", 2, 2, &fnMapIndexed },
@@ -218,7 +218,7 @@ const core_natives = table("", .{
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "split-at", 2, 2, &fnSplitAt },
     .{ "take-last", 2, 2, &fnTakeLast },
-    .{ "drop-last", 2, 2, &fnDropLast },
+    .{ "drop-last", 1, 2, &fnDropLast },
     .{ "flatten", 1, 1, &fnFlatten },
     .{ "reductions", 2, 3, &fnReductions },
     .{ "repeat", 2, 2, &fnRepeat },
@@ -296,7 +296,7 @@ const core_natives = table("", .{
     .{ "contains?", 2, 2, &fnContainsQ },
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
-    .{ "conj", 1, null, &fnConj },
+    .{ "conj", 0, null, &fnConj },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
     .{ "i64-vector", 1, 1, &fnI64Vector },
     .{ "f64-vector", 1, 1, &fnF64Vector },
@@ -331,7 +331,7 @@ const core_natives = table("", .{
     .{ "bound?", 1, null, &fnBoundQ },
     .{ "nano-time", 0, 0, &fnNanoTime },
     .{ "slurp", 1, 1, &fnSlurp },
-    .{ "spit", 2, 2, &fnSpit },
+    .{ "spit", 2, null, &fnSpit },
     .{ "read-line", 0, 0, &fnReadLine },
     .{ "exit", 0, 1, &fnExit },
     // db primitives live in the `db` namespace
@@ -374,7 +374,7 @@ const string_natives = table("nexis.string", .{
     .{ "lower-case", 1, 1, &fnStringLowerCase },
     .{ "upper-case", 1, 1, &fnStringUpperCase },
     .{ "trim", 1, 1, &fnStringTrim },
-    .{ "split", 2, 2, &fnStringSplit },
+    .{ "split", 2, 3, &fnStringSplit },
     .{ "join", 1, 2, &fnStringJoin },
     .{ "replace", 3, 3, &fnStringReplace },
 });
@@ -449,14 +449,15 @@ fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items);
 }
 
-/// `(cons x s)` → new cons cell with `x` as head and `s` as
-/// tail. `s` may be nil (treated as empty) or a list; other
-/// kinds are a `KindMismatch`.
+/// `(cons x s)` → a list of `x` followed by the elements of `s`,
+/// any seqable; a list tail is shared, anything else is copied.
 fn fnCons(vm: *VM, args: []const Value) VmError!Value {
-    const x = args[0];
-    const tail_v = try coerceToList(vm, args[1]);
-    const heap = vm.ensureHeap();
-    return list_mod.cons(heap, x, tail_v) catch VmError.OutOfMemory;
+    const tail = if (args[1].kind() == .list) args[1] else blk: {
+        var items = try collectSeq(vm, args[1]);
+        defer items.deinit(vm.allocator);
+        break :blk try buildListFromSlice(vm, items.items);
+    };
+    return list_mod.cons(vm.ensureHeap(), args[0], tail) catch VmError.OutOfMemory;
 }
 
 /// `(first s)` → head of the seq, or nil if empty/nil.
@@ -550,7 +551,8 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
 /// bounds. Negative indices rejected as `IndexOutOfBounds`.
 ///
 /// `(nth coll n default)` → element at index `n`, or `default`
-/// if out-of-bounds. nil coll always returns default. Required
+/// if out-of-bounds. nil coll always returns default (nil without
+/// one, as in Clojure). Required
 /// by destructuring: `[a b c]` against a 2-element source binds
 /// c to nil, not throw.
 fn fnNth(vm: *VM, args: []const Value) VmError!Value {
@@ -577,7 +579,7 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     }
     const u_idx: usize = @intCast(idx);
     return switch (coll.kind()) {
-        .nil => if (has_default) default else VmError.IndexOutOfBounds,
+        .nil => default,
         .list => blk: {
             if (u_idx >= list_mod.count(coll)) {
                 if (has_default) break :blk default;
@@ -840,12 +842,16 @@ fn fnMathCeil(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFloat(@ceil(try asDouble(args[0])));
 }
 
-/// A float that is NaN or infinite has no nearest integer:
-/// `:invalid-argument`, as `long` says.
+/// Java's `Math/round`: the floor, plus one when the fraction is at
+/// least a half, computed without `f + 0.5` (which rounds for
+/// values just under a half and past 2^52, where every double is an
+/// integer already). A float that is NaN or infinite has no nearest
+/// integer: `:invalid-argument`, as `long` says.
 fn fnMathRound(vm: *VM, args: []const Value) VmError!Value {
     if (vm_mod.isInteger(args[0])) return args[0];
     const f = try asDouble(args[0]);
-    return vm_mod.numLong(vm.ensureHeap(), value_mod.fromFloat(@floor(f + 0.5)));
+    const r = @floor(f);
+    return vm_mod.numLong(vm.ensureHeap(), value_mod.fromFloat(if (f - r >= 0.5) r + 1 else r));
 }
 
 fn fnNot(_: *VM, args: []const Value) VmError!Value {
@@ -1318,11 +1324,14 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
     return coll;
 }
 
+/// `(get m k)` / `(get m k default)`: never throws for the kind of
+/// `m`; a value that is not a collection has no entries (Clojure's
+/// `RT.get`).
 fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
-    return vm_mod.lookup(args[0], args[1], default);
+    return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
 }
 
 /// The element at fixnum index `k` of typed vector `tv`, or null
@@ -1433,7 +1442,10 @@ fn mapPart(vm: *VM, m: Value, part: enum { key, value }) VmError!Value {
 ///   map    → each x must be a 2-element vector [k v]; assoc
 ///   set    → include each x
 ///   nil    → builds a list (Clojure makes (conj nil 1 2) => (2 1))
+/// `(conj)` is `[]` and `(conj coll)` is `coll`, nil included.
 fn fnConj(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return vector_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+    if (args.len == 1) return args[0];
     const coll = args[0];
     const xs = args[1..];
     const heap = vm.ensureHeap();
@@ -1506,9 +1518,13 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
 // `filterv`, `vec`) go through `vector_mod.fromSlice`.
 
 /// `(range end)` / `(range start end)` / `(range start end step)`
-/// → list of fixnums. A zero step is `:invalid-argument` (there
-/// is no infinite sequence to return).
+/// → the list start, start+step, ... up to but not including end.
+/// Any number works; the elements follow the tower's contagion
+/// (`(range 0 1 0.25)` is `(0 0.25 0.5 0.75)`, `(range 3.0)` is
+/// `(0 1 2)`). A zero step is `:invalid-argument` (there is no
+/// infinite sequence to return).
 fn fnRange(vm: *VM, args: []const Value) VmError!Value {
+    for (args) |a| if (a.kind() != .fixnum) return rangeNumbers(vm, args);
     const start: i64 = if (args.len == 1) 0 else try requireFixnum(args[0]);
     const end: i64 = try requireFixnum(args[if (args.len == 1) 0 else 1]);
     const step: i64 = if (args.len == 3) try requireFixnum(args[2]) else 1;
@@ -1518,6 +1534,23 @@ fn fnRange(vm: *VM, args: []const Value) VmError!Value {
     var i = start;
     while (if (step > 0) i < end else i > end) : (i += step) {
         items.append(vm.allocator, value_mod.fromFixnum(i) orelse return VmError.ArithmeticOverflow) catch return VmError.OutOfMemory;
+    }
+    return try buildListFromSlice(vm, items.items);
+}
+
+/// `range` over any numbers, through the tower.
+fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const start = if (args.len == 1) value_mod.fromFixnum(0).? else try requireNumber(args[0]);
+    const end = try requireNumber(args[if (args.len == 1) 0 else 1]);
+    const step = if (args.len == 3) try requireNumber(args[2]) else value_mod.fromFixnum(1).?;
+    const sign = (try vm_mod.numSign(step)) orelse return VmError.InvalidArgument;
+    if (sign == .eq) return VmError.InvalidArgument;
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    var x = start;
+    while (try vm_mod.numCompare(if (sign == .gt) .lt else .gt, x, end)) : (x = try vm_mod.numAdd(heap, x, step)) {
+        items.append(vm.allocator, x) catch return VmError.OutOfMemory;
     }
     return try buildListFromSlice(vm, items.items);
 }
@@ -1540,8 +1573,10 @@ fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items);
 }
 
-/// `(into to from)` → `to` with every element of `from` conj'd.
+/// `(into to from)` → `to` with every element of `from` conj'd;
+/// `(into)` is `[]` and `(into to)` is `to`.
 fn fnInto(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len < 2) return fnConj(vm, args);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return args[0];
@@ -1781,8 +1816,8 @@ fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireCount(args[0]);
-    var items = try collectSeq(vm, args[1]);
+    const n = if (args.len == 1) 1 else try requireCount(args[0]);
+    var items = try collectSeq(vm, args[args.len - 1]);
     defer items.deinit(vm.allocator);
     const drop = @min(n, items.items.len);
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
@@ -1996,7 +2031,8 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(empty coll)` → an empty collection of the same kind; a
-/// record, being a map, gives `{}`.
+/// record, being a map, gives `{}`; anything that is not a
+/// collection (a string included) gives nil, as in Clojure.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (args[0].kind()) {
@@ -2005,8 +2041,9 @@ fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
         .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
         .persistent_map, .record => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
         .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
-        .string => string_mod.fromBytes(heap, "") catch VmError.OutOfMemory,
-        else => VmError.KindMismatch,
+        // A typed vector takes no updates (TYPED_VECTOR.md §6).
+        .typed_vector => VmError.KindMismatch,
+        else => value_mod.nilValue(),
     };
 }
 
@@ -2038,14 +2075,7 @@ fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
     if (ka != kb) return VmError.KindMismatch;
     return switch (ka) {
         .string => std.mem.order(u8, string_mod.asBytes(a), string_mod.asBytes(b)),
-        .keyword => blk: {
-            const it = vm.ensureInterner();
-            break :blk std.mem.order(u8, it.keywordName(a.asKeywordId()), it.keywordName(b.asKeywordId()));
-        },
-        .symbol => blk: {
-            const it = vm.ensureInterner();
-            break :blk std.mem.order(u8, it.symbolName(a.asSymbolId()), it.symbolName(b.asSymbolId()));
-        },
+        .keyword, .symbol => compareNames(try internedName(vm, a), try internedName(vm, b)),
         .char => std.math.order(a.asChar(), b.asChar()),
         .persistent_vector => blk: {
             const na = vector_mod.count(a);
@@ -2060,6 +2090,20 @@ fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
         },
         else => VmError.KindMismatch,
     };
+}
+
+/// Clojure's order of symbols and keywords: an unqualified name
+/// before any qualified one, then by namespace, then by name.
+fn compareNames(a: []const u8, b: []const u8) std.math.Order {
+    const pa = intern_mod.Interner.splitQualified(a);
+    const pb = intern_mod.Interner.splitQualified(b);
+    if (pa.ns == null and pb.ns != null) return .lt;
+    if (pa.ns != null and pb.ns == null) return .gt;
+    if (pa.ns) |na| {
+        const o = std.mem.order(u8, na, pb.ns.?);
+        if (o != .eq) return o;
+    }
+    return std.mem.order(u8, pa.name, pb.name);
 }
 
 fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
@@ -2208,7 +2252,7 @@ fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
         const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
         return vm.ensureInterner().internQualifiedKeyword(ns, try internedName(vm, args[1])) catch |err| internFailure(err);
     }
-    if (args[0].kind() == .keyword) return args[0];
+    if (args[0].kind() == .keyword or args[0].isNil()) return args[0];
     return vm.ensureInterner().internKeywordValue(try internedName(vm, args[0])) catch |err| internFailure(err);
 }
 
@@ -3150,23 +3194,20 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 // walking the args slice, which is rooted for the call, and never
 // call back into the VM (`docs/GC.md` §11.5, class 1).
 
-/// Append a single Value to `out` in `str`-semantics (display mode
-/// with `nil → empty` override). Used by `str`, `join`, and `spit`.
-/// `print`/`println`/`prn` do NOT go through this — they print
-/// `nil` as the literal `"nil"`.
+/// Append `v` as `str` makes it text (Clojure's `toString`): nil is
+/// empty, a string or char is itself, anything else prints as `pr`
+/// prints it, so the strings inside a collection keep their quotes.
+/// Used by `str`, `join` and `spit`.
 fn appendStrValue(
-    allocator: std.mem.Allocator,
     w: *std.Io.Writer.Allocating,
     v: Value,
     interner: ?*const intern_mod.Interner,
 ) VmError!void {
-    _ = allocator;
-    if (v.kind() == .nil) return; // str/join/spit: nil → "".
-    // `format_mod.Error = std.Io.Writer.Error || error{Utf8Error}` —
-    // WriteFailed bubbles up from the Allocating writer's drain
-    // when the backing allocator fails, so map it to OutOfMemory
-    // (the closest catchable taxonomy entry the VM has).
-    format_mod.format(v, .display, &w.writer, interner) catch |err| switch (err) {
+    if (v.kind() == .nil) return;
+    const mode: format_mod.FormatMode = if (v.kind() == .string or v.kind() == .char) .display else .readable;
+    // The writer is an Allocating buffer: a failed write is an
+    // allocation failure.
+    format_mod.format(v, mode, &w.writer, interner) catch |err| switch (err) {
         error.Utf8Error => return VmError.Utf8Error,
         error.WriteFailed => return VmError.OutOfMemory,
     };
@@ -3177,7 +3218,7 @@ fn fnStr(vm: *VM, args: []const Value) VmError!Value {
     defer w.deinit();
     const interner = vm.ensureInterner();
     for (args) |x| {
-        try appendStrValue(vm.allocator, &w, x, interner);
+        try appendStrValue(&w, x, interner);
     }
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
@@ -3285,115 +3326,62 @@ fn fnStringTrim(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
 }
 
-/// `(nexis.string/split s delim)` — literal split, preserves
-/// trailing empties (unlike Clojure's regex trimming). Returns
-/// a vector.
-///   - Empty delimiter → :invalid-argument
-///   - Invalid UTF-8 in either arg → :utf8-error
+/// `(nexis.string/split s sep)` / `(nexis.string/split s sep limit)`
+/// → a vector of the pieces of `s` between occurrences of the literal
+/// `sep`, as Clojure's `split` with a regex that matches only `sep`:
+/// trailing empty pieces are dropped; a positive `limit` splits at
+/// most `limit - 1` times and keeps the rest whole; a negative one
+/// keeps trailing empties.
+///   - Empty separator → :invalid-argument
+///   - Invalid UTF-8 in either string → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
-    const s = args[0];
-    const delim = args[1];
-    if (s.kind() != .string or delim.kind() != .string) return VmError.KindMismatch;
-    const src = string_mod.asBytes(s);
-    const sep = string_mod.asBytes(delim);
+    if (args[0].kind() != .string or args[1].kind() != .string) return VmError.KindMismatch;
+    const src = string_mod.asBytes(args[0]);
+    const sep = string_mod.asBytes(args[1]);
+    const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
     if (sep.len == 0) return VmError.InvalidArgument;
-    // Validate both arguments as UTF-8 before scanning. Storage
-    // is byte-blob
-    // (STRING.md §2 invariant 4); without validation a delimiter
-    // like a lone 0xC3 byte could match the first byte of a
-    // multibyte codepoint and split mid-character, producing
-    // invalid UTF-8 output from valid-looking inputs. Validation
-    // is O(n) and the input is already byte-walked anyway.
+    // A separator that is not UTF-8 could match the first byte of a
+    // multibyte scalar and split inside it (STRING.md §2).
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
     if (!std.unicode.utf8ValidateSlice(sep)) return VmError.Utf8Error;
 
-    var fragments: std.ArrayList(Value) = .empty;
-    defer fragments.deinit(vm.allocator);
-    const heap = vm.ensureHeap();
-
-    var cursor: usize = 0;
-    while (cursor <= src.len) {
-        // `std.mem.indexOf(u8, haystack[cursor..], sep)` returns an
-        // offset relative to the suffix; remap to an absolute index.
-        const rel = std.mem.indexOf(u8, src[cursor..], sep);
-        if (rel) |r| {
-            const abs = cursor + r;
-            const frag = string_mod.fromBytes(heap, src[cursor..abs]) catch return VmError.OutOfMemory;
-            fragments.append(vm.allocator, frag) catch return VmError.OutOfMemory;
-            cursor = abs + sep.len;
-        } else {
-            const frag = string_mod.fromBytes(heap, src[cursor..]) catch return VmError.OutOfMemory;
-            fragments.append(vm.allocator, frag) catch return VmError.OutOfMemory;
-            break;
-        }
+    var pieces: std.ArrayList([]const u8) = .empty;
+    defer pieces.deinit(vm.allocator);
+    var rest = src;
+    while (limit <= 0 or pieces.items.len + 1 < limit) {
+        const at = std.mem.indexOf(u8, rest, sep) orelse break;
+        pieces.append(vm.allocator, rest[0..at]) catch return VmError.OutOfMemory;
+        rest = rest[at + sep.len ..];
     }
-    return vector_mod.fromSlice(heap, fragments.items) catch return VmError.OutOfMemory;
+    pieces.append(vm.allocator, rest) catch return VmError.OutOfMemory;
+    if (limit == 0 and src.len > 0) {
+        while (pieces.items.len > 0 and pieces.items[pieces.items.len - 1].len == 0) _ = pieces.pop();
+    }
+    const heap = vm.ensureHeap();
+    var out = vector_mod.empty(heap) catch return VmError.OutOfMemory;
+    for (pieces.items) |p| out = vector_mod.conj(heap, out, string_mod.fromBytes(heap, p) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
+    return out;
 }
 
-/// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` —
-/// concatenate stringified elements, optionally separated.
-/// Elements stringify via `appendStrValue` (str-semantics:
-/// nil → "") so `(join [1 nil 2]) → "12"` and
-/// `(join "," [1 nil 2]) → "1,,2"`. Maps are rejected: CHAMP
-/// iteration order isn't pinned.
+/// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` → the
+/// elements of any seqable as `str` makes them text (nil is empty),
+/// separated by `sep`.
 fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
-    const sep_bytes: []const u8 = if (args.len == 2) blk: {
+    const sep: []const u8 = if (args.len == 2) blk: {
         if (args[0].kind() != .string) return VmError.KindMismatch;
         break :blk string_mod.asBytes(args[0]);
-    } else &.{};
-    const coll = if (args.len == 2) args[1] else args[0];
-
-    // Validate the collection kind up front (the kind check
-    // fires before any other branch).
-    switch (coll.kind()) {
-        .nil, .list, .persistent_vector, .persistent_set => {},
-        else => return VmError.KindMismatch,
-    }
-
+    } else "";
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
     const interner = vm.ensureInterner();
+    var it = try makeSeqIter(vm, args[args.len - 1]);
     var first = true;
-
-    const appendSep = struct {
-        fn go(ww: *std.Io.Writer.Allocating, sep: []const u8, firstp: *bool) VmError!void {
-            if (!firstp.*) {
-                // Allocating writer; WriteFailed = allocator-fail.
-                ww.writer.writeAll(sep) catch return VmError.OutOfMemory;
-            }
-            firstp.* = false;
-        }
-    }.go;
-
-    switch (coll.kind()) {
-        .nil => {},
-        .list => {
-            var node = coll;
-            while (node.kind() == .list and !list_mod.isEmpty(node)) {
-                try appendSep(&w, sep_bytes, &first);
-                try appendStrValue(vm.allocator, &w, list_mod.head(node), interner);
-                node = list_mod.tail(node);
-            }
-        },
-        .persistent_vector => {
-            const n = vector_mod.count(coll);
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                try appendSep(&w, sep_bytes, &first);
-                try appendStrValue(vm.allocator, &w, vector_mod.nth(coll, i), interner);
-            }
-        },
-        .persistent_set => {
-            var it = champ_mod.setIter(coll);
-            while (it.next()) |elem| {
-                try appendSep(&w, sep_bytes, &first);
-                try appendStrValue(vm.allocator, &w, elem, interner);
-            }
-        },
-        else => unreachable,
+    while (try it.next()) |x| {
+        if (!first) w.writer.writeAll(sep) catch return VmError.OutOfMemory;
+        first = false;
+        try appendStrValue(&w, x, interner);
     }
-
-    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
+    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch VmError.OutOfMemory;
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
@@ -3541,25 +3529,23 @@ fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(@mod(now.nanoseconds, value_mod.fixnum_max))) orelse VmError.ArithmeticOverflow;
 }
 
-/// `(slurp path)` — read a UTF-8 text file into a String.
-/// 16 MiB cap (matches `cli.zig`'s file-source reader).
-/// Errors: `:invalid-path` for non-string path or empty path;
-/// `:file-not-found` for a missing target; `:utf8-error` for
-/// malformed file content (validation happens after read);
-/// `:io-error` for anything else (permissions, too-large, etc.).
+/// A path argument of `slurp` / `spit`: a string, not empty, with
+/// no NUL byte (`:invalid-path`).
+fn pathArg(v: Value) VmError![]const u8 {
+    if (v.kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(v);
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return VmError.InvalidPath;
+    return path;
+}
+
+/// `(slurp path)` → the file's text. `:file-not-found` for a missing
+/// file, `:utf8-error` for text that is not UTF-8, `:io-error` for
+/// any other failure.
 fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
-    const path = string_mod.asBytes(args[0]);
-    if (path.len == 0) return VmError.InvalidPath;
-    for (path) |b| if (b == 0) return VmError.InvalidPath;
-    const io_handle = vm.io orelse return VmError.IoError;
-    const slice = std.Io.Dir.cwd().readFileAlloc(
-        io_handle,
-        path,
-        vm.allocator,
-        .limited(16 * 1024 * 1024),
-    ) catch |err| switch (err) {
+    const path = try pathArg(args[0]);
+    const slice = std.Io.Dir.cwd().readFileAlloc(ioOf(vm), path, vm.allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
+        error.OutOfMemory => return VmError.OutOfMemory,
         else => return VmError.IoError,
     };
     defer vm.allocator.free(slice);
@@ -3567,29 +3553,30 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), slice) catch return VmError.OutOfMemory;
 }
 
-/// `(spit path content)` — write `(str content)` to a file.
-/// `spit` does NOT auto-create parent
-/// directories (unlike `db/open`); missing parents surface as
-/// `:file-not-found` / `:io-error`. Content stringifies via the
-/// str-semantics wrapper (nil → empty).
+/// `(spit path content)` / `(spit path content :append true)` →
+/// writes `(str content)` to the file, replacing it, or after its
+/// end with `:append`; nil. Parent directories are not created
+/// (`:file-not-found`).
 fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
-    const path = string_mod.asBytes(args[0]);
-    if (path.len == 0) return VmError.InvalidPath;
-    for (path) |b| if (b == 0) return VmError.InvalidPath;
-    const io_handle = vm.io orelse return VmError.IoError;
-
+    const path = try pathArg(args[0]);
+    if (args.len % 2 != 0) return VmError.ArityMismatch;
+    var append = false;
+    var i: usize = 2;
+    while (i < args.len) : (i += 2) {
+        if (args[i].kind() != .keyword or !std.mem.eql(u8, vm.ensureInterner().keywordName(args[i].asKeywordId()), "append")) return VmError.InvalidArgument;
+        append = args[i + 1].isTruthy();
+    }
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    try appendStrValue(vm.allocator, &w, args[1], vm.ensureInterner());
-
-    std.Io.Dir.cwd().writeFile(io_handle, .{
-        .sub_path = path,
-        .data = w.written(),
-    }) catch |err| switch (err) {
+    try appendStrValue(&w, args[1], vm.ensureInterner());
+    const io = ioOf(vm);
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = !append }) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
         else => return VmError.IoError,
     };
+    defer file.close(io);
+    const at = if (append) file.length(io) catch return VmError.IoError else 0;
+    file.writePositionalAll(io, w.written(), at) catch return VmError.IoError;
     return value_mod.nilValue();
 }
 
@@ -4257,28 +4244,6 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
             return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
         },
     }
-}
-
-/// Convert a Value into a list for cons. nil → empty list;
-/// list passes through unchanged; vector becomes a fresh list
-/// of its elements. Other kinds → KindMismatch.
-fn coerceToList(vm: *VM, v: Value) VmError!Value {
-    return switch (v.kind()) {
-        .nil => list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory,
-        .list => v,
-        .persistent_vector => blk: {
-            const heap = vm.ensureHeap();
-            const n = vector_mod.count(v);
-            var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-            var i: usize = n;
-            while (i > 0) {
-                i -= 1;
-                result = list_mod.cons(heap, vector_mod.nth(v, i), result) catch return VmError.OutOfMemory;
-            }
-            break :blk result;
-        },
-        else => VmError.KindMismatch,
-    };
 }
 
 // =============================================================================

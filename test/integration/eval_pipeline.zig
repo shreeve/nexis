@@ -1083,6 +1083,27 @@ test "integration: assoc / dissoc" {
     try expectOutput("(contains? (dissoc {:a 1 :b 2} :a) :b)", "true");
 }
 
+test "integration: get and get-in never throw on a value that is not a collection" {
+    try expectOutput("[(get 5 :a) (get 5 :a :d) (get :k :a) (get inc 0 :d) (get-in {:a 1} [:a :b]) (get-in {:a 1} [:a :b] :d)]", "[nil :d nil :d nil :d]");
+}
+
+test "integration: small Clojure agreements: nth of nil, empty of a string, conj and keyword of nil, compare of qualified names, into with no source" {
+    try expectOutput("[(nth nil 3) (empty \"abc\") (conj nil) (keyword nil) (compare :b :a/c) (compare :a/c :b) (into []) (into) (into [1])]", "[nil nil nil nil -1 1 [] [] [1]]");
+    try expectOutput("[(conj) (conj [1]) (drop-last [1 2 3]) (drop-last nil)]", "[[] [1] (1 2) ()]");
+}
+
+test "integration: range over floats, as Clojure's" {
+    try expectOutput("[(range 0 1 0.25) (range 3.0) (range 0.5 2) (range 1 0 -0.5)]", "[(0 0.25 0.5 0.75) (0 1 2) (0.5 1.5) (1 0.5)]");
+}
+
+test "integration: nexis.math/round is Java's Math/round, exact near one half and past 2^52" {
+    try expectOutput("[(nexis.math/round 0.49999999999999994) (nexis.math/round 4503599627370497.0) (nexis.math/round -0.5) (nexis.math/round 0.5)]", "[0 4503599627370497 0 1]");
+}
+
+test "integration: cons onto any seqable" {
+    try expectOutput("[(cons 1 #{2}) (cons 1 {:a 1}) (cons 1 \"ab\") (cons 0 [1 2]) (cons 0 nil) (cons 0 (list))]", "[(1 2) (1 [:a 1]) (1 a b) (0 1 2) (0) (0)]");
+}
+
 test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get {:a 1} :a)", "1");
     try expectOutput("(get {:a 1} :missing)", "nil");
@@ -1728,6 +1749,13 @@ test "string: str: Clojure-canonical concat shape" {
     try expectOutput("(str (atom 1))", "#<atom>");
 }
 
+test "string: str of a collection prints its elements readably, as Clojure's toString does" {
+    try expectOutput("(str [\"a\" \\b])", "[\"a\" \\b]");
+    try expectOutput("(str {:a \"b\"})", "{:a \"b\"}");
+    try expectOutput("(str \"x\" [nil \"y\"] \\z)", "x[nil \"y\"]z");
+    try expectOutput("(str '(\"q\"))", "(\"q\")");
+}
+
 test "string: str: result is itself a string" {
     try expectOutput("(string? (str \"a\" 1 :b))", "true");
     try expectOutput("(count (str \"héllo\"))", "5");
@@ -1778,6 +1806,12 @@ test "string: end-to-end DB persistence of a string value" {
         \\  (with-tx [tx conn] (db/put! tx r "hello-utf8-é-🦀"))
         \\  (with-read-tx [tx conn] (db/get tx r)))
     , "hello-utf8-é-🦀");
+}
+
+test "spit :append adds to the file; slurp reads it back" {
+    try expectOutputProgramWithStore("spit-append",
+        \\(do (spit "@STORE@" "a") (spit "@STORE@" [1 "b"] :append true) (spit "@STORE@" nil :append true) (slurp "@STORE@"))
+    , "a[1 \"b\"]");
 }
 
 test "db/scan seeks to the start bound and stops before the end bound" {
@@ -1984,12 +2018,15 @@ test "nexis.string: trim: six ASCII whitespace chars; both sides" {
     try expectOutput("(nexis.string/trim \"\u{00A0}x\u{00A0}\")", "\u{00A0}x\u{00A0}");
 }
 
-test "nexis.string: split: literal delimiter, preserves trailing empties" {
-    // Differs from Clojure's regex-trim behavior (STRING.md §8.3).
+test "nexis.string: split: literal delimiter; trailing empties dropped unless the limit is negative, as in Clojure" {
     try expectOutput("(nexis.string/split \"a,b,c\" \",\")", "[a b c]");
-    try expectOutput("(nexis.string/split \"a,b,\" \",\")", "[a b ]");
-    try expectOutput("(nexis.string/split \",,\" \",\")", "[  ]");
-    try expectOutput("(nexis.string/split \"\" \",\")", "[]");
+    try expectOutput("(pr-str (nexis.string/split \"a,b,,c,,\" \",\"))", "[\"a\" \"b\" \"\" \"c\"]");
+    try expectOutput("(pr-str (nexis.string/split \",,\" \",\"))", "[]");
+    try expectOutput("(pr-str (nexis.string/split \"\" \",\"))", "[\"\"]");
+    try expectOutput("(pr-str (nexis.string/split \"a b c\" \" \" 2))", "[\"a\" \"b c\"]");
+    try expectOutput("(pr-str (nexis.string/split \"a b\" \" \" 1))", "[\"a b\"]");
+    try expectOutput("(pr-str (nexis.string/split \"a,,\" \",\" -1))", "[\"a\" \"\" \"\"]");
+    try expectOutput("(pr-str (nexis.string/split \"a,b,,\" \",\" 3))", "[\"a\" \"b\" \",\"]");
     try expectOutput("(nexis.string/split \"a\" \"foo\")", "[a]");
     // Multi-char delim.
     try expectOutput("(nexis.string/split \"a::b::c\" \"::\")", "[a b c]");
@@ -2029,26 +2066,27 @@ test "nexis.string: join: 2-arity inserts separator between elements" {
     try expectOutput("(nexis.string/join \"::\" [\"x\" \"y\" \"z\"])", "x::y::z");
 }
 
-test "nexis.string: join: rejects map; rejects non-string sep" {
-    // STRING.md §8 item 4: a map is `:kind-mismatch`, as is a
-    // non-string separator.
-    try expectOutput("(try (nexis.string/join {:a 1 :b 2}) (catch any e e))", ":kind-mismatch");
+test "nexis.string: join: any seqable; a non-string separator is :kind-mismatch" {
+    try expectOutput("(nexis.string/join \",\" \"abc\")", "a,b,c");
+    try expectOutput("(nexis.string/join \",\" {:a 1})", "[:a 1]");
+    try expectOutput("(nexis.string/join \"-\" #{7})", "7");
+    try expectOutput("(nexis.string/join [\"a\" [1 \"b\"]])", "a[1 \"b\"]");
     try expectOutput("(try (nexis.string/join :sep [1 2]) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/join 42 [1 2]) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/join \",\" 42) (catch any e e))", ":kind-mismatch");
 }
 
 test "nexis.string: join: round-trips with split" {
-    // Useful pin: (join sep (split s sep)) == s when sep is in s
-    // and trailing empties are preserved (STRING.md §8.3).
+    // (join sep (split s sep -1)) is s: a negative limit keeps the
+    // trailing empty pieces a plain split drops.
     try expectOutput(
         \\(let [s "x,y,z" sep ","]
         \\  (nexis.string/join sep (nexis.string/split s sep)))
     , "x,y,z");
     try expectOutput(
         \\(let [s "a,b,," sep ","]
-        \\  (nexis.string/join sep (nexis.string/split s sep)))
-    , "a,b,,");
+        \\  [(nexis.string/join sep (nexis.string/split s sep -1)) (nexis.string/join sep (nexis.string/split s sep))])
+    , "[a,b,, a,b]");
 }
 
 test "nexis.string: replace: literal, all-non-overlapping" {
@@ -2147,9 +2185,9 @@ test "io: print / println / prn / pr-str: no vm.io → :io-error" {
     try expectOutput("(pr-str :a)", ":a");
 }
 
-test "io: slurp / spit: no vm.io → :io-error" {
-    try expectOutput("(try (slurp \"/tmp/anything.txt\") (catch any e e))", ":io-error");
-    try expectOutput("(try (spit \"/tmp/anything.txt\" \"x\") (catch any e e))", ":io-error");
+test "io: slurp / spit: a missing file or directory is :file-not-found" {
+    try expectOutput("(try (slurp \"/nexis-no-such-dir/anything.txt\") (catch any e e))", ":file-not-found");
+    try expectOutput("(try (spit \"/nexis-no-such-dir/anything.txt\" \"x\") (catch any e e))", ":file-not-found");
 }
 
 test "io: slurp / spit: non-string path is :kind-mismatch" {
@@ -3802,7 +3840,7 @@ test "eval: what an evaluated form allocates survives a collection" {
     // a collection here marks nothing of the last run's routine.
     program.v.collectGarbage();
     const out = try program.run("(str (greet) (f) q)");
-    try testing.expectEqualStrings("helloab(1 two :three)", string_mod.asBytes(out));
+    try testing.expectEqualStrings("helloab(1 \"two\" :three)", string_mod.asBytes(out));
 }
 
 test "eval: a VM without compiler hooks throws :no-compiler" {
