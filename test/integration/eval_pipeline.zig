@@ -3915,6 +3915,21 @@ test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive c
     try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
 }
 
+/// A map receiver: every element a native sees is a `[k v]` entry
+/// the iterator builds, reachable from no argument.
+const zmap = "(def m (zipmap (range 40) (range 40))) ";
+
+test "gc: over a map, the entries a native keeps across its callbacks survive cycles" {
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (filter (fn [e] (churn (key e)) (even? (val e))) m)] [(count r) (reduce + (map val r))])", "[20 380]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (remove (fn [e] (churn (key e)) (even? (val e))) m)] [(count r) (reduce + (map val r))])", "[20 400]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (filterv (fn [e] (churn (key e)) true) m)] [(count r) (reduce + (map key r))])", "[40 780]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (take-while (fn [e] (churn (key e)) true) m)] [(count r) (reduce + (map val r))])", "[40 780]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (sort (fn [a b] (churn (key a)) (< (key a) (key b))) m)] [(first r) (last r)])", "[[0 0] [39 39]]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (sort-by (fn [e] (churn (key e)) (- (key e))) m)] [(first r) (last r)])", "[[39 39] [0 0]]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (reductions (fn [a e] (churn (key e)) e) m)] [(count r) (reduce + (map val r))])", "[40 780]");
+    try expectOutputUnderGc(churn ++ "(defrecord P [a b c]) (count (filter (fn [e] (churn (key e)) true) (->P 1 2 3)))", "3");
+}
+
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [a (atom [])] (dotimes [i 40] (swap! a (fn [v] (churn i) (conj v (str i))))) [(count @a) (last @a)])", "[40 39]");
     try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (meta (var v))", "{:i 19}");

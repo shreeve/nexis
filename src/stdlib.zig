@@ -1226,12 +1226,13 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // Rooting (GC.md §3): a collection can run inside any `callValue`.
 // A native's own arguments are rooted for its whole call (the
 // caller's slots, or the root stack when reached through
-// `callValue`), and so is everything reachable from them; a value
-// a callback returned is not, once the native holds it only in a
-// Zig local and calls back again. Every native below that keeps
-// callback results across a further callback pushes them on a
-// `RootScope` first; one whose only held value is the next call's
-// argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
+// `callValue`), and so is everything reachable from them. Two kinds
+// of value are not: a value a callback returned, and a value the
+// iterator built (a map's `[k v]` entry, a boxed typed-vector
+// element). Every native below that keeps either across a further
+// callback pushes it on a `RootScope` first, the second kind by
+// iterating with `rootedSeqIter`; one whose only held value is the
+// next call's argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
 // `db/reduce-tree`) needs nothing, because an argument is rooted
 // for the call that could collect.
 
@@ -1381,7 +1382,7 @@ fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
 fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList(Value)) VmError!void {
     const scope = vm.rootScope();
     defer scope.release();
-    var it = try makeSeqIter(vm, coll);
+    var it = try rootedSeqIter(vm, coll, scope);
     while (try it.next()) |x| {
         const one = [_]Value{x};
         const r = try vm.callValue(pred, &one);
@@ -1391,8 +1392,6 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, out: *std.ArrayList
             .keep_result => if (r.isNil()) null else r,
         };
         if (kept) |v| {
-            // A kept element is reachable from `coll`; a kept
-            // result is not.
             if (mode == .keep_result) try scope.push(v);
             out.append(vm.allocator, v) catch return VmError.OutOfMemory;
         }
@@ -2024,7 +2023,9 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
 fn whileSplit(vm: *VM, take: bool, pred: Value, coll: Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
-    var it = try makeSeqIter(vm, coll);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try rootedSeqIter(vm, coll, scope);
     var dropping = true;
     while (try it.next()) |x| {
         if (dropping) {
@@ -2121,12 +2122,12 @@ fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
 /// intermediate accumulator of the fold.
 fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
-    var it = try makeSeqIter(vm, args[args.len - 1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try rootedSeqIter(vm, args[args.len - 1], scope);
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
-    const scope = vm.rootScope();
-    defer scope.release();
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
     while (try it.next()) |x| {
         acc = try vm.callValue(f, &.{ acc, x });
@@ -2445,6 +2446,9 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator: ?Value, coll: Value) VmError!Val
     defer vm.allocator.free(scratch);
     const scope = vm.rootScope();
     defer scope.release();
+    // A map's entries were built by the walk and are reachable from
+    // nothing else while the key function or comparator runs.
+    if (keyfn != null or comparator != null) try scope.pushAll(items.items);
     for (items.items, 0..) |v, i| {
         const key = if (keyfn) |kf| try vm.callValue(kf, &.{v}) else v;
         if (keyfn != null) try scope.push(key);
@@ -4237,17 +4241,26 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
 
 /// Walks any seqable: nil, list, vector, map or record (as `[k v]`
 /// entries), set, string (as chars).
-const SeqIter = union(enum) {
-    empty,
-    list: Value,
-    vector: struct { v: Value, idx: usize, count: usize },
-    typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
-    map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
-    set: champ_mod.SetIter,
-    string: std.unicode.Utf8Iterator,
+///
+/// A map entry and a boxed typed-vector element are built by the
+/// iterator, so no argument reaches them (docs/GC.md §11.5). A native
+/// that keeps what the iterator yields across a call back into the VM
+/// iterates with `rootedSeqIter`, which pushes each such value on the
+/// native's `RootScope`.
+const SeqIter = struct {
+    state: union(enum) {
+        empty,
+        list: Value,
+        vector: struct { v: Value, idx: usize, count: usize },
+        typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
+        map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
+        set: champ_mod.SetIter,
+        string: std.unicode.Utf8Iterator,
+    },
+    roots: ?vm_mod.RootScope = null,
 
     fn next(self: *SeqIter) VmError!?Value {
-        switch (self.*) {
+        switch (self.state) {
             .empty => return null,
             .list => |*node| {
                 if (list_mod.isEmpty(node.*)) return null;
@@ -4265,11 +4278,11 @@ const SeqIter = union(enum) {
                 if (tv.idx >= tv.count) return null;
                 const e = typed_vector_mod.nth(tv.heap, tv.v, tv.idx) catch return VmError.OutOfMemory;
                 tv.idx += 1;
-                return e;
+                return try self.built(e);
             },
             .map => |*m| {
                 const e = m.it.next() orelse return null;
-                return vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch VmError.OutOfMemory;
+                return try self.built(vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch return VmError.OutOfMemory);
             },
             .set => |*it| return it.next(),
             .string => |*utf8| {
@@ -4277,6 +4290,11 @@ const SeqIter = union(enum) {
                 return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
             },
         }
+    }
+
+    fn built(self: *SeqIter, v: Value) VmError!Value {
+        if (self.roots) |scope| try scope.push(v);
+        return v;
     }
 };
 
@@ -4286,7 +4304,7 @@ const SeqIter = union(enum) {
 /// not valid UTF-8 is `:utf8-error`, as for every other string
 /// operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
-    return switch (coll.kind()) {
+    return .{ .state = switch (coll.kind()) {
         .nil => .empty,
         .list => .{ .list = coll },
         .persistent_vector => .{ .vector = .{ .v = coll, .idx = 0, .count = vector_mod.count(coll) } },
@@ -4298,8 +4316,15 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
         .string => .{
             .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),
         },
-        else => VmError.KindMismatch,
-    };
+        else => return VmError.KindMismatch,
+    } };
+}
+
+/// `makeSeqIter` whose built values stay rooted in `scope`.
+fn rootedSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
+    var it = try makeSeqIter(vm, coll);
+    it.roots = scope;
+    return it;
 }
 
 /// Materialize a seqable into an owned list of Values. The
