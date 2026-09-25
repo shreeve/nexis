@@ -77,9 +77,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero
 - The header locates the instruction that raised the error through
   the routine's span table (`COMPILER.md` §8): the path, the
   1-based line and column of the form the instruction was lowered
-  from, and the `VmError` name. An uncaught throw is
-  `UncaughtThrow` followed by the thrown value as `pr-str` prints
-  it. The source line and a caret under the span follow, exactly as
+  from, and the `VmError` name, then `: ` and the VM's sentence
+  about it when it has one (`ArityMismatch: f takes 1 argument, got
+  0`). An uncaught throw is `UncaughtThrow` followed by the thrown
+  value as `pr-str` prints it. The source line and a caret under the span follow, exactly as
   a compile error's do.
 - One `at` line per frame of the chain the VM recorded
   (`VM.md` §13), innermost first: the routine's name (`defn` and
@@ -88,7 +89,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:4: runtime error: DivideByZero
   listed by name alone since it has no source) and the position of the
   instruction that frame was executing, which for a caller is its
   call. A closure a native called back (`map`, `reduce`) appears
-  as its own frame; the native itself has none.
+  as its own frame; the native itself has none. A chain too deep to
+  list whole (a runaway recursion ending in `StackOverflow`) keeps its
+  innermost and outermost frames with one line between them,
+  `<N frames elided>`, which is no frame and has no `at`.
 - A form that a macro produced reports at the macro call, since
   its forms carry the call's span.
 - The REPL reports under `<repl>` and keeps every line's source,

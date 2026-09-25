@@ -238,7 +238,9 @@ pub const Loader = struct {
                 continue;
             }
             // A nested call, never a retarget of the top frame: the VM
-            // may be running the program that required this text.
+            // may be running the program that required this text. A
+            // failure's detail is this form's, not an earlier one's.
+            self.vm.error_detail = "";
             last = self.vm.runRoutine(routine) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.ControlTransferred => error.ControlTransferred,

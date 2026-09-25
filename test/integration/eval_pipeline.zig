@@ -1249,6 +1249,10 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
+test "integration: flatten and compare of data nested past the stack are :stack-overflow" {
+    try expectOutput("(let [deep (fn [] (reduce (fn [acc _] [acc]) [] (range 200000)))] [(try (flatten (deep)) (catch :stack-overflow e :deep)) (try (compare (deep) (deep)) (catch :stack-overflow e :deep))])", "[:deep :deep]");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");

@@ -9,6 +9,7 @@
 //! REPL session.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
 const compile = @import("compile.zig");
@@ -86,11 +87,15 @@ fn runtimeThread(init: std.process.Init, result: *anyerror!void) void {
 }
 
 fn runCommand(init: std.process.Init) !void {
-    // Every heap block the VM allocates goes through this allocator;
-    // Zig's leak-checking DebugAllocator costs a Debug build most of
-    // its speed, so it is opt-in (`NEXIS_DEBUG_ALLOC`). The unit and
-    // integration tests check leaks under `std.testing.allocator`.
-    const allocator = if (init.environ_map.get("NEXIS_DEBUG_ALLOC") != null) init.gpa else std.heap.smp_allocator;
+    // Every heap block the VM allocates goes through this allocator.
+    // A Debug build keeps the leak check but not the stack trace per
+    // allocation, which costs it three orders of magnitude on
+    // allocation-heavy programs; a release build uses the process's.
+    var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer if (builtin.mode == .Debug) {
+        _ = debug_allocator.deinit();
+    };
+    const allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
@@ -132,28 +137,23 @@ fn usageExit(io: std.Io) noreturn {
 }
 
 /// `nexis: <path>:<line>:<col>: <label>`, then the source line
-/// and a caret under the span.
+/// and a caret under the span. Nothing is cut: a long path, label or
+/// line goes out whole.
 fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, span: reader_mod.SrcSpan) !void {
-    const stderr = std.Io.File.stderr();
+    var buf: [1024]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
+    const w = &stderr.interface;
     const loc = info.lineCol(span.pos);
-    var buf: [512]u8 = undefined;
-    const header = std.fmt.bufPrint(&buf, "nexis: {s}:{d}:{d}: ", .{ info.path, loc.line, loc.col }) catch "nexis: ";
-    try stderr.writeStreamingAll(io, header);
-    try stderr.writeStreamingAll(io, label);
-    try stderr.writeStreamingAll(io, "\n");
+    try w.print("nexis: {s}:{d}:{d}: {s}\n", .{ info.path, loc.line, loc.col, label });
     const line_text = info.lineText(loc.line);
     if (line_text.len > 0) {
-        try stderr.writeStreamingAll(io, "    ");
-        try stderr.writeStreamingAll(io, line_text);
-        try stderr.writeStreamingAll(io, "\n    ");
-        var i: usize = 1;
-        while (i < loc.col) : (i += 1) try stderr.writeStreamingAll(io, " ");
+        try w.print("    {s}\n    ", .{line_text});
+        try w.splatByteAll(' ', loc.col -| 1);
         // One caret per byte of the span, at least one.
-        const span_len: usize = @max(span.len, 1);
-        var j: usize = 0;
-        while (j < span_len) : (j += 1) try stderr.writeStreamingAll(io, "^");
-        try stderr.writeStreamingAll(io, "\n");
+        try w.splatByteAll('^', @max(span.len, 1));
+        try w.writeAll("\n");
     }
+    try w.flush();
 }
 
 const Runtime = struct {
@@ -254,10 +254,10 @@ const Runtime = struct {
     /// `pr-str` prints it. A frame whose routine carries no span
     /// table is listed by name alone.
     fn reportRuntimeError(rt: *Runtime, err: anyerror) !void {
-        const stderr = std.Io.File.stderr();
         var label: std.Io.Writer.Allocating = .init(rt.allocator);
         defer label.deinit();
         try label.writer.print("runtime error: {s}", .{@errorName(err)});
+        if (rt.v.error_detail.len > 0) try label.writer.print(": {s}", .{rt.v.error_detail});
         if (err == vm.VmError.UncaughtThrow) if (rt.v.unhandled_throw) |payload| {
             try label.writer.writeAll(" ");
             format_mod.format(payload, .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
@@ -267,21 +267,26 @@ const Runtime = struct {
         if (trace.len > 0 and trace[0].span != null and trace[0].source != null) {
             try emitSourceError(rt.io, trace[0].source.?, label.written(), .{ .pos = trace[0].span.?.pos, .len = trace[0].span.?.len });
         } else {
-            try stderr.writeStreamingAll(rt.io, "nexis: ");
-            try stderr.writeStreamingAll(rt.io, label.written());
-            try stderr.writeStreamingAll(rt.io, "\n");
+            try std.Io.File.stderr().writeStreamingAll(rt.io, "nexis: ");
+            try std.Io.File.stderr().writeStreamingAll(rt.io, label.written());
+            try std.Io.File.stderr().writeStreamingAll(rt.io, "\n");
         }
+        var buf: [1024]u8 = undefined;
+        var stderr = std.Io.File.stderr().writerStreaming(rt.io, &buf);
+        const w = &stderr.interface;
         for (trace) |frame| {
-            var buf: [1024]u8 = undefined;
-            const line = if (frame.source) |src| blk: {
+            // The marker the VM leaves where it cut a deep chain
+            // (`<N frames elided>`) is no frame to be "at".
+            if (frame.source == null and std.mem.endsWith(u8, frame.name, " frames elided>")) {
+                try w.print("  {s}\n", .{frame.name});
+            } else if (frame.source) |src| {
                 if (frame.span) |span| {
                     const loc = src.lineCol(span.pos);
-                    break :blk std.fmt.bufPrint(&buf, "  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col }) catch continue;
-                }
-                break :blk std.fmt.bufPrint(&buf, "  at {s} ({s})\n", .{ frame.name, src.path }) catch continue;
-            } else std.fmt.bufPrint(&buf, "  at {s}\n", .{frame.name}) catch continue;
-            try stderr.writeStreamingAll(rt.io, line);
+                    try w.print("  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col });
+                } else try w.print("  at {s} ({s})\n", .{ frame.name, src.path });
+            } else try w.print("  at {s}\n", .{frame.name});
         }
+        try w.flush();
     }
 
     /// `v` as `pr` prints it, then a newline, on stdout.

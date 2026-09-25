@@ -46,6 +46,7 @@ const protocol_mod = @import("protocol.zig");
 const nextomic_mod = @import("nextomic/root.zig");
 const transient_mod = @import("coll/transient.zig");
 const loader_mod = @import("loader.zig");
+const stack_guard = @import("stack.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -2053,6 +2054,7 @@ fn fnFlatten(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
+    stack_guard.check() catch return VmError.StackOverflow;
     if (!isSequential(v.kind())) return out.append(vm.allocator, v) catch VmError.OutOfMemory;
     var it = try makeSeqIter(vm, v);
     while (try it.next()) |x| try flattenInto(vm, x, out);
@@ -2280,6 +2282,7 @@ fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
 /// then elementwise. Comparing different kinds is a
 /// `KindMismatch`.
 fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
+    stack_guard.check() catch return VmError.StackOverflow;
     const ka = a.kind();
     const kb = b.kind();
     if (ka == .nil and kb == .nil) return .eq;
