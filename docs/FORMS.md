@@ -76,8 +76,9 @@ foo, ns/foo, set!, ->>               ;; symbol
 Notes:
 
 - `(map k1 v1 k2 v2)` is a **flat** alternation. The reader rejects odd arity.
-- `#%anon-fn` is a **reserved symbol name** (with the literal `%` characters),
-  not a dedicated Datum variant. The macroexpander later rewrites it to
+- `#(...)` reads as the `anon_fn` datum holding the body forms; the
+  pretty-printer renders it with the reserved head `#%anon-fn`, a name user
+  code cannot spell (§8). The macroexpander rewrites it to
   `(fn* [%1 %2 ...] body)`.
 - `syntax-quote` is a **structural marker**. Expansion (auto-qualification,
   auto-gensym `x#`, unquote/splice handling) is the macroexpander's job (PLAN
@@ -172,8 +173,8 @@ boundaries.
 |---|---|---|---|
 | **Parser** (`src/parser.zig`, generated; scanner `src/nexis.zig`) | source text | raw `Sexp` tree with `.src` spans | Tokenization + LALR(1) parse. Drops `#_` and the form it discards. No semantic validation beyond grammar. No normalization. |
 | **Reader / normalizer** (`src/reader.zig`) | raw `Sexp` | canonical `Form` tree | §3 rules. Attaches spans. Normalizes metadata. Lowers `#(...)`. Emits `(syntax-quote f)` marker. Rejects duplicate literal keys / odd map / nested anon-fn / bare unquote. |
-| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. Passes `&form` and `&env`. |
-| **Resolver** (`src/resolve.zig`) | expanded `Form` | `Resolved` AST | Symbols → slot / upvalue / var / special form. Errors on unbound. |
+| **Macroexpander** (`src/expand.zig`) | canonical `Form` | expanded `Form` | Macros to fixpoint. **Expands `syntax-quote` forms.** Resolves `#%anon-fn` to `(fn* ...)`. A macro receives its arguments only (PLAN §23 decision 34). |
+| **Compiler** (`src/compile.zig`) | expanded `Form` | bytecode | Symbols → slot / upvalue / var / special form. Errors on unbound (`docs/COMPILER.md`). |
 
 **Important**: `syntax-quote` expansion happens in the macroexpander, not the
 reader. The reader only tags. This keeps the reader stateless wrt namespaces
@@ -183,7 +184,7 @@ and lets tooling inspect raw reader output without losing backtick structure.
 
 ### 5. Pretty-printer (canonical Form serialization)
 
-Used by `test/golden/*.sexp` expected files and by `nexis -s`. The pretty-
+Used by the `test/golden/*.sexp` expected files (`src/golden.zig`). The pretty-
 printer must be **deterministic, stable, and diff-friendly** — goldens cannot
 tolerate whitespace churn.
 
@@ -195,7 +196,7 @@ tolerate whitespace churn.
   current printer does not measure columns.)
 - Children are indented 2 spaces beyond the opening `(`.
 - Atom notation:
-  - `nil`, `true`, `false` — bare.
+  - `nil` bare; booleans as `(bool true)`, `(bool false)`.
   - Integers: decimal, with a leading `-` for negatives. Hex and binary source
     literals are normalized to decimal in the Form's `datum` — the pretty-
     printer does not preserve the source radix. An integer beyond i64 is a
@@ -203,9 +204,9 @@ tolerate whitespace churn.
   - Floats: Zig's default `{d}` formatting, except special values:
     `+inf`, `-inf`, `+nan` (canonical NaN; the Form stores NaN as a single
     canonical bit pattern — see SEMANTICS §3.2).
-  - Chars: `\a`, `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-    `\backspace` for the named set; all others as `\u{HEX}` with uppercase hex
-    digits and no leading zeros.
+  - Chars: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
+    `\backspace` for the named set; printable ASCII as itself (`\a`, `\(`);
+    all others as `\u{HEX}` with uppercase hex digits and no leading zeros.
   - Strings: double-quoted with `\n \t \r \\ \" \u{HEX}` escapes — same
     escape language as source (PLAN §23 decision 26).
   - Keywords: `:name` or `:ns/name`.
@@ -219,9 +220,8 @@ tolerate whitespace churn.
   canonical order; runtime persistent maps are unordered.
 - Set children render in **source order** for the same reason. Duplicate
   detection already fired at the reader.
-- `user_meta`, when present, is emitted as a second line after the target
-  form, prefixed with `^meta `, and its map uses the same pretty-printer
-  recursively. When `user_meta` is absent, nothing is emitted for it.
+- Metadata is the `with-meta` compound, printed like any other:
+  `(with-meta TARGET META-MAP)`.
 - `ann` is **never** emitted — it is invisible to user code and tooling.
 
 **Example.**
@@ -271,10 +271,9 @@ churn goldens on unrelated edits. The CLI goldens under `test/golden/cli`
 pin them where they are visible, in error carets and `nexis disasm`
 annotations.
 
-For reader **errors**, spans are formatted as `{:line L :col C :end-line L
-:end-col C}` in the error map, where `L`/`C` are 1-based and `end-col` is the
-first column *after* the offending region. This minimal form is stable across
-editor conventions.
+A reader **error** carries the span of the form or token it rejects; the
+CLI reports it as `path:line:col: reader error: :kind detail` with a caret
+under the span (`TOOLING.md` §1), and `read-string` throws `:reader-error`.
 
 ---
 
@@ -287,13 +286,13 @@ editor conventions.
   (numbers in every radix, strings with every escape, chars named and
   hex-escaped, keywords/symbols with and without namespace, all collection
   literals, all reader macros, `#_`, `#(...)`, metadata in every shape).
-- `test/golden/errors/*.nx` each pair with `<name>.err` — a single-map EDN-ish
-  value of the form `{:kind :K, ...slots...}` where `...slots...` are stable
-  diagnostic fields (no raw spans unless the test explicitly exercises span
-  reporting). Example: `{:kind :duplicate-literal-key :key :a}`.
+- `test/golden/errors/*.nx` each pair with `<name>.err`, one line: the
+  error kind, then ` :detail "..."` when the reader gives one, or
+  `:parser-error ParseError` for input the grammar rejects. Example:
+  `:duplicate-literal-key :detail "(keyword :a)"`.
 
-A golden diff is a **reader regression**. The test runner supports a
-`-Dupdate-golden=true` option that overwrites the expected files; use it only
+A golden diff is a **reader regression**. `zig build golden -Dupdate=true`
+overwrites the expected files; use it only
 when intentionally changing the schema, and commit the diff alongside the code
 change so reviewers see both.
 
@@ -339,9 +338,8 @@ quirks, not contract.
 
 ### 9. What FORMS.md does not cover (and why)
 
-- **Macroexpansion rules** — lives in PLAN §14 and future `docs/MACROS.md`.
-- **Resolver / compiler lowering** — lives in PLAN §11 and future
-  `docs/PIPELINE.md`.
+- **Macroexpansion rules** — lives in PLAN §14 and `docs/MACROEXPAND.md`.
+- **Resolver / compiler lowering** — lives in PLAN §11 and `docs/COMPILER.md`.
 - **Serializable kinds** — lives in PLAN §15.10 and `docs/CODEC.md`. Forms
   themselves are **not** serializable values; only the Value-layer outputs of
   quote/compile are.
