@@ -510,7 +510,7 @@ const Ctx = struct {
 
     /// The attribute as a program names it: its ident, else its id.
     fn attrValue(self: *Ctx, a: u32) ?Value {
-        const k = (self.conn.idents.internOf(self.txn, a) catch null) orelse return value.fromFixnum(a);
+        const k = (self.minter.keywordOf(a) catch null) orelse return value.fromFixnum(a);
         return value.fromKeywordId(k);
     }
 

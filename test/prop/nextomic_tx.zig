@@ -681,3 +681,106 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
     }
     try testing.expectEqual(model.log.items.len + 1, logged);
 }
+
+// =============================================================================
+// Cache coherence: after any transaction, committed or failed, the
+// connection that ran it agrees with a fresh one on every ident and
+// every attribute.
+// =============================================================================
+
+const ident_pool = [_][]const u8{ "p/a", "p/b", "p/c", "p/d", "p/e", "p/f", "p/g", "p/h" };
+
+/// `conn` and a connection opened fresh on the same file resolve every
+/// pool name, name every ident id, and describe every attribute alike.
+fn expectAgreesWithFresh(arena: Allocator, tc: *db_mod.TestConn, where: usize) !void {
+    errdefer std.debug.print("caches disagree after transaction {d} (seed 0x{x})\n", .{ where, prng_seed });
+    const fresh = try db_mod.Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer fresh.destroy();
+    const old_db = try tc.conn.db();
+    const new_db = try fresh.db();
+    try testing.expectEqual(new_db.basis, old_db.basis);
+    for (ident_pool) |name| {
+        const k = try kw(tc, name);
+        try testing.expectEqual(try new_db.entid(arena, .{ .ident = k }), try old_db.entid(arena, .{ .ident = k }));
+    }
+    const next_aid = blk: {
+        const txn = try fresh.store.beginRead();
+        defer txn.abort();
+        break :blk try fresh.store.readNextAid(txn);
+    };
+    var id: u32 = 1;
+    while (id < next_aid) : (id += 1) {
+        try testing.expectEqual(try new_db.ident(arena, id), try old_db.ident(arena, id));
+        const want = try new_db.attr(id);
+        const got = try old_db.attr(id);
+        try testing.expectEqual(want == null, got == null);
+        if (want) |w| {
+            const g = got.?;
+            try testing.expectEqual(w.value_type, g.value_type);
+            try testing.expectEqual(w.cardinality, g.cardinality);
+            try testing.expectEqual(w.unique, g.unique);
+            try testing.expectEqual(w.indexed, g.indexed);
+            try testing.expectEqual(w.component, g.component);
+            try testing.expectEqual(w.fulltext, g.fulltext);
+        }
+    }
+}
+
+test "T2 a failed transaction leaves the ident and schema caches as a fresh connection sees them" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(prng_seed ^ 0x1de);
+    const rand = prng.random();
+
+    const tc = try db_mod.TestConn.init("prop_tx_idents");
+    defer tc.deinit();
+    // Attribute ids the store holds: renamed, given keyword values, and
+    // named by the pool.
+    var attrs: std.ArrayList(u32) = .empty;
+    const seed_ops = try attrOps(arena, tc, "k", "p/a", boot.type_keyword, false, false, false);
+    const r0 = try transact.transactOps(tc.conn, arena, seed_ops, .{});
+    try attrs.append(arena, @intCast(r0.tempids[0].eid));
+
+    var committed: usize = 0;
+    var failed: usize = 0;
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var ops: std.ArrayList(Op) = .empty;
+        const n = 1 + rand.uintLessThan(usize, 4);
+        for (0..n) |_| {
+            const name = try kw(tc, ident_pool[rand.uintLessThan(usize, ident_pool.len)]);
+            const a = attrs.items[rand.uintLessThan(usize, attrs.items.len)];
+            switch (rand.uintLessThan(u8, 5)) {
+                // Rename an attribute: the name may be taken or retired,
+                // and a second rename in the same transaction may name it too.
+                0, 1 => try ops.append(arena, .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = boot.ident }, .v = .{ .keyword = name } } }),
+                // A new attribute under a pool name.
+                2 => try ops.appendSlice(arena, try attrOps(arena, tc, try std.fmt.allocPrint(arena, "t{d}", .{i}), ident_pool[rand.uintLessThan(usize, ident_pool.len)], if (rand.boolean()) boot.type_keyword else boot.type_long, false, false, false)),
+                // Name an attribute by a pool keyword, as an entity and
+                // as an attribute, with a keyword value from the pool.
+                3 => try ops.append(arena, .{ .add = .{ .e = .{ .ident = name }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "d" } } } }),
+                else => try ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = "v" } }, .a = .{ .ident = name }, .v = .{ .keyword = try kw(tc, ident_pool[rand.uintLessThan(usize, ident_pool.len)]) } } }),
+            }
+        }
+        // Half the transactions end in a conflict of their own.
+        if (rand.boolean()) {
+            try ops.append(arena, .{ .add = .{ .e = .{ .eid = boot.ident }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "x" } } } });
+            try ops.append(arena, .{ .add = .{ .e = .{ .eid = boot.ident }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "y" } } } });
+        }
+        var fault: db_mod.Fault = .{};
+        const speculative = rand.uintLessThan(u8, 4) == 0;
+        if (speculative) {
+            if (transact.withOps(tc.conn, arena, ops.items, .{ .fault = &fault })) |w| w.destroy() else |_| {}
+        } else if (transact.transactOps(tc.conn, arena, ops.items, .{ .fault = &fault })) |r| {
+            committed += 1;
+            for (r.tempids) |b| {
+                if (b.key != .string or b.key.string[0] != 't') continue;
+                if (key.isAttrPartition(b.eid)) try attrs.append(arena, @intCast(b.eid));
+            }
+        } else |_| failed += 1;
+        try expectAgreesWithFresh(arena, tc, i);
+    }
+    try testing.expect(committed > 10);
+    try testing.expect(failed > 10);
+}

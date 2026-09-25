@@ -21,6 +21,10 @@
 :db/open-failed
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
+{:error :nextomic/conflict, :e 27, :a :db/ident}
+ok an aborted rename is not cached
+ok the attribute keeps its old name
+:nextomic/value-type
 :nextomic/closed
 :nextomic/closed
 :nextomic/closed

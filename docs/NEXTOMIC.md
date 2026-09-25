@@ -268,9 +268,11 @@ so there is no queue; emdb's write lock is the transactor.
    then AEVT, then AVET and VAET after sorting the batch (better leaf
    fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
    including `"t"`.
-7. **Commit**: `wtxn.commit()`, after which the minted idents reach the
-   connection's cache. On any error `wtxn.abort()`: nothing partial can
-   exist (emdb INV-SUB04).
+7. **Commit**: `wtxn.commit()`, after which the idents the transaction
+   minted, renamed or read reach the connection's cache; until then
+   they live in the transaction alone, since the write transaction
+   sees its own uncommitted names. On any error `wtxn.abort()`: nothing
+   partial can exist (emdb INV-SUB04), in the file or in the cache.
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`.
 

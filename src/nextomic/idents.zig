@@ -4,10 +4,12 @@
 //! a name an ident no longer carries, `[0x02][text] -> id`. The cache
 //! maps the VM interner's keyword id to the store's ident id and back.
 //! Invariants:
-//!   - The cache only ever holds committed mappings: a transaction's
-//!     freshly minted idents and renames wait in its `Minter` and enter
-//!     the cache through `Minter.commitCache` after the commit succeeds,
-//!     into room reserved before it, so the publication cannot fail.
+//!   - The cache only ever holds committed mappings: everything a write
+//!     transaction mints, renames or reads from the tree waits in its
+//!     `Minter` and enters the cache through `Minter.commitCache` after
+//!     the commit succeeds, into room reserved before it, so the
+//!     publication cannot fail. `Idents.idOf` and `internOf` remember
+//!     what they read, so they take read transactions only.
 //!   - A text names at most one id, and an id has one live text. A
 //!     rename (`:db/ident` asserted on an attribute entity) moves the
 //!     old text to the retired names, where it stays reserved: it is
@@ -122,22 +124,28 @@ pub const Idents = struct {
     }
 };
 
-/// Ident resolution inside one write transaction: looks through the
-/// cache, then this transaction's mints, then the tree, and mints a new
-/// id from `sys["aid"]` when asked to. `finish` writes the bumped
-/// counter, `reserveCache` makes room in the cache, and `commitCache`
-/// publishes the mints after the commit without allocating.
+/// Ident resolution inside one write transaction: looks through this
+/// transaction's own mappings, then the cache, then the tree, and mints
+/// a new id from `sys["aid"]` when asked to. Nothing reaches the cache
+/// before the commit: the tree read through the write transaction holds
+/// its uncommitted mints and renames, so what a lookup finds there is
+/// kept in `local` and published by `commitCache` only once the commit
+/// succeeds. `finish` writes the bumped counter and `reserveCache`
+/// makes room in the cache, so the publication cannot fail.
 pub const Minter = struct {
     idents: *Idents,
     txn: *Txn,
     arena: Allocator,
+    first_aid: u32,
     next_aid: u32,
-    minted: std.ArrayList(Mint) = .empty,
-    /// Renames of this transaction: the new keyword of an id whose old
-    /// keyword, if the cache holds it, is dropped at commit.
-    renamed: std.ArrayList(Mint) = .empty,
-
-    pub const Mint = struct { intern_id: u32, id: u32 };
+    /// VM keyword id -> ident id for every keyword this transaction
+    /// minted or found in the tree.
+    local: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Ident id -> its new VM keyword id, for every rename of this
+    /// transaction; the id's old keyword names nothing from the rename on.
+    renamed: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Renames written, each of which bumps the store's generation.
+    renames: u64 = 0,
 
     pub const Error = error{
         /// The name was retired by a rename and is never minted again.
@@ -145,39 +153,35 @@ pub const Minter = struct {
     };
 
     pub fn init(idents: *Idents, txn: *Txn, arena: Allocator) !Minter {
-        return .{
-            .idents = idents,
-            .txn = txn,
-            .arena = arena,
-            .next_aid = try idents.store.readNextAid(txn),
-        };
-    }
-
-    fn pending(self: *const Minter, intern_id: u32) ?u32 {
-        for (self.minted.items) |m| {
-            if (m.intern_id == intern_id) return m.id;
-        }
-        return null;
+        const next = try idents.store.readNextAid(txn);
+        return .{ .idents = idents, .txn = txn, .arena = arena, .first_aid = next, .next_aid = next };
     }
 
     /// Existing id of the keyword, or null; never mints. A keyword the
-    /// transaction renamed away from is null even while the cache,
-    /// which changes only at commit, still holds it.
+    /// transaction renamed away from is null.
     pub fn lookup(self: *Minter, intern_id: u32) !?u32 {
-        if (self.idents.by_intern.get(intern_id)) |id| {
-            for (self.renamed.items) |r| if (r.id == id and r.intern_id != intern_id) return null;
-            return id;
-        }
-        if (self.pending(intern_id)) |id| return id;
-        const name = self.idents.interner.keywordName(intern_id);
-        const id = (try self.idents.store.identIdByName(self.txn, name)) orelse return null;
-        try self.idents.remember(intern_id, id);
+        const id = self.local.get(intern_id) orelse self.idents.by_intern.get(intern_id) orelse blk: {
+            const name = self.idents.interner.keywordName(intern_id);
+            const found = (try self.idents.store.identIdByName(self.txn, name)) orelse return null;
+            try self.local.put(self.arena, intern_id, found);
+            break :blk found;
+        };
+        if (self.renamed.get(id)) |now| if (now != intern_id) return null;
         return id;
     }
 
     pub fn lookupName(self: *Minter, name: []const u8) !?u32 {
         const intern_id = try self.idents.interner.internKeyword(name);
         return self.lookup(intern_id);
+    }
+
+    /// VM keyword id of ident `id` as this transaction sees it, or null;
+    /// for fault payloads, so nothing is cached.
+    pub fn keywordOf(self: *Minter, id: u32) !?u32 {
+        if (self.renamed.get(id)) |k| return k;
+        if (self.idents.by_ident.get(id)) |k| return k;
+        const name = (try self.idents.store.identNameById(self.txn, id)) orelse return null;
+        return try self.idents.interner.internKeyword(name);
     }
 
     /// Id of the keyword, minting one when the store has none; a
@@ -190,7 +194,7 @@ pub const Minter = struct {
         if (id == std.math.maxInt(u32)) return error.DatabaseFull;
         self.next_aid += 1;
         try self.idents.store.putIdent(self.txn, name, id);
-        try self.minted.append(self.arena, .{ .intern_id = intern_id, .id = id });
+        try self.local.put(self.arena, intern_id, id);
         return id;
     }
 
@@ -201,38 +205,37 @@ pub const Minter = struct {
         const name = self.idents.interner.keywordName(intern_id);
         if ((try self.idents.store.retiredIdentId(self.txn, name)) != null) return error.RetiredIdent;
         try self.idents.store.renameIdent(self.txn, id, name);
-        try self.renamed.append(self.arena, .{ .intern_id = intern_id, .id = id });
-    }
-
-    /// Did this transaction mint `id`?
-    pub fn mintedId(self: *const Minter, id: u32) bool {
-        for (self.minted.items) |m| {
-            if (m.id == id) return true;
-        }
-        return false;
+        try self.renamed.put(self.arena, id, intern_id);
+        self.renames += 1;
     }
 
     /// Write the bumped counter. Call once before commit.
     pub fn finish(self: *Minter) !void {
-        if (self.minted.items.len > 0) try self.idents.store.writeNextAid(self.txn, self.next_aid);
+        if (self.next_aid != self.first_aid) try self.idents.store.writeNextAid(self.txn, self.next_aid);
     }
 
-    /// Make room in the cache for every mint and rename. Call before
-    /// the commit.
+    /// Make room in the cache for every mapping `commitCache`
+    /// publishes. Call before the commit.
     pub fn reserveCache(self: *Minter) !void {
-        try self.idents.reserve(@intCast(self.minted.items.len + self.renamed.items.len));
+        try self.idents.reserve(@intCast(self.local.count() + self.renamed.count()));
     }
 
-    /// Publish the mints and renames to the room `reserveCache` made,
-    /// and take the generation the renames reached. Call only after a
-    /// successful commit; cannot fail.
+    /// Publish this transaction's mappings to the room `reserveCache`
+    /// made, and take the generation the renames reached. Call only
+    /// after a successful commit; cannot fail. A renamed id's mapping
+    /// comes from the rename alone, whatever `local` found for it.
     pub fn commitCache(self: *Minter) void {
-        for (self.minted.items) |m| self.idents.rememberAssumeCapacity(m.intern_id, m.id);
-        for (self.renamed.items) |m| {
-            if (self.idents.by_ident.get(m.id)) |old| _ = self.idents.by_intern.remove(old);
-            self.idents.rememberAssumeCapacity(m.intern_id, m.id);
+        var it = self.local.iterator();
+        while (it.next()) |m| {
+            if (self.renamed.contains(m.value_ptr.*)) continue;
+            self.idents.rememberAssumeCapacity(m.key_ptr.*, m.value_ptr.*);
         }
-        self.idents.gen += self.renamed.items.len;
+        var rit = self.renamed.iterator();
+        while (rit.next()) |r| {
+            if (self.idents.by_ident.get(r.key_ptr.*)) |old| _ = self.idents.by_intern.remove(old);
+            self.idents.rememberAssumeCapacity(r.value_ptr.*, r.key_ptr.*);
+        }
+        self.idents.gen += self.renames;
     }
 };
 
@@ -273,7 +276,6 @@ test "bootstrap idents resolve both ways and new ones mint after commit" {
         const id = try m.resolve(k_color);
         try testing.expectEqual(store_mod.boot.next_aid, id);
         try testing.expectEqual(id, try m.resolve(k_color));
-        try testing.expect(m.mintedId(id));
         try m.finish();
         txn.abort();
         try testing.expect(idents.by_intern.get(k_color) == null);
