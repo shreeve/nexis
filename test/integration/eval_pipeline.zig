@@ -1117,6 +1117,10 @@ test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
 
+test "integration: *command-line-args* is nil without arguments; read-line needs the host's stdin" {
+    try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
+}
+
 test "integration: core.nx composite + HOFs" {
     try expectOutput("(reduce + 0 (range 10))", "45");
     try expectOutput("(count (filter odd? (range 10)))", "5");
