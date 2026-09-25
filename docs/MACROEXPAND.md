@@ -472,15 +472,15 @@ its special-form dispatcher and which are never user-shadowable
 
 A host macro follows the same rule: every core function its
 output calls is emitted as the qualified symbol `nexis.core/name`
-through `coreSym` (§10b), never bare. `let` destructures through
+(§10b), never bare. `let` destructures through
 `nexis.core/nth`, `nexis.core/next` and `nexis.core/get`; `fn`
 overload dispatch counts and tests through `nexis.core/count`,
 `nexis.core/=`, `nexis.core/<` and `nexis.core/not` and takes a
 clause's rest through `nexis.core/rest`; `case` compares with
 `nexis.core/=`; `for` walks with `nexis.core/seq`,
 `nexis.core/first`, `nexis.core/next` and `nexis.core/conj`;
-`defrecord` builds with `nexis.core/assoc` and tests with
-`nexis.core/=`; `case` and `condp` report through
+`defrecord` reads fields in its methods with `nexis.core/get` and
+tests with `nexis.core/=`; `case` and `condp` report through
 `nexis.core/str`; `@x` is `nexis.core/deref`. So
 `(let [nth (fn [& _] :captured)] (let [[a b] [1 2]] [a b]))` is
 `[1 2]` and `(defn nth ...)` in the user's namespace changes
