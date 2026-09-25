@@ -8,7 +8,7 @@
 //!   key     = attr | (attr opt+) | [attr opt+]
 //!   attr    = :ns/name | :ns/_name        reverse: entities that point
 //!                                         at this one through `name`
-//!   opt     = :limit n | :limit nil | :default v | :as k
+//!   opt     = :limit n | :limit nil | :default v | :as key
 //!   sub     = pattern | ... | depth
 //!
 //! `(limit attr n)` and `(default attr v)` are accepted as well.
@@ -27,7 +27,9 @@
 //!     a component: a component target is pulled with `[*]`.
 //!   - Recursion (`...` or a depth) re-applies the enclosing pattern to
 //!     the target; a target already on the recursion path, or past the
-//!     depth, renders as a plain ref, so cycles terminate.
+//!     depth, renders as a plain ref, so cycles terminate. The walk and
+//!     the pattern parser recurse on the native stack under the stack
+//!     guard: nesting past it is `error.StackOverflow`, never a fault.
 //!   - Explicit specs win over `*` for the attributes they name.
 //!   - An entity with no datoms in the view pulls as nil.
 //!   - Not defined on a history view: `error.HistoryView`.
@@ -50,6 +52,7 @@ const relation = @import("relation.zig");
 const parse_mod = @import("query/parse.zig");
 const plan_mod = @import("query/plan.zig");
 const marshal = @import("marshal.zig");
+const stack = @import("../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -73,7 +76,7 @@ pub const Error = error{
 
 /// Everything a pull can fail with: its own errors, the entity
 /// contract's and the store's.
-pub const Failure = Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
+pub const Failure = Error || stack.Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
 
 /// Card-many values are cut here unless the spec says otherwise.
 pub const default_limit: u32 = 1000;
@@ -172,8 +175,9 @@ const Sub = union(enum) {
 const Spec = struct {
     attr: Attr,
     reverse: bool,
-    /// VM keyword id the value is emitted under.
-    key: u32,
+    /// The key the value is emitted under: the attribute's keyword, or
+    /// what `:as` names.
+    key: Value,
     /// Null: no limit.
     limit: ?u32,
     default: ?Value,
@@ -250,6 +254,7 @@ const Parser = struct {
     }
 
     fn parsePattern(self: *Parser, v: Value) Failure!*Pattern {
+        try stack.check();
         const items = try self.elems(v);
         if (items.len == 0) return self.fail("empty pattern");
         const top = self.index == null;
@@ -350,8 +355,7 @@ const Parser = struct {
             } else if (k == self.k_default) {
                 spec.default = arg;
             } else if (k == self.k_as) {
-                if (arg.kind() != .keyword) return self.fail(":as needs a keyword");
-                spec.key = arg.asKeywordId();
+                spec.key = arg;
             } else return self.fail("unknown attribute option");
         }
         return spec;
@@ -385,7 +389,7 @@ const Parser = struct {
         const spec: Spec = .{
             .attr = attr,
             .reverse = reverse,
-            .key = k,
+            .key = value.fromKeywordId(k),
             .limit = default_limit,
             .default = null,
             .sub = .none,
@@ -406,8 +410,8 @@ const Puller = struct {
     diag: *Diag,
     k_db_id: Value,
     k_db_ident: Value,
-    /// Entities on the current recursion path, root first.
-    path: std.ArrayList(u64) = .empty,
+    /// Entities on the current recursion path.
+    path: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn init(arena: Allocator, read: *Read, heap: *Heap, interner: *Interner, diag: *Diag) !Puller {
         return .{
@@ -419,11 +423,6 @@ const Puller = struct {
             .k_db_id = try interner.internKeywordValue("db/id"),
             .k_db_ident = try interner.internKeywordValue("db/ident"),
         };
-    }
-
-    fn fail(self: *Puller, message: []const u8) error{PullSyntax} {
-        self.diag.* = .{ .message = message };
-        return error.PullSyntax;
     }
 
     /// The eid of an entity argument: an eid, a lookup ref or an ident.
@@ -440,12 +439,8 @@ const Puller = struct {
 
     fn root(self: *Puller, pat: *const Pattern, e: u64) Failure!?Value {
         self.path.clearRetainingCapacity();
-        try self.path.append(self.arena, e);
+        try self.path.put(self.arena, e, {});
         return self.entity(pat, e, pat.budget);
-    }
-
-    fn onPath(self: *const Puller, e: u64) bool {
-        return std.mem.indexOfScalar(u64, self.path.items, e) != null;
     }
 
     fn assoc(self: *Puller, m: Value, k: Value, v: Value) !Value {
@@ -470,13 +465,14 @@ const Puller = struct {
     /// The pattern applied to `e`: null when the entity has no datoms
     /// in this view. `budget` is the remaining depth per spec.
     fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u32) Failure!?Value {
+        try stack.check();
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
         var any = false;
         var covered: std.AutoHashMapUnmanaged(u32, void) = .empty;
 
         for (pat.specs, 0..) |*s, i| {
-            const k = value.fromKeywordId(s.key);
+            const k = s.key;
             if (try self.specValue(pat, s, i, e, budget)) |v| {
                 m = try self.assoc(m, k, v);
                 any = true;
@@ -513,7 +509,7 @@ const Puller = struct {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
-        const spec: Spec = .{ .attr = attr, .reverse = false, .key = k, .limit = default_limit, .default = null, .sub = .none };
+        const spec: Spec = .{ .attr = attr, .reverse = false, .key = value.fromKeywordId(k), .limit = default_limit, .default = null, .sub = .none };
         const cut = if (spec.many()) @min(vals.len, default_limit) else 1;
         const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
         return self.assoc(m, value.fromKeywordId(k), v);
@@ -578,9 +574,9 @@ const Puller = struct {
     }
 
     fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u32) Failure!Value {
-        if (self.onPath(target)) return self.refMap(target);
-        try self.path.append(self.arena, target);
-        defer _ = self.path.pop();
+        if (self.path.contains(target)) return self.refMap(target);
+        try self.path.put(self.arena, target, {});
+        defer _ = self.path.remove(target);
         return (try self.entity(pat, target, budget)) orelse self.refMap(target);
     }
 };
@@ -855,6 +851,41 @@ test "nested patterns, reverse refs, recursion with cycles, depth" {
     try testing.expectEqualStrings("Bob", string_mod.asBytes((try fx.getName(vector_mod.nth((try fx.getName(mixed, "p/friend")).?, 0), "p/name")).?));
 }
 
+test "a recursion past the stack guard is StackOverflow, and the path set stops long cycles" {
+    const fx = try Fx.init("pull_deep");
+    defer fx.deinit();
+    try installSchema(fx);
+    const a = fx.arena();
+    const boss = try fx.attrId("p/boss");
+    // A ring of 100: each entity's boss is the next, the last's the first.
+    const n = 100;
+    var ops: std.ArrayList(Op) = .empty;
+    for (0..n) |i| {
+        const me: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{i}) } };
+        const next: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{(i + 1) % n}) } };
+        try ops.append(a, .{ .add = .{ .e = me, .a = .{ .id = boss }, .v = .{ .entity = next } } });
+    }
+    const r = try transact_mod.transactOps(fx.tc.conn, a, ops.items, .{});
+    const first = Fx.int(@intCast(r.tempids[0].eid));
+    const dbv = try fx.db();
+    const pattern = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/boss"), try fx.sym("...") })});
+
+    // The whole ring pulls, ending in a plain ref back to the start.
+    var m = try fx.pullOne(dbv, pattern, first);
+    var depth: usize = 0;
+    while (try fx.getName(m, "p/boss")) |next| : (depth += 1) m = next;
+    try testing.expectEqual(@as(usize, n), depth);
+    try testing.expectEqual(first.asFixnum(), (try fx.getName(m, "db/id")).?.asFixnum());
+
+    // A small guard: the same walk, and a deeply nested pattern, fail cleanly.
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    try testing.expectError(error.StackOverflow, fx.pullOne(dbv, pattern, first));
+    var deep = try fx.vec(&.{try fx.kw("p/boss")});
+    for (0..5000) |_| deep = try fx.vec(&.{try fx.map(&.{ try fx.kw("p/boss"), deep })});
+    try testing.expectError(error.StackOverflow, fx.pullOne(dbv, deep, first));
+}
+
 test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
     const fx = try Fx.init("pull_opts");
     defer fx.deinit();
@@ -907,7 +938,6 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
         .{ .pattern = try fx.vec(&.{try fx.kw("p/_name")}), .message = "reverse reference on a non-ref attribute", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit") })}), .message = "attribute options come in pairs", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), try fx.str("x") })}), .message = ":limit needs a non-negative integer or nil", .clause = 0 },
-        .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("as"), Fx.int(1) })}), .message = ":as needs a keyword", .clause = 0 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("zap"), Fx.int(1) })}), .message = "unknown attribute option", .clause = 0 },
         .{ .pattern = try fx.vec(&.{ try fx.kw("p/name"), try fx.lst(&.{ try fx.sym("zap"), try fx.kw("p/tags"), Fx.int(1) }) }), .message = "unknown attribute expression", .clause = 1 },
         .{ .pattern = try fx.vec(&.{try fx.lst(&.{})}), .message = "empty attribute expression", .clause = 0 },

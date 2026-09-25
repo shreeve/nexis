@@ -1309,6 +1309,14 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
 }
 
+test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
+    try expectOutput(
+        \\(let [t (transient [])]
+        \\  [(= (hash t) (hash t)) (count (conj #{t} t (transient []))) (get {t 1} t)
+        \\   (= t (transient [])) (= t [])])
+    , "[true 2 1 false false]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
@@ -2196,6 +2204,19 @@ test "storage failures surface as :db/<reason> keywords inside try" {
         \\   (try (db/open "/nexis-no-such-directory/sub/store.edb")
         \\        (catch any e e))])
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
+}
+
+test "a value nested past the codec's max depth is refused with a catchable error; max depth round-trips" {
+    // CODEC.md §2.7: max_depth is 4096.
+    try expectOutputProgramWithStore("seam-deep",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [acc]) acc)))
+        \\  [(try (do (db/put-key! (db/ref conn :t :deep) (nest 4097)) :stored)
+        \\        (catch any e (keyword? e)))
+        \\   (do (db/put-key! (db/ref conn :t :ok) (nest 4096))
+        \\       (= (nest 4096) (db/get-key (db/ref conn :t :ok))))])
+    , "[true true]");
 }
 
 test "the VM keeps running after a caught storage failure" {

@@ -6,37 +6,31 @@ Authoritative wire-format and API contract for `src/codec.zig`. Derivative from 
 `docs/VALUE.md` §2 (Kind numbering). Those documents win on
 conflict.
 
-The format is the **v1 wire format**: it satisfies the PLAN §20.2
-codec round-trip property and leaves room for a byte-incompatible
-successor via the version envelope. Cross-process byte-canonicality
-for collections with non-deterministic iteration order (map, set)
-is not provided; within-process round-trip equality + hash
-preservation is the contract.
+The format is the **v1 wire format**, the value half of every durable
+ref and the Nextomic transaction log: bytes written by one process are
+read by another, so the format is frozen (§9). It satisfies the PLAN
+§20.2 codec round-trip property and leaves room for a successor via the
+version envelope. Cross-process byte-canonicality for collections with
+non-deterministic iteration order (map, set) is not provided.
 
 ---
 
 ### 1. Scope
 
 **In (v1 codec):**
-- Every kind allocatable in the v1 runtime: `nil`, `false_`,
-  `true_`, `char`, `fixnum`, `float`, `keyword`, `symbol`,
-  `string`, `bignum`, `list`, `persistent_vector`,
-  `persistent_map`, `persistent_set`, `typed_vector`.
+- The data kinds: `nil`, `false_`, `true_`, `char`, `fixnum`,
+  `float`, `keyword`, `symbol`, `string`, `bignum`, `list`,
+  `persistent_vector`, `persistent_map`, `persistent_set`,
+  `typed_vector`, nested at most `max_depth` (4096) deep (§2.7).
 - Encode: `Value → []u8`. Decode: `[]u8 → Value`.
 - Version envelope for future format evolution.
 - Deterministic within-process round-trip: `(= v (decode(encode(v))))`
   and `hash(v) = hash(decode(encode(v)))`.
 
 **Out (v1 codec):**
-- `byte_vector`: a kind reserved in VALUE.md §2 with no
-  implementation; `durable_ref`: an identity into a store
-  (`docs/DB.md` §9). Public codec API returns
-  `error.UnserializableKind` if encountered; internal assertions may
-  panic loudly for truly-impossible inputs (public API = typed
-  error; "this can't happen" = assert).
-- `function`, `var_`, `transient`, `error_`, `meta_symbol`:
-  non-serializable per PLAN §15.10 + §23 #25. Public API returns
-  `error.UnserializableKind`.
+- Every other kind (§3): identity-valued, mutable or process-local.
+  Encode returns `error.UnserializableKind`; decode returns the same
+  error for a byte that names such a kind.
 - **Metadata is never serialized.** SEMANTICS §7 /
   PLAN §8.5: metadata never participates in equality or hash; the
   codec respects this by discarding `HeapHeader.meta` during
@@ -110,21 +104,28 @@ VALUE.md §2 numeric values):
 - **Fixed little-endian for bignum limbs** — bignum magnitudes are
   large by definition (canonicalization guarantees magnitude >
   i48 range per BIGNUM.md §1). Varint overhead per limb would be
-  wasted. Decode bounds the input it needs from the limb count
-  before allocating, so a count past the input is `TruncatedInput`,
-  never an allocation failure.
+  wasted.
 - **Fixed little-endian for typed-vector elements** — the elements
   are unboxed `i64` / `f64` in memory; the wire form is the same
-  eight bytes each, so decode can bound the input it needs from the
-  count before allocating (a count past the input is
-  `TruncatedInput`, an element tag other than 1 or 3 is
-  `MalformedPayload`).
+  eight bytes each. An element tag other than 1 or 3 is
+  `MalformedPayload`.
+- **Every length and count is bounded by the input before anything
+  is allocated for it.** A LEB128 value can be anything up to
+  2^64 − 1, so decode compares it with the bytes that remain, never
+  adds it to the cursor: each string byte, list, vector or set
+  element takes at least one byte, each map entry two, each limb or
+  typed-vector element eight. A count past what remains is
+  `TruncatedInput`, never an overflow or an allocation sized by the
+  count. The tenth byte of a LEB128 may carry only bit 63; more is
+  `InvalidLeb128`. Overlong encodings (`80 00` for 0) name the same
+  number and are accepted; encode never writes them.
 
 #### 2.2 Keyword / symbol / string byte-exactness
 
 Encoded as length-prefixed **raw bytes** of the interned name (for
 keyword / symbol) or the string body (for string). Byte-exact;
-codec does NOT validate UTF-8 at the encode or decode boundary.
+codec does NOT validate UTF-8 at the encode or decode boundary
+(`docs/STRING.md` §2.4 states the same).
 
 Rationale (STRING.md §2 invariant 4 + INTERN.md §1 invariant 4):
 runtime-constructed strings / keyword / symbol names are byte-
@@ -183,11 +184,10 @@ not canonical. Policies:
   equality is preserved because `hash(bignum(N)) == hash(fixnum(N))`
   never arises — canonicalization ensures only one representation
   exists per mathematical value (BIGNUM.md §1).
-- **Map / set with duplicate keys / elements**: reconstruction
-  proceeds via normal `mapAssoc` / `setConj` which handle
-  duplicates (later wins for map; deduplicated for set). Decode
-  does NOT reject duplicates; the reconstructed collection's count
-  reflects unique entries only.
+- **Map / set with duplicate keys / elements**: encode never writes
+  one, so a map or set whose decoded distinct entries fall short of
+  its count is corrupt input: `MalformedPayload`. A corrupt file
+  never decodes silently to different data.
 - **NaN bit patterns that aren't canonical**: decode re-canonicalizes
   via `value.fromFloat`. Any NaN input produces the canonical NaN
   output bits.
@@ -197,6 +197,17 @@ encode never emits a non-canonical bignum). Decode leniency
 is defensive against input that another encoder version or an
 external producer might emit.
 
+#### 2.7 Nesting depth
+
+The outermost value is at depth 0 and a container's elements sit one
+deeper. `codec.max_depth` is 4096: encode refuses a value with anything
+deeper as `UnserializableKind` (a catchable error at the language
+boundary, never a crash), and decode treats deeper input as
+`MalformedPayload` (corrupt: encode never writes it). One bound on both
+sides means every value written reads back. Both recursions keep a
+nesting level to two small frames (well under 1 KiB in Debug builds),
+so the bound fits the default 8 MiB stack in every build mode.
+
 ---
 
 ### 3. Non-serializable kinds
@@ -205,20 +216,20 @@ From PLAN §15.10 / §23 #25 (frozen):
 
 | Kind | Reason |
 |---|---|
-| `function` / closure | Code, upvalues, captured VM state are process-local. |
+| `function`, `native_fn` | Code, upvalues, captured VM state are process-local. |
 | `var_` | Identity + mutation machinery are process-local. Serialize the root value instead. |
 | `transient` | Mutable by definition. Only `persistentBang`-ed results cross the codec. |
-| `namespace` | Process-local binding table. |
-| `tx handle` / `emdb.Env` connection | Open OS resources. |
-| `error_` | Stack traces carry process-local frame references. |
-| `meta_symbol` | Process-local wrapper (kind 29); non-serializable per the metadata discipline. |
-| `byte_vector` | Reserved kind with no implementation. |
+| `atom` | A mutable identity (`docs/ATOM.md` §6). |
+| `record`, `protocol`, `protocol_fn` | Their type and protocol ids are dense per-VM numbers with no meaning in another process (`docs/PROTOCOLS.md` §0). |
+| `db_connection`, `db_write_txn`, `db_read_txn` | Open OS resources. |
 | `durable_ref` | An identity into a store; the value half of a durable pair is codec bytes, but a ref inside a value is `:unserializable` (`docs/DB.md` §9). |
 | `nextomic_conn`, `nextomic_db`, `nextomic_entity` | Process-local: a Nextomic connection, the db-values taken from it and the entities read through them name a `Conn` the VM owns (`docs/NEXTOMIC.md` §6, §8). |
 
-Attempting to encode any of these returns
-`error.UnserializableKind` at the public API. No silent stubs, no
-lossy round-trips.
+Encoding any of these returns `error.UnserializableKind`, and decoding
+a kind byte that names one returns the same error; a byte that names no
+kind (the reserved immediates 8..15, the reserved heap bytes, the
+runtime-private sentinels 64 and up) is `InvalidKindByte`. No silent
+stubs, no lossy round-trips.
 
 ---
 
@@ -246,46 +257,22 @@ values in `test/prop/codec.zig`.
 
 ```zig
 pub const CodecError = error{
-    /// Attempt to encode/decode a kind excluded from the v1
-    /// Serializable set (§1 "Out"): function, var_, transient,
-    /// namespace, error_, meta_symbol, byte_vector, durable_ref.
-    UnserializableKind,
-
-    /// Decode ran out of bytes mid-value.
-    TruncatedInput,
-
-    /// `decode` consumed a valid value but input has extra bytes.
-    /// Exactly one envelope + body expected per decode call.
-    TrailingBytes,
-
-    /// Envelope version bytes don't match a version this build
-    /// understands. v1 accepts only `[1, 0]`.
-    InvalidVersion,
-
-    /// First byte of a ValueEncoding doesn't map to any recognized
-    /// Kind in the Kind enum (i.e., byte is outside the valid
-    /// numeric range). Distinct from `UnserializableKind`, which is
-    /// returned when the kind IS recognized but not serializable.
-    InvalidKindByte,
-
-    /// Per-kind payload field is structurally invalid: bignum sign
-    /// byte not in {0, 1}, or similar per-kind field that doesn't
-    /// fit a more specific error. `InvalidKindByte` is not
-    /// overloaded for per-kind fields.
-    MalformedPayload,
-
-    /// Unsigned LEB128 decode produced a value that doesn't fit
-    /// in u64, or the encoding itself is malformed (e.g., 11+
-    /// continuation bytes).
-    InvalidLeb128,
-
-    /// Char encoding decoded to a surrogate (0xD800..0xDFFF) or
-    /// value > 0x10FFFF. Matches `value.fromChar` rejection.
-    InvalidCharScalar,
+    UnserializableKind, // a kind outside §1, or nesting past max_depth (encode)
+    TruncatedInput,     // the input ends mid-value, or a count exceeds what remains
+    TrailingBytes,      // a whole value, then more bytes
+    InvalidVersion,     // envelope other than [1, 0]
+    InvalidKindByte,    // a byte that names no kind
+    InvalidLeb128,      // a LEB128 past u64
+    InvalidCharScalar,  // a surrogate or a scalar past 0x10FFFF
+    MalformedPayload,   // a bad per-kind field, a count that disagrees
+                        // with the distinct entries, nesting past max_depth
 };
+
+pub const max_depth: u32 = 4096;
 
 pub fn encode(
     allocator: std.mem.Allocator,
+    interner: *const Interner,
     v: Value,
 ) (CodecError || std.mem.Allocator.Error)![]u8;
 
@@ -295,7 +282,7 @@ pub fn decode(
     bytes: []const u8,
     elementHash: *const fn (Value) u64,
     elementEq: *const fn (Value, Value) bool,
-) (CodecError || std.mem.Allocator.Error || error{Overflow})!Value;
+) DecodeError!Value; // CodecError, allocation and interning errors
 ```
 
 **`encode`** walks the Value graph (recursively for containers),
@@ -306,34 +293,19 @@ Returns the owned byte slice; caller frees.
 triggers `error.TrailingBytes`. Takes `*Heap` (for allocating
 strings / bignums / collections), `*Interner` (for re-interning
 keywords / symbols), and hash/eq callbacks (for reconstructing
-maps/sets via `hamt.mapAssoc` / `setConj`).
+maps/sets via `champ.mapAssoc` / `setConj`).
 
 Neither function mutates the input or any existing Value — both
 are pure producers.
 
 ---
 
-### 6. One-way terminal module (dispatch/gc/transient discipline)
+### 6. Callers
 
-`codec.zig` imports every kind module that has serializable
-content. Nothing imports `codec.zig`:
-
-```
-src/codec.zig
-├── @import("value")
-├── @import("heap")
-├── @import("intern")
-├── @import("hash")
-├── @import("string")
-├── @import("bignum")
-├── @import("list")
-├── @import("vector")
-├── @import("champ")
-└── @import("typed_vector")
-```
-
-This matches the `src/dispatch.zig` / `src/gc.zig` / `src/coll/transient.zig`
-one-way-terminal pattern.
+`src/db.zig` (durable refs), `src/stdlib.zig` (`db/scan`,
+`db/reduce-tree`) and `src/nextomic/datom.zig` (the transaction log)
+call `encode` and `decode`; the codec imports only the value layer and
+the collection modules it walks.
 
 ---
 
@@ -347,13 +319,19 @@ Inline tests in `src/codec.zig`:
 - Truncation rejection for a half-written envelope.
 - Trailing-byte rejection.
 - Malformed varint rejection.
-- Malformed UTF-8 rejection.
 - Surrogate char rejection.
-- Invalid-kind-byte rejection.
+- Every kind byte outside §1: `UnserializableKind` for a kind,
+  `InvalidKindByte` for a byte that names none.
 - `UnserializableKind` on encoding a transient wrapper.
+- Hostile lengths and counts (§2.1): a string, keyword or symbol
+  length near 2^64, a bignum, typed-vector, list, vector, map or set
+  count past the input: `TruncatedInput`, with nothing allocated.
+- Depth (§2.7): a value exactly `max_depth` deep round-trips, one
+  level more is `UnserializableKind`; 200 000 levels of input is
+  `MalformedPayload`.
 - Canonicalization policies (§2.6): bignum with trailing zeros
-  round-trips to a fixnum; map with duplicate keys in byte input
-  round-trips to a deduplicated map.
+  round-trips to a fixnum; a map or set with a duplicate in its byte
+  input is `MalformedPayload`.
 
 Property tests in `test/prop/codec.zig`:
 
@@ -380,6 +358,12 @@ between equal values built via different paths.
 either succeed (producing some Value) or return a `CodecError`;
 no panic, no infinite loop, no memory corruption. 1000 trials of
 random bytes.
+
+**C5. Hostile structure**: 500 inputs built to attack the bounds:
+LEB128 lengths and counts near 2^64 or past the input behind runs of
+nested containers, some past `max_depth`. Each ends in a typed error
+(never `OutOfMemory`), and a failed decode allocates no more than the
+nesting it read.
 
 `test/prop/typed_vector.zig` T1 is the typed-vector round trip
 (both element types, lengths 0, 1, 31, 32, 33 and 1000, equality,
@@ -412,6 +396,9 @@ general robustness property against malformed input.
 
 ### 9. Stability
 
-The v1 format is **stable within a process** but NOT frozen for
-cross-version byte compatibility; any byte-level change bumps the
-major or minor version in the envelope.
+The v1 format is the on-disk format of every durable value and the
+Nextomic transaction log, so it is **frozen**: a build reads what an
+earlier build wrote. The kind bytes are the `Kind` numbers of
+`docs/VALUE.md` §2, which are never renumbered (a retired kind leaves a
+reserved gap). Any byte-level change bumps the major or minor version
+in the envelope.

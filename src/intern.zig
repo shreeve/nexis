@@ -37,13 +37,6 @@ pub const InternError = error{
     InternTableFull,
 };
 
-pub const SplitError = error{
-    EmptyName,
-    EmptyNamespace,
-    EmptyLocalName,
-    MultipleSlashes,
-};
-
 // =============================================================================
 // Private table — shared shape for keyword + symbol
 // =============================================================================
@@ -95,9 +88,9 @@ fn internInto(table: *Table, gpa: Allocator, name: []const u8) InternError!u32 {
 }
 
 /// Look up `id` in `table`. Panics unconditionally on out-of-range
-/// ids in every build mode: an invalid id is a runtime-bug leak
-/// upstream, matching the fail-fast discipline `eq.zig` uses for
-/// sentinel escape. Contract is pinned in `docs/INTERN.md` §2.
+/// ids in every build mode: every id comes from this table, so an
+/// invalid one is a runtime bug upstream. Contract is pinned in
+/// `docs/INTERN.md` §2.
 fn nameFrom(table: *const Table, id: u32) []const u8 {
     if (id >= table.names.items.len) {
         std.debug.panic(
@@ -116,6 +109,10 @@ pub const Interner = struct {
     gpa: Allocator,
     keyword: Table = .{},
     symbol: Table = .{},
+    /// `ns.Type` of each record type, by its dense per-VM type id; an
+    /// empty slice for an id not yet named. The printer's source for
+    /// `#ns.Type{...}` (INTERN.md §2).
+    record_types: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(gpa: Allocator) Interner {
         return .{ .gpa = gpa };
@@ -124,7 +121,29 @@ pub const Interner = struct {
     pub fn deinit(self: *Interner) void {
         self.keyword.deinit(self.gpa);
         self.symbol.deinit(self.gpa);
+        for (self.record_types.items) |name| self.gpa.free(name);
+        self.record_types.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    // ---- Record type names ----
+
+    /// Name record type `type_id` as `ns.name`, the way Clojure
+    /// prints a record's class.
+    pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) Allocator.Error!void {
+        const full = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns, name });
+        errdefer self.gpa.free(full);
+        while (self.record_types.items.len <= type_id) try self.record_types.append(self.gpa, &.{});
+        self.gpa.free(self.record_types.items[type_id]);
+        self.record_types.items[type_id] = full;
+    }
+
+    /// The `ns.Type` name of record type `type_id`, or null when the
+    /// type was never named.
+    pub fn recordTypeName(self: *const Interner, type_id: u32) ?[]const u8 {
+        if (type_id >= self.record_types.items.len) return null;
+        const name = self.record_types.items[type_id];
+        return if (name.len == 0) null else name;
     }
 
     // ---- Raw intern: name -> id ----
@@ -162,8 +181,9 @@ pub const Interner = struct {
     }
 
     /// Split an interned `ns/name` text back into its parts at its
-    /// first slash; `ns` is null for an unqualified name. The bare
-    /// division symbol `/` is an unqualified name, as in `split`.
+    /// first slash, as Clojure's `namespace` and `name` do; `ns` is
+    /// null for an unqualified name. The bare division symbol `/` is
+    /// an unqualified name (INTERN.md §3).
     pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 } {
         if (std.mem.eql(u8, full, "/")) return .{ .ns = null, .name = full };
         const slash = std.mem.indexOfScalar(u8, full, '/') orelse return .{ .ns = null, .name = full };
@@ -177,9 +197,8 @@ pub const Interner = struct {
 
     // ---- Accessors: id -> name ----
     //
-    // Panic (via assert) on out-of-range id. An invalid id here is a
-    // runtime-bug leak upstream, never a user-surfaceable condition.
-    // Matches the fail-fast discipline in `eq.zig` for sentinel escape.
+    // Panic on an out-of-range id: a runtime bug upstream, never a
+    // user-surfaceable condition.
 
     pub fn keywordName(self: *const Interner, id: u32) []const u8 {
         return nameFrom(&self.keyword, id);
@@ -196,66 +215,7 @@ pub const Interner = struct {
     pub fn symbolCount(self: *const Interner) u32 {
         return @intCast(self.symbol.names.items.len);
     }
-
-    // ---- GC-root tracing seam (PLAN §10.5) ----
-    //
-    // A no-op: name bytes are plain allocations, not heap objects
-    // with a `HeapHeader`. This seam exists so GC wiring can
-    // register the interner as a root without reshaping the public
-    // struct. If heap-owned names arrive (e.g.
-    // if interned names ever move to the runtime heap), iterate
-    // `self.keyword.names` and `self.symbol.names` and call
-    // `visitor.visit(entry)` here.
-    pub fn trace(self: *Interner, visitor: anytype) void {
-        _ = self;
-        _ = visitor;
-    }
 };
-
-// =============================================================================
-// split — namespace/local decomposition
-//
-// Pure function; reachable outside the reader. Robust against
-// malformed raw inputs per INTERN.md §3.
-// =============================================================================
-
-pub const Qualified = struct {
-    ns: ?[]const u8,
-    local: []const u8,
-};
-
-pub fn split(name: []const u8) SplitError!Qualified {
-    if (name.len == 0) return error.EmptyName;
-
-    // Bare "/" is the division symbol — an unqualified name whose
-    // local part literally is "/". This is INTENTIONAL: it matches
-    // nexis.grammar (which permits bare `/` as a legal symbol) and
-    // Clojure's `clojure.core//` convention. Without this carve-out,
-    // `"/"` would fall through to the single-slash path and error as
-    // `EmptyNamespace` / `EmptyLocalName`. Pinned in INTERN.md §3.
-    if (name.len == 1 and name[0] == '/') {
-        return .{ .ns = null, .local = name };
-    }
-
-    var slash_count: usize = 0;
-    var slash_at: usize = 0;
-    for (name, 0..) |c, i| {
-        if (c == '/') {
-            slash_count += 1;
-            if (slash_count > 1) return error.MultipleSlashes;
-            slash_at = i;
-        }
-    }
-
-    if (slash_count == 0) return .{ .ns = null, .local = name };
-
-    // Exactly one slash.
-    const ns = name[0..slash_at];
-    const local = name[slash_at + 1 ..];
-    if (ns.len == 0) return error.EmptyNamespace;
-    if (local.len == 0) return error.EmptyLocalName;
-    return .{ .ns = ns, .local = local };
-}
 
 // =============================================================================
 // Tests — inline. Randomized property sweeps live in test/prop/intern.zig.
@@ -349,44 +309,31 @@ test "transient input slice: interner holds its own copy" {
     try testing.expectEqualStrings("foo", it.keywordName(id));
 }
 
-test "split: canonical cases" {
-    {
-        const q = try split("foo");
-        try testing.expect(q.ns == null);
-        try testing.expectEqualStrings("foo", q.local);
-    }
-    {
-        const q = try split("+");
-        try testing.expect(q.ns == null);
-        try testing.expectEqualStrings("+", q.local);
-    }
-    {
-        const q = try split("/");
-        try testing.expect(q.ns == null);
-        try testing.expectEqualStrings("/", q.local);
-    }
-    {
-        const q = try split("ns/foo");
-        try testing.expectEqualStrings("ns", q.ns.?);
-        try testing.expectEqualStrings("foo", q.local);
+test "splitQualified: first slash; bare / is unqualified" {
+    const cases = [_]struct { full: []const u8, ns: ?[]const u8, name: []const u8 }{
+        .{ .full = "foo", .ns = null, .name = "foo" },
+        .{ .full = "/", .ns = null, .name = "/" },
+        .{ .full = "ns/foo", .ns = "ns", .name = "foo" },
+        .{ .full = "a/b/c", .ns = "a", .name = "b/c" },
+        .{ .full = "nexis.core//", .ns = "nexis.core", .name = "/" },
+    };
+    for (cases) |c| {
+        const got = Interner.splitQualified(c.full);
+        if (c.ns) |ns| try testing.expectEqualStrings(ns, got.ns.?) else try testing.expect(got.ns == null);
+        try testing.expectEqualStrings(c.name, got.name);
     }
 }
 
-test "split: malformed input returns specific errors" {
-    try testing.expectError(error.EmptyName, split(""));
-    try testing.expectError(error.EmptyNamespace, split("/foo"));
-    try testing.expectError(error.EmptyLocalName, split("foo/"));
-    try testing.expectError(error.MultipleSlashes, split("a//b"));
-    try testing.expectError(error.MultipleSlashes, split("a/b/c"));
-}
-
-test "trace seam exists and is callable as a no-op" {
+test "record type names: named ids print as ns.Type, others are null" {
     var it = Interner.init(testing.allocator);
     defer it.deinit();
-    _ = try it.internKeyword("foo");
-    const NullVisitor = struct {};
-    var v: NullVisitor = .{};
-    it.trace(&v);
+    try testing.expect(it.recordTypeName(0) == null);
+    try it.nameRecordType(2, "my.app", "Point");
+    try testing.expectEqualStrings("my.app.Point", it.recordTypeName(2).?);
+    try testing.expect(it.recordTypeName(0) == null);
+    try testing.expect(it.recordTypeName(3) == null);
+    try it.nameRecordType(2, "user", "P");
+    try testing.expectEqualStrings("user.P", it.recordTypeName(2).?);
 }
 
 test "by_name lookups survive names reallocation" {

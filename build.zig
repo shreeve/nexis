@@ -160,7 +160,9 @@ pub fn build(b: *std.Build) void {
     // (NEXTOMIC.md §8), run from a fresh directory that holds the
     // stores it creates; `prelude.nx` is found beside the script.
     // `<name>-2.nx` reads what `<name>-1.nx` wrote, from the same
-    // directory. gc.nx runs with a collection every few kilobytes.
+    // directory. Every script runs with a collection every few
+    // kilobytes (NEXIS_GC_STRESS), so a rooting gap in a native the
+    // scripts reach fails the gate rather than a later program.
     const nextomic_nx_step = b.step("nextomic-nx", "Run the test/nextomic end-to-end scripts through bin/nexis");
     for (listStems(b, "test/nextomic", ".nx")) |name| {
         if (std.mem.eql(u8, name, "prelude") or std.mem.endsWith(u8, name, "-2")) continue;
@@ -178,7 +180,7 @@ pub fn build(b: *std.Build) void {
         var previous: ?*std.Build.Step = null;
         for (pair) |n| {
             const run = scripts.run(nextomic_nx_step, b.fmt("test/nextomic/{s}.nx", .{n}), cwd, b.fmt("test/nextomic/{s}.out", .{n}));
-            if (std.mem.eql(u8, n, "gc")) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
+            run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
             if (previous) |p| run.step.dependOn(p);
             previous = &run.step;
         }
@@ -236,7 +238,8 @@ pub fn build(b: *std.Build) void {
 
     // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
     // runtime error's stderr (exit 5), a reader error's stderr (exit
-    // 3), a disassembly, a script's stdout, a REPL session and the
+    // 3), a disassembly, scripts' stdout (with arguments, from stdin,
+    // an explicit exit status), `nexis test`, a REPL session and the
     // usage errors. Each runs from the build root, so the paths in
     // the output are the relative ones committed.
     {
@@ -258,6 +261,10 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
+            .{ .args = &.{ "run", cli ++ "args.nx", "a", "b c" }, .stdout = "args.out" },
+            .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
+            .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
+            .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err" },
             .{ .args = &.{"--help"}, .stderr = "help.err" },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },

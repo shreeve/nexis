@@ -128,9 +128,9 @@ pub fn limbCount(v: value.Value) usize;
 /// nonzero pattern (VALUE.md §4).
 pub fn hashHeader(h: *HeapHeader) u32;
 
-/// Per-kind equality entry point. Called by `dispatch.heapEqual`
-/// after the cross-kind rule and bit-identity fast path have been
-/// ruled out.
+/// Per-kind equality entry point. Called by `dispatch.equal` after
+/// the cross-kind rule and bit-identity fast path have been ruled
+/// out.
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool;
 
 /// GC trace entry point (GC.md §4). A bignum body holds limbs and
@@ -173,8 +173,8 @@ pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value;
 
 ### 5. Hash — semantic bytes only
 
-SEMANTICS.md §3.2: "xxHash3-32 over the canonical magnitude byte stream
-plus sign byte." Concretely:
+SEMANTICS.md §3.2: xxHash3 over the sign byte and the canonical
+magnitude, truncated to 32 bits and cached. Concretely:
 
 ```
 hash_input := [negative_byte] ++ limbs_as_little_endian_bytes
@@ -242,13 +242,11 @@ which handles the fixnum-range check (`-2⁴⁷` is representable as
 
 ### 8. Dispatch integration
 
-Two one-line additions to `src/dispatch.zig`:
+`src/dispatch.zig` routes `.bignum` to `bignum.hashHeader` in
+`heapHashBase` and to `bignum.limbsEqual` in `equal`.
 
-- `heapHashBase` kind switch gains `.bignum => @as(u64, bignum.hashHeader(h)),`.
-- `heapEqual` kind switch gains `.bignum => bignum.limbsEqual(ah, bh),`.
-
-No changes to `eqCategory` (bignum is kind-local per SEMANTICS §2.6)
-and no new domain byte — bignum uses the kind-byte domain like string.
+Bignum is kind-local (SEMANTICS §2.6): its hash domain byte is its kind
+byte, like string.
 
 ---
 
@@ -280,7 +278,15 @@ Semantics, matching Clojure's `Numbers` for BigInt:
 - `toI64`: the value when it fits, `null` otherwise.
 - `formatDecimal` / `parseDecimal`: decimal text with a leading `-`
   for a negative value and no suffix; the parser accepts exactly
-  `-?[0-9]+` and returns `null` for anything else.
+  `-?[0-9]+` and returns `null` for anything else. Printing is
+  implicit everywhere (`str`, `pr-str`, REPL results, error reports),
+  so `formatDecimal` divides and conquers past 32 limbs: it splits the
+  value at 10^(9·2^i), the power whose square first exceeds it, and
+  writes the quotient and the zero-padded remainder the same way. Each
+  level costs about half the one above, so the whole conversion is
+  about one Knuth division of the value by its square root, not one
+  pass over the value per nine digits: a million digits print in about
+  a second (ReleaseFast) where `std`'s conversion takes minutes.
 
 The VM's tower (`src/vm.zig` `numAdd` … `numCompare`) keeps the
 fixnum × fixnum fast path in `i64` and reaches this module only when

@@ -117,8 +117,14 @@ Vars / atoms / etc.).
 **GC trace**: walk `fields`. The `type_id` is a `u32`, not a heap
 pointer.
 
-**Format**: `#<record type-id=N>` in both display and readable
-modes (opaque, not reader-roundtrippable).
+**Format**: `#ns.Type{:field value, ...}` in both display and
+readable modes, as Clojure prints a record (`(->P 1 "a")` in `user`
+prints `#user.P{:x 1, :y "a"}`, the value strings unquoted in display
+mode). The name comes from the interner, which
+`registerRecordType` tells each new type's `ns.Type`
+(`Interner.nameRecordType`, INTERN.md §2); a type it was never told
+prints opaquely as `#<record type-id=N>`. Not reader-roundtrippable:
+the reader has no tagged literals.
 
 #### 2.2 `Kind.protocol = 36`
 

@@ -27,9 +27,10 @@
 //! `:nextomic/closed`; VM teardown destroys every connection through
 //! `closeCallback`.
 //!
-//! Per-VM state (`State`): the parsed-query caches and the view of
-//! every finished `with` scope, created on first use and destroyed at
-//! VM teardown through `vm.nextomic_query_close`. A view outlives its
+//! Per-VM state (`State`): the parsed-query caches, whose query values
+//! a var in `nexis.internal` keeps reachable, and the view of every
+//! finished `with` scope, created on first use and destroyed at VM
+//! teardown through `vm.nextomic_query_close`. A view outlives its
 //! scope the way a released connection's struct does, so a db-value
 //! that escaped the scope answers `:nextomic/closed`; the scope's
 //! scratch is freed when the native returns.
@@ -150,30 +151,38 @@ pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
+    ir_roots: CacheRoots,
+    rules_roots: CacheRoots,
     /// The views of finished `with` scopes: closed, kept allocated for
     /// the db-values that name them, destroyed at VM teardown.
     views: std.ArrayList(*Conn) = .empty,
-    /// Queries in flight: each borrows its parsed IR from the caches
-    /// for its duration, so a collection that happens inside one of
-    /// its callbacks defers the clearing (`clear_pending`) to the
-    /// moment the outermost query returns.
-    active: usize = 0,
-    clear_pending: bool = false,
+};
 
-    /// Enter a query; `leave` is its pair.
-    pub fn enter(self: *State) void {
-        self.active += 1;
+/// Keeps a cache's query values reachable: a var in `nexis.internal`
+/// whose root is the vector of them, slot for slot. Every var's root is
+/// a collector root (GC.md §3).
+const CacheRoots = struct {
+    holder: *vm_mod.Var,
+    heap: *Heap,
+
+    fn init(vm: *VM, name: []const u8) !CacheRoots {
+        const registry = try vm.ensureRegistry();
+        const ns = try registry.getOrCreate("nexis.internal", registry.core);
+        const heap = vm.ensureHeap();
+        const holder = try ns.intern(name);
+        holder.root = try vector_mod.empty(heap);
+        return .{ .holder = holder, .heap = heap };
     }
 
-    pub fn leave(self: *State) void {
-        self.active -= 1;
-        if (self.active == 0 and self.clear_pending) self.clearCaches();
+    fn roots(self: *CacheRoots) query.Roots {
+        return .{ .ctx = @ptrCast(self), .set = &set };
     }
 
-    fn clearCaches(self: *State) void {
-        self.clear_pending = false;
-        self.ir_cache.clear();
-        self.rules_cache.clear();
+    fn set(ctx: *anyopaque, slot: usize, v: Value) error{OutOfMemory}!void {
+        const self: *CacheRoots = @ptrCast(@alignCast(ctx));
+        const held = self.holder.root;
+        const next = if (slot < vector_mod.count(held)) vector_mod.assoc(self.heap, held, slot, v) else vector_mod.conj(self.heap, held, v);
+        self.holder.root = next catch return error.OutOfMemory;
     }
 };
 
@@ -181,27 +190,19 @@ pub const State = struct {
 pub fn state(vm: *VM) !*State {
     if (vm.nextomic_query_state) |p| return @ptrCast(@alignCast(p));
     const s = try vm.allocator.create(State);
+    errdefer vm.allocator.destroy(s);
     s.* = .{
         .gpa = vm.allocator,
         .ir_cache = query.Cache.init(vm.allocator),
         .rules_cache = query.RulesCache.init(vm.allocator),
+        .ir_roots = try CacheRoots.init(vm, "#%query-cache"),
+        .rules_roots = try CacheRoots.init(vm, "#%rules-cache"),
     };
+    s.ir_cache.roots = s.ir_roots.roots();
+    s.rules_cache.roots = s.rules_roots.roots();
     vm.nextomic_query_state = @ptrCast(s);
     vm.nextomic_query_close = &closeState;
-    vm.nextomic_query_clear = &clearState;
     return s;
-}
-
-/// Empty both query caches: the collector calls this after every
-/// cycle because the caches key on heap identity (§5). With a query
-/// in flight the clearing waits until it returns.
-fn clearState(ptr: *anyopaque) void {
-    const s: *State = @ptrCast(@alignCast(ptr));
-    if (s.active > 0) {
-        s.clear_pending = true;
-        return;
-    }
-    s.clearCaches();
 }
 
 fn closeState(ptr: *anyopaque) void {
@@ -236,8 +237,11 @@ pub fn errorKeyword(err: anyerror) []const u8 {
         error.Cas => "nextomic/cas",
         error.Schema => "nextomic/schema",
         error.PullSyntax => "nextomic/pull-syntax",
+        error.QuerySyntax => "nextomic/query-syntax",
+        error.UnboundPattern => "nextomic/unbound-pattern",
         error.HistoryView => "nextomic/history-view",
         error.Format, error.UnknownIdent => "db/corrupted",
+        error.StackOverflow => "stack-overflow",
         else => dblayer.failureName(err),
     };
 }
@@ -543,7 +547,7 @@ const fnTransact = wrap(transactNative);
 
 /// Runs `:db.fn/call` forms (NEXTOMIC.md §3 "Transaction functions"):
 /// a symbol resolves as a query function does (`query/natives.zig`
-/// `Hook.resolve`), and the function is called through `vm.callValue`
+/// `lookup`), and the function is called through `vm.callValue`
 /// with the boxed `db-before` ahead of the form's arguments. Whatever it
 /// throws propagates through the transaction, which aborts.
 const TxHook = struct {
@@ -568,8 +572,7 @@ const TxHook = struct {
     fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
         const self: *TxHook = @ptrCast(@alignCast(ctx));
         const vm = self.vm;
-        var resolver = query_natives.Hook{ .vm = vm, .scope = self.scope };
-        const callee = if (f.kind() == .symbol) (try resolver.lookup(f.asSymbolId())) orelse {
+        const callee = if (f.kind() == .symbol) (try query_natives.lookup(vm, f.asSymbolId())) orelse {
             const name = vm.ensureInterner().symbolName(f.asSymbolId());
             const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
             defer vm.allocator.free(message);
@@ -696,7 +699,7 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 
 fn fnPull(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return pullNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+    return pullNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull db pattern e)`: the pattern's map for `e`; nil when the
@@ -708,7 +711,7 @@ fn pullNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 
 fn fnPullMany(vm: *VM, args: []const Value) VmError!Value {
     var diag: Diag = .{};
-    return pullManyNative(vm, args, &diag) catch |err| failPull(vm, err, &diag);
+    return pullManyNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull-many db pattern es)`: one result per entity of the vector
@@ -722,11 +725,16 @@ fn pullManyNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 }
 
 /// A pattern or entity syntax error travels with its reason.
-fn failPull(vm: *VM, err: anyerror, diag: *const Diag) VmError {
-    if (err == error.PullSyntax) return throwSyntax(vm, "nextomic/pull-syntax", diag.message, diag.clause);
-    if (err == error.UnknownAttribute) return failWith(vm, err, .{ .attr = diag.attr });
-    if (err == error.TxData) return failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr });
-    return fail(vm, err);
+/// Surface an error of the query or pull pipeline with what `diag`
+/// knows: the reason and clause of a syntax error, the attribute of an
+/// unknown one, the reason and attribute of malformed input.
+pub fn failDiag(vm: *VM, err: anyerror, diag: *const Diag) VmError {
+    return switch (err) {
+        error.QuerySyntax, error.PullSyntax => throwSyntax(vm, errorKeyword(err), diag.message, diag.clause),
+        error.UnknownAttribute => failWith(vm, err, .{ .attr = diag.attr }),
+        error.TxData => failWith(vm, err, .{ .message = if (diag.message.len == 0) null else diag.message, .attr = diag.attr }),
+        else => fail(vm, err),
+    };
 }
 
 // =============================================================================
@@ -1228,6 +1236,8 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.Cas, .name = "nextomic/cas" },
         .{ .err = error.Schema, .name = "nextomic/schema" },
         .{ .err = error.PullSyntax, .name = "nextomic/pull-syntax" },
+        .{ .err = error.QuerySyntax, .name = "nextomic/query-syntax" },
+        .{ .err = error.UnboundPattern, .name = "nextomic/unbound-pattern" },
         .{ .err = error.HistoryView, .name = "nextomic/history-view" },
         .{ .err = error.Format, .name = "db/corrupted" },
         .{ .err = error.Corrupted, .name = "db/corrupted" },

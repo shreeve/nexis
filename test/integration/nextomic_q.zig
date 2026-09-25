@@ -126,9 +126,11 @@ fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args:
     }
     const reads = try openReads(arena, dbv, parsed, args);
     defer for (reads) |r| r.close();
-    var ctx = try query.plan.Ctx.init(arena, reads, fx.interner(), parsed, rules, diag);
+    const sources = try arena.alloc(query.Source, reads.len);
+    for (reads, sources) |r, *s| s.* = .{ .db = r };
+    var ctx = try query.plan.Ctx.init(arena, sources, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
-    var ex = query.Exec{ .arena = arena, .reads = reads, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
+    var ex = query.Exec{ .arena = arena, .sources = sources, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
     const input = try ex.inputRelation(parsed, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
@@ -383,7 +385,7 @@ const Naive = struct {
         const op = ag.op;
         const sorted = try self.arena.alloc(Cell, members.len);
         for (members, sorted) |m, *c| c.* = m[col];
-        std.mem.sort(Cell, sorted, {}, cellAsc);
+        std.mem.sort(Cell, sorted, self.fx.interner(), cellAsc);
         switch (op) {
             .count => return .{ .int = @intCast(members.len) },
             .median => {
@@ -430,7 +432,7 @@ const Naive = struct {
                 }
                 var best = members[0][col];
                 for (members[1..]) |m| {
-                    const o = m[col].order(best);
+                    const o = naiveOrder(self.fx.interner(), m[col], best);
                     if ((op == .min and o == .lt) or (op == .max and o == .gt)) best = m[col];
                 }
                 return best;
@@ -735,7 +737,7 @@ const Naive = struct {
                 .lt, .le, .gt, .ge => {
                     var i: usize = 0;
                     while (i + 1 < cells.len) : (i += 1) {
-                        const o = cells[i].compare(cells[i + 1]) orelse return error.ValueType;
+                        const o = naiveCompare(self.fx.interner(), cells[i], cells[i + 1]) orelse return error.ValueType;
                         const ok = switch (b) {
                             .lt => o == .lt,
                             .le => o != .gt,
@@ -843,8 +845,24 @@ const Naive = struct {
     }
 };
 
-fn cellAsc(_: void, a: Cell, b: Cell) bool {
-    return a.order(b) == .lt;
+fn cellAsc(names: *Interner, a: Cell, b: Cell) bool {
+    return naiveOrder(names, a, b) == .lt;
+}
+
+/// The oracle's order: keywords by their text, as `compare` orders
+/// them; everything else in the cell order.
+fn naiveOrder(names: *Interner, a: Cell, b: Cell) std.math.Order {
+    if (a == .keyword and b == .keyword) return std.mem.order(u8, names.keywordName(a.keyword), names.keywordName(b.keyword));
+    return a.order(b);
+}
+
+/// The oracle's comparison: values of one type (int and double are
+/// one), never VM values.
+fn naiveCompare(names: *Interner, a: Cell, b: Cell) ?std.math.Order {
+    const numeric = (a == .int or a == .double) and (b == .int or b == .double);
+    if (!numeric and std.meta.activeTag(a) != std.meta.activeTag(b)) return null;
+    if (a == .vm) return null;
+    return naiveOrder(names, a, b);
 }
 
 fn num(c: Cell) !f64 {
@@ -1235,6 +1253,7 @@ test "corpus: not, not-join, or, or-join, and" {
         .{ .src = "[:find ?e :where [?e :person/name ?n] [(< ?zz 3)]]", .message = "?zz is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it", .clause = 1 },
         .{ .src = "[:find ?e :where [?e :person/name ?n] [(?f ?n)] [?e :person/age 30]]", .message = "?f in function position is never bound", .clause = 1 },
         .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?e] (not [?q :person/tags :blue]))]", .message = "not shares no variable with the clauses around it: ?q is bound nowhere outside; not joins on a variable bound outside it", .clause = 1 },
+        .{ .src = "[:find ?e :where [?e :person/name ?n] (not-join [?zz] [?zz :person/tags :blue])]", .message = "?zz is never bound; not-join joins on variables the clauses around it bind", .clause = 1 },
     }) |case| {
         var d: query.Diag = .{};
         try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, case.src, none, &d));
@@ -1528,10 +1547,12 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red]) (admin ?e) [(< 1 2)]]"), dbv, &.{ value.nilValue(), rules_v }, &diag, opts, &out.writer);
     const text = out.written();
     try testing.expect(std.mem.indexOf(u8, text, "1. pred (< 1 2)") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "2. scan [?e :person/age 30 _ _] aevt") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
+    // The admin rule's body (3 entities) is cheaper than the age scan.
+    try testing.expect(std.mem.indexOf(u8, text, "2. or-join [?e] branches=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e :person/role :role/admin _ _] aevt est=3") != null);
     try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "or-join [?e] branches=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/age 30 _ _] eavt est=1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);

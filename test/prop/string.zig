@@ -22,6 +22,11 @@
 //!       cache (when the hash is nonzero); subsequent calls return
 //!       the same result without recomputing from bytes (tested by
 //!       reading the raw `HeapHeader.hash` field).
+//!   S7. Codepoint indexing (`codepointCount`, `codepointAt`,
+//!       `byteRangeForCodepoints`) agrees with a plain decode of the
+//!       bytes on 2000 random strings: ASCII runs of every length
+//!       around the 16-byte scan width, multi-byte scalars, and some
+//!       malformed bytes.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -221,4 +226,75 @@ test "S6: hashHeader populates the cache (when nonzero) on first call" {
     // nonzero hashes. Don't hard-fail on zero_cases > 0, but require
     // at least one nonzero cache to have been populated.
     try std.testing.expect(populated > 0);
+}
+
+// -----------------------------------------------------------------------------
+// S7. Codepoint indexing against a reference decode
+// -----------------------------------------------------------------------------
+
+/// Byte offset of each codepoint, plus the end; null on malformed UTF-8.
+fn referenceOffsets(bytes: []const u8, out: []usize) ?[]usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return null;
+        if (i + len > bytes.len) return null;
+        _ = std.unicode.utf8Decode(bytes[i..][0..len]) catch return null;
+        out[n] = i;
+        n += 1;
+        i += len;
+    }
+    out[n] = bytes.len;
+    return out[0 .. n + 1];
+}
+
+test "S7: codepoint count, index and range agree with a reference decode" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
+    const r = prng.random();
+    const pieces = [_][]const u8{ "a", "Z", "~", "\xc3\xa9", "\xe2\x98\x83", "\xf0\x9f\x98\x80" };
+
+    var buf: [256]u8 = undefined;
+    var offsets: [257]usize = undefined;
+    var trial: usize = 0;
+    while (trial < 2000) : (trial += 1) {
+        var len: usize = 0;
+        // An ASCII run first, then a mix.
+        const ascii_run = r.uintLessThan(usize, 40);
+        for (0..ascii_run) |_| {
+            buf[len] = 'a' + r.uintLessThan(u8, 26);
+            len += 1;
+        }
+        while (len < 200 and r.uintLessThan(u8, 8) != 0) {
+            const piece = pieces[r.uintLessThan(usize, pieces.len)];
+            @memcpy(buf[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        if (len > 0 and r.uintLessThan(u8, 16) == 0) buf[r.uintLessThan(usize, len)] = 0x80 | r.int(u8);
+        const bytes = buf[0..len];
+        const v = try string.fromBytes(&heap, bytes);
+        const ref = referenceOffsets(bytes, &offsets) orelse {
+            try std.testing.expectError(error.InvalidUtf8, string.codepointCount(v));
+            continue;
+        };
+        const count = ref.len - 1;
+        try std.testing.expectEqual(count, try string.codepointCount(v));
+        for (0..count) |i| {
+            const want = try std.unicode.utf8Decode(bytes[ref[i]..ref[i + 1]]);
+            try std.testing.expectEqual(want, try string.codepointAt(v, i));
+        }
+        try std.testing.expectError(error.OutOfBounds, string.codepointAt(v, count));
+        for (0..4) |_| {
+            const a = r.uintAtMost(usize, count);
+            const b = r.uintAtMost(usize, count);
+            const lo = @min(a, b);
+            const hi = @max(a, b);
+            const got = try string.byteRangeForCodepoints(v, lo, hi);
+            try std.testing.expectEqual(ref[lo], got.start);
+            try std.testing.expectEqual(ref[hi], got.end);
+        }
+        try std.testing.expectError(error.OutOfBounds, string.byteRangeForCodepoints(v, 0, count + 1));
+    }
 }

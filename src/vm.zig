@@ -1461,12 +1461,8 @@ pub const VM = struct {
     /// The nextomic natives' per-VM state (parsed-query caches and
     /// finished `with` scopes), created on first use and destroyed at
     /// teardown through `nextomic_query_close`. The natives own the cast.
-    /// `nextomic_query_clear` empties the caches, which hold query
-    /// values by heap identity, after every collection
-    /// (docs/NEXTOMIC.md §5).
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
-    nextomic_query_clear: ?*const fn (*anyopaque) void = null,
     /// Zig 0.16 `std.Io` handle for filesystem ops that live
     /// below the language surface —
     /// only `(db/open path)` uses it to auto-create the
@@ -1778,12 +1774,6 @@ pub const VM = struct {
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
         _ = collector.collect(&.{});
         self.gc_cycles += 1;
-        // The query caches hold query values by heap identity
-        // (docs/NEXTOMIC.md §5); a freed value's address may be
-        // reused, so the caches empty with every cycle.
-        if (self.nextomic_query_state) |state| {
-            if (self.nextomic_query_clear) |clear| clear(state);
-        }
         const by_growth = heap.live_bytes / 100 * self.gc_growth_percent;
         self.gc_next_at = @max(self.gc_threshold, by_growth);
     }

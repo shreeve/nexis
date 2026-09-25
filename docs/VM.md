@@ -750,8 +750,7 @@ on a `VM.RootScope`, and `callValue` roots a native callee's
 arguments for the call (`docs/GC.md` §3, §11.5). A VM over a
 borrowed heap (`evalClosure`, the `defmacro` evaluation) has
 `gc_enabled = false` and never collects. `VM.collectGarbage` runs
-one cycle from a safe point, clears the Nextomic query caches
-(`nextomic_query_clear`) and sizes the next window; `gc_cycles`
+one cycle from a safe point and sizes the next window; `gc_cycles`
 counts them.
 
 ---

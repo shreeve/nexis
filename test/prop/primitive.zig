@@ -30,7 +30,6 @@
 const std = @import("std");
 const nx = @import("nexis");
 const value = nx.value;
-const eq = nx.eq;
 const hash = nx.hash;
 
 const Value = value.Value;
@@ -84,7 +83,7 @@ test "P1: identical? is reflexive" {
     var i: usize = 0;
     while (i < iterations_per_property) : (i += 1) {
         const v = randValue(r);
-        try std.testing.expect(eq.identical(v, v));
+        try std.testing.expect(v.identicalTo(v));
     }
 }
 
@@ -98,12 +97,12 @@ test "P2: = is reflexive, symmetric, (pairwise) transitive" {
         const c = randValue(r);
 
         // Reflexive.
-        try std.testing.expect(eq.equalImmediate(a, a));
+        try std.testing.expect(a.equalImmediate(a));
         // Symmetric.
-        try std.testing.expectEqual(eq.equalImmediate(a, b), eq.equalImmediate(b, a));
+        try std.testing.expectEqual(a.equalImmediate(b), b.equalImmediate(a));
         // Transitive — only interesting when both halves hold.
-        if (eq.equalImmediate(a, b) and eq.equalImmediate(b, c)) {
-            try std.testing.expect(eq.equalImmediate(a, c));
+        if (a.equalImmediate(b) and b.equalImmediate(c)) {
+            try std.testing.expect(a.equalImmediate(c));
         }
     }
 }
@@ -115,8 +114,8 @@ test "P3: identical? ⇒ =" {
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (eq.identical(a, b)) {
-            try std.testing.expect(eq.equalImmediate(a, b));
+        if (a.identicalTo(b)) {
+            try std.testing.expect(a.equalImmediate(b));
         }
     }
 }
@@ -128,7 +127,7 @@ test "P4: = ⇒ hash equal — the bedrock" {
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (eq.equalImmediate(a, b)) {
+        if (a.equalImmediate(b)) {
             try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
         }
     }
@@ -166,7 +165,7 @@ test "P6: cross-kind = is false (except within {true_, false_} / {keyword×keywo
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (a.kind() != b.kind() and eq.equalImmediate(a, b)) {
+        if (a.kind() != b.kind() and a.equalImmediate(b)) {
             // There are zero legitimate cross-kind equalities among
             // immediates; cross-type numeric `==` does not exist
             // (PLAN §23 #11).
@@ -190,7 +189,7 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
         const bits: u64 = sign | (@as(u64, 0x7FF) << 52) | @as(u64, mantissa);
         const v = value.fromFloat(@bitCast(bits));
 
-        try std.testing.expect(eq.equalImmediate(v, canonical));
+        try std.testing.expect(v.equalImmediate(canonical));
         try std.testing.expectEqual(v.hashImmediate(), canonical.hashImmediate());
         // And bit-level: all NaN inputs collapse to the canonical bit pattern.
         try std.testing.expectEqual(hash.canonical_nan_bits, v.payload);
