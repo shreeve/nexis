@@ -2792,23 +2792,6 @@ pub const VM = struct {
         return frame;
     }
 
-    /// `call:call` on a keyword or collection (PLAN §8.7): `(:k m)`,
-    /// `(m :k)`, `(s x)`, `(v i)` are lookups, which take at most a
-    /// receiver and a default and never push a frame.
-    fn execCallLookup(self: *VM, callee: Value, call_base: u32, argc: u32, result_dst: u12) VmError!void {
-        if (argc > 2) return VmError.ArityMismatch;
-        var args_buf: [2]Value = undefined;
-        var i: u32 = 0;
-        while (i < argc) : (i += 1) {
-            args_buf[i] = (try self.slotPtr(@intCast(call_base + 1 + i))).*;
-        }
-        const result = try callLookup(callee, args_buf[0..argc]);
-        if (result_dst >= self.currentFrame().slot_count) {
-            return VmError.OperandOutOfRange;
-        }
-        (try self.slotPtr(result_dst)).* = result;
-    }
-
     /// `call:return A=slot _ _` — return `slot[A]` from the current
     /// frame.
     fn execCallReturn(self: *VM, inst: Inst) VmError!void {
