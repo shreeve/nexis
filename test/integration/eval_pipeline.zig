@@ -722,6 +722,36 @@ test "integration: runaway recursion is a catchable :stack-overflow; deep legiti
     try testing.expectEqualStrings("test-form", trace[40].name);
 }
 
+test "integration: an uncaught runtime error names what went wrong in VM.error_detail" {
+    const Case = struct { src: []const u8, err: anyerror, detail: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "(defn f [x] x) (f)", .err = vm.VmError.ArityMismatch, .detail = "f takes 1 argument, got 0" },
+        .{ .src = "(defn g [a b & r] a) (g 1)", .err = vm.VmError.ArityMismatch, .detail = "g takes at least 2 arguments, got 1" },
+        .{ .src = "(first 1 2)", .err = vm.VmError.ArityMismatch, .detail = "first takes 1 argument, got 2" },
+        .{ .src = "(mapv (fn [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 2 arguments, got 1" },
+        .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
+        .{ .src = "(map \"s\" [1])", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
+        .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
+        .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
+        .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
+    };
+    for (cases) |case| {
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        // A caught error's detail does not linger into the next one.
+        _ = try program.run("(try (first) (catch any e e))");
+        try testing.expectError(case.err, program.run(case.src));
+        try testing.expectEqualStrings(case.detail, program.v.error_detail);
+    }
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(try (first) (catch any e e))");
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run("(throw :x)"));
+    try testing.expectEqualStrings("", program.v.error_detail);
+}
+
 // =============================================================================
 // Multi-arity defn
 // =============================================================================

@@ -1552,6 +1552,14 @@ pub const VM = struct {
     /// The text of the marker `recordErrorTrace` puts where it
     /// leaves frames out.
     trace_gap: [48]u8 = undefined,
+    /// What the most recent runtime error was about, for the host's
+    /// report: `f takes 1 argument, got 0`, `+ expects numbers, got
+    /// a string`. Set where the VM raises the error, empty when the
+    /// raise site has nothing to add (natives raise without one);
+    /// cleared when a run starts and when a handler takes the error
+    /// as a keyword, so it never describes an earlier error.
+    error_detail: []const u8 = "",
+    detail_buf: [160]u8 = undefined,
 
     pub const default_max_frames = 1 << 20;
     /// A trace keeps this many innermost frames and
@@ -1725,6 +1733,23 @@ pub const VM = struct {
     /// A root scope starting at the top of the root stack.
     pub fn rootScope(self: *VM) RootScope {
         return .{ .vm = self, .base = self.roots.items.len };
+    }
+
+    /// `err`, with `error_detail` set to the formatted sentence (cut
+    /// to nothing if it does not fit the buffer).
+    fn fail(self: *VM, err: VmError, comptime fmt: []const u8, args: anytype) VmError {
+        self.error_detail = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch "";
+        return err;
+    }
+
+    /// `ArityMismatch` for `name`, which takes `min` to `max`
+    /// arguments (`max` null: no upper bound), called with `argc`.
+    fn arityError(self: *VM, name: []const u8, min: usize, max: ?usize, argc: usize) VmError {
+        const noun = if (min == 1) "argument" else "arguments";
+        const e = VmError.ArityMismatch;
+        if (max == null) return self.fail(e, "{s} takes at least {d} {s}, got {d}", .{ name, min, noun, argc });
+        if (max.? == min) return self.fail(e, "{s} takes {d} {s}, got {d}", .{ name, min, noun, argc });
+        return self.fail(e, "{s} takes {d} to {d} arguments, got {d}", .{ name, min, max.?, argc });
     }
 
     // -------------------------------------------------------------------------
@@ -2000,8 +2025,6 @@ pub const VM = struct {
         args: []const Value,
     ) VmError!Value {
         std.debug.assert(callee.kind() == .protocol_fn);
-        if (args.len == 0) return VmError.ArityMismatch;
-
         const protocol_id = protocol_mod.protocolFnProtocolId(callee);
         const method_name_id = protocol_mod.protocolFnMethodNameId(callee);
         const proto = self.protocolById(protocol_id) orelse return VmError.NoProtocolImpl;
@@ -2015,13 +2038,14 @@ pub const VM = struct {
             }
         }
         const method = method_ptr orelse return VmError.NoProtocolMethod;
+        if (args.len == 0) return self.arityError(method.name, 1, null, 0);
 
         // Look up impl by dispatch key (receiver is args[0]).
         const key = DispatchKey.ofValue(args[0]);
         const impl_v: Value = blk: {
             if (method.impls.get(key)) |impl| break :blk impl;
             if (method.default_impl) |dflt| break :blk dflt;
-            return VmError.NoProtocolImpl;
+            return self.fail(VmError.NoProtocolImpl, "no impl of {s} for {s}", .{ method.name, kindPhrase(args[0].kind()) });
         };
 
         // Invoke. callValue handles closures, native_fns, etc.
@@ -2149,13 +2173,17 @@ pub const VM = struct {
         switch (callee.kind()) {
             .native_fn => {
                 const native = asNativeFn(callee);
-                if (args.len < native.min_arity) return VmError.ArityMismatch;
-                if (native.max_arity) |max| if (args.len > max) return VmError.ArityMismatch;
+                if (args.len < native.min_arity or args.len > native.max_arity orelse args.len) {
+                    const max: ?usize = if (native.max_arity) |m| m else null;
+                    return self.arityError(native.name, native.min_arity, max, args.len);
+                }
                 return native.call(self, args);
             },
             .protocol_fn => return self.dispatchProtocolMethod(callee, args),
             else => {
-                if (!isLookupCallable(callee.kind())) return VmError.NotCallable;
+                if (!isLookupCallable(callee.kind())) {
+                    return self.fail(VmError.NotCallable, "{s} is not callable", .{kindPhrase(callee.kind())});
+                }
                 return callLookup(callee, args);
             },
         }
@@ -2180,7 +2208,9 @@ pub const VM = struct {
         const closure = asClosure(callee);
         const routine = closure.routine;
         const fixed: usize = routine.fixed_arity;
-        if (if (routine.variadic) argc < fixed else argc != fixed) return VmError.ArityMismatch;
+        if (if (routine.variadic) argc < fixed else argc != fixed) {
+            return self.arityError(routine.name, fixed, if (routine.variadic) null else fixed, argc);
+        }
         if (closure.upvalues.len != routine.upvalue_count) return VmError.CaptureCountMismatch;
         // A variadic routine needs a slot for its rest parameter.
         if (routine.slot_count < fixed + @intFromBool(routine.variadic)) return VmError.BytecodeCorruption;
@@ -2515,6 +2545,7 @@ pub const VM = struct {
     /// `BytecodeExhausted`. Any error that leaves the run records
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
+        self.error_detail = "";
         self.loop(0) catch |err| {
             self.recordErrorTrace(err);
             return err;
@@ -2594,6 +2625,7 @@ pub const VM = struct {
         // propagates, so a program that does not opt into
         // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
+        self.error_detail = "";
         const interner = self.ensureInterner();
         const id = interner.internKeyword(kw_name) catch return err;
         const payload = value_mod.fromKeywordId(id);
@@ -3062,19 +3094,31 @@ pub const VM = struct {
         // Resolve every source operand BEFORE storing so that
         // dst/src aliasing (e.g., math:add s0, s0, c0) is correct.
         const lhs = try self.resolveIn(frame, inst.b);
+        const rhs = switch (variant) {
+            .neg, .abs => value_mod.fromFixnum(0).?,
+            else => try self.resolveIn(frame, inst.c),
+        };
         const heap = self.ensureHeap();
         const result = switch (variant) {
-            .add => try numAdd(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .sub => try numSub(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .mul => try numMul(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .div => try numDiv(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .idiv => try numQuot(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .mod => try numMod(heap, lhs, try self.resolveIn(frame, inst.c)),
-            .neg => try numNeg(heap, lhs),
-            .abs => try numAbs(heap, lhs),
+            .add => numAdd(heap, lhs, rhs),
+            .sub => numSub(heap, lhs, rhs),
+            .mul => numMul(heap, lhs, rhs),
+            .div => numDiv(heap, lhs, rhs),
+            .idiv => numQuot(heap, lhs, rhs),
+            .mod => numMod(heap, lhs, rhs),
+            .neg => numNeg(heap, lhs),
+            .abs => numAbs(heap, lhs),
             .pow => return VmError.UnimplementedOpcode,
             _ => return VmError.BytecodeCorruption,
-        };
+        } catch |err| return self.numericError(err, switch (variant) {
+            .add => "+",
+            .sub, .neg => "-",
+            .mul => "*",
+            .div => "/",
+            .idiv => "quot",
+            .mod => "mod",
+            else => "abs",
+        }, lhs, rhs);
         try self.storeIn(frame, inst.a, result);
     }
 
@@ -3087,7 +3131,22 @@ pub const VM = struct {
         const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
         const lhs = try self.resolveIn(frame, inst.b);
         const rhs = try self.resolveIn(frame, inst.c);
-        try self.storeIn(frame, inst.a, value_mod.fromBool(try numCompare(cmp, lhs, rhs)));
+        const holds_ = numCompare(cmp, lhs, rhs) catch |err| return self.numericError(err, switch (cmp) {
+            .lt => "<",
+            .lte => "<=",
+            .gt => ">",
+            .gte => ">=",
+            .eq => "==",
+        }, lhs, rhs);
+        try self.storeIn(frame, inst.a, value_mod.fromBool(holds_));
+    }
+
+    /// `err` from the numeric operation `op` on `lhs` and `rhs`; a
+    /// `KindMismatch` names the operand that is not a number.
+    fn numericError(self: *VM, err: VmError, op: []const u8, lhs: Value, rhs: Value) VmError {
+        if (err != VmError.KindMismatch) return err;
+        const bad = if (isNumber(lhs)) rhs else lhs;
+        return self.fail(err, "{s} expects numbers, got {s}", .{ op, kindPhrase(bad.kind()) });
     }
 
     // -------------------------------------------------------------------------
@@ -3721,6 +3780,29 @@ fn mapLookup(m: Value, key: Value, default: Value) Value {
     return switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
         .present => |v| v,
         .absent => default,
+    };
+}
+
+/// How an error report names a value of kind `k`: as the language
+/// presents it, the integer tower one kind.
+pub fn kindPhrase(k: value_mod.Kind) []const u8 {
+    return switch (k) {
+        .nil => "nil",
+        .false_, .true_ => "a boolean",
+        .fixnum, .bignum => "an integer",
+        .persistent_map => "a map",
+        .persistent_set => "a set",
+        .persistent_vector => "a vector",
+        .function, .native_fn, .protocol_fn => "a function",
+        .var_ => "a var",
+        .error_ => "an error",
+        .atom => "an atom",
+        else => {
+            inline for (@typeInfo(value_mod.Kind).@"enum".fields) |f| {
+                if (@intFromEnum(k) == f.value) return "a " ++ f.name;
+            }
+            return "a value";
+        },
     };
 }
 

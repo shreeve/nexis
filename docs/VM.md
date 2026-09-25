@@ -1097,6 +1097,19 @@ Frames live on the heap, so bytecode recursion costs no native
 stack; its depth is bounded by `VM.max_frames`. The native stack is
 bounded and guarded (§13.1).
 
+**What the error was about**: where the VM raises an error it can
+describe, it writes one sentence to `VM.error_detail` for the host's
+report: `f takes 1 argument, got 0`, `first takes 1 argument, got
+2`, `g takes at least 2 arguments, got 1` (closures, natives and
+protocol methods alike), `an integer is not callable`, `+ expects
+numbers, got a string` (the `math:*` and `cmp:*` opcodes), `no impl
+of area for a vector`. A value's kind is named as the language
+presents it (`kindPhrase`: `nil`, `a boolean`, `an integer`, `a
+map`, ...). The detail is empty when the raise site has nothing to
+add, as for errors natives raise; `run` clears it on entry and a
+handler clears it when it takes the error as a keyword, so it never
+describes an earlier error.
+
 **What the VM records when an error leaves `run`**: the frame
 chain as it stood, in `VM.error_trace`, innermost first, one
 `TraceFrame{name, pc, span, source}` per frame: the routine's
