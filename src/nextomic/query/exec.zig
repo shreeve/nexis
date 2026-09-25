@@ -189,6 +189,9 @@ pub const Exec = struct {
 
         const nested = plan_mod.nestedLoop(s, rel.rows);
         const slots = s.slots();
+        // A pattern that binds nothing only asks whether a datom exists:
+        // one per row is the answer, and nothing repeats.
+        const probe = s.fresh.len == 0;
 
         if (nested) {
             const srcs = try self.arena.alloc(Src, out_vars.len);
@@ -197,8 +200,9 @@ pub const Exec = struct {
             var i: usize = 0;
             while (i < rel.rows) : (i += 1) {
                 rel.rowInto(i, row);
-                try self.scanInto(s, s.index, &rel, row, srcs, &out);
+                try self.scanInto(s, s.index, &rel, row, srcs, &out, probe);
             }
+            if (probe) return out;
         } else {
             var pvars: std.ArrayList(Var) = .empty;
             for (slots) |slot| switch (slot) {
@@ -208,7 +212,8 @@ pub const Exec = struct {
             var scanned = try Relation.init(self.arena, pvars.items);
             const srcs = try self.arena.alloc(Src, pvars.items.len);
             for (pvars.items, srcs) |v, *src| src.* = .{ .pos = slotPos(slots, v) };
-            try self.scanInto(s, s.hash_index.?, null, &.{}, srcs, &scanned);
+            try self.scanInto(s, s.hash_index.?, null, &.{}, srcs, &scanned, false);
+            if (probe) return rel.hashJoin(&(try scanned.dedup()));
             out = try rel.hashJoin(&scanned);
         }
         return if (s.dedup) out.dedup() else out;
@@ -268,10 +273,11 @@ pub const Exec = struct {
     }
 
     /// Scan `planned` for the datoms of `s` given one input row (or
-    /// none), appending the passing rows to `out` through `srcs`. A
+    /// none), appending the passing rows to `out` through `srcs`, or
+    /// only the first when `first_only`. A
     /// VAET scan whose value cell is not an entity id becomes a scan
     /// of every datom in AEVT, filtered on the value.
-    fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation) anyerror!void {
+    fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation, first_only: bool) anyerror!void {
         const read = self.sources[s.src].db;
         const slots = s.slots();
         var comps: key.Components = .{};
@@ -331,6 +337,7 @@ pub const Exec = struct {
                 .pos => |p| dc[p],
             };
             try out.append(cells);
+            if (first_only) return;
         }
     }
 

@@ -446,6 +446,8 @@ without an attribute; give the attribute when it is known.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
+A pattern that binds no new variable (`[?e :tags _]` with `?e` bound)
+is an existence test: its seek stops at the first matching datom.
 An `or` costs the sum over its branches of each branch's cheapest
 pattern; a call to a non-recursive rule the same over the rule's
 bodies, with the head variables bound where the call's arguments are
