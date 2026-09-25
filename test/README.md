@@ -1,8 +1,7 @@
 # Tests
 
-nexis test coverage is split across three locations. **Most unit tests
-live inline in `src/*.zig`** as Zig `test "..."` blocks — that is the
-convention; there is no `test/unit/`.
+Most unit tests live inline in `src/**/*.zig` as `test "..."` blocks;
+the directories below hold what crosses modules.
 
 ## Layout
 
@@ -32,24 +31,11 @@ Every expected-output file the gate compares (`.sexp`, `.err`,
 `nextomic-nx` steps); read the diff before committing it. A missing
 expected file fails its step and names the flag.
 
-## Two build steps for two loops
+## Running
 
-- **`zig build quick`** (~30 s from a cold cache) — the `unit` binary
-  (every inline test), the compile and Nextomic property tests and
-  the `eval_pipeline`, `runtime_polish` and `numbers` integration
-  tests. The inner edit/test loop.
-- **`zig build test`** (~1 min from a cold cache) — the full suite:
-  the `unit` binary, every property and integration test, the
-  layering check, the reader and CLI goldens, the Nextomic scripts
-  and the examples. Run before commits.
-
-Each property and integration file is its own binary, so they run in
-parallel; the longest runs are the `unit` binary (its vector
-boundary tests) and the collection property suites, each well under
-a minute.
-
-## Counts
-
-`zig build test --summary all` prints the authoritative count
-(`HANDOFF.md` §2 carries the number of record). Per-binary counts are
-in the same summary.
+`AGENTS.md` lists the build steps: `zig build quick` is the inner
+loop (the `unit` binary, the compile and Nextomic property tests, the
+`eval_pipeline`, `runtime_polish` and `numbers` suites) and
+`zig build test --summary all` the gate, whose summary line
+(`HANDOFF.md` §2) is the count of record. Each property and
+integration file is its own binary, so they run in parallel.

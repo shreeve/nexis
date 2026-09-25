@@ -68,7 +68,7 @@ The fastest end-to-end checks:
 
 ```bash
 ./bin/nexis run examples/nextomic-app.nx   # clinic chart on Nextomic; a second run prints the same
-./bin/nexis run examples/todo-app.nx       # durable refs across processes; the second run shows :completed 1
+./bin/nexis run examples/todo-app.nx       # durable refs over the whole db/* surface, rollback included
 ./bin/nexis run examples/shapes-app.nx     # multi-file protocols, records, atoms: total-area atom = 9650
 ./bin/nexis -e '(reduce + (range 101))'    # 5050
 ./bin/nexis repl                           # :quit or Ctrl-D exits
