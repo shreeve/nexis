@@ -673,7 +673,9 @@ const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
     }
 }, std.hash_map.default_max_load_percentage);
 
-fn formLiteralEq(a: *const Form, b: *const Form) bool {
+/// Whether the atoms `a` and `b` are the same literal; false for
+/// anything else.
+pub fn formLiteralEq(a: *const Form, b: *const Form) bool {
     return switch (a.datum) {
         .nil => b.datum == .nil,
         .bool_ => |ab| b.datum == .bool_ and b.datum.bool_ == ab,

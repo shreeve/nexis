@@ -1961,6 +1961,16 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const g = try b.gensym("case");
     const clauses = args[1..];
+    var keys: std.ArrayList(*const Form) = .empty;
+    var k: usize = 0;
+    while (k + 1 < clauses.len) : (k += 2) {
+        const key = clauses[k];
+        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
+        for (alternatives) |alt| {
+            for (keys.items) |seen| if (try sameConstant(seen, alt)) return ctx.fail(alt.origin, "case: duplicate test constant", .{});
+            try keys.append(ctx.allocator, alt);
+        }
+    }
     var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
     var i = clauses.len / 2;
     while (i > 0) {
@@ -1968,6 +1978,25 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
         chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
     }
     return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+}
+
+/// Whether the `case` constants `a` and `b` are one datum: the same
+/// literal atom, or collections of one kind whose items are, in order.
+fn sameConstant(a: *const Form, b: *const Form) ExpandError!bool {
+    try checkStack();
+    switch (a.datum) {
+        .list, .vector, .map, .set => |items| {
+            if (std.meta.activeTag(a.datum) != std.meta.activeTag(b.datum)) return false;
+            const other = switch (b.datum) {
+                .list, .vector, .map, .set => |x| x,
+                else => unreachable,
+            };
+            if (items.len != other.len) return false;
+            for (items, other) |x, y| if (!try sameConstant(x, y)) return false;
+            return true;
+        },
+        else => return reader_mod.formLiteralEq(a, b),
+    }
 }
 
 /// The test for one `case` key: `(= g 'k)`, or for a group of

@@ -2673,6 +2673,15 @@ test "case: constants are data, never evaluated" {
     try expectOutput("(let [x 5] (case x (4 5 6) :mid :d))", ":mid");
 }
 
+test "case: a test constant given twice fails at expansion, as in Clojure" {
+    try expectMacroFailure("", "(case 1 1 :a 1 :b)", "case: duplicate test constant", "1");
+    try expectMacroFailure("", "(case x (1 2) :a (3 2) :b :d)", "case: duplicate test constant", "2");
+    try expectMacroFailure("", "(case x [1 (2)] :a y :b [1 (2)] :c)", "case: duplicate test constant", "[1 (2)]");
+    try expectMacroFailure("", "(case x (a a) :a)", "case: duplicate test constant", "a");
+    // Equal-looking constants of different kinds, and a default equal to a key, are not duplicates.
+    try expectOutput("[(case 1 1 :int 1.0 :float \\1 :char \"1\" :str :d) (case 1 1 :a 1)]", "[:int :a]");
+}
+
 test "case: no match without default throws a map naming the value" {
     try expectOutput(
         \\(try (case 99 1 :one 2 :two) (catch any e [(:error e) (:value e) (:message e)]))
