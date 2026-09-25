@@ -583,9 +583,9 @@ fn expandOrdinaryCall(
     return try rebuildListIfChanged(ctx, list_form, items, env, depth);
 }
 
-/// Common pattern: expand every list item with the same env,
-/// rebuild the list ONLY if at least one item changed. Avoids
-/// unnecessary allocation when no expansion fires.
+/// Expand every list item with the same env, each exactly once
+/// (a user macro may have side effects); the list is rebuilt only
+/// when some item changed.
 fn rebuildListIfChanged(
     ctx: *ExpandContext,
     list_form: *const Form,
@@ -596,24 +596,17 @@ fn rebuildListIfChanged(
     var new_items: ?[]*Form = null;
     for (items, 0..) |item, i| {
         const expanded = try expandFormDepth(ctx, env, item, depth);
-        if (expanded == item) continue;
-        // First divergence: clone the slice up to here.
-        if (new_items == null) {
-            new_items = try ctx.allocator.alloc(*Form, items.len);
-            for (items[0..i], 0..) |earlier, j| new_items.?[j] = mutCast(earlier);
+        if (new_items) |out| {
+            out[i] = expanded;
+        } else if (expanded != item) {
+            const out = try ctx.allocator.alloc(*Form, items.len);
+            for (items[0..i], 0..) |earlier, j| out[j] = mutCast(earlier);
+            out[i] = expanded;
+            new_items = out;
         }
-        new_items.?[i] = expanded;
     }
-    if (new_items == null) return mutCast(list_form);
-    // The loop above only records changed items, so items that
-    // came back unchanged after the first divergence are not in
-    // `new_items`. Once ANY item changed, do a second pass that
-    // copies every expansion.
-    const final = try ctx.allocator.alloc(*Form, items.len);
-    for (items, 0..) |item, i| {
-        final[i] = try expandFormDepth(ctx, env, item, depth);
-    }
-    return try makeList(ctx, final, list_form.origin);
+    const out = new_items orelse return mutCast(list_form);
+    return try makeList(ctx, out, list_form.origin);
 }
 
 // ---- let* / loop* — sequential binding scope ------------------------------

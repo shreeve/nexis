@@ -305,6 +305,9 @@ that should be expanded.
 | `require` | `(require 'my.ns)` / `(require '[my.ns :as a])`, several specs per call: the file load, registry update and alias entry happen at expansion time through `ctx.load_callback`; replaced by `nil`. Only `:as` is accepted — `:refer` / `:rename` / `:exclude` are `MalformedMacroCall`. |
 | Non-symbol head | Treat as ordinary call: expand head + all args. |
 
+Every sub-form is expanded exactly once, so a user macro runs once
+per call site and its side effects happen once.
+
 The macroexpander tracks lexical names in an `ExpandEnv` that
 mirrors `compile.LowerEnv` exactly (innermost-first lookup via a
 parent walk) so the two stay aligned.

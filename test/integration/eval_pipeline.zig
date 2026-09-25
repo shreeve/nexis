@@ -1253,6 +1253,16 @@ test "integration: defmacro — user macro shadows host macro" {
     , ":user-when");
 }
 
+test "defmacro: a macro call nested in calls and host macros expands exactly once" {
+    try expectOutput(
+        \\(def counter (atom 0))
+        \\(defmacro m [] (swap! counter inc) 1)
+        \\(+ 1 (+ 1 (+ 1 (m))))
+        \\(defn g [y] (let [z (m)] (when true (-> y (+ z) (if (m) 0)))))
+        \\@counter
+    , "3");
+}
+
 test "integration: defmacro — macro can use already-defined macros in body" {
     // twice's body uses unless (a macro defined above it);
     // when outer is invoked, the macro fn body is already
