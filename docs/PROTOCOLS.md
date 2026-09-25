@@ -83,6 +83,11 @@ field maps are `=`; a record is never `=` to a map. The hash is
 32 bits, then mixed with kind domain 35 by `dispatch.hashValue`, and
 cached in the header. Records work as map keys and set members.
 
+**Metadata** (`docs/SEMANTICS.md` §7): a record carries it in its
+header like a map, through `with-meta`, and keeps it through `assoc`
+and `dissoc` (`record.withFields`). It never takes part in `=`, hash
+or printing.
+
 **Print**: `#ns.Type{:field value, ...}` in both modes, as Clojure
 prints a record: `(->P 1 "a")` in `user` prints `#user.P{:x 1, :y a}`
 with `println` and `#user.P{:x 1, :y "a"}` with `prn`, the field values

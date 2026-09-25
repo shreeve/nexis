@@ -35,8 +35,8 @@ absent), `contains?`, `find`, `keys`, `vals`, `key`, `val`, `zipmap`,
 `update-vals` and `update-keys` are `src/stdlib/core.nx`; set algebra
 is the `nexis.set` namespace (`src/stdlib/set.nx`). `(assoc nil k v)`
 is `{k v}` (SEMANTICS §4). An update that changes nothing returns its
-argument, metadata included; any other update returns a collection
-without the argument's metadata.
+argument; any other update returns a new root carrying the argument's
+metadata (SEMANTICS §7).
 
 **Absent.** Sorted maps and sets, and any other member of the map or
 set equality category; transients are `src/coll/transient.zig`

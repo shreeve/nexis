@@ -31,8 +31,8 @@ or the default), `get` (nil out of range), `peek` (nil on empty), `pop`
 O(end - start); bounds outside `0..count` are `:index-out-of-bounds`, a
 non-vector is `:kind-mismatch`), and invocation `([1 2 3] 1)`. `seq`,
 `rest`, `next` and `nthrest` of a vector are an O(1) list view
-(`docs/LIST.md` §1). `conj`, `assoc` and `pop` return a vector without
-the argument's metadata.
+(`docs/LIST.md` §1). `conj`, `assoc` and `pop` return a vector carrying
+the argument's metadata (SEMANTICS §7).
 
 **Absent.** RRB relaxation and O(1) `subvec`/`concat` (PLAN §23 #30);
 the small-vector inline form (subkind 0, reserved).

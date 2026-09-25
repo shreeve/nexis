@@ -164,8 +164,10 @@ and never reads a collection's body.
 - **Print**: `#<transient>`; it does not read back.
 - **Codec**: not serializable (`docs/CODEC.md` §3); a transient inside
   a durable value is `:unserializable`.
-- **Metadata**: `with-meta` is `:no-metadata-on-immediate`; `meta` is
-  nil (SEMANTICS §7).
+- **Metadata**: `with-meta` is `:kind-mismatch`; `meta` is nil
+  (SEMANTICS §7). `transient` of a collection carrying metadata holds
+  a copy of its root without it, so `persistent!` returns none, as in
+  Clojure.
 
 ---
 

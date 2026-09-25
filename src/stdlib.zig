@@ -1690,7 +1690,7 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         .list => blk: {
             var result = coll;
             for (xs) |x| {
-                result = list_mod.cons(heap, x, result) catch return VmError.OutOfMemory;
+                result = list_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
             }
             break :blk result;
         },
@@ -2260,21 +2260,25 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(empty coll)` → an empty collection of the same kind; a
-/// record, being a map, gives `{}`; anything that is not a
-/// collection (a string included) gives nil, as in Clojure.
+/// `(empty coll)` → an empty collection of the same kind carrying
+/// `coll`'s metadata; a record, being a map, gives `{}`; anything
+/// that is not a collection (a string included) gives nil, as in
+/// Clojure.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
-    return switch (args[0].kind()) {
-        .nil => value_mod.nilValue(),
-        .list => list_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_vector => vector_mod.empty(heap) catch VmError.OutOfMemory,
-        .persistent_map, .record => champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
-        .persistent_set => champ_mod.setEmpty(heap) catch VmError.OutOfMemory,
+    const e = switch (args[0].kind()) {
+        .nil => return value_mod.nilValue(),
+        .list => list_mod.empty(heap),
+        .persistent_vector => vector_mod.empty(heap),
+        .record => return champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
+        .persistent_map => champ_mod.mapEmpty(heap),
+        .persistent_set => champ_mod.setEmpty(heap),
         // A typed vector takes no updates (TYPED_VECTOR.md §6).
-        .typed_vector => VmError.KindMismatch,
-        else => value_mod.nilValue(),
-    };
+        .typed_vector => return VmError.KindMismatch,
+        else => return value_mod.nilValue(),
+    } catch return VmError.OutOfMemory;
+    heap_mod.Heap.asHeapHeader(e).setMeta(heap_mod.Heap.asHeapHeader(args[0]).getMeta());
+    return e;
 }
 
 /// `(not-empty coll)` → coll, or nil when it has no elements.
@@ -2572,16 +2576,19 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 // Metadata (PLAN §8.5, SEMANTICS.md §7)
 // =============================================================================
 //
-// A list, vector, map or set carries its metadata map in the heap
-// header's `meta` slot; a Var carries it in `Var.meta`. Metadata
+// A list, vector, map, set or record carries its metadata map in the
+// heap header's `meta` slot; a Var carries it in `Var.meta`. Metadata
 // never takes part in equality, hashing, printing or the codec.
 
 fn carriesHeaderMeta(k: Kind) bool {
-    return k == .list or k == .persistent_vector or k == .persistent_map or k == .persistent_set;
+    return switch (k) {
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        else => false,
+    };
 }
 
-/// `(meta x)` → the metadata map of a list, vector, map, set or Var;
-/// nil for anything else or when none is attached.
+/// `(meta x)` → the metadata map of a list, vector, map, set, record
+/// or Var; nil for anything else or when none is attached.
 fn fnMeta(_: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .var_) return VM.asVar(x).meta;
@@ -2592,27 +2599,29 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
 
 /// `(with-meta x m)` → a value equal to `x` carrying `m` (a map or
 /// nil) as its metadata. The root object is copied, so `x` keeps its
-/// own; the copy shares every node below the root. A kind that
-/// cannot carry metadata is `:no-metadata-on-immediate`; a Var's
-/// metadata changes in place through `reset-meta!` / `alter-meta!`.
+/// own; the copy shares every node below the root. A scalar (nil, a
+/// boolean, char, number, string, keyword or symbol) is
+/// `:no-metadata-on-immediate`; any other kind that cannot carry
+/// metadata is `:kind-mismatch`, a Var included: its metadata changes
+/// in place through `reset-meta!` / `alter-meta!` (SEMANTICS §7).
 fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     const m = args[1];
     if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
-    if (!carriesHeaderMeta(args[0].kind())) return vm.throwKeyword("no-metadata-on-immediate");
-    // Every rest of a vector view shares its block (LIST.md §1), so
-    // metadata on it would follow `rest`; the copy gets cells of its own.
-    const x = if (args[0].kind() == .list and args[0].subkind() == list_mod.subkind_view) blk: {
-        var items = try collectSeq(vm, args[0]);
-        defer items.deinit(vm.allocator);
-        break :blk try buildListFromSlice(vm, items.items);
-    } else args[0];
+    const x = args[0];
+    if (!carriesHeaderMeta(x.kind())) return switch (x.kind()) {
+        .nil, .true_, .false_, .char, .fixnum, .float, .bignum, .string, .keyword, .symbol => vm.throwKeyword("no-metadata-on-immediate"),
+        else => VmError.KindMismatch,
+    };
+    const meta_h: ?*heap_mod.HeapHeader = if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m);
+    // Every rest of a vector view shares its block (LIST.md §2).
+    if (x.kind() == .list and x.subkind() == list_mod.subkind_view) return list_mod.viewWithMeta(vm.ensureHeap(), x, meta_h) catch VmError.OutOfMemory;
     const h = heap_mod.Heap.asHeapHeader(x);
     const body = heap_mod.Heap.bodyBytes(h);
     const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
     @memcpy(heap_mod.Heap.bodyBytes(copy), body);
     copy.kind = h.kind;
     copy.flags = h.flags & ~heap_mod.flag_has_meta;
-    copy.setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m));
+    copy.setMeta(meta_h);
     return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
 }
 

@@ -99,6 +99,15 @@ fn allocRoot(heap: *Heap) !*HeapHeader {
 }
 
 /// Fresh zeroed interior node — 32 null child pointers.
+/// A root for an update of the vector rooted at `src`: it carries
+/// `src`'s metadata, as every Clojure collection update does
+/// (SEMANTICS §7).
+fn allocDerivedRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
+    const h = try allocRoot(heap);
+    h.setMeta(src.getMeta());
+    return h;
+}
+
 fn allocInterior(heap: *Heap) !*HeapHeader {
     return heap.alloc(.persistent_vector, interior_body_size);
 }
@@ -205,7 +214,8 @@ pub fn empty(heap: *Heap) !Value {
 ///       interior node has old root in slot 0 and a freshly-built
 ///       path to the promoted leaf in slot 1; start new tail.
 pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
-    const src = rootBody(rootHeader(v));
+    const src_h = rootHeader(v);
+    const src = rootBody(src_h);
 
     // Path (a): tail has room → grow tail by 1.
     if (src.tail_len < branch_factor) {
@@ -214,7 +224,7 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
         if (src.tail_node) |t| @memcpy(new_tail_values[0..src.tail_len], tailValues(t));
         new_tail_values[src.tail_len] = elem;
 
-        const new_root_h = try allocRoot(heap);
+        const new_root_h = try allocDerivedRoot(heap, src_h);
         const new_root = rootBody(new_root_h);
         new_root.* = src.*;
         new_root.count = src.count + 1;
@@ -291,7 +301,7 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
         new_root_node = try pushLeaf(heap, src.root_node.?, src.shift, promoted_leaf_base, promoted_leaf);
     }
 
-    const new_root_h = try allocRoot(heap);
+    const new_root_h = try allocDerivedRoot(heap, src_h);
     const new_root = rootBody(new_root_h);
     new_root.count = src.count + 1;
     new_root.shift = new_shift;
@@ -308,7 +318,7 @@ pub fn assoc(heap: *Heap, v: Value, i: usize, elem: Value) !Value {
     const src_h = rootHeader(v);
     const src = rootBody(src_h);
     std.debug.assert(i < src.count);
-    const new_root_h = try allocRoot(heap);
+    const new_root_h = try allocDerivedRoot(heap, src_h);
     const new_root = rootBody(new_root_h);
     new_root.* = src.*;
     const tail_offset: usize = src.count - src.tail_len;
@@ -344,10 +354,15 @@ fn assocPath(heap: *Heap, node: *HeapHeader, level_shift: u32, i: usize, elem: V
 /// root left with a single child is replaced by that child (the shift
 /// drops by 5). `v` must not be empty.
 pub fn pop(heap: *Heap, v: Value) !Value {
-    const src = rootBody(rootHeader(v));
+    const src_h = rootHeader(v);
+    const src = rootBody(src_h);
     std.debug.assert(src.count > 0);
-    if (src.count == 1) return empty(heap);
-    const new_root_h = try allocRoot(heap);
+    if (src.count == 1) {
+        const e = try empty(heap);
+        Heap.asHeapHeader(e).setMeta(src_h.getMeta());
+        return e;
+    }
+    const new_root_h = try allocDerivedRoot(heap, src_h);
     const new_root = rootBody(new_root_h);
     new_root.* = src.*;
     new_root.count = src.count - 1;

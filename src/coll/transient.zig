@@ -167,14 +167,26 @@ pub fn transientFrom(heap: *Heap, persistent_v: Value) (TransientError || std.me
         .persistent_vector => subkind_transient_vector,
         else => return TransientError.InvalidTransientInner,
     };
+    const inner = try withoutMeta(heap, Heap.asHeapHeader(persistent_v));
     const h = try heap.alloc(.transient, @sizeOf(TransientBody));
     const body = transientBody(h);
     body.owner_token = issueOwnerToken();
-    body.inner_header = Heap.asHeapHeader(persistent_v);
+    body.inner_header = inner;
     return .{
         .tag = @as(u64, @intFromEnum(Kind.transient)) | (@as(u64, subkind) << 16),
         .payload = @intFromPtr(h),
     };
+}
+
+/// `root`, or a copy of it without metadata when it carries some:
+/// `persistent!` returns a collection without metadata, as in Clojure,
+/// though the ops underneath keep a root's metadata (SEMANTICS §7).
+fn withoutMeta(heap: *Heap, root: *HeapHeader) !*HeapHeader {
+    if (root.getMeta() == null) return root;
+    const body = Heap.bodyBytes(root);
+    const copy = try heap.alloc(@enumFromInt(root.kind), body.len);
+    @memcpy(Heap.bodyBytes(copy), body);
+    return copy;
 }
 
 /// Freeze the transient and return the current inner persistent

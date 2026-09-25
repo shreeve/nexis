@@ -270,15 +270,43 @@ test "meta / with-meta / vary-meta on collections never touch equality, hash or 
     try expectOutput("(meta (with-meta #{1} {:m 2}))", "{:m 2}");
     try expectOutput("(meta (with-meta '(1 2) {:m 2}))", "{:m 2}");
     try expectOutput("(meta (with-meta () {:m 2}))", "{:m 2}");
-    try expectOutput("(let [m (with-meta {:k 1} {:m 2})] [(get m :k) (assoc m :j 2) (meta (assoc m :j 2))])", "[1 {:k 1, :j 2} nil]");
+    try expectOutput("(let [m (with-meta {:k 1} {:m 2})] [(get m :k) (assoc m :j 2) (meta (assoc m :j 2))])", "[1 {:k 1, :j 2} {:m 2}]");
     try expectOutput("(meta (vary-meta [1] assoc :b 2))", "{:b 2}");
     try expectOutput("(meta (vary-meta (with-meta [1] {:a 1}) assoc :b 2))", "{:a 1, :b 2}");
     try expectOutput("(meta (with-meta (with-meta [1] {:a 1}) nil))", "nil");
     try expectOutput("(try (with-meta 1 {}) (catch any e e))", ":no-metadata-on-immediate");
     try expectOutput("(try (with-meta \"s\" {}) (catch any e e))", ":no-metadata-on-immediate");
-    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", ":no-metadata-on-immediate");
+    try expectOutput("(try (with-meta (var meta) {}) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (with-meta [1] 5) (catch any e e))", ":kind-mismatch");
     try expectOutput("[(meta \"s\") (meta 1) (meta nil) (meta :k)]", "[nil nil nil nil]");
+}
+
+test "metadata: every update of a collection keeps it, as in Clojure; rest and transients do not" {
+    const m = "(def m {:m 1}) ";
+    try expectOutput(m ++ "(mapv meta [(conj (with-meta [1] m) 2) (conj (with-meta '(1) m) 2) (conj (with-meta () m) 1) (conj (with-meta {:a 1} m) [:b 2]) (conj (with-meta #{1} m) 2)])", "[{:m 1} {:m 1} {:m 1} {:m 1} {:m 1}]");
+    try expectOutput(m ++ "(mapv meta [(assoc (with-meta {:a 1} m) :b 2) (assoc (with-meta [1 2] m) 0 3) (assoc (with-meta [1 2] m) 2 3) (dissoc (with-meta {:a 1 :b 2} m) :a) (dissoc (with-meta {:a 1} m) :a) (disj (with-meta #{1 2} m) 1) (disj (with-meta #{1} m) 1)])", "[{:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1}]");
+    try expectOutput(m ++ "(let [big (with-meta (zipmap (range 20) (range 20)) m)] (mapv meta [(assoc big :x 1) (dissoc big 0) (conj (with-meta (set (range 20)) m) :x) (disj (with-meta (set (range 20)) m) 0) (conj (with-meta (vec (range 40)) m) 40)]))", "[{:m 1} {:m 1} {:m 1} {:m 1} {:m 1}]");
+    try expectOutput(m ++ "(mapv meta [(pop (with-meta [1 2] m)) (pop (with-meta [1] m)) (pop (with-meta (vec (range 33)) m)) (into (with-meta [] m) [1 2]) (into (with-meta {} m) {:a 1}) (into (with-meta #{} m) [1]) (empty (with-meta [1] m)) (empty (with-meta {:a 1} m)) (empty (with-meta #{1} m)) (empty (with-meta '(1) m))])", "[{:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1} {:m 1}]");
+    try expectOutput(m ++ "(mapv meta [(assoc-in (with-meta {:a {:b 1}} m) [:a :b] 2) (update (with-meta {:a 1} m) :a inc) (merge (with-meta {:a 1} m) {:b 2}) (update (with-meta [1] m) 0 inc)])", "[{:m 1} {:m 1} {:m 1} {:m 1}]");
+    // rest, next and a list's pop are the elements after the first, which carry no metadata of their own.
+    try expectOutput(m ++ "(mapv meta [(rest (with-meta [1 2 3] m)) (next (with-meta [1 2 3] m)) (rest (with-meta '(1 2) m)) (pop (with-meta '(1 2) m)) (seq (with-meta [1 2] m))])", "[nil nil nil nil nil]");
+    // transient and persistent! drop it; into keeps its target's.
+    try expectOutput(m ++ "(mapv meta [(persistent! (conj! (transient (with-meta [1] m)) 2)) (persistent! (transient (with-meta #{1} m))) (persistent! (assoc! (transient (with-meta {} m)) :a 1))])", "[nil nil nil]");
+    try expectOutput(m ++ "(let [v (conj (with-meta [1] m) 2)] [(= v [1 2]) (= (hash v) (hash [1 2])) v])", "[true true [1 2]]");
+}
+
+test "metadata: a seq view of a vector takes it without copying, and its rest does not carry it" {
+    try expectOutput(
+        \\(let [v (vec (range 5)) s (with-meta (seq v) {:a 1}) r (with-meta (rest v) {:b 2})]
+        \\  [(meta s) s (count s) (first s) (= s v) (meta (rest s)) (rest s) (meta (next s)) (meta (drop 2 s)) (drop 2 s)
+        \\   (meta r) r (meta (rest r)) (rest r) (nth s 4) (vec s) (meta (with-meta s {:c 3})) (meta (with-meta s nil)) (with-meta s nil)
+        \\   (meta (seq v)) (into [] s) (apply + s) (= (hash s) (hash (seq v)))])
+    , "[{:a 1} (0 1 2 3 4) 5 0 true nil (1 2 3 4) nil nil (2 3 4) {:b 2} (1 2 3 4) nil (2 3 4) 4 [0 1 2 3 4] {:c 3} nil (0 1 2 3 4) nil [0 1 2 3 4] 10 true]");
+}
+
+test "metadata: a record carries it through assoc and dissoc; kinds that cannot carry it are :kind-mismatch" {
+    try expectOutput("(defrecord P [x y]) (let [p (with-meta (->P 1 2) {:m 1})] [(meta p) p (= p (->P 1 2)) (meta (assoc p :x 3)) (meta (dissoc p :z)) (meta (assoc p :z 3)) (meta (->P 1 2)) (meta (with-meta p nil))])", "[{:m 1} #user.P{:x 1, :y 2} true {:m 1} {:m 1} {:m 1} nil nil]");
+    try expectOutput("[(try (with-meta (atom 1) {}) (catch any e e)) (try (with-meta (i64-vector [1]) {}) (catch any e e)) (try (with-meta inc {}) (catch any e e)) (try (with-meta (transient []) {}) (catch any e e)) (meta (atom 1))]", "[:kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch nil]");
 }
 
 test "metadata: hints in binding positions are dropped, ^meta on a collection literal is its metadata" {
@@ -4468,7 +4496,7 @@ test "typed vectors: constructor errors and the absent update operations" {
         .{ .src = "(try (subvec (i64-vector [1]) 0) (catch any e e))", .expected = ":kind-mismatch" },
         .{ .src = "(try (empty (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
         .{ .src = "(try ((i64-vector [1]) 0) (catch any e e))", .expected = ":not-callable" },
-        .{ .src = "(try (with-meta (i64-vector [1]) {}) (catch any e e))", .expected = ":no-metadata-on-immediate" },
+        .{ .src = "(try (with-meta (i64-vector [1]) {}) (catch any e e))", .expected = ":kind-mismatch" },
     });
 }
 
