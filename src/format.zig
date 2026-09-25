@@ -171,24 +171,6 @@ pub fn format(
     }
 }
 
-/// Convenience wrapper for callers that want a fresh heap-string
-/// Value built from format-output. Builds bytes into a
-/// `std.Io.Writer.Allocating` (Zig 0.16's growable-writer
-/// adapter) and hands them to `string_mod.fromBytes`. Used by
-/// `str` (display) and `pr-str` (readable).
-pub fn formatToString(
-    allocator: std.mem.Allocator,
-    heap: *heap_mod.Heap,
-    v: Value,
-    mode: FormatMode,
-    interner: ?*const intern_mod.Interner,
-) !Value {
-    var w = std.Io.Writer.Allocating.init(allocator);
-    defer w.deinit();
-    try format(v, mode, &w.writer, interner);
-    return try string_mod.fromBytes(heap, w.written());
-}
-
 // =============================================================================
 // Per-kind helpers
 // =============================================================================
@@ -537,15 +519,6 @@ test "collections: list / vector display + readable round-trip" {
     const got_r = try formatForTest(vec, .readable, &it);
     defer testing.allocator.free(got_r);
     try testing.expectEqualStrings("[1 :a \"x\"]", got_r);
-}
-
-test "formatToString: builds a fresh heap-string Value" {
-    var heap = heap_mod.Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const v = try formatToString(testing.allocator, &heap, value_mod.fromFixnum(42).?, .display, null);
-    try testing.expect(v.kind() == .string);
-    try testing.expectEqualStrings("42", string_mod.asBytes(v));
 }
 
 test "records: #ns.Type{...} in both modes once the interner names the type; opaque otherwise" {

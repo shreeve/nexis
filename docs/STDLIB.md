@@ -255,9 +255,6 @@ readable mode refuses them with `:utf8-error` rather than emit text
 that is not source. The REPL and `-e` print such a value as
 `#<invalid utf-8>`.
 
-`format.formatToString` builds a heap string from one value; only
-its own test calls it.
-
 ---
 
 ### 6. I/O natives
