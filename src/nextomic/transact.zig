@@ -1487,8 +1487,8 @@ const Ctx = struct {
         return null;
     }
 
-    /// The value of a current EAVT row. A cursor's value is clamped to
-    /// one page, so an out-of-line payload is read again by exact key.
+    /// The value of a current row. An out-of-line payload lives in the
+    /// EAVT row's value alone, so it is read by the EAVT key.
     fn valFromParts(self: *Ctx, parts: key.Parts) !Val {
         const kv = try key.decodeVal(self.arena, parts.v);
         if (kv == .val) return kv.val;

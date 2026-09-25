@@ -23,8 +23,9 @@
 //!   - Current-tree values are `[t:6]`, plus the payload in `nx/eavt`
 //!     for out-of-line values; history-tree values are empty, plus the
 //!     payload in `nx/eavt-h`.
-//!   - Values read off a cursor are clamped to one page; a payload is
-//!     always read with `getFromTree` on its exact key.
+//!   - A value spanning several pages, from a cursor or `getFromTree`,
+//!     is assembled in the transaction's buffer and valid until the
+//!     next such read; callers copy what they keep.
 
 const std = @import("std");
 const emdb = @import("emdb");
@@ -741,7 +742,8 @@ pub const Store = struct {
     /// Forward scan of one tree: the keys starting with a prefix (every
     /// key when it is empty), or the keys in `[start, end)` (an absent
     /// `end` runs to the tree's last key). Keys and values borrow the
-    /// transaction's snapshot; cursor values are clamped to one page.
+    /// transaction's snapshot, a multi-page value only until the next
+    /// multi-page read.
     pub const Scan = struct {
         cursor: emdb.Cursor,
         start: []const u8,
@@ -793,7 +795,7 @@ pub const Store = struct {
         }
     };
 
-    /// A history row: the key without `top`, its clamped value, `t` and
+    /// A history row: the key without `top`, its value, `t` and
     /// `added`. Slices borrow the transaction's snapshot.
     pub const HistoryRow = struct {
         fact: []const u8,
