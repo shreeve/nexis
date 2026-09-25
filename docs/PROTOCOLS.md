@@ -176,9 +176,9 @@ qualified by the current namespace (`"<ns>/Name"`).
 A docstring and `:option value` pairs before the methods are accepted
 and ignored. Each method spec must be a non-empty list headed by an
 unqualified symbol; its parameter vectors (and anything after them)
-are ignored. A method has exactly one arity, its impl's own: the
-registry records none, and whichever impl the dispatcher calls checks
-its arguments.
+are ignored. A method's arities are its impl's own: the registry
+records none, and whichever impl the dispatcher calls picks the arity
+by the argument count or raises `:arity-mismatch` (§4.2).
 
 #### 4.2 `defrecord`
 
@@ -199,6 +199,13 @@ its arguments.
   following `(method [params] body...)` clauses implement; a method
   clause before any protocol symbol is a malformed macro call. A
   method must take the record as its first parameter.
+- A method with several arities takes either Clojure spelling: one
+  clause per arity, `(m [this] ...) (m [this x] ...)`, or one clause
+  listing them, `(m ([this] ...) ([this x] ...))`. Every clause of a
+  name under one protocol symbol goes into one impl, an overloaded
+  `fn` (`MACROEXPAND.md` §10), so the argument count picks the arity,
+  a variadic arity included; two arities with the same count fail as
+  `fn`'s overloads do.
 - Inside an inline method each field is a local bound to
   `(get this :field)`, as in Clojure, so a field assoc'd onto the
   record is what the method sees; a field whose name appears anywhere
@@ -224,7 +231,8 @@ its arguments.
 `Protocol (method ...)...` groups; `extend-protocol` takes one protocol
 and any number of `type (method ...)...` groups. Both use the clause
 parser `defrecord` uses, with the fixed and iterated positions
-swapped.
+swapped, so a method's arities take either spelling of §4.2:
+`(extend-type :string P (m ([s] ...) ([s x] ...)))`.
 
 | Type form | Emits | Dispatch key |
 |---|---|---|
@@ -355,7 +363,7 @@ namespace.
 - `defrecord` does not bind the type name (§0).
 - No default impl inside `defprotocol`; defaults are installed with
   `extend-protocol ... :any`.
-- No per-method arity and no multi-arity protocol methods (§4.1).
+- No arity check at the protocol fn: the impl checks its own (§4.1).
 - No umbrella numeric dispatch target (§3.2).
 - No inline caching of protocol dispatch (§5.5).
 - No tagged-literal reading of printed records (§2.1).

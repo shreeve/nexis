@@ -1118,7 +1118,7 @@ pub const DeclaredNames = struct {
     }
 
     /// Record every name `form` defines, at any depth: `def`,
-    /// `defn`, `defonce`, `defmacro`, `defrecord` (the type id, `->T`,
+    /// `defn`, `defn-`, `defonce`, `defmacro`, `defrecord` (the type id, `->T`,
     /// `map->T`, `T?`) and `defprotocol` (the protocol and each
     /// method). A definition inside a `let`, a `when` or a call
     /// interns its Var when it runs, exactly like one at top level,
@@ -1143,7 +1143,7 @@ pub const DeclaredNames = struct {
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;
         const name = name_form.datum.symbol.name;
-        const plain = [_][]const u8{ "def", "defn", "defonce", "defmacro" };
+        const plain = [_][]const u8{ "def", "defn", "defn-", "defonce", "defmacro" };
         if (for (plain) |h| {
             if (std.mem.eql(u8, head, h)) break true;
         } else false) {
@@ -1615,13 +1615,15 @@ fn lowerQuotePayload(
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // `'(a 'b)` is `(a (quote b))`: the inner quote is data, the
-        // 2-list `formToValue` renders it as.
+        // 2-list `formToValue` renders it as, a constant like any
+        // other quoted list.
         .quote => |inner| blk: {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
             const quote_sym = interner.internSymbolValue("quote") catch return CompileError.OutOfMemory;
             const tiny_items = try allocator.alloc(*const Tiny, 2);
             tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
             tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
+            if (try constantColl(allocator, .list, tiny_items, ctx)) |v| break :blk try allocTiny(allocator, .{ .literal = v });
             break :blk try allocTiny(allocator, .{ .coll = .{ .op = .list, .items = tiny_items } });
         },
         else => return CompileError.UnsupportedFeature,
@@ -2790,11 +2792,11 @@ fn compileLetStar(
 ///
 /// Layout WITH finally:
 ///   try-enter catch_pc binding_slot finally_pc
-///   <body → dst>
+///   <body → result>
 ///   try-exit post_pc          ; VM pushes .normal(post_pc),
 ///                              ; jumps to finally_pc
 /// catch_pc:
-///   <handler → dst, binding in scope>
+///   <handler → result, binding in scope>
 ///   try-exit post_pc          ; same: VM pushes .normal,
 ///                              ; runs finally, resumes post_pc
 /// finally_pc:
@@ -2803,6 +2805,13 @@ fn compileLetStar(
 ///                              ; dispatches (.normal → post,
 ///                              ;             .throwing → unwind)
 /// post_pc:
+///   mov result → dst
+///
+/// A node writes `dst` as its last act (§4.4), so `dst` may be a
+/// live binding's slot (a recur argument's): with a finally, the
+/// value waits in `result` until the finally has completed, since a
+/// finally that throws must leave `dst`, which an enclosing handler
+/// may read, untouched.
 ///
 /// The finally body sees the OUTER lexical scope, NOT the
 /// catch binding (which is only in scope inside the handler).
@@ -2816,10 +2825,7 @@ fn compileTry(
     dst: u12,
 ) CompileError!void {
     const binding_slot = try e.allocSlot();
-    // Scratch slot for finally body's result (discarded). Even
-    // when finally is absent we allocate to keep dst-slot
-    // ownership clean.
-    const finally_scratch: u12 = if (finally_ != null) try e.allocSlot() else 0;
+    const result: u12 = if (finally_ != null) try e.allocSlot() else dst;
 
     // Emit try-enter with placeholder catch_pc (and
     // finally_pc when present). Patch after we know both PCs.
@@ -2830,8 +2836,7 @@ fn compileTry(
         try e.emit(vm.asm_.tryEnter(0, binding_slot));
     }
 
-    // Body → dst.
-    try compileExpr(e, body, dst, null);
+    try compileExpr(e, body, result, null);
 
     // Body-exit try-exit (post_pc placeholder).
     const body_exit_pc = e.code.items.len;
@@ -2845,7 +2850,7 @@ fn compileTry(
     const scope_mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(scope_mark);
     try e.bindLocal(binding, binding_slot, binding_captured);
-    try compileExpr(e, handler, dst, null);
+    try compileExpr(e, handler, result, null);
     e.scope.shrinkRetainingCapacity(scope_mark);
 
     // Catch-exit try-exit (post_pc placeholder).
@@ -2855,23 +2860,20 @@ fn compileTry(
     // Optional finally block + finally-exit.
     if (finally_) |fin_body| {
         e.code.items[try_enter_pc].c = vm.Operand.jump(try e.nextPc());
-        // Finally body sees OUTER scope (binding is out of
-        // scope here — we already popped it). Result discarded
-        // into finally_scratch slot.
-        try compileExpr(e, fin_body, finally_scratch, null);
+        // The binding is out of scope here; the value is discarded.
+        try compileExpr(e, fin_body, try e.allocSlot(), null);
         try e.emit(vm.asm_.finallyExit());
     }
 
-    // post_pc = end of code. Patch both try-exits.
     const post_pc = try e.nextPc();
     e.code.items[body_exit_pc].a = vm.Operand.jump(post_pc);
     e.code.items[catch_exit_pc].a = vm.Operand.jump(post_pc);
+    if (result != dst) try e.emit(vm.asm_.move(dst, result));
 }
 
-/// Compile `(throw value)`. Compile value into a
-/// fresh slot (we use `dst` since the throw never returns
-/// normally — the dst slot's prior contents don't matter),
-/// then emit `ctrl:throw <dst>`.
+/// Compile `(throw value)`: `ctrl:throw` of the value, read in
+/// place where it can be (`compileOperand`). A throw never writes a
+/// destination.
 fn compileThrow(e: *Emitter, value: *const Tiny) CompileError!void {
     try e.emit(vm.asm_.throwOp(try compileOperand(e, value, true)));
 }

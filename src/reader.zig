@@ -673,7 +673,9 @@ const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
     }
 }, std.hash_map.default_max_load_percentage);
 
-fn formLiteralEq(a: *const Form, b: *const Form) bool {
+/// Whether the atoms `a` and `b` are the same literal; false for
+/// anything else.
+pub fn formLiteralEq(a: *const Form, b: *const Form) bool {
     return switch (a.datum) {
         .nil => b.datum == .nil,
         .bool_ => |ab| b.datum == .bool_ and b.datum.bool_ == ab,
@@ -1216,6 +1218,13 @@ fn expectReads(src: []const u8, expected: []const u8) !void {
         try al.writer.writeByte('\n');
     }
     try std.testing.expectEqualStrings(expected, al.written());
+}
+
+test "a UTF-8 byte-order mark is skipped at the start of the source only" {
+    try expectReads("\xEF\xBB\xBF(a)", "(list (symbol a))\n");
+    try expectReads("\xEF\xBB\xBF", "");
+    // Anywhere else it is a symbol constituent, as in Clojure.
+    try expectReads("a\xEF\xBB\xBF", "(symbol a\xEF\xBB\xBF)\n");
 }
 
 test "discard: #_ drops the next form wherever a form may stand" {

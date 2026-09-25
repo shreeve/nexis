@@ -258,6 +258,11 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     try expectOutputProgram("(defmacro ^:private pm [x] x) [(pm 1) (:private (meta (var pm)))]", "[1 true]");
     // A ^meta name is still declared for forward references.
     try expectOutputProgram("(defn a [] (b)) (defn ^:private b [] :b) (a)", ":b");
+    // defn- is defn with :private true, which :refer :all skips.
+    try expectOutputProgram("(defn- dp \"doc\" [x] x) [(dp 1) (select-keys (meta (var dp)) [:private :doc :arglists])]", "[1 {:private true, :doc doc, :arglists ([x])}]");
+    try expectOutputProgram("(defn- ^{:k 1} dq ([] 0) ([x] x)) [(dq) (dq 2) (select-keys (meta (var dq)) [:private :k])]", "[0 2 {:private true, :k 1}]");
+    try expectOutputProgram("(defn e [] (dr)) (defn- dr [] :dr) (e)", ":dr");
+    try expectOutputWithFiles(&.{.{ "privy.nx", "(ns privy) (defn- hidden [] 1) (defn shown [] 2)" }}, "(require '[privy :refer :all]) [(shown) (try (eval 'hidden) (catch any e :unresolved))]", "[2 :unresolved]");
     // reset-meta! / alter-meta! change a Var in place.
     try expectOutputProgram("(defn f [x] x) (reset-meta! (var f) {:z 1}) (alter-meta! (var f) assoc :y 2) (meta (var f))", "{:z 1, :y 2}");
 }
@@ -299,6 +304,10 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     // ^meta inside syntax-quote reaches the definition the macro writes.
     try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
     try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
+    // A syntax-quoted collection with ^meta is that collection carrying it.
+    try expectOutput("[`^:foo [1 2] (meta `^:foo [1 2]) (meta `^{:k 1} {:a 1}) (meta `^:s #{1}) (meta `^:l (a b))]", "[[1 2] {:foo true} {:k 1} {:s true} {:l true}]");
+    try expectOutputProgram("(defmacro mv [] `(meta ^:foo [1 2])) (mv)", "{:foo true}");
+    try expectOutputProgram("(defmacro wm [] (with-meta [1 2] {:w 1})) [(wm) (meta (wm))]", "[[1 2] {:w 1}]");
 }
 
 test "integration: defn forward reference (Var late-binding)" {
@@ -1058,6 +1067,21 @@ test "hygiene: a local or Var named after a core function cannot capture host-ma
     try expectOutput("(let [< (fn [& _] false) not (fn [& _] false)] ((fn ([x] :one) ([x & r] :var)) 1 2))", ":var");
     try expectOutput("(let [first (fn [& _] :f) next (fn [& _] nil) conj (fn [& _] :c)] (for [x [1 2]] x))", "(1 2)");
     try expectOutput("(let [rest (fn [& _] :r)] (let [[a & r] [1 2 3]] r))", "(2 3)");
+}
+
+test "hygiene: a local, Var or macro named let, fn, loop, defn or and cannot capture host-macro output" {
+    // MACROEXPAND.md §5: host macros emit `nexis.core/let` and the like.
+    try expectOutputProgram("(defmacro and [& xs] :my-and) (defrecord R9 [a]) (R9? (->R9 1))", "true");
+    try expectOutputProgram("(defn four [let] (for [[a b] [[1 2]]] [let a b])) (four 9)", "([9 1 2])");
+    try expectOutput("(let [loop 5] ((fn ([x] (+ x loop)) ([x y] y)) 1))", "6");
+    try expectOutput("(let [let 5] ((fn [[a b]] (+ a b let)) [1 2]))", "8");
+    try expectOutput("(let [let 5] (loop [[a b] [1 2]] (+ a b let)))", "8");
+    try expectOutput("(let [fn 5] (defn g [x] (+ x fn)) (g 1))", "6");
+    try expectOutput("(let [defn 5] (defrecord RR [a]) (:a (->RR 1)))", "1");
+    try expectOutputProgram("(defprotocol P (m [s])) (let [fn 7 let 8] (defrecord R2 [a] P (m [s] [a fn let])) (m (->R2 1)))", "[1 7 8]");
+    try expectOutputProgram("(defprotocol P (m [s])) (defrecord R3 [a]) (let [fn 7] (extend-type R3 P (m [s] fn)) (m (->R3 1)))", "7");
+    // `@x` in a macro's arguments is `(nexis.core/deref x)`.
+    try expectOutputProgram("(defmacro q [x] (list 'quote x)) (q @a)", "(nexis.core/deref a)");
 }
 
 test "integration: fn with destructured params" {
@@ -2727,6 +2751,15 @@ test "case: constants are data, never evaluated" {
     try expectOutput("(let [x 5] (case x (4 5 6) :mid :d))", ":mid");
 }
 
+test "case: a test constant given twice fails at expansion, as in Clojure" {
+    try expectMacroFailure("", "(case 1 1 :a 1 :b)", "case: duplicate test constant", "1");
+    try expectMacroFailure("", "(case x (1 2) :a (3 2) :b :d)", "case: duplicate test constant", "2");
+    try expectMacroFailure("", "(case x [1 (2)] :a y :b [1 (2)] :c)", "case: duplicate test constant", "[1 (2)]");
+    try expectMacroFailure("", "(case x (a a) :a)", "case: duplicate test constant", "a");
+    // Equal-looking constants of different kinds, and a default equal to a key, are not duplicates.
+    try expectOutput("[(case 1 1 :int 1.0 :float \\1 :char \"1\" :str :d) (case 1 1 :a 1)]", "[:int :a]");
+}
+
 test "case: no match without default throws a map naming the value" {
     try expectOutput(
         \\(try (case 99 1 :one 2 :two) (catch any e [(:error e) (:value e) (:message e)]))
@@ -3109,6 +3142,40 @@ test "defrecord impls: multiple methods" {
         \\    (baz [this y] (+ (get this :n) y)))
         \\  [(bar (->Counter 5)) (baz (->Counter 5) 7)])
     , "[5 12]");
+}
+
+test "protocol methods: several arities, in either Clojure spelling, dispatch by argument count" {
+    // Separate clauses per arity, Clojure's defrecord spelling.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a]
+        \\  P
+        \\  (m [this] [:one a])
+        \\  (m [this x] [:two a x]))
+        \\[(m (->R 1)) (m (->R 1) 2)]
+    , "[[:one 1] [:two 1 2]]");
+    // One clause listing its arities, Clojure's extend spelling.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a] P (m ([this] [:one a]) ([this x] [:two a x])))
+        \\(extend-type :string P (m ([s] [:s1 s]) ([s x] [:s2 s x])))
+        \\(extend-protocol P :fixnum (m ([n] [:n1 n]) ([n x] [:n2 n x])) :keyword (m [k] :k1) (m [k x] :k2))
+        \\[(m (->R 1)) (m (->R 1) 2) (m "a") (m "a" 2) (m 5) (m 5 6) (m :z) (m :z 1)]
+    , "[[:one 1] [:two 1 2] [:s1 a] [:s2 a 2] [:n1 5] [:n2 5 6] :k1 :k2]");
+    // A variadic arity, and an arity no impl has.
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x] [s x y]))
+        \\(extend-type :fixnum P (m ([n] n) ([n & xs] (apply + n xs))))
+        \\[(m 1) (m 1 2 3) (try (m "x") (catch any e e))]
+    , "[1 6 :no-protocol-impl]");
+    try expectOutputProgram(
+        \\(defprotocol P (m [s] [s x]))
+        \\(defrecord R [a] P (m [this] 1))
+        \\(try (m (->R 1) 2) (catch any e e))
+    , ":arity-mismatch");
+    // The same arity twice is the fn overload error.
+    try expectMacroFailure("(defprotocol P (m [s]))", "(defrecord R [a] P (m [this] 1) (m [that] 2))", "fn: two overload clauses take 1 arguments", "(m [that] 2)");
+    try expectMacroFailure("(defprotocol P (m [s]))", "(extend-type :string P (m ([s] 1) [s]))", "expected the method's parameter vector or its arities ([params] body...), not a vector", "[s]");
 }
 
 test "defrecord impls: multiple protocols on one record" {
@@ -4949,6 +5016,19 @@ fn expectOutputWithFiles(files: []const [2][]const u8, src: []const u8, expected
 }
 
 const utilns = [2][]const u8{ "util.nx", "(ns util)\n(defn twice [x] (* 2 x))\n(def ^:private secret 1)\n(defn half [x] (quot x 2))\n" };
+
+test "ns: (:refer-clojure :exclude [names]) leaves those names to the namespace" {
+    // A form compiled before the namespace's own + calls it, not core's inlined +.
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [+ when])) (defn f [] (+ 1 2)) (defn + [a b] (str a b)) (f)", "12");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [when])) (defn when [x] [:mine x]) (when 1)", "[:mine 1]");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) [(nexis.core/inc 1) (try (inc 1) (catch any e e))]", "[2 :unbound-var]");
+    try expectOutputProgram("(ns ex (:refer-clojure :exclude [inc])) `(inc 1)", "(ex/inc 1)");
+    try expectOutputProgram("(ns ex (:refer-clojure)) (inc 1)", "2");
+    // Without :exclude, a Var the namespace defines hides a host macro too.
+    try expectOutputProgram("(defn when [x] [:mine x]) (when 1)", "[:mine 1]");
+    try expectMacroFailure("", "(ns ex (:refer-clojure :only [inc]))", "ns: (:refer-clojure :only ...) is not supported; :exclude is", ":only");
+    try expectMacroFailure("", "(ns ex (:refer-clojure :exclude inc))", "ns: :exclude takes a vector of symbols, not a symbol", "inc");
+}
 
 test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
     try expectOutputWithFiles(&.{utilns},
