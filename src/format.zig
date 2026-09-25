@@ -16,13 +16,13 @@
 //! delegate here.
 //!
 //! Authoritative contract: `docs/STRING.md` §9 (and the readable
-//! escape table). Non-readable value kinds (atom, function, var,
-//! native_fn, durable_ref, transient, error_, meta_symbol) format
-//! OPAQUELY in both modes — the readable mode output for those
-//! is intentionally NOT round-trippable through the reader, because
-//! they are identity-valued or process-local and have no canonical
-//! source form. The codec (`src/codec.zig`) is the serialization
-//! layer; format.zig is presentation.
+//! escape table). Identity-valued and process-local kinds (atom,
+//! function, native fn, transient, protocols, handles, durable refs)
+//! format OPAQUELY in both modes, as `#<...>`: they have no source
+//! form, and the readable output does not read back. A record prints
+//! as Clojure prints one, `#ns.Type{:k v, ...}`, which the reader does
+//! not read back either. The codec (`src/codec.zig`) is the
+//! serialization layer; format.zig is presentation.
 //!
 //! Frozen invariants:
 //!   §F1. `format(.display, nil)` writes `"nil"`. `str`/`join`/`spit`
@@ -32,11 +32,12 @@
 //!        Value containing malformed UTF-8 surfaces `error.Utf8Error`
 //!        in readable mode (display mode preserves raw bytes
 //!        unmodified, since storage is byte-blob per STRING.md §2).
-//!   §F3. Recursion has no depth cap. Persistent collections
-//!        can't self-cycle without an atom in the way, and atoms
-//!        format opaquely — so no infinite recursion is possible
-//!        with the heap-kind set; every Kind that can hold a
-//!        reference cycle formats opaquely.
+//!   §F3. Recursion is bounded by the native stack, not by a depth
+//!        cap. Persistent collections can't self-cycle without an
+//!        atom in the way, and atoms format opaquely, so recursion is
+//!        finite. A collection nested past the stack guard prints as
+//!        `#<too deep>` and counts an overflow, which the VM raises as
+//!        `:stack-overflow` (SEMANTICS §2.7).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -54,6 +55,8 @@ const db_mod = @import("db.zig");
 const record_mod = @import("record.zig");
 const protocol_mod = @import("protocol.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
+const dispatch = @import("dispatch.zig");
+const stack = @import("stack.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -76,8 +79,8 @@ pub const FormatMode = enum { display, readable };
 pub const Error = std.Io.Writer.Error || error{Utf8Error};
 
 /// Format any Value into `writer` according to `mode`. `interner`
-/// is required for keyword/symbol/native-fn names + var names; if
-/// the value tree contains none of those a null interner is safe.
+/// is required for keyword and symbol names and names record types;
+/// if the value tree contains none of those a null interner is safe.
 ///
 /// `writer` is `*std.Io.Writer` (Zig 0.16's canonical writer
 /// interface). Callers obtain one from `std.Io.Writer.fixed(&buf)`,
@@ -109,10 +112,19 @@ pub fn format(
         },
         .char => try formatChar(v.asChar(), mode, writer),
         .string => try formatString(v, mode, writer),
-        .list => try formatList(v, mode, writer, interner),
-        .persistent_vector => try formatVector(v, mode, writer, interner),
-        .persistent_map => try formatMap(v, mode, writer, interner),
-        .persistent_set => try formatSet(v, mode, writer, interner),
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record => {
+            stack.check() catch {
+                dispatch.noteOverflow();
+                return writer.writeAll("#<too deep>");
+            };
+            switch (v.kind()) {
+                .list => try formatList(v, mode, writer, interner),
+                .persistent_vector => try formatVector(v, mode, writer, interner),
+                .persistent_map => try formatMap(v, mode, writer, interner),
+                .persistent_set => try formatSet(v, mode, writer, interner),
+                else => try formatRecord(v, mode, writer, interner),
+            }
+        },
         .function => try writer.writeAll("#<fn>"),
         .var_ => {
             const var_obj = vm_mod.VM.asVar(v);
@@ -128,11 +140,6 @@ pub fn format(
         // round-trippable. The codec is the serialization layer;
         // these kinds throw `:unserializable` there.
         .atom => try writer.writeAll("#<atom>"),
-        // Records render as `#<record type-id={id}>` opaque in
-        // both modes (NOT reader-roundtrippable: the reader has no
-        // tagged-literal support, so there is no
-        // `#my.ns/Counter{:n 1}` shape).
-        .record => try writer.print("#<record type-id={d}>", .{record_mod.typeId(v)}),
         // Protocols + protocol_fn are opaque
         // identity-valued. Format prints `#<protocol id=N>` and
         // `#<protocol-fn proto=P method=M>` (interned-name
@@ -155,16 +162,11 @@ pub fn format(
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),
         .db_read_txn => try writer.writeAll("#<db-read-txn>"),
         .transient => try writer.writeAll("#<transient>"),
-        .error_ => try writer.writeAll("#<error>"),
-        .meta_symbol => try writer.writeAll("#<meta-symbol>"),
         .float => try formatFloat(v.asFloat(), writer),
         .bignum => try bignum_mod.formatDecimal(v, writer),
         // `#i64[1 2 3]` / `#f64[1.0 2.0]` in both modes; the reader
         // has no such dispatch, so the text does not read back.
         .typed_vector => try typed_vector_mod.format(v, writer, formatFloat),
-        .byte_vector => {
-            try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())});
-        },
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }
 }
@@ -330,6 +332,23 @@ fn formatMap(
         try format(entry.value, mode, writer, interner);
     }
     try writer.writeByte('}');
+}
+
+/// `#ns.Type{:k v, ...}`, as Clojure prints a record, when the
+/// interner names the type (`Interner.nameRecordType`); the opaque
+/// `#<record type-id=N>` otherwise.
+fn formatRecord(
+    v: Value,
+    mode: FormatMode,
+    writer: *std.Io.Writer,
+    interner: ?*const intern_mod.Interner,
+) Error!void {
+    const type_id = record_mod.typeId(v);
+    const name = if (interner) |it| it.recordTypeName(type_id) else null;
+    if (name) |n| {
+        try writer.print("#{s}", .{n});
+        try formatMap(record_mod.fieldsOf(v), mode, writer, interner);
+    } else try writer.print("#<record type-id={d}>", .{type_id});
 }
 
 fn formatSet(
@@ -528,4 +547,43 @@ test "formatToString: builds a fresh heap-string Value" {
     const v = try formatToString(testing.allocator, &heap, value_mod.fromFixnum(42).?, .display, null);
     try testing.expect(v.kind() == .string);
     try testing.expectEqualStrings("42", string_mod.asBytes(v));
+}
+
+test "records: #ns.Type{...} in both modes once the interner names the type; opaque otherwise" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var it = intern_mod.Interner.init(testing.allocator);
+    defer it.deinit();
+    var fields = try champ_mod.mapEmpty(&heap);
+    fields = try champ_mod.mapAssoc(&heap, fields, try it.internKeywordValue("x"), value_mod.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal);
+    fields = try champ_mod.mapAssoc(&heap, fields, try it.internKeywordValue("y"), try string_mod.fromBytes(&heap, "a"), &dispatch.hashValue, &dispatch.equal);
+    const r = try record_mod.make(&heap, 0, fields);
+
+    const opaque_form = try formatForTest(r, .readable, &it);
+    defer testing.allocator.free(opaque_form);
+    try testing.expectEqualStrings("#<record type-id=0>", opaque_form);
+
+    try it.nameRecordType(0, "user", "P");
+    const readable = try formatForTest(r, .readable, &it);
+    defer testing.allocator.free(readable);
+    try testing.expectEqualStrings("#user.P{:x 1, :y \"a\"}", readable);
+    const display = try formatForTest(r, .display, &it);
+    defer testing.allocator.free(display);
+    try testing.expectEqualStrings("#user.P{:x 1, :y a}", display);
+}
+
+test "a collection nested past the stack guard prints #<too deep> and counts an overflow" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var v = value_mod.nilValue();
+    for (0..20_000) |_| v = try vector_mod.fromSlice(&heap, &.{v});
+
+    defer stack.arm(stack.main_thread_budget);
+    stack.arm(64 * 1024);
+    const before = dispatch.overflowCount();
+    const got = try formatForTest(v, .readable, null);
+    defer testing.allocator.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "[#<too deep>]") != null);
+    try testing.expect(std.mem.startsWith(u8, got, "[[[") and std.mem.endsWith(u8, got, "]]]"));
+    try testing.expect(dispatch.overflowCount() > before);
 }

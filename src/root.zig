@@ -15,7 +15,6 @@ pub const bench = @import("bench.zig");
 pub const hash = @import("hash.zig");
 pub const value = @import("value.zig");
 pub const heap = @import("heap.zig");
-pub const eq = @import("eq.zig");
 pub const intern = @import("intern.zig");
 pub const string = @import("string.zig");
 pub const atom = @import("atom.zig");

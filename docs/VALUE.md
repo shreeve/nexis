@@ -29,13 +29,13 @@ register on NEON and SSE (PLAN §19.6 Tier 1 win T1.2).
 | Bits | Field | Purpose |
 |---|---|---|
 | `0..7` | `kind: u8` | Primary discriminator (§2 kind table) |
-| `8..15` | `flags: u8` | `has_meta`, `hash_cached`, `durable`, `interned`; reserved bits = 0 |
+| `8..15` | reserved | 0 (metadata and the cached hash live in the HeapHeader, §4) |
 | `16..31` | `subkind: u16` | Heap-kind sub-type when `kind` names a heap family |
-| `32..63` | `aux: u32` | Per-kind auxiliary: length prefix, cached hash low bits, intern-table version hint |
+| `32..63` | reserved | 0 |
 
-Accessors (`Value.kind()`, `.flags()`, `.subkind()`, `.aux()`) read these
-bit fields via bit shifts; the tag word is never modified directly outside
-the canonical constructors (§3).
+Accessors (`Value.kind()`, `.subkind()`) read these bit fields via bit
+shifts; the tag word is never modified directly outside the canonical
+constructors (§3).
 
 #### 1.2 Payload word interpretation
 
@@ -76,8 +76,8 @@ any re-mapping layer.
 | 3 | `char` | Unicode scalar | `payload[0..32] = u21` scalar, upper bits zero; surrogate range (D800..DFFF) rejected at construction | |
 | 4 | `fixnum` | i48 integer | `payload` = sign-extended to i64; only values in `[-(1<<47), (1<<47)-1]` are representable. Out-of-range uses `bignum` | |
 | 5 | `float` | f64 | `payload = @bitCast(u64, f)` — the bit pattern of a canonical-form f64 (SEMANTICS §3.2). Incoming NaN is canonicalized to `0x7FF8000000000000` at construction | |
-| 6 | `keyword` | interned keyword id | `payload[0..32] = u32` intern id. Hash-domain offset (`0x9E3779B9`) applied in `hash()` only | |
-| 7 | `symbol` | interned symbol id | `payload[0..32] = u32` intern id. Metadata-bearing symbols live on the heap (see §2.2) | |
+| 6 | `keyword` | interned keyword id | `payload[0..32] = u32` intern id. Kept apart from symbols in hash by its kind byte (SEMANTICS §3.2) | |
+| 7 | `symbol` | interned symbol id | `payload[0..32] = u32` intern id | |
 
 **Canonical-NaN discipline.** `float` values round-trip through
 canonicalization on every entry path (constructor, codec decode,
@@ -115,14 +115,14 @@ Payload = `u64` pointer to a heap object with a standard `HeapHeader`
 | 19 | `persistent_set` | CHAMP set | Parallel subkind numbering to map: 0 = array-set; 1 = CHAMP root; 2 = CHAMP interior; 3 = collision. Pinned in `docs/CHAMP.md` §3. |
 | 20 | `persistent_vector` | 32-way persistent vector | 0 = reserved (future small-vector inline optimization); 1 = root (user-facing); 2 = interior trie node (internal); 3 = leaf trie node (internal, always 32 Values); 4 = tail node (internal, 0..32 Values). Taxonomy pinned in `docs/VECTOR.md` §2. |
 | 21 | `list` | cons list | 0 = normal cons; 1 = empty singleton |
-| 22 | `byte_vector` | packed u8 slice | |
+| 22 | `byte_vector` | reserved: never constructed | |
 | 23 | `typed_vector` | homogeneous numeric slice: 16-byte `{len, elem}` prefix plus unboxed 8-byte elements (`docs/TYPED_VECTOR.md`) | 1 = i64 and 3 = f64 (the element type, also stored in the body); 0 = i32 and 2 = f32 are reserved with no implementation |
 | 24 | `function` | closure (routine + upvalues) | Body `Closure { routine, upvalues }` with the cell pointers in the block's tail (`docs/VM.md` §6); identity-valued |
 | 25 | `var_` | namespace var cell | Payload is a raw `*Var` in the VM's runtime arena, not a `HeapHeader` block: Vars are immortal and the collector roots their contents through the namespaces (`docs/GC.md` §3); identity-valued |
 | 26 | `durable_ref` | emdb identity triple | |
 | 27 | `transient` | mutable wrapper | 0 = transient map, 1 = transient set, 2 = transient vector (local enum, pinned in `docs/TRANSIENT.md` §2; the subkind classifies within the kind and does not mirror the inner collection's kind byte) |
-| 28 | `error_` | exception value | |
-| 29 | `meta_symbol` | metadata-bearing symbol wrapper | wraps base-symbol id + meta map (PLAN §8.4) |
+| 28 | `error_` | reserved: never constructed | |
+| 29 | `meta_symbol` | reserved: never constructed | |
 | 30 | `native_fn` | host-Zig function exposed as a first-class Value | Payload is `*const NativeFn` (static descriptor). |
 | 31 | `db_connection` | emdb connection handle | Payload is `*db.Connection` owned by the VM. |
 | 32 | `db_write_txn` | write transaction handle | Single-owner; invalidated on commit/abort. |
@@ -139,19 +139,19 @@ Values 8–15 are **reserved** for immediate kinds (e.g. a second
 fixnum flavor, or a tagged inline byte burst). Values 41–63 are
 **reserved** for heap kinds. Values 64+ are **reserved** for
 runtime-private use (internal sentinels that must never escape a public
-API).
+API). A kind number is never reused or renumbered: kind bytes are the
+codec's wire tags (`docs/CODEC.md` §9), so a retired kind leaves a
+reserved gap.
 
 #### 2.3 Sentinel values (runtime-private)
 
 | Sentinel | Purpose |
 |---|---|
 | `unbound` (kind = 64) | `Var.root` when the var has no root (PLAN §13.3). Calling an unbound var throws `:unbound-var`. Never serializable. |
-| `undef` (kind = 65) | Compile-time placeholder in IR construction. Never reaches the VM. |
 | `cell_internal` (kind = 66) | A slot whose binding has been boxed into an upvalue cell: the payload is the `*HeapHeader` of a cell block of this kind (`docs/VM.md` §6). Never observable by user code; the collector traces the block through the VM. |
 
-Sentinels satisfy `identical?` but never `=` — attempting `(= unbound x)`
-at the language level throws `:sentinel-escape`, since a user-observable
-sentinel is a bug somewhere upstream.
+Sentinels never reach user code. `=` on one compares bits; hashing one
+panics, since a sentinel in a hashed position is a bug upstream.
 
 ---
 
@@ -162,13 +162,13 @@ invariants in §2 before the `Value` escapes. Raw field writes are package-
 private.
 
 ```zig
-pub fn nil() Value;
+pub fn nilValue() Value;
 pub fn fromBool(b: bool) Value;
 pub fn fromChar(scalar: u21) ?Value;          // null on surrogate
 pub fn fromFixnum(n: i64) ?Value;             // null on out-of-range
 pub fn fromFloat(f: f64) Value;               // canonicalizes NaN
-pub fn fromKeyword(intern_id: u32) Value;
-pub fn fromSymbol(intern_id: u32) Value;
+pub fn fromKeywordId(intern_id: u32) Value;
+pub fn fromSymbolId(intern_id: u32) Value;
 ```
 
 Heap-pointer constructors are internal to the heap module and wrap a
@@ -181,8 +181,7 @@ invalid input would hide the range check from the type system.
 
 **`fromFloat` is infallible** because every f64 bit pattern maps to a
 valid `Value`, via NaN canonicalization when needed. Callers that care
-about distinguishing "was this a NaN?" call `isNaN()` on the resulting
-`Value`.
+whether it was a NaN test `std.math.isNan(v.asFloat())`.
 
 ---
 
@@ -245,11 +244,13 @@ across randomized pairs drawn from every kind. Implementation obligations:
 - `identical?` is bit-equality on the 16-byte struct for immediates; for
   heap kinds, pointer identity on the `HeapHeader*` (the same header
   pointer in two different `Value` wrappers still satisfies identity).
-- `=` follows SEMANTICS.md §2 exactly. Cross-category false. Canonical
-  NaN reflexive. Cross-type numeric false (no `1 == 1.0`).
-- `hash` follows SEMANTICS.md §3.2 per-kind table. Hash-domain offset
-  for keyword/symbol separation enforced in `Value.hash()`, not in the
-  raw intern-id hash.
+- `=` follows SEMANTICS.md §2 exactly: `Value.equalImmediate` for the
+  immediates, `dispatch.equal` for any Value. Cross-kind false except
+  list against vector. Canonical NaN reflexive. Cross-type numeric
+  false (no `1 == 1.0`).
+- `hash` follows SEMANTICS.md §3.2 per-kind table: `Value.hashImmediate`
+  and `dispatch.hashValue` mix the kind's domain byte into every hash,
+  which is what keeps keywords and symbols apart.
 
 ---
 

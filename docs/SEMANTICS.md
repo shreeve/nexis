@@ -2,7 +2,7 @@
 
 Freezes the numeric corner cases, truthiness, equality, hashing,
 nil-propagation, interning, and print/read contract that `value.zig`,
-`eq.zig`, `hash.zig` and `dispatch.zig` implement. Derivative from `PLAN.md` §6 and §8.
+`hash.zig` and `dispatch.zig` implement. Derivative from `PLAN.md` §6 and §8.
 PLAN.md wins on any apparent conflict.
 
 Risk-register entry #13 (PLAN §25) is this document: "Numeric corner cases
@@ -161,54 +161,62 @@ Cross-type operators (PLAN §8.3):
 - `(= 'foo 'foo)` → `true` for plain interned symbols.
 - `(= 'foo :foo)` → `false`. Keyword and symbol live in **different hash
   domains** (PLAN §8.4) so they never collide in maps.
-- Metadata on symbols is **ignored** for equality. `(= (with-meta 'foo {:a
-  1}) 'foo)` → `true`. (PLAN §23 decision 12: metadata never affects
-  equality or hash.)
+- Symbols carry no metadata (§7): `(with-meta 'foo {:a 1})` throws
+  `:no-metadata-on-immediate`.
 
-#### 2.6 Collections — three-category rule (PLAN §6.6, §23 decision 36)
+#### 2.6 Collections, and the three rules of `=` (PLAN §6.6, §23 decision 36)
 
-Equality partitions into three categories. Within a category, equality is
-structural element-wise. Across categories, equality is always `false`.
+`src/dispatch.zig` decides every pair of values by one of three rules:
 
-| Category | Members |
-|---|---|
-| **sequential** | `list`, `vector`, lazy `seq`, cons cells |
-| **map** | persistent-map, array-map |
-| **set** | persistent-set |
+| Rule | Kinds | `=` | `hash` |
+|---|---|---|---|
+| **sequential** | `list`, `vector` | element-wise, across the two kinds | ordered combine, one shared domain byte `0xF0` |
+| **identity** | function, native fn, var, the db handles, transient, atom, protocol, protocol fn, Nextomic connection | the same value only | the pointer (the collector never moves a block) |
+| **kind-local** | every other kind | within the kind only, by the kind's structural rule | the kind's own hash, domain byte = the kind byte |
 
-Worked examples (copy-pasted from PLAN §6.6):
+Worked examples:
 
-- `(= (list 1 2 3) [1 2 3])` → `true`.
-- `(= [1 2 3] #{1 2 3})` → `false` (cross-category).
-- `(= {:a 1} [:a 1])` → `false` (cross-category).
+- `(= (list 1 2 3) [1 2 3])` → `true`, and the hashes agree.
+- `(= [1 2 3] #{1 2 3})` → `false`.
+- `(= {:a 1} [:a 1])` → `false`.
 - `(= () nil)` → `false` (nil is not a sequential; empty-list is).
 - `(= (list) [])` → `true` (both empty sequentials).
 - `(= (map inc [1 2 3]) [2 3 4])` → `true` (map returns sequential).
 
+Maps compare entry-wise across their two layouts (array-map and CHAMP
+are subkinds of one kind); sets likewise. A record is equal to a record
+of the same type with equal fields (`docs/PROTOCOLS.md` §2.1), never to
+its field map.
+
 Typed vectors (`i64-vector`, `f64-vector`) are **not** in the
-sequential category. They are their own kind with identity-free
-equality (element-wise, same element type required): `(= (i64-vector
-[1 2]) [1 2])` → `false`, `(= (i64-vector [1 2]) (f64-vector [1.0
-2.0]))` → `false`. This preserves SIMD-friendly layouts without forcing
-a structural-comparison path through generic sequence code
-(`docs/TYPED_VECTOR.md` §3). A byte-vector would be the same; the kind
-has no implementation.
+sequential category. They are their own kind with element-wise
+equality, same element type required: `(= (i64-vector [1 2]) [1 2])` →
+`false`, `(= (i64-vector [1 2]) (f64-vector [1.0 2.0]))` → `false`
+(`docs/TYPED_VECTOR.md` §3).
 
 Durable refs (`durable-ref`) compare by identity triple
 `{store-id, tree-id, key-bytes}`, never by dereferenced value (PLAN §8.6,
-§15.2).
+§15.2). A Nextomic db-value compares by connection, basis and mode; an
+entity by its db-value and eid.
 
-Vars compare by identity (PLAN §13.3).
+Identity kinds: two atoms holding `(= a b)` values are still
+`(not (= atom-a atom-b))`, and an atom's hash does not change when its
+value does. This matches Clojure and is load-bearing: a mutable value
+that took part in structural equality would let a map key become
+unequal to itself on mutation. A transient hashes by identity as in
+Clojure, so it may be a map key; it compares equal to no persistent
+collection.
 
-Functions, closures, transients: equality is identity-based; serialization
-is disallowed (PLAN §15.10).
+#### 2.7 Values nested deeper than the native stack
 
-Atoms (`docs/ATOM.md`) compare by identity (pointer-to-AtomBox);
-the contained value is NEVER consulted during equality or hash. Two
-atoms holding `(= a b)` values are still `(not (= atom-a atom-b))`. This
-matches Clojure and is load-bearing: mutable identity values participating
-in structural equality would let a map key become unequal to itself on
-mutation. Serialization is disallowed; see `docs/ATOM.md` §3 + §6.
+`=`, `hash` and printing recurse on nesting depth on the native stack.
+Past the stack guard (`src/stack.zig`) they do not fault: the step that
+ran out answers `false`, `0` or a `#<too deep>` marker and counts an overflow (`dispatch.overflowCount`), and the VM turns a
+count that changed across a native call or opcode into the catchable
+`:stack-overflow` (`docs/VM.md` §13.1). A map, set or record whose hash
+was computed past an overflow keeps no cached hash, so the wrong answer
+never outlives the throw. The codec bounds nesting at a fixed 4096
+levels instead (`docs/CODEC.md` §2.7).
 
 ---
 
@@ -223,102 +231,54 @@ values.
 
 #### 3.1 Scope and stability
 
-- Hash is stable **within a process**. Across processes, stability is
-  guaranteed only for values that round-trip through the codec (PLAN §6.3,
-  §15.10).
-- Hash is a `u32` stored cached on every heap object (HeapHeader `hash`, PLAN
-  §8.2). A sentinel value `0` means "uncomputed".
+- Hash is stable **within a process** only. No hash is persisted: the
+  codec writes values, never hashes, and a decoded collection is
+  rebuilt with the reading process's hashes. The seed and the domain
+  bytes may change freely.
+- Hashes are `u64`. String, bignum, map, set and record hashes are
+  truncated to `u32` and cached in the HeapHeader `hash` slot, `0`
+  meaning "uncomputed".
 - Metadata never contributes to hash (PLAN §23 decision 12).
 
 #### 3.2 Per-kind hash functions
 
-Choices here are frozen so that §2 equality and §3 hash cannot drift:
+Every hash is xxHash3-64 (seed: the bytes `"nexis1/1"`) of the kind's
+discriminating bytes, then **domain-mixed**:
+`hash = base + domain_byte * 0x9E3779B97F4A7C15`, where the domain byte
+is the kind byte, or `0xF0` for list and vector (§2.6). The mixing keeps
+kinds whose raw payload hashes coincide (`fixnum(65)`, `char(65)`,
+`symbol(65)`, `keyword(65)`) apart, and subsumes Clojure's
+keyword-only `^ 0x9E3779B9` offset.
 
-- **`nil`** → `0xB01DFACE` (fixed constant, picked to not collide with small
-  fixnums). A singleton with cached hash.
-- **`false`** → `0x00000000`; **`true`** → `0x00000001`. Singleton.
-- **`char`** → xxHash3-32 over the scalar's 4-byte little-endian encoding,
-  domain-tagged.
-- **`fixnum`** → xxHash3-32 over the i48 sign-extended to 8 bytes, little-
-  endian.
-- **`bignum`** → xxHash3-32 over the canonical magnitude byte stream plus
-  sign byte. Fixnum-range bignums are impossible by construction (they
-  canonicalize); therefore `hash(fixnum(n)) ≠ hash(bignum(n))` can never
-  arise for an equal pair.
-- **`float`** — canonical bit pattern in (§2.2):
-  - `+0.0` and `-0.0` both hash from `0x0000000000000000` (the `+0.0` bit
-    pattern) so `(= 0.0 -0.0)` preserves hash equality.
-  - Canonical NaN hashes from the fixed bit pattern
-    `0x7FF8000000000000`.
-  - Otherwise, hash is xxHash3-32 over the IEEE 754 bits.
-- **`string`** — xxHash3-32 over the raw UTF-8 bytes.
-- **`keyword`** — xxHash3-64 over the intern id (textual form on codec
-  serialize; see §6.1). Separated from symbol hashes by the generic
-  `mixKindDomain` mechanism below (each `Kind` byte lands in a distinct
-  high-entropy region of `u64` space). This subsumes Clojure's
-  keyword-specific `^ 0x9E3779B9` offset into a single cross-kind
-  separation story.
-- **`symbol`** — xxHash3-64 over the intern id (textual form on codec
-  serialize). Kind-domain-mixed (see below).
-- **Equality-category domain mixing.** Every full hash output has a
-  **per-equality-category** offset `domain_byte * 0x9E3779B97F4A7C15`
-  folded in before return. The `domain_byte` is chosen so the bedrock
-  invariant `(= x y) ⇒ (hash x) = (hash y)` holds across kinds whose
-  equality rule spans multiple physical kinds (§2.6 cross-category
-  rule). Specifically:
-    - **Kind-local equality** — every kind whose equality rule is
-      confined to its own kind (nil, bool, char, fixnum, float, bignum,
-      string, keyword, symbol, byte-vector, typed-vector, durable-ref,
-      function, var, transient, error, meta-symbol, persistent-set):
-      `domain_byte = @intFromEnum(Kind)`.
-    - **Sequential category** (list, persistent-vector, and any future
-      lazy-seq / cons / sequential kind): all members share
-      `domain_byte = 0xF0`. Without this shared byte, `(list 1 2 3)`
-      and `[1 2 3]` \u2014 required to be `=` \u2014 would hash to different
-      values after domain mixing, breaking the bedrock invariant.
-    - **Associative category** (persistent-map, including the
-      array-map subkind): members share `domain_byte = 0xF1`. v1's
-      array-map is a subkind of kind `persistent_map`, so the bytes
-      coincide today; the category byte is reserved for future
-      cross-kind associative equality.
-  
-  Scalar kinds that coincidentally share a raw payload hash
-  (`fixnum(65)` / `symbol(65)` / `char(65)` / `keyword(65)`) still
-  separate through the kind-local domain mixer exactly as before.
-  Clojure doesn't need this machinery because the JVM gives each
-  heap type its own `hashCode()` dispatch; in our single-flat-hash
-  world the domain mixer replaces that discipline, with the cross-
-  kind-equality categories carved out.
+- **`nil`** → base `0xB01DFACEB01DFACE`; **`false`** → `0`; **`true`**
+  → `0x1111111111111111`.
+- **`char`** → the scalar as 4 little-endian bytes.
+- **`fixnum`** → the i64 as 8 little-endian bytes.
+- **`bignum`** → the sign byte and the limbs. Fixnum-range bignums are
+  impossible by construction (they canonicalize), so an equal fixnum
+  and bignum never arise.
+- **`float`** → the IEEE bits, with `-0.0` hashed as `+0.0` (so
+  `(= 0.0 -0.0)` keeps hash equality) and NaN canonical
+  (`0x7FF8000000000000`).
+- **`string`** → the raw bytes.
+- **`keyword`**, **`symbol`** → the intern id as 8 bytes; the two kinds
+  differ by domain byte.
 - **Sequential collections** — ordered combine:
-  `h = 1; for each x: h = 31 * h + hasheq(x); finalize h with count`.
-- **Map collections** — unordered combine over ordered (k, v) pairs:
-  - Per-entry: `entry_h = 31 * (31 * 1 + hasheq(k)) + hasheq(v)` (i.e.
-    `combineOrdered(combineOrdered(ordered_init, hasheq(k)), hasheq(v))`
-    — two ordered combines, **no sequential finalize, no sequential
-    domain byte**; the aggregate gets its own associative domain byte
-    below).
-  - Aggregate: `h = 0; for each entry: h += entry_h; finalize h with count`.
-  - Rationale: ordered combine within each entry keeps hash sensitive
-    to swapped key/value positions (stronger than Clojure's
-    order-insensitive XOR); unordered combine across entries preserves
-    the map's entry-order-insensitive equality. Entry hashes do not
-    route through the full sequential hash pipeline — that pipeline
-    would fold in the `0xF0` sequential domain byte, which is
-    irrelevant for a map-internal pair and would waste a `mixKindDomain`
-    call per entry. (`h += hasheq(list(k, v))` as pseudocode would
-    double-domain-mix and finalize-with-count-2 per entry; the
-    per-entry mix above is the contract.)
-- **Set collections** — unordered combine:
-  `h = 0; for each x: h += hasheq(x); finalize h with count`.
-- **`durable-ref`** — xxHash3-32 over `store-id ++ tree-id-bytes ++
-  key-bytes`. Dereferenced value is not consulted.
-- **`var`** — hash over namespace/symbol pair.
-- **`transient`** — throws `:no-hash-on-transient` (transients are mutable
-  by definition).
-- **`function`**, **`error`** — hash by heap address (identity).
-
-Finalization: all 32-bit hashes run through `xxHash3.finalize` to scramble
-low bits before storage.
+  `h = 1; for each x: h = 31 * h + hash(x); finalize h with count`.
+- **Maps** — unordered combine over per-entry ordered pairs:
+  - Per-entry: `entry_h = 31 * (31 * 1 + hash(k)) + hash(v)`, two
+    ordered combines with no finalize and no domain byte.
+  - Aggregate: `h = 0; for each entry: h += entry_h; finalize h with
+    count`. The ordered combine within an entry keeps the hash
+    sensitive to a swapped key and value; the unordered combine across
+    entries keeps it insensitive to entry order.
+- **Sets** — unordered combine:
+  `h = 0; for each x: h += hash(x); finalize h with count`.
+- **`record`** → the type id and the field map's hash.
+- **`typed-vector`** → the element type and the elements.
+- **`durable-ref`** → `store-id ++ tree-id-bytes ++ key-bytes`; the
+  dereferenced value is not consulted.
+- **Identity kinds** (§2.6) → the pointer.
 
 ---
 
@@ -362,21 +322,12 @@ Records are maps to every collection function: `count`, `empty?`,
 
 ### 5. Interning (PLAN §8.4)
 
-- Keywords are globally interned; the interned id is what the Value payload
-  carries. Keywords carry no metadata (hard constraint).
-- Symbols are globally interned in the common case. A **metadata-bearing
-  symbol** is a heap object that wraps a base symbol id plus a metadata map.
-  Two metadata-bearing symbols with the same name but different metadata
-  compare `=` but are not `identical?`.
+- Keywords and symbols are interned; the interned id is what the Value
+  payload carries. Neither carries metadata (§7).
 - Intern ids are process-local. Serialization always emits textual form
   (PLAN §15.10) and the receiver re-interns.
-- The intern table API is designed to allow future multi-isolate sharing
-  (a multi-isolate runtime). v1 assumes single-isolate.
-
-**Hash domain separation.** Keyword and symbol hashes differ by
-`0x9E3779B9`. This prevents `(:foo)` and `(foo)` from collocating in the
-same HAMT slot when both appear as keys in one map — essential for
-keyword-keyed maps to stay collision-free under realistic workloads.
+- Keyword and symbol hashes live in different domains (§3.2), so `:foo`
+  and `'foo` never collocate in one HAMT slot.
 
 ---
 
@@ -395,16 +346,17 @@ For every value kind, a **pr-style** textual representation exists such that:
 - `list`, `vector`, `map`, `set` — yes, recursively.
 - `typed-vector` — no. It prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
-- `byte-vector` — no. The kind is reserved with no implementation;
-  `src/format.zig` prints it as `#<value kind=22>`.
+- `record` — no. It prints as `#ns.Type{:field value, ...}` in both
+  modes, as Clojure does; the reader has no tagged literals.
 - `durable-ref` — no. It prints as the opaque token
   `#<durable-ref :<tree> hex:<key-bytes>>`, which does not read back.
 
 #### 6.2 Which kinds do **not** round-trip
 
-- `function`/`closure`, `var`, `transient`, `namespace`, `tx handle`,
-  `error`. These print with an `#object[...]` style marker for debugging but
-  do not parse back. Matches PLAN §15.10 "not serializable".
+- `function`/`closure`, `var`, `transient`, `atom`, protocols, the db
+  and Nextomic handles. These print as `#<...>` markers (a var as
+  `#'ns/name`) for debugging but do not parse back. Matches PLAN §15.10
+  "not serializable".
 
 #### 6.3 Numeric print rules
 
@@ -466,11 +418,8 @@ alike. The metadata argument is a map or nil; anything else is
 These are explicitly **not** frozen yet; they are PLAN §24 open questions
 and must not be silently decided in implementation:
 
-- Protocols (PLAN §24.1): out of v1, no surface syntax.
 - Laziness of `map`/`filter`/`reduce` (PLAN §24.2): v1 is eager, returning
   vectors.
-- Record types: `defrecord` records exist (`docs/PROTOCOLS.md`); their
-  print form is opaque and not reader-roundtrippable.
 - Schema/spec (PLAN §24.5): none.
 
 If you need one of these, stop and amend PLAN.md first.

@@ -46,16 +46,18 @@ lands.
    (NFC/NFD) — strings are deliberately byte blobs.
 3. **Hash** (SEMANTICS §3.2). `hashHeader(h)` returns
    `xxHash3(seed, bytes)` truncated to `u32`, where `seed` is the
-   project-wide constant in `src/hash.zig`. The final `Value.hashValue`
-   for a string extends to `u64`, mixes the `Kind` byte via
-   `mixKindDomain`, and returns the result.
+   project-wide constant in `src/hash.zig`. `dispatch.hashValue`
+   extends it to `u64` and mixes in the `Kind` byte via
+   `mixKindDomain`.
 4. **UTF-8 validation is NOT performed at the storage boundary.**
-   `fromBytes` trusts its caller — the reader already produces
-   well-formed UTF-8. Untrusted-bytes decoders (the codec) are
-   expected to validate before calling. A malformed-bytes `Value`
+   `fromBytes` stores bytes as given; the reader produces well-formed
+   UTF-8, and the codec round-trips a string byte-exact without
+   validating it (`docs/CODEC.md` §2.2). A malformed-bytes `Value`
    remains byte-identical to itself, byte-equal only to another string
    with the same bytes, and hashes deterministically — equality and
-   hash discipline hold even for ill-formed bytes.
+   hash discipline hold even for ill-formed bytes. The operations that
+   read characters (`count`, `nth`, `subs`, readable printing) raise
+   `:utf8-error` on one.
 5. **Not interned.** PLAN §8.4: strings are not content-deduplicated.
    Two `fromBytes(heap, "foo")` calls produce two distinct
    `*HeapHeader`s with different addresses; `(identical? a b)` is
@@ -94,12 +96,12 @@ pub fn byteLen(v: value.Value) usize;
 /// Per-kind hash entry point. Reads the cached hash from `h.hash`; if
 /// zero (uncomputed), computes `xxHash3(seed, bodyBytes(h))`,
 /// truncates to u32, writes to the cache only when the result is
-/// nonzero, and returns it. Called by `dispatch.heapHashValue`.
+/// nonzero, and returns it. Called by `dispatch.heapHashBase`.
 pub fn hashHeader(h: *HeapHeader) u32;
 
 /// Per-kind equality entry point. Byte-for-byte comparison over the
-/// two string headers' bodies. Called by `dispatch.heapEqual` after
-/// the dispatcher has verified both sides are `.string`.
+/// two string headers' bodies. Called by `dispatch.equal` after the
+/// dispatcher has verified both sides are `.string`.
 pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool;
 ```
 
@@ -112,44 +114,19 @@ rather than silently mishandling.
 
 ### 4. Cross-kind dispatch (`src/dispatch.zig`)
 
-Landing alongside this module. The contract every subsequent heap
-kind follows:
-
-```zig
-// src/dispatch.zig — single central integration point.
-
-pub fn heapHashValue(v: value.Value) u64;
-pub fn heapEqual(a: value.Value, b: value.Value) bool;
-```
-
-- `heapHashValue(v)` is called by `value.hashValue(v)` when the Kind
-  dispatcher sees a heap kind. It resolves the `*HeapHeader`,
-  switches on kind to the right per-kind `hashHeader`, extends the
-  `u32` result to `u64`, and applies `mixKindDomain`.
-- `heapEqual(a, b)` is called by `eq.equal(a, b)` from the same-kind
-  heap branch. It asserts both sides share the kind, resolves both
-  `*HeapHeader`s, and dispatches to the per-kind `bytesEqual` /
-  `structuralEqual` / etc.
-
-Rationale: keeping `value.zig` and `eq.zig` low-level — they describe
-semantics for immediates and cross-kind rules — while cross-kind
-integration lives in one module where "have we accounted for every
-heap kind?" is a single-file audit.
-
-`dispatch.zig` depends on every heap-kind module; no heap-kind module
-depends on `dispatch.zig`. A new kind adds exactly one `switch`
-arm to each dispatch function.
+`dispatch.hashValue` and `dispatch.equal` are the full-Value entry
+points (SEMANTICS §2.6). A string is a kind-local kind: equal only to
+another string, through `bytesEqual`; hashed through `hashHeader` with
+the string kind byte mixed in. `dispatch.zig` depends on every heap-kind
+module; no heap-kind module depends on it.
 
 ---
 
 ### 5. Interaction with other layers
 
-- **Value layer.** `value.hashValue(v)` for `.string` delegates to
-  `dispatch.heapHashValue(v)`. The Kind byte is still the canonical
-  discriminator; `mixKindDomain` is still applied exactly once.
-- **eq layer.** `eq.equal(a, b)` for same-kind heap strings delegates
-  to `dispatch.heapEqual(a, b)`. Cross-kind comparisons still resolve
-  to `false` without touching string-specific code.
+- **Dispatch.** `dispatch.hashValue` / `dispatch.equal` reach this
+  module for `.string`; cross-kind comparisons resolve to `false`
+  without touching string-specific code.
 - **Heap layer.** `heap.alloc(.string, len)` is the only path to a
   string heap-header. `HeapHeader.hash` caches the computed hash
   (nonzero only). `HeapHeader.flags` bits are unused for strings:
@@ -211,7 +188,7 @@ out of scope and documented).
 (subs s start)        ; [start, codepoint-count) byte-slice → fresh string
 (subs s start end)    ; [start, end)
 
-(count s)         ; extends to strings: number of codepoints (O(n) walk).
+(count s)         ; extends to strings: number of codepoints (O(n) scan).
 (nth s i)         ; codepoint at index → Kind.char
 (nth s i default) ; default on out-of-bounds (matches existing nth)
 (empty? s)        ; (= 0 (count s))
@@ -223,15 +200,18 @@ out of scope and documented).
 - `:index-out-of-bounds` — negative start, end > count, start > end,
   index outside `[0, count)`.
 
-**Algorithm**: `string.codepointCount(v)` walks the byte body once
-using `std.unicode.utf8ByteSequenceLength`-style decoding;
-`string.byteRangeForCodepoints(v, start, end)` converts a
-codepoint range to a byte range in a second walk;
-`string.codepointAt(v, i)` returns a `Kind.char` Value via a
-front-to-position walk. None of these store side-cache state on
-the HeapHeader — the codepoint count is not cached (a cache slot
-or a codepoint-counted subkind is the lever if profiling shows hot
-use).
+**Algorithm**: `string.codepointCount(v)` counts with
+`std.unicode.utf8CountCodepoints`, which skips ASCII a word at a time
+and validates the rest. `string.codepointAt(v, i)` and
+`string.byteRangeForCodepoints(v, start, end)` first find the ASCII run
+at the start of the body, sixteen bytes at a time; an index inside it
+is its own byte offset, and only the bytes past it are decoded one
+scalar at a time. On an ASCII string `nth` and `subs` therefore cost a
+vector scan to the index, not a decode per character (40 000 `nth`
+calls over a 40 000-character string: 3.1 s → under 0.1 s,
+ReleaseFast). None of these store side-cache state on the HeapHeader —
+the codepoint count is not cached (a cache slot or a
+codepoint-counted subkind is the lever if profiling shows hot use).
 
 **Storage shape unchanged.** Byte layout (§2) is invariant: the body
 is still raw UTF-8 bytes; codepoint indexing is purely a presentation
@@ -414,6 +394,8 @@ pub fn formatToString(
 | char | UTF-8 encoded scalar | named tokens (`\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`), printable ASCII as `\x`, NUL + non-printable as `\u{HEX}` |
 | atom / function / native-fn / var / durable-ref / transient / connection / tx | OPAQUE (`#<atom>`, `#<fn>`, `#<native-fn NAME>`, `#'name`, `#<durable-ref :tree/key>`, ...) | OPAQUE (same; intentionally NOT reader-round-trippable — these are identity-valued/process-local kinds) |
 | collections | recursive in same mode | recursive in same mode |
+| record | `#ns.Type{:k v, ...}`, fields in display mode (`docs/PROTOCOLS.md` §2.1) | `#ns.Type{:k v, ...}`, fields readable; does not read back |
+| a collection nested past the native stack guard | `#<too deep>`, and the VM raises `:stack-overflow` (SEMANTICS §2.7) | same |
 | malformed UTF-8 in string | passes through bytes unchanged | `:utf8-error` (readable mode must not emit invalid source) |
 
 **`format` is purely presentation, not serialization.** The codec
