@@ -2,9 +2,9 @@
 
 Authoritative contract for `src/db.zig` and the `db/*` language surface
 built on it (the db natives in `src/stdlib.zig`, the `with-tx` family
-in `src/stdlib/core.nx`). Derivative from `PLAN.md` §15 (durable
-identities, connection model, transactions) and §20.2 gate test #6
-(emdb round-trip); values cross the store as `docs/CODEC.md` bytes;
+in `src/stdlib/core.nx`). Derivative from `PLAN.md` §23 #5, #6, #7
+and #22 (one isolate, explicit transactions, durable identities, as-of
+reads); values cross the store as `docs/CODEC.md` bytes;
 `durable_ref` is kind 26 (`docs/VALUE.md` §2.2). Nextomic, the datom
 database on the same engine, is `docs/NEXTOMIC.md`.
 
@@ -21,7 +21,7 @@ language surface (§12) adds auto-transaction ref operations,
 tree walks `db/scan` and `db/reduce-tree`.
 
 Multi-process concurrent writes are emdb's single-writer discipline;
-the nexis surface is single-isolate (PLAN §16.1).
+the nexis surface is single-isolate (PLAN §23 #5).
 
 ---
 
@@ -232,7 +232,7 @@ Values are CODEC.md bytes. A durable ref inside a stored value is
 
 ### 10. Tests
 
-`test/prop/db.zig` is PLAN §20.2 gate test #6: D1 writes 10 000 random
+`test/prop/db.zig` is the emdb round-trip property test: D1 writes 10 000 random
 values across 5 named trees and reads each back equal with an equal
 hash; D2 closes, reopens the file with a fresh heap and interner, and
 reads 2 000 values back; D3 checks that the identity triple alone
@@ -301,8 +301,8 @@ committed after. A held snapshot keeps emdb from reclaiming the pages
 it sees, so release what you pin. A transaction handle lives until VM
 teardown; one never finished keeps its connection from closing.
 
-**Absent.** Cursors as Values (PLAN §15.8; `db/scan` and
+**Absent.** Cursors as Values (`db/scan` and
 `db/reduce-tree` are the eager surface), a lazy `db/scan`,
 `db/cursor`, `with-read-tx-at`, `db/as-of`, `db/pin-snapshot`,
-`with-db`, `(deref r :using db)` and `db/snapshot-stats` (PLAN §15.7).
+`with-db`, `(deref r :using db)` and `db/snapshot-stats`.
 Point-in-time database values are Nextomic's (`docs/NEXTOMIC.md` §4).

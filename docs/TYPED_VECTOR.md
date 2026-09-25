@@ -2,7 +2,7 @@
 
 The contract for the `typed_vector` heap kind
 (`src/coll/typed_vector.zig`) and the natives over it
-(`src/stdlib.zig`) (PLAN §9.5). Kind number and subkinds:
+(`src/stdlib.zig`). Kind number and subkinds:
 `docs/VALUE.md` §2.2. Header bits: `docs/HEAP.md`. Equality category
 and hash domain: `docs/SEMANTICS.md` §3.3. Serializable and wire
 format: `docs/CODEC.md` §2, §3.
@@ -38,7 +38,7 @@ the constructors use, `hashHeader`, `equalHeaders`, `trace` and
   error.
 - Metadata: `with-meta` is `:no-metadata-on-immediate`, `meta` is nil
   (SEMANTICS §7).
-- Metal or other off-CPU dispatch (PLAN §19.5), the `simd` opcode group
+- Metal or other off-CPU dispatch, the `simd` opcode group
   (`UnimplementedOpcode`, VM.md §10), and a shared representation with
   Nextomic's `Relation` columns, which are arena-scoped and never VM
   values.

@@ -2,7 +2,7 @@
 
 The contract for the `persistent_vector` heap kind
 (`src/coll/vector.zig`): a plain 32-way radix trie plus a separate tail
-node, no RRB relaxation (PLAN §9.2, §23 #30). Kind number: `docs/VALUE.md`
+node, no RRB relaxation (PLAN §23 #30). Kind number: `docs/VALUE.md`
 §2.2. Header bits: `docs/HEAP.md`. Equality category and hash domain:
 `docs/SEMANTICS.md` §3.3. Serializable: `docs/CODEC.md` §3.
 

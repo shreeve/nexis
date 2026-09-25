@@ -41,7 +41,7 @@ A second subkind would have to keep every invariant below, with
    writes its bytes (STDLIB.md §2, §5).
 5. **Not interned.** Two `fromBytes` calls with the same bytes make
    two headers: `=` and of equal hash, not `identical?`. Explicit
-   interning of strings is absent (PLAN §8.4).
+   interning of strings is absent.
 6. **No metadata.** A string carries none; `with-meta` on one throws
    `:no-metadata-on-immediate` (SEMANTICS.md §7).
 7. **Cached hash, nonzero only.** The hash is cached in the header

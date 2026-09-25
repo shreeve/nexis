@@ -3,7 +3,7 @@
 The contract for the `persistent_map` and `persistent_set` heap kinds
 (`src/coll/champ.zig`): a CHAMP trie (Steindorfer and Vinju, OOPSLA
 2015: separate data and node bitmaps, a canonical layout) behind a flat
-array form for up to 8 keys (PLAN §9.1, §23 #37). Kind numbers:
+array form for up to 8 keys (PLAN §23 #37). Kind numbers:
 `docs/VALUE.md` §2.2. Header bits: `docs/HEAP.md`. Equality category
 and hash domain: `docs/SEMANTICS.md` §3.3. GC trace: `docs/GC.md` §5.
 Serializable: `docs/CODEC.md` §3.

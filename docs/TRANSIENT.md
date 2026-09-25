@@ -3,7 +3,7 @@
 The contract for the `.transient` heap kind (`src/coll/transient.zig`)
 and its language surface (`transient`, `persistent!` and the `!`
 operations in `src/stdlib.zig`). Kind number: `docs/VALUE.md` §2.2.
-Governing decision: PLAN §9.4. Ownership compared with Clojure's:
+Ownership compared with Clojure's:
 `CLOJURE-REVIEW.md` §1.2, §3.5.
 
 ---
@@ -180,6 +180,6 @@ hash-equal results, for maps, sets and vectors, T1d with random
 every operation; the wrong family gives `TransientKindMismatch`);
 T3a-T3b the source collection is unchanged; T4, T4b the inner root
 survives collection through an active or a frozen wrapper. These are
-the transient properties of PLAN §20.2. Inline tests in
+the transient properties. Inline tests in
 `transient.zig` cover the wrapper; `test/integration/eval_pipeline.zig`
 ("transients") covers the language surface.

@@ -3,7 +3,7 @@
 The contract for the `bignum` heap kind (`src/bignum.zig`): the
 canonical form that keeps the integer tower's equality and hash
 consistent without a cross-kind rule, the layout, and the arithmetic
-the VM's numeric tower builds on (PLAN §8.3; SEMANTICS §2.2). Kind
+the VM's numeric tower builds on (PLAN §23 #10; SEMANTICS §2.2). Kind
 number: `docs/VALUE.md` §2.2. Header bits: `docs/HEAP.md`. Equality
 category and hash domain: `docs/SEMANTICS.md` §3.3. Serializable:
 `docs/CODEC.md` §3.
@@ -14,7 +14,7 @@ and from `f64` and `i64`, and decimal parsing and printing.
 
 **Absent.** GCD, bitwise operations beyond 64 bits (the `bit-*`
 natives work on 64-bit two's complement), modular exponentiation,
-rationals, multi-precision floats and decimals (PLAN §8.3); interned
+rationals, multi-precision floats and decimals (PLAN §23 #10); interned
 small bignums (§1 forbids them); metadata (`with-meta` is
 `:no-metadata-on-immediate`, SEMANTICS §7). Integer literals are the
 reader's and compiler's (`docs/FORMS.md` §3); this module parses the

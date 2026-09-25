@@ -41,7 +41,7 @@ Two empty lists are `=`; `identical?` tells them apart by address.
 `()` is not `=` to nil, and is `=` to `[]` (both sequential).
 
 **Count.** Not cached: O(1) for a view, O(n) over cons cells. Lists are
-reader and macro material (PLAN §9.3); large sequences are vectors.
+reader and macro material; large sequences are vectors.
 
 ---
 
@@ -111,6 +111,6 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
   `coll:list` opcode, which builds them with `cons` (`docs/VM.md`
   §10.8).
 - **Printer.** `src/format.zig` prints every subkind as `(...)`.
-- **Absent.** Lazy sequences (PLAN §6.7): `seq` of a vector is the view
+- **Absent.** Lazy sequences (PLAN §23 #14): `seq` of a vector is the view
   of §1, of every other collection a fresh list. Destructive list
   operations. Transients of lists.
