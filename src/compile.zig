@@ -136,35 +136,17 @@ pub const Tiny = union(enum) {
     /// VM run). Heap-backed Values from arbitrary sources do NOT
     /// — only use `Tiny.literal` for Values with stable identity.
     literal: value_mod.Value,
-    /// Runtime list construction from N evaluated subexpressions.
-    /// The IR representation of the internal `#%list` special
-    /// form emitted by the syntax-quote walker AND by `lowerQuotePayload`
-    /// when the quoted payload is a compound list. Each item
-    /// is recursively compiled into a contiguous slot block;
-    /// the backend emits a single `coll:list` opcode.
-    list_construct: []const *const Tiny,
-    /// Runtime list concatenation. The IR
-    /// representation of `#%concat`. Each arg must evaluate
-    /// to a list at runtime (KindMismatch trap otherwise);
-    /// result is the left-to-right concatenation.
-    concat: []const *const Tiny,
-    /// Runtime vector construction. IR for the
-    /// `#%vector` special form emitted by syntax-quote and by
-    /// `lowerQuotePayload` for vector payloads. Same block-
-    /// allocation pattern as `list_construct`; backend emits
-    /// `coll:vector`.
-    vector_construct: []const *const Tiny,
-    /// Runtime map construction. IR for the
-    /// `#%map` special form + bare `{...}` literals. Items
-    /// are flat k,v,k,v,... pairs (length MUST be even at
-    /// build time — compiler guarantees this). Backend emits
-    /// `coll:map`; duplicate keys overwrite earlier (Clojure
-    /// semantics).
-    map_construct: []const *const Tiny,
-    /// Runtime set construction. IR for `#%set`
-    /// + bare `#{...}` literals. Duplicates collapse at
-    /// runtime via `champ.setConj`.
-    set_construct: []const *const Tiny,
+    /// A collection built from its evaluated items: the internal
+    /// `#%list`, `#%concat`, `#%vector`, `#%map` and `#%set` forms
+    /// syntax-quote emits, `[...]`, `{...}` and `#{...}` literals,
+    /// and quoted compound data. Map items are flat key, value pairs.
+    /// Emits one `coll:<op>` over a slot block (VM.md §10): a later
+    /// duplicate map key wins, set duplicates collapse, and each
+    /// `concat` item must be seqable.
+    coll: struct {
+        op: vm.CollOp,
+        items: []const *const Tiny,
+    },
     /// `try` / `catch` / `finally`. The only catch matcher is
     /// `any` and the catch clause is mandatory; `finally` is
     /// optional. body, handler and finally are each implicit-do;
@@ -1460,37 +1442,11 @@ fn lowerDatum(
             const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // `{k1 v1 k2 v2 ...}` as an expression → each key +
-        // value is a normal expression, evaluated
-        // left-to-right. The runtime
-        // map-builder fires after all are evaluated; duplicate
-        // keys keep the LATER value.
-        .map => |items| blk: {
-            if (items.len % 2 != 0) return CompileError.MalformedForm;
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
-        },
-        // `#{a b c}` as an expression. Each element
-        // is a normal expression; duplicates collapse at
-        // runtime via `champ.setConj`.
-        .set => |items| blk: {
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
-        },
-        // `[a b c]` as an expression: same shape as maps/sets.
-        .vector => |items| blk: {
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerFormEnv(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
-        },
+        // `{k1 v1 ...}`, `#{a b}` and `[a b]` as expressions: each
+        // item is an expression, evaluated left to right.
+        .map => |items| try lowerColl(allocator, .map, items, ctx, false),
+        .set => |items| try lowerColl(allocator, .set, items, ctx, false),
+        .vector => |items| try lowerColl(allocator, .vector, items, ctx, false),
         // Reader macros / meta.
         .quote => |inner| try lowerQuotePayload(allocator, inner, ctx),
         .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
@@ -1522,7 +1478,7 @@ fn lowerList(
     items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (items.len == 0) return try allocTiny(allocator, .{ .list_construct = &.{} });
+    if (items.len == 0) return try lowerColl(allocator, .list, &.{}, ctx, false);
     // Head-symbol dispatch only fires when head is an unqualified
     // symbol. Qualified symbols (`foo/x`) and non-symbol heads
     // (calls of computed values) fall through to ordinary call.
@@ -1532,16 +1488,11 @@ fn lowerList(
         if (std.mem.eql(u8, name, "do")) return try lowerDo(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "if")) return try lowerIf(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "quote")) return try lowerQuote(allocator, items[1..], ctx);
-        // Internal compiler primitives for collection construction.
-        // NOT user-shadowable (recognized as special forms in the
-        // dispatcher, never checked against the macro table or
-        // lexical env). Per MACROEXPAND.md §5 this is the
-        // unshadowable substrate that syntax-quote emits.
-        if (std.mem.eql(u8, name, "#%list")) return try lowerInternalList(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "#%concat")) return try lowerInternalConcat(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "#%vector")) return try lowerInternalVector(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "#%map")) return try lowerInternalMap(allocator, items[1..], ctx);
-        if (std.mem.eql(u8, name, "#%set")) return try lowerInternalSet(allocator, items[1..], ctx);
+        // The collection constructors syntax-quote emits: special
+        // forms, never shadowed (MACROEXPAND.md §5).
+        inline for (.{ "#%list", "#%concat", "#%vector", "#%map", "#%set" }, .{ .list, .concat, .vector, .map, .set }) |form, op| {
+            if (std.mem.eql(u8, name, form)) return try lowerColl(allocator, op, items[1..], ctx, false);
+        }
         // Binding forms.
         if (std.mem.eql(u8, name, "let*")) return try lowerLetStar(allocator, items[1..], ctx);
         if (std.mem.eql(u8, name, "loop*")) return try lowerLoopStar(allocator, items[1..], ctx);
@@ -1619,72 +1570,21 @@ fn lowerQuote(
     return lowerQuotePayload(allocator, args[0], ctx);
 }
 
-/// Lower `(#%list a b c)` — recursively lower each
-/// arg as a normal evaluable expression, then build a
-/// Tiny.list_construct with those subtrees. The args ARE
-/// evaluated (this is NOT quote-like opacity); macros nested
-/// in args do expand.
-fn lowerInternalList(
+/// A `Tiny.coll` of `op` over `forms`: each lowered as an
+/// expression, or as quoted data when `quoted`.
+fn lowerColl(
     allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
+    op: vm.CollOp,
+    forms: []const *reader_mod.Form,
     ctx: LowerCtx,
+    quoted: bool,
 ) CompileError!*Tiny {
-    const tiny_items = try allocator.alloc(*const Tiny, args.len);
-    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
-    return try allocTiny(allocator, .{ .list_construct = tiny_items });
-}
-
-/// Lower `(#%concat a b c)` — same shape as
-/// `#%list`. Each arg must evaluate to a list value at runtime
-/// (KindMismatch trap otherwise — enforced by the VM, not the
-/// compiler, since we can't statically know an expression's
-/// kind in general).
-fn lowerInternalConcat(
-    allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    const tiny_items = try allocator.alloc(*const Tiny, args.len);
-    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
-    return try allocTiny(allocator, .{ .concat = tiny_items });
-}
-
-/// Lower `(#%vector a b c)` — same pattern as
-/// `#%list` but emits Tiny.vector_construct (backend: coll:vector).
-fn lowerInternalVector(
-    allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    const tiny_items = try allocator.alloc(*const Tiny, args.len);
-    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
-    return try allocTiny(allocator, .{ .vector_construct = tiny_items });
-}
-
-/// Lower `(#%map k1 v1 k2 v2 ...)`. Args MUST be
-/// even (compiler raises MalformedForm otherwise; the runtime
-/// also enforces). Backend: coll:map → champ.mapAssoc per pair.
-fn lowerInternalMap(
-    allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    if (args.len % 2 != 0) return CompileError.MalformedForm;
-    const tiny_items = try allocator.alloc(*const Tiny, args.len);
-    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
-    return try allocTiny(allocator, .{ .map_construct = tiny_items });
-}
-
-/// Lower `(#%set a b c)`. Duplicates collapse at
-/// runtime via `champ.setConj`. Backend: coll:set.
-fn lowerInternalSet(
-    allocator: std.mem.Allocator,
-    args: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    const tiny_items = try allocator.alloc(*const Tiny, args.len);
-    for (args, 0..) |a, i| tiny_items[i] = try lowerFormEnv(allocator, a, ctx);
-    return try allocTiny(allocator, .{ .set_construct = tiny_items });
+    if (op == .map and forms.len % 2 != 0) return CompileError.MalformedForm;
+    const items = try allocator.alloc(*const Tiny, forms.len);
+    for (forms, items) |form, *item| {
+        item.* = if (quoted) try lowerQuotePayload(allocator, form, ctx) else try lowerFormEnv(allocator, form, ctx);
+    }
+    return try allocTiny(allocator, .{ .coll = .{ .op = op, .items = items } });
 }
 
 /// Shared implementation for `(quote x)` and the reader-macro
@@ -1735,50 +1635,11 @@ fn lowerQuotePayload(
             const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
-        // Quoted compound list, `(quote (1 2 3))`. Each element
-        // is recursively quote-lowered (so a
-        // nested `(quote (foo (bar baz)))` builds nested lists
-        // of interned symbols). Lowers to `Tiny.list_construct`
-        // with each element being a literal/recursive quote
-        // payload — NOT a normal evaluation (per the quote
-        // contract: elements are data, not source forms).
-        .list => |items| blk: {
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
-        },
-        // Quoted compound vector. Same pattern as
-        // quoted list — elements are recursively quote-lowered.
-        .vector => |items| blk: {
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .vector_construct = tiny_items });
-        },
-        // Quoted compound map. Items are k,v,k,v...
-        // recursively quote-lowered. The reader ensures even
-        // arity for `{...}` source syntax; defensive check
-        // here in case a synthesized map form sneaks in.
-        .map => |items| blk: {
-            if (items.len % 2 != 0) return CompileError.MalformedForm;
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .map_construct = tiny_items });
-        },
-        // Quoted compound set. Duplicate elements
-        // collapse via runtime `champ.setConj`.
-        .set => |items| blk: {
-            const tiny_items = try allocator.alloc(*const Tiny, items.len);
-            for (items, 0..) |item, i| {
-                tiny_items[i] = try lowerQuotePayload(allocator, item, ctx);
-            }
-            break :blk try allocTiny(allocator, .{ .set_construct = tiny_items });
-        },
+        // Quoted compound data: each element is quoted data too.
+        .list => |items| try lowerColl(allocator, .list, items, ctx, true),
+        .vector => |items| try lowerColl(allocator, .vector, items, ctx, true),
+        .map => |items| try lowerColl(allocator, .map, items, ctx, true),
+        .set => |items| try lowerColl(allocator, .set, items, ctx, true),
         // Quoting a self-evaluating literal yields the literal.
         .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
         .char => |c| try allocTiny(allocator, .{
@@ -1797,7 +1658,7 @@ fn lowerQuotePayload(
             const tiny_items = try allocator.alloc(*const Tiny, 2);
             tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
             tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
-            break :blk try allocTiny(allocator, .{ .list_construct = tiny_items });
+            break :blk try allocTiny(allocator, .{ .coll = .{ .op = .list, .items = tiny_items } });
         },
         else => return CompileError.UnsupportedFeature,
     };
@@ -3142,11 +3003,7 @@ fn freeVars(allocator: std.mem.Allocator, form: *const Tiny, env: *const NameSet
             for (r.args) |a| try freeVars(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no free vars
-        .list_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
-        .concat => |items| for (items) |it| try freeVars(allocator, it, env, out),
-        .vector_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
-        .map_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
-        .set_construct => |items| for (items) |it| try freeVars(allocator, it, env, out),
+        .coll => |c| for (c.items) |it| try freeVars(allocator, it, env, out),
         .try_ => |t| {
             try freeVars(allocator, t.body, env, out);
             var handler_env: NameSet = .{};
@@ -3314,11 +3171,7 @@ fn capturedByDescendantFns(
             for (r.args) |a| try capturedByDescendantFns(allocator, a, env, out);
         },
         .literal => {}, // leaf — Value constants have no descendant fns
-        .list_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
-        .concat => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
-        .vector_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
-        .map_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
-        .set_construct => |items| for (items) |it| try capturedByDescendantFns(allocator, it, env, out),
+        .coll => |c| for (c.items) |it| try capturedByDescendantFns(allocator, it, env, out),
         .try_ => |t| {
             try capturedByDescendantFns(allocator, t.body, env, out);
             var handler_env: NameSet = .{};
@@ -3399,11 +3252,7 @@ fn compileExpr(
         .literal => |v| try compileLiteral(e, v, dst),
         .symbol => |name| try compileSymbol(e, name, dst),
         .qualified_symbol => |qs| try compileQualifiedSymbol(e, qs.ns, qs.name, dst),
-        .list_construct => |items| try compileListConstruct(e, items, dst),
-        .concat => |items| try compileConcat(e, items, dst),
-        .vector_construct => |items| try compileVectorConstruct(e, items, dst),
-        .map_construct => |items| try compileMapConstruct(e, items, dst),
-        .set_construct => |items| try compileSetConstruct(e, items, dst),
+        .coll => |c| try compileColl(e, c.op, c.items, dst),
         .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, dst),
         .throw_ => |value| try compileThrow(e, value),
         .prim => |p| try compilePrim(e, p.op, p.lhs, p.rhs, dst),
@@ -3437,115 +3286,15 @@ fn compileLiteral(e: *Emitter, v: value_mod.Value, dst: u12) CompileError!void {
     try e.emit(vm.asm_.loadConst(dst, c));
 }
 
-/// Compile `#%list` — allocate a contiguous slot
-/// block for argc items, compile each arg into its slot, then
-/// emit `coll:list arg_base argc dst`. Empty list is a degenerate
-/// case: emit with argc=0 (the VM handles it specially via
-/// `list_mod.empty`).
-///
-/// Block-allocation strategy mirrors `compileCall`:
-/// reserve the entire block upfront so internal
-/// temporaries from sub-expression compilation don't fragment
-/// the arg slots.
-fn compileListConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len == 0) {
-        try e.emit(vm.asm_.collList(dst, 0, dst));
-        return;
-    }
-    const argc: u12 = if (items.len <= std.math.maxInt(u12))
-        @intCast(items.len)
-    else
-        return CompileError.SlotOverflow;
-    const arg_base = try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| {
-        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-        // Non-tail position: top-level expressions in a list
-        // construction never tail-call.
-        try compileExpr(e, item, slot, null);
-    }
-    try e.emit(vm.asm_.collList(arg_base, argc, dst));
-}
-
-/// Compile `#%concat`. Same block-allocation
-/// strategy as `compileListConstruct`; backend emits a
-/// single `coll:concat` opcode that does the runtime
-/// traverse-collect-rebuild.
-fn compileConcat(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len == 0) {
-        try e.emit(vm.asm_.collConcat(dst, 0, dst));
-        return;
-    }
-    const argc: u12 = if (items.len <= std.math.maxInt(u12))
-        @intCast(items.len)
-    else
-        return CompileError.SlotOverflow;
-    const arg_base = try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| {
-        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-        try compileExpr(e, item, slot, null);
-    }
-    try e.emit(vm.asm_.collConcat(arg_base, argc, dst));
-}
-
-/// Compile `#%vector`. Same pattern as `#%list`;
-/// backend emits `coll:vector` which routes through
-/// `vector_mod.fromSlice` (RRB persistent vector).
-fn compileVectorConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len == 0) {
-        try e.emit(vm.asm_.collVector(dst, 0, dst));
-        return;
-    }
-    const argc: u12 = if (items.len <= std.math.maxInt(u12))
-        @intCast(items.len)
-    else
-        return CompileError.SlotOverflow;
-    const arg_base = try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| {
-        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-        try compileExpr(e, item, slot, null);
-    }
-    try e.emit(vm.asm_.collVector(arg_base, argc, dst));
-}
-
-/// Compile `#%map`. Items are flat k,v,k,v,... so
-/// length MUST be even (compiler enforces; runtime would
-/// reject as BytecodeCorruption otherwise). Backend emits
-/// `coll:map` which iterates pairs through `champ.mapAssoc`.
-fn compileMapConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len % 2 != 0) return CompileError.MalformedForm;
-    if (items.len == 0) {
-        try e.emit(vm.asm_.collMap(dst, 0, dst));
-        return;
-    }
-    const argc: u12 = if (items.len <= std.math.maxInt(u12))
-        @intCast(items.len)
-    else
-        return CompileError.SlotOverflow;
-    const arg_base = try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| {
-        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-        try compileExpr(e, item, slot, null);
-    }
-    try e.emit(vm.asm_.collMap(arg_base, argc, dst));
-}
-
-/// Compile `#%set`. Same shape as `#%list`; backend
-/// emits `coll:set` which de-duplicates via `champ.setConj`.
-fn compileSetConstruct(e: *Emitter, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len == 0) {
-        try e.emit(vm.asm_.collSet(dst, 0, dst));
-        return;
-    }
-    const argc: u12 = if (items.len <= std.math.maxInt(u12))
-        @intCast(items.len)
-    else
-        return CompileError.SlotOverflow;
-    const arg_base = try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| {
-        const slot: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-        try compileExpr(e, item, slot, null);
-    }
-    try e.emit(vm.asm_.collSet(arg_base, argc, dst));
+/// `coll:<op>` over the items, each compiled into its slot of one
+/// block reserved up front: a per-item allocation would interleave
+/// with the items' own temporaries and break the block's contiguity.
+fn compileColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
+    if (items.len > std.math.maxInt(u12)) return CompileError.SlotOverflow;
+    const argc: u12 = @intCast(items.len);
+    const base = if (argc == 0) dst else try e.allocSlotBlock(argc);
+    for (items, 0..) |item, i| try compileExpr(e, item, base + @as(u12, @intCast(i)), null);
+    try e.emit(Inst.primary(.coll, op, Operand.slot(base), .{ .kind = .unused, .index = argc }, Operand.slot(dst)));
 }
 
 /// `op` over its operands, read in place where they allow it
@@ -4113,7 +3862,8 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
     return switch (t.*) {
         .nil, .bool, .int, .literal, .qualified_symbol, .var_ref => false,
         .symbol => |sym| std.mem.eql(u8, sym, name),
-        .list_construct, .concat, .vector_construct, .map_construct, .set_construct, .do_ => |items| any(items, name),
+        .coll => |c| any(c.items, name),
+        .do_ => |items| any(items, name),
         .recur => |r| any(r.args, name),
         .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false),
         .if_ => |i| try readsName(i.test_, name) or try readsName(i.then, name) or (if (i.else_) |x| try readsName(x, name) else false),
