@@ -301,13 +301,9 @@ one writer, tree registration, sync modes, `delPrefixFromTree`).
 **The owner's rules**:
 
 - **Zero changes to emdb.** Anything the engine seems to lack is
-  solved on the nexis side. The "emdb wants" list is two items,
-  both worked around (`docs/NEXTOMIC.md` §11): a transaction id
-  accessor (Nextomic reads its own `t` from `sys` inside the same
-  snapshot instead) and full multi-page values off a cursor (index
-  trees carry only `[t]` or nothing; payloads and txlog entries are
-  read with `Txn.getFromTree` on the exact key, which assembles every
-  page). `../emdb/NEXTOMIC.md` §6 lists the temptations to refuse.
+  solved on the nexis side (`docs/NEXTOMIC.md` §11: Nextomic reads
+  its own `t` from `sys` rather than the engine's transaction id).
+  `../emdb/NEXTOMIC.md` §6 lists the temptations to refuse.
 - **Timeless code and comments.** Describe what is. No "now",
   "previously", "used to", phase or turn numbers, or era framing in
   code, comments or docs; a review treats such phrasing as a defect.

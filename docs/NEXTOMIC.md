@@ -731,14 +731,11 @@ one writer.
 
 ## 11. emdb: nothing required
 
-Two wishes noted and worked around, so that the engine stays untouched:
-
-1. A transaction id accessor: the public `Txn.txnId` field is not used;
-   Nextomic's own `t` is read from `sys` inside the same snapshot.
-2. Full multi-page overflow values off a cursor (cursors clamp to one
-   page): index trees carry only `[t]` in current trees and nothing in
-   history trees; out-of-line payloads and txlog entries are read with
-   `Txn.getFromTree` on the exact key, which assembles every page.
+The engine's public `Txn.txnId` field is not used: Nextomic's own `t`
+is read from `sys` inside the same snapshot. Index trees carry only
+`[t]` in current trees and nothing in history trees; out-of-line
+payloads and txlog entries are read with `Txn.getFromTree` on the
+exact key.
 
 ---
 

@@ -3224,44 +3224,28 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 
 /// A cursor over one named tree inside an active transaction.
 const TreeCursor = struct {
-    conn: *db_mod.Connection,
-    inner: *emdb_mod.Txn,
-    tree_id: emdb_mod.TreeId,
     cursor: emdb_mod.Cursor,
-    /// See `db.cursorPageBytes`.
-    page_bytes: u32,
 
     /// Open a cursor on `tree_name`. Null when the tree does not
     /// exist, which every caller treats as an empty tree.
     fn open(vm: *VM, tx_v: Value, tree_name: []const u8) VmError!?TreeCursor {
-        const Resolved = struct { conn: *db_mod.Connection, inner: *emdb_mod.Txn, tree_id: ?emdb_mod.TreeId };
-        const r: Resolved = switch (try activeTxn(tx_v)) {
-            inline else => |h| .{
-                .conn = h.txn.conn,
-                .inner = h.txn.inner,
-                .tree_id = db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err),
+        switch (try activeTxn(tx_v)) {
+            inline else => |h| {
+                const tree_id = (db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err)) orelse return null;
+                const cursor = h.txn.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
+                return .{ .cursor = cursor };
             },
-        };
-        const tree_id = r.tree_id orelse return null;
-        const cursor = r.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
-        return .{
-            .conn = r.conn,
-            .inner = r.inner,
-            .tree_id = tree_id,
-            .cursor = cursor,
-            .page_bytes = db_mod.cursorPageBytes(r.conn),
-        };
+        }
     }
 
-    /// The complete value of `kv`, decoded onto the heap. Values
-    /// that continue past the cursor's first page are re-read
-    /// through the tree (`db.cursorValue`).
-    fn decode(self: *TreeCursor, vm: *VM, kv: emdb_mod.Cursor.KeyValue) VmError!Value {
-        const bytes = db_mod.cursorValue(self, self.tree_id, kv, self.page_bytes) catch |err| return dbFailure(vm, err);
+    /// The value of `kv`, decoded onto the heap. The cursor returns
+    /// a multi-page value whole, assembled in the transaction's
+    /// buffer, so it is decoded before the cursor moves.
+    fn decode(_: *TreeCursor, vm: *VM, kv: emdb_mod.Cursor.KeyValue) VmError!Value {
         return codec_mod.decode(
             vm.ensureHeap(),
             vm.ensureInterner(),
-            bytes,
+            kv.value,
             &dispatch_mod_alias.hashValue,
             &dispatch_mod_alias.equal,
         ) catch |err| return dbFailure(vm, err);
