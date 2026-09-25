@@ -933,25 +933,14 @@ fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, i
 ///   :rename {x z}      a referred `x` is named `z` here
 ///
 /// A keyword spec (`:reload`, `:reload-all`, `:verbose`) is a flag
-/// and changes nothing. `clojure.string`, `clojure.set`,
-/// `clojure.test`, `clojure.pprint`, `clojure.math` and
-/// `clojure.core` name their nexis namespaces, and the Clojure name
-/// becomes an alias of the nexis one.
+/// and changes nothing. What a namespace name loads, including the
+/// Clojure library names that stand for nexis namespaces, is the
+/// loader's (`loader.zig`).
 fn expandRequire(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 2) return ctx.fail(list_form.origin, "require: expected a namespace", .{});
     for (items[1..]) |spec| try requireSpec(ctx, spec);
     return try makeNil(ctx, list_form.origin);
 }
-
-/// The nexis namespace a Clojure library namespace stands for.
-const clojure_namespaces = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "clojure.core", "nexis.core" },
-    .{ "clojure.string", "nexis.string" },
-    .{ "clojure.set", "nexis.set" },
-    .{ "clojure.test", "nexis.test" },
-    .{ "clojure.pprint", "nexis.pprint" },
-    .{ "clojure.math", "nexis.math" },
-});
 
 /// Load and refer one `require` spec (see `expandRequire`).
 fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
@@ -964,8 +953,7 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
     };
     const name_form = if (spec.datum == .vector) spec.datum.vector[0] else spec;
     if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
-    const written = name_form.datum.symbol.name;
-    const ns_name = clojure_namespaces.get(written) orelse written;
+    const ns_name = name_form.datum.symbol.name;
     if (opts.len % 2 != 0) return ctx.fail(spec.origin, "require: options come in pairs", .{});
     var as_alias: ?[]const u8 = null;
     var load = true;
@@ -1000,12 +988,12 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
             // A file that ran and failed: the VM carries the failure.
             error.RunFailed => ExpandError.RequiredFileFailed,
             error.ControlTransferred => ExpandError.ControlTransferred,
-            error.FileNotFound => ctx.fail(name_form.origin, "require: no namespace {s} on the load path", .{ns_name}),
-            else => ctx.fail(name_form.origin, "require: {s} could not be loaded: {s}", .{ ns_name, @errorName(err) }),
+            // The loader has its own account of why, located in the
+            // file that failed when there is one.
+            else => ctx.fail(name_form.origin, "require: {s} did not load", .{ns_name}),
         };
     }
     const cur = reg.current;
-    if (!std.mem.eql(u8, written, ns_name)) cur.putAlias(written, ns_name) catch return ExpandError.OutOfMemory;
     if (as_alias) |a| cur.putAlias(a, ns_name) catch return ExpandError.OutOfMemory;
     const r = refer orelse return;
     const target = reg.lookupNs(ns_name) orelse return ctx.fail(name_form.origin, "require: no namespace {s} to refer from", .{ns_name});

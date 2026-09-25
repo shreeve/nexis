@@ -4755,6 +4755,9 @@ const RequireDir = struct {
             program.registry,
             &program.host_macros,
         );
+        // The namespaces the program installed have no file.
+        var names = program.registry.map.keyIterator();
+        while (names.next()) |name| try self.loader.markLoaded(name.*);
         program.hooks.load_callback = self.callback();
     }
 
@@ -4884,7 +4887,7 @@ fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []
 }
 
 test "ns and require: a bad spec or a missing namespace or Var is reported by name" {
-    try expectRequireFailure(&.{}, "", "(require '[nope.ns :as n])", "require: no namespace nope.ns on the load path", "nope.ns");
+    try expectRequireFailure(&.{}, "", "(require '[nope.ns :as n])", "require: nope.ns did not load", "nope.ns");
     try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [nope]])", "require: util/nope does not exist", "nope");
     try expectRequireFailure(&.{utilns}, "", "(require '[util :only [twice]])", "require: unknown option only", ":only");
     try expectRequireFailure(&.{}, "", "(ns x (:import java.util.Date))", "ns: (:import ...) is not supported", "(:import java.util.Date)");
