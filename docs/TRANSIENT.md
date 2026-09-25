@@ -101,12 +101,12 @@ wrapper it was given; the source collection is never changed.
 |---|---|
 | `(transient coll)` | an active transient of a map, set or vector |
 | `(persistent! t)` | the collection; `t` is frozen |
-| `(conj! t x & xs)` | vector: append; set: add; map: `x` is a `[k v]` vector. `(conj!)` is a new transient vector, `(conj! t)` is `t` |
+| `(conj! t x & xs)` | vector: append; set: add; map: `x` as `conj` onto a map takes it, a `[k v]` vector, a map or record whose entries are all put, or nil (nothing). `(conj!)` is a new transient vector, `(conj! t)` is `t` |
 | `(assoc! t k v & kvs)` | map: put; vector: replace index `k`, or append when `k` is the count |
 | `(dissoc! t k & ks)` | map only |
 | `(disj! t x & xs)` | set only |
 | `(pop! t)` | vector only: without its last element |
-| `count`, `get`, `contains?` | on any transient; `get` of a vector transient takes an index |
+| `count`, `empty?`, `get`, `contains?` | on any transient; `get` of a vector transient takes an index |
 | `nth` | on a vector transient |
 
 A transient is not callable and not seqable (`seq` of one is

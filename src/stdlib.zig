@@ -712,8 +712,9 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(empty? coll)` → true if coll has zero elements. nil →
 /// true (matches Clojure). Strings: byte-length test (O(1)) —
-/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed.
-fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
+/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed. A
+/// transient is counted, as Clojure 1.12's `empty?` counts one.
+fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     const is_empty = switch (c.kind()) {
         .nil => true,
@@ -726,6 +727,7 @@ fn fnEmptyQ(_: *VM, args: []const Value) VmError!Value {
         .nextomic_entity => false,
         .persistent_set => champ_mod.setCount(c) == 0,
         .string => string_mod.byteLen(c) == 0,
+        .transient => try transientCount(vm, c) == 0,
         else => return VmError.KindMismatch,
     };
     return value_mod.fromBool(is_empty);
@@ -3368,14 +3370,31 @@ fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
     var t = args[0];
     const sub = try requireTransient(t);
     for (args[1..]) |x| t = switch (sub) {
-        transient_mod.subkind_transient_map => blk: {
-            if (x.kind() != .persistent_vector or vector_mod.count(x) != 2) return VmError.KindMismatch;
-            break :blk transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal);
-        },
+        transient_mod.subkind_transient_map => try conjBangMap(vm, t, x),
         transient_mod.subkind_transient_set => transient_mod.setConjBang(heap, t, x, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => transient_mod.vectorConjBang(heap, t, x),
     } catch |err| return transientFailure(vm, err);
     return t;
+}
+
+/// A transient map with `x` added as `conj` adds it to a map: a
+/// `[k v]` entry, every entry of a map or record, or nothing for nil.
+fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    switch (x.kind()) {
+        .nil => return t,
+        .persistent_map, .record => {
+            var result = t;
+            var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
+            while (it.next()) |e| result = transient_mod.mapAssocBang(heap, result, e.key, e.value, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+            return result;
+        },
+        .persistent_vector => {
+            if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+            return transient_mod.mapAssocBang(heap, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1), &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| transientFailure(vm, err);
+        },
+        else => return VmError.KindMismatch,
+    }
 }
 
 /// `(assoc! t k v & kvs)` on a transient map or vector.

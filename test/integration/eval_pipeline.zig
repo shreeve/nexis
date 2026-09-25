@@ -1339,6 +1339,13 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("(let [t (transient [])] (persistent! t) (try (conj! t 1) (catch any e e)))", ":transient-used-after-persistent");
     try expectOutput("(try (transient '(1)) (catch any e e))", ":kind-mismatch");
     try expectOutput("(persistent! (conj! (transient {}) [:k 1]))", "{:k 1}");
+    // conj! onto a transient map takes what conj onto a map takes: an
+    // entry, a map or record whose entries are all added, or nil.
+    try expectOutputProgram("(defrecord R [x]) (persistent! (conj! (transient {:a 1}) {:b 2 :c 3} nil [:d 4] (->R 5)))", "{:a 1, :b 2, :c 3, :d 4, :x 5}");
+    try expectOutput("[(try (conj! (transient {}) [1 2 3]) (catch any e e)) (try (conj! (transient {}) 1) (catch any e e))]", "[:arity-mismatch :kind-mismatch]");
+    // empty? counts a transient, as Clojure 1.12's does (CLJ-1872).
+    try expectOutput("[(empty? (transient [])) (empty? (transient [1])) (empty? (transient {:a 1})) (empty? (transient #{}))]", "[true false false true]");
+    try expectOutput("(let [t (transient [])] (persistent! t) (try (empty? t) (catch any e e)))", ":transient-used-after-persistent");
     try expectOutput("(let [t (transient [1 2 3])] (identical? t (assoc! t 3 4)))", "true");
     try expectOutput("[(try (assoc! (transient [1]) 5 :x) (catch any e e)) (try (pop! (transient [])) (catch any e e))]", "[:index-out-of-bounds :index-out-of-bounds]");
     try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
