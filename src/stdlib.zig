@@ -4179,23 +4179,49 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
 
 /// The process's stdin, read through one buffer: the REPL's input
 /// and `read-line` share it, so neither loses what the other
-/// buffered. One isolate, one thread.
+/// buffered. A line longer than the buffer is gathered in
+/// `stdin_long_line`. One isolate, one thread.
 var stdin_buf: [64 * 1024]u8 = undefined;
 var stdin_reader: ?std.Io.File.Reader = null;
+var stdin_long_line: std.ArrayList(u8) = .empty;
 
 /// The next line of stdin without its newline, null at end of input;
-/// valid until the next read. A line longer than the buffer is
-/// `error.StreamTooLong`.
-pub fn readStdinLine(io: std.Io) error{ ReadFailed, StreamTooLong }!?[]const u8 {
+/// valid until the next read.
+pub fn readStdinLine(io: std.Io) error{ ReadFailed, OutOfMemory }!?[]const u8 {
     if (stdin_reader == null) stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
-    const line = (try stdin_reader.?.interface.takeDelimiter('\n')) orelse return null;
+    return readLine(&stdin_reader.?.interface, &stdin_long_line, std.heap.page_allocator);
+}
+
+/// The next line of `r` without its newline or a trailing `\r`, null
+/// at end of input; valid until the next read. A line longer than
+/// `r`'s buffer is gathered in `overflow`, allocated from `gpa`.
+fn readLine(r: *std.Io.Reader, overflow: *std.ArrayList(u8), gpa: std.mem.Allocator) error{ ReadFailed, OutOfMemory }!?[]const u8 {
+    const line = r.takeDelimiter('\n') catch |err| switch (err) {
+        error.ReadFailed => return error.ReadFailed,
+        error.StreamTooLong => long: {
+            overflow.clearRetainingCapacity();
+            var w: std.Io.Writer.Allocating = .fromArrayList(gpa, overflow);
+            const streamed = r.streamDelimiterEnding(&w.writer, '\n');
+            overflow.* = w.toArrayList();
+            _ = streamed catch |e| return switch (e) {
+                error.ReadFailed => error.ReadFailed,
+                error.WriteFailed => error.OutOfMemory,
+            };
+            // The newline, unless the input ended first.
+            if (r.bufferedLen() > 0) r.toss(1);
+            break :long overflow.items;
+        },
+    } orelse return null;
     return std.mem.trimEnd(u8, line, "\r");
 }
 
 /// `(read-line)` → the next line of stdin as a string, nil at end
 /// of input.
 fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
-    const line = (readStdinLine(vm.io orelse return VmError.IoError) catch return VmError.IoError) orelse return value_mod.nilValue();
+    const line = (readStdinLine(vm.io orelse return VmError.IoError) catch |err| return switch (err) {
+        error.OutOfMemory => VmError.OutOfMemory,
+        error.ReadFailed => VmError.IoError,
+    }) orelse return value_mod.nilValue();
     return string_mod.fromBytes(vm.ensureHeap(), line) catch VmError.OutOfMemory;
 }
 
@@ -4880,6 +4906,17 @@ test "stdlib: name of a string is the string itself" {
     const s = try string_mod.fromBytes(vm.ensureHeap(), "abc");
     const named = try fnName(&vm, &.{s});
     try testing.expectEqual(s.payload, named.payload);
+}
+
+test "stdlib: readLine returns a line longer than the reader's buffer whole" {
+    var buf: [8]u8 = undefined;
+    var r: std.testing.Reader = .init(&buf, &.{ .{ .buffer = "short\r\n0123456789abcdef" }, .{ .buffer = "ghij\nthe-last-line" } });
+    var overflow: std.ArrayList(u8) = .empty;
+    defer overflow.deinit(testing.allocator);
+    try testing.expectEqualStrings("short", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expectEqualStrings("0123456789abcdefghij", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expectEqualStrings("the-last-line", (try readLine(&r.interface, &overflow, testing.allocator)).?);
+    try testing.expect(try readLine(&r.interface, &overflow, testing.allocator) == null);
 }
 
 test "stdlib: nativeFnValue round-trips" {
