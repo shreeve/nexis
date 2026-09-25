@@ -36,7 +36,10 @@ transients wrap the persistent ops (`docs/TRANSIENT.md`).
   PLAN §9.2 + §23 #30. There is no RRB relaxation.
 - Construction: `empty(heap)`, `fromSlice(heap, elems)`, `conj(heap,
   v, elem)` (O(1) amortized append with automatic tail promotion and
-  root-shift growth).
+  root-shift growth). `fromSlice` builds the trie bottom-up, one
+  allocation per node, into exactly the shape a left fold of `conj`
+  produces; `conj` promotes a full tail into the trie as it stands
+  (a leaf and a full tail share one layout).
 - Update: `assoc(heap, v, i, elem)` (O(log₃₂ n) path copy; O(1) in
   the tail) and `pop(heap, v)` (§6: O(1) while the tail holds more
   than one element, O(log₃₂ n) when the last leaf becomes the tail).

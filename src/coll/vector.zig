@@ -257,7 +257,9 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     const new_tail = try allocTail(heap, 1);
     tailValues(new_tail)[0] = elem;
 
-    const promoted_leaf = try leafFromTail(heap, src.tail_node.?);
+    // A full tail and a leaf share one layout: the tail joins the trie
+    // as it stands.
+    const promoted_leaf = src.tail_node.?;
     // `promoted_leaf_base` is the logical element index the promoted
     // leaf covers from: the leaf spans indices
     // `[promoted_leaf_base, promoted_leaf_base + 32)`. Derived from
@@ -298,10 +300,9 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // elems_after_promotion STRICTLY exceeds current capacity, which
     // matches Clojure's `(cnt >>> 5) > (1 << shift)` formulation.
     //
-    // GC-interaction note: this function allocates 3–5 heap objects
-    // (new_tail, promoted_leaf, possibly clones and new interiors,
-    // new_root_h) before any of them is reachable from a user-held
-    // Value. `Heap.alloc` never triggers a collection (GC.md §7: a
+    // GC-interaction note: this function allocates several heap
+    // objects (new_tail, path clones or new interiors, new_root_h)
+    // before any of them is reachable from a user-held Value. `Heap.alloc` never triggers a collection (GC.md §7: a
     // cycle runs only at the VM's instruction fetch), so no
     // temporary root-stack is needed to protect the partial tree.
     if (src.root_node == null or elems_after_promotion > capacityAtShift(src.shift)) {
@@ -417,13 +418,52 @@ fn popTail(heap: *Heap, node: *HeapHeader, level_shift: u32, last: usize) !?*Hea
     return clone;
 }
 
-/// Build a vector from a slice, in natural order. Implemented as
-/// a left-fold of `conj` for simplicity and to exercise the append
-/// paths during construction.
+/// Build a vector from a slice, in natural order. The trie is built
+/// bottom-up, one allocation per node, into exactly the shape a
+/// left fold of `conj` produces.
 pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
-    var result = try empty(heap);
-    for (elems) |e| result = try conj(heap, result, e);
-    return result;
+    if (elems.len == 0) return empty(heap);
+    const n = std.math.cast(u32, elems.len) orelse return error.Overflow;
+    const tail_offset: u32 = (n - 1) & ~branch_mask;
+    const tail = try allocTail(heap, n - tail_offset);
+    @memcpy(tailValues(tail), elems[tail_offset..]);
+    var shift: u32 = 0;
+    var trie: ?*HeapHeader = null;
+    if (tail_offset > 0) {
+        shift = branch_bits;
+        while (tail_offset > capacityAtShift(shift)) shift += branch_bits;
+        trie = try buildTrie(heap, elems[0..tail_offset], shift);
+    }
+    const root_h = try allocRoot(heap);
+    const root = rootBody(root_h);
+    root.count = n;
+    root.shift = shift;
+    root.root_node = trie;
+    root.tail_node = tail;
+    root.tail_len = n - tail_offset;
+    return valueFromRoot(root_h);
+}
+
+/// The node at `level_shift` holding `elems`, a non-empty multiple of
+/// 32 elements that fits under it; children fill from slot 0.
+fn buildTrie(heap: *Heap, elems: []const Value, level_shift: u32) !*HeapHeader {
+    if (level_shift == 0) {
+        const leaf = try allocLeaf(heap);
+        @memcpy(leafValues(leaf), elems);
+        return leaf;
+    }
+    const node = try allocInterior(heap);
+    const span = capacityAtShift(level_shift - branch_bits);
+    var start: usize = 0;
+    var slot: usize = 0;
+    while (start < elems.len) : ({
+        start += span;
+        slot += 1;
+    }) {
+        const chunk = elems[start..@min(start + span, elems.len)];
+        interiorChildren(node)[slot] = try buildTrie(heap, chunk, level_shift - branch_bits);
+    }
+    return node;
 }
 
 // =============================================================================
@@ -589,17 +629,6 @@ fn cloneInterior(heap: *Heap, src: *HeapHeader) !*HeapHeader {
     const new = try allocInterior(heap);
     @memcpy(interiorChildren(new), interiorChildren(src));
     return new;
-}
-
-/// Build a fresh tail node that's an exact copy of an existing tail
-/// PROMOTED to leaf shape (a full 32-Value leaf). The source MUST
-/// have exactly 32 values (tail was full).
-fn leafFromTail(heap: *Heap, tail: *HeapHeader) !*HeapHeader {
-    const tail_vals = tailValuesConst(tail);
-    std.debug.assert(tail_vals.len == branch_factor);
-    const leaf = try allocLeaf(heap);
-    @memcpy(leafValues(leaf), tail_vals);
-    return leaf;
 }
 
 /// Build a chain of interior nodes from `level_shift` down to level 0
@@ -1033,51 +1062,35 @@ test "conj at the actual shift-5 → shift-10 overflow (1056 + 1 = 1057)" {
     }
 }
 
-test "conj at the actual shift-10 → shift-15 overflow (32800 + 1 = 32801)" {
-    // The deep growth boundary: a shift-10 trie holds
-    // capacityAtShift(10) = 32768 elements plus a 32-element tail =
-    // 32800 total before forcing a new level. At count 32801 shift
-    // grows to 15. This test validates the recursive newPath
-    // construction at the deepest depth the tests exercise.
-    const gpa = std.testing.allocator;
-    var heap = Heap.init(gpa);
+test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
+    // A shift-10 trie holds capacityAtShift(10) = 32768 elements plus
+    // a 32-element tail: 32800 in all. Count 32769 fills the trie
+    // exactly; count 32801 grows the shift to 15 through `newPath`.
+    // Each conj from 32766 on must land on the shape fromSlice builds.
+    var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    var v = try empty(&heap);
-    var i: usize = 0;
-    while (i < 32801) : (i += 1) {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
+    var v = try rangeVector(&heap, 32766);
+    var n: usize = 32766;
+    while (n < 32802) : (n += 1) {
+        v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
+        try expectSameShape(try rangeVector(&heap, n + 1), v);
+        const body = rootBodyConst(rootHeader(v));
+        try testing.expectEqual(@as(u32, if (n + 1 > 32800) 3 * branch_bits else 2 * branch_bits), body.shift);
     }
     const body = rootBodyConst(rootHeader(v));
-    try testing.expectEqual(@as(u32, 32801), body.count);
-    try testing.expectEqual(@as(u32, 3 * branch_bits), body.shift); // 15
-    try testing.expectEqual(@as(u32, 1), body.tail_len);
-    // Spot-check at deep-trie boundaries.
-    const probe = [_]usize{ 0, 31, 1023, 1024, 32767, 32768, 32799, 32800 };
-    for (probe) |idx| {
-        try testing.expectEqual(@as(i64, @intCast(idx)), nth(v, idx).asFixnum());
-    }
+    try testing.expectEqual(@as(u32, 32802), body.count);
+    try testing.expectEqual(@as(u32, 2), body.tail_len);
+    const probe = [_]usize{ 0, 31, 1023, 1024, 32767, 32768, 32799, 32800, 32801 };
+    for (probe) |idx| try testing.expectEqual(@as(i64, @intCast(idx)), nth(v, idx).asFixnum());
 }
 
-test "conj just past shift-10 capacity (32768 + 1): still shift 10, tail=1" {
-    // A trie at shift 10 holds 32 * 32 * 32 = 32768 elements
-    // plus a 32-element tail = 32800 total before overflow. At
-    // count 32769 the trie is exactly full; tail has 1 element.
-    // No shift growth yet.
+test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var v = try empty(&heap);
-    var i: usize = 0;
-    while (i < 32769) : (i += 1) {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
-    }
-    const body = rootBodyConst(rootHeader(v));
-    try testing.expectEqual(@as(u32, 32769), body.count);
-    try testing.expectEqual(@as(u32, 2 * branch_bits), body.shift); // 10
-    try testing.expectEqual(@as(u32, 1), body.tail_len);
-    // Spot-check a few indices across the range to confirm the trie
-    // pathing survived the grow operations.
-    const probe = [_]usize{ 0, 1023, 1024, 32767, 32768 };
-    for (probe) |idx| {
-        try testing.expectEqual(@as(i64, @intCast(idx)), nth(v, idx).asFixnum());
+    var n: usize = 0;
+    while (n < 1100) : (n += 1) {
+        try expectSameShape(try rangeVector(&heap, n), v);
+        v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
     }
 }
