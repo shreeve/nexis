@@ -447,6 +447,15 @@ test "syntax-quote: auto-gensyms stay unique across top-level forms" {
     , "[true false]");
 }
 
+test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
+    try expectOutputProgram("(defmacro m [x] ``(a ~~x)) (m 1)", "(user/a 1)");
+    try expectOutputProgram(
+        \\(defmacro make-adder-macro [name n] `(defmacro ~name [y#] `(+ ~y# ~~n)))
+        \\(make-adder-macro add5 5)
+        \\(add5 10)
+    , "15");
+}
+
 test "syntax-quote: a bare binding name inside syntax-quote is the Clojure mistake" {
     // `(let [x ~a] x)` qualifies `x`; a qualified name cannot be bound.
     try expectProgramError("(defmacro bad [a] `(let [x ~a] x)) (bad 1)", compile.CompileError.MacroExpansionFailure);

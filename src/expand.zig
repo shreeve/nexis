@@ -2402,7 +2402,14 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
             try syntaxQuote(ctx, scope, wm.target),
             try syntaxQuote(ctx, scope, wm.meta),
         }),
-        .syntax_quote => ctx.fail(payload.origin, "a syntax-quote cannot nest in another", .{}),
+        // Clojure's rule: the inner syntax-quote becomes its
+        // construction form first, in its own gensym scope, and the
+        // outer one quotes that, so `~~x` is unquoted by the outer.
+        .syntax_quote => |inner| blk: {
+            var inner_scope = GensymScope{};
+            defer inner_scope.deinit(ctx.allocator);
+            break :blk try syntaxQuote(ctx, scope, try syntaxQuote(ctx, &inner_scope, inner));
+        },
     };
 }
 

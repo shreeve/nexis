@@ -414,7 +414,14 @@ sq('x)               → (#%list 'quote sq(x))          ; `'a → (quote ns/a)
 sq(@x)               → (#%list 'nexis.core/deref sq(x))
 sq(#(...))           → sq of the fn* form it stands for
 sq(^m x)             → (#%list 'nexis.internal/#%meta sq(x) sq(m))
+sq(`x)               → sq(sq'(x))   ; sq' in a gensym scope of its own
 ```
+
+A nested syntax-quote follows Clojure's rule: the inner one becomes
+its construction form first, and the outer one quotes that, so in
+`` `(a `(b ~~x)) `` the `~~x` is unquoted by the outer level and a
+macro can write a macro: `` (defmacro make-adder [name n]
+`(defmacro ~name [y#] `(+ ~y# ~~n))) ``.
 
 The list a syntax-quoted `^m x` builds turns back into `^m x` when
 a macro's result becomes a form, so `` `(def ^:private ~name 1) ``
@@ -428,7 +435,7 @@ rebuilt from the resulting list with `nexis.core/vec`,
 `(nexis.core/apply nexis.core/hash-set ...)`. `coll:concat`
 accepts every seqable (nil, list, vector, map as `[k v]`
 entries, set), so `~@` splices whatever a seq function returns.
-A nested syntax-quote is `MacroExpansionFailure`.
+
 
 **Qualification** (PLAN §23 #29, Clojure's rule): an unqualified
 symbol becomes `ns/name` where `ns` is the namespace whose own
