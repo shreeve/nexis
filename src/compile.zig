@@ -4,7 +4,7 @@
 //!
 //! **Pipeline**: `compileSourceWith` / `compileFormWith` macroexpand
 //! the form (`expand.zig`), lower it to a `Tiny` tree (`lowerForm`),
-//! and compile that tree with `compileTinyWithNamespace`. `Tiny` is
+//! and compile that tree with `emitRoutine`. `Tiny` is
 //! the only IR; there is no separate Form → bytecode path.
 //!
 //! **Forms lowered**:
@@ -506,8 +506,8 @@ pub const CompileError = error{
     /// than emitting subtly-wrong code.
     UnsupportedFeature,
 
-    /// The parser or reader rejected the source string while
-    /// compiling via `compileSource` / `compileSourceWithNamespace`.
+    /// The parser or reader rejected the source string given to
+    /// `compileSourceWith`.
     /// Bucketed error wrapping any error from `parser.parseForm`
     /// / `reader.readOneForm`; the reader's own ErrorKind is not
     /// carried through.
@@ -1040,58 +1040,41 @@ const Emitter = struct {
 // Public API
 // =============================================================================
 
-/// Compile a `Tiny` form to a `Compiled` artifact. Named
-/// `compileTiny` rather than `compile` to make it loud that this
-/// entry point accepts the `Tiny` IR directly; source and Form
-/// callers use `compileSourceWith` / `compileFormWith`.
+/// Compile a `Tiny` tree built by hand: no namespace (every symbol
+/// must be lexical) and no span table. Source and Form callers use
+/// `compileSourceWith` / `compileFormWith`.
 pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
-    return compileTinyWithNamespace(allocator, form, null);
+    return emitRoutine(allocator, form, .{});
 }
 
-/// Compile with a Namespace for `def` / `(var x)` /
-/// symbol-fall-through-to-Var resolution. Call sites that don't
-/// use vars call `compileTiny` (namespace=null), and unresolved
-/// symbols raise `UnresolvedSymbol`. Tests that exercise `def` build a
-/// Namespace (typically `VM.ensureNamespace()`'s) and pass it
-/// here.
-pub fn compileTinyWithNamespace(
-    allocator: std.mem.Allocator,
-    form: *const Tiny,
-    namespace: ?*vm.Namespace,
-) CompileError!Compiled {
-    return compileTinyWithSpans(allocator, form, namespace, false, null, null, null);
-}
+/// What `emitRoutine` compiles a top-level `Tiny` tree with.
+const EmitOptions = struct {
+    namespace: ?*vm.Namespace = null,
+    /// Whether every node is a `TinyNode` (a tree `lowerForm`
+    /// built), so the routines carry span tables.
+    spanned: bool = false,
+    /// The span of the form the tree was lowered from.
+    origin: ?reader_mod.SrcSpan = null,
+    source: ?*const vm.SourceInfo = null,
+    diag: ?*LowerDiag = null,
+};
 
-/// `compileTinyWithNamespace` for a tree `lowerForm` built
-/// (`spanned`), with the span of the top-level form and the source
-/// it came from, so the routine and every routine nested in it
-/// carry a span table.
-pub fn compileTinyWithSpans(
-    allocator: std.mem.Allocator,
-    form: *const Tiny,
-    namespace: ?*vm.Namespace,
-    spanned: bool,
-    origin: ?reader_mod.SrcSpan,
-    source: ?*const vm.SourceInfo,
-    diag: ?*LowerDiag,
-) CompileError!Compiled {
+/// The top-level routine for `form`: its value in slot 0, returned.
+/// There is no enclosing `recur` target, so a top-level `(recur)`
+/// is `RecurOutsideTail`.
+fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOptions) CompileError!Compiled {
     var emitter = Emitter.init(allocator);
-    emitter.namespace = namespace;
-    emitter.spanned = spanned;
-    emitter.current_span = origin;
-    emitter.source = source;
-    emitter.diag = diag;
+    emitter.namespace = opts.namespace;
+    emitter.spanned = opts.spanned;
+    emitter.current_span = opts.origin;
+    emitter.source = opts.source;
+    emitter.diag = opts.diag;
     errdefer emitter.deinit();
-
-    // Top-level form compiles into slot 0; routine returns slot 0.
-    // Top-level position has NO enclosing loop/fn → recur_target is null.
-    // A top-level `(recur)` correctly raises RecurOutsideTail.
     const dst = try emitter.allocSlot();
     try compileExpr(&emitter, form, dst, null);
     try emitter.emit(vm.asm_.returnSlot(dst));
-
     var compiled = try emitter.finish();
-    compiled.origin = if (origin) |o| toSourceSpan(o) else null;
+    compiled.origin = if (opts.origin) |o| toSourceSpan(o) else null;
     return compiled;
 }
 
@@ -1101,7 +1084,7 @@ pub fn compileTinyWithSpans(
 //
 // `lowerForm` converts a `reader.Form` tree into a `Tiny` IR tree on the
 // passed allocator. The Tiny tree is then compiled via the backend
-// (`compileTinyWithNamespace`), so the entire codegen pipeline
+// (`emitRoutine`), so the entire codegen pipeline
 // (RecurTarget threading, variadic rest, Var fall-through, etc.) runs
 // on the one Tiny path. Lowering also marks every binding a closure
 // captures (`LowerEnv`).
@@ -1115,8 +1098,8 @@ pub fn compileTinyWithSpans(
 
 /// Allocate and initialize a Tiny node on the given allocator.
 /// Used by `lowerForm` to build the IR tree. The arena passed to
-/// `compileForm`/`compileSource` owns these allocations. Every node
-/// is a `TinyNode` so `lowerFormEnv` can attach the Form's span.
+/// `compileFormWith` / `compileSourceWith` owns these allocations. Every node
+/// is a `TinyNode` so `lowerForm` can attach the Form's span.
 fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
     const node = try allocator.create(TinyNode);
     node.* = .{ .tiny = value };
@@ -1129,7 +1112,7 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
 /// pointers); copied by value at each level — child contexts
 /// override `env` while inheriting `interner`.
 ///
-/// Why a bundle: every helper that recurses into `lowerFormEnv`
+/// Why a bundle: every helper that recurses into `lowerForm`
 /// needs to pass BOTH. Threading two parallel parameters through
 /// ~15 helpers is mechanical churn that this struct collapses to
 /// one parameter.
@@ -1340,29 +1323,15 @@ fn namesCore(ctx: LowerCtx, name: []const u8) bool {
     return !declared.contains(name);
 }
 
-/// Translate a `reader.Form` tree into a `Tiny` IR tree on the
-/// passed allocator. Public entry; passes a null `LowerEnv` so
-/// top-level forms see no lexical bindings (correct — the
-/// top-level operator-position is the outermost scope). Internal
-/// recursion goes through `lowerFormEnv` which threads the env.
-///
-/// Symbol names are NOT duped — they're borrowed from the
-/// reader's source string. The caller must keep that source
-/// alive for the lifetime of the Compiled artifact.
-pub fn lowerForm(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-) CompileError!*Tiny {
-    return lowerFormEnv(allocator, form, .{});
-}
-
-/// `lowerForm` with the lexical environment threaded through
-/// `ctx`. The env is consulted only when classifying list-head
+/// Translate a `reader.Form` into a `Tiny` node on `allocator`,
+/// with the lexical environment threaded through `ctx`. Symbol
+/// names are borrowed from the reader's source, which must outlive
+/// the compiled routine. The env is consulted only when classifying list-head
 /// symbols as intrinsics vs ordinary calls. Recursion into
 /// sub-expressions passes the env through unchanged; binding
 /// forms (let*, fn*, loop*, letfn*) construct a child env that
 /// adds their bindings.
-fn lowerFormEnv(
+fn lowerForm(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
     ctx: LowerCtx,
@@ -1533,7 +1502,7 @@ fn lowerDo(
 ) CompileError!*Tiny {
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
-        exprs[i] = try lowerFormEnv(allocator, item, ctx);
+        exprs[i] = try lowerForm(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .do_ = exprs });
 }
@@ -1546,10 +1515,10 @@ fn lowerIf(
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 2 and args.len != 3) return CompileError.MalformedForm;
-    const test_ = try lowerFormEnv(allocator, args[0], ctx);
-    const then = try lowerFormEnv(allocator, args[1], ctx);
+    const test_ = try lowerForm(allocator, args[0], ctx);
+    const then = try lowerForm(allocator, args[1], ctx);
     const else_: ?*const Tiny = if (args.len == 3)
-        try lowerFormEnv(allocator, args[2], ctx)
+        try lowerForm(allocator, args[2], ctx)
     else
         null;
     return try allocTiny(allocator, .{ .if_ = .{
@@ -1585,7 +1554,7 @@ fn lowerColl(
     if (op == .map and forms.len % 2 != 0) return CompileError.MalformedForm;
     const items = try allocator.alloc(*const Tiny, forms.len);
     for (forms, items) |form, *item| {
-        item.* = if (quoted) try lowerQuotePayload(allocator, form, ctx) else try lowerFormEnv(allocator, form, ctx);
+        item.* = if (quoted) try lowerQuotePayload(allocator, form, ctx) else try lowerForm(allocator, form, ctx);
     }
     if (try constantColl(allocator, op, items, ctx)) |v| return try allocTiny(allocator, .{ .literal = v });
     return try allocTiny(allocator, .{ .coll = .{ .op = op, .items = items } });
@@ -1746,11 +1715,11 @@ fn lowerPrim(
     const in = for (inlined_ops) |in| {
         if (in.argc == args.len and std.mem.eql(u8, in.name, name)) break in;
     } else return null;
-    const lhs = try lowerFormEnv(allocator, args[0], ctx);
+    const lhs = try lowerForm(allocator, args[0], ctx);
     const rhs: ?*const Tiny = if (in.one)
         try allocTiny(allocator, .{ .int = 1 })
     else if (args.len == 2)
-        try lowerFormEnv(allocator, args[1], ctx)
+        try lowerForm(allocator, args[1], ctx)
     else
         null;
     return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs } });
@@ -1764,10 +1733,10 @@ fn lowerCall(
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     std.debug.assert(items.len >= 1);
-    const callee = try lowerFormEnv(allocator, items[0], ctx);
+    const callee = try lowerForm(allocator, items[0], ctx);
     const args = try allocator.alloc(*const Tiny, items.len - 1);
     for (items[1..], 0..) |item, i| {
-        args[i] = try lowerFormEnv(allocator, item, ctx);
+        args[i] = try lowerForm(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .call = .{ .callee = callee, .args = args } });
 }
@@ -1794,10 +1763,10 @@ fn lowerBody(
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (body_items.len == 0) return try allocTiny(allocator, .nil);
-    if (body_items.len == 1) return try lowerFormEnv(allocator, body_items[0], ctx);
+    if (body_items.len == 1) return try lowerForm(allocator, body_items[0], ctx);
     const exprs = try allocator.alloc(*const Tiny, body_items.len);
     for (body_items, 0..) |item, i| {
-        exprs[i] = try lowerFormEnv(allocator, item, ctx);
+        exprs[i] = try lowerForm(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .do_ = exprs });
 }
@@ -1882,7 +1851,7 @@ fn lowerScope(
     for (bindings, 0..) |*b, i| {
         b.* = .{
             .name = try expectUnqualifiedSymbol(binding_vec[i * 2]),
-            .value = try lowerFormEnv(allocator, binding_vec[i * 2 + 1], ctx.withEnv(&local)),
+            .value = try lowerForm(allocator, binding_vec[i * 2 + 1], ctx.withEnv(&local)),
         };
         try local.bind(allocator, b.name, &b.captured);
     }
@@ -1899,7 +1868,7 @@ fn lowerRecur(
 ) CompileError!*Tiny {
     const recur_args = try allocator.alloc(*const Tiny, args.len);
     for (args, 0..) |item, i| {
-        recur_args[i] = try lowerFormEnv(allocator, item, ctx);
+        recur_args[i] = try lowerForm(allocator, item, ctx);
     }
     return try allocTiny(allocator, .{ .recur = .{ .args = recur_args } });
 }
@@ -2020,7 +1989,7 @@ fn lowerDef(
     if (args.len != 1 and args.len != 2) return CompileError.MalformedForm;
     const name = try expectUnqualifiedSymbol(args[0]);
     const value: ?*const Tiny = if (args.len == 2)
-        try lowerFormEnv(allocator, args[1], ctx)
+        try lowerForm(allocator, args[1], ctx)
     else
         null;
     return try allocTiny(allocator, .{ .def = .{ .name = name, .value = value } });
@@ -2143,30 +2112,8 @@ fn lowerThrow(
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
-    const value = try lowerFormEnv(allocator, args[0], ctx);
+    const value = try lowerForm(allocator, args[0], ctx);
     return try allocTiny(allocator, .{ .throw_ = value });
-}
-
-/// Compile a `reader.Form` tree into a `Compiled` artifact, no
-/// namespace. Equivalent to `compileTiny(allocator, lowerForm(form))`.
-/// Symbols that don't resolve lexically raise `UnresolvedSymbol`
-/// (no Var fall-through without a namespace).
-pub fn compileForm(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-) CompileError!Compiled {
-    return compileFormWithNamespace(allocator, form, null);
-}
-
-/// Compile a `reader.Form` tree into a `Compiled` artifact, with
-/// namespace access for `def` / `(var x)` / symbol fall-through.
-/// Equivalent to `compileTinyWithNamespace(allocator, lowerForm(form), ns)`.
-pub fn compileFormWithNamespace(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-) CompileError!Compiled {
-    return compileFormFull(allocator, form, namespace, null);
 }
 
 /// user_data for the
@@ -2204,19 +2151,14 @@ fn compileEvalCallback(
     out_vm: *vm.VM,
 ) anyerror!value_mod.Value {
     const data: *CompileEvalData = @ptrCast(@alignCast(user_data));
-    var dummy_span: ?reader_mod.SrcSpan = null;
     // Compile into the PERSISTENT allocator (typically the
     // user VM's runtime_arena). The macro fn's Closure +
     // Routine + capture_descs all live there and outlive
     // any per-form compile arena.
-    const compiled = try compileFormFullWithMacrosSpan(
-        data.persistent_allocator,
-        form,
-        data.namespace,
-        data.interner,
-        null,
-        &dummy_span,
-    );
+    const compiled = try compileFormWith(data.persistent_allocator, form, .{
+        .namespace = data.namespace,
+        .interner = data.interner,
+    });
     const routine_storage = try data.persistent_allocator.create(vm.Routine);
     routine_storage.* = compiled.toRoutine("defmacro-eval");
     out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
@@ -2371,144 +2313,8 @@ pub const RuntimeHooks = struct {
     }
 };
 
-/// Full form-compile with both namespace AND interner.
-/// Without an Interner, quoted symbols/keywords raise
-/// `UnsupportedFeature`. With one (typically `VM.ensureInterner()`),
-/// `(quote foo)` / `'foo` / `(quote :bar)` / `':bar` all work
-/// end-to-end and produce stable interned symbol/keyword Values.
-///
-/// Lifetime: the returned Compiled holds Values that reference
-/// the Interner's name storage. The Interner must outlive the
-/// Compiled + any VM that runs it (typically by living on the
-/// VM itself).
-pub fn compileFormFull(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-) CompileError!Compiled {
-    return compileFormFullWithMacros(allocator, form, namespace, interner, null);
-}
-
-/// Full form-compile with optional macroexpansion.
-///
-/// If `host_macros` is non-null AND `interner` is non-null,
-/// the form is run through the macroexpander BEFORE lowering.
-/// Macro errors are bucketed per `ExpandError`:
-///   ExpansionDepthExceeded → CompileError.MacroDepthExceeded
-///   RequiredFileFailed / ControlTransferred → the same names
-///   everything else        → CompileError.MacroExpansionFailure
-///
-/// Without either, behavior is identical to `compileFormFull`
-/// (no expansion). The `host_macros` table can be empty, in
-/// which case the expander walks the tree but never fires a
-/// macro — still slightly more expensive than null, but
-/// useful for testing the scaffold.
-pub fn compileFormFullWithMacros(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-) CompileError!Compiled {
-    return compileFormFullWithMacrosSpan(allocator, form, namespace, interner, host_macros, null);
-}
-
-/// Variant of `compileFormFullWithMacros` that surfaces the
-/// source span associated with any error raised. `out_span`,
-/// when non-null, is written with the span of the last Form
-/// walked before the error (a best-effort pointer, not a
-/// per-variant span). Callers ignoring spans pass null.
-pub fn compileFormFullWithMacrosSpan(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-) CompileError!Compiled {
-    return compileFormFullWithMacrosSpanPersistent(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        null,
-    );
-}
-
-/// Variant that accepts a `persistent_allocator`
-/// for defmacro Closure storage. When non-null, the synthetic
-/// `(def name (fn* ...))` form produced by `defmacro` is
-/// compiled into this allocator, so the resulting macro fn
-/// Closure outlives the per-form compile arena.
-///
-/// CLI's REPL passes `vm.runtime_arena.allocator()` so
-/// defmacros defined in one REPL line are usable in
-/// subsequent lines. The file runner also passes a persistent
-/// arena (runFile shares one arena across the file).
-///
-/// If null, defmacro Closures use the regular `allocator`
-/// (the per-form arena). That's fine when ALL macro uses
-/// fall within the same arena lifetime (e.g., one-shot
-/// source compilation).
-///
-/// `registry` (optional) enables `(ns NAME)` expansion to
-/// switch the current namespace. If null, `(ns ...)` is a hard
-/// error.
-pub fn compileFormFullWithMacrosSpanPersistent(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-) CompileError!Compiled {
-    return compileFormFullWithMacrosSpanPersistentRegistry(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        null,
-    );
-}
-
-/// Same as `compileFormFullWithMacrosSpanPersistent`
-/// but also accepts a `*NamespaceRegistry` for `(ns NAME)`
-/// expansion support.
-pub fn compileFormFullWithMacrosSpanPersistentRegistry(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-) CompileError!Compiled {
-    return compileFormFullWithMacrosSpanPersistentRegistryLoader(
-        allocator,
-        form,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        registry,
-        null,
-        null,
-    );
-}
-
 /// Everything a full compile may be given beyond the form and its
-/// allocator. Every field is optional; the short-name entry points
-/// (`compileForm`, `compileFormFull`, ...) are spellings of
-/// particular subsets.
+/// allocator. Every field is optional.
 pub const CompileOptions = struct {
     /// Namespace for `def`, `(var x)` and symbol fall-through.
     /// Without one, symbols must resolve lexically.
@@ -2626,153 +2432,23 @@ pub fn compileFormWith(
         .declared = declared,
         .diag = &diag,
     };
-    const tiny = lowerFormEnv(allocator, working_form, ctx) catch |err| {
+    const tiny = lowerForm(allocator, working_form, ctx) catch |err| {
         // An error that located itself reports that span; the
         // rest carry the macroexpanded form's span.
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
         return err;
     };
     diag.span = null;
-    return compileTinyWithSpans(allocator, tiny, namespace, true, working_form.origin, opts.source, &diag) catch |err| {
+    return emitRoutine(allocator, tiny, .{
+        .namespace = namespace,
+        .spanned = true,
+        .origin = working_form.origin,
+        .source = opts.source,
+        .diag = &diag,
+    }) catch |err| {
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
         return err;
     };
-}
-
-/// `compileFormWith` with every option positional.
-pub fn compileFormFullWithMacrosSpanPersistentRegistryLoader(
-    allocator: std.mem.Allocator,
-    form: *const reader_mod.Form,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-    load_callback: ?expand_mod.LoadCallback,
-    declared: ?*DeclaredNames,
-) CompileError!Compiled {
-    return compileFormWith(allocator, form, .{
-        .namespace = namespace,
-        .interner = interner,
-        .host_macros = host_macros,
-        .out_span = out_span,
-        .persistent_allocator = persistent_allocator,
-        .registry = registry,
-        .load_callback = load_callback,
-        .declared = declared,
-    });
-}
-
-/// End-to-end: parse + read + lower + compile a source string.
-/// Convenience wrapper around `parser.parseForm` + `Reader.readOneForm`
-/// + `compileFormWithNamespace`. No namespace; symbols must
-/// resolve lexically.
-pub fn compileSource(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-) CompileError!Compiled {
-    return compileSourceWithNamespace(allocator, source, null);
-}
-
-/// End-to-end with namespace access for `def` / `(var x)` /
-/// symbol fall-through.
-///
-/// Lifetime: the returned `Compiled` references strings borrowed
-/// from `source` (via Tiny.symbol → routine.var_table[*].name).
-/// The caller MUST keep `source` alive for the lifetime of the
-/// `Compiled` artifact and any VM that runs it. Tests typically
-/// achieve this by storing source as a string literal (program
-/// lifetime) or by holding it in the same arena as the
-/// `Compiled`.
-///
-/// Reader/parser errors are bucketed as `CompileError.ReaderFailure`;
-/// the `*Span` entry points surface a SrcSpan alongside the error.
-pub fn compileSourceWithNamespace(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-) CompileError!Compiled {
-    return compileSourceFull(allocator, source, namespace, null);
-}
-
-/// End-to-end source compile with namespace AND interner.
-/// Pass `VM.ensureInterner()` to enable quoted-symbol / quoted-
-/// keyword support via real source syntax.
-pub fn compileSourceFull(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-) CompileError!Compiled {
-    return compileSourceFullWithMacros(allocator, source, namespace, interner, null);
-}
-
-/// End-to-end source compile with optional macroexpansion.
-/// See `compileFormFullWithMacros` for macro semantics.
-pub fn compileSourceFullWithMacros(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-) CompileError!Compiled {
-    return compileSourceFullWithMacrosSpan(
-        allocator,
-        source,
-        namespace,
-        interner,
-        host_macros,
-        null,
-    );
-}
-
-/// End-to-end source compile with span surfacing.
-/// Mirrors `compileFormFullWithMacrosSpan`. Reader errors set
-/// span to `null` (the reader's own error machinery owns that
-/// surface — see `reader.readOneForm`'s ErrorKind for spans
-/// from the reader layer).
-pub fn compileSourceFullWithMacrosSpan(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-) CompileError!Compiled {
-    return compileSourceFullWithMacrosSpanPersistent(
-        allocator,
-        source,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        null,
-    );
-}
-
-/// Source-string entry with `persistent_allocator`.
-/// Callers that want defmacros to survive beyond the per-form
-/// arena (REPL, file runner) pass `vm.runtime_arena.allocator()`.
-pub fn compileSourceFullWithMacrosSpanPersistent(
-    allocator: std.mem.Allocator,
-    source: []const u8,
-    namespace: ?*vm.Namespace,
-    interner: ?*intern_mod.Interner,
-    host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-) CompileError!Compiled {
-    return compileSourceFullWithMacrosSpanPersistentRegistry(
-        allocator,
-        source,
-        namespace,
-        interner,
-        host_macros,
-        out_span,
-        persistent_allocator,
-        null,
-    );
 }
 
 /// Parse and read one form from `source`, then `compileFormWith`.
@@ -2792,35 +2468,31 @@ pub fn compileSourceWith(
     return compileFormWith(allocator, form, opts);
 }
 
-/// `compileSourceWith` with every option positional.
-pub fn compileSourceFullWithMacrosSpanPersistentRegistryLoader(
+/// `compileSourceWith` with a namespace and an interner; bench/main.zig
+/// compiles its programs this way.
+pub fn compileSourceFull(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    namespace: ?*vm.Namespace,
+    interner: ?*intern_mod.Interner,
+) CompileError!Compiled {
+    return compileSourceWith(allocator, source, .{ .namespace = namespace, .interner = interner });
+}
+
+/// `compileSourceWith` with a macro table; the eval pipeline tests
+/// compile a source string this way.
+pub fn compileSourceFullWithMacros(
     allocator: std.mem.Allocator,
     source: []const u8,
     namespace: ?*vm.Namespace,
     interner: ?*intern_mod.Interner,
     host_macros: ?*const expand_mod.HostMacroTable,
-    out_span: ?*?reader_mod.SrcSpan,
-    persistent_allocator: ?std.mem.Allocator,
-    registry: ?*vm.NamespaceRegistry,
-    load_callback: ?expand_mod.LoadCallback,
-    declared: ?*DeclaredNames,
 ) CompileError!Compiled {
-    return compileSourceWith(allocator, source, .{
-        .namespace = namespace,
-        .interner = interner,
-        .host_macros = host_macros,
-        .out_span = out_span,
-        .persistent_allocator = persistent_allocator,
-        .registry = registry,
-        .load_callback = load_callback,
-        .declared = declared,
-    });
+    return compileSourceWith(allocator, source, .{ .namespace = namespace, .interner = interner, .host_macros = host_macros });
 }
 
-/// Source-string entry with both persistent
-/// allocator AND namespace registry. CLI's REPL + runFile call
-/// this so `(ns NAME)` switches affect subsequent forms in the
-/// session/file.
+/// `compileSourceWith` with every option the eval pipeline tests
+/// pass positionally.
 pub fn compileSourceFullWithMacrosSpanPersistentRegistry(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -3088,8 +2760,7 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
 /// the Var's root and write the Var object into `dst`.
 ///
 /// Without a Namespace (`e.namespace == null`), `def` raises
-/// `UnresolvedSymbol`. Tests that exercise `def` must pass
-/// a Namespace to `compileTinyWithNamespace`.
+/// `UnresolvedSymbol`.
 ///
 /// `(def x)` (no value) is a forward-declaration: intern the
 /// Var, but don't emit any store-var. `dst` gets the Var

@@ -55,7 +55,7 @@ here.
 - No bytecode cache and no object file: nothing writes or reads
   `.nx.o`. Every run compiles from source.
 - No separate resolver or analyzer module; classification and
-  capture analysis happen inside `lowerForm` and the `Emitter`.
+  capture marking happen inside `lowerForm`.
 - No register allocation beyond a stack of slots: a slot is
   freed when the form that allocated it is compiled (§4.4).
 - No profile-guided optimization, inline caches or
@@ -975,24 +975,33 @@ Three layers:
 
 ### 10. Compilation entry points
 
-The public surface of `src/compile.zig`, from lowest to highest:
+The public surface of `src/compile.zig`:
 
-- `compileTiny` / `compileTinyWithNamespace` — `Tiny` → routine.
-- `lowerForm` — `Form` → `Tiny`.
-- `compileForm*` / `compileSource*` — Form or source bytes →
-  routine, in variants that add a namespace, an interner, a macro
-  table, an error span, a persistent allocator, a namespace
-  registry and a loader. `compileFormWith(options)` /
-  `compileSourceWith(options)` take all of these as one
-  `CompileOptions` record and are what the CLI uses.
+- `compileFormWith(allocator, form, options)` — macroexpand, lower
+  and emit one Form into a `Compiled` routine; `CompileOptions`
+  carries the namespace, interner, host macro table, error-span
+  out-parameter, persistent allocator (for `defmacro` closures),
+  namespace registry, loader, declared names and source. The CLI,
+  the loader and `eval` compile through it.
+- `compileSourceWith(allocator, source, options)` — parse and read
+  the first form of `source` (`parser.parseForm` +
+  `Reader.readOneForm`), then `compileFormWith`.
+- `compileTiny(allocator, tiny)` — a hand-built `Tiny` tree, with
+  no namespace and no span table.
 - `DeclaredNames` — the top-level names of a file or REPL line,
   collected before any of its forms compile (§4.3 rule #7).
+- `RuntimeHooks` — the compiler as `macroexpand-1`, `read-string`
+  and `eval` reach it at run time.
 
-`compileSource` runs `parser.parseForm` + `Reader.readOneForm` +
-expansion + `lowerForm` + the `Emitter`; the CLI's file runner
-parses all top-level forms first (`parser.parseProgram` +
-`Reader.readProgram`), then compiles and runs each in turn, sharing
-the VM's namespace, interner and macro table.
+`compileSourceFull`, `compileSourceFullWithMacros` and
+`compileSourceFullWithMacrosSpanPersistentRegistry` are positional
+spellings of `compileSourceWith` for `bench/main.zig` and the eval
+pipeline tests.
+
+The CLI's file runner parses all top-level forms first
+(`parser.parseProgram` + `Reader.readProgram`), then compiles and
+runs each in turn, sharing the VM's namespace, interner and macro
+table.
 
 ---
 
