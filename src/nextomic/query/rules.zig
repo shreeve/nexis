@@ -261,11 +261,10 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         v.* = switch (a) {
             .variable => |x| x,
             .constant => |c| blk: {
-                const fresh = try ctx.freshVar(try ctx.interner.internSymbol("?const"));
-                const call: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try ctx.arena.dupe(ir.Arg, &.{.{ .constant = c }}) };
-                try steps.append(ctx.arena, .{ .bind = .{ .call = call, .out = .{ .scalar = fresh }, .fresh = try ctx.arena.dupe(Var, &.{fresh}) } });
-                try bound.append(ctx.arena, fresh);
-                break :blk fresh;
+                const g = try groundConst(ctx, c);
+                try steps.append(ctx.arena, .{ .bind = .{ .call = g.bind.call, .out = g.bind.out, .fresh = try ctx.arena.dupe(Var, &.{g.bind.out.scalar}) } });
+                try bound.append(ctx.arena, g.bind.out.scalar);
+                break :blk g.bind.out.scalar;
             },
             .src => return ctx.syntax("$ cannot be a rule argument"),
         };
@@ -292,6 +291,14 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         try steps.append(ctx.arena, .{ .fix = fix });
     }
     rows.* = std.math.mul(u64, rows.*, body_cost) catch std.math.maxInt(u64) / 4;
+}
+
+/// `[(ground c) ?const]` over a fresh variable: a constant rule
+/// argument, grounded so that every argument is a variable.
+fn groundConst(ctx: *Ctx, c: ir.Cell) !Clause {
+    const fresh = try ctx.freshVar(try ctx.interner.internSymbol("?const"));
+    const call: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try ctx.arena.dupe(ir.Arg, &.{.{ .constant = c }}) };
+    return .{ .bind = .{ .call = call, .out = .{ .scalar = fresh } } };
 }
 
 pub const CallSite = struct {
@@ -498,10 +505,9 @@ const Renamer = struct {
                         for (renamed, svars) |a, *sv| sv.* = switch (a) {
                             .variable => |pv| pv,
                             .constant => |cell| blk: {
-                                const fresh = try self.ctx.freshVar(try self.ctx.interner.internSymbol("?const"));
-                                const g: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try arena.dupe(ir.Arg, &.{.{ .constant = cell }}) };
-                                try out.append(arena, .{ .bind = .{ .call = g, .out = .{ .scalar = fresh } } });
-                                break :blk fresh;
+                                const g = try groundConst(self.ctx, cell);
+                                try out.append(arena, g);
+                                break :blk g.bind.out.scalar;
                             },
                             .src => return self.ctx.syntax("$ cannot be a rule argument"),
                         };

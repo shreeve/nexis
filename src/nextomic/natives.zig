@@ -545,7 +545,7 @@ const fnTransact = wrap(transactNative);
 
 /// Runs `:db.fn/call` forms (NEXTOMIC.md §3 "Transaction functions"):
 /// a symbol resolves as a query function does (`query/natives.zig`
-/// `Hook.resolve`), and the function is called through `vm.callValue`
+/// `lookup`), and the function is called through `vm.callValue`
 /// with the boxed `db-before` ahead of the form's arguments. Whatever it
 /// throws propagates through the transaction, which aborts.
 const TxHook = struct {
@@ -570,8 +570,7 @@ const TxHook = struct {
     fn call(ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value {
         const self: *TxHook = @ptrCast(@alignCast(ctx));
         const vm = self.vm;
-        var resolver = query_natives.Hook{ .vm = vm, .scope = self.scope };
-        const callee = if (f.kind() == .symbol) (try resolver.lookup(f.asSymbolId())) orelse {
+        const callee = if (f.kind() == .symbol) (try query_natives.lookup(vm, f.asSymbolId())) orelse {
             const name = vm.ensureInterner().symbolName(f.asSymbolId());
             const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
             defer vm.allocator.free(message);

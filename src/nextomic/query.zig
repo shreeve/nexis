@@ -137,44 +137,55 @@ const Sources = struct {
     }
 };
 
+/// A query parsed, its sources open and its plan made: what `q` runs
+/// and `explain` prints. Initialised in place, since the plan context
+/// holds the arena's allocator.
+const Prepared = struct {
+    parsed: Parsed,
+    arena_state: std.heap.ArenaAllocator,
+    sources: Sources,
+    ctx: plan.Ctx,
+    plan: *plan.Plan,
+
+    fn init(self: *Prepared, gpa: Allocator, interner: *Interner, query: Value, db: ?DbValue, args: []const Value, diag: *Diag, options: Options) !void {
+        self.parsed = try parseAll(gpa, interner, query, args, diag, options);
+        errdefer self.parsed.deinit();
+        self.arena_state = std.heap.ArenaAllocator.init(gpa);
+        errdefer self.arena_state.deinit();
+        const arena = self.arena_state.allocator();
+        self.sources = try Sources.open(arena, db, self.parsed.query, args, options, diag);
+        errdefer self.sources.close();
+        self.ctx = try plan.Ctx.init(arena, self.sources.items, interner, self.parsed.query, self.parsed.rules, diag);
+        self.plan = try plan.plan(&self.ctx, self.parsed.query);
+    }
+
+    fn deinit(self: *Prepared) void {
+        self.sources.close();
+        self.arena_state.deinit();
+        self.parsed.deinit();
+    }
+};
+
 /// Run `query` with `args` positional to its `:in`: a source position
-/// carries a db value, the `%` position the rules. `db`, when given,
-/// is `$` in place of its input. The result lives in `heap`.
+/// carries a db value or a collection, the `%` position the rules.
+/// `db`, when given, is `$` in place of its input. The result lives in
+/// `heap`.
 pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?DbValue, args: []const Value, diag: *Diag, options: Options) anyerror!Value {
-    var parsed = try parseAll(gpa, interner, query, args, diag, options);
-    defer parsed.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const sources = try Sources.open(arena, db, parsed.query, args, options, diag);
-    defer sources.close();
-
-    var ctx = try plan.Ctx.init(arena, sources.items, interner, parsed.query, parsed.rules, diag);
-    const p = try plan.plan(&ctx, parsed.query);
-    var ex = exec.Exec{ .arena = arena, .sources = sources.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
-    const input = try ex.inputRelation(parsed.query, args);
-    const rel = try ex.runPlan(p, input);
-    const rows = try ex.findRows(parsed.query, rel);
-    return ex.materialise(parsed.query, rows);
+    var pr: Prepared = undefined;
+    try pr.init(gpa, interner, query, db, args, diag, options);
+    defer pr.deinit();
+    const parsed = pr.parsed.query;
+    var ex = exec.Exec{ .arena = pr.arena_state.allocator(), .sources = pr.sources.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
+    const rel = try ex.runPlan(pr.plan, try ex.inputRelation(parsed, args));
+    return ex.materialise(parsed, try ex.findRows(parsed, rel));
 }
 
-/// Print the plan of `query` against `db` to `w`.
+/// Print the plan `q` would run to `w`.
 pub fn explain(gpa: Allocator, interner: *Interner, query: Value, db: ?DbValue, args: []const Value, diag: *Diag, options: Options, w: *std.Io.Writer) anyerror!void {
-    var parsed = try parseAll(gpa, interner, query, args, diag, options);
-    defer parsed.deinit();
-
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const sources = try Sources.open(arena, db, parsed.query, args, options, diag);
-    defer sources.close();
-
-    var ctx = try plan.Ctx.init(arena, sources.items, interner, parsed.query, parsed.rules, diag);
-    const p = try plan.plan(&ctx, parsed.query);
-    try plan.explain(p, &ctx, w);
+    var pr: Prepared = undefined;
+    try pr.init(gpa, interner, query, db, args, diag, options);
+    defer pr.deinit();
+    try plan.explain(pr.plan, &pr.ctx, w);
 }
 
 test {

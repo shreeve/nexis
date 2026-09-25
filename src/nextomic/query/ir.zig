@@ -296,6 +296,8 @@ pub const Ir = struct {
     keys: ?Keys = null,
     with: []const Var,
     in: []const InBinding,
+    /// The variables `in` binds, in order.
+    in_vars: []const Var = &.{},
     /// VM symbol ids of the sources, by `Src`; the first is what `$`
     /// names.
     sources: []const u32,

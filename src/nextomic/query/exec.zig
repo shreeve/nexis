@@ -708,8 +708,6 @@ pub const Exec = struct {
 
     // ── inputs ────────────────────────────────────────────────────
 
-    /// The relation the `:in` bindings describe over `args`, which are
-    /// positional with `in` (the `$` and `%` positions are ignored).
     /// The relation the `:in` bindings of `q` make of `args`, one per
     /// binding. A lookup ref or an ident bound to a variable in an
     /// entity position, or in the value position of a ref attribute,
@@ -735,13 +733,13 @@ pub const Exec = struct {
                     break :blk try r.dedup();
                 },
                 .tuple => |ts| blk: {
-                    var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
+                    var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
                     if (try fillTuple(&r, ts, try self.valueCells(a), row, 0)) try r.append(row);
                     break :blk r;
                 },
                 .relation => |ts| blk: {
-                    var r = try Relation.init(self.arena, try tupleVars(self.arena, ts));
+                    var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
                     for ((try self.seqElems(a)) orelse return error.ValueType) |x| {
                         if (try fillTuple(&r, ts, try self.valueCells(x), row, 0)) try r.append(row);
@@ -825,12 +823,6 @@ pub const Exec = struct {
             if (self.diag) |d| d.* = .{ .message = fault.message orelse "unknown attribute", .attr = fault.attr };
             return err;
         };
-    }
-
-    fn tupleVars(arena: Allocator, ts: []const ?Var) ![]Var {
-        var out: std.ArrayList(Var) = .empty;
-        for (ts) |t| if (t) |v| try out.append(arena, v);
-        return out.toOwnedSlice(arena);
     }
 
     // ── find ──────────────────────────────────────────────────────

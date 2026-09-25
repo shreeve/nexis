@@ -631,12 +631,6 @@ pub const Accumulator = struct {
         try self.rel.dropLast();
         return false;
     }
-
-    /// Does the set hold an equal row to row `row` of `other` (over
-    /// the same variables in the same order)?
-    pub fn contains(self: *Accumulator, other: *const Relation, row: usize) bool {
-        return self.set.contains(other, row, other.rowHash(row));
-    }
 };
 
 // =============================================================================

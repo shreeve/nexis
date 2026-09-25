@@ -361,15 +361,7 @@ pub const Ctx = struct {
 /// Plan `query` for `read`. The returned plan starts from the relation
 /// over the `:in` variables.
 pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
-    var bound: std.ArrayList(Var) = .empty;
-    for (query.in) |b| switch (b) {
-        .scalar, .collection => |v| try ir.addVar(ctx.arena, &bound, v),
-        .tuple, .relation => |ts| for (ts) |t| {
-            if (t) |v| try ir.addVar(ctx.arena, &bound, v);
-        },
-        .src, .rules => {},
-    };
-    return planSub(ctx, query.where, bound.items, 1);
+    return planSub(ctx, query.where, query.in_vars, 1);
 }
 
 /// Plan `clauses` starting from a relation over `input`.

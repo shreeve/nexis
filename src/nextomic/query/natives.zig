@@ -129,7 +129,7 @@ fn throwSyntax(vm: *VM, message: []const u8, clause: ?usize) VmError {
 // The call hook
 // =============================================================================
 
-pub const Hook = struct {
+const Hook = struct {
     vm: *VM,
     /// Roots every result a callback returns for the query's life.
     scope: vm_mod.RootScope,
@@ -172,38 +172,34 @@ pub const Hook = struct {
 
     /// The bound value the symbol names, or a thrown
     /// `:nextomic/query-syntax` naming what is missing.
-    pub fn resolve(self: *Hook, sym: u32) anyerror!Value {
-        return (try self.lookup(sym)) orelse self.unknown("unknown function", self.vm.ensureInterner().symbolName(sym));
-    }
-
-    /// The bound value the symbol names as the compiler resolves it: an
-    /// alias-qualified `ns/name` to that namespace's own var, a bare
-    /// name in the current namespace and then its auto-referred
-    /// parents; null when nothing is bound.
-    pub fn lookup(self: *Hook, sym: u32) !?Value {
+    fn resolve(self: *Hook, sym: u32) anyerror!Value {
         const vm = self.vm;
-        const name = vm.ensureInterner().symbolName(sym);
-        const registry = try vm.ensureRegistry();
-        const current = registry.current;
-        const found: ?*Var = blk: {
-            if (splitQualified(name)) |q| {
-                const ns_name = if (current.aliases_initialized) current.lookupAlias(q.ns) orelse q.ns else q.ns;
-                const ns = registry.lookupNs(ns_name) orelse break :blk null;
-                break :blk ns.lookupLocal(q.name);
-            }
-            break :blk current.lookup(name);
-        };
-        if (found) |v| if (v.bound) return v.root;
-        return null;
-    }
-
-    fn unknown(self: *Hook, reason: []const u8, name: []const u8) anyerror!Value {
-        const vm = self.vm;
-        const message = try std.fmt.allocPrint(vm.allocator, "{s}: {s}", .{ reason, name });
+        if (try lookup(vm, sym)) |v| return v;
+        const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{vm.ensureInterner().symbolName(sym)});
         defer vm.allocator.free(message);
         return throwSyntax(vm, message, null);
     }
 };
+
+/// The bound value the symbol names as the compiler resolves it: an
+/// alias-qualified `ns/name` to that namespace's own var, a bare name
+/// in the current namespace and then its auto-referred parents; null
+/// when nothing is bound.
+pub fn lookup(vm: *VM, sym: u32) !?Value {
+    const name = vm.ensureInterner().symbolName(sym);
+    const registry = try vm.ensureRegistry();
+    const current = registry.current;
+    const found: ?*Var = blk: {
+        if (splitQualified(name)) |q| {
+            const ns_name = if (current.aliases_initialized) current.lookupAlias(q.ns) orelse q.ns else q.ns;
+            const ns = registry.lookupNs(ns_name) orelse break :blk null;
+            break :blk ns.lookupLocal(q.name);
+        }
+        break :blk current.lookup(name);
+    };
+    if (found) |v| if (v.bound) return v.root;
+    return null;
+}
 
 const Qualified = struct { ns: []const u8, name: []const u8 };
 

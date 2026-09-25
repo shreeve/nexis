@@ -425,11 +425,6 @@ const Puller = struct {
         };
     }
 
-    fn fail(self: *Puller, message: []const u8) error{PullSyntax} {
-        self.diag.* = .{ .message = message };
-        return error.PullSyntax;
-    }
-
     /// The eid of an entity argument: an eid, a lookup ref or an ident.
     /// The entity to pull: the `marshal` contract, where a reference
     /// that names nothing is `NoEntity`.

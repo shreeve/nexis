@@ -437,6 +437,7 @@ const Parser = struct {
             },
             .src, .rules => {},
         };
+        out.in_vars = try self.arena.dupe(Var, bound.items);
         try ir.boundVars(self.arena, out.where, &bound);
         self.clause_index = null;
         for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
