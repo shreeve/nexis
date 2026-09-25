@@ -893,7 +893,7 @@ from `slot[arg_base ..]`:
 | Var | Name | Semantics |
 |---|---|---|
 | 0 | `coll:list` | Build a list right-to-left via `cons` |
-| 1 | `coll:concat` | Each arg must be a list (`:kind-mismatch` otherwise); result is the left-to-right concatenation, built by collecting every element then consing right-to-left (no recursive append) |
+| 1 | `coll:concat` | Each arg is a seqable: nil, a list, a vector, a map (its `[k v]` entries) or a set (`:kind-mismatch` otherwise); result is the list of every element left to right, built by collecting the elements then consing right-to-left (no recursive append) |
 | 2 | `coll:vector` | `vector.fromSlice` over the range |
 | 3 | `coll:map` | Flat `k v k v ...` pairs (`argc` even); later duplicate keys overwrite earlier (Clojure semantics) |
 | 4 | `coll:set` | Set from the range; duplicates collapse |
@@ -1052,7 +1052,7 @@ handler is active):
 
 | Keyword | When |
 |---|---|
-| `:kind-mismatch` | An operand of the wrong kind: non-numeric to `math:*` / `cmp:*`, non-list to `coll:concat`, wrong kind to a native |
+| `:kind-mismatch` | An operand of the wrong kind: non-numeric to `math:*` / `cmp:*`, non-seqable to `coll:concat`, wrong kind to a native |
 | `:arity-mismatch` | `call:call` (or `callValue`) passes an argument count the callee does not accept |
 | `:not-callable` | `call:call` on a value that is not a function, native, protocol fn, keyword, symbol, map, set or vector |
 | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound by `def` |

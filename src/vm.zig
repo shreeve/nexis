@@ -3230,227 +3230,81 @@ pub const VM = struct {
     // instructions, VM.md §9), so partial results need no rooting
     // during construction.
 
+    /// `coll:<op> A=arg_base B=argc C=dst`: build a collection from
+    /// the `argc` values in `slot[A ..]` and store it in `slot[C]`.
+    /// `list` and `vector` keep the order, `map` takes flat key,
+    /// value pairs (a later duplicate key wins; an odd count is
+    /// corrupt bytecode), `set` drops duplicates, and `concat` joins
+    /// the elements of seqables (nil, list, vector, map entries,
+    /// set) into a list, so `~@` splices whatever a seq function
+    /// returns. The arguments are read as one slice of the stack:
+    /// `Heap.alloc` never touches `vm.stack`, so the slice outlives
+    /// every allocation here.
     fn execColl(self: *VM, inst: Inst) VmError!void {
         const variant: CollOp = @enumFromInt(inst.variant);
-        switch (variant) {
-            .list => try self.execCollList(inst),
-            .concat => try self.execCollConcat(inst),
-            .vector => try self.execCollVector(inst),
-            .map => try self.execCollMap(inst),
-            .set => try self.execCollSet(inst),
+        if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
+        const frame = self.currentFrame();
+        const argc: usize = inst.b.index;
+        if (inst.a.index + argc > frame.slot_count) return VmError.OperandOutOfRange;
+        const start = @as(usize, frame.base_slot) + inst.a.index;
+        if (start + argc > self.stack.items.len) return VmError.BytecodeCorruption;
+        const args = self.stack.items[start..][0..argc];
+        const heap = self.ensureHeap();
+        const hash = &dispatch_mod.hashValue;
+        const eql = &dispatch_mod.equal;
+        const result: Value = switch (variant) {
+            .list => list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
+            .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
+            .map => blk: {
+                if (argc % 2 != 0) return VmError.BytecodeCorruption;
+                var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+                var i: usize = 0;
+                while (i < argc) : (i += 2) m = champ_mod.mapAssoc(heap, m, args[i], args[i + 1], hash, eql) catch return VmError.OutOfMemory;
+                break :blk m;
+            },
+            .set => blk: {
+                var set = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
+                for (args) |v| set = champ_mod.setConj(heap, set, v, hash, eql) catch return VmError.OutOfMemory;
+                break :blk set;
+            },
+            .concat => blk: {
+                var elements: std.ArrayList(Value) = .empty;
+                defer elements.deinit(self.allocator);
+                for (args) |arg| self.appendSeqable(&elements, arg) catch |err| return switch (err) {
+                    error.KindMismatch => VmError.KindMismatch,
+                    else => VmError.OutOfMemory,
+                };
+                break :blk list_mod.fromSlice(heap, elements.items) catch return VmError.OutOfMemory;
+            },
             _ => return VmError.BytecodeCorruption,
-        }
+        };
+        (try self.slotPtrIn(frame, inst.c.index)).* = result;
     }
 
-    /// `coll:list A=arg_base B=argc C=dst` — read argc values
-    /// from `stack[arg_base .. arg_base+argc]` and build a list
-    /// right-to-left via `list_mod.cons`.
-    fn execCollList(self: *VM, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-        const arg_base: u12 = inst.a.index;
-        const argc: u12 = inst.b.index; // raw immediate (operand kind ignored)
-        const dst: u12 = inst.c.index;
-
-        // Validate the arg block is within the current frame's
-        // logical slot range. Catch malformed bytecode early.
-        const frame = self.currentFrame();
-        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
-        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
-
-        const heap = self.ensureHeap();
-        var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-        var i: usize = argc;
-        while (i > 0) {
-            i -= 1;
-            // slotPtr is read-only here; arg slots are within
-            // the same frame, so the pointer is valid for one
-            // step. We deref into a Value (16 bytes) immediately
-            // to avoid holding *Value across the cons call.
-            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-            const arg_val = (try self.slotPtr(arg_idx)).*;
-            result = list_mod.cons(heap, arg_val, result) catch return VmError.OutOfMemory;
+    /// Append the elements of the seqable `v` to `out`; a map
+    /// contributes `[k v]` entry vectors.
+    fn appendSeqable(self: *VM, out: *std.ArrayList(Value), v: Value) !void {
+        switch (v.kind()) {
+            .nil => {},
+            .list => {
+                var node = v;
+                while (node.kind() == .list and !list_mod.isEmpty(node)) : (node = list_mod.tail(node)) try out.append(self.allocator, list_mod.head(node));
+            },
+            .persistent_vector => {
+                const n = vector_mod.count(v);
+                try out.ensureUnusedCapacity(self.allocator, n);
+                for (0..n) |j| out.appendAssumeCapacity(vector_mod.nth(v, j));
+            },
+            .persistent_map => {
+                var it = champ_mod.mapIter(v);
+                while (it.next()) |e| try out.append(self.allocator, try vector_mod.fromSlice(self.ensureHeap(), &.{ e.key, e.value }));
+            },
+            .persistent_set => {
+                var it = champ_mod.setIter(v);
+                while (it.next()) |e| try out.append(self.allocator, e);
+            },
+            else => return error.KindMismatch,
         }
-        try self.store(.{ .kind = .slot, .index = dst }, result);
-    }
-
-    /// `coll:concat A=arg_base B=argc C=dst` — each arg is a
-    /// seqable (nil, list, vector, map, set); result is the list
-    /// of every element left to right, so `~@` in syntax-quote
-    /// splices whatever a seq function returns.
-    /// Strategy: traverse each input, collect elements into a
-    /// temp slice, then build the result right-to-left via cons.
-    /// Avoids recursive append on singly-linked lists.
-    fn execCollConcat(self: *VM, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-        const arg_base: u12 = inst.a.index;
-        const argc: u12 = inst.b.index;
-        const dst: u12 = inst.c.index;
-
-        const frame = self.currentFrame();
-        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
-        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
-
-        const heap = self.ensureHeap();
-
-        // First pass: collect every element from every list
-        // into a temp ArrayList. We need this because we
-        // don't know the total length upfront, and singly-
-        // linked lists can only be built efficiently right-
-        // to-left. Empty concat → empty list.
-        var elements = std.ArrayList(Value).empty;
-        defer elements.deinit(self.runtime_arena.allocator());
-
-        var i: usize = 0;
-        while (i < argc) : (i += 1) {
-            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-            const arg_val = (try self.slotPtr(arg_idx)).*;
-            const scratch = self.runtime_arena.allocator();
-            switch (arg_val.kind()) {
-                .nil => {},
-                .list => {
-                    var node = arg_val;
-                    while (node.kind() == .list and !list_mod.isEmpty(node)) {
-                        try elements.append(scratch, list_mod.head(node));
-                        node = list_mod.tail(node);
-                    }
-                },
-                .persistent_vector => {
-                    const n = vector_mod.count(arg_val);
-                    var j: usize = 0;
-                    while (j < n) : (j += 1) try elements.append(scratch, vector_mod.nth(arg_val, j));
-                },
-                .persistent_map => {
-                    var it = champ_mod.mapIter(arg_val);
-                    while (it.next()) |e| {
-                        const pair = [_]Value{ e.key, e.value };
-                        const entry = vector_mod.fromSlice(heap, &pair) catch return VmError.OutOfMemory;
-                        try elements.append(scratch, entry);
-                    }
-                },
-                .persistent_set => {
-                    var it = champ_mod.setIter(arg_val);
-                    while (it.next()) |e| try elements.append(scratch, e);
-                },
-                else => return VmError.KindMismatch,
-            }
-        }
-
-        // Second pass: build result right-to-left.
-        var result = list_mod.empty(heap) catch return VmError.OutOfMemory;
-        var k: usize = elements.items.len;
-        while (k > 0) {
-            k -= 1;
-            result = list_mod.cons(heap, elements.items[k], result) catch return VmError.OutOfMemory;
-        }
-        try self.store(.{ .kind = .slot, .index = dst }, result);
-    }
-
-    /// `coll:vector A=arg_base B=argc C=dst` — build a
-    /// persistent vector from argc slot values via
-    /// `vector_mod.fromSlice`.
-    fn execCollVector(self: *VM, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-        const arg_base: u12 = inst.a.index;
-        const argc: u12 = inst.b.index;
-        const dst: u12 = inst.c.index;
-
-        const frame = self.currentFrame();
-        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
-        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
-
-        const heap = self.ensureHeap();
-        if (argc == 0) {
-            const result = vector_mod.empty(heap) catch return VmError.OutOfMemory;
-            try self.store(.{ .kind = .slot, .index = dst }, result);
-            return;
-        }
-        // Collect elements into a temp slice then hand to
-        // fromSlice. The slice escapes the loop, so we allocate
-        // from runtime_arena.
-        var elems = std.ArrayList(Value).empty;
-        defer elems.deinit(self.runtime_arena.allocator());
-        try elems.ensureTotalCapacity(self.runtime_arena.allocator(), argc);
-        var i: usize = 0;
-        while (i < argc) : (i += 1) {
-            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-            const arg_val = (try self.slotPtr(arg_idx)).*;
-            try elems.append(self.runtime_arena.allocator(), arg_val);
-        }
-
-        const result = vector_mod.fromSlice(heap, elems.items) catch return VmError.OutOfMemory;
-        try self.store(.{ .kind = .slot, .index = dst }, result);
-    }
-
-    /// `coll:map A=arg_base B=argc C=dst` — build a persistent
-    /// map from argc slot values interpreted as flat k,v,k,v,...
-    /// pairs. argc MUST be even. Iterates left-to-right calling
-    /// `champ.mapAssoc`; later duplicate keys overwrite earlier
-    /// (Clojure semantics).
-    fn execCollMap(self: *VM, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-        const arg_base: u12 = inst.a.index;
-        const argc: u12 = inst.b.index;
-        const dst: u12 = inst.c.index;
-
-        if (argc % 2 != 0) return VmError.BytecodeCorruption;
-
-        const frame = self.currentFrame();
-        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
-        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
-
-        const heap = self.ensureHeap();
-        var result = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-        var i: usize = 0;
-        while (i < argc) : (i += 2) {
-            const k_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-            const v_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i + 1)));
-            const k = (try self.slotPtr(k_idx)).*;
-            const v = (try self.slotPtr(v_idx)).*;
-            result = champ_mod.mapAssoc(
-                heap,
-                result,
-                k,
-                v,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory;
-        }
-        try self.store(.{ .kind = .slot, .index = dst }, result);
-    }
-
-    /// `coll:set A=arg_base B=argc C=dst` — build a persistent
-    /// set from argc slot values. Duplicates collapse (set
-    /// semantics).
-    fn execCollSet(self: *VM, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
-        if (inst.c.kind != .slot) return VmError.InvalidOperandKind;
-        const arg_base: u12 = inst.a.index;
-        const argc: u12 = inst.b.index;
-        const dst: u12 = inst.c.index;
-
-        const frame = self.currentFrame();
-        const last_arg_slot: u32 = @as(u32, arg_base) + @as(u32, argc);
-        if (last_arg_slot > frame.slot_count) return VmError.OperandOutOfRange;
-
-        const heap = self.ensureHeap();
-        var result = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
-        var i: usize = 0;
-        while (i < argc) : (i += 1) {
-            const arg_idx: u12 = @intCast(@as(u32, arg_base) + @as(u32, @intCast(i)));
-            const v = (try self.slotPtr(arg_idx)).*;
-            result = champ_mod.setConj(
-                heap,
-                result,
-                v,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory;
-        }
-        try self.store(.{ .kind = .slot, .index = dst }, result);
     }
 
     // -------------------------------------------------------------
@@ -3458,7 +3312,7 @@ pub const VM = struct {
     // -------------------------------------------------------------
     //
     // Per VM.md §12. User-thrown values and the recoverable
-    // VM-detected errors (translated by `translateRecoverable`)
+    // VM-detected errors (translated by `vmErrorToKeywordName`)
     // are catchable; non-recoverable errors bubble out of `run`.
 
     fn execCtrl(self: *VM, inst: Inst) VmError!void {
