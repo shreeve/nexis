@@ -263,8 +263,7 @@ Invariants (normative; position arithmetic in prose is illustrative,
 formula authority lives in the code):
 
 - `data_bitmap & node_bitmap == 0` — a slot holds at most one of
-  {inline-entry, child-pointer}, never both. Safe-build code asserts
-  this on every traversal.
+  {inline-entry, child-pointer}, never both.
 - **Compact payload.** The node body is a contiguous segment: all
   inline entries, then all child pointers, with no gaps.
 - **Entry segment order.** Inline entries are stored in **ascending
@@ -294,13 +293,17 @@ formula authority lives in the code):
   (built via `champSingleEntryInterior`) is the canonical form
   (§5.6).
   
-  This invariant is what makes bitmap-level early-exit equality work
-  **below the root_node level**: two equal CHAMP-backed maps at count
-  ≥ 2 necessarily produce bit-identical bitmap chains at every
-  corresponding interior node. At the root_node level, equal CHAMP
-  maps of count 1 produce bit-identical single-entry interiors by the
-  same token (both built via `champSingleEntryInterior` with
-  matching entry and shift-0 slot index).
+  Equivalently: every node below the root holds at least two keys in
+  its subtree. A node with no entries and a single child is legal
+  when that child's subtree holds two or more keys (they share the
+  longer hash prefix).
+
+  Together these make the trie a function of the key set (outside
+  collision nodes, §2.3): two equal CHAMP-backed maps have
+  bit-identical bitmaps at every corresponding node and iterate in the
+  same order. `canonicalTrie(v, elementHash)` checks every invariant
+  of this section over a whole trie; the property tests assert it
+  after assoc and dissoc sequences of up to 30000 keys (§12.4).
 - **Entry types.** For `persistent_map`, each inline entry occupies
   32 bytes (`{ key: Value, value: Value }`). For `persistent_set`,
   each inline entry occupies 16 bytes (`key: Value`). The code module
@@ -427,9 +430,13 @@ this via §2.4's semantic fallback; no user-visible behavior changes.
 
 When `dissoc` empties all entries out of an interior subtree except
 for a single entry at one depth, that entry is **pulled up** into
-the parent's data area. This preserves canonicality of CHAMP node
-shape: an interior node with one entry and no children cannot exist
-anywhere but at the root.
+the parent's data area. If the parent's only content was that
+subtree, the parent would itself hold the lone entry, so the entry
+passes further up, level by level, until it reaches a node with other
+content or the root. A collision node left with one entry starts the
+same climb from the bottom of the trie. This preserves canonicality
+of CHAMP node shape: an interior node with one entry and no children
+cannot exist anywhere but at the root.
 
 Skipping this promotion would be simpler but would break bitmap
 canonicality — two equal maps built by different paths could
@@ -720,9 +727,10 @@ pub fn setIter(s: value.Value) SetIter;
 pub fn traceMap(h: *HeapHeader, visitor: anytype) void;
 pub fn traceSet(h: *HeapHeader, visitor: anytype) void;
 
-// -- Trie introspection for tests (§12.3) --
+// -- Trie introspection for tests (§4.3, §12.3) --
 pub fn mapCollisionCount(m: value.Value, hash32: u32) ?u32;
 pub fn setCollisionCount(s: value.Value, hash32: u32) ?u32;
+pub fn canonicalTrie(v: value.Value, elementHash: ElementHash) bool;
 ```
 
 #### 8.1 Error set and semantic details
@@ -926,6 +934,9 @@ Map:
   looks up to exactly `v`; absent keys return `.absent`.
 - M2. `mapAssoc` + `mapDissoc` random sequences on random starting
   maps preserve the entry multiset minus dissoc'd keys.
+- M2b. At 2000 and 30000 keys, `assoc` and `dissoc` keep the
+  canonical layout (`canonicalTrie`, §4.3), and equal maps built in
+  different orders iterate in the same order. S2b is the set side.
 - M3. `mapAssoc` replace-value: associng `(k, v1)` then `(k, v2)`
   yields `mapGet(m, k) == v2` with unchanged count.
 - M4. `assoc` same-value short-circuit returns the same map pointer.

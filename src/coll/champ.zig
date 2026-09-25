@@ -410,6 +410,59 @@ pub fn setCollisionCount(s: Value, hash32: u32) ?u32 {
     return hdr.count;
 }
 
+/// Whether the trie of map or set `v` has the canonical layout
+/// (CHAMP.md §4.3): bitmaps disjoint, every key at the slot its
+/// indexing hash selects along the path from the root, every
+/// collision node holding at least two keys that share its hash, and
+/// every node below the root holding at least two keys in its subtree
+/// (a subtree with one key is that key, inline in its parent). An
+/// array-map or array-set is trivially canonical.
+pub fn canonicalTrie(v: Value, elementHash: *const fn (Value) u64) bool {
+    if (v.subkind() != subkind_champ_root) return true;
+    const root = champRootBodyConst(Heap.asHeapHeader(v));
+    const total = switch (v.kind()) {
+        .persistent_map => canonicalNode(true, root.root_node, 0, 0, elementHash),
+        else => canonicalNode(false, root.root_node, 0, 0, elementHash),
+    };
+    return total == root.count;
+}
+
+/// The key count of the canonical subtree `node` at `shift`, whose
+/// keys' indexing hashes all have `path` in their low `shift` bits;
+/// null when the subtree is not canonical.
+fn canonicalNode(comptime is_map: bool, node: *HeapHeader, shift: u8, path: u32, elementHash: *const fn (Value) u64) ?usize {
+    const low: u32 = @truncate((@as(u64, 1) << @intCast(shift)) - 1);
+    if (shift > MAX_TRIE_SHIFT) {
+        const hdr = collisionHeaderConst(node);
+        if (hdr.count < 2 or hdr.shared_hash != path) return null;
+        for (0..hdr.count) |i| {
+            const key = if (is_map) collisionEntries(node)[i].key else setCollisionElements(node)[i];
+            if (indexHashOf(key, elementHash) != hdr.shared_hash) return null;
+        }
+        return hdr.count;
+    }
+    const hdr = champInteriorHeaderConst(node);
+    if (hdr.data_bitmap & hdr.node_bitmap != 0) return null;
+    var total: usize = 0;
+    var bits = hdr.data_bitmap;
+    while (bits != 0) : (bits &= bits - 1) {
+        const slot: u32 = @ctz(bits);
+        const key = if (is_map) champInteriorEntries(node)[total].key else setInteriorElements(node)[total];
+        const h = indexHashOf(key, elementHash);
+        if (h & low != path or (h >> @intCast(shift)) & branch_mask != slot) return null;
+        total += 1;
+    }
+    const children = if (is_map) champInteriorChildren(node) else setInteriorChildren(node);
+    bits = hdr.node_bitmap;
+    for (children) |child| {
+        const slot: u32 = 31 - @clz(bits);
+        bits &= ~(@as(u32, 1) << @intCast(slot));
+        total += canonicalNode(is_map, child, shift + branch_bits, path | (slot << @intCast(shift)), elementHash) orelse return null;
+    }
+    if (shift > 0 and total < 2) return null;
+    return total;
+}
+
 // =============================================================================
 // Public API — construction & query (CHAMP.md §8)
 // =============================================================================
@@ -1373,8 +1426,13 @@ fn champDissocFromNode(
             return .{ .node = node, .removed = false };
         }
         if (sub.promoted_single) |pulled| {
-            // Single-entry-subtree promotion (CHAMP.md §5.5): pull the
-            // lone entry up into THIS node's data area.
+            // Single-entry-subtree promotion (CHAMP.md §5.5). A node
+            // whose only content was that child would itself hold the
+            // lone entry: pass it further up.
+            if (hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) {
+                return .{ .node = null, .promoted_single = pulled, .removed = true };
+            }
+            // Otherwise pull it into THIS node's data area.
             const new_node = try cloneInteriorMigrateChildToData(heap, node, slot, child_idx, pulled);
             return .{ .node = new_node, .removed = true };
         }
@@ -2562,6 +2620,9 @@ fn champSetDisjFromNode(
             return .{ .node = node, .removed = false };
         }
         if (sub.promoted_single) |pulled| {
+            if (hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) {
+                return .{ .node = null, .promoted_single = pulled, .removed = true };
+            }
             const new_node = try cloneSetInteriorMigrateChildToData(heap, node, slot, child_idx, pulled);
             return .{ .node = new_node, .removed = true };
         }
@@ -3621,6 +3682,70 @@ test "single-entry-subtree promotion: dissoc inside a deep subtree pulls entry u
         .present => |v| try testing.expectEqual(@as(i64, 1001), v.asFixnum()),
         .absent => try testing.expect(false),
     }
+}
+
+/// Indexing hash for the canonical-layout tests: a string key
+/// "collider-N" hashes to N, so a test places each key at chosen
+/// slots on every level.
+fn slotHash(x: Value) u64 {
+    const bytes = string_mod.asBytes(x);
+    return std.fmt.parseInt(u32, bytes["collider-".len..], 10) catch unreachable;
+}
+
+/// Key `(c << 10) | (b << 5) | a`: slot a on level 0, b on level 1,
+/// c on level 2.
+fn slotKey(heap: *Heap, a: u32, b: u32, c: u32) !Value {
+    return collidingKey(heap, (c << 10) | (b << 5) | a);
+}
+
+test "dissoc passes a lone entry up through every emptied level (canonical layout)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // Nine fillers at level-0 slots 8..16, then `a` at slot 7. `b`
+    // shares a's slots on levels 0 and 1 and splits from it on level
+    // 2, so assoc b builds a two-level subtree under slot 7; dissoc b
+    // must pull `a` all the way back to slot 7 of the root.
+    var base = try mapEmpty(&heap);
+    for (8..17) |i| base = try mapAssoc(&heap, base, try slotKey(&heap, @intCast(i), 0, 0), value.fromFixnum(@intCast(i)).?, &slotHash, &synthEq);
+    const a = try slotKey(&heap, 7, 3, 1);
+    const b = try slotKey(&heap, 7, 3, 2);
+    const m2 = try mapAssoc(&heap, base, a, value.fromFixnum(1).?, &slotHash, &synthEq);
+    const with_b = try mapAssoc(&heap, m2, b, value.fromFixnum(2).?, &slotHash, &synthEq);
+    try testing.expect(canonicalTrie(with_b, &slotHash));
+    const m1 = try mapDissoc(&heap, with_b, b, &slotHash, &synthEq);
+    try testing.expect(canonicalTrie(m1, &slotHash));
+    // Equal maps with canonical tries iterate in the same order.
+    var it1 = mapIter(m1);
+    var it2 = mapIter(m2);
+    while (it2.next()) |e2| {
+        const e1 = it1.next().?;
+        try testing.expect(synthEq(e1.key, e2.key));
+    }
+    try testing.expect(it1.next() == null);
+
+    var s_base = try setEmpty(&heap);
+    for (8..17) |i| s_base = try setConj(&heap, s_base, try slotKey(&heap, @intCast(i), 0, 0), &slotHash, &synthEq);
+    const s2 = try setConj(&heap, s_base, a, &slotHash, &synthEq);
+    const s1 = try setDisj(&heap, try setConj(&heap, s2, b, &slotHash, &synthEq), b, &slotHash, &synthEq);
+    try testing.expect(canonicalTrie(s1, &slotHash));
+    var si1 = setIter(s1);
+    var si2 = setIter(s2);
+    while (si2.next()) |x2| try testing.expect(synthEq(si1.next().?, x2));
+    try testing.expect(si1.next() == null);
+}
+
+test "dissoc from a collision node passes the survivor up to the root" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var m = try mapEmpty(&heap);
+    for (8..17) |i| m = try mapAssoc(&heap, m, value.fromFixnum(@intCast(i)).?, value.nilValue(), &collidingHash, &synthEq);
+    m = try mapAssoc(&heap, m, try collidingKey(&heap, 1), value.nilValue(), &collidingHash, &synthEq);
+    m = try mapAssoc(&heap, m, try collidingKey(&heap, 2), value.nilValue(), &collidingHash, &synthEq);
+    try testing.expectEqual(@as(?u32, 2), mapCollisionCount(m, 0xDEAD_BEEF));
+    try testing.expect(canonicalTrie(m, &collidingHash));
+    m = try mapDissoc(&heap, m, try collidingKey(&heap, 1), &collidingHash, &synthEq);
+    try testing.expectEqual(@as(?u32, null), mapCollisionCount(m, 0xDEAD_BEEF));
+    try testing.expect(canonicalTrie(m, &collidingHash));
 }
 
 // =============================================================================
