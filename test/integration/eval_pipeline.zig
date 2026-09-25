@@ -1301,6 +1301,12 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
     try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
+    // Java's Long/valueOf and Double/valueOf grammars, as Clojure's
+    // parse-long and parse-double use them: no Zig-only spellings.
+    try expectOutput("[(parse-long \"+5\") (parse-long \"-0\") (parse-long \"1_000\") (parse-long \"+-5\") (parse-long \"0x10\") (parse-long \"+\") (parse-long \"\") (parse-long \"99999999999999999999\") (parse-long \"-9223372036854775808\")]", "[5 0 nil nil nil nil nil nil -9223372036854775808]");
+    try expectOutput("[(parse-double \"1_000\") (parse-double \"0x10\") (parse-double \"inf\") (parse-double \"nan\") (parse-double \"infinity\") (parse-double \".\") (parse-double \"e5\") (parse-double \"1e\") (parse-double \"\") (parse-double \"1.5 x\") (parse-double \"++1\") (parse-double \"0x1.8\")]", "[nil nil nil nil nil nil nil nil nil nil nil nil]");
+    try expectOutput("[(parse-double \" 1.5\\n\") (parse-double \"1e5\") (parse-double \"+1\") (parse-double \".5\") (parse-double \"5.\") (parse-double \"1.5d\") (parse-double \"2F\") (parse-double \"-2.5E-1\") (parse-double \"0x10p0\") (parse-double \"0X.8P1\") (parse-double \"0x1.p1f\")]", "[1.5 100000.0 1.0 0.5 5.0 1.5 2.0 -0.25 16.0 1.0 2.0]");
+    try expectOutput("(map (comp str parse-double) [\"NaN\" \"-Infinity\" \"+Infinity\" \"\\tNaN \"])", "(NaN -Infinity Infinity NaN)");
 }
 
 test "integration: bit operations" {

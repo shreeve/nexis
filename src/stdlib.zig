@@ -891,21 +891,59 @@ fn fnChar(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(parse-long s)` / `(parse-double s)`: the number `s` spells in
-/// full, else nil; a non-string is `:kind-mismatch`, as in Clojure.
+/// full as Java's `Long/valueOf` / `Double/valueOf` read it, else nil;
+/// a non-string is `:kind-mismatch`, as in Clojure (STDLIB.md §2).
 fn fnParseLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const text = string_mod.asBytes(args[0]);
-    const digits = if (text.len > 0 and text[0] == '+') text[1..] else text;
-    if (digits.len > 0 and digits[0] == '+') return value_mod.nilValue();
-    const n = std.fmt.parseInt(i64, digits, 10) catch return value_mod.nilValue();
+    const digits = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) text[1..] else text;
+    if (digits.len == 0) return value_mod.nilValue();
+    for (digits) |c| if (!std.ascii.isDigit(c)) return value_mod.nilValue();
+    const n = std.fmt.parseInt(i64, text, 10) catch return value_mod.nilValue();
     return integerValue(vm, n);
 }
 
 fn fnParseDouble(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
-    const text = string_mod.asBytes(args[0]);
-    if (text.len == 0 or std.ascii.isWhitespace(text[0]) or std.ascii.isWhitespace(text[text.len - 1])) return value_mod.nilValue();
+    const text = javaDouble(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
     return value_mod.fromFloat(std.fmt.parseFloat(f64, text) catch return value_mod.nilValue());
+}
+
+/// The part of `s` for `parseFloat` when `s` is in the grammar
+/// Clojure's `parse-double` admits (Java's `Double/valueOf`): control
+/// and space bytes around an optional sign and `NaN`, `Infinity`, a
+/// decimal with an optional exponent, or a hex significand with a
+/// binary exponent, the last two with an optional `[fFdD]` suffix.
+/// Null otherwise.
+fn javaDouble(s: []const u8) ?[]const u8 {
+    var lo: usize = 0;
+    var hi = s.len;
+    while (lo < hi and s[lo] <= ' ') lo += 1;
+    while (hi > lo and s[hi - 1] <= ' ') hi -= 1;
+    const t = s[lo..hi];
+    const sign = @intFromBool(t.len > 0 and (t[0] == '+' or t[0] == '-'));
+    const body = t[sign..];
+    if (std.mem.eql(u8, body, "NaN") or std.mem.eql(u8, body, "Infinity")) return t;
+    const suffix = body.len > 0 and std.mem.indexOfScalar(u8, "fFdD", body[body.len - 1]) != null;
+    const number = t[0 .. t.len - @intFromBool(suffix)];
+    const hex = body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X');
+    const isDigit: *const fn (u8) bool = if (hex) &std.ascii.isHex else &std.ascii.isDigit;
+    var i: usize = sign + @as(usize, if (hex) 2 else 0);
+    var mantissa: usize = 0;
+    while (i < number.len and isDigit(number[i])) : (i += 1) mantissa += 1;
+    if (i < number.len and number[i] == '.') {
+        i += 1;
+        while (i < number.len and isDigit(number[i])) : (i += 1) mantissa += 1;
+    }
+    if (mantissa == 0) return null;
+    if (i < number.len and std.mem.indexOfScalar(u8, if (hex) "pP" else "eE", number[i]) != null) {
+        i += 1;
+        if (i < number.len and (number[i] == '+' or number[i] == '-')) i += 1;
+        const digits = i;
+        while (i < number.len and std.ascii.isDigit(number[i])) i += 1;
+        if (i == digits) return null;
+    } else if (hex) return null;
+    return if (i == number.len) number else null;
 }
 
 /// An integer argument as an `i64`: a fixnum, or a bignum that fits.
