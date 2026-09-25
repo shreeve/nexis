@@ -1,19 +1,12 @@
-//! nexis language module — the `@lang = "nexis"` companion for
+//! nexis language module: the `@lang = "nexis"` companion of
 //! `nexis.grammar`.
 //!
-//! Responsibilities:
-//!   - `Tag` enum whose variants match every tagged S-expression emitted by
-//!     the grammar's parser actions.
-//!   - `Lexer` wrapper that fully replaces nexus's generated `BaseLexer`
-//!     tokenization. The generated scanner is tailored to imperative-language
-//!     conventions (hardcoded integer/keyword/ident shapes, no support for
-//!     Clojure-style `-?[0-9]+` numbers, no char literals, no multi-char
-//!     sharp-dispatch tokens beyond the ones listed in the operator switch).
-//!     Overriding `Lexer` here is the clean fix: the parser continues to
-//!     drive `self.lexer.next()` but our scanner produces exactly the token
-//!     shapes §7.2 of PLAN.md and FORMS.md §2 demand.
-//!   - `keyword_as`: promotion hook — unused (nexis has no
-//!     context-sensitive keywords at the reader level).
+//!   - `Tag`: every tag the grammar's actions put at the head of a list;
+//!     `src/reader.zig` consumes exactly this set.
+//!   - `Lexer`: the scanner, which replaces the generated one entirely.
+//!     Clojure's token boundaries (a number, char or symbol token runs to
+//!     the next delimiter) are written here once, and the generated parser
+//!     drives `next()` as it would its own lexer.
 
 const std = @import("std");
 const parser = @import("parser.zig");
@@ -51,12 +44,6 @@ pub const Tag = enum(u8) {
     discard,
     @"with-meta-raw",
 };
-
-/// Keyword-promotion hook required by the generated parser. nexis does not
-/// use the `@as` promotion machinery.
-pub fn keyword_as(_: []const u8, _: u16) ?u16 {
-    return null;
-}
 
 // =============================================================================
 // Lexer — full hand-written replacement

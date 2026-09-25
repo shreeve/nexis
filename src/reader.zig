@@ -188,7 +188,7 @@ pub const Reader = struct {
 
     fn readForm(self: *Reader, s: Sexp) ReaderError!*Form {
         const items = switch (s) {
-            .list => |it| it,
+            .list => |l| l.items(),
             else => return self.fail(.unknown_reader_construct, srcSpan(s), null),
         };
         if (items.len == 0 or items[0] != .tag) {
@@ -633,7 +633,7 @@ pub const Reader = struct {
 
     fn requireCompound(self: *Reader, s: Sexp, expected: Tag) ReaderError![]const Sexp {
         const items = switch (s) {
-            .list => |it| it,
+            .list => |l| l.items(),
             else => return self.fail(.unknown_reader_construct, srcSpan(s), null),
         };
         if (items.len == 0 or items[0] != .tag or items[0].tag != expected) {
@@ -644,7 +644,7 @@ pub const Reader = struct {
 
     fn isCompoundWithTag(_: *const Reader, s: Sexp, expected: Tag) bool {
         return switch (s) {
-            .list => |it| it.len > 0 and it[0] == .tag and it[0].tag == expected,
+            .list => |l| l.len > 0 and l.ptr[0] == .tag and l.ptr[0].tag == expected,
             else => false,
         };
     }
@@ -668,7 +668,7 @@ fn discardChainDepth(s: Sexp) usize {
     var cur = s;
     while (true) {
         if (cur != .list) break;
-        const it = cur.list;
+        const it = cur.list.items();
         if (it.len < 2 or it[0] != .tag or it[0].tag != .discard) break;
         const payload = withoutDelimiters(it[1..]);
         if (payload.len == 0) break;
@@ -692,7 +692,7 @@ fn withoutDelimiters(items: []const Sexp) []const Sexp {
 fn srcSpan(s: Sexp) SrcSpan {
     return switch (s) {
         .src => |r| .{ .pos = r.pos, .len = r.len },
-        .list => |it| blk: {
+        .list => |l| blk: {
             // Actions like (with-meta-raw 1 3 2) reorder positional
             // children relative to source order; the compound's span is
             // the min/max envelope over all descendant source positions,
@@ -700,7 +700,7 @@ fn srcSpan(s: Sexp) SrcSpan {
             var lo: u32 = std.math.maxInt(u32);
             var hi: u32 = 0;
             var any = false;
-            for (it) |c| {
+            for (l.items()) |c| {
                 if (c == .tag) continue;
                 const s2 = srcSpan(c);
                 if (s2.len == 0 and s2.pos == 0) continue;
@@ -1066,6 +1066,24 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
     try std.testing.expect(items[1].datum == .deref);
+}
+
+test "parsing is linear: a list of n forms costs O(n) parser memory" {
+    const allocator = std.testing.allocator;
+    const n = 4000;
+    inline for (.{ "[", "" }, .{ "]", "" }) |open, close| {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(allocator);
+        try src.appendSlice(allocator, open);
+        for (0..n) |i| try src.print(allocator, "{d} ", .{i});
+        try src.appendSlice(allocator, close);
+        var p = parser.Parser.init(allocator, src.items);
+        defer p.deinit();
+        _ = try p.parseProgram();
+        // A few Sexps per element; a list that copied itself on every
+        // append would hold n²/2 of them.
+        try std.testing.expect(p.arena.queryCapacity() < 256 * n);
+    }
 }
 
 test "N suffix: an integer literal of any radix or size reads as the integer" {
