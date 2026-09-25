@@ -1,43 +1,29 @@
 //! reader.zig — Sexp → Form normalizer.
 //!
-//! Consumes the raw `Sexp` tree produced by the nexus-generated parser and
-//! produces the canonical `Form` tree documented in `docs/FORMS.md`. All
-//! normalization rules from PLAN §28.3 / FORMS.md §3 are enforced here;
-//! anything that requires namespace resolution or macro context is left for
-//! later stages (`src/expand.zig`, `src/compile.zig`).
+//! Consumes the raw `Sexp` tree produced by the nexus-generated parser
+//! (`nexis.grammar`, scanner `src/nexis.zig`) and produces the canonical
+//! `Form` tree documented in `docs/FORMS.md`. All normalization rules
+//! from PLAN §28.3 / FORMS.md §3 are enforced here; anything that requires
+//! namespace resolution or macro context is left for later stages
+//! (`src/expand.zig`, `src/compile.zig`).
 //!
-//! Scope:
-//!   - Parse atom text into typed datums (int, real, char, string, kw, sym).
-//!   - Detect nil/true/false from symbol text.
-//!   - Recognize and reject reader errors per FORMS.md §3:
-//!       * `:duplicate-literal-key`
-//!       * `:map-odd-count`
-//!       * `:duplicate-literal-element`
-//!       * `:nested-anon-fn`
-//!       * `:unquote-outside-syntax-quote`
-//!       * `:unquote-splice-outside-syntax-quote`
-//!       * `:invalid-char-literal`
-//!       * `:invalid-string-escape`
-//!       * `:bad-number-literal`
-//!   - Merge stacked metadata (rightmost wins on duplicate keys).
-//!   - Lower `(anon-fn body)` → `(#%anon-fn body)` (reserved symbol).
+//!   - Parse atom text into typed datums (int, bigint, real, char, string,
+//!     keyword, symbol) and nil/true/false from symbol text.
+//!   - Reject what FORMS.md §3 calls reader errors (`ErrorKind`), with the
+//!     span of the offending form or token.
+//!   - Merge stacked metadata into one map; an outer `^` overrides an inner.
+//!   - Store `#(...)` as the `anon_fn` datum, rejecting nesting.
+//!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
+//!     unquote expansion live in the macroexpander (PLAN §14.2).
 //!
-//! Scope boundary (PLAN §14.2 / FORMS.md §4): `(syntax-quote x)` is emitted
-//! as a structural tag only. Auto-qualification, auto-gensym, and
-//! unquote/splice expansion live in the macroexpander, not here.
-//!
-//! An integer literal within i64 is an `int`; one beyond i64, in any radix,
-//! is a `bigint` carrying the value as canonical decimal text, so the
-//! compiler lifts it into a bignum without re-reading the radix.
+//! `readForm` calls `stack.check` on entry, so input nested past the stack's
+//! budget is `:nesting-too-deep`, and each Form's span comes from its
+//! tokens in O(1). An integer literal beyond i64, in any radix, is a
+//! `bigint` carrying canonical decimal text, so the compiler lifts it into
+//! a bignum without re-reading the radix.
 
 const std = @import("std");
-/// Re-exported as `pub` so downstream modules
-/// (specifically `src/compile.zig` for the `compileSource`
-/// end-to-end entry point) can access `parser.parseForm`
-/// without needing their own `@import("parser.zig")` (which
-/// would require another build.zig module wiring). The actual
-/// parser is generated from `nexis.grammar` by the nexus tool;
-/// see `src/parser.zig`.
+/// The generated parser, for the callers that parse before reading.
 pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
 const stack = @import("stack.zig");
