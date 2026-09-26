@@ -53,9 +53,10 @@ complete from the start; `core.clj`'s two-stage bootstrap (a trivial
 
 `ATransientMap.ensureEditable` checks ownership on every operation, and
 `persistent!` ends it. nexis transients check an owner token on every
-operation and freeze on `persistent!` (§3.5). They are shallow: an
-operation calls the persistent one underneath and swaps the result in,
-so it costs what the persistent operation costs (`docs/TRANSIENT.md`).
+operation and freeze on `persistent!` (§3.5). As in Clojure, an
+operation edits the nodes the transient owns in place and copies a
+shared node once; the token lives in the node header's hash field,
+which an internal node does not use (`docs/TRANSIENT.md`).
 
 ### 1.3 `seq` as the iteration abstraction
 

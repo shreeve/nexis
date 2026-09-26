@@ -297,8 +297,8 @@ programs.
 - *Sequences.* nexis sequences are eager (PLAN §23 #14): `map` and
   `filter` build their whole result, where babashka's are lazy and
   chunked. The pipeline row runs the same code and pays for that.
-- *Transients.* nexis's transients are wrappers over the persistent
-  operations (`docs/TRANSIENT.md`), not in-place node edits.
+- *Transients.* Both edit the nodes a transient owns in place
+  (`docs/TRANSIENT.md`).
 - *Durability.* A default Nextomic commit (`:sync :full`) is two
   `fcntl(F_FULLFSYNC)` calls (data, then meta; emdb's `datasync` on
   macOS), which ask the drive to empty its write cache. Datalevin

@@ -157,10 +157,10 @@ handle.zig` is the pattern for a kind whose body lives above
 
 `src/coll/` holds CHAMP (`champ.zig`), the vector (`vector.zig`,
 `conj`, `assoc` and `pop` O(log n)), the list and the O(1) seq view of
-a vector (`list.zig`), transients (`transient.zig`, shallow: a
-transient op costs what the persistent one does) and typed vectors.
+a vector (`list.zig`), transients (`transient.zig`, editing the nodes
+they own in place) and typed vectors.
 Every runtime value, closure and upvalue cell is a block on the VM's
-`Heap` (`src/heap.zig`), backed by the process allocator; Vars and
+`Heap` (`src/heap.zig`), carved from size-class slabs; Vars and
 namespaces are arena objects. `src/gc.zig` is a precise, non-moving
 mark-sweep collector with an iterative mark; the VM enumerates the
 roots and collects at the instruction-fetch safe point once 16 MiB (or

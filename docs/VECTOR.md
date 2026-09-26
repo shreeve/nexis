@@ -52,12 +52,14 @@ names are conceptual labels.
 | root | the user-facing Value: the 32-byte root body (§3) |
 | interior | `[32]?*HeapHeader` child pointers, 256 bytes |
 | leaf | exactly `[32]Value`, 512 bytes; always full |
-| tail | `[len]Value`, `len × 16` bytes, `1 ≤ len ≤ 32` |
+| tail | `len` Values, `1 ≤ len ≤ 32`: a block of `len × 16` bytes, or of 512 when a transient owns it |
 
 Only the root flows through dispatch. A leaf and a full tail share one
 layout, so one node can serve both roles: `conj` promotes a full tail
 into the trie as it stands, and `pop` makes the trie's last leaf the
-new tail. A node reachable twice this way is traced once.
+new tail. A node reachable twice this way is traced once. Every access
+reads a node's shape from the root and the descent, never from the
+block's size: the tail's length is the root's `tail_len`.
 
 ---
 
@@ -122,6 +124,8 @@ stdlib's sequence iterator use it. It is internal, not a language API.
 | `equalSeq(a, b, elementEq) bool` | §7; takes root headers |
 | `Cursor` | §4 |
 | `valueFromVectorHeader(h) Value` | the Value for a root header (the transient seam, `docs/TRANSIENT.md` §8) |
+| `copyRoot(heap, h)` | a copy of a root, without metadata, for a transient to own |
+| `conjInPlace(heap, root, elem, edit)`, `assocInPlace(heap, root, i, elem, edit)`, `popInPlace(heap, root, edit)` | the edits of a transient that owns `root` (`docs/TRANSIENT.md` §1): they write the root and the nodes whose header `hash` is `edit` in place, copy any other node on the path once, stamping the copy, and give the shape `conj`, `assoc` and `pop` give; an owned tail has room for 32 elements, and `pop` lets go of the element it drops |
 | `trace(h, visitor)` | GC trace (`docs/GC.md` §5) |
 
 `vector.zig` never imports `dispatch`: element hashing and comparison

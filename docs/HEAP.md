@@ -53,7 +53,9 @@ Frozen invariants (a change is a PLAN amendment):
    `mark` bit (§4) may be set.
 
 Only a user-visible root carries metadata; the internal nodes of a map,
-set or vector never do.
+set or vector never do. Those nodes cache no hash either: their `hash`
+holds the edit token of the transient that owns them, or 0
+(`docs/TRANSIENT.md` §4).
 
 ---
 
@@ -123,6 +125,7 @@ at the db layer.
 | `clearMarks()` | Clears every live block's `marked` bit: a cycle abandoned (`docs/GC.md` §4) |
 | `live_bytes`, `peak_live_bytes`, `allocated_since_collect` | Bytes held by live blocks (a slab block counts its class's size, a large block its allocation), the largest that has been, and bytes allocated since `resetAllocationCounter()`, which the collector's trigger reads (`docs/GC.md` §7) |
 | `slab_count`, `empty_slab_count` | Slabs held, and how many of them are empty and kept (§2) |
+| `edit_clock` | The last edit token a transient on the heap took (`docs/TRANSIENT.md` §4) |
 | `isBlockKind(kind) bool` | Whether a Value of `kind` carries a `*HeapHeader`: every heap kind except `native_fn`, `var_` and the three db handles, plus `cell_internal`. The collector marks only these |
 | `bodyOf(Body, h) *Body`, `bodyBytes(h) []u8`, `bodySize(h)` | The body, typed (alignment ≤ 16, checked at compile time) or as bytes, as long as `alloc` or the last `resizeInPlace` made it |
 | `bodyCapacity(h)`, `resizeInPlace(h, n) bool` | The longest body the block can take where it stands (its class's size less the header, or a large block's allocation), and a new body size up to it: bytes a longer body gains are zero; false, changing nothing, past the capacity. The transient operations grow and shrink the nodes they own through it (`docs/TRANSIENT.md` §1) |

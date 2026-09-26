@@ -320,6 +320,9 @@ pub const Heap = struct {
     /// Bytes allocated since `resetAllocationCounter`: what the
     /// collector's trigger compares against its threshold.
     allocated_since_collect: usize = 0,
+    /// The last edit token a transient on this heap took
+    /// (`docs/TRANSIENT.md` §4).
+    edit_clock: u32 = 0,
 
     const Class = struct {
         /// Free slots of the class's slabs, linked through `meta`.

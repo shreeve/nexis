@@ -54,7 +54,7 @@ the §3 rows.
 | 7 | Persistent list | cons cells | cons cells | parity | §3.2 | measured |
 | 8 | Hashing | Murmur3 | xxHash3-64; a heap value's hash cached in its header | faster on long bytes | §3.1 | measured |
 | 9 | Keyword identity | interned, identity equality | intern id in the payload, identity equality | parity | §3.1 | measured |
-| 10 | Transients | node-owner in-place edit | owner-token wrapper over the persistent operations (`docs/TRANSIENT.md`) | behind; same cost as persistent | §3.3 | measured |
+| 10 | Transients | node-owner in-place edit | node-owner in-place edit, the token in an internal node's header (`docs/TRANSIENT.md`) | parity | §3.3 | measured |
 | 11 | GC | generational (G1, ZGC) | precise non-moving mark-sweep (`docs/GC.md` §1) | behind under allocation churn | — | not measured |
 | 12 | Allocator | TLAB bump pointer | `VM.heap` over size-class slabs with free lists, no per-block prefix (`docs/HEAP.md` §2) | behind on construction | §3.2 | measured |
 | 13 | Dispatch | JIT inline caches | two-level switch on group and variant (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8 | measured |
@@ -133,10 +133,6 @@ The same builds through `transient`, the `!` operations and
 | `transient_vector_conjbang_n` | 208 μs | 82.5 μs |
 | `transient_map_assocbang_n` | 615 μs | 348 μs |
 | `transient_set_conjbang_n` | 580 μs | 321 μs |
-
-Transients cost what the persistent builds of §3.2 cost: a transient
-is a wrapper that runs the persistent operation (`docs/TRANSIENT.md`),
-not Clojure's in-place node edit.
 
 ### 3.4 Lookup
 
@@ -409,8 +405,6 @@ Each lever is a measured change: a before/after from `zig build bench`
 - **Opcode specialization**, and then **inline caches at call sites**.
 - **Comptime specialization** beyond CHAMP's inline immediate hash:
   `(reduce + xs)` over fixnums, `equal` by kind pair.
-- **Node-owner in-place-edit transients**: the source of Clojure's
-  transient speedup; nexis's transients are wrappers (§3.3).
 - **A smaller heap header** for small objects.
 - **A single-key read path for durable refs** that skips the general
   transaction scaffolding.

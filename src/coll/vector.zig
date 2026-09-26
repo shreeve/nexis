@@ -130,31 +130,31 @@ fn allocTail(heap: *Heap, len: usize) !*HeapHeader {
 // Body accessors
 // =============================================================================
 
-fn rootBody(h: *HeapHeader) *RootBody {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == root_body_size);
-    return @ptrCast(@alignCast(body.ptr));
+// Every accessor reads a node's shape from the root, never from the
+// block's size: a tail a transient owns has room for 32 elements
+// whatever `tail_len` says (VECTOR.md §2).
+
+inline fn rootBody(h: *HeapHeader) *RootBody {
+    return Heap.bodyOf(RootBody, h);
 }
 
-fn interiorChildren(h: *HeapHeader) *[branch_factor]?*HeapHeader {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == interior_body_size);
-    return @ptrCast(@alignCast(body.ptr));
+inline fn interiorChildren(h: *HeapHeader) *[branch_factor]?*HeapHeader {
+    return Heap.bodyOf([branch_factor]?*HeapHeader, h);
 }
 
-fn leafValues(h: *HeapHeader) *[branch_factor]Value {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len == leaf_body_size);
-    return @ptrCast(@alignCast(body.ptr));
+inline fn leafValues(h: *HeapHeader) *[branch_factor]Value {
+    return Heap.bodyOf([branch_factor]Value, h);
 }
 
-fn tailValues(h: *HeapHeader) []Value {
-    const body = Heap.bodyBytes(h);
-    std.debug.assert(body.len % @sizeOf(Value) == 0);
-    const count_len = body.len / @sizeOf(Value);
-    std.debug.assert(count_len >= 1 and count_len <= branch_factor);
-    const ptr: [*]Value = @ptrCast(@alignCast(body.ptr));
-    return ptr[0..count_len];
+/// The first `len` elements of a tail node.
+inline fn tailValues(h: *HeapHeader, len: usize) []Value {
+    std.debug.assert(len >= 1 and len <= branch_factor);
+    return leafValues(h)[0..len];
+}
+
+/// The tail of the vector rooted at `body`: `tail_len` elements.
+inline fn tailOf(body: *const RootBody) []Value {
+    return if (body.tail_node) |t| tailValues(t, body.tail_len) else &.{};
 }
 
 // =============================================================================
@@ -220,8 +220,8 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // Path (a): tail has room → grow tail by 1.
     if (src.tail_len < branch_factor) {
         const new_tail = try allocTail(heap, src.tail_len + 1);
-        const new_tail_values = tailValues(new_tail);
-        if (src.tail_node) |t| @memcpy(new_tail_values[0..src.tail_len], tailValues(t));
+        const new_tail_values = tailValues(new_tail, src.tail_len + 1);
+        @memcpy(new_tail_values[0..src.tail_len], tailOf(src));
         new_tail_values[src.tail_len] = elem;
 
         const new_root_h = try allocDerivedRoot(heap, src_h);
@@ -236,7 +236,7 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     // Tail is full (len == 32). Old tail becomes a leaf under the
     // trie; new tail starts with the appended element.
     const new_tail = try allocTail(heap, 1);
-    tailValues(new_tail)[0] = elem;
+    tailValues(new_tail, 1)[0] = elem;
 
     // A full tail and a leaf share one layout: the tail joins the trie
     // as it stands.
@@ -324,8 +324,8 @@ pub fn assoc(heap: *Heap, v: Value, i: usize, elem: Value) !Value {
     const tail_offset: usize = src.count - src.tail_len;
     if (i >= tail_offset) {
         const new_tail = try allocTail(heap, src.tail_len);
-        @memcpy(tailValues(new_tail), tailValues(src.tail_node.?));
-        tailValues(new_tail)[i - tail_offset] = elem;
+        @memcpy(tailValues(new_tail, src.tail_len), tailOf(src));
+        tailValues(new_tail, src.tail_len)[i - tail_offset] = elem;
         new_root.tail_node = new_tail;
     } else {
         new_root.root_node = try assocPath(heap, src.root_node.?, src.shift, i, elem);
@@ -368,7 +368,7 @@ pub fn pop(heap: *Heap, v: Value) !Value {
     new_root.count = src.count - 1;
     if (src.tail_len > 1) {
         const new_tail = try allocTail(heap, src.tail_len - 1);
-        @memcpy(tailValues(new_tail), tailValues(src.tail_node.?)[0 .. src.tail_len - 1]);
+        @memcpy(tailValues(new_tail, src.tail_len - 1), tailOf(src)[0 .. src.tail_len - 1]);
         new_root.tail_node = new_tail;
         new_root.tail_len = src.tail_len - 1;
         return valueFromRoot(new_root_h);
@@ -405,6 +405,181 @@ fn popTail(heap: *Heap, node: *HeapHeader, level_shift: u32, last: usize) !?*Hea
     return clone;
 }
 
+// =============================================================================
+// In-place edits (TRANSIENT.md §1)
+//
+// A transient owns its root and every node whose header `hash` holds
+// its edit token: it writes those in place and copies any other node
+// once, stamping the copy, before writing it. A node it does not own
+// may be shared with persistent vectors, which never change. Every
+// edit allocates what it needs before it writes a node the vector
+// reaches, so a failed allocation leaves the elements as they were.
+// =============================================================================
+
+/// `node` if the edit owns it, else a copy it owns.
+fn editable(heap: *Heap, node: *HeapHeader, edit: u32, size: usize) !*HeapHeader {
+    if (node.hash == edit) return node;
+    const copy = try heap.alloc(.persistent_vector, size);
+    @memcpy(Heap.bodyBytes(copy)[0..size], Heap.bodyBytes(node)[0..size]);
+    copy.hash = edit;
+    return copy;
+}
+
+/// A tail the edit owns, with room for 32 elements, holding `len`
+/// elements of `from`.
+fn ownedTail(heap: *Heap, from: []const Value, edit: u32) !*HeapHeader {
+    const t = try allocLeaf(heap);
+    t.hash = edit;
+    @memcpy(leafValues(t)[0..from.len], from);
+    return t;
+}
+
+fn ownedInterior(heap: *Heap, edit: u32) !*HeapHeader {
+    const node = try allocInterior(heap);
+    node.hash = edit;
+    return node;
+}
+
+/// A private copy of the root `src` for a transient: the same
+/// elements, no metadata, no nodes owned.
+pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
+    const h = try allocRoot(heap);
+    rootBody(h).* = rootBody(src).*;
+    return h;
+}
+
+/// Append `elem` to the vector rooted at `root`, which the edit owns.
+pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void {
+    const body = rootBody(root);
+    if (body.tail_len < branch_factor) {
+        const tail = if (body.tail_node) |t| (if (t.hash == edit) t else try ownedTail(heap, tailOf(body), edit)) else try ownedTail(heap, &.{}, edit);
+        leafValues(tail)[body.tail_len] = elem;
+        body.tail_node = tail;
+        body.tail_len += 1;
+        body.count += 1;
+        return;
+    }
+    // A full tail joins the trie as a leaf, owned or not, and a new
+    // owned tail starts.
+    const new_tail = try ownedTail(heap, &.{elem}, edit);
+    const leaf = body.tail_node.?;
+    const leaf_base: u32 = body.count - @as(u32, branch_factor);
+    if (body.root_node == null or body.count > capacityAtShift(body.shift)) {
+        const grown = try ownedInterior(heap, edit);
+        const shift = if (body.root_node == null) branch_bits else body.shift + branch_bits;
+        interiorChildren(grown)[(@as(usize, leaf_base) >> @intCast(shift)) & branch_mask] = try ownedPath(heap, shift - branch_bits, leaf, edit);
+        if (body.root_node) |old| interiorChildren(grown)[0] = old;
+        body.root_node = grown;
+        body.shift = shift;
+    } else {
+        body.root_node = try pushLeafInPlace(heap, body.root_node.?, body.shift, leaf_base, leaf, edit);
+    }
+    body.tail_node = new_tail;
+    body.tail_len = 1;
+    body.count += 1;
+}
+
+/// `newPath`, every interior owned by the edit.
+fn ownedPath(heap: *Heap, level_shift: u32, leaf: *HeapHeader, edit: u32) !*HeapHeader {
+    if (level_shift == 0) return leaf;
+    const below = try ownedPath(heap, level_shift - branch_bits, leaf, edit);
+    const node = try ownedInterior(heap, edit);
+    interiorChildren(node)[0] = below;
+    return node;
+}
+
+/// `pushLeaf`, editing the nodes the edit owns in place.
+fn pushLeafInPlace(heap: *Heap, node: *HeapHeader, shift: u32, idx: u32, leaf: *HeapHeader, edit: u32) !*HeapHeader {
+    const local: usize = (idx >> @intCast(shift)) & branch_mask;
+    const children = interiorChildren(node);
+    const child: *HeapHeader = if (shift == branch_bits)
+        leaf
+    else if (children[local]) |existing|
+        try pushLeafInPlace(heap, existing, shift - branch_bits, idx, leaf, edit)
+    else
+        try ownedPath(heap, shift - branch_bits, leaf, edit);
+    const owned = try editable(heap, node, edit, interior_body_size);
+    interiorChildren(owned)[local] = child;
+    return owned;
+}
+
+/// Replace element `i` (in bounds) of the vector rooted at `root`,
+/// which the edit owns.
+pub fn assocInPlace(heap: *Heap, root: *HeapHeader, i: usize, elem: Value, edit: u32) !void {
+    const body = rootBody(root);
+    std.debug.assert(i < body.count);
+    const tail_offset: usize = body.count - body.tail_len;
+    if (i >= tail_offset) {
+        const t = body.tail_node.?;
+        const tail = if (t.hash == edit) t else try ownedTail(heap, tailOf(body), edit);
+        leafValues(tail)[i - tail_offset] = elem;
+        body.tail_node = tail;
+        return;
+    }
+    body.root_node = try assocPathInPlace(heap, body.root_node.?, body.shift, i, elem, edit);
+}
+
+fn assocPathInPlace(heap: *Heap, node: *HeapHeader, level_shift: u32, i: usize, elem: Value, edit: u32) !*HeapHeader {
+    if (level_shift == 0) {
+        const leaf = try editable(heap, node, edit, leaf_body_size);
+        leafValues(leaf)[i & branch_mask] = elem;
+        return leaf;
+    }
+    const idx: usize = (i >> @intCast(level_shift)) & branch_mask;
+    const child = try assocPathInPlace(heap, interiorChildren(node)[idx].?, level_shift - branch_bits, i, elem, edit);
+    const owned = try editable(heap, node, edit, interior_body_size);
+    interiorChildren(owned)[idx] = child;
+    return owned;
+}
+
+/// Drop the last element of the non-empty vector rooted at `root`,
+/// which the edit owns: the shape `pop` gives.
+pub fn popInPlace(heap: *Heap, root: *HeapHeader, edit: u32) !void {
+    const body = rootBody(root);
+    std.debug.assert(body.count > 0);
+    if (body.count == 1) {
+        body.* = std.mem.zeroes(RootBody);
+        return;
+    }
+    if (body.tail_len > 1) {
+        // A tail the edit owns lets go of the element; a shared one
+        // keeps it and is copied at the next write.
+        const t = body.tail_node.?;
+        if (t.hash == edit) leafValues(t)[body.tail_len - 1] = value.nilValue();
+        body.tail_len -= 1;
+        body.count -= 1;
+        return;
+    }
+    const last = body.count - 2;
+    const new_tail = leafFor(body, last);
+    var trie = try popTailInPlace(heap, body.root_node.?, body.shift, last, edit);
+    var shift = body.shift;
+    if (trie) |t| {
+        if (shift > branch_bits and interiorChildren(t)[1] == null) {
+            trie = interiorChildren(t)[0];
+            shift -= branch_bits;
+        }
+    } else shift = 0;
+    body.root_node = trie;
+    body.shift = shift;
+    body.tail_node = new_tail;
+    body.tail_len = branch_factor;
+    body.count -= 1;
+}
+
+/// `popTail`, editing the nodes the edit owns in place.
+fn popTailInPlace(heap: *Heap, node: *HeapHeader, level_shift: u32, last: usize, edit: u32) !?*HeapHeader {
+    const idx: usize = (last >> @intCast(level_shift)) & branch_mask;
+    const child: ?*HeapHeader = if (level_shift > branch_bits)
+        try popTailInPlace(heap, interiorChildren(node)[idx].?, level_shift - branch_bits, last, edit)
+    else
+        null;
+    if (child == null and idx == 0) return null;
+    const owned = try editable(heap, node, edit, interior_body_size);
+    interiorChildren(owned)[idx] = child;
+    return owned;
+}
+
 /// Build a vector from a slice, in natural order. The trie is built
 /// bottom-up, one allocation per node, into exactly the shape a
 /// left fold of `conj` produces.
@@ -413,7 +588,7 @@ pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
     const n = std.math.cast(u32, elems.len) orelse return error.Overflow;
     const tail_offset: u32 = (n - 1) & ~branch_mask;
     const tail = try allocTail(heap, n - tail_offset);
-    @memcpy(tailValues(tail), elems[tail_offset..]);
+    @memcpy(tailValues(tail, n - tail_offset), elems[tail_offset..]);
     var shift: u32 = 0;
     var trie: ?*HeapHeader = null;
     if (tail_offset > 0) {
@@ -534,9 +709,7 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
     const body = rootBody(h);
     if (body.tail_node) |tn| {
         if (visitor.markInternal(tn)) {
-            // Tail node body is [tail_len] Value — walk and mark
-            // heap-kind children.
-            for (tailValues(tn)) |elem| visitor.markValue(elem);
+            for (tailOf(body)) |elem| visitor.markValue(elem);
         }
     }
     if (body.root_node) |rn| traceTrie(rn, body.shift, visitor);
@@ -672,7 +845,7 @@ fn pushLeaf(
 /// The leaf or the tail holding index `i`. Both start at a multiple
 /// of 32, so `i & branch_mask` indexes into the result.
 fn chunkFor(body: *const RootBody, i: usize) []const Value {
-    if (i >= body.count - body.tail_len) return tailValues(body.tail_node.?);
+    if (i >= body.count - body.tail_len) return tailOf(body);
     return leafValues(leafFor(body, i));
 }
 
@@ -713,7 +886,7 @@ fn expectSameShape(a: Value, b: Value) !void {
     try testing.expectEqual(x.shift, y.shift);
     try testing.expectEqual(x.tail_len, y.tail_len);
     try testing.expectEqual(x.tail_node == null, y.tail_node == null);
-    if (x.tail_node) |t| try expectSameValues(tailValues(t), tailValues(y.tail_node.?));
+    if (x.tail_node != null) try expectSameValues(tailOf(x), tailOf(y));
     try testing.expectEqual(x.root_node == null, y.root_node == null);
     if (x.root_node) |r| try expectSameNode(r, y.root_node.?, x.shift);
 }

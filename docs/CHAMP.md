@@ -39,8 +39,9 @@ argument; any other update returns a new root carrying the argument's
 metadata (SEMANTICS §7).
 
 **Absent.** Sorted maps and sets, and any other member of the map or
-set equality category; transients are `src/coll/transient.zig`
-(`docs/TRANSIENT.md`).
+set equality category. Transients are `src/coll/transient.zig`
+(`docs/TRANSIENT.md`); the in-place edits they run are this module's
+(§8.3).
 
 ---
 
@@ -312,6 +313,22 @@ constants are public. Every constructor can fail only with
   ascending slot order, then its children in their stored, descending
   slot order; a collision node's payloads in association order.
 
+#### 8.3 In-place edits
+
+A transient's edit (`docs/TRANSIENT.md` §1) is two calls:
+`mapLocate`/`setLocate` finds where a key is or would go, doing every
+hash and comparison and changing nothing, and returns a `MapSpot` or
+`SetSpot` (`mapSpotPresent`, `mapSpotValue` read it);
+`mapPut`/`setPut` then stores, or `mapDrop`/`setDrop` removes, at that
+spot in a collection whose root the edit owns, and return the root
+afterwards. They rewrite the nodes whose header `hash` holds the edit
+token and copy any other node on the path, stamping the copy; a node
+an edit allocates keeps two payloads of spare room in its block, and
+an insert into an owned node grows it in place when its block has room
+(`Heap.resizeInPlace`). The result has the layout `mapAssoc` and
+`mapDissoc` give (§2.2, §5.3-§5.6). `copyRoot` copies a root for a
+transient to own.
+
 #### 8.2 Nil
 
 Nil is a legal key, a legal value and a legal set element: `(assoc {}
@@ -367,7 +384,9 @@ hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
 dissoc, the builder, the iterator and the trace are shared, and the
 public `map*`/`set*` functions are thin wrappers over the two
 instances. Every path copy goes through one primitive, `withSlot`: a
-copy of an interior with one slot made empty, a payload or a child.
+copy of an interior with one slot made empty, a payload or a child;
+an in-place edit rewrites an owned interior the same way where it
+stands when its block has room (§8.3).
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
