@@ -529,6 +529,14 @@ test "syntax-quote: auto-gensyms stay unique across top-level forms" {
     , "[true false]");
 }
 
+test "gensym takes a prefix of any length" {
+    try expectOutputProgram(
+        \\(let [p (apply str (repeat 1000 "p"))
+        \\      g (name (gensym p))]
+        \\  (= (subs g 0 1002) (str p "__")))
+    , "true");
+}
+
 test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
     try expectOutputProgram("(defmacro m [x] ``(a ~~x)) (m 1)", "(user/a 1)");
     try expectOutputProgram(
