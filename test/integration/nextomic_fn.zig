@@ -320,3 +320,69 @@ test "full-text stays in step under assert, retract, backfill and excision, on a
     try testing.expectEqual(@as(usize, 1), count(try fx.q(excised, "[:find ?v :where [(fulltext $ :doc/title \"apple\") [[?e ?v]]]]")));
     try testing.expectEqual(@as(usize, 0), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
 }
+
+/// Leave the tokens tree as a build of another folding would: no stamp,
+/// and a row under an unfolded token for `e`'s value `text`.
+fn staleFulltext(fx: *Fx, a: u32, e: u64, text: []const u8) !void {
+    const store = fx.conn().store;
+    const txn = try store.beginWrite(.none);
+    errdefer txn.abort();
+    _ = try txn.delFromTree(store.trees.sys, "ft");
+    try txn.putInTree(store.trees.fulltext, try nextomic.fulltext.rowKey(fx.arena(), a, "cafÉ", e, nextomic.key.hash128(text)), &.{});
+    try txn.commit();
+}
+
+test "full-text folds case across scripts; rows of another folding are searched exactly and rebuilt at connect and by a transaction" {
+    const fx = try Fx.init("fn_fulltext_fold");
+    defer fx.deinit();
+    _ = try fx.transact(
+        \\[{:db/ident :doc/title :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}
+        \\ {:db/ident :doc/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+    );
+    const r = try fx.transact(
+        \\[{:db/id "a" :doc/title "Café au lait"} {:db/id "b" :doc/title "CAFÉ NOIR"}
+        \\ {:db/id "c" :doc/title "ΣΟΦΙΑ"} {:db/id "d" :doc/title "σοφιας"} {:db/id "e" :doc/title "ПРИВЕТ мир"}]
+    );
+    // café au lait noir σοφια σοφιασ привет мир
+    try testing.expectEqual(@as(usize, 9), try tokenRows(fx));
+    const cases = [_]struct { needle: []const u8, hits: usize }{
+        .{ .needle = "café", .hits = 2 },
+        .{ .needle = "CAFÉ", .hits = 2 },
+        .{ .needle = "Café Noir", .hits = 1 },
+        .{ .needle = "σοφια", .hits = 1 },
+        .{ .needle = "ΣΟΦΙΑΣ", .hits = 1 },
+        .{ .needle = "привет", .hits = 1 },
+        .{ .needle = "Мир", .hits = 1 },
+    };
+    const a = fx.arena();
+    const title = try fx.conn().db();
+    const title_id = (try title.entid(a, .{ .ident = try fx.kwId("doc/title") })).?;
+    const check = struct {
+        fn run(f: *Fx, list: []const @TypeOf(cases[0])) !void {
+            const dbv = try f.db();
+            for (list) |c| {
+                errdefer std.debug.print("needle {s}\n", .{c.needle});
+                const src = try std.fmt.allocPrint(f.arena(), "[:find ?e :where [(fulltext $ :doc/title \"{s}\") [[?e ?v]]]]", .{c.needle});
+                try testing.expectEqual(c.hits, count(try f.q(dbv, src)));
+            }
+        }
+    }.run;
+    try check(fx, &cases);
+
+    // Rows another folding wrote: searches re-tokenise until the next
+    // connect rebuilds them.
+    const b = r.tempids[1].eid;
+    try staleFulltext(fx, @intCast(title_id), b, "CAFÉ NOIR");
+    try testing.expectEqual(@as(usize, 10), try tokenRows(fx));
+    try check(fx, &cases);
+    try fx.tc.reopen();
+    try testing.expectEqual(@as(usize, 9), try tokenRows(fx));
+    try check(fx, &cases);
+
+    // A transaction rebuilds them too, before it writes its own.
+    try staleFulltext(fx, @intCast(title_id), b, "CAFÉ NOIR");
+    _ = try fx.transact("[{:doc/n 1 :doc/title \"Crème brûlée\"}]");
+    try testing.expectEqual(@as(usize, 11), try tokenRows(fx));
+    try check(fx, &cases);
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(try fx.db(), "[:find ?e :where [(fulltext $ :doc/title \"CRÈME BRÛLÉE\") [[?e ?v]]]]")));
+}

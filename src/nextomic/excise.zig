@@ -83,7 +83,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     for (rows.items) |r| {
         const attr = schema.attr(r.a) orelse return error.Corrupted;
         const history = r.top != null;
-        if (!history and attr.fulltext) try fulltext.unindexRow(store, txn, arena, r.a, e, r.vbytes);
+        if (!history and attr.fulltext) try fulltext.indexRow(store, txn, arena, r.a, e, r.vbytes, false);
         // AEVT under a given attribute is one prefix delete below.
         if (a == null) try delete(store, txn, arena, .aevt, history, e, r);
         if (attr.inAvet()) try delete(store, txn, arena, .avet, history, e, r);

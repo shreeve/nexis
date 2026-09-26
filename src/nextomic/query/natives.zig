@@ -190,13 +190,17 @@ fn qNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
 
 /// The arguments an arg-map call `(q {:query q :args [...]})` stands
 /// for, `[q ...]`; null when the call is not one. A map is an arg-map
-/// when it has `:query`; its other key is `:args`, and anything else is
+/// when it has `:query`; its other keys are `:args` and Datomic's
+/// `:timeout` and `:io-context`, which are ignored so that code written
+/// for Datomic runs (a query here is one read in the caller's thread,
+/// with no timer to arm and no I/O to attribute), and anything else is
 /// `:nextomic/query-syntax`.
 fn argMap(vm: *VM, arena: std.mem.Allocator, args: []const Value, diag: *Diag) !?[]const Value {
     if (args.len != 1 or args[0].kind() != .persistent_map) return null;
     const it = vm.ensureInterner();
     const k_query = try it.internKeywordValue("query");
     const k_args = try it.internKeywordValue("args");
+    const ignored = [_]Value{ try it.internKeywordValue("timeout"), try it.internKeywordValue("io-context") };
     const query_v = switch (champ.mapGet(args[0], k_query, &dispatch.hashValue, &dispatch.equal)) {
         .present => |v| v,
         .absent => return null,
@@ -204,9 +208,9 @@ fn argMap(vm: *VM, arena: std.mem.Allocator, args: []const Value, diag: *Diag) !
     var inputs: []const Value = &.{};
     var keys = champ.mapIter(args[0]);
     while (keys.next()) |e| {
-        if (dispatch.equal(e.key, k_query)) continue;
+        if (dispatch.equal(e.key, k_query) or dispatch.equal(e.key, ignored[0]) or dispatch.equal(e.key, ignored[1])) continue;
         if (!dispatch.equal(e.key, k_args)) {
-            diag.* = .{ .message = "an arg-map takes :query and :args" };
+            diag.* = .{ .message = "an arg-map takes :query and :args, and ignores :timeout and :io-context" };
             return error.QuerySyntax;
         }
         inputs = (try marshal.sequence(arena, e.value)) orelse {

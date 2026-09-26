@@ -55,5 +55,14 @@
 (t/check "datoms carry their transaction" (= 3 (nth (first (d/datoms db :eavt nut :item/name)) 3)))
 (t/check "current datoms are assertions" (every? #(nth % 4) (d/datoms db :aevt :item/qty)))
 
+; An attribute indexed late holds its whole history in AVET: a value
+; retracted before the index was added is in the history view's range.
+(d/transact! c [[:db/add bolt :item/name "Bolt v2"]])
+(d/transact! c [[:db/add :item/name :db/index true]])
+(def hdb (d/history (d/db c)))
+(println (mapv (fn [[e a v t added]] [v added]) (d/index-range hdb :item/name "B" "C")))
+(t/check "history AVET equals the attribute's EAVT history"
+       (= (set (d/datoms hdb :avet :item/name)) (set (filter #(= :item/name (nth % 1)) (d/datoms hdb :eavt)))))
+
 (d/release c)
 (println :indexes-done)

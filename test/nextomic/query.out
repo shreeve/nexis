@@ -21,7 +21,8 @@ Cy
 ([Cy 42.0])
 ([Ann] [Di])
 #{[1] [2]}
-{:error :nextomic/query-syntax, :message an arg-map takes :query and :args}
+#{[1]}
+{:error :nextomic/query-syntax, :message an arg-map takes :query and :args, and ignores :timeout and :io-context}
 {:error :nextomic/query-syntax, :message :args is a vector of the query's inputs}
 #{[1] [2] [3]}
 ([1 3] [2 3])
@@ -62,7 +63,7 @@ Cy
 ([ANN] [BOB] [CY] [DI] [EDWARD] [FLO])
 ([Ann 30] [Bob 26] [Cy 41] [Di 30] [Edward 55] [Flo 33])
 ([Ann :person/height 1.7] [Bob :person/height 1.8] [Cy :person/height 1.65] [Di :person/age 30] [Edward :person/age 55] [Flo :person/age 33])
-{:error :nextomic/query-syntax, :message get-else takes a cardinality-one attribute}
+{:error :nextomic/query-syntax, :message get-else takes a cardinality-one attribute, :clause 1}
 {:error :nextomic/query-syntax, :message get-else takes a default that is not nil, :clause 1}
 {:error :nextomic/query-syntax, :message get-else takes a default that is not nil}
 {:error :nextomic/unknown-attribute, :attr :person/nope}
@@ -158,6 +159,7 @@ ok results are ordinary sets
 [false true]
 ([Ann] [Bob])
 ([Ann Ann runs the red team; loves Café Noir.])
+([Ann])
 ([Ann])
 ([Cy])
 #{}

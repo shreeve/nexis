@@ -215,6 +215,13 @@ pub const boot = struct {
 // Store
 // =============================================================================
 
+/// The case folding `nx/fulltext` rows are written under (fulltext.zig
+/// `fold`); 1, folding ASCII only, is what a store without a stamp
+/// holds.
+pub const fulltext_fold: u8 = 2;
+
+pub const FulltextStamp = struct { fold: u8, t: u64 };
+
 pub const Store = struct {
     allocator: Allocator,
     /// The file's one environment in this process, shared with every
@@ -546,6 +553,29 @@ pub const Store = struct {
         try self.sysPutInt(txn, "ig", 8, gen);
     }
 
+    /// The `nx/fulltext` stamp: the folding its rows were written under
+    /// and the `t` they are current at; null when absent (rows an older
+    /// build wrote, folding ASCII only).
+    pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
+        const raw = (try self.sysGet(txn, "ft")) orelse return null;
+        if (raw.len != 1 + key.id_len) return error.Corrupted;
+        return .{ .fold = raw[0], .t = try key.readId(raw[1..][0..key.id_len]) };
+    }
+
+    /// Stamp the rows current at `t` under `fulltext_fold`.
+    pub fn writeFulltextStamp(self: *Store, txn: *Txn, t: u64) !void {
+        var buf: [1 + key.id_len]u8 = undefined;
+        buf[0] = fulltext_fold;
+        key.writeId(buf[1..][0..key.id_len], t);
+        try self.sysPut(txn, "ft", &buf);
+    }
+
+    /// Whether the rows are this build's folding, current at `t`.
+    pub fn fulltextFresh(self: *Store, txn: *Txn, t: u64) !bool {
+        const stamp = (try self.readFulltextStamp(txn)) orelse return false;
+        return stamp.fold == fulltext_fold and stamp.t == t;
+    }
+
     /// Schema generation: bumped by every transaction that writes a
     /// datom on an attribute-partition entity; absent reads as 0.
     pub fn readSchemaGen(self: *Store, txn: *Txn) !u64 {
@@ -873,6 +903,8 @@ pub const Store = struct {
         try self.putTxlog(txn, t, entry);
         try self.writeT(txn, t);
         try self.bumpSchemaGen(txn);
+        // No attribute is full-text yet: the empty tree is current.
+        try self.writeFulltextStamp(txn, t);
     }
 
     /// Ident names for the txlog encoder, from `nx/idents` through the

@@ -22,6 +22,7 @@ ok the speculative tag change did not happen
 :nextomic/closed
 ok transact! afterwards takes the t the scope reported
 ok and its tempid
+ok a speculative db-value never equals the committed one at its t
 :boom
 ok the basis is still the committed one
 ok the connection writes again after the throw

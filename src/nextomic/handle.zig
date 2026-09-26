@@ -16,9 +16,11 @@
 //!
 //!   - A connection handle is identity-valued: equal to itself only.
 //!   - A db-value is a plain value: two db boxes are equal when they
-//!     name the same connection, basis and mode (as-of, since,
-//!     history); `(= (d/db c) (d/db c))` holds while nothing was
-//!     transacted in between.
+//!     read the same file, at the same basis and mode (as-of, since,
+//!     history), whichever connection to the file they came through;
+//!     `(= (d/db c) (d/db c))` holds while nothing was transacted in
+//!     between. A box without a file, the view of a speculative `with`,
+//!     equals only boxes of its own connection.
 //!   - A lazy entity is a value: two entity boxes are equal when their
 //!     db-values are equal and their eids agree, and hash accordingly.
 //!     Its attributes are read on access through the hook the box
@@ -89,6 +91,10 @@ pub fn formatConn(v: Value, writer: *std.Io.Writer) !void {
 /// The fields of a db-value (NEXTOMIC.md §4).
 pub const DbShape = struct {
     conn: *anyopaque,
+    /// The (device, inode) of the file the connection reads, which
+    /// equality compares; null when only the connection names what it
+    /// reads.
+    file: ?[2]u64 = null,
     basis: u64,
     as_of: ?u64 = null,
     since: ?u64 = null,
@@ -97,18 +103,20 @@ pub const DbShape = struct {
 
 const DbBox = extern struct {
     conn: *anyopaque,
+    file: [2]u64,
     basis: u64,
     as_of: u64,
     since: u64,
+    has_file: u8,
     has_as_of: u8,
     has_since: u8,
     history: u8,
-    _pad: [5]u8,
+    _pad: [4]u8,
 };
 
 comptime {
     std.debug.assert(@alignOf(DbBox) <= 16);
-    std.debug.assert(@sizeOf(DbBox) == 40);
+    std.debug.assert(@sizeOf(DbBox) == 56);
 }
 
 pub fn makeDb(heap: *Heap, shape: DbShape) !Value {
@@ -116,13 +124,15 @@ pub fn makeDb(heap: *Heap, shape: DbShape) !Value {
     const body = Heap.bodyOf(DbBox, h);
     body.* = .{
         .conn = shape.conn,
+        .file = shape.file orelse .{ 0, 0 },
         .basis = shape.basis,
         .as_of = shape.as_of orelse 0,
         .since = shape.since orelse 0,
+        .has_file = @intFromBool(shape.file != null),
         .has_as_of = @intFromBool(shape.as_of != null),
         .has_since = @intFromBool(shape.since != null),
         .history = @intFromBool(shape.history),
-        ._pad = [_]u8{0} ** 5,
+        ._pad = [_]u8{0} ** 4,
     };
     return Heap.valueFromHeader(.nextomic_db, h);
 }
@@ -131,6 +141,7 @@ fn shapeOf(h: *HeapHeader) DbShape {
     const body = Heap.bodyOf(DbBox, h);
     return .{
         .conn = body.conn,
+        .file = if (body.has_file != 0) body.file else null,
         .basis = body.basis,
         .as_of = if (body.has_as_of != 0) body.as_of else null,
         .since = if (body.has_since != 0) body.since else null,
@@ -146,7 +157,8 @@ pub fn dbShape(v: Value) DbShape {
 pub fn dbEqual(a: *HeapHeader, b: *HeapHeader) bool {
     const x = shapeOf(a);
     const y = shapeOf(b);
-    return x.conn == y.conn and x.basis == y.basis and
+    const same_source = if (x.file != null and y.file != null) std.meta.eql(x.file, y.file) else x.file == null and y.file == null and x.conn == y.conn;
+    return same_source and x.basis == y.basis and
         std.meta.eql(x.as_of, y.as_of) and std.meta.eql(x.since, y.since) and
         x.history == y.history;
 }
@@ -155,7 +167,7 @@ pub fn dbEqual(a: *HeapHeader, b: *HeapHeader) bool {
 pub fn dbHash(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
     const s = shapeOf(h);
-    var acc = hash_mod.hashU64(@intFromPtr(s.conn));
+    var acc = if (s.file) |f| hash_mod.combineOrdered(hash_mod.hashU64(f[0]), hash_mod.hashU64(f[1])) else hash_mod.hashU64(@intFromPtr(s.conn));
     acc = hash_mod.combineOrdered(acc, hash_mod.hashU64(s.basis));
     acc = hash_mod.combineOrdered(acc, hash_mod.hashU64(if (s.as_of) |t| t + 1 else 0));
     acc = hash_mod.combineOrdered(acc, hash_mod.hashU64(if (s.since) |t| t + 1 else 0));
@@ -356,6 +368,11 @@ test "db box round trips its shape, compares structurally and prints its mode" {
     const hist = try makeDb(&heap, .{ .conn = conn, .basis = 7, .as_of = 3, .history = true });
     const sinc = try makeDb(&heap, .{ .conn = conn, .basis = 7, .since = 2 });
     const zero = try makeDb(&heap, .{ .conn = conn, .basis = 7, .as_of = 0 });
+    // Two connections to one file; a view of neither.
+    var second: u32 = 0;
+    const file_a = try makeDb(&heap, .{ .conn = conn, .file = .{ 1, 2 }, .basis = 7 });
+    const file_b = try makeDb(&heap, .{ .conn = @ptrCast(&second), .file = .{ 1, 2 }, .basis = 7 });
+    const file_c = try makeDb(&heap, .{ .conn = @ptrCast(&second), .file = .{ 1, 3 }, .basis = 7 });
 
     const H = Heap.asHeapHeader;
     try testing.expect(dbEqual(H(cur), H(cur2)));
@@ -364,6 +381,11 @@ test "db box round trips its shape, compares structurally and prints its mode" {
     try testing.expect(!dbEqual(H(older), H(hist)));
     try testing.expect(!dbEqual(H(cur), H(zero)));
     try testing.expect(dbHash(H(cur)) != dbHash(H(zero)));
+    try testing.expect(dbEqual(H(file_a), H(file_b)));
+    try testing.expectEqual(dbHash(H(file_a)), dbHash(H(file_b)));
+    try testing.expect(!dbEqual(H(file_a), H(file_c)));
+    try testing.expect(!dbEqual(H(file_a), H(cur)));
+    try testing.expectEqual(@as(?[2]u64, .{ 1, 2 }), dbShape(file_b).file);
 
     const s = dbShape(hist);
     try testing.expectEqual(@as(u64, 7), s.basis);

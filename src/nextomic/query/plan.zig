@@ -628,6 +628,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
                 .bind => |b| blk: {
                     if (!callBound(b.call, bound)) break :blk false;
                     try callSources(ctx, b.call);
+                    try checkGetElse(ctx, b.call);
                     const outs = try b.out.vars(ctx.arena);
                     const fresh = try newVars(ctx.arena, outs, bound);
                     for (fresh) |v| try bound.add(ctx.arena, v);
@@ -812,6 +813,18 @@ fn planSource(ctx: *Ctx, s: anytype, bound: *const Bound) !Step {
 /// Every source a call's arguments name exists.
 fn callSources(ctx: *Ctx, call: ir.Call) error{QuerySyntax}!void {
     for (call.args) |a| if (a == .src) try ctx.selectDb(a.src);
+}
+
+/// A `get-else` on a constant card-many attribute is refused here,
+/// where the refusal can name its clause; one on a variable is refused
+/// when it runs. An unknown attribute is left to the run, which names
+/// it.
+fn checkGetElse(ctx: *Ctx, call: ir.Call) !void {
+    if (call.f != .builtin or call.f.builtin != .get_else) return;
+    const a = call.args[2];
+    if (a != .constant or a.constant != .keyword) return;
+    const attr = (try ctx.attrByKeyword(a.constant.keyword)) orelse return;
+    if (attr.many()) return ctx.syntax("get-else takes a cardinality-one attribute");
 }
 
 /// A call can run once its function (when a variable) and every

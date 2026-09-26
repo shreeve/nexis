@@ -329,43 +329,10 @@ failing test (AGENTS.md).
 
 ### 6.2 Nextomic
 
-1. **Two connections to one file in one process** share the file's
-   environment, but their db-values at one basis are unequal:
-   equality is by connection.
-2. **Retracting an attribute's `:db/ident` is accepted** and leaves
-   the name live: `[?e :db/ident :u/n]` finds nothing afterwards, yet
-   `:u/n` still reads and writes the attribute. Next: refuse it with
-   `:nextomic/schema` in `transact.zig`'s check step (or retire the
-   name through the minter), a `docs/NEXTOMIC.md` §3 row and a
-   `test/nextomic` case.
-3. **A late `:db/index true` backfills AVET history from current
-   datoms only**: `index-range` over `history` misses a value
-   retracted before the attribute was indexed, which EAVT history
-   still holds. Next: backfill `nx/avet-h` from the attribute's AEVT
-   history, or state in `docs/NEXTOMIC.md` §3 that history AVET starts
-   at the indexing `t`.
-4. **Concurrent writers must share a version**: a connection's schema
-   cache trusts the `sys` counter `"sg"`, which a build older than it
-   does not bump, so a process of an older build that alters schema
-   while a newer one has the file open leaves the newer one enforcing
-   the old schema. Sequential use across versions is fine. Next:
-   state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
-   unchanged but `t` advanced, check the txlog entries in between for
-   attribute-partition datoms.
-5. **Small**: a `:db.fn/cas` old value that is an unseen keyword
-   mints it (`transact.zig` resolves the old value with `.assert`;
-   `.match` would refuse it without a write), harmless but a stray
-   ident; the arg-map form of `q` refuses Datomic's `:timeout` and
-   `:io-context` keys with `:nextomic/query-syntax` where ignoring them
-   would port more code (an owner's call); the refusal of a
-   `get-else` on a card-many attribute carries no `:clause`.
-6. **The planner's join estimates** come from `treeStat` and
+1. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-7. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
-   tokens. Case folding needs a table and a rebuild of `nx/fulltext`
-   at open.
-8. **No datom heap kind**: reads return `[e a v t added]` vectors.
+2. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

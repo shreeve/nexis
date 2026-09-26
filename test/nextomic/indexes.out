@@ -22,4 +22,6 @@ ok unknown ident as entity matches nothing
 [[1 :db/ident :db/ident 1 true] [1 :db/valueType :db.type/keyword 1 true] [1 :db/cardinality :db.cardinality/one 1 true] [1 :db/unique :db.unique/identity 1 true] [1 :db/index true 1 true]]
 ok datoms carry their transaction
 ok current datoms are assertions
+[[Bolt true] [Bolt false] [Bolt v2 true]]
+ok history AVET equals the attribute's EAVT history
 :indexes-done

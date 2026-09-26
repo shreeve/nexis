@@ -30,6 +30,7 @@ const datom_mod = @import("datom.zig");
 const store_mod = @import("store.zig");
 const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
+const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -68,8 +69,9 @@ pub const Fault = struct {
     value: ?Val = null,
     message: ?[]const u8 = null,
     /// A failed `:db.fn/cas`: what it expected and what it found, either
-    /// absent when the attribute had no value.
-    cas: ?struct { expected: ?Val, actual: ?Val } = null,
+    /// absent when the attribute had no value, and the expected keyword
+    /// as the form wrote it when the store has never seen it.
+    cas: ?struct { expected: ?Val, actual: ?Val, unseen: ?Value = null } = null,
 };
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.
@@ -126,6 +128,11 @@ pub const Conn = struct {
     /// The view of the speculative `with` holding this connection's
     /// write transaction, while it is open.
     speculative: ?*Conn = null,
+    /// The (device, inode) of the store's file, which db-values compare
+    /// by (NEXTOMIC.md §6): every connection to one file reads one
+    /// database. Null on the view of a speculative `with`, whose
+    /// uncommitted state is its own.
+    file: ?[2]u64 = null,
 
     /// Open or create the store at `path`; bootstrap on first open.
     /// `interner` is the VM's keyword table and outlives the connection.
@@ -134,6 +141,7 @@ pub const Conn = struct {
         errdefer gpa.destroy(self);
         const store = try Store.open(gpa, path, .{ .map_size = options.map_size });
         errdefer store.close();
+        try refreshFulltext(gpa, store);
         self.* = .{
             .gpa = gpa,
             .store = store,
@@ -141,8 +149,32 @@ pub const Conn = struct {
             .idents = Idents.init(gpa, store, interner),
             .sync_mode = options.sync,
             .is_open = true,
+            .file = .{ store.file.id.dev, store.file.id.ino },
         };
         return self;
+    }
+
+    /// Rebuild `nx/fulltext` when its rows are stale and some attribute
+    /// is full-text (fulltext.zig), in a write transaction of its own
+    /// that writes no datom. A file this process may only read, or one
+    /// whose writer is busy in this process, is left as it is: its
+    /// searches re-tokenise until a transaction rebuilds the rows.
+    fn refreshFulltext(gpa: Allocator, store: *Store) !void {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        {
+            const txn = try store.beginRead();
+            defer txn.abort();
+            if (!try fulltext.needsRebuild(store, txn, arena, try store.readT(txn))) return;
+        }
+        const txn = store.beginWrite(.full) catch |err| switch (err) {
+            error.TxnReadOnly, error.WriterActive => return,
+            else => return err,
+        };
+        errdefer txn.abort();
+        try fulltext.rebuild(store, txn, arena, try store.readT(txn));
+        try txn.commit();
     }
 
     /// Stop accepting operations. Idempotent. The `Conn` stays allocated
@@ -237,12 +269,14 @@ pub const Conn = struct {
     /// The schema serving `basis` inside `txn` (whose `sys["t"]` is
     /// `now`). A cached schema built at a basis `>= basis` serves it
     /// through `attrAt`; one whose schema generation is still the
-    /// store's serves `now` too, since only data was committed since;
-    /// otherwise the cache is rebuilt at `now`.
+    /// store's serves `now` too once the txlog entries committed since
+    /// hold no attribute-partition datom, since only data was committed
+    /// (the entries settle it for a writer of a build that does not
+    /// bump the generation); otherwise the cache is rebuilt at `now`.
     pub fn schemaAt(self: *Conn, txn: *Txn, basis: u64, now: u64) !*Schema {
         if (self.schema_cache) |s| {
             if (s.basis >= basis) return s;
-            if (s.gen == try self.store.readSchemaGen(txn)) {
+            if (s.gen == try self.store.readSchemaGen(txn) and !try self.schemaWritten(txn, s.basis, now)) {
                 s.basis = now;
                 return s;
             }
@@ -252,6 +286,24 @@ pub const Conn = struct {
         const s = try Schema.build(self.gpa, self.store, txn, now);
         self.schema_cache = s;
         return s;
+    }
+
+    /// Whether a transaction in `(after, upto]` wrote a datom on an
+    /// attribute-partition entity. Each entry is read once per
+    /// connection: the cache then serves `upto`.
+    fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var start: [key.id_len]u8 = undefined;
+        key.writeId(&start, after + 1);
+        var end: [key.id_len]u8 = undefined;
+        key.writeId(&end, upto + 1);
+        var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
+        while (s.next()) |kv| {
+            defer _ = arena_state.reset(.retain_capacity);
+            if (try datom_mod.touchesAttrPartition(arena_state.allocator(), kv.value)) return true;
+        }
+        return false;
     }
 
     /// Materialise a datom value into the VM heap. Refs become
