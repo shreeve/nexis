@@ -402,10 +402,13 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. A green CI run on Linux (§2), then a store carried between macOS
-   and Linux (§6.4).
-2. Performance: the levers and measured dead ends are
-   `docs/PERF.md` §6; measure with `zig build bench` first
-   (`docs/BENCH.md`).
+1. A store carried between macOS and Linux (§6.4); CI runs the gate on
+   both.
+2. Performance against babashka and Datalevin (`docs/PERF.md` §3.11):
+   the durable commit of a small transaction (group commit), memory on
+   million-element collections, `frequencies`/`group-by`, transient
+   maps, vector `conj`/`nth` and string splitting; the levers are
+   `docs/PERF.md` §6. Rerun `bb bench/compare/run.clj --out DIR`
+   (`docs/BENCH.md` §12) before and after.
 3. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).
