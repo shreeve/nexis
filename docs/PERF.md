@@ -183,26 +183,50 @@ once.
 
 `bench/nextomic.zig` builds both stores (emdb, 16 KiB pages) and runs
 every row through the engine's Zig API: 40,000 employees in 20
-departments, five attributes each (~200k datoms). The integration
-tests carry 10k-datom twins that check the row counts
-(`test/integration/nextomic_q.zig`, `nextomic_pull.zig`). Each figure
-is the best of five invocations, the spread across them in brackets.
+departments, five attributes each (~200k datoms), then, after those
+rows have run, two chains in the same store (10 and 20,000 entities
+linked by a ref). The integration tests carry 10k-datom twins that
+check the row counts (`test/integration/nextomic_q.zig`,
+`nextomic_pull.zig`). Each figure is the best of five invocations, the
+spread across them in brackets; the two columns alternated in one
+session, the tree before the planner and join work (`8548eda`) and
+after it.
 
-| Harness row | What | Time |
-|---|---|---:|
-| `q_join3_by_dept_2k_rows` | 3-way join by department (`avet` seek → `vaet` → `eavt`), 2000 rows | 0.72 ms to rows [0.72–0.79]; 1.27 ms [1.27–1.37] with the persistent result set |
-| `q_join3_by_age` | 3-way join by age (`avet` range → `eavt` → `eavt`), 851 rows | 2.63 ms [2.63–2.76] |
-| `q_count_hash_join` | `(count ?e)` by department (`aevt` scan, hash join), 667 rows | 0.43 ms [0.43–0.45] |
-| `q_join3_from_1_age` | 3-way join from one age, nested loop, 851 rows | 0.40 ms [0.40–0.42] |
-| `q_join3_from_3_ages` | from three ages, nested loop, 2602 rows | 1.33 ms [1.33–1.36] |
-| `q_join3_from_7_ages` | from seven ages, hash join on name and salary, 6259 rows | 3.25 ms [3.25–3.44] |
-| `pull_many_star` | `pull-many [*]` over 20,000 entities, one read transaction | 12.9 ms [12.9–13.2] |
-| `pull_many_nested_ref_limit` | `pull-many` with a nested ref and `:limit`, 20,000 entities | 18.0 ms [18.0–18.3] |
-| `pull_reverse_ref_2k` | reverse-ref pull of one department's 2,000 employees | 0.20 ms [0.20–0.22] |
+| Harness row | What | Before | After |
+|---|---|---:|---:|
+| `q_join3_by_dept_2k_rows` | 3-way join by department (`avet` seek → `vaet` → `eavt`), 2000 rows | 0.99 ms [0.99–1.10] | 0.94 ms [0.94–1.05] |
+| `q_join3_by_age` | 3-way join by age (`avet` range → `eavt` → `eavt`), 851 rows | 2.20 ms [2.20–2.58] | 1.78 ms [1.78–2.06] |
+| `q_count_hash_join` | `(count ?e)` by department (`aevt` scan, hash join), 667 rows | 0.34 ms [0.34–0.69] | 0.33 ms [0.33–0.39] |
+| `q_join3_from_1_age` | 3-way join from one age, nested loop, 851 rows | 0.34 ms [0.34–0.76] | 0.32 ms [0.32–0.72] |
+| `q_join3_from_3_ages` | from three ages, nested loop, 2602 rows | 1.09 ms [1.09–2.55] | 1.02 ms [1.02–2.87] |
+| `q_join3_from_7_ages` | from seven ages, hash join on name and salary, 6259 rows | 2.74 ms [2.74–4.12] | 2.57 ms [2.57–6.04] |
+| `q_chain_1000_clauses` | 1000-clause chain over a 10-entity chain, no row survives: planning | 113 ms [113–114] | 3.3 ms [3.3–4.5] |
+| `q_chain_100_over_20k` | 100-clause chain over a 20k-entity chain, finding its ends, 19,900 rows | 431 ms [431–455] | 34.8 ms [34.8–36.4] |
+| `q_chain_100_find_all_over_20k` | the same chain finding all 101 variables | 472 ms [472–529] | 72.2 ms [72.2–75.6] |
+| `pull_many_star` | `pull-many [*]` over 20,000 entities, one read transaction | 9.98 ms [9.98–18.3] | 9.95 ms [9.95–10.3] |
+| `pull_many_nested_ref_limit` | `pull-many` with a nested ref and `:limit`, 20,000 entities | 15.6 ms [15.6–21.4] | 15.5 ms [15.5–15.7] |
+| `pull_reverse_ref_2k` | reverse-ref pull of one department's 2,000 employees | 0.096 ms [0.096–0.118] | 0.095 ms [0.095–0.096] |
+
+Through `bin/nexis` over a chain of 100,000 entities, one query at a
+time: a 300-clause chain finding its two ends took 80 s before and
+0.67 s after, finding all 301 variables 1.5 s after; a 1000-clause
+chain over a 10-entity chain took 118 ms before and 3.0 ms after. What
+the rows before paid for: the planner re-estimated every pending
+clause after each placement with a linear search of the bound
+variables (O(n³) in clauses; `plan.choose` held nearly every sample),
+and every join appended each row of a relation that kept every
+variable bound so far, cell by cell (`Column.append` and the arena's
+`memmove` of regrown columns held most of the rest). What the rows
+after do is `docs/NEXTOMIC.md` §5: estimates kept until a clause's
+variables change, dead variables dropped and output-only ones parked,
+joins gathered column by column from the smaller side's index, and a
+constant-prefix scan and its indexes kept for the query. A profile of
+the chain after the change puts the time in the hash probe of the join
+(`Relation.join`, `Cell.hash`) and nothing in the planner.
 
 The result sets live on a heap over the process allocator. A profile
-of the query rows (`sample` on the ReleaseFast test binary) puts about
-30 % of the time in emdb's page search (`page.searchPage`,
+of the three-way join rows (`sample` on the ReleaseFast test binary)
+puts about 30 % of the time in emdb's page search (`page.searchPage`,
 `simd.compare`), 10 % in `Exec.scanInto` and about 5 % in decoding
 string values out of keys; the rest is relation building and the
 arena. Debug builds under the testing allocator are an order of
@@ -407,6 +431,6 @@ is one invocation's 30-sample median.
 |---|---|---|
 | §3.1–§3.5, §3.6 M1 column | Apple M1, macOS, Zig 0.16.0, ReleaseFast | 2026-04-19; `src/bench.zig` + `bench/main.zig`, 30 samples of ≥50 ms each. The two columns of §3.2, §3.3 and §3.5 are the benchmark heaps over the process allocator and over the size-class pool, since deleted. §3.1, §3.4 and §3.6 allocate nothing from the heap in their timed bodies |
 | §3.6 M5 column, §3.8 | Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0, ReleaseFast, idle | `zig build bench -Doptimize=ReleaseFast`, five invocations per state of the tree, the best median with the spread; "before" is the tree at `739d24f`, "after" the `vm` and `champ` commits named in the table. That run had the pool under the benchmark heaps; its construction and codec-decode rows are dropped as pool figures. The `vm`, `compiler`, lookup and `db` rows do not allocate from the pool |
-| §3.7 | Apple M5, as above | `zig build bench -Doptimize=ReleaseFast -- --filter nextomic`, best of five invocations with the spread; the pull rows took a single sample per run |
+| §3.7 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 6–20) | revamp, 2026-09-25: `nexis-bench --filter nextomic` built by `zig build bench -Doptimize=ReleaseFast` from `bench/nextomic.zig` at the ws-planner head over the `src/` of `8548eda` (before) and of the ws-planner head (after), five invocations of each, alternating, the best median with the spread; the `bin/nexis` figures are one run each of a probe program timing `d/q` with `nano-time`, before at `b8c17a1` |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |

@@ -523,6 +523,10 @@ unsatisfiable: it yields nothing and is not an error.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
+A clause's estimate is taken once and again only after one of its own
+variables is bound, and membership in the bound set is a lookup, so
+ordering n clauses takes O(n) estimates and O(n²) constant-time
+checks.
 A pattern that binds no new variable (`[?e :tags _]` with `?e` bound)
 is an existence test: its seek stops at the first matching datom.
 An `or` costs the sum over its branches of each branch's cheapest
@@ -532,10 +536,38 @@ bodies, with the head variables bound where the call's arguments are
 rule runs after every pattern that could bind its arguments.
 Join per step: index nested loop (seek per row) when `rows × log n` is
 below four times the scan estimate, otherwise one scan of the constant
-prefix hash-joined on the shared variables (`plan.nestedLoop`). The
-hash side is a chained index keyed by row hash, sized up front.
+prefix hash-joined on the shared variables (`plan.nestedLoop`); a
+pattern that takes nothing from the row is always that one scan, joined
+as a cross product, since every row would read the same datoms. The
+constant-prefix scan runs once per query for each source, index and
+shape of its positions (which hold constants, which a variable, which
+repeat one), and a later pattern of that shape joins with the same rows
+under its own variables. The hash side is the smaller one, or the
+cached scan, which keeps its indexes for the next join with it; an
+index is chained by row hash and sized up front. The joined rows are
+gathered column by column from the two sides, and a side whose every
+row comes through once, in order, lends its columns instead.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
+
+After ordering, a liveness pass gives each step the variables the
+relation drops after it: every variable no later step reads and the
+plan's caller does not ask for. The query's caller asks for its
+`:find` and `:with` variables, a `not` for its join variables, an `or`
+branch for the `or`'s join variables, a rule body for the rule's head.
+A variable only a predicate, a function, a `not` or an `or-join` reads
+is dropped once that clause has run, so a relation holds the variables
+still in use rather than every variable bound so far: an n-clause chain
+`[?x0 :next ?x1] ... [?xn-1 :next ?xn]` finding `?x0 ?xn` keeps two
+columns between steps, not n. A variable only the caller asks for,
+which no later step reads, is still carried; once four such are held
+with two steps still to run, the relation parks them: they leave it for
+one column of row numbers into the rows that held them (the previous
+park's column among them), and the plan's end puts them back. The same
+chain finding every `?xi` then carries at most five columns, and its
+cost grows with the rows times the clauses, not times their square.
+`explain` ends a step's line with the variables dropped after it (`drop
+?x1`) and the ones it parks (`park ?x0 ?x1 ?x2 ?x3 -> ?row`).
 
 **Sources.** A query without `:in` reads `[$]`. `:in` binds data
 sources, `$` or any `$name` (`:in $db ?x`), positional like every
@@ -649,7 +681,9 @@ for `.` and `[...]`), not zero.
 
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
-never a VM value. Results are copied into the VM heap as a persistent
+never a VM value, and never changed once built, so a relation made
+from another shares the columns it keeps (dropping a variable copies
+nothing). Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups
@@ -675,7 +709,8 @@ adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are anti-joins on the shared
 variables; `or`/`or-join` are unions of sub-plans with the same output
-variables, and an `or-join` whose join vector leads with a group,
+variables (every branch's rows go into one set, each row hashed once),
+and an `or-join` whose join vector leads with a group,
 `(or-join [[?a] ?b] ...)`, runs only once the group's variables are
 bound.
 
@@ -887,6 +922,14 @@ Wins, by construction: reads straight off the mapping with no
 deserialization; empty-value index leaves; history as a range filter;
 one file, one process, backup by transaction number. The measured
 numbers are `docs/PERF.md` §3.7.
+
+Queries scale with their clauses (§5): ordering n clauses takes O(n)
+estimates, and a step costs its rows times the few columns still in
+use, so a chain of n patterns over r rows costs O(n·r), whether its
+`:find` names two variables or all of them. A 300-clause chain over a
+100k-entity chain runs in under a second; a 1000-clause query plans in
+a few milliseconds. What a step cannot avoid is its join: every step
+of a long chain probes one hash index with every row it carries.
 
 Not in scope: distribution (Datomic's peer/transactor split), a
 cost-based optimizer beyond greedy selectivity, write-heavy OLTP beyond

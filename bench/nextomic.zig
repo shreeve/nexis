@@ -5,7 +5,8 @@
 //! Zig API, not through the language: a 200k-datom employee store for
 //! `q` (joins by department and by age, an aggregate over a hash join,
 //! and one join from 1, 3 and 7 ages, either side of the nested-loop /
-//! hash-join crossover) and a 20k-entity store for `pull`. Each row
+//! hash-join crossover; then two long chains added to it) and a
+//! 20k-entity store for `pull`. Each row
 //! runs once and checks how many rows it returns before it is timed,
 //! so a timing never measures a wrong answer; the tests carry 10k-datom
 //! twins of both (test/integration/nextomic_{q,pull}.zig).
@@ -253,6 +254,52 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     var young: usize = 0;
     for (of_age[20..27]) |n| young += n;
     try benchQuery(runner, "q_join3_from_7_ages", &ages_7, young);
+
+    // Long chains, transacted after the rows above ran so their store
+    // is the 200k datoms alone: a 1000-clause chain over a 10-entity
+    // chain (planning dominates; no row survives ten hops) and a
+    // 100-clause chain over a 20k-entity chain (every step joins 20k
+    // rows), finding its ends (the relation keeps two of its 101
+    // variables) and finding every variable (it parks them).
+    try fx.transact(
+        \\[{:db/ident :chain/short :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :chain/long :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+        \\ {:db/ident :chain/end :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one}]
+    );
+    const a_end = try fx.attr("chain/end");
+    try chain(&fx, try fx.attr("chain/short"), a_end, 10);
+    try chain(&fx, try fx.attr("chain/long"), a_end, 20_000);
+    const chain_db = try fx.conn.db();
+    var short = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 1000, ":chain/short", false)) };
+    try benchQuery(runner, "q_chain_1000_clauses", &short, 0);
+    var long = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 100, ":chain/long", false)) };
+    try benchQuery(runner, "q_chain_100_over_20k", &long, 20_000 - 100);
+    var wide = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 100, ":chain/long", true)) };
+    try benchQuery(runner, "q_chain_100_find_all_over_20k", &wide, 20_000 - 100);
+}
+
+/// Transact `n` entities linked by `attr`, each to the next; the last
+/// carries `end`.
+fn chain(fx: *Fixture, attr: u32, end: u32, n: usize) !void {
+    var arena_state = std.heap.ArenaAllocator.init(fx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var ops: std.ArrayList(nextomic.Op) = .empty;
+    for (0..n - 1) |i| try ops.append(arena, .{ .add = .{ .e = tempid(i), .a = .{ .id = attr }, .v = .{ .entity = tempid(i + 1) } } });
+    try ops.append(arena, .{ .add = .{ .e = tempid(n - 1), .a = .{ .id = end }, .v = .{ .val = .{ .boolean = true } } } });
+    _ = try nextomic.transact.transactOps(fx.conn, arena, ops.items, .{});
+}
+
+/// `[:find ?x0 ?xn :where [?x0 attr ?x1] ... [?xn-1 attr ?xn]]`, or
+/// with every variable in `:find` when `every`.
+fn chainQuery(arena: Allocator, n: usize, attr: []const u8, every: bool) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll("[:find");
+    for (0..n + 1) |i| if (every or i == 0 or i == n) try out.writer.print(" ?x{d}", .{i});
+    try out.writer.writeAll(" :where");
+    for (0..n) |i| try out.writer.print(" [?x{d} {s} ?x{d}]", .{ i, attr, i + 1 });
+    try out.writer.writeByte(']');
+    return out.written();
 }
 
 /// The 20k-entity `pull` corpus: employees with a name, an age, a
