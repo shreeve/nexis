@@ -1780,7 +1780,17 @@ pub const VM = struct {
     /// `err`, with `error_detail` set to the formatted sentence (cut
     /// to nothing if it does not fit the buffer).
     fn fail(self: *VM, err: VmError, comptime fmt: []const u8, args: anytype) VmError {
-        self.error_detail = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch "";
+        self.error_detail = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch blk: {
+            // Too long for the buffer: keep what fits, cut at a
+            // character boundary, and mark the cut.
+            var w: std.Io.Writer = .fixed(&self.detail_buf);
+            w.print(fmt, args) catch {};
+            const mark = "…";
+            var end = self.detail_buf.len - mark.len;
+            while (end > 0 and self.detail_buf[end] & 0xC0 == 0x80) end -= 1;
+            @memcpy(self.detail_buf[end..][0..mark.len], mark);
+            break :blk self.detail_buf[0 .. end + mark.len];
+        };
         return err;
     }
 
@@ -4710,6 +4720,20 @@ test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
     try testing.expectError(VmError.UncaughtThrow, vm.run());
     // Should be the SECOND throw (value 2), not the first.
     try testing.expectEqual(@as(i64, 2), vm.unhandled_throw.?.asFixnum());
+}
+
+test "VM error detail: a sentence longer than the buffer is cut with an ellipsis, not dropped" {
+    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+    defer vm.deinit();
+    const name = "é" ** 150;
+    try testing.expectEqual(VmError.ArityMismatch, vm.arityError(name, 1, 1, 0));
+    try testing.expect(std.mem.startsWith(u8, vm.error_detail, "éé"));
+    try testing.expect(std.mem.endsWith(u8, vm.error_detail, "é…"));
+    try testing.expect(vm.error_detail.len <= vm.detail_buf.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(vm.error_detail));
+    // One that fits is whole.
+    try testing.expectEqual(VmError.ArityMismatch, vm.arityError("f", 1, 1, 0));
+    try testing.expectEqualStrings("f takes 1 argument, got 0", vm.error_detail);
 }
 
 test "VM ctrl: a try's finally body runs after its catch; try-enter names a try of the routine" {

@@ -722,8 +722,9 @@ natives and protocol methods alike), `an integer is not callable`,
 `+ expects numbers, got a string`, `no impl of area for a vector`,
 `a value nests too deeply to compare, hash or print`. A value's kind
 is named as the language presents it (`kindPhrase`: `nil`, `a
-boolean`, `an integer`, `a map`, ...). The detail is empty when the
-raise site has nothing to add; `run` clears it on entry and a
+boolean`, `an integer`, `a map`, ...). A sentence longer than the
+160-byte buffer keeps what fits, cut at a character, and ends in `…`.
+The detail is empty when the raise site has nothing to add; `run` clears it on entry and a
 handler clears it when it takes the error as a keyword, so it never
 describes an earlier error.
 
