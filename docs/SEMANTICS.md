@@ -358,7 +358,8 @@ How each kind prints in the `pr-str` and `str` modes is
 - `nil`, booleans, `char`, fixnum, bignum, float, string, keyword and
   symbol (as text, re-interned on read).
 - `list` (a vector view included), `vector`, `map`, `set`,
-  recursively.
+  recursively. A sorted map or set reads back as the hash map or set
+  with its entries, which is `=` to it and hashes alike.
 - Not a typed vector: it prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
 - Not a record: it prints as `#ns.Type{:field value, ...}` in both
@@ -416,7 +417,7 @@ map or `nil`; it never throws.
 
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
-| `list`, `vector`, `map`, `set`, `record` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `list`, `vector`, `map`, `set` (hash or sorted), `record` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
 | every other kind: `typed-vector`, `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
@@ -433,7 +434,7 @@ map or `nil`; it never throws.
   `merge`, `update`, `assoc-in` and the rest built on them; a
   record's `assoc` and `dissoc` keep the record's. The collection
   modules carry it from the old root to the new one (`champ`,
-  `vector`, `list.conj`, `record.withFields`).
+  `vector`, `sorted`, `list.conj`, `record.withFields`).
 - **Parts do not.** `rest`, `next`, `seq` of a vector, a list's `pop`
   and `cons` return a sequence with no metadata of its own; the rest
   of a list is its tail cell, which carries whatever it was built

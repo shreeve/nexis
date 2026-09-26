@@ -47,6 +47,7 @@ const intern_mod = @import("intern.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const string_mod = @import("string.zig");
 const heap_mod = @import("heap.zig");
 const vm_mod = @import("vm.zig");
@@ -114,7 +115,7 @@ pub fn format(
         },
         .char => try formatChar(v.asChar(), mode, writer),
         .string => try formatString(v, mode, writer),
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => {
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
             stack.check() catch {
                 dispatch.noteOverflow();
                 return writer.writeAll("#<too deep>");
@@ -124,6 +125,7 @@ pub fn format(
                 .persistent_vector => try formatVector(v, mode, writer, interner),
                 .persistent_map => try formatMap(v, mode, writer, interner),
                 .persistent_set => try formatSet(v, mode, writer, interner),
+                .sorted_map, .sorted_set => try formatSorted(v, mode, writer, interner),
                 else => try formatRecord(v, mode, writer, interner),
             }
         },
@@ -347,6 +349,30 @@ fn formatSet(
         if (!first) try writer.writeByte(' ');
         first = false;
         try format(elem, mode, writer, interner);
+    }
+    try writer.writeByte('}');
+}
+
+/// A sorted map as `{k v, k v}` and a sorted set as `#{a b}`, in
+/// order.
+fn formatSorted(
+    v: Value,
+    mode: FormatMode,
+    writer: *std.Io.Writer,
+    interner: ?*const intern_mod.Interner,
+) Error!void {
+    const is_map = v.kind() == .sorted_map;
+    try writer.writeAll(if (is_map) "{" else "#{");
+    var it = sorted_mod.Iter.init(v, true);
+    var first = true;
+    while (it.next()) |e| {
+        if (!first) try writer.writeAll(if (is_map) ", " else " ");
+        first = false;
+        try format(e.key, mode, writer, interner);
+        if (is_map) {
+            try writer.writeByte(' ');
+            try format(e.value, mode, writer, interner);
+        }
     }
     try writer.writeByte('}');
 }

@@ -606,10 +606,6 @@
 (defn distinct? [& xs]
   (= (count xs) (count (set xs))))
 
-; (rseq v) → v's elements last first, nil when empty.
-(defn rseq [v]
-  (seq (reverse v)))
-
 ; (rand-nth coll) → a random element; (shuffle coll) → a vector of
 ; coll's elements in random order.
 (defn rand-nth [coll]

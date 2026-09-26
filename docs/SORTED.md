@@ -15,18 +15,28 @@ add the kinds: PLAN Amendment Log, 2026-09-26.
 
 A sorted map or set holds its entries in the order of a comparator,
 fixed when the collection is made: the natural order (§6), or a
-function. The module provides construction, `assoc`, `conj`,
-`without`, `find`, `first`, `last`, `entryAt`, the walks (§5), and
-the hash, equality and trace entry points. Costs:
+function given to `sorted-map-by` / `sorted-set-by`. Costs:
 
 | Operation | Cost |
 |---|---|
-| `assoc`, `conj`, `without` | O(log n) comparisons; copies the O(log n) nodes on the path |
-| `find` | O(log n) comparisons, no allocation |
-| `count`; `first`, `last`, `entryAt` | O(1); O(log n) |
-| a whole walk, `hashOf` | O(n), in order |
-| `Iter.from` | O(log n) to the bound, then O(1) per entry |
-| `=` against a hash collection | O(n) with no comparator call (§7) |
+| `assoc`, `dissoc`, `conj`, `disj` | O(log n) comparisons; copies the O(log n) nodes on the path |
+| `get`, `contains?`, `find`, calling it, a keyword lookup | O(log n) comparisons, no allocation |
+| `count`, `empty?`, `first` of the collection's seq | O(1), O(1), O(log n) |
+| `seq`, `rseq`, `keys`, `vals`, `reduce`, `reduce-kv`, printing | O(n), in order; `rseq` in reverse |
+| `subseq`, `rsubseq` | O(log n) to the bound, then O(1) per entry returned |
+| `=` against a hash collection, `hash` | O(n) with no comparator call (§7) |
+
+**Absent, as in Clojure.** Transients (`(transient (sorted-map))` is
+`:kind-mismatch`), `nth`, `peek`, `pop` and sequential destructuring
+of a sorted set (`(let [[a] (seq s)] ...)` destructures its seq).
+
+**Differences.** A sorted map is not a metadata map (`with-meta`
+takes a hash map). A protocol extended to `:map` or `:set` does not
+reach a sorted collection, which has kinds of its own: extend
+`:sorted_map` or `:sorted_set` (`docs/PROTOCOLS.md` §4.3). Functions
+that build a fresh map or set (`select-keys`, `set`, `zipmap`,
+`frequencies`, `update-vals`, `nexis.set/union`) build a hash one, as
+Clojure's `select-keys` and `set` do.
 
 ---
 
@@ -95,12 +105,22 @@ keep the collection's comparator and metadata (SEMANTICS §7).
 
 ### 4. Comparators
 
-The module takes the order as a Zig value with a `pub const Error` and
-an `order(a, b) Error!std.math.Order` method: `Natural` (§6), or a
-comparator of the caller's. The root holds a comparator Value (nil for
-the natural order) for the caller to read back through
-`comparatorOf`; the module never calls it. Two keys the order calls
-equal are one key.
+`(sorted-map-by f & kvs)` and `(sorted-set-by f & xs)` order by `f`,
+coerced as Clojure's `AFunction.compare` coerces a function:
+
+- a number: its sign, after truncation toward zero (a float between -1
+  and 1 is equal, as Java's `intValue` makes it); NaN is equal;
+- `true`: less; `false` or nil: `(f b a)` decides, truthy meaning
+  greater and falsy equal, so a predicate such as `<` or `>` is a
+  comparator;
+- anything else: `:kind-mismatch`.
+
+`f` may be any callable. `(sorted-map-by compare ...)` is the natural
+order itself, stored as nil, so it serializes and compares in lock
+step with other natural-order collections. A comparator that throws
+aborts the operation with its throw and leaves the collection as it
+was. Two keys the comparator calls equal are one key: `(sorted-set-by
+(fn [a b] (compare (count a) (count b))) "ab" "cd")` is `#{"ab"}`.
 
 ---
 
@@ -115,11 +135,28 @@ position through the subtree sizes, O(log n) a step in a few words;
 the codec keeps one per open container. `first`, `last` and
 `entryAt(v, i)` answer in O(log n).
 
+`subseq` and `rsubseq` are Clojure's:
+
+- `(subseq sc test key)`, `test` one of `<` `<=` `>` `>=`: the entries
+  whose key satisfies `(test (cmp k key) 0)`, ascending. For `>` and
+  `>=` the walk starts at `key`; for `<` and `<=` it starts at the
+  least entry and stops at the first key that fails.
+- `(subseq sc start-test start-key end-test end-key)`: from
+  `start-key`, while the end test holds.
+- `rsubseq` is the same, descending: `<` and `<=` start at the key,
+  `>` and `>=` at the greatest entry.
+
+A test that is not one of the four is called as `(test (cmp k key) 0)`
+and, like Clojure, never chooses the starting point. Each returns a
+list of entries (`[k v]` for a map), or nil when nothing satisfies it.
+`(rseq sc)` is every entry, greatest first; nil when empty.
+
 ---
 
 ### 6. The natural order
 
-`sorted.naturalOrder(interner, a, b)` is Clojure's `compare`:
+`sorted.naturalOrder(interner, a, b)` is Clojure's `compare`, and the
+`compare` native, `sort` and `sort-by` use it too:
 
 | Operands | Order |
 |---|---|
@@ -130,14 +167,13 @@ the codec keeps one per open container. `first`, `last` and
 | two keywords, two symbols | an unqualified name before a qualified one, then by namespace, then by name, bytewise |
 | two chars | by scalar |
 | two vectors | the shorter first, then element by element |
-| anything else | `KindMismatch`: two kinds apart, or a kind with no order (lists, maps, sets, functions, ...) |
+| anything else | `:kind-mismatch`: two kinds apart, or a kind with no order (lists, maps, sets, functions, ...) |
 
-A natural-order collection's keys must be mutually comparable, as
-Clojure's `ClassCastException` requires: an insert that compares a
-keyword with a number is `KindMismatch`. A collection of one entry
-holds any key, since nothing is compared. The natural order equates
-`1` and `1.0`, so a sorted map holds one of them where a hash map
-holds both.
+A natural-order collection's keys must be mutually comparable: `(assoc
+(sorted-map 1 :a) :k :b)` is `:kind-mismatch`, as Clojure's
+`ClassCastException`. A collection of one entry holds any key, since
+nothing is compared. The natural order equates `1` and `1.0`, so a
+sorted map holds one of them where a hash map holds both.
 
 ---
 
@@ -162,13 +198,29 @@ order that keeps two `=` keys apart.
 
 ---
 
-### 8. Rooting
+### 8. Rooting and errors
 
-A comparator that is user code re-enters the VM and may collect
-(`docs/GC.md` §11.5). The tree module compares only on the way down,
-before it allocates, so a node it builds is never held in a Zig local
-across a comparator call. The natural order checks the stack guard at
-each level: a key nested too deeply to compare is `StackOverflow`.
+A comparator call re-enters the VM and may collect (`docs/GC.md`
+§11.5). The tree module compares only on the way down, before it
+allocates, so a node it builds is never held in a Zig local across a
+comparator call. The natives that make several updates in one call
+(`sorted-map-by`, `sorted-set-by`, `conj` and `into` of many entries,
+`assoc` and `dissoc` of several keys, `select-keys` of a sorted map)
+push each intermediate collection on the native's root scope, and
+`into` roots the entries it collected before the first update; the
+natives that collect entries for a range (`subseq`, `rsubseq`) gather
+the tree's nodes, all reachable from the argument, and build the
+result only after the last comparison. `NEXIS_GC_STRESS=1` exercises
+each (`test/integration/eval_pipeline.zig`, "gc: sorted").
+
+An incomparable key is `:kind-mismatch`; a comparator's throw
+propagates unchanged; a key nested too deeply to compare is
+`:stack-overflow` (the natural order checks the stack guard at each
+level).
+
+**A caller without a VM.** `vm.lookup` and `vm.callLookup` without a
+VM (the Nextomic query hook) find a sorted key by `=` in a linear walk
+instead of through the comparator.
 
 ---
 
@@ -185,4 +237,6 @@ vectors; P7 the collector keeping the tree through the root alone and
 sweeping a dropped path; P8 the codec round trip, equal, hash-equal,
 sorted and byte-stable. Inline tests in `sorted.zig` pin the shape
 through 2000 random and 4096 ascending inserts, the walks and the
-natural order; `codec.zig` the wire format and its refusals.
+natural order; `codec.zig` the wire format and its refusals;
+`eval_pipeline.zig` the language surface ("sorted collections: ...")
+and the rooting under the collector.

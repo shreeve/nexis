@@ -12,8 +12,8 @@
 // Every native declares its arity in its descriptor and the VM
 // enforces it; a native never indexes `args` past its declared
 // minimum. Any seqable receiver goes through `makeSeqIter`, so
-// nil, lists, vectors, maps, records, sets and strings behave the
-// same way in every sequence function. Arithmetic delegates to the
+// nil, lists, vectors, maps, records, sets (hash or sorted) and
+// strings behave the same way in every sequence function. Arithmetic delegates to the
 // VM's numeric tower. nil is the empty sequence, as in Clojure:
 //   (first nil)   => nil
 //   (rest nil)    => ()
@@ -32,6 +32,7 @@ const vector_mod = @import("coll/vector.zig");
 const typed_vector_mod = @import("coll/typed_vector.zig");
 const bignum_mod = @import("bignum.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const intern_mod = @import("intern.zig");
 const db_mod = @import("db.zig");
 const codec_mod = @import("codec.zig");
@@ -334,6 +335,16 @@ const core_natives = table("", .{
     .{ "dissoc!", 2, null, &fnDissocBang },
     .{ "disj!", 2, null, &fnDisjBang },
     .{ "pop!", 1, 1, &fnPopBang },
+    // Sorted collections (docs/SORTED.md).
+    .{ "sorted-map", 0, null, &fnSortedMap },
+    .{ "sorted-map-by", 1, null, &fnSortedMapBy },
+    .{ "sorted-set", 0, null, &fnSortedSet },
+    .{ "sorted-set-by", 1, null, &fnSortedSetBy },
+    .{ "sorted?", 1, 1, kindPredicate(sorted_mod.isSortedKind) },
+    .{ "reversible?", 1, 1, kindPredicate(isReversible) },
+    .{ "subseq", 3, 5, &fnSubseq },
+    .{ "rsubseq", 3, 5, &fnRsubseq },
+    .{ "rseq", 1, 1, &fnRseq },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
     .{ "i64-vector", 1, 1, &fnI64Vector },
     .{ "f64-vector", 1, 1, &fnF64Vector },
@@ -619,6 +630,7 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         .record => @intCast(champ_mod.mapCount(record_mod.fieldsOf(c))),
         .nextomic_entity => @intCast(champ_mod.mapCount(try nextomic_mod.natives.entityMap(vm, c))),
         .persistent_set => @intCast(champ_mod.setCount(c)),
+        .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         .transient => @intCast(try transientCount(vm, c)),
         else => return VmError.KindMismatch,
@@ -721,6 +733,7 @@ fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
         // An entity always has its :db/id.
         .nextomic_entity => false,
         .persistent_set => champ_mod.setCount(c) == 0,
+        .sorted_map, .sorted_set => sorted_mod.count(c) == 0,
         .string => string_mod.byteLen(c) == 0,
         .transient => try transientCount(vm, c) == 0,
         else => return VmError.KindMismatch,
@@ -1310,8 +1323,8 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[2];
     switch (coll.kind()) {
         .nil => {},
-        .persistent_map, .record => {
-            var it = champ_mod.mapIter(if (coll.kind() == .record) record_mod.fieldsOf(coll) else coll);
+        .persistent_map, .record, .sorted_map => {
+            var it = MapEntries.of(coll).?;
             while (it.next()) |e| {
                 acc = try vm.callValue(f, &.{ acc, e.key, e.value });
                 if (isReduced(vm, acc)) return reducedValue(acc);
@@ -1486,6 +1499,7 @@ fn fnIdenticalQ(_: *VM, args: []const Value) VmError!Value {
 /// map.
 fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
     if (args.len % 2 != 1) return VmError.ArityMismatch;
+    if (args[0].kind() == .sorted_map) return sortedAddAll(vm, args[0], args[1..]);
     var coll = args[0];
     var i: usize = 1;
     while (i < args.len) : (i += 2) {
@@ -1544,6 +1558,7 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
 
 /// `(dissoc m k & ks)` → persistent remove from a map or record.
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .sorted_map) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
     var coll = args[0];
     for (args[1..]) |k| {
@@ -1575,6 +1590,7 @@ fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(disj s x & xs)` → set without the elements.
 fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .sorted_set) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
     var coll = args[0];
     for (args[1..]) |x| {
@@ -1600,6 +1616,9 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (args[0].kind() == .string) return (try stringIndex(args[0], args[1])) orelse default;
     if (args[0].kind() == .typed_vector) return (try typedVectorIndex(vm, args[0], args[1])) orelse default;
+    // A key the order cannot place is an error, as in Clojure
+    // (SORTED.md §6).
+    if (sorted_mod.isSortedKind(args[0].kind())) return vm_mod.lookupIn(vm, args[0], args[1], default);
     return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
 }
 
@@ -1654,6 +1673,7 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
             break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
         },
         .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
+        .sorted_map, .sorted_set => value_mod.fromBool((try vm_mod.sortedFind(vm, coll, k)) != null),
         .typed_vector => blk: {
             if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
             const idx = k.asFixnum();
@@ -1693,14 +1713,13 @@ fn fnVals(vm: *VM, args: []const Value) VmError!Value {
 fn mapPart(vm: *VM, m: Value, part: enum { key, value }) VmError!Value {
     const map_v: Value = switch (m.kind()) {
         .nil => return value_mod.nilValue(),
-        .persistent_map => m,
-        .record => record_mod.fieldsOf(m),
+        .persistent_map, .record, .sorted_map => m,
         .nextomic_entity => try nextomic_mod.natives.entityMap(vm, m),
         else => return VmError.KindMismatch,
     };
     var collected: std.ArrayList(Value) = .empty;
     defer collected.deinit(vm.allocator);
-    var it = champ_mod.mapIter(map_v);
+    var it = MapEntries.of(map_v).?;
     while (it.next()) |e| {
         collected.append(vm.allocator, if (part == .key) e.key else e.value) catch return VmError.OutOfMemory;
     }
@@ -1751,8 +1770,8 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
                 // entries are all added, or nil (skipped).
                 switch (x.kind()) {
                     .nil => {},
-                    .persistent_map, .record => {
-                        var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
+                    .persistent_map, .record, .sorted_map => {
+                        var it = MapEntries.of(x).?;
                         while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
                     },
                     .persistent_vector => {
@@ -1764,6 +1783,26 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             }
             break :blk result;
         },
+        .sorted_map => blk: {
+            // The entries of every x as key-value pairs, all reachable
+            // from the arguments.
+            var kvs: std.ArrayList(Value) = .empty;
+            defer kvs.deinit(vm.allocator);
+            for (xs) |x| switch (x.kind()) {
+                .nil => {},
+                .persistent_map, .record, .sorted_map => {
+                    var it = MapEntries.of(x).?;
+                    while (it.next()) |e| kvs.appendSlice(vm.allocator, &.{ e.key, e.value }) catch return VmError.OutOfMemory;
+                },
+                .persistent_vector => {
+                    if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+                    kvs.appendSlice(vm.allocator, &.{ vector_mod.nth(x, 0), vector_mod.nth(x, 1) }) catch return VmError.OutOfMemory;
+                },
+                else => return VmError.KindMismatch,
+            };
+            break :blk try sortedAddAll(vm, coll, kvs.items);
+        },
+        .sorted_set => try sortedAddAll(vm, coll, xs),
         .persistent_set => blk: {
             var result = coll;
             for (xs) |x| {
@@ -1853,6 +1892,12 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return args[0];
+    // A sorted target's comparator can collect while `conj` runs; a
+    // map source's entries were built by the walk and reach from
+    // nothing else (GC.md §11.5, class 4).
+    const scope = vm.rootScope();
+    defer scope.release();
+    if (sorted_mod.isSortedKind(args[0].kind())) try scope.pushAll(items.items);
     const conj_args = vm.allocator.alloc(Value, items.items.len + 1) catch return VmError.OutOfMemory;
     defer vm.allocator.free(conj_args);
     conj_args[0] = args[0];
@@ -2243,14 +2288,22 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
     const src = args[0];
     switch (src.kind()) {
-        .nil, .persistent_map, .record, .persistent_vector => {},
+        .nil, .persistent_map, .record, .persistent_vector, .sorted_map => {},
         else => return VmError.KindMismatch,
     }
-    var ks = try makeSeqIter(vm, args[1]);
+    // A sorted source's comparator can collect inside `find`: the
+    // result so far and the keys the walk built are kept rooted
+    // (GC.md §11.5, class 4).
+    const scope = vm.rootScope();
+    defer scope.release();
+    const collects = src.kind() == .sorted_map and !sorted_mod.comparatorOf(src).isNil();
+    if (collects) try scope.push(out);
+    var ks = if (collects) try rootedSeqIter(vm, args[1], scope) else try makeSeqIter(vm, args[1]);
     while (try ks.next()) |k| {
         const entry = try fnFind(vm, &.{ src, k });
         if (entry.isNil()) continue;
         out = champ_mod.mapAssoc(heap, out, k, vector_mod.nth(entry, 1), &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        if (collects) try scope.push(out);
     }
     return out;
 }
@@ -2269,6 +2322,10 @@ fn fnFind(vm: *VM, args: []const Value) VmError!Value {
             const idx = k.asFixnum();
             if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(m)) return value_mod.nilValue();
             return vector_mod.fromSlice(vm.ensureHeap(), &.{ k, vector_mod.nth(m, @intCast(idx)) }) catch VmError.OutOfMemory;
+        },
+        .sorted_map => {
+            const e = (try vm_mod.sortedFind(vm, m, args[1])) orelse return value_mod.nilValue();
+            return vector_mod.fromSlice(vm.ensureHeap(), &.{ e.key, e.value }) catch VmError.OutOfMemory;
         },
         else => return VmError.KindMismatch,
     };
@@ -2325,6 +2382,7 @@ fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
         .record => return champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
         .persistent_map => champ_mod.mapEmpty(heap),
         .persistent_set => champ_mod.setEmpty(heap),
+        .sorted_map, .sorted_set => sorted_mod.empty(heap, args[0].kind(), sorted_mod.comparatorOf(args[0])),
         // A typed vector takes no updates (TYPED_VECTOR.md §8).
         .typed_vector => return VmError.KindMismatch,
         else => return value_mod.nilValue(),
@@ -2341,42 +2399,10 @@ fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
 
 // ---- ordering ----
 
-/// Total order used by `compare` and `sort`: nil sorts first;
-/// numbers order across the tower; strings, keywords and symbols
-/// by bytes; chars by scalar; false before true; vectors by count
-/// then elementwise. Comparing different kinds is a
-/// `KindMismatch`.
+/// Total order used by `compare` and `sort`: Clojure's `compare`,
+/// which sorted collections share (SORTED.md §6).
 fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
-    stack_guard.check() catch return VmError.StackOverflow;
-    const ka = a.kind();
-    const kb = b.kind();
-    if (ka == .nil and kb == .nil) return .eq;
-    if (ka == .nil) return .lt;
-    if (kb == .nil) return .gt;
-    if (vm_mod.isNumber(a) and vm_mod.isNumber(b)) {
-        if (try vm_mod.numCompare(.lt, a, b)) return .lt;
-        if (try vm_mod.numCompare(.gt, a, b)) return .gt;
-        return .eq;
-    }
-    if (a.isBool() and b.isBool()) return std.math.order(@intFromBool(a.asBool()), @intFromBool(b.asBool()));
-    if (ka != kb) return VmError.KindMismatch;
-    return switch (ka) {
-        .string => std.mem.order(u8, string_mod.asBytes(a), string_mod.asBytes(b)),
-        .keyword, .symbol => intern_mod.Interner.compareNames(try internedName(vm, a), try internedName(vm, b)),
-        .char => std.math.order(a.asChar(), b.asChar()),
-        .persistent_vector => blk: {
-            const na = vector_mod.count(a);
-            const nb = vector_mod.count(b);
-            if (na != nb) break :blk std.math.order(na, nb);
-            var i: usize = 0;
-            while (i < na) : (i += 1) {
-                const o = try compareValues(vm, vector_mod.nth(a, i), vector_mod.nth(b, i));
-                if (o != .eq) break :blk o;
-            }
-            break :blk .eq;
-        },
-        else => VmError.KindMismatch,
-    };
+    return vm_mod.naturalOrder(vm, a, b);
 }
 
 fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
@@ -2620,7 +2646,7 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 
 fn carriesHeaderMeta(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => true,
         else => false,
     };
 }
@@ -2785,10 +2811,10 @@ fn isVector(k: Kind) bool {
     return k == .persistent_vector;
 }
 fn isMap(k: Kind) bool {
-    return k == .persistent_map or k == .record;
+    return k == .persistent_map or k == .record or k == .sorted_map;
 }
 fn isSet(k: Kind) bool {
-    return k == .persistent_set;
+    return k == .persistent_set or k == .sorted_set;
 }
 fn isKeyword(k: Kind) bool {
     return k == .keyword;
@@ -2804,7 +2830,7 @@ fn isBoolean(k: Kind) bool {
 }
 fn isColl(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => true,
         else => false,
     };
 }
@@ -2812,7 +2838,7 @@ fn isSequential(k: Kind) bool {
     return k == .list or k == .persistent_vector;
 }
 fn isAssociative(k: Kind) bool {
-    return k == .persistent_map or k == .persistent_vector or k == .record;
+    return k == .persistent_map or k == .persistent_vector or k == .record or k == .sorted_map;
 }
 fn isFn(k: Kind) bool {
     return switch (k) {
@@ -3420,9 +3446,9 @@ fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!Value {
     const heap = vm.ensureHeap();
     switch (x.kind()) {
         .nil => return t,
-        .persistent_map, .record => {
+        .persistent_map, .record, .sorted_map => {
             var result = t;
-            var it = champ_mod.mapIter(if (x.kind() == .record) record_mod.fieldsOf(x) else x);
+            var it = MapEntries.of(x).?;
             while (it.next()) |e| result = transient_mod.mapAssocBang(heap, result, e.key, e.value, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
             return result;
         },
@@ -4496,7 +4522,7 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
 fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    if (items.items.len == 1 and (items.items[0].kind() == .persistent_map or items.items[0].kind() == .record)) return items.items[0];
+    if (items.items.len == 1 and isMap(items.items[0].kind())) return items.items[0];
     if (items.items.len % 2 != 0) return VmError.InvalidArgument;
     const heap = vm.ensureHeap();
     var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
@@ -4592,6 +4618,7 @@ const SeqIter = struct {
         typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
         map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
         set: champ_mod.SetIter,
+        sorted: struct { it: sorted_mod.Iter, heap: *heap_mod.Heap },
         string: std.unicode.Utf8Iterator,
     },
     roots: ?vm_mod.RootScope = null,
@@ -4617,6 +4644,11 @@ const SeqIter = struct {
                 return try self.built(vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch return VmError.OutOfMemory);
             },
             .set => |*it| return it.next(),
+            .sorted => |*st| {
+                const e = st.it.next() orelse return null;
+                if (!st.it.is_map) return e.key;
+                return try self.built(vector_mod.fromSlice(st.heap, &.{ e.key, e.value }) catch return VmError.OutOfMemory);
+            },
             .string => |*utf8| {
                 const scalar = utf8.nextCodepoint() orelse return null;
                 return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
@@ -4632,7 +4664,8 @@ const SeqIter = struct {
 
 /// Every seqable receiver: nil, list, vector, map (as `[k v]`
 /// entries), record (its field map), lazy entity (its attributes,
-/// read in one pass), set and string (as chars). A string that is
+/// read in one pass), set, sorted map and set (in order) and string
+/// (as chars). A string that is
 /// not valid UTF-8 is `:utf8-error`, as for every other string
 /// operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
@@ -4645,6 +4678,7 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
         .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
         .nextomic_entity => .{ .map = .{ .it = champ_mod.mapIter(try nextomic_mod.natives.entityMap(vm, coll)), .heap = vm.ensureHeap() } },
         .persistent_set => .{ .set = champ_mod.setIter(coll) },
+        .sorted_map, .sorted_set => .{ .sorted = .{ .it = sorted_mod.Iter.init(coll, true), .heap = vm.ensureHeap() } },
         .string => .{
             .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),
         },
@@ -4681,6 +4715,245 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
 /// `Heap.alloc` never collects (VM.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
     return list_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
+}
+
+// =============================================================================
+// Sorted collections (docs/SORTED.md)
+//
+// A comparator of the user's re-enters the VM and may collect. The
+// natives that update a sorted collection more than once in one call
+// keep each intermediate collection on a root scope (GC.md §11.5,
+// class 4); `subseq` and `rsubseq` gather the tree's own entries and
+// build the result after the last comparison.
+// =============================================================================
+
+/// The entries of a hash map, record or sorted map, in its order.
+const MapEntries = union(enum) {
+    champ: champ_mod.MapIter,
+    sorted: sorted_mod.Iter,
+
+    fn of(m: Value) ?MapEntries {
+        return switch (m.kind()) {
+            .persistent_map => .{ .champ = champ_mod.mapIter(m) },
+            .record => .{ .champ = champ_mod.mapIter(record_mod.fieldsOf(m)) },
+            .sorted_map => .{ .sorted = sorted_mod.Iter.init(m, true) },
+            else => null,
+        };
+    }
+
+    fn next(self: *MapEntries) ?sorted_mod.Entry {
+        switch (self.*) {
+            .champ => |*it| {
+                const e = it.next() orelse return null;
+                return .{ .key = e.key, .value = e.value };
+            },
+            .sorted => |*it| return it.next(),
+        }
+    }
+};
+
+fn isReversible(k: Kind) bool {
+    return k == .persistent_vector or sorted_mod.isSortedKind(k);
+}
+
+/// The comparator a `-by` constructor keeps: `compare` itself is the
+/// natural order, kept as nil (SORTED.md §4).
+fn comparatorArg(f: Value) Value {
+    if (f.kind() == .native_fn and vm_mod.asNativeFn(f).call == &fnCompare) return value_mod.nilValue();
+    return f;
+}
+
+/// `coll`, a sorted map or set, with `items` added: key-value pairs
+/// for a map (an odd count is `:arity-mismatch`), elements for a set.
+fn sortedAddAll(vm: *VM, coll: Value, items: []const Value) VmError!Value {
+    const is_map = coll.kind() == .sorted_map;
+    if (is_map and items.len % 2 != 0) return VmError.ArityMismatch;
+    const heap = vm.ensureHeap();
+    const order = vm_mod.SortedOrder.of(vm, coll);
+    const collects = !order.comparator.isNil();
+    const scope = vm.rootScope();
+    defer scope.release();
+    var acc = coll;
+    if (collects) try scope.push(acc);
+    var i: usize = 0;
+    while (i < items.len) : (i += if (is_map) 2 else 1) {
+        acc = (if (is_map)
+            sorted_mod.assoc(heap, acc, items[i], items[i + 1], order)
+        else
+            sorted_mod.conj(heap, acc, items[i], order)) catch |err| return vm_mod.sortedFailure(err);
+        if (collects) try scope.push(acc);
+    }
+    return acc;
+}
+
+/// `coll`, a sorted map or set, without `keys`.
+fn sortedRemoveAll(vm: *VM, coll: Value, keys: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const order = vm_mod.SortedOrder.of(vm, coll);
+    const collects = !order.comparator.isNil();
+    const scope = vm.rootScope();
+    defer scope.release();
+    var acc = coll;
+    for (keys) |k| {
+        acc = sorted_mod.without(heap, acc, k, order) catch |err| return vm_mod.sortedFailure(err);
+        if (collects) try scope.push(acc);
+    }
+    return acc;
+}
+
+fn sortedFrom(vm: *VM, kind: Kind, comparator: Value, items: []const Value) VmError!Value {
+    const empty = sorted_mod.empty(vm.ensureHeap(), kind, comparator) catch return VmError.OutOfMemory;
+    return sortedAddAll(vm, empty, items);
+}
+
+/// `(sorted-map & kvs)`, `(sorted-map-by f & kvs)`,
+/// `(sorted-set & xs)`, `(sorted-set-by f & xs)`: a later equal key
+/// replaces the value and keeps the first key object.
+fn fnSortedMap(vm: *VM, args: []const Value) VmError!Value {
+    return sortedFrom(vm, .sorted_map, value_mod.nilValue(), args);
+}
+
+fn fnSortedMapBy(vm: *VM, args: []const Value) VmError!Value {
+    return sortedFrom(vm, .sorted_map, comparatorArg(args[0]), args[1..]);
+}
+
+fn fnSortedSet(vm: *VM, args: []const Value) VmError!Value {
+    return sortedFrom(vm, .sorted_set, value_mod.nilValue(), args);
+}
+
+fn fnSortedSetBy(vm: *VM, args: []const Value) VmError!Value {
+    return sortedFrom(vm, .sorted_set, comparatorArg(args[0]), args[1..]);
+}
+
+/// The relation a `subseq` test names when it is one of `<`, `<=`,
+/// `>`, `>=`.
+const Relation = enum { lt, lte, gt, gte };
+
+fn relationOf(f: Value) ?Relation {
+    if (f.kind() != .native_fn) return null;
+    const call = vm_mod.asNativeFn(f).call;
+    if (call == &fnLt) return .lt;
+    if (call == &fnLte) return .lte;
+    if (call == &fnGt) return .gt;
+    if (call == &fnGte) return .gte;
+    return null;
+}
+
+/// One bound of a `subseq`: whether `(test (cmp k key) 0)` holds. A
+/// test other than the four relations is called on the comparison's
+/// sign (class 2: its arguments are immediates).
+const Bound = struct {
+    vm: *VM,
+    order: vm_mod.SortedOrder,
+    test_fn: Value,
+    key: Value,
+
+    fn holds(b: Bound, k: Value) VmError!bool {
+        const o = try b.order.order(k, b.key);
+        if (relationOf(b.test_fn)) |r| return switch (r) {
+            .lt => o == .lt,
+            .lte => o != .gt,
+            .gt => o == .gt,
+            .gte => o != .lt,
+        };
+        const sign = value_mod.fromFixnum(switch (o) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        }).?;
+        return (try b.vm.callValue(b.test_fn, &.{ sign, value_mod.fromFixnum(0).? })).isTruthy();
+    }
+};
+
+/// `(subseq sc test key)` / `(subseq sc start-test start-key end-test
+/// end-key)`, and `rsubseq` descending (SORTED.md §5): Clojure's
+/// walks, returning a list of entries or nil.
+fn subseqImpl(vm: *VM, args: []const Value, ascending: bool) VmError!Value {
+    if (args.len == 4) return VmError.ArityMismatch;
+    const sc = args[0];
+    if (!sorted_mod.isSortedKind(sc.kind())) return VmError.KindMismatch;
+    const order = vm_mod.SortedOrder.of(vm, sc);
+    var found: std.ArrayList(sorted_mod.Entry) = .empty;
+    defer found.deinit(vm.allocator);
+    if (args.len == 3) {
+        const b: Bound = .{ .vm = vm, .order = order, .test_fn = args[1], .key = args[2] };
+        const r = relationOf(args[1]);
+        // `subseq` starts at the key for `>` and `>=`, `rsubseq` for
+        // `<` and `<=`; any other test walks from the first entry.
+        const from_key = if (r) |rel| (if (ascending) rel == .gt or rel == .gte else rel == .lt or rel == .lte) else false;
+        if (from_key) {
+            var it = try sorted_mod.Iter.from(sc, b.key, ascending, order);
+            if (it.next()) |e| if (try b.holds(e.key)) found.append(vm.allocator, e) catch return VmError.OutOfMemory;
+            while (it.next()) |e| found.append(vm.allocator, e) catch return VmError.OutOfMemory;
+        } else {
+            var it = sorted_mod.Iter.init(sc, ascending);
+            while (it.next()) |e| {
+                if (!try b.holds(e.key)) break;
+                found.append(vm.allocator, e) catch return VmError.OutOfMemory;
+            }
+        }
+    } else {
+        const start: Bound = .{ .vm = vm, .order = order, .test_fn = args[1], .key = args[2] };
+        const end: Bound = .{ .vm = vm, .order = order, .test_fn = args[3], .key = args[4] };
+        const near, const far = if (ascending) .{ start, end } else .{ end, start };
+        var it = try sorted_mod.Iter.from(sc, near.key, ascending, order);
+        var next = it.next();
+        if (next) |e| if (!try near.holds(e.key)) {
+            next = it.next();
+        };
+        while (next) |e| : (next = it.next()) {
+            if (!try far.holds(e.key)) break;
+            found.append(vm.allocator, e) catch return VmError.OutOfMemory;
+        }
+    }
+    return entriesList(vm, sc.kind() == .sorted_map, found.items);
+}
+
+fn fnSubseq(vm: *VM, args: []const Value) VmError!Value {
+    return subseqImpl(vm, args, true);
+}
+
+fn fnRsubseq(vm: *VM, args: []const Value) VmError!Value {
+    return subseqImpl(vm, args, false);
+}
+
+/// The list of `entries` (`[k v]` vectors for a map, the keys for a
+/// set), or nil when there are none. Nothing calls back in while it
+/// builds.
+fn entriesList(vm: *VM, is_map: bool, entries: []const sorted_mod.Entry) VmError!Value {
+    if (entries.len == 0) return value_mod.nilValue();
+    const items = vm.allocator.alloc(Value, entries.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(items);
+    for (items, entries) |*slot, e| slot.* = if (is_map)
+        vector_mod.fromSlice(vm.ensureHeap(), &.{ e.key, e.value }) catch return VmError.OutOfMemory
+    else
+        e.key;
+    return buildListFromSlice(vm, items);
+}
+
+/// `(rseq rev)` → the elements of a vector or sorted collection last
+/// first, nil when it is empty; anything else is `:kind-mismatch`, as
+/// Clojure's `Reversible` requires.
+fn fnRseq(vm: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    switch (c.kind()) {
+        .persistent_vector => {
+            const n = vector_mod.count(c);
+            if (n == 0) return value_mod.nilValue();
+            const items = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(items);
+            for (items, 0..) |*slot, i| slot.* = vector_mod.nth(c, n - 1 - i);
+            return buildListFromSlice(vm, items);
+        },
+        .sorted_map, .sorted_set => {
+            const entries = vm.allocator.alloc(sorted_mod.Entry, sorted_mod.count(c)) catch return VmError.OutOfMemory;
+            defer vm.allocator.free(entries);
+            var it = sorted_mod.Iter.init(c, false);
+            for (entries) |*slot| slot.* = it.next().?;
+            return entriesList(vm, c.kind() == .sorted_map, entries);
+        },
+        else => return VmError.KindMismatch,
+    }
 }
 
 // =============================================================================

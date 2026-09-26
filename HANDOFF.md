@@ -300,7 +300,7 @@ failing test (AGENTS.md).
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-2. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
+2. **Library absences**: regex (§24 #9),
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
