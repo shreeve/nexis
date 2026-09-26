@@ -481,7 +481,7 @@ const Builder = struct {
 
     fn attrKeyword(self: *Builder, a: u32) !Value {
         const k = (try self.conn.idents.internOf(self.txn, a)) orelse return error.Corrupted;
-        return value.fromKeywordId(k);
+        return self.vm.ensureInterner().keywordValue(k);
     }
 
     fn val(self: *Builder, v: Val) !Value {
@@ -927,7 +927,7 @@ fn identNative(vm: *VM, args: []const Value) !Value {
             const n = x.asFixnum();
             if (n <= 0 or n > @as(i64, @intCast(key.id_max))) return value.nilValue();
             const k = (try sc.rd.ident(arena, @intCast(n))) orelse return value.nilValue();
-            return value.fromKeywordId(k);
+            return vm.ensureInterner().keywordValue(k);
         },
         .keyword => {
             if ((try sc.rd.entid(arena, .{ .ident = x.asKeywordId() })) == null) return value.nilValue();

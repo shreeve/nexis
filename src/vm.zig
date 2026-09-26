@@ -2715,8 +2715,7 @@ pub const VM = struct {
         // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
         const interner = self.ensureInterner();
-        const id = interner.internKeyword(kw_name) catch return err;
-        const payload = value_mod.fromKeywordId(id);
+        const payload = interner.internKeywordValue(kw_name) catch return err;
         const origin = try self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
@@ -3469,8 +3468,8 @@ pub const VM = struct {
 
     /// `throwValue` of the keyword named `name`.
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
-        const id = self.ensureInterner().internKeyword(name) catch return VmError.OutOfMemory;
-        return self.throwValue(value_mod.fromKeywordId(id));
+        const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
+        return self.throwValue(kw);
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow`,

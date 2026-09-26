@@ -251,7 +251,7 @@ const Naive = struct {
         var m = try champ.mapEmpty(&self.fx.heap);
         m = try self.assoc(m, self.k_db_id, value.fromFixnum(@intCast(e)).?);
         if (key.isAttrPartition(e)) {
-            if (try self.dbv.ident(self.arena, e)) |k| m = try self.assoc(m, self.k_db_ident, value.fromKeywordId(k));
+            if (try self.dbv.ident(self.arena, e)) |k| m = try self.assoc(m, self.k_db_ident, self.fx.interner().keywordValue(k));
         }
         return m;
     }
@@ -376,7 +376,7 @@ const Naive = struct {
                 if (covered.contains(ea.a)) continue;
                 const attr = (try self.dbv.attr(ea.a)).?;
                 const k = (try self.dbv.conn.idents.internOf(self.txn, ea.a)).?;
-                const spec: Spec = .{ .attr = attr, .reverse = false, .k = value.fromKeywordId(k), .limit = default_limit, .default = null };
+                const spec: Spec = .{ .attr = attr, .reverse = false, .k = self.fx.interner().keywordValue(k), .limit = default_limit, .default = null };
                 _ = try self.emit(&m, pattern, ent, e, spec, .none, budget);
             }
         }

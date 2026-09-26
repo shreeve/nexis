@@ -104,12 +104,12 @@ pub fn format(
             // user-visible runtime path. Caller guarantees the
             // interner outlives the Value tree being formatted.
             const it = interner.?;
-            const id: u32 = @intCast(v.payload);
+            const id: u32 = v.asKeywordId();
             try writer.print(":{s}", .{it.keywordName(id)});
         },
         .symbol => {
             const it = interner.?;
-            const id: u32 = @intCast(v.payload);
+            const id: u32 = v.asSymbolId();
             try writer.print("{s}", .{it.symbolName(id)});
         },
         .char => try formatChar(v.asChar(), mode, writer),

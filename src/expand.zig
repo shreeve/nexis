@@ -1179,7 +1179,7 @@ fn callUserMacro(
 fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]const u8 {
     switch (thrown.kind()) {
         .string => return string_mod.asBytes(thrown),
-        .keyword => return std.fmt.allocPrint(ctx.allocator, ":{s}", .{ctx.interner.keywordName(@intCast(thrown.payload))}),
+        .keyword => return std.fmt.allocPrint(ctx.allocator, ":{s}", .{ctx.interner.keywordName(thrown.asKeywordId())}),
         .persistent_map => for ([_][]const u8{ "message", "error" }) |key_name| {
             const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
             switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
@@ -1275,8 +1275,8 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         .float => .{ .real = v.asFloat() },
         .char => .{ .char = v.asChar() },
         .string => .{ .string = try ctx.allocator.dupe(u8, string_mod.asBytes(v)) },
-        .symbol => .{ .symbol = nameOf(ctx.interner.symbolName(@intCast(v.payload))) },
-        .keyword => .{ .keyword = nameOf(ctx.interner.keywordName(@intCast(v.payload))) },
+        .symbol => .{ .symbol = nameOf(ctx.interner.symbolName(v.asSymbolId())) },
+        .keyword => .{ .keyword = nameOf(ctx.interner.keywordName(v.asKeywordId())) },
         .list => blk: {
             var items: std.ArrayList(*Form) = .empty;
             var node = v;

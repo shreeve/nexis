@@ -58,7 +58,7 @@ fn randKey(rand: std.Random) Value {
     // (exercises the general-purpose key path).
     const pick = rand.uintLessThan(u8, 2);
     return switch (pick) {
-        0 => value.fromKeywordId(rand.uintLessThan(u32, 1024)),
+        0 => value.testKeyword(rand.uintLessThan(u32, 1024)),
         1 => value.fromFixnum(rand.intRangeAtMost(i64, -1000, 1000)).?,
         else => unreachable,
     };
@@ -68,7 +68,7 @@ fn randValue(rand: std.Random) Value {
     const pick = rand.uintLessThan(u8, 4);
     return switch (pick) {
         0 => value.fromFixnum(rand.intRangeAtMost(i64, -10_000, 10_000)).?,
-        1 => value.fromKeywordId(rand.uintLessThan(u32, 32)),
+        1 => value.testKeyword(rand.uintLessThan(u32, 32)),
         2 => value.nilValue(),
         3 => value.fromBool(rand.boolean()),
         else => unreachable,
@@ -420,7 +420,7 @@ test "M7: map never equal to non-associative Values" {
     const m = try champ.mapAssoc(
         &heap,
         try champ.mapEmpty(&heap),
-        value.fromKeywordId(1),
+        value.testKeyword(1),
         value.fromFixnum(1).?,
         &dispatch.hashValue,
         &dispatch.equal,
@@ -432,7 +432,7 @@ test "M7: map never equal to non-associative Values" {
         value.fromFixnum(0).?,
         value.fromFixnum(1).?,
         value.fromFloat(0.0),
-        value.fromKeywordId(1),
+        value.testKeyword(1),
         value.fromChar('a').?,
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
@@ -523,14 +523,14 @@ test "M9: keyword-keyed maps give identical results to fixnum-keyed maps" {
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const v = randValue(r);
-            m_kw = try champ.mapAssoc(&heap, m_kw, value.fromKeywordId(i), v, &dispatch.hashValue, &dispatch.equal);
+            m_kw = try champ.mapAssoc(&heap, m_kw, value.testKeyword(i), v, &dispatch.hashValue, &dispatch.equal);
             m_fx = try champ.mapAssoc(&heap, m_fx, value.fromFixnum(@intCast(i)).?, v, &dispatch.hashValue, &dispatch.equal);
         }
         try std.testing.expectEqual(champ.mapCount(m_kw), champ.mapCount(m_fx));
         // Every key lookup must match presence and value between them.
         i = 0;
         while (i < n) : (i += 1) {
-            const kw = champ.mapGet(m_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            const kw = champ.mapGet(m_kw, value.testKeyword(i), &dispatch.hashValue, &dispatch.equal);
             const fx = champ.mapGet(m_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
             switch (kw) {
                 .absent => try std.testing.expect(fx == .absent),
@@ -928,7 +928,7 @@ test "S6: set never equal to non-set Values" {
     const s = try champ.setConj(
         &heap,
         try champ.setEmpty(&heap),
-        value.fromKeywordId(1),
+        value.testKeyword(1),
         &dispatch.hashValue,
         &dispatch.equal,
     );
@@ -936,7 +936,7 @@ test "S6: set never equal to non-set Values" {
         value.nilValue(),
         value.fromBool(true),
         value.fromFixnum(0).?,
-        value.fromKeywordId(1),
+        value.testKeyword(1),
         value.fromChar('a').?,
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
@@ -1003,13 +1003,13 @@ test "S8: keyword-element sets give identical results to fixnum-element sets" {
         var s_fx = try champ.setEmpty(&heap);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            s_kw = try champ.setConj(&heap, s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            s_kw = try champ.setConj(&heap, s_kw, value.testKeyword(i), &dispatch.hashValue, &dispatch.equal);
             s_fx = try champ.setConj(&heap, s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
         }
         try std.testing.expectEqual(champ.setCount(s_kw), champ.setCount(s_fx));
         i = 0;
         while (i < n) : (i += 1) {
-            const in_kw = champ.setContains(s_kw, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+            const in_kw = champ.setContains(s_kw, value.testKeyword(i), &dispatch.hashValue, &dispatch.equal);
             const in_fx = champ.setContains(s_fx, value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
             try std.testing.expectEqual(in_kw, in_fx);
         }

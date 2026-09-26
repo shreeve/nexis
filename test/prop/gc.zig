@@ -301,11 +301,11 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
     while (i < depth) : (i += 1) {
         node = switch (i % 4) {
             0 => try vector_mod.fromSlice(&heap, &.{node}),
-            1 => try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.fromKeywordId(1), node, &dispatch.hashValue, &dispatch.equal),
+            1 => try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.testKeyword(1), node, &dispatch.hashValue, &dispatch.equal),
             2 => try nx.atom.make(&heap, node),
             // A fresh string whose metadata map holds the level below.
             else => blk: {
-                const m = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.fromKeywordId(2), node, &dispatch.hashValue, &dispatch.equal);
+                const m = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), value.testKeyword(2), node, &dispatch.hashValue, &dispatch.equal);
                 const s = try string.fromBytes(&heap, "m");
                 Heap.asHeapHeader(s).setMeta(Heap.asHeapHeader(m));
                 break :blk s;
@@ -325,7 +325,7 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
         cur = switch (cur.kind()) {
             .persistent_vector => vector_mod.nth(cur, 0),
             .persistent_map => for ([_]u32{ 1, 2 }) |k| {
-                switch (champ.mapGet(cur, value.fromKeywordId(k), &dispatch.hashValue, &dispatch.equal)) {
+                switch (champ.mapGet(cur, value.testKeyword(k), &dispatch.hashValue, &dispatch.equal)) {
                     .present => |v| break v,
                     .absent => {},
                 }

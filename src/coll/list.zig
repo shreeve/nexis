@@ -440,7 +440,7 @@ test "cons body: head / tail are the same Value bits we stored" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const e = try empty(&heap);
-    const kw = value.fromKeywordId(7);
+    const kw = value.testKeyword(7);
     const lst = try cons(&heap, kw, e);
 
     const h_value = head(lst);
@@ -550,11 +550,11 @@ test "hashSeq: equal lists produce equal base hashes (different allocations)" {
     defer heap.deinit();
     const a = try fromSlice(&heap, &.{
         value.fromFixnum(7).?,
-        value.fromKeywordId(3),
+        value.testKeyword(3),
     });
     const b = try fromSlice(&heap, &.{
         value.fromFixnum(7).?,
-        value.fromKeywordId(3),
+        value.testKeyword(3),
     });
     const ha = hashSeq(a, &callbackHashImmediateOnly);
     const hb = hashSeq(b, &callbackHashImmediateOnly);
