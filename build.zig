@@ -92,6 +92,7 @@ pub fn build(b: *std.Build) void {
         .name = "nextomic-unit",
         .root_module = nexis,
         .filters = &.{"nextomic"},
+        .use_llvm = useLlvm(target),
     }));
     nextomic_unit.setCwd(b.path("."));
     nextomic_test_step.dependOn(&nextomic_unit.step);
@@ -139,8 +140,8 @@ pub fn build(b: *std.Build) void {
     // release supports; nothing runs. The musl builds are the static
     // binaries.
     const check_targets_step = b.step("check-targets", "Compile and link every binary and test binary for Linux (x86_64 and aarch64, glibc and musl)");
-    for (linux_targets) |triple| {
-        const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = triple }) catch unreachable);
+    for (linux_targets) |t| {
+        const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
         const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize));
         for ([_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit } ++ cross_bins.suites) |compile| {
             _ = compile.getEmittedBin();
@@ -439,8 +440,16 @@ const suites = [_]Suite{
 };
 
 /// The targets `check-targets` compiles for: Linux on both
-/// architectures, glibc and musl (the static binary).
-const linux_targets = [_][]const u8{ "x86_64-linux-gnu", "aarch64-linux-gnu", "x86_64-linux-musl", "aarch64-linux-musl" };
+/// architectures, glibc and musl (the static binary). x86_64 is
+/// checked at the x86-64-v3 level, the CPU of every current CI runner
+/// and server, so emdb's SSE4.2 and AVX2 paths compile as they will
+/// on a native build; baseline x86_64 would skip them.
+const linux_targets = [_]struct { triple: []const u8, cpu: []const u8 }{
+    .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3" },
+    .{ .triple = "aarch64-linux-gnu", .cpu = "baseline" },
+    .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v3" },
+    .{ .triple = "aarch64-linux-musl", .cpu = "baseline" },
+};
 
 const Binaries = struct {
     nexis: *std.Build.Step.Compile,
@@ -470,7 +479,7 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         });
         module.addImport("nexis", nexis);
         module.addImport("harness", harness);
-        bin.* = b.addTest(.{ .name = std.fs.path.stem(suite.path), .root_module = module });
+        bin.* = b.addTest(.{ .name = std.fs.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
     }
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
@@ -480,7 +489,7 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     });
     cli_mod.addImport("emdb", emdbModule(b, target, optimize));
     return .{
-        .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod }),
+        .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) }),
         .golden = b.addExecutable(.{
             .name = "nexis-golden",
             .root_module = b.createModule(.{
@@ -488,9 +497,10 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
                 .target = target,
                 .optimize = optimize,
             }),
+            .use_llvm = useLlvm(target),
         }),
         .bench = benchExe(b, target, optimize, nexis),
-        .unit = b.addTest(.{ .name = "unit", .root_module = nexis }),
+        .unit = b.addTest(.{ .name = "unit", .root_module = nexis, .use_llvm = useLlvm(target) }),
         .suites = suite_bins,
     };
 }
@@ -502,7 +512,17 @@ fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         .optimize = optimize,
     });
     module.addImport("nexis", nexis);
-    return b.addExecutable(.{ .name = "nexis-bench", .root_module = module });
+    return b.addExecutable(.{ .name = "nexis-bench", .root_module = module, .use_llvm = useLlvm(target) });
+}
+
+/// Every binary on x86_64 compiles through LLVM, whatever the optimize
+/// mode. Zig 0.16's own x86_64 backend, the default for Debug there,
+/// rejects the `"q"` byte-register constraint in emdb's hardware CRC
+/// step (`emdb/src/simd.zig`, compiled when the CPU has SSE4.2); LLVM
+/// accepts it, and release builds use LLVM already. Elsewhere the
+/// compiler chooses.
+fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
+    return if (target.result.cpu.arch == .x86_64) true else null;
 }
 
 /// The `nexis` module: the whole runtime, rooted at src/root.zig. It
