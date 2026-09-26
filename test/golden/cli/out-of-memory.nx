@@ -1,0 +1,11 @@
+; An allocation the runtime cannot have is a runtime error: the report
+; locates the form that asked for it (exit 5). The golden runs with
+; NEXIS_MAX_ALLOC=16777216, so the list below, 16 bytes an element,
+; fails as it passes 16 MiB instead of exhausting the machine.
+
+(defn fill [n]
+  (count (repeat n 0)))
+
+(println "before")
+(fill 100000000)
+(println "never")

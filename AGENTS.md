@@ -62,9 +62,12 @@ changes to emdb.
   before committing it.
 - `-Doptimize=ReleaseFast` applies to any step. A Debug binary is not
   a performance measurement.
-- `NEXIS_GC_STRESS=1` makes every VM collect every 4 KiB of
-  allocation (`docs/GC.md` §7); `NEXIS_GC_STRESS=1 zig build test`
-  proves the natives' rooting. It is the only environment variable.
+- The runtime reads two environment variables. `NEXIS_GC_STRESS=1`
+  makes every VM collect every 4 KiB of allocation (`docs/GC.md` §7);
+  `NEXIS_GC_STRESS=1 zig build test` proves the natives' rooting.
+  `NEXIS_MAX_ALLOC=BYTES` refuses every allocation past BYTES
+  (`docs/TOOLING.md` §1); the out-of-memory and REPL goldens set it
+  on their runs, which otherwise start from an empty environment.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
 
