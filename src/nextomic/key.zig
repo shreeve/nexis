@@ -13,7 +13,7 @@
 //!   - Strings and byte arrays carry one tag each. Up to `inline_max`
 //!     bytes they are stored inline; longer ones become an equality key
 //!     (the escaped 64-byte prefix, then `0x00`, `out_of_line_mark` and
-//!     the 128-bit hash) and the full payload lives in the EAVT value.
+//!     the 128-bit hash) and the full payload lives in the EAVT-h values.
 //!     The one tag keeps byte order equal to value order across the
 //!     threshold whenever two values differ within their first 64 bytes.
 //!   - `-0.0` is stored as `+0.0`; NaN is refused with `error.ValueType`.
@@ -418,8 +418,8 @@ pub const Digest = struct {
 };
 
 /// A value decoded from an index key: exact for inline values, a digest
-/// for out-of-line strings and byte arrays (the full value is in the
-/// EAVT payload).
+/// for out-of-line strings and byte arrays (the full value is the
+/// payload of the fact's EAVT-h rows).
 pub const KeyVal = union(enum) {
     val: Val,
     string_long: Digest,

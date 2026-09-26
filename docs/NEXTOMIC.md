@@ -54,7 +54,7 @@ file's page size from its meta and fixes it for the file's life
 a store is never opened another way and the 4078-byte hard key bound
 holds on every platform. Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
-byte array in EAVT or a transaction's txlog entry, is at most 65 535
+byte array in EAVT-h or a transaction's txlog entry, is at most 65 535
 overflow pages, just under 1 GiB; past that the engine refuses the
 write as `:db/value-too-large` and the transaction aborts.
 
@@ -84,11 +84,11 @@ wait on itself.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` + full payload for out-of-line values |
+| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` (format 1 also wrote the payload of an out-of-line value after it) |
 | `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
 | `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
 | `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or the full payload |
+| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or the full payload of an out-of-line value |
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
@@ -153,7 +153,7 @@ value, a bignum past `±2^47`. An integer outside i64 is
 `:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
 or an `index-range` bound. A key holds every long in the same 8
 bytes, and the txlog spells one past the fixnum range as the codec's
-bignum; the format number stays 1. A build that takes longs in the
+bignum; neither changes the format number. A build that takes longs in the
 fixnum range only reads such a file's fixnum-range values and refuses
 a wider one, `:nextomic/value-type` from an index and `:db/corrupted`
 from the txlog, never misreading it. String order is UTF-8 byte order,
@@ -172,9 +172,14 @@ and two out-of-line values order by hash (two seeded xxh3-64 lanes).
 The decoder tells the shapes apart by the bare `0x00`: an inline value
 ends there, an out-of-line one continues with `0x01` and the hash.
 Range predicates compare decoded values, never index keys, so they are
-exact on long strings. The full value is stored in the `nx/eavt` value
-after the 6-byte `t` (and in `nx/eavt-h`); an AVET or AEVT hit on a
-long value is confirmed by an EAVT point read before it is returned.
+exact on long strings. The full value is the value of each of the
+fact's `nx/eavt-h` rows, assertions and retractions alike, and nowhere
+else in the index trees: a current read seeks the fact's latest
+EAVT-h row, which is its assertion while the fact is current, and a
+history read gets its own row. An AVET or AEVT hit on a long value is
+confirmed by an EAVT point read before it is returned. A store format
+1 wrote also holds the payload after `t` in the current EAVT row,
+which no read needs.
 Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
@@ -188,7 +193,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 
 | key | value |
 |---|---|
-| `"format"` | u16 Nextomic format number (1) |
+| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction writes an out-of-line value, whose current EAVT row holds `t` alone (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place |
 | `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
@@ -379,8 +384,8 @@ so there is no queue; emdb's write lock is the transactor.
      otherwise) and may be set false again; `:db/doc` is an ordinary
      card-one attribute.
 6. **Write**: for each assertion, put into the current trees (value
-   `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
-   append `[.. top]` with `added = 1` to the history trees; for each
+   `[t]`) and append `[.. top]` with `added = 1` to the history trees,
+   an out-of-line value's payload as the `nx/eavt-h` value; for each
    retraction, delete from the current trees and append `added = 0` to
    the history trees. EAVT first, then AEVT, then AVET and VAET, each
    tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
@@ -1014,8 +1019,9 @@ one writer.
 
 The engine's public `Txn.txnId` field is not used: Nextomic's own `t`
 is read from `sys` inside the same snapshot. Index trees carry only
-`[t]` in current trees and nothing in history trees; an out-of-line
-payload is read with `Txn.getFromTree` on its exact EAVT key. emdb
+`[t]` in current trees and nothing in history trees but an
+out-of-line payload in EAVT-h, read with `Txn.getFromTree` on its
+exact key or with a cursor seek to the fact's latest row. emdb
 returns a value spanning several pages whole, from a cursor or a get,
 assembled in the transaction's buffer and valid until that
 transaction's next such read, so Nextomic copies what it keeps.

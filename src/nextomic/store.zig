@@ -22,9 +22,10 @@
 //!     store whose idents lack `:db/fulltext` receives it at open, minted
 //!     at the store's next ident id in a transaction of its own, and the
 //!     id it took is `fulltext_aid`.
-//!   - Current-tree values are `[t:6]`, plus the payload in `nx/eavt`
-//!     for out-of-line values; history-tree values are empty, plus the
-//!     payload in `nx/eavt-h`.
+//!   - Current-tree values are `[t:6]` (a format-1 store's `nx/eavt`
+//!     rows may follow it with their payload); history-tree values are
+//!     empty, except an out-of-line value's payload in every `nx/eavt-h`
+//!     row of its fact.
 //!   - A value spanning several pages, from a cursor or `getFromTree`,
 //!     is assembled in the transaction's buffer and valid until the
 //!     next such read; callers copy what they keep.
@@ -41,7 +42,12 @@ const TreeId = emdb.TreeId;
 const Index = key.Index;
 const Datom = datom_mod.Datom;
 
-pub const format_version: u16 = 1;
+/// The newest store format this build reads and writes (NEXTOMIC.md
+/// §2.3). A new store is format 1; the first transaction that writes
+/// an out-of-line value makes it 2, whose current EAVT rows hold `t`
+/// alone.
+pub const format_version: u16 = 2;
+const format_payload_once: u16 = 2;
 
 // =============================================================================
 // Trees
@@ -332,7 +338,9 @@ pub const Store = struct {
 
     fn readHeader(self: *Store, txn: *Txn) !void {
         const fmt = (try self.sysGet(txn, "format")) orelse return error.Corrupted;
-        if (fmt.len != 2 or std.mem.readInt(u16, fmt[0..2], .big) != format_version) return error.Format;
+        if (fmt.len != 2) return error.Corrupted;
+        const version = std.mem.readInt(u16, fmt[0..2], .big);
+        if (version == 0 or version > format_version) return error.Format;
         const uuid = (try self.sysGet(txn, "uuid")) orelse return error.Corrupted;
         if (uuid.len != 16) return error.Corrupted;
         self.uuid = uuid[0..16].*;
@@ -636,6 +644,14 @@ pub const Store = struct {
     /// gives. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
+        for (batch) |p| {
+            if (p.added and p.payload != null) {
+                // A build that reads format 1 only would take the
+                // current row's missing payload for an empty value.
+                if (try self.sysGetInt(txn, "format", 2) < format_payload_once) try self.sysPutInt(txn, "format", 2, format_payload_once);
+                break;
+            }
+        }
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
@@ -664,8 +680,8 @@ pub const Store = struct {
                 n += 1;
             }
             const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n] };
-            try self.writeTree(txn, w, false, arena);
-            try self.writeTree(txn, w, true, arena);
+            try self.writeTree(txn, w, false);
+            try self.writeTree(txn, w, true);
         }
     }
 
@@ -716,7 +732,7 @@ pub const Store = struct {
     /// 55 % of them spread evenly by Fibonacci hashing of the rank, so
     /// the half-full leaves the first pass leaves behind take the
     /// second pass's keys between their own.
-    fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool, arena: Allocator) !void {
+    fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool) !void {
         const tree = if (history) self.trees.hist(w.index) else self.trees.cur(w.index);
         var buf: [key.max_key_len]u8 = undefined;
         var tail = w.sorted.len;
@@ -732,30 +748,26 @@ pub const Store = struct {
                 // Equal keys stay in one pass, in batch order.
                 if (r == 0 or !std.mem.eql(u8, w.keys.at(w.sorted[r]), w.keys.at(w.sorted[r - 1])))
                     in_first = @as(u64, r) *% 0x9E37_79B9_7F4A_7C15 < first_pass_share;
-                if (in_first == first) try self.writeOne(txn, w, r, history, &buf, arena);
+                if (in_first == first) try self.writeOne(txn, w, r, history, &buf);
             }
         }
-        for (tail..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf, arena);
+        for (tail..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf);
     }
 
-    fn writeOne(self: *Store, txn: *Txn, w: TreeWrite, r: usize, comptime history: bool, buf: *[key.max_key_len]u8, arena: Allocator) !void {
+    fn writeOne(self: *Store, txn: *Txn, w: TreeWrite, r: usize, comptime history: bool, buf: *[key.max_key_len]u8) !void {
         const p = w.batch[w.sorted[r]];
         const k = w.keyAt(buf, r, history);
-        const payload: []const u8 = if (w.index == .eavt) (p.payload orelse &.{}) else &.{};
-        if (history) return txn.putInTree(self.trees.hist(w.index), k, payload);
+        if (history) {
+            const payload: []const u8 = if (w.index == .eavt) (p.payload orelse &.{}) else &.{};
+            return txn.putInTree(self.trees.hist(w.index), k, payload);
+        }
         if (!p.added) {
             _ = try txn.delFromTree(self.trees.cur(w.index), k);
             return;
         }
         var tb: [key.id_len]u8 = undefined;
         key.writeId(&tb, w.t);
-        const val = if (payload.len == 0) &tb else blk: {
-            const b = try arena.alloc(u8, key.id_len + payload.len);
-            @memcpy(b[0..key.id_len], &tb);
-            @memcpy(b[key.id_len..], payload);
-            break :blk b;
-        };
-        try txn.putInTree(self.trees.cur(w.index), k, val);
+        try txn.putInTree(self.trees.cur(w.index), k, &tb);
     }
 
     /// The current-tree value of `(e a v)` in `index`, or null.
@@ -764,13 +776,28 @@ pub const Store = struct {
         return txn.getFromTree(self.trees.cur(index), k);
     }
 
-    /// The out-of-line payload of the current datom `(e a v)`: the bytes
-    /// after the `t` header of its EAVT value, copied into `arena`.
-    /// Null when there is no such datom.
+    /// The out-of-line payload of the current datom `(e a v)`, copied
+    /// into `arena`: the EAVT-h value of the fact's latest row when that
+    /// row is an assertion (every EAVT-h row of an out-of-line value
+    /// holds its payload, in every format), null when the fact is not
+    /// current. One seek, the cost of the current row's own read.
     pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
-        const raw = (try self.getCurrent(txn, .eavt, e, a, vbytes, arena)) orelse return null;
-        if (raw.len < key.id_len) return error.Corrupted;
-        return try arena.dupe(u8, raw[key.id_len..]);
+        if (vbytes.len > key.max_val_len) return error.Corrupted;
+        var buf: [key.max_key_len]u8 = undefined;
+        const fact_len = key.id_len + key.attr_len + vbytes.len;
+        key.writeId(buf[0..key.id_len], e);
+        key.writeAttr(buf[key.id_len..][0..key.attr_len], a);
+        @memcpy(buf[key.id_len + key.attr_len ..][0..vbytes.len], vbytes);
+        const fact = buf[0..fact_len];
+        // Past every `top` of the fact (whose first byte is below 0x80)
+        // and before any longer fact it prefixes.
+        buf[fact_len] = 0x80;
+        const probe = buf[0 .. fact_len + 1];
+        var c = try txn.openCursorForTree(self.trees.hist(.eavt));
+        const row = (if (c.setRange(probe) != null) c.prev() else c.last()) orelse return null;
+        if (row.key.len != fact.len + key.top_len or !std.mem.startsWith(u8, row.key, fact)) return null;
+        const top = try key.readTop(row.key[fact.len..][0..key.top_len]);
+        return if (top.added) try arena.dupe(u8, row.value) else null;
     }
 
     /// The history-tree value of `(e a v top)` in `index`, or null.
@@ -906,9 +933,7 @@ pub const Store = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        var fmt: [2]u8 = undefined;
-        std.mem.writeInt(u16, &fmt, format_version, .big);
-        try self.sysPut(txn, "format", &fmt);
+        try self.sysPutInt(txn, "format", 2, 1);
         std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
@@ -1413,6 +1438,86 @@ test "a batch holds what writing its datoms one at a time holds" {
         }
         try testing.expect(scans[1].next() == null);
     };
+}
+
+fn formatOf(store: *Store, txn: *Txn) !u16 {
+    const raw = (try store.sysGet(txn, "format")).?;
+    return std.mem.readInt(u16, raw[0..2], .big);
+}
+
+test "an out-of-line value is stored once in the index trees, on its history rows" {
+    var td = try TestDir.init("store_payload");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const e: u64 = 1 << 33;
+    const long = "a string long enough to leave its index keys for a payload of its own, " ** 3;
+    const v = try key.valBytes(arena, .{ .string = long });
+    const short = try key.valBytes(arena, .{ .long = 7 });
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        try store.writeBatch(txn, 2, &.{.{ .e = e, .a = 100, .vbytes = short, .added = true, .avet = false, .vaet = false }}, arena);
+        // A store no out-of-line value was written to keeps format 1.
+        try testing.expectEqual(1, try formatOf(store, txn));
+        try store.writeBatch(txn, 3, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = true, .avet = false, .vaet = false }}, arena);
+        try txn.commit();
+    }
+    {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expectEqual(2, try formatOf(store, txn));
+        try testing.expectEqual(key.id_len, (try store.getCurrent(txn, .eavt, e, 101, v, arena)).?.len);
+        try testing.expectEqualStrings(long, (try store.getHistory(txn, .eavt, e, 101, v, .{ .t = 3, .added = true }, arena)).?);
+        try testing.expectEqualStrings(long, (try store.currentPayload(txn, e, 101, v, arena)).?);
+    }
+    {
+        // The retraction's history row holds the payload too.
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        try store.writeBatch(txn, 4, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = false, .avet = false, .vaet = false }}, arena);
+        try txn.commit();
+    }
+    {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        try testing.expect((try store.currentPayload(txn, e, 101, v, arena)) == null);
+        try testing.expectEqualStrings(long, (try store.getHistory(txn, .eavt, e, 101, v, .{ .t = 4, .added = false }, arena)).?);
+    }
+    {
+        const w = try store.beginWrite(.none);
+        errdefer w.abort();
+        try store.writeBatch(w, 5, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = true, .avet = false, .vaet = false }}, arena);
+        try w.commit();
+    }
+    const again = try store.beginRead();
+    defer again.abort();
+    try testing.expectEqualStrings(long, (try store.currentPayload(again, e, 101, v, arena)).?);
+}
+
+test "a store opens at every format up to this build's and refuses a newer one" {
+    var td = try TestDir.init("store_format");
+    defer td.deinit();
+    for ([_]u16{ 1, 2, 3 }) |f| {
+        {
+            const store = try Store.open(testing.allocator, td.path.ptr, .{});
+            defer store.close();
+            const txn = try store.beginWrite(.none);
+            errdefer txn.abort();
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &buf, f, .big);
+            try store.sysPut(txn, "format", &buf);
+            try txn.commit();
+        }
+        if (f <= format_version) {
+            const store = try Store.open(testing.allocator, td.path.ptr, .{});
+            store.close();
+        } else try testing.expectError(error.Format, Store.open(testing.allocator, td.path.ptr, .{}));
+    }
 }
 
 test "renaming an ident retires the old name and bumps the generation" {
