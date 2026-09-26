@@ -225,8 +225,9 @@ const FileId = struct {
 
     /// The file at `path` relative to the directory `fd`, or the file
     /// open as `fd` when `path` is empty; null when it cannot be
-    /// examined. Linux's libc declares no `stat` family, so Linux asks
-    /// the kernel's `statx`.
+    /// examined. Zig's `std.c` declares no `stat` family for Linux,
+    /// whose glibc versions those symbols, so Linux asks the kernel's
+    /// `statx`.
     fn of(fd: std.c.fd_t, path: [*:0]const u8) ?FileId {
         if (builtin.os.tag == .linux) {
             const linux = std.os.linux;
