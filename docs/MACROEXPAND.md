@@ -97,7 +97,7 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `defn` does), expands it in the enclosing env, compiles and runs
    it through `ctx.compile_eval` in a fresh sub-VM, and sets the
    Var's `macro` flag. The form is replaced by `(var name)`, so the
-   REPL prints `#'name`.
+   REPL prints `#'ns/name`.
 3. **Invocation**: the argument count is checked against the macro
    function's arity, each argument Form becomes a Value
    (`formToValue`), and a fresh sub-VM (an idle routine, the
