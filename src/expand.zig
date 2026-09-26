@@ -1604,11 +1604,13 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 ///
 ///   (fn name? [& args#]
 ///     (let* [n# (count args#)]
-///       (if (= n# 1) (loop [p1 (nth args# 0 nil)] b1)
-///       (if (= n# 2) (loop [p1 (nth args# 0 nil) p2 (nth args# 1 nil)] b2)
-///       (if (not (< n# k)) (loop [... r (next ... args#)] bv)
+///       (if (== n# 1) (loop [p1 (first args#)] b1)
+///       (if (== n# 2) (loop [p1 (first args#) p2 (nth args# 1)] b2)
+///       (if (>= n# k) (loop [... r (next ... args#)] bv)
 ///       (throw :arity-mismatch))))))
 ///
+/// `n#` is a count, so the tests are the inlined fixnum compares, and
+/// every `nth` is in range once its clause's test has passed.
 /// Fixed arities are tested in source order and the variadic clause
 /// last, so an exact arity wins over the variadic one. At most one
 /// clause is variadic, its fixed count is not below any fixed
@@ -1652,7 +1654,10 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
         i -= 1;
         const a = if (i == fixed_arities.items.len) variadic.? else fixed_arities.items[i];
         var bindings: std.ArrayList(*Form) = .empty;
-        for (a.params[0..a.fixed], 0..) |p, k| try bindings.appendSlice(ctx.allocator, &.{ p, try b.list(.{ "nexis.core/nth", args, k, null }) });
+        for (a.params[0..a.fixed], 0..) |p, k| {
+            const arg = if (k == 0) try b.list(.{ "nexis.core/first", args }) else try b.list(.{ "nexis.core/nth", args, k });
+            try bindings.appendSlice(ctx.allocator, &.{ p, arg });
+        }
         if (a.variadic) {
             // `next`, as `nthnext`: an empty rest is nil, as the VM
             // binds a single-arity fn's (VM.md §6).
@@ -1661,10 +1666,7 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             const pattern = a.params[a.fixed + 1];
             try bindings.appendSlice(ctx.allocator, &.{ pattern, try restSource(b, pattern, rest) });
         }
-        const test_form = if (a.variadic)
-            try b.list(.{ "nexis.core/not", try b.list(.{ "nexis.core/<", n, a.fixed }) })
-        else
-            try b.list(.{ "nexis.core/=", n, a.fixed });
+        const test_form = try b.list(.{ if (a.variadic) "nexis.core/>=" else "nexis.core/==", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
         // on entry and after every `recur`.
         chain = try b.list(.{ "if", test_form, try b.list(.{ "nexis.core/loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
@@ -1936,8 +1938,23 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     var chain = try b.item(null);
     var i = args.len;
+    // A last test that is a truthy literal (`:else`) is no test.
+    if (i >= 2 and isTruthyLiteral(args[i - 2])) {
+        chain = mutCast(args[i - 1]);
+        i -= 2;
+    }
     while (i >= 2) : (i -= 2) chain = try b.list(.{ "if", args[i - 2], args[i - 1], chain });
     return chain;
+}
+
+/// A form whose value is known truthy without running code: a
+/// keyword, `true`, a number, a string or a char.
+fn isTruthyLiteral(form: *const Form) bool {
+    return switch (form.datum) {
+        .keyword, .int, .bigint, .real, .string, .char => true,
+        .bool_ => |v| v,
+        else => false,
+    };
 }
 
 // ---- case / condp ------------------------------------------------

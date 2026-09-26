@@ -104,12 +104,16 @@
 
 ; (assert x) / (assert x message) → nil when x is truthy, else throws
 ; ex-info "Assert failed: <message or the form>" whose data's :error
-; is :assertion-failed.
+; is :assertion-failed. The printed form and the data are built when
+; the macro expands, so the check costs its test and the failure one
+; call.
 (defmacro assert [x & message]
   `(when-not ~x
-     (throw (ex-info (str "Assert failed: "
-                          ~(if (seq message) `(str ~(first message) "\n" (pr-str '~x)) `(pr-str '~x)))
-                     (hash-map (keyword "error") (keyword "assertion-failed"))))))
+     (throw (ex-info ~(cond
+                        (empty? message) (str "Assert failed: " (pr-str x))
+                        (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
+                        true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))
+                     ~(hash-map (keyword "error") (keyword "assertion-failed"))))))
 
 ; (time expr) → expr's value, after printing how long it took, as
 ; Clojure's does.
