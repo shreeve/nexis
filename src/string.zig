@@ -56,6 +56,14 @@ pub fn fromBytes(heap: *Heap, bytes: []const u8) !Value {
     return valueFrom(h);
 }
 
+/// A fresh `.string` block of `len` bytes for the caller to fill
+/// before the value is used: a builder that knows its length writes
+/// its text once, in place, with no intermediate buffer.
+pub fn allocUninit(heap: *Heap, len: usize) !struct { value: Value, bytes: []u8 } {
+    const h = try heap.alloc(.string, len);
+    return .{ .value = valueFrom(h), .bytes = Heap.bodyBytes(h) };
+}
+
 /// Byte view over a string Value. Panics if `v.kind() != .string`.
 /// For subkind 1 this is the body of the heap block. Another subkind
 /// would return its logical byte view the same way (STRING.md §1), so
@@ -159,7 +167,10 @@ fn decodeAt(bytes: []const u8, pos: usize) error{InvalidUtf8}!struct { scalar: u
 /// `error.InvalidUtf8` if the body contains an invalid byte
 /// sequence.
 pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
-    return std.unicode.utf8CountCodepoints(asBytes(v)) catch error.InvalidUtf8;
+    const bytes = asBytes(v);
+    const ascii = asciiPrefixLen(bytes);
+    if (ascii == bytes.len) return ascii;
+    return ascii + (std.unicode.utf8CountCodepoints(bytes[ascii..]) catch return error.InvalidUtf8);
 }
 
 /// Unicode scalar at codepoint index `i`. Returns `error.OutOfBounds`
@@ -206,6 +217,95 @@ pub fn byteRangeForCodepoints(
         if (cp_pos + 1 == start) byte_start = byte_pos;
     }
     return .{ .start = byte_start.?, .end = byte_pos };
+}
+
+// =============================================================================
+// Substring search
+// =============================================================================
+
+/// The start offsets of the non-overlapping occurrences of `needle`
+/// (one byte or more) in `hay`, left to right from `from`: each search
+/// resumes after the previous occurrence. Thirty-two positions are
+/// tested at once: a position is a candidate when its byte is the
+/// needle's first and the byte `needle.len - 1` past it the needle's
+/// last, and only a candidate is compared in full, so a one-byte
+/// needle costs a vector compare per 32 bytes and a bit scan per
+/// occurrence, with no table to build per search. On valid UTF-8 an
+/// occurrence of valid UTF-8 starts and ends on code-point boundaries.
+pub const Matches = struct {
+    hay: []const u8,
+    needle: []const u8,
+    /// No occurrence starts before this: the end of the last one.
+    pos: usize,
+    /// The start of the next block to test.
+    scan: usize,
+    /// The block `bits` describes, and its untested candidates.
+    base: usize = 0,
+    bits: u32 = 0,
+
+    const width = 32;
+    const Block = @Vector(width, u8);
+
+    pub fn init(hay: []const u8, needle: []const u8, from: usize) Matches {
+        std.debug.assert(needle.len > 0);
+        return .{ .hay = hay, .needle = needle, .pos = from, .scan = from };
+    }
+
+    pub fn next(self: *Matches) ?usize {
+        const n = self.needle.len;
+        if (n > self.hay.len) return null;
+        // The last position an occurrence can start at.
+        const last = self.hay.len - n;
+        while (true) {
+            while (self.bits != 0) {
+                const i = self.base + @ctz(self.bits);
+                self.bits &= self.bits - 1;
+                if (i < self.pos) continue;
+                if (n > 2 and !std.mem.eql(u8, self.hay[i + 1 .. i + n - 1], self.needle[1 .. n - 1])) continue;
+                self.pos = i + n;
+                return i;
+            }
+            self.scan = @max(self.scan, self.pos);
+            if (self.scan > last) return null;
+            self.base = self.scan;
+            self.bits = candidates(self.hay, self.needle, self.base, last);
+            self.scan += width;
+        }
+    }
+
+    /// Bit `k` set when `base + k` (at most `last`) is a candidate.
+    fn candidates(hay: []const u8, needle: []const u8, base: usize, last: usize) u32 {
+        const n = needle.len;
+        if (last - base >= width - 1) {
+            const first: Block = hay[base..][0..width].*;
+            const bits: u32 = @bitCast(first == @as(Block, @splat(needle[0])));
+            if (n == 1) return bits;
+            const end: Block = hay[base + n - 1 ..][0..width].*;
+            return bits & @as(u32, @bitCast(end == @as(Block, @splat(needle[n - 1]))));
+        }
+        var bits: u32 = 0;
+        for (base..last + 1) |i| {
+            if (hay[i] == needle[0] and hay[i + n - 1] == needle[n - 1]) bits |= @as(u32, 1) << @intCast(i - base);
+        }
+        return bits;
+    }
+};
+
+/// The first occurrence of `needle` in `hay` at or after `from`; the
+/// empty needle is found at `from`.
+pub fn indexOf(hay: []const u8, needle: []const u8, from: usize) ?usize {
+    if (needle.len == 0) return if (from <= hay.len) from else null;
+    var m = Matches.init(hay, needle, from);
+    return m.next();
+}
+
+/// How many non-overlapping occurrences of `needle` (one byte or
+/// more) `hay` holds.
+pub fn countMatches(hay: []const u8, needle: []const u8) usize {
+    var m = Matches.init(hay, needle, 0);
+    var k: usize = 0;
+    while (m.next()) |_| k += 1;
+    return k;
 }
 
 // =============================================================================
@@ -434,6 +534,75 @@ test "malformed UTF-8 bytes round-trip byte-exact (byte-blob semantics)" {
         const v2 = try fromBytes(&heap, m);
         try testing.expect(bytesEqual(Heap.asHeapHeader(v), Heap.asHeapHeader(v2)));
     }
+}
+
+// =============================================================================
+// Substring search tests
+// =============================================================================
+
+/// Every non-overlapping occurrence by a plain left-to-right scan.
+fn naiveMatches(hay: []const u8, needle: []const u8, from: usize, out: *std.ArrayList(usize)) !void {
+    var i = from;
+    while (i + needle.len <= hay.len) {
+        if (std.mem.eql(u8, hay[i..][0..needle.len], needle)) {
+            try out.append(testing.allocator, i);
+            i += needle.len;
+        } else i += 1;
+    }
+}
+
+fn expectMatches(hay: []const u8, needle: []const u8, from: usize) !void {
+    var want: std.ArrayList(usize) = .empty;
+    defer want.deinit(testing.allocator);
+    try naiveMatches(hay, needle, from, &want);
+    var got: std.ArrayList(usize) = .empty;
+    defer got.deinit(testing.allocator);
+    var m = Matches.init(hay, needle, from);
+    while (m.next()) |i| try got.append(testing.allocator, i);
+    try testing.expectEqualSlices(usize, want.items, got.items);
+    try testing.expectEqual(if (want.items.len > 0) want.items[0] else null, indexOf(hay, needle, from));
+    if (from == 0) try testing.expectEqual(want.items.len, countMatches(hay, needle));
+}
+
+test "Matches: occurrences across block edges, at both ends, overlapping and past the end" {
+    const long = "a,b,,c" ++ ("x" ** 40) ++ ",," ++ ("y," ** 30) ++ "z,";
+    try expectMatches(long, ",", 0);
+    try expectMatches(long, ",,", 0);
+    try expectMatches(long, "y,y", 0);
+    try expectMatches(long, "x" ** 33, 0);
+    try expectMatches(long, ",", 7);
+    try expectMatches(long, "z,", 0);
+    try expectMatches("aaaa", "aa", 0);
+    try expectMatches("aaaaa", "aa", 1);
+    try expectMatches(",", ",", 0);
+    try expectMatches("", ",", 0);
+    try expectMatches("ab", "abc", 0);
+    try expectMatches("h\xC3\xA9llo w\xC3\xB6rld \xC3\xA9", "\xC3\xA9", 0);
+    try testing.expectEqual(@as(?usize, 3), indexOf("abc", "", 3));
+    try testing.expectEqual(@as(?usize, null), indexOf("abc", "", 4));
+}
+
+test "Matches: agrees with a plain scan over random text" {
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const r = prng.random();
+    var hay: [200]u8 = undefined;
+    var needle: [5]u8 = undefined;
+    for (0..2000) |_| {
+        const hay_len = r.uintLessThan(usize, hay.len + 1);
+        for (hay[0..hay_len]) |*b| b.* = "ab,"[r.uintLessThan(usize, 3)];
+        const needle_len = 1 + r.uintLessThan(usize, needle.len);
+        for (needle[0..needle_len]) |*b| b.* = "ab,"[r.uintLessThan(usize, 3)];
+        try expectMatches(hay[0..hay_len], needle[0..needle_len], r.uintLessThan(usize, hay_len + 2));
+    }
+}
+
+test "allocUninit: a block of the length asked, filled by the caller" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const s = try allocUninit(&heap, 5);
+    @memcpy(s.bytes, "héll");
+    try testing.expectEqualStrings("héll", asBytes(s.value));
+    try testing.expectEqual(@as(usize, 0), (try allocUninit(&heap, 0)).bytes.len);
 }
 
 // =============================================================================

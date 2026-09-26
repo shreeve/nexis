@@ -1719,10 +1719,9 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             try bindings.appendSlice(ctx.allocator, &.{ p, arg });
         }
         if (a.variadic) {
-            // `next`, as `nthnext`: an empty rest is nil, as the VM
-            // binds a single-arity fn's (VM.md §6).
-            var rest = args;
-            for (0..a.fixed) |_| rest = try b.list(.{ "nexis.core/next", rest });
+            // `nthnext`: an empty rest is nil, as the VM binds a
+            // single-arity fn's (VM.md §6).
+            const rest = if (a.fixed == 0) args else try b.list(.{ "nexis.core/nthnext", args, a.fixed });
             const pattern = a.params[a.fixed + 1];
             try bindings.appendSlice(ctx.allocator, &.{ pattern, try restSource(b, pattern, rest) });
         }
@@ -1756,9 +1755,9 @@ fn destructurePair(b: Builder, hinted_pattern: *const Form, expr: *const Form, o
 }
 
 /// A vector pattern over `src`: element `i` binds `(nth src i nil)`,
-/// `& r` binds `r` to `next` applied once per element before it (so
-/// an exhausted rest is nil, as `nthnext` gives), `:as name` binds
-/// `src` itself.
+/// `& r` binds `r` to `(nthnext src i)`, the seq after the `i`
+/// elements before it (nil once exhausted), `:as name` binds `src`
+/// itself.
 fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.ArrayList(*Form)) ExpandError!void {
     var i: usize = 0;
     while (i < elems.len) : (i += 1) {
@@ -1770,8 +1769,7 @@ fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.Arr
             if (is_as) {
                 try destructurePair(b, target, src, out);
             } else {
-                var rest = src;
-                for (0..i) |_| rest = try b.list(.{ "nexis.core/next", rest });
+                const rest = try b.list(.{ "nexis.core/nthnext", src, i });
                 try destructurePair(b, target, try restSource(b, target, rest), out);
             }
             i += 1;
