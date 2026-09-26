@@ -241,13 +241,20 @@ proves the rooting rules. A test can set the three fields on its VM to
 the same effect. A VM with `gc_enabled = false` or a borrowed heap is
 never due.
 
-**Safe point.** The VM tests `gcDue` in one place: before fetching an
-instruction in its one run loop (`VM.loop`, which `run`, `callValue`
-and `runRoutine` drive), at a loop's first fetch and at every fetch
-after an instruction of a group that can allocate (`math`, `call`,
-`closure`, `coll`, `ctrl`); after `mov`, `cmp`, `jump` or `var` the
-counter cannot have moved. Between two instructions every live value
-is in one of the roots §3 lists, so a cycle there frees nothing live.
+**Safe point.** The VM tests `gcDue` in two places. The first is
+before fetching an instruction in its one run loop (`VM.loop`, which
+`run`, `callValue` and `runRoutine` drive), at a loop's first fetch
+and at every fetch after an instruction of a group that can allocate
+(`math`, `call`, `closure`, `coll`, `ctrl`); after `mov`, `cmp`, `jump`
+or `var` the counter cannot have moved. Between two instructions every
+live value is in one of the roots §3 lists, so a cycle there frees
+nothing live. The second is `callValue` of anything but a closure (a
+native, a protocol fn, a lookup), once its arguments are on the root
+stack: a native that calls natives in a loop (`(reduce conj #{} xs)`)
+reaches no closure frame, and without it would run to its end without
+collecting. A native keeps what it holds across `callValue` on its
+root scope already (§11.5), so a cycle there frees nothing live
+either; a leaf native (`docs/VM.md` §6) is called without it.
 `Heap.alloc` never collects: the compiler, a native and one instruction
 (a rest list, a closure and its cells) allocate as many blocks as they
 like with no rooting, and what one instruction allocates is in a slot
