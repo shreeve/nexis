@@ -65,7 +65,8 @@ emdb's writer lock is per file and makes a second writer wait for the
 first to end. Every connection to one file in the process, and every
 `db/*` connection to it, shares the file's one environment
 (`db.StoreFile`, `docs/DB.md` §3.1; files are told apart by device and
-inode, so a symlink is the same file and a copy is another). A write
+inode, so a symlink is the same file and a copy is another, and a file
+with a second hard link is refused, `:db/hard-linked`). A write
 through one while another holds the file's write transaction is
 `:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
 wait on itself.

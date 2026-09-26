@@ -172,14 +172,17 @@ the live size) has been allocated, 4 KiB under `NEXIS_GC_STRESS`
 `src/db.zig` opens each store file once per process: `StoreFile` keys
 the open files by `(st_dev, st_ino)` and hands its one
 reference-counted `emdb.Env` to every `db/open` connection and every
-Nextomic connection of the file, so any spelling, symlink or hard link
-of the path is one store, and a second writer on it is `:db/busy`
-(`:nextomic/nested` in Nextomic), never a deadlock (`docs/DB.md`
-§3.1). It pins `pageSize = 16384` and `maxNamedTrees = 128`, resolves
-tree ids once per connection, reads values whole off cursors, holds
-the transaction a `db/alter!` or `db/reduce-tree` callback runs in so
-the callback cannot finish it, and names every engine failure as a
-`:db/*` keyword (`docs/DB.md`).
+Nextomic connection of the file, so any spelling or symlink of the
+path is one store (a file with a second hard link is refused), and a
+second writer on it is `:db/busy` (`:nextomic/nested` in Nextomic),
+never a deadlock (`docs/DB.md` §3.1). It pins `pageSize = 16384` and
+`maxNamedTrees = 128`, resolves tree ids once per connection, reads
+values whole off cursors, lets a walk see its tree as it began
+whatever its callback writes, holds the transaction a `db/alter!` or
+`db/reduce-tree` callback runs in so the callback cannot finish it,
+aborts a transaction the program drops at the next collection that
+finds nothing holding it and every open one at `db/close`, and names
+every engine failure as a `:db/*` keyword (`docs/DB.md`).
 
 ### 3.5 Nextomic
 
@@ -301,27 +304,19 @@ failing test (AGENTS.md).
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-3. **A transaction handle dropped open is never aborted**: nothing
-   ends a `db/begin-read` or `db/begin-write` handle the program
-   neither commits nor aborts, because handles are not collector
-   blocks and nothing finalizes them; it lives until VM teardown and
-   keeps its connection from closing (`docs/DB.md` §12). `with-tx`
-   and `with-read-tx` always close theirs. Next: track open handles on
-   the connection and abort them when it closes, or give the kind a
-   finalizer.
-4. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+3. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
    is `MalformedMacroCall` ("options come in pairs"). Next: in
    `expand.zig`'s require walk, expand a spec whose second element is
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-5. **Small Clojure differences**: `(int x)` of NaN is
+4. **Small Clojure differences**: `(int x)` of NaN is
    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
    transient (Clojure's transient collections are counted);
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-6. **A routine holds at most 4096 live locals and 4096 captured
+5. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
@@ -380,25 +375,7 @@ failing test (AGENTS.md).
 
 ### 6.3 Storage
 
-1. **Hard links across processes**: one process opens a file once
-   whatever it is called (`docs/DB.md` §3.1), but emdb names its lock
-   file after the path it was given, so two processes that open one
-   store through two hard-link names take two lock files and can both
-   write. Next: state it in `docs/DB.md` §3.1 (open a store by one
-   name); emdb is not changed for it.
-2. **Writes to a tree during `db/reduce-tree` over it**: the callback
-   may write through the held transaction, and emdb does not specify
-   what a cursor sees after its own tree is written under it. Next:
-   refuse writes to the walked tree while the walk holds the
-   transaction (`:db/busy`), or walk a copy of the keys, with a test
-   that writes during a reduce.
-3. **The environment lives on the first opener's allocator**:
-   `db/open` leaves emdb's default, `page_allocator`, so an
-   environment `db/open` opened allocates its small objects a page at
-   a time, while one Nextomic opened first uses the VM's allocator.
-   Next: pass `vm.allocator` from `db/open` (it outlives every
-   connection), measured with `zig build bench -- --filter db-integrated`.
-4. **Engine bounds surface as bare keywords**: a `db/*` key past
+1. **Engine bounds surface as bare keywords**: a `db/*` key past
    4078 bytes, a stored value past just under 1 GiB and a file's 129th
    named tree are `:db/key-too-large`, `:db/value-too-large` and
    `:db/max-trees`, which name the bound but not its value or the
@@ -474,12 +451,10 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. Transaction handles dropped open (§6.1 item 3) and writes during
-   `db/reduce-tree` (§6.3 item 2).
-2. A green CI run on Linux (§2), then a store carried between macOS
+1. A green CI run on Linux (§2), then a store carried between macOS
    and Linux (§6.4).
-3. Performance: the levers and measured dead ends are
+2. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
-4. The open design questions, each an amendment first: laziness
+3. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

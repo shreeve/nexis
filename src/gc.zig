@@ -109,14 +109,18 @@ pub const Collector = struct {
     /// Start a reachability walk from a `Value`. Immediate-kind
     /// Values (nil, bool, char, fixnum, float, keyword, symbol) have
     /// no heap allocation underneath, and the pointer kinds the VM or
-    /// static storage owns (`native_fn`, `var_`, the db handles;
-    /// `Heap.isBlockKind`) have no block to mark: both are silently
-    /// ignored. A Var's root, metadata and thread value are marked by
-    /// the host's namespace walk, so skipping the `var_` Value loses
-    /// nothing. Every other Value is dereferenced to its
-    /// `*HeapHeader` and marked.
+    /// static storage owns (`native_fn`, `var_`, the db connection
+    /// and transaction handles; `Heap.isBlockKind`) have no block to
+    /// mark: a transaction handle is flagged reached for the handle
+    /// sweep (GC.md §5), the rest are ignored. A Var's root, metadata
+    /// and thread value are marked by the host's namespace walk, so
+    /// skipping the `var_` Value loses nothing. Every other Value is
+    /// dereferenced to its `*HeapHeader` and marked.
     pub fn markValue(self: *Collector, v: Value) void {
-        if (!Heap.isBlockKind(v.kind())) return;
+        if (!Heap.isBlockKind(v.kind())) {
+            if (v.kind() == .db_write_txn or v.kind() == .db_read_txn) db_mod.markHandle(v);
+            return;
+        }
         std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
         self.mark(@ptrFromInt(v.payload));
     }
@@ -256,7 +260,9 @@ pub const Collector = struct {
     /// Run a full collection cycle:
     ///   1. Push each root, then the host's roots when there is a
     ///      host, and drain the worklist: the transitive closure.
-    ///   2. Sweep: free every unmarked, non-pinned heap block.
+    ///   2. Sweep: end and free every db transaction handle of this
+    ///      heap no Value reached (`db.sweepHandles`), then free every
+    ///      unmarked, non-pinned heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.
     /// Returns the number of blocks freed. A cycle whose worklist
@@ -270,6 +276,7 @@ pub const Collector = struct {
         self.drain();
         self.draining = false;
         self.gray.clearRetainingCapacity();
+        db_mod.sweepHandles(self.heap, !self.overflowed);
         const freed = if (self.overflowed) self.abandon() else self.heap.sweepUnmarked();
         self.heap.resetAllocationCounter();
         return freed;
