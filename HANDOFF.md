@@ -57,13 +57,33 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 159/159 steps succeeded; 1244/1244 tests passed
+Build Summary: 164/164 steps succeeded; 1244/1244 tests passed
 ```
 
-It ran in 49 s wall (138 s CPU) from a warm cache on an Apple-silicon
-Mac shared with other builds. Any output besides the summary tree is a
+With `../nexus` checked out the gate includes `parser-check`'s two
+steps; without it the count is 162 steps. It ran in 63 s wall (256 s
+CPU) from a warm cache on an Apple-silicon Mac shared with other
+builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (619 inline tests) and
 `eval_pipeline` (417 programs).
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request
+to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64;
+`zig fmt --check` over the tracked Zig files but the generated
+`src/parser.zig`, and `zig build parser-check` against a nexus built
+from `shreeve/nexus`; and a ReleaseFast job that runs a script, the
+benchmark suite once, and the static `x86_64-linux-musl` binary. Each
+job checks nexis out into `nexis/` and emdb into `emdb/` beside it.
+emdb is private: the checkout reads it with the repository secret
+`EMDB_TOKEN`, a fine-grained personal access token whose one
+permission is read-only Contents on `shreeve/emdb`. Without the secret
+every job fails at that checkout, and pull requests from forks never
+receive it.
+
+`zig build check-targets` compiles and links every binary and test
+binary for x86_64 and aarch64 Linux, glibc and musl, from any host;
+the musl builds are static. Both platforms link libc: emdb and the
+runtime call it.
 
 The fastest end-to-end checks:
 
@@ -396,14 +416,19 @@ failing test (AGENTS.md).
 
 ### 6.4 Build and platform
 
-1. **Linux is unverified**: there is no CI. The proof is `zig build
-   test` on a Linux host plus a store written on one platform and read
-   on the other (the page size is pinned, so the files should be
-   byte-compatible).
-2. **Nothing checks that `src/parser.zig` matches `nexis.grammar`.**
-   Next: a build step that, when `../nexus/bin/nexus` exists,
-   regenerates into the cache and diffs against the committed file.
-3. `zig fmt --check` fails only on the generated `src/parser.zig`.
+1. **Linux compiles; its test run is CI's.** `zig build
+   check-targets` compiles and links every binary for x86_64 and
+   aarch64 Linux, glibc and musl, from macOS, and CI runs the gate on
+   Linux x86_64 and arm64; a green CI run on `main` is the first proof
+   that the tests pass there. Still unproven: a store written on one
+   platform and read on the other (the page size is pinned, so the
+   files should be byte-compatible). The runtime thread reserves a
+   1 GiB stack, which a Linux host with strict overcommit
+   (`vm.overcommit_memory=2`) may refuse. The tests that open a
+   read-only store file assume a user who is not root: root may write
+   any file.
+2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI
+   checks every other tracked Zig file.
 
 ---
 
@@ -459,7 +484,8 @@ after numbers in the commit message.
    `.out` change is smaller after it.
 2. Transaction handles dropped open (§6.1 item 4) and writes during
    `db/reduce-tree` (§6.3 item 2).
-3. The parser regeneration check and a Linux run (§6.4).
+3. A green CI run on Linux, once `EMDB_TOKEN` is set (§2), then a
+   store carried between macOS and Linux (§6.4).
 4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
