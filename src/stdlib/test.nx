@@ -2,12 +2,9 @@
 ; §3): deftest, is, testing, run-tests and run-all-tests over
 ; atoms and throw. Embedded via @embedFile and bootstrapped at VM
 ; startup with nexis.test as the current namespace, after core.nx.
-;
-; No keyword literal appears in this file, nor a defn- (whose
-; metadata is the keyword :private): it is compiled at boot, ahead of
-; every keyword a script reads, and a map's layout is a function of
-; intern order. The keywords of the result map are
-; built when run-tests returns; the counters use string keys.
+; The helpers the macros call (register!, check=, check-truthy,
+; check-thrown, pass!, fail!) are public, since an expansion names
+; them from the caller's namespace; the rest are private.
 
 ; ---- registry ----
 
@@ -40,36 +37,36 @@
 ; Every report line goes through the function in `out`; a program
 ; that wants the lines instead of the printing replaces it.
 (def out (atom println))
-; {"test" n "pass" n "fail" n "error" n} while a run is on.
+; {:test n :pass n :fail n :error n} while a run is on.
 (def counts (atom nil))
-; {"ns" name "name" name} of the running test.
+; {:ns name :name name} of the running test.
 (def current (atom nil))
 ; The `testing` descriptions in force, outermost first.
 (def contexts (atom []))
 
-(defn emit! [line] (@out line))
-(defn bump! [k] (swap! counts update k inc))
+(defn- emit! [line] (@out line))
+(defn- bump! [k] (swap! counts update k inc))
 
-(defn describe-current []
-  (str (get @current "ns") "/" (get @current "name")
+(defn- describe-current []
+  (str (:ns @current) "/" (:name @current)
        (if (empty? @contexts)
          ""
          (str " (" (apply str (interpose " > " @contexts)) ")"))))
 
 ; The three outcomes of an assertion or a test. `pass!` is true and
 ; `fail!` false so `is` yields what it asserted.
-(defn pass! [] (bump! "pass") true)
+(defn pass! [] (bump! :pass) true)
 
 (defn fail! [form expected actual msg]
-  (bump! "fail")
+  (bump! :fail)
   (emit! (str "FAIL in " (describe-current) ": " (pr-str form)
               " expected: " (pr-str expected)
               " actual: " (pr-str actual)
               (if msg (str " ; " msg) "")))
   false)
 
-(defn error! [e]
-  (bump! "error")
+(defn- error! [e]
+  (bump! :error)
   (emit! (str "ERROR in " (describe-current) ": " (pr-str e))))
 
 ; ---- assertions ----
@@ -79,16 +76,16 @@
 ; Each returns whether the assertion passed; a pass is counted here
 ; rather than through `pass!`, one closure call fewer per assertion.
 (defn check= [form expected actual msg]
-  (if (= expected actual) (do (bump! "pass") true) (fail! form expected actual msg)))
+  (if (= expected actual) (do (bump! :pass) true) (fail! form expected actual msg)))
 
 (defn check-truthy [form v msg]
-  (if v (do (bump! "pass") true) (fail! form true v msg)))
+  (if v (do (bump! :pass) true) (fail! form true v msg)))
 
 ; The handler of a `thrown?` with a keyword tag: a throw the tag does
 ; not take goes on (a throw of the value the catch holds keeps its
 ; origin, VM.md §12).
 (defn check-thrown [e tag]
-  (if (nexis.internal/#%catch-matches? e tag) (do (bump! "pass") true) (throw e)))
+  (if (nexis.internal/#%catch-matches? e tag) (do (bump! :pass) true) (throw e)))
 
 ; (is (= expected actual) msg?) → reports the two values on failure.
 ; (is (thrown? MATCHER expr) msg?) → passes when expr throws a value
@@ -105,7 +102,7 @@
       `(nexis.test/check= '~form ~(second form) ~(third form) ~msg)
       (= head "thrown?")
       (let* [m (second form)
-             tag? (and (keyword? m) (not (and (nil? (namespace m)) (= (name m) "default"))))]
+             tag? (and (keyword? m) (not= m :default))]
         `(try
            (nexis.test/fail! '~form '~m ~(third form) ~msg)
            ~(if tag?
@@ -123,10 +120,10 @@
 
 ; ---- running ----
 
-(defn run-test [ns-name entry]
-  (reset! current {"ns" ns-name "name" (first entry)})
+(defn- run-test [ns-name entry]
+  (reset! current {:ns ns-name :name (first entry)})
   (reset! contexts [])
-  (bump! "test")
+  (bump! :test)
   (try ((second entry))
        (catch any e (error! e))))
 
@@ -134,19 +131,16 @@
 ; report; {:test n :pass n :fail n :error n} where :test counts the
 ; tests run, :pass and :fail the assertions, :error the tests that
 ; threw.
-(defn run-namespaces [ns-names]
-  (reset! counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
+(defn- run-namespaces [ns-names]
+  (reset! counts {:test 0 :pass 0 :fail 0 :error 0})
   (doseq [n ns-names]
     (doseq [entry (get @tests n [])]
       (run-test n entry)))
   (let* [c @counts]
-    (emit! (str "Ran " (get c "test") " tests containing "
-                (+ (get c "pass") (get c "fail")) " assertions."))
-    (emit! (str (get c "fail") " failures, " (get c "error") " errors."))
-    (hash-map (keyword "test") (get c "test")
-              (keyword "pass") (get c "pass")
-              (keyword "fail") (get c "fail")
-              (keyword "error") (get c "error"))))
+    (emit! (str "Ran " (:test c) " tests containing "
+                (+ (:pass c) (:fail c)) " assertions."))
+    (emit! (str (:fail c) " failures, " (:error c) " errors."))
+    c))
 
 ; (run-tests) → the current namespace's tests; (run-tests 'my.ns) →
 ; that namespace's.

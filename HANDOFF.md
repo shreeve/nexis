@@ -293,22 +293,15 @@ failing test (AGENTS.md).
 
 ### 6.1 Language and runtime
 
-1. **Keyword hashes follow intern order**, so a map past eight entries
-   prints in an order that depends on what was interned first; the
-   embedded `.nx` files may hold no keyword literal, and
-   `test/nextomic/*.out` and `test/examples/*.out` pin that order.
-   Next: hash a keyword by its text in the keyword domain (as a
-   symbol is), regenerate the `.out` files with `-Dupdate=true`,
-   and drop the rule from `docs/STDLIB.md` §1.
-2. **Sequences are eager** (§23 #14; open question §24 #2):
+1. **Sequences are eager** (§23 #14; open question §24 #2):
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-3. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
+2. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-4. **A transaction handle dropped open is never aborted**: nothing
+3. **A transaction handle dropped open is never aborted**: nothing
    ends a `db/begin-read` or `db/begin-write` handle the program
    neither commits nor aborts, because handles are not collector
    blocks and nothing finalizes them; it lives until VM teardown and
@@ -316,19 +309,19 @@ failing test (AGENTS.md).
    and `with-read-tx` always close theirs. Next: track open handles on
    the connection and abort them when it closes, or give the kind a
    finalizer.
-5. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+4. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
    is `MalformedMacroCall` ("options come in pairs"). Next: in
    `expand.zig`'s require walk, expand a spec whose second element is
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-6. **Small Clojure differences**: `(int x)` of NaN is
+5. **Small Clojure differences**: `(int x)` of NaN is
    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
    transient (Clojure's transient collections are counted);
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-7. **A routine holds at most 4096 live locals and 4096 captured
+6. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
@@ -448,8 +441,8 @@ path. The contract row goes in `docs/STDLIB.md` or the kind's doc.
 
 **Adding to the library in nexis.** `src/stdlib/*.nx` are embedded and
 booted in order, each into its namespace; a file may use the natives
-and the files before it, and holds no keyword literal
-(`docs/STDLIB.md` §1). Host macros (Zig) are registered in
+and the files before it, and makes a helper no other file names
+`defn-` (`docs/STDLIB.md` §1). Host macros (Zig) are registered in
 `src/expand.zig`'s table (`docs/MACROEXPAND.md`).
 
 **Adding a Nextomic tree or error.** A tree: `store.zig` `tree_names`
@@ -464,8 +457,9 @@ keys, a §7 row, and the `.out` line that shows the map.
 `t/check`, `t/caught` and the partition constants; the build finds it.
 Keep store paths relative. Produce the `.out` with
 `zig build nextomic-nx -Dupdate=true` and read every line before
-committing it. Sort a map's entries before printing when a line needs
-a readable order (§6.1 item 1).
+committing it. A map or set past eight entries prints in hash order,
+which depends only on its contents (`docs/SEMANTICS.md` §3.2); sort
+the entries before printing when a line needs a readable order.
 
 **Running one test binary.** `zig build quick --verbose` prints each
 binary's command line (`.zig-cache/o/<hash>/<name>`); run it directly.
@@ -489,5 +483,5 @@ after numbers in the commit message.
 4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
-5. The open design questions, each an amendment first: laziness
+4. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

@@ -33,8 +33,10 @@ differ in the tag, so `identical?` tells them apart.
 
 Determined by `kind` (§2). The payload is a plain `u64`; each accessor
 (`asFixnum`, `asFloat`, `asChar`, `asKeywordId`, `asSymbolId`,
-`Heap.asHeapHeader`) reinterprets it as signed integer, float bits,
-scalar, intern id or pointer.
+`nameHash`, `Heap.asHeapHeader`) reinterprets it as signed integer,
+float bits, scalar, intern id, name hash or pointer. Code reads a
+keyword's or symbol's id through `asKeywordId` / `asSymbolId`, never
+from the raw payload, whose high word is the name hash.
 
 The all-zero Value is `nil`, so zero-filled memory (a fresh heap body,
 a grown stack) holds `nil` without initialization.
@@ -60,8 +62,8 @@ runtime-private sentinels (§2.3).
 | 3 | `char` | A Unicode scalar (`u21`), zero-extended. Surrogates (D800–DFFF) and values above 10FFFF are rejected at construction |
 | 4 | `fixnum` | An i48 integer, sign-extended to i64: `fixnum_min = -(2^47)` to `fixnum_max = 2^47 - 1`. An integer outside that range is a `bignum` (SEMANTICS §2.2) |
 | 5 | `float` | The f64 bits. Every NaN is stored as the canonical quiet NaN `0x7FF8000000000000`; `-0.0` is stored as itself |
-| 6 | `keyword` | The keyword's intern id (`u32`, `docs/INTERN.md`) |
-| 7 | `symbol` | The symbol's intern id (`u32`) |
+| 6 | `keyword` | The keyword's intern id (`u32`, `docs/INTERN.md`) in the low word, the `hash.nameHash` of its text in the high word (SEMANTICS §3.2) |
+| 7 | `symbol` | As `keyword`, from the symbol table |
 
 Because NaN is canonical on every entry path (the constructor, codec
 decode, arithmetic), `(= nan nan)` is true and hashes agree. `-0.0` and
@@ -130,7 +132,7 @@ Every immediate has one constructor in `src/value.zig`, which enforces
 | `fromChar(scalar: u21) ?Value` | null on a surrogate or a value above 10FFFF |
 | `fromFixnum(n: i64) ?Value` | null outside `[fixnum_min, fixnum_max]` (`isFixnumRange`); the caller builds a bignum (`bignum.fromI64`) |
 | `fromFloat(f: f64) Value` | infallible; canonicalizes NaN |
-| `fromKeywordId(id: u32)`, `fromSymbolId(id: u32)` | wrap an id from the interner, which the constructor does not validate |
+| `fromKeyword(id: u32, name_hash: u32)`, `fromSymbol(id: u32, name_hash: u32)` | pack an id and its name hash; neither is validated. The interner is the one caller that pairs them (`Interner.keywordValue`, `internKeywordValue` and the symbol forms, `docs/INTERN.md` §2); tests without an interner use `testKeyword(id)` / `testSymbol(id)`, which hash as their id and compile only in a test build |
 | `fromNativeFnPtr(descriptor)` | a `native_fn` over a static descriptor |
 
 A nullable result makes the caller handle the out-of-range case; a

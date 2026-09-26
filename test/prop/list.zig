@@ -50,7 +50,7 @@ fn randImmediate(rand: std.Random) Value {
     const pick = rand.uintLessThan(u8, 3);
     return switch (pick) {
         0 => value.fromFixnum(rand.intRangeAtMost(i64, -1000, 1000)).?,
-        1 => value.fromKeywordId(rand.uintLessThan(u32, 32)),
+        1 => value.testKeyword(rand.uintLessThan(u32, 32)),
         2 => value.fromChar(rand.intRangeAtMost(u21, 32, 126)).?,
         else => unreachable,
     };
@@ -128,8 +128,8 @@ test "L3: list is never equal to any non-sequential Value; hashes differ" {
         value.fromFixnum(0).?,
         value.fromFixnum(1).?,
         value.fromChar('x').?,
-        value.fromKeywordId(0),
-        value.fromSymbolId(0),
+        value.testKeyword(0),
+        value.testSymbol(0),
     };
     for (non_sequentials) |o| {
         try std.testing.expect(!dispatch.equal(lst, o));
@@ -180,12 +180,12 @@ test "L5: nested lists round-trip hash and equal via recursive dispatch" {
 
     const outer_a = try list.fromSlice(&heap, &.{
         inner2a,
-        value.fromKeywordId(7),
+        value.testKeyword(7),
         try list.empty(&heap),
     });
     const outer_b = try list.fromSlice(&heap, &.{
         inner2b,
-        value.fromKeywordId(7),
+        value.testKeyword(7),
         try list.empty(&heap),
     });
     try std.testing.expect(dispatch.equal(outer_a, outer_b));

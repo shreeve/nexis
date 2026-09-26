@@ -200,9 +200,6 @@ shares only the `:db/*` error names with the `db/*` layer. `build.zig`
 - **The page size.** emdb's page size is fixed for a file's life;
   `db.zig` and `nextomic/store.zig` pin 16 KiB. Never open a store
   another way.
-- **Keyword literals in `src/stdlib/*.nx`.** None: a keyword's hash
-  follows intern order, so a literal interned at boot changes the
-  print order the `.out` files pin (`docs/STDLIB.md` §1).
 - **Zig 0.16.** `init.gpa` is a `DebugAllocator` in Debug;
   `std.ArrayList(T)` is unmanaged and starts `.empty`; every file
   operation takes `io` (`ZIG-0.16.0.md`).

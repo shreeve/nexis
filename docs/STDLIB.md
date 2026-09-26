@@ -71,17 +71,10 @@ the names the namespace's own (`MACROEXPAND.md` §2b).
   order.
 - A definition that needs bytes, bits, the clock or a callback loop
   that must stop early is a native; the rest is nexis.
-- No embedded file holds a keyword literal; each builds the keywords
-  it needs when it runs (`(keyword "doc")`). A keyword is an
-  immediate whose hash is its intern id (`Value.hashImmediate`), and
-  ids are handed out in the order keywords are first interned. A
-  literal in an embedded file is interned at boot, ahead of the
-  program's keywords, and shifts the id, and so the hash, of every
-  keyword a program interns. A map or set past the eight-entry array form
-  (CHAMP.md §2.1) iterates, and prints, in hash order, so its printed
-  order would change, and with it the pinned outputs under
-  `test/nextomic/*.out` and `test/examples/*.out`. The rule stands
-  while keyword hashing follows intern order.
+- A helper no caller outside the file names is `defn-`, so `(require
+  '[ns :refer :all])` skips it; a function a macro's expansion calls
+  stays public, since the expansion names it from the caller's
+  namespace.
 
 ---
 

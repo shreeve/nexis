@@ -464,7 +464,7 @@ const Naive = struct {
             .int => |n| value.fromFixnum(n).?,
             .double => |d| value.fromFloat(d),
             .boolean => |b| value.fromBool(b),
-            .keyword => |k| value.fromKeywordId(k),
+            .keyword => |k| self.fx.interner().keywordValue(k),
             .str => |s| try string_mod.fromBytes(&self.fx.heap, s),
             .vm => |v| v,
         };
@@ -1139,7 +1139,7 @@ test "corpus: every :in form" {
 
     try checkCount(fx, dbv, "[:find ?e :in $ ?n :where [?e :person/name ?n]]", &.{ nil, try fx.str("Cy") }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e :person/age ?a]]", &.{ nil, value.fromFixnum(30).? }, 2);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?t :where [?e :person/tags ?t]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[\"Ann\" \"Bob\" \"Nobody\"]") }, 2);
     try checkCount(fx, dbv, "[:find ?e :in $ [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]", &.{ nil, try fx.read("[\"Ann\" 30]") }, 1);
@@ -1148,7 +1148,7 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?e :in $ ?lo ?hi :where [?e :person/age ?a] [(< ?lo ?a ?hi)]]", &.{ nil, value.fromFixnum(29).?, value.fromFixnum(34).? }, 3);
     try checkCount(fx, dbv, "[:find ?n ?x :in $ [?x ...] :where [?e :person/name ?n] [?e :person/age ?a] [(< ?a ?x)]]", &.{ nil, try fx.read("[27 31]") }, 4);
     try checkCount(fx, dbv, "[:find ?p :in $ % :where (admin ?p)]", &.{ nil, try fx.read(rules_src) }, 2);
-    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), value.fromKeywordId(try fx.kwId("green")) }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?t :where (has-tag ?p ?t) [?p :person/name ?n]]", &.{ nil, try fx.read(rules_src), fx.interner().keywordValue(try fx.kwId("green")) }, 4);
     try checkCount(fx, dbv, "[:find ?x :in $ ?x]", &.{ nil, value.fromFixnum(5).? }, 1);
     // A variable in function position applies the value it holds: as
     // a predicate, as a function binding under every binding form, in
@@ -1168,8 +1168,8 @@ test "corpus: every :in form" {
     try testing.expectEqual(@as(usize, 3), via_rule.len);
     try checkCount(fx, dbv, "[:find ?n :in $ ?g :where [(identity ?g) ?pred] [?e :person/age ?a] [(?pred ?a)] [?e :person/name ?n]]", &.{ nil, even_fn }, 3);
     // A keyword in function position looks itself up in a map.
-    try checkCount(fx, dbv, "[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("x")) }, 6);
-    try checkCount(fx, dbv, "[:find ?n :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("y")) }, 0);
+    try checkCount(fx, dbv, "[:find ?n ?v :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("x")) }, 6);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?k :where [?e :person/name ?n] [(ground {:x 1}) ?m] [(?k ?m) ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("y")) }, 0);
     // A value that is not callable is an error, and the function
     // variable must be bound before the call runs.
     try testing.expectError(error.NotCallable, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]]", &.{ nil, value.fromFixnum(7).? }));
@@ -1178,13 +1178,13 @@ test "corpus: every :in form" {
     // A bound attribute variable, by id and by ident; an unknown ident matches nothing.
     const name_id = (try dbv.entid(fx.arena(), .{ .ident = try fx.kwId("person/name") })).?;
     try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromFixnum(@intCast(name_id)).? }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 6);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/name")) }, 1);
-    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("nope/attr")) }, 0);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("person/name")) }, 6);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a \"Cy\"]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("person/name")) }, 1);
+    try checkCount(fx, dbv, "[:find ?v :in $ ?a ?e :where [?e ?a ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("person/tags")), value.fromFixnum(@intCast(key.user_partition_start)).? }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?a :where [?e ?a ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("nope/attr")) }, 0);
     // A bound value with no attribute: a string or keyword is matched across every attribute.
     try checkCount(fx, dbv, "[:find ?e :in $ ?v :where [?e _ ?v]]", &.{ nil, try fx.str("Cy") }, 1);
-    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, value.fromKeywordId(try fx.kwId("green")) }, 2);
+    try checkCount(fx, dbv, "[:find ?e ?a :in $ ?v :where [?e ?a ?v]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("green")) }, 2);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e ?a :where [?e ?a \"Cy\"]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?e :where [?e _ \"Nobody\"]]", &.{nil}, 0);
@@ -1197,15 +1197,15 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, ann_ref }, 1);
     const as_eid = try check(fx, dbv, "[:find ?e :in $ ?e :where [?e :person/name _]]", &.{ nil, ann_ref });
     try testing.expectEqual(@as(i64, @intCast(key.user_partition_start)), as_eid.cell(0, 0).int);
-    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [?e :db/ident _]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [?e :db/ident _]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("role/admin")) }, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ [?e ...] :where [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] [:person/email \"bob@x\"] [:person/email \"nobody@x\"]]") }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?b :where [?e :person/boss ?b] [?e :person/name ?n]]", &.{ nil, ann_ref }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ [?b ?a] :where [?e :person/boss ?b] [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[:person/email \"ann@x\"] 26]") }, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ [[?e ?a]] :where [?e :person/age ?a] [?e :person/name ?n]]", &.{ nil, try fx.read("[[[:person/email \"ann@x\"] 30] [[:person/email \"bob@x\"] 1] [:role/admin 5]]") }, 1);
-    try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/admin")) }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?r :where [?e :person/role ?r] [?e :person/name ?n]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("role/admin")) }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email \"nobody@x\"]") }, 0);
     try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }));
-    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, value.fromKeywordId(try fx.kwId("role/nobody")) }, 0);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("role/nobody")) }, 0);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where (not [?e :person/age 30]) [?e :person/name ?n]]", &.{ nil, ann_ref }, 0);
     try testing.expectError(error.TxData, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/name \"Ann\"]") }));
     try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }));

@@ -62,6 +62,14 @@ pub inline fn hashBytes(bytes: []const u8) u64 {
     return std.hash.XxHash3.hash(seed, bytes);
 }
 
+/// The 32-bit hash of a keyword's or symbol's text: the low word of
+/// `hashBytes(name)`. The intern table computes it once per name and
+/// the Value carries it, so a keyword hashes by its text at the cost
+/// of hashing an id (SEMANTICS §3.2).
+pub inline fn nameHash(name: []const u8) u32 {
+    return @truncate(hashBytes(name));
+}
+
 /// Hash a 64-bit signed integer in a fixed (little-endian) byte order.
 /// This is the canonical int hasher used by fixnum and (for small
 /// values) bignum canonicalizations.
@@ -71,7 +79,7 @@ pub fn hashI64(n: i64) u64 {
     return hashBytes(&buf);
 }
 
-/// Hash an unsigned 64-bit integer (used for intern ids, store-ids,
+/// Hash an unsigned 64-bit integer (used for name hashes, store-ids,
 /// bignum limb blocks, etc.) in fixed-endian.
 pub fn hashU64(n: u64) u64 {
     var buf: [8]u8 = undefined;

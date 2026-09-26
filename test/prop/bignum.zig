@@ -278,8 +278,8 @@ test "N8: bignum is never equal to any non-bignum Value; hashes differ" {
         value.fromFloat(0.0),
         value.fromFloat(1.0),
         value.fromChar('x').?,
-        value.fromKeywordId(0),
-        value.fromSymbolId(0),
+        value.testKeyword(0),
+        value.testSymbol(0),
     };
     for (others) |o| {
         try std.testing.expect(!dispatch.equal(big, o));

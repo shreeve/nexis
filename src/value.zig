@@ -271,6 +271,13 @@ pub const Value = extern struct {
         return @truncate(self.payload);
     }
 
+    /// The `hash.nameHash` of a keyword's or symbol's text, carried in
+    /// the payload's high word (VALUE.md §2).
+    pub inline fn nameHash(self: Value) u32 {
+        std.debug.assert(self.isKeyword() or self.isSymbol());
+        return @truncate(self.payload >> 32);
+    }
+
     // ---- identical? — bit equality for immediates ----
 
     /// Bit-equality on the 16-byte struct. For heap kinds this compares
@@ -317,11 +324,10 @@ pub const Value = extern struct {
             .char => hash.hashChar(self.asChar()),
             .fixnum => hash.hashI64(self.asFixnum()),
             .float => hash.hashFloat(self.asFloat()),
-            .symbol => hash.hashU64(@as(u64, self.asSymbolId())),
-            // Keyword domain separation is handled by the generic
-            // `mixKindDomain` below — keyword's kind byte differs from
-            // symbol's, so same-id kw and sym never collide.
-            .keyword => hash.hashU64(@as(u64, self.asKeywordId())),
+            // The text, never the intern id: a map's order must not
+            // depend on which names a process happened to intern first.
+            // The kind byte mixed in below keeps `:foo` and `'foo` apart.
+            .keyword, .symbol => hash.hashU64(self.nameHash()),
             else => @panic("value.hashImmediate: heap / sentinel kind — use dispatch.hashValue instead"),
         };
         return hash.mixKindDomain(base, kind_byte);
@@ -380,22 +386,36 @@ pub fn fromFloat(f: f64) Value {
     };
 }
 
-/// Wrap an already-interned keyword id. Callers obtain the id from the
-/// intern table (`src/intern.zig`).
-pub fn fromKeywordId(intern_id: u32) Value {
+/// A keyword from its intern id and the `hash.nameHash` of its text.
+/// Both come from the intern table (`Interner.keywordValue`,
+/// `internKeywordValue`), which is the one place that pairs them.
+pub fn fromKeyword(intern_id: u32, name_hash: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.keyword),
-        .payload = @as(u64, intern_id),
+        .payload = @as(u64, name_hash) << 32 | intern_id,
     };
 }
 
-/// Wrap an already-interned symbol id. Symbols carry no metadata
-/// (SEMANTICS §7).
-pub fn fromSymbolId(intern_id: u32) Value {
+/// A symbol, as `fromKeyword`. Symbols carry no metadata (SEMANTICS §7).
+pub fn fromSymbol(intern_id: u32, name_hash: u32) Value {
     return Value{
         .tag = @intFromEnum(Kind.symbol),
-        .payload = @as(u64, intern_id),
+        .payload = @as(u64, name_hash) << 32 | intern_id,
     };
+}
+
+/// A keyword whose name hash is its id, for a test that needs keywords
+/// without an intern table; ids and hashes stay consistent as long as
+/// the test builds every keyword this way.
+pub fn testKeyword(id: u32) Value {
+    if (!@import("builtin").is_test) @compileError("testKeyword is for tests");
+    return fromKeyword(id, id);
+}
+
+/// `testKeyword` for symbols.
+pub fn testSymbol(id: u32) Value {
+    if (!@import("builtin").is_test) @compileError("testSymbol is for tests");
+    return fromSymbol(id, id);
 }
 
 /// Pack a STATIC `NativeFn` descriptor pointer into a Value of kind `.native_fn`. The
@@ -504,12 +524,12 @@ test "keyword and same-named symbol hash into different domains" {
     // A keyword and a symbol with the same intern id must not collide
     // in a mixed-key HAMT. Separation comes from `mixKindDomain` — the
     // keyword and symbol kind bytes differ, so their final hashes do too.
-    const kw = fromKeywordId(7);
-    const sy = fromSymbolId(7);
+    const kw = testKeyword(7);
+    const sy = testSymbol(7);
     try std.testing.expect(kw.hashImmediate() != sy.hashImmediate());
     // Within-kind: same id ⇒ same hash.
-    try std.testing.expectEqual(fromKeywordId(7).hashImmediate(), fromKeywordId(7).hashImmediate());
-    try std.testing.expectEqual(fromSymbolId(7).hashImmediate(), fromSymbolId(7).hashImmediate());
+    try std.testing.expectEqual(testKeyword(7).hashImmediate(), testKeyword(7).hashImmediate());
+    try std.testing.expectEqual(testSymbol(7).hashImmediate(), testSymbol(7).hashImmediate());
 }
 
 test "kind predicates cover the immediate family" {
@@ -537,8 +557,8 @@ test "coincidentally-equal payload values hash disjointly across kinds" {
     // distinct to protect mixed-key HAMTs from degenerate collisions.
     const fx = fromFixnum(65).?.hashImmediate();
     const ch = fromChar(65).?.hashImmediate();
-    const sy = fromSymbolId(65).hashImmediate();
-    const kw = fromKeywordId(65).hashImmediate();
+    const sy = testSymbol(65).hashImmediate();
+    const kw = testKeyword(65).hashImmediate();
     try std.testing.expect(fx != ch);
     try std.testing.expect(fx != sy);
     try std.testing.expect(fx != kw);
@@ -561,12 +581,12 @@ test "signed zero: identical? distinguishes, = folds, hash matches =" {
 /// zeros, NaN, and a keyword and a symbol sharing an intern id.
 fn immediateSamples() [16]Value {
     return .{
-        nilValue(),       fromBool(true),   fromBool(false),
-        fromChar('a').?,  fromChar('b').?,  fromFixnum(0).?,
-        fromFixnum(1).?,  fromFixnum(-1).?, fromFloat(0.0),
-        fromFloat(-0.0),  fromFloat(1.0),   fromFloat(std.math.nan(f64)),
-        fromKeywordId(1), fromKeywordId(2), fromSymbolId(1),
-        fromSymbolId(2),
+        nilValue(),      fromBool(true),   fromBool(false),
+        fromChar('a').?, fromChar('b').?,  fromFixnum(0).?,
+        fromFixnum(1).?, fromFixnum(-1).?, fromFloat(0.0),
+        fromFloat(-0.0), fromFloat(1.0),   fromFloat(std.math.nan(f64)),
+        testKeyword(1),  testKeyword(2),   testSymbol(1),
+        testSymbol(2),
     };
 }
 
@@ -586,7 +606,7 @@ test "equalImmediate is an equivalence, and equal values hash equal" {
 
 test "equalImmediate: no cross-kind equality, NaN reflexive, the zeros fold" {
     try std.testing.expect(!fromFixnum(1).?.equalImmediate(fromFloat(1.0)));
-    try std.testing.expect(!fromKeywordId(7).equalImmediate(fromSymbolId(7)));
+    try std.testing.expect(!testKeyword(7).equalImmediate(testSymbol(7)));
     try std.testing.expect(!fromBool(false).equalImmediate(nilValue()));
     try std.testing.expect(!fromChar(65).?.equalImmediate(fromFixnum(65).?));
     try std.testing.expect(fromFloat(std.math.nan(f64)).equalImmediate(fromFloat(@bitCast(@as(u64, 0x7FFF_FFFF_FFFF_FFFF)))));
