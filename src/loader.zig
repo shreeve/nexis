@@ -253,12 +253,23 @@ pub const Loader = struct {
             }
             // A nested call, never a retarget of the top frame: the VM
             // may be running the program that required this text. A
-            // failure's detail is this form's, not an earlier one's.
+            // failure's detail and error are this form's, not an
+            // earlier one's. Out of memory is a runtime error like any
+            // other: what the failed allocation was building is
+            // unreachable, and the report locates the form that asked.
             self.vm.error_detail = "";
-            last = self.vm.runRoutine(routine) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.ControlTransferred => error.ControlTransferred,
-                else => error.RunFailed,
+            self.vm.traced_error = null;
+            last = self.vm.runRoutine(routine) catch |err| switch (err) {
+                error.ControlTransferred => return error.ControlTransferred,
+                else => {
+                    // A run that failed before its first instruction
+                    // (its frame could not be pushed) has no trace.
+                    if (self.vm.traced_error == null) {
+                        self.vm.traced_error = err;
+                        self.vm.error_trace.clearRetainingCapacity();
+                    }
+                    return error.RunFailed;
+                },
             };
             if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
         }

@@ -382,14 +382,14 @@ const Parser = struct {
             if (try self.read.db.conn.idents.idOf(self.read.txn, attr_k)) |id| {
                 if (try self.read.attr(id)) |attr| break :blk attr;
             }
-            self.diag.* = .{ .clause = self.index, .message = "unknown attribute", .attr = value.fromKeywordId(k) };
+            self.diag.* = .{ .clause = self.index, .message = "unknown attribute", .attr = self.interner.keywordValue(k) };
             return error.UnknownAttribute;
         };
         if (reverse and attr.value_type != .ref) return self.fail("reverse reference on a non-ref attribute");
         const spec: Spec = .{
             .attr = attr,
             .reverse = reverse,
-            .key = value.fromKeywordId(k),
+            .key = self.interner.keywordValue(k),
             .limit = default_limit,
             .default = null,
             .sub = .none,
@@ -457,7 +457,7 @@ const Puller = struct {
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
         if (key.isAttrPartition(e)) {
-            if (try self.read.ident(self.arena, e)) |k| m = try self.assoc(m, self.k_db_ident, value.fromKeywordId(k));
+            if (try self.read.ident(self.arena, e)) |k| m = try self.assoc(m, self.k_db_ident, self.interner.keywordValue(k));
         }
         return m;
     }
@@ -509,10 +509,10 @@ const Puller = struct {
         if (covered.contains(a)) return m;
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
-        const spec: Spec = .{ .attr = attr, .reverse = false, .key = value.fromKeywordId(k), .limit = default_limit, .default = null, .sub = .none };
+        const spec: Spec = .{ .attr = attr, .reverse = false, .key = self.interner.keywordValue(k), .limit = default_limit, .default = null, .sub = .none };
         const cut: usize = if (spec.many()) @intCast(@min(vals.len, default_limit)) else 1;
         const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
-        return self.assoc(m, value.fromKeywordId(k), v);
+        return self.assoc(m, self.interner.keywordValue(k), v);
     }
 
     /// The value of spec `i` of `pat` on `e`, or null when absent.

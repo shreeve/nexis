@@ -13,7 +13,8 @@ VM is the host: `src/vm.zig` enumerates the runtime's roots (§3),
 traces closures and upvalue cells (§5), and runs a cycle between two
 instructions once the heap has allocated enough since the last (§7).
 There is no stack scanning, no generation, no concurrency, no write
-barrier and no finalizer (§9).
+barrier and no finalizer on a block (§9); the one resource the
+collector ends is a db transaction the program dropped (§5).
 
 A VM over a borrowed heap (the sub-VMs the expander runs macros on,
 which allocate on the heap of the VM whose Vars they use) never
@@ -45,7 +46,8 @@ measurements demand it (PLAN §23 #18).
 | Keyword and symbol names | `src/intern.zig` | no; freed by `Interner.deinit` (`docs/INTERN.md`) |
 | Forms and macro-expansion intermediates | the caller's arena | no; freed with the arena |
 | Vars, namespaces, routines | `VM.runtime_arena` and the compiler's allocator | no; they live as long as the VM, and their values are roots (§3) |
-| `NativeFn` descriptors, `db.Connection`, db transaction handles | static storage or the VM | no; pointer kinds with no block, skipped by `markValue` (`Heap.isBlockKind`) |
+| `NativeFn` descriptors, `db.Connection` | static storage or the VM | no; pointer kinds with no block, skipped by `markValue` (`Heap.isBlockKind`) |
+| db transaction handles (`db.Handle`) | `src/db.zig`, on the VM's allocator | ended and freed by the handle sweep once no Value reaches them (§5) |
 
 A heap block that points into storage the collector does not own
 (interned bytes, an emdb page) holds data, not a GC edge.
@@ -63,8 +65,11 @@ VM's roots, in the order it marks them:
 1. **The backing stack, in full** (`vm.stack.items`): every slot of
    every frame's window and the slots above them. A slot above a
    popped frame keeps its stale value until the slot is grown into
-   again, which retains garbage for a while and is sound. A slot
-   holding a `cell_internal` Value marks the cell.
+   again, which retains garbage for a while and is sound. Between
+   top-level forms the stack holds nothing: `retargetTop` and
+   `resetAfterError` clear every slot, so a form keeps nothing an
+   earlier one left alive. A slot holding a `cell_internal` Value
+   marks the cell.
 2. **Every frame**: the closure it runs, whose trace reaches its cells
    and its routine's constants once however many frames run it; or,
    for a frame with no closure (a top-level form, a loader routine),
@@ -106,10 +111,10 @@ block, only tests do.
 | `init(heap)` | A collector over `heap` with no host |
 | `deinit()` | Frees the gray worklist, whose capacity `collect` keeps |
 | `host: ?Host` | `Host.roots(ctx, collector)` marks every root the runtime holds, once per cycle after the explicit roots; `Host.trace(ctx, h, collector)` walks an already-marked `function` or `cell_internal` block |
-| `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db handles); marks any other Value's header |
+| `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db connection), flags a db transaction handle reached (§5), and marks any other Value's header |
 | `mark(h)` | Sets the mark bit once and pushes `h` on the gray worklist, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace; outside `collect` it drains before returning, so a direct call marks the transitive closure |
 | `markInternal(h) bool` | Sets the mark bit of a collection-internal node and returns whether this call set it; walks neither the node's `meta` nor its kind: the caller walks the payload |
-| `collect(roots) usize` | Marks the roots and the host's roots, drains the worklist, sweeps (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
+| `collect(roots) usize` | Marks the roots and the host's roots, drains the worklist, sweeps the db transaction handles of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
 
 `mark` and `markInternal` share one primitive (`markHeaderOnce`), so
 the mark bit has one owner. Nothing in the API can fail: sweeping only
@@ -168,6 +173,18 @@ The dispatch in `Collector.trace`:
 | `byte_vector`, `error_`, `meta_symbol` | panic | reserved, never allocated |
 | `var_` | panic | not a block: its payload is an arena `*Var` |
 
+**Transaction handles.** A `db_write_txn` or `db_read_txn` Value
+points at a `db.Handle`, which is not a block but holds an emdb
+transaction: the file's writer, or one of its reader slots. `markValue`
+sets the handle's reached flag. After the drain, `db.sweepHandles`
+walks the process's handles whose connection is on this heap: a
+flagged or held one (a native is running a callback over it) has its
+flag cleared and survives; any other has its transaction ended (a
+write aborted, a read ended) and is freed. Ending one frees emdb's
+transaction and releases its lock or slot, touching nothing on the
+heap. A cycle whose worklist could not grow ends nothing and only
+clears the flags. `docs/DB.md` §3.2 is the db side.
+
 A `function` or `cell_internal` block reaching a collector with no
 host panics, as does any immediate or sentinel kind byte on a header.
 The collector panics rather than skip: a silent no-op on a kind that
@@ -198,6 +215,7 @@ collect(roots):
     mark each root; host.roots(...)     // push on gray
     while gray.pop() |h|: trace(h)      // the transitive closure
     draining = false; empty gray, keeping its capacity
+    db.sweepHandles(heap, !overflowed)  // ends unreached transactions
     freed = heap.sweepUnmarked()        // frees unmarked, unpinned blocks;
                                         // clears the mark on survivors
                                         // (or, if gray could not grow:
@@ -234,7 +252,12 @@ is in one of the roots §3 lists, so a cycle there frees nothing live.
 like with no rooting, and what one instruction allocates is in a slot
 before the next fetch. A cycle therefore runs inside a native only
 through a call back into the VM, which is what the rooting rule
-(§11.5) covers. `VM.collectGarbage` runs one cycle on demand from a
+(§11.5) covers, or where a native that holds nothing but its rooted
+arguments runs one itself: a native that begins a db transaction
+collects once when the file's writer or reader slots are taken by a
+handle the cycle could end (`docs/DB.md` §3.2). Such a native is at
+the point a `callValue` from it would be, so every frame beneath it is
+already safe for a cycle. `VM.collectGarbage` runs one cycle on demand from a
 safe point and counts it in `gc_cycles`; tests call it directly.
 
 ---
@@ -256,8 +279,10 @@ already marked, so the walk stops there.
 - **Stack scanning.** The VM's slot windows are precise.
 - **Write barriers, generations, concurrent or incremental marking.**
   One thread, stop-the-world (PLAN §23 #5, #18).
-- **Finalizers.** An object that owns an OS resource (an emdb
-  connection, a transaction) is closed explicitly at the db layer.
+- **Finalizers on blocks.** No block owns an OS resource. A db
+  connection is closed explicitly; a db transaction handle, which is
+  not a block, is ended by commit, abort, `db/close` or the handle
+  sweep (§5).
 - **Transient ownership in the collector.** A transient is an ordinary
   block whose trace walks the wrapped collection; its owner token is
   the kind's business (`src/coll/transient.zig`).
@@ -283,7 +308,9 @@ T4 and T4b collect with a transient as the only root. Under the
 runtime, the `gc:` tests of `test/integration/eval_pipeline.zig` run
 every callback-taking native of §11.5 with allocating callbacks on a
 stressed VM, and `test/nextomic/gc.nx` does the same through `bin/nexis`
-for query predicates, function bindings and custom aggregates.
+for query predicates, function bindings and custom aggregates. The
+`db:` test of dropped transactions ends ten thousand unreachable read
+handles and dropped writes under both policies.
 `NEXIS_GC_STRESS=1 zig build test` runs the whole suite with every VM
 under the stress policy.
 

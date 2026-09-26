@@ -2542,6 +2542,9 @@ pub const VM = struct {
         top.pc = 0;
         top.slot_count = routine.slot_count;
         self.halted = false;
+        // Only the top frame stands, so every slot is dead: the form
+        // starts on nils and keeps nothing an earlier one left alive.
+        @memset(self.stack.items, value_mod.nilValue());
         if (self.stack.items.len < routine.slot_count) {
             self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count - self.stack.items.len) catch return VmError.OutOfMemory;
         }
@@ -2692,6 +2695,7 @@ pub const VM = struct {
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
         self.frames.items[0].routine = &idle_routine;
+        @memset(self.stack.items, value_mod.nilValue());
     }
 
     /// Runtime error translation to a user-throwable Value.
@@ -2715,8 +2719,7 @@ pub const VM = struct {
         // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
         const interner = self.ensureInterner();
-        const id = interner.internKeyword(kw_name) catch return err;
-        const payload = value_mod.fromKeywordId(id);
+        const payload = interner.internKeywordValue(kw_name) catch return err;
         const origin = try self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
@@ -3469,8 +3472,8 @@ pub const VM = struct {
 
     /// `throwValue` of the keyword named `name`.
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
-        const id = self.ensureInterner().internKeyword(name) catch return VmError.OutOfMemory;
-        return self.throwValue(value_mod.fromKeywordId(id));
+        const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
+        return self.throwValue(kw);
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow`,

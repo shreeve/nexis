@@ -44,8 +44,14 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold
-complete forms, so a form or a string literal may span lines (with no
-second prompt) and a line may hold several; blank lines are skipped. It evaluates every
+complete forms, so a form or a string literal may span lines and a
+line may hold several; blank lines are skipped. While a form is open
+each further line is prompted with `#_=> `, right-aligned under the
+namespace prompt (`user=> ` then `  #_=> `, as Leiningen's REPL
+prints it). A line is scanned once for the brackets, strings,
+comments and character literals it opens or closes, and the text is
+read only when they balance, so pasting a form of n lines costs
+O(n). It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
@@ -61,9 +67,13 @@ session.
 
 **A parse, reader or compile error** is `nexis: PATH:LINE:COL:
 LABEL`, the source line and a caret under the span the error is
-about, one `^` per byte up to the end of that line, so a form that
-spans lines is underlined on its first (exit 3 for a parse or reader
-error, 4 for a compile error):
+about, one `^` per character up to the end of that line, so a form
+that spans lines is underlined on its first (exit 3 for a parse or
+reader error, 4 for a compile error). LINE and COL are 1-based and
+COL counts code points, not bytes, as the trace's positions do; the
+shown line has each tab as four spaces and the caret lines up beneath
+(`unicode-columns.err`); a byte-order mark that opens any text, a
+file's or `-e`'s, takes no column (`bom.err`, `bom-expr.err`):
 
 ```
 nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
@@ -134,6 +144,16 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   longer than 40 frames keeps its innermost 32 and outermost 8 around
   one line `  <N frames elided>`, which has no `at` (VM.md §13), so a
   runaway recursion ending in `StackOverflow` lists 41 lines.
+- Out of memory is a runtime error like the rest: `runtime error:
+  OutOfMemory` at the call whose allocation failed, with its frames
+  (`out-of-memory.err`). No `try` catches it (VM.md §13); what the
+  failed allocation was building is unreachable, so the heap stays
+  usable and the REPL carries on. Memory that runs out while reading,
+  compiling or printing is reported the same way with no position.
+  With `NEXIS_MAX_ALLOC=BYTES` in the environment every allocation, or
+  growth of one, past BYTES fails as a request the machine refuses
+  does; the goldens reach this report through it without exhausting
+  the machine.
 - A form a macro produced reports at the macro call.
 - A frame without a span table (a routine built from hand-written
   bytecode) is listed by name alone; when the innermost frame has none
@@ -213,9 +233,9 @@ tables in `src/disasm.zig`; a test walks every variant enum
 ### 3. Test runner (`src/stdlib/test.nx`, the `nexis.test` namespace)
 
 `nexis.test` is written in nexis over atoms and `throw`, embedded at
-build and booted at start (STDLIB.md §1, which also gives the rule
-that keeps keyword literals out of it); `(require '[nexis.test :as
-t])` only makes the alias.
+build and booted at start (STDLIB.md §1); `(require '[nexis.test :as
+t])` only makes the alias, and `:refer :all` refers the API but not
+the private helpers.
 
 ```clojure
 (t/deftest area-test

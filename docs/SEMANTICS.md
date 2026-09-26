@@ -195,8 +195,13 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`).
 - **fixnum**: `xxh3` of the i64 as 8 little-endian bytes.
 - **float**: `xxh3` of the IEEE bits, `-0.0` hashed as `+0.0`, NaN
   canonical.
-- **keyword**, **symbol**: `xxh3` of the intern id as 8 bytes; the
-  kinds differ by domain.
+- **keyword**, **symbol**: `xxh3` of the name hash as 8 bytes. The
+  name hash is the low 32 bits of `xxh3` of the name's text
+  (`hash.nameHash`), computed once when the name is interned and
+  carried in the Value (`docs/VALUE.md` §2.1). A hash is a function
+  of the text alone, never of the intern id, so the order of a map or
+  set a keyword keys does not depend on which names the process
+  interned first. The kinds differ by domain.
 - **string**: `xxh3` of the bytes. **bignum**: `xxh3` of the sign byte
   and the limbs.
 - **Ordered combine** (list, vector): `h = 1; for each x: h = 31*h +
@@ -234,8 +239,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 3 | `char` | own kind | 3 | scalar | scalar bytes |
 | 4 | `fixnum` | own kind | 4 | value | i64 bytes |
 | 5 | `float` | own kind | 5 | IEEE, `-0.0 = 0.0`, NaN = NaN | bits, zero folded |
-| 6 | `keyword` | own kind | 6 | intern id | id bytes |
-| 7 | `symbol` | own kind | 7 | intern id | id bytes |
+| 6 | `keyword` | own kind | 6 | intern id | name hash |
+| 7 | `symbol` | own kind | 7 | intern id | name hash |
 | 16 | `string` | own kind | 16 | bytes | bytes, cached |
 | 17 | `bignum` | own kind | 17 | sign and limbs | sign and limbs, cached |
 | 18 | `persistent_map` | own kind | 18 | entry-wise, both layouts | unordered, cached |
@@ -320,7 +325,8 @@ r)` is `{}`.
 ### 5. Interning
 
 - Keywords and symbols are interned (`docs/INTERN.md`); the Value's
-  payload is the intern id.
+  payload is the intern id and the name hash (§3.2), so `=` compares
+  ids and `hash` never reads the intern order.
 - Intern ids are process-local. The codec writes the name as text and
   the reader of the bytes re-interns it (`docs/CODEC.md`).
 - Keyword and symbol hashes are in different domains (§3.3), so `:foo`

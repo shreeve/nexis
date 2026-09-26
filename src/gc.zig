@@ -109,14 +109,18 @@ pub const Collector = struct {
     /// Start a reachability walk from a `Value`. Immediate-kind
     /// Values (nil, bool, char, fixnum, float, keyword, symbol) have
     /// no heap allocation underneath, and the pointer kinds the VM or
-    /// static storage owns (`native_fn`, `var_`, the db handles;
-    /// `Heap.isBlockKind`) have no block to mark: both are silently
-    /// ignored. A Var's root, metadata and thread value are marked by
-    /// the host's namespace walk, so skipping the `var_` Value loses
-    /// nothing. Every other Value is dereferenced to its
-    /// `*HeapHeader` and marked.
+    /// static storage owns (`native_fn`, `var_`, the db connection
+    /// and transaction handles; `Heap.isBlockKind`) have no block to
+    /// mark: a transaction handle is flagged reached for the handle
+    /// sweep (GC.md §5), the rest are ignored. A Var's root, metadata
+    /// and thread value are marked by the host's namespace walk, so
+    /// skipping the `var_` Value loses nothing. Every other Value is
+    /// dereferenced to its `*HeapHeader` and marked.
     pub fn markValue(self: *Collector, v: Value) void {
-        if (!Heap.isBlockKind(v.kind())) return;
+        if (!Heap.isBlockKind(v.kind())) {
+            if (v.kind() == .db_write_txn or v.kind() == .db_read_txn) db_mod.markHandle(v);
+            return;
+        }
         std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
         self.mark(@ptrFromInt(v.payload));
     }
@@ -256,7 +260,9 @@ pub const Collector = struct {
     /// Run a full collection cycle:
     ///   1. Push each root, then the host's roots when there is a
     ///      host, and drain the worklist: the transitive closure.
-    ///   2. Sweep: free every unmarked, non-pinned heap block.
+    ///   2. Sweep: end and free every db transaction handle of this
+    ///      heap no Value reached (`db.sweepHandles`), then free every
+    ///      unmarked, non-pinned heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.
     /// Returns the number of blocks freed. A cycle whose worklist
@@ -270,6 +276,7 @@ pub const Collector = struct {
         self.drain();
         self.draining = false;
         self.gray.clearRetainingCapacity();
+        db_mod.sweepHandles(self.heap, !self.overflowed);
         const freed = if (self.overflowed) self.abandon() else self.heap.sweepUnmarked();
         self.heap.resetAllocationCounter();
         return freed;
@@ -381,8 +388,8 @@ test "collect: cross-kind graph — map whose values are lists" {
     const l1 = try list.fromSlice(&heap, &.{ value.fromFixnum(10).?, value.fromFixnum(20).? });
     const l2 = try list.fromSlice(&heap, &.{value.fromFixnum(30).?});
     var m = try champ.mapEmpty(&heap);
-    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(1), l1, &synthHash, &synthEq);
-    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(2), l2, &synthHash, &synthEq);
+    m = try champ.mapAssoc(&heap, m, value.testKeyword(1), l1, &synthHash, &synthEq);
+    m = try champ.mapAssoc(&heap, m, value.testKeyword(2), l2, &synthHash, &synthEq);
 
     // Allocate an unrelated orphan.
     _ = try string.fromBytes(&heap, "orphan");
@@ -423,7 +430,7 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     var m = try champ.mapEmpty(&heap);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        m = try champ.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        m = try champ.mapAssoc(&heap, m, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     try testing.expect(m.subkind() == 1); // CHAMP root, not array-map
 
@@ -440,7 +447,7 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     // Every key still looks up to the correct value post-GC.
     i = 0;
     while (i < 20) : (i += 1) {
-        switch (champ.mapGet(m, value.fromKeywordId(i), &synthHash, &synthEq)) {
+        switch (champ.mapGet(m, value.testKeyword(i), &synthHash, &synthEq)) {
             .absent => try testing.expect(false),
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
         }
@@ -497,7 +504,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
     while (i < 15) : (i += 1) {
-        s = try champ.setConj(&heap, s, value.fromKeywordId(i), &synthHash, &synthEq);
+        s = try champ.setConj(&heap, s, value.testKeyword(i), &synthHash, &synthEq);
     }
     try testing.expect(s.subkind() == 1);
 
@@ -512,7 +519,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     try testing.expectEqual(@as(usize, 15), champ.setCount(s));
     i = 0;
     while (i < 15) : (i += 1) {
-        try testing.expect(champ.setContains(s, value.fromKeywordId(i), &synthHash, &synthEq));
+        try testing.expect(champ.setContains(s, value.testKeyword(i), &synthHash, &synthEq));
     }
 }
 
@@ -698,7 +705,7 @@ test "markValue: no-op on immediate Values" {
     gc.markValue(value.nilValue());
     gc.markValue(value.fromBool(true));
     gc.markValue(value.fromFixnum(42).?);
-    gc.markValue(value.fromKeywordId(1));
+    gc.markValue(value.testKeyword(1));
     // No panic, no allocation, no state change.
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }

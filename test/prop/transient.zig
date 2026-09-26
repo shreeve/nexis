@@ -201,15 +201,15 @@ test "T2a: map transient post-freeze rejects every op with TransientFrozen" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapDissocBang(&heap, t, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.mapDissocBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapGetBang(t, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.mapGetBang(t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
@@ -229,15 +229,15 @@ test "T2b: set transient post-freeze rejects every op" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setConjBang(&heap, t, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setDisjBang(&heap, t, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setDisjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setContainsBang(t, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setContainsBang(t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(transient.TransientError.TransientFrozen, transient.setCountBang(t));
 }
@@ -268,20 +268,20 @@ test "T2d: kind-mismatch routing yields TransientKindMismatch for every family" 
     // map ops on non-map transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_set, value.fromKeywordId(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_vec, value.fromKeywordId(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t_vec, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
     );
     // set ops on non-set transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_map, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t_map, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_vec, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t_vec, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
     );
     // vector ops on non-vector transients.
     try std.testing.expectError(
@@ -318,7 +318,7 @@ test "T3a: transient session does NOT mutate source persistent map" {
         var src = try champ.mapEmpty(&heap);
         var i: u32 = 0;
         while (i < 15) : (i += 1) {
-            src = try champ.mapAssoc(&heap, src, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+            src = try champ.mapAssoc(&heap, src, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
         }
         const src_hash_before = dispatch.hashValue(src);
         const src_count_before = champ.mapCount(src);
@@ -330,10 +330,10 @@ test "T3a: transient session does NOT mutate source persistent map" {
         while (op < ops) : (op += 1) {
             const pick = r.uintLessThan(u8, 2);
             if (pick == 0) {
-                const k = value.fromKeywordId(r.intRangeAtMost(u32, 0, 100));
+                const k = value.testKeyword(r.intRangeAtMost(u32, 0, 100));
                 t = try transient.mapAssocBang(&heap, t, k, value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?, &dispatch.hashValue, &dispatch.equal);
             } else {
-                const k = value.fromKeywordId(r.intRangeAtMost(u32, 0, 30));
+                const k = value.testKeyword(r.intRangeAtMost(u32, 0, 30));
                 t = try transient.mapDissocBang(&heap, t, k, &dispatch.hashValue, &dispatch.equal);
             }
         }
@@ -344,7 +344,7 @@ test "T3a: transient session does NOT mutate source persistent map" {
         try std.testing.expectEqual(src_hash_before, dispatch.hashValue(src));
         i = 0;
         while (i < 15) : (i += 1) {
-            switch (champ.mapGet(src, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal)) {
+            switch (champ.mapGet(src, value.testKeyword(i), &dispatch.hashValue, &dispatch.equal)) {
                 .present => |v| try std.testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
                 .absent => try std.testing.expect(false),
             }
@@ -392,7 +392,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     var t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        t = try transient.mapAssocBang(&heap, t, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+        t = try transient.mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
     }
 
     var collector = gc.Collector.init(&heap);
@@ -407,7 +407,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     // Every key is still reachable via the transient.
     i = 0;
     while (i < 20) : (i += 1) {
-        const lookup = try transient.mapGetBang(t, value.fromKeywordId(i), &dispatch.hashValue, &dispatch.equal);
+        const lookup = try transient.mapGetBang(t, value.testKeyword(i), &dispatch.hashValue, &dispatch.equal);
         switch (lookup) {
             .present => |v| try std.testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
             .absent => try std.testing.expect(false),
@@ -420,7 +420,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     defer heap.deinit();
 
     const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
-    _ = try transient.mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal);
+    _ = try transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal);
     const frozen_persistent = try transient.persistentBang(t);
 
     // Keep BOTH the wrapper AND the returned persistent Value as
@@ -438,7 +438,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     // Persistent Value still functional after GC — proves
     // inner_header reachability was maintained.
     try std.testing.expectEqual(@as(usize, 1), champ.mapCount(frozen_persistent));
-    switch (champ.mapGet(frozen_persistent, value.fromKeywordId(1), &dispatch.hashValue, &dispatch.equal)) {
+    switch (champ.mapGet(frozen_persistent, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal)) {
         .present => |v| try std.testing.expectEqual(@as(i64, 100), v.asFixnum()),
         .absent => try std.testing.expect(false),
     }

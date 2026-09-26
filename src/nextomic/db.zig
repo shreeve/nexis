@@ -265,7 +265,7 @@ pub const Conn = struct {
             .double => |d| value.fromFloat(d),
             .keyword => |id| blk: {
                 const k = (try self.idents.internOf(txn, id)) orelse return error.Corrupted;
-                break :blk value.fromKeywordId(k);
+                break :blk self.interner.keywordValue(k);
             },
             .ref => |eid| value.fromFixnum(@intCast(eid)) orelse error.ValueType,
             .string => |s| try string_mod.fromBytes(heap, s),

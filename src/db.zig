@@ -15,7 +15,10 @@
 //!     self-contained identity triple (store_id, tree_name,
 //!     key_bytes) and an advisory non-identity `conn: ?*Connection`
 //!     pointer.
-//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`.
+//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`, and the
+//!     `Handle` the language holds one by, which `close` and the
+//!     collector end.
+//!   - `Walk`: a tree walk that a write under it cannot disturb.
 //!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
 //!     keys are **opaque byte slices**, values
 //!     are codec-encoded via `src/codec.zig`.
@@ -23,8 +26,8 @@
 //!   - Per-kind hash / equality / trace helpers consumed by
 //!     `src/dispatch.zig` and `src/gc.zig`.
 //!
-//! Scope (DB.md §1): explicit-transaction primitives only. No
-//! `alter!`, no cursors, no as-of, no with-tx macro live here.
+//! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
+//! no as-of, no with-tx macro live here.
 //!
 //! Module graph (one-way terminal):
 //!
@@ -38,11 +41,13 @@
 //!     └── @import("emdb")
 //!
 //! Importers (DB.md §11): `dispatch.zig` / `gc.zig` at their
-//! `.durable_ref` arms, `format.zig` to print refs and handles,
-//! `stdlib.zig` for the natives, and Nextomic for `StoreFile` and the
-//! geometry constants.
+//! `.durable_ref` arms, `gc.zig` to mark and sweep transaction
+//! handles, `format.zig` to print refs and handles, `stdlib.zig` for
+//! the natives, and Nextomic for `StoreFile` and the geometry
+//! constants.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const intern_mod = @import("intern.zig");
@@ -67,8 +72,11 @@ pub const DbError = error{
     StoreMismatch,
     InvalidTreeName,
     InvalidKey,
-    /// `close` of a connection with a transaction still open.
+    /// `close` of a connection while a native holds one of its
+    /// transactions, or with a Zig-level transaction still open.
     TransactionsOpen,
+    /// A store file with more than one hard link (DB.md §3.1).
+    HardLinked,
 };
 
 /// The keyword a storage-layer error surfaces as at the language
@@ -88,6 +96,8 @@ pub fn failureName(err: anyerror) []const u8 {
         error.OpenFailed => "db/open-failed",
         error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",
+        error.ReaderTableFull => "db/readers-full",
+        error.HardLinked => "db/hard-linked",
         error.TxnAborted => "db/txn-aborted",
         error.TxnReadOnly => "db/read-only",
         error.SyncFailed => "db/sync-failed",
@@ -120,10 +130,14 @@ pub fn failureName(err: anyerror) []const u8 {
 /// first. One environment per file makes a second writer
 /// `error.WriterActive` instead, whichever connection asks.
 ///
-/// Files are told apart by `(st_dev, st_ino)`, so a symlink, a hard
-/// link or `./x` finds the file already open, and a copy is another
-/// file. The environment opens at the canonical path, so every
-/// process that names the file shares one lock file.
+/// Files are told apart by `(st_dev, st_ino)`, so a symlink or `./x`
+/// finds the file already open, and a copy is another file. The
+/// environment opens at the canonical path, so every process that
+/// names the file shares one lock file. emdb names the lock file
+/// after the path, and no path is canonical across hard links, so a
+/// file with a second hard link is refused (`error.HardLinked`):
+/// two processes opening it by two names would write beside each
+/// other, each blind to the other's readers.
 ///
 /// The runtime is single-threaded, so the list of open files is a
 /// plain global. The environment lives on the allocator of the first
@@ -132,8 +146,7 @@ pub const StoreFile = struct {
     env: emdb.Env,
     /// Canonical absolute path the environment was opened at, owned.
     path: [:0]u8,
-    dev: std.c.dev_t,
-    ino: std.c.ino_t,
+    id: FileId,
     /// Connections and stores holding the file; the last `release`
     /// closes the environment.
     refs: u32,
@@ -148,11 +161,11 @@ pub const StoreFile = struct {
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstatat(std.c.AT.FDCWD, canonical.ptr, &st, 0) == 0) {
+        if (FileId.of(std.c.AT.FDCWD, canonical.ptr)) |id| {
+            if (id.hard_linked) return DbError.HardLinked;
             var it = open_files;
             while (it) |f| : (it = f.next) {
-                if (f.dev == st.dev and f.ino == st.ino) {
+                if (f.id.dev == id.dev and f.id.ino == id.ino) {
                     allocator.free(canonical);
                     f.refs += 1;
                     return f;
@@ -171,10 +184,9 @@ pub const StoreFile = struct {
             else => return err,
         };
         errdefer self.env.close();
-        if (std.c.fstat(self.env.inner.dataFile.fd, &st) != 0) return error.OpenFailed;
+        self.id = FileId.of(self.env.inner.dataFile.fd, "") orelse return error.OpenFailed;
+        if (self.id.hard_linked) return DbError.HardLinked;
         self.path = canonical;
-        self.dev = st.dev;
-        self.ino = st.ino;
         self.refs = 1;
         self.next = open_files;
         open_files = self;
@@ -221,6 +233,42 @@ pub const StoreFile = struct {
     }
 };
 
+/// The device and inode that name a file whatever path reaches it.
+const FileId = struct {
+    dev: u64,
+    ino: u64,
+    /// A regular file with a second name (`StoreFile`). A directory's
+    /// links are its entries; emdb refuses it as a store.
+    hard_linked: bool,
+
+    /// The file at `path` relative to the directory `fd`, or the file
+    /// open as `fd` when `path` is empty; null when it cannot be
+    /// examined. Zig's `std.c` declares no `stat` family for Linux,
+    /// whose glibc versions those symbols, so Linux asks the kernel's
+    /// `statx`.
+    fn of(fd: std.c.fd_t, path: [*:0]const u8) ?FileId {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            var sx: linux.Statx = undefined;
+            const flags: u32 = if (path[0] == 0) linux.AT.EMPTY_PATH else 0;
+            if (linux.errno(linux.statx(fd, path, flags, .{ .TYPE = true, .NLINK = true, .INO = true }, &sx)) != .SUCCESS) return null;
+            return .{
+                .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
+                .ino = sx.ino,
+                .hard_linked = linux.S.ISREG(sx.mode) and sx.nlink > 1,
+            };
+        }
+        var st: std.c.Stat = undefined;
+        const rc = if (path[0] == 0) std.c.fstat(fd, &st) else std.c.fstatat(fd, path, &st, 0);
+        if (rc != 0) return null;
+        return .{
+            .dev = @bitCast(@as(i64, st.dev)),
+            .ino = st.ino,
+            .hard_linked = std.c.S.ISREG(st.mode) and st.nlink > 1,
+        };
+    }
+};
+
 /// The absolute path of `path` with every symlink resolved; for a file
 /// not yet created, its resolved directory joined with its name.
 fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
@@ -263,8 +311,9 @@ pub const Connection = struct {
     /// `ConnectionUnavailable` for subsequent ops.
     open_flag: bool,
 
-    /// Transactions begun and not yet committed or aborted; `close`
-    /// refuses while any is open, so no transaction outlives its env.
+    /// Transactions begun and not yet committed or aborted. `close`
+    /// ends the language's (`Handle`) and refuses while any other
+    /// transaction is open, so none outlives its env.
     open_txns: u32 = 0,
 
     /// Named-tree handles this connection has resolved, keyed by
@@ -332,19 +381,44 @@ pub fn open(
     };
 }
 
-/// Close the connection. A closed connection stays a valid struct:
-/// refs and transaction handles that name it read `open_flag` and
-/// report it closed. A second close does nothing; a close while a
-/// transaction of the connection is open is refused, so no emdb
-/// transaction outlives its env.
+/// Close the connection, aborting every transaction the language
+/// holds on it (DB.md §3). A closed connection stays a valid struct:
+/// refs and handles that name it read `open_flag` and report it
+/// closed. A second close does nothing. A close while a native holds
+/// one of the connection's transactions for a callback, or while a
+/// Zig-level transaction is open, is refused, so no emdb transaction
+/// outlives its env.
 pub fn close(self: *Connection) DbError!void {
+    if (!self.open_flag) return;
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        if (h.conn() == self and h.held != 0) return DbError.TransactionsOpen;
+    }
+    it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        if (h.conn() == self) h.end();
+    }
     if (self.open_txns != 0) return DbError.TransactionsOpen;
-    shutdown(self);
+    release(self);
 }
 
-/// Close the connection whatever is still open: teardown of the whole
-/// VM, when nothing can use the connection again.
+/// Teardown of the whole VM, when nothing can use the connection
+/// again: end and free its handles and close it whatever is open.
 pub fn shutdown(self: *Connection) void {
+    var link = &Handle.all;
+    while (link.*) |h| {
+        if (h.conn() != self) {
+            link = &h.next;
+            continue;
+        }
+        h.end();
+        link.* = h.next;
+        self.allocator.destroy(h);
+    }
+    release(self);
+}
+
+fn release(self: *Connection) void {
     if (!self.open_flag) return;
     self.file.release();
     var names = self.tree_ids.keyIterator();
@@ -366,6 +440,9 @@ pub const WriteTxn = struct {
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
     opened: TreeSet = TreeSet.initEmpty(),
+    /// Walks in progress over this transaction's trees; a write to a
+    /// walked tree copies what the walk has yet to visit first.
+    walks: ?*Walk = null,
 };
 
 pub const ReadTxn = struct {
@@ -408,6 +485,221 @@ pub fn abortWrite(txn: *WriteTxn) void {
 pub fn abortRead(txn: *ReadTxn) void {
     txn.conn.open_txns -= 1;
     txn.inner.abort();
+}
+
+// =============================================================================
+// Transaction handles (DB.md §12)
+// =============================================================================
+
+/// A transaction as the language holds it: the payload of a
+/// `db_write_txn` or `db_read_txn` Value, allocated on the
+/// connection's allocator. It ends by commit or abort, by `close` of
+/// its connection, or by a collection that finds no Value of it
+/// (`markHandle`, `sweepHandles`). The struct outlives its
+/// transaction while a Value names it, which then reports the
+/// transaction closed, and is freed by the first collection after
+/// it becomes unreachable, or at VM teardown (`shutdown`).
+pub const Handle = struct {
+    txn: union(enum) { write: WriteTxn, read: ReadTxn },
+    /// Neither committed nor aborted yet.
+    active: bool = true,
+    /// Natives running a callback over the transaction: commit, abort
+    /// and `close` refuse while any does, so no callback finishes a
+    /// transaction a native is still using.
+    held: u32 = 0,
+    /// Set by the collector's mark phase when it reaches a Value of
+    /// the handle; cleared by the sweep.
+    reached: bool = false,
+    next: ?*Handle,
+
+    /// Every handle of the process. The runtime is single-threaded,
+    /// as `StoreFile.open_files` is.
+    var all: ?*Handle = null;
+
+    /// A handle over `txn`, just begun; on failure `txn` is aborted.
+    pub fn create(txn: @FieldType(Handle, "txn")) !*Handle {
+        var t = txn;
+        const self = switch (t) {
+            inline else => |*x| x.conn.allocator.create(Handle) catch |err| {
+                x.conn.open_txns -= 1;
+                x.inner.abort();
+                return err;
+            },
+        };
+        self.* = .{ .txn = t, .next = all };
+        all = self;
+        return self;
+    }
+
+    pub fn conn(self: *const Handle) *Connection {
+        return switch (self.txn) {
+            inline else => |x| x.conn,
+        };
+    }
+
+    /// Abort the transaction if it is still open.
+    pub fn end(self: *Handle) void {
+        if (!self.active) return;
+        switch (self.txn) {
+            .write => |*w| abortWrite(w),
+            .read => |*r| abortRead(r),
+        }
+        self.active = false;
+    }
+};
+
+/// The handle behind a `db_write_txn` or `db_read_txn` Value.
+pub fn handleOf(v: Value) *Handle {
+    std.debug.assert(v.kind() == .db_write_txn or v.kind() == .db_read_txn);
+    return @ptrFromInt(v.payload);
+}
+
+/// The collector reached a Value of the handle (GC.md §5).
+pub fn markHandle(v: Value) void {
+    handleOf(v).reached = true;
+}
+
+/// After a mark phase over `heap`: end and free every handle of a
+/// connection on `heap` that no Value reached, unless a native holds
+/// it. `complete` is false when the marks are incomplete, which only
+/// clears them. Ending a transaction allocates nothing on the heap.
+pub fn sweepHandles(heap: *Heap, complete: bool) void {
+    var link = &Handle.all;
+    while (link.*) |h| {
+        const c = h.conn();
+        if (c.heap != heap or !complete or h.reached or h.held != 0) {
+            if (c.heap == heap) h.reached = false;
+            link = &h.next;
+            continue;
+        }
+        h.end();
+        link.* = h.next;
+        c.allocator.destroy(h);
+    }
+}
+
+/// Whether a handle a collection on `conn`'s heap could end holds a
+/// transaction on `conn`'s file: the one retry a busy writer or a
+/// full reader table earns (DB.md §12).
+pub fn collectableHandles(conn: *const Connection) bool {
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        const c = h.conn();
+        if (h.active and h.held == 0 and c.heap == conn.heap and c.file == conn.file) return true;
+    }
+    return false;
+}
+
+/// Handles alive in the process, ended or not.
+pub fn handleCount() usize {
+    var n: usize = 0;
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) n += 1;
+    return n;
+}
+
+// =============================================================================
+// Tree walks (DB.md §12)
+// =============================================================================
+
+/// A walk over one named tree of a transaction in key order: `db/scan`
+/// and `db/reduce-tree`. emdb leaves undefined what a cursor sees once
+/// its own tree is written under it, so a write through the
+/// transaction to a tree being walked first copies the entries the
+/// walk has yet to visit (`WriteTxn.walks`): the walk sees the tree as
+/// it was when it began, whatever its callback writes, and a walk no
+/// callback writes under copies nothing. A walk lives on its caller's
+/// stack between `begin` and `end`.
+pub const Walk = struct {
+    cursor: emdb.Cursor,
+    tree: emdb.TreeId,
+    allocator: std.mem.Allocator,
+    /// The write transaction the walk is registered on.
+    owner: ?*WriteTxn,
+    next_walk: ?*Walk = null,
+    /// The entries still to visit once the tree was written: key and
+    /// value bytes back to back, and where each key and value ends.
+    rest: ?struct {
+        bytes: std.ArrayList(u8) = .empty,
+        ends: std.ArrayList([2]usize) = .empty,
+        at: usize = 0,
+    } = null,
+
+    pub const Entry = emdb.Cursor.KeyValue;
+
+    /// Start a walk over `tree_name` in `txn` (a `*WriteTxn` or
+    /// `*ReadTxn`); false when the tree does not exist, and then no
+    /// `end` is due.
+    pub fn begin(self: *Walk, txn: anytype, tree_name: []const u8) !bool {
+        try validateTreeName(tree_name);
+        const id = (try treeId(txn, tree_name, false)) orelse return false;
+        self.* = .{
+            .cursor = try txn.inner.openCursorForTree(id),
+            .tree = id,
+            .allocator = txn.conn.allocator,
+            .owner = null,
+        };
+        if (@TypeOf(txn) == *WriteTxn) {
+            self.owner = txn;
+            self.next_walk = txn.walks;
+            txn.walks = self;
+        }
+        return true;
+    }
+
+    pub fn end(self: *Walk) void {
+        if (self.owner) |w| {
+            var link = &w.walks;
+            while (link.*) |x| : (link = &x.next_walk) {
+                if (x == self) {
+                    link.* = self.next_walk;
+                    break;
+                }
+            }
+        }
+        if (self.rest) |*r| {
+            r.bytes.deinit(self.allocator);
+            r.ends.deinit(self.allocator);
+        }
+    }
+
+    /// The first entry, or the first at or after `start`.
+    pub fn first(self: *Walk, start: ?[]const u8) ?Entry {
+        return if (start) |s| self.cursor.setRange(s) else self.cursor.first();
+    }
+
+    pub fn next(self: *Walk) ?Entry {
+        const r = if (self.rest) |*r| r else return self.cursor.next();
+        if (r.at == r.ends.items.len) return null;
+        const from = if (r.at == 0) 0 else r.ends.items[r.at - 1][1];
+        const e = r.ends.items[r.at];
+        r.at += 1;
+        return .{ .key = r.bytes.items[from..e[0]], .value = r.bytes.items[e[0]..e[1]] };
+    }
+
+    /// Copy what the cursor has yet to visit, before the tree changes
+    /// under it. Each value is copied before the cursor moves: a
+    /// multi-page value lives in the transaction's buffer until the
+    /// next multi-page read.
+    fn copyRest(self: *Walk) !void {
+        self.rest = .{};
+        const r = &self.rest.?;
+        while (self.cursor.next()) |kv| {
+            try r.bytes.appendSlice(self.allocator, kv.key);
+            const key_end = r.bytes.items.len;
+            try r.bytes.appendSlice(self.allocator, kv.value);
+            try r.ends.append(self.allocator, .{ key_end, r.bytes.items.len });
+        }
+    }
+};
+
+/// Before `txn` writes tree `id`: every walk over it copies what it
+/// has yet to visit.
+fn beforeWrite(txn: *WriteTxn, id: emdb.TreeId) !void {
+    var it = txn.walks;
+    while (it) |w| : (it = w.next_walk) {
+        if (w.tree == id and w.rest == null) try w.copyRest();
+    }
 }
 
 // =============================================================================
@@ -471,6 +763,7 @@ pub fn put(
     // codec buffer.
     const encoded = try codec_mod.encode(txn.conn.allocator, txn.conn.interner, v);
     defer txn.conn.allocator.free(encoded);
+    try beforeWrite(txn, tree_id);
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
@@ -529,6 +822,7 @@ pub fn del(
 ) !bool {
     try validateTreeNameAndKey(tree_name, key_bytes);
     const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
+    try beforeWrite(txn, tree_id);
     return try txn.inner.delFromTree(tree_id, key_bytes);
 }
 
@@ -891,6 +1185,36 @@ test "open: a copy of a store is another file, written beside the original" {
     defer abortRead(&rb);
     try testing.expectEqual(@as(i64, 2), (try get(&ra, "t", "k", synthHash, synthEq)).?.asFixnum());
     try testing.expectEqual(@as(i64, 3), (try get(&rb, "t", "k", synthHash, synthEq)).?.asFixnum());
+}
+
+test "open: a store file with a second hard link is refused under either name" {
+    const path = try tmpDbPath(testing.allocator, "linked");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&a);
+    const other = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/other.emdb", .{std.fs.path.dirname(path).?}, 0);
+    defer testing.allocator.free(other);
+    try testing.expectEqual(@as(c_int, 0), std.c.link(path.ptr, other.ptr));
+    // Already open here, and not yet open anywhere: both refused.
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    try close(&a);
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, other.ptr, .{ .allocator = testing.allocator }));
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
+    // A directory has links of its own, and is no store.
+    const dir = try testing.allocator.dupeZ(u8, std.fs.path.dirname(path).?);
+    defer testing.allocator.free(dir);
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, dir.ptr, .{ .allocator = testing.allocator }));
+    // One name again: the file opens.
+    try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
+    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
 }
 
 test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {

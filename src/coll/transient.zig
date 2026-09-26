@@ -496,10 +496,10 @@ test "mapAssocBang + mapGetBang: round-trip on transient map" {
     defer heap.deinit();
     const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
-    const t2 = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(100).?, &synthHash, &synthEq);
+    const t2 = try mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &synthHash, &synthEq);
     // Pointer stability: t and t2 are the same wrapper Value.
     try testing.expect(t.tag == t2.tag and t.payload == t2.payload);
-    const lookup = try mapGetBang(t, value.fromKeywordId(1), &synthHash, &synthEq);
+    const lookup = try mapGetBang(t, value.testKeyword(1), &synthHash, &synthEq);
     switch (lookup) {
         .present => |v| try testing.expectEqual(@as(i64, 100), v.asFixnum()),
         .absent => try testing.expect(false),
@@ -513,12 +513,12 @@ test "mapAssocBang: multiple assoc operations" {
     var t = try transientFrom(&heap, m);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        t = try mapAssocBang(&heap, t, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        t = try mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     try testing.expectEqual(@as(usize, 20), try mapCountBang(t));
     i = 0;
     while (i < 20) : (i += 1) {
-        const lookup = try mapGetBang(t, value.fromKeywordId(i), &synthHash, &synthEq);
+        const lookup = try mapGetBang(t, value.testKeyword(i), &synthHash, &synthEq);
         switch (lookup) {
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
             .absent => try testing.expect(false),
@@ -531,12 +531,12 @@ test "mapDissocBang: removes entry, updates count" {
     defer heap.deinit();
     const m = try champ.mapEmpty(&heap);
     var t = try transientFrom(&heap, m);
-    t = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq);
-    t = try mapAssocBang(&heap, t, value.fromKeywordId(2), value.fromFixnum(2).?, &synthHash, &synthEq);
+    t = try mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
+    t = try mapAssocBang(&heap, t, value.testKeyword(2), value.fromFixnum(2).?, &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 2), try mapCountBang(t));
-    _ = try mapDissocBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
+    _ = try mapDissocBang(&heap, t, value.testKeyword(1), &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 1), try mapCountBang(t));
-    try testing.expect((try mapGetBang(t, value.fromKeywordId(1), &synthHash, &synthEq)) == .absent);
+    try testing.expect((try mapGetBang(t, value.testKeyword(1), &synthHash, &synthEq)) == .absent);
 }
 
 // ---- Set ops ----
@@ -546,12 +546,12 @@ test "setConjBang + setContainsBang: round-trip" {
     defer heap.deinit();
     const s = try champ.setEmpty(&heap);
     var t = try transientFrom(&heap, s);
-    t = try setConjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
-    t = try setConjBang(&heap, t, value.fromKeywordId(2), &synthHash, &synthEq);
+    t = try setConjBang(&heap, t, value.testKeyword(1), &synthHash, &synthEq);
+    t = try setConjBang(&heap, t, value.testKeyword(2), &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 2), try setCountBang(t));
-    try testing.expect(try setContainsBang(t, value.fromKeywordId(1), &synthHash, &synthEq));
-    try testing.expect(try setContainsBang(t, value.fromKeywordId(2), &synthHash, &synthEq));
-    try testing.expect(!try setContainsBang(t, value.fromKeywordId(999), &synthHash, &synthEq));
+    try testing.expect(try setContainsBang(t, value.testKeyword(1), &synthHash, &synthEq));
+    try testing.expect(try setContainsBang(t, value.testKeyword(2), &synthHash, &synthEq));
+    try testing.expect(!try setContainsBang(t, value.testKeyword(999), &synthHash, &synthEq));
 }
 
 test "setDisjBang: removes element" {
@@ -559,10 +559,10 @@ test "setDisjBang: removes element" {
     defer heap.deinit();
     const s = try champ.setEmpty(&heap);
     var t = try transientFrom(&heap, s);
-    t = try setConjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
-    t = try setDisjBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq);
+    t = try setConjBang(&heap, t, value.testKeyword(1), &synthHash, &synthEq);
+    t = try setDisjBang(&heap, t, value.testKeyword(1), &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 0), try setCountBang(t));
-    try testing.expect(!try setContainsBang(t, value.fromKeywordId(1), &synthHash, &synthEq));
+    try testing.expect(!try setContainsBang(t, value.testKeyword(1), &synthHash, &synthEq));
 }
 
 // ---- Vector ops ----
@@ -611,7 +611,7 @@ test "persistentBang: freezes wrapper and returns inner persistent Value" {
     defer heap.deinit();
     const m = try champ.mapEmpty(&heap);
     var t = try transientFrom(&heap, m);
-    t = try mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(99).?, &synthHash, &synthEq);
+    t = try mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(99).?, &synthHash, &synthEq);
     const frozen = try persistentBang(t);
     try testing.expectEqual(Kind.persistent_map, frozen.kind());
     try testing.expectEqual(@as(usize, 1), champ.mapCount(frozen));
@@ -629,15 +629,15 @@ test "persistentBang: post-freeze ops return TransientFrozen" {
     // Every op now errors.
     try testing.expectError(
         TransientError.TransientFrozen,
-        mapAssocBang(&heap, t, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq),
+        mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq),
     );
     try testing.expectError(
         TransientError.TransientFrozen,
-        mapDissocBang(&heap, t, value.fromKeywordId(1), &synthHash, &synthEq),
+        mapDissocBang(&heap, t, value.testKeyword(1), &synthHash, &synthEq),
     );
     try testing.expectError(
         TransientError.TransientFrozen,
-        mapGetBang(t, value.fromKeywordId(1), &synthHash, &synthEq),
+        mapGetBang(t, value.testKeyword(1), &synthHash, &synthEq),
     );
     try testing.expectError(
         TransientError.TransientFrozen,
@@ -667,7 +667,7 @@ test "mapAssocBang on a set transient returns TransientKindMismatch" {
     const t_set = try transientFrom(&heap, s);
     try testing.expectError(
         TransientError.TransientKindMismatch,
-        mapAssocBang(&heap, t_set, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq),
+        mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq),
     );
 }
 
@@ -678,7 +678,7 @@ test "setConjBang on a map transient returns TransientKindMismatch" {
     const t_map = try transientFrom(&heap, m);
     try testing.expectError(
         TransientError.TransientKindMismatch,
-        setConjBang(&heap, t_map, value.fromKeywordId(1), &synthHash, &synthEq),
+        setConjBang(&heap, t_map, value.testKeyword(1), &synthHash, &synthEq),
     );
 }
 
@@ -710,20 +710,20 @@ test "transient session does not mutate source persistent" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const m0 = try champ.mapEmpty(&heap);
-    const m1 = try champ.mapAssoc(&heap, m0, value.fromKeywordId(1), value.fromFixnum(1).?, &synthHash, &synthEq);
+    const m1 = try champ.mapAssoc(&heap, m0, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
     // Wrap m1 in a transient, do a bunch of mutations.
     var t = try transientFrom(&heap, m1);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        t = try mapAssocBang(&heap, t, value.fromKeywordId(i + 100), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        t = try mapAssocBang(&heap, t, value.testKeyword(i + 100), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     _ = try persistentBang(t);
     // m1 MUST still have exactly 1 entry.
     try testing.expectEqual(@as(usize, 1), champ.mapCount(m1));
-    const lookup = champ.mapGet(m1, value.fromKeywordId(1), &synthHash, &synthEq);
+    const lookup = champ.mapGet(m1, value.testKeyword(1), &synthHash, &synthEq);
     switch (lookup) {
         .present => |v| try testing.expectEqual(@as(i64, 1), v.asFixnum()),
         .absent => try testing.expect(false),
     }
-    try testing.expect(champ.mapGet(m1, value.fromKeywordId(100), &synthHash, &synthEq) == .absent);
+    try testing.expect(champ.mapGet(m1, value.testKeyword(100), &synthHash, &synthEq) == .absent);
 }

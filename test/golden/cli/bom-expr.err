@@ -1,0 +1,3 @@
+nexis: <-e>:1:2: compile error: unable to resolve symbol: nope
+    (nope)
+     ^^^^

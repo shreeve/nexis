@@ -585,6 +585,18 @@ fn tableIndex(n: usize) CompileError!u32 {
 /// VM instead of jumping.
 const unpatched = std.math.maxInt(u32);
 
+/// A value computed into `dst` that nothing reads until its last
+/// instruction writes it, with the slots from `lo` below it dead too:
+/// the items of `dst`'s block still to be written. The value's own
+/// evaluation may use `lo` and up as working space (COMPILER.md §4.4).
+const Scratch = struct { lo: u12, dst: u12 };
+
+/// A Var's value in force, read into `slot` by a block item. Until
+/// another instruction runs, a read of the same Var yields the same
+/// value, so a later item copies the slot instead of holding a read
+/// of its own while its neighbours run (COMPILER.md §4.4).
+const HeldVar = struct { var_: *vm.Var, slot: u12 };
+
 /// `Emitter` accumulates a routine's bytecode, constants, slot
 /// count, and active lexical scope as a tree of `compileExpr`
 /// calls runs. It's allocator-owned and turned into a `Compiled`
@@ -622,7 +634,7 @@ const Emitter = struct {
     /// every slot a node allocated once the node is compiled, so a
     /// slot lives as long as the value in it is needed (bindings to
     /// the end of their scope, temporaries until their consumer is
-    /// emitted), and a call block always lies above every live slot
+    /// emitted), and a block always lies above every live slot
     /// (§4.4's capture-cell rule).
     slot_top: u16 = 0,
     /// The most slots live at once: the routine's frame size.
@@ -686,10 +698,14 @@ const Emitter = struct {
     /// Receives the span of the innermost form being compiled when
     /// an error is raised; nested routines share their parent's.
     diag: ?*LowerDiag = null,
-    /// The temporary `compileOperand` is computing a value into: no
-    /// code reads it until the value's last instruction writes it, so
-    /// that value's own evaluation may use it as working space.
-    scratch: ?u12 = null,
+    /// The slot a value is being computed into when nothing reads it
+    /// until the value's last instruction writes it (`Scratch`).
+    scratch: ?Scratch = null,
+    /// Vars a block item read into a slot, all at pc `held_pc`
+    /// (`HeldVar`); none once code grows past it.
+    held: [8]HeldVar = undefined,
+    held_len: u8 = 0,
+    held_pc: usize = 0,
     /// Whether this routine is a `fn*`'s, and its name when it has
     /// one: what a limit error names.
     is_fn: bool = false,
@@ -810,24 +826,32 @@ const Emitter = struct {
         return self.allocSlotBlock(1);
     }
 
-    /// Allocate a contiguous run of `count` fresh slots, return the
-    /// base index. Required by `compileCall` to reserve the call
-    /// block BEFORE compiling sub-expressions: per-arg `allocSlot`
-    /// interleaved with sub-expression compilation would be
-    /// incorrect — sub-expressions allocate their own temps and
-    /// the next "arg slot" would not be adjacent to the previous,
-    /// breaking the range-call ABI invariant.
+    /// Allocate a contiguous run of `count` fresh slots on top of
+    /// the live ones; return the first.
     fn allocSlotBlock(self: *Emitter, count: usize) CompileError!u12 {
-        if (!self.blockFits(count)) return self.limit("local slots");
-        const base = self.slot_top;
-        self.slot_top += @intCast(count);
+        return self.claimSlots(self.slot_top, count) orelse self.limit("local slots");
+    }
+
+    /// The base of a block of `count` slots for the instruction that
+    /// writes `dst`: the lowest dead slot of `dst`'s scratch, else on
+    /// top of every live slot; null when it would pass slot 4095.
+    fn reserveBlock(self: *Emitter, dst: u12, count: usize) ?u12 {
+        return self.claimSlots(self.scratchFrom(dst) orelse self.slot_top, count);
+    }
+
+    /// Slots `base` up to `base + count` in use, when they fit.
+    fn claimSlots(self: *Emitter, base: u16, count: usize) ?u12 {
+        if (base + count > max_operands) return null;
+        self.slot_top = @max(self.slot_top, base + @as(u16, @intCast(count)));
         self.slot_count = @max(self.slot_count, self.slot_top);
         return @intCast(base);
     }
 
-    /// Whether `count` more slots fit on top of the live ones.
-    fn blockFits(self: *const Emitter, count: usize) bool {
-        return self.slot_top + count <= max_operands;
+    /// The lowest slot a value computed into `dst` may build in:
+    /// `scratch`'s dead slots while nothing is live above `dst`.
+    fn scratchFrom(self: *const Emitter, dst: u12) ?u16 {
+        const s = self.scratch orelse return null;
+        return if (s.dst == dst and self.slot_top == @as(u16, dst) + 1) s.lo else null;
     }
 
     /// `SlotOverflow`, with `LowerDiag.detail` naming this routine
@@ -935,8 +959,42 @@ const Emitter = struct {
     }
 
     /// The pc of the next instruction, a jump or handler target.
-    fn nextPc(self: *const Emitter) CompileError!u32 {
+    /// Control reaches a target from elsewhere too, so a Var read
+    /// before it is not what a read there sees on every path.
+    fn nextPc(self: *Emitter) CompileError!u32 {
+        self.held_len = 0;
         return tableIndex(self.code.items.len);
+    }
+
+    /// Whether `name` is a local of this routine or of one it is
+    /// nested in, never a Var.
+    fn isLexical(self: *const Emitter, name: []const u8) bool {
+        var e: ?*const Emitter = self;
+        while (e) |r| : (e = r.parent) {
+            if (r.resolveLocalRef(name) != null or r.lookupCapturedName(name) != null) return true;
+        }
+        return false;
+    }
+
+    /// The slot holding `v` as read at this pc, if a block item
+    /// read it there.
+    fn heldSlot(self: *const Emitter, v: *vm.Var) ?u12 {
+        if (self.held_pc != self.code.items.len) return null;
+        for (self.held[0..self.held_len]) |h| {
+            if (h.var_ == v) return h.slot;
+        }
+        return null;
+    }
+
+    /// Record that the instruction just emitted, at `pc`, read `v`
+    /// into `slot`: a Var read is no code, so what was held before
+    /// it still is.
+    fn hold(self: *Emitter, v: *vm.Var, slot: u12, pc: usize) void {
+        if (self.held_pc != pc) self.held_len = 0;
+        self.held_pc = self.code.items.len;
+        if (self.held_len == self.held.len) return;
+        self.held[self.held_len] = .{ .var_ = v, .slot = slot };
+        self.held_len += 1;
     }
 
     /// Point the jump or handler instruction emitted at `at` at the
@@ -2628,16 +2686,99 @@ fn passesTail(form: *const Tiny) bool {
     };
 }
 
-/// `coll:<op>` over the items, each compiled into its slot of one
-/// block reserved up front: a per-item allocation would interleave
-/// with the items' own temporaries and break the block's contiguity.
+/// `coll:<op>` over the items, compiled into one block (`fillBlock`).
 /// Items too many for one block are built in chunks.
 fn compileColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (!e.blockFits(items.len)) return compileChunkedColl(e, op, items, dst);
-    const argc: u12 = @intCast(items.len);
-    const base = if (argc == 0) dst else try e.allocSlotBlock(argc);
-    for (items, 0..) |item, i| try compileExpr(e, item, base + @as(u12, @intCast(i)), null);
-    try e.emit(Inst.primary(.coll, op, Operand.slot(base), .{ .kind = .unused, .index = argc }, Operand.slot(dst)));
+    const base = if (items.len == 0) dst else e.reserveBlock(dst, items.len) orelse return compileChunkedColl(e, op, items, dst);
+    try fillBlock(e, base, null, items);
+    try e.emit(Inst.primary(.coll, op, Operand.slot(base), .{ .kind = .unused, .index = @intCast(items.len) }, Operand.slot(dst)));
+}
+
+/// Compile a block's items into `base` and up, the callee first when
+/// there is one: what the instruction consuming the block reads
+/// (VM.md §6). The block is reserved before any item compiles, so the
+/// items' own temporaries land above the slot being computed instead
+/// of breaking its contiguity.
+///
+/// Items evaluate left to right, but one whose evaluation has no
+/// effect, cannot fail and reads nothing that can change (a literal,
+/// a local: `isTimeless`), or a Var an item before it read with no
+/// instruction since (`HeldVar`), is written after the items that run
+/// code, just before the consuming instruction, so no slot holds it
+/// while they run. Each item that runs code is computed with its own
+/// slot and every unwritten one below it as scratch (`Scratch`): a
+/// block it builds starts at the lowest of them, and its result
+/// lands in the item's slot. A call nested in an argument thus reuses
+/// its consumer's slots, and nesting costs a slot per level only for
+/// a value some level holds while the next one runs (COMPILER.md
+/// §4.4).
+fn fillBlock(e: *Emitter, base: u12, callee: ?*const Tiny, args: []const *const Tiny) CompileError!void {
+    const first = @intFromBool(callee != null);
+    const count = first + args.len;
+    const top = e.slot_top;
+    const saved = e.scratch;
+    defer e.scratch = saved;
+    // Items that copy a held Var's slot; past its capacity an item
+    // reads its Var itself.
+    var copies: [16]struct { slot: u12, from: u12 } = undefined;
+    var n_copies: usize = 0;
+    var lo: u16 = base;
+    for (0..count) |k| {
+        const item = if (k < first) callee.? else args[k - first];
+        const slot = base + @as(u12, @intCast(k));
+        if (isTimeless(e, item)) {
+            // Resolved now, so a captured name's upvalue is numbered
+            // in the order the source reads it.
+            if (item.* == .symbol) _ = try e.resolveOrCapture(item.symbol);
+            continue;
+        }
+        const read = varOf(e, item);
+        if (read) |v| if (n_copies < copies.len) if (e.heldSlot(v)) |from| {
+            copies[n_copies] = .{ .slot = slot, .from = from };
+            n_copies += 1;
+            continue;
+        };
+        e.slot_top = @as(u16, slot) + 1;
+        e.scratch = .{ .lo = @intCast(lo), .dst = slot };
+        const pc = e.code.items.len;
+        try compileExpr(e, item, slot, null);
+        e.slot_top = top;
+        lo = @as(u16, slot) + 1;
+        if (read) |v| if (e.code.items.len == pc + 1) e.hold(v, slot, pc);
+    }
+    e.scratch = saved;
+    var c: usize = 0;
+    for (0..count) |k| {
+        const item = if (k < first) callee.? else args[k - first];
+        const slot = base + @as(u12, @intCast(k));
+        if (isTimeless(e, item)) {
+            try compileExpr(e, item, slot, null);
+        } else if (c < n_copies and copies[c].slot == slot) {
+            try e.emit(vm.asm_.move(slot, copies[c].from));
+            c += 1;
+        }
+    }
+}
+
+/// A node whose value is the same whenever the enclosing form reads
+/// it, which has no effect and cannot fail: a literal, or a local of
+/// this routine or of one it is nested in (a captured local's cell
+/// is written once, before any code can read it).
+fn isTimeless(e: *const Emitter, t: *const Tiny) bool {
+    return switch (t.*) {
+        .symbol => |name| e.isLexical(name),
+        else => isInert(e, t),
+    };
+}
+
+/// The Var a symbol reads, when it names one that exists.
+fn varOf(e: *const Emitter, t: *const Tiny) ?*vm.Var {
+    const ns = e.namespace orelse return null;
+    return switch (t.*) {
+        .symbol => |name| if (e.isLexical(name)) null else ns.lookup(name),
+        .qualified_symbol => |q| (qualifiedTarget(ns, q.ns) orelse return null).lookupLocal(q.name),
+        else => null,
+    };
 }
 
 /// Items per chunk of a call or collection too large for one slot
@@ -2723,7 +2864,7 @@ fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst
     // instruction writes it, so the first operand that needs code is
     // computed there: nested arithmetic reuses one slot instead of
     // taking one per level.
-    var free_dst = e.scratch == dst;
+    var free_dst = if (e.scratch) |s| s.dst == dst else false;
     const a = try primOperand(e, lhs, rhs == null or isLeaf(rhs.?), dst, &free_dst);
     const b = if (rhs) |r| try primOperand(e, r, true, dst, &free_dst) else Operand.none;
     try e.emit(op.inst(dst, a, b));
@@ -2769,7 +2910,7 @@ fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Ope
     const tmp = try e.allocSlot();
     const saved = e.scratch;
     defer e.scratch = saved;
-    e.scratch = tmp;
+    e.scratch = .{ .lo = tmp, .dst = tmp };
     try compileExpr(e, t, tmp, null);
     return Operand.slot(tmp);
 }
@@ -3513,23 +3654,19 @@ fn compileLetFnStar(
 }
 
 /// A call through the range-call ABI (VM.md §6): the callee and
-/// the arguments in one contiguous block, then `call:call` writes the
-/// result to `dst`. The block is reserved before any sub-expression
-/// is compiled, so their temporaries land above it instead of
-/// breaking its contiguity; `dst`, allocated earlier, lies below the
-/// block and the callee's frame, so the call cannot clobber it.
+/// the arguments in one contiguous block (`fillBlock`), then
+/// `call:call` writes the result to `dst`. `dst` is either live below
+/// the block or dead until the call writes it, so the callee's frame
+/// cannot clobber what it holds.
 fn compileCall(
     e: *Emitter,
     callee: *const Tiny,
     args: []const *const Tiny,
     dst: u12,
 ) CompileError!void {
-    if (!e.blockFits(1 + args.len)) return compileChunkedCall(e, callee, args, dst);
-    const call_base = try e.allocSlotBlock(1 + args.len);
-    // The callee and the arguments are not in tail position.
-    try compileExpr(e, callee, call_base, null);
-    for (args, 1..) |arg, i| try compileExpr(e, arg, call_base + @as(u12, @intCast(i)), null);
-    try e.emit(vm.asm_.callCall(call_base, @intCast(args.len), dst));
+    const base = e.reserveBlock(dst, 1 + args.len) orelse return compileChunkedCall(e, callee, args, dst);
+    try fillBlock(e, base, callee, args);
+    try e.emit(vm.asm_.callCall(base, @intCast(args.len), dst));
 }
 
 fn compileIf(

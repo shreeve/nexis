@@ -14,11 +14,16 @@
 //!   zig build bench [-- ARGS]         the benchmark suite, ReleaseFast
 //!   zig build run -- ARGS             build and run bin/nexis
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
+//!   zig build parser-check            diff src/parser.zig against a fresh generation
+//!                                     (part of `test` when nexus is present)
+//!   zig build check-targets           compile and link every binary for Linux
+//!                                     (x86_64 and aarch64, glibc and musl)
 //!
 //! The runtime is one module, `nexis`, rooted at src/root.zig; its files
 //! import each other by relative path. `checkLayering` below enforces the
 //! import order src/root.zig declares. The checked-in src/parser.zig is
-//! authoritative; `parser` regenerates it after an edit to nexis.grammar.
+//! authoritative; `parser` regenerates it after an edit to nexis.grammar,
+//! with the nexus at ../nexus/bin/nexus or `-Dnexus=PATH`.
 
 const std = @import("std");
 
@@ -45,16 +50,40 @@ pub fn build(b: *std.Build) void {
     })).step);
 
     // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
-    const nexus_bin = b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
+    const nexus_bin = b.option([]const u8, "nexus", "the nexus parser generator (default ../nexus/bin/nexus)") orelse
+        b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
     const run_nexus = b.addSystemCommand(&.{ nexus_bin, "nexis.grammar", "src/parser.zig" });
     run_nexus.setCwd(b.path("."));
     b.step("parser", "Regenerate src/parser.zig from nexis.grammar").dependOn(&run_nexus.step);
+    // The committed src/parser.zig against a generation into the cache;
+    // the gate runs it whenever nexus is there to run.
+    const parser_check_step = b.step("parser-check", "Fail when src/parser.zig differs from what nexus generates from nexis.grammar");
+    if (b.build_root.handle.access(b.graph.io, nexus_bin, .{})) |_| {
+        const generate = b.addSystemCommand(&.{nexus_bin});
+        generate.addFileArg(b.path("nexis.grammar"));
+        const generated = generate.addOutputFileArg("parser.zig");
+        generate.addFileInput(.{ .cwd_relative = nexus_bin });
+        generate.expectExitCode(0);
+        _ = generate.captureStdOut(.{});
+        _ = generate.captureStdErr(.{});
+        const compare = b.addSystemCommand(&.{ "sh", "-c", "diff -u \"$1\" \"$2\" >&2 || { echo 'src/parser.zig is stale: run zig build parser' >&2; exit 1; }", "parser-check" });
+        compare.addFileArg(b.path("src/parser.zig"));
+        compare.addFileArg(generated);
+        compare.expectExitCode(0);
+        parser_check_step.dependOn(&compare.step);
+        test_step.dependOn(&compare.step);
+    } else |_| {
+        const skip = b.addSystemCommand(&.{ "echo", b.fmt("parser-check: skipped, no nexus at {s}", .{nexus_bin}) });
+        parser_check_step.dependOn(&skip.step);
+    }
+
+    const bins = binaries(b, target, optimize, nexis);
 
     // Every inline `test` block of the runtime, in one binary.
     // Every test binary runs from the build root, so the stores its
     // tests create under .zig-cache/tmp/ land in the build's cache
     // whatever directory `zig build` started in.
-    const unit = b.addRunArtifact(b.addTest(.{ .name = "unit", .root_module = nexis }));
+    const unit = b.addRunArtifact(bins.unit);
     unit.setCwd(b.path("."));
     test_step.dependOn(&unit.step);
     quick_step.dependOn(&unit.step);
@@ -63,53 +92,14 @@ pub fn build(b: *std.Build) void {
         .name = "nextomic-unit",
         .root_module = nexis,
         .filters = &.{"nextomic"},
+        .use_llvm = useLlvm(target),
     }));
     nextomic_unit.setCwd(b.path("."));
     nextomic_test_step.dependOn(&nextomic_unit.step);
 
     // Property and integration binaries: one per file, so they run in parallel.
-    const Suite = struct { path: []const u8, quick: bool = false, nextomic: bool = false };
-    const suites = [_]Suite{
-        .{ .path = "test/prop/primitive.zig" },
-        .{ .path = "test/prop/intern.zig" },
-        .{ .path = "test/prop/heap.zig" },
-        .{ .path = "test/prop/string.zig" },
-        .{ .path = "test/prop/list.zig" },
-        .{ .path = "test/prop/bignum.zig" },
-        .{ .path = "test/prop/vector.zig" },
-        .{ .path = "test/prop/champ.zig" },
-        .{ .path = "test/prop/gc.zig" },
-        .{ .path = "test/prop/transient.zig" },
-        .{ .path = "test/prop/codec.zig" },
-        .{ .path = "test/prop/typed_vector.zig" },
-        .{ .path = "test/prop/db.zig" },
-        .{ .path = "test/prop/compile.zig", .quick = true },
-        .{ .path = "test/prop/nextomic_key.zig", .quick = true, .nextomic = true },
-        .{ .path = "test/prop/nextomic_tx.zig", .quick = true, .nextomic = true },
-        .{ .path = "test/integration/eval_pipeline.zig", .quick = true },
-        .{ .path = "test/integration/runtime_polish.zig", .quick = true },
-        .{ .path = "test/integration/numbers.zig", .quick = true },
-        .{ .path = "test/integration/nextomic_q.zig", .nextomic = true },
-        .{ .path = "test/integration/nextomic_pull.zig", .nextomic = true },
-        .{ .path = "test/integration/nextomic_fn.zig", .nextomic = true },
-        .{ .path = "test/integration/nextomic_entity.zig", .nextomic = true },
-    };
-    const harness = b.createModule(.{
-        .root_source_file = b.path("test/harness.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    harness.addImport("nexis", nexis);
-    for (suites) |suite| {
-        const module = b.createModule(.{
-            .root_source_file = b.path(suite.path),
-            .target = target,
-            .optimize = optimize,
-        });
-        module.addImport("nexis", nexis);
-        module.addImport("harness", harness);
-        const name = std.fs.path.stem(suite.path);
-        const run = b.addRunArtifact(b.addTest(.{ .name = name, .root_module = module }));
+    for (suites, bins.suites) |suite, compile| {
+        const run = b.addRunArtifact(compile);
         run.setCwd(b.path("."));
         test_step.dependOn(&run.step);
         if (suite.quick) quick_step.dependOn(&run.step);
@@ -117,13 +107,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // bin/nexis, the CLI.
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    cli_mod.addImport("emdb", emdbModule(b, target, optimize));
-    const nexis_exe = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod });
+    const nexis_exe = bins.nexis;
     const install_nexis = b.addInstallArtifact(nexis_exe, .{
         .dest_dir = .{ .override = .{ .custom = ".." } },
         .dest_sub_path = "bin/nexis",
@@ -138,13 +122,7 @@ pub fn build(b: *std.Build) void {
     // The benchmark runner. Its runtime is optimized too, so the numbers
     // measure release code; `-Doptimize=ReleaseSafe` and the like apply.
     const bench_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/main.zig"),
-        .target = target,
-        .optimize = bench_optimize,
-    });
-    bench_mod.addImport("nexis", runtime(b, target, bench_optimize));
-    const bench_exe = b.addExecutable(.{ .name = "nexis-bench", .root_module = bench_mod });
+    const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize));
     const install_bench = b.addInstallArtifact(bench_exe, .{
         .dest_dir = .{ .override = .{ .custom = ".." } },
         .dest_sub_path = "bin/nexis-bench",
@@ -156,13 +134,20 @@ pub fn build(b: *std.Build) void {
     // The gate analyzes the suite against the Debug runtime without
     // generating code or running it, so an API change cannot leave the
     // bench broken.
-    const bench_check_mod = b.createModule(.{
-        .root_source_file = b.path("bench/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    bench_check_mod.addImport("nexis", nexis);
-    test_step.dependOn(&b.addExecutable(.{ .name = "nexis-bench", .root_module = bench_check_mod }).step);
+    test_step.dependOn(&bins.bench.step);
+
+    // Every binary above, compiled and linked for each Linux target the
+    // release supports; nothing runs. The musl builds are the static
+    // binaries.
+    const check_targets_step = b.step("check-targets", "Compile and link every binary and test binary for Linux (x86_64 and aarch64, glibc and musl)");
+    for (linux_targets) |t| {
+        const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
+        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize));
+        for ([_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit } ++ cross_bins.suites) |compile| {
+            _ = compile.getEmittedBin();
+            check_targets_step.dependOn(&compile.step);
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Programs through bin/nexis, their output pinned byte for byte.
@@ -217,14 +202,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(examples_step);
 
     // Goldens: the reader's Form output (src/golden.zig) and the CLI.
-    const golden_exe = b.addExecutable(.{
-        .name = "nexis-golden",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/golden.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+    const golden_exe = bins.golden;
     const install_golden = b.addInstallArtifact(golden_exe, .{
         .dest_dir = .{ .override = .{ .custom = ".." } },
         .dest_sub_path = "bin/nexis-golden",
@@ -256,6 +234,8 @@ pub fn build(b: *std.Build) void {
             stderr: ?[]const u8 = null,
             exit_code: u8 = 0,
             stdin: ?[]const u8 = null,
+            /// `NEXIS_MAX_ALLOC` for the run (TOOLING.md §1).
+            max_alloc: ?[]const u8 = null,
         };
         const cli = "test/golden/cli/";
         const cases = [_]CliGolden{
@@ -269,15 +249,19 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "macro-failure.nx" }, .stderr = "macro-failure.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "too-many-locals.nx" }, .stderr = "too-many-locals.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
+            .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },
+            .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
             .{ .args = &.{ "run", cli ++ "deep-nesting.nx" }, .stdout = "deep-nesting.out" },
+            .{ .args = &.{ "run", cli ++ "deep-calls.nx" }, .stdout = "deep-calls.out" },
             .{ .args = &.{ "run", cli ++ "args.nx", "a", "b c" }, .stdout = "args.out" },
             .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
             .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
             .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
-            .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err" },
+            .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
@@ -285,6 +269,7 @@ pub fn build(b: *std.Build) void {
         for (cases) |case| {
             const run = scripts.program(scripts.stress);
             run.setCwd(b.path("."));
+            if (case.max_alloc) |max| run.setEnvironmentVariable("NEXIS_MAX_ALLOC", max);
             run.addArgs(case.args);
             for (case.args) |arg| {
                 if (std.mem.endsWith(u8, arg, ".nx")) run.addFileInput(b.path(arg));
@@ -427,12 +412,129 @@ fn exists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
-/// The `nexis` module: the whole runtime, rooted at src/root.zig.
+/// The property and integration test files, each its own binary.
+const Suite = struct { path: []const u8, quick: bool = false, nextomic: bool = false };
+const suites = [_]Suite{
+    .{ .path = "test/prop/primitive.zig" },
+    .{ .path = "test/prop/intern.zig" },
+    .{ .path = "test/prop/heap.zig" },
+    .{ .path = "test/prop/string.zig" },
+    .{ .path = "test/prop/list.zig" },
+    .{ .path = "test/prop/bignum.zig" },
+    .{ .path = "test/prop/vector.zig" },
+    .{ .path = "test/prop/champ.zig" },
+    .{ .path = "test/prop/gc.zig" },
+    .{ .path = "test/prop/transient.zig" },
+    .{ .path = "test/prop/codec.zig" },
+    .{ .path = "test/prop/typed_vector.zig" },
+    .{ .path = "test/prop/db.zig" },
+    .{ .path = "test/prop/compile.zig", .quick = true },
+    .{ .path = "test/prop/nextomic_key.zig", .quick = true, .nextomic = true },
+    .{ .path = "test/prop/nextomic_tx.zig", .quick = true, .nextomic = true },
+    .{ .path = "test/integration/eval_pipeline.zig", .quick = true },
+    .{ .path = "test/integration/runtime_polish.zig", .quick = true },
+    .{ .path = "test/integration/numbers.zig", .quick = true },
+    .{ .path = "test/integration/nextomic_q.zig", .nextomic = true },
+    .{ .path = "test/integration/nextomic_pull.zig", .nextomic = true },
+    .{ .path = "test/integration/nextomic_fn.zig", .nextomic = true },
+    .{ .path = "test/integration/nextomic_entity.zig", .nextomic = true },
+};
+
+/// The targets `check-targets` compiles for: Linux on both
+/// architectures, glibc and musl (the static binary). x86_64 is
+/// checked at the x86-64-v3 level, the CPU of every current CI runner
+/// and server, so emdb's SSE4.2 and AVX2 paths compile as they will
+/// on a native build; baseline x86_64 would skip them.
+const linux_targets = [_]struct { triple: []const u8, cpu: []const u8 }{
+    .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3" },
+    .{ .triple = "aarch64-linux-gnu", .cpu = "baseline" },
+    .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v3" },
+    .{ .triple = "aarch64-linux-musl", .cpu = "baseline" },
+};
+
+const Binaries = struct {
+    nexis: *std.Build.Step.Compile,
+    golden: *std.Build.Step.Compile,
+    /// The benchmark runner over the runtime at the build's optimize
+    /// mode: the gate's check that it compiles.
+    bench: *std.Build.Step.Compile,
+    unit: *std.Build.Step.Compile,
+    suites: [suites.len]*std.Build.Step.Compile,
+};
+
+/// Every binary the build compiles for `target`, over the runtime
+/// module `nexis`.
+fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, nexis: *std.Build.Module) Binaries {
+    const harness = b.createModule(.{
+        .root_source_file = b.path("test/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    harness.addImport("nexis", nexis);
+    var suite_bins: [suites.len]*std.Build.Step.Compile = undefined;
+    for (suites, &suite_bins) |suite, *bin| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(suite.path),
+            .target = target,
+            .optimize = optimize,
+        });
+        module.addImport("nexis", nexis);
+        module.addImport("harness", harness);
+        bin.* = b.addTest(.{ .name = std.fs.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
+    }
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cli_mod.addImport("emdb", emdbModule(b, target, optimize));
+    return .{
+        .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) }),
+        .golden = b.addExecutable(.{
+            .name = "nexis-golden",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/golden.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .use_llvm = useLlvm(target),
+        }),
+        .bench = benchExe(b, target, optimize, nexis),
+        .unit = b.addTest(.{ .name = "unit", .root_module = nexis, .use_llvm = useLlvm(target) }),
+        .suites = suite_bins,
+    };
+}
+
+fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, nexis: *std.Build.Module) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path("bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("nexis", nexis);
+    return b.addExecutable(.{ .name = "nexis-bench", .root_module = module, .use_llvm = useLlvm(target) });
+}
+
+/// Every binary on x86_64 compiles through LLVM, whatever the optimize
+/// mode. Zig 0.16's own x86_64 backend, the default for Debug there,
+/// rejects the `"q"` byte-register constraint in emdb's hardware CRC
+/// step (`emdb/src/simd.zig`, compiled when the CPU has SSE4.2); LLVM
+/// accepts it, and release builds use LLVM already. Elsewhere the
+/// compiler chooses.
+fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
+    return if (target.result.cpu.arch == .x86_64) true else null;
+}
+
+/// The `nexis` module: the whole runtime, rooted at src/root.zig. It
+/// links libc on every target: the runtime and emdb call it, and
+/// Linux, unlike macOS, links it only on request.
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     module.addImport("emdb", emdbModule(b, target, optimize));
     return module;
