@@ -1633,6 +1633,26 @@ test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
 
+test "db: read-line lets every held snapshot go before it waits" {
+    var store = try SeamStore.init("read-line-held");
+    defer store.deinit();
+    const src = try store.source(
+        \\(def c (nextomic/connect "@STORE@"))
+        \\(nextomic/transact! c [{:db/ident :rl/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+        \\(nextomic/transact! c [{:rl/n 1}])
+        \\(nextomic/q '[:find ?n . :where [_ :rl/n ?n]] (nextomic/db c))
+    );
+    defer testing.allocator.free(src);
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(src);
+    try testing.expect(nx.db.StoreFile.heldCount() > 0);
+    _ = try program.run("(try (read-line) (catch any e e))");
+    try testing.expectEqual(@as(usize, 0), nx.db.StoreFile.heldCount());
+    _ = try program.run("(nextomic/release c)");
+}
+
 test "integration: *command-line-args* is nil without arguments; read-line needs the host's stdin" {
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }

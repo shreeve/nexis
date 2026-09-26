@@ -311,6 +311,16 @@ pub const StoreFile = struct {
         while (it) |f| : (it = f.next) f.dropHeld();
     }
 
+    /// How many open files hold a snapshot (§3.4).
+    pub fn heldCount() usize {
+        var n: usize = 0;
+        var it = open_files;
+        while (it) |f| : (it = f.next) {
+            if (f.held != null) n += 1;
+        }
+        return n;
+    }
+
     /// Whether `txn` reads the file's newest commit, by this process
     /// or any other.
     fn latest(self: *StoreFile, txn: *emdb.Txn) bool {

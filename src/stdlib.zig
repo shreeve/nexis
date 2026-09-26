@@ -4714,6 +4714,9 @@ fn readLine(r: *std.Io.Reader, overflow: *std.ArrayList(u8), gpa: std.mem.Alloca
 /// `(read-line)` → the next line of stdin as a string, nil at end
 /// of input.
 fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
+    // A wait on stdin is a wait like the REPL's: no read snapshot is
+    // held across it (DB.md §3.4).
+    db_mod.StoreFile.dropAllHeld();
     const line = (readStdinLine(vm.io orelse return VmError.IoError) catch |err| return switch (err) {
         error.OutOfMemory => VmError.OutOfMemory,
         error.ReadFailed => VmError.IoError,
