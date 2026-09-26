@@ -1088,6 +1088,9 @@ test "integration: sequential destructuring with rest" {
     try expectOutput("((fn ([x & r] r)) 1)", "nil");
     try expectOutput("((fn ([x & r] r) ([] 0)) 1 2 3)", "(2 3)");
     try expectOutput("((fn ([] 0) ([x & r] r)) 1)", "nil");
+    // With nothing before it, the rest is still a seq of the source.
+    try expectOutput("(let [[& r] [1 2]] [r (seq? r)])", "[(1 2) true]");
+    try expectOutput("(nil? (let [[& r] []] r))", "true");
 }
 
 test "integration: sequential destructuring with :as" {

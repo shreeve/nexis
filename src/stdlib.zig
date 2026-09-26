@@ -247,6 +247,7 @@ const core_natives = table("", .{
     .{ "drop-while", 2, 2, &fnDropWhile },
     .{ "butlast", 1, 1, &fnButlast },
     .{ "nthrest", 2, 2, &fnNthrest },
+    .{ "nthnext", 2, 2, &fnNthnext },
     .{ "split-at", 2, 2, &fnSplitAt },
     .{ "take-last", 2, 2, &fnTakeLast },
     .{ "drop-last", 1, 2, &fnDropLast },
@@ -2191,6 +2192,13 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return args[0];
     return try buildListFromSlice(vm, items.items[@min(count, items.items.len)..]);
+}
+
+/// `(nthnext coll n)` → `(seq (nthrest coll n))`: the elements after
+/// the first n, nil when none; a vector's is its view, so a
+/// destructuring rest (`[a b & more]`) costs one block.
+fn fnNthnext(vm: *VM, args: []const Value) VmError!Value {
+    return fnSeq(vm, &.{try fnNthrest(vm, args)});
 }
 
 /// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.

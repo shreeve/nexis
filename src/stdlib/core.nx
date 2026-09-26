@@ -37,10 +37,6 @@
 (defn drop [n s]
   (or (seq (nthrest s n)) (list)))
 
-; (nthnext coll n) → the elements after the first n, nil when none.
-(defn nthnext [coll n]
-  (seq (nthrest coll n)))
-
 ; ============================================================
 ; Conditional macros
 ; ============================================================
