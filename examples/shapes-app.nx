@@ -29,7 +29,7 @@
 ;     extend-type   (Triangle), extend-protocol over built-ins,
 ;                   :any default, satisfies?
 ;     for loop      (iterate shapes vector)
-;     core.nx       (every?, frequencies)
+;     core library  (every?, frequencies)
 
 (require '[lib.shapes.protocol :as p])
 (require '[lib.shapes.records :as r])

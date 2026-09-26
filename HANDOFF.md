@@ -57,15 +57,15 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 170/170 steps succeeded; 1335/1335 tests passed
+Build Summary: 170/170 steps succeeded; 1354/1354 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
 steps; without it the count is 168 steps. It ran in 63 s wall (256 s
 CPU) from a warm cache on an Apple-silicon Mac shared with other
 builds. Any output besides the summary tree is a
-failure. The largest binaries are `unit` (619 inline tests) and
-`eval_pipeline` (417 programs).
+failure. The largest binaries are `unit` (675 inline tests) and
+`eval_pipeline` (454 programs).
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request
 to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64;
@@ -408,11 +408,13 @@ after numbers in the commit message.
 
 1. A store carried between macOS and Linux (§6.4); CI runs the gate on
    both.
-2. Performance against babashka (`docs/PERF.md` §3.11; Nextomic is
-   ahead of Datalevin on every phase): memory on
-   million-element collections, `frequencies`/`group-by`, transient
-   maps, vector `conj`/`nth` and string splitting; the levers are
-   `docs/PERF.md` §6. Rerun `bb bench/compare/run.clj --out DIR`
-   (`docs/BENCH.md` §12) before and after.
+2. Performance against babashka (`docs/PERF.md` §3.11): nexis is
+   ahead on every row but the eager `map`/`filter`/`reduce` pipeline
+   (1.15×), and holds more memory than babashka only there and in
+   `sort`; Nextomic is ahead of Datalevin on every phase with a store
+   3.3× the size. The levers are `docs/PERF.md` §6 (the collector's
+   trigger, generational collection, store size). Rerun
+   `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12) before
+   and after.
 3. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

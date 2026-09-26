@@ -333,56 +333,53 @@ ratio above 1 means nexis is slower. Provenance: §11.
 
 | Workload | nexis | babashka 1.13 | ratio | nexis RSS | bb RSS |
 |---|---:|---:|---:|---:|---:|
-| startup (`-e`) | 4.70 ms | 11.3 ms | 0.41 | 6 MB | 30 MB |
-| fib 30 | 101 ms | 104 ms | 0.97 | 6 MB | 77 MB |
-| loop/recur, 1M | 37.1 ms | 58.0 ms | 0.64 | 6 MB | 83 MB |
-| sort, 1M ints | 133 ms | 202 ms | 0.66 | 278 MB | 114 MB |
-| map build and read, 1M | 854 ms | 827 ms | 1.03 | 331 MB | 192 MB |
-| destructuring loop | 360 ms | 300 ms | 1.20 | 25 MB | 84 MB |
-| map through transients, 1M | 821 ms | 595 ms | 1.38 | 331 MB | 178 MB |
-| vector conj and nth, 1M | 177 ms | 77.6 ms | 2.29 | 504 MB | 127 MB |
-| string build and split, 1 MB | 47.1 ms | 17.8 ms | 2.64 | 131 MB | 72 MB |
-| map/filter/reduce over 1M maps | 162 ms | 37.1 ms | 4.36 | 498 MB | 212 MB |
-| `frequencies` and `group-by`, 1M | 813 ms | 185 ms | 4.40 | 311 MB | 130 MB |
+| startup (`-e`) | 4.77 ms | 11.5 ms | 0.41 | 6 MB | 30 MB |
+| loop/recur, 1M | 13.5 ms | 57.6 ms | 0.23 | 6 MB | 83 MB |
+| sort, 1M ints | 83.5 ms | 202 ms | 0.41 | 188 MB | 114 MB |
+| fib 30 | 47.7 ms | 103 ms | 0.47 | 6 MB | 77 MB |
+| map through transients, 1M | 302 ms | 646 ms | 0.47 | 156 MB | 178 MB |
+| `frequencies` and `group-by`, 1M | 88.1 ms | 185 ms | 0.48 | 97 MB | 130 MB |
+| destructuring loop | 188 ms | 301 ms | 0.62 | 24 MB | 84 MB |
+| map build and read, 1M | 674 ms | 1.03 s | 0.65 | 175 MB | 193 MB |
+| vector conj and nth, 1M | 57.2 ms | 77.2 ms | 0.74 | 100 MB | 126 MB |
+| string build and split, 1 MB | 13.7 ms | 17.7 ms | 0.78 | 35 MB | 72 MB |
+| map/filter/reduce over 1M maps | 48.8 ms | 42.5 ms | 1.15 | 238 MB | 212 MB |
 
 | Phase (100k entities × 5 attributes) | Nextomic | Datalevin 1.1 | ratio |
 |---|---:|---:|---:|
-| open an existing store | 120 μs | 14.2 ms | 0.01 |
-| load, default commit | 656 ms | 2.26 s | 0.29 |
-| load, no per-commit flush | 784 ms | 2.15 s | 0.36 |
-| 10k point lookups by a unique attribute | 13.5 ms | 34.5 ms | 0.39 |
-| three-clause join, 20 × 1,000 rows | 14.2 ms | 35.6 ms | 0.40 |
-| aggregate query | 19.0 ms | 123 ms | 0.16 |
-| pull of 10k entities with a nested ref | 10.1 ms | 75.3 ms | 0.13 |
-| 1,000 one-datom transactions, default commit | 17.7 ms | 183 ms | 0.10 |
-| 1,000 one-datom transactions, no per-commit flush | 23.3 ms | 62.6 ms | 0.37 |
-| as-of and history query | 2.17 ms | no counterpart | — |
-| store after the load (allocated) | 147 MB | 47 MB | 3.1 |
+| open an existing store | 130 μs | 13.9 ms | 0.01 |
+| create a store | 565 μs | 19.8 ms | 0.03 |
+| load, default commit | 665 ms | 2.29 s | 0.29 |
+| load, no per-commit flush | 750 ms | 2.23 s | 0.34 |
+| 10k point lookups by a unique attribute | 12.0 ms | 35.8 ms | 0.33 |
+| three-clause join, 20 × 1,000 rows | 12.5 ms | 35.9 ms | 0.35 |
+| aggregate query | 20.3 ms | 137 ms | 0.15 |
+| pull of 10k entities with a nested ref | 9.43 ms | 78.8 ms | 0.12 |
+| 1,000 one-datom transactions, default commit | 19.4 ms | 171 ms | 0.11 |
+| 1,000 one-datom transactions, no per-commit flush | 23.7 ms | 63.0 ms | 0.38 |
+| as-of and history query | 2.23 ms | no counterpart | — |
+| store after the load (allocated) | 152 MB | 46 MB | 3.3 |
 
-The database rows are a run of their own, at the durability and
-held-snapshot commits; the same run at `cc935cc`, where every default
-commit synced and every read began its own transaction, measured
-3.42 s for the default-commit transactions, 1.64 s for the
-default-commit load and 24.6 ms for the lookups, and matched these
-rows elsewhere within the spread (§11).
+The tree at `cc935cc`, where every default commit synced and every
+read began its own transaction, measured 3.42 s for the default-commit
+transactions, 1.64 s for the default-commit load and 24.6 ms for the
+lookups under the same harness (§6 "Levers pulled", §11).
 
 What the rows say:
 
-- nexis starts in under 5 ms with a 6 MB resident set, matches
-  babashka on calls and arithmetic (`fib`) and is ahead on tight loops
-  and `sort`; §3.12 reruns the language rows after the threaded
-  dispatch.
-- It is behind on sequence pipelines (`map`/`filter`, eager here and
-  lazy and chunked in babashka, `docs/BENCH.md` §12), on
-  `frequencies`/`group-by` and transient maps, on vector `conj`/`nth`
-  and on string splitting, and it holds 2–4× the memory on
-  collections of a million elements. The sequence and string rows
-  below the list narrow the first and last; the collection rows below
-  them put nexis ahead on `frequencies`/`group-by`, transient and
-  persistent maps and vector `conj`/`nth`, within 1.2× of babashka's
-  resident set on those.
-- Nextomic is ahead of Datalevin on every phase: opening, loading,
-  lookups, joins, aggregates, pull and small transactions.
+- nexis starts in under 5 ms with a 6 MB resident set and is ahead of
+  babashka on every row but one: 2–4× on loops, calls (`fib`), `sort`,
+  transient maps and `frequencies`/`group-by`, 1.3–1.6× on
+  destructuring, the map build, vector `conj`/`nth` and string
+  splitting.
+- The pipeline (`map`/`filter`/`reduce` over a million maps) is 1.15×
+  babashka's. Its sequences are eager here, lazy and chunked in
+  babashka (`docs/BENCH.md` §12); its cost is the filter's closure
+  call per element and the collector re-marking the million live maps
+  (§6, the collector's trigger). Its resident set and `sort`'s are the
+  two above babashka's; every other row holds less.
+- Nextomic is ahead of Datalevin on every phase: creating, opening,
+  loading, lookups, joins, aggregates, pull and small transactions.
 - The default-commit rows compare different guarantees. A default
   Nextomic commit (`:commit`, `docs/DB.md` §3.3) syncs nothing: it is
   atomic and survives a crash of the process, and the file is synced
@@ -390,10 +387,9 @@ What the rows say:
   phase. Datalevin's calls `fsync`, which on macOS does not empty the
   drive's cache (`docs/BENCH.md` §12). A Nextomic connection opened
   `{:durability :durable}` syncs each commit, two `F_FULLFSYNC`, and
-  pays what every default commit paid before: 3.42 s for the 1,000
-  transactions. The no-flush rows include one sync at the end in
-  both systems.
-- The store is 3.1× Datalevin's. Half of it is the four history
+  pays 3.42 s for the 1,000 transactions. The no-flush rows include
+  one sync at the end in both systems.
+- The store is 3.3× Datalevin's. Half of it is the four history
   indexes and the txlog, which Datalevin does not keep; the table below
   has the rest. Writing each tree in plain key order leaves every
   leaf half full under emdb's splits: 198 MB, 4.3× (the "before"
@@ -463,10 +459,11 @@ the two runs back to back under the same load (provenance §11).
 | sort, 1M ints | 98.9 ms | 94.2 ms | 223 ms | 0.42 | 183 → 188 MB | 114 MB |
 
 A map built persistently still marks its whole live set at every
-cycle (§6, the collector's trigger); the vector row's resident set is
-the garbage of a million persistent `conj`s that `reduce`, a native
-calling a native, never lets the collector see (§6, a safe point where
-a native calls a native).
+cycle (§6, the collector's trigger). The vector row's 150 MB was
+measured without a safe point in `callValue` of a native
+(`docs/GC.md` §7): `reduce`, a native calling a native, kept the
+garbage of a million persistent `conj`s resident until it returned.
+The main table's run, with it, holds 100 MB.
 
 ### 3.12 Threaded dispatch and direct calls, Apple M5
 
@@ -539,7 +536,7 @@ Each lever is a measured change: a before/after from `zig build bench`
   would save part of a `:commit` transaction's cost, about 18 μs in
   all (§3.11), at the price of holding the writer between natives. A `:durable` commit's two device flushes are the other
   cost left; group commit under one flush would divide it.
-- **Store size** (§3.11, 3.1× Datalevin). A history index that holds
+- **Store size** (§3.11, 3.3× Datalevin). A history index that holds
   only facts no longer current, with `as-of` and `history` merging it
   with the current index, would drop half the index pages of an
   append-mostly store; the readers are `nextomic/db.zig` and
@@ -554,15 +551,6 @@ Each lever is a measured change: a before/after from `zig build bench`
   an out-of-line value's payload for its assertion and its
   retraction; referring to EAVT-h instead would drop most of a
   text-heavy store's log.
-- **A safe point where a native calls a native.** `VM.callValue`
-  reaches the collector's safe point only through a closure, so
-  `(reduce conj [] xs)` and every other native that calls a native
-  back collects nothing until it returns, and the garbage of a million
-  `conj`s stays resident. A due check before `callValue` calls a
-  non-closure, whose arguments are already on the root stack, keeps
-  the heap near its live set: tried on the tree of §3.11's collection
-  rows, it took the vector workload from 399 to 123 MB and from 186 to
-  131 ms (one run each, not a row of record).
 - **The collector's trigger.** A cycle is due once the heap has
   allocated its live size again (100 %) or 16 MiB, so a build that
   grows a large live set re-marks it every few megabytes. A higher
@@ -608,6 +596,12 @@ Each lever is a measured change: a before/after from `zig build bench`
   one attribute 16.9 → 8.6 ms, `d/entid` by lookup ref 8.5 → 4.3 ms
   (§11). The query and pull rows of §3.7 each run one read and did
   not move outside their spread.
+- *A safe point where a native calls a native* (`docs/GC.md` §7):
+  `VM.callValue` checks the collector before it calls a non-closure,
+  whose arguments are rooted. `(reduce conj [] xs)` over a million
+  elements peaked at 15.5 MB live against 193 KB kept before and
+  under 3× the kept set after (the `eval_pipeline` test); §3.11's
+  vector row 150 → 100 MB and 64.7 → 57.2 ms.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
 
@@ -694,8 +688,8 @@ is one invocation's 30-sample median.
 | §3.7 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 6–20) | revamp, 2026-09-25: `nexis-bench --filter nextomic` built by `zig build bench -Doptimize=ReleaseFast` from `bench/nextomic.zig` at the ws-planner head over the `src/` of `8548eda` (before) and of the ws-planner head (after), five invocations of each, alternating, the best median with the spread; the `bin/nexis` figures are one run each of a probe program timing `d/q` with `nano-time`, before at `b8c17a1` |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |
-| §3.11 language rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
-| §3.11 database rows, §6 "Levers pulled" | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
+| §3.11 language and database rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0; shared with concurrent builds (load average 4.1 at the start, 8.0 at the end) | 2026-09-26 17:25 MDT: `bb bench/compare/run.clj --n 10 --max-load 4` at `5440e80`; ten rounds after a discarded warm-up (startup thirty), the implementations alternating, each workload started below a load average of 4 and repeated if the load rose past it; every answer equal; raw results kept with the run (`results.json`) |
+| §6 "Levers pulled", the `cc935cc` figures of §3.11 | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
 | §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
