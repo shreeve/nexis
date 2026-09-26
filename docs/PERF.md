@@ -309,6 +309,66 @@ each build put every row's medians within each other's spread.
 
 ---
 
+### 3.11 Against babashka and Datalevin
+
+The same workloads through nexis and babashka, and through Nextomic and
+Datalevin, by `bench/compare/run.clj` (`docs/BENCH.md` §12): ten
+rounds, the implementations alternating, the median of the time
+measured inside each process with its minimum and 95th percentile.
+Every workload gave the same answers in every run of both systems. A
+ratio above 1 means nexis is slower. Provenance: §11.
+
+| Workload | nexis | babashka 1.13 | ratio | nexis RSS | bb RSS |
+|---|---:|---:|---:|---:|---:|
+| startup (`-e`) | 4.70 ms | 11.3 ms | 0.41 | 6 MB | 30 MB |
+| fib 30 | 101 ms | 104 ms | 0.97 | 6 MB | 77 MB |
+| loop/recur, 1M | 37.1 ms | 58.0 ms | 0.64 | 6 MB | 83 MB |
+| sort, 1M ints | 133 ms | 202 ms | 0.66 | 278 MB | 114 MB |
+| map build and read, 1M | 854 ms | 827 ms | 1.03 | 331 MB | 192 MB |
+| destructuring loop | 360 ms | 300 ms | 1.20 | 25 MB | 84 MB |
+| map through transients, 1M | 821 ms | 595 ms | 1.38 | 331 MB | 178 MB |
+| vector conj and nth, 1M | 177 ms | 77.6 ms | 2.29 | 504 MB | 127 MB |
+| string build and split, 1 MB | 47.1 ms | 17.8 ms | 2.64 | 131 MB | 72 MB |
+| map/filter/reduce over 1M maps | 162 ms | 37.1 ms | 4.36 | 498 MB | 212 MB |
+| `frequencies` and `group-by`, 1M | 813 ms | 185 ms | 4.40 | 311 MB | 130 MB |
+
+| Phase (100k entities × 5 attributes) | Nextomic | Datalevin 1.1 | ratio |
+|---|---:|---:|---:|
+| open an existing store | 106 μs | 12.5 ms | 0.01 |
+| load, default commit | 1.64 s | 2.00 s | 0.82 |
+| load, no per-commit flush | 702 ms | 1.90 s | 0.37 |
+| 10k point lookups by a unique attribute | 21.1 ms | 31.9 ms | 0.66 |
+| three-clause join, 20 × 1,000 rows | 12.6 ms | 31.0 ms | 0.41 |
+| aggregate query | 18.0 ms | 93.8 ms | 0.19 |
+| pull of 10k entities with a nested ref | 9.53 ms | 68.5 ms | 0.14 |
+| 1,000 one-datom transactions, default commit | 4.02 s | 159 ms | 25.3 |
+| 1,000 one-datom transactions, no per-commit flush | 39.9 ms | 58.4 ms | 0.68 |
+| as-of and history query | 2.79 ms | no counterpart | — |
+| store after the load (allocated) | 198 MB | 46 MB | 4.3 |
+
+What the rows say:
+
+- nexis starts in under 5 ms with a 6 MB resident set, matches
+  babashka on calls and arithmetic (`fib`) and is ahead on tight loops
+  and `sort`.
+- It is behind on sequence pipelines (`map`/`filter`, eager here and
+  lazy and chunked in babashka, `docs/BENCH.md` §12), on
+  `frequencies`/`group-by` and transient maps, on vector `conj`/`nth`
+  and on string splitting, and it holds 2–4× the memory on
+  collections of a million elements: the collector's policy and the
+  16-byte value cell show there.
+- Nextomic is ahead of Datalevin on opening, loading, lookups, joins,
+  aggregates and pull.
+- The default-commit transaction row compares different guarantees:
+  a Nextomic commit asks the drive to empty its write cache
+  (`F_FULLFSYNC`, twice), Datalevin's does not (`docs/BENCH.md` §12).
+  With the per-commit flush off in both, Nextomic is ahead. A
+  durable commit per small transaction is the cost to lower (group
+  commit, or a WAL); §6.
+- The store is 4.3× Datalevin's: history indexes and the txlog, which
+  Datalevin does not keep, and 16 KiB pages over 256 MB of initial
+  map.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -316,20 +376,34 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Rows that do not exist.**
 
-- A Clojure comparison suite under BENCH.md, same machine, one row per
-  §3 row. Until it exists every Clojure figure here is external.
+- A JVM Clojure column beside §3.11's babashka one (no JVM Clojure on
+  the measuring host); every JVM Clojure figure here is external.
 - Garbage-collection rows: steady-state allocation pressure, pause
   times.
-- A memory-footprint row (scorecard #1): peak RSS and allocated bytes
-  for a fixed workload.
+- Allocated bytes for a fixed workload (scorecard #1); §3.11 has peak
+  RSS per workload.
 - A cold-cache random-access `nth` row beside §3.4's sequential one.
 - `nexis.simd` and typed-vector rows (scorecard #17).
-- Startup (scorecard #18): exec to first result.
 - Reruns: §3.1–§3.6 on the machine of §3.7–§3.8, with the emdb
   revision, to settle §3.6's 17×; §3.8's `vm` rows against the
   compiler's shorter loop.
 
 **Levers not built.**
+
+- **The durable commit of a small transaction.** A default Nextomic
+  commit is two `F_FULLFSYNC` calls, about 4 ms, so 1,000 one-datom
+  transactions take 4 s where Datalevin's weaker default takes 159 ms
+  (§3.11). Group commit, several transactions under one flush, keeps
+  the guarantee and divides the cost; the measurement is §3.11's
+  `tx-1k-durable` row.
+- **Memory on large collections.** §3.11's million-element rows hold
+  2–4× babashka's resident set: the 16-byte value cell, non-moving
+  mark-sweep over the process allocator, and eager intermediate
+  results. The size-class pool below and a collection trigger that
+  follows the live set are the levers.
+- **`frequencies`, `group-by`, transient maps, `conj`/`nth` on
+  vectors, string splitting** (§3.11, 2.3–4.4× behind babashka):
+  each is a native or `core.nx` path to profile before changing.
 
 - **A size-class pool under `VM.heap`.** The heap allocates every
   block from the process allocator. The pool the bench carried built
@@ -434,3 +508,4 @@ is one invocation's 30-sample median.
 | §3.7 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 6–20) | revamp, 2026-09-25: `nexis-bench --filter nextomic` built by `zig build bench -Doptimize=ReleaseFast` from `bench/nextomic.zig` at the ws-planner head over the `src/` of `8548eda` (before) and of the ws-planner head (after), five invocations of each, alternating, the best median with the spread; the `bin/nexis` figures are one run each of a probe program timing `d/q` with `nano-time`, before at `b8c17a1` |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |
+| §3.11 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
