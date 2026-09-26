@@ -743,7 +743,9 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
         // Every slot of the block: vectors sharing a tail use
         // different lengths of it, and the node is marked once.
         if (visitor.markInternal(tn)) {
-            for (leafValues(tn)[0..tailCapacity(tn)]) |elem| visitor.markValue(elem);
+            for (leafValues(tn)[0..tailCapacity(tn)]) |elem| {
+                if (elem.kind().isHeap()) visitor.markValue(elem);
+            }
         }
     }
     if (body.root_node) |rn| traceTrie(rn, body.shift, visitor);
@@ -756,7 +758,9 @@ fn traceTrie(node: *HeapHeader, shift: u32, visitor: anytype) void {
     if (!visitor.markInternal(node)) return;
     if (shift == 0) {
         // Leaf: 32 Value slots.
-        for (leafValues(node)) |elem| visitor.markValue(elem);
+        for (leafValues(node)) |elem| {
+            if (elem.kind().isHeap()) visitor.markValue(elem);
+        }
     } else {
         // Interior: 32 ?*HeapHeader child slots.
         const next_shift: u32 = shift - branch_bits;

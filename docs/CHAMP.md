@@ -226,9 +226,11 @@ lookup must tell an absent key from a nil value (§6.6).
 #### 6.5 Key comparison
 
 Key comparison inside the module (`keyEquivalent`) tries two shortcuts
-before `elementEq`: bit identity (same tag and payload), and for two
-keywords, interned-id equality. Both are exact: two keywords are `=`
-exactly when their ids are equal.
+before `elementEq`: bit identity (same tag and payload), and, when
+either key is an immediate, `Value.equalImmediate` inline, since an
+immediate is `=` only to an immediate of its own kind (SEMANTICS
+§3.3). Both are exact: two keywords are `=` exactly when their ids
+are equal, and a keyword or fixnum key never reaches the callback.
 
 #### 6.6 `MapLookup`
 
@@ -401,7 +403,7 @@ through 0..8 entries, promotion at 9 (and none on a duplicate key at
 8), no demotion, the root dissoc, the same-pointer short-circuits, the
 kept key object, nil keys, values and elements, the builders against
 `assoc`/`conj` folds, insertion-order-independent hashing, cross-subkind
-equality, the keyword shortcut, the bitmap ranks, lone-key pull-up
+equality, the keyword and immediate shortcuts, the bitmap ranks, lone-key pull-up
 through every level and out of a collision node, and an immediate key
 bypassing the hash callback.
 

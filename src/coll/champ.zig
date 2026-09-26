@@ -148,12 +148,13 @@ inline fn afterHeader(h: *HeapHeader) [*]u8 {
 // =============================================================================
 
 /// Key equality with two shortcuts ahead of `elementEq` (CHAMP.md
-/// §6.5): bit identity, and interned-id identity for two keywords.
+/// §6.5): bit identity, and an immediate on either side compared
+/// inline, since an immediate is `=` only to an immediate of its kind.
 inline fn keyEquivalent(a: Value, b: Value, elementEq: ElementEq) bool {
     if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() == .keyword and b.kind() == .keyword) {
-        return a.asKeywordId() == b.asKeywordId();
-    }
+    const a_heap = a.kind().isHeap();
+    const b_heap = b.kind().isHeap();
+    if (!a_heap or !b_heap) return !a_heap and !b_heap and a.equalImmediate(b);
     return elementEq(a, b);
 }
 
@@ -1151,9 +1152,9 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         fn markPayload(p: P, visitor: anytype) void {
             if (is_map) {
-                visitor.markValue(p.key);
-                visitor.markValue(p.value);
-            } else visitor.markValue(p);
+                if (p.key.kind().isHeap()) visitor.markValue(p.key);
+                if (p.value.kind().isHeap()) visitor.markValue(p.value);
+            } else if (p.kind().isHeap()) visitor.markValue(p);
         }
 
         // ---- introspection for tests (CHAMP.md §4.3, §12.3) ----
@@ -2056,6 +2057,22 @@ test "keyword-keyed fast path: intern-id identity matches general equality" {
     try testing.expect(keyEquivalent(a, b, &wrapEq.f));
     // Different keyword ids → not equal.
     try testing.expect(!keyEquivalent(value.testKeyword(1), value.testKeyword(2), &wrapEq.f));
+}
+
+test "immediate keys compare inline: never through the callback, never equal to a heap key" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const never = struct {
+        fn f(_: Value, _: Value) bool {
+            unreachable;
+        }
+    };
+    try testing.expect(keyEquivalent(value.fromFloat(-0.0), value.fromFloat(0.0), &never.f));
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, value.fromFixnum(2).?, &never.f));
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, value.fromFloat(1.0), &never.f));
+    const s = try string_mod.fromBytes(&heap, "1");
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, s, &never.f));
+    try testing.expect(!keyEquivalent(s, value.testKeyword(1), &never.f));
 }
 
 // ---- Single-entry-subtree promotion ----
