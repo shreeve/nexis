@@ -63,6 +63,20 @@
 (t/check "an aborted rename is not cached" (= (d/entid (d/db c2) :x/new) (d/entid (d/db c) :x/new)))
 (t/check "the attribute keeps its old name" (= :x/a (d/ident (d/db c) (d/entid (d/db c) :x/a))))
 (println (t/caught (d/transact! c [{:db/id "e" :x/new 5}])))
+
+; An ident is never retracted, from an attribute or an enum, by any
+; form: a name leaves only by a rename, and resolves as before.
+(d/transact! c [{:db/ident :x/role :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+                {:db/ident :role/admin}])
+(println (t/caught (d/transact! c [[:db/retract :x/a :db/ident :x/a]])))
+(println (t/caught (d/transact! c [[:db/retract :x/a :db/ident]])))
+(println (t/caught (d/transact! c [[:db/retractEntity :x/a]])))
+(println (t/caught (d/transact! c [[:db/retract :role/admin :db/ident :role/admin]])))
+(println (t/caught (d/transact! c [[:db/retractEntity :role/admin]])))
+(t/check "a refused ident retraction leaves every name resolving"
+       (and (= #{[:x/a]} (d/q '[:find ?i :where [?e :db/ident ?i] [(= ?i :x/a)]] (d/db c)))
+            (= #{[(d/entid (d/db c) :role/admin)]} (d/q '[:find ?e :where [?e :db/ident :role/admin]] (d/db c)))
+            (= :role/admin (d/ident (d/db c) (d/entid (d/db c) :role/admin)))))
 (d/release c2)
 (def last-t (d/basis-t (d/db c)))
 

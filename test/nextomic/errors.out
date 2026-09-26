@@ -32,6 +32,12 @@ ok the store still works after every failure
 ok an aborted rename is not cached
 ok the attribute keeps its old name
 :nextomic/value-type
+{:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
+{:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
+{:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
+{:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
+{:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
+ok a refused ident retraction leaves every name resolving
 :nextomic/closed
 :nextomic/closed
 :nextomic/closed

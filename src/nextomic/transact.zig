@@ -1563,6 +1563,9 @@ const Ctx = struct {
     fn push(self: *Ctx, e: u64, attr: *const Attr, v: Val, vbytes: []const u8, added: bool, fact_key: ?[]const u8) !void {
         // The txlog entry carries the instant too: it never changes.
         if (attr.id == boot.tx_instant and (!added or e != key.txEntity(self.t))) return self.malformed(":db/txInstant is asserted on the transaction's own entity only, and never retracted");
+        // Keyword values and the attribute of every datom are stored by
+        // the ident's id, so a name only moves, by a rename.
+        if (attr.id == boot.ident and !added) return self.schemaRefused(@intCast(e), null, "an ident is never retracted; assert a new :db/ident to rename it");
         const fk = fact_key orelse try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
         const i: u32 = @intCast(self.overlay.items.len);
         try self.overlay.append(self.arena, .{ .e = e, .attr = attr, .v = v, .vbytes = vbytes, .added = added });

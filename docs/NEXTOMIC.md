@@ -326,6 +326,13 @@ so there is no queue; emdb's write lock is the transactor.
      datoms and its keyword values are untouched, so the rename writes
      no datom; the transaction's entry holds only its `:db/txInstant`.
      An ident on a user-partition entity is `:nextomic/conflict`.
+     An ident is never retracted, from an attribute or any other
+     ident entity and by any form (`[:db/retract x :db/ident k]`, the
+     bare `[:db/retract x :db/ident]`, a `:db/retractEntity`):
+     `:nextomic/schema` naming it. Every datom's attribute and every
+     keyword value is stored by the ident's id, so a name only moves,
+     by a rename, and resolves the same way in `q`, `pull`, `entity`
+     and tx-data before and after the refusal.
    - `:db/isComponent true` takes a ref attribute (`:nextomic/schema`
      otherwise) and may be set false again; `:db/doc` is an ordinary
      card-one attribute.
@@ -840,7 +847,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | bare |
 | `:nextomic/busy` | `release` while an operation is in flight | bare |
 | `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute, a nested map nothing could reach, a value-only tempid, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:message`; `:attr` when an attribute is at fault |
-| `:nextomic/schema` | a schema change the attribute's data or type refuses | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
+| `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | bare |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | bare |
 | `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit and its value |
