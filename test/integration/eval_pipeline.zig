@@ -1633,6 +1633,27 @@ test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
 
+test "gc: a native that calls a native through callValue reaches a safe point" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.gc_threshold = 1 << 16;
+    program.v.gc_growth_percent = 0;
+    program.v.gc_next_at = 1 << 16;
+    // reduce calls the conj native for every element with no
+    // closure frame in between; each persistent set conj leaves the
+    // replaced path behind as garbage.
+    _ = try program.run("(def xs (vec (range 20000)))");
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    _ = try program.run("(def s (reduce conj #{} xs))");
+    program.v.collectGarbage();
+    const kept = heap.live_bytes - start;
+    const peak = heap.peak_live_bytes - start;
+    try testing.expect(peak < 3 * kept);
+}
+
 test "db: read-line lets every held snapshot go before it waits" {
     var store = try SeamStore.init("read-line-held");
     defer store.deinit();

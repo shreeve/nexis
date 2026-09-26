@@ -2163,6 +2163,12 @@ pub const VM = struct {
             const scope = self.rootScope();
             defer scope.release();
             try scope.pushAll(args);
+            // A native called from a native reaches no closure frame's
+            // safe point, so a loop of them (`(reduce conj #{} xs)`)
+            // would otherwise run to the end without collecting; the
+            // arguments are rooted and the caller keeps what it holds
+            // on its own root scope (GC.md §7, §11.5).
+            if (self.gcDue()) self.collectGarbage();
             return self.callDirect(callee, args);
         }
         const base = self.stack.items.len;
