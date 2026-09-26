@@ -134,6 +134,9 @@ and a reused subform its own (MACROEXPAND.md §4b).
    | 2 | `+` `-` `*` `/` `quot` `mod` `<` `<=` `>` `>=` `==` |
    | 1 | `-` (negate), `abs`, `inc` and `dec` (`+` / `-` with a constant 1) |
 
+   `(not x)` inlines the same way, as `(if x false true)`, which is
+   what the fn computes; as an `if` test it is a branch (§5.2).
+
    It inlines only when the operator means `nexis.core`'s Var
    (`namesCore`): it is not lexically bound, the namespace resolves it
    to `nexis.core`'s Var rather than one it defines or refers to, and
@@ -328,11 +331,18 @@ the else label; `then` into the result slot; `jump:jmp` to the end,
 unless every path through `then` ends in `recur` or `throw`; the else
 branch (nil when absent).
 
-A test `(not x)`, when `not` means `nexis.core`'s as an inlined fn
-must (§4.3 rule 2), lowers as `x` with the arms swapped, so the call
-of `not` is never made. For effect (§5.3) an `if` whose `then` is
-dropped is `jump:if-true` past its else arm, so `(when-not x (f))`
-there is the test, the branch and the call.
+The test is compiled as branches rather than as a value: a `not`
+(`(if x false true)`, §4.3 rule 2) branches on `x` the other way, and
+an `and` or an `or` in the shape the expander gives them
+(`(let* [g x] (if g rest g))`, `(let* [g x] (if g g rest))`,
+MACROEXPAND.md §10) branches on `x` and then on `rest`, jumping to the
+else arm (or past it, with `jump:if-true`) as soon as the answer is
+known, so none of the three is ever made as a value:
+`(if (and a (not b)) x y)` with `a` and `b` locals is
+`jump:if-false a`, `jump:if-true b`, then the arms. For effect (§5.3)
+an `if` whose `then` is dropped branches past its else arm when the
+test holds, so `(when-not x (f))` there is the test, the branch and
+the call.
 
 #### 5.3 `(do expr...)`
 

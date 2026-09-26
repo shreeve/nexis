@@ -1407,11 +1407,14 @@ fn lowerList(
         if (inlinedOp(name, items.len - 1)) |in| {
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
         }
+        if (items.len == 2 and std.mem.eql(u8, name, "not") and namesCore(ctx, name)) return try lowerNot(allocator, items[1], ctx);
     } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
         // A qualified head is never a lexical local, so `nexis.core/+`
         // inlines unconditionally. Host macros emit these
         // (MACROEXPAND.md §5).
-        if (inlinedOp(items[0].datum.symbol.name, items.len - 1)) |in| return try lowerPrim(allocator, in, items[1..], ctx);
+        const name = items[0].datum.symbol.name;
+        if (inlinedOp(name, items.len - 1)) |in| return try lowerPrim(allocator, in, items[1..], ctx);
+        if (items.len == 2 and std.mem.eql(u8, name, "not")) return try lowerNot(allocator, items[1], ctx);
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
@@ -1477,49 +1480,34 @@ fn lowerDo(
 }
 
 /// `(if test then)` or `(if test then else)`. Missing else
-/// synthesizes nil (matches Tiny semantics). A test `(not x)`, with
-/// `not` core's, is `x` with the arms swapped (COMPILER.md §5.2).
+/// synthesizes nil (matches Tiny semantics).
 fn lowerIf(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 2 and args.len != 3) return CompileError.MalformedForm;
-    var test_form: *const reader_mod.Form = args[0];
-    var negated = false;
-    while (negatedTest(test_form, ctx)) |inner| {
-        test_form = inner;
-        negated = !negated;
-    }
-    const test_ = try lowerForm(allocator, test_form, ctx);
+    const test_ = try lowerForm(allocator, args[0], ctx);
     const then = try lowerForm(allocator, args[1], ctx);
     const else_: ?*const Tiny = if (args.len == 3)
         try lowerForm(allocator, args[2], ctx)
     else
         null;
-    return try allocTiny(allocator, .{ .if_ = if (negated) .{
-        .test_ = test_,
-        .then = else_ orelse try allocTiny(allocator, .nil),
-        .else_ = then,
-    } else .{
+    return try allocTiny(allocator, .{ .if_ = .{
         .test_ = test_,
         .then = then,
         .else_ = else_,
     } });
 }
 
-/// `x` when `form` is `(not x)` and `not` means `nexis.core`'s, as an
-/// inlined fn must (§4.3 rule 2).
-fn negatedTest(form: *const reader_mod.Form, ctx: LowerCtx) ?*const reader_mod.Form {
-    const items = switch (form.datum) {
-        .list => |items| items,
-        else => return null,
-    };
-    if (items.len != 2 or items[0].datum != .symbol) return null;
-    const head = items[0].datum.symbol;
-    if (!std.mem.eql(u8, head.name, "not")) return null;
-    const core = if (head.ns) |ns| std.mem.eql(u8, ns, "nexis.core") else namesCore(ctx, "not");
-    return if (core) items[1] else null;
+/// `(not x)` as `(if x false true)`, which is what `nexis.core/not`
+/// computes: an `if` testing it branches on `x` (§4.3 rule 2).
+fn lowerNot(allocator: std.mem.Allocator, arg: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    return try allocTiny(allocator, .{ .if_ = .{
+        .test_ = try lowerForm(allocator, arg, ctx),
+        .then = try allocTiny(allocator, .{ .bool = false }),
+        .else_ = try allocTiny(allocator, .{ .bool = true }),
+    } });
 }
 
 /// `(quote x)`. Scalars that already map to Tiny variants are
@@ -3196,22 +3184,20 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
         .if_ => |i| {
             const else_inert = i.else_ == null or isInert(e, i.else_.?);
             if (isInert(e, i.then) and else_inert) return compileEffect(e, i.test_);
+            var skip: Jumps = .empty;
+            defer skip.deinit(e.allocator);
             if (isInert(e, i.then)) {
                 // Only the else arm runs code: skip it when the test holds.
-                const if_true_pc = try e.emitJumpIfTruePlaceholder(try compileOperand(e, i.test_, true));
-                e.slot_top = slot_mark;
+                try compileBranch(e, i.test_, true, &skip);
                 try compileEffect(e, i.else_.?);
-                return e.patchJumpHere(if_true_pc);
+                return patchJumpsHere(e, skip.items);
             }
-            const test_op = try compileOperand(e, i.test_, true);
-            const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
-            e.slot_top = slot_mark;
+            try compileBranch(e, i.test_, false, &skip);
             try compileEffect(e, i.then);
-            const else_form = i.else_ orelse return e.patchJumpHere(if_false_pc);
-            if (isInert(e, else_form)) return e.patchJumpHere(if_false_pc);
+            if (else_inert) return patchJumpsHere(e, skip.items);
             const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitJumpPlaceholder();
-            try e.patchJumpHere(if_false_pc);
-            try compileEffect(e, else_form);
+            try patchJumpsHere(e, skip.items);
+            try compileEffect(e, i.else_.?);
             if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
         },
         else => try compileExpr(e, t, try e.allocSlot(), null),
@@ -3446,25 +3432,92 @@ fn compileIf(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // The test is non-tail and read in place where it can be; a
-    // slot it needed is free again once the jump has read it.
-    const slot_mark = e.slot_top;
-    const test_op = try compileOperand(e, test_form, true);
-    const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
-    e.slot_top = slot_mark;
+    // The test is non-tail and branched on (`compileBranch`).
+    var if_false: Jumps = .empty;
+    defer if_false.deinit(e.allocator);
+    try compileBranch(e, test_form, false, &if_false);
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
     // An arm that always jumps away (recur, throw) or returns needs
     // no jump past the else arm.
     const returns = if (recur_target) |t| t.returns else false;
     const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
-    try e.patchJumpHere(if_false_pc);
+    try patchJumpsHere(e, if_false.items);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
     } else {
         try e.emit(if (returns) vm.asm_.returnNil() else vm.asm_.loadNil(dst));
     }
     if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+}
+
+/// The pcs of jumps a caller points at one target.
+const Jumps = std.ArrayList(usize);
+
+fn patchJumpsHere(e: *Emitter, pcs: []const usize) CompileError!void {
+    for (pcs) |pc| try e.patchJumpHere(pc);
+}
+
+/// Emit `t` as a branch: control jumps (from a pc added to `jumps`)
+/// when `t`'s truthiness is `jump_when` and falls through otherwise;
+/// the test is read in place where it can be, and a slot it needed
+/// is free again after the jump. An `and` or an `or` branches on
+/// each operand in turn and a `not` on its operand, so their values
+/// are never made (COMPILER.md §5.2).
+fn compileBranch(e: *Emitter, t: *const Tiny, jump_when: bool, jumps: *Jumps) CompileError!void {
+    try stack.check();
+    // `(if x true false)` is x's truthiness, `(if x false true)`
+    // (a `not`) its negation.
+    if (t.* == .if_ and t.if_.else_ != null and t.if_.then.* == .bool and t.if_.else_.?.* == .bool and t.if_.then.bool != t.if_.else_.?.bool) {
+        return compileBranch(e, t.if_.test_, if (t.if_.then.bool) jump_when else !jump_when, jumps);
+    }
+    if (try andOr(t)) |ao| {
+        if (ao.is_and != jump_when) {
+            // Either operand alone decides a jump: an and that is
+            // false, an or that is true.
+            try compileBranch(e, ao.first, jump_when, jumps);
+            try compileBranch(e, ao.rest, jump_when, jumps);
+        } else {
+            // The first operand can only decide the fall-through.
+            var decided: Jumps = .empty;
+            defer decided.deinit(e.allocator);
+            try compileBranch(e, ao.first, !jump_when, &decided);
+            try compileBranch(e, ao.rest, jump_when, jumps);
+            try patchJumpsHere(e, decided.items);
+        }
+        return;
+    }
+    const slot_mark = e.slot_top;
+    defer e.slot_top = slot_mark;
+    const op = try compileOperand(e, t, true);
+    try jumps.append(e.allocator, if (jump_when) try e.emitJumpIfTruePlaceholder(op) else try e.emitJumpIfFalsePlaceholder(op));
+}
+
+const AndOr = struct { is_and: bool, first: *const Tiny, rest: *const Tiny };
+
+/// `t` as the operands of an `and` or an `or`, when it has the shape
+/// the expander gives them (MACROEXPAND.md §10): `(let* [g x] (if g
+/// rest g))` or `(let* [g x] (if g g rest))`, `rest` not naming `g`.
+fn andOr(t: *const Tiny) CompileError!?AndOr {
+    const l = switch (t.*) {
+        .let_star => |l| l,
+        else => return null,
+    };
+    if (l.bindings.len != 1) return null;
+    const g = l.bindings[0].name;
+    const i = switch (l.body.*) {
+        .if_ => |i| i,
+        else => return null,
+    };
+    const else_form = i.else_ orelse return null;
+    if (!namesSymbol(i.test_, g)) return null;
+    if (namesSymbol(else_form, g) and !try readsName(i.then, g)) return .{ .is_and = true, .first = l.bindings[0].value, .rest = i.then };
+    if (namesSymbol(i.then, g) and !try readsName(else_form, g)) return .{ .is_and = false, .first = l.bindings[0].value, .rest = else_form };
+    return null;
+}
+
+fn namesSymbol(t: *const Tiny, name: []const u8) bool {
+    return t.* == .symbol and std.mem.eql(u8, t.symbol, name);
 }
 
 /// Whether control never reaches the end of `t`'s code: every path

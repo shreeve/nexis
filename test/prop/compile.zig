@@ -76,6 +76,11 @@ const cases = [_]Case{
     .{ .src = "((fn* [n acc] (let* [m n] (if (< m 3) (recur (inc m) (+ acc m)) [n acc]))) 0 0)", .out = "[3 3]" },
     .{ .src = "(try (throw 5) (catch any e (let* [x e] (+ x 1))))", .out = "6" },
     .{ .src = "(let* [x 1] (let* [f (let* [y x] (fn* [] y))] (f)))", .out = "1" },
+    // and, or and not as tests branch on their operands, in order,
+    // stopping where the answer is known; as values they are values.
+    .{ .src = "(let* [log (atom []) f (fn* [k v] (do (swap! log conj k) v))] [(if (and (f :a 1) (f :b nil) (f :c 3)) :t :f) (if (or (f :d nil) (f :e 2) (f :f 3)) :t :f) (if (not (and (f :g 1) (f :h 2))) :t :f) (if (or (and (f :i nil) (f :j 1)) (not (f :k false))) :t :f) @log])", .out = "[:f :t :f :t [:a :b :d :e :g :h :i :k]]" },
+    .{ .src = "(let* [log (atom [])] (do (if (and true (not false)) (swap! log conj 1)) (if (or nil false) nil (swap! log conj 2)) (if (or nil (not true)) (swap! log conj 3)) @log))", .out = "[1 2]" },
+    .{ .src = "[(not nil) (not 0) (nexis.core/not false) (let* [not (fn* [x] :shadow)] (not 1)) (and 1 2) (or nil false) (let* [x 5] (and x (not (not x))))]", .out = "[true false true :shadow 2 false true]" },
     // (not x) as a test swaps the arms when not is core's.
     .{ .src = "[(if (not false) 1 2) (if (not nil) 1) (if (not 1) 1) (if (not (not 0)) :a :b) (if (nexis.core/not true) 1 2)]", .out = "[1 1 nil :a 2]" },
     .{ .src = "(let* [not (fn* [_] true)] (if (not false) 1 2))", .out = "1" },
@@ -684,8 +689,12 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
         // message.
         .{ .src = "(fn* [a] (nexis.test/is (= a 1)))", .len = 7 },
         .{ .src = "(fn* [a] (nexis.test/is (a) \"m\"))", .len = 7 },
-        // A test (not x) is x with the arms swapped.
+        // A test (not x) is x with the arms swapped; and and or are
+        // branches on their operands.
         .{ .src = "(fn* [a] (if (not a) 1 2))", .len = 3 },
+        .{ .src = "(fn* [a b] (if (and a (not b)) 1 2))", .len = 4 },
+        .{ .src = "(fn* [a b] (if (or a b) 1 2))", .len = 4 },
+        .{ .src = "(fn* [a] (not a))", .len = 3 },
         // cond's :else is no test.
         .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 3 },
         // assert builds its message and data at expansion.
@@ -780,7 +789,8 @@ test "eval: a form's lowering is freed once its routine is compiled" {
 // Random programs over integer literals, + - * inc, if on <, let*
 // (new names and names that shadow), fn* called in place with one or
 // two arguments or bound and called twice (closures over outer
-// names), a call whose argument may throw to an enclosing catch, and
+// names), a call whose argument may throw to an enclosing catch, an
+// if testing an and or an or of comparisons, one negated, and
 // a counting loop* whose second binding's recur argument reads both
 // bindings (parallel assignment), sometimes through a closure, or
 // whose recur argument is the step itself, sometimes with the loop's
@@ -806,6 +816,8 @@ const Expr = union(enum) {
     apply: struct { param: u8, body: *const Expr, arg: *const Expr },
     /// ((fn* [p q] body) a b)
     apply2: struct { p: u8, q: u8, body: *const Expr, a: *const Expr, b: *const Expr },
+    /// (if (and|or (< a b) (not? (< c d))) then other)
+    if_logic: struct { is_and: bool, negate: bool, a: *const Expr, b: *const Expr, c: *const Expr, d: *const Expr, then: *const Expr, other: *const Expr },
     /// (try ((fn* [p q] (+ p q)) a (if (< x y) (throw 0) b)) (catch any e handler))
     may_throw: struct { p: u8, q: u8, a: *const Expr, x: *const Expr, y: *const Expr, b: *const Expr, handler: *const Expr },
     /// (let* [f (fn* [param] body)] (+ (f a1) (f a2)))
@@ -858,7 +870,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 12)) {
+    e.* = switch (rand.uintLessThan(u8, 13)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -899,6 +911,16 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
                 .b = try genExpr(a, rand, names, d),
             } };
         },
+        11 => .{ .if_logic = .{
+            .is_and = rand.boolean(),
+            .negate = rand.boolean(),
+            .a = try genExpr(a, rand, names, d),
+            .b = try genExpr(a, rand, names, d),
+            .c = try genExpr(a, rand, names, d),
+            .d = try genExpr(a, rand, names, d),
+            .then = try genExpr(a, rand, names, d),
+            .other = try genExpr(a, rand, names, d),
+        } },
         10 => .{ .may_throw = .{
             .p = @intCast(names.len + 120),
             .q = @intCast(names.len + 150),
@@ -990,6 +1012,25 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
             try printExpr(x.a, w);
             try w.writeAll(" ");
             try printExpr(x.b, w);
+            try w.writeAll(")");
+        },
+        .if_logic => |x| {
+            try w.print("(if ({s} (< ", .{if (x.is_and) "and" else "or"});
+            try printExpr(x.a, w);
+            try w.writeAll(" ");
+            try printExpr(x.b, w);
+            try w.writeAll(") ");
+            if (x.negate) try w.writeAll("(not ");
+            try w.writeAll("(< ");
+            try printExpr(x.c, w);
+            try w.writeAll(" ");
+            try printExpr(x.d, w);
+            try w.writeAll(")");
+            if (x.negate) try w.writeAll(")");
+            try w.writeAll(") ");
+            try printExpr(x.then, w);
+            try w.writeAll(" ");
+            try printExpr(x.other, w);
             try w.writeAll(")");
         },
         .may_throw => |x| {
@@ -1094,6 +1135,13 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             const va = try evalExpr(a, x.a, env);
             const vb = try evalExpr(a, x.b, env);
             break :blk try evalExpr(a, x.body, try (try env.with(a, x.p, va)).with(a, x.q, vb));
+        },
+        .if_logic => |x| blk: {
+            const first = try evalExpr(a, x.a, env) < try evalExpr(a, x.b, env);
+            const decided = if (x.is_and) !first else first;
+            const second = if (decided) false else (try evalExpr(a, x.c, env) < try evalExpr(a, x.d, env)) != x.negate;
+            const truthy = if (x.is_and) first and second else first or second;
+            break :blk if (truthy) try evalExpr(a, x.then, env) else try evalExpr(a, x.other, env);
         },
         .may_throw => |x| if (try evalExpr(a, x.x, env) < try evalExpr(a, x.y, env))
             try evalExpr(a, x.handler, env)
