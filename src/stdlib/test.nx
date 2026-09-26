@@ -89,7 +89,7 @@
 ; not take goes on (a throw of the value the catch holds keeps its
 ; origin, VM.md §12).
 (defn check-thrown [e tag]
-  (if (nexis.internal/#%catch-matches? e tag) (pass!) (throw e)))
+  (if (nexis.internal/#%catch-matches? e tag) (do (bump! "pass") true) (throw e)))
 
 ; (is (= expected actual) msg?) → reports the two values on failure.
 ; (is (thrown? MATCHER expr) msg?) → passes when expr throws a value
