@@ -313,6 +313,8 @@ const core_natives = table("", .{
     .{ "associative?", 1, 1, kindPredicate(isAssociative) },
     .{ "fn?", 1, 1, kindPredicate(isFn) },
     .{ "ifn?", 1, 1, kindPredicate(isIfn) },
+    .{ "counted?", 1, 1, kindPredicate(isCounted) },
+    .{ "indexed?", 1, 1, kindPredicate(isIndexed) },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector },
     .{ "vec", 1, 1, &fnVec },
@@ -2642,7 +2644,7 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 
 fn carriesHeaderMeta(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector => true,
         else => false,
     };
 }
@@ -2829,6 +2831,14 @@ fn isColl(k: Kind) bool {
         .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
         else => false,
     };
+}
+/// Clojure's `Counted`: the collections, typed vectors and transients.
+fn isCounted(k: Kind) bool {
+    return isColl(k) or k == .typed_vector or k == .transient;
+}
+/// Clojure's `Indexed`: the vectors, `nth` in constant time.
+fn isIndexed(k: Kind) bool {
+    return k == .persistent_vector or k == .typed_vector;
 }
 fn isSequential(k: Kind) bool {
     return k == .list or k == .persistent_vector;

@@ -16,6 +16,7 @@
 ; second, third, take, some and every? are natives that walk no
 ; further than they must.
 (defn ffirst [x] (first (first x)))
+(defn nfirst [x] (next (first x)))
 (defn fnext [x] (second x))
 (defn nnext [x] (next (next x)))
 
@@ -606,6 +607,53 @@
 (defn distinct? [& xs]
   (= (count xs) (count (set xs))))
 
+; (tree-seq branch? children root) → the nodes of the tree under root,
+; depth first, each before its children; an explicit stack, so the
+; depth of the tree costs no native stack.
+(defn tree-seq [branch? children root]
+  (loop [stack (list root) acc (transient [])]
+    (if (seq stack)
+      (let [node (first stack) more (rest stack)]
+        (recur (if (branch? node) (into more (reverse (children node))) more)
+               (conj! acc node)))
+      (seq (persistent! acc)))))
+
+; (replace smap coll) → coll with each element that is a key of smap
+; (a map, or a vector by index) replaced by its value: a vector of a
+; vector, keeping its metadata, else a seq.
+(defn replace [smap coll]
+  (let [f (fn [x] (let [e (find smap x)] (if e (val e) x)))]
+    (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll))))
+
+; (bounded-count n coll) → the count of a counted coll, else the count
+; of at most its first n elements.
+(defn bounded-count [n coll]
+  (if (counted? coll)
+    (count coll)
+    (loop [i 0 s (seq coll)]
+      (if (and s (< i n)) (recur (inc i) (next s)) i))))
+
+; (random-sample prob coll) → the elements of coll each kept with
+; probability prob.
+(defn random-sample [prob coll]
+  (filter (fn [_] (< (rand) prob)) coll))
+
+; partition and partition-all with each part a vector, and split-at
+; with the first part a vector (Clojure 1.12).
+(defn partitionv
+  ([n coll] (map vec (partition n coll)))
+  ([n step coll] (map vec (partition n step coll)))
+  ([n step pad coll] (map vec (partition n step pad coll))))
+(defn partitionv-all
+  ([n coll] (map vec (partition-all n coll)))
+  ([n step coll] (map vec (partition-all n step coll))))
+(defn splitv-at [n coll]
+  [(vec (take n coll)) (drop n coll)])
+
+; (map-entry? x) → whether x is a map entry: a two-element vector, the
+; shape a map's seq yields.
+(defn map-entry? [x] (and (vector? x) (= 2 (count x))))
+
 ; (rseq v) → v's elements last first, nil when empty.
 (defn rseq [v]
   (seq (reverse v)))
@@ -656,7 +704,6 @@
 (defn neg-int? [x] (and (int? x) (neg? x)))
 (defn double? [x] (float? x))
 (defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
-(defn counted? [x] (or (coll? x) (typed-vector? x)))
 (defn record? [x] (nexis.internal/#%record? x))
 
 ; ---- the numeric names Clojure spells apart ----

@@ -296,3 +296,25 @@ tests; `test/golden/cli/` pins `read-line` (`stdin`),
 `*command-line-args*` (`args`) and `exit` (`exit-status`) through
 `bin/nexis`; `test/integration/numbers.zig` pins the float
 spellings.
+
+---
+
+### 8. More of Clojure's core
+
+Functions of `nexis.core` that no kind doc owns, each with Clojure
+1.12's semantics except where a row says otherwise. Sequences are
+eager (PLAN §23 #14): where Clojure returns a lazy seq, these return
+a realized list.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `nfirst` | 1 | `(next (first x))` |
+| `tree-seq` | 3 | `(tree-seq branch? children root)`: every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. An explicit stack, so a tree of any depth walks |
+| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a list |
+| `partitionv`, `partitionv-all` | 2–4, 2–3 | `partition` and `partition-all` with each part a vector |
+| `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
+| `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
+| `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
+| `indexed?` | 1 | True of a vector or typed vector |
+| `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |

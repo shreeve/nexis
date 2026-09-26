@@ -426,10 +426,10 @@ map or `nil`; it never throws.
 
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
-| `list`, `vector`, `map`, `set`, `record` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `list`, `vector`, `map`, `set`, `record`, `typed-vector` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
-| every other kind: `typed-vector`, `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
+| every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
 - The metadata argument is a map or `nil` (which clears it); anything
   else is `:kind-mismatch`, checked before the target's kind.
