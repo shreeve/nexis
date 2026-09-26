@@ -238,7 +238,7 @@ unique; name; age; department, a ref; salary):
 | `join3-20x` | a three-clause join (department name → people → names), once for each of 20 departments, 20,000 rows |
 | `aggregate` | `(sum ?s)` of salaries per department `:with` the person, over every person |
 | `pull-10k` | `pull-many` of 10,000 people with a nested ref pattern |
-| `tx-1k-durable` | 1,000 transactions of one datom each, in each system's default durable commit |
+| `tx-1k-durable` | 1,000 transactions of one datom each, in each system's default commit |
 | `tx-1k-nosync` | the same with the commit's flush off and one sync at the end |
 | `as-of+history` | nexis only: the salary total as of the basis before the writes, and a `history` count |
 | `create-nosync`, `load-nosync` | `create` and `load` with the flush off and one sync at the end |
@@ -299,20 +299,24 @@ programs.
   chunked. The pipeline row runs the same code and pays for that.
 - *Transients.* nexis's transients are wrappers over the persistent
   operations (`docs/TRANSIENT.md`), not in-place node edits.
-- *Durability.* A default Nextomic commit (`:sync :full`) is two
-  `fcntl(F_FULLFSYNC)` calls (data, then meta; emdb's `datasync` on
-  macOS), which ask the drive to empty its write cache. Datalevin
-  1.1.0's datalog store opens with the LMDB flags `#{:nordahead
-  :notls}` (`get-env-flags`) and its write-ahead log off (`opts` gives
-  `:wal? false`), so a commit syncs as LMDB does. Its measured cost
-  per commit (`docs/PERF.md` §3.11) is a twentieth of one
-  `F_FULLFSYNC` on the same drive, consistent with `fsync(2)`, which
-  on macOS returns before the drive's cache is flushed; the system
-  calls themselves were not traced (that needs root). The `durable` rows therefore
-  compare different guarantees, each system's default. The `nosync`
-  rows compare the transaction machinery alone: Nextomic's
-  `{:sync :none}` per transaction and `d/sync` at the end; Datalevin's
-  `:nosync` environment flag and `sync` at the end.
+- *Durability.* A default Nextomic commit (`:commit`, `docs/DB.md`
+  §3.3) syncs nothing: it is atomic and survives a crash of the
+  process, and the file is synced once when the connection is
+  released, outside the timed phase. With `{:durability :durable}`
+  a commit is two `fcntl(F_FULLFSYNC)` calls (data, then meta; emdb's
+  `datasync` on macOS), which ask the drive to empty its write cache.
+  Datalevin 1.1.0's datalog store opens with the LMDB flags
+  `#{:nordahead :notls}` (`get-env-flags`) and its write-ahead log off
+  (`opts` gives `:wal? false`), so a commit syncs as LMDB does. Its
+  measured cost per commit (`docs/PERF.md` §3.11) is a twentieth of one
+  `F_FULLFSYNC` on the same drive, consistent with `fsync(2)`, which on
+  macOS returns before the drive's cache is flushed; the system calls
+  themselves were not traced (that needs root). The `tx-1k-durable`
+  and `load` rows therefore compare different guarantees, each
+  system's default. The `nosync` rows compare the
+  transaction machinery alone: Nextomic's `{:sync :none}` per
+  transaction and `d/sync` at the end; Datalevin's `:nosync`
+  environment flag and `sync` at the end.
 - *What a write stores.* Nextomic writes every datom to EAVT and AEVT,
   AVET for unique and indexed attributes, VAET for refs, the four
   history twins of those, and a txlog entry per transaction
