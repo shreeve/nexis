@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 164/164 steps succeeded; 1244/1244 tests passed
+Build Summary: 165/165 steps succeeded; 1246/1246 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 162 steps. It ran in 63 s wall (256 s
+steps; without it the count is 163 steps. It ran in 63 s wall (256 s
 CPU) from a warm cache on an Apple-silicon Mac shared with other
 builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (619 inline tests) and
