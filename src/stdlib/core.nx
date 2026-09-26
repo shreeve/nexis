@@ -113,7 +113,7 @@
                         (empty? message) (str "Assert failed: " (pr-str x))
                         (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
                         true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))
-                     ~(hash-map (keyword "error") (keyword "assertion-failed"))))))
+                     {:error :assertion-failed}))))
 
 ; (time expr) → expr's value, after printing how long it took, as
 ; Clojure's does.
@@ -409,13 +409,11 @@
 
 ; (doc name) → prints the Var's :arglists and :doc, the way a
 ; REPL shows them; nil. A defn carries them once it is given a
-; docstring or attribute map. The keys are built when doc runs:
-; a keyword literal here would be interned at boot and shift the
-; intern order every script's map layout depends on.
+; docstring or attribute map.
 (defmacro doc [name]
   `(let* [m# (meta (var ~name))
-          arglists# (get m# (keyword "arglists"))
-          docstring# (get m# (keyword "doc"))]
+          arglists# (:arglists m#)
+          docstring# (:doc m#)]
      (println "-------------------------")
      (println '~name)
      (when arglists# (println arglists#))
@@ -448,8 +446,7 @@
 ; each x in xs and, nested inside, each y in ys; nil. A binding
 ; form may destructure, and each pair may be followed by
 ; `:let [b]`, `:when t` (skip the element) and `:while t` (end
-; that loop), as in `for`; the modifier names are compared as
-; strings so no keyword is interned at boot. One loop per pair:
+; that loop), as in `for`. One loop per pair:
 ;   (loop* [s (seq xs)]
 ;     (if s (let [x (first s)] <modifiers around
 ;                               (do (doseq [rest...] body...) (recur (next s)))>)
@@ -464,12 +461,12 @@
         (if (and (seq more) (keyword? (first more)))
           (recur (rest (rest more)) (cons [(first more) (second more)] mods))
           (let* [inner (reduce (fn* [inner mod]
-                                 (let* [k (name (first mod)) v (second mod)]
+                                 (let* [k (first mod) v (second mod)]
                                    (cond
-                                     (= k "let") `(let ~v ~inner)
-                                     (= k "when") `(if ~v ~inner (recur (next ~s)))
-                                     (= k "while") `(if ~v ~inner nil)
-                                     true (throw (str "doseq: unknown modifier :" k)))))
+                                     (= k :let) `(let ~v ~inner)
+                                     (= k :when) `(if ~v ~inner (recur (next ~s)))
+                                     (= k :while) `(if ~v ~inner nil)
+                                     true (throw (str "doseq: unknown modifier " k)))))
                                `(do (doseq ~(vec more) ~@body) (recur (next ~s)))
                                mods)]
             `(loop* [~s (seq ~src)]
@@ -662,11 +659,11 @@
 (defn counted? [x] (or (coll? x) (typed-vector? x)))
 (defn record? [x] (nexis.internal/#%record? x))
 (defn parse-boolean [s]
-  (cond (= s "true") true (= s "false") false (string? s) nil true (throw (keyword "kind-mismatch"))))
+  (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 
 ; (ex-cause e) → the cause an ex-info carries, nil for anything else.
 (defn ex-cause [e]
-  (when (map? e) (get e (keyword "cause"))))
+  (when (map? e) (:cause e)))
 
 ; (printf fmt & args) → prints (format fmt args...); nil.
 (defn printf [fmt & args]

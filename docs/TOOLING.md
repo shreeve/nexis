@@ -213,9 +213,9 @@ tables in `src/disasm.zig`; a test walks every variant enum
 ### 3. Test runner (`src/stdlib/test.nx`, the `nexis.test` namespace)
 
 `nexis.test` is written in nexis over atoms and `throw`, embedded at
-build and booted at start (STDLIB.md §1, which also gives the rule
-that keeps keyword literals out of it); `(require '[nexis.test :as
-t])` only makes the alias.
+build and booted at start (STDLIB.md §1); `(require '[nexis.test :as
+t])` only makes the alias, and `:refer :all` refers the API but not
+the private helpers.
 
 ```clojure
 (t/deftest area-test

@@ -1,23 +1,22 @@
 ; src/stdlib/pprint.nx — the `nexis.pprint` namespace (docs/TOOLING.md
 ; §4): pprint prints nested collections with indentation. Embedded
 ; via @embedFile and bootstrapped at VM startup with nexis.pprint as
-; the current namespace, after core.nx. No keyword literal appears
-; here (see test.nx).
+; the current namespace, after core.nx.
 
 ; A collection whose one-line form fits within `width` columns from
 ; its indent prints on one line, exactly as pr-str prints it.
 (def width 72)
 
-(defn spaces [n] (apply str (repeat n " ")))
+(defn- spaces [n] (apply str (repeat n " ")))
 
-(defn breakable? [x]
+(defn- breakable? [x]
   (and (coll? x)
        (not (empty? x))
        (not (nexis.internal/#%record? x))))
 
 ; The strings in `strs` packed onto lines of at most `width`
 ; columns from column `indent`, joined by newline and indent.
-(defn fill-lines [strs indent]
+(defn- fill-lines [strs indent]
   (let* [lines (reduce (fn* [lines s]
                          (let* [cur (peek lines)]
                            (if (and (not (empty? cur))
@@ -33,7 +32,7 @@
 ; laid out from the column after its key; a vector, list or set of
 ; scalars filled line by line; one holding a collection one element
 ; per line, each laid out from its own column.
-(defn layout [x indent]
+(defn- layout [x indent]
   (let* [flat (pr-str x)]
     (if (or (not (breakable? x)) (<= (+ indent (count flat)) width))
       flat
