@@ -1014,8 +1014,10 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// the value, keeping the first key), built bottom-up with one
         /// allocation per node.
         fn fromSlice(heap: *Heap, ps: []const P, elementHash: ElementHash, elementEq: ElementEq) !Value {
-            const items = try heap.backing.alloc(Item, ps.len);
-            defer heap.backing.free(items);
+            // A literal's handful of payloads sorts on the stack.
+            var small: [16]Item = undefined;
+            const items = if (ps.len <= small.len) small[0..ps.len] else try heap.backing.alloc(Item, ps.len);
+            defer if (ps.len > small.len) heap.backing.free(items);
             for (ps, items, 0..) |p, *item, i| item.* = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = @intCast(i) };
             std.mem.sortUnstable(Item, items, {}, Item.lessThan);
             // Merge equal keys; they share a hash, so they are adjacent.
@@ -1814,6 +1816,22 @@ fn mapIterKey(m: Value, key: Value) Value {
     var it = mapIter(m);
     while (it.next()) |e| if (synthEq(e.key, key)) return e.key;
     unreachable;
+}
+
+test "mapFromEntries of a literal's few entries asks the backing allocator for nothing" {
+    // Slabs do not come from the backing allocator, so a heap over one
+    // that refuses everything still holds small blocks.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var heap = Heap.init(failing.allocator());
+    defer heap.deinit();
+    const es = [_]Entry{
+        .{ .key = value.testKeyword(1), .value = value.fromFixnum(1).? },
+        .{ .key = value.testKeyword(2), .value = value.fromFixnum(2).? },
+        .{ .key = value.testKeyword(3), .value = value.fromFixnum(3).? },
+    };
+    const m = try mapFromEntries(&heap, &es, &synthHash, &synthEq);
+    try testing.expectEqual(@as(usize, 3), mapCount(m));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "mapFromEntries and setFromElements build what a fold of assoc and conj builds" {
