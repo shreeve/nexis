@@ -1,7 +1,7 @@
 //! db.zig — durable identities + emdb integration.
 //!
-//! Authoritative spec: `docs/DB.md`. Derivative from PLAN §15
-//! (durable identities), §20.2 gate test #6 (emdb round-trip),
+//! Authoritative spec: `docs/DB.md`. Derivative from PLAN §23 #6,
+//! #7 (explicit transactions; durable refs are identities),
 //! `docs/CODEC.md` (value-bytes serialization), `docs/VALUE.md`
 //! §2.2 (kind 26 `durable_ref`), `docs/SEMANTICS.md` §2.6 / §3.2
 //! (identity-triple equality + hash).
@@ -37,8 +37,10 @@
 //!     ├── @import("codec.zig")
 //!     └── @import("emdb")
 //!
-//! Nothing imports `db.zig` except `dispatch.zig` / `gc.zig` at
-//! their `.durable_ref` arms.
+//! Importers (DB.md §11): `dispatch.zig` / `gc.zig` at their
+//! `.durable_ref` arms, `format.zig` to print refs and handles,
+//! `stdlib.zig` for the natives, and Nextomic for `StoreFile` and the
+//! geometry constants.
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -574,9 +576,8 @@ pub fn ref(
 }
 
 /// Construct a durable-ref from bytes (no live Connection
-/// context). The `conn` pointer is null; I/O ops on this ref will
-/// return `error.ConnectionUnavailable` until it's paired with a
-/// live Connection (the stdlib's responsibility).
+/// context). The `conn` pointer is null, so I/O through this ref is
+/// `error.ConnectionUnavailable` (DB.md §4).
 pub fn refFromBytes(
     heap: *Heap,
     store_id: u128,

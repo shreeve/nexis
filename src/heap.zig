@@ -1,7 +1,8 @@
 //! heap.zig — runtime heap allocator + `HeapHeader` storage.
 //!
-//! Authoritative layout contract: `docs/VALUE.md` §4 (HeapHeader) and
-//! `docs/HEAP.md` (allocator + object-enumeration + minimal sweep).
+//! Authoritative layout contract: `docs/HEAP.md` §1 (HeapHeader) and
+//! the rest of `docs/HEAP.md` (allocator + object-enumeration +
+//! minimal sweep).
 //!
 //! This is the bedrock every heap-kind Value sits on. String, bignum,
 //! CHAMP map/set, persistent vector, cons list, transient wrapper,
@@ -11,9 +12,9 @@
 //! this file owns allocation, enumeration, the byte counters the
 //! trigger policy reads and the sweep primitive.
 //!
-//! Frozen invariants (VALUE.md §4 + HEAP.md §1):
+//! Frozen invariants (HEAP.md §1):
 //!   - Returned `*HeapHeader` is 16-byte aligned.
-//!   - `HeapHeader` size is 16; field order matches VALUE.md §4 exactly.
+//!   - `HeapHeader` size is 16; field order matches HEAP.md §1 exactly.
 //!   - Fresh allocations are zero-initialized except `kind`.
 //!   - `HeapHeader.hash == 0` means "not yet computed".
 //!   - Double-free is a runtime bug; debug builds panic via a poisoned-
@@ -28,7 +29,7 @@ const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 
-// nexis is pinned to 64-bit single-isolate targets (PLAN §16). Every
+// nexis is pinned to 64-bit single-isolate targets (PLAN §23 #5). Every
 // layout assert below assumes 8-byte pointers and 8-byte `usize`; state
 // that assumption explicitly so a 32-bit build would fail fast and
 // loudly rather than silently mis-size `Block`.
@@ -39,7 +40,7 @@ comptime {
 }
 
 // =============================================================================
-// HeapHeader — 16 bytes, layout frozen by VALUE.md §4.
+// HeapHeader — 16 bytes, layout frozen by HEAP.md §1.
 // =============================================================================
 
 pub const HeapHeader = extern struct {
@@ -51,7 +52,7 @@ pub const HeapHeader = extern struct {
     mark: u8,
     /// Heap-object flags. See `flag_*` constants.
     flags: u8,
-    /// Cached hash; 0 = "not yet computed". VALUE.md §4 explicitly
+    /// Cached hash; 0 = "not yet computed". HEAP.md §1 explicitly
     /// accepts the (rare) recompute cost when a real hash value is 0.
     hash: u32,
     /// Optional metadata map (always a persistent-map heap object when
@@ -65,7 +66,7 @@ pub const HeapHeader = extern struct {
         // noise at every call site. Runtime alignment is guaranteed by
         // the allocator via `.@"16"` at alloc time (HEAP.md §1 invariant 1).
         std.debug.assert(@alignOf(HeapHeader) == 16);
-        // Field offsets pinned to match VALUE.md §4 exactly.
+        // Field offsets pinned to match HEAP.md §1 exactly.
         std.debug.assert(@offsetOf(HeapHeader, "kind") == 0);
         std.debug.assert(@offsetOf(HeapHeader, "mark") == 2);
         std.debug.assert(@offsetOf(HeapHeader, "flags") == 3);
@@ -125,7 +126,7 @@ pub const HeapHeader = extern struct {
 
     // ---- Cached hash ----
     //
-    // VALUE.md §4 accepts the "hash == 0 means uncomputed" sentinel:
+    // HEAP.md §1 accepts the "hash == 0 means uncomputed" sentinel:
     // a genuine computed-zero hash recomputes on next access. This
     // saves one flag bit per heap object. If a per-
     // kind hasher produces output with a non-trivial 0-collision rate
@@ -166,7 +167,7 @@ const Block = extern struct {
     /// Total allocation bytes: `@sizeOf(Block) + body_size`. Stored so
     /// `free` can reconstruct the backing slice for `allocator.free`.
     total_size: usize,
-    /// User-visible header. VALUE.md §4.
+    /// User-visible header. HEAP.md §1.
     header: HeapHeader,
     // body follows.
 
@@ -376,8 +377,8 @@ pub const Heap = struct {
     /// roots or trace reachability — that's `gc.zig`'s job. Returns the
     /// number of blocks freed.
     ///
-    /// `pinned` blocks survive regardless of mark state (PLAN §10.5):
-    /// open transactions, durable-ref handles, REPL history, etc.
+    /// `pinned` blocks survive regardless of mark state (GC.md §3); no
+    /// runtime module pins a block, only tests do.
     pub fn sweepUnmarked(self: *Heap) usize {
         var freed: usize = 0;
         var prev: ?*Block = null;

@@ -9,13 +9,11 @@
 //! §6 pins the contract (`(= x y) ⇒ (hash x) = (hash y)`). This file is
 //! the implementation, not the spec.
 //!
-//! Algorithm: xxHash3-64 from `std.hash.XxHash3`. Chosen for speed,
-//! distribution, and SIMD friendliness (PLAN §9.1, §23 #37 companion).
-//! Clojure uses Murmur3; we target a better-distributed, faster modern
-//! hash as planned in CLOJURE-REVIEW §2.3.
+//! Algorithm: xxHash3-64 from `std.hash.XxHash3`, for speed and
+//! distribution; Clojure uses Murmur3 (CLOJURE-REVIEW §2.3).
 //!
 //! Collection combine functions match Clojure's structural hashing so
-//! that the cross-category sequential equality rule (PLAN §6.6) yields
+//! that the cross-category sequential equality rule (SEMANTICS §2.6) yields
 //! equal hashes for `(list 1 2 3)` and `[1 2 3]` by construction.
 
 const std = @import("std");
@@ -27,12 +25,12 @@ pub const seed: u64 = 0x0000_0000_3173_6978_656E | (@as(u64, '/') << 48) | (@as(
 
 // Keyword/symbol domain separation is the generic `mixKindDomain`
 // below: each Kind byte lands in a distinct region of u64 space. That
-// subsumes Clojure's `keyword.hash ^= 0x9E3779B9` (PLAN §8.4, §23 #32).
+// subsumes Clojure's `keyword.hash ^= 0x9E3779B9` (SEMANTICS §3.2, PLAN §23 #32).
 
 /// Multiplier used by `combineOrdered`. Matches Clojure's `31 * h +
 /// hasheq(x)` (Util.java:hashCombine). List and vector both combine
 /// with it, so `(list 1 2 3)` and `[1 2 3]` share a hash, as the
-/// sequential equality rule (PLAN §6.6) requires.
+/// sequential equality rule (SEMANTICS §2.6) requires.
 pub const ordered_mul: u64 = 31;
 
 /// Per-kind domain mixer used by `mixKindDomain`. A 64-bit golden-ratio
@@ -126,9 +124,9 @@ pub fn canonicalizeFloat(f: f64) f64 {
 /// `symbol(65)` vs `char(65)`) still land in disjoint regions of the
 /// 64-bit hash space. Cheap — a multiply and an add. Applied by
 /// `Value.hashImmediate` and `dispatch.hashValue` after the per-kind
-/// primitive hash, so every kind carries its own domain, including any
-/// kind added later. Includes keyword-vs-symbol separation as a
-/// special case (their kind bytes differ).
+/// primitive hash, so every kind carries its own domain. Includes
+/// keyword-vs-symbol separation as a special case (their kind bytes
+/// differ).
 pub inline fn mixKindDomain(base: u64, kind_tag: u8) u64 {
     return base +% (@as(u64, kind_tag) *% kind_domain_mixer);
 }
@@ -138,9 +136,9 @@ pub inline fn mixKindDomain(base: u64, kind_tag: u8) u64 {
 // -----------------------------------------------------------------------------
 
 /// Ordered (sequential) combine: `h := mul * h + x`. Matches Clojure's
-/// `Util.hashCombine` pattern. Sequential-category collections (list,
-/// vector, lazy-seq, cons) must use this same combiner for the cross-
-/// category equality rule to hold (PLAN §6.6, §23 #36).
+/// `Util.hashCombine` pattern. The sequential-category collections
+/// (every list subkind and the vector) use this same combiner for the
+/// cross-category equality rule to hold (SEMANTICS §2.6, PLAN §23 #36).
 pub inline fn combineOrdered(h: u64, x: u64) u64 {
     return h *% ordered_mul +% x;
 }

@@ -1,8 +1,7 @@
 //! test/prop/intern.zig — randomized property tests for the intern tables.
 //!
-//! Covers PLAN §20.2 test #8 ("Interning invariants: same textual
-//! symbol → same intern id across reads; namespace qualification
-//! preserved").
+//! Interning invariants: the same text always interns to the same id,
+//! and namespace qualification is preserved.
 //!
 //! Properties (INTERN.md §1):
 //!   I1. Idempotence — interning the same bytes twice yields the same id.

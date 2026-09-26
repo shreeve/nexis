@@ -1,7 +1,7 @@
 //! codec.zig — serialize / deserialize Value ↔ bytes.
 //!
 //! Authoritative spec: `docs/CODEC.md`. Derivative from PLAN
-//! §15.6 / §15.10 / §23 #25 (serialization scope frozen),
+//! §23 #25 (serialization scope frozen),
 //! `docs/SEMANTICS.md` §2.2 / §3.2 (numeric canonical form +
 //! hash invariants), and `docs/VALUE.md` §2 (Kind numbering).
 //!
