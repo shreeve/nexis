@@ -100,7 +100,10 @@ between two cycles), for the next class that needs one, and hands the
 rest back to the operating system: a steady workload refills the
 slabs it emptied instead of mapping fresh ones every cycle, and a
 program whose live set shrinks, a long REPL session among them, gives
-its memory back.
+its memory back. A heap that ends (`deinit`) leaves its slabs to a
+pool the process keeps for the next heap, at most 64; heaps on several
+threads share it through a try-lock and skip it when it is busy, so
+none waits. A slab the pool takes is carved afresh.
 
 **Large blocks.** A block over 8 KiB comes from the backing allocator
 with a 32-byte prefix (the next large block, the allocation's length,

@@ -329,6 +329,44 @@ inline fn isLarge(h: *const HeapHeader) bool {
 /// so an empty one handed back leaves the resident set (HEAP.md §2).
 const slab_source = std.heap.page_allocator;
 
+/// The slabs of heaps that ended, kept for the next heap, at most
+/// `pooled_slabs_max` for the process. Heaps on several threads share
+/// it through a try-lock and skip it when another holds the lock, so
+/// none ever waits.
+const SlabPool = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    head: ?*Slab = null,
+    count: usize = 0,
+};
+
+var slab_pool: SlabPool = .{};
+
+pub const pooled_slabs_max = 64;
+
+fn takePooledSlab() ?*Slab {
+    if (!slab_pool.lock.tryLock()) return null;
+    defer slab_pool.lock.unlock();
+    const s = slab_pool.head orelse return null;
+    slab_pool.head = s.next;
+    slab_pool.count -= 1;
+    return s;
+}
+
+/// Pool a slab a heap gives up at its end, or hand it back to the
+/// operating system when the pool is full or busy.
+fn poolSlab(s: *Slab) void {
+    if (slab_pool.lock.tryLock()) {
+        defer slab_pool.lock.unlock();
+        if (slab_pool.count < pooled_slabs_max) {
+            s.next = slab_pool.head;
+            slab_pool.head = s;
+            slab_pool.count += 1;
+            return;
+        }
+    }
+    Heap.freeSlab(s);
+}
+
 // =============================================================================
 // Heap — the allocator facade.
 // =============================================================================
@@ -378,20 +416,20 @@ pub const Heap = struct {
         return .{ .backing = backing };
     }
 
-    /// Frees every block and slab. After this call the Heap is
-    /// unusable.
+    /// Frees every block, and pools or hands back every slab. After
+    /// this call the Heap is unusable.
     pub fn deinit(self: *Heap) void {
         for (&self.classes) |*cls| {
             var cur = cls.slabs;
             while (cur) |s| {
                 cur = s.next;
-                freeSlab(s);
+                poolSlab(s);
             }
         }
         var empty = self.empty_slabs;
         while (empty) |s| {
             empty = s.next;
-            freeSlab(s);
+            poolSlab(s);
         }
         var large = self.large_head;
         while (large) |l| {
@@ -451,9 +489,12 @@ pub const Heap = struct {
             self.empty_slab_count -= 1;
             break :blk s;
         } else blk: {
-            const mem = try slab_source.alignedAlloc(u8, slab_alignment, slab_bytes);
+            const s = takePooledSlab() orelse fresh: {
+                const mem = try slab_source.alignedAlloc(u8, slab_alignment, slab_bytes);
+                break :fresh @as(*Slab, @ptrCast(mem.ptr));
+            };
             self.slab_count += 1;
-            break :blk @ptrCast(mem.ptr);
+            break :blk s;
         };
         const cls = &self.classes[c];
         slab.* = .{ .next = cls.slabs, .class = c, .bump = 0, .live = 0 };
@@ -1250,6 +1291,26 @@ test "slabs: a sweep keeps as many empty slabs as are in use, and hands the rest
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
     try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.slab_count);
     try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
+}
+
+test "slabs: a heap that ends leaves its slabs to the next heap, up to the pool's bound" {
+    // Room in the pool for this test's two slabs.
+    while (slab_pool.count > pooled_slabs_max - 2) Heap.freeSlab(takePooledSlab().?);
+    var a = Heap.init(testing.allocator);
+    _ = try a.alloc(.string, 8);
+    _ = try a.alloc(.persistent_vector, 512);
+    try testing.expectEqual(@as(usize, 2), a.slab_count);
+    const slab = Slab.of(try a.alloc(.string, 8));
+    const before = slab_pool.count;
+    a.deinit();
+    try testing.expectEqual(before + 2, slab_pool.count);
+    var b = Heap.init(testing.allocator);
+    defer b.deinit();
+    const h = try b.alloc(.list, 32);
+    try testing.expectEqual(before + 1, slab_pool.count);
+    try testing.expect(Slab.of(h) == slab or slab_pool.head.? == slab);
+    try testing.expectEqual(@as(u8, 0), h.mark);
+    for (Heap.bodyBytes(h)) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "slabs: a sweep keeps pinned and marked slots and every class stays consistent" {
