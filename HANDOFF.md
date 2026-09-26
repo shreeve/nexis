@@ -473,14 +473,11 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. Keyword hashing by name (§6.1 item 1): it removes a rule, makes
-   printed output independent of intern history, and every later
-   `.out` change is smaller after it.
-2. Transaction handles dropped open (§6.1 item 4) and writes during
+1. Transaction handles dropped open (§6.1 item 3) and writes during
    `db/reduce-tree` (§6.3 item 2).
-3. A green CI run on Linux, once `EMDB_TOKEN` is set (§2), then a
-   store carried between macOS and Linux (§6.4).
-4. Performance: the levers and measured dead ends are
+2. A green CI run on Linux (§2), then a store carried between macOS
+   and Linux (§6.4).
+3. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
 4. The open design questions, each an amendment first: laziness
