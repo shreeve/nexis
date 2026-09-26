@@ -1327,6 +1327,21 @@ test "corpus: rules" {
     }
 }
 
+test "corpus: long chains, wide joins, and the variables a relation drops" {
+    const fx = try Fx.init("q_chains");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const dbv = try fx.db();
+    const none: []const Value = &.{value.nilValue()};
+
+    // A variable repeated in a pattern whose other variables are bound
+    // must carry one value in both positions, on the hash join as on
+    // the seek: nobody is their own boss, nor their own friend.
+    try checkCount(fx, dbv, "[:find ?e ?b :where [?e :person/boss ?b] [?b :person/boss ?b]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?e ?f :where [?e :person/friend ?f] [?f :person/friend ?f]]", none, 0);
+    try checkCount(fx, dbv, "[:find ?a :where [?a :edge/to ?b] [?b :edge/to ?c] [?c :edge/to ?a]]", none, 3);
+}
+
 test "corpus: as-of, since, history views" {
     const fx = try Fx.init("q_time");
     defer fx.deinit();

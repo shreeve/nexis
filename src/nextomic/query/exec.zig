@@ -328,9 +328,12 @@ pub const Exec = struct {
             for (slots, 0..) |slot, pos| {
                 switch (slot) {
                     .blank, .fresh => {},
-                    .constant, .bound => if (wants[pos]) |want| {
+                    .constant => if (!dc[pos].eql(wants[pos].?)) continue :datoms,
+                    // Without a row (the hash join's scan) a bound variable
+                    // repeated in the pattern is held to one value, as `same`.
+                    .bound => |v| if (wants[pos]) |want| {
                         if (!dc[pos].eql(want)) continue :datoms;
-                    },
+                    } else if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
                     .same => |v| if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
                 }
             }
