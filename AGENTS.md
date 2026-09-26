@@ -50,8 +50,8 @@ changes to emdb.
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
-| `zig build golden` | the reader goldens and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, a few minutes: all of the above, every property test, the layering check and a compile check of `bench/` |
+| `zig build golden` | the reader goldens and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
+| `zig build test --summary all` | the gate, 152 steps, about a minute from a warm cache: all of the above, every property test, the layering check and a compile check of `bench/` |
 | `zig build bench [-- --filter nextomic]` | the ReleaseFast benchmark harness (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` |
 
