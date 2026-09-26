@@ -19,6 +19,9 @@
 {:error :nextomic/tx-fn, :message unknown function: no-such-fn}
 3
 {:error :nextomic/tx-fn, :message transaction functions nest past 1000 calls}
+2
+{:error :nextomic/tx-data, :message a keyword the store holds is at most 4077 bytes long}
+nil
 :db/open-failed
 {:error :nextomic/tx-data, :message a tempid used only as a value, or not at all, names no entity}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}

@@ -84,6 +84,8 @@ pub const Error = error{
     Schema,
 };
 
+const ident_too_long = std.fmt.comptimePrint("a keyword the store holds is at most {d} bytes long", .{idents_mod.max_name_len});
+
 /// How deep `:db.fn/call` results may nest further calls: far past any
 /// real chain, and short enough that a function calling itself forever
 /// fails in milliseconds.
@@ -520,6 +522,7 @@ const Ctx = struct {
     fn mintKeyword(self: *Ctx, k: u32) !u32 {
         return self.minter.resolve(k) catch |err| switch (err) {
             error.RetiredIdent => self.malformed("a retired ident name is never reused"),
+            error.IdentTooLong => self.malformed(ident_too_long),
             else => err,
         };
     }
@@ -1141,6 +1144,7 @@ const Ctx = struct {
                 if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
                 self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
                     error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
+                    error.IdentTooLong => return self.malformed(ident_too_long),
                     else => return err,
                 };
                 break :blk @intCast(eid);

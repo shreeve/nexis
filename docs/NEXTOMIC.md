@@ -45,7 +45,11 @@ store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128), a
 256 MB initial map and emdb's 64 MB growth step. emdb reads a file's
 page size from its meta and fixes it for the file's life (INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
-holds on every platform.
+holds on every platform. Keys never approach it except a keyword's
+text (§2.1 below). A stored value, whether a datom's full string or
+byte array in EAVT or a transaction's txlog entry, is at most 65 535
+overflow pages, just under 1 GiB; past that the engine refuses the
+write as `:db/value-too-large` and the transaction aborts.
 
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
@@ -108,6 +112,10 @@ are the same mechanism. They sort by id, not by text. An ident's text
 is a property of its id, not a datom value; a rename (§3 step 5) moves
 the old text to the retired names, which only the txlog decoder reads
 (an entry spells keywords by the names they had when it was written).
+Since the text is an `nx/idents` key after its prefix byte, a keyword
+the store holds, as an ident or a value, is at most 4077 bytes
+(`idents.max_name_len`); a transaction that would mint a longer one is
+`:nextomic/tx-data` naming the bound, and a read of one finds nothing.
 
 ### 2.2 Sortable value encoding
 

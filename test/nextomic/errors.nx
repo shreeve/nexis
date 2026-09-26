@@ -39,6 +39,13 @@
 (println (d/with c [[:db.fn/call chain 998]] (fn [db-after report] (count (:tx-data report)))))
 (defn loops [db] [[:db.fn/call loops]])
 (println (t/caught (d/transact! c [[:db.fn/call loops]])))
+; A keyword's text is an index key, so the store takes one of up to
+; 4077 bytes; a longer one is refused as tx-data naming the bound
+; (the store is left alone), and reads of it find nothing.
+(def long-kw (keyword (apply str (repeat 4078 "k"))))
+(println (d/with c [{:db/ident (keyword (apply str (repeat 4077 "k")))}] (fn [db-after report] (count (:tx-data report)))))
+(println (t/caught (d/transact! c [{:db/ident long-kw}])))
+(println (d/entid (d/db c) long-kw))
 (println (t/caught (d/connect "/")))
 (println (t/caught (d/transact! c [{:db/id "a" :user/boss "ghost"}])))
 (println (t/caught (d/transact! c [[:db/add (+ t/tx-partition 2) :db/txInstant 0]])))

@@ -31,6 +31,11 @@ const Interner = intern_mod.Interner;
 const Store = store_mod.Store;
 const Txn = emdb.Txn;
 
+/// The longest keyword text the store holds: a name is an `nx/idents`
+/// key after its one-byte prefix, and a key is at most emdb's bound for
+/// the pinned page size (4078 bytes).
+pub const max_name_len = emdb.btree.maxKeySize(store_mod.db_layer.page_size) - 1;
+
 pub const Idents = struct {
     gpa: Allocator,
     store: *Store,
@@ -150,6 +155,8 @@ pub const Minter = struct {
     pub const Error = error{
         /// The name was retired by a rename and is never minted again.
         RetiredIdent,
+        /// The name is longer than `max_name_len`.
+        IdentTooLong,
     };
 
     pub fn init(idents: *Idents, txn: *Txn, arena: Allocator) !Minter {
@@ -189,6 +196,7 @@ pub const Minter = struct {
     pub fn resolve(self: *Minter, intern_id: u32) !u32 {
         if (try self.lookup(intern_id)) |id| return id;
         const name = self.idents.interner.keywordName(intern_id);
+        if (name.len > max_name_len) return error.IdentTooLong;
         if ((try self.idents.store.retiredIdentId(self.txn, name)) != null) return error.RetiredIdent;
         const id = self.next_aid;
         if (id == std.math.maxInt(u32)) return error.DatabaseFull;
@@ -203,6 +211,7 @@ pub const Minter = struct {
     /// name is retired.
     pub fn rename(self: *Minter, id: u32, intern_id: u32) !void {
         const name = self.idents.interner.keywordName(intern_id);
+        if (name.len > max_name_len) return error.IdentTooLong;
         if ((try self.idents.store.retiredIdentId(self.txn, name)) != null) return error.RetiredIdent;
         try self.idents.store.renameIdent(self.txn, id, name);
         try self.renamed.put(self.arena, id, intern_id);
