@@ -130,11 +130,12 @@ spelling and symlink of a file one lock file, but no path names a file
 for all its hard links, and emdb takes no lock path of its own. Two
 processes opening a store by two hard-link names would take two lock
 files: two writers at once, and each writer blind to the other's
-readers, reusing pages they still read. So `acquire` refuses a store
-file whose link count is above one, at every `open` and `connect`,
-whether or not the process has it open already: `HardLinked`,
-`:db/hard-linked`. Removing the extra name makes it openable again; a
-copy of the file is another store.
+readers, reusing pages they still read. So `acquire` refuses a
+regular file whose link count is above one, at every `open` and
+`connect`, whether or not the process has it open already:
+`HardLinked`, `:db/hard-linked` (a directory's links are its entries,
+and emdb refuses it as a store). Removing the extra name makes the
+file openable again; a copy of it is another store.
 
 The environment has one write transaction. `StoreFile.beginWrite`
 while any holder of the file has one open is `WriterActive`

@@ -133,8 +133,8 @@ test "S3: string Value is never equal to any non-string Value; hashes differ" {
         value.fromChar('a').?,
         value.fromFixnum(42).?,
         value.fromFloat(3.14),
-        value.fromKeywordId(0),
-        value.fromSymbolId(0),
+        value.testKeyword(0),
+        value.testSymbol(0),
     };
     for (others) |o| {
         try std.testing.expect(!dispatch.equal(s, o));

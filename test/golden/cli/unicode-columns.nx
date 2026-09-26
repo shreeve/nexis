@@ -1,0 +1,4 @@
+; Columns and carets count characters, not bytes: each accented letter
+; before the failing call is one column, and so is the tab, which the
+; report shows as four spaces with the caret lined up beneath.
+(def café "naïve")	(/ (count café) (count ""))

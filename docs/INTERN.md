@@ -1,9 +1,8 @@
 ## INTERN.md — Keyword & Symbol Intern Tables
 
 The contract of `src/intern.zig`: the process-local tables that map
-keyword and symbol names to the ids `Value.fromKeywordId` and
-`Value.fromSymbolId` carry, and the record-type names the printer
-reads. PLAN §23 #32 freezes the keyword/symbol asymmetry; equality and
+keyword and symbol names to the ids and name hashes a keyword or
+symbol Value carries, and the record-type names the printer reads. PLAN §23 #32 freezes the keyword/symbol asymmetry; equality and
 hashing of the two kinds are `docs/SEMANTICS.md` §2.5 and §3.3.
 
 A VM owns one `Interner` (`VM.ensureInterner`); a sub-VM the expander
@@ -57,7 +56,8 @@ split (§3) and the map/list lockstep (§4) over random names.
 |---|---|
 | `init(gpa)`, `deinit()` | Empty tables; `deinit` frees every name |
 | `internKeyword(name) !u32`, `internSymbol(name) !u32` | The dense id (§1) |
-| `internKeywordValue(name) !Value`, `internSymbolValue(name) !Value` | The same, wrapped as a Value |
+| `internKeywordValue(name) !Value`, `internSymbolValue(name) !Value` | The same, as a Value: the id and the name hash |
+| `keywordValue(id) Value`, `symbolValue(id) Value` | The Value of an interned id; the only way to build one from an id (`docs/VALUE.md` §3). An out-of-range id panics, as for `keywordName` |
 | `internQualifiedKeyword(ns, name) !Value`, `internQualifiedSymbol(ns, name) !Value` | Interns `ns/name`, or `name` when `ns` is null (§3) |
 | `splitQualified(full)` | `{ ns: ?[]const u8, name: []const u8 }`, without allocating (§3) |
 | `keywordName(id)`, `symbolName(id)` | The name. An out-of-range id panics in every build mode: every id comes from the table, so a bad one is a runtime bug, not a user error |
@@ -96,22 +96,29 @@ returned slices point into the argument.
 
 ### 4. Internal shape
 
-Each table is a `StringHashMapUnmanaged(u32)` from name to id and an
+Each table is a `StringHashMapUnmanaged(u32)` from name to id, an
 `ArrayListUnmanaged([]const u8)` from id to the owned copy of the
-name; the map's key is that copy, never a slice of the list's backing
-array, which moves when the list grows. `internInto`, shared by both
-tables, rejects an empty name, returns an existing id on a hit, checks
-the bound, then copies the name, appends it and inserts it, each step
-undone by an `errdefer` if a following step fails. Both `internInto` and
-`deinit` assert that the map and the list have the same length.
+name, and an `ArrayListUnmanaged(u32)` from id to the name's
+`hash.nameHash`; the map's key is the owned copy, never a slice of
+the list's backing array, which moves when the list grows. The hash
+is computed once, at the first intern, so building a Value from an
+id costs an index. `internInto`, shared by both tables, rejects an
+empty name, returns an existing id on a hit, checks the bound, then
+copies the name, appends it and its hash and inserts it, each step
+undone by an `errdefer` if a following step fails. `internInto`
+asserts that the map and the lists have the same length, `deinit`
+that the map and the names do.
 
 ---
 
 ### 5. Interaction with other layers
 
-- **Value layer.** `Value.fromKeywordId` / `fromSymbolId` do not
-  validate an id; validity is this module's invariant. Equality and
-  hashing read the id and never consult the interner.
+- **Value layer.** A keyword or symbol Value carries its id and its
+  name hash (`docs/VALUE.md` §2.1); `Value.fromKeyword` /
+  `fromSymbol` validate neither, which is this module's invariant.
+  Equality reads the id, hashing the name hash (SEMANTICS §3.2);
+  neither consults the interner, and neither depends on the order
+  names were interned.
 - **Codec.** A keyword or symbol is written as its name and re-interned
   when decoded; ids never leave the process (`docs/CODEC.md`).
 - **Collector.** Names are plain allocations, not heap blocks; the

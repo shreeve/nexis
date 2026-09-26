@@ -2,11 +2,18 @@
 (+ x 2)
 (/ 1 0)
 *e
+(count (repeat 100000000 0))
+*e
+(+ 1 2)
 (def a 1) (def b 2) (+ a b)
 (* *1 10)
 (defn twice [n]
   (* 2 n))
 (twice 21)
+(str "(" \) ; a ( comment [
+     "]" \")
+'
+done
 (def s "one
 two \" three
 

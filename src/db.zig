@@ -47,6 +47,7 @@
 //! constants.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const intern_mod = @import("intern.zig");
@@ -145,8 +146,7 @@ pub const StoreFile = struct {
     env: emdb.Env,
     /// Canonical absolute path the environment was opened at, owned.
     path: [:0]u8,
-    dev: std.c.dev_t,
-    ino: std.c.ino_t,
+    id: FileId,
     /// Connections and stores holding the file; the last `release`
     /// closes the environment.
     refs: u32,
@@ -161,12 +161,11 @@ pub const StoreFile = struct {
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
-        var st: std.c.Stat = undefined;
-        if (std.c.fstatat(std.c.AT.FDCWD, canonical.ptr, &st, 0) == 0) {
-            if (hardLinked(st)) return DbError.HardLinked;
+        if (FileId.of(std.c.AT.FDCWD, canonical.ptr)) |id| {
+            if (id.hard_linked) return DbError.HardLinked;
             var it = open_files;
             while (it) |f| : (it = f.next) {
-                if (f.dev == st.dev and f.ino == st.ino) {
+                if (f.id.dev == id.dev and f.id.ino == id.ino) {
                     allocator.free(canonical);
                     f.refs += 1;
                     return f;
@@ -185,11 +184,9 @@ pub const StoreFile = struct {
             else => return err,
         };
         errdefer self.env.close();
-        if (std.c.fstat(self.env.inner.dataFile.fd, &st) != 0) return error.OpenFailed;
-        if (hardLinked(st)) return DbError.HardLinked;
+        self.id = FileId.of(self.env.inner.dataFile.fd, "") orelse return error.OpenFailed;
+        if (self.id.hard_linked) return DbError.HardLinked;
         self.path = canonical;
-        self.dev = st.dev;
-        self.ino = st.ino;
         self.refs = 1;
         self.next = open_files;
         open_files = self;
@@ -222,12 +219,6 @@ pub const StoreFile = struct {
         return self.env.beginWriteWith(options);
     }
 
-    /// A regular file with a second name. A directory's links are
-    /// its entries; emdb refuses it as a store.
-    fn hardLinked(st: std.c.Stat) bool {
-        return std.c.S.ISREG(st.mode) and st.nlink > 1;
-    }
-
     /// A regular file this process may read but not write: the one
     /// `OpenFailed` that opens again read-only.
     fn readOnlyFile(path: [*:0]const u8) bool {
@@ -239,6 +230,42 @@ pub const StoreFile = struct {
             return false;
         }
         return true;
+    }
+};
+
+/// The device and inode that name a file whatever path reaches it.
+const FileId = struct {
+    dev: u64,
+    ino: u64,
+    /// A regular file with a second name (`StoreFile`). A directory's
+    /// links are its entries; emdb refuses it as a store.
+    hard_linked: bool,
+
+    /// The file at `path` relative to the directory `fd`, or the file
+    /// open as `fd` when `path` is empty; null when it cannot be
+    /// examined. Zig's `std.c` declares no `stat` family for Linux,
+    /// whose glibc versions those symbols, so Linux asks the kernel's
+    /// `statx`.
+    fn of(fd: std.c.fd_t, path: [*:0]const u8) ?FileId {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            var sx: linux.Statx = undefined;
+            const flags: u32 = if (path[0] == 0) linux.AT.EMPTY_PATH else 0;
+            if (linux.errno(linux.statx(fd, path, flags, .{ .TYPE = true, .NLINK = true, .INO = true }, &sx)) != .SUCCESS) return null;
+            return .{
+                .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
+                .ino = sx.ino,
+                .hard_linked = linux.S.ISREG(sx.mode) and sx.nlink > 1,
+            };
+        }
+        var st: std.c.Stat = undefined;
+        const rc = if (path[0] == 0) std.c.fstat(fd, &st) else std.c.fstatat(fd, path, &st, 0);
+        if (rc != 0) return null;
+        return .{
+            .dev = @bitCast(@as(i64, st.dev)),
+            .ino = st.ino,
+            .hard_linked = std.c.S.ISREG(st.mode) and st.nlink > 1,
+        };
     }
 };
 

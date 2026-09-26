@@ -76,8 +76,8 @@ fn randValue(rand: std.Random) Value {
             const f: f64 = @bitCast(bits);
             break :blk value.fromFloat(f);
         },
-        .kw_v => value.fromKeywordId(rand.uintLessThan(u32, 32)),
-        .sym_v => value.fromSymbolId(rand.uintLessThan(u32, 32)),
+        .kw_v => value.testKeyword(rand.uintLessThan(u32, 32)),
+        .sym_v => value.testSymbol(rand.uintLessThan(u32, 32)),
     };
 }
 
@@ -154,8 +154,8 @@ test "P5: hash is a pure function of the Value bits (modulo the -0.0/+0.0 collap
             .char => value.fromChar(a.asChar()).?,
             .fixnum => value.fromFixnum(a.asFixnum()).?,
             .float => value.fromFloat(a.asFloat()),
-            .keyword => value.fromKeywordId(a.asKeywordId()),
-            .symbol => value.fromSymbolId(a.asSymbolId()),
+            .keyword => value.fromKeyword(a.asKeywordId(), a.nameHash()),
+            .symbol => value.fromSymbol(a.asSymbolId(), a.nameHash()),
             else => unreachable,
         };
         try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
@@ -202,8 +202,8 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
 
 test "P8: within a kind, = follows the value: distinct chars, keywords, symbols and fixnums are never =" {
     try std.testing.expect(!value.fromChar('a').?.equalImmediate(value.fromChar('b').?));
-    try std.testing.expect(!value.fromKeywordId(7).equalImmediate(value.fromKeywordId(8)));
-    try std.testing.expect(!value.fromSymbolId(7).equalImmediate(value.fromSymbolId(8)));
+    try std.testing.expect(!value.testKeyword(7).equalImmediate(value.testKeyword(8)));
+    try std.testing.expect(!value.testSymbol(7).equalImmediate(value.testSymbol(8)));
     try std.testing.expect(!value.fromFixnum(1).?.equalImmediate(value.fromFixnum(2).?));
     var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
     const r = prng.random();

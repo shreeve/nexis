@@ -1,0 +1,125 @@
+# nexis CI: the full gate on macOS and Linux, formatting and the parser
+# check, and a ReleaseFast build with a benchmark smoke run and the
+# static (musl) Linux binary.
+#
+# nexis builds against emdb as a path dependency (build.zig.zon
+# `.path = "../emdb"`), so every job checks nexis out into `nexis/` and
+# emdb into `emdb/` beside it. emdb is a private repository: the
+# checkout reads it with the repository secret EMDB_TOKEN, a
+# fine-grained personal access token whose only permission is
+# "Contents: read-only" on shreeve/emdb. Secrets do not reach pull
+# requests from forks, so those runs fail at the emdb checkout.
+#
+# mlugg/setup-zig installs Zig and caches the Zig cache directory (the
+# global cache, with the local caches redirected into it) under a key
+# of the job, the Zig release and host, and the hash of build.zig.zon.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          path: emdb
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      - name: zig build test
+        working-directory: nexis
+        run: zig build test --summary all
+
+  lint:
+    name: fmt and parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          path: emdb
+      # The parser generator; public. `parser-check` diffs its output
+      # against the committed src/parser.zig.
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/nexus
+          path: nexus
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      - name: zig fmt --check (src/parser.zig is generated)
+        working-directory: nexis
+        run: git ls-files -z '*.zig' ':!:src/parser.zig' | xargs -0 zig fmt --check
+      - name: build nexus
+        working-directory: nexus
+        run: zig build
+      - name: zig build parser-check
+        working-directory: nexis
+        run: zig build parser-check --summary all
+
+  release:
+    name: ReleaseFast, bench and static binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          path: emdb
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      - name: ReleaseFast bin/nexis
+        working-directory: nexis
+        run: |
+          zig build install -Doptimize=ReleaseFast
+          test "$(./bin/nexis -e '(reduce + (range 101))')" = 5050
+          ./bin/nexis run examples/shapes-app.nx
+      - name: benchmark smoke run
+        working-directory: nexis
+        run: zig build bench -Doptimize=ReleaseFast
+      - name: static x86_64-linux-musl bin/nexis
+        working-directory: nexis
+        run: |
+          zig build install -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
+          file bin/nexis | tee /dev/stderr | grep -q 'statically linked'
+          test "$(./bin/nexis -e '(reduce + (range 101))')" = 5050

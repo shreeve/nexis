@@ -974,7 +974,7 @@ test "hashSeq: equal vectors share pre-mix hash across allocations" {
     defer heap.deinit();
     const elems = [_]Value{
         value.fromFixnum(7).?,
-        value.fromKeywordId(3),
+        value.testKeyword(3),
         value.fromChar('z').?,
     };
     const a = try fromSlice(&heap, &elems);

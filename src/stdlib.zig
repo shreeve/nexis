@@ -2926,11 +2926,11 @@ fn fnDbRef(vm: *VM, args: []const Value) VmError!Value {
     const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
     if (!conn.open_flag) return VmError.DbClosed;
     const interner = vm.ensureInterner();
-    const tree_id: u32 = @intCast(tree_v.payload);
+    const tree_id: u32 = tree_v.asKeywordId();
     const tree_name = interner.keywordName(tree_id);
     const key_bytes: []const u8 = switch (key_v.kind()) {
-        .keyword => interner.keywordName(@intCast(key_v.payload)),
-        .symbol => interner.symbolName(@intCast(key_v.payload)),
+        .keyword => interner.keywordName(key_v.asKeywordId()),
+        .symbol => interner.symbolName(key_v.asSymbolId()),
         .string => string_mod.asBytes(key_v),
         else => unreachable,
     };
@@ -3216,7 +3216,7 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const tree_v = args[1];
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
     const interner = vm.ensureInterner();
-    const tree_name = interner.keywordName(@intCast(tree_v.payload));
+    const tree_name = interner.keywordName(tree_v.asKeywordId());
 
     // Optional range bounds: a keyword or symbol, whose name is the
     // key's bytes.
@@ -3238,8 +3238,8 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
             if (std.mem.order(u8, kv.key, eb) != .lt) break;
         }
         const decoded_v = try decodeEntry(vm, kv);
-        const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
-        const pair = [_]Value{ value_mod.fromKeywordId(key_id), decoded_v };
+        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const pair = [_]Value{ key_v, decoded_v };
         const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
         entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
     }
@@ -3272,7 +3272,7 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     var acc = args[3];
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
     const interner = vm.ensureInterner();
-    const tree_name = interner.keywordName(@intCast(tree_v.payload));
+    const tree_name = interner.keywordName(tree_v.asKeywordId());
 
     const h = try activeTxn(tx_v);
     var walk: db_mod.Walk = undefined;
@@ -3284,8 +3284,8 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     var maybe_kv = walk.first(null);
     while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
         const decoded_v = try decodeEntry(vm, kv);
-        const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
-        const call_args = [_]Value{ acc, value_mod.fromKeywordId(key_id), decoded_v };
+        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const call_args = [_]Value{ acc, key_v, decoded_v };
         acc = try vm.callValue(f, &call_args);
     }
     return acc;
@@ -4310,7 +4310,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     while (i < n) : (i += 1) {
         const f = vector_mod.nth(fields_vec, i);
         if (f.kind() != .keyword) return VmError.KindMismatch;
-        const id: u32 = @intCast(f.payload);
+        const id: u32 = f.asKeywordId();
         field_names[i] = interner.keywordName(id);
     }
 
@@ -4390,7 +4390,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
     while (i < n) : (i += 1) {
         const m = vector_mod.nth(methods_vec, i);
         if (m.kind() != .keyword) return VmError.KindMismatch;
-        const id: u32 = @intCast(m.payload);
+        const id: u32 = m.asKeywordId();
         specs[i] = .{ .name_id = id, .name = interner.keywordName(id) };
     }
 
@@ -4402,7 +4402,7 @@ fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .protocol) return VmError.KindMismatch;
     if (args[1].kind() != .keyword) return VmError.KindMismatch;
     const protocol_id = protocol_mod.protocolId(args[0]);
-    const method_name_id: u32 = @intCast(args[1].payload);
+    const method_name_id: u32 = args[1].asKeywordId();
 
     // Verify the method exists on the protocol — otherwise the
     // protocol_fn would be dispatching into the void at every
@@ -4438,7 +4438,7 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     // invocable. Errors point at the user's impl form rather
     // than this scaffolding.
     const protocol_id = protocol_mod.protocolId(args[0]);
-    const method_name_id: u32 = @intCast(args[1].payload);
+    const method_name_id: u32 = args[1].asKeywordId();
     const type_id_signed = args[2].asFixnum();
     if (type_id_signed < 0) return VmError.KindMismatch;
     const type_id: u32 = @intCast(type_id_signed);
@@ -4474,10 +4474,10 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
     if (args[2].kind() != .keyword) return VmError.KindMismatch;
 
     const protocol_id = protocol_mod.protocolId(args[0]);
-    const method_name_id: u32 = @intCast(args[1].payload);
+    const method_name_id: u32 = args[1].asKeywordId();
 
     const interner = vm.ensureInterner();
-    const type_id_kw: u32 = @intCast(args[2].payload);
+    const type_id_kw: u32 = args[2].asKeywordId();
     const type_name = interner.keywordName(type_id_kw);
     const kind = typeNameToKind(type_name) orelse return VmError.InvalidArgument;
     const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @intFromEnum(kind) };
@@ -4530,7 +4530,7 @@ fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {
     if (args[1].kind() != .keyword) return VmError.KindMismatch;
 
     const protocol_id = protocol_mod.protocolId(args[0]);
-    const method_name_id: u32 = @intCast(args[1].payload);
+    const method_name_id: u32 = args[1].asKeywordId();
     const proto = vm.protocolById(protocol_id) orelse return VmError.NoProtocolMethod;
     for (proto.methods.items) |*m| {
         if (m.name_id == method_name_id) {

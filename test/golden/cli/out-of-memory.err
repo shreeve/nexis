@@ -1,0 +1,5 @@
+nexis: test/golden/cli/out-of-memory.nx:7:10: runtime error: OutOfMemory
+      (count (repeat n 0)))
+             ^^^^^^^^^^^^
+  at fill (test/golden/cli/out-of-memory.nx:7:10)
+  at <top> (test/golden/cli/out-of-memory.nx:10:1)

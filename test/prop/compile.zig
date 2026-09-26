@@ -260,6 +260,25 @@ const cases = [_]Case{
     .{ .src = "(try 1)", .out = "1" },
     .{ .src = "(try (try (throw 100) (catch any e (throw e))) (catch any e e))", .out = "100" },
     .{ .src = "(try (do (try 1 (catch any e 2)) (throw :x)) (catch any e [:outer e]))", .out = "[:outer :x]" },
+    // Calls nested in calls, in every position: each item evaluated
+    // once, left to right, the callee first.
+    .{ .src = "(do (def log (atom [])) (defn t [k] (swap! log conj k) k) (defn f [a b c] [a b c]) [(f (t 1) (f (t 2) (f (t 3) (t 4) (t 5)) (t 6)) (t 7)) @log])", .out = "[[1 [2 [3 4 5] 6] 7] [1 2 3 4 5 6 7]]" },
+    .{ .src = "(do (def log (atom [])) (defn t [k] (swap! log conj k) k) [((do (t :f) vector) (t 1) ((do (t :g) vector) (t 2))) @log])", .out = "[[1 [2]] [:f 1 :g 2]]" },
+    .{ .src = "(do (defn f [a b] [a b]) (defn pick [x] (if x f vector)) [((pick true) ((pick nil) 1 2) 3) ((pick (f 1 2)) 3 ((pick nil) 4 5))])", .out = "[[[1 2] 3] [3 [4 5]]]" },
+    .{ .src = "(let* [f (fn* [a b] [a b]) x 1] (f (f x (f x (f x 2))) (f (f (f 3 x) x) x)))", .out = "[[1 [1 [1 2]]] [[[3 1] 1] 1]]" },
+    .{ .src = "(let* [m {:k {:k {:k 7}}}] [(:k (:k (:k m))) (get (get (get m :k) :k) :k) (:k (:k m) :none)])", .out = "[7 7 {:k 7}]" },
+    // A Var callee is read before its arguments run: an argument that
+    // redefines it changes only the calls that read it afterwards,
+    // each time a loop reaches them.
+    .{ .src = "(do (defn f [& xs] (into [:old] xs)) (def gen (atom 0)) (defn g [] (let [k (swap! gen inc)] (defn f [& xs] (into [k] xs))) 0) [(f (f (f (g)))) (f (g) (f 1))])", .out = "[[:old [:old [:old 0]]] [1 0 [2 1]]]" },
+    .{ .src = "(do (defn f [x] [:old x]) (def n (atom 0)) (f (loop* [] (let* [v (f 1)] (if (< (swap! n inc) 3) (do (defn f [x] [:new x]) (recur)) v)))))", .out = "[:old [:new 1]]" },
+    .{ .src = "(do (declare nope) (def log (atom [])) (try (nope (nope (swap! log conj 1))) (catch any e [e @log])))", .out = "[:unbound-var []]" },
+    // Varargs, apply, a throw from a nested argument, recur arguments
+    // and closures over the locals the calls read.
+    .{ .src = "(do (defn v [a & r] (into [a] r)) [(v 1 (v 2 (v 3 4 5) 6) (apply v 7 (v 8 9) [(v 10)])) (apply v (apply v 1 [2]) (v 3) [])])", .out = "[[1 [2 [3 4 5] 6] [7 [8 9] [10]]] [[1 2] [3]]]" },
+    .{ .src = "(do (defn f [a b] (if (= b :x) (throw [:thrown a]) [a b])) [(try (f 1 (f 2 (f 3 :x))) (catch any e e)) (try (f (f 4 5) (f 6 :x)) (catch any e e))])", .out = "[[:thrown 3] [:thrown 6]]" },
+    .{ .src = "(do (defn f [a b] (+ a b)) (loop* [i 0 acc 0] (if (< i 4) (recur (f i (f 1 0)) (f acc (f i (f acc 1)))) acc)))", .out = "26" },
+    .{ .src = "(do (defn f [a b] (+ a b)) (let* [x 10 h (fn* [y] (f x (f y (f x y))))] [(h 1) (h 2) (f (h 3) (f (h 4) x))]))", .out = "[22 24 64]" },
 };
 
 test "cases: each source evaluates to the printed value" {
@@ -748,6 +767,42 @@ test "slots: a routine's frame holds what is live at once, not every temporary i
             return err;
         };
     }
+    // So do nested calls, in any argument position, whatever their
+    // callee: no level holds a value across the next, since a callee
+    // or argument that runs no code (a local, a constant, a Var read
+    // just as the level outside it read it) is written after it.
+    const Level = struct { open: []const u8, close: []const u8, result: []const u8 };
+    const levels = [_]Level{
+        .{ .open = "(identity ", .close = ")", .result = "1" },
+        .{ .open = "(max ", .close = " x)", .result = "1" },
+        .{ .open = "(max x ", .close = " x)", .result = "1" },
+        .{ .open = "(f ", .close = ")", .result = "301" },
+        .{ .open = "(:k ", .close = ")", .result = "nil" },
+        .{ .open = "(nexis.core/max x ", .close = ")", .result = "1" },
+        .{ .open = "(identity (max x ", .close = "))", .result = "1" },
+        .{ .open = "(get {:k 1} :k ", .close = ")", .result = "1" },
+        .{ .open = "[x ", .close = "]", .result = "" },
+    };
+    for (levels) |level| {
+        var slots: [2]usize = undefined;
+        for ([_]usize{ 3, 300 }, &slots) |depth, *count| {
+            src.clearRetainingCapacity();
+            try src.appendSlice(testing.allocator, "(fn* [x f] ");
+            for (0..depth) |_| try src.appendSlice(testing.allocator, level.open);
+            try src.appendSlice(testing.allocator, "x");
+            for (0..depth) |_| try src.appendSlice(testing.allocator, level.close);
+            try src.appendSlice(testing.allocator, ")");
+            count.* = (try compileIn(&program, src.items)).capture_descs[0].routine.slot_count;
+        }
+        testing.expect(slots[1] == slots[0] and slots[1] <= 8) catch |err| {
+            std.debug.print("\n  {s}...: {d} slots 3 deep, {d} 300 deep\n", .{ level.open, slots[0], slots[1] });
+            return err;
+        };
+        if (level.result.len == 0) continue;
+        const call = try std.fmt.allocPrint(testing.allocator, "({s} 1 inc)", .{src.items});
+        defer testing.allocator.free(call);
+        try harness.expectResult(&program, level.open, try program.run(call), level.result);
+    }
 }
 
 test "literals: constant data of any size is one constant built at compile time" {
@@ -811,8 +866,11 @@ test "eval: a form's lowering is freed once its routine is compiled" {
 // whose recur argument is the step itself, sometimes with the loop's
 // bindings read through `let*` aliases, and a guarded expression
 // whose value an inner finally discards by throwing, so its
-// handler's value is the result. Arguments are any of these, so
-// calls nest inside call and recur arguments. Each program
+// handler's value is the result, and calls of the Vars `helpers`
+// defines: of three arguments, with the callee itself a call, and
+// variadic, directly or through apply. Arguments are any of these, so
+// calls nest inside call and recur arguments, in every position. Each
+// program
 // is built as a tree, printed as source and evaluated directly; the
 // compiled program must agree. The reference computes in i128 and
 // the VM promotes past the fixnum range, so both print the same
@@ -845,7 +903,21 @@ const Expr = union(enum) {
     loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool, replace: bool, alias: bool },
     /// (try (try body (finally (throw 0))) (catch any e handler))
     guard: struct { body: *const Expr, handler: *const Expr },
+    /// (h0 a b c) or (h1 a b c)
+    vcall: struct { f: u1, a: *const Expr, b: *const Expr, c: *const Expr },
+    /// ((pick s) a b c): h0 when s is negative, else h1
+    picked: struct { s: *const Expr, a: *const Expr, b: *const Expr, c: *const Expr },
+    /// (hv a b c), (apply hv a b [c]) or (apply hv a [b c])
+    vararg: struct { how: u8, a: *const Expr, b: *const Expr, c: *const Expr },
 };
+
+/// The Vars the generated programs call.
+const helpers =
+    \\(do (defn h0 [a b c] (- (+ a a) (+ b c)))
+    \\    (defn h1 [a b c] (+ (- a b) (* 2 c)))
+    \\    (defn pick [s] (if (< s 0) h0 h1))
+    \\    (defn hv [a & r] (- a (reduce + 0 r))))
+;
 
 const Names = struct {
     items: [24]u8 = undefined,
@@ -885,7 +957,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 13)) {
+    e.* = switch (rand.uintLessThan(u8, 16)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -936,6 +1008,9 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
             .then = try genExpr(a, rand, names, d),
             .other = try genExpr(a, rand, names, d),
         } },
+        12 => .{ .vcall = .{ .f = rand.int(u1), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
+        13 => .{ .picked = .{ .s = try genExpr(a, rand, names, d), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
+        14 => .{ .vararg = .{ .how = rand.uintLessThan(u8, 3), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
         10 => .{ .may_throw = .{
             .p = @intCast(names.len + 120),
             .q = @intCast(names.len + 150),
@@ -979,7 +1054,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
     return e;
 }
 
-fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
+fn printExpr(e: *const Expr, w: *std.Io.Writer) std.Io.Writer.Error!void {
     switch (e.*) {
         .lit => |n| try w.print("{d}", .{n}),
         .ref => |n| try w.print("v{d}", .{n}),
@@ -1097,6 +1172,46 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
             try printExpr(x.handler, w);
             try w.writeAll("))");
         },
+        .vcall => |x| {
+            try w.print("(h{d} ", .{x.f});
+            try printArgs(&.{ x.a, x.b, x.c }, w);
+            try w.writeAll(")");
+        },
+        .picked => |x| {
+            try w.writeAll("((pick ");
+            try printExpr(x.s, w);
+            try w.writeAll(") ");
+            try printArgs(&.{ x.a, x.b, x.c }, w);
+            try w.writeAll(")");
+        },
+        .vararg => |x| switch (x.how) {
+            0 => {
+                try w.writeAll("(hv ");
+                try printArgs(&.{ x.a, x.b, x.c }, w);
+                try w.writeAll(")");
+            },
+            1 => {
+                try w.writeAll("(apply hv ");
+                try printArgs(&.{ x.a, x.b }, w);
+                try w.writeAll(" [");
+                try printExpr(x.c, w);
+                try w.writeAll("])");
+            },
+            else => {
+                try w.writeAll("(apply hv ");
+                try printExpr(x.a, w);
+                try w.writeAll(" [");
+                try printArgs(&.{ x.b, x.c }, w);
+                try w.writeAll("])");
+            },
+        },
+    }
+}
+
+fn printArgs(args: []const *const Expr, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (args, 0..) |arg, i| {
+        if (i > 0) try w.writeAll(" ");
+        try printExpr(arg, w);
     }
 }
 
@@ -1183,7 +1298,18 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             _ = try evalExpr(a, x.body, env);
             break :blk try evalExpr(a, x.handler, env);
         },
+        .vcall => |x| helper(x.f, try evalExpr(a, x.a, env), try evalExpr(a, x.b, env), try evalExpr(a, x.c, env)),
+        .picked => |x| blk: {
+            const f: u1 = if (try evalExpr(a, x.s, env) < 0) 0 else 1;
+            break :blk helper(f, try evalExpr(a, x.a, env), try evalExpr(a, x.b, env), try evalExpr(a, x.c, env));
+        },
+        .vararg => |x| try evalExpr(a, x.a, env) - try evalExpr(a, x.b, env) - try evalExpr(a, x.c, env),
     };
+}
+
+/// What `helpers`' h0 and h1 compute.
+fn helper(f: u1, x: i128, y: i128, z: i128) i128 {
+    return if (f == 0) 2 * x - y - z else x - y + 2 * z;
 }
 
 test "prop differential: compiled random programs agree with a reference evaluator" {
@@ -1192,6 +1318,7 @@ test "prop differential: compiled random programs agree with a reference evaluat
     var program: harness.Program = undefined;
     try program.init();
     defer program.deinit();
+    _ = try program.run(helpers);
     for (0..400) |_| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();
@@ -1218,6 +1345,7 @@ test "prop differential: the same programs agree when their code starts past pc 
     try program.init();
     defer program.deinit();
     _ = try program.run("(defmacro pad [] (cons 'do (repeat 70000 '(inc 1))))");
+    _ = try program.run(helpers);
     for (0..30) |_| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena.deinit();

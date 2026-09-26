@@ -540,7 +540,7 @@ const Ctx = struct {
     /// The attribute as a program names it: its ident, else its id.
     fn attrValue(self: *Ctx, a: u32) ?Value {
         const k = (self.minter.keywordOf(a) catch null) orelse return value.fromFixnum(a);
-        return value.fromKeywordId(k);
+        return self.conn.interner.keywordValue(k);
     }
 
     fn abort(self: *Ctx) void {
@@ -569,8 +569,8 @@ const Ctx = struct {
     }
 
     fn attrByIntern(self: *Ctx, intern_id: u32) !*const Attr {
-        const id = (try self.minter.lookup(intern_id)) orelse return self.unknownAttr(value.fromKeywordId(intern_id));
-        return (try self.attrCopy(id)) orelse self.unknownAttr(value.fromKeywordId(intern_id));
+        const id = (try self.minter.lookup(intern_id)) orelse return self.unknownAttr(self.conn.interner.keywordValue(intern_id));
+        return (try self.attrCopy(id)) orelse self.unknownAttr(self.conn.interner.keywordValue(intern_id));
     }
 
     fn attrOf(self: *Ctx, ref: AttrRef) !*const Attr {

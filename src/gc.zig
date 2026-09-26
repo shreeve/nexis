@@ -388,8 +388,8 @@ test "collect: cross-kind graph — map whose values are lists" {
     const l1 = try list.fromSlice(&heap, &.{ value.fromFixnum(10).?, value.fromFixnum(20).? });
     const l2 = try list.fromSlice(&heap, &.{value.fromFixnum(30).?});
     var m = try champ.mapEmpty(&heap);
-    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(1), l1, &synthHash, &synthEq);
-    m = try champ.mapAssoc(&heap, m, value.fromKeywordId(2), l2, &synthHash, &synthEq);
+    m = try champ.mapAssoc(&heap, m, value.testKeyword(1), l1, &synthHash, &synthEq);
+    m = try champ.mapAssoc(&heap, m, value.testKeyword(2), l2, &synthHash, &synthEq);
 
     // Allocate an unrelated orphan.
     _ = try string.fromBytes(&heap, "orphan");
@@ -430,7 +430,7 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     var m = try champ.mapEmpty(&heap);
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        m = try champ.mapAssoc(&heap, m, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
+        m = try champ.mapAssoc(&heap, m, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
     }
     try testing.expect(m.subkind() == 1); // CHAMP root, not array-map
 
@@ -447,7 +447,7 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     // Every key still looks up to the correct value post-GC.
     i = 0;
     while (i < 20) : (i += 1) {
-        switch (champ.mapGet(m, value.fromKeywordId(i), &synthHash, &synthEq)) {
+        switch (champ.mapGet(m, value.testKeyword(i), &synthHash, &synthEq)) {
             .absent => try testing.expect(false),
             .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
         }
@@ -504,7 +504,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     var s = try champ.setEmpty(&heap);
     var i: u32 = 0;
     while (i < 15) : (i += 1) {
-        s = try champ.setConj(&heap, s, value.fromKeywordId(i), &synthHash, &synthEq);
+        s = try champ.setConj(&heap, s, value.testKeyword(i), &synthHash, &synthEq);
     }
     try testing.expect(s.subkind() == 1);
 
@@ -519,7 +519,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     try testing.expectEqual(@as(usize, 15), champ.setCount(s));
     i = 0;
     while (i < 15) : (i += 1) {
-        try testing.expect(champ.setContains(s, value.fromKeywordId(i), &synthHash, &synthEq));
+        try testing.expect(champ.setContains(s, value.testKeyword(i), &synthHash, &synthEq));
     }
 }
 
@@ -705,7 +705,7 @@ test "markValue: no-op on immediate Values" {
     gc.markValue(value.nilValue());
     gc.markValue(value.fromBool(true));
     gc.markValue(value.fromFixnum(42).?);
-    gc.markValue(value.fromKeywordId(1));
+    gc.markValue(value.testKeyword(1));
     // No panic, no allocation, no state change.
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }

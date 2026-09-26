@@ -712,7 +712,7 @@ fn patternAttr(ctx: *Ctx, a: ir.Term) !?Attr {
     if (a != .constant) return null;
     switch (a.constant) {
         .cell => |c| switch (c) {
-            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse ctx.unknownAttr(value.fromKeywordId(kw)),
+            .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse ctx.unknownAttr(ctx.interner.keywordValue(kw)),
             .int => |n| {
                 // An int cell holds any i64; an id is a fixnum, as transact takes it.
                 const id = value.fromFixnum(n) orelse return ctx.syntax("an attribute is a keyword or an id");
@@ -919,7 +919,7 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) Failure!?u64 {
             else => return ctx.syntax("an entity is an id, an ident or a lookup ref"),
         },
         .lookup => |l| {
-            const at = (try ctx.attrByKeyword(l.attr)) orelse return ctx.unknownAttr(value.fromKeywordId(l.attr));
+            const at = (try ctx.attrByKeyword(l.attr)) orelse return ctx.unknownAttr(ctx.interner.keywordValue(l.attr));
             if (at.unique == .none) return ctx.syntax("a lookup ref needs a unique attribute");
             const val = (try resolveTyped(ctx, .{ .cell = l.v }, at.value_type)) orelse return null;
             return ctx.read.entid(ctx.arena, .{ .lookup = .{ .a = at.id, .v = val } }) catch |err| switch (err) {

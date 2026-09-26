@@ -1,0 +1,27 @@
+; Calls nested 10,000 deep, in any argument position, compile into a
+; fixed number of slots: a level's callee and its arguments that run
+; no code are written after the level inside it has run, and that
+; level builds its call in the slots its consumer has not yet
+; written. Only the native stack bounds depth.
+(defn subst [tmpl x]
+  (cond (= tmpl '%) x
+        (seq? tmpl) (apply list (map #(subst % x) tmpl))
+        (vector? tmpl) (mapv #(subst % x) tmpl)
+        :else tmpl))
+
+(defmacro nest [n tmpl form]
+  (reduce (fn [acc _] (subst tmpl acc)) form (range n)))
+
+(defn f [x] (inc x))
+(defn f2 [a b] (+ a b))
+
+(println (nest 10000 (f %) 0))
+(println (let [g f] (nest 10000 (g %) 0)))
+(println (nest 10000 (f2 % 1) 0))
+(println (nest 10000 (max 1 % 2) 0))
+(println (nest 5000 (f2 1 (f %)) 0))
+(println (nest 10000 (:k {} %) 0))
+(println (nest 10000 (apply f2 % [1]) 0))
+(println (let [x 1] (count (nest 10000 [x %] 0))))
+(println (loop [i 0 n 0] (if (< i 3) (recur (inc i) (nest 10000 (f %) n)) n)))
+(println (try (nest 10000 (f2 % 1) (throw :deep)) (catch :deep e [:caught e])))

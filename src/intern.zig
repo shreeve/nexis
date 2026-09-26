@@ -3,8 +3,9 @@
 //! Authoritative contract: `docs/INTERN.md`. Physical layout of the
 //! `Value` ids produced here is pinned in `docs/VALUE.md`. The hash
 //! domain separation between keyword and symbol lives in the Value
-//! layer (`mixKindDomain`), not here; this file only maps
-//! textual names to dense process-local `u32` ids.
+//! layer (`mixKindDomain`), not here; this file maps textual names to
+//! dense process-local `u32` ids and keeps each name's text hash, which
+//! every keyword and symbol Value carries.
 //!
 //! Invariants (INTERN.md §1 — frozen):
 //!   - Dense-from-0 ids per table; never reused, never renumbered.
@@ -24,6 +25,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const hash = @import("hash.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,6 +46,8 @@ pub const InternError = error{
 const Table = struct {
     by_name: std.StringHashMapUnmanaged(u32) = .empty,
     names: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// `hash.nameHash` of each name, by id.
+    hashes: std.ArrayListUnmanaged(u32) = .empty,
 
     fn deinit(self: *Table, gpa: Allocator) void {
         // Lockstep invariant: `by_name` keys are borrowed slices into
@@ -55,6 +59,7 @@ const Table = struct {
         // the name bytes must be freed explicitly via `names`.
         for (self.names.items) |n| gpa.free(n);
         self.names.deinit(gpa);
+        self.hashes.deinit(gpa);
         self.by_name.deinit(gpa);
     }
 };
@@ -80,10 +85,12 @@ fn internInto(table: *Table, gpa: Allocator, name: []const u8) InternError!u32 {
 
     try table.names.append(gpa, dup);
     errdefer _ = table.names.pop();
+    try table.hashes.append(gpa, hash.nameHash(name));
+    errdefer _ = table.hashes.pop();
 
     try table.by_name.put(gpa, dup, id);
 
-    std.debug.assert(table.by_name.count() == table.names.items.len);
+    std.debug.assert(table.by_name.count() == table.names.items.len and table.hashes.items.len == table.names.items.len);
     return id;
 }
 
@@ -159,8 +166,7 @@ pub const Interner = struct {
     // ---- Convenience: name -> Value ----
 
     pub fn internKeywordValue(self: *Interner, name: []const u8) InternError!value.Value {
-        const id = try self.internKeyword(name);
-        return value.fromKeywordId(id);
+        return self.keywordValue(try self.internKeyword(name));
     }
 
     /// A keyword's full text is `ns/name` when it is qualified;
@@ -206,8 +212,22 @@ pub const Interner = struct {
     }
 
     pub fn internSymbolValue(self: *Interner, name: []const u8) InternError!value.Value {
-        const id = try self.internSymbol(name);
-        return value.fromSymbolId(id);
+        return self.symbolValue(try self.internSymbol(name));
+    }
+
+    // ---- Accessors: id -> Value ----
+
+    /// The keyword Value of interned id `id`: the id and its name's
+    /// hash (VALUE.md §2). Panics on an out-of-range id, as `keywordName`.
+    pub fn keywordValue(self: *const Interner, id: u32) value.Value {
+        _ = nameFrom(&self.keyword, id);
+        return value.fromKeyword(id, self.keyword.hashes.items[id]);
+    }
+
+    /// `keywordValue` for symbols.
+    pub fn symbolValue(self: *const Interner, id: u32) value.Value {
+        _ = nameFrom(&self.symbol, id);
+        return value.fromSymbol(id, self.symbol.hashes.items[id]);
     }
 
     // ---- Accessors: id -> name ----

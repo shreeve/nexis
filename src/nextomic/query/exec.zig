@@ -158,7 +158,7 @@ pub const Exec = struct {
             .int => |n| value.fromFixnum(n) orelse try bignum.fromI64(self.heap, n),
             .double => |d| value.fromFloat(d),
             .boolean => |b| value.fromBool(b),
-            .keyword => |k| value.fromKeywordId(k),
+            .keyword => |k| self.interner.keywordValue(k),
             .str => |s| try string_mod.fromBytes(self.heap, s),
             .vm => |v| v,
         };
@@ -435,7 +435,7 @@ pub const Exec = struct {
         const at = try self.attrNamed(read, attr);
         const a = at.id;
         if (!at.fulltext) {
-            if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = value.fromKeywordId(attr.keyword) };
+            if (self.diag) |d| d.* = .{ .message = "attribute is not :db/fulltext", .attr = self.interner.keywordValue(attr.keyword) };
             return error.TxData;
         }
         const tokens = try fulltext.tokens(self.arena, needle.str);
@@ -473,7 +473,7 @@ pub const Exec = struct {
     }
 
     fn unknownAttribute(self: *Exec, kw: u32) anyerror {
-        if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = value.fromKeywordId(kw) };
+        if (self.diag) |d| d.* = .{ .message = "unknown attribute", .attr = self.interner.keywordValue(kw) };
         return error.UnknownAttribute;
     }
 
@@ -823,7 +823,7 @@ pub const Exec = struct {
     /// carries what a failing lookup ref named.
     fn inputEntity(self: *Exec, read: *Read, c: Cell) anyerror!?u64 {
         const v: Value = switch (c) {
-            .keyword => |kw| value.fromKeywordId(kw),
+            .keyword => |kw| self.interner.keywordValue(kw),
             .vm => |v| v,
             else => return null,
         };
@@ -1125,7 +1125,7 @@ pub const Exec = struct {
             n.* = switch (keys.kind) {
                 .keyword => try self.interner.internKeywordValue(text),
                 .string => try string_mod.fromBytes(self.heap, text),
-                .symbol => value.fromSymbolId(sym),
+                .symbol => self.interner.symbolValue(sym),
             };
         }
         const maps = try self.arena.alloc(Value, rows.len);

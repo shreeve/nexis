@@ -17,11 +17,17 @@
 //!   I8. Long names — a 64 KiB name round-trips byte-exact.
 //!   I9. splitQualified inverts the qualified intern at the first slash.
 //!   I10. by_name/names counts stay in lockstep across a mixed workload.
+//!   I11. A keyword's or symbol's hash is a function of its text: two
+//!        interners that intern the same names in different orders give
+//!        each name the same hash, and a map or set past the array form
+//!        iterates in the same order in both (SEMANTICS §3.2).
 
 const std = @import("std");
 const nx = @import("nexis");
 const value = nx.value;
 const intern = nx.intern;
+const champ = nx.champ;
+const dispatch = nx.dispatch;
 
 const Interner = intern.Interner;
 const prng_seed: u64 = 0x696E_7465_726E_5F50; // "intern_P" ASCII LE
@@ -267,4 +273,64 @@ test "I10: by_name/names counts stay in lockstep under mixed workload" {
         try std.testing.expectEqual(keywords_before + keywords.count(), it.keywordCount());
         try std.testing.expectEqual(symbols_before + symbols.count(), it.symbolCount());
     }
+}
+
+test "I11: hash and map order follow the text, not the intern order" {
+    const gpa = std.testing.allocator;
+    var heap = nx.heap.Heap.init(gpa);
+    defer heap.deinit();
+
+    var names: [40][8]u8 = undefined;
+    var slices: [40][]const u8 = undefined;
+    for (&names, &slices, 0..) |*buf, *s, i| s.* = try std.fmt.bufPrint(buf, "k{d}", .{i});
+
+    // `a` interns unrelated names first and the names forward; `b`
+    // interns them backward, so every name has a different id in each.
+    var a = Interner.init(gpa);
+    defer a.deinit();
+    var b = Interner.init(gpa);
+    defer b.deinit();
+    for ([_][]const u8{ "private", "doc", "arglists" }) |n| _ = try a.internKeyword(n);
+    for (slices) |n| _ = try a.internKeyword(n);
+    var i: usize = slices.len;
+    while (i > 0) : (i -= 1) {
+        _ = try b.internKeyword(slices[i - 1]);
+        _ = try b.internSymbol(slices[i - 1]);
+    }
+    for (slices) |n| _ = try a.internSymbol(n);
+
+    var ma = try champ.mapEmpty(&heap);
+    var mb = try champ.mapEmpty(&heap);
+    var sa = try champ.setEmpty(&heap);
+    var sb = try champ.setEmpty(&heap);
+    for (slices, 0..) |n, j| {
+        const ka = try a.internKeywordValue(n);
+        const kb = try b.internKeywordValue(n);
+        try std.testing.expectEqual(dispatch.hashValue(ka), dispatch.hashValue(kb));
+        const ya = try a.internSymbolValue(n);
+        const yb = try b.internSymbolValue(n);
+        try std.testing.expectEqual(dispatch.hashValue(ya), dispatch.hashValue(yb));
+        try std.testing.expect(dispatch.hashValue(ka) != dispatch.hashValue(ya));
+        const v = value.fromFixnum(@intCast(j)).?;
+        ma = try champ.mapAssoc(&heap, ma, ka, v, &dispatch.hashValue, &dispatch.equal);
+        mb = try champ.mapAssoc(&heap, mb, kb, v, &dispatch.hashValue, &dispatch.equal);
+        sa = try champ.setConj(&heap, sa, ya, &dispatch.hashValue, &dispatch.equal);
+        sb = try champ.setConj(&heap, sb, yb, &dispatch.hashValue, &dispatch.equal);
+    }
+
+    var ia = champ.mapIter(ma);
+    var ib = champ.mapIter(mb);
+    var n: usize = 0;
+    while (ia.next()) |ea| : (n += 1) {
+        const eb = ib.next().?;
+        try std.testing.expectEqualStrings(a.keywordName(ea.key.asKeywordId()), b.keywordName(eb.key.asKeywordId()));
+        try std.testing.expect(dispatch.equal(ea.value, eb.value));
+    }
+    try std.testing.expect(ib.next() == null);
+    try std.testing.expectEqual(slices.len, n);
+
+    var ja = champ.setIter(sa);
+    var jb = champ.setIter(sb);
+    while (ja.next()) |ya| try std.testing.expectEqualStrings(a.symbolName(ya.asSymbolId()), b.symbolName(jb.next().?.asSymbolId()));
+    try std.testing.expect(jb.next() == null);
 }

@@ -45,7 +45,7 @@ fn randImmediate(rand: std.Random) Value {
     const pick = rand.uintLessThan(u8, 3);
     return switch (pick) {
         0 => value.fromFixnum(rand.intRangeAtMost(i64, -1000, 1000)).?,
-        1 => value.fromKeywordId(rand.uintLessThan(u32, 32)),
+        1 => value.testKeyword(rand.uintLessThan(u32, 32)),
         2 => value.fromChar(rand.intRangeAtMost(u21, 32, 126)).?,
         else => unreachable,
     };
@@ -274,8 +274,8 @@ test "V6: vector is never equal to a non-sequential Value; hashes differ" {
         value.fromFixnum(0).?,
         value.fromFixnum(1).?,
         value.fromChar('x').?,
-        value.fromKeywordId(0),
-        value.fromSymbolId(0),
+        value.testKeyword(0),
+        value.testSymbol(0),
     };
     for (non_seq) |o| {
         try std.testing.expect(!dispatch.equal(v, o));
@@ -326,8 +326,8 @@ test "V8: nested vectors — recursive dispatch reaches inner sequences" {
         value.fromFixnum(10).?,
         value.fromFixnum(20).?,
     });
-    const outer_a = try vector_mod.fromSlice(&heap, &.{ inner_a, value.fromKeywordId(5) });
-    const outer_b = try vector_mod.fromSlice(&heap, &.{ inner_b, value.fromKeywordId(5) });
+    const outer_a = try vector_mod.fromSlice(&heap, &.{ inner_a, value.testKeyword(5) });
+    const outer_b = try vector_mod.fromSlice(&heap, &.{ inner_b, value.testKeyword(5) });
     try std.testing.expect(dispatch.equal(outer_a, outer_b));
     try std.testing.expectEqual(dispatch.hashValue(outer_a), dispatch.hashValue(outer_b));
 }
