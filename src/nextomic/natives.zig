@@ -300,7 +300,7 @@ fn detailOf(vm: *VM, conn: *Conn, fault: *const Fault) Detail {
             const heap = vm.ensureHeap();
             if (fault.value) |v| d.value = conn.valToValue(txn, heap, v) catch null;
             if (fault.cas) |c| d.cas = .{
-                .expected = if (c.expected) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
+                .expected = if (c.unseen) |k| k else if (c.expected) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
                 .actual = if (c.actual) |v| conn.valToValue(txn, heap, v) catch value.nilValue() else value.nilValue(),
             };
         } else |_| {}

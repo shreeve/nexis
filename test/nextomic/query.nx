@@ -98,7 +98,9 @@
 
 (println (rows (d/q {:query '[:find ?n :in $ ?a :where [?e :person/age ?a] [?e :person/name ?n]] :args [db 30]})))
 (println (d/q {:query '{:find [?x] :in [[?x ...]]} :args [[1 2]]}))
-(println (t/caught (d/q {:query '[:find ?x :in ?x] :args [1] :timeout 10})))
+; Datomic's :timeout and :io-context are accepted and ignored.
+(println (d/q {:query '[:find ?x :in ?x] :args [1] :timeout 10 :io-context :request-7}))
+(println (t/caught (d/q {:query '[:find ?x :in ?x] :args [1] :limit 10})))
 (println (t/caught (d/q {:query '[:find ?x :in ?x] :args 1})))
 
 ; --- queries over their inputs alone ---------------------------------------

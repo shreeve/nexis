@@ -68,8 +68,9 @@ pub const Fault = struct {
     value: ?Val = null,
     message: ?[]const u8 = null,
     /// A failed `:db.fn/cas`: what it expected and what it found, either
-    /// absent when the attribute had no value.
-    cas: ?struct { expected: ?Val, actual: ?Val } = null,
+    /// absent when the attribute had no value, and the expected keyword
+    /// as the form wrote it when the store has never seen it.
+    cas: ?struct { expected: ?Val, actual: ?Val, unseen: ?Value = null } = null,
 };
 
 /// The Nextomic error set; each maps to a `:nextomic/*` keyword.

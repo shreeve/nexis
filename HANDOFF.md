@@ -346,20 +346,13 @@ failing test (AGENTS.md).
    state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
    unchanged but `t` advanced, check the txlog entries in between for
    attribute-partition datoms.
-4. **Small**: a `:db.fn/cas` old value that is an unseen keyword
-   mints it (`transact.zig` resolves the old value with `.assert`;
-   `.match` would refuse it without a write), harmless but a stray
-   ident; the arg-map form of `q` refuses Datomic's `:timeout` and
-   `:io-context` keys with `:nextomic/query-syntax` where ignoring them
-   would port more code (an owner's call); the refusal of a
-   `get-else` on a card-many attribute carries no `:clause`.
-5. **The planner's join estimates** come from `treeStat` and
+4. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-6. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+5. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-7. **No datom heap kind**: reads return `[e a v t added]` vectors.
+6. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

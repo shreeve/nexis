@@ -77,6 +77,11 @@
        (and (= #{[:x/a]} (d/q '[:find ?i :where [?e :db/ident ?i] [(= ?i :x/a)]] (d/db c)))
             (= #{[(d/entid (d/db c) :role/admin)]} (d/q '[:find ?e :where [?e :db/ident :role/admin]] (d/db c)))
             (= :role/admin (d/ident (d/db c) (d/entid (d/db c) :role/admin)))))
+; A cas whose old value is a keyword the store has never seen fails
+; as a cas naming that keyword, and mints nothing.
+(d/transact! c [[:db/add a :x/role :role/admin]])
+(println (t/caught (d/transact! c [[:db.fn/cas a :x/role :role/never :role/admin]])))
+(t/check "a cas mints no ident for its old value" (nil? (d/entid (d/db c) :role/never)))
 (d/release c2)
 (def last-t (d/basis-t (d/db c)))
 

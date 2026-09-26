@@ -38,6 +38,8 @@ ok the attribute keeps its old name
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 ok a refused ident retraction leaves every name resolving
+{:error :nextomic/cas, :attr :x/role, :expected :role/never, :actual :role/admin}
+ok a cas mints no ident for its old value
 :nextomic/closed
 :nextomic/closed
 :nextomic/closed

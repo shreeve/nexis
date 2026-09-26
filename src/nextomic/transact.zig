@@ -347,7 +347,9 @@ const PVal = union(enum) {
 /// `[:db.fn/cas e a old new]`: assert `new` when the current value of
 /// the card-one `(e a)` is `old` (absent when `old` is null). In the
 /// arena: the rare case, kept off the common op's size.
-const CasOp = struct { e: Ent, attr: *const Attr, old: ?PVal, new: PVal };
+/// `old` is matched, never minted; `written` is the old value as the
+/// form wrote it, for the refusal to name one the store cannot spell.
+const CasOp = struct { e: Ent, attr: *const Attr, old: ?PVal, written: Value, new: PVal };
 
 const ROp = union(enum) {
     add: struct { e: Ent, attr: *const Attr, v: PVal },
@@ -504,9 +506,10 @@ const Ctx = struct {
         return error.TxFn;
     }
 
-    /// `Cas`: `attr` holds `actual` where the form expected `expected`.
-    fn cas(self: *Ctx, attr: *const Attr, expected: ?Val, actual: ?Val) error{Cas} {
-        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual } };
+    /// `Cas`: `attr` holds `actual` where the form expected `expected`;
+    /// `unseen` is the expected keyword when the store has never seen it.
+    fn cas(self: *Ctx, attr: *const Attr, expected: ?Val, actual: ?Val, unseen: ?Value) error{Cas} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual, .unseen = unseen } };
         return error.Cas;
     }
 
@@ -759,7 +762,7 @@ const Ctx = struct {
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
                     const old_v = vector_mod.nth(form, 3);
                     const op_cas = try self.arena.create(CasOp);
-                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v, .assert), .new = try self.valueFromVm(attr, vector_mod.nth(form, 4), .assert) };
+                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v, .match), .written = old_v, .new = try self.valueFromVm(attr, vector_mod.nth(form, 4), .assert) };
                     try self.ops.append(self.arena, .{ .cas = op_cas });
                 } else if (self.kwIs(op, "db/add")) {
                     if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
@@ -1105,13 +1108,7 @@ const Ctx = struct {
             const slot: *PVal = switch (op.*) {
                 .add => |*o| if (o.attr.id == boot.ident) &o.v else continue,
                 .retract => |*o| if (o.attr.id == boot.ident) &o.v else continue,
-                .cas => |c| blk: {
-                    const mutable: *CasOp = @constCast(c);
-                    if (mutable.old) |*old| if (old.* == .ident) {
-                        old.* = .{ .val = .{ .keyword = try self.mintKeyword(old.ident) } };
-                    };
-                    break :blk &mutable.new;
-                },
+                .cas => |c| &@constCast(c).new,
                 else => continue,
             };
             if (slot.* != .ident) continue;
@@ -1388,7 +1385,7 @@ const Ctx = struct {
                 .retract_entity => |e| try self.expandRetractEntity(try self.resolveEnt(e)),
                 .cas => |o| {
                     const old: ?Val = if (o.old) |v| try self.resolveVal(v) else null;
-                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, try self.resolveVal(o.new));
+                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, o.written, try self.resolveVal(o.new));
                 },
             }
         }
@@ -1397,12 +1394,15 @@ const Ctx = struct {
     /// `:db.fn/cas`: the committed value of the card-one `(e a)`, less
     /// what this transaction retracted, must be `old` (absent when `old`
     /// is null); then `new` is asserted as an ordinary add.
-    fn expandCas(self: *Ctx, e: u64, attr: *const Attr, old: ?Val, new: Val) !void {
+    fn expandCas(self: *Ctx, e: u64, attr: *const Attr, old: ?Val, written: Value, new: Val) !void {
         if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute");
         const current = try self.currentOne(e, attr.id);
         const actual: ?Val = if (current) |c| c.val else null;
         const matches = if (old) |o| (if (actual) |a| a.eql(o) else false) else actual == null;
-        if (!matches) return self.cas(attr, old, actual);
+        if (!matches) {
+            const unseen = if (old) |o| o == .keyword and o.keyword == no_keyword else false;
+            return self.cas(attr, old, actual, if (unseen) written else null);
+        }
         try self.expandAdd(e, attr, new);
     }
 

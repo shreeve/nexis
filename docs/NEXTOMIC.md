@@ -377,7 +377,10 @@ built-in `[:db.fn/cas e a old new]` asserts `new` on the
 cardinality-one attribute `a` when the value the transaction sees (the
 committed value, less what an earlier form of the same transaction
 retracted) is `old`, nil meaning absent; otherwise it is
-`:nextomic/cas` with `:attr`, `:expected` and `:actual`. A card-many
+`:nextomic/cas` with `:attr`, `:expected` and `:actual`. `old` is only
+matched, as a retraction's value is (step 2): a keyword the store has
+never seen mints nothing and matches no value, so the cas fails with
+`:expected` the keyword as the form wrote it. A card-many
 attribute is `:nextomic/tx-data`. The assertion then follows the
 card-one rule of step 4, so two cas forms on one `(e a)` in one
 transaction conflict as two values would.
@@ -618,7 +621,10 @@ The built-ins are Zig over cells:
   boolean instead of filtering;
 - `ground`, `tuple`, `untuple`;
 - `get-else`, which takes a cardinality-one attribute and a default
-  that is not nil (`:nextomic/query-syntax` otherwise);
+  that is not nil (`:nextomic/query-syntax` otherwise; a card-many
+  attribute or a nil default written as a constant is refused when the
+  query is planned, with its `:clause`, one bound to a variable when
+  the clause runs);
 - `get-some`, which binds `[attr value]` for the first of its
   attributes the entity has and drops the row when it has none;
 - `fulltext` (below).
@@ -747,7 +753,7 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 | `(d/entid db x)` / `(d/ident db x)` | lookup ref or ident → eid; eid → ident |
 | `(d/datoms db index c1 ... tx added)` | vector of `[e a v t added]` after the fold. `index` is `:eavt`, `:aevt`, `:avet` or `:vaet` (another keyword is `:invalid-argument`); its components follow in index order, then `tx` (a t or a transaction entity id) and `added` (a boolean); nil leaves one unbound, later ones filter |
 | `(d/index-range db attr start end)` | the AVET datoms of an indexed or unique attribute with `start <= v < end` in value order; a nil bound is open; another attribute is `:nextomic/tx-data` naming it, a bound of the wrong type `:nextomic/value-type`. The cursor seeks to `start` and stops at `end`; the range test compares decoded values, so long strings and byte arrays (§2.2) are placed by value: a bound of 64 bytes or more seeks at its 64-byte prefix class, which is scanned whole |
-| `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5, inputs positional to `:in`; the arg-map is the same call, and a key other than `:query` and `:args` is `:nextomic/query-syntax`. `:find` takes `.`, `[...]`, `[[...]]`, aggregates and pull expressions, with `:keys`/`:strs`/`:syms` and `:with`; `:where` takes patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and` and rule calls. A relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
+| `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5, inputs positional to `:in`; the arg-map is the same call; Datomic's `:timeout` and `:io-context` keys are accepted and ignored (a query is one read in the caller's thread, with no timer to arm and no I/O to attribute), and any other key is `:nextomic/query-syntax`. `:find` takes `.`, `[...]`, `[[...]]`, aggregates and pull expressions, with `:keys`/`:strs`/`:syms` and `:with`; `:where` takes patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and` and rule calls. A relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query & inputs)` / `(d/explain {:query query :args [...]})` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`, or `unsatisfiable`), the join the step runs (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule; `none` for an unsatisfiable scan) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
 | `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the count of history rows that went |
