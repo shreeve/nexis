@@ -20,6 +20,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Lists: cons, empty, O(1) vector view |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector: 32-way trie with a tail |
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map and set |
+| `src/coll/sorted.zig` | [`SORTED.md`](SORTED.md) | Sorted map and set: a weight-balanced tree, the natural order, `subseq` |
 | `src/coll/transient.zig` | [`TRANSIENT.md`](TRANSIENT.md) | Transients and their language surface |
 | `src/coll/typed_vector.zig` | [`TYPED_VECTOR.md`](TYPED_VECTOR.md) | Unboxed i64 / f64 vectors, `nexis.simd` |
 | `src/gc.zig` | [`GC.md`](GC.md) | Precise mark-sweep collector; §11.5 the native rooting rule |

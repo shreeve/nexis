@@ -300,9 +300,8 @@ failing test (AGENTS.md).
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-2. **Library absences**: `sorted-map`, `sorted-set` and regex
-   (§24 #9) (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
-   rule plus an `eval_pipeline` case.
+2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
+   design question, so an amendment comes first.
 3. **Small Clojure differences**: `(long x)` of NaN is
    `:invalid-argument` (Clojure returns 0, as nexis's `int`, `short`
    and `byte` do; `test/integration/numbers.zig` pins the rule); a

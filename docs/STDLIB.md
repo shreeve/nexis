@@ -33,7 +33,7 @@ loader's diagnostic.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; the macros MACROEXPAND.md §2b |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -107,7 +107,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
 | `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
-| `compare` | 2 | Of two strings: byte order of their UTF-8, which is code-point order; `sort` uses it | — |
+| `compare` | 2 | Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6) | — |
 
 **`format`.** `(format fmt & args)` is a subset of Java's
 `Formatter`, as Clojure's `format` uses it. `fmt` is text with
@@ -222,8 +222,8 @@ their elements in the same mode. Who uses which:
 | char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, printable ASCII as `\x`, anything else `\u{HEX}` (`\u{E9}`) |
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
-| list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space |
-| map | `{k v, k v}`, entries separated by `, ` |
+| list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
+| map | `{k v, k v}`, entries separated by `, `; a sorted map in its order |
 | record | `#ns.Type{:k v, ...}` (the fields in the record's mode), or `#<record type-id=N>` when the interner has no name for the type; `(reduced x)` is the record `#nexis.core.Reduced{:val x}` |
 | typed vector | `#i64[1 2]`, `#f64[1.5]` |
 | function, native fn | `#<fn>`, `#<native-fn NAME>` (`NAME` is `ns/name` outside `nexis.core`: `#<native-fn nexis.string/join>`) |
@@ -234,8 +234,10 @@ their elements in the same mode. Who uses which:
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
 
-A map or set of up to eight entries prints in insertion order, a
-larger one in hash order (CHAMP.md §2). A Var's `#'ns/name` reads
+A hash map or set of up to eight entries prints in insertion order, a
+larger one in hash order (CHAMP.md §2); a sorted one prints in its
+comparator's order, so `(pr-str (sorted-map :b 1 :a 2))` is `"{:a 2,
+:b 1}"` and reads back as a hash map equal to it. A Var's `#'ns/name` reads
 back as `(var ns/name)`, which evaluates to the same Var; none of the
 `#<...>`, `#ns.Type{...}`, `#i64[...]` or `#nextomic/...` forms reads
 back; the codec (CODEC.md) is the serialization layer.

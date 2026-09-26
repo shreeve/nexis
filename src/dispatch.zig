@@ -6,7 +6,7 @@
 //! &hashValue)`), so recursion into elements comes back through here
 //! and no kind module imports this one.
 //!
-//! Three rules decide every pair of values:
+//! Four rules decide every pair of values:
 //!
 //!   - **Identity kinds** (functions, vars, handles, atoms, transients,
 //!     protocols, Nextomic connections) are equal to themselves only
@@ -15,6 +15,9 @@
 //!   - **Sequential kinds** (list, vector) compare element-wise across
 //!     kinds and share one hash domain byte, so `(= '(1 2) [1 2])` and
 //!     their hashes agree.
+//!   - **Maps and sets** compare entry-wise across their hash and
+//!     sorted kinds and hash in the hash kind's domain, so `(=
+//!     (sorted-map 1 2) {1 2})` and their hashes agree.
 //!   - **Every other kind** is equal only within its own kind, by its
 //!     module's structural rule, and mixes its own kind byte into its
 //!     hash.
@@ -42,6 +45,7 @@ const vector = @import("coll/vector.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 const bignum = @import("bignum.zig");
 const champ = @import("coll/champ.zig");
+const sorted = @import("coll/sorted.zig");
 const typed_vector = @import("coll/typed_vector.zig");
 const db = @import("db.zig");
 const record = @import("record.zig");
@@ -79,9 +83,23 @@ inline fn isSequential(k: Kind) bool {
     return k == .list or k == .persistent_vector;
 }
 
-/// The domain byte `hashValue` mixes into a heap kind's hash.
+inline fn isMapKind(k: Kind) bool {
+    return k == .persistent_map or k == .sorted_map;
+}
+
+inline fn isSetKind(k: Kind) bool {
+    return k == .persistent_set or k == .sorted_set;
+}
+
+/// The domain byte `hashValue` mixes into a heap kind's hash. A sorted
+/// map or set hashes in the hash map's or hash set's domain.
 pub fn domainByte(k: Kind) u8 {
-    return if (isSequential(k)) sequential_domain_byte else @intFromEnum(k);
+    if (isSequential(k)) return sequential_domain_byte;
+    return switch (k) {
+        .sorted_map => @intFromEnum(Kind.persistent_map),
+        .sorted_set => @intFromEnum(Kind.persistent_set),
+        else => @intFromEnum(k),
+    };
 }
 
 // =============================================================================
@@ -141,6 +159,7 @@ pub fn heapHashBase(v: Value) u64 {
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => champ.hashMap(h, &hashValue),
         .persistent_set => champ.hashSet(h, &hashValue),
+        .sorted_map, .sorted_set => sorted.hashOf(h, &hashValue),
         .typed_vector => typed_vector.hashHeader(h),
         // Over the identity triple (store, tree, key), never the
         // advisory connection (DB.md §7.2).
@@ -163,7 +182,11 @@ pub fn equal(a: Value, b: Value) bool {
     if (a.tag == b.tag and a.payload == b.payload) return true;
     const ka = a.kind();
     const kb = b.kind();
-    if (ka != kb) return isSequential(ka) and isSequential(kb) and sequentialEqual(a, b);
+    if (ka != kb) {
+        if (isSequential(ka) and isSequential(kb)) return sequentialEqual(a, b);
+        if ((isMapKind(ka) and isMapKind(kb)) or (isSetKind(ka) and isSetKind(kb))) return mixedEqual(a, b);
+        return false;
+    }
     if (!ka.isHeap()) return a.equalImmediate(b);
     // Distinct identity values: the bit test above already said no.
     if (isIdentityKind(ka)) return false;
@@ -180,6 +203,7 @@ pub fn equal(a: Value, b: Value) bool {
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => champ.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => champ.equalSet(ah, bh, &hashValue, &equal),
+        .sorted_map, .sorted_set => mixedEqual(a, b),
         .typed_vector => typed_vector.equalHeaders(ah, bh),
         .durable_ref => db.refsEqual(ah, bh),
         .record => record.recordsEqual(ah, bh, &equal),
@@ -187,6 +211,103 @@ pub fn equal(a: Value, b: Value) bool {
         .nextomic_entity => nextomic_handle.entityEqual(ah, bh),
         else => std.debug.panic("dispatch.equal: kind {s} is never constructed", .{@tagName(ka)}),
     };
+}
+
+/// Two maps or two sets, at least one of them sorted. A sorted
+/// collection finds a key only through its comparator, which may be
+/// user code, so equality never asks it: it walks the sorted side's
+/// entries and looks each up in the hash side, walks two sorted sides
+/// in the natural order in lock step, and indexes one side by hash
+/// when their orders differ.
+fn mixedEqual(a: Value, b: Value) bool {
+    stack.check() catch {
+        noteOverflow();
+        return false;
+    };
+    if (collCount(a) != collCount(b)) return false;
+    // Two sorted keys `=` to one hash key would pass the walks below;
+    // the hashes tell such collections apart.
+    if (hashValue(a) != hashValue(b)) return false;
+    if (!sorted.isSortedKind(a.kind())) return sortedInHash(b, a);
+    if (!sorted.isSortedKind(b.kind())) return sortedInHash(a, b);
+    if (sorted.comparatorOf(a).isNil() and sorted.comparatorOf(b).isNil()) return sorted.equalInOrder(a, b, &equal);
+    return sortedByHash(a, b);
+}
+
+fn collCount(v: Value) usize {
+    return switch (v.kind()) {
+        .persistent_map => champ.mapCount(v),
+        .persistent_set => champ.setCount(v),
+        else => sorted.count(v),
+    };
+}
+
+/// Every entry of sorted `s` in hash map or set `h`, with an equal
+/// value.
+fn sortedInHash(s: Value, h: Value) bool {
+    var it = sorted.Iter.init(s, true);
+    while (it.next()) |e| {
+        if (s.kind() == .sorted_set) {
+            if (!champ.setContains(h, e.key, &hashValue, &equal)) return false;
+        } else switch (champ.mapGet(h, e.key, &hashValue, &equal)) {
+            .absent => return false,
+            .present => |v| if (!equal(v, e.value)) return false,
+        }
+    }
+    return true;
+}
+
+const Hashed = struct { hash: u64, entry: sorted.Entry };
+
+fn hashedLess(_: void, x: Hashed, y: Hashed) bool {
+    return x.hash < y.hash;
+}
+
+fn hashedOrder(target: u64, item: Hashed) std.math.Order {
+    return std.math.order(target, item.hash);
+}
+
+/// Every entry of `a` among `b`'s, found through `b`'s entries sorted
+/// by key hash. Scratch outside the collected heap; when it cannot be
+/// had, a scan of `b` per entry of `a`.
+fn sortedByHash(a: Value, b: Value) bool {
+    const is_map = a.kind() == .sorted_map;
+    const items = std.heap.smp_allocator.alloc(Hashed, sorted.count(b)) catch return sortedByScan(a, b);
+    defer std.heap.smp_allocator.free(items);
+    var ib = sorted.Iter.init(b, true);
+    for (items) |*slot| {
+        const e = ib.next().?;
+        slot.* = .{ .hash = hashValue(e.key), .entry = e };
+    }
+    std.mem.sortUnstable(Hashed, items, {}, hashedLess);
+    var ia = sorted.Iter.init(a, true);
+    outer: while (ia.next()) |x| {
+        const hx = hashValue(x.key);
+        var i = std.sort.lowerBound(Hashed, items, hx, hashedOrder);
+        while (i < items.len and items[i].hash == hx) : (i += 1) {
+            const y = items[i].entry;
+            if (equal(x.key, y.key)) {
+                if (is_map and !equal(x.value, y.value)) return false;
+                continue :outer;
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+fn sortedByScan(a: Value, b: Value) bool {
+    const is_map = a.kind() == .sorted_map;
+    var ia = sorted.Iter.init(a, true);
+    outer: while (ia.next()) |x| {
+        var ib = sorted.Iter.init(b, true);
+        while (ib.next()) |y| if (equal(x.key, y.key)) {
+            if (is_map and !equal(x.value, y.value)) return false;
+            continue :outer;
+        };
+        return false;
+    }
+    return true;
 }
 
 /// A list against a vector: one streaming walk over both.

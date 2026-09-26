@@ -1727,6 +1727,53 @@ test "integration: hash-map / hash-set" {
     try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
 }
 
+// =============================================================================
+// Sorted collections (docs/SORTED.md)
+// =============================================================================
+
+test "sorted collections: construction, printing and the predicates" {
+    try expectOutput("[(sorted-map :c 3 :a 1 :b 2) (sorted-set 3 1 2 1) (sorted-map) (sorted-set) (sorted-map-by > 1 :a 3 :c 2 :b) (sorted-set-by > 1 3 2)]", "[{:a 1, :b 2, :c 3} #{1 2 3} {} #{} {3 :c, 2 :b, 1 :a} #{3 2 1}]");
+    try expectOutput("(pr-str (sorted-map \"b\" [2] \"a\" #{1}))", "{\"a\" #{1}, \"b\" [2]}");
+    try expectOutput("[(sorted? (sorted-map)) (sorted? {}) (sorted? (sorted-set)) (sorted? []) (map? (sorted-map)) (set? (sorted-set)) (coll? (sorted-set)) (associative? (sorted-map)) (associative? (sorted-set)) (reversible? (sorted-map)) (reversible? []) (reversible? '(1)) (reversible? {}) (counted? (sorted-set)) (ifn? (sorted-map)) (sequential? (sorted-set)) (seqable? (sorted-map))]", "[true false true false true true true true false true true false false true true false true]");
+    try expectOutput("(try (sorted-map 1) (catch :arity-mismatch e :odd))", ":odd");
+}
+
+test "sorted collections: every collection function reads and updates them in order" {
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a 2 :b)] [(assoc m 0 :z) (assoc m 4 :d 0 :z) (dissoc m 2) (dissoc m 1 3 9) (get m 1) (get m 9 :none) (contains? m 3) (contains? m 4) (find m 2) (find m 7) (count m) (empty? m) (empty? (sorted-map))])", "[{0 :z, 1 :a, 2 :b, 3 :c} {0 :z, 1 :a, 2 :b, 3 :c, 4 :d} {1 :a, 3 :c} {2 :b} :a :none true false [2 :b] nil 3 false true]");
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a 2 :b)] [(keys m) (vals m) (first m) (second m) (last m) (seq m) (rest m) (next m) (seq (sorted-map)) (keys (sorted-map)) (m 3) (m 9 :d) (:k (sorted-map :k 1)) (:q (sorted-map :k 1) :d)])", "[(1 2 3) (:a :b :c) [1 :a] [2 :b] [3 :c] ([1 :a] [2 :b] [3 :c]) ([2 :b] [3 :c]) ([2 :b] [3 :c]) nil nil :c :d 1 :d]");
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a)] [(conj m [2 :b]) (conj m {0 :z} [4 :d]) (conj m (sorted-map 9 :i)) (conj m nil) (into m {5 :e}) (into {} m) (empty m) (sorted? (empty m)) (merge m {0 :z}) (merge {0 :z} m) (update m 1 name) (assoc-in m [9 :x] 1) (select-keys m [3 7]) (zipmap (keys m) (vals m))])", "[{1 :a, 2 :b, 3 :c} {0 :z, 1 :a, 3 :c, 4 :d} {1 :a, 3 :c, 9 :i} {1 :a, 3 :c} {1 :a, 3 :c, 5 :e} {1 :a, 3 :c} {} true {0 :z, 1 :a, 3 :c} {0 :z, 1 :a, 3 :c} {1 a, 3 :c} {1 :a, 3 :c, 9 {:x 1}} {3 :c} {1 :a, 3 :c}]");
+    try expectOutput("(let [s (sorted-set 5 1 3)] [(conj s 2) (conj s 0 9) (disj s 3) (disj s 1 5 7) (contains? s 5) (get s 1) (get s 2) (s 3) (s 4) (seq s) (into s [0 9]) (count s) (first s) (last s) (empty s) (set s) (vec s)])", "[#{1 2 3 5} #{0 1 3 5 9} #{1 5} #{3} true 1 nil 3 nil (1 3 5) #{0 1 3 5 9} 3 1 5 #{} #{1 3 5} [1 3 5]]");
+    try expectOutput("(let [{:keys [a b]} (sorted-map :b 2 :a 1) [x y] (seq (sorted-set 9 8))] [a b x y (reduce + (sorted-set 1 2 3)) (reduce-kv (fn [acc k v] (conj acc k v)) [] (sorted-map 2 :b 1 :a)) (into [] (sorted-map 2 :b 1 :a)) (map inc (sorted-set 3 1)) (apply + (sorted-set 1 2)) (sort (sorted-set 3 1 2)) (frequencies (sorted-set 1 2)) (filter even? (sorted-set 4 1 2)) (update-vals (sorted-map 1 1) inc) (reverse (sorted-set 1 2 3)) `(~@(sorted-set 2 1))])", "[1 2 8 9 6 [1 :a 2 :b] [[1 :a] [2 :b]] (2 4) 3 (1 2 3) {1 1, 2 1} (2 4) {1 2} (3 2 1) (1 2)]");
+    // A replaced value keeps the key object the map holds, as Clojure's.
+    try expectOutput("(let [m (assoc (sorted-map 1 :a) 1.0 :b)] [m (count m) (key (first m))])", "[{1 :b} 1 1]");
+}
+
+test "sorted collections: = and hash agree with the hash collections, whatever the order" {
+    try expectOutput("[(= (sorted-map 1 2 3 4) {3 4 1 2}) (= {3 4 1 2} (sorted-map 1 2 3 4)) (= (hash (sorted-map 1 2 3 4)) (hash {1 2 3 4})) (= (sorted-set 1 2) #{2 1}) (= (hash (sorted-set 1 2)) (hash #{1 2})) (= (sorted-map-by > 1 2 3 4) (sorted-map 3 4 1 2)) (= (sorted-map 1 2) (sorted-map 1 3)) (= (sorted-set 1) (sorted-map 1 1)) (= (sorted-set) #{}) (= (sorted-map) {}) (= (sorted-set) {}) (contains? #{(sorted-set 1 2)} #{1 2}) (get {(sorted-map :a 1) :found} {:a 1}) (= [(sorted-set 1)] [#{1}])]", "[true true true true true true false false true true false true :found true]");
+}
+
+test "sorted collections: a comparator orders them, coerced as Clojure coerces a function" {
+    try expectOutput("[(sorted-set-by (fn [a b] (- b a)) 1 5 3) (sorted-set-by (comparator <) 3 1 2) (sorted-set-by < 3 1 2) (sorted-map-by compare :b 1 :a 2) (sorted-set-by (fn [a b] (compare (count a) (count b))) [1 2] [3 4] [5]) (sorted-set-by (fn [a b] 0.5) 1 2 3) (sorted-set-by (fn [a b] -0.5) 1 2) (sorted-set-by (fn [a b] (compare (:n a) (:n b))) {:n 2} {:n 1})]", "[#{5 3 1} #{1 2 3} #{1 2 3} {:a 2, :b 1} #{[5] [1 2]} #{1} #{1} #{{:n 1} {:n 2}}]");
+    // A comparator keeps its order through every update and `empty`.
+    try expectOutput("(let [s (sorted-set-by > 1 2)] [(conj s 3) (disj (conj s 0) 2) (into (empty s) [5 7 6]) (assoc (sorted-map-by > 1 :a) 2 :b)])", "[#{3 2 1} #{1 0} #{7 6 5} {2 :b, 1 :a}]");
+}
+
+test "sorted collections: an incomparable key, a bad comparator result and a comparator's throw are errors" {
+    try expectOutput("[(try (sorted-map 1 :a :b 2) (catch :kind-mismatch e :km)) (try (assoc (sorted-map 1 2) \"x\" 3) (catch :kind-mismatch e :km)) (try (get (sorted-map 1 2) :k) (catch :kind-mismatch e :km)) (try (:k (sorted-map 1 2)) (catch :kind-mismatch e :km)) (try (contains? (sorted-set 1) \"s\") (catch :kind-mismatch e :km)) (try (sorted-set '(1) '(2)) (catch :kind-mismatch e :km)) (count (sorted-set '(1)))]", "[:km :km :km :km :km :km 1]");
+    try expectOutput("[(try (sorted-set-by (fn [a b] :x) 1 2) (catch :kind-mismatch e :km)) (try (sorted-set-by (fn [a b] (throw :boom)) 1 2) (catch :boom e :caught)) (try (transient (sorted-map)) (catch :kind-mismatch e :km)) (try (nth (sorted-set 1) 0) (catch :kind-mismatch e :km)) (try (peek (sorted-set 1)) (catch :kind-mismatch e :km))]", "[:km :caught :km :km :km]");
+}
+
+test "sorted collections: subseq, rsubseq and rseq" {
+    try expectOutput("(let [s (sorted-set 1 2 3 4 5 6)] [(subseq s > 3) (subseq s >= 3) (subseq s < 3) (subseq s <= 3) (subseq s > 2 < 5) (subseq s >= 2 <= 5) (subseq s > 3.5) (subseq s > 6) (subseq (sorted-set) < 1)])", "[(4 5 6) (3 4 5 6) (1 2) (1 2 3) (3 4) (2 3 4 5) (4 5 6) nil nil]");
+    try expectOutput("(let [s (sorted-set 1 2 3 4 5 6)] [(rsubseq s < 3) (rsubseq s <= 3) (rsubseq s > 4) (rsubseq s >= 4) (rsubseq s > 1 < 5) (rsubseq s >= 1 <= 5) (rsubseq s < 1)])", "[(2 1) (3 2 1) (6 5) (6 5 4) (4 3 2) (5 4 3 2 1) nil]");
+    try expectOutput("[(subseq (sorted-map 1 :a 2 :b 3 :c) >= 2) (rsubseq (sorted-map 1 :a 2 :b 3 :c) < 3) (subseq (sorted-set-by > 1 2 3 4) > 2) (subseq (sorted-set 1 2 3) (fn [c z] (= c z)) 2)]", "[([2 :b] [3 :c]) ([2 :b] [1 :a]) (1) nil]");
+    try expectOutput("[(rseq (sorted-set 1 2 3)) (rseq (sorted-map 1 :a 2 :b)) (rseq (sorted-set)) (rseq [1 2 3]) (rseq []) (try (rseq '(1 2)) (catch :kind-mismatch e :km)) (try (subseq [1 2] > 1) (catch :kind-mismatch e :km))]", "[(3 2 1) ([2 :b] [1 :a]) nil (3 2 1) nil :km :km]");
+}
+
+test "sorted collections: metadata rides along, never into = or hash" {
+    try expectOutput("(let [m (with-meta (sorted-map 1 2) {:x 1})] [(meta m) (meta (assoc m 3 4)) (meta (dissoc m 1)) (meta (empty m)) (sorted? m) (= m (sorted-map 1 2)) (= (hash m) (hash {1 2})) (meta (conj (with-meta (sorted-set 1) {:z 1}) 2)) (meta (disj (with-meta (sorted-set-by > 1) {:z 1}) 1)) (meta (sorted-map))])", "[{:x 1} {:x 1} {:x 1} {:x 1} true true true {:z 1} {:z 1} nil]");
+}
+
 test "integration: assoc / dissoc" {
     try expectOutput("(get (assoc {:a 1} :b 2) :b)", "2");
     try expectOutput("(get (assoc nil :x 99) :x)", "99");
@@ -5149,6 +5196,18 @@ test "typed vectors: nexis.simd kernels" {
     });
 }
 
+test "sorted collections: a store round trip through the codec keeps the order; a comparator is unserializable" {
+    try expectOutputProgramWithStore("sorted",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (def r (db/ref conn :s "k"))
+        \\  (with-tx [tx conn] (db/put! tx r {:m (sorted-map "b" 2 "a" 1) :s (sorted-set :z :a/b :c) :c (sorted-map-by compare 2 :b 1 :a)}))
+        \\  (def v (with-read-tx [tx conn] (db/get tx r)))
+        \\  [(:m v) (sorted? (:m v)) (:s v) (sorted? (:s v)) (:c v) (sorted? (:c v)) (assoc (:m v) "c" 3)
+        \\   (try (with-tx [tx conn] (db/put! tx r (sorted-set-by > 1 2))) (catch :unserializable e :unserializable))])
+    , "[{a 1, b 2} true #{:c :z :a/b} true {1 :a, 2 :b} true {a 1, b 2, c 3} :unserializable]");
+}
+
 test "typed vectors: a store round trip through the codec" {
     try expectOutputProgramWithStore("typed-vectors",
         \\(do
@@ -5230,6 +5289,19 @@ test "gc: over a map, the entries a native keeps across its callbacks survive cy
     try expectOutputUnderGc(churn ++ zmap ++ "(let [r (sort-by (fn [e] (churn (key e)) (- (key e))) m)] [(first r) (last r)])", "[[39 39] [0 0]]");
     try expectOutputUnderGc(churn ++ zmap ++ "(let [r (reductions (fn [a e] (churn (key e)) e) m)] [(count r) (reduce + (map val r))])", "[40 780]");
     try expectOutputUnderGc(churn ++ "(defrecord P [a b c]) (count (filter (fn [e] (churn (key e)) true) (->P 1 2 3)))", "3");
+}
+
+/// A comparator that allocates a few kilobytes of garbage per call,
+/// so a cycle runs inside every sorted update and lookup.
+const by = "(defn by [a b] (churn a) (compare a b)) ";
+
+test "gc: sorted collections under a comparator that collects keep every intermediate and entry" {
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (apply sorted-map-by by (interleave (range 40) (map str (range 40))))] [(count m) (first m) (last m) (get m 17) (m 39) (contains? m 40)])", "[40 [0 0] [39 39] 17 39 false]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [s (reduce conj (sorted-set-by by) (range 40))] [(count s) (subseq s > 36) (rsubseq s < 3) (subseq s >= 10 < 13)])", "[40 (37 38 39) (2 1 0) (10 11 12)]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (into (sorted-map-by by) (zipmap (range 30) (map str (range 30))))] [(count m) (last m)])", "[30 [29 29]]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (conj (sorted-map-by by) {1 (str 2) 3 (str 4)} [5 (str 6)] (zipmap (range 10 20) (map str (range 10 20))))] [(count m) (map val (subseq m < 6))])", "[13 (2 4 6)]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (apply sorted-map-by by (range 40))] [(count (apply dissoc m (range 0 40 4))) (select-keys m [0 2 4 6]) (count (apply assoc m (range 100 120)))])", "[10 {0 1, 2 3, 4 5, 6 7} 30]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [s (apply sorted-set-by by (map str (range 30)))] [(count (apply disj s (map str (range 10)))) (first s) (count (into s (map str (range 25 35))))])", "[20 0 35]");
 }
 
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {

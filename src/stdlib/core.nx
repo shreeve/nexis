@@ -654,9 +654,6 @@
 ; shape a map's seq yields.
 (defn map-entry? [x] (and (vector? x) (= 2 (count x))))
 
-; (rseq v) → v's elements last first, nil when empty.
-(defn rseq [v]
-  (seq (reverse v)))
 
 ; (rand-nth coll) → a random element; (shuffle coll) → a vector of
 ; coll's elements in random order.
