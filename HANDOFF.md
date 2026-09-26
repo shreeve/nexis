@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 165/165 steps succeeded; 1252/1252 tests passed
+Build Summary: 167/167 steps succeeded; 1299/1299 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 163 steps. It ran in 63 s wall (256 s
+steps; without it the count is 165 steps. It ran in 63 s wall (256 s
 CPU) from a warm cache on an Apple-silicon Mac shared with other
 builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (619 inline tests) and
@@ -300,23 +300,13 @@ failing test (AGENTS.md).
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-2. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
-   `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
-   `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
-   rule plus an `eval_pipeline` case.
-3. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
-   is `MalformedMacroCall` ("options come in pairs"). Next: in
-   `expand.zig`'s require walk, expand a spec whose second element is
-   a symbol or vector into one spec per suffix, and add the row to
-   `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
-   namespaces through one prefix.
-4. **Small Clojure differences**: `(int x)` of NaN is
-   `:invalid-argument` (Clojure returns 0); `counted?` is false for a
-   transient (Clojure's transient collections are counted);
-   `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
-   `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
-   `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-5. **A routine holds at most 4096 live locals and 4096 captured
+2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
+   design question, so an amendment comes first.
+3. **Float `/` by zero is IEEE** (`docs/SEMANTICS.md` §2.2): `(/ 1.0
+   0.0)` is `##Inf` where Clojure raises `ArithmeticException`. A
+   decision for the owner: Clojure's rule is one arm of `numDiv` and
+   the `numbers`/`eval_pipeline` rows that pin IEEE.
+4. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
@@ -329,43 +319,10 @@ failing test (AGENTS.md).
 
 ### 6.2 Nextomic
 
-1. **Two connections to one file in one process** share the file's
-   environment, but their db-values at one basis are unequal:
-   equality is by connection.
-2. **Retracting an attribute's `:db/ident` is accepted** and leaves
-   the name live: `[?e :db/ident :u/n]` finds nothing afterwards, yet
-   `:u/n` still reads and writes the attribute. Next: refuse it with
-   `:nextomic/schema` in `transact.zig`'s check step (or retire the
-   name through the minter), a `docs/NEXTOMIC.md` §3 row and a
-   `test/nextomic` case.
-3. **A late `:db/index true` backfills AVET history from current
-   datoms only**: `index-range` over `history` misses a value
-   retracted before the attribute was indexed, which EAVT history
-   still holds. Next: backfill `nx/avet-h` from the attribute's AEVT
-   history, or state in `docs/NEXTOMIC.md` §3 that history AVET starts
-   at the indexing `t`.
-4. **Concurrent writers must share a version**: a connection's schema
-   cache trusts the `sys` counter `"sg"`, which a build older than it
-   does not bump, so a process of an older build that alters schema
-   while a newer one has the file open leaves the newer one enforcing
-   the old schema. Sequential use across versions is fine. Next:
-   state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
-   unchanged but `t` advanced, check the txlog entries in between for
-   attribute-partition datoms.
-5. **Small**: a `:db.fn/cas` old value that is an unseen keyword
-   mints it (`transact.zig` resolves the old value with `.assert`;
-   `.match` would refuse it without a write), harmless but a stray
-   ident; the arg-map form of `q` refuses Datomic's `:timeout` and
-   `:io-context` keys with `:nextomic/query-syntax` where ignoring them
-   would port more code (an owner's call); the refusal of a
-   `get-else` on a card-many attribute carries no `:clause`.
-6. **The planner's join estimates** come from `treeStat` and
+1. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-7. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
-   tokens. Case folding needs a table and a rebuild of `nx/fulltext`
-   at open.
-8. **No datom heap kind**: reads return `[e a v t added]` vectors.
+2. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

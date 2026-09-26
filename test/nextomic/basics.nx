@@ -15,6 +15,15 @@
 (t/check "fresh store is at the bootstrap basis" (= 1 (d/basis-t (d/db c))))
 (t/check "db-values are values" (= (d/db c) (d/db c)))
 (t/check "a db-value is not its history view" (not= (d/db c) (d/history (d/db c))))
+; Two connections to one file read one database: their db-values at
+; one basis and mode are equal, and hash alike.
+(d/with-conn [again "basics.edb"]
+  (t/check "db-values of two connections to one file are equal"
+         (and (= (d/db c) (d/db again)) (= (hash (d/db c)) (hash (d/db again)))
+              (= (d/as-of (d/db c) 1) (d/as-of (d/db again) 1))
+              (not= (d/db c) (d/history (d/db again)))
+              (= #{(d/db c)} #{(d/db again)})
+              (= (d/entity (d/db c) :db/ident) (d/entity (d/db again) :db/ident)))))
 
 ; Schema install is an ordinary transaction of attribute entities.
 (def schema-report
@@ -199,6 +208,11 @@
 (t/check "a lookup ref names an identity asserted after it" (= 7 (:person/age (d/entity (d/db c) [:person/email "new@example.com"]))))
 (println (t/caught (d/transact! c [[:db/add x :person/email "y2@example.com"] [:db/add y :person/email "x2@example.com"]])))
 (println (t/caught (d/transact! c [[:db/add x :person/email "x2@example.com"] [:db/add x :person/age 1]])))
+
+; A sorted map is an entity map like any other.
+(d/transact! c [{:db/ident :srt/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+(d/transact! c [(sorted-map :srt/n 42)])
+(println :sorted-entity (d/q '[:find ?n . :where [_ :srt/n ?n]] (d/db c)))
 
 (d/release c)
 (println :basics-done)

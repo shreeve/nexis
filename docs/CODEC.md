@@ -17,7 +17,8 @@ the format is frozen (§9).
 **In.** The data kinds `nil`, `false_`, `true_`, `char`, `fixnum`,
 `float`, `keyword`, `symbol`, `string`, `bignum`, `list`,
 `persistent_vector`, `persistent_map`, `persistent_set` and
-`typed_vector`, nested to any depth (§2.7).
+`typed_vector`, and `sorted_map` and `sorted_set` in the natural order
+(§2.8), nested to any depth (§2.7).
 `encode: Value → []u8`, `decode: []u8 → Value`, behind a version
 envelope, with the round-trip laws of §4.
 
@@ -46,8 +47,10 @@ envelope, with the round-trip laws of §4.
 
 The envelope appears exactly once, at the outermost frame; elements,
 keys and values inside a container carry only their per-kind encoding.
-A major version marks a breaking change, a minor one an additive
-change (a new kind, a new optional subformat). The format is 1.0.
+A major version marks a breaking change, a minor one a new optional
+subformat. The format is 1.0. A new kind byte is additive without a
+version change: a reader that predates it refuses the byte as
+`InvalidKindByte`, never misreads it.
 
 **Per-kind `ValueEncoding`**, kind byte first (the `Kind` number of
 VALUE.md §2):
@@ -69,6 +72,8 @@ VALUE.md §2):
 | `persistent_vector` (20) | `[20] [unsigned LEB128 count] [element × count]` |
 | `list` (21) | `[21] [unsigned LEB128 count] [element × count]` |
 | `typed_vector` (23) | `[23] [elem: u8 ∈ {1 = i64, 3 = f64}] [unsigned LEB128 count] [u64 LE × count]`: i64 as two's-complement bits, f64 as canonical IEEE bits (`docs/TYPED_VECTOR.md` §4) |
+| `sorted_map` (41) | `[41] [unsigned LEB128 count] [(key, value) × count]`, keys ascending (§2.8) |
+| `sorted_set` (42) | `[42] [unsigned LEB128 count] [element × count]`, ascending (§2.8) |
 
 #### 2.1 Varints and bounds
 
@@ -149,6 +154,18 @@ list and vector being decoded share one scratch stack, which grows by
 one per element actually decoded: nested headers that each claim the
 rest of the input cost nothing until the input runs out.
 
+#### 2.8 Sorted maps and sets
+
+A sorted map or set in the natural order (`docs/SORTED.md` §6) is
+written in ascending order, so its bytes are canonical: two equal
+natural-order collections encode alike, and a re-encode is
+byte-stable. Decode checks that each key orders strictly after the one
+before it, then builds the balanced tree bottom-up in O(n); keys out
+of order, repeated, or with no natural order between them are
+`MalformedPayload`. A collection of one entry holds any key, since
+nothing is compared. A sorted collection with a comparator of its own
+is `UnserializableKind`: the comparator is code.
+
 ---
 
 ### 3. Serializability by kind
@@ -157,6 +174,7 @@ rest of the input cost nothing until the input runs out.
 |---|---|---|
 | `nil` `false_` `true_` `char` `fixnum` `float` `keyword` `symbol` (0–7) | yes | |
 | `string` (16), `bignum` (17), `persistent_map` (18), `persistent_set` (19), `persistent_vector` (20), `list` (21), `typed_vector` (23) | yes | |
+| `sorted_map` (41), `sorted_set` (42) | in the natural order | A comparator of its own is code (§2.8). |
 | `function` (24), `native_fn` (30) | no | Code, upvalues and VM state are process-local. |
 | `var_` (25) | no | An identity with process-local mutation; store its value instead. |
 | `durable_ref` (26) | no | A ref names a connection only its own process has (`docs/DB.md` §9). |
@@ -170,7 +188,7 @@ rest of the input cost nothing until the input runs out.
 Encoding any kind marked no is `UnserializableKind`. Decoding a kind byte that names a heap kind
 outside the set (every "no" row above) is `UnserializableKind` too;
 a byte that names no kind (the reserved immediates 8–15, the reserved
-heap bytes 41–63, the runtime-private sentinels 64 and up) is
+heap bytes 43–63, the runtime-private sentinels 64 and up) is
 `InvalidKindByte`. No silent stubs, no lossy round trips.
 
 **At the language level** (`db.failureName`, `docs/DB.md` §8)
@@ -188,7 +206,7 @@ For every value `v` of the serializable set:
 ```
 (= v (decode (encode v)))                     structural equality
 (= (hash v) (hash (decode (encode v))))       hash preservation
-(encode v) == (encode (decode (encode v)))    byte-stable re-encode, for every kind but map and set (§2.5)
+(encode v) == (encode (decode (encode v)))    byte-stable re-encode, for every kind but the hash map and set (§2.5)
 ```
 
 This is the codec gate property, run by `test/prop/codec.zig` (§7).
@@ -230,7 +248,9 @@ the collection modules it walks.
 
 ### 7. Testing
 
-The inline tests in `src/codec.zig` cover each kind's round trip, the
+The inline tests in `src/codec.zig` cover each kind's round trip (a
+sorted map and set among them, with the refusal of a comparator and of
+keys out of order), the
 envelope, truncation, trailing bytes, malformed LEB128, surrogate
 chars, every one of the 256 kind bytes outside the set
 (`UnserializableKind` or `InvalidKindByte` as §3 says), a transient on
@@ -239,7 +259,8 @@ nothing allocated), a value 200 000 levels deep round-tripping byte
 for byte, 200 000 levels of input of each container kind decoding,
 and the leniency of §2.6.
 
-`test/prop/codec.zig`: **C1** 100 000 random values of every
+`test/prop/sorted.zig` P8 round-trips random natural-order sorted maps
+and sets, byte-stable. `test/prop/codec.zig`: **C1** 100 000 random values of every
 serializable kind, nested up to depth 4, round-trip equal with equal
 hashes; **C2** re-encode is byte-equal for every kind but map and set;
 **C3** a transient is `UnserializableKind`; **C4** 1 000 random byte

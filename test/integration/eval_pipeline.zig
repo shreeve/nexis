@@ -330,7 +330,9 @@ test "metadata: a seq view of a vector takes it without copying, and its rest do
 
 test "metadata: a record carries it through assoc and dissoc; kinds that cannot carry it are :kind-mismatch" {
     try expectOutput("(defrecord P [x y]) (let [p (with-meta (->P 1 2) {:m 1})] [(meta p) p (= p (->P 1 2)) (meta (assoc p :x 3)) (meta (dissoc p :z)) (meta (assoc p :z 3)) (meta (->P 1 2)) (meta (with-meta p nil))])", "[{:m 1} #user.P{:x 1, :y 2} true {:m 1} {:m 1} {:m 1} nil nil]");
-    try expectOutput("[(try (with-meta (atom 1) {}) (catch any e e)) (try (with-meta (i64-vector [1]) {}) (catch any e e)) (try (with-meta inc {}) (catch any e e)) (try (with-meta (transient []) {}) (catch any e e)) (meta (atom 1))]", "[:kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch nil]");
+    try expectOutput("[(try (with-meta (atom 1) {}) (catch any e e)) (try (with-meta inc {}) (catch any e e)) (try (with-meta (transient []) {}) (catch any e e)) (meta (atom 1))]", "[:kind-mismatch :kind-mismatch :kind-mismatch nil]");
+    // A typed vector carries it, as Clojure's vector-of does.
+    try expectOutput("(let [v (i64-vector [1 2]) m (with-meta v {:k 1})] [(meta m) (meta v) (= m v) (= (hash m) (hash v)) m (meta (with-meta m nil)) (meta (vary-meta (f64-vector [0.5]) assoc :f 2))])", "[{:k 1} nil true true #i64[1 2] nil {:f 2}]");
 }
 
 test "metadata: hints in binding positions are dropped, ^meta on a collection literal is its metadata" {
@@ -1421,13 +1423,42 @@ test "integration: core.nx predicates" {
     // int? and its kin are Java's long range, as Clojure's (a Long, not a BigInt).
     try expectOutput("[(int? 140737488355328) (int? 9223372036854775807) (int? 9223372036854775808) (int? -9223372036854775808) (int? -9223372036854775809) (pos-int? 9223372036854775808) (nat-int? 99999999999999999999) (neg-int? -99999999999999999999)]", "[true true false true false false false false]");
     try expectOutput("[(seqable? nil) (seqable? \"s\") (seqable? 1) (counted? [1]) (counted? \"s\") (record? {}) (ex-cause (ex-info \"m\" {} :c))]", "[true true false true false false :c]");
+    // A transient is counted, as Clojure's are.
+    try expectOutput("[(counted? (transient [])) (counted? (transient {})) (counted? (transient #{})) (counted? nil) (counted? '(1)) (counted? (i64-vector [1]))]", "[true true true false true true]");
+    try expectOutput("[(indexed? []) (indexed? (f64-vector [1.0])) (indexed? '()) (indexed? \"a\") (indexed? nil) (indexed? {})]", "[true true false false false false]");
+    // A map entry is a two-element vector.
+    try expectOutput("[(map-entry? (first {:a 1})) (map-entry? [1 2]) (map-entry? [1]) (map-entry? '(1 2)) (map-entry? nil)]", "[true true false false false]");
+}
+
+test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
+    try expectOutput("[(nfirst [[1 2 3] 4]) (nfirst nil) (nfirst [[1]])]", "[(2 3) nil nil]");
+    try expectOutput("(tree-seq seq? identity '((1 2 (3)) (4)))", "(((1 2 (3)) (4)) (1 2 (3)) 1 2 (3) 3 (4) 4)");
+    try expectOutput("[(tree-seq map? vals {:a {:b 1} :c 2}) (tree-seq vector? seq []) (tree-seq vector? seq 1)]", "[({:a {:b 1}, :c 2} {:b 1} 1 2) ([]) (1)]");
+    try expectOutput("(try (tree-seq nil nil 1) (catch any e e))", ":not-callable");
+    // Deep trees walk without the native stack.
+    try expectOutput("(count (tree-seq vector? seq (reduce (fn [t _] [t]) 0 (range 100000))))", "100001");
+    try expectOutput("[(replace {1 :a 2 :b} [1 2 3]) (replace {1 :a} '(1 2 1)) (replace [:a :b] [0 1 0 5]) (replace {} nil) (replace {1 2} #{1 3}) (meta (replace {} ^:m [1]))]", "[[:a :b 3] (:a 2 :a) [:a :b :a 5] () (2 3) {:m true}]");
+    try expectOutput("[(bounded-count 2 [1 2 3 4]) (bounded-count 2 \"abcd\") (bounded-count 10 \"ab\") (bounded-count 2 nil) (bounded-count 2 '(1 2 3))]", "[4 2 2 0 3]");
+    try expectOutput("[(random-sample 0 [1 2 3]) (random-sample 1 [1 2 3]) (every? #{1 2 3} (random-sample 0.5 [1 2 3]))]", "[() (1 2 3) true]");
+}
+
+test "core: partitionv, partitionv-all, splitv-at" {
+    try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
+    try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
+    try expectOutput("[(splitv-at 2 [1 2 3 4]) (splitv-at 2 '(1)) (vector? (first (splitv-at 1 '(1 2))))]", "[[[1 2] (3 4)] [[1] ()] true]");
 }
 
 test "integration: char and int conversion, parse-long, parse-double, parse-boolean" {
     try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
     // int checks Java's 32-bit int range, as Clojure's cast does.
     try expectOutput("[(int 2147483647) (int -2147483648) (int -3.9) (int -2147483647.9)]", "[2147483647 -2147483648 -3 -2147483647]");
-    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 (/ 0.0 0.0)])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    // NaN casts to 0, as Java's (int) and Clojure's int make it.
+    try expectOutput("[(int ##NaN) (short ##NaN) (byte ##NaN)]", "[0 0 0]");
+    // short and byte check their Java ranges the same way.
+    try expectOutput("[(byte 127) (byte -128) (byte 1.9) (byte \\a) (short 32767) (short -32768) (short -1.5) (short \\a)]", "[127 -128 1 97 32767 -32768 -1 97]");
+    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 127.5 -128.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
+    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32767.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
     try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
@@ -1519,6 +1550,77 @@ test "integration: identity kinds are = only to themselves, and two of them hash
         \\(nextomic/release n)
         \\seen
     , "[true true true true false true true]");
+}
+
+test "integration: delay, force, realized?, delay?" {
+    try expectOutput("(let [n (atom 0) d (delay (swap! n inc) :v)] [(realized? d) (delay? d) @d (realized? d) (force d) @d @n (force 3) (delay? 1)])", "[false true :v true :v :v 1 3 false]");
+    // A throw is cached: the body runs once and every deref rethrows it.
+    try expectOutput("(let [n (atom 0) d (delay (swap! n inc) (throw :boom))] [(try @d (catch any e e)) (try (force d) (catch any e e)) @n (realized? d)])", "[:boom :boom 1 true]");
+    try expectOutput("(let [d (delay nil)] [@d (realized? d) (= d d) (= d (delay nil))])", "[nil true true false]");
+    try expectOutput("[(try (realized? 1) (catch any e e)) (try (realized? nil) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutputUnderGc("(let [ds (mapv (fn [i] (delay (vec (range i)))) (range 50))] (reduce + (map (comp count deref) ds)))", "1225");
+}
+
+test "integration: with-open closes each binding in reverse order, through Closeable" {
+    try expectOutput(
+        \\(def log (atom []))
+        \\(defrecord R [n] Closeable (close [_] (swap! log conj n)))
+        \\[(with-open [a (->R 1) b (->R 2)] (swap! log conj :body) :result) @log
+        \\ (try (with-open [c (->R 3)] (throw :boom)) (catch any e e)) @log (with-open [] 7)]
+    , "[:result [:body 2 1] :boom [:body 2 1 3] 7]");
+    try expectOutput("(try (with-open [a 1] 2) (catch any e e))", ":no-protocol-impl");
+    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", ":macro-expansion-failure");
+    try expectOutputProgramWithStore("with-open-conns",
+        \\(def c (with-open [c (db/open "@STORE@")] c))
+        \\(def n (with-open [n (nextomic/connect "@STORE@.nextomic")] n))
+        \\[(try (db/begin-read c) (catch any e e)) (try (nextomic/db n) (catch any e (or (:error e) e)))]
+    , "[:db-closed :nextomic/closed]");
+}
+
+test "integration: tap> calls every tap, and a tap that throws is ignored" {
+    try expectOutput(
+        \\(def seen (atom []))
+        \\(defn t1 [x] (swap! seen conj [:t1 x]))
+        \\(defn t2 [x] (throw :bad))
+        \\[(tap> 0) (add-tap t1) (add-tap t2) (tap> 1) (remove-tap t1) (tap> 2) @seen (remove-tap t2)]
+    , "[true nil nil true nil true [[:t1 1]] nil]");
+}
+
+test "integration: class, type, instance?, var?, special-symbol?" {
+    try expectOutput("(map class [nil true false \\a 1 99999999999999999999 1.5 :k 'x \"s\" '(1) [1] {:a 1} #{1} (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc])", "(nil :boolean :boolean :char :fixnum :bignum :float :keyword :symbol :string :list :vector :map :set :typed_vector :function :native_fn :atom :transient :var_)");
+    // A record's type is the symbol it prints with; :type metadata is type's.
+    try expectOutput("(defrecord P [x]) [(class (->P 1)) (type (->P 1)) (symbol? (type (->P 1))) (type (with-meta [1] {:type :point})) (class (with-meta [1] {:type :point})) (type (with-meta (->P 1) {:type :q}))]", "[user.P user.P true :point :vector :q]");
+    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true :kind-mismatch]");
+    try expectOutput("(def x 1) [(var? #'x) (var? x) (var? 'x) (var? (resolve 'inc))]", "[true false false true]");
+    try expectOutput("(map special-symbol? '[if def let* fn* loop* letfn* quote var recur try catch finally throw do set! & let fn nexis.core/if])", "(true true true true true true true true true true true true true true true true false false false)");
+    try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
+}
+
+const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
+
+test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, all-ns, ns-publics, ns-interns" {
+    try expectOutputWithFiles(&.{apputil},
+        \\(ns user (:require [app.util :as u :refer [x]]))
+        \\[(the-ns 'app.util) (find-ns 'app.util) (find-ns 'nope) (ns-name 'user) (try (the-ns 'nope) (catch any e e))
+        \\ (ns-publics 'app.util) (ns-interns 'app.util) (contains? (ns-publics 'user) 'x) (get (ns-publics 'nexis.core) 'inc)
+        \\ (every? symbol? (all-ns)) (boolean (some #{'app.util} (all-ns))) (try (find-ns "user") (catch any e e))]
+    , "[app.util app.util nil user :no-such-namespace {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true :kind-mismatch]");
+}
+
+test "integration: resolve and ns-resolve name a Var through the namespace's names" {
+    try expectOutputWithFiles(&.{apputil},
+        \\(ns user (:require [app.util :as u :refer [x]] [nexis.string :as s]))
+        \\(def own 2)
+        \\[(resolve 'first) (resolve 'x) (resolve 'u/x) (resolve 'app.util/x) (resolve 's/join) (resolve 'own) (resolve 'nope) (resolve 'nope/x) (resolve 'u/nope)
+        \\ (ns-resolve 'app.util 'x) (ns-resolve 'app.util 'own) (ns-resolve 'app.util 'inc) (resolve 'when) (@(resolve 'inc) 1)
+        \\ (try (resolve "x") (catch any e e)) (try (ns-resolve 'nope 'x) (catch any e e))]
+    , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 :kind-mismatch :no-such-namespace]");
+}
+
+test "integration: a UUID is its canonical string" {
+    try expectOutput("(let [u (random-uuid)] [(uuid? u) (string? u) (count u) (subs u 14 15) (contains? #{\\8 \\9 \\a \\b} (nth u 19)) (= u (parse-uuid u)) (not= u (random-uuid))])", "[true true 36 4 true true true]");
+    try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[\"0123abcd-4567-89ef-0123-456789abcdef\" nil nil nil nil]");
+    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[true false false false :kind-mismatch :kind-mismatch]");
 }
 
 test "integration: in-ns switches the namespace the next forms compile in" {
@@ -1623,6 +1725,53 @@ test "integration: hash-map / hash-set" {
     // hash-map iteration order is unspecified (HAMT); test via count + get
     try expectOutput("(count (hash-map :a 1 :b 2 :c 3))", "3");
     try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
+}
+
+// =============================================================================
+// Sorted collections (docs/SORTED.md)
+// =============================================================================
+
+test "sorted collections: construction, printing and the predicates" {
+    try expectOutput("[(sorted-map :c 3 :a 1 :b 2) (sorted-set 3 1 2 1) (sorted-map) (sorted-set) (sorted-map-by > 1 :a 3 :c 2 :b) (sorted-set-by > 1 3 2)]", "[{:a 1, :b 2, :c 3} #{1 2 3} {} #{} {3 :c, 2 :b, 1 :a} #{3 2 1}]");
+    try expectOutput("(pr-str (sorted-map \"b\" [2] \"a\" #{1}))", "{\"a\" #{1}, \"b\" [2]}");
+    try expectOutput("[(sorted? (sorted-map)) (sorted? {}) (sorted? (sorted-set)) (sorted? []) (map? (sorted-map)) (set? (sorted-set)) (coll? (sorted-set)) (associative? (sorted-map)) (associative? (sorted-set)) (reversible? (sorted-map)) (reversible? []) (reversible? '(1)) (reversible? {}) (counted? (sorted-set)) (ifn? (sorted-map)) (sequential? (sorted-set)) (seqable? (sorted-map))]", "[true false true false true true true true false true true false false true true false true]");
+    try expectOutput("(try (sorted-map 1) (catch :arity-mismatch e :odd))", ":odd");
+}
+
+test "sorted collections: every collection function reads and updates them in order" {
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a 2 :b)] [(assoc m 0 :z) (assoc m 4 :d 0 :z) (dissoc m 2) (dissoc m 1 3 9) (get m 1) (get m 9 :none) (contains? m 3) (contains? m 4) (find m 2) (find m 7) (count m) (empty? m) (empty? (sorted-map))])", "[{0 :z, 1 :a, 2 :b, 3 :c} {0 :z, 1 :a, 2 :b, 3 :c, 4 :d} {1 :a, 3 :c} {2 :b} :a :none true false [2 :b] nil 3 false true]");
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a 2 :b)] [(keys m) (vals m) (first m) (second m) (last m) (seq m) (rest m) (next m) (seq (sorted-map)) (keys (sorted-map)) (m 3) (m 9 :d) (:k (sorted-map :k 1)) (:q (sorted-map :k 1) :d)])", "[(1 2 3) (:a :b :c) [1 :a] [2 :b] [3 :c] ([1 :a] [2 :b] [3 :c]) ([2 :b] [3 :c]) ([2 :b] [3 :c]) nil nil :c :d 1 :d]");
+    try expectOutput("(let [m (sorted-map 3 :c 1 :a)] [(conj m [2 :b]) (conj m {0 :z} [4 :d]) (conj m (sorted-map 9 :i)) (conj m nil) (into m {5 :e}) (into {} m) (empty m) (sorted? (empty m)) (merge m {0 :z}) (merge {0 :z} m) (update m 1 name) (assoc-in m [9 :x] 1) (select-keys m [3 7]) (zipmap (keys m) (vals m))])", "[{1 :a, 2 :b, 3 :c} {0 :z, 1 :a, 3 :c, 4 :d} {1 :a, 3 :c, 9 :i} {1 :a, 3 :c} {1 :a, 3 :c, 5 :e} {1 :a, 3 :c} {} true {0 :z, 1 :a, 3 :c} {0 :z, 1 :a, 3 :c} {1 a, 3 :c} {1 :a, 3 :c, 9 {:x 1}} {3 :c} {1 :a, 3 :c}]");
+    try expectOutput("(let [s (sorted-set 5 1 3)] [(conj s 2) (conj s 0 9) (disj s 3) (disj s 1 5 7) (contains? s 5) (get s 1) (get s 2) (s 3) (s 4) (seq s) (into s [0 9]) (count s) (first s) (last s) (empty s) (set s) (vec s)])", "[#{1 2 3 5} #{0 1 3 5 9} #{1 5} #{3} true 1 nil 3 nil (1 3 5) #{0 1 3 5 9} 3 1 5 #{} #{1 3 5} [1 3 5]]");
+    try expectOutput("(let [{:keys [a b]} (sorted-map :b 2 :a 1) [x y] (seq (sorted-set 9 8))] [a b x y (reduce + (sorted-set 1 2 3)) (reduce-kv (fn [acc k v] (conj acc k v)) [] (sorted-map 2 :b 1 :a)) (into [] (sorted-map 2 :b 1 :a)) (map inc (sorted-set 3 1)) (apply + (sorted-set 1 2)) (sort (sorted-set 3 1 2)) (frequencies (sorted-set 1 2)) (filter even? (sorted-set 4 1 2)) (update-vals (sorted-map 1 1) inc) (reverse (sorted-set 1 2 3)) `(~@(sorted-set 2 1))])", "[1 2 8 9 6 [1 :a 2 :b] [[1 :a] [2 :b]] (2 4) 3 (1 2 3) {1 1, 2 1} (2 4) {1 2} (3 2 1) (1 2)]");
+    // A replaced value keeps the key object the map holds, as Clojure's.
+    try expectOutput("(let [m (assoc (sorted-map 1 :a) 1.0 :b)] [m (count m) (key (first m))])", "[{1 :b} 1 1]");
+}
+
+test "sorted collections: = and hash agree with the hash collections, whatever the order" {
+    try expectOutput("[(= (sorted-map 1 2 3 4) {3 4 1 2}) (= {3 4 1 2} (sorted-map 1 2 3 4)) (= (hash (sorted-map 1 2 3 4)) (hash {1 2 3 4})) (= (sorted-set 1 2) #{2 1}) (= (hash (sorted-set 1 2)) (hash #{1 2})) (= (sorted-map-by > 1 2 3 4) (sorted-map 3 4 1 2)) (= (sorted-map 1 2) (sorted-map 1 3)) (= (sorted-set 1) (sorted-map 1 1)) (= (sorted-set) #{}) (= (sorted-map) {}) (= (sorted-set) {}) (contains? #{(sorted-set 1 2)} #{1 2}) (get {(sorted-map :a 1) :found} {:a 1}) (= [(sorted-set 1)] [#{1}])]", "[true true true true true true false false true true false true :found true]");
+}
+
+test "sorted collections: a comparator orders them, coerced as Clojure coerces a function" {
+    try expectOutput("[(sorted-set-by (fn [a b] (- b a)) 1 5 3) (sorted-set-by (comparator <) 3 1 2) (sorted-set-by < 3 1 2) (sorted-map-by compare :b 1 :a 2) (sorted-set-by (fn [a b] (compare (count a) (count b))) [1 2] [3 4] [5]) (sorted-set-by (fn [a b] 0.5) 1 2 3) (sorted-set-by (fn [a b] -0.5) 1 2) (sorted-set-by (fn [a b] (compare (:n a) (:n b))) {:n 2} {:n 1})]", "[#{5 3 1} #{1 2 3} #{1 2 3} {:a 2, :b 1} #{[5] [1 2]} #{1} #{1} #{{:n 1} {:n 2}}]");
+    // A comparator keeps its order through every update and `empty`.
+    try expectOutput("(let [s (sorted-set-by > 1 2)] [(conj s 3) (disj (conj s 0) 2) (into (empty s) [5 7 6]) (assoc (sorted-map-by > 1 :a) 2 :b)])", "[#{3 2 1} #{1 0} #{7 6 5} {2 :b, 1 :a}]");
+}
+
+test "sorted collections: an incomparable key, a bad comparator result and a comparator's throw are errors" {
+    try expectOutput("[(try (sorted-map 1 :a :b 2) (catch :kind-mismatch e :km)) (try (assoc (sorted-map 1 2) \"x\" 3) (catch :kind-mismatch e :km)) (try (get (sorted-map 1 2) :k) (catch :kind-mismatch e :km)) (try (:k (sorted-map 1 2)) (catch :kind-mismatch e :km)) (try (contains? (sorted-set 1) \"s\") (catch :kind-mismatch e :km)) (try (sorted-set '(1) '(2)) (catch :kind-mismatch e :km)) (count (sorted-set '(1)))]", "[:km :km :km :km :km :km 1]");
+    try expectOutput("[(try (sorted-set-by (fn [a b] :x) 1 2) (catch :kind-mismatch e :km)) (try (sorted-set-by (fn [a b] (throw :boom)) 1 2) (catch :boom e :caught)) (try (transient (sorted-map)) (catch :kind-mismatch e :km)) (try (nth (sorted-set 1) 0) (catch :kind-mismatch e :km)) (try (peek (sorted-set 1)) (catch :kind-mismatch e :km))]", "[:km :caught :km :km :km]");
+}
+
+test "sorted collections: subseq, rsubseq and rseq" {
+    try expectOutput("(let [s (sorted-set 1 2 3 4 5 6)] [(subseq s > 3) (subseq s >= 3) (subseq s < 3) (subseq s <= 3) (subseq s > 2 < 5) (subseq s >= 2 <= 5) (subseq s > 3.5) (subseq s > 6) (subseq (sorted-set) < 1)])", "[(4 5 6) (3 4 5 6) (1 2) (1 2 3) (3 4) (2 3 4 5) (4 5 6) nil nil]");
+    try expectOutput("(let [s (sorted-set 1 2 3 4 5 6)] [(rsubseq s < 3) (rsubseq s <= 3) (rsubseq s > 4) (rsubseq s >= 4) (rsubseq s > 1 < 5) (rsubseq s >= 1 <= 5) (rsubseq s < 1)])", "[(2 1) (3 2 1) (6 5) (6 5 4) (4 3 2) (5 4 3 2 1) nil]");
+    try expectOutput("[(subseq (sorted-map 1 :a 2 :b 3 :c) >= 2) (rsubseq (sorted-map 1 :a 2 :b 3 :c) < 3) (subseq (sorted-set-by > 1 2 3 4) > 2) (subseq (sorted-set 1 2 3) (fn [c z] (= c z)) 2)]", "[([2 :b] [3 :c]) ([2 :b] [1 :a]) (1) nil]");
+    try expectOutput("[(rseq (sorted-set 1 2 3)) (rseq (sorted-map 1 :a 2 :b)) (rseq (sorted-set)) (rseq [1 2 3]) (rseq []) (try (rseq '(1 2)) (catch :kind-mismatch e :km)) (try (subseq [1 2] > 1) (catch :kind-mismatch e :km))]", "[(3 2 1) ([2 :b] [1 :a]) nil (3 2 1) nil :km :km]");
+}
+
+test "sorted collections: metadata rides along, never into = or hash" {
+    try expectOutput("(let [m (with-meta (sorted-map 1 2) {:x 1})] [(meta m) (meta (assoc m 3 4)) (meta (dissoc m 1)) (meta (empty m)) (sorted? m) (= m (sorted-map 1 2)) (= (hash m) (hash {1 2})) (meta (conj (with-meta (sorted-set 1) {:z 1}) 2)) (meta (disj (with-meta (sorted-set-by > 1) {:z 1}) 1)) (meta (sorted-map))])", "[{:x 1} {:x 1} {:x 1} {:x 1} true true true {:z 1} {:z 1} nil]");
 }
 
 test "integration: assoc / dissoc" {
@@ -3444,8 +3593,8 @@ test "defprotocol: registers protocol + method dispatchers" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
-        \\  (str IFoo " " (fn? bar)))
-    , "#<protocol id=0> true");
+        \\  [(nexis.string/starts-with? (str IFoo) "#<protocol id=") (fn? bar)])
+    , "[true true]");
 }
 
 test "protocol dispatch with NO impl raises :no-protocol-impl" {
@@ -4073,14 +4222,43 @@ test "numbers: float literals print like Clojure doubles" {
 }
 
 test "numbers: special floats" {
-    try expectOutput("(/ 1.0 0)", "Infinity");
-    try expectOutput("(/ -1.0 0)", "-Infinity");
-    try expectOutput("(/ 0.0 0.0)", "NaN");
+    try expectOutput("(/ 1.0 0)", "##Inf");
+    try expectOutput("(/ -1.0 0)", "##-Inf");
+    try expectOutput("(/ 0.0 0.0)", "##NaN");
     try expectOutput("(NaN? (/ 0.0 0.0))", "true");
     try expectOutput("(NaN? 1.5)", "false");
     try expectOutput("(infinite? (/ 1.0 0))", "true");
     try expectOutput("(infinite? (/ 1 2))", "false");
     try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+}
+
+test "numbers: the promoting and unchecked operators, num, float, ratio? and rational?" {
+    // Every integer operator promotes, so the ' forms are the same functions.
+    try expectOutput("[(+' 9223372036854775807 1) (+') (*') (-' 1) (-' 1 2 3) (inc' 1.5) (dec' -9223372036854775808) (*' 4294967296 4294967296)]", "[9223372036854775808 0 1 -1 -4 2.5 -9223372036854775809 18446744073709551616]");
+    // The unchecked operators wrap two longs at 64 bits, as Java's do;
+    // a float or an integer beyond 64 bits computes as + does.
+    try expectOutput("[(unchecked-add 9223372036854775807 1) (unchecked-subtract -9223372036854775808 1) (unchecked-multiply 9223372036854775807 2) (unchecked-inc 9223372036854775807) (unchecked-dec -9223372036854775808) (unchecked-negate -9223372036854775808)]", "[-9223372036854775808 9223372036854775807 -2 -9223372036854775808 9223372036854775807 -9223372036854775808]");
+    try expectOutput("[(unchecked-add 1 2) (unchecked-add 1 2.5) (unchecked-add 99999999999999999999 1) (unchecked-multiply 3 -4)]", "[3 3.5 100000000000000000000 -12]");
+    try expectOutput("(try (unchecked-add nil 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil :kind-mismatch]");
+    try expectOutput("[(float 1) (float 0.5) (NaN? (float ##NaN)) (float -3.4028234663852886E38)]", "[1.0 0.5 true -3.4028234663852886E38]");
+    try expectOutput("(map #(try (float %) (catch any e e)) [1e39 -1e39 ##Inf nil \\a \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch :kind-mismatch)");
+    try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
+}
+
+test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
+    try expectOutput("[(= ##Inf (/ 1.0 0)) (= ##-Inf (/ -1.0 0)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
+    try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
+    // str of a bare float is Java's spelling; print and a collection, the reader's.
+    try expectOutput("(pr-str [(str ##Inf) (str ##-Inf ##NaN) (str [##Inf]) (format \"%s\" ##NaN) (with-out-str (print ##Inf))])", "[\"Infinity\" \"-InfinityNaN\" \"[##Inf]\" \"NaN\" \"##Inf\"]");
+    try expectOutput("(let [v (read-string (pr-str [##Inf ##-Inf ##NaN]))] [(= (pop v) [##Inf ##-Inf]) (NaN? (peek v))])", "[true true]");
+    try expectOutput("[(+ ##Inf 1) '##-Inf]", "[##Inf ##-Inf]");
+}
+
+test "reader: Clojure's \\uXXXX char and string escapes" {
+    try expectOutput("[(= \\u0041 \\A) (= \\u00e9 \\u{E9}) (int \\u2603)]", "[true true 9731]");
+    try expectOutput("[(= \"\\u00e9t\\u00E9\" \"été\") (count \"\\uD83D\\uDE00\") (= \"\\uD83D\\uDE00\" \"\\u{1F600}\")]", "[true 1 true]");
+    try expectOutput("(try (read-string \"\\\"\\\\uD800\\\"\") (catch :reader-error e :bad))", ":bad");
 }
 
 test "numbers: arithmetic contagion" {
@@ -4244,6 +4422,25 @@ test "collection-as-function: maps, sets and vectors" {
     try expectOutput("(let [m {:x 1}] (m :x))", "1");
     try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
     try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+}
+
+test "integration: print writes a float's infinities and NaN as the reader does; str and %s of a bare float keep Java's spelling" {
+    try expectOutput("(with-out-str (print ##Inf ##-Inf ##NaN [1.5 ##Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf]");
+    try expectOutput("(with-out-str (println [##NaN]))", "[##NaN]\n");
+    try expectOutput("[(str ##Inf) (str ##-Inf ##NaN) (str [##Inf] 'x ##NaN) (format \"%s\" ##Inf)]", "[Infinity -InfinityNaN [##Inf]xNaN Infinity]");
+}
+
+test "integration: defrecord names its type, which instance? takes, and returns it" {
+    try expectOutput("(do (defrecord P [a]) [(instance? P (->P 1)) (pr-str P) (symbol? P) (= P (type (->P 1)))])", "[true user.P true true]");
+    try expectOutput("(defrecord Q [a])", "user.Q");
+}
+
+test "integration: a macro may return a sorted collection; quoted, it is itself; it may be metadata" {
+    try expectOutput("(do (defmacro sm [] (sorted-map 2 :b 1 :a)) [(sm) (sorted? (sm))])", "[{1 :a, 2 :b} true]");
+    try expectOutput("(let [s (eval (list 'quote (sorted-set 3 1)))] [s (sorted? s)])", "[#{1 3} true]");
+    try expectOutput("(let [m (eval (list 'quote {:k (sorted-map :b 2 :a 1)}))] [m (sorted? (:k m))])", "[{:k {:a 1, :b 2}} true]");
+    try expectOutput("(do (defmacro sb [] (sorted-set-by > 1 2)) (:error (try (eval '(sb)) (catch any e e))))", ":compile-error");
+    try expectOutput("(let [m (meta (with-meta [1] (sorted-map :b 2 :a 1)))] [m (sorted? m)])", "[{:a 1, :b 2} true]");
 }
 
 test "integration: a Var calls, and derefs to, the value in force" {
@@ -4888,7 +5085,7 @@ test "typed vectors: constructors, type, printing and the generic natives" {
         .{ .src = "(i64-vector (range 5))", .expected = "#i64[0 1 2 3 4]" },
         .{ .src = "(f64-vector #{1})", .expected = "#f64[1.0]" },
         .{ .src = "(f64-vector (i64-vector [1 2]))", .expected = "#f64[1.0 2.0]" },
-        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 Infinity -Infinity]" },
+        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 ##Inf ##-Inf]" },
         .{ .src = "(i64-vector [140737488355328 -140737488355329])", .expected = "#i64[140737488355328 -140737488355329]" },
         .{ .src = "(nth (i64-vector [140737488355328]) 0)", .expected = "140737488355328" },
         .{ .src = "(i64-vector [9223372036854775807])", .expected = "#i64[9223372036854775807]" },
@@ -4976,7 +5173,6 @@ test "typed vectors: constructor errors and the absent update operations" {
         .{ .src = "(try (subvec (i64-vector [1]) 0) (catch any e e))", .expected = ":kind-mismatch" },
         .{ .src = "(try (empty (i64-vector [1])) (catch any e e))", .expected = ":kind-mismatch" },
         .{ .src = "(try ((i64-vector [1]) 0) (catch any e e))", .expected = ":not-callable" },
-        .{ .src = "(try (with-meta (i64-vector [1]) {}) (catch any e e))", .expected = ":kind-mismatch" },
     });
 }
 
@@ -5019,6 +5215,18 @@ test "typed vectors: nexis.simd kernels" {
     });
 }
 
+test "sorted collections: a store round trip through the codec keeps the order; a comparator is unserializable" {
+    try expectOutputProgramWithStore("sorted",
+        \\(do
+        \\  (def conn (db/open "@STORE@"))
+        \\  (def r (db/ref conn :s "k"))
+        \\  (with-tx [tx conn] (db/put! tx r {:m (sorted-map "b" 2 "a" 1) :s (sorted-set :z :a/b :c) :c (sorted-map-by compare 2 :b 1 :a)}))
+        \\  (def v (with-read-tx [tx conn] (db/get tx r)))
+        \\  [(:m v) (sorted? (:m v)) (:s v) (sorted? (:s v)) (:c v) (sorted? (:c v)) (assoc (:m v) "c" 3)
+        \\   (try (with-tx [tx conn] (db/put! tx r (sorted-set-by > 1 2))) (catch :unserializable e :unserializable))])
+    , "[{a 1, b 2} true #{:c :z :a/b} true {1 :a, 2 :b} true {a 1, b 2, c 3} :unserializable]");
+}
+
 test "typed vectors: a store round trip through the codec" {
     try expectOutputProgramWithStore("typed-vectors",
         \\(do
@@ -5029,7 +5237,7 @@ test "typed vectors: a store round trip through the codec" {
         \\  (with-tx [tx conn] (db/put! tx r (f64-vector [0.5 -0.0 (/ 1.0 0)])))
         \\  (def f (with-read-tx [tx conn] (db/get tx r)))
         \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 (/ 1.0 0)]))])
-    , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 Infinity] :f64 true]");
+    , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 ##Inf] :f64 true]");
 }
 
 // =============================================================================
@@ -5100,6 +5308,19 @@ test "gc: over a map, the entries a native keeps across its callbacks survive cy
     try expectOutputUnderGc(churn ++ zmap ++ "(let [r (sort-by (fn [e] (churn (key e)) (- (key e))) m)] [(first r) (last r)])", "[[39 39] [0 0]]");
     try expectOutputUnderGc(churn ++ zmap ++ "(let [r (reductions (fn [a e] (churn (key e)) e) m)] [(count r) (reduce + (map val r))])", "[40 780]");
     try expectOutputUnderGc(churn ++ "(defrecord P [a b c]) (count (filter (fn [e] (churn (key e)) true) (->P 1 2 3)))", "3");
+}
+
+/// A comparator that allocates a few kilobytes of garbage per call,
+/// so a cycle runs inside every sorted update and lookup.
+const by = "(defn by [a b] (churn a) (compare a b)) ";
+
+test "gc: sorted collections under a comparator that collects keep every intermediate and entry" {
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (apply sorted-map-by by (interleave (range 40) (map str (range 40))))] [(count m) (first m) (last m) (get m 17) (m 39) (contains? m 40)])", "[40 [0 0] [39 39] 17 39 false]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [s (reduce conj (sorted-set-by by) (range 40))] [(count s) (subseq s > 36) (rsubseq s < 3) (subseq s >= 10 < 13)])", "[40 (37 38 39) (2 1 0) (10 11 12)]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (into (sorted-map-by by) (zipmap (range 30) (map str (range 30))))] [(count m) (last m)])", "[30 [29 29]]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (conj (sorted-map-by by) {1 (str 2) 3 (str 4)} [5 (str 6)] (zipmap (range 10 20) (map str (range 10 20))))] [(count m) (map val (subseq m < 6))])", "[13 (2 4 6)]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [m (apply sorted-map-by by (range 40))] [(count (apply dissoc m (range 0 40 4))) (select-keys m [0 2 4 6]) (count (apply assoc m (range 100 120)))])", "[10 {0 1, 2 3, 4 5, 6 7} 30]");
+    try expectOutputUnderGc(churn ++ by ++ "(let [s (apply sorted-set-by by (map str (range 30)))] [(count (apply disj s (map str (range 10)))) (first s) (count (into s (map str (range 25 35))))])", "[20 0 35]");
 }
 
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
@@ -5344,6 +5565,7 @@ const RequireDir = struct {
         for (files) |f| {
             const path = try std.fs.path.join(testing.allocator, &.{ self.dir_path, f[0] });
             defer testing.allocator.free(path);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
             const file = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer file.close(io);
             try file.writeStreamingAll(io, f[1]);
@@ -5463,6 +5685,19 @@ test "require: Clojure's library namespaces name nexis's" {
     , "[A x b true]");
 }
 
+const appc = [2][]const u8{ "app/c.nx", "(ns app.c)\n(defn f [] :c)\n" };
+const appd = [2][]const u8{ "app/d.nx", "(ns app.d)\n(defn x [] :x)\n(defn y [] :y)\n" };
+
+test "require: a prefix list names several namespaces under one prefix" {
+    try expectOutputWithFiles(&.{ appc, appd },
+        \\(ns t (:require [app [c :as cc] [d :refer [x]]]))
+        \\[(cc/f) (x) (app.d/y)]
+    , "[:c :x :y]");
+    try expectOutputWithFiles(&.{ appc, appd }, "(require '(app c [d :as dd])) [(app.c/f) (dd/y)]", "[:c :y]");
+    try expectOutputWithFiles(&.{ appc, appd }, "(require '[app c d]) [(app.c/f) (app.d/x)]", "[:c :x]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure [string :as s] [set :refer [union]]]) [(s/upper-case \"a\") (union #{1} #{2})]", "[A #{1 2}]");
+}
+
 /// Run `setup`, then expand `src` with the loader over `files` and
 /// expect a failure recorded with `message` against the source text
 /// `at`.
@@ -5530,6 +5765,11 @@ test "ns and require: a bad spec or a missing namespace or Var is reported by na
     try expectRequireFailure(&.{}, "", "(ns x (:import java.util.Date))", "ns: (:import ...) is not supported", "(:import java.util.Date)");
     try expectRequireFailure(&.{utilns}, "(defn twice [] 0)", "(require '[util :refer [twice]])", "require: twice is already defined in user", "twice");
     try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [twice]]) (def twice 0)", "def: twice already refers to a Var of another namespace", "twice");
+    // Clojure's rules for prefix lists: no period in a name under a
+    // prefix, no prefix list inside another.
+    try expectRequireFailure(&.{appc}, "", "(require '[app [c.e :as e]])", "require: c.e is under the prefix app, so it cannot contain a period", "c.e");
+    try expectRequireFailure(&.{appc}, "", "(require '[app [c [e]]])", "require: a prefix list cannot hold another", "[c [e]]");
+    try expectRequireFailure(&.{appc}, "", "(require '[app 1])", "require: a prefix list holds symbols and vectors, not an integer", "1");
 }
 
 const throwsns = [2][]const u8{ "throwsns.nx", "(ns throwsns)\n(throw :boom)\n" };

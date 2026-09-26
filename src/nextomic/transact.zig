@@ -39,6 +39,7 @@ const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
+const sorted = @import("../coll/sorted.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -103,6 +104,32 @@ pub const CallHook = struct {
 
 /// Everything a transaction can fail with: its own errors, the
 /// db-value's, the value contract's and the store's.
+/// A map tx-data form: a hash map or a sorted one, as Datomic takes
+/// any `java.util.Map`.
+fn isMapForm(v: Value) bool {
+    return v.kind() == .persistent_map or v.kind() == .sorted_map;
+}
+
+/// The entries of a map form, in either kind's order.
+const MapEntries = union(enum) {
+    hash: champ.MapIter,
+    sorted: sorted.Cursor,
+
+    fn of(m: Value) MapEntries {
+        return if (m.kind() == .sorted_map) .{ .sorted = sorted.Cursor.init(m) } else .{ .hash = champ.mapIter(m) };
+    }
+
+    fn next(self: *MapEntries) ?sorted.Entry {
+        switch (self.*) {
+            .hash => |*it| {
+                const e = it.next() orelse return null;
+                return .{ .key = e.key, .value = e.value };
+            },
+            .sorted => |*c| return c.next(),
+        }
+    }
+};
+
 pub const Failure = Error || stack.Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
 
 pub const Options = struct {
@@ -347,7 +374,9 @@ const PVal = union(enum) {
 /// `[:db.fn/cas e a old new]`: assert `new` when the current value of
 /// the card-one `(e a)` is `old` (absent when `old` is null). In the
 /// arena: the rare case, kept off the common op's size.
-const CasOp = struct { e: Ent, attr: *const Attr, old: ?PVal, new: PVal };
+/// `old` is matched, never minted; `written` is the old value as the
+/// form wrote it, for the refusal to name one the store cannot spell.
+const CasOp = struct { e: Ent, attr: *const Attr, old: ?PVal, written: Value, new: PVal };
 
 const ROp = union(enum) {
     add: struct { e: Ent, attr: *const Attr, v: PVal },
@@ -504,9 +533,10 @@ const Ctx = struct {
         return error.TxFn;
     }
 
-    /// `Cas`: `attr` holds `actual` where the form expected `expected`.
-    fn cas(self: *Ctx, attr: *const Attr, expected: ?Val, actual: ?Val) error{Cas} {
-        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual } };
+    /// `Cas`: `attr` holds `actual` where the form expected `expected`;
+    /// `unseen` is the expected keyword when the store has never seen it.
+    fn cas(self: *Ctx, attr: *const Attr, expected: ?Val, actual: ?Val, unseen: ?Value) error{Cas} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .cas = .{ .expected = expected, .actual = actual, .unseen = unseen } };
         return error.Cas;
     }
 
@@ -759,7 +789,7 @@ const Ctx = struct {
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
                     const old_v = vector_mod.nth(form, 3);
                     const op_cas = try self.arena.create(CasOp);
-                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v, .assert), .new = try self.valueFromVm(attr, vector_mod.nth(form, 4), .assert) };
+                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v, .match), .written = old_v, .new = try self.valueFromVm(attr, vector_mod.nth(form, 4), .assert) };
                     try self.ops.append(self.arena, .{ .cas = op_cas });
                 } else if (self.kwIs(op, "db/add")) {
                     if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
@@ -780,7 +810,7 @@ const Ctx = struct {
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
                 } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
             },
-            .persistent_map => _ = try self.normaliseMap(form),
+            .persistent_map, .sorted_map => _ = try self.normaliseMap(form),
             else => return self.malformed("a form is a vector or a map"),
         }
     }
@@ -818,7 +848,7 @@ const Ctx = struct {
         // Nested map forms recurse here, one frame per level.
         try stack.check();
         var ent: ?Ent = null;
-        var it = champ.mapIter(m);
+        var it = MapEntries.of(m);
         while (it.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) {
                 ent = try self.entityFromVm(entry.value);
@@ -827,7 +857,7 @@ const Ctx = struct {
         }
         const e: Ent = ent orelse .{ .tempid = try self.internalTempid() };
 
-        var it2 = champ.mapIter(m);
+        var it2 = MapEntries.of(m);
         while (it2.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) continue;
             const v = entry.value;
@@ -866,7 +896,7 @@ const Ctx = struct {
     /// `[referrer attr e]` for one value under a reverse ref: an entity,
     /// or a map form of one.
     fn addReverse(self: *Ctx, e: Ent, attr: *const Attr, referrer: Value) Failure!void {
-        const from = if (referrer.kind() == .persistent_map) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
+        const from = if (isMapForm(referrer)) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
         try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
     }
 
@@ -881,7 +911,7 @@ const Ctx = struct {
     /// Does a map form name its entity: a `:db/id`, or a unique
     /// attribute?
     fn carriesIdentity(self: *Ctx, m: Value) !bool {
-        var it = champ.mapIter(m);
+        var it = MapEntries.of(m);
         while (it.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) return true;
             if (entry.key.kind() != .keyword) continue;
@@ -906,7 +936,7 @@ const Ctx = struct {
     /// entity; unless the attribute is a component it must carry an
     /// identity, or nothing could ever reach it.
     fn addFromVm(self: *Ctx, e: Ent, attr: *const Attr, v: Value) Failure!void {
-        if (v.kind() == .persistent_map and attr.value_type == .ref) {
+        if (isMapForm(v) and attr.value_type == .ref) {
             if (!attr.component and !try self.carriesIdentity(v)) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute");
             const nested = try self.normaliseMap(v);
             try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested) } });
@@ -1008,6 +1038,9 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
+        // Rows an older build or another folding wrote are replaced
+        // before this transaction adds its own.
+        if (!try self.conn.store.fulltextFresh(self.txn, self.now)) try fulltext.rebuild(self.conn.store, self.txn, self.arena, self.now);
         try self.bindIdents();
         try self.bindTempids();
         try self.claimAll();
@@ -1105,13 +1138,7 @@ const Ctx = struct {
             const slot: *PVal = switch (op.*) {
                 .add => |*o| if (o.attr.id == boot.ident) &o.v else continue,
                 .retract => |*o| if (o.attr.id == boot.ident) &o.v else continue,
-                .cas => |c| blk: {
-                    const mutable: *CasOp = @constCast(c);
-                    if (mutable.old) |*old| if (old.* == .ident) {
-                        old.* = .{ .val = .{ .keyword = try self.mintKeyword(old.ident) } };
-                    };
-                    break :blk &mutable.new;
-                },
+                .cas => |c| &@constCast(c).new,
                 else => continue,
             };
             if (slot.* != .ident) continue;
@@ -1388,7 +1415,7 @@ const Ctx = struct {
                 .retract_entity => |e| try self.expandRetractEntity(try self.resolveEnt(e)),
                 .cas => |o| {
                     const old: ?Val = if (o.old) |v| try self.resolveVal(v) else null;
-                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, try self.resolveVal(o.new));
+                    try self.expandCas(try self.resolveEnt(o.e), o.attr, old, o.written, try self.resolveVal(o.new));
                 },
             }
         }
@@ -1397,12 +1424,15 @@ const Ctx = struct {
     /// `:db.fn/cas`: the committed value of the card-one `(e a)`, less
     /// what this transaction retracted, must be `old` (absent when `old`
     /// is null); then `new` is asserted as an ordinary add.
-    fn expandCas(self: *Ctx, e: u64, attr: *const Attr, old: ?Val, new: Val) !void {
+    fn expandCas(self: *Ctx, e: u64, attr: *const Attr, old: ?Val, written: Value, new: Val) !void {
         if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute");
         const current = try self.currentOne(e, attr.id);
         const actual: ?Val = if (current) |c| c.val else null;
         const matches = if (old) |o| (if (actual) |a| a.eql(o) else false) else actual == null;
-        if (!matches) return self.cas(attr, old, actual);
+        if (!matches) {
+            const unseen = if (old) |o| o == .keyword and o.keyword == no_keyword else false;
+            return self.cas(attr, old, actual, if (unseen) written else null);
+        }
         try self.expandAdd(e, attr, new);
     }
 
@@ -1563,6 +1593,9 @@ const Ctx = struct {
     fn push(self: *Ctx, e: u64, attr: *const Attr, v: Val, vbytes: []const u8, added: bool, fact_key: ?[]const u8) !void {
         // The txlog entry carries the instant too: it never changes.
         if (attr.id == boot.tx_instant and (!added or e != key.txEntity(self.t))) return self.malformed(":db/txInstant is asserted on the transaction's own entity only, and never retracted");
+        // Keyword values and the attribute of every datom are stored by
+        // the ident's id, so a name only moves, by a rename.
+        if (attr.id == boot.ident and !added) return self.schemaRefused(@intCast(e), null, "an ident is never retracted; assert a new :db/ident to rename it");
         const fk = fact_key orelse try key.keyBytes(self.arena, .eavt, e, attr.id, vbytes, null);
         const i: u32 = @intCast(self.overlay.items.len);
         try self.overlay.append(self.arena, .{ .e = e, .attr = attr, .v = v, .vbytes = vbytes, .added = added });
@@ -1762,8 +1795,10 @@ const Ctx = struct {
     }
 
     /// Copy every current `(e v t)` of the attribute from AEVT into AVET
-    /// and AVET-h with its original `t`, refusing duplicate values when
-    /// the attribute becomes unique.
+    /// with its original `t`, and every row of its AEVT history into
+    /// AVET-h, retractions and values retracted long before included,
+    /// so a history or as-of view of the index reads what EAVT holds;
+    /// refuse duplicate values when the attribute becomes unique.
     fn backfillAvet(self: *Ctx, attr: *const Attr) !void {
         var becomes_unique = false;
         for (self.overlay.items) |p| {
@@ -1793,9 +1828,15 @@ const Ctx = struct {
             var tb: [key.id_len]u8 = undefined;
             key.writeId(&tb, r.t);
             try self.txn.putInTree(store.trees.cur(.avet), ck, &tb);
-            const hk = try key.keyBytes(self.arena, .avet, r.e, attr.id, r.vbytes, .{ .t = r.t, .added = true });
-            try self.txn.putInTree(store.trees.hist(.avet), hk, &.{});
         }
+        // Collected before the puts: no cursor stays open across a write.
+        var history: std.ArrayList([]const u8) = .empty;
+        var hs = try Store.scan(self.txn, store.trees.hist(.aevt), try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id }));
+        while (hs.next()) |kv| {
+            const parts = try key.unpackKey(.aevt, true, kv.key);
+            try history.append(self.arena, try key.keyBytes(self.arena, .avet, parts.e, attr.id, parts.v, parts.top orelse return error.Corrupted));
+        }
+        for (history.items) |hk| try self.txn.putInTree(store.trees.hist(.avet), hk, &.{});
         // Pending datoms of this attribute belong in AVET too.
         if (self.attrs.get(attr.id)) |c| c.indexed = true;
     }
@@ -1845,6 +1886,7 @@ const Ctx = struct {
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
+        try store.writeFulltextStamp(self.txn, self.t);
         if (self.schema_touched) try store.bumpSchemaGen(self.txn);
         if (self.eid_bumped) try store.writeNextEid(self.txn, self.next_eid);
         try self.minter.finish();
@@ -3493,6 +3535,49 @@ test "another connection's data commits keep the schema cache; its schema change
         .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
     }, .{});
     try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
+}
+
+test "a schema change that leaves the generation alone, as an older build's does, still rebuilds the cache" {
+    const tc = try TestConn.init("tx_schema_gen_old_build");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer other.destroy();
+
+    try testing.expect(!(try (try tc.conn.db()).attr(name)).?.many());
+    const store = other.store;
+    const gen = blk: {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        break :blk try store.readSchemaGen(txn);
+    };
+    // A data commit, then the schema change, then "sg" put back.
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+    }, .{});
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{});
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, gen, .big);
+        try store.sysPut(txn, "sg", &bytes);
+        try txn.commit();
+    }
+    try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
+    // Data-only commits since keep the rebuilt cache.
+    const cached = tc.conn.schema_cache.?;
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    _ = try (try tc.conn.db()).attr(name);
+    try testing.expectEqual(cached, tc.conn.schema_cache.?);
 }
 
 test "the view outlives the scratch arena until destroy" {

@@ -24,6 +24,7 @@ pub const bignum = @import("bignum.zig");
 pub const protocol = @import("protocol.zig");
 pub const typed_vector = @import("coll/typed_vector.zig");
 pub const champ = @import("coll/champ.zig");
+pub const sorted = @import("coll/sorted.zig");
 pub const transient = @import("coll/transient.zig");
 pub const record = @import("record.zig");
 pub const codec = @import("codec.zig");

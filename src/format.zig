@@ -47,6 +47,7 @@ const intern_mod = @import("intern.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const string_mod = @import("string.zig");
 const heap_mod = @import("heap.zig");
 const vm_mod = @import("vm.zig");
@@ -114,7 +115,7 @@ pub fn format(
         },
         .char => try formatChar(v.asChar(), mode, writer),
         .string => try formatString(v, mode, writer),
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => {
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
             stack.check() catch {
                 dispatch.noteOverflow();
                 return writer.writeAll("#<too deep>");
@@ -124,6 +125,7 @@ pub fn format(
                 .persistent_vector => try formatVector(v, mode, writer, interner),
                 .persistent_map => try formatMap(v, mode, writer, interner),
                 .persistent_set => try formatSet(v, mode, writer, interner),
+                .sorted_map, .sorted_set => try formatSorted(v, mode, writer, interner),
                 else => try formatRecord(v, mode, writer, interner),
             }
         },
@@ -177,12 +179,21 @@ pub fn format(
 // Per-kind helpers
 // =============================================================================
 
-/// Floats print the way Clojure prints doubles (SEMANTICS §6.3):
-/// the shortest round-trip decimal with a mandatory fraction
-/// (`1.0`, `2.5`, `-0.0`), switching to `1.0E10` / `1.5E-7`
-/// exponent form at or above 1e7 and below 1e-3, plus the
-/// literal spellings `NaN`, `Infinity` and `-Infinity`.
+/// Floats print the way Clojure prints doubles in either mode
+/// (SEMANTICS §6.3): the shortest round-trip decimal with a
+/// mandatory fraction (`1.0`, `2.5`, `-0.0`), switching to
+/// `1.0E10` / `1.5E-7` exponent form at or above 1e7 and below
+/// 1e-3, and the reader's `##NaN`, `##Inf` and `##-Inf`.
 fn formatFloat(f: f64, writer: *std.Io.Writer) Error!void {
+    if (std.math.isNan(f)) return writer.writeAll("##NaN");
+    if (std.math.isInf(f)) return writer.writeAll(if (f > 0) "##Inf" else "##-Inf");
+    return formatFloatJava(f, writer);
+}
+
+/// A float as Java's `Double.toString` writes it, the spelling
+/// `str` and `%s` give a bare float: `NaN`, `Infinity` and
+/// `-Infinity` for the special values.
+pub fn formatFloatJava(f: f64, writer: *std.Io.Writer) Error!void {
     if (std.math.isNan(f)) return writer.writeAll("NaN");
     if (std.math.isInf(f)) return writer.writeAll(if (f > 0) "Infinity" else "-Infinity");
     // Both spellings of a finite f64 fit comfortably: the
@@ -351,6 +362,30 @@ fn formatSet(
     try writer.writeByte('}');
 }
 
+/// A sorted map as `{k v, k v}` and a sorted set as `#{a b}`, in
+/// order.
+fn formatSorted(
+    v: Value,
+    mode: FormatMode,
+    writer: *std.Io.Writer,
+    interner: ?*const intern_mod.Interner,
+) Error!void {
+    const is_map = v.kind() == .sorted_map;
+    try writer.writeAll(if (is_map) "{" else "#{");
+    var it = sorted_mod.Iter.init(v, true);
+    var first = true;
+    while (it.next()) |e| {
+        if (!first) try writer.writeAll(if (is_map) ", " else " ");
+        first = false;
+        try format(e.key, mode, writer, interner);
+        if (is_map) {
+            try writer.writeByte(' ');
+            try format(e.value, mode, writer, interner);
+        }
+    }
+    try writer.writeByte('}');
+}
+
 fn formatDurableRef(
     v: Value,
     writer: *std.Io.Writer,
@@ -409,6 +444,26 @@ test "display and readable: a bignum prints its decimal value with no suffix" {
         const got = try formatForTest(v, mode, null);
         defer testing.allocator.free(got);
         try testing.expectEqualStrings("-340282366920938463463374607431768211456", got);
+    }
+}
+
+test "floats: NaN and the infinities print as the reader reads them in either mode; formatFloatJava is Java's spelling" {
+    const cases = [_]struct { f: f64, printed: []const u8, java: []const u8 }{
+        .{ .f = std.math.inf(f64), .printed = "##Inf", .java = "Infinity" },
+        .{ .f = -std.math.inf(f64), .printed = "##-Inf", .java = "-Infinity" },
+        .{ .f = std.math.nan(f64), .printed = "##NaN", .java = "NaN" },
+        .{ .f = 2.5, .printed = "2.5", .java = "2.5" },
+    };
+    for (cases) |c| {
+        for ([_]FormatMode{ .display, .readable }) |mode| {
+            const got = try formatForTest(value_mod.fromFloat(c.f), mode, null);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(c.printed, got);
+        }
+        var buf: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try formatFloatJava(c.f, &w);
+        try testing.expectEqualStrings(c.java, w.buffered());
     }
 }
 

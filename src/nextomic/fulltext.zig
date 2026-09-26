@@ -10,11 +10,21 @@
 //!     arrival; excise.zig under excision. The hash tells apart two
 //!     values of one cardinality-many attribute that share a token, so
 //!     retracting one leaves the other's rows.
-//!   - `tokens` lowercases ASCII letters, keeps digits and every byte of
-//!     a non-ASCII character, and splits on every other byte; a token
-//!     longer than `max_token` bytes is dropped, so no row key exceeds
-//!     the page's key bound. A token never holds 0x00, which makes the
-//!     separator unambiguous.
+//!   - `tokens` splits text into runs of ASCII letters, digits and
+//!     non-ASCII bytes, and folds each run's characters by Unicode
+//!     simple case folding (`fold`: ASCII, Latin, Greek, Cyrillic,
+//!     Armenian, Georgian, Glagolitic, Deseret, the letterlike and
+//!     fullwidth forms); bytes that are not UTF-8 stay as they are. A
+//!     folded token longer than `max_token` bytes is dropped, so no row
+//!     key exceeds the page's key bound. A token never holds 0x00,
+//!     which makes the separator unambiguous. Indexing and search both
+//!     tokenise through `tokens`, so they fold alike.
+//!   - The rows are written under `store.fulltext_fold`, stamped in
+//!     `sys` with the `t` they are current at (`Store.fulltextFresh`).
+//!     A stamp of another folding, or one an older build left behind,
+//!     is stale: `rebuild` writes the rows again, at connect when the
+//!     file is writable and at the start of the next transaction, and
+//!     until then a search re-tokenises the values instead.
 //!   - `search` answers the `(e, hash)` pairs whose rows carry every
 //!     token of the needle; a needle without tokens matches nothing.
 
@@ -30,7 +40,7 @@ const Store = store_mod.Store;
 /// Longest token indexed, in bytes.
 pub const max_token = 255;
 
-/// The distinct tokens of `text`, in byte order.
+/// The distinct folded tokens of `text`, in byte order.
 pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -42,8 +52,8 @@ pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
         }
         const start = i;
         while (i < text.len and isTokenByte(text[i])) i += 1;
-        if (i - start > max_token) continue;
-        const token = try std.ascii.allocLowerString(arena, text[start..i]);
+        const token = try foldRun(arena, text[start..i]);
+        if (token.len > max_token) continue;
         const g = try seen.getOrPut(arena, token);
         if (!g.found_existing) try out.append(arena, token);
     }
@@ -57,6 +67,174 @@ pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
 
 fn isTokenByte(b: u8) bool {
     return std.ascii.isAlphanumeric(b) or b >= 0x80;
+}
+
+/// `run` with every character folded; a byte that does not start a
+/// valid UTF-8 sequence is kept as it is.
+fn foldRun(arena: Allocator, run: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = try .initCapacity(arena, run.len);
+    var i: usize = 0;
+    while (i < run.len) {
+        const b = run[i];
+        if (b < 0x80) {
+            try out.append(arena, std.ascii.toLower(b));
+            i += 1;
+            continue;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(b) catch 1;
+        const cp = if (n > 1 and i + n <= run.len) std.unicode.utf8Decode(run[i..][0..n]) catch null else null;
+        if (cp) |c| {
+            var buf: [4]u8 = undefined;
+            const m = std.unicode.utf8Encode(fold(c), &buf) catch unreachable;
+            try out.appendSlice(arena, buf[0..m]);
+            i += n;
+        } else {
+            try out.append(arena, b);
+            i += 1;
+        }
+    }
+    return out.items;
+}
+
+/// A span of code points that fold by one offset: every one of them,
+/// or (`alternate`) every other one from `lo`, the upper case of a
+/// lower-case neighbour.
+const Fold = struct { lo: u21, hi: u21, delta: i32, alternate: bool = false };
+
+fn single(cp: u21, to: u21) Fold {
+    return .{ .lo = cp, .hi = cp, .delta = @as(i32, to) - @as(i32, cp) };
+}
+
+fn span(lo: u21, hi: u21, to: u21) Fold {
+    return .{ .lo = lo, .hi = hi, .delta = @as(i32, to) - @as(i32, lo) };
+}
+
+fn pairs(lo: u21, hi: u21) Fold {
+    return .{ .lo = lo, .hi = hi, .delta = 1, .alternate = true };
+}
+
+/// Unicode simple case folding (CaseFolding.txt, statuses C and S) for
+/// the scripts `fold` covers, sorted by `lo`. ASCII folds in `foldRun`.
+const folds = [_]Fold{
+    single(0xB5, 0x3BC),
+    span(0xC0, 0xD6, 0xE0),
+    span(0xD8, 0xDE, 0xF8),
+    pairs(0x100, 0x12F),
+    pairs(0x132, 0x137),
+    pairs(0x139, 0x148),
+    pairs(0x14A, 0x177),
+    single(0x178, 0xFF),
+    pairs(0x179, 0x17E),
+    single(0x17F, 's'),
+    single(0x1C4, 0x1C6),
+    single(0x1C5, 0x1C6),
+    single(0x1C7, 0x1C9),
+    single(0x1C8, 0x1C9),
+    single(0x1CA, 0x1CC),
+    pairs(0x1CB, 0x1DC),
+    pairs(0x1DE, 0x1EF),
+    single(0x1F1, 0x1F3),
+    single(0x1F2, 0x1F3),
+    single(0x1F4, 0x1F5),
+    pairs(0x1F8, 0x21F),
+    pairs(0x222, 0x233),
+    pairs(0x246, 0x24F),
+    single(0x345, 0x3B9),
+    pairs(0x370, 0x373),
+    single(0x376, 0x377),
+    single(0x37F, 0x3F3),
+    single(0x386, 0x3AC),
+    span(0x388, 0x38A, 0x3AD),
+    single(0x38C, 0x3CC),
+    span(0x38E, 0x38F, 0x3CD),
+    span(0x391, 0x3A1, 0x3B1),
+    span(0x3A3, 0x3AB, 0x3C3),
+    single(0x3C2, 0x3C3),
+    single(0x3CF, 0x3D7),
+    single(0x3D0, 0x3B2),
+    single(0x3D1, 0x3B8),
+    single(0x3D5, 0x3C6),
+    single(0x3D6, 0x3C0),
+    pairs(0x3D8, 0x3EF),
+    single(0x3F0, 0x3BA),
+    single(0x3F1, 0x3C1),
+    single(0x3F4, 0x3B8),
+    single(0x3F5, 0x3B5),
+    single(0x3F7, 0x3F8),
+    single(0x3F9, 0x3F2),
+    single(0x3FA, 0x3FB),
+    span(0x3FD, 0x3FF, 0x37B),
+    span(0x400, 0x40F, 0x450),
+    span(0x410, 0x42F, 0x430),
+    pairs(0x460, 0x481),
+    pairs(0x48A, 0x4BF),
+    single(0x4C0, 0x4CF),
+    pairs(0x4C1, 0x4CE),
+    pairs(0x4D0, 0x52F),
+    span(0x531, 0x556, 0x561),
+    span(0x10A0, 0x10C5, 0x2D00),
+    single(0x10C7, 0x2D27),
+    single(0x10CD, 0x2D2D),
+    pairs(0x1E00, 0x1E95),
+    single(0x1E9B, 0x1E61),
+    single(0x1E9E, 0xDF),
+    pairs(0x1EA0, 0x1EFF),
+    span(0x1F08, 0x1F0F, 0x1F00),
+    span(0x1F18, 0x1F1D, 0x1F10),
+    span(0x1F28, 0x1F2F, 0x1F20),
+    span(0x1F38, 0x1F3F, 0x1F30),
+    span(0x1F48, 0x1F4D, 0x1F40),
+    .{ .lo = 0x1F59, .hi = 0x1F5F, .delta = -8, .alternate = true },
+    span(0x1F68, 0x1F6F, 0x1F60),
+    span(0x1F88, 0x1F8F, 0x1F80),
+    span(0x1F98, 0x1F9F, 0x1F90),
+    span(0x1FA8, 0x1FAF, 0x1FA0),
+    span(0x1FB8, 0x1FB9, 0x1FB0),
+    span(0x1FBA, 0x1FBB, 0x1F70),
+    single(0x1FBC, 0x1FB3),
+    single(0x1FBE, 0x3B9),
+    span(0x1FC8, 0x1FCB, 0x1F72),
+    single(0x1FCC, 0x1FC3),
+    span(0x1FD8, 0x1FD9, 0x1FD0),
+    span(0x1FDA, 0x1FDB, 0x1F76),
+    span(0x1FE8, 0x1FE9, 0x1FE0),
+    span(0x1FEA, 0x1FEB, 0x1F7A),
+    single(0x1FEC, 0x1FE5),
+    span(0x1FF8, 0x1FF9, 0x1F78),
+    span(0x1FFA, 0x1FFB, 0x1F7C),
+    single(0x1FFC, 0x1FF3),
+    single(0x2126, 0x3C9),
+    single(0x212A, 'k'),
+    single(0x212B, 0xE5),
+    single(0x2132, 0x214E),
+    span(0x2160, 0x216F, 0x2170),
+    single(0x2183, 0x2184),
+    span(0x24B6, 0x24CF, 0x24D0),
+    span(0x2C00, 0x2C2F, 0x2C30),
+    pairs(0xA640, 0xA66D),
+    pairs(0xA680, 0xA69B),
+    span(0xFF21, 0xFF3A, 0xFF41),
+    span(0x10400, 0x10427, 0x10428),
+};
+
+/// The simple case folding of `cp`: itself outside the table.
+pub fn fold(cp: u21) u21 {
+    if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
+    var lo: usize = 0;
+    var hi: usize = folds.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        const f = folds[mid];
+        if (cp < f.lo) {
+            hi = mid;
+        } else if (cp > f.hi) {
+            lo = mid + 1;
+        } else {
+            if (f.alternate and (cp - f.lo) % 2 != 0) return cp;
+            return @intCast(@as(i32, cp) + f.delta);
+        }
+    }
+    return cp;
 }
 
 /// True when the tokens of `text` include every token of `needle`;
@@ -110,16 +288,58 @@ pub fn index(store: *Store, txn: *Txn, arena: Allocator, a: u32, e: u64, text: [
     }
 }
 
-/// Delete the rows of a current EAVT row `(e a vbytes)` of a string
-/// attribute; an out-of-line value is read back from its payload.
-pub fn unindexRow(store: *Store, txn: *Txn, arena: Allocator, a: u32, e: u64, vbytes: []const u8) !void {
+/// Put (`added`) or delete the rows of a current EAVT row
+/// `(e a vbytes)` of a string attribute; an out-of-line value is read
+/// back from its payload.
+pub fn indexRow(store: *Store, txn: *Txn, arena: Allocator, a: u32, e: u64, vbytes: []const u8, added: bool) !void {
     const kv = try key.decodeVal(arena, vbytes);
     const text = switch (kv) {
         .val => |v| if (v == .string) v.string else return,
         .string_long => (try store.currentPayload(txn, e, a, vbytes, arena)) orelse return error.Corrupted,
         .bytes_long => return,
     };
-    try index(store, txn, arena, a, e, text, false);
+    try index(store, txn, arena, a, e, text, added);
+}
+
+/// The attributes whose current `:db/fulltext` is true.
+fn fulltextAttrs(store: *Store, txn: *Txn, arena: Allocator) ![]const u32 {
+    var out: std.ArrayList(u32) = .empty;
+    var s = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = store.fulltext_aid }));
+    while (s.next()) |kv| {
+        const parts = try key.unpackKey(.aevt, false, kv.key);
+        const v = try key.decodeVal(arena, parts.v);
+        if (v == .val and v.val == .boolean and v.val.boolean) try out.append(arena, @intCast(parts.e));
+    }
+    return out.items;
+}
+
+/// Whether `rebuild` has work at `t`: the rows are stale and some
+/// attribute is full-text.
+pub fn needsRebuild(store: *Store, txn: *Txn, arena: Allocator, t: u64) !bool {
+    if (try store.fulltextFresh(txn, t)) return false;
+    return (try fulltextAttrs(store, txn, arena)).len > 0;
+}
+
+/// Write every row again, under this build's folding, from the current
+/// string values of every full-text attribute, and stamp the rows
+/// current at `t`.
+pub fn rebuild(store: *Store, txn: *Txn, arena: Allocator, t: u64) !void {
+    // Collected before the writes: no cursor stays open across one.
+    var stale: std.ArrayList([]const u8) = .empty;
+    var s = try Store.scan(txn, store.trees.fulltext, &.{});
+    while (s.next()) |kv| try stale.append(arena, try arena.dupe(u8, kv.key));
+    for (stale.items) |k| _ = try txn.delFromTree(store.trees.fulltext, k);
+    for (try fulltextAttrs(store, txn, arena)) |a| {
+        var rows: std.ArrayList(key.Parts) = .empty;
+        var r = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = a }));
+        while (r.next()) |kv| {
+            var parts = try key.unpackKey(.aevt, false, kv.key);
+            parts.v = try arena.dupe(u8, parts.v);
+            try rows.append(arena, parts);
+        }
+        for (rows.items) |p| try indexRow(store, txn, arena, a, p.e, p.v, true);
+    }
+    try store.writeFulltextStamp(txn, t);
 }
 
 /// One value found by `search`: the entity and its value's hash.
@@ -166,12 +386,33 @@ fn hitOf(k: []const u8) !Hit {
 
 const testing = std.testing;
 
-test "tokens lowercase ASCII, keep digits and non-ASCII bytes, split on the rest" {
+test "the fold table is sorted, disjoint and idempotent, and folds to lower case" {
+    for (folds[0 .. folds.len - 1], folds[1..]) |x, y| try testing.expect(x.hi < y.lo);
+    for (folds) |f| try testing.expect(f.lo <= f.hi);
+    var cp: u21 = 0;
+    while (cp < 0x110000) : (cp += 1) {
+        const once = fold(cp);
+        errdefer std.debug.print("U+{X} folds to U+{X}, then to U+{X}\n", .{ cp, once, fold(once) });
+        try testing.expectEqual(once, fold(once));
+        // Surrogates are no characters; nothing folds into them.
+        if (once != cp) try testing.expect(once < 0xD800 or once > 0xDFFF);
+    }
+    const pairs_ = [_][2]u21{
+        .{ 'A', 'a' },       .{ 0xC9, 0xE9 },     .{ 0x178, 0xFF },    .{ 0x17F, 's' },
+        .{ 0x1C5, 0x1C6 },   .{ 0x391, 0x3B1 },   .{ 0x3A3, 0x3C3 },   .{ 0x3C2, 0x3C3 },
+        .{ 0x386, 0x3AC },   .{ 0x410, 0x430 },   .{ 0x401, 0x451 },   .{ 0x531, 0x561 },
+        .{ 0x1E9E, 0xDF },   .{ 0x1F59, 0x1F51 }, .{ 0x1F5A, 0x1F5A }, .{ 0x212A, 'k' },
+        .{ 0xFF21, 0xFF41 }, .{ 0x130, 0x130 },   .{ 0xDF, 0xDF },     .{ 0x4E00, 0x4E00 },
+    };
+    for (pairs_) |p| try testing.expectEqual(p[1], fold(p[0]));
+}
+
+test "tokens fold case, keep digits and non-ASCII bytes, split on the rest" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const ts = try tokens(arena, "  Hello, WORLD! x2 -- café_au-lait  hello ");
-    const want = [_][]const u8{ "au", "café", "hello", "lait", "world", "x2" };
+    const ts = try tokens(arena, "  Hello, WORLD! x2 -- CAFÉ_au-lait  hello café ΣΟΦΊΑ σοφία");
+    const want = [_][]const u8{ "au", "café", "hello", "lait", "world", "x2", "σοφία" };
     try testing.expectEqual(want.len, ts.len);
     for (want, ts) |w, t| try testing.expectEqualStrings(w, t);
     try testing.expectEqual(@as(usize, 0), (try tokens(arena, " ... ")).len);
@@ -184,6 +425,11 @@ test "tokens lowercase ASCII, keep digits and non-ASCII bytes, split on the rest
     try testing.expectEqual(@as(usize, 2), kept.len);
     try testing.expectEqualStrings("b", kept[0]);
     try testing.expectEqualStrings("c", kept[1]);
+    // Bytes that are not UTF-8 stay as they are; a fold may shorten a token.
+    const odd = try tokens(arena, "\xC3\xFF\xE9 \u{212A}ELVIN");
+    try testing.expectEqual(@as(usize, 2), odd.len);
+    try testing.expectEqualStrings("kelvin", odd[0]);
+    try testing.expectEqualStrings("\xC3\xFF\xE9", odd[1]);
 }
 
 test "matches needs every needle token and refuses an empty needle" {
@@ -244,6 +490,6 @@ test "index and search keep rows per value and intersect tokens" {
     }, arena);
     try index(store, txn, arena, a, e2, long_text, true);
     try testing.expectEqual(@as(usize, 1), (try search(store, txn, arena, a, try tokens(arena, "zebra"))).len);
-    try unindexRow(store, txn, arena, a, e2, vb);
+    try indexRow(store, txn, arena, a, e2, vb, false);
     try testing.expectEqual(@as(usize, 0), (try search(store, txn, arena, a, try tokens(arena, "zebra"))).len);
 }

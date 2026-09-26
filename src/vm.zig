@@ -33,6 +33,7 @@ const bignum_mod = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const transient_mod = @import("coll/transient.zig");
 /// Canonical `hashValue` + `equal` entry points for map and set
 /// construction.
@@ -2190,7 +2191,7 @@ pub const VM = struct {
                 if (!isLookupCallable(callee.kind())) {
                     return self.fail(VmError.NotCallable, "{s} is not callable", .{kindPhrase(callee.kind())});
                 }
-                break :blk try callLookup(callee, args);
+                break :blk try callLookupIn(self, callee, args);
             },
         };
         try self.checkDeepData(overflows);
@@ -3323,6 +3324,10 @@ pub const VM = struct {
                 var it = champ_mod.setIter(v);
                 while (it.next()) |e| try out.append(self.allocator, e);
             },
+            .sorted_map, .sorted_set => {
+                var it = sorted_mod.Iter.init(v, true);
+                while (it.next()) |e| try out.append(self.allocator, if (v.kind() == .sorted_map) try vector_mod.fromSlice(self.ensureHeap(), &.{ e.key, e.value }) else e.key);
+            },
             else => return error.KindMismatch,
         }
     }
@@ -3618,10 +3623,23 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
 /// `(get coll key default)`. Maps and records look the key up,
 /// sets return the element itself when present, vectors index by
 /// fixnum, a lazy entity reads the attribute from its view, nil
-/// yields the default. Any other receiver is a `KindMismatch`.
+/// yields the default. Any other receiver is a `KindMismatch`. A
+/// sorted collection with no VM to call its comparator through is
+/// searched by `=` (`lookupIn`).
 pub fn lookup(coll: Value, key: Value, default: Value) VmError!Value {
+    return lookupIn(null, coll, key, default);
+}
+
+/// `lookup` with the VM a sorted collection's comparator runs on
+/// (SORTED.md §8): an incomparable key is `KindMismatch` and a
+/// comparator's throw propagates, as in Clojure.
+pub fn lookupIn(vm: ?*VM, coll: Value, key: Value, default: Value) VmError!Value {
     return switch (coll.kind()) {
         .nil => default,
+        .sorted_map, .sorted_set => {
+            const e = (try sortedFind(vm, coll, key)) orelse return default;
+            return if (coll.kind() == .sorted_map) e.value else e.key;
+        },
         .persistent_map => mapLookup(coll, key, default),
         .record => mapLookup(record_mod.fieldsOf(coll), key, default),
         // A lazy entity reads the attribute through the hook its box
@@ -3669,6 +3687,66 @@ fn transientFind(t: Value, k: Value) transient_mod.TransientError!?Value {
     }
 }
 
+/// The entry of sorted `coll` whose key its order finds equal to
+/// `key`; without a VM, the entry whose key is `=` to it.
+pub fn sortedFind(vm: ?*VM, coll: Value, key: Value) VmError!?sorted_mod.Entry {
+    if (vm) |v| return sorted_mod.find(coll, key, SortedOrder.of(v, coll));
+    var it = sorted_mod.Iter.init(coll, true);
+    while (it.next()) |e| if (dispatch_mod.equal(e.key, key)) return e;
+    return null;
+}
+
+/// A sorted collection's order as `sorted.zig` takes it (SORTED.md
+/// §4, §6): the natural order, or the comparator function coerced as
+/// Clojure's `AFunction.compare` coerces one. The comparator re-enters
+/// the VM and may collect.
+pub const SortedOrder = struct {
+    vm: *VM,
+    /// The function, or nil for the natural order.
+    comparator: Value,
+
+    pub const Error = VmError;
+
+    pub fn of(vm: *VM, coll: Value) SortedOrder {
+        return .{ .vm = vm, .comparator = sorted_mod.comparatorOf(coll) };
+    }
+
+    pub fn order(self: SortedOrder, a: Value, b: Value) VmError!std.math.Order {
+        if (self.comparator.isNil()) return naturalOrder(self.vm, a, b);
+        const r = try self.vm.callValue(self.comparator, &.{ a, b });
+        return switch (r.kind()) {
+            .true_ => .lt,
+            // A predicate: `(f b a)` tells greater from equal.
+            .false_, .nil => if ((try self.vm.callValue(self.comparator, &.{ b, a })).isTruthy()) .gt else .eq,
+            .fixnum => std.math.order(r.asFixnum(), 0),
+            // Java's `intValue`: toward zero, NaN to zero.
+            .float => if (std.math.isNan(r.asFloat())) .eq else std.math.order(@trunc(r.asFloat()), 0),
+            .bignum => if (bignum_mod.isNegative(r)) .lt else .gt,
+            else => VmError.KindMismatch,
+        };
+    }
+};
+
+/// Clojure's `compare` (SORTED.md §6).
+pub fn naturalOrder(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
+    return sorted_mod.naturalOrder(vm.ensureInterner(), a, b) catch |err| switch (err) {
+        error.KindMismatch => VmError.KindMismatch,
+        error.StackOverflow => VmError.StackOverflow,
+    };
+}
+
+/// What a sorted-collection update can fail with.
+pub const SortedUpdateError = VmError || sorted_mod.AllocError;
+
+/// A sorted-collection update's failure as the VM reports it: the
+/// comparator's own error, or memory.
+pub fn sortedFailure(err: SortedUpdateError) VmError {
+    return switch (err) {
+        error.Overflow => VmError.OutOfMemory,
+        else => |e| @errorCast(e),
+    };
+}
+
 fn mapLookup(m: Value, key: Value, default: Value) Value {
     return switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
         .present => |v| v,
@@ -3685,6 +3763,8 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .fixnum, .bignum => "an integer",
         .persistent_map => "a map",
         .persistent_set => "a set",
+        .sorted_map => "a sorted map",
+        .sorted_set => "a sorted set",
         .persistent_vector => "a vector",
         .function, .native_fn, .protocol_fn => "a function",
         .var_ => "a var",
@@ -3702,7 +3782,7 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
 /// Kinds a `call:call` treats as a lookup rather than a function.
 pub fn isLookupCallable(k: value_mod.Kind) bool {
     return switch (k) {
-        .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector, .transient => true,
+        .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector, .transient, .sorted_map, .sorted_set => true,
         else => false,
     };
 }
@@ -3717,18 +3797,20 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 ///                                 out of range is an error
 ///
 /// A transient map, set or vector is called, and looked up by a
-/// keyword, as its persistent kind is (TRANSIENT.md §7). Any other
-/// arity is `ArityMismatch` (VM.md §6).
-pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
+/// keyword, as its persistent kind is (TRANSIENT.md §7); a sorted map
+/// or set as a map or set is, through its comparator on `vm`. Any
+/// other arity is `ArityMismatch` (VM.md §6). A caller with no VM
+/// reaches a sorted key by `=` (`lookupIn`).
+pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value {
     if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
     return switch (callee.kind()) {
         .keyword, .symbol => switch (args[0].kind()) {
-            .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity, .transient => lookup(args[0], callee, default),
+            .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity, .transient, .sorted_map, .sorted_set => lookupIn(vm, args[0], callee, default),
             else => default,
         },
-        .persistent_map => lookup(callee, args[0], default),
-        .persistent_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,
+        .persistent_map, .sorted_map => lookupIn(vm, callee, args[0], default),
+        .persistent_set, .sorted_set => if (args.len == 1) lookupIn(vm, callee, args[0], default) else VmError.ArityMismatch,
         .transient => switch (callee.subkind()) {
             transient_mod.subkind_transient_map => lookup(callee, args[0], default),
             transient_mod.subkind_transient_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,

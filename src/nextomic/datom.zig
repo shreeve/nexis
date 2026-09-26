@@ -200,6 +200,27 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, ids: IdSource) !
     return .{ .instant = instant, .datoms = datoms, .excised = excised };
 }
 
+/// Whether a txlog entry holds a datom on an attribute-partition
+/// entity, a schema or ident change; the values are not converted.
+pub fn touchesAttrPartition(arena: Allocator, bytes: []const u8) !bool {
+    var heap = Heap.init(arena);
+    defer heap.deinit();
+    var interner = Interner.init(arena);
+    defer interner.deinit();
+    const vec = codec_mod.decode(&heap, &interner, bytes, &dispatch.hashValue, &dispatch.equal) catch return error.Corrupted;
+    if (vec.kind() != .persistent_vector) return error.Corrupted;
+    var it = vector_mod.Cursor.init(vec);
+    _ = it.next() orelse return error.Corrupted;
+    while (it.next()) |row| {
+        if (row.kind() != .persistent_vector) continue;
+        if (vector_mod.count(row) != 4) return error.Corrupted;
+        const e = vector_mod.nth(row, 0);
+        if (e.kind() != .fixnum or e.asFixnum() < 0) return error.Corrupted;
+        if (key.isAttrPartition(@intCast(e.asFixnum()))) return true;
+    }
+    return false;
+}
+
 /// The i64 of a long or an instant: an integer, fixnum or bignum, in
 /// i64's range; null for any other value (NEXTOMIC.md §2.2).
 pub fn longOf(v: Value) ?i64 {

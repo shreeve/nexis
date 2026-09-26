@@ -263,12 +263,15 @@ Each item is a commitment; changing one takes an Amendment Log entry
     see and produce Forms (§5).
 25. **Serialization has a fixed scope.** Serializable: nil, bool,
     char, fixnum, bignum, f64, string, keyword and symbol (as text),
-    list, vector, map, set, typed vector. Everything else (functions,
-    Vars, atoms, transients, durable refs, byte vectors, records,
-    protocols, db and Nextomic handles) is not; encoding one raises the
-    keyword `:unserializable` (`docs/CODEC.md`). Nesting depth is
-    unbounded.
-26. **Character and string escapes are unified on `\u{HEX}`.** Named
+    list, vector, map, set, typed vector, and sorted map and sorted
+    set in the natural order. Everything else (functions, Vars, atoms,
+    transients, durable refs, byte vectors, records, protocols, db and
+    Nextomic handles, a sorted collection with a comparator of its
+    own) is not; encoding one raises the keyword `:unserializable`
+    (`docs/CODEC.md`). Nesting depth is unbounded.
+26. **Character and string escapes are unified on `\u{HEX}`**, which
+    names any scalar; Clojure's `\uXXXX` (exactly four hex digits) is
+    read too, a surrogate pair in a string spelling one scalar. Named
     chars for the common set; single-char `\a` syntax.
 27. **No block comments.** `;` (line), `#_` (discard the next form),
     `(comment ...)` (a macro that yields nil).
@@ -302,9 +305,11 @@ Each item is a commitment; changing one takes an Amendment Log entry
     indexing and typed-vector kernels bypass it where that is clearer.
 36. **Sequential equality crosses types.** Lists, vectors and their
     seq views are equal when element-wise equal; maps and sets are
-    categories of their own; hashes are built so the invariant holds.
+    categories of their own, each spanning its hash and sorted kinds;
+    hashes are built so the invariant holds.
 37. **CHAMP is the persistent map and set**: separate data and node
-    bitmaps, canonical layout.
+    bitmaps, canonical layout. The sorted map and set are a
+    weight-balanced tree in a comparator's order (`docs/SORTED.md`).
 38. **Performance is a first-class goal.** A performance claim is a
     measured ReleaseFast number (`docs/PERF.md`); a comparison with
     Clojure is published only from same-machine numbers, the cases
@@ -314,7 +319,7 @@ Each item is a commitment; changing one takes an Amendment Log entry
 lives in one place:
 
 - nil propagation on collection ops — `docs/SEMANTICS.md`;
-- the three collection equality categories — `docs/SEMANTICS.md`;
+- the collection equality categories — `docs/SEMANTICS.md`;
 - the metadata attachability matrix — `docs/SEMANTICS.md` §7;
 - the serializable-kind table and wire format — `docs/CODEC.md`;
 - the operand kinds and opcode groups — `docs/VM.md`;
@@ -401,9 +406,9 @@ nil                                  ;; nil
 true, false                          ;; bool
 42, 0x2A, 0b101, 42N                 ;; int (any radix, within i64; N changes nothing)
 18446744073709551616                 ;; bigint (an integer beyond i64, as decimal text)
-3.14, 1e9, 1.5e-3                    ;; real (f64)
+3.14, 1e9, 1.5e-3, ##Inf, ##NaN      ;; real (f64; ##Inf, ##-Inf, ##NaN the symbolic floats)
 "hello"                              ;; string (UTF-8; may span lines)
-\a, \newline, \u{2603}               ;; char (Unicode scalar)
+\a, \newline, \u{2603}, \u2603       ;; char (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>, λ            ;; symbol
 
@@ -455,13 +460,13 @@ all before macroexpansion.
 | `~x` outside `` `...` `` | reader error `:unquote-outside-syntax-quote` |
 | `~@x` outside `` `...` `` | reader error `:unquote-splice-outside-syntax-quote` |
 | `1abc`, `1-2`, `1/2`, `1.`, `3.14M` | reader error `:bad-number-literal` |
-| `"a\qb"`, `"\u{D800}"` | reader error `:invalid-string-escape` |
-| `A`, `\ab`, `\u{110000}` | reader error `:invalid-char-literal` |
+| `"a\qb"`, `"\u{D800}"`, `"\uD800"` | reader error `:invalid-string-escape` |
+| `A`, `\ab`, `\u{110000}`, `\u041` | reader error `:invalid-char-literal` |
 | `foo/bar/baz`, `:foo/bar/baz` | reader error `:invalid-symbol`, `:invalid-keyword` |
 | `^1 x` | reader error `:unknown-reader-construct` (metadata is a keyword, map or symbol) |
 | bytes that are not UTF-8 in a string, symbol or keyword | reader error `:invalid-utf8` |
 | a form nested past the native stack's budget | reader error `:nesting-too-deep` |
-| `#"re"`, `##Inf`, `#?(...)`, `::k` | parse error naming the construct |
+| `#"re"`, `##Infinity`, `#?(...)`, `::k` | parse error naming the construct |
 
 Only statically detectable literal keys and elements count as
 duplicates: `{:a 1 (keyword "a") 2}` reads.
@@ -773,3 +778,34 @@ entry stating the decision and its rationale.
   and 4096 upvalues, whose compile error names the routine and the
   limit. `docs/VM.md` §3, §4, §10, §12 and `docs/COMPILER.md` §4.4 are
   the authority.
+
+- **2026-09-26 — Clojure's `\uXXXX` and the symbolic floats (§23 #26,
+  §28.2, §28.3).** The reader takes Clojure's `\uXXXX` beside
+  `\u{HEX}`: in a char, `\u` and exactly four hex digits naming a
+  scalar; in a string, a UTF-16 unit, a high surrogate followed by a
+  `\uXXXX` low one spelling one scalar and a lone surrogate an
+  `:invalid-string-escape`. `##Inf`, `##-Inf` and `##NaN` read as the
+  real datum, and the printer's readable mode writes them, so every
+  float round-trips through `pr-str` and `read-string`. Clojure source
+  that spells these reads unchanged. `docs/FORMS.md` §2–§3 is the
+  authority.
+
+- **2026-09-26 — Sorted collections (§23 #25, #36, #37).** Heap kinds
+  41 (`sorted_map`) and 42 (`sorted_set`) join `docs/VALUE.md` §2.2,
+  with Clojure 1.12's surface: `sorted-map`, `sorted-map-by`,
+  `sorted-set`, `sorted-set-by`, `sorted?`, `reversible?`, `subseq`,
+  `rsubseq` and `rseq`, and every collection function over them. Each
+  is a persistent weight-balanced tree (the (3, 2) trees of Haskell's
+  `Data.Map`): O(log n) updates by path copying, the nodes off the
+  path shared. The order is Clojure's `compare`, which the collections,
+  `compare` and `sort` share (`docs/SORTED.md` §6), or a comparator
+  function coerced as Clojure coerces one (a number's sign, or a
+  boolean predicate). A sorted map is `=` to the hash map with its
+  entries and hashes alike, a sorted set likewise (§23 #36): the map
+  and set categories span the two kinds, and equality never calls a
+  comparator. §23 #25 grows by the two kinds in the natural order,
+  written in ascending order; a sorted collection with its own
+  comparator is `:unserializable`, since the comparator is code. As in
+  Clojure, a sorted collection has no transient. `docs/SORTED.md` is
+  the authority; `docs/SEMANTICS.md` §3.3, `docs/CODEC.md` §2.8 and
+  §3, and `docs/GC.md` §5 carry the rows.

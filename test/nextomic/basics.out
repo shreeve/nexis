@@ -3,6 +3,7 @@
 ok fresh store is at the bootstrap basis
 ok db-values are values
 ok a db-value is not its history view
+ok db-values of two connections to one file are equal
 ok schema transaction is t=2
 ok attribute entities take ids in the attribute partition
 ok db-before and db-after bracket the transaction
@@ -79,4 +80,5 @@ ok a unique value moves before its old holder lets go
 ok a lookup ref names an identity asserted after it
 :no-error
 {:error :nextomic/unique, :attr :person/email, :value x2@example.com}
+:sorted-entity 42
 :basics-done

@@ -229,6 +229,8 @@ test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" 
         };
         const domain: u8 = switch (k) {
             .list, .persistent_vector => 0xF0,
+            .sorted_map => @intFromEnum(value.Kind.persistent_map),
+            .sorted_set => @intFromEnum(value.Kind.persistent_set),
             else => @intFromEnum(k),
         };
         std.testing.expectEqual(identity, dispatch.isIdentityKind(k)) catch |err| {

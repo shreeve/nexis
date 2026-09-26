@@ -423,6 +423,7 @@ const suites = [_]Suite{
     .{ .path = "test/prop/bignum.zig" },
     .{ .path = "test/prop/vector.zig" },
     .{ .path = "test/prop/champ.zig" },
+    .{ .path = "test/prop/sorted.zig" },
     .{ .path = "test/prop/gc.zig" },
     .{ .path = "test/prop/transient.zig" },
     .{ .path = "test/prop/codec.zig" },

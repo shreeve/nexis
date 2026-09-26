@@ -16,6 +16,7 @@
 ; second, third, take, some and every? are natives that walk no
 ; further than they must.
 (defn ffirst [x] (first (first x)))
+(defn nfirst [x] (next (first x)))
 (defn fnext [x] (second x))
 (defn nnext [x] (next (next x)))
 
@@ -606,9 +607,53 @@
 (defn distinct? [& xs]
   (= (count xs) (count (set xs))))
 
-; (rseq v) → v's elements last first, nil when empty.
-(defn rseq [v]
-  (seq (reverse v)))
+; (tree-seq branch? children root) → the nodes of the tree under root,
+; depth first, each before its children; an explicit stack, so the
+; depth of the tree costs no native stack.
+(defn tree-seq [branch? children root]
+  (loop [stack (list root) acc (transient [])]
+    (if (seq stack)
+      (let [node (first stack) more (rest stack)]
+        (recur (if (branch? node) (into more (reverse (children node))) more)
+               (conj! acc node)))
+      (seq (persistent! acc)))))
+
+; (replace smap coll) → coll with each element that is a key of smap
+; (a map, or a vector by index) replaced by its value: a vector of a
+; vector, keeping its metadata, else a seq.
+(defn replace [smap coll]
+  (let [f (fn [x] (let [e (find smap x)] (if e (val e) x)))]
+    (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll))))
+
+; (bounded-count n coll) → the count of a counted coll, else the count
+; of at most its first n elements.
+(defn bounded-count [n coll]
+  (if (counted? coll)
+    (count coll)
+    (loop [i 0 s (seq coll)]
+      (if (and s (< i n)) (recur (inc i) (next s)) i))))
+
+; (random-sample prob coll) → the elements of coll each kept with
+; probability prob.
+(defn random-sample [prob coll]
+  (filter (fn [_] (< (rand) prob)) coll))
+
+; partition and partition-all with each part a vector, and split-at
+; with the first part a vector (Clojure 1.12).
+(defn partitionv
+  ([n coll] (map vec (partition n coll)))
+  ([n step coll] (map vec (partition n step coll)))
+  ([n step pad coll] (map vec (partition n step pad coll))))
+(defn partitionv-all
+  ([n coll] (map vec (partition-all n coll)))
+  ([n step coll] (map vec (partition-all n step coll))))
+(defn splitv-at [n coll]
+  [(vec (take n coll)) (drop n coll)])
+
+; (map-entry? x) → whether x is a map entry: a two-element vector, the
+; shape a map's seq yields.
+(defn map-entry? [x] (and (vector? x) (= 2 (count x))))
+
 
 ; (rand-nth coll) → a random element; (shuffle coll) → a vector of
 ; coll's elements in random order.
@@ -656,8 +701,37 @@
 (defn neg-int? [x] (and (int? x) (neg? x)))
 (defn double? [x] (float? x))
 (defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
-(defn counted? [x] (or (coll? x) (typed-vector? x)))
 (defn record? [x] (nexis.internal/#%record? x))
+
+; ---- the numeric names Clojure spells apart ----
+; Every integer operator promotes to a bignum (docs/BIGNUM.md), so the
+; promoting forms are the same functions.
+(def +' +)
+(def -' -)
+(def *' *)
+(def inc' inc)
+(def dec' dec)
+
+; The unchecked operators wrap two longs at 64 bits, as Java's long
+; arithmetic does; with a float or an integer beyond 64 bits they
+; compute as the checked operator does, as Clojure's do.
+(defn- wrap64 [r x y]
+  (if (and (int? x) (int? y))
+    (let [m (mod r 18446744073709551616)]
+      (if (< m 9223372036854775808) m (- m 18446744073709551616)))
+    r))
+(defn unchecked-add [x y] (wrap64 (+ x y) x y))
+(defn unchecked-subtract [x y] (wrap64 (- x y) x y))
+(defn unchecked-multiply [x y] (wrap64 (* x y) x y))
+(defn unchecked-inc [x] (wrap64 (inc x) x 0))
+(defn unchecked-dec [x] (wrap64 (dec x) x 0))
+(defn unchecked-negate [x] (wrap64 (- x) x 0))
+
+; (num x) → x, a number or nil; there are no boxed kinds to convert.
+(defn num [x] (if (or (nil? x) (number? x)) x (throw :kind-mismatch)))
+; No rationals (PLAN §23 #10): the rationals are the integers.
+(defn ratio? [_] false)
+(defn rational? [x] (integer? x))
 (defn parse-boolean [s]
   (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 
@@ -668,6 +742,93 @@
 ; (printf fmt & args) → prints (format fmt args...); nil.
 (defn printf [fmt & args]
   (print (apply format fmt args)))
+
+; ============================================================
+; Types, namespaces, UUIDs (docs/STDLIB.md §8)
+; ============================================================
+
+; (type x) → the :type in x's metadata, else (class x), as Clojure's.
+(defn type [x] (or (get (meta x) :type) (class x)))
+
+; (instance? t x) → whether x's class is the type t: a kind keyword
+; such as :vector, or a record's symbol, as class returns them.
+(defn instance? [t x]
+  (if (or (keyword? t) (symbol? t)) (= t (class x)) (throw :kind-mismatch)))
+
+; The names the compiler takes as special forms.
+(defn special-symbol? [s]
+  (contains? '#{def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &} s))
+
+; A namespace is its name symbol.
+(defn the-ns [x] (or (find-ns x) (throw :no-such-namespace)))
+(defn ns-name [x] (the-ns x))
+
+; (uuid? x) → whether x is a UUID's canonical text, as random-uuid
+; and parse-uuid make it.
+(defn uuid? [x] (and (string? x) (= x (parse-uuid x))))
+
+; ============================================================
+; Delays, closing, taps
+; ============================================================
+
+; (delay body...) → a delay: body runs the first time the delay is
+; forced (force or deref), and every later force returns its value,
+; or rethrows what it threw. A delay is the record nexis.core/Delay,
+; whose :state atom holds [:pending thunk], [:ready v] or [:failed e].
+(defmacro delay [& body]
+  `(nexis.internal/#%delay (fn* [] ~@body)))
+
+(defn force [x]
+  (if (delay? x)
+    (let [state (:state x)
+          s @state]
+      (case (first s)
+        :ready (second s)
+        :failed (throw (second s))
+        (try
+          (let [v ((second s))]
+            (reset! state [:ready v])
+            v)
+          (catch any e
+            (reset! state [:failed e])
+            (throw e)))))
+    x))
+
+; (realized? d) → whether the delay has been forced.
+(defn realized? [x]
+  (if (delay? x) (not= :pending (first @(:state x))) (throw :kind-mismatch)))
+
+; What with-open closes: a db connection, a Nextomic connection, and
+; any type extended to it (Java's Closeable).
+(defprotocol Closeable
+  (close [this]))
+(extend-protocol Closeable
+  :db_connection (close [c] (db/close c))
+  :nextomic_conn (close [c] (nextomic/release c)))
+
+; (with-open [name init ...] body...) → body with each name bound,
+; closing each through Closeable in reverse order on every exit, a
+; throw included.
+(defmacro with-open [bindings & body]
+  (when (or (not (vector? bindings)) (odd? (count bindings)) (not (every? symbol? (take-nth 2 bindings))))
+    (throw (ex-info "with-open takes a vector of symbol and value pairs" {})))
+  (if (empty? bindings)
+    `(do ~@body)
+    `(let [~(first bindings) ~(second bindings)]
+       (try
+         (with-open ~(vec (drop 2 bindings)) ~@body)
+         (finally (nexis.core/close ~(first bindings)))))))
+
+; (tap> x) → true, after calling every function add-tap added with x;
+; a tap that throws is ignored. Clojure runs taps on another thread;
+; here, one isolate and one thread, they run before tap> returns.
+(def ^:private taps (atom #{}))
+(defn add-tap [f] (swap! taps conj f) nil)
+(defn remove-tap [f] (swap! taps disj f) nil)
+(defn tap> [x]
+  (doseq [f @taps]
+    (try (f x) (catch any _ nil)))
+  true)
 
 ; ============================================================
 ; Printing to a string

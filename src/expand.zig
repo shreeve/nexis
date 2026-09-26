@@ -13,6 +13,7 @@ const value_mod = @import("value.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const heap_mod = @import("heap.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
@@ -938,6 +939,8 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
 ///   :refer :all        so does every public Var of the namespace
 ///   :rename {x z}      a referred `x` is named `z` here
 ///
+/// A prefix list, `[prefix suffix...]` or `(prefix suffix...)`,
+/// requires each suffix spec under `prefix.` (`requirePrefixList`).
 /// A keyword spec (`:reload`, `:reload-all`, `:verbose`) is a flag
 /// and changes nothing. What a namespace name loads, including the
 /// Clojure library names that stand for nexis namespaces, is the
@@ -951,6 +954,7 @@ fn expandRequire(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Fo
 /// Load and refer one `require` spec (see `expandRequire`).
 fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
     const spec = unwrapQuote(quoted);
+    if (prefixList(spec)) |items| return requirePrefixList(ctx, items);
     const opts: []const *Form = switch (spec.datum) {
         .keyword => return,
         .symbol => &.{},
@@ -1016,6 +1020,45 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
         const name = sym.datum.symbol.name;
         const v = target.lookupLocal(name) orelse return ctx.fail(sym.origin, "require: {s}/{s} does not exist", .{ ns_name, name });
         try referVar(ctx, cur, v, renamed(rename, name), sym.origin);
+    }
+}
+
+/// The items of a prefix list, `(prefix suffix...)` or a vector
+/// whose second element is not an option keyword: `[app c [d :as
+/// dd]]` names `app.c` and `[app.d :as dd]`, as Clojure's `require`
+/// reads it. null for any other spec.
+fn prefixList(spec: *const Form) ?[]const *Form {
+    return switch (spec.datum) {
+        .list => |l| if (l.len > 0) l else null,
+        .vector => |v| if (v.len >= 2 and v[1].datum != .keyword) v else null,
+        else => null,
+    };
+}
+
+/// Require each suffix of a prefix list under its prefix. As in
+/// Clojure, a name under a prefix has no period and a suffix is not
+/// itself a prefix list.
+fn requirePrefixList(ctx: *ExpandContext, items: []const *Form) ExpandError!void {
+    const prefix = items[0];
+    if (prefix.datum != .symbol or prefix.datum.symbol.ns != null) return ctx.fail(prefix.origin, "require: a prefix must be an unqualified symbol, not {s}", .{describeForm(prefix)});
+    for (items[1..]) |suffix| {
+        const name_form = switch (suffix.datum) {
+            .symbol => suffix,
+            .vector => |v| if (v.len == 0) suffix else v[0],
+            else => return ctx.fail(suffix.origin, "require: a prefix list holds symbols and vectors, not {s}", .{describeForm(suffix)}),
+        };
+        if (prefixList(suffix) != null) return ctx.fail(suffix.origin, "require: a prefix list cannot hold another", .{});
+        if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
+        const name = name_form.datum.symbol.name;
+        if (std.mem.indexOfScalar(u8, name, '.') != null) return ctx.fail(name_form.origin, "require: {s} is under the prefix {s}, so it cannot contain a period", .{ name, prefix.datum.symbol.name });
+        const full = try makeSymbol(ctx, try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ prefix.datum.symbol.name, name }), name_form.origin);
+        if (suffix.datum == .symbol) {
+            try requireSpec(ctx, full);
+        } else {
+            const v = try ctx.allocator.dupe(*Form, suffix.datum.vector);
+            v[0] = full;
+            try requireSpec(ctx, try makeVector(ctx, v, suffix.origin));
+        }
     }
 }
 
@@ -1303,6 +1346,22 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
             while (it.next()) |e| try items.append(ctx.allocator, try valueToForm(ctx, e, origin));
             break :blk .{ .set = items.items };
         },
+        // A sorted collection in the natural order travels as
+        // `(nexis.internal/#%sorted-map k v ...)`, which builds it and
+        // which `quote` folds to the collection itself; one with a
+        // comparator of its own carries code, which no form holds.
+        .sorted_map, .sorted_set => blk: {
+            const set = v.kind() == .sorted_set;
+            if (!sorted_mod.comparatorOf(v).isNil()) return ctx.fail(origin, "a macro returned a sorted {s} with a comparator of its own, which is not a form", .{if (set) "set" else "map"});
+            var items: std.ArrayList(*Form) = .empty;
+            try items.append(ctx.allocator, try makeForm(ctx, .{ .symbol = .{ .ns = "nexis.internal", .name = if (set) "#%sorted-set" else "#%sorted-map" } }, origin));
+            var c = sorted_mod.Cursor.init(v);
+            while (c.next()) |e| {
+                try items.append(ctx.allocator, try valueToForm(ctx, e.key, origin));
+                if (!set) try items.append(ctx.allocator, try valueToForm(ctx, e.value, origin));
+            }
+            break :blk .{ .list = items.items };
+        },
         else => return ctx.fail(origin, "a macro returned a {s}, which is not a form", .{@tagName(v.kind())}),
     };
     const form = try makeForm(ctx, datum, origin);
@@ -1311,7 +1370,8 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         else => false,
     };
     if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
-        const meta = try valueToForm(ctx, champ_mod.valueFromMapHeader(m), origin);
+        const meta_v = if (m.kind == @intFromEnum(value_mod.Kind.sorted_map)) heap_mod.Heap.valueFromHeader(.sorted_map, m) else champ_mod.valueFromMapHeader(m);
+        const meta = try valueToForm(ctx, meta_v, origin);
         return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
     };
     return form;
@@ -2284,6 +2344,13 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
         }) }),
     });
     try extendClauses(b, args[2..], .{ .record = .{ .name = args[0], .fields = fields } }, &out);
+    // The name is the record's type, as Clojure's class: the symbol
+    // `ns.Name` that `type` returns, so `(instance? P x)` reads as in
+    // Clojure; the form's value is that type.
+    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "user";
+    const type_sym = try b.item(try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ ns_name, rec_name }));
+    try out.append(ctx.allocator, try b.list(.{ "def", try b.item(rec_name), try b.list(.{ "quote", type_sym }) }));
+    try out.append(ctx.allocator, try b.item(rec_name));
     return makeList(ctx, out.items, b.origin);
 }
 

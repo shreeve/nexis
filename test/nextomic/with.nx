@@ -75,6 +75,7 @@
 (def committed (d/transact! c [{:db/id "gus" :person/name "Gus" :person/email "gus@x"}]))
 (t/check "transact! afterwards takes the t the scope reported" (= (inc (d/basis-t before)) (:tx committed)))
 (t/check "and its tempid" (= @gus (get (:tempids committed) "gus")))
+(t/check "a speculative db-value never equals the committed one at its t" (not= @escaped (d/db c)))
 
 ; A throw inside f propagates after the scope is cleaned up.
 (println (t/caught (d/with c [{:db/id "x" :person/name "X" :person/email "x@x"}]

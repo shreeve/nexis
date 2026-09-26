@@ -136,8 +136,9 @@ nothing to give up relative to an atom, so it is one.
 `deref` is one native, `fnDbDeref`, installed as `nexis.core/deref` and
 as `db/deref`. On an atom it returns the contained value; on a durable
 ref it reads the stored value (`docs/DB.md`), on a Var its root
-(`:unbound-var` when unbound), on a `reduced` wrapper its value, and on
-anything else it is `:not-derefable`. The reader's `@x` expands to
+(`:unbound-var` when unbound), on a `reduced` wrapper its value, on a
+delay its forced value (`force`, `docs/STDLIB.md` §8), and on anything
+else it is `:not-derefable`. The reader's `@x` expands to
 `(nexis.core/deref x)`, qualified so that no local or Var named `deref`
 captures it (`src/expand.zig`).
 
@@ -178,7 +179,7 @@ first.
 | `:arity-mismatch` | a wrong argument count, including options to `atom` |
 | `:kind-mismatch` | a non-atom to `reset!`, `swap!`, `swap-vals!` or `compare-and-set!` |
 | `:not-callable` | an `f` to `swap!` or `swap-vals!` that cannot be called |
-| `:not-derefable` | `deref` of a value that is not an atom, Var, durable ref or `reduced` |
+| `:not-derefable` | `deref` of a value that is not an atom, Var, durable ref, delay or `reduced` |
 | `:unserializable` | the codec meets an atom (§6) |
 | `:kind-mismatch` | `with-meta` on an atom (SEMANTICS.md §7) |
 

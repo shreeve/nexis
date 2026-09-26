@@ -16,7 +16,8 @@
 //!
 //! Scope (CODEC.md §1): the data kinds (nil, bool, char, fixnum,
 //! float, keyword, symbol, string, bignum, list, vector, map, set,
-//! typed vector) nested to any depth. Every other kind is
+//! typed vector, and the sorted map and set in the natural order)
+//! nested to any depth. Every other kind is
 //! `error.UnserializableKind`.
 //!
 //! Both directions walk containers with an explicit stack, so data
@@ -36,6 +37,7 @@ const bignum = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ = @import("coll/champ.zig");
+const sorted = @import("coll/sorted.zig");
 const typed_vector = @import("coll/typed_vector.zig");
 
 const Value = value.Value;
@@ -87,7 +89,7 @@ pub const CodecError = error{
     /// Input no encoder writes: a bignum sign byte not in {0, 1}, a
     /// typed-vector element tag that names no element type, a fixnum
     /// outside i48, a map or set count that disagrees with its
-    /// distinct entries.
+    /// distinct entries, sorted keys out of their natural order.
     MalformedPayload,
 };
 
@@ -278,16 +280,26 @@ const Encoder = struct {
         vector: vector_mod.Cursor,
         map: struct { iter: champ.MapIter, value: ?Value = null },
         set: champ.SetIter,
+        sorted_map: struct { cursor: sorted.Cursor, value: ?Value = null },
+        sorted_set: sorted.Cursor,
 
         fn next(o: *Open) ?Value {
             return switch (o.*) {
                 .list => |*c| c.next(),
                 .vector => |*c| c.next(),
                 .set => |*it| it.next(),
+                .sorted_set => |*c| if (c.next()) |e| e.key else null,
                 .map => |*m| if (m.value) |v| blk: {
                     m.value = null;
                     break :blk v;
                 } else if (m.iter.next()) |entry| blk: {
+                    m.value = entry.value;
+                    break :blk entry.key;
+                } else null,
+                .sorted_map => |*m| if (m.value) |v| blk: {
+                    m.value = null;
+                    break :blk v;
+                } else if (m.cursor.next()) |entry| blk: {
                     m.value = entry.value;
                     break :blk entry.key;
                 } else null,
@@ -316,6 +328,16 @@ const Encoder = struct {
                 .persistent_set => {
                     try e.header(.persistent_set, champ.setCount(v));
                     try e.stack.append(e.allocator, .{ .set = champ.setIter(v) });
+                },
+                // Only the natural order can be named in bytes; a
+                // comparator is code (CODEC.md §2.8).
+                .sorted_map, .sorted_set => {
+                    if (!sorted.comparatorOf(v).isNil()) return CodecError.UnserializableKind;
+                    try e.header(v.kind(), sorted.count(v));
+                    try e.stack.append(e.allocator, if (v.kind() == .sorted_map)
+                        .{ .sorted_map = .{ .cursor = sorted.Cursor.init(v) } }
+                    else
+                        .{ .sorted_set = sorted.Cursor.init(v) });
                 },
                 else => try e.leaf(v),
             }
@@ -419,8 +441,8 @@ const Decoder = struct {
         while (true) {
             const tag = try readByte(d.bytes, &d.cursor);
             var v = switch (tag) {
-                @intFromEnum(Kind.list), @intFromEnum(Kind.persistent_vector), @intFromEnum(Kind.persistent_set) => try d.open(tag, try d.count(1)),
-                @intFromEnum(Kind.persistent_map) => try d.open(tag, 2 * try d.count(2)),
+                @intFromEnum(Kind.list), @intFromEnum(Kind.persistent_vector), @intFromEnum(Kind.persistent_set), @intFromEnum(Kind.sorted_set) => try d.open(tag, try d.count(1)),
+                @intFromEnum(Kind.persistent_map), @intFromEnum(Kind.sorted_map) => try d.open(tag, 2 * try d.count(2)),
                 else => try d.leaf(tag),
             } orelse continue;
             // Hand `v` to the innermost open container, closing every
@@ -455,6 +477,7 @@ const Decoder = struct {
         switch (tag) {
             @intFromEnum(Kind.list) => return list_mod.fromSlice(d.heap, elems),
             @intFromEnum(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
+            @intFromEnum(Kind.sorted_map), @intFromEnum(Kind.sorted_set) => return d.sortedFrom(@enumFromInt(tag), elems),
             @intFromEnum(Kind.persistent_map) => {
                 var m = try champ.mapEmpty(d.heap);
                 var i: usize = 0;
@@ -469,6 +492,25 @@ const Decoder = struct {
                 return s;
             },
         }
+    }
+
+    /// A sorted collection in the natural order from its elements,
+    /// which encode wrote in ascending order: each key must order
+    /// strictly after the one before it, or the input is corrupt.
+    fn sortedFrom(d: *Decoder, kind: Kind, elems: []const Value) DecodeError!Value {
+        const is_map = kind == .sorted_map;
+        const entries = try d.heap.backing.alloc(sorted.Entry, if (is_map) elems.len / 2 else elems.len);
+        defer d.heap.backing.free(entries);
+        for (entries, 0..) |*e, i| e.* = if (is_map)
+            .{ .key = elems[2 * i], .value = elems[2 * i + 1] }
+        else
+            .{ .key = elems[i], .value = value.nilValue() };
+        const order = sorted.Natural{ .interner = d.interner };
+        if (entries.len > 1) for (entries[0 .. entries.len - 1], entries[1..]) |a, b| {
+            const o = order.order(a.key, b.key) catch return CodecError.MalformedPayload;
+            if (o != .lt) return CodecError.MalformedPayload;
+        };
+        return sorted.fromSortedEntries(d.heap, kind, value.nilValue(), entries);
     }
 
     fn leaf(d: *Decoder, tag: u8) DecodeError!Value {
@@ -1152,7 +1194,7 @@ test "decode: a map or set whose count disagrees with its distinct entries is Ma
 test "decode: every kind byte outside the serializable set is refused with a typed error" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
-    const serializable = [_]Kind{ .nil, .false_, .true_, .char, .fixnum, .float, .keyword, .symbol, .string, .bignum, .persistent_map, .persistent_set, .persistent_vector, .list, .typed_vector };
+    const serializable = [_]Kind{ .nil, .false_, .true_, .char, .fixnum, .float, .keyword, .symbol, .string, .bignum, .persistent_map, .persistent_set, .persistent_vector, .list, .typed_vector, .sorted_map, .sorted_set };
     var b: usize = 0;
     while (b < 256) : (b += 1) {
         const byte: u8 = @intCast(b);
@@ -1169,6 +1211,71 @@ test "decode: every kind byte outside the serializable set is refused with a typ
         const bytes = [_]u8{ 1, 0, @intFromEnum(k) };
         try testing.expectError(CodecError.UnserializableKind, decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq));
     }
+}
+
+// ---- Sorted collections (CODEC.md §2.8) ----
+
+/// Keyword `name` in `ctx`'s interner.
+fn keywordIn(ctx: *TestCtx, name: []const u8) !Value {
+    return ctx.interner.internKeywordValue(name);
+}
+
+test "roundtrip: a sorted map and set in the natural order come back sorted, entry for entry" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const order = sorted.Natural{ .interner = &ctx.interner };
+    var m = try sorted.empty(&ctx.heap, .sorted_map, value.nilValue());
+    var s = try sorted.empty(&ctx.heap, .sorted_set, value.nilValue());
+    for ([_][]const u8{ "pear", "apple", "fig", "b/kiwi", "date" }, 0..) |name, i| {
+        m = try sorted.assoc(&ctx.heap, m, try keywordIn(&ctx, name), value.fromFixnum(@intCast(i)).?, order);
+        s = try sorted.conj(&ctx.heap, s, try string.fromBytes(&ctx.heap, name), order);
+    }
+    for ([_]Value{ m, s, try sorted.empty(&ctx.heap, .sorted_set, value.nilValue()) }) |v| {
+        const got = try ctx.roundtrip(v);
+        try testing.expectEqual(v.kind(), got.kind());
+        try testing.expectEqual(sorted.count(v), sorted.count(got));
+        try sorted.checkInvariants(got, order);
+        var a = sorted.Iter.init(v, true);
+        var b = sorted.Iter.init(got, true);
+        while (a.next()) |x| {
+            const y = b.next().?;
+            try testing.expectEqual(std.math.Order.eq, try order.order(x.key, y.key));
+            try testing.expect(synthEq(x.value, y.value));
+        }
+    }
+    // Written in ascending order: the keyword `:apple` comes first.
+    const bytes = try encode(testing.allocator, &ctx.interner, m);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, @intFromEnum(Kind.sorted_map), 5, @intFromEnum(Kind.keyword), 5, 'a', 'p', 'p', 'l', 'e' }, bytes[0..11]);
+}
+
+test "encode: a sorted collection with a comparator of its own is unserializable" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const by = value.fromNativeFnPtr(&ctx);
+    try testing.expectError(CodecError.UnserializableKind, encode(testing.allocator, &ctx.interner, try sorted.empty(&ctx.heap, .sorted_map, by)));
+    try testing.expectError(CodecError.UnserializableKind, encode(testing.allocator, &ctx.interner, try sorted.empty(&ctx.heap, .sorted_set, by)));
+}
+
+test "decode: sorted entries out of order, repeated or without an order are MalformedPayload" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const map_tag = @intFromEnum(Kind.sorted_map);
+    const set_tag = @intFromEnum(Kind.sorted_set);
+    const fixnum = @intFromEnum(Kind.fixnum);
+    // {2 0, 1 0}: descending keys.
+    const descending = [_]u8{ 1, 0, map_tag, 2, fixnum, 4, fixnum, 0, fixnum, 2, fixnum, 0 };
+    try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &descending, &synthHash, &synthEq));
+    // #{1 1}.
+    const repeated = [_]u8{ 1, 0, set_tag, 2, fixnum, 2, fixnum, 2 };
+    try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &repeated, &synthHash, &synthEq));
+    // #{1 nil-list}: a list has no natural order.
+    const unordered = [_]u8{ 1, 0, set_tag, 2, fixnum, 2, @intFromEnum(Kind.list), 0 };
+    try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &unordered, &synthHash, &synthEq));
+    // One entry needs no comparison, whatever its key.
+    const single = [_]u8{ 1, 0, set_tag, 1, @intFromEnum(Kind.list), 0 };
+    const got = try decode(&ctx.heap, &ctx.interner, &single, &synthHash, &synthEq);
+    try testing.expectEqual(@as(usize, 1), sorted.count(got));
 }
 
 // ---- Error surface ----
