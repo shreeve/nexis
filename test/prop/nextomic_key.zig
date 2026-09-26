@@ -1,5 +1,6 @@
 //! test/prop/nextomic_key.zig — for every value type, the byte order of
-//! two encodings equals the order of the two values (NEXTOMIC.md §2.2);
+//! two encodings equals the order of the two values and each decodes to
+//! its value (NEXTOMIC.md §2.2), longs over all of i64 with its edges;
 //! the string escape round-trips through embedded NUL; order holds across
 //! the inline threshold on the 64-byte prefix; every AVET key of an
 //! inline value stays under emdb's 256-byte search-clue buffer.
@@ -15,11 +16,16 @@ const testing = std.testing;
 const prng_seed: u64 = 0x6e78_6b65_795f_7000; // "nxkey_p\0"
 const pairs_per_type: usize = 100_000;
 
+/// The edges of the long range: i64's ends, the fixnum range's (±2^47)
+/// and the last integers a double holds exactly (±2^53).
+const long_edges = [_]i64{ std.math.minInt(i64), -(1 << 53), -(1 << 47), 0, (1 << 47) - 1, 1 << 53, std.math.maxInt(i64) };
+
 fn randLong(rand: std.Random) i64 {
-    return switch (rand.uintLessThan(u8, 4)) {
+    return switch (rand.uintLessThan(u8, 5)) {
         0 => rand.int(i64),
         1 => @as(i64, rand.int(i8)),
         2 => @as(i64, rand.int(i32)),
+        3 => long_edges[rand.uintLessThan(usize, long_edges.len)] +| rand.intRangeAtMost(i64, -2, 2),
         else => rand.intRangeAtMost(i64, -1000, 1000),
     };
 }
@@ -81,6 +87,7 @@ fn expectOrdered(gpa: std.mem.Allocator, a: Val, b: Val) !void {
         return error.OrderMismatch;
     }
     try testing.expectEqual(want == .eq, a.eql(b));
+    for ([_]Val{ a, b }, [_][]const u8{ ea, eb }) |v, e| try testing.expect((try key.decodeVal(gpa, e)).val.eql(v));
 }
 
 /// Names the failing trial of a sweep: its seed and iteration.

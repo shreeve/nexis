@@ -984,21 +984,26 @@ pub const Exec = struct {
                 var isum: i128 = 0;
                 var fsum: f64 = 0;
                 var is_float = false;
+                // Integers past i64 (inputs, function results), summed exactly.
+                var big: ?Value = null;
                 for (members) |m| switch (basis.cell(m, col)) {
                     .int => |n| isum += n,
                     .double => |d| {
                         is_float = true;
                         fsum += d;
                     },
+                    .vm => |v| {
+                        if (v.kind() != .bignum) return error.ValueType;
+                        big = if (big) |acc| try bignum.add(self.heap, acc, v) else v;
+                    },
                     else => return error.ValueType,
                 };
-                if (op == .sum) {
-                    if (is_float) return .{ .double = fsum + @as(f64, @floatFromInt(isum)) };
-                    if (std.math.cast(i64, isum)) |n| return .{ .int = n };
-                    return .{ .vm = try self.kept(try bignum.fromI128(self.heap, isum)) };
-                }
-                const total = fsum + @as(f64, @floatFromInt(isum));
-                return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
+                const total = fsum + @as(f64, @floatFromInt(isum)) + if (big) |v| bignum.toF64(v) else 0;
+                if (op == .avg) return .{ .double = total / @as(f64, @floatFromInt(members.len)) };
+                if (is_float) return .{ .double = total };
+                var exact = try bignum.fromI128(self.heap, isum);
+                if (big) |v| exact = try bignum.add(self.heap, exact, v);
+                return Cell.fromValue(try self.kept(exact));
             },
         }
     }
@@ -1015,11 +1020,7 @@ pub const Exec = struct {
 
     /// A numeric cell as a double; anything else is `ValueType`.
     fn numberOf(c: Cell) error{ValueType}!f64 {
-        return switch (c) {
-            .int => |n| @floatFromInt(n),
-            .double => |d| d,
-            else => error.ValueType,
-        };
+        return c.asNumber() orelse error.ValueType;
     }
 
     fn cellVector(self: *Exec, cells: []const Cell) !Cell {

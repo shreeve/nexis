@@ -1,0 +1,16 @@
+; test/nextomic/longs-2.nx — second process: the longs longs-1.nx wrote
+; read back from the file, in value order.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def i64-max 9223372036854775807)
+(def i64-min -9223372036854775808)
+
+(d/with-conn [c "longs.edb"]
+  (let [db (d/db c)]
+    (println (mapv #(nth % 2) (d/datoms db :avet :n/at)))
+    (t/check "a lookup ref by a bignum" (= i64-max (:n/id (d/entity db [:n/id i64-max]))))
+    (t/check "a card-many set of edges" (= #{i64-min 0 i64-max} (:n/all (d/entity db [:n/id i64-min]))))
+    (println (d/q '[:find (sum ?v) . :with ?e :where [?e :n/id ?v]] db))))
+(println :longs-2-done)

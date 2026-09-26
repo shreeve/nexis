@@ -4,7 +4,7 @@
 //! transaction, an arena for the storage layer's scratch, and copies
 //! only results into the VM heap. Marshalling runs both ways here:
 //! Lisp values become `key.Val` by the attribute's `:db/valueType`
-//! (fixnum → long or instant, double → double, keyword → ident id,
+//! (integer in i64 → long or instant, double → double, keyword → ident id,
 //! eid/ident/lookup ref → ref, string → string, uuid or bytes text →
 //! their storage form, boolean → boolean) and datom values come back
 //! through `Conn.valToValue`.
@@ -39,6 +39,7 @@ const std = @import("std");
 const value = @import("../value.zig");
 const vm_mod = @import("../vm.zig");
 const heap_mod = @import("../heap.zig");
+const bignum = @import("../bignum.zig");
 const gc = @import("../gc.zig");
 const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
@@ -1128,7 +1129,7 @@ fn txRangeNative(vm: *VM, args: []const Value) !Value {
     for (out, entries) |*slot, entry| {
         var m = try champ.mapEmpty(b.heap);
         m = try b.putKw(m, "t", try fixnum(entry.t));
-        m = try b.putKw(m, "instant", value.fromFixnum(entry.instant) orelse return error.ArithmeticOverflow);
+        m = try b.putKw(m, "instant", try bignum.fromI64(b.heap, entry.instant));
         m = try b.putKw(m, "data", try b.datoms(arena, entry.datoms));
         if (entry.excised.len > 0) {
             const ids = try arena.alloc(Value, entry.excised.len);

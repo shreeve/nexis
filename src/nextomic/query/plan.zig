@@ -714,7 +714,8 @@ fn patternAttr(ctx: *Ctx, a: ir.Term) !?Attr {
         .cell => |c| switch (c) {
             .keyword => |kw| return (try ctx.attrByKeyword(kw)) orelse ctx.unknownAttr(value.fromKeywordId(kw)),
             .int => |n| {
-                const id = value.fromFixnum(n) orelse unreachable;
+                // An int cell holds any i64; an id is a fixnum, as transact takes it.
+                const id = value.fromFixnum(n) orelse return ctx.syntax("an attribute is a keyword or an id");
                 if (n <= 0 or n >= key.attr_partition_end) return ctx.unknownAttr(id);
                 return (try ctx.read.attr(@intCast(n))) orelse ctx.unknownAttr(id);
             },
@@ -886,7 +887,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Con
         3 => {
             if (c != .cell or c.cell != .int) return ctx.syntax("the tx position takes a t or a transaction id");
             const n = c.cell.int;
-            if (n < 0) return null;
+            if (n < 0 or n > key.id_max) return null;
             const t = key.txOfEntity(@intCast(n)) orelse @as(u64, @intCast(n));
             if (t >= key.tx_partition_bit) return null;
             return .{ .cell = .{ .int = @intCast(key.txEntity(t)) } };
