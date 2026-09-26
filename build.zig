@@ -271,6 +271,8 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "macro-failure.nx" }, .stderr = "macro-failure.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "too-many-locals.nx" }, .stderr = "too-many-locals.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
+            .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },
+            .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },

@@ -1,0 +1,4 @@
+nexis: test/golden/cli/unicode-columns.nx:4:20: runtime error: DivideByZero
+    (def café "naïve")    (/ (count café) (count ""))
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  at <top> (test/golden/cli/unicode-columns.nx:4:20)

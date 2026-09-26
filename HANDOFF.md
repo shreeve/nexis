@@ -302,18 +302,13 @@ failing test (AGENTS.md).
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-6. **An error's caret counts bytes**: the underline and column of an
-   error report advance one per byte, so a line with multi-byte
-   characters before the span underlines the wrong place. Next: count
-   code points in `cli.zig`'s report, with a CLI golden holding a
-   non-ASCII line.
-7. **Small Clojure differences**: `(int x)` of NaN is
+6. **Small Clojure differences**: `(int x)` of NaN is
    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
    transient (Clojure's transient collections are counted);
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-8. **A routine holds at most 4096 live locals and 4096 captured
+7. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other

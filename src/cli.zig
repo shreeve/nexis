@@ -186,20 +186,57 @@ fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, sp
     var buf: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
     const w = &stderr.interface;
-    const loc = info.lineCol(span.pos);
-    try w.print("nexis: {s}:{d}:{d}: {s}\n", .{ info.path, loc.line, loc.col, label });
-    const line_text = info.lineText(loc.line);
-    if (line_text.len > 0) {
-        try w.print("    {s}\n    ", .{line_text});
-        try w.splatByteAll(' ', loc.col -| 1);
-        // One caret per byte of the span up to the line's end, at
-        // least one.
-        const rest = line_text.len -| (loc.col -| 1);
-        try w.splatByteAll('^', @max(@min(span.len, rest), 1));
+    const at = Place.of(info, span.pos);
+    try w.print("nexis: {s}:{d}:{d}: {s}\n", .{ info.path, at.line, at.col, label });
+    if (at.text.len > 0) {
+        try w.writeAll("    ");
+        for (at.text) |c| if (c == '\t') try w.writeAll(tab) else try w.writeByte(c);
+        try w.writeAll("\n    ");
+        try w.splatByteAll(' ', width(at.text[0..at.offset]));
+        // One caret per character of the span up to the line's end,
+        // at least one.
+        const under = at.text[at.offset..@min(at.text.len, at.offset + span.len)];
+        try w.splatByteAll('^', @max(width(under), 1));
         try w.writeAll("\n");
     }
     try w.flush();
 }
+
+/// How a report shows a tab in a source line: a fixed width, so the
+/// caret beneath lines up whatever the terminal's tab stops.
+const tab = "    ";
+
+/// The columns `text` takes in a report: one per code point, a tab's
+/// width for a tab.
+fn width(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |c| n += if (c == '\t') tab.len else @intFromBool(c & 0xC0 != 0x80);
+    return n;
+}
+
+/// Where byte `pos` of a source falls, as a report names it: the
+/// 1-based line and column, the column counted in code points (a tab
+/// is one), the line's text and `pos`'s byte offset in it. A
+/// byte-order mark that opens the text is not part of line 1.
+const Place = struct {
+    line: usize,
+    col: usize,
+    text: []const u8,
+    offset: usize,
+
+    fn of(info: *const vm.SourceInfo, pos: u32) Place {
+        const all = info.text;
+        const at = @min(pos, all.len);
+        const bom: usize = if (std.mem.startsWith(u8, all, loader_mod.byte_order_mark)) loader_mod.byte_order_mark.len else 0;
+        const start = if (std.mem.lastIndexOfScalar(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
+        const end = std.mem.indexOfScalarPos(u8, all, at, '\n') orelse all.len;
+        const text = std.mem.trimEnd(u8, all[start..end], "\r");
+        const offset = @min(at -| start, text.len);
+        var chars: usize = 0;
+        for (text[0..offset]) |c| chars += @intFromBool(c & 0xC0 != 0x80);
+        return .{ .line = 1 + std.mem.count(u8, all[0..at], "\n"), .col = 1 + chars, .text = text, .offset = offset };
+    }
+};
 
 const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -333,8 +370,8 @@ const Runtime = struct {
                 try w.print("  {s}\n", .{frame.name});
             } else if (frame.source) |src| {
                 if (frame.span) |span| {
-                    const loc = src.lineCol(span.pos);
-                    try w.print("  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col });
+                    const at = Place.of(src, span.pos);
+                    try w.print("  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, at.line, at.col });
                 } else try w.print("  at {s} ({s})\n", .{ frame.name, src.path });
             } else try w.print("  at {s}\n", .{frame.name});
         }

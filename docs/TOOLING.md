@@ -67,9 +67,13 @@ session.
 
 **A parse, reader or compile error** is `nexis: PATH:LINE:COL:
 LABEL`, the source line and a caret under the span the error is
-about, one `^` per byte up to the end of that line, so a form that
-spans lines is underlined on its first (exit 3 for a parse or reader
-error, 4 for a compile error):
+about, one `^` per character up to the end of that line, so a form
+that spans lines is underlined on its first (exit 3 for a parse or
+reader error, 4 for a compile error). LINE and COL are 1-based and
+COL counts code points, not bytes, as the trace's positions do; the
+shown line has each tab as four spaces and the caret lines up beneath
+(`unicode-columns.err`); a byte-order mark that opens any text, a
+file's or `-e`'s, takes no column (`bom.err`, `bom-expr.err`):
 
 ```
 nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
