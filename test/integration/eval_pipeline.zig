@@ -2571,20 +2571,84 @@ test "db/close: a ref, a connection and a second close after it are :db-closed o
     , "[:db-closed :db-closed nil :db-closed :db-closed]");
 }
 
-test "db/close: refused while a transaction of the connection is open" {
-    try expectOutputProgramWithStore("close-busy",
+test "db/close: aborts the connection's open transactions, whose handles then report :tx-closed" {
+    try expectOutputProgramWithStore("close-open",
         \\(do
         \\  (def c (db/open "@STORE@"))
         \\  (def r (db/ref c :t "k"))
+        \\  (db/put-key! r 1)
         \\  (def tx (db/begin-read c))
         \\  (def wx (db/begin-write c))
-        \\  [(try (db/close c) (catch any e e))
-        \\   (db/abort-read! tx)
-        \\   (try (db/close c) (catch any e e))
+        \\  (db/put! wx r 2)
+        \\  [(db/close c)
+        \\   (try (db/get tx r) (catch any e e))
+        \\   (try (db/put! wx r 3) (catch any e e))
+        \\   (try (db/commit! wx) (catch any e e))
         \\   (db/abort-write! wx)
+        \\   (db/snapshot? tx)
+        \\   (let [c2 (db/open "@STORE@") r2 (db/ref c2 :t "k")]
+        \\     [(db/get-key r2) (do (db/put-key! r2 4) (db/get-key r2))])])
+    , "[nil :tx-closed :tx-closed :tx-closed nil false [1 4]]");
+}
+
+test "db/close: refused from a callback that holds one of the connection's transactions" {
+    try expectOutputProgramWithStore("close-held",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k"))
+        \\  (db/put-key! r 1)
+        \\  (def wx (db/begin-write c))
+        \\  [(try (db/reduce-tree wx :t (fn [a k v] (db/close c)) nil) (catch any e e))
+        \\   (try (db/alter! wx r (fn [v] (db/close c) v)) (catch any e e))
+        \\   (db/get wx r)
         \\   (db/close c)
-        \\   (try (db/get tx r) (catch any e e))])
-    , "[:db/busy nil :db/busy nil nil :tx-closed]");
+        \\   (try (db/get wx r) (catch any e e))])
+    , "[:db/busy :db/busy 1 nil :tx-closed]");
+}
+
+/// Run `src`, which opens `@STORE@`, on a VM under `policy`; a
+/// collection afterwards leaves at most a handful of transaction
+/// handles alive.
+fn expectDroppedTxns(policy: vm.GcPolicy, src_template: []const u8, expected: []const u8) !void {
+    var store = try SeamStore.init("dropped-txns");
+    defer store.deinit();
+    const src = try store.source(src_template);
+    defer testing.allocator.free(src);
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.gc_threshold = policy.threshold;
+    program.v.gc_growth_percent = policy.growth_percent;
+    program.v.gc_next_at = policy.threshold;
+    try harness.expectResult(&program, src, try program.run(src), expected);
+    program.v.collectGarbage();
+    try testing.expect(nx.db.handleCount() < 8);
+}
+
+/// Ten thousand dropped reads (emdb has 126 reader slots), and
+/// dropped writes that hold the file's writer until a collection or
+/// the close ends them. Each write is dropped by a top-level form of
+/// its own: a slot of the running frame that still holds a handle
+/// keeps it reachable (GC.md §3).
+const dropped_txns =
+    \\(def c (db/open "@STORE@"))
+    \\(def r (db/ref c :t :k))
+    \\(db/put-key! r 1)
+    \\(defn stage [v] (let [tx (db/begin-write c)] (db/put! tx r v)) nil)
+    \\(dotimes [i 10000] (db/begin-read c))
+    \\(stage 2)
+    \\(def a (db/get-key r))
+    \\(def b (do (db/put-key! r 3) (db/get-key r)))
+    \\(stage 4)
+    \\(def d (with-tx [tx c] (db/alter! tx r inc)))
+    \\(stage 5)
+    \\(db/close c)
+    \\[a b d (db/get-key (db/ref (db/open "@STORE@") :t :k))]
+;
+
+test "db: a transaction the program drops is ended when a collection finds it unreachable" {
+    try expectDroppedTxns(vm.GcPolicy.default, dropped_txns, "[1 3 4 4]");
+    try expectDroppedTxns(vm.GcPolicy.stress, dropped_txns, "[1 3 4 4]");
 }
 
 test "db/reduce-tree walks the tree as it was when the walk began, whatever the callback writes to it" {

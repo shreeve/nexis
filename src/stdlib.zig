@@ -2899,9 +2899,11 @@ fn dbCloseCallback(opaque_ptr: *anyopaque) void {
     conn.allocator.destroy(conn);
 }
 
-/// `(db/close conn)` → nil. Refs and handles of a closed connection
-/// report `:db-closed`; closing twice is nil; closing while one of
-/// its transactions is open is `:db/busy`.
+/// `(db/close conn)` → nil. Aborts the connection's open
+/// transactions, whose handles then report `:tx-closed`; refs of a
+/// closed connection report `:db-closed`; closing twice is nil;
+/// closing from a callback a native runs over one of its
+/// transactions is `:db/busy` (DB.md §3).
 fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .db_connection) return VmError.KindMismatch;
     const conn: *db_mod.Connection = @ptrFromInt(args[0].payload);
@@ -2952,7 +2954,7 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const v = args[1];
     const conn = try liveConnOf(vm, r);
-    var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
+    var txn = try beginWrite(vm, conn);
     db_mod.putRef(&txn, r, v) catch |err| {
         db_mod.abortWrite(&txn);
         return dbFailure(vm, err);
@@ -2967,7 +2969,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
     const conn = try liveConnOf(vm, r);
-    var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
+    var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
     const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
     return result orelse default;
@@ -2976,7 +2978,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
 fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const conn = try liveConnOf(vm, r);
-    var txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err);
+    var txn = try beginWrite(vm, conn);
     const existed = db_mod.delRef(&txn, r) catch |err| {
         db_mod.abortWrite(&txn);
         return dbFailure(vm, err);
@@ -2988,7 +2990,7 @@ fn fnDbDeleteKey(vm: *VM, args: []const Value) VmError!Value {
 fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const conn = try liveConnOf(vm, r);
-    var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
+    var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
     const tree = db_mod.refTreeName(r);
     const key = db_mod.refKeyBytes(r);
@@ -3005,10 +3007,9 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 // `(let [tx (db/begin-write conn)] (try ...body... (catch any e (db/abort-write! tx) (throw e))))`
 // with commit at the end of the body.
 //
-// Single-owner enforcement: each TxnHandle struct carries an
-// `active` flag. commit/abort sets it to false; subsequent ops
-// detect this and raise `:tx-closed`. Prevents double-commit and
-// use-after-finalize.
+// A handle (`db.Handle`) is open until commit or abort, the close
+// of its connection, or a collection that finds it unreachable;
+// afterwards every operation on it but abort is `:tx-closed`.
 //
 // Held transactions: a native that calls back into the program
 // while it uses a transaction (`db/alter!`, `db/reduce-tree`) holds
@@ -3016,145 +3017,115 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 // `:db/busy`, so no callback finishes a transaction under the native
 // using it (DB.md §12).
 //
-// Lifetime: TxnHandle structs live on `vm.runtime_arena` (small
-// allocations, short-lived; arena reclaims at VM teardown). The
-// underlying emdb txn handle is freed by commit/abort.
-//
 // Connection mismatch: `db/put!` etc. validate that the supplied
 // ref belongs to the same connection the tx is open against.
 // db.zig's putRef/getRef/delRef do this via `assertRefMatchesConn`.
 
-pub const WriteTxnHandle = struct {
-    txn: db_mod.WriteTxn,
-    active: bool,
-    /// Natives running a callback over the transaction; commit and
-    /// abort refuse while any does.
-    held: u32 = 0,
-};
-
-pub const ReadTxnHandle = struct {
-    txn: db_mod.ReadTxn,
-    active: bool,
-    /// As `WriteTxnHandle.held`.
-    held: u32 = 0,
-};
-
-fn writeTxnHandle(v: Value) ?*WriteTxnHandle {
+fn writeTxnHandle(v: Value) ?*db_mod.Handle {
     if (v.kind() != .db_write_txn) return null;
-    return @ptrFromInt(v.payload);
+    return db_mod.handleOf(v);
 }
 
-fn readTxnHandle(v: Value) ?*ReadTxnHandle {
+fn readTxnHandle(v: Value) ?*db_mod.Handle {
     if (v.kind() != .db_read_txn) return null;
-    return @ptrFromInt(v.payload);
+    return db_mod.handleOf(v);
 }
 
-/// A transaction Value of either kind that is still open.
-const ActiveTxn = union(enum) {
-    write: *WriteTxnHandle,
-    read: *ReadTxnHandle,
+/// The open handle of a transaction Value of either kind.
+fn activeTxn(v: Value) VmError!*db_mod.Handle {
+    if (v.kind() != .db_write_txn and v.kind() != .db_read_txn) return VmError.KindMismatch;
+    const h = db_mod.handleOf(v);
+    if (!h.active) return VmError.TxClosed;
+    return h;
+}
 
-    /// Keep the transaction open across a callback; `release` ends
-    /// the hold.
-    fn hold(self: ActiveTxn) void {
-        switch (self) {
-            inline else => |h| h.held += 1,
-        }
-    }
+/// The open write transaction of `v`.
+fn activeWrite(v: Value) VmError!*db_mod.WriteTxn {
+    const h = writeTxnHandle(v) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
+    return &h.txn.write;
+}
 
-    fn release(self: ActiveTxn) void {
-        switch (self) {
-            inline else => |h| h.held -= 1,
-        }
-    }
-};
+/// A write transaction on `conn`. When the file's writer or every
+/// reader slot is taken and a handle this VM could collect holds a
+/// transaction on the file, one collection ends the handles the
+/// program dropped and the transaction is begun again (DB.md §12).
+/// The natives that begin transactions hold no heap value but their
+/// rooted arguments, so the cycle may run inside them (GC.md §7).
+fn beginWrite(vm: *VM, conn: *db_mod.Connection) VmError!db_mod.WriteTxn {
+    return db_mod.beginWrite(conn) catch |err| {
+        try collectForTxn(vm, conn, err);
+        return db_mod.beginWrite(conn) catch |again| dbFailure(vm, again);
+    };
+}
 
-fn activeTxn(v: Value) VmError!ActiveTxn {
-    switch (v.kind()) {
-        .db_write_txn => {
-            const h = writeTxnHandle(v).?;
-            if (!h.active) return VmError.TxClosed;
-            return .{ .write = h };
-        },
-        .db_read_txn => {
-            const h = readTxnHandle(v).?;
-            if (!h.active) return VmError.TxClosed;
-            return .{ .read = h };
-        },
-        else => return VmError.KindMismatch,
-    }
+/// A read transaction on `conn`, as `beginWrite`.
+fn beginRead(vm: *VM, conn: *db_mod.Connection) VmError!db_mod.ReadTxn {
+    return db_mod.beginRead(conn) catch |err| {
+        try collectForTxn(vm, conn, err);
+        return db_mod.beginRead(conn) catch |again| dbFailure(vm, again);
+    };
+}
+
+fn collectForTxn(vm: *VM, conn: *db_mod.Connection, err: anyerror) VmError!void {
+    if (err != error.WriterActive and err != error.ReaderTableFull) return dbFailure(vm, err);
+    if (!vm.gc_enabled or vm.borrowed_heap != null or !db_mod.collectableHandles(conn)) return dbFailure(vm, err);
+    vm.collectGarbage();
+}
+
+/// The open connection a `db/begin-*` native names.
+fn openConn(v: Value) VmError!*db_mod.Connection {
+    if (v.kind() != .db_connection) return VmError.KindMismatch;
+    const conn: *db_mod.Connection = @ptrFromInt(v.payload);
+    if (!conn.open_flag) return VmError.DbClosed;
+    return conn;
 }
 
 fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
-    const conn_v = args[0];
-    if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
-    const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
-    if (!conn.open_flag) return VmError.DbClosed;
-    const handle = vm.runtime_arena.allocator().create(WriteTxnHandle) catch return VmError.OutOfMemory;
-    handle.* = .{
-        .txn = db_mod.beginWrite(conn) catch |err| return dbFailure(vm, err),
-        .active = true,
-    };
-    return value_mod.Value{
-        .tag = @intFromEnum(value_mod.Kind.db_write_txn),
-        .payload = @intFromPtr(handle),
-    };
+    const txn = try beginWrite(vm, try openConn(args[0]));
+    const h = db_mod.Handle.create(.{ .write = txn }) catch return VmError.OutOfMemory;
+    return .{ .tag = @intFromEnum(Kind.db_write_txn), .payload = @intFromPtr(h) };
 }
 
 fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
-    const conn_v = args[0];
-    if (conn_v.kind() != .db_connection) return VmError.KindMismatch;
-    const conn: *db_mod.Connection = @ptrFromInt(conn_v.payload);
-    if (!conn.open_flag) return VmError.DbClosed;
-    const handle = vm.runtime_arena.allocator().create(ReadTxnHandle) catch return VmError.OutOfMemory;
-    handle.* = .{
-        .txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err),
-        .active = true,
-    };
-    return value_mod.Value{
-        .tag = @intFromEnum(value_mod.Kind.db_read_txn),
-        .payload = @intFromPtr(handle),
-    };
+    const txn = try beginRead(vm, try openConn(args[0]));
+    const h = db_mod.Handle.create(.{ .read = txn }) catch return VmError.OutOfMemory;
+    return .{ .tag = @intFromEnum(Kind.db_read_txn), .payload = @intFromPtr(h) };
 }
 
 fn fnDbCommit(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
     if (h.held != 0) return vm.throwKeyword("db/busy");
-    db_mod.commit(&h.txn) catch |err| {
-        h.active = false;
-        return dbFailure(vm, err);
-    };
     h.active = false;
+    db_mod.commit(&h.txn.write) catch |err| return dbFailure(vm, err);
+    return value_mod.nilValue();
+}
+
+/// `(db/abort-write! tx)` and `(db/abort-read! tx)`: nil, and nil
+/// again for a finished transaction.
+fn abortHandle(vm: *VM, h: *db_mod.Handle) VmError!Value {
+    if (!h.active) return value_mod.nilValue();
+    if (h.held != 0) return vm.throwKeyword("db/busy");
+    h.end();
     return value_mod.nilValue();
 }
 
 fn fnDbAbortWrite(vm: *VM, args: []const Value) VmError!Value {
-    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
-    if (!h.active) return value_mod.nilValue(); // idempotent abort
-    if (h.held != 0) return vm.throwKeyword("db/busy");
-    db_mod.abortWrite(&h.txn);
-    h.active = false;
-    return value_mod.nilValue();
+    return abortHandle(vm, writeTxnHandle(args[0]) orelse return VmError.KindMismatch);
 }
 
 fn fnDbAbortRead(vm: *VM, args: []const Value) VmError!Value {
-    const h = readTxnHandle(args[0]) orelse return VmError.KindMismatch;
-    if (!h.active) return value_mod.nilValue();
-    if (h.held != 0) return vm.throwKeyword("db/busy");
-    db_mod.abortRead(&h.txn);
-    h.active = false;
-    return value_mod.nilValue();
+    return abortHandle(vm, readTxnHandle(args[0]) orelse return VmError.KindMismatch);
 }
 
 /// `(db/put! tx ref value)` — write through an active tx.
 fn fnDbPut(vm: *VM, args: []const Value) VmError!Value {
-    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
-    if (!h.active) return VmError.TxClosed;
+    const txn = try activeWrite(args[0]);
     const r = args[1];
     const v = args[2];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    db_mod.putRef(&h.txn, r, v) catch |err| return dbFailure(vm, err);
+    db_mod.putRef(txn, r, v) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
@@ -3166,18 +3137,17 @@ fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const r = args[1];
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const result: ?Value = switch (try activeTxn(tx_v)) {
-        inline else => |h| db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
+    const result: ?Value = switch ((try activeTxn(tx_v)).txn) {
+        inline else => |*t| db_mod.getRef(t, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
     };
     return result orelse default;
 }
 
 fn fnDbDelete(vm: *VM, args: []const Value) VmError!Value {
-    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
-    if (!h.active) return VmError.TxClosed;
+    const txn = try activeWrite(args[0]);
     const r = args[1];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    const existed = db_mod.delRef(&h.txn, r) catch |err| return dbFailure(vm, err);
+    const existed = db_mod.delRef(txn, r) catch |err| return dbFailure(vm, err);
     return value_mod.fromBool(existed);
 }
 
@@ -3194,7 +3164,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     return switch (x.kind()) {
         .durable_ref => blk: {
             const conn = try liveConnOf(vm, x);
-            var txn = db_mod.beginRead(conn) catch |err| return dbFailure(vm, err);
+            var txn = try beginRead(vm, conn);
             defer db_mod.abortRead(&txn);
             const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
             break :blk result orelse value_mod.nilValue();
@@ -3222,11 +3192,11 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 // (the key model of `db/ref`). Each value is fully decoded onto
 // the heap before the cursor advances. Results are eager.
 
-/// Start `walk` over `tree_name` in `txn`; false for an absent tree,
-/// which every caller treats as empty.
-fn beginWalk(vm: *VM, walk: *db_mod.Walk, txn: ActiveTxn, tree_name: []const u8) VmError!bool {
-    return switch (txn) {
-        inline else => |h| walk.begin(&h.txn, tree_name),
+/// Start `walk` over `tree_name` in the transaction of `h`; false
+/// for an absent tree, which every caller treats as empty.
+fn beginWalk(vm: *VM, walk: *db_mod.Walk, h: *db_mod.Handle, tree_name: []const u8) VmError!bool {
+    return switch (h.txn) {
+        inline else => |*t| walk.begin(t, tree_name),
     } catch |err| dbFailure(vm, err);
 }
 
@@ -3304,12 +3274,12 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const interner = vm.ensureInterner();
     const tree_name = interner.keywordName(@intCast(tree_v.payload));
 
-    const txn = try activeTxn(tx_v);
+    const h = try activeTxn(tx_v);
     var walk: db_mod.Walk = undefined;
-    if (!try beginWalk(vm, &walk, txn, tree_name)) return acc;
+    if (!try beginWalk(vm, &walk, h, tree_name)) return acc;
     defer walk.end();
-    txn.hold();
-    defer txn.release();
+    h.held += 1;
+    defer h.held -= 1;
 
     var maybe_kv = walk.first(null);
     while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
@@ -3340,7 +3310,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
 
     // 1. Read current.
-    const current_opt = db_mod.getRef(&h.txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+    const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
     const current = current_opt orelse value_mod.nilValue();
 
     // 2. Build (f current extra...) arg list. f is the FIRST
@@ -3359,7 +3329,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const new_value = try called;
 
     // 4. Write.
-    db_mod.putRef(&h.txn, r, new_value) catch |err| return dbFailure(vm, err);
+    db_mod.putRef(&h.txn.write, r, new_value) catch |err| return dbFailure(vm, err);
     return new_value;
 }
 

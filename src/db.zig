@@ -15,7 +15,9 @@
 //!     self-contained identity triple (store_id, tree_name,
 //!     key_bytes) and an advisory non-identity `conn: ?*Connection`
 //!     pointer.
-//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`.
+//!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`, and the
+//!     `Handle` the language holds one by, which `close` and the
+//!     collector end.
 //!   - `Walk`: a tree walk that a write under it cannot disturb.
 //!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
 //!     keys are **opaque byte slices**, values
@@ -39,9 +41,10 @@
 //!     └── @import("emdb")
 //!
 //! Importers (DB.md §11): `dispatch.zig` / `gc.zig` at their
-//! `.durable_ref` arms, `format.zig` to print refs and handles,
-//! `stdlib.zig` for the natives, and Nextomic for `StoreFile` and the
-//! geometry constants.
+//! `.durable_ref` arms, `gc.zig` to mark and sweep transaction
+//! handles, `format.zig` to print refs and handles, `stdlib.zig` for
+//! the natives, and Nextomic for `StoreFile` and the geometry
+//! constants.
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -68,7 +71,8 @@ pub const DbError = error{
     StoreMismatch,
     InvalidTreeName,
     InvalidKey,
-    /// `close` of a connection with a transaction still open.
+    /// `close` of a connection while a native holds one of its
+    /// transactions, or with a Zig-level transaction still open.
     TransactionsOpen,
     /// A store file with more than one hard link (DB.md §3.1).
     HardLinked,
@@ -91,6 +95,7 @@ pub fn failureName(err: anyerror) []const u8 {
         error.OpenFailed => "db/open-failed",
         error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",
+        error.ReaderTableFull => "db/readers-full",
         error.HardLinked => "db/hard-linked",
         error.TxnAborted => "db/txn-aborted",
         error.TxnReadOnly => "db/read-only",
@@ -273,8 +278,9 @@ pub const Connection = struct {
     /// `ConnectionUnavailable` for subsequent ops.
     open_flag: bool,
 
-    /// Transactions begun and not yet committed or aborted; `close`
-    /// refuses while any is open, so no transaction outlives its env.
+    /// Transactions begun and not yet committed or aborted. `close`
+    /// ends the language's (`Handle`) and refuses while any other
+    /// transaction is open, so none outlives its env.
     open_txns: u32 = 0,
 
     /// Named-tree handles this connection has resolved, keyed by
@@ -342,19 +348,44 @@ pub fn open(
     };
 }
 
-/// Close the connection. A closed connection stays a valid struct:
-/// refs and transaction handles that name it read `open_flag` and
-/// report it closed. A second close does nothing; a close while a
-/// transaction of the connection is open is refused, so no emdb
-/// transaction outlives its env.
+/// Close the connection, aborting every transaction the language
+/// holds on it (DB.md §3). A closed connection stays a valid struct:
+/// refs and handles that name it read `open_flag` and report it
+/// closed. A second close does nothing. A close while a native holds
+/// one of the connection's transactions for a callback, or while a
+/// Zig-level transaction is open, is refused, so no emdb transaction
+/// outlives its env.
 pub fn close(self: *Connection) DbError!void {
+    if (!self.open_flag) return;
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        if (h.conn() == self and h.held != 0) return DbError.TransactionsOpen;
+    }
+    it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        if (h.conn() == self) h.end();
+    }
     if (self.open_txns != 0) return DbError.TransactionsOpen;
-    shutdown(self);
+    release(self);
 }
 
-/// Close the connection whatever is still open: teardown of the whole
-/// VM, when nothing can use the connection again.
+/// Teardown of the whole VM, when nothing can use the connection
+/// again: end and free its handles and close it whatever is open.
 pub fn shutdown(self: *Connection) void {
+    var link = &Handle.all;
+    while (link.*) |h| {
+        if (h.conn() != self) {
+            link = &h.next;
+            continue;
+        }
+        h.end();
+        link.* = h.next;
+        self.allocator.destroy(h);
+    }
+    release(self);
+}
+
+fn release(self: *Connection) void {
     if (!self.open_flag) return;
     self.file.release();
     var names = self.tree_ids.keyIterator();
@@ -421,6 +452,117 @@ pub fn abortWrite(txn: *WriteTxn) void {
 pub fn abortRead(txn: *ReadTxn) void {
     txn.conn.open_txns -= 1;
     txn.inner.abort();
+}
+
+// =============================================================================
+// Transaction handles (DB.md §12)
+// =============================================================================
+
+/// A transaction as the language holds it: the payload of a
+/// `db_write_txn` or `db_read_txn` Value, allocated on the
+/// connection's allocator. It ends by commit or abort, by `close` of
+/// its connection, or by a collection that finds no Value of it
+/// (`markHandle`, `sweepHandles`). The struct outlives its
+/// transaction while a Value names it, which then reports the
+/// transaction closed, and is freed by the first collection after
+/// it becomes unreachable, or at VM teardown (`shutdown`).
+pub const Handle = struct {
+    txn: union(enum) { write: WriteTxn, read: ReadTxn },
+    /// Neither committed nor aborted yet.
+    active: bool = true,
+    /// Natives running a callback over the transaction: commit, abort
+    /// and `close` refuse while any does, so no callback finishes a
+    /// transaction a native is still using.
+    held: u32 = 0,
+    /// Set by the collector's mark phase when it reaches a Value of
+    /// the handle; cleared by the sweep.
+    reached: bool = false,
+    next: ?*Handle,
+
+    /// Every handle of the process. The runtime is single-threaded,
+    /// as `StoreFile.open_files` is.
+    var all: ?*Handle = null;
+
+    /// A handle over `txn`, just begun; on failure `txn` is aborted.
+    pub fn create(txn: @FieldType(Handle, "txn")) !*Handle {
+        var t = txn;
+        const self = switch (t) {
+            inline else => |*x| x.conn.allocator.create(Handle) catch |err| {
+                x.conn.open_txns -= 1;
+                x.inner.abort();
+                return err;
+            },
+        };
+        self.* = .{ .txn = t, .next = all };
+        all = self;
+        return self;
+    }
+
+    pub fn conn(self: *const Handle) *Connection {
+        return switch (self.txn) {
+            inline else => |x| x.conn,
+        };
+    }
+
+    /// Abort the transaction if it is still open.
+    pub fn end(self: *Handle) void {
+        if (!self.active) return;
+        switch (self.txn) {
+            .write => |*w| abortWrite(w),
+            .read => |*r| abortRead(r),
+        }
+        self.active = false;
+    }
+};
+
+/// The handle behind a `db_write_txn` or `db_read_txn` Value.
+pub fn handleOf(v: Value) *Handle {
+    std.debug.assert(v.kind() == .db_write_txn or v.kind() == .db_read_txn);
+    return @ptrFromInt(v.payload);
+}
+
+/// The collector reached a Value of the handle (GC.md §5).
+pub fn markHandle(v: Value) void {
+    handleOf(v).reached = true;
+}
+
+/// After a mark phase over `heap`: end and free every handle of a
+/// connection on `heap` that no Value reached, unless a native holds
+/// it. `complete` is false when the marks are incomplete, which only
+/// clears them. Ending a transaction allocates nothing on the heap.
+pub fn sweepHandles(heap: *Heap, complete: bool) void {
+    var link = &Handle.all;
+    while (link.*) |h| {
+        const c = h.conn();
+        if (c.heap != heap or !complete or h.reached or h.held != 0) {
+            if (c.heap == heap) h.reached = false;
+            link = &h.next;
+            continue;
+        }
+        h.end();
+        link.* = h.next;
+        c.allocator.destroy(h);
+    }
+}
+
+/// Whether a handle a collection on `conn`'s heap could end holds a
+/// transaction on `conn`'s file: the one retry a busy writer or a
+/// full reader table earns (DB.md §12).
+pub fn collectableHandles(conn: *const Connection) bool {
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) {
+        const c = h.conn();
+        if (h.active and h.held == 0 and c.heap == conn.heap and c.file == conn.file) return true;
+    }
+    return false;
+}
+
+/// Handles alive in the process, ended or not.
+pub fn handleCount() usize {
+    var n: usize = 0;
+    var it = Handle.all;
+    while (it) |h| : (it = h.next) n += 1;
+    return n;
 }
 
 // =============================================================================

@@ -160,8 +160,10 @@ second writer on it is `:db/busy`
 tree ids once per connection, reads values whole off cursors, lets a
 walk see its tree as it began whatever its callback writes, holds
 the transaction a `db/alter!` or `db/reduce-tree` callback runs in so
-the callback cannot finish it, and names every engine failure as a
-`:db/*` keyword (`docs/DB.md`).
+the callback cannot finish it, aborts a transaction the program drops
+at the next collection that finds nothing holding it and every open
+one at `db/close`, and names every engine failure as a `:db/*`
+keyword (`docs/DB.md`).
 
 ### 3.5 Nextomic
 
@@ -290,53 +292,45 @@ failing test (AGENTS.md).
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-4. **A transaction handle dropped open is never aborted**: nothing
-   ends a `db/begin-read` or `db/begin-write` handle the program
-   neither commits nor aborts, because handles are not collector
-   blocks and nothing finalizes them; it lives until VM teardown and
-   keeps its connection from closing (`docs/DB.md` §12). `with-tx`
-   and `with-read-tx` always close theirs. Next: track open handles on
-   the connection and abort them when it closes, or give the kind a
-   finalizer.
-5. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+4. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
    is `MalformedMacroCall` ("options come in pairs"). Next: in
    `expand.zig`'s require walk, expand a spec whose second element is
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-6. **Out of memory ends the process with exit status 1**:
+5. **Out of memory ends the process with exit status 1**:
    `VmError.OutOfMemory` escapes `main` as a Zig `error: OutOfMemory`,
    the status of a usage error, and ends a REPL session. Next: report
    it as a runtime error (exit 5, `docs/TOOLING.md` §1) and keep the
    REPL alive after `resetAfterError`; a CLI golden whose program asks
    for an allocation no machine has.
-7. **The REPL copies pending input on every line**: each line of an
+6. **The REPL copies pending input on every line**: each line of an
    incomplete form dupes the whole pending text into the session arena
    and reads it again, so a pasted form of n lines costs O(n²), and
    there is no continuation prompt. Next: `cli.zig` keeps the pending
    text in its growable buffer and dupes it once when the form is
    complete, and prints a continuation prompt; `test/golden/cli/repl.*`
    gains a multi-line form.
-8. **An error's caret counts bytes**: the underline and column of an
+7. **An error's caret counts bytes**: the underline and column of an
    error report advance one per byte, so a line with multi-byte
    characters before the span underlines the wrong place. Next: count
    code points in `cli.zig`'s report, with a CLI golden holding a
    non-ASCII line.
-9. **Small Clojure differences**: `(int x)` of NaN is
+8. **Small Clojure differences**: `(int x)` of NaN is
    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
    transient (Clojure's transient collections are counted);
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-10. **A routine holds at most 4096 live locals and 4096 captured
-    locals**, the two routine caps the 12-bit slot and upvalue
-    operands leave (COMPILER.md §4.4); past either the compile error
-    names the routine and the cap (`too-many-locals.err`). Every other
-    routine table is 32-bit. Deeply nested calls whose arguments need
-    code, `(f (f (f …)))`, still take a slot per level, so about 4000
-    levels reach the slot cap before the stack guard. Next: release a
-    call block's slots to the argument that consumes them, as nested
-    arithmetic does (`compile.zig` call lowering).
+9. **A routine holds at most 4096 live locals and 4096 captured
+   locals**, the two routine caps the 12-bit slot and upvalue
+   operands leave (COMPILER.md §4.4); past either the compile error
+   names the routine and the cap (`too-many-locals.err`). Every other
+   routine table is 32-bit. Deeply nested calls whose arguments need
+   code, `(f (f (f …)))`, still take a slot per level, so about 4000
+   levels reach the slot cap before the stack guard. Next: release a
+   call block's slots to the argument that consumes them, as nested
+   arithmetic does (`compile.zig` call lowering).
 
 ### 6.2 Nextomic
 
@@ -465,8 +459,7 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 1): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. Transaction handles dropped open (§6.1 item 4) and out of memory
-   as a runtime error (§6.1 item 6).
+2. Out of memory as a runtime error (§6.1 item 5).
 3. The parser regeneration check and a Linux run (§6.4).
 4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
