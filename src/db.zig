@@ -157,6 +157,10 @@ pub const StoreFile = struct {
     unsynced: bool = false,
     /// How the open write transaction's commit syncs.
     write_sync: emdb.SyncOverride = .full,
+    /// A Nextomic read transaction, every tree loaded, kept from one
+    /// read to the next while it is still the file's latest commit
+    /// (DB.md §3.4).
+    held: ?*emdb.Txn = null,
 
     var open_files: ?*StoreFile = null;
 
@@ -198,6 +202,7 @@ pub const StoreFile = struct {
         self.refs = 1;
         self.unsynced = false;
         self.write_sync = .full;
+        self.held = null;
         self.next = open_files;
         open_files = self;
         return self;
@@ -208,6 +213,7 @@ pub const StoreFile = struct {
     pub fn release(self: *StoreFile) void {
         self.refs -= 1;
         if (self.refs > 0) return;
+        self.dropHeld();
         self.syncOrWarn();
         var link = &open_files;
         while (link.*) |f| : (link = &f.next) {
@@ -227,6 +233,9 @@ pub const StoreFile = struct {
     /// opened read-only.
     pub fn beginWrite(self: *StoreFile, options: emdb.Env.WriteOptions) !*emdb.Txn {
         if (self.env.options.readOnly) return error.TxnReadOnly;
+        // The commit would pass the held snapshot, which would then pin
+        // the pages it frees until the next read.
+        self.dropHeld();
         const txn = try self.env.beginWriteWith(options);
         self.write_sync = options.sync;
         return txn;
@@ -258,12 +267,54 @@ pub const StoreFile = struct {
         self.sync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
     }
 
-    /// Sync every open file that needs it: what a process runs on its
-    /// way out, where no connection is closed first (`exit`, an
-    /// uncaught error in `bin/nexis`).
+    /// Sync every open file that needs it and let every held snapshot
+    /// go: what a process runs on its way out, where no connection is
+    /// closed first (`exit`, an uncaught error in `bin/nexis`).
     pub fn syncAll() void {
         var it = open_files;
-        while (it) |f| : (it = f.next) f.syncOrWarn();
+        while (it) |f| : (it = f.next) {
+            f.dropHeld();
+            f.syncOrWarn();
+        }
+    }
+
+    /// The held read transaction, while no commit has passed it; the
+    /// caller ends it with `keep`. Null when none is held, and when the
+    /// one held was passed, which ends it.
+    pub fn takeHeld(self: *StoreFile) ?*emdb.Txn {
+        const txn = self.held orelse return null;
+        self.held = null;
+        if (self.latest(txn)) return txn;
+        txn.abort();
+        return null;
+    }
+
+    /// End the read `txn`: held for the next read when none is and it
+    /// is still the latest commit, aborted otherwise.
+    pub fn keep(self: *StoreFile, txn: *emdb.Txn) void {
+        if (self.held == null and self.latest(txn)) {
+            self.held = txn;
+        } else txn.abort();
+    }
+
+    pub fn dropHeld(self: *StoreFile) void {
+        const txn = self.held orelse return;
+        self.held = null;
+        txn.abort();
+    }
+
+    /// Let every held snapshot go: at each collection and while the
+    /// REPL waits for input, so an idle or busy program pins no pages
+    /// another process frees.
+    pub fn dropAllHeld() void {
+        var it = open_files;
+        while (it) |f| : (it = f.next) f.dropHeld();
+    }
+
+    /// Whether `txn` reads the file's newest commit, by this process
+    /// or any other.
+    fn latest(self: *StoreFile, txn: *emdb.Txn) bool {
+        return txn.txnId == self.env.inner.activeMeta().loadTxnId();
     }
 
     /// A regular file this process may read but not write: the one
@@ -660,9 +711,11 @@ pub fn markHandle(v: Value) void {
 
 /// After a mark phase over `heap`: end and free every handle of a
 /// connection on `heap` that no Value reached, unless a native holds
-/// it. `complete` is false when the marks are incomplete, which only
-/// clears them. Ending a transaction allocates nothing on the heap.
+/// it, and let every held snapshot go (DB.md §3.4). `complete` is false
+/// when the marks are incomplete, which only clears them. Ending a
+/// transaction allocates nothing on the heap.
 pub fn sweepHandles(heap: *Heap, complete: bool) void {
+    StoreFile.dropAllHeld();
     var link = &Handle.all;
     while (link.*) |h| {
         const c = h.conn();
@@ -1480,6 +1533,65 @@ test "syncAll: one sync for each file written without one; shutdown syncs a file
     try commit(&w);
     shutdown(&conns[2]);
     try testing.expectEqual(before + 3, engineSyncs());
+}
+
+test "held snapshot: kept while it is the latest commit; a commit passing it, a write, a collection and the last release let it go" {
+    const path = try tmpDbPath(testing.allocator, "held");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    const file = conn.file;
+    try testing.expect(file.takeHeld() == null);
+
+    // Kept, and handed out again while no commit has passed it.
+    const first = try file.env.beginRead();
+    file.keep(first);
+    try testing.expectEqual(first, file.takeHeld().?);
+    try testing.expect(file.takeHeld() == null);
+    // One is held at a time: a second read ends.
+    const second = try file.env.beginRead();
+    file.keep(first);
+    file.keep(second);
+    try testing.expectEqual(first, file.held.?);
+
+    // A commit the file's own writer did not begin, as another
+    // process's is, passes it: the next take ends it.
+    const other = try file.env.beginWriteWith(.{ .sync = .none });
+    try other.putInTree(try other.openTree("t", true), "a", "b");
+    try other.commit();
+    try testing.expect(file.takeHeld() == null);
+    try testing.expect(file.held == null);
+
+    // A read that a commit passed while it ran is not kept.
+    const stale = try file.env.beginRead();
+    var w = try beginWrite(&conn);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    file.keep(stale);
+    try testing.expect(file.held == null);
+
+    // This process's own write lets it go before it begins.
+    file.keep(try file.env.beginRead());
+    try testing.expect(file.held != null);
+    w = try beginWrite(&conn);
+    try testing.expect(file.held == null);
+    abortWrite(&w);
+
+    // So does a collection's sweep.
+    file.keep(try file.env.beginRead());
+    sweepHandles(&heap, true);
+    try testing.expect(file.held == null);
+
+    // The last release ends one still held (the allocator and emdb
+    // would report a transaction outliving its environment).
+    file.keep(try file.env.beginRead());
+    try testing.expect(file.held != null);
 }
 
 test "durability commit: a commit survives its process ending without a sync or a close" {

@@ -580,6 +580,8 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             try stdout.writeStreamingAll(io, pad[0..@min(ns.len -| 2, pad.len)]);
             try stdout.writeStreamingAll(io, "#_=> ");
         }
+        // A wait of any length: no held read may pin pages meanwhile.
+        db.StoreFile.dropAllHeld();
         const line = stdlib.readStdinLine(io) catch |err| {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: stdin read error: ");
             try std.Io.File.stderr().writeStreamingAll(io, @errorName(err));

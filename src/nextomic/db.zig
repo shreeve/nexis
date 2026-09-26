@@ -220,20 +220,23 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
-    /// A read transaction for one operation: a fresh reader, or a
-    /// read-only child of the held write transaction on a `with` view.
-    /// Ends with `endReadTxn`.
+    /// A read transaction for one operation: the file's held snapshot
+    /// while no commit has passed it (`db.StoreFile.takeHeld`), else a
+    /// fresh reader; on a `with` view, a read-only child of the held
+    /// write transaction. Ends with `endReadTxn`.
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
-        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else try self.store.beginRead();
+        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else self.store.file.takeHeld() orelse try self.store.beginRead();
         errdefer txn.abort();
         try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
 
+    /// End the read: a reader is kept for the next read while it is the
+    /// latest commit (NEXTOMIC.md §2), a child is aborted.
     pub fn endReadTxn(self: *Conn, txn: *Txn) void {
-        txn.abort();
+        if (self.overlay == null) self.store.file.keep(txn) else txn.abort();
         self.taskDone();
     }
 

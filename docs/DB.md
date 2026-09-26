@@ -240,6 +240,38 @@ commit it, and the deadline needs a clock checked from the VM's loop.
 A `:commit` transaction already costs tens of microseconds
 (`docs/PERF.md` §3.11), so the gain left is the per-commit meta write.
 
+#### 3.4 The held snapshot
+
+A Nextomic read begins an emdb read transaction and loads the store's
+twelve trees into it, each a lookup in the file's main tree: most of
+the cost of a point read such as `d/entity` or `d/entid`. So the file
+keeps one (`StoreFile.held`): a Nextomic operation's read ends by
+`keep`, which holds it when none is held and it still reads the file's
+newest commit, and the next operation's read on any connection to the
+file begins by `takeHeld`, which hands it out while no commit, by this
+process or another, has passed it (its snapshot is still the active
+meta page's), and otherwise ends it. One operation uses it at a time:
+a read nested inside another begins its own, since a multi-page value
+lives in its transaction's buffer. A read on the view of a `with` is a
+child of the held write transaction and is never kept.
+
+A held snapshot pins the pages every later commit frees, so it goes:
+
+- before any write transaction on the file in this process begins
+  (`StoreFile.beginWrite`), whichever connection or layer asks;
+- when a commit has passed it, at the next read;
+- at every collection (`sweepHandles`), so a program that computes
+  between reads holds it for at most one collection's interval;
+- while the REPL waits for a line, and at the last release, `exit`
+  and an error `bin/nexis` reports.
+
+A program that reads and then blocks outside the REPL (`read-line`)
+keeps it until its next read, write, collection or exit; meanwhile
+another process's commits cannot reuse the pages it pins, and the file
+grows by what they write. A read through `db/*` begins its own
+transaction: it loads only the tree it reads, so holding one would
+save little.
+
 ---
 
 ### 4. `durable_ref` heap kind (VALUE.md §2.2 kind 26)
@@ -276,7 +308,8 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |
 | `commit(*WriteTxn) !void` / `abortWrite(*WriteTxn)` / `abortRead(*ReadTxn)` | End the transaction; a failed commit aborts (§3). |
 | `Handle.create(txn) !*Handle` / `Handle.end(*Handle)` / `handleOf(Value) *Handle` | §3.2; `end` aborts a transaction still open. |
-| `markHandle(Value)` / `sweepHandles(*Heap, complete)` | The collector's two calls (§3.2, `GC.md` §5). |
+| `markHandle(Value)` / `sweepHandles(*Heap, complete)` | The collector's two calls (§3.2, `GC.md` §5); the sweep also lets every held snapshot go (§3.4). |
+| `StoreFile.takeHeld(*StoreFile) ?*emdb.Txn` / `keep(*StoreFile, txn)` / `dropHeld(*StoreFile)` / `StoreFile.dropAllHeld()` | The held snapshot (§3.4). |
 | `collectableHandles(*const Connection) bool` / `handleCount() usize` | Whether a collection could end a transaction on the connection's file; the handles alive in the process. |
 | `Walk.begin(*Walk, txn, tree) !bool` / `first(?start)` / `next()` / `end()` | A walk (§3); `begin` is false for an absent tree. |
 | `treeId(txn, name, create) !?TreeId` | §3; null for an absent tree when `create` is false. |

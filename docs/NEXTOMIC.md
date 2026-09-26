@@ -80,7 +80,10 @@ re-tokenises a store at connect alike, is atomic and seen at once by
 every connection and process sharing the file; whether it syncs is the
 connection's durability (§3 "Durability", `docs/DB.md` §3.3). The file
 is opened with 4,096 reader slots (`db.reader_slots`, `docs/DB.md`
-§3.2).
+§3.2). A read begins in the file's held snapshot, a read transaction
+kept from the previous operation while no commit has passed it, or in
+a fresh one, and ends by keeping it (`docs/DB.md` §3.4); a db-value
+still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|

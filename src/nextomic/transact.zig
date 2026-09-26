@@ -3576,6 +3576,55 @@ test "durability: a connection opened without :sync takes the process's (NEXIS_D
     try testing.expectEqual(expected, conn.sync_mode);
 }
 
+test "reads share the file's held snapshot until a commit passes it; a with view's reads are never kept" {
+    const tc = try TestConn.init("tx_held");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const file = tc.conn.store.file;
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer other.destroy();
+
+    const db2 = try tc.conn.db();
+    const held = file.held.?;
+    // Another connection to the file reads through the same snapshot.
+    try testing.expectEqual(db2.basis, (try other.db()).basis);
+    try testing.expectEqual(held, file.held.?);
+    // Nested reads: the outer holds the snapshot, the inner begins its own.
+    var outer = try db2.beginRead();
+    try testing.expect(file.held == null);
+    try testing.expectEqual(held, outer.txn);
+    var inner = try db2.beginRead();
+    try testing.expect(inner.txn != held);
+    inner.close();
+    try testing.expect(file.held != null);
+    outer.close();
+
+    // A transaction on either connection lets it go, and the next read
+    // sees its commit.
+    const r = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+    }, .{});
+    try testing.expectEqual(r.t, (try tc.conn.db()).basis);
+    const e = r.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 1), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = e })).len);
+
+    // The view of a with reads children of its write transaction; the
+    // write let the snapshot go and the view keeps none.
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    try testing.expect(file.held == null);
+    try testing.expectEqual(r.t + 1, w.db().basis);
+    try testing.expectEqual(@as(usize, 1), (try w.db().datoms(arena, .eavt, .{ .e = e })).len);
+    try testing.expect(file.held == null);
+    w.destroy();
+    try testing.expectEqual(r.t, (try tc.conn.db()).basis);
+}
+
 test "another connection's data commits keep the schema cache; its schema changes rebuild it" {
     const tc = try TestConn.init("tx_schema_gen");
     defer tc.deinit();
