@@ -441,8 +441,9 @@ map or `nil`; it never throws.
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
 | every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
-- The metadata argument is a map or `nil` (which clears it); anything
-  else is `:kind-mismatch`, checked before the target's kind.
+- The metadata argument is a map, hash or sorted, or `nil` (which
+  clears it); anything else is `:kind-mismatch`, checked before the
+  target's kind.
 - `reset-meta!` and `alter-meta!` take a Var; any other target is
   `:kind-mismatch`.
 - Reader metadata on a collection literal attaches: `(meta ^:foo [1])`

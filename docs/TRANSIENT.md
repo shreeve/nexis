@@ -82,7 +82,7 @@ a frozen wrapper still traces its inner root (§10).
 |---|---|---|
 | `TransientFrozen` | any operation on a frozen wrapper | `:transient-used-after-persistent` |
 | `TransientKindMismatch` | a non-transient Value, or the wrong family (`dissoc!` on a vector transient) | `:kind-mismatch` |
-| `InvalidTransientInner` | `transient` of anything but a map, set or vector | `:kind-mismatch` |
+| `InvalidTransientInner` | `transient` of anything but a hash map, hash set or vector (a sorted collection has no transient, as in Clojure) | `:kind-mismatch` |
 | `IndexOutOfBounds` | `pop!` of an empty vector; `assoc!` past the count | `:index-out-of-bounds` |
 | `TransientWrongOwner` | never (§4) | — |
 
@@ -105,7 +105,7 @@ wrapper it was given; the source collection is never changed.
 
 | Form | Meaning |
 |---|---|
-| `(transient coll)` | an active transient of a map, set or vector |
+| `(transient coll)` | an active transient of a hash map, hash set or vector |
 | `(persistent! t)` | the collection; `t` is frozen |
 | `(conj! t x & xs)` | vector: append; set: add; map: `x` as `conj` onto a map takes it, a `[k v]` vector, a map or record whose entries are all put, or nil (nothing). `(conj!)` is a new transient vector, `(conj! t)` is `t` |
 | `(assoc! t k v & kvs)` | map: put; vector: replace index `k`, or append when `k` is the count |

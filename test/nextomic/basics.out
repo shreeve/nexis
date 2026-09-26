@@ -80,4 +80,5 @@ ok a unique value moves before its old holder lets go
 ok a lookup ref names an identity asserted after it
 :no-error
 {:error :nextomic/unique, :attr :person/email, :value x2@example.com}
+:sorted-entity 42
 :basics-done

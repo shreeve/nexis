@@ -13,6 +13,7 @@ const value_mod = @import("value.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const heap_mod = @import("heap.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
@@ -1345,6 +1346,22 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
             while (it.next()) |e| try items.append(ctx.allocator, try valueToForm(ctx, e, origin));
             break :blk .{ .set = items.items };
         },
+        // A sorted collection in the natural order travels as
+        // `(nexis.internal/#%sorted-map k v ...)`, which builds it and
+        // which `quote` folds to the collection itself; one with a
+        // comparator of its own carries code, which no form holds.
+        .sorted_map, .sorted_set => blk: {
+            const set = v.kind() == .sorted_set;
+            if (!sorted_mod.comparatorOf(v).isNil()) return ctx.fail(origin, "a macro returned a sorted {s} with a comparator of its own, which is not a form", .{if (set) "set" else "map"});
+            var items: std.ArrayList(*Form) = .empty;
+            try items.append(ctx.allocator, try makeForm(ctx, .{ .symbol = .{ .ns = "nexis.internal", .name = if (set) "#%sorted-set" else "#%sorted-map" } }, origin));
+            var c = sorted_mod.Cursor.init(v);
+            while (c.next()) |e| {
+                try items.append(ctx.allocator, try valueToForm(ctx, e.key, origin));
+                if (!set) try items.append(ctx.allocator, try valueToForm(ctx, e.value, origin));
+            }
+            break :blk .{ .list = items.items };
+        },
         else => return ctx.fail(origin, "a macro returned a {s}, which is not a form", .{@tagName(v.kind())}),
     };
     const form = try makeForm(ctx, datum, origin);
@@ -1353,7 +1370,8 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         else => false,
     };
     if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
-        const meta = try valueToForm(ctx, champ_mod.valueFromMapHeader(m), origin);
+        const meta_v = if (m.kind == @intFromEnum(value_mod.Kind.sorted_map)) heap_mod.Heap.valueFromHeader(.sorted_map, m) else champ_mod.valueFromMapHeader(m);
+        const meta = try valueToForm(ctx, meta_v, origin);
         return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
     };
     return form;

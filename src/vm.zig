@@ -3798,13 +3798,9 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 ///
 /// A transient map, set or vector is called, and looked up by a
 /// keyword, as its persistent kind is (TRANSIENT.md §7); a sorted map
-/// or set as a map or set is. Any other arity is `ArityMismatch`
-/// (VM.md §6). A caller with no VM reaches a sorted key by `=`
-/// (`lookupIn`).
-pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
-    return callLookupIn(null, callee, args);
-}
-
+/// or set as a map or set is, through its comparator on `vm`. Any
+/// other arity is `ArityMismatch` (VM.md §6). A caller with no VM
+/// reaches a sorted key by `=` (`lookupIn`).
 pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value {
     if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
     const default = if (args.len == 2) args[1] else value_mod.nilValue();

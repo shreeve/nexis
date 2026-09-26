@@ -209,5 +209,10 @@
 (println (t/caught (d/transact! c [[:db/add x :person/email "y2@example.com"] [:db/add y :person/email "x2@example.com"]])))
 (println (t/caught (d/transact! c [[:db/add x :person/email "x2@example.com"] [:db/add x :person/age 1]])))
 
+; A sorted map is an entity map like any other.
+(d/transact! c [{:db/ident :srt/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+(d/transact! c [(sorted-map :srt/n 42)])
+(println :sorted-entity (d/q '[:find ?n . :where [_ :srt/n ?n]] (d/db c)))
+
 (d/release c)
 (println :basics-done)

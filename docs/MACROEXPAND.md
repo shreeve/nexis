@@ -125,8 +125,13 @@ otherwise it is an ordinary call. User macros shadow host macros.
    (`valueToForm`): nil, booleans, fixnums, bignums (an `int` within
    i64, else a `bigint`), floats, chars, strings, symbols, keywords,
    lists (including a vector's seq view), vectors, maps and sets; the
-   list `(nexis.internal/#%meta x m)` becomes `^m x` (§5). Any other
-   kind (a function, a Var, an atom) is `MalformedMacroCall`.
+   list `(nexis.internal/#%meta x m)` becomes `^m x` (§5). A sorted map
+   or set in the natural order becomes the list
+   `(nexis.internal/#%sorted-map k v ...)` or `(nexis.internal/#%sorted-set x ...)`,
+   which evaluates to the collection and which `quote` folds to the
+   collection itself; one with a comparator of its own holds code, and
+   is `MalformedMacroCall`. Any other kind (a function, a Var, an atom)
+   is `MalformedMacroCall`.
 7. **Variadic macros** (`& body`) work; `recur` in a variadic macro
    body is rejected as at run time.
 8. Macro arguments are **unevaluated forms as data**: a macro body
