@@ -1,0 +1,16 @@
+; Forms past what 4096 slots and 12-bit jump targets allowed compile:
+; arithmetic nested 10,000 deep computes each level into the slot the
+; level outside it reads, and a cond of 2000 clauses branches past pc
+; 4095. Only the native stack bounds depth.
+(defmacro nest [n form]
+  (reduce (fn [acc _] (list 'inc acc)) form (range n)))
+
+(defmacro big-cond [x n]
+  (cons 'cond (concat (mapcat (fn [i] [(list '= x i) (* i 2)]) (range n))
+                      [:else :none])))
+
+(defn classify [x] (big-cond x 2000))
+
+(println (nest 10000 0))
+(println (let [x 1] (nest 10000 x)))
+(println [(classify 0) (classify 1999) (classify 2000)])

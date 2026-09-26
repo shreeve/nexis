@@ -347,7 +347,7 @@ pub const CapturedName = struct {
 ///   - `loop*` body: REPLACE with new loop target
 ///   - all other positions: pass `null` (recur invalid here)
 pub const RecurTarget = struct {
-    entry_pc: u12,
+    entry_pc: u32,
     /// The slots `recur` rebinds, in argument order: a loop's
     /// bindings, or a fn's fixed params followed by its rest
     /// slot when it has one (the rest slot takes the seq `recur`
@@ -383,19 +383,10 @@ pub const CompileError = error{
     /// bignum `Tiny.literal`.
     IntegerOutOfFixnumRange,
 
-    /// A routine needs more than 4096 constants or capture
-    /// descriptors: the 12-bit operands that index them cannot
-    /// address more, and there are no extension instructions.
-    ConstantPoolOverflow,
-
-    /// A jump targets a pc past 4095, which the 12-bit jump
-    /// operand cannot address. Code past pc 4095 that nothing jumps
-    /// to runs.
-    JumpTargetOutOfRange,
-
-    /// A routine needs more than 4096 slots live at once, upvalues
-    /// or Var-table entries: the 12-bit operands that index them
-    /// cannot address more.
+    /// A routine needs more than 4096 slots live at once or more
+    /// than 4096 upvalues, the two limits the 12-bit slot and
+    /// upvalue operands leave (COMPILER.md §4.4); `LowerDiag.detail`
+    /// names the routine and the limit.
     SlotOverflow,
 
     /// A symbol resolves to nothing COMPILER.md §4.3 classifies: no
@@ -516,8 +507,10 @@ pub const CompileError = error{
 /// until it is reset or destroyed; there is no `deinit`.
 pub const Compiled = struct {
     code: []const Inst,
-    consts: []const vm.Const,
+    consts: []const Value,
     capture_descs: []const vm.CaptureDescriptor = &.{},
+    /// The routine's `try` forms, which `ctrl:try-enter` names.
+    tries: []const vm.Try = &.{},
     /// Per-routine Var table. The V operand index
     /// resolves through this table at runtime. Lifetime: same
     /// as the rest of the Compiled (compile-arena-owned).
@@ -542,6 +535,7 @@ pub const Compiled = struct {
             .code = self.code,
             .consts = self.consts,
             .capture_descs = self.capture_descs,
+            .tries = self.tries,
             .var_table = self.var_table,
             .slot_count = self.slot_count,
             .fixed_arity = self.fixed_arity,
@@ -575,6 +569,22 @@ fn toSourceSpan(span: reader_mod.SrcSpan) vm.SourceSpan {
 // Emitter — internal mutable accumulator
 // =============================================================================
 
+/// How many slots, upvalues, and in-place constants and Vars an
+/// operand's 12-bit index addresses (VM.md §3).
+const max_operands = 1 << 12;
+
+/// A pc, or a constant, Var, try or capture-descriptor index, which
+/// the VM reads from an instruction's 32-bit wide field; a table that
+/// outgrows it cannot have been allocated.
+fn tableIndex(n: usize) CompileError!u32 {
+    return std.math.cast(u32, n) orelse CompileError.OutOfMemory;
+}
+
+/// The target a jump or handler instruction carries until it is
+/// patched: past any routine's code, so a missed patch fails in the
+/// VM instead of jumping.
+const unpatched = std.math.maxInt(u32);
+
 /// `Emitter` accumulates a routine's bytecode, constants, slot
 /// count, and active lexical scope as a tree of `compileExpr`
 /// calls runs. It's allocator-owned and turned into a `Compiled`
@@ -602,10 +612,11 @@ const Emitter = struct {
     /// and nested routines, which live as long as the caller needs.
     out: std.mem.Allocator,
     code: std.ArrayList(Inst) = .empty,
-    consts: std.ArrayList(vm.Const) = .empty,
-    /// Where each Value constant sits in `consts`.
-    value_consts: std.AutoHashMapUnmanaged([2]u64, u12) = .empty,
+    consts: std.ArrayList(Value) = .empty,
+    /// Where each constant sits in `consts`.
+    value_consts: std.AutoHashMapUnmanaged([2]u64, u32) = .empty,
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
+    tries: std.ArrayList(vm.Try) = .empty,
     scope: std.ArrayList(LocalBinding) = .empty,
     /// The next free slot. Slots are a stack: `compileExpr` frees
     /// every slot a node allocated once the node is compiled, so a
@@ -675,6 +686,14 @@ const Emitter = struct {
     /// Receives the span of the innermost form being compiled when
     /// an error is raised; nested routines share their parent's.
     diag: ?*LowerDiag = null,
+    /// The temporary `compileOperand` is computing a value into: no
+    /// code reads it until the value's last instruction writes it, so
+    /// that value's own evaluation may use it as working space.
+    scratch: ?u12 = null,
+    /// Whether this routine is a `fn*`'s, and its name when it has
+    /// one: what a limit error names.
+    is_fn: bool = false,
+    fn_name: ?[]const u8 = null,
 
     fn init(allocator: std.mem.Allocator, out: std.mem.Allocator) Emitter {
         return .{ .allocator = allocator, .out = out };
@@ -686,6 +705,7 @@ const Emitter = struct {
         self.consts.deinit(self.allocator);
         self.value_consts.deinit(self.allocator);
         self.capture_descs.deinit(self.allocator);
+        self.tries.deinit(self.allocator);
         self.scope.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.captured_names.deinit(self.allocator);
@@ -778,7 +798,7 @@ const Emitter = struct {
         // capture there could be popped by inner let_star
         // scope restoration.
         const u_idx_usize = self.captures.items.len;
-        if (u_idx_usize >= 4096) return CompileError.SlotOverflow;
+        if (u_idx_usize >= max_operands) return self.limit("captured locals");
         const u_idx: u12 = @intCast(u_idx_usize);
         try self.captures.append(self.allocator, source);
         try self.captured_names.append(self.allocator, .{ .name = name, .upvalue = u_idx });
@@ -797,51 +817,58 @@ const Emitter = struct {
     /// incorrect — sub-expressions allocate their own temps and
     /// the next "arg slot" would not be adjacent to the previous,
     /// breaking the range-call ABI invariant.
-    fn allocSlotBlock(self: *Emitter, count: u32) CompileError!u12 {
-        const base: u32 = self.slot_top;
-        const end: u32 = base + count;
-        if (end > 4096) return CompileError.SlotOverflow;
-        self.slot_top = @intCast(end);
+    fn allocSlotBlock(self: *Emitter, count: usize) CompileError!u12 {
+        if (!self.blockFits(count)) return self.limit("local slots");
+        const base = self.slot_top;
+        self.slot_top += @intCast(count);
         self.slot_count = @max(self.slot_count, self.slot_top);
         return @intCast(base);
     }
 
-    /// Add a constant to the pool, return its index. Most callers
-    /// want `addValueConst(v)` for an ordinary `Value` or
-    /// `addRoutineConst(*const Routine)` for `closure:make` lowering.
-    fn addConst(self: *Emitter, c: vm.Const) CompileError!u12 {
-        const idx = self.consts.items.len;
-        if (idx >= 4096) return CompileError.ConstantPoolOverflow;
-        try self.consts.append(self.allocator, c);
-        return @intCast(idx);
+    /// Whether `count` more slots fit on top of the live ones.
+    fn blockFits(self: *const Emitter, count: usize) bool {
+        return self.slot_top + count <= max_operands;
+    }
+
+    /// `SlotOverflow`, with `LowerDiag.detail` naming this routine
+    /// and the limit it reached, `what` (COMPILER.md §7).
+    fn limit(self: *const Emitter, comptime what: []const u8) CompileError {
+        const d = self.diag orelse return CompileError.SlotOverflow;
+        if (d.detail != null) return CompileError.SlotOverflow;
+        const tail = ": more than " ++ std.fmt.comptimePrint("{d}", .{max_operands}) ++ " " ++ what;
+        d.detail = (if (!self.is_fn)
+            std.fmt.allocPrint(self.allocator, "top-level form" ++ tail, .{})
+        else if (self.fn_name) |name|
+            std.fmt.allocPrint(self.allocator, "fn {s}" ++ tail, .{name})
+        else
+            std.fmt.allocPrint(self.allocator, "anonymous fn" ++ tail, .{})) catch return CompileError.OutOfMemory;
+        return CompileError.SlotOverflow;
     }
 
     /// The pool index of `v`, one entry per identical Value (same
     /// bits: the same immediate, or the same heap object).
-    fn addValueConst(self: *Emitter, v: Value) CompileError!u12 {
+    fn addValueConst(self: *Emitter, v: Value) CompileError!u32 {
         const key = [2]u64{ v.tag, v.payload };
         if (self.value_consts.get(key)) |idx| return idx;
-        const idx = try self.addConst(.{ .value = v });
+        const idx = try tableIndex(self.consts.items.len);
+        try self.consts.append(self.allocator, v);
         try self.value_consts.put(self.allocator, key, idx);
         return idx;
     }
 
-    /// Convenience: add a `*const Routine` constant. Used by
-    /// `compileFn` when registering a child routine in the
-    /// parent's pool for `closure:make`.
-    fn addRoutineConst(self: *Emitter, r: *const vm.Routine) CompileError!u12 {
-        return self.addConst(.{ .routine = r });
+    /// `v` as a `c` operand, or null when its index lies past what
+    /// an operand addresses and it must be loaded into a slot.
+    fn constOperand(self: *Emitter, v: Value) CompileError!?Operand {
+        const idx = try self.addValueConst(v);
+        return if (idx < max_operands) Operand.constant(@intCast(idx)) else null;
     }
 
     /// Add a capture descriptor to the emitter's table; return
-    /// the descriptor's index for use as `closure:make`'s B
-    /// operand. Sources are `local_cell_slot` /
-    /// `inherited_upvalue` entries, or none for a capture-free fn.
-    fn addCaptureDescriptor(self: *Emitter, desc: vm.CaptureDescriptor) CompileError!u12 {
-        const idx = self.capture_descs.items.len;
-        if (idx >= 4096) return CompileError.ConstantPoolOverflow;
+    /// its index for `closure:make`'s wide field.
+    fn addCaptureDescriptor(self: *Emitter, desc: vm.CaptureDescriptor) CompileError!u32 {
+        const idx = try tableIndex(self.capture_descs.items.len);
         try self.capture_descs.append(self.allocator, desc);
-        return @intCast(idx);
+        return idx;
     }
 
     /// Get-or-create a V operand index for `name` in
@@ -854,7 +881,7 @@ const Emitter = struct {
     /// Dedup: a routine that references `x` twice gets ONE
     /// var_table entry (same V index). Matches the const-pool
     /// dedup pattern.
-    fn addVarRef(self: *Emitter, name: []const u8) CompileError!u12 {
+    fn addVarRef(self: *Emitter, name: []const u8) CompileError!u32 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
         // Lookup walks the parent chain (auto-refer fallback to
         // `nexis.core` etc.). If found there, use
@@ -874,7 +901,7 @@ const Emitter = struct {
     /// with the current namespace's name means. A definition
     /// therefore shadows a referred Var of the same name for this
     /// namespace and leaves the referred Var as it was.
-    fn addVarLocal(self: *Emitter, name: []const u8) CompileError!u12 {
+    fn addVarLocal(self: *Emitter, name: []const u8) CompileError!u32 {
         const ns = self.namespace orelse return CompileError.InternalCompilerBug;
         const v = ns.intern(name) catch return CompileError.OutOfMemory;
         return self.addVarTableEntry(v);
@@ -882,14 +909,13 @@ const Emitter = struct {
 
     /// Dedup-append `v` to the routine's var table: a routine that
     /// references one Var twice carries one entry.
-    fn addVarTableEntry(self: *Emitter, v: *vm.Var) CompileError!u12 {
+    fn addVarTableEntry(self: *Emitter, v: *vm.Var) CompileError!u32 {
         for (self.var_table.items, 0..) |existing, i| {
             if (existing == v) return @intCast(i);
         }
-        const idx = self.var_table.items.len;
-        if (idx >= 4096) return CompileError.SlotOverflow;
+        const idx = try tableIndex(self.var_table.items.len);
         try self.var_table.append(self.allocator, v);
-        return @intCast(idx);
+        return idx;
     }
 
     /// Append an instruction to the code stream, opening a new
@@ -908,41 +934,22 @@ const Emitter = struct {
         try self.code.append(self.allocator, inst);
     }
 
-    /// The pc of the next instruction, as a jump operand: jump
-    /// targets are 12-bit indexes (VM.md §3), so a target past 4095
-    /// is `JumpTargetOutOfRange` at the form that needs the jump.
-    fn nextPc(self: *const Emitter) CompileError!u12 {
-        const pc = self.code.items.len;
-        if (pc > std.math.maxInt(u12)) return CompileError.JumpTargetOutOfRange;
-        return @intCast(pc);
+    /// The pc of the next instruction, a jump or handler target.
+    fn nextPc(self: *const Emitter) CompileError!u32 {
+        return tableIndex(self.code.items.len);
     }
 
-    /// Point the jump emitted at `jump_pc` at the next instruction.
-    fn patchJumpHere(self: *Emitter, jump_pc: usize) CompileError!void {
-        vm.asm_.patchJumpTarget(&self.code.items[jump_pc], try self.nextPc());
+    /// Point the jump or handler instruction emitted at `at` at the
+    /// next instruction.
+    fn patchJumpHere(self: *Emitter, at: usize) CompileError!void {
+        self.code.items[at].setWide(try self.nextPc());
     }
 
-    /// Emit `jump:if-false A=PLACEHOLDER B=test`. Returns the PC
-    /// of the emitted instruction so the caller can back-patch
-    /// the target later.
-    fn emitJumpIfFalsePlaceholder(self: *Emitter, test_op: Operand) CompileError!usize {
+    /// Emit `inst`, whose target is still to be patched; return its
+    /// pc for `patchJumpHere`.
+    fn emitPlaceholder(self: *Emitter, inst: Inst) CompileError!usize {
         const pc = self.code.items.len;
-        try self.emit(vm.asm_.jumpIfFalse(0, test_op));
-        return pc;
-    }
-
-    /// Emit `jump:if-true A=PLACEHOLDER B=test`, for back-patching.
-    fn emitJumpIfTruePlaceholder(self: *Emitter, test_op: Operand) CompileError!usize {
-        const pc = self.code.items.len;
-        try self.emit(vm.asm_.jumpIfTrue(0, test_op));
-        return pc;
-    }
-
-    /// Emit `jump:jmp A=PLACEHOLDER`. Returns the PC of the
-    /// emitted instruction for back-patching.
-    fn emitJumpPlaceholder(self: *Emitter) CompileError!usize {
-        const pc = self.code.items.len;
-        try self.emit(vm.asm_.jumpJmp(0));
+        try self.emit(inst);
         return pc;
     }
 
@@ -955,10 +962,12 @@ const Emitter = struct {
     fn finish(self: *Emitter) CompileError!Compiled {
         const code = try self.out.dupe(Inst, self.code.items);
         errdefer self.out.free(code);
-        const consts = try self.out.dupe(vm.Const, self.consts.items);
+        const consts = try self.out.dupe(Value, self.consts.items);
         errdefer self.out.free(consts);
         const caps = try self.out.dupe(vm.CaptureDescriptor, self.capture_descs.items);
         errdefer self.out.free(caps);
+        const tries = try self.out.dupe(vm.Try, self.tries.items);
+        errdefer self.out.free(tries);
         const vt = try self.out.dupe(*vm.Var, self.var_table.items);
         errdefer self.out.free(vt);
         const spans = try self.out.dupe(vm.SpanEntry, self.span_table.items);
@@ -967,6 +976,7 @@ const Emitter = struct {
             .code = code,
             .consts = consts,
             .capture_descs = caps,
+            .tries = tries,
             .var_table = vt,
             .slot_count = if (self.slot_count == 0) 1 else self.slot_count,
             .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
@@ -1100,6 +1110,9 @@ pub const LowerCtx = struct {
 /// "somewhere in this top-level form".
 pub const LowerDiag = struct {
     span: ?reader_mod.SrcSpan = null,
+    /// Why, when a routine limit was reached: the routine and the
+    /// limit, on the compile allocator.
+    detail: ?[]const u8 = null,
 };
 
 /// Names a file or REPL line defines at top level, collected before
@@ -1294,6 +1307,18 @@ fn lowerForm(
     return tiny;
 }
 
+/// `UnresolvedSymbol` for `ns/name` (or `name`), located at `span`
+/// and saying which symbol (COMPILER.md §7).
+fn unresolved(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: ?reader_mod.SrcSpan, ns: ?[]const u8, name: []const u8) CompileError {
+    const d = diag orelse return CompileError.UnresolvedSymbol;
+    if (span) |sp| d.span = sp;
+    if (d.detail == null) d.detail = (if (ns) |n|
+        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}/{s}", .{ n, name })
+    else
+        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
+    return CompileError.UnresolvedSymbol;
+}
+
 fn lowerDatum(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1314,20 +1339,16 @@ fn lowerDatum(
             if (name.ns) |ns_prefix| {
                 if (ctx.declared) |declared| {
                     if (ctx.namespace) |ns| {
-                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name)) {
-                            if (ctx.diag) |d| d.span = form.origin;
-                            return CompileError.UnresolvedSymbol;
-                        }
+                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name))
+                            return unresolved(allocator, ctx.diag, form.origin, ns_prefix, name.name);
                     }
                 }
                 break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
             }
             if (!resolveLexical(ctx, name.name)) {
                 if (ctx.declared) |declared| {
-                    if (!symbolResolves(ctx, declared, name.name)) {
-                        if (ctx.diag) |d| d.span = form.origin;
-                        return CompileError.UnresolvedSymbol;
-                    }
+                    if (!symbolResolves(ctx, declared, name.name))
+                        return unresolved(allocator, ctx.diag, form.origin, null, name.name);
                 }
             }
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
@@ -2378,7 +2399,8 @@ pub const CompileOptions = struct {
     /// was raised at, or the symbol's own span.
     out_span: ?*?reader_mod.SrcSpan = null,
     /// Receives why macro expansion failed, when the expander said
-    /// (`ExpandContext.failure`); the text lives on `allocator`.
+    /// (`ExpandContext.failure`), or which routine limit a form
+    /// reached (`LowerDiag.detail`); the text lives on `allocator`.
     out_detail: ?*?[]const u8 = null,
     /// The `std.Io` a user macro's sub-VM prints through.
     io: ?std.Io = null,
@@ -2487,6 +2509,7 @@ pub fn compileFormWith(
         // An error that located itself reports that span; the
         // rest carry the macroexpanded form's span.
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
+        if (opts.out_detail) |d| d.* = diag.detail;
         return err;
     };
     diag.span = null;
@@ -2499,6 +2522,7 @@ pub fn compileFormWith(
         .diag = &diag,
     }) catch |err| {
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
+        if (opts.out_detail) |d| d.* = diag.detail;
         return err;
     };
 }
@@ -2607,12 +2631,87 @@ fn passesTail(form: *const Tiny) bool {
 /// `coll:<op>` over the items, each compiled into its slot of one
 /// block reserved up front: a per-item allocation would interleave
 /// with the items' own temporaries and break the block's contiguity.
+/// Items too many for one block are built in chunks.
 fn compileColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
-    if (items.len > std.math.maxInt(u12)) return CompileError.SlotOverflow;
+    if (!e.blockFits(items.len)) return compileChunkedColl(e, op, items, dst);
     const argc: u12 = @intCast(items.len);
     const base = if (argc == 0) dst else try e.allocSlotBlock(argc);
     for (items, 0..) |item, i| try compileExpr(e, item, base + @as(u12, @intCast(i)), null);
     try e.emit(Inst.primary(.coll, op, Operand.slot(base), .{ .kind = .unused, .index = argc }, Operand.slot(dst)));
+}
+
+/// Items per chunk of a call or collection too large for one slot
+/// block (COMPILER.md §4.4); even, so a map's pairs stay whole.
+const chunk_items = 256;
+
+/// A collection of more items than fit in one slot block: the items
+/// in order, `chunk_items` at a time, each chunk built by `coll:*`
+/// and poured into an accumulator with `nexis.core/into`; a list
+/// comes out of `(apply list acc)`.
+fn compileChunkedColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
+    const acc = switch (op) {
+        .vector => try accumulate(e, .vector, .vector, items),
+        .map => try accumulate(e, .map, .map, items),
+        .set => try accumulate(e, .set, .set, items),
+        .list => try accumulate(e, .vector, .vector, items),
+        .concat => try accumulate(e, .vector, .concat, items),
+        _ => return CompileError.InternalCompilerBug,
+    };
+    switch (op) {
+        .list, .concat => try callCore(e, "apply", &.{ .{ .core = "list" }, .{ .slot = acc } }, dst),
+        else => try e.emit(vm.asm_.move(dst, acc)),
+    }
+}
+
+/// A call of more arguments than fit in one slot block:
+/// `(apply callee args)`, the callee evaluated first and the
+/// arguments gathered into a vector in chunks.
+fn compileChunkedCall(e: *Emitter, callee: *const Tiny, args: []const *const Tiny, dst: u12) CompileError!void {
+    const f = try e.allocSlot();
+    try compileExpr(e, callee, f, null);
+    const acc = try accumulate(e, .vector, .vector, args);
+    try callCore(e, "apply", &.{ .{ .slot = f }, .{ .slot = acc } }, dst);
+}
+
+/// A fresh slot holding the `acc_op` collection of `items`: an empty
+/// one, then `(into acc chunk)` for each `chunk_op` chunk in order.
+fn accumulate(e: *Emitter, acc_op: vm.CollOp, chunk_op: vm.CollOp, items: []const *const Tiny) CompileError!u12 {
+    const acc = try e.allocSlot();
+    try e.emit(Inst.primary(.coll, acc_op, Operand.slot(acc), .{ .kind = .unused, .index = 0 }, Operand.slot(acc)));
+    var start: usize = 0;
+    while (start < items.len) : (start += chunk_items) {
+        const mark = e.slot_top;
+        defer e.slot_top = mark;
+        const chunk = try e.allocSlot();
+        try compileColl(e, chunk_op, items[start..@min(start + chunk_items, items.len)], chunk);
+        try callCore(e, "into", &.{ .{ .slot = acc }, .{ .slot = chunk } }, acc);
+    }
+    return acc;
+}
+
+/// An argument of `callCore`: a slot's value, or a core Var's.
+const CoreArg = union(enum) { slot: u12, core: []const u8 };
+
+/// `(nexis.core/<name> args...)` into `dst`. Without the core
+/// namespace there is no way to build what does not fit in slots.
+fn callCore(e: *Emitter, name: []const u8, args: []const CoreArg, dst: u12) CompileError!void {
+    const base = try e.allocSlotBlock(1 + args.len);
+    try loadCore(e, name, base);
+    for (args, 1..) |arg, i| {
+        const slot = base + @as(u12, @intCast(i));
+        switch (arg) {
+            .slot => |s| try e.emit(vm.asm_.move(slot, s)),
+            .core => |n| try loadCore(e, n, slot),
+        }
+    }
+    try e.emit(vm.asm_.callCall(base, @intCast(args.len), dst));
+}
+
+fn loadCore(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
+    const ns = e.namespace orelse return e.limit("local slots");
+    const registry = ns.registry orelse return e.limit("local slots");
+    const v = registry.core.lookupLocal(name) orelse return e.limit("local slots");
+    try e.emit(vm.asm_.varLoadVar(dst, try e.addVarTableEntry(v)));
 }
 
 /// `op` over its operands, read in place where they allow it
@@ -2620,9 +2719,24 @@ fn compileColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12)
 /// call's arguments are; it reads a Var in place only when computing
 /// the right one runs no code that could change the Var.
 fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst: u12) CompileError!void {
-    const a = try compileOperand(e, lhs, rhs == null or isLeaf(rhs.?));
-    const b = if (rhs) |r| try compileOperand(e, r, true) else Operand.none;
+    // A scratch destination holds nothing anyone reads until this
+    // instruction writes it, so the first operand that needs code is
+    // computed there: nested arithmetic reuses one slot instead of
+    // taking one per level.
+    var free_dst = e.scratch == dst;
+    const a = try primOperand(e, lhs, rhs == null or isLeaf(rhs.?), dst, &free_dst);
+    const b = if (rhs) |r| try primOperand(e, r, true, dst, &free_dst) else Operand.none;
     try e.emit(op.inst(dst, a, b));
+}
+
+/// `compileOperand`, or `t` computed into `dst` when `free_dst` says
+/// no operand holds it yet.
+fn primOperand(e: *Emitter, t: *const Tiny, allow_var: bool, dst: u12, free_dst: *bool) CompileError!Operand {
+    if (try directOperand(e, t, allow_var)) |op| return op;
+    if (!free_dst.*) return compileOperand(e, t, allow_var);
+    free_dst.* = false;
+    try compileExpr(e, t, dst, null);
+    return Operand.slot(dst);
 }
 
 /// A node whose evaluation has no effect and cannot fail: a literal
@@ -2653,6 +2767,9 @@ fn isLeaf(t: *const Tiny) bool {
 fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Operand {
     if (try directOperand(e, t, allow_var)) |op| return op;
     const tmp = try e.allocSlot();
+    const saved = e.scratch;
+    defer e.scratch = saved;
+    e.scratch = tmp;
     try compileExpr(e, t, tmp, null);
     return Operand.slot(tmp);
 }
@@ -2660,22 +2777,19 @@ fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Ope
 /// `t` as an operand read in place, or null when it needs code.
 fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Operand {
     switch (t.*) {
-        .nil => return Operand.constant(try e.addValueConst(value_mod.nilValue())),
-        .bool => |b| return Operand.constant(try e.addValueConst(value_mod.fromBool(b))),
-        .int => |n| {
-            const v = value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange;
-            return Operand.constant(try e.addValueConst(v));
-        },
-        .literal => |v| return Operand.constant(try e.addValueConst(v)),
+        .nil => return e.constOperand(value_mod.nilValue()),
+        .bool => |b| return e.constOperand(value_mod.fromBool(b)),
+        .int => |n| return e.constOperand(value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange),
+        .literal => |v| return e.constOperand(v),
         .qualified_symbol => |q| {
             if (!allow_var) return null;
-            return Operand.varRef(try qualifiedVarIndex(e, q.ns, q.name));
+            return varOperand(try qualifiedVarIndex(e, q.ns, q.name));
         },
         .symbol => |name| {
             const ref = e.resolveOrCapture(name) catch |err| switch (err) {
                 CompileError.UnresolvedSymbol => {
                     if (!allow_var or e.namespace == null) return null;
-                    return Operand.varRef(try e.addVarRef(name));
+                    return varOperand(try e.addVarRef(name));
                 },
                 else => return err,
             };
@@ -2687,6 +2801,12 @@ fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Ope
         },
         else => return null,
     }
+}
+
+/// Var-table entry `idx` as a `v` operand, or null when it lies past
+/// what an operand addresses and must be loaded into a slot.
+fn varOperand(idx: u32) ?Operand {
+    return if (idx < max_operands) Operand.varRef(@intCast(idx)) else null;
 }
 
 /// `ns/name`: its Var's root, never a lexical binding
@@ -2702,11 +2822,11 @@ fn compileQualifiedSymbol(e: *Emitter, ns_prefix: []const u8, name: []const u8, 
 /// current namespace's own name is its own Var, interned unbound
 /// when the definition is still to come (a forward reference
 /// syntax-quote qualified).
-fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) CompileError!u12 {
-    const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
-    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
+fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) CompileError!u32 {
+    const current_ns = e.namespace orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
+    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
     if (target_ns == current_ns) return e.addVarLocal(name);
-    const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
+    const v = target_ns.lookupLocal(name) orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
     return e.addVarTableEntry(v);
 }
 
@@ -2741,7 +2861,7 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
                 try e.emit(vm.asm_.varLoadVar(dst, idx));
                 return;
             }
-            return err; // no namespace; propagate UnresolvedSymbol
+            return unresolved(e.allocator, e.diag, null, null, name); // no namespace
         },
         else => return err,
     };
@@ -2768,16 +2888,15 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
 
 /// Lower `(def name value?)`. Interns the Var in the current
 /// namespace itself (creating an unbound Var if absent; a referred
-/// Var of the same name is shadowed, never rebound), compiles
-/// `value` into a temp slot, emits `var:store-var` to update
-/// the Var's root and write the Var object into `dst`.
+/// Var of the same name is shadowed, never rebound), stores the
+/// value, read in place where it can be, as its root
+/// (`var:store-var`), and yields the Var object (`var:var-object`).
 ///
 /// Without a Namespace (`e.namespace == null`), `def` raises
 /// `UnresolvedSymbol`.
 ///
-/// `(def x)` (no value) is a forward-declaration: intern the
-/// Var, but don't emit any store-var. `dst` gets the Var
-/// object (load via `var:var-object`).
+/// `(def x)` (no value) is a forward-declaration: the Var is
+/// interned and stays as it was.
 fn compileDef(
     e: *Emitter,
     name: []const u8,
@@ -2786,15 +2905,9 @@ fn compileDef(
 ) CompileError!void {
     if (e.namespace == null) return CompileError.UnresolvedSymbol;
     const idx = try e.addVarLocal(name);
-    if (value) |val| {
-        // RHS is non-tail.
-        try e.emit(vm.asm_.varStoreVar(dst, idx, try compileOperand(e, val, true)));
-    } else {
-        // Declare-only: emit var:var-object so dst gets the
-        // Var object. Bound state unchanged (still unbound on
-        // first declare).
-        try e.emit(vm.asm_.varVarObject(dst, idx));
-    }
+    // RHS is non-tail.
+    if (value) |val| try e.emit(vm.asm_.varStoreVar(idx, try compileOperand(e, val, true)));
+    try e.emit(vm.asm_.varVarObject(dst, idx));
 }
 
 /// Lower `(var name)`. Interns the Var if absent,
@@ -2935,23 +3048,19 @@ fn compileTry(
     const binding_slot = try e.allocSlot();
     const result: u12 = if (finally_ != null) try e.allocSlot() else dst;
 
-    // Emit try-enter with placeholder catch_pc (and
-    // finally_pc when present). Patch after we know both PCs.
-    const try_enter_pc = e.code.items.len;
-    if (finally_ != null) {
-        try e.emit(vm.asm_.tryEnterFinally(0, binding_slot, 0));
-    } else {
-        try e.emit(vm.asm_.tryEnter(0, binding_slot));
-    }
+    // The try's catch and finally pcs are filled in once placed.
+    const t = try tableIndex(e.tries.items.len);
+    try e.tries.append(e.allocator, .{ .catch_pc = unpatched });
+    try e.emit(vm.asm_.tryEnter(t, binding_slot));
 
     try compileExpr(e, body, result, null);
 
-    // Body-exit try-exit (post_pc placeholder).
-    const body_exit_pc = e.code.items.len;
-    try e.emit(vm.asm_.tryExit(0));
+    // A body or handler that always throws or recurs never reaches
+    // its try-exit, so it has none.
+    const body_exit_pc: ?usize = if (neverFallsThrough(body)) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
 
     // Catch entry.
-    e.code.items[try_enter_pc].a = vm.Operand.jump(try e.nextPc());
+    e.tries.items[t].catch_pc = try e.nextPc();
 
     // The VM stores the thrown value in the binding's slot and jumps
     // here; a captured binding is boxed first thing.
@@ -2961,21 +3070,18 @@ fn compileTry(
     try compileExpr(e, handler, result, null);
     e.scope.shrinkRetainingCapacity(scope_mark);
 
-    // Catch-exit try-exit (post_pc placeholder).
-    const catch_exit_pc = e.code.items.len;
-    try e.emit(vm.asm_.tryExit(0));
+    const catch_exit_pc: ?usize = if (neverFallsThrough(handler)) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
 
     // Optional finally block + finally-exit.
     if (finally_) |fin_body| {
-        e.code.items[try_enter_pc].c = vm.Operand.jump(try e.nextPc());
+        e.tries.items[t].finally_pc = try e.nextPc();
         // The binding is out of scope here; the value is discarded.
-        try compileExpr(e, fin_body, try e.allocSlot(), null);
+        try compileEffect(e, fin_body);
         try e.emit(vm.asm_.finallyExit());
     }
 
-    const post_pc = try e.nextPc();
-    e.code.items[body_exit_pc].a = vm.Operand.jump(post_pc);
-    e.code.items[catch_exit_pc].a = vm.Operand.jump(post_pc);
+    if (body_exit_pc) |pc| try e.patchJumpHere(pc);
+    if (catch_exit_pc) |pc| try e.patchJumpHere(pc);
     if (result != dst) try e.emit(vm.asm_.move(dst, result));
 }
 
@@ -3195,7 +3301,7 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
             try compileBranch(e, i.test_, false, &skip);
             try compileEffect(e, i.then);
             if (else_inert) return patchJumpsHere(e, skip.items);
-            const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitJumpPlaceholder();
+            const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
             try patchJumpsHere(e, skip.items);
             try compileEffect(e, i.else_.?);
             if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
@@ -3255,6 +3361,8 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     // The prelude (parameter boxing) carries the fn form's span.
     child.current_span = parent.current_span;
     child.diag = parent.diag;
+    child.is_fn = true;
+    child.fn_name = f.display_name;
     defer child.deinit();
 
     // The self-name is upvalue 0, sourced from the placeholder cell.
@@ -3300,6 +3408,7 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
         .code = child_compiled.code,
         .consts = child_compiled.consts,
         .capture_descs = child_compiled.capture_descs,
+        .tries = child_compiled.tries,
         .var_table = child_compiled.var_table,
         .slot_count = child_compiled.slot_count,
         .fixed_arity = @intCast(f.params.len),
@@ -3310,9 +3419,8 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
         .origin = if (parent.current_span) |sp| toSourceSpan(sp) else null,
         .source = parent.source,
     };
-    const proto_idx = try parent.addRoutineConst(child_routine);
-    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .sources = sources });
-    try parent.emit(vm.asm_.closureMake(proto_idx, cap_desc_idx, dst));
+    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .routine = child_routine, .sources = sources });
+    try parent.emit(vm.asm_.closureMake(cap_desc_idx, dst));
     if (f.self_referenced) {
         try parent.emit(vm.asm_.closureInitCell(self_cell_slot, vm.Operand.slot(dst)));
     }
@@ -3416,8 +3524,8 @@ fn compileCall(
     args: []const *const Tiny,
     dst: u12,
 ) CompileError!void {
-    if (args.len >= std.math.maxInt(u12)) return CompileError.SlotOverflow;
-    const call_base = try e.allocSlotBlock(1 + @as(u32, @intCast(args.len)));
+    if (!e.blockFits(1 + args.len)) return compileChunkedCall(e, callee, args, dst);
+    const call_base = try e.allocSlotBlock(1 + args.len);
     // The callee and the arguments are not in tail position.
     try compileExpr(e, callee, call_base, null);
     for (args, 1..) |arg, i| try compileExpr(e, arg, call_base + @as(u12, @intCast(i)), null);
@@ -3439,9 +3547,12 @@ fn compileIf(
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
     // An arm that always jumps away (recur, throw) or returns needs
-    // no jump past the else arm.
+    // no jump past the else arm, nor does an else arm that is `dst`
+    // itself (`(if c (+ acc 1) acc)` into acc's slot), which emits
+    // nothing.
     const returns = if (recur_target) |t| t.returns else false;
-    const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
+    const else_empty = if (else_form) |ef| isSlot(e, ef, dst) else false;
+    const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form) or else_empty) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
     try patchJumpsHere(e, if_false.items);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
@@ -3449,6 +3560,14 @@ fn compileIf(
         try e.emit(if (returns) vm.asm_.returnNil() else vm.asm_.loadNil(dst));
     }
     if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+}
+
+/// Whether `t` is the local held directly in `slot`, whose value is
+/// already there.
+fn isSlot(e: *const Emitter, t: *const Tiny, slot: u12) bool {
+    if (t.* != .symbol) return false;
+    const ref = e.resolveLocalRef(t.symbol) orelse return false;
+    return ref == .direct_slot and ref.direct_slot == slot;
 }
 
 /// The pcs of jumps a caller points at one target.
@@ -3490,7 +3609,7 @@ fn compileBranch(e: *Emitter, t: *const Tiny, jump_when: bool, jumps: *Jumps) Co
     const slot_mark = e.slot_top;
     defer e.slot_top = slot_mark;
     const op = try compileOperand(e, t, true);
-    try jumps.append(e.allocator, if (jump_when) try e.emitJumpIfTruePlaceholder(op) else try e.emitJumpIfFalsePlaceholder(op));
+    try jumps.append(e.allocator, try e.emitPlaceholder(if (jump_when) vm.asm_.jumpIfTrue(unpatched, op) else vm.asm_.jumpIfFalse(unpatched, op)));
 }
 
 const AndOr = struct { is_and: bool, first: *const Tiny, rest: *const Tiny };
@@ -3529,6 +3648,7 @@ fn neverFallsThrough(t: *const Tiny) bool {
         .do_ => |items| items.len > 0 and neverFallsThrough(items[items.len - 1]),
         .let_star => |l| neverFallsThrough(l.body),
         .letfn_star => |l| neverFallsThrough(l.body),
+        .try_ => |x| neverFallsThrough(x.body) and neverFallsThrough(x.handler),
         else => false,
     };
 }
@@ -3733,7 +3853,7 @@ test "bytecode: only a captured binding is boxed, and on every path" {
             for (r.code) |inst| {
                 if (inst.groupOf() == .closure and inst.variant == @intFromEnum(vm.Closure_.box_local)) boxes += 1;
             }
-            for (r.consts) |k| if (k == .routine) try routines.append(arena.allocator(), k.routine);
+            for (r.capture_descs) |d| try routines.append(arena.allocator(), d.routine);
         }
         testing.expectEqual(c.boxes, boxes) catch |err| {
             std.debug.print("\n  source: {s}\n", .{c.src});
@@ -3749,6 +3869,43 @@ test "bytecode: a quoted scalar needs no Value constant beyond itself" {
         const compiled = try compileSourceWith(arena.allocator(), src, .{});
         try testing.expectEqual(@as(usize, 0), compiled.consts.len);
     }
+}
+
+test "bytecode: a try body or handler that always throws has no try-exit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    const cases = [_]struct { src: []const u8, exits: usize, want: i64 }{
+        .{ .src = "(try 1 (catch any e 2))", .exits = 2, .want = 1 },
+        .{ .src = "(try (throw 1) (catch any e 2))", .exits = 1, .want = 2 },
+        .{ .src = "(try (try 3 (catch any e (throw e))) (catch any e 4))", .exits = 3, .want = 3 },
+        .{ .src = "(try (try (throw 3) (catch any e (throw e)) (finally nil)) (catch any e e))", .exits = 1, .want = 3 },
+    };
+    for (cases) |c| {
+        const compiled = try compileSourceWith(arena.allocator(), c.src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
+        var exits: usize = 0;
+        for (compiled.code) |inst| {
+            if (inst.groupOf() == .ctrl and inst.variant == @intFromEnum(vm.CtrlOp.try_exit)) exits += 1;
+        }
+        try testing.expectEqual(c.exits, exits);
+        try testing.expectEqual(c.want, (try runBare(arena.allocator(), &v, c.src)).asFixnum());
+    }
+}
+
+test "bytecode: no jump lands on the instruction after it" {
+    // An else arm that is its destination's own local emits nothing,
+    // so the then arm needs no jump past it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    const src = "(loop* [i 5 acc 0] (if i (recur nil (if (if i nil true) (quote x) acc)) acc))";
+    const compiled = try compileSourceWith(arena.allocator(), src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
+    for (compiled.code, 0..) |inst, pc| {
+        if (inst.groupOf() == .jump) try testing.expect(inst.wide() != pc + 1);
+    }
+    try testing.expectEqual(@as(i64, 0), (try runBare(arena.allocator(), &v, src)).asFixnum());
 }
 
 test "bytecode: recur runs a 10k-iteration loop in constant stack space" {
@@ -3786,65 +3943,93 @@ test "bytecode: forms compile and run in a bare namespace" {
     try testing.expectEqual(@as(i64, 7), (try v.run()).asFixnum());
 }
 
-/// `(do (inc 1) (inc 1) ... tail)`: `pad` increments, each one
-/// instruction, ahead of `tail`, so the code `tail` emits starts at
-/// pc `pad`.
-fn paddedSource(allocator: std.mem.Allocator, pad: usize, tail: []const u8) ![]u8 {
+/// `open`, then `item` n times with every `{d}` in it replaced by
+/// the item's index, then `close`.
+fn generatedSource(allocator: std.mem.Allocator, open: []const u8, item: []const u8, n: usize, close: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(allocator, "(do");
-    for (0..pad) |_| try out.appendSlice(allocator, " (inc 1)");
-    try out.print(allocator, " {s})", .{tail});
+    try out.appendSlice(allocator, open);
+    for (0..n) |i| {
+        var parts = std.mem.splitSequence(u8, item, "{d}");
+        try out.appendSlice(allocator, parts.first());
+        while (parts.next()) |part| {
+            try out.print(allocator, "{d}", .{i});
+            try out.appendSlice(allocator, part);
+        }
+    }
+    try out.appendSlice(allocator, close);
     return out.toOwnedSlice(allocator);
 }
 
-test "routine limits: a jump past the 12-bit range is JumpTargetOutOfRange at the form that needs it" {
+test "wide targets: a routine of more than 100,000 instructions branches, loops and catches past pc 65,536" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    for ([_][]const u8{ "(if true 1 2)", "(try 1 (catch any e 2))", "(try 1 (catch any e 2) (finally 3))", "(loop* [i 1] (if i (recur nil) 2))" }) |tail| {
-        const ok = try paddedSource(a, 4000, tail);
-        _ = try compileSourceWith(a, ok, .{});
-        const src = try paddedSource(a, 4100, tail);
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    // Each (var pad) is one instruction ahead of the tail.
+    const src = try generatedSource(a, "((fn* big [n] (do", " (var pad)", 100_000,
+        \\ (loop* [i n acc nil]
+        \\   (if i (recur nil (try (throw i) (catch any e e) (finally nil))) acc)))) 7)
+    );
+    try testing.expectEqual(@as(i64, 7), (try runBare(a, &v, src)).asFixnum());
+
+    const compiled = try compileSourceWith(a, src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
+    const big = compiled.capture_descs[0].routine;
+    try testing.expect(big.code.len > 100_000);
+    // Every branch, handler and exit targets a pc past 65,536.
+    try testing.expectEqual(@as(usize, 1), big.tries.len);
+    try testing.expect(big.tries[0].catch_pc > 65_536 and big.tries[0].finally_pc.? > 65_536);
+    var targets: usize = 0;
+    for (big.code) |inst| {
+        const wide_target = switch (inst.groupOf()) {
+            .jump => true,
+            .ctrl => switch (@as(vm.CtrlOp, @enumFromInt(inst.variant))) {
+                .try_exit => true,
+                else => false,
+            },
+            else => false,
+        };
+        if (!wide_target) continue;
+        try testing.expect(inst.wide() > 65_536);
+        targets += 1;
+    }
+    // if-false, recur's jump and the handler's try-exit (the body
+    // always throws, so it has none).
+    try testing.expectEqual(@as(usize, 3), targets);
+}
+
+test "routine limits: constants past the operand range load through the wide index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    const src = try generatedSource(a, "(do", " (let* [x {d}] x)", 5000, " (if 4999 4998 nil))");
+    try testing.expectEqual(@as(i64, 4998), (try runBare(a, &v, src)).asFixnum());
+    const compiled = try compileSourceWith(a, src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
+    try testing.expectEqual(@as(usize, 5000), compiled.consts.len);
+}
+
+test "routine limits: more than 4096 live slots or captures is SlotOverflow, naming the fn and the limit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const let_4000 = try generatedSource(a, "(let* [", "a{d} {d} ", 4000, "] a0)");
+    _ = try compileSourceWith(a, let_4000, .{});
+    const let_4100 = try generatedSource(a, "(let* [", "a{d} {d} ", 4100, "] a0)");
+    const captures = try generatedSource(a, "(let* [", "a{d} {d} ", 2100, try generatedSource(a, "] (fn* [] (let* [", "b{d} {d} ", 2100, try generatedSource(a, "] (fn* inner [] (do", " a{d} b{d}", 2100, ")))))")));
+    const cases = [_]struct { src: []const u8, detail: []const u8, at: usize }{
+        .{ .src = let_4100, .detail = "top-level form: more than 4096 local slots", .at = 0 },
+        .{ .src = try std.fmt.allocPrint(a, "(fn* many [] {s})", .{let_4100}), .detail = "fn many: more than 4096 local slots", .at = 13 },
+        .{ .src = try std.fmt.allocPrint(a, "(fn* [] {s})", .{let_4100}), .detail = "anonymous fn: more than 4096 local slots", .at = 8 },
+        .{ .src = captures, .detail = "fn inner: more than 4096 captured locals", .at = std.mem.indexOf(u8, captures, " a2048 b2048").? + 1 },
+    };
+    for (cases) |c| {
         var span: ?reader_mod.SrcSpan = null;
-        try testing.expectError(CompileError.JumpTargetOutOfRange, compileSourceWith(a, src, .{ .out_span = &span }));
-        try testing.expectEqual(src.len - 1 - tail.len, span.?.pos);
-    }
-}
-
-test "routine limits: at most 4096 slots are live at once" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_]struct { n: usize, ok: bool }{ .{ .n = 4000, .ok = true }, .{ .n = 4100, .ok = false } }) |c| {
-        var src: std.ArrayList(u8) = .empty;
-        try src.appendSlice(a, "(let* [");
-        for (0..c.n) |i| try src.print(a, "a{d} {d} ", .{ i, i });
-        try src.appendSlice(a, "] a0)");
-        if (c.ok) {
-            _ = try compileSourceWith(a, src.items, .{});
-        } else {
-            var span: ?reader_mod.SrcSpan = null;
-            try testing.expectError(CompileError.SlotOverflow, compileSourceWith(a, src.items, .{ .out_span = &span }));
-            // Reported at the form whose binding did not fit.
-            try testing.expectEqual(@as(usize, 0), span.?.pos);
-        }
-    }
-}
-
-test "routine limits: at most 4096 constants" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_]struct { n: usize, ok: bool }{ .{ .n = 4096, .ok = true }, .{ .n = 4097, .ok = false } }) |c| {
-        var src: std.ArrayList(u8) = .empty;
-        try src.appendSlice(a, "(do");
-        for (0..c.n) |i| try src.print(a, " (inc {d})", .{i});
-        try src.appendSlice(a, ")");
-        if (c.ok) {
-            _ = try compileSourceWith(a, src.items, .{});
-        } else {
-            try testing.expectError(CompileError.ConstantPoolOverflow, compileSourceWith(a, src.items, .{}));
-        }
+        var detail: ?[]const u8 = null;
+        try testing.expectError(CompileError.SlotOverflow, compileSourceWith(a, c.src, .{ .out_span = &span, .out_detail = &detail }));
+        try testing.expectEqualStrings(c.detail, detail.?);
+        try testing.expectEqual(c.at, span.?.pos);
     }
 }
 
@@ -3917,16 +4102,25 @@ test "declared names: an unresolved symbol is reported at its own span" {
     var declared = DeclaredNames.init(testing.allocator);
     defer declared.deinit();
     var span: ?reader_mod.SrcSpan = null;
+    var detail: ?[]const u8 = null;
     const opts: CompileOptions = .{
         .namespace = v.ensureNamespace(),
         .interner = v.ensureInterner(),
         .declared = &declared,
         .out_span = &span,
+        .out_detail = &detail,
     };
     const src = "(fn* [x] (let* [z 1] (+ x (< z y))))";
     try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), src, opts));
     const sp = span orelse return error.TestFailed;
     try testing.expectEqualStrings("y", src[sp.pos .. sp.pos + sp.len]);
+    try testing.expectEqualStrings("unable to resolve symbol: y", detail.?);
+    // So is a qualified one naming no namespace, and, compiled
+    // without declared names or a namespace, a bare one.
+    try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), "(+ 1 nope/w)", opts));
+    try testing.expectEqualStrings("unable to resolve symbol: nope/w", detail.?);
+    try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), "(let* [a 1] b)", .{ .out_detail = &detail }));
+    try testing.expectEqualStrings("unable to resolve symbol: b", detail.?);
     // Declaring it makes the same source compile.
     try declared.declare("y");
     _ = try compileSourceWith(arena.allocator(), src, opts);
@@ -4025,11 +4219,8 @@ test "span table: a nested routine carries its own table, origin and name" {
     const ns = v.ensureNamespace();
     const src = "(def sq (fn* sq [x]\n  (* x x)))";
     const compiled = try compileSourceWith(arena.allocator(), src, .{ .namespace = ns, .interner = v.ensureInterner() });
-    var child: ?*const vm.Routine = null;
-    for (compiled.consts) |c| if (c == .routine) {
-        child = c.routine;
-    };
-    const r = child orelse return error.TestFailed;
+    if (compiled.capture_descs.len != 1) return error.TestFailed;
+    const r = compiled.capture_descs[0].routine;
     try testing.expectEqualStrings("sq", r.name);
     try testing.expect(r.spans.len > 0);
     const origin = r.origin orelse return error.TestFailed;

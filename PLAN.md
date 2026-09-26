@@ -241,12 +241,17 @@ Each item is a commitment; changing one takes an Amendment Log entry
     is the arithmetic and comparison operators the compiler inlines
     when the name resolves to `nexis.core`'s own Var
     (`docs/COMPILER.md`).
-21. **Operand kinds.** Each operand is `[kind:4][index:12]`. The
-    hot-path kinds are `S`=0 slot, `C`=1 constant, `V`=2 Var, `U`=3
-    upvalue; `J`=5 is a jump target; `I`=4 (intern id) and `E`=6
+21. **Operand kinds and the wide field.** Each operand is
+    `[kind:4][index:12]`. The hot-path kinds are `S`=0 slot, `C`=1
+    constant, `V`=2 Var, `U`=3 upvalue; `I`=4 (intern id) and `E`=6
     (durable-ref literal) are reserved and no opcode resolves them
-    (`docs/VM.md`). A 12-bit jump index bounds a routine at 4096
-    instructions.
+    (`docs/VM.md`). An instruction that names a pc or a table entry
+    reads operands B and C as one 32-bit wide field: every jump
+    target, the `try` of `ctrl:try-enter`, the constant of
+    `mov:load-const`, the Var of `var:*`, the capture descriptor of
+    `closure:make`. Only slots live
+    at once and upvalues are bounded by the 12-bit index, at 4096 per
+    routine.
 22. **As-of reads exist.** `db/snapshot` and `with-snapshot` pin an
     emdb MVCC read; Nextomic's `as-of`, `since` and `history` read
     tx-in-key history.
@@ -744,3 +749,27 @@ entry stating the decision and its rationale.
   4096-level bound, which refused legitimate data and bought nothing
   the input-size bounds of decode do not, is gone
   (`docs/CODEC.md` §2.7).
+
+- **2026-09-25 — Wide jump targets (§23 #21).** A jump target was a
+  `J` operand whose 12-bit index put every branch, loop and handler
+  target below pc 4096, so a routine of more than about 4096
+  instructions (a `deftest` of 241 assertions) failed to compile with
+  a bare `JumpTargetOutOfRange`; more than 4096 constants, Vars or
+  closures in one routine failed with `ConstantPoolOverflow` or
+  `SlotOverflow`. The instruction stays one 64-bit word; operands B
+  and C read as one 32-bit wide field W. W carries every jump target
+  (`jump:*`, the test in A) and `ctrl:try-exit`'s continuation; the
+  index of the routine's `try` entry that `ctrl:try-enter` pushes
+  (the binding slot in A), which holds the catch and finally pcs,
+  since a handler needs two; the constant index of `mov:load-const`;
+  the Var index of `var:*` (`var:store-var` takes its value in A and
+  writes no slot); and the capture-descriptor index of
+  `closure:make`, whose descriptor names the child routine, so the
+  constant pool holds Values only. The `J` kind (5) is unassigned,
+  and the extension instruction form, which nothing emitted, is
+  deleted. A call or computed collection too large for one slot block
+  is built in chunks. A routine is bounded by 2^32 instructions,
+  constants, Vars, tries and closures, and by 4096 slots live at once
+  and 4096 upvalues, whose compile error names the routine and the
+  limit. `docs/VM.md` §3, §4, §10, §12 and `docs/COMPILER.md` §4.4 are
+  the authority.

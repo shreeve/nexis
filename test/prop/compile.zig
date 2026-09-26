@@ -11,7 +11,9 @@
 //!   - closure capture at nesting depth 1..10 round-trips a value
 //!     (§9.4 item 3);
 //!   - syntax-quote of a random shape equals `quote` of the shape
-//!     with its symbols qualified (§9.4 item 4).
+//!     with its symbols qualified (§9.4 item 4);
+//!   - random programs agree with a reference evaluator, and still
+//!     agree when their code starts past pc 65,536.
 //!
 //! Deterministic PRNG seeds so failures reproduce.
 
@@ -639,9 +641,8 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
         const src = try std.fmt.allocPrint(testing.allocator, "(fn* [a b] {s})", .{op});
         defer testing.allocator.free(src);
         const compiled = try compileIn(&program, src);
-        const body = for (compiled.consts) |k| {
-            if (k == .routine) break k.routine;
-        } else return error.TestFailed;
+        if (compiled.capture_descs.len != 1) return error.TestFailed;
+        const body = compiled.capture_descs[0].routine;
         testing.expectEqual(@as(usize, 0), body.var_table.len) catch |err| {
             std.debug.print("\n  {s} calls through a Var\n", .{op});
             return err;
@@ -651,14 +652,14 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
     }
     // Every other arity is a call.
     const call = try compileIn(&program, "(fn* [a b c] (+ a b c))");
-    for (call.consts) |k| if (k == .routine) try testing.expectEqual(@as(usize, 1), k.routine.var_table.len);
+    for (call.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.routine.var_table.len);
 }
 
 /// The instructions of the one `fn*` routine `src` compiles to.
 fn fnCodeLen(program: *harness.Program, src: []const u8) !usize {
     const compiled = try compileIn(program, src);
-    for (compiled.consts) |k| if (k == .routine) return k.routine.code.len;
-    return error.TestFailed;
+    if (compiled.capture_descs.len == 0) return error.TestFailed;
+    return compiled.capture_descs[0].routine.code.len;
 }
 
 test "codegen: what common shapes cost (COMPILER.md §4.4)" {
@@ -732,7 +733,21 @@ test "slots: a routine's frame holds what is live at once, not every temporary i
     for (0..2000) |_| try src.appendSlice(testing.allocator, "(identity x) ");
     try src.appendSlice(testing.allocator, "x)");
     const compiled = try compileIn(&program, src.items);
-    for (compiled.consts) |k| if (k == .routine) try testing.expect(k.routine.slot_count <= 8);
+    for (compiled.capture_descs) |d| try testing.expect(d.routine.slot_count <= 8);
+    // Nested arithmetic computes each level into the slot the level
+    // outside it reads: depth costs no slots.
+    for ([_][]const u8{ "(inc ", "(+ x ", "(- 1 " }) |level| {
+        src.clearRetainingCapacity();
+        try src.appendSlice(testing.allocator, "(fn* [x] ");
+        for (0..300) |_| try src.appendSlice(testing.allocator, level);
+        try src.appendSlice(testing.allocator, "x");
+        try src.appendNTimes(testing.allocator, ')', 301);
+        const nested = try compileIn(&program, src.items);
+        testing.expect(nested.capture_descs[0].routine.slot_count <= 3) catch |err| {
+            std.debug.print("\n  {s}...: {d} slots\n", .{ level, nested.capture_descs[0].routine.slot_count });
+            return err;
+        };
+    }
 }
 
 test "literals: constant data of any size is one constant built at compile time" {
@@ -754,10 +769,10 @@ test "literals: constant data of any size is one constant built at compile time"
     try harness.expectResult(&program, "", try program.run("(let* [f (fn* [] '(a 'b ['c]))] [(identical? (f) (f)) (f)])"), "[true (a (quote b) [(quote c)])]");
     // The literal is the constant itself; equal constants share an entry.
     const compiled = try compileIn(&program, "(fn* [x] [x [1 2] {:a [1 2]} #{1 2} '(1 2) 1 2 1 2])");
-    for (compiled.consts) |k| if (k == .routine) {
-        try testing.expectEqual(@as(usize, 6), k.routine.consts.len);
-        try testing.expectEqual(@as(usize, 0), k.routine.var_table.len);
-    };
+    for (compiled.capture_descs) |d| {
+        try testing.expectEqual(@as(usize, 6), d.routine.consts.len);
+        try testing.expectEqual(@as(usize, 0), d.routine.var_table.len);
+    }
 }
 
 test "eval: a form's lowering is freed once its routine is compiled" {
@@ -1190,5 +1205,33 @@ test "prop differential: compiled random programs agree with a reference evaluat
             return err;
         };
         try harness.expectResult(&program, src.written(), got, want);
+    }
+}
+
+test "prop differential: the same programs agree when their code starts past pc 65,536" {
+    // A 70,000-instruction prefix puts every branch, loop entry and
+    // handler of the top-level routine past the 16-bit range, so the
+    // program runs on wide jump and handler targets (VM.md §3).
+    var prng = std.Random.DefaultPrng.init(diff_prng_seed ^ 0xFFFF);
+    const rand = prng.random();
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(defmacro pad [] (cons 'do (repeat 70000 '(inc 1))))");
+    for (0..30) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const e = try genExpr(a, rand, .{}, 5);
+        var src: std.Io.Writer.Allocating = .init(a);
+        try src.writer.writeAll("(do (pad) ");
+        try printExpr(e, &src.writer);
+        try src.writer.writeAll(")");
+        const want = try std.fmt.allocPrint(a, "{d}", .{try evalExpr(a, e, .{})});
+        const got = program.run(src.written()) catch |err| {
+            std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ src.written()[10..], @errorName(err) });
+            return err;
+        };
+        try harness.expectResult(&program, src.written()[10..], got, want);
     }
 }

@@ -1,11 +1,12 @@
 //! disasm.zig — bytecode disassembler (docs/TOOLING.md §2).
 //!
 //! Prints a `Routine` one instruction per line, then every routine
-//! prototype in its constant pool the same way, so `nexis disasm
+//! its capture descriptors build the same way, so `nexis disasm
 //! FILE.nx` shows a file as the VM sees it: pc, `group:variant`,
-//! the three operands with their kind letters (VM.md §4), constants
-//! as `pr-str` prints them, jump targets as pcs, and the span table
-//! (VM.md §5) as `; line:col` annotations where the span changes.
+//! the operands with their kind letters (VM.md §4), or operand A and
+//! the wide field (VM.md §3), constants as `pr-str` prints them, jump
+//! targets as pcs, and the span table (VM.md §5) as `; line:col`
+//! annotations where the span changes.
 //!
 //! The opcode names live in the tables below, one per dispatched
 //! group, indexed by variant number. A test walks every variant
@@ -74,14 +75,31 @@ fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
 }
 
 /// Whether operand B of an instruction is a raw immediate (VM.md
-/// §4.5): an argument count or a capture-descriptor index whose
-/// kind bits the handler ignores.
+/// §4.5): an argument count whose kind bits the handler ignores.
 fn immediateB(group: vm.Group, variant: u6) bool {
     return switch (group) {
         .call => variant == @intFromEnum(vm.Call.call) or variant == @intFromEnum(vm.Call.tailcall),
-        .closure => variant == @intFromEnum(vm.Closure_.make),
         .coll => true,
         else => false,
+    };
+}
+
+/// What an instruction's wide field names (VM.md §3), or null when
+/// it has operands B and C instead.
+const Wide = enum { pc, constant, var_, capture, try_ };
+
+fn wideField(group: vm.Group, variant: u6) ?Wide {
+    return switch (group) {
+        .jump => .pc,
+        .ctrl => switch (@as(vm.CtrlOp, @enumFromInt(variant))) {
+            .try_enter => .try_,
+            .try_exit => .pc,
+            else => null,
+        },
+        .mov => if (variant == @intFromEnum(vm.Mov.load_const)) .constant else null,
+        .var_ => .var_,
+        .closure => if (variant == @intFromEnum(vm.Closure_.make)) .capture else null,
+        else => null,
     };
 }
 
@@ -89,24 +107,21 @@ fn immediateB(group: vm.Group, variant: u6) bool {
 // Printing
 // =============================================================================
 
-/// Disassemble `routine` and, after it, every routine prototype in
-/// its constant pool, depth first. `interner` names keywords,
+/// Disassemble `routine` and, after it, every routine its capture
+/// descriptors build, depth first. `interner` names keywords,
 /// symbols and Vars; a null interner prints them by id.
 pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     try disassembleRoutine(routine, interner, writer);
-    for (routine.consts) |c| switch (c) {
-        .routine => |child| {
-            try writer.writeAll("\n");
-            try disassemble(child, interner, writer);
-        },
-        .value => {},
-    };
+    for (routine.capture_descs) |d| {
+        try writer.writeAll("\n");
+        try disassemble(d.routine, interner, writer);
+    }
 }
 
 /// One routine: a header line, then one line per instruction.
 ///
 ///   routine NAME (PATH:LINE:COL) slots=N arity=A upvalues=U
-///     0000  mov:load-const  s1  c0=42  -   ; 4:9
+///     0000  mov:load-const  s1  c0=42  ; 4:9
 fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     try writer.print("routine {s}", .{routine.name});
     if (routine.source) |src| {
@@ -124,19 +139,15 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
     var last_span: ?vm.SourceSpan = null;
     for (routine.code, 0..) |inst, pc| {
         try writer.print("  {d:0>4}  ", .{pc});
-        if (inst.kind == .extension) {
-            try writer.writeAll("extension");
+        try writeOpcode(inst, writer);
+        try writer.writeAll("  ");
+        const group: vm.Group = @enumFromInt(inst.group);
+        try writeOperand(inst.a, routine, interner, false, writer);
+        try writer.writeAll("  ");
+        if (wideField(group, inst.variant)) |wide| {
+            try writeWide(wide, inst.wide(), routine, interner, writer);
         } else {
-            try writeOpcode(inst, writer);
-            try writer.writeAll("  ");
-            const group: vm.Group = @enumFromInt(inst.group);
-            try writeOperand(inst.a, routine, interner, false, writer);
-            try writer.writeAll("  ");
-            if (group == .closure and inst.variant == @intFromEnum(vm.Closure_.make)) {
-                try writeCaptures(inst.b.index, routine, writer);
-            } else {
-                try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
-            }
+            try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
             try writer.writeAll("  ");
             try writeOperand(inst.c, routine, interner, false, writer);
         }
@@ -179,27 +190,56 @@ fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     while (pad < 18) : (pad += 1) try writer.writeAll(" ");
 }
 
-/// A `closure:make` descriptor: its index, then where each captured
-/// cell comes from, `sN` for a cell in this frame's slot N and `uN`
-/// for this closure's upvalue N (VM.md §6).
-fn writeCaptures(index: u12, routine: *const vm.Routine, writer: *Writer) Writer.Error!void {
-    try writer.print("#{d}", .{index});
-    if (index >= routine.capture_descs.len) return;
-    try writer.writeAll("[");
-    for (routine.capture_descs[index].sources, 0..) |source, i| {
-        if (i > 0) try writer.writeAll(" ");
-        switch (source) {
-            .local_cell_slot => |slot| try writer.print("s{d}", .{slot}),
-            .inherited_upvalue => |u| try writer.print("u{d}", .{u}),
-        }
+/// A wide field: a pc as `jNNNN`, a constant as `cN=value`, a Var
+/// as `vN=name`, a try as `#N<catch jNNNN finally jNNNN>`, and a
+/// capture descriptor as `#N<routine NAME>[...]` with where each
+/// captured cell comes from, `sN` for a cell in this frame's slot N
+/// and `uN` for this closure's upvalue N (VM.md §6).
+fn writeWide(wide: Wide, w: u32, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+    switch (wide) {
+        .pc => try writer.print("j{d:0>4}", .{w}),
+        .constant => try writeConst(w, routine, interner, writer),
+        .var_ => try writeVar(w, routine, writer),
+        .try_ => {
+            try writer.print("#{d}", .{w});
+            if (w >= routine.tries.len) return;
+            const t = routine.tries[w];
+            try writer.print("<catch j{d:0>4}", .{t.catch_pc});
+            if (t.finally_pc) |f| try writer.print(" finally j{d:0>4}", .{f});
+            try writer.writeAll(">");
+        },
+        .capture => {
+            try writer.print("#{d}", .{w});
+            if (w >= routine.capture_descs.len) return;
+            const desc = routine.capture_descs[w];
+            try writer.print("<routine {s}>[", .{desc.routine.name});
+            for (desc.sources, 0..) |source, i| {
+                if (i > 0) try writer.writeAll(" ");
+                switch (source) {
+                    .local_cell_slot => |slot| try writer.print("s{d}", .{slot}),
+                    .inherited_upvalue => |u| try writer.print("u{d}", .{u}),
+                }
+            }
+            try writer.writeAll("]");
+        },
     }
-    try writer.writeAll("]");
+}
+
+fn writeConst(index: u32, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+    try writer.print("c{d}", .{index});
+    if (index >= routine.consts.len) return;
+    try writer.writeAll("=");
+    try writeConstant(routine.consts[index], interner, writer);
+}
+
+fn writeVar(index: u32, routine: *const vm.Routine, writer: *Writer) Writer.Error!void {
+    try writer.print("v{d}", .{index});
+    if (index < routine.var_table.len) try writer.print("={s}", .{routine.var_table[index].name});
 }
 
 /// One operand: its kind letter and index, then what the index
 /// names when the routine can say (`c0=42`, `v1=inc`); `-` for an
-/// unused operand, `#n` for a raw immediate, `jNNNN` for a jump
-/// target.
+/// unused operand, `#n` for a raw immediate.
 fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, immediate: bool, writer: *Writer) Writer.Error!void {
     if (immediate) {
         try writer.print("#{d}", .{op.index});
@@ -207,25 +247,10 @@ fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const in
     }
     switch (op.kind) {
         .slot => try writer.print("s{d}", .{op.index}),
-        .constant => {
-            try writer.print("c{d}", .{op.index});
-            if (op.index < routine.consts.len) {
-                switch (routine.consts[op.index]) {
-                    .value => |v| {
-                        try writer.writeAll("=");
-                        try writeConstant(v, interner, writer);
-                    },
-                    .routine => |r| try writer.print("=<routine {s}>", .{r.name}),
-                }
-            }
-        },
-        .var_ => {
-            try writer.print("v{d}", .{op.index});
-            if (op.index < routine.var_table.len) try writer.print("={s}", .{routine.var_table[op.index].name});
-        },
+        .constant => try writeConst(op.index, routine, interner, writer),
+        .var_ => try writeVar(op.index, routine, writer),
         .upvalue => try writer.print("u{d}", .{op.index}),
         .intern => try writer.print("i{d}", .{op.index}),
-        .jump => try writer.print("j{d:0>4}", .{op.index}),
         .durable => try writer.print("e{d}", .{op.index}),
         .unused => try writer.writeAll("-"),
         _ => try writer.print("?{d}", .{op.index}),
@@ -310,46 +335,56 @@ test "every variant of every dispatched group has a name, and nothing else does"
     try testing.expect(variantName(.simd, 0) == null);
 }
 
-test "a listing shows every operand kind, immediates, constants and jump targets" {
-    const consts = [_]vm.Const{ vm.cval(value_mod.fromFixnum(42).?), vm.cval(value_mod.nilValue()) };
+test "a listing shows every operand kind, immediates, constants and wide fields" {
+    const consts = [_]value_mod.Value{ value_mod.fromFixnum(42).?, value_mod.nilValue() };
     const code = [_]vm.Inst{
         vm.asm_.loadConst(0, 0),
         vm.asm_.mathAdd(1, vm.Operand.slot(0), vm.Operand.constant(0)),
-        vm.asm_.jumpIfFalse(4, vm.Operand.slot(1)),
+        vm.asm_.jumpIfFalse(70_000, vm.Operand.slot(1)),
         vm.asm_.callCall(0, 2, 3),
         vm.asm_.moveFrom(2, vm.Operand.upvalue(0)),
+        vm.asm_.loadConst(0, 1),
+        vm.asm_.tryEnter(0, 2),
+        vm.asm_.tryEnter(1, 2),
+        vm.asm_.tryExit(11),
+        vm.asm_.jumpJmp(3),
         vm.asm_.returnSlot(1),
     };
-    const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 4, .name = "t" };
+    const tries = [_]vm.Try{ .{ .catch_pc = 9 }, .{ .catch_pc = 8, .finally_pc = 10 } };
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .tries = &tries, .slot_count = 4, .name = "t" };
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try disassemble(&routine, null, &out.writer);
     try testing.expectEqualStrings(
         \\routine t slots=4 arity=0 upvalues=0
-        \\  0000  mov:load-const      s0  c0=42  -
+        \\  0000  mov:load-const      s0  c0=42
         \\  0001  math:add            s1  s0  c0=42
-        \\  0002  jump:if-false       j0004  s1  -
+        \\  0002  jump:if-false       s1  j70000
         \\  0003  call:call           s0  #2  s3
         \\  0004  mov:move            s2  u0  -
-        \\  0005  call:return         s1  -  -
+        \\  0005  mov:load-const      s0  c1=nil
+        \\  0006  ctrl:try-enter      s2  #0<catch j0009>
+        \\  0007  ctrl:try-enter      s2  #1<catch j0008 finally j0010>
+        \\  0008  ctrl:try-exit       -  j0011
+        \\  0009  jump:jmp            -  j0003
+        \\  0010  call:return         s1  -  -
         \\
     , out.written());
 }
 
-test "closure:make lists where each captured cell comes from" {
+test "closure:make lists its routine and where each captured cell comes from, then the routine" {
     const inner = vm.Routine{ .code = &.{vm.asm_.returnSlot(0)}, .consts = &.{}, .slot_count = 1, .name = "f", .upvalue_count = 2 };
-    const consts = [_]vm.Const{.{ .routine = &inner }};
     const sources = [_]vm.CaptureSource{ .{ .local_cell_slot = 3 }, .{ .inherited_upvalue = 1 } };
-    const descs = [_]vm.CaptureDescriptor{ .{ .sources = &.{} }, .{ .sources = &sources } };
-    const code = [_]vm.Inst{ vm.asm_.closureMake(0, 0, 1), vm.asm_.closureMake(0, 1, 2) };
-    const routine = vm.Routine{ .code = &code, .consts = &consts, .capture_descs = &descs, .slot_count = 4, .name = "t" };
+    const descs = [_]vm.CaptureDescriptor{ .{ .routine = &inner, .sources = &.{} }, .{ .routine = &inner, .sources = &sources } };
+    const code = [_]vm.Inst{ vm.asm_.closureMake(0, 1), vm.asm_.closureMake(1, 2) };
+    const routine = vm.Routine{ .code = &code, .consts = &.{}, .capture_descs = &descs, .slot_count = 4, .name = "t" };
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try disassembleRoutine(&routine, null, &out.writer);
     try testing.expectEqualStrings(
         \\routine t slots=4 arity=0 upvalues=0
-        \\  0000  closure:make        c0=<routine f>  #0[]  s1
-        \\  0001  closure:make        c0=<routine f>  #1[s3 u1]  s2
+        \\  0000  closure:make        s1  #0<routine f>[]
+        \\  0001  closure:make        s2  #1<routine f>[s3 u1]
         \\
     , out.written());
 }
@@ -377,7 +412,7 @@ test "a large constant prints as its first 60 bytes and its item count" {
     defer heap.deinit();
     var items: [5000]value_mod.Value = undefined;
     for (&items, 0..) |*item, i| item.* = value_mod.fromFixnum(@intCast(i)).?;
-    const consts = [_]vm.Const{ vm.cval(try vector_mod.fromSlice(&heap, &items)), vm.cval(try vector_mod.fromSlice(&heap, items[0..3])) };
+    const consts = [_]value_mod.Value{ try vector_mod.fromSlice(&heap, &items), try vector_mod.fromSlice(&heap, items[0..3]) };
     const code = [_]vm.Inst{ vm.asm_.loadConst(0, 0), vm.asm_.loadConst(0, 1) };
     const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 1, .name = "t" };
     var out: Writer.Allocating = .init(testing.allocator);
@@ -385,8 +420,8 @@ test "a large constant prints as its first 60 bytes and its item count" {
     try disassemble(&routine, null, &out.writer);
     try testing.expectEqualStrings(
         \\routine t slots=1 arity=0 upvalues=0
-        \\  0000  mov:load-const      s0  c0=[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ...(5000 items)  -
-        \\  0001  mov:load-const      s0  c1=[0 1 2]  -
+        \\  0000  mov:load-const      s0  c0=[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ...(5000 items)
+        \\  0001  mov:load-const      s0  c1=[0 1 2]
         \\
     , out.written());
 }

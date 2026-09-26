@@ -47,29 +47,35 @@ and `(v i)`), namespaces, Vars and the namespace registry.
 ### 3. Physical instruction format
 
 ```
-Primary instruction (64 bits):
+Instruction (64 bits):
   | kind(4) | group(6) | variant(6) | opA(16) | opB(16) | opC(16) |
 
 Operand (16 bits):
   | kind(4) | index(12) |
 
-Extension instruction (64 bits):
-  | kind(4) | extA(20) | extB(20) | extC(20) |
+Wide field W (32 bits): opB and opC read as one number, opB the low half
+  | kind(4) | group(6) | variant(6) | opA(16) | W(32) |
 ```
 
-- `InstKind` is `primary` (0) or `extension` (1). The extension form
-  is defined but never executed: the VM traps `UnimplementedOpcode`
-  on one and the compiler never emits one.
+- `InstKind` has one value, `primary` (0); an instruction of any
+  other kind is `BytecodeCorruption`.
 - Group and variant together select the handler (64 × 64 address
   space).
-- An operand index is 12 bits (0..4095). Every table an operand
-  indexes is bounded by it, and the compiler reports the overflow
-  (`COMPILER.md` §4.4): more than 4096 constants or capture
-  descriptors is `ConstantPoolOverflow`; more than 4096 live slots,
-  upvalues or Var-table entries is `SlotOverflow`; a jump to a pc
-  past 4095 is `JumpTargetOutOfRange` at the form that needs it.
-  Code past pc 4095 that nothing jumps to runs, so the limit is on
-  branch targets, not on routine length.
+- An operand index is 12 bits (0..4095). It addresses a frame's
+  slots, a closure's upvalues, and the first 4096 constants and
+  Var-table entries in place.
+- An instruction that names a pc or a table entry carries it in W:
+  every jump target (`jump:*`) and `ctrl:try-exit`'s continuation, the
+  `try` of `ctrl:try-enter` (whose entry holds the catch and finally
+  pcs), the constant of `mov:load-const`, the Var of `var:*` and the
+  capture descriptor of `closure:make`. A routine's code, constants,
+  Var table, tries and capture descriptors are therefore bounded only
+  by 2^32 entries; a constant or Var past the
+  operand range is read through `mov:load-const` or `var:load-var`
+  into a slot (`COMPILER.md` §4.4).
+- Slots and upvalues are addressed only by operands: a routine has at
+  most 4096 slots live at once and 4096 upvalues, the compile error
+  `SlotOverflow`, whose detail names the routine and the limit.
 
 ---
 
@@ -78,13 +84,12 @@ Extension instruction (64 bits):
 | # | Letter | Name | Meaning |
 |---|---|---|---|
 | 0 | `s` | slot | Frame-local slot, `stack[frame.base_slot + index]` |
-| 1 | `c` | constant | `routine.consts[index]`, which must be `Const.value` where a value is read |
+| 1 | `c` | constant | `routine.consts[index]` |
 | 2 | `v` | var | `routine.var_table[index]`: its binding in force, else its root; `:unbound-var` if never bound |
 | 3 | `u` | upvalue | The contents of `frame.upvalues[index]` (a cell read, not the cell) |
 | 4 | `i` | intern | Reserved: no opcode resolves it (`resolve` traps `UnimplementedOpcode`) |
-| 5 | `j` | jump | An absolute pc in the current routine: `jump:*` targets and the pcs of `ctrl:try-enter` / `ctrl:try-exit` |
 | 6 | `e` | durable | Reserved: no opcode resolves it (`resolve` traps `UnimplementedOpcode`) |
-| 7–14 | | | Unassigned; an operand carrying one is `BytecodeCorruption` |
+| 5, 7–14 | | | Unassigned; an operand carrying one is `BytecodeCorruption` |
 | 15 | `-` | unused | No operand; `resolve` of it is `InvalidOperandKind` |
 
 `resolve()` accepts `s`, `c`, `v` and `u`: an operand position
@@ -97,10 +102,9 @@ traps `UnimplementedOpcode` (upvalues are never written, §6).
 The format has no immediate operand kind. Where §10 says
 "immediate", the handler reads the 12-bit `index` as the datum and
 ignores the kind bits; assemblers write the kind as `.slot`. The
-immediates are operand B of `call:call` / `call:tailcall` (argc),
-of `closure:make` (capture-descriptor index) and of every `coll:*`
-variant (argc). A jump target is not an immediate: it must carry
-kind `j` (§10.6).
+immediates are operand B of `call:call` / `call:tailcall` (argc) and
+of every `coll:*` variant (argc). A pc or table index is not an
+immediate: it is the wide field (§3).
 
 ---
 
@@ -113,9 +117,10 @@ the closures that wrap it (§6).
 | Field | Contents |
 |---|---|
 | `code` | The instructions |
-| `consts` | Typed constants, `Const = union { value: Value, routine: *const Routine }`. A position that reads a value (`mov:load-const`, any `c` operand) needs `.value`; `closure:make` operand A needs `.routine`; a mismatch is `InvalidOperandKind` |
-| `var_table` | The `*Var`s the code references, bound at compile time; `v` operands index it |
-| `capture_descs` | The capture descriptors this routine's `closure:make` instructions use to build child closures (§6) |
+| `consts` | The constant pool, Values; `c` operands address its first 4096 entries, `mov:load-const` any |
+| `var_table` | The `*Var`s the code references, bound at compile time; `v` operands address its first 4096 entries, `var:*` any |
+| `capture_descs` | What this routine's `closure:make` instructions build: each descriptor names a child routine and where its upvalue cells come from (§6) |
+| `tries` | One `Try{catch_pc, finally_pc?}` per `try` form, named by `ctrl:try-enter` (§12): a handler needs two pcs and an instruction carries one wide field, so they live here, as the capture sources of a `closure:make` do |
 | `upvalue_count` | The number of cells a closure over this routine carries; `u` operands index them |
 | `slot_count` | The frame window size |
 | `fixed_arity`, `variadic` | `call:call` requires `argc == fixed_arity`, or `argc >= fixed_arity` when variadic; a variadic routine with `slot_count < fixed_arity + 1` is `BytecodeCorruption` |
@@ -151,8 +156,8 @@ it. There is no rewrite path.
 
 **Capture.** The compiler knows every closure's capture set
 statically, so capture is a side table rather than runtime staging.
-A capture descriptor is a list of sources, one per upvalue of the
-child:
+A capture descriptor names the child routine and lists its sources,
+one per upvalue of the child:
 
 | Source | Effect |
 |---|---|
@@ -180,7 +185,7 @@ beyond their preconditions.
 
 | Opcode | Operands | Effect | Traps |
 |---|---|---|---|
-| `closure:make` | A=routine constant, B=descriptor (immediate), C=dst slot | Allocate a closure over `consts[A].routine` with one cell per descriptor source, filled as above; store it in `slot[C]` | `CaptureCountMismatch` when the source count differs from the child's `upvalue_count`; `ExpectedCell`, `UpvalueOutOfRange` |
+| `closure:make` | A=dst slot, W=capture descriptor | Allocate a closure over descriptor W's routine with one cell per source, filled as above; store it in `slot[A]` | `CaptureCountMismatch` when the source count differs from the child's `upvalue_count`; `ExpectedCell`, `UpvalueOutOfRange`; `OperandOutOfRange` for W past the table |
 | `closure:box-local` | A=slot | Replace `slot[A]`'s value `v` with a fresh cell `{v, initialized}` | `InvalidCellState` if the slot already holds a cell |
 | `closure:new-cell` | A=dst slot | Store a fresh uninitialized cell in `slot[A]` | |
 | `closure:init-cell` | A=cell slot, B=any | Write `resolve(B)` into the cell, mark it initialized | `ExpectedCell`; `InvalidCellState` if already initialized; `InvalidOperandKind` if A is not a slot |
@@ -318,7 +323,7 @@ loop:
   frame = current frame
   if frame.pc >= code.len: BytecodeExhausted
   inst = frame.routine.code[frame.pc]; frame.pc += 1
-  if inst is an extension: UnimplementedOpcode
+  if inst.kind is not primary: BytecodeCorruption
   switch inst.group:
     mov, cmp, jump, var, math     => exec<Group>(frame, inst)
     call, closure, coll, ctrl     => exec<Group>(inst)
@@ -415,13 +420,12 @@ and `call`, where it traps `UnimplementedOpcode`.
 | # | Name | Operands | Semantics |
 |---|---|---|---|
 | 0 | `mov:move` | A=slot, B=any | `slot[A] := resolve(B)` |
-| 1 | `mov:load-const` | A=slot, B=constant | `slot[A] := consts[B].value` |
+| 1 | `mov:load-const` | A=slot, W=constant index | `slot[A] := consts[W]`; `OperandOutOfRange` past the pool |
 | 2 | `mov:load-nil` | A=slot | `slot[A] := nil` |
 | 3 | `mov:load-true` | A=slot | `slot[A] := true` |
 | 4 | `mov:load-false` | A=slot | `slot[A] := false` |
 
-Keywords and symbols are `Const.value` entries; there is no
-`load-keyword`.
+Keywords and symbols are constants; there is no `load-keyword`.
 
 #### 10.2 `call`
 
@@ -487,23 +491,26 @@ Operands, effects and traps: §6.
 
 | # | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `jump:jmp` | A=jump | `pc := A` |
-| 1 | `jump:if-true` | A=jump, B=any | `pc := A` when `resolve(B)` is truthy |
-| 2 | `jump:if-false` | A=jump, B=any | `pc := A` when `resolve(B)` is nil or false |
+| 0 | `jump:jmp` | W=target | `pc := W` |
+| 1 | `jump:if-true` | A=any, W=target | `pc := W` when `resolve(A)` is truthy |
+| 2 | `jump:if-false` | A=any, W=target | `pc := W` when `resolve(A)` is nil or false |
 
-The target must carry kind `j`: any other kind is
-`InvalidOperandKind`, so a stale placeholder instruction fails
-cleanly instead of jumping to slot 0's index. A target at or past
-the end of the code is `OperandOutOfRange`. A conditional jump
-checks its target only when taken.
+The target is an absolute pc in the current routine. A target at or
+past the end of the code is `OperandOutOfRange`; the compiler's
+placeholder for a target still to be patched is 2^32 − 1, so a missed
+patch fails there instead of jumping. A conditional jump checks its
+target only when taken.
 
 #### 10.7 `var`
 
 | # | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `var:load-var` | A=slot, B=var | `slot[A] :=` the Var's `thread_value` when a binding is in force (§6.5), else its root; `:unbound-var` when it has neither. The same as `mov:move A, vB` |
-| 1 | `var:store-var` | A=slot, B=var, C=any | The Var's root `:= resolve(C)`, marked bound; `slot[A] :=` the Var object. Redefining a name updates the same Var, so code compiled against it sees the new root |
-| 2 | `var:var-object` | A=slot, B=var | `slot[A] :=` the Var object; an unbound Var does not trap |
+| 0 | `var:load-var` | A=slot, W=Var index | `slot[A] :=` the Var's `thread_value` when a binding is in force (§6.5), else its root; `:unbound-var` when it has neither. The same as `mov:move A, vW` for W below 4096 |
+| 1 | `var:store-var` | A=any, W=Var index | The Var's root `:= resolve(A)`, marked bound. Redefining a name updates the same Var, so code compiled against it sees the new root |
+| 2 | `var:var-object` | A=slot, W=Var index | `slot[A] :=` the Var object; an unbound Var does not trap |
+
+W past the Var table is `OperandOutOfRange`. `(def x v)` is
+`store-var` then `var-object`, so it yields the Var.
 
 A `Var` carries `root`, `bound`, `meta`, `macro` (set by `defmacro`,
 `docs/MACROEXPAND.md` §1.2), `dynamic`, `thread_value` and
@@ -528,8 +535,8 @@ Maps and sets hash and compare through `src/dispatch.zig`.
 
 | # | Name | Operands | Semantics |
 |---|---|---|---|
-| 0 | `ctrl:try-enter` | A=catch pc (jump), B=binding slot, C=finally pc (jump) or unused | Push a `try_` handler (§12) |
-| 1 | `ctrl:try-exit` | A=post pc (jump) | Normal exit of a try or catch body (§12) |
+| 0 | `ctrl:try-enter` | A=binding slot, W=try index | Push a `try_` handler for `tries[W]` (§12) |
+| 1 | `ctrl:try-exit` | W=post pc | Normal exit of a try or catch body (§12) |
 | 2 | `ctrl:finally-exit` | | End of a finally body: resume its continuation (§12) |
 | 3 | `ctrl:throw` | A=any | Throw `resolve(A)` (§12) |
 | 5 | `ctrl:halt` | | Traps `UnimplementedOpcode` |
@@ -573,11 +580,12 @@ finally_depth}`, where `finally_depth` is the length of
   handler's `finally_pc` for the catch body's `try-exit` and ensures
   a throw from the catch body is not caught by the same handler.
 
-**`ctrl:try-enter A=catch_pc B=binding_slot C=finally_pc?`** pushes a
-`try_` handler for the current frame; the pcs are absolute in the
-current routine and C is unused for a `try` without `finally`.
+**`ctrl:try-enter A=binding_slot W=try`** pushes a `try_` handler for
+the current frame with the catch pc and, for a `try` with a
+`finally`, the finally pc of `routine.tries[W]` (`OperandOutOfRange`
+past the table); the pcs are absolute in the current routine.
 
-**`ctrl:try-exit A=post_pc`** pops the top handler
+**`ctrl:try-exit W=post_pc`** pops the top handler
 (`InvalidHandlerState` if there is none or it belongs to another
 frame). With a `finally_pc` it pushes a
 `FinallyContinuation{frame_index, .normal = post_pc}` and jumps to
@@ -684,11 +692,11 @@ run):
 
 | Error | When |
 |---|---|
-| `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an extension instruction, an `i`, `j` or `e` operand where a value is read, a store to `u` |
-| `OperandOutOfRange` | An operand index past the routine's slots, constants or Var table; a jump target past the code |
-| `InvalidOperandKind` | An operand kind the position does not accept: `resolve` of unused, `store` to a constant, a jump target without kind `j`, the wrong `Const` variant |
+| `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an `i` or `e` operand where a value is read, a store to `u` |
+| `OperandOutOfRange` | An operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target past the code |
+| `InvalidOperandKind` | An operand kind the position does not accept: `resolve` of unused, `store` to a constant, a destination that is not a slot |
 | `BytecodeExhausted` | `pc` ran past the code |
-| `BytecodeCorruption` | An unrecognized group, variant or operand-kind bit pattern (§10); a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `BytecodeCorruption` | An instruction kind other than `primary`; an unrecognized group, variant or operand-kind bit pattern (§10); a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | A call block past the frame's slot count |
 | `CaptureCountMismatch` | A capture descriptor's source count differs from the child's `upvalue_count` |
 | `UpvalueOutOfRange` | A `u` index or `inherited_upvalue` source past the closure's upvalue count |
@@ -714,8 +722,9 @@ natives and protocol methods alike), `an integer is not callable`,
 `+ expects numbers, got a string`, `no impl of area for a vector`,
 `a value nests too deeply to compare, hash or print`. A value's kind
 is named as the language presents it (`kindPhrase`: `nil`, `a
-boolean`, `an integer`, `a map`, ...). The detail is empty when the
-raise site has nothing to add; `run` clears it on entry and a
+boolean`, `an integer`, `a map`, ...). A sentence longer than the
+160-byte buffer keeps what fits, cut at a character, and ends in `…`.
+The detail is empty when the raise site has nothing to add; `run` clears it on entry and a
 handler clears it when it takes the error as a keyword, so it never
 describes an earlier error.
 

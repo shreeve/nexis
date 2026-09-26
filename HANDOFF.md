@@ -273,32 +273,22 @@ failing test (AGENTS.md).
 
 ### 6.1 Language and runtime
 
-1. **A routine over 4096 instructions does not compile**: the 12-bit
-   jump operand (PLAN §23 #21) makes a longer routine the compile
-   error `JumpTargetOutOfRange`, and the report gives no reason. A
-   `deftest` body is one routine and an `is` compiles to about 17
-   instructions, so 240 assertions compile and 241 do not; no file in
-   the tree comes near it (the largest `deftest` holds 3). Next: either have `deftest` (`src/stdlib/test.nx`)
-   compile each `is` into its own function, which needs no amendment,
-   or widen jump targets with an amendment to #21 and the VM's
-   `applyJump`, try-enter and try-exit operands; the test is a
-   generated 5000-instruction routine that runs.
-2. **Keyword hashes follow intern order**, so a map past eight entries
+1. **Keyword hashes follow intern order**, so a map past eight entries
    prints in an order that depends on what was interned first; the
    embedded `.nx` files may hold no keyword literal, and
    `test/nextomic/*.out` and `test/examples/*.out` pin that order.
    Next: hash a keyword by its text in the keyword domain (as a
    symbol is), regenerate the `.out` files with `-Dupdate=true`,
    and drop the rule from `docs/STDLIB.md` §1.
-3. **Sequences are eager** (§23 #14; open question §24 #2):
+2. **Sequences are eager** (§23 #14; open question §24 #2):
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-4. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
+3. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-5. **A transaction handle dropped open is never aborted**: nothing
+4. **A transaction handle dropped open is never aborted**: nothing
    ends a `db/begin-read` or `db/begin-write` handle the program
    neither commits nor aborts, because handles are not collector
    blocks and nothing finalizes them; it lives until VM teardown and
@@ -306,36 +296,36 @@ failing test (AGENTS.md).
    and `with-read-tx` always close theirs. Next: track open handles on
    the connection and abort them when it closes, or give the kind a
    finalizer.
-6. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+5. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
    is `MalformedMacroCall` ("options come in pairs"). Next: in
    `expand.zig`'s require walk, expand a spec whose second element is
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-7. **Out of memory ends the process with exit status 1**:
+6. **Out of memory ends the process with exit status 1**:
    `VmError.OutOfMemory` escapes `main` as a Zig `error: OutOfMemory`,
    the status of a usage error, and ends a REPL session. Next: report
    it as a runtime error (exit 5, `docs/TOOLING.md` §1) and keep the
    REPL alive after `resetAfterError`; a CLI golden whose program asks
    for an allocation no machine has.
-8. **The REPL copies pending input on every line**: each line of an
+7. **The REPL copies pending input on every line**: each line of an
    incomplete form dupes the whole pending text into the session arena
    and reads it again, so a pasted form of n lines costs O(n²), and
    there is no continuation prompt. Next: `cli.zig` keeps the pending
    text in its growable buffer and dupes it once when the form is
    complete, and prints a continuation prompt; `test/golden/cli/repl.*`
    gains a multi-line form.
-9. **An error's caret counts bytes**: the underline and column of an
-    error report advance one per byte, so a line with multi-byte
-    characters before the span underlines the wrong place. Next: count
-    code points in `cli.zig`'s report, with a CLI golden holding a
-    non-ASCII line.
-10. **Small Clojure differences**: `(int x)` of NaN is
-    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
-    transient (Clojure's transient collections are counted);
-    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
-    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
-    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
+8. **An error's caret counts bytes**: the underline and column of an
+   error report advance one per byte, so a line with multi-byte
+   characters before the span underlines the wrong place. Next: count
+   code points in `cli.zig`'s report, with a CLI golden holding a
+   non-ASCII line.
+9. **Small Clojure differences**: `(int x)` of NaN is
+   `:invalid-argument` (Clojure returns 0); `counted?` is false for a
+   transient (Clojure's transient collections are counted);
+   `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
+   `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
+   `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
 
 ### 6.2 Nextomic
 
@@ -453,7 +443,7 @@ keys, a §7 row, and the `.out` line that shows the map.
 Keep store paths relative. Produce the `.out` with
 `zig build nextomic-nx -Dupdate=true` and read every line before
 committing it. Sort a map's entries before printing when a line needs
-a readable order (§6.1 item 2).
+a readable order (§6.1 item 1).
 
 **Running one test binary.** `zig build quick --verbose` prints each
 binary's command line (`.zig-cache/o/<hash>/<name>`); run it directly.
@@ -467,18 +457,15 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. Keyword hashing by name (§6.1 item 2): it removes a rule, makes
+1. Keyword hashing by name (§6.1 item 1): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. The 4096-instruction limit (§6.1 item 1): a generated test or
-   function past about 240 branches' worth of code fails to compile,
-   with an error that does not say why.
-3. Transaction handles dropped open (§6.1 item 5), writes during
+2. Transaction handles dropped open (§6.1 item 4), writes during
    `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
-   error (§6.1 item 7).
-4. The parser regeneration check and a Linux run (§6.4).
-5. Performance: the levers and measured dead ends are
+   error (§6.1 item 6).
+3. The parser regeneration check and a Linux run (§6.4).
+4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
-6. The open design questions, each an amendment first: laziness
+5. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

@@ -79,12 +79,17 @@ unterminated string` at the `"` of a string literal no quote closes;
 (keyword :a_b)`, FORMS.md §3); a `CompileError` name at the span
 COMPILER.md §7 gives. A macro expansion that failed adds the
 expander's reason (MACROEXPAND.md §8) at the innermost form that
-failed:
+failed, an unresolved symbol its name (`UnresolvedSymbol: unable to
+resolve symbol: foo`), and a routine limit the routine and the limit
+(COMPILER.md §4.4, `too-many-locals.err`):
 
 ```
 nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m threw bad macro input
     (m 1)
     ^^^^^
+nexis: test/golden/cli/too-many-locals.nx:7:3: SlotOverflow: fn many: more than 4096 local slots
+      (let-many 4100 a0))
+      ^^^^^^^^^^^^^^^^^^
 ```
 
 A file `require` could not load is reported in that file at its
@@ -148,21 +153,21 @@ line, column and frame names of the trace.
 
 `nexis disasm FILE` compiles FILE the way `run` does and prints every
 routine on stdout instead of running it: each top-level form's
-routine, then every closure prototype in its constant pool, depth
+routine, then every routine its capture descriptors build, depth
 first, a blank line between routines. `test/golden/cli/sum10.disasm`
 pins the listing of `examples/sum10.nx`:
 
 ```
 routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=println  -  ; 4:2
-  0001  mov:load-const      s3  c0=0  -  ; 5:13
-  0002  mov:load-const      s4  c0=0  -  ; 5:19
+  0000  var:load-var        s1  v0=println  ; 4:2
+  0001  mov:load-const      s3  c0=0  ; 5:13
+  0002  mov:load-const      s4  c0=0  ; 5:19
   0003  cmp:lt              s5  s3  c1=10  ; 6:9
-  0004  jump:if-false       j0009  s5  -  ; 6:5
+  0004  jump:if-false       s5  j0009  ; 6:5
   0005  math:add            s5  s3  c2=1  ; 7:14
   0006  math:add            s4  s4  s3  ; 7:22
   0007  mov:move            s3  s5  -  ; 7:7
-  0008  jump:jmp            j0003  -  -
+  0008  jump:jmp            -  j0003
   0009  mov:move            s2  s4  -  ; 8:7
   0010  call:call           s1  #1  s0  ; 4:1
   0011  call:return         s0  -  -
@@ -177,20 +182,23 @@ into a temporary because `(+ acc i)` still reads `i` (COMPILER.md
   it was lowered from, its slot count, its fixed arity (`+rest` when
   variadic) and its upvalue count.
 - One line per instruction: the pc, `group:variant` as VM.md §10
-  names them, then operands A, B and C. An operand prints its kind
-  letter and index (VM.md §4: `s` slot, `c` constant, `v` var, `u`
-  upvalue, `i` intern, `j` jump, `e` durable), `-` when unused. A
+  names them, then operands A, B and C, or operand A and the wide
+  field for an instruction that has one (VM.md §3). An operand prints
+  its kind letter and index (VM.md §4: `s` slot, `c` constant, `v`
+  var, `u` upvalue, `i` intern, `e` durable), `-` when unused. A
   constant shows its value as `pr-str` prints it (`c2=1`), cut at a
   space within 60 bytes and followed by ` ...` and, for a collection,
-  its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`), or
-  the routine it holds (`c0=<routine adder>`); a var its name
-  (`v0=println`); a jump its target pc (`j0009`). Operand B of
-  `call:call`, `call:tailcall` and every `coll:*` is a raw immediate
-  (VM.md §4.5) and prints as `#n`; `closure:make`'s B prints its
-  capture descriptor as `#n[sources]`, `sN` for a cell in this frame's
-  slot N and `uN` for this closure's upvalue N (`#0[s0]`, `#0[]` for
-  none). An unnamed group or variant prints its number after `?`; an
-  extension instruction prints `extension`.
+  its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
+  var its name (`v0=println`). Operand B of `call:call`,
+  `call:tailcall` and every `coll:*` is a raw immediate (VM.md §4.5)
+  and prints as `#n`. The wide field prints as what it names: a jump
+  or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
+  constant and a `var:*` Var as a `c` or `v` operand would,
+  `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
+  `closure:make`'s capture descriptor as `#n<routine NAME>[sources]`,
+  `sN` for a cell in this frame's slot N and `uN` for this closure's
+  upvalue N (`#0<routine adder>[s0]`, `[]` for none). An unnamed group or
+  variant prints its number after `?`.
 - `; LINE:COL` is the source position of the form an instruction was
   lowered from, printed where the span table changes (VM.md §5); an
   instruction without one carries the last one printed.
