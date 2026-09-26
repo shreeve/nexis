@@ -2608,11 +2608,9 @@ test "db/close: refused from a callback that holds one of the connection's trans
 
 /// Run each of `steps`, which open `@STORE@`, on one VM under
 /// `policy`; the last yields `expected`, and a collection afterwards
-/// leaves at most a handful of transaction handles alive. Between two
-/// steps no frame is live, but the VM's backing stack keeps what the
-/// last step left in its slots, and the whole stack is a root (GC.md
-/// §3); the steps clear it so that only what the program holds keeps
-/// a handle.
+/// leaves at most a handful of transaction handles alive: between two
+/// steps no frame is live and the backing stack holds nothing, so only
+/// what the program holds keeps a handle.
 fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: []const u8) !void {
     var store = try SeamStore.init("dropped-txns");
     defer store.deinit();
@@ -2626,7 +2624,6 @@ fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: [
     for (steps) |step| {
         const src = try store.source(step);
         defer testing.allocator.free(src);
-        @memset(program.v.stack.items, value_mod.nilValue());
         last = try program.run(src);
     }
     try harness.expectResult(&program, steps[steps.len - 1], last, expected);

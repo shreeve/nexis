@@ -65,8 +65,11 @@ VM's roots, in the order it marks them:
 1. **The backing stack, in full** (`vm.stack.items`): every slot of
    every frame's window and the slots above them. A slot above a
    popped frame keeps its stale value until the slot is grown into
-   again, which retains garbage for a while and is sound. A slot
-   holding a `cell_internal` Value marks the cell.
+   again, which retains garbage for a while and is sound. Between
+   top-level forms the stack holds nothing: `retargetTop` and
+   `resetAfterError` clear every slot, so a form keeps nothing an
+   earlier one left alive. A slot holding a `cell_internal` Value
+   marks the cell.
 2. **Every frame**: the closure it runs, whose trace reaches its cells
    and its routine's constants once however many frames run it; or,
    for a frame with no closure (a top-level form, a loader routine),
