@@ -74,6 +74,10 @@
       (symbol inc)
       (unquote-splicing (symbol xs))))
   (deref (symbol r))
+  (list (symbol var) (symbol x))
+  (list (symbol var) (symbol nexis.core/inc))
+  (quote
+    (list (symbol var) (symbol x)))
   (#%anon-fn (symbol +) (symbol %1) (symbol %2))
   (#%anon-fn (symbol +) (symbol %) (int 1))
   (with-meta

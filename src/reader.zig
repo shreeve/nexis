@@ -13,6 +13,7 @@
 //!     span of the offending form or token.
 //!   - Merge stacked metadata into one map; an outer `^` overrides an inner.
 //!   - Store `#(...)` as the `anon_fn` datum, rejecting nesting.
+//!   - Read `#'x` as the list `(var x)`.
 //!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
 //!     unquote expansion live in the macroexpander (PLAN §14.2).
 //!
@@ -213,6 +214,7 @@ pub const Reader = struct {
             },
             .quote, .deref, .@"syntax-quote", .unquote, .@"unquote-splicing" => return self.readPrefix(tag, s),
             .@"with-meta-raw" => return self.readWithMetaRaw(s),
+            .@"var-quote" => return self.readVarQuote(s),
             .program => return self.fail(.unknown_reader_construct, sexpSpan(s), "nested (program ...) not allowed"),
         }
     }
@@ -374,6 +376,17 @@ pub const Reader = struct {
             else => unreachable,
         };
         return try self.makeForm(datum, spanTo(items[1].src.pos, inner.origin));
+    }
+
+    /// `#'x` is the list `(var x)`, as Clojure's reader makes it: no
+    /// datum of its own, so quoting it yields the list and `var`
+    /// rejects a non-symbol target at compile time. `var` spans `#'`.
+    fn readVarQuote(self: *Reader, s: Sexp) ReaderError!*Form {
+        const items = s.items();
+        const head = try self.makeForm(.{ .symbol = .{ .ns = null, .name = "var" } }, tokenSpan(items[1].src));
+        const inner = try self.readForm(items[2]);
+        const list = try self.allocator().dupe(*Form, &.{ head, inner });
+        return try self.makeForm(.{ .list = list }, spanTo(items[1].src.pos, inner.origin));
     }
 
     fn readAnonFn(self: *Reader, items: []const Sexp, span: SrcSpan) ReaderError!*Form {
@@ -1327,12 +1340,42 @@ test "duplicate literal detection is linear in the literal's size" {
     }
 }
 
+test "var-quote: #'x reads as the list (var x), whatever form follows" {
+    // Clojure's VarReader reads the next form, so whitespace and a
+    // discard may stand between, and a non-symbol target reads (the
+    // compiler rejects it).
+    try expectReads("#'x", "(list (symbol var) (symbol x))\n");
+    try expectReads("#'foo/bar", "(list (symbol var) (symbol foo/bar))\n");
+    try expectReads("#' x", "(list (symbol var) (symbol x))\n");
+    try expectReads("#'#_ x y", "(list (symbol var) (symbol y))\n");
+    try expectReads("#'(f)", "(list\n  (symbol var)\n  (list (symbol f)))\n");
+    try expectReads("'#'x", "(quote\n  (list (symbol var) (symbol x)))\n");
+    try expectReads("(f #'x)", "(list\n  (symbol f)\n  (list (symbol var) (symbol x)))\n");
+    // The list spans `#'` through its target; `var` spans `#'`.
+    const allocator = std.testing.allocator;
+    const src: []const u8 = "( #' #_ q x )";
+    var p = parser.Parser.init(allocator, src);
+    defer p.deinit();
+    var rd = Reader.init(allocator, src);
+    defer rd.deinit();
+    const forms = try rd.readProgram(try p.parseProgram());
+    const vq = forms[0].datum.list[0];
+    try std.testing.expectEqualStrings("#' #_ q x", src[vq.origin.pos..][0..vq.origin.len]);
+    const head = vq.datum.list[0];
+    try std.testing.expectEqualStrings("#'", src[head.origin.pos..][0..head.origin.len]);
+    // `#'` with no form after it is a parse error.
+    for ([_][]const u8{ "#'", "(#')", "#' #_ x" }) |bad| {
+        var bp = parser.Parser.init(allocator, bad);
+        defer bp.deinit();
+        try std.testing.expectError(error.ParseError, bp.parseProgram());
+    }
+}
+
 test "an unsupported construct is one err token, so the parse error names it" {
     const allocator = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "(f #'x)", "#'x" }, .{ "#\"a.*\"", "#\"" },                        .{ "::k", "::k" },
-        .{ "##Inf", "##Inf" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" }, .{ "#?(:clj 1)", "#?" },
-        .{ "# x", "#" },
+        .{ "#\"a.*\"", "#\"" }, .{ "##Inf", "##Inf" },   .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
+        .{ "::k", "::k" },      .{ "#?(:clj 1)", "#?" }, .{ "# x", "#" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c[0]);

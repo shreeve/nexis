@@ -13,6 +13,7 @@
 #     `anon_fn` datum and rejects nested anon-fns.
 #   - `` `x `` emits `(syntax-quote ` x)`; expansion (auto-qualify, auto-gensym,
 #     unquote handling) is the macroexpander's job.
+#   - `#'x` emits `(var-quote #' x)`; the reader builds the list `(var x)`.
 #   - `nil`, `true`, `false` arrive as symbols; the reader converts them.
 #   - Duplicate literal keys, odd map counts, nested anon-fns and bare
 #     unquotes are the reader's to reject.
@@ -48,6 +49,7 @@ tokens
     unquote_splicing_tok
     unquote_tok
     deref_tok
+    var_quote_tok
     caret
     eof
     err
@@ -90,4 +92,5 @@ datum    = INTEGER                               → (int 1)
          | UNQUOTE_TOK gap datum                 → (unquote 1 3)
          | UNQUOTE_SPLICING_TOK gap datum        → (unquote-splicing 1 3)
          | DEREF_TOK gap datum                   → (deref 1 3)
+         | VAR_QUOTE_TOK gap datum               → (var-quote 1 3)
          | CARET gap datum gap datum             → (with-meta-raw 1 5 3)

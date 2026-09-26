@@ -413,6 +413,7 @@ foo, ns/foo, set!, ->>, λ            ;; symbol
 (unquote           f)                ;; ~f
 (unquote-splicing  f)                ;; ~@f
 (deref             f)                ;; @f
+(list (symbol var) f)                ;; #'f: an ordinary list, as in Clojure
 
 ;; Metadata
 (with-meta TARGET META-MAP)          ;; ^meta x: META-MAP first in source, TARGET first in the Form
@@ -437,6 +438,7 @@ all before macroexpansion.
 | `#_ #_ x y z` | each `#_` consumes one form, which may itself begin with `#_`: only `z` remains |
 | `#(body)` | `(#%anon-fn body)`; `%`, `%1`, `%2`, `%&` stay ordinary symbols for the macroexpander |
 | `` `x `` | `(syntax-quote x)`, not expanded here |
+| `#'x`, `#'(f)` | the list `(var x)`, `(var (f))`: `#'` reads the next form, as Clojure's reader does, and `var` rejects a non-symbol at compile time |
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer without the suffix |
 | `"one⏎two"` | a string may span lines; the newline is part of it |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold non-ASCII UTF-8 |
@@ -453,7 +455,7 @@ all before macroexpansion.
 | `^1 x` | reader error `:unknown-reader-construct` (metadata is a keyword, map or symbol) |
 | bytes that are not UTF-8 in a string, symbol or keyword | reader error `:invalid-utf8` |
 | a form nested past the native stack's budget | reader error `:nesting-too-deep` |
-| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `::k` | parse error naming the construct |
+| `#"re"`, `##Inf`, `#?(...)`, `::k` | parse error naming the construct |
 
 Only statically detectable literal keys and elements count as
 duplicates: `{:a 1 (keyword "a") 2}` reads.
@@ -727,3 +729,8 @@ entry stating the decision and its rationale.
     §27 move to the documents that own their facts (redirect table);
     §24 #1, #10, #11, #12 and §25 #9, #11, #14 are removed as settled;
     §24 #13 (`&form`, `&env`) is added.
+
+- **2026-09-25 — Var-quote reader form (§28.2, §28.3).** `#'x` reads as
+  the list `(var x)`, as in Clojure's reader, so Clojure code reads and
+  a printed Var (`#'ns/name`) reads back. `docs/FORMS.md` §3 is the
+  authority.

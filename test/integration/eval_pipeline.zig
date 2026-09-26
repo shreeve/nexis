@@ -232,6 +232,24 @@ test "integration: def returns the Var" {
     try expectOutputProgram("(ns my.app) (def y 1) [(var inc) (var y)]", "[#'nexis.core/inc #'my.app/y]");
 }
 
+test "var-quote: #'x reads as (var x), and a printed Var reads back" {
+    // FORMS.md §3: the reader turns `#'x` into the list `(var x)`.
+    try expectOutput("[(= (var inc) #'inc) (identical? #'inc #'nexis.core/inc) (@#'inc 1)]", "[true true 2]");
+    try expectOutputProgram("(def ^{:doc \"d\"} x 1) [#'x (:doc (meta #'x)) @#'x]", "[#'user/x d 1]");
+    try expectOutput("['#'x (read-string \"#' nexis.core/inc\")]", "[(var x) (var nexis.core/inc)]");
+    try expectOutput("(= (read-string (pr-str (var inc))) '(var nexis.core/inc))", "true");
+    try expectOutput("(identical? (eval (read-string (pr-str #'inc))) #'inc)", "true");
+    // Syntax-quote leaves the special form `var` unqualified.
+    try expectOutputProgram("(defmacro m [n] `(@#'inc ~n)) (m 1)", "2");
+    try expectOutputProgram("(def z 3) (defmacro vz [] `#'z) [(vz) (macroexpand '(vz))]", "[#'user/z (var user/z)]");
+    try expectOutputProgram("(defmacro vq [s] `#'~s) (vq inc)", "#'nexis.core/inc");
+    // `#'` reads any form, as Clojure's reader does; `var` takes only
+    // a symbol, so a non-symbol target fails to compile.
+    try expectProgramError("#'(f)", compile.CompileError.ExpectedSymbol);
+    try expectProgramError("#'42", compile.CompileError.ExpectedSymbol);
+    try expectOutput("(try (read-string \"#'\") (catch :reader-error e :bad))", ":bad");
+}
+
 test "integration: def + Var lookup" {
     try expectOutput("(do (def x 42) x)", "42");
 }
