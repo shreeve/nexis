@@ -1,0 +1,7 @@
+nexis: test/golden/cli/rethrow-catch.nx:6:5: runtime error: UncaughtThrow {:error :negative, :value -3}
+        (throw {:error :negative :value x})))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  at check (test/golden/cli/rethrow-catch.nx:6:5)
+  at guarded (test/golden/cli/rethrow-catch.nx:10:5)
+  at logged (test/golden/cli/rethrow-catch.nx:15:5)
+  at <top> (test/golden/cli/rethrow-catch.nx:20:1)

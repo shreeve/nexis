@@ -921,6 +921,39 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
     try testing.expectEqualStrings("", program.v.error_detail);
 }
 
+test "integration: a throw that leaves through a catch or a finally is reported where it began" {
+    const Case = struct { src: []const u8, err: anyerror, detail: []const u8 = "", at: []const u8 };
+    const f = "(defn f [] (into [] [1] [2] [3])) (defn g [] (throw {:e 1})) ";
+    const cases = [_]Case{
+        // A runtime error through a finally, a catch no clause of
+        // which matches, and a catch that throws it again.
+        .{ .src = f ++ "(defn h [] (try (f) (finally 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch :nope e 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw e)))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
+        // A thrown value the same ways, and through both at once.
+        .{ .src = f ++ "(defn h [] (try (g) (catch :nope e 1) (finally 2))) (h)", .err = vm.VmError.UncaughtThrow, .at = "g" },
+        // A catch that catches another throw inside it still rethrows
+        // the first from where it began.
+        .{ .src = f ++ "(defn h [] (try (g) (catch any e (try (throw :x) (catch any _ nil)) (throw e)))) (h)", .err = vm.VmError.UncaughtThrow, .at = "g" },
+        // A different value thrown from a catch, or from a finally,
+        // begins where it is thrown.
+        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw {:wrapped e})))) (h)", .err = vm.VmError.UncaughtThrow, .at = "h" },
+        .{ .src = f ++ "(defn h [] (try (f) (finally (throw :cleanup-failed)))) (h)", .err = vm.VmError.UncaughtThrow, .at = "h" },
+        // A handled error does not stay with its value: a later throw
+        // of the same keyword begins where it is thrown.
+        .{ .src = f ++ "(try (f) (catch any e e)) (defn h [] (throw :arity-mismatch)) (h)", .err = vm.VmError.UncaughtThrow, .at = "h" },
+    };
+    for (cases) |case| {
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        try testing.expectError(vm.VmError.UncaughtThrow, program.run(case.src));
+        try testing.expectEqual(case.err, program.v.traced_error.?);
+        try testing.expectEqualStrings(case.detail, program.v.error_detail);
+        try testing.expectEqualStrings(case.at, program.v.error_trace.items[0].name);
+    }
+}
+
 // =============================================================================
 // Multi-arity defn
 // =============================================================================

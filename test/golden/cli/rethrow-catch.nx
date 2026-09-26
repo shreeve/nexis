@@ -1,0 +1,20 @@
+; A thrown value that no catch clause matches, or that a catch throws
+; again, keeps the site and the frames of the throw that raised it.
+
+(defn check [x]
+  (when (neg? x)
+    (throw {:error :negative :value x})))
+
+(defn guarded [x]
+  (try
+    (check x)
+    (catch :timeout e :retry)))
+
+(defn logged [x]
+  (try
+    (guarded x)
+    (catch any e
+      (println "logged" (:error e))
+      (throw e))))
+
+(logged -3)

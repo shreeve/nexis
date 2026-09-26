@@ -57,13 +57,13 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 152/152 steps succeeded; 1226/1226 tests passed
+Build Summary: 154/154 steps succeeded; 1227/1227 tests passed
 ```
 
 It ran in 67 s wall (225 s CPU) from a warm cache on an Apple-silicon
 Mac shared with other builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (612 inline tests) and
-`eval_pipeline` (408 programs).
+`eval_pipeline` (409 programs).
 
 The fastest end-to-end checks:
 
@@ -287,26 +287,15 @@ failing test (AGENTS.md).
    Next: hash a keyword by its text in the keyword domain (as a
    symbol is), regenerate the `.out` files with `-Dupdate=true`,
    and drop the rule from `docs/STDLIB.md` §1.
-3. **A rethrow loses the original error's report.** When no `catch`
-   clause matches, or a `finally` runs and rethrows, the VM rethrows
-   the error as a value, so an uncaught one is reported as
-   `UncaughtThrow :arity-mismatch` at the `try` form, without the
-   failing call's span, its frame trace or its detail ("into takes 0
-   to 2 arguments, got 4"): `(try (into [] [1] [2] [3]) (finally 1))`.
-   `with-out-str`, which catches and rethrows, hides errors the same
-   way. Next: keep the original `traced_error`, span, trace and
-   `error_detail` with the pending throw (`vm.finally_stack`) and
-   report them when the rethrow is not caught; a CLI golden pins the
-   report of that program.
-4. **Sequences are eager** (§23 #14; open question §24 #2):
+3. **Sequences are eager** (§23 #14; open question §24 #2):
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-5. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
+4. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
    `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
    `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-6. **A transaction handle dropped open is never aborted**: nothing
+5. **A transaction handle dropped open is never aborted**: nothing
    ends a `db/begin-read` or `db/begin-write` handle the program
    neither commits nor aborts, because handles are not collector
    blocks and nothing finalizes them; it lives until VM teardown and
@@ -314,31 +303,31 @@ failing test (AGENTS.md).
    and `with-read-tx` always close theirs. Next: track open handles on
    the connection and abort them when it closes, or give the kind a
    finalizer.
-7. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+6. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
    is `MalformedMacroCall` ("options come in pairs"). Next: in
    `expand.zig`'s require walk, expand a spec whose second element is
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-8. **Out of memory ends the process with exit status 1**:
+7. **Out of memory ends the process with exit status 1**:
    `VmError.OutOfMemory` escapes `main` as a Zig `error: OutOfMemory`,
    the status of a usage error, and ends a REPL session. Next: report
    it as a runtime error (exit 5, `docs/TOOLING.md` §1) and keep the
    REPL alive after `resetAfterError`; a CLI golden whose program asks
    for an allocation no machine has.
-9. **The REPL copies pending input on every line**: each line of an
+8. **The REPL copies pending input on every line**: each line of an
    incomplete form dupes the whole pending text into the session arena
    and reads it again, so a pasted form of n lines costs O(n²), and
    there is no continuation prompt. Next: `cli.zig` keeps the pending
    text in its growable buffer and dupes it once when the form is
    complete, and prints a continuation prompt; `test/golden/cli/repl.*`
    gains a multi-line form.
-10. **An error's caret counts bytes**: the underline and column of an
+9. **An error's caret counts bytes**: the underline and column of an
     error report advance one per byte, so a line with multi-byte
     characters before the span underlines the wrong place. Next: count
     code points in `cli.zig`'s report, with a CLI golden holding a
     non-ASCII line.
-11. **Small Clojure differences**: `(int x)` of NaN is
+10. **Small Clojure differences**: `(int x)` of NaN is
     `:invalid-argument` (Clojure returns 0); `counted?` is false for a
     transient (Clojure's transient collections are counted);
     `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
@@ -476,16 +465,13 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 2): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. The rethrow that loses the original report (§6.1 item 3): every
-   uncaught error through a `finally` or a non-matching `catch` is
-   reported at the wrong place.
-3. The 4096-instruction limit (§6.1 item 1): real test files hit it.
-4. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
-5. Transaction handles dropped open (§6.1 item 6), writes during
+2. The 4096-instruction limit (§6.1 item 1): real test files hit it.
+3. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
+4. Transaction handles dropped open (§6.1 item 5), writes during
    `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
-   error (§6.1 item 8).
-6. The parser regeneration check and a Linux run (§6.4).
-7. Performance: the levers and measured dead ends are
+   error (§6.1 item 7).
+5. The parser regeneration check and a Linux run (§6.4).
+6. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
 8. The open design questions, each an amendment first: laziness

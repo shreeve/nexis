@@ -1,0 +1,14 @@
+; A runtime error that leaves through a finally is reported where it
+; was raised, with its detail and the frames it left, exactly as it
+; would be with no try around it.
+
+(defn load-all [xs]
+  (into [] xs [2] [3]))
+
+(defn run-job []
+  (try
+    (load-all [1])
+    (finally
+      (println "cleanup ran"))))
+
+(run-job)

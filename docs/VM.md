@@ -358,7 +358,8 @@ cells and routine constants) or, for a frame without one, its
 routine's constants, recursively through nested routines; every Var
 of every namespace (`root`, `meta`, `thread_value`); the saved
 dynamic bindings; the root stack (`vm.roots`); the values of pending
-`finally` throws; `vm.unhandled_throw`; `vm.result`; and the
+`finally` throws; the values of throw origins (`vm.origins`, §12);
+`vm.unhandled_throw`; `vm.result`; and the
 protocol registry's implementations. `VM.gcTrace` traces a closure
 (cells, then routine constants) and a cell (its value).
 
@@ -595,6 +596,22 @@ walk the handler stack from the top:
 - With no handler anywhere the run fails with `UncaughtThrow` and the
   value in `vm.unhandled_throw`.
 
+**Where a throw began.** A throw a handler takes keeps its origin on
+`vm.origins`: the value, the `VmError` it was translated from (if
+any), that error's `vm.error_detail` and the frame chain at the raise.
+The `cleanup` handler a catch leaves and the `.throwing` continuation
+a finally resumes carry the origin's index. A throw of a value
+identical to the one a live catch holds is that throw again and keeps
+its origin, which covers the rethrow of a `catch` no clause of which
+matches and `(catch any e (throw e))`; any other throw begins where it
+is thrown. When a throw that carries an origin leaves the run,
+`recordErrorTrace` reports the origin: `traced_error` is the original
+`VmError` (or `UncaughtThrow` for a thrown value), `error_detail` its
+detail and `error_trace` its chain, so the report is the one the error
+would have without the `try` around it. An origin no live record names
+is dropped before the next one is pushed; `resetAfterError` clears
+them all.
+
 **`ctrl:finally-exit`** pops the top `FinallyContinuation`
 (`InvalidHandlerState` if there is none or it belongs to another
 frame): `.normal(pc)` resumes at `pc`, `.throwing(v)` re-throws `v`.
@@ -608,8 +625,8 @@ innermost active `try` catches every throw. The `try` macro turns
 keyword and class-name `catch` clauses into tests on the caught value
 and re-throws what no clause takes (`docs/MACROEXPAND.md` §10).
 Thrown values are ordinary Values with no stack trace or cause
-chain; an error that leaves a run records the frame chain in
-`VM.error_trace` (§13).
+chain; an error that leaves a run records in `VM.error_trace` (§13)
+the frame chain where its throw began.
 
 **Throws from natives.** A native throws exactly as `ctrl:throw`
 does, with the same walk and the same unwinding through every frame

@@ -1,0 +1,6 @@
+nexis: test/golden/cli/rethrow-finally.nx:6:3: runtime error: ArityMismatch: into takes 0 to 2 arguments, got 4
+      (into [] xs [2] [3]))
+      ^^^^^^^^^^^^^^^^^^^^
+  at load-all (test/golden/cli/rethrow-finally.nx:6:3)
+  at run-job (test/golden/cli/rethrow-finally.nx:10:5)
+  at <top> (test/golden/cli/rethrow-finally.nx:14:1)
