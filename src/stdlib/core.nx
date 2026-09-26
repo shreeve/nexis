@@ -747,6 +747,69 @@
   (print (apply format fmt args)))
 
 ; ============================================================
+; Delays, closing, taps
+; ============================================================
+
+; (delay body...) → a delay: body runs the first time the delay is
+; forced (force or deref), and every later force returns its value,
+; or rethrows what it threw. A delay is the record nexis.core/Delay,
+; whose :state atom holds [:pending thunk], [:ready v] or [:failed e].
+(defmacro delay [& body]
+  `(nexis.internal/#%delay (fn* [] ~@body)))
+
+(defn force [x]
+  (if (delay? x)
+    (let [state (:state x)
+          s @state]
+      (case (first s)
+        :ready (second s)
+        :failed (throw (second s))
+        (try
+          (let [v ((second s))]
+            (reset! state [:ready v])
+            v)
+          (catch any e
+            (reset! state [:failed e])
+            (throw e)))))
+    x))
+
+; (realized? d) → whether the delay has been forced.
+(defn realized? [x]
+  (if (delay? x) (not= :pending (first @(:state x))) (throw :kind-mismatch)))
+
+; What with-open closes: a db connection, a Nextomic connection, and
+; any type extended to it (Java's Closeable).
+(defprotocol Closeable
+  (close [this]))
+(extend-protocol Closeable
+  :db_connection (close [c] (db/close c))
+  :nextomic_conn (close [c] (nextomic/release c)))
+
+; (with-open [name init ...] body...) → body with each name bound,
+; closing each through Closeable in reverse order on every exit, a
+; throw included.
+(defmacro with-open [bindings & body]
+  (when (or (not (vector? bindings)) (odd? (count bindings)) (not (every? symbol? (take-nth 2 bindings))))
+    (throw (ex-info "with-open takes a vector of symbol and value pairs" {})))
+  (if (empty? bindings)
+    `(do ~@body)
+    `(let [~(first bindings) ~(second bindings)]
+       (try
+         (with-open ~(vec (drop 2 bindings)) ~@body)
+         (finally (nexis.core/close ~(first bindings)))))))
+
+; (tap> x) → true, after calling every function add-tap added with x;
+; a tap that throws is ignored. Clojure runs taps on another thread;
+; here, one isolate and one thread, they run before tap> returns.
+(def ^:private taps (atom #{}))
+(defn add-tap [f] (swap! taps conj f) nil)
+(defn remove-tap [f] (swap! taps disj f) nil)
+(defn tap> [x]
+  (doseq [f @taps]
+    (try (f x) (catch any _ nil)))
+  true)
+
+; ============================================================
 ; Printing to a string
 ; ============================================================
 

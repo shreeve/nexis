@@ -314,6 +314,7 @@ const core_natives = table("", .{
     .{ "fn?", 1, 1, kindPredicate(isFn) },
     .{ "ifn?", 1, 1, kindPredicate(isIfn) },
     .{ "counted?", 1, 1, kindPredicate(isCounted) },
+    .{ "delay?", 1, 1, &fnDelayQ },
     .{ "indexed?", 1, 1, kindPredicate(isIndexed) },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector },
@@ -454,6 +455,8 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%kwargs", 1, 1, &fnKwargs },
     // deftest and run-tests: the name of the current namespace.
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
+    // delay: the record a delay is (core.nx `delay`, `force`).
+    .{ "#%delay", 1, 1, &fnDelay },
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
@@ -3203,9 +3206,59 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
         },
         .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
         .atom => atom_mod.getValue(x),
-        .record => if (isReduced(vm, x)) reducedValue(x) else VmError.NotDerefable,
+        .record => if (isReduced(vm, x)) reducedValue(x) else if (isDelay(vm, x)) forceDelay(vm, x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
     };
+}
+
+// =============================================================================
+// Delays
+// =============================================================================
+//
+// A delay is the record `nexis.core/Delay` whose `:state` is an atom
+// holding `[:pending thunk]`, `[:ready value]` or `[:failed thrown]`.
+// `force` (core.nx) runs the thunk once and caches its value or its
+// throw, which only nexis code can catch; `deref` of a delay calls it.
+
+/// The type id of `nexis.core/Delay`, registered on first use.
+fn delayType(vm: *VM) VmError!u32 {
+    for (vm.record_registry.items) |e| {
+        if (std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay")) return e.id;
+    }
+    return vm.registerRecordType("nexis.core", "Delay", &.{"state"}) catch VmError.OutOfMemory;
+}
+
+fn isDelay(vm: *const VM, v: Value) bool {
+    if (v.kind() != .record) return false;
+    const e = vm.record_registry.items[record_mod.typeId(v)];
+    return std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay");
+}
+
+/// `(#%delay thunk)` → a pending delay of `thunk` (the `delay` macro).
+fn fnDelay(vm: *VM, args: []const Value) VmError!Value {
+    const type_id = try delayType(vm);
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    const pending = interner.internKeywordValue("pending") catch return VmError.OutOfMemory;
+    const key = interner.internKeywordValue("state") catch return VmError.OutOfMemory;
+    // `Heap.alloc` never collects (GC.md §11.5): the pieces need no
+    // roots on their way into the record.
+    const thunk = vector_mod.fromSlice(heap, &.{ pending, args[0] }) catch return VmError.OutOfMemory;
+    const state = atom_mod.make(heap, thunk) catch return VmError.OutOfMemory;
+    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = champ_mod.mapAssoc(heap, empty, key, state, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+}
+
+fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(isDelay(vm, args[0]));
+}
+
+/// `@d` of a delay: `(nexis.core/force d)`.
+fn forceDelay(vm: *VM, d: Value) VmError!Value {
+    const registry = vm.registry orelse return VmError.NotDerefable;
+    const force = registry.core.lookupLocal("force") orelse return VmError.NotDerefable;
+    return vm.callValue(force.current() orelse return VmError.UnboundVar, &.{d});
 }
 
 // =============================================================================

@@ -318,3 +318,10 @@ a realized list.
 | `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
 | `indexed?` | 1 | True of a vector or typed vector |
 | `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |
+| `delay` | macro | `(delay body...)`: a delay, the record `nexis.core/Delay`, whose body runs the first time it is forced; every later `force` or `deref` (`@d`) returns the same value, or rethrows what the body threw (the body runs once either way) |
+| `force` | 1 | A delay's value, forcing it; anything else itself |
+| `delay?`, `realized?` | 1 | Whether `x` is a delay; whether the delay has been forced (`realized?` of anything else is `:kind-mismatch`) |
+| `Closeable`, `close` | protocol | What `with-open` closes: `close` of a db connection is `db/close`, of a Nextomic connection `nextomic/release`; a record or kind extends it to be closed the same way |
+| `with-open` | macro | `(with-open [name init ...] body...)`: body with each name bound, each closed through `close` in reverse order on every exit, a throw included; the bindings must be symbol and value pairs (`MalformedMacroCall` otherwise) |
+| `tap>` | 1 | Calls every function `add-tap` added with `x`, ignoring any that throws, and returns true. Clojure calls the taps on another thread; one isolate, one thread calls them before `tap>` returns |
+| `add-tap`, `remove-tap` | 1 | Add or remove a tap function; nil |

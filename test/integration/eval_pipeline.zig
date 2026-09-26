@@ -1552,6 +1552,40 @@ test "integration: identity kinds are = only to themselves, and two of them hash
     , "[true true true true false true true]");
 }
 
+test "integration: delay, force, realized?, delay?" {
+    try expectOutput("(let [n (atom 0) d (delay (swap! n inc) :v)] [(realized? d) (delay? d) @d (realized? d) (force d) @d @n (force 3) (delay? 1)])", "[false true :v true :v :v 1 3 false]");
+    // A throw is cached: the body runs once and every deref rethrows it.
+    try expectOutput("(let [n (atom 0) d (delay (swap! n inc) (throw :boom))] [(try @d (catch any e e)) (try (force d) (catch any e e)) @n (realized? d)])", "[:boom :boom 1 true]");
+    try expectOutput("(let [d (delay nil)] [@d (realized? d) (= d d) (= d (delay nil))])", "[nil true true false]");
+    try expectOutput("[(try (realized? 1) (catch any e e)) (try (realized? nil) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+    try expectOutputUnderGc("(let [ds (mapv (fn [i] (delay (vec (range i)))) (range 50))] (reduce + (map (comp count deref) ds)))", "1225");
+}
+
+test "integration: with-open closes each binding in reverse order, through Closeable" {
+    try expectOutput(
+        \\(def log (atom []))
+        \\(defrecord R [n] Closeable (close [_] (swap! log conj n)))
+        \\[(with-open [a (->R 1) b (->R 2)] (swap! log conj :body) :result) @log
+        \\ (try (with-open [c (->R 3)] (throw :boom)) (catch any e e)) @log (with-open [] 7)]
+    , "[:result [:body 2 1] :boom [:body 2 1 3] 7]");
+    try expectOutput("(try (with-open [a 1] 2) (catch any e e))", ":no-protocol-impl");
+    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", ":macro-expansion-failure");
+    try expectOutputProgramWithStore("with-open-conns",
+        \\(def c (with-open [c (db/open "@STORE@")] c))
+        \\(def n (with-open [n (nextomic/connect "@STORE@.nextomic")] n))
+        \\[(try (db/begin-read c) (catch any e e)) (try (nextomic/db n) (catch any e (or (:error e) e)))]
+    , "[:db-closed :nextomic/closed]");
+}
+
+test "integration: tap> calls every tap, and a tap that throws is ignored" {
+    try expectOutput(
+        \\(def seen (atom []))
+        \\(defn t1 [x] (swap! seen conj [:t1 x]))
+        \\(defn t2 [x] (throw :bad))
+        \\[(tap> 0) (add-tap t1) (add-tap t2) (tap> 1) (remove-tap t1) (tap> 2) @seen (remove-tap t2)]
+    , "[true nil nil true nil true [[:t1 1]] nil]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }
@@ -3475,8 +3509,8 @@ test "defprotocol: registers protocol + method dispatchers" {
     try expectOutputProgram(
         \\(do
         \\  (defprotocol IFoo (bar [this y]))
-        \\  (str IFoo " " (fn? bar)))
-    , "#<protocol id=0> true");
+        \\  [(nexis.string/starts-with? (str IFoo) "#<protocol id=") (fn? bar)])
+    , "[true true]");
 }
 
 test "protocol dispatch with NO impl raises :no-protocol-impl" {
