@@ -274,8 +274,10 @@ failing test (AGENTS.md).
 
 1. **A routine over 4096 instructions does not compile**: the 12-bit
    jump operand (PLAN §23 #21) makes a longer routine the compile
-   error `JumpTargetOutOfRange`. A `deftest` of about 300 assertions
-   reaches it. Next: either have `deftest` (`src/stdlib/test.nx`)
+   error `JumpTargetOutOfRange`, and the report gives no reason. A
+   `deftest` body is one routine and an `is` compiles to about 17
+   instructions, so 240 assertions compile and 241 do not; no file in
+   the tree comes near it (the largest `deftest` holds 3). Next: either have `deftest` (`src/stdlib/test.nx`)
    compile each `is` into its own function, which needs no amendment,
    or widen jump targets with an amendment to #21 and the VM's
    `applyJump`, try-enter and try-exit operands; the test is a
@@ -465,7 +467,9 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 2): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. The 4096-instruction limit (§6.1 item 1): real test files hit it.
+2. The 4096-instruction limit (§6.1 item 1): a generated test or
+   function past about 240 branches' worth of code fails to compile,
+   with an error that does not say why.
 3. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
 4. Transaction handles dropped open (§6.1 item 5), writes during
    `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
