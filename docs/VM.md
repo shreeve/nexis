@@ -257,6 +257,14 @@ and the direct call, so a protocol fn passed to `map` behaves as it
 does in call position. `VM.runRoutine` runs a routine to completion
 the same way (the loader and `eval`).
 
+**Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
+never re-enters the VM and never compares, hashes or prints nested
+data (arithmetic, numeric predicates, `nth`), so nothing under it can
+collect, grow the stack or move the deep-data overflow count (§13.1).
+`call:call` passes it its arguments in place on the stack, and
+`callValue` calls it without the root scope, the stack guard or the
+overflow check. Its arity is checked, and reported, as any native's.
+
 ---
 
 #### 6.5 Dynamic bindings
@@ -363,7 +371,7 @@ fetch (every handler's last step):
   capacity have room, pushes the callee's frame without allocating,
   and `callValue` enters a closure the same way; a native within its
   arity is called with its arguments copied to a buffer on the native
-  stack. Every other call goes through the general entry of §6, with
+  stack, or read in place by a leaf (§6). Every other call goes through the general entry of §6, with
   the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the

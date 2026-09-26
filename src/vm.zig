@@ -859,6 +859,12 @@ pub const NativeFn = struct {
     min_arity: u16,
     max_arity: ?u16,
     call: *const fn (vm: *VM, args: []const Value) VmError!Value,
+    /// A leaf never re-enters the VM and never compares, hashes or
+    /// prints nested data, so no collection, stack growth or deep-data
+    /// overflow can happen under it: a caller passes its arguments in
+    /// place, unrooted, and skips the stack guard and the overflow
+    /// check (VM.md §6).
+    leaf: bool = false,
 };
 
 /// Unpack the descriptor pointer from a `.native_fn` Value.
@@ -2146,6 +2152,10 @@ pub const VM = struct {
     /// caller's slots. Values a native derives and keeps across a
     /// nested `callValue` are its own to root (`RootScope`; GC.md §11.5).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
+        if (callee.kind() == .native_fn) {
+            const native = asNativeFn(callee);
+            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len)) return native.call(self, args);
+        }
         // Every re-entry nests a native call and a run loop on the
         // native stack (§13.1).
         stack_guard.check() catch return VmError.StackOverflow;
@@ -3160,6 +3170,14 @@ pub const VM = struct {
                 },
                 .native_fn => {
                     const native = asNativeFn(callee);
+                    if (native.leaf) {
+                        if (argc < native.min_arity or argc > (native.max_arity orelse argc)) break :fast;
+                        // Nothing can grow the stack under a leaf, so
+                        // it reads its arguments where they are.
+                        const result = try native.call(self, self.stack.items[base..][0..argc]);
+                        self.slotAt(frame, inst.c.index).* = result;
+                        return self.nextSafe(frame);
+                    }
                     const max: usize = native.max_arity orelse max_native_args;
                     if (argc < native.min_arity or argc > max or argc > max_native_args) break :fast;
                     // The arguments are copied off the stack, which the
@@ -6678,9 +6696,37 @@ const dispatch_test_natives = struct {
     fn callArg(vm: *VM, args: []const Value) VmError!Value {
         return vm.callValue(args[0], args[1..]);
     }
+    fn sub(_: *VM, args: []const Value) VmError!Value {
+        return fx(args[0].asFixnum() - args[1].asFixnum());
+    }
     const native_boom = NativeFn{ .name = "boom", .min_arity = 0, .max_arity = 0, .call = &boom };
     const native_call = NativeFn{ .name = "call", .min_arity = 1, .max_arity = null, .call = &callArg };
+    const native_sub = NativeFn{ .name = "sub", .min_arity = 2, .max_arity = 2, .call = &sub, .leaf = true };
 };
+
+test "VM dispatch: a leaf native reads its arguments in place and keeps its arity" {
+    // (sub 50 8) by call:call and by callValue; then (sub 1) by each.
+    const code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 1),
+        asm_.loadConst(2, 2),
+        asm_.callCall(0, 2, 3),
+        asm_.returnSlot(3),
+    };
+    const consts = [_]Value{ nativeFnValue(&dispatch_test_natives.native_sub), fx(50), fx(8) };
+    const routine = makeRoutine(&code, &consts, 4, "leaf");
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectEqual(@as(i64, 42), (try vm.run()).asFixnum());
+    try testing.expectEqual(@as(i64, 42), (try vm.callValue(consts[0], &.{ fx(50), fx(8) })).asFixnum());
+    try testing.expectError(VmError.ArityMismatch, vm.callValue(consts[0], &.{fx(1)}));
+    try testing.expectEqualStrings("sub takes 2 arguments, got 1", vm.error_detail);
+    const short = [_]Inst{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.callCall(0, 1, 2), asm_.returnSlot(2) };
+    const short_routine = makeRoutine(&short, &consts, 3, "leaf-short");
+    try vm.retargetTop(&short_routine);
+    try testing.expectError(VmError.ArityMismatch, vm.run());
+    try testing.expectEqualStrings("sub takes 2 arguments, got 1", vm.error_detail);
+}
 
 test "VM dispatch: a native's throw two loops deep reaches the handler below" {
     // (try (call (fn [] (boom))) (catch any e e)), then a call after
