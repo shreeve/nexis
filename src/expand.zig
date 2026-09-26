@@ -2326,6 +2326,13 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
         }) }),
     });
     try extendClauses(b, args[2..], .{ .record = .{ .name = args[0], .fields = fields } }, &out);
+    // The name is the record's type, as Clojure's class: the symbol
+    // `ns.Name` that `type` returns, so `(instance? P x)` reads as in
+    // Clojure; the form's value is that type.
+    const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "user";
+    const type_sym = try b.item(try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ ns_name, rec_name }));
+    try out.append(ctx.allocator, try b.list(.{ "def", try b.item(rec_name), try b.list(.{ "quote", type_sym }) }));
+    try out.append(ctx.allocator, try b.item(rec_name));
     return makeList(ctx, out.items, b.origin);
 }
 

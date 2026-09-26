@@ -107,7 +107,7 @@ vectors through this encoding unchanged.
 `src/format.zig` prints `#i64[1 -2 3]` and `#f64[1.0 2.5E7]` in both
 the display and the readable mode: spaces between elements, no commas,
 and each `f64` element exactly as the float Value `nth` returns for it
-prints (SEMANTICS §6.3), `NaN`, `Infinity` and `-Infinity` included.
+prints (SEMANTICS §6.3), `##NaN`, `##Inf` and `##-Inf` included.
 The text does not read back (§1).
 
 ---

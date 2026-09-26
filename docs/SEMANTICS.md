@@ -406,11 +406,11 @@ the db and Nextomic handles print as markers for debugging (`#<fn>`,
   `1e7` and below `1e-3` (`1.0E10`, `1.23456785E7`, `1.0E-4`).
 - `0.0` prints `"0.0"` and `-0.0` prints `"-0.0"`; each reads back to
   its own bits.
-- Readable mode (`pr-str`, the REPL) prints the infinities `##Inf` /
-  `##-Inf` and NaN `##NaN`, the reader's literals (`docs/FORMS.md`
-  §2), so they round-trip; display mode and `str` of a bare float
-  write Java's `Infinity`, `-Infinity`, `NaN`, as Clojure's `str`
-  does.
+- Both modes (`pr-str`, the REPL, `print`, `println`) print the
+  infinities `##Inf` / `##-Inf` and NaN `##NaN`, the reader's literals
+  (`docs/FORMS.md` §2), so they round-trip; `str` and `%s` of a bare
+  float write Java's `Infinity`, `-Infinity`, `NaN`, as Clojure's
+  `str` does.
 
 #### 6.4 Character print rules
 

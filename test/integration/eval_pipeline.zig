@@ -4222,9 +4222,9 @@ test "numbers: float literals print like Clojure doubles" {
 }
 
 test "numbers: special floats" {
-    try expectOutput("(/ 1.0 0)", "Infinity");
-    try expectOutput("(/ -1.0 0)", "-Infinity");
-    try expectOutput("(/ 0.0 0.0)", "NaN");
+    try expectOutput("(/ 1.0 0)", "##Inf");
+    try expectOutput("(/ -1.0 0)", "##-Inf");
+    try expectOutput("(/ 0.0 0.0)", "##NaN");
     try expectOutput("(NaN? (/ 0.0 0.0))", "true");
     try expectOutput("(NaN? 1.5)", "false");
     try expectOutput("(infinite? (/ 1.0 0))", "true");
@@ -4249,10 +4249,10 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
 test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
     try expectOutput("[(= ##Inf (/ 1.0 0)) (= ##-Inf (/ -1.0 0)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
     try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
-    // str of a bare float is Java's spelling; inside a collection, readable.
-    try expectOutput("(pr-str [(str ##Inf) (str ##-Inf ##NaN) (str [##Inf]) (format \"%s\" ##NaN) (with-out-str (print ##Inf))])", "[\"Infinity\" \"-InfinityNaN\" \"[##Inf]\" \"NaN\" \"Infinity\"]");
+    // str of a bare float is Java's spelling; print and a collection, the reader's.
+    try expectOutput("(pr-str [(str ##Inf) (str ##-Inf ##NaN) (str [##Inf]) (format \"%s\" ##NaN) (with-out-str (print ##Inf))])", "[\"Infinity\" \"-InfinityNaN\" \"[##Inf]\" \"NaN\" \"##Inf\"]");
     try expectOutput("(let [v (read-string (pr-str [##Inf ##-Inf ##NaN]))] [(= (pop v) [##Inf ##-Inf]) (NaN? (peek v))])", "[true true]");
-    try expectOutput("[(+ ##Inf 1) '##-Inf]", "[Infinity -Infinity]");
+    try expectOutput("[(+ ##Inf 1) '##-Inf]", "[##Inf ##-Inf]");
 }
 
 test "reader: Clojure's \\uXXXX char and string escapes" {
@@ -4422,6 +4422,17 @@ test "collection-as-function: maps, sets and vectors" {
     try expectOutput("(let [m {:x 1}] (m :x))", "1");
     try expectOutput("(try (5 1) (catch any e e))", ":not-callable");
     try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
+}
+
+test "integration: print writes a float's infinities and NaN as the reader does; str and %s of a bare float keep Java's spelling" {
+    try expectOutput("(with-out-str (print ##Inf ##-Inf ##NaN [1.5 ##Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf]");
+    try expectOutput("(with-out-str (println [##NaN]))", "[##NaN]\n");
+    try expectOutput("[(str ##Inf) (str ##-Inf ##NaN) (str [##Inf] 'x ##NaN) (format \"%s\" ##Inf)]", "[Infinity -InfinityNaN [##Inf]xNaN Infinity]");
+}
+
+test "integration: defrecord names its type, which instance? takes, and returns it" {
+    try expectOutput("(do (defrecord P [a]) [(instance? P (->P 1)) (pr-str P) (symbol? P) (= P (type (->P 1)))])", "[true user.P true true]");
+    try expectOutput("(defrecord Q [a])", "user.Q");
 }
 
 test "integration: a Var calls, and derefs to, the value in force" {
@@ -5218,7 +5229,7 @@ test "typed vectors: a store round trip through the codec" {
         \\  (with-tx [tx conn] (db/put! tx r (f64-vector [0.5 -0.0 (/ 1.0 0)])))
         \\  (def f (with-read-tx [tx conn] (db/get tx r)))
         \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 (/ 1.0 0)]))])
-    , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 Infinity] :f64 true]");
+    , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 ##Inf] :f64 true]");
 }
 
 // =============================================================================

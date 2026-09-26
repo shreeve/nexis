@@ -382,7 +382,7 @@ and any operation on a closed connection or through a ref of one is
 | `(db/get-key ref)` / `(db/get-key ref default)` | 1–2 | The stored value, or `default` (nil); one read transaction. |
 | `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
 | `(db/present? ref)` | 1 | Whether the key exists. |
-| `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (vars, atoms, reduced too); another kind is `:not-derefable`. |
+| `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (Vars, atoms, delays, reduced too); another kind is `:not-derefable`. |
 | `(db/begin-write conn)` | 1 | A write transaction; while any connection or Nextomic store of the same file holds one, `:db/busy`. |
 | `(db/begin-read conn)` | 1 | A read transaction; with 126 open on the file, `:db/readers-full`. |
 | `(db/commit! tx)` | 1 | nil; the transaction is over even when the commit fails. Any use of a finished transaction is `:tx-closed`. |
