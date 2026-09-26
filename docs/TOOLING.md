@@ -79,8 +79,9 @@ unterminated string` at the `"` of a string literal no quote closes;
 (keyword :a_b)`, FORMS.md §3); a `CompileError` name at the span
 COMPILER.md §7 gives. A macro expansion that failed adds the
 expander's reason (MACROEXPAND.md §8) at the innermost form that
-failed, and a routine limit the routine and the limit (COMPILER.md
-§4.4, `too-many-locals.err`):
+failed, an unresolved symbol its name (`UnresolvedSymbol: unable to
+resolve symbol: foo`), and a routine limit the routine and the limit
+(COMPILER.md §4.4, `too-many-locals.err`):
 
 ```
 nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m threw bad macro input

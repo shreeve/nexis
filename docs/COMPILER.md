@@ -666,7 +666,7 @@ not):
 
 | Variant | Raised for |
 |---|---|
-| `UnresolvedSymbol` | a symbol that resolves to nothing (§4.3) |
+| `UnresolvedSymbol` | a symbol that resolves to nothing (§4.3); the detail names it |
 | `DuplicateParam`, `DuplicateBinding` | a repeated parameter; a repeated `letfn*` name |
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
@@ -693,8 +693,9 @@ form being lowered or emitted when the error was raised, or the
 symbol's own for `UnresolvedSymbol` (`LowerDiag`). An expansion error
 carries the span of the innermost form the expander failed at
 (`ExpandContext.failure`), and its reason goes to
-`CompileOptions.out_detail`; so does a limit's (`LowerDiag.detail`):
-`fn many: more than 4096 local slots`. Forms a macro produced carry
+`CompileOptions.out_detail`; so does what `LowerDiag.detail` says of
+an unresolved symbol (`unable to resolve symbol: foo`) or a limit
+(`fn many: more than 4096 local slots`). Forms a macro produced carry
 the call's span, so an error inside an expansion is reported at the
 call. There
 is no secondary span and no expansion-provenance chain. The CLI's

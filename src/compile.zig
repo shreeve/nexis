@@ -1307,6 +1307,18 @@ fn lowerForm(
     return tiny;
 }
 
+/// `UnresolvedSymbol` for `ns/name` (or `name`), located at `span`
+/// and saying which symbol (COMPILER.md §7).
+fn unresolved(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: ?reader_mod.SrcSpan, ns: ?[]const u8, name: []const u8) CompileError {
+    const d = diag orelse return CompileError.UnresolvedSymbol;
+    if (span) |sp| d.span = sp;
+    if (d.detail == null) d.detail = (if (ns) |n|
+        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}/{s}", .{ n, name })
+    else
+        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
+    return CompileError.UnresolvedSymbol;
+}
+
 fn lowerDatum(
     allocator: std.mem.Allocator,
     form: *const reader_mod.Form,
@@ -1327,20 +1339,16 @@ fn lowerDatum(
             if (name.ns) |ns_prefix| {
                 if (ctx.declared) |declared| {
                     if (ctx.namespace) |ns| {
-                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name)) {
-                            if (ctx.diag) |d| d.span = form.origin;
-                            return CompileError.UnresolvedSymbol;
-                        }
+                        if (qualifiedTarget(ns, ns_prefix) == ns and ns.lookupLocal(name.name) == null and !declared.contains(name.name))
+                            return unresolved(allocator, ctx.diag, form.origin, ns_prefix, name.name);
                     }
                 }
                 break :blk try allocTiny(allocator, .{ .qualified_symbol = .{ .ns = ns_prefix, .name = name.name } });
             }
             if (!resolveLexical(ctx, name.name)) {
                 if (ctx.declared) |declared| {
-                    if (!symbolResolves(ctx, declared, name.name)) {
-                        if (ctx.diag) |d| d.span = form.origin;
-                        return CompileError.UnresolvedSymbol;
-                    }
+                    if (!symbolResolves(ctx, declared, name.name))
+                        return unresolved(allocator, ctx.diag, form.origin, null, name.name);
                 }
             }
             break :blk try allocTiny(allocator, .{ .symbol = name.name });
@@ -2501,6 +2509,7 @@ pub fn compileFormWith(
         // An error that located itself reports that span; the
         // rest carry the macroexpanded form's span.
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
+        if (opts.out_detail) |d| d.* = diag.detail;
         return err;
     };
     diag.span = null;
@@ -2814,10 +2823,10 @@ fn compileQualifiedSymbol(e: *Emitter, ns_prefix: []const u8, name: []const u8, 
 /// when the definition is still to come (a forward reference
 /// syntax-quote qualified).
 fn qualifiedVarIndex(e: *Emitter, ns_prefix: []const u8, name: []const u8) CompileError!u32 {
-    const current_ns = e.namespace orelse return CompileError.UnresolvedSymbol;
-    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return CompileError.UnresolvedSymbol;
+    const current_ns = e.namespace orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
+    const target_ns = qualifiedTarget(current_ns, ns_prefix) orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
     if (target_ns == current_ns) return e.addVarLocal(name);
-    const v = target_ns.lookupLocal(name) orelse return CompileError.UnresolvedSymbol;
+    const v = target_ns.lookupLocal(name) orelse return unresolved(e.allocator, e.diag, null, ns_prefix, name);
     return e.addVarTableEntry(v);
 }
 
@@ -2852,7 +2861,7 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
                 try e.emit(vm.asm_.varLoadVar(dst, idx));
                 return;
             }
-            return err; // no namespace; propagate UnresolvedSymbol
+            return unresolved(e.allocator, e.diag, null, null, name); // no namespace
         },
         else => return err,
     };
@@ -4093,16 +4102,25 @@ test "declared names: an unresolved symbol is reported at its own span" {
     var declared = DeclaredNames.init(testing.allocator);
     defer declared.deinit();
     var span: ?reader_mod.SrcSpan = null;
+    var detail: ?[]const u8 = null;
     const opts: CompileOptions = .{
         .namespace = v.ensureNamespace(),
         .interner = v.ensureInterner(),
         .declared = &declared,
         .out_span = &span,
+        .out_detail = &detail,
     };
     const src = "(fn* [x] (let* [z 1] (+ x (< z y))))";
     try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), src, opts));
     const sp = span orelse return error.TestFailed;
     try testing.expectEqualStrings("y", src[sp.pos .. sp.pos + sp.len]);
+    try testing.expectEqualStrings("unable to resolve symbol: y", detail.?);
+    // So is a qualified one naming no namespace, and, compiled
+    // without declared names or a namespace, a bare one.
+    try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), "(+ 1 nope/w)", opts));
+    try testing.expectEqualStrings("unable to resolve symbol: nope/w", detail.?);
+    try testing.expectError(CompileError.UnresolvedSymbol, compileSourceWith(arena.allocator(), "(let* [a 1] b)", .{ .out_detail = &detail }));
+    try testing.expectEqualStrings("unable to resolve symbol: b", detail.?);
     // Declaring it makes the same source compile.
     try declared.declare("y");
     _ = try compileSourceWith(arena.allocator(), src, opts);
