@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 167/167 steps succeeded; 1306/1306 tests passed
+Build Summary: 170/170 steps succeeded; 1335/1335 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 165 steps. It ran in 63 s wall (256 s
+steps; without it the count is 168 steps. It ran in 63 s wall (256 s
 CPU) from a warm cache on an Apple-silicon Mac shared with other
 builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (619 inline tests) and
@@ -175,8 +175,12 @@ reference-counted `emdb.Env` to every `db/open` connection and every
 Nextomic connection of the file, so any spelling or symlink of the
 path is one store (a file with a second hard link is refused), and a
 second writer on it is `:db/busy` (`:nextomic/nested` in Nextomic),
-never a deadlock (`docs/DB.md` §3.1). It pins `pageSize = 16384` and
-`maxNamedTrees = 128`, resolves tree ids once per connection, reads
+never a deadlock (`docs/DB.md` §3.1). It pins `pageSize = 16384`,
+`maxNamedTrees = 128` and 4,096 reader slots; commits without a sync
+unless the connection is `:durable`, syncing each written file once at
+close, `sync` and the end of the process (`NEXIS_DURABILITY`,
+`docs/DB.md` §3.3); keeps one Nextomic read transaction between
+operations while no commit passes it (§3.4); resolves tree ids once per connection, reads
 values whole off cursors, lets a walk see its tree as it began
 whatever its callback writes, holds the transaction a `db/alter!` or
 `db/reduce-tree` callback runs in so the callback cannot finish it,
@@ -404,8 +408,8 @@ after numbers in the commit message.
 
 1. A store carried between macOS and Linux (§6.4); CI runs the gate on
    both.
-2. Performance against babashka and Datalevin (`docs/PERF.md` §3.11):
-   the durable commit of a small transaction (group commit), memory on
+2. Performance against babashka (`docs/PERF.md` §3.11; Nextomic is
+   ahead of Datalevin on every phase): memory on
    million-element collections, `frequencies`/`group-by`, transient
    maps, vector `conj`/`nth` and string splitting; the levers are
    `docs/PERF.md` §6. Rerun `bb bench/compare/run.clj --out DIR`

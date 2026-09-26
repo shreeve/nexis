@@ -60,7 +60,11 @@ const VmError = vm_mod.VmError;
 // =============================================================================
 //
 // One table per namespace: each native's name, arity and function,
-// once. `table` turns it into static descriptors (immortal, so a
+// once, and `.leaf` after a leaf (`NativeFn.leaf`: arithmetic,
+// predicates and lookups over the arguments alone, none calling back,
+// comparing or hashing nested data; a bignum one makes is a fresh
+// block, and `Heap.alloc` never collects, VM.md §9). `table` turns
+// it into static descriptors (immortal, so a
 // `.native_fn` Value can point at one); a descriptor outside
 // nexis.core is named `ns/name` for traces and printing.
 
@@ -71,6 +75,7 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .min_arity = e[1],
         .max_arity = e[2],
         .call = e[3],
+        .leaf = if (e.len > 4) e[4] == .leaf else false,
     };
     return out;
 }
@@ -159,31 +164,31 @@ const core_natives = table("", .{
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
-    .{ "nth", 2, 3, &fnNth },
+    .{ "nth", 2, 3, &fnNth, .leaf },
     .{ "empty?", 1, 1, &fnEmptyQ },
-    .{ "identity", 1, 1, &fnIdentity },
-    .{ "nil?", 1, 1, &fnNilQ },
-    .{ "some?", 1, 1, &fnSomeQ },
+    .{ "identity", 1, 1, &fnIdentity, .leaf },
+    .{ "nil?", 1, 1, &fnNilQ, .leaf },
+    .{ "some?", 1, 1, &fnSomeQ, .leaf },
     // First-class arithmetic + comparison Vars.
     // Required so `(reduce + 0 xs)` resolves `+` as a Var.
     // `(+ x y)` at the call head is still inlined by the
     // compiler; the Var is only reached through non-head uses.
-    .{ "+", 0, null, &fnAdd },
-    .{ "-", 1, null, &fnSub },
-    .{ "*", 0, null, &fnMul },
+    .{ "+", 0, null, &fnAdd, .leaf },
+    .{ "-", 1, null, &fnSub, .leaf },
+    .{ "*", 0, null, &fnMul, .leaf },
     .{ "/", 1, null, &fnDiv },
     .{ "quot", 2, 2, &fnQuot },
     .{ "rem", 2, 2, &fnRem },
     .{ "mod", 2, 2, &fnMod },
-    .{ "<", 0, null, &fnLt },
-    .{ "<=", 0, null, &fnLte },
-    .{ ">", 0, null, &fnGt },
-    .{ ">=", 0, null, &fnGte },
-    .{ "==", 0, null, &fnNumEq },
+    .{ "<", 0, null, &fnLt, .leaf },
+    .{ "<=", 0, null, &fnLte, .leaf },
+    .{ ">", 0, null, &fnGt, .leaf },
+    .{ ">=", 0, null, &fnGte, .leaf },
+    .{ "==", 0, null, &fnNumEq, .leaf },
     .{ "=", 0, null, &fnEq },
     .{ "not=", 1, null, &fnNotEq },
-    .{ "inc", 1, 1, &fnInc },
-    .{ "dec", 1, 1, &fnDec },
+    .{ "inc", 1, 1, &fnInc, .leaf },
+    .{ "dec", 1, 1, &fnDec, .leaf },
     .{ "long", 1, 1, &fnLong },
     .{ "int", 1, 1, castTo(i32) },
     .{ "short", 1, 1, castTo(i16) },
@@ -206,20 +211,20 @@ const core_natives = table("", .{
     .{ "rand-int", 1, 1, &fnRandInt },
     .{ "format", 1, null, &fnFormat },
     .{ "double", 1, 1, &fnDouble },
-    .{ "max", 1, null, &fnMax },
-    .{ "min", 1, null, &fnMin },
+    .{ "max", 1, null, &fnMax, .leaf },
+    .{ "min", 1, null, &fnMin, .leaf },
     .{ "abs", 1, 1, &fnAbs },
     .{ "number?", 1, 1, &fnNumberQ },
     .{ "integer?", 1, 1, &fnIntegerQ },
     .{ "float?", 1, 1, &fnFloatQ },
     .{ "NaN?", 1, 1, &fnNanQ },
     .{ "infinite?", 1, 1, &fnInfiniteQ },
-    .{ "not", 1, 1, &fnNot },
-    .{ "zero?", 1, 1, &fnZeroQ },
-    .{ "pos?", 1, 1, &fnPosQ },
-    .{ "neg?", 1, 1, &fnNegQ },
-    .{ "odd?", 1, 1, &fnOddQ },
-    .{ "even?", 1, 1, &fnEvenQ },
+    .{ "not", 1, 1, &fnNot, .leaf },
+    .{ "zero?", 1, 1, &fnZeroQ, .leaf },
+    .{ "pos?", 1, 1, &fnPosQ, .leaf },
+    .{ "neg?", 1, 1, &fnNegQ, .leaf },
+    .{ "odd?", 1, 1, &fnOddQ, .leaf },
+    .{ "even?", 1, 1, &fnEvenQ, .leaf },
     // apply + HOFs.
     .{ "apply", 2, null, &fnApply },
     .{ "map", 2, null, &fnMap },
@@ -407,8 +412,9 @@ const core_natives = table("", .{
 
 const db_natives = table("db", .{
     // Connection + ref + auto-ephemeral primitives.
-    .{ "open", 1, 1, &fnDbOpen },
+    .{ "open", 1, 2, &fnDbOpen },
     .{ "close", 1, 1, &fnDbClose },
+    .{ "sync", 1, 1, &fnDbSync },
     .{ "ref", 3, 3, &fnDbRef },
     .{ "ref?", 1, 1, &fnDbRefQ },
     .{ "put-key!", 2, 2, &fnDbPutKey },
@@ -1259,39 +1265,18 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // for the call that could collect.
 
 /// `(f args...)` for a sequence native's callback. A keyword looking
-/// up a map, a record or nil, and a leaf native (`leaf_natives`), run
-/// here directly: neither can re-enter the VM, collect, or compare or
-/// hash nested structure, so the root scope, the stack guard and the
-/// deep-data check `VM.callValue` puts around a call have nothing to
-/// do. Everything else goes through `callValue`, as does a leaf
-/// native called with an arity it refuses, for its error.
+/// up a map, a record or nil runs here directly: it cannot re-enter
+/// the VM, collect, or compare or hash nested structure, so the root
+/// scope, the stack guard and the deep-data check `VM.callValue` puts
+/// around a call have nothing to do. Everything else goes through
+/// `callValue`, which calls a leaf native as directly
+/// (`NativeFn.leaf`).
 fn callBack(vm: *VM, f: Value, args: []const Value) VmError!Value {
-    switch (f.kind()) {
-        .keyword => if (args.len == 1) switch (args[0].kind()) {
-            .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
-            else => {},
-        },
-        .native_fn => {
-            const native = vm_mod.asNativeFn(f);
-            if (isLeafNative(native.call) and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len)) return native.call(vm, args);
-        },
+    if (f.kind() == .keyword and args.len == 1) switch (args[0].kind()) {
+        .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
         else => {},
-    }
+    };
     return vm.callValue(f, args);
-}
-
-/// The natives `callBack` calls directly: arithmetic and predicates
-/// over their arguments alone. A bignum they make is a fresh block,
-/// and `Heap.alloc` never collects (VM.md §9).
-const leaf_natives = [_]*const fn (*VM, []const Value) VmError!Value{
-    &fnAdd,   &fnSub,  &fnMul,  &fnInc, &fnDec,   &fnMax,   &fnMin,
-    &fnLt,    &fnLte,  &fnGt,   &fnGte, &fnNumEq, &fnEvenQ, &fnOddQ,
-    &fnZeroQ, &fnPosQ, &fnNegQ, &fnNot, &fnNilQ,  &fnSomeQ, &fnIdentity,
-};
-
-fn isLeafNative(call: *const fn (*VM, []const Value) VmError!Value) bool {
-    inline for (leaf_natives) |leaf| if (call == leaf) return true;
-    return false;
 }
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
@@ -3078,10 +3063,13 @@ fn ioOf(vm: *VM) std.Io {
     return vm.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-/// `(db/open path)`: the store at `path`, created with its parent
-/// directories when absent (emdb creates only the file).
+/// `(db/open path)` / `(db/open path {:durability d})`: the store at
+/// `path`, created with its parent directories when absent (emdb
+/// creates only the file). `d` is `:commit` or `:durable`; without it
+/// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
+    const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
     const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -3090,12 +3078,27 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
     conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{ .allocator = vm.allocator }) catch |err| return dbFailure(vm, err);
+    if (durability) |d| conn.durability = d;
     vm.db_close_callback = &dbCloseCallback;
     vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);
         return VmError.OutOfMemory;
     };
     return .{ .tag = @intFromEnum(Kind.db_connection), .payload = @intFromPtr(conn) };
+}
+
+/// The `:durability` of a `db/open` options map; null when the map is
+/// nil or has none.
+fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
+    if (opts.isNil()) return null;
+    if (opts.kind() != .persistent_map) return VmError.KindMismatch;
+    const k = vm.ensureInterner().internKeywordValue("durability") catch return VmError.OutOfMemory;
+    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+        .absent => return null,
+        .present => |x| x,
+    };
+    if (found.kind() != .keyword) return VmError.InvalidArgument;
+    return db_mod.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse VmError.InvalidArgument;
 }
 
 /// Teardown of the VM: close whatever is still open and free the
@@ -3117,6 +3120,14 @@ fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .db_connection) return VmError.KindMismatch;
     const conn: *db_mod.Connection = @ptrFromInt(args[0].payload);
     db_mod.close(conn) catch |err| return dbFailure(vm, err);
+    return value_mod.nilValue();
+}
+
+/// `(db/sync conn)` → nil: every commit to the connection's file is
+/// durable, with one full sync when a commit left it unsynced.
+fn fnDbSync(vm: *VM, args: []const Value) VmError!Value {
+    const conn = try openConn(args[0]);
+    db_mod.sync(conn) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
@@ -4799,6 +4810,9 @@ fn readLine(r: *std.Io.Reader, overflow: *std.ArrayList(u8), gpa: std.mem.Alloca
 /// `(read-line)` → the next line of stdin as a string, nil at end
 /// of input.
 fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
+    // A wait on stdin is a wait like the REPL's: no read snapshot is
+    // held across it (DB.md §3.4).
+    db_mod.StoreFile.dropAllHeld();
     const line = (readStdinLine(vm.io orelse return VmError.IoError) catch |err| return switch (err) {
         error.OutOfMemory => VmError.OutOfMemory,
         error.ReadFailed => VmError.IoError,
@@ -4808,12 +4822,14 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 
 /// `(exit)` / `(exit status)` → ends the process with `status` (0 by
 /// default) after closing every store the program opened, through
-/// `db/open` or `nextomic/connect`; nothing after it runs, `finally`
-/// blocks included, as with Java's `System/exit`.
+/// `db/open` or `nextomic/connect`, and syncing every file a commit
+/// left unsynced; nothing after it runs, `finally` blocks included, as
+/// with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
     if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
+    db_mod.StoreFile.syncAll();
     std.process.exit(status);
 }
 

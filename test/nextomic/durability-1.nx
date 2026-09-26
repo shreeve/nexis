@@ -1,0 +1,36 @@
+; test/nextomic/durability-1.nx — first process: commits under each
+; durability and per-transaction :sync, then `exit` with every
+; connection still open. durability-2.nx reads them back in a new
+; process.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def schema [{:db/ident :n/v :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+              :db/unique :db.unique/identity}])
+
+(def c (d/connect "commit.edb" {:durability :commit}))
+(def k (d/connect "durable.edb" {:durability :durable}))
+(d/transact! c schema)
+(d/transact! k schema)
+
+(def c2 (d/connect "commit.edb"))
+(t/check "another connection sees a commit at once" (= 2 (d/basis-t (d/db c2))))
+(d/transact! c2 [{:n/v 1}] {:sync :full})
+(d/transact! k [{:n/v 1}] {:sync :none})
+(t/check "the first connection sees the second's commit at once" (= 3 (d/basis-t (d/db c))))
+(t/check "sync is nil" (and (nil? (d/sync c)) (nil? (d/sync k))))
+(t/check "release is nil" (nil? (d/release c2)))
+
+(t/check "an unknown durability is :invalid-argument"
+         (= :invalid-argument (t/caught (d/connect "other.edb" {:durability :batch}))))
+(t/check "a durability that is not a keyword is :invalid-argument"
+         (= :invalid-argument (t/caught (d/connect "other.edb" {:durability "commit"}))))
+(t/check "options that are not a map are :kind-mismatch"
+         (= :kind-mismatch (t/caught (d/connect "other.edb" [:durability :commit]))))
+
+(d/transact! c [{:n/v 2}])
+(d/transact! k [{:n/v 2}])
+(println :durability-1-exits)
+(exit 0)
+(println :not-reached)

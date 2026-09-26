@@ -51,7 +51,7 @@ changes to emdb.
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 167 steps (165 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
+| `zig build test --summary all` | the gate, 170 steps (168 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the ReleaseFast benchmark harness (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
@@ -62,12 +62,16 @@ changes to emdb.
   before committing it.
 - `-Doptimize=ReleaseFast` applies to any step. A Debug binary is not
   a performance measurement.
-- The runtime reads two environment variables. `NEXIS_GC_STRESS=1`
+- The runtime reads three environment variables. `NEXIS_GC_STRESS=1`
   makes every VM collect every 4 KiB of allocation (`docs/GC.md` §7);
   `NEXIS_GC_STRESS=1 zig build test` proves the natives' rooting.
   `NEXIS_MAX_ALLOC=BYTES` refuses every allocation past BYTES
   (`docs/TOOLING.md` §1); the out-of-memory and REPL goldens set it
   on their runs, which otherwise start from an empty environment.
+  `NEXIS_DURABILITY=commit|durable` chooses whether a store commit
+  syncs (`docs/DB.md` §3.3; `commit`, no sync, when unset);
+  `NEXIS_DURABILITY=durable zig build test` runs the gate with every
+  commit synced.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
 

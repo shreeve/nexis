@@ -41,6 +41,18 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 | 5 | runtime error that no `try` caught |
 | n | `(exit n)` |
 
+However a command ends, through its normal end, `exit` or an error it
+reports, every store file a commit left unsynced is synced once first
+(`docs/DB.md` §3.3).
+
+**Environment.** `NEXIS_DURABILITY` is the durability of every store
+connection that names none: `commit` (the default: a commit syncs
+nothing, and the file is synced at close, `sync` and the end of the
+program) or `durable` (every commit syncs); `docs/DB.md` §3.3. Any
+other value stops the command before it runs with `nexis:
+NEXIS_DURABILITY is not commit or durable`, exit 1.
+`NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7.
+
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold

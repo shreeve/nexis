@@ -36,7 +36,7 @@ print each value. Exit status is 0 on success, 3 for a parse or reader
 error, 4 for a compile error, 5 for an uncaught runtime error, and `n`
 for `(exit n)` (`docs/TOOLING.md` §1).
 
-`zig build test --summary all` is the gate: 1306 tests in 167 build
+`zig build test --summary all` is the gate: 1335 tests in 170 build
 steps, about a minute from a warm cache. `AGENTS.md` lists every build step.
 
 ## The language
@@ -154,8 +154,8 @@ Lisp API (§6.1 lazy entities, §6.2 pull patterns), §7 errors, §8
 module layout, §10 where Nextomic wins and where it does not, §11 what
 it asks of emdb (nothing), §12 its differences from Datomic.
 
-A store file is a sparse 256 MB reservation that grows when it fills:
-`ls -l` reports the reservation, `du` the bytes in use.
+A new store file starts at 1 MiB and grows 8 MiB at a time as it
+fills (`docs/NEXTOMIC.md` §2).
 
 ## Differences from Clojure
 

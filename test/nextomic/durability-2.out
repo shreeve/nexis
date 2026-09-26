@@ -1,0 +1,4 @@
+ok commit.edb holds both values
+commit.edb 4
+ok durable.edb holds both values
+durable.edb 4

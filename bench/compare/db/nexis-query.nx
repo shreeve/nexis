@@ -57,7 +57,8 @@
   '[:find (sum ?s) . :with ?p :in $ [?em ...] :where [?p :person/email ?em] [?p :person/salary ?s]])
 (def first-1000 (mapv email (range 1000)))
 
-; 1,000 transactions of one datom each, default sync (durable).
+; 1,000 transactions of one datom each, in the default commit
+; (`:commit`: atomic, no sync; docs/DB.md §3.3).
 (def t-before (d/basis-t (d/db conn)))
 (let [t0 (nano-time)]
   (dotimes [i 1000]

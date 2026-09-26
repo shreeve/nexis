@@ -41,13 +41,20 @@ below is a public function or a committed invariant of emdb as it stands
 ## 2. Store layout
 
 `Store.open` opens its own emdb `Env` with the geometry every nexis
-store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128), a
-256 MB initial map and emdb's 64 MB growth step. emdb reads a file's
-page size from its meta and fixes it for the file's life (INV-M05), so
+store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
+new file starts at the map size its opener names
+(`Store.Options.map_size`: 1 MiB, `Store.initial_map_size`, unless
+named, as `nextomic.db.OpenOptions.map_size` is by default) and emdb
+extends a full file 8 MiB at a time (`Store.map_grow_step`).
+emdb reserves the address space when it opens a file, so an extension
+moves no mapping and costs one `ftruncate`; the file's length is the
+map, and its allocated blocks are the pages written. emdb reads a
+file's page size from its meta and fixes it for the file's life
+(INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
 holds on every platform. Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
-byte array in EAVT or a transaction's txlog entry, is at most 65 535
+byte array in EAVT-h or a transaction's txlog entry, is at most 65 535
 overflow pages, just under 1 GiB; past that the engine refuses the
 write as `:db/value-too-large` and the transaction aborts.
 
@@ -75,13 +82,23 @@ through one while another holds the file's write transaction is
 `:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
 wait on itself.
 
+Every commit, a transaction's and the one that creates, completes or
+re-tokenises a store at connect alike, is atomic and seen at once by
+every connection and process sharing the file; whether it syncs is the
+connection's durability (§3 "Durability", `docs/DB.md` §3.3). The file
+is opened with 4,096 reader slots (`db.reader_slots`, `docs/DB.md`
+§3.2). A read begins in the file's held snapshot, a read transaction
+kept from the previous operation while no commit has passed it, or in
+a fresh one, and ends by keeping it (`docs/DB.md` §3.4); a db-value
+still holds no read transaction.
+
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` + full payload for out-of-line values |
+| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` (format 1 also wrote the payload of an out-of-line value after it) |
 | `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
 | `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
 | `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or the full payload |
+| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or on an assertion row the full payload of an out-of-line value |
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
@@ -146,7 +163,7 @@ value, a bignum past `±2^47`. An integer outside i64 is
 `:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
 or an `index-range` bound. A key holds every long in the same 8
 bytes, and the txlog spells one past the fixnum range as the codec's
-bignum; the format number stays 1. A build that takes longs in the
+bignum; neither changes the format number. A build that takes longs in the
 fixnum range only reads such a file's fixnum-range values and refuses
 a wider one, `:nextomic/value-type` from an index and `:db/corrupted`
 from the txlog, never misreading it. String order is UTF-8 byte order,
@@ -165,9 +182,15 @@ and two out-of-line values order by hash (two seeded xxh3-64 lanes).
 The decoder tells the shapes apart by the bare `0x00`: an inline value
 ends there, an out-of-line one continues with `0x01` and the hash.
 Range predicates compare decoded values, never index keys, so they are
-exact on long strings. The full value is stored in the `nx/eavt` value
-after the 6-byte `t` (and in `nx/eavt-h`); an AVET or AEVT hit on a
-long value is confirmed by an EAVT point read before it is returned.
+exact on long strings. The full value is the value of each of the
+fact's assertion rows in `nx/eavt-h` and nowhere else in the index
+trees: a current read seeks the fact's latest EAVT-h row, which is its
+assertion while the fact is current; a history read gets its own row,
+and a retraction row, which holds nothing, the row before it, the
+assertion it retracts. An AVET or AEVT hit on a long value is
+confirmed by an EAVT point read before it is returned. A store format
+1 wrote also holds the payload after `t` in the current EAVT row and
+on its retraction rows, which reads take as they find.
 Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
@@ -181,7 +204,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 
 | key | value |
 |---|---|
-| `"format"` | u16 Nextomic format number (1) |
+| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction asserts or retracts an out-of-line value, whose current EAVT row holds `t` alone and whose retraction rows hold nothing (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place |
 | `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
@@ -204,6 +227,31 @@ A store whose idents lack `:db/fulltext` receives it at open, in a
 transaction of its own at the store's next ident id, so its id is the
 one the store reports (`Store.fulltext_aid`), not 22.
 
+### 2.5 Write order and page fill
+
+emdb splits a full leaf in half, except when the new key sorts after
+every key on the leaf, when it keeps nine tenths on the left. A tree
+written in ascending order at its right end therefore fills its
+leaves to about 90 %, and one written in ascending order between
+existing keys leaves every leaf behind it half full. Most of a
+transaction's datoms land between existing keys: a new entity's EAVT
+rows sort before the transaction entities (partition `2^46`), its
+AEVT rows at the end of each attribute's run, its VAET rows at the end
+of each referenced entity's.
+
+`Store.writeBatch` writes each of the eight trees in turn, a current
+tree before its history twin. It sorts one index's keys; those past
+the tree's last key are appended in order. The rest go in two
+ascending passes: the first over about 55 % of them, picked by
+Fibonacci hashing of their rank so the two passes interleave evenly,
+the second over the others, which land between the first pass's keys
+on the half-full leaves it left behind. Equal keys stay in one pass in
+batch order, so a batch leaves the trees exactly as writing its datoms
+one at a time does. The gain grows with the keys a transaction writes
+into one gap: one that takes less than a leaf's worth leaves its leaf
+half full as before (`docs/PERF.md` §3.11 has the measured fill). The
+order changes no byte of the format.
+
 ---
 
 ## 3. Transactions
@@ -211,7 +259,8 @@ one the store reports (`Store.fulltext_aid`), not 22.
 One `transact!` is one emdb write transaction. The VM is single-threaded,
 so there is no queue; emdb's write lock is the transactor.
 
-1. **Begin**: `wtxn = env.beginWriteWith(.{ .sync = opt })`;
+1. **Begin**: `wtxn = env.beginWriteWith(.{ .sync = opt })`, `opt`
+   the transaction's `:sync` or else its connection's durability;
    `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]` ops. tx-data is a vector or a
    list of forms, each a list form or a map form (a hash map or a
@@ -347,13 +396,12 @@ so there is no queue; emdb's write lock is the transactor.
      otherwise) and may be set false again; `:db/doc` is an ordinary
      card-one attribute.
 6. **Write**: for each assertion, put into the current trees (value
-   `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
-   append `[.. top]` with `added = 1` to the history trees; for each
+   `[t]`) and append `[.. top]` with `added = 1` to the history trees,
+   an out-of-line value's payload as its `nx/eavt-h` value; for each
    retraction, delete from the current trees and append `added = 0` to
-   the history trees. EAVT first in key order (append-biased splits),
-   then AEVT, then AVET and VAET after sorting the batch (better leaf
-   fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
-   including `"t"`.
+   the history trees. EAVT first, then AEVT, then AVET and VAET, each
+   tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
+   counters including `"t"`.
 7. **Commit**: `wtxn.commit()`, after which the idents the transaction
    minted, renamed or read reach the connection's cache; until then
    they live in the transaction alone, since the write transaction
@@ -395,10 +443,33 @@ attribute is `:nextomic/tx-data`. The assertion then follows the
 card-one rule of step 4, so two cas forms on one `(e a)` in one
 transaction conflict as two values would.
 
-**Sync mode.** `:full` (default) syncs data and meta; `:no-meta`
-batches the meta flush; `:none` is for bulk loads followed by
-`(d/sync conn)`. A fully durable commit is two device flushes. Any
-other `:sync` value is the VM's `:invalid-argument`.
+**Durability.** A commit is atomic and seen at once by every
+connection and process sharing the file; whether it is on the disk
+when `transact!` returns is the connection's durability
+(`docs/DB.md` §3.3):
+
+| Durability | A commit | Lost if the process crashes | Lost if the system crashes |
+|---|---|---|---|
+| `:commit` (default) | syncs nothing | nothing | the commits since the file's last sync |
+| `:durable` | syncs data, then meta: two device flushes | nothing | nothing |
+
+`(d/connect path {:durability d})` sets it for one connection; without
+it the connection takes the process's, `NEXIS_DURABILITY` (`commit`
+when unset). When a commit syncs nothing, the file is synced once,
+with one full sync, at `(d/sync conn)`, at `release` (and so at the end
+of `with-conn`), at `exit`, and when the program ends, through
+`bin/nexis`'s normal end or an error it reports; never when nothing was
+written since the last. A process killed by a signal loses nothing it
+committed; a crash of the system can lose the commits since the last
+sync. A commit that syncs makes every commit before it durable too.
+
+A transaction's own `{:sync s}` overrides its connection's for its
+commit: `:full` syncs data and meta, `:no-meta` data alone, `:none`
+nothing. At connect `{:sync s}` sets that for every transaction of the
+connection and wins over `:durability`. Any other `:sync` or
+`:durability` value is the VM's `:invalid-argument`. Consecutive
+transactions are never joined into one emdb transaction (`docs/DB.md`
+§3.3 "No batching").
 
 ---
 
@@ -763,8 +834,8 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 
 | form | semantics |
 |---|---|
-| `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
-| `(d/release conn)` | close, idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4) |
+| `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
+| `(d/release conn)` | sync the file when a commit left it unsynced (§3 "Durability"), then close; idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4); a failed sync is `:db/sync-failed`, and the connection is closed |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
@@ -783,7 +854,7 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 | `(d/pull db pattern e)` | the pattern's map (§6.2); nil when the entity has no datoms in the view. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
 | `(d/with conn tx-data f)` | speculative transaction: tx-data applied in a held write transaction, `f` called with `db-after` (a db-value over the uncommitted state: `q`, `entity`, `pull`, `datoms`, `schema` and the time views read it) and the report `transact!` would have returned, then aborted. Returns `f`'s value; a throw inside `f` propagates after the abort; the committed basis is unchanged and the next `transact!` takes the same `t`. `transact!`, `with` and `excise!` inside the scope are `:nextomic/nested`; `db-after` after the scope is `:nextomic/closed` |
-| `(d/sync conn)` | `Env.sync()` after `:none` loads |
+| `(d/sync conn)` | nil once every commit to the file is durable: one full sync (`Env.sync`) when a commit left it unsynced, nothing otherwise |
 | `(d/with-conn [c path opts?] body...)` | macro: connect for the extent of body; released on every exit, a throw keeps propagating |
 
 A connection prints as `#nextomic/conn "path"`, a db-value as
@@ -888,7 +959,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:message`; `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault: the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |
-| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` option or a negative `t`, or a wrong argument count | bare |
+| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | bare |
 | `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | bare |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, is `:db/corrupted` | bare |
 
@@ -983,8 +1054,9 @@ one writer.
 
 The engine's public `Txn.txnId` field is not used: Nextomic's own `t`
 is read from `sys` inside the same snapshot. Index trees carry only
-`[t]` in current trees and nothing in history trees; an out-of-line
-payload is read with `Txn.getFromTree` on its exact EAVT key. emdb
+`[t]` in current trees and nothing in history trees but an
+out-of-line payload in EAVT-h, read with `Txn.getFromTree` on its
+exact key or with a cursor seek to the fact's latest row. emdb
 returns a value spanning several pages whole, from a cursor or a get,
 assembled in the transaction's buffer and valid until that
 transaction's next such read, so Nextomic copies what it keeps.
@@ -992,6 +1064,16 @@ transaction's next such read, so Nextomic copies what it keeps.
 ---
 
 ## 12. Differences from Datomic
+
+- **A transaction returns committed, not synced.** Datomic's
+  `transact` returns once the transaction is durable in storage.
+  Nextomic's default durability, `:commit`, returns once it is atomic
+  and visible to every connection and process: it survives a crash of
+  the process, and the file is synced at `sync`, `release` and the
+  end of the program, so a crash of the system can lose the commits
+  since the last sync. `{:durability :durable}` on the connection, or
+  `{:sync :full}` on one transaction, gives Datomic's contract at two
+  device flushes a commit (§3 "Durability").
 
 - **An ident rename retires the old keyword in every view** (§3 step
   5): after `[:db/add :person/name :db/ident :person/full-name]` every
