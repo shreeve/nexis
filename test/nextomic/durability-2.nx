@@ -1,0 +1,12 @@
+; test/nextomic/durability-2.nx — second process: every commit
+; durability-1.nx made before its `exit` is in both stores.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(doseq [path ["commit.edb" "durable.edb"]]
+  (d/with-conn [c path]
+    (let [db (d/db c)]
+      (t/check (str path " holds both values")
+               (= #{[1] [2]} (d/q '[:find ?v :where [_ :n/v ?v]] db)))
+      (println path (d/basis-t db)))))

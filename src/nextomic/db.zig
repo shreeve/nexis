@@ -96,7 +96,9 @@ pub const Error = error{
 // =============================================================================
 
 pub const OpenOptions = struct {
-    sync: SyncMode = .full,
+    /// How the connection's commits sync; null takes the process's
+    /// durability (`NEXIS_DURABILITY`, NEXTOMIC.md §3).
+    sync: ?SyncMode = null,
     map_size: u64 = 256 * 1024 * 1024,
 };
 
@@ -139,15 +141,16 @@ pub const Conn = struct {
     pub fn open(gpa: Allocator, interner: *Interner, path: [*:0]const u8, options: OpenOptions) !*Conn {
         const self = try gpa.create(Conn);
         errdefer gpa.destroy(self);
-        const store = try Store.open(gpa, path, .{ .map_size = options.map_size });
+        const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
+        const store = try Store.open(gpa, path, .{ .map_size = options.map_size, .sync = sync_mode });
         errdefer store.close();
-        try refreshFulltext(gpa, store);
+        try refreshFulltext(gpa, store, sync_mode);
         self.* = .{
             .gpa = gpa,
             .store = store,
             .interner = interner,
             .idents = Idents.init(gpa, store, interner),
-            .sync_mode = options.sync,
+            .sync_mode = sync_mode,
             .is_open = true,
             .file = .{ store.file.id.dev, store.file.id.ino },
         };
@@ -159,7 +162,7 @@ pub const Conn = struct {
     /// that writes no datom. A file this process may only read, or one
     /// whose writer is busy in this process, is left as it is: its
     /// searches re-tokenise until a transaction rebuilds the rows.
-    fn refreshFulltext(gpa: Allocator, store: *Store) !void {
+    fn refreshFulltext(gpa: Allocator, store: *Store, sync_mode: SyncMode) !void {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -168,13 +171,13 @@ pub const Conn = struct {
             defer txn.abort();
             if (!try fulltext.needsRebuild(store, txn, arena, try store.readT(txn))) return;
         }
-        const txn = store.beginWrite(.full) catch |err| switch (err) {
+        const txn = store.beginWrite(sync_mode) catch |err| switch (err) {
             error.TxnReadOnly, error.WriterActive => return,
             else => return err,
         };
         errdefer txn.abort();
         try fulltext.rebuild(store, txn, arena, try store.readT(txn));
-        try txn.commit();
+        try store.commit(txn);
     }
 
     /// Stop accepting operations. Idempotent. The `Conn` stays allocated
@@ -191,10 +194,15 @@ pub const Conn = struct {
         self.closeStore();
     }
 
-    /// `close`, refused while an operation is in flight.
-    pub fn release(self: *Conn) error{Busy}!void {
-        if (self.is_open and self.busy > 0) return error.Busy;
+    /// `close`, refused while an operation is in flight, after syncing
+    /// the file when a commit left it unsynced. A failed sync is
+    /// returned once the connection is closed.
+    pub fn release(self: *Conn) !void {
+        if (!self.is_open) return;
+        if (self.busy > 0) return error.Busy;
+        const synced = self.store.sync();
         self.close();
+        return synced;
     }
 
     fn closeStore(self: *Conn) void {
@@ -212,20 +220,23 @@ pub const Conn = struct {
         self.gpa.destroy(self);
     }
 
-    /// A read transaction for one operation: a fresh reader, or a
-    /// read-only child of the held write transaction on a `with` view.
-    /// Ends with `endReadTxn`.
+    /// A read transaction for one operation: the file's held snapshot
+    /// while no commit has passed it (`db.StoreFile.takeHeld`), else a
+    /// fresh reader; on a `with` view, a read-only child of the held
+    /// write transaction. Ends with `endReadTxn`.
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
-        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else try self.store.beginRead();
+        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else self.store.file.takeHeld() orelse try self.store.beginRead();
         errdefer txn.abort();
         try self.idents.refresh(txn);
         self.busy += 1;
         return txn;
     }
 
+    /// End the read: a reader is kept for the next read while it is the
+    /// latest commit (NEXTOMIC.md §2), a child is aborted.
     pub fn endReadTxn(self: *Conn, txn: *Txn) void {
-        txn.abort();
+        if (self.overlay == null) self.store.file.keep(txn) else txn.abort();
         self.taskDone();
     }
 

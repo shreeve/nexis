@@ -171,7 +171,8 @@ decoding builds them, which is the only row the pool moved.
 
 | Row | Apple M1 | Apple M5 | Measures |
 |---|---:|---:|---|
-| `db_put_commit_scalar` | 6.15 ms | 6.00 ms | one put and a durable commit: the fsync, per commit, not per put |
+| `db_put_commit_scalar` | — | 330 ns | one put and a commit in the default durability, `:commit`: no sync (`docs/DB.md` §3.3) |
+| `db_put_commit_scalar`, `NEXIS_DURABILITY=durable` | 6.15 ms | 6.00 ms | one put and a durable commit: two `F_FULLFSYNC`, per commit, not per put |
 | `db_get_hit_scalar` | 1.04 μs | 60 ns | read transaction, B+ tree lookup, decode of a fixnum, abort |
 
 The two `db_get_hit_scalar` figures differ by 17×; the difference is
@@ -334,17 +335,24 @@ ratio above 1 means nexis is slower. Provenance: §11.
 
 | Phase (100k entities × 5 attributes) | Nextomic | Datalevin 1.1 | ratio |
 |---|---:|---:|---:|
-| open an existing store | 106 μs | 12.5 ms | 0.01 |
-| load, default commit | 1.64 s | 2.00 s | 0.82 |
-| load, no per-commit flush | 702 ms | 1.90 s | 0.37 |
-| 10k point lookups by a unique attribute | 21.1 ms | 31.9 ms | 0.66 |
-| three-clause join, 20 × 1,000 rows | 12.6 ms | 31.0 ms | 0.41 |
-| aggregate query | 18.0 ms | 93.8 ms | 0.19 |
-| pull of 10k entities with a nested ref | 9.53 ms | 68.5 ms | 0.14 |
-| 1,000 one-datom transactions, default commit | 4.02 s | 159 ms | 25.3 |
-| 1,000 one-datom transactions, no per-commit flush | 39.9 ms | 58.4 ms | 0.68 |
-| as-of and history query | 2.79 ms | no counterpart | — |
+| open an existing store | 120 μs | 14.2 ms | 0.01 |
+| load, default commit | 656 ms | 2.26 s | 0.29 |
+| load, no per-commit flush | 784 ms | 2.15 s | 0.36 |
+| 10k point lookups by a unique attribute | 13.5 ms | 34.5 ms | 0.39 |
+| three-clause join, 20 × 1,000 rows | 14.2 ms | 35.6 ms | 0.40 |
+| aggregate query | 19.0 ms | 123 ms | 0.16 |
+| pull of 10k entities with a nested ref | 10.1 ms | 75.3 ms | 0.13 |
+| 1,000 one-datom transactions, default commit | 17.7 ms | 183 ms | 0.10 |
+| 1,000 one-datom transactions, no per-commit flush | 23.3 ms | 62.6 ms | 0.37 |
+| as-of and history query | 2.17 ms | no counterpart | — |
 | store after the load (allocated) | 198 MB | 46 MB | 4.3 |
+
+The database rows are a run of their own, at the durability and
+held-snapshot commits; the same run at `cc935cc`, where every default
+commit synced and every read began its own transaction, measured
+3.42 s for the default-commit transactions, 1.64 s for the
+default-commit load and 24.6 ms for the lookups, and matched these
+rows elsewhere within the spread (§11).
 
 What the rows say:
 
@@ -358,14 +366,18 @@ What the rows say:
   list narrow the first and last), and it holds 2–4× the memory on
   collections of a million elements: the collector's policy and the
   16-byte value cell show there.
-- Nextomic is ahead of Datalevin on opening, loading, lookups, joins,
-  aggregates and pull.
-- The default-commit transaction row compares different guarantees:
-  a Nextomic commit asks the drive to empty its write cache
-  (`F_FULLFSYNC`, twice), Datalevin's does not (`docs/BENCH.md` §12).
-  With the per-commit flush off in both, Nextomic is ahead. A
-  durable commit per small transaction is the cost to lower (group
-  commit, or a WAL); §6.
+- Nextomic is ahead of Datalevin on every phase: opening, loading,
+  lookups, joins, aggregates, pull and small transactions.
+- The default-commit rows compare different guarantees. A default
+  Nextomic commit (`:commit`, `docs/DB.md` §3.3) syncs nothing: it is
+  atomic and survives a crash of the process, and the file is synced
+  once at `release` and at the end of the program, outside the timed
+  phase. Datalevin's calls `fsync`, which on macOS does not empty the
+  drive's cache (`docs/BENCH.md` §12). A Nextomic connection opened
+  `{:durability :durable}` syncs each commit, two `F_FULLFSYNC`, and
+  pays what every default commit paid before: 3.42 s for the 1,000
+  transactions. The no-flush rows include one sync at the end in
+  both systems.
 - The store is 4.3× Datalevin's: history indexes and the txlog, which
   Datalevin does not keep, and 16 KiB pages over 256 MB of initial
   map.
@@ -410,12 +422,11 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers not built.**
 
-- **The durable commit of a small transaction.** A default Nextomic
-  commit is two `F_FULLFSYNC` calls, about 4 ms, so 1,000 one-datom
-  transactions take 4 s where Datalevin's weaker default takes 159 ms
-  (§3.11). Group commit, several transactions under one flush, keeps
-  the guarantee and divides the cost; the measurement is §3.11's
-  `tx-1k-durable` row.
+- **Batched commits** (`docs/DB.md` §3.3 "No batching"): consecutive
+  auto-transaction writes joined into one open emdb write transaction
+  would save part of a `:commit` transaction's cost, about 18 μs in
+  all (§3.11), at the price of holding the writer between natives. A `:durable` commit's two device flushes are the other
+  cost left; group commit under one flush would divide it.
 - **Memory on large collections.** §3.11's million-element rows hold
   2–4× babashka's resident set: the 16-byte value cell, non-moving
   mark-sweep over the process allocator, and eager intermediate
@@ -450,6 +461,20 @@ Each lever is a measured change: a before/after from `zig build bench`
   into a slot and `jump:if-false` on it; a fused form halves every
   loop test and every `case` clause (§3.10). It is a new instruction
   (VM.md §10), so it needs the encoding's amendment.
+
+**Levers pulled.**
+
+- *Commit without a sync by default* (`docs/DB.md` §3.3): §3.11's
+  1,000 default-commit transactions 3.42 s → 17.7 ms, the
+  default-commit load 1.64 s → 656 ms, `db_put_commit_scalar`
+  6.00 ms → 330 ns. The file is synced once at close and exit.
+- *A held read snapshot* (`docs/DB.md` §3.4): a Nextomic read reuses
+  the file's last read transaction, twelve trees loaded, while no
+  commit has passed it. §3.11's lookups 24.6 → 13.5 ms; through
+  `bin/nexis`, 10,000 `(d/db conn)` 4.63 → 0.77 ms, `d/entity` plus
+  one attribute 16.9 → 8.6 ms, `d/entid` by lookup ref 8.5 → 4.3 ms
+  (§11). The query and pull rows of §3.7 each run one read and did
+  not move outside their spread.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
 
@@ -528,5 +553,6 @@ is one invocation's 30-sample median.
 | §3.7 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 6–20) | revamp, 2026-09-25: `nexis-bench --filter nextomic` built by `zig build bench -Doptimize=ReleaseFast` from `bench/nextomic.zig` at the ws-planner head over the `src/` of `8548eda` (before) and of the ws-planner head (after), five invocations of each, alternating, the best median with the spread; the `bin/nexis` figures are one run each of a probe program timing `d/q` with `nano-time`, before at `b8c17a1` |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |
-| §3.11 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
+| §3.11 language rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
+| §3.11 database rows, §6 "Levers pulled" | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |

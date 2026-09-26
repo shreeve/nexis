@@ -405,8 +405,9 @@ const core_natives = table("", .{
 
 const db_natives = table("db", .{
     // Connection + ref + auto-ephemeral primitives.
-    .{ "open", 1, 1, &fnDbOpen },
+    .{ "open", 1, 2, &fnDbOpen },
     .{ "close", 1, 1, &fnDbClose },
+    .{ "sync", 1, 1, &fnDbSync },
     .{ "ref", 3, 3, &fnDbRef },
     .{ "ref?", 1, 1, &fnDbRefQ },
     .{ "put-key!", 2, 2, &fnDbPutKey },
@@ -3013,10 +3014,13 @@ fn ioOf(vm: *VM) std.Io {
     return vm.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-/// `(db/open path)`: the store at `path`, created with its parent
-/// directories when absent (emdb creates only the file).
+/// `(db/open path)` / `(db/open path {:durability d})`: the store at
+/// `path`, created with its parent directories when absent (emdb
+/// creates only the file). `d` is `:commit` or `:durable`; without it
+/// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
+    const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
     const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -3025,12 +3029,27 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
     conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{ .allocator = vm.allocator }) catch |err| return dbFailure(vm, err);
+    if (durability) |d| conn.durability = d;
     vm.db_close_callback = &dbCloseCallback;
     vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);
         return VmError.OutOfMemory;
     };
     return .{ .tag = @intFromEnum(Kind.db_connection), .payload = @intFromPtr(conn) };
+}
+
+/// The `:durability` of a `db/open` options map; null when the map is
+/// nil or has none.
+fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
+    if (opts.isNil()) return null;
+    if (opts.kind() != .persistent_map) return VmError.KindMismatch;
+    const k = vm.ensureInterner().internKeywordValue("durability") catch return VmError.OutOfMemory;
+    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+        .absent => return null,
+        .present => |x| x,
+    };
+    if (found.kind() != .keyword) return VmError.InvalidArgument;
+    return db_mod.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse VmError.InvalidArgument;
 }
 
 /// Teardown of the VM: close whatever is still open and free the
@@ -3052,6 +3071,14 @@ fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .db_connection) return VmError.KindMismatch;
     const conn: *db_mod.Connection = @ptrFromInt(args[0].payload);
     db_mod.close(conn) catch |err| return dbFailure(vm, err);
+    return value_mod.nilValue();
+}
+
+/// `(db/sync conn)` → nil: every commit to the connection's file is
+/// durable, with one full sync when a commit left it unsynced.
+fn fnDbSync(vm: *VM, args: []const Value) VmError!Value {
+    const conn = try openConn(args[0]);
+    db_mod.sync(conn) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
 }
 
@@ -4696,12 +4723,14 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 
 /// `(exit)` / `(exit status)` → ends the process with `status` (0 by
 /// default) after closing every store the program opened, through
-/// `db/open` or `nextomic/connect`; nothing after it runs, `finally`
-/// blocks included, as with Java's `System/exit`.
+/// `db/open` or `nextomic/connect`, and syncing every file a commit
+/// left unsynced; nothing after it runs, `finally` blocks included, as
+/// with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
     if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
+    db_mod.StoreFile.syncAll();
     std.process.exit(status);
 }
 

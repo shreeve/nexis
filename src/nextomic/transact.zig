@@ -1099,7 +1099,7 @@ const Ctx = struct {
         const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
         const tempids = try self.userTempids();
         try self.minter.reserveCache();
-        try self.txn.commit();
+        try self.conn.store.commit(self.txn);
         self.finished = true;
         self.conn.taskDone();
         self.minter.commitCache();
@@ -3508,6 +3508,117 @@ test "two identities naming two entities for one tempid conflict, naming the dat
     }, .{ .fault = &fault }));
     try testing.expect(fault.e != null);
     try testing.expectEqual(try kw(tc, "user/email"), fault.attr.?.asKeywordId());
+}
+
+fn engineSyncs() u64 {
+    return emdb.platform.File.syncCalls.load(.monotonic);
+}
+
+test "durability: a transaction syncs only when it or its connection asks; sync and release sync what is left once" {
+    const tc = try TestConn.init("tx_durability");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file = tc.conn.store.file;
+
+    // TestConn's connection commits without a sync; the store's
+    // bootstrap was its first commit.
+    var before = engineSyncs();
+    try installSchema(tc, arena);
+    try testing.expectEqual(before, engineSyncs());
+    try testing.expect(file.unsynced);
+    const name = try attrId(tc, "user/name");
+    const add: []const Op = &.{.{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } }};
+
+    // Another connection sees the commit at once. One whose commits sync
+    // makes every commit before it durable.
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .full });
+    defer other.destroy();
+    try testing.expectEqual(@as(u64, 2), (try other.db()).basis);
+    _ = try transactOps(other, arena, add, .{});
+    try testing.expect(engineSyncs() > before);
+    try testing.expect(!file.unsynced);
+
+    // A transaction's own :sync overrides its connection's, either way.
+    before = engineSyncs();
+    _ = try transactOps(other, arena, add, .{ .sync = .none });
+    try testing.expectEqual(before, engineSyncs());
+    try testing.expect(file.unsynced);
+    _ = try transactOps(tc.conn, arena, add, .{ .sync = .full });
+    try testing.expect(engineSyncs() > before);
+    try testing.expect(!file.unsynced);
+
+    // sync is one full sync of what is unsynced, and nothing when all is.
+    _ = try transactOps(tc.conn, arena, add, .{});
+    before = engineSyncs();
+    try tc.conn.sync();
+    try testing.expectEqual(before + 1, engineSyncs());
+    try tc.conn.sync();
+    try testing.expectEqual(before + 1, engineSyncs());
+
+    // release syncs, though another connection still holds the file.
+    _ = try transactOps(tc.conn, arena, add, .{});
+    try other.release();
+    try testing.expectEqual(before + 2, engineSyncs());
+    try testing.expect(!file.unsynced);
+}
+
+test "durability: a connection opened without :sync takes the process's (NEXIS_DURABILITY)" {
+    const tc = try TestConn.init("tx_durability_default");
+    defer tc.deinit();
+    const conn = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{});
+    defer conn.destroy();
+    try testing.expectEqual(SyncMode.of(store_mod.db_layer.Durability.process()), conn.sync_mode);
+}
+
+test "reads share the file's held snapshot until a commit passes it; a with view's reads are never kept" {
+    const tc = try TestConn.init("tx_held");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const file = tc.conn.store.file;
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer other.destroy();
+
+    const db2 = try tc.conn.db();
+    const held = file.held.?;
+    // Another connection to the file reads through the same snapshot.
+    try testing.expectEqual(db2.basis, (try other.db()).basis);
+    try testing.expectEqual(held, file.held.?);
+    // Nested reads: the outer holds the snapshot, the inner begins its own.
+    var outer = try db2.beginRead();
+    try testing.expect(file.held == null);
+    try testing.expectEqual(held, outer.txn);
+    var inner = try db2.beginRead();
+    try testing.expect(inner.txn != held);
+    inner.close();
+    try testing.expect(file.held != null);
+    outer.close();
+
+    // A transaction on either connection lets it go, and the next read
+    // sees its commit.
+    const r = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+    }, .{});
+    try testing.expectEqual(r.t, (try tc.conn.db()).basis);
+    const e = r.tempids[0].eid;
+    try testing.expectEqual(@as(usize, 1), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = e })).len);
+
+    // The view of a with reads children of its write transaction; the
+    // write let the snapshot go and the view keeps none.
+    const w = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    try testing.expect(file.held == null);
+    try testing.expectEqual(r.t + 1, w.db().basis);
+    try testing.expectEqual(@as(usize, 1), (try w.db().datoms(arena, .eavt, .{ .e = e })).len);
+    try testing.expect(file.held == null);
+    w.destroy();
+    try testing.expectEqual(r.t, (try tc.conn.db()).basis);
 }
 
 test "another connection's data commits keep the schema cache; its schema changes rebuild it" {

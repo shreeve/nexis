@@ -75,6 +75,16 @@ through one while another holds the file's write transaction is
 `:nextomic/nested` from Nextomic and `:db/busy` from `db/*`, never a
 wait on itself.
 
+Every commit, a transaction's and the one that creates, completes or
+re-tokenises a store at connect alike, is atomic and seen at once by
+every connection and process sharing the file; whether it syncs is the
+connection's durability (§3 "Durability", `docs/DB.md` §3.3). The file
+is opened with 4,096 reader slots (`db.reader_slots`, `docs/DB.md`
+§3.2). A read begins in the file's held snapshot, a read transaction
+kept from the previous operation while no commit has passed it, or in
+a fresh one, and ends by keeping it (`docs/DB.md` §3.4); a db-value
+still holds no read transaction.
+
 | tree | key | value |
 |---|---|---|
 | `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` + full payload for out-of-line values |
@@ -211,7 +221,8 @@ one the store reports (`Store.fulltext_aid`), not 22.
 One `transact!` is one emdb write transaction. The VM is single-threaded,
 so there is no queue; emdb's write lock is the transactor.
 
-1. **Begin**: `wtxn = env.beginWriteWith(.{ .sync = opt })`;
+1. **Begin**: `wtxn = env.beginWriteWith(.{ .sync = opt })`, `opt`
+   the transaction's `:sync` or else its connection's durability;
    `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]` ops. tx-data is a vector or a
    list of forms, each a list form or a map form (a hash map or a
@@ -395,10 +406,33 @@ attribute is `:nextomic/tx-data`. The assertion then follows the
 card-one rule of step 4, so two cas forms on one `(e a)` in one
 transaction conflict as two values would.
 
-**Sync mode.** `:full` (default) syncs data and meta; `:no-meta`
-batches the meta flush; `:none` is for bulk loads followed by
-`(d/sync conn)`. A fully durable commit is two device flushes. Any
-other `:sync` value is the VM's `:invalid-argument`.
+**Durability.** A commit is atomic and seen at once by every
+connection and process sharing the file; whether it is on the disk
+when `transact!` returns is the connection's durability
+(`docs/DB.md` §3.3):
+
+| Durability | A commit | Lost if the process crashes | Lost if the system crashes |
+|---|---|---|---|
+| `:commit` (default) | syncs nothing | nothing | the commits since the file's last sync |
+| `:durable` | syncs data, then meta: two device flushes | nothing | nothing |
+
+`(d/connect path {:durability d})` sets it for one connection; without
+it the connection takes the process's, `NEXIS_DURABILITY` (`commit`
+when unset). When a commit syncs nothing, the file is synced once,
+with one full sync, at `(d/sync conn)`, at `release` (and so at the end
+of `with-conn`), at `exit`, and when the program ends, through
+`bin/nexis`'s normal end or an error it reports; never when nothing was
+written since the last. A process killed by a signal loses nothing it
+committed; a crash of the system can lose the commits since the last
+sync. A commit that syncs makes every commit before it durable too.
+
+A transaction's own `{:sync s}` overrides its connection's for its
+commit: `:full` syncs data and meta, `:no-meta` data alone, `:none`
+nothing. At connect `{:sync s}` sets that for every transaction of the
+connection and wins over `:durability`. Any other `:sync` or
+`:durability` value is the VM's `:invalid-argument`. Consecutive
+transactions are never joined into one emdb transaction (`docs/DB.md`
+§3.3 "No batching").
 
 ---
 
@@ -763,8 +797,8 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 
 | form | semantics |
 |---|---|
-| `(d/connect path)` / `(d/connect path {:sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
-| `(d/release conn)` | close, idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4) |
+| `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
+| `(d/release conn)` | sync the file when a commit left it unsynced (§3 "Durability"), then close; idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4); a failed sync is `:db/sync-failed`, and the connection is closed |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
@@ -783,7 +817,7 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 | `(d/pull db pattern e)` | the pattern's map (§6.2); nil when the entity has no datoms in the view. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
 | `(d/with conn tx-data f)` | speculative transaction: tx-data applied in a held write transaction, `f` called with `db-after` (a db-value over the uncommitted state: `q`, `entity`, `pull`, `datoms`, `schema` and the time views read it) and the report `transact!` would have returned, then aborted. Returns `f`'s value; a throw inside `f` propagates after the abort; the committed basis is unchanged and the next `transact!` takes the same `t`. `transact!`, `with` and `excise!` inside the scope are `:nextomic/nested`; `db-after` after the scope is `:nextomic/closed` |
-| `(d/sync conn)` | `Env.sync()` after `:none` loads |
+| `(d/sync conn)` | nil once every commit to the file is durable: one full sync (`Env.sync`) when a commit left it unsynced, nothing otherwise |
 | `(d/with-conn [c path opts?] body...)` | macro: connect for the extent of body; released on every exit, a throw keeps propagating |
 
 A connection prints as `#nextomic/conn "path"`, a db-value as
@@ -888,7 +922,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:message`; `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault: the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |
-| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` option or a negative `t`, or a wrong argument count | bare |
+| `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | bare |
 | `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | bare |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, is `:db/corrupted` | bare |
 
@@ -992,6 +1026,16 @@ transaction's next such read, so Nextomic copies what it keeps.
 ---
 
 ## 12. Differences from Datomic
+
+- **A transaction returns committed, not synced.** Datomic's
+  `transact` returns once the transaction is durable in storage.
+  Nextomic's default durability, `:commit`, returns once it is atomic
+  and visible to every connection and process: it survives a crash of
+  the process, and the file is synced at `sync`, `release` and the
+  end of the program, so a crash of the system can lose the commits
+  since the last sync. `{:durability :durable}` on the connection, or
+  `{:sync :full}` on one transaction, gives Datomic's contract at two
+  device flushes a commit (§3 "Durability").
 
 - **An ident rename retires the old keyword in every view** (§3 step
   5): after `[:db/add :person/name :db/ident :person/full-name]` every
