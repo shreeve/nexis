@@ -1,13 +1,12 @@
 //! heap.zig — runtime heap allocator + `HeapHeader` storage.
 //!
-//! Authoritative layout contract: `docs/HEAP.md` §1 (HeapHeader) and
-//! the rest of `docs/HEAP.md` (allocator + object-enumeration +
-//! minimal sweep).
+//! Authoritative contract: `docs/HEAP.md` (§1 the header, §2 the
+//! size-class slabs and large blocks, §3 the API).
 //!
-//! This is the bedrock every heap-kind Value sits on. String, bignum,
-//! CHAMP map/set, persistent vector, cons list, transient wrapper,
-//! closure, upvalue cell, durable-ref — all of them land on a
-//! `*HeapHeader` returned from `Heap.alloc`. The collector in
+//! Every heap-kind Value sits on a `*HeapHeader` returned from
+//! `Heap.alloc`. A block of up to `max_small_block` bytes, header
+//! included, is a slot in a slab of its size class; a larger one is a
+//! large block from the backing allocator. The collector in
 //! `src/gc.zig` marks from roots and sweeps through `sweepUnmarked`;
 //! this file owns allocation, enumeration, the byte counters the
 //! trigger policy reads and the sweep primitive.
@@ -17,11 +16,8 @@
 //!   - `HeapHeader` size is 16; field order matches HEAP.md §1 exactly.
 //!   - Fresh allocations are zero-initialized except `kind`.
 //!   - `HeapHeader.hash == 0` means "not yet computed".
-//!   - Double-free is a runtime bug; debug builds panic via a poisoned-
-//!     kind sentinel set on free.
-//!
-//! The prefix-block strategy (rather than an external registry)
-//! avoids a dual source of truth for live objects.
+//!   - A freed block's kind is poisoned; a second free panics in
+//!     safe builds.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,7 +28,7 @@ const Allocator = std.mem.Allocator;
 // nexis is pinned to 64-bit single-isolate targets (PLAN §23 #5). Every
 // layout assert below assumes 8-byte pointers and 8-byte `usize`; state
 // that assumption explicitly so a 32-bit build would fail fast and
-// loudly rather than silently mis-size `Block`.
+// loudly rather than silently mis-size a slab or a large block.
 comptime {
     std.debug.assert(builtin.target.ptrBitWidth() == 64);
     std.debug.assert(@sizeOf(usize) == 8);
@@ -143,52 +139,232 @@ pub const HeapHeader = extern struct {
 };
 
 // =============================================================================
+// An internal collection node's `hash` field (HEAP.md §1)
+//
+// The internal nodes of a vector, map or set cache no hash. Their `hash`
+// holds the edit token of the transient that owns them in its high 26
+// bits (0: none) and six bits of the collection's own below: a vector
+// tail's claimed length (VECTOR.md §2).
+// =============================================================================
+
+pub const edit_token_max: u32 = (1 << 26) - 1;
+
+pub inline fn editTokenOf(h: *const HeapHeader) u32 {
+    return h.hash >> 6;
+}
+
+/// Whether the transient with token `edit` (nonzero) owns `h`.
+pub inline fn ownedBy(h: *const HeapHeader, edit: u32) bool {
+    return h.hash >> 6 == edit;
+}
+
+/// Stamp a fresh node as the transient's with token `edit`.
+pub inline fn stampEdit(h: *HeapHeader, edit: u32) void {
+    h.hash = edit << 6;
+}
+
+pub inline fn nodeAux(h: *const HeapHeader) u6 {
+    return @truncate(h.hash);
+}
+
+pub inline fn setNodeAux(h: *HeapHeader, aux: u6) void {
+    h.hash = (h.hash & ~@as(u32, 63)) | aux;
+}
+
+// =============================================================================
 // Bit constants
 // =============================================================================
 
 pub const mark_bit_marked: u8 = 1 << 0;
 pub const mark_bit_pinned: u8 = 1 << 1;
-// Bits 2..7 reserved (tri-color / generational / remembered-set use).
+/// The block is a large block (HEAP.md §2): the allocator's own bit,
+/// set when the block is allocated and never cleared.
+const mark_bit_large: u8 = 1 << 2;
+// Bits 3..7 reserved.
 
 pub const flag_has_meta: u8 = 1 << 0;
 // Bits 1..7 reserved.
 
+/// The kind of a free slot, and of a freed block: outside the `Kind`
+/// range, so a sweep tells a free slot from a block and a second free
+/// of one block is caught.
+const poisoned_kind: u16 = 0xDEAD;
+
 // =============================================================================
-// Block — private prefix; users never see it.
+// Size classes and slabs (HEAP.md §2)
 // =============================================================================
 
-/// Allocation prefix. Sits immediately before `HeapHeader` in every
-/// block. 16-byte aligned (both because `Block` itself is 16 bytes and
-/// because the allocator is asked for 16-byte alignment at alloc time),
-/// so `block.header` lands at a 16-byte boundary too.
-const Block = extern struct {
-    /// Singly-linked list of live blocks. Alloc prepends.
-    next: ?*Block align(16),
-    /// Total allocation bytes: `@sizeOf(Block) + body_size`. Stored so
-    /// `free` can reconstruct the backing slice for `allocator.free`.
-    total_size: usize,
-    /// User-visible header. HEAP.md §1.
-    header: HeapHeader,
-    // body follows.
+/// Every slab is this many bytes, aligned to its size, so the slab of
+/// a block is its address with the low bits cleared.
+pub const slab_bytes: usize = 256 * 1024;
+const slab_alignment: std.mem.Alignment = .fromByteUnits(slab_bytes);
 
-    comptime {
-        std.debug.assert(@sizeOf(Block) == 16 + 16);
-        std.debug.assert(@alignOf(Block) == 16);
-        std.debug.assert(@offsetOf(Block, "next") == 0);
-        std.debug.assert(@offsetOf(Block, "total_size") == 8);
-        std.debug.assert(@offsetOf(Block, "header") == 16);
+/// The largest block, header included, a slab holds; a larger one is
+/// a large block from the backing allocator.
+pub const max_small_block: usize = 8192;
+
+/// Block sizes, header included: every multiple of 16 to 528 (a
+/// 32-value vector leaf), every multiple of 32 to 1072 (a 32-entry
+/// CHAMP node), then steps of an eighth.
+const class_sizes: []const u32 = blk: {
+    @setEvalBranchQuota(10_000);
+    var sizes: []const u32 = &.{};
+    var s: u32 = 16;
+    while (s < max_small_block) {
+        sizes = sizes ++ &[_]u32{s};
+        s += if (s < 528) 16 else if (s < 1072) 32 else std.mem.alignForward(u32, s / 8, 16);
+    }
+    break :blk sizes ++ &[_]u32{max_small_block};
+};
+pub const class_count = class_sizes.len;
+
+/// Where a class's slots sit in a slab: after the slab header and one
+/// `u16` body size per slot. `recip` is `ceil(2^32 / size)`, so a
+/// slot's offset times it, shifted down 32, is its index (exact while
+/// an offset times `size` stays below 2^32).
+const ClassInfo = struct { size: u32, slots: u32, first: u32, recip: u64 };
+
+const slab_header_bytes: usize = std.mem.alignForward(usize, @sizeOf(Slab), 16);
+
+const class_info: [class_count]ClassInfo = blk: {
+    @setEvalBranchQuota(100_000);
+    var infos: [class_count]ClassInfo = undefined;
+    for (class_sizes, &infos) |size, *info| {
+        var slots: usize = (slab_bytes - slab_header_bytes) / (size + 2);
+        while (std.mem.alignForward(usize, slab_header_bytes + 2 * slots, 16) + slots * size > slab_bytes) slots -= 1;
+        info.* = .{
+            .size = size,
+            .slots = @intCast(slots),
+            .first = @intCast(std.mem.alignForward(usize, slab_header_bytes + 2 * slots, 16)),
+            .recip = ((@as(u64, 1) << 32) + size - 1) / size,
+        };
+    }
+    break :blk infos;
+};
+
+/// The smallest class holding a block of `n * 16` bytes, for `n` up to
+/// `max_small_block / 16`.
+const class_of: [max_small_block / 16 + 1]u8 = blk: {
+    @setEvalBranchQuota(10_000);
+    var table: [max_small_block / 16 + 1]u8 = undefined;
+    var c: usize = 0;
+    for (&table, 0..) |*slot, n| {
+        while (class_sizes[c] < n * 16) c += 1;
+        slot.* = @intCast(c);
+    }
+    break :blk table;
+};
+
+comptime {
+    std.debug.assert(class_count <= 256);
+    for (class_info) |info| std.debug.assert(info.slots >= 16 and info.size % 16 == 0);
+}
+
+/// A slab's header, at its start; the body sizes of its slots follow,
+/// then the slots.
+const Slab = struct {
+    /// The next slab of the same class.
+    next: ?*Slab,
+    class: u8,
+    /// Slots handed out at least once; the rest have never been used.
+    bump: u32,
+    /// Slots holding a block.
+    live: u32,
+
+    inline fn of(h: *const HeapHeader) *Slab {
+        return @ptrFromInt(@intFromPtr(h) & ~(slab_bytes - 1));
+    }
+
+    inline fn info(self: *const Slab) ClassInfo {
+        return class_info[self.class];
+    }
+
+    inline fn sizes(self: *Slab) [*]u16 {
+        return @ptrFromInt(@intFromPtr(self) + slab_header_bytes);
+    }
+
+    inline fn slot(self: *Slab, i: usize) *HeapHeader {
+        const in = self.info();
+        return @ptrFromInt(@intFromPtr(self) + in.first + i * in.size);
+    }
+
+    inline fn indexOf(self: *Slab, h: *const HeapHeader) usize {
+        const in = self.info();
+        return @intCast(((@intFromPtr(h) - @intFromPtr(self) - in.first) * in.recip) >> 32);
     }
 };
 
-const header_and_body_offset: usize = @sizeOf(Block);
+/// The prefix of a large block; its header follows.
+const Large = extern struct {
+    next: ?*Large align(16),
+    /// The allocation's length, prefix included.
+    len: usize,
+    /// The body's length.
+    body: usize,
+    _pad: usize = 0,
 
-/// Debug sentinel written to `block.header.kind` at free time, used to
-/// detect double-free on subsequent free attempts. Chosen outside the
-/// valid `Kind` range (0..255 valid) but inside the u16 space.
-const poisoned_kind: u16 = 0xDEAD;
+    comptime {
+        std.debug.assert(@sizeOf(Large) == 32);
+    }
 
-inline fn blockOf(h: *HeapHeader) *Block {
-    return @fieldParentPtr("header", h);
+    inline fn of(h: *HeapHeader) *Large {
+        return @ptrFromInt(@intFromPtr(h) - @sizeOf(Large));
+    }
+
+    inline fn header(self: *Large) *HeapHeader {
+        return @ptrFromInt(@intFromPtr(self) + @sizeOf(Large));
+    }
+
+    fn bytes(self: *Large) []align(16) u8 {
+        const ptr: [*]align(16) u8 = @ptrCast(self);
+        return ptr[0..self.len];
+    }
+};
+
+inline fn isLarge(h: *const HeapHeader) bool {
+    return h.mark & mark_bit_large != 0;
+}
+
+/// Slabs come from the operating system, not the backing allocator,
+/// so an empty one handed back leaves the resident set (HEAP.md §2).
+const slab_source = std.heap.page_allocator;
+
+/// The slabs of heaps that ended, kept for the next heap, at most
+/// `pooled_slabs_max` for the process. Heaps on several threads share
+/// it through a try-lock and skip it when another holds the lock, so
+/// none ever waits.
+const SlabPool = struct {
+    lock: std.atomic.Mutex = .unlocked,
+    head: ?*Slab = null,
+    count: usize = 0,
+};
+
+var slab_pool: SlabPool = .{};
+
+pub const pooled_slabs_max = 64;
+
+fn takePooledSlab() ?*Slab {
+    if (!slab_pool.lock.tryLock()) return null;
+    defer slab_pool.lock.unlock();
+    const s = slab_pool.head orelse return null;
+    slab_pool.head = s.next;
+    slab_pool.count -= 1;
+    return s;
+}
+
+/// Pool a slab a heap gives up at its end, or hand it back to the
+/// operating system when the pool is full or busy.
+fn poolSlab(s: *Slab) void {
+    if (slab_pool.lock.tryLock()) {
+        defer slab_pool.lock.unlock();
+        if (slab_pool.count < pooled_slabs_max) {
+            s.next = slab_pool.head;
+            slab_pool.head = s;
+            slab_pool.count += 1;
+            return;
+        }
+    }
+    Heap.freeSlab(s);
 }
 
 // =============================================================================
@@ -196,9 +372,18 @@ inline fn blockOf(h: *HeapHeader) *Block {
 // =============================================================================
 
 pub const Heap = struct {
+    /// Large blocks and the collector's worklist come from here.
     backing: Allocator,
-    live_head: ?*Block = null,
-    /// Bytes held by every live block, header and body included.
+    classes: [class_count]Class = @splat(.{}),
+    large_head: ?*Large = null,
+    /// Empty slabs kept for the next class that needs one, linked
+    /// through `next` (`sweepUnmarked` says how many).
+    empty_slabs: ?*Slab = null,
+    empty_slab_count: usize = 0,
+    /// Slabs held, the empty ones kept included.
+    slab_count: usize = 0,
+    /// Bytes held by every live block: its class's size for a slab
+    /// block, the allocation's length for a large one.
     live_bytes: usize = 0,
     /// The largest `live_bytes` has been: the high-water mark a
     /// bounded-memory test asserts against.
@@ -206,20 +391,50 @@ pub const Heap = struct {
     /// Bytes allocated since `resetAllocationCounter`: what the
     /// collector's trigger compares against its threshold.
     allocated_since_collect: usize = 0,
+    /// The last edit token a transient on this heap took, at most
+    /// `edit_token_max` (`docs/TRANSIENT.md` §4).
+    edit_clock: u32 = 0,
+
+    const Class = struct {
+        /// Free slots of the class's slabs, linked through `meta`.
+        free: ?*HeapHeader = null,
+        /// The slab never-used slots are carved from.
+        carving: ?*Slab = null,
+        /// Every slab of the class.
+        slabs: ?*Slab = null,
+    };
+
+    /// A sweep keeps as many empty slabs as slabs still in use, and
+    /// at least this many (16 MiB, the collector's default trigger:
+    /// what a program allocates between two cycles), and hands the
+    /// rest back. A steady workload then refills kept slabs instead of
+    /// mapping fresh ones each cycle; a live set that shrinks gives
+    /// its memory back.
+    pub const empty_slabs_kept_min = 64;
 
     pub fn init(backing: Allocator) Heap {
         return .{ .backing = backing };
     }
 
-    /// Frees every block still on the live list. Typically called at
-    /// runtime teardown. After this call the Heap is unusable.
+    /// Frees every block, and pools or hands back every slab. After
+    /// this call the Heap is unusable.
     pub fn deinit(self: *Heap) void {
-        var cur = self.live_head;
-        while (cur) |b| {
-            const next = b.next;
-            const slice = blockSlice(b);
-            self.backing.free(slice);
-            cur = next;
+        for (&self.classes) |*cls| {
+            var cur = cls.slabs;
+            while (cur) |s| {
+                cur = s.next;
+                poolSlab(s);
+            }
+        }
+        var empty = self.empty_slabs;
+        while (empty) |s| {
+            empty = s.next;
+            poolSlab(s);
+        }
+        var large = self.large_head;
+        while (large) |l| {
+            large = l.next;
+            self.backing.free(l.bytes());
         }
         self.* = undefined;
     }
@@ -239,29 +454,96 @@ pub const Heap = struct {
 
     pub fn alloc(self: *Heap, kind: value.Kind, body_size: usize) !*HeapHeader {
         std.debug.assert(kind.isHeap() or kind == .cell_internal);
-        // Overflow-safe: on a 32-bit usize + near-maxInt body_size we'd
-        // wrap and under-allocate silently in non-safe release builds.
-        // `std.math.add` returns `error.Overflow`; the caller's error
-        // set subsumes it via the inferred `!*HeapHeader`.
-        const total = try std.math.add(usize, header_and_body_offset, body_size);
-        const buf = try self.backing.alignedAlloc(u8, .@"16", total);
-        // Zero-init the whole allocation so downstream code can rely on
-        // header.mark == 0, header.flags == 0, header.hash == 0 (uncomputed),
-        // header.meta == null, and all body bytes == 0. The kind byte
-        // overwrites the zero immediately below.
+        const total = try std.math.add(usize, @sizeOf(HeapHeader), body_size);
+        const h = if (total <= max_small_block) try self.allocSmall(total) else try self.allocLarge(body_size);
+        h.kind = @intFromEnum(kind);
+        return h;
+    }
+
+    inline fn allocSmall(self: *Heap, total: usize) !*HeapHeader {
+        const c = class_of[(total + 15) >> 4];
+        const cls = &self.classes[c];
+        const h = if (cls.free) |f| blk: {
+            cls.free = f.meta;
+            break :blk f;
+        } else try self.carve(c);
+        const slab = Slab.of(h);
+        slab.live += 1;
+        slab.sizes()[slab.indexOf(h)] = @intCast(total - @sizeOf(HeapHeader));
+        const bytes: [*]align(16) u8 = @ptrCast(h);
+        @memset(bytes[0..std.mem.alignForward(usize, total, 16)], 0);
+        self.count(class_info[c].size);
+        return h;
+    }
+
+    fn carve(self: *Heap, c: u8) !*HeapHeader {
+        const cls = &self.classes[c];
+        const slab = if (cls.carving) |s| (if (s.bump < class_info[c].slots) s else try self.newSlab(c)) else try self.newSlab(c);
+        slab.bump += 1;
+        return slab.slot(slab.bump - 1);
+    }
+
+    fn newSlab(self: *Heap, c: u8) !*Slab {
+        const slab: *Slab = if (self.empty_slabs) |s| blk: {
+            self.empty_slabs = s.next;
+            self.empty_slab_count -= 1;
+            break :blk s;
+        } else blk: {
+            const s = takePooledSlab() orelse fresh: {
+                const mem = try slab_source.alignedAlloc(u8, slab_alignment, slab_bytes);
+                break :fresh @as(*Slab, @ptrCast(mem.ptr));
+            };
+            self.slab_count += 1;
+            break :blk s;
+        };
+        const cls = &self.classes[c];
+        slab.* = .{ .next = cls.slabs, .class = c, .bump = 0, .live = 0 };
+        cls.slabs = slab;
+        cls.carving = slab;
+        return slab;
+    }
+
+    fn freeSlab(s: *Slab) void {
+        const ptr: [*]align(slab_bytes) u8 = @ptrCast(@alignCast(s));
+        slab_source.free(@as([]align(slab_bytes) u8, ptr[0..slab_bytes]));
+    }
+
+    fn keepEmptySlab(self: *Heap, s: *Slab) void {
+        s.next = self.empty_slabs;
+        self.empty_slabs = s;
+        self.empty_slab_count += 1;
+    }
+
+    /// Hand back the empty slabs past what `empty_slabs_kept_min`
+    /// allows.
+    fn trimEmptySlabs(self: *Heap) void {
+        const keep = @max(empty_slabs_kept_min, self.slab_count - self.empty_slab_count);
+        while (self.empty_slab_count > keep) {
+            const s = self.empty_slabs.?;
+            self.empty_slabs = s.next;
+            self.empty_slab_count -= 1;
+            self.slab_count -= 1;
+            freeSlab(s);
+        }
+    }
+
+    fn allocLarge(self: *Heap, body_size: usize) !*HeapHeader {
+        const len = try std.math.add(usize, @sizeOf(Large) + @sizeOf(HeapHeader), body_size);
+        const buf = try self.backing.alignedAlloc(u8, .@"16", len);
         @memset(buf, 0);
+        const large: *Large = @ptrCast(buf.ptr);
+        large.* = .{ .next = self.large_head, .len = len, .body = body_size };
+        self.large_head = large;
+        const h = large.header();
+        h.mark = mark_bit_large;
+        self.count(len);
+        return h;
+    }
 
-        const block: *Block = @ptrCast(buf.ptr);
-        block.next = self.live_head;
-        block.total_size = total;
-        block.header.kind = @intFromEnum(kind);
-        // mark / flags / hash / meta are already 0 from the memset.
-
-        self.live_head = block;
-        self.live_bytes += total;
+    inline fn count(self: *Heap, bytes: usize) void {
+        self.live_bytes += bytes;
         if (self.live_bytes > self.peak_live_bytes) self.peak_live_bytes = self.live_bytes;
-        self.allocated_since_collect += total;
-        return &block.header;
+        self.allocated_since_collect += bytes;
     }
 
     /// Start a new allocation-counting window; the collector calls
@@ -271,37 +553,27 @@ pub const Heap = struct {
     }
 
     pub fn free(self: *Heap, h: *HeapHeader) void {
-        const block = blockOf(h);
-
-        if (std.debug.runtime_safety) {
-            if (h.kind == poisoned_kind) {
-                std.debug.panic("heap.free: double-free detected on *HeapHeader {*}", .{h});
-            }
+        if (std.debug.runtime_safety and h.kind == poisoned_kind) {
+            std.debug.panic("heap.free: double-free detected on *HeapHeader {*}", .{h});
         }
-
-        // Unlink from the live list. O(n): the live list is singly
-        // linked.
-        if (self.live_head == block) {
-            self.live_head = block.next;
-        } else {
-            var prev: *Block = self.live_head orelse {
-                std.debug.panic("heap.free: block {*} not on any live list (empty heap)", .{block});
-            };
-            while (prev.next) |next| {
-                if (next == block) {
-                    prev.next = block.next;
-                    break;
-                }
-                prev = next;
-            } else {
-                std.debug.panic("heap.free: block {*} not found on live list", .{block});
-            }
+        if (isLarge(h)) {
+            const large = Large.of(h);
+            var link = &self.large_head;
+            while (link.*) |l| : (link = &l.next) {
+                if (l == large) break;
+            } else std.debug.panic("heap.free: block {*} not found among the large blocks", .{h});
+            link.* = large.next;
+            self.live_bytes -= large.len;
+            self.backing.free(large.bytes());
+            return;
         }
-
+        const slab = Slab.of(h);
+        const cls = &self.classes[slab.class];
         h.kind = poisoned_kind;
-        const slice = blockSlice(block);
-        self.live_bytes -= slice.len;
-        self.backing.free(slice);
+        h.meta = cls.free;
+        cls.free = h;
+        slab.live -= 1;
+        self.live_bytes -= slab.info().size;
     }
 
     // ---- Body accessors ----
@@ -317,11 +589,42 @@ pub const Heap = struct {
         return @ptrCast(@alignCast(body_ptr));
     }
 
+    /// The body, as long as `alloc` or the last `resizeInPlace` made it.
     pub fn bodyBytes(h: *HeapHeader) []u8 {
-        const block = blockOf(h);
-        const body_len = block.total_size - header_and_body_offset;
         const body_ptr: [*]u8 = @as([*]u8, @ptrCast(h)) + @sizeOf(HeapHeader);
-        return body_ptr[0..body_len];
+        return body_ptr[0..bodySize(h)];
+    }
+
+    pub fn bodySize(h: *HeapHeader) usize {
+        if (isLarge(h)) return Large.of(h).body;
+        const slab = Slab.of(h);
+        return slab.sizes()[slab.indexOf(h)];
+    }
+
+    /// The longest body `resizeInPlace` can give the block.
+    pub fn bodyCapacity(h: *HeapHeader) usize {
+        if (isLarge(h)) return Large.of(h).len - @sizeOf(Large) - @sizeOf(HeapHeader);
+        return Slab.of(h).info().size - @sizeOf(HeapHeader);
+    }
+
+    /// Give the block a body of `new_size` bytes where it stands, when
+    /// its capacity allows; bytes a longer body gains are zero. False,
+    /// and nothing changed, otherwise.
+    pub fn resizeInPlace(h: *HeapHeader, new_size: usize) bool {
+        if (new_size > bodyCapacity(h)) return false;
+        const old = bodySize(h);
+        if (new_size > old) @memset(bodyBytesAt(h)[old..new_size], 0);
+        if (isLarge(h)) {
+            Large.of(h).body = new_size;
+        } else {
+            const slab = Slab.of(h);
+            slab.sizes()[slab.indexOf(h)] = @intCast(new_size);
+        }
+        return true;
+    }
+
+    inline fn bodyBytesAt(h: *HeapHeader) [*]u8 {
+        return @as([*]u8, @ptrCast(h)) + @sizeOf(HeapHeader);
     }
 
     // ---- Value ↔ *HeapHeader ----
@@ -351,8 +654,12 @@ pub const Heap = struct {
 
     pub fn liveCount(self: *const Heap) usize {
         var n: usize = 0;
-        var cur = self.live_head;
-        while (cur) |b| : (cur = b.next) n += 1;
+        for (self.classes) |cls| {
+            var cur = cls.slabs;
+            while (cur) |s| : (cur = s.next) n += s.live;
+        }
+        var large = self.large_head;
+        while (large) |l| : (large = l.next) n += 1;
         return n;
     }
 
@@ -362,55 +669,102 @@ pub const Heap = struct {
     /// `heap.free` / `heap.alloc` / `heap.sweepUnmarked` during the
     /// walk; mutation invalidates the iterator.
     pub fn forEachLive(self: *const Heap, visitor: anytype) void {
-        var cur = self.live_head;
-        while (cur) |b| {
-            const next = b.next;
-            visitor.visit(&b.header);
-            cur = next;
+        for (self.classes) |cls| {
+            var cur = cls.slabs;
+            while (cur) |s| : (cur = s.next) {
+                for (0..s.bump) |i| {
+                    const h = s.slot(i);
+                    if (h.kind != poisoned_kind) visitor.visit(h);
+                }
+            }
         }
+        var large = self.large_head;
+        while (large) |l| : (large = l.next) visitor.visit(l.header());
     }
 
-    // ---- Minimal sweep ----
+    /// Clear the `marked` bit of every live block: what a cycle that
+    /// cannot finish its marking leaves behind (GC.md §4).
+    pub fn clearMarks(self: *Heap) void {
+        const Clear = struct {
+            pub fn visit(_: @This(), h: *HeapHeader) void {
+                h.clearMarked();
+            }
+        };
+        self.forEachLive(Clear{});
+    }
+
+    // ---- Sweep ----
 
     /// Free every block with `marked == 0`. Clear the `marked` bit on
     /// survivors so the next cycle starts fresh. Does NOT enumerate
     /// roots or trace reachability — that's `gc.zig`'s job. Returns the
-    /// number of blocks freed.
+    /// number of blocks freed. Rebuilds each class's free list in
+    /// address order within a slab, and keeps or hands back every
+    /// slab left empty (HEAP.md §2).
     ///
     /// `pinned` blocks survive regardless of mark state (GC.md §3); no
     /// runtime module pins a block, only tests do.
     pub fn sweepUnmarked(self: *Heap) usize {
         var freed: usize = 0;
-        var prev: ?*Block = null;
-        var cur = self.live_head;
-        while (cur) |b| {
-            const next = b.next;
-            const survive = b.header.isMarked() or b.header.isPinned();
-            if (survive) {
-                b.header.clearMarked();
-                prev = b;
-            } else {
-                if (prev) |p| p.next = next else self.live_head = next;
-                b.header.kind = poisoned_kind;
-                const slice = blockSlice(b);
-                self.live_bytes -= slice.len;
-                self.backing.free(slice);
-                freed += 1;
+        const keep = mark_bit_marked | mark_bit_pinned;
+        for (&self.classes) |*cls| {
+            cls.free = null;
+            var link = &cls.slabs;
+            while (link.*) |slab| {
+                const size = slab.info().size;
+                var live: u32 = 0;
+                var head: ?*HeapHeader = null;
+                var tail: ?*HeapHeader = null;
+                var i = slab.bump;
+                while (i > 0) {
+                    i -= 1;
+                    const h = slab.slot(i);
+                    if (h.kind != poisoned_kind) {
+                        if (h.mark & keep != 0) {
+                            h.mark &= ~mark_bit_marked;
+                            live += 1;
+                            continue;
+                        }
+                        h.kind = poisoned_kind;
+                        freed += 1;
+                        self.live_bytes -= size;
+                    }
+                    h.meta = head;
+                    head = h;
+                    if (tail == null) tail = h;
+                }
+                slab.live = live;
+                if (live == 0) {
+                    link.* = slab.next;
+                    if (cls.carving == slab) cls.carving = null;
+                    self.keepEmptySlab(slab);
+                    continue;
+                }
+                if (tail) |t| {
+                    t.meta = cls.free;
+                    cls.free = head;
+                }
+                link = &slab.next;
             }
-            cur = next;
         }
+        var link = &self.large_head;
+        while (link.*) |l| {
+            const h = l.header();
+            if (h.mark & keep != 0) {
+                h.mark &= ~mark_bit_marked;
+                link = &l.next;
+                continue;
+            }
+            link.* = l.next;
+            h.kind = poisoned_kind;
+            self.live_bytes -= l.len;
+            self.backing.free(l.bytes());
+            freed += 1;
+        }
+        self.trimEmptySlabs();
         return freed;
     }
 };
-
-// =============================================================================
-// Private helpers
-// =============================================================================
-
-fn blockSlice(b: *Block) []align(16) u8 {
-    const ptr: [*]align(16) u8 = @ptrCast(b);
-    return ptr[0..b.total_size];
-}
 
 // =============================================================================
 // Tests — storage-layout, alloc/free, enumeration, sweep smoke test.
@@ -427,9 +781,24 @@ test "HeapHeader layout is exactly HEAP.md §1" {
     try testing.expectEqual(@as(usize, 8), @offsetOf(HeapHeader, "meta"));
 }
 
-test "Block prefix is 16 bytes; header lands 16 bytes in" {
-    try testing.expectEqual(@as(usize, 32), @sizeOf(Block));
-    try testing.expectEqual(@as(usize, 16), @offsetOf(Block, "header"));
+test "size classes: 16-byte steps to a vector leaf, every block fits its class, slots fit their slab" {
+    try testing.expectEqual(@as(u32, 16), class_sizes[0]);
+    try testing.expectEqual(@as(u32, 528), class_sizes[class_of[528 / 16]]);
+    try testing.expectEqual(@as(u32, max_small_block), class_sizes[class_count - 1]);
+    for (1..max_small_block + 1) |total| {
+        const size = class_sizes[class_of[(total + 15) >> 4]];
+        try testing.expect(size >= total);
+        if (total <= 528) try testing.expect(size - total < 16);
+        if (total > 1072) try testing.expect(size - total <= total / 8 + 16);
+    }
+    for (class_info) |info| {
+        try testing.expect(info.first >= slab_header_bytes + 2 * info.slots);
+        try testing.expect(info.first + info.slots * info.size <= slab_bytes);
+        for (0..info.slots) |i| {
+            const off: u64 = i * info.size;
+            try testing.expectEqual(i, @as(usize, @intCast((off * info.recip) >> 32)));
+        }
+    }
 }
 
 test "Heap.init/deinit on empty heap" {
@@ -802,16 +1171,17 @@ test "byte counters: alloc adds, free and sweep subtract, peak holds, the window
     defer heap.deinit();
     try testing.expectEqual(@as(usize, 0), heap.live_bytes);
 
+    // A block counts its class's size: 16 + 16 and 16 + 48 bytes fill
+    // the 32- and 64-byte classes exactly.
     const a = try heap.alloc(.string, 16);
     const b = try heap.alloc(.string, 48);
-    const per = header_and_body_offset;
-    try testing.expectEqual(per * 2 + 64, heap.live_bytes);
-    try testing.expectEqual(per * 2 + 64, heap.peak_live_bytes);
-    try testing.expectEqual(per * 2 + 64, heap.allocated_since_collect);
+    try testing.expectEqual(@as(usize, 96), heap.live_bytes);
+    try testing.expectEqual(@as(usize, 96), heap.peak_live_bytes);
+    try testing.expectEqual(@as(usize, 96), heap.allocated_since_collect);
 
     heap.free(b);
-    try testing.expectEqual(per + 16, heap.live_bytes);
-    try testing.expectEqual(per * 2 + 64, heap.peak_live_bytes);
+    try testing.expectEqual(@as(usize, 32), heap.live_bytes);
+    try testing.expectEqual(@as(usize, 96), heap.peak_live_bytes);
 
     heap.resetAllocationCounter();
     try testing.expectEqual(@as(usize, 0), heap.allocated_since_collect);
@@ -819,8 +1189,161 @@ test "byte counters: alloc adds, free and sweep subtract, peak holds, the window
     _ = try heap.alloc(.list, 0); // unmarked: swept
     a.setMarked();
     _ = heap.sweepUnmarked();
-    try testing.expectEqual(per + 16, heap.live_bytes);
-    try testing.expectEqual(per, heap.allocated_since_collect);
+    try testing.expectEqual(@as(usize, 32), heap.live_bytes);
+    try testing.expectEqual(@as(usize, 16), heap.allocated_since_collect);
+
+    // A large block counts its allocation, prefix included.
+    const big = try heap.alloc(.string, max_small_block);
+    try testing.expectEqual(@as(usize, 32 + @sizeOf(Large) + 16 + max_small_block), heap.live_bytes);
+    heap.free(big);
+    try testing.expectEqual(@as(usize, 32), heap.live_bytes);
+}
+
+test "bodyBytes: the exact size asked for, in every class and for a large block" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var sizes: [40]usize = undefined;
+    var hs: [40]*HeapHeader = undefined;
+    for (&sizes, &hs, 0..) |*n, *h, i| {
+        n.* = i * 331 % (max_small_block + 100);
+        h.* = try heap.alloc(.string, n.*);
+        @memset(Heap.bodyBytes(h.*), @intCast(i));
+    }
+    for (sizes, hs, 0..) |n, h, i| {
+        try testing.expectEqual(n, Heap.bodyBytes(h).len);
+        for (Heap.bodyBytes(h)) |byte| try testing.expectEqual(@as(u8, @intCast(i)), byte);
+        try testing.expect(Heap.bodyCapacity(h) >= n);
+    }
+}
+
+test "resizeInPlace: grows within the class with zeroed bytes, shrinks, refuses past the capacity" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const h = try heap.alloc(.persistent_map, 40); // class 64: capacity 48
+    @memset(Heap.bodyBytes(h), 7);
+    try testing.expectEqual(@as(usize, 48), Heap.bodyCapacity(h));
+    try testing.expect(Heap.resizeInPlace(h, 24));
+    try testing.expectEqual(@as(usize, 24), Heap.bodyBytes(h).len);
+    try testing.expect(Heap.resizeInPlace(h, 48));
+    for (Heap.bodyBytes(h)[0..24]) |byte| try testing.expectEqual(@as(u8, 7), byte);
+    for (Heap.bodyBytes(h)[24..]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expect(!Heap.resizeInPlace(h, 49));
+    try testing.expectEqual(@as(usize, 48), Heap.bodyBytes(h).len);
+
+    const big = try heap.alloc(.string, 10_000);
+    try testing.expect(Heap.resizeInPlace(big, 9_000));
+    try testing.expectEqual(@as(usize, 9_000), Heap.bodyBytes(big).len);
+    try testing.expect(Heap.resizeInPlace(big, 10_000));
+    try testing.expect(!Heap.resizeInPlace(big, 10_001));
+}
+
+test "slabs: a freed slot is reused, a sweep hands empty slabs back beyond the ones it keeps" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const per_slab = class_info[class_of[528 / 16]].slots;
+    // A hundred slabs of vector-leaf-sized blocks.
+    const n = per_slab * 100;
+    var keep: ?*HeapHeader = null;
+    for (0..n) |i| {
+        const h = try heap.alloc(.persistent_vector, 512);
+        if (i == n / 2) keep = h;
+    }
+    try testing.expectEqual(@as(usize, 100), heap.slab_count);
+    try testing.expectEqual(n, heap.liveCount());
+
+    // Everything but one block is garbage: one slab stays, the
+    // minimum of empty ones is kept, the rest go back.
+    keep.?.setMarked();
+    try testing.expectEqual(n - 1, heap.sweepUnmarked());
+    try testing.expectEqual(@as(usize, 1), heap.liveCount());
+    try testing.expectEqual(@as(usize, 1 + Heap.empty_slabs_kept_min), heap.slab_count);
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
+
+    // The survivor's slab serves the next allocations from its free
+    // slots before any kept slab is taken.
+    const again = try heap.alloc(.persistent_vector, 512);
+    try testing.expectEqual(Slab.of(keep.?), Slab.of(again));
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
+
+    // A freed block's slot is the next one handed out in its class.
+    heap.free(again);
+    try testing.expectEqual(again, try heap.alloc(.persistent_vector, 500));
+}
+
+test "slabs: a sweep keeps as many empty slabs as are in use, and hands the rest back once the live set shrinks" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const per_slab = class_info[class_of[528 / 16]].slots;
+    var held: std.ArrayList(*HeapHeader) = .empty;
+    defer held.deinit(testing.allocator);
+    // Three hundred slabs; one block of each of the first two hundred
+    // survives.
+    for (0..per_slab * 300) |i| {
+        const h = try heap.alloc(.persistent_vector, 512);
+        if (i < per_slab * 200 and i % per_slab == 0) try held.append(testing.allocator, h);
+    }
+    for (held.items) |h| h.setMarked();
+    _ = heap.sweepUnmarked();
+    try testing.expectEqual(@as(usize, 300), heap.slab_count);
+    try testing.expectEqual(@as(usize, 100), heap.empty_slab_count);
+    // Nothing survives: all but the minimum go back.
+    _ = heap.sweepUnmarked();
+    try testing.expectEqual(@as(usize, 0), heap.liveCount());
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.slab_count);
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
+}
+
+test "slabs: a heap that ends leaves its slabs to the next heap, up to the pool's bound" {
+    // Room in the pool for this test's two slabs.
+    while (slab_pool.count > pooled_slabs_max - 2) Heap.freeSlab(takePooledSlab().?);
+    var a = Heap.init(testing.allocator);
+    _ = try a.alloc(.string, 8);
+    _ = try a.alloc(.persistent_vector, 512);
+    try testing.expectEqual(@as(usize, 2), a.slab_count);
+    const slab = Slab.of(try a.alloc(.string, 8));
+    const before = slab_pool.count;
+    a.deinit();
+    try testing.expectEqual(before + 2, slab_pool.count);
+    var b = Heap.init(testing.allocator);
+    defer b.deinit();
+    const h = try b.alloc(.list, 32);
+    try testing.expectEqual(before + 1, slab_pool.count);
+    try testing.expect(Slab.of(h) == slab or slab_pool.head.? == slab);
+    try testing.expectEqual(@as(u8, 0), h.mark);
+    for (Heap.bodyBytes(h)) |byte| try testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "slabs: a sweep keeps pinned and marked slots and every class stays consistent" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var hs: std.ArrayList(*HeapHeader) = .empty;
+    defer hs.deinit(testing.allocator);
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    const r = rng.random();
+    for (0..20_000) |_| try hs.append(testing.allocator, try heap.alloc(.string, r.uintLessThan(usize, 2 * max_small_block)));
+    for (0..4) |round| {
+        var survivors: usize = 0;
+        for (hs.items, 0..) |h, i| {
+            if ((i + round) % 3 == 0) {
+                h.setMarked();
+                survivors += 1;
+            }
+        }
+        _ = heap.sweepUnmarked();
+        try testing.expectEqual(survivors, heap.liveCount());
+        // Keep the survivors, refill with fresh blocks.
+        var w: usize = 0;
+        for (hs.items, 0..) |h, i| {
+            if ((i + round) % 3 == 0) {
+                try testing.expect(!h.isMarked());
+                hs.items[w] = h;
+                w += 1;
+            }
+        }
+        hs.shrinkRetainingCapacity(w);
+        while (hs.items.len < 20_000) try hs.append(testing.allocator, try heap.alloc(.string, r.uintLessThan(usize, 2 * max_small_block)));
+        try testing.expectEqual(@as(usize, 20_000), heap.liveCount());
+    }
 }
 
 test "isBlockKind: pointer payloads the collector must not dereference" {

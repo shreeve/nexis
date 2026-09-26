@@ -148,12 +148,13 @@ inline fn afterHeader(h: *HeapHeader) [*]u8 {
 // =============================================================================
 
 /// Key equality with two shortcuts ahead of `elementEq` (CHAMP.md
-/// §6.5): bit identity, and interned-id identity for two keywords.
+/// §6.5): bit identity, and an immediate on either side compared
+/// inline, since an immediate is `=` only to an immediate of its kind.
 inline fn keyEquivalent(a: Value, b: Value, elementEq: ElementEq) bool {
     if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() == .keyword and b.kind() == .keyword) {
-        return a.asKeywordId() == b.asKeywordId();
-    }
+    const a_heap = a.kind().isHeap();
+    const b_heap = b.kind().isHeap();
+    if (!a_heap or !b_heap) return !a_heap and !b_heap and a.equalImmediate(b);
     return elementEq(a, b);
 }
 
@@ -267,19 +268,38 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             return h;
         }
 
-        fn allocInterior(heap: *Heap, data_bitmap: u32, node_bitmap: u32) !*HeapHeader {
-            std.debug.assert(data_bitmap & node_bitmap == 0);
-            const size = @sizeOf(InteriorHeader) +
+        /// Room a node an edit grows keeps past its body, so the next
+        /// payloads it gains land in place (TRANSIENT.md §1). A node
+        /// an edit makes at its final size (a copy, a split's pair)
+        /// keeps none.
+        const edit_slack = 2 * @sizeOf(P);
+
+        /// A node of `size` body bytes with `spare` more bytes of room;
+        /// one an edit allocates (`edit` nonzero) carries its token.
+        fn allocNode(heap: *Heap, size: usize, edit: u32, spare: usize) !*HeapHeader {
+            if (edit == 0) return heap.alloc(kind, size);
+            const h = try heap.alloc(kind, size + spare);
+            if (spare > 0) _ = Heap.resizeInPlace(h, size);
+            heap_mod.stampEdit(h, edit);
+            return h;
+        }
+
+        inline fn interiorSize(data_bitmap: u32, node_bitmap: u32) usize {
+            return @sizeOf(InteriorHeader) +
                 @as(usize, @popCount(data_bitmap)) * @sizeOf(P) +
                 @as(usize, @popCount(node_bitmap)) * @sizeOf(*HeapHeader);
-            const h = try heap.alloc(kind, size);
+        }
+
+        fn allocInterior(heap: *Heap, data_bitmap: u32, node_bitmap: u32, edit: u32, spare: usize) !*HeapHeader {
+            std.debug.assert(data_bitmap & node_bitmap == 0);
+            const h = try allocNode(heap, interiorSize(data_bitmap, node_bitmap), edit, spare);
             headerOf(InteriorHeader, h).* = .{ .data_bitmap = data_bitmap, .node_bitmap = node_bitmap };
             return h;
         }
 
-        fn allocCollision(heap: *Heap, shared_hash: u32, n: usize) !*HeapHeader {
+        fn allocCollision(heap: *Heap, shared_hash: u32, n: usize, edit: u32) !*HeapHeader {
             std.debug.assert(n >= 2);
-            const h = try heap.alloc(kind, @sizeOf(CollisionHeader) + n * @sizeOf(P));
+            const h = try allocNode(heap, @sizeOf(CollisionHeader) + n * @sizeOf(P), edit, 0);
             headerOf(CollisionHeader, h).* = .{ .shared_hash = shared_hash, .count = @intCast(n) };
             return h;
         }
@@ -397,7 +417,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 for (ps, 0..) |old, i| items[i] = .{ .p = old, .hash = indexHashOf(keyOf(old), elementHash), .order = @intCast(i) };
                 items[array_map_max] = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = array_map_max };
                 std.mem.sortUnstable(Item, &items, {}, Item.lessThan);
-                return newRoot(heap, items.len, try build(heap, &items, 0));
+                return newRoot(heap, items.len, try build(heap, &items, 0, 0));
             }
             const root = headerOf(RootBody, h);
             var added = false;
@@ -423,13 +443,13 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 for (ps, 0..) |old, i| {
                     if (!keyEquivalent(keyOf(old), keyOf(p), elementEq)) continue;
                     if (sameValue(old, p)) return node;
-                    const nh = try allocCollision(heap, hash32, ps.len);
+                    const nh = try allocCollision(heap, hash32, ps.len, 0);
                     @memcpy(collisionPayloads(nh), ps);
                     collisionPayloads(nh)[i] = replaced(old, p);
                     return nh;
                 }
                 added.* = true;
-                const nh = try allocCollision(heap, hash32, ps.len + 1);
+                const nh = try allocCollision(heap, hash32, ps.len + 1, 0);
                 splice(P, collisionPayloads(nh), ps, ps.len, false, p);
                 return nh;
             }
@@ -439,30 +459,30 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 const old = payloads(node)[dataIndex(hdr.data_bitmap, slot)];
                 if (keyEquivalent(keyOf(old), keyOf(p), elementEq)) {
                     if (sameValue(old, p)) return node;
-                    return withSlot(heap, node, slot, .{ .data = replaced(old, p) });
+                    return withSlot(heap, node, slot, .{ .data = replaced(old, p) }, 0);
                 }
                 // Two keys on one slot: they move into a subtree.
                 added.* = true;
-                const sub = try pair(heap, old, indexHashOf(keyOf(old), elementHash), p, hash32, shift + branch_bits);
-                return withSlot(heap, node, slot, .{ .child = sub });
+                const sub = try pair(heap, old, indexHashOf(keyOf(old), elementHash), p, hash32, shift + branch_bits, 0);
+                return withSlot(heap, node, slot, .{ .child = sub }, 0);
             }
             if (hdr.node_bitmap & bitOf(slot) != 0) {
                 const child = children(node)[childIndex(hdr.node_bitmap, slot)];
                 const new_child = try insertIn(heap, child, p, hash32, shift + branch_bits, elementHash, elementEq, added);
                 if (new_child == child) return node;
-                return withSlot(heap, node, slot, .{ .child = new_child });
+                return withSlot(heap, node, slot, .{ .child = new_child }, 0);
             }
             added.* = true;
-            return withSlot(heap, node, slot, .{ .data = p });
+            return withSlot(heap, node, slot, .{ .data = p }, 0);
         }
 
         /// The subtree at `shift` holding `a` and `b`, distinct keys
         /// whose hashes share the bits below `shift`: a collision node
         /// past the last level, else an interior with both inline or,
         /// when they share this level's slot too, one child.
-        fn pair(heap: *Heap, a: P, ha: u32, b: P, hb: u32, shift: u8) !*HeapHeader {
+        fn pair(heap: *Heap, a: P, ha: u32, b: P, hb: u32, shift: u8, edit: u32) !*HeapHeader {
             if (shift > MAX_TRIE_SHIFT) {
-                const h = try allocCollision(heap, ha, 2);
+                const h = try allocCollision(heap, ha, 2, edit);
                 collisionPayloads(h)[0] = a;
                 collisionPayloads(h)[1] = b;
                 return h;
@@ -470,11 +490,12 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const sa = slotOf(ha, shift);
             const sb = slotOf(hb, shift);
             if (sa == sb) {
-                const h = try allocInterior(heap, 0, bitOf(sa));
-                children(h)[0] = try pair(heap, a, ha, b, hb, shift + branch_bits);
+                const below = try pair(heap, a, ha, b, hb, shift + branch_bits, edit);
+                const h = try allocInterior(heap, 0, bitOf(sa), edit, 0);
+                children(h)[0] = below;
                 return h;
             }
-            const h = try allocInterior(heap, bitOf(sa) | bitOf(sb), 0);
+            const h = try allocInterior(heap, bitOf(sa) | bitOf(sb), 0, edit, 0);
             payloads(h)[@intFromBool(sa > sb)] = a;
             payloads(h)[@intFromBool(sb > sa)] = b;
             return h;
@@ -522,7 +543,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 for (ps, 0..) |old, i| {
                     if (!keyEquivalent(keyOf(old), key, elementEq)) continue;
                     if (ps.len == 2) return .{ .single = ps[1 - i] };
-                    const nh = try allocCollision(heap, hash32, ps.len - 1);
+                    const nh = try allocCollision(heap, hash32, ps.len - 1, 0);
                     splice(P, collisionPayloads(nh), ps, i, true, null);
                     return .{ .node = nh };
                 }
@@ -536,18 +557,18 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 if (shift > 0 and hdr.node_bitmap == 0 and @popCount(hdr.data_bitmap) == 2) {
                     return .{ .single = payloads(node)[1 - i] };
                 }
-                return .{ .node = try withSlot(heap, node, slot, .empty) };
+                return .{ .node = try withSlot(heap, node, slot, .empty, 0) };
             }
             if (hdr.node_bitmap & bitOf(slot) == 0) return null;
             const child = children(node)[childIndex(hdr.node_bitmap, slot)];
             return switch ((try removeIn(heap, child, key, hash32, shift + branch_bits, elementEq)) orelse return null) {
-                .node => |c| .{ .node = try withSlot(heap, node, slot, .{ .child = c }) },
+                .node => |c| .{ .node = try withSlot(heap, node, slot, .{ .child = c }, 0) },
                 // A node whose only content was that child would hold
                 // the lone payload itself: it passes further up.
                 .single => |p| if (shift > 0 and hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1)
                     .{ .single = p }
                 else
-                    .{ .node = try withSlot(heap, node, slot, .{ .data = p }) },
+                    .{ .node = try withSlot(heap, node, slot, .{ .data = p }, 0) },
             };
         }
 
@@ -555,7 +576,9 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         /// A copy of interior `src` with `slot` holding `new`: the one
         /// path-copy primitive every insert and remove goes through.
-        inline fn withSlot(heap: *Heap, src: *HeapHeader, slot: u32, new: Slot) !*HeapHeader {
+        /// An edit's copy carries its token and room to grow: an edit
+        /// copies a node here only to add a payload (`insertData`).
+        inline fn withSlot(heap: *Heap, src: *HeapHeader, slot: u32, new: Slot, edit: u32) !*HeapHeader {
             const hdr = headerOf(InteriorHeader, src).*;
             const bit = bitOf(slot);
             var data = hdr.data_bitmap & ~bit;
@@ -565,7 +588,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 .data => data |= bit,
                 .child => nodes |= bit,
             }
-            const h = try allocInterior(heap, data, nodes);
+            const h = try allocInterior(heap, data, nodes, edit, if (edit == 0) 0 else edit_slack);
             const put_data: ?P = switch (new) {
                 .data => |p| p,
                 else => null,
@@ -577,6 +600,353 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             splice(P, payloads(h), payloads(src), dataIndex(hdr.data_bitmap, slot), hdr.data_bitmap & bit != 0, put_data);
             splice(*HeapHeader, children(h), children(src), childIndex(hdr.node_bitmap, slot), hdr.node_bitmap & bit != 0, put_child);
             return h;
+        }
+
+        // ---- in-place edits (TRANSIENT.md §1) ----
+        //
+        // A transient owns its root and every node whose header `hash`
+        // holds its edit token. An edit is two steps: `locate` does
+        // every hash and comparison and changes nothing; `put` or
+        // `drop` then rewrites the owned nodes in place and copies any
+        // other node on the path once, stamping the copy. A caller can
+        // therefore look at what `locate` cost (a comparison past the
+        // stack guard, SEMANTICS §2.7) before anything changes. Both
+        // allocate before they write a node the collection reaches,
+        // so a failed allocation leaves the payloads as they were.
+        // The layout stays canonical (CHAMP.md §2.2): the same
+        // insert, promotion and lone-key pull-up as the persistent
+        // operations.
+
+        const At = enum {
+            /// The key is stored: `index` in the last node.
+            present,
+            /// An empty slot of the last interior.
+            empty_slot,
+            /// The last interior's slot holds `old`, another key.
+            split,
+            /// The last node is a collision node without the key.
+            collision_append,
+            /// An array form with room.
+            array_append,
+            /// A full array form: `hashes` are its payloads'.
+            promote,
+        };
+
+        /// What `locate` found: the nodes from the root interior down
+        /// to where the key is or would go (`path[k]` reached at shift
+        /// `5k`, a collision node past `MAX_TRIE_SHIFT`).
+        pub const Spot = struct {
+            at: At,
+            hash32: u32 = 0,
+            len: u8 = 0,
+            path: [8]*HeapHeader = undefined,
+            index: usize = 0,
+            /// The stored payload (`present`) or the occupant (`split`).
+            old: P = undefined,
+            other_hash: u32 = 0,
+            hashes: [array_map_max]u32 = undefined,
+        };
+
+        fn locate(v: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) Spot {
+            const h = rootHeader(v);
+            if (v.subkind() == subkind_array_map) {
+                const ps = arrayPayloads(h);
+                for (ps, 0..) |p, i| {
+                    if (keyEquivalent(keyOf(p), key, elementEq)) return .{ .at = .present, .index = i, .old = p };
+                }
+                if (ps.len < array_map_max) return .{ .at = .array_append };
+                var spot: Spot = .{ .at = .promote, .hash32 = indexHashOf(key, elementHash) };
+                for (ps, 0..) |p, i| spot.hashes[i] = indexHashOf(keyOf(p), elementHash);
+                return spot;
+            }
+            var spot: Spot = .{ .at = .empty_slot, .hash32 = indexHashOf(key, elementHash) };
+            var node = headerOf(RootBody, h).root_node;
+            var shift: u8 = 0;
+            while (true) : (shift += branch_bits) {
+                spot.path[spot.len] = node;
+                spot.len += 1;
+                if (shift > MAX_TRIE_SHIFT) {
+                    for (collisionPayloads(node), 0..) |p, i| {
+                        if (keyEquivalent(keyOf(p), key, elementEq)) {
+                            spot.at = .present;
+                            spot.index = i;
+                            spot.old = p;
+                            return spot;
+                        }
+                    }
+                    spot.at = .collision_append;
+                    return spot;
+                }
+                const hdr = headerOf(InteriorHeader, node);
+                const slot = slotOf(spot.hash32, shift);
+                if (hdr.data_bitmap & bitOf(slot) != 0) {
+                    spot.index = dataIndex(hdr.data_bitmap, slot);
+                    spot.old = payloads(node)[spot.index];
+                    if (keyEquivalent(keyOf(spot.old), key, elementEq)) {
+                        spot.at = .present;
+                    } else {
+                        spot.at = .split;
+                        spot.other_hash = indexHashOf(keyOf(spot.old), elementHash);
+                    }
+                    return spot;
+                }
+                if (hdr.node_bitmap & bitOf(slot) == 0) return spot;
+                node = children(node)[childIndex(hdr.node_bitmap, slot)];
+            }
+        }
+
+        /// Point the link to `path[k]` at `node`: the root's
+        /// `root_node`, or the child slot of `path[k - 1]`, which the
+        /// edit owns.
+        fn relink(root: *HeapHeader, spot: *Spot, k: usize, node: *HeapHeader) void {
+            spot.path[k] = node;
+            if (k == 0) {
+                headerOf(RootBody, root).root_node = node;
+                return;
+            }
+            const parent = spot.path[k - 1];
+            const slot = slotOf(spot.hash32, @intCast(5 * (k - 1)));
+            children(parent)[childIndex(headerOf(InteriorHeader, parent).node_bitmap, slot)] = node;
+        }
+
+        /// Make `path[0..n]` owned by the edit, top down.
+        fn ownPath(heap: *Heap, root: *HeapHeader, spot: *Spot, n: usize, edit: u32) !void {
+            for (0..n) |k| {
+                const node = spot.path[k];
+                if (heap_mod.ownedBy(node, edit)) continue;
+                const size = Heap.bodySize(node);
+                const copy = try allocNode(heap, size, edit, 0);
+                @memcpy(Heap.bodyBytes(copy), Heap.bodyBytes(node));
+                relink(root, spot, k, copy);
+            }
+        }
+
+        /// Store `p` where `spot` says in the collection rooted at
+        /// `root`, which the edit owns; the root afterwards, which is
+        /// `root` unless an array form grew or promoted.
+        fn put(heap: *Heap, root: *HeapHeader, spot_in: Spot, p: P, edit: u32) !*HeapHeader {
+            var spot = spot_in;
+            const array = spot.len == 0;
+            switch (spot.at) {
+                .present => {
+                    if (sameValue(spot.old, p)) return root;
+                    if (array) {
+                        arrayPayloads(root)[spot.index] = replaced(spot.old, p);
+                        return root;
+                    }
+                    try ownPath(heap, root, &spot, spot.len, edit);
+                    const last = spot.path[spot.len - 1];
+                    const ps = if (5 * (spot.len - 1) > MAX_TRIE_SHIFT) collisionPayloads(last) else payloads(last);
+                    ps[spot.index] = replaced(spot.old, p);
+                    return root;
+                },
+                .array_append => {
+                    const n = headerOf(ArrayHeader, root).count;
+                    const size = @sizeOf(ArrayHeader) + (n + 1) * @sizeOf(P);
+                    const target = if (Heap.resizeInPlace(root, size)) root else blk: {
+                        const grown = try heap.alloc(kind, size + edit_slack);
+                        _ = Heap.resizeInPlace(grown, size);
+                        @memcpy(Heap.bodyBytes(grown)[0..Heap.bodySize(root)], Heap.bodyBytes(root));
+                        break :blk grown;
+                    };
+                    headerOf(ArrayHeader, target).count = n + 1;
+                    arrayPayloads(target)[n] = p;
+                    return target;
+                },
+                .promote => {
+                    var items: [array_map_max + 1]Item = undefined;
+                    for (arrayPayloads(root), 0..) |old, i| items[i] = .{ .p = old, .hash = spot.hashes[i], .order = @intCast(i) };
+                    items[array_map_max] = .{ .p = p, .hash = spot.hash32, .order = array_map_max };
+                    std.mem.sortUnstable(Item, &items, {}, Item.lessThan);
+                    return Heap.asHeapHeader(try newRoot(heap, items.len, try build(heap, &items, 0, edit)));
+                },
+                .empty_slot, .collision_append => {
+                    try ownPath(heap, root, &spot, spot.len - 1, edit);
+                    const k = spot.len - 1;
+                    const last = spot.path[k];
+                    const grown = if (spot.at == .empty_slot)
+                        try insertData(heap, last, slotOf(spot.hash32, @intCast(5 * k)), p, edit)
+                    else
+                        try appendCollision(heap, last, p, edit);
+                    if (grown != last) relink(root, &spot, k, grown);
+                },
+                .split => {
+                    const k = spot.len - 1;
+                    const shift: u8 = @intCast(5 * k);
+                    const sub = try pair(heap, spot.old, spot.other_hash, p, spot.hash32, shift + branch_bits, edit);
+                    try ownPath(heap, root, &spot, spot.len, edit);
+                    dataToChild(spot.path[k], slotOf(spot.hash32, shift), sub);
+                },
+            }
+            headerOf(RootBody, root).count += 1;
+            return root;
+        }
+
+        /// Interior `node` with payload `p` in its empty `slot`: in
+        /// place when the edit owns it and its block has room, else an
+        /// owned copy.
+        fn insertData(heap: *Heap, node: *HeapHeader, slot: u32, p: P, edit: u32) !*HeapHeader {
+            const hdr = headerOf(InteriorHeader, node);
+            const nd: usize = @popCount(hdr.data_bitmap);
+            const nc: usize = @popCount(hdr.node_bitmap);
+            const at = dataIndex(hdr.data_bitmap, slot);
+            if (!heap_mod.ownedBy(node, edit) or !Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap | bitOf(slot), hdr.node_bitmap))) {
+                return withSlot(heap, node, slot, .{ .data = p }, edit);
+            }
+            const base = afterHeader(node);
+            const child_bytes = nc * @sizeOf(*HeapHeader);
+            const old_children = base + nd * @sizeOf(P);
+            @memmove((old_children + @sizeOf(P))[0..child_bytes], old_children[0..child_bytes]);
+            const ps: [*]P = @ptrCast(@alignCast(base));
+            @memmove(ps[at + 1 .. nd + 1], ps[at..nd]);
+            ps[at] = p;
+            hdr.data_bitmap |= bitOf(slot);
+            return node;
+        }
+
+        /// Collision node `node` with `p` appended: in place when the
+        /// edit owns it and its block has room, else an owned copy.
+        fn appendCollision(heap: *Heap, node: *HeapHeader, p: P, edit: u32) !*HeapHeader {
+            const hdr = headerOf(CollisionHeader, node);
+            const n = hdr.count;
+            const size = @sizeOf(CollisionHeader) + (n + 1) * @sizeOf(P);
+            const target = if (heap_mod.ownedBy(node, edit) and Heap.resizeInPlace(node, size)) node else blk: {
+                const copy = try allocNode(heap, size, edit, edit_slack);
+                @memcpy(Heap.bodyBytes(copy)[0..Heap.bodySize(node)], Heap.bodyBytes(node));
+                break :blk copy;
+            };
+            headerOf(CollisionHeader, target).count = n + 1;
+            collisionPayloads(target)[n] = p;
+            return target;
+        }
+
+        /// Owned interior `node` with its payload at `slot` replaced by
+        /// the child `sub`: smaller, so always in place.
+        fn dataToChild(node: *HeapHeader, slot: u32, sub: *HeapHeader) void {
+            const hdr = headerOf(InteriorHeader, node);
+            const nd: usize = @popCount(hdr.data_bitmap);
+            const nc: usize = @popCount(hdr.node_bitmap);
+            const base = afterHeader(node);
+            const ps: [*]P = @ptrCast(@alignCast(base));
+            const at = dataIndex(hdr.data_bitmap, slot);
+            @memmove(ps[at .. nd - 1], ps[at + 1 .. nd]);
+            const old_cs: [*]*HeapHeader = @ptrCast(@alignCast(base + nd * @sizeOf(P)));
+            const cs: [*]*HeapHeader = @ptrCast(@alignCast(base + (nd - 1) * @sizeOf(P)));
+            @memmove(cs[0..nc], old_cs[0..nc]);
+            const nodes = hdr.node_bitmap | bitOf(slot);
+            const ci = childIndex(nodes, slot);
+            @memmove(cs[ci + 1 .. nc + 1], cs[ci..nc]);
+            cs[ci] = sub;
+            hdr.data_bitmap &= ~bitOf(slot);
+            hdr.node_bitmap = nodes;
+            _ = Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap, nodes));
+        }
+
+        /// Remove the key `spot` found present from the collection
+        /// rooted at `root`, which the edit owns; the root afterwards,
+        /// a fresh empty array form when the last key went (CHAMP.md
+        /// §5.6).
+        fn drop(heap: *Heap, root: *HeapHeader, spot_in: Spot, edit: u32) !*HeapHeader {
+            var spot = spot_in;
+            std.debug.assert(spot.at == .present);
+            if (spot.len == 0) {
+                const hdr = headerOf(ArrayHeader, root);
+                const ps = arrayPayloads(root);
+                @memmove(ps[spot.index .. ps.len - 1], ps[spot.index + 1 ..]);
+                hdr.count -= 1;
+                _ = Heap.resizeInPlace(root, @sizeOf(ArrayHeader) + hdr.count * @sizeOf(P));
+                return root;
+            }
+            const rb = headerOf(RootBody, root);
+            if (rb.count == 1) return Heap.asHeapHeader(try empty(heap));
+            var k: usize = spot.len - 1;
+            const bottom = spot.path[k];
+            var single: ?P = null;
+            if (5 * k > MAX_TRIE_SHIFT) {
+                const ps = collisionPayloads(bottom);
+                if (ps.len == 2) {
+                    single = ps[1 - spot.index];
+                } else {
+                    try ownPath(heap, root, &spot, k + 1, edit);
+                    const owned = spot.path[k];
+                    const qs = collisionPayloads(owned);
+                    @memmove(qs[spot.index .. qs.len - 1], qs[spot.index + 1 ..]);
+                    headerOf(CollisionHeader, owned).count -= 1;
+                    _ = Heap.resizeInPlace(owned, @sizeOf(CollisionHeader) + (qs.len - 1) * @sizeOf(P));
+                }
+            } else {
+                const hdr = headerOf(InteriorHeader, bottom);
+                if (k > 0 and hdr.node_bitmap == 0 and @popCount(hdr.data_bitmap) == 2) {
+                    single = payloads(bottom)[1 - spot.index];
+                } else {
+                    try ownPath(heap, root, &spot, k + 1, edit);
+                    removeData(spot.path[k], slotOf(spot.hash32, @intCast(5 * k)));
+                }
+            }
+            // A lone payload climbs to the first ancestor with other
+            // content, or to the root (CHAMP.md §5.5).
+            while (single) |lone| {
+                k -= 1;
+                const hdr = headerOf(InteriorHeader, spot.path[k]);
+                if (k > 0 and hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) continue;
+                try ownPath(heap, root, &spot, k + 1, edit);
+                const node = spot.path[k];
+                const replaced_node = try withSlotInPlace(heap, node, slotOf(spot.hash32, @intCast(5 * k)), .{ .data = lone }, edit);
+                if (replaced_node != node) relink(root, &spot, k, replaced_node);
+                single = null;
+            }
+            rb.count -= 1;
+            return root;
+        }
+
+        /// Owned interior `node` without its payload at `slot`: always
+        /// in place.
+        fn removeData(node: *HeapHeader, slot: u32) void {
+            const hdr = headerOf(InteriorHeader, node);
+            const nd: usize = @popCount(hdr.data_bitmap);
+            const nc: usize = @popCount(hdr.node_bitmap);
+            const base = afterHeader(node);
+            const ps: [*]P = @ptrCast(@alignCast(base));
+            const at = dataIndex(hdr.data_bitmap, slot);
+            @memmove(ps[at .. nd - 1], ps[at + 1 .. nd]);
+            const child_bytes = nc * @sizeOf(*HeapHeader);
+            const old_children = base + nd * @sizeOf(P);
+            @memmove((old_children - @sizeOf(P))[0..child_bytes], old_children[0..child_bytes]);
+            hdr.data_bitmap &= ~bitOf(slot);
+            _ = Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap, hdr.node_bitmap));
+        }
+
+        /// Owned interior `node` with `slot` holding `new`, rewritten
+        /// in place when its block has room, else an owned copy.
+        fn withSlotInPlace(heap: *Heap, node: *HeapHeader, slot: u32, new: Slot, edit: u32) !*HeapHeader {
+            const hdr = headerOf(InteriorHeader, node).*;
+            var ps_buf: [branch_factor]P = undefined;
+            var cs_buf: [branch_factor]*HeapHeader = undefined;
+            const ps = ps_buf[0..@popCount(hdr.data_bitmap)];
+            const cs = cs_buf[0..@popCount(hdr.node_bitmap)];
+            @memcpy(ps, payloads(node));
+            @memcpy(cs, children(node));
+            const bit = bitOf(slot);
+            var data = hdr.data_bitmap & ~bit;
+            var nodes = hdr.node_bitmap & ~bit;
+            switch (new) {
+                .empty => {},
+                .data => data |= bit,
+                .child => nodes |= bit,
+            }
+            const target = if (Heap.resizeInPlace(node, interiorSize(data, nodes))) node else try allocInterior(heap, data, nodes, edit, edit_slack);
+            headerOf(InteriorHeader, target).* = .{ .data_bitmap = data, .node_bitmap = nodes };
+            const put_data: ?P = switch (new) {
+                .data => |p| p,
+                else => null,
+            };
+            const put_child: ?*HeapHeader = switch (new) {
+                .child => |c| c,
+                else => null,
+            };
+            splice(P, payloads(target), ps, dataIndex(hdr.data_bitmap, slot), hdr.data_bitmap & bit != 0, put_data);
+            splice(*HeapHeader, children(target), cs, childIndex(hdr.node_bitmap, slot), hdr.node_bitmap & bit != 0, put_child);
+            return target;
         }
 
         // ---- bulk construction ----
@@ -602,9 +972,9 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// sorted by `Item.lessThan`, have distinct keys, and share
         /// the hash bits below `shift`; at least two below the root.
         /// One allocation per node.
-        fn build(heap: *Heap, items: []const Item, shift: u8) !*HeapHeader {
+        fn build(heap: *Heap, items: []const Item, shift: u8, edit: u32) !*HeapHeader {
             if (shift > MAX_TRIE_SHIFT) {
-                const h = try allocCollision(heap, items[0].hash, items.len);
+                const h = try allocCollision(heap, items[0].hash, items.len, edit);
                 for (collisionPayloads(h), items) |*dst, item| dst.* = item.p;
                 return h;
             }
@@ -617,7 +987,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 if (j - i == 1) data |= bitOf(slot) else nodes |= bitOf(slot);
                 i = j;
             }
-            const h = try allocInterior(heap, data, nodes);
+            const h = try allocInterior(heap, data, nodes, edit, 0);
             i = 0;
             while (i < items.len) {
                 const slot = slotOf(items[i].hash, shift);
@@ -625,7 +995,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 if (j - i == 1) {
                     payloads(h)[dataIndex(data, slot)] = items[i].p;
                 } else {
-                    children(h)[childIndex(nodes, slot)] = try build(heap, items[i..j], shift + branch_bits);
+                    children(h)[childIndex(nodes, slot)] = try build(heap, items[i..j], shift + branch_bits, edit);
                 }
                 i = j;
             }
@@ -644,8 +1014,10 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// the value, keeping the first key), built bottom-up with one
         /// allocation per node.
         fn fromSlice(heap: *Heap, ps: []const P, elementHash: ElementHash, elementEq: ElementEq) !Value {
-            const items = try heap.backing.alloc(Item, ps.len);
-            defer heap.backing.free(items);
+            // A literal's handful of payloads sorts on the stack.
+            var small: [16]Item = undefined;
+            const items = if (ps.len <= small.len) small[0..ps.len] else try heap.backing.alloc(Item, ps.len);
+            defer if (ps.len > small.len) heap.backing.free(items);
             for (ps, items, 0..) |p, *item, i| item.* = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = @intCast(i) };
             std.mem.sortUnstable(Item, items, {}, Item.lessThan);
             // Merge equal keys; they share a hash, so they are adjacent.
@@ -678,7 +1050,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 for (arrayPayloads(h), items[0..n]) |*dst, item| dst.* = item.p;
                 return valueOf(h, subkind_array_map);
             }
-            return newRoot(heap, n, try build(heap, items[0..n], 0));
+            return newRoot(heap, n, try build(heap, items[0..n], 0, 0));
         }
 
         // ---- dispatch entry points ----
@@ -784,9 +1156,9 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         fn markPayload(p: P, visitor: anytype) void {
             if (is_map) {
-                visitor.markValue(p.key);
-                visitor.markValue(p.value);
-            } else visitor.markValue(p);
+                if (p.key.kind().isHeap()) visitor.markValue(p.key);
+                if (p.value.kind().isHeap()) visitor.markValue(p.value);
+            } else if (p.kind().isHeap()) visitor.markValue(p);
         }
 
         // ---- introspection for tests (CHAMP.md §4.3, §12.3) ----
@@ -913,6 +1285,66 @@ pub fn mapIter(m: Value) MapIter {
 /// subkind read off the body size.
 pub fn valueFromMapHeader(h: *HeapHeader) Value {
     return MapTrie.fromHeader(h);
+}
+
+// =============================================================================
+// In-place edits for transients (TRANSIENT.md §1)
+// =============================================================================
+
+/// A copy of the map or set root `src` for a transient to own: the
+/// same payloads, no metadata, no cached hash.
+pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
+    const size = Heap.bodySize(src);
+    const h = try heap.alloc(@enumFromInt(src.kind), size);
+    @memcpy(Heap.bodyBytes(h), Heap.bodyBytes(src));
+    return h;
+}
+
+pub const MapSpot = MapTrie.Spot;
+
+/// Where `key` is or would go in `m`: every hash and comparison an
+/// edit makes, and no change.
+pub fn mapLocate(m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) MapSpot {
+    return MapTrie.locate(m, key, elementHash, elementEq);
+}
+
+pub fn mapSpotPresent(spot: MapSpot) bool {
+    return spot.at == .present;
+}
+
+/// The value stored under the key `spot` found, or null when absent.
+pub fn mapSpotValue(spot: MapSpot) ?Value {
+    return if (spot.at == .present) spot.old.value else null;
+}
+
+/// Store `key → val` at `spot` in the map rooted at `root`, which the
+/// edit `edit` owns, as `mapAssoc` would; the root afterwards.
+pub fn mapPut(heap: *Heap, root: *HeapHeader, spot: MapSpot, key: Value, val: Value, edit: u32) !*HeapHeader {
+    return MapTrie.put(heap, root, spot, .{ .key = key, .value = val }, edit);
+}
+
+/// Remove the key `spot` found present, as `mapDissoc` would; the root
+/// afterwards.
+pub fn mapDrop(heap: *Heap, root: *HeapHeader, spot: MapSpot, edit: u32) !*HeapHeader {
+    return MapTrie.drop(heap, root, spot, edit);
+}
+
+pub const SetSpot = SetTrie.Spot;
+
+pub fn setLocate(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) SetSpot {
+    return SetTrie.locate(s, elem, elementHash, elementEq);
+}
+
+pub fn setSpotPresent(spot: SetSpot) bool {
+    return spot.at == .present;
+}
+
+pub fn setPut(heap: *Heap, root: *HeapHeader, spot: SetSpot, elem: Value, edit: u32) !*HeapHeader {
+    return SetTrie.put(heap, root, spot, elem, edit);
+}
+
+pub fn setDrop(heap: *Heap, root: *HeapHeader, spot: SetSpot, edit: u32) !*HeapHeader {
+    return SetTrie.drop(heap, root, spot, edit);
 }
 
 // =============================================================================
@@ -1386,6 +1818,22 @@ fn mapIterKey(m: Value, key: Value) Value {
     unreachable;
 }
 
+test "mapFromEntries of a literal's few entries asks the backing allocator for nothing" {
+    // Slabs do not come from the backing allocator, so a heap over one
+    // that refuses everything still holds small blocks.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var heap = Heap.init(failing.allocator());
+    defer heap.deinit();
+    const es = [_]Entry{
+        .{ .key = value.testKeyword(1), .value = value.fromFixnum(1).? },
+        .{ .key = value.testKeyword(2), .value = value.fromFixnum(2).? },
+        .{ .key = value.testKeyword(3), .value = value.fromFixnum(3).? },
+    };
+    const m = try mapFromEntries(&heap, &es, &synthHash, &synthEq);
+    try testing.expectEqual(@as(usize, 3), mapCount(m));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
 test "mapFromEntries and setFromElements build what a fold of assoc and conj builds" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -1629,6 +2077,22 @@ test "keyword-keyed fast path: intern-id identity matches general equality" {
     try testing.expect(keyEquivalent(a, b, &wrapEq.f));
     // Different keyword ids → not equal.
     try testing.expect(!keyEquivalent(value.testKeyword(1), value.testKeyword(2), &wrapEq.f));
+}
+
+test "immediate keys compare inline: never through the callback, never equal to a heap key" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const never = struct {
+        fn f(_: Value, _: Value) bool {
+            unreachable;
+        }
+    };
+    try testing.expect(keyEquivalent(value.fromFloat(-0.0), value.fromFloat(0.0), &never.f));
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, value.fromFixnum(2).?, &never.f));
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, value.fromFloat(1.0), &never.f));
+    const s = try string_mod.fromBytes(&heap, "1");
+    try testing.expect(!keyEquivalent(value.fromFixnum(1).?, s, &never.f));
+    try testing.expect(!keyEquivalent(s, value.testKeyword(1), &never.f));
 }
 
 // ---- Single-entry-subtree promotion ----

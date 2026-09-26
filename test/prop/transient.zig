@@ -18,6 +18,14 @@
 //!   T4. GC survival: a transient's inner structure survives GC
 //!       when the transient itself is a root, even when the
 //!       original persistent Value is dropped.
+//!   T5. Persistence under in-place edits: every persistent map,
+//!       set and vector any round produced keeps its contents, its
+//!       canonical layout and its hash while later transients over
+//!       it and its relatives, two at once, edit in place, through
+//!       collision nodes and across the vector's trie boundaries,
+//!       with collections in between.
+//!   T6. The edit clock's wrap: tokens restart and no transient
+//!       edits a node another owned.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -63,11 +71,11 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)"
                 // assoc
                 const val = value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?;
                 persistent_path = try champ.mapAssoc(&heap, persistent_path, key, val, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.mapAssocBang(&heap, t, key, val, &dispatch.hashValue, &dispatch.equal);
+                _ = try transient.mapAssocBang(&heap, t, key, val, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             } else {
                 // dissoc
                 persistent_path = try champ.mapDissoc(&heap, persistent_path, key, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.mapDissocBang(&heap, t, key, &dispatch.hashValue, &dispatch.equal);
+                _ = try transient.mapDissocBang(&heap, t, key, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             }
         }
 
@@ -101,10 +109,10 @@ test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials)"
             const elem = value.fromFixnum(r.intRangeAtMost(i64, 0, 19)).?;
             if (r.boolean()) {
                 persistent_path = try champ.setConj(&heap, persistent_path, elem, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.setConjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal);
+                _ = try transient.setConjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             } else {
                 persistent_path = try champ.setDisj(&heap, persistent_path, elem, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.setDisjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal);
+                _ = try transient.setDisjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             }
         }
 
@@ -201,11 +209,11 @@ test "T2a: map transient post-freeze rejects every op with TransientFrozen" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapDissocBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
+        transient.mapDissocBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
@@ -229,11 +237,11 @@ test "T2b: set transient post-freeze rejects every op" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setConjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setDisjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setDisjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
@@ -268,20 +276,20 @@ test "T2d: kind-mismatch routing yields TransientKindMismatch for every family" 
     // map ops on non-map transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_vec, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal),
+        transient.mapAssocBang(&heap, t_vec, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     // set ops on non-set transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_map, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t_map, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_vec, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal),
+        transient.setConjBang(&heap, t_vec, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
     );
     // vector ops on non-vector transients.
     try std.testing.expectError(
@@ -331,10 +339,10 @@ test "T3a: transient session does NOT mutate source persistent map" {
             const pick = r.uintLessThan(u8, 2);
             if (pick == 0) {
                 const k = value.testKeyword(r.intRangeAtMost(u32, 0, 100));
-                t = try transient.mapAssocBang(&heap, t, k, value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?, &dispatch.hashValue, &dispatch.equal);
+                t = try transient.mapAssocBang(&heap, t, k, value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             } else {
                 const k = value.testKeyword(r.intRangeAtMost(u32, 0, 30));
-                t = try transient.mapDissocBang(&heap, t, k, &dispatch.hashValue, &dispatch.equal);
+                t = try transient.mapDissocBang(&heap, t, k, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
             }
         }
         _ = try transient.persistentBang(t);
@@ -392,7 +400,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     var t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        t = try transient.mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal);
+        t = try transient.mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
     }
 
     var collector = gc.Collector.init(&heap);
@@ -420,7 +428,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     defer heap.deinit();
 
     const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
-    _ = try transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal);
+    _ = try transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
     const frozen_persistent = try transient.persistentBang(t);
 
     // Keep BOTH the wrapper AND the returned persistent Value as
@@ -442,4 +450,278 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
         .present => |v| try std.testing.expectEqual(@as(i64, 100), v.asFixnum()),
         .absent => try std.testing.expect(false),
     }
+}
+
+// =============================================================================
+// T5 — Persistence under in-place edits (TRANSIENT.md §1)
+//
+// A transient edits the nodes it owns in place and shares the rest
+// with the persistent collections it came from and gave. Every
+// persistent collection any round produced must keep its contents,
+// its canonical layout and its hash, however many transients later
+// start from it or from its relatives, two of them active at once,
+// with collections in between.
+// =============================================================================
+
+fn fx(i: i64) Value {
+    return value.fromFixnum(i).?;
+}
+
+const MapModel = std.AutoArrayHashMapUnmanaged(i64, i64);
+
+/// A collision fixture's hash (test/prop/champ.zig M10): every key's
+/// low 32 bits are one value, so the keys meet in a collision node.
+fn collidingHash(v: Value) u64 {
+    return (@as(u64, dispatch.hashValue(v) >> 32) << 32) | 0xDEAD_BEEF;
+}
+
+const MapKeys = struct {
+    hash: *const fn (Value) u64,
+    /// Fixnum keys, or strings under `collidingHash`.
+    strings: bool,
+
+    fn key(self: MapKeys, heap: *Heap, i: i64) !Value {
+        if (!self.strings) return fx(i);
+        var buf: [32]u8 = undefined;
+        return nx.string.fromBytes(heap, std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable);
+    }
+};
+
+fn expectMapIs(gpa: std.mem.Allocator, heap: *Heap, keys: MapKeys, m: Value, model: *const MapModel) !void {
+    try std.testing.expectEqual(model.count(), champ.mapCount(m));
+    const entries = try gpa.alloc(champ.Entry, model.count());
+    defer gpa.free(entries);
+    for (model.keys(), model.values(), entries) |k, v, *e| {
+        const kv = try keys.key(heap, k);
+        switch (champ.mapGet(m, kv, keys.hash, &dispatch.equal)) {
+            .present => |got| try std.testing.expectEqual(v, got.asFixnum()),
+            .absent => return error.TestUnexpectedResult,
+        }
+        e.* = .{ .key = kv, .value = fx(v) };
+    }
+    try std.testing.expect(champ.canonicalTrie(m, keys.hash));
+    // `=` looks keys up by their own hash: only a fixture that keeps it
+    // can compare.
+    if (keys.strings) return;
+    const fresh = try champ.mapFromEntries(heap, entries, keys.hash, &dispatch.equal);
+    try std.testing.expect(dispatch.equal(fresh, m));
+    try std.testing.expectEqual(dispatch.hashValue(fresh), dispatch.hashValue(m));
+}
+
+const Persisted = struct { v: Value, model: MapModel };
+
+fn randomMapEdit(heap: *Heap, r: std.Random, keys: MapKeys, key_max: i64, t: Value, model: *MapModel, gpa: std.mem.Allocator) !void {
+    const k = r.intRangeAtMost(i64, 0, key_max);
+    const kv = try keys.key(heap, k);
+    if (r.uintLessThan(u8, 4) < 3) {
+        const v = r.intRangeAtMost(i64, -1000, 1000);
+        _ = try transient.mapAssocBang(heap, t, kv, fx(v), keys.hash, &dispatch.equal, &dispatch.overflowCount);
+        try model.put(gpa, k, v);
+    } else {
+        _ = try transient.mapDissocBang(heap, t, kv, keys.hash, &dispatch.equal, &dispatch.overflowCount);
+        _ = model.orderedRemove(k);
+    }
+}
+
+/// Rounds of edits, each through a transient over the last round's
+/// map and, alongside it, one over an earlier map; every map any
+/// round gave is checked against its model, after a collection that
+/// roots only those maps.
+fn mapPersistenceRounds(heap: *Heap, r: std.Random, keys: MapKeys, rounds: usize, key_max: i64, max_edits: usize) !void {
+    const gpa = std.testing.allocator;
+    var persisted: std.ArrayList(Persisted) = .empty;
+    defer {
+        for (persisted.items) |*p| p.model.deinit(gpa);
+        persisted.deinit(gpa);
+    }
+    var roots: std.ArrayList(*HeapHeader) = .empty;
+    defer roots.deinit(gpa);
+    var collector = gc.Collector.init(heap);
+    defer collector.deinit();
+
+    var cur = try champ.mapEmpty(heap);
+    var cur_model: MapModel = .empty;
+    defer cur_model.deinit(gpa);
+    for (0..rounds) |round| {
+        const t = try transient.transientFrom(heap, cur);
+        var model = try cur_model.clone(gpa);
+        var other: ?struct { t: Value, model: MapModel } = null;
+        if (persisted.items.len > 0) {
+            const src = persisted.items[r.uintLessThan(usize, persisted.items.len)];
+            other = .{ .t = try transient.transientFrom(heap, src.v), .model = try src.model.clone(gpa) };
+        }
+        for (0..r.uintLessThan(usize, max_edits)) |_| {
+            try randomMapEdit(heap, r, keys, key_max, t, &model, gpa);
+            if (other) |*o| try randomMapEdit(heap, r, keys, key_max, o.t, &o.model, gpa);
+        }
+        cur = try transient.persistentBang(t);
+        cur_model.deinit(gpa);
+        cur_model = try model.clone(gpa);
+        try persisted.append(gpa, .{ .v = cur, .model = model });
+        if (other) |o| try persisted.append(gpa, .{ .v = try transient.persistentBang(o.t), .model = o.model });
+
+        roots.clearRetainingCapacity();
+        for (persisted.items) |p| try roots.append(gpa, Heap.asHeapHeader(p.v));
+        _ = collector.collect(roots.items);
+        const all = round % 4 == 3 or round + 1 == rounds;
+        for (persisted.items, 0..) |*p, i| {
+            if (all or i + 2 >= persisted.items.len) try expectMapIs(gpa, heap, keys, p.v, &p.model);
+        }
+    }
+}
+
+test "T5a: persistent maps never change under in-place edits of transients over them" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x5a);
+    try mapPersistenceRounds(&heap, prng.random(), .{ .hash = &dispatch.hashValue, .strings = false }, 24, 1500, 600);
+}
+
+test "T5b: in-place edits through collision nodes keep every persistent map" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x5b);
+    const keys: MapKeys = .{ .hash = &collidingHash, .strings = true };
+    try mapPersistenceRounds(&heap, prng.random(), keys, 24, 14, 40);
+    // The fixture reaches the collision layer.
+    const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
+    for (0..12) |i| _ = try transient.mapAssocBang(&heap, t, try keys.key(&heap, @intCast(i)), fx(@intCast(i)), keys.hash, &dispatch.equal, &dispatch.overflowCount);
+    try std.testing.expectEqual(@as(?u32, 12), champ.mapCollisionCount(try transient.persistentBang(t), 0xDEAD_BEEF));
+}
+
+const SetModel = std.AutoArrayHashMapUnmanaged(i64, void);
+
+fn expectSetIs(gpa: std.mem.Allocator, heap: *Heap, s: Value, model: *const SetModel) !void {
+    try std.testing.expectEqual(model.count(), champ.setCount(s));
+    const elems = try gpa.alloc(Value, model.count());
+    defer gpa.free(elems);
+    for (model.keys(), elems) |k, *e| {
+        try std.testing.expect(champ.setContains(s, fx(k), &dispatch.hashValue, &dispatch.equal));
+        e.* = fx(k);
+    }
+    try std.testing.expect(champ.canonicalTrie(s, &dispatch.hashValue));
+    try std.testing.expect(dispatch.equal(try champ.setFromElements(heap, elems, &dispatch.hashValue, &dispatch.equal), s));
+}
+
+test "T5c: persistent sets never change under in-place edits of transients over them" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x5c);
+    const r = prng.random();
+    var sets: std.ArrayList(Value) = .empty;
+    defer sets.deinit(gpa);
+    var models: std.ArrayList(SetModel) = .empty;
+    defer {
+        for (models.items) |*m| m.deinit(gpa);
+        models.deinit(gpa);
+    }
+    try sets.append(gpa, try champ.setEmpty(&heap));
+    try models.append(gpa, .empty);
+    for (0..30) |_| {
+        const from = r.uintLessThan(usize, sets.items.len);
+        const t = try transient.transientFrom(&heap, sets.items[from]);
+        var model = try models.items[from].clone(gpa);
+        for (0..r.uintLessThan(usize, 500)) |_| {
+            const k = r.intRangeAtMost(i64, 0, 1200);
+            if (r.uintLessThan(u8, 3) < 2) {
+                _ = try transient.setConjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                try model.put(gpa, k, {});
+            } else {
+                _ = try transient.setDisjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = model.orderedRemove(k);
+            }
+        }
+        try sets.append(gpa, try transient.persistentBang(t));
+        try models.append(gpa, model);
+        for (sets.items, models.items) |s, *m| try expectSetIs(gpa, &heap, s, m);
+    }
+}
+
+test "T5d: persistent vectors never change under in-place conj!/assoc!/pop! of transients over them" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x5d);
+    const r = prng.random();
+    var vecs: std.ArrayList(Value) = .empty;
+    defer vecs.deinit(gpa);
+    var models: std.ArrayList(std.ArrayList(i64)) = .empty;
+    defer {
+        for (models.items) |*m| m.deinit(gpa);
+        models.deinit(gpa);
+    }
+    var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
+    var roots: std.ArrayList(*HeapHeader) = .empty;
+    defer roots.deinit(gpa);
+    try vecs.append(gpa, try vector.empty(&heap));
+    try models.append(gpa, .empty);
+    for (0..40) |_| {
+        const from = r.uintLessThan(usize, vecs.items.len);
+        const t = try transient.transientFrom(&heap, vecs.items[from]);
+        var model = try models.items[from].clone(gpa);
+        // Grow past the 1056 and 32800 boundaries now and then.
+        const edits = if (r.uintLessThan(u8, 8) == 0) r.uintLessThan(usize, 34000) else r.uintLessThan(usize, 1500);
+        for (0..edits) |_| {
+            const pick = r.uintLessThan(u8, 10);
+            if (pick < 6 or model.items.len == 0) {
+                const x = r.int(i32);
+                _ = try transient.vectorConjBang(&heap, t, fx(x));
+                try model.append(gpa, x);
+            } else if (pick < 9) {
+                const i = r.uintLessThan(usize, model.items.len);
+                const x = r.int(i32);
+                _ = try transient.vectorAssocBang(&heap, t, i, fx(x));
+                model.items[i] = x;
+            } else {
+                _ = try transient.vectorPopBang(&heap, t);
+                _ = model.pop();
+            }
+        }
+        try vecs.append(gpa, try transient.persistentBang(t));
+        try models.append(gpa, model);
+        roots.clearRetainingCapacity();
+        for (vecs.items) |v| try roots.append(gpa, Heap.asHeapHeader(v));
+        _ = collector.collect(roots.items);
+        for (vecs.items, models.items) |v, m| {
+            try std.testing.expectEqual(m.items.len, vector.count(v));
+            const elems = try gpa.alloc(Value, m.items.len);
+            defer gpa.free(elems);
+            for (m.items, elems, 0..) |x, *e, i| {
+                e.* = fx(x);
+                try std.testing.expectEqual(x, vector.nth(v, i).asFixnum());
+            }
+            const fresh = try vector.fromSlice(&heap, elems);
+            try std.testing.expect(dispatch.equal(fresh, v));
+            try std.testing.expectEqual(dispatch.hashValue(fresh), dispatch.hashValue(v));
+        }
+    }
+}
+
+// =============================================================================
+// T6 — The edit clock wraps (TRANSIENT.md §4)
+// =============================================================================
+
+test "T6: across the edit clock's wrap, no transient edits a node another owned" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    heap.edit_clock = heap_mod.edit_token_max - 5;
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x6);
+    try mapPersistenceRounds(&heap, prng.random(), .{ .hash = &dispatch.hashValue, .strings = false }, 12, 800, 300);
+    try std.testing.expect(heap.edit_clock < 100);
+
+    // A transient active across the wrap keeps working and its
+    // collection keeps its elements.
+    heap.edit_clock = heap_mod.edit_token_max - 1;
+    const t = try transient.transientFrom(&heap, try vector.empty(&heap));
+    for (0..100) |i| _ = try transient.vectorConjBang(&heap, t, fx(@intCast(i)));
+    const kept = try transient.persistentBang(try transient.transientFrom(&heap, try vector.fromSlice(&heap, &.{ fx(1), fx(2) })));
+    const u = try transient.transientFrom(&heap, kept);
+    _ = try transient.vectorAssocBang(&heap, u, 0, fx(-1));
+    for (100..200) |i| _ = try transient.vectorConjBang(&heap, t, fx(@intCast(i)));
+    const v = try transient.persistentBang(t);
+    for (0..200) |i| try std.testing.expectEqual(@as(i64, @intCast(i)), vector.nth(v, i).asFixnum());
+    try std.testing.expectEqual(@as(i64, 1), vector.nth(kept, 0).asFixnum());
+    try std.testing.expectEqual(@as(i64, -1), vector.nth(try transient.persistentBang(u), 0).asFixnum());
 }

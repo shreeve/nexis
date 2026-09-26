@@ -288,8 +288,12 @@
     (reduce conj (remove nil? maps))))
 
 ; (update m k f & args) → assoc m with k → (apply f (get m k) args).
-(defn update [m k f & args]
-  (assoc m k (apply f (cons (get m k) args))))
+; The short arities call f directly, with no argument list to build.
+(defn update
+  ([m k f] (assoc m k (f (get m k))))
+  ([m k f x] (assoc m k (f (get m k) x)))
+  ([m k f x y] (assoc m k (f (get m k) x y)))
+  ([m k f x y & more] (assoc m k (apply f (get m k) x y more))))
 
 ; (get-in m [k1 k2 ...]) → nested lookup. nil if any step
 ; misses. (get-in m ks default) → default when any key along
@@ -324,22 +328,6 @@
   (assoc-in m ks (apply f (cons (get-in m ks) args))))
 
 ; ---- sequence breakdown helpers ----
-
-; (frequencies coll) → map counting occurrences of each elt.
-(defn frequencies [coll]
-  (reduce (fn* [acc x] (assoc acc x (inc (get acc x 0))))
-          {}
-          coll))
-
-; (group-by f coll) → map from (f x) to vector of matching xs.
-; Order within each bucket is left-to-right.
-(defn group-by [f coll]
-  (reduce (fn* [acc x]
-            (let* [k (f x)
-                   bucket (get acc k [])]
-              (assoc acc k (conj bucket x))))
-          {}
-          coll))
 
 ; (interpose sep coll) → coll with sep between each pair of
 ; adjacent elements. Returns a list.

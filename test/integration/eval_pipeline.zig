@@ -5436,6 +5436,13 @@ test "gc: over a map, the entries a native keeps across its callbacks survive cy
     try expectOutputUnderGc(churn ++ "(defrecord P [a b c]) (count (filter (fn [e] (churn (key e)) true) (->P 1 2 3)))", "3");
 }
 
+test "gc: group-by and transients built in place keep every group and node across cycles" {
+    try expectOutputUnderGc(churn ++ "(let [g (group-by (fn [x] (churn x) (mod x 7)) (range 300))] [(count g) (count (g 3)) (first (g 3)) (last (g 6))])", "[7 43 3 293]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [g (group-by (fn [e] (churn (key e)) (even? (val e))) m)] [(count (g true)) (reduce + (map val (g false)))])", "[20 400]");
+    try expectOutputUnderGc(churn ++ "(let [m (persistent! (reduce (fn [t x] (churn x) (assoc! t (str x) [x])) (transient {}) (range 200)))] [(count m) (m \"150\") (m \"7\")])", "[200 [150] [7]]");
+    try expectOutputUnderGc(churn ++ "(let [v (persistent! (reduce (fn [t x] (churn x) (conj! t (str x))) (transient []) (range 1100)))] [(count v) (v 0) (v 1099) (v 1056)])", "[1100 0 1099 1056]");
+}
+
 /// A comparator that allocates a few kilobytes of garbage per call,
 /// so a cycle runs inside every sorted update and lookup.
 const by = "(defn by [a b] (churn a) (compare a b)) ";

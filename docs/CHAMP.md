@@ -29,9 +29,9 @@ points (§8). Costs:
 The language surface lives in `src/stdlib.zig`: `hash-map`, `hash-set`,
 `set`, `assoc`, `dissoc`, `disj`, `get` (nil or the default when
 absent), `contains?`, `find`, `keys`, `vals`, `key`, `val`, `zipmap`,
-`select-keys`, `conj`, `into`, `count`, `empty`, and invocation (`({:a
-1} :a)`, `(#{:x} :x)`, `(:a m)`). `merge`, `merge-with`, `update`,
-`get-in`, `assoc-in`, `update-in`, `frequencies`, `group-by`,
+`select-keys`, `conj`, `into`, `frequencies`, `group-by`, `count`,
+`empty`, and invocation (`({:a 1} :a)`, `(#{:x} :x)`, `(:a m)`).
+`merge`, `merge-with`, `update`, `get-in`, `assoc-in`, `update-in`,
 `update-vals` and `update-keys` are `src/stdlib/core.nx`; set algebra
 is the `nexis.set` namespace (`src/stdlib/set.nx`). `(assoc nil k v)`
 is `{k v}` (SEMANTICS §4). An update that changes nothing returns its
@@ -39,8 +39,9 @@ argument; any other update returns a new root carrying the argument's
 metadata (SEMANTICS §7).
 
 **Absent.** Sorted maps and sets, and any other member of the map or
-set equality category; transients are `src/coll/transient.zig`
-(`docs/TRANSIENT.md`).
+set equality category. Transients are `src/coll/transient.zig`
+(`docs/TRANSIENT.md`); the in-place edits they run are this module's
+(§8.3).
 
 ---
 
@@ -225,9 +226,11 @@ lookup must tell an absent key from a nil value (§6.6).
 #### 6.5 Key comparison
 
 Key comparison inside the module (`keyEquivalent`) tries two shortcuts
-before `elementEq`: bit identity (same tag and payload), and for two
-keywords, interned-id equality. Both are exact: two keywords are `=`
-exactly when their ids are equal.
+before `elementEq`: bit identity (same tag and payload), and, when
+either key is an immediate, `Value.equalImmediate` inline, since an
+immediate is `=` only to an immediate of its own kind (SEMANTICS
+§3.3). Both are exact: two keywords are `=` exactly when their ids
+are equal, and a keyword or fixnum key never reaches the callback.
 
 #### 6.6 `MapLookup`
 
@@ -312,6 +315,22 @@ constants are public. Every constructor can fail only with
   ascending slot order, then its children in their stored, descending
   slot order; a collision node's payloads in association order.
 
+#### 8.3 In-place edits
+
+A transient's edit (`docs/TRANSIENT.md` §1) is two calls:
+`mapLocate`/`setLocate` finds where a key is or would go, doing every
+hash and comparison and changing nothing, and returns a `MapSpot` or
+`SetSpot` (`mapSpotPresent`, `mapSpotValue` read it);
+`mapPut`/`setPut` then stores, or `mapDrop`/`setDrop` removes, at that
+spot in a collection whose root the edit owns, and return the root
+afterwards. They rewrite the nodes whose header `hash` holds the edit
+token and copy any other node on the path, stamping the copy; an
+insert into an owned node grows it in place when its block has room
+(`Heap.resizeInPlace`), and a node an edit grows into a new block
+keeps two payloads of spare room there. The result has the layout `mapAssoc` and
+`mapDissoc` give (§2.2, §5.3-§5.6). `copyRoot` copies a root for a
+transient to own.
+
 #### 8.2 Nil
 
 Nil is a legal key, a legal value and a legal set element: `(assoc {}
@@ -367,7 +386,9 @@ hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
 dissoc, the builder, the iterator and the trace are shared, and the
 public `map*`/`set*` functions are thin wrappers over the two
 instances. Every path copy goes through one primitive, `withSlot`: a
-copy of an interior with one slot made empty, a payload or a child.
+copy of an interior with one slot made empty, a payload or a child;
+an in-place edit rewrites an owned interior the same way where it
+stands when its block has room (§8.3).
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
@@ -382,7 +403,7 @@ through 0..8 entries, promotion at 9 (and none on a duplicate key at
 8), no demotion, the root dissoc, the same-pointer short-circuits, the
 kept key object, nil keys, values and elements, the builders against
 `assoc`/`conj` folds, insertion-order-independent hashing, cross-subkind
-equality, the keyword shortcut, the bitmap ranks, lone-key pull-up
+equality, the keyword and immediate shortcuts, the bitmap ranks, lone-key pull-up
 through every level and out of a collision node, and an immediate key
 bypassing the hash callback.
 
