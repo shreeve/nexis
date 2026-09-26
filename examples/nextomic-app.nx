@@ -1,10 +1,12 @@
 ; examples/nextomic-app.nx — a small clinic chart on Nextomic
-; (docs/NEXTOMIC.md). Patients are upserted by medical record number,
-; visits by their own id, so the script is safe to run again: the
-; store under tmp/ keeps every fact it ever learned, the queries ask
-; the chart questions as Datalog, pull shapes an answer, the time
-; views show how the chart looked at each transaction, and a
-; speculative transaction trials a change without filing it.
+; (docs/NEXTOMIC.md). The store under tmp/ keeps every fact it ever
+; learned, the queries ask the chart questions as Datalog, pull shapes
+; an answer, the time views show how the chart looked at each
+; transaction, and a speculative transaction trials a change without
+; filing it. Patients upsert by medical record number and visits by
+; their own id, so a second run over the same store still counts two
+; patients and one visit; the notes have no identity and are added
+; again, and the time views show both runs.
 ;
 ;   ./bin/nexis run examples/nextomic-app.nx
 

@@ -4,13 +4,9 @@
 ; MULTI-FILE DEMO — a Clojure-style application.
 ; ============================================================
 ;
-; Per the PLAN.md §21 Phase 5 exit criterion:
-;
-;     "A non-trivial Clojure-style application — not just a
-;      script, but a MULTI-FILE PROJECT USING atoms +
-;      protocols + records + REQUIRE + multiple stdlib
-;      utilities — runs end-to-end on nexis with no source
-;      modifications beyond namespace renames."
+; A multi-file project using atoms, protocols, records, `require`
+; and the core library, written as it would be in Clojure apart from
+; namespace names.
 ;
 ; Run:
 ;     $ ./bin/nexis run examples/shapes-app.nx
@@ -60,8 +56,8 @@
   [(r/->Circle 5)
    (r/->Rectangle 3 4)
    (r/->Triangle 6 4)
-   42                   ; treated as square (5.3d :fixnum impl)
-   "hello"              ; treated as label (5.3d :string impl)
+   42                   ; treated as square (the :fixnum impl)
+   "hello"              ; treated as label (the :string impl)
    :unknown-shape])     ; caught by :any default
 
 (println "=== multi-file shapes demo ===")

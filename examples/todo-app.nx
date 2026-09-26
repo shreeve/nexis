@@ -4,12 +4,11 @@
 ; DEMO: persistent to-do tracker.
 ; ============================================================
 ;
-; A small application with persistent state, end-to-end (the
-; PLAN.md §21 Phase 4 exit criterion).
+; A small application with persistent state, end-to-end.
 ;
 ; Run it twice:
 ;   $ ./bin/nexis run examples/todo-app.nx
-;   $ ./bin/nexis run examples/todo-app.nx   # state PERSISTS
+;   $ ./bin/nexis run examples/todo-app.nx   # starts from the first run's state
 ;
 ; Demonstrates the durable-state surface:
 ;   - db/open + db/close (Connection lifecycle)
@@ -19,7 +18,7 @@
 ;   - db/put! / db/get / db/delete! inside tx
 ;   - db/alter! read-modify-write inside tx
 ;   - db/scan ordered range iteration
-;   - db/reduce-tree server-side reduction
+;   - db/reduce-tree reduction over a whole tree
 ;   - @deref ephemeral read
 ;   - exception-driven rollback (try / throw inside with-tx)
 ;
@@ -56,7 +55,7 @@
     (db/scan t :todos)))
 
 (defn stats []
-  ; Server-side reduction: walk every todo, accumulate counts.
+  ; One reduction over the tree: walk every todo, accumulate counts.
   (with-read-tx [t conn]
     (db/reduce-tree t :todos
       (fn* [acc k v]
