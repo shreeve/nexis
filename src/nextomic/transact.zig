@@ -39,6 +39,7 @@ const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
+const sorted = @import("../coll/sorted.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -103,6 +104,32 @@ pub const CallHook = struct {
 
 /// Everything a transaction can fail with: its own errors, the
 /// db-value's, the value contract's and the store's.
+/// A map tx-data form: a hash map or a sorted one, as Datomic takes
+/// any `java.util.Map`.
+fn isMapForm(v: Value) bool {
+    return v.kind() == .persistent_map or v.kind() == .sorted_map;
+}
+
+/// The entries of a map form, in either kind's order.
+const MapEntries = union(enum) {
+    hash: champ.MapIter,
+    sorted: sorted.Cursor,
+
+    fn of(m: Value) MapEntries {
+        return if (m.kind() == .sorted_map) .{ .sorted = sorted.Cursor.init(m) } else .{ .hash = champ.mapIter(m) };
+    }
+
+    fn next(self: *MapEntries) ?sorted.Entry {
+        switch (self.*) {
+            .hash => |*it| {
+                const e = it.next() orelse return null;
+                return .{ .key = e.key, .value = e.value };
+            },
+            .sorted => |*c| return c.next(),
+        }
+    }
+};
+
 pub const Failure = Error || stack.Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
 
 pub const Options = struct {
@@ -783,7 +810,7 @@ const Ctx = struct {
                     try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
                 } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
             },
-            .persistent_map => _ = try self.normaliseMap(form),
+            .persistent_map, .sorted_map => _ = try self.normaliseMap(form),
             else => return self.malformed("a form is a vector or a map"),
         }
     }
@@ -821,7 +848,7 @@ const Ctx = struct {
         // Nested map forms recurse here, one frame per level.
         try stack.check();
         var ent: ?Ent = null;
-        var it = champ.mapIter(m);
+        var it = MapEntries.of(m);
         while (it.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) {
                 ent = try self.entityFromVm(entry.value);
@@ -830,7 +857,7 @@ const Ctx = struct {
         }
         const e: Ent = ent orelse .{ .tempid = try self.internalTempid() };
 
-        var it2 = champ.mapIter(m);
+        var it2 = MapEntries.of(m);
         while (it2.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) continue;
             const v = entry.value;
@@ -869,7 +896,7 @@ const Ctx = struct {
     /// `[referrer attr e]` for one value under a reverse ref: an entity,
     /// or a map form of one.
     fn addReverse(self: *Ctx, e: Ent, attr: *const Attr, referrer: Value) Failure!void {
-        const from = if (referrer.kind() == .persistent_map) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
+        const from = if (isMapForm(referrer)) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
         try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
     }
 
@@ -884,7 +911,7 @@ const Ctx = struct {
     /// Does a map form name its entity: a `:db/id`, or a unique
     /// attribute?
     fn carriesIdentity(self: *Ctx, m: Value) !bool {
-        var it = champ.mapIter(m);
+        var it = MapEntries.of(m);
         while (it.next()) |entry| {
             if (self.kwIs(entry.key, "db/id")) return true;
             if (entry.key.kind() != .keyword) continue;
@@ -909,7 +936,7 @@ const Ctx = struct {
     /// entity; unless the attribute is a component it must carry an
     /// identity, or nothing could ever reach it.
     fn addFromVm(self: *Ctx, e: Ent, attr: *const Attr, v: Value) Failure!void {
-        if (v.kind() == .persistent_map and attr.value_type == .ref) {
+        if (isMapForm(v) and attr.value_type == .ref) {
             if (!attr.component and !try self.carriesIdentity(v)) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute");
             const nested = try self.normaliseMap(v);
             try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested) } });

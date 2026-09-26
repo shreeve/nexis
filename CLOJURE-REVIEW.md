@@ -240,5 +240,5 @@ The deliberate ones are PLAN §4's non-goals: multimethods, STM,
 agents, `core.async`, lazy sequences, regex, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
 targets, Java interop. Library functions that do not exist
-(`sorted-map`, `sorted-set`, transducers and others) are known gaps,
-not decisions (`HANDOFF.md` §6).
+(transducers and others) are known gaps, not decisions
+(`HANDOFF.md` §6).

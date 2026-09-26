@@ -87,6 +87,7 @@ const stack = @import("stack.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
+const sorted_mod = @import("coll/sorted.zig");
 const dispatch_mod = @import("dispatch.zig");
 
 pub const Inst = vm.Inst;
@@ -1673,6 +1674,56 @@ fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value 
 /// the payload is the 2-list `(quote x)`, as `formToValue` renders
 /// it. Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
 /// syntax-quote) are `UnsupportedFeature`.
+/// Whether `items` is the marker list a sorted collection travels as
+/// in a form, `(nexis.internal/#%sorted-map k v ...)` or
+/// `(nexis.internal/#%sorted-set x ...)` (MACROEXPAND.md §5): true
+/// for a set, false for a map, null for any other list.
+fn sortedMarker(items: []const *const reader_mod.Form) ?bool {
+    if (items.len == 0 or items[0].datum != .symbol) return null;
+    const sym = items[0].datum.symbol;
+    const ns = sym.ns orelse return null;
+    if (!std.mem.eql(u8, ns, "nexis.internal")) return null;
+    if (std.mem.eql(u8, sym.name, "#%sorted-set")) return true;
+    if (std.mem.eql(u8, sym.name, "#%sorted-map")) return false;
+    return null;
+}
+
+/// A quoted sorted-collection marker as the collection itself, in the
+/// natural order: quoting it yields the collection, as quoting the
+/// value would in Clojure.
+fn lowerQuotedSorted(allocator: std.mem.Allocator, set: bool, items: []const *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+    const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
+    if (!set and items.len % 2 != 0) return CompileError.MalformedForm;
+    const order = sorted_mod.Natural{ .interner = interner };
+    var acc = sorted_mod.empty(h, if (set) .sorted_set else .sorted_map, value_mod.nilValue()) catch return CompileError.OutOfMemory;
+    var i: usize = 0;
+    while (i < items.len) : (i += if (set) 1 else 2) {
+        const k = try quotedLiteral(allocator, items[i], ctx);
+        const next = if (set)
+            sorted_mod.conj(h, acc, k, order)
+        else
+            sorted_mod.assoc(h, acc, k, try quotedLiteral(allocator, items[i + 1], ctx), order);
+        acc = next catch |err| switch (err) {
+            error.OutOfMemory => return CompileError.OutOfMemory,
+            else => return CompileError.MalformedForm,
+        };
+    }
+    return allocTiny(allocator, .{ .literal = acc });
+}
+
+/// Quoted data `item` as the constant it lowers to.
+fn quotedLiteral(allocator: std.mem.Allocator, item: *const reader_mod.Form, ctx: LowerCtx) CompileError!Value {
+    const t = try lowerQuotePayload(allocator, item, ctx);
+    return switch (t.*) {
+        .nil => value_mod.nilValue(),
+        .bool => |b| value_mod.fromBool(b),
+        .int => |n| value_mod.fromFixnum(n) orelse CompileError.MalformedForm,
+        .literal => |v| v,
+        else => CompileError.UnsupportedForm,
+    };
+}
+
 fn lowerQuotePayload(
     allocator: std.mem.Allocator,
     payload: *const reader_mod.Form,
@@ -1705,7 +1756,10 @@ fn lowerQuotePayload(
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
         // Quoted compound data: each element is quoted data too.
-        .list => |items| try lowerColl(allocator, .list, items, ctx, true),
+        .list => |items| if (sortedMarker(items)) |set|
+            try lowerQuotedSorted(allocator, set, items[1..], ctx)
+        else
+            try lowerColl(allocator, .list, items, ctx, true),
         .vector => |items| try lowerColl(allocator, .vector, items, ctx, true),
         .map => |items| try lowerColl(allocator, .map, items, ctx, true),
         .set => |items| try lowerColl(allocator, .set, items, ctx, true),

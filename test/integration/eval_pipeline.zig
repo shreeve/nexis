@@ -4435,6 +4435,14 @@ test "integration: defrecord names its type, which instance? takes, and returns 
     try expectOutput("(defrecord Q [a])", "user.Q");
 }
 
+test "integration: a macro may return a sorted collection; quoted, it is itself; it may be metadata" {
+    try expectOutput("(do (defmacro sm [] (sorted-map 2 :b 1 :a)) [(sm) (sorted? (sm))])", "[{1 :a, 2 :b} true]");
+    try expectOutput("(let [s (eval (list 'quote (sorted-set 3 1)))] [s (sorted? s)])", "[#{1 3} true]");
+    try expectOutput("(let [m (eval (list 'quote {:k (sorted-map :b 2 :a 1)}))] [m (sorted? (:k m))])", "[{:k {:a 1, :b 2}} true]");
+    try expectOutput("(do (defmacro sb [] (sorted-set-by > 1 2)) (:error (try (eval '(sb)) (catch any e e))))", ":compile-error");
+    try expectOutput("(let [m (meta (with-meta [1] (sorted-map :b 2 :a 1)))] [m (sorted? m)])", "[{:a 1, :b 2} true]");
+}
+
 test "integration: a Var calls, and derefs to, the value in force" {
     try expectOutput("[(#'inc 1) ((var +) 1 2 3) (apply #'max [3 9 4]) (map #'inc [1 2])]", "[2 6 9 (2 3)]");
     try expectOutput("(def ^:dynamic *f* inc) (binding [*f* dec] [(#'*f* 10) (@#'*f* 10) (*f* 10)])", "[9 9 9]");

@@ -218,9 +218,15 @@ propagates unchanged; a key nested too deeply to compare is
 `:stack-overflow` (the natural order checks the stack guard at each
 level).
 
-**A caller without a VM.** `vm.lookup` and `vm.callLookup` without a
-VM (the Nextomic query hook) find a sorted key by `=` in a linear walk
-instead of through the comparator.
+**A caller without a VM.** `vm.lookup` and `vm.callLookupIn` given no
+VM find a sorted key by `=` in a linear walk instead of through the
+comparator; the Nextomic query hook passes its VM.
+
+**Forms, metadata and tx-data.** A macro may return a sorted
+collection in the natural order, and quoting one yields it
+(`docs/MACROEXPAND.md` §1.2); a sorted map may be metadata
+(`docs/SEMANTICS.md` §7) and a Nextomic entity map
+(`docs/NEXTOMIC.md` §3).
 
 ---
 

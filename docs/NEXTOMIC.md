@@ -214,7 +214,9 @@ so there is no queue; emdb's write lock is the transactor.
 1. **Begin**: `wtxn = env.beginWriteWith(.{ .sync = opt })`;
    `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]` ops. tx-data is a vector or a
-   list of forms; anything else, or a malformed form, is
+   list of forms, each a list form or a map form (a hash map or a
+   sorted map, as Datomic takes any map); anything else, or a malformed
+   form, is
    `:nextomic/tx-data` with a `:message`. Entities may be an eid, a
    tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`
    (`[:db/ident :kw]` names the entity that ident names), a keyword

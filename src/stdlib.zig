@@ -463,6 +463,9 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%make-record", 2, 2, &fnMakeRecord },
     .{ "#%record?", 1, 1, &fnRecordQ },
     .{ "#%record-type-id", 1, 1, &fnRecordTypeId },
+    // A sorted collection a macro returned, as a form (MACROEXPAND.md §5).
+    .{ "#%sorted-map", 0, null, &fnSortedMap },
+    .{ "#%sorted-set", 0, null, &fnSortedSet },
     // Protocols.
     .{ "#%register-protocol", 2, 2, &fnRegisterProtocol },
     .{ "#%protocol-fn", 2, 2, &fnProtocolFn },
@@ -2698,6 +2701,9 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
     if (x.kind() == .var_) return VM.asVar(x).meta;
     if (!carriesHeaderMeta(x.kind())) return value_mod.nilValue();
     const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
+    // The metadata is a hash map or, when with-meta was given one, a
+    // sorted map.
+    if (m.kind == @intFromEnum(Kind.sorted_map)) return heap_mod.Heap.valueFromHeader(.sorted_map, m);
     return champ_mod.valueFromMapHeader(m);
 }
 
@@ -2710,7 +2716,7 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
 /// in place through `reset-meta!` / `alter-meta!` (SEMANTICS §7).
 fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     const m = args[1];
-    if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
+    if (!m.isNil() and m.kind() != .persistent_map and m.kind() != .sorted_map) return VmError.KindMismatch;
     const x = args[0];
     if (!carriesHeaderMeta(x.kind())) return switch (x.kind()) {
         .nil, .true_, .false_, .char, .fixnum, .float, .bignum, .string, .keyword, .symbol => vm.throwKeyword("no-metadata-on-immediate"),

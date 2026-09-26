@@ -121,7 +121,7 @@ const Hook = struct {
     /// applies them; anything else is the VM's `:not-callable`.
     fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
-        if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookup(f, args);
+        if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookupIn(self.vm, f, args);
         const result = try self.vm.callValue(f, args);
         try self.scope.push(result);
         return result;
