@@ -380,13 +380,7 @@ failing test (AGENTS.md).
 
 ### 6.3 Storage
 
-1. **The environment lives on the first opener's allocator**:
-   `db/open` leaves emdb's default, `page_allocator`, so an
-   environment `db/open` opened allocates its small objects a page at
-   a time, while one Nextomic opened first uses the VM's allocator.
-   Next: pass `vm.allocator` from `db/open` (it outlives every
-   connection), measured with `zig build bench -- --filter db-integrated`.
-2. **Engine bounds surface as bare keywords**: a `db/*` key past
+1. **Engine bounds surface as bare keywords**: a `db/*` key past
    4078 bytes, a stored value past just under 1 GiB and a file's 129th
    named tree are `:db/key-too-large`, `:db/value-too-large` and
    `:db/max-trees`, which name the bound but not its value or the

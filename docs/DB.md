@@ -140,9 +140,11 @@ The environment has one write transaction. `StoreFile.beginWrite`
 while any holder of the file has one open is `WriterActive`
 (`:db/busy`; Nextomic reports it as `:nextomic/nested`), never a wait.
 Read transactions run beside it. The first open sets the environment's
-options and allocator, which outlive every connection to the file; a
-file the process may read but not write opens read-only, and every
-write on it is `:db/read-only`.
+options and allocator, which outlive every connection to the file:
+`db/open` and Nextomic's `connect` both pass the VM's allocator, which
+outlives every connection the VM makes. A file the process may read
+but not write opens read-only, and every write on it is
+`:db/read-only`.
 
 #### 3.2 Transaction handles
 
