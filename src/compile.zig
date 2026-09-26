@@ -2568,12 +2568,8 @@ fn compileExpr(
     // once computed. The forms that pass the tail on to their parts
     // return through them.
     const returns = if (recur_target) |t| t.returns else false;
-    const passes_tail = switch (form.*) {
-        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
-        .do_ => |items| items.len > 0,
-        else => false,
-    };
-    if (returns and !passes_tail) {
+    const returns_here = returns and !passesTail(form);
+    if (returns_here) {
         if (form.* == .nil or form.* == .do_) return e.emit(vm.asm_.returnNil());
         if (try directOperand(e, form, true)) |op| return e.emit(Inst.primary(.call, vm.Call.@"return", op, Operand.none, Operand.none));
     }
@@ -2607,7 +2603,17 @@ fn compileExpr(
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.ns, v.name, dst),
     }
-    if (returns and !passes_tail) try e.emit(vm.asm_.returnSlot(dst));
+    if (returns_here) try e.emit(vm.asm_.returnSlot(dst));
+}
+
+/// Whether `form` passes a tail position on to its parts, which then
+/// return (or recur, or throw) on every path.
+fn passesTail(form: *const Tiny) bool {
+    return switch (form.*) {
+        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
+        .do_ => |items| items.len > 0,
+        else => false,
+    };
 }
 
 /// `coll:<op>` over the items, each compiled into its slot of one
