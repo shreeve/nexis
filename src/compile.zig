@@ -360,6 +360,12 @@ pub const RecurTarget = struct {
     /// The bindings' names, so `recur` can tell which arguments
     /// read which bindings.
     names: []const []const u8,
+    /// Whether a tail position of this target is a tail of the
+    /// function: a form there ends by returning its value itself
+    /// (`call:return`) instead of writing the destination and
+    /// falling through to the return after the body (COMPILER.md
+    /// §5.5). True for a `fn*`'s target and a `loop*` in its tail.
+    returns: bool = false,
 };
 
 // =============================================================================
@@ -925,6 +931,13 @@ const Emitter = struct {
         return pc;
     }
 
+    /// Emit `jump:if-true A=PLACEHOLDER B=test`, for back-patching.
+    fn emitJumpIfTruePlaceholder(self: *Emitter, test_op: Operand) CompileError!usize {
+        const pc = self.code.items.len;
+        try self.emit(vm.asm_.jumpIfTrue(0, test_op));
+        return pc;
+    }
+
     /// Emit `jump:jmp A=PLACEHOLDER`. Returns the PC of the
     /// emitted instruction for back-patching.
     fn emitJumpPlaceholder(self: *Emitter) CompileError!usize {
@@ -1394,11 +1407,14 @@ fn lowerList(
         if (inlinedOp(name, items.len - 1)) |in| {
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
         }
+        if (items.len == 2 and std.mem.eql(u8, name, "not") and namesCore(ctx, name)) return try lowerNot(allocator, items[1], ctx);
     } else if (items[0].datum == .symbol and std.mem.eql(u8, items[0].datum.symbol.ns.?, "nexis.core")) {
         // A qualified head is never a lexical local, so `nexis.core/+`
         // inlines unconditionally. Host macros emit these
         // (MACROEXPAND.md §5).
-        if (inlinedOp(items[0].datum.symbol.name, items.len - 1)) |in| return try lowerPrim(allocator, in, items[1..], ctx);
+        const name = items[0].datum.symbol.name;
+        if (inlinedOp(name, items.len - 1)) |in| return try lowerPrim(allocator, in, items[1..], ctx);
+        if (items.len == 2 and std.mem.eql(u8, name, "not")) return try lowerNot(allocator, items[1], ctx);
     }
     // Ordinary call: lower head as callee, rest as args.
     return try lowerCall(allocator, items, ctx);
@@ -1481,6 +1497,16 @@ fn lowerIf(
         .test_ = test_,
         .then = then,
         .else_ = else_,
+    } });
+}
+
+/// `(not x)` as `(if x false true)`, which is what `nexis.core/not`
+/// computes: an `if` testing it branches on `x` (§4.3 rule 2).
+fn lowerNot(allocator: std.mem.Allocator, arg: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
+    return try allocTiny(allocator, .{ .if_ = .{
+        .test_ = try lowerForm(allocator, arg, ctx),
+        .then = try allocTiny(allocator, .{ .bool = false }),
+        .else_ = try allocTiny(allocator, .{ .bool = true }),
     } });
 }
 
@@ -2525,6 +2551,16 @@ fn compileExpr(
     // What this node allocates is dead once it is compiled.
     const slot_mark = e.slot_top;
     defer e.slot_top = slot_mark;
+    // In a tail of the function a form returns its value itself: in
+    // place when it is a literal, a local or a Var, else from `dst`
+    // once computed. The forms that pass the tail on to their parts
+    // return through them.
+    const returns = if (recur_target) |t| t.returns else false;
+    const returns_here = returns and !passesTail(form);
+    if (returns_here) {
+        if (form.* == .nil or form.* == .do_) return e.emit(vm.asm_.returnNil());
+        if (try directOperand(e, form, true)) |op| return e.emit(Inst.primary(.call, vm.Call.@"return", op, Operand.none, Operand.none));
+    }
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
@@ -2550,11 +2586,22 @@ fn compileExpr(
         }, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
-        .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
+        .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst, returns),
         .recur => |r| try compileRecur(e, r.args, recur_target),
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.ns, v.name, dst),
     }
+    if (returns_here) try e.emit(vm.asm_.returnSlot(dst));
+}
+
+/// Whether `form` passes a tail position on to its parts, which then
+/// return (or recur, or throw) on every path.
+fn passesTail(form: *const Tiny) bool {
+    return switch (form.*) {
+        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
+        .do_ => |items| items.len > 0,
+        else => false,
+    };
 }
 
 /// `coll:<op>` over the items, each compiled into its slot of one
@@ -2576,6 +2623,18 @@ fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst
     const a = try compileOperand(e, lhs, rhs == null or isLeaf(rhs.?));
     const b = if (rhs) |r| try compileOperand(e, r, true) else Operand.none;
     try e.emit(op.inst(dst, a, b));
+}
+
+/// A node whose evaluation has no effect and cannot fail: a literal
+/// or a local of this routine. (A Var's read fails while it is
+/// unbound.)
+fn isInert(e: *const Emitter, t: *const Tiny) bool {
+    return switch (t.*) {
+        .nil, .bool, .literal => true,
+        .int => |n| value_mod.isFixnumRange(n),
+        .symbol => |name| e.resolveLocalRef(name) != null,
+        else => false,
+    };
 }
 
 /// A node that evaluates without running code: a literal or a
@@ -2763,6 +2822,9 @@ fn bindSequential(e: *Emitter, bindings: []const Binding, slots: ?[]u12) Compile
     }
 }
 
+/// `let*` binds as `bindSequential`, except that a binding whose
+/// value is a local already held in a slot names that slot instead
+/// of copying it (`aliasSlot`).
 fn compileLetStar(
     e: *Emitter,
     bindings: []const Binding,
@@ -2774,9 +2836,55 @@ fn compileLetStar(
     // behind for a recovering caller.
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
-    try bindSequential(e, bindings, null);
+    for (bindings) |b| {
+        if (try aliasSlot(e, b, body, recur_target)) |slot| {
+            try e.scope.append(e.allocator, .{ .name = b.name, .ref = .{ .direct_slot = slot } });
+            continue;
+        }
+        const slot = try e.allocSlot();
+        try compileExpr(e, b.value, slot, null);
+        try e.bindLocal(b.name, slot, b.captured);
+    }
     // The body is in the let's own tail position.
     try compileExpr(e, body, dst, recur_target);
+}
+
+/// The slot a `let*` binding can share instead of taking its own
+/// (COMPILER.md §4.4, aliasing): its value is a symbol naming an
+/// uncaptured local of this routine, the binding is not captured
+/// (a cell would box the shared slot), and nothing rewrites the
+/// slot while the binding is in scope. The only instruction that
+/// rewrites a bound slot is a `recur` rebinding its target's
+/// bindings, and a `recur` inside the scope can only target the
+/// `let*`'s own target, from the body's tail.
+fn aliasSlot(e: *Emitter, b: Binding, body: *const Tiny, recur_target: ?*const RecurTarget) CompileError!?u12 {
+    if (b.captured) return null;
+    const name = switch (b.value.*) {
+        .symbol => |n| n,
+        else => return null,
+    };
+    const slot = switch (e.resolveLocalRef(name) orelse return null) {
+        .direct_slot => |s| s,
+        else => return null,
+    };
+    if (recur_target) |t| {
+        if (isRecurSlot(t, slot) and try mayRecur(body)) return null;
+    }
+    return slot;
+}
+
+/// Whether a tail position of `t` is a `recur`: the positions a
+/// `recur` of the enclosing target can take (COMPILER.md §4.4).
+fn mayRecur(t: *const Tiny) CompileError!bool {
+    try stack.check();
+    return switch (t.*) {
+        .recur => true,
+        .if_ => |i| try mayRecur(i.then) or (if (i.else_) |x| try mayRecur(x) else false),
+        .do_ => |items| items.len > 0 and try mayRecur(items[items.len - 1]),
+        .let_star => |l| try mayRecur(l.body),
+        .letfn_star => |l| try mayRecur(l.body),
+        else => false,
+    };
 }
 
 /// Lower `(try body (catch any binding handler) (finally body))`.
@@ -2897,6 +3005,7 @@ fn compileLoopStar(
     bindings: []const Binding,
     body: *const Tiny,
     dst: u12,
+    returns: bool,
 ) CompileError!void {
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
@@ -2918,6 +3027,7 @@ fn compileLoopStar(
         .binding_slots = binding_slots,
         .captured_mask = captured_mask,
         .names = names,
+        .returns = returns,
     };
 
     // 5. Compile body with the loop target installed. The
@@ -3043,14 +3153,55 @@ fn compileDo(
         try compileExpr(e, exprs[0], dst, recur_target);
         return;
     }
-    // The forms before the last run for effect, into one discard
-    // slot, and are not in tail position.
-    const discard = try e.allocSlot();
-    for (exprs[0 .. exprs.len - 1]) |expr| {
-        try compileExpr(e, expr, discard, null);
-    }
+    // The forms before the last run for effect and are not in tail
+    // position.
+    for (exprs[0 .. exprs.len - 1]) |expr| try compileEffect(e, expr);
     // Last expression IS tail position; inherit recur target.
     try compileExpr(e, exprs[exprs.len - 1], dst, recur_target);
+}
+
+/// Compile `t` for its effect alone (COMPILER.md §5.3): a form that
+/// runs no code and cannot fail is dropped, a `do` is its forms for
+/// effect, and an `if` runs its arms for effect, so an arm that is
+/// dropped costs no jump and no nil. Anything else computes into a
+/// slot freed at once.
+fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
+    if (isInert(e, t)) return;
+    const saved_span = e.current_span;
+    defer e.current_span = saved_span;
+    if (e.spanned) {
+        const node: *const TinyNode = @fieldParentPtr("tiny", t);
+        if (node.span) |span| e.current_span = span;
+    }
+    errdefer if (e.diag) |d| {
+        if (d.span == null) d.span = e.current_span;
+    };
+    try stack.check();
+    const slot_mark = e.slot_top;
+    defer e.slot_top = slot_mark;
+    switch (t.*) {
+        .do_ => |items| for (items) |item| try compileEffect(e, item),
+        .if_ => |i| {
+            const else_inert = i.else_ == null or isInert(e, i.else_.?);
+            if (isInert(e, i.then) and else_inert) return compileEffect(e, i.test_);
+            var skip: Jumps = .empty;
+            defer skip.deinit(e.allocator);
+            if (isInert(e, i.then)) {
+                // Only the else arm runs code: skip it when the test holds.
+                try compileBranch(e, i.test_, true, &skip);
+                try compileEffect(e, i.else_.?);
+                return patchJumpsHere(e, skip.items);
+            }
+            try compileBranch(e, i.test_, false, &skip);
+            try compileEffect(e, i.then);
+            if (else_inert) return patchJumpsHere(e, skip.items);
+            const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitJumpPlaceholder();
+            try patchJumpsHere(e, skip.items);
+            try compileEffect(e, i.else_.?);
+            if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+        },
+        else => try compileExpr(e, t, try e.allocSlot(), null),
+    }
 }
 
 /// What `compileFn` builds a routine from: a `fn*`, or a `letfn*`
@@ -3132,10 +3283,11 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
         .binding_slots = slots,
         .captured_mask = captured,
         .names = names,
+        .returns = true,
     };
+    // The body returns on every path that does not recur or throw.
     const result_slot = try child.allocSlot();
     try compileExpr(&child, f.body, result_slot, &fn_target);
-    try child.emit(vm.asm_.returnSlot(result_slot));
 
     const sources = try parent.out.dupe(vm.CaptureSource, child.captures.items);
     const upvalue_count: u16 = @intCast(child.captures.items.len);
@@ -3280,24 +3432,92 @@ fn compileIf(
     dst: u12,
     recur_target: ?*const RecurTarget,
 ) CompileError!void {
-    // The test is non-tail and read in place where it can be; a
-    // slot it needed is free again once the jump has read it.
-    const slot_mark = e.slot_top;
-    const test_op = try compileOperand(e, test_form, true);
-    const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
-    e.slot_top = slot_mark;
+    // The test is non-tail and branched on (`compileBranch`).
+    var if_false: Jumps = .empty;
+    defer if_false.deinit(e.allocator);
+    try compileBranch(e, test_form, false, &if_false);
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
-    // An arm that always jumps away (recur, throw) needs no jump
-    // past the else arm.
-    const end_jmp_pc: ?usize = if (neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
-    try e.patchJumpHere(if_false_pc);
+    // An arm that always jumps away (recur, throw) or returns needs
+    // no jump past the else arm.
+    const returns = if (recur_target) |t| t.returns else false;
+    const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
+    try patchJumpsHere(e, if_false.items);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
     } else {
-        try e.emit(vm.asm_.loadNil(dst));
+        try e.emit(if (returns) vm.asm_.returnNil() else vm.asm_.loadNil(dst));
     }
     if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+}
+
+/// The pcs of jumps a caller points at one target.
+const Jumps = std.ArrayList(usize);
+
+fn patchJumpsHere(e: *Emitter, pcs: []const usize) CompileError!void {
+    for (pcs) |pc| try e.patchJumpHere(pc);
+}
+
+/// Emit `t` as a branch: control jumps (from a pc added to `jumps`)
+/// when `t`'s truthiness is `jump_when` and falls through otherwise;
+/// the test is read in place where it can be, and a slot it needed
+/// is free again after the jump. An `and` or an `or` branches on
+/// each operand in turn and a `not` on its operand, so their values
+/// are never made (COMPILER.md §5.2).
+fn compileBranch(e: *Emitter, t: *const Tiny, jump_when: bool, jumps: *Jumps) CompileError!void {
+    try stack.check();
+    // `(if x true false)` is x's truthiness, `(if x false true)`
+    // (a `not`) its negation.
+    if (t.* == .if_ and t.if_.else_ != null and t.if_.then.* == .bool and t.if_.else_.?.* == .bool and t.if_.then.bool != t.if_.else_.?.bool) {
+        return compileBranch(e, t.if_.test_, if (t.if_.then.bool) jump_when else !jump_when, jumps);
+    }
+    if (try andOr(t)) |ao| {
+        if (ao.is_and != jump_when) {
+            // Either operand alone decides a jump: an and that is
+            // false, an or that is true.
+            try compileBranch(e, ao.first, jump_when, jumps);
+            try compileBranch(e, ao.rest, jump_when, jumps);
+        } else {
+            // The first operand can only decide the fall-through.
+            var decided: Jumps = .empty;
+            defer decided.deinit(e.allocator);
+            try compileBranch(e, ao.first, !jump_when, &decided);
+            try compileBranch(e, ao.rest, jump_when, jumps);
+            try patchJumpsHere(e, decided.items);
+        }
+        return;
+    }
+    const slot_mark = e.slot_top;
+    defer e.slot_top = slot_mark;
+    const op = try compileOperand(e, t, true);
+    try jumps.append(e.allocator, if (jump_when) try e.emitJumpIfTruePlaceholder(op) else try e.emitJumpIfFalsePlaceholder(op));
+}
+
+const AndOr = struct { is_and: bool, first: *const Tiny, rest: *const Tiny };
+
+/// `t` as the operands of an `and` or an `or`, when it has the shape
+/// the expander gives them (MACROEXPAND.md §10): `(let* [g x] (if g
+/// rest g))` or `(let* [g x] (if g g rest))`, `rest` not naming `g`.
+fn andOr(t: *const Tiny) CompileError!?AndOr {
+    const l = switch (t.*) {
+        .let_star => |l| l,
+        else => return null,
+    };
+    if (l.bindings.len != 1) return null;
+    const g = l.bindings[0].name;
+    const i = switch (l.body.*) {
+        .if_ => |i| i,
+        else => return null,
+    };
+    const else_form = i.else_ orelse return null;
+    if (!namesSymbol(i.test_, g)) return null;
+    if (namesSymbol(else_form, g) and !try readsName(i.then, g)) return .{ .is_and = true, .first = l.bindings[0].value, .rest = i.then };
+    if (namesSymbol(i.then, g) and !try readsName(else_form, g)) return .{ .is_and = false, .first = l.bindings[0].value, .rest = else_form };
+    return null;
+}
+
+fn namesSymbol(t: *const Tiny, name: []const u8) bool {
+    return t.* == .symbol and std.mem.eql(u8, t.symbol, name);
 }
 
 /// Whether control never reaches the end of `t`'s code: every path
@@ -3566,12 +3786,13 @@ test "bytecode: forms compile and run in a bare namespace" {
     try testing.expectEqual(@as(i64, 7), (try v.run()).asFixnum());
 }
 
-/// `(do nil nil ... tail)`: `pad` nils, each one instruction, ahead
-/// of `tail`, so the code `tail` emits starts at pc `pad`.
+/// `(do (inc 1) (inc 1) ... tail)`: `pad` increments, each one
+/// instruction, ahead of `tail`, so the code `tail` emits starts at
+/// pc `pad`.
 fn paddedSource(allocator: std.mem.Allocator, pad: usize, tail: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(allocator, "(do");
-    for (0..pad) |_| try out.appendSlice(allocator, " nil");
+    for (0..pad) |_| try out.appendSlice(allocator, " (inc 1)");
     try out.print(allocator, " {s})", .{tail});
     return out.toOwnedSlice(allocator);
 }
@@ -3617,7 +3838,7 @@ test "routine limits: at most 4096 constants" {
     for ([_]struct { n: usize, ok: bool }{ .{ .n = 4096, .ok = true }, .{ .n = 4097, .ok = false } }) |c| {
         var src: std.ArrayList(u8) = .empty;
         try src.appendSlice(a, "(do");
-        for (0..c.n) |i| try src.print(a, " {d}", .{i});
+        for (0..c.n) |i| try src.print(a, " (inc {d})", .{i});
         try src.appendSlice(a, ")");
         if (c.ok) {
             _ = try compileSourceWith(a, src.items, .{});

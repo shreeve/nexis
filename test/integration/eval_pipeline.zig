@@ -1363,6 +1363,8 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutputProgram("(def y 5) (defonce y 6) y", "5");
     try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
+    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") {:error :assertion-failed}]");
+    try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
 }
 
@@ -2975,6 +2977,25 @@ test "case: a test constant given twice fails at expansion, as in Clojure" {
     try expectMacroFailure("", "(case x (a a) :a)", "case: duplicate test constant", "a");
     // Equal-looking constants of different kinds, and a default equal to a key, are not duplicates.
     try expectOutput("[(case 1 1 :int 1.0 :float \\1 :char \"1\" :str :d) (case 1 1 :a 1)]", "[:int :a]");
+}
+
+test "case: three or more constants dispatch through one lookup with the chain's answers" {
+    // Every kind of atom, one compound constant, grouped and alone,
+    // and a miss.
+    try expectOutput(
+        \\(let [f (fn [x] (case x :a 1 (:b :c) 2 "s" 3 \c 4 nil 5 [1 2] 6 sym 8 1.0 9 1 10 () 11 :none))]
+        \\  (mapv f [:a :b :c "s" \c nil [1 2] '(1 2) 'sym 1.0 1 2 :zz false]))
+    , "[1 2 2 3 4 5 6 6 8 9 10 :none :none :none]");
+    // Of two constants that are = but spelled differently, the first
+    // clause wins: a case with two compound constants keeps the chain.
+    try expectOutput("[(case [1] ((1)) :list [1] :vec 0 :zero) (case '(1) [1] :vec ((1)) :list 0 :zero)]", "[:list :vec]");
+    try expectOutput(
+        \\(try (case 99 1 :one 2 :two 3 :three) (catch any e [(:error e) (:value e) (:message e)]))
+    , "[:no-matching-clause 99 No matching clause: 99]");
+    // The dispatch value is evaluated once, before any test.
+    try expectOutput("(let [n (atom 0)] [(case (swap! n inc) 1 :one 2 :two 3 :three) (case (swap! n inc) 1 :one 2 :two 3 :three :d) @n])", "[:one :two 2]");
+    // Locals named after the core fns the expansion calls do not capture it.
+    try expectOutput("(let [get (fn [& _] 0) == (fn [& _] true)] (case 2 1 :a 2 :b 3 :c))", ":b");
 }
 
 test "case: no match without default throws a map naming the value" {
@@ -5557,6 +5578,22 @@ test "nexis.test: is returns whether the assertion passed and deftest yields the
         \\(reset! nexis.test/counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
         \\[(nexis.test/is (= 1 1)) (nexis.test/is (= 1 2)) (nexis.test/is nil) (fn? @(var t))]
     , "[true false false true]");
+}
+
+test "nexis.test: thrown? takes what its catch would take, and a message is evaluated once" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(reset! nexis.test/counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
+        \\(def n (atom 0))
+        \\[(nexis.test/is (nexis.test/thrown? :x (throw {:error :x})))
+        \\ (nexis.test/is (nexis.test/thrown? :default (throw 1)))
+        \\ (nexis.test/is (nexis.test/thrown? Exception (throw 1)))
+        \\ (try (nexis.test/is (nexis.test/thrown? :x (throw :y))) (catch any e [:went-on e]))
+        \\ (nexis.test/is (= 1 1) (str "m" (swap! n inc)))
+        \\ (nexis.test/is (= 1 2) (str "m" (swap! n inc)))
+        \\ @n @log @nexis.test/counts]
+    , "[true true true [:went-on :y] true false 2 [FAIL in /: (= 1 2) expected: 1 actual: 2 ; m2] {test 0, pass 4, fail 1, error 0}]");
 }
 
 test "nexis.pprint: a short collection prints flat, a long one breaks from its column" {

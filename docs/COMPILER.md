@@ -134,6 +134,9 @@ and a reused subform its own (MACROEXPAND.md §4b).
    | 2 | `+` `-` `*` `/` `quot` `mod` `<` `<=` `>` `>=` `==` |
    | 1 | `-` (negate), `abs`, `inc` and `dec` (`+` / `-` with a constant 1) |
 
+   `(not x)` inlines the same way, as `(if x false true)`, which is
+   what the fn computes; as an `if` test it is a branch (§5.2).
+
    It inlines only when the operator means `nexis.core`'s Var
    (`namesCore`): it is not lexically bound, the namespace resolves it
    to `nexis.core`'s Var rather than one it defines or refers to, and
@@ -222,6 +225,13 @@ constant pool, Var table, capture descriptors, span table,
   `finally` computes its value into a temporary and moves it to the
   destination after the finally has run (§5.10). This is what lets a
   `recur` argument compile straight into its binding's slot (§5.6).
+- **Aliases share a slot.** A `let*` binding whose value is a local
+  held directly in a slot, and which no closure captures, names that
+  slot instead of copying it, so `(let* [g x] ...)` from a macro
+  costs nothing. A bound slot is rewritten only by a `recur` of its
+  target, so the alias is refused when the slot is one of the
+  enclosing target's bindings and a tail position of the `let*`
+  body is a `recur`.
 - **Operands in place.** A `math` or `cmp` instruction,
   `jump:if-false`, `var:store-var` and `ctrl:throw` read a literal (as
   a constant), a local held directly in its slot, an upvalue or a Var
@@ -297,6 +307,48 @@ reported at the instruction that raised it.
 - `(require ...)` runs through the expander and `src/loader.zig`
   (MACROEXPAND.md §8).
 
+#### 4.8 What common forms cost
+
+Instructions `bin/nexis disasm` lists for each form as the whole body
+of `(defn f [a b c m xs] ...)`, its return included (a value in the
+tail is returned in place, §5.5); `g` and `h` are Vars, `pm` a
+protocol method. `test/prop/compile.zig` pins a set of such shapes.
+
+| Form | Instructions |
+|---|---:|
+| `(g (h a) (h b) (h c))` | 12 |
+| `(g a b c)` | 6 |
+| `(str "a" a "b" b)` | 7 |
+| `{:a (inc a) :b (g b) :c c}` | 10 |
+| `(pm a)`, `(:x a)` | 4 |
+| `(is (= 1 (inc (dec a))))` | 8 |
+| `(is (pos? a))` | 8 |
+| `(is (thrown? :x (g a)))` | 16 |
+| `(let [[x y & r] xs] (g x y r))` | 21 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))` | 15 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 20 |
+| `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
+| `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
+| `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |
+| `(condp = a 1 :a 2 :b 3 :c :d)` | 20 |
+| `(when-let [x (g a)] (h x))` | 9 |
+| `(if-let [x (g a)] (h x) (h b))` | 12 |
+| `(and (h a) (h b) (h c))` | 14 |
+| `(-> a (g b) (h) (g c))` | 10 |
+| `(doseq [x xs] (g x))` | 15 |
+| `(for [x xs] (h x))` | 24 |
+| `(dotimes [i a] (g i))` | 9 |
+| `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
+| `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
+| `(assert (pos? a) "a must be positive")` | 10 |
+
+A call's arguments compute straight into its block; an argument that
+is already in a slot (a parameter, a `let` binding) is one `mov:move`
+into it, a constant one `mov:load-const`, the callee one
+`var:load-var`, as the range-call ABI (VM.md §6) needs every one of
+them in the block. A `let` binding that only renames a local costs
+nothing (§4.4).
+
 ---
 
 ### 5. Primitive core lowering
@@ -321,10 +373,28 @@ the else label; `then` into the result slot; `jump:jmp` to the end,
 unless every path through `then` ends in `recur` or `throw`; the else
 branch (nil when absent).
 
+The test is compiled as branches rather than as a value: a `not`
+(`(if x false true)`, §4.3 rule 2) branches on `x` the other way, and
+an `and` or an `or` in the shape the expander gives them
+(`(let* [g x] (if g rest g))`, `(let* [g x] (if g g rest))`,
+MACROEXPAND.md §10) branches on `x` and then on `rest`, jumping to the
+else arm (or past it, with `jump:if-true`) as soon as the answer is
+known, so none of the three is ever made as a value:
+`(if (and a (not b)) x y)` with `a` and `b` locals is
+`jump:if-false a`, `jump:if-true b`, then the arms. For effect (§5.3)
+an `if` whose `then` is dropped branches past its else arm when the
+test holds, so `(when-not x (f))` there is the test, the branch and
+the call.
+
 #### 5.3 `(do expr...)`
 
 Every expression but the last compiles for effect; the last into the
-result slot. `(do)` is nil, and so is every empty body: `(fn* [])`,
+result slot. For effect, a form that runs no code and cannot fail (a
+literal, a local; not a Var, whose read fails while it is unbound)
+emits nothing, a `do` is its forms for effect, and an `if` runs its
+arms for effect, so a dropped arm costs neither the jump past it nor
+the nil it would have been: `(do (when x (f)) y)` is the test, the
+call and the read of `y`. `(do)` is nil, and so is every empty body: `(fn* [])`,
 `(let* [x 1])`, `(loop* [x 1])`, a `letfn*` without a body, a `try`
 body or handler with no forms. The literal `()` is the empty list.
 
@@ -332,7 +402,8 @@ body or handler with no forms. The literal `()` is the empty list.
 
 Each binding takes a slot; each value compiles into it in order, and
 a captured binding is boxed with `closure:box-local` immediately
-(§6.1). The body compiles as `do`.
+(§6.1), except that a binding to a local shares that local's slot
+when §4.4 allows it. The body compiles as `do`.
 
 #### 5.5 `(fn* name? [params... & rest?] body...)`
 
@@ -348,6 +419,15 @@ a captured binding is boxed with `closure:box-local` immediately
   captured parameter, rest included, is boxed at function entry.
 - `fn*` takes one parameter vector; multi-arity `fn` and `defn` are
   the expander's (MACROEXPAND.md §10).
+
+**Returns in the tail.** The body's tail positions (§4.4) return the
+value themselves: a literal, a local or a Var with `call:return` of
+the operand in place (nil with `call:return-nil`), any other form by
+computing into the result slot and returning it. An `if` passes the
+tail to both arms, so neither jumps to a shared return, and a `loop*`
+in the tail passes it to its body. `(fn* [a] (if a 1))` is
+`jump:if-false`, `call:return c`, `call:return-nil`. The tail never
+reaches into a `try` (§5.10), so no return leaves a handler behind.
 
 **Self-name.** When the body refers to its self-name, the closure
 does not exist yet at `closure:make`, so the self-reference goes
@@ -616,8 +696,9 @@ failure, on the calling VM, a catchable value like any other throw
 - The `Emitter` attributes every instruction to the innermost node
   being compiled: `compileExpr` sets the current span on entry and
   restores the parent's on exit, so an instruction a parent emits
-  after its children (`call:call` after the arguments, `call:return`
-  after a body) carries the parent's span. `emit` grows a run-length
+  after its children (`call:call` after the arguments, the
+  `call:return` of a computed value in a function's tail) carries the
+  parent's span. `emit` grows a run-length
   table, one `SpanEntry{pc, span}` per change of span, ascending by pc.
 - Each `Routine` carries the table (`spans`), the span of the form it
   was lowered from (`origin`) and the `vm.SourceInfo{path, text}` the
@@ -645,12 +726,15 @@ limits of §4.4, the span table, declared names and the stack guard.
 `bin/nexis` boots one: the `cases` table (source and printed value for
 every primitive-core form, binding and capture shape, `recur` target,
 quoted literal and the host macros the compiler relies on), the
-`failures` table (source and error), inlining, slot reuse, constant
-collections, `eval`'s freeing, the randomized properties (capture at
-nesting depth 1..10, syntax-quote equal to the hand-built shape), and
-a differential test comparing random programs over arithmetic, `if`,
-shadowing `let*`, closures and counting `loop*`s against a reference
-evaluator. `test/integration/eval_pipeline.zig` runs source end to
+`failures` table (source and error), inlining, the instruction counts
+of common shapes (§4.8), slot reuse, constant collections, `eval`'s
+freeing, the randomized properties (capture at nesting depth 1..10,
+syntax-quote equal to the hand-built shape), and a differential test
+comparing random programs over arithmetic, `if` (on a comparison, or
+on an `and` or `or` of comparisons, one negated), shadowing `let*`,
+closures, calls of one and two arguments nested in each other's
+arguments, a call whose argument throws, and counting `loop*`s read
+directly and through `let*` aliases, against a reference evaluator. `test/integration/eval_pipeline.zig` runs source end to
 end through every host macro and every `try` exit path.
 
 #### 9.4 Guarantees the tests pin

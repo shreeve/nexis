@@ -1604,11 +1604,13 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 ///
 ///   (fn name? [& args#]
 ///     (let* [n# (count args#)]
-///       (if (= n# 1) (loop [p1 (nth args# 0 nil)] b1)
-///       (if (= n# 2) (loop [p1 (nth args# 0 nil) p2 (nth args# 1 nil)] b2)
-///       (if (not (< n# k)) (loop [... r (next ... args#)] bv)
+///       (if (== n# 1) (loop [p1 (first args#)] b1)
+///       (if (== n# 2) (loop [p1 (first args#) p2 (nth args# 1)] b2)
+///       (if (>= n# k) (loop [... r (next ... args#)] bv)
 ///       (throw :arity-mismatch))))))
 ///
+/// `n#` is a count, so the tests are the inlined fixnum compares, and
+/// every `nth` is in range once its clause's test has passed.
 /// Fixed arities are tested in source order and the variadic clause
 /// last, so an exact arity wins over the variadic one. At most one
 /// clause is variadic, its fixed count is not below any fixed
@@ -1652,7 +1654,10 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
         i -= 1;
         const a = if (i == fixed_arities.items.len) variadic.? else fixed_arities.items[i];
         var bindings: std.ArrayList(*Form) = .empty;
-        for (a.params[0..a.fixed], 0..) |p, k| try bindings.appendSlice(ctx.allocator, &.{ p, try b.list(.{ "nexis.core/nth", args, k, null }) });
+        for (a.params[0..a.fixed], 0..) |p, k| {
+            const arg = if (k == 0) try b.list(.{ "nexis.core/first", args }) else try b.list(.{ "nexis.core/nth", args, k });
+            try bindings.appendSlice(ctx.allocator, &.{ p, arg });
+        }
         if (a.variadic) {
             // `next`, as `nthnext`: an empty rest is nil, as the VM
             // binds a single-arity fn's (VM.md §6).
@@ -1661,10 +1666,7 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             const pattern = a.params[a.fixed + 1];
             try bindings.appendSlice(ctx.allocator, &.{ pattern, try restSource(b, pattern, rest) });
         }
-        const test_form = if (a.variadic)
-            try b.list(.{ "nexis.core/not", try b.list(.{ "nexis.core/<", n, a.fixed }) })
-        else
-            try b.list(.{ "nexis.core/=", n, a.fixed });
+        const test_form = try b.list(.{ if (a.variadic) "nexis.core/>=" else "nexis.core/==", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
         // on entry and after every `recur`.
         chain = try b.list(.{ "if", test_form, try b.list(.{ "nexis.core/loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
@@ -1936,14 +1938,35 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     var chain = try b.item(null);
     var i = args.len;
+    // A last test that is a truthy literal (`:else`) is no test.
+    if (i >= 2 and isTruthyLiteral(args[i - 2])) {
+        chain = mutCast(args[i - 1]);
+        i -= 2;
+    }
     while (i >= 2) : (i -= 2) chain = try b.list(.{ "if", args[i - 2], args[i - 1], chain });
     return chain;
 }
 
+/// A form whose value is known truthy without running code: a
+/// keyword, `true`, a number, a string or a char.
+fn isTruthyLiteral(form: *const Form) bool {
+    return switch (form.datum) {
+        .keyword, .int, .bigint, .real, .string, .char => true,
+        .bool_ => |v| v,
+        else => false,
+    };
+}
+
 // ---- case / condp ------------------------------------------------
 //
-//   (case e k1 v1 k2 v2 ... default?)
+//   (case e k1 v1 k2 v2 ... default?), fewer than three constants
 //     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
+//   three or more, no two of which could be `=` while spelled
+//   differently: one hashed lookup of the clause's index in a
+//   constant map, then fixnum compares, each one instruction
+//     => (let* [g e i (get '{k1 0 k2 1 ...} g -1)]
+//          (if (== i 0) v1 (if (== i 1) v2 ... terminal)))
+//     (without `g` when there is a default: e goes straight to get)
 //   (condp pred e c1 v1 ... default?)
 //     => (let* [p pred g e] (if (p c1 g) v1 ... terminal))
 //   a clause `c :>> f` calls `f` on the predicate's truthy result.
@@ -1954,7 +1977,13 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 // there is one, else the throw of `{:error :no-matching-clause
 // :message "No matching clause: <e>" :value e}` (Clojure's
 // IllegalArgumentException carries the same message). The dispatch
-// value, and condp's predicate, are evaluated once.
+// value, and condp's predicate, are evaluated once. The map's lookup
+// is `=`'s equality (dispatch.equal and its hash). Two constants
+// that are `=` but spelled differently (`[1]` and a grouped `(1)`)
+// would be one key of the map, where the chain lets the first clause
+// win, so a case with two compound constants (or two bignums) keeps
+// the chain. The map lists the constants in clause order, so they
+// are interned in source order.
 
 fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len == 0) return ctx.fail(call_form.origin, "case: expected an expression", .{});
@@ -1971,13 +2000,48 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
             try keys.append(ctx.allocator, alt);
         }
     }
-    var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    const has_default = clauses.len % 2 == 1;
+    var chain = if (has_default) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    if (keys.items.len < 3 or mayShareKey(keys.items)) {
+        var i = clauses.len / 2;
+        while (i > 0) {
+            i -= 1;
+            chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
+        }
+        return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+    }
+    const index = try b.gensym("case");
+    var table: std.ArrayList(*Form) = .empty;
+    for (0..clauses.len / 2) |c| {
+        const key = clauses[2 * c];
+        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
+        for (alternatives) |alt| try table.appendSlice(ctx.allocator, &.{ mutCast(alt), try b.item(c) });
+    }
     var i = clauses.len / 2;
     while (i > 0) {
         i -= 1;
-        chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
+        const key = clauses[2 * i];
+        if (key.datum == .list and key.datum.list.len == 0) continue;
+        chain = try b.list(.{ "if", try b.list(.{ "nexis.core/==", index, i }), clauses[2 * i + 1], chain });
     }
-    return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+    const lookup = try b.list(.{ "nexis.core/get", try b.list(.{ "quote", try makeForm(ctx, .{ .map = table.items }, b.origin) }), if (has_default) args[0] else g, -1 });
+    const bindings = if (has_default) try b.vec(.{ index, lookup }) else try b.vec(.{ g, args[0], index, lookup });
+    return b.list(.{ "let*", bindings, chain });
+}
+
+/// Whether two of the `case` constants `keys`, none the same datum
+/// as another, could still be `=`: two compound constants (a list is
+/// `=` to a vector of the same items, a map to one listing its
+/// entries in another order) or two bignums.
+fn mayShareKey(keys: []const *const Form) bool {
+    var compounds: usize = 0;
+    var bignums: usize = 0;
+    for (keys) |k| switch (k.datum) {
+        .int, .real, .char, .string, .keyword, .symbol, .nil, .bool_ => {},
+        .bigint => bignums += 1,
+        else => compounds += 1,
+    };
+    return compounds > 1 or bignums > 1;
 }
 
 /// Whether the `case` constants `a` and `b` are one datum: the same

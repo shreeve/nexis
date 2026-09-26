@@ -230,7 +230,14 @@ t])` only makes the alias.
   throw the matcher does not take propagates and counts as an error.
   `(is expr msg?)` passes when `expr` is truthy. Every `is` returns
   whether it passed. The head is matched by name, so `t/thrown?` and
-  `thrown?` are the same.
+  `thrown?` are the same. `msg` is evaluated once, after the values,
+  whether the assertion passes or fails, as in Clojure. An assertion
+  is one call of a helper (`check=`, `check-truthy`; a
+  `thrown?` with a keyword tag is a `try` whose handler calls
+  `check-thrown`) with the quoted form, the values and the message,
+  so the judging and the reporting are compiled once, in
+  `nexis.test`: `(is (= a 1))` is six instructions, the helper, the
+  form, the two values, the message and the call.
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
 - `(run-tests)` runs the current namespace's tests in definition
