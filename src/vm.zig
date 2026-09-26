@@ -5080,6 +5080,23 @@ test "VM opcodes: jump" {
     });
 }
 
+test "VM dispatch: a variant outside its group's enum" {
+    const none = Operand.none;
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "mov 9", .code = &.{ raw(.mov, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "call:tailcall", .code = &.{ raw(.call, @intFromEnum(Call.tailcall), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "call 9", .code = &.{ raw(.call, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "jump 9", .code = &.{ raw(.jump, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "math 20", .code = &.{ raw(.math, 20, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "var 9", .code = &.{ raw(.var_, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "closure 9", .code = &.{ raw(.closure, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "coll 9", .code = &.{ raw(.coll, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "ctrl 4", .code = &.{ raw(.ctrl, 4, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "ctrl:halt", .code = &.{ raw(.ctrl, @intFromEnum(CtrlOp.halt_), sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "simd 0", .code = &.{ raw(.simd, 0, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+    });
+}
+
 test "VM dispatch: a comparison and the conditional jump on its slot" {
     const lt = asm_.cmpLt;
     try expectRuns(comptime &[_]RunCase{
