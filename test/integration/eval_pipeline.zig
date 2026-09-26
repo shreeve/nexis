@@ -2980,13 +2980,14 @@ test "case: a test constant given twice fails at expansion, as in Clojure" {
 }
 
 test "case: three or more constants dispatch through one lookup with the chain's answers" {
-    // Every kind of constant, grouped and alone, and a miss.
+    // Every kind of atom, one compound constant, grouped and alone,
+    // and a miss.
     try expectOutput(
-        \\(let [f (fn [x] (case x :a 1 (:b :c) 2 "s" 3 \c 4 nil 5 [1 2] 6 {:k 1} 7 sym 8 1.0 9 1 10 () 11 :none))]
-        \\  (mapv f [:a :b :c "s" \c nil [1 2] '(1 2) {:k 1} 'sym 1.0 1 2 :zz false]))
-    , "[1 2 2 3 4 5 6 6 7 8 9 10 :none :none :none]");
+        \\(let [f (fn [x] (case x :a 1 (:b :c) 2 "s" 3 \c 4 nil 5 [1 2] 6 sym 8 1.0 9 1 10 () 11 :none))]
+        \\  (mapv f [:a :b :c "s" \c nil [1 2] '(1 2) 'sym 1.0 1 2 :zz false]))
+    , "[1 2 2 3 4 5 6 6 8 9 10 :none :none :none]");
     // Of two constants that are = but spelled differently, the first
-    // clause wins.
+    // clause wins: a case with two compound constants keeps the chain.
     try expectOutput("[(case [1] ((1)) :list [1] :vec 0 :zero) (case '(1) [1] :vec ((1)) :list 0 :zero)]", "[:list :vec]");
     try expectOutput(
         \\(try (case 99 1 :one 2 :two 3 :three) (catch any e [(:error e) (:value e) (:message e)]))

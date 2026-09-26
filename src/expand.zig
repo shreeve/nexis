@@ -1961,7 +1961,8 @@ fn isTruthyLiteral(form: *const Form) bool {
 //
 //   (case e k1 v1 k2 v2 ... default?), fewer than three constants
 //     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
-//   three or more: one hashed lookup of the clause's index in a
+//   three or more, no two of which could be `=` while spelled
+//   differently: one hashed lookup of the clause's index in a
 //   constant map, then fixnum compares, each one instruction
 //     => (let* [g e i (get '{k1 0 k2 1 ...} g -1)]
 //          (if (== i 0) v1 (if (== i 1) v2 ... terminal)))
@@ -1977,10 +1978,12 @@ fn isTruthyLiteral(form: *const Form) bool {
 // :message "No matching clause: <e>" :value e}` (Clojure's
 // IllegalArgumentException carries the same message). The dispatch
 // value, and condp's predicate, are evaluated once. The map's lookup
-// is `=`'s equality (dispatch.equal and its hash), and its entries
-// go in last clause first, so of two constants that are `=` but
-// spelled differently (`[1]` and a grouped `(1)`), the first clause
-// wins, as the chain of `=` tests would have it.
+// is `=`'s equality (dispatch.equal and its hash). Two constants
+// that are `=` but spelled differently (`[1]` and a grouped `(1)`)
+// would be one key of the map, where the chain lets the first clause
+// win, so a case with two compound constants (or two bignums) keeps
+// the chain. The map lists the constants in clause order, so they
+// are interned in source order.
 
 fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len == 0) return ctx.fail(call_form.origin, "case: expected an expression", .{});
@@ -1999,7 +2002,7 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     }
     const has_default = clauses.len % 2 == 1;
     var chain = if (has_default) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
-    if (keys.items.len < 3) {
+    if (keys.items.len < 3 or mayShareKey(keys.items)) {
         var i = clauses.len / 2;
         while (i > 0) {
             i -= 1;
@@ -2009,22 +2012,36 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     }
     const index = try b.gensym("case");
     var table: std.ArrayList(*Form) = .empty;
+    for (0..clauses.len / 2) |c| {
+        const key = clauses[2 * c];
+        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
+        for (alternatives) |alt| try table.appendSlice(ctx.allocator, &.{ mutCast(alt), try b.item(c) });
+    }
     var i = clauses.len / 2;
     while (i > 0) {
         i -= 1;
         const key = clauses[2 * i];
-        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
-        if (alternatives.len == 0) continue;
-        var a = alternatives.len;
-        while (a > 0) {
-            a -= 1;
-            try table.appendSlice(ctx.allocator, &.{ mutCast(alternatives[a]), try b.item(i) });
-        }
+        if (key.datum == .list and key.datum.list.len == 0) continue;
         chain = try b.list(.{ "if", try b.list(.{ "nexis.core/==", index, i }), clauses[2 * i + 1], chain });
     }
     const lookup = try b.list(.{ "nexis.core/get", try b.list(.{ "quote", try makeForm(ctx, .{ .map = table.items }, b.origin) }), if (has_default) args[0] else g, -1 });
     const bindings = if (has_default) try b.vec(.{ index, lookup }) else try b.vec(.{ g, args[0], index, lookup });
     return b.list(.{ "let*", bindings, chain });
+}
+
+/// Whether two of the `case` constants `keys`, none the same datum
+/// as another, could still be `=`: two compound constants (a list is
+/// `=` to a vector of the same items, a map to one listing its
+/// entries in another order) or two bignums.
+fn mayShareKey(keys: []const *const Form) bool {
+    var compounds: usize = 0;
+    var bignums: usize = 0;
+    for (keys) |k| switch (k.datum) {
+        .int, .real, .char, .string, .keyword, .symbol, .nil, .bool_ => {},
+        .bigint => bignums += 1,
+        else => compounds += 1,
+    };
+    return compounds > 1 or bignums > 1;
 }
 
 /// Whether the `case` constants `a` and `b` are one datum: the same
