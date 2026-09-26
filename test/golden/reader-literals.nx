@@ -1,5 +1,5 @@
 ; test/golden/reader-literals.nx — exhaustive coverage of every reader
-; construct from PLAN §7.2. Each top-level form exercises one feature.
+; construct (FORMS.md §2–§3). Each top-level form exercises one feature.
 
 ; ----------------------------------------------------------------------
 ; Numbers — decimal, hex, binary, negative, real, exponent

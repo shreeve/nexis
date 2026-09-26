@@ -28,7 +28,7 @@ that begins `#!` is a comment, so a script can be made executable. A
 file (run, tested, disassembled or required) that opens with a UTF-8
 byte-order mark is read without it, so its line-1 columns and carets
 count from the character after the mark (`test/golden/cli/bom.nx`;
-`lib/failing.nx` is required through one).
+`test/golden/cli/lib/failing.nx` is required through one).
 `exit`, `read-line` and `*command-line-args*` are STDLIB.md §6.
 
 | Exit status | Meaning |
