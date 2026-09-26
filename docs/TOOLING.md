@@ -232,7 +232,7 @@ t])` only makes the alias.
   whether it passed. The head is matched by name, so `t/thrown?` and
   `thrown?` are the same. `msg` is evaluated once, after the values,
   whether the assertion passes or fails, as in Clojure. An assertion
-  is one call of a private helper (`check=`, `check-truthy`; a
+  is one call of a helper (`check=`, `check-truthy`; a
   `thrown?` with a keyword tag is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
