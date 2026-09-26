@@ -734,6 +734,20 @@ test "slots: a routine's frame holds what is live at once, not every temporary i
     try src.appendSlice(testing.allocator, "x)");
     const compiled = try compileIn(&program, src.items);
     for (compiled.capture_descs) |d| try testing.expect(d.routine.slot_count <= 8);
+    // Nested arithmetic computes each level into the slot the level
+    // outside it reads: depth costs no slots.
+    for ([_][]const u8{ "(inc ", "(+ x ", "(- 1 " }) |level| {
+        src.clearRetainingCapacity();
+        try src.appendSlice(testing.allocator, "(fn* [x] ");
+        for (0..300) |_| try src.appendSlice(testing.allocator, level);
+        try src.appendSlice(testing.allocator, "x");
+        try src.appendNTimes(testing.allocator, ')', 301);
+        const nested = try compileIn(&program, src.items);
+        testing.expect(nested.capture_descs[0].routine.slot_count <= 3) catch |err| {
+            std.debug.print("\n  {s}...: {d} slots\n", .{ level, nested.capture_descs[0].routine.slot_count });
+            return err;
+        };
+    }
 }
 
 test "literals: constant data of any size is one constant built at compile time" {

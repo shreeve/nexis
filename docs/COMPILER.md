@@ -218,7 +218,11 @@ constant pool, Var table, capture descriptors, span table,
   so a cell slot needed after the call (per the range-call ABI,
   VM.md §6) or by a later `closure:make` is never inside it:
   `(let* [x 1, f (g), h (fn* [] x)] h)` keeps `x`'s cell below `(g)`'s
-  block.
+  block. A value computed into a fresh temporary for an operand may
+  use that temporary for its own first computed operand, since no
+  code reads it before the value's last instruction writes it: nested
+  arithmetic, `(inc (inc ... x))` or `(+ x (+ x ...))`, takes one slot
+  at any depth.
 - **The destination is written last.** Every form writes its result
   slot as its last act: nothing it evaluates runs after the write, so
   no handler inside it can see the slot half-updated. A `try` with a
@@ -690,8 +694,9 @@ symbol's own for `UnresolvedSymbol` (`LowerDiag`). An expansion error
 carries the span of the innermost form the expander failed at
 (`ExpandContext.failure`), and its reason goes to
 `CompileOptions.out_detail`; so does a limit's (`LowerDiag.detail`):
-`fn many: more than 4096 local slots`. Forms a macro produced carry the call's
-span, so an error inside an expansion is reported at the call. There
+`fn many: more than 4096 local slots`. Forms a macro produced carry
+the call's span, so an error inside an expansion is reported at the
+call. There
 is no secondary span and no expansion-provenance chain. The CLI's
 rendering of a compile error, and its exit status, are `TOOLING.md`
 §1.

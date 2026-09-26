@@ -686,6 +686,10 @@ const Emitter = struct {
     /// Receives the span of the innermost form being compiled when
     /// an error is raised; nested routines share their parent's.
     diag: ?*LowerDiag = null,
+    /// The temporary `compileOperand` is computing a value into: no
+    /// code reads it until the value's last instruction writes it, so
+    /// that value's own evaluation may use it as working space.
+    scratch: ?u12 = null,
     /// Whether this routine is a `fn*`'s, and its name when it has
     /// one: what a limit error names.
     is_fn: bool = false,
@@ -2706,9 +2710,24 @@ fn loadCore(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
 /// call's arguments are; it reads a Var in place only when computing
 /// the right one runs no code that could change the Var.
 fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst: u12) CompileError!void {
-    const a = try compileOperand(e, lhs, rhs == null or isLeaf(rhs.?));
-    const b = if (rhs) |r| try compileOperand(e, r, true) else Operand.none;
+    // A scratch destination holds nothing anyone reads until this
+    // instruction writes it, so the first operand that needs code is
+    // computed there: nested arithmetic reuses one slot instead of
+    // taking one per level.
+    var free_dst = e.scratch == dst;
+    const a = try primOperand(e, lhs, rhs == null or isLeaf(rhs.?), dst, &free_dst);
+    const b = if (rhs) |r| try primOperand(e, r, true, dst, &free_dst) else Operand.none;
     try e.emit(op.inst(dst, a, b));
+}
+
+/// `compileOperand`, or `t` computed into `dst` when `free_dst` says
+/// no operand holds it yet.
+fn primOperand(e: *Emitter, t: *const Tiny, allow_var: bool, dst: u12, free_dst: *bool) CompileError!Operand {
+    if (try directOperand(e, t, allow_var)) |op| return op;
+    if (!free_dst.*) return compileOperand(e, t, allow_var);
+    free_dst.* = false;
+    try compileExpr(e, t, dst, null);
+    return Operand.slot(dst);
 }
 
 /// A node whose evaluation has no effect and cannot fail: a literal
@@ -2739,6 +2758,9 @@ fn isLeaf(t: *const Tiny) bool {
 fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Operand {
     if (try directOperand(e, t, allow_var)) |op| return op;
     const tmp = try e.allocSlot();
+    const saved = e.scratch;
+    defer e.scratch = saved;
+    e.scratch = tmp;
     try compileExpr(e, t, tmp, null);
     return Operand.slot(tmp);
 }
