@@ -71,8 +71,9 @@ the §3 rows.
 
 ## 3. Measured rows
 
-Hosts: §3.1–§3.6 on an Apple M1; §3.6's second column, §3.7 and §3.8
-on an Apple M5; §3.9 through `bin/nexis`. Every row is ReleaseFast.
+Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
+§3.6's second column, §3.7 and §3.8 on an Apple M5; §3.9 through
+`bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
 section says otherwise.
@@ -96,43 +97,55 @@ resolution. Read it as below resolution, not as free.
 
 N-fold `conj`/`assoc` from empty with keyword keys; each invocation
 builds on a fresh `Heap` and frees it, so memory stays bounded and
-N=4096 does not accumulate across repetitions. "Process allocator" is
-the configuration of the tree. "Pool" is a size-class pool under the
-benchmark heaps (16 classes from 16 B to 4 KiB, LIFO free lists, slab
-bump pointer); it is not in the tree, and its column is history, the
-evidence for the §6 lever.
+N=4096 does not accumulate across repetitions. Apple M5; before is the
+tree at `cc935cc`, every block from the process allocator; after is
+the size-class slabs, tail claims and inline immediate keys
+(`docs/HEAP.md` §2, `docs/VECTOR.md` §2, `docs/CHAMP.md` §6.5). The
+median of three invocations' 30-sample medians, the two alternating,
+the three in brackets. Provenance: §11.
 
-| Row | N | Process allocator | Pool (history) | Ratio |
+| Row | N | Before | After | Ratio |
 |---|---:|---:|---:|---:|
-| `list_cons_n` | 16 | 296 ns | 55 ns | 5.38× |
-| `list_cons_n` | 256 | 4.35 μs | 858 ns | 5.07× |
-| `list_cons_n` | 4096 | 72.0 μs | 18.3 μs | 3.94× |
-| `vector_conj_n` | 16 | 701 ns | 215 ns | 3.26× |
-| `vector_conj_n` | 256 | 12.3 μs | 4.30 μs | 2.86× |
-| `vector_conj_n` | 4096 | 213 μs | 82.2 μs | 2.59× |
-| `map_assoc_n` | 16 | 1.01 μs | 475 ns | 2.13× |
-| `map_assoc_n` | 256 | 25.8 μs | 11.9 μs | 2.17× |
-| `map_assoc_n` | 4096 | 620 μs | 345 μs | 1.80× |
-| `set_conj_n` | 16 | 963 ns | 419 ns | 2.30× |
-| `set_conj_n` | 256 | 24.6 μs | 10.7 μs | 2.30× |
-| `set_conj_n` | 4096 | 586 μs | 319 μs | 1.84× |
+| `list_cons_n` | 16 | 270 ns [267–271] | 130 ns [128–130] | 2.08× |
+| `list_cons_n` | 256 | 3.89 μs [3.88–3.95] | 1.44 μs [1.40–1.44] | 2.70× |
+| `list_cons_n` | 4096 | 62.8 μs [62.5–63.3] | 21.2 μs [20.9–21.4] | 2.96× |
+| `vector_conj_n` | 16 | 648 ns [648–658] | 212 ns [211–213] | 3.05× |
+| `vector_conj_n` | 256 | 10.9 μs [10.9–11.6] | 2.31 μs [2.31–2.34] | 4.71× |
+| `vector_conj_n` | 4096 | 185 μs [183–188] | 36.5 μs [36.1–36.9] | 5.06× |
+| `map_assoc_n` | 16 | 811 ns [809–850] | 710 ns [709–710] | 1.14× |
+| `map_assoc_n` | 256 | 24.9 μs [24.9–25.1] | 15.3 μs [15.3–15.3] | 1.63× |
+| `map_assoc_n` | 4096 | 600 μs [598–611] | 406 μs [388–408] | 1.48× |
+| `set_conj_n` | 16 | 746 ns [739–752] | 654 ns [651–659] | 1.14× |
+| `set_conj_n` | 256 | 23.6 μs [23.4–24.2] | 12.8 μs [12.8–12.8] | 1.84× |
+| `set_conj_n` | 4096 | 558 μs [556–571] | 340 μs [332–770] | 1.64× |
 
 The smaller the per-operation work, the more of it is the allocator:
-list cons gains most, map assoc (hash, path copy, trie walk) least.
-An external reference puts Clojure's `assoc` on a 4k-entry
-`PersistentHashMap` at 100–300 ns after JIT warm-up; not a
-same-machine comparison.
+list cons gains from the slabs alone, vector conj also from claiming
+its tail's next slot instead of copying the tail, map assoc (hash,
+path copy, trie walk) least. A fresh heap takes its first slabs from
+those an ended heap left (`docs/HEAP.md` §2); without that pool the
+N=16 rows measure mapping them. An external reference puts Clojure's
+`assoc` on a 4k-entry `PersistentHashMap` at 100–300 ns after JIT
+warm-up; not a same-machine comparison.
 
 ### 3.3 Transient construction
 
 The same builds through `transient`, the `!` operations and
-`persistent!`, N=4096.
+`persistent!`, measured as §3.2. Before, a transient ran the
+persistent operation under a wrapper; after, it edits the nodes it
+owns in place (`docs/TRANSIENT.md` §1).
 
-| Row | Process allocator | Pool (history) |
-|---|---:|---:|
-| `transient_vector_conjbang_n` | 208 μs | 82.5 μs |
-| `transient_map_assocbang_n` | 615 μs | 348 μs |
-| `transient_set_conjbang_n` | 580 μs | 321 μs |
+| Row | N | Before | After | Ratio |
+|---|---:|---:|---:|---:|
+| `transient_vector_conjbang_n` | 16 | 661 ns [659–691] | 140 ns [139–172] | 4.73× |
+| `transient_vector_conjbang_n` | 256 | 11.0 μs [10.9–11.5] | 730 ns [729–732] | 15.0× |
+| `transient_vector_conjbang_n` | 4096 | 187 μs [186–196] | 9.90 μs [9.66–11.7] | 18.9× |
+| `transient_map_assocbang_n` | 16 | 840 ns [837–879] | 496 ns [492–549] | 1.69× |
+| `transient_map_assocbang_n` | 256 | 26.0 μs [25.0–26.2] | 7.25 μs [7.21–7.86] | 3.58× |
+| `transient_map_assocbang_n` | 4096 | 613 μs [611–664] | 156 μs [144–173] | 3.92× |
+| `transient_set_conjbang_n` | 16 | 771 ns [768–803] | 473 ns [468–475] | 1.63× |
+| `transient_set_conjbang_n` | 256 | 24.9 μs [24.1–25.1] | 6.71 μs [6.69–7.72] | 3.72× |
+| `transient_set_conjbang_n` | 4096 | 565 μs [562–611] | 127 μs [127–152] | 4.46× |
 
 ### 3.4 Lookup
 
@@ -147,21 +160,25 @@ present key for the map and set.
 
 Sequential `nth` within dense leaves is cache-hot and near the
 harness's resolution per operation; a cold-cache random-access row
-does not exist. External references put Clojure's 4k-entry
+does not exist. On the M5, measured as §3.2, the slabs leave every
+lookup row within its spread (N=4096: 2.91 → 2.92 μs, 40.1 → 40.1 μs,
+30.0 → 29.8 μs). External references put Clojure's 4k-entry
 `PersistentHashMap` get at 25–40 ns and `nth` at 2–4 ns after JIT
 warm-up; not same-machine comparisons.
 
 ### 3.5 Codec
 
-| Row | Process allocator | Pool (history) |
+Apple M5, measured as §3.2.
+
+| Row | Before | After |
 |---|---:|---:|
-| `codec_encode_fixnum` | 23 ns | 24 ns |
-| `codec_decode_fixnum` | 4 ns | 4 ns |
-| `codec_encode_map_n64` | 1.15 μs | 1.18 μs |
-| `codec_decode_map_n64` | 6.18 μs | 5.44 μs |
+| `codec_encode_fixnum` | 22 ns [21–22] | 21 ns [21–25] |
+| `codec_decode_fixnum` | 7 ns [0–7] | 8 ns [8–8] |
+| `codec_encode_map_n64` | 682 ns [671–685] | 686 ns [685–747] |
+| `codec_decode_map_n64` | 6.43 μs [6.26–6.53] | 4.62 μs [4.53–4.62] |
 
 Encoding writes into a presized buffer and does not allocate values;
-decoding builds them, which is the only row the pool moved.
+decoding builds them, which is the only row the slabs move.
 
 ### 3.6 Durable refs (`db/*`)
 
@@ -358,10 +375,12 @@ What the rows say:
 - It is behind on sequence pipelines (`map`/`filter`, eager here and
   lazy and chunked in babashka, `docs/BENCH.md` §12), on
   `frequencies`/`group-by` and transient maps, on vector `conj`/`nth`
-  and on string splitting (the sequence and string rows below the
-  list narrow the first and last), and it holds 2–4× the memory on
-  collections of a million elements: the collector's policy and the
-  16-byte value cell show there.
+  and on string splitting, and it holds 2–4× the memory on
+  collections of a million elements. The sequence and string rows
+  below the list narrow the first and last; the collection rows below
+  them put nexis ahead on `frequencies`/`group-by`, transient and
+  persistent maps and vector `conj`/`nth`, within 1.2× of babashka's
+  resident set on those.
 - Nextomic is ahead of Datalevin on every phase: opening, loading,
   lookups, joins, aggregates, pull and small transactions.
 - The default-commit rows compare different guarantees. A default
@@ -425,6 +444,29 @@ The pipeline's remaining cost is the filter's closure call per
 element and the collector re-marking the million live maps; the
 destructuring loop's is the VM's calls and the two literals it
 allocates per iteration.
+
+**Collections and the heap.** The collection rows rerun on the tree
+with the size-class slabs, in-place transients, native `frequencies`
+and `group-by`, vector tail claims and inline immediate keys
+(`docs/HEAP.md` §2, `docs/TRANSIENT.md` §1, `docs/VECTOR.md` §2),
+against `main` at the same point without them (`f84ab80`, which has
+the sequence, string and dispatch work); one run of ten rounds each,
+the two runs back to back under the same load (provenance §11).
+
+| Workload | nexis before | nexis after | babashka | ratio after | RSS before → after | bb RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| map build and read, 1M | 1.14 s | 757 ms | 1.07 s | 0.70 | 188 → 175 MB | 193 MB |
+| map through transients, 1M | 1.05 s | 307 ms | 647 ms | 0.47 | 188 → 156 MB | 178 MB |
+| vector conj and nth, 1M | 145 ms | 64.7 ms | 86.3 ms | 0.75 | 461 → 150 MB | 126 MB |
+| `frequencies` and `group-by`, 1M | 797 ms | 94.9 ms | 205 ms | 0.46 | 140 → 97 MB | 133 MB |
+| map/filter/reduce over 1M maps | 49.9 ms | 52.6 ms | 45.2 ms | 1.16 | 283 → 238 MB | 212 MB |
+| sort, 1M ints | 98.9 ms | 94.2 ms | 223 ms | 0.42 | 183 → 188 MB | 114 MB |
+
+A map built persistently still marks its whole live set at every
+cycle (§6, the collector's trigger); the vector row's resident set is
+the garbage of a million persistent `conj`s that `reduce`, a native
+calling a native, never lets the collector see (§6, a safe point where
+a native calls a native).
 
 ### 3.12 Threaded dispatch and direct calls, Apple M5
 
@@ -645,7 +687,9 @@ is one invocation's 30-sample median.
 
 | Rows | Host | Run |
 |---|---|---|
-| §3.1–§3.5, §3.6 M1 column | Apple M1, macOS, Zig 0.16.0, ReleaseFast | 2026-04-19; `src/bench.zig` + `bench/main.zig`, 30 samples of ≥50 ms each. The two columns of §3.2, §3.3 and §3.5 are the benchmark heaps over the process allocator and over the size-class pool, since deleted. §3.1, §3.4 and §3.6 allocate nothing from the heap in their timed bodies |
+| §3.1, §3.4's table, §3.6 M1 column | Apple M1, macOS, Zig 0.16.0, ReleaseFast | 2026-04-19; `src/bench.zig` + `bench/main.zig`, 30 samples of ≥50 ms each. These rows allocate nothing from the heap in their timed bodies |
+| §3.2, §3.3, §3.4's M5 figures, §3.5 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 4–7) | revamp, 2026-09-26, ws-collections: `nexis-bench --filter collection-construction,transient-construction,collection-lookup-update,codec`, built by `zig build bench -Doptimize=ReleaseFast` at `cc935cc` (before) and at the ws-collections head `5a1e9b4` (after); three invocations of each, alternating, the median of the three 30-sample medians with the three in brackets |
+| §3.11 collections and the heap | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-collections: `bb bench/compare/run.clj --n 10 --max-load 6 --workloads map-build-read,map-transient,vector-conj-nth,freq-group,pipeline,sort,startup` with the `bin/nexis` of the ws-collections head `5a1e9b4` (after), then of `f84ab80` (before), load 3.7–4.8 at the starts and ends; each workload started below a load average of 6 and repeated if the load rose past it |
 | §3.6 M5 column, §3.8 | Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0, ReleaseFast, idle | `zig build bench -Doptimize=ReleaseFast`, five invocations per state of the tree, the best median with the spread; "before" is the tree at `739d24f`, "after" the `vm` and `champ` commits named in the table. That run had the pool under the benchmark heaps; its construction and codec-decode rows are dropped as pool figures. The `vm`, `compiler`, lookup and `db` rows do not allocate from the pool |
 | §3.7 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds (load average 6–20) | revamp, 2026-09-25: `nexis-bench --filter nextomic` built by `zig build bench -Doptimize=ReleaseFast` from `bench/nextomic.zig` at the ws-planner head over the `src/` of `8548eda` (before) and of the ws-planner head (after), five invocations of each, alternating, the best median with the spread; the `bin/nexis` figures are one run each of a probe program timing `d/q` with `nano-time`, before at `b8c17a1` |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
