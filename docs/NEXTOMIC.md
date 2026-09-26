@@ -204,6 +204,31 @@ A store whose idents lack `:db/fulltext` receives it at open, in a
 transaction of its own at the store's next ident id, so its id is the
 one the store reports (`Store.fulltext_aid`), not 22.
 
+### 2.5 Write order and page fill
+
+emdb splits a full leaf in half, except when the new key sorts after
+every key on the leaf, when it keeps nine tenths on the left. A tree
+written in ascending order at its right end therefore fills its
+leaves to about 90 %, and one written in ascending order between
+existing keys leaves every leaf behind it half full. Most of a
+transaction's datoms land between existing keys: a new entity's EAVT
+rows sort before the transaction entities (partition `2^46`), its
+AEVT rows at the end of each attribute's run, its VAET rows at the end
+of each referenced entity's.
+
+`Store.writeBatch` writes each of the eight trees in turn, a current
+tree before its history twin. It sorts one index's keys; those past
+the tree's last key are appended in order. The rest go in two
+ascending passes: the first over about 55 % of them, picked by
+Fibonacci hashing of their rank so the two passes interleave evenly,
+the second over the others, which land between the first pass's keys
+on the half-full leaves it left behind. Equal keys stay in one pass in
+batch order, so a batch leaves the trees exactly as writing its datoms
+one at a time does. The gain grows with the keys a transaction writes
+into one gap: one that takes less than a leaf's worth leaves its leaf
+half full as before (`docs/PERF.md` §3.11 has the measured fill). The
+order changes no byte of the format.
+
 ---
 
 ## 3. Transactions
@@ -350,10 +375,9 @@ so there is no queue; emdb's write lock is the transactor.
    `[t]`, plus the payload in `nx/eavt` for out-of-line values) and
    append `[.. top]` with `added = 1` to the history trees; for each
    retraction, delete from the current trees and append `added = 0` to
-   the history trees. EAVT first in key order (append-biased splits),
-   then AEVT, then AVET and VAET after sorting the batch (better leaf
-   fill for random-order keys). Then `nx/txlog[t]`, then `sys` counters
-   including `"t"`.
+   the history trees. EAVT first, then AEVT, then AVET and VAET, each
+   tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
+   counters including `"t"`.
 7. **Commit**: `wtxn.commit()`, after which the idents the transaction
    minted, renamed or read reach the connection's cache; until then
    they live in the transaction alone, since the write transaction

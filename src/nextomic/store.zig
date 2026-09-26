@@ -622,8 +622,9 @@ pub const Store = struct {
     };
 
     /// Write a batch of datoms of transaction `t` to the eight index
-    /// trees: EAVT in key order, then AEVT, then AVET and VAET, each in
-    /// its own key order. Scratch lives in `arena`.
+    /// trees: EAVT, then AEVT, then AVET and VAET, each current tree
+    /// before its history twin, each tree in the order `writeTree`
+    /// gives. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
         // The keys of one index, packed end to end and reused for the
@@ -634,6 +635,7 @@ pub const Store = struct {
         try keys.ensureTotalCapacityPrecise(arena, total);
         const offsets = try arena.alloc(u32, batch.len + 1);
         const order = try arena.alloc(usize, batch.len);
+        const sorted = try arena.alloc(usize, batch.len);
         for (order, 0..) |*o, i| o.* = i;
         inline for (.{ Index.eavt, Index.aevt, Index.avet, Index.vaet }) |index| {
             keys.clearRetainingCapacity();
@@ -644,12 +646,17 @@ pub const Store = struct {
             }
             offsets[batch.len] = @intCast(keys.items.len);
             const packed_keys: PackedKeys = .{ .bytes = keys.items, .offsets = offsets };
+            // Stable, so equal keys keep their batch order.
             std.mem.sort(usize, order, packed_keys, PackedKeys.less);
+            var n: usize = 0;
             for (order) |i| {
-                const k = packed_keys.at(i);
-                if (k.len == 0) continue;
-                try self.writeOne(txn, index, t, batch[i], k, arena);
+                if (packed_keys.at(i).len == 0) continue;
+                sorted[n] = i;
+                n += 1;
             }
+            const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n] };
+            try self.writeTree(txn, w, false, arena);
+            try self.writeTree(txn, w, true, arena);
         }
     }
 
@@ -666,27 +673,80 @@ pub const Store = struct {
         }
     };
 
-    fn writeOne(self: *Store, txn: *Txn, index: Index, t: u64, p: Prepared, cur_key: []const u8, arena: Allocator) !void {
-        var hist_buf: [key.max_key_len]u8 = undefined;
-        const hist_key = hist_buf[0 .. cur_key.len + key.top_len];
-        @memcpy(hist_key[0..cur_key.len], cur_key);
-        key.writeTop(hist_key[cur_key.len..][0..key.top_len], t, p.added);
-        const payload: []const u8 = if (index == .eavt) (p.payload orelse &.{}) else &.{};
+    /// One index's share of a batch: its current keys and their
+    /// ascending order.
+    const TreeWrite = struct {
+        index: Index,
+        t: u64,
+        batch: []const Prepared,
+        keys: PackedKeys,
+        sorted: []const usize,
 
-        if (p.added) {
-            var tb: [key.id_len]u8 = undefined;
-            key.writeId(&tb, t);
-            const val = if (payload.len == 0) &tb else blk: {
-                const buf = try arena.alloc(u8, key.id_len + payload.len);
-                @memcpy(buf[0..key.id_len], &tb);
-                @memcpy(buf[key.id_len..], payload);
-                break :blk buf;
-            };
-            try txn.putInTree(self.trees.cur(index), cur_key, val);
-        } else {
-            _ = try txn.delFromTree(self.trees.cur(index), cur_key);
+        /// The key of the `r`th datom in key order, in the current or
+        /// the history tree's form.
+        fn keyAt(self: TreeWrite, buf: *[key.max_key_len]u8, r: usize, history: bool) []const u8 {
+            const i = self.sorted[r];
+            const k = self.keys.at(i);
+            if (!history) return k;
+            @memcpy(buf[0..k.len], k);
+            key.writeTop(buf[k.len..][0..key.top_len], self.t, self.batch[i].added);
+            return buf[0 .. k.len + key.top_len];
         }
-        try txn.putInTree(self.trees.hist(index), hist_key, payload);
+    };
+
+    /// Share of 2^64 that picks the datoms of the first pass (55 %).
+    const first_pass_share: u64 = 0x8CCC_CCCC_CCCC_CCCD;
+
+    /// Write one index's share of a batch to its current or history
+    /// tree (NEXTOMIC.md §2.5). emdb splits a full leaf in half unless
+    /// the new key follows every key on it, when it keeps nine tenths
+    /// on the left. Keys past the tree's last key are appended in
+    /// order and fill their leaves. The rest land between existing
+    /// keys, where writing them in order would leave every leaf behind
+    /// half full: they go in two ascending passes, the first over about
+    /// 55 % of them spread evenly by Fibonacci hashing of the rank, so
+    /// the half-full leaves the first pass leaves behind take the
+    /// second pass's keys between their own.
+    fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool, arena: Allocator) !void {
+        const tree = if (history) self.trees.hist(w.index) else self.trees.cur(w.index);
+        var buf: [key.max_key_len]u8 = undefined;
+        var tail = w.sorted.len;
+        {
+            var c = try txn.openCursorForTree(tree);
+            if (c.last()) |last| {
+                while (tail > 0 and std.mem.order(u8, w.keyAt(&buf, tail - 1, history), last.key) == .gt) tail -= 1;
+            } else tail = 0;
+        }
+        inline for (.{ true, false }) |first| {
+            var in_first = true;
+            for (0..tail) |r| {
+                // Equal keys stay in one pass, in batch order.
+                if (r == 0 or !std.mem.eql(u8, w.keys.at(w.sorted[r]), w.keys.at(w.sorted[r - 1])))
+                    in_first = @as(u64, r) *% 0x9E37_79B9_7F4A_7C15 < first_pass_share;
+                if (in_first == first) try self.writeOne(txn, w, r, history, &buf, arena);
+            }
+        }
+        for (tail..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf, arena);
+    }
+
+    fn writeOne(self: *Store, txn: *Txn, w: TreeWrite, r: usize, comptime history: bool, buf: *[key.max_key_len]u8, arena: Allocator) !void {
+        const p = w.batch[w.sorted[r]];
+        const k = w.keyAt(buf, r, history);
+        const payload: []const u8 = if (w.index == .eavt) (p.payload orelse &.{}) else &.{};
+        if (history) return txn.putInTree(self.trees.hist(w.index), k, payload);
+        if (!p.added) {
+            _ = try txn.delFromTree(self.trees.cur(w.index), k);
+            return;
+        }
+        var tb: [key.id_len]u8 = undefined;
+        key.writeId(&tb, w.t);
+        const val = if (payload.len == 0) &tb else blk: {
+            const b = try arena.alloc(u8, key.id_len + payload.len);
+            @memcpy(b[0..key.id_len], &tb);
+            @memcpy(b[key.id_len..], payload);
+            break :blk b;
+        };
+        try txn.putInTree(self.trees.cur(w.index), k, val);
     }
 
     /// The current-tree value of `(e a v)` in `index`, or null.
@@ -1211,6 +1271,116 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     const only = cur.next().?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
     try testing.expect(cur.next() == null);
+}
+
+/// Share of `tree`'s leaf pages its entries fill, counting emdb's 10
+/// bytes of pointer and node header per entry.
+fn leafFill(txn: *Txn, tree: TreeId) !f64 {
+    const stat = try txn.treeStat(tree);
+    var bytes: u64 = 0;
+    var c = try txn.openCursorForTree(tree);
+    var kv = c.first();
+    while (kv) |e| : (kv = c.next()) bytes += 10 + e.key.len + e.value.len;
+    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(stat.leafPages * db_layer.page_size));
+}
+
+test "batches written between existing keys fill their leaves" {
+    var td = try TestDir.init("store_fill");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // New entities land before the bootstrap transaction's entity in
+    // EAVT and attribute 100's between attribute 8's and 101's in AEVT;
+    // attribute 101's are appended past AEVT's last key.
+    var k: u64 = 0;
+    for (0..16) |t| {
+        const batch = try arena.alloc(Store.Prepared, 5000);
+        for (0..2500) |j| {
+            const e = (1 << 33) + k;
+            const name = try std.fmt.allocPrint(arena, "name-{d}", .{k});
+            batch[2 * j] = .{ .e = e, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = @intCast(k) }), .added = true, .avet = false, .vaet = false };
+            batch[2 * j + 1] = .{ .e = e, .a = 101, .vbytes = try key.valBytes(arena, .{ .string = name }), .added = true, .avet = false, .vaet = false };
+            k += 1;
+        }
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        try store.writeBatch(txn, t + 2, batch, arena);
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    for ([_]TreeId{ store.trees.cur(.eavt), store.trees.hist(.eavt), store.trees.cur(.aevt), store.trees.hist(.aevt) }) |tree| {
+        try testing.expect(try leafFill(txn, tree) > 0.75);
+    }
+}
+
+test "a batch holds what writing its datoms one at a time holds" {
+    var tds = [2]TestDir{ try TestDir.init("store_order_batch"), try TestDir.init("store_order_single") };
+    defer for (&tds) |*td| td.deinit();
+    const batched = try Store.open(testing.allocator, tds[0].path.ptr, .{});
+    defer batched.close();
+    const single = try Store.open(testing.allocator, tds[1].path.ptr, .{});
+    defer single.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x6e78_6f72_6465_7200);
+    const rand = prng.random();
+
+    // Batches of up to 4000 datoms over a few thousand facts, most of
+    // them assertions, with retractions of held and absent facts and
+    // the same fact more than once in a batch.
+    for (0..30) |i| {
+        const t = i + 2;
+        const batch = try arena.alloc(Store.Prepared, rand.intRangeAtMost(usize, 1, 4000));
+        for (batch) |*p| {
+            const a = rand.intRangeAtMost(u32, 100, 102);
+            const x = rand.uintLessThan(u64, 3000);
+            const v: key.Val = if (a == 102) .{ .ref = (1 << 33) + x } else .{ .long = @intCast(x % 50) };
+            p.* = .{
+                .e = (1 << 33) + rand.uintLessThan(u64, 3000),
+                .a = a,
+                .vbytes = try key.valBytes(arena, v),
+                .added = rand.uintLessThan(u8, 5) != 0,
+                .avet = a == 101,
+                .vaet = a == 102,
+            };
+        }
+        for ([_]*Store{ batched, single }) |store| {
+            const txn = try store.beginWrite(.none);
+            errdefer txn.abort();
+            if (store == batched) {
+                try store.writeBatch(txn, t, batch, arena);
+            } else for (batch) |p| try store.writeBatch(txn, t, &.{p}, arena);
+            try txn.commit();
+        }
+    }
+    const txns = [2]*Txn{ try batched.beginRead(), try single.beginRead() };
+    defer for (txns) |txn| txn.abort();
+    for (0..4) |ix| for ([_]bool{ false, true }) |history| {
+        const index: Index = @enumFromInt(ix);
+        // The bootstrap's datoms differ in their instants: compare the
+        // keys the batches can hold.
+        var start: [key.id_len]u8 = undefined;
+        if (index == .eavt or index == .vaet) key.writeId(&start, 1 << 33) else key.writeAttr(start[0..key.attr_len], 100);
+        const from = if (index == .eavt or index == .vaet) start[0..] else start[0..key.attr_len];
+        var tx_start: [key.id_len]u8 = undefined;
+        key.writeId(&tx_start, key.tx_partition_bit);
+        const to: ?[]const u8 = if (index == .eavt) &tx_start else null;
+        var scans: [2]Store.Scan = undefined;
+        for (&scans, txns, [_]*Store{ batched, single }) |*sc, txn, store|
+            sc.* = try Store.scanRange(txn, if (history) store.trees.hist(index) else store.trees.cur(index), from, to);
+        while (scans[0].next()) |x| {
+            const y = scans[1].next() orelse return error.TestUnexpectedResult;
+            try testing.expectEqualSlices(u8, y.key, x.key);
+            try testing.expectEqualSlices(u8, y.value, x.value);
+        }
+        try testing.expect(scans[1].next() == null);
+    };
 }
 
 test "renaming an ident retires the old name and bumps the generation" {
