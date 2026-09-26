@@ -2538,9 +2538,10 @@ pub const VM = struct {
         return (try self.operandPtr(frame, op, &tmp)).*;
     }
 
-    /// Where `resolveIn(frame, op)` reads its value: the slot or the
-    /// constant in place, found inline, or `tmp`, which every other
-    /// operand is resolved into out of line. The hot handlers read
+    /// Where `resolveIn(frame, op)` reads its value: the slot, the
+    /// constant, the initialized cell or the bound Var in place, found
+    /// inline, or `tmp`, which every other operand is resolved into
+    /// out of line, its trap included. The hot handlers read
     /// through the pointer, so the value never passes through an
     /// error union.
     inline fn operandPtr(self: *VM, frame: *const Frame, op: Operand, tmp: *Value) VmError!*const Value {
@@ -2549,6 +2550,11 @@ pub const VM = struct {
         if (op.kind == .upvalue and op.index < frame.upvalues.len) {
             const cell = frame.upvalues[op.index];
             if (cell.initialized) return &cell.value;
+        }
+        if (op.kind == .var_ and op.index < frame.routine.var_table.len) {
+            const v = frame.routine.var_table[op.index];
+            if (v.thread_bound) return &v.thread_value;
+            if (v.bound) return &v.root;
         }
         try self.resolveOther(frame, op, tmp);
         return tmp;
@@ -5713,6 +5719,37 @@ test "VM var: var:load-var on unbound Var traps :unbound-var" {
     try vm.retargetTop(&routine);
     const res = vm.run();
     try testing.expectError(VmError.UnboundVar, res);
+}
+
+test "VM var: a v operand reads the binding in force, else the root, else traps" {
+    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+    defer vm.deinit();
+    const ns = vm.ensureNamespace();
+    const rooted = try ns.intern("rooted");
+    rooted.root = fx(40);
+    rooted.bound = true;
+    const rebound = try ns.intern("rebound");
+    rebound.root = fx(1);
+    rebound.bound = true;
+    rebound.thread_value = fx(2);
+    rebound.thread_bound = true;
+    const unbound = try ns.intern("unbound");
+    const var_table = [_]*Var{ rooted, rebound, unbound };
+    // (+ rooted rebound), then the same through the general mov:move.
+    var code = [_]Inst{
+        asm_.mathAdd(0, Operand.varRef(0), Operand.varRef(1)),
+        asm_.returnSlot(0),
+    };
+    var routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1, .var_table = &var_table };
+    try vm.retargetTop(&routine);
+    try testing.expectEqual(@as(i64, 42), (try vm.run()).asFixnum());
+    code[0] = asm_.moveFrom(0, Operand.varRef(2));
+    try vm.retargetTop(&routine);
+    try testing.expectError(VmError.UnboundVar, vm.run());
+    vm.resetAfterError();
+    code[0] = asm_.moveFrom(0, Operand.varRef(3));
+    try vm.retargetTop(&routine);
+    try testing.expectError(VmError.OperandOutOfRange, vm.run());
 }
 
 test "VM var: var:load-var operand index out of range traps :operand-out-of-range" {

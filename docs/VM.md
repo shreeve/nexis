@@ -353,9 +353,9 @@ fetch (every handler's last step):
   next pc: a conditional jump not taken does nothing, a taken one
   overwrites `pc`, and every frame's `pc` in an error trace is one
   past its instruction (§13).
-- The hot handlers read a slot, a constant or an initialized
-  upvalue in place and hand every other operand to the general
-  resolution of §4. Two fixnums compare, add, subtract, multiply,
+- The hot handlers read a slot, a constant, an initialized upvalue
+  or a bound Var in place and hand every other operand, a trap
+  included, to the general resolution of §4. Two fixnums compare, add, subtract, multiply,
   `quot` and `mod` inline when the result is a fixnum; anything else,
   a promotion or a zero divisor included, goes through the numeric
   tower (§10.3). `call:call` of a
