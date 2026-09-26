@@ -88,7 +88,7 @@ wait on itself.
 | `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
 | `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
 | `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or the full payload of an out-of-line value |
+| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or on an assertion row the full payload of an out-of-line value |
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
@@ -173,13 +173,14 @@ The decoder tells the shapes apart by the bare `0x00`: an inline value
 ends there, an out-of-line one continues with `0x01` and the hash.
 Range predicates compare decoded values, never index keys, so they are
 exact on long strings. The full value is the value of each of the
-fact's `nx/eavt-h` rows, assertions and retractions alike, and nowhere
-else in the index trees: a current read seeks the fact's latest
-EAVT-h row, which is its assertion while the fact is current, and a
-history read gets its own row. An AVET or AEVT hit on a long value is
+fact's assertion rows in `nx/eavt-h` and nowhere else in the index
+trees: a current read seeks the fact's latest EAVT-h row, which is its
+assertion while the fact is current; a history read gets its own row,
+and a retraction row, which holds nothing, the row before it, the
+assertion it retracts. An AVET or AEVT hit on a long value is
 confirmed by an EAVT point read before it is returned. A store format
-1 wrote also holds the payload after `t` in the current EAVT row,
-which no read needs.
+1 wrote also holds the payload after `t` in the current EAVT row and
+on its retraction rows, which reads take as they find.
 Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
@@ -193,7 +194,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 
 | key | value |
 |---|---|
-| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction writes an out-of-line value, whose current EAVT row holds `t` alone (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place |
+| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction asserts or retracts an out-of-line value, whose current EAVT row holds `t` alone and whose retraction rows hold nothing (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place |
 | `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
@@ -385,7 +386,7 @@ so there is no queue; emdb's write lock is the transactor.
      card-one attribute.
 6. **Write**: for each assertion, put into the current trees (value
    `[t]`) and append `[.. top]` with `added = 1` to the history trees,
-   an out-of-line value's payload as the `nx/eavt-h` value; for each
+   an out-of-line value's payload as its `nx/eavt-h` value; for each
    retraction, delete from the current trees and append `added = 0` to
    the history trees. EAVT first, then AEVT, then AVET and VAET, each
    tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
