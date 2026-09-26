@@ -535,7 +535,9 @@ bodies, with the head variables bound where the call's arguments are
 rule runs after every pattern that could bind its arguments.
 Join per step: index nested loop (seek per row) when `rows × log n` is
 below four times the scan estimate, otherwise one scan of the constant
-prefix hash-joined on the shared variables (`plan.nestedLoop`). The
+prefix hash-joined on the shared variables (`plan.nestedLoop`); a
+pattern that takes nothing from the row is always that one scan, joined
+as a cross product, since every row would read the same datoms. The
 constant-prefix scan runs once per query for each source, index and
 shape of its positions (which hold constants, which a variable, which
 repeat one), and a later pattern of that shape joins with the same rows
@@ -706,7 +708,8 @@ adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are anti-joins on the shared
 variables; `or`/`or-join` are unions of sub-plans with the same output
-variables, and an `or-join` whose join vector leads with a group,
+variables (every branch's rows go into one set, each row hashed once),
+and an `or-join` whose join vector leads with a group,
 `(or-join [[?a] ?b] ...)`, runs only once the group's variables are
 bound.
 

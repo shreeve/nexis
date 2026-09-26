@@ -1394,6 +1394,11 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     var diag: query.Diag = .{};
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age ?a] [(> ?a 40)] [?e :person/name ?n]]"), dbv, none, &diag, .{ .hook = fx.hook() }, &out.writer);
     try testing.expect(std.mem.indexOf(u8, out.written(), "2. pred (> ?a 40)") != null);
+    // A pattern that takes nothing from the row is the one scan of its
+    // constant prefix, whatever the rows: every row reads the same datoms.
+    const first = out.written()[0..std.mem.indexOfScalar(u8, out.written(), '\n').?];
+    try testing.expect(std.mem.startsWith(u8, first, "1. scan [?e :person/age ?a _ _] aevt"));
+    try testing.expect(std.mem.indexOf(u8, first, " hash ") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?a\n") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?e\n") != null);
     // A long chain finding every variable parks the ones no later step

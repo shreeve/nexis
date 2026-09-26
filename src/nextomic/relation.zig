@@ -549,26 +549,6 @@ pub const Relation = struct {
         };
     }
 
-    /// `self ∪ other`, both over the same variables (in any order);
-    /// the result is distinct.
-    pub fn unionWith(self: *const Relation, other: *const Relation) !Relation {
-        var out = try init(self.arena, self.vars);
-        var seen: RowSet = .{ .rel = &out };
-        const self_map = try out.mapFrom(self);
-        var i: usize = 0;
-        while (i < self.rows) : (i += 1) {
-            try out.appendFrom(self, i, self_map);
-            if (!try seen.insert(self.arena, out.rows - 1)) try out.dropLast();
-        }
-        const other_map = try out.mapFrom(other);
-        i = 0;
-        while (i < other.rows) : (i += 1) {
-            try out.appendFrom(other, i, other_map);
-            if (!try seen.insert(self.arena, out.rows - 1)) try out.dropLast();
-        }
-        return out;
-    }
-
     /// The rows of `self` whose values on `on` do not appear in
     /// `other` (the anti-join). `other` must have every variable in
     /// `on`; the result keeps `self`'s columns and order.
@@ -635,7 +615,8 @@ pub const Relation = struct {
     /// The natural join of `self` and `other` on their shared variables
     /// (a cross product when they share none), without the columns of
     /// `drop`. The smaller side, or `other` when it keeps its indexes,
-    /// is hashed on the shared variables and the other side probes it.
+    /// is hashed on the shared variables and the other side probes it;
+    /// a cross product pairs the rows without an index.
     /// The result's columns are `self`'s followed
     /// by `other`'s new variables, its rows in `self`'s order with the
     /// matches of a row in `other`'s order; a side whose every row comes
@@ -655,11 +636,17 @@ pub const Relation = struct {
         // the index is built once for every join with it.
         const hash_other = other.rows <= self.rows or other.indexes != null;
         // Room for one match per probing row, the common case of a join
-        // on a key, so that neither list regrows in the arena.
-        const probing = if (hash_other) self.rows else other.rows;
-        try left.ensureTotalCapacityPrecise(arena, probing);
-        try right.ensureTotalCapacityPrecise(arena, probing);
-        if (hash_other) {
+        // on a key, so that neither list regrows in the arena; a cross
+        // product knows its size.
+        const pairs = if (on.len == 0) self.rows * other.rows else if (hash_other) self.rows else other.rows;
+        try left.ensureTotalCapacityPrecise(arena, pairs);
+        try right.ensureTotalCapacityPrecise(arena, pairs);
+        if (on.len == 0) {
+            for (0..self.rows) |i| for (0..other.rows) |j| {
+                left.appendAssumeCapacity(@intCast(i));
+                right.appendAssumeCapacity(@intCast(j));
+            };
+        } else if (hash_other) {
             // Rows go in last to first, so the matches of a row come out
             // in `other`'s row order and the result's order is settled.
             const index = try other.indexOn(on_other);
@@ -782,7 +769,8 @@ pub const Relation = struct {
 };
 
 /// A growing set of rows: a relation plus a hash index over it, for
-/// accumulating a fixpoint total without rescanning it.
+/// accumulating a fixpoint total or an `or`'s branches without
+/// rescanning it.
 pub const Accumulator = struct {
     rel: Relation,
     set: Relation.RowSet,
@@ -871,7 +859,7 @@ test "column widens from int to cell" {
     try testing.expect(c.get(2).eql(.{ .str = "x" }));
 }
 
-test "dedup, project, union, difference, sort" {
+test "dedup, project, difference, sort" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -893,9 +881,6 @@ test "dedup, project, union, difference, sort" {
         &.{ .{ .str = "z" }, .{ .int = 9 } },
         &.{ .{ .str = "a" }, .{ .int = 1 } },
     });
-    const u = try d.unionWith(&s);
-    try testing.expectEqual(@as(usize, 4), u.rows);
-    try testing.expectEqualSlices(Var, &.{ 0, 1 }, u.vars);
 
     const diff = try r.difference(&s, &.{0});
     try testing.expectEqual(@as(usize, 1), diff.rows);

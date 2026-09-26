@@ -132,6 +132,12 @@ pub const Scan = struct {
     pub fn slots(self: *const Scan) [5]Slot {
         return .{ self.e, self.a, self.v, self.tx, self.added };
     }
+
+    /// Does a position take its value from the input row?
+    pub fn readsRow(self: *const Scan) bool {
+        for (self.slots()) |slot| if (slot == .bound) return true;
+        return false;
+    }
 };
 
 /// A data pattern over a collection source: its tuples filtered and
@@ -1242,8 +1248,10 @@ pub const hash_weight: u64 = 4;
 /// prefix hash-joined on the shared variables? A pattern with no
 /// constant to seek by, or whose attribute arrives with the row (an
 /// ident a hash join could not match against attribute ids), always
-/// seeks.
+/// seeks; one that takes nothing from the row never does, since every
+/// row would read the same datoms.
 pub fn nestedLoop(s: *const Scan, rows: u64) bool {
+    if (!s.readsRow()) return false;
     const log_n: u64 = std.math.log2_int_ceil(u64, s.tree_entries + 2);
     return s.hash_index == null or s.a == .bound or (std.math.mulWide(u64, rows, log_n) < std.math.mulWide(u64, s.hash_estimate, hash_weight));
 }

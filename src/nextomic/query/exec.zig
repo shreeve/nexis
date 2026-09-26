@@ -768,13 +768,15 @@ pub const Exec = struct {
     fn execOr(self: *Exec, o: *const plan_mod.Or, rel: Relation, drop: []const Var) anyerror!Relation {
         if (rel.rows == 0) return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, o.fresh }))).without(drop);
         const input = if (o.bound.len == 0) try Relation.unit(self.arena) else try rel.project(o.bound, true);
-        var acc = try Relation.init(self.arena, o.join);
+        // Every branch's rows go into one set, each hashed once.
+        const acc = try relation.Accumulator.create(self.arena, o.join);
         for (o.branches) |br| {
             const r = try self.runPlan(br, input);
-            const projected = try r.project(o.join, true);
-            acc = try acc.unionWith(&projected);
+            const map = try acc.rel.mapFrom(&r);
+            var i: usize = 0;
+            while (i < r.rows) : (i += 1) _ = try acc.add(&r, i, map);
         }
-        return rel.join(&acc, drop);
+        return rel.join(&acc.rel, drop);
     }
 
     fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation, drop: []const Var) anyerror!Relation {
