@@ -96,8 +96,17 @@ fn runCommand(init: std.process.Init) !void {
     defer if (builtin.mode == .Debug) {
         _ = debug_allocator.deinit();
     };
-    const allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
+    var allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
     const io = init.io;
+    var max_alloc: MaxAlloc = undefined;
+    if (init.environ_map.get("NEXIS_MAX_ALLOC")) |text| {
+        const max = std.fmt.parseInt(usize, text, 10) catch {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: NEXIS_MAX_ALLOC is not a byte count\n");
+            std.process.exit(1);
+        };
+        max_alloc = .{ .child = allocator, .max = max };
+        allocator = max_alloc.allocator();
+    }
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) usageExit(io);
@@ -128,6 +137,39 @@ fn runCommand(init: std.process.Init) !void {
     }
 }
 
+/// `NEXIS_MAX_ALLOC=BYTES`: an allocation, or the growth of one, past
+/// BYTES fails as a request the machine cannot satisfy does, so the
+/// out-of-memory report and the REPL's recovery from it can be tested
+/// without exhausting memory (TOOLING.md §1).
+const MaxAlloc = struct {
+    child: std.mem.Allocator,
+    max: usize,
+
+    fn allocator(self: *MaxAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return if (len > self.max) null else self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return new_len <= self.max and self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return if (new_len > self.max) null else self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
@@ -144,20 +186,57 @@ fn emitSourceError(io: std.Io, info: *const vm.SourceInfo, label: []const u8, sp
     var buf: [1024]u8 = undefined;
     var stderr = std.Io.File.stderr().writerStreaming(io, &buf);
     const w = &stderr.interface;
-    const loc = info.lineCol(span.pos);
-    try w.print("nexis: {s}:{d}:{d}: {s}\n", .{ info.path, loc.line, loc.col, label });
-    const line_text = info.lineText(loc.line);
-    if (line_text.len > 0) {
-        try w.print("    {s}\n    ", .{line_text});
-        try w.splatByteAll(' ', loc.col -| 1);
-        // One caret per byte of the span up to the line's end, at
-        // least one.
-        const rest = line_text.len -| (loc.col -| 1);
-        try w.splatByteAll('^', @max(@min(span.len, rest), 1));
+    const at = Place.of(info, span.pos);
+    try w.print("nexis: {s}:{d}:{d}: {s}\n", .{ info.path, at.line, at.col, label });
+    if (at.text.len > 0) {
+        try w.writeAll("    ");
+        for (at.text) |c| if (c == '\t') try w.writeAll(tab) else try w.writeByte(c);
+        try w.writeAll("\n    ");
+        try w.splatByteAll(' ', width(at.text[0..at.offset]));
+        // One caret per character of the span up to the line's end,
+        // at least one.
+        const under = at.text[at.offset..@min(at.text.len, at.offset + span.len)];
+        try w.splatByteAll('^', @max(width(under), 1));
         try w.writeAll("\n");
     }
     try w.flush();
 }
+
+/// How a report shows a tab in a source line: a fixed width, so the
+/// caret beneath lines up whatever the terminal's tab stops.
+const tab = "    ";
+
+/// The columns `text` takes in a report: one per code point, a tab's
+/// width for a tab.
+fn width(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |c| n += if (c == '\t') tab.len else @intFromBool(c & 0xC0 != 0x80);
+    return n;
+}
+
+/// Where byte `pos` of a source falls, as a report names it: the
+/// 1-based line and column, the column counted in code points (a tab
+/// is one), the line's text and `pos`'s byte offset in it. A
+/// byte-order mark that opens the text is not part of line 1.
+const Place = struct {
+    line: usize,
+    col: usize,
+    text: []const u8,
+    offset: usize,
+
+    fn of(info: *const vm.SourceInfo, pos: u32) Place {
+        const all = info.text;
+        const at = @min(pos, all.len);
+        const bom: usize = if (std.mem.startsWith(u8, all, loader_mod.byte_order_mark)) loader_mod.byte_order_mark.len else 0;
+        const start = if (std.mem.lastIndexOfScalar(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
+        const end = std.mem.indexOfScalarPos(u8, all, at, '\n') orelse all.len;
+        const text = std.mem.trimEnd(u8, all[start..end], "\r");
+        const offset = @min(at -| start, text.len);
+        var chars: usize = 0;
+        for (text[0..offset]) |c| chars += @intFromBool(c & 0xC0 != 0x80);
+        return .{ .line = 1 + std.mem.count(u8, all[0..at], "\n"), .col = 1 + chars, .text = text, .offset = offset };
+    }
+};
 
 const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -240,7 +319,14 @@ const Runtime = struct {
                 try rt.reportRuntimeError(rt.v.traced_error orelse vm.VmError.UncaughtThrow);
                 return 5;
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            // Memory ran out outside a run (reading, compiling,
+            // printing a value): the error has no frame to be at.
+            error.OutOfMemory => {
+                rt.v.error_detail = "";
+                rt.v.error_trace.clearRetainingCapacity();
+                try rt.reportRuntimeError(vm.VmError.OutOfMemory);
+                return 5;
+            },
         }
     }
 
@@ -284,8 +370,8 @@ const Runtime = struct {
                 try w.print("  {s}\n", .{frame.name});
             } else if (frame.source) |src| {
                 if (frame.span) |span| {
-                    const loc = src.lineCol(span.pos);
-                    try w.print("  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, loc.line, loc.col });
+                    const at = Place.of(src, span.pos);
+                    try w.print("  at {s} ({s}:{d}:{d})\n", .{ frame.name, src.path, at.line, at.col });
                 } else try w.print("  at {s} ({s})\n", .{ frame.name, src.path });
             } else try w.print("  at {s}\n", .{frame.name});
         }
@@ -463,13 +549,21 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     };
     var results = Results{ .rt = &rt };
 
+    // The text of the form being read, a line at a time; copied to
+    // the session once it is complete.
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(allocator);
+    var balance: Balance = .{};
     while (true) {
+        const ns = rt.registry.current.name;
         if (pending.items.len == 0) {
-            const ns = rt.registry.current.name;
             try stdout.writeStreamingAll(io, ns);
             try stdout.writeStreamingAll(io, "=> ");
+        } else {
+            // `#_=> `, right-aligned under `ns=> `.
+            var pad: [64]u8 = @splat(' ');
+            try stdout.writeStreamingAll(io, pad[0..@min(ns.len -| 2, pad.len)]);
+            try stdout.writeStreamingAll(io, "#_=> ");
         }
         const line = stdlib.readStdinLine(io) catch |err| {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: stdin read error: ");
@@ -485,8 +579,11 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             if (trimmed.len == 0) continue;
             if (eql(trimmed, ":quit") or eql(trimmed, ":q")) return;
         }
+        const start = pending.items.len;
         try pending.appendSlice(allocator, line);
         try pending.append(allocator, '\n');
+        balance.scan(pending.items[start..]);
+        if (!balance.complete()) continue;
 
         // Closures made here are called from later inputs, so the
         // text, its SourceInfo and its routines live as long as the
@@ -503,8 +600,51 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             if (err == error.RunFailed) rt.registry.core.lookupLocal("*e").?.root = e;
         };
         pending.clearRetainingCapacity();
+        balance = .{};
     }
 }
+
+/// Whether the REPL's pending text may hold complete forms, kept a
+/// line at a time so a form of n lines is scanned once, not n times:
+/// the depth of brackets outside strings, comments and character
+/// literals, with the lexer's rules for each (`src/nexis.zig`). Only
+/// text this calls complete is read; the reader has the last word,
+/// and a trailing `'` or `#_` still reads as incomplete.
+const Balance = struct {
+    depth: usize = 0,
+    in_string: bool = false,
+    /// A closer with no opener: the reader reports it.
+    stray_closer: bool = false,
+
+    fn scan(self: *Balance, text: []const u8) void {
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (self.in_string) switch (text[i]) {
+                '\\' => i += 1,
+                '"' => self.in_string = false,
+                else => {},
+            } else switch (text[i]) {
+                '"' => self.in_string = true,
+                // A character literal: `\(` and `\"` open nothing.
+                '\\' => i += 1,
+                ';' => while (i + 1 < text.len and text[i + 1] != '\n') {
+                    i += 1;
+                },
+                '(', '[', '{' => self.depth += 1,
+                ')', ']', '}' => if (self.depth == 0) {
+                    self.stray_closer = true;
+                } else {
+                    self.depth -= 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn complete(self: Balance) bool {
+        return !self.in_string and (self.depth == 0 or self.stray_closer);
+    }
+};
 
 /// The keyword a caught runtime error would be (`DivideByZero` is
 /// `:divide-by-zero`), for `*e`.

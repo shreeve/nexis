@@ -256,6 +256,8 @@ pub fn build(b: *std.Build) void {
             stderr: ?[]const u8 = null,
             exit_code: u8 = 0,
             stdin: ?[]const u8 = null,
+            /// `NEXIS_MAX_ALLOC` for the run (TOOLING.md §1).
+            max_alloc: ?[]const u8 = null,
         };
         const cli = "test/golden/cli/";
         const cases = [_]CliGolden{
@@ -269,6 +271,9 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "macro-failure.nx" }, .stderr = "macro-failure.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "too-many-locals.nx" }, .stderr = "too-many-locals.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
+            .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },
+            .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
@@ -277,7 +282,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
             .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
             .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
-            .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err" },
+            .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
@@ -285,6 +290,7 @@ pub fn build(b: *std.Build) void {
         for (cases) |case| {
             const run = scripts.program(scripts.stress);
             run.setCwd(b.path("."));
+            if (case.max_alloc) |max| run.setEnvironmentVariable("NEXIS_MAX_ALLOC", max);
             run.addArgs(case.args);
             for (case.args) |arg| {
                 if (std.mem.endsWith(u8, arg, ".nx")) run.addFileInput(b.path(arg));

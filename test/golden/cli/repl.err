@@ -2,6 +2,10 @@ nexis: <repl>:1:1: runtime error: DivideByZero
     (/ 1 0)
     ^^^^^^^
   at <top> (<repl>:1:1)
+nexis: <repl>:1:8: runtime error: OutOfMemory
+    (count (repeat 100000000 0))
+           ^^^^^^^^^^^^^^^^^^^^
+  at <top> (<repl>:1:8)
 nexis: <repl>:1:1: parse error: unexpected `)`
     )
     ^
