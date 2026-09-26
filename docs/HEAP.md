@@ -88,10 +88,14 @@ and its `meta` links the free list.
 block neither marked nor pinned is freed (its kind poisoned), a
 survivor's mark cleared. It rebuilds each class's free list from the
 free slots of the slabs that still hold a block, lowest address first
-within a slab, and takes every slab left empty off its class: the
-heap keeps up to eight for the next class that needs one and hands the
-rest back to the operating system, so a program whose live set
-shrinks, a long REPL session among them, gives its memory back.
+within a slab, and takes every slab left empty off its class. It
+keeps as many empty slabs as slabs still in use, and at least 64 (16
+MiB, what the collector's default trigger lets a program allocate
+between two cycles), for the next class that needs one, and hands the
+rest back to the operating system: a steady workload refills the
+slabs it emptied instead of mapping fresh ones every cycle, and a
+program whose live set shrinks, a long REPL session among them, gives
+its memory back.
 
 **Large blocks.** A block over 8 KiB comes from the backing allocator
 with a 32-byte prefix (the next large block, the allocation's length,

@@ -306,7 +306,7 @@ pub const Heap = struct {
     classes: [class_count]Class = @splat(.{}),
     large_head: ?*Large = null,
     /// Empty slabs kept for the next class that needs one, linked
-    /// through `next`, at most `empty_slabs_kept`.
+    /// through `next` (`sweepUnmarked` says how many).
     empty_slabs: ?*Slab = null,
     empty_slab_count: usize = 0,
     /// Slabs held, the empty ones kept included.
@@ -330,8 +330,13 @@ pub const Heap = struct {
         slabs: ?*Slab = null,
     };
 
-    /// Empty slabs a sweep keeps rather than hands back.
-    pub const empty_slabs_kept = 8;
+    /// A sweep keeps as many empty slabs as slabs still in use, and
+    /// at least this many (16 MiB, the collector's default trigger:
+    /// what a program allocates between two cycles), and hands the
+    /// rest back. A steady workload then refills kept slabs instead of
+    /// mapping fresh ones each cycle; a live set that shrinks gives
+    /// its memory back.
+    pub const empty_slabs_kept_min = 64;
 
     pub fn init(backing: Allocator) Heap {
         return .{ .backing = backing };
@@ -426,16 +431,22 @@ pub const Heap = struct {
         slab_source.free(@as([]align(slab_bytes) u8, ptr[0..slab_bytes]));
     }
 
-    /// Keep an emptied slab for reuse, or hand it back once
-    /// `empty_slabs_kept` are kept.
-    fn releaseSlab(self: *Heap, s: *Slab) void {
-        if (self.empty_slab_count < empty_slabs_kept) {
-            s.next = self.empty_slabs;
-            self.empty_slabs = s;
-            self.empty_slab_count += 1;
-        } else {
-            freeSlab(s);
+    fn keepEmptySlab(self: *Heap, s: *Slab) void {
+        s.next = self.empty_slabs;
+        self.empty_slabs = s;
+        self.empty_slab_count += 1;
+    }
+
+    /// Hand back the empty slabs past what `empty_slabs_kept_min`
+    /// allows.
+    fn trimEmptySlabs(self: *Heap) void {
+        const keep = @max(empty_slabs_kept_min, self.slab_count - self.empty_slab_count);
+        while (self.empty_slab_count > keep) {
+            const s = self.empty_slabs.?;
+            self.empty_slabs = s.next;
+            self.empty_slab_count -= 1;
             self.slab_count -= 1;
+            freeSlab(s);
         }
     }
 
@@ -611,8 +622,8 @@ pub const Heap = struct {
     /// survivors so the next cycle starts fresh. Does NOT enumerate
     /// roots or trace reachability — that's `gc.zig`'s job. Returns the
     /// number of blocks freed. Rebuilds each class's free list in
-    /// address order within a slab, and gives up every slab left
-    /// empty (HEAP.md §2).
+    /// address order within a slab, and keeps or hands back every
+    /// slab left empty (HEAP.md §2).
     ///
     /// `pinned` blocks survive regardless of mark state (GC.md §3); no
     /// runtime module pins a block, only tests do.
@@ -649,7 +660,7 @@ pub const Heap = struct {
                 if (live == 0) {
                     link.* = slab.next;
                     if (cls.carving == slab) cls.carving = null;
-                    self.releaseSlab(slab);
+                    self.keepEmptySlab(slab);
                     continue;
                 }
                 if (tail) |t| {
@@ -673,6 +684,7 @@ pub const Heap = struct {
             self.backing.free(l.bytes());
             freed += 1;
         }
+        self.trimEmptySlabs();
         return freed;
     }
 };
@@ -1148,37 +1160,60 @@ test "resizeInPlace: grows within the class with zeroed bytes, shrinks, refuses 
     try testing.expect(!Heap.resizeInPlace(big, 10_001));
 }
 
-test "slabs: a freed slot is reused, a sweep hands empty slabs back beyond the few it keeps" {
+test "slabs: a freed slot is reused, a sweep hands empty slabs back beyond the ones it keeps" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const per_slab = class_info[class_of[48 / 16]].slots;
-    // Forty slabs of cons-cell-sized blocks.
-    const n = per_slab * 40;
+    const per_slab = class_info[class_of[528 / 16]].slots;
+    // A hundred slabs of vector-leaf-sized blocks.
+    const n = per_slab * 100;
     var keep: ?*HeapHeader = null;
     for (0..n) |i| {
-        const h = try heap.alloc(.list, 32);
+        const h = try heap.alloc(.persistent_vector, 512);
         if (i == n / 2) keep = h;
     }
-    try testing.expectEqual(@as(usize, 40), heap.slab_count);
+    try testing.expectEqual(@as(usize, 100), heap.slab_count);
     try testing.expectEqual(n, heap.liveCount());
 
-    // Everything but one block is garbage: one slab stays, a few
-    // empty ones are kept, the rest go back.
+    // Everything but one block is garbage: one slab stays, the
+    // minimum of empty ones is kept, the rest go back.
     keep.?.setMarked();
     try testing.expectEqual(n - 1, heap.sweepUnmarked());
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
-    try testing.expectEqual(@as(usize, 1 + Heap.empty_slabs_kept), heap.slab_count);
-    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept), heap.empty_slab_count);
+    try testing.expectEqual(@as(usize, 1 + Heap.empty_slabs_kept_min), heap.slab_count);
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
 
     // The survivor's slab serves the next allocations from its free
     // slots before any kept slab is taken.
-    const again = try heap.alloc(.list, 32);
+    const again = try heap.alloc(.persistent_vector, 512);
     try testing.expectEqual(Slab.of(keep.?), Slab.of(again));
-    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept), heap.empty_slab_count);
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
 
     // A freed block's slot is the next one handed out in its class.
     heap.free(again);
-    try testing.expectEqual(again, try heap.alloc(.list, 30));
+    try testing.expectEqual(again, try heap.alloc(.persistent_vector, 500));
+}
+
+test "slabs: a sweep keeps as many empty slabs as are in use, and hands the rest back once the live set shrinks" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const per_slab = class_info[class_of[528 / 16]].slots;
+    var held: std.ArrayList(*HeapHeader) = .empty;
+    defer held.deinit(testing.allocator);
+    // Three hundred slabs; one block of each of the first two hundred
+    // survives.
+    for (0..per_slab * 300) |i| {
+        const h = try heap.alloc(.persistent_vector, 512);
+        if (i < per_slab * 200 and i % per_slab == 0) try held.append(testing.allocator, h);
+    }
+    for (held.items) |h| h.setMarked();
+    _ = heap.sweepUnmarked();
+    try testing.expectEqual(@as(usize, 300), heap.slab_count);
+    try testing.expectEqual(@as(usize, 100), heap.empty_slab_count);
+    // Nothing survives: all but the minimum go back.
+    _ = heap.sweepUnmarked();
+    try testing.expectEqual(@as(usize, 0), heap.liveCount());
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.slab_count);
+    try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
 }
 
 test "slabs: a sweep keeps pinned and marked slots and every class stays consistent" {
