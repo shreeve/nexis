@@ -301,10 +301,12 @@ pub const Loader = struct {
             return error.Diagnosed;
         }
         const base: Diagnostic = .{ .source = info, .span = span, .label = "" };
+        // A compile error with a sentence reads as that sentence; the
+        // Zig name is for the ones with nothing to add (TOOLING.md §1).
         if (detail) |d|
-            self.diagnose(base, "{s}: {s}", .{ @errorName(err), d }) catch return error.OutOfMemory
+            self.diagnose(base, "compile error: {s}", .{d}) catch return error.OutOfMemory
         else
-            self.diagnose(base, "{s}", .{@errorName(err)}) catch return error.OutOfMemory;
+            self.diagnose(base, "compile error: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }
 
