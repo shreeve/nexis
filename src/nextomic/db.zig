@@ -99,7 +99,7 @@ pub const OpenOptions = struct {
     /// How the connection's commits sync; null takes the process's
     /// durability (`NEXIS_DURABILITY`, NEXTOMIC.md §3).
     sync: ?SyncMode = null,
-    map_size: u64 = 256 * 1024 * 1024,
+    map_size: u64 = store_mod.initial_map_size,
 };
 
 pub const Conn = struct {
@@ -647,7 +647,7 @@ pub const DatomScan = struct {
         return .{ .e = parts.e, .a = parts.a, .v = v, .t = t, .added = added };
     }
 
-    /// The full out-of-line value from the EAVT payload of this exact
+    /// The full out-of-line value from the EAVT-h payload of this exact
     /// datom (current or history), read with `getFromTree` and copied
     /// into the arena: a multi-page value is assembled in the
     /// transaction's own buffer, which dies with the transaction.
@@ -757,6 +757,12 @@ pub const TestConn = struct {
         testing.allocator.destroy(self);
     }
 };
+
+test "a connection creates a new store file at the store's initial map size" {
+    const tc = try TestConn.init("db_map_size");
+    defer tc.deinit();
+    try testing.expectEqual(store_mod.initial_map_size, tc.conn.store.file.env.info().mapSize);
+}
 
 test "db at bootstrap: datoms, entity, entid, ident, tx-range" {
     const tc = try TestConn.init("db_boot");

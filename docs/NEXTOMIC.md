@@ -44,8 +44,8 @@ below is a public function or a committed invariant of emdb as it stands
 store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
 new file starts at the map size its opener names
 (`Store.Options.map_size`: 1 MiB, `Store.initial_map_size`, unless
-named; a connection names `nextomic.db.OpenOptions.map_size`, 256 MB)
-and emdb extends a full file 8 MiB at a time (`Store.map_grow_step`).
+named, as `nextomic.db.OpenOptions.map_size` is by default) and emdb
+extends a full file 8 MiB at a time (`Store.map_grow_step`).
 emdb reserves the address space when it opens a file, so an extension
 moves no mapping and costs one `ftruncate`; the file's length is the
 map, and its allocated blocks are the pages written. emdb reads a
