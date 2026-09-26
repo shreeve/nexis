@@ -536,9 +536,28 @@ rule runs after every pattern that could bind its arguments.
 Join per step: index nested loop (seek per row) when `rows × log n` is
 below four times the scan estimate, otherwise one scan of the constant
 prefix hash-joined on the shared variables (`plan.nestedLoop`). The
-hash side is a chained index keyed by row hash, sized up front.
+constant-prefix scan runs once per query for each source, index and
+shape of its positions (which hold constants, which a variable, which
+repeat one), and a later pattern of that shape joins with the same rows
+under its own variables. The hash side is the smaller one, or the
+cached scan, which keeps its indexes for the next join with it; an
+index is chained by row hash and sized up front. The joined rows are
+gathered column by column from the two sides, and a side whose every
+row comes through once, in order, lends its columns instead.
 Estimates come from `treeStat` and per-attribute counts kept in
 `Schema`.
+
+After ordering, a liveness pass gives each step the variables the
+relation drops after it: every variable no later step reads and the
+plan's caller does not ask for. The query's caller asks for its
+`:find` and `:with` variables, a `not` for its join variables, an `or`
+branch for the `or`'s join variables, a rule body for the rule's head.
+A variable only a predicate, a function, a `not` or an `or-join` reads
+is dropped once that clause has run, so a relation holds the variables
+still in use rather than every variable bound so far: an n-clause chain
+`[?x0 :next ?x1] ... [?xn-1 :next ?xn]` finding `?x0 ?xn` keeps two
+columns between steps, not n. `explain` ends a step's line with the
+variables dropped after it (`drop ?x1`).
 
 **Sources.** A query without `:in` reads `[$]`. `:in` binds data
 sources, `$` or any `$name` (`:in $db ?x`), positional like every
@@ -652,7 +671,9 @@ for `.` and `[...]`), not zero.
 
 **Relation** is a Zig-private columnar struct in the query arena
 (`vars`, typed columns for eids and longs, a `Value` column otherwise);
-never a VM value. Results are copied into the VM heap as a persistent
+never a VM value, and never changed once built, so a relation made
+from another shares the columns it keeps (dropping a variable copies
+nothing). Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups

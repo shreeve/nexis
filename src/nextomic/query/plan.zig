@@ -12,6 +12,8 @@
 //!     the smallest estimate given the variables bound so far runs next.
 //!     An estimate is kept until one of the clause's own variables is
 //!     bound, so placing n clauses costs O(n) estimates, not O(n²).
+//!   - After each step the relation drops every variable no later step
+//!     reads and the plan's caller does not ask for (`Plan.drop`).
 //!   - A data pattern with nothing bound in `e`, `a` or `v` is refused
 //!     with `error.UnboundPattern`; a predicate or function whose inputs
 //!     (its arguments, and its function when that is a variable) can
@@ -197,6 +199,9 @@ pub const Plan = struct {
     /// The variables this plan starts with (bound by its input relation).
     input: []const Var,
     steps: []const Step,
+    /// Per step, the variables the relation drops after it: those no
+    /// later step reads and the caller does not ask for.
+    drop: []const []const Var,
     /// Estimated rows of the input relation.
     rows_in: u64,
     /// Estimated rows after each step, one per step.
@@ -399,13 +404,17 @@ pub const Bound = struct {
 };
 
 /// Plan `query` for `read`. The returned plan starts from the relation
-/// over the `:in` variables.
+/// over the `:in` variables and ends with the `:find` and `:with` ones.
 pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
-    return planSub(ctx, query.where, query.in_vars, 1);
+    var output: std.ArrayList(Var) = .empty;
+    for (query.find) |f| try ir.addVar(ctx.arena, &output, f.variable_of());
+    for (query.with) |w| try ir.addVar(ctx.arena, &output, w);
+    return planSub(ctx, query.where, query.in_vars, 1, output.items);
 }
 
-/// Plan `clauses` starting from a relation over `input`.
-pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
+/// Plan `clauses` starting from a relation over `input`; the caller
+/// reads the variables `output` from its result.
+pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64, output: []const Var) Failure!*Plan {
     try stack.check();
     ctx.depth += 1;
     defer ctx.depth -= 1;
@@ -418,11 +427,99 @@ pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: 
     out.* = .{
         .input = try ctx.arena.dupe(Var, input),
         .steps = try steps.toOwnedSlice(ctx.arena),
+        .drop = &.{},
         .rows_in = rows_in,
         .rows_after = try rows_after.toOwnedSlice(ctx.arena),
         .rows_estimate = rows,
     };
+    out.drop = try liveness(ctx, input, out.steps, output);
     return out;
+}
+
+/// Per step, the variables the relation can drop after it: those it
+/// holds that no later step reads and `output` does not name.
+fn liveness(ctx: *Ctx, input: []const Var, steps: []const Step, output: []const Var) ![]const []const Var {
+    const arena = ctx.arena;
+    const n_vars = ctx.vars.items.len;
+    // Back to front: what is live after each step.
+    const live_after = try arena.alloc(std.DynamicBitSetUnmanaged, steps.len);
+    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_vars);
+    for (output) |v| live.set(v);
+    var reads: std.ArrayList(Var) = .empty;
+    var i = steps.len;
+    while (i > 0) {
+        i -= 1;
+        live_after[i] = try live.clone(arena);
+        reads.clearRetainingCapacity();
+        const adds = try stepVars(arena, &steps[i], &reads);
+        for (adds) |v| live.unset(v);
+        for (reads.items) |v| live.set(v);
+    }
+    // Front to back: what the relation holds, and what it drops.
+    const drop = try arena.alloc([]const Var, steps.len);
+    var held: std.ArrayList(Var) = .empty;
+    try held.appendSlice(arena, input);
+    for (steps, drop, live_after) |*s, *d, la| {
+        var reads_unused: std.ArrayList(Var) = .empty;
+        for (try stepVars(arena, s, &reads_unused)) |v| try ir.addVar(arena, &held, v);
+        var gone: std.ArrayList(Var) = .empty;
+        var kept: usize = 0;
+        for (held.items) |v| {
+            if (la.isSet(v)) {
+                held.items[kept] = v;
+                kept += 1;
+            } else try gone.append(arena, v);
+        }
+        held.shrinkRetainingCapacity(kept);
+        d.* = gone.items;
+    }
+    return drop;
+}
+
+/// The variables step `s` adds to the relation; appends to `reads` the
+/// ones it reads from its input.
+fn stepVars(arena: Allocator, s: *const Step, reads: *std.ArrayList(Var)) ![]const Var {
+    switch (s.*) {
+        .scan => |sc| {
+            for (sc.slots()) |slot| if (slot == .bound) try reads.append(arena, slot.bound);
+            return sc.fresh;
+        },
+        .match => |m| {
+            for (m.slots) |slot| if (slot == .bound) try reads.append(arena, slot.bound);
+            return m.fresh;
+        },
+        .pred => |p| {
+            try callReads(arena, p.call, reads);
+            return &.{};
+        },
+        .bind => |b| {
+            try callReads(arena, b.call, reads);
+            // An output bound before the step is compared, not bound.
+            for (try b.out.vars(arena)) |v| if (!ir.containsVar(b.fresh, v)) try reads.append(arena, v);
+            return b.fresh;
+        },
+        .not => |n| {
+            try reads.appendSlice(arena, n.join);
+            return &.{};
+        },
+        .@"or" => |o| {
+            try reads.appendSlice(arena, o.bound);
+            return o.fresh;
+        },
+        .source => |src| {
+            for (src.vars) |v| if (!ir.containsVar(src.fresh, v)) try reads.append(arena, v);
+            return src.fresh;
+        },
+        .fix => |f| {
+            for (f.args) |v| if (!ir.containsVar(f.fresh, v)) try reads.append(arena, v);
+            return f.fresh;
+        },
+    }
+}
+
+fn callReads(arena: Allocator, call: ir.Call, reads: *std.ArrayList(Var)) !void {
+    if (call.f == .variable) try reads.append(arena, call.f.variable);
+    for (call.args) |a| if (a == .variable) try reads.append(arena, a.variable);
 }
 
 /// Record `rows` as the estimate after every step placed since the
@@ -497,7 +594,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
                     const join = p.join orelse try notJoin(ctx, n, &scope);
                     p.join = join;
                     if (!allBound(join, bound)) break :blk false;
-                    const sub = try planSub(ctx, n.body, join, rows.*);
+                    const sub = try planSub(ctx, n.body, join, rows.*, join);
                     try steps.append(ctx.arena, .{ .not = .{ .join = join, .sub = sub } });
                     break :blk true;
                 },
@@ -735,7 +832,7 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     const fresh = try newVars(ctx.arena, join, bound);
     const plans = try ctx.arena.alloc(*Plan, branches.len);
     for (branches, plans, 1..) |br, *p, n| {
-        p.* = try planSub(ctx, br, bound_join.items, rows);
+        p.* = try planSub(ctx, br, bound_join.items, rows, join);
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
@@ -1048,8 +1145,9 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.V
 /// description (index, estimate, tree size, bound variables), the join
 /// the executor will run for a scan (`nested`: one seek per input row;
 /// `hash`: one scan of the constant prefix hash-joined on the shared
-/// variables) and the estimated rows after the step; sub-plans indent
-/// under their step and end with their own `rows~` line.
+/// variables), the estimated rows after the step and the variables the
+/// relation drops after it (`drop ?x ?y`); sub-plans indent under their
+/// step and end with their own `rows~` line.
 pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
     var lines: std.ArrayList(Line) = .empty;
     try explainSub(p, ctx, &lines, 0);
@@ -1065,16 +1163,21 @@ pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
         while (pad > 0) : (pad -= 1) try w.writeByte(' ');
         try w.print("{s: <7}", .{l.join orelse ""});
         if (l.rows) |r| try w.print(" rows~{d}", .{r});
+        if (l.drop.len > 0) {
+            try w.writeAll(" drop ");
+            try explainVars(l.drop, ctx, w);
+        }
         try w.writeByte('\n');
     }
 }
 
 /// One line of the table: the description, the join kind of a scan,
-/// the estimated rows after the step.
+/// the estimated rows after the step, the variables dropped after it.
 const Line = struct {
     text: []const u8,
     join: ?[]const u8 = null,
     rows: ?u64 = null,
+    drop: []const Var = &.{},
 };
 
 fn indent(w: *std.Io.Writer, depth: usize) !void {
@@ -1108,12 +1211,12 @@ fn joinKind(s: *const Scan, rows: u64) []const u8 {
 
 pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
     try stack.check();
-    for (p.steps, 0..) |step, i| {
+    for (p.steps, p.drop, 0..) |step, drop, i| {
         var out: std.Io.Writer.Allocating = .init(ctx.arena);
         const w = &out.writer;
         try indent(w, depth);
         try w.print("{d}. ", .{i + 1});
-        var line: Line = .{ .text = "", .rows = p.rows_after[i] };
+        var line: Line = .{ .text = "", .rows = p.rows_after[i], .drop = drop };
         switch (step) {
             .scan => |s| {
                 try w.writeAll("scan [");

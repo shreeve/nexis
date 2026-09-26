@@ -1327,12 +1327,25 @@ test "corpus: rules" {
     }
 }
 
+/// An `n`-clause chain `[?x0 attr ?x1] [?x1 attr ?x2] ...` with `find`
+/// as its find elements; `%` among the inputs when `rules`.
+fn chainQuery(arena: Allocator, n: usize, attr: []const u8, find: []const u8, rules: bool) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("[:find {s} {s}:where", .{ find, if (rules) ":in $ % " else "" });
+    for (0..n) |i| try out.writer.print(" [?x{d} {s} ?x{d}]", .{ i, attr, i + 1 });
+    try out.writer.writeByte(']');
+    return out.written();
+}
+
 test "corpus: long chains, wide joins, and the variables a relation drops" {
     const fx = try Fx.init("q_chains");
     defer fx.deinit();
     try loadCorpus(fx);
     const dbv = try fx.db();
     const none: []const Value = &.{value.nilValue()};
+    const arena = fx.arena();
+    const rules = try fx.read(rules_src);
+    const args: []const Value = &.{ value.nilValue(), rules };
 
     // A variable repeated in a pattern whose other variables are bound
     // must carry one value in both positions, on the hash join as on
@@ -1340,6 +1353,49 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     try checkCount(fx, dbv, "[:find ?e ?b :where [?e :person/boss ?b] [?b :person/boss ?b]]", none, 0);
     try checkCount(fx, dbv, "[:find ?e ?f :where [?e :person/friend ?f] [?f :person/friend ?f]]", none, 0);
     try checkCount(fx, dbv, "[:find ?a :where [?a :edge/to ?b] [?b :edge/to ?c] [?c :edge/to ?a]]", none, 3);
+
+    // Chains round the n1 → n2 → n3 → n1 cycle, narrow and wide: the
+    // ends, every variable, the start alone, a count; then rule calls.
+    for ([_]usize{ 2, 5, 12, 30 }) |n| {
+        const last = try std.fmt.allocPrint(arena, "?x0 ?x{d}", .{n});
+        _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", last, false), none);
+        var every: std.Io.Writer.Allocating = .init(arena);
+        for (0..n + 1) |i| try every.writer.print("?x{d} ", .{i});
+        _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", every.written(), false), none);
+        _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", "?x0", false), none);
+        const counted = try std.fmt.allocPrint(arena, "(count ?x{d}) ?x0", .{n});
+        _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", counted, false), none);
+    }
+    try checkCount(fx, dbv, "[:find ?a ?d :in $ % :where (reach-left ?a ?b) (reach-left ?b ?c) (reach-left ?c ?d) [?d :node/label \"n5\"]]", args, 3);
+
+    // A wide join: every attribute of a person, one entity variable.
+    _ = try check(fx, dbv, "[:find ?n ?em ?a ?h ?act ?t ?r :where [?e :person/name ?n] [?e :person/email ?em] [?e :person/age ?a] [?e :person/height ?h] [?e :person/active ?act] [?e :person/tags ?t] [?e :person/role ?r]]", none);
+    _ = try check(fx, dbv, "[:find ?n ?fn ?bn :where [?e :person/name ?n] [?e :person/friend ?f] [?f :person/name ?fn] [?e :person/boss ?b] [?b :person/name ?bn] [?b :person/age ?ba] [?f :person/age ?fa] [(< ?fa ?ba)]]", none);
+
+    // A variable read by no later clause and asked for by nobody is
+    // dropped; the answer is the same wherever its last reader is: only
+    // in :with, a rule head, a not, an or-join, a predicate, a function,
+    // or nowhere.
+    try checkCount(fx, dbv, "[:find (sum ?a) . :with ?e :where [?e :person/age ?a] [?e :person/name ?n]]", none, 1);
+    try testing.expectEqual(@as(i64, 30 + 26 + 41 + 30 + 55 + 33), (try check(fx, dbv, "[:find (sum ?a) . :with ?e :where [?e :person/age ?a] [?e :person/name ?n]]", none)).cell(0, 0).int);
+    try checkCount(fx, dbv, "[:find (count ?a) . :where [?e :person/age ?a] [?e :person/name ?n]]", none, 1);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where (friend ?a ?b) [?a :person/name ?n]]", args, 5);
+    try checkCount(fx, dbv, "[:find ?n :in $ % :where (has-tag ?p ?t) (older ?p ?q) [?p :person/name ?n]]", args, 5);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] (not [?e :person/boss ?b] [?b :person/age ?a])]", none, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] (or-join [?e ?a] [?e :person/tags :green] (and [?e :person/boss ?b] [?b :person/age ?a]))]", none, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?a] [(add ?a ?a) ?d] [(> ?d 60)]]", none, 3);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?d] [(> ?d 40)]]", &.{ value.nilValue(), try fx.read("inc") }, 2);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [?e :person/age ?unused] [?e :person/tags ?t]]", none, 4);
+    try checkCount(fx, dbv, "[:find ?t :where [?e :person/tags ?t] [?e :person/age ?a] [(> ?a 20)]]", none, 3);
+
+    // explain names what each step drops.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var diag: query.Diag = .{};
+    try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age ?a] [(> ?a 40)] [?e :person/name ?n]]"), dbv, none, &diag, .{ .hook = fx.hook() }, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "2. pred (> ?a 40)") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?a\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?e\n") != null);
 }
 
 test "corpus: as-of, since, history views" {

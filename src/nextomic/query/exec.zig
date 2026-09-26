@@ -15,7 +15,12 @@
 //!     the db-value is inside the `Read`, so scans see folded datoms.
 //!   - Per scan the join is an index nested loop (one seek per input
 //!     row) or one constant-prefix scan hash-joined on the shared
-//!     variables, as `plan.nestedLoop` decides from the input rows.
+//!     variables, as `plan.nestedLoop` decides from the input rows. A
+//!     constant-prefix scan runs once per query for each source, index
+//!     and shape, and keeps the hash indexes joins build over it.
+//!   - Each step's result leaves out the variables `Plan.drop` names
+//!     for it; a step that keeps every row of its input, in order,
+//!     lends that input's columns rather than copying them.
 //!   - Built-in predicates and functions are Zig over cells; any other
 //!     symbol goes to the `CallHook` with VM values, as does the value
 //!     of a variable in function position, and its errors propagate
@@ -102,25 +107,29 @@ pub const Exec = struct {
     args: []const Value = &.{},
     /// The random source of `sample` and `rand`, made on first use.
     prng: ?std.Random.DefaultPrng = null,
+    /// The constant-prefix scans run so far, reused by a later pattern
+    /// that reads the same datoms (`Scanned`).
+    scans: std.ArrayList(Scanned) = .empty,
 
     /// Run `p` from `input`, which binds at least `p.input`.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
         try stack.check();
         var rel = input;
-        for (p.steps) |*s| rel = try self.step(s, rel);
+        for (p.steps, p.drop) |*s, drop| rel = try self.step(s, rel, drop);
         return rel;
     }
 
-    fn step(self: *Exec, s: *const Step, rel: Relation) anyerror!Relation {
+    /// Run one step and drop the columns `drop` from its result.
+    fn step(self: *Exec, s: *const Step, rel: Relation, drop: []const Var) anyerror!Relation {
         return switch (s.*) {
-            .scan => |*sc| self.execScan(sc, rel),
-            .match => |*m| self.execMatch(m, rel),
-            .pred => |*p| self.execPred(p, rel),
-            .bind => |*b| self.execBind(b, rel),
-            .not => |*n| self.execNot(n, rel),
-            .@"or" => |*o| self.execOr(o, rel),
-            .source => |*src| self.execSource(src, rel),
-            .fix => |*f| rules_mod.execFix(self, f, rel),
+            .scan => |*sc| self.execScan(sc, rel, drop),
+            .match => |*m| self.execMatch(m, rel, drop),
+            .pred => |*p| self.execPred(p, rel, drop),
+            .bind => |*b| (try self.execBind(b, rel)).without(drop),
+            .not => |*n| (try self.execNot(n, rel)).without(drop),
+            .@"or" => |*o| self.execOr(o, rel, drop),
+            .source => |*src| self.execSource(src, rel, drop),
+            .fix => |*f| rules_mod.execFix(self, f, rel, drop),
         };
     }
 
@@ -178,54 +187,110 @@ pub const Exec = struct {
 
     // ── scans ─────────────────────────────────────────────────────
 
-    /// Where an output variable's cell comes from.
-    const Src = union(enum) {
-        row: usize,
-        pos: usize,
+    /// A constant-prefix scan already run: its datoms depend only on the
+    /// source, the index and what each position holds, so a later
+    /// pattern of the same shape reads them again under its own
+    /// variables, with the hash indexes earlier joins built over them.
+    /// The relation's columns are the pattern's variables in order of
+    /// first position.
+    const Scanned = struct {
+        src: ir.Src,
+        index: key.Index,
+        shape: [5]Shape,
+        rel: Relation,
     };
 
-    fn execScan(self: *Exec, s: *const Scan, rel: Relation) anyerror!Relation {
-        const out_vars = try std.mem.concat(self.arena, Var, &.{ rel.vars, s.fresh });
-        var out = try Relation.init(self.arena, out_vars);
-        if (s.unsatisfiable or rel.rows == 0) return out;
+    /// What a position of a hash-joined scan holds: nothing, a
+    /// constant, or a variable named by its first position.
+    const Shape = union(enum) {
+        blank,
+        constant: Cell,
+        first: usize,
 
-        const nested = plan_mod.nestedLoop(s, rel.rows);
+        fn eql(a: Shape, b: Shape) bool {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return switch (a) {
+                .blank => true,
+                .constant => |c| c.eql(b.constant),
+                .first => |p| p == b.first,
+            };
+        }
+    };
+
+    fn shapeOf(slots: [5]plan_mod.Slot) [5]Shape {
+        var out: [5]Shape = undefined;
+        for (slots, &out) |slot, *o| o.* = switch (slot) {
+            .blank => .blank,
+            .constant => |c| .{ .constant = c.cell },
+            .bound, .fresh, .same => |v| .{ .first = slotPos(slots, v) },
+        };
+        return out;
+    }
+
+    fn execScan(self: *Exec, s: *const Scan, rel: Relation, drop: []const Var) anyerror!Relation {
+        if (s.unsatisfiable or rel.rows == 0) return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, s.fresh }))).without(drop);
+        if (!plan_mod.nestedLoop(s, rel.rows)) return rel.join(&(try self.scanned(s)), drop);
+
+        // One seek per input row; `picked` names the input row of each
+        // output row and `fresh` holds the variables the scan binds.
         const slots = s.slots();
         // A pattern that binds nothing only asks whether a datom exists:
         // one per row is the answer, and nothing repeats.
         const probe = s.fresh.len == 0;
-
-        if (nested) {
-            const srcs = try self.arena.alloc(Src, out_vars.len);
-            for (out_vars, srcs) |v, *src| src.* = if (rel.colOf(v)) |c| .{ .row = c } else .{ .pos = slotPos(slots, v) };
-            const row = try self.arena.alloc(Cell, rel.cols.len);
-            var i: usize = 0;
-            while (i < rel.rows) : (i += 1) {
-                rel.rowInto(i, row);
-                try self.scanInto(s, s.index, &rel, row, srcs, &out, probe);
-            }
-            if (probe) return out;
-        } else {
-            var pvars: std.ArrayList(Var) = .empty;
-            for (slots) |slot| switch (slot) {
-                .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
-                else => {},
-            };
-            var scanned = try Relation.init(self.arena, pvars.items);
-            const srcs = try self.arena.alloc(Src, pvars.items.len);
-            for (pvars.items, srcs) |v, *src| src.* = .{ .pos = slotPos(slots, v) };
-            try self.scanInto(s, s.hash_index.?, null, &.{}, srcs, &scanned, false);
-            if (probe) return rel.hashJoin(&(try scanned.dedup()));
-            out = try rel.hashJoin(&scanned);
+        var fresh = try Relation.init(self.arena, s.fresh);
+        const srcs = try self.arena.alloc(usize, s.fresh.len);
+        for (s.fresh, srcs) |v, *src| src.* = slotPos(slots, v);
+        var picked: std.ArrayList(u32) = .empty;
+        var cols: [5]?usize = undefined;
+        for (slots, &cols) |slot, *c| c.* = if (slot == .bound) rel.colOf(slot.bound).? else null;
+        var i: usize = 0;
+        while (i < rel.rows) : (i += 1) {
+            var wants: [5]?Cell = undefined;
+            for (slots, cols, &wants) |slot, c, *w| w.* = if (c) |col| rel.cell(i, col) else if (slot == .constant) slot.constant.cell else null;
+            try self.scanInto(s, s.index, wants, srcs, &fresh, probe);
+            while (picked.items.len < fresh.rows) try picked.append(self.arena, @intCast(i));
         }
+        if (probe) return rel.rowsAt(picked.items, drop);
+        const out = try (try rel.rowsAt(picked.items, drop)).beside(&(try fresh.without(drop)));
         return if (s.dedup) out.dedup() else out;
+    }
+
+    /// The rows of `s`'s constant-prefix scan over the pattern's
+    /// variables, deduplicated when the pattern has a blank; run once
+    /// per query for each shape.
+    fn scanned(self: *Exec, s: *const Scan) anyerror!Relation {
+        const slots = s.slots();
+        var pvars: std.ArrayList(Var) = .empty;
+        for (slots) |slot| switch (slot) {
+            .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
+            else => {},
+        };
+        const shape = shapeOf(slots);
+        const index = s.hash_index.?;
+        for (self.scans.items) |c| {
+            if (c.src != s.src or c.index != index) continue;
+            for (c.shape, shape) |a, b| {
+                if (!a.eql(b)) break;
+            } else return .{ .arena = self.arena, .vars = pvars.items, .cols = c.rel.cols, .rows = c.rel.rows, .indexes = c.rel.indexes };
+        }
+        var rows = try Relation.init(self.arena, pvars.items);
+        const srcs = try self.arena.alloc(usize, pvars.items.len);
+        for (pvars.items, srcs) |v, *src| src.* = slotPos(slots, v);
+        var wants: [5]?Cell = undefined;
+        for (slots, &wants) |slot, *w| w.* = if (slot == .constant) slot.constant.cell else null;
+        try self.scanInto(s, index, wants, srcs, &rows, false);
+        if (s.dedup) rows = try rows.dedup();
+        rows.indexes = try self.arena.create(std.ArrayList(Relation.Hashed));
+        rows.indexes.?.* = .empty;
+        try self.scans.append(self.arena, .{ .src = s.src, .index = index, .shape = shape, .rel = rows });
+        return rows;
     }
 
     /// A pattern over a collection: the tuples whose elements equal the
     /// constants and agree on a repeated variable, joined with `rel` on
     /// the bound variables. A tuple shorter than a position the pattern
     /// uses matches nothing.
-    fn execMatch(self: *Exec, m: *const plan_mod.Match, rel: Relation) anyerror!Relation {
+    fn execMatch(self: *Exec, m: *const plan_mod.Match, rel: Relation, drop: []const Var) anyerror!Relation {
         var pvars: std.ArrayList(Var) = .empty;
         for (m.slots) |slot| switch (slot) {
             .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
@@ -251,7 +316,7 @@ pub const Exec = struct {
             }
             try matched.append(cells);
         }
-        return rel.hashJoin(&(try matched.dedup()));
+        return rel.join(&(try matched.dedup()), drop);
     }
 
     /// The first position whose slot names `v`.
@@ -263,31 +328,22 @@ pub const Exec = struct {
         unreachable;
     }
 
-    /// The cell a bound slot compares against: the constant, or the
-    /// input row's value (null without a row, when the hash join
-    /// compares instead).
-    fn slotCell(slot: plan_mod.Slot, rel: ?*const Relation, row: []const Cell) ?Cell {
-        return switch (slot) {
-            .constant => |c| c.cell,
-            .bound => |v| if (rel) |r| row[r.colOf(v).?] else null,
-            else => null,
-        };
-    }
-
-    /// Scan `planned` for the datoms of `s` given one input row (or
-    /// none), appending the passing rows to `out` through `srcs`, or
-    /// only the first when `first_only`. A
-    /// VAET scan whose value cell is not an entity id becomes a scan
-    /// of every datom in AEVT, filtered on the value.
-    fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, rel: ?*const Relation, row: []const Cell, srcs: []const Src, out: *Relation, first_only: bool) anyerror!void {
+    /// Scan `planned` for the datoms of `s`, appending the passing rows
+    /// to `out` (its columns from the positions `srcs`), or only the
+    /// first when `first_only`. `wants` holds, per position, the cell a
+    /// datom must carry there: a constant, or an input row's value in
+    /// the nested loop; a variable repeated in the pattern with no
+    /// value yet must carry one value in each of its positions. A VAET
+    /// scan whose value cell is not an entity id becomes a scan of
+    /// every datom in AEVT, filtered on the value.
+    fn scanInto(self: *Exec, s: *const Scan, planned: key.Index, wants_in: [5]?Cell, srcs: []const usize, out: *Relation, first_only: bool) anyerror!void {
         const read = self.sources[s.src].db;
         const slots = s.slots();
         var comps: key.Components = .{};
         var index = planned;
-        // The cells the bound positions compare against, with an ident
-        // in the attribute position turned into the attribute id.
-        var wants: [5]?Cell = undefined;
-        for (slots, 0..) |slot, pos| wants[pos] = slotCell(slot, rel, row);
+        // The attribute position's cell is an attribute id, even when
+        // the row carried an ident.
+        var wants = wants_in;
 
         if (wants[0]) |c| comps.e = c.asEid() orelse return;
 
@@ -325,22 +381,15 @@ pub const Exec = struct {
         const cells = try self.arena.alloc(Cell, out.cols.len);
         datoms: while (try it.next()) |d| {
             const dc = try self.datomCells(read, d);
-            for (slots, 0..) |slot, pos| {
-                switch (slot) {
-                    .blank, .fresh => {},
-                    .constant => if (!dc[pos].eql(wants[pos].?)) continue :datoms,
-                    // Without a row (the hash join's scan) a bound variable
-                    // repeated in the pattern is held to one value, as `same`.
-                    .bound => |v| if (wants[pos]) |want| {
-                        if (!dc[pos].eql(want)) continue :datoms;
-                    } else if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
-                    .same => |v| if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
+            for (slots, wants, 0..) |slot, want, pos| {
+                if (want) |w| {
+                    if (!dc[pos].eql(w)) continue :datoms;
+                } else switch (slot) {
+                    .same, .bound => |v| if (!dc[pos].eql(dc[slotPos(slots, v)])) continue :datoms,
+                    else => {},
                 }
             }
-            for (srcs, cells) |src, *cell| cell.* = switch (src) {
-                .row => |c| row[c],
-                .pos => |p| dc[p],
-            };
+            for (srcs, cells) |p, *cell| cell.* = dc[p];
             try out.append(cells);
             if (first_only) return;
         }
@@ -381,9 +430,8 @@ pub const Exec = struct {
         return args;
     }
 
-    fn execPred(self: *Exec, p: *const plan_mod.Pred, rel: Relation) anyerror!Relation {
-        var out = try Relation.init(self.arena, rel.vars);
-        const map = try out.mapFrom(&rel);
+    fn execPred(self: *Exec, p: *const plan_mod.Pred, rel: Relation, drop: []const Var) anyerror!Relation {
+        var passed: std.ArrayList(u32) = .empty;
         var i: usize = 0;
         while (i < rel.rows) : (i += 1) {
             const cells = try self.argCells(&rel, i, p.call.args);
@@ -392,9 +440,9 @@ pub const Exec = struct {
                 .user => |sym| (try self.callUser(sym, cells)).isTruthy(),
                 .variable => |f| (try self.applyVar(&rel, i, f, cells)).isTruthy(),
             };
-            if (keep) try out.appendFrom(&rel, i, map);
+            if (keep) try passed.append(self.arena, @intCast(i));
         }
-        return out;
+        return rel.rowsAt(passed.items, drop);
     }
 
     /// `call_args` carry what a cell cannot: the source of `missing?`.
@@ -700,8 +748,8 @@ pub const Exec = struct {
         return rel.difference(&found, n.join);
     }
 
-    fn execOr(self: *Exec, o: *const plan_mod.Or, rel: Relation) anyerror!Relation {
-        if (rel.rows == 0) return Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, o.fresh }));
+    fn execOr(self: *Exec, o: *const plan_mod.Or, rel: Relation, drop: []const Var) anyerror!Relation {
+        if (rel.rows == 0) return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, o.fresh }))).without(drop);
         const input = if (o.bound.len == 0) try Relation.unit(self.arena) else try rel.project(o.bound, true);
         var acc = try Relation.init(self.arena, o.join);
         for (o.branches) |br| {
@@ -709,13 +757,13 @@ pub const Exec = struct {
             const projected = try r.project(o.join, true);
             acc = try acc.unionWith(&projected);
         }
-        return rel.hashJoin(&acc);
+        return rel.join(&acc, drop);
     }
 
-    fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation) anyerror!Relation {
+    fn execSource(self: *Exec, src: *const plan_mod.Source, rel: Relation, drop: []const Var) anyerror!Relation {
         // A fix step fills every slot of its instances before running them.
         const view = try Relation.viewAs(self.arena, src.vars, src.slot.rel.?);
-        return rel.hashJoin(&view);
+        return rel.join(&view, drop);
     }
 
     // ── inputs ────────────────────────────────────────────────────
@@ -759,7 +807,7 @@ pub const Exec = struct {
                     break :blk try r.dedup();
                 },
             };
-            rel = try rel.hashJoin(&part);
+            rel = try rel.join(&part, &.{});
         }
         return self.resolveInputs(q, rel);
     }

@@ -15,6 +15,10 @@
 //!   - `sort` orders rows by `Cell.order` column by column, so two
 //!     relations over the same variables with the same row set compare
 //!     equal row by row after sorting.
+//!   - A relation is not changed once built: `without`, `rowsAt`,
+//!     `beside` and `join` lend its columns to the relations they make
+//!     rather than copying them, so only the builder of a relation
+//!     appends to it or sorts it.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -229,6 +233,17 @@ pub const Column = union(enum) {
             .cell => |*c| try c.append(arena, v),
         }
     }
+
+    /// The values at rows `idx`, in that order.
+    fn gather(self: *const Column, arena: Allocator, idx: []const u32) !Column {
+        switch (self.*) {
+            inline else => |c, tag| {
+                const out = try arena.alloc(@TypeOf(c.items[0]), idx.len);
+                for (idx, out) |i, *o| o.* = c.items[i];
+                return @unionInit(Column, @tagName(tag), .fromOwnedSlice(out));
+            },
+        }
+    }
 };
 
 // =============================================================================
@@ -240,6 +255,16 @@ pub const Relation = struct {
     vars: []const Var,
     cols: []Column,
     rows: usize = 0,
+    /// The hash indexes `join` has built over these columns, when the
+    /// relation's keeper lets them outlive one join: a query's cached
+    /// scans do, since later patterns join with them again.
+    indexes: ?*std.ArrayList(Hashed) = null,
+
+    /// A row index by the column positions it hashes.
+    pub const Hashed = struct {
+        cols: []const usize,
+        index: RowIndex,
+    };
 
     /// An empty relation over `vars`, which are copied.
     pub fn init(arena: Allocator, vars: []const Var) !Relation {
@@ -357,7 +382,7 @@ pub const Relation = struct {
     /// it as the key as is; a chain is a linked list through `next`,
     /// which costs nothing per row beyond its slot, and reads from the
     /// row added last, so rows added last to first read in row order.
-    const RowIndex = struct {
+    pub const RowIndex = struct {
         head: std.HashMapUnmanaged(u64, u32, Identity, std.hash_map.default_max_load_percentage) = .empty,
         next: std.ArrayList(u32) = .empty,
 
@@ -388,6 +413,19 @@ pub const Relation = struct {
         fn after(self: *const RowIndex, row: u32) ?u32 {
             const n = self.next.items[row];
             return if (n == none) null else n;
+        }
+
+        /// An index over every row of `r` hashed on `cols`, added last
+        /// to first so that a chain reads in row order.
+        fn over(arena: Allocator, r: *const Relation, cols: []const usize) !RowIndex {
+            var index: RowIndex = .{};
+            try index.reserve(arena, r.rows);
+            var i: usize = r.rows;
+            while (i > 0) {
+                i -= 1;
+                try index.add(arena, @intCast(i), r.rowHashOn(cols, i));
+            }
+            return index;
         }
 
         /// Add row `row` with hash `h` at the front of its chain.
@@ -457,6 +495,44 @@ pub const Relation = struct {
         return out;
     }
 
+    /// The relation without the columns of `drop`; the other columns
+    /// are lent, not copied.
+    pub fn without(self: *const Relation, drop: []const Var) !Relation {
+        if (drop.len == 0) return self.*;
+        const vars = try self.arena.alloc(Var, self.vars.len);
+        const cols = try self.arena.alloc(Column, vars.len);
+        var n: usize = 0;
+        for (self.vars, self.cols) |v, c| {
+            if (std.mem.indexOfScalar(Var, drop, v) != null) continue;
+            vars[n] = v;
+            cols[n] = c;
+            n += 1;
+        }
+        return .{ .arena = self.arena, .vars = vars[0..n], .cols = cols[0..n], .rows = self.rows };
+    }
+
+    /// Rows `idx` of the relation, in that order, without the columns
+    /// of `drop`; when `idx` is every row in order the columns are lent.
+    pub fn rowsAt(self: *const Relation, idx: []const u32, drop: []const Var) !Relation {
+        const kept = try self.without(drop);
+        if (isIdentity(idx, self.rows)) return kept;
+        const cols = try self.arena.alloc(Column, kept.cols.len);
+        for (kept.cols, cols) |*c, *o| o.* = try c.gather(self.arena, idx);
+        return .{ .arena = self.arena, .vars = kept.vars, .cols = cols, .rows = idx.len };
+    }
+
+    /// The columns of `self` followed by those of `other`, which has as
+    /// many rows and none of its variables; both are lent.
+    pub fn beside(self: *const Relation, other: *const Relation) !Relation {
+        std.debug.assert(self.rows == other.rows);
+        return .{
+            .arena = self.arena,
+            .vars = try std.mem.concat(self.arena, Var, &.{ self.vars, other.vars }),
+            .cols = try std.mem.concat(self.arena, Column, &.{ self.cols, other.cols }),
+            .rows = self.rows,
+        };
+    }
+
     /// `self ∪ other`, both over the same variables (in any order);
     /// the result is distinct.
     pub fn unionWith(self: *const Relation, other: *const Relation) !Relation {
@@ -487,12 +563,12 @@ pub const Relation = struct {
         while (i < probe.rows) : (i += 1) _ = try index.insert(self.arena, i);
 
         const keyed = try self.project(on, false);
-        var out = try init(self.arena, self.vars);
+        var kept: std.ArrayList(u32) = .empty;
         i = 0;
         while (i < self.rows) : (i += 1) {
-            if (!index.contains(&keyed, i, keyed.rowHash(i))) try out.copyRow(self, i);
+            if (!index.contains(&keyed, i, keyed.rowHash(i))) try kept.append(self.arena, @intCast(i));
         }
-        return out;
+        return self.rowsAt(kept.items, &.{});
     }
 
     /// `src` seen through `vars`, one per column of `src`: the relation
@@ -541,42 +617,99 @@ pub const Relation = struct {
     }
 
     /// The natural join of `self` and `other` on their shared variables
-    /// (a cross product when they share none). `other` is hashed on
-    /// the shared variables; the result's columns are `self`'s followed
+    /// (a cross product when they share none), without the columns of
+    /// `drop`. The smaller side, or `other` when it keeps its indexes,
+    /// is hashed on the shared variables and the other side probes it.
+    /// The result's columns are `self`'s followed
     /// by `other`'s new variables, its rows in `self`'s order with the
-    /// matches of a row in `other`'s order.
-    pub fn hashJoin(self: *const Relation, other: *const Relation) !Relation {
+    /// matches of a row in `other`'s order; a side whose every row comes
+    /// out once, in order, lends its columns instead of copying them.
+    pub fn join(self: *const Relation, other: *const Relation, drop: []const Var) !Relation {
+        const arena = self.arena;
         const on = try self.sharedVars(other);
         const extra = try self.newVars(other);
-        const out_vars = try std.mem.concat(self.arena, Var, &.{ self.vars, extra });
-        var out = try init(self.arena, out_vars);
-        if (self.rows == 0 or other.rows == 0) return out;
+        const out_vars = try std.mem.concat(arena, Var, &.{ self.vars, extra });
+        if (self.rows == 0 or other.rows == 0) return (try init(arena, out_vars)).without(drop);
 
         const on_self = try self.mapOf(on);
         const on_other = try other.mapOf(on);
-        // Rows go in last to first, so the matches of a row come out
-        // in `other`'s row order and the result's order is settled.
-        var index: RowIndex = .{};
-        try index.reserve(self.arena, other.rows);
-        var i: usize = other.rows;
-        while (i > 0) {
-            i -= 1;
-            try index.add(self.arena, @intCast(i), other.rowHashOn(on_other, i));
-        }
-
-        const extra_map = try self.arena.alloc(usize, extra.len);
-        for (extra, extra_map) |v, *m| m.* = other.colOf(v).?;
-
-        while (i < self.rows) : (i += 1) {
-            var r = index.first(self.rowHashOn(on_self, i));
-            while (r) |j| : (r = index.after(j)) {
-                if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
-                for (out.cols[0..self.cols.len], 0..) |*c, sc| try c.append(self.arena, self.cell(i, sc));
-                for (out.cols[self.cols.len..], extra_map) |*c, oc| try c.append(self.arena, other.cell(j, oc));
-                out.rows += 1;
+        var left: std.ArrayList(u32) = .empty;
+        var right: std.ArrayList(u32) = .empty;
+        // A relation that keeps its indexes is hashed whatever its size:
+        // the index is built once for every join with it.
+        if (other.rows <= self.rows or other.indexes != null) {
+            // Rows go in last to first, so the matches of a row come out
+            // in `other`'s row order and the result's order is settled.
+            const index = try other.indexOn(on_other);
+            var i: usize = 0;
+            while (i < self.rows) : (i += 1) {
+                var r = index.first(self.rowHashOn(on_self, i));
+                while (r) |j| : (r = index.after(j)) {
+                    if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
+                    try left.append(arena, @intCast(i));
+                    try right.append(arena, j);
+                }
             }
+        } else {
+            const index = try self.indexOn(on_self);
+            var j: usize = 0;
+            while (j < other.rows) : (j += 1) {
+                var r = index.first(other.rowHashOn(on_other, j));
+                while (r) |i| : (r = index.after(i)) {
+                    if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
+                    try left.append(arena, i);
+                    try right.append(arena, @intCast(j));
+                }
+            }
+            try sortPairs(arena, self.rows, left.items, right.items);
         }
-        return out;
+
+        const self_whole = isIdentity(left.items, self.rows);
+        const other_whole = isIdentity(right.items, other.rows);
+        const cols = try arena.alloc(Column, out_vars.len);
+        for (self.cols, cols[0..self.cols.len]) |*c, *o| o.* = if (self_whole) c.* else try c.gather(arena, left.items);
+        for (extra, cols[self.cols.len..]) |v, *o| {
+            const c = &other.cols[other.colOf(v).?];
+            o.* = if (other_whole) c.* else try c.gather(arena, right.items);
+        }
+        const out: Relation = .{ .arena = arena, .vars = out_vars, .cols = cols, .rows = left.items.len };
+        return out.without(drop);
+    }
+
+    /// The index over every row hashed on `cols`: the one `indexes`
+    /// holds, or a new one it then holds.
+    fn indexOn(self: *const Relation, cols: []const usize) !*const RowIndex {
+        const kept = self.indexes orelse {
+            const index = try self.arena.create(RowIndex);
+            index.* = try RowIndex.over(self.arena, self, cols);
+            return index;
+        };
+        for (kept.items) |*h| if (std.mem.eql(usize, h.cols, cols)) return &h.index;
+        try kept.append(self.arena, .{ .cols = try self.arena.dupe(usize, cols), .index = try RowIndex.over(self.arena, self, cols) });
+        return &kept.items[kept.items.len - 1].index;
+    }
+
+    /// Does `idx` name each of rows `0..rows` once, in order?
+    fn isIdentity(idx: []const u32, rows: usize) bool {
+        if (idx.len != rows) return false;
+        for (idx, 0..) |x, i| if (x != i) return false;
+        return true;
+    }
+
+    /// Order the pairs `(left[k], right[k])` by `left`, keeping the
+    /// order of pairs with one `left`: a counting sort over `0..rows`.
+    fn sortPairs(arena: Allocator, rows: usize, left: []u32, right: []u32) !void {
+        const starts = try arena.alloc(u32, rows + 1);
+        @memset(starts, 0);
+        for (left) |i| starts[i + 1] += 1;
+        for (starts[1..], starts[0..rows]) |*s, prev| s.* += prev;
+        const l = try arena.dupe(u32, left);
+        const r = try arena.dupe(u32, right);
+        for (l, r) |i, j| {
+            left[starts[i]] = i;
+            right[starts[i]] = j;
+            starts[i] += 1;
+        }
     }
 
     /// Sort rows lexicographically by `Cell.order` over the columns in
@@ -793,7 +926,7 @@ test "a relation has no column cap" {
     const none = try rel(arena, vars[0..1], &.{});
     const diff = try d.difference(&none, vars[0..1]);
     try testing.expectEqual(@as(usize, 1), diff.rows);
-    const j = try d.hashJoin(&d);
+    const j = try d.join(&d, &.{});
     try testing.expectEqual(@as(usize, 1), j.rows);
     try testing.expectEqual(@as(usize, n), j.cols.len);
 }
@@ -813,7 +946,7 @@ test "hash join on shared vars and cross product" {
         &.{ .{ .int = 40 }, .{ .int = 3 } },
         &.{ .{ .int = 50 }, .{ .int = 7 } },
     });
-    var j = try people.hashJoin(&ages);
+    var j = try people.join(&ages, &.{});
     try testing.expectEqualSlices(Var, &.{ 0, 1, 2 }, j.vars);
     try testing.expectEqual(@as(usize, 3), j.rows);
     // Rows in `people` order, the matches of a row in `ages` order.
@@ -825,11 +958,47 @@ test "hash join on shared vars and cross product" {
     try testing.expect(j.cell(2, 1).eql(.{ .str = "cy" }));
 
     const flags = try rel(arena, &.{5}, &.{ &.{.{ .boolean = true }}, &.{.{ .boolean = false }} });
-    const cross = try people.hashJoin(&flags);
+    const cross = try people.join(&flags, &.{});
     try testing.expectEqual(@as(usize, 6), cross.rows);
 
     const unit = try Relation.unit(arena);
-    const seeded = try unit.hashJoin(&people);
+    const seeded = try unit.join(&people, &.{});
     try testing.expectEqual(@as(usize, 3), seeded.rows);
     try testing.expectEqualSlices(Var, &.{ 0, 1 }, seeded.vars);
+    // Every row of `people` comes out once, in order: its columns are lent.
+    try testing.expectEqual(people.cols[1].cell.items.ptr, seeded.cols[1].cell.items.ptr);
+}
+
+test "join: either side hashed gives one order; dropped columns are not built" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var small = try Relation.init(arena, &.{ 0, 1 });
+    var big = try Relation.init(arena, &.{ 1, 2 });
+    for (0..5) |i| try small.append(&.{ .{ .int = @intCast(i) }, .{ .int = @intCast(i % 2) } });
+    for (0..40) |i| try big.append(&.{ .{ .int = @intCast(i % 3) }, .{ .int = @intCast(i) } });
+    // `small` probes `big`'s index; `big` probes `small`'s: the rows of
+    // either come out grouped by the left side's row, matches in order.
+    const a = try small.join(&big, &.{});
+    const b = try big.join(&small, &.{});
+    try testing.expectEqual(a.rows, b.rows);
+    var i: usize = 0;
+    var last: i64 = -1;
+    while (i < a.rows) : (i += 1) {
+        const e = a.cell(i, 0).int;
+        try testing.expect(e >= last);
+        if (e == last) try testing.expect(a.cell(i, 2).int > a.cell(i - 1, 2).int);
+        last = e;
+    }
+    i = 0;
+    while (i < b.rows) : (i += 1) {
+        if (i > 0) try testing.expect(b.cell(i, 1).int >= b.cell(i - 1, 1).int);
+    }
+    const narrow = try small.join(&big, &.{1});
+    try testing.expectEqualSlices(Var, &.{ 0, 2 }, narrow.vars);
+    try testing.expectEqual(a.rows, narrow.rows);
+    try testing.expect(narrow.cell(3, 1).eql(a.cell(3, 2)));
+    const bare = try narrow.without(&.{0});
+    try testing.expectEqualSlices(Var, &.{2}, bare.vars);
+    try testing.expectEqual(narrow.cols[1].int.items.ptr, bare.cols[0].int.items.ptr);
 }

@@ -375,7 +375,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
             var r = try Renamer.init(ctx, inst.head, def, .{ .names = scc_names, .instances = instances }, src);
             const clauses = try r.clauses(def.body);
             body.* = .{
-                .plan = try plan_mod.planSub(ctx, clauses, input.items, rows),
+                .plan = try plan_mod.planSub(ctx, clauses, input.items, rows, inst.head),
                 .sites = try r.sites.toOwnedSlice(ctx.arena),
             };
         }
@@ -538,7 +538,7 @@ const Renamer = struct {
 // =============================================================================
 
 /// Run the fixpoint of `fix` and join its result with `rel`.
-pub fn execFix(ex: *exec_mod.Exec, fix: *const Fix, rel: Relation) anyerror!Relation {
+pub fn execFix(ex: *exec_mod.Exec, fix: *const Fix, rel: Relation, drop: []const Var) anyerror!Relation {
     const arena = ex.arena;
     const n = fix.instances.len;
     const totals = try arena.alloc(*relation.Accumulator, n);
@@ -597,7 +597,7 @@ pub fn execFix(ex: *exec_mod.Exec, fix: *const Fix, rel: Relation) anyerror!Rela
 
     // Rename the target's rows to the call's arguments.
     const result = try Relation.viewAs(arena, fix.args, &totals[fix.target].rel);
-    return rel.hashJoin(&result);
+    return rel.join(&result, drop);
 }
 
 /// Add the rows of `r` (over the accumulator's variables) to `total`,
