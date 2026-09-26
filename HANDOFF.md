@@ -325,11 +325,12 @@ failing test (AGENTS.md).
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
-   routine table is 32-bit. Deeply nested calls whose arguments need
-   code, `(f (f (f …)))`, still take a slot per level, so about 4000
-   levels reach the slot cap before the stack guard. Next: release a
-   call block's slots to the argument that consumes them, as nested
-   arithmetic does (`compile.zig` call lowering).
+   routine table is 32-bit, and nesting costs slots only for the
+   values a level holds while the level inside it runs: `(f (f …))`
+   in any argument position is bounded by the stack guard alone
+   (`deep-calls.nx`), `(+ (g) (+ (g) …))` holds each `(g)`. So only
+   a function with thousands of simultaneously live values (bindings,
+   or such pending operands nested past 4000 levels) reaches a cap.
 
 ### 6.2 Nextomic
 
