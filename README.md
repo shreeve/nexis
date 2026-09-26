@@ -36,7 +36,7 @@ print each value. Exit status is 0 on success, 3 for a parse or reader
 error, 4 for a compile error, 5 for an uncaught runtime error, and `n`
 for `(exit n)` (`docs/TOOLING.md` §1).
 
-`zig build test --summary all` is the gate: 1246 tests in 165 build
+`zig build test --summary all` is the gate: 1250 tests in 165 build
 steps, about a minute from a warm cache. `AGENTS.md` lists every build step.
 
 ## The language
