@@ -170,8 +170,8 @@ are the map for someone who knows Clojure.
 - `##Inf`, `##-Inf`, `##NaN`, which `pr-str` prints back.
 - Strings may span lines.
 - `;` line comments and `(comment ...)`.
-- `ns` with a docstring and `(:require [lib :as a :refer [f]])`, and
-  `require`.
+- `ns` with a docstring and `(:require [lib :as a :refer [f]])`,
+  prefix lists (`[app [c :as cc] d]`) included, and `require`.
 
 ### 4.2 Reader divergences
 

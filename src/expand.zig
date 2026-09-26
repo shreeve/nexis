@@ -938,6 +938,8 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
 ///   :refer :all        so does every public Var of the namespace
 ///   :rename {x z}      a referred `x` is named `z` here
 ///
+/// A prefix list, `[prefix suffix...]` or `(prefix suffix...)`,
+/// requires each suffix spec under `prefix.` (`requirePrefixList`).
 /// A keyword spec (`:reload`, `:reload-all`, `:verbose`) is a flag
 /// and changes nothing. What a namespace name loads, including the
 /// Clojure library names that stand for nexis namespaces, is the
@@ -951,6 +953,7 @@ fn expandRequire(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Fo
 /// Load and refer one `require` spec (see `expandRequire`).
 fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
     const spec = unwrapQuote(quoted);
+    if (prefixList(spec)) |items| return requirePrefixList(ctx, items);
     const opts: []const *Form = switch (spec.datum) {
         .keyword => return,
         .symbol => &.{},
@@ -1016,6 +1019,45 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
         const name = sym.datum.symbol.name;
         const v = target.lookupLocal(name) orelse return ctx.fail(sym.origin, "require: {s}/{s} does not exist", .{ ns_name, name });
         try referVar(ctx, cur, v, renamed(rename, name), sym.origin);
+    }
+}
+
+/// The items of a prefix list, `(prefix suffix...)` or a vector
+/// whose second element is not an option keyword: `[app c [d :as
+/// dd]]` names `app.c` and `[app.d :as dd]`, as Clojure's `require`
+/// reads it. null for any other spec.
+fn prefixList(spec: *const Form) ?[]const *Form {
+    return switch (spec.datum) {
+        .list => |l| if (l.len > 0) l else null,
+        .vector => |v| if (v.len >= 2 and v[1].datum != .keyword) v else null,
+        else => null,
+    };
+}
+
+/// Require each suffix of a prefix list under its prefix. As in
+/// Clojure, a name under a prefix has no period and a suffix is not
+/// itself a prefix list.
+fn requirePrefixList(ctx: *ExpandContext, items: []const *Form) ExpandError!void {
+    const prefix = items[0];
+    if (prefix.datum != .symbol or prefix.datum.symbol.ns != null) return ctx.fail(prefix.origin, "require: a prefix must be an unqualified symbol, not {s}", .{describeForm(prefix)});
+    for (items[1..]) |suffix| {
+        const name_form = switch (suffix.datum) {
+            .symbol => suffix,
+            .vector => |v| if (v.len == 0) suffix else v[0],
+            else => return ctx.fail(suffix.origin, "require: a prefix list holds symbols and vectors, not {s}", .{describeForm(suffix)}),
+        };
+        if (prefixList(suffix) != null) return ctx.fail(suffix.origin, "require: a prefix list cannot hold another", .{});
+        if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
+        const name = name_form.datum.symbol.name;
+        if (std.mem.indexOfScalar(u8, name, '.') != null) return ctx.fail(name_form.origin, "require: {s} is under the prefix {s}, so it cannot contain a period", .{ name, prefix.datum.symbol.name });
+        const full = try makeSymbol(ctx, try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ prefix.datum.symbol.name, name }), name_form.origin);
+        if (suffix.datum == .symbol) {
+            try requireSpec(ctx, full);
+        } else {
+            const v = try ctx.allocator.dupe(*Form, suffix.datum.vector);
+            v[0] = full;
+            try requireSpec(ctx, try makeVector(ctx, v, suffix.origin));
+        }
     }
 }
 

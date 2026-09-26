@@ -5359,6 +5359,7 @@ const RequireDir = struct {
         for (files) |f| {
             const path = try std.fs.path.join(testing.allocator, &.{ self.dir_path, f[0] });
             defer testing.allocator.free(path);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
             const file = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer file.close(io);
             try file.writeStreamingAll(io, f[1]);
@@ -5478,6 +5479,19 @@ test "require: Clojure's library namespaces name nexis's" {
     , "[A x b true]");
 }
 
+const appc = [2][]const u8{ "app/c.nx", "(ns app.c)\n(defn f [] :c)\n" };
+const appd = [2][]const u8{ "app/d.nx", "(ns app.d)\n(defn x [] :x)\n(defn y [] :y)\n" };
+
+test "require: a prefix list names several namespaces under one prefix" {
+    try expectOutputWithFiles(&.{ appc, appd },
+        \\(ns t (:require [app [c :as cc] [d :refer [x]]]))
+        \\[(cc/f) (x) (app.d/y)]
+    , "[:c :x :y]");
+    try expectOutputWithFiles(&.{ appc, appd }, "(require '(app c [d :as dd])) [(app.c/f) (dd/y)]", "[:c :y]");
+    try expectOutputWithFiles(&.{ appc, appd }, "(require '[app c d]) [(app.c/f) (app.d/x)]", "[:c :x]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure [string :as s] [set :refer [union]]]) [(s/upper-case \"a\") (union #{1} #{2})]", "[A #{1 2}]");
+}
+
 /// Run `setup`, then expand `src` with the loader over `files` and
 /// expect a failure recorded with `message` against the source text
 /// `at`.
@@ -5545,6 +5559,11 @@ test "ns and require: a bad spec or a missing namespace or Var is reported by na
     try expectRequireFailure(&.{}, "", "(ns x (:import java.util.Date))", "ns: (:import ...) is not supported", "(:import java.util.Date)");
     try expectRequireFailure(&.{utilns}, "(defn twice [] 0)", "(require '[util :refer [twice]])", "require: twice is already defined in user", "twice");
     try expectRequireFailure(&.{utilns}, "", "(require '[util :refer [twice]]) (def twice 0)", "def: twice already refers to a Var of another namespace", "twice");
+    // Clojure's rules for prefix lists: no period in a name under a
+    // prefix, no prefix list inside another.
+    try expectRequireFailure(&.{appc}, "", "(require '[app [c.e :as e]])", "require: c.e is under the prefix app, so it cannot contain a period", "c.e");
+    try expectRequireFailure(&.{appc}, "", "(require '[app [c [e]]])", "require: a prefix list cannot hold another", "[c [e]]");
+    try expectRequireFailure(&.{appc}, "", "(require '[app 1])", "require: a prefix list holds symbols and vectors, not an integer", "1");
 }
 
 const throwsns = [2][]const u8{ "throwsns.nx", "(ns throwsns)\n(throw :boom)\n" };
