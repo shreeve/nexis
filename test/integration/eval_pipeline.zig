@@ -529,6 +529,14 @@ test "syntax-quote: auto-gensyms stay unique across top-level forms" {
     , "[true false]");
 }
 
+test "gensym takes a prefix of any length" {
+    try expectOutputProgram(
+        \\(let [p (apply str (repeat 1000 "p"))
+        \\      g (name (gensym p))]
+        \\  (= (subs g 0 1002) (str p "__")))
+    , "true");
+}
+
 test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
     try expectOutputProgram("(defmacro m [x] ``(a ~~x)) (m 1)", "(user/a 1)");
     try expectOutputProgram(
@@ -2523,17 +2531,17 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
-test "a value nested past the codec's max depth is refused with a catchable error; max depth round-trips" {
-    // CODEC.md §2.7: max_depth is 4096.
+test "a value nested 100 000 deep is stored and read back through a durable ref" {
+    // CODEC.md §2.7: the codec bounds no nesting depth.
     try expectOutputProgramWithStore("seam-deep",
         \\(do
         \\  (def conn (db/open "@STORE@"))
-        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [acc]) acc)))
-        \\  [(try (do (db/put-key! (db/ref conn :t :deep) (nest 4097)) :stored)
-        \\        (catch any e (keyword? e)))
-        \\   (do (db/put-key! (db/ref conn :t :ok) (nest 4096))
-        \\       (= (nest 4096) (db/get-key (db/ref conn :t :ok))))])
-    , "[true true]");
+        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [i acc]) acc)))
+        \\  (defn depth [v] (loop [v v n 0] (if (vector? v) (recur (second v) (inc n)) n)))
+        \\  (db/put-key! (db/ref conn :t :deep) (nest 100000))
+        \\  (let [v (db/get-key (db/ref conn :t :deep))]
+        \\    [(depth v) (first v) (first (second v))]))
+    , "[100000 99999 99998]");
 }
 
 test "the VM keeps running after a caught storage failure" {
@@ -5401,6 +5409,26 @@ fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []
     const f = failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, f.message);
     try testing.expectEqualStrings(at, src[f.span.pos..][0..f.span.len]);
+}
+
+test "a source text past 4 GiB is a reader error that names the bound, never a fault" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var dir: RequireDir = undefined;
+    try dir.init(&program, &.{});
+    defer dir.deinit();
+    // Byte positions are u32, so the loader refuses the text before
+    // the parser reads a byte of it; the slice is never dereferenced.
+    const byte: u8 = '(';
+    const huge = @as([*]const u8, @ptrCast(&byte))[0 .. @as(usize, std.math.maxInt(u32)) + 2];
+    const info = vm.SourceInfo{ .path = "huge.nx", .text = huge };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.Diagnosed, dir.loader.evalSource(&info, .{ .allocator = arena.allocator() }));
+    const d = dir.loader.diagnostic.?;
+    try testing.expect(d.reading);
+    try testing.expectEqualStrings("reader error: a source text is at most 4294967295 bytes; this one is 4294967297", d.label);
 }
 
 test "ns and require: a bad spec or a missing namespace or Var is reported by name" {

@@ -45,7 +45,11 @@ store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128), a
 256 MB initial map and emdb's 64 MB growth step. emdb reads a file's
 page size from its meta and fixes it for the file's life (INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
-holds on every platform.
+holds on every platform. Keys never approach it except a keyword's
+text (§2.1 below). A stored value, whether a datom's full string or
+byte array in EAVT or a transaction's txlog entry, is at most 65 535
+overflow pages, just under 1 GiB; past that the engine refuses the
+write as `:db/value-too-large` and the transaction aborts.
 
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
@@ -108,6 +112,10 @@ are the same mechanism. They sort by id, not by text. An ident's text
 is a property of its id, not a datom value; a rename (§3 step 5) moves
 the old text to the retired names, which only the txlog decoder reads
 (an entry spells keywords by the names they had when it was written).
+Since the text is an `nx/idents` key after its prefix byte, a keyword
+the store holds, as an ident or a value, is at most 4077 bytes
+(`idents.max_name_len`); a transaction that would mint a longer one is
+`:nextomic/tx-data` naming the bound, and a read of one finds nothing.
 
 ### 2.2 Sortable value encoding
 
@@ -343,7 +351,9 @@ during normalisation with `db-before` (a db-value at the connection's
 basis, the state every function in the transaction sees) followed by
 the args, and the tx-data it returns takes the form's place: it is
 normalised like any other tx-data, so it may hold map forms, tempids
-and further calls, to a depth of 16 (`:nextomic/tx-fn` past it). `f` is
+and further calls, in chains up to 1000 calls deep (`transact.max_call_depth`;
+past it `:nextomic/tx-fn` names the limit). The bound stops a function
+that calls itself forever long before the native stack would. `f` is
 a function value, or a symbol naming a var resolved as a query
 function is (§5); anything else is `:nextomic/tx-data`, and an unbound
 symbol `:nextomic/tx-fn` naming it. A nil result is no tx-data. The
@@ -797,7 +807,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/schema` | a schema change the attribute's data or type refuses | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | bare |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | bare |
-| `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit |
+| `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit and its value |
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:message`; `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault: the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |

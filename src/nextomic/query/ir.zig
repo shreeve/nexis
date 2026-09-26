@@ -237,7 +237,7 @@ pub const Agg = struct {
     op: AggOp,
     arg: Var,
     /// The `n` of `(sample n ?x)`, `(rand n ?x)`, `(min n ?x)`, `(max n ?x)`.
-    n: ?u32 = null,
+    n: ?u64 = null,
     /// The symbol of a `custom` aggregate.
     sym: u32 = 0,
 };

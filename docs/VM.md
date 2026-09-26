@@ -753,7 +753,7 @@ built from the detail and the trace is `docs/TOOLING.md` §1.
 
 Bytecode recursion costs no native stack, but Zig code that recurses
 once per level of nested input does: reading, expanding and lowering
-forms, equality, hashing and comparison, printing, the codec, pull,
+forms, equality, hashing and comparison, printing, pull,
 transaction expansion, query parsing and rule expansion, and every
 native that re-enters the VM through `callValue`. `src/stack.zig`
 guards all of it with one address per thread (a `threadlocal`), the
@@ -777,9 +777,9 @@ The VM checks on entry to `callValue` and `runRoutine`, the two ways
 a native re-enters it, so recursion through `apply`, `map`, `reduce`,
 a protocol impl or `eval` ends in the same catchable `:stack-overflow`
 as runaway bytecode recursion. Each layer maps the error to its own
-report: the VM raises `StackOverflow`, the reader a reader error, the
-compiler a compile error, and a codec decode of bytes nested too deep
-treats them as corrupt input.
+report: the VM raises `StackOverflow`, the reader a reader error and
+the compiler a compile error. The codec and the collector walk nested
+data with heap stacks and need no guard.
 
 `=`, `hash` and printing cannot return an error to their many callers,
 so past the guard they answer `false`, `0` or `#<too deep>` and count

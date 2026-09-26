@@ -2,8 +2,8 @@
 //!
 //! The runtime recurses on the Zig stack wherever data nests: reading,
 //! expanding and lowering forms, equality, hashing and comparison,
-//! printing, the codec, pull, transaction expansion, query parsing, rule
-//! expansion, and every native that calls back into the VM. Each such
+//! printing, pull, transaction expansion, query parsing, rule expansion,
+//! and every native that calls back into the VM. Each such
 //! function calls `check` on entry, so an input nested past the stack's
 //! budget fails with `error.StackOverflow` instead of faulting
 //! (docs/VM.md §13.1).

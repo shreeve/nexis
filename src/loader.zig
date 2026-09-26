@@ -182,6 +182,10 @@ pub const Loader = struct {
     /// routines (`options.allocator`).
     pub fn evalSource(self: *Loader, info: *const vm_mod.SourceInfo, options: EvalOptions) EvalError!Value {
         const text = info.text;
+        if (text.len > reader_mod.max_source_len) {
+            try self.diagnose(.{ .label = "", .reading = true }, "reader error: a source text is at most {d} bytes; this one is {d}", .{ reader_mod.max_source_len, text.len });
+            return error.Diagnosed;
+        }
         var parser = reader_mod.parser.Parser.init(self.allocator, text);
         defer parser.deinit();
         const sexp = parser.parseProgram() catch {

@@ -62,10 +62,12 @@ pub const Diag = struct {
     attr: ?Value = null,
     /// Backing store of a formatted message, so one that names a
     /// variable outlives the arena of the parse or plan that failed.
-    buf: [160]u8 = undefined,
+    /// The longest template is under 160 bytes, so a message keeps
+    /// every name up to several hundred bytes long whole.
+    buf: [1024]u8 = undefined,
 
-    /// Leave a formatted message for `clause`; a message past the
-    /// buffer is cut.
+    /// Leave a formatted message for `clause`; one past the buffer
+    /// keeps its first 1024 bytes.
     pub fn set(self: *Diag, clause: ?usize, comptime fmt: []const u8, args: anytype) void {
         self.clause = clause;
         self.attr = null;
@@ -359,14 +361,14 @@ const Parser = struct {
             }
             if (self.isVarSym(parts[0])) return self.fail("an aggregate is named by a symbol");
             const op = ir.AggOp.fromName(name) orelse .custom;
-            var n: ?u32 = null;
+            var n: ?u64 = null;
             var arg_at: usize = 1;
             if (op.takesN()) |takes| {
                 const given = parts.len == 3;
                 if (takes == .required and !given) return self.fail("this aggregate is (op n ?x)");
                 if (given) {
                     if (parts[1].kind() != .fixnum or parts[1].asFixnum() < 0) return self.fail("an aggregate's n is a non-negative integer");
-                    n = std.math.cast(u32, parts[1].asFixnum()) orelse return self.fail("an aggregate's n is too large");
+                    n = @intCast(parts[1].asFixnum());
                     arg_at = 2;
                 }
             }
@@ -1014,6 +1016,14 @@ test "vector form: find specs, in bindings, where clause kinds" {
     try testing.expectEqualStrings("?e", interner.symbolName(parsed.vars[1].sym));
 }
 
+test "a formatted message naming a long variable is kept whole" {
+    var diag: Diag = .{};
+    const name = "?" ++ "v" ** 300;
+    diag.set(3, "or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ 2, name });
+    try testing.expectEqualStrings("or-join branch 2 leaves " ++ name ++ " unbound; every branch binds every join variable", diag.message);
+    try testing.expectEqual(@as(?usize, 3), diag.clause);
+}
+
 test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
@@ -1144,6 +1154,11 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     try testing.expect(pa.find[1].agg.op == .sample and pa.find[1].agg.n.? == 3);
     try testing.expect(pa.find[2].agg.op == .custom and pa.find[2].agg.sym == b.sym("my/total").asSymbolId());
     try testing.expect(pa.find[3].agg.op == .median and pa.find[3].agg.n == null);
+    // An n past 2^32 is an n like any other.
+    const q_big = b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("max"), b.int(1 << 40), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) });
+    const pbig = try parse(testing.allocator, &interner, q_big, &diag);
+    defer pbig.deinit();
+    try testing.expectEqual(@as(?u64, 1 << 40), pbig.find[0].agg.n);
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("sample"), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
         b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("rand"), b.int(-1), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),

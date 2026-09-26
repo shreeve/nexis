@@ -84,8 +84,12 @@ pub const Error = error{
     Schema,
 };
 
-/// How deep `:db.fn/call` results may nest further calls.
-pub const max_call_depth: u32 = 16;
+const ident_too_long = std.fmt.comptimePrint("a keyword the store holds is at most {d} bytes long", .{idents_mod.max_name_len});
+
+/// How deep `:db.fn/call` results may nest further calls: far past any
+/// real chain, and short enough that a function calling itself forever
+/// fails in milliseconds.
+pub const max_call_depth: u32 = 1000;
 
 /// Calls a transaction function (NEXTOMIC.md §3 "Transaction
 /// functions"). `f` is the value in the `:db.fn/call` form: a function,
@@ -518,6 +522,7 @@ const Ctx = struct {
     fn mintKeyword(self: *Ctx, k: u32) !u32 {
         return self.minter.resolve(k) catch |err| switch (err) {
             error.RetiredIdent => self.malformed("a retired ident name is never reused"),
+            error.IdentTooLong => self.malformed(ident_too_long),
             else => err,
         };
     }
@@ -787,13 +792,14 @@ const Ctx = struct {
     /// returns reach the trees and the txlog. A nil result is no
     /// tx-data.
     fn normaliseCall(self: *Ctx, form: Value) anyerror!void {
+        try stack.check();
         const hook = self.hook orelse return self.txFn("transaction functions run inside transact! and with only");
         const f = vector_mod.nth(form, 1);
         switch (f.kind()) {
             .function, .native_fn, .symbol => {},
             else => return self.malformed(":db.fn/call takes a function or a symbol naming one"),
         }
-        if (self.call_depth >= max_call_depth) return self.txFn("transaction functions nest past the depth limit");
+        if (self.call_depth >= max_call_depth) return self.txFn(std.fmt.comptimePrint("transaction functions nest past {d} calls", .{max_call_depth}));
         const n = vector_mod.count(form);
         const args = try self.arena.alloc(Value, n - 2);
         for (args, 2..) |*a, i| a.* = vector_mod.nth(form, i);
@@ -1132,6 +1138,7 @@ const Ctx = struct {
                 if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
                 self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
                     error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
+                    error.IdentTooLong => return self.malformed(ident_too_long),
                     else => return err,
                 };
                 break :blk @intCast(eid);
@@ -3841,6 +3848,15 @@ const TestTxHook = struct {
             const form = try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), f });
             return vector_mod.fromSlice(heap, &.{form});
         }
+        // `(countdown e n)`: calls itself `n` levels deep, then `age!`.
+        if (std.mem.eql(u8, name, "countdown")) {
+            const n = args[1].asFixnum();
+            const next = if (n == 0)
+                try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), try it.internSymbolValue("age!"), args[0], value.fromFixnum(99).? })
+            else
+                try vector_mod.fromSlice(heap, &.{ try it.internKeywordValue("db.fn/call"), f, args[0], value.fromFixnum(n - 1).? });
+            return vector_mod.fromSlice(heap, &.{next});
+        }
         // Nothing.
         if (std.mem.eql(u8, name, "nothing")) return value.nilValue();
         // Not tx-data.
@@ -3890,10 +3906,18 @@ test "transaction functions splice their tx-data in place, nest to a bound, and 
     try testing.expectEqual(age, r1.tx_data[2].a);
     try testing.expectEqual(@as(i64, 30), r1.tx_data[2].v.long);
 
-    // Unbounded nesting stops at the depth limit with nothing written.
+    // A chain of `max_call_depth` nested calls runs: countdown from
+    // n makes n + 1 calls, then `age!` one more.
+    const countdown = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("countdown"), eid, value.fromFixnum(max_call_depth - 2).? })});
+    const r_deep = try transact(tc.conn, arena, countdown, .{ .hook = th.hook() });
+    try testing.expectEqual(@as(i64, 99), r_deep.tx_data[1].v.long);
+
+    // Unbounded nesting stops at the depth limit, which the message
+    // names, with nothing written.
     const forever = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("forever") })});
     try testing.expectError(error.TxFn, transact(tc.conn, arena, forever, .{ .hook = th.hook(), .fault = &fault }));
-    try testing.expectEqual(r1.t, (try tc.conn.db()).basis);
+    try testing.expectEqualStrings("transaction functions nest past 1000 calls", fault.message.?);
+    try testing.expectEqual(r_deep.t, (try tc.conn.db()).basis);
 
     // A nil result is no tx-data; a non-tx-data result is malformed.
     const nothing = try vector_mod.fromSlice(&heap, &.{try vector_mod.fromSlice(&heap, &.{ call_kw, try it.internSymbolValue("nothing") })});

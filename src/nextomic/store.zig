@@ -33,7 +33,7 @@ const std = @import("std");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
-const db_layer = @import("../db.zig");
+pub const db_layer = @import("../db.zig");
 
 const Allocator = std.mem.Allocator;
 const Txn = emdb.Txn;
