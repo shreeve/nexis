@@ -81,7 +81,7 @@ const ScalarCtx = struct {
 fn benchFixnumAdd(ctx: *ScalarCtx) anyerror!void {
     // Read operands via volatile pointers to force a memory
     // load per call; otherwise ReleaseFast constant-folds the
-    // entire body (observed: 0 ns before this fix).
+    // entire body and the row reads 0 ns.
     const ap: *volatile i64 = &ctx.a_fx;
     const bp: *volatile i64 = &ctx.b_fx;
     const a = value_mod.fromFixnum(ap.*).?;
@@ -373,7 +373,7 @@ const CompileBenchCtx = struct {
 };
 
 /// Measure compile throughput: parser + reader + macroexpand +
-/// lowerForm + compileTiny for `(+ 1 2)`. Allocates a fresh
+/// lowerForm + emitRoutine for `(+ 1 2)`. Allocates a fresh
 /// arena per iteration so the measured cost is steady-state
 /// compile, not amortized scope reuse.
 fn benchCompileSimple(ctx: *CompileBenchCtx) !void {
