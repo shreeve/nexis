@@ -4083,6 +4083,21 @@ test "numbers: special floats" {
     try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
 }
 
+test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
+    try expectOutput("[(= ##Inf (/ 1.0 0)) (= ##-Inf (/ -1.0 0)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
+    try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
+    // str of a bare float is Java's spelling; inside a collection, readable.
+    try expectOutput("(pr-str [(str ##Inf) (str ##-Inf ##NaN) (str [##Inf]) (format \"%s\" ##NaN) (with-out-str (print ##Inf))])", "[\"Infinity\" \"-InfinityNaN\" \"[##Inf]\" \"NaN\" \"Infinity\"]");
+    try expectOutput("(let [v (read-string (pr-str [##Inf ##-Inf ##NaN]))] [(= (pop v) [##Inf ##-Inf]) (NaN? (peek v))])", "[true true]");
+    try expectOutput("[(+ ##Inf 1) '##-Inf]", "[Infinity -Infinity]");
+}
+
+test "reader: Clojure's \\uXXXX char and string escapes" {
+    try expectOutput("[(= \\u0041 \\A) (= \\u00e9 \\u{E9}) (int \\u2603)]", "[true true 9731]");
+    try expectOutput("[(= \"\\u00e9t\\u00E9\" \"été\") (count \"\\uD83D\\uDE00\") (= \"\\uD83D\\uDE00\" \"\\u{1F600}\")]", "[true 1 true]");
+    try expectOutput("(try (read-string \"\\\"\\\\uD800\\\"\") (catch :reader-error e :bad))", ":bad");
+}
+
 test "numbers: arithmetic contagion" {
     try expectOutput("(+ 1 2.5)", "3.5");
     try expectOutput("(+ 1.5 2)", "3.5");
@@ -4888,7 +4903,7 @@ test "typed vectors: constructors, type, printing and the generic natives" {
         .{ .src = "(i64-vector (range 5))", .expected = "#i64[0 1 2 3 4]" },
         .{ .src = "(f64-vector #{1})", .expected = "#f64[1.0]" },
         .{ .src = "(f64-vector (i64-vector [1 2]))", .expected = "#f64[1.0 2.0]" },
-        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 Infinity -Infinity]" },
+        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 ##Inf ##-Inf]" },
         .{ .src = "(i64-vector [140737488355328 -140737488355329])", .expected = "#i64[140737488355328 -140737488355329]" },
         .{ .src = "(nth (i64-vector [140737488355328]) 0)", .expected = "140737488355328" },
         .{ .src = "(i64-vector [9223372036854775807])", .expected = "#i64[9223372036854775807]" },

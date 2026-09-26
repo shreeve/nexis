@@ -379,17 +379,19 @@ the db and Nextomic handles print as markers for debugging (`#<fn>`,
   `1e7` and below `1e-3` (`1.0E10`, `1.23456785E7`, `1.0E-4`).
 - `0.0` prints `"0.0"` and `-0.0` prints `"-0.0"`; each reads back to
   its own bits.
-- The infinities print `Infinity` / `-Infinity` and NaN prints `NaN`.
-  The reader has no literal for them (`docs/FORMS.md` §8), so the text
-  reads back as a symbol.
+- Readable mode (`pr-str`, the REPL) prints the infinities `##Inf` /
+  `##-Inf` and NaN `##NaN`, the reader's literals (`docs/FORMS.md`
+  §2), so they round-trip; display mode and `str` of a bare float
+  write Java's `Infinity`, `-Infinity`, `NaN`, as Clojure's `str`
+  does.
 
 #### 6.4 Character print rules
 
 Named: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
 `\backspace`, and `\\` for the backslash. Other printable ASCII
 prints as `\a`; everything else as `\u{HEX}`, uppercase, no leading
-zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set (PLAN §23
-#26).
+zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set, and
+Clojure's `\uXXXX` (PLAN §23 #26).
 
 #### 6.5 String print rules
 

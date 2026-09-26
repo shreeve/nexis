@@ -3721,7 +3721,12 @@ fn appendStrValue(
     interner: ?*const intern_mod.Interner,
 ) VmError!void {
     if (v.kind() == .nil) return;
-    const mode: format_mod.FormatMode = if (v.kind() == .string or v.kind() == .char) .display else .readable;
+    // A float by itself is Java's `toString` (`Infinity`), as Clojure's
+    // `str` makes it; inside a collection it prints readable (`##Inf`).
+    const mode: format_mod.FormatMode = switch (v.kind()) {
+        .string, .char, .float => .display,
+        else => .readable,
+    };
     // The writer is an Allocating buffer: a failed write is an
     // allocation failure.
     format_mod.format(v, mode, &w.writer, interner) catch |err| switch (err) {

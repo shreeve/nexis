@@ -164,7 +164,10 @@ are the map for someone who knows Clojure.
   wins.
 - Keywords and symbols, including non-ASCII names; at most one `/`,
   neither side empty; `/` alone is division.
-- Named chars `\newline \space \tab \return \formfeed \backspace`.
+- Named chars `\newline \space \tab \return \formfeed \backspace`,
+  and `\uXXXX` in a char or a string (a surrogate pair in a string is
+  one character).
+- `##Inf`, `##-Inf`, `##NaN`, which `pr-str` prints back.
 - Strings may span lines.
 - `;` line comments and `(comment ...)`.
 - `ns` with a docstring and `(:require [lib :as a :refer [f]])`, and
@@ -182,11 +185,8 @@ are the map for someone who knows Clojure.
 | `017` | octal 15 | decimal 17 | one decimal spelling |
 | `1.` | `1.0` | `:bad-number-literal` | a real has digits on both sides of the dot |
 | `1abc`, `1-2` | "Invalid number" | `:bad-number-literal` for the whole token | a number token ends where a symbol would |
-| `##NaN`, `##Inf` | symbolic values | parse error | `(/ 0.0 0)` and `(/ 1.0 0)` produce them |
-| `☃` | a char | `:invalid-char-literal`; write `\u{2603}` | one escape form (§23 #26) |
-| `"☃"` | a string escape | `:invalid-string-escape`; write `"\u{2603}"` | the same |
-| `\o377` | an octal char | unsupported | `\u{...}` covers it |
-| String escapes | `\b \f \0`, octal, `\uHHHH` | `\n \t \r \\ \" \u{HEX}` | a narrow set |
+| `\o377` | an octal char | unsupported | `\uHHHH` and `\u{...}` cover it |
+| String escapes | `\b \f`, octal, `\uHHHH` | `\n \t \r \\ \" \uHHHH \u{HEX}` | a narrow set; `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
@@ -225,6 +225,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
+| `(print ##Inf)`, `(println [##NaN])` | `##Inf`, `[##NaN]` | `Infinity`, `[NaN]`: display mode writes Java's spelling; `pr`, `pr-str` and `str` of a collection write `##Inf` | `docs/STDLIB.md` §5 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
 | `instance?`, `class`, `type` | JVM classes | absent; kind predicates (`string?`, `map?`, ...) | — |
 

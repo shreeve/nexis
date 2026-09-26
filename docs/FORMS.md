@@ -37,8 +37,9 @@ true, false                          ;; bool
 42, 0x2A, 0b101                      ;; int     (any radix, within i64)
 18446744073709551616                 ;; bigint  (beyond i64, canonical decimal text)
 3.14, 1e9, 1.5e-3                    ;; real    (f64)
+##Inf, ##-Inf, ##NaN                 ;; real    (the symbolic floats)
 "hello"                              ;; string  (escapes decoded, UTF-8)
-\a, \newline, \u{2603}               ;; char    (Unicode scalar)
+\a, \newline, \u{2603}, \u2603       ;; char    (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>               ;; symbol
 
@@ -86,14 +87,17 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix |
 | `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | `:bad-number-literal`, detail the token |
 | `"one⏎two"` | a string may span lines; the newline is part of it |
-| `"a\qb"`, `"\u{D800}"`, `"\u0041"` | `:invalid-string-escape`, detail the escape |
+| `"\u00e9"`, `"\uD83D\uDE00"` | Clojure's escape: `\u` and exactly four hex digits name a UTF-16 unit, and a high surrogate followed by a `\uXXXX` low one spells one scalar (`"é"`, `"😀"`) |
+| `"a\qb"`, `"\u{D800}"`, `"\u41"`, `"\uD800"`, `"\uDE00\uD83D"` | `:invalid-string-escape`, detail the escape |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
 | a UTF-8 byte-order mark (U+FEFF) | skipped when it starts the source, as whitespace; anywhere else a symbol constituent, as in Clojure |
 | a string, symbol or keyword that is not UTF-8 | `:invalid-utf8` |
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
-| `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
+| `\u0041`, `\u{41}` | the char `A`: `\u` and exactly four hex digits, as Clojure spells it, or `\u{HEX}` (PLAN §23 #26) |
+| `\u041`, `\u00411`, `\uD800`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token |
+| `##Inf`, `##-Inf`, `##NaN` | the reals positive infinity, negative infinity and NaN |
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
-| `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Inf` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
+| `#"re"`, `##Infinity`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 | a source text past 4 GiB (`reader.max_source_len`, 2^32 - 1 bytes) | reader error naming the bound and the size, before a byte is read: positions are `u32` offsets |
 
@@ -114,16 +118,17 @@ are in `CLOJURE-REVIEW.md` §4.2.
 **Char token boundary.** A char token is `\`, one character (a whole
 UTF-8 sequence, or any other byte, a delimiter included), then every
 symbol constituent that follows; `\u{HEX}` runs to its `}` first. The
-reader accepts the text only when it is one character, `u{HEX}` naming
-a Unicode scalar, or a name of the named set (§5), so `\a1` and
-`\u0041` fail whole.
+reader accepts the text only when it is one character, `u{HEX}` or `u`
+and four hex digits naming a Unicode scalar, or a name of the named
+set (§5), so `\a1` and `\u041` fail whole.
 
 **Duplicate detection.** Only literal keys and elements count:
 `{:a 1 (keyword "a") 2}` reads, since the second key is a runtime value.
 Literal equality compares integers by value, `bigint` by text, strings
 byte for byte, keywords and symbols by name. `1` and `1.0` differ
 (`(= 1 1.0)` is false, PLAN §23 #11), `:a` and `a` differ, and reals
-compare with `==`, so `{0.0 x -0.0 y}` is a duplicate. Detection
+compare with `==` except that NaN equals NaN, as `=` has it, so
+`{0.0 x -0.0 y}` and `#{##NaN ##NaN}` are duplicates. Detection
 hashes, so it is linear in the literal's size.
 
 **Metadata targets.** The reader wraps any Form in `with-meta`; which
@@ -232,11 +237,8 @@ These describe the reader as it is; they are not language commitments.
   is a `bigint` of canonical decimal text. The compiler lifts an `int`
   outside the i48 fixnum range, and every `bigint`, into a bignum
   constant (`COMPILER.md` §4.3).
-- **No NaN or infinity literals.** There is no source spelling
-  (Clojure's `##NaN`, `##Inf`); `SEMANTICS.md` §2.2 gives the runtime
-  rules.
 - **`#%` names are unreachable.** The lexer accepts `#` only before
-  `{`, `(` and `_`, so no user symbol begins with `#%` and the
+  `{`, `(`, `_`, `'` and in `##Inf`, `##-Inf`, `##NaN`, so no user symbol begins with `#%` and the
   printer's `#%anon-fn` head cannot collide with one.
 - **Nested `#()`** is rejected because nesting would make the `%`
   placeholders ambiguous.
