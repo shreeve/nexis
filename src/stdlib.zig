@@ -2762,8 +2762,8 @@ var gensym_next: u64 = 0;
 fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
     const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G";
     gensym_next += 1;
-    var buf: [256]u8 = undefined;
-    const name = std.fmt.bufPrint(&buf, "{s}__{d}", .{ prefix, gensym_next }) catch return VmError.InvalidArgument;
+    const name = std.fmt.allocPrint(vm.allocator, "{s}__{d}", .{ prefix, gensym_next }) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(name);
     return vm.ensureInterner().internSymbolValue(name) catch |err| internFailure(err);
 }
 

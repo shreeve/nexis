@@ -95,6 +95,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
 | `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Inf` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
+| a source text past 4 GiB (`reader.max_source_len`, 2^32 - 1 bytes) | reader error naming the bound and the size, before a byte is read: positions are `u32` offsets |
 
 `ErrorKind` in `reader.zig` is the complete list. The reader fails fast
 on the first error and produces no partial tree.

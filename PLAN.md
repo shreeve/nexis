@@ -260,9 +260,9 @@ Each item is a commitment; changing one takes an Amendment Log entry
     char, fixnum, bignum, f64, string, keyword and symbol (as text),
     list, vector, map, set, typed vector. Everything else (functions,
     Vars, atoms, transients, durable refs, byte vectors, records,
-    protocols, db and Nextomic handles) and any value nested past the
-    codec's depth limit is not; encoding one raises the keyword
-    `:unserializable` (`docs/CODEC.md`).
+    protocols, db and Nextomic handles) is not; encoding one raises the
+    keyword `:unserializable` (`docs/CODEC.md`). Nesting depth is
+    unbounded.
 26. **Character and string escapes are unified on `\u{HEX}`.** Named
     chars for the common set; single-char `\a` syntax.
 27. **No block comments.** `;` (line), `#_` (discard the next form),
@@ -737,3 +737,10 @@ entry stating the decision and its rationale.
   authority. §23 #33: a Var is callable, calling its value in force, as
   Clojure's `Var.invoke`, and `deref` of a Var reads the binding in
   force (`docs/VM.md` §6).
+
+- **2026-09-25 — Serialization depth (§23 #25).** The codec walks
+  containers with an explicit stack in both directions, so a
+  serializable value nested to any depth encodes and decodes; the
+  4096-level bound, which refused legitimate data and bought nothing
+  the input-size bounds of decode do not, is gone
+  (`docs/CODEC.md` §2.7).

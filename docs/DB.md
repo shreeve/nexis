@@ -228,8 +228,12 @@ None: a ref has no heap children. `conn` points at a non-heap
 | Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
 | Stored bytes that do not decode | any other `CodecError` | `:codec-failed` |
 
-emdb errors map by `failureName`: `:db/key-too-large`,
-`:db/value-too-large`, `:db/max-trees`, `:db/not-found`,
+emdb errors map by `failureName`: `:db/key-too-large` (a key past
+4078 bytes, emdb's bound for the pinned 16 KiB page),
+`:db/value-too-large` (an encoded value past 65 535 overflow pages,
+just under 1 GiB), `:db/max-trees` (a file holds at most 128 named
+trees, Nextomic's twelve among them when it shares the file),
+`:db/not-found`,
 `:db/corrupted` (also a file that is not a store, and a format-version
 mismatch), `:db/map-full`, `:db/mmap-failed`, `:db/open-failed`,
 `:db/page-size-mismatch`, `:db/busy` (a writer already active, the

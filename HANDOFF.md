@@ -256,8 +256,9 @@ and a reader slot, which its own §3 and `docs/NEXTOMIC.md` §4 contradict
   session, deep recursion, a source file with a byte-order mark,
   `--help` on stdout and the usage errors.
 - **Deep input.** Inline tests in the reader, expander, compiler,
-  codec, printer, dispatch, pull, transaction and query parsers feed
-  each input nested past the guard; `eval_pipeline.zig` checks that
+  printer, dispatch, pull, transaction and query parsers feed each
+  input nested past the guard, and the codec's tests round-trip 200 000
+  levels; `eval_pipeline.zig` checks that
   runaway recursion, recursion through a native, and `=`, `hash`,
   `compare` and printing of too-deep data all end in a catchable
   `:stack-overflow`, and `test/golden/cli/deep-recursion.nx` that
@@ -396,6 +397,15 @@ failing test (AGENTS.md).
    a time, while one Nextomic opened first uses the VM's allocator.
    Next: pass `vm.allocator` from `db/open` (it outlives every
    connection), measured with `zig build bench -- --filter db-integrated`.
+4. **Engine bounds surface as bare keywords**: a `db/*` key past
+   4078 bytes, a stored value past just under 1 GiB and a file's 129th
+   named tree are `:db/key-too-large`, `:db/value-too-large` and
+   `:db/max-trees`, which name the bound but not its value or the
+   size that crossed it (`docs/DB.md` §8 gives the values). They are
+   emdb's, fixed by the pinned 16 KiB page. Next, an owner's call:
+   throw `{:error :db/key-too-large :limit 4078 :size n}` maps (a
+   `catch` on the keyword still takes them; `=` against the keyword
+   no longer does, so the `.out` files and DB.md §8 change with it).
 
 ### 6.4 Build and platform
 
