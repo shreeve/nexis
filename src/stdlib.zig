@@ -343,6 +343,8 @@ const core_natives = table("", .{
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
     .{ "conj", 0, null, &fnConj },
+    .{ "frequencies", 1, 1, &fnFrequencies },
+    .{ "group-by", 2, 2, &fnGroupBy },
     // Transients (docs/TRANSIENT.md): each `!` edits the nodes the
     // transient owns in place and returns the transient to use.
     .{ "transient", 1, 1, &fnTransient },
@@ -1801,31 +1803,20 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             }
             break :blk result;
         },
-        .persistent_vector => blk: {
-            var result = coll;
-            for (xs) |x| result = vector_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
-            break :blk result;
+        .persistent_vector, .persistent_map, .persistent_set => if (xs.len >= conj_in_place_min) try conjInPlace(vm, coll, xs) else switch (coll.kind()) {
+            .persistent_vector => blk: {
+                var result = coll;
+                for (xs) |x| result = vector_mod.conj(heap, result, x) catch return VmError.OutOfMemory;
+                break :blk result;
+            },
+            .persistent_set => blk: {
+                var result = coll;
+                for (xs) |x| result = champ_mod.setConj(heap, result, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+                break :blk result;
+            },
+            else => try conjMap(vm, coll, xs),
         },
-        .persistent_map, .record => blk: {
-            var result = coll;
-            for (xs) |x| {
-                // Each x is a `[k v]` entry, a map or record whose
-                // entries are all added, or nil (skipped).
-                switch (x.kind()) {
-                    .nil => {},
-                    .persistent_map, .record, .sorted_map => {
-                        var it = MapEntries.of(x).?;
-                        while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
-                    },
-                    .persistent_vector => {
-                        if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
-                        result = try assocOne(vm, result, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
-                    },
-                    else => return VmError.KindMismatch,
-                }
-            }
-            break :blk result;
-        },
+        .record => try conjMap(vm, coll, xs),
         .sorted_map => blk: {
             // The entries of every x as key-value pairs, all reachable
             // from the arguments.
@@ -1846,21 +1837,95 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             break :blk try sortedAddAll(vm, coll, kvs.items);
         },
         .sorted_set => try sortedAddAll(vm, coll, xs),
-        .persistent_set => blk: {
-            var result = coll;
-            for (xs) |x| {
-                result = champ_mod.setConj(
-                    heap,
-                    result,
-                    x,
-                    &dispatch_mod.hashValue,
-                    &dispatch_mod.equal,
-                ) catch return VmError.OutOfMemory;
-            }
-            break :blk result;
-        },
         else => return VmError.KindMismatch,
     };
+}
+
+/// A map or record with each `x` conj'd: a `[k v]` entry, every entry
+/// of a map or record, or nothing for nil.
+fn conjMap(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
+    var result = coll;
+    for (xs) |x| {
+        switch (x.kind()) {
+            .nil => {},
+            .persistent_map, .record, .sorted_map => {
+                var it = MapEntries.of(x).?;
+                while (it.next()) |e| result = try assocOne(vm, result, e.key, e.value);
+            },
+            .persistent_vector => {
+                if (vector_mod.count(x) != 2) return VmError.ArityMismatch;
+                result = try assocOne(vm, result, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
+            },
+            else => return VmError.KindMismatch,
+        }
+    }
+    return result;
+}
+
+/// From this many elements on, `conj` onto a vector, hash map or hash
+/// set (and so `into`) builds through a transient: one root copy, and
+/// then each element lands in place (TRANSIENT.md §1).
+const conj_in_place_min = 4;
+
+/// `coll` with every `xs` conj'd in place on a transient over it,
+/// carrying `coll`'s metadata as the persistent path does (SEMANTICS
+/// §7). No collection runs while it builds.
+fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const t = transient_mod.transientFrom(heap, coll) catch |err| return transientFailure(vm, err);
+    for (xs) |x| switch (coll.kind()) {
+        .persistent_vector => _ = transient_mod.vectorConjBang(heap, t, x) catch |err| return transientFailure(vm, err),
+        .persistent_set => try conjBangSet(vm, t, x),
+        else => try conjBangMap(vm, t, x),
+    };
+    const result = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
+    heap_mod.Heap.asHeapHeader(result).setMeta(heap_mod.Heap.asHeapHeader(coll).getMeta());
+    return result;
+}
+
+/// `(frequencies coll)` → a map from each distinct element of `coll` to
+/// the number of times it occurs, counted in place on a transient
+/// (TRANSIENT.md §1): one lookup per element. No collection runs while
+/// it counts.
+fn fnFrequencies(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
+    var it = try makeSeqIter(vm, args[0]);
+    while (try it.next()) |x| {
+        const spot = transient_mod.mapLocateBang(t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+        const n: i64 = if (champ_mod.mapSpotValue(spot)) |c| c.asFixnum() + 1 else 1;
+        transient_mod.mapPutBang(heap, t, spot, x, value_mod.fromFixnum(n).?) catch |err| return transientFailure(vm, err);
+    }
+    return transient_mod.persistentBang(t) catch |err| transientFailure(vm, err);
+}
+
+/// `(group-by f coll)` → a map from each `(f x)` to the vector of the
+/// xs it came from, in order. The map is a transient and each vector
+/// a root of its own edited under the map's token, so both grow in
+/// place (TRANSIENT.md §1). Rooting (GC.md §11.5, class 4): the
+/// transient, which reaches every vector, is on the root scope across
+/// every call of `f`; `x` is the call's argument and lands in its
+/// vector, and `(f x)` in the map, before the next call.
+fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    const f = args[0];
+    const scope = vm.rootScope();
+    defer scope.release();
+    const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
+    try scope.push(t);
+    const edit = transient_mod.editToken(t) catch |err| return transientFailure(vm, err);
+    var it = try makeSeqIter(vm, args[1]);
+    while (try it.next()) |x| {
+        const k = try vm.callValue(f, &.{x});
+        const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
+        const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
+            const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;
+            transient_mod.mapPutBang(heap, t, spot, k, fresh) catch |err| return transientFailure(vm, err);
+            break :blk fresh;
+        };
+        vector_mod.conjInPlace(heap, heap_mod.Heap.asHeapHeader(bucket), x, edit) catch return VmError.OutOfMemory;
+    }
+    return transient_mod.persistentBang(t) catch |err| transientFailure(vm, err);
 }
 
 // =============================================================================

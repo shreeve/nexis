@@ -29,9 +29,9 @@ points (§8). Costs:
 The language surface lives in `src/stdlib.zig`: `hash-map`, `hash-set`,
 `set`, `assoc`, `dissoc`, `disj`, `get` (nil or the default when
 absent), `contains?`, `find`, `keys`, `vals`, `key`, `val`, `zipmap`,
-`select-keys`, `conj`, `into`, `count`, `empty`, and invocation (`({:a
-1} :a)`, `(#{:x} :x)`, `(:a m)`). `merge`, `merge-with`, `update`,
-`get-in`, `assoc-in`, `update-in`, `frequencies`, `group-by`,
+`select-keys`, `conj`, `into`, `frequencies`, `group-by`, `count`,
+`empty`, and invocation (`({:a 1} :a)`, `(#{:x} :x)`, `(:a m)`).
+`merge`, `merge-with`, `update`, `get-in`, `assoc-in`, `update-in`,
 `update-vals` and `update-keys` are `src/stdlib/core.nx`; set algebra
 is the `nexis.set` namespace (`src/stdlib/set.nx`). `(assoc nil k v)`
 is `{k v}` (SEMANTICS §4). An update that changes nothing returns its

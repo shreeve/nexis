@@ -39,6 +39,10 @@ compared past the stack guard changes nothing (§6). Every edit
 allocates what it needs before it writes a node the collection
 reaches, so a failed allocation leaves the elements as they were.
 
+`frequencies`, `group-by` and `conj` of four or more elements onto a
+vector, hash map or hash set (and so `into`) build their result
+through a transient.
+
 **Absent.** Transient lists (a `cons` is already O(1)), transient typed
 vectors (a typed vector takes no updates, `docs/TYPED_VECTOR.md` §1),
 and an owner-mismatch check between isolates (there is one isolate).
@@ -233,6 +237,6 @@ relatives, two at once, edit in place, through collision nodes and
 across the vector's trie boundaries, with collections in between; T6
 the edit clock's wrap. Inline tests in `transient.zig` cover the
 wrapper and that an edit of owned nodes allocates nothing;
-`test/integration/eval_pipeline.zig` ("transients", and the `gc:` test
-of transient builds under the stress policy) covers the language
-surface.
+`test/integration/eval_pipeline.zig` ("transients", and the `gc:` tests
+of `group-by` and transient builds under the stress policy) covers the
+language surface.

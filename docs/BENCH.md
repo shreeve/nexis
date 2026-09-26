@@ -291,9 +291,9 @@ programs.
   `reduce`, the persistent collections) is compiled ahead of time into
   the native image. Where a workload's time is inside library
   functions, the row compares nexis's library, some of it written in
-  nexis and interpreted (`frequencies`, `group-by`), with compiled
-  Java. Datalevin's engine is compiled Java and C; Nextomic's is Zig;
-  both run their glue through an interpreter.
+  nexis and interpreted, with compiled Java. Datalevin's engine is
+  compiled Java and C; Nextomic's is Zig; both run their glue through
+  an interpreter.
 - *Sequences.* nexis sequences are eager (PLAN §23 #14): `map` and
   `filter` build their whole result, where babashka's are lazy and
   chunked. The pipeline row runs the same code and pays for that.

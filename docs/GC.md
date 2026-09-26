@@ -365,7 +365,9 @@ The rule each native follows, by what it holds across a further
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's
    root scope; `sortImpl` (`sort`, `sort-by`) collects the elements and
-   pushes them all (`pushAll`) before any key fn or comparator runs.
+   pushes them all (`pushAll`) before any key fn or comparator runs;
+   `group-by` builds its map on a transient it pushes, which reaches
+   every group, and stores each element and key before its next call.
    A native that only passes a built value to the next call (`map`,
    `some`, `every?`, `reduce` over a map) is class 2 for it.
 
