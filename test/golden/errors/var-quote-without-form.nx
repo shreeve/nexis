@@ -1,0 +1,2 @@
+; `#'` with no form after it is a parse error.
+(f #')

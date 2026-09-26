@@ -53,6 +53,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 - `nil`, `true` and `false` lex as symbols and become their own datums.
 - `syntax_quote` is a marker. Auto-qualification, auto-gensym `x#` and
   unquote handling belong to the macroexpander (`MACROEXPAND.md` §5).
+- `#'x` has no datum of its own: it reads as the list `(var x)` (§3).
 - `anon_fn` holds the body forms only; `%`, `%1`, `%&` inside stay
   ordinary symbols. The macroexpander rewrites it to `(fn* [%1 ...]
   (body))` (`MACROEXPAND.md` §9). The pretty-printer renders it with the
@@ -75,6 +76,9 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `#(body)` | `anon_fn` of the body forms |
 | `#(#(inc %))` | `:nested-anon-fn` |
 | `` `x `` | `(syntax-quote x)`, unexpanded |
+| `#'x`, `#'ns/x`, `#' x` | the list `(var x)`, as Clojure's reader makes it: quoting it yields the list, and a printed Var (`#'ns/name`) reads back as `(var ns/name)` |
+| `#'(f)`, `#'42` | `(var (f))`, `(var 42)`: `#'` reads any form, as in Clojure; the compiler rejects a `var` whose operand is not a symbol |
+| `#'` with no form after it | parse error |
 | `~x`, `~@x` outside `` `...` `` | `:unquote-outside-syntax-quote`, `:unquote-splice-outside-syntax-quote` |
 | `{:a 1 :a 2}` | `:duplicate-literal-key`, detail the key |
 | `#{1 1 2}` | `:duplicate-literal-element`, detail the element |
@@ -89,7 +93,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `\é`, `\☃`, `\(` | one character, any UTF-8 sequence or delimiter |
 | `\u0041`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token (`\u{HEX}` is the one escape, PLAN §23 #26) |
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
-| `#'x`, `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `#'x` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
+| `#"re"`, `##Inf`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Inf` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 
 `ErrorKind` in `reader.zig` is the complete list. The reader fails fast
@@ -187,8 +191,9 @@ Source `^:private (defn foo [x] x)` prints:
 
 - An atom's span is its token's.
 - A compound's span runs from its opening punctuation (`(`, `[`, `{`,
-  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`) to its closing
-  delimiter, or to the end of its target for a prefix form.
+  `#{`, `'`, `` ` ``, `~`, `~@`, `@`, `^`, `#(`, `#'`) to its closing
+  delimiter, or to the end of its target for a prefix form. In the `(var x)`
+  that `#'x` reads as, the `var` symbol spans the `#'`.
 - A `with-meta` Form covers the first `^` through the target; the merged
   metadata map carries that same span.
 - A reader error carries the span of the token or form it rejects. The

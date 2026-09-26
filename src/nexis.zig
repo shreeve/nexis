@@ -42,6 +42,7 @@ pub const Tag = enum(u8) {
     // Internal reader-stage tags consumed and rewritten by src/reader.zig
     @"anon-fn",
     @"with-meta-raw",
+    @"var-quote",
 };
 
 /// The byte length of a leaf the parser built from a `Lexer` token (see
@@ -135,8 +136,12 @@ pub const Lexer = struct {
                             self.base.pos += 2;
                             return .{ .cat = .hash_discard, .pre = pre, .pos = start, .len = 2 };
                         },
+                        '\'' => {
+                            self.base.pos += 2;
+                            return .{ .cat = .var_quote_tok, .pre = pre, .pos = start, .len = 2 };
+                        },
                         ' ', '\t', '\r', '\n', ',' => {},
-                        // An unsupported dispatch (`#'x`, `#"`, `##Inf`,
+                        // An unsupported dispatch (`#"`, `##Inf`,
                         // `#?`) is one err token, so the parse error
                         // names the construct.
                         else => |after| {

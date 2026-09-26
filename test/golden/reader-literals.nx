@@ -95,6 +95,9 @@ false
 `(inc ~x)
 `(inc ~@xs)
 @r
+#'x
+#'nexis.core/inc
+'#'x
 #(+ %1 %2)
 #(+ % 1)
 
