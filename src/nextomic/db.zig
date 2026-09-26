@@ -128,6 +128,11 @@ pub const Conn = struct {
     /// The view of the speculative `with` holding this connection's
     /// write transaction, while it is open.
     speculative: ?*Conn = null,
+    /// The (device, inode) of the store's file, which db-values compare
+    /// by (NEXTOMIC.md §6): every connection to one file reads one
+    /// database. Null on the view of a speculative `with`, whose
+    /// uncommitted state is its own.
+    file: ?[2]u64 = null,
 
     /// Open or create the store at `path`; bootstrap on first open.
     /// `interner` is the VM's keyword table and outlives the connection.
@@ -144,6 +149,7 @@ pub const Conn = struct {
             .idents = Idents.init(gpa, store, interner),
             .sync_mode = options.sync,
             .is_open = true,
+            .file = .{ store.file.id.dev, store.file.id.ino },
         };
         return self;
     }

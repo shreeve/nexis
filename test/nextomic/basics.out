@@ -3,6 +3,7 @@
 ok fresh store is at the bootstrap basis
 ok db-values are values
 ok a db-value is not its history view
+ok db-values of two connections to one file are equal
 ok schema transaction is t=2
 ok attribute entities take ids in the attribute partition
 ok db-before and db-after bracket the transaction

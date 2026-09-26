@@ -329,13 +329,10 @@ failing test (AGENTS.md).
 
 ### 6.2 Nextomic
 
-1. **Two connections to one file in one process** share the file's
-   environment, but their db-values at one basis are unequal:
-   equality is by connection.
-2. **The planner's join estimates** come from `treeStat` and
+1. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-3. **No datom heap kind**: reads return `[e a v t added]` vectors.
+2. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

@@ -340,7 +340,7 @@ pub fn dbOf(v: Value) !DbValue {
 }
 
 pub fn boxDb(heap: *Heap, d: DbValue) !Value {
-    return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
+    return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .file = d.conn.file, .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
 }
 
 /// `{:sync :full | :no-meta | :none}`; nil means the default.

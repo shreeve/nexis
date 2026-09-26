@@ -789,9 +789,16 @@ A connection prints as `#nextomic/conn "path"`, a db-value as
 `:history` with their bounds), an entity as `#nextomic/entity {:db/id
 4294967296}`: the eid alone, since the attributes are read on access
 and `touch` prints them. A connection is identity-valued; db-values
-are values, equal when they name the same connection, basis and mode;
-entities are values, equal when their db-values are equal and their
-eids agree, and hash accordingly.
+are values, equal when they read the same file (by device and inode,
+as §2 tells files apart), basis and mode, whichever connection to the
+file they came through, and hash accordingly: every connection to one
+file shares its environment and its `t`, so one basis and mode name
+the same datoms through any of them, as Datomic's peer hands every
+`connect` to one database the same connection. The view of a
+speculative `with` reads uncommitted datoms at a `t` a later commit
+reuses, so its db-values equal only its own. Entities are values,
+equal when their db-values are equal and their eids agree, and hash
+accordingly.
 
 Schema install is `transact!` of attribute entities: `{:db/ident
 :user/email :db/valueType :db.type/string :db/cardinality
@@ -927,7 +934,8 @@ Value kinds `nextomic_conn`, `nextomic_db` and `nextomic_entity` are
 heap boxes from `handle.zig`, which `dispatch`, `format`, `gc` and `vm`
 import without the rest of Nextomic. The connection box (the `Conn` the
 VM owns on `vm.nextomic_connections`, and the path text) and the db box
-(that pointer, basis and mode) are collector leaves; the entity box
+(that pointer, the file's device and inode, basis and mode) are
+collector leaves; the entity box
 holds its db box, the eid, the read hook and the map of its last full
 read, and the collector marks the db box and that map (`docs/GC.md`
 §5). `vm.lookup` reaches the hook for `(:attr ent)` and `get`; the
