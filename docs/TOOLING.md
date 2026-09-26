@@ -112,7 +112,12 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   argument, got 0`). An uncaught throw is `UncaughtThrow` followed by
   the thrown value as `pr-str` prints it (`runtime error:
   UncaughtThrow {:error :negative, :value -3}`, `uncaught-throw.err`,
-  whose `throw` spans two lines and is underlined on its first).
+  whose `throw` spans two lines and is underlined on its first). An
+  error or a thrown value that leaves through a `finally`, a `catch`
+  no clause of which matches, or a `catch` that throws it again is
+  reported where it was raised, with its detail and the frames it left,
+  as it would be with no `try` around it (VM.md §12;
+  `rethrow-finally.err`, `rethrow-catch.err`).
 
 - One `at NAME (PATH:LINE:COL)` line per frame of `vm.error_trace`,
   innermost first: `defn` and named `fn*` routines carry their name,

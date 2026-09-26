@@ -968,6 +968,21 @@ pub const TraceFrame = struct {
     source: ?*const SourceInfo,
 };
 
+/// Where a throw a handler took was raised (VM.md §12): the value, the
+/// runtime error it was translated from, that error's detail and the
+/// frame chain at the raise. A catch that rethrows the value, or a
+/// finally that resumes the throw, carries the origin on, so a throw
+/// that finally escapes is reported where it began.
+pub const ThrowOrigin = struct {
+    value: Value,
+    err: ?VmError,
+    detail_buf: [160]u8 = undefined,
+    detail_len: usize = 0,
+    trace: [VM.trace_capacity]TraceFrame = undefined,
+    trace_len: usize = 0,
+    gap_buf: [48]u8 = undefined,
+};
+
 // =============================================================================
 // Errors
 // =============================================================================
@@ -1307,6 +1322,9 @@ pub const Handler = struct {
     /// continuation above it belongs to a finally body running inside
     /// this try, which a throw this handler takes abandons.
     finally_depth: usize,
+    /// On the `.cleanup` a catch leaves: the origin of the throw the
+    /// catch is handling (`VM.origins`), so rethrowing it keeps it.
+    origin: ?u32 = null,
 };
 
 /// Tagged continuation for finally bodies. When a try-exit / catch-exit / throw-unwind
@@ -1328,6 +1346,8 @@ pub const FinallyContinuation = struct {
     /// sanity check at finally-exit time.
     frame_index: usize,
     reason: FinallyReason,
+    /// With `.throwing`: the origin of the throw the finally resumes.
+    origin: ?u32 = null,
 };
 
 /// The collector's trigger settings (GC.md §7). `default` is what
@@ -1565,6 +1585,14 @@ pub const VM = struct {
     /// as a keyword, so it never describes an earlier error.
     error_detail: []const u8 = "",
     detail_buf: [160]u8 = undefined,
+    /// The origins of the throws handlers are holding, innermost last;
+    /// a `.cleanup` handler or a `.throwing` continuation names its
+    /// entry by index. Entries no live record names are dropped before
+    /// the next one is pushed.
+    origins: std.ArrayList(ThrowOrigin) = .empty,
+    /// The origin of the throw that left `run` uncaught, for
+    /// `recordErrorTrace`.
+    escaped_origin: ?u32 = null,
 
     pub const default_max_frames = 1 << 20;
     /// A trace keeps this many innermost frames and
@@ -1572,6 +1600,7 @@ pub const VM = struct {
     /// rest.
     const trace_innermost = 32;
     const trace_outermost = 8;
+    pub const trace_capacity = trace_innermost + trace_outermost + 1;
 
     /// Build a VM around `routine`, allocating a single top-level
     /// frame with `routine.slot_count` slots zero-initialized to nil.
@@ -1623,6 +1652,7 @@ pub const VM = struct {
         // contain POD entries.
         self.handlers.deinit(self.allocator);
         self.finally_stack.deinit(self.allocator);
+        self.origins.deinit(self.allocator);
         self.error_trace.deinit(self.allocator);
         // Interner owns hash maps allocated via self.allocator;
         // free explicitly.
@@ -1820,6 +1850,7 @@ pub const VM = struct {
             .normal => {},
         };
         if (self.unhandled_throw) |v| c.markValue(v);
+        for (self.origins.items) |o| c.markValue(o.value);
         c.markValue(self.result);
         for (self.protocol_registry.items) |*proto| {
             for (proto.methods.items) |*method| {
@@ -2539,27 +2570,108 @@ pub const VM = struct {
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
+        if (err == VmError.UncaughtThrow) if (self.escapedOrigin()) |o| {
+            // The throw began below the frames still standing: report
+            // the error, detail and chain it was raised with.
+            if (o.err) |raised| self.traced_error = raised;
+            @memcpy(self.detail_buf[0..o.detail_len], o.detail_buf[0..o.detail_len]);
+            self.error_detail = self.detail_buf[0..o.detail_len];
+            self.error_trace.appendSlice(self.allocator, o.trace[0..o.trace_len]) catch return;
+            // The detail and the elision marker's text move to the
+            // VM's own buffers, which outlive the origin.
+            for (self.error_trace.items) |*frame| if (frame.name.ptr == &o.gap_buf) {
+                @memcpy(self.trace_gap[0..frame.name.len], frame.name);
+                frame.name = self.trace_gap[0..frame.name.len];
+            };
+            return;
+        };
+        var buf: [trace_capacity]TraceFrame = undefined;
+        const n = self.captureTrace(&buf, &self.trace_gap);
+        self.error_trace.appendSlice(self.allocator, buf[0..n]) catch return;
+    }
+
+    /// The frame chain as `recordErrorTrace` reports it, into `out`;
+    /// returns how many entries it wrote. The elision marker's text
+    /// goes to `gap`.
+    fn captureTrace(self: *VM, out: []TraceFrame, gap: []u8) usize {
         const frames = self.frames.items;
         const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
         const elided = (frames.len - lowest) -| (trace_innermost + trace_outermost);
+        var n: usize = 0;
         var i = frames.len;
-        while (i > lowest) {
+        while (i > lowest and n < out.len) {
             i -= 1;
             if (elided > 0 and i == frames.len - 1 - trace_innermost) {
-                const name = std.fmt.bufPrint(&self.trace_gap, "<{d} frames elided>", .{elided}) catch unreachable;
-                self.error_trace.append(self.allocator, .{ .name = name, .pc = 0, .span = null, .source = null }) catch return;
+                const name = std.fmt.bufPrint(gap, "<{d} frames elided>", .{elided}) catch unreachable;
+                out[n] = .{ .name = name, .pc = 0, .span = null, .source = null };
+                n += 1;
                 i -= elided - 1;
                 continue;
             }
             const f = frames[i];
             const pc: u32 = if (f.pc > 0) f.pc - 1 else 0;
-            self.error_trace.append(self.allocator, .{
-                .name = f.routine.name,
-                .pc = pc,
-                .span = f.routine.spanAt(pc),
-                .source = f.routine.source,
-            }) catch return;
+            out[n] = .{ .name = f.routine.name, .pc = pc, .span = f.routine.spanAt(pc), .source = f.routine.source };
+            n += 1;
         }
+        return n;
+    }
+
+    /// The origin of a throw of `value`. A throw of the value a live
+    /// catch is handling is that throw again and keeps its origin.
+    /// Otherwise the throw begins here, recorded when a handler is in
+    /// force to take it (with none, it leaves `run` with its frames
+    /// standing and `recordErrorTrace` sees them). `err` is the runtime
+    /// error the value was translated from, if any; its detail is
+    /// `error_detail`.
+    fn originFor(self: *VM, value: Value, err: ?VmError) VmError!?u32 {
+        if (err == null) if (self.rethrownOrigin(value)) |o| return o;
+        if (self.findThrowTarget() == null) return null;
+        self.dropUnreferencedOrigins();
+        const o = self.origins.addOne(self.allocator) catch return VmError.OutOfMemory;
+        o.* = .{ .value = value, .err = err };
+        const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
+        @memcpy(o.detail_buf[0..detail.len], detail);
+        o.detail_len = detail.len;
+        o.trace_len = self.captureTrace(&o.trace, &o.gap_buf);
+        return @intCast(self.origins.items.len - 1);
+    }
+
+    /// The origin of the innermost live catch holding `value`.
+    fn rethrownOrigin(self: *VM, value: Value) ?u32 {
+        var i = self.handlers.items.len;
+        while (i > 0) {
+            i -= 1;
+            const h = self.handlers.items[i];
+            if (h.kind != .cleanup) continue;
+            const o = h.origin orelse continue;
+            if (o < self.origins.items.len and self.origins.items[o].value.identicalTo(value)) return o;
+        }
+        return null;
+    }
+
+    /// Truncate `origins` past the last entry a handler or finally
+    /// continuation still names.
+    fn dropUnreferencedOrigins(self: *VM) void {
+        var keep: usize = 0;
+        for (self.handlers.items) |h| if (h.origin) |o| {
+            keep = @max(keep, o + 1);
+        };
+        for (self.finally_stack.items) |c| if (c.origin) |o| {
+            keep = @max(keep, o + 1);
+        };
+        if (keep < self.origins.items.len) self.origins.shrinkRetainingCapacity(keep);
+    }
+
+    /// The origin of the throw that left the run, if it still names
+    /// the value that left.
+    fn escapedOrigin(self: *VM) ?*const ThrowOrigin {
+        const i = self.escaped_origin orelse return null;
+        self.escaped_origin = null;
+        if (i >= self.origins.items.len) return null;
+        const o = &self.origins.items[i];
+        const thrown = self.unhandled_throw orelse return null;
+        if (!o.value.identicalTo(thrown)) return null;
+        return o;
     }
 
     /// Discard what a failed run left behind (the frames above the
@@ -2571,6 +2683,8 @@ pub const VM = struct {
         while (self.frames.items.len > 1) _ = self.popFrame();
         self.handlers.clearRetainingCapacity();
         self.finally_stack.clearRetainingCapacity();
+        self.origins.clearRetainingCapacity();
+        self.escaped_origin = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
         self.frames.items[0].routine = &idle_routine;
@@ -2596,11 +2710,12 @@ pub const VM = struct {
         // propagates, so a program that does not opt into
         // try/catch sees the original error taxonomy.
         if (self.findThrowTarget() == null) return err;
-        self.error_detail = "";
         const interner = self.ensureInterner();
         const id = interner.internKeyword(kw_name) catch return err;
         const payload = value_mod.fromKeywordId(id);
-        try self.unwindThrow(payload);
+        const origin = try self.originFor(payload, err);
+        self.error_detail = "";
+        try self.unwindThrow(payload, origin);
     }
 
     /// One instruction, fetched from `frame`: the two-level switch
@@ -3353,7 +3468,7 @@ pub const VM = struct {
                 frame.pc = post_pc;
             },
             .throwing => |value| {
-                try self.unwindThrow(value);
+                try self.unwindThrow(value, cont.origin);
             },
         }
     }
@@ -3375,7 +3490,7 @@ pub const VM = struct {
     /// `VmError.UncaughtThrow`.
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
         const value = try self.resolve(inst.a);
-        try self.unwindThrow(value);
+        try self.unwindThrow(value, try self.originFor(value, null));
     }
 
     /// Walk the handler stack top-down looking for the topmost
@@ -3409,7 +3524,8 @@ pub const VM = struct {
     /// result is `UncaughtThrow` and `unhandled_throw` holds the
     /// value.
     pub fn throwValue(self: *VM, value: Value) VmError {
-        self.unwindThrow(value) catch |err| return err;
+        const origin = self.originFor(value, null) catch |err| return err;
+        self.unwindThrow(value, origin) catch |err| return err;
         return VmError.ControlTransferred;
     }
 
@@ -3422,10 +3538,11 @@ pub const VM = struct {
     /// Common throw-unwind logic. Used by `execCtrlThrow`,
     /// `throwValue` and by `finally-exit`'s `.throwing`
     /// continuation.
-    fn unwindThrow(self: *VM, value: Value) VmError!void {
+    fn unwindThrow(self: *VM, value: Value, origin: ?u32) VmError!void {
         const handler_idx = self.findThrowTarget() orelse {
             // No matching handler anywhere — uncaught.
             self.unhandled_throw = value;
+            self.escaped_origin = origin;
             return VmError.UncaughtThrow;
         };
         const matched = self.handlers.items[handler_idx];
@@ -3464,6 +3581,7 @@ pub const VM = struct {
                     .binding_slot = 0,
                     .finally_pc = matched.finally_pc,
                     .finally_depth = matched.finally_depth,
+                    .origin = origin,
                 });
 
                 // Store thrown value into the handler's binding_slot.
@@ -3484,6 +3602,7 @@ pub const VM = struct {
                 try self.finally_stack.append(self.allocator, .{
                     .frame_index = matched.frame_index,
                     .reason = .{ .throwing = value },
+                    .origin = origin,
                 });
                 frame.pc = fpc;
             },

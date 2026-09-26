@@ -261,6 +261,8 @@ pub fn build(b: *std.Build) void {
         const cases = [_]CliGolden{
             .{ .args = &.{ "run", cli ++ "divide-by-zero.nx" }, .stderr = "divide-by-zero.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "uncaught-throw.nx" }, .stderr = "uncaught-throw.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "rethrow-finally.nx" }, .stdout = "rethrow-finally.out", .stderr = "rethrow-finally.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "rethrow-catch.nx" }, .stdout = "rethrow-catch.out", .stderr = "rethrow-catch.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "require-runtime-error.nx" }, .stderr = "require-runtime-error.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "bad-number.nx" }, .stderr = "bad-number.err", .exit_code = 3 },
             .{ .args = &.{ "run", cli ++ "duplicate-key.nx" }, .stderr = "duplicate-key.err", .exit_code = 3 },
