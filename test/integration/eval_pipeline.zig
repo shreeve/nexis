@@ -2606,49 +2606,59 @@ test "db/close: refused from a callback that holds one of the connection's trans
     , "[:db/busy :db/busy 1 nil :tx-closed]");
 }
 
-/// Run `src`, which opens `@STORE@`, on a VM under `policy`; a
-/// collection afterwards leaves at most a handful of transaction
-/// handles alive.
-fn expectDroppedTxns(policy: vm.GcPolicy, src_template: []const u8, expected: []const u8) !void {
+/// Run each of `steps`, which open `@STORE@`, on one VM under
+/// `policy`; the last yields `expected`, and a collection afterwards
+/// leaves at most a handful of transaction handles alive. Between two
+/// steps no frame is live, but the VM's backing stack keeps what the
+/// last step left in its slots, and the whole stack is a root (GC.md
+/// §3); the steps clear it so that only what the program holds keeps
+/// a handle.
+fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: []const u8) !void {
     var store = try SeamStore.init("dropped-txns");
     defer store.deinit();
-    const src = try store.source(src_template);
-    defer testing.allocator.free(src);
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
     program.v.gc_threshold = policy.threshold;
     program.v.gc_growth_percent = policy.growth_percent;
     program.v.gc_next_at = policy.threshold;
-    try harness.expectResult(&program, src, try program.run(src), expected);
+    var last = value_mod.nilValue();
+    for (steps) |step| {
+        const src = try store.source(step);
+        defer testing.allocator.free(src);
+        @memset(program.v.stack.items, value_mod.nilValue());
+        last = try program.run(src);
+    }
+    try harness.expectResult(&program, steps[steps.len - 1], last, expected);
     program.v.collectGarbage();
     try testing.expect(nx.db.handleCount() < 8);
 }
 
 /// Ten thousand dropped reads (emdb has 126 reader slots), and
 /// dropped writes that hold the file's writer until a collection or
-/// the close ends them. Each write is dropped by a top-level form of
-/// its own: a slot of the running frame that still holds a handle
-/// keeps it reachable (GC.md §3).
-const dropped_txns =
+/// the close ends them.
+const dropped_txns = [_][]const u8{
     \\(def c (db/open "@STORE@"))
     \\(def r (db/ref c :t :k))
     \\(db/put-key! r 1)
     \\(defn stage [v] (let [tx (db/begin-write c)] (db/put! tx r v)) nil)
     \\(dotimes [i 10000] (db/begin-read c))
     \\(stage 2)
+    ,
     \\(def a (db/get-key r))
     \\(def b (do (db/put-key! r 3) (db/get-key r)))
     \\(stage 4)
+    ,
     \\(def d (with-tx [tx c] (db/alter! tx r inc)))
     \\(stage 5)
     \\(db/close c)
     \\[a b d (db/get-key (db/ref (db/open "@STORE@") :t :k))]
-;
+    ,
+};
 
 test "db: a transaction the program drops is ended when a collection finds it unreachable" {
-    try expectDroppedTxns(vm.GcPolicy.default, dropped_txns, "[1 3 4 4]");
-    try expectDroppedTxns(vm.GcPolicy.stress, dropped_txns, "[1 3 4 4]");
+    try expectDroppedTxns(vm.GcPolicy.default, &dropped_txns, "[1 3 4 4]");
+    try expectDroppedTxns(vm.GcPolicy.stress, &dropped_txns, "[1 3 4 4]");
 }
 
 test "db/reduce-tree walks the tree as it was when the walk began, whatever the callback writes to it" {
