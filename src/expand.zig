@@ -1942,8 +1942,13 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 
 // ---- case / condp ------------------------------------------------
 //
-//   (case e k1 v1 k2 v2 ... default?)
+//   (case e k1 v1 k2 v2 ... default?), fewer than three constants
 //     => (let* [g e] (if (= g 'k1) v1 (if (= g 'k2) v2 ... terminal)))
+//   three or more: one hashed lookup of the clause's index in a
+//   constant map, then fixnum compares, each one instruction
+//     => (let* [g e i (get '{k1 0 k2 1 ...} g -1)]
+//          (if (== i 0) v1 (if (== i 1) v2 ... terminal)))
+//     (without `g` when there is a default: e goes straight to get)
 //   (condp pred e c1 v1 ... default?)
 //     => (let* [p pred g e] (if (p c1 g) v1 ... terminal))
 //   a clause `c :>> f` calls `f` on the predicate's truthy result.
@@ -1954,7 +1959,11 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 // there is one, else the throw of `{:error :no-matching-clause
 // :message "No matching clause: <e>" :value e}` (Clojure's
 // IllegalArgumentException carries the same message). The dispatch
-// value, and condp's predicate, are evaluated once.
+// value, and condp's predicate, are evaluated once. The map's lookup
+// is `=`'s equality (dispatch.equal and its hash), and its entries
+// go in last clause first, so of two constants that are `=` but
+// spelled differently (`[1]` and a grouped `(1)`), the first clause
+// wins, as the chain of `=` tests would have it.
 
 fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     if (args.len == 0) return ctx.fail(call_form.origin, "case: expected an expression", .{});
@@ -1971,13 +1980,34 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
             try keys.append(ctx.allocator, alt);
         }
     }
-    var chain = if (clauses.len % 2 == 1) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    const has_default = clauses.len % 2 == 1;
+    var chain = if (has_default) mutCast(clauses[clauses.len - 1]) else try noMatchThrow(b, g);
+    if (keys.items.len < 3) {
+        var i = clauses.len / 2;
+        while (i > 0) {
+            i -= 1;
+            chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
+        }
+        return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+    }
+    const index = try b.gensym("case");
+    var table: std.ArrayList(*Form) = .empty;
     var i = clauses.len / 2;
     while (i > 0) {
         i -= 1;
-        chain = try b.list(.{ "if", try caseTest(b, g, clauses[2 * i]), clauses[2 * i + 1], chain });
+        const key = clauses[2 * i];
+        const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
+        if (alternatives.len == 0) continue;
+        var a = alternatives.len;
+        while (a > 0) {
+            a -= 1;
+            try table.appendSlice(ctx.allocator, &.{ mutCast(alternatives[a]), try b.item(i) });
+        }
+        chain = try b.list(.{ "if", try b.list(.{ "nexis.core/==", index, i }), clauses[2 * i + 1], chain });
     }
-    return b.list(.{ "let*", try b.vec(.{ g, args[0] }), chain });
+    const lookup = try b.list(.{ "nexis.core/get", try b.list(.{ "quote", try makeForm(ctx, .{ .map = table.items }, b.origin) }), if (has_default) args[0] else g, -1 });
+    const bindings = if (has_default) try b.vec(.{ index, lookup }) else try b.vec(.{ g, args[0], index, lookup });
+    return b.list(.{ "let*", bindings, chain });
 }
 
 /// Whether the `case` constants `a` and `b` are one datum: the same

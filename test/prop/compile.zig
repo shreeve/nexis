@@ -665,6 +665,10 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
         // message.
         .{ .src = "(fn* [a] (nexis.test/is (= a 1)))", .len = 7 },
         .{ .src = "(fn* [a] (nexis.test/is (a) \"m\"))", .len = 7 },
+        // A case of three or more constants: one lookup of the
+        // clause's index, then a compare, a branch, the result and
+        // a jump per clause.
+        .{ .src = "(fn* [a] (case a :k0 0 :k1 1 :k2 2 :d))", .len = 19 },
     };
     for (shapes) |shape| {
         const len = try fnCodeLen(&program, shape.src);

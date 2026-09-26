@@ -2977,6 +2977,24 @@ test "case: a test constant given twice fails at expansion, as in Clojure" {
     try expectOutput("[(case 1 1 :int 1.0 :float \\1 :char \"1\" :str :d) (case 1 1 :a 1)]", "[:int :a]");
 }
 
+test "case: three or more constants dispatch through one lookup with the chain's answers" {
+    // Every kind of constant, grouped and alone, and a miss.
+    try expectOutput(
+        \\(let [f (fn [x] (case x :a 1 (:b :c) 2 "s" 3 \c 4 nil 5 [1 2] 6 {:k 1} 7 sym 8 1.0 9 1 10 () 11 :none))]
+        \\  (mapv f [:a :b :c "s" \c nil [1 2] '(1 2) {:k 1} 'sym 1.0 1 2 :zz false]))
+    , "[1 2 2 3 4 5 6 6 7 8 9 10 :none :none :none]");
+    // Of two constants that are = but spelled differently, the first
+    // clause wins.
+    try expectOutput("[(case [1] ((1)) :list [1] :vec 0 :zero) (case '(1) [1] :vec ((1)) :list 0 :zero)]", "[:list :vec]");
+    try expectOutput(
+        \\(try (case 99 1 :one 2 :two 3 :three) (catch any e [(:error e) (:value e) (:message e)]))
+    , "[:no-matching-clause 99 No matching clause: 99]");
+    // The dispatch value is evaluated once, before any test.
+    try expectOutput("(let [n (atom 0)] [(case (swap! n inc) 1 :one 2 :two 3 :three) (case (swap! n inc) 1 :one 2 :two 3 :three :d) @n])", "[:one :two 2]");
+    // Locals named after the core fns the expansion calls do not capture it.
+    try expectOutput("(let [get (fn [& _] 0) == (fn [& _] true)] (case 2 1 :a 2 :b 3 :c))", ":b");
+}
+
 test "case: no match without default throws a map naming the value" {
     try expectOutput(
         \\(try (case 99 1 :one 2 :two) (catch any e [(:error e) (:value e) (:message e)]))
