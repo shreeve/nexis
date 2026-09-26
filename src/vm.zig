@@ -2903,7 +2903,10 @@ pub const VM = struct {
         t[opcode(.math, Math.add)] = mathHandler(.add);
         t[opcode(.math, Math.sub)] = mathHandler(.sub);
         t[opcode(.math, Math.mul)] = mathHandler(.mul);
+        t[opcode(.math, Math.idiv)] = mathHandler(.idiv);
+        t[opcode(.math, Math.mod)] = mathHandler(.mod);
         t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
+        t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
         t[opcode(.call, Call.call)] = &opCall;
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
@@ -3035,6 +3038,11 @@ pub const VM = struct {
         return self.next(frame);
     }
 
+    fn opGetCell(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execClosureGetCell(frame, inst);
+        return self.next(frame);
+    }
+
     fn opLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         try self.execVarLoadVar(frame, inst);
         return self.next(frame);
@@ -3083,9 +3091,10 @@ pub const VM = struct {
         }.run;
     }
 
-    /// `math:<op>` for `+`, `-` and `*`: two fixnums whose result is
-    /// a fixnum compute inline and allocate nothing; anything else,
-    /// a promotion included, goes through the numeric tower.
+    /// `math:<op>` for `+`, `-`, `*`, `quot` and `mod`: two fixnums
+    /// whose result is a fixnum compute inline and allocate nothing;
+    /// anything else, a promotion or a zero divisor included, goes
+    /// through the numeric tower.
     fn mathHandler(comptime op: Math) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3105,6 +3114,9 @@ pub const VM = struct {
                             const p = @mulWithOverflow(x, y);
                             break :blk if (p[1] == 0) p[0] else value_mod.fixnum_max + 1;
                         },
+                        // Only `(quot fixnum_min -1)` leaves i48.
+                        .idiv => if (y != 0) @divTrunc(x, y) else value_mod.fixnum_max + 1,
+                        .mod => if (y != 0) @mod(x, y) else value_mod.fixnum_max + 1,
                         else => comptime unreachable,
                     };
                     if (value_mod.fromFixnum(r)) |v| {
@@ -3357,7 +3369,7 @@ pub const VM = struct {
         switch (variant) {
             .make => try self.execClosureMake(inst),
             .box_local => try self.execClosureBoxLocal(inst),
-            .get_cell => try self.execClosureGetCell(inst),
+            .get_cell => try self.execClosureGetCell(self.currentFrame(), inst),
             .new_cell => try self.execClosureNewCell(inst),
             .init_cell => try self.execClosureInitCell(inst),
             _ => return VmError.BytecodeCorruption,
@@ -3393,13 +3405,13 @@ pub const VM = struct {
     /// Errors:
     ///   - ExpectedCell if slot[B] doesn't hold a cell pointer.
     ///   - UninitializedCell if cell.initialized = false.
-    fn execClosureGetCell(self: *VM, inst: Inst) VmError!void {
+    fn execClosureGetCell(self: *VM, frame: *const Frame, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
-        const cell_v = (try self.slotPtr(inst.b.index)).*;
+        const cell_v = (try self.slotPtrIn(frame, inst.b.index)).*;
         const cell = try VM.asCell(cell_v);
         if (!cell.initialized) return VmError.UninitializedCell;
-        try self.store(inst.a, cell.value);
+        try self.storeIn(frame, inst.a, cell.value);
     }
 
     /// `closure:new-cell A=slot _ _` — allocate an
@@ -5140,22 +5152,30 @@ test "VM dispatch: a trap in a fused pair names its own instruction" {
 }
 
 test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
-    const mul = struct {
-        fn f(dst: u12, lhs: Operand, rhs: Operand) Inst {
-            return Inst.primary(.math, Math.mul, Operand.slot(dst), lhs, rhs);
+    const op = struct {
+        fn of(comptime m: Math) fn (u12, Operand, Operand) Inst {
+            return struct {
+                fn f(dst: u12, lhs: Operand, rhs: Operand) Inst {
+                    return Inst.primary(.math, m, Operand.slot(dst), lhs, rhs);
+                }
+            }.f;
         }
-    }.f;
-    const sub = struct {
-        fn f(dst: u12, lhs: Operand, rhs: Operand) Inst {
-            return Inst.primary(.math, Math.sub, Operand.slot(dst), lhs, rhs);
-        }
-    }.f;
+    };
+    const mul = op.of(.mul);
+    const sub = op.of(.sub);
+    const quot = op.of(.idiv);
+    const mod = op.of(.mod);
     try expectRuns(comptime &[_]RunCase{
         .{ .name = "a product past i48", .code = &.{ mul(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(value_mod.fixnum_max), fx(2) }, .want = .{ .decimal = "281474976710654" } },
         // Past i64 too: the fast path's overflow check hands it on.
         .{ .name = "a product past i64", .code = &.{ mul(0, kn(0), kn(0)), asm_.returnSlot(0) }, .consts = &.{fx(value_mod.fixnum_min)}, .want = .{ .decimal = "19807040628566084398385987584" } },
         .{ .name = "a difference below i48", .code = &.{ sub(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(value_mod.fixnum_min), fx(1) }, .want = .{ .decimal = "-140737488355329" } },
         .{ .name = "a product in range", .code = &.{ mul(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(-12), fx(12) }, .want = .{ .value = fx(-144) } },
+        .{ .name = "the one quotient past i48", .code = &.{ quot(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(value_mod.fixnum_min), fx(-1) }, .want = .{ .decimal = "140737488355328" } },
+        .{ .name = "a quotient truncates", .code = &.{ quot(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(-7), fx(2) }, .want = .{ .value = fx(-3) } },
+        .{ .name = "a modulus takes the divisor's sign", .code = &.{ mod(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(-7), fx(2) }, .want = .{ .value = fx(1) } },
+        .{ .name = "a zero divisor", .code = &.{ mod(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
+        .{ .name = "a zero quotient divisor", .code = &.{ quot(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
     });
 }
 

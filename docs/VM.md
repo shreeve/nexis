@@ -333,8 +333,8 @@ fetch (every handler's last step):
   (§10 gives each group's traps for a variant outside its enum), or
   a handler of its own for a hot variant: `mov:move`,
   `mov:load-const`, the three `jump:*`, the five `cmp:*`, `math:add`,
-  `math:sub`, `math:mul`, `var:load-var`, `call:call`, `call:return`
-  and `call:return-nil`. A group outside the enum is
+  `math:sub`, `math:mul`, `math:idiv`, `math:mod`, `closure:get-cell`,
+  `var:load-var`, `call:call`, `call:return` and `call:return-nil`. A group outside the enum is
   `BytecodeCorruption`; `transient`, `hash`, `tx`, `io` and `simd`
   trap `UnimplementedOpcode` for every variant.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
@@ -355,9 +355,10 @@ fetch (every handler's last step):
   past its instruction (§13).
 - The hot handlers read a slot, a constant or an initialized
   upvalue in place and hand every other operand to the general
-  resolution of §4. Two fixnums compare, add, subtract and multiply
-  inline when the result is a fixnum; anything else, a promotion
-  included, goes through the numeric tower (§10.3). `call:call` of a
+  resolution of §4. Two fixnums compare, add, subtract, multiply,
+  `quot` and `mod` inline when the result is a fixnum; anything else,
+  a promotion or a zero divisor included, goes through the numeric
+  tower (§10.3). `call:call` of a
   closure with its fixed arity, where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
   and `callValue` enters a closure the same way; a native within its
