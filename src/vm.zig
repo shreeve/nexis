@@ -3717,16 +3717,11 @@ pub const VM = struct {
             .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
             .map => blk: {
                 if (argc % 2 != 0) return VmError.BytecodeCorruption;
-                var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-                var i: usize = 0;
-                while (i < argc) : (i += 2) m = champ_mod.mapAssoc(heap, m, args[i], args[i + 1], hash, eql) catch return VmError.OutOfMemory;
-                break :blk m;
+                // Flat key, value pairs are `Entry`s laid end to end.
+                const entries: [*]const champ_mod.Entry = @ptrCast(args.ptr);
+                break :blk champ_mod.mapFromEntries(heap, entries[0 .. argc / 2], hash, eql) catch return VmError.OutOfMemory;
             },
-            .set => blk: {
-                var set = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
-                for (args) |v| set = champ_mod.setConj(heap, set, v, hash, eql) catch return VmError.OutOfMemory;
-                break :blk set;
-            },
+            .set => champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory,
             .concat => blk: {
                 var elements: std.ArrayList(Value) = .empty;
                 defer elements.deinit(self.allocator);
@@ -5060,6 +5055,41 @@ test "VM opcodes: coll" {
         .{ .name = "odd map argc", .code = &.{ asm_.collMap(0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "args past the frame", .code = &.{ asm_.collVector(0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
     });
+}
+
+test "VM opcodes: coll:map and coll:set keep the first key and the last value" {
+    // {1 :a 2 :b 1 :c} is {1 :c 2 :b}, in association order; #{3 1 3}
+    // is #{3 1}.
+    var vm = try VM.init(testing.allocator, &VM.idle_routine);
+    defer vm.deinit();
+    const kw = vm.ensureInterner();
+    const a = try kw.internKeywordValue("a");
+    const b = try kw.internKeywordValue("b");
+    const c = try kw.internKeywordValue("c");
+    const consts = [_]Value{ fx(1), a, fx(2), b, c, fx(3) };
+    const code = [_]Inst{
+        asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2),  asm_.loadConst(3, 3),
+        asm_.loadConst(4, 0), asm_.loadConst(5, 4), asm_.collMap(0, 6, 6), asm_.loadConst(0, 5),
+        asm_.loadConst(1, 0), asm_.loadConst(2, 5), asm_.collSet(0, 3, 7), asm_.collVector(6, 2, 0),
+        asm_.returnSlot(0),
+    };
+    const routine = makeRoutine(&code, &consts, 8, "coll-dupes");
+    try vm.retargetTop(&routine);
+    const result = try vm.run();
+    const m = vector_mod.nth(result, 0);
+    try testing.expectEqual(@as(usize, 2), champ_mod.mapCount(m));
+    var it = champ_mod.mapIter(m);
+    const first = it.next().?;
+    try testing.expectEqual(@as(i64, 1), first.key.asFixnum());
+    try testing.expect(first.value.identicalTo(c));
+    const second = it.next().?;
+    try testing.expectEqual(@as(i64, 2), second.key.asFixnum());
+    try testing.expect(second.value.identicalTo(b));
+    const set = vector_mod.nth(result, 1);
+    try testing.expectEqual(@as(usize, 2), champ_mod.setCount(set));
+    var sit = champ_mod.setIter(set);
+    try testing.expectEqual(@as(i64, 3), sit.next().?.asFixnum());
+    try testing.expectEqual(@as(i64, 1), sit.next().?.asFixnum());
 }
 
 test "VM opcodes: math and cmp" {
