@@ -27,8 +27,9 @@
 //!     └── @import("coll/champ.zig")     // for hash composition of field map
 //!
 //! Nothing imports record.zig except `dispatch.zig` (heapHashBase +
-//! heapEqual arms), `gc.zig` (trace arm), `stdlib.zig` (native fns),
-//! `format.zig` (printer arm), `codec.zig` (unserializable arm).
+//! heapEqual arms), `gc.zig` (trace arm), `vm.zig` (dispatch key,
+//! lookup), `stdlib.zig` (native fns), `format.zig` (printer arm)
+//! and `root.zig`.
 
 const std = @import("std");
 const value_mod = @import("value.zig");

@@ -45,8 +45,7 @@ const testing = std.testing;
 /// `compare-and-set!` / `swap-vals!` for the duration of their
 /// critical section.
 ///
-/// Padding makes total size a multiple of 8 so added fields stay
-/// naturally aligned without re-thinking the layout.
+/// The padding makes the body a multiple of 8 bytes.
 pub const AtomBox = extern struct {
     value: Value,
     in_flight: u8,

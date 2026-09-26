@@ -584,7 +584,7 @@ fn describeForm(form: *const Form) []const u8 {
 
 /// `form` without the `^meta` it carries: in a binding or parameter
 /// position a type hint or flag has no meaning in nexis and is
-/// dropped (PLAN §7.3).
+/// dropped (MACROEXPAND.md §2b, `^meta`).
 fn stripMeta(form: *const Form) *Form {
     var f = form;
     while (f.datum == .with_meta) f = f.datum.with_meta.target;
@@ -1471,8 +1471,8 @@ const Builder = struct {
 //   - Malformed shapes raise `MalformedMacroCall` which the
 //     compile layer buckets as `MacroExpansionFailure`.
 //   - Output forms are re-fed to the expander (see
-//     `invokeMacro`), so macro-of-macros termination is
-//     automatic.
+//     `expandList`), so a macro may expand to another macro
+//     call.
 
 // ---- let / fn / loop and destructuring --------------------------
 //

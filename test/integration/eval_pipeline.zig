@@ -1,5 +1,5 @@
 //! test/integration/eval_pipeline.zig — end-to-end golden + eval
-//! tests (COMPILER.md §9.4, §10, §11).
+//! tests (COMPILER.md §9, §10).
 //!
 //! End-to-end pipeline coverage: source → reader → macroexpand →
 //! lowerForm → Tiny → compile → VM → printed Value. Each test
@@ -2009,7 +2009,7 @@ test "integration: composite — syntax-quote inside defn" {
 //   §4.5 `(swap-vals! a f & args)`               → swap-vals test
 //   §4.6 `(compare-and-set! a old new)`          → CAS tests
 //   §5 universal `deref` / `@a` / `db/deref`     → deref tests
-//   §6 codec :unserializable (atom + nested)     → not covered here
+//   §6 codec :unserializable (nested atom)       → db :unserializable test
 //   §9 catchable errors                          → error keyword tests
 
 test "atom: ctor + atom? predicate" {
@@ -2619,12 +2619,13 @@ test "db/scan and db/reduce-tree read a value that spans several overflow pages"
 // nexis.string namespace
 // =============================================================================
 //
-// Coverage map (every STRING.md §8 invariant gets at least one row):
-//   §8.1 ASCII case conversion preserves non-ASCII bytes
-//   §8.2 trim = six ASCII whitespace chars; both sides
-//   §8.3 literal split preserves trailing empties; vector return
-//   §8.4 join over nil/list/vector/set; map rejected; sep is string
-//   §8.5 replace literal, all-non-overlapping, left-to-right
+// Coverage map (every STDLIB.md §3 row gets at least one test):
+//   case conversion maps ASCII letters, passes other bytes through
+//   trim takes Java's whitespace at both ends; U+00A0 stays
+//   literal split drops trailing empties unless the limit is
+//   negative; vector return
+//   join over any seqable (a map by entries); sep is a string
+//   replace literal, all-non-overlapping, left-to-right
 //
 // Also pins: qualified-only (NOT auto-referred into user).
 
@@ -2648,7 +2649,7 @@ test "nexis.string: lower-case + upper-case: ASCII baseline" {
 
 test "nexis.string: lower-case + upper-case: non-ASCII passes through unchanged" {
     // ASCII letters map; non-ASCII bytes are preserved verbatim
-    // (STRING.md §8.1). UTF-8 validity is preserved by
+    // (STDLIB.md §3). UTF-8 validity is preserved by
     // construction because bytes ≥ 0x80 are never modified.
     try expectOutput("(nexis.string/lower-case \"HéLLO\")", "héllo");
     try expectOutput("(nexis.string/upper-case \"abç\")", "ABç");
@@ -2662,14 +2663,14 @@ test "nexis.string: trim: six ASCII whitespace chars; both sides" {
     try expectOutput("(nexis.string/trim \"hello\")", "hello");
     try expectOutput("(nexis.string/trim \"\")", "");
     // nexis source uses `\t` `\n` `\r` escapes inside string
-    // literals (the reader decodes them per nexis.grammar §28.3).
+    // literals (the reader decodes them, FORMS.md §3).
     // The Zig source-level "\\t" produces the two bytes `\` `t`,
     // which the nexis reader then decodes into the tab byte.
     try expectOutput("(nexis.string/trim \"\\t\\nhi\\r\\n\")", "hi");
     // All-whitespace input → empty.
     try expectOutput("(nexis.string/trim \"   \\t\\n\")", "");
-    // Unicode whitespace (U+00A0 NBSP) is NOT recognized
-    // (STRING.md §8.2). Bytes 0xC2 0xA0 pass through.
+    // No-break space (U+00A0) is not whitespace
+    // (STDLIB.md §3). Bytes 0xC2 0xA0 pass through.
     try expectOutput("(nexis.string/trim \"\u{00A0}x\u{00A0}\")", "\u{00A0}x\u{00A0}");
 }
 
@@ -2772,7 +2773,7 @@ test "nexis.string: replace: literal, all-non-overlapping" {
     try expectOutput("[(try (nexis.string/replace \"abc\" \\a \"x\") (catch any e e)) (try (nexis.string/replace \"abc\" \"a\" \\x) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
     try expectOutput("(nexis.string/replace \"abc\" \"b\" \"X\")", "aXc");
     try expectOutput("(nexis.string/replace \"abababab\" \"ab\" \"X\")", "XXXX");
-    // STRING.md §8 item 5: after a match the cursor advances by the
+    // STDLIB.md §3 `replace`: after a match the cursor advances by the
     // match length, so `(replace "aaa" "aa" "x") → "xa"`, not `"xx"`.
     try expectOutput("(nexis.string/replace \"aaa\" \"aa\" \"x\")", "xa");
     // Consecutive non-overlapping matches both fire.
@@ -3217,7 +3218,7 @@ test "defprotocol: registers protocol + method dispatchers" {
 }
 
 test "protocol dispatch with NO impl raises :no-protocol-impl" {
-    // Hand-trace from PROTOCOLS.md §5: registering IFoo then
+    // Hand-trace from PROTOCOLS.md §5.5: registering IFoo then
     // calling `(bar receiver y)` with no impl for receiver's
     // dispatch key must raise a catchable :no-protocol-impl
     // (NOT panic, NOT silently return nil).
@@ -3951,7 +3952,7 @@ test "numbers: macros can return float and char literals" {
 }
 
 // =============================================================================
-// Keyword-as-function and collection-as-function (PLAN §8.7)
+// Keyword-as-function and collection-as-function (VM.md §6, PLAN §23 #33)
 // =============================================================================
 
 test "keyword-as-function: direct calls" {
