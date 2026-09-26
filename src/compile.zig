@@ -3371,8 +3371,10 @@ fn compileIf(
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
     // An arm that always jumps away (recur, throw) needs no jump
-    // past the else arm.
-    const end_jmp_pc: ?usize = if (neverFallsThrough(then_form)) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
+    // past the else arm, nor does an else arm that is `dst` itself
+    // (`(if c (+ acc 1) acc)` into acc's slot), which emits nothing.
+    const else_empty = if (else_form) |ef| isSlot(e, ef, dst) else false;
+    const end_jmp_pc: ?usize = if (neverFallsThrough(then_form) or else_empty) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
     try e.patchJumpHere(if_false_pc);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
@@ -3380,6 +3382,14 @@ fn compileIf(
         try e.emit(vm.asm_.loadNil(dst));
     }
     if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+}
+
+/// Whether `t` is the local held directly in `slot`, whose value is
+/// already there.
+fn isSlot(e: *const Emitter, t: *const Tiny, slot: u12) bool {
+    if (t.* != .symbol) return false;
+    const ref = e.resolveLocalRef(t.symbol) orelse return false;
+    return ref == .direct_slot and ref.direct_slot == slot;
 }
 
 /// Whether control never reaches the end of `t`'s code: every path
@@ -3611,6 +3621,21 @@ test "bytecode: a quoted scalar needs no Value constant beyond itself" {
         const compiled = try compileSourceWith(arena.allocator(), src, .{});
         try testing.expectEqual(@as(usize, 0), compiled.consts.len);
     }
+}
+
+test "bytecode: no jump lands on the instruction after it" {
+    // An else arm that is its destination's own local emits nothing,
+    // so the then arm needs no jump past it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    const src = "(loop* [i 5 acc 0] (if i (recur nil (if (if i nil true) (quote x) acc)) acc))";
+    const compiled = try compileSourceWith(arena.allocator(), src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
+    for (compiled.code, 0..) |inst, pc| {
+        if (inst.groupOf() == .jump) try testing.expect(inst.wide() != pc + 1);
+    }
+    try testing.expectEqual(@as(i64, 0), (try runBare(arena.allocator(), &v, src)).asFixnum());
 }
 
 test "bytecode: recur runs a 10k-iteration loop in constant stack space" {

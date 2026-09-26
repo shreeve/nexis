@@ -331,7 +331,9 @@ What each form lowers to, in terms of the opcodes of VM.md §10.
 
 `test` is read in place when it can be (§4.4); `jump:if-false` to
 the else label; `then` into the result slot; `jump:jmp` to the end,
-unless every path through `then` ends in `recur` or `throw`; the else
+unless every path through `then` ends in `recur` or `throw` or the
+else branch is the local already in the result slot, which emits
+nothing (`(if c (+ acc 1) acc)` as a `recur` argument); the else
 branch (nil when absent).
 
 #### 5.3 `(do expr...)`
