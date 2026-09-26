@@ -277,12 +277,12 @@ language surface runs in `test/integration/eval_pipeline.zig`,
 
 `db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
 `emdb`. `dispatch.zig` and `gc.zig` call its hash, equality and trace
-helpers at their `.durable_ref` arms; `stdlib.zig` holds the natives;
+helpers at their `.durable_ref` arms; `format.zig` reads a ref's
+tree name and key bytes to print it; `stdlib.zig` holds the natives;
 Nextomic imports it only for `failureName`, the geometry constants
 `page_size` and `max_named_trees`, and `StoreFile`, through which it
 shares the file's environment (§3.1); it keeps raw byte keys and never
-goes through
-`db.zig`'s connections, trees, codec calls or refs.
+goes through `db.zig`'s connections, trees, codec calls or refs.
 
 ---
 
