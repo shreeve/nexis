@@ -43,6 +43,7 @@ const bignum = @import("bignum.zig");
 const list = @import("coll/list.zig");
 const vector = @import("coll/vector.zig");
 const champ = @import("coll/champ.zig");
+const sorted = @import("coll/sorted.zig");
 const typed_vector = @import("coll/typed_vector.zig");
 const transient_mod = @import("coll/transient.zig");
 const db_mod = @import("db.zig");
@@ -171,6 +172,7 @@ pub const Collector = struct {
             .persistent_vector => vector.trace(h, self),
             .persistent_map => champ.traceMap(h, self),
             .persistent_set => champ.traceSet(h, self),
+            .sorted_map, .sorted_set => sorted.trace(h, self),
             // Typed vectors are leaves: unboxed numbers, no children.
             .typed_vector => typed_vector.trace(h, self),
             .transient => transient_mod.trace(h, self),

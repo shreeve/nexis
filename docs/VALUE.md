@@ -49,7 +49,7 @@ Kind numbers are frozen: the VM switches on them and the codec writes
 them as wire tags (`docs/CODEC.md` §9). A kind number is never reused
 or renumbered; a retired kind leaves a reserved gap. `Kind.isImmediate`
 is `kind < 16`, `Kind.isHeap` is `16 <= kind < 64`. Values 8–15 are
-reserved for immediates, 41–63 for heap kinds, 64 and above for
+reserved for immediates, 43–63 for heap kinds, 64 and above for
 runtime-private sentinels (§2.3).
 
 #### 2.1 Immediates (the payload is the value)
@@ -103,6 +103,8 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 38 | `nextomic_conn` | Nextomic connection (`docs/NEXTOMIC.md` §8) | The block holds a VM-owned connection pointer and the path |
 | 39 | `nextomic_db` | Nextomic db-value (`docs/NEXTOMIC.md` §4) | Connection, basis and mode, inline |
 | 40 | `nextomic_entity` | Nextomic lazy entity (`docs/NEXTOMIC.md` §6) | The db-value box, the eid and the map of its last full read |
+| 41 | `sorted_map` | Sorted map: a weight-balanced tree in its comparator's order (`docs/SORTED.md`) | 0 = root: the comparator and the tree. Tree nodes are blocks of this kind that no Value points at (`docs/SORTED.md` §2) |
+| 42 | `sorted_set` | Sorted set, laid out as the sorted map without values | As for the sorted map |
 
 The equality category and hash domain of every kind are SEMANTICS
 §3.3; what each block's trace walks is `docs/GC.md` §5; which kinds

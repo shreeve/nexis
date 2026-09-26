@@ -122,7 +122,15 @@ pub const Kind = enum(u8) {
     /// db-value's basis and mode. Equal when the db-values are equal
     /// and the eids agree.
     nextomic_entity = 40,
-    // 41..63 reserved for heap kinds.
+    /// Sorted map (docs/SORTED.md): a weight-balanced tree ordered by
+    /// its comparator. The root block holds the comparator and the
+    /// tree; the nodes are blocks of this kind that no Value points
+    /// at. Equal to, and hashed as, a hash map with the same entries.
+    sorted_map = 41,
+    /// Sorted set (docs/SORTED.md), laid out as `sorted_map` without
+    /// the values.
+    sorted_set = 42,
+    // 43..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     unbound = 64,

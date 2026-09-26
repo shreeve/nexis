@@ -24,7 +24,8 @@ empty collections `[]`, `{}`, `#{}`, `()`, and every char.
 - `(= x y)` is value equality, specified per kind below.
 
 **Cross-kind rule.** Values of different kinds are never `=`, except
-list and vector (§2.6). No numeric coercion, no collection–string
+list and vector, hash map and sorted map, and hash set and sorted set
+(§2.6). No numeric coercion, no collection–string
 coercion, no keyword–symbol coercion.
 
 #### 2.1 Nil and booleans
@@ -105,9 +106,9 @@ Equality is intern-id equality. `(= :foo :ns/foo)` is false: a
 qualified and an unqualified keyword are different names. `(= 'foo
 :foo)` is false, and the two kinds hash in different domains (§3.3).
 
-#### 2.6 Collections: the three rules (PLAN §23 #36)
+#### 2.6 Collections: the equality rules (PLAN §23 #36)
 
-`src/dispatch.zig` decides every pair of values by one of three rules;
+`src/dispatch.zig` decides every pair of values by one of four rules;
 §3.3 gives each kind's rule.
 
 | Rule | `=` | `hash` |
@@ -115,13 +116,17 @@ qualified and an unqualified keyword are different names. `(= 'foo
 | **sequential** (list, vector) | element-wise, across the two kinds | ordered combine; one shared domain byte `0xF0` |
 | **identity** | the same value only | the pointer; the collector never moves a block |
 | **own-kind structural** | within the kind only, by the kind's structural rule | the kind's own hash; domain byte = the kind number |
+| **map, set** (hash map and sorted map; hash set and sorted set) | entry-wise, across the two kinds | unordered combine; the hash kind's number, 18 or 19 |
 
 - `(= (list 1 2 3) [1 2 3])` is true, and the hashes agree; a vector
   view (`(rest [1 2 3])`) is a list and follows the same rule.
 - `(= (list) [])` is true; `(= () nil)` is false.
 - `(= [1 2 3] #{1 2 3})` and `(= {:a 1} [:a 1])` are false.
 - Maps compare entry-wise across their array-map and CHAMP layouts
-  (subkinds of one kind); sets likewise.
+  (subkinds of one kind) and the sorted map (a kind of its own); sets
+  likewise across the hash set and the sorted set. `(= (sorted-map 1
+  :a) {1 :a})` is true and the two hash alike; the comparator never
+  takes part (`docs/SORTED.md` §7).
 - A record equals a record of the same type with equal field maps,
   never its field map (`docs/PROTOCOLS.md` §2.1).
 - A typed vector equals a typed vector of the same element type with
@@ -213,6 +218,8 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`).
   insensitive to entry order.
 - **Set**: the elements' hashes summed from `0`, finalized with the
   count.
+- **Sorted map**, **sorted set**: the map or set formula over the
+  same entries, in the map's or set's domain.
 - **typed vector**: ordered combine over the element-type code, then
   each element (`xxh3` of the i64, or the float rule), finalized with
   the length.
@@ -243,8 +250,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 7 | `symbol` | own kind | 7 | intern id | name hash |
 | 16 | `string` | own kind | 16 | bytes | bytes, cached |
 | 17 | `bignum` | own kind | 17 | sign and limbs | sign and limbs, cached |
-| 18 | `persistent_map` | own kind | 18 | entry-wise, both layouts | unordered, cached |
-| 19 | `persistent_set` | own kind | 19 | element-wise, both layouts | unordered, cached |
+| 18 | `persistent_map` | map | 18 | entry-wise, both layouts and with a sorted map | unordered, cached |
+| 19 | `persistent_set` | set | 19 | element-wise, both layouts and with a sorted set | unordered, cached |
 | 20 | `persistent_vector` | sequential | `0xF0` | element-wise with any list or vector | ordered, cached |
 | 21 | `list` (all three subkinds) | sequential | `0xF0` | element-wise with any list or vector | ordered; cached except a view |
 | 23 | `typed_vector` | own kind | 23 | element type and elements | ordered, cached |
@@ -261,6 +268,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 38 | `nextomic_conn` | identity | 38 | same value | pointer |
 | 39 | `nextomic_db` | own kind | 39 | connection, basis, mode | same fields, cached |
 | 40 | `nextomic_entity` | own kind | 40 | db-value and eid | same fields, cached |
+| 41 | `sorted_map` | map | 18 | entry-wise with any map | unordered, cached |
+| 42 | `sorted_set` | set | 19 | element-wise with any set | unordered, cached |
 
 The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
 are never constructed; `dispatch` panics on one. A kind module
