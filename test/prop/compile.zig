@@ -661,6 +661,10 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
         .{ .src = "(fn* [a] (do (if a (a)) a))", .len = 5 },
         // Arguments compute straight into the call block.
         .{ .src = "(fn* [a] (a (inc a) (a) 1))", .len = 7 },
+        // An assertion is one call: helper, quoted form, values,
+        // message.
+        .{ .src = "(fn* [a] (nexis.test/is (= a 1)))", .len = 7 },
+        .{ .src = "(fn* [a] (nexis.test/is (a) \"m\"))", .len = 7 },
     };
     for (shapes) |shape| {
         const len = try fnCodeLen(&program, shape.src);

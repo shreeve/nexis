@@ -5559,6 +5559,22 @@ test "nexis.test: is returns whether the assertion passed and deftest yields the
     , "[true false false true]");
 }
 
+test "nexis.test: thrown? takes what its catch would take, and a message is evaluated once" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(reset! nexis.test/counts {"test" 0 "pass" 0 "fail" 0 "error" 0})
+        \\(def n (atom 0))
+        \\[(nexis.test/is (nexis.test/thrown? :x (throw {:error :x})))
+        \\ (nexis.test/is (nexis.test/thrown? :default (throw 1)))
+        \\ (nexis.test/is (nexis.test/thrown? Exception (throw 1)))
+        \\ (try (nexis.test/is (nexis.test/thrown? :x (throw :y))) (catch any e [:went-on e]))
+        \\ (nexis.test/is (= 1 1) (str "m" (swap! n inc)))
+        \\ (nexis.test/is (= 1 2) (str "m" (swap! n inc)))
+        \\ @n @log @nexis.test/counts]
+    , "[true true true [:went-on :y] true false 2 [FAIL in /: (= 1 2) expected: 1 actual: 2 ; m2] {test 0, pass 4, fail 1, error 0}]");
+}
+
 test "nexis.pprint: a short collection prints flat, a long one breaks from its column" {
     try expectOutputProgram(
         \\[(nexis.pprint/pprint-str {:a [1 2] :b "x"})
