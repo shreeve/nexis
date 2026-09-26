@@ -213,16 +213,41 @@ constant pool, Var table, capture descriptors, span table,
   is compiled: a binding's slot lives to the end of its scope, a
   temporary until the instruction that consumes it, a call block
   until the call. `slot_count` is the most slots live at once. A
-  call's argument block (and a `coll:*` item block) is reserved
-  contiguously before its items compile, on top of every live slot,
-  so a cell slot needed after the call (per the range-call ABI,
-  VM.md §6) or by a later `closure:make` is never inside it:
+  call's block (and a `coll:*` item block) is reserved contiguously
+  before its items compile, above every live slot, so a cell slot
+  needed after the call (per the range-call ABI, VM.md §6) or by a
+  later `closure:make` is never inside it:
   `(let* [x 1, f (g), h (fn* [] x)] h)` keeps `x`'s cell below `(g)`'s
-  block. A value computed into a fresh temporary for an operand may
-  use that temporary for its own first computed operand, since no
-  code reads it before the value's last instruction writes it: nested
-  arithmetic, `(inc (inc ... x))` or `(+ x (+ x ...))`, takes one slot
-  at any depth.
+  block.
+- **Scratch.** A value computed into a slot that nothing reads before
+  the value's last instruction writes it (a fresh temporary for an
+  operand, or an item of a block) may use that slot as working space,
+  and so may it use a block's slots not yet written, the item's own
+  and every one after the last item written before it. Nested
+  arithmetic computes its first operand that needs code into its
+  destination, so `(inc (inc ... x))` or `(+ x (+ x ...))` takes one
+  slot at any depth; a call or collection computed into such a slot
+  puts its block at the lowest of them, the result landing in the
+  slot the level outside reads.
+- **Block items that run no code wait.** A block's items evaluate
+  left to right, but an item whose evaluation has no effect, cannot
+  fail and reads nothing that can change (a literal, or a local of
+  the routine or of one it is nested in, a captured local's cell being
+  written once before any code can read it) is written after the items
+  that run code, just before the `call:call` or `coll:*`. So is a Var
+  read (callee or argument) when an item of the same or an enclosing
+  block read the same Var with no instruction emitted since: no code
+  ran in between, so the value in force is the one already in that
+  slot, and the item is a `mov:move` from it. A jump or handler
+  target ends that, since control reaches it from elsewhere. With
+  both, nesting takes slots only for values some level holds while
+  the level inside it runs: `(f (f ... x))`, `(f (g (f (g ... x))))`,
+  `(map inc (map inc ... xs))`, `(:k (:k ... m))`, `[x [x ... ]]` and
+  a nested call in any argument position take a fixed number of slots
+  at any depth, bounded by the native stack guard alone, while
+  `(+ (g) (+ (g) ...))` holds each `(g)` until the `+` of its level
+  runs, and `(f (g) (f (g) ...))` each level's `f` and `(g)`, a slot
+  or two per level up to the 4096 cap (below).
 - **The destination is written last.** Every form writes its result
   slot as its last act: nothing it evaluates runs after the write, so
   no handler inside it can see the slot half-updated. A `try` with a
@@ -279,8 +304,10 @@ constant pool, Var table, capture descriptors, span table,
   `nexis.core/into`: a vector, map or set is the accumulator; a list
   or `#%concat` is `(apply list acc)`; a call is `(apply f acc)`, the
   callee evaluated first. What stays out of reach is more than 4096
-  slots live at once (the bindings in scope and the temporaries of
-  the form being computed) and a closure over more than 4096 names.
+  values live at once (the bindings in scope and the values the form
+  being computed holds while it computes the rest, such as the left
+  operands of `(+ (g) (+ (g) ...))` nested past 4000 levels) and a
+  closure over more than 4096 names.
   Each error is reported at the innermost form being compiled when it
   is raised, with a detail naming the routine (`fn NAME`, `anonymous
   fn` or `top-level form`) and the limit (§7).
@@ -362,9 +389,11 @@ protocol method. `test/prop/compile.zig` pins a set of such shapes.
 A call's arguments compute straight into its block; an argument that
 is already in a slot (a parameter, a `let` binding) is one `mov:move`
 into it, a constant one `mov:load-const`, the callee one
-`var:load-var`, as the range-call ABI (VM.md §6) needs every one of
-them in the block. A `let` binding that only renames a local costs
-nothing (§4.4).
+`var:load-var` (or a `mov:move` from the slot where an enclosing
+level read the same Var, §4.4), as the range-call ABI (VM.md §6)
+needs every one of them in the block; the ones that run no code are
+written after the ones that do. A `let` binding that only renames a
+local costs nothing (§4.4).
 
 ---
 
@@ -760,8 +789,10 @@ syntax-quote equal to the hand-built shape), and a differential test
 comparing random programs over arithmetic, `if` (on a comparison, or
 on an `and` or `or` of comparisons, one negated), shadowing `let*`,
 closures, calls of one and two arguments nested in each other's
-arguments, a call whose argument throws, and counting `loop*`s read
-directly and through `let*` aliases, against a reference evaluator. `test/integration/eval_pipeline.zig` runs source end to
+arguments, calls of Vars of three arguments, variadic and through
+`apply`, with the callee itself a call, a call whose argument throws,
+and counting `loop*`s read directly and through `let*` aliases,
+against a reference evaluator. `test/integration/eval_pipeline.zig` runs source end to
 end through every host macro and every `try` exit path.
 
 #### 9.4 Guarantees the tests pin

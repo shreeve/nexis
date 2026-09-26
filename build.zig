@@ -273,6 +273,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
             .{ .args = &.{ "run", cli ++ "deep-nesting.nx" }, .stdout = "deep-nesting.out" },
+            .{ .args = &.{ "run", cli ++ "deep-calls.nx" }, .stdout = "deep-calls.out" },
             .{ .args = &.{ "run", cli ++ "args.nx", "a", "b c" }, .stdout = "args.out" },
             .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
             .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
