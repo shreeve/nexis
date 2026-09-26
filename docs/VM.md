@@ -337,12 +337,12 @@ fetch (every handler's last step):
   tail-call op_table[inst.group | inst.variant << 6](vm, frame, inst)
 ```
 
-- An entry is its group's handler, which switches on the variant
-  (§10 gives each group's traps for a variant outside its enum), or
-  a handler of its own for a hot variant: `mov:move`,
-  `mov:load-const`, the three `jump:*`, the five `cmp:*`, `math:add`,
+- Every variant of `mov`, `jump` and `cmp`, and `math:add`,
   `math:sub`, `math:mul`, `math:idiv`, `math:mod`, `closure:get-cell`,
-  `var:load-var`, `call:call`, `call:return` and `call:return-nil`. A group outside the enum is
+  `var:load-var`, `call:call`, `call:return` and `call:return-nil`,
+  has a handler of its own; every other entry is its group's, which
+  switches on the variant or, where no variant is left, traps as §10
+  says for one outside the enum. A group outside the enum is
   `BytecodeCorruption`; `transient`, `hash`, `tx`, `io` and `simd`
   trap `UnimplementedOpcode` for every variant.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,

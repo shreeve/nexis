@@ -2891,12 +2891,15 @@ pub const VM = struct {
     const op_table: [4096]OpHandler = blk: {
         @setEvalBranchQuota(20_000);
         var t = [_]OpHandler{&opCorrupt} ** 4096;
+        // A group's handler takes the variants without one of their
+        // own: every variant of `jump` and `cmp` has one, so theirs
+        // are corrupt; `mov` and `call` trap theirs (§10).
         const groups = .{
-            .{ Group.jump, &opJump },
-            .{ Group.cmp, &opCmp },
+            .{ Group.jump, &opCorrupt },
+            .{ Group.cmp, &opCorrupt },
             .{ Group.math, &opMath },
-            .{ Group.mov, &opMov },
-            .{ Group.call, &opCallGroup },
+            .{ Group.mov, &opUnimplemented },
+            .{ Group.call, &opUnimplemented },
             .{ Group.closure, &opClosure },
             .{ Group.var_, &opVar },
             .{ Group.coll, &opColl },
@@ -2912,6 +2915,9 @@ pub const VM = struct {
         }
         t[opcode(.mov, Mov.move)] = &opMove;
         t[opcode(.mov, Mov.load_const)] = &opLoadConst;
+        t[opcode(.mov, Mov.load_nil)] = loadHandler(value_mod.nilValue());
+        t[opcode(.mov, Mov.load_true)] = loadHandler(value_mod.fromBool(true));
+        t[opcode(.mov, Mov.load_false)] = loadHandler(value_mod.fromBool(false));
         t[opcode(.jump, Jump.jmp)] = &opJmp;
         t[opcode(.jump, Jump.if_false)] = &opIfFalse;
         t[opcode(.jump, Jump.if_true)] = &opIfTrue;
@@ -2975,21 +2981,6 @@ pub const VM = struct {
     // and `coll` allocate on the heap only; `call` and `ctrl` may
     // change the frame chain.
 
-    fn opMov(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        try self.execMov(frame, inst);
-        return self.next(frame);
-    }
-
-    fn opCmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        try self.execCmp(frame, inst);
-        return self.next(frame);
-    }
-
-    fn opJump(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        try self.execJump(frame, inst);
-        return self.next(frame);
-    }
-
     fn opVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         try self.execVar(frame, inst);
         return self.next(frame);
@@ -3010,11 +3001,6 @@ pub const VM = struct {
         return self.nextSafe(frame);
     }
 
-    fn opCallGroup(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        try self.execCall(frame, inst);
-        return self.nextFrame();
-    }
-
     fn opCtrl(self: *VM, _: *Frame, inst: Inst) VmError!void {
         try self.execCtrl(inst);
         return self.nextFrame();
@@ -3027,6 +3013,16 @@ pub const VM = struct {
         var tmp: Value = undefined;
         try self.storeIn(frame, inst.a, (try self.operandPtr(frame, inst.b, &tmp)).*);
         return self.next(frame);
+    }
+
+    /// `mov:load-nil`, `mov:load-true`, `mov:load-false`.
+    fn loadHandler(comptime v: Value) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                try self.storeIn(frame, inst.a, v);
+                return self.next(frame);
+            }
+        }.run;
     }
 
     fn opLoadConst(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3224,53 +3220,8 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `mov` (VM.md §10.1)
-    // -------------------------------------------------------------------------
-
-    fn execMov(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const variant: Mov = @enumFromInt(inst.variant);
-        switch (variant) {
-            .move => {
-                // mov:move a b _      ;  slot[a] = resolve(b)
-                const v = try self.resolveIn(frame, inst.b);
-                try self.storeIn(frame, inst.a, v);
-            },
-            .load_const => {
-                // mov:load-const a W  ;  slot[a] = consts[W]
-                const consts = frame.routine.consts;
-                const i = inst.wide();
-                if (i >= consts.len) return VmError.OperandOutOfRange;
-                try self.storeIn(frame, inst.a, consts[i]);
-            },
-            .load_nil => {
-                try self.storeIn(frame, inst.a, value_mod.nilValue());
-            },
-            .load_true => {
-                try self.storeIn(frame, inst.a, value_mod.fromBool(true));
-            },
-            .load_false => {
-                try self.storeIn(frame, inst.a, value_mod.fromBool(false));
-            },
-            _ => return VmError.UnimplementedOpcode,
-        }
-    }
-
-    // -------------------------------------------------------------------------
     // Group `call` (VM.md §10.2)
     // -------------------------------------------------------------------------
-
-    fn execCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const variant: Call = @enumFromInt(inst.variant);
-        switch (variant) {
-            .call => try self.execCallCall(frame, inst),
-            .@"return" => try self.execCallReturn(inst),
-            .return_nil => try self.execCallReturnNil(),
-            // tailcall is unimplemented; `recur` compiles to a
-            // jump instead.
-            .tailcall => return VmError.UnimplementedOpcode,
-            _ => return VmError.UnimplementedOpcode,
-        }
-    }
 
     /// `call:call A=call_base B=argc C=result_slot` — range-call
     /// ABI per VM.md §6. Caller has staged `slot[A] = callee` and
@@ -3338,20 +3289,6 @@ pub const VM = struct {
         const frame = self.frames.pop().?;
         self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
         return frame;
-    }
-
-    /// `call:return A=slot _ _` — return `slot[A]` from the current
-    /// frame.
-    fn execCallReturn(self: *VM, inst: Inst) VmError!void {
-        // Read the return value while the callee frame is still
-        // active; popping first would invalidate the slot.
-        const return_value = try self.resolve(inst.a);
-        return self.returnValue(return_value);
-    }
-
-    /// `call:return-nil` — return nil from the current frame.
-    fn execCallReturnNil(self: *VM) VmError!void {
-        return self.returnValue(value_mod.nilValue());
     }
 
     /// Complete the current frame with `return_value`. A frame
@@ -3550,20 +3487,6 @@ pub const VM = struct {
     // is operand A.
     // -------------------------------------------------------------------------
 
-    fn execJump(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const variant: Jump = @enumFromInt(inst.variant);
-        switch (variant) {
-            .jmp => try applyJump(frame, inst.wide()),
-            .if_true => {
-                if ((try self.resolveIn(frame, inst.a)).isTruthy()) try applyJump(frame, inst.wide());
-            },
-            .if_false => {
-                if ((try self.resolveIn(frame, inst.a)).isFalsy()) try applyJump(frame, inst.wide());
-            },
-            _ => return VmError.BytecodeCorruption,
-        }
-    }
-
     /// Move the frame to `pc`, which must lie inside its routine's
     /// code: a target at the end would exhaust the code on the next
     /// fetch, and the compiler's unpatched placeholder target
@@ -3623,14 +3546,6 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
     // Group `cmp` (VM.md §10.4)
     // -------------------------------------------------------------------------
-
-    fn execCmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        // cmp:<op> a b c   ;  slot[a] = bool(resolve(b) <op> resolve(c))
-        const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
-        const lhs = try self.resolveIn(frame, inst.b);
-        const rhs = try self.resolveIn(frame, inst.c);
-        try self.storeIn(frame, inst.a, value_mod.fromBool(try self.compareNumbers(cmp, lhs, rhs)));
-    }
 
     /// `numCompare`, with the report naming the operator.
     fn compareNumbers(self: *VM, cmp: NumCmp, lhs: Value, rhs: Value) VmError!bool {
@@ -4478,7 +4393,7 @@ pub fn numAbs(heap: *heap_mod.Heap, a: value_mod.Value) VmError!value_mod.Value 
 }
 
 /// The comparison predicates of the tower. The variants share
-/// their values with the `cmp` opcode group so `execCmp` needs no
+/// their values with the `cmp` opcode group so `cmpHandler` needs no
 /// mapping.
 pub const NumCmp = enum(u6) { lt, lte, gt, gte, eq };
 
