@@ -69,6 +69,8 @@ pub const DbError = error{
     InvalidKey,
     /// `close` of a connection with a transaction still open.
     TransactionsOpen,
+    /// A store file with more than one hard link (DB.md §3.1).
+    HardLinked,
 };
 
 /// The keyword a storage-layer error surfaces as at the language
@@ -88,6 +90,7 @@ pub fn failureName(err: anyerror) []const u8 {
         error.OpenFailed => "db/open-failed",
         error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",
+        error.HardLinked => "db/hard-linked",
         error.TxnAborted => "db/txn-aborted",
         error.TxnReadOnly => "db/read-only",
         error.SyncFailed => "db/sync-failed",
@@ -120,10 +123,14 @@ pub fn failureName(err: anyerror) []const u8 {
 /// first. One environment per file makes a second writer
 /// `error.WriterActive` instead, whichever connection asks.
 ///
-/// Files are told apart by `(st_dev, st_ino)`, so a symlink, a hard
-/// link or `./x` finds the file already open, and a copy is another
-/// file. The environment opens at the canonical path, so every
-/// process that names the file shares one lock file.
+/// Files are told apart by `(st_dev, st_ino)`, so a symlink or `./x`
+/// finds the file already open, and a copy is another file. The
+/// environment opens at the canonical path, so every process that
+/// names the file shares one lock file. emdb names the lock file
+/// after the path, and no path is canonical across hard links, so a
+/// file with a second hard link is refused (`error.HardLinked`):
+/// two processes opening it by two names would write beside each
+/// other, each blind to the other's readers.
 ///
 /// The runtime is single-threaded, so the list of open files is a
 /// plain global. The environment lives on the allocator of the first
@@ -150,6 +157,7 @@ pub const StoreFile = struct {
         errdefer allocator.free(canonical);
         var st: std.c.Stat = undefined;
         if (std.c.fstatat(std.c.AT.FDCWD, canonical.ptr, &st, 0) == 0) {
+            if (st.nlink > 1) return DbError.HardLinked;
             var it = open_files;
             while (it) |f| : (it = f.next) {
                 if (f.dev == st.dev and f.ino == st.ino) {
@@ -172,6 +180,7 @@ pub const StoreFile = struct {
         };
         errdefer self.env.close();
         if (std.c.fstat(self.env.inner.dataFile.fd, &st) != 0) return error.OpenFailed;
+        if (st.nlink > 1) return DbError.HardLinked;
         self.path = canonical;
         self.dev = st.dev;
         self.ino = st.ino;
@@ -891,6 +900,32 @@ test "open: a copy of a store is another file, written beside the original" {
     defer abortRead(&rb);
     try testing.expectEqual(@as(i64, 2), (try get(&ra, "t", "k", synthHash, synthEq)).?.asFixnum());
     try testing.expectEqual(@as(i64, 3), (try get(&rb, "t", "k", synthHash, synthEq)).?.asFixnum());
+}
+
+test "open: a store file with a second hard link is refused under either name" {
+    const path = try tmpDbPath(testing.allocator, "linked");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&a);
+    const other = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/other.emdb", .{std.fs.path.dirname(path).?}, 0);
+    defer testing.allocator.free(other);
+    try testing.expectEqual(@as(c_int, 0), std.c.link(path.ptr, other.ptr));
+    // Already open here, and not yet open anywhere: both refused.
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    try close(&a);
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, other.ptr, .{ .allocator = testing.allocator }));
+    try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
+    // One name again: the file opens.
+    try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
+    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
 }
 
 test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {

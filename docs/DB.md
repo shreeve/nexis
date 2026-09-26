@@ -106,10 +106,23 @@ one opened through another spelling of the path would take a lock
 file of its own and write beside the first. A process therefore opens
 each store file once: `StoreFile.acquire` keeps the open files in one
 process-wide list keyed by `(st_dev, st_ino)`, and every `open` of the
-file, through any spelling, symlink or hard link, and every Nextomic
-`connect` to it (`docs/NEXTOMIC.md` §2) share its one `emdb.Env`,
+file, through any spelling or symlink, and every Nextomic `connect` to
+it (`docs/NEXTOMIC.md` §2) share its one `emdb.Env`,
 reference-counted; the last `release` closes it. A copy of a store
 file is another file.
+
+**Hard links are refused.** Across processes the lock is emdb's:
+its writer lock and reader table live in `<path>-lock`, named after
+the path the environment opens. The canonical path (§2) makes every
+spelling and symlink of a file one lock file, but no path names a file
+for all its hard links, and emdb takes no lock path of its own. Two
+processes opening a store by two hard-link names would take two lock
+files: two writers at once, and each writer blind to the other's
+readers, reusing pages they still read. So `acquire` refuses a store
+file whose link count is above one, at every `open` and `connect`,
+whether or not the process has it open already: `HardLinked`,
+`:db/hard-linked`. Removing the extra name makes it openable again; a
+copy of the file is another store.
 
 The environment has one write transaction. `StoreFile.beginWrite`
 while any holder of the file has one open is `WriterActive`
@@ -141,8 +154,8 @@ the same store it reads and writes normally (§8).
 ### 5. Zig API
 
 `DbError` is `ConnectionUnavailable`, `StoreMismatch`,
-`InvalidTreeName`, `InvalidKey`, `TransactionsOpen`; emdb, codec,
-intern and allocator errors propagate unchanged.
+`InvalidTreeName`, `InvalidKey`, `TransactionsOpen`, `HardLinked`;
+emdb, codec, intern and allocator errors propagate unchanged.
 
 | Function | Contract |
 |---|---|
@@ -222,6 +235,7 @@ None: a ref has no heap children. `conn` points at a non-heap
 | A transaction begun on a closed connection | `ConnectionUnavailable` | `:db-closed` (the natives check first) |
 | Empty or `nx/` tree name, empty key | `InvalidTreeName` / `InvalidKey` | `:db/invalid-key` |
 | `close` with a transaction open | `TransactionsOpen` | `:db/busy` |
+| A store file with more than one hard link (§3.1) | `HardLinked` | `:db/hard-linked` |
 | A write while any connection or Nextomic store of the file holds its writer | `WriterActive` | `:db/busy` (§3.1) |
 | A write on a file opened read-only | `TxnReadOnly` | `:db/read-only` |
 | A second `close` | none | none (nil) |
@@ -269,8 +283,9 @@ hash; D2 closes, reopens the file with a fresh heap and interner, and
 reads 2 000 values back; D3 checks that the identity triple alone
 decides ref equality and hash; D4 writes the same key to every tree
 with different values and reads each tree's own back. The inline tests
-in `src/db.zig` pin the canonical store id, the pinned geometry, close
-refused while a transaction is open, the tree-handle cache,
+in `src/db.zig` pin the canonical store id, the pinned geometry, the
+refusal of a hard-linked file, close refused while a transaction is
+open, the tree-handle cache,
 `ConnectionUnavailable`, `StoreMismatch` and the invalid names. The
 language surface runs in `test/integration/eval_pipeline.zig`,
 `test/integration/runtime_polish.zig` and `examples/durable-refs.nx`.

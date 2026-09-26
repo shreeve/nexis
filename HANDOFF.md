@@ -152,8 +152,9 @@ the live size) has been allocated, 4 KiB under `NEXIS_GC_STRESS`
 `src/db.zig` opens each store file once per process: `StoreFile` keys
 the open files by `(st_dev, st_ino)` and hands its one
 reference-counted `emdb.Env` to every `db/open` connection and every
-Nextomic connection of the file, so any spelling, symlink or hard link
-of the path is one store, and a second writer on it is `:db/busy`
+Nextomic connection of the file, so any spelling or symlink of the
+path is one store (a file with a second hard link is refused), and a
+second writer on it is `:db/busy`
 (`:nextomic/nested` in Nextomic), never a deadlock (`docs/DB.md`
 §3.1). It pins `pageSize = 16384` and `maxNamedTrees = 128`, resolves
 tree ids once per connection, reads values whole off cursors, holds
@@ -384,25 +385,19 @@ failing test (AGENTS.md).
 
 ### 6.3 Storage
 
-1. **Hard links across processes**: one process opens a file once
-   whatever it is called (`docs/DB.md` §3.1), but emdb names its lock
-   file after the path it was given, so two processes that open one
-   store through two hard-link names take two lock files and can both
-   write. Next: state it in `docs/DB.md` §3.1 (open a store by one
-   name); emdb is not changed for it.
-2. **Writes to a tree during `db/reduce-tree` over it**: the callback
+1. **Writes to a tree during `db/reduce-tree` over it**: the callback
    may write through the held transaction, and emdb does not specify
    what a cursor sees after its own tree is written under it. Next:
    refuse writes to the walked tree while the walk holds the
    transaction (`:db/busy`), or walk a copy of the keys, with a test
    that writes during a reduce.
-3. **The environment lives on the first opener's allocator**:
+2. **The environment lives on the first opener's allocator**:
    `db/open` leaves emdb's default, `page_allocator`, so an
    environment `db/open` opened allocates its small objects a page at
    a time, while one Nextomic opened first uses the VM's allocator.
    Next: pass `vm.allocator` from `db/open` (it outlives every
    connection), measured with `zig build bench -- --filter db-integrated`.
-4. **Engine bounds surface as bare keywords**: a `db/*` key past
+3. **Engine bounds surface as bare keywords**: a `db/*` key past
    4078 bytes, a stored value past just under 1 GiB and a file's 129th
    named tree are `:db/key-too-large`, `:db/value-too-large` and
    `:db/max-trees`, which name the bound but not its value or the
@@ -476,7 +471,7 @@ after numbers in the commit message.
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
 2. Transaction handles dropped open (§6.1 item 4), writes during
-   `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
+   `db/reduce-tree` (§6.3 item 1), and out of memory as a runtime
    error (§6.1 item 6).
 3. The parser regeneration check and a Linux run (§6.4).
 4. Performance: the levers and measured dead ends are
