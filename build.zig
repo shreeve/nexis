@@ -14,13 +14,16 @@
 //!   zig build bench [-- ARGS]         the benchmark suite, ReleaseFast
 //!   zig build run -- ARGS             build and run bin/nexis
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
+//!   zig build parser-check            diff src/parser.zig against a fresh generation
+//!                                     (part of `test` when nexus is present)
 //!   zig build check-targets           compile and link every binary for Linux
 //!                                     (x86_64 and aarch64, glibc and musl)
 //!
 //! The runtime is one module, `nexis`, rooted at src/root.zig; its files
 //! import each other by relative path. `checkLayering` below enforces the
 //! import order src/root.zig declares. The checked-in src/parser.zig is
-//! authoritative; `parser` regenerates it after an edit to nexis.grammar.
+//! authoritative; `parser` regenerates it after an edit to nexis.grammar,
+//! with the nexus at ../nexus/bin/nexus or `-Dnexus=PATH`.
 
 const std = @import("std");
 
@@ -47,10 +50,32 @@ pub fn build(b: *std.Build) void {
     })).step);
 
     // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
-    const nexus_bin = b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
+    const nexus_bin = b.option([]const u8, "nexus", "the nexus parser generator (default ../nexus/bin/nexus)") orelse
+        b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
     const run_nexus = b.addSystemCommand(&.{ nexus_bin, "nexis.grammar", "src/parser.zig" });
     run_nexus.setCwd(b.path("."));
     b.step("parser", "Regenerate src/parser.zig from nexis.grammar").dependOn(&run_nexus.step);
+    // The committed src/parser.zig against a generation into the cache;
+    // the gate runs it whenever nexus is there to run.
+    const parser_check_step = b.step("parser-check", "Fail when src/parser.zig differs from what nexus generates from nexis.grammar");
+    if (b.build_root.handle.access(b.graph.io, nexus_bin, .{})) |_| {
+        const generate = b.addSystemCommand(&.{nexus_bin});
+        generate.addFileArg(b.path("nexis.grammar"));
+        const generated = generate.addOutputFileArg("parser.zig");
+        generate.addFileInput(.{ .cwd_relative = nexus_bin });
+        generate.expectExitCode(0);
+        _ = generate.captureStdOut(.{});
+        _ = generate.captureStdErr(.{});
+        const compare = b.addSystemCommand(&.{ "sh", "-c", "diff -u \"$1\" \"$2\" >&2 || { echo 'src/parser.zig is stale: run zig build parser' >&2; exit 1; }", "parser-check" });
+        compare.addFileArg(b.path("src/parser.zig"));
+        compare.addFileArg(generated);
+        compare.expectExitCode(0);
+        parser_check_step.dependOn(&compare.step);
+        test_step.dependOn(&compare.step);
+    } else |_| {
+        const skip = b.addSystemCommand(&.{ "echo", b.fmt("parser-check: skipped, no nexus at {s}", .{nexus_bin}) });
+        parser_check_step.dependOn(&skip.step);
+    }
 
     const bins = binaries(b, target, optimize, nexis);
 
