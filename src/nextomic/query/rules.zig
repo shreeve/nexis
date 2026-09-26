@@ -45,6 +45,7 @@ const Ctx = plan_mod.Ctx;
 const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Failure = plan_mod.Failure;
+const Bound = plan_mod.Bound;
 const Relation = relation.Relation;
 
 /// Planner cost of a recursive rule call: after every pattern that
@@ -236,10 +237,10 @@ fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
 
 /// The planner's cost for calling `name`, or null while a required
 /// argument is unbound.
-pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const Var) Failure!?u64 {
+pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *const Bound) Failure!?u64 {
     const defs = try defsOf(ctx, name, args);
     for (args[0..defs[0].required]) |a| {
-        if (a == .variable and !ir.containsVar(bound, a.variable)) return null;
+        if (a == .variable and !bound.has(a.variable)) return null;
     }
     const info = try ctx.ruleInfo();
     if (info.isRecursive(name)) return recursive_cost;
@@ -247,18 +248,18 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
     // bound where the call's arguments are.
     var total: u64 = 0;
     for (defs) |def| {
-        var head_bound: std.ArrayList(Var) = .empty;
+        var head_bound: Bound = .{};
         for (def.head, args) |h, a| {
-            if (a != .variable or ir.containsVar(bound, a.variable)) try head_bound.append(ctx.arena, h);
+            if (a != .variable or bound.has(a.variable)) try head_bound.add(ctx.arena, h);
         }
-        total +|= (try plan_mod.clausesEstimate(ctx, def.body, head_bound.items)) orelse body_cost;
+        total +|= (try plan_mod.clausesEstimate(ctx, def.body, &head_bound)) orelse body_cost;
     }
     return total;
 }
 
 /// Append the steps of a rule call: grounding binds for constant
 /// arguments, then an `or` (non-recursive) or a `fix` (recursive).
-pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *std.ArrayList(Var), steps: *std.ArrayList(Step), rows: *u64) Failure!void {
+pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *Bound, steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
@@ -267,14 +268,14 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
             .constant => |c| blk: {
                 const g = try groundConst(ctx, c);
                 try steps.append(ctx.arena, .{ .bind = .{ .call = g.bind.call, .out = g.bind.out, .fresh = try ctx.arena.dupe(Var, &.{g.bind.out.scalar}) } });
-                try bound.append(ctx.arena, g.bind.out.scalar);
+                try bound.add(ctx.arena, g.bind.out.scalar);
                 break :blk g.bind.out.scalar;
             },
             .src => return ctx.syntax("$ cannot be a rule argument"),
         };
     }
     for (arg_vars[0..defs[0].required]) |v| {
-        if (!ir.containsVar(bound.items, v)) return ctx.syntax("a required rule argument is unbound");
+        if (!bound.has(v)) return ctx.syntax("a required rule argument is unbound");
     }
 
     const info = try ctx.ruleInfo();
@@ -286,12 +287,12 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         }
         var join: std.ArrayList(Var) = .empty;
         for (arg_vars) |v| try ir.addVar(ctx.arena, &join, v);
-        const step = try plan_mod.planOr(ctx, branches, join.items, bound.items, rows.*, name);
-        for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
+        const step = try plan_mod.planOr(ctx, branches, join.items, bound, rows.*, name);
+        for (step.@"or".fresh) |v| try bound.add(ctx.arena, v);
         try steps.append(ctx.arena, step);
     } else {
-        const fix = try planFix(ctx, name, arg_vars, src, bound.items, rows.*);
-        for (fix.fresh) |v| try bound.append(ctx.arena, v);
+        const fix = try planFix(ctx, name, arg_vars, src, bound, rows.*);
+        for (fix.fresh) |v| try bound.add(ctx.arena, v);
         try steps.append(ctx.arena, .{ .fix = fix });
     }
     rows.* = std.math.mul(u64, rows.*, body_cost) catch std.math.maxInt(u64) / 4;
@@ -335,7 +336,7 @@ pub const Fix = struct {
     fresh: []const Var,
 };
 
-fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: []const Var, rows: u64) Failure!Fix {
+fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *const Bound, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
     // The fixpoint only adds rows, which is sound for stratified rules
     // alone: a rule that depends on its own negation has no answer it
@@ -346,7 +347,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: []c
     var pushed: std.ArrayList(usize) = .empty;
     if (members.len == 1) {
         for (arg_vars, 0..) |v, i| {
-            if (ir.containsVar(bound, v) and try passThrough(ctx.arena, ctx.rules, name, i)) try pushed.append(ctx.arena, i);
+            if (bound.has(v) and try passThrough(ctx.arena, ctx.rules, name, i)) try pushed.append(ctx.arena, i);
         }
     }
 

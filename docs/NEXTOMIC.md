@@ -522,6 +522,10 @@ unsatisfiable: it yields nothing and is not an error.
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
+A clause's estimate is taken once and again only after one of its own
+variables is bound, and membership in the bound set is a lookup, so
+ordering n clauses takes O(n) estimates and O(n²) constant-time
+checks.
 A pattern that binds no new variable (`[?e :tags _]` with `?e` bound)
 is an existence test: its seek stops at the first matching datom.
 An `or` costs the sum over its branches of each branch's cheapest
