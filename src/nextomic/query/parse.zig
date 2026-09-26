@@ -62,10 +62,12 @@ pub const Diag = struct {
     attr: ?Value = null,
     /// Backing store of a formatted message, so one that names a
     /// variable outlives the arena of the parse or plan that failed.
-    buf: [160]u8 = undefined,
+    /// The longest template is under 160 bytes, so a message keeps
+    /// every name up to several hundred bytes long whole.
+    buf: [1024]u8 = undefined,
 
-    /// Leave a formatted message for `clause`; a message past the
-    /// buffer is cut.
+    /// Leave a formatted message for `clause`; one past the buffer
+    /// keeps its first 1024 bytes.
     pub fn set(self: *Diag, clause: ?usize, comptime fmt: []const u8, args: anytype) void {
         self.clause = clause;
         self.attr = null;
@@ -1012,6 +1014,14 @@ test "vector form: find specs, in bindings, where clause kinds" {
     try testing.expect(last.e == .constant and last.e.constant == .lookup);
     try testing.expect(last.v == .blank and last.tx == .variable and last.added.constant.cell.boolean);
     try testing.expectEqualStrings("?e", interner.symbolName(parsed.vars[1].sym));
+}
+
+test "a formatted message naming a long variable is kept whole" {
+    var diag: Diag = .{};
+    const name = "?" ++ "v" ** 300;
+    diag.set(3, "or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ 2, name });
+    try testing.expectEqualStrings("or-join branch 2 leaves " ++ name ++ " unbound; every branch binds every join variable", diag.message);
+    try testing.expectEqual(@as(?usize, 3), diag.clause);
 }
 
 test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
