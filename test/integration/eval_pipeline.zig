@@ -4032,6 +4032,14 @@ test "collection-as-function: maps, sets and vectors" {
     try expectOutput("(try (\"s\" 1) (catch any e e))", ":not-callable");
 }
 
+test "integration: a Var calls, and derefs to, the value in force" {
+    try expectOutput("[(#'inc 1) ((var +) 1 2 3) (apply #'max [3 9 4]) (map #'inc [1 2])]", "[2 6 9 (2 3)]");
+    try expectOutput("(def ^:dynamic *f* inc) (binding [*f* dec] [(#'*f* 10) (@#'*f* 10) (*f* 10)])", "[9 9 9]");
+    try expectOutput("(def ^:dynamic *x* 1) (binding [*x* 2] [@#'*x* (deref (var *x*))])", "[2 2]");
+    try expectOutput("(declare later) (try (#'later 1) (catch any e e))", ":unbound-var");
+    try expectOutput("(def n 5) (try (#'n 1) (catch any e e))", ":not-callable");
+}
+
 // =============================================================================
 // Core library completeness (table-driven)
 // =============================================================================

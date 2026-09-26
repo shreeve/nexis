@@ -205,6 +205,9 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
 - `protocol_fn`: dispatched on the first argument's kind or record
   type through the VM's protocol registry (`docs/PROTOCOLS.md`);
   `:no-protocol-impl` on a miss.
+- `var_`: the Var's value in force (the binding under `binding`, else
+  the root) is called with the same arguments, as Clojure's
+  `Var.invoke`; `:unbound-var` while it is unbound.
 - `keyword`, `symbol`, `persistent_map`, `persistent_set`,
   `persistent_vector`, `transient`: a lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
@@ -636,7 +639,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
 | `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
-| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, keyword, symbol, map, set, vector or transient |
+| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map, set, vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
 | `NoThreadBinding` | `:no-thread-binding` | `set!` on a dynamic Var with no binding in force |

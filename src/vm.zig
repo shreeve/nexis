@@ -545,6 +545,14 @@ pub const Var = struct {
     /// (`VM.pushBindings`), written by `set!`, restored by the pop.
     thread_value: Value = value_mod.nilValue(),
     thread_bound: bool = false,
+
+    /// The value in force: the binding under `binding`, else the
+    /// root; null while unbound. A load, a call through the Var and
+    /// `deref` all read this.
+    pub fn current(self: *const Var) ?Value {
+        if (self.thread_bound) return self.thread_value;
+        return if (self.bound) self.root else null;
+    }
 };
 
 /// A namespace mapping symbol names to `*Var`. A VM holds one
@@ -2119,7 +2127,8 @@ pub const VM = struct {
 
     /// Call `callee`, anything but a closure, with `args`, to
     /// completion on the native stack: a native (after its arity
-    /// check), a protocol fn (dispatched on `args[0]`), or a lookup
+    /// check), a protocol fn (dispatched on `args[0]`), a Var (its
+    /// value in force, as Clojure's `Var.invoke`), or a lookup
     /// (`callLookup`). Anything else is `NotCallable`.
     fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
         const overflows = dispatch_mod.overflowCount();
@@ -2136,6 +2145,7 @@ pub const VM = struct {
                 break :blk try native.call(self, args);
             },
             .protocol_fn => try self.dispatchProtocolMethod(callee, args),
+            .var_ => try self.callValue(asVar(callee).current() orelse return VmError.UnboundVar, args),
             else => blk: {
                 if (!isLookupCallable(callee.kind())) {
                     return self.fail(VmError.NotCallable, "{s} is not callable", .{kindPhrase(callee.kind())});
@@ -2432,12 +2442,7 @@ pub const VM = struct {
             .var_ => blk: {
                 const var_table = frame.routine.var_table;
                 if (op.index >= var_table.len) return VmError.OperandOutOfRange;
-                const v = var_table[op.index];
-                // A dynamic Var under `binding` answers with the
-                // binding in force; every other load is the root.
-                if (v.thread_bound) break :blk v.thread_value;
-                if (!v.bound) return VmError.UnboundVar;
-                break :blk v.root;
+                break :blk var_table[op.index].current() orelse VmError.UnboundVar;
             },
             // Kinds no opcode reads through `resolve`.
             .intern, .jump, .durable => VmError.UnimplementedOpcode,

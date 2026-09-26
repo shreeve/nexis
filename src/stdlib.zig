@@ -3204,11 +3204,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
             const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
             break :blk result orelse value_mod.nilValue();
         },
-        .var_ => blk: {
-            const var_obj = vm_mod.VM.asVar(x);
-            if (!var_obj.bound) return VmError.UnboundVar;
-            break :blk var_obj.root;
-        },
+        .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
         .atom => atom_mod.getValue(x),
         .record => if (isReduced(vm, x)) reducedValue(x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
