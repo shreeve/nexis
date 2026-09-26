@@ -37,7 +37,6 @@ const db_mod = @import("db.zig");
 const codec_mod = @import("codec.zig");
 const heap_mod = @import("heap.zig");
 const dispatch_mod_alias = @import("dispatch.zig");
-const emdb_mod = @import("emdb");
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
 const format_mod = @import("format.zig");
@@ -3223,75 +3222,56 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 // (the key model of `db/ref`). Each value is fully decoded onto
 // the heap before the cursor advances. Results are eager.
 
-/// A cursor over one named tree inside an active transaction.
-const TreeCursor = struct {
-    cursor: emdb_mod.Cursor,
+/// Start `walk` over `tree_name` in `txn`; false for an absent tree,
+/// which every caller treats as empty.
+fn beginWalk(vm: *VM, walk: *db_mod.Walk, txn: ActiveTxn, tree_name: []const u8) VmError!bool {
+    return switch (txn) {
+        inline else => |h| walk.begin(&h.txn, tree_name),
+    } catch |err| dbFailure(vm, err);
+}
 
-    /// Open a cursor on `tree_name`. Null when the tree does not
-    /// exist, which every caller treats as an empty tree.
-    fn open(vm: *VM, txn: ActiveTxn, tree_name: []const u8) VmError!?TreeCursor {
-        db_mod.validateTreeName(tree_name) catch |err| return dbFailure(vm, err);
-        switch (txn) {
-            inline else => |h| {
-                const tree_id = (db_mod.treeId(&h.txn, tree_name, false) catch |err| return dbFailure(vm, err)) orelse return null;
-                const cursor = h.txn.inner.openCursorForTree(tree_id) catch |err| return dbFailure(vm, err);
-                return .{ .cursor = cursor };
-            },
-        }
-    }
-
-    /// The value of `kv`, decoded onto the heap. The cursor returns
-    /// a multi-page value whole, assembled in the transaction's
-    /// buffer, so it is decoded before the cursor moves.
-    fn decode(_: *TreeCursor, vm: *VM, kv: emdb_mod.Cursor.KeyValue) VmError!Value {
-        return codec_mod.decode(
-            vm.ensureHeap(),
-            vm.ensureInterner(),
-            kv.value,
-            &dispatch_mod_alias.hashValue,
-            &dispatch_mod_alias.equal,
-        ) catch |err| return dbFailure(vm, err);
-    }
-};
+/// An entry's value, decoded onto the heap before the walk moves on.
+fn decodeEntry(vm: *VM, kv: db_mod.Walk.Entry) VmError!Value {
+    return codec_mod.decode(
+        vm.ensureHeap(),
+        vm.ensureInterner(),
+        kv.value,
+        &dispatch_mod_alias.hashValue,
+        &dispatch_mod_alias.equal,
+    ) catch |err| return dbFailure(vm, err);
+}
 
 fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const tree_v = args[1];
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
     const interner = vm.ensureInterner();
-    const tree_id: u32 = @intCast(tree_v.payload);
-    const tree_name = interner.keywordName(tree_id);
+    const tree_name = interner.keywordName(@intCast(tree_v.payload));
 
     // Optional range bounds: a keyword or symbol, whose name is the
     // key's bytes.
     const start_bytes: ?[]const u8 = if (args.len >= 3) try boundBytes(vm, args[2]) else null;
     const end_bytes: ?[]const u8 = if (args.len >= 4) try boundBytes(vm, args[3]) else null;
 
-    var tc = (try TreeCursor.open(vm, try activeTxn(tx_v), tree_name)) orelse {
+    var walk: db_mod.Walk = undefined;
+    if (!try beginWalk(vm, &walk, try activeTxn(tx_v), tree_name)) {
         return vector_mod.fromSlice(vm.ensureHeap(), &.{}) catch VmError.OutOfMemory;
-    };
+    }
+    defer walk.end();
 
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(vm.allocator);
 
-    // Seek to the first key >= start (or the first key).
-    var maybe_kv: ?emdb_mod.Cursor.KeyValue = if (start_bytes) |sb| tc.cursor.setRange(sb) else tc.cursor.first();
-
-    while (maybe_kv) |kv| {
-        // End-exclusive check.
+    var maybe_kv = walk.first(start_bytes);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
         if (end_bytes) |eb| {
             if (std.mem.order(u8, kv.key, eb) != .lt) break;
         }
-        // Decode value (Heap-owned) and intern key (interner-owned).
-        // Both are stable past the next cursor advance.
-        const decoded_v = try tc.decode(vm, kv);
+        const decoded_v = try decodeEntry(vm, kv);
         const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
-        const key_v = value_mod.fromKeywordId(key_id);
-        // Build [key value] 2-vector.
-        const pair = [_]Value{ key_v, decoded_v };
+        const pair = [_]Value{ value_mod.fromKeywordId(key_id), decoded_v };
         const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
         entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
-        maybe_kv = tc.cursor.next();
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
@@ -3312,6 +3292,9 @@ fn fnDbSnapshotQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(h.active);
 }
 
+/// `(db/reduce-tree tx tree f init)`: `(f acc key value)` over the
+/// tree as it was when the walk began, whatever `f` writes to it
+/// (DB.md §12). Rooting class 2 (GC.md §11.5).
 fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const tree_v = args[1];
@@ -3319,24 +3302,21 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     var acc = args[3];
     if (tree_v.kind() != .keyword) return VmError.KindMismatch;
     const interner = vm.ensureInterner();
-    const tree_id: u32 = @intCast(tree_v.payload);
-    const tree_name = interner.keywordName(tree_id);
+    const tree_name = interner.keywordName(@intCast(tree_v.payload));
 
-    // No such tree: the init value, unchanged.
     const txn = try activeTxn(tx_v);
-    var tc = (try TreeCursor.open(vm, txn, tree_name)) orelse return acc;
+    var walk: db_mod.Walk = undefined;
+    if (!try beginWalk(vm, &walk, txn, tree_name)) return acc;
+    defer walk.end();
     txn.hold();
     defer txn.release();
 
-    var maybe_kv: ?emdb_mod.Cursor.KeyValue = tc.cursor.first();
-    while (maybe_kv) |kv| {
-        const decoded_v = try tc.decode(vm, kv);
+    var maybe_kv = walk.first(null);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
+        const decoded_v = try decodeEntry(vm, kv);
         const key_id = interner.internKeyword(kv.key) catch return VmError.OutOfMemory;
-        const key_v = value_mod.fromKeywordId(key_id);
-        // (f acc key value)
-        const call_args = [_]Value{ acc, key_v, decoded_v };
+        const call_args = [_]Value{ acc, value_mod.fromKeywordId(key_id), decoded_v };
         acc = try vm.callValue(f, &call_args);
-        maybe_kv = tc.cursor.next();
     }
     return acc;
 }

@@ -81,10 +81,18 @@ loads a tree the first time it touches it; later operations on that
 tree in the same transaction are a bit test. A tree registered by an
 aborted transaction stays registered and reads as empty.
 
-**Cursor values are whole.** An emdb cursor returns a multi-page value
-assembled in the transaction's buffer, valid until the next multi-page
-read on that transaction; `db/scan` and `db/reduce-tree` decode each
-entry before advancing.
+**Walks.** `db/scan` and `db/reduce-tree` walk a tree with a `Walk`,
+an emdb cursor that decodes each entry before advancing: a multi-page
+value is assembled in the transaction's buffer, valid until the next
+multi-page read on that transaction. emdb leaves undefined what a
+cursor sees once its own tree is written under it, so a walk over a
+write transaction registers on it, and a `put` or `del` to the walked
+tree first copies the entries the walk has yet to visit, keys and
+values, onto the connection's allocator. The walk then goes on over
+the copy: it sees the tree as it was when it began, as a Clojure
+`reduce` never sees its own updates. A walk nothing writes under copies
+nothing; one whose callback writes its tree pays one copy of the rest
+of the tree, at the first such write.
 
 **Closing.** `close` releases the `StoreFile` and leaves the struct in place
 with the open flag false: a ref, transaction handle or connection
@@ -170,6 +178,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `put(*WriteTxn, tree, key, value) !void` | Encodes `value` (CODEC.md) under the opaque `key` bytes; creates the tree. |
 | `get(txn, tree, key, elementHash, elementEq) !?Value` | Either transaction kind; null when the key or the tree is absent. |
 | `del(*WriteTxn, tree, key) !bool` | Whether the key existed. |
+| `Walk.begin(*Walk, txn, tree) !bool` / `first(?start)` / `next()` / `end()` | A walk (§3); `begin` is false for an absent tree. |
 | `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
 | `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
 | `refStoreId` / `refTreeName` / `refKeyBytes` / `refConn` | The ref's fields. |
@@ -287,8 +296,10 @@ in `src/db.zig` pin the canonical store id, the pinned geometry, the
 refusal of a hard-linked file, close refused while a transaction is
 open, the tree-handle cache,
 `ConnectionUnavailable`, `StoreMismatch` and the invalid names. The
-language surface runs in `test/integration/eval_pipeline.zig`,
-`test/integration/runtime_polish.zig` and `examples/durable-refs.nx`.
+language surface runs in `test/integration/eval_pipeline.zig` (among
+them a `db/reduce-tree` whose callback writes, deletes and walks the
+tree under it), `test/integration/runtime_polish.zig` and
+`examples/durable-refs.nx`.
 
 ---
 
@@ -336,7 +347,7 @@ and any operation on a closed connection or through a ref of one is
 | `(db/delete! tx ref)` | 2 | Whether the key existed. |
 | `(db/alter! tx ref f & args)` | 3+ | Writes and returns `(apply f current args)`, `current` nil when absent; when `f` throws, nothing is written. |
 | `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, keys as keywords; `start` inclusive, `end` exclusive, each a keyword or symbol. An absent tree is `[]`. |
-| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order; `init` for an absent tree. |
+| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order, as it was when the walk began whatever `f` writes to it (§3); `init` for an absent tree. |
 | `(db/snapshot conn)` / `(db/release-snapshot! snap)` | 1 | `db/begin-read` and `db/abort-read!` under the snapshot names. |
 | `(db/snapshot? x)` | 1 | Whether `x` is a read transaction not yet released. |
 | `(with-tx [tx conn] body…)` | macro | Begins a write, commits after body and returns its value; when body throws, aborts and rethrows. |
@@ -349,8 +360,9 @@ walks: `db/commit!`, `db/abort-write!`, `db/abort-read!` and
 `db/release-snapshot!` of a held handle are `:db/busy`, so no callback
 finishes a transaction a native is still using. A throw from the
 callback ends the hold before it propagates, so `with-tx` aborts as
-usual; reads and writes through the handle, a nested `db/alter!`
-included, are allowed.
+usual; reads and writes through the handle, a nested `db/alter!` or
+`db/reduce-tree` included, are allowed. `db/scan` is eager and calls
+nothing back.
 
 A read transaction sees the store as of when it began and nothing
 committed after. A held snapshot keeps emdb from reclaiming the pages

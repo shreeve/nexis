@@ -157,7 +157,8 @@ path is one store (a file with a second hard link is refused), and a
 second writer on it is `:db/busy`
 (`:nextomic/nested` in Nextomic), never a deadlock (`docs/DB.md`
 §3.1). It pins `pageSize = 16384` and `maxNamedTrees = 128`, resolves
-tree ids once per connection, reads values whole off cursors, holds
+tree ids once per connection, reads values whole off cursors, lets a
+walk see its tree as it began whatever its callback writes, holds
 the transaction a `db/alter!` or `db/reduce-tree` callback runs in so
 the callback cannot finish it, and names every engine failure as a
 `:db/*` keyword (`docs/DB.md`).
@@ -385,19 +386,13 @@ failing test (AGENTS.md).
 
 ### 6.3 Storage
 
-1. **Writes to a tree during `db/reduce-tree` over it**: the callback
-   may write through the held transaction, and emdb does not specify
-   what a cursor sees after its own tree is written under it. Next:
-   refuse writes to the walked tree while the walk holds the
-   transaction (`:db/busy`), or walk a copy of the keys, with a test
-   that writes during a reduce.
-2. **The environment lives on the first opener's allocator**:
+1. **The environment lives on the first opener's allocator**:
    `db/open` leaves emdb's default, `page_allocator`, so an
    environment `db/open` opened allocates its small objects a page at
    a time, while one Nextomic opened first uses the VM's allocator.
    Next: pass `vm.allocator` from `db/open` (it outlives every
    connection), measured with `zig build bench -- --filter db-integrated`.
-3. **Engine bounds surface as bare keywords**: a `db/*` key past
+2. **Engine bounds surface as bare keywords**: a `db/*` key past
    4078 bytes, a stored value past just under 1 GiB and a file's 129th
    named tree are `:db/key-too-large`, `:db/value-too-large` and
    `:db/max-trees`, which name the bound but not its value or the
@@ -470,9 +465,8 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 1): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. Transaction handles dropped open (§6.1 item 4), writes during
-   `db/reduce-tree` (§6.3 item 1), and out of memory as a runtime
-   error (§6.1 item 6).
+2. Transaction handles dropped open (§6.1 item 4) and out of memory
+   as a runtime error (§6.1 item 6).
 3. The parser regeneration check and a Linux run (§6.4).
 4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first

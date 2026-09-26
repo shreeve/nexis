@@ -16,6 +16,7 @@
 //!     key_bytes) and an advisory non-identity `conn: ?*Connection`
 //!     pointer.
 //!   - `WriteTxn` / `ReadTxn` wrappers around `emdb.Txn`.
+//!   - `Walk`: a tree walk that a write under it cannot disturb.
 //!   - `put` / `get` / `del` by `(tree_name, key_bytes, value)` —
 //!     keys are **opaque byte slices**, values
 //!     are codec-encoded via `src/codec.zig`.
@@ -23,8 +24,8 @@
 //!   - Per-kind hash / equality / trace helpers consumed by
 //!     `src/dispatch.zig` and `src/gc.zig`.
 //!
-//! Scope (DB.md §1): explicit-transaction primitives only. No
-//! `alter!`, no cursors, no as-of, no with-tx macro live here.
+//! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
+//! no as-of, no with-tx macro live here.
 //!
 //! Module graph (one-way terminal):
 //!
@@ -375,6 +376,9 @@ pub const WriteTxn = struct {
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
     opened: TreeSet = TreeSet.initEmpty(),
+    /// Walks in progress over this transaction's trees; a write to a
+    /// walked tree copies what the walk has yet to visit first.
+    walks: ?*Walk = null,
 };
 
 pub const ReadTxn = struct {
@@ -417,6 +421,110 @@ pub fn abortWrite(txn: *WriteTxn) void {
 pub fn abortRead(txn: *ReadTxn) void {
     txn.conn.open_txns -= 1;
     txn.inner.abort();
+}
+
+// =============================================================================
+// Tree walks (DB.md §12)
+// =============================================================================
+
+/// A walk over one named tree of a transaction in key order: `db/scan`
+/// and `db/reduce-tree`. emdb leaves undefined what a cursor sees once
+/// its own tree is written under it, so a write through the
+/// transaction to a tree being walked first copies the entries the
+/// walk has yet to visit (`WriteTxn.walks`): the walk sees the tree as
+/// it was when it began, whatever its callback writes, and a walk no
+/// callback writes under copies nothing. A walk lives on its caller's
+/// stack between `begin` and `end`.
+pub const Walk = struct {
+    cursor: emdb.Cursor,
+    tree: emdb.TreeId,
+    allocator: std.mem.Allocator,
+    /// The write transaction the walk is registered on.
+    owner: ?*WriteTxn,
+    next_walk: ?*Walk = null,
+    /// The entries still to visit once the tree was written: key and
+    /// value bytes back to back, and where each key and value ends.
+    rest: ?struct {
+        bytes: std.ArrayList(u8) = .empty,
+        ends: std.ArrayList([2]usize) = .empty,
+        at: usize = 0,
+    } = null,
+
+    pub const Entry = emdb.Cursor.KeyValue;
+
+    /// Start a walk over `tree_name` in `txn` (a `*WriteTxn` or
+    /// `*ReadTxn`); false when the tree does not exist, and then no
+    /// `end` is due.
+    pub fn begin(self: *Walk, txn: anytype, tree_name: []const u8) !bool {
+        try validateTreeName(tree_name);
+        const id = (try treeId(txn, tree_name, false)) orelse return false;
+        self.* = .{
+            .cursor = try txn.inner.openCursorForTree(id),
+            .tree = id,
+            .allocator = txn.conn.allocator,
+            .owner = null,
+        };
+        if (@TypeOf(txn) == *WriteTxn) {
+            self.owner = txn;
+            self.next_walk = txn.walks;
+            txn.walks = self;
+        }
+        return true;
+    }
+
+    pub fn end(self: *Walk) void {
+        if (self.owner) |w| {
+            var link = &w.walks;
+            while (link.*) |x| : (link = &x.next_walk) {
+                if (x == self) {
+                    link.* = self.next_walk;
+                    break;
+                }
+            }
+        }
+        if (self.rest) |*r| {
+            r.bytes.deinit(self.allocator);
+            r.ends.deinit(self.allocator);
+        }
+    }
+
+    /// The first entry, or the first at or after `start`.
+    pub fn first(self: *Walk, start: ?[]const u8) ?Entry {
+        return if (start) |s| self.cursor.setRange(s) else self.cursor.first();
+    }
+
+    pub fn next(self: *Walk) ?Entry {
+        const r = if (self.rest) |*r| r else return self.cursor.next();
+        if (r.at == r.ends.items.len) return null;
+        const from = if (r.at == 0) 0 else r.ends.items[r.at - 1][1];
+        const e = r.ends.items[r.at];
+        r.at += 1;
+        return .{ .key = r.bytes.items[from..e[0]], .value = r.bytes.items[e[0]..e[1]] };
+    }
+
+    /// Copy what the cursor has yet to visit, before the tree changes
+    /// under it. Each value is copied before the cursor moves: a
+    /// multi-page value lives in the transaction's buffer until the
+    /// next multi-page read.
+    fn copyRest(self: *Walk) !void {
+        self.rest = .{};
+        const r = &self.rest.?;
+        while (self.cursor.next()) |kv| {
+            try r.bytes.appendSlice(self.allocator, kv.key);
+            const key_end = r.bytes.items.len;
+            try r.bytes.appendSlice(self.allocator, kv.value);
+            try r.ends.append(self.allocator, .{ key_end, r.bytes.items.len });
+        }
+    }
+};
+
+/// Before `txn` writes tree `id`: every walk over it copies what it
+/// has yet to visit.
+fn beforeWrite(txn: *WriteTxn, id: emdb.TreeId) !void {
+    var it = txn.walks;
+    while (it) |w| : (it = w.next_walk) {
+        if (w.tree == id and w.rest == null) try w.copyRest();
+    }
 }
 
 // =============================================================================
@@ -480,6 +588,7 @@ pub fn put(
     // codec buffer.
     const encoded = try codec_mod.encode(txn.conn.allocator, txn.conn.interner, v);
     defer txn.conn.allocator.free(encoded);
+    try beforeWrite(txn, tree_id);
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
@@ -538,6 +647,7 @@ pub fn del(
 ) !bool {
     try validateTreeNameAndKey(tree_name, key_bytes);
     const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
+    try beforeWrite(txn, tree_id);
     return try txn.inner.delFromTree(tree_id, key_bytes);
 }
 

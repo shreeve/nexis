@@ -2587,6 +2587,27 @@ test "db/close: refused while a transaction of the connection is open" {
     , "[:db/busy nil :db/busy nil nil :tx-closed]");
 }
 
+test "db/reduce-tree walks the tree as it was when the walk began, whatever the callback writes to it" {
+    try expectOutputProgramWithStore("walk-writes",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (with-tx [tx c] (dotimes [i 300] (db/put! tx (db/ref c :t (str "k" (+ 100 i))) i)))
+        \\  (with-tx [tx c]
+        \\    [(db/reduce-tree tx :t
+        \\       (fn [acc k v]
+        \\         (db/put! tx (db/ref c :t (str (name k) "x")) v)
+        \\         (db/delete! tx (db/ref c :t "k399"))
+        \\         (db/alter! tx (db/ref c :t "k100") inc)
+        \\         (when (= k :k100)
+        \\           (db/reduce-tree tx :t (fn [a k v] (db/put! tx (db/ref c :t (str (name k) "y")) v) a) nil))
+        \\         (+ acc v))
+        \\       0)
+        \\     (count (db/scan tx :t))
+        \\     (db/get tx (db/ref c :t "k100"))
+        \\     (db/get tx (db/ref c :t "k399"))]))
+    , "[44850 899 300 nil]");
+}
+
 test "db: a callback cannot finish the transaction db/alter! or db/reduce-tree is running it in" {
     try expectOutputProgramWithStore("held-tx",
         \\(do
