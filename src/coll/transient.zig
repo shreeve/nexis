@@ -579,15 +579,19 @@ test "in place: a vector transient's conj! fills its owned tail without allocati
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const t = try transientFrom(&heap, try vector.fromSlice(&heap, &.{value.fromFixnum(0).?}));
-    _ = try vectorConjBang(&heap, t, value.fromFixnum(1).?);
+    // The 33rd element starts a tail with room for a leaf.
+    for (1..33) |i| _ = try vectorConjBang(&heap, t, value.fromFixnum(@intCast(i)).?);
     const live = heap.liveCount();
-    for (2..32) |i| _ = try vectorConjBang(&heap, t, value.fromFixnum(@intCast(i)).?);
+    for (33..64) |i| _ = try vectorConjBang(&heap, t, value.fromFixnum(@intCast(i)).?);
+    _ = try vectorAssocBang(&heap, t, 40, value.fromFixnum(-40).?);
     _ = try vectorAssocBang(&heap, t, 5, value.fromFixnum(-5).?);
     _ = try vectorPopBang(&heap, t);
+    // The leaf and the trie are the transient's own: nothing copied.
     try testing.expectEqual(live, heap.liveCount());
     const v = try persistentBang(t);
-    try testing.expectEqual(@as(usize, 31), vector.count(v));
+    try testing.expectEqual(@as(usize, 63), vector.count(v));
     try testing.expectEqual(@as(i64, -5), vector.nth(v, 5).asFixnum());
+    try testing.expectEqual(@as(i64, -40), vector.nth(v, 40).asFixnum());
 }
 
 test "in place: a map transient's assoc! over a key it holds allocates nothing" {

@@ -18,13 +18,14 @@ transient's; any other node may be shared with persistent
 collections. An edit writes the root and the nodes it owns in place,
 and copies any other node on its path once, stamping the copy with
 the token, before writing it (Clojure's `ensureEditable`). A vector
-transient appends into a tail with room for 32 elements, pushes a full
-tail into the trie as a leaf, and writes a leaf or interior it owns
+transient appends into a tail it owns while it has room, copying it
+into a block twice the size when it has none, as `conj` does
+(VECTOR.md §2), pushes a full tail into the trie as a leaf, starting
+the next with room for 32, and writes a leaf or interior it owns
 directly; a map or set transient replaces a value where it lies,
 inserts a payload into an owned node that has room in its block
-(`Heap.resizeInPlace`, `docs/HEAP.md` §3), and gives a node it
-allocates two payloads of spare room so the next inserts land in
-place. A persistent collection never changes: no transient owns a node
+(`Heap.resizeInPlace`, `docs/HEAP.md` §3), and gives a node it grows
+two payloads of spare room so the next inserts land in place. A persistent collection never changes: no transient owns a node
 it can reach.
 
 The layout a transient builds is the one the persistent operations

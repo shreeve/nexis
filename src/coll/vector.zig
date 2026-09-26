@@ -154,8 +154,8 @@ inline fn grownCapacity(len: usize) usize {
 // =============================================================================
 
 // Every accessor reads a node's shape from the root, never from the
-// block's size: a tail a transient owns has room for 32 elements
-// whatever `tail_len` says (VECTOR.md §2).
+// block's size: vectors share tails with room past their elements
+// (VECTOR.md §2).
 
 inline fn rootBody(h: *HeapHeader) *RootBody {
     return Heap.bodyOf(RootBody, h);
@@ -457,10 +457,10 @@ fn editable(heap: *Heap, node: *HeapHeader, edit: u32, size: usize) !*HeapHeader
     return copy;
 }
 
-/// A tail the edit owns, with room for 32 elements, holding `len`
-/// elements of `from`.
-fn ownedTail(heap: *Heap, from: []const Value, edit: u32) !*HeapHeader {
-    const t = try allocLeaf(heap);
+/// A tail the edit owns, with room for `capacity` elements, holding
+/// the elements of `from`.
+fn ownedTail(heap: *Heap, from: []const Value, capacity: usize, edit: u32) !*HeapHeader {
+    const t = try allocTail(heap, capacity);
     heap_mod.stampEdit(t, edit);
     @memcpy(leafValues(t)[0..from.len], from);
     return t;
@@ -484,7 +484,10 @@ pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
 pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void {
     const body = rootBody(root);
     if (body.tail_len < branch_factor) {
-        const tail = if (body.tail_node) |t| (if (heap_mod.ownedBy(t, edit)) t else try ownedTail(heap, tailOf(body), edit)) else try ownedTail(heap, &.{}, edit);
+        // An owned tail with room takes the element; else an owned copy
+        // with room to grow, as `conj` sizes one (VECTOR.md §2).
+        const room = if (body.tail_node) |t| heap_mod.ownedBy(t, edit) and body.tail_len < tailCapacity(t) else false;
+        const tail = if (room) body.tail_node.? else try ownedTail(heap, tailOf(body), grownCapacity(body.tail_len + 1), edit);
         leafValues(tail)[body.tail_len] = elem;
         body.tail_node = tail;
         body.tail_len += 1;
@@ -493,7 +496,7 @@ pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void
     }
     // A full tail joins the trie as a leaf, owned or not, and a new
     // owned tail starts.
-    const new_tail = try ownedTail(heap, &.{elem}, edit);
+    const new_tail = try ownedTail(heap, &.{elem}, branch_factor, edit);
     const leaf = body.tail_node.?;
     const leaf_base: u32 = body.count - @as(u32, branch_factor);
     if (body.root_node == null or body.count > capacityAtShift(body.shift)) {
@@ -543,7 +546,7 @@ pub fn assocInPlace(heap: *Heap, root: *HeapHeader, i: usize, elem: Value, edit:
     const tail_offset: usize = body.count - body.tail_len;
     if (i >= tail_offset) {
         const t = body.tail_node.?;
-        const tail = if (heap_mod.ownedBy(t, edit)) t else try ownedTail(heap, tailOf(body), edit);
+        const tail = if (heap_mod.ownedBy(t, edit)) t else try ownedTail(heap, tailOf(body), grownCapacity(body.tail_len), edit);
         leafValues(tail)[i - tail_offset] = elem;
         body.tail_node = tail;
         return;

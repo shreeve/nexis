@@ -268,17 +268,18 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             return h;
         }
 
-        /// Room a node an edit allocates keeps past its body, so the
-        /// next payloads it gains land in place (TRANSIENT.md §1).
+        /// Room a node an edit grows keeps past its body, so the next
+        /// payloads it gains land in place (TRANSIENT.md §1). A node
+        /// an edit makes at its final size (a copy, a split's pair)
+        /// keeps none.
         const edit_slack = 2 * @sizeOf(P);
 
-        /// A node of `size` body bytes; one an edit allocates (`edit`
-        /// nonzero) carries the edit's token and `edit_slack` spare
-        /// bytes.
-        fn allocNode(heap: *Heap, size: usize, edit: u32) !*HeapHeader {
+        /// A node of `size` body bytes with `spare` more bytes of room;
+        /// one an edit allocates (`edit` nonzero) carries its token.
+        fn allocNode(heap: *Heap, size: usize, edit: u32, spare: usize) !*HeapHeader {
             if (edit == 0) return heap.alloc(kind, size);
-            const h = try heap.alloc(kind, size + edit_slack);
-            _ = Heap.resizeInPlace(h, size);
+            const h = try heap.alloc(kind, size + spare);
+            if (spare > 0) _ = Heap.resizeInPlace(h, size);
             heap_mod.stampEdit(h, edit);
             return h;
         }
@@ -289,16 +290,16 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 @as(usize, @popCount(node_bitmap)) * @sizeOf(*HeapHeader);
         }
 
-        fn allocInterior(heap: *Heap, data_bitmap: u32, node_bitmap: u32, edit: u32) !*HeapHeader {
+        fn allocInterior(heap: *Heap, data_bitmap: u32, node_bitmap: u32, edit: u32, spare: usize) !*HeapHeader {
             std.debug.assert(data_bitmap & node_bitmap == 0);
-            const h = try allocNode(heap, interiorSize(data_bitmap, node_bitmap), edit);
+            const h = try allocNode(heap, interiorSize(data_bitmap, node_bitmap), edit, spare);
             headerOf(InteriorHeader, h).* = .{ .data_bitmap = data_bitmap, .node_bitmap = node_bitmap };
             return h;
         }
 
         fn allocCollision(heap: *Heap, shared_hash: u32, n: usize, edit: u32) !*HeapHeader {
             std.debug.assert(n >= 2);
-            const h = try allocNode(heap, @sizeOf(CollisionHeader) + n * @sizeOf(P), edit);
+            const h = try allocNode(heap, @sizeOf(CollisionHeader) + n * @sizeOf(P), edit, 0);
             headerOf(CollisionHeader, h).* = .{ .shared_hash = shared_hash, .count = @intCast(n) };
             return h;
         }
@@ -490,11 +491,11 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const sb = slotOf(hb, shift);
             if (sa == sb) {
                 const below = try pair(heap, a, ha, b, hb, shift + branch_bits, edit);
-                const h = try allocInterior(heap, 0, bitOf(sa), edit);
+                const h = try allocInterior(heap, 0, bitOf(sa), edit, 0);
                 children(h)[0] = below;
                 return h;
             }
-            const h = try allocInterior(heap, bitOf(sa) | bitOf(sb), 0, edit);
+            const h = try allocInterior(heap, bitOf(sa) | bitOf(sb), 0, edit, 0);
             payloads(h)[@intFromBool(sa > sb)] = a;
             payloads(h)[@intFromBool(sb > sa)] = b;
             return h;
@@ -575,7 +576,8 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         /// A copy of interior `src` with `slot` holding `new`: the one
         /// path-copy primitive every insert and remove goes through.
-        /// An edit's copy carries its token (`allocNode`).
+        /// An edit's copy carries its token and room to grow: an edit
+        /// copies a node here only to add a payload (`insertData`).
         inline fn withSlot(heap: *Heap, src: *HeapHeader, slot: u32, new: Slot, edit: u32) !*HeapHeader {
             const hdr = headerOf(InteriorHeader, src).*;
             const bit = bitOf(slot);
@@ -586,7 +588,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 .data => data |= bit,
                 .child => nodes |= bit,
             }
-            const h = try allocInterior(heap, data, nodes, edit);
+            const h = try allocInterior(heap, data, nodes, edit, if (edit == 0) 0 else edit_slack);
             const put_data: ?P = switch (new) {
                 .data => |p| p,
                 else => null,
@@ -713,7 +715,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 const node = spot.path[k];
                 if (heap_mod.ownedBy(node, edit)) continue;
                 const size = Heap.bodySize(node);
-                const copy = try allocNode(heap, size, edit);
+                const copy = try allocNode(heap, size, edit, 0);
                 @memcpy(Heap.bodyBytes(copy), Heap.bodyBytes(node));
                 relink(root, spot, k, copy);
             }
@@ -809,7 +811,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const n = hdr.count;
             const size = @sizeOf(CollisionHeader) + (n + 1) * @sizeOf(P);
             const target = if (heap_mod.ownedBy(node, edit) and Heap.resizeInPlace(node, size)) node else blk: {
-                const copy = try allocNode(heap, size, edit);
+                const copy = try allocNode(heap, size, edit, edit_slack);
                 @memcpy(Heap.bodyBytes(copy)[0..Heap.bodySize(node)], Heap.bodyBytes(node));
                 break :blk copy;
             };
@@ -932,7 +934,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 .data => data |= bit,
                 .child => nodes |= bit,
             }
-            const target = if (Heap.resizeInPlace(node, interiorSize(data, nodes))) node else try allocInterior(heap, data, nodes, edit);
+            const target = if (Heap.resizeInPlace(node, interiorSize(data, nodes))) node else try allocInterior(heap, data, nodes, edit, edit_slack);
             headerOf(InteriorHeader, target).* = .{ .data_bitmap = data, .node_bitmap = nodes };
             const put_data: ?P = switch (new) {
                 .data => |p| p,
@@ -985,7 +987,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 if (j - i == 1) data |= bitOf(slot) else nodes |= bitOf(slot);
                 i = j;
             }
-            const h = try allocInterior(heap, data, nodes, edit);
+            const h = try allocInterior(heap, data, nodes, edit, 0);
             i = 0;
             while (i < items.len) {
                 const slot = slotOf(items[i].hash, shift);

@@ -324,10 +324,10 @@ hash and comparison and changing nothing, and returns a `MapSpot` or
 `mapPut`/`setPut` then stores, or `mapDrop`/`setDrop` removes, at that
 spot in a collection whose root the edit owns, and return the root
 afterwards. They rewrite the nodes whose header `hash` holds the edit
-token and copy any other node on the path, stamping the copy; a node
-an edit allocates keeps two payloads of spare room in its block, and
-an insert into an owned node grows it in place when its block has room
-(`Heap.resizeInPlace`). The result has the layout `mapAssoc` and
+token and copy any other node on the path, stamping the copy; an
+insert into an owned node grows it in place when its block has room
+(`Heap.resizeInPlace`), and a node an edit grows into a new block
+keeps two payloads of spare room there. The result has the layout `mapAssoc` and
 `mapDissoc` give (§2.2, §5.3-§5.6). `copyRoot` copies a root for a
 transient to own.
 
