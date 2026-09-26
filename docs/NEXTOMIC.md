@@ -556,8 +556,15 @@ A variable only a predicate, a function, a `not` or an `or-join` reads
 is dropped once that clause has run, so a relation holds the variables
 still in use rather than every variable bound so far: an n-clause chain
 `[?x0 :next ?x1] ... [?xn-1 :next ?xn]` finding `?x0 ?xn` keeps two
-columns between steps, not n. `explain` ends a step's line with the
-variables dropped after it (`drop ?x1`).
+columns between steps, not n. A variable only the caller asks for,
+which no later step reads, is still carried; once four such are held
+with two steps still to run, the relation parks them: they leave it for
+one column of row numbers into the rows that held them (the previous
+park's column among them), and the plan's end puts them back. The same
+chain finding every `?xi` then carries at most five columns, and its
+cost grows with the rows times the clauses, not times their square.
+`explain` ends a step's line with the variables dropped after it (`drop
+?x1`) and the ones it parks (`park ?x0 ?x1 ?x2 ?x3 -> ?row`).
 
 **Sources.** A query without `:in` reads `[$]`. `:in` binds data
 sources, `$` or any `$name` (`:in $db ?x`), positional like every

@@ -19,8 +19,10 @@
 //!     constant-prefix scan runs once per query for each source, index
 //!     and shape, and keeps the hash indexes joins build over it.
 //!   - Each step's result leaves out the variables `Plan.drop` names
-//!     for it; a step that keeps every row of its input, in order,
-//!     lends that input's columns rather than copying them.
+//!     for it and sets aside the ones `Plan.park` names, which come
+//!     back after the last step; a step that keeps every row of its
+//!     input, in order, lends that input's columns rather than copying
+//!     them.
 //!   - Built-in predicates and functions are Zig over cells; any other
 //!     symbol goes to the `CallHook` with VM values, as does the value
 //!     of a variable in function position, and its errors propagate
@@ -111,11 +113,26 @@ pub const Exec = struct {
     /// that reads the same datoms (`Scanned`).
     scans: std.ArrayList(Scanned) = .empty,
 
-    /// Run `p` from `input`, which binds at least `p.input`.
+    /// Run `p` from `input`, which binds at least `p.input`. A parked
+    /// relation (`plan.Park`) keeps the columns it set aside, and its
+    /// row numbers put them back after the last step, latest park first.
     pub fn runPlan(self: *Exec, p: *const Plan, input: Relation) anyerror!Relation {
         try stack.check();
+        const Parked = struct { row: Var, rel: Relation };
+        var parked: std.ArrayList(Parked) = .empty;
         var rel = input;
-        for (p.steps, p.drop) |*s, drop| rel = try self.step(s, rel, drop);
+        for (p.steps, p.drop, p.park) |*s, drop, park| {
+            rel = try self.step(s, rel, drop);
+            const pk = park orelse continue;
+            try parked.append(self.arena, .{ .row = pk.row, .rel = try rel.pick(pk.vars) });
+            rel = try (try rel.without(pk.vars)).beside(&(try Relation.rowNumbers(self.arena, pk.row, rel.rows)));
+        }
+        while (parked.pop()) |pk| {
+            const numbers = &rel.cols[rel.colOf(pk.row).?];
+            const idx = try self.arena.alloc(u32, rel.rows);
+            for (idx, 0..) |*x, i| x.* = @intCast(numbers.get(i).int);
+            rel = try (try rel.without(&.{pk.row})).beside(&(try pk.rel.rowsAt(idx, &.{})));
+        }
         return rel;
     }
 

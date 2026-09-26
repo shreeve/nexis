@@ -259,7 +259,8 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     // is the 200k datoms alone: a 1000-clause chain over a 10-entity
     // chain (planning dominates; no row survives ten hops) and a
     // 100-clause chain over a 20k-entity chain (every step joins 20k
-    // rows; the relation keeps two of its 101 variables).
+    // rows), finding its ends (the relation keeps two of its 101
+    // variables) and finding every variable (it parks them).
     try fx.transact(
         \\[{:db/ident :chain/short :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
         \\ {:db/ident :chain/long :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
@@ -269,10 +270,12 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     try chain(&fx, try fx.attr("chain/short"), a_end, 10);
     try chain(&fx, try fx.attr("chain/long"), a_end, 20_000);
     const chain_db = try fx.conn.db();
-    var short = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 1000, ":chain/short")) };
+    var short = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 1000, ":chain/short", false)) };
     try benchQuery(runner, "q_chain_1000_clauses", &short, 0);
-    var long = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 100, ":chain/long")) };
+    var long = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 100, ":chain/long", false)) };
     try benchQuery(runner, "q_chain_100_over_20k", &long, 20_000 - 100);
+    var wide = QCtx{ .fx = &fx, .dbv = chain_db, .inputs = none, .q = try fx.read(try chainQuery(fx.arena(), 100, ":chain/long", true)) };
+    try benchQuery(runner, "q_chain_100_find_all_over_20k", &wide, 20_000 - 100);
 }
 
 /// Transact `n` entities linked by `attr`, each to the next; the last
@@ -287,10 +290,13 @@ fn chain(fx: *Fixture, attr: u32, end: u32, n: usize) !void {
     _ = try nextomic.transact.transactOps(fx.conn, arena, ops.items, .{});
 }
 
-/// `[:find ?x0 ?xn :where [?x0 attr ?x1] ... [?xn-1 attr ?xn]]`.
-fn chainQuery(arena: Allocator, n: usize, attr: []const u8) ![]const u8 {
+/// `[:find ?x0 ?xn :where [?x0 attr ?x1] ... [?xn-1 attr ?xn]]`, or
+/// with every variable in `:find` when `every`.
+fn chainQuery(arena: Allocator, n: usize, attr: []const u8, every: bool) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try out.writer.print("[:find ?x0 ?x{d} :where", .{n});
+    try out.writer.writeAll("[:find");
+    for (0..n + 1) |i| if (every or i == 0 or i == n) try out.writer.print(" ?x{d}", .{i});
+    try out.writer.writeAll(" :where");
     for (0..n) |i| try out.writer.print(" [?x{d} {s} ?x{d}]", .{ i, attr, i + 1 });
     try out.writer.writeByte(']');
     return out.written();

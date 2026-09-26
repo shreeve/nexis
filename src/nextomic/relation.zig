@@ -511,6 +511,22 @@ pub const Relation = struct {
         return .{ .arena = self.arena, .vars = vars[0..n], .cols = cols[0..n], .rows = self.rows };
     }
 
+    /// The columns of `vars`, each of which the relation has, lent.
+    pub fn pick(self: *const Relation, vars: []const Var) !Relation {
+        const cols = try self.arena.alloc(Column, vars.len);
+        for (vars, cols) |v, *c| c.* = self.cols[self.colOf(v).?];
+        return .{ .arena = self.arena, .vars = vars, .cols = cols, .rows = self.rows };
+    }
+
+    /// The relation over `v` alone whose rows are the numbers `0..rows`.
+    pub fn rowNumbers(arena: Allocator, v: Var, rows: usize) !Relation {
+        const numbers = try arena.alloc(i64, rows);
+        for (numbers, 0..) |*x, i| x.* = @intCast(i);
+        const cols = try arena.alloc(Column, 1);
+        cols[0] = .{ .int = .fromOwnedSlice(numbers) };
+        return .{ .arena = arena, .vars = try arena.dupe(Var, &.{v}), .cols = cols, .rows = rows };
+    }
+
     /// Rows `idx` of the relation, in that order, without the columns
     /// of `drop`; when `idx` is every row in order the columns are lent.
     pub fn rowsAt(self: *const Relation, idx: []const u32, drop: []const Var) !Relation {
@@ -637,7 +653,13 @@ pub const Relation = struct {
         var right: std.ArrayList(u32) = .empty;
         // A relation that keeps its indexes is hashed whatever its size:
         // the index is built once for every join with it.
-        if (other.rows <= self.rows or other.indexes != null) {
+        const hash_other = other.rows <= self.rows or other.indexes != null;
+        // Room for one match per probing row, the common case of a join
+        // on a key, so that neither list regrows in the arena.
+        const probing = if (hash_other) self.rows else other.rows;
+        try left.ensureTotalCapacityPrecise(arena, probing);
+        try right.ensureTotalCapacityPrecise(arena, probing);
+        if (hash_other) {
             // Rows go in last to first, so the matches of a row come out
             // in `other`'s row order and the result's order is settled.
             const index = try other.indexOn(on_other);

@@ -1396,6 +1396,14 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     try testing.expect(std.mem.indexOf(u8, out.written(), "2. pred (> ?a 40)") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?a\n") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?e\n") != null);
+    // A long chain finding every variable parks the ones no later step
+    // reads behind a column of row numbers.
+    out.clearRetainingCapacity();
+    var every: std.Io.Writer.Allocating = .init(arena);
+    for (0..13) |i| try every.writer.print("?x{d} ", .{i});
+    try query.explain(testing.allocator, fx.interner(), try fx.read(try chainQuery(arena, 12, ":edge/to", every.written(), false)), dbv, none, &diag, .{}, &out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), " park ?x0 ?x1 ?x2 ?x3 -> ?row\n") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), " park ?x4 ?row ?x5 ?x6 -> ?row\n") != null);
 }
 
 test "corpus: as-of, since, history views" {

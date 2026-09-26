@@ -13,7 +13,8 @@
 //!     An estimate is kept until one of the clause's own variables is
 //!     bound, so placing n clauses costs O(n) estimates, not O(n²).
 //!   - After each step the relation drops every variable no later step
-//!     reads and the plan's caller does not ask for (`Plan.drop`).
+//!     reads and the plan's caller does not ask for (`Plan.drop`), and
+//!     parks those only the caller asks for (`Plan.park`).
 //!   - A data pattern with nothing bound in `e`, `a` or `v` is refused
 //!     with `error.UnboundPattern`; a predicate or function whose inputs
 //!     (its arguments, and its function when that is a variable) can
@@ -167,6 +168,22 @@ pub const Or = struct {
     branches: []const *Plan,
 };
 
+/// Columns set aside until the plan ends: variables only the plan's
+/// caller asks for, which no later step reads, leave the relation for
+/// one column of row numbers, `row`, into the rows that held them; the
+/// executor puts them back when the plan's last step has run. A later
+/// step then copies one column where it would copy all of `vars`.
+pub const Park = struct {
+    /// The parked variables, the previous park's `row` among them.
+    vars: []const Var,
+    row: Var,
+};
+
+/// Parked variables it takes to set a park: under four, the column of
+/// row numbers and the columns put back at the end cost what carrying
+/// them saves.
+const park_min: usize = 4;
+
 /// A join with a relation supplied at run time (rule iterations).
 pub const Source = struct {
     slot: *SourceSlot,
@@ -202,6 +219,8 @@ pub const Plan = struct {
     /// Per step, the variables the relation drops after it: those no
     /// later step reads and the caller does not ask for.
     drop: []const []const Var,
+    /// Per step, the columns the relation parks after it, or null.
+    park: []const ?Park,
     /// Estimated rows of the input relation.
     rows_in: u64,
     /// Estimated rows after each step, one per step.
@@ -428,52 +447,71 @@ pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: 
         .input = try ctx.arena.dupe(Var, input),
         .steps = try steps.toOwnedSlice(ctx.arena),
         .drop = &.{},
+        .park = &.{},
         .rows_in = rows_in,
         .rows_after = try rows_after.toOwnedSlice(ctx.arena),
         .rows_estimate = rows,
     };
-    out.drop = try liveness(ctx, input, out.steps, output);
+    try liveness(ctx, out, output);
     return out;
 }
 
-/// Per step, the variables the relation can drop after it: those it
-/// holds that no later step reads and `output` does not name.
-fn liveness(ctx: *Ctx, input: []const Var, steps: []const Step, output: []const Var) ![]const []const Var {
+/// Fill `p.drop` and `p.park`: after each step the relation drops the
+/// variables no later step reads and `output` does not name, and parks
+/// the ones only `output` names once there are `park_min` of them and
+/// two steps still to run.
+fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
     const arena = ctx.arena;
     const n_vars = ctx.vars.items.len;
-    // Back to front: what is live after each step.
-    const live_after = try arena.alloc(std.DynamicBitSetUnmanaged, steps.len);
-    var live = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_vars);
-    for (output) |v| live.set(v);
-    var reads: std.ArrayList(Var) = .empty;
-    var i = steps.len;
-    while (i > 0) {
-        i -= 1;
-        live_after[i] = try live.clone(arena);
-        reads.clearRetainingCapacity();
-        const adds = try stepVars(arena, &steps[i], &reads);
-        for (adds) |v| live.unset(v);
-        for (reads.items) |v| live.set(v);
+    // Per variable, one past the index of the last step that reads it.
+    const last_read = try arena.alloc(usize, n_vars);
+    @memset(last_read, 0);
+    var scratch: std.ArrayList(Var) = .empty;
+    for (p.steps, 1..) |*s, n| {
+        scratch.clearRetainingCapacity();
+        _ = try stepVars(arena, s, &scratch);
+        for (scratch.items) |v| last_read[v] = n;
     }
-    // Front to back: what the relation holds, and what it drops.
-    const drop = try arena.alloc([]const Var, steps.len);
+    var asked = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_vars);
+    for (output) |v| asked.set(v);
+
+    const drop = try arena.alloc([]const Var, p.steps.len);
+    const park = try arena.alloc(?Park, p.steps.len);
     var held: std.ArrayList(Var) = .empty;
-    try held.appendSlice(arena, input);
-    for (steps, drop, live_after) |*s, *d, la| {
-        var reads_unused: std.ArrayList(Var) = .empty;
-        for (try stepVars(arena, s, &reads_unused)) |v| try ir.addVar(arena, &held, v);
+    try held.appendSlice(arena, p.input);
+    // The row numbers of the latest park: held, read by no step.
+    var row: ?Var = null;
+    for (p.steps, drop, park, 1..) |*s, *d, *pk, n| {
+        scratch.clearRetainingCapacity();
+        for (try stepVars(arena, s, &scratch)) |v| try ir.addVar(arena, &held, v);
         var gone: std.ArrayList(Var) = .empty;
+        var payload: std.ArrayList(Var) = .empty;
         var kept: usize = 0;
         for (held.items) |v| {
-            if (la.isSet(v)) {
+            const later = v != row and last_read[v] > n;
+            if (v == row or (!later and asked.isSet(v))) try payload.append(arena, v);
+            if (v == row or later or asked.isSet(v)) {
                 held.items[kept] = v;
                 kept += 1;
             } else try gone.append(arena, v);
         }
         held.shrinkRetainingCapacity(kept);
         d.* = gone.items;
+        pk.* = null;
+        if (payload.items.len < park_min or n + 2 > p.steps.len) continue;
+        const next = try ctx.freshVar(try ctx.interner.internSymbol("?row"));
+        pk.* = .{ .vars = payload.items, .row = next };
+        kept = 0;
+        for (held.items) |v| if (!ir.containsVar(payload.items, v)) {
+            held.items[kept] = v;
+            kept += 1;
+        };
+        held.shrinkRetainingCapacity(kept);
+        try held.append(arena, next);
+        row = next;
     }
-    return drop;
+    p.drop = drop;
+    p.park = park;
 }
 
 /// The variables step `s` adds to the relation; appends to `reads` the
@@ -1145,9 +1183,10 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.V
 /// description (index, estimate, tree size, bound variables), the join
 /// the executor will run for a scan (`nested`: one seek per input row;
 /// `hash`: one scan of the constant prefix hash-joined on the shared
-/// variables), the estimated rows after the step and the variables the
-/// relation drops after it (`drop ?x ?y`); sub-plans indent under their
-/// step and end with their own `rows~` line.
+/// variables), the estimated rows after the step, the variables the
+/// relation drops after it (`drop ?x ?y`) and the ones it parks (`park
+/// ?a ?b ?c ?d -> ?row`); sub-plans indent under their step and end
+/// with their own `rows~` line.
 pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
     var lines: std.ArrayList(Line) = .empty;
     try explainSub(p, ctx, &lines, 0);
@@ -1167,6 +1206,11 @@ pub fn explain(p: *const Plan, ctx: *const Ctx, w: *std.Io.Writer) !void {
             try w.writeAll(" drop ");
             try explainVars(l.drop, ctx, w);
         }
+        if (l.park) |pk| {
+            try w.writeAll(" park ");
+            try explainVars(pk.vars, ctx, w);
+            try w.print(" -> {s}", .{ctx.varName(pk.row)});
+        }
         try w.writeByte('\n');
     }
 }
@@ -1178,6 +1222,7 @@ const Line = struct {
     join: ?[]const u8 = null,
     rows: ?u64 = null,
     drop: []const Var = &.{},
+    park: ?Park = null,
 };
 
 fn indent(w: *std.Io.Writer, depth: usize) !void {
@@ -1211,12 +1256,12 @@ fn joinKind(s: *const Scan, rows: u64) []const u8 {
 
 pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
     try stack.check();
-    for (p.steps, p.drop, 0..) |step, drop, i| {
+    for (p.steps, p.drop, p.park, 0..) |step, drop, park, i| {
         var out: std.Io.Writer.Allocating = .init(ctx.arena);
         const w = &out.writer;
         try indent(w, depth);
         try w.print("{d}. ", .{i + 1});
-        var line: Line = .{ .text = "", .rows = p.rows_after[i], .drop = drop };
+        var line: Line = .{ .text = "", .rows = p.rows_after[i], .drop = drop, .park = park };
         switch (step) {
             .scan => |s| {
                 try w.writeAll("scan [");
