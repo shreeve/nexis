@@ -67,7 +67,8 @@ and typed-vector kernels stay direct.
 
 `Keyword` implements `IFn` as `get`; so does `Symbol`. In nexis `(:k m)`
 and `(:k m d)` are `get`, a symbol in function position looks itself up
-the same way, and maps, sets and vectors are callable (§23 #33).
+the same way, and maps, sets and vectors are callable (§23 #33). A
+Var is callable as in Clojure: `(#'f x)` calls the Var's value.
 
 ### 1.5 Unbound Vars
 
@@ -185,7 +186,6 @@ are the map for someone who knows Clojure.
 | `"☃"` | a string escape | `:invalid-string-escape`; write `"\u{2603}"` | the same |
 | `\o377` | an octal char | unsupported | `\u{...}` covers it |
 | String escapes | `\b \f \0`, octal, `\uHHHH` | `\n \t \r \\ \" \u{HEX}` | a narrow set |
-| `#'foo` | `(var foo)` | parse error; write `(var foo)` | a minimal reader |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
@@ -193,7 +193,8 @@ are the map for someone who knows Clojure.
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 | `#!` | a comment to end of line | the CLI treats a first line starting `#!` as a comment; elsewhere a parse error | executable scripts only |
 
-The `#` dispatch set is `#{}`, `#(...)` and `#_`. Clojure's reader
+The `#` dispatch set is `#{}`, `#(...)`, `#_` and `#'` (`#'foo` is
+`(var foo)`). Clojure's reader
 throws ad-hoc exceptions for malformed input; nexis reports a stable
 keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 `:nested-anon-fn`, `:unquote-outside-syntax-quote`, ...; PLAN §28.3).

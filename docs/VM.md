@@ -211,6 +211,8 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
   symbol looks itself up exactly as a keyword does, and a transient
   map, set or vector as its persistent kind.
 - `function` (a closure): the frame transfer below.
+- `var_`: the call goes to the Var's value (the binding in force, else
+  the root), as Clojure's `Var` is invoked: `(#'inc 1)` is 2.
 - Anything else: `:not-callable`.
 
 A closure call checks `argc` against `fixed_arity` / `variadic`
@@ -636,7 +638,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
 | `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
-| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, keyword, symbol, map, set, vector or transient |
+| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map, set, vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
 | `NoThreadBinding` | `:no-thread-binding` | `set!` on a dynamic Var with no binding in force |

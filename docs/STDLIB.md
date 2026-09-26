@@ -242,8 +242,9 @@ their elements in the same mode. Who uses which:
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
 
 A map or set of up to eight entries prints in insertion order, a
-larger one in hash order (CHAMP.md §2). None of the `#<...>`,
-`#'`, `#ns.Type{...}`, `#i64[...]` or `#nextomic/...` forms reads
+larger one in hash order (CHAMP.md §2). A Var's `#'ns/name` reads
+back as `(var ns/name)`, which evaluates to the same Var; none of the
+`#<...>`, `#ns.Type{...}`, `#i64[...]` or `#nextomic/...` forms reads
 back; the codec (CODEC.md) is the serialization layer.
 
 **Limits.** There is no length or depth option (`*print-length*` is
