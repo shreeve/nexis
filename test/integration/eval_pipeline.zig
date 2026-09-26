@@ -1305,12 +1305,15 @@ test "integration: core.nx second / third / last" {
     try expectOutput("(last [10 20 30])", "30");
     try expectOutput("(last (list :a :b :c))", ":c");
     try expectOutput("(last (list))", "nil");
+    try expectOutput("[(last []) (last nil) (last \"hé\") (last {:a 1}) (last (range 100000)) (last (rest [1])) (last (map inc (range 9))) (last (cons 0 (rest [1 2 3 4 5])))]", "[nil nil é [:a 1] 99999 nil 9 5]");
+    try expectOutput("(try (last 5) (catch any e e))", ":kind-mismatch");
 }
 
 test "integration: core.nx reverse" {
     try expectOutput("(reverse [1 2 3 4 5])", "(5 4 3 2 1)");
     try expectOutput("(reverse (list))", "()");
     try expectOutput("(reverse nil)", "()");
+    try expectOutput("[(reverse \"héb\") (reverse (range 6)) (list? (reverse (range 6))) (reverse {:a 1}) (nexis.string/reverse \"héb🦀\")]", "[(b é h) (5 4 3 2 1 0) true ([:a 1]) 🦀béh]");
 }
 
 test "integration: core.nx range" {

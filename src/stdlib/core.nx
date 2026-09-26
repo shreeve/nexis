@@ -20,17 +20,9 @@
 (defn fnext [x] (second x))
 (defn nnext [x] (next (next x)))
 
-(defn last [s]
-  ; Walk by reducing; the reduce fn keeps only the latest x.
-  (reduce (fn* [_ x] x) nil s))
-
 ; ============================================================
 ; Sequence transforms
 ; ============================================================
-
-(defn reverse [s]
-  ; reduce + cons builds the list in reverse order naturally.
-  (reduce (fn* [acc x] (cons x acc)) (list) s))
 
 ; (drop n coll) → a seq of coll without its first n elements, () when
 ; none are left.

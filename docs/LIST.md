@@ -38,7 +38,10 @@ map or set, and the rest that build a fresh list; `stdlib.zig`
 more, a vector of them and its view at offset 0: a root, a tail and
 one block per 32 elements instead of a cons cell per element, and an
 O(1) `count`. Fewer than four are cons cells, fewer blocks than a
-vector's root, tail and view. `list` always builds cons cells.
+vector's root, tail and view. `list` always builds cons cells. As
+with any view, a `rest` or `drop` of a built sequence keeps the whole
+vector reachable (§6), where a cons chain's rest frees the cells before
+it.
 
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
 `(...)`, is `=` to and hashes as the list of the same elements, can be

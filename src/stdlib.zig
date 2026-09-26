@@ -246,6 +246,8 @@ const core_natives = table("", .{
     .{ "take-while", 2, 2, &fnTakeWhile },
     .{ "drop-while", 2, 2, &fnDropWhile },
     .{ "butlast", 1, 1, &fnButlast },
+    .{ "last", 1, 1, &fnLast },
+    .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "nthnext", 2, 2, &fnNthnext },
     .{ "split-at", 2, 2, &fnSplitAt },
@@ -2164,6 +2166,33 @@ fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
     defer items.deinit(vm.allocator);
     if (items.items.len < 2) return value_mod.nilValue();
     return try buildListFromSlice(vm, items.items[0 .. items.items.len - 1]);
+}
+
+/// `(last coll)` → the last element, nil when there is none: an O(1)
+/// read of a vector or a view, a walk of anything else.
+fn fnLast(vm: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    switch (c.kind()) {
+        .persistent_vector => return if (vector_mod.isEmpty(c)) value_mod.nilValue() else vector_mod.nth(c, vector_mod.count(c) - 1),
+        .list => if (c.subkind() == list_mod.subkind_view) {
+            const n = list_mod.count(c);
+            return if (n == 0) value_mod.nilValue() else list_mod.head(list_mod.drop(c, n - 1));
+        },
+        else => {},
+    }
+    var it = try makeSeqIter(vm, c);
+    var last = value_mod.nilValue();
+    while (try it.next()) |x| last = x;
+    return last;
+}
+
+/// `(reverse coll)` → a list of the elements in reverse order, `()`
+/// when there are none.
+fn fnReverse(vm: *VM, args: []const Value) VmError!Value {
+    var items = try collectSeq(vm, args[0]);
+    defer items.deinit(vm.allocator);
+    std.mem.reverse(Value, items.items);
+    return try buildListFromSlice(vm, items.items);
 }
 
 /// A count argument. Negative counts mean zero everywhere Clojure
@@ -4171,10 +4200,9 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 /// of a multibyte scalar included, pass through.
 fn mapAsciiCase(vm: *VM, s: Value, upper: bool) VmError!Value {
     const src = try stringArg(s);
-    const buf = vm.allocator.alloc(u8, src.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(buf);
-    for (src, buf) |b, *out| out.* = if (upper) std.ascii.toUpper(b) else std.ascii.toLower(b);
-    return string_mod.fromBytes(vm.ensureHeap(), buf) catch return VmError.OutOfMemory;
+    const out = string_mod.allocUninit(vm.ensureHeap(), src.len) catch return VmError.OutOfMemory;
+    for (src, out.bytes) |b, *o| o.* = if (upper) std.ascii.toUpper(b) else std.ascii.toLower(b);
+    return out.value;
 }
 
 fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
