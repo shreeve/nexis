@@ -163,7 +163,7 @@ pub const StoreFile = struct {
         errdefer allocator.free(canonical);
         var st: std.c.Stat = undefined;
         if (std.c.fstatat(std.c.AT.FDCWD, canonical.ptr, &st, 0) == 0) {
-            if (st.nlink > 1) return DbError.HardLinked;
+            if (hardLinked(st)) return DbError.HardLinked;
             var it = open_files;
             while (it) |f| : (it = f.next) {
                 if (f.dev == st.dev and f.ino == st.ino) {
@@ -186,7 +186,7 @@ pub const StoreFile = struct {
         };
         errdefer self.env.close();
         if (std.c.fstat(self.env.inner.dataFile.fd, &st) != 0) return error.OpenFailed;
-        if (st.nlink > 1) return DbError.HardLinked;
+        if (hardLinked(st)) return DbError.HardLinked;
         self.path = canonical;
         self.dev = st.dev;
         self.ino = st.ino;
@@ -220,6 +220,12 @@ pub const StoreFile = struct {
     pub fn beginWrite(self: *StoreFile, options: emdb.Env.WriteOptions) !*emdb.Txn {
         if (self.env.options.readOnly) return error.TxnReadOnly;
         return self.env.beginWriteWith(options);
+    }
+
+    /// A regular file with a second name. A directory's links are
+    /// its entries; emdb refuses it as a store.
+    fn hardLinked(st: std.c.Stat) bool {
+        return std.c.S.ISREG(st.mode) and st.nlink > 1;
     }
 
     /// A regular file this process may read but not write: the one
@@ -1174,6 +1180,10 @@ test "open: a store file with a second hard link is refused under either name" {
     try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, other.ptr, .{ .allocator = testing.allocator }));
     try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
     try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
+    // A directory has links of its own, and is no store.
+    const dir = try testing.allocator.dupeZ(u8, std.fs.path.dirname(path).?);
+    defer testing.allocator.free(dir);
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, dir.ptr, .{ .allocator = testing.allocator }));
     // One name again: the file opens.
     try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
     var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
