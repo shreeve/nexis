@@ -76,11 +76,12 @@ root. A transient never carries metadata.
 
 ### 4. Edit token
 
-Tokens come from a counter on the heap, `Heap.edit_clock`, a `u32`
-that `transient` advances; 0 is reserved for "frozen" and for the
-nodes no transient owns (a fresh block's `hash` is 0). An internal
-node of a vector, map or set caches no hash, so its `hash` field holds
-the token of the transient that owns it (`docs/HEAP.md` §1). A token is
+Tokens come from a counter on the heap, `Heap.edit_clock`, which
+`transient` advances up to `edit_token_max` (2²⁶ − 1); 0 is reserved
+for "frozen" and for the nodes no transient owns (a fresh block's
+`hash` is 0). An internal node of a vector, map or set caches no hash,
+so the high 26 bits of its `hash` field hold the token of the
+transient that owns it (`docs/HEAP.md` §1). A token is
 never reissued while a node carries it: when the clock would wrap,
 every map, set and vector block of the heap forgets its token (a root
 forgets its cached hash, recomputed on the next use) and every active

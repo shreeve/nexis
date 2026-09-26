@@ -706,14 +706,14 @@ test "T5d: persistent vectors never change under in-place conj!/assoc!/pop! of t
 test "T6: across the edit clock's wrap, no transient edits a node another owned" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
-    heap.edit_clock = std.math.maxInt(u32) - 5;
+    heap.edit_clock = heap_mod.edit_token_max - 5;
     var prng = std.Random.DefaultPrng.init(prng_seed +% 0x6);
     try mapPersistenceRounds(&heap, prng.random(), .{ .hash = &dispatch.hashValue, .strings = false }, 12, 800, 300);
     try std.testing.expect(heap.edit_clock < 100);
 
     // A transient active across the wrap keeps working and its
     // collection keeps its elements.
-    heap.edit_clock = std.math.maxInt(u32) - 1;
+    heap.edit_clock = heap_mod.edit_token_max - 1;
     const t = try transient.transientFrom(&heap, try vector.empty(&heap));
     for (0..100) |i| _ = try transient.vectorConjBang(&heap, t, fx(@intCast(i)));
     const kept = try transient.persistentBang(try transient.transientFrom(&heap, try vector.fromSlice(&heap, &.{ fx(1), fx(2) })));

@@ -27,6 +27,10 @@
 //!   V9. Cross-kind at shift-boundary sizes (33, 1024, 1025, 1057,
 //!       32768, 32769, 32801) — stresses the trie descent in the
 //!       cursor walker through a three-level trie.
+//!   V10. Branching histories: conj, assoc and pop from random earlier
+//!       versions (so versions share tails and claim their slots,
+//!       VECTOR.md §2) with heap elements and collections in between;
+//!       every version keeps its elements.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -35,6 +39,8 @@ const heap_mod = nx.heap;
 const list_mod = nx.list;
 const vector_mod = nx.vector;
 const dispatch = nx.dispatch;
+const gc = nx.gc;
+const string_mod = nx.string;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -358,5 +364,79 @@ test "V9: cross-kind equality + hash at shift-boundary sizes up to a three-level
         try std.testing.expect(dispatch.equal(l, v));
         try std.testing.expect(dispatch.equal(v, l));
         try std.testing.expectEqual(dispatch.hashValue(l), dispatch.hashValue(v));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// V10. Branching histories share tails and claim their slots
+// -----------------------------------------------------------------------------
+
+test "V10: conj, assoc and pop from random earlier versions keep every version's elements across collections" {
+    const gpa = std.testing.allocator;
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 10);
+    const r = prng.random();
+    var versions: std.ArrayList(Value) = .empty;
+    defer versions.deinit(gpa);
+    // Each version's elements, as the integers its strings spell.
+    var models: std.ArrayList(std.ArrayList(u32)) = .empty;
+    defer {
+        for (models.items) |*m| m.deinit(gpa);
+        models.deinit(gpa);
+    }
+    var roots: std.ArrayList(*heap_mod.HeapHeader) = .empty;
+    defer roots.deinit(gpa);
+    var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
+
+    try versions.append(gpa, try vector_mod.empty(&heap));
+    try models.append(gpa, .empty);
+    var next: u32 = 0;
+    for (0..6000) |step| {
+        // Mostly the newest versions, sometimes any: a version conj'd
+        // twice gives one claim and one copy.
+        const n = versions.items.len;
+        const from = if (r.boolean()) n - 1 - r.uintLessThan(usize, @min(n, 4)) else r.uintLessThan(usize, n);
+        const v = versions.items[from];
+        var model = try models.items[from].clone(gpa);
+        const pick = r.uintLessThan(u8, 10);
+        var buf: [16]u8 = undefined;
+        const out = if (pick < 7 or model.items.len == 0) blk: {
+            next += 1;
+            try model.append(gpa, next);
+            break :blk try vector_mod.conj(&heap, v, try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "{d}", .{next}) catch unreachable));
+        } else if (pick < 9) blk: {
+            next += 1;
+            const i = r.uintLessThan(usize, model.items.len);
+            model.items[i] = next;
+            break :blk try vector_mod.assoc(&heap, v, i, try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "{d}", .{next}) catch unreachable));
+        } else blk: {
+            _ = model.pop();
+            break :blk try vector_mod.pop(&heap, v);
+        };
+        try versions.append(gpa, out);
+        try models.append(gpa, model);
+
+        if (step % 500 == 499) {
+            // Drop the oldest third, collect with the rest as roots,
+            // then check every version left.
+            const drop = versions.items.len / 3;
+            for (models.items[0..drop]) |*m| m.deinit(gpa);
+            std.mem.copyForwards(Value, versions.items, versions.items[drop..]);
+            versions.shrinkRetainingCapacity(versions.items.len - drop);
+            std.mem.copyForwards(std.ArrayList(u32), models.items, models.items[drop..]);
+            models.shrinkRetainingCapacity(models.items.len - drop);
+            roots.clearRetainingCapacity();
+            for (versions.items) |x| try roots.append(gpa, Heap.asHeapHeader(x));
+            _ = collector.collect(roots.items);
+            for (versions.items, models.items) |x, m| {
+                try std.testing.expectEqual(m.items.len, vector_mod.count(x));
+                for (m.items, 0..) |e, i| {
+                    const got = string_mod.asBytes(vector_mod.nth(x, i));
+                    try std.testing.expectEqualStrings(std.fmt.bufPrint(&buf, "{d}", .{e}) catch unreachable, got);
+                }
+            }
+        }
     }
 }

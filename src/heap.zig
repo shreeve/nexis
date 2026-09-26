@@ -139,6 +139,39 @@ pub const HeapHeader = extern struct {
 };
 
 // =============================================================================
+// An internal collection node's `hash` field (HEAP.md §1)
+//
+// The internal nodes of a vector, map or set cache no hash. Their `hash`
+// holds the edit token of the transient that owns them in its high 26
+// bits (0: none) and six bits of the collection's own below: a vector
+// tail's claimed length (VECTOR.md §2).
+// =============================================================================
+
+pub const edit_token_max: u32 = (1 << 26) - 1;
+
+pub inline fn editTokenOf(h: *const HeapHeader) u32 {
+    return h.hash >> 6;
+}
+
+/// Whether the transient with token `edit` (nonzero) owns `h`.
+pub inline fn ownedBy(h: *const HeapHeader, edit: u32) bool {
+    return h.hash >> 6 == edit;
+}
+
+/// Stamp a fresh node as the transient's with token `edit`.
+pub inline fn stampEdit(h: *HeapHeader, edit: u32) void {
+    h.hash = edit << 6;
+}
+
+pub inline fn nodeAux(h: *const HeapHeader) u6 {
+    return @truncate(h.hash);
+}
+
+pub inline fn setNodeAux(h: *HeapHeader, aux: u6) void {
+    h.hash = (h.hash & ~@as(u32, 63)) | aux;
+}
+
+// =============================================================================
 // Bit constants
 // =============================================================================
 
@@ -320,8 +353,8 @@ pub const Heap = struct {
     /// Bytes allocated since `resetAllocationCounter`: what the
     /// collector's trigger compares against its threshold.
     allocated_since_collect: usize = 0,
-    /// The last edit token a transient on this heap took
-    /// (`docs/TRANSIENT.md` §4).
+    /// The last edit token a transient on this heap took, at most
+    /// `edit_token_max` (`docs/TRANSIENT.md` §4).
     edit_clock: u32 = 0,
 
     const Class = struct {

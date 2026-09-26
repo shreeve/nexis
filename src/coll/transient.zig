@@ -105,7 +105,7 @@ const TransientBody = extern struct {
 /// hash, which is recomputed) and every active transient takes a new
 /// one, so the clock restarts clear.
 fn issueEditToken(heap: *Heap) u32 {
-    if (heap.edit_clock == std.math.maxInt(u32)) retireEditTokens(heap);
+    if (heap.edit_clock == heap_mod.edit_token_max) retireEditTokens(heap);
     heap.edit_clock += 1;
     return heap.edit_clock;
 }

@@ -158,7 +158,7 @@ The dispatch in `Collector.trace`:
 |---|---|---|
 | `string`, `bignum` | `string.trace`, `bignum.trace` | nothing (bytes, limbs) |
 | `list` | `list.trace` | subkind 0 (cons): every head, and the tail chain in a loop (cells through `markInternal`, a cell's meta through `mark`); subkind 1 (empty): nothing; subkind 2 (vector view): its vector, through `markValue`, also when the view ends a cons chain |
-| `persistent_vector` | `vector.trace` | the tail node and the trie, interior and leaf nodes through `markInternal` |
+| `persistent_vector` | `vector.trace` | the tail node, every slot of its block (vectors sharing a tail use different lengths of it, `docs/VECTOR.md` §2), and the trie, interior and leaf nodes through `markInternal` |
 | `persistent_map`, `persistent_set` | `champ.traceMap`, `champ.traceSet` | the array-form entries, or the CHAMP trie with interior and collision nodes through `markInternal` |
 | `sorted_map`, `sorted_set` | `sorted.trace` | the comparator, then every tree node through `markInternal` and its key and value through `markValue`, recursing to the tree's height (`docs/SORTED.md` §2) |
 | `typed_vector` | `typed_vector.trace` | nothing (unboxed elements) |

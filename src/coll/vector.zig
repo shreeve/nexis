@@ -118,12 +118,35 @@ fn allocLeaf(heap: *Heap) !*HeapHeader {
     return heap.alloc(.persistent_vector, leaf_body_size);
 }
 
-/// Fresh zeroed tail node of `len` Values, `len` in `[1, 32]`. An
-/// empty vector has no tail node: its root's `tail_node` is null.
+/// Fresh zeroed tail node with room for `len` Values, `len` in
+/// `[1, 32]`. An empty vector has no tail node: its root's
+/// `tail_node` is null.
 fn allocTail(heap: *Heap, len: usize) !*HeapHeader {
     std.debug.assert(len >= 1 and len <= branch_factor);
     const body_size = try std.math.mul(usize, len, @sizeOf(Value));
     return heap.alloc(.persistent_vector, body_size);
+}
+
+/// How many Values a tail node has room for.
+inline fn tailCapacity(t: *HeapHeader) usize {
+    return Heap.bodySize(t) / @sizeOf(Value);
+}
+
+/// A tail's claimed length (VECTOR.md §2): no vector uses a slot at or
+/// past it. 0 when the tail takes no claims.
+inline fn claimed(t: *const HeapHeader) usize {
+    return heap_mod.nodeAux(t);
+}
+
+inline fn setClaimed(t: *HeapHeader, len: usize) void {
+    heap_mod.setNodeAux(t, @intCast(len));
+}
+
+/// The room a copied tail of `len` elements gets: the next power of
+/// two, so a vector grown by `conj` copies its tail at lengths 1, 2,
+/// 3, 5, 9 and 17 and claims the slots between.
+inline fn grownCapacity(len: usize) usize {
+    return @min(branch_factor, std.math.ceilPowerOfTwoAssert(usize, len));
 }
 
 // =============================================================================
@@ -206,8 +229,10 @@ pub fn empty(heap: *Heap) !Value {
 
 /// Append `elem` to `v`, producing a new vector. O(1) amortized.
 /// Three paths:
-///   (a) tail not full (or absent) → allocate a (tail_len+1)-length
-///       tail with the old elements + the appended element.
+///   (a) tail not full (or absent) → when the tail has room and no
+///       vector has claimed the slot past `v`'s elements, claim it:
+///       write `elem` there and share the tail (VECTOR.md §2); else a
+///       copy of the tail with room to grow.
 ///   (b) tail full + trie has room → push old tail into trie as a
 ///       leaf; start new 1-element tail.
 ///   (c) tail full + trie at capacity → grow shift by 5; new root
@@ -219,24 +244,31 @@ pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
 
     // Path (a): tail has room → grow tail by 1.
     if (src.tail_len < branch_factor) {
-        const new_tail = try allocTail(heap, src.tail_len + 1);
-        const new_tail_values = tailValues(new_tail, src.tail_len + 1);
-        @memcpy(new_tail_values[0..src.tail_len], tailOf(src));
-        new_tail_values[src.tail_len] = elem;
-
+        const new_len = src.tail_len + 1;
+        const claim = if (src.tail_node) |t| claimed(t) == src.tail_len and src.tail_len < tailCapacity(t) else false;
         const new_root_h = try allocDerivedRoot(heap, src_h);
+        const new_tail = if (claim) src.tail_node.? else blk: {
+            const t = try allocTail(heap, grownCapacity(new_len));
+            @memcpy(tailValues(t, new_len)[0..src.tail_len], tailOf(src));
+            break :blk t;
+        };
+        leafValues(new_tail)[src.tail_len] = elem;
+        setClaimed(new_tail, new_len);
+
         const new_root = rootBody(new_root_h);
         new_root.* = src.*;
         new_root.count = src.count + 1;
         new_root.tail_node = new_tail;
-        new_root.tail_len = src.tail_len + 1;
+        new_root.tail_len = @intCast(new_len);
         return valueFromRoot(new_root_h);
     }
 
     // Tail is full (len == 32). Old tail becomes a leaf under the
-    // trie; new tail starts with the appended element.
-    const new_tail = try allocTail(heap, 1);
+    // trie; new tail starts with the appended element, with room for
+    // a leaf's worth.
+    const new_tail = try allocTail(heap, branch_factor);
     tailValues(new_tail, 1)[0] = elem;
+    setClaimed(new_tail, 1);
 
     // A full tail and a leaf share one layout: the tail joins the trie
     // as it stands.
@@ -418,10 +450,10 @@ fn popTail(heap: *Heap, node: *HeapHeader, level_shift: u32, last: usize) !?*Hea
 
 /// `node` if the edit owns it, else a copy it owns.
 fn editable(heap: *Heap, node: *HeapHeader, edit: u32, size: usize) !*HeapHeader {
-    if (node.hash == edit) return node;
+    if (heap_mod.ownedBy(node, edit)) return node;
     const copy = try heap.alloc(.persistent_vector, size);
     @memcpy(Heap.bodyBytes(copy)[0..size], Heap.bodyBytes(node)[0..size]);
-    copy.hash = edit;
+    heap_mod.stampEdit(copy, edit);
     return copy;
 }
 
@@ -429,14 +461,14 @@ fn editable(heap: *Heap, node: *HeapHeader, edit: u32, size: usize) !*HeapHeader
 /// elements of `from`.
 fn ownedTail(heap: *Heap, from: []const Value, edit: u32) !*HeapHeader {
     const t = try allocLeaf(heap);
-    t.hash = edit;
+    heap_mod.stampEdit(t, edit);
     @memcpy(leafValues(t)[0..from.len], from);
     return t;
 }
 
 fn ownedInterior(heap: *Heap, edit: u32) !*HeapHeader {
     const node = try allocInterior(heap);
-    node.hash = edit;
+    heap_mod.stampEdit(node, edit);
     return node;
 }
 
@@ -452,7 +484,7 @@ pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
 pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void {
     const body = rootBody(root);
     if (body.tail_len < branch_factor) {
-        const tail = if (body.tail_node) |t| (if (t.hash == edit) t else try ownedTail(heap, tailOf(body), edit)) else try ownedTail(heap, &.{}, edit);
+        const tail = if (body.tail_node) |t| (if (heap_mod.ownedBy(t, edit)) t else try ownedTail(heap, tailOf(body), edit)) else try ownedTail(heap, &.{}, edit);
         leafValues(tail)[body.tail_len] = elem;
         body.tail_node = tail;
         body.tail_len += 1;
@@ -511,7 +543,7 @@ pub fn assocInPlace(heap: *Heap, root: *HeapHeader, i: usize, elem: Value, edit:
     const tail_offset: usize = body.count - body.tail_len;
     if (i >= tail_offset) {
         const t = body.tail_node.?;
-        const tail = if (t.hash == edit) t else try ownedTail(heap, tailOf(body), edit);
+        const tail = if (heap_mod.ownedBy(t, edit)) t else try ownedTail(heap, tailOf(body), edit);
         leafValues(tail)[i - tail_offset] = elem;
         body.tail_node = tail;
         return;
@@ -545,7 +577,7 @@ pub fn popInPlace(heap: *Heap, root: *HeapHeader, edit: u32) !void {
         // A tail the edit owns lets go of the element; a shared one
         // keeps it and is copied at the next write.
         const t = body.tail_node.?;
-        if (t.hash == edit) leafValues(t)[body.tail_len - 1] = value.nilValue();
+        if (heap_mod.ownedBy(t, edit)) leafValues(t)[body.tail_len - 1] = value.nilValue();
         body.tail_len -= 1;
         body.count -= 1;
         return;
@@ -708,8 +740,10 @@ pub fn equalSeq(
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     const body = rootBody(h);
     if (body.tail_node) |tn| {
+        // Every slot of the block: vectors sharing a tail use
+        // different lengths of it, and the node is marked once.
         if (visitor.markInternal(tn)) {
-            for (tailOf(body)) |elem| visitor.markValue(elem);
+            for (leafValues(tn)[0..tailCapacity(tn)]) |elem| visitor.markValue(elem);
         }
     }
     if (body.root_node) |rn| traceTrie(rn, body.shift, visitor);
@@ -1058,6 +1092,28 @@ test "conj at 32→33 boundary: old tail promoted to leaf, shift becomes 5" {
     try testing.expectEqual(@as(u32, 1), body.tail_len);
     // Full round-trip via nth.
     for (0..33) |i| try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
+}
+
+test "conj claims the tail slot past its source's elements, and a second conj from that source copies" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var v = try empty(&heap);
+    for (0..3) |i| v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
+    // Three elements in a tail with room for four: the fourth claims.
+    const a = try conj(&heap, v, value.fromFixnum(10).?);
+    try testing.expectEqual(rootBody(rootHeader(v)).tail_node, rootBody(rootHeader(a)).tail_node);
+    const b = try conj(&heap, v, value.fromFixnum(20).?);
+    try testing.expect(rootBody(rootHeader(b)).tail_node != rootBody(rootHeader(v)).tail_node);
+    try testing.expectEqual(@as(usize, 3), count(v));
+    try testing.expectEqual(@as(i64, 10), nth(a, 3).asFixnum());
+    try testing.expectEqual(@as(i64, 20), nth(b, 3).asFixnum());
+    // A vector grown by conj copies its tail at lengths 1, 2, 3, 5, 9
+    // and 17, and once per leaf after that: the empty root, a root per
+    // conj, six tails, the second leaf's tail and the trie's root.
+    const before = heap.liveCount();
+    var w = try empty(&heap);
+    for (0..64) |i| w = try conj(&heap, w, value.fromFixnum(@intCast(i)).?);
+    try testing.expectEqual(before + 1 + 64 + 6 + 1 + 1, heap.liveCount());
 }
 
 test "immutability: conj on a vector does not mutate the source" {

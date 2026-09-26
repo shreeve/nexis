@@ -278,7 +278,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             if (edit == 0) return heap.alloc(kind, size);
             const h = try heap.alloc(kind, size + edit_slack);
             _ = Heap.resizeInPlace(h, size);
-            h.hash = edit;
+            heap_mod.stampEdit(h, edit);
             return h;
         }
 
@@ -710,7 +710,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         fn ownPath(heap: *Heap, root: *HeapHeader, spot: *Spot, n: usize, edit: u32) !void {
             for (0..n) |k| {
                 const node = spot.path[k];
-                if (node.hash == edit) continue;
+                if (heap_mod.ownedBy(node, edit)) continue;
                 const size = Heap.bodySize(node);
                 const copy = try allocNode(heap, size, edit);
                 @memcpy(Heap.bodyBytes(copy), Heap.bodyBytes(node));
@@ -787,7 +787,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const nd: usize = @popCount(hdr.data_bitmap);
             const nc: usize = @popCount(hdr.node_bitmap);
             const at = dataIndex(hdr.data_bitmap, slot);
-            if (node.hash != edit or !Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap | bitOf(slot), hdr.node_bitmap))) {
+            if (!heap_mod.ownedBy(node, edit) or !Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap | bitOf(slot), hdr.node_bitmap))) {
                 return withSlot(heap, node, slot, .{ .data = p }, edit);
             }
             const base = afterHeader(node);
@@ -807,7 +807,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const hdr = headerOf(CollisionHeader, node);
             const n = hdr.count;
             const size = @sizeOf(CollisionHeader) + (n + 1) * @sizeOf(P);
-            const target = if (node.hash == edit and Heap.resizeInPlace(node, size)) node else blk: {
+            const target = if (heap_mod.ownedBy(node, edit) and Heap.resizeInPlace(node, size)) node else blk: {
                 const copy = try allocNode(heap, size, edit);
                 @memcpy(Heap.bodyBytes(copy)[0..Heap.bodySize(node)], Heap.bodyBytes(node));
                 break :blk copy;

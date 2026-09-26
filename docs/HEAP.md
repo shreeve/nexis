@@ -54,8 +54,11 @@ Frozen invariants (a change is a PLAN amendment):
 
 Only a user-visible root carries metadata; the internal nodes of a map,
 set or vector never do. Those nodes cache no hash either: their `hash`
-holds the edit token of the transient that owns them, or 0
-(`docs/TRANSIENT.md` §4).
+holds, in its high 26 bits, the edit token of the transient that owns
+them, or 0 (`docs/TRANSIENT.md` §4), and six bits of the collection's
+own below it, a vector tail's claimed length (`docs/VECTOR.md` §2);
+`editTokenOf`, `ownedBy`, `stampEdit`, `nodeAux` and `setNodeAux` read
+and write the two.
 
 ---
 

@@ -17,7 +17,7 @@ points. Costs:
 | Operation | Cost |
 |---|---|
 | `nth`, `assoc` | O(log₃₂ n) path copy; O(1) in the tail |
-| `conj` | O(1) amortized: copies the tail (≤ 32 Values), promotes a full tail into the trie, grows the root shift at capacity |
+| `conj` | O(1) amortized: a new root, and the tail's next slot claimed or the tail copied with room to grow (§2); promotes a full tail into the trie, grows the root shift at capacity |
 | `pop` | O(1) while the tail holds more than one element; O(log₃₂ n) when the trie's last leaf becomes the tail |
 | `fromSlice` | O(n), bottom-up, one allocation per node |
 | `count`, `isEmpty` | O(1) |
@@ -52,7 +52,7 @@ names are conceptual labels.
 | root | the user-facing Value: the 32-byte root body (§3) |
 | interior | `[32]?*HeapHeader` child pointers, 256 bytes |
 | leaf | exactly `[32]Value`, 512 bytes; always full |
-| tail | `len` Values, `1 ≤ len ≤ 32`: a block of `len × 16` bytes, or of 512 when a transient owns it |
+| tail | `len` Values, `1 ≤ len ≤ 32`, in a block with room for `len` or more |
 
 Only the root flows through dispatch. A leaf and a full tail share one
 layout, so one node can serve both roles: `conj` promotes a full tail
@@ -60,6 +60,22 @@ into the trie as it stands, and `pop` makes the trie's last leaf the
 new tail. A node reachable twice this way is traced once. Every access
 reads a node's shape from the root and the descent, never from the
 block's size: the tail's length is the root's `tail_len`.
+
+**Tail claims.** Vectors may share a tail node, each using its own
+`tail_len` of it. A tail's claimed length, six bits of its header's
+`hash` field (`docs/HEAP.md` §1), is a length no vector sharing it
+uses a slot past. `conj` onto a vector whose tail has room past its
+elements and whose claimed length is its `tail_len` claims the next
+slot: it writes the element there, advances the claim and shares the
+node with the new vector, so the source never sees the slot. Any other
+`conj` copies the tail into a block with room for the next power of
+two elements, claimed at the new length: a vector grown by `conj`
+copies its tail at lengths 1, 2, 3, 5, 9 and 17 and once per 32 after
+its first leaf, whose tails start with room for 32. `fromSlice`,
+`assoc` and `pop` build tails of exactly their length, which take no
+claim, and a tail a transient owns claims nothing. A claimed slot that
+a discarded vector wrote keeps its value alive as long as the node
+lives: the collector marks every slot of a tail's block (GC.md §5).
 
 ---
 
@@ -138,6 +154,11 @@ arrive as function-pointer callbacks.
 - **Tail promotion.** A `conj` onto a full tail pushes the tail into the
   trie as a leaf at index `tail_offset` (not `count - 1`) and starts a
   new one-element tail.
+- **Claims.** A claim is safe only when the claimed length equals the
+  source's `tail_len`: a larger one means another vector uses the slot.
+  A tail's trace marks its whole block, never `tail_len` of it: a
+  node marked through one vector is not traced again for another that
+  shares it with more elements.
 - **Shift growth.** When the promoted leaf needs a new trie level, a new
   root interior holds the old root in slot 0 and the path to the leaf
   in slot 1; `shift` grows by 5.
@@ -173,5 +194,9 @@ against a model across the 32, 1056 and 32800 boundaries; V3 list and
 vector equal and hash-equal; V4 equivalence laws; V5 `=` implies equal
 hash; V6 never equal to a non-sequential value; V7 length
 discrimination; V8 nested vectors; V9 cross-kind equality and hash at
-the boundary sizes 33 through 32801. Unit tests in `vector.zig` cover
-`pop` shapes node for node against `fromSlice`.
+the boundary sizes 33 through 32801; V10 branching histories (`conj`,
+`assoc` and `pop` from random earlier versions, so versions share
+tails and claim slots, with heap elements and collections in between)
+keep every version's elements. Unit tests in `vector.zig` cover `pop`
+shapes node for node against `fromSlice`, and a claim and the copy
+that follows a second `conj` from one vector.
