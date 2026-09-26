@@ -1,0 +1,56 @@
+; bench/compare/db/nexis-load.nx — create a Nextomic store and load
+; 100 departments and 100,000 people with five attributes each, in
+; batches of 1,000 entities (docs/BENCH.md §12). MODE `durable` commits
+; every transaction in the default sync mode; `nosync` commits with
+; `:sync :none` and syncs once at the end, and names its phases
+; `create-nosync` and `load-nosync`.
+; Usage: nexis run nexis-load.nx STORE MODE
+; Twin: dtlv-load.clj; same data, same batches, same answers.
+
+(require '[nextomic :as d])
+
+(def path (first *command-line-args*))
+(def n-people 100000)
+(def batch 1000)
+(def nosync (= "nosync" (second *command-line-args*)))
+(def suffix (if nosync "-nosync" ""))
+(def tx-opts (if nosync {:sync :none} {}))
+
+; ns is taken before the answer is computed: arguments evaluate left
+; to right, so a check query after the work stays outside the time.
+(defn report [phase ns answer]
+  (println (str "phase=" phase suffix " ns=" ns " answer=" answer)))
+
+(def schema
+  [{:db/ident :dept/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :person/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one
+    :db/index true}
+   {:db/ident :person/dept :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+   {:db/ident :person/salary :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+
+(defn person [i dept-eids]
+  {:person/email (str "p" i "@x.org")
+   :person/name (str "name-" i)
+   :person/age (+ 18 (mod (* i 7) 60))
+   :person/dept (nth dept-eids (mod i 100))
+   :person/salary (+ 30000 (mod (* i 7919) 90001))})
+
+(let [t0 (nano-time)
+      conn (d/connect path)
+      _ (d/transact! conn schema tx-opts)
+      _ (d/transact! conn (mapv (fn [k] {:dept/name (str "d" k)}) (range 100)) tx-opts)
+      dept-map (into {} (d/q '[:find ?n ?e :where [?e :dept/name ?n]] (d/db conn)))
+      dept-eids (mapv (fn [k] (get dept-map (str "d" k))) (range 100))]
+  (report "create" (- (nano-time) t0) (count dept-eids))
+  (let [t1 (nano-time)]
+    (loop [start 0]
+      (when (< start n-people)
+        (d/transact! conn (mapv (fn [i] (person i dept-eids)) (range start (+ start batch))) tx-opts)
+        (recur (+ start batch))))
+    (when nosync (d/sync conn))
+    (report "load" (- (nano-time) t1) (d/q '[:find (count ?e) . :where [?e :person/email]] (d/db conn))))
+  (d/release conn))

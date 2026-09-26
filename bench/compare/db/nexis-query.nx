@@ -1,0 +1,84 @@
+; bench/compare/db/nexis-query.nx — reopen the store nexis-load.nx
+; built and time the read and write workloads of docs/BENCH.md §12
+; against it. Usage: nexis run nexis-query.nx STORE
+; Twin: dtlv-query.clj; the same operations and answers, except the
+; time-view phase, which Datalevin has no counterpart for.
+
+(require '[nextomic :as d])
+
+(def path (first *command-line-args*))
+
+; ns is taken before the answer is computed: arguments evaluate left
+; to right, so a check query after the work stays outside the time.
+(defn report [phase ns answer]
+  (println (str "phase=" phase " ns=" ns " answer=" answer)))
+
+(defn email [i] (str "p" i "@x.org"))
+
+(def t-open (nano-time))
+(def conn (d/connect path))
+(def db0 (d/db conn))
+(report "open" (- (nano-time) t-open) (some? (d/entid db0 [:dept/name "d0"])))
+
+; 10,000 point reads through the unique email, one entity each.
+(let [t0 (nano-time)
+      total (loop [i 0 acc 0]
+              (if (< i 10000)
+                (recur (inc i) (+ acc (:person/age (d/entity db0 [:person/email (email (* i 10))]))))
+                acc))]
+  (report "lookup-10k" (- (nano-time) t0) total))
+
+; A three-clause join, once for each of 20 departments (20,000 rows).
+(let [t0 (nano-time)
+      total (loop [k 0 acc 0]
+              (if (< k 20)
+                (recur (inc k)
+                       (+ acc (count (d/q '[:find ?p ?name :in $ ?dn
+                                            :where [?d :dept/name ?dn] [?p :person/dept ?d] [?p :person/name ?name]]
+                                          db0 (str "d" k)))))
+                acc))]
+  (report "join3-20x" (- (nano-time) t0) total))
+
+; Salary totals per department over every person.
+(let [t0 (nano-time)
+      rows (d/q '[:find ?dn (sum ?s) :with ?p
+                  :where [?p :person/dept ?d] [?d :dept/name ?dn] [?p :person/salary ?s]]
+                db0)]
+  (report "aggregate" (- (nano-time) t0) (str (count rows) "/" (reduce + (map second rows)))))
+
+; pull-many of 10,000 people with their department's name.
+(let [eids (mapv (fn [i] (d/entid db0 [:person/email (email (* i 10))])) (range 10000))
+      t0 (nano-time)
+      res (d/pull-many db0 [:person/name :person/age {:person/dept [:dept/name]}] eids)]
+  (report "pull-10k" (- (nano-time) t0) (str (count res) "/" (reduce + (map :person/age res)) "/"
+                             (count (filter (fn [r] (:dept/name (:person/dept r))) res)))))
+
+(def salary-sum-q
+  '[:find (sum ?s) . :with ?p :in $ [?em ...] :where [?p :person/email ?em] [?p :person/salary ?s]])
+(def first-1000 (mapv email (range 1000)))
+
+; 1,000 transactions of one datom each, default sync (durable).
+(def t-before (d/basis-t (d/db conn)))
+(let [t0 (nano-time)]
+  (dotimes [i 1000]
+    (d/transact! conn [[:db/add [:person/email (email i)] :person/salary (inc i)]]))
+  (report "tx-1k-durable" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
+
+; The same 1,000 transactions with sync off, one sync at the end.
+(let [t0 (nano-time)]
+  (dotimes [i 1000]
+    (d/transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 2 i)]] {:sync :none}))
+  (d/sync conn)
+  (report "tx-1k-nosync" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
+
+; The time views: the salary total as of the basis before the writes,
+; and the count of salary datoms in the history of those 1,000 people.
+(let [t0 (nano-time)
+      db (d/db conn)
+      before (d/q salary-sum-q (d/as-of db t-before) first-1000)
+      hist (d/q '[:find (count ?s) . :with ?p ?tx ?added :in $ [?em ...]
+                  :where [?p :person/email ?em] [?p :person/salary ?s ?tx ?added]]
+                (d/history db) first-1000)]
+  (report "as-of+history" (- (nano-time) t0) (str before "/" hist)))
+
+(d/release conn)

@@ -1,0 +1,9 @@
+; bench/compare/prelude.nx — prepended to every lang/*.clj body for
+; nexis (docs/BENCH.md §12). prelude.bb.clj is its babashka twin; the
+; two differ only in the clock, the string namespace and split's
+; separator (nexis has no regex, so split takes a string).
+(require '[nexis.string :as s])
+(defn now [] (nano-time))
+(defn split-comma [x] (s/split x ","))
+(defn report [t0 answer]
+  (println (str "phase=main ns=" (- (now) t0) " answer=" answer)))
