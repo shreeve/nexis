@@ -41,6 +41,10 @@ pub const SrcSpan = struct {
     len: u32,
 };
 
+/// The longest source text the reader takes: every position in it is
+/// a `u32` byte offset. The loader refuses a longer one up front.
+pub const max_source_len: usize = std.math.maxInt(u32);
+
 pub const Name = struct {
     /// namespace (null = unqualified); text portion is borrowed from source.
     ns: ?[]const u8,
