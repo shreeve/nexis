@@ -23,6 +23,7 @@ const string_mod = @import("string.zig");
 const vector_mod = @import("coll/vector.zig");
 const reader_mod = @import("reader.zig");
 const stack_guard = @import("stack.zig");
+const db = @import("db.zig");
 
 const Value = value_mod.Value;
 
@@ -107,6 +108,12 @@ fn runCommand(init: std.process.Init) !void {
         max_alloc = .{ .child = allocator, .max = max };
         allocator = max_alloc.allocator();
     }
+    if (init.environ_map.get("NEXIS_DURABILITY")) |text| {
+        if (db.Durability.parse(text) == null) {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: NEXIS_DURABILITY is not commit or durable\n");
+            std.process.exit(1);
+        }
+    }
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) usageExit(io);
@@ -172,6 +179,14 @@ const MaxAlloc = struct {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// End the process with `status` where the runtime is not torn down
+/// (an error that ends a run, a failing test run): every store a commit
+/// left unsynced is synced first, as teardown and `exit` do.
+fn exitSynced(status: u8) noreturn {
+    db.StoreFile.syncAll();
+    std.process.exit(status);
 }
 
 fn usageExit(io: std.Io) noreturn {
@@ -440,7 +455,7 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, args: []c
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const info = vm.SourceInfo{ .path = if (eql(path, "-")) "<stdin>" else path, .text = text };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
 }
 
 /// `nexis -e EXPR`: EXPR's forms, each non-nil value printed.
@@ -458,7 +473,7 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
             if (!v.isNil()) try @as(*Runtime, @ptrCast(@alignCast(ctx))).printReadably(v);
         }
     };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| std.process.exit(try rt.report(err));
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
 }
 
 /// `nexis test FILE...`: run each file, then `run-all-tests`; exit 1
@@ -475,12 +490,12 @@ fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8)
         const info = try arena.allocator().create(vm.SourceInfo);
         info.* = .{ .path = path, .text = text };
         const saved = rt.registry.current;
-        _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
+        _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
         rt.registry.current = saved;
     }
     const info = vm.SourceInfo{ .path = "<test>", .text = "(let [r (nexis.test/run-all-tests)] (+ (get r :fail) (get r :error)))" };
-    const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| std.process.exit(try rt.report(err));
-    if (!bad.isFixnum() or bad.asFixnum() != 0) std.process.exit(1);
+    const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
+    if (!bad.isFixnum() or bad.asFixnum() != 0) exitSynced(1);
 }
 
 /// Compile FILE the way `run` does and print every routine's
@@ -512,7 +527,7 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     };
     var each = Disasm{ .rt = &rt, .out = &out.writer };
     const info = vm.SourceInfo{ .path = path, .text = text };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| std.process.exit(try rt.report(err));
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| exitSynced(try rt.report(err));
     try std.Io.File.stdout().writeStreamingAll(io, out.written());
 }
 

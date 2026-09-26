@@ -364,11 +364,26 @@ fn fnConnect(vm: *VM, args: []const Value) VmError!Value {
     return connect(vm, args) catch |err| fail(vm, err);
 }
 
+/// `{:durability :commit | :durable}`; nil, or no `:durability`, means
+/// the process's (`NEXIS_DURABILITY`).
+fn durabilityOption(vm: *VM, v: Value) !?SyncMode {
+    if (v.isNil()) return null;
+    if (v.kind() != .persistent_map) return error.KindMismatch;
+    const k = try vm.ensureInterner().internKeywordValue("durability");
+    const found = switch (champ.mapGet(v, k, &dispatch.hashValue, &dispatch.equal)) {
+        .absent => return null,
+        .present => |x| x,
+    };
+    if (found.kind() != .keyword) return error.InvalidArgument;
+    const durability = dblayer.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse return error.InvalidArgument;
+    return SyncMode.of(durability);
+}
+
 fn connect(vm: *VM, args: []const Value) !Value {
     if (args[0].kind() != .string) return error.KindMismatch;
     const path = string_mod.asBytes(args[0]);
     var options: db_mod.OpenOptions = .{};
-    if (args.len == 2) options.sync = (try syncOption(vm, args[1])) orelse options.sync;
+    if (args.len == 2) options.sync = (try syncOption(vm, args[1])) orelse try durabilityOption(vm, args[1]);
 
     const path_z = try vm.allocator.dupeZ(u8, path);
     defer vm.allocator.free(path_z);

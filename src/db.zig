@@ -152,12 +152,20 @@ pub const StoreFile = struct {
     refs: u32,
     next: ?*StoreFile,
 
+    /// A commit since the last sync left without one: the file's
+    /// data or meta may still be only in the operating system's cache.
+    unsynced: bool = false,
+    /// How the open write transaction's commit syncs.
+    write_sync: emdb.SyncOverride = .full,
+
     var open_files: ?*StoreFile = null;
 
     /// The open file at `path`, or the file opened (or created) now
-    /// with `options`. A file this process may read but not write
-    /// opens read-only.
-    pub fn acquire(path: [*:0]const u8, options: emdb.EnvOptions) !*StoreFile {
+    /// with `options` and `reader_slots` reader slots. A file this
+    /// process may read but not write opens read-only.
+    pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
+        var options = env_options;
+        options.maxReaders = reader_slots;
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
@@ -188,16 +196,19 @@ pub const StoreFile = struct {
         if (self.id.hard_linked) return DbError.HardLinked;
         self.path = canonical;
         self.refs = 1;
+        self.unsynced = false;
+        self.write_sync = .full;
         self.next = open_files;
         open_files = self;
         return self;
     }
 
-    /// Drop one hold; the last closes the environment and frees the
-    /// file.
+    /// Drop one hold; the last syncs what is unsynced, closes the
+    /// environment and frees the file.
     pub fn release(self: *StoreFile) void {
         self.refs -= 1;
         if (self.refs > 0) return;
+        self.syncOrWarn();
         var link = &open_files;
         while (link.*) |f| : (link = &f.next) {
             if (f == self) {
@@ -216,7 +227,43 @@ pub const StoreFile = struct {
     /// opened read-only.
     pub fn beginWrite(self: *StoreFile, options: emdb.Env.WriteOptions) !*emdb.Txn {
         if (self.env.options.readOnly) return error.TxnReadOnly;
-        return self.env.beginWriteWith(options);
+        const txn = try self.env.beginWriteWith(options);
+        self.write_sync = options.sync;
+        return txn;
+    }
+
+    /// Commit the file's write transaction `txn`. One that syncs data
+    /// and meta makes every commit before it durable too; any other
+    /// leaves the file unsynced until `sync`.
+    pub fn commit(self: *StoreFile, txn: *emdb.Txn) !void {
+        try txn.commit();
+        self.unsynced = switch (self.write_sync) {
+            // nexis never opens an environment with emdb's `noSync`
+            // or `noMetaSync`, so its own setting is a full sync.
+            .full, .inherit => false,
+            .none, .noMeta => true,
+        };
+    }
+
+    /// Make every commit so far durable with one full sync of the
+    /// file, when a commit since the last sync was left without one.
+    pub fn sync(self: *StoreFile) !void {
+        if (!self.unsynced) return;
+        try self.env.sync();
+        self.unsynced = false;
+    }
+
+    /// `sync` where no caller can take its error: teardown and exit.
+    fn syncOrWarn(self: *StoreFile) void {
+        self.sync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
+    }
+
+    /// Sync every open file that needs it: what a process runs on its
+    /// way out, where no connection is closed first (`exit`, an
+    /// uncaught error in `bin/nexis`).
+    pub fn syncAll() void {
+        var it = open_files;
+        while (it) |f| : (it = f.next) f.syncOrWarn();
     }
 
     /// A regular file this process may read but not write: the one
@@ -325,6 +372,10 @@ pub const Connection = struct {
     /// track that.
     tree_ids: std.StringHashMapUnmanaged(emdb.TreeId),
 
+    /// How this connection's commits sync; `open` sets the process's
+    /// (`Durability.process`).
+    durability: Durability,
+
     pub fn storeId(self: *const Connection) u128 {
         return (@as(u128, self.store_id_hi) << 64) | @as(u128, self.store_id_lo);
     }
@@ -342,6 +393,43 @@ pub const page_size: u32 = 16384;
 /// Named-tree capacity every nexis store is opened with. Bounds
 /// the `TreeId` range, which sizes the per-transaction tree set.
 pub const max_named_trees: u32 = 128;
+
+/// Reader slots in a store's lock file, 64 bytes each: how many read
+/// transactions every process sharing the file can hold at once. A
+/// table in use keeps the size its first opener gave it until every
+/// process has closed it (emdb INV-T14E).
+pub const reader_slots: u32 = 4096;
+
+/// How a commit reaches the disk (DB.md §3.3). Every commit is atomic
+/// and seen at once by every connection and process sharing the file.
+pub const Durability = enum {
+    /// A commit syncs nothing; the file is synced once when its
+    /// connection closes, at `db/sync` and `nextomic/sync`, and when
+    /// the process ends. A crash of the process loses nothing; a crash
+    /// of the system can lose the commits since the last sync.
+    commit,
+    /// Every commit syncs data and meta.
+    durable,
+
+    pub fn parse(text: []const u8) ?Durability {
+        return std.meta.stringToEnum(Durability, text);
+    }
+
+    /// `NEXIS_DURABILITY`, or `commit` when it is unset. `bin/nexis`
+    /// refuses any other value at start, so an unknown one reaches
+    /// here only from an embedding, and reads as unset.
+    pub fn process() Durability {
+        const text = std.c.getenv("NEXIS_DURABILITY") orelse return .commit;
+        return parse(std.mem.span(text)) orelse .commit;
+    }
+
+    pub fn syncOverride(self: Durability) emdb.SyncOverride {
+        return switch (self) {
+            .commit => .none,
+            .durable => .full,
+        };
+    }
+};
 
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
@@ -378,17 +466,20 @@ pub fn open(
         .store_id_hi = hash_hi,
         .open_flag = true,
         .tree_ids = .empty,
+        .durability = Durability.process(),
     };
 }
 
 /// Close the connection, aborting every transaction the language
-/// holds on it (DB.md §3). A closed connection stays a valid struct:
+/// holds on it (DB.md §3), and sync the file when a commit left it
+/// unsynced. A closed connection stays a valid struct:
 /// refs and handles that name it read `open_flag` and report it
 /// closed. A second close does nothing. A close while a native holds
 /// one of the connection's transactions for a callback, or while a
 /// Zig-level transaction is open, is refused, so no emdb transaction
-/// outlives its env.
-pub fn close(self: *Connection) DbError!void {
+/// outlives its env. A failed sync is returned once the connection is
+/// closed.
+pub fn close(self: *Connection) (DbError || emdb.Error)!void {
     if (!self.open_flag) return;
     var it = Handle.all;
     while (it) |h| : (it = h.next) {
@@ -399,7 +490,15 @@ pub fn close(self: *Connection) DbError!void {
         if (h.conn() == self) h.end();
     }
     if (self.open_txns != 0) return DbError.TransactionsOpen;
+    const synced = self.file.sync();
     release(self);
+    return synced;
+}
+
+/// Make every commit to the connection's file durable (`db/sync`).
+pub fn sync(self: *Connection) !void {
+    if (!self.open_flag) return DbError.ConnectionUnavailable;
+    try self.file.sync();
 }
 
 /// Teardown of the whole VM, when nothing can use the connection
@@ -454,7 +553,7 @@ pub const ReadTxn = struct {
 
 pub fn beginWrite(conn: *Connection) !WriteTxn {
     if (!conn.open_flag) return DbError.ConnectionUnavailable;
-    const txn = try conn.file.beginWrite(.{});
+    const txn = try conn.file.beginWrite(.{ .sync = conn.durability.syncOverride() });
     conn.open_txns += 1;
     return .{ .conn = conn, .inner = txn };
 }
@@ -471,7 +570,7 @@ pub fn beginRead(conn: *Connection) !ReadTxn {
 /// write lock, until it is aborted.
 pub fn commit(txn: *WriteTxn) !void {
     txn.conn.open_txns -= 1;
-    txn.inner.commit() catch |err| {
+    txn.conn.file.commit(txn.inner) catch |err| {
         txn.inner.abort();
         return err;
     };
@@ -1262,6 +1361,160 @@ test "close: refused while a transaction is open; the connection stays a closed 
     try testing.expectError(DbError.ConnectionUnavailable, beginRead(&conn));
 }
 
+/// Syncs the engine has issued in this process (data and meta alike).
+fn engineSyncs() u64 {
+    return emdb.platform.File.syncCalls.load(.monotonic);
+}
+
+test "Durability: parses its two names and nothing else" {
+    try testing.expectEqual(Durability.commit, Durability.parse("commit").?);
+    try testing.expectEqual(Durability.durable, Durability.parse("durable").?);
+    for ([_][]const u8{ "", "batch", "batched", "Durable", "commit " }) |text| {
+        try testing.expect(Durability.parse(text) == null);
+    }
+}
+
+test "durability commit: a commit is seen at once and syncs nothing; close syncs the file once" {
+    const path = try tmpDbPath(testing.allocator, "commit_mode");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&a);
+    a.durability = .commit;
+    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
+
+    const before = engineSyncs();
+    var w = try beginWrite(&a);
+    try put(&w, "t", "k", value.fromFixnum(7).?);
+    try commit(&w);
+    try testing.expectEqual(before, engineSyncs());
+    try testing.expect(a.file.unsynced);
+    {
+        var r = try beginRead(&b);
+        defer abortRead(&r);
+        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+    }
+    // An abort writes nothing, so it leaves nothing more to sync.
+    var aborted = try beginWrite(&a);
+    abortWrite(&aborted);
+    try close(&a);
+    try testing.expectEqual(before + 1, engineSyncs());
+    try testing.expect(!b.file.unsynced);
+    try close(&b);
+    try testing.expectEqual(before + 1, engineSyncs());
+}
+
+test "durability durable: every commit syncs, which leaves nothing for close; a read-only program never syncs" {
+    const path = try tmpDbPath(testing.allocator, "durable_mode");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    conn.durability = .commit;
+    var w = try beginWrite(&conn);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    try testing.expect(conn.file.unsynced);
+    // A durable commit makes every commit before it durable too.
+    conn.durability = .durable;
+    const before = engineSyncs();
+    w = try beginWrite(&conn);
+    try put(&w, "t", "k", value.fromFixnum(2).?);
+    try commit(&w);
+    try testing.expect(engineSyncs() > before);
+    try testing.expect(!conn.file.unsynced);
+    const after_commit = engineSyncs();
+    try close(&conn);
+    try testing.expectEqual(after_commit, engineSyncs());
+
+    var reader = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&reader);
+    var r = try beginRead(&reader);
+    try testing.expectEqual(@as(i64, 2), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+    abortRead(&r);
+    try close(&reader);
+    try testing.expectEqual(after_commit, engineSyncs());
+}
+
+test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    var paths: [3][:0]u8 = undefined;
+    var conns: [3]Connection = undefined;
+    for (&paths, &conns, 0..) |*p, *c, i| {
+        p.* = try tmpDbPath(testing.allocator, &.{'a' + @as(u8, @intCast(i))});
+        c.* = try open(testing.allocator, &heap, &interner, p.*.ptr, .{ .allocator = testing.allocator });
+        c.durability = .commit;
+    }
+    defer for (&paths, &conns) |p, *c| {
+        shutdown(c);
+        cleanupDb(p);
+        testing.allocator.free(p);
+    };
+    for (conns[0..2]) |*c| {
+        var w = try beginWrite(c);
+        try put(&w, "t", "k", value.fromFixnum(1).?);
+        try commit(&w);
+    }
+    const before = engineSyncs();
+    StoreFile.syncAll();
+    try testing.expectEqual(before + 2, engineSyncs());
+    StoreFile.syncAll();
+    try testing.expectEqual(before + 2, engineSyncs());
+
+    var w = try beginWrite(&conns[2]);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    shutdown(&conns[2]);
+    try testing.expectEqual(before + 3, engineSyncs());
+}
+
+test "durability commit: a commit survives its process ending without a sync or a close" {
+    const path = try tmpDbPath(testing.allocator, "crash");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    // The child commits and ends at once, as a killed process does:
+    // no sync, no close, no exit handlers.
+    const pid = std.c.fork();
+    try testing.expect(pid >= 0);
+    if (pid == 0) {
+        var conn = open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }) catch std.c._exit(1);
+        conn.durability = .commit;
+        var w = beginWrite(&conn) catch std.c._exit(2);
+        put(&w, "t", "k", value.fromFixnum(42).?) catch std.c._exit(3);
+        const before = engineSyncs();
+        commit(&w) catch std.c._exit(4);
+        std.c._exit(if (engineSyncs() == before) 0 else 5);
+    }
+    var status: c_int = 0;
+    try testing.expectEqual(pid, std.c.waitpid(pid, &status, 0));
+    try testing.expectEqual(@as(c_int, 0), status);
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    try testing.expectEqual(@as(i64, 42), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+}
+
 test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     const path = try tmpDbPath(testing.allocator, "pagesize");
     defer testing.allocator.free(path);
@@ -1284,6 +1537,23 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     try testing.expectEqual(page_size, conn.file.env.options.pageSize);
     try testing.expectEqual(max_named_trees, conn.file.env.options.maxNamedTrees);
     try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.file.env.maxKeySize());
+}
+
+test "open: the reader table has reader_slots slots, so more than emdb's default 126 reads run at once" {
+    const path = try tmpDbPath(testing.allocator, "readers");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator, .maxReaders = 8 });
+    defer shutdown(&conn);
+    try testing.expectEqual(reader_slots, conn.file.env.info().maxReaders);
+    var reads: [200]ReadTxn = undefined;
+    for (&reads) |*r| r.* = try beginRead(&conn);
+    for (&reads) |*r| abortRead(r);
 }
 
 test "open: failure in a missing directory releases everything it took" {

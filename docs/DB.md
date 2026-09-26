@@ -59,7 +59,7 @@ none); a failure there is ignored, and emdb's own open then reports
 A plain Zig struct, not a Value: it holds its file's `StoreFile`
 (§3.1), the non-owning allocator, heap and interner the codec needs,
 the two `store_id` halves, an open flag, a count of
-open transactions and the tree-handle cache. The stdlib allocates each
+open transactions, the tree-handle cache and its durability (§3.3). The stdlib allocates each
 one on the VM's allocator, records it in `vm.db_connections`, and
 frees it only at VM teardown, so no address a Value holds is reused
 while the VM lives. A `db_connection` Value (kind 31) is a pointer to
@@ -95,15 +95,18 @@ nothing; one whose callback writes its tree pays one copy of the rest
 of the tree, at the first such write.
 
 **Closing.** `close` aborts every transaction the language holds on
-the connection (§3.2), releases the `StoreFile` and leaves the struct
+the connection (§3.2), syncs the file when a commit left it unsynced
+(§3.3), releases the `StoreFile` and leaves the struct
 in place with the open flag false: a ref or connection Value that
 still names it reports the connection closed, and a handle reports its
 transaction closed. A second `close` does nothing. `close` while a
 native holds one of the connection's transactions for a callback, or
 while a Zig-level transaction is open, is refused (`TransactionsOpen`),
 so no emdb transaction outlives its environment and no callback loses
-the transaction its native is using. `shutdown` ends and frees the
-connection's handles and closes whatever is open, for VM teardown.
+the transaction its native is using. A sync that fails is reported
+(`:db/sync-failed`) after the connection is closed. `shutdown` ends
+and frees the connection's handles and closes whatever is open, for
+VM teardown.
 
 **A failed commit aborts.** emdb leaves a transaction whose commit
 failed open, holding the write lock; `commit` aborts it before
@@ -171,13 +174,71 @@ connection, or by a collection:
   names it and reports `:tx-closed`; the first collection that finds
   it unreachable frees it, and teardown frees the rest.
 - Beginning a transaction when the file's writer is taken
-  (`WriterActive`) or emdb's 126 reader slots are full
+  (`WriterActive`) or its reader slots are full
   (`ReaderTableFull`), while a handle this VM could collect holds a
   transaction on the file, runs one collection and begins again. So
   dropped transactions never hold the writer against a later write,
   or the reader slots against a later read, of the same VM; a live
-  writer is still `:db/busy` and 126 live reads still make the next
-  `:db/readers-full`.
+  writer is still `:db/busy`, and when every slot holds a live read
+  the next is `:db/readers-full`.
+
+**Reader slots.** `StoreFile.acquire` opens every file with
+`db.reader_slots` = 4,096 slots in its lock file (64 bytes each, a
+256 KiB `<path>-lock`), where emdb's default is 126. Every process
+sharing the file draws on the one table, and a table in use keeps the
+size its first opener gave it until every process has closed the file
+(emdb INV-T14E), so a process that opens a file an older build holds
+open gets the older size.
+
+#### 3.3 Durability
+
+Every commit is atomic and seen at once by every connection and every
+process sharing the file. Whether it is on the disk when `commit`
+returns is the connection's durability, `db.Durability`:
+
+| Durability | A commit | Lost if the process crashes | Lost if the system crashes |
+|---|---|---|---|
+| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync |
+| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing |
+
+`(db/open path {:durability d})` sets it for one connection. Without
+it a connection takes the process's: the environment variable
+`NEXIS_DURABILITY`, `commit` or `durable`, and `commit` when it is
+unset (`bin/nexis` refuses any other value at start, `docs/TOOLING.md`
+§1). Nextomic's `connect` takes the same option, and `transact!` a
+per-transaction `:sync` (`docs/NEXTOMIC.md` §3).
+
+`StoreFile` records whether a commit since the file's last sync went
+without one (`unsynced`). A commit that syncs data and meta makes
+every commit before it durable too, and clears it. The file is synced,
+with one full sync of the data file (emdb `Env.sync`), when:
+
+- `db/sync` or `nextomic/sync` asks for it;
+- a connection closes: `db/close`, `nextomic/release`, the end of
+  `with-conn`, whether or not another connection still holds the file;
+- the last holder releases it: VM teardown, which ends every `bin/nexis`
+  command that finishes normally;
+- the process ends through `exit` or through an error `bin/nexis`
+  reports (`StoreFile.syncAll`).
+
+A file nothing wrote since its last sync is not synced again, and a
+program that only reads never syncs. A process killed by a signal ends
+without the sync: its commits are in the operating system's cache and
+outlive it (the inline test "a commit survives its process ending
+without a sync or a close" commits in a child process that then
+`_exit`s), and only a crash of the system before the cache reaches the
+disk can lose them. A sync that fails at teardown or exit, where no
+caller can take the error, is reported on stderr.
+
+**No batching.** Consecutive `:commit` writes are separate emdb
+transactions. Joining them into one open write transaction, committed
+within a count or a deadline, would hold the file's writer between
+natives: every point at which another connection or process could read
+the store or wait for its writer (a read through another connection,
+`db/begin-read`, a release, a sync, output, `exit`) would first have to
+commit it, and the deadline needs a clock checked from the VM's loop.
+A `:commit` transaction already costs tens of microseconds
+(`docs/PERF.md` §3.11), so the gain left is the per-commit meta write.
 
 ---
 
@@ -207,8 +268,10 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | Function | Contract |
 |---|---|
 | `open(allocator, heap, interner, path, options) !Connection` | §2, §3. |
-| `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1. |
-| `close(*Connection) DbError!void` / `shutdown(*Connection) void` | §3. |
+| `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
+| `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced; that for every open file (§3.3). |
+| `Durability.parse(text) ?Durability` / `Durability.process() Durability` | `commit` or `durable`; the process's, from `NEXIS_DURABILITY` (§3.3). |
+| `close(*Connection) !void` / `shutdown(*Connection) void` / `sync(*Connection) !void` | §3, §3.3. |
 | `storeId(*const Connection) u128` | §2. |
 | `beginWrite(*Connection) !WriteTxn` / `beginRead(*Connection) !ReadTxn` | `ConnectionUnavailable` on a closed connection. |
 | `commit(*WriteTxn) !void` / `abortWrite(*WriteTxn)` / `abortRead(*ReadTxn)` | End the transaction; a failed commit aborts (§3). |
@@ -302,8 +365,8 @@ trees, Nextomic's twelve among them when it shares the file),
 `:db/corrupted` (also a file that is not a store, and a format-version
 mismatch), `:db/map-full`, `:db/mmap-failed`, `:db/open-failed`,
 `:db/page-size-mismatch`, `:db/busy` (a writer already active, the
-environment busy), `:db/readers-full` (126 read transactions open on
-the file, emdb's reader table; §3.2), `:db/txn-aborted`,
+environment busy), `:db/readers-full` (every one of the file's 4,096
+reader slots holds a read; §3.2), `:db/txn-aborted`,
 `:db/read-only`, `:db/sync-failed`; anything else is `:db-error`.
 Nextomic shares these `:db/*` names through the same function.
 
@@ -374,17 +437,18 @@ and any operation on a closed connection or through a ref of one is
 
 | Form | Arity | Result |
 |---|---|---|
-| `(db/open path)` | 1 | A connection; creates the file and its parent directories. A file the process may only read opens read-only. |
-| `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3); closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
+| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
+| `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3); closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
+| `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3). |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
 | `(db/ref? x)` | 1 | Whether `x` is a durable ref. |
-| `(db/put-key! ref v)` | 2 | nil; one write transaction around one put. |
+| `(db/put-key! ref v)` | 2 | nil; one write transaction around one put, committed as the connection's durability says (§3.3), as every commit here is. |
 | `(db/get-key ref)` / `(db/get-key ref default)` | 1–2 | The stored value, or `default` (nil); one read transaction. |
 | `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
 | `(db/present? ref)` | 1 | Whether the key exists. |
 | `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (Vars, atoms, delays, reduced too); another kind is `:not-derefable`. |
 | `(db/begin-write conn)` | 1 | A write transaction; while any connection or Nextomic store of the same file holds one, `:db/busy`. |
-| `(db/begin-read conn)` | 1 | A read transaction; with 126 open on the file, `:db/readers-full`. |
+| `(db/begin-read conn)` | 1 | A read transaction; with every reader slot of the file taken (§3.2), `:db/readers-full`. |
 | `(db/commit! tx)` | 1 | nil; the transaction is over even when the commit fails. Any use of a finished transaction is `:tx-closed`. |
 | `(db/abort-write! tx)` / `(db/abort-read! tx)` | 1 | nil; aborting a finished transaction is nil. |
 | `(db/put! tx ref v)` | 3 | nil. A read transaction here is `:kind-mismatch`. |

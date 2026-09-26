@@ -1,0 +1,8 @@
+ok another connection sees a commit at once
+ok the first connection sees the second's commit at once
+ok sync is nil
+ok release is nil
+ok an unknown durability is :invalid-argument
+ok a durability that is not a keyword is :invalid-argument
+ok options that are not a map are :kind-mismatch
+:durability-1-exits

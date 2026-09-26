@@ -2780,7 +2780,7 @@ fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: [
     try testing.expect(nx.db.handleCount() < 8);
 }
 
-/// Ten thousand dropped reads (emdb has 126 reader slots), and
+/// Ten thousand dropped reads (a store has 4,096 reader slots), and
 /// dropped writes that hold the file's writer until a collection or
 /// the close ends them.
 const dropped_txns = [_][]const u8{
@@ -2909,6 +2909,68 @@ test "db/open: two connections to one file share its writer; a second write is :
         \\ (do (db/abort-write! t1) (db/put-key! (db/ref b :t :x) 2) (db/get-key (db/ref a :t :x)))
         \\ (do (db/close a) (db/get-key (db/ref b :t :x)))]
     , "[:db/busy :db/busy 2 2]");
+}
+
+fn engineSyncs() u64 {
+    return nx.emdb.platform.File.syncCalls.load(.monotonic);
+}
+
+/// Run each `[source expected syncs]` step of `steps` on one program
+/// holding `@STORE@`, where `syncs` is how many engine syncs the step
+/// may issue: an exact count, or null for at least one.
+fn expectSyncs(name: []const u8, steps: []const struct { []const u8, []const u8, ?u64 }) !void {
+    var store = try SeamStore.init(name);
+    defer store.deinit();
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    for (steps) |step| {
+        const src = try store.source(step[0]);
+        defer testing.allocator.free(src);
+        const before = engineSyncs();
+        try harness.expectResult(&program, src, try program.run(src), step[1]);
+        const n = engineSyncs() - before;
+        if (step[2]) |expected| try testing.expectEqual(expected, n) else try testing.expect(n > 0);
+    }
+}
+
+test "db/open: a commit syncs nothing unless the connection is :durable; db/sync and db/close sync once" {
+    try expectSyncs("durability", &.{
+        .{
+            \\(def c (db/open "@STORE@" {:durability :commit}))
+            \\(def d (db/open "@STORE@" {:durability :durable}))
+            \\(def r (db/ref c :t :k))
+            \\(do (db/put-key! r 1) (with-tx [tx c] (db/put! tx r 2)) [(db/get-key (db/ref d :t :k)) (db/delete-key! (db/ref c :t :j))])
+            ,
+            "[2 false]",
+            0,
+        },
+        .{ "(db/sync c)", "nil", 1 },
+        .{ "[(db/sync c) (db/sync d)]", "[nil nil]", 0 },
+        .{ "(db/put-key! (db/ref d :t :k) 3)", "nil", null },
+        .{ "(db/close d)", "nil", 0 },
+        .{ "(do (db/put-key! r 4) (db/close c))", "nil", 1 },
+        .{
+            \\[(try (db/sync c) (catch any e e))
+            \\ (try (db/open "@STORE@" {:durability :batch}) (catch any e e))
+            \\ (try (db/open "@STORE@" {:durability "commit"}) (catch any e e))
+            \\ (try (db/open "@STORE@" [:durability :commit]) (catch any e e))
+            \\ (db/get-key (db/ref (db/open "@STORE@" nil) :t :k))]
+            ,
+            "[:db-closed :invalid-argument :invalid-argument :kind-mismatch 4]",
+            0,
+        },
+    });
+}
+
+test "db/begin-read: two hundred reads stay open at once, past emdb's default of 126 slots" {
+    try expectOutputProgramWithStore("many-readers",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (db/put-key! (db/ref c :t :k) 1)
+        \\  (def reads (mapv (fn [_] (db/begin-read c)) (range 200)))
+        \\  [(count reads) (db/get (peek reads) (db/ref c :t :k)) (every? nil? (mapv db/abort-read! reads))])
+    , "[200 1 true]");
 }
 
 test "db/* and Nextomic on one file: a write inside the other's transaction is refused, not waited on" {

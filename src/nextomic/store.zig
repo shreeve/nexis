@@ -71,10 +71,19 @@ pub const Trees = struct {
     }
 };
 
+/// How one commit syncs: data and meta, data only, or nothing
+/// (`db.Durability` chooses a connection's).
 pub const SyncMode = enum {
     full,
     no_meta,
     none,
+
+    pub fn of(durability: db_layer.Durability) SyncMode {
+        return switch (durability) {
+            .commit => .none,
+            .durable => .full,
+        };
+    }
 
     fn override(self: SyncMode) emdb.SyncOverride {
         return switch (self) {
@@ -87,6 +96,9 @@ pub const SyncMode = enum {
 
 pub const Options = struct {
     map_size: u64 = 256 * 1024 * 1024,
+    /// How the commit that creates, bootstraps or completes the store
+    /// syncs.
+    sync: SyncMode = .full,
     /// False leaves `:db/fulltext` out of the bootstrap, making a store
     /// as one written without the attribute, for the test of its mint
     /// at open.
@@ -258,7 +270,7 @@ pub const Store = struct {
         errdefer self.file.release();
 
         if (!try self.openComplete()) {
-            const txn = try self.file.beginWrite(.{});
+            const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
             errdefer txn.abort();
             try self.openTrees(txn);
             if (try self.sysGet(txn, "format")) |_| {
@@ -267,7 +279,7 @@ pub const Store = struct {
             } else {
                 try self.bootstrap(txn, options.fulltext_attr);
             }
-            try txn.commit();
+            try self.file.commit(txn);
         }
         self.is_open = true;
         return self;
@@ -380,10 +392,16 @@ pub const Store = struct {
         }
     }
 
-    /// Make every commit so far durable (after `.none` loads).
+    /// Commit the write transaction `txn` (`db.StoreFile.commit`).
+    pub fn commit(self: *Store, txn: *Txn) !void {
+        try self.file.commit(txn);
+    }
+
+    /// Make every commit so far durable: one full sync, when a commit
+    /// since the last left the file unsynced.
     pub fn sync(self: *Store) !void {
         if (!self.is_open) return error.Closed;
-        try self.file.env.sync();
+        try self.file.sync();
     }
 
     // ── sys ───────────────────────────────────────────────────────
