@@ -2578,6 +2578,18 @@ fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst
     try e.emit(op.inst(dst, a, b));
 }
 
+/// A node whose evaluation has no effect and cannot fail: a literal
+/// or a local of this routine. (A Var's read fails while it is
+/// unbound.)
+fn isInert(e: *const Emitter, t: *const Tiny) bool {
+    return switch (t.*) {
+        .nil, .bool, .literal => true,
+        .int => |n| value_mod.isFixnumRange(n),
+        .symbol => |name| e.resolveLocalRef(name) != null,
+        else => false,
+    };
+}
+
 /// A node that evaluates without running code: a literal or a
 /// symbol.
 fn isLeaf(t: *const Tiny) bool {
@@ -2763,6 +2775,9 @@ fn bindSequential(e: *Emitter, bindings: []const Binding, slots: ?[]u12) Compile
     }
 }
 
+/// `let*` binds as `bindSequential`, except that a binding whose
+/// value is a local already held in a slot names that slot instead
+/// of copying it (`aliasSlot`).
 fn compileLetStar(
     e: *Emitter,
     bindings: []const Binding,
@@ -2774,9 +2789,55 @@ fn compileLetStar(
     // behind for a recovering caller.
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
-    try bindSequential(e, bindings, null);
+    for (bindings) |b| {
+        if (try aliasSlot(e, b, body, recur_target)) |slot| {
+            try e.scope.append(e.allocator, .{ .name = b.name, .ref = .{ .direct_slot = slot } });
+            continue;
+        }
+        const slot = try e.allocSlot();
+        try compileExpr(e, b.value, slot, null);
+        try e.bindLocal(b.name, slot, b.captured);
+    }
     // The body is in the let's own tail position.
     try compileExpr(e, body, dst, recur_target);
+}
+
+/// The slot a `let*` binding can share instead of taking its own
+/// (COMPILER.md §4.4, aliasing): its value is a symbol naming an
+/// uncaptured local of this routine, the binding is not captured
+/// (a cell would box the shared slot), and nothing rewrites the
+/// slot while the binding is in scope. The only instruction that
+/// rewrites a bound slot is a `recur` rebinding its target's
+/// bindings, and a `recur` inside the scope can only target the
+/// `let*`'s own target, from the body's tail.
+fn aliasSlot(e: *Emitter, b: Binding, body: *const Tiny, recur_target: ?*const RecurTarget) CompileError!?u12 {
+    if (b.captured) return null;
+    const name = switch (b.value.*) {
+        .symbol => |n| n,
+        else => return null,
+    };
+    const slot = switch (e.resolveLocalRef(name) orelse return null) {
+        .direct_slot => |s| s,
+        else => return null,
+    };
+    if (recur_target) |t| {
+        if (isRecurSlot(t, slot) and try mayRecur(body)) return null;
+    }
+    return slot;
+}
+
+/// Whether a tail position of `t` is a `recur`: the positions a
+/// `recur` of the enclosing target can take (COMPILER.md §4.4).
+fn mayRecur(t: *const Tiny) CompileError!bool {
+    try stack.check();
+    return switch (t.*) {
+        .recur => true,
+        .if_ => |i| try mayRecur(i.then) or (if (i.else_) |x| try mayRecur(x) else false),
+        .do_ => |items| items.len > 0 and try mayRecur(items[items.len - 1]),
+        .let_star => |l| try mayRecur(l.body),
+        .letfn_star => |l| try mayRecur(l.body),
+        else => false,
+    };
 }
 
 /// Lower `(try body (catch any binding handler) (finally body))`.
@@ -3043,14 +3104,49 @@ fn compileDo(
         try compileExpr(e, exprs[0], dst, recur_target);
         return;
     }
-    // The forms before the last run for effect, into one discard
-    // slot, and are not in tail position.
-    const discard = try e.allocSlot();
-    for (exprs[0 .. exprs.len - 1]) |expr| {
-        try compileExpr(e, expr, discard, null);
-    }
+    // The forms before the last run for effect and are not in tail
+    // position.
+    for (exprs[0 .. exprs.len - 1]) |expr| try compileEffect(e, expr);
     // Last expression IS tail position; inherit recur target.
     try compileExpr(e, exprs[exprs.len - 1], dst, recur_target);
+}
+
+/// Compile `t` for its effect alone (COMPILER.md §5.3): a form that
+/// runs no code and cannot fail is dropped, a `do` is its forms for
+/// effect, and an `if` runs its arms for effect, so an arm that is
+/// dropped costs no jump and no nil. Anything else computes into a
+/// slot freed at once.
+fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
+    if (isInert(e, t)) return;
+    const saved_span = e.current_span;
+    defer e.current_span = saved_span;
+    if (e.spanned) {
+        const node: *const TinyNode = @fieldParentPtr("tiny", t);
+        if (node.span) |span| e.current_span = span;
+    }
+    errdefer if (e.diag) |d| {
+        if (d.span == null) d.span = e.current_span;
+    };
+    try stack.check();
+    const slot_mark = e.slot_top;
+    defer e.slot_top = slot_mark;
+    switch (t.*) {
+        .do_ => |items| for (items) |item| try compileEffect(e, item),
+        .if_ => |i| {
+            if (isInert(e, i.then) and (i.else_ == null or isInert(e, i.else_.?))) return compileEffect(e, i.test_);
+            const test_op = try compileOperand(e, i.test_, true);
+            const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
+            e.slot_top = slot_mark;
+            try compileEffect(e, i.then);
+            const else_form = i.else_ orelse return e.patchJumpHere(if_false_pc);
+            if (isInert(e, else_form)) return e.patchJumpHere(if_false_pc);
+            const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitJumpPlaceholder();
+            try e.patchJumpHere(if_false_pc);
+            try compileEffect(e, else_form);
+            if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
+        },
+        else => try compileExpr(e, t, try e.allocSlot(), null),
+    }
 }
 
 /// What `compileFn` builds a routine from: a `fn*`, or a `letfn*`
@@ -3566,12 +3662,13 @@ test "bytecode: forms compile and run in a bare namespace" {
     try testing.expectEqual(@as(i64, 7), (try v.run()).asFixnum());
 }
 
-/// `(do nil nil ... tail)`: `pad` nils, each one instruction, ahead
-/// of `tail`, so the code `tail` emits starts at pc `pad`.
+/// `(do (inc 1) (inc 1) ... tail)`: `pad` increments, each one
+/// instruction, ahead of `tail`, so the code `tail` emits starts at
+/// pc `pad`.
 fn paddedSource(allocator: std.mem.Allocator, pad: usize, tail: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(allocator, "(do");
-    for (0..pad) |_| try out.appendSlice(allocator, " nil");
+    for (0..pad) |_| try out.appendSlice(allocator, " (inc 1)");
     try out.print(allocator, " {s})", .{tail});
     return out.toOwnedSlice(allocator);
 }
@@ -3617,7 +3714,7 @@ test "routine limits: at most 4096 constants" {
     for ([_]struct { n: usize, ok: bool }{ .{ .n = 4096, .ok = true }, .{ .n = 4097, .ok = false } }) |c| {
         var src: std.ArrayList(u8) = .empty;
         try src.appendSlice(a, "(do");
-        for (0..c.n) |i| try src.print(a, " {d}", .{i});
+        for (0..c.n) |i| try src.print(a, " (inc {d})", .{i});
         try src.appendSlice(a, ")");
         if (c.ok) {
             _ = try compileSourceWith(a, src.items, .{});

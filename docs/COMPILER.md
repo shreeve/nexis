@@ -222,6 +222,13 @@ constant pool, Var table, capture descriptors, span table,
   `finally` computes its value into a temporary and moves it to the
   destination after the finally has run (§5.10). This is what lets a
   `recur` argument compile straight into its binding's slot (§5.6).
+- **Aliases share a slot.** A `let*` binding whose value is a local
+  held directly in a slot, and which no closure captures, names that
+  slot instead of copying it, so `(let* [g x] ...)` from a macro
+  costs nothing. A bound slot is rewritten only by a `recur` of its
+  target, so the alias is refused when the slot is one of the
+  enclosing target's bindings and a tail position of the `let*`
+  body is a `recur`.
 - **Operands in place.** A `math` or `cmp` instruction,
   `jump:if-false`, `var:store-var` and `ctrl:throw` read a literal (as
   a constant), a local held directly in its slot, an upvalue or a Var
@@ -324,7 +331,12 @@ branch (nil when absent).
 #### 5.3 `(do expr...)`
 
 Every expression but the last compiles for effect; the last into the
-result slot. `(do)` is nil, and so is every empty body: `(fn* [])`,
+result slot. For effect, a form that runs no code and cannot fail (a
+literal, a local; not a Var, whose read fails while it is unbound)
+emits nothing, a `do` is its forms for effect, and an `if` runs its
+arms for effect, so a dropped arm costs neither the jump past it nor
+the nil it would have been: `(do (when x (f)) y)` is the test, the
+call and the read of `y`. `(do)` is nil, and so is every empty body: `(fn* [])`,
 `(let* [x 1])`, `(loop* [x 1])`, a `letfn*` without a body, a `try`
 body or handler with no forms. The literal `()` is the empty list.
 
@@ -332,7 +344,8 @@ body or handler with no forms. The literal `()` is the empty list.
 
 Each binding takes a slot; each value compiles into it in order, and
 a captured binding is boxed with `closure:box-local` immediately
-(§6.1). The body compiles as `do`.
+(§6.1), except that a binding to a local shares that local's slot
+when §4.4 allows it. The body compiles as `do`.
 
 #### 5.5 `(fn* name? [params... & rest?] body...)`
 

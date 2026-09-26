@@ -66,6 +66,22 @@ const cases = [_]Case{
     .{ .src = "(let* [x (if false 1 2)] x)", .out = "2" },
     .{ .src = "(let* [] 42)", .out = "42" },
     .{ .src = "(let* [x 1] 99 88 x)", .out = "1" },
+    // A binding to a local shares its slot unless a recur could
+    // rebind that slot while the binding is in scope.
+    .{ .src = "(let* [a 1] (let* [b a a 2] [a b]))", .out = "[2 1]" },
+    .{ .src = "((fn* [a] (let* [x a y x] (+ x y))) 4)", .out = "8" },
+    .{ .src = "(loop* [i 0 j 0] (let* [x i] (if (< x 3) (recur (inc j) x) [i j x])))", .out = "[3 2 3]" },
+    .{ .src = "(loop* [i 0 acc []] (if (< i 3) (let* [x i] (recur (inc x) (conj acc x))) acc))", .out = "[0 1 2]" },
+    .{ .src = "(loop* [i 0 acc 0] (if (< i 3) (recur (inc i) (+ acc (let* [x i] (* x x)))) acc))", .out = "5" },
+    .{ .src = "((fn* [n acc] (let* [m n] (if (< m 3) (recur (inc m) (+ acc m)) [n acc]))) 0 0)", .out = "[3 3]" },
+    .{ .src = "(try (throw 5) (catch any e (let* [x e] (+ x 1))))", .out = "6" },
+    .{ .src = "(let* [x 1] (let* [f (let* [y x] (fn* [] y))] (f)))", .out = "1" },
+    // A form for effect: what cannot fail is dropped, an if's arms
+    // run for effect.
+    .{ .src = "(let* [x 1] (do nil 2 x (if x 1 2) (if x 1) x))", .out = "1" },
+    .{ .src = "(let* [a (atom 0)] (do (if true (swap! a inc)) (if false 1 (swap! a inc)) (if false (swap! a inc)) (if true (swap! a inc) 2) @a))", .out = "3" },
+    .{ .src = "(try (do (if true (throw :t)) 1) (catch any e e))", .out = ":t" },
+    .{ .src = "(let* [a (atom 0)] (do (do (swap! a inc) nil (do 1 (swap! a inc))) @a))", .out = "2" },
     // fn* and calls.
     .{ .src = "((fn* [] 42))", .out = "42" },
     .{ .src = "((fn* [x] (+ x 1)) 5)", .out = "6" },
@@ -280,6 +296,8 @@ const failures = [_]Failure{
     .{ .src = "(recur)", .err = error.RecurOutsideTail },
     .{ .src = "(loop* [i 0] (let* [x (recur 1)] x))", .err = error.RecurOutsideTail },
     .{ .src = "(loop* [i 0] (do (recur 1) i))", .err = error.RecurOutsideTail },
+    .{ .src = "(loop* [i 0] (do (if true (recur 1)) i))", .err = error.RecurOutsideTail },
+    .{ .src = "(loop* [i 0] (do (if true 1 (recur 1)) i))", .err = error.RecurOutsideTail },
     .{ .src = "(loop* [i 0] (if (recur 1) i i))", .err = error.RecurOutsideTail },
     .{ .src = "(loop* [i 0] ((fn* [x] x) (recur 1)))", .err = error.RecurOutsideTail },
     .{ .src = "(loop* [i 0] (try (recur 1) (catch any e e)))", .err = error.RecurOutsideTail },
@@ -292,6 +310,7 @@ const failures = [_]Failure{
     .{ .src = "(var nope/x)", .err = error.UnresolvedSymbol },
     .{ .src = "(var nexis.core/no-such-var)", .err = error.UnresolvedSymbol },
     .{ .src = "never-bound", .err = error.UnboundVar },
+    .{ .src = "(do never-bound 1)", .err = error.UnboundVar },
     .{ .src = "(do (defn f [] (g)) (f))", .err = error.UnboundVar },
     .{ .src = "(throw 13)", .err = error.UncaughtThrow },
     .{ .src = "(let* [z 0] (quot 1 z))", .err = error.DivideByZero },
@@ -617,6 +636,41 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
     for (call.consts) |k| if (k == .routine) try testing.expectEqual(@as(usize, 1), k.routine.var_table.len);
 }
 
+/// The instructions of the one `fn*` routine `src` compiles to.
+fn fnCodeLen(program: *harness.Program, src: []const u8) !usize {
+    const compiled = try compileIn(program, src);
+    for (compiled.consts) |k| if (k == .routine) return k.routine.code.len;
+    return error.TestFailed;
+}
+
+test "codegen: what common shapes cost (COMPILER.md §4.4)" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const Shape = struct { src: []const u8, len: usize };
+    const shapes = [_]Shape{
+        // A binding to a local shares its slot: the move into the
+        // result, the return.
+        .{ .src = "(fn* [a] (let* [x a] x))", .len = 2 },
+        .{ .src = "(fn* [a] (let* [x a y x z y] z))", .len = 2 },
+        // Unless a recur could rebind the slot in its scope.
+        .{ .src = "(fn* [a] (let* [x a] (if x (recur 1) x)))", .len = 6 },
+        // What runs for effect and cannot fail costs nothing.
+        .{ .src = "(fn* [a] (do nil 1 a (if a 1) (if a 1 2) 2))", .len = 2 },
+        // An if for effect: no jump past a dropped arm, no nil.
+        .{ .src = "(fn* [a] (do (if a (a)) a))", .len = 5 },
+        // Arguments compute straight into the call block.
+        .{ .src = "(fn* [a] (a (inc a) (a) 1))", .len = 7 },
+    };
+    for (shapes) |shape| {
+        const len = try fnCodeLen(&program, shape.src);
+        testing.expectEqual(shape.len, len) catch |err| {
+            std.debug.print("\n  {s}: {d} instructions\n", .{ shape.src, len });
+            return err;
+        };
+    }
+}
+
 test "slots: a routine's frame holds what is live at once, not every temporary it ever used" {
     var program: harness.Program = undefined;
     try program.init();
@@ -689,13 +743,16 @@ test "eval: a form's lowering is freed once its routine is compiled" {
 // =============================================================================
 //
 // Random programs over integer literals, + - * inc, if on <, let*
-// (new names and names that shadow), fn* called in place or bound
-// and called twice (closures over outer names), and a counting loop*
-// whose second binding's recur argument reads both bindings
-// (parallel assignment), sometimes through a closure, or whose
-// recur argument is the step itself, and a guarded expression whose
-// value an inner finally discards by throwing, so its handler's
-// value is the result. Each program
+// (new names and names that shadow), fn* called in place with one or
+// two arguments or bound and called twice (closures over outer
+// names), a call whose argument may throw to an enclosing catch, and
+// a counting loop* whose second binding's recur argument reads both
+// bindings (parallel assignment), sometimes through a closure, or
+// whose recur argument is the step itself, sometimes with the loop's
+// bindings read through `let*` aliases, and a guarded expression
+// whose value an inner finally discards by throwing, so its
+// handler's value is the result. Arguments are any of these, so
+// calls nest inside call and recur arguments. Each program
 // is built as a tree, printed as source and evaluated directly; the
 // compiled program must agree. The reference computes in i128 and
 // the VM promotes past the fixnum range, so both print the same
@@ -712,12 +769,18 @@ const Expr = union(enum) {
     let: struct { name: u8, value: *const Expr, body: *const Expr },
     /// ((fn* [param] body) arg)
     apply: struct { param: u8, body: *const Expr, arg: *const Expr },
+    /// ((fn* [p q] body) a b)
+    apply2: struct { p: u8, q: u8, body: *const Expr, a: *const Expr, b: *const Expr },
+    /// (try ((fn* [p q] (+ p q)) a (if (< x y) (throw 0) b)) (catch any e handler))
+    may_throw: struct { p: u8, q: u8, a: *const Expr, x: *const Expr, y: *const Expr, b: *const Expr, handler: *const Expr },
     /// (let* [f (fn* [param] body)] (+ (f a1) (f a2)))
     twice: struct { f: u8, param: u8, body: *const Expr, a1: *const Expr, a2: *const Expr },
     /// (loop* [i 0 j init] (if (< i k) (recur (inc i) (+ j (* i step))) j)),
     /// the step inside ((fn* [] step)) when `closure`, and the recur
-    /// argument the step itself when `replace`.
-    loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool, replace: bool },
+    /// argument the step itself when `replace`. When `alias`, the
+    /// body reads `i` as `a` and the step's `j` as `b`:
+    /// (let* [a i] (if (< a k) (recur (inc a) (let* [b j] (+ b (* a step)))) j))
+    loop: struct { i: u8, j: u8, k: u8, init: *const Expr, step: *const Expr, closure: bool, replace: bool, alias: bool },
     /// (try (try body (finally (throw 0))) (catch any e handler))
     guard: struct { body: *const Expr, handler: *const Expr },
 };
@@ -760,7 +823,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 10)) {
+    e.* = switch (rand.uintLessThan(u8, 12)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -790,6 +853,26 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
             } };
         },
         8 => .{ .guard = .{ .body = try genExpr(a, rand, names, d), .handler = try genExpr(a, rand, names, d) } },
+        9 => blk: {
+            const p = names.binder(rand);
+            const q: u8 = @intCast(names.len + 120);
+            break :blk .{ .apply2 = .{
+                .p = p,
+                .q = q,
+                .body = try genExpr(a, rand, names.with(p).with(q), d),
+                .a = try genExpr(a, rand, names, d),
+                .b = try genExpr(a, rand, names, d),
+            } };
+        },
+        10 => .{ .may_throw = .{
+            .p = @intCast(names.len + 120),
+            .q = @intCast(names.len + 150),
+            .a = try genExpr(a, rand, names, d),
+            .x = try genExpr(a, rand, names, d),
+            .y = try genExpr(a, rand, names, d),
+            .b = try genExpr(a, rand, names, d),
+            .handler = try genExpr(a, rand, names, d),
+        } },
         else => blk: {
             const i = names.binder(rand);
             const j: u8 = @intCast(names.len + 60);
@@ -816,6 +899,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
                     .step = step,
                     .closure = rand.boolean(),
                     .replace = rand.boolean(),
+                    .alias = rand.boolean(),
                 },
             };
         },
@@ -864,6 +948,28 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
             try printExpr(x.arg, w);
             try w.writeAll(")");
         },
+        .apply2 => |x| {
+            try w.print("((fn* [v{d} v{d}] ", .{ x.p, x.q });
+            try printExpr(x.body, w);
+            try w.writeAll(") ");
+            try printExpr(x.a, w);
+            try w.writeAll(" ");
+            try printExpr(x.b, w);
+            try w.writeAll(")");
+        },
+        .may_throw => |x| {
+            try w.print("(try ((fn* [v{d} v{d}] (+ v{d} v{d})) ", .{ x.p, x.q, x.p, x.q });
+            try printExpr(x.a, w);
+            try w.writeAll(" (if (< ");
+            try printExpr(x.x, w);
+            try w.writeAll(" ");
+            try printExpr(x.y, w);
+            try w.writeAll(") (throw 0) ");
+            try printExpr(x.b, w);
+            try w.writeAll(")) (catch any e ");
+            try printExpr(x.handler, w);
+            try w.writeAll("))");
+        },
         .twice => |x| {
             try w.print("(let* [v{d} (fn* [v{d}] ", .{ x.f, x.param });
             try printExpr(x.body, w);
@@ -874,15 +980,24 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) !void {
             try w.writeAll(")))");
         },
         .loop => |x| {
+            // The aliases' names are past every name in scope.
+            const ai: u8 = if (x.alias) 200 else x.i;
+            const bj: u8 = if (x.alias) 201 else x.j;
             try w.print("(loop* [v{d} 0 v{d} ", .{ x.i, x.j });
             try printExpr(x.init, w);
-            try w.print("] (if (< v{d} {d}) (recur (inc v{d}) ", .{ x.i, x.k, x.i });
-            if (!x.replace) try w.print("(+ v{d} (* v{d} ", .{ x.j, x.i });
+            try w.writeAll("] ");
+            if (x.alias) try w.print("(let* [v{d} v{d}] ", .{ ai, x.i });
+            try w.print("(if (< v{d} {d}) (recur (inc v{d}) ", .{ ai, x.k, ai });
+            if (x.alias and !x.replace) try w.print("(let* [v{d} v{d}] ", .{ bj, x.j });
+            if (!x.replace) try w.print("(+ v{d} (* v{d} ", .{ bj, ai });
             if (x.closure) try w.writeAll("((fn* [] ");
             try printExpr(x.step, w);
             if (x.closure) try w.writeAll("))");
             if (!x.replace) try w.writeAll("))");
-            try w.print(") v{d}))", .{x.j});
+            if (x.alias and !x.replace) try w.writeAll(")");
+            try w.print(") v{d})", .{x.j});
+            if (x.alias) try w.writeAll(")");
+            try w.writeAll(")");
         },
         .guard => |x| {
             try w.writeAll("(try (try ");
@@ -940,6 +1055,15 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             try evalExpr(a, x.other, env),
         .let => |x| try evalExpr(a, x.body, try env.with(a, x.name, try evalExpr(a, x.value, env))),
         .apply => |x| try evalExpr(a, x.body, try env.with(a, x.param, try evalExpr(a, x.arg, env))),
+        .apply2 => |x| blk: {
+            const va = try evalExpr(a, x.a, env);
+            const vb = try evalExpr(a, x.b, env);
+            break :blk try evalExpr(a, x.body, try (try env.with(a, x.p, va)).with(a, x.q, vb));
+        },
+        .may_throw => |x| if (try evalExpr(a, x.x, env) < try evalExpr(a, x.y, env))
+            try evalExpr(a, x.handler, env)
+        else
+            try evalExpr(a, x.a, env) + try evalExpr(a, x.b, env),
         .twice => |x| blk: {
             // The fn closes over `env`; `f` is fresh, so the
             // arguments see `env` as it is.
