@@ -2616,6 +2616,14 @@ test "string: str: result is itself a string" {
     try expectOutput("(count (str \"héllo\"))", "5");
 }
 
+test "string: str measures plain parts and writes them once; one string alone is itself" {
+    try expectOutput("(str -12 \\u{E9} nil \"x\" 0 \\u{1F980})", "-12éx0🦀");
+    try expectOutput("(str 140737488355327 \" \" -140737488355328)", "140737488355327 -140737488355328");
+    try expectOutput("(let [s (str \"a\" 1)] [(identical? s (str s)) (= \"a1\" (str s)) (str \"\")])", "[true true ]");
+    // A part the printer makes switches the whole call to it.
+    try expectOutput("(str 1 1.5 :k \"é\" [\"q\"])", "11.5:ké[\"q\"]");
+}
+
 test "string: string? after subs returns true" {
     try expectOutput("(string? (subs \"hello\" 1 4))", "true");
 }
@@ -3124,6 +3132,17 @@ test "nexis.string: join: round-trips with split" {
         \\(let [s "a,b,," sep ","]
         \\  [(nexis.string/join sep (nexis.string/split s sep -1)) (nexis.string/join sep (nexis.string/split s sep))])
     , "[a,b,, a,b]");
+}
+
+test "nexis.string: join, split, replace and index-of across 32-byte blocks and multibyte text" {
+    try expectOutput("(nexis.string/join \",\" [1 -2 nil \"é\" \\c])", "1,-2,,é,c");
+    try expectOutput("[(nexis.string/join \"-\" \"héb\") (nexis.string/join \", \" []) (nexis.string/join \",\" {:a 1})]", "[h-é-b  [:a 1]]");
+    try expectOutput("(let [s (nexis.string/join \",\" (range 1000))] [(count s) (count (nexis.string/split s \",\")) (last (nexis.string/split s \",\"))])", "[3889 1000 999]");
+    try expectOutput("(pr-str [(nexis.string/split \",a,b\" \",\") (nexis.string/split \"aébéc\" \"é\") (nexis.string/split \"a::b:::c\" \"::\")])", "[[\"\" \"a\" \"b\"] [\"a\" \"b\" \"c\"] [\"a\" \"b\" \":c\"]]");
+    try expectOutput("(let [s (apply str (repeat 50 \"xé,\"))] [(count (nexis.string/split s \",\")) (count (nexis.string/split s \"é,x\")) (count (nexis.string/split s \",\" 7))])", "[50 50 7]");
+    try expectOutput("(let [s (apply str (repeat 100 \"ab\"))] [(count (nexis.string/replace s \"b\" \"xyz\")) (count (nexis.string/replace s \"ab\" \"\")) (identical? s (nexis.string/replace s \"z\" \"y\"))])", "[400 0 true]");
+    try expectOutput("[(nexis.string/replace \"é🦀\" \"\" \"-\") (nexis.string/replace \"a.b.c\" \\. \\é) (nexis.string/replace \"aéaéa\" \"é\" \"--\")]", "[-é-🦀- aébéc a--a--a]");
+    try expectOutput("(let [s (str (apply str (repeat 40 \"x\")) \"é\" \"yz\" (apply str (repeat 40 \"x\")) \"yz\")] [(nexis.string/index-of s \"yz\") (nexis.string/index-of s \"yz\" 42) (nexis.string/index-of s \\é) (nexis.string/includes? s \"éyz\") (nexis.string/includes? s \"zé\")])", "[41 83 40 true false]");
 }
 
 test "nexis.string: predicates and searches" {

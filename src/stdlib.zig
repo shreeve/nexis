@@ -4051,13 +4051,61 @@ fn appendStrValue(
     };
 }
 
+/// The length of `v`'s `str` text when no formatter is needed to
+/// make it: nil, a string, a char or a fixnum; null for anything else.
+fn plainStrLen(v: Value) ?usize {
+    return switch (v.kind()) {
+        .nil => 0,
+        .string => string_mod.byteLen(v),
+        .char => std.unicode.utf8CodepointSequenceLength(v.asChar()) catch unreachable,
+        .fixnum => decimalLen(v.asFixnum()),
+        else => null,
+    };
+}
+
+fn decimalLen(x: i64) usize {
+    const u = @abs(x);
+    var len: usize = if (x < 0) 2 else 1;
+    var bound: u64 = 10;
+    while (u >= bound) : (bound *%= 10) {
+        len += 1;
+        if (bound > std.math.maxInt(u64) / 10) break;
+    }
+    return len;
+}
+
+/// Write `v`'s text, `plainStrLen(v)` bytes, at the start of `out`;
+/// the rest of `out` follows it.
+fn writePlainStr(v: Value, out: []u8) []u8 {
+    const len = plainStrLen(v).?;
+    switch (v.kind()) {
+        .string => @memcpy(out[0..len], string_mod.asBytes(v)),
+        .char => _ = std.unicode.utf8Encode(v.asChar(), out[0..len]) catch unreachable,
+        .fixnum => _ = std.fmt.printInt(out[0..len], v.asFixnum(), 10, .lower, .{}),
+        else => {},
+    }
+    return out[len..];
+}
+
+/// `(str x ...)`. Arguments that are all nil, strings, chars or
+/// fixnums are measured and written once into a string of their
+/// length; one string alone is itself, as in Clojure. Anything else
+/// goes through the printer.
 fn fnStr(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1 and args[0].kind() == .string) return args[0];
+    var len: usize = 0;
+    for (args) |x| len += plainStrLen(x) orelse return strFormatted(vm, args);
+    const out = string_mod.allocUninit(vm.ensureHeap(), len) catch return VmError.OutOfMemory;
+    var rest = out.bytes;
+    for (args) |x| rest = writePlainStr(x, rest);
+    return out.value;
+}
+
+fn strFormatted(vm: *VM, args: []const Value) VmError!Value {
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
     const interner = vm.ensureInterner();
-    for (args) |x| {
-        try appendStrValue(&w, x, interner);
-    }
+    for (args) |x| try appendStrValue(&w, x, interner);
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
 
@@ -4106,7 +4154,7 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 // The fifteen natives of `string_natives` (docs/STDLIB.md §3);
 // `capitalize`, `reverse` and `split-lines` are in string.nx. Case
 // mapping is ASCII-only. Searches, `split` and `replace` compare
-// bytes with `std.mem.indexOf`, which on valid UTF-8 matches only at
+// bytes with `string.Matches`, which on valid UTF-8 matches only at
 // code-point boundaries; indexes count code points.
 //
 // Errors are catchable keywords: `:kind-mismatch` for an argument of
@@ -4222,7 +4270,7 @@ fn fnStringEndsWithQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnStringIncludesQ(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromBool(std.mem.indexOf(u8, try stringArg(args[0]), try stringArg(args[1])) != null);
+    return value_mod.fromBool(string_mod.indexOf(try stringArg(args[0]), try stringArg(args[1]), 0) != null);
 }
 
 /// The bytes a search looks for: a string's, or a char's UTF-8.
@@ -4260,7 +4308,8 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
     const at = string_mod.byteRangeForCodepoints(args[0], from, from) catch return VmError.Utf8Error;
     const byte_at: ?usize = if (last)
         std.mem.lastIndexOf(u8, src[0..@min(src.len, at.start + needle.len)], needle)
-    else if (std.mem.indexOf(u8, src[at.start..], needle)) |i| at.start + i else null;
+    else
+        string_mod.indexOf(src, needle, at.start);
     const b = byte_at orelse return value_mod.nilValue();
     return value_mod.fromFixnum(@intCast(std.unicode.utf8CountCodepoints(src[0..b]) catch return VmError.Utf8Error)).?;
 }
@@ -4279,33 +4328,35 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const sep = string_mod.asBytes(args[1]);
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
     // A separator that is not UTF-8 could match the first byte of a
-    // multibyte scalar and split inside it (STDLIB.md §3).
+    // multibyte scalar and split inside it (STDLIB.md §3). Validated
+    // once here, the pieces are made from their bytes as they are.
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
     if (!std.unicode.utf8ValidateSlice(sep)) return VmError.Utf8Error;
 
-    var pieces: std.ArrayList([]const u8) = .empty;
+    // The pieces are fresh strings nothing else reaches, gathered
+    // before the vector is built; `Heap.alloc` never collects (VM.md §9).
+    const heap = vm.ensureHeap();
+    var pieces: std.ArrayList(Value) = .empty;
     defer pieces.deinit(vm.allocator);
-    var rest = src;
+    var start: usize = 0;
+    var matches = string_mod.Matches.init(src, if (sep.len > 0) sep else " ", 0);
     while (limit <= 0 or pieces.items.len + 1 < limit) {
         // An empty separator matches after each code point but the
         // last, whose match ends the text.
         const at = if (sep.len > 0)
-            std.mem.indexOf(u8, rest, sep) orelse break
-        else if (rest.len > 0)
-            std.unicode.utf8ByteSequenceLength(rest[0]) catch unreachable
+            matches.next() orelse break
+        else if (start < src.len)
+            start + (std.unicode.utf8ByteSequenceLength(src[start]) catch unreachable)
         else
             break;
-        pieces.append(vm.allocator, rest[0..at]) catch return VmError.OutOfMemory;
-        rest = rest[at + sep.len ..];
+        pieces.append(vm.allocator, string_mod.fromBytes(heap, src[start..at]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
+        start = at + sep.len;
     }
-    pieces.append(vm.allocator, rest) catch return VmError.OutOfMemory;
+    pieces.append(vm.allocator, string_mod.fromBytes(heap, src[start..]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
     if (limit == 0 and src.len > 0) {
-        while (pieces.items.len > 0 and pieces.items[pieces.items.len - 1].len == 0) _ = pieces.pop();
+        while (pieces.items.len > 0 and string_mod.byteLen(pieces.items[pieces.items.len - 1]) == 0) _ = pieces.pop();
     }
-    const heap = vm.ensureHeap();
-    var out = vector_mod.empty(heap) catch return VmError.OutOfMemory;
-    for (pieces.items) |p| out = vector_mod.conj(heap, out, string_mod.fromBytes(heap, p) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
-    return out;
+    return vector_mod.fromSlice(heap, pieces.items) catch VmError.OutOfMemory;
 }
 
 /// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` → the
@@ -4316,10 +4367,12 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
         if (args[0].kind() != .string) return VmError.KindMismatch;
         break :blk string_mod.asBytes(args[0]);
     } else "";
+    const coll = args[args.len - 1];
+    if (try joinPlain(vm, sep, coll)) |joined| return joined;
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
     const interner = vm.ensureInterner();
-    var it = try makeSeqIter(vm, args[args.len - 1]);
+    var it = try makeSeqIter(vm, coll);
     var first = true;
     while (try it.next()) |x| {
         if (!first) w.writer.writeAll(sep) catch return VmError.OutOfMemory;
@@ -4327,6 +4380,31 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
         try appendStrValue(&w, x, interner);
     }
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch VmError.OutOfMemory;
+}
+
+/// `join` of a collection whose elements are all nil, strings, chars
+/// or fixnums: measured in one walk, written in a second into a
+/// string of that length. Null at the first element that is not, for
+/// the printer's path.
+fn joinPlain(vm: *VM, sep: []const u8, coll: Value) VmError!?Value {
+    var len: usize = 0;
+    var n: usize = 0;
+    var it = try makeSeqIter(vm, coll);
+    while (try it.next()) |x| : (n += 1) len += plainStrLen(x) orelse return null;
+    if (n > 1) len += sep.len * (n - 1);
+    const out = string_mod.allocUninit(vm.ensureHeap(), len) catch return VmError.OutOfMemory;
+    var rest = out.bytes;
+    it = try makeSeqIter(vm, coll);
+    var first = true;
+    while (try it.next()) |x| {
+        if (!first) {
+            @memcpy(rest[0..sep.len], sep);
+            rest = rest[sep.len..];
+        }
+        first = false;
+        rest = writePlainStr(x, rest);
+    }
+    return out.value;
 }
 
 /// `(nexis.string/replace s match replacement)` — literal,
@@ -4355,31 +4433,37 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     if (!std.unicode.utf8ValidateSlice(m)) return VmError.Utf8Error;
     if (!std.unicode.utf8ValidateSlice(r)) return VmError.Utf8Error;
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.allocator);
-
+    // Measured first, so the result is written once into a string of
+    // its length.
+    const heap = vm.ensureHeap();
     if (m.len == 0) {
+        const n = std.unicode.utf8CountCodepoints(src) catch unreachable;
+        const out = string_mod.allocUninit(heap, src.len + r.len * (n + 1)) catch return VmError.OutOfMemory;
+        var at: usize = 0;
         var it = std.unicode.Utf8View.initUnchecked(src).iterator();
         while (it.nextCodepointSlice()) |c| {
-            buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
-            buf.appendSlice(vm.allocator, c) catch return VmError.OutOfMemory;
+            @memcpy(out.bytes[at..][0..r.len], r);
+            @memcpy(out.bytes[at + r.len ..][0..c.len], c);
+            at += r.len + c.len;
         }
-        buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
+        @memcpy(out.bytes[at..], r);
+        return out.value;
     }
-    var cursor: usize = if (m.len == 0) src.len else 0;
-    while (cursor < src.len) {
-        const rel = std.mem.indexOf(u8, src[cursor..], m);
-        if (rel) |off| {
-            const abs = cursor + off;
-            buf.appendSlice(vm.allocator, src[cursor..abs]) catch return VmError.OutOfMemory;
-            buf.appendSlice(vm.allocator, r) catch return VmError.OutOfMemory;
-            cursor = abs + m.len;
-        } else {
-            buf.appendSlice(vm.allocator, src[cursor..]) catch return VmError.OutOfMemory;
-            cursor = src.len;
-        }
+    const k = string_mod.countMatches(src, m);
+    if (k == 0) return s;
+    const out = string_mod.allocUninit(heap, src.len - k * m.len + k * r.len) catch return VmError.OutOfMemory;
+    var at: usize = 0;
+    var cursor: usize = 0;
+    var matches = string_mod.Matches.init(src, m, 0);
+    while (matches.next()) |i| {
+        @memcpy(out.bytes[at..][0 .. i - cursor], src[cursor..i]);
+        at += i - cursor;
+        @memcpy(out.bytes[at..][0..r.len], r);
+        at += r.len;
+        cursor = i + m.len;
     }
-    return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch return VmError.OutOfMemory;
+    @memcpy(out.bytes[at..], src[cursor..]);
+    return out.value;
 }
 
 // =============================================================================
@@ -5535,4 +5619,14 @@ test "stdlib: nativeFnValue round-trips" {
     try testing.expectEqual(Kind.native_fn, v.kind());
     const back = vm_mod.asNativeFn(v);
     try testing.expectEqualStrings("first", back.name);
+}
+
+test "stdlib: decimalLen agrees with printInt at every power of ten and the i64 ends" {
+    var buf: [24]u8 = undefined;
+    var x: i64 = 1;
+    for (0..19) |_| {
+        for ([_]i64{ x - 1, x, -x, -(x - 1) }) |v| try std.testing.expectEqual(std.fmt.printInt(&buf, v, 10, .lower, .{}), decimalLen(v));
+        x *%= 10;
+    }
+    for ([_]i64{ std.math.maxInt(i64), std.math.minInt(i64) }) |v| try std.testing.expectEqual(std.fmt.printInt(&buf, v, 10, .lower, .{}), decimalLen(v));
 }
