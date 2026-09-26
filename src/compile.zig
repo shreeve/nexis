@@ -360,6 +360,12 @@ pub const RecurTarget = struct {
     /// The bindings' names, so `recur` can tell which arguments
     /// read which bindings.
     names: []const []const u8,
+    /// Whether a tail position of this target is a tail of the
+    /// function: a form there ends by returning its value itself
+    /// (`call:return`) instead of writing the destination and
+    /// falling through to the return after the body (COMPILER.md
+    /// §5.5). True for a `fn*`'s target and a `loop*` in its tail.
+    returns: bool = false,
 };
 
 // =============================================================================
@@ -2557,6 +2563,20 @@ fn compileExpr(
     // What this node allocates is dead once it is compiled.
     const slot_mark = e.slot_top;
     defer e.slot_top = slot_mark;
+    // In a tail of the function a form returns its value itself: in
+    // place when it is a literal, a local or a Var, else from `dst`
+    // once computed. The forms that pass the tail on to their parts
+    // return through them.
+    const returns = if (recur_target) |t| t.returns else false;
+    const passes_tail = switch (form.*) {
+        .if_, .let_star, .letfn_star, .loop_star, .recur, .throw_ => true,
+        .do_ => |items| items.len > 0,
+        else => false,
+    };
+    if (returns and !passes_tail) {
+        if (form.* == .nil or form.* == .do_) return e.emit(vm.asm_.returnNil());
+        if (try directOperand(e, form, true)) |op| return e.emit(Inst.primary(.call, vm.Call.@"return", op, Operand.none, Operand.none));
+    }
     switch (form.*) {
         .nil => try e.emit(vm.asm_.loadNil(dst)),
         .bool => |b| try e.emit(if (b) vm.asm_.loadTrue(dst) else vm.asm_.loadFalse(dst)),
@@ -2582,11 +2602,12 @@ fn compileExpr(
         }, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
-        .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst),
+        .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst, returns),
         .recur => |r| try compileRecur(e, r.args, recur_target),
         .def => |d| try compileDef(e, d.name, d.value, dst),
         .var_ref => |v| try compileVarRef(e, v.ns, v.name, dst),
     }
+    if (returns and !passes_tail) try e.emit(vm.asm_.returnSlot(dst));
 }
 
 /// `coll:<op>` over the items, each compiled into its slot of one
@@ -2990,6 +3011,7 @@ fn compileLoopStar(
     bindings: []const Binding,
     body: *const Tiny,
     dst: u12,
+    returns: bool,
 ) CompileError!void {
     const mark = e.scope.items.len;
     defer e.scope.shrinkRetainingCapacity(mark);
@@ -3011,6 +3033,7 @@ fn compileLoopStar(
         .binding_slots = binding_slots,
         .captured_mask = captured_mask,
         .names = names,
+        .returns = returns,
     };
 
     // 5. Compile body with the loop target installed. The
@@ -3268,10 +3291,11 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
         .binding_slots = slots,
         .captured_mask = captured,
         .names = names,
+        .returns = true,
     };
+    // The body returns on every path that does not recur or throw.
     const result_slot = try child.allocSlot();
     try compileExpr(&child, f.body, result_slot, &fn_target);
-    try child.emit(vm.asm_.returnSlot(result_slot));
 
     const sources = try parent.out.dupe(vm.CaptureSource, child.captures.items);
     const upvalue_count: u16 = @intCast(child.captures.items.len);
@@ -3424,14 +3448,15 @@ fn compileIf(
     e.slot_top = slot_mark;
     // Both arms inherit tail position.
     try compileExpr(e, then_form, dst, recur_target);
-    // An arm that always jumps away (recur, throw) needs no jump
-    // past the else arm.
-    const end_jmp_pc: ?usize = if (neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
+    // An arm that always jumps away (recur, throw) or returns needs
+    // no jump past the else arm.
+    const returns = if (recur_target) |t| t.returns else false;
+    const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form)) null else try e.emitJumpPlaceholder();
     try e.patchJumpHere(if_false_pc);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
     } else {
-        try e.emit(vm.asm_.loadNil(dst));
+        try e.emit(if (returns) vm.asm_.returnNil() else vm.asm_.loadNil(dst));
     }
     if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
 }

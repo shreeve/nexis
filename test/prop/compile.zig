@@ -662,16 +662,22 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
     defer program.deinit();
     const Shape = struct { src: []const u8, len: usize };
     const shapes = [_]Shape{
-        // A binding to a local shares its slot: the move into the
-        // result, the return.
-        .{ .src = "(fn* [a] (let* [x a] x))", .len = 2 },
-        .{ .src = "(fn* [a] (let* [x a y x z y] z))", .len = 2 },
+        // A binding to a local shares its slot: the function returns
+        // the parameter's slot.
+        .{ .src = "(fn* [a] (let* [x a] x))", .len = 1 },
+        .{ .src = "(fn* [a] (let* [x a y x z y] z))", .len = 1 },
         // Unless a recur could rebind the slot in its scope.
-        .{ .src = "(fn* [a] (let* [x a] (if x (recur 1) x)))", .len = 6 },
+        .{ .src = "(fn* [a] (let* [x a] (if x (recur 1) x)))", .len = 5 },
         // What runs for effect and cannot fail costs nothing.
-        .{ .src = "(fn* [a] (do nil 1 a (if a 1) (if a 1 2) 2))", .len = 2 },
+        .{ .src = "(fn* [a] (do nil 1 a (if a 1) (if a 1 2) 2))", .len = 1 },
         // An if for effect: no jump past a dropped arm, no nil.
-        .{ .src = "(fn* [a] (do (if a (a)) a))", .len = 5 },
+        .{ .src = "(fn* [a] (do (if a (a)) a))", .len = 4 },
+        .{ .src = "(fn* [a] (do (if a nil (a)) a))", .len = 4 },
+        // Each arm in the function's tail returns: no jump to a
+        // shared return, a leaf returned in place.
+        .{ .src = "(fn* [a] (if a (a) a))", .len = 5 },
+        .{ .src = "(fn* [a] (if a 1))", .len = 3 },
+        .{ .src = "(fn* [n] (loop* [i 0] (if (< i n) (recur (inc i)) i)))", .len = 6 },
         // Arguments compute straight into the call block.
         .{ .src = "(fn* [a] (a (inc a) (a) 1))", .len = 7 },
         // An assertion is one call: helper, quoted form, values,
@@ -679,19 +685,17 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
         .{ .src = "(fn* [a] (nexis.test/is (= a 1)))", .len = 7 },
         .{ .src = "(fn* [a] (nexis.test/is (a) \"m\"))", .len = 7 },
         // A test (not x) is x with the arms swapped.
-        .{ .src = "(fn* [a] (if (not a) 1 2))", .len = 5 },
-        // An if for effect whose then arm is dropped jumps on truth.
-        .{ .src = "(fn* [a] (do (if a nil (a)) a))", .len = 5 },
+        .{ .src = "(fn* [a] (if (not a) 1 2))", .len = 3 },
         // cond's :else is no test.
-        .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 5 },
+        .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 3 },
         // assert builds its message and data at expansion.
-        .{ .src = "(fn* [a] (assert a \"m\"))", .len = 9 },
+        .{ .src = "(fn* [a] (assert a \"m\"))", .len = 7 },
         // Overload dispatch compares the count inline.
-        .{ .src = "(fn ([x] x) ([x y] y))", .len = 23 },
+        .{ .src = "(fn ([x] x) ([x y] y))", .len = 20 },
         // A case of three or more constants: one lookup of the
-        // clause's index, then a compare, a branch, the result and
-        // a jump per clause.
-        .{ .src = "(fn* [a] (case a :k0 0 :k1 1 :k2 2 :d))", .len = 19 },
+        // clause's index, then a compare, a branch and the result
+        // per clause.
+        .{ .src = "(fn* [a] (case a :k0 0 :k1 1 :k2 2 :d))", .len = 15 },
     };
     for (shapes) |shape| {
         const len = try fnCodeLen(&program, shape.src);

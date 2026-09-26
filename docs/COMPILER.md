@@ -368,6 +368,15 @@ when §4.4 allows it. The body compiles as `do`.
 - `fn*` takes one parameter vector; multi-arity `fn` and `defn` are
   the expander's (MACROEXPAND.md §10).
 
+**Returns in the tail.** The body's tail positions (§4.4) return the
+value themselves: a literal, a local or a Var with `call:return` of
+the operand in place (nil with `call:return-nil`), any other form by
+computing into the result slot and returning it. An `if` passes the
+tail to both arms, so neither jumps to a shared return, and a `loop*`
+in the tail passes it to its body. `(fn* [a] (if a 1))` is
+`jump:if-false`, `call:return c`, `call:return-nil`. The tail never
+reaches into a `try` (§5.10), so no return leaves a handler behind.
+
 **Self-name.** When the body refers to its self-name, the closure
 does not exist yet at `closure:make`, so the self-reference goes
 through a placeholder cell:
@@ -635,8 +644,9 @@ failure, on the calling VM, a catchable value like any other throw
 - The `Emitter` attributes every instruction to the innermost node
   being compiled: `compileExpr` sets the current span on entry and
   restores the parent's on exit, so an instruction a parent emits
-  after its children (`call:call` after the arguments, `call:return`
-  after a body) carries the parent's span. `emit` grows a run-length
+  after its children (`call:call` after the arguments, the
+  `call:return` of a computed value in a function's tail) carries the
+  parent's span. `emit` grows a run-length
   table, one `SpanEntry{pc, span}` per change of span, ascending by pc.
 - Each `Routine` carries the table (`spans`), the span of the form it
   was lowered from (`origin`) and the `vm.SourceInfo{path, text}` the
