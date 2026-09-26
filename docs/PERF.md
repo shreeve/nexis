@@ -33,8 +33,8 @@ lead Clojure on startup (a native binary against JVM start), on
 memory density (a 16-byte value cell with immediates inline, no boxed
 numbers) and on durable-state latency (emdb in process); and to trail
 it on sustained compute (a bytecode VM against HotSpot's JIT) and on
-allocation-heavy throughput (a non-generational collector over the
-process allocator). Only §3 turns any of these into a number.
+allocation-heavy throughput (a non-generational collector, no bump
+allocation). Only §3 turns any of these into a number.
 
 ---
 
@@ -56,7 +56,7 @@ the §3 rows.
 | 9 | Keyword identity | interned, identity equality | intern id in the payload, identity equality | parity | §3.1 | measured |
 | 10 | Transients | node-owner in-place edit | owner-token wrapper over the persistent operations (`docs/TRANSIENT.md`) | behind; same cost as persistent | §3.3 | measured |
 | 11 | GC | generational (G1, ZGC) | precise non-moving mark-sweep (`docs/GC.md` §1) | behind under allocation churn | — | not measured |
-| 12 | Allocator | TLAB bump pointer | `VM.heap` over the process allocator (`smp_allocator` in release builds) | behind on construction | §3.2 | measured |
+| 12 | Allocator | TLAB bump pointer | `VM.heap` over size-class slabs with free lists, no per-block prefix (`docs/HEAP.md` §2) | behind on construction | §3.2 | measured |
 | 13 | Dispatch | JIT inline caches | two-level switch on group and variant (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8 | measured |
 | 14 | Durable state | no stdlib primitive | emdb memory-mapped B+ tree (`docs/DB.md`) | lower latency than an out-of-process store | §3.6 | measured |
 | 15 | Serialization | EDN text, Nippy | binary, LEB128 and ZigZag (`docs/CODEC.md`) | smaller, faster than text | §3.5 | measured |
@@ -398,20 +398,12 @@ Each lever is a measured change: a before/after from `zig build bench`
   `tx-1k-durable` row.
 - **Memory on large collections.** §3.11's million-element rows hold
   2–4× babashka's resident set: the 16-byte value cell, non-moving
-  mark-sweep over the process allocator, and eager intermediate
-  results. The size-class pool below and a collection trigger that
-  follows the live set are the levers.
+  mark-sweep, and eager intermediate results. A collection trigger
+  that follows the live set is the lever.
 - **`frequencies`, `group-by`, transient maps, `conj`/`nth` on
   vectors, string splitting** (§3.11, 2.3–4.4× behind babashka):
   each is a native or `core.nx` path to profile before changing.
 
-- **A size-class pool under `VM.heap`.** The heap allocates every
-  block from the process allocator. The pool the bench carried built
-  lists 3.94×, vectors 2.59×, maps 1.80× and sets 1.84× faster at
-  N=4096 and decoded maps 1.14× faster (§3.2, §3.3, §3.5); the runtime
-  never used it. Under `VM.heap` it needs empty-slab reclamation, so a
-  long REPL session gives memory back, and a before/after on the
-  runtime's own heap.
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
 - **Opcode specialization**, and then **inline caches at call sites**.

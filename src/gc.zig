@@ -286,8 +286,7 @@ pub const Collector = struct {
 
     fn abandon(self: *Collector) usize {
         self.overflowed = false;
-        var cur = self.heap.live_head;
-        while (cur) |b| : (cur = b.next) b.header.clearMarked();
+        self.heap.clearMarks();
         return 0;
     }
 };
@@ -644,8 +643,15 @@ test "collect: a worklist that cannot grow abandons the cycle instead of recursi
     failing.fail_index = failing.alloc_index;
     try testing.expectEqual(@as(usize, 0), gc.collect(&.{Heap.asHeapHeader(chain)}));
     try testing.expectEqual(live, heap.liveCount());
-    var cur = heap.live_head;
-    while (cur) |b| : (cur = b.next) try testing.expect(!b.header.isMarked());
+    const Unmarked = struct {
+        marked: usize = 0,
+        pub fn visit(self: *@This(), h: *HeapHeader) void {
+            if (h.isMarked()) self.marked += 1;
+        }
+    };
+    var unmarked: Unmarked = .{};
+    heap.forEachLive(&unmarked);
+    try testing.expectEqual(@as(usize, 0), unmarked.marked);
 
     failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqual(@as(usize, 1), gc.collect(&.{Heap.asHeapHeader(chain)}));
