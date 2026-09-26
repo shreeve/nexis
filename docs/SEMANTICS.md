@@ -151,8 +151,8 @@ overflows it reports, as does a native call that fails, so one overflow
 raises once: a callback that catches it returns normally to the native
 that called it. A map, set or record whose hash
 was computed past an overflow keeps no cached hash, so the wrong answer
-never outlives the throw. The codec bounds nesting at 4096 levels
-instead (`docs/CODEC.md` §2.7).
+never outlives the throw. The codec walks nesting with a heap stack
+and has no depth bound (`docs/CODEC.md` §2.7).
 
 ---
 

@@ -16,13 +16,15 @@
 //!
 //! Scope (CODEC.md §1): the data kinds (nil, bool, char, fixnum,
 //! float, keyword, symbol, string, bignum, list, vector, map, set,
-//! typed vector) nested at most `max_depth` deep. Every other kind is
+//! typed vector) nested to any depth. Every other kind is
 //! `error.UnserializableKind`.
 //!
-//! Decode reads bytes from store files, so every length, count and
-//! nesting level in them is hostile until bounded (CODEC.md §2.1,
-//! §2.7): nothing is allocated, sliced or recursed on before the input
-//! is known to hold it.
+//! Both directions walk containers with an explicit stack, so data
+//! nesting never becomes native recursion (CODEC.md §2.7).
+//!
+//! Decode reads bytes from store files, so every length and count in
+//! them is hostile until bounded (CODEC.md §2.1, §2.7): nothing is
+//! allocated or sliced before the input is known to hold it.
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -56,8 +58,7 @@ pub const version_minor: u8 = 0;
 
 pub const CodecError = error{
     /// A kind outside the serializable set (CODEC.md §3), on encode
-    /// or as a decoded kind byte; or, on encode, nesting past
-    /// `max_depth`.
+    /// or as a decoded kind byte.
     UnserializableKind,
 
     /// The input ends mid-value, or a length or count asks for more
@@ -86,7 +87,7 @@ pub const CodecError = error{
     /// Input no encoder writes: a bignum sign byte not in {0, 1}, a
     /// typed-vector element tag that names no element type, a fixnum
     /// outside i48, a map or set count that disagrees with its
-    /// distinct entries, nesting past `max_depth`.
+    /// distinct entries.
     MalformedPayload,
 };
 
@@ -208,28 +209,20 @@ fn readBytes(bytes: []const u8, cursor: *usize, len: usize) CodecError![]const u
 // Public API
 // =============================================================================
 
-/// The deepest nesting the codec writes or reads: the outermost value
-/// is at depth 0 and each container puts its elements one deeper
-/// (CODEC.md §2.7). Encode refuses a deeper value as
-/// `UnserializableKind`, so every stored value decodes; decode treats
-/// deeper input as `MalformedPayload`. The bound keeps both
-/// recursions inside the native stack whatever the input.
-pub const max_depth: u32 = 4096;
-
 /// Encode `v` to a freshly-allocated byte slice. Caller frees.
 /// Returns `UnserializableKind` if `v` is not in the
-/// serializable set (CODEC.md §1), including a value nested deeper
-/// than `max_depth`.
+/// serializable set (CODEC.md §1).
 pub fn encode(
     allocator: std.mem.Allocator,
     interner: *const Interner,
     v: Value,
 ) (CodecError || std.mem.Allocator.Error)![]u8 {
     var e: Encoder = .{ .allocator = allocator, .interner = interner };
+    defer e.stack.deinit(allocator);
     errdefer e.buf.deinit(allocator);
     try e.byte(version_major);
     try e.byte(version_minor);
-    try e.item(v, 0);
+    try e.run(v);
     return e.buf.toOwnedSlice(allocator);
 }
 
@@ -255,7 +248,8 @@ pub fn decode(
         .elementEq = elementEq,
     };
     defer d.scratch.deinit(heap.backing);
-    const v = try d.item(0);
+    defer d.frames.deinit(heap.backing);
+    const v = try d.run();
     if (d.cursor != bytes.len) return CodecError.TrailingBytes;
     return v;
 }
@@ -263,64 +257,81 @@ pub fn decode(
 pub const DecodeError = CodecError || std.mem.Allocator.Error || intern_mod.InternError || error{ Overflow, InvalidListTail };
 
 // =============================================================================
-// Encoder — recursive over containers
-//
-// The recursion runs through `item` and one small function per
-// container kind, and the leaf kinds live in their own function, so a
-// nesting level costs two small frames and `max_depth` levels fit the native stack in
-// every build mode.
+// Encoder — a loop over an explicit stack of open containers
 // =============================================================================
 
 const Encoder = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
     interner: *const Interner,
+    /// The containers whose elements are still being written,
+    /// innermost last.
+    stack: std.ArrayList(Open) = .empty,
 
     const Error = CodecError || std.mem.Allocator.Error;
 
-    fn item(e: *Encoder, v: Value, depth: u32) Error!void {
-        if (depth > max_depth) return CodecError.UnserializableKind;
-        return switch (v.kind()) {
-            .list => e.list(v, depth + 1),
-            .persistent_vector => e.vector(v, depth + 1),
-            .persistent_map => e.map(v, depth + 1),
-            .persistent_set => e.set(v, depth + 1),
-            else => e.leaf(v),
-        };
-    }
+    /// A container being written and where its walk stands. A map
+    /// yields each entry's key, then holds its value for the next
+    /// step.
+    const Open = union(enum) {
+        list: list_mod.Cursor,
+        vector: vector_mod.Cursor,
+        map: struct { iter: champ.MapIter, value: ?Value = null },
+        set: champ.SetIter,
 
-    noinline fn list(e: *Encoder, v: Value, depth: u32) Error!void {
-        try e.byte(@intFromEnum(Kind.list));
-        try e.uleb(list_mod.count(v));
-        var it = list_mod.Cursor.init(v);
-        while (it.next()) |x| try e.item(x, depth);
-    }
+        fn next(o: *Open) ?Value {
+            return switch (o.*) {
+                .list => |*c| c.next(),
+                .vector => |*c| c.next(),
+                .set => |*it| it.next(),
+                .map => |*m| if (m.value) |v| blk: {
+                    m.value = null;
+                    break :blk v;
+                } else if (m.iter.next()) |entry| blk: {
+                    m.value = entry.value;
+                    break :blk entry.key;
+                } else null,
+            };
+        }
+    };
 
-    noinline fn vector(e: *Encoder, v: Value, depth: u32) Error!void {
-        try e.byte(@intFromEnum(Kind.persistent_vector));
-        const n = vector_mod.count(v);
-        try e.uleb(n);
-        for (0..n) |i| try e.item(vector_mod.nth(v, i), depth);
-    }
-
-    noinline fn map(e: *Encoder, v: Value, depth: u32) Error!void {
-        try e.byte(@intFromEnum(Kind.persistent_map));
-        try e.uleb(champ.mapCount(v));
-        var iter = champ.mapIter(v);
-        while (iter.next()) |entry| {
-            try e.item(entry.key, depth);
-            try e.item(entry.value, depth);
+    /// Write `root`: a container's header opens it on the stack, and
+    /// every step writes the next element of the innermost open one.
+    fn run(e: *Encoder, root: Value) Error!void {
+        var v = root;
+        while (true) {
+            switch (v.kind()) {
+                .list => {
+                    try e.header(.list, list_mod.count(v));
+                    try e.stack.append(e.allocator, .{ .list = list_mod.Cursor.init(v) });
+                },
+                .persistent_vector => {
+                    try e.header(.persistent_vector, vector_mod.count(v));
+                    try e.stack.append(e.allocator, .{ .vector = vector_mod.Cursor.init(v) });
+                },
+                .persistent_map => {
+                    try e.header(.persistent_map, champ.mapCount(v));
+                    try e.stack.append(e.allocator, .{ .map = .{ .iter = champ.mapIter(v) } });
+                },
+                .persistent_set => {
+                    try e.header(.persistent_set, champ.setCount(v));
+                    try e.stack.append(e.allocator, .{ .set = champ.setIter(v) });
+                },
+                else => try e.leaf(v),
+            }
+            v = while (e.stack.items.len > 0) {
+                if (e.stack.items[e.stack.items.len - 1].next()) |x| break x;
+                _ = e.stack.pop();
+            } else return;
         }
     }
 
-    noinline fn set(e: *Encoder, v: Value, depth: u32) Error!void {
-        try e.byte(@intFromEnum(Kind.persistent_set));
-        try e.uleb(champ.setCount(v));
-        var iter = champ.setIter(v);
-        while (iter.next()) |elem| try e.item(elem, depth);
+    fn header(e: *Encoder, k: Kind, n: usize) Error!void {
+        try e.byte(@intFromEnum(k));
+        try e.uleb(n);
     }
 
-    noinline fn leaf(e: *Encoder, v: Value) Error!void {
+    fn leaf(e: *Encoder, v: Value) Error!void {
         const k = v.kind();
         switch (k) {
             .nil, .false_, .true_ => try e.byte(@intFromEnum(k)),
@@ -380,7 +391,7 @@ const Encoder = struct {
 };
 
 // =============================================================================
-// Decoder — recursive over containers, with the Encoder's frame shape
+// Decoder — a loop over an explicit stack of open containers
 // =============================================================================
 
 const Decoder = struct {
@@ -390,72 +401,77 @@ const Decoder = struct {
     cursor: usize,
     elementHash: *const fn (Value) u64,
     elementEq: *const fn (Value, Value) bool,
-    /// The elements of every list and vector being decoded, innermost
+    /// The elements decoded so far of every open container, innermost
     /// last. It grows one element per element decoded, so a count
     /// that claims more than the input holds costs nothing until the
     /// input runs out (CODEC.md §2.7).
     scratch: std.ArrayList(Value) = .empty,
+    /// The open containers, innermost last. Each took at least two
+    /// bytes of input, so the stack is bounded by the input's size.
+    frames: std.ArrayList(Frame) = .empty,
 
-    fn item(d: *Decoder, depth: u32) DecodeError!Value {
-        if (depth > max_depth) return CodecError.MalformedPayload;
-        const tag = try readByte(d.bytes, &d.cursor);
-        return switch (tag) {
-            @intFromEnum(Kind.list) => d.list(depth + 1),
-            @intFromEnum(Kind.persistent_vector) => d.vector(depth + 1),
-            @intFromEnum(Kind.persistent_map) => d.map(depth + 1),
-            @intFromEnum(Kind.persistent_set) => d.set(depth + 1),
-            else => d.leaf(tag),
-        };
+    /// A container whose elements are being read: its kind byte, how
+    /// many elements (a map's keys and values both count) are still to
+    /// come, and where its elements start in `scratch`.
+    const Frame = struct { tag: u8, remaining: usize, start: usize };
+
+    fn run(d: *Decoder) DecodeError!Value {
+        while (true) {
+            const tag = try readByte(d.bytes, &d.cursor);
+            var v = switch (tag) {
+                @intFromEnum(Kind.list), @intFromEnum(Kind.persistent_vector), @intFromEnum(Kind.persistent_set) => try d.open(tag, try d.count(1)),
+                @intFromEnum(Kind.persistent_map) => try d.open(tag, 2 * try d.count(2)),
+                else => try d.leaf(tag),
+            } orelse continue;
+            // Hand `v` to the innermost open container, closing every
+            // one it completes.
+            while (d.frames.items.len > 0) {
+                const top = &d.frames.items[d.frames.items.len - 1];
+                try d.scratch.append(d.heap.backing, v);
+                top.remaining -= 1;
+                if (top.remaining > 0) break;
+                const f = d.frames.pop().?;
+                v = try d.close(f.tag, f.start);
+            } else return v;
+        }
     }
 
-    noinline fn list(d: *Decoder, depth: u32) DecodeError!Value {
-        const start = try d.elements(depth);
-        defer d.scratch.shrinkRetainingCapacity(start);
-        return list_mod.fromSlice(d.heap, d.scratch.items[start..]);
-    }
-
-    noinline fn vector(d: *Decoder, depth: u32) DecodeError!Value {
-        const start = try d.elements(depth);
-        defer d.scratch.shrinkRetainingCapacity(start);
-        return vector_mod.fromSlice(d.heap, d.scratch.items[start..]);
-    }
-
-    /// Read a count and that many elements onto `scratch`; returns
-    /// where they start.
-    fn elements(d: *Decoder, depth: u32) DecodeError!usize {
-        const n = try d.count(1);
+    /// Open a container of `n` elements; an empty one is complete at
+    /// once and returned.
+    fn open(d: *Decoder, tag: u8, n: usize) DecodeError!?Value {
         const start = d.scratch.items.len;
-        for (0..n) |_| {
-            const v = try d.item(depth);
-            try d.scratch.append(d.heap.backing, v);
+        if (n == 0) return try d.close(tag, start);
+        try d.frames.append(d.heap.backing, .{ .tag = tag, .remaining = n, .start = start });
+        return null;
+    }
+
+    /// Build the container whose elements are `scratch[start..]` and
+    /// drop them from `scratch`. Encode never writes a duplicate key
+    /// or element, so a map or set with fewer distinct entries than
+    /// elements read is corrupt input (CODEC.md §2.6).
+    fn close(d: *Decoder, tag: u8, start: usize) DecodeError!Value {
+        defer d.scratch.shrinkRetainingCapacity(start);
+        const elems = d.scratch.items[start..];
+        switch (tag) {
+            @intFromEnum(Kind.list) => return list_mod.fromSlice(d.heap, elems),
+            @intFromEnum(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
+            @intFromEnum(Kind.persistent_map) => {
+                var m = try champ.mapEmpty(d.heap);
+                var i: usize = 0;
+                while (i < elems.len) : (i += 2) m = try champ.mapAssoc(d.heap, m, elems[i], elems[i + 1], d.elementHash, d.elementEq);
+                if (champ.mapCount(m) != elems.len / 2) return CodecError.MalformedPayload;
+                return m;
+            },
+            else => {
+                var s = try champ.setEmpty(d.heap);
+                for (elems) |x| s = try champ.setConj(d.heap, s, x, d.elementHash, d.elementEq);
+                if (champ.setCount(s) != elems.len) return CodecError.MalformedPayload;
+                return s;
+            },
         }
-        return start;
     }
 
-    // Encode never writes a duplicate key or element, so a count
-    // that disagrees with the distinct entries decoded is corrupt
-    // input (CODEC.md §2.6).
-
-    noinline fn map(d: *Decoder, depth: u32) DecodeError!Value {
-        const n = try d.count(2);
-        var m = try champ.mapEmpty(d.heap);
-        for (0..n) |_| {
-            const key = try d.item(depth);
-            m = try champ.mapAssoc(d.heap, m, key, try d.item(depth), d.elementHash, d.elementEq);
-        }
-        if (champ.mapCount(m) != n) return CodecError.MalformedPayload;
-        return m;
-    }
-
-    noinline fn set(d: *Decoder, depth: u32) DecodeError!Value {
-        const n = try d.count(1);
-        var s = try champ.setEmpty(d.heap);
-        for (0..n) |_| s = try champ.setConj(d.heap, s, try d.item(depth), d.elementHash, d.elementEq);
-        if (champ.setCount(s) != n) return CodecError.MalformedPayload;
-        return s;
-    }
-
-    noinline fn leaf(d: *Decoder, tag: u8) DecodeError!Value {
+    fn leaf(d: *Decoder, tag: u8) DecodeError!Value {
         const bytes = d.bytes;
         const cursor = &d.cursor;
         return switch (tag) {
@@ -1040,21 +1056,43 @@ test "decode: a collection count past the input is TruncatedInput before any all
     }
 }
 
-test "decode: nesting past max_depth is MalformedPayload, never a stack fault" {
-    var ctx = TestCtx.init();
-    defer ctx.deinit();
-    for ([_]Kind{ .list, .persistent_vector, .persistent_set }) |kind| {
+test "decode: 200 000 levels of nesting decode, on any stack" {
+    // Deep input allocates a block per level; the arena keeps the
+    // test from paying the leak-checking allocator for each.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ctx: TestCtx = .{ .heap = Heap.init(arena.allocator()), .interner = Interner.init(testing.allocator) };
+    defer ctx.interner.deinit();
+    const depth = 200_000;
+    for ([_]Kind{ .list, .persistent_vector, .persistent_set, .persistent_map }) |kind| {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(testing.allocator);
         try writeByte(&buf, testing.allocator, version_major);
         try writeByte(&buf, testing.allocator, version_minor);
-        // 200 000 levels of one-element containers around a nil.
-        for (0..200_000) |_| {
+        // One-element containers around a nil; a map's one entry is
+        // `nil` to the next level.
+        for (0..depth) |_| {
             try writeByte(&buf, testing.allocator, @intFromEnum(kind));
             try writeByte(&buf, testing.allocator, 1);
+            if (kind == .persistent_map) try writeByte(&buf, testing.allocator, 0);
         }
         try writeByte(&buf, testing.allocator, 0);
-        try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, buf.items, &synthHash, &synthEq));
+        var v = try decode(&ctx.heap, &ctx.interner, buf.items, &synthHash, &synthEq);
+        var levels: usize = 0;
+        while (v.kind() == kind) : (levels += 1) v = switch (kind) {
+            .list => list_mod.head(v),
+            .persistent_vector => vector_mod.nth(v, 0),
+            .persistent_set => blk: {
+                var it = champ.setIter(v);
+                break :blk it.next().?;
+            },
+            else => blk: {
+                var it = champ.mapIter(v);
+                break :blk it.next().?.value;
+            },
+        };
+        try testing.expectEqual(@as(usize, depth), levels);
+        try testing.expect(v.isNil());
     }
 }
 
@@ -1081,15 +1119,23 @@ test "decode: nested counts that each claim the rest of the input allocate by wh
     }
 }
 
-test "codec: a value exactly max_depth deep round-trips; one deeper is unserializable" {
-    var ctx = TestCtx.init();
-    defer ctx.deinit();
+test "codec: a value nested 200 000 deep round-trips byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var ctx: TestCtx = .{ .heap = Heap.init(arena.allocator()), .interner = Interner.init(testing.allocator) };
+    defer ctx.interner.deinit();
     var v = value.nilValue();
-    for (0..max_depth) |_| v = try vector_mod.fromSlice(&ctx.heap, &.{v});
-    const got = try ctx.roundtrip(v);
-    try testing.expect(got.kind() == .persistent_vector);
-    const deeper = try vector_mod.fromSlice(&ctx.heap, &.{v});
-    try testing.expectError(CodecError.UnserializableKind, encode(testing.allocator, &ctx.interner, deeper));
+    for (0..200_000) |i| v = switch (i % 3) {
+        0 => try vector_mod.fromSlice(&ctx.heap, &.{ value.fromFixnum(@intCast(i)).?, v }),
+        1 => try list_mod.fromSlice(&ctx.heap, &.{v}),
+        else => try champ.mapAssoc(&ctx.heap, try champ.mapEmpty(&ctx.heap), value.fromFixnum(@intCast(i)).?, v, &synthHash, &synthEq),
+    };
+    const bytes = try encode(testing.allocator, &ctx.interner, v);
+    defer testing.allocator.free(bytes);
+    const got = try decode(&ctx.heap, &ctx.interner, bytes, &synthHash, &synthEq);
+    const again = try encode(testing.allocator, &ctx.interner, got);
+    defer testing.allocator.free(again);
+    try testing.expectEqualSlices(u8, bytes, again);
 }
 
 test "decode: a map or set whose count disagrees with its distinct entries is MalformedPayload" {

@@ -2462,17 +2462,17 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
-test "a value nested past the codec's max depth is refused with a catchable error; max depth round-trips" {
-    // CODEC.md §2.7: max_depth is 4096.
+test "a value nested 100 000 deep is stored and read back through a durable ref" {
+    // CODEC.md §2.7: the codec bounds no nesting depth.
     try expectOutputProgramWithStore("seam-deep",
         \\(do
         \\  (def conn (db/open "@STORE@"))
-        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [acc]) acc)))
-        \\  [(try (do (db/put-key! (db/ref conn :t :deep) (nest 4097)) :stored)
-        \\        (catch any e (keyword? e)))
-        \\   (do (db/put-key! (db/ref conn :t :ok) (nest 4096))
-        \\       (= (nest 4096) (db/get-key (db/ref conn :t :ok))))])
-    , "[true true]");
+        \\  (defn nest [n] (loop [i 0 acc nil] (if (< i n) (recur (inc i) [i acc]) acc)))
+        \\  (defn depth [v] (loop [v v n 0] (if (vector? v) (recur (second v) (inc n)) n)))
+        \\  (db/put-key! (db/ref conn :t :deep) (nest 100000))
+        \\  (let [v (db/get-key (db/ref conn :t :deep))]
+        \\    [(depth v) (first v) (first (second v))]))
+    , "[100000 99999 99998]");
 }
 
 test "the VM keeps running after a caught storage failure" {

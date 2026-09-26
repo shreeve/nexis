@@ -17,7 +17,7 @@ the format is frozen (§9).
 **In.** The data kinds `nil`, `false_`, `true_`, `char`, `fixnum`,
 `float`, `keyword`, `symbol`, `string`, `bignum`, `list`,
 `persistent_vector`, `persistent_map`, `persistent_set` and
-`typed_vector`, nested at most `max_depth` (4096) deep (§2.7).
+`typed_vector`, nested to any depth (§2.7).
 `encode: Value → []u8`, `decode: []u8 → Value`, behind a version
 envelope, with the round-trip laws of §4.
 
@@ -134,13 +134,13 @@ the canonical form.
 
 #### 2.7 Nesting depth
 
-The outermost value is at depth 0 and a container's elements sit one
-deeper. `codec.max_depth` is 4096: encode refuses a value with
-anything deeper as `UnserializableKind` (at the language level
-`:unserializable`, never a crash), and decode treats deeper input as
-`MalformedPayload`. One bound on both sides means every value written
-reads back. Each nesting level costs two small frames of the
-recursion, so the bound fits the native stack in every build mode.
+Nesting is unbounded. Encode and decode each walk containers with an
+explicit stack of open containers on the heap, never with native
+recursion, so a value nested a million levels deep round-trips on any
+thread's stack, and every value written reads back. Decode's stack
+holds one frame per open container, and each frame took at least two
+bytes of input, so it is bounded by the input's size like everything
+else decode allocates.
 
 Decode memory is bounded by what the input holds, whatever its counts
 claim. A count larger than the bytes left could encode is
@@ -167,8 +167,7 @@ rest of the input cost nothing until the input runs out.
 | `nextomic_conn` (38), `nextomic_db` (39), `nextomic_entity` (40) | no | They name a Nextomic connection the VM owns (`docs/NEXTOMIC.md` §6). |
 | `byte_vector` (22), `error_` (28), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
 
-Encoding any kind marked no, or a value nested past `max_depth`, is
-`UnserializableKind`. Decoding a kind byte that names a heap kind
+Encoding any kind marked no is `UnserializableKind`. Decoding a kind byte that names a heap kind
 outside the set (every "no" row above) is `UnserializableKind` too;
 a byte that names no kind (the reserved immediates 8–15, the reserved
 heap bytes 41–63, the runtime-private sentinels 64 and up) is
@@ -177,7 +176,7 @@ heap bytes 41–63, the runtime-private sentinels 64 and up) is
 **At the language level** (`db.failureName`, `docs/DB.md` §8)
 `UnserializableKind` is `:unserializable`, on encode and on decode
 alike, and every other codec error — hostile lengths and counts,
-excess nesting in stored bytes, a bad envelope, trailing bytes — is
+a bad envelope, trailing bytes — is
 `:codec-failed`.
 
 ---
@@ -202,7 +201,6 @@ This is the codec gate property, run by `test/prop/codec.zig` (§7).
 |---|---|
 | `encode(allocator, *const Interner, Value) (CodecError \|\| Allocator.Error)![]u8` | The owned bytes of `v`; the caller frees. |
 | `decode(*Heap, *Interner, bytes, elementHash, elementEq) DecodeError!Value` | Consumes `bytes` completely. Maps and sets are rebuilt with the supplied hash and equality, which must be `dispatch.hashValue` / `dispatch.equal` or agree with them (`docs/DB.md` §5). |
-| `max_depth: u32 = 4096` | §2.7. |
 | `version_major = 1`, `version_minor = 0` | §2. |
 
 `DecodeError` is `CodecError` plus allocation and interning errors.
@@ -210,14 +208,14 @@ Neither function mutates its input or any existing value.
 
 | `CodecError` | Meaning |
 |---|---|
-| `UnserializableKind` | A kind outside the set (§3), on encode or as a decoded kind byte; on encode, nesting past `max_depth`. |
+| `UnserializableKind` | A kind outside the set (§3), on encode or as a decoded kind byte. |
 | `TruncatedInput` | The input ends mid-value, or a length or count asks for more than remains. |
 | `TrailingBytes` | A whole value, then more bytes. |
 | `InvalidVersion` | An envelope other than `[1, 0]`. |
 | `InvalidKindByte` | A byte that names no kind. |
 | `InvalidLeb128` | A LEB128 past u64. |
 | `InvalidCharScalar` | A surrogate or a scalar past `0x10FFFF`. |
-| `MalformedPayload` | Input no encoder writes: a bad sign byte or element tag, a fixnum outside i48, a count that disagrees with the distinct entries, nesting past `max_depth`. |
+| `MalformedPayload` | Input no encoder writes: a bad sign byte or element tag, a fixnum outside i48, a count that disagrees with the distinct entries. |
 
 ---
 
@@ -237,9 +235,9 @@ envelope, truncation, trailing bytes, malformed LEB128, surrogate
 chars, every one of the 256 kind bytes outside the set
 (`UnserializableKind` or `InvalidKindByte` as §3 says), a transient on
 encode, hostile lengths and counts near 2^64 (`TruncatedInput` with
-nothing allocated), a value exactly `max_depth` deep round-tripping
-and one level more refused, 200 000 levels of input
-(`MalformedPayload`), and the leniency of §2.6.
+nothing allocated), a value 200 000 levels deep round-tripping byte
+for byte, 200 000 levels of input of each container kind decoding,
+and the leniency of §2.6.
 
 `test/prop/codec.zig`: **C1** 100 000 random values of every
 serializable kind, nested up to depth 4, round-trip equal with equal
@@ -247,8 +245,8 @@ hashes; **C2** re-encode is byte-equal for every kind but map and set;
 **C3** a transient is `UnserializableKind`; **C4** 1 000 random byte
 slices decode to a value or a `CodecError`, never a crash; **C5** 500
 hostile headers (lengths and counts near 2^64 or past the input,
-nesting past `max_depth`) end in a typed error, never `OutOfMemory`,
-allocating no more than the nesting read. `test/prop/typed_vector.zig`
+under nesting thousands of levels deep) end in a typed error or a
+value, never `OutOfMemory`, allocating no more than the nesting read. `test/prop/typed_vector.zig`
 T1 is the typed-vector round trip.
 
 ---

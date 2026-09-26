@@ -18,10 +18,10 @@
 //!       fed to decode either succeed (producing some Value) or
 //!       return a `CodecError`; no panic, no crash, no memory
 //!       corruption.
-//!   C5. **Hostile structure**: lengths and counts near 2^64, counts
-//!       past the input, and nesting past `codec.max_depth` end in a
-//!       typed error without overflow, stack exhaustion or an
-//!       allocation sized by the count.
+//!   C5. **Hostile structure**: lengths and counts near 2^64 and
+//!       counts past the input, under nesting thousands of levels
+//!       deep, end in a typed error or a value without overflow, stack
+//!       exhaustion or an allocation sized by the count.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -291,8 +291,8 @@ test "C5: 500 hostile headers (huge lengths and counts, deep nesting) decode to 
     while (trial < 500) : (trial += 1) {
         buf.clearRetainingCapacity();
         try buf.appendSlice(std.testing.allocator, &.{ 1, 0 });
-        // A run of one-element containers, sometimes past max_depth.
-        const depth = if (r.uintLessThan(u8, 8) != 0) r.uintLessThan(usize, 8) else codec.max_depth + r.uintLessThan(usize, 64);
+        // A run of one-element containers, sometimes thousands deep.
+        const depth = if (r.uintLessThan(u8, 8) != 0) r.uintLessThan(usize, 8) else 5000 + r.uintLessThan(usize, 64);
         for (0..depth) |_| try buf.appendSlice(std.testing.allocator, &.{ kinds[4 + r.uintLessThan(usize, 4)], 1 });
         // Then a header whose length or count is hostile.
         const kind = kinds[r.uintLessThan(usize, kinds.len)];

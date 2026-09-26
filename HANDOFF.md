@@ -256,8 +256,9 @@ and a reader slot, which its own §3 and `docs/NEXTOMIC.md` §4 contradict
   session, deep recursion, a source file with a byte-order mark,
   `--help` on stdout and the usage errors.
 - **Deep input.** Inline tests in the reader, expander, compiler,
-  codec, printer, dispatch, pull, transaction and query parsers feed
-  each input nested past the guard; `eval_pipeline.zig` checks that
+  printer, dispatch, pull, transaction and query parsers feed each
+  input nested past the guard, and the codec's tests round-trip 200 000
+  levels; `eval_pipeline.zig` checks that
   runaway recursion, recursion through a native, and `=`, `hash`,
   `compare` and printing of too-deep data all end in a catchable
   `:stack-overflow`, and `test/golden/cli/deep-recursion.nx` that
