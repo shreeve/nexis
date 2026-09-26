@@ -361,14 +361,14 @@ const Parser = struct {
             }
             if (self.isVarSym(parts[0])) return self.fail("an aggregate is named by a symbol");
             const op = ir.AggOp.fromName(name) orelse .custom;
-            var n: ?u32 = null;
+            var n: ?u64 = null;
             var arg_at: usize = 1;
             if (op.takesN()) |takes| {
                 const given = parts.len == 3;
                 if (takes == .required and !given) return self.fail("this aggregate is (op n ?x)");
                 if (given) {
                     if (parts[1].kind() != .fixnum or parts[1].asFixnum() < 0) return self.fail("an aggregate's n is a non-negative integer");
-                    n = std.math.cast(u32, parts[1].asFixnum()) orelse return self.fail("an aggregate's n is too large");
+                    n = @intCast(parts[1].asFixnum());
                     arg_at = 2;
                 }
             }
@@ -1154,6 +1154,11 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     try testing.expect(pa.find[1].agg.op == .sample and pa.find[1].agg.n.? == 3);
     try testing.expect(pa.find[2].agg.op == .custom and pa.find[2].agg.sym == b.sym("my/total").asSymbolId());
     try testing.expect(pa.find[3].agg.op == .median and pa.find[3].agg.n == null);
+    // An n past 2^32 is an n like any other.
+    const q_big = b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("max"), b.int(1 << 40), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) });
+    const pbig = try parse(testing.allocator, &interner, q_big, &diag);
+    defer pbig.deinit();
+    try testing.expectEqual(@as(?u64, 1 << 40), pbig.find[0].agg.n);
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("sample"), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),
         b.vec(&.{ b.kw("find"), b.lst(&.{ b.sym("rand"), b.int(-1), b.sym("?v") }), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }) }),

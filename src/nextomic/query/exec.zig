@@ -926,7 +926,7 @@ pub const Exec = struct {
                 return .{ .vm = try self.kept(set) };
             },
             .rand => {
-                const n = agg.n.?;
+                const n = std.math.cast(usize, agg.n.?) orelse return error.OutOfMemory;
                 const cells = try self.arena.alloc(Cell, if (members.len == 0) 0 else n);
                 for (cells) |*c| c.* = basis.cell(members[self.random().uintLessThan(usize, members.len)], col);
                 return self.cellVector(cells);
