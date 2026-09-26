@@ -164,7 +164,9 @@ connection, or by a collection:
   collection that finds nothing holding it. A slot of a running
   frame that still holds a copy of it counts (`GC.md` §3): a
   handle a function dropped can stay open in its caller's window
-  until the slot is reused or the caller returns.
+  until the slot is reused or the caller returns. Between top-level
+  forms no slot holds anything, so a form never keeps a handle an
+  earlier form dropped.
 - A handle whose transaction has ended stays allocated while a Value
   names it and reports `:tx-closed`; the first collection that finds
   it unreachable frees it, and teardown frees the rest.

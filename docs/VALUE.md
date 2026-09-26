@@ -94,8 +94,8 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 29 | `meta_symbol` | Reserved: never constructed | Symbols carry no metadata (SEMANTICS §7) |
 | 30 | `native_fn` | Host function | The payload points at a static `NativeFn` descriptor, not a block |
 | 31 | `db_connection` | emdb connection handle | Payload: a VM-owned `*db.Connection`, not a block |
-| 32 | `db_write_txn` | Write transaction handle | Payload: a VM-owned handle, not a block; invalid after commit or abort |
-| 33 | `db_read_txn` | Read transaction handle | Payload: a VM-owned handle, not a block |
+| 32 | `db_write_txn` | Write transaction handle | Payload: a `db.Handle` on the VM's allocator, not a block; after commit, abort or close it reports `:tx-closed`; freed by the collector's handle sweep (`docs/DB.md` §3.2) |
+| 33 | `db_read_txn` | Read transaction handle | Payload: a `db.Handle` on the VM's allocator, not a block; as kind 32 |
 | 34 | `atom` | In-memory mutable cell (`docs/ATOM.md`) | |
 | 35 | `record` | `defrecord` instance: type id plus field map (`docs/PROTOCOLS.md` §2.1) | |
 | 36 | `protocol` | Protocol object (`docs/PROTOCOLS.md` §2.2) | |
