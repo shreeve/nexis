@@ -345,7 +345,7 @@ ratio above 1 means nexis is slower. Provenance: §11.
 | 1,000 one-datom transactions, default commit | 17.7 ms | 183 ms | 0.10 |
 | 1,000 one-datom transactions, no per-commit flush | 23.3 ms | 62.6 ms | 0.37 |
 | as-of and history query | 2.17 ms | no counterpart | — |
-| store after the load (allocated) | 198 MB | 46 MB | 4.3 |
+| store after the load (allocated) | 147 MB | 47 MB | 3.1 |
 
 The database rows are a run of their own, at the durability and
 held-snapshot commits; the same run at `cc935cc`, where every default
@@ -378,9 +378,38 @@ What the rows say:
   pays what every default commit paid before: 3.42 s for the 1,000
   transactions. The no-flush rows include one sync at the end in
   both systems.
-- The store is 4.3× Datalevin's: history indexes and the txlog, which
-  Datalevin does not keep, and 16 KiB pages over 256 MB of initial
-  map.
+- The store is 3.1× Datalevin's. Half of it is the four history
+  indexes and the txlog, which Datalevin does not keep; the table below
+  has the rest. Writing each tree in plain key order leaves every
+  leaf half full under emdb's splits: 198 MB, 4.3× (the "before"
+  column, `docs/NEXTOMIC.md` §2.5).
+
+Where the store's bytes go after the load (both commit modes give the
+same trees): entries, key and value bytes, leaf pages, the share of
+the leaves the entries fill, and the tree's pages in MB.
+
+| tree | entries | key B | value B | leaves before → after | fill before → after | MB before → after |
+|---|---:|---:|---:|---:|---:|---:|
+| `nx/eavt` | 500,267 | 10.1 M | 3.0 M | 2,252 → 1,317 | 0.50 → 0.85 | 37.0 → 21.6 |
+| `nx/aevt` | 500,267 | 10.1 M | 3.0 M | 2,053 → 1,577 | 0.55 → 0.71 | 33.7 → 25.9 |
+| `nx/avet` | 200,231 | 4.3 M | 1.2 M | 898 → 757 | 0.52 → 0.61 | 14.8 → 12.5 |
+| `nx/vaet` | 100,000 | 1.6 M | 0.6 M | 324 → 329 | 0.60 → 0.59 | 5.3 → 5.4 |
+| `nx/eavt-h` | 500,267 | 13.1 M | 0 | 2,252 → 1,317 | 0.50 → 0.85 | 37.0 → 21.6 |
+| `nx/aevt-h` | 500,267 | 13.1 M | 0 | 2,053 → 1,577 | 0.55 → 0.71 | 33.7 → 25.9 |
+| `nx/avet-h` | 200,231 | 5.5 M | 0 | 898 → 757 | 0.52 → 0.61 | 14.8 → 12.5 |
+| `nx/vaet-h` | 100,000 | 2.2 M | 0 | 324 → 329 | 0.60 → 0.59 | 5.3 → 5.4 |
+| `nx/txlog` | 103 | 618 | 9.3 M | 600 overflow pages | — | 9.9 → 9.9 |
+| all trees | | | | | | 191.4 → 140.7 |
+
+Keys are already compact (6-byte `e` and `t`, 4-byte `a`); emdb adds
+10 bytes per entry. EAVT fills best because each transaction writes
+5,000 of its keys into one gap; AEVT's five gaps take 1,000 each and
+fill less; AVET's and VAET's keys scatter over many small gaps, which
+fill as random inserts do. A store of 20,000 entities with a 282-byte
+string each (an out-of-line value, `docs/NEXTOMIC.md` §2.2) went from
+56.0 MB of trees to 29.6 MB, the payload leaving the current EAVT row
+(18.6 MB → 3.6 MB), and to 70.3 MB from 92.4 MB after every string was
+replaced once.
 
 **Sequences and strings.** Three of the rows above rerun on the tree
 with eager sequences built as vector views, direct leaf callbacks,
@@ -427,6 +456,21 @@ Each lever is a measured change: a before/after from `zig build bench`
   would save part of a `:commit` transaction's cost, about 18 μs in
   all (§3.11), at the price of holding the writer between natives. A `:durable` commit's two device flushes are the other
   cost left; group commit under one flush would divide it.
+- **Store size** (§3.11, 3.1× Datalevin). A history index that holds
+  only facts no longer current, with `as-of` and `history` merging it
+  with the current index, would drop half the index pages of an
+  append-mostly store; the readers are `nextomic/db.zig` and
+  `query/plan.zig`. A transaction that writes less than a leaf's worth
+  of keys into a gap (every one-datom transaction, and VAET's and
+  AVET's scattered keys) still leaves a half-full leaf behind: emdb
+  splits in half unless the key is the leaf's last, and a split at the
+  insert point after a run of adjacent inserts would fill such leaves
+  too, an engine change Nextomic does not ask for. Shorter integers
+  (a variable-width `t` in current values and in `top`) would save
+  about 5 % and change every key and value reader. The txlog repeats
+  an out-of-line value's payload for its assertion and its
+  retraction; referring to EAVT-h instead would drop most of a
+  text-heavy store's log.
 - **Memory on large collections.** §3.11's million-element rows hold
   2–4× babashka's resident set: the 16-byte value cell, non-moving
   mark-sweep over the process allocator, and eager intermediate
@@ -556,3 +600,4 @@ is one invocation's 30-sample median.
 | §3.11 language rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
 | §3.11 database rows, §6 "Levers pulled" | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
+| §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
