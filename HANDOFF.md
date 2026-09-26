@@ -17,9 +17,10 @@ runtime: a grammar-generated reader, a macroexpander, a compiler to
 mark-sweep collector, shipped as one binary. It runs real programs:
 `defn`, `defmacro`, namespaces with `require`, destructuring,
 multi-arity functions, atoms, records and protocols, callable
-keywords, symbols and collections, bignums and doubles with Clojure
-contagion, `try`/`catch`/`finally` over catchable values. It is not a
-Clojure port: no Java interop, no STM, one isolate, one thread.
+keywords, symbols, collections and Vars, bignums and doubles with
+Clojure contagion, `try`/`catch`/`finally` over catchable values. It
+is not a Clojure port: no Java interop, no STM, one isolate, one
+thread.
 
 **emdb** is the storage engine underneath: a memory-mapped,
 copy-on-write MVCC B+ tree with named trees, one writer, wait-free
@@ -56,18 +57,18 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 148/148 steps succeeded; 1192/1192 tests passed
+Build Summary: 152/152 steps succeeded; 1223/1223 tests passed
 ```
 
-It ran in 63 s wall (247 s CPU) from a warm cache on an Apple-silicon
+It ran in 56 s wall (231 s CPU) from a warm cache on an Apple-silicon
 Mac shared with other builds. Any output besides the summary tree is a
-failure. The largest binaries are `unit` (599 inline tests) and
-`eval_pipeline` (393 programs).
+failure. The largest binaries are `unit` (611 inline tests) and
+`eval_pipeline` (406 programs).
 
 The fastest end-to-end checks:
 
 ```bash
-./bin/nexis run examples/nextomic-app.nx   # clinic chart on Nextomic; a second run prints the same
+./bin/nexis run examples/nextomic-app.nx   # clinic chart on Nextomic; a second run adds to its store
 ./bin/nexis run examples/todo-app.nx       # durable refs over the whole db/* surface, rollback included
 ./bin/nexis run examples/shapes-app.nx     # multi-file protocols, records, atoms: total-area atom = 9650
 ./bin/nexis -e '(reduce + (range 101))'    # 5050
@@ -90,8 +91,8 @@ Sexp
    │  src/reader.zig    canonical Form tree (PLAN §28): spans, merged ^meta, #() as the
    ▼                    anon-fn datum, syntax-quote marker, reader errors
 Form {datum, origin}
-   │  src/expand.zig    macros to a fixpoint: 18 host macros in Zig (let fn defn loop
-   ▼                    when when-not and or cond -> ->> case condp for defrecord
+   │  src/expand.zig    macros to a fixpoint: 19 host macros in Zig (let fn defn defn-
+   ▼                    loop when when-not and or cond -> ->> case condp for defrecord
                         defprotocol extend-type extend-protocol), the try, ns, require,
                         defmacro and set! rules, user macros run in a compile-time
                         sub-VM, syntax-quote with auto-gensym
@@ -148,18 +149,25 @@ the live size) has been allocated, 4 KiB under `NEXIS_GC_STRESS`
 
 ### 3.4 The db seam
 
-`src/db.zig` owns an `emdb.Env` per `db.Connection`, pins
-`pageSize = 16384` and `maxNamedTrees = 128`, canonicalizes the path
-so two spellings of one file are one store, resolves tree ids once per
-connection, reads values whole off cursors, and names every engine
-failure as a `:db/*` keyword (`docs/DB.md`).
+`src/db.zig` opens each store file once per process: `StoreFile` keys
+the open files by `(st_dev, st_ino)` and hands its one
+reference-counted `emdb.Env` to every `db/open` connection and every
+Nextomic connection of the file, so any spelling, symlink or hard link
+of the path is one store, and a second writer on it is `:db/busy`
+(`:nextomic/nested` in Nextomic), never a deadlock (`docs/DB.md`
+§3.1). It pins `pageSize = 16384` and `maxNamedTrees = 128`, resolves
+tree ids once per connection, reads values whole off cursors, holds
+the transaction a `db/alter!` or `db/reduce-tree` callback runs in so
+the callback cannot finish it, and names every engine failure as a
+`:db/*` keyword (`docs/DB.md`).
 
 ### 3.5 Nextomic
 
 `src/nextomic/` sits above `dispatch` and `vm` and is imported by
-`stdlib.zig` only. `store.zig` opens its own `Env` with the same pinned
-geometry; the layer holds raw `*emdb.Txn` handles and byte keys and
-shares only the `:db/*` names with `db.zig`.
+`stdlib.zig` only. `store.zig` opens the file through `db.StoreFile`
+with the same pinned geometry, sharing its environment with any
+`db/open` of the file; the layer holds raw `*emdb.Txn` handles and byte
+keys and otherwise shares only the `:db/*` names with `db.zig`.
 
 | file | role |
 |---|---|
@@ -242,10 +250,11 @@ and a reader slot, which its own §3 and `docs/NEXTOMIC.md` §4 contradict
   `persist-2` share one store across two processes. Every
   `examples/*.nx` is pinned the same way, the store-backed ones twice.
 - **Goldens.** `test/golden/` pins the reader's Form output
-  byte-for-byte, fourteen reader-error cases, and under `cli/` what
+  byte-for-byte, fifteen reader-error cases, and under `cli/` what
   `bin/nexis` prints for runtime, reader and macro errors, a
   disassembly, script output, stdin, arguments, exit statuses, a REPL
-  session, deep recursion and the usage errors.
+  session, deep recursion, a source file with a byte-order mark,
+  `--help` on stdout and the usage errors.
 - **Deep input.** Inline tests in the reader, expander, compiler,
   codec, printer, dispatch, pull, transaction and query parsers feed
   each input nested past the guard; `eval_pipeline.zig` checks that
@@ -278,49 +287,133 @@ failing test (AGENTS.md).
    Next: hash a keyword by its text in the keyword domain (as a
    symbol is), regenerate the `.out` files with `-Dupdate=true`,
    and drop the rule from `docs/STDLIB.md` §1.
-3. **`with-meta` on a record or a typed vector** raises
-   `:no-metadata-on-immediate`, though neither is an immediate and a
-   Clojure record carries metadata. Next: decide in
-   `docs/SEMANTICS.md` §7 (records take metadata through the heap
-   header, or a keyword that names the kind), then `stdlib.zig`
-   `fnWithMeta`.
+3. **A rethrow loses the original error's report.** When no `catch`
+   clause matches, or a `finally` runs and rethrows, the VM rethrows
+   the error as a value, so an uncaught one is reported as
+   `UncaughtThrow :arity-mismatch` at the `try` form, without the
+   failing call's span, its frame trace or its detail ("into takes 0
+   to 2 arguments, got 4"): `(try (into [] [1] [2] [3]) (finally 1))`.
+   `with-out-str`, which catches and rethrows, hides errors the same
+   way. Next: keep the original `traced_error`, span, trace and
+   `error_detail` with the pending throw (`vm.finally_stack`) and
+   report them when the rethrow is not caught; a CLI golden pins the
+   report of that program.
 4. **Sequences are eager** (§23 #14; open question §24 #2):
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
 5. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
-   `instance?`/`type`/`class`, and the reader forms `#'x`, `\uXXXX`,
-   `##Inf` (`CLOJURE-REVIEW.md` §4). Each is a native or a reader rule
-   plus an `eval_pipeline` case.
+   `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
+   `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
+   rule plus an `eval_pipeline` case.
 6. **A transaction handle dropped open is never aborted**: nothing
    ends a `db/begin-read` or `db/begin-write` handle the program
    neither commits nor aborts, because handles are not collector
-   blocks and nothing finalizes them.
-   `with-tx` and `with-read-tx` always close theirs. Next: track open
-   handles on the connection and abort them when it closes, or give
-   the kind a finalizer.
-7. **`nexis --help` writes to stderr.** Most tools print requested
-   help to stdout. Next: `cli.zig` `usageExit`, with
-   `test/golden/cli/help.err` becoming an `.out`.
+   blocks and nothing finalizes them; it lives until VM teardown and
+   keeps its connection from closing (`docs/DB.md` §12). `with-tx`
+   and `with-read-tx` always close theirs. Next: track open handles on
+   the connection and abort them when it closes, or give the kind a
+   finalizer.
+7. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
+   is `MalformedMacroCall` ("options come in pairs"). Next: in
+   `expand.zig`'s require walk, expand a spec whose second element is
+   a symbol or vector into one spec per suffix, and add the row to
+   `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
+   namespaces through one prefix.
+8. **Out of memory ends the process with exit status 1**:
+   `VmError.OutOfMemory` escapes `main` as a Zig `error: OutOfMemory`,
+   the status of a usage error, and ends a REPL session. Next: report
+   it as a runtime error (exit 5, `docs/TOOLING.md` §1) and keep the
+   REPL alive after `resetAfterError`; a CLI golden whose program asks
+   for an allocation no machine has.
+9. **The REPL copies pending input on every line**: each line of an
+   incomplete form dupes the whole pending text into the session arena
+   and reads it again, so a pasted form of n lines costs O(n²), and
+   there is no continuation prompt. Next: `cli.zig` keeps the pending
+   text in its growable buffer and dupes it once when the form is
+   complete, and prints a continuation prompt; `test/golden/cli/repl.*`
+   gains a multi-line form.
+10. **An error's caret counts bytes**: the underline and column of an
+    error report advance one per byte, so a line with multi-byte
+    characters before the span underlines the wrong place. Next: count
+    code points in `cli.zig`'s report, with a CLI golden holding a
+    non-ASCII line.
+11. **Small Clojure differences**: `(int x)` of NaN is
+    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
+    transient (Clojure's transient collections are counted);
+    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
+    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
+    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
 
 ### 6.2 Nextomic
 
 1. **A `:db.type/long` value outside i48** is refused with
-   `:nextomic/value-type`, though the key encoding is 8 bytes. Next:
-   `marshal.zig` accepts a bignum that fits i64 and returns one on the
-   way out, with query `exec.zig` comparisons over it; a
-   `test/nextomic` case transacts and queries `2^47`.
-2. **Two connections to one file in one process** work, but their
-   db-values at one basis are unequal: equality is by connection.
-3. **The planner's join estimates** come from `treeStat` and
+   `:nextomic/value-type`, though the key encoding is 8 bytes, and a
+   bignum query input (`(sum ?x)` over one, `[(< ?x ?y)]` against one)
+   is refused the same way. Next: `marshal.zig` accepts a bignum that
+   fits i64 and returns one on the way out, and query `exec.zig`
+   cells carry i64 and promote when materialized; a `test/nextomic`
+   case transacts and queries `2^47` and `2^63 - 1`.
+2. **Two connections to one file in one process** share the file's
+   environment, but their db-values at one basis are unequal:
+   equality is by connection.
+3. **Retracting an attribute's `:db/ident` is accepted** and leaves
+   the name live: `[?e :db/ident :u/n]` finds nothing afterwards, yet
+   `:u/n` still reads and writes the attribute. Next: refuse it with
+   `:nextomic/schema` in `transact.zig`'s check step (or retire the
+   name through the minter), a `docs/NEXTOMIC.md` §3 row and a
+   `test/nextomic` case.
+4. **A late `:db/index true` backfills AVET history from current
+   datoms only**: `index-range` over `history` misses a value
+   retracted before the attribute was indexed, which EAVT history
+   still holds. Next: backfill `nx/avet-h` from the attribute's AEVT
+   history, or state in `docs/NEXTOMIC.md` §3 that history AVET starts
+   at the indexing `t`.
+5. **Concurrent writers must share a version**: a connection's schema
+   cache trusts the `sys` counter `"sg"`, which a build older than it
+   does not bump, so a process of an older build that alters schema
+   while a newer one has the file open leaves the newer one enforcing
+   the old schema. Sequential use across versions is fine. Next:
+   state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
+   unchanged but `t` advanced, check the txlog entries in between for
+   attribute-partition datoms.
+6. **Small**: a `:db.fn/cas` old value that is an unseen keyword
+   mints it (`transact.zig` resolves the old value with `.assert`;
+   `.match` would refuse it without a write), harmless but a stray
+   ident; the arg-map form of `q` refuses Datomic's `:timeout` and
+   `:io-context` keys with `:nextomic/query-syntax` where ignoring them
+   would port more code (an owner's call); the refusal of a
+   `get-else` on a card-many attribute carries no `:clause`.
+7. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-4. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+8. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-5. **No datom heap kind**: reads return `[e a v t added]` vectors.
+9. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
-### 6.3 Build and platform
+### 6.3 Storage
+
+1. **Hard links across processes**: one process opens a file once
+   whatever it is called (`docs/DB.md` §3.1), but emdb names its lock
+   file after the path it was given, so two processes that open one
+   store through two hard-link names take two lock files and can both
+   write. Next: state it in `docs/DB.md` §3.1 (open a store by one
+   name); emdb is not changed for it.
+2. **Writes to a tree during `db/reduce-tree` over it**: the callback
+   may write through the held transaction, and emdb does not specify
+   what a cursor sees after its own tree is written under it. Next:
+   refuse writes to the walked tree while the walk holds the
+   transaction (`:db/busy`), or walk a copy of the keys, with a test
+   that writes during a reduce.
+3. **The environment lives on the first opener's allocator**:
+   `db/open` leaves emdb's default, `page_allocator`, so an
+   environment `db/open` opened allocates its small objects a page at
+   a time, while one Nextomic opened first uses the VM's allocator.
+   Next: pass `vm.allocator` from `db/open` (it outlives every
+   connection), measured with `zig build bench -- --filter db-integrated`.
+
+### 6.4 Build and platform
 
 1. **Linux is unverified**: there is no CI. The proof is `zig build
    test` on a Linux host plus a store written on one platform and read
@@ -383,13 +476,17 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 2): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. The 4096-instruction limit (§6.1 item 1): real test files hit it.
-3. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
-4. Transaction handles dropped open (§6.1 item 6) and record and
-   typed-vector metadata (§6.1 item 3).
-5. The parser regeneration check and a Linux run (§6.3).
-6. Performance: the levers and measured dead ends are
+2. The rethrow that loses the original report (§6.1 item 3): every
+   uncaught error through a `finally` or a non-matching `catch` is
+   reported at the wrong place.
+3. The 4096-instruction limit (§6.1 item 1): real test files hit it.
+4. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
+5. Transaction handles dropped open (§6.1 item 6), writes during
+   `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
+   error (§6.1 item 8).
+6. The parser regeneration check and a Linux run (§6.4).
+7. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
-7. The open design questions, each an amendment first: laziness
+8. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).
