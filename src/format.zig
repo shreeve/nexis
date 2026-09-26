@@ -2,26 +2,28 @@
 //!
 //! Two modes:
 //!   - `.display`  strings UNQUOTED; chars as their UTF-8 bytes;
-//!                 nil → `"nil"`. Used by REPL/CLI output, `print`,
-//!                 `println`, and `str`'s element printer.
+//!                 nil → `"nil"`. Used by `print`, `println`, and
+//!                 `str` for a string or char.
 //!   - `.readable` strings DOUBLE-QUOTED with `\ " \n \t \r` plus
 //!                 `\u{HEX}` for other ASCII controls and DEL;
 //!                 chars as `\space` / `\newline` / `\tab` / `\return`
 //!                 / `\formfeed` / `\backspace` / `\\` / `\x` for
 //!                 printable ASCII / `\u{HEX}` for the rest;
-//!                 nil → `"nil"`. Used by `prn` and `pr-str`.
+//!                 nil → `"nil"`. Used by `pr`, `prn`, `pr-str`,
+//!                 the REPL and `-e` results, and error reports.
 //!
 //! The single formatter: `src/cli.zig` (REPL + run output),
 //! `test/integration/eval_pipeline.zig` and `src/stdlib.zig` all
 //! delegate here.
 //!
-//! Authoritative contract: `docs/STRING.md` §9 (and the readable
+//! Authoritative contract: `docs/STDLIB.md` §5 (and the readable
 //! escape table). Identity-valued and process-local kinds (atom,
-//! function, native fn, transient, protocols, handles, durable refs)
-//! format OPAQUELY in both modes, as `#<...>`: they have no source
-//! form, and the readable output does not read back. A record prints
-//! as Clojure prints one, `#ns.Type{:k v, ...}`, which the reader does
-//! not read back either. The codec (`src/codec.zig`) is the
+//! function, native fn, transient, protocols, db handles, durable
+//! refs) format OPAQUELY in both modes, as `#<...>`: they have no
+//! source form, and the readable output does not read back. A Var
+//! prints as `#'ns/name`, a Nextomic handle as `#nextomic/...`, and a
+//! record as Clojure prints one, `#ns.Type{:k v, ...}`; the reader
+//! reads none of them back. The codec (`src/codec.zig`) is the
 //! serialization layer; format.zig is presentation.
 //!
 //! Frozen invariants:
@@ -227,7 +229,7 @@ fn formatString(v: Value, mode: FormatMode, writer: *std.Io.Writer) Error!void {
             '\r' => try writer.writeAll("\\r"),
             // ASCII controls 0x00..0x1F (minus the named four above)
             // + DEL (0x7F): hex-escape so the output is valid nexis
-            // source per FORMS.md §28.3's `\u{HEX}` escape syntax.
+            // source per the `\u{HEX}` escape (PLAN §23 #26).
             0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => {
                 try writer.print("\\u{{{X}}}", .{b});
             },
@@ -245,8 +247,8 @@ fn formatChar(scalar: u21, mode: FormatMode, writer: *std.Io.Writer) Error!void 
         return;
     }
     // Readable: named tokens for common whitespace + backslash;
-    // printable ASCII as `\x`; everything else hex-escape. STRING.md
-    // §9 pins the exact set.
+    // printable ASCII as `\x`; everything else hex-escape. STDLIB.md
+    // §5 pins the exact set.
     switch (scalar) {
         ' ' => try writer.writeAll("\\space"),
         '\n' => try writer.writeAll("\\newline"),

@@ -1,6 +1,6 @@
 ; src/stdlib/math.nx — the constants of the `nexis.math` namespace
 ; (docs/TOOLING.md §4). The functions (sqrt, pow, floor, ceil,
-; round) are natives in src/stdlib.zig `math_fns`; abs lives in
+; round) are natives in src/stdlib.zig `math_natives`; abs lives in
 ; nexis.core. Embedded via @embedFile and bootstrapped at VM startup
 ; with nexis.math as the current namespace.
 
