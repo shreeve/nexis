@@ -1586,6 +1586,43 @@ test "integration: tap> calls every tap, and a tap that throws is ignored" {
     , "[true nil nil true nil true [[:t1 1]] nil]");
 }
 
+test "integration: class, type, instance?, var?, special-symbol?" {
+    try expectOutput("(map class [nil true false \\a 1 99999999999999999999 1.5 :k 'x \"s\" '(1) [1] {:a 1} #{1} (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc])", "(nil :boolean :boolean :char :fixnum :bignum :float :keyword :symbol :string :list :vector :map :set :typed_vector :function :native_fn :atom :transient :var_)");
+    // A record's type is the symbol it prints with; :type metadata is type's.
+    try expectOutput("(defrecord P [x]) [(class (->P 1)) (type (->P 1)) (symbol? (type (->P 1))) (type (with-meta [1] {:type :point})) (class (with-meta [1] {:type :point})) (type (with-meta (->P 1) {:type :q}))]", "[user.P user.P true :point :vector :q]");
+    try expectOutput("(defrecord P [x]) [(instance? :vector [1]) (instance? :map [1]) (instance? 'user.P (->P 1)) (instance? (type (->P 1)) (->P 2)) (instance? :map (->P 1)) (instance? :vector (with-meta [] {:type :t})) (try (instance? nil 1) (catch any e e))]", "[true false true true false true :kind-mismatch]");
+    try expectOutput("(def x 1) [(var? #'x) (var? x) (var? 'x) (var? (resolve 'inc))]", "[true false false true]");
+    try expectOutput("(map special-symbol? '[if def let* fn* loop* letfn* quote var recur try catch finally throw do set! & let fn nexis.core/if])", "(true true true true true true true true true true true true true true true true false false false)");
+    try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
+}
+
+const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
+
+test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, all-ns, ns-publics, ns-interns" {
+    try expectOutputWithFiles(&.{apputil},
+        \\(ns user (:require [app.util :as u :refer [x]]))
+        \\[(the-ns 'app.util) (find-ns 'app.util) (find-ns 'nope) (ns-name 'user) (try (the-ns 'nope) (catch any e e))
+        \\ (ns-publics 'app.util) (ns-interns 'app.util) (contains? (ns-publics 'user) 'x) (get (ns-publics 'nexis.core) 'inc)
+        \\ (every? symbol? (all-ns)) (boolean (some #{'app.util} (all-ns))) (try (find-ns "user") (catch any e e))]
+    , "[app.util app.util nil user :no-such-namespace {x #'app.util/x} {x #'app.util/x, y #'app.util/y} false #'nexis.core/inc true true :kind-mismatch]");
+}
+
+test "integration: resolve and ns-resolve name a Var through the namespace's names" {
+    try expectOutputWithFiles(&.{apputil},
+        \\(ns user (:require [app.util :as u :refer [x]] [nexis.string :as s]))
+        \\(def own 2)
+        \\[(resolve 'first) (resolve 'x) (resolve 'u/x) (resolve 'app.util/x) (resolve 's/join) (resolve 'own) (resolve 'nope) (resolve 'nope/x) (resolve 'u/nope)
+        \\ (ns-resolve 'app.util 'x) (ns-resolve 'app.util 'own) (ns-resolve 'app.util 'inc) (resolve 'when) (@(resolve 'inc) 1)
+        \\ (try (resolve "x") (catch any e e)) (try (ns-resolve 'nope 'x) (catch any e e))]
+    , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 :kind-mismatch :no-such-namespace]");
+}
+
+test "integration: a UUID is its canonical string" {
+    try expectOutput("(let [u (random-uuid)] [(uuid? u) (string? u) (count u) (subs u 14 15) (contains? #{\\8 \\9 \\a \\b} (nth u 19)) (= u (parse-uuid u)) (not= u (random-uuid))])", "[true true 36 4 true true true]");
+    try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[\"0123abcd-4567-89ef-0123-456789abcdef\" nil nil nil nil]");
+    try expectOutput("[(uuid? \"0123abcd-4567-89ef-0123-456789abcdef\") (uuid? \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (uuid? 1) (uuid? nil) (try (parse-uuid nil) (catch any e e)) (try (parse-uuid 1) (catch any e e))]", "[true false false false :kind-mismatch :kind-mismatch]");
+}
+
 test "integration: in-ns switches the namespace the next forms compile in" {
     try expectOutputProgram("(in-ns 'other) (def x 1) (in-ns 'user) [other/x (try (in-ns \"s\") (catch any e e))]", "[1 :kind-mismatch]");
 }

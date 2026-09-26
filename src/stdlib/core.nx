@@ -747,6 +747,30 @@
   (print (apply format fmt args)))
 
 ; ============================================================
+; Types, namespaces, UUIDs (docs/STDLIB.md §8)
+; ============================================================
+
+; (type x) → the :type in x's metadata, else (class x), as Clojure's.
+(defn type [x] (or (get (meta x) :type) (class x)))
+
+; (instance? t x) → whether x's class is the type t: a kind keyword
+; such as :vector, or a record's symbol, as class returns them.
+(defn instance? [t x]
+  (if (or (keyword? t) (symbol? t)) (= t (class x)) (throw :kind-mismatch)))
+
+; The names the compiler takes as special forms.
+(defn special-symbol? [s]
+  (contains? '#{def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &} s))
+
+; A namespace is its name symbol.
+(defn the-ns [x] (or (find-ns x) (throw :no-such-namespace)))
+(defn ns-name [x] (the-ns x))
+
+; (uuid? x) → whether x is a UUID's canonical text, as random-uuid
+; and parse-uuid make it.
+(defn uuid? [x] (and (string? x) (= x (parse-uuid x))))
+
+; ============================================================
 ; Delays, closing, taps
 ; ============================================================
 

@@ -322,6 +322,18 @@ a realized list.
 | `force` | 1 | A delay's value, forcing it; anything else itself |
 | `delay?`, `realized?` | 1 | Whether `x` is a delay; whether the delay has been forced (`realized?` of anything else is `:kind-mismatch`) |
 | `Closeable`, `close` | protocol | What `with-open` closes: `close` of a db connection is `db/close`, of a Nextomic connection `nextomic/release`; a record or kind extends it to be closed the same way |
-| `with-open` | macro | `(with-open [name init ...] body...)`: body with each name bound, each closed through `close` in reverse order on every exit, a throw included; the bindings must be symbol and value pairs (`MalformedMacroCall` otherwise) |
+| `with-open` | macro | `(with-open [name init ...] body...)`: body with each name bound, each closed through `close` in reverse order on every exit, a throw included; the bindings must be symbol and value pairs, else the expansion fails |
 | `tap>` | 1 | Calls every function `add-tap` added with `x`, ignoring any that throws, and returns true. Clojure calls the taps on another thread; one isolate, one thread calls them before `tap>` returns |
 | `add-tap`, `remove-tap` | 1 | Add or remove a tap function; nil |
+| `class` | 1 | The type of `x`: for a record the symbol it prints with (`user.P`), for anything else the keyword `extend-type` names its kind with (`:vector`, `:map`, `:set`, `:list`, `:fixnum`, `:bignum`, `:float`, `:string`, `:typed_vector`, `:function`, `:native_fn`, `:var_`, ...), except that both booleans are `:boolean`; nil for nil |
+| `type` | 1 | `(or (:type (meta x)) (class x))`, as Clojure's |
+| `instance?` | 2 | `(instance? t x)`: whether `(class x)` is `t`, a keyword or symbol (`(instance? :vector [])`, `(instance? 'user.P p)`); there is no hierarchy, so `(instance? :map p)` of a record is false. Any other `t` is `:kind-mismatch` |
+| `var?` | 1 | Whether `x` is a Var |
+| `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
+| `find-ns`, `the-ns`, `ns-name` | 1 | A namespace is its name symbol: `find-ns` returns the symbol when a namespace has that name, else nil; `the-ns` and `ns-name` return it, else throw `:no-such-namespace`. A non-symbol is `:kind-mismatch` |
+| `all-ns` | 0 | Every namespace's name, sorted |
+| `ns-interns`, `ns-publics` | 1 | The map of name symbol to Var of every Var interned in the namespace (the ones it refers to from another excluded), an unbound one a `declare` or a forward reference made included; `ns-publics` leaves out those marked `:private`. `clojure.string` and its kin hold `nexis.string`'s Vars, so ask the `nexis.*` namespace |
+| `resolve`, `ns-resolve` | 1, 2 | `(resolve sym)`, `(ns-resolve ns sym)`: the Var `sym` names in the current namespace or `ns`, resolved as the compiler resolves a global (an unqualified name the namespace's own or referred, then `nexis.core`'s; a qualified one through an alias or a namespace name), else nil. A host macro (`when`, `let`, `defn`, ...) has no Var, so it resolves to nil |
+| `random-uuid` | 0 | A random version-4 UUID. A UUID is its canonical lowercase text, a string, as Nextomic's `:db.type/uuid` values are; there is no `#uuid` literal |
+| `parse-uuid` | 1 | The canonical text of the UUID a string spells as 8-4-4-4-12 hex digits of either case, else nil (Java's lenient short groups included); a non-string is `:kind-mismatch` |
+| `uuid?` | 1 | Whether `x` is a string in the canonical form (so `(uuid? (random-uuid))` is true, and an uppercase spelling is not) |
