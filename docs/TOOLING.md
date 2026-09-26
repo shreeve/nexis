@@ -44,8 +44,14 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold
-complete forms, so a form or a string literal may span lines (with no
-second prompt) and a line may hold several; blank lines are skipped. It evaluates every
+complete forms, so a form or a string literal may span lines and a
+line may hold several; blank lines are skipped. While a form is open
+each further line is prompted with `#_=> `, right-aligned under the
+namespace prompt (`user=> ` then `  #_=> `, as Leiningen's REPL
+prints it). A line is scanned once for the brackets, strings,
+comments and character literals it opens or closes, and the text is
+read only when they balance, so pasting a form of n lines costs
+O(n). It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and

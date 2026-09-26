@@ -512,13 +512,21 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     };
     var results = Results{ .rt = &rt };
 
+    // The text of the form being read, a line at a time; copied to
+    // the session once it is complete.
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(allocator);
+    var balance: Balance = .{};
     while (true) {
+        const ns = rt.registry.current.name;
         if (pending.items.len == 0) {
-            const ns = rt.registry.current.name;
             try stdout.writeStreamingAll(io, ns);
             try stdout.writeStreamingAll(io, "=> ");
+        } else {
+            // `#_=> `, right-aligned under `ns=> `.
+            var pad: [64]u8 = @splat(' ');
+            try stdout.writeStreamingAll(io, pad[0..@min(ns.len -| 2, pad.len)]);
+            try stdout.writeStreamingAll(io, "#_=> ");
         }
         const line = stdlib.readStdinLine(io) catch |err| {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: stdin read error: ");
@@ -534,8 +542,11 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             if (trimmed.len == 0) continue;
             if (eql(trimmed, ":quit") or eql(trimmed, ":q")) return;
         }
+        const start = pending.items.len;
         try pending.appendSlice(allocator, line);
         try pending.append(allocator, '\n');
+        balance.scan(pending.items[start..]);
+        if (!balance.complete()) continue;
 
         // Closures made here are called from later inputs, so the
         // text, its SourceInfo and its routines live as long as the
@@ -552,8 +563,51 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             if (err == error.RunFailed) rt.registry.core.lookupLocal("*e").?.root = e;
         };
         pending.clearRetainingCapacity();
+        balance = .{};
     }
 }
+
+/// Whether the REPL's pending text may hold complete forms, kept a
+/// line at a time so a form of n lines is scanned once, not n times:
+/// the depth of brackets outside strings, comments and character
+/// literals, with the lexer's rules for each (`src/nexis.zig`). Only
+/// text this calls complete is read; the reader has the last word,
+/// and a trailing `'` or `#_` still reads as incomplete.
+const Balance = struct {
+    depth: usize = 0,
+    in_string: bool = false,
+    /// A closer with no opener: the reader reports it.
+    stray_closer: bool = false,
+
+    fn scan(self: *Balance, text: []const u8) void {
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (self.in_string) switch (text[i]) {
+                '\\' => i += 1,
+                '"' => self.in_string = false,
+                else => {},
+            } else switch (text[i]) {
+                '"' => self.in_string = true,
+                // A character literal: `\(` and `\"` open nothing.
+                '\\' => i += 1,
+                ';' => while (i + 1 < text.len and text[i + 1] != '\n') {
+                    i += 1;
+                },
+                '(', '[', '{' => self.depth += 1,
+                ')', ']', '}' => if (self.depth == 0) {
+                    self.stray_closer = true;
+                } else {
+                    self.depth -= 1;
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn complete(self: Balance) bool {
+        return !self.in_string and (self.depth == 0 or self.stray_closer);
+    }
+};
 
 /// The keyword a caught runtime error would be (`DivideByZero` is
 /// `:divide-by-zero`), for `*e`.

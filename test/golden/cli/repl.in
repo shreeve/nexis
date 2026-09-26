@@ -10,6 +10,10 @@
 (defn twice [n]
   (* 2 n))
 (twice 21)
+(str "(" \) ; a ( comment [
+     "]" \")
+'
+done
 (def s "one
 two \" three
 

@@ -302,25 +302,18 @@ failing test (AGENTS.md).
    a symbol or vector into one spec per suffix, and add the row to
    `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
    namespaces through one prefix.
-6. **The REPL copies pending input on every line**: each line of an
-   incomplete form dupes the whole pending text into the session arena
-   and reads it again, so a pasted form of n lines costs O(n²), and
-   there is no continuation prompt. Next: `cli.zig` keeps the pending
-   text in its growable buffer and dupes it once when the form is
-   complete, and prints a continuation prompt; `test/golden/cli/repl.*`
-   gains a multi-line form.
-7. **An error's caret counts bytes**: the underline and column of an
+6. **An error's caret counts bytes**: the underline and column of an
    error report advance one per byte, so a line with multi-byte
    characters before the span underlines the wrong place. Next: count
    code points in `cli.zig`'s report, with a CLI golden holding a
    non-ASCII line.
-8. **Small Clojure differences**: `(int x)` of NaN is
+7. **Small Clojure differences**: `(int x)` of NaN is
    `:invalid-argument` (Clojure returns 0); `counted?` is false for a
    transient (Clojure's transient collections are counted);
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-9. **A routine holds at most 4096 live locals and 4096 captured
+8. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other

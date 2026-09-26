@@ -10,9 +10,11 @@ user=> #'user/a
 #'user/b
 3
 user=> 30
-user=> #'user/twice
+user=>   #_=> #'user/twice
 user=> 42
-user=> #'user/s
+user=>   #_=> "()]\""
+user=>   #_=> done
+user=>   #_=>   #_=>   #_=> #'user/s
 user=> 23
 user=> ["a" \b "c d"]
 user=> 8891
