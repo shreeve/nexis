@@ -184,7 +184,10 @@ const core_natives = table("", .{
     .{ "inc", 1, 1, &fnInc },
     .{ "dec", 1, 1, &fnDec },
     .{ "long", 1, 1, &fnLong },
-    .{ "int", 1, 1, &fnInt },
+    .{ "int", 1, 1, castTo(i32) },
+    .{ "short", 1, 1, castTo(i16) },
+    .{ "byte", 1, 1, castTo(i8) },
+    .{ "float", 1, 1, &fnFloat },
     .{ "char", 1, 1, &fnChar },
     .{ "parse-long", 1, 1, &fnParseLong },
     .{ "parse-double", 1, 1, &fnParseDouble },
@@ -876,15 +879,34 @@ fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
 }
 
-/// `(int x)`: as `long`, within Java's 32-bit `int` range, else
-/// `:invalid-argument`, as Clojure's cast checks.
-fn fnInt(vm: *VM, args: []const Value) VmError!Value {
-    const x = args[0];
-    const min = std.math.minInt(i32);
-    const max = std.math.maxInt(i32);
-    if (x.isFloat() and !(x.asFloat() >= min and x.asFloat() <= max)) return VmError.InvalidArgument;
-    const r = try fnLong(vm, args);
-    return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
+/// `(int x)`, `(short x)`, `(byte x)`: as `long`, within the range of
+/// Java's `T`, else `:invalid-argument`, as Clojure's casts check; NaN
+/// is 0, as Java's cast makes it.
+fn castTo(comptime T: type) *const fn (*VM, []const Value) VmError!Value {
+    return &struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const x = args[0];
+            const min = std.math.minInt(T);
+            const max = std.math.maxInt(T);
+            if (x.isFloat()) {
+                const f = x.asFloat();
+                if (std.math.isNan(f)) return value_mod.fromFixnum(0).?;
+                if (!(f >= min and f <= max)) return VmError.InvalidArgument;
+            }
+            const r = try fnLong(vm, args);
+            return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
+        }
+    }.call;
+}
+
+/// `(float x)`: as `double`, within Java's `float` range, else
+/// `:invalid-argument`, as Clojure's cast checks. The one float type
+/// is f64, so the value is not rounded to single precision.
+fn fnFloat(_: *VM, args: []const Value) VmError!Value {
+    const d = try vm_mod.numDouble(args[0]);
+    const f = d.asFloat();
+    if (!std.math.isNan(f) and @abs(f) > std.math.floatMax(f32)) return VmError.InvalidArgument;
+    return d;
 }
 
 /// `(char n)`: the char with code point `n`; a char is itself. A

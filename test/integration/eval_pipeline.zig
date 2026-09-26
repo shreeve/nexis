@@ -1427,7 +1427,13 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
     // int checks Java's 32-bit int range, as Clojure's cast does.
     try expectOutput("[(int 2147483647) (int -2147483648) (int -3.9) (int -2147483647.9)]", "[2147483647 -2147483648 -3 -2147483647]");
-    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 (/ 0.0 0.0)])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    // NaN casts to 0, as Java's (int) and Clojure's int make it.
+    try expectOutput("[(int ##NaN) (short ##NaN) (byte ##NaN)]", "[0 0 0]");
+    // short and byte check their Java ranges the same way.
+    try expectOutput("[(byte 127) (byte -128) (byte 1.9) (byte \\a) (short 32767) (short -32768) (short -1.5) (short \\a)]", "[127 -128 1 97 32767 -32768 -1 97]");
+    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 127.5 -128.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
+    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32767.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
     try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
@@ -4081,6 +4087,20 @@ test "numbers: special floats" {
     try expectOutput("(infinite? (/ 1.0 0))", "true");
     try expectOutput("(infinite? (/ 1 2))", "false");
     try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+}
+
+test "numbers: the promoting and unchecked operators, num, float, ratio? and rational?" {
+    // Every integer operator promotes, so the ' forms are the same functions.
+    try expectOutput("[(+' 9223372036854775807 1) (+') (*') (-' 1) (-' 1 2 3) (inc' 1.5) (dec' -9223372036854775808) (*' 4294967296 4294967296)]", "[9223372036854775808 0 1 -1 -4 2.5 -9223372036854775809 18446744073709551616]");
+    // The unchecked operators wrap two longs at 64 bits, as Java's do;
+    // a float or an integer beyond 64 bits computes as + does.
+    try expectOutput("[(unchecked-add 9223372036854775807 1) (unchecked-subtract -9223372036854775808 1) (unchecked-multiply 9223372036854775807 2) (unchecked-inc 9223372036854775807) (unchecked-dec -9223372036854775808) (unchecked-negate -9223372036854775808)]", "[-9223372036854775808 9223372036854775807 -2 -9223372036854775808 9223372036854775807 -9223372036854775808]");
+    try expectOutput("[(unchecked-add 1 2) (unchecked-add 1 2.5) (unchecked-add 99999999999999999999 1) (unchecked-multiply 3 -4)]", "[3 3.5 100000000000000000000 -12]");
+    try expectOutput("(try (unchecked-add nil 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("[(num 1) (num 1.5) (num nil) (try (num \"a\") (catch any e e))]", "[1 1.5 nil :kind-mismatch]");
+    try expectOutput("[(float 1) (float 0.5) (NaN? (float ##NaN)) (float -3.4028234663852886E38)]", "[1.0 0.5 true -3.4028234663852886E38]");
+    try expectOutput("(map #(try (float %) (catch any e e)) [1e39 -1e39 ##Inf nil \\a \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch :kind-mismatch)");
+    try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
 }
 
 test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {

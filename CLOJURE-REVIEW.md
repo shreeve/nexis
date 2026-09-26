@@ -206,9 +206,9 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 |---|---|---|---|
 | `(= 1 1.0)` | true | false; `(== 1 1.0)` is true | §23 #11 |
 | NaN `=` NaN | false | true (canonical bits) | `docs/SEMANTICS.md` |
-| integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48 | `docs/BIGNUM.md` |
+| integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48; `+'` and its kin are the same functions, and `unchecked-add` and its kin wrap two longs at 64 bits as Clojure's do | `docs/BIGNUM.md`, `docs/SEMANTICS.md` §2.2 |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
-| `(long x)` | throws beyond 64 bits | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int` checks Java's int range (`:invalid-argument` outside it, and for NaN, which Clojure makes 0); `short`, `byte`, `float`, `bigint` do not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
+| `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` does not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
 | `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |

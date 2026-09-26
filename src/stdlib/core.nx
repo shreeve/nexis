@@ -658,6 +658,36 @@
 (defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
 (defn counted? [x] (or (coll? x) (typed-vector? x)))
 (defn record? [x] (nexis.internal/#%record? x))
+
+; ---- the numeric names Clojure spells apart ----
+; Every integer operator promotes to a bignum (docs/BIGNUM.md), so the
+; promoting forms are the same functions.
+(def +' +)
+(def -' -)
+(def *' *)
+(def inc' inc)
+(def dec' dec)
+
+; The unchecked operators wrap two longs at 64 bits, as Java's long
+; arithmetic does; with a float or an integer beyond 64 bits they
+; compute as the checked operator does, as Clojure's do.
+(defn- wrap64 [r x y]
+  (if (and (int? x) (int? y))
+    (let [m (mod r 18446744073709551616)]
+      (if (< m 9223372036854775808) m (- m 18446744073709551616)))
+    r))
+(defn unchecked-add [x y] (wrap64 (+ x y) x y))
+(defn unchecked-subtract [x y] (wrap64 (- x y) x y))
+(defn unchecked-multiply [x y] (wrap64 (* x y) x y))
+(defn unchecked-inc [x] (wrap64 (inc x) x 0))
+(defn unchecked-dec [x] (wrap64 (dec x) x 0))
+(defn unchecked-negate [x] (wrap64 (- x) x 0))
+
+; (num x) → x, a number or nil; there are no boxed kinds to convert.
+(defn num [x] (if (or (nil? x) (number? x)) x (throw :kind-mismatch)))
+; No rationals (PLAN §23 #10): the rationals are the integers.
+(defn ratio? [_] false)
+(defn rational? [x] (integer? x))
 (defn parse-boolean [s]
   (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 

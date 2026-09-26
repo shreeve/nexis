@@ -86,7 +86,24 @@ true.
 - `(long x)` is `x` for an integer and the integer part of a finite
   float, toward zero and a bignum when wide (`(long 1e30)` is
   `1000000000000000019884624838656`); NaN and the infinities raise
-  `:invalid-argument`. `(double x)` is the nearest f64 of any number.
+  `:invalid-argument`. `int`, `short` and `byte` are `long` within
+  the range of Java's `int`, `short`, `byte` (a float outside it, or
+  the integer part outside it, is `:invalid-argument`), except that
+  NaN is 0, as Java's casts make it. `(double x)` is the nearest f64
+  of any number; `(float x)` is the same f64 within Java's `float`
+  range (NaN included), else `:invalid-argument`: there is no
+  single-precision value to round to. `(num x)` is a number or nil
+  itself, else `:kind-mismatch`.
+- `+'`, `-'`, `*'`, `inc'` and `dec'` are `+`, `-`, `*`, `inc` and
+  `dec`: every integer operator already promotes. `unchecked-add`,
+  `unchecked-subtract`, `unchecked-multiply`, `unchecked-inc`,
+  `unchecked-dec` and `unchecked-negate` wrap at 64 bits, two's
+  complement, when every argument is within Java's `long` range
+  (`(unchecked-add 9223372036854775807 1)` is
+  `-9223372036854775808`); with a float or a wider integer they
+  compute as the checked operator does, as Clojure's do.
+- `(ratio? x)` is false and `(rational? x)` is `(integer? x)`: there
+  are no ratios or decimals.
 
 #### 2.3 Characters
 
