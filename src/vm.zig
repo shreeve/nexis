@@ -517,6 +517,9 @@ pub const Var = struct {
     /// Symbol name (the Var's identity). The Namespace that
     /// owns this Var owns the name's backing storage.
     name: []const u8,
+    /// The owning Namespace's name, for printing `#'ns/name`; empty
+    /// for a Var of a bare Namespace.
+    ns: []const u8 = "",
     /// Current root value. Read by `var:load-var` / V-operand
     /// resolve. Written by `var:store-var`.
     root: Value = value_mod.nilValue(),
@@ -660,7 +663,7 @@ pub const Namespace = struct {
         if (self.vars.get(name)) |v| return v;
         const owned_name = try self.var_allocator.dupe(u8, name);
         const new_var = try self.var_allocator.create(Var);
-        new_var.* = .{ .name = owned_name };
+        new_var.* = .{ .name = owned_name, .ns = self.name };
         try self.vars.put(self.map_allocator, owned_name, new_var);
         return new_var;
     }

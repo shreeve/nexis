@@ -234,7 +234,7 @@ their elements in the same mode. Who uses which:
 | record | `#ns.Type{:k v, ...}` (the fields in the record's mode), or `#<record type-id=N>` when the interner has no name for the type; `(reduced x)` is the record `#nexis.core.Reduced{:val x}` |
 | typed vector | `#i64[1 2]`, `#f64[1.5]` |
 | function, native fn | `#<fn>`, `#<native-fn NAME>` (`NAME` is `ns/name` outside `nexis.core`: `#<native-fn nexis.string/join>`) |
-| var | `#'name`, the Var's unqualified name (`#'inc`, `#'join`) |
+| var | `#'ns/name`, as Clojure prints one (`#'nexis.core/inc`, `#'user/x`) |
 | atom, transient | `#<atom>`, `#<transient>` |
 | protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn proto=N method=M>` |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |

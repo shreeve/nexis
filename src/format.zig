@@ -128,7 +128,7 @@ pub fn format(
         .function => try writer.writeAll("#<fn>"),
         .var_ => {
             const var_obj = vm_mod.VM.asVar(v);
-            try writer.print("#'{s}", .{var_obj.name});
+            if (var_obj.ns.len > 0) try writer.print("#'{s}/{s}", .{ var_obj.ns, var_obj.name }) else try writer.print("#'{s}", .{var_obj.name});
         },
         .native_fn => {
             const nf = vm_mod.asNativeFn(v);

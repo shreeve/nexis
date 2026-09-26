@@ -1,16 +1,16 @@
 nexis repl
 Type `:quit` or hit Ctrl-D to exit.
 
-user=> #'x
+user=> #'user/x
 user=> 42
 user=> user=> :divide-by-zero
-user=> #'a
-#'b
+user=> #'user/a
+#'user/b
 3
 user=> 30
-user=> #'twice
+user=> #'user/twice
 user=> 42
-user=> #'s
+user=> #'user/s
 user=> 23
 user=> ["a" \b "c d"]
 user=> 8891

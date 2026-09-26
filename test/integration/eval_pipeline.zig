@@ -228,7 +228,8 @@ test "integration: recur into a variadic fn passes the rest param one seq" {
 // =============================================================================
 
 test "integration: def returns the Var" {
-    try expectOutput("(def x 5)", "#'x");
+    try expectOutput("(def x 5)", "#'user/x");
+    try expectOutputProgram("(ns my.app) (def y 1) [(var inc) (var y)]", "[#'nexis.core/inc #'my.app/y]");
 }
 
 test "integration: def + Var lookup" {
