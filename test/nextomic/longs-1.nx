@@ -58,6 +58,10 @@
 ; Query: constants, inputs, predicates and aggregates across the boundaries.
 (t/check "a bignum constant in a pattern" (= #{[(peek ids)]} (d/q '[:find ?e :where [?e :n/v 9223372036854775807]] db)))
 (println (t/caught (d/q '[:find ?v :where [_ 140737488355328 ?v]] db)))
+(t/check "the tx position holds a transaction entity"
+         (= 12 (count (d/q '[:find ?e :where [?e :n/v _ 70368744177667]] db))))
+(t/check "a tx constant past the id range matches nothing"
+         (empty? (d/q '[:find ?e :where [?e :n/v _ 4611756387171565571]] db)))
 (t/check "a bignum input" (= #{[(first ids)]} (d/q '[:find ?e :in $ ?x :where [?e :n/v ?x]] db i64-min)))
 (println (sort (d/q '[:find [?v ...] :where [_ :n/v ?v] [(> ?v 140737488355327)]] db)))
 (println (sort (d/q '[:find [?v ...] :in $ ?lo ?hi :where [_ :n/v ?v] [(<= ?lo ?v ?hi)]] db (- two53) i48-min)))

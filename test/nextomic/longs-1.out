@@ -20,6 +20,8 @@ ok instant order agrees with sort
 :nextomic/value-type
 ok a bignum constant in a pattern
 {:error :nextomic/query-syntax, :message an attribute is a keyword or an id, :clause 0}
+ok the tx position holds a transaction entity
+ok a tx constant past the id range matches nothing
 ok a bignum input
 (140737488355328 9007199254740992 9007199254740993 9223372036854775807)
 (-9007199254740992 -140737488355329 -140737488355328)
