@@ -57,7 +57,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 167/167 steps succeeded; 1296/1296 tests passed
+Build Summary: 167/167 steps succeeded; 1298/1298 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -302,12 +302,10 @@ failing test (AGENTS.md).
    `&env`** (§23 #34, §24 #13).
 2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
    design question, so an amendment comes first.
-3. **Small Clojure differences**: `(long x)` of NaN is
-   `:invalid-argument` (Clojure returns 0, as nexis's `int`, `short`
-   and `byte` do; `test/integration/numbers.zig` pins the rule); a
-   record's name is not a Var, so Clojure's `(instance? P x)` is
-   `(instance? 'user.P x)` here (defining `P` as its type is a
-   `defrecord` change, `docs/PROTOCOLS.md` §4).
+3. **Float `/` by zero is IEEE** (`docs/SEMANTICS.md` §2.2): `(/ 1.0
+   0.0)` is `##Inf` where Clojure raises `ArithmeticException`. A
+   decision for the owner: Clojure's rule is one arm of `numDiv` and
+   the `numbers`/`eval_pipeline` rows that pin IEEE.
 4. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error

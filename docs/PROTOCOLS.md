@@ -23,7 +23,7 @@ natives and `satisfies?`).
 | Form | Meaning |
 |---|---|
 | `(defprotocol IFoo "doc"? (bar [this x]) ...)` | Defines `IFoo` (a protocol) and one Var per method whose root is a protocol fn |
-| `(defrecord Counter [n] IFoo (bar [this x] ...) ...)` | Registers a record type; defines `Counter-type-id`, `->Counter`, `map->Counter`, `Counter?`; installs the inline impls |
+| `(defrecord Counter [n] IFoo (bar [this x] ...) ...)` | Registers a record type; defines `Counter` (its type), `Counter-type-id`, `->Counter`, `map->Counter`, `Counter?`; installs the inline impls; returns the type |
 | `(extend-type :map IFoo (bar [m x] ...) ...)` | Installs impls for one type across protocols |
 | `(extend-protocol IFoo :map (bar [m x] ...) Counter (bar ...) ...)` | Installs impls for one protocol across types |
 | `(satisfies? IFoo x)` | Whether `IFoo` has an impl for `x`'s dispatch key, or a default |
@@ -34,10 +34,12 @@ Records are map-like for `get`, `(:k rec)`, `assoc`, `dissoc`,
 `assoc` and `dissoc` return a record of the same type (a `dissoc` of
 a declared field included); `empty` returns `{}`.
 
-`defrecord` does not bind the type name itself: `Counter` is declared
-to the compiler (so a form naming it compiles) but has no root, so
-evaluating it raises an unbound-Var runtime error. The type is reached
-through `Counter-type-id`, which `extend-*` uses.
+`defrecord` binds the type name to the record's type, as Clojure binds
+its class: `Counter` is the symbol `user.Counter` (namespace, `.`,
+name) that `type` and `class` return for an instance, so
+`(instance? Counter x)` reads as in Clojure, and the `defrecord` form's
+value is that type. `extend-*` reaches the type through
+`Counter-type-id`.
 
 Records, protocols and protocol fns are not serializable: the codec
 raises `:unserializable` (`docs/CODEC.md` §3). Their ids are dense

@@ -672,7 +672,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | `DivideByZero` | `:divide-by-zero` | `/` with an integer zero divisor; `quot`, `rem`, `mod` with a zero divisor of either kind |
 | `IndexOutOfBounds` | `:index-out-of-bounds` | `nth` and friends past the end |
 | `DbError`, `DbClosed`, `InvalidDurableRef`, `CodecFailed`, `TxClosed` | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |
-| `NotDerefable` | `:not-derefable` | `deref` of a value that is not a durable ref, Var or atom |
+| `NotDerefable` | `:not-derefable` | `deref` of a value that is not a durable ref, Var, atom, delay or `reduced` |
 | `AtomReEntry` | `:atom-re-entry` | A mutating atom op re-entered on the atom it is mutating (`docs/ATOM.md`) |
 | `TransientUsedAfterPersistent` | `:transient-used-after-persistent` | A transient called or looked up after `persistent!` froze it (`docs/TRANSIENT.md` §6) |
 | `Utf8Error`, `InvalidArgument`, `IoError`, `FileNotFound`, `InvalidPath` | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String, math and I/O natives |

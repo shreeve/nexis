@@ -225,9 +225,9 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
-| `(print ##Inf)`, `(println [##NaN])` | `##Inf`, `[##NaN]` | `Infinity`, `[NaN]`: display mode writes Java's spelling; `pr`, `pr-str` and `str` of a collection write `##Inf` | `docs/STDLIB.md` §5 |
+| `(/ 1.0 0.0)`, `(/ 0.0 0.0)` | `ArithmeticException` (Divide by zero) | IEEE: `##Inf`, `##-Inf`, `##NaN`; integer `/` by zero raises `:divide-by-zero` | `docs/SEMANTICS.md` §2.2 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
-| `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; a record's name is not a Var, so write `(instance? 'user.P x)` or `(P? x)` | `docs/STDLIB.md` §8 |
+| `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; `defrecord` binds `P` to that symbol, so `(instance? P x)` reads as in Clojure | `docs/STDLIB.md` §8 |
 | namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` is `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil | `docs/STDLIB.md` §8 |
 | `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |

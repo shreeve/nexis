@@ -902,9 +902,11 @@ fn fnDec(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(long x)`: a number as an integer of any size, a float by its
-/// integer part, a char as its code point (SEMANTICS.md §2.2).
+/// integer part (NaN is 0, as Java's cast makes it), a char as its
+/// code point (SEMANTICS.md §2.2).
 fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .char) return value_mod.fromFixnum(args[0].asChar()).?;
+    if (args[0].isFloat() and std.math.isNan(args[0].asFloat())) return value_mod.fromFixnum(0).?;
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
 }
 
@@ -3998,8 +4000,9 @@ fn appendStrValue(
     if (v.kind() == .nil) return;
     // A float by itself is Java's `toString` (`Infinity`), as Clojure's
     // `str` makes it; inside a collection it prints readable (`##Inf`).
+    if (v.isFloat()) return format_mod.formatFloatJava(v.asFloat(), &w.writer) catch return VmError.OutOfMemory;
     const mode: format_mod.FormatMode = switch (v.kind()) {
-        .string, .char, .float => .display,
+        .string, .char => .display,
         else => .readable,
     };
     // The writer is an Allocating buffer: a failed write is an

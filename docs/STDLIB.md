@@ -210,7 +210,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | `print`, `println`, `print-str`, `println-str` | display |
 | `pr`, `prn`, `pr-str`, `prn-str`; the REPL and `nexis -e` results; error-report payloads | readable |
-| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string, char or float display (`(str ##Inf)` is `"Infinity"`); any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
+| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display, a float in Java's spelling (`(str ##Inf)` is `"Infinity"`); any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
 
 **By kind** (both modes unless the row says otherwise):
 
@@ -218,7 +218,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
-| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; display: `NaN`, `Infinity`, `-Infinity`; readable: `##NaN`, `##Inf`, `##-Inf` |
+| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; `##NaN`, `##Inf`, `##-Inf` in both modes (`str` and `%s` of a bare float write Java's `NaN`, `Infinity`, `-Infinity`) |
 | char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, printable ASCII as `\x`, anything else `\u{HEX}` (`\u{E9}`) |
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |

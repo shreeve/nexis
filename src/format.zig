@@ -166,11 +166,11 @@ pub fn format(
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),
         .db_read_txn => try writer.writeAll("#<db-read-txn>"),
         .transient => try writer.writeAll("#<transient>"),
-        .float => if (mode == .readable) try formatFloatReadable(v.asFloat(), writer) else try formatFloat(v.asFloat(), writer),
+        .float => try formatFloat(v.asFloat(), writer),
         .bignum => try bignum_mod.formatDecimal(v, writer),
         // `#i64[1 2 3]` / `#f64[1.0 2.0]` in both modes; the reader
         // has no such dispatch, so the text does not read back.
-        .typed_vector => if (mode == .readable) try typed_vector_mod.format(v, writer, formatFloatReadable) else try typed_vector_mod.format(v, writer, formatFloat),
+        .typed_vector => try typed_vector_mod.format(v, writer, formatFloat),
         else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
     }
 }
@@ -179,19 +179,21 @@ pub fn format(
 // Per-kind helpers
 // =============================================================================
 
-/// Floats print the way Clojure prints doubles (SEMANTICS §6.3):
-/// the shortest round-trip decimal with a mandatory fraction
-/// (`1.0`, `2.5`, `-0.0`), switching to `1.0E10` / `1.5E-7`
-/// exponent form at or above 1e7 and below 1e-3, plus the
-/// Java spellings `NaN`, `Infinity` and `-Infinity` in display mode;
-/// readable mode writes the reader's `##NaN`, `##Inf` and `##-Inf`.
-fn formatFloatReadable(f: f64, writer: *std.Io.Writer) Error!void {
+/// Floats print the way Clojure prints doubles in either mode
+/// (SEMANTICS §6.3): the shortest round-trip decimal with a
+/// mandatory fraction (`1.0`, `2.5`, `-0.0`), switching to
+/// `1.0E10` / `1.5E-7` exponent form at or above 1e7 and below
+/// 1e-3, and the reader's `##NaN`, `##Inf` and `##-Inf`.
+fn formatFloat(f: f64, writer: *std.Io.Writer) Error!void {
     if (std.math.isNan(f)) return writer.writeAll("##NaN");
     if (std.math.isInf(f)) return writer.writeAll(if (f > 0) "##Inf" else "##-Inf");
-    return formatFloat(f, writer);
+    return formatFloatJava(f, writer);
 }
 
-fn formatFloat(f: f64, writer: *std.Io.Writer) Error!void {
+/// A float as Java's `Double.toString` writes it, the spelling
+/// `str` and `%s` give a bare float: `NaN`, `Infinity` and
+/// `-Infinity` for the special values.
+pub fn formatFloatJava(f: f64, writer: *std.Io.Writer) Error!void {
     if (std.math.isNan(f)) return writer.writeAll("NaN");
     if (std.math.isInf(f)) return writer.writeAll(if (f > 0) "Infinity" else "-Infinity");
     // Both spellings of a finite f64 fit comfortably: the
@@ -445,20 +447,23 @@ test "display and readable: a bignum prints its decimal value with no suffix" {
     }
 }
 
-test "floats: NaN and the infinities print as Java spells them, or as the reader reads them" {
-    const cases = [_]struct { f: f64, display: []const u8, readable: []const u8 }{
-        .{ .f = std.math.inf(f64), .display = "Infinity", .readable = "##Inf" },
-        .{ .f = -std.math.inf(f64), .display = "-Infinity", .readable = "##-Inf" },
-        .{ .f = std.math.nan(f64), .display = "NaN", .readable = "##NaN" },
-        .{ .f = 2.5, .display = "2.5", .readable = "2.5" },
+test "floats: NaN and the infinities print as the reader reads them in either mode; formatFloatJava is Java's spelling" {
+    const cases = [_]struct { f: f64, printed: []const u8, java: []const u8 }{
+        .{ .f = std.math.inf(f64), .printed = "##Inf", .java = "Infinity" },
+        .{ .f = -std.math.inf(f64), .printed = "##-Inf", .java = "-Infinity" },
+        .{ .f = std.math.nan(f64), .printed = "##NaN", .java = "NaN" },
+        .{ .f = 2.5, .printed = "2.5", .java = "2.5" },
     };
     for (cases) |c| {
-        const d = try formatForTest(value_mod.fromFloat(c.f), .display, null);
-        defer testing.allocator.free(d);
-        try testing.expectEqualStrings(c.display, d);
-        const r = try formatForTest(value_mod.fromFloat(c.f), .readable, null);
-        defer testing.allocator.free(r);
-        try testing.expectEqualStrings(c.readable, r);
+        for ([_]FormatMode{ .display, .readable }) |mode| {
+            const got = try formatForTest(value_mod.fromFloat(c.f), mode, null);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(c.printed, got);
+        }
+        var buf: [32]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try formatFloatJava(c.f, &w);
+        try testing.expectEqualStrings(c.java, w.buffered());
     }
 }
 

@@ -82,7 +82,7 @@ test "contagion: a float operand makes a bignum operation a float" {
     try expectOutput("(quot (* 2 " ++ fm ++ ") 2.0)", "1.40737488355327E14");
     try expectOutput("(mod (* 2 " ++ fm ++ ") 3.0)", "2.0");
     try expectOutput("(mod (- (* 2 " ++ fm ++ ")) 3.0)", "1.0");
-    try expectOutput("(/ (+ " ++ fm ++ " 1) 0.0)", "Infinity");
+    try expectOutput("(/ (+ " ++ fm ++ " 1) 0.0)", "##Inf");
     try expectOutput("(float? (* (* " ++ fm ++ " " ++ fm ++ ") 1e300))", "true");
 }
 
@@ -109,7 +109,7 @@ test "conversions: long truncates a float toward zero at any size, double widens
     try expectOutput("[(long 140737488355328.0) (integer? (long 140737488355328.0)) (= (long 140737488355327.0) 140737488355327)]", "[140737488355328 true true]");
     try expectOutput("[(double 3) (double 1.5) (double 18446744073709551616) (double -140737488355328)]", "[3.0 1.5 1.8446744073709552E19 -1.40737488355328E14]");
     try expectOutput("(float? (double 18446744073709551616))", "true");
-    try expectOutput("(try (long (/ 0.0 0.0)) (catch any e e))", ":invalid-argument");
+    try expectOutput("(long (/ 0.0 0.0))", "0");
     try expectOutput("(try (long (/ 1.0 0.0)) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (long \"7\") (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (double nil) (catch any e e))", ":kind-mismatch");
