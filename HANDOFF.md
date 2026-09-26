@@ -300,23 +300,16 @@ failing test (AGENTS.md).
    `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
    is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-2. **Library absences**: `sorted-map`, `sorted-set`, regex (§24 #9),
-   `instance?`/`type`/`class`, and the reader forms `\uXXXX` and
-   `##Inf` (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
+2. **Library absences**: `sorted-map`, `sorted-set` and regex
+   (§24 #9) (`CLOJURE-REVIEW.md` §4.4). Each is a native or a reader
    rule plus an `eval_pipeline` case.
-3. **`require` has no prefix lists**: `(:require [app [c :as cc]])`
-   is `MalformedMacroCall` ("options come in pairs"). Next: in
-   `expand.zig`'s require walk, expand a spec whose second element is
-   a symbol or vector into one spec per suffix, and add the row to
-   `docs/MACROEXPAND.md` §2b; an `eval_pipeline` case loads two
-   namespaces through one prefix.
-4. **Small Clojure differences**: `(int x)` of NaN is
-   `:invalid-argument` (Clojure returns 0); `counted?` is false for a
-   transient (Clojure's transient collections are counted);
-   `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
-   `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
-   `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
-5. **A routine holds at most 4096 live locals and 4096 captured
+3. **Small Clojure differences**: `(long x)` of NaN is
+   `:invalid-argument` (Clojure returns 0, as nexis's `int`, `short`
+   and `byte` do; `test/integration/numbers.zig` pins the rule); a
+   record's name is not a Var, so Clojure's `(instance? P x)` is
+   `(instance? 'user.P x)` here (defining `P` as its type is a
+   `defrecord` change, `docs/PROTOCOLS.md` §4).
+4. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
