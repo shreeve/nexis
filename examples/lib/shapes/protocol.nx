@@ -4,7 +4,7 @@
 ; consumed by `lib.shapes.records`, `lib.shapes.builtins`, and the
 ; top-level driver `examples/shapes-app.nx` via `require`.
 ;
-; Phase 5 EXIT demo: §1 of 4 — defprotocol in its own module.
+; Part 1 of 4 of the shapes-app demo: defprotocol in its own module.
 
 (ns lib.shapes.protocol)
 

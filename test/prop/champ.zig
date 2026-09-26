@@ -1,12 +1,9 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
-//! heap kind (CHAMP). Ships alongside commit 1; commit 2 extends this
-//! file with parallel set properties (S1–S9) when `persistent_set`
-//! lands.
+//! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets.
 //!
-//! Primary purpose: retire the associative equality category's hidden
-//! fault line — until these properties pass, the `(= a b) ⇒ hash(a) =
-//! hash(b)` invariant is hypothetical for the entire associative
-//! category. M6 is the retirement receipt parallel to
+//! Primary purpose: pin the map and set invariant
+//! `(= a b) ⇒ hash(a) = hash(b)` across both subkinds. M6 is the
+//! map property parallel to
 //! `test/prop/vector.zig` V3 (sequential category) and V9 (cross-kind
 //! at structural boundaries).
 //!
@@ -15,17 +12,22 @@
 //!       (k, v) looks up to exactly `v`; absent keys return `.absent`.
 //!   M2. `mapAssoc` + `mapDissoc` random sequences preserve the entry
 //!       multiset (minus dissoc'd keys).
+//!   M2b. At 2000 and 30000 keys, assoc and dissoc keep the canonical
+//!       trie layout (`champ.canonicalTrie`), and equal maps built in
+//!       different orders iterate in the same order.
 //!   M3. `mapAssoc` replace-value: associng `(k, v1)` then `(k, v2)`
 //!       yields `mapGet(m, k) == .present = v2` with unchanged count.
 //!   M4. `assoc` same-value short-circuit returns the same map pointer.
 //!   M5. Equality laws over random maps: reflexive, symmetric,
 //!       transitive (pairwise).
-//!   M6. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
-//!       `.associative` category): 500 random maps built via two
-//!       different paths — one that stays array-map, one that
-//!       promote-then-dissocs — hash and equal identically.
+//!   M6. **Cross-subkind hash equivalence** for maps: 2000 random
+//!       maps of 1..8 entries
+//!       built two ways — one stays array-map, one promotes to CHAMP
+//!       and dissocs back to the same entries — hash and equal
+//!       identically.
 //!   M7. Cross-category never-equal: a map is never `=` to any non-
-//!       associative Value; `dispatch.hashValue` outputs distinct.
+//!       associative Value (an immediate, a list or vector, a string,
+//!       a set, a record), and the hashes differ.
 //!   M8. Persistent immutability: `mapAssoc(m, k, v)` does not mutate
 //!       `m`; `mapGet(m, k)` still returns the pre-assoc result.
 //!   M9. Keyword-keyed fast-path correctness: maps keyed entirely by
@@ -36,19 +38,20 @@
 //!        + equality all hold.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ = @import("champ");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const champ = nx.champ;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const record = nx.record;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
 
-const prng_seed: u64 = 0x686D_7470_5F70_726F; // "ormp_thmt" LE-ish
+const prng_seed: u64 = 0x686D_7470_5F70_726F; // "hmtp_pro" ASCII
 
 fn randKey(rand: std.Random) Value {
     // Mix of keyword ids (exercises the keyword fast path) and fixnums
@@ -73,7 +76,7 @@ fn randValue(rand: std.Random) Value {
 }
 
 // -----------------------------------------------------------------------------
-// M1. fromEntries + get round-trip
+// M1. mapFromEntries + mapGet round-trip
 // -----------------------------------------------------------------------------
 
 test "M1: mapFromEntries + mapGet round-trip over 200 random maps" {
@@ -167,6 +170,69 @@ test "M2: random assoc/dissoc sequences preserve the entry set" {
                 }
             }
         }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// M2b. Canonical layout through multi-level tries
+// -----------------------------------------------------------------------------
+
+/// The keys `0, 7919, 2·7919, …` as fixnums, `n` of them, shuffled.
+fn spreadKeys(gpa: std.mem.Allocator, r: std.Random, n: usize) ![]Value {
+    const keys = try gpa.alloc(Value, n);
+    for (keys, 0..) |*k, i| k.* = value.fromFixnum(@intCast(i * 7919)).?;
+    r.shuffle(Value, keys);
+    return keys;
+}
+
+/// `a` and `b` yield equal keys in the same order.
+fn expectSameOrder(a: Value, b: Value) !void {
+    var ia = champ.mapIter(a);
+    var ib = champ.mapIter(b);
+    while (ia.next()) |ea| try std.testing.expect(dispatch.equal(ea.key, ib.next().?.key));
+    try std.testing.expect(ib.next() == null);
+}
+
+test "M2b: assoc/dissoc through multi-level tries keep the canonical layout" {
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x2b);
+    const r = prng.random();
+
+    // Build n keys in random order, dissoc three quarters of them in
+    // another random order, then rebuild the survivors from empty in a
+    // third order. Equal maps have one canonical trie (CHAMP.md §2.2),
+    // so the two iterate in the same order.
+    for ([_]usize{ 2000, 30000 }) |n| {
+        const keys = try spreadKeys(gpa, r, n);
+        defer gpa.free(keys);
+        var m = try champ.mapEmpty(&heap);
+        for (keys) |k| m = try champ.mapAssoc(&heap, m, k, k, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(n, champ.mapCount(m));
+        try std.testing.expect(champ.canonicalTrie(m, &dispatch.hashValue));
+
+        r.shuffle(Value, keys);
+        const drop = n * 3 / 4;
+        for (keys[0..drop], 0..) |k, i| {
+            m = try champ.mapDissoc(&heap, m, k, &dispatch.hashValue, &dispatch.equal);
+            if (n <= 2000 or i % 1000 == 0) try std.testing.expect(champ.canonicalTrie(m, &dispatch.hashValue));
+        }
+        try std.testing.expectEqual(n - drop, champ.mapCount(m));
+        try std.testing.expect(champ.canonicalTrie(m, &dispatch.hashValue));
+        for (keys[0..drop]) |k| try std.testing.expect(champ.mapGet(m, k, &dispatch.hashValue, &dispatch.equal) == .absent);
+        for (keys[drop..]) |k| try std.testing.expect(champ.mapGet(m, k, &dispatch.hashValue, &dispatch.equal) == .present);
+
+        r.shuffle(Value, keys[drop..]);
+        var fresh = try champ.mapEmpty(&heap);
+        for (keys[drop..]) |k| fresh = try champ.mapAssoc(&heap, fresh, k, k, &dispatch.hashValue, &dispatch.equal);
+        try expectSameOrder(fresh, m);
+
+        // And down to empty.
+        for (keys[drop..]) |k| m = try champ.mapDissoc(&heap, m, k, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expectEqual(@as(usize, 0), champ.mapCount(m));
     }
 }
 
@@ -287,17 +353,16 @@ test "M5: equality laws (reflexive, symmetric, pairwise transitive)" {
 }
 
 // -----------------------------------------------------------------------------
-// M6. Cross-subkind hash equivalence — THE RETIREMENT RECEIPT
+// M6. Cross-subkind hash equivalence
 // -----------------------------------------------------------------------------
 
 test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 trials)" {
-    // Parallel to test/prop/vector.zig V3 for the associative category.
+    // Parallel to test/prop/vector.zig V3, for maps.
     // For each of 2000 random ≤8-entry key-value sets we build two
     // maps: `am` that stays as array-map, `ch` that grows to 9 entries
     // and dissocs one back out (forcing CHAMP subkind). Both must be
     // `dispatch.equal` and produce identical `dispatch.hashValue`
-    // outputs, proving the associative-category architecture holds
-    // across subkinds (the associative analogue of vector V3).
+    // outputs across subkinds (the map analogue of vector V3).
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -325,17 +390,20 @@ test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 t
         }
         try std.testing.expect(am.subkind() == 0);
 
-        // Path B: grow to n+1 then dissoc the extra key → CHAMP.
+        // Path B: grow past the array-map limit to 9 keys, which
+        // promotes to CHAMP, then dissoc the extra keys: the same
+        // entries in the other subkind.
         var ch = am;
-        const extra_key = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try champ.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
-        if (n >= 8) {
-            try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| {
+            const extra_key = value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?;
+            ch = try champ.mapAssoc(&heap, ch, extra_key, value.fromFixnum(99).?, &dispatch.hashValue, &dispatch.equal);
         }
-        ch = try champ.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
-
-        // Equality and hash must agree regardless of whether ch is
-        // actually CHAMP (it is, when n == 8) or stayed array-map.
+        try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| {
+            const extra_key = value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?;
+            ch = try champ.mapDissoc(&heap, ch, extra_key, &dispatch.hashValue, &dispatch.equal);
+        }
+        try std.testing.expect(ch.subkind() == 1);
         try std.testing.expect(dispatch.equal(am, ch));
         try std.testing.expect(dispatch.equal(ch, am));
         try std.testing.expectEqual(dispatch.hashValue(am), dispatch.hashValue(ch));
@@ -368,15 +436,22 @@ test "M7: map never equal to non-associative Values" {
         value.fromChar('a').?,
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
+        try string_mod.fromBytes(&heap, ""),
+        try string_mod.fromBytes(&heap, "a"),
+        try champ.setEmpty(&heap),
+        // A record is never its field map (SEMANTICS §2.6).
+        try record.make(&heap, 1, m),
     };
+    // Empty-map vs all of the above: never equal, and the hashes
+    // land in different domains.
+    const em = try champ.mapEmpty(&heap);
     for (non_assoc) |other| {
         try std.testing.expect(!dispatch.equal(m, other));
         try std.testing.expect(!dispatch.equal(other, m));
-    }
-    // Empty-map vs all of the above: never equal.
-    const em = try champ.mapEmpty(&heap);
-    for (non_assoc) |other| {
+        try std.testing.expect(dispatch.hashValue(m) != dispatch.hashValue(other));
         try std.testing.expect(!dispatch.equal(em, other));
+        try std.testing.expect(!dispatch.equal(other, em));
+        try std.testing.expect(dispatch.hashValue(em) != dispatch.hashValue(other));
     }
 }
 
@@ -544,7 +619,7 @@ test "M10: collision node stress — ≥5 distinct keys sharing an indexing hash
     for (remaining) |r| {
         m = try champ.mapDissoc(&heap, m, try collidingKey(&heap, r), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(champ.mapIsEmpty(m));
+    try std.testing.expectEqual(@as(usize, 0), champ.mapCount(m));
 }
 
 // -----------------------------------------------------------------------------
@@ -588,17 +663,18 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
 }
 
 // =============================================================================
-// Persistent set property tests (commit 2)
+// Persistent set property tests
 //
 // Properties (CHAMP.md §12.2 / §12.4 parallel):
 //   S1. setFromElements + setContains round-trip; absent returns false.
 //   S2. Random conj/disj sequences preserve the element set (model
 //       vs. implementation).
+//   S2b. The set side of M2b over 20000 string elements.
 //   S3. setConj of existing element returns the same pointer.
 //   S4. Equality laws over random sets (reflexive / symmetric /
 //       pairwise transitive).
-//   S5. **Cross-subkind hash equivalence** (RETIREMENT RECEIPT for
-//       `.set` equality category): 500 random sets built via two
+//   S5. **Cross-subkind hash equivalence** for sets: 2000 random
+//       sets built via two
 //       different paths — pure array-set vs. promote-then-disj — hash
 //       and equal identically. Parallel to M6.
 //   S6. Cross-category never-equal: a set is never `=` to any non-set
@@ -678,6 +754,48 @@ test "S2: random conj/disj sequences preserve the element set" {
     }
 }
 
+test "S2b: conj/disj through multi-level tries keep the canonical layout" {
+    // The set side of M2b, keyed by heap strings so every indexing
+    // hash goes through `dispatch.hashValue`.
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+    var heap = Heap.init(gpa);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x52b);
+    const r = prng.random();
+
+    const n: usize = 20000;
+    const elems = try gpa.alloc(Value, n);
+    defer gpa.free(elems);
+    for (elems, 0..) |*e, i| {
+        var buf: [24]u8 = undefined;
+        e.* = try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "elem-{d}", .{i}) catch unreachable);
+    }
+    r.shuffle(Value, elems);
+    var s = try champ.setEmpty(&heap);
+    for (elems) |e| s = try champ.setConj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+    try std.testing.expect(champ.canonicalTrie(s, &dispatch.hashValue));
+
+    r.shuffle(Value, elems);
+    const drop = n * 3 / 4;
+    for (elems[0..drop], 0..) |e, i| {
+        s = try champ.setDisj(&heap, s, e, &dispatch.hashValue, &dispatch.equal);
+        if (i % 500 == 0) try std.testing.expect(champ.canonicalTrie(s, &dispatch.hashValue));
+    }
+    try std.testing.expectEqual(n - drop, champ.setCount(s));
+    try std.testing.expect(champ.canonicalTrie(s, &dispatch.hashValue));
+    for (elems[drop..]) |e| try std.testing.expect(champ.setContains(s, e, &dispatch.hashValue, &dispatch.equal));
+
+    r.shuffle(Value, elems[drop..]);
+    var fresh = try champ.setEmpty(&heap);
+    for (elems[drop..]) |e| fresh = try champ.setConj(&heap, fresh, e, &dispatch.hashValue, &dispatch.equal);
+    var it_a = champ.setIter(fresh);
+    var it_b = champ.setIter(s);
+    while (it_a.next()) |x| try std.testing.expect(dispatch.equal(x, it_b.next().?));
+    try std.testing.expect(it_b.next() == null);
+}
+
 test "S3: setConj of existing element returns same pointer" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
@@ -755,16 +873,53 @@ test "S5: cross-subkind (array-set vs CHAMP) equal + hash-equal (2000 trials)" {
         var as = try champ.setEmpty(&heap);
         for (elems) |e| as = try champ.setConj(&heap, as, e, &dispatch.hashValue, &dispatch.equal);
         try std.testing.expect(as.subkind() == 0);
-        // Path B: grow to n+1 then disj the extra → CHAMP.
+        // Path B: grow past the array-set limit to 9 elements, which
+        // promotes to CHAMP, then disj the extras.
         var ch = as;
-        const extra = value.fromFixnum(@intCast(1_000_000 + trial)).?;
-        ch = try champ.setConj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
-        if (n >= 8) try std.testing.expect(ch.subkind() == 1);
-        ch = try champ.setDisj(&heap, ch, extra, &dispatch.hashValue, &dispatch.equal);
+        for (n..9) |extra| ch = try champ.setConj(&heap, ch, value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(ch.subkind() == 1);
+        for (n..9) |extra| ch = try champ.setDisj(&heap, ch, value.fromFixnum(@intCast(1_000_000 + trial * 16 + extra)).?, &dispatch.hashValue, &dispatch.equal);
+        try std.testing.expect(ch.subkind() == 1);
         try std.testing.expect(dispatch.equal(as, ch));
         try std.testing.expect(dispatch.equal(ch, as));
         try std.testing.expectEqual(dispatch.hashValue(as), dispatch.hashValue(ch));
     }
+}
+
+test "S5b: a set of sets is equal and hash-equal in either insertion order" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const H = struct {
+        fn set(h: *Heap, elems: []const Value) !Value {
+            var s = try champ.setEmpty(h);
+            for (elems) |e| s = try champ.setConj(h, s, e, &dispatch.hashValue, &dispatch.equal);
+            return s;
+        }
+    };
+    const fx = struct {
+        fn f(n: i64) Value {
+            return value.fromFixnum(n).?;
+        }
+    }.f;
+    // #{#{1 2} #{3 4}}, inner and outer sets built in both orders, and
+    // a map keyed by one (the codec's C1 covers a set inside a map).
+    const a12 = try H.set(&heap, &.{ fx(1), fx(2) });
+    const b12 = try H.set(&heap, &.{ fx(2), fx(1) });
+    const a34 = try H.set(&heap, &.{ fx(3), fx(4) });
+    const b34 = try H.set(&heap, &.{ fx(4), fx(3) });
+    const outer_a = try H.set(&heap, &.{ a12, a34 });
+    const outer_b = try H.set(&heap, &.{ b34, b12 });
+    try std.testing.expect(dispatch.equal(outer_a, outer_b));
+    try std.testing.expect(dispatch.equal(outer_b, outer_a));
+    try std.testing.expectEqual(dispatch.hashValue(outer_a), dispatch.hashValue(outer_b));
+    try std.testing.expect(champ.setContains(outer_a, b12, &dispatch.hashValue, &dispatch.equal));
+    // One element apart: #{#{1 2} #{3 5}} is a different set.
+    const other = try H.set(&heap, &.{ a12, try H.set(&heap, &.{ fx(3), fx(5) }) });
+    try std.testing.expect(!dispatch.equal(outer_a, other));
+    const m_a = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), outer_a, fx(1), &dispatch.hashValue, &dispatch.equal);
+    const m_b = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), outer_b, fx(1), &dispatch.hashValue, &dispatch.equal);
+    try std.testing.expect(dispatch.equal(m_a, m_b));
+    try std.testing.expectEqual(dispatch.hashValue(m_a), dispatch.hashValue(m_b));
 }
 
 test "S6: set never equal to non-set Values" {
@@ -786,14 +941,18 @@ test "S6: set never equal to non-set Values" {
         try list_mod.empty(&heap),
         try vector_mod.empty(&heap),
         try champ.mapEmpty(&heap),
+        try string_mod.fromBytes(&heap, ""),
+        try string_mod.fromBytes(&heap, "a"),
+        try record.make(&heap, 1, try champ.mapEmpty(&heap)),
     };
+    const es = try champ.setEmpty(&heap);
     for (non_set) |other| {
         try std.testing.expect(!dispatch.equal(s, other));
         try std.testing.expect(!dispatch.equal(other, s));
-    }
-    const es = try champ.setEmpty(&heap);
-    for (non_set) |other| {
+        try std.testing.expect(dispatch.hashValue(s) != dispatch.hashValue(other));
         try std.testing.expect(!dispatch.equal(es, other));
+        try std.testing.expect(!dispatch.equal(other, es));
+        try std.testing.expect(dispatch.hashValue(es) != dispatch.hashValue(other));
     }
 }
 
@@ -882,5 +1041,5 @@ test "S9: collision-node stress for set (≥5 elements sharing indexing hash)" {
     for (remaining) |x| {
         s = try champ.setDisj(&heap, s, try collidingKey(&heap, x), &collidingHash, &dispatch.equal);
     }
-    try std.testing.expect(champ.setIsEmpty(s));
+    try std.testing.expectEqual(@as(usize, 0), champ.setCount(s));
 }

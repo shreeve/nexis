@@ -1,0 +1,6 @@
+42
+:dz
+7
+:cleanup
+[:outer :x]
+[missing 3]

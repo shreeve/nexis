@@ -30,8 +30,8 @@
 //!   - Everything a plan allocates lives in the query arena.
 
 const std = @import("std");
-const value = @import("value");
-const intern_mod = @import("intern");
+const value = @import("../../value.zig");
+const intern_mod = @import("../../intern.zig");
 const key = @import("../key.zig");
 const datom_mod = @import("../datom.zig");
 const schema_mod = @import("../schema.zig");
@@ -39,9 +39,11 @@ const db_mod = @import("../db.zig");
 const store_mod = @import("../store.zig");
 const marshal = @import("../marshal.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 const ir = @import("ir.zig");
 const rules_mod = @import("rules.zig");
 const parse_mod = @import("parse.zig");
+const exec_mod = @import("exec.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -65,7 +67,7 @@ pub const Error = error{
 
 /// Everything planning can fail with: the planner's own errors and
 /// the store's, through the attribute and constant lookups.
-pub const Failure = Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
+pub const Failure = Error || stack.Error || marshal.Error || db_mod.ErrorsOf(marshal.cellOf) || db_mod.ErrorsOf(Interner.internSymbol) || db_mod.ErrorsOf(store_mod.Store.treeEntries);
 
 // =============================================================================
 // Steps
@@ -127,6 +129,16 @@ pub const Scan = struct {
     }
 };
 
+/// A data pattern over a collection source: its tuples filtered and
+/// joined by position, with no index and no resolution (constants are
+/// compared as written).
+pub const Match = struct {
+    src: ir.Src,
+    slots: [5]Slot,
+    fresh: []const Var,
+    rows: []const []const Cell,
+};
+
 pub const Pred = struct {
     call: ir.Call,
 };
@@ -166,6 +178,7 @@ pub const SourceSlot = struct {
 
 pub const Step = union(enum) {
     scan: Scan,
+    match: Match,
     pred: Pred,
     bind: Bind,
     not: Not,
@@ -196,9 +209,10 @@ pub const Plan = struct {
 };
 
 /// One data source at plan time: its `Read` and what has been
-/// resolved against it.
+/// resolved against it, or the tuples of a collection.
 pub const DbSource = struct {
-    read: *Read,
+    read: ?*Read,
+    coll: ?[]const []const Cell = null,
     /// Attributes resolved so far, by VM keyword id.
     attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// Entries of the AEVT tree this view reads, once asked.
@@ -210,8 +224,11 @@ pub const DbSource = struct {
 /// every sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
-    /// The selected source's `Read`; `select` switches it.
+    /// The selected source's `Read`; `select` switches it. Undefined
+    /// while a collection is selected (`coll`).
     read: *Read,
+    /// The selected source's tuples when it is a collection.
+    coll: ?[]const []const Cell = null,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
@@ -236,26 +253,45 @@ pub const Ctx = struct {
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
 
-    /// `reads` has one `Read` per query source, `$` first.
-    pub fn init(arena: Allocator, reads: []const *Read, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
-        std.debug.assert(reads.len == query.sources.len);
+    /// `sources` has one entry per query source, `$` first.
+    pub fn init(arena: Allocator, sources: []const exec_mod.Source, interner: *Interner, query: *const Ir, rules: *const RuleSet, diag: *Diag) !Ctx {
+        std.debug.assert(sources.len == query.sources.len);
         var vars: std.ArrayList(ir.VarInfo) = .empty;
         try vars.appendSlice(arena, query.vars);
-        const dbs = try arena.alloc(DbSource, reads.len);
-        for (reads, dbs) |r, *d| d.* = .{ .read = r };
-        return .{ .arena = arena, .read = reads[0], .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        const dbs = try arena.alloc(DbSource, sources.len);
+        for (sources, dbs) |src, *d| d.* = switch (src) {
+            .db => |r| .{ .read = r },
+            .coll => |rows| .{ .read = null, .coll = rows },
+        };
+        var ctx: Ctx = .{ .arena = arena, .read = undefined, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        if (dbs.len > 0) ctx.enter(0);
+        return ctx;
     }
 
-    /// Make `src` (null: `$`) the source the resolvers read.
-    pub fn select(self: *Ctx, src: ?ir.Src) void {
+    /// Make `src` (null: `$`) the source the resolvers read; a query
+    /// whose `:in` names no source has none to read.
+    pub fn select(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
+        if (self.dbs.len == 0) return self.syntax("this clause reads a data source, and :in names none");
         const next = src orelse 0;
         if (next == self.selected) return;
         self.dbs[self.selected].attr_cache = self.attr_cache;
         self.dbs[self.selected].aevt_entries = self.aevt_entries;
+        self.enter(next);
+    }
+
+    fn enter(self: *Ctx, next: ir.Src) void {
         self.selected = next;
-        self.read = self.dbs[next].read;
+        self.read = self.dbs[next].read orelse undefined;
+        self.coll = self.dbs[next].coll;
         self.attr_cache = self.dbs[next].attr_cache;
         self.aevt_entries = self.dbs[next].aevt_entries;
+    }
+
+    /// `select` for a clause that reads a db value: `missing?`,
+    /// `get-else`, `get-some`, `fulltext`.
+    pub fn selectDb(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
+        try self.select(src);
+        if (self.coll != null) return self.syntax("this clause reads a db value, and its source is a collection");
     }
 
     /// `QuerySyntax` with its reason and the top-level clause it was
@@ -326,19 +362,12 @@ pub const Ctx = struct {
 /// Plan `query` for `read`. The returned plan starts from the relation
 /// over the `:in` variables.
 pub fn plan(ctx: *Ctx, query: *const Ir) Failure!*Plan {
-    var bound: std.ArrayList(Var) = .empty;
-    for (query.in) |b| switch (b) {
-        .scalar, .collection => |v| try ir.addVar(ctx.arena, &bound, v),
-        .tuple, .relation => |ts| for (ts) |t| {
-            if (t) |v| try ir.addVar(ctx.arena, &bound, v);
-        },
-        .src, .rules => {},
-    };
-    return planSub(ctx, query.where, bound.items, 1);
+    return planSub(ctx, query.where, query.in_vars, 1);
 }
 
 /// Plan `clauses` starting from a relation over `input`.
 pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: u64) Failure!*Plan {
+    try stack.check();
     ctx.depth += 1;
     defer ctx.depth -= 1;
     const out = try ctx.arena.create(Plan);
@@ -383,11 +412,13 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
             const placed = switch (p.clause) {
                 .pred => |call| blk: {
                     if (!callBound(call, bound.items)) break :blk false;
+                    try callSources(ctx, call);
                     try steps.append(ctx.arena, .{ .pred = .{ .call = call } });
                     break :blk true;
                 },
                 .bind => |b| blk: {
                     if (!callBound(b.call, bound.items)) break :blk false;
+                    try callSources(ctx, b.call);
                     const outs = try b.out.vars(ctx.arena);
                     const fresh = try newVars(ctx.arena, outs, bound.items);
                     for (fresh) |v| try bound.append(ctx.arena, v);
@@ -404,7 +435,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                 .@"or" => |o| blk: {
                     const join = try orJoin(ctx, o);
                     if (!allBound(join, bound.items)) break :blk false;
-                    try steps.append(ctx.arena, try planOr(ctx, o.branches, join, bound.items, rows.*));
+                    try steps.append(ctx.arena, try planOr(ctx, o.branches, join, bound.items, rows.*, null));
                     break :blk true;
                 },
                 .rule => |r| blk: {
@@ -444,7 +475,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
                     },
                     else => return err,
                 },
-                .@"or" => |o| try orEstimate(ctx, o, bound.items),
+                .@"or" => |o| if (allBound(o.required, bound.items)) try orEstimate(ctx, o, bound.items) else null,
                 .rule => |r| try rules_mod.callEstimate(ctx, r.name, r.args, bound.items),
                 .source => 0,
                 else => null,
@@ -462,14 +493,23 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *std.ArrayList(Var), s
         if (ctx.depth == 1) ctx.clause_index = (@intFromPtr(p) - @intFromPtr(pending.ptr)) / @sizeOf(Pending);
         switch (p.clause) {
             .pattern => |pat| {
-                const scan = try planScan(ctx, pat, bound.items);
-                for (scan.fresh) |v| try bound.append(ctx.arena, v);
-                rows.* = if (scan.unsatisfiable) 0 else clampRows(std.math.mulWide(u64, rows.*, scan.estimate));
-                try steps.append(ctx.arena, .{ .scan = scan });
+                const step = try planPattern(ctx, pat, bound.items);
+                switch (step) {
+                    .scan => |scan| {
+                        for (scan.fresh) |v| try bound.append(ctx.arena, v);
+                        rows.* = if (scan.unsatisfiable) 0 else clampRows(std.math.mulWide(u64, rows.*, scan.estimate));
+                    },
+                    .match => |m| {
+                        for (m.fresh) |v| try bound.append(ctx.arena, v);
+                        rows.* = clampRows(std.math.mulWide(u64, rows.*, best_cost));
+                    },
+                    else => unreachable,
+                }
+                try steps.append(ctx.arena, step);
             },
             .@"or" => |o| {
                 const join = try orJoin(ctx, o);
-                const step = try planOr(ctx, o.branches, join, bound.items, rows.*);
+                const step = try planOr(ctx, o.branches, join, bound.items, rows.*, null);
                 for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
                 rows.* = clampRows(std.math.mulWide(u64, rows.*, best_cost));
                 try steps.append(ctx.arena, step);
@@ -498,6 +538,15 @@ fn neverBound(ctx: *Ctx, pending: []const Pending, bound: []const Var) error{Que
             .pred => |call| call.args,
             .bind => |b| b.call.args,
             .rule => |r| r.args,
+            .not => |n| {
+                const join = n.join orelse continue;
+                for (join) |v| if (!ir.containsVar(bound, v)) return ctx.syntaxFmt("{s} is never bound; not-join joins on variables the clauses around it bind", .{ctx.varName(v)});
+                continue;
+            },
+            .@"or" => |o| {
+                for (o.required) |v| if (!ir.containsVar(bound, v)) return ctx.syntaxFmt("{s} is never bound; or-join needs its required variables bound before it runs", .{ctx.varName(v)});
+                continue;
+            },
             else => continue,
         };
         const f: ?ir.FnRef = switch (p.clause) {
@@ -526,6 +575,11 @@ fn placeRule(ctx: *Ctx, r: anytype, bound: *std.ArrayList(Var), steps: *std.Arra
 fn planSource(ctx: *Ctx, s: anytype, bound: []const Var) !Step {
     const fresh = try newVars(ctx.arena, s.vars, bound);
     return .{ .source = .{ .slot = ctx.sources.items[s.id], .vars = s.vars, .fresh = fresh } };
+}
+
+/// Every source a call's arguments name exists.
+fn callSources(ctx: *Ctx, call: ir.Call) error{QuerySyntax}!void {
+    for (call.args) |a| if (a == .src) try ctx.selectDb(a.src);
 }
 
 /// A call can run once its function (when a variable) and every
@@ -582,7 +636,7 @@ fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
 
 /// Plan an `or`: every branch starts from the join variables already
 /// bound and must end with every join variable bound.
-pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64) Failure!Step {
+pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: []const Var, rows: u64, rule: ?u32) Failure!Step {
     var bound_join: std.ArrayList(Var) = .empty;
     for (join) |v| {
         if (ir.containsVar(bound, v)) try bound_join.append(ctx.arena, v);
@@ -594,21 +648,24 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
         var ends: std.ArrayList(Var) = .empty;
         try ends.appendSlice(ctx.arena, bound_join.items);
         try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
+        for (join) |v| if (!ir.containsVar(ends.items, v)) {
+            if (rule) |name| return ctx.syntaxFmt("rule {s} body {d} leaves {s} unbound; every body binds every head variable", .{ ctx.interner.symbolName(name), n, ctx.varName(v) });
+            return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
+        };
     }
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
 
 fn orEstimate(ctx: *Ctx, o: anytype, bound: []const Var) Failure!u64 {
     var total: u64 = 0;
-    for (o.branches) |br| total +|= try clausesEstimate(ctx, br, bound);
+    for (o.branches) |br| total +|= (try clausesEstimate(ctx, br, bound)) orelse 1;
     return total;
 }
 
-/// The smallest pattern estimate among `clauses` given `bound`; 1 for a
-/// branch without runnable patterns.
-pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!u64 {
-    var best: u64 = std.math.maxInt(u64);
+/// The smallest pattern estimate among `clauses` given `bound`; null
+/// when none of them is a pattern or `or` that can run.
+pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) Failure!?u64 {
+    var best: ?u64 = null;
     for (clauses) |c| {
         const est: u64 = switch (c) {
             .pattern => |p| patternEstimate(ctx, p, bound) catch |err| switch (err) {
@@ -618,9 +675,9 @@ pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: []const Var) F
             .@"or" => |o| try orEstimate(ctx, o, bound),
             else => continue,
         };
-        best = @min(best, est);
+        best = @min(best orelse est, est);
     }
-    return if (best == std.math.maxInt(u64)) 1 else best;
+    return best;
 }
 
 // =============================================================================
@@ -711,12 +768,36 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !Choice {
 }
 
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: []const Var) !u64 {
-    ctx.select(p.src);
+    try ctx.select(p.src);
+    if (ctx.coll) |rows| return @max(1, rows.len);
     return (try choose(ctx, p, bound)).estimate;
 }
 
+/// The step of a data pattern: a scan of a db source, or a match over
+/// a collection.
+fn planPattern(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Step {
+    try ctx.select(p.src);
+    const rows = ctx.coll orelse return .{ .scan = try planScan(ctx, p, bound) };
+    var fresh: std.ArrayList(Var) = .empty;
+    var slots: [5]Slot = undefined;
+    for (p.terms(), &slots) |t, *slot| slot.* = switch (t) {
+        .blank => .blank,
+        .variable => |v| blk: {
+            if (ir.containsVar(bound, v)) break :blk .{ .bound = v };
+            if (ir.containsVar(fresh.items, v)) break :blk .{ .same = v };
+            try fresh.append(ctx.arena, v);
+            break :blk .{ .fresh = v };
+        },
+        .constant => |c| switch (c) {
+            .cell => |cell| .{ .constant = .{ .cell = cell } },
+            .lookup => return ctx.syntax("a lookup ref needs a db source; this source is a collection"),
+        },
+    };
+    return .{ .match = .{ .src = ctx.selected, .slots = slots, .fresh = try fresh.toOwnedSlice(ctx.arena), .rows = rows } };
+}
+
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: []const Var) Failure!Scan {
-    ctx.select(p.src);
+    try ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
     const hash_choice: ?Choice = choose(ctx, p, &.{}) catch |err| switch (err) {
         error.UnboundPattern => null,
@@ -934,6 +1015,7 @@ fn joinKind(s: *const Scan, rows: u64) []const u8 {
 }
 
 pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), depth: usize) (Failure || std.Io.Writer.Error)!void {
+    try stack.check();
     for (p.steps, 0..) |step, i| {
         var out: std.Io.Writer.Allocating = .init(ctx.arena);
         const w = &out.writer;
@@ -999,6 +1081,17 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
                 try w.writeAll("]");
+                line.join = "hash";
+                line.text = out.written();
+                try lines.append(ctx.arena, line);
+            },
+            .match => |m| {
+                try w.print("match [{s}", .{ctx.interner.symbolName(ctx.source_names[m.src])});
+                for (m.slots) |slot| {
+                    try w.writeByte(' ');
+                    try explainSlot(slot, ctx, w);
+                }
+                try w.print("] tuples={d}", .{m.rows.len});
                 line.join = "hash";
                 line.text = out.written();
                 try lines.append(ctx.arena, line);

@@ -8,29 +8,36 @@
 //!   - The IR is pure syntax (see `ir.zig`); nothing here touches a
 //!     store, so a parsed query is reusable across dbs and bases.
 //!   - Every `find` and `with` variable is bound by `in` or `where`.
-//!   - `in` variables are unique; `$` comes first and every source and
-//!     `%` appear at most once; a `$name` in a clause is declared in
-//!     `in`, and a rule body reads `$` only.
+//!   - `in` variables are unique; `$` is the first source when declared,
+//!     and every source and `%` appear at most once; a `$name` in a
+//!     clause is declared in `in`, and a rule body reads `$` only. `in`
+//!     may declare no source at all: the query then runs over its
+//!     inputs alone.
 //!   - `or` branches bind the same variables; `not` mentions at least
 //!     one variable.
 //!   - A `?variable` in function position is a `FnRef.variable`; it is
 //!     an input of the clause, never something the clause binds.
-//!   - Rules with one name share one arity and one required count.
+//!   - Rules with one name share one arity and one required count, and
+//!     every call to a rule inside a rule body passes that many
+//!     arguments.
 //!
-//! `Cache` memoises parses per query value: by heap identity first
-//! (the query literal's pointer), then by structural hash and
-//! equality. Heap pointers are stable for the process's life because
-//! nothing moves or frees a value while a cache references it; a
-//! collector that frees values must `clear` the cache.
+//! `Cache` memoises parses per query value: by identity first (the
+//! query literal's pointer), then by structural hash and an equality
+//! that tells lists from vectors. It keeps at most `cache_capacity`
+//! parses that no query is running on, and `mark` keeps every query
+//! value it holds reachable, so no address it compares by is reused
+//! while it is there.
 
 const std = @import("std");
-const value = @import("value");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
+const value = @import("../../value.zig");
+const intern_mod = @import("../../intern.zig");
+const string_mod = @import("../../string.zig");
+const list_mod = @import("../../coll/list.zig");
+const vector_mod = @import("../../coll/vector.zig");
+const champ = @import("../../coll/champ.zig");
+const dispatch = @import("../../dispatch.zig");
+const stack = @import("../../stack.zig");
+const gc = @import("../../gc.zig");
 const marshal = @import("../marshal.zig");
 const ir = @import("ir.zig");
 
@@ -43,7 +50,7 @@ const Clause = ir.Clause;
 const Ir = ir.Ir;
 const RuleSet = ir.RuleSet;
 
-pub const Error = error{ QuerySyntax, OutOfMemory };
+pub const Error = error{ QuerySyntax, OutOfMemory, StackOverflow };
 
 /// Where a syntax error was found. `clause` is the index into `:where`
 /// (or into the rule vector for rule parsing) when the error is inside
@@ -120,6 +127,11 @@ const Parser = struct {
     sources: std.ArrayList(u32) = .empty,
     rule_body: bool = false,
     clause_index: ?usize = null,
+    /// The `:find` element being parsed, and the source each
+    /// `(pull $src ...)` names, resolved once `:in` is known.
+    find_index: usize = 0,
+    find_elems: []ir.FindElem = &.{},
+    pull_srcs: std.ArrayList(struct { find: usize, sym: Value }) = .empty,
 
     fn fail(self: *Parser, message: []const u8) Error {
         self.diag.* = .{ .clause = self.clause_index, .message = message };
@@ -301,40 +313,49 @@ const Parser = struct {
 
     fn parseFind(self: *Parser, items: []Value, out: *Ir) Error!void {
         // `[?a .]`, `[[?a ...]]`, `[[?a ?b]]`, else relation.
+        var elems_in = items;
+        out.find_spec = .relation;
         if (items.len == 2 and self.isSym(items[1], ".")) {
             out.find_spec = .scalar;
-            out.find = try self.arena.dupe(ir.FindElem, &.{try self.parseFindElem(items[0])});
-            return;
-        }
-        if (items.len == 1 and items[0].kind() == .persistent_vector) {
+            elems_in = items[0..1];
+        } else if (items.len == 1 and items[0].kind() == .persistent_vector) {
             const inner = try self.elems(items[0]);
             if (inner.len == 2 and self.isSym(inner[1], "...")) {
                 out.find_spec = .collection;
-                out.find = try self.arena.dupe(ir.FindElem, &.{try self.parseFindElem(inner[0])});
-                return;
+                elems_in = inner[0..1];
+            } else {
+                if (inner.len == 0) return self.fail("empty :find tuple");
+                out.find_spec = .tuple;
+                elems_in = inner;
             }
-            if (inner.len == 0) return self.fail("empty :find tuple");
-            out.find_spec = .tuple;
-            const fs = try self.arena.alloc(ir.FindElem, inner.len);
-            for (inner, fs) |x, *f| f.* = try self.parseFindElem(x);
-            out.find = fs;
-            return;
         }
-        out.find_spec = .relation;
-        const fs = try self.arena.alloc(ir.FindElem, items.len);
-        for (items, fs) |x, *f| f.* = try self.parseFindElem(x);
+        const fs = try self.arena.alloc(ir.FindElem, elems_in.len);
+        for (elems_in, fs, 0..) |x, *f, i| {
+            self.find_index = i;
+            f.* = try self.parseFindElem(x);
+        }
         out.find = fs;
+        self.find_elems = fs;
     }
 
     fn parseFindElem(self: *Parser, v: Value) Error!ir.FindElem {
         if (self.isVarSym(v)) return .{ .variable = try self.varOf(v.asSymbolId()) };
         if (v.kind() == .list) {
             const parts = try self.elems(v);
+            if (parts.len == 0) return self.fail("empty :find element");
             const name = self.symName(parts[0]) orelse return self.fail("aggregate head must be a symbol");
             if (std.mem.eql(u8, name, "pull")) {
-                if (parts.len != 3 or !self.isVarSym(parts[1])) return self.fail("pull is (pull ?e pattern)");
-                if (parts[2].kind() != .persistent_vector) return self.fail("pull takes a pattern vector");
-                return .{ .pull = .{ .e = try self.varOf(parts[1].asSymbolId()), .pattern = parts[2] } };
+                // The source is resolved once `:in` is parsed (`checkBound`).
+                const with_src = parts.len == 4 and self.isSrcSym(parts[1]);
+                const rest = if (with_src) parts[2..] else parts[1..];
+                if (rest.len != 2 or !self.isVarSym(rest[0])) return self.fail("pull is (pull ?e pattern) or (pull $src ?e pattern)");
+                const pattern = rest[1];
+                var out: ir.Pull = .{ .e = try self.varOf(rest[0].asSymbolId()), .pattern = .{ .value = pattern } };
+                if (self.isVarSym(pattern)) {
+                    out.pattern = .{ .input = try self.varOf(pattern.asSymbolId()) };
+                } else if (pattern.kind() != .persistent_vector) return self.fail("pull takes a pattern vector or a variable bound by :in");
+                if (with_src) try self.pull_srcs.append(self.arena, .{ .find = self.find_index, .sym = parts[1] });
+                return .{ .pull = out };
             }
             if (self.isVarSym(parts[0])) return self.fail("an aggregate is named by a symbol");
             const op = ir.AggOp.fromName(name) orelse .custom;
@@ -359,11 +380,10 @@ const Parser = struct {
         var out: std.ArrayList(ir.InBinding) = .empty;
         var seen: std.ArrayList(Var) = .empty;
         var has_rules = false;
-        for (items, 0..) |x, i| {
+        for (items) |x| {
             if (self.isSrcSym(x)) {
                 const sym = x.asSymbolId();
-                if (self.sources.items.len == 0 and i != 0) return self.fail(":in starts with a data source");
-                if (i != 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
+                if (self.sources.items.len > 0 and self.isSym(x, "$")) return self.fail("$ names the first data source; declare it first");
                 for (self.sources.items) |s| if (s == sym) return self.fail("duplicate data source in :in");
                 try out.append(self.arena, .{ .src = @intCast(self.sources.items.len) });
                 try self.sources.append(self.arena, sym);
@@ -385,7 +405,6 @@ const Parser = struct {
                 }
             } else return self.fail("unknown :in binding form");
         }
-        if (self.sources.items.len == 0) return self.fail(":in starts with a data source");
         return out.toOwnedSlice(self.arena);
     }
 
@@ -419,14 +438,27 @@ const Parser = struct {
             },
             .src, .rules => {},
         };
+        out.in_vars = try self.arena.dupe(Var, bound.items);
         try ir.boundVars(self.arena, out.where, &bound);
         self.clause_index = null;
+        for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
         for (out.find) |f| {
             if (!ir.containsVar(bound.items, f.variable_of())) return self.fail(":find variable is not bound by :in or :where");
+            if (f != .pull) continue;
+            if (self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
+            switch (f.pull.pattern) {
+                .value => {},
+                .input => |v| if (!scalarInput(out.in, v)) return self.fail("a pull pattern variable is bound by a scalar :in input"),
+            }
         }
         for (out.with) |w| {
             if (!ir.containsVar(bound.items, w)) return self.fail(":with variable is not bound by :in or :where");
         }
+    }
+
+    fn scalarInput(in: []const ir.InBinding, v: Var) bool {
+        for (in) |b| if (b == .scalar and b.scalar == v) return true;
+        return false;
     }
 
     // ── clauses ───────────────────────────────────────────────────
@@ -441,6 +473,7 @@ const Parser = struct {
     }
 
     fn parseClauseInto(self: *Parser, x: Value, out: *std.ArrayList(Clause)) Error!void {
+        try stack.check();
         switch (x.kind()) {
             .persistent_vector => {
                 const parts = try self.elems(x);
@@ -471,7 +504,7 @@ const Parser = struct {
                 } else if (std.mem.eql(u8, head, "or-join")) {
                     if (parts.len < 3) return self.fail("or-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]) } });
+                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]), .required = try self.requiredVars(parts[1]) } });
                 } else if (parts[0].isSymbol() and self.isSrcSym(parts[0])) {
                     if (parts.len < 2 or self.symName(parts[1]) == null) return self.fail("a source prefix is followed by a rule name");
                     const src = try self.srcOf(parts[0]);
@@ -512,6 +545,17 @@ const Parser = struct {
             for (first.items) |v| if (!ir.containsVar(vs.items, v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
             for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
         }
+    }
+
+    /// The variables of the leading `[?a ...]` group of a join vector:
+    /// the ones an `or-join` needs bound before it runs.
+    fn requiredVars(self: *Parser, v: Value) Error![]const Var {
+        const items = try self.elems(v);
+        if (items.len == 0 or items[0].kind() != .persistent_vector) return &.{};
+        const group = try self.elems(items[0]);
+        const out = try self.arena.alloc(Var, group.len);
+        for (group, out) |x, *o| o.* = try self.varOf(x.asSymbolId());
+        return out;
     }
 
     /// `[?a ?b]` or `[[?a] ?b]` (a required-bound group, flattened).
@@ -579,16 +623,15 @@ const Parser = struct {
         return .{ .bind = .{ .call = call, .out = try self.parseBinding(parts[1]) } };
     }
 
-    /// A built-in's arity and role: predicates stand alone, functions
-    /// need a binding form.
+    /// A built-in's arity and role: a comparison or `missing?` stands
+    /// alone as a predicate or binds its boolean; a function needs a
+    /// binding form.
     fn checkBuiltin(self: *Parser, b: ir.Builtin, args: []const ir.Arg, predicate: bool) Error!void {
         switch (b) {
             .lt, .le, .gt, .ge, .eq, .ne => {
-                if (!predicate) return self.fail("a comparison is a predicate; it binds nothing");
                 if (args.len < 2) return self.fail("a comparison needs at least two arguments");
             },
             .missing => {
-                if (!predicate) return self.fail("missing? is a predicate; it binds nothing");
                 if (args.len != 3 or args[0] != .src) return self.fail("missing? is (missing? $ ?e :attr)");
             },
             .ground => {
@@ -598,6 +641,7 @@ const Parser = struct {
             .get_else => {
                 if (predicate) return self.fail("get-else needs a binding form");
                 if (args.len != 4 or args[0] != .src) return self.fail("get-else is (get-else $ ?e :attr default)");
+                if (args[3] == .constant and args[3].constant == .nil) return self.fail("get-else takes a default that is not nil");
             },
             .get_some => {
                 if (predicate) return self.fail("get-some needs a binding form");
@@ -704,10 +748,30 @@ const Parser = struct {
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
+        for (out.items, 0..) |r, i| {
+            self.clause_index = i;
+            try self.checkCalls(out.items, r.body);
+        }
         // Group the bodies of one rule: `RuleSet.byName` is one slice.
         // The sort is stable, so bodies keep their source order.
         std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
+    }
+
+    /// Every call in `body` to a rule of the set passes as many
+    /// arguments as its head has.
+    fn checkCalls(self: *Parser, rules: []const ir.Rule, body: []const Clause) Error!void {
+        try stack.check();
+        for (body) |c| switch (c) {
+            .rule => |call| for (rules) |def| {
+                if (def.name != call.name) continue;
+                if (def.head.len != call.args.len) return self.fail("a rule is called with the wrong number of arguments");
+                break;
+            },
+            .not => |n| try self.checkCalls(rules, n.body),
+            .@"or" => |o| for (o.branches) |br| try self.checkCalls(rules, br),
+            else => {},
+        };
     }
 
     fn ruleNameLess(_: void, a: ir.Rule, b: ir.Rule) bool {
@@ -719,63 +783,135 @@ const Parser = struct {
 // Cache
 // =============================================================================
 
+/// The parses a cache keeps before a miss replaces the least recently
+/// used one that no query is running on.
+pub const cache_capacity = 128;
+
 fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
     return struct {
         const Self = @This();
-        const Entry = struct { query: Value, parsed: *T };
+        const Entry = struct {
+            query: Value,
+            hash: u64,
+            parsed: *T,
+            /// The cache's clock at the entry's last use.
+            used: u64,
+            /// Queries running on the parse; a pinned entry stays.
+            pins: u32 = 0,
+        };
 
         gpa: Allocator,
-        by_ptr: std.AutoHashMapUnmanaged(u64, *T) = .empty,
-        by_hash: std.AutoHashMapUnmanaged(u64, std.ArrayList(Entry)) = .empty,
+        entries: std.ArrayList(Entry) = .empty,
+        clock: u64 = 0,
 
         pub fn init(gpa: Allocator) Self {
             return .{ .gpa = gpa };
         }
 
         pub fn deinit(self: *Self) void {
-            self.clear();
-            self.by_ptr.deinit(self.gpa);
-            self.by_hash.deinit(self.gpa);
-        }
-
-        /// Drop every entry.
-        pub fn clear(self: *Self) void {
-            var it = self.by_hash.valueIterator();
-            while (it.next()) |bucket| {
-                for (bucket.items) |e| e.parsed.deinit();
-                bucket.deinit(self.gpa);
-            }
-            self.by_hash.clearRetainingCapacity();
-            self.by_ptr.clearRetainingCapacity();
+            for (self.entries.items) |e| e.parsed.deinit();
+            self.entries.deinit(self.gpa);
         }
 
         pub fn count(self: *const Self) usize {
-            return self.by_ptr.count();
+            return self.entries.items.len;
         }
 
-        /// The parse of `query`, parsing on a miss. The result is owned
-        /// by the cache.
-        pub fn get(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*T {
-            const is_heap = query.kind().isHeap();
-            if (is_heap) {
-                if (self.by_ptr.get(query.payload)) |p| return p;
-            }
+        /// Mark every query value the cache holds, from the VM's root
+        /// walk (GC.md §3). A parse borrows from its query value
+        /// (string constants' bytes, opaque and lookup-ref constants,
+        /// pull patterns and their defaults), so the collector must see
+        /// each one for as long as the cache holds it.
+        pub fn mark(self: *const Self, c: *gc.Collector) void {
+            for (self.entries.items) |e| c.markValue(e.query);
+        }
+
+        /// The parse of `query`, parsing on a miss, pinned until
+        /// `release`. A hit is the same value, or one equal to it with
+        /// lists and vectors told apart (`sameShape`), since the parser
+        /// reads them differently.
+        pub fn acquire(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*T {
+            self.clock += 1;
+            const e = try self.find(interner, query, diag);
+            e.used = self.clock;
+            e.pins += 1;
+            return e.parsed;
+        }
+
+        pub fn release(self: *Self, parsed: *const T) void {
+            for (self.entries.items) |*e| if (e.parsed == parsed) {
+                e.pins -= 1;
+                return;
+            };
+            unreachable;
+        }
+
+        fn find(self: *Self, interner: *Interner, query: Value, diag: *Diag) Error!*Entry {
+            for (self.entries.items) |*e| if (e.query.tag == query.tag and e.query.payload == query.payload) return e;
             const h = dispatch.hashValue(query);
-            const gop = try self.by_hash.getOrPut(self.gpa, h);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            for (gop.value_ptr.items) |e| {
-                if (dispatch.equal(e.query, query)) {
-                    if (is_heap) try self.by_ptr.put(self.gpa, query.payload, e.parsed);
-                    return e.parsed;
-                }
-            }
+            for (self.entries.items) |*e| if (e.hash == h and try sameShape(e.query, query)) return e;
             const parsed = try parseFn(self.gpa, interner, query, diag);
             errdefer parsed.deinit();
-            try gop.value_ptr.append(self.gpa, .{ .query = query, .parsed = parsed });
-            if (is_heap) try self.by_ptr.put(self.gpa, query.payload, parsed);
-            return parsed;
+            const slot = self.victim() orelse self.entries.items.len;
+            const entry: Entry = .{ .query = query, .hash = h, .parsed = parsed, .used = self.clock };
+            if (slot == self.entries.items.len) {
+                try self.entries.append(self.gpa, entry);
+            } else {
+                self.entries.items[slot].parsed.deinit();
+                self.entries.items[slot] = entry;
+            }
+            return &self.entries.items[slot];
+        }
+
+        /// The entry a miss replaces: the least recently used unpinned
+        /// one once the cache is full, else null (append).
+        fn victim(self: *const Self) ?usize {
+            if (self.entries.items.len < cache_capacity) return null;
+            var best: ?usize = null;
+            for (self.entries.items, 0..) |e, i| {
+                if (e.pins > 0) continue;
+                if (best == null or e.used < self.entries.items[best.?].used) best = i;
+            }
+            return best;
         }
     };
+}
+
+/// `=` over query values with lists and vectors told apart at every
+/// depth: `[?e :a (:b 1)]` and `[?e :a [:b 1]]` are equal as data but
+/// parse to different clauses. Anything that is not a list, vector or
+/// map compares by `=`.
+fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
+    try stack.check();
+    if (a.kind() != b.kind()) return false;
+    switch (a.kind()) {
+        .persistent_vector => {
+            const n = vector_mod.count(a);
+            if (n != vector_mod.count(b)) return false;
+            for (0..n) |i| if (!try sameShape(vector_mod.nth(a, i), vector_mod.nth(b, i))) return false;
+            return true;
+        },
+        .list => {
+            var x = list_mod.Cursor.init(a);
+            var y = list_mod.Cursor.init(b);
+            while (true) {
+                const p = x.next();
+                const q = y.next();
+                if (p == null or q == null) return p == null and q == null;
+                if (!try sameShape(p.?, q.?)) return false;
+            }
+        },
+        .persistent_map => {
+            if (champ.mapCount(a) != champ.mapCount(b)) return false;
+            var it = champ.mapIter(a);
+            while (it.next()) |e| switch (champ.mapGet(b, e.key, &dispatch.hashValue, &dispatch.equal)) {
+                .absent => return false,
+                .present => |v| if (!try sameShape(e.value, v)) return false,
+            };
+            return true;
+        },
+        else => return dispatch.equal(a, b),
+    }
 }
 
 pub const Cache = CacheOf(Ir, parse);
@@ -786,7 +922,7 @@ pub const RulesCache = CacheOf(RuleSet, parseRules);
 // =============================================================================
 
 const testing = std.testing;
-const heap_mod = @import("heap");
+const heap_mod = @import("../../heap.zig");
 
 /// Builds query values in tests: `v.sym("?e")`, `v.vec(&.{...})`.
 const Builder = struct {
@@ -925,9 +1061,16 @@ test "sources: $ first, $name prefixes on patterns, calls and rule calls" {
     try testing.expectEqual(@as(?ir.Src, 0), pn.where[1].pattern.src);
     try testing.expect(pn.where[2].pattern.src == null);
 
+    // A source may follow other inputs, and a query may have none.
+    const late = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("?x"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?x") }) }), &diag);
+    defer late.deinit();
+    try testing.expect(late.in[1] == .src and late.in[1].src == 0);
+    const none = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("in"), b.sym("?x") }), &diag);
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.sources.len);
+
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$2"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
-        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("?x"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("in"), b.sym("$"), b.sym("$"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("$2"), b.sym("?e"), b.kw("a"), b.int(1) }) }),
     }) |bad| {
@@ -1036,7 +1179,6 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
     // Built-in arity and role are checked here, with a reason.
     for ([_]Value{
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("<"), b.sym("?v") })}) }),
-        b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{b.lst(&.{ b.sym("missing?"), b.sym("?e"), b.kw("a") })}) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("ground"), b.int(1), b.int(2) }), b.sym("?x") }) }),
         b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("get-else"), b.sym("?e"), b.kw("a"), b.int(0) }), b.sym("?x") }) }),
@@ -1049,6 +1191,11 @@ test "map form, scalar/collection/tuple find, default :in, errors carry clause i
         try testing.expect(diag.message.len > 0);
         try testing.expectEqual(@as(?usize, 1), diag.clause);
     }
+
+    // A comparison with a binding form binds its boolean.
+    const lt_bind = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), b.vec(&.{ b.lst(&.{ b.sym("<"), b.sym("?v"), b.int(3) }), b.sym("?x") }) }), &diag);
+    defer lt_bind.deinit();
+    try testing.expect(lt_bind.where[1] == .bind and lt_bind.where[1].bind.call.f.builtin == .lt);
 
     // A variable twice in one tuple binding.
     const q8 = b.vec(&.{ b.kw("find"), b.sym("?x"), b.kw("where"), b.vec(&.{ b.lst(&.{ b.sym("f"), b.int(1) }), b.vec(&.{ b.sym("?x"), b.sym("?x") }) }) });
@@ -1109,14 +1256,89 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     var cache = Cache.init(testing.allocator);
     defer cache.deinit();
     const q = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
-    const p1 = try cache.get(&interner, q, &diag);
-    const p2 = try cache.get(&interner, q, &diag);
+    const p1 = try cache.acquire(&interner, q, &diag);
+    const p2 = try cache.acquire(&interner, q, &diag);
     try testing.expect(p1 == p2);
     const q_again = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) }) });
-    const p3 = try cache.get(&interner, q_again, &diag);
+    const p3 = try cache.acquire(&interner, q_again, &diag);
     try testing.expect(p1 == p3);
-    try testing.expectEqual(@as(usize, 2), cache.count());
+    try testing.expectEqual(@as(usize, 1), cache.count());
     const q_other = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(2) }) });
-    const p4 = try cache.get(&interner, q_other, &diag);
+    const p4 = try cache.acquire(&interner, q_other, &diag);
     try testing.expect(p1 != p4);
+    for ([_]*Ir{ p1, p2, p3, p4 }) |p| cache.release(p);
+
+    // A list constant and a lookup-ref vector are `=` but parse apart.
+    const as_list = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.lst(&.{ b.kw("b"), b.int(1) }) }) });
+    const as_vec = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.vec(&.{ b.kw("b"), b.int(1) }) }) });
+    try testing.expect(dispatch.equal(as_list, as_vec));
+    const pl = try cache.acquire(&interner, as_list, &diag);
+    const pv = try cache.acquire(&interner, as_vec, &diag);
+    try testing.expect(pl.where[0].pattern.v.constant == .cell);
+    try testing.expect(pv.where[0].pattern.v.constant == .lookup);
+    cache.release(pl);
+    cache.release(pv);
+}
+
+test "clauses nested past the stack guard are StackOverflow" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    var clause = b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) });
+    for (0..5000) |_| clause = b.lst(&.{ b.sym("not"), clause });
+    const q = b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") }), clause });
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    var diag: Diag = .{};
+    try testing.expectError(error.StackOverflow, parse(testing.allocator, &interner, q, &diag));
+}
+
+test "a full cache replaces its least recently used unpinned parse and marks what it holds" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+    var diag: Diag = .{};
+    const queryOf = struct {
+        fn f(bb: Builder, n: i64) Value {
+            return bb.vec(&.{ bb.kw("find"), bb.sym("?e"), bb.kw("where"), bb.vec(&.{ bb.sym("?e"), bb.kw("a"), bb.int(n) }) });
+        }
+    }.f;
+    // The first query stays pinned; the second is the oldest unpinned.
+    const pinned = try cache.acquire(&interner, queryOf(b, 0), &diag);
+    var i: i64 = 1;
+    while (i < cache_capacity) : (i += 1) cache.release(try cache.acquire(&interner, queryOf(b, i), &diag));
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+    const newest = try cache.acquire(&interner, queryOf(b, 1000), &diag);
+    cache.release(newest);
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+
+    // A collection rooted only by the cache frees the replaced query
+    // and keeps the rest: an equal query built afresh finds each.
+    const Walk = struct {
+        fn roots(ctx: *anyopaque, c: *gc.Collector) void {
+            const self: *const Cache = @ptrCast(@alignCast(ctx));
+            self.mark(c);
+        }
+        fn trace(_: *anyopaque, _: *heap_mod.HeapHeader, _: *gc.Collector) void {
+            unreachable;
+        }
+    };
+    var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
+    collector.host = .{ .ctx = @ptrCast(&cache), .roots = &Walk.roots, .trace = &Walk.trace };
+    try testing.expect(collector.collect(&.{}) > 0);
+    try testing.expect(pinned == try cache.acquire(&interner, queryOf(b, 0), &diag));
+    try testing.expect(newest == try cache.acquire(&interner, queryOf(b, 1000), &diag));
+    i = 2;
+    while (i < cache_capacity) : (i += 1) cache.release(try cache.acquire(&interner, queryOf(b, i), &diag));
+    try testing.expectEqual(@as(usize, cache_capacity), cache.count());
+    cache.release(newest);
+    cache.release(pinned);
+    cache.release(pinned);
 }

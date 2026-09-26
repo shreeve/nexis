@@ -9,4 +9,4 @@
     (< 99 n)                :large
     :else                   :non-positive))
 
-(classify 42)
+(println (classify 42))

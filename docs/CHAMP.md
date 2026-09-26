@@ -1,990 +1,414 @@
-## CHAMP.md — Persistent Map & Set Heap Kinds
+## CHAMP.md — Persistent Map and Set Heap Kinds
 
-Authoritative body-layout and semantic contract for the
-`persistent_map` and `persistent_set` heap kinds, implemented in
-`src/coll/champ.zig`. Derivative from `PLAN.md` §9.1 + §23 #37,
-`docs/VALUE.md` §2.2, `docs/SEMANTICS.md` §2.6 / §3.2, `docs/HEAP.md`,
-and the precedents set by `docs/LIST.md` and `docs/VECTOR.md`. Those
-documents win on conflict.
-
-The **algorithm is CHAMP** (Steindorfer & Vinju, OOPSLA 2015 —
-separate data and node bitmaps, canonical layout), not classic
-Bagwell HAMT.
-
-This module is the sole runtime member of the **associative** and
-**set** equality categories (hash-domain bytes `0xF1` and `0xF2`).
-The category/domain scaffolding and exhaustive table tests in
-`dispatch.zig` pin `.persistent_map` and `.persistent_set` to those
-categories; this module gives them bodies. The two kinds are a
-parallel subkind family sharing one CHAMP machinery: map core plus
-associative infrastructure, and set as a parallel implementation
-reusing it.
+The contract for the `persistent_map` and `persistent_set` heap kinds
+(`src/coll/champ.zig`): a CHAMP trie (Steindorfer and Vinju, OOPSLA
+2015: separate data and node bitmaps, a canonical layout) behind a flat
+array form for up to 8 keys (PLAN §23 #37). Kind numbers:
+`docs/VALUE.md` §2.2. Header bits: `docs/HEAP.md`. Equality category
+and hash domain: `docs/SEMANTICS.md` §3.3. GC trace: `docs/GC.md` §5.
+Serializable: `docs/CODEC.md` §3.
 
 ---
 
 ### 1. Scope
 
-**In:**
+The module implements the trie once, for both kinds (§11), and
+provides construction, `assoc`/`conj`, `dissoc`/`disj`, lookup,
+`count`, an iterator, and the per-kind hash, equality and trace entry
+points (§8). Costs:
 
-- Representation: classic CHAMP layout — separate data and node
-  bitmaps per Steindorfer & Vinju (OOPSLA 2015) — plus a flat
-  array-map / array-set inline optimization for small collections.
-  Collision nodes at the trie's depth limit for keys that share a
-  full 32-bit hash.
-- Construction: `empty`, `fromEntries` / `fromElements`, `assoc` /
-  `conj`, `dissoc` / `disj`.
-- Accessors: `count` (O(1)), `get` / `contains`, `isEmpty`.
-- Per-kind dispatch: `hashMap` / `hashSet`, `equalMap` / `equalSet`,
-  element/entry iterator for unordered hash accumulation.
-- Two category-equality helpers in `dispatch.zig`: `associativeEqual`
-  and `setEqualCategory`, parallel to `sequentialEqual`. (These
-  handle within-category equality; each category has exactly one
-  kind, so they reduce to kind-local dispatch, but the shape is the
-  seam for any cross-kind associative / set member.)
+| Operation | Cost |
+|---|---|
+| lookup (`mapGet`, `setContains`) | O(log₃₂ n): an iterative descent of at most 7 interior levels and a collision node |
+| `assoc`/`conj`, `dissoc`/`disj` | O(log₃₂ n) path copy, one new node per level; an array form copies its ≤ 8 payloads |
+| `mapFromEntries`, `setFromElements` | O(n log n): a sort by slot path, then one allocation per node |
+| `count` | O(1) |
+| `=` | O(n) lookups (§6.3) |
+| `hash` | O(n) the first time; cached in the root header (§7.5) |
 
-**Out (owned elsewhere or absent):**
+The language surface lives in `src/stdlib.zig`: `hash-map`, `hash-set`,
+`set`, `assoc`, `dissoc`, `disj`, `get` (nil or the default when
+absent), `contains?`, `find`, `keys`, `vals`, `key`, `val`, `zipmap`,
+`select-keys`, `conj`, `into`, `count`, `empty`, and invocation (`({:a
+1} :a)`, `(#{:x} :x)`, `(:a m)`). `merge`, `merge-with`, `update`,
+`get-in`, `assoc-in`, `update-in`, `frequencies`, `group-by`,
+`update-vals` and `update-keys` are `src/stdlib/core.nx`; set algebra
+is the `nexis.set` namespace (`src/stdlib/set.nx`). `(assoc nil k v)`
+is `{k v}` (SEMANTICS §4). An update that changes nothing returns its
+argument; any other update returns a new root carrying the argument's
+metadata (SEMANTICS §7).
 
-- **Transients**. Owner-token editable copies live in
-  `src/coll/transient.zig` (spec: `docs/TRANSIENT.md`). CHAMP node
-  layouts carry no transient-specific fields; the transient wrapper
-  owns its edit state.
-- `merge` / `merge-with` / `update` / `select-keys` / `zipmap` and
-  other stdlib-level map operators. Those compose over `assoc` /
-  `dissoc` / `get` and live in the stdlib (`src/stdlib.zig` natives
-  and `src/stdlib/core.nx`).
-- Set operators (`union` / `intersection` / `difference`). Not
-  implemented; no stdlib binding exists for them.
-- RRB-style balancing for maps. Not a thing — CHAMP is the committed
-  layout. Listed here only to pre-empt the question.
-- Cross-kind associative or set members. Each category has one kind;
-  no sorted-map or similar kind exists. Adding one requires a spec
-  amendment.
+**Absent.** Sorted maps and sets, and any other member of the map or
+set equality category; transients are `src/coll/transient.zig`
+(`docs/TRANSIENT.md`).
 
 ---
 
-### 2. The three-layer canonicality model (central)
+### 2. Canonical layout
 
-**Overclaiming canonical representation is the single most likely
-spec mistake here.** The rule set below is deliberately narrower
-than a naive "CHAMP guarantees a unique layout for any logical entry
-set" reading of PLAN §9.1.
+#### 2.1 Array form (subkind 0)
 
-nexis claims canonical representation at **three distinct levels**,
-each with its own scope:
+An array-map or array-set holds up to 8 payloads in association order:
+insertion order, a replaced value keeping its position. The order is a
+representation detail: it shows in iteration, printing and codec
+bytes, never in `=` or `hash`.
 
-#### 2.1 Array-map layer (subkind 0)
+#### 2.2 Trie (subkind 1)
 
-- Array-maps store up to 8 entries **in association order** as a
-  representation detail.
-- **Two array-maps with the same key-value set compare `=` regardless
-  of entry order.** Equality is O(n²) membership comparison (n ≤ 8);
-  hash uses the order-independent `hash.combineUnordered`.
-- There is **no** structural / bytewise uniqueness guarantee at this
-  layer. Build order leaks into representation but NOT into equality
-  or hash.
+The trie is a function of the key set. Every key sits at the
+shallowest node where no other key shares its indexing-hash path
+(§5.1), and every node below the root holds at least two keys in its
+subtree (§4.3, §5.5). Two trie-backed maps with the same keys therefore
+have identical bitmaps at every node and iterate, print and encode in
+the same order, whatever their build history, except inside a
+collision node (§2.3). `canonicalTrie` checks this layout.
 
-#### 2.2 CHAMP node layer (subkind 1 root, subkind 2 interior)
+The layout is a representation property, not an equality mechanism:
+`=` and `hash` are semantic (§6.3, §7) and compare an array form with a
+trie freely, since a trie that shrinks below 9 keys stays a trie
+(§5.4).
 
-- Within a single CHAMP node, entries and child pointers occupy
-  physical array positions determined by **bitmap rank (popcount)** of
-  a deterministic slot assignment. Slot assignment is derived from
-  5-bit hash fragments at the node's depth. This is the CHAMP paper's
-  canonicality guarantee.
-- Two **CHAMP-backed maps** with the same entry set produce
-  structurally-identical node trees (bitmap-equal, entry-array-equal,
-  recursively). This enables bitmap-level early-exit equality on
-  CHAMP-vs-CHAMP comparison.
-- Promotion and splitting are deterministic — independent of insertion
-  order — for every case that does NOT involve a collision node.
+#### 2.3 Collision nodes
 
-#### 2.3 Collision-node layer (subkind 3)
+A collision node keeps its entries in association order. A canonical
+order would need a total order over arbitrary Values, which nexis does
+not define.
 
-- Collision nodes hold entries whose keys share a **full 32-bit hash**
-  (indexable bits exhausted). The bucket is small in expectation —
-  xxHash3 collision probability is ~1-in-2³².
-- **Collision nodes do NOT have canonical raw-layout equality.**
-  Defining one would require a total comparator over arbitrary Values
-  (sorting keys by some byte encoding), which is a huge semantic
-  commitment — it entangles equality-internals with a canonical-order
-  contract that would propagate into serialization, stable iteration,
-  and potentially language-level ordering primitives. nexis does not
-  accept that commitment.
-- Collision-node equality is **semantic membership comparison**:
-  same count, then every entry in `a` has an equal-keyed entry in
-  `b`. O(k²) in the collision-bucket size k, which is tiny.
-- Bitmap early-exit does NOT apply to collision-node payloads beyond
-  trivial checks (same count, same shared 32-bit hash).
+---
 
-#### 2.4 Cross-subkind equality
+### 3. Subkinds
 
-- Two maps with the same entry set but different subkinds (e.g. an
-  array-map built to 8 entries vs. a CHAMP-backed map built to 9
-  entries and then reduced by one `dissoc`) compare `=` and hash
-  equal.
-- Equality across subkinds **cannot** use bitmap early-exit. It falls
-  back to **semantic associative comparison** — count equality, then
-  `∀ (k,v) ∈ a: get(b, k) == Some(v)`. Same pattern for sets via
-  `contains`.
-- Hash is structure-independent by construction: both paths iterate
-  every entry and fold via `hash.combineUnordered` + `finalizeUnordered`
-  with the same entry-hash function.
-
-#### 2.5 Summary
-
-| Comparison kind | Equality strategy | Hash strategy |
+| Subkind | Map | Set |
 |---|---|---|
-| array-map vs array-map | O(n²) membership | unordered combine |
-| CHAMP vs CHAMP, no collision | bitmap + recursive structural | unordered combine |
-| CHAMP vs CHAMP with collision | bitmap + structural above, semantic at collision node | unordered combine |
-| array-map vs CHAMP (cross-subkind) | semantic associative via `get` | unordered combine |
+| 0 | array-map: ≤ 8 entries inline | array-set: ≤ 8 elements inline |
+| 1 | CHAMP root: count and root interior | CHAMP root: count and root interior |
+| 2..15 | reserved | reserved |
 
-Equal entry-sets always hash equal, regardless of which cell of the
-table the pair lands in. Equality is correct in every cell; bitmap
-early-exit is an **optimization** confined to the cells where
-canonicality provably holds.
+Every map or set Value carries subkind 0 or 1, and the root accessors
+assert it. Interior and collision nodes are allocations of the same
+heap kind that no Value points at; no header records which one a node
+is. Every walk knows it from the shift it reached the node at: past
+`MAX_TRIE_SHIFT` a node is a collision node, otherwise an interior. A
+root header's subkind follows from its body size (a CHAMP root body is
+16 bytes, which no array body `8 + n·32` or `8 + n·16` can be); this is
+how `hashMap`, `equalMap`, `traceMap` and `valueFromMapHeader` read a
+bare header.
 
-#### 2.6 Explicit exclusions
-
-**Canonicality in this document refers only to CHAMP node
-partitioning and bitmap-derived slot placement for non-collision
-paths.** It does not imply:
-
-- unique bytewise representation across subkinds (array-map and CHAMP
-  can both represent the same logical map — they do NOT share byte
-  layout),
-- canonical ordering of entries inside collision nodes (no total
-  comparator over arbitrary keys),
-- assoc-history-independent raw shape for array-map (insertion order
-  leaks into representation but not into equality or hash).
-
-Any implementation or review claim that requires one of the above
-must be read as a bug in the claim, not a property of the spec.
-
----
-
-### 3. Subkind taxonomy
-
-Per VALUE.md §2.2, `Kind.persistent_map = 18` and
-`Kind.persistent_set = 19` are frozen. The subkind byte disambiguates
-representation families within each kind; subkind numbering is
-**parallel across both kinds** to keep dispatch and GC logic regular.
-
-| Subkind | Map role | Set role | User-facing? |
-|---------|---------|---------|---|
-| 0 | array-map (inline ≤ 8 entries) | array-set (inline ≤ 8 elements) | yes |
-| 1 | CHAMP root (count + pointer to root node) | CHAMP root (count + pointer to root node) | yes |
-| 2 | CHAMP interior node | CHAMP interior node | no (internal) |
-| 3 | collision node | collision node | no (internal) |
-| 4..15 | reserved | reserved | — |
-
-Only subkinds 0 and 1 ever flow through `dispatch.heapHashBase` /
-`dispatch.heapEqual`. Subkinds 2 and 3 are internal allocations —
-the heap holds them, the GC traces them (`traceMap` / `traceSet`),
-but they never escape into a user-visible `Value`. Each accessor
-safe-asserts the subkind of the header it receives.
-
-**Empty collections.** A fresh empty map is `subkind = 0, count = 0`
-(a zero-entry array-map). Same for sets. Per the list / vector
-precedent, empty collections are **not** a shared singleton — each
-`empty(heap)` call allocates a fresh header. There is no pinned
-shared-empty singleton.
+An empty map or set is a zero-payload array form, freshly allocated by
+each `mapEmpty`/`setEmpty`; there is no shared empty singleton.
 
 ---
 
 ### 4. Body layouts
 
-Values are little-endian 64-bit. All pointers are `*HeapHeader` =
-16-byte-aligned. All bodies obey HEAP.md's "zero-initialized on
-allocation" rule; constructor code overwrites the fields it owns.
+Every body starts with an 8-byte header and is followed by its
+payloads. A payload is an `Entry` (`key: Value, value: Value`, 32
+bytes) in a map and a bare key `Value` (16 bytes) in a set. `_pad`
+fields are never hashed or compared. Only a root carries metadata (the
+header's `meta` slot, SEMANTICS §7); the collector's `markInternal`
+skips the `meta` of interior and collision nodes.
 
-#### 4.1 Array-map / array-set body (subkind 0)
+#### 4.1 Array body (subkind 0)
 
-```zig
-// Map: 8 bytes of header + count * 32 bytes of (key, value) pairs
-const ArrayMapBody = extern struct {
-    count: u32,   // 0..8
-    _pad: u32,
-    // followed by: [count] entry pairs of { key: Value, value: Value }
-};
+`count: u32` (0..8), `_pad: u32`, then `count` payloads in association
+order.
 
-// Set: 8 bytes of header + count * 16 bytes of keys
-const ArraySetBody = extern struct {
-    count: u32,   // 0..8
-    _pad: u32,
-    // followed by: [count] element Values
-};
-```
+#### 4.2 Root body (subkind 1)
 
-- `count` ∈ [0, 8]. On the 9th insert, promotion to subkind 1 (CHAMP)
-  fires — see §5.3.
-- Entries / elements are stored in **association order** (insertion
-  order, with replace-value updating in place). This ordering is a
-  representation detail, NOT a semantic commitment — equality and
-  hash ignore it.
-- `_pad` bytes are never fed into hash or equality (the same
-  discipline as `bignum.zig`: layout detail must not leak into hash
-  output).
-- Empty array-map / array-set: body size = 8 bytes; no trailing
-  entries.
+`count: u32` (the total over the whole trie), `_pad: u32`, `root_node:
+*HeapHeader` (always an interior); 16 bytes. `root_node` is never null:
+an empty collection is an array form (§5.6). The root's count makes
+`count` O(1) without per-node counts; `assoc` reports through its
+recursion whether it added a key.
 
-#### 4.2 CHAMP root body (subkind 1)
+#### 4.3 Interior node
 
-```zig
-const ChampRootBody = extern struct {
-    count: u32,                  // total entries across the whole trie
-    _pad: u32,
-    root_node: *HeapHeader,      // points to a subkind-2 (interior) or
-                                 // subkind-3 (collision) node
-};  // 16 bytes
-```
+`data_bitmap: u32`, `node_bitmap: u32`, then `popCount(data_bitmap)`
+payloads, then `popCount(node_bitmap)` child pointers. Invariants:
 
-- Always has a non-null `root_node` — an empty collection lives in
-  subkind 0 (array-map/set with count 0), never in subkind 1.
-- `count` is the authoritative total; it makes `count(v)` O(1) for
-  user code and means interior nodes do NOT need to cache subtree
-  counts. `assoc` / `dissoc` maintain a `changed: bool` flag passed
-  through the recursion and adjust root count at the outer layer.
-  (Clojure's pattern; simpler than per-node count caching.)
-- `_pad` same semantic rules as above.
+1. `data_bitmap & node_bitmap == 0`: a slot holds at most one payload
+   or one child.
+2. The body is compact: payloads, then children, with no gaps.
+3. Payloads are in ascending slot order: slot `i`'s payload is at
+   `popCount(data_bitmap & ((1 << i) - 1))`.
+4. Children are in descending slot order: slot `i`'s child is at the
+   number of `node_bitmap` bits above `i`.
+5. No empty interior exists, and every interior below the root holds at
+   least two keys in its subtree. A lone key belongs inline in its
+   parent (§5.5); an interior with no payloads and one child is legal
+   when that child's subtree holds two or more keys. The root interior
+   is exempt: a one-key trie is a root interior holding one payload
+   (§5.4).
 
-#### 4.3 CHAMP interior node (subkind 2)
+Together these make the trie canonical (§2.2). `canonicalTrie(v,
+elementHash)` checks every one of them, and that each key sits at the
+slot its indexing hash selects along its path.
 
-```zig
-const ChampInteriorBody = extern struct {
-    data_bitmap: u32,    // bit i set ⇒ slot i holds an inline entry
-    node_bitmap: u32,    // bit i set ⇒ slot i holds a child pointer
-    // followed by a single compact payload segment:
-    //   first:  popCount(data_bitmap) inline entries
-    //   then:   popCount(node_bitmap) child pointers
-};
-```
+#### 4.4 Collision node
 
-Invariants (normative; position arithmetic in prose is illustrative,
-formula authority lives in the code):
-
-- `data_bitmap & node_bitmap == 0` — a slot holds at most one of
-  {inline-entry, child-pointer}, never both. Safe-build code asserts
-  this on every traversal.
-- **Compact payload.** The node body is a contiguous segment: all
-  inline entries, then all child pointers, with no gaps.
-- **Entry segment order.** Inline entries are stored in **ascending
-  slot-index order** (lowest slot first). For slot `i` with bit set
-  in `data_bitmap`, the entry's physical index inside the entry
-  segment is the number of set bits in `data_bitmap` at slots lower
-  than `i`.
-- **Child segment order.** Child pointers are stored in **descending
-  slot-index order** (highest slot first — CHAMP paper convention;
-  lets promotion append from the back without reshuffling). For slot
-  `i` with bit set in `node_bitmap`, the child's physical index
-  inside the child segment is the number of set bits in `node_bitmap`
-  at slots greater than `i`, counting from the top of the segment.
-- **No empty interior nodes.** An interior node with zero entries
-  and zero children cannot exist — that state collapses to the
-  parent-level representation (either an empty subkind-0 at the
-  root, or an empty slot at an ancestor node).
-- **No lonely interior nodes below the CHAMP root's `root_node`.**
-  An interior node with exactly one entry and zero children cannot
-  exist anywhere **except as a CHAMP root's `root_node` payload** —
-  the entry is otherwise pulled up into the parent's data area via
-  the single-entry-subtree promotion rule (§5.5). The carve-out for
-  the CHAMP root's `root_node` is necessary because the no-demotion
-  rule (§5.4) keeps a one-entry CHAMP as subkind-1 rather than
-  demoting to array-map; that subkind-1 must hold its single entry
-  somewhere, and wrapping it in a one-entry interior at shift 0
-  (built via `champSingleEntryInterior`) is the canonical form
-  (§5.6).
-  
-  This invariant is what makes bitmap-level early-exit equality work
-  **below the root_node level**: two equal CHAMP-backed maps at count
-  ≥ 2 necessarily produce bit-identical bitmap chains at every
-  corresponding interior node. At the root_node level, equal CHAMP
-  maps of count 1 produce bit-identical single-entry interiors by the
-  same token (both built via `champSingleEntryInterior` with
-  matching entry and shift-0 slot index).
-- **Entry types.** For `persistent_map`, each inline entry occupies
-  32 bytes (`{ key: Value, value: Value }`). For `persistent_set`,
-  each inline entry occupies 16 bytes (`key: Value`). The code module
-  selects entry width by kind; bitmap semantics are identical.
-
-The exact popcount expressions used at call sites live in
-`src/coll/champ.zig` and are covered by inline unit tests.
-
-#### 4.4 Collision node (subkind 3)
-
-```zig
-const CollisionBody = extern struct {
-    shared_hash: u32,    // the 32-bit indexing hash every entry shares
-    count: u32,          // 2..N entries
-    // followed by:
-    //   map: [count] { key: Value, value: Value }
-    //   set: [count] Value
-};
-```
-
-- `count ≥ 2` — a bucket of one is not a collision, it's an inline
-  entry that belongs in the parent interior node's data area.
-- `shared_hash` is specifically the 32-bit **indexing hash** defined
-  in §5.1 (low 32 bits of `dispatch.hashValue(key)`). It is stored so
-  lookup can reject a mismatched query hash in O(1) before any per-entry
-  `=` walk. Not an independent hash; not pre-domain-mix.
-- Entries are stored in **association order** as a representation
-  detail (like array-map). Equality/hash at this layer is semantic
-  (per §2.3) — no canonical ordering over arbitrary keys.
+`shared_hash: u32` (the 32-bit indexing hash every key in it shares,
+§5.1), `count: u32` (≥ 2), then `count` payloads in association order.
+A lookup compares its hash against `shared_hash` before walking the
+payloads.
 
 ---
 
-### 5. Indexing hash, shift schedule, promotion, dissoc
+### 5. Indexing hash, levels, promotion and dissoc
 
 #### 5.1 Indexing hash
 
-Keys are indexed by the **low 32 bits** of the key's `dispatch.hashValue(key)`
-result. The hash is computed once per lookup/update and reused
-throughout. Since `dispatch.hashValue` already applies the
-equality-category domain mixer, this is the same hash value that
-would be written to `HeapHeader.hash` for heap-kind keys; no second
-xxHash3 invocation per key per op.
+A key's indexing hash is the low 32 bits of `dispatch.hashValue(key)`,
+computed once per operation. The module takes `elementHash` as a
+callback (§9) and consults it for heap keys only: an immediate key
+hashes through `Value.hashImmediate`, which is what `dispatch.hashValue`
+computes for it, so a keyword or fixnum key skips the callback. A test
+fixture that shapes the indexing hash through `elementHash` must
+therefore key by heap values (§12.3).
 
-```zig
-inline fn indexHashOf(key: Value, elementHash: *const fn (Value) u64) u32 {
-    if (!key.kind().isHeap()) return @truncate(key.hashImmediate());
-    return @truncate(elementHash(key));
-}
-```
+#### 5.2 Levels
 
-(`elementHash` is `&dispatch.hashValue` at every real call site; the
-module takes it as a parameter rather than importing `dispatch.zig`.
-An immediate key hashes through `Value.hashImmediate` directly: that
-is the value `dispatch.hashValue` computes for every non-heap kind,
-so the index is the same either way and a keyword or fixnum key
-skips the callback. `elementHash` is consulted for heap keys only.
-A test fixture that shapes the indexing hash through the callback
-therefore keys by heap values, strings in every collision fixture,
-and asserts through `mapCollisionCount` / `setCollisionCount` that
-its keys reached the collision node; an immediate key would never
-see the fixture's hash and the trie would partition it cleanly.)
+The slot at shift `s` is `(hash >> s) & 0x1F`. Levels 0..5 (shifts 0,
+5, …, 25) consume 5 bits each; level 6 (shift 30, `MAX_TRIE_SHIFT`, a
+`u8`) consumes the last 2, so only slots 0..3 are reachable there. Keys
+whose full 32-bit indexing hashes are equal meet in a collision node
+below level 6. The indexing width is fixed at 32 bits.
 
-Rationale for low-32 (vs. high-32 / XOR-fold): freeze one rule;
-pick the simpler. Truncation does not bias distribution because
-xxHash3 output is uniform across 64 bits.
+#### 5.3 Promotion
 
-#### 5.2 Level shifts
+`assoc` of a new key into an 8-entry array form builds a subkind-1
+root holding the nine: they are sorted by slot path and the trie is
+built bottom-up, one allocation per node, with the builder that serves
+`mapFromEntries` and `setFromElements`. The result is the canonical
+trie of the nine keys.
 
-- Levels 0..5 each consume 5 bits in 5-bit chunks (30 bits total).
-- Level 6 consumes the remaining 2 bits (bitmap still `u32` but only
-  slots 0..3 are reachable).
-- After all 32 indexing bits are exhausted, two keys with equal 32-bit
-  indexing hashes are placed in a collision node (§4.4).
+#### 5.4 No demotion
 
-| Level | Shift | Fragment width | Reachable slots |
-|-------|-------|----------------|-----------------|
-| 0 | 0 | 5 bits | 0..31 |
-| 1 | 5 | 5 bits | 0..31 |
-| 2 | 10 | 5 bits | 0..31 |
-| 3 | 15 | 5 bits | 0..31 |
-| 4 | 20 | 5 bits | 0..31 |
-| 5 | 25 | 5 bits | 0..31 |
-| 6 | 30 | 2 bits | 0..3 |
+A trie that shrinks below 9 keys stays subkind 1, as Clojure's
+`PersistentHashMap.without` does: demotion would churn at the 8/9
+boundary. Equal maps can therefore differ in subkind, which §6.3 and §7
+handle. A trie left with one key is a root interior holding that one
+payload.
 
-Slot index at a node with shift `s` is `(hash >> s) & 0x1F`.
+#### 5.5 Lone-key pull-up
 
-Frozen constants:
-
-```zig
-pub const MAX_TRIE_SHIFT: u5 = 30;  // shift at the deepest interior level
-pub const COLLISION_DEPTH: u8 = 7;  // total levels (0..6) before collision
-```
-
-Not configurable. 64-bit indexing would be a spec amendment.
-
-#### 5.3 Array-map → CHAMP promotion
-
-Trigger: `assoc` on a subkind-0 array-map at count 8, adding an entry
-whose key is not already present. Result: a subkind-1 CHAMP root
-with exactly 9 entries distributed into a single subkind-2 interior
-node at shift 0. The interior node may in turn split further if the
-existing-8 keys all land at the same 5-bit slot, but that's a rare
-adversarial case (probability ~1-in-2³⁵ per random key) and the
-generic assoc algorithm handles it via recursive promotion.
-
-Promotion is deterministic in the final tree shape for a given
-key-set, but the representation the user observes changes subkind
-mid-operation — which is why cross-subkind equality (§2.4) must
-work.
-
-#### 5.4 No demotion on dissoc
-
-A CHAMP root that shrinks below 8 entries via `dissoc` does NOT
-demote back to array-map. This matches Clojure's
-`PersistentHashMap.without` behavior: demotion churn at the 8↔9
-boundary would dominate real workloads that bounce around that
-threshold.
-
-Consequence: two logically-equal maps may have different subkinds
-depending on their construction history. Equality and hash handle
-this via §2.4's semantic fallback; no user-visible behavior changes.
-
-#### 5.5 Single-entry-subtree promotion on dissoc
-
-When `dissoc` empties all entries out of an interior subtree except
-for a single entry at one depth, that entry is **pulled up** into
-the parent's data area. This preserves canonicality of CHAMP node
-shape: an interior node with one entry and no children cannot exist
-anywhere but at the root.
-
-Skipping this promotion would be simpler but would break bitmap
-canonicality — two equal maps built by different paths could
-differ by a "lonely interior node" in one and a "direct data entry"
-in the other. The bitmap early-exit equality fast path would then
-produce false negatives.
+When `dissoc` leaves a subtree below the root holding one key, that key
+moves inline into the parent. If the parent's only content was that
+subtree, the parent would hold the lone key itself, so the key passes
+further up until it reaches a node with other content or the root. A
+collision node left with one key starts the same climb from the bottom.
+A subtree emptied entirely is removed from its parent's `node_bitmap`.
+Without this rule two equal maps could differ by a lone-key interior
+and iterate in different orders.
 
 #### 5.6 Dissoc at the root
 
-When `dissoc` removes the last entry of a CHAMP root, the result is
-a fresh empty array-map (subkind 0, count 0), NOT a subkind-1 root
-with a null pointer. The subkind-1 invariant is `root_node != null`;
-an empty CHAMP would violate that.
-
-When `dissoc` leaves a CHAMP root with exactly one entry, the result
-is the **same subkind-1 CHAMP root** holding one entry in a trivial
-interior node at the root position. (It does NOT demote to array-map
-per §5.4.)
+Removing a trie's last key returns a fresh empty array form, never a
+subkind-1 root with a null `root_node`.
 
 ---
 
-### 6. Equality contract
+### 6. Equality
 
-#### 6.1 Category filter (already in dispatch.zig)
+The category rule (a map is never `=` to a set, a record or a
+sequential) is dispatch's (SEMANTICS §3.3); this section is the
+same-kind comparison `equalMap`/`equalSet`.
 
-`dispatch.equal(a, b)` first checks `eqCategory(a.kind()) ==
-eqCategory(b.kind())`. Map and set are in different categories
-(associative vs set), so `(= {:a 1} #{:a 1})` is false without ever
-consulting the map/set module. This is handled entirely upstream;
-this doc inherits the guarantee.
+#### 6.3 Same-kind equality
 
-#### 6.2 Within-category dispatch
+One strategy serves every subkind pair (array/array, trie/trie,
+array/trie): the same header is equal; different counts are unequal;
+otherwise every entry `(k, v)` of `a` must be found in `b` by `mapGet`
+with an `=` value (for a set, every element found by `setContains`).
+Collision nodes need no special case. A map value may be nil, so the
+lookup must tell an absent key from a nil value (§6.6).
 
-For two Values in the `.associative` category, `dispatch.equal`
-routes through:
+#### 6.5 Key comparison
 
-```zig
-fn associativeEqual(a: Value, b: Value) bool;
-```
+Key comparison inside the module (`keyEquivalent`) tries two shortcuts
+before `elementEq`: bit identity (same tag and payload), and for two
+keywords, interned-id equality. Both are exact: two keywords are `=`
+exactly when their ids are equal.
 
-This reduces to same-kind dispatch (only `persistent_map` exists in
-the category), but the shape is the seam for any cross-kind
-associative member. Same shape for `setEqualCategory` in the set
-category.
+#### 6.6 `MapLookup`
 
-#### 6.3 Same-kind, same-subkind equality
-
-| Subkind pair | Strategy |
-|---|---|
-| (0, 0) array-map ↔ array-map | O(n²) membership: count match, then every (k,v) in `a` is found in `b` |
-| (1, 1) CHAMP ↔ CHAMP | Count match, then recursive node structural compare starting at roots; bitmap early-exit enabled |
-| (3, 3) collision ↔ collision | Count match, shared-hash match, then O(k²) semantic membership |
-
-Recursive node structural compare:
-- Bitmaps equal? If not, return false.
-- For each data slot: recursive `dispatch.equal` on key and on value.
-- For each node slot: recursive structural compare on children. If
-  the child pair is (interior, interior), recurse. If either is a
-  collision node, fall through to semantic membership compare at
-  that subtree.
-
-#### 6.4 Same-kind, cross-subkind equality
-
-Subkind pairs (0, 1) and (1, 0) — array-map vs. CHAMP root:
-
-- Count match first.
-- Then iterate the side with the cheaper iteration / smaller bound
-  (always the array-map side, since it is capped at 8 entries).
-  For each entry (k, v), call `mapGet(otherMap, k)`:
-  - `.absent` → return false.
-  - `.present = v'` → compare `v == v'` via `dispatch.equal`; unequal
-    → return false.
-- If the iteration completes, return true.
-
-Subkind pair (3, anything-other-than-3) cannot occur as a
-**top-level** comparison — subkind 3 is internal and never escapes
-as a user-facing Value. Collision nodes only appear nested inside
-CHAMP tree walks, where §6.3 handles them.
-
-**Nil-value correctness.** Nil is a legal map value. The `?Value`
-return shape would conflate "absent" with "present with nil value",
-which would break this equality strategy on maps containing nil
-values. The `MapLookup` union in §6.6 / §8 fixes this at the API
-level; this §6.4 strategy depends on that fix.
-
-#### 6.5 Keyword-keyed fast path
-
-Per PLAN §9.1: when both the search key and the candidate key are
-`.keyword`, compare via **interned-id identity**
-instead of calling through `dispatch.equal`. Scope narrowly — this
-shortcut applies only to same-kind keyword pairs. Every other key
-kind pair routes through `dispatch.equal`.
-
-Rationale: the keyword intern-id check is a single u32 compare; the
-`dispatch.equal` path goes through kind-category dispatch and a
-function-pointer indirection. For keyword-keyed maps (the dominant
-idiom — `:user/name`, `:status`, `:id`), the fast path eliminates
-the call-through in the inner loop.
-
-Correctness: two Values with `kind == .keyword` and equal payload
-ids are `=` by intern-table invariants. Two Values with
-`kind == .keyword` and different payload ids are never `=`. So the
-shortcut is equivalent to `dispatch.equal` for this kind pair, not
-an approximation.
-
-#### 6.6 `mapGet` returns `MapLookup`, not `?Value`
-
-Two distinct points:
-
-1. **Absence is normal programmatic flow**, not a contract violation
-   (unlike `vector.nth` out-of-bounds). Map lookup must not panic
-   on an absent key.
-2. **`?Value` would conflate "absent" with "present with nil value"**
-   because nil is a legal map value (nothing in SEMANTICS.md §2.6 or
-   PLAN §9.1 prohibits it, and prohibiting it would break
-   `(nil-propagation) (assoc m k nil)` idioms). The API must
-   distinguish the two cases explicitly.
-
-The API:
-
-```zig
-pub const MapLookup = union(enum) {
-    absent,
-    present: value.Value,
-};
-
-pub fn mapGet(m: value.Value, key: value.Value,
-              elementHash: *const fn (Value) u64,
-              elementEq: *const fn (Value, Value) bool) MapLookup;
-pub fn setContains(s: value.Value, elem: value.Value,
-                   elementHash: *const fn (Value) u64,
-                   elementEq: *const fn (Value, Value) bool) bool;  // set: presence-only
-```
-
-The language-surface `(get m k)` returns `nil` on absent;
-`(get m k default)` returns the default; `(contains? s e)` returns
-a bool. Those wrappers switch on the union in the stdlib natives
-(`src/stdlib.zig`).
+`mapGet` returns `MapLookup`, a union of `absent` and `present: Value`,
+not `?Value`: nil is a legal map value, and absence is ordinary flow,
+not a contract violation. `setContains` returns a bool. The stdlib
+natives map `absent` to nil or the caller's default.
 
 ---
 
-### 7. Hash contract
+### 7. Hash
 
-#### 7.1 Entry-hash function (map)
+#### 7.1 Entry hash (map)
 
-For a map entry `(k, v)`:
+`entryHash(k, v) = combineOrdered(combineOrdered(ordered_init,
+hashValue(k)), hashValue(v))`: two ordered combines, no
+`finalizeOrdered`, no domain mix (SEMANTICS §3.2). Swapping a key and
+its value changes the entry hash.
 
-```
-entry_hash(k, v) =
-    combineOrdered(
-        combineOrdered(ordered_init, dispatch.hashValue(k)),
-        dispatch.hashValue(v))
-```
+#### 7.2 Aggregate hash
 
-= `31 * (31 + hash(k)) + hash(v)` (with wrap-around u64 arithmetic).
+`hashMap` folds every entry hash, `hashSet` every element's
+`hashValue`, with `combineUnordered` from `unordered_init`, then
+`finalizeUnordered(acc, count)`. Every representation iterates every
+payload through the same fold, so the result is independent of subkind
+and layout, and `dispatch.hashValue` mixes the kind's domain byte in on
+top.
 
-This is **two `combineOrdered` calls, no `finalizeOrdered`, no
-sequential-domain mix**. SEMANTICS.md §3.2 pins this formula. The
-informal reading `h += hasheq(list(k, v))` is NOT the contract: it
-would route entries through the full sequential hash pipeline (which
-adds a `finalizeOrdered(..., 2)` + `mixKindDomain(..., 0xF0)` per
-entry), which is both more expensive and semantically wrong (the
-0xF0 sequential-domain byte has no business inside a map's internal
-entry hash).
+#### 7.5 Caching
 
-Rationale:
-- Two ordered combines keep the hash sensitive to swapped key/value
-  positions within a pair (stronger than Clojure's
-  `hash(k) XOR hash(v)`, which is commutative in k, v).
-- No inner finalize: the outer map-level `finalizeUnordered(..., count)`
-  already disambiguates empty-vs-populated and count-differing maps.
-- No inner domain mix: the outer `mixKindDomain(..., 0xF1)` applied
-  by `dispatch.hashValue` at the map level is the correct and only
-  domain fold.
-
-#### 7.2 Aggregate hash (map)
-
-```
-hashMap(h, entryIter):
-    var acc: u64 = hash.unordered_init;
-    while (iter.next()) |entry| {
-        acc = hash.combineUnordered(acc, entry_hash(entry.key, entry.value));
-    }
-    return hash.finalizeUnordered(acc, count);
-```
-
-The final `finalizeUnordered(acc, count)` folds in the entry count to
-disambiguate empty vs. non-empty cases and isolate count-differing
-maps into distinct hash regions.
-
-#### 7.3 Aggregate hash (set)
-
-Same shape, without the (k, v) inner combine:
-
-```
-hashSet(h, elementIter):
-    var acc: u64 = hash.unordered_init;
-    while (iter.next()) |elem| {
-        acc = hash.combineUnordered(acc, dispatch.hashValue(elem));
-    }
-    return hash.finalizeUnordered(acc, count);
-```
-
-#### 7.4 Domain mixing
-
-`dispatch.hashValue` applies `mixKindDomain(base,
-domainByteForKind(k))` at the top level. For maps, this fold uses
-`0xF1` (associative category); for sets, `0xF2` (set category).
-Both domain bytes are already declared as constants in `dispatch.zig`.
-Two maps with the same entries — regardless of whether they're
-array-map, CHAMP, or a mix across the comparison — produce identical
-final hashes because:
-1. Every entry's hash comes from the same `dispatch.hashValue` path.
-2. Every representation uses `combineUnordered` (order-independent).
-3. The same category domain byte folds in at the end.
-
-This is the bedrock `(= a b) ⇒ (hash a) = (hash b)` invariant in
-action across subkinds.
-
-#### 7.5 Hash caching
-
-Per HEAP.md's cache-if-nonzero rule: a computed `u32` of zero is not
-written to `HeapHeader.hash` (uncomputed sentinel). The cache is the
-domain-mixed final hash value (actually the u32 truncation of it)
-per the pattern established by string and bignum.
-
-For map/set roots, the cached hash accelerates repeated `hash(m)`
-calls. For internal interior and collision nodes, hash caching is
-**not** beneficial — those nodes aren't user-addressable and their
-hashes are recomputed as part of root-level `hashMap` traversal
-anyway. Interior/collision node bodies therefore do not cache hash;
-the root body caches via the standard `HeapHeader.hash` slot.
+`hashMap` and `hashSet` return the aggregate truncated to `u32` and
+cache it in the root header when nonzero (the HEAP.md cache rule).
+Interior and collision nodes cache nothing.
 
 ---
 
-### 8. Public API
+### 8. Public API (`src/coll/champ.zig`)
 
-Lives in `src/coll/champ.zig`. Map and set operations are prefixed for
-clarity because both live in the same module.
+`ElementHash` is `*const fn (Value) u64` and `ElementEq` is `*const fn
+(Value, Value) bool`; callers pass `&dispatch.hashValue` and
+`&dispatch.equal` (§9). `h` is a root header.
 
-Every operation that must hash or compare keys takes the hash and
-equality functions as explicit parameters (`elementHash` /
-`elementEq`); callers pass `&dispatch.hashValue` / `&dispatch.equal`.
-The module never imports `dispatch.zig` directly.
+| Map | Set | Contract |
+|---|---|---|
+| `mapEmpty(heap)` | `setEmpty(heap)` | a fresh empty array form |
+| `mapFromEntries(heap, entries, eh, ee)` | `setFromElements(heap, elems, eh, ee)` | §8.1 |
+| `mapAssoc(heap, m, k, v, eh, ee)` | `setConj(heap, s, e, eh, ee)` | §8.1 |
+| `mapDissoc(heap, m, k, eh, ee)` | `setDisj(heap, s, e, eh, ee)` | §8.1 |
+| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool` | §6.6 |
+| `mapFind(m, k, eh, ee) ?Entry` | | The stored entry, its key as the map holds it (`find`) |
+| `mapCount(m)`, `mapIter(m)` → `MapIter` | `setCount(s)`, `setIter(s)` → `SetIter` | `next()` gives `?Entry` / `?Value` in iteration order (§8.1) |
+| `hashMap(h, eh)` | `hashSet(h, eh)` | §7 |
+| `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.3; header arguments |
+| `traceMap(h, visitor)` | `traceSet(h, visitor)` | GC trace: every key and value, every internal node through `markInternal` |
+| `valueFromMapHeader(h)` | `valueFromSetHeader(h)` | the Value for a root header (`docs/TRANSIENT.md` §8) |
+| `mapCollisionCount(m, hash32) ?u32` | `setCollisionCount(s, hash32) ?u32` | tests: the collision node's count along `hash32`, or null (§12.3) |
 
-```zig
-const ElementHash = *const fn (value.Value) u64;
-const ElementEq = *const fn (value.Value, value.Value) bool;
+`canonicalTrie(v, eh)` takes a map or a set (§4.3); `Entry`,
+`MapLookup`, `MAX_TRIE_SHIFT` (30), `array_map_max` (8) and the subkind
+constants are public. Every constructor can fail only with
+`error.OutOfMemory`.
 
-// -- Map --
-pub const Entry = extern struct { key: value.Value, value: value.Value };  // 32 bytes
+#### 8.1 Update semantics
 
-pub const MapLookup = union(enum) {
-    absent,
-    present: value.Value,
-};
+- `mapAssoc` of a present key: a bit-identical value returns `m`
+  itself; any other value, even an `=` one, is stored, the key object
+  already in the map kept (Clojure's behaviour) and the count
+  unchanged. `setConj` of a present element returns `s`, keeping the
+  stored element.
+- `mapAssoc`/`setConj` of a new key: an array form below 8 appends; at
+  8 it promotes (§5.3); a trie inserts along the key's path.
+- `mapDissoc`/`setDisj` of an absent key returns the argument itself.
+  Removing a present key applies §5.4 to §5.6.
+- `mapFromEntries`/`setFromElements` return what a left fold of
+  `mapAssoc`/`setConj` from empty returns (same subkind, same trie,
+  same iteration order) and never fail on duplicates: a later entry's
+  value wins, the first key object and its position stay. The payloads
+  are sorted by slot path, equal keys merged, and each node allocated
+  once.
+- **Iteration order.** An array form iterates in association order. A
+  trie iterates depth first from the root: each node's payloads in
+  ascending slot order, then its children in their stored, descending
+  slot order; a collision node's payloads in association order.
 
-pub fn mapEmpty(heap: *Heap) !value.Value;
-pub fn mapFromEntries(heap: *Heap, entries: []const Entry, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn mapAssoc(heap: *Heap, m: value.Value, key: value.Value, val: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn mapDissoc(heap: *Heap, m: value.Value, key: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn mapGet(m: value.Value, key: value.Value, elementHash: ElementHash, elementEq: ElementEq) MapLookup;
-pub fn mapCount(m: value.Value) usize;
-pub fn mapIsEmpty(m: value.Value) bool;
+#### 8.2 Nil
 
-// -- Set --
-pub fn setEmpty(heap: *Heap) !value.Value;
-pub fn setFromElements(heap: *Heap, elems: []const value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn setConj(heap: *Heap, s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn setDisj(heap: *Heap, s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) !value.Value;
-pub fn setContains(s: value.Value, elem: value.Value, elementHash: ElementHash, elementEq: ElementEq) bool;
-pub fn setCount(s: value.Value) usize;
-pub fn setIsEmpty(s: value.Value) bool;
+Nil is a legal key, a legal value and a legal set element: `(assoc {}
+nil nil)` is `{nil nil}`, `(contains? {nil nil} nil)` and `(contains?
+#{nil} nil)` are true. Its hash and equality come from dispatch; the
+module has no nil case.
 
-// -- Dispatch entry points (called by dispatch.zig) --
-pub fn hashMap(h: *HeapHeader, elementHash: ElementHash) u64;
-pub fn hashSet(h: *HeapHeader, elementHash: ElementHash) u64;
-pub fn equalMap(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool;
-pub fn equalSet(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool;
+#### 8.3 Panics
 
-// -- Iterators for hash accumulation and seq --
-pub const MapIter = struct { ... };
-pub const SetIter = struct { ... };
-pub fn mapIter(m: value.Value) MapIter;
-pub fn setIter(s: value.Value) SetIter;
-
-// -- GC trace entry points (called by gc.zig) --
-pub fn traceMap(h: *HeapHeader, visitor: anytype) void;
-pub fn traceSet(h: *HeapHeader, visitor: anytype) void;
-
-// -- Trie introspection for tests (§12.3) --
-pub fn mapCollisionCount(m: value.Value, hash32: u32) ?u32;
-pub fn setCollisionCount(s: value.Value, hash32: u32) ?u32;
-```
-
-#### 8.1 Error set and semantic details
-
-- All constructing / updating functions may return `error.OutOfMemory`
-  from `heap.alloc`. No other error paths.
-- `mapFromEntries` on an input with duplicate keys does NOT error —
-  **later entry wins**. This is Clojure's
-  runtime behavior for programmatically-built maps with duplicate
-  keys, distinct from the reader's static duplicate-literal-key
-  rejection. `setFromElements` same: duplicate elements are
-  deduplicated.
-- `mapAssoc` on an existing key:
-  - if the existing value is `=` to the new value, return the same
-    map pointer (identity preserved; no allocation). Clojure's
-    behavior; avoids churn on idempotent updates.
-  - otherwise, replace the value; count unchanged; path copied as
-    needed.
-- `mapAssoc` on an absent key:
-  - array-map with count < 8: append the entry; count +1.
-  - array-map with count == 8: promote to CHAMP root; count +1.
-  - CHAMP: recurse down the trie path; count +1.
-- `mapDissoc` on an absent key: return the same map pointer (no
-  allocation). Clojure's behavior.
-- `mapDissoc` on a present key: remove the entry; count -1; apply
-  single-entry-subtree promotion (§5.5) and empty-subtree collapse
-  (trap #4) as needed; if result count is 0, return a fresh subkind-0
-  empty array-map.
-
-#### 8.2 Nil-as-key / nil-as-value / nil-as-element (frozen)
-
-- **Nil is a legal map key.** SEMANTICS.md §3.2 defines `hash(nil) =
-  0xB01DFACE`; `dispatch.equal(nil, nil)` is true. The hash and
-  equality functions return deterministic, consistent values for nil
-  in both key and value positions; no special-case logic is needed in
-  the map implementation.
-- **Nil is a legal map value.** Required for the nil-propagation
-  rule `(assoc m k nil)` to produce a map containing `(k, nil)`. The
-  `MapLookup` union in §6.6 / §8 is what makes lookup's
-  present-with-nil-value distinguishable from absent.
-- **Nil is a legal set element.** `(conj #{} nil)` produces `#{nil}`;
-  `(contains? #{nil} nil)` is true.
-
-#### 8.3 Panic contracts
-
-- `mapGet(m, k)` returns a `MapLookup`; never panics on absence (for
-  well-formed maps). Panics via safe-assert only on a non-map Value
-  or a malformed internal subkind.
-- `mapCount(m)`, `mapIsEmpty(m)` — safe-assert the Value is a map
-  kind; panic otherwise (caller bug).
-- `mapAssoc` / `mapDissoc` on a non-map Value panic. Language surface
-  provides the nil-propagation layer (`(assoc nil k v) → {k v}`, in
-  the `assoc` native in `src/stdlib.zig`).
+`mapGet`, `mapCount`, `mapAssoc` and `mapDissoc` (and their set
+counterparts) assert a map (set) Value of subkind 0 or 1 in safe
+builds; an absent key is never a panic. The nil and wrong-kind cases of
+the language surface are the stdlib natives'.
 
 ---
 
-### 9. Dispatch integration
+### 9. Dispatch
 
-`dispatch.zig` integrates the module at three points:
-
-1. Two kind arms in `heapHashBase`:
-
-```zig
-.persistent_map => champ.hashMap(h, &hashValue),
-.persistent_set => champ.hashSet(h, &hashValue),
-```
-
-2. Two category-equality helpers paralleling `sequentialEqual`:
-
-```zig
-fn associativeEqual(a: Value, b: Value) bool;
-fn setEqualCategory(a: Value, b: Value) bool;
-```
-
-These reduce to same-kind dispatch because each category has one
-kind. The `dispatch.equal` switch routes:
-
-```zig
-.associative => return associativeEqual(a, b),
-.set => return setEqualCategory(a, b),
-```
-
-(`heapEqual` also carries `.persistent_map` / `.persistent_set` arms
-calling `champ.equalMap` / `champ.equalSet` for the same-kind path.)
-
-3. `eqCategory`, `domainByteForKind`, the category domain-byte
-constants, and the exhaustive `eqCategory + domainByteForKind` table
-test all include map and set rows.
+`dispatch` calls `hashMap`/`hashSet` from `heapHashBase` and
+`equalMap`/`equalSet` from `equal`; the category and domain rules are
+SEMANTICS §3.3. `champ.zig` never imports `dispatch`: hashing and
+comparison of arbitrary Values arrive as the `elementHash`/`elementEq`
+callbacks, so the module is a one-way terminal of the import graph.
 
 ---
 
 ### 10. Implementation traps
 
-Checklist of classic mistakes — tests must cover each.
-
-1. **Bitmap popcount arithmetic.** Data position for slot `i` is
-   `popCount(data_bitmap & ((1 << i) - 1))`. Off-by-one here produces
-   silent wrong lookups for every slot but the first.
-2. **Data and node bitmaps disjoint invariant.** `data_bitmap &
-   node_bitmap == 0`. Violating it means a slot is interpreted two
-   ways; assoc may silently drop or duplicate entries.
-3. **Single-entry-subtree promotion on dissoc.** Skipping this breaks
-   CHAMP canonicality as covered in §5.5.
-4. **Empty-subtree collapse on dissoc.** A subtree whose last entry
-   was dissoc'd must be removed from the parent (clear the node-bitmap
-   bit) rather than left as a dangling empty interior node.
-5. **Array-map duplicate-key overwrite.** `assoc` on an existing key
-   replaces the value in place; count unchanged.
-6. **Array-map same-value short-circuit.** `assoc` where the existing
-   value is already `=` to the new value returns the same map pointer
-   without allocating.
-7. **Promotion boundary.** `assoc` on count=8 array-map adding a
-   new key produces a CHAMP root, not a 9-entry array-map.
-8. **Promotion preserves multiset equality.** The 9 entries of the
-   promoted CHAMP must be the same entries (by `=`) as the pre-promotion
-   array-map plus the new (k, v), in any order.
-9. **Collision-node creation path.** When two keys with identical
-   32-bit hashes collide at `shift >= MAX_TRIE_SHIFT`, create a
-   subkind-3 node holding both. Do NOT attempt to split the hashes
-   further — there are no more bits.
-10. **Collision-node lookup short-circuit on shared_hash.** Compare
-    the search key's hash against `shared_hash` first; if unequal,
-    the key cannot be in this collision bucket regardless of `=`.
-11. **`mapGet` on absent key in CHAMP.** Must walk slot-index path;
-    must NOT return `null` early just because a slot is empty — the
-    key might be in a collision node nested deeper.
-12. **`_pad` bytes never hashed / compared.** The same discipline as
-    `bignum.zig` applies to array-map and CHAMP root.
-13. **Hash cache discipline.** Cache only nonzero u32 results at the
-    root; never cache on interior/collision subkind bodies.
+1. **Bitmap rank.** Payloads count set bits below the slot; children
+   count set bits above it (§4.3). An off-by-one misroutes every slot
+   but the first.
+2. **Disjoint bitmaps.** A slot set in both bitmaps is read two ways
+   and silently drops or duplicates entries.
+3. **Dissoc canonicality.** Skipping the lone-key pull-up or leaving an
+   emptied subtree in the parent breaks §2.2 (§5.5).
+4. **Collision placement.** Two keys still sharing a slot at shift 30
+   go into a collision node; there are no more bits to split on.
+5. **Absence in a trie.** A lookup follows the child pointer of an
+   occupied node slot to its end; only an empty slot, a payload with a
+   different key, or a collision node with another `shared_hash` means
+   absent.
 
 ---
 
-### 11. Map / set parallelism in the module
+### 11. One trie for both kinds
 
-`src/coll/champ.zig` is organized as two parallel parts: the map
-kind first, then the set kind reusing the same CHAMP machinery.
-
-- The set side's body types are **type aliases** of the map side's
-  header structs (`ChampSetRootBody = ChampRootBody`,
-  `SetInteriorHeader = ChampInteriorHeader`,
-  `SetCollisionHeader = ChampCollisionHeader`). Bitmap semantics,
-  subkind numbering, promotion, and dissoc rules are identical.
-- Entry storage differs: 16-byte `Value` per set element vs. 32-byte
-  `Entry` per map key-value pair. Every payload-size computation
-  selects the width by kind.
-- The interior-node clone helpers and recursive assoc / dissoc /
-  lookup operations exist in a map version and a set version with
-  the same structure (module-internal; see §14).
-- All three equality categories (`.sequential`, `.associative`,
-  `.set`) have concrete runtime members and property-test coverage
-  of the `(= a b) ⇒ (hash a) = (hash b)` invariant (§12).
+`Trie(P, kind)` is generic over the payload: `MapTrie` is
+`Trie(Entry, .persistent_map)`, `SetTrie` is `Trie(Value,
+.persistent_set)`. The payload type decides how its key is read,
+whether a store over an equal key changes anything (a set's never
+does; a map's does unless the value is bit-identical), and how it
+hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
+dissoc, the builder, the iterator and the trace are shared, and the
+public `map*`/`set*` functions are thin wrappers over the two
+instances. Every path copy goes through one primitive, `withSlot`: a
+copy of an interior with one slot made empty, a payload or a child.
+Lookup is an iterative descent; insert and remove recurse at most
+eight levels.
 
 ---
 
-### 12. Testing strategy
+### 12. Tests
 
-#### 12.1 The cross-category invariant tests
+#### 12.1 Unit tests
 
-The parallel of `test/prop/vector.zig` V3 for associative and set:
+Inline tests in `champ.zig` cover the body layouts, the array form
+through 0..8 entries, promotion at 9 (and none on a duplicate key at
+8), no demotion, the root dissoc, the same-pointer short-circuits, the
+kept key object, nil keys, values and elements, the builders against
+`assoc`/`conj` folds, insertion-order-independent hashing, cross-subkind
+equality, the keyword shortcut, the bitmap ranks, lone-key pull-up
+through every level and out of a collision node, and an immediate key
+bypassing the hash callback.
 
-**Build-order independence (M11; inline `hashMap` / `hashSet`
-insertion-order tests).** Random entry sequences built in different
-`assoc` orders must compare `=` and hash equal. Sizes vary across the
-array-map → CHAMP boundary.
+#### 12.2 Set properties
 
-**Cross-subkind (M6, S5).** Force one map to stay subkind 0
-(count ≤ 8), force another of the same entries to be subkind 1 via
-promote-then-dissoc. Assert `=` and hash equal. Same for sets.
+S1 to S9 in `test/prop/champ.zig` parallel M1 to M10 over sets (S2b is
+the set side of M2b over 20000 string elements; S5 compares an
+array-set with a promoted-then-shrunk trie).
 
-#### 12.2 Same-category, different-kind
+#### 12.3 Collision fixtures
 
-`.associative` has one member. If another kind joins (a sorted map),
-the equivalent of `test/prop/vector.zig` V3's list↔vector cross-kind
-test slots in via the `associativeEqual` helper.
+The collision tests key by heap strings and pin the low 32 bits of
+their hash to one value through the `elementHash` callback (§5.1).
+Every one asserts through `mapCollisionCount`/`setCollisionCount`,
+which descend along a 32-bit hash and return the collision node's count
+or null, that its keys reached the collision node, so a fixture cannot
+degrade into a cleanly partitioned trie unnoticed.
 
-#### 12.3 Structural cliff edges
+#### 12.4 Map properties
 
-The counts at which representation changes, and which boundary
-tests target:
-
-- count 0, 1, 7, 8 (array-map only)
-- count 9 (first promotion; single interior node)
-- count 32, 33 (bitmap boundary within a node)
-- count 1024 (level-2 first promotion; trie depth 2)
-- Hash-collision stress: string keys all hashing to the same 32-bit
-  value (a hash-colliding test fixture: low 32 bits pinned to
-  `0xDEAD_BEEF`; heap keys because the callback is consulted for
-  heap keys only, §5.1) forcing collision nodes. `mapCollisionCount`
-  / `setCollisionCount` descend the trie along a 32-bit hash and
-  report the entry count of the collision node at the bottom, or
-  `null` when the descent leaves the trie earlier; every collision
-  test asserts the count so the fixture cannot degrade into a
-  cleanly partitioned trie without failing.
-
-#### 12.4 Property tests (`test/prop/champ.zig`)
-
-Map:
-
-- M1. `mapFromEntries` + `mapGet` round-trip: every inserted (k, v)
-  looks up to exactly `v`; absent keys return `.absent`.
-- M2. `mapAssoc` + `mapDissoc` random sequences on random starting
-  maps preserve the entry multiset minus dissoc'd keys.
-- M3. `mapAssoc` replace-value: associng `(k, v1)` then `(k, v2)`
-  yields `mapGet(m, k) == v2` with unchanged count.
-- M4. `assoc` same-value short-circuit returns the same map pointer.
-- M5. Equality laws over random maps: reflexive, symmetric, transitive.
-- M6. Cross-subkind hash equivalence (A2's setup across 500 random
-  maps).
-- M7. Cross-category never-equal: a map is never `=` to any
-  non-associative Value; hashes distinct.
-- M8. Persistent immutability: `mapAssoc(m1, k, v)` does not mutate
-  `m1`; `mapGet(m1, k)` returns its original value.
-- M9. Keyword-keyed fast path correctness: maps keyed entirely by
-  keywords give the same results as maps keyed by other kinds — the
-  fast path is an optimization, not a semantic change.
-- M10. Collision-bucket stress: synthetic collision fixture builds
-  a map with 5+ collision-bucket entries, asserts `mapGet` finds
-  each, `mapDissoc` removes each, `=` and hash invariants hold.
-- M11. `=` ⇒ `hashValue`-equal over random map pairs built in two
-  insertion orders.
-
-Set: S1–S9, parallel over set operations (S5 is the cross-subkind
-array-set vs. CHAMP receipt).
-
----
-
-### 13. Outside this module, explicitly
-
-Listed so nothing silently slips the scope boundary.
-
-- **Transients.** `src/coll/transient.zig`, spec `docs/TRANSIENT.md`.
-- **`merge` / `merge-with` / `update` / `select-keys` / `reduce-kv` /
-  `group-by` / etc.** Stdlib material composing over `assoc` /
-  `dissoc` / `get` (`src/stdlib.zig` natives and
-  `src/stdlib/core.nx`).
-- **Set operators** (`union` / `intersection` / `difference`). Not
-  implemented anywhere.
-- **SIMD-accelerated bitmap operations** (T2.1 per PLAN §19.6). Not
-  implemented; `champ.zig` uses scalar popcount.
-- **Branchless small-bitmap lookup** (T2.8). Not implemented.
-- **Zero-copy map nodes from emdb pages** (T2.2). Not implemented.
-- **Cross-kind associative members** (sorted-map or similar). None
-  exist; adding one requires a spec amendment.
-
----
-
-### 14. What CHAMP.md does not cover
-
-- **`champ.zig` implementation details** — popcount rank helpers,
-  recursive node construction helpers, layout access functions. Those
-  are module-internal and documented via inline comments, not here.
-- **Serialization wire format** — lives in `docs/CODEC.md`. Map and
-  set are on the frozen-serializable list (PLAN §23 #25).
-- **Language-surface `seq` API** — PLAN §6.7. The `MapIter` /
-  `SetIter` types in §8 are the runtime-internal iteration seam;
-  user-facing `(seq m)` / `(keys m)` / `(vals m)` are stdlib natives
-  in `src/stdlib.zig` built on them.
-- **Print/read round-trip** — the reader parses `{:a 1}` and
-  `#{1 2}` into Form trees; the Value→textual direction lives in
-  `src/format.zig` (`formatMap` / `formatSet`).
-- **Metadata** — maps and sets are metadata-attachable per
-  SEMANTICS.md §7. The `HeapHeader.meta` slot is the storage; no
-  special map/set logic. Metadata never affects equality or hash
-  (PLAN §23 #12).
+`test/prop/champ.zig`: M1 `mapFromEntries`/`mapGet` round-trip; M2
+random `assoc`/`dissoc` against a model; M2b the canonical layout
+(`canonicalTrie`) and equal iteration order at 2000 and 30000 keys
+built in different orders; M3 replace-value; M4 the same-value
+short-circuit returns the same pointer; M5 equality laws; M6 an
+array-map against a promoted-then-shrunk trie, `=` and hash-equal; M7
+never `=` to a non-map; M8 persistence; M9 keyword keys against fixnum
+keys; M10 collision-node stress with five or more keys; M11 `=`
+implies equal `hashValue` across insertion orders.

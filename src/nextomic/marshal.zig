@@ -25,10 +25,10 @@
 //!     or of a vector, list or set; null for any other kind.
 
 const std = @import("std");
-const value = @import("value");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
+const value = @import("../value.zig");
+const list_mod = @import("../coll/list.zig");
+const vector_mod = @import("../coll/vector.zig");
+const champ = @import("../coll/champ.zig");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const db_mod = @import("db.zig");
@@ -235,8 +235,8 @@ pub fn cellOf(read: *Read, arena: Allocator, v: Val) !Cell {
 
 const testing = std.testing;
 const TestConn = db_mod.TestConn;
-const Heap = @import("heap").Heap;
-const string_mod = @import("string");
+const Heap = @import("../heap.zig").Heap;
+const string_mod = @import("../string.zig");
 const boot = @import("store.zig").boot;
 
 test "marshalling both ways for every value type" {

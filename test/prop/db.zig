@@ -1,11 +1,11 @@
 //! test/prop/db.zig — randomized round-trip property tests for
-//! `src/db.zig` + emdb integration. Covers PLAN §20.2 test #6
-//! (emdb round-trip).
+//! `src/db.zig` + emdb integration: values written through emdb
+//! read back equal.
 //!
 //! Properties (DB.md §10):
 //!
-//!   D1. **10k random Values across 5 named trees** (PLAN §20.2
-//!       test #6): every trial writes a random Value to a
+//!   D1. **10k random Values across 5 named trees**: every trial
+//!       writes a random Value to a
 //!       `(tree_name, key_bytes)` pair selected from 5 named trees.
 //!       After commit, a fresh read transaction pulls each entry
 //!       back. Assert:
@@ -31,18 +31,21 @@
 //!       tree must return its own value.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const intern_mod = @import("intern");
-const string = @import("string");
-const bignum = @import("bignum");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const codec_mod = @import("codec");
-const db = @import("db");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const intern_mod = nx.intern;
+const string = nx.string;
+const bignum = nx.bignum;
+const champ = nx.champ;
+const codec_mod = nx.codec;
+const db = nx.db;
+const dispatch = nx.dispatch;
+const harness = @import("harness");
+
+/// Smaller values than the codec suite's: shorter names and
+/// collections, and more leaves at depth three.
+const gen_shape: harness.Gen.Shape = .{ .name_max = 8, .list_max = 5, .vector_max = 8, .map_max = 6, .set_max = 6, .deep_leaf = 5 };
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -62,17 +65,19 @@ const tree_names = [_][]const u8{
 // Temp DB path helpers
 // =============================================================================
 
+/// A store path in a fresh directory under `.zig-cache/tmp/`, so
+/// concurrent runs never share a file; `cleanupDb` removes the
+/// directory with the store in it.
 fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
-    const path = try std.fmt.allocPrintSentinel(allocator, "test_nexis_dbprop_{s}.emdb", .{suffix}, 0);
-    cleanupDb(path);
-    return path;
+    var tmp = std.testing.tmpDir(.{});
+    tmp.dir.close(std.testing.io);
+    tmp.parent_dir.close(std.testing.io);
+    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    _ = std.c.unlink(path.ptr);
-    var buf: [256]u8 = undefined;
-    const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
-    _ = std.c.unlink(lock_path.ptr);
+    const dir = std.fs.path.dirname(path) orelse return;
+    std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
 // =============================================================================
@@ -96,125 +101,13 @@ const TestCtx = struct {
     }
 };
 
-const Gen = struct {
-    ctx: *TestCtx,
-    r: std.Random,
-
-    fn scalar(self: *Gen) !Value {
-        const pick = self.r.uintLessThan(u8, 10);
-        return switch (pick) {
-            0 => value.nilValue(),
-            1 => value.fromBool(true),
-            2 => value.fromBool(false),
-            3 => value.fromFixnum(self.r.intRangeAtMost(i64, value.fixnum_min, value.fixnum_max)).?,
-            4 => blk: {
-                var c: u21 = self.r.intRangeAtMost(u21, 0, 0x10FFFF);
-                if (c >= 0xD800 and c <= 0xDFFF) c = 'a';
-                break :blk value.fromChar(c).?;
-            },
-            5 => value.fromFloat(self.r.float(f64)),
-            6 => blk: {
-                var buf: [16]u8 = undefined;
-                const n = self.r.intRangeAtMost(usize, 1, 8);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 'a', 'z');
-                break :blk try self.ctx.interner.internKeywordValue(buf[0..n]);
-            },
-            7 => blk: {
-                var buf: [16]u8 = undefined;
-                const n = self.r.intRangeAtMost(usize, 1, 8);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 'A', 'Z');
-                break :blk try self.ctx.interner.internSymbolValue(buf[0..n]);
-            },
-            8 => blk: {
-                var buf: [32]u8 = undefined;
-                const n = self.r.uintLessThan(usize, 20);
-                for (buf[0..n]) |*b| b.* = self.r.intRangeAtMost(u8, 32, 126);
-                break :blk try string.fromBytes(&self.ctx.heap, buf[0..n]);
-            },
-            9 => blk: {
-                const high: u64 = self.r.int(u64) | (@as(u64, 1) << 63);
-                const neg = self.r.boolean();
-                break :blk try bignum.fromLimbs(&self.ctx.heap, neg, &[_]u64{ self.r.int(u64), high });
-            },
-            else => unreachable,
-        };
-    }
-
-    fn container(self: *Gen, depth: u8) (std.mem.Allocator.Error || error{
-        InternTableFull,
-        EmptyName,
-        InvalidListTail,
-        Overflow,
-    })!Value {
-        if (depth == 0) return try self.scalar();
-
-        // Bias toward leaves.
-        const leaf_prob: u8 = if (depth >= 2) 5 else 7;
-        if (self.r.uintLessThan(u8, 10) < leaf_prob) return try self.scalar();
-
-        const pick = self.r.uintLessThan(u8, 4);
-        return switch (pick) {
-            0 => try self.makeList(depth - 1),
-            1 => try self.makeVector(depth - 1),
-            2 => try self.makeMap(depth - 1),
-            3 => try self.makeSet(depth - 1),
-            else => unreachable,
-        };
-    }
-
-    fn makeList(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 5);
-        const elems = try std.testing.allocator.alloc(Value, n);
-        defer std.testing.allocator.free(elems);
-        for (elems) |*slot| slot.* = try self.container(depth);
-        return try list_mod.fromSlice(&self.ctx.heap, elems);
-    }
-
-    fn makeVector(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 8);
-        var v = try vector_mod.empty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            v = try vector_mod.conj(&self.ctx.heap, v, try self.container(depth));
-        }
-        return v;
-    }
-
-    fn makeMap(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 6);
-        var m = try champ.mapEmpty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const key = try self.scalar();
-            const val = try self.container(depth);
-            m = try champ.mapAssoc(&self.ctx.heap, m, key, val, &dispatch.hashValue, &dispatch.equal);
-        }
-        return m;
-    }
-
-    fn makeSet(self: *Gen, depth: u8) !Value {
-        const n = self.r.uintLessThan(usize, 6);
-        var s = try champ.setEmpty(&self.ctx.heap);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            _ = depth;
-            s = try champ.setConj(&self.ctx.heap, s, try self.scalar(), &dispatch.hashValue, &dispatch.equal);
-        }
-        return s;
-    }
-};
-
 // =============================================================================
-// D1. 10k Values across 5 named trees (PLAN §20.2 test #6)
-//
-// Partitioned into 5 × 2000-trial sub-tests so that a single sub-
-// test's runtime stays reasonable (matches the codec C1 shape).
-// Each sub-test is independent — fresh DB file, fresh Connection,
-// fresh heap, fresh interner, fresh PRNG seed offset.
+// D1. 10k Values across 5 named trees
 // =============================================================================
 
-fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
-    const path = try tmpDbPath(std.testing.allocator, suffix);
+test "D1: 10000 random Values across 5 trees read back equal after commit" {
+    const trials: usize = 10_000;
+    const path = try tmpDbPath(std.testing.allocator, "d1");
     defer std.testing.allocator.free(path);
     defer cleanupDb(path);
 
@@ -228,10 +121,10 @@ fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
         path.ptr,
         .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
     );
-    defer db.close(&conn);
+    defer db.shutdown(&conn);
 
-    var prng = std.Random.DefaultPrng.init(prng_seed +% seed_offset);
-    var gen = Gen{ .ctx = &ctx, .r = prng.random() };
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
+    var gen = harness.Gen{ .heap = &ctx.heap, .interner = &ctx.interner, .allocator = std.testing.allocator, .r = prng.random(), .shape = gen_shape };
 
     // Pre-generate the values and their (tree_idx, key_bytes) slots
     // so we can replay the reads after commit.
@@ -295,22 +188,6 @@ fn runD1Partition(suffix: []const u8, seed_offset: u64, trials: usize) !void {
     }
 }
 
-test "D1a: 2000 random Values across 5 trees (partition 1/5)" {
-    try runD1Partition("d1a", 1, 2000);
-}
-test "D1b: 2000 random Values across 5 trees (partition 2/5)" {
-    try runD1Partition("d1b", 2, 2000);
-}
-test "D1c: 2000 random Values across 5 trees (partition 3/5)" {
-    try runD1Partition("d1c", 3, 2000);
-}
-test "D1d: 2000 random Values across 5 trees (partition 4/5)" {
-    try runD1Partition("d1d", 4, 2000);
-}
-test "D1e: 2000 random Values across 5 trees (partition 5/5, 10k in total)" {
-    try runD1Partition("d1e", 5, 2000);
-}
-
 // =============================================================================
 // D2. Reopen-connection readback
 //
@@ -349,10 +226,10 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
             path.ptr,
             .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
         );
-        defer db.close(&conn);
+        defer db.shutdown(&conn);
 
         var prng = std.Random.DefaultPrng.init(prng_seed +% 0x42);
-        var gen = Gen{ .ctx = &ctx, .r = prng.random() };
+        var gen = harness.Gen{ .heap = &ctx.heap, .interner = &ctx.interner, .allocator = std.testing.allocator, .r = prng.random(), .shape = gen_shape };
 
         var wtxn = try db.beginWrite(&conn);
 
@@ -403,7 +280,7 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
             path.ptr,
             .{ .allocator = std.testing.allocator, .mapSize = 64 * 1024 * 1024 },
         );
-        defer db.close(&conn);
+        defer db.shutdown(&conn);
 
         var rtxn = try db.beginRead(&conn);
         defer db.abortRead(&rtxn);
@@ -503,7 +380,7 @@ test "D4: same key in every tree returns its own value (no cross-contamination)"
         path.ptr,
         .{ .allocator = std.testing.allocator },
     );
-    defer db.close(&conn);
+    defer db.shutdown(&conn);
 
     var wtxn = try db.beginWrite(&conn);
     for (tree_names, 0..) |tn, i| {

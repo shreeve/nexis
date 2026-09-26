@@ -11,14 +11,14 @@
 //! asks for.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const vector_mod = @import("vector");
-const codec_mod = @import("codec");
-const dispatch = @import("dispatch");
-const champ = @import("champ");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const intern_mod = @import("../intern.zig");
+const string_mod = @import("../string.zig");
+const vector_mod = @import("../coll/vector.zig");
+const codec_mod = @import("../codec.zig");
+const dispatch = @import("../dispatch.zig");
+const champ = @import("../coll/champ.zig");
 const key = @import("key.zig");
 
 const Allocator = std.mem.Allocator;

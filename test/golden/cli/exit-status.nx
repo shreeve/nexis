@@ -1,0 +1,4 @@
+; `(exit n)` ends the process with status n; nothing after it runs.
+(println "before")
+(try (exit 3) (finally (println "not reached")))
+(println "after")

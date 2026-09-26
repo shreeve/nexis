@@ -1,76 +1,67 @@
-//! bench/main.zig — nexis baseline benchmark suite.
+//! bench/main.zig — the nexis benchmark suite.
 //!
-//! Driver `main()` that runs every benchmark in this file,
-//! prints a human-readable table to stdout, and writes JSON to
-//! `--out <path>` (default `bench/baseline.json` under the repo
-//! root).
+//! `main()` runs every benchmark of the selected categories and
+//! prints a table to stdout; with `--out <path>` it also writes the
+//! JSON report there.
 //!
-//! Categories (BENCH.md §2):
-//!   - scalar: fixnum / float arithmetic, keyword identity hash,
-//!     raw xxHash3 over bytes.
+//! Categories, in the order they run (docs/BENCH.md §10):
+//!   - scalar: fixnum / float arithmetic, fixnum, keyword and string
+//!     hashes, raw xxHash3 over bytes.
 //!   - collection-construction: list / vector / map / set built
 //!     by N-fold conj/assoc from empty.
-//!   - collection-lookup-update: random lookup on a pre-built
-//!     collection of size N.
-//!   - transient-construction: same as collection-construction,
-//!     but using transient wrappers + `persistent!`.
-//!   - codec: encode / decode for representative Values.
-//!   - db-integrated: emdb put / get round-trip cost (PLAN §19
-//!     "database-integrated" category).
+//!   - transient-construction: the same through transients and
+//!     `persistent!`.
+//!   - collection-lookup-update: lookups on a pre-built collection
+//!     of size N.
+//!   - compiler: compiling `(+ 1 2)`, and the whole pipeline for a
+//!     loop, a closure and nested arithmetic.
 //!   - vm: the dispatch loop on a routine compiled once (a counting
 //!     loop, the same loop calling a global fn, a keyword lookup).
+//!   - codec: encode / decode for representative Values.
+//!   - db-integrated: emdb put / get round-trip cost (the
+//!     Database-integrated category of docs/BENCH.md §2).
+//!   - nextomic: `q` over a 200k-datom store and `pull` over 20k
+//!     entities (bench/nextomic.zig).
 //!
 //! Every benchmark function here is a tiny wrapper over a
-//! `Runner.bench` call; the heavy lifting lives in `src/bench.zig`.
+//! `Runner.bench` call; the harness lives in `src/bench.zig`.
 //!
 //! CLI:
 //!
 //!     zig build bench                         # full suite, table to stdout
 //!     zig build bench -- --out FILE           # also write JSON to FILE
-//!     zig build bench -- --filter list,vector # run only named categories
+//!     zig build bench -- --filter vm,codec    # run only the named categories
 //!     zig build bench -- --note "M4 idle"     # annotate the JSON host field
 //!
-//! The baseline numbers checked into `bench/baseline.json` are
-//! produced by running this on the canonical benchmark hardware
-//! noted in `docs/PERF-MEASURED.md`. Re-runs on other hardware
-//! are welcome but publish separately per BENCH.md §4.
+//! An unknown flag or category is an error. The numbers of record live
+//! in docs/PERF.md, each with the host that produced it (BENCH.md §4).
 
 const std = @import("std");
-const bench = @import("bench");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const hash_mod = @import("hash");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const transient_mod = @import("transient");
-const codec_mod = @import("codec");
-const dispatch = @import("dispatch");
-const db = @import("db");
-const emdb = @import("emdb");
-const pool_mod = @import("pool");
-const vm_mod = @import("vm");
-const compile_mod = @import("compile");
-const expand_mod = @import("expand");
+const nx = @import("nexis");
+const bench = nx.bench;
+const nextomic_bench = @import("nextomic.zig");
+const value_mod = nx.value;
+const heap_mod = nx.heap;
+const intern_mod = nx.intern;
+const hash_mod = nx.hash;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ = nx.champ;
+const transient_mod = nx.transient;
+const codec_mod = nx.codec;
+const dispatch = nx.dispatch;
+const db = nx.db;
+const emdb = nx.emdb;
+const vm_mod = nx.vm;
+const compile_mod = nx.compile;
 
 const Value = value_mod.Value;
 const Heap = heap_mod.Heap;
 const Interner = intern_mod.Interner;
 const Runner = bench.Runner;
 
-// =============================================================================
-// Shared context — built once, reused across many benchmark calls.
-//
-// Zig 0.16: benchmark functions take a pointer to a per-bench
-// state struct; the outer Bench* context below is plumbed via
-// field access in closures.
-// =============================================================================
-
-fn makeHeap(alloc: std.mem.Allocator) Heap {
-    return Heap.init(alloc);
-}
+// Each benchmark function takes a pointer to its own state struct.
 
 // -----------------------------------------------------------------------------
 // Scalar — fixnum arithmetic
@@ -90,7 +81,7 @@ const ScalarCtx = struct {
 fn benchFixnumAdd(ctx: *ScalarCtx) anyerror!void {
     // Read operands via volatile pointers to force a memory
     // load per call; otherwise ReleaseFast constant-folds the
-    // entire body (observed: 0 ns before this fix).
+    // entire body and the row reads 0 ns.
     const ap: *volatile i64 = &ctx.a_fx;
     const bp: *volatile i64 = &ctx.b_fx;
     const a = value_mod.fromFixnum(ap.*).?;
@@ -298,33 +289,31 @@ fn benchSetContains(ctx: *LookupCtx) anyerror!void {
 // -----------------------------------------------------------------------------
 
 const CodecCtx = struct {
-    heap: *Heap,
     interner: *Interner,
     allocator: std.mem.Allocator,
     target: Value,
     encoded: []u8, // pre-encoded bytes for the decode benchmark
+    /// Where decoded values go. It is dropped whenever it holds more
+    /// than `scratch_limit` bytes, so a decode benchmark's memory stays
+    /// bounded however many repetitions the pilot chooses.
+    scratch: Heap,
     sink: u64 = 0,
+
+    const scratch_limit = 16 << 20;
 };
 
-fn benchCodecEncodeScalar(ctx: *CodecCtx) anyerror!void {
+fn benchCodecEncode(ctx: *CodecCtx) anyerror!void {
     const bytes = try codec_mod.encode(ctx.allocator, ctx.interner, ctx.target);
     defer ctx.allocator.free(bytes);
     ctx.sink +%= bytes.len;
 }
 
-fn benchCodecDecodeScalar(ctx: *CodecCtx) anyerror!void {
-    const v = try codec_mod.decode(ctx.heap, ctx.interner, ctx.encoded, &dispatch.hashValue, &dispatch.equal);
-    ctx.sink +%= @as(u64, @bitCast(@as(u64, v.tag)));
-}
-
-fn benchCodecEncodeMap(ctx: *CodecCtx) anyerror!void {
-    const bytes = try codec_mod.encode(ctx.allocator, ctx.interner, ctx.target);
-    defer ctx.allocator.free(bytes);
-    ctx.sink +%= bytes.len;
-}
-
-fn benchCodecDecodeMap(ctx: *CodecCtx) anyerror!void {
-    const v = try codec_mod.decode(ctx.heap, ctx.interner, ctx.encoded, &dispatch.hashValue, &dispatch.equal);
+fn benchCodecDecode(ctx: *CodecCtx) anyerror!void {
+    if (ctx.scratch.live_bytes > CodecCtx.scratch_limit) {
+        ctx.scratch.deinit();
+        ctx.scratch = Heap.init(ctx.allocator);
+    }
+    const v = try codec_mod.decode(&ctx.scratch, ctx.interner, ctx.encoded, &dispatch.hashValue, &dispatch.equal);
     ctx.sink +%= @as(u64, @bitCast(@as(u64, v.tag)));
 }
 
@@ -376,7 +365,7 @@ fn populateKeysAndVals(
 }
 
 // =============================================================================
-// Compiler benchmarks (COMPILER.md §9.4 gate item 7)
+// Compiler benchmarks (COMPILER.md §9.4 item 6)
 // =============================================================================
 
 const CompileBenchCtx = struct {
@@ -384,7 +373,7 @@ const CompileBenchCtx = struct {
 };
 
 /// Measure compile throughput: parser + reader + macroexpand +
-/// lowerForm + compileTiny for `(+ 1 2)`. Allocates a fresh
+/// lowerForm + emitRoutine for `(+ 1 2)`. Allocates a fresh
 /// arena per iteration so the measured cost is steady-state
 /// compile, not amortized scope reuse.
 fn benchCompileSimple(ctx: *CompileBenchCtx) !void {
@@ -392,97 +381,28 @@ fn benchCompileSimple(ctx: *CompileBenchCtx) !void {
     defer arena.deinit();
     var interner = intern_mod.Interner.init(arena.allocator());
     defer interner.deinit();
-    const compiled = try compile_mod.compileSourceFull(
-        arena.allocator(),
-        "(+ 1 2)",
-        null,
-        &interner,
-    );
+    const compiled = try compile_mod.compileSourceWith(arena.allocator(), "(+ 1 2)", .{ .interner = &interner });
     std.mem.doNotOptimizeAway(compiled);
 }
 
-/// Measure eval throughput on a 100-iteration recur loop.
-/// per-iteration cost = total / 100. The bench harness
-/// reports ops/sec at the OUTER iteration; divide by the
-/// loop-iter count to get recur per-iter.
-fn benchEvalSimpleLoop(ctx: *CompileBenchCtx) !void {
-    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
-    defer arena.deinit();
-    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
-    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm_mod.VM.init(ctx.alloc, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    const compiled = try compile_mod.compileSourceFull(
-        arena.allocator(),
-        "(loop* [i 0] (if (< i 100) (recur (+ i 1)) i))",
-        null,
-        interner,
-    );
-    const routine = compiled.toRoutine("bench");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
-    const result = try v.run();
-    std.mem.doNotOptimizeAway(result);
-}
+/// The whole pipeline for a one-form program, per sample: a VM is
+/// built, the source is read, expanded, compiled and run, and
+/// everything is released. The `vm` category measures the dispatch
+/// loop alone.
+const PipelineCtx = struct {
+    alloc: std.mem.Allocator,
+    source: []const u8,
+};
 
-/// Closure creation cost: `((fn* [] 42))`. Each iteration
-/// constructs a fresh closure and immediately calls it.
-fn benchClosureCreate(ctx: *CompileBenchCtx) !void {
+fn benchPipeline(ctx: *PipelineCtx) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.alloc);
     defer arena.deinit();
-    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
-    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm_mod.VM.init(ctx.alloc, &stub);
+    var v = try vm_mod.VM.init(ctx.alloc, &vm_mod.VM.idle_routine);
     defer v.deinit();
-    const interner = v.ensureInterner();
-    const compiled = try compile_mod.compileSourceFull(
-        arena.allocator(),
-        "((fn* [] 42))",
-        null,
-        interner,
-    );
+    const compiled = try compile_mod.compileSourceWith(arena.allocator(), ctx.source, .{ .interner = v.ensureInterner() });
     const routine = compiled.toRoutine("bench");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
-    const result = try v.run();
-    std.mem.doNotOptimizeAway(result);
-}
-
-/// Eval throughput on a 4-arg arithmetic chain `(+ (+ 1 2) (+ 3 4))`.
-/// Tests cost of nested calls + arithmetic without the loop
-/// overhead. Closer to "raw eval" speed.
-fn benchEvalArith(ctx: *CompileBenchCtx) !void {
-    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
-    defer arena.deinit();
-    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
-    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
-    var v = try vm_mod.VM.init(ctx.alloc, &stub);
-    defer v.deinit();
-    const interner = v.ensureInterner();
-    const compiled = try compile_mod.compileSourceFull(
-        arena.allocator(),
-        "(+ (+ 1 2) (+ 3 4))",
-        null,
-        interner,
-    );
-    const routine = compiled.toRoutine("bench");
-    v.frames.items[0].routine = &routine;
-    v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
-    if (v.stack.items.len < routine.slot_count) {
-        try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
-    }
-    const result = try v.run();
-    std.mem.doNotOptimizeAway(result);
+    try v.retargetTop(&routine);
+    std.mem.doNotOptimizeAway(try v.run());
 }
 
 // -----------------------------------------------------------------------------
@@ -507,12 +427,12 @@ const RunCtx = struct {
         const interner = ctx.v.ensureInterner();
         const ns = ctx.v.ensureNamespace();
         if (setup) |s| {
-            const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), s, ns, interner);
+            const compiled = try compile_mod.compileSourceWith(ctx.arena.allocator(), s, .{ .namespace = ns, .interner = interner });
             const routine = compiled.toRoutine("bench-setup");
             try ctx.v.retargetTop(&routine);
             _ = try ctx.v.run();
         }
-        const compiled = try compile_mod.compileSourceFull(ctx.arena.allocator(), source, ns, interner);
+        const compiled = try compile_mod.compileSourceWith(ctx.arena.allocator(), source, .{ .namespace = ns, .interner = interner });
         ctx.routine = compiled.toRoutine("bench");
         ctx.sink = 0;
         return ctx;
@@ -531,6 +451,44 @@ fn benchRun(ctx: *RunCtx) anyerror!void {
     ctx.sink +%= @as(u64, @bitCast(result.payload));
 }
 
+/// A fresh store file under $TMPDIR (or /tmp), named for this
+/// process so concurrent runs never share it; `deinit` removes it.
+const TmpStore = struct {
+    path: [:0]u8,
+
+    fn init(alloc: std.mem.Allocator, name: []const u8) !TmpStore {
+        const dir = if (std.c.getenv("TMPDIR")) |d| std.mem.span(d) else "/tmp";
+        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/nexis-bench-{d}-{s}.emdb", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid(), name }, 0);
+        remove(path);
+        return .{ .path = path };
+    }
+
+    fn deinit(self: *TmpStore, alloc: std.mem.Allocator) void {
+        remove(self.path);
+        alloc.free(self.path);
+    }
+
+    fn remove(path: [:0]const u8) void {
+        _ = std.c.unlink(path.ptr);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
+        _ = std.c.unlink(lock_path.ptr);
+    }
+};
+
+/// Every category `--filter` accepts, in the order the suite runs them.
+const categories = [_][]const u8{
+    "scalar",
+    "collection-construction",
+    "transient-construction",
+    "collection-lookup-update",
+    "compiler",
+    "vm",
+    "codec",
+    "db-integrated",
+    "nextomic",
+};
+
 pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
     const io = init.io;
@@ -540,7 +498,6 @@ pub fn main(init: std.process.Init) !u8 {
     var out_path: ?[]const u8 = null;
     var note: []const u8 = "";
     var filter: ?[]const u8 = null;
-    var allocator_choice: []const u8 = "pool"; // POOL.md §9 default
     var ai: usize = 1;
     while (ai < args.len) : (ai += 1) {
         const a = args[ai];
@@ -553,31 +510,27 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, a, "--filter") and ai + 1 < args.len) {
             ai += 1;
             filter = args[ai];
-        } else if (std.mem.eql(u8, a, "--allocator") and ai + 1 < args.len) {
-            ai += 1;
-            allocator_choice = args[ai];
+        } else {
+            std.debug.print("nexis-bench: unknown argument '{s}'\nusage: nexis-bench [--out FILE] [--note TEXT] [--filter CATEGORY,...]\n", .{a});
+            return 2;
         }
     }
-
-    // Backing allocator for the size-class pool itself. Must be
-    // a real general-purpose allocator — `page_allocator` is NOT
-    // suitable here because it rounds every allocation up to a
-    // page, which under the bench workload OOMs quickly.
-    const backing = init.gpa;
-
-    // Heap-backing allocator under measurement. POOL.md §9:
-    // pool is the default; --allocator std selects the process
-    // GPA directly (matches commit 7e5bb1a's baseline).
-    var pool: pool_mod.PoolAllocator = undefined;
-    var heap_backing: std.mem.Allocator = undefined;
-    const use_pool = std.mem.eql(u8, allocator_choice, "pool");
-    if (use_pool) {
-        pool = pool_mod.PoolAllocator.init(backing);
-        heap_backing = pool.allocator();
-    } else {
-        heap_backing = init.gpa;
+    if (filter) |f| {
+        var it = std.mem.tokenizeScalar(u8, f, ',');
+        while (it.next()) |name| {
+            for (categories) |category| {
+                if (std.mem.eql(u8, name, category)) break;
+            } else {
+                std.debug.print("nexis-bench: unknown category '{s}'; the categories are", .{name});
+                for (categories) |category| std.debug.print(" {s}", .{category});
+                std.debug.print("\n", .{});
+                return 2;
+            }
+        }
     }
-    defer if (use_pool) pool.deinit();
+    // The runtime's heap allocates from the process allocator, so the
+    // benchmark heaps do too.
+    const heap_backing = init.gpa;
 
     // ---- Runner ----
     var runner = try Runner.init(alloc, .{});
@@ -586,10 +539,7 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- Shared interner + heap for non-DB benches ----
     var interner = Interner.init(alloc);
     defer interner.deinit();
-    // Heap is what the pool allocator actually backs for the A/B:
-    // the vast majority of allocations under measurement come from
-    // `heap.alloc()`.
-    var heap = makeHeap(heap_backing);
+    var heap = Heap.init(heap_backing);
     defer heap.deinit();
 
     const include = struct {
@@ -683,26 +633,22 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // ---- Compiler (COMPILER.md §9.4 gate item 7) ----
+    // ---- Compiler (COMPILER.md §9.4 item 6) ----
     //
-    // 4 measurements per gate spec:
-    //   compile_simple — forms/sec for `(+ 1 2)`
-    //   eval_simple_loop — ops/sec for a tight recur loop
-    //                      (= recur-per-iteration cost)
-    //   closure_create — per-construction cost for `((fn* [] 42))`
-    //   eval_arith — ops/sec for a 4-arg arithmetic chain
-    //
-    // These exercise the full reader→Form→lowerForm→Tiny→VM
-    // pipeline. The bench runner amortizes pilot+warmup+30
-    // measurements with criterion-style sampling; the per-bench
-    // setup (allocator + VM init) is amortized across the inner
-    // reps for stability.
+    //   compile_simple — read, expand and compile `(+ 1 2)`
+    //   eval_simple_loop, closure_create, eval_arith — the whole
+    //     pipeline (VM construction, compile, run) for a 100-iteration
+    //     recur loop, an immediately called closure and a nested
+    //     arithmetic call
     if (include(filter, "compiler")) {
         var cctx = CompileBenchCtx{ .alloc = alloc };
         try runner.bench("compile_simple", "compiler", null, &cctx, benchCompileSimple);
-        try runner.bench("eval_simple_loop", "compiler", 100, &cctx, benchEvalSimpleLoop);
-        try runner.bench("closure_create", "compiler", null, &cctx, benchClosureCreate);
-        try runner.bench("eval_arith", "compiler", null, &cctx, benchEvalArith);
+        var loop = PipelineCtx{ .alloc = alloc, .source = "(loop* [i 0] (if (< i 100) (recur (+ i 1)) i))" };
+        try runner.bench("eval_simple_loop", "compiler", 100, &loop, benchPipeline);
+        var closure = PipelineCtx{ .alloc = alloc, .source = "((fn* [] 42))" };
+        try runner.bench("closure_create", "compiler", null, &closure, benchPipeline);
+        var arith = PipelineCtx{ .alloc = alloc, .source = "(+ (+ 1 2) (+ 3 4))" };
+        try runner.bench("eval_arith", "compiler", null, &arith, benchPipeline);
     }
 
     // ---- VM dispatch ----
@@ -739,9 +685,10 @@ pub fn main(init: std.process.Init) !u8 {
             const v = value_mod.fromFixnum(123_456_789).?;
             const bytes = try codec_mod.encode(alloc, &interner, v);
             defer alloc.free(bytes);
-            var cctx = CodecCtx{ .heap = &heap, .interner = &interner, .allocator = alloc, .target = v, .encoded = bytes };
-            try runner.bench("codec_encode_fixnum", "codec", null, &cctx, benchCodecEncodeScalar);
-            try runner.bench("codec_decode_fixnum", "codec", null, &cctx, benchCodecDecodeScalar);
+            var cctx = CodecCtx{ .interner = &interner, .allocator = alloc, .target = v, .encoded = bytes, .scratch = Heap.init(alloc) };
+            defer cctx.scratch.deinit();
+            try runner.bench("codec_encode_fixnum", "codec", null, &cctx, benchCodecEncode);
+            try runner.bench("codec_decode_fixnum", "codec", null, &cctx, benchCodecDecode);
         }
         // Map round-trip (N=64, nested values).
         {
@@ -756,27 +703,19 @@ pub fn main(init: std.process.Init) !u8 {
             }
             const bytes = try codec_mod.encode(alloc, &interner, m);
             defer alloc.free(bytes);
-            var cctx = CodecCtx{ .heap = &heap, .interner = &interner, .allocator = alloc, .target = m, .encoded = bytes };
-            try runner.bench("codec_encode_map_n64", "codec", 64, &cctx, benchCodecEncodeMap);
-            try runner.bench("codec_decode_map_n64", "codec", 64, &cctx, benchCodecDecodeMap);
+            var cctx = CodecCtx{ .interner = &interner, .allocator = alloc, .target = m, .encoded = bytes, .scratch = Heap.init(alloc) };
+            defer cctx.scratch.deinit();
+            try runner.bench("codec_encode_map_n64", "codec", 64, &cctx, benchCodecEncode);
+            try runner.bench("codec_decode_map_n64", "codec", 64, &cctx, benchCodecDecode);
         }
     }
 
     // ---- DB-integrated ----
     if (include(filter, "db-integrated")) {
-        // Fresh temp DB per benchmark run.
-        const path: [:0]const u8 = "bench_tmp.emdb";
-        _ = std.c.unlink(path.ptr);
-        var lockbuf: [64]u8 = undefined;
-        const lock_path = try std.fmt.bufPrintSentinel(&lockbuf, "{s}-lock", .{path}, 0);
-        _ = std.c.unlink(lock_path.ptr);
-
-        var conn = try db.open(alloc, &heap, &interner, path.ptr, .{ .allocator = alloc });
-        defer {
-            db.close(&conn);
-            _ = std.c.unlink(path.ptr);
-            _ = std.c.unlink(lock_path.ptr);
-        }
+        var store = try TmpStore.init(alloc, "db");
+        defer store.deinit(alloc);
+        var conn = try db.open(alloc, &heap, &interner, store.path.ptr, .{ .allocator = alloc });
+        defer db.close(&conn) catch {};
 
         // Seed the key we'll be overwriting.
         {
@@ -790,35 +729,38 @@ pub fn main(init: std.process.Init) !u8 {
         try runner.bench("db_get_hit_scalar", "db-integrated", null, &dctx, benchDbGetHit);
     }
 
-    // ---- Output ----
-    //
-    // Zig 0.16 removed `std.fs.File.stdout()` in favor of an
-    // Io-handle model. The simplest stable path that works across
-    // 0.15/0.16 is to build the table into an ArrayList and emit
-    // via std.debug.print (which targets stderr but is acceptable
-    // for a bench tool's human-readable output). JSON writes go
-    // to a file via the standard fs.cwd().createFile path.
+    // ---- Nextomic (docs/PERF.md §3.7) ----
+    if (include(filter, "nextomic")) {
+        {
+            var store = try TmpStore.init(alloc, "q");
+            defer store.deinit(alloc);
+            try nextomic_bench.runQuery(&runner, alloc, store.path);
+        }
+        {
+            var store = try TmpStore.init(alloc, "pull");
+            defer store.deinit(alloc);
+            try nextomic_bench.runPull(&runner, alloc, store.path);
+        }
+    }
 
+    // ---- Output: the table to stdout, JSON to --out ----
     {
-        std.debug.print("\n(allocator: {s})\n", .{allocator_choice});
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
         try runner.writeTable(&aw.writer);
-        std.debug.print("{s}", .{aw.written()});
+        try std.Io.File.stdout().writeStreamingAll(io, aw.written());
     }
 
     if (out_path) |p| {
         var jw: std.Io.Writer.Allocating = .init(alloc);
         defer jw.deinit();
-        var note_buf: [256]u8 = undefined;
-        const decorated_note = try std.fmt.bufPrint(&note_buf, "{s} | allocator={s}", .{ note, allocator_choice });
         try runner.writeJson(&jw.writer, .{
             .cpu = builtin_cpu_model_str,
             .os = @tagName(@import("builtin").os.tag),
             .ram = "",
             .zig_version = @import("builtin").zig_version_string,
             .optimize_mode = @tagName(@import("builtin").mode),
-            .note = decorated_note,
+            .note = note,
         });
         var file = try std.Io.Dir.cwd().createFile(io, p, .{});
         defer file.close(io);

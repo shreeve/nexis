@@ -22,6 +22,9 @@
 //!     the result. Pushing elsewhere would lose derivations.
 //!   - Termination: `total` only grows and every row comes from a
 //!     finite set of datoms and inputs, so the fixpoint is reached.
+//!   - Soundness: a growing fixpoint answers stratified programs only,
+//!     so a component whose rules call one another inside `not` is
+//!     refused before it runs.
 //!   - Rule bodies see the same `Read` snapshots as the query; a body's
 //!     unprefixed clauses read the source the call names (`$` by
 //!     default), and a recursive component is instantiated under one
@@ -32,6 +35,7 @@ const ir = @import("ir.zig");
 const plan_mod = @import("plan.zig");
 const exec_mod = @import("exec.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Var = ir.Var;
@@ -46,7 +50,8 @@ const Relation = relation.Relation;
 /// Planner cost of a recursive rule call: after every pattern that
 /// could bind its arguments.
 const recursive_cost: u64 = 1 << 20;
-/// Planner cost of one inlined rule body.
+/// Planner cost of an inlined rule body with no pattern that can run,
+/// and the row growth assumed per rule call.
 const body_cost: u64 = 16;
 
 // =============================================================================
@@ -60,6 +65,9 @@ pub const Info = struct {
     scc_of: []const usize,
     /// Per component: does it contain a cycle?
     recursive: []const bool,
+    /// Per component: does one of its rules call another of its rules
+    /// inside a `not`? Such a program is not stratified.
+    negated: []const bool,
 
     pub fn nameIndex(self: *const Info, name: u32) ?usize {
         for (self.names, 0..) |n, i| if (n == name) return i;
@@ -92,14 +100,20 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     }
     const n = names.items.len;
     const edges = try arena.alloc([]usize, n);
+    const negative = try arena.alloc([]usize, n);
     for (names.items, 0..) |name, i| {
-        var calls: std.ArrayList(u32) = .empty;
-        for (set.byName(name).?) |r| try collectCalls(arena, r.body, &calls);
+        var calls: std.ArrayList(Call) = .empty;
+        for (set.byName(name).?) |r| try collectCalls(arena, r.body, false, &calls);
         var out: std.ArrayList(usize) = .empty;
+        var neg: std.ArrayList(usize) = .empty;
         for (calls.items) |c| {
-            for (names.items, 0..) |m, j| if (m == c) try out.append(arena, j);
+            for (names.items, 0..) |m, j| if (m == c.name) {
+                try out.append(arena, j);
+                if (c.negated) try neg.append(arena, j);
+            };
         }
         edges[i] = try out.toOwnedSlice(arena);
+        negative[i] = try neg.toOwnedSlice(arena);
     }
 
     var t = Tarjan{
@@ -126,7 +140,12 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
             recursive[t.scc_of[i]] = true;
         };
     }
-    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive };
+    const negated = try arena.alloc(bool, t.scc_count);
+    @memset(negated, false);
+    for (negative, 0..) |js, i| for (js) |j| {
+        if (t.scc_of[i] == t.scc_of[j]) negated[t.scc_of[i]] = true;
+    };
+    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive, .negated = negated };
 }
 
 const Tarjan = struct {
@@ -141,6 +160,7 @@ const Tarjan = struct {
     scc_count: usize = 0,
 
     fn visit(self: *Tarjan, v: usize) !void {
+        try stack.check();
         self.index[v] = self.next;
         self.low[v] = self.next;
         self.next += 1;
@@ -166,12 +186,16 @@ const Tarjan = struct {
     }
 };
 
-/// Rule names called anywhere in `clauses`.
-fn collectCalls(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(u32)) !void {
+const Call = struct { name: u32, negated: bool };
+
+/// Rule names called anywhere in `clauses`, each marked when it is
+/// inside a `not`.
+fn collectCalls(arena: Allocator, clauses: []const Clause, negated: bool, out: *std.ArrayList(Call)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
-        .rule => |r| try out.append(arena, r.name),
-        .not => |n| try collectCalls(arena, n.body, out),
-        .@"or" => |o| for (o.branches) |br| try collectCalls(arena, br, out),
+        .rule => |r| try out.append(arena, .{ .name = r.name, .negated = negated }),
+        .not => |n| try collectCalls(arena, n.body, true, out),
+        .@"or" => |o| for (o.branches) |br| try collectCalls(arena, br, negated, out),
         else => {},
     };
 }
@@ -191,6 +215,7 @@ fn passThrough(arena: Allocator, set: *const RuleSet, name: u32, pos: usize) !bo
 }
 
 fn collectRuleCalls(arena: Allocator, clauses: []const Clause, name: u32, out: *std.ArrayList(Clause)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .rule => |r| if (r.name == name) try out.append(arena, c),
         .not => |n| try collectRuleCalls(arena, n.body, name, out),
@@ -218,7 +243,17 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: []const V
     }
     const info = try ctx.ruleInfo();
     if (info.isRecursive(name)) return recursive_cost;
-    return body_cost * defs.len;
+    // Each body costs its cheapest pattern, with the head variables
+    // bound where the call's arguments are.
+    var total: u64 = 0;
+    for (defs) |def| {
+        var head_bound: std.ArrayList(Var) = .empty;
+        for (def.head, args) |h, a| {
+            if (a != .variable or ir.containsVar(bound, a.variable)) try head_bound.append(ctx.arena, h);
+        }
+        total +|= (try plan_mod.clausesEstimate(ctx, def.body, head_bound.items)) orelse body_cost;
+    }
+    return total;
 }
 
 /// Append the steps of a rule call: grounding binds for constant
@@ -230,11 +265,10 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         v.* = switch (a) {
             .variable => |x| x,
             .constant => |c| blk: {
-                const fresh = try ctx.freshVar(try ctx.interner.internSymbol("?const"));
-                const call: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try ctx.arena.dupe(ir.Arg, &.{.{ .constant = c }}) };
-                try steps.append(ctx.arena, .{ .bind = .{ .call = call, .out = .{ .scalar = fresh }, .fresh = try ctx.arena.dupe(Var, &.{fresh}) } });
-                try bound.append(ctx.arena, fresh);
-                break :blk fresh;
+                const g = try groundConst(ctx, c);
+                try steps.append(ctx.arena, .{ .bind = .{ .call = g.bind.call, .out = g.bind.out, .fresh = try ctx.arena.dupe(Var, &.{g.bind.out.scalar}) } });
+                try bound.append(ctx.arena, g.bind.out.scalar);
+                break :blk g.bind.out.scalar;
             },
             .src => return ctx.syntax("$ cannot be a rule argument"),
         };
@@ -252,7 +286,7 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         }
         var join: std.ArrayList(Var) = .empty;
         for (arg_vars) |v| try ir.addVar(ctx.arena, &join, v);
-        const step = try plan_mod.planOr(ctx, branches, join.items, bound.items, rows.*);
+        const step = try plan_mod.planOr(ctx, branches, join.items, bound.items, rows.*, name);
         for (step.@"or".fresh) |v| try bound.append(ctx.arena, v);
         try steps.append(ctx.arena, step);
     } else {
@@ -261,6 +295,14 @@ pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound:
         try steps.append(ctx.arena, .{ .fix = fix });
     }
     rows.* = std.math.mul(u64, rows.*, body_cost) catch std.math.maxInt(u64) / 4;
+}
+
+/// `[(ground c) ?const]` over a fresh variable: a constant rule
+/// argument, grounded so that every argument is a variable.
+fn groundConst(ctx: *Ctx, c: ir.Cell) !Clause {
+    const fresh = try ctx.freshVar(try ctx.interner.internSymbol("?const"));
+    const call: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try ctx.arena.dupe(ir.Arg, &.{.{ .constant = c }}) };
+    return .{ .bind = .{ .call = call, .out = .{ .scalar = fresh } } };
 }
 
 pub const CallSite = struct {
@@ -295,6 +337,10 @@ pub const Fix = struct {
 
 fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: []const Var, rows: u64) Failure!Fix {
     const info = try ctx.ruleInfo();
+    // The fixpoint only adds rows, which is sound for stratified rules
+    // alone: a rule that depends on its own negation has no answer it
+    // could reach.
+    if (info.negated[info.scc_of[info.nameIndex(name).?]]) return ctx.syntaxFmt("{s} recurses through not; a rule cannot depend on the negation of itself", .{ctx.interner.symbolName(name)});
     const members = try info.members(ctx.arena, name);
 
     var pushed: std.ArrayList(usize) = .empty;
@@ -432,6 +478,7 @@ const Renamer = struct {
     }
 
     fn clause(self: *Renamer, c: Clause, out: *std.ArrayList(Clause)) Failure!void {
+        try stack.check();
         const arena = self.ctx.arena;
         switch (c) {
             .pattern => |p| try out.append(arena, .{ .pattern = .{
@@ -451,7 +498,7 @@ const Renamer = struct {
             .@"or" => |o| {
                 const branches = try arena.alloc(ir.Branch, o.branches.len);
                 for (o.branches, branches) |br, *nb| nb.* = try self.clauses(br);
-                try out.append(arena, .{ .@"or" = .{ .join = if (o.join) |js| try self.vars(js) else null, .branches = branches } });
+                try out.append(arena, .{ .@"or" = .{ .join = if (o.join) |js| try self.vars(js) else null, .branches = branches, .required = try self.vars(o.required) } });
             },
             .rule => |r| {
                 const renamed = try self.args(r.args);
@@ -463,10 +510,9 @@ const Renamer = struct {
                         for (renamed, svars) |a, *sv| sv.* = switch (a) {
                             .variable => |pv| pv,
                             .constant => |cell| blk: {
-                                const fresh = try self.ctx.freshVar(try self.ctx.interner.internSymbol("?const"));
-                                const g: ir.Call = .{ .f = .{ .builtin = .ground }, .args = try arena.dupe(ir.Arg, &.{.{ .constant = cell }}) };
-                                try out.append(arena, .{ .bind = .{ .call = g, .out = .{ .scalar = fresh } } });
-                                break :blk fresh;
+                                const g = try groundConst(self.ctx, cell);
+                                try out.append(arena, g);
+                                break :blk g.bind.out.scalar;
                             },
                             .src => return self.ctx.syntax("$ cannot be a rule argument"),
                         };
@@ -624,6 +670,27 @@ test "call graph: self loop, mutual recursion, acyclic" {
     try testing.expect(!info.isRecursive(4));
     try testing.expect(!info.isRecursive(5));
     try testing.expectEqual(@as(usize, 2), (try info.members(arena, 2)).len);
+    // 3 calls 2 under `not` and 2 calls 3: not stratified; 1 is.
+    try testing.expect(info.negated[info.scc_of[info.nameIndex(2).?]]);
+    try testing.expect(!info.negated[info.scc_of[info.nameIndex(1).?]]);
+    try testing.expect(!info.negated[info.scc_of[info.nameIndex(4).?]]);
+}
+
+test "a call chain past the stack guard is StackOverflow" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // r0 calls r1 calls r2 ... : one frame per rule in the analysis.
+    const n = 5000;
+    const rules = try arena.alloc(ir.Rule, n);
+    for (rules, 0..) |*r, i| {
+        const body: []const Clause = if (i + 1 < n) try arena.dupe(Clause, &.{.{ .rule = .{ .name = @intCast(i + 1), .args = &.{} } }}) else &.{};
+        r.* = .{ .name = @intCast(i), .required = 0, .head = &.{}, .body = body };
+    }
+    const set: RuleSet = .{ .arena_state = null, .vars = &.{}, .rules = rules };
+    stack.arm(64 * 1024);
+    defer stack.arm(stack.main_thread_budget);
+    try testing.expectError(error.StackOverflow, analyze(arena, &set));
 }
 
 test "pass-through positions" {

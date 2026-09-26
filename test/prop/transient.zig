@@ -1,15 +1,16 @@
 //! test/prop/transient.zig — randomized property tests for the
-//! transient wrapper. Together with test/prop/champ.zig (map/set) and
-//! test/prop/vector.zig (vector), this file covers PLAN §20.2
-//! tests #3 (transient equivalence) and #4 (transient ownership).
+//! transient wrapper: transient equivalence and ownership, alongside
+//! test/prop/champ.zig (map/set) and test/prop/vector.zig (vector).
 //!
 //! Properties (TRANSIENT.md §12):
 //!
-//!   T1. Equivalence (test #3): random edit sequences applied via
+//!   T1. Equivalence: random edit sequences applied via
 //!       (transient → N × ...Bang → persistentBang) produce the same
 //!       persistent Value (by `dispatch.equal` AND `dispatch.hashValue`)
-//!       as the direct persistent path. 300 trials per kind.
-//!   T2. Ownership (test #4): frozen transients reject every op with
+//!       as the direct persistent path. 1000 trials per kind; T1d
+//!       drives random conj!/assoc!/pop! on vectors of up to 1100
+//!       elements, across the first trie boundary.
+//!   T2. Ownership: frozen transients reject every op with
 //!       `error.TransientFrozen`.
 //!   T3. Source immutability: a `...Bang` session on transient
 //!       `t = transientFrom(p)` does NOT mutate the original
@@ -19,14 +20,14 @@
 //!       original persistent Value is dropped.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ = @import("champ");
-const vector = @import("vector");
-const transient = @import("transient");
-const dispatch = @import("dispatch");
-const gc = @import("gc");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const champ = nx.champ;
+const vector = nx.vector;
+const transient = nx.transient;
+const dispatch = nx.dispatch;
+const gc = nx.gc;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -35,7 +36,7 @@ const HeapHeader = heap_mod.HeapHeader;
 const prng_seed: u64 = 0x7472_616E_7369_656E; // "transien" LE
 
 // =============================================================================
-// T1 — Equivalence (PLAN §20.2 test #3)
+// T1 — Equivalence
 // =============================================================================
 
 test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)" {
@@ -72,7 +73,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)"
 
         const persistent_from_transient = try transient.persistentBang(t);
 
-        // Equivalence: PLAN §20.2 test #3.
+        // Equivalence: `=` and hash-equal.
         try std.testing.expect(dispatch.equal(persistent_path, persistent_from_transient));
         try std.testing.expectEqual(
             dispatch.hashValue(persistent_path),
@@ -146,8 +147,51 @@ test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (
     }
 }
 
+test "T1d: vector equivalence — random conj!/assoc!/pop! ≡ conj/assoc/pop (300 trials)" {
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
+    defer heap.deinit();
+
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 0x34);
+    const r = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 300) : (trial += 1) {
+        // Start anywhere up to past the first trie boundary (1056).
+        const start = r.uintLessThan(usize, 1100);
+        const elems = try debug.allocator().alloc(Value, start);
+        defer debug.allocator().free(elems);
+        for (elems, 0..) |*e, i| e.* = value.fromFixnum(@intCast(i)).?;
+        var persistent_path = try vector.fromSlice(&heap, elems);
+        const t = try transient.transientFrom(&heap, persistent_path);
+        for (0..60) |_| {
+            const n = vector.count(persistent_path);
+            const elem = value.fromFixnum(r.intRangeAtMost(i64, -99, 99)).?;
+            switch (r.uintLessThan(u8, 3)) {
+                0 => {
+                    persistent_path = try vector.conj(&heap, persistent_path, elem);
+                    _ = try transient.vectorConjBang(&heap, t, elem);
+                },
+                1 => if (n > 0) {
+                    const i = r.uintLessThan(usize, n);
+                    persistent_path = try vector.assoc(&heap, persistent_path, i, elem);
+                    _ = try transient.vectorAssocBang(&heap, t, i, elem);
+                },
+                else => if (n > 0) {
+                    persistent_path = try vector.pop(&heap, persistent_path);
+                    _ = try transient.vectorPopBang(&heap, t);
+                },
+            }
+        }
+        const persistent_from_transient = try transient.persistentBang(t);
+        try std.testing.expect(dispatch.equal(persistent_path, persistent_from_transient));
+        try std.testing.expectEqual(dispatch.hashValue(persistent_path), dispatch.hashValue(persistent_from_transient));
+    }
+}
+
 // =============================================================================
-// T2 — Ownership (PLAN §20.2 test #4)
+// T2 — Ownership
 // =============================================================================
 
 test "T2a: map transient post-freeze rejects every op with TransientFrozen" {
@@ -352,6 +396,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     }
 
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     const live_before = heap.liveCount();
     _ = collector.collect(&.{Heap.asHeapHeader(t)});
     const live_after = heap.liveCount();
@@ -384,6 +429,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     // persistent Value (which points at the same *HeapHeader)
     // remains usable.
     var collector = gc.Collector.init(&heap);
+    defer collector.deinit();
     _ = collector.collect(&.{
         Heap.asHeapHeader(t),
         Heap.asHeapHeader(frozen_persistent),

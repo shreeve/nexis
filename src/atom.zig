@@ -11,29 +11,13 @@
 //!   - `getValue` / `setValue` — body accessors used by the native fns.
 //!   - `tryEnterCritical` / `exitCritical` — `in_flight` flag for
 //!     `swap!` / `reset!` / `compare-and-set!` re-entrancy detection.
-//!   - `hashHeader` — pointer-identity hash (xxHash3-32 over the raw
-//!     pointer bytes). Kind-domain mixing is applied by
-//!     `dispatch.hashValue` on the way out.
-//!   - `atomsEqual` — pointer-identity equality.
 //!   - `trace` — GC walks the contained value.
 //!
-//! Module graph (one-way terminal — same shape as src/db.zig for
-//! durable_ref):
-//!
-//!     src/atom.zig
-//!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     └── @import("hash")
-//!
-//! Nothing imports atom.zig except `dispatch.zig` (heapHashBase +
-//! heapEqual arms), `gc.zig` (trace arm), `stdlib.zig` (native fns),
-//! `codec.zig` (Unserializable arm), `cli.zig` (formatter arm).
-//!
-//! Identity-based equality is load-bearing: a mutable identity value
-//! that participated in structural equality would let a map key
-//! become unequal to itself after a mutation. See SEMANTICS.md §2.6
-//! addendum for the formal pinning.
+//! An atom is an identity kind (`dispatch.isIdentityKind`): equal to
+//! itself only and hashed by its pointer, never by the value it holds.
+//! A mutable value that took part in structural equality would let a
+//! map key become unequal to itself after a mutation (SEMANTICS.md
+//! §2.6).
 //!
 //! GC rooting: `swap-vals!` allocates a result vector AFTER the
 //! atom write, with no safe point in between: a cycle runs only at
@@ -41,9 +25,8 @@
 //! (`docs/GC.md` §7, §11.5).
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -62,8 +45,7 @@ const testing = std.testing;
 /// `compare-and-set!` / `swap-vals!` for the duration of their
 /// critical section.
 ///
-/// Padding makes total size a multiple of 8 so added fields stay
-/// naturally aligned without re-thinking the layout.
+/// The padding makes the body a multiple of 8 bytes.
 pub const AtomBox = extern struct {
     value: Value,
     in_flight: u8,
@@ -138,46 +120,6 @@ pub inline fn exitCritical(v: Value) void {
 }
 
 // =============================================================================
-// Hash + equality (identity-based; SEMANTICS.md §2.6 + §3.2)
-// =============================================================================
-
-/// Identity hash: xxHash3-32 over the raw `*HeapHeader` pointer.
-/// Stable for the atom's lifetime (the pointer never changes; only
-/// the contained `value` mutates, which we deliberately ignore so
-/// atom-as-map-key stays well-behaved across mutations).
-///
-/// Caches the result in the HeapHeader's cached-hash slot. Domain
-/// mixing (`mixKindDomain` with `Kind.atom = 34`) happens in
-/// `dispatch.hashValue` on the way out, parallel to every other
-/// kind-local heap kind.
-///
-/// **Invariant**: the collector is non-moving mark-sweep, which
-/// makes raw pointer hashing both correct and cheap. A moving
-/// collector would need a stable object identity instead (e.g., a
-/// per-allocation u64 stamp baked into the header at allocation
-/// time).
-pub fn hashHeader(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    const ptr_int: usize = @intFromPtr(h);
-    var ptr_bytes: [@sizeOf(usize)]u8 = undefined;
-    std.mem.writeInt(usize, &ptr_bytes, ptr_int, .little);
-    hasher.update(&ptr_bytes);
-    const full = hasher.final();
-    const truncated: u32 = @truncate(full);
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-
-/// Identity equality: same `*HeapHeader` ↔ same atom. Two distinct
-/// AtomBoxes are never equal even if their `value` fields are
-/// structurally `=`. This is the load-bearing invariant for
-/// atom-as-map-key — see SEMANTICS.md §2.6 amendment for atoms.
-pub fn atomsEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
-}
-
-// =============================================================================
 // GC trace
 // =============================================================================
 
@@ -223,45 +165,6 @@ test "tryEnterCritical / exitCritical: re-entrancy guard" {
     // After exit, the flag is clear and we can re-enter.
     try testing.expect(tryEnterCritical(a));
     exitCritical(a);
-}
-
-test "atomsEqual: identity, not contained-value equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const v1 = value_mod.fromFixnum(7).?;
-    const a = try make(&heap, v1);
-    const b = try make(&heap, v1); // distinct atom, same contained value
-    const ah = Heap.asHeapHeader(a);
-    const bh = Heap.asHeapHeader(b);
-    try testing.expect(atomsEqual(ah, ah));
-    try testing.expect(!atomsEqual(ah, bh));
-}
-
-test "hashHeader: identity-stable across value mutation" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try make(&heap, value_mod.fromFixnum(1).?);
-    const ah = Heap.asHeapHeader(a);
-    const h_before = hashHeader(ah);
-
-    // Mutate the contained value; the atom's hash is identity-based,
-    // so it MUST be invariant.
-    setValue(a, value_mod.fromFixnum(99999).?);
-    const h_after = hashHeader(ah);
-    try testing.expectEqual(h_before, h_after);
-}
-
-test "hashHeader: distinct atoms (almost certainly) hash differently" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try make(&heap, value_mod.nilValue());
-    const b = try make(&heap, value_mod.nilValue());
-    const ha = hashHeader(Heap.asHeapHeader(a));
-    const hb = hashHeader(Heap.asHeapHeader(b));
-    try testing.expect(ha != hb);
 }
 
 test "trace: visits the contained value via markValue" {

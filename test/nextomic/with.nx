@@ -59,6 +59,8 @@
              (= :nextomic/nested (t/caught (d/transact! c [[:db/add ann :person/tags :blue]]))))
       (t/check "with inside the scope is nested"
              (= :nextomic/nested (t/caught (d/with c [] (fn [inner r] inner)))))
+      (t/check "a second connection to the file is nested too, not blocked"
+             (= :nextomic/nested (d/with-conn [c2 "with.edb"] (t/caught (d/transact! c2 [[:db/add ann :person/tags :blue]])))))
       :speculated)))
 (t/check "with returns f's value" (= :speculated outcome))
 
@@ -94,4 +96,4 @@
 (t/check "a failed with leaves the connection writable" (= 6 (:tx (d/transact! c [[:db/add ann :person/tags :teal]]))))
 (d/release c)
 (println (t/caught (d/with c [] (fn [db-after report] :unreached))))
-:with-done
+(println :with-done)

@@ -1,59 +1,41 @@
-// =============================================================================
-// src/loader.zig — namespace loader
-// =============================================================================
-//
-// `(require ...)` resolves a namespace
-// name to a `.nx` file, parses + compiles + evaluates it in its
-// own declared namespace, and returns control to the caller's
-// namespace. Idempotent: re-requiring an already-loaded ns is a
-// no-op. Cycle detection via a `loading` set.
-//
-// SCOPE:
-//   - `(require 'my.ns)` and `(require '[my.ns :as alias])`
-//   - Ns-to-file mapping: `my.app.foo` → `my/app/foo.nx`
-//   - Load path: each entry is a directory to search
-//   - Idempotent (`loaded_set`) + cycle detection (`loading_set`)
-//   - Caller's current namespace restored after load
-//   - Required file's `(ns ...)` declaration MUST match the
-//     requested name (else `LoadError.NamespaceMismatch`)
-//
-// NOT SUPPORTED:
-//   - `:refer`, `:rename`, `:exclude`, `:reload`
-//   - Relative requires
-//   - Private vars
-//   - Classpath / package semantics
-//
-// The loader is wired into the expander via a callback on
-// `ExpandContext.load_callback` (set by the CLI / test harness).
-// Approach mirrors the compile-eval callback pattern: the
-// expander doesn't depend on compile/loader machinery directly;
-// it just calls through an opaque user_data pointer.
+//! loader.zig — evaluating source text, and `(require ...)`.
+//!
+//! `Loader.evalSource` is the one path from text to effect: parse,
+//! read, declare the names the text defines, then compile each
+//! top-level form in the current namespace and run it (or hand its
+//! routine to the caller, for `disasm`). The CLI's `run`, `repl`,
+//! `disasm` and `test`, the stdlib bootstrap (`stdlib.boot`) and
+//! `require` all go through it, so a failure is reported the same
+//! way wherever the text came from: a `Diagnostic` located in the
+//! file that failed, or a runtime error whose frame chain the VM
+//! recorded.
+//!
+//! `(require 'my.app.foo)` maps the name to `my/app/foo.nx` (dots
+//! to slashes, dashes to underscores, as Clojure does) on the load
+//! path, evaluates the file, whose first form must be
+//! `(ns my.app.foo ...)`, and restores the caller's namespace. A
+//! namespace loads once; a require of one still loading is a cycle.
+//! The namespaces the stdlib installs have no file (`markLoaded`),
+//! and `clojure.string`, `clojure.set`, `clojure.test` and
+//! `clojure.pprint` name their nexis counterparts' Vars.
+//!
+//! The expander reaches the loader through `ExpandContext
+//! .load_callback`, so it depends on neither this file nor the
+//! compiler.
 
 const std = @import("std");
-const reader_mod = @import("reader");
-const intern_mod = @import("intern");
-const expand_mod = @import("expand");
-const compile_mod = @import("compile");
-const vm_mod = @import("vm");
+const reader_mod = @import("reader.zig");
+const intern_mod = @import("intern.zig");
+const expand_mod = @import("expand.zig");
+const compile_mod = @import("compile.zig");
+const vm_mod = @import("vm.zig");
+
+const Value = @import("value.zig").Value;
 
 pub const LoadError = error{
-    /// The requested namespace name could not be mapped to a
-    /// readable file on any entry of the load path.
-    FileNotFound,
-    /// File found but I/O error reading it.
-    FileReadError,
-    /// `(require ...)` was passed a malformed argument (not a
-    /// quoted symbol or quoted `[ns :as alias]` vector).
-    MalformedRequire,
-    /// `(require ...)` would form a cycle (namespace is already
-    /// in the loading set).
-    CyclicRequire,
-    /// The loaded file's `(ns ...)` declaration differs from
-    /// the requested namespace name. Catches typos and rename
-    /// errors early.
-    NamespaceMismatch,
-    /// The file did not parse, read or compile.
-    LoadCompileFailed,
+    /// The file could not be found, read or evaluated, or did not
+    /// declare the namespace; `Loader.diagnostic` says why.
+    LoadFailed,
     /// A form of the file failed at run time with no handler in
     /// force anywhere; the VM's `traced_error` names the error and
     /// its `error_trace` locates it.
@@ -67,32 +49,83 @@ pub const LoadError = error{
     OutOfMemory,
 };
 
-/// Stable load context. Owns the loaded-set and
-/// loading-set across all `(require ...)` calls in a compilation
-/// session. CLI creates one at startup; tests can create their
-/// own. The expander invokes `loadNamespaceCallback` indirectly
-/// through `ExpandContext.load_callback`.
-pub const Loader = struct {
+/// What `evalSource` fails with: `Diagnosed` when `diagnostic`
+/// describes the failure, the rest as for `LoadError`.
+pub const EvalError = error{ Diagnosed, RunFailed, ControlTransferred, OutOfMemory };
+
+/// A UTF-8 byte-order mark. A source file that opens with one is read
+/// without it, so its positions count from the character after it
+/// (TOOLING.md §1).
+pub const byte_order_mark = "\xEF\xBB\xBF";
+
+/// A failure to read or compile, and where it happened.
+pub const Diagnostic = struct {
+    /// The source and the span in it the failure is at; null when
+    /// the failure has no place of its own (a required file that
+    /// does not exist), in which case `evalSource` puts it at the
+    /// requiring form.
+    source: ?*const vm_mod.SourceInfo = null,
+    span: ?reader_mod.SrcSpan = null,
+    /// What went wrong, as the CLI prints it after the location.
+    label: []const u8,
+    /// A parse or reader failure rather than a compile failure.
+    reading: bool = false,
+    /// The parser ran out of input: more text may complete the
+    /// form, so the REPL reads another line.
+    incomplete: bool = false,
+};
+
+/// A callback `evalSource` makes for each top-level form.
+pub fn Each(comptime T: type) type {
+    return struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, x: T) anyerror!void,
+    };
+}
+
+pub const EvalOptions = struct {
+    /// Where Form trees and compiled routines go. Routines must
+    /// outlive every closure and trace made from them: a file's run
+    /// passes an arena that lives as long as the run, a load or the
+    /// REPL the VM's runtime arena.
     allocator: std.mem.Allocator,
-    /// Allocator for compiled artifacts that must outlive the
-    /// per-form arena. Typically `vm.runtime_arena.allocator()`.
+    /// Every symbol must resolve to a name that exists or that the
+    /// text defines, as in a file; without it an unresolved symbol
+    /// is a forward reference (the embedded stdlib sources).
+    declare: bool = true,
+    /// Compile each form without running it and hand the routine
+    /// here (`disasm`).
+    on_routine: ?Each(*const vm_mod.Routine) = null,
+    /// Each form's value as it runs (the REPL prints it).
+    on_value: ?Each(Value) = null,
+};
+
+pub const Loader = struct {
+    /// Scratch: parse and read trees, name sets, diagnostic labels.
+    allocator: std.mem.Allocator,
+    /// Where a required file's text, path and routines live: they
+    /// outlive the load. Typically `vm.runtime_arena.allocator()`.
     persistent_allocator: std.mem.Allocator,
-    /// Zig 0.16 I/O context (needed for std.Io.Dir file ops).
     io: std.Io,
-    /// Directories to search for `.nx` files (in order).
+    /// Directories to search for `.nx` files, in order.
     load_paths: []const []const u8,
-    /// Shared VM + registry + interner + macros.
     vm: *vm_mod.VM,
     interner: *intern_mod.Interner,
     registry: *vm_mod.NamespaceRegistry,
     host_macros: *const expand_mod.HostMacroTable,
-    /// Idempotent-load set: ns names already fully loaded.
-    /// Keys are arena-owned (we dupe on insertion).
+    /// Namespaces fully loaded, or installed without a file.
     loaded: std.StringHashMap(void),
-    /// Cycle detection set: ns names currently in the middle
-    /// of loading. A nested `(require ...)` for a name already
-    /// here raises `CyclicRequire`.
-    loading: std.StringHashMap(void),
+    /// Namespaces being loaded, outermost first: a require of one
+    /// of them is a cycle.
+    loading: std.ArrayList([]const u8) = .empty,
+    /// The last failure `evalSource` or a load reported.
+    diagnostic: ?Diagnostic = null,
+    /// The label `diagnostic` owns.
+    label_buf: std.ArrayList(u8) = .empty,
+    /// Set by a failed load while a form is being compiled, so the
+    /// compile error the expander turns it into does not replace
+    /// the load's own diagnostic.
+    load_failed: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -114,163 +147,261 @@ pub const Loader = struct {
             .registry = registry,
             .host_macros = host_macros,
             .loaded = std.StringHashMap(void).init(allocator),
-            .loading = std.StringHashMap(void).init(allocator),
         };
     }
 
     pub fn deinit(self: *Loader) void {
         self.loaded.deinit();
-        self.loading.deinit();
+        self.loading.deinit(self.allocator);
+        self.label_buf.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Load `ns_name` from disk into the registry. Idempotent.
-    /// On success the namespace is registered AND populated.
-    /// The caller's current namespace is preserved (saved before
-    /// load, restored after).
+    /// Record `name` as loaded without a file: a namespace the
+    /// runtime installs. The name must outlive the loader.
+    pub fn markLoaded(self: *Loader, name: []const u8) !void {
+        try self.loaded.put(name, {});
+    }
+
+    /// The load callback the expander calls for `(require ...)`.
+    pub fn callback(self: *Loader) expand_mod.LoadCallback {
+        return .{ .user_data = @ptrCast(self), .load = &loadCallback };
+    }
+
+    pub fn loadCallback(user_data: *anyopaque, ns_name: []const u8) anyerror!void {
+        const self: *Loader = @ptrCast(@alignCast(user_data));
+        self.loadNamespace(ns_name) catch |err| {
+            if (err == LoadError.LoadFailed) self.load_failed = true;
+            return err;
+        };
+    }
+
+    /// Parse, read and compile every top-level form of `info.text`
+    /// in the current namespace, running each before the next is
+    /// compiled; the last form's value. `info` must outlive the
+    /// routines (`options.allocator`).
+    pub fn evalSource(self: *Loader, info: *const vm_mod.SourceInfo, options: EvalOptions) EvalError!Value {
+        const text = info.text;
+        var parser = reader_mod.parser.Parser.init(self.allocator, text);
+        defer parser.deinit();
+        const sexp = parser.parseProgram() catch {
+            const pos: u32 = @intCast(@min(parser.current.pos, text.len));
+            if (pos >= text.len) {
+                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
+            } else if (unterminatedString(text[pos..])) {
+                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
+            } else {
+                const len: u32 = @max(parser.current.len, 1);
+                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = len }, .label = "", .reading = true }, "parse error: unexpected `{s}`", .{text[pos..@min(text.len, pos + len)]});
+            }
+            return error.Diagnosed;
+        };
+        var rdr = reader_mod.Reader.init(self.allocator, text);
+        defer rdr.deinit();
+        const forms = rdr.readProgram(sexp) catch |err| {
+            const e = rdr.err orelse {
+                try self.diagnose(.{ .label = "", .reading = true }, "reader error: {s}", .{@errorName(err)});
+                return error.Diagnosed;
+            };
+            // Kinds are spelled with underscores in Zig and dashes in
+            // nexis; the detail is the user's own text.
+            var kind_buf: [64]u8 = undefined;
+            const kind = kind_buf[0..@tagName(e.kind).len];
+            @memcpy(kind, @tagName(e.kind));
+            std.mem.replaceScalar(u8, kind, '_', '-');
+            const base: Diagnostic = .{ .source = info, .span = e.span, .label = "", .reading = true };
+            if (e.detail) |detail|
+                try self.diagnose(base, "reader error: :{s} {s}", .{ kind, detail })
+            else
+                try self.diagnose(base, "reader error: :{s}", .{kind});
+            return error.Diagnosed;
+        };
+
+        var declared = compile_mod.DeclaredNames.init(self.allocator);
+        defer declared.deinit();
+        if (options.declare) for (forms) |form| try declared.declareForm(form);
+
+        var last: Value = @import("value.zig").nilValue();
+        for (forms) |form| {
+            var span: ?reader_mod.SrcSpan = null;
+            var detail: ?[]const u8 = null;
+            self.load_failed = false;
+            const compiled = compile_mod.compileFormWith(options.allocator, form, .{
+                .namespace = self.registry.current,
+                .interner = self.interner,
+                .host_macros = self.host_macros,
+                .out_span = &span,
+                .out_detail = &detail,
+                .io = self.io,
+                .persistent_allocator = self.persistent_allocator,
+                .registry = self.registry,
+                .load_callback = self.callback(),
+                .declared = if (options.declare) &declared else null,
+                .source = info,
+            }) catch |err| return self.compileFailure(info, err, span, detail);
+            // A run that fails leaves its frame for the trace, and
+            // the frame points at the routine.
+            const routine = try options.allocator.create(vm_mod.Routine);
+            routine.* = compiled.toRoutine("<top>");
+            if (options.on_routine) |each| {
+                each.call(each.ctx, routine) catch |err| return mapCallbackError(err);
+                continue;
+            }
+            // A nested call, never a retarget of the top frame: the VM
+            // may be running the program that required this text. A
+            // failure's detail is this form's, not an earlier one's.
+            self.vm.error_detail = "";
+            last = self.vm.runRoutine(routine) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ControlTransferred => error.ControlTransferred,
+                else => error.RunFailed,
+            };
+            if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
+        }
+        return last;
+    }
+
+    /// Whether `rest` opens a string literal that no unescaped `"`
+    /// closes: the parser stops at the opening quote, and more input
+    /// may complete it.
+    fn unterminatedString(rest: []const u8) bool {
+        if (rest.len == 0 or rest[0] != '"') return false;
+        var i: usize = 1;
+        while (i < rest.len) : (i += 1) switch (rest[i]) {
+            '\\' => i += 1,
+            '"' => return false,
+            else => {},
+        };
+        return true;
+    }
+
+    fn mapCallbackError(err: anyerror) EvalError {
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.RunFailed;
+    }
+
+    fn compileFailure(self: *Loader, info: *const vm_mod.SourceInfo, err: anyerror, span: ?reader_mod.SrcSpan, detail: ?[]const u8) EvalError {
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ControlTransferred => return error.ControlTransferred,
+            error.RequiredFileFailed => return error.RunFailed,
+            else => {},
+        }
+        if (self.load_failed) {
+            self.load_failed = false;
+            // A load failure with no place of its own is the
+            // requiring form's.
+            if (self.diagnostic) |*d| if (d.source == null) {
+                d.source = info;
+                d.span = span;
+            };
+            return error.Diagnosed;
+        }
+        const base: Diagnostic = .{ .source = info, .span = span, .label = "" };
+        if (detail) |d|
+            self.diagnose(base, "{s}: {s}", .{ @errorName(err), d }) catch return error.OutOfMemory
+        else
+            self.diagnose(base, "{s}", .{@errorName(err)}) catch return error.OutOfMemory;
+        return error.Diagnosed;
+    }
+
+    /// Set `diagnostic` to `base` with the formatted label.
+    fn diagnose(self: *Loader, base: Diagnostic, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        self.label_buf.clearRetainingCapacity();
+        self.label_buf.print(self.allocator, fmt, args) catch return error.OutOfMemory;
+        var d = base;
+        d.label = self.label_buf.items;
+        self.diagnostic = d;
+    }
+
+    /// Load `ns_name` from the load path into the registry, once.
+    /// The caller's current namespace is restored afterwards.
     pub fn loadNamespace(self: *Loader, ns_name: []const u8) LoadError!void {
-        // Namespaces installed at VM startup have no file; a require
-        // of one only aliases it.
-        for (installed_namespaces) |name| if (std.mem.eql(u8, name, ns_name)) return;
-        // Already loaded → no-op.
         if (self.loaded.contains(ns_name)) return;
-        // Already loading → cycle.
-        if (self.loading.contains(ns_name)) return LoadError.CyclicRequire;
+        for (self.loading.items) |name| if (std.mem.eql(u8, name, ns_name)) {
+            try self.diagnose(.{ .label = "" }, "require: cyclic require of {s}", .{ns_name});
+            return LoadError.LoadFailed;
+        };
+        for (clojure_names) |pair| if (std.mem.eql(u8, pair[0], ns_name)) return self.loadCounterpart(pair[0], pair[1]);
 
-        // Map ns name to file: dots → slashes, ".nx" suffix.
-        const rel_path = nsNameToRelPath(self.allocator, ns_name) catch return LoadError.OutOfMemory;
+        const rel_path = try nsNameToRelPath(self.allocator, ns_name);
         defer self.allocator.free(rel_path);
-
-        // Search load paths for the file.
-        const file_path = searchLoadPaths(self.allocator, self.io, self.load_paths, rel_path) catch return LoadError.OutOfMemory;
-        const path = file_path orelse return LoadError.FileNotFound;
+        const path = (try searchLoadPaths(self.allocator, self.io, self.load_paths, rel_path)) orelse {
+            try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path", .{rel_path});
+            return LoadError.LoadFailed;
+        };
         defer self.allocator.free(path);
 
         // The text and the path outlive the load: every routine
         // compiled from the file points at them for its error
         // reports (TOOLING.md §1).
-        const source = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            path,
-            self.persistent_allocator,
-            .limited(16 * 1024 * 1024),
-        ) catch return LoadError.FileReadError;
+        const file = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.persistent_allocator, .unlimited) catch |err| {
+            try self.diagnose(.{ .label = "" }, "require: cannot read {s}: {s}", .{ path, @errorName(err) });
+            return LoadError.LoadFailed;
+        };
+        const source = if (std.mem.startsWith(u8, file, byte_order_mark)) file[byte_order_mark.len..] else file;
+        const info = try self.persistent_allocator.create(vm_mod.SourceInfo);
+        info.* = .{ .path = try self.persistent_allocator.dupe(u8, path), .text = source };
 
-        // Dupe ns_name into a stable storage so `loaded` set
-        // entries outlive the requesting expander's call (the
-        // borrowed `ns_name` slice may be in a per-form arena).
-        const stable_name = self.persistent_allocator.dupe(u8, ns_name) catch return LoadError.OutOfMemory;
-        self.loading.put(stable_name, {}) catch return LoadError.OutOfMemory;
-        // On any return path, unconditionally remove from loading.
-        defer _ = self.loading.remove(stable_name);
-
-        // Save caller's current namespace; restore on exit.
+        const stable_name = try self.persistent_allocator.dupe(u8, ns_name);
+        try self.loading.append(self.allocator, stable_name);
+        defer _ = self.loading.pop();
         const saved_current = self.registry.current;
         defer self.registry.current = saved_current;
 
-        // Compile + evaluate each top-level form in the source
-        // file. The file's `(ns ...)` form (which we require) is
-        // the FIRST form; it must set the current ns to the
-        // requested name. We verify after.
-        try self.evalFile(stable_name, source, path);
-
-        // Mark as loaded.
-        self.loaded.put(stable_name, {}) catch return LoadError.OutOfMemory;
-    }
-
-    fn evalFile(self: *Loader, ns_name: []const u8, source: []const u8, path: []const u8) LoadError!void {
-        var parse_result = reader_mod.parser.parseProgram(self.allocator, source) catch return LoadError.LoadCompileFailed;
-        defer parse_result.parser.deinit();
-        var rdr = reader_mod.Reader.init(self.allocator, source);
-        defer rdr.deinit();
-        const forms = rdr.readProgram(parse_result.sexp) catch return LoadError.LoadCompileFailed;
-
-        // Validate first form is `(ns NAME)` matching ns_name.
-        if (forms.len == 0) return LoadError.NamespaceMismatch;
-        if (!firstFormIsNs(forms[0], ns_name)) return LoadError.NamespaceMismatch;
-
-        // Use the persistent allocator as the compile arena so
-        // every def'd Var + Closure + Routine outlives the load.
-        const ra = self.persistent_allocator;
-
-        // Every name the file defines is visible to every form in
-        // it; anything else unresolved is a compile error.
-        var declared = compile_mod.DeclaredNames.init(self.allocator);
-        defer declared.deinit();
-        for (forms) |form| declared.declareForm(form) catch return LoadError.OutOfMemory;
-
-        const info = ra.create(vm_mod.SourceInfo) catch return LoadError.OutOfMemory;
-        info.* = .{
-            .path = ra.dupe(u8, path) catch return LoadError.OutOfMemory,
-            .text = source,
-        };
-
-        for (forms) |form| {
-            const current_ns = self.registry.current;
-            // The loader is the form's load callback too, so a
-            // `(require ...)` inside the file resolves the same way.
-            const compiled = compile_mod.compileFormWith(ra, form, .{
-                .namespace = current_ns,
-                .interner = self.interner,
-                .host_macros = self.host_macros,
-                .persistent_allocator = ra,
-                .registry = self.registry,
-                .load_callback = .{ .user_data = @ptrCast(self), .load = &Loader.loadCallback },
-                .declared = &declared,
-                .source = info,
-            }) catch |err| return switch (err) {
-                error.OutOfMemory => LoadError.OutOfMemory,
-                error.ControlTransferred => LoadError.ControlTransferred,
-                error.RequiredFileFailed => LoadError.RunFailed,
-                else => LoadError.LoadCompileFailed,
-            };
-            // A nested call, never a retarget of the top frame: the
-            // VM may be executing the program that required us. The
-            // routine lives in the persistent allocator because a run
-            // that fails leaves its frame in place for the error
-            // trace, and that frame must not point at a dead local.
-            const routine = ra.create(vm_mod.Routine) catch return LoadError.OutOfMemory;
-            routine.* = compiled.toRoutine("<top>");
-            _ = self.vm.runRoutine(routine) catch |err| return switch (err) {
-                error.OutOfMemory => LoadError.OutOfMemory,
-                error.ControlTransferred => LoadError.ControlTransferred,
-                else => LoadError.RunFailed,
-            };
+        if (!startsWithNs(source, ns_name)) {
+            try self.diagnose(.{ .source = info, .span = .{ .pos = 0, .len = 1 }, .label = "" }, "require: {s} does not begin with (ns {s})", .{ path, ns_name });
+            return LoadError.LoadFailed;
         }
+        _ = self.evalSource(info, .{ .allocator = self.persistent_allocator }) catch |err| return switch (err) {
+            error.Diagnosed => LoadError.LoadFailed,
+            error.RunFailed => LoadError.RunFailed,
+            error.ControlTransferred => LoadError.ControlTransferred,
+            error.OutOfMemory => LoadError.OutOfMemory,
+        };
+        try self.loaded.put(stable_name, {});
     }
 
-    /// Callback: expander's `ExpandContext.load_callback`
-    /// is set to this. Translates the opaque `user_data` back to
-    /// `*Loader` + invokes `loadNamespace`.
-    pub fn loadCallback(user_data: *anyopaque, ns_name: []const u8) anyerror!void {
-        const self: *Loader = @ptrCast(@alignCast(user_data));
-        try self.loadNamespace(ns_name);
+    /// `name`, a Clojure library namespace, as a namespace of its own
+    /// whose Vars are `target`'s, so `(clojure.string/join ...)` and
+    /// an alias of `clojure.string` reach `nexis.string/join`.
+    fn loadCounterpart(self: *Loader, name: []const u8, target_name: []const u8) LoadError!void {
+        const target = self.registry.lookupNs(target_name) orelse {
+            try self.diagnose(.{ .label = "" }, "require: {s} has no counterpart ({s} is not installed)", .{ name, target_name });
+            return LoadError.LoadFailed;
+        };
+        const ns = try self.registry.getOrCreate(name, self.registry.core);
+        var it = target.vars.iterator();
+        while (it.next()) |entry| try ns.vars.put(ns.map_allocator, entry.key_ptr.*, entry.value_ptr.*);
+        try self.loaded.put(ns.name, {});
     }
 };
 
-/// Namespaces the CLI populates before any file runs.
-const installed_namespaces = [_][]const u8{ "nexis.core", "db", "nexis.string", "nexis.internal", "nexis.simd", "nextomic", "nexis.test", "nexis.pprint", "nexis.math" };
+/// Clojure's library namespaces and the nexis namespaces that stand
+/// for them.
+const clojure_names = [_][2][]const u8{
+    .{ "clojure.string", "nexis.string" },
+    .{ "clojure.set", "nexis.set" },
+    .{ "clojure.test", "nexis.test" },
+    .{ "clojure.pprint", "nexis.pprint" },
+};
 
-/// Map `my.app.foo` → `my/app/foo.nx`. Caller owns returned slice.
+/// `my.app-core.foo` → `my/app_core/foo.nx`. Caller owns the slice.
 fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
-    // Output length = input length (dots → slashes, same chars)
-    //                 + len(".nx") = +3.
-    var buf = try allocator.alloc(u8, ns_name.len + 3);
-    var i: usize = 0;
-    while (i < ns_name.len) : (i += 1) {
-        buf[i] = if (ns_name[i] == '.') '/' else ns_name[i];
-    }
+    const buf = try allocator.alloc(u8, ns_name.len + 3);
+    for (ns_name, buf[0..ns_name.len]) |c, *out| out.* = switch (c) {
+        '.' => '/',
+        '-' => '_',
+        else => c,
+    };
     @memcpy(buf[ns_name.len..], ".nx");
     return buf;
 }
 
-/// Search `load_paths` for `rel_path`. Returns the first
-/// existing path, or null if not found. Caller owns the
-/// returned slice.
+/// The first of `load_paths` holding `rel_path`, joined; the caller
+/// owns it.
 fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const []const u8, rel_path: []const u8) !?[]u8 {
     for (load_paths) |dir| {
         const candidate = try std.fs.path.join(allocator, &.{ dir, rel_path });
-        // Try to stat via Zig 0.16 std.Io.Dir API. If accessible, return.
         std.Io.Dir.cwd().access(io, candidate, .{}) catch {
             allocator.free(candidate);
             continue;
@@ -280,20 +411,62 @@ fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const
     return null;
 }
 
-/// Returns true iff `form` is `(ns NAME)` where NAME (as an
-/// unqualified symbol) equals `expected_ns_name`. Used to
-/// validate that a required file declares the namespace the
-/// caller asked for.
-fn firstFormIsNs(form: *const reader_mod.Form, expected_ns_name: []const u8) bool {
-    if (form.datum != .list) return false;
-    const items = form.datum.list;
-    if (items.len != 2) return false;
-    const head = items[0];
-    const name = items[1];
-    if (head.datum != .symbol or head.datum.symbol.ns != null) return false;
-    if (!std.mem.eql(u8, head.datum.symbol.name, "ns")) return false;
-    if (name.datum != .symbol or name.datum.symbol.ns != null) return false;
-    return std.mem.eql(u8, name.datum.symbol.name, expected_ns_name);
+/// Whether `source`'s first form is `(ns NAME ...)` with NAME the
+/// requested namespace, `^meta` before it allowed: a file that
+/// declares another name, or none, is refused before any of it runs.
+/// Only the head and the name are looked at; the rest of the form is
+/// the expander's.
+fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
+    var i: usize = 0;
+    while (i < source.len) {
+        switch (source[i]) {
+            ' ', '\t', '\r', '\n', ',' => i += 1,
+            ';' => while (i < source.len and source[i] != '\n') {
+                i += 1;
+            },
+            else => break,
+        }
+    }
+    const rest = source[i..];
+    if (!std.mem.startsWith(u8, rest, "(ns")) return false;
+    var after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
+    if (after.len == rest.len - 3) return false;
+    while (after.len > 0 and after[0] == '^') {
+        after = std.mem.trimStart(u8, after[metaLen(after)..], " \t\r\n,");
+    }
+    if (!std.mem.startsWith(u8, after, ns_name)) return false;
+    if (after.len == ns_name.len) return false;
+    return switch (after[ns_name.len]) {
+        ' ', '\t', '\r', '\n', ',', ')', '"', '(', '^', '{' => true,
+        else => false,
+    };
+}
+
+/// The length of the `^meta` that opens `text`: a map to its closing
+/// brace (braces in strings and char literals aside), else a keyword
+/// or symbol token; all of `text` when the map is not closed.
+fn metaLen(text: []const u8) usize {
+    var i: usize = 1;
+    if (i < text.len and text[i] == '{') {
+        var depth: usize = 0;
+        var in_string = false;
+        while (i < text.len) : (i += 1) switch (text[i]) {
+            '\\' => i += 1,
+            '"' => in_string = !in_string,
+            '{' => depth += @intFromBool(!in_string),
+            '}' => if (!in_string) {
+                depth -= 1;
+                if (depth == 0) return i + 1;
+            },
+            else => {},
+        };
+        return text.len;
+    }
+    while (i < text.len) : (i += 1) switch (text[i]) {
+        ' ', '\t', '\r', '\n', ',', ')', '(', '"' => break,
+        else => {},
+    };
+    return i;
 }
 
 // =============================================================================
@@ -302,15 +475,31 @@ fn firstFormIsNs(form: *const reader_mod.Form, expected_ns_name: []const u8) boo
 
 const testing = std.testing;
 
-test "loader: nsNameToRelPath" {
+test "loader: namespace names map to relative paths" {
     const cases = .{
         .{ "foo", "foo.nx" },
         .{ "foo.bar", "foo/bar.nx" },
         .{ "a.b.c.d", "a/b/c/d.nx" },
+        .{ "my.app-core.foo-bar", "my/app_core/foo_bar.nx" },
     };
     inline for (cases) |c| {
         const out = try nsNameToRelPath(testing.allocator, c[0]);
         defer testing.allocator.free(out);
         try testing.expectEqualStrings(c[1], out);
     }
+}
+
+test "loader: a file must open with (ns NAME ...)" {
+    try testing.expect(startsWithNs("(ns app.a)", "app.a"));
+    try testing.expect(startsWithNs("; header\n\n(ns app.a \"doc\" (:require [b]))", "app.a"));
+    try testing.expect(startsWithNs("(ns\n  app.a\n  (:require [app.b :as b]))", "app.a"));
+    try testing.expect(!startsWithNs("(ns app.ab)", "app.a"));
+    try testing.expect(!startsWithNs("(nsx app.a)", "app.a"));
+    try testing.expect(!startsWithNs("(def x 1)", "app.a"));
+    try testing.expect(!startsWithNs("", "app.a"));
+    // Metadata on the name, as Clojure allows it.
+    try testing.expect(startsWithNs("(ns ^:no-doc app.a)", "app.a"));
+    try testing.expect(startsWithNs("(ns ^:no-doc ^{:doc \"a {b} \\\" }\" :k \\}}\n  app.a (:require [b]))", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^:no-doc app.ab)", "app.a"));
+    try testing.expect(!startsWithNs("(ns ^{:doc \"x\"", "app.a"));
 }

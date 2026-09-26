@@ -102,4 +102,4 @@
 (println [(flags (d/as-of flagged t-uniq) :doc/part) (flags flagged :doc/part)])
 
 (d/release c)
-:time-done
+(println :time-done)

@@ -13,9 +13,11 @@
 (defn true?  [x] (= x true))
 (defn false? [x] (= x false))
 
-; second / nthrest / last — basic seq access.
-(defn second [s] (first (rest s)))
-(defn third  [s] (first (rest (rest s))))
+; second, third, take, some and every? are natives that walk no
+; further than they must.
+(defn ffirst [x] (first (first x)))
+(defn fnext [x] (second x))
+(defn nnext [x] (next (next x)))
 
 (defn last [s]
   ; Walk by reducing; the reduce fn keeps only the latest x.
@@ -29,39 +31,101 @@
   ; reduce + cons builds the list in reverse order naturally.
   (reduce (fn* [acc x] (cons x acc)) (list) s))
 
-(defn take [n s]
-  ; Return up to n elements of s as a list.
-  (loop* [i 0 rem s acc (list)]
-    (if (< i n)
-      (if (empty? rem)
-        (reverse acc)
-        (recur (inc i) (rest rem) (cons (first rem) acc)))
-      (reverse acc))))
-
+; (drop n coll) → a seq of coll without its first n elements, () when
+; none are left.
 (defn drop [n s]
-  (nthrest s n))
+  (or (seq (nthrest s n)) (list)))
+
+; (nthnext coll n) → the elements after the first n, nil when none.
+(defn nthnext [coll n]
+  (seq (nthrest coll n)))
 
 ; ============================================================
 ; Conditional macros
 ; ============================================================
 
-; (when-let [name val-expr] body...)
-;   evaluates val-expr; if truthy, binds it to name and runs
-;   body, returning its last value. Else nil.
-(defmacro when-let [binding & body]
-  `(let* [bound# ~(first (rest binding))]
-     (if bound#
-       (let* [~(first binding) bound#]
-         (do ~@body))
-       nil)))
+; (if-let [binding test] then else?) → then with binding bound to
+; test's value when it is truthy, else. The binding may destructure;
+; any other shape fails to expand, as in Clojure.
+(defmacro if-let [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-let takes [binding test], then and an optional else" {})))
+  `(let [temp# ~(second binding)]
+     (if temp#
+       (let [~(first binding) temp#] ~then)
+       ~(first else))))
 
-; (if-let [name val-expr] then else)
-;   like when-let but with explicit else branch.
-(defmacro if-let [binding then else]
-  `(let* [bound# ~(first (rest binding))]
-     (if bound#
-       (let* [~(first binding) bound#] ~then)
-       ~else)))
+; (when-let [binding test] body...) → body when test is truthy.
+(defmacro when-let [binding & body]
+  `(let [temp# ~(second binding)]
+     (when temp#
+       (let [~(first binding) temp#] ~@body))))
+
+; (if-some [binding test] then else?) / (when-some [binding test]
+; body...) → as if-let / when-let, but only nil fails: false binds.
+(defmacro if-some [binding then & else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
+    (throw (ex-info "if-some takes [binding test], then and an optional else" {})))
+  `(let [temp# ~(second binding)]
+     (if (nil? temp#)
+       ~(first else)
+       (let [~(first binding) temp#] ~then))))
+
+(defmacro when-some [binding & body]
+  `(let [temp# ~(second binding)]
+     (if (nil? temp#)
+       nil
+       (let [~(first binding) temp#] ~@body))))
+
+; (when-first [x coll] body...) → body with x bound to the first
+; element, when coll has one.
+(defmacro when-first [binding & body]
+  `(let [s# (seq ~(second binding))]
+     (when s#
+       (let [~(first binding) (first s#)] ~@body))))
+
+; (comment ...) → nil; the body is never evaluated or compiled, so
+; it may hold anything that reads (PLAN §23 #27).
+(defmacro comment [& _] nil)
+
+; (doto x (f a) g ...) → x, after (f x a), (g x), ... in order.
+(defmacro doto [x & forms]
+  (let [g (gensym "doto")]
+    `(let [~g ~x]
+       ~@(map (fn [f] (if (seq? f) `(~(first f) ~g ~@(rest f)) `(~f ~g))) forms)
+       ~g)))
+
+; (defonce name expr) → defines name as expr's value unless it
+; already has one; expr is not evaluated then.
+(defmacro defonce [name expr]
+  `(let [v# (def ~name)]
+     (when-not (bound? v#) (def ~name ~expr))
+     v#))
+
+; (assert x) / (assert x message) → nil when x is truthy, else throws
+; ex-info "Assert failed: <message or the form>" whose data's :error
+; is :assertion-failed.
+(defmacro assert [x & message]
+  `(when-not ~x
+     (throw (ex-info (str "Assert failed: "
+                          ~(if (seq message) `(str ~(first message) "\n" (pr-str '~x)) `(pr-str '~x)))
+                     (hash-map (keyword "error") (keyword "assertion-failed"))))))
+
+; (time expr) → expr's value, after printing how long it took, as
+; Clojure's does.
+(defmacro time [expr]
+  `(let [start# (nano-time)
+         ret# ~expr]
+     (prn (str "Elapsed time: " (/ (double (- (nano-time) start#)) 1000000.0) " msecs"))
+     ret#))
+
+; (with-out-str body...) → what body printed, as a string; nothing
+; reaches stdout. Captures nest.
+(defmacro with-out-str [& body]
+  `(do (nexis.internal/#%push-out)
+       (try (do ~@body)
+            (catch any e# (nexis.internal/#%pop-out) (throw e#)))
+       (nexis.internal/#%pop-out)))
 
 ; (dotimes [name n-expr] body...)
 ;   runs body n times with name bound to 0..n-1.
@@ -106,7 +170,7 @@
          (db/abort-read! ~(first binding))
          (throw e#)))))
 
-; Snapshot vocabulary (PLAN.md §15.7).
+; Snapshot vocabulary (docs/DB.md §12).
 ;
 ; A snapshot is an emdb read transaction pinned to the commit
 ; generation that was current when it began. As long as the
@@ -123,7 +187,7 @@
 ; snapshot is an ordinary Value — pass it to functions, store
 ; it, compare it for identity.
 ;
-; Caveat (per PLAN.md §15.7): long-held snapshots prevent emdb
+; Caveat (docs/DB.md §12): long-held snapshots prevent emdb
 ; from reclaiming pages they reference. Don't pin snapshots
 ; you don't intend to release.
 
@@ -212,28 +276,10 @@
 
 ; ---- short-circuiting predicates over sequences ----
 
-; (every? pred coll) → true iff pred is truthy for every elt.
-; Empty coll → true (vacuous). Stops on first falsy result.
-(defn every? [pred coll]
-  (loop* [s coll]
-    (if (empty? s)
-      true
-      (if (pred (first s))
-        (recur (rest s))
-        false))))
-
 ; (not-every? pred coll) → true iff pred is falsy for at
 ; least one elt. (Inverse of every?.)
 (defn not-every? [pred coll]
   (not (every? pred coll)))
-
-; (some pred coll) → first truthy (pred x) result, or nil.
-(defn some [pred coll]
-  (loop* [s coll]
-    (if (empty? s)
-      nil
-      (let* [r (pred (first s))]
-        (if r r (recur (rest s)))))))
 
 ; (not-any? pred coll) → true iff pred is falsy for all elts.
 (defn not-any? [pred coll]
@@ -261,12 +307,15 @@
            m
            ks))
   ([m ks default]
-   (loop* [acc m s (seq ks)]
-     (if (nil? s)
-       acc
-       (if (and (some? acc) (contains? acc (first s)))
-         (recur (get acc (first s)) (next s))
-         default)))))
+   ; A fresh atom is identical to no value a map holds.
+   (let* [missing (atom nil)]
+     (loop* [acc m s (seq ks)]
+       (if (nil? s)
+         acc
+         (let* [v (get acc (first s) missing)]
+           (if (identical? v missing)
+             default
+             (recur v (next s)))))))))
 
 ; (assoc-in m [k1 k2 ...] v) → m with the nested path set to v.
 (defn assoc-in [m ks v]
@@ -469,3 +518,169 @@
     expr
     `(let* [~name ~expr]
        (as-> ~(first forms) ~name ~@(rest forms)))))
+
+; ============================================================
+; More sequence and function helpers
+; ============================================================
+
+; (some-fn p & ps) → a fn returning the first truthy result of a
+; predicate on an argument, in Clojure's order: each predicate over the
+; first three arguments, then each further argument against every
+; predicate (every predicate against those arguments past three
+; predicates). A miss is the last result for up to three predicates
+; and three arguments, else nil. (every-pred p & ps) → a fn true when
+; every predicate is truthy of every argument.
+(defn some-fn [p & ps]
+  (let [ps (cons p ps)
+        many (> (count ps) 3)
+        hit (fn [f coll]
+              (loop [s (seq coll) r nil]
+                (if s (let [v (f (first s))] (if v v (recur (next s) v))) r)))]
+    (fn [& xs]
+      (let [more (drop 3 xs)
+            r (hit (fn [p] (hit p (take 3 xs))) ps)]
+        (cond r r
+              (seq more) (if many
+                           (some (fn [p] (some p more)) ps)
+                           (some (fn [x] (hit (fn [p] (p x)) ps)) more))
+              many nil
+              true r)))))
+
+(defn every-pred [& ps]
+  (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
+
+; (memoize f) → f, caching each result by its arguments.
+(defn memoize [f]
+  (let [cache (atom {})]
+    (fn [& args]
+      (let [hit (find @cache args)]
+        (if hit
+          (val hit)
+          (let [r (apply f args)]
+            (swap! cache assoc args r)
+            r))))))
+
+; (trampoline f & args) → calls f, then each fn it returns, until a
+; value that is not a fn comes back; mutual recursion without stack.
+(defn trampoline [f & args]
+  (loop [r (apply f args)]
+    (if (fn? r) (recur (r)) r)))
+
+; (comparator pred) → a comparator of two arguments from a "less
+; than" predicate.
+(defn comparator [pred]
+  (fn [a b] (cond (pred a b) -1 (pred b a) 1 true 0)))
+
+; (run! f coll) → calls f on each element for its effect; nil.
+(defn run! [f coll]
+  (reduce (fn [_ x] (f x) nil) nil coll))
+
+; Sequences are eager, so doall and dorun only return.
+(defn doall [coll] coll)
+(defn dorun [coll] nil)
+
+; (partition-by f coll) → coll split each time (f x) changes.
+(defn partition-by [f coll]
+  (loop [s (seq coll) acc [] run [] k nil]
+    (if s
+      (let [x (first s) fx (f x)]
+        (if (or (empty? run) (= fx k))
+          (recur (next s) acc (conj run x) fx)
+          (recur (next s) (conj acc (seq run)) [x] fx)))
+      (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
+
+; (dedupe coll) → coll without consecutive duplicates.
+(defn dedupe [coll]
+  (or (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)) (list)))
+
+; (take-nth n coll) → every nth element, starting with the first.
+(defn take-nth [n coll]
+  (keep-indexed (fn [i x] (when (zero? (rem i n)) x)) coll))
+
+; (split-with pred coll) → [(take-while pred coll) (drop-while pred coll)].
+(defn split-with [pred coll]
+  [(take-while pred coll) (drop-while pred coll)])
+
+; (distinct? x & xs) → whether no two arguments are equal.
+(defn distinct? [& xs]
+  (= (count xs) (count (set xs))))
+
+; (rseq v) → v's elements last first, nil when empty.
+(defn rseq [v]
+  (seq (reverse v)))
+
+; (rand-nth coll) → a random element; (shuffle coll) → a vector of
+; coll's elements in random order.
+(defn rand-nth [coll]
+  (nth coll (rand-int (count coll))))
+
+(defn shuffle [coll]
+  (loop [v (vec coll) i (dec (count v))]
+    (if (pos? i)
+      (let [j (rand-int (inc i)) vi (nth v i)]
+        (recur (assoc v i (nth v j) j vi) (dec i)))
+      v)))
+
+; (update-vals m f) / (update-keys m f) → a map of m's entries with f
+; applied to every value / key, keeping m's metadata.
+(defn update-vals [m f]
+  (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (f v))) (transient {}) m)) (meta m)))
+
+(defn update-keys [m f]
+  (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc (f k) v)) (transient {}) m)) (meta m)))
+
+; (reset-vals! a v) → [old new] after setting a to v.
+(defn reset-vals! [a v]
+  (swap-vals! a (constantly v)))
+
+; Volatiles are atoms: one isolate, one thread.
+(defn volatile! [x] (atom x))
+(defn volatile? [x] (atom? x))
+(defn vreset! [v x] (reset! v x))
+(defmacro vswap! [v f & args]
+  `(swap! ~v ~f ~@args))
+
+; ---- predicates ----
+(defn any? [_] true)
+(defn ident? [x] (or (keyword? x) (symbol? x)))
+(defn qualified-keyword? [x] (boolean (and (keyword? x) (namespace x))))
+(defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
+(defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
+(defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
+; int? and its kin: an integer in Java's long range, as Clojure's are
+; true of a Long and not a BigInt.
+(defn int? [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
+(defn pos-int? [x] (and (int? x) (pos? x)))
+(defn nat-int? [x] (and (int? x) (not (neg? x))))
+(defn neg-int? [x] (and (int? x) (neg? x)))
+(defn double? [x] (float? x))
+(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
+(defn counted? [x] (or (coll? x) (typed-vector? x)))
+(defn record? [x] (nexis.internal/#%record? x))
+(defn parse-boolean [s]
+  (cond (= s "true") true (= s "false") false (string? s) nil true (throw (keyword "kind-mismatch"))))
+
+; (ex-cause e) → the cause an ex-info carries, nil for anything else.
+(defn ex-cause [e]
+  (when (map? e) (get e (keyword "cause"))))
+
+; (printf fmt & args) → prints (format fmt args...); nil.
+(defn printf [fmt & args]
+  (print (apply format fmt args)))
+
+; ============================================================
+; Printing to a string
+; ============================================================
+
+(defn newline [] (print "\n"))
+(defn print-str [& xs] (with-out-str (apply print xs)))
+(defn println-str [& xs] (with-out-str (apply println xs)))
+(defn prn-str [& xs] (with-out-str (apply prn xs)))
+
+; ============================================================
+; The command line
+; ============================================================
+
+; The arguments after the program on the command line, as a vector
+; of strings; nil when there are none. `nexis run` binds it.
+(def *command-line-args* nil)

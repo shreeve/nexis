@@ -1,0 +1,3 @@
+nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m threw bad macro input
+    (m 1)
+    ^^^^^

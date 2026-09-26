@@ -9,9 +9,14 @@ zig build examples                      # every example through bin/nexis
 ```
 
 `zig build examples` (part of `zig build test`) runs every file below
-from a generated working directory; `durable-refs`, `todo-app` and
-`nextomic-app` run a second time in the same directory, which proves
-their second-run behavior.
+from a fresh working directory and compares what it prints with
+`test/examples/<name>.out`. `durable-refs`, `todo-app` and
+`nextomic-app` then run a second time over the store the first run
+left, compared with `test/examples/<name>.2.out`. `durable-refs`
+prints the same both times; `todo-app` starts its second run from the
+first run's state, and `nextomic-app` shows the facts both runs
+added. `zig build examples -Dupdate=true` rewrites the expected
+files.
 
 | File | What it shows |
 |---|---|
@@ -37,8 +42,8 @@ their second-run behavior.
 | `tests-demo.nx` | `nexis.test`: `deftest`, `is` (`=`, `thrown?`, bare), `testing`, `run-tests`; one test fails, one throws, so the report shows every outcome and the summary map |
 | `shapes-app.nx` + `lib/shapes/{protocol,records,builtins}.nx` | The same program as a multi-file application: a driver and three required modules; prints one report per shape and `total-area atom = 9650` |
 | `durable-refs.nx` | Durable identity backed by emdb: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`; values persist across processes |
-| `todo-app.nx` | Persistent to-do tracker over the whole `db/*` surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Run twice: the second run shows `:completed 1` |
-| `nextomic-app.nx` | A clinic chart on Nextomic (`docs/NEXTOMIC.md`): schema as data, upserts by unique identity, component notes, Datalog queries with `d/q` (joins, `:in`, a predicate, an aggregate), `d/pull` patterns (nested, reverse, component), `as-of`/`history`/`tx-range` reads, a speculative `d/with`, a caught `:nextomic/unique`. Safe to run twice: the second run re-upserts the same patients and advances only the basis |
+| `todo-app.nx` | Persistent to-do tracker over the whole `db/*` surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Its report ends `:final-stats {:total 3, :completed 1}` on every run |
+| `nextomic-app.nx` | A clinic chart on Nextomic (`docs/NEXTOMIC.md`): schema as data, upserts by unique identity, component notes, Datalog queries with `d/q` (joins, `:in`, a predicate, an aggregate), `d/pull` patterns (nested, reverse, component), `as-of`/`history`/`tx-range` reads, a speculative `d/with`, a caught `:nextomic/unique`. Patients and visits upsert by unique identity, so a second run still counts two patients and one visit; its notes are added again and its history shows both runs |
 
 The store-backed examples write under `tmp/` relative to the working
 directory; delete it to start from an empty store.

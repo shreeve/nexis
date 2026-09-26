@@ -4,16 +4,17 @@
 //! the user functions a query may call.
 
 const std = @import("std");
-const nextomic = @import("nextomic");
-const value = @import("value");
-const heap_mod = @import("heap");
-const intern_mod = @import("intern");
-const string_mod = @import("string");
-const list_mod = @import("list");
-const vector_mod = @import("vector");
-const champ = @import("champ");
-const dispatch = @import("dispatch");
-const reader_mod = @import("reader");
+const nx = @import("nexis");
+const nextomic = nx.nextomic;
+const value = nx.value;
+const heap_mod = nx.heap;
+const intern_mod = nx.intern;
+const string_mod = nx.string;
+const list_mod = nx.list;
+const vector_mod = nx.vector;
+const champ = nx.champ;
+const dispatch = nx.dispatch;
+const reader_mod = nx.reader;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -31,20 +32,15 @@ pub const Fx = struct {
     arena_state: std.heap.ArenaAllocator,
     diag: pull.Diag = .{},
     /// The allocator behind the heap, the arena and each pull's
-    /// scratch: the testing allocator, or a plain one for a benchmark.
-    gpa: Allocator,
+    /// scratch.
+    gpa: Allocator = testing.allocator,
 
     pub fn init(name: []const u8) !*Fx {
-        return initWith(name, testing.allocator);
-    }
-
-    pub fn initWith(name: []const u8, gpa: Allocator) !*Fx {
         const self = try testing.allocator.create(Fx);
         self.* = .{
             .tc = try TestConn.init(name),
-            .heap = Heap.init(gpa),
-            .arena_state = std.heap.ArenaAllocator.init(gpa),
-            .gpa = gpa,
+            .heap = Heap.init(testing.allocator),
+            .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
         };
         return self;
     }
@@ -68,7 +64,6 @@ pub const Fx = struct {
             .tc = tc,
             .heap = Heap.init(testing.allocator),
             .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
-            .gpa = testing.allocator,
         };
         return self;
     }

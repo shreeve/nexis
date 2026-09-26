@@ -1,8 +1,7 @@
 //! test/prop/intern.zig — randomized property tests for the intern tables.
 //!
-//! Covers PLAN §20.2 test #8 ("Interning invariants: same textual
-//! symbol → same intern id across reads; namespace qualification
-//! preserved").
+//! Interning invariants: the same text always interns to the same id,
+//! and namespace qualification is preserved.
 //!
 //! Properties (INTERN.md §1):
 //!   I1. Idempotence — interning the same bytes twice yields the same id.
@@ -16,12 +15,13 @@
 //!       is consistent with an oracle map.
 //!   I7. UTF-8 — non-ASCII names round-trip byte-exact.
 //!   I8. Long names — a 64 KiB name round-trips byte-exact.
-//!   I9. split — full edge-case table matches INTERN.md §3.
+//!   I9. splitQualified inverts the qualified intern at the first slash.
 //!   I10. by_name/names counts stay in lockstep across a mixed workload.
 
 const std = @import("std");
-const value = @import("value");
-const intern = @import("intern");
+const nx = @import("nexis");
+const value = nx.value;
+const intern = nx.intern;
 
 const Interner = intern.Interner;
 const prng_seed: u64 = 0x696E_7465_726E_5F50; // "intern_P" ASCII LE
@@ -211,39 +211,29 @@ test "I8: very-long names round-trip (64 KiB)" {
     try std.testing.expectEqual(@as(u32, 1), it.keywordCount());
 }
 
-test "I9: split — edge-case table matches INTERN.md §3" {
-    // Canonical passes.
-    {
-        const q = try intern.split("foo");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("foo", q.local);
+test "I9: splitQualified inverts internQualified* at the first slash" {
+    var it = intern.Interner.init(std.testing.allocator);
+    defer it.deinit();
+    var prng = std.Random.DefaultPrng.init(0x1239);
+    const r = prng.random();
+    const alphabet = "abc.-/";
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var ns_buf: [6]u8 = undefined;
+        var name_buf: [6]u8 = undefined;
+        // A namespace never holds a slash; a name may.
+        const ns_len = 1 + r.uintLessThan(usize, ns_buf.len);
+        for (ns_buf[0..ns_len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len - 1)];
+        const name_len = 1 + r.uintLessThan(usize, name_buf.len);
+        for (name_buf[0..name_len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        const ns: ?[]const u8 = if (r.boolean()) ns_buf[0..ns_len] else null;
+        const name = name_buf[0..name_len];
+        if (ns == null and std.mem.indexOfScalar(u8, name, '/') != null and !std.mem.eql(u8, name, "/")) continue;
+        const kw = try it.internQualifiedKeyword(ns, name);
+        const parts = intern.Interner.splitQualified(it.keywordName(kw.asKeywordId()));
+        if (ns) |want| try std.testing.expectEqualStrings(want, parts.ns.?) else try std.testing.expect(parts.ns == null);
+        try std.testing.expectEqualStrings(name, parts.name);
     }
-    {
-        const q = try intern.split("+");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("+", q.local);
-    }
-    {
-        const q = try intern.split("/");
-        try std.testing.expect(q.ns == null);
-        try std.testing.expectEqualStrings("/", q.local);
-    }
-    {
-        const q = try intern.split("a/b");
-        try std.testing.expectEqualStrings("a", q.ns.?);
-        try std.testing.expectEqualStrings("b", q.local);
-    }
-    {
-        const q = try intern.split("nexis.core/map");
-        try std.testing.expectEqualStrings("nexis.core", q.ns.?);
-        try std.testing.expectEqualStrings("map", q.local);
-    }
-    // Errors.
-    try std.testing.expectError(error.EmptyName, intern.split(""));
-    try std.testing.expectError(error.EmptyNamespace, intern.split("/foo"));
-    try std.testing.expectError(error.EmptyLocalName, intern.split("foo/"));
-    try std.testing.expectError(error.MultipleSlashes, intern.split("a//b"));
-    try std.testing.expectError(error.MultipleSlashes, intern.split("a/b/c"));
 }
 
 test "I10: by_name/names counts stay in lockstep under mixed workload" {
@@ -255,18 +245,26 @@ test "I10: by_name/names counts stay in lockstep under mixed workload" {
     const alphabet = "xyzw";
     var buf: [4]u8 = undefined;
 
+    // The distinct names interned so far, per table: each count must
+    // equal its table's, whatever the mix of new and repeated names.
+    var keywords: std.StringHashMapUnmanaged(void) = .empty;
+    defer keywords.deinit(std.testing.allocator);
+    var symbols: std.StringHashMapUnmanaged(void) = .empty;
+    defer symbols.deinit(std.testing.allocator);
+    const keywords_before = it.keywordCount();
+    const symbols_before = it.symbolCount();
+
     var i: usize = 0;
     while (i < 2000) : (i += 1) {
         const name = randName(r, &buf, alphabet, 4);
         if (r.boolean()) {
-            _ = try it.internKeyword(name);
+            const id = try it.internKeyword(name);
+            try keywords.put(std.testing.allocator, it.keywordName(id), {});
         } else {
-            _ = try it.internSymbol(name);
+            const id = try it.internSymbol(name);
+            try symbols.put(std.testing.allocator, it.symbolName(id), {});
         }
-        // Internal count invariant — accessor-based sanity check.
-        const kn = it.keywordCount();
-        const sn = it.symbolCount();
-        try std.testing.expect(kn <= @as(u32, @intCast(i + 1)));
-        try std.testing.expect(sn <= @as(u32, @intCast(i + 1)));
+        try std.testing.expectEqual(keywords_before + keywords.count(), it.keywordCount());
+        try std.testing.expectEqual(symbols_before + symbols.count(), it.symbolCount());
     }
 }

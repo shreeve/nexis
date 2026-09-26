@@ -15,8 +15,9 @@
 //!   - Everything hangs off `arena`; `deinit` frees it all.
 
 const std = @import("std");
-const value = @import("value");
+const value = @import("../../value.zig");
 const relation = @import("../relation.zig");
+const stack = @import("../../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -167,8 +168,9 @@ pub const Clause = union(enum) {
     /// (join on `join`).
     not: struct { join: ?[]const Var, body: []const Clause },
     /// `or` (every branch binds the same variables, all of which join)
-    /// or `or-join` (join on `join`; other variables are branch-local).
-    @"or": struct { join: ?[]const Var, branches: []const Branch },
+    /// or `or-join` (join on `join`; other variables are branch-local;
+    /// `required`, the `[[?a] ?b]` group, must be bound before it runs).
+    @"or": struct { join: ?[]const Var, branches: []const Branch, required: []const Var = &.{} },
     /// `(rule-name arg ...)` or `($src rule-name arg ...)`; the body's
     /// unprefixed clauses read `src` (null: the default source).
     rule: struct { name: u32, args: []const Arg, src: ?Src = null },
@@ -243,10 +245,10 @@ pub const Agg = struct {
 pub const FindElem = union(enum) {
     variable: Var,
     agg: Agg,
-    /// `(pull ?e pattern)`: the pattern value is resolved against the
-    /// db when the result is materialised; the element groups and
-    /// dedups as its variable.
-    pull: struct { e: Var, pattern: Value },
+    /// `(pull ?e pattern)` or `(pull $src ?e pattern)`: the pattern is
+    /// resolved against the source (null: `$`) when the result is
+    /// materialised; the element groups and dedups as its variable.
+    pull: Pull,
 
     pub fn variable_of(self: FindElem) Var {
         return switch (self) {
@@ -255,6 +257,17 @@ pub const FindElem = union(enum) {
             .pull => |p| p.e,
         };
     }
+};
+
+pub const Pull = struct {
+    e: Var,
+    src: ?Src = null,
+    pattern: union(enum) {
+        value: Value,
+        /// A variable bound by a scalar `:in` input: the pattern is
+        /// that input's value.
+        input: Var,
+    },
 };
 
 pub const FindSpec = enum { relation, scalar, collection, tuple };
@@ -285,6 +298,8 @@ pub const Ir = struct {
     keys: ?Keys = null,
     with: []const Var,
     in: []const InBinding,
+    /// The variables `in` binds, in order.
+    in_vars: []const Var = &.{},
     /// VM symbol ids of the sources, by `Src`; the first is what `$`
     /// names.
     sources: []const u32,
@@ -365,6 +380,7 @@ pub const no_rules: RuleSet = .{
 /// Variables bound by evaluating `clauses` (patterns, function outputs,
 /// `or` join variables, rule arguments); not `not` bodies.
 pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
             if (t.asVar()) |v| try addVar(arena, out, v);
@@ -387,6 +403,7 @@ pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(
 /// Every variable mentioned anywhere in `clauses`, including predicate
 /// arguments and `not` bodies.
 pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
             if (t.asVar()) |v| try addVar(arena, out, v);

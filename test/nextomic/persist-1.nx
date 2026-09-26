@@ -13,4 +13,4 @@
                   {:city/name "Genoa" :city/population 560000}])
   (d/transact! c [[:db/add [:city/name "Turin"] :city/population 870000]])
   (println (d/basis-t (d/db c))))
-:persist-1-done
+(println :persist-1-done)

@@ -1,19 +1,17 @@
 //! bench.zig — criterion-style benchmark harness for nexis.
 //!
-//! Authoritative methodology: `docs/BENCH.md`. This file is the
-//! *implementation* of the methodology — the Runner, the Stats
-//! computation, the adaptive inner-loop, the JSON output.
+//! Authoritative methodology: `docs/BENCH.md`. This file implements
+//! it: the Runner, the Stats computation, the adaptive inner loop, the
+//! table and the JSON output. `docs/PERF.md` holds the numbers of
+//! record.
 //!
-//! Complements `docs/PERF.md` (performance landscape) and
-//! `docs/PERF-MEASURED.md` (human-readable companion to
-//! `bench/baseline.json`, updated on each baseline refresh).
+//! Design (BENCH.md §3, §10):
 //!
-//! Design (BENCH.md §3):
-//!
-//!   - Every benchmark produces a distribution (min 30 samples for
-//!     warm microbenchmarks; user can override).
+//!   - Every benchmark produces a distribution (30 samples by
+//!     default).
 //!   - Stats reported: min, p5, median, p95, p99, max, mean,
-//!     stddev. Median is the headline (§3 mandate).
+//!     stddev, in fractional nanoseconds per operation. Median is
+//!     the headline.
 //!   - For nanosecond-scale operations: adaptive inner loop —
 //!     a pilot that repeats the body until one timing spans a
 //!     millisecond chooses `inner_reps` so a single measurement
@@ -22,35 +20,24 @@
 //!   - For operations that already take ≥min_time_ns per run:
 //!     inner_reps = 1.
 //!
-//! Output:
-//!
-//!   - Human-readable table to stdout.
-//!   - JSON to `--out <file>` (one entry per `Runner.bench` call)
-//!     with fields matching BENCH.md §3 and §4 hardware-disclosure
-//!     metadata (host metadata filled by the caller of
-//!     `Runner.writeJson`).
-//!
 //! Usage:
 //!
 //!     var runner = try bench.Runner.init(allocator, .{});
 //!     defer runner.deinit();
 //!
-//!     try runner.bench("fixnum add", "scalar", null, &ctx, 1, struct {
+//!     try runner.bench("fixnum add", "scalar", null, &ctx, struct {
 //!         fn run(c: *Ctx) anyerror!void { ... }
 //!     }.run);
 //!
 //!     try runner.writeTable(stdout);
 //!     try runner.writeJson(json_file, .{ .cpu = "...", .os = "...", ... });
 //!
-//! This file is imported only by benchmark source files and by
-//! the `bench` executable entrypoint. It is NOT part of the
-//! runtime core.
+//! Imported by `bench/main.zig` only; no runtime file imports it.
 
 const std = @import("std");
 
-/// Monotonic nanosecond timestamp. Zig 0.16 removed
-/// `std.time.nanoTimestamp`; we use POSIX `clock_gettime(MONOTONIC)`
-/// directly via `std.c`. macOS, Linux, and *BSD all expose it.
+/// Monotonic nanosecond timestamp through POSIX
+/// `clock_gettime(MONOTONIC)`.
 fn nowNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
@@ -63,68 +50,47 @@ fn nowNs() u64 {
 
 pub const Stats = struct {
     samples: usize,
-    min_ns: u64,
-    p5_ns: u64,
-    median_ns: u64,
-    p95_ns: u64,
-    p99_ns: u64,
-    max_ns: u64,
+    min_ns: f64,
+    p5_ns: f64,
+    median_ns: f64,
+    p95_ns: f64,
+    p99_ns: f64,
+    max_ns: f64,
     mean_ns: f64,
     stddev_ns: f64,
 
-    pub fn fromSamples(samples_ns: []u64) Stats {
+    /// Per-operation times in nanoseconds; sorts them in place.
+    pub fn fromSamples(samples_ns: []f64) Stats {
         std.debug.assert(samples_ns.len > 0);
-        std.mem.sort(u64, samples_ns, {}, comptime std.sort.asc(u64));
-
+        std.mem.sort(f64, samples_ns, {}, comptime std.sort.asc(f64));
         const n = samples_ns.len;
-        const min_ns = samples_ns[0];
-        const max_ns = samples_ns[n - 1];
 
-        // Percentile helper — nearest-rank method (BENCH.md §3
-        // specifies percentiles; nearest-rank is the
-        // parameterless default. We document; we do not compute
-        // interpolated percentiles to avoid per-rep method drift
-        // across harnesses.)
-        const p5_ns = percentile(samples_ns, 5);
-        const median_ns = percentile(samples_ns, 50);
-        const p95_ns = percentile(samples_ns, 95);
-        const p99_ns = percentile(samples_ns, 99);
-
-        // Mean + stddev.
         var sum: f64 = 0;
-        for (samples_ns) |s| sum += @floatFromInt(s);
+        for (samples_ns) |x| sum += x;
         const mean_ns = sum / @as(f64, @floatFromInt(n));
         var sqsum: f64 = 0;
-        for (samples_ns) |s| {
-            const d = @as(f64, @floatFromInt(s)) - mean_ns;
-            sqsum += d * d;
-        }
-        const stddev_ns = if (n > 1)
-            std.math.sqrt(sqsum / @as(f64, @floatFromInt(n - 1)))
-        else
-            0.0;
+        for (samples_ns) |x| sqsum += (x - mean_ns) * (x - mean_ns);
+        const stddev_ns = if (n > 1) std.math.sqrt(sqsum / @as(f64, @floatFromInt(n - 1))) else 0.0;
 
         return .{
             .samples = n,
-            .min_ns = min_ns,
-            .p5_ns = p5_ns,
-            .median_ns = median_ns,
-            .p95_ns = p95_ns,
-            .p99_ns = p99_ns,
-            .max_ns = max_ns,
+            .min_ns = samples_ns[0],
+            .p5_ns = percentile(samples_ns, 5),
+            .median_ns = percentile(samples_ns, 50),
+            .p95_ns = percentile(samples_ns, 95),
+            .p99_ns = percentile(samples_ns, 99),
+            .max_ns = samples_ns[n - 1],
             .mean_ns = mean_ns,
             .stddev_ns = stddev_ns,
         };
     }
 
-    fn percentile(sorted: []const u64, comptime p: u8) u64 {
-        // Nearest-rank: rank k = ceil(p/100 * n), then sample at
-        // index k-1.
+    /// Nearest rank (BENCH.md §10): the sample at rank ceil(p/100 * n),
+    /// never interpolated.
+    fn percentile(sorted: []const f64, comptime p: u8) f64 {
         const n = sorted.len;
-        const rank_num: u64 = @as(u64, p) * @as(u64, n);
-        const rank_ceil = (rank_num + 99) / 100; // ceil division
-        const idx = if (rank_ceil == 0) 0 else rank_ceil - 1;
-        return sorted[@min(idx, n - 1)];
+        const rank = (@as(usize, p) * n + 99) / 100;
+        return sorted[@min(if (rank == 0) 0 else rank - 1, n - 1)];
     }
 };
 
@@ -139,11 +105,11 @@ pub const BenchResult = struct {
     /// collection size). Carried through to the JSON.
     param: ?i64,
     stats: Stats,
-    /// Best-case ops/sec derived from the *median* (not the min,
+    /// Ops/sec derived from the *median* (not the min,
     /// not the mean). BENCH.md §3 requires median as the headline.
     ops_per_sec_median: f64,
     /// How many inner-loop iterations collapsed into each sample
-    /// (adaptive scaling — §1 of this file's doc).
+    /// (the adaptive inner loop of this file's design notes).
     inner_reps: usize,
     /// Warmup iterations discarded before measurement.
     warmup_iters: usize,
@@ -189,17 +155,17 @@ pub const Runner = struct {
     /// Run `run_fn(ctx)` under criterion-style measurement.
     ///
     /// `name`: stable identifier for this benchmark (appears in JSON).
-    /// `category`: one of BENCH.md §2 taxonomy strings
-    ///   ("warm-microbench", "collection-construction",
-    ///   "collection-lookup-update", "memory-footprint", etc.).
+    /// `category`: the suite category the row belongs to, the name
+    ///   `--filter` selects it by ("scalar", "collection-construction",
+    ///   "db-integrated", ...; bench/main.zig lists them).
     /// `param`: optional scaling parameter (e.g., N for size-N
     ///   collection benchmarks).
     /// `ctx`: arbitrary state passed to `run_fn`.
     /// `run_fn`: the function under measurement. MUST be
     ///   deterministic-time (no I/O, no allocator pressure that
     ///   depends on prior state unless the benchmark explicitly
-    ///   resets it). Returning an error aborts this benchmark and
-    ///   records a zero-sample BenchResult.
+    ///   resets it). An error it returns propagates, and no result
+    ///   is recorded.
     pub fn bench(
         self: *Runner,
         comptime name: []const u8,
@@ -243,7 +209,7 @@ pub const Runner = struct {
         }
 
         // ---- Measurement. ----
-        const samples = try self.allocator.alloc(u64, self.opts.measure_iters);
+        const samples = try self.allocator.alloc(f64, self.opts.measure_iters);
         defer self.allocator.free(samples);
 
         var mi: usize = 0;
@@ -252,17 +218,13 @@ pub const Runner = struct {
             var r: usize = 0;
             while (r < inner_reps) : (r += 1) try run_fn(ctx);
             const t1 = nowNs();
-            const elapsed: u64 = t1 - t0;
-            samples[mi] = elapsed / inner_reps;
+            samples[mi] = @as(f64, @floatFromInt(t1 - t0)) / @as(f64, @floatFromInt(inner_reps));
         }
 
         const stats = Stats.fromSamples(samples);
 
         // 1 / median (ns) → ops / s
-        const ops_per_sec_median: f64 = if (stats.median_ns == 0)
-            0
-        else
-            1_000_000_000.0 / @as(f64, @floatFromInt(stats.median_ns));
+        const ops_per_sec_median: f64 = if (stats.median_ns == 0) 0 else 1_000_000_000.0 / stats.median_ns;
 
         try self.results.append(self.allocator, .{
             .name = name,
@@ -276,7 +238,7 @@ pub const Runner = struct {
     }
 
     // =========================================================================
-    // Human-readable output (table to stdout)
+    // Human-readable output
     // =========================================================================
 
     pub fn writeTable(self: Runner, writer: anytype) !void {
@@ -311,7 +273,7 @@ pub const Runner = struct {
     }
 
     // =========================================================================
-    // JSON output (machine-readable; checked into bench/baseline.json)
+    // JSON output (machine-readable, `--out FILE`)
     // =========================================================================
 
     pub const HostInfo = struct {
@@ -332,18 +294,18 @@ pub const Runner = struct {
             .{wall_ts.sec},
         );
         try writer.writeAll("  \"host\": {\n");
-        try writer.print("    \"cpu\": \"{s}\",\n", .{host.cpu});
-        try writer.print("    \"os\": \"{s}\",\n", .{host.os});
-        try writer.print("    \"ram\": \"{s}\",\n", .{host.ram});
-        try writer.print("    \"zig_version\": \"{s}\",\n", .{host.zig_version});
-        try writer.print("    \"optimize_mode\": \"{s}\",\n", .{host.optimize_mode});
-        try writer.print("    \"note\": \"{s}\"\n", .{host.note});
+        try writer.print("    \"cpu\": {f},\n", .{std.json.fmt(host.cpu, .{})});
+        try writer.print("    \"os\": {f},\n", .{std.json.fmt(host.os, .{})});
+        try writer.print("    \"ram\": {f},\n", .{std.json.fmt(host.ram, .{})});
+        try writer.print("    \"zig_version\": {f},\n", .{std.json.fmt(host.zig_version, .{})});
+        try writer.print("    \"optimize_mode\": {f},\n", .{std.json.fmt(host.optimize_mode, .{})});
+        try writer.print("    \"note\": {f}\n", .{std.json.fmt(host.note, .{})});
         try writer.writeAll("  },\n");
         try writer.writeAll("  \"results\": [\n");
         for (self.results.items, 0..) |r, i| {
             try writer.writeAll("    {\n");
-            try writer.print("      \"name\": \"{s}\",\n", .{r.name});
-            try writer.print("      \"category\": \"{s}\",\n", .{r.category});
+            try writer.print("      \"name\": {f},\n", .{std.json.fmt(r.name, .{})});
+            try writer.print("      \"category\": {f},\n", .{std.json.fmt(r.category, .{})});
             if (r.param) |p| {
                 try writer.print("      \"param\": {d},\n", .{p});
             } else {
@@ -352,12 +314,12 @@ pub const Runner = struct {
             try writer.print("      \"samples\": {d},\n", .{r.stats.samples});
             try writer.print("      \"inner_reps\": {d},\n", .{r.inner_reps});
             try writer.print("      \"warmup_iters\": {d},\n", .{r.warmup_iters});
-            try writer.print("      \"min_ns\": {d},\n", .{r.stats.min_ns});
-            try writer.print("      \"p5_ns\": {d},\n", .{r.stats.p5_ns});
-            try writer.print("      \"median_ns\": {d},\n", .{r.stats.median_ns});
-            try writer.print("      \"p95_ns\": {d},\n", .{r.stats.p95_ns});
-            try writer.print("      \"p99_ns\": {d},\n", .{r.stats.p99_ns});
-            try writer.print("      \"max_ns\": {d},\n", .{r.stats.max_ns});
+            try writer.print("      \"min_ns\": {d:.3},\n", .{r.stats.min_ns});
+            try writer.print("      \"p5_ns\": {d:.3},\n", .{r.stats.p5_ns});
+            try writer.print("      \"median_ns\": {d:.3},\n", .{r.stats.median_ns});
+            try writer.print("      \"p95_ns\": {d:.3},\n", .{r.stats.p95_ns});
+            try writer.print("      \"p99_ns\": {d:.3},\n", .{r.stats.p99_ns});
+            try writer.print("      \"max_ns\": {d:.3},\n", .{r.stats.max_ns});
             try writer.print("      \"mean_ns\": {d:.2},\n", .{r.stats.mean_ns});
             try writer.print("      \"stddev_ns\": {d:.2},\n", .{r.stats.stddev_ns});
             try writer.print("      \"ops_per_sec_median\": {d:.2}\n", .{r.ops_per_sec_median});
@@ -376,19 +338,11 @@ pub const Runner = struct {
 // Formatting helpers
 // =============================================================================
 
-fn formatDurationInto(buf: []u8, ns: u64) ![]const u8 {
-    if (ns < 1_000) {
-        return std.fmt.bufPrint(buf, "{d} ns", .{ns});
-    } else if (ns < 1_000_000) {
-        const us = @as(f64, @floatFromInt(ns)) / 1_000.0;
-        return std.fmt.bufPrint(buf, "{d:.2} us", .{us});
-    } else if (ns < 1_000_000_000) {
-        const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-        return std.fmt.bufPrint(buf, "{d:.2} ms", .{ms});
-    } else {
-        const s = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
-        return std.fmt.bufPrint(buf, "{d:.2} s", .{s});
-    }
+fn formatDurationInto(buf: []u8, ns: f64) ![]const u8 {
+    if (ns < 1_000) return std.fmt.bufPrint(buf, "{d:.2} ns", .{ns});
+    if (ns < 1_000_000) return std.fmt.bufPrint(buf, "{d:.2} us", .{ns / 1_000.0});
+    if (ns < 1_000_000_000) return std.fmt.bufPrint(buf, "{d:.2} ms", .{ns / 1_000_000.0});
+    return std.fmt.bufPrint(buf, "{d:.2} s", .{ns / 1_000_000_000.0});
 }
 
 // =============================================================================
@@ -398,23 +352,23 @@ fn formatDurationInto(buf: []u8, ns: u64) ![]const u8 {
 const testing = std.testing;
 
 test "Stats.fromSamples: percentiles on trivial distribution" {
-    var samples = [_]u64{ 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
+    var samples = [_]f64{ 100, 20, 30, 40, 50, 60, 70, 80, 90, 10 };
     const s = Stats.fromSamples(&samples);
     try testing.expectEqual(@as(usize, 10), s.samples);
-    try testing.expectEqual(@as(u64, 10), s.min_ns);
-    try testing.expectEqual(@as(u64, 100), s.max_ns);
+    try testing.expectEqual(@as(f64, 10), s.min_ns);
+    try testing.expectEqual(@as(f64, 100), s.max_ns);
     // median of 10 items = 5th ranked = 50
-    try testing.expectEqual(@as(u64, 50), s.median_ns);
+    try testing.expectEqual(@as(f64, 50), s.median_ns);
     // p95 nearest-rank of 10 → rank ceil(0.95*10)=10 → idx 9 → 100
-    try testing.expectEqual(@as(u64, 100), s.p95_ns);
+    try testing.expectEqual(@as(f64, 100), s.p95_ns);
 }
 
 test "Stats.fromSamples: singleton" {
-    var samples = [_]u64{42};
+    var samples = [_]f64{42};
     const s = Stats.fromSamples(&samples);
-    try testing.expectEqual(@as(u64, 42), s.min_ns);
-    try testing.expectEqual(@as(u64, 42), s.median_ns);
-    try testing.expectEqual(@as(u64, 42), s.max_ns);
+    try testing.expectEqual(@as(f64, 42), s.min_ns);
+    try testing.expectEqual(@as(f64, 42), s.median_ns);
+    try testing.expectEqual(@as(f64, 42), s.max_ns);
     try testing.expectEqual(@as(f64, 0.0), s.stddev_ns);
 }
 
@@ -444,4 +398,23 @@ test "Runner: runs a trivial benchmark and computes stats" {
     const r = runner.results.items[0];
     try testing.expectEqual(@as(usize, 5), r.stats.samples);
     try testing.expect(r.ops_per_sec_median > 0);
+}
+
+test "Stats: a sub-nanosecond operation keeps its fraction" {
+    var samples = [_]f64{ 0.25, 0.5, 0.75 };
+    const s = Stats.fromSamples(&samples);
+    try testing.expectEqual(@as(f64, 0.5), s.median_ns);
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("0.50 ns", try formatDurationInto(&buf, s.median_ns));
+}
+
+test "writeJson escapes the strings it writes" {
+    var runner = try Runner.init(testing.allocator, .{});
+    defer runner.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try runner.writeJson(&out.writer, .{ .cpu = "M5", .os = "macos", .ram = "", .zig_version = "0.16.0", .optimize_mode = "ReleaseFast", .note = "an \"idle\" run\\" });
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"note\": \"an \\\"idle\\\" run\\\\\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    defer parsed.deinit();
 }

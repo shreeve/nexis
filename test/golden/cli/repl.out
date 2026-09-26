@@ -1,0 +1,19 @@
+nexis repl
+Type `:quit` or hit Ctrl-D to exit.
+
+user=> #'user/x
+user=> 42
+user=> user=> :divide-by-zero
+user=> #'user/a
+#'user/b
+3
+user=> 30
+user=> #'user/twice
+user=> 42
+user=> #'user/s
+user=> 23
+user=> ["a" \b "c d"]
+user=> 8891
+user=> nil
+other=> "in other"
+other=> other=> 

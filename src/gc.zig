@@ -1,7 +1,7 @@
 //! gc.zig — precise mark-sweep tracing garbage collector.
 //!
-//! Authoritative spec: `docs/GC.md`. Strategy and root model:
-//! `PLAN.md` §10. Mark-bit layout: `docs/VALUE.md` §5. Heap / sweep
+//! Authoritative spec: `docs/GC.md` (strategy §1, roots §3; PLAN.md
+//! §23 #2, #18). Mark-bit layout: `docs/HEAP.md` §4. Heap / sweep
 //! scaffold: `docs/HEAP.md` and `src/heap.zig`.
 //!
 //! Every heap kind that allocates blocks (string, bignum, list,
@@ -14,25 +14,19 @@
 //!     host's (`Host.roots`), then the sweep. The VM decides when a
 //!     cycle is due (GC.md §7); the collector has no policy of its
 //!     own.
-//!   - Non-reentrant — `collect` panics if called from inside a
-//!     visitor callback. Flag-guarded via `self.collecting`.
+//!   - Iterative — `mark` sets the bit and pushes the header on a
+//!     gray worklist; `collect` drains it. Data nesting depth never
+//!     becomes native recursion depth (GC.md §4). A worklist that
+//!     cannot grow abandons the cycle; it never recurses.
 //!   - Precise — the roots are complete; the collector does NOT
 //!     scan stacks or registers.
 //!   - No write barriers (STW, single-threaded).
 //!   - No generational / concurrent phases.
 //!
-//! Module graph (one-way terminal, like dispatch.zig):
-//!
-//!     gc.zig
-//!     ├─ @import("heap")
-//!     ├─ @import("value")
-//!     ├─ @import("string")  — string.trace
-//!     ├─ @import("bignum")  — bignum.trace
-//!     ├─ @import("list")    — list.trace
-//!     ├─ @import("vector")  — vector.trace
-//!     ├─ @import("champ")    — champ.traceMap + champ.traceSet
-//!     ├─ @import("typed_vector") — typed_vector.trace (leaf)
-//!     └─ @import("nextomic_handle") — nextomic_handle.traceEntity
+//! Imports: the heap, `value.zig`, and each module whose kind has a
+//! block to trace (string, bignum, the collections, transient, db,
+//! atom, record, protocol, `nextomic/handle.zig`); the kind → trace
+//! table is GC.md §5.
 //!
 //! `vm.zig` imports gc.zig and is the collector's host: it
 //! enumerates the runtime's roots and traces the two block kinds
@@ -42,20 +36,20 @@
 //! `{ markValue, mark, markInternal }`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const string = @import("string");
-const bignum = @import("bignum");
-const list = @import("list");
-const vector = @import("vector");
-const champ = @import("champ");
-const typed_vector = @import("typed_vector");
-const transient_mod = @import("transient");
-const db_mod = @import("db");
-const atom_mod = @import("atom");
-const record_mod = @import("record");
-const protocol_mod = @import("protocol");
-const nextomic_handle = @import("nextomic_handle");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const string = @import("string.zig");
+const bignum = @import("bignum.zig");
+const list = @import("coll/list.zig");
+const vector = @import("coll/vector.zig");
+const champ = @import("coll/champ.zig");
+const typed_vector = @import("coll/typed_vector.zig");
+const transient_mod = @import("coll/transient.zig");
+const db_mod = @import("db.zig");
+const atom_mod = @import("atom.zig");
+const record_mod = @import("record.zig");
+const protocol_mod = @import("protocol.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -70,16 +64,24 @@ const testing = std.testing;
 
 pub const Collector = struct {
     heap: *Heap,
-    /// Re-entrancy guard. `collect` sets this to true for the duration
-    /// of a cycle; nested `collect` panics. Direct `mark` /
-    /// `markInternal` / `markValue` calls outside an active collect
-    /// are legal (tests exercise them to verify individual primitives);
-    /// they do not touch this flag.
-    collecting: bool = false,
     /// The runtime behind this heap, when there is one. A collector
     /// over a bare heap (the property tests) has none: its roots are
     /// all explicit and a closure or cell block cannot appear.
     host: ?Host = null,
+    /// Headers marked but not yet traced. `mark` pushes; the drain
+    /// pops and runs the kind's trace, whose own `mark` calls push
+    /// again, so the walk is a loop whatever the data's depth. Its
+    /// capacity survives `collect`; `deinit` frees it.
+    gray: std.ArrayList(*HeapHeader) = .empty,
+    /// Set when `gray` could not grow: a header was marked but never
+    /// traced, so this cycle's marks are incomplete and it must not
+    /// sweep.
+    overflowed: bool = false,
+    /// True while a drain is running (for the whole of `collect`):
+    /// `mark` only pushes. Outside one, a direct `mark` drains before
+    /// it returns, so a caller marking by hand still gets the
+    /// transitive closure.
+    draining: bool = false,
 
     /// What the collector needs from the runtime that owns the heap
     /// (GC.md §3, §5): its roots, and the tracing of the two block
@@ -100,6 +102,10 @@ pub const Collector = struct {
         return .{ .heap = heap };
     }
 
+    pub fn deinit(self: *Collector) void {
+        self.gray.deinit(self.heap.backing);
+    }
+
     /// Start a reachability walk from a `Value`. Immediate-kind
     /// Values (nil, bool, char, fixnum, float, keyword, symbol) have
     /// no heap allocation underneath, and the pointer kinds the VM or
@@ -108,24 +114,50 @@ pub const Collector = struct {
     /// ignored. A Var's root, metadata and thread value are marked by
     /// the host's namespace walk, so skipping the `var_` Value loses
     /// nothing. Every other Value is dereferenced to its
-    /// `*HeapHeader` and marked + traced. This is the safe entry
-    /// point for callers holding Values (e.g. from a VM frame slot)
-    /// rather than raw heap headers.
+    /// `*HeapHeader` and marked.
     pub fn markValue(self: *Collector, v: Value) void {
         if (!Heap.isBlockKind(v.kind())) return;
         std.debug.assert(v.payload != 0 and (v.payload & 0xF) == 0);
         self.mark(@ptrFromInt(v.payload));
     }
 
-    /// Mark a full heap object and recursively walk its children.
-    /// Idempotent via mark-bit short-circuit (a second call on an
-    /// already-marked header returns immediately). Handles:
-    ///   - mark-bit transition via `markHeaderOnce`.
-    ///   - meta chain: if `h.meta != null`, recursively marks `h.meta`
-    ///     (which is itself a persistent-map root per SEMANTICS §7).
-    ///   - kind dispatch: invokes the per-kind trace function.
+    /// Mark a full heap object; its metadata and children are marked
+    /// when the drain traces it. Idempotent via the mark bit. A leaf
+    /// without metadata has nothing to trace and is never queued.
+    /// When the worklist cannot grow, the header stays marked but
+    /// untraced and `overflowed` says the marks are incomplete.
     pub fn mark(self: *Collector, h: *HeapHeader) void {
         if (!self.markHeaderOnce(h)) return;
+        if (h.meta == null and isLeafKind(h.kind)) return;
+        self.gray.append(self.heap.backing, h) catch {
+            self.overflowed = true;
+            return;
+        };
+        if (!self.draining) {
+            self.drain();
+            self.gray.clearRetainingCapacity();
+        }
+    }
+
+    /// Kinds whose blocks hold no heap reference but their metadata.
+    fn isLeafKind(kind: u16) bool {
+        return switch (@as(Kind, @enumFromInt(kind))) {
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => true,
+            else => false,
+        };
+    }
+
+    /// Trace every gray header until none is left.
+    fn drain(self: *Collector) void {
+        const was_draining = self.draining;
+        self.draining = true;
+        defer self.draining = was_draining;
+        while (self.gray.pop()) |h| self.trace(h);
+    }
+
+    /// Mark `h`'s metadata map and dispatch to the kind's trace.
+    /// `h` is already marked.
+    fn trace(self: *Collector, h: *HeapHeader) void {
         if (h.meta) |m| self.mark(m);
         const k: Kind = @enumFromInt(h.kind);
         switch (k) {
@@ -202,11 +234,11 @@ pub const Collector = struct {
     /// to decide whether to walk the node's payload.
     ///
     /// Does NOT walk `h.meta` — internal nodes have no metadata
-    /// semantics (CHAMP.md §8.2, VECTOR.md §3 invariants).
+    /// semantics (CHAMP.md §4, VECTOR.md §3 invariants).
     /// Does NOT dispatch on `h.kind` — the caller knows the
     /// structural context and will walk the payload itself (vector
     /// trie walking via `traceTrie`; CHAMP walking via
-    /// `traceMapNode` / `traceSetNode`).
+    /// `Trie.traceNode`).
     pub fn markInternal(self: *Collector, h: *HeapHeader) bool {
         return self.markHeaderOnce(h);
     }
@@ -222,29 +254,32 @@ pub const Collector = struct {
     }
 
     /// Run a full collection cycle:
-    ///   1. Mark each root (transitive closure via `mark`), then the
-    ///      host's roots when there is a host.
+    ///   1. Push each root, then the host's roots when there is a
+    ///      host, and drain the worklist: the transitive closure.
     ///   2. Sweep: free every unmarked, non-pinned heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.
-    /// Returns the number of blocks freed.
-    ///
-    /// **Not reentrant.** Panics if called while already collecting.
+    /// Returns the number of blocks freed. A cycle whose worklist
+    /// could not grow frees nothing: it clears every mark and leaves
+    /// the memory to the allocation that fails next (GC.md §4).
     pub fn collect(self: *Collector, roots: []const *HeapHeader) usize {
-        if (self.collecting) {
-            std.debug.panic(
-                "gc.collect: reentrant invocation (already inside a collect cycle)",
-                .{},
-            );
-        }
-        self.collecting = true;
-        defer self.collecting = false;
-
+        std.debug.assert(!self.draining);
+        self.draining = true;
         for (roots) |r| self.mark(r);
         if (self.host) |host| host.roots(host.ctx, self);
-        const freed = self.heap.sweepUnmarked();
+        self.drain();
+        self.draining = false;
+        self.gray.clearRetainingCapacity();
+        const freed = if (self.overflowed) self.abandon() else self.heap.sweepUnmarked();
         self.heap.resetAllocationCounter();
         return freed;
+    }
+
+    fn abandon(self: *Collector) usize {
+        self.overflowed = false;
+        var cur = self.heap.live_head;
+        while (cur) |b| : (cur = b.next) b.header.clearMarked();
+        return 0;
     }
 };
 
@@ -265,6 +300,7 @@ test "collect with empty root set frees every live block" {
     try testing.expectEqual(@as(usize, 5), heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const freed = gc.collect(&.{});
     try testing.expectEqual(@as(usize, 5), freed);
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
@@ -282,6 +318,7 @@ test "collect: flat roots — only roots survive" {
     try testing.expectEqual(@as(usize, 5), heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const ah = Heap.asHeapHeader(a);
     const bh = Heap.asHeapHeader(b);
     const ch = Heap.asHeapHeader(c);
@@ -312,6 +349,7 @@ test "collect: nested reachability — list of lists, only outer root" {
     try testing.expectEqual(live_before + 1, heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const outer_h = Heap.asHeapHeader(outer);
     const freed = gc.collect(&.{outer_h});
     try testing.expectEqual(@as(usize, 1), freed); // only the orphan string
@@ -351,6 +389,7 @@ test "collect: cross-kind graph — map whose values are lists" {
     const total_before = heap.liveCount();
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const mh = Heap.asHeapHeader(m);
     const freed = gc.collect(&.{mh});
     // At least 1 block (the orphan string) must be freed.
@@ -392,6 +431,7 @@ test "collect: CHAMP-backed map survives (>8 entries exercises internal nodes)" 
     _ = try string.fromBytes(&heap, "o2");
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const live_before = heap.liveCount();
     _ = gc.collect(&.{Heap.asHeapHeader(m)});
     const live_after = heap.liveCount();
@@ -425,6 +465,7 @@ test "collect: vector with deep trie survives end-to-end" {
     _ = try string.fromBytes(&heap, "orphan-vec");
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const live_before = heap.liveCount();
     _ = gc.collect(&.{Heap.asHeapHeader(v)});
     const live_after = heap.liveCount();
@@ -463,6 +504,7 @@ test "collect: persistent set survives (>8 elements exercises CHAMP internals)" 
     _ = try string.fromBytes(&heap, "orphan");
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const live_before = heap.liveCount();
     _ = gc.collect(&.{Heap.asHeapHeader(s)});
     const live_after = heap.liveCount();
@@ -487,6 +529,7 @@ test "collect: atom contained value survives via trace" {
     const a = try atom_mod.make(&heap, contained);
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     // Only `a` is rooted. `contained` is reachable ONLY through
     // the atom's body. If `atom_mod.trace` is wrong, the string
     // is freed.
@@ -517,6 +560,7 @@ test "collect: atom whose contained value is unreferenced gets that value swept"
     atom_mod.setValue(a, replacement);
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const live_before = heap.liveCount();
     const freed = gc.collect(&.{Heap.asHeapHeader(a)});
     const live_after = heap.liveCount();
@@ -536,6 +580,7 @@ test "collect: pinned block survives without being in roots" {
     _ = b;
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const freed = gc.collect(&.{}); // empty roots
     try testing.expectEqual(@as(usize, 1), freed); // only `b` freed; `a` pinned
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
@@ -551,6 +596,7 @@ test "collect: idempotent — second call frees 0 blocks" {
     try testing.expectEqual(@as(usize, 2), heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     try testing.expectEqual(@as(usize, 1), gc.collect(&.{Heap.asHeapHeader(a)}));
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
     // Second collect: only `a` is live, and it's in roots → nothing freed.
@@ -567,10 +613,53 @@ test "collect: sweep clears mark bits on survivors" {
     try testing.expect(!ah.isMarked()); // freshly allocated
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     _ = gc.collect(&.{ah});
     // After sweep, survivor's mark bit must be cleared so the next
     // cycle starts fresh.
     try testing.expect(!ah.isMarked());
+}
+
+test "collect: a worklist that cannot grow abandons the cycle instead of recursing" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var heap = Heap.init(failing.allocator());
+    defer heap.deinit();
+
+    var chain = try vector.empty(&heap);
+    for (0..100) |_| chain = try vector.fromSlice(&heap, &.{chain});
+    _ = try string.fromBytes(&heap, "orphan");
+    const live = heap.liveCount();
+
+    var gc = Collector.init(&heap);
+    defer gc.deinit();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectEqual(@as(usize, 0), gc.collect(&.{Heap.asHeapHeader(chain)}));
+    try testing.expectEqual(live, heap.liveCount());
+    var cur = heap.live_head;
+    while (cur) |b| : (cur = b.next) try testing.expect(!b.header.isMarked());
+
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(usize, 1), gc.collect(&.{Heap.asHeapHeader(chain)}));
+}
+
+test "mark: a leaf without metadata is marked in place, never queued" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const a = Heap.asHeapHeader(try string.fromBytes(&heap, "a"));
+    var gc = Collector.init(&heap);
+    defer gc.deinit();
+    gc.draining = true;
+    gc.mark(a);
+    try testing.expect(a.isMarked());
+    try testing.expectEqual(@as(usize, 0), gc.gray.items.len);
+    const b = Heap.asHeapHeader(try string.fromBytes(&heap, "b"));
+    b.setMeta(Heap.asHeapHeader(try champ.mapEmpty(&heap)));
+    gc.mark(b);
+    try testing.expectEqual(@as(usize, 1), gc.gray.items.len);
+    gc.drain();
+    gc.draining = false;
+    try testing.expect(b.getMeta().?.isMarked());
 }
 
 test "markInternal: returns true on first call, false on second" {
@@ -581,6 +670,7 @@ test "markInternal: returns true on first call, false on second" {
     // do for this mechanism test; we're not dispatching on kind).
     const h = try heap.alloc(.persistent_vector, 32);
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     try testing.expect(gc.markInternal(h));
     try testing.expect(!gc.markInternal(h));
 }
@@ -591,6 +681,7 @@ test "mark: idempotent across direct calls" {
 
     const a = try string.fromBytes(&heap, "a");
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const ah = Heap.asHeapHeader(a);
     gc.mark(ah);
     try testing.expect(ah.isMarked());
@@ -603,33 +694,13 @@ test "markValue: no-op on immediate Values" {
     defer heap.deinit();
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     gc.markValue(value.nilValue());
     gc.markValue(value.fromBool(true));
     gc.markValue(value.fromFixnum(42).?);
     gc.markValue(value.fromKeywordId(1));
     // No panic, no allocation, no state change.
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "non-reentrant: collect from inside a visitor panics" {
-    // This is a structural property we verify by construction; a
-    // runtime panic test would require a custom visitor that
-    // re-entered the collector. We instead validate the flag guard
-    // directly.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    var gc = Collector.init(&heap);
-    gc.collecting = true; // simulate mid-cycle
-    // Calling collect while `collecting` is true would panic — we
-    // can't easily trigger that without expectPanic infrastructure.
-    // The guard is documented and asserted; the inverse assertion
-    // is covered by every other test that calls collect successfully
-    // (which requires `collecting == false` on entry).
-    try testing.expect(gc.collecting);
-    gc.collecting = false;
-    _ = gc.collect(&.{});
-    try testing.expect(!gc.collecting);
 }
 
 test "metadata chain: reachable through h.meta" {
@@ -647,6 +718,7 @@ test "metadata chain: reachable through h.meta" {
     try testing.expectEqual(@as(usize, 2), heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const freed = gc.collect(&.{ah});
     // Both `a` and its meta must survive.
     try testing.expectEqual(@as(usize, 0), freed);
@@ -663,6 +735,7 @@ test "metadata chain: meta-only unreachable block is swept" {
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
 
     var gc = Collector.init(&heap);
+    defer gc.deinit();
     const freed = gc.collect(&.{}); // no roots
     try testing.expectEqual(@as(usize, 1), freed);
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
@@ -697,6 +770,7 @@ test "host: roots are marked after the explicit roots and closure/cell blocks tr
     };
     var fake = FakeHost{ .cell = cell_h, .root = host_root };
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     collector.host = .{ .ctx = @ptrCast(&fake), .roots = &FakeHost.roots, .trace = &FakeHost.trace };
     const freed = collector.collect(&.{});
     try testing.expectEqual(@as(usize, 1), freed);
@@ -708,6 +782,7 @@ test "markValue ignores the pointer kinds that carry no block" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var collector = Collector.init(&heap);
+    defer collector.deinit();
     // A `native_fn` Value whose payload is a stack address: marking
     // must not dereference it.
     var descriptor: u64 = 0;

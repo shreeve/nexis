@@ -15,10 +15,14 @@
 //! while instructions execute.
 
 const std = @import("std");
-const vm = @import("vm");
-const value_mod = @import("value");
-const format_mod = @import("format");
-const intern_mod = @import("intern");
+const vm = @import("vm.zig");
+const value_mod = @import("value.zig");
+const format_mod = @import("format.zig");
+const intern_mod = @import("intern.zig");
+const heap_mod = @import("heap.zig");
+const vector_mod = @import("coll/vector.zig");
+const list_mod = @import("coll/list.zig");
+const champ_mod = @import("coll/champ.zig");
 
 const Writer = std.Io.Writer;
 
@@ -44,14 +48,14 @@ const ctrl_names = [_]?[]const u8{ "try-enter", "try-exit", "finally-exit", "thr
 
 /// The name of group number `group`, or null for a number outside
 /// VM.md §10.
-pub fn groupName(group: u6) ?[]const u8 {
+fn groupName(group: u6) ?[]const u8 {
     if (group >= group_names.len) return null;
     return group_names[group];
 }
 
 /// The name of `variant` within `group`, or null when the group
 /// defines no such variant.
-pub fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
+fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
     const table: []const ?[]const u8 = switch (group) {
         .jump => &jump_names,
         .cmp => &cmp_names,
@@ -89,7 +93,7 @@ fn immediateB(group: vm.Group, variant: u6) bool {
 /// its constant pool, depth first. `interner` names keywords,
 /// symbols and Vars; a null interner prints them by id.
 pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
-    try disassembleOne(routine, interner, writer);
+    try disassembleRoutine(routine, interner, writer);
     for (routine.consts) |c| switch (c) {
         .routine => |child| {
             try writer.writeAll("\n");
@@ -103,7 +107,7 @@ pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Inte
 ///
 ///   routine NAME (PATH:LINE:COL) slots=N arity=A upvalues=U
 ///     0000  mov:load-const  s1  c0=42  -   ; 4:9
-pub fn disassembleOne(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     try writer.print("routine {s}", .{routine.name});
     if (routine.source) |src| {
         if (routine.origin) |origin| {
@@ -128,7 +132,11 @@ pub fn disassembleOne(routine: *const vm.Routine, interner: ?*const intern_mod.I
             const group: vm.Group = @enumFromInt(inst.group);
             try writeOperand(inst.a, routine, interner, false, writer);
             try writer.writeAll("  ");
-            try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
+            if (group == .closure and inst.variant == @intFromEnum(vm.Closure_.make)) {
+                try writeCaptures(inst.b.index, routine, writer);
+            } else {
+                try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
+            }
             try writer.writeAll("  ");
             try writeOperand(inst.c, routine, interner, false, writer);
         }
@@ -171,6 +179,23 @@ fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     while (pad < 18) : (pad += 1) try writer.writeAll(" ");
 }
 
+/// A `closure:make` descriptor: its index, then where each captured
+/// cell comes from, `sN` for a cell in this frame's slot N and `uN`
+/// for this closure's upvalue N (VM.md §6).
+fn writeCaptures(index: u12, routine: *const vm.Routine, writer: *Writer) Writer.Error!void {
+    try writer.print("#{d}", .{index});
+    if (index >= routine.capture_descs.len) return;
+    try writer.writeAll("[");
+    for (routine.capture_descs[index].sources, 0..) |source, i| {
+        if (i > 0) try writer.writeAll(" ");
+        switch (source) {
+            .local_cell_slot => |slot| try writer.print("s{d}", .{slot}),
+            .inherited_upvalue => |u| try writer.print("u{d}", .{u}),
+        }
+    }
+    try writer.writeAll("]");
+}
+
 /// One operand: its kind letter and index, then what the index
 /// names when the routine can say (`c0=42`, `v1=inc`); `-` for an
 /// unused operand, `#n` for a raw immediate, `jNNNN` for a jump
@@ -188,10 +213,7 @@ fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const in
                 switch (routine.consts[op.index]) {
                     .value => |v| {
                         try writer.writeAll("=");
-                        format_mod.format(v, .readable, writer, interner) catch |err| switch (err) {
-                            error.Utf8Error => try writer.writeAll("#<invalid utf-8>"),
-                            else => |e| return e,
-                        };
+                        try writeConstant(v, interner, writer);
                     },
                     .routine => |r| try writer.print("=<routine {s}>", .{r.name}),
                 }
@@ -208,6 +230,35 @@ fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const in
         .unused => try writer.writeAll("-"),
         _ => try writer.print("?{d}", .{op.index}),
     }
+}
+
+/// The most bytes of a constant's printed form a listing shows.
+const max_constant_width = 60;
+
+/// `v` as `pr-str` prints it, cut at a space within
+/// `max_constant_width` bytes when longer, then ` ...` and, for a
+/// collection, its item count: a large literal is one constant
+/// (COMPILER.md §4.4) and stays one readable line.
+fn writeConstant(v: value_mod.Value, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
+    var buf: [max_constant_width + 1]u8 = undefined;
+    var fixed = Writer.fixed(&buf);
+    format_mod.format(v, .readable, &fixed, interner) catch |err| switch (err) {
+        error.WriteFailed => {},
+        error.Utf8Error => return writer.writeAll("#<invalid utf-8>"),
+    };
+    const text = fixed.buffered();
+    if (text.len <= max_constant_width) return writer.writeAll(text);
+    var cut = std.mem.lastIndexOfScalar(u8, text[0..max_constant_width], ' ') orelse max_constant_width;
+    while (cut > 0 and text[cut] & 0xC0 == 0x80) cut -= 1;
+    try writer.print("{s} ...", .{text[0..cut]});
+    const items: ?usize = switch (v.kind()) {
+        .list => list_mod.count(v),
+        .persistent_vector => vector_mod.count(v),
+        .persistent_map => champ_mod.mapCount(v),
+        .persistent_set => champ_mod.setCount(v),
+        else => null,
+    };
+    if (items) |n| try writer.print("({d} items)", .{n});
 }
 
 // =============================================================================
@@ -285,6 +336,24 @@ test "a listing shows every operand kind, immediates, constants and jump targets
     , out.written());
 }
 
+test "closure:make lists where each captured cell comes from" {
+    const inner = vm.Routine{ .code = &.{vm.asm_.returnSlot(0)}, .consts = &.{}, .slot_count = 1, .name = "f", .upvalue_count = 2 };
+    const consts = [_]vm.Const{.{ .routine = &inner }};
+    const sources = [_]vm.CaptureSource{ .{ .local_cell_slot = 3 }, .{ .inherited_upvalue = 1 } };
+    const descs = [_]vm.CaptureDescriptor{ .{ .sources = &.{} }, .{ .sources = &sources } };
+    const code = [_]vm.Inst{ vm.asm_.closureMake(0, 0, 1), vm.asm_.closureMake(0, 1, 2) };
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .capture_descs = &descs, .slot_count = 4, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassembleRoutine(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=4 arity=0 upvalues=0
+        \\  0000  closure:make        c0=<routine f>  #0[]  s1
+        \\  0001  closure:make        c0=<routine f>  #1[s3 u1]  s2
+        \\
+    , out.written());
+}
+
 test "a span table annotates the line and column where it changes" {
     const text = "(+ 1\n   2)";
     const info = vm.SourceInfo{ .path = "t.nx", .text = text };
@@ -299,6 +368,25 @@ test "a span table annotates the line and column where it changes" {
         \\  0000  mov:load-nil        s0  -  -  ; 1:2
         \\  0001  mov:load-nil        s0  -  -
         \\  0002  call:return         s0  -  -  ; 2:4
+        \\
+    , out.written());
+}
+
+test "a large constant prints as its first 60 bytes and its item count" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var items: [5000]value_mod.Value = undefined;
+    for (&items, 0..) |*item, i| item.* = value_mod.fromFixnum(@intCast(i)).?;
+    const consts = [_]vm.Const{ vm.cval(try vector_mod.fromSlice(&heap, &items)), vm.cval(try vector_mod.fromSlice(&heap, items[0..3])) };
+    const code = [_]vm.Inst{ vm.asm_.loadConst(0, 0), vm.asm_.loadConst(0, 1) };
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 1, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassemble(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=1 arity=0 upvalues=0
+        \\  0000  mov:load-const      s0  c0=[0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 ...(5000 items)  -
+        \\  0001  mov:load-const      s0  c1=[0 1 2]  -
         \\
     , out.written());
 }

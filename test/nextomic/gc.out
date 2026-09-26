@@ -1,6 +1,12 @@
 ok predicate survives collections
 ok function binding results survive collections
 ok custom aggregate survives collections
-ok the same query parses again after the caches emptied
+ok a ground string survives collections
+ok a get-else default survives collections
+ok a tuple bound as one value survives collections
+ok get-some and fulltext tuples survive collections
+ok built-in aggregate values survive a custom aggregate's collections
+ok the same query parses again after collections
+ok nested queries built afresh answer their own query across collections
+ok the query caches survive a program redefining names in nexis.internal
 done
-nil

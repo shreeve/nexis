@@ -1,17 +1,18 @@
 //! coll/transient.zig — transient wrapper kind.
 //!
-//! Authoritative spec: `docs/TRANSIENT.md`. Derivative semantics:
-//! `docs/SEMANTICS.md` §2.6 (identity-based equality; not hashable;
-//! not serializable), `docs/VALUE.md` §2.2 (kind 27, local-enum
-//! subkinds 0/1/2), `docs/GC.md` §5 (trace contract), PLAN §9.4
-//! (owner-token + frozen state machine), CLOJURE-REVIEW §1.2 + §2.7
-//! (owner-token epoch vs. Clojure's thread identity).
+//! Authoritative spec: `docs/TRANSIENT.md` (§4 owner token, §5 the
+//! active/frozen states). Derivative semantics: `docs/SEMANTICS.md`
+//! §2.6 (identity equality and hash), `docs/CODEC.md` §3 (not
+//! serializable), `docs/VALUE.md` §2.2 (kind 27, local-enum subkinds
+//! 0/1/2), `docs/GC.md` §5 (trace contract), CLOJURE-REVIEW §1.2, §3.5
+//! (owner token vs. Clojure's thread identity).
 //!
-//! Transients are "shallow" (TRANSIENT.md §1 Option B): mutation ops
+//! Transients are shallow wrappers (TRANSIENT.md §1): mutation ops
 //! call the persistent backing operations (`champ.mapAssoc`,
-//! `champ.setConj`, `vector.conj`) underneath, updating the wrapper's
-//! `inner_header` field in place. There is no in-place node editing
-//! (TRANSIENT.md §1 Option A, Clojure's performance advantage).
+//! `champ.setConj`, `vector.conj`, …) underneath, updating the
+//! wrapper's `inner_header` field in place. There is no per-node
+//! in-place editing, so a transient op costs what the persistent op
+//! costs, plus the wrapper check.
 //!
 //! Token discipline enforced at every public entry point:
 //!   - `owner_token == 0` → frozen; all ops return `error.TransientFrozen`.
@@ -19,22 +20,16 @@
 //!   - Wrong subkind (mapAssocBang on a set wrapper) →
 //!     `error.TransientKindMismatch`.
 //!
-//! Module graph (one-way terminal):
-//!
-//!     src/coll/transient.zig
-//!     ├─ @import("value")
-//!     ├─ @import("heap")
-//!     ├─ @import("champ")    — mapAssoc/Dissoc/Get/Count, setConj/Disj/Contains/Count, valueFromMapHeader, valueFromSetHeader
-//!     └─ @import("vector")  — conj/nth/count, valueFromVectorHeader
-//!
-//! Importers: the `.transient` arms of `src/dispatch.zig` (operations),
-//! `src/gc.zig` (this module's `trace`) and `src/codec.zig`.
+//! Imports: value, heap, `champ.zig` and `vector.zig` (never
+//! dispatch; hash and equality arrive as callbacks). Importers: the
+//! `.transient` arms of `src/dispatch.zig`, `src/gc.zig` (this
+//! module's `trace`) and `src/codec.zig`.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const champ = @import("champ");
-const vector = @import("vector");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const champ = @import("champ.zig");
+const vector = @import("vector.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
@@ -115,10 +110,6 @@ fn transientBody(h: *HeapHeader) *TransientBody {
     return Heap.bodyOf(TransientBody, h);
 }
 
-fn transientBodyConst(h: *HeapHeader) *const TransientBody {
-    return Heap.bodyOf(TransientBody, h);
-}
-
 // =============================================================================
 // Internal validation helpers
 // =============================================================================
@@ -134,13 +125,13 @@ fn assertTransientSubkind(t: Value, expected_subkind: u16) TransientError!void {
 
 fn assertActive(t: Value) TransientError!void {
     try assertTransient(t);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     if (body.owner_token == 0) return TransientError.TransientFrozen;
 }
 
 fn assertActiveSubkind(t: Value, expected_subkind: u16) TransientError!void {
     try assertTransientSubkind(t, expected_subkind);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     if (body.owner_token == 0) return TransientError.TransientFrozen;
 }
 
@@ -176,14 +167,26 @@ pub fn transientFrom(heap: *Heap, persistent_v: Value) (TransientError || std.me
         .persistent_vector => subkind_transient_vector,
         else => return TransientError.InvalidTransientInner,
     };
+    const inner = try withoutMeta(heap, Heap.asHeapHeader(persistent_v));
     const h = try heap.alloc(.transient, @sizeOf(TransientBody));
     const body = transientBody(h);
     body.owner_token = issueOwnerToken();
-    body.inner_header = Heap.asHeapHeader(persistent_v);
+    body.inner_header = inner;
     return .{
         .tag = @as(u64, @intFromEnum(Kind.transient)) | (@as(u64, subkind) << 16),
         .payload = @intFromPtr(h),
     };
+}
+
+/// `root`, or a copy of it without metadata when it carries some:
+/// `persistent!` returns a collection without metadata, as in Clojure,
+/// though the ops underneath keep a root's metadata (SEMANTICS §7).
+fn withoutMeta(heap: *Heap, root: *HeapHeader) !*HeapHeader {
+    if (root.getMeta() == null) return root;
+    const body = Heap.bodyBytes(root);
+    const copy = try heap.alloc(@enumFromInt(root.kind), body.len);
+    @memcpy(Heap.bodyBytes(copy), body);
+    return copy;
 }
 
 /// Freeze the transient and return the current inner persistent
@@ -197,6 +200,19 @@ pub fn persistentBang(t: Value) TransientError!Value {
     const inner = body.inner_header;
     body.owner_token = 0; // freeze
     return innerValueForSubkind(t.subkind(), inner);
+}
+
+/// The collection a transient holds. A caller whose ops must leave no
+/// trace when it raises saves it and `restoreInner`s it on the way out.
+pub fn savedInner(t: Value) *HeapHeader {
+    std.debug.assert(t.kind() == .transient);
+    return transientBody(Heap.asHeapHeader(t)).inner_header;
+}
+
+/// Put back a collection `savedInner` returned for the same transient.
+pub fn restoreInner(t: Value, inner: *HeapHeader) void {
+    std.debug.assert(t.kind() == .transient);
+    transientBody(Heap.asHeapHeader(t)).inner_header = inner;
 }
 
 // =============================================================================
@@ -243,14 +259,14 @@ pub fn mapGetBang(
     elementEq: *const fn (Value, Value) bool,
 ) TransientError!champ.MapLookup {
     try assertActiveSubkind(t, subkind_transient_map);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromMapHeader(body.inner_header);
     return champ.mapGet(v, key, elementHash, elementEq);
 }
 
 pub fn mapCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_map);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromMapHeader(body.inner_header);
     return champ.mapCount(v);
 }
@@ -298,14 +314,14 @@ pub fn setContainsBang(
     elementEq: *const fn (Value, Value) bool,
 ) TransientError!bool {
     try assertActiveSubkind(t, subkind_transient_set);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromSetHeader(body.inner_header);
     return champ.setContains(v, elem, elementHash, elementEq);
 }
 
 pub fn setCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_set);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = champ.valueFromSetHeader(body.inner_header);
     return champ.setCount(v);
 }
@@ -328,16 +344,49 @@ pub fn vectorConjBang(
     return t;
 }
 
+/// `(assoc! t idx elem)`: replaces element `idx`, or appends when
+/// `idx` is the count (as Clojure's `assoc!` on a transient vector).
+/// `error.IndexOutOfBounds` beyond that.
+pub fn vectorAssocBang(
+    heap: *Heap,
+    t: Value,
+    idx: usize,
+    elem: Value,
+) (TransientError || std.mem.Allocator.Error || error{ Overflow, IndexOutOfBounds })!Value {
+    try assertActiveSubkind(t, subkind_transient_vector);
+    const body = transientBody(Heap.asHeapHeader(t));
+    const old_v = vector.valueFromVectorHeader(body.inner_header);
+    const n = vector.count(old_v);
+    if (idx > n) return error.IndexOutOfBounds;
+    const new_v = if (idx == n) try vector.conj(heap, old_v, elem) else try vector.assoc(heap, old_v, idx, elem);
+    body.inner_header = Heap.asHeapHeader(new_v);
+    return t;
+}
+
+/// `(pop! t)`: drops the last element. `error.IndexOutOfBounds` on an
+/// empty vector.
+pub fn vectorPopBang(
+    heap: *Heap,
+    t: Value,
+) (TransientError || std.mem.Allocator.Error || error{ Overflow, IndexOutOfBounds })!Value {
+    try assertActiveSubkind(t, subkind_transient_vector);
+    const body = transientBody(Heap.asHeapHeader(t));
+    const old_v = vector.valueFromVectorHeader(body.inner_header);
+    if (vector.isEmpty(old_v)) return error.IndexOutOfBounds;
+    body.inner_header = Heap.asHeapHeader(try vector.pop(heap, old_v));
+    return t;
+}
+
 pub fn vectorNthBang(t: Value, idx: usize) TransientError!Value {
     try assertActiveSubkind(t, subkind_transient_vector);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = vector.valueFromVectorHeader(body.inner_header);
     return vector.nth(v, idx);
 }
 
 pub fn vectorCountBang(t: Value) TransientError!usize {
     try assertActiveSubkind(t, subkind_transient_vector);
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     const v = vector.valueFromVectorHeader(body.inner_header);
     return vector.count(v);
 }
@@ -348,11 +397,11 @@ pub fn vectorCountBang(t: Value) TransientError!usize {
 // Wrappers have exactly one outgoing heap reference: `inner_header`.
 // Frozen wrappers (owner_token == 0) still trace through
 // inner_header; freezing does NOT sever the GC edge. Metadata is not
-// attachable on transients (VALUE.md §7), so no meta walk.
+// attachable on transients (SEMANTICS.md §7), so no meta walk.
 // =============================================================================
 
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = transientBodyConst(h);
+    const body = transientBody(h);
     visitor.mark(body.inner_header);
 }
 
@@ -393,7 +442,7 @@ test "transientFrom: wraps persistent map; subkind 0; owner_token nonzero" {
     const t = try transientFrom(&heap, m);
     try testing.expectEqual(Kind.transient, t.kind());
     try testing.expectEqual(subkind_transient_map, t.subkind());
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     try testing.expect(body.owner_token != 0);
     try testing.expect(body.inner_header == Heap.asHeapHeader(m));
 }
@@ -435,8 +484,8 @@ test "transientFrom: two calls yield distinct owner tokens" {
     const m = try champ.mapEmpty(&heap);
     const t1 = try transientFrom(&heap, m);
     const t2 = try transientFrom(&heap, m);
-    const b1 = transientBodyConst(Heap.asHeapHeader(t1));
-    const b2 = transientBodyConst(Heap.asHeapHeader(t2));
+    const b1 = transientBody(Heap.asHeapHeader(t1));
+    const b2 = transientBody(Heap.asHeapHeader(t2));
     try testing.expect(b1.owner_token != b2.owner_token);
 }
 
@@ -535,6 +584,26 @@ test "vectorConjBang + vectorNthBang: round-trip" {
     }
 }
 
+test "vectorAssocBang + vectorPopBang: replace, append at count, pop to empty" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const t = try transientFrom(&heap, try vector.empty(&heap));
+    for (0..40) |i| _ = try vectorAssocBang(&heap, t, i, value.fromFixnum(@intCast(i)).?);
+    try testing.expectEqual(@as(usize, 40), try vectorCountBang(t));
+    _ = try vectorAssocBang(&heap, t, 3, value.fromFixnum(-3).?);
+    try testing.expectEqual(@as(i64, -3), (try vectorNthBang(t, 3)).asFixnum());
+    try testing.expectError(error.IndexOutOfBounds, vectorAssocBang(&heap, t, 41, value.nilValue()));
+    var n: usize = 40;
+    while (n > 0) : (n -= 1) {
+        try testing.expectEqual(@as(i64, if (n == 4) -3 else @intCast(n - 1)), (try vectorNthBang(t, n - 1)).asFixnum());
+        _ = try vectorPopBang(&heap, t);
+    }
+    try testing.expectError(error.IndexOutOfBounds, vectorPopBang(&heap, t));
+    _ = try persistentBang(t);
+    try testing.expectError(TransientError.TransientFrozen, vectorPopBang(&heap, t));
+    try testing.expectError(TransientError.TransientFrozen, vectorAssocBang(&heap, t, 0, value.nilValue()));
+}
+
 // ---- Freeze semantics ----
 
 test "persistentBang: freezes wrapper and returns inner persistent Value" {
@@ -547,7 +616,7 @@ test "persistentBang: freezes wrapper and returns inner persistent Value" {
     try testing.expectEqual(Kind.persistent_map, frozen.kind());
     try testing.expectEqual(@as(usize, 1), champ.mapCount(frozen));
     // Wrapper's owner_token is now zero.
-    const body = transientBodyConst(Heap.asHeapHeader(t));
+    const body = transientBody(Heap.asHeapHeader(t));
     try testing.expectEqual(@as(u64, 0), body.owner_token);
 }
 
@@ -583,9 +652,9 @@ test "persistentBang: inner_header survives post-freeze (for GC reachability)" {
     defer heap.deinit();
     const m = try champ.mapEmpty(&heap);
     const t = try transientFrom(&heap, m);
-    const inner_before = transientBodyConst(Heap.asHeapHeader(t)).inner_header;
+    const inner_before = transientBody(Heap.asHeapHeader(t)).inner_header;
     _ = try persistentBang(t);
-    const inner_after = transientBodyConst(Heap.asHeapHeader(t)).inner_header;
+    const inner_after = transientBody(Heap.asHeapHeader(t)).inner_header;
     try testing.expect(inner_before == inner_after);
 }
 

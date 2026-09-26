@@ -4,9 +4,13 @@ End-to-end suites that run source through the whole pipeline
 (`.nx` text → reader → Form → macroexpansion → bytecode → VM → result)
 and Nextomic through its public Zig API:
 
+The language suites run programs through `test/harness.zig`: one VM
+per assertion, booted as `bin/nexis` boots one, each top-level form
+compiled and run in order; every run asserts the VM's stack length
+and frame depth are restored.
+
 - `eval_pipeline.zig`: every primitive core form, every macro, every
-  try/catch/finally path, VM stack discipline across nested calls
-  (each run asserts the stack length and frame depth are restored),
+  try/catch/finally path, VM stack discipline across nested calls,
   and the `db/*` seam; each store-backed test opens its own store
   under `.zig-cache/tmp/` and deletes it.
 - `runtime_polish.zig`: the Clojure-fidelity rules of the sequence
@@ -26,10 +30,9 @@ and Nextomic through its public Zig API:
   navigating, `touch`, identity, a released connection, and an entity
   kept in a Var under the collector's stress policy.
 
-Both Nextomic corpora end with a benchmark over ~200k datoms whose
-row-count checks always run; the `[bench]` timing lines print to
-stderr only when the `NEXTOMIC_BENCH` environment variable is set
-(`docs/PERF.md` §3.7 has the ReleaseFast numbers).
+The q and pull corpora each end with a 10k-datom twin of a
+`zig build bench` scenario (`bench/nextomic.zig`) that checks its row
+counts.
 
 Run with `zig build test`; `eval_pipeline`, `runtime_polish` and
 `numbers` also run under `zig build quick` and the Nextomic suites under

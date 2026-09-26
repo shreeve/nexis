@@ -1,7 +1,8 @@
 //! heap.zig — runtime heap allocator + `HeapHeader` storage.
 //!
-//! Authoritative layout contract: `docs/VALUE.md` §4 (HeapHeader) and
-//! `docs/HEAP.md` (allocator + object-enumeration + minimal sweep).
+//! Authoritative layout contract: `docs/HEAP.md` §1 (HeapHeader) and
+//! the rest of `docs/HEAP.md` (allocator + object-enumeration +
+//! minimal sweep).
 //!
 //! This is the bedrock every heap-kind Value sits on. String, bignum,
 //! CHAMP map/set, persistent vector, cons list, transient wrapper,
@@ -11,9 +12,9 @@
 //! this file owns allocation, enumeration, the byte counters the
 //! trigger policy reads and the sweep primitive.
 //!
-//! Frozen invariants (VALUE.md §4 + HEAP.md §1):
+//! Frozen invariants (HEAP.md §1):
 //!   - Returned `*HeapHeader` is 16-byte aligned.
-//!   - `HeapHeader` size is 16; field order matches VALUE.md §4 exactly.
+//!   - `HeapHeader` size is 16; field order matches HEAP.md §1 exactly.
 //!   - Fresh allocations are zero-initialized except `kind`.
 //!   - `HeapHeader.hash == 0` means "not yet computed".
 //!   - Double-free is a runtime bug; debug builds panic via a poisoned-
@@ -24,11 +25,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const value = @import("value");
+const value = @import("value.zig");
 
 const Allocator = std.mem.Allocator;
 
-// nexis is pinned to 64-bit single-isolate targets (PLAN §16). Every
+// nexis is pinned to 64-bit single-isolate targets (PLAN §23 #5). Every
 // layout assert below assumes 8-byte pointers and 8-byte `usize`; state
 // that assumption explicitly so a 32-bit build would fail fast and
 // loudly rather than silently mis-size `Block`.
@@ -39,7 +40,7 @@ comptime {
 }
 
 // =============================================================================
-// HeapHeader — 16 bytes, layout frozen by VALUE.md §4.
+// HeapHeader — 16 bytes, layout frozen by HEAP.md §1.
 // =============================================================================
 
 pub const HeapHeader = extern struct {
@@ -51,7 +52,7 @@ pub const HeapHeader = extern struct {
     mark: u8,
     /// Heap-object flags. See `flag_*` constants.
     flags: u8,
-    /// Cached hash; 0 = "not yet computed". VALUE.md §4 explicitly
+    /// Cached hash; 0 = "not yet computed". HEAP.md §1 explicitly
     /// accepts the (rare) recompute cost when a real hash value is 0.
     hash: u32,
     /// Optional metadata map (always a persistent-map heap object when
@@ -65,7 +66,7 @@ pub const HeapHeader = extern struct {
         // noise at every call site. Runtime alignment is guaranteed by
         // the allocator via `.@"16"` at alloc time (HEAP.md §1 invariant 1).
         std.debug.assert(@alignOf(HeapHeader) == 16);
-        // Field offsets pinned to match VALUE.md §4 exactly.
+        // Field offsets pinned to match HEAP.md §1 exactly.
         std.debug.assert(@offsetOf(HeapHeader, "kind") == 0);
         std.debug.assert(@offsetOf(HeapHeader, "mark") == 2);
         std.debug.assert(@offsetOf(HeapHeader, "flags") == 3);
@@ -125,7 +126,7 @@ pub const HeapHeader = extern struct {
 
     // ---- Cached hash ----
     //
-    // VALUE.md §4 accepts the "hash == 0 means uncomputed" sentinel:
+    // HEAP.md §1 accepts the "hash == 0 means uncomputed" sentinel:
     // a genuine computed-zero hash recomputes on next access. This
     // saves one flag bit per heap object. If a per-
     // kind hasher produces output with a non-trivial 0-collision rate
@@ -150,10 +151,7 @@ pub const mark_bit_pinned: u8 = 1 << 1;
 // Bits 2..7 reserved (tri-color / generational / remembered-set use).
 
 pub const flag_has_meta: u8 = 1 << 0;
-pub const flag_interned: u8 = 1 << 1;
-pub const flag_immutable: u8 = 1 << 2;
-pub const flag_zero_copy: u8 = 1 << 3;
-// Bits 4..7 reserved.
+// Bits 1..7 reserved.
 
 // =============================================================================
 // Block — private prefix; users never see it.
@@ -169,7 +167,7 @@ const Block = extern struct {
     /// Total allocation bytes: `@sizeOf(Block) + body_size`. Stored so
     /// `free` can reconstruct the backing slice for `allocator.free`.
     total_size: usize,
-    /// User-visible header. VALUE.md §4.
+    /// User-visible header. HEAP.md §1.
     header: HeapHeader,
     // body follows.
 
@@ -362,33 +360,8 @@ pub const Heap = struct {
     /// every live block, strictly for observation — diagnostics, GC
     /// mark-phase tracing, stats collection. The visitor must NOT call
     /// `heap.free` / `heap.alloc` / `heap.sweepUnmarked` during the
-    /// walk; mutation invalidates the iterator. Use `forEachLiveMut`
-    /// if you need to free the currently-visited block.
+    /// walk; mutation invalidates the iterator.
     pub fn forEachLive(self: *const Heap, visitor: anytype) void {
-        var cur = self.live_head;
-        while (cur) |b| {
-            const next = b.next;
-            visitor.visit(&b.header);
-            cur = next;
-        }
-    }
-
-    /// Mutation-aware traversal. The visitor is permitted to call
-    /// `heap.free(h)` on the **currently-visited block only** — the
-    /// iterator captures `next` before the callback so the current
-    /// block's storage becoming invalid mid-walk is safe.
-    ///
-    /// **NOT guaranteed safe:**
-    ///   - Freeing a different live block during the walk (breaks the
-    ///     iterator's `prev → next` chain).
-    ///   - Allocating a new block during the walk (the new block
-    ///     prepends to `live_head`; whether it's visited this walk is
-    ///     unspecified).
-    ///   - Calling `sweepUnmarked` from inside a visitor.
-    ///
-    /// Use `sweepUnmarked` directly when you want bulk mutation driven
-    /// by the mark bits.
-    pub fn forEachLiveMut(self: *Heap, visitor: anytype) void {
         var cur = self.live_head;
         while (cur) |b| {
             const next = b.next;
@@ -404,8 +377,8 @@ pub const Heap = struct {
     /// roots or trace reachability — that's `gc.zig`'s job. Returns the
     /// number of blocks freed.
     ///
-    /// `pinned` blocks survive regardless of mark state (PLAN §10.5):
-    /// open transactions, durable-ref handles, REPL history, etc.
+    /// `pinned` blocks survive regardless of mark state (GC.md §3); no
+    /// runtime module pins a block, only tests do.
     pub fn sweepUnmarked(self: *Heap) usize {
         var freed: usize = 0;
         var prev: ?*Block = null;
@@ -445,7 +418,7 @@ fn blockSlice(b: *Block) []align(16) u8 {
 
 const testing = std.testing;
 
-test "HeapHeader layout is exactly VALUE.md §4" {
+test "HeapHeader layout is exactly HEAP.md §1" {
     try testing.expectEqual(@as(usize, 16), @sizeOf(HeapHeader));
     try testing.expectEqual(@as(usize, 0), @offsetOf(HeapHeader, "kind"));
     try testing.expectEqual(@as(usize, 2), @offsetOf(HeapHeader, "mark"));
@@ -799,32 +772,6 @@ test "forEachLive: read-only traversal is callable through *const Heap" {
     heap_ref.forEachLive(&counter);
     try testing.expectEqual(@as(usize, 3), counter.count);
     try testing.expect(counter.sum_kind > 0);
-}
-
-test "forEachLiveMut: visitor may free the currently-visited block" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    _ = try heap.alloc(.string, 0);
-    const b = try heap.alloc(.bignum, 0);
-    _ = try heap.alloc(.list, 0);
-
-    // Visitor that frees one specific block during the walk.
-    const Killer = struct {
-        heap_ptr: *Heap,
-        target: *HeapHeader,
-        visited: usize = 0,
-
-        pub fn visit(self: *@This(), h: *HeapHeader) void {
-            self.visited += 1;
-            if (h == self.target) self.heap_ptr.free(h);
-        }
-    };
-
-    var killer: Killer = .{ .heap_ptr = &heap, .target = b };
-    heap.forEachLiveMut(&killer);
-    try testing.expectEqual(@as(usize, 3), killer.visited);
-    try testing.expectEqual(@as(usize, 2), heap.liveCount());
 }
 
 test "alloc stress: 256 allocations, sweep half, deinit the rest" {

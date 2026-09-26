@@ -1,0 +1,40 @@
+; src/stdlib/set.nx — the `nexis.set` namespace: set algebra over
+; persistent sets, Clojure's clojure.set (which names this namespace).
+; Embedded via @embedFile and bootstrapped with nexis.set current.
+
+; (union & sets) → every element of any of the sets.
+(defn union [& sets]
+  (reduce (fn [acc s] (into acc s)) #{} sets))
+
+; (intersection s & sets) → the elements of s in every other set.
+(defn intersection [s & sets]
+  (reduce (fn [acc t] (set (filter (fn [x] (contains? t x)) acc))) s sets))
+
+; (difference s & sets) → the elements of s in none of the others.
+(defn difference [s & sets]
+  (reduce (fn [acc t] (reduce disj acc t)) s sets))
+
+; (subset? a b) → whether every element of a is in b;
+; (superset? a b) → whether every element of b is in a.
+(defn subset? [a b]
+  (and (<= (count a) (count b)) (every? (fn [x] (contains? b x)) a)))
+
+(defn superset? [a b]
+  (subset? b a))
+
+; (select pred s) → the elements of s for which pred is truthy.
+(defn select [pred s]
+  (set (filter pred s)))
+
+; (map-invert m) → m with its keys and values swapped.
+(defn map-invert [m]
+  (reduce-kv (fn [acc k v] (assoc acc v k)) {} m))
+
+; (rename-keys m kmap) → m with each key of kmap renamed to its value.
+(defn rename-keys [m kmap]
+  (reduce-kv (fn [acc old new]
+               (if (contains? m old)
+                 (assoc acc new (get m old))
+                 acc))
+             (apply dissoc m (keys kmap))
+             kmap))

@@ -6,14 +6,13 @@
 ; file for `.nx` files. `lib.geom` resolves to `lib/geom.nx`.
 ; (Dots in namespace names become slashes in the file path.)
 ;
-; Supported require shapes (v1 scope):
+; Two require shapes:
 ;   (require 'my.ns)              — load my.ns; no alias
 ;   (require '[my.ns :as alias])  — load + alias `alias → my.ns`
-;
-; Deferred to post-v1: :refer, :rename, :exclude, relative
-; requires, reload.
+; `:as-alias`, `:refer` and `:rename` work as in Clojure
+; (docs/MACROEXPAND.md, the `require` row); prefix lists do not.
 
 (require '[lib.geom :as g])
 
 ; Qualified call via alias.
-(g/area-of-square 5)
+(println (g/area-of-square 5))

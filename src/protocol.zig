@@ -1,13 +1,9 @@
 //! protocol.zig — `Kind.protocol = 36` + `Kind.protocol_fn = 37`
 //! heap kinds.
 //!
-//! Authoritative spec: `docs/PROTOCOLS.md` §2.2 + §2.3. Per-VM
-//! protocol registry lives on the VM; this module owns only the
-//! heap-side storage + identity-equality + identity-hash for the
-//! two kinds. The dispatch logic for `(method-fn receiver args)`
-//! lives in `vm.zig`'s `dispatchProtocolMethod`.
-//!
-//! Storage (both kinds opaque, identity-valued):
+//! Authoritative spec: `docs/PROTOCOLS.md` §2.2 + §2.3. The per-VM
+//! protocol registry and method dispatch live in `vm.zig`; this module
+//! owns only the heap bodies of the two kinds:
 //!
 //!     ProtocolBody extern struct {
 //!         id: u32,         // dense per-VM
@@ -19,21 +15,12 @@
 //!         method_name_id: u32,   // interned symbol id of method
 //!     }
 //!
-//! Both kinds are opaque (`#<protocol my.ns/IFoo>` /
-//! `#<protocol-fn my.ns/IFoo/bar>` in format.zig). Identity
-//! equality + identity hash via the *HeapHeader pointer (matching
-//! atoms / durable_refs / vars). NOT serializable.
-//!
-//! Module graph: src/protocol.zig depends on value + heap + hash
-//! only. Consumed by dispatch.zig (eq + hash arms), gc.zig
-//! (trace arms — both are leafs, no inner heap to mark),
-//! format.zig (printer arms), codec.zig (unserializable arm),
-//! stdlib.zig (native helpers + dispatcher).
+//! Both are identity kinds (`dispatch.isIdentityKind`): equal to
+//! themselves only, hashed by pointer, not serializable.
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -102,26 +89,6 @@ pub inline fn protocolFnMethodNameId(v: Value) u32 {
 }
 
 // =============================================================================
-// Identity hash / equality (both kinds — pointer-identity)
-// =============================================================================
-
-pub fn hashHeader(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    const ptr_int: usize = @intFromPtr(h);
-    var ptr_bytes: [@sizeOf(usize)]u8 = undefined;
-    std.mem.writeInt(usize, &ptr_bytes, ptr_int, .little);
-    hasher.update(&ptr_bytes);
-    const truncated: u32 = @truncate(hasher.final());
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-
-pub fn pointerEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
-}
-
-// =============================================================================
 // GC trace (both kinds — leaf; no inner heap to mark)
 // =============================================================================
 
@@ -154,16 +121,4 @@ test "makeProtocolFn / accessors" {
     try testing.expect(pfn.kind() == .protocol_fn);
     try testing.expectEqual(@as(u32, 7), protocolFnProtocolId(pfn));
     try testing.expectEqual(@as(u32, 99), protocolFnMethodNameId(pfn));
-}
-
-test "pointerEqual + hashHeader: identity-based" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const p1 = try makeProtocol(&heap, 1);
-    const p2 = try makeProtocol(&heap, 1); // distinct allocation, same id
-    const ph1 = Heap.asHeapHeader(p1);
-    const ph2 = Heap.asHeapHeader(p2);
-    try testing.expect(pointerEqual(ph1, ph1));
-    try testing.expect(!pointerEqual(ph1, ph2));
-    try testing.expect(hashHeader(ph1) != hashHeader(ph2));
 }

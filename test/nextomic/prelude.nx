@@ -1,10 +1,10 @@
 ; test/nextomic/prelude.nx — shared by every script in this directory
-; through `(require '[prelude :as t])`; the build copies it into the
-; scripts' scratch directory next to them.
+; through `(require '[prelude :as t])`, which finds it beside the
+; script.
 
 (ns prelude)
 
-; Entity-id partitions (docs/NEXTOMIC.md §2): user entities start at
+; Entity-id partitions (docs/NEXTOMIC.md §2.1): user entities start at
 ; 2^32; a transaction entity is tx-partition + t.
 (def user-partition 4294967296)
 (def tx-partition 70368744177664)

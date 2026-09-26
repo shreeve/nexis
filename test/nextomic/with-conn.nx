@@ -33,4 +33,4 @@
   (d/sync c)
   (t/check "nested with-conn on another store"
          (= 1 (d/with-conn [c2 "with-conn-2.edb"] (d/basis-t (d/db c2))))))
-:with-conn-done
+(println :with-conn-done)

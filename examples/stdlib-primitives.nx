@@ -4,9 +4,9 @@
 ; inspection: list, cons, first, rest, count, nth, empty?,
 ; identity, nil?, some?
 ;
-; These are pure host-Zig fns installed into the user's
-; namespace at VM startup. They're callable from both runtime
-; code AND inside `defmacro` bodies at compile time.
+; These are Zig natives of `nexis.core`, which every namespace
+; refers. They're callable from both runtime code AND inside
+; `defmacro` bodies at compile time.
 ;
 ; Higher-order fns (map/reduce/filter/apply), first-class
 ; arithmetic (+, <, =, inc, ...) and map/set utilities (assoc,
@@ -42,7 +42,7 @@
        ~(first (rest clauses))
        (my-cond ~@(rest (rest clauses))))))
 
-(my-cond
+(println (my-cond
   (empty? (list))          :got-empty
   (empty? (list :anything)) :unreached
-  true                      :default)
+  true                      :default))

@@ -1,7 +1,7 @@
 //! test/prop/primitive.zig — randomized property tests for immediates.
 //!
-//! Covers PLAN §20.2 test #1. It exercises the bedrock invariants of
-//! `identical?`, `=`,
+//! Randomized equality and hash laws over the immediates. It exercises
+//! the bedrock invariants of `identical?`, `=`,
 //! and `hash` across the full immediate kind space, using a deterministic
 //! PRNG so failures are reproducible.
 //!
@@ -22,15 +22,19 @@
 //!   P7. NaN canonicalization: any f64 input — including arbitrary NaN
 //!       bit patterns — produces a Value whose hash and equality
 //!       behaviour are identical to the canonical NaN.
+//!   P8. Within a kind, `=` follows the value: distinct chars,
+//!       keywords, symbols and fixnums are never `=`.
+//!   K1. Every kind's equality category (identity or not) and hash
+//!       domain byte match the table of SEMANTICS §3.3.
 //!
 //! There's no adversarial key generator here; the sample space is
 //! dense enough (every kind, broad value ranges) that a fixed-seed
 //! uniform sampler catches the interesting cases.
 
 const std = @import("std");
-const value = @import("value");
-const eq = @import("eq");
-const hash = @import("hash");
+const nx = @import("nexis");
+const value = nx.value;
+const hash = nx.hash;
 
 const Value = value.Value;
 
@@ -83,7 +87,7 @@ test "P1: identical? is reflexive" {
     var i: usize = 0;
     while (i < iterations_per_property) : (i += 1) {
         const v = randValue(r);
-        try std.testing.expect(eq.identical(v, v));
+        try std.testing.expect(v.identicalTo(v));
     }
 }
 
@@ -97,12 +101,12 @@ test "P2: = is reflexive, symmetric, (pairwise) transitive" {
         const c = randValue(r);
 
         // Reflexive.
-        try std.testing.expect(eq.equalImmediate(a, a));
+        try std.testing.expect(a.equalImmediate(a));
         // Symmetric.
-        try std.testing.expectEqual(eq.equalImmediate(a, b), eq.equalImmediate(b, a));
+        try std.testing.expectEqual(a.equalImmediate(b), b.equalImmediate(a));
         // Transitive — only interesting when both halves hold.
-        if (eq.equalImmediate(a, b) and eq.equalImmediate(b, c)) {
-            try std.testing.expect(eq.equalImmediate(a, c));
+        if (a.equalImmediate(b) and b.equalImmediate(c)) {
+            try std.testing.expect(a.equalImmediate(c));
         }
     }
 }
@@ -114,8 +118,8 @@ test "P3: identical? ⇒ =" {
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (eq.identical(a, b)) {
-            try std.testing.expect(eq.equalImmediate(a, b));
+        if (a.identicalTo(b)) {
+            try std.testing.expect(a.equalImmediate(b));
         }
     }
 }
@@ -127,7 +131,7 @@ test "P4: = ⇒ hash equal — the bedrock" {
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (eq.equalImmediate(a, b)) {
+        if (a.equalImmediate(b)) {
             try std.testing.expectEqual(a.hashImmediate(), b.hashImmediate());
         }
     }
@@ -165,10 +169,10 @@ test "P6: cross-kind = is false (except within {true_, false_} / {keyword×keywo
     while (i < iterations_per_property) : (i += 1) {
         const a = randValue(r);
         const b = randValue(r);
-        if (a.kind() != b.kind() and eq.equalImmediate(a, b)) {
+        if (a.kind() != b.kind() and a.equalImmediate(b)) {
             // There are zero legitimate cross-kind equalities among
-            // immediates; cross-type numeric `==` does not exist
-            // (PLAN §23 #11).
+            // immediates; cross-type numeric equality is `==`, never
+            // `=` (PLAN §23 #11).
             try std.testing.expect(false);
         }
     }
@@ -189,9 +193,51 @@ test "P7: NaN canonicalization — arbitrary NaN bits behave identically" {
         const bits: u64 = sign | (@as(u64, 0x7FF) << 52) | @as(u64, mantissa);
         const v = value.fromFloat(@bitCast(bits));
 
-        try std.testing.expect(eq.equalImmediate(v, canonical));
+        try std.testing.expect(v.equalImmediate(canonical));
         try std.testing.expectEqual(v.hashImmediate(), canonical.hashImmediate());
         // And bit-level: all NaN inputs collapse to the canonical bit pattern.
         try std.testing.expectEqual(hash.canonical_nan_bits, v.payload);
+    }
+}
+
+test "P8: within a kind, = follows the value: distinct chars, keywords, symbols and fixnums are never =" {
+    try std.testing.expect(!value.fromChar('a').?.equalImmediate(value.fromChar('b').?));
+    try std.testing.expect(!value.fromKeywordId(7).equalImmediate(value.fromKeywordId(8)));
+    try std.testing.expect(!value.fromSymbolId(7).equalImmediate(value.fromSymbolId(8)));
+    try std.testing.expect(!value.fromFixnum(1).?.equalImmediate(value.fromFixnum(2).?));
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
+    const r = prng.random();
+    var i: usize = 0;
+    while (i < iterations_per_property) : (i += 1) {
+        const a = randValue(r);
+        const b = randValue(r);
+        if (a.kind() != b.kind()) continue;
+        const same = if (a.kind() == .float)
+            a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat()))
+        else
+            a.payload == b.payload;
+        try std.testing.expectEqual(same, a.equalImmediate(b));
+    }
+}
+
+test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" {
+    const dispatch = nx.dispatch;
+    for (std.enums.values(value.Kind)) |k| {
+        const identity = switch (k) {
+            .function, .var_, .transient, .native_fn, .db_connection, .db_write_txn, .db_read_txn, .atom, .protocol, .protocol_fn, .nextomic_conn => true,
+            else => false,
+        };
+        const domain: u8 = switch (k) {
+            .list, .persistent_vector => 0xF0,
+            else => @intFromEnum(k),
+        };
+        std.testing.expectEqual(identity, dispatch.isIdentityKind(k)) catch |err| {
+            std.debug.print("\n  kind {t}: identity\n", .{k});
+            return err;
+        };
+        std.testing.expectEqual(domain, dispatch.domainByte(k)) catch |err| {
+            std.debug.print("\n  kind {t}: domain\n", .{k});
+            return err;
+        };
     }
 }

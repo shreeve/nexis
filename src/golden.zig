@@ -13,16 +13,21 @@
 //!   Error path: `<dir>/errors/<name>.nx` + `<name>.err`
 //!       Reader must fail with `:<kind>` (optionally ` :detail "..."`).
 //!
-//! Mismatches print a diff to stderr and exit 1. In update mode, expected
-//! files are rewritten in place and the runner exits 0.
+//! A run that passes prints nothing. Mismatches print a diff to stderr
+//! and exit 1. In update mode, expected files are rewritten in place,
+//! each one named on stderr, and the runner exits 0.
 
 const std = @import("std");
 const parser = @import("parser.zig");
 const reader = @import("reader.zig");
+const stack = @import("stack.zig");
 
 const Mode = enum { verify, update };
 
 pub fn main(init: std.process.Init) !u8 {
+    // The reader recurses on nesting; the guard turns input nested
+    // past the main thread's stack into :nesting-too-deep.
+    stack.arm(stack.main_thread_budget);
     const gpa = init.gpa;
     const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -50,7 +55,10 @@ pub fn main(init: std.process.Init) !u8 {
         else => return e,
     };
 
-    std.debug.print("golden: ok={d} updated={d} failed={d} missing={d}\n", .{ stats.ok, stats.updated, stats.failed, stats.missing });
+    // Silent on success, so the build caches the verify run and the
+    // gate's output carries only failures.
+    if (stats.failed > 0 or stats.missing > 0 or stats.updated > 0)
+        std.debug.print("golden: ok={d} updated={d} failed={d} missing={d}\n", .{ stats.ok, stats.updated, stats.failed, stats.missing });
     // Missing expected files are a verification failure — silent greens on
     // absent `.sexp` / `.err` files would let whole test cases disappear
     // unnoticed. In `--update` mode the runner regenerates them instead
@@ -105,9 +113,9 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8
         return;
     };
 
-    const forms = rd.readProgram(tree) catch {
-        const e = rd.err orelse unreachable;
-        std.debug.print("✗ {s}.nx — unexpected reader error :{s}\n", .{ stem, @tagName(e.kind) });
+    const forms = rd.readProgram(tree) catch |err| {
+        const kind = if (rd.err) |e| @tagName(e.kind) else @errorName(err);
+        std.debug.print("✗ {s}.nx — unexpected reader error :{s}\n", .{ stem, kind });
         stats.failed += 1;
         return;
     };
@@ -139,7 +147,6 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8
     defer gpa.free(expected);
 
     if (std.mem.eql(u8, expected, actual)) {
-        std.debug.print("✓ {s}.nx\n", .{stem});
         stats.ok += 1;
         return;
     }
@@ -163,7 +170,7 @@ fn runErrorCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []con
 
     _ = rd.readProgram(tree) catch |err| switch (err) {
         error.ReaderFailure => {
-            const e = rd.err orelse unreachable;
+            const e = rd.err orelse return error.ReaderFailure;
             var al: std.Io.Writer.Allocating = .init(gpa);
             defer al.deinit();
             // Kebab-case the error kind so `.err` files read naturally
@@ -190,7 +197,7 @@ fn compareErr(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const
     const err_path = try std.fs.path.join(gpa, &.{ dir, err_name });
     defer gpa.free(err_path);
 
-    const expected = std.Io.Dir.cwd().readFileAlloc(io, err_path, gpa, .limited(1 << 10)) catch |e| switch (e) {
+    const expected = std.Io.Dir.cwd().readFileAlloc(io, err_path, gpa, .limited(1 << 20)) catch |e| switch (e) {
         error.FileNotFound => {
             if (mode == .update) {
                 const with_newline = try std.mem.concat(gpa, u8, &.{ actual, "\n" });
@@ -210,7 +217,6 @@ fn compareErr(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const
     const exp_trim = std.mem.trimEnd(u8, expected, "\n \t");
 
     if (std.mem.eql(u8, exp_trim, actual)) {
-        std.debug.print("✓ errors/{s}.nx\n", .{stem});
         stats.ok += 1;
         return;
     }

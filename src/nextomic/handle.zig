@@ -27,9 +27,9 @@
 //!     `natives.zig`, and the VM it runs against rides in the box too.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
+const value = @import("../value.zig");
+const heap_mod = @import("../heap.zig");
+const hash_mod = @import("../hash.zig");
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;
@@ -74,19 +74,6 @@ pub fn connPtr(v: Value) *anyopaque {
 pub fn connPath(v: Value) []const u8 {
     std.debug.assert(v.kind() == .nextomic_conn);
     return connPathBytes(Heap.asHeapHeader(v));
-}
-
-/// Identity hash on the header pointer.
-pub fn connHash(h: *HeapHeader) u32 {
-    if (h.cachedHash()) |cached| return cached;
-    const full = hash_mod.hashU64(@intFromPtr(h));
-    const truncated: u32 = @truncate(full);
-    if (truncated != 0) h.setCachedHash(truncated);
-    return truncated;
-}
-
-pub fn connEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    return a == b;
 }
 
 pub fn formatConn(v: Value, writer: *std.Io.Writer) !void {
@@ -199,7 +186,7 @@ pub fn formatDb(v: Value, writer: *std.Io.Writer) !void {
 /// only errors of the VM's set, so `vm.lookup` can cast them back.
 pub const EntityRead = *const fn (vm: *anyopaque, ent: Value, key: Value, default: Value) anyerror!Value;
 
-/// The fields of a lazy entity (NEXTOMIC.md §6).
+/// The fields of a lazy entity (NEXTOMIC.md §6.1).
 pub const EntityShape = struct {
     /// The `nextomic_db` box the entity reads through.
     db: Value,
@@ -343,7 +330,7 @@ test "entity box is a value over its db-value and eid, and reads through its hoo
     try testing.expectEqualStrings("#nextomic/entity {:db/id 4294967297}", w.buffered());
 }
 
-test "conn box keeps its path and is identity-valued" {
+test "conn box keeps its path; two boxes are two identities" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var target: u32 = 0;
@@ -351,8 +338,7 @@ test "conn box keeps its path and is identity-valued" {
     const b = try makeConn(&heap, @ptrCast(&target), "/tmp/a.edb");
     try testing.expectEqualStrings("/tmp/a.edb", connPath(a));
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&target)), connPtr(a));
-    try testing.expect(connEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(a)));
-    try testing.expect(!connEqual(Heap.asHeapHeader(a), Heap.asHeapHeader(b)));
+    try testing.expect(Heap.asHeapHeader(a) != Heap.asHeapHeader(b));
     var buf: [64]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try formatConn(a, &w);

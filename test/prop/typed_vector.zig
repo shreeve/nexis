@@ -1,5 +1,5 @@
 //! test/prop/typed_vector.zig — randomized properties for the typed
-//! vector heap kind (`docs/TYPED_VECTOR.md` §7).
+//! vector heap kind (`docs/TYPED_VECTOR.md` §9).
 //!
 //! Properties:
 //!   T1. Codec round trip for both element types at lengths 0, 1, 31,
@@ -11,21 +11,23 @@
 //!       elements in distinct allocations are `=` and hash alike;
 //!       one changed element, a different length, or the other
 //!       element type breaks `=`.
+//!   T2b. Signed zero and NaN: `-0.0` equals `+0.0`, NaN equals NaN,
+//!       and the hashes agree.
 //!   T3. A typed vector is never `=` to the persistent vector of the
 //!       same numbers, and their hashes differ.
 //!   T4. `nth` reads back every element and fails with
 //!       `IndexOutOfBounds` at `count` and beyond.
 
 const std = @import("std");
-const value = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const intern_mod = @import("intern");
-const bignum = @import("bignum");
-const vector_mod = @import("vector");
-const typed_vector = @import("typed_vector");
-const codec = @import("codec");
-const dispatch = @import("dispatch");
+const nx = @import("nexis");
+const value = nx.value;
+const heap_mod = nx.heap;
+const intern_mod = nx.intern;
+const bignum = nx.bignum;
+const vector_mod = nx.vector;
+const typed_vector = nx.typed_vector;
+const codec = nx.codec;
+const dispatch = nx.dispatch;
 
 const Value = value.Value;
 const Heap = heap_mod.Heap;

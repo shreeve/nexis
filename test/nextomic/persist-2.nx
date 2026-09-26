@@ -19,4 +19,4 @@
   (d/transact! c [{:city/name "Bari" :city/population 320000}])
   (t/check "writing continues from the persisted t" (= 5 (d/basis-t (d/db c))))
   (println (count (d/datoms (d/db c) :aevt :city/name)))))
-:persist-2-done
+(println :persist-2-done)

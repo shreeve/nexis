@@ -1,0 +1,1 @@
+[:rolled-back [:caught :oops] :after-rollback {:age 31, :note :updated-via-with-tx}]

@@ -67,4 +67,4 @@
 (println (lens (d/index-range (d/as-of db3 (:tx r3)) :item/sku s60 s97)))
 (t/check "the view before the long values has none of them" (empty? (d/index-range db :item/sku s60 nil)))
 (d/release c)
-:datoms-done
+(println :datoms-done)

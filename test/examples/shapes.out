@@ -1,0 +1,27 @@
+=== shapes + areas demo ===
+
+Per-shape reports:
+   Circle r=5 => area=7850 label=:small-circle satisfies?=true
+   Rectangle 3x4 => area=12 label=:small-rect satisfies?=true
+   Triangle b=6 h=4 => area=24 label=:triangle satisfies?=true
+   Square of side 42 => area=1764 label=:answer satisfies?=true
+   Label: hi => area=0 label=:greeting satisfies?=true
+   Unknown: :unknown-shape => area=0 label=:no-label satisfies?=true
+
+Aggregate state (atom):
+  total area = 9650
+
+Equality probes (structural =):
+  (= (->Circle 5) (->Circle 5)) => true
+  (= (->Circle 5) (->Circle 7)) => false
+  records-as-map-keys: lookup by fresh constructor:
+    (get label-by-shape (->Circle 5)) => :small-circle
+
+Dispatch table snapshot (satisfies?):
+  Shape ⊇ Circle    ? true
+  Shape ⊇ Triangle  ? true
+  Shape ⊇ :fixnum   ? true
+  Shape ⊇ :string   ? true
+  Shape ⊇ :keyword  ? (caught by :any) => true
+
+=== demo complete ===

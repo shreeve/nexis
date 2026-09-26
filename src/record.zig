@@ -21,20 +21,21 @@
 //!
 //!     src/record.zig
 //!     ├── @import("std")
-//!     ├── @import("value")
-//!     ├── @import("heap")
-//!     ├── @import("hash")
-//!     └── @import("champ")     // for hash composition of field map
+//!     ├── @import("value.zig")
+//!     ├── @import("heap.zig")
+//!     ├── @import("hash.zig")
+//!     └── @import("coll/champ.zig")     // for hash composition of field map
 //!
 //! Nothing imports record.zig except `dispatch.zig` (heapHashBase +
-//! heapEqual arms), `gc.zig` (trace arm), `stdlib.zig` (native fns),
-//! `format.zig` (printer arm), `codec.zig` (unserializable arm).
+//! heapEqual arms), `gc.zig` (trace arm), `vm.zig` (dispatch key,
+//! lookup), `stdlib.zig` (native fns), `format.zig` (printer arm)
+//! and `root.zig`.
 
 const std = @import("std");
-const value_mod = @import("value");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const champ_mod = @import("champ");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
+const champ_mod = @import("coll/champ.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -85,10 +86,14 @@ pub inline fn fieldsOf(v: Value) Value {
     return Heap.bodyOf(RecordBody, Heap.asHeapHeader(v)).fields;
 }
 
-/// Return a NEW record Value with the same type_id but `new_fields`
-/// substituted. Used by `assoc` / `dissoc` to preserve record type.
+/// Return a NEW record Value with the same type_id and metadata but
+/// `new_fields` substituted. Used by `assoc` / `dissoc` to preserve
+/// record type; the metadata stays as on every Clojure record update
+/// (SEMANTICS §7).
 pub fn withFields(heap: *Heap, v: Value, new_fields: Value) !Value {
-    return try make(heap, typeId(v), new_fields);
+    const r = try make(heap, typeId(v), new_fields);
+    Heap.asHeapHeader(r).setMeta(Heap.asHeapHeader(v).getMeta());
+    return r;
 }
 
 // =============================================================================

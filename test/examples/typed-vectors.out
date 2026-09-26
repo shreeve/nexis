@@ -1,0 +1,14 @@
+xs = #i64[1 2 3 4 5] type :i64
+ys = #f64[1.0 2.0 3.0 4.0 5.0] type :f64
+count 5 nth 2 3 get 9 :none
+vec [1 2 3 4 5]
+reduce 15 into #{1.0 2.0 3.0 4.0 5.0}
+map (2 3 4 5 6)
+sum 15 15.0
+dot 55 55.0
+scale #i64[10 20 30 40 50] #f64[0.5 1.0 1.5 2.0 2.5]
+tv/map #i64[1 4 9 16 25] #f64[0.5 1.0 1.5 2.0 2.5]
+= same true = f64 false = vector false
+conj :kind-mismatch
+i64 of a float :kind-mismatch
+nth past the end :index-out-of-bounds

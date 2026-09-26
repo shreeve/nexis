@@ -1,0 +1,18 @@
+intake at t = 8 , basis now 10
+Mara today: {:patient/mrn MRN-1001, :patient/name Mara Quist, :patient/born 631152000000, :patient/allergies #{:latex}}
+Mara's visits: [annual]
+V-1 notes: [BP normal advised flu shot BP normal advised flu shot]
+latex allergies: [Mara Quist]
+visits per patient: ([Mara Quist 1])
+visits over 60 kg: #{[V-1 63.0]}
+Dr. Okafor's patients: (Mara Quist Teo Lund)
+Mara's chart: {:db/id 4294967297, :patient/name Mara Quist, :patient/allergies [:latex], :patient/primary {:db/id 4294967296, :clinician/name Dr. Okafor}, :visit/_patient [{:db/id 4294967299, :visit/reason annual, :visit/weight-kg 63.0, :visit/notes [{:db/id 4294967300, :note/text BP normal} {:db/id 4294967301, :note/text advised flu shot} {:db/id 4294967302, :note/text BP normal} {:db/id 4294967303, :note/text advised flu shot}]}]}
+both names: [Mara Quist Teo Lund]
+Mara at intake: #{:penicillin :latex}
+weight history: [[62.5 4 true] [62.5 5 false] [62.5 9 true] [62.5 10 false] [63.0 5 true] [63.0 9 false] [63.0 10 true]]
+what changed in the correction: [[:visit/weight-kg 62.5 false] [:visit/weight-kg 63.0 true] [:patient/allergies :penicillin false]]
+if V-2 were filed: ([Mara Quist 2]) at t = 11
+on file: 1 visit(s), basis 10
+Teo renamed: Teodor Lund
+conflict: {:error :nextomic/unique, :attr :visit/id, :value V-1}
+patients: 2 visits: 1 basis: 11

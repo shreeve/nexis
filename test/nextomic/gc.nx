@@ -12,8 +12,11 @@
 
 (def c (d/connect "gc.edb"))
 (d/transact! c [{:db/ident :item/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-                {:db/ident :item/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
-(d/transact! c (mapv (fn [i] {:item/name (str "item-" i) :item/n i}) (range 40)))
+                {:db/ident :item/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                {:db/ident :item/note :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}])
+(d/transact! c (mapv (fn [i] (merge {:item/name (str "item-" i) :item/n i}
+                                    (when (< i 5) {:item/note (str "note number " i " of the long enough kind")})))
+                     (range 40)))
 (def db (d/db c))
 
 ; Every call builds and drops a few kilobytes of garbage.
@@ -34,9 +37,69 @@
   (= (d/q '[:find (total ?n) . :where [?e :item/n ?n]] db)
      (reduce + 0 (range 40))))
 
-(t/check "the same query parses again after the caches emptied"
+; Values the pipeline builds itself sit in relation cells and groups
+; while later user functions collect.
+(defn heavy? [x] (churn x) true)
+(def long-text "a string long enough to live on the heap by itself")
+(t/check "a ground string survives collections"
+  (every? (fn [[s _]] (= s long-text))
+          (d/q '[:find ?s ?n :in $ ?text :where [(ground ?text) ?s] [?e :item/n ?n] [(heavy? ?n)]] db long-text)))
+(t/check "a get-else default survives collections"
+  (every? (fn [[s _]] (= s "no name given to this one at all"))
+          (d/q '[:find ?s ?n :where [?e :item/n ?n] [(get-else $ ?e :item/note "no name given to this one at all") ?s] [(heavy? ?n)] [(> ?n 4)]] db)))
+(t/check "a tuple bound as one value survives collections"
+  (= (rows (d/q '[:find ?t :where [?e :item/n ?n] [(< ?n 5)] [?e :item/name ?m] [(tuple ?m ?n) ?t] [(heavy? ?n)]] db))
+     (rows (map (fn [n] [[(str "item-" n) n]]) (range 5)))))
+(t/check "get-some and fulltext tuples survive collections"
+  (and (= (rows (d/q '[:find ?a ?v :where [?e :item/n ?n] [(< ?n 7)] [(get-some $ ?e :item/note :item/name) [?a ?v]] [(heavy? ?v)]] db))
+          (rows (concat (map (fn [i] [:item/note (str "note number " i " of the long enough kind")]) (range 5))
+                        [[:item/name "item-5"] [:item/name "item-6"]])))
+       (= (rows (d/q '[:find ?v :where [(fulltext $ :item/note "kind") [[?e ?v]]] [(heavy? ?v)]] db))
+          (rows (map (fn [i] [(str "note number " i " of the long enough kind")]) (range 5))))
+       (= 5 (count (first (first (d/q '[:find ?h :where [(fulltext $ :item/note "kind") ?h] [(heavy? ?h)]] db)))))))
+(defn tally [xs] (churn (count xs)) (count xs))
+(t/check "built-in aggregate values survive a custom aggregate's collections"
+  (= (d/q '[:find [(distinct ?m) (min 2 ?m) (max 2 ?n) (tally ?n)] :where [?e :item/n ?n] [(< ?n 3)] [?e :item/name ?m]] db)
+     [#{"item-0" "item-1" "item-2"} ["item-0" "item-1"] [2 1] 3]))
+
+(t/check "the same query parses again after collections"
   (= (rows (d/q '[:find ?n :where [?e :item/n ?n] [(big-even? ?n)]] db))
      (rows (map vector (filter even? (range 40))))))
+
+; A query run from inside another query's predicate, its value built
+; afresh on every call and each one asked four times: the cache keeps
+; every value it holds alive, so a later equal query never compares
+; against freed memory and a freed address is never mistaken for a new
+; query.
+(def wrong (atom []))
+(defn inner-agrees? [n]
+  (churn n)
+  (let [m (d/q [:find '?m '. :where ['?e :item/n n] ['?e :item/n '?m]] db)]
+    (when (not= m n) (swap! wrong conj [n m]))
+    true))
+(t/check "nested queries built afresh answer their own query across collections"
+  (and (= 40 (count (d/q '[:find ?e :where [?e :item/n ?n] [(mod ?n 10) ?k] [(inner-agrees? ?k)]] db)))
+       (empty? @wrong)))
+
+; The collector finds the caches' query values through the VM itself, so
+; a program that defines names in nexis.internal cannot unroot them.
+(def long-name (apply str (repeat 200 "x")))
+(def held-query (vector :find '?e :where (vector '?e :item/name long-name)))
+(def held-rules (vector (vector (list 'named '?e) (vector '?e :item/name long-name))))
+(d/q held-query db)
+(d/q '[:find ?e :in $ % :where (named ?e)] db held-rules)
+(in-ns 'nexis.internal)
+(nexis.core/eval (nexis.core/list 'def (nexis.core/symbol "#%query-cache") []))
+(nexis.core/eval (nexis.core/list 'def (nexis.core/symbol "#%rules-cache") 42))
+(nexis.core/in-ns 'user)
+(def held-query nil)
+(def held-rules nil)
+(churn 1)
+(t/check "the query caches survive a program redefining names in nexis.internal"
+  (and (empty? (d/q (vector :find '?e :where (vector '?e :item/name (apply str (repeat 200 "x")))) db))
+       (empty? (d/q '[:find ?e :in $ % :where (named ?e)] db
+                    (vector (vector (list 'named '?e) (vector '?e :item/name (apply str (repeat 200 "x")))))))
+       (= 40 (count (d/q '[:find ?e :in $ % :where (numbered ?e)] db '[[(numbered ?e) [?e :item/n _]]])))))
 
 (d/release c)
 (println "done")

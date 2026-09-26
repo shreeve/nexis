@@ -1,1191 +1,364 @@
-//! dispatch.zig — full-Value hash and equality dispatch.
+//! dispatch.zig — `=` and `hash` over any Value (SEMANTICS §2, §3).
 //!
-//! This is the canonical public API for hashing and comparing any
-//! `Value`, immediate or heap. `value.zig` and `eq.zig` stay low-level
-//! (they own immediate semantics + cross-kind rules); this module
-//! layers per-kind heap dispatch on top of them.
+//! Immediates go to `Value.equalImmediate` / `Value.hashImmediate`;
+//! heap kinds to their own modules. The collection modules take the
+//! element hash and equality as function pointers (`hashSeq(h,
+//! &hashValue)`), so recursion into elements comes back through here
+//! and no kind module imports this one.
 //!
-//! Why this split instead of folding heap dispatch into `value` / `eq`?
-//! The centralized shape serves two purposes: (1) keeping the per-kind import
-//! list out of `value` / `eq` so they don't accrete one import per
-//! heap kind, and (2) avoiding the module-graph cycle that results
-//! when `value` or `eq` imports a dispatcher that transitively imports
-//! them back — Zig tolerates the cycle at ordinary compile time, but
-//! the test runner's "each source file is also a test binary root"
-//! model rejects a file appearing in both `root` and a named module
-//! of the same graph. One-way dependencies (everyone below depends on
-//! `dispatch`; `dispatch` depends on nothing else in the runtime via
-//! dispatch itself) make every test binary resolve cleanly.
+//! Three rules decide every pair of values:
 //!
-//! Dependency shape (one-way; no cycles):
+//!   - **Identity kinds** (functions, vars, handles, atoms, transients,
+//!     protocols, Nextomic connections) are equal to themselves only
+//!     and hash their pointer. The collector never moves a block, so
+//!     the pointer is stable for the value's life.
+//!   - **Sequential kinds** (list, vector) compare element-wise across
+//!     kinds and share one hash domain byte, so `(= '(1 2) [1 2])` and
+//!     their hashes agree.
+//!   - **Every other kind** is equal only within its own kind, by its
+//!     module's structural rule, and mixes its own kind byte into its
+//!     hash.
 //!
-//!     dispatch.zig
-//!     ├─ @import("value")        (Value + Kind + v.hashImmediate path)
-//!     ├─ @import("eq")           (cross-kind rule + immediate equality)
-//!     ├─ @import("heap")         (*HeapHeader + Heap.asHeapHeader)
-//!     ├─ @import("hash")         (combineOrdered + mixKindDomain)
-//!     ├─ @import("string")       (hashHeader + bytesEqual)
-//!     ├─ @import("bignum")       (hashHeader + limbsEqual)
-//!     ├─ @import("list")         (hashSeq + equalSeq + Cursor)
-//!     ├─ @import("vector")       (hashSeq + equalSeq + Cursor; cross-kind sequential)
-//!     ├─ @import("champ")         (hashMap + equalMap + hashSet + equalSet;
-//!     │                            associative + set categories)
-//!     └─ @import("typed_vector") (hashHeader + equalHeaders; kind-local)
-//!
-//! No heap-kind module imports `dispatch.zig`. Collection kinds whose
-//! hash/equal is recursive over their elements (list, vector, map,
-//! set) take the element callback as a function pointer:
-//! `hashSeq(h, &hashValue)` / `equalSeq(a, b, &equal)`. That keeps
-//! the dependency graph acyclic while letting collection modules
-//! recurse through the full dispatcher.
-//!
-//! Public API:
-//!   - `hashValue(v)`: full hash for any Value. Immediates go through
-//!     `value.hashImmediate`; heap kinds go through `heapHashBase` +
-//!     the **equality-category** domain mixer (SEMANTICS §3.2).
-//!   - `equal(a, b)`: full equality. Bit-identity fast path, then
-//!     equality-category check (cross-category → false; within a
-//!     cross-kind category → dispatch by category; kind-local →
-//!     same-kind routes through `heapEqual` or `eq.equalImmediate`).
-//!   - `heapHashBase(v)` / `heapEqual(a, b)`: low-level entry points
-//!     exposed for tests and advanced callers who have already
-//!     established they hold heap-kind Values.
-//!   - `eqCategory(k)`: the equality category a kind belongs to.
-//!     Drives both the hash domain byte and the equality dispatch.
+//! **Native stack.** `=` and `hash` recurse on nesting depth. Each
+//! structural step checks the stack guard (`stack.zig`); a value too
+//! deep for the stack that remains makes the step answer `false` or
+//! `0` and counts an overflow instead of faulting. The callers of `=`
+//! and `hash` are too many to thread an error through, so the VM reads
+//! `overflowCount` around each native call and opcode that compares or
+//! hashes and turns a change into the catchable `:stack-overflow`
+//! (SEMANTICS §2.7), rewinding the count as it does so that one
+//! overflow is reported once, by the innermost call that saw it. A
+//! map, set or record whose hash was computed past an overflow keeps
+//! no cached hash.
 
 const std = @import("std");
-const value = @import("value");
-const eq = @import("eq");
-const heap_mod = @import("heap");
-const hash_mod = @import("hash");
-const string = @import("string");
-const list = @import("list");
-const vector = @import("vector");
-const nextomic_handle = @import("nextomic_handle");
-const bignum = @import("bignum");
-const champ = @import("champ");
-const typed_vector = @import("typed_vector");
-const transient = @import("transient");
-const db = @import("db");
-const atom = @import("atom");
-const record = @import("record");
-const protocol = @import("protocol");
+const value = @import("value.zig");
+const heap_mod = @import("heap.zig");
+const hash_mod = @import("hash.zig");
+const stack = @import("stack.zig");
+const string = @import("string.zig");
+const list = @import("coll/list.zig");
+const vector = @import("coll/vector.zig");
+const nextomic_handle = @import("nextomic/handle.zig");
+const bignum = @import("bignum.zig");
+const champ = @import("coll/champ.zig");
+const typed_vector = @import("coll/typed_vector.zig");
+const db = @import("db.zig");
+const record = @import("record.zig");
 
 const Value = value.Value;
 const Kind = value.Kind;
 const Heap = heap_mod.Heap;
 
-// =============================================================================
-// Equality categories (SEMANTICS.md §2.6 + §3.2)
-// =============================================================================
-
-/// Equality category a kind belongs to. Values in different categories
-/// are always unequal (even among heap kinds). Values in the same
-/// cross-kind category (e.g. `.sequential`) may be `=` even when their
-/// physical kinds differ.
-pub const EqCategory = enum(u8) {
-    kind_local,
-    sequential,
-    associative,
-    set,
-};
-
-/// Maps a `Kind` to its equality category. Amended whenever a new
-/// cross-kind equality category gains a member: `.list` and
-/// `.persistent_vector` are the sequential kinds.
-pub fn eqCategory(k: Kind) EqCategory {
-    return switch (k) {
-        .list, .persistent_vector => .sequential,
-        .persistent_map => .associative,
-        .persistent_set => .set,
-        else => .kind_local,
-    };
-}
-
-/// Shared domain bytes for cross-kind equality categories. Chosen
-/// outside the 0..29 valid-Kind range so they can never collide with
-/// a real kind byte used by kind-local mixing. Frozen; changing these
-/// invalidates any already-serialized hashes.
+/// The hash domain byte list and vector share, outside the range of
+/// kind bytes so it never meets a kind-local domain.
 pub const sequential_domain_byte: u8 = 0xF0;
-pub const associative_domain_byte: u8 = 0xF1;
-pub const set_domain_byte: u8 = 0xF2;
 
-/// The domain byte fed into `mixKindDomain` for a given kind. For
-/// kind-local equality, it's the kind byte itself; for cross-kind
-/// categories it's the shared category byte so two different kinds
-/// in the same category fold to the same hash when their base hashes
-/// match. Pinned in SEMANTICS.md §3.2.
-pub fn domainByteForKind(k: Kind) u8 {
-    return switch (eqCategory(k)) {
-        .kind_local => @intFromEnum(k),
-        .sequential => sequential_domain_byte,
-        .associative => associative_domain_byte,
-        .set => set_domain_byte,
+/// Is `k` compared and hashed by identity? These kinds are mutable,
+/// process-local or code; two of them are equal only when they are
+/// the same value.
+pub fn isIdentityKind(k: Kind) bool {
+    return switch (k) {
+        .function,
+        .native_fn,
+        .var_,
+        .db_connection,
+        .db_write_txn,
+        .db_read_txn,
+        .transient,
+        .atom,
+        .protocol,
+        .protocol_fn,
+        .nextomic_conn,
+        => true,
+        else => false,
     };
 }
 
+inline fn isSequential(k: Kind) bool {
+    return k == .list or k == .persistent_vector;
+}
+
+/// The domain byte `hashValue` mixes into a heap kind's hash.
+pub fn domainByte(k: Kind) u8 {
+    return if (isSequential(k)) sequential_domain_byte else @intFromEnum(k);
+}
+
 // =============================================================================
-// Hash dispatch
+// Native-stack overflows
 // =============================================================================
 
-/// Full hash for any Value. Routes immediates to `value.hashImmediate`
-/// (the immediate-kind fast path) and heap kinds through
-/// `heapHashBase` + the equality-category domain mixer. Result
-/// satisfies the bedrock `(= x y) ⇒ (hash x) = (hash y)` invariant
-/// end-to-end, including across cross-kind equality categories
-/// (sequential, associative and set collections).
+var overflow_count: u64 = 0;
+
+/// How many times `equal`, `hashValue` or the printer ran out of
+/// native stack in this process. A caller that sees the count change
+/// across a call knows the call's answer is meaningless and raises
+/// `:stack-overflow` instead.
+pub fn overflowCount() u64 {
+    return overflow_count;
+}
+
+/// Record that a recursion on data depth stopped at the stack guard.
+pub fn noteOverflow() void {
+    overflow_count +%= 1;
+}
+
+/// Consume the overflows counted since `before`: the caller has turned
+/// them into a throw (or abandoned the answer they spoiled), so a
+/// caller further out that took its snapshot earlier must not see them
+/// again.
+pub fn rewindOverflows(before: u64) void {
+    overflow_count = before;
+}
+
+// =============================================================================
+// Hash
+// =============================================================================
+
+/// `hash` for any Value: `(= x y) ⇒ (hash x) = (hash y)`, including
+/// across list and vector.
 pub fn hashValue(v: Value) u64 {
     const k = v.kind();
-    if (k.isHeap()) {
-        // The pointer kinds (a Var, a native descriptor, a db
-        // handle) are identity-valued and carry no block to read.
-        const base = if (Heap.isBlockKind(k)) heapHashBase(v) else hash_mod.hashU64(v.payload);
-        return hash_mod.mixKindDomain(base, domainByteForKind(k));
-    }
-    // Sentinels (`unbound`, `undef`) panic inside value.hashImmediate
-    // via its default switch arm. Immediates are all kind-local.
-    return v.hashImmediate();
+    if (!k.isHeap()) return v.hashImmediate();
+    return hash_mod.mixKindDomain(heapHashBase(v), domainByte(k));
 }
 
-/// Pre-mix heap-kind hash base. Resolves the `*HeapHeader`, switches
-/// on kind to the per-kind hasher, extends narrow results to `u64`.
-/// Does **not** apply the domain mixer — `hashValue` above owns that
-/// final step so every heap kind goes through exactly one mixer
-/// with the correct category byte.
+/// A heap kind's hash before the domain byte is mixed in.
 pub fn heapHashBase(v: Value) u64 {
-    std.debug.assert(v.kind().isHeap());
     const k = v.kind();
+    std.debug.assert(k.isHeap());
+    if (isIdentityKind(k)) return hash_mod.hashU64(v.payload);
+    stack.check() catch {
+        noteOverflow();
+        return 0;
+    };
     const h = Heap.asHeapHeader(v);
-    return switch (k) {
-        .string => @as(u64, string.hashHeader(h)),
-        .bignum => @as(u64, bignum.hashHeader(h)),
-        .list => list.hashSeq(h, &hashValue),
+    const overflows_before = overflow_count;
+    const base: u64 = switch (k) {
+        .string => string.hashHeader(h),
+        .bignum => bignum.hashHeader(h),
+        .list => list.hashSeq(v, &hashValue),
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => champ.hashMap(h, &hashValue),
         .persistent_set => champ.hashSet(h, &hashValue),
-        // Typed vectors are kind-local: the element type tag and the
-        // unboxed elements, never comparable with a persistent vector.
         .typed_vector => typed_vector.hashHeader(h),
-        // Durable refs hash on the identity triple only
-        // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2 and
-        // SEMANTICS.md §3.2. The advisory `conn` pointer is NOT
-        // part of the hash (DB.md §7.2).
-        .durable_ref => @as(u64, db.hashHeader(h)),
-        // Atoms hash on their
-        // *HeapHeader pointer identity only; the contained value
-        // is NEVER consulted (mutation must not change an atom's
-        // hash, or atom-as-map-key would break across mutations).
-        // ATOM.md §3, SEMANTICS.md §2.6 amendment.
-        .atom => @as(u64, atom.hashHeader(h)),
-        // Records hash STRUCTURALLY
-        // over (type_id, field_map). Field-map hash uses
-        // dispatch.hashValue recursively (one-way through this
-        // function pointer). PROTOCOLS.md §2.1.
-        .record => @as(u64, record.hashHeader(h, &hashValue)),
-        // protocol + protocol_fn are identity-valued.
-        // Pointer hash, domain-mixed by their own kind byte.
-        .protocol, .protocol_fn => @as(u64, protocol.hashHeader(h)),
-        // A Nextomic connection is identity-valued; a db-value hashes
-        // over the fields its equality reads (connection, basis, mode).
-        .nextomic_conn => @as(u64, nextomic_handle.connHash(h)),
-        .nextomic_db => @as(u64, nextomic_handle.dbHash(h)),
-        // A lazy entity hashes over its db-value and eid.
-        .nextomic_entity => @as(u64, nextomic_handle.entityHash(h)),
-        // A closure is identity-valued.
-        .function => hash_mod.hashU64(@intFromPtr(h)),
-        // Transients are not hashable per SEMANTICS §3.2 / PLAN §9.4:
-        // "transient — throws `:no-hash-on-transient`". Using a
-        // transient as a map key or set element is a programming error.
-        // Explicit panic arm rather than fast-path fallthrough, so
-        // equality/hash semantics are pinned at dispatch, not emergent.
-        .transient => std.debug.panic(
-            "dispatch.hashValue: transients are not hashable (SEMANTICS §3.2). " ++
-                "Call persistentBang first, or avoid using transients as map keys / set elements.",
-            .{},
-        ),
-        // No implementation: .byte_vector, .function, .var_,
-        // .error_, .meta_symbol.
-        else => std.debug.panic(
-            "dispatch.heapHashBase: kind {s} not implemented",
-            .{@tagName(k)},
-        ),
+        // Over the identity triple (store, tree, key), never the
+        // advisory connection (DB.md §7.2).
+        .durable_ref => db.hashHeader(h),
+        .record => record.hashHeader(h, &hashValue),
+        .nextomic_db => nextomic_handle.dbHash(h),
+        .nextomic_entity => nextomic_handle.entityHash(h),
+        else => std.debug.panic("dispatch.hashValue: kind {s} is never constructed", .{@tagName(k)}),
     };
+    if (overflow_count != overflows_before) h.setCachedHash(0);
+    return base;
 }
 
 // =============================================================================
-// Equality dispatch
+// Equality
 // =============================================================================
 
-/// Full equality for any two Values. Category-aware: two Values in
-/// different equality categories are always unequal; within a cross-
-/// kind category (e.g. `.sequential`) two Values with different kinds
-/// can still be `=`. Handles the bit-identity fast path inline.
+/// `=` for any two Values.
 pub fn equal(a: Value, b: Value) bool {
-    // Identical bits → trivially equal for every immediate kind and
-    // for heap kinds when the payload is the same *HeapHeader.
     if (a.tag == b.tag and a.payload == b.payload) return true;
     const ka = a.kind();
     const kb = b.kind();
-    const cat_a = eqCategory(ka);
-    const cat_b = eqCategory(kb);
-    if (cat_a != cat_b) return false;
-    // Cross-kind category paths. All three non-kind-local categories
-    // have runtime members.
-    switch (cat_a) {
-        .sequential => return sequentialEqual(a, b),
-        .associative => return associativeEqual(a, b),
-        .set => return setEqualCategory(a, b),
-        .kind_local => {
-            if (ka != kb) return false;
-            // A pointer kind (Var, native descriptor, db handle) is
-            // equal to itself only, and the fast path above has
-            // already said no.
-            if (ka.isHeap()) return Heap.isBlockKind(ka) and heapEqual(a, b);
-            return eq.equalImmediate(a, b);
-        },
-    }
-}
-
-/// Cross-kind associative equality. `persistent_map` is the only
-/// member of the `.associative` category, so this reduces to
-/// kind-local dispatch; the shape parallels `sequentialEqual` so a
-/// second associative member slots in the same way.
-///
-/// Semantic strategy is provided by `champ.equalMap` which handles all
-/// four subkind-pair combinations (array-map × array-map, array-map ×
-/// CHAMP, CHAMP × array-map, CHAMP × CHAMP) per CHAMP.md §6.3 / §6.4.
-fn associativeEqual(a: Value, b: Value) bool {
-    std.debug.assert(eqCategory(a.kind()) == .associative);
-    std.debug.assert(eqCategory(b.kind()) == .associative);
-    if (a.kind() != b.kind()) {
-        // Only `.persistent_map` is in the category; a second kind
-        // would add an arm here.
+    if (ka != kb) return isSequential(ka) and isSequential(kb) and sequentialEqual(a, b);
+    if (!ka.isHeap()) return a.equalImmediate(b);
+    // Distinct identity values: the bit test above already said no.
+    if (isIdentityKind(ka)) return false;
+    stack.check() catch {
+        noteOverflow();
         return false;
-    }
-    return champ.equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &hashValue, &equal);
-}
-
-/// Cross-kind set equality. Parallel to `associativeEqual`;
-/// `persistent_set` is the only member of the `.set` category. Named
-/// `setEqualCategory` (not `setEqual`) because `setEqual` is already
-/// an identifier exported by `champ` for the same-kind entry point.
-fn setEqualCategory(a: Value, b: Value) bool {
-    std.debug.assert(eqCategory(a.kind()) == .set);
-    std.debug.assert(eqCategory(b.kind()) == .set);
-    if (a.kind() != b.kind()) {
-        return false;
-    }
-    return champ.equalSet(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &hashValue, &equal);
-}
-
-/// Cross-kind sequential equality. Both operands are known to be in
-/// the `.sequential` category; their physical kinds may differ. The
-/// cursor-walk below handles every pair of sequential kinds with one
-/// algorithm (streaming ordered traversal, not random-access-by-index,
-/// so the pattern extends to any sequential kind without random
-/// access).
-fn sequentialEqual(a: Value, b: Value) bool {
-    std.debug.assert(eqCategory(a.kind()) == .sequential);
-    std.debug.assert(eqCategory(b.kind()) == .sequential);
-    const ka = a.kind();
-    const kb = b.kind();
-
-    // Same-kind fast paths — each kind's own `equalSeq` avoids the
-    // cursor indirection.
-    if (ka == .list and kb == .list) {
-        return list.equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &equal);
-    }
-    if (ka == .persistent_vector and kb == .persistent_vector) {
-        return vector.equalSeq(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &equal);
-    }
-
-    // Cross-kind: walk both sides pairwise via cursors. Each cursor
-    // is a per-kind streaming iterator; this pattern generalizes to
-    // any sequential kind without requiring it to expose
-    // random-access.
-    var ca = seqCursorInit(a);
-    var cb = seqCursorInit(b);
-    while (true) {
-        const na = seqCursorNext(&ca);
-        const nb = seqCursorNext(&cb);
-        if (na == null and nb == null) return true;
-        if (na == null or nb == null) return false;
-        if (!equal(na.?, nb.?)) return false;
-    }
-}
-
-/// Sequential cursor union. Each sequential kind contributes its own
-/// `Cursor` state; the walker in `sequentialEqual` dispatches per
-/// kind on each `next()`. Never exposed as a public API.
-const SeqCursor = union(enum) {
-    list: list.Cursor,
-    vector: vector.Cursor,
-};
-
-fn seqCursorInit(v: Value) SeqCursor {
-    return switch (v.kind()) {
-        .list => .{ .list = list.Cursor.init(v) },
-        .persistent_vector => .{ .vector = vector.Cursor.init(v) },
-        else => std.debug.panic(
-            "dispatch.seqCursorInit: kind {s} has no sequential cursor",
-            .{@tagName(v.kind())},
-        ),
     };
-}
-
-fn seqCursorNext(cur: *SeqCursor) ?Value {
-    return switch (cur.*) {
-        .list => |*c| c.next(),
-        .vector => |*c| c.next(),
-    };
-}
-
-/// Same-kind heap structural compare. Caller (`equal` above, or
-/// advanced code that has already done its own kind checks) has
-/// established `a.kind() == b.kind()`, `a.kind().isHeap()`, and that
-/// the category is `.kind_local` (cross-kind categories route through
-/// `sequentialEqual` and friends instead).
-pub fn heapEqual(a: Value, b: Value) bool {
-    std.debug.assert(a.kind() == b.kind());
-    std.debug.assert(a.kind().isHeap());
-    const k = a.kind();
     const ah = Heap.asHeapHeader(a);
     const bh = Heap.asHeapHeader(b);
-    return switch (k) {
+    return switch (ka) {
         .string => string.bytesEqual(ah, bh),
         .bignum => bignum.limbsEqual(ah, bh),
-        // Category kinds (sequential / associative) are normally
-        // handled by `sequentialEqual` / `associativeEqual` via the
-        // category branch in `equal`; the arms below exist for
-        // defensive routing if a caller bypasses the category
-        // dispatch and lands on `heapEqual` directly.
-        .list => list.equalSeq(ah, bh, &equal),
+        .list => list.equalSeq(a, b, &equal),
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => champ.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => champ.equalSet(ah, bh, &hashValue, &equal),
-        // Same element type, same length, element-wise equal.
         .typed_vector => typed_vector.equalHeaders(ah, bh),
-        // Durable refs compare on the identity triple only
-        // (store_id ++ tree_name ++ key_bytes) per PLAN §15.2,
-        // SEMANTICS.md §2.6, and DB.md §7.1. The advisory `conn`
-        // pointer is NOT part of equality — two refs to the same
-        // (store, tree, key) from different Connection objects
-        // compare equal.
         .durable_ref => db.refsEqual(ah, bh),
-        // Atom equality is
-        // pointer identity. Two atoms holding `(= a b)` values are
-        // NOT equal — mutable identity values must not participate
-        // in structural equality. ATOM.md §3.
-        .atom => atom.atomsEqual(ah, bh),
-        // Records use STRUCTURAL
-        // equality: same type_id + equal field maps. Field-map
-        // equality delegates to dispatch.equal recursively.
         .record => record.recordsEqual(ah, bh, &equal),
-        // protocols + protocol_fn use POINTER
-        // identity (opaque, identity-valued).
-        .protocol, .protocol_fn => protocol.pointerEqual(ah, bh),
-        // A Nextomic connection equals itself only; db-values are
-        // equal when they name the same connection, basis and mode.
-        .nextomic_conn => nextomic_handle.connEqual(ah, bh),
         .nextomic_db => nextomic_handle.dbEqual(ah, bh),
-        // Lazy entities are equal when their db-values are equal and
-        // their eids agree.
         .nextomic_entity => nextomic_handle.entityEqual(ah, bh),
-        // A closure equals itself only.
-        .function => ah == bh,
-        // Transient equality is bit-identity on the wrapper header
-        // (TRANSIENT.md §9, SEMANTICS §2.6). Two transient wrappers
-        // are equal iff they are the same allocation. The top-level
-        // `equal` function's bit-identity fast path (`a.tag == b.tag
-        // and a.payload == b.payload`) already catches this before
-        // reaching here; the arm is documented defensively so
-        // transient identity semantics are visible
-        // in the dispatch table rather than a fast-path accident.
-        .transient => ah == bh,
-        else => std.debug.panic(
-            "dispatch.heapEqual: kind {s} not implemented",
-            .{@tagName(k)},
-        ),
+        else => std.debug.panic("dispatch.equal: kind {s} is never constructed", .{@tagName(ka)}),
     };
 }
 
+/// A list against a vector: one streaming walk over both.
+fn sequentialEqual(a: Value, b: Value) bool {
+    stack.check() catch {
+        noteOverflow();
+        return false;
+    };
+    const l, const v = if (a.kind() == .list) .{ a, b } else .{ b, a };
+    var cl = list.Cursor.init(l);
+    var cv = vector.Cursor.init(v);
+    while (true) {
+        const x = cl.next() orelse return cv.next() == null;
+        const y = cv.next() orelse return false;
+        if (!equal(x, y)) return false;
+    }
+}
+
 // =============================================================================
-// Tests — end-to-end dispatch for every wired kind. Per-kind deep
-// semantics are tested inside the kind's own module.
+// Tests — the routing rules. Each kind's own structural rule is tested
+// in its module; the randomized laws live in test/prop.
 // =============================================================================
 
 const testing = std.testing;
+const atom = @import("atom.zig");
+const transient = @import("coll/transient.zig");
 
-test "heapHashBase: string dispatch returns the raw per-kind hash as u64" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const v = try string.fromBytes(&heap, "dispatch-test");
-    const direct: u32 = string.hashHeader(Heap.asHeapHeader(v));
-    try testing.expectEqual(@as(u64, direct), heapHashBase(v));
+fn fx(n: i64) Value {
+    return value.fromFixnum(n).?;
 }
 
-test "heapEqual: string dispatch delegates to string.bytesEqual" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "hello");
-    const b = try string.fromBytes(&heap, "hello");
-    const c = try string.fromBytes(&heap, "world");
-
-    try testing.expect(heapEqual(a, b));
-    try testing.expect(!heapEqual(a, c));
-}
-
-test "heapHashBase: equal strings produce equal pre-mix bases" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "bedrock-invariant");
-    const b = try string.fromBytes(&heap, "bedrock-invariant");
-    try testing.expect(heapEqual(a, b));
-    try testing.expectEqual(heapHashBase(a), heapHashBase(b));
-}
-
-test "heapHashBase: different strings almost certainly differ" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "abc");
-    const b = try string.fromBytes(&heap, "xyz");
-    try testing.expect(!heapEqual(a, b));
-    try testing.expect(heapHashBase(a) != heapHashBase(b));
-}
-
-// ---- Full-Value dispatch (covers both immediate and heap) ----
-
-test "hashValue: routes immediates to v.hashImmediate()" {
-    const nil = value.nilValue();
-    const t = value.fromBool(true);
-    const f = value.fromBool(false);
-    try testing.expectEqual(nil.hashImmediate(), hashValue(nil));
-    try testing.expectEqual(t.hashImmediate(), hashValue(t));
-    try testing.expectEqual(f.hashImmediate(), hashValue(f));
-    const fx = value.fromFixnum(42).?;
-    try testing.expectEqual(fx.hashImmediate(), hashValue(fx));
-}
-
-test "hashValue: routes heap kinds through the mixed-base path" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "full-hash");
-    const b = try string.fromBytes(&heap, "full-hash");
-    const c = try string.fromBytes(&heap, "different");
-
-    try testing.expectEqual(hashValue(a), hashValue(b));
-    try testing.expect(hashValue(a) != hashValue(c));
-    // The full hashValue applies mixKindDomain once.
-    const expected = hash_mod.mixKindDomain(heapHashBase(a), @intFromEnum(Kind.string));
-    try testing.expectEqual(expected, hashValue(a));
-}
-
-test "equal: bit-identity fast path returns true without dispatch" {
-    const nil = value.nilValue();
-    try testing.expect(equal(nil, nil));
-    const t = value.fromBool(true);
-    try testing.expect(equal(t, t));
-    const fx = value.fromFixnum(7).?;
-    try testing.expect(equal(fx, fx));
-}
-
-test "equal: cross-kind is false; same-kind immediate delegates to eq.equalImmediate" {
-    const n = value.nilValue();
-    const f = value.fromBool(false);
-    try testing.expect(!equal(n, f)); // nil != false
-    const pos = value.fromFloat(0.0);
-    const neg = value.fromFloat(-0.0);
-    // Signed-zero case: eq.equalImmediate returns true; bit-identity
-    // doesn't match. Covered via dispatch.
-    try testing.expect(equal(pos, neg));
-}
-
-test "equal: same-kind-heap strings dispatch to bytesEqual" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try string.fromBytes(&heap, "same");
-    const b = try string.fromBytes(&heap, "same");
-    const c = try string.fromBytes(&heap, "different");
+/// `=` holds both ways and the hashes agree.
+fn expectSame(a: Value, b: Value) !void {
     try testing.expect(equal(a, b));
-    try testing.expect(!equal(a, c));
-}
-
-test "equal ⇒ hashValue equal: bedrock invariant end-to-end (string)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try string.fromBytes(&heap, "bedrock-string-invariant");
-    const b = try string.fromBytes(&heap, "bedrock-string-invariant");
-    try testing.expect(equal(a, b));
+    try testing.expect(equal(b, a));
     try testing.expectEqual(hashValue(a), hashValue(b));
 }
 
-// ---- Bignum kind end-to-end dispatch ----
-
-const bignum_mod = @import("bignum");
-
-test "hashValue / equal: bignum round-trip across distinct allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const a = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 7 });
-    const b = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 7 });
-    try testing.expect(a.kind() == .bignum and b.kind() == .bignum);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+fn expectDifferent(a: Value, b: Value) !void {
+    try testing.expect(!equal(a, b));
+    try testing.expect(!equal(b, a));
 }
 
-test "equal: bignum is never equal to a fixnum (cross-kind, canonical form prevents overlap)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Large bignum that can't canonicalize to fixnum.
-    const big = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ 1, 1 });
-    try testing.expect(big.kind() == .bignum);
-
-    // Every fixnum. Cross-kind (both are kind-local, different kinds).
-    const small_fx = value.fromFixnum(42).?;
-    const zero_fx = value.fromFixnum(0).?;
-    try testing.expect(!equal(big, small_fx));
-    try testing.expect(!equal(big, zero_fx));
-    try testing.expect(hashValue(big) != hashValue(small_fx));
-}
-
-test "fromI64 integer-tower boundary: fixnum_max vs fixnum_max + 1 dispatch cleanly" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const at = try bignum_mod.fromI64(&heap, value.fixnum_max);
-    const over = try bignum_mod.fromI64(&heap, value.fixnum_max + 1);
-    try testing.expect(at.kind() == .fixnum);
-    try testing.expect(over.kind() == .bignum);
-    // Definitely NOT equal — they differ mathematically by 1.
-    try testing.expect(!equal(at, over));
-    try testing.expect(hashValue(at) != hashValue(over));
-}
-
-test "fromI64 integer-tower boundary: fixnum_min is representable as fixnum (asymmetric i48)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try bignum_mod.fromI64(&heap, value.fixnum_min);
-    try testing.expect(v.kind() == .fixnum);
-    try testing.expectEqual(value.fixnum_min, v.asFixnum());
-}
-
-test "equal: bignum sign flip breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const big: u64 = @as(u64, 1) << 60;
-    const pos = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ big, 1 });
-    const neg = try bignum_mod.fromLimbs(&heap, true, &[_]u64{ big, 1 });
-    try testing.expect(!equal(pos, neg));
-    try testing.expect(hashValue(pos) != hashValue(neg));
-}
-
-test "canonicalization invariant: fromLimbs with trailing zeros + fixnum-range tail folds to fixnum" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Input has a real fixnum-range limb and trailing zeros; must
-    // canonicalize to a fixnum Value, not a bignum.
-    const v = try bignum_mod.fromLimbs(&heap, false, &[_]u64{ 42, 0, 0 });
-    try testing.expect(v.kind() == .fixnum);
-    try testing.expectEqual(@as(i64, 42), v.asFixnum());
-    // Equality against a directly-constructed fixnum.
-    const direct = value.fromFixnum(42).?;
-    try testing.expect(equal(v, direct));
-    try testing.expectEqual(hashValue(v), hashValue(direct));
-}
-
-// ---- List kind end-to-end dispatch ----
-
-const list_mod = @import("list");
-
-test "hashValue / equal: empty list round-trip" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try list_mod.empty(&heap);
-    const b = try list_mod.empty(&heap);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
-}
-
-test "hashValue / equal: (list 1 2 3) across two allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    };
-    const a = try list_mod.fromSlice(&heap, &elems);
-    const b = try list_mod.fromSlice(&heap, &elems);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
-}
-
-test "hashValue / equal: nested lists recurse through dispatch" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // Outer list whose first element is itself a list; hashes and
-    // equality must walk both levels through the dispatch callback.
-    const inner_a = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(7).?,
-        value.fromFixnum(8).?,
-    });
-    const inner_b = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(7).?,
-        value.fromFixnum(8).?,
-    });
-    const outer_a = try list_mod.fromSlice(&heap, &.{ inner_a, value.fromFixnum(99).? });
-    const outer_b = try list_mod.fromSlice(&heap, &.{ inner_b, value.fromFixnum(99).? });
-
-    try testing.expect(equal(outer_a, outer_b));
-    try testing.expectEqual(hashValue(outer_a), hashValue(outer_b));
-}
-
-test "equal: empty list is NOT equal to nil (cross-category)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const e = try list_mod.empty(&heap);
-    const n = value.nilValue();
-    // nil is kind_local (.nil), list is sequential → cross-category.
-    try testing.expect(!equal(e, n));
-    try testing.expect(!equal(n, e));
-}
-
-test "hashValue: sequential domain differs from string's kind domain" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Construct a list and a string whose base hashes might coincide;
-    // verify the full hashValue outputs differ because their domain
-    // bytes differ.
-    const lst = try list_mod.empty(&heap);
-    const s = try string.fromBytes(&heap, "");
-
-    // Base hashes are independent streams. We only assert the domain
-    // mixer fully separates the kinds under hashValue.
-    try testing.expect(hashValue(lst) != hashValue(s));
-
-    // domainByteForKind returns the sequential byte for list, the
-    // kind byte for string. Confirm directly.
-    try testing.expectEqual(sequential_domain_byte, domainByteForKind(.list));
-    try testing.expectEqual(@intFromEnum(Kind.string), domainByteForKind(.string));
-}
-
-test "eqCategory + domainByteForKind: exhaustive table matches SEMANTICS §2.6/§3.2" {
-    // Exhaustive table over every Kind. This test is the
-    // primary defense against silent drift between the equality-
-    // category rule and the hash-domain rule; a missed entry here
-    // would create a subtle `(= x y) ⇒ hash(x) = hash(y)` bug.
-    const cases = [_]struct {
-        kind: Kind,
-        cat: EqCategory,
-        domain: u8,
-    }{
-        // Immediates — all kind-local.
-        .{ .kind = .nil, .cat = .kind_local, .domain = 0 },
-        .{ .kind = .false_, .cat = .kind_local, .domain = 1 },
-        .{ .kind = .true_, .cat = .kind_local, .domain = 2 },
-        .{ .kind = .char, .cat = .kind_local, .domain = 3 },
-        .{ .kind = .fixnum, .cat = .kind_local, .domain = 4 },
-        .{ .kind = .float, .cat = .kind_local, .domain = 5 },
-        .{ .kind = .keyword, .cat = .kind_local, .domain = 6 },
-        .{ .kind = .symbol, .cat = .kind_local, .domain = 7 },
-        // Heap kinds — most are kind-local; sequentials share 0xF0,
-        // associative shares 0xF1, set shares 0xF2.
-        .{ .kind = .string, .cat = .kind_local, .domain = 16 },
-        .{ .kind = .bignum, .cat = .kind_local, .domain = 17 },
-        .{ .kind = .persistent_map, .cat = .associative, .domain = associative_domain_byte },
-        .{ .kind = .persistent_set, .cat = .set, .domain = set_domain_byte },
-        .{ .kind = .persistent_vector, .cat = .sequential, .domain = sequential_domain_byte },
-        .{ .kind = .list, .cat = .sequential, .domain = sequential_domain_byte },
-        .{ .kind = .byte_vector, .cat = .kind_local, .domain = 22 },
-        .{ .kind = .typed_vector, .cat = .kind_local, .domain = 23 },
-        .{ .kind = .function, .cat = .kind_local, .domain = 24 },
-        .{ .kind = .var_, .cat = .kind_local, .domain = 25 },
-        .{ .kind = .durable_ref, .cat = .kind_local, .domain = 26 },
-        .{ .kind = .transient, .cat = .kind_local, .domain = 27 },
-        .{ .kind = .error_, .cat = .kind_local, .domain = 28 },
-        .{ .kind = .meta_symbol, .cat = .kind_local, .domain = 29 },
-        // Atoms are kind-local
-        // identity-valued; domain byte 34 == @intFromEnum(.atom).
-        .{ .kind = .atom, .cat = .kind_local, .domain = 34 },
-        // Records are kind-local
-        // (structural over field map but NOT cross-kind equal to
-        // plain maps). Domain byte 35.
-        .{ .kind = .record, .cat = .kind_local, .domain = 35 },
-        // protocol + protocol_fn are kind-local
-        // identity-valued. Domain bytes 36 / 37.
-        .{ .kind = .protocol, .cat = .kind_local, .domain = 36 },
-        .{ .kind = .protocol_fn, .cat = .kind_local, .domain = 37 },
-        .{ .kind = .nextomic_conn, .cat = .kind_local, .domain = 38 },
-        .{ .kind = .nextomic_db, .cat = .kind_local, .domain = 39 },
-        .{ .kind = .nextomic_entity, .cat = .kind_local, .domain = 40 },
-    };
-    for (cases) |c| {
-        try testing.expectEqual(c.cat, eqCategory(c.kind));
-        try testing.expectEqual(c.domain, domainByteForKind(c.kind));
+test "immediates: hash is hashImmediate; no cross-kind equality; the zeros fold" {
+    for ([_]Value{ value.nilValue(), value.fromBool(true), fx(42), value.fromFloat(1.5) }) |v| {
+        try testing.expectEqual(v.hashImmediate(), hashValue(v));
     }
+    try expectDifferent(value.nilValue(), value.fromBool(false));
+    try expectDifferent(fx(1), value.fromFloat(1.0));
+    try expectSame(value.fromFloat(0.0), value.fromFloat(-0.0));
 }
 
-// ---- Vector kind end-to-end dispatch + cross-kind list↔vector ----
-
-const vector_mod = @import("vector");
-
-test "hashValue / equal: empty vector round-trip" {
+test "strings and bignums compare by content across allocations; a bignum never equals a fixnum" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const a = try vector_mod.empty(&heap);
-    const b = try vector_mod.empty(&heap);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+    try expectSame(try string.fromBytes(&heap, "same"), try string.fromBytes(&heap, "same"));
+    try expectDifferent(try string.fromBytes(&heap, "same"), try string.fromBytes(&heap, "other"));
+    const big = value.fixnum_max + 1;
+    try expectSame(try bignum.fromI64(&heap, big), try bignum.fromI64(&heap, big));
+    try expectDifferent(try bignum.fromI64(&heap, big), try bignum.fromI64(&heap, -big));
+    // One canonical form per integer: in range, fromI64 is a fixnum.
+    try testing.expect((try bignum.fromI64(&heap, value.fixnum_max)).kind() == .fixnum);
+    try expectDifferent(try bignum.fromI64(&heap, big), fx(value.fixnum_max));
 }
 
-test "hashValue / equal: same-kind [1 2 3] across two allocations" {
+test "list and vector: equal across kinds with one hash; length and element kinds still count" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    };
-    const a = try vector_mod.fromSlice(&heap, &elems);
-    const b = try vector_mod.fromSlice(&heap, &elems);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+    const items = [_]Value{ fx(1), fx(2), fx(3) };
+    try expectSame(try list.fromSlice(&heap, &items), try vector.fromSlice(&heap, &items));
+    try expectSame(try list.empty(&heap), try vector.empty(&heap));
+    try expectDifferent(try list.fromSlice(&heap, items[0..2]), try vector.fromSlice(&heap, &items));
+    try expectDifferent(try list.fromSlice(&heap, &items), try vector.fromSlice(&heap, &.{ fx(1), fx(2), fx(4) }));
+    try expectDifferent(try list.empty(&heap), value.nilValue());
+    // 1025 elements: past the vector's tail into its trie.
+    var many: [1025]Value = undefined;
+    for (&many, 0..) |*slot, i| slot.* = fx(@intCast(i));
+    try expectSame(try list.fromSlice(&heap, &many), try vector.fromSlice(&heap, &many));
+    // Nested: an inner list against an inner vector is still sequential.
+    const nested_l = try list.fromSlice(&heap, &.{ fx(1), try list.fromSlice(&heap, &.{fx(2)}) });
+    const nested_v = try vector.fromSlice(&heap, &.{ fx(1), try vector.fromSlice(&heap, &.{fx(2)}) });
+    try expectSame(nested_l, nested_v);
 }
 
-// THE cross-kind invariant test: the architecture must survive
-// composition of list + vector as two sequential kinds
-// sharing one hash domain byte + one equality category.
-
-test "cross-kind: (list 1 2 3) and [1 2 3] are equal and share hashValue" {
+test "maps and sets: equal across insertion orders and subkinds; never equal to each other or to a sequence" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    };
-    const l = try list_mod.fromSlice(&heap, &elems);
-    const v = try vector_mod.fromSlice(&heap, &elems);
-    try testing.expect(equal(l, v));
-    try testing.expect(equal(v, l)); // symmetry
-    try testing.expectEqual(hashValue(l), hashValue(v));
-}
-
-test "cross-kind: empty list = empty vector, same hash" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const le = try list_mod.empty(&heap);
-    const ve = try vector_mod.empty(&heap);
-    try testing.expect(equal(le, ve));
-    try testing.expect(equal(ve, le));
-    try testing.expectEqual(hashValue(le), hashValue(ve));
-}
-
-test "cross-kind: list and vector of different lengths are NOT equal" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const l = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-    });
-    const v = try vector_mod.fromSlice(&heap, &.{value.fromFixnum(1).?});
-    try testing.expect(!equal(l, v));
-    try testing.expect(!equal(v, l));
-    try testing.expect(hashValue(l) != hashValue(v));
-}
-
-test "cross-kind: nested — (list 1 [2 3] 4) == [1 (2 3) 4] is FALSE (element-level kind mismatch)" {
-    // The outer sequence shape is both sequential (list vs vector
-    // headers are cross-kind-equal when elements match), but the
-    // interior element at index 1 is a list on one side and a vector
-    // on the other, AND those interior pairs ARE sequential too, so
-    // they should in fact be equal.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const inner_list = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    const inner_vec = try vector_mod.fromSlice(&heap, &.{
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    const outer_list = try list_mod.fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        inner_vec, // element 1 is a VECTOR
-        value.fromFixnum(4).?,
-    });
-    const outer_vec = try vector_mod.fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        inner_list, // element 1 is a LIST
-        value.fromFixnum(4).?,
-    });
-    // Cross-kind sequential equality all the way down: the outer
-    // list↔vector matches at the top, and element 1 (list↔vector)
-    // also matches via sequential equality. So these ARE equal:
-    // the sequential category is cross-kind-equal through every
-    // level of nesting, which is exactly the design.
-    try testing.expect(equal(outer_list, outer_vec));
-    try testing.expectEqual(hashValue(outer_list), hashValue(outer_vec));
-}
-
-test "cross-kind: same prefix, one differing element → not equal, different hash" {
-    // Negative cross-kind case where
-    // prefixes match but one element differs. Stresses the cursor
-    // walker's element-by-element mismatch short-circuit at
-    // boundary positions.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const base = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-        value.fromFixnum(4).?,
-    };
-    const diff = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(99).?, // differs
-        value.fromFixnum(4).?,
-    };
-    const l = try list_mod.fromSlice(&heap, &base);
-    const v = try vector_mod.fromSlice(&heap, &diff);
-    try testing.expect(!equal(l, v));
-    try testing.expect(!equal(v, l));
-    try testing.expect(hashValue(l) != hashValue(v));
-}
-
-test "cross-kind: one prefix-of-the-other → not equal (length discrimination)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const prefix = [_]Value{ value.fromFixnum(1).?, value.fromFixnum(2).?, value.fromFixnum(3).? };
-    const longer = [_]Value{ value.fromFixnum(1).?, value.fromFixnum(2).?, value.fromFixnum(3).?, value.fromFixnum(4).? };
-    const l = try list_mod.fromSlice(&heap, &prefix);
-    const v = try vector_mod.fromSlice(&heap, &longer);
-    try testing.expect(!equal(l, v));
-    try testing.expect(!equal(v, l));
-    try testing.expect(hashValue(l) != hashValue(v));
-}
-
-test "cross-kind: large sequences (1025 elements) list vs vector equal+hash-equal" {
-    const gpa = testing.allocator;
-    var heap = Heap.init(gpa);
-    defer heap.deinit();
-
-    const N: usize = 1025;
-    const elems = try gpa.alloc(Value, N);
-    defer gpa.free(elems);
-    for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
-
-    const l = try list_mod.fromSlice(&heap, elems);
-    const v = try vector_mod.fromSlice(&heap, elems);
-    try testing.expect(equal(l, v));
-    try testing.expectEqual(hashValue(l), hashValue(v));
-}
-
-test "cross-kind: empty list/vector is NOT equal to nil (different categories)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const le = try list_mod.empty(&heap);
-    const ve = try vector_mod.empty(&heap);
-    const nil = value.nilValue();
-    try testing.expect(!equal(le, nil));
-    try testing.expect(!equal(ve, nil));
-    try testing.expect(!equal(nil, le));
-    try testing.expect(!equal(nil, ve));
-}
-
-test "equal rejects cross-kind heap Values before payload interpretation" {
-    // White-box test: forges a fake map Value to prove `dispatch.equal`
-    // short-circuits on the cross-CATEGORY rule (string is
-    // .kind_local, persistent_map is .associative) BEFORE it reaches
-    // kind-specific dispatch. The forgery is never interpreted as a
-    // real map.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s = try string.fromBytes(&heap, "cross");
-    const h = try heap.alloc(.persistent_map, 0);
-    const fake_map: Value = .{
-        .tag = @intFromEnum(Kind.persistent_map),
-        .payload = @intFromPtr(h),
-    };
-    try testing.expect(!equal(s, fake_map));
-}
-
-// ---- Persistent map (CHAMP) kind end-to-end dispatch ----
-
-const champ_mod = @import("champ");
-
-test "hashValue / equal: empty map round-trip (two separate allocations)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try champ_mod.mapEmpty(&heap);
-    const b = try champ_mod.mapEmpty(&heap);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
-}
-
-test "hashValue / equal: {:k1 1 :k2 2} across two insertion orders" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const k1 = value.fromKeywordId(1);
-    const k2 = value.fromKeywordId(2);
-    const v1 = value.fromFixnum(10).?;
-    const v2 = value.fromFixnum(20).?;
-
-    var a = try champ_mod.mapEmpty(&heap);
-    a = try champ_mod.mapAssoc(&heap, a, k1, v1, &hashValue, &equal);
-    a = try champ_mod.mapAssoc(&heap, a, k2, v2, &hashValue, &equal);
-
-    var b = try champ_mod.mapEmpty(&heap);
-    b = try champ_mod.mapAssoc(&heap, b, k2, v2, &hashValue, &equal);
-    b = try champ_mod.mapAssoc(&heap, b, k1, v1, &hashValue, &equal);
-
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
-}
-
-test "equal: map vs non-associative kinds is always false (cross-category)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m = try champ_mod.mapEmpty(&heap);
-    const s = try string.fromBytes(&heap, "");
-    const l = try list_mod.empty(&heap);
-    const v = try vector_mod.empty(&heap);
-    const nil = value.nilValue();
-    const fx = value.fromFixnum(0).?;
-    try testing.expect(!equal(m, s));
-    try testing.expect(!equal(m, l));
-    try testing.expect(!equal(m, v));
-    try testing.expect(!equal(m, nil));
-    try testing.expect(!equal(m, fx));
-    // Cross-direction same.
-    try testing.expect(!equal(l, m));
-    try testing.expect(!equal(v, m));
-    try testing.expect(!equal(nil, m));
-}
-
-test "hashValue: map hash uses associative-category domain byte (0xF1)" {
-    // Two logically-identical maps and lists hash differently at the
-    // final `mixKindDomain` step because their domain bytes differ.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m = try champ_mod.mapEmpty(&heap);
-    const l = try list_mod.empty(&heap);
-    try testing.expect(hashValue(m) != hashValue(l));
-    try testing.expectEqual(associative_domain_byte, domainByteForKind(.persistent_map));
-    // The pre-mix bases may coincidentally match; the final hashValue
-    // must still differ because of the domain-byte folding.
-    const final_m = hashValue(m);
-    const final_l = hashValue(l);
-    const base_m = heapHashBase(m);
-    const base_l = heapHashBase(l);
-    try testing.expectEqual(
-        hash_mod.mixKindDomain(base_m, associative_domain_byte),
-        final_m,
-    );
-    try testing.expectEqual(
-        hash_mod.mixKindDomain(base_l, sequential_domain_byte),
-        final_l,
-    );
-}
-
-test "equal: cross-subkind (array-map vs CHAMP) with the same entries" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Build an 8-entry array-map `am` and a CHAMP `ch` that holds the
-    // same 8 entries (via grow-to-9-then-dissoc). Cross-subkind
-    // equality must recognize them as equal via semantic associative
-    // compare (CHAMP.md §6.4).
-    var am = try champ_mod.mapEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        am = try champ_mod.mapAssoc(&heap, am, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
+    var small_a = try champ.mapEmpty(&heap);
+    var small_b = try champ.mapEmpty(&heap);
+    var big_a = try champ.mapEmpty(&heap);
+    var set_a = try champ.setEmpty(&heap);
+    var set_b = try champ.setEmpty(&heap);
+    for (0..20) |i| {
+        const k = fx(@intCast(i));
+        const rk = fx(@intCast(19 - i));
+        big_a = try champ.mapAssoc(&heap, big_a, k, k, &hashValue, &equal);
+        set_a = try champ.setConj(&heap, set_a, k, &hashValue, &equal);
+        set_b = try champ.setConj(&heap, set_b, rk, &hashValue, &equal);
+        if (i < 4) {
+            small_a = try champ.mapAssoc(&heap, small_a, k, k, &hashValue, &equal);
+            small_b = try champ.mapAssoc(&heap, small_b, fx(@intCast(3 - i)), fx(@intCast(3 - i)), &hashValue, &equal);
+        }
     }
-    var ch = am;
-    ch = try champ_mod.mapAssoc(&heap, ch, value.fromKeywordId(100), value.fromFixnum(100).?, &hashValue, &equal);
-    ch = try champ_mod.mapDissoc(&heap, ch, value.fromKeywordId(100), &hashValue, &equal);
-
-    try testing.expect(am.subkind() == 0); // array-map
-    try testing.expect(ch.subkind() == 1); // CHAMP (no demote)
-    try testing.expect(equal(am, ch));
-    try testing.expectEqual(hashValue(am), hashValue(ch));
+    try expectSame(small_a, small_b);
+    try expectSame(set_a, set_b);
+    // An array-map against a CHAMP root with the same entries.
+    var big_b = big_a;
+    for (4..20) |i| big_b = try champ.mapDissoc(&heap, big_b, fx(@intCast(i)), &hashValue, &equal);
+    try expectSame(small_a, big_b);
+    try expectDifferent(small_a, set_a);
+    try expectDifferent(try champ.mapEmpty(&heap), try champ.setEmpty(&heap));
+    try expectDifferent(try champ.mapEmpty(&heap), try vector.empty(&heap));
 }
 
-test "nested map as value: dispatch recurses correctly" {
-    // Outer map `{:outer inner}` where `inner = {:a 1 :b 2}`. Hash
-    // and equality must walk both levels via the element callbacks.
+test "records: structural within a type, never equal to their field map" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    var inner_a = try champ_mod.mapEmpty(&heap);
-    inner_a = try champ_mod.mapAssoc(&heap, inner_a, value.fromKeywordId(1), value.fromFixnum(1).?, &hashValue, &equal);
-    inner_a = try champ_mod.mapAssoc(&heap, inner_a, value.fromKeywordId(2), value.fromFixnum(2).?, &hashValue, &equal);
-
-    var inner_b = try champ_mod.mapEmpty(&heap);
-    inner_b = try champ_mod.mapAssoc(&heap, inner_b, value.fromKeywordId(2), value.fromFixnum(2).?, &hashValue, &equal);
-    inner_b = try champ_mod.mapAssoc(&heap, inner_b, value.fromKeywordId(1), value.fromFixnum(1).?, &hashValue, &equal);
-
-    const k_outer = value.fromKeywordId(100);
-    const outer_a = try champ_mod.mapAssoc(&heap, try champ_mod.mapEmpty(&heap), k_outer, inner_a, &hashValue, &equal);
-    const outer_b = try champ_mod.mapAssoc(&heap, try champ_mod.mapEmpty(&heap), k_outer, inner_b, &hashValue, &equal);
-
-    try testing.expect(equal(outer_a, outer_b));
-    try testing.expectEqual(hashValue(outer_a), hashValue(outer_b));
+    var fields = try champ.mapEmpty(&heap);
+    fields = try champ.mapAssoc(&heap, fields, fx(1), value.fromFloat(-0.0), &hashValue, &equal);
+    var fields_pos = try champ.mapEmpty(&heap);
+    fields_pos = try champ.mapAssoc(&heap, fields_pos, fx(1), value.fromFloat(0.0), &hashValue, &equal);
+    // -0.0 and 0.0 are `=`, so the records are too, with one hash.
+    try expectSame(try record.make(&heap, 3, fields), try record.make(&heap, 3, fields_pos));
+    try expectDifferent(try record.make(&heap, 3, fields), try record.make(&heap, 4, fields));
+    try expectDifferent(try record.make(&heap, 3, fields), fields);
 }
 
-test "equal ⇒ hashValue equal: bedrock invariant end-to-end (map)" {
+test "identity kinds: equal to themselves only, hash stable across mutation, transients hash" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    // Build two identical 50-entry maps in different insertion
-    // orders. Equality must hold and hashes must match.
-    var a = try champ_mod.mapEmpty(&heap);
-    var b = try champ_mod.mapEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        a = try champ_mod.mapAssoc(&heap, a, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
-    }
-    i = 49;
-    while (true) : (i -|= 1) {
-        b = try champ_mod.mapAssoc(&heap, b, value.fromKeywordId(i), value.fromFixnum(@intCast(i)).?, &hashValue, &equal);
-        if (i == 0) break;
-    }
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+    const a = try atom.make(&heap, fx(1));
+    const b = try atom.make(&heap, fx(1));
+    try expectSame(a, a);
+    try expectDifferent(a, b);
+    const before = hashValue(a);
+    atom.setValue(a, fx(2));
+    try testing.expectEqual(before, hashValue(a));
+    const t = try transient.transientFrom(&heap, try vector.empty(&heap));
+    try expectSame(t, t);
+    try expectDifferent(t, try transient.transientFrom(&heap, try vector.empty(&heap)));
+    try testing.expect(!equal(t, try vector.empty(&heap)));
 }
 
-// ---- Persistent set (CHAMP) kind end-to-end dispatch ----
-
-test "hashValue / equal: empty set round-trip (two allocations)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try champ_mod.setEmpty(&heap);
-    const b = try champ_mod.setEmpty(&heap);
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+/// `depth` one-element vectors around a nil.
+fn nest(heap: *Heap, depth: usize) !Value {
+    var v = value.nilValue();
+    for (0..depth) |_| v = try vector.fromSlice(heap, &.{v});
+    return v;
 }
 
-test "hashValue / equal: #{1 2 3} across two insertion orders" {
+test "stack guard: = and hash on data too deep for the stack count an overflow instead of faulting" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    };
-    var a = try champ_mod.setEmpty(&heap);
-    for (elems) |e| a = try champ_mod.setConj(&heap, a, e, &hashValue, &equal);
-    var b = try champ_mod.setEmpty(&heap);
-    var i: usize = elems.len;
-    while (i > 0) {
-        i -= 1;
-        b = try champ_mod.setConj(&heap, b, elems[i], &hashValue, &equal);
-    }
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
-}
+    const deep_a = try nest(&heap, 20_000);
+    const deep_b = try nest(&heap, 20_000);
+    var m = try champ.mapEmpty(&heap);
+    m = try champ.mapAssoc(&heap, m, fx(1), deep_a, &hashValue, &equal);
 
-test "equal: set vs non-set is always false (cross-category)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s = try champ_mod.setConj(
-        &heap,
-        try champ_mod.setEmpty(&heap),
-        value.fromKeywordId(1),
-        &hashValue,
-        &equal,
-    );
-    // Map with the same element as a key (any value) — not equal.
-    const m = try champ_mod.mapAssoc(
-        &heap,
-        try champ_mod.mapEmpty(&heap),
-        value.fromKeywordId(1),
-        value.fromFixnum(1).?,
-        &hashValue,
-        &equal,
-    );
-    const l = try list_mod.fromSlice(&heap, &.{value.fromKeywordId(1)});
-    const v = try vector_mod.fromSlice(&heap, &.{value.fromKeywordId(1)});
-    try testing.expect(!equal(s, m));
-    try testing.expect(!equal(m, s));
-    try testing.expect(!equal(s, l));
-    try testing.expect(!equal(l, s));
-    try testing.expect(!equal(s, v));
-    try testing.expect(!equal(s, value.nilValue()));
-    try testing.expect(!equal(s, value.fromFixnum(0).?));
-}
+    // A shallow value is unaffected by a tight budget.
+    defer stack.arm(stack.main_thread_budget);
+    stack.arm(64 * 1024);
+    const shallow = try nest(&heap, 3);
+    const n0 = overflowCount();
+    try testing.expect(equal(shallow, try nest(&heap, 3)));
+    _ = hashValue(shallow);
+    try testing.expectEqual(n0, overflowCount());
 
-test "hashValue: set hash uses set-category domain byte (0xF2)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s = try champ_mod.setEmpty(&heap);
-    try testing.expectEqual(set_domain_byte, domainByteForKind(.persistent_set));
-    const final = hashValue(s);
-    const base = heapHashBase(s);
-    try testing.expectEqual(
-        hash_mod.mixKindDomain(base, set_domain_byte),
-        final,
-    );
-    // Different from map (associative) and list (sequential) at the
-    // domain-mix step even when base hashes coincide.
-    const m = try champ_mod.mapEmpty(&heap);
-    const l = try list_mod.empty(&heap);
-    try testing.expect(hashValue(s) != hashValue(m));
-    try testing.expect(hashValue(s) != hashValue(l));
-}
-
-test "equal: cross-subkind set (array-set vs CHAMP) with same elements" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var as = try champ_mod.setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        as = try champ_mod.setConj(&heap, as, value.fromKeywordId(i), &hashValue, &equal);
-    }
-    var ch = as;
-    ch = try champ_mod.setConj(&heap, ch, value.fromKeywordId(100), &hashValue, &equal);
-    ch = try champ_mod.setDisj(&heap, ch, value.fromKeywordId(100), &hashValue, &equal);
-
-    try testing.expect(as.subkind() == 0);
-    try testing.expect(ch.subkind() == 1);
-    try testing.expect(equal(as, ch));
-    try testing.expectEqual(hashValue(as), hashValue(ch));
-}
-
-test "nested set in a map / set of sets: dispatch recurses correctly" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Two sets-of-sets: #{ #{1 2} #{3 4} } built in two orders.
-    const inner_12_a = try champ_mod.setConj(&heap, try champ_mod.setConj(&heap, try champ_mod.setEmpty(&heap), value.fromFixnum(1).?, &hashValue, &equal), value.fromFixnum(2).?, &hashValue, &equal);
-    const inner_12_b = try champ_mod.setConj(&heap, try champ_mod.setConj(&heap, try champ_mod.setEmpty(&heap), value.fromFixnum(2).?, &hashValue, &equal), value.fromFixnum(1).?, &hashValue, &equal);
-    const inner_34 = try champ_mod.setConj(&heap, try champ_mod.setConj(&heap, try champ_mod.setEmpty(&heap), value.fromFixnum(3).?, &hashValue, &equal), value.fromFixnum(4).?, &hashValue, &equal);
-    try testing.expect(equal(inner_12_a, inner_12_b));
-
-    const outer_a = try champ_mod.setConj(&heap, try champ_mod.setConj(&heap, try champ_mod.setEmpty(&heap), inner_12_a, &hashValue, &equal), inner_34, &hashValue, &equal);
-    const outer_b = try champ_mod.setConj(&heap, try champ_mod.setConj(&heap, try champ_mod.setEmpty(&heap), inner_34, &hashValue, &equal), inner_12_b, &hashValue, &equal);
-    try testing.expect(equal(outer_a, outer_b));
-    try testing.expectEqual(hashValue(outer_a), hashValue(outer_b));
-}
-
-test "equal ⇒ hashValue equal: bedrock invariant end-to-end (set, 50 elements)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var a = try champ_mod.setEmpty(&heap);
-    var b = try champ_mod.setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 50) : (i += 1) {
-        a = try champ_mod.setConj(&heap, a, value.fromKeywordId(i), &hashValue, &equal);
-    }
-    i = 49;
-    while (true) : (i -|= 1) {
-        b = try champ_mod.setConj(&heap, b, value.fromKeywordId(i), &hashValue, &equal);
-        if (i == 0) break;
-    }
-    try testing.expect(equal(a, b));
-    try testing.expectEqual(hashValue(a), hashValue(b));
+    try testing.expect(!equal(deep_a, deep_b));
+    try testing.expect(overflowCount() > n0);
+    const n1 = overflowCount();
+    _ = hashValue(m);
+    try testing.expect(overflowCount() > n1);
+    // The map computed its hash past the overflow and keeps none.
+    try testing.expect(Heap.asHeapHeader(m).cachedHash() == null);
 }

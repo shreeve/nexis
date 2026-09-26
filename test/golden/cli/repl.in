@@ -1,0 +1,20 @@
+(def x 40)
+(+ x 2)
+(/ 1 0)
+*e
+(def a 1) (def b 2) (+ a b)
+(* *1 10)
+(defn twice [n]
+  (* 2 n))
+(twice 21)
+(def s "one
+two \" three
+
+four \\")
+(count s)
+["a" \b "c d"]
+(count (pr-str (range 2000)))
+(ns other)
+(str "in " 'other)
+)
+:quit

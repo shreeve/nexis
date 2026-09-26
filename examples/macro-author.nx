@@ -6,7 +6,8 @@
 ; `let*` bindings (vector), `fn*` params (vector), `loop*`
 ; bindings (vector), `cond` clauses (list of pairs).
 ;
-; Host macros are built with FormBuilder directly; a user writes
+; Host macros build their Forms in Zig (`Builder` in src/expand.zig);
+; a user writes
 ;
 ;   (defmacro unless [test & body]
 ;     \`(if ~test nil (do ~@body)))
@@ -14,9 +15,9 @@
 ; The expansion below is the same mechanism without the
 ; (defmacro ...) wrapper:
 
-(let [name (quote my-binding) value 99]
+(println (let [name (quote my-binding) value 99]
   ; Construct (let* [my-binding 99] my-binding) — a fully
   ; valid nexis form ready to feed back into the compiler.
-  `(let* [~name ~value] ~name))
+  `(let* [~name ~value] ~name)))
 
 ; -> (let* [my-binding 99] my-binding)
