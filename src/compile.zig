@@ -925,6 +925,13 @@ const Emitter = struct {
         return pc;
     }
 
+    /// Emit `jump:if-true A=PLACEHOLDER B=test`, for back-patching.
+    fn emitJumpIfTruePlaceholder(self: *Emitter, test_op: Operand) CompileError!usize {
+        const pc = self.code.items.len;
+        try self.emit(vm.asm_.jumpIfTrue(0, test_op));
+        return pc;
+    }
+
     /// Emit `jump:jmp A=PLACEHOLDER`. Returns the PC of the
     /// emitted instruction for back-patching.
     fn emitJumpPlaceholder(self: *Emitter) CompileError!usize {
@@ -1464,24 +1471,49 @@ fn lowerDo(
 }
 
 /// `(if test then)` or `(if test then else)`. Missing else
-/// synthesizes nil (matches Tiny semantics).
+/// synthesizes nil (matches Tiny semantics). A test `(not x)`, with
+/// `not` core's, is `x` with the arms swapped (COMPILER.md §5.2).
 fn lowerIf(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 2 and args.len != 3) return CompileError.MalformedForm;
-    const test_ = try lowerForm(allocator, args[0], ctx);
+    var test_form: *const reader_mod.Form = args[0];
+    var negated = false;
+    while (negatedTest(test_form, ctx)) |inner| {
+        test_form = inner;
+        negated = !negated;
+    }
+    const test_ = try lowerForm(allocator, test_form, ctx);
     const then = try lowerForm(allocator, args[1], ctx);
     const else_: ?*const Tiny = if (args.len == 3)
         try lowerForm(allocator, args[2], ctx)
     else
         null;
-    return try allocTiny(allocator, .{ .if_ = .{
+    return try allocTiny(allocator, .{ .if_ = if (negated) .{
+        .test_ = test_,
+        .then = else_ orelse try allocTiny(allocator, .nil),
+        .else_ = then,
+    } else .{
         .test_ = test_,
         .then = then,
         .else_ = else_,
     } });
+}
+
+/// `x` when `form` is `(not x)` and `not` means `nexis.core`'s, as an
+/// inlined fn must (§4.3 rule 2).
+fn negatedTest(form: *const reader_mod.Form, ctx: LowerCtx) ?*const reader_mod.Form {
+    const items = switch (form.datum) {
+        .list => |items| items,
+        else => return null,
+    };
+    if (items.len != 2 or items[0].datum != .symbol) return null;
+    const head = items[0].datum.symbol;
+    if (!std.mem.eql(u8, head.name, "not")) return null;
+    const core = if (head.ns) |ns| std.mem.eql(u8, ns, "nexis.core") else namesCore(ctx, "not");
+    return if (core) items[1] else null;
 }
 
 /// `(quote x)`. Scalars that already map to Tiny variants are
@@ -3133,7 +3165,15 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
     switch (t.*) {
         .do_ => |items| for (items) |item| try compileEffect(e, item),
         .if_ => |i| {
-            if (isInert(e, i.then) and (i.else_ == null or isInert(e, i.else_.?))) return compileEffect(e, i.test_);
+            const else_inert = i.else_ == null or isInert(e, i.else_.?);
+            if (isInert(e, i.then) and else_inert) return compileEffect(e, i.test_);
+            if (isInert(e, i.then)) {
+                // Only the else arm runs code: skip it when the test holds.
+                const if_true_pc = try e.emitJumpIfTruePlaceholder(try compileOperand(e, i.test_, true));
+                e.slot_top = slot_mark;
+                try compileEffect(e, i.else_.?);
+                return e.patchJumpHere(if_true_pc);
+            }
             const test_op = try compileOperand(e, i.test_, true);
             const if_false_pc = try e.emitJumpIfFalsePlaceholder(test_op);
             e.slot_top = slot_mark;

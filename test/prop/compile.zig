@@ -76,6 +76,11 @@ const cases = [_]Case{
     .{ .src = "((fn* [n acc] (let* [m n] (if (< m 3) (recur (inc m) (+ acc m)) [n acc]))) 0 0)", .out = "[3 3]" },
     .{ .src = "(try (throw 5) (catch any e (let* [x e] (+ x 1))))", .out = "6" },
     .{ .src = "(let* [x 1] (let* [f (let* [y x] (fn* [] y))] (f)))", .out = "1" },
+    // (not x) as a test swaps the arms when not is core's.
+    .{ .src = "[(if (not false) 1 2) (if (not nil) 1) (if (not 1) 1) (if (not (not 0)) :a :b) (if (nexis.core/not true) 1 2)]", .out = "[1 1 nil :a 2]" },
+    .{ .src = "(let* [not (fn* [_] true)] (if (not false) 1 2))", .out = "1" },
+    .{ .src = "(let* [a (atom 0)] (do (if (not (swap! a inc)) (swap! a + 10)) (if (not false) nil (swap! a + 100)) @a))", .out = "1" },
+    .{ .src = "(let* [a (atom 0)] (do (if (swap! a inc) nil (swap! a + 10)) (if false nil (swap! a + 100)) @a))", .out = "101" },
     // A form for effect: what cannot fail is dropped, an if's arms
     // run for effect.
     .{ .src = "(let* [x 1] (do nil 2 x (if x 1 2) (if x 1) x))", .out = "1" },
@@ -576,6 +581,14 @@ test "inlining: an operator inlines only when it names nexis.core's Var" {
     , "[:mine :mine]");
     // A definition in the same form counts from its own definition on.
     try harness.expectCheckedOutput("(do (def + (fn* [a b] 42)) (+ 1 2))", "42");
+    // So for `not` as an if test, which swaps the arms only when it
+    // is core's.
+    try harness.expectCheckedOutput("(do (def not (fn* [_] :mine)) (if (not true) 1 2))", "1");
+    try harness.expectOutput(
+        \\(ns foo)
+        \\(defn not [x] :mine)
+        \\(if (not true) 1 2)
+    , "1");
     // A call that does not inline lowers its operands once: nesting
     // 40 deep would take 2^40 lowerings otherwise.
     var src: std.ArrayList(u8) = .empty;
@@ -665,6 +678,16 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
         // message.
         .{ .src = "(fn* [a] (nexis.test/is (= a 1)))", .len = 7 },
         .{ .src = "(fn* [a] (nexis.test/is (a) \"m\"))", .len = 7 },
+        // A test (not x) is x with the arms swapped.
+        .{ .src = "(fn* [a] (if (not a) 1 2))", .len = 5 },
+        // An if for effect whose then arm is dropped jumps on truth.
+        .{ .src = "(fn* [a] (do (if a nil (a)) a))", .len = 5 },
+        // cond's :else is no test.
+        .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 5 },
+        // assert builds its message and data at expansion.
+        .{ .src = "(fn* [a] (assert a \"m\"))", .len = 9 },
+        // Overload dispatch compares the count inline.
+        .{ .src = "(fn ([x] x) ([x y] y))", .len = 23 },
         // A case of three or more constants: one lookup of the
         // clause's index, then a compare, a branch, the result and
         // a jump per clause.

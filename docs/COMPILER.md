@@ -328,6 +328,12 @@ the else label; `then` into the result slot; `jump:jmp` to the end,
 unless every path through `then` ends in `recur` or `throw`; the else
 branch (nil when absent).
 
+A test `(not x)`, when `not` means `nexis.core`'s as an inlined fn
+must (§4.3 rule 2), lowers as `x` with the arms swapped, so the call
+of `not` is never made. For effect (§5.3) an `if` whose `then` is
+dropped is `jump:if-true` past its else arm, so `(when-not x (f))`
+there is the test, the branch and the call.
+
 #### 5.3 `(do expr...)`
 
 Every expression but the last compiles for effect; the last into the
