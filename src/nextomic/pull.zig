@@ -79,7 +79,7 @@ pub const Error = error{
 pub const Failure = Error || stack.Error || marshal.Error || db_mod.Error || db_mod.ErrorsOf(DbValue.beginRead) || db_mod.ErrorsOf(Read.scan) || db_mod.ErrorsOf(db_mod.DatomScan.next) || db_mod.ErrorsOf(Read.ident) || db_mod.ErrorsOf(db_mod.Conn.valToValue) || db_mod.ErrorsOf(champ.mapEmpty) || db_mod.ErrorsOf(champ.mapAssoc) || db_mod.ErrorsOf(vector_mod.fromSlice) || db_mod.ErrorsOf(string_mod.fromBytes) || db_mod.ErrorsOf(idents_mod.Idents.internOf);
 
 /// Card-many values are cut here unless the spec says otherwise.
-pub const default_limit: u32 = 1000;
+pub const default_limit: u64 = 1000;
 
 // =============================================================================
 // Entry points
@@ -169,7 +169,7 @@ const Sub = union(enum) {
     none,
     pattern: *const Pattern,
     /// Re-apply the enclosing pattern; a null depth is unlimited.
-    recurse: ?u32,
+    recurse: ?u64,
 };
 
 const Spec = struct {
@@ -179,7 +179,7 @@ const Spec = struct {
     /// what `:as` names.
     key: Value,
     /// Null: no limit.
-    limit: ?u32,
+    limit: ?u64,
     default: ?Value,
     sub: Sub,
 
@@ -194,7 +194,7 @@ const Pattern = struct {
     specs: []const Spec,
     /// Remaining depth per spec at entry: the depth of a `.recurse`
     /// spec, null elsewhere.
-    budget: []const ?u32,
+    budget: []const ?u64,
 };
 
 const wildcard_pattern: Pattern = .{ .wildcard = true, .specs = &.{}, .budget = &.{} };
@@ -267,7 +267,7 @@ const Parser = struct {
         }
         if (top) self.index = null;
         pat.specs = try specs.toOwnedSlice(self.arena);
-        const budget = try self.arena.alloc(?u32, pat.specs.len);
+        const budget = try self.arena.alloc(?u64, pat.specs.len);
         for (pat.specs, budget) |s, *b| b.* = if (s.sub == .recurse) s.sub.recurse else null;
         pat.budget = budget;
         return pat;
@@ -318,7 +318,7 @@ const Parser = struct {
             },
             .fixnum => {
                 const n = v.asFixnum();
-                if (n < 0 or n > std.math.maxInt(u32)) return self.fail("recursion depth must be a non-negative integer");
+                if (n < 0) return self.fail("recursion depth must be a non-negative integer");
                 return .{ .recurse = @intCast(n) };
             },
             .persistent_vector, .list => return .{ .pattern = try self.parsePattern(v) },
@@ -361,9 +361,9 @@ const Parser = struct {
         return spec;
     }
 
-    fn limitOf(self: *Parser, v: Value) !?u32 {
+    fn limitOf(self: *Parser, v: Value) !?u64 {
         if (v.isNil()) return null;
-        if (v.kind() != .fixnum or v.asFixnum() < 0 or v.asFixnum() > std.math.maxInt(u32)) return self.fail(":limit needs a non-negative integer or nil");
+        if (v.kind() != .fixnum or v.asFixnum() < 0) return self.fail(":limit needs a non-negative integer or nil");
         return @intCast(v.asFixnum());
     }
 
@@ -464,7 +464,7 @@ const Puller = struct {
 
     /// The pattern applied to `e`: null when the entity has no datoms
     /// in this view. `budget` is the remaining depth per spec.
-    fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u32) Failure!?Value {
+    fn entity(self: *Puller, pat: *const Pattern, e: u64, budget: []const ?u64) Failure!?Value {
         try stack.check();
         var m = try champ.mapEmpty(self.heap);
         m = try self.assoc(m, self.k_db_id, try eidValue(e));
@@ -510,15 +510,15 @@ const Puller = struct {
         const attr = (try self.read.attr(a)) orelse return error.Corrupted;
         const k = (try self.read.db.conn.idents.internOf(self.read.txn, a)) orelse return error.Corrupted;
         const spec: Spec = .{ .attr = attr, .reverse = false, .key = value.fromKeywordId(k), .limit = default_limit, .default = null, .sub = .none };
-        const cut = if (spec.many()) @min(vals.len, default_limit) else 1;
+        const cut: usize = if (spec.many()) @intCast(@min(vals.len, default_limit)) else 1;
         const v = try self.render(&wildcard_pattern, &spec, 0, &.{}, vals[0..cut]);
         return self.assoc(m, value.fromKeywordId(k), v);
     }
 
     /// The value of spec `i` of `pat` on `e`, or null when absent.
-    fn specValue(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, e: u64, budget: []const ?u32) Failure!?Value {
+    fn specValue(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, e: u64, budget: []const ?u64) Failure!?Value {
         var vals: std.ArrayList(Val) = .empty;
-        const cap: usize = if (s.many()) (s.limit orelse std.math.maxInt(u32)) else 1;
+        const cap: u64 = if (s.many()) (s.limit orelse std.math.maxInt(u64)) else 1;
         if (cap == 0) return null;
         if (s.reverse) {
             const vb = try key.valBytes(self.arena, .{ .ref = e });
@@ -539,14 +539,14 @@ const Puller = struct {
     }
 
     /// One value, or a vector of them, for a spec.
-    fn render(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, vals: []const Val) Failure!Value {
+    fn render(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u64, vals: []const Val) Failure!Value {
         if (!s.many()) return self.renderVal(pat, s, i, budget, vals[0]);
         const out = try self.arena.alloc(Value, vals.len);
         for (vals, out) |v, *o| o.* = try self.renderVal(pat, s, i, budget, v);
         return vector_mod.fromSlice(self.heap, out);
     }
 
-    fn renderVal(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, v: Val) Failure!Value {
+    fn renderVal(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u64, v: Val) Failure!Value {
         if (v == .ref) return self.renderRef(pat, s, i, budget, v.ref);
         return self.read.db.conn.valToValue(self.read.txn, self.heap, v);
     }
@@ -554,13 +554,13 @@ const Puller = struct {
     /// A referenced entity: pulled with the spec's sub-pattern, the
     /// enclosing pattern on recursion, `[*]` for a component, else a
     /// plain ref. Anything on the path or past the depth is a plain ref.
-    fn renderRef(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u32, target: u64) Failure!Value {
+    fn renderRef(self: *Puller, pat: *const Pattern, s: *const Spec, i: usize, budget: []const ?u64, target: u64) Failure!Value {
         switch (s.sub) {
             .pattern => |p| return self.nested(p, target, p.budget),
             .recurse => {
                 if (budget[i]) |remaining| {
                     if (remaining == 0) return self.refMap(target);
-                    const next = try self.arena.dupe(?u32, budget);
+                    const next = try self.arena.dupe(?u64, budget);
                     next[i] = remaining - 1;
                     return self.nested(pat, target, next);
                 }
@@ -573,7 +573,7 @@ const Puller = struct {
         }
     }
 
-    fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u32) Failure!Value {
+    fn nested(self: *Puller, pat: *const Pattern, target: u64, budget: []const ?u64) Failure!Value {
         if (self.path.contains(target)) return self.refMap(target);
         try self.path.put(self.arena, target, {});
         defer _ = self.path.remove(target);
@@ -841,6 +841,10 @@ test "nested patterns, reverse refs, recursion with cycles, depth" {
     try testing.expectEqualStrings("Ann", string_mod.asBytes((try fx.getName(ann1, "p/name")).?));
     const bob0 = vector_mod.nth((try fx.getName(ann1, "p/friend")).?, 0);
     try testing.expectEqual(@as(usize, 1), champ.mapCount(bob0));
+    // A depth past 2^32 recurses like `...`.
+    const deep = try fx.pullOne(dbv, try fx.vec(&.{ try fx.kw("p/name"), try fx.map(&.{ try fx.kw("p/friend"), Fx.int(1 << 40) }) }), Fx.int(@intCast(p.bob)));
+    const ann_deep = vector_mod.nth((try fx.getName(deep, "p/friend")).?, 0);
+    try testing.expectEqualStrings("Ann", string_mod.asBytes((try fx.getName(ann_deep, "p/name")).?));
     // Depth 0 is a plain ref.
     const d0 = try fx.pullOne(dbv, try fx.vec(&.{try fx.map(&.{ try fx.kw("p/friend"), Fx.int(0) })}), Fx.int(@intCast(p.bob)));
     try testing.expectEqual(@as(usize, 1), champ.mapCount(vector_mod.nth((try fx.getName(d0, "p/friend")).?, 0)));
@@ -914,6 +918,9 @@ test "limit, default, as, expression forms, pull-many, syntax diagnostics" {
     try testing.expectEqual(@as(usize, 2), vector_mod.count((try fx.getName(nolim, "p/tags")).?));
     const zero = try fx.pullOne(dbv, try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), Fx.int(0) })}), ann);
     try testing.expect((try fx.getName(zero, "p/tags")) == null);
+    // A limit past 2^32 is a limit like any other.
+    const huge = try fx.pullOne(dbv, try fx.vec(&.{try fx.lst(&.{ try fx.kw("p/tags"), try fx.kw("limit"), Fx.int(1 << 40) })}), ann);
+    try testing.expectEqual(@as(usize, 2), vector_mod.count((try fx.getName(huge, "p/tags")).?));
     // A limit on a map spec key.
     const lm = try fx.pullOne(dbv, try fx.vec(&.{try fx.map(&.{ try fx.lst(&.{ try fx.kw("p/friend"), try fx.kw("limit"), Fx.int(1) }), try fx.vec(&.{try fx.kw("p/name")}) })}), ann);
     try testing.expectEqual(@as(usize, 1), vector_mod.count((try fx.getName(lm, "p/friend")).?));
