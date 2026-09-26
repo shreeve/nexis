@@ -5501,7 +5501,7 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     const Case = struct { src: []const u8, label: []const u8, file: ?[]const u8 = null, line: u32 = 0 };
     const cases = [_]Case{
         .{ .src = "(require 'broken)", .label = "parse error: unexpected end of input", .file = "broken.nx", .line = 3 },
-        .{ .src = "(require 'unresolved)", .label = "UnresolvedSymbol: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
+        .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
     };

@@ -57,13 +57,13 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 154/154 steps succeeded; 1227/1227 tests passed
+Build Summary: 159/159 steps succeeded; 1244/1244 tests passed
 ```
 
-It ran in 67 s wall (225 s CPU) from a warm cache on an Apple-silicon
+It ran in 49 s wall (138 s CPU) from a warm cache on an Apple-silicon
 Mac shared with other builds. Any output besides the summary tree is a
-failure. The largest binaries are `unit` (612 inline tests) and
-`eval_pipeline` (409 programs).
+failure. The largest binaries are `unit` (619 inline tests) and
+`eval_pipeline` (417 programs).
 
 The fastest end-to-end checks:
 
@@ -326,6 +326,15 @@ failing test (AGENTS.md).
    `with-meta` on a typed vector is `:kind-mismatch` (Clojure's
    `vector-of` carries metadata; `docs/SEMANTICS.md` §7). Each is a
    `stdlib.zig` arm, its doc row and an `eval_pipeline` case.
+10. **A routine holds at most 4096 live locals and 4096 captured
+    locals**, the two routine caps the 12-bit slot and upvalue
+    operands leave (COMPILER.md §4.4); past either the compile error
+    names the routine and the cap (`too-many-locals.err`). Every other
+    routine table is 32-bit. Deeply nested calls whose arguments need
+    code, `(f (f (f …)))`, still take a slot per level, so about 4000
+    levels reach the slot cap before the stack guard. Next: release a
+    call block's slots to the argument that consumes them, as nested
+    arithmetic does (`compile.zig` call lowering).
 
 ### 6.2 Nextomic
 
@@ -362,10 +371,16 @@ failing test (AGENTS.md).
 6. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-7. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+7. **Planning and joining grow steeply with clause count**: a
+   1000-clause chain over 10 entities plans and runs in 118 ms, but a
+   300-clause chain over a 100k-entity chain takes 34 s, because every
+   join copies an ever-wider relation. Next: profile
+   `query/plan.zig` and `relation.zig` on that query; project away
+   variables no later clause or `:find` uses before each join.
+8. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-8. **No datom heap kind**: reads return `[e a v t added]` vectors.
+9. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

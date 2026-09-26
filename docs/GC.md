@@ -69,7 +69,7 @@ VM's roots, in the order it marks them:
    and its routine's constants once however many frames run it; or,
    for a frame with no closure (a top-level form, a loader routine),
    the heap constants of its routine, recursively through the
-   routines in its constant pool.
+   routines its capture descriptors name (`Routine.capture_descs`).
 3. **Every Var of every namespace** in the registry, and of the
    ad-hoc namespace: `root`, `meta` and `thread_value`. A `var_` Value
    is never marked itself (`Heap.isBlockKind` excludes it); its
@@ -347,5 +347,6 @@ A new native that calls back into the VM states its class next to its
 **Routine constant pools.** The heap constants of a routine (string,
 bignum and constant-collection literals, allocated on the VM's heap)
 are rooted through every frame running the routine and every closure
-over it, recursively through the routines nested in its pool (§3), so
-a literal lives as long as any code that can load it and no longer.
+over it, recursively through the routines its capture descriptors
+name (§3), so a literal lives as long as any code that can load it and
+no longer.

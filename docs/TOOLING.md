@@ -76,18 +76,19 @@ end of input` at the token the parser stopped on, or `parse error:
 unterminated string` at the `"` of a string literal no quote closes;
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
-(keyword :a_b)`, FORMS.md §3); a `CompileError` name at the span
-COMPILER.md §7 gives. A macro expansion that failed adds the
-expander's reason (MACROEXPAND.md §8) at the innermost form that
-failed, an unresolved symbol its name (`UnresolvedSymbol: unable to
-resolve symbol: foo`), and a routine limit the routine and the limit
-(COMPILER.md §4.4, `too-many-locals.err`):
+(keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span
+COMPILER.md §7 gives, the sentence saying what failed: the expander's
+reason for a macro expansion that failed (MACROEXPAND.md §8), at the
+innermost form that failed; `unable to resolve symbol: foo`; a routine
+limit with the routine and the limit (COMPILER.md §4.4,
+`too-many-locals.err`). A compile error with nothing to add reads
+`compile error: NAME`, the `CompileError` name.
 
 ```
-nexis: test/golden/cli/macro-failure.nx:4:1: MacroExpansionFailure: macro m threw bad macro input
+nexis: test/golden/cli/macro-failure.nx:4:1: compile error: macro m threw bad macro input
     (m 1)
     ^^^^^
-nexis: test/golden/cli/too-many-locals.nx:7:3: SlotOverflow: fn many: more than 4096 local slots
+nexis: test/golden/cli/too-many-locals.nx:7:3: compile error: fn many: more than 4096 local slots
       (let-many 4100 a0))
       ^^^^^^^^^^^^^^^^^^
 ```
