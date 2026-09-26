@@ -250,6 +250,14 @@ const Gen = struct {
     next_email: u32 = 0,
     long_bios: usize = 0,
 
+    /// A small age that collides often, or one at an edge of the long
+    /// range (NEXTOMIC.md §2.2), past the fixnum range included.
+    fn age(self: *Gen) i64 {
+        const edges = [_]i64{ std.math.minInt(i64), -(1 << 47) - 1, 1 << 47, 1 << 53, std.math.maxInt(i64) };
+        const i = self.rand.uintLessThan(usize, 5 + edges.len);
+        return if (i < 5) @intCast(i + 1) else edges[i - 5];
+    }
+
     /// One transaction: ops, the entities it touches (no conflicts), and
     /// the tempid names for new entities.
     const Tx = struct {
@@ -319,7 +327,7 @@ const Gen = struct {
                     const tmp = try std.fmt.allocPrint(self.arena, "n{d}", .{tx.new_count});
                     const e: transact.Entity = .{ .tempid = .{ .string = tmp } };
                     try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.email }, .v = .{ .val = .{ .string = try self.freshEmail() } } } });
-                    try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.rand.intRangeAtMost(i64, 1, 5) } } } });
+                    try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.age() } } } });
                     if (self.rand.boolean()) try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.tags }, .v = .{ .val = self.tagVal() } } });
                 },
                 2 => {
@@ -346,7 +354,7 @@ const Gen = struct {
                     try tx.touched.put(self.arena, e, {});
                     const which = self.rand.uintLessThan(u8, 3);
                     if (which == 0) {
-                        try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.rand.intRangeAtMost(i64, 1, 5) } } } });
+                        try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.age() } } } });
                     } else if (which == 1) {
                         try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.bio }, .v = .{ .val = .{ .string = try self.bio() } } } });
                     } else {
@@ -407,7 +415,7 @@ const Gen = struct {
                     const e = self.pickAlive(&tx) orelse continue;
                     if (tx.touched.contains(e)) continue;
                     try tx.touched.put(self.arena, e, {});
-                    try tx.ops.append(self.arena, .{ .retract = .{ .e = .{ .eid = e }, .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.rand.intRangeAtMost(i64, 1, 5) } } } });
+                    try tx.ops.append(self.arena, .{ .retract = .{ .e = .{ .eid = e }, .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.age() } } } });
                 },
             }
         }

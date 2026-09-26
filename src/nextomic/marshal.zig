@@ -15,12 +15,14 @@
 //!     reason.
 //!   - `valOf`: a VM value under an attribute's type; null when a
 //!     keyword or entity reference names nothing (no datom can match
-//!     it), `ValueType` on a kind mismatch.
+//!     it), `ValueType` on a kind mismatch. A long or an instant is
+//!     any integer in i64 (`datom.longOf`), a bignum past the fixnum range
+//!     included.
 //!   - `encodeCell`: a query cell under an attribute's type; null when
 //!     no value of that type equals it, never an error, because a
 //!     query constant of the wrong type matches nothing.
-//!   - `cellOf`: a datom value as the query engine compares it: ids
-//!     as `int`, keywords as VM keyword ids.
+//!   - `cellOf`: a datom value as the query engine compares it: ids,
+//!     longs and instants as `int`, keywords as VM keyword ids.
 //!   - `sequence` and `collection`: the elements of a vector or list,
 //!     or of a vector, list or set; null for any other kind.
 
@@ -142,20 +144,14 @@ pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *F
             if (!v.isBool()) return error.ValueType;
             return .{ .boolean = v.asBool() };
         },
-        .long => {
-            if (v.kind() != .fixnum) return error.ValueType;
-            return .{ .long = v.asFixnum() };
-        },
+        .long => return .{ .long = datom_mod.longOf(v) orelse return error.ValueType },
         .double => {
             if (v.kind() != .float) return error.ValueType;
             const d = v.asFloat();
             if (std.math.isNan(d)) return error.ValueType;
             return .{ .double = d };
         },
-        .instant => {
-            if (v.kind() != .fixnum) return error.ValueType;
-            return .{ .instant = v.asFixnum() };
-        },
+        .instant => return .{ .instant = datom_mod.longOf(v) orelse return error.ValueType },
         .keyword => {
             if (v.kind() != .keyword) return error.ValueType;
             const id = (try rd.db.conn.idents.idOf(rd.txn, v.asKeywordId())) orelse return null;
@@ -237,6 +233,7 @@ const testing = std.testing;
 const TestConn = db_mod.TestConn;
 const Heap = @import("../heap.zig").Heap;
 const string_mod = @import("../string.zig");
+const bignum = @import("../bignum.zig");
 const boot = @import("store.zig").boot;
 
 test "marshalling both ways for every value type" {
@@ -297,6 +294,27 @@ test "marshalling both ways for every value type" {
     const by = (try valOf(&rd, arena, .bytes, try string_mod.fromBytes(&heap, "\x00\x01"), &fault)).?;
     try testing.expectEqualStrings("\x00\x01", by.bytes);
     try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(try conn.valToValue(rd.txn, &heap, by)));
+
+    // A long or an instant is any integer in i64, a fixnum or a bignum,
+    // and reads back as the language's integer.
+    for ([_]i64{ std.math.minInt(i64), -(1 << 47) - 1, -(1 << 47), (1 << 47) - 1, 1 << 47, std.math.maxInt(i64) }) |x| {
+        const in = try bignum.fromI64(&heap, x);
+        for ([_]key.ValueType{ .long, .instant }) |vt| {
+            const got = (try valOf(&rd, arena, vt, in, &fault)).?;
+            try testing.expectEqual(x, switch (got) {
+                .long, .instant => |m| m,
+                else => unreachable,
+            });
+            try testing.expectEqual(x, bignum.toI64(try conn.valToValue(rd.txn, &heap, got)).?);
+            try testing.expect((try cellOf(&rd, arena, got)).eql(.{ .int = x }));
+            try testing.expect((try encodeCell(&rd, .{ .int = x }, vt)).?.eql(got));
+        }
+    }
+    for ([_]i128{ @as(i128, std.math.maxInt(i64)) + 1, @as(i128, std.math.minInt(i64)) - 1 }) |x| {
+        const past = try bignum.fromI128(&heap, x);
+        try testing.expectError(error.ValueType, valOf(&rd, arena, .long, past, &fault));
+        try testing.expectError(error.ValueType, valOf(&rd, arena, .instant, past, &fault));
+    }
 
     // Names that resolve to nothing match nothing.
     const kw_none = try tc.interner.internKeywordValue("nope/nope");

@@ -126,11 +126,19 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x60` | uuid | 16 bytes |
 | `0x70` | bytes | as string, both shapes |
 
-A long or an instant is a fixnum: the encoding has room for an i64,
-but a value is taken from and returned to the VM as a fixnum, so a
-bignum under `:db.type/long` or `:db.type/instant` is
-`:nextomic/value-type`. String order is UTF-8 byte order, which is code
-point order, not UTF-16 order; no Unicode normalization is applied.
+A long or an instant is any integer in i64, as Datomic's long is: a
+fixnum, or a bignum past the fixnum range (`docs/SEMANTICS.md` §2.2),
+goes in, and a read returns the language's integer for the stored
+value, a bignum past `±2^47`. An integer outside i64 is
+`:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
+or an `index-range` bound. A key holds every long in the same 8
+bytes, and the txlog spells one past the fixnum range as the codec's
+bignum; the format number stays 1. A build that takes longs in the
+fixnum range only reads such a file's fixnum-range values and refuses
+a wider one, `:nextomic/value-type` from an index and `:db/corrupted`
+from the txlog, never misreading it. String order is UTF-8 byte order,
+which is code point order, not UTF-16 order; no Unicode normalization
+is applied.
 Type tags never compare equal across types, so `1` and `1.0` are
 different keys, in line with `(= 1 1.0)` being false.
 
@@ -566,12 +574,14 @@ The built-ins are Zig over cells:
 - `fulltext` (below).
 
 An attribute `missing?`, `get-else` or `get-some` names that does not
-exist is `:nextomic/unknown-attribute`. An int and a double compare
-numerically, strings by their bytes and keywords as `compare`
-orders them (an unqualified keyword before any qualified one, then by
-namespace, then by name); a comparison across other types (a string
-against a number, a number against a keyword) or of any other value (a
-vector, a bignum) is `:nextomic/value-type`, as is an input or a
+exist is `:nextomic/unknown-attribute`. Numbers compare as `compare`
+orders them: two integers exactly at any size (a long, a bignum input
+past i64), an integer and a double in f64. Strings compare by their
+bytes and keywords as `compare` orders them (an unqualified keyword
+before any qualified one, then by namespace, then by name); a
+comparison across other types (a string against a number, a number
+against a keyword) or of any other value (a vector) is
+`:nextomic/value-type`, as is an input or a
 function result whose shape does not fit its binding form. Any other
 symbol resolves through the namespace registry as the compiler resolves
 it (an alias-qualified `ns/name` to that namespace's own var, a bare
@@ -613,11 +623,12 @@ and `:with` variables) by the plain find elements: `count`, `sum`,
 largest, a vector), `(sample n ?x)` (up to n distinct values, a vector)
 and `(rand n ?x)` (n values with repetition, a vector). `min` and `max`
 take any type, in the cell order: nil, booleans, numbers, strings,
-keywords as `compare` orders them, then other values in a stable order; `sum`,
-`avg`, `variance` and `stddev` take numbers (`:nextomic/value-type`
-otherwise), and a `sum` of integers past the fixnum range is a bignum,
-as `+` gives; `median` of an odd count is the middle value of any type,
-of an even count the mean of the two middle numbers as a double;
+keywords as `compare` orders them, then other values in a stable
+order; `sum`, `avg`, `variance` and `stddev` take numbers, bignums
+included (`:nextomic/value-type` otherwise), and a `sum` of integers
+is exact at any size, a bignum past the fixnum range as `+` gives;
+`median` of an odd count is the middle value of any type, of an even
+count the mean of the two middle numbers as a double;
 `variance` divides by the count (population variance) and `stddev` is
 its square root. Any other symbol in aggregate position,
 `(my.ns/total ?x)`, is a custom aggregate: it resolves like a function
@@ -846,8 +857,9 @@ read, and the collector marks the db box and that map (`docs/GC.md`
 and `into` call `natives.entityHas` and `natives.entityMap`.
 
 Tests: `test/prop/nextomic_key.zig` (encoded order equals value order
-per type) and `test/prop/nextomic_tx.zig` (random transactions against
-an in-memory model, at every basis); the corpora
+per type, longs over all of i64 and its edges) and
+`test/prop/nextomic_tx.zig` (random transactions against an in-memory
+model, at every basis); the corpora
 `test/integration/nextomic_q.zig` and `nextomic_pull.zig` against naive
 evaluators over the shared fixture `nextomic_fx.zig`;
 `nextomic_fn.zig` (transaction functions, cas, schema alteration,
@@ -903,6 +915,7 @@ transaction's next such read, so Nextomic copies what it keeps.
 - **`tx-range` takes the connection.** `(d/tx-range conn from to)`,
   either bound optional or nil, returns the entries as a vector of
   maps; Datomic's reads a log value.
-- **Values are the VM's.** A long or an instant is a fixnum (i48, §2.2),
-  and an instant is milliseconds as a long; Datomic takes a 64-bit long
-  and a `java.util.Date`.
+- **Values are the VM's.** A long or an instant is an integer in i64,
+  a fixnum or a bignum by its size (§2.2), and an instant is
+  milliseconds as a long; Datomic takes a 64-bit long and a
+  `java.util.Date`.

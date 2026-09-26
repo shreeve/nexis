@@ -3,9 +3,10 @@
 //! A txlog entry is the codec-encoded vector
 //! `[instant [e a v added] ...]` (NEXTOMIC.md §2, `nx/txlog`), with a
 //! trailing map `{:excised [e ...]}` on an entry an excision touched
-//! (§4). Inside it `e` and `a` are fixnums, `added` a boolean and `v`
-//! the value in its natural VM shape: keywords by name (durable across
-//! stores), refs / longs / instants as fixnums, doubles as floats,
+//! (§4). Inside it `e` and `a` are fixnums, `added` a boolean, the
+//! instant an integer and `v` the value in its natural VM shape:
+//! keywords by name (durable across stores), refs as fixnums, longs and
+//! instants as integers (a bignum past the fixnum range), doubles as floats,
 //! uuids as canonical text, byte arrays as strings. The entry is
 //! self-describing given the attribute's value type, which the decoder
 //! asks for.
@@ -19,6 +20,7 @@ const vector_mod = @import("../coll/vector.zig");
 const codec_mod = @import("../codec.zig");
 const dispatch = @import("../dispatch.zig");
 const champ = @import("../coll/champ.zig");
+const bignum = @import("../bignum.zig");
 const key = @import("key.zig");
 
 const Allocator = std.mem.Allocator;
@@ -91,7 +93,7 @@ pub fn encodeTxlog(arena: Allocator, instant: i64, datoms: []const Datom, excise
 
     const marker: usize = if (excised.len > 0) 1 else 0;
     const elems = try arena.alloc(Value, datoms.len + 1 + marker);
-    elems[0] = value.fromFixnum(instant) orelse return error.Corrupted;
+    elems[0] = try bignum.fromI64(&heap, instant);
     for (datoms, 0..) |d, i| {
         const v = try valToTxlogValue(&heap, &interner, d.v, names);
         const row = [_]Value{
@@ -121,9 +123,8 @@ fn fixnum(n: u64) ?Value {
 fn valToTxlogValue(heap: *Heap, interner: *Interner, v: Val, names: NameSource) !Value {
     return switch (v) {
         .boolean => |b| value.fromBool(b),
-        .long => |n| value.fromFixnum(n) orelse error.Corrupted,
+        .long, .instant => |n| try bignum.fromI64(heap, n),
         .double => |d| value.fromFloat(d),
-        .instant => |n| value.fromFixnum(n) orelse error.Corrupted,
         .keyword => |id| blk: {
             const name = (try names.identName(names.ctx, id)) orelse return error.UnknownIdent;
             break :blk try interner.internKeywordValue(name);
@@ -155,8 +156,7 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, ids: IdSource) !
     if (vec.kind() != .persistent_vector) return error.Corrupted;
     const n = vector_mod.count(vec);
     if (n == 0) return error.Corrupted;
-    const inst = vector_mod.nth(vec, 0);
-    if (inst.kind() != .fixnum) return error.Corrupted;
+    const instant = longOf(vector_mod.nth(vec, 0)) orelse return error.Corrupted;
 
     // A trailing map is the excision marker.
     var excised: []u64 = &.{};
@@ -197,17 +197,26 @@ pub fn decodeTxlog(arena: Allocator, bytes: []const u8, t: u64, ids: IdSource) !
             .added = added.asBool(),
         };
     }
-    return .{ .instant = inst.asFixnum(), .datoms = datoms, .excised = excised };
+    return .{ .instant = instant, .datoms = datoms, .excised = excised };
+}
+
+/// The i64 of a long or an instant: an integer, fixnum or bignum, in
+/// i64's range; null for any other value (NEXTOMIC.md §2.2).
+pub fn longOf(v: Value) ?i64 {
+    return switch (v.kind()) {
+        .fixnum, .bignum => bignum.toI64(v),
+        else => null,
+    };
 }
 
 fn txlogValueToVal(arena: Allocator, interner: *const Interner, v: Value, vt: ?ValueType, ids: IdSource) !Val {
     switch (v.kind()) {
         .true_, .false_ => return .{ .boolean = v.asBool() },
-        .fixnum => {
-            const n = v.asFixnum();
+        .fixnum, .bignum => {
+            const n = longOf(v) orelse return error.Corrupted;
             return switch (vt orelse .long) {
                 .instant => .{ .instant = n },
-                .ref => if (n < 0) error.Corrupted else .{ .ref = @intCast(n) },
+                .ref => if (n < 0 or n > key.id_max) error.Corrupted else .{ .ref = @intCast(n) },
                 else => .{ .long = n },
             };
         },
@@ -330,6 +339,26 @@ test "txlog entry round trips every value type" {
         try testing.expect(x.eqlFact(y));
         try testing.expectEqual(x.added, y.added);
         try testing.expectEqual(@as(u64, 7), y.t);
+    }
+}
+
+test "txlog entry holds longs and instants over all of i64" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var dummy: u8 = 0;
+    const names: NameSource = .{ .ctx = @ptrCast(&dummy), .identName = &TestNames.identName };
+    const ids: IdSource = .{ .ctx = @ptrCast(&dummy), .identId = &TestNames.identId, .attrType = &TestNames.attrType };
+    const edges = [_]i64{ std.math.minInt(i64), -(1 << 47) - 1, 1 << 47, std.math.maxInt(i64) };
+    var in: [2 * edges.len]Datom = undefined;
+    for (edges, 0..) |n, i| {
+        in[2 * i] = .{ .e = 1 << 33, .a = 9, .v = .{ .long = n }, .t = 0, .added = true };
+        in[2 * i + 1] = .{ .e = 1 << 33, .a = 4, .v = .{ .instant = n }, .t = 0, .added = true };
+    }
+    for (edges) |instant| {
+        const out = try decodeTxlog(arena, try encodeTxlog(arena, instant, &in, &.{}, names), 7, ids);
+        try testing.expectEqual(instant, out.instant);
+        for (in, out.datoms) |x, y| try testing.expect(x.eqlFact(y));
     }
 }
 

@@ -953,20 +953,14 @@ const Ctx = struct {
                 if (!v.isBool()) return error.ValueType;
                 return .{ .val = .{ .boolean = v.asBool() } };
             },
-            .long => {
-                if (v.kind() != .fixnum) return error.ValueType;
-                return .{ .val = .{ .long = v.asFixnum() } };
-            },
+            .long => return .{ .val = .{ .long = datom_mod.longOf(v) orelse return error.ValueType } },
             .double => {
                 if (v.kind() != .float) return error.ValueType;
                 const d = v.asFloat();
                 if (std.math.isNan(d)) return error.ValueType;
                 return .{ .val = .{ .double = d } };
             },
-            .instant => {
-                if (v.kind() != .fixnum) return error.ValueType;
-                return .{ .val = .{ .instant = v.asFixnum() } };
-            },
+            .instant => return .{ .val = .{ .instant = datom_mod.longOf(v) orelse return error.ValueType } },
             .keyword => {
                 if (v.kind() != .keyword) return error.ValueType;
                 return self.keywordValue(attr, v.asKeywordId(), use);
