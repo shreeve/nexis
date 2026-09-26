@@ -262,13 +262,14 @@ A held snapshot pins the pages every later commit frees, so it goes:
 - when a commit has passed it, at the next read;
 - at every collection (`sweepHandles`), so a program that computes
   between reads holds it for at most one collection's interval;
-- while the REPL waits for a line, and at the last release, `exit`
-  and an error `bin/nexis` reports.
+- while the REPL waits for a line, before `read-line` waits for one,
+  and at the last release, `exit` and an error `bin/nexis` reports.
 
-A program that reads and then blocks outside the REPL (`read-line`)
-keeps it until its next read, write, collection or exit; meanwhile
-another process's commits cannot reuse the pages it pins, and the file
-grows by what they write. A read through `db/*` begins its own
+A program that reads and then blocks some other way (a long
+computation with no allocation, which reaches no collection) keeps it
+until its next read, write, collection or exit; meanwhile another
+process's commits cannot reuse the pages it pins, and the file grows by
+what they write. A read through `db/*` begins its own
 transaction: it loads only the tree it reads, so holding one would
 save little.
 

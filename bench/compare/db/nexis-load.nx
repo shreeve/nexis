@@ -1,8 +1,9 @@
 ; bench/compare/db/nexis-load.nx — create a Nextomic store and load
 ; 100 departments and 100,000 people with five attributes each, in
 ; batches of 1,000 entities (docs/BENCH.md §12). MODE `durable` commits
-; every transaction in the default sync mode; `nosync` commits with
-; `:sync :none` and syncs once at the end, and names its phases
+; every transaction in the default commit mode (`:commit`, no sync;
+; docs/DB.md §3.3); `nosync` commits with `:sync :none` and syncs once
+; at the end, and names its phases
 ; `create-nosync` and `load-nosync`.
 ; Usage: nexis run nexis-load.nx STORE MODE
 ; Twin: dtlv-load.clj; same data, same batches, same answers.
