@@ -2,8 +2,8 @@
 //!
 //! Spec: `docs/VM.md`. This file holds:
 //!
-//!   - The 64-bit instruction encoding (`Inst`, `Operand`) and the
-//!     opcode groups the two-level `dispatch` switch understands.
+//!   - The 64-bit instruction encoding (`Inst`, `Operand`), the
+//!     opcode groups, and the threaded dispatch through `op_table`.
 //!   - `Routine`, a unit of compiled code with its constant pool,
 //!     and `Closure`, a routine plus captured upvalue cells.
 //!   - `Frame`s that window one shared backing `stack`; a call
@@ -1566,6 +1566,9 @@ pub const VM = struct {
     /// halt.
     result: Value = value_mod.nilValue(),
     halted: bool = false,
+    /// The `depth` of the innermost `loop` running: the dispatch
+    /// chain leaves when the frame chain is back to it (`running`).
+    loop_depth: usize = 0,
     /// High-water marks for the backing stack and frame stack.
     /// Used by `recur`/`loop*` tests to assert
     /// that long-running iteration runs in bounded stack space
@@ -2153,13 +2156,22 @@ pub const VM = struct {
             return self.callDirect(callee, args);
         }
         const base = self.stack.items.len;
-        self.stack.appendSlice(self.allocator, args) catch return VmError.OutOfMemory;
         var result_cell = HostCallResult{};
         const depth = self.frames.items.len;
-        self.enterClosure(callee, base, args.len, base, .{ .host_result = &result_cell }) catch |err| {
-            self.stack.shrinkRetainingCapacity(base);
-            return err;
+        const link: Link = .{ .host_result = &result_cell };
+        // The arguments go past the stack's end, where the callee's
+        // window begins.
+        const direct = base + args.len <= self.stack.capacity and blk: {
+            for (args, self.stack.items.ptr[base..][0..args.len]) |arg, *slot| slot.* = arg;
+            break :blk self.enterClosureDirect(callee, base, args.len, link) != null;
         };
+        if (!direct) {
+            self.stack.appendSlice(self.allocator, args) catch return VmError.OutOfMemory;
+            self.enterClosure(callee, base, args.len, base, link) catch |err| {
+                self.stack.shrinkRetainingCapacity(base);
+                return err;
+            };
+        }
         try self.loop(depth);
         // Back at `depth` without a return: a throw went past us.
         if (!result_cell.done) return VmError.ControlTransferred;
@@ -2238,10 +2250,21 @@ pub const VM = struct {
         // A variadic routine needs a slot for its rest parameter.
         if (routine.slot_count < fixed + @intFromBool(routine.variadic)) return VmError.BytecodeCorruption;
 
+        // Every check that can refuse the call runs before the stack
+        // or the frames change, so a refused call leaves both as they
+        // were.
+        if (self.frames.items.len >= self.max_frames) return VmError.StackOverflow;
+        if (self.frames.items.len == self.frames.capacity) {
+            self.frames.ensureUnusedCapacity(self.allocator, 1) catch return VmError.OutOfMemory;
+        }
         const window_end = base + routine.slot_count;
         const args_end = base + argc;
         if (window_end > self.stack.items.len) {
-            self.stack.appendNTimes(self.allocator, value_mod.nilValue(), window_end - self.stack.items.len) catch return VmError.OutOfMemory;
+            if (window_end > self.stack.capacity) {
+                self.stack.ensureTotalCapacity(self.allocator, window_end) catch return VmError.OutOfMemory;
+            }
+            // The slots this uncovers are nil'd below with the rest.
+            self.stack.items.len = window_end;
         }
         errdefer self.stack.shrinkRetainingCapacity(entry_stack_len);
         // The rest list is built while the excess arguments still
@@ -2263,13 +2286,14 @@ pub const VM = struct {
         }
         // Locals start nil, and so do excess argument slots past the
         // window: whatever they held is dead.
-        @memset(self.stack.items[live_end..@max(args_end, window_end)], value_mod.nilValue());
+        nilSlots(self.stack.items[live_end..@max(args_end, window_end)]);
         // An argument list longer than the window was appended by
         // `callValue` and ends at the window.
         const extent = @max(entry_stack_len, window_end);
         if (self.stack.items.len > extent) self.stack.shrinkRetainingCapacity(extent);
+        if (self.stack.items.len > self.stack_high_water) self.stack_high_water = self.stack.items.len;
 
-        try self.pushFrame(.{
+        self.frames.appendAssumeCapacity(.{
             .routine = routine,
             .base_slot = @intCast(base),
             .entry_stack_len = @intCast(entry_stack_len),
@@ -2280,6 +2304,63 @@ pub const VM = struct {
             .closure = callee,
             .host_result = link.host_result,
         });
+        if (self.frames.items.len > self.frame_high_water) self.frame_high_water = self.frames.items.len;
+    }
+
+    /// `enterClosure` for the common call, a closure called with its
+    /// fixed arity where the frame chain and the stack's capacity have
+    /// room: the frame is pushed without allocating or growing
+    /// anything. Returns the new frame, or null, having changed
+    /// nothing, for a call `enterClosure` has to make. The arguments
+    /// sit at `stack[base..base + argc]`, at or past the stack's
+    /// length, and the frame's pop restores the length as it is.
+    inline fn enterClosureDirect(self: *VM, callee: Value, base: usize, argc: usize, link: Link) ?*Frame {
+        const closure = asClosure(callee);
+        const routine = closure.routine;
+        if (routine.variadic or argc != routine.fixed_arity or closure.upvalues.len != routine.upvalue_count) return null;
+        const depth = self.frames.items.len;
+        if (depth >= self.max_frames or depth == self.frames.capacity) return null;
+        const args_end = base + argc;
+        const window_end = base + routine.slot_count;
+        if (window_end < args_end or window_end > self.stack.capacity) return null;
+        const entry_stack_len = self.stack.items.len;
+        if (window_end > entry_stack_len) {
+            self.stack.items.len = window_end;
+            if (window_end > self.stack_high_water) self.stack_high_water = window_end;
+        }
+        nilSlots(self.stack.items[args_end..window_end]);
+        self.frames.items.len = depth + 1;
+        if (depth + 1 > self.frame_high_water) self.frame_high_water = depth + 1;
+        const frame = &self.frames.items[depth];
+        frame.* = .{
+            .routine = routine,
+            .base_slot = @intCast(base),
+            .entry_stack_len = @intCast(entry_stack_len),
+            .slot_count = routine.slot_count,
+            .return_dst = link.return_dst,
+            .return_pc = link.return_pc,
+            .upvalues = closure.upvalues,
+            .closure = callee,
+            .host_result = link.host_result,
+        };
+        return frame;
+    }
+
+    /// The most arguments `opCall` passes a native from its own buffer.
+    const max_native_args = 8;
+
+    /// Set `slots` to nil: a callee's locals, usually a handful, so
+    /// they are written in place rather than through a `memset` call.
+    inline fn nilSlots(slots: []Value) void {
+        var rest = slots;
+        while (rest.len >= 4) : (rest = rest[4..]) rest[0..4].* = @splat(value_mod.nilValue());
+        switch (rest.len) {
+            0 => {},
+            1 => rest[0] = value_mod.nilValue(),
+            2 => rest[0..2].* = @splat(value_mod.nilValue()),
+            3 => rest[0..3].* = @splat(value_mod.nilValue()),
+            else => unreachable,
+        }
     }
 
     /// Run a compiled top-level `routine` to its `return` as a
@@ -2324,27 +2405,26 @@ pub const VM = struct {
     /// handler, leaves the loop with the frames as they stood. When a
     /// throw unwinds past `depth` the loop ends without its frame's
     /// return, which the caller detects through its result cell.
-    /// The `frame` pointer is scoped to one iteration: `step` may
-    /// grow `frames` and invalidate it.
+    /// Each pass enters the dispatch chain (§8), which runs until the
+    /// loop's frame returns or an instruction fails.
     fn loop(self: *VM, depth: usize) VmError!void {
-        var check_gc = true;
-        while (if (depth == 0) !self.halted else self.frames.items.len > depth) {
-            if (check_gc and self.gcDue()) self.collectGarbage();
-            const frame = self.currentFrame();
-            if (frame.pc >= frame.routine.code.len) return VmError.BytecodeExhausted;
-            const inst = frame.routine.code[frame.pc];
-            frame.pc += 1;
-            if (inst.kind != .primary) return VmError.BytecodeCorruption;
-            check_gc = self.step(frame, inst) catch |err| switch (err) {
+        const outer = self.loop_depth;
+        self.loop_depth = depth;
+        defer self.loop_depth = outer;
+        while (self.running()) {
+            opEnter(self, self.currentFrame(), undefined) catch |err| switch (err) {
                 // A native's throw was caught below it: frames and pc
                 // are already at the handler.
-                VmError.ControlTransferred => true,
-                else => blk: {
-                    try self.handleRuntimeError(err);
-                    break :blk true;
-                },
+                VmError.ControlTransferred => {},
+                else => try self.handleRuntimeError(err),
             };
         }
+    }
+
+    /// Whether the innermost `loop` has more to run: until the VM
+    /// halts at depth 0, else until its frame has returned.
+    inline fn running(self: *const VM) bool {
+        return if (self.loop_depth == 0) !self.halted else self.frames.items.len > self.loop_depth;
     }
 
     /// Pack a `*Var` into a `Value` of kind `.var_`.
@@ -2411,15 +2491,13 @@ pub const VM = struct {
     /// returned pointer is invalidated by any `stack.append` /
     /// `stack.appendNTimes`.
     ///
-    /// Two bounds checks, not one.
-    /// - Logical (`slot_count`): catches bad bytecode.
-    ///   call:call produces overlapping frame windows where
-    ///   `stack.items.len > base_slot + slot_count` for the caller
-    ///   even after the callee has been popped, so the logical
-    ///   check is what defines a frame's visible slot range.
-    /// - Physical (`stack.items.len`): catches corrupt VM/frame
-    ///   state — a stale `slot_count` paired with a shrunken
-    ///   stack would underrun otherwise.
+    /// The bound is the frame's `slot_count`, which catches bad
+    /// bytecode: call:call produces overlapping frame windows where
+    /// `stack.items.len > base_slot + slot_count` for the caller even
+    /// after the callee has been popped, so the logical bound is what
+    /// defines a frame's visible slot range. That the stack covers
+    /// the current frame's window is the frame discipline's invariant
+    /// (§7), asserted, not tested.
     fn slotPtr(self: *VM, slot_index: u12) VmError!*Value {
         return self.slotPtrIn(self.currentFrame(), slot_index);
     }
@@ -2429,9 +2507,15 @@ pub const VM = struct {
     /// through one frame pointer instead of re-deriving it.
     inline fn slotPtrIn(self: *VM, frame: *const Frame, slot_index: u12) VmError!*Value {
         if (slot_index >= frame.slot_count) return VmError.OperandOutOfRange;
+        return self.slotAt(frame, slot_index);
+    }
+
+    /// Slot `slot_index` of `frame`, which the caller has checked
+    /// against `frame.slot_count`.
+    inline fn slotAt(self: *VM, frame: *const Frame, slot_index: u12) *Value {
         const absolute: usize = @as(usize, frame.base_slot) + slot_index;
-        if (absolute >= self.stack.items.len) return VmError.BytecodeCorruption;
-        return &self.stack.items[absolute];
+        std.debug.assert(absolute < self.stack.items.len);
+        return &self.stack.items.ptr[absolute];
     }
 
     /// Resolve an operand to a `Value` (read side).
@@ -2450,7 +2534,29 @@ pub const VM = struct {
 
     /// `resolve` against `frame`, the current frame.
     inline fn resolveIn(self: *VM, frame: *const Frame, op: Operand) VmError!Value {
-        return switch (op.kind) {
+        var tmp: Value = undefined;
+        return (try self.operandPtr(frame, op, &tmp)).*;
+    }
+
+    /// Where `resolveIn(frame, op)` reads its value: the slot or the
+    /// constant in place, found inline, or `tmp`, which every other
+    /// operand is resolved into out of line. The hot handlers read
+    /// through the pointer, so the value never passes through an
+    /// error union.
+    inline fn operandPtr(self: *VM, frame: *const Frame, op: Operand, tmp: *Value) VmError!*const Value {
+        if (op.kind == .slot and op.index < frame.slot_count) return self.slotAt(frame, op.index);
+        if (op.kind == .constant and op.index < frame.routine.consts.len) return &frame.routine.consts[op.index];
+        if (op.kind == .upvalue and op.index < frame.upvalues.len) {
+            const cell = frame.upvalues[op.index];
+            if (cell.initialized) return &cell.value;
+        }
+        try self.resolveOther(frame, op, tmp);
+        return tmp;
+    }
+
+    /// `resolveIn` of the operands its inline cases leave, into `out`.
+    noinline fn resolveOther(self: *VM, frame: *const Frame, op: Operand, out: *Value) VmError!void {
+        out.* = switch (op.kind) {
             .slot => (try self.slotPtrIn(frame, op.index)).*,
             .constant => blk: {
                 const consts = frame.routine.consts;
@@ -2473,16 +2579,16 @@ pub const VM = struct {
             .var_ => blk: {
                 const var_table = frame.routine.var_table;
                 if (op.index >= var_table.len) return VmError.OperandOutOfRange;
-                break :blk var_table[op.index].current() orelse VmError.UnboundVar;
+                break :blk var_table[op.index].current() orelse return VmError.UnboundVar;
             },
             // Kinds no opcode reads through `resolve`.
-            .intern, .durable => VmError.UnimplementedOpcode,
+            .intern, .durable => return VmError.UnimplementedOpcode,
             // `unused` is a sentinel emitted by the assembler for
             // operand slots the opcode doesn't consume; calling
             // `resolve` on one is an opcode-handler bug.
-            .unused => VmError.InvalidOperandKind,
+            .unused => return VmError.InvalidOperandKind,
             // Unrecognized kind bit pattern — bytecode corruption.
-            _ => VmError.BytecodeCorruption,
+            _ => return VmError.BytecodeCorruption,
         };
     }
 
@@ -2509,8 +2615,18 @@ pub const VM = struct {
         return self.storeIn(self.currentFrame(), op, v);
     }
 
-    /// `store` against `frame`, the current frame.
+    /// `store` against `frame`, the current frame: a slot in range
+    /// inline, every other case out of line.
     inline fn storeIn(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
+        if (op.kind == .slot and op.index < frame.slot_count) {
+            self.slotAt(frame, op.index).* = v;
+            return;
+        }
+        return storeOther(self, frame, op, v);
+    }
+
+    /// `storeIn` of the operands its inline case leaves.
+    noinline fn storeOther(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
         switch (op.kind) {
             .slot => (try self.slotPtrIn(frame, op.index)).* = v,
             .upvalue => return VmError.UnimplementedOpcode,
@@ -2726,47 +2842,349 @@ pub const VM = struct {
         try self.unwindThrow(payload, origin);
     }
 
-    /// One instruction, fetched from `frame`: the two-level switch
-    /// of VM.md §8, on the group and then in each handler on the
-    /// variant. The groups that never allocate and never push or pop
-    /// a frame (`mov`, `cmp`, `jump`, `var`) run against `frame`
-    /// directly; `math` allocates only on the heap and runs the same
-    /// way; the others re-derive the frame. Returns whether the
-    /// instruction could have allocated, which is when the next safe
-    /// point has to test for a due collection: the heap's counter
-    /// cannot move otherwise.
-    inline fn step(self: *VM, frame: *Frame, inst: Inst) VmError!bool {
-        switch (inst.groupOf()) {
-            .mov => try self.execMov(frame, inst),
-            .cmp => try self.execCmp(frame, inst),
-            .jump => try self.execJump(frame, inst),
-            .var_ => try self.execVar(frame, inst),
-            .math => {
-                try self.execMath(frame, inst);
-                return true;
-            },
-            .call => {
-                try self.execCall(inst);
-                return true;
-            },
-            .closure => {
-                try self.execClosure(inst);
-                return true;
-            },
-            .coll => {
-                try self.execColl(inst);
-                return true;
-            },
-            .ctrl => {
-                try self.execCtrl(inst);
-                return true;
-            },
-            // Known groups with no implemented variants.
-            .transient, .hash, .tx, .io, .simd => return VmError.UnimplementedOpcode,
-            // Unrecognized group byte — bytecode corruption.
-            _ => return VmError.BytecodeCorruption,
+    // -------------------------------------------------------------------------
+    // Dispatch (VM.md §8)
+    //
+    // Threaded code: a handler runs its instruction, fetches the next
+    // one itself and tail-calls that instruction's handler through
+    // `op_table`, indexed by group and variant together, so an
+    // instruction costs one indirect branch and the native stack does
+    // not grow with the instructions run. A handler returns only to
+    // leave the chain: with an error, which `loop` translates or
+    // passes on, or once `running` says the loop's frame has returned.
+    // Every handler has the one signature `@call(.always_tail, ...)`
+    // requires of caller and callee.
+    // -------------------------------------------------------------------------
+
+    const OpHandler = *const fn (*VM, *Frame, Inst) VmError!void;
+
+    /// An instruction's index into `op_table`: its group and variant
+    /// bits, `group | variant << 6`.
+    inline fn opIndex(inst: Inst) u12 {
+        return @truncate(@as(u64, @bitCast(inst)) >> 4);
+    }
+
+    fn opcode(g: Group, variant: anytype) u12 {
+        return @as(u12, @intFromEnum(g)) | @as(u12, @intFromEnum(variant)) << 6;
+    }
+
+    /// The handler of every opcode: its group's, which switches on
+    /// the variant, or one of its own for the hot variants. A group
+    /// outside the enum is corrupt; the groups with no executed
+    /// variant trap.
+    const op_table: [4096]OpHandler = blk: {
+        @setEvalBranchQuota(20_000);
+        var t = [_]OpHandler{&opCorrupt} ** 4096;
+        const groups = .{
+            .{ Group.jump, &opJump },
+            .{ Group.cmp, &opCmp },
+            .{ Group.math, &opMath },
+            .{ Group.mov, &opMov },
+            .{ Group.call, &opCallGroup },
+            .{ Group.closure, &opClosure },
+            .{ Group.var_, &opVar },
+            .{ Group.coll, &opColl },
+            .{ Group.transient, &opUnimplemented },
+            .{ Group.hash, &opUnimplemented },
+            .{ Group.tx, &opUnimplemented },
+            .{ Group.ctrl, &opCtrl },
+            .{ Group.io, &opUnimplemented },
+            .{ Group.simd, &opUnimplemented },
+        };
+        for (groups) |g| {
+            for (0..64) |v| t[@as(u12, @intFromEnum(g[0])) | @as(u12, v) << 6] = g[1];
         }
-        return false;
+        t[opcode(.mov, Mov.move)] = &opMove;
+        t[opcode(.mov, Mov.load_const)] = &opLoadConst;
+        t[opcode(.jump, Jump.jmp)] = &opJmp;
+        t[opcode(.jump, Jump.if_false)] = &opIfFalse;
+        t[opcode(.jump, Jump.if_true)] = &opIfTrue;
+        for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = cmpHandler(c);
+        t[opcode(.math, Math.add)] = mathHandler(.add);
+        t[opcode(.math, Math.sub)] = mathHandler(.sub);
+        t[opcode(.math, Math.mul)] = mathHandler(.mul);
+        t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
+        t[opcode(.call, Call.call)] = &opCall;
+        t[opcode(.call, Call.@"return")] = &opReturn;
+        t[opcode(.call, Call.return_nil)] = &opReturnNil;
+        break :blk t;
+    };
+
+    /// Fetch `frame`'s next instruction and tail-call its handler.
+    inline fn next(self: *VM, frame: *Frame) VmError!void {
+        const code = frame.routine.code;
+        const pc = frame.pc;
+        if (pc >= code.len) return VmError.BytecodeExhausted;
+        const inst = code[pc];
+        frame.pc = pc + 1;
+        if (inst.kind != .primary) return VmError.BytecodeCorruption;
+        return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst });
+    }
+
+    /// `next` after an instruction that could allocate: the safe
+    /// point (§9).
+    inline fn nextSafe(self: *VM, frame: *Frame) VmError!void {
+        if (self.gcDue()) self.collectGarbage();
+        return self.next(frame);
+    }
+
+    /// `next` after an instruction that could pop or unwind frames or
+    /// halt: the chain ends when the loop's frame has returned.
+    inline fn nextFrame(self: *VM) VmError!void {
+        if (!self.running()) return;
+        if (self.gcDue()) self.collectGarbage();
+        return self.next(self.currentFrame());
+    }
+
+    /// Where `loop` enters the chain: a safe point, then the current
+    /// frame's next instruction.
+    fn opEnter(self: *VM, frame: *Frame, _: Inst) VmError!void {
+        return self.nextSafe(frame);
+    }
+
+    fn opCorrupt(_: *VM, _: *Frame, _: Inst) VmError!void {
+        return VmError.BytecodeCorruption;
+    }
+
+    fn opUnimplemented(_: *VM, _: *Frame, _: Inst) VmError!void {
+        return VmError.UnimplementedOpcode;
+    }
+
+    // The group handlers. `mov`, `cmp`, `jump` and `var` neither
+    // allocate nor push or pop a frame, so they run against the
+    // frame the fetch took and skip the safe point; `math`, `closure`
+    // and `coll` allocate on the heap only; `call` and `ctrl` may
+    // change the frame chain.
+
+    fn opMov(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execMov(frame, inst);
+        return self.next(frame);
+    }
+
+    fn opCmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execCmp(frame, inst);
+        return self.next(frame);
+    }
+
+    fn opJump(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execJump(frame, inst);
+        return self.next(frame);
+    }
+
+    fn opVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execVar(frame, inst);
+        return self.next(frame);
+    }
+
+    fn opMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execMath(frame, inst);
+        return self.nextSafe(frame);
+    }
+
+    fn opClosure(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execClosure(inst);
+        return self.nextSafe(frame);
+    }
+
+    fn opColl(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execColl(inst);
+        return self.nextSafe(frame);
+    }
+
+    fn opCallGroup(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execCall(frame, inst);
+        return self.nextFrame();
+    }
+
+    fn opCtrl(self: *VM, _: *Frame, inst: Inst) VmError!void {
+        try self.execCtrl(inst);
+        return self.nextFrame();
+    }
+
+    // The hot variants' own handlers: the same effect and traps as
+    // their group's, without its switch.
+
+    fn opMove(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        var tmp: Value = undefined;
+        try self.storeIn(frame, inst.a, (try self.operandPtr(frame, inst.b, &tmp)).*);
+        return self.next(frame);
+    }
+
+    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        const consts = frame.routine.consts;
+        const i = inst.wide();
+        if (i >= consts.len) return VmError.OperandOutOfRange;
+        try self.storeIn(frame, inst.a, consts[i]);
+        return self.next(frame);
+    }
+
+    fn opJmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try applyJump(frame, inst.wide());
+        return self.next(frame);
+    }
+
+    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        var tmp: Value = undefined;
+        if ((try self.operandPtr(frame, inst.a, &tmp)).isFalsy()) try applyJump(frame, inst.wide());
+        return self.next(frame);
+    }
+
+    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        var tmp: Value = undefined;
+        if ((try self.operandPtr(frame, inst.a, &tmp)).isTruthy()) try applyJump(frame, inst.wide());
+        return self.next(frame);
+    }
+
+    fn opLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        try self.execVarLoadVar(frame, inst);
+        return self.next(frame);
+    }
+
+    /// The low half of a conditional jump testing `test_op`: what
+    /// `cmpHandler` looks for after its comparison.
+    fn condJumpKey(variant: Jump, test_op: Operand) u32 {
+        const lo: u32 = @truncate(@as(u64, @bitCast(Inst.primaryWide(.jump, variant, Operand.none, 0))));
+        return (lo & 0xFFFF) | @as(u32, @as(u16, @bitCast(test_op))) << 16;
+    }
+
+    /// `cmp:<c>`: two fixnums compare inline, anything else through
+    /// the numeric tower. When the next instruction is a conditional
+    /// jump on the slot just written, the compiler's lowering of an
+    /// `if` on a comparison, it runs here too: the pair costs one
+    /// dispatch, and pc, the slot and every trap are what running
+    /// the two in turn leaves.
+    fn cmpHandler(comptime c: NumCmp) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                var lhs_tmp: Value = undefined;
+                var rhs_tmp: Value = undefined;
+                const lhs = try self.operandPtr(frame, inst.b, &lhs_tmp);
+                const rhs = try self.operandPtr(frame, inst.c, &rhs_tmp);
+                const holds_ = if (lhs.isFixnum() and rhs.isFixnum())
+                    ordered(i64, c, lhs.asFixnum(), rhs.asFixnum())
+                else
+                    try self.compareNumbers(c, lhs.*, rhs.*);
+                try self.storeIn(frame, inst.a, value_mod.fromBool(holds_));
+                const code = frame.routine.code;
+                if (frame.pc < code.len) {
+                    const j = code[frame.pc];
+                    const lo: u32 = @truncate(@as(u64, @bitCast(j)));
+                    const taken = if (lo == condJumpKey(.if_false, inst.a))
+                        !holds_
+                    else if (lo == condJumpKey(.if_true, inst.a))
+                        holds_
+                    else
+                        return self.next(frame);
+                    frame.pc += 1;
+                    if (taken) try applyJump(frame, j.wide());
+                }
+                return self.next(frame);
+            }
+        }.run;
+    }
+
+    /// `math:<op>` for `+`, `-` and `*`: two fixnums whose result is
+    /// a fixnum compute inline and allocate nothing; anything else,
+    /// a promotion included, goes through the numeric tower.
+    fn mathHandler(comptime op: Math) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                var lhs_tmp: Value = undefined;
+                var rhs_tmp: Value = undefined;
+                const lhs_p = try self.operandPtr(frame, inst.b, &lhs_tmp);
+                const rhs_p = try self.operandPtr(frame, inst.c, &rhs_tmp);
+                if (lhs_p.isFixnum() and rhs_p.isFixnum()) {
+                    const x = lhs_p.asFixnum();
+                    const y = rhs_p.asFixnum();
+                    // i48 operands: a sum or difference cannot leave
+                    // i64, and a product that does is not a fixnum.
+                    const r = switch (op) {
+                        .add => x + y,
+                        .sub => x - y,
+                        .mul => blk: {
+                            const p = @mulWithOverflow(x, y);
+                            break :blk if (p[1] == 0) p[0] else value_mod.fixnum_max + 1;
+                        },
+                        else => comptime unreachable,
+                    };
+                    if (value_mod.fromFixnum(r)) |v| {
+                        try self.storeIn(frame, inst.a, v);
+                        return self.next(frame);
+                    }
+                }
+                try self.storeIn(frame, inst.a, try self.arithmetic(op, lhs_p.*, rhs_p.*));
+                return self.nextSafe(frame);
+            }
+        }.run;
+    }
+
+    /// `call:call`. The common calls run here: a closure called with
+    /// its fixed arity where the frame chain and the stack have room,
+    /// whose frame is pushed without allocating, so its callee starts
+    /// without a safe point; and a native within its arity. Every
+    /// other call, and every call that traps, goes through
+    /// `execCallCall`.
+    fn opCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        fast: {
+            if (inst.a.kind != .slot or inst.c.kind != .slot) break :fast;
+            const call_base: u32 = inst.a.index;
+            const argc: u32 = inst.b.index;
+            if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) break :fast;
+            const callee = self.slotAt(frame, inst.a.index).*;
+            const base: usize = @as(usize, frame.base_slot) + call_base + 1;
+            switch (callee.kind()) {
+                .function => {
+                    const callee_frame = self.enterClosureDirect(callee, base, argc, .{
+                        .return_dst = inst.c.index,
+                        .return_pc = frame.pc,
+                    }) orelse break :fast;
+                    return self.next(callee_frame);
+                },
+                .native_fn => {
+                    const native = asNativeFn(callee);
+                    const max: usize = native.max_arity orelse max_native_args;
+                    if (argc < native.min_arity or argc > max or argc > max_native_args) break :fast;
+                    // The arguments are copied off the stack, which the
+                    // native may grow by re-entering the VM; the slots
+                    // keep them rooted. A whole buffer copies inline
+                    // where the stack's capacity covers it.
+                    var buf: [max_native_args]Value = undefined;
+                    if (base + max_native_args <= self.stack.capacity) {
+                        buf = self.stack.items.ptr[base..][0..max_native_args].*;
+                    } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+                    const overflows = dispatch_mod.overflowCount();
+                    const result = native.call(self, buf[0..argc]) catch |err| {
+                        dispatch_mod.rewindOverflows(overflows);
+                        return err;
+                    };
+                    try self.checkDeepData(overflows);
+                    // The native may have grown `frames`: the caller is
+                    // the current frame again, not necessarily at `frame`.
+                    const caller = self.currentFrame();
+                    self.slotAt(caller, inst.c.index).* = result;
+                    return self.nextSafe(caller);
+                },
+                else => break :fast,
+            }
+        }
+        try self.execCallCall(frame, inst);
+        // A call pushes a frame or runs a callee to completion, so the
+        // loop's frame is still running.
+        return self.nextSafe(self.currentFrame());
+    }
+
+    fn opReturn(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        // Read the value while the callee frame is still active;
+        // popping first would invalidate the slot.
+        try self.returnValue(try self.resolveIn(frame, inst.a));
+        if (!self.running()) return;
+        return self.next(self.currentFrame());
+    }
+
+    fn opReturnNil(self: *VM, _: *Frame, _: Inst) VmError!void {
+        try self.returnValue(value_mod.nilValue());
+        if (!self.running()) return;
+        return self.next(self.currentFrame());
     }
 
     // -------------------------------------------------------------------------
@@ -2805,10 +3223,10 @@ pub const VM = struct {
     // Group `call` (VM.md §10.2)
     // -------------------------------------------------------------------------
 
-    fn execCall(self: *VM, inst: Inst) VmError!void {
+    fn execCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Call = @enumFromInt(inst.variant);
         switch (variant) {
-            .call => try self.execCallCall(inst),
+            .call => try self.execCallCall(frame, inst),
             .@"return" => try self.execCallReturn(inst),
             .return_nil => try self.execCallReturnNil(),
             // tailcall is unimplemented; `recur` compiles to a
@@ -2825,7 +3243,7 @@ pub const VM = struct {
     /// the caller resumes at the instruction following this one. Any
     /// other callee runs to completion here and its value lands in
     /// `slot[C]` at once.
-    fn execCallCall(self: *VM, inst: Inst) VmError!void {
+    fn execCallCall(self: *VM, caller: *Frame, inst: Inst) VmError!void {
         // A and C are slot operands; B is a raw-index immediate
         // (§4.5).
         if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
@@ -2833,7 +3251,6 @@ pub const VM = struct {
         const argc: u32 = inst.b.index;
         const result_dst: u12 = inst.c.index;
 
-        const caller = self.currentFrame();
         if (call_base + 1 + argc > caller.slot_count) return VmError.CallBlockOutOfRange;
         if (result_dst >= caller.slot_count) return VmError.OperandOutOfRange;
         const callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
@@ -2909,24 +3326,26 @@ pub const VM = struct {
     /// Frame metadata is validated before anything is mutated so
     /// a corrupt frame surfaces an error, not a half-popped VM.
     fn returnValue(self: *VM, return_value: Value) VmError!void {
-        const callee = self.frames.items[self.frames.items.len - 1];
+        const n = self.frames.items.len;
+        const callee = &self.frames.items[n - 1];
         if (callee.host_result) |hr| {
             hr.value = return_value;
             hr.done = true;
             _ = self.popFrame();
             return;
         }
-        if (self.frames.items.len == 1) {
+        if (n == 1) {
             self.result = return_value;
             self.halted = true;
             return;
         }
-        const caller = self.frames.items[self.frames.items.len - 2];
+        const caller = &self.frames.items[n - 2];
         if (callee.return_dst >= caller.slot_count) return VmError.OperandOutOfRange;
         const absolute: usize = @as(usize, caller.base_slot) + callee.return_dst;
-        _ = self.popFrame();
+        caller.pc = callee.return_pc;
+        self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
+        self.frames.items.len = n - 1;
         self.stack.items[absolute] = return_value;
-        self.frames.items[self.frames.items.len - 1].pc = callee.return_pc;
     }
 
     // -------------------------------------------------------------------------
@@ -3136,8 +3555,14 @@ pub const VM = struct {
             .neg, .abs => value_mod.fromFixnum(0).?,
             else => try self.resolveIn(frame, inst.c),
         };
+        try self.storeIn(frame, inst.a, try self.arithmetic(variant, lhs, rhs));
+    }
+
+    /// The `math:<variant>` of `lhs` and `rhs` (`rhs` ignored by the
+    /// unary variants) through the numeric tower.
+    fn arithmetic(self: *VM, variant: Math, lhs: Value, rhs: Value) VmError!Value {
         const heap = self.ensureHeap();
-        const result = switch (variant) {
+        return switch (variant) {
             .add => numAdd(heap, lhs, rhs),
             .sub => numSub(heap, lhs, rhs),
             .mul => numMul(heap, lhs, rhs),
@@ -3157,7 +3582,6 @@ pub const VM = struct {
             .mod => "mod",
             else => "abs",
         }, lhs, rhs);
-        try self.storeIn(frame, inst.a, result);
     }
 
     // -------------------------------------------------------------------------
@@ -3169,14 +3593,18 @@ pub const VM = struct {
         const cmp = std.enums.fromInt(NumCmp, inst.variant) orelse return VmError.BytecodeCorruption;
         const lhs = try self.resolveIn(frame, inst.b);
         const rhs = try self.resolveIn(frame, inst.c);
-        const holds_ = numCompare(cmp, lhs, rhs) catch |err| return self.numericError(err, switch (cmp) {
+        try self.storeIn(frame, inst.a, value_mod.fromBool(try self.compareNumbers(cmp, lhs, rhs)));
+    }
+
+    /// `numCompare`, with the report naming the operator.
+    fn compareNumbers(self: *VM, cmp: NumCmp, lhs: Value, rhs: Value) VmError!bool {
+        return numCompare(cmp, lhs, rhs) catch |err| return self.numericError(err, switch (cmp) {
             .lt => "<",
             .lte => "<=",
             .gt => ">",
             .gte => ">=",
             .eq => "==",
         }, lhs, rhs);
-        try self.storeIn(frame, inst.a, value_mod.fromBool(holds_));
     }
 
     /// `err` from the numeric operation `op` on `lhs` and `rhs`; a
@@ -4671,6 +5099,66 @@ test "VM opcodes: jump" {
     });
 }
 
+test "VM dispatch: a comparison and the conditional jump on its slot" {
+    const lt = asm_.cmpLt;
+    try expectRuns(comptime &[_]RunCase{
+        // (if (< 1 2) 10 20), and the pair not taken.
+        .{ .name = "if-false not taken", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = true_v } },
+        .{ .name = "if-false taken", .code = &.{ lt(0, kn(1), kn(0)), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = fx(20) } },
+        .{ .name = "if-true taken", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfTrue(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = fx(20) } },
+        .{ .name = "if-true not taken", .code = &.{ lt(0, kn(1), kn(0)), asm_.jumpIfTrue(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = false_v } },
+        // The jump taken still leaves the comparison in its slot.
+        .{ .name = "the slot keeps the boolean", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfTrue(2, sl(0)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
+        // Floats compare through the tower, then branch the same way.
+        .{ .name = "float operands", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fl(2.5), fx(2), fx(20) }, .want = .{ .value = fx(20) } },
+        // A jump testing another slot tests that slot.
+        .{ .name = "a jump on another slot", .code = &.{ asm_.loadNil(1), lt(0, kn(0), kn(1)), asm_.jumpIfFalse(4, sl(1)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .slots = 2, .want = .{ .value = fx(20) } },
+        .{ .name = "a comparison ending the code", .code = &.{lt(0, kn(0), kn(1))}, .consts = &.{ fx(1), fx(2) }, .want = .{ .err = VmError.BytecodeExhausted } },
+        .{ .name = "the jump's target past the code", .code = &.{ lt(0, kn(1), kn(0)), asm_.jumpIfFalse(9, sl(0)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2) }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "a non-number before the jump", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfFalse(2, sl(0)), asm_.returnSlot(0) }, .consts = &.{ true_v, fx(2) }, .want = .{ .err = VmError.KindMismatch } },
+    });
+}
+
+test "VM dispatch: a trap in a fused pair names its own instruction" {
+    // The jump's target is past the code: the trace names the jump
+    // (pc 1), not the comparison it ran with.
+    const bad_jump = [_]Inst{ asm_.cmpLt(0, kn(1), kn(0)), asm_.jumpIfFalse(9, sl(0)), asm_.returnSlot(0) };
+    // A non-number: the trace names the comparison (pc 0).
+    const bad_cmp = [_]Inst{ asm_.cmpLt(0, kn(2), kn(0)), asm_.jumpIfFalse(2, sl(0)), asm_.returnSlot(0) };
+    const consts = [_]Value{ fx(1), fx(2), true_v };
+    for ([_]struct { []const Inst, VmError, u32 }{
+        .{ &bad_jump, VmError.OperandOutOfRange, 1 },
+        .{ &bad_cmp, VmError.KindMismatch, 0 },
+    }) |case| {
+        const routine = makeRoutine(case[0], &consts, 1, "fused");
+        var vm = try VM.init(testing.allocator, &routine);
+        defer vm.deinit();
+        try testing.expectError(case[1], vm.run());
+        try testing.expectEqual(@as(usize, 1), vm.error_trace.items.len);
+        try testing.expectEqual(case[2], vm.error_trace.items[0].pc);
+    }
+}
+
+test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
+    const mul = struct {
+        fn f(dst: u12, lhs: Operand, rhs: Operand) Inst {
+            return Inst.primary(.math, Math.mul, Operand.slot(dst), lhs, rhs);
+        }
+    }.f;
+    const sub = struct {
+        fn f(dst: u12, lhs: Operand, rhs: Operand) Inst {
+            return Inst.primary(.math, Math.sub, Operand.slot(dst), lhs, rhs);
+        }
+    }.f;
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "a product past i48", .code = &.{ mul(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(value_mod.fixnum_max), fx(2) }, .want = .{ .decimal = "281474976710654" } },
+        // Past i64 too: the fast path's overflow check hands it on.
+        .{ .name = "a product past i64", .code = &.{ mul(0, kn(0), kn(0)), asm_.returnSlot(0) }, .consts = &.{fx(value_mod.fixnum_min)}, .want = .{ .decimal = "19807040628566084398385987584" } },
+        .{ .name = "a difference below i48", .code = &.{ sub(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(value_mod.fixnum_min), fx(1) }, .want = .{ .decimal = "-140737488355329" } },
+        .{ .name = "a product in range", .code = &.{ mul(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(-12), fx(12) }, .want = .{ .value = fx(-144) } },
+    });
+}
+
 test "VM jump: targets and constants past the 16-bit range" {
     // 70,000 instructions: the jump at pc 0 lands at pc 69,997,
     // which loads constant 69,000 and returns it.
@@ -6059,6 +6547,113 @@ test "VM cells: placeholder pattern — new-cell + make + init enables self-recu
     // (same routine pointer).
     const c = VM.asClosure(result);
     try testing.expectEqual(&child_routine, c.routine);
+}
+
+test "VM dispatch: calls and closures under a collection every few kilobytes" {
+    // A closure over a boxed 1, made and called 500 times: each
+    // iteration allocates a closure, so the stress policy collects
+    // between calls, and the cell, the closures in flight and the
+    // frames must all survive it.
+    const child_code = [_]Inst{ asm_.mathAdd(1, sl(0), Operand.upvalue(0)), asm_.returnSlot(1) };
+    const child = Routine{ .code = &child_code, .consts = &.{}, .slot_count = 2, .fixed_arity = 1, .upvalue_count = 1 };
+    const caps = [_]CaptureDescriptor{.{ .routine = &child, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} }};
+    const code = [_]Inst{
+        asm_.loadConst(0, 2), // s0 = 1, boxed
+        asm_.closureBoxLocal(0),
+        asm_.loadConst(1, 0), // i
+        asm_.loadConst(2, 0), // acc
+        asm_.cmpLt(3, sl(1), kn(1)), // 4
+        asm_.jumpIfFalse(12, sl(3)),
+        asm_.closureMake(0, 3),
+        asm_.move(4, 1),
+        asm_.callCall(3, 1, 4), // s4 = i + 1
+        asm_.mathAdd(2, sl(2), sl(4)),
+        asm_.mathAdd(1, sl(1), kn(2)),
+        asm_.jumpJmp(4),
+        asm_.returnSlot(2), // 12
+    };
+    const consts = [_]Value{ fx(0), fx(500), fx(1) };
+    var routine = makeRoutine(&code, &consts, 5, "gc-calls");
+    routine.capture_descs = &caps;
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    vm.gc_threshold = GcPolicy.stress.threshold;
+    vm.gc_growth_percent = GcPolicy.stress.growth_percent;
+    vm.gc_next_at = GcPolicy.stress.threshold;
+    try testing.expectEqual(@as(i64, 125_250), (try vm.run()).asFixnum());
+    try testing.expect(vm.gc_cycles > 0);
+}
+
+const dispatch_test_natives = struct {
+    fn boom(vm: *VM, _: []const Value) VmError!Value {
+        return vm.throwKeyword("boom");
+    }
+    fn callArg(vm: *VM, args: []const Value) VmError!Value {
+        return vm.callValue(args[0], args[1..]);
+    }
+    const native_boom = NativeFn{ .name = "boom", .min_arity = 0, .max_arity = 0, .call = &boom };
+    const native_call = NativeFn{ .name = "call", .min_arity = 1, .max_arity = null, .call = &callArg };
+};
+
+test "VM dispatch: a native's throw two loops deep reaches the handler below" {
+    // (try (call (fn [] (boom))) (catch any e e)), then a call after
+    // the catch: the throw leaves the nested run `callValue` started
+    // and the native that started it, and the outer run carries on.
+    const child_code = [_]Inst{ asm_.loadConst(0, 0), asm_.callCall(0, 0, 1), asm_.returnSlot(1) };
+    const child_consts = [_]Value{nativeFnValue(&dispatch_test_natives.native_boom)};
+    const child = Routine{ .code = &child_code, .consts = &child_consts, .slot_count = 2 };
+    const ret7_code = [_]Inst{ asm_.loadConst(0, 0), asm_.returnSlot(0) };
+    const ret7_consts = [_]Value{fx(7)};
+    const ret7 = Routine{ .code = &ret7_code, .consts = &ret7_consts, .slot_count = 1 };
+    const caps = [_]CaptureDescriptor{ .{ .routine = &child, .sources = &.{} }, .{ .routine = &ret7, .sources = &.{} } };
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.loadConst(2, 0),
+        asm_.closureMake(0, 3),
+        asm_.callCall(2, 1, 4),
+        asm_.returnNil(),
+        asm_.move(0, 1), // 5: the catch
+        asm_.tryExit(7),
+        asm_.closureMake(1, 2), // 7
+        asm_.callCall(2, 0, 1),
+        Inst.primary(.coll, CollOp.vector, sl(0), Operand.slot(2), sl(4)), // [e 7]
+        asm_.returnSlot(4),
+    };
+    const consts = [_]Value{nativeFnValue(&dispatch_test_natives.native_call)};
+    var routine = makeRoutine(&code, &consts, 5, "two-loops");
+    routine.capture_descs = &caps;
+    routine.tries = &.{.{ .catch_pc = 5 }};
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    const result = try vm.run();
+    try testing.expectEqual(@as(usize, 2), vector_mod.count(result));
+    try testing.expect(vector_mod.nth(result, 0).isKeyword());
+    try testing.expectEqual(@as(i64, 7), vector_mod.nth(result, 1).asFixnum());
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+}
+
+test "VM dispatch: recursion stops at max_frames on the direct call path" {
+    // (letfn [(f [] (f))] (f)) with room for 50 frames.
+    const child_code = [_]Inst{ asm_.moveFrom(0, Operand.upvalue(0)), asm_.callCall(0, 0, 1), asm_.returnSlot(1) };
+    const child = Routine{ .code = &child_code, .consts = &.{}, .slot_count = 2, .upvalue_count = 1 };
+    const caps = [_]CaptureDescriptor{.{ .routine = &child, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} }};
+    const code = [_]Inst{
+        asm_.closureNewCell(0),
+        asm_.closureMake(0, 1),
+        asm_.closureInitCell(0, sl(1)),
+        asm_.callCall(1, 0, 2),
+        asm_.returnSlot(2),
+    };
+    var routine = makeRoutine(&code, &.{}, 3, "runaway");
+    routine.capture_descs = &caps;
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    vm.max_frames = 50;
+    try testing.expectError(VmError.StackOverflow, vm.run());
+    try testing.expectEqual(@as(usize, 50), vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 50), vm.frame_high_water);
 }
 
 test "VM closure call: same closure called twice — both invocations succeed" {
