@@ -255,12 +255,18 @@ constant pool, Var table, capture descriptors, span table,
   | constants | 2^32; the first 4096 read in place as `c` operands | a constant past 4095 is loaded into a slot with `mov:load-const` |
   | Var-table entries | 2^32; the first 4096 read in place as `v` operands | a Var past 4095 is loaded into a slot with `var:load-var` |
   | capture descriptors (the `fn*` forms in it) | 2^32 | none reachable |
+  | the items of a call, or of a computed collection literal | none | built in chunks (below) |
   | slots live at once | 4096 | `SlotOverflow`: `fn NAME: more than 4096 local slots` |
   | upvalues (distinct captured names) | 4096 | `SlotOverflow`: `fn NAME: more than 4096 captured locals` |
 
-  Slots live at once are the bindings in scope, the temporaries of
-  the form being computed and the block of a call or computed
-  collection, one slot per item.
+  A call or computed collection whose slot block does not fit below
+  slot 4096 is built in chunks of 256 items, left to right, each
+  chunk a `coll:*` block poured into an accumulator with
+  `nexis.core/into`: a vector, map or set is the accumulator; a list
+  or `#%concat` is `(apply list acc)`; a call is `(apply f acc)`, the
+  callee evaluated first. What stays out of reach is more than 4096
+  slots live at once (the bindings in scope and the temporaries of
+  the form being computed) and a closure over more than 4096 names.
   Each error is reported at the innermost form being compiled when it
   is raised, with a detail naming the routine (`fn NAME`, `anonymous
   fn` or `top-level form`) and the limit (§7).

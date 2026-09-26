@@ -2578,11 +2578,87 @@ fn compileExpr(
 /// `coll:<op>` over the items, each compiled into its slot of one
 /// block reserved up front: a per-item allocation would interleave
 /// with the items' own temporaries and break the block's contiguity.
+/// Items too many for one block are built in chunks.
 fn compileColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
-    const base = if (items.len == 0) dst else try e.allocSlotBlock(items.len);
+    if (!e.blockFits(items.len)) return compileChunkedColl(e, op, items, dst);
     const argc: u12 = @intCast(items.len);
+    const base = if (argc == 0) dst else try e.allocSlotBlock(argc);
     for (items, 0..) |item, i| try compileExpr(e, item, base + @as(u12, @intCast(i)), null);
     try e.emit(Inst.primary(.coll, op, Operand.slot(base), .{ .kind = .unused, .index = argc }, Operand.slot(dst)));
+}
+
+/// Items per chunk of a call or collection too large for one slot
+/// block (COMPILER.md §4.4); even, so a map's pairs stay whole.
+const chunk_items = 256;
+
+/// A collection of more items than fit in one slot block: the items
+/// in order, `chunk_items` at a time, each chunk built by `coll:*`
+/// and poured into an accumulator with `nexis.core/into`; a list
+/// comes out of `(apply list acc)`.
+fn compileChunkedColl(e: *Emitter, op: vm.CollOp, items: []const *const Tiny, dst: u12) CompileError!void {
+    const acc = switch (op) {
+        .vector => try accumulate(e, .vector, .vector, items),
+        .map => try accumulate(e, .map, .map, items),
+        .set => try accumulate(e, .set, .set, items),
+        .list => try accumulate(e, .vector, .vector, items),
+        .concat => try accumulate(e, .vector, .concat, items),
+        _ => return CompileError.InternalCompilerBug,
+    };
+    switch (op) {
+        .list, .concat => try callCore(e, "apply", &.{ .{ .core = "list" }, .{ .slot = acc } }, dst),
+        else => try e.emit(vm.asm_.move(dst, acc)),
+    }
+}
+
+/// A call of more arguments than fit in one slot block:
+/// `(apply callee args)`, the callee evaluated first and the
+/// arguments gathered into a vector in chunks.
+fn compileChunkedCall(e: *Emitter, callee: *const Tiny, args: []const *const Tiny, dst: u12) CompileError!void {
+    const f = try e.allocSlot();
+    try compileExpr(e, callee, f, null);
+    const acc = try accumulate(e, .vector, .vector, args);
+    try callCore(e, "apply", &.{ .{ .slot = f }, .{ .slot = acc } }, dst);
+}
+
+/// A fresh slot holding the `acc_op` collection of `items`: an empty
+/// one, then `(into acc chunk)` for each `chunk_op` chunk in order.
+fn accumulate(e: *Emitter, acc_op: vm.CollOp, chunk_op: vm.CollOp, items: []const *const Tiny) CompileError!u12 {
+    const acc = try e.allocSlot();
+    try e.emit(Inst.primary(.coll, acc_op, Operand.slot(acc), .{ .kind = .unused, .index = 0 }, Operand.slot(acc)));
+    var start: usize = 0;
+    while (start < items.len) : (start += chunk_items) {
+        const mark = e.slot_top;
+        defer e.slot_top = mark;
+        const chunk = try e.allocSlot();
+        try compileColl(e, chunk_op, items[start..@min(start + chunk_items, items.len)], chunk);
+        try callCore(e, "into", &.{ .{ .slot = acc }, .{ .slot = chunk } }, acc);
+    }
+    return acc;
+}
+
+/// An argument of `callCore`: a slot's value, or a core Var's.
+const CoreArg = union(enum) { slot: u12, core: []const u8 };
+
+/// `(nexis.core/<name> args...)` into `dst`. Without the core
+/// namespace there is no way to build what does not fit in slots.
+fn callCore(e: *Emitter, name: []const u8, args: []const CoreArg, dst: u12) CompileError!void {
+    const base = try e.allocSlotBlock(1 + args.len);
+    try loadCore(e, name, base);
+    for (args, 1..) |arg, i| {
+        const slot = base + @as(u12, @intCast(i));
+        switch (arg) {
+            .slot => |s| try e.emit(vm.asm_.move(slot, s)),
+            .core => |n| try loadCore(e, n, slot),
+        }
+    }
+    try e.emit(vm.asm_.callCall(base, @intCast(args.len), dst));
+}
+
+fn loadCore(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
+    const ns = e.namespace orelse return e.limit("local slots");
+    const registry = ns.registry orelse return e.limit("local slots");
+    const v = registry.core.lookupLocal(name) orelse return e.limit("local slots");
+    try e.emit(vm.asm_.varLoadVar(dst, try e.addVarTableEntry(v)));
 }
 
 /// `op` over its operands, read in place where they allow it
@@ -3270,6 +3346,7 @@ fn compileCall(
     args: []const *const Tiny,
     dst: u12,
 ) CompileError!void {
+    if (!e.blockFits(1 + args.len)) return compileChunkedCall(e, callee, args, dst);
     const call_base = try e.allocSlotBlock(1 + args.len);
     // The callee and the arguments are not in tail position.
     try compileExpr(e, callee, call_base, null);

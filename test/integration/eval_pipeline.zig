@@ -1983,6 +1983,31 @@ fn generated(open: []const u8, item: []const u8, n: usize, close: []const u8) ![
     return out.toOwnedSlice(testing.allocator);
 }
 
+test "literals: a computed collection or call of any size builds, its items evaluated left to right" {
+    // Each form has more items than a routine has slots (COMPILER.md
+    // §4.4), so each is built in chunks.
+    const cases = [_]struct { open: []const u8, item: []const u8, close: []const u8, out: []const u8 }{
+        .{ .open = "(def n (atom 0)) (def v [", .item = " (swap! n inc)", .close = "]) [(count v) (= v (vec (range 1 10001))) (vector? v)]", .out = "[10000 true true]" },
+        .{ .open = "(def n (atom 0)) (def l (list", .item = " (swap! n inc)", .close = ")) [(count l) (= l (range 1 10001)) (list? l)]", .out = "[10000 true true]" },
+        .{ .open = "(def x 1) (+", .item = " x", .close = ")", .out = "10000" },
+        .{ .open = "(def n (atom 0)) (def m {", .item = " {d} (swap! n inc)", .close = "}) [(count m) (get m 0) (get m 9999)]", .out = "[10000 1 10000]" },
+        .{ .open = "(def x 0) (def s #{", .item = " (+ x {d})", .close = "}) [(count s) (contains? s 9999) (set? s)]", .out = "[10000 true true]" },
+        .{ .open = "(def x 1) (def q `(", .item = " ~x", .close = ")) [(count q) (seq? q)]", .out = "[10000 true]" },
+        .{ .open = "(def x [1]) (def q `(", .item = " ~@x", .close = ")) [(count q) (seq? q)]", .out = "[10000 true]" },
+    };
+    for (cases) |c| {
+        const src = try generated(c.open, c.item, 10_000, c.close);
+        defer testing.allocator.free(src);
+        try expectOutputProgram(src, c.out);
+    }
+}
+
+test "literals: a map built in chunks keeps the later of two equal keys" {
+    const src = try generated("(def m {", " (* {d} 0) {d}", 5000, "}) [(count m) (get m 0)]");
+    defer testing.allocator.free(src);
+    try expectOutputProgram(src, "[1 4999]");
+}
+
 test "compile: a routine of more than 4096 constants, Vars and closures runs" {
     // Each distinct literal is a constant, each (def ...) a Var, each
     // fn a closure of the one routine the let compiles to.

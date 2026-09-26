@@ -760,7 +760,8 @@ entry stating the decision and its rationale.
   `closure:make`, whose descriptor names the child routine, so the
   constant pool holds Values only. The `J` kind (5) is unassigned,
   and the extension instruction form, which nothing emitted, is
-  deleted. A routine is bounded by 2^32 instructions,
+  deleted. A call or computed collection too large for one slot block
+  is built in chunks. A routine is bounded by 2^32 instructions,
   constants, Vars, tries and closures, and by 4096 slots live at once
   and 4096 upvalues, whose compile error names the routine and the
   limit. `docs/VM.md` §3, §4, §10, §12 and `docs/COMPILER.md` §4.4 are
