@@ -923,6 +923,14 @@ deserialization; empty-value index leaves; history as a range filter;
 one file, one process, backup by transaction number. The measured
 numbers are `docs/PERF.md` §3.7.
 
+Queries scale with their clauses (§5): ordering n clauses takes O(n)
+estimates, and a step costs its rows times the few columns still in
+use, so a chain of n patterns over r rows costs O(n·r), whether its
+`:find` names two variables or all of them. A 300-clause chain over a
+100k-entity chain runs in under a second; a 1000-clause query plans in
+a few milliseconds. What a step cannot avoid is its join: every step
+of a long chain probes one hash index with every row it carries.
+
 Not in scope: distribution (Datomic's peer/transactor split), a
 cost-based optimizer beyond greedy selectivity, write-heavy OLTP beyond
 one writer.

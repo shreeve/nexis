@@ -362,16 +362,10 @@ failing test (AGENTS.md).
 6. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-7. **Planning and joining grow steeply with clause count**: a
-   1000-clause chain over 10 entities plans and runs in 118 ms, but a
-   300-clause chain over a 100k-entity chain takes 34 s, because every
-   join copies an ever-wider relation. Next: profile
-   `query/plan.zig` and `relation.zig` on that query; project away
-   variables no later clause or `:find` uses before each join.
-8. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+7. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-9. **No datom heap kind**: reads return `[e a v t added]` vectors.
+8. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 
