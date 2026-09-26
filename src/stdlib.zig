@@ -1189,7 +1189,7 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // `VmError.ControlTransferred` unchanged so a throw from inside a
 // user fn lands at the outer handler.
 //
-// Rooting (GC.md §3): a collection can run inside any `callValue`.
+// Rooting (GC.md §11.5): a collection can run inside any `callValue`.
 // A native's own arguments are rooted for its whole call (the
 // caller's slots, or the root stack when reached through
 // `callValue`), and so is everything reachable from them. Two kinds

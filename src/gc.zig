@@ -1,7 +1,7 @@
 //! gc.zig — precise mark-sweep tracing garbage collector.
 //!
-//! Authoritative spec: `docs/GC.md`. Strategy and root model:
-//! `PLAN.md` §10. Mark-bit layout: `docs/VALUE.md` §5. Heap / sweep
+//! Authoritative spec: `docs/GC.md` (strategy §1, roots §3; PLAN.md
+//! §23 #2, #18). Mark-bit layout: `docs/HEAP.md` §4. Heap / sweep
 //! scaffold: `docs/HEAP.md` and `src/heap.zig`.
 //!
 //! Every heap kind that allocates blocks (string, bignum, list,
@@ -23,18 +23,10 @@
 //!   - No write barriers (STW, single-threaded).
 //!   - No generational / concurrent phases.
 //!
-//! Module graph (one-way terminal, like dispatch.zig):
-//!
-//!     gc.zig
-//!     ├─ @import("heap.zig")
-//!     ├─ @import("value.zig")
-//!     ├─ @import("string.zig")  — string.trace
-//!     ├─ @import("bignum.zig")  — bignum.trace
-//!     ├─ @import("coll/list.zig")    — list.trace
-//!     ├─ @import("coll/vector.zig")  — vector.trace
-//!     ├─ @import("coll/champ.zig")    — champ.traceMap + champ.traceSet
-//!     ├─ @import("coll/typed_vector.zig") — typed_vector.trace (leaf)
-//!     └─ @import("nextomic/handle.zig") — nextomic_handle.traceEntity
+//! Imports: the heap, `value.zig`, and each module whose kind has a
+//! block to trace (string, bignum, the collections, transient, db,
+//! atom, record, protocol, `nextomic/handle.zig`); the kind → trace
+//! table is GC.md §5.
 //!
 //! `vm.zig` imports gc.zig and is the collector's host: it
 //! enumerates the runtime's roots and traces the two block kinds
@@ -242,11 +234,11 @@ pub const Collector = struct {
     /// to decide whether to walk the node's payload.
     ///
     /// Does NOT walk `h.meta` — internal nodes have no metadata
-    /// semantics (CHAMP.md §8.2, VECTOR.md §3 invariants).
+    /// semantics (CHAMP.md §4, VECTOR.md §3 invariants).
     /// Does NOT dispatch on `h.kind` — the caller knows the
     /// structural context and will walk the payload itself (vector
     /// trie walking via `traceTrie`; CHAMP walking via
-    /// `traceMapNode` / `traceSetNode`).
+    /// `Trie.traceNode`).
     pub fn markInternal(self: *Collector, h: *HeapHeader) bool {
         return self.markHeaderOnce(h);
     }

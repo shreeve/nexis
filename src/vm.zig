@@ -2092,7 +2092,7 @@ pub const VM = struct {
     /// call, so a native reached this way holds rooted arguments
     /// exactly as one reached by `call:call` holds them in the
     /// caller's slots. Values a native derives and keeps across a
-    /// nested `callValue` are its own to root (`RootScope`; GC.md §3).
+    /// nested `callValue` are its own to root (`RootScope`; GC.md §11.5).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         // Every re-entry nests a native call and a run loop on the
         // native stack (§13.1).

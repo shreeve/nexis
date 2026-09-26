@@ -2,8 +2,8 @@
 //!
 //! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
 //! `docs/SEMANTICS.md` §2.6 (associative and set equality categories)
-//! and §3.2 (hash-domain bytes `0xF1` / `0xF2`, map entry-hash
-//! formula). Physical storage: `docs/HEAP.md`. Representation
+//! and §3.2–§3.3 (map entry-hash formula; the hash domains are the
+//! kind numbers 18 and 19). Physical storage: `docs/HEAP.md`. Representation
 //! choices: `docs/VALUE.md` §2.2.
 //!
 //! One trie implementation, `Trie(P)`, serves both kinds: a map's
@@ -961,13 +961,13 @@ pub fn valueFromSetHeader(h: *HeapHeader) Value {
 // Dispatch and GC entry points (CHAMP.md §9, GC.md §5)
 // =============================================================================
 
-/// Pre-domain-mix hash of a map root; `dispatch.hashValue` applies the
-/// `0xF1` domain mix.
+/// Pre-domain-mix hash of a map root; `dispatch.hashValue` mixes in
+/// the map's domain, its kind number 18.
 pub fn hashMap(h: *HeapHeader, elementHash: ElementHash) u64 {
     return MapTrie.hashOf(h, elementHash);
 }
 
-/// Pre-domain-mix hash of a set root (domain byte `0xF2`).
+/// Pre-domain-mix hash of a set root (domain: kind number 19).
 pub fn hashSet(h: *HeapHeader, elementHash: ElementHash) u64 {
     return SetTrie.hashOf(h, elementHash);
 }
@@ -1509,7 +1509,7 @@ test "equalMap: different value breaks equality" {
     try testing.expect(!equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &synthHash, &synthEq));
 }
 
-// ---- Cross-subkind equality (§6.4) ----
+// ---- Cross-subkind equality (§6.3) ----
 
 test "cross-subkind: array-map and CHAMP holding same entries compare equal" {
     var heap = Heap.init(testing.allocator);

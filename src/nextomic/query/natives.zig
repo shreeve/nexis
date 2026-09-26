@@ -18,7 +18,7 @@
 //! Rooting: a value a user function returns to the pipeline may end up
 //! in a relation cell that the next call back into the VM must not see
 //! collected, so the hook pushes every result on a root scope that
-//! lives as long as the `q` call (GC.md §3); `root` pushes the heap
+//! lives as long as the `q` call (GC.md §11.5); `root` pushes the heap
 //! values the pipeline builds itself (a `tuple` bound as one value, an
 //! aggregate's vector or set) the same way.
 //!
