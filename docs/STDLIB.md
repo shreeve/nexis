@@ -88,7 +88,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 
 | Name | Arity | Semantics | Errors |
 |---|---|---|---|
-| `str` | 0+ | The arguments' text, concatenated: nil is empty, a string or char is itself, anything else as `pr-str` prints it, so strings inside a collection keep their quotes: `(str "a" \b 1 nil :k)` is `"ab1:k"`, `(str ["a" nil])` is `"[\"a\" nil]"`; `(str)` is `""` | `:utf8-error` (a malformed string inside a collection) |
+| `str` | 0+ | The arguments' text, concatenated: nil is empty, a string or char is itself, anything else as `pr-str` prints it, so strings inside a collection keep their quotes: `(str "a" \b 1 nil :k)` is `"ab1:k"`, `(str ["a" nil])` is `"[\"a\" nil]"`; `(str)` is `""`. One string argument is returned itself, as Clojure's (`(identical? s (str s))`); arguments that are all nil, strings, chars or fixnums are measured and written once into a string of that length | `:utf8-error` (a malformed string inside a collection) |
 | `string?` | 1 | Whether the argument is a string | — |
 | `subs` | 2–3 | `(subs s start)`, `(subs s start end)`: a fresh string of the code points in `[start, end)`, `end` defaulting to the count; `(subs "héllo" 1 3)` is `"él"` | `:kind-mismatch` (non-string, non-fixnum index), `:index-out-of-bounds` (negative, past the count, or `start > end`) |
 | `count` | 1 | Of a string: its code points, an O(n) scan | — |
@@ -143,8 +143,12 @@ The natives are in `string_natives`; `capitalize`, `reverse` and
 strings, not chars or nil, except where the table says so; any
 other kind is `:kind-mismatch`. There are no regular expressions:
 `split` and `replace` take a literal string (`replace` also a char).
-Searches compare bytes,
-which on valid UTF-8 match only at code-point boundaries.
+Searches compare bytes 32 at a time (`string.Matches`, STRING.md §3),
+which on valid UTF-8 match only at code-point boundaries. `split`
+validates its arguments once and makes each piece from its bytes;
+`join` of nil, strings, chars and fixnums and every `replace` measure
+the result and write it once; a `replace` that finds nothing returns
+`s` itself.
 
 | Name | Arity | Semantics |
 |---|---|---|

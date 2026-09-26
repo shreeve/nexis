@@ -49,7 +49,9 @@ A second subkind would have to keep every invariant below, with
    is 0 recomputes it on each use.
 
 Strings are immutable; there is no mutable string builder, and
-`subs` copies (no slice of a heap string shares its body).
+`subs` copies (no slice of a heap string shares its body). A native
+that builds a string measures it first and writes it once into an
+`allocUninit` block (§3).
 
 ---
 
@@ -58,6 +60,7 @@ Strings are immutable; there is no mutable string builder, and
 | Function | Contract |
 |---|---|
 | `fromBytes(heap, bytes) !Value` | A fresh `.string` block (`heap.alloc(.string, len)`) holding a copy of `bytes` |
+| `allocUninit(heap, len)` | A fresh `.string` block of `len` bytes and its writable body, for a builder that knows its length (`str`, `join`, `replace`) to write its text once, in place; the caller fills every byte before the value is used |
 | `asBytes(v) []const u8` | The byte view; asserts the kind, and subkind 1 in safe builds. Callers must not assume the bytes live on the heap |
 | `byteLen(v) usize` | The byte length |
 | `hashHeader(h) u32` | Invariants 3 and 7; called by `dispatch.heapHashBase` |
@@ -66,13 +69,27 @@ Strings are immutable; there is no mutable string builder, and
 | `codepointCount(v) error{InvalidUtf8}!usize` | Unicode scalars in the body (`std.unicode.utf8CountCodepoints`) |
 | `codepointAt(v, i) error{OutOfBounds, InvalidUtf8}!u21` | The scalar at code-point index `i` |
 | `byteRangeForCodepoints(v, start, end)` | The byte range of code points `[start, end)`; `error.OutOfBounds` when `start > end` or `end` is past the count, `error.InvalidUtf8` on malformed bytes before `end` |
+| `Matches.init(hay, needle, from)`, `next() ?usize` | The byte offsets of the non-overlapping occurrences of `needle` (one byte or more) in `hay` from `from`, left to right, each search resuming after the previous occurrence |
+| `indexOf(hay, needle, from) ?usize` | The first occurrence at or after `from`; the empty needle is found at `from` (null past the end) |
+| `countMatches(hay, needle) usize` | How many occurrences `Matches` yields from 0 |
+
+**Search.** `Matches` tests thirty-two positions per step: a
+position is a candidate when its byte is the needle's first and the
+byte `needle.len − 1` past it is the needle's last (two 32-byte vector
+compares ANDed into a bit mask), and only a candidate is compared in
+full. A one-byte needle is a compare per 32 bytes and a bit scan per
+occurrence; there is no per-search table. The byte searches of
+`nexis.string` (`includes?`, `index-of`, `split`, `replace`) use it;
+on valid UTF-8 a needle that is valid UTF-8 matches only on code-point
+boundaries.
 
 The code-point helpers are what the language's indexing is built on:
 a string indexes by Unicode scalar, not by byte and not by grapheme
 cluster. `codepointAt` and `byteRangeForCodepoints` find the ASCII
 run at the start of the body sixteen bytes at a time and index inside
 it directly, decoding only the bytes past it, so on an ASCII string
-`nth` and `subs` cost a vector scan to the index. The code-point
+`nth` and `subs` cost a vector scan to the index. `codepointCount`
+skips the same ASCII run and counts only past it. The code-point
 count is not cached; `count` of a string is an O(n) scan. The stdlib
 maps `error.InvalidUtf8` to `:utf8-error`.
 
@@ -80,7 +97,9 @@ maps `error.InvalidUtf8` to `:utf8-error`.
 (reflexive, symmetric, transitive; equal implies equal hash; never
 equal to another kind), S4 the `fromBytes` / `asBytes` round trip,
 S5 the hash function, S6 the hash cache, S7 the code-point helpers
-against a plain decode, malformed bytes included.
+against a plain decode, malformed bytes included. The inline tests of
+`src/string.zig` check `Matches` against a plain left-to-right scan,
+across block edges and over random text.
 
 ---
 

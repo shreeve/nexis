@@ -1088,6 +1088,9 @@ test "integration: sequential destructuring with rest" {
     try expectOutput("((fn ([x & r] r)) 1)", "nil");
     try expectOutput("((fn ([x & r] r) ([] 0)) 1 2 3)", "(2 3)");
     try expectOutput("((fn ([] 0) ([x & r] r)) 1)", "nil");
+    // With nothing before it, the rest is still a seq of the source.
+    try expectOutput("(let [[& r] [1 2]] [r (seq? r)])", "[(1 2) true]");
+    try expectOutput("(nil? (let [[& r] []] r))", "true");
 }
 
 test "integration: sequential destructuring with :as" {
@@ -1302,12 +1305,15 @@ test "integration: core.nx second / third / last" {
     try expectOutput("(last [10 20 30])", "30");
     try expectOutput("(last (list :a :b :c))", ":c");
     try expectOutput("(last (list))", "nil");
+    try expectOutput("[(last []) (last nil) (last \"hé\") (last {:a 1}) (last (range 100000)) (last (rest [1])) (last (map inc (range 9))) (last (cons 0 (rest [1 2 3 4 5])))]", "[nil nil é [:a 1] 99999 nil 9 5]");
+    try expectOutput("(try (last 5) (catch any e e))", ":kind-mismatch");
 }
 
 test "integration: core.nx reverse" {
     try expectOutput("(reverse [1 2 3 4 5])", "(5 4 3 2 1)");
     try expectOutput("(reverse (list))", "()");
     try expectOutput("(reverse nil)", "()");
+    try expectOutput("[(reverse \"héb\") (reverse (range 6)) (list? (reverse (range 6))) (reverse {:a 1}) (nexis.string/reverse \"héb🦀\")]", "[(b é h) (5 4 3 2 1 0) true ([:a 1]) 🦀béh]");
 }
 
 test "integration: core.nx range" {
@@ -1903,6 +1909,25 @@ test "integration: map (eager) on list + vector" {
     try expectOutput("(map inc (list 1 2 3 4))", "(2 3 4 5)");
     try expectOutput("(map inc [10 20 30])", "(11 21 31)");
     try expectOutput("(map inc nil)", "()");
+}
+
+test "integration: a built sequence is a list to every consumer, whatever its length" {
+    // LIST.md §1: four or more results are a vector's view, fewer
+    // are cons cells; nothing tells them apart.
+    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[true true true]");
+    try expectOutput("(map inc (range 6))", "(1 2 3 4 5 6)");
+    try expectOutput("(keep (fn [x] (when (odd? x) (str x x))) (range 9))", "(11 33 55 77)");
+    try expectOutput("[(= (map inc (range 5)) '(1 2 3 4 5)) (= (hash (map inc (range 5))) (hash '(1 2 3 4 5))) (= (remove odd? (range 10)) [0 2 4 6 8])]", "[true true true]");
+    try expectOutput("[(conj (map inc (range 5)) 0) (cons :a (filter even? (range 10))) (rest (map inc (range 5))) (next (map inc (range 1)))]", "[(0 1 2 3 4 5) (:a 0 2 4 6 8) (2 3 4 5) nil]");
+    try expectOutput("[(peek (map inc (range 5))) (pop (map inc (range 5))) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[1 (2 3 4 5) 8 7 99999]");
+    try expectOutput("[(meta (with-meta (filter odd? (range 9)) {:a 1})) (meta (map inc (range 9))) (with-meta (map inc (range 5)) {:b 2})]", "[{:a 1} nil (1 2 3 4 5)]");
+    try expectOutput("[(map inc []) (filter odd? [2 4 6 8]) (seq (map inc [])) (empty? (remove any? (range 5)))]", "[() () nil true]");
+    try expectOutput("(let [xs (map inc (range 5))] {xs :v (vec xs) :w})", "{(1 2 3 4 5) :w}");
+    try expectOutput("(let [v (into [] (filter even? (range 80)))] [(count v) (v 39) (peek (conj v :x)) (= v (vec (range 0 80 2))) (into [1] (range 2 5))])", "[40 78 :x true [1 2 3 4]]");
+    try expectOutput("[(reduce-kv (fn [acc i x] (+ acc (* i x))) 0 (vec (range 40))) (reduce-kv (fn [acc k v] (+ acc k v)) 0 (zipmap (range 10) (range 10)))]", "[20540 90]");
+    // A macro's expansion may be a built sequence, or hold one.
+    try expectOutput("(do (defmacro twice-all [& xs] (cons '+ (map (fn [x] (list '* 2 x)) xs))) (twice-all 1 2 3 4))", "20");
+    try expectOutput("(do (defmacro as-code [] (map identity '(+ 1 2 3 4))) (as-code))", "10");
 }
 
 test "integration: reduce" {
@@ -2594,6 +2619,14 @@ test "string: str: result is itself a string" {
     try expectOutput("(count (str \"héllo\"))", "5");
 }
 
+test "string: str measures plain parts and writes them once; one string alone is itself" {
+    try expectOutput("(str -12 \\u{E9} nil \"x\" 0 \\u{1F980})", "-12éx0🦀");
+    try expectOutput("(str 140737488355327 \" \" -140737488355328)", "140737488355327 -140737488355328");
+    try expectOutput("(let [s (str \"a\" 1)] [(identical? s (str s)) (= \"a1\" (str s)) (str \"\")])", "[true true ]");
+    // A part the printer makes switches the whole call to it.
+    try expectOutput("(str 1 1.5 :k \"é\" [\"q\"])", "11.5:ké[\"q\"]");
+}
+
 test "string: string? after subs returns true" {
     try expectOutput("(string? (subs \"hello\" 1 4))", "true");
 }
@@ -3102,6 +3135,17 @@ test "nexis.string: join: round-trips with split" {
         \\(let [s "a,b,," sep ","]
         \\  [(nexis.string/join sep (nexis.string/split s sep -1)) (nexis.string/join sep (nexis.string/split s sep))])
     , "[a,b,, a,b]");
+}
+
+test "nexis.string: join, split, replace and index-of across 32-byte blocks and multibyte text" {
+    try expectOutput("(nexis.string/join \",\" [1 -2 nil \"é\" \\c])", "1,-2,,é,c");
+    try expectOutput("[(nexis.string/join \"-\" \"héb\") (nexis.string/join \", \" []) (nexis.string/join \",\" {:a 1})]", "[h-é-b  [:a 1]]");
+    try expectOutput("(let [s (nexis.string/join \",\" (range 1000))] [(count s) (count (nexis.string/split s \",\")) (last (nexis.string/split s \",\"))])", "[3889 1000 999]");
+    try expectOutput("(pr-str [(nexis.string/split \",a,b\" \",\") (nexis.string/split \"aébéc\" \"é\") (nexis.string/split \"a::b:::c\" \"::\")])", "[[\"\" \"a\" \"b\"] [\"a\" \"b\" \"c\"] [\"a\" \"b\" \":c\"]]");
+    try expectOutput("(let [s (apply str (repeat 50 \"xé,\"))] [(count (nexis.string/split s \",\")) (count (nexis.string/split s \"é,x\")) (count (nexis.string/split s \",\" 7))])", "[50 50 7]");
+    try expectOutput("(let [s (apply str (repeat 100 \"ab\"))] [(count (nexis.string/replace s \"b\" \"xyz\")) (count (nexis.string/replace s \"ab\" \"\")) (identical? s (nexis.string/replace s \"z\" \"y\"))])", "[400 0 true]");
+    try expectOutput("[(nexis.string/replace \"é🦀\" \"\" \"-\") (nexis.string/replace \"a.b.c\" \\. \\é) (nexis.string/replace \"aéaéa\" \"é\" \"--\")]", "[-é-🦀- aébéc a--a--a]");
+    try expectOutput("(let [s (str (apply str (repeat 40 \"x\")) \"é\" \"yz\" (apply str (repeat 40 \"x\")) \"yz\")] [(nexis.string/index-of s \"yz\") (nexis.string/index-of s \"yz\" 42) (nexis.string/index-of s \\é) (nexis.string/includes? s \"éyz\") (nexis.string/includes? s \"zé\")])", "[41 83 40 true false]");
 }
 
 test "nexis.string: predicates and searches" {

@@ -354,7 +354,8 @@ What the rows say:
 - It is behind on sequence pipelines (`map`/`filter`, eager here and
   lazy and chunked in babashka, `docs/BENCH.md` §12), on
   `frequencies`/`group-by` and transient maps, on vector `conj`/`nth`
-  and on string splitting, and it holds 2–4× the memory on
+  and on string splitting (the sequence and string rows below the
+  list narrow the first and last), and it holds 2–4× the memory on
   collections of a million elements: the collector's policy and the
   16-byte value cell show there.
 - Nextomic is ahead of Datalevin on opening, loading, lookups, joins,
@@ -368,6 +369,25 @@ What the rows say:
 - The store is 4.3× Datalevin's: history indexes and the txlog, which
   Datalevin does not keep, and 16 KiB pages over 256 MB of initial
   map.
+
+**Sequences and strings.** Three of the rows above rerun on the tree
+with eager sequences built as vector views, direct leaf callbacks,
+`nthnext` destructuring, and the one-pass string natives (`LIST.md`
+§1, `STRING.md` §3), against the same tree before them; before and
+after are separate runs under different load (provenance §11), so the
+instructions retired in the timed phase (`/usr/bin/time -l`, the
+setup's subtracted, median of five or seven) are the steadier figure.
+
+| Workload | nexis before | nexis after | babashka | ratio after | RSS before → after | instructions, timed phase |
+|---|---:|---:|---:|---:|---:|---:|
+| map/filter/reduce over 1M maps | 174 ms | 78.7 ms | 39.9 ms | 1.97 | 500 → 333 MB | 3.30 G → 1.98 G |
+| string build and split, 1 MB | 50.8 ms | 30.5 ms | 22.6 ms | 1.35 | 133 → 47 MB | 1.23 G → 0.66 G |
+| destructuring loop | 358 ms | 372 ms | 309 ms | 1.20 | 25 → 25 MB | 10.63 G → 10.30 G |
+
+The pipeline's remaining cost is the filter's closure call per
+element and the collector re-marking the million live maps; the
+destructuring loop's is the VM's calls and the two literals it
+allocates per iteration.
 
 ## 6. Levers and dead ends
 
@@ -402,7 +422,7 @@ Each lever is a measured change: a before/after from `zig build bench`
   results. The size-class pool below and a collection trigger that
   follows the live set are the levers.
 - **`frequencies`, `group-by`, transient maps, `conj`/`nth` on
-  vectors, string splitting** (§3.11, 2.3–4.4× behind babashka):
+  vectors** (§3.11, 2.3–4.4× behind babashka):
   each is a native or `core.nx` path to profile before changing.
 
 - **A size-class pool under `VM.heap`.** The heap allocates every
@@ -509,3 +529,4 @@ is one invocation's 30-sample median.
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |
 | §3.11 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0 | 2026-09-26: `bb bench/compare/run.clj --n 10 --max-load 4` at `72d8312` (`main` at `f827775` with the harness); ten rounds after a discarded warm-up (startup thirty), each workload started below a load average of 4 and repeated if the load rose past it; raw results kept with the run (`results.json`) |
+| §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
