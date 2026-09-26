@@ -57,9 +57,13 @@ the connection's life (tree registration is the engine's one call that
 is not thread-safe, and it happens only here). Only a store missing one
 of them takes a write transaction at connect: a new file is
 bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
-minted (§2.4). So opening a complete store writes nothing, waits on no
-writer, and succeeds on a file the process may only read, where every
-`transact!` is `:db/read-only`.
+minted (§2.4). One more write can follow the open: when the
+`nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
+full-text, `Conn.open` rebuilds them in a write transaction of its own
+that writes no datom, and skips the rebuild on a file it may only read
+or whose writer this process holds. So opening a complete store with
+current rows writes nothing, waits on no writer, and succeeds on a file
+the process may only read, where every `transact!` is `:db/read-only`.
 
 emdb's writer lock is per file and makes a second writer wait for the
 first to end. Every connection to one file in the process, and every
@@ -83,7 +87,7 @@ wait on itself.
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
 | `nx/idents` | `[0x00][utf8 text]` / `[0x01][id:4]` / `[0x02][utf8 text]` | id / text / id of a name a rename retired |
-| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"n"[a:4]` | see §2.3 |
+| `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"ft"`, `"n"[a:4]` | see §2.3 |
 | `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
@@ -184,6 +188,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it when the writer was a build that does not bump the generation, and each is read once per connection |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (2, Unicode simple case folding, §5 "fulltext") and the `t` they are current at; absent in a store an older build wrote, whose rows fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` an older build committed without stamping) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -667,12 +672,21 @@ string attribute carrying `:db/fulltext` at the view's basis, every
 `[e v]` whose value holds every token of the needle, in entity order;
 the attribute and the needle may be variables bound earlier or by
 `:in`. Tokens are the runs of ASCII letters, digits and non-ASCII
-bytes, ASCII letters lowercased, split on every other byte; a run
-longer than 255 bytes is not a token, and a needle without tokens
-matches nothing. The plain view at the newest basis intersects the
-`nx/fulltext` rows of the tokens, then reads the matching values from
-EAVT; an as-of, since or history view re-tokenises the attribute's
-values under that view, so it answers with the values its time held.
+bytes, split on every other byte, each character folded by Unicode
+simple case folding (`CaseFolding.txt`, statuses C and S) for ASCII,
+Latin (Latin-1, Extended-A, the regular pairs of Extended-B, Extended
+Additional), Greek and its extended block, Cyrillic, Armenian,
+Georgian, Glagolitic, Deseret and the letterlike, Roman numeral,
+circled and fullwidth forms, so `Café`, `CAFÉ` and `café` are one
+token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays as
+it is, and no accent or normalization is removed. A folded run longer
+than 255 bytes is not a token, and a needle without tokens matches
+nothing. Indexing and search fold through one tokenizer. The plain view
+at the newest basis intersects the `nx/fulltext` rows of the tokens
+when they are current (§2.3 `"ft"`), then reads the matching values
+from EAVT; an as-of, since or history view, or one over stale rows,
+re-tokenises the attribute's values under that view, so it answers
+with the values its time held.
 An attribute without `:db/fulltext` at the basis is `:nextomic/tx-data`
 naming it; an unknown one `:nextomic/unknown-attribute`; a needle that
 is not a string `:nextomic/value-type`.
@@ -883,7 +897,7 @@ src/nextomic/
   schema.zig     Schema from attribute datoms as-of a basis, per-attribute counts
   transact.zig   §3
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
-  fulltext.zig   the tokenizer and the nx/fulltext rows: put, delete, search
+  fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search, rebuild
   db.zig         Conn, DbValue, datoms, entity, entid/ident, tx-range
   handle.zig     heap bodies of the three value kinds (its own build module)
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts

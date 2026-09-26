@@ -494,8 +494,9 @@ pub const Exec = struct {
 
     /// `[[e v] ...]`: the string values of `attr` (a keyword cell) in
     /// source `src` that hold every token of `needle`, in entity order.
-    /// A view at the newest basis reads the tokens tree; any other
-    /// re-tokenises the attribute's values in that view. The attribute
+    /// A view at the newest basis reads the tokens tree when its rows
+    /// are current; any other re-tokenises the attribute's values in
+    /// that view. The attribute
     /// must carry `:db/fulltext` at the view's basis.
     fn fulltextHits(self: *Exec, src: ?ir.Src, attr: Cell, needle: Cell) anyerror![]const []const Cell {
         const read = try self.readOf(src);
@@ -508,7 +509,9 @@ pub const Exec = struct {
         }
         const tokens = try fulltext.tokens(self.arena, needle.str);
         var rows: std.ArrayList([]const Cell) = .empty;
-        if (read.fast()) {
+        // Rows another folding wrote wait for a rebuild (fulltext.zig);
+        // until then the values are re-tokenised.
+        if (read.fast() and try read.db.conn.store.fulltextFresh(read.txn, read.db.basis)) {
             const hits = try fulltext.search(read.db.conn.store, read.txn, self.arena, a, tokens);
             var i: usize = 0;
             while (i < hits.len) {

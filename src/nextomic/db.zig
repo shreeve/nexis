@@ -30,6 +30,7 @@ const datom_mod = @import("datom.zig");
 const store_mod = @import("store.zig");
 const idents_mod = @import("idents.zig");
 const schema_mod = @import("schema.zig");
+const fulltext = @import("fulltext.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -135,6 +136,7 @@ pub const Conn = struct {
         errdefer gpa.destroy(self);
         const store = try Store.open(gpa, path, .{ .map_size = options.map_size });
         errdefer store.close();
+        try refreshFulltext(gpa, store);
         self.* = .{
             .gpa = gpa,
             .store = store,
@@ -144,6 +146,29 @@ pub const Conn = struct {
             .is_open = true,
         };
         return self;
+    }
+
+    /// Rebuild `nx/fulltext` when its rows are stale and some attribute
+    /// is full-text (fulltext.zig), in a write transaction of its own
+    /// that writes no datom. A file this process may only read, or one
+    /// whose writer is busy in this process, is left as it is: its
+    /// searches re-tokenise until a transaction rebuilds the rows.
+    fn refreshFulltext(gpa: Allocator, store: *Store) !void {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        {
+            const txn = try store.beginRead();
+            defer txn.abort();
+            if (!try fulltext.needsRebuild(store, txn, arena, try store.readT(txn))) return;
+        }
+        const txn = store.beginWrite(.full) catch |err| switch (err) {
+            error.TxnReadOnly, error.WriterActive => return,
+            else => return err,
+        };
+        errdefer txn.abort();
+        try fulltext.rebuild(store, txn, arena, try store.readT(txn));
+        try txn.commit();
     }
 
     /// Stop accepting operations. Idempotent. The `Conn` stays allocated

@@ -335,10 +335,7 @@ failing test (AGENTS.md).
 2. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-3. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
-   tokens. Case folding needs a table and a rebuild of `nx/fulltext`
-   at open.
-4. **No datom heap kind**: reads return `[e a v t added]` vectors.
+3. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

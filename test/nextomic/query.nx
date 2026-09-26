@@ -355,6 +355,8 @@
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "red") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n ?v :where [(fulltext $ :person/bio "RED team") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "café") [[?e ?v]]] [?e :person/name ?n]] ft)))
+; Case folds by Unicode simple case folding, not ASCII alone.
+(println (rows (d/q '[:find ?n :where [(fulltext $ :person/bio "CAFÉ NOIR") [[?e ?v]]] [?e :person/name ?n]] ft)))
 (println (rows (d/q '[:find ?n :in $ ?needle :where [(fulltext $ :person/bio ?needle) [[?e ?v]]] [?e :person/name ?n]] ft "team blue x2")))
 (println (d/q '[:find ?e :where [(fulltext $ :person/bio "red green") [[?e ?v]]]] ft))
 (println (d/q '[:find ?e :where [(fulltext $ :person/bio "...") [[?e ?v]]]] ft))

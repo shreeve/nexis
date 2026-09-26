@@ -1011,6 +1011,9 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
+        // Rows an older build or another folding wrote are replaced
+        // before this transaction adds its own.
+        if (!try self.conn.store.fulltextFresh(self.txn, self.now)) try fulltext.rebuild(self.conn.store, self.txn, self.arena, self.now);
         try self.bindIdents();
         try self.bindTempids();
         try self.claimAll();
@@ -1856,6 +1859,7 @@ const Ctx = struct {
         try store.putTxlog(self.txn, self.t, entry);
 
         try store.writeT(self.txn, self.t);
+        try store.writeFulltextStamp(self.txn, self.t);
         if (self.schema_touched) try store.bumpSchemaGen(self.txn);
         if (self.eid_bumped) try store.writeNextEid(self.txn, self.next_eid);
         try self.minter.finish();
