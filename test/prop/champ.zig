@@ -1,7 +1,7 @@
 //! test/prop/champ.zig — randomized properties for the persistent map
 //! and set heap kinds (CHAMP): M1–M11 for maps, S1–S9 for sets.
 //!
-//! Primary purpose: pin the associative equality category's invariant
+//! Primary purpose: pin the map and set invariant
 //! `(= a b) ⇒ hash(a) = hash(b)` across both subkinds. M6 is the
 //! map property parallel to
 //! `test/prop/vector.zig` V3 (sequential category) and V9 (cross-kind
@@ -20,8 +20,8 @@
 //!   M4. `assoc` same-value short-circuit returns the same map pointer.
 //!   M5. Equality laws over random maps: reflexive, symmetric,
 //!       transitive (pairwise).
-//!   M6. **Cross-subkind hash equivalence** for the `.associative`
-//!       category: 2000 random maps of 1..8 entries
+//!   M6. **Cross-subkind hash equivalence** for maps: 2000 random
+//!       maps of 1..8 entries
 //!       built two ways — one stays array-map, one promotes to CHAMP
 //!       and dissocs back to the same entries — hash and equal
 //!       identically.
@@ -51,7 +51,7 @@ const dispatch = nx.dispatch;
 const Value = value.Value;
 const Heap = heap_mod.Heap;
 
-const prng_seed: u64 = 0x686D_7470_5F70_726F; // "ormp_thmt" LE-ish
+const prng_seed: u64 = 0x686D_7470_5F70_726F; // "hmtp_pro" ASCII
 
 fn randKey(rand: std.Random) Value {
     // Mix of keyword ids (exercises the keyword fast path) and fixnums
@@ -76,7 +76,7 @@ fn randValue(rand: std.Random) Value {
 }
 
 // -----------------------------------------------------------------------------
-// M1. fromEntries + get round-trip
+// M1. mapFromEntries + mapGet round-trip
 // -----------------------------------------------------------------------------
 
 test "M1: mapFromEntries + mapGet round-trip over 200 random maps" {
@@ -357,13 +357,12 @@ test "M5: equality laws (reflexive, symmetric, pairwise transitive)" {
 // -----------------------------------------------------------------------------
 
 test "M6: cross-subkind (array-map vs CHAMP) same entries hash AND equal (2000 trials)" {
-    // Parallel to test/prop/vector.zig V3 for the associative category.
+    // Parallel to test/prop/vector.zig V3, for maps.
     // For each of 2000 random ≤8-entry key-value sets we build two
     // maps: `am` that stays as array-map, `ch` that grows to 9 entries
     // and dissocs one back out (forcing CHAMP subkind). Both must be
     // `dispatch.equal` and produce identical `dispatch.hashValue`
-    // outputs, proving the associative-category architecture holds
-    // across subkinds (the associative analogue of vector V3).
+    // outputs across subkinds (the map analogue of vector V3).
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -674,8 +673,8 @@ test "M11: equal ⇒ hashValue equal over 2000 random map pairs" {
 //   S3. setConj of existing element returns the same pointer.
 //   S4. Equality laws over random sets (reflexive / symmetric /
 //       pairwise transitive).
-//   S5. **Cross-subkind hash equivalence** for the `.set` equality
-//       category: 2000 random sets built via two
+//   S5. **Cross-subkind hash equivalence** for sets: 2000 random
+//       sets built via two
 //       different paths — pure array-set vs. promote-then-disj — hash
 //       and equal identically. Parallel to M6.
 //   S6. Cross-category never-equal: a set is never `=` to any non-set

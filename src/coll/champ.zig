@@ -1,12 +1,12 @@
 //! coll/champ.zig — persistent map + set heap kinds.
 //!
 //! Authoritative spec: `docs/CHAMP.md`. Semantic framing:
-//! `docs/SEMANTICS.md` §2.6 (associative and set equality categories)
+//! `docs/SEMANTICS.md` §2.6 (maps and sets: the own-kind structural rule)
 //! and §3.2–§3.3 (map entry-hash formula; the hash domains are the
 //! kind numbers 18 and 19). Physical storage: `docs/HEAP.md`. Representation
 //! choices: `docs/VALUE.md` §2.2.
 //!
-//! One trie implementation, `Trie(P)`, serves both kinds: a map's
+//! One trie implementation, `Trie(P, kind)`, serves both kinds: a map's
 //! payload is an `Entry` (key + value, 32 bytes), a set's a bare key
 //! `Value` (16 bytes). The public `map*` / `set*` functions are thin
 //! wrappers over `MapTrie` and `SetTrie`.
@@ -717,7 +717,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// Every payload of a map or set: array order for an array
         /// root; otherwise depth first, each node's payloads before its
         /// children. Equal CHAMP-backed maps iterate alike (CHAMP.md
-        /// §4.3) except inside collision nodes.
+        /// §2.2) except inside collision nodes.
         const Iter = struct {
             /// The array root's payloads not yet returned.
             flat: []const P = &.{},
@@ -1338,7 +1338,7 @@ test "persistent: dissoc does not mutate source" {
     }
 }
 
-// ---- Duplicate-key canonicalization in fromEntries ----
+// ---- Duplicate-key canonicalization in mapFromEntries ----
 
 test "mapFromEntries: later wins on duplicate keys; count reflects unique" {
     var heap = Heap.init(testing.allocator);

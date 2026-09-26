@@ -2,7 +2,7 @@
 //!
 //! **This is plain 32-way radix trie + tail buffer, NOT RRB-relaxed.**
 //! Despite the canonical academic name "RRB tree," the implementation
-//! is the same shape Clojure ships (PLAN §9.2 + §23 #30). There is no
+//! is the same shape Clojure ships (`docs/VECTOR.md`, PLAN §23 #30). There is no
 //! RRB relaxation. The module is named `vector` for user-facing
 //! clarity.
 //!
