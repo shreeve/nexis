@@ -1905,6 +1905,25 @@ test "integration: map (eager) on list + vector" {
     try expectOutput("(map inc nil)", "()");
 }
 
+test "integration: a built sequence is a list to every consumer, whatever its length" {
+    // LIST.md §1: four or more results are a vector's view, fewer
+    // are cons cells; nothing tells them apart.
+    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[true true true]");
+    try expectOutput("(map inc (range 6))", "(1 2 3 4 5 6)");
+    try expectOutput("(keep (fn [x] (when (odd? x) (str x x))) (range 9))", "(11 33 55 77)");
+    try expectOutput("[(= (map inc (range 5)) '(1 2 3 4 5)) (= (hash (map inc (range 5))) (hash '(1 2 3 4 5))) (= (remove odd? (range 10)) [0 2 4 6 8])]", "[true true true]");
+    try expectOutput("[(conj (map inc (range 5)) 0) (cons :a (filter even? (range 10))) (rest (map inc (range 5))) (next (map inc (range 1)))]", "[(0 1 2 3 4 5) (:a 0 2 4 6 8) (2 3 4 5) nil]");
+    try expectOutput("[(peek (map inc (range 5))) (pop (map inc (range 5))) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[1 (2 3 4 5) 8 7 99999]");
+    try expectOutput("[(meta (with-meta (filter odd? (range 9)) {:a 1})) (meta (map inc (range 9))) (with-meta (map inc (range 5)) {:b 2})]", "[{:a 1} nil (1 2 3 4 5)]");
+    try expectOutput("[(map inc []) (filter odd? [2 4 6 8]) (seq (map inc [])) (empty? (remove any? (range 5)))]", "[() () nil true]");
+    try expectOutput("(let [xs (map inc (range 5))] {xs :v (vec xs) :w})", "{(1 2 3 4 5) :w}");
+    try expectOutput("(let [v (into [] (filter even? (range 80)))] [(count v) (v 39) (peek (conj v :x)) (= v (vec (range 0 80 2))) (into [1] (range 2 5))])", "[40 78 :x true [1 2 3 4]]");
+    try expectOutput("[(reduce-kv (fn [acc i x] (+ acc (* i x))) 0 (vec (range 40))) (reduce-kv (fn [acc k v] (+ acc k v)) 0 (zipmap (range 10) (range 10)))]", "[20540 90]");
+    // A macro's expansion may be a built sequence, or hold one.
+    try expectOutput("(do (defmacro twice-all [& xs] (cons '+ (map (fn [x] (list '* 2 x)) xs))) (twice-all 1 2 3 4))", "20");
+    try expectOutput("(do (defmacro as-code [] (map identity '(+ 1 2 3 4))) (as-code))", "10");
+}
+
 test "integration: reduce" {
     try expectOutput("(reduce + 0 [1 2 3 4 5])", "15");
     try expectOutput("(reduce + 0 (list))", "0");
