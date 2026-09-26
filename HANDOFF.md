@@ -328,29 +328,22 @@ failing test (AGENTS.md).
 
 ### 6.2 Nextomic
 
-1. **A `:db.type/long` value outside i48** is refused with
-   `:nextomic/value-type`, though the key encoding is 8 bytes, and a
-   bignum query input (`(sum ?x)` over one, `[(< ?x ?y)]` against one)
-   is refused the same way. Next: `marshal.zig` accepts a bignum that
-   fits i64 and returns one on the way out, and query `exec.zig`
-   cells carry i64 and promote when materialized; a `test/nextomic`
-   case transacts and queries `2^47` and `2^63 - 1`.
-2. **Two connections to one file in one process** share the file's
+1. **Two connections to one file in one process** share the file's
    environment, but their db-values at one basis are unequal:
    equality is by connection.
-3. **Retracting an attribute's `:db/ident` is accepted** and leaves
+2. **Retracting an attribute's `:db/ident` is accepted** and leaves
    the name live: `[?e :db/ident :u/n]` finds nothing afterwards, yet
    `:u/n` still reads and writes the attribute. Next: refuse it with
    `:nextomic/schema` in `transact.zig`'s check step (or retire the
    name through the minter), a `docs/NEXTOMIC.md` §3 row and a
    `test/nextomic` case.
-4. **A late `:db/index true` backfills AVET history from current
+3. **A late `:db/index true` backfills AVET history from current
    datoms only**: `index-range` over `history` misses a value
    retracted before the attribute was indexed, which EAVT history
    still holds. Next: backfill `nx/avet-h` from the attribute's AEVT
    history, or state in `docs/NEXTOMIC.md` §3 that history AVET starts
    at the indexing `t`.
-5. **Concurrent writers must share a version**: a connection's schema
+4. **Concurrent writers must share a version**: a connection's schema
    cache trusts the `sys` counter `"sg"`, which a build older than it
    does not bump, so a process of an older build that alters schema
    while a newer one has the file open leaves the newer one enforcing
@@ -358,20 +351,20 @@ failing test (AGENTS.md).
    state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
    unchanged but `t` advanced, check the txlog entries in between for
    attribute-partition datoms.
-6. **Small**: a `:db.fn/cas` old value that is an unseen keyword
+5. **Small**: a `:db.fn/cas` old value that is an unseen keyword
    mints it (`transact.zig` resolves the old value with `.assert`;
    `.match` would refuse it without a write), harmless but a stray
    ident; the arg-map form of `q` refuses Datomic's `:timeout` and
    `:io-context` keys with `:nextomic/query-syntax` where ignoring them
    would port more code (an owner's call); the refusal of a
    `get-else` on a card-many attribute carries no `:clause`.
-7. **The planner's join estimates** come from `treeStat` and
+6. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-8. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+7. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-9. **No datom heap kind**: reads return `[e a v t added]` vectors.
+8. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 
@@ -457,13 +450,12 @@ after numbers in the commit message.
 1. Keyword hashing by name (§6.1 item 1): it removes a rule, makes
    printed output independent of intern history, and every later
    `.out` change is smaller after it.
-2. Nextomic longs beyond i48 (§6.2 item 1): user data is refused.
-3. Transaction handles dropped open (§6.1 item 4), writes during
+2. Transaction handles dropped open (§6.1 item 4), writes during
    `db/reduce-tree` (§6.3 item 2), and out of memory as a runtime
    error (§6.1 item 6).
-4. The parser regeneration check and a Linux run (§6.4).
-5. Performance: the levers and measured dead ends are
+3. The parser regeneration check and a Linux run (§6.4).
+4. Performance: the levers and measured dead ends are
    `docs/PERF.md` §6; measure with `zig build bench` first
    (`docs/BENCH.md`).
-6. The open design questions, each an amendment first: laziness
+5. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

@@ -121,7 +121,7 @@ pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Inte
 /// One routine: a header line, then one line per instruction.
 ///
 ///   routine NAME (PATH:LINE:COL) slots=N arity=A upvalues=U
-///     0000  mov:load-const  s1  c0=42  -   ; 4:9
+///     0000  mov:load-const  s1  c0=42  ; 4:9
 fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     try writer.print("routine {s}", .{routine.name});
     if (routine.source) |src| {

@@ -21,6 +21,7 @@ const value = @import("../value.zig");
 const string_mod = @import("../string.zig");
 const dispatch = @import("../dispatch.zig");
 const hash_mod = @import("../hash.zig");
+const bignum = @import("../bignum.zig");
 const key = @import("key.zig");
 const Interner = @import("../intern.zig").Interner;
 
@@ -36,15 +37,16 @@ pub const Var = u32;
 // =============================================================================
 
 /// A relation value in the VM's own terms: every integer-valued datom
-/// component (entity id, ref, long, instant, transaction entity) is
-/// `int`, keywords carry the VM intern id, strings borrow arena bytes
-/// (uuids as their canonical text, byte arrays as their bytes), and
-/// every other VM value rides in `vm`. `Cell.fromValue` maps a VM value
-/// onto the first six arms, so `vm` never holds a fixnum, float,
-/// boolean, keyword or string; cross-arm equality is therefore always
-/// false without loss. A function (a variable in function position
-/// holds one) is identity-valued: it hashes and compares by the bits
-/// of its value.
+/// component (entity id, ref, long, instant, transaction entity) and
+/// every integer in i64, fixnum or bignum, is `int`; keywords carry the
+/// VM intern id, strings borrow arena bytes (uuids as their canonical
+/// text, byte arrays as their bytes), and every other VM value rides in
+/// `vm`. `Cell.fromValue` maps a VM value onto the first six arms, so
+/// `vm` never holds a fixnum, float, boolean, keyword, string or
+/// integer in i64; cross-arm equality is therefore always false without
+/// loss. An integer past i64 is a `vm` bignum and orders as a number. A
+/// function (a variable in function position holds one) is
+/// identity-valued: it hashes and compares by the bits of its value.
 pub const Cell = union(enum) {
     nil,
     int: i64,
@@ -63,6 +65,7 @@ pub const Cell = union(enum) {
             .true_, .false_ => .{ .boolean = v.asBool() },
             .keyword => .{ .keyword = v.asKeywordId() },
             .string => .{ .str = string_mod.asBytes(v) },
+            .bignum => if (bignum.toI64(v)) |n| .{ .int = n } else .{ .vm = v },
             else => .{ .vm = v },
         };
     }
@@ -113,7 +116,7 @@ pub const Cell = union(enum) {
             .int, .double => 2,
             .str => 3,
             .keyword => 4,
-            .vm => 5,
+            .vm => |v| if (v.kind() == .bignum) 2 else 5,
         };
     }
 
@@ -121,7 +124,7 @@ pub const Cell = union(enum) {
     /// one type), or null when they are not comparable here: different
     /// types, or VM values.
     pub fn compare(a: Cell, b: Cell, names: *const Interner) ?std.math.Order {
-        if (a.rank() != b.rank() or a == .vm) return null;
+        if (a.rank() != b.rank() or a.rank() == 5) return null;
         return a.orderBy(b, names);
     }
 
@@ -132,7 +135,8 @@ pub const Cell = union(enum) {
     }
 
     /// A total order: nil < booleans < numbers < strings < keywords <
-    /// other VM values. Numbers compare numerically across int and
+    /// other VM values. Numbers compare as `compare` orders them:
+    /// integers exactly at any size, and in f64 when either is a
     /// double; strings by bytes; keywords by intern id; VM values by
     /// hash. Keywords and VM values are in a stable order, not a
     /// semantic one; `orderBy` orders keywords as the language does.
@@ -140,29 +144,40 @@ pub const Cell = union(enum) {
         const ra = a.rank();
         const rb = b.rank();
         if (ra != rb) return std.math.order(ra, rb);
+        if (ra == 2) return orderNumbers(a, b);
         return switch (a) {
             .nil => .eq,
             .boolean => |x| std.math.order(@intFromBool(x), @intFromBool(b.boolean)),
-            .int => |x| switch (b) {
-                .int => |y| std.math.order(x, y),
-                .double => |y| orderNum(@floatFromInt(x), y),
-                else => unreachable,
-            },
-            .double => |x| switch (b) {
-                .int => |y| orderNum(x, @floatFromInt(y)),
-                .double => |y| orderNum(x, y),
-                else => unreachable,
-            },
             .str => |x| std.mem.order(u8, x, b.str),
             .keyword => |x| std.math.order(x, b.keyword),
             .vm => |x| std.math.order(vmHash(x), vmHash(b.vm)),
+            .int, .double => unreachable,
         };
+    }
+
+    fn orderNumbers(a: Cell, b: Cell) std.math.Order {
+        if (a == .double or b == .double) return orderNum(a.asNumber().?, b.asNumber().?);
+        if (a == .int and b == .int) return std.math.order(a.int, b.int);
+        // A bignum cell lies past i64, so its sign places it against an int.
+        if (a == .int) return if (bignum.isNegative(b.vm)) .gt else .lt;
+        if (b == .int) return if (bignum.isNegative(a.vm)) .lt else .gt;
+        return bignum.compare(a.vm, b.vm);
     }
 
     fn orderNum(x: f64, y: f64) std.math.Order {
         if (x < y) return .lt;
         if (x > y) return .gt;
         return .eq;
+    }
+
+    /// A number cell as the nearest double, or null for another cell.
+    pub fn asNumber(self: Cell) ?f64 {
+        return switch (self) {
+            .int => |n| @floatFromInt(n),
+            .double => |d| d,
+            .vm => |v| if (v.kind() == .bignum) bignum.toF64(v) else null,
+            else => null,
+        };
     }
 
     /// The integer of an `int` cell, or null.
@@ -665,6 +680,26 @@ test "cells: equality, hash agreement, order" {
     try testing.expect(Cell.fromValue(value.fromChar('x').?) == .vm);
     try testing.expectEqual(@as(?u64, 5), (Cell{ .int = 5 }).asEid());
     try testing.expect((Cell{ .int = -5 }).asEid() == null);
+}
+
+test "cells: an integer is int in i64 and a number past it" {
+    var heap = @import("../heap.zig").Heap.init(testing.allocator);
+    defer heap.deinit();
+    const max = try bignum.fromI64(&heap, std.math.maxInt(i64));
+    try testing.expect(Cell.fromValue(max).eql(.{ .int = std.math.maxInt(i64) }));
+    try testing.expect(Cell.fromValue(try bignum.fromI64(&heap, -(1 << 47) - 1)).eql(.{ .int = -(1 << 47) - 1 }));
+    const past = Cell.fromValue(try bignum.fromI128(&heap, @as(i128, std.math.maxInt(i64)) + 1));
+    const below = Cell.fromValue(try bignum.fromI128(&heap, @as(i128, std.math.minInt(i64)) - 1));
+    try testing.expect(past == .vm and below == .vm);
+    var names = Interner.init(testing.allocator);
+    defer names.deinit();
+    try testing.expect(past.compare(.{ .int = std.math.maxInt(i64) }, &names) == .gt);
+    try testing.expect((Cell{ .int = std.math.minInt(i64) }).compare(below, &names) == .gt);
+    try testing.expect(below.compare(past, &names) == .lt);
+    try testing.expect(past.compare(.{ .double = 1.0e19 }, &names) == .lt);
+    try testing.expect(past.compare(.{ .str = "a" }, &names) == null);
+    try testing.expect(past.order(.{ .str = "a" }) == .lt);
+    try testing.expect(past.order(.{ .boolean = true }) == .gt);
 }
 
 test "column widens from int to cell" {

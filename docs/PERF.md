@@ -252,6 +252,37 @@ copy.
 | `(loop [v (vec (range 20000))] (if (seq v) (recur (pop v)) v))` | 5.73 s | 0.11 s |
 | 100 × `(reduce + (rest v))`, `v` of 100,000 elements | 0.43 s | 0.14 s |
 
+### 3.10 Common forms through `bin/nexis`
+
+What the compiler emits for common forms (instruction counts,
+`docs/COMPILER.md` §4.8) and what that costs at run time, before and
+after these changes to the code it emits: `let` aliases, forms for effect, returns in a function's tail, branching on
+`and`, `or` and `not`, `is` as one helper call, `case` through one
+lookup, overload dispatch on inlined compares, `assert` built at
+expansion. Wall time inside one `bin/nexis run` of a probe program,
+read with `nano-time` around each loop; the median of nine runs, the
+two builds alternating, range in brackets.
+
+| Loop | Before | After |
+|---|---:|---:|
+| 200k calls of a 10-keyword `case` with a default | 35.8 ms [35.4–38.4] | 27.6 ms [27.1–29.0] |
+| 200k calls of a 10-int `case` with a default | 33.4 ms [31.0–35.4] | 24.6 ms [24.3–26.2] |
+| 200k calls `(multi 1 2)` of a three-arity `defn` | 42.0 ms [38.7–43.5] | 32.4 ms [31.8–34.0] |
+| 200k calls of a fn nesting `when-let` and `if-let` | 12.7 ms [12.2–14.1] | 10.2 ms [9.9–10.8] |
+| 200k `(assert (pos? 1) "positive")` | 6.1 ms [6.0–6.6] | 5.7 ms [5.3–5.8] |
+| 200k calls destructuring a vector and a map | 34.4 ms [33.2–36.5] | 32.9 ms [32.1–35.0] |
+| 3 × `(count (for [x (range 100000)] (inc x)))` | 45.6 ms [44.3–48.7] | 45.3 ms [44.6–46.6] |
+| 60k `is` assertions (`=`, a predicate, `thrown?`) through `run-tests` | 21.9 ms [21.5–23.5] | 22.3 ms [21.8–23.3] |
+
+Before, an assertion inlined its whole report (17 instructions for
+`(is (= ...))`); after, it is one call of a `nexis.test` helper (7),
+making as many closure calls when it passes. Alone, 300k
+`thrown?` assertions ran 113.7 ms before and 120.0 ms after (median of
+five), the `fail!` call's operands being loaded before the throw. The
+`compiler` and `vm` rows of `zig build bench` compile top-level forms
+whose code these changes leave as it was; five alternating runs of
+each build put every row's medians within each other's spread.
+
 ---
 
 ## 6. Levers and dead ends
@@ -293,6 +324,14 @@ Each lever is a measured change: a before/after from `zig build bench`
 - **A smaller heap header** for small objects.
 - **A single-key read path for durable refs** that skips the general
   transaction scaffolding.
+- **Forwarding single-use `let` bindings into a call block**: `(let [x
+  (f)] (g x))` computes `x` into its slot and moves it into `g`'s
+  block; computing it into the block directly saves the move for each
+  binding used once, as an argument, by the body's call.
+- **A compare-and-branch opcode**: an `if` on `(< i n)` is `cmp:lt`
+  into a slot and `jump:if-false` on it; a fused form halves every
+  loop test and every `case` clause (§3.10). It is a new instruction
+  (VM.md §10), so it needs the encoding's amendment.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
 
@@ -370,3 +409,4 @@ is one invocation's 30-sample median.
 | §3.6 M5 column, §3.8 | Apple M5, 32 GiB, macOS 26.6, Zig 0.16.0, ReleaseFast, idle | `zig build bench -Doptimize=ReleaseFast`, five invocations per state of the tree, the best median with the spread; "before" is the tree at `739d24f`, "after" the `vm` and `champ` commits named in the table. That run had the pool under the benchmark heaps; its construction and codec-decode rows are dropped as pool figures. The `vm`, `compiler`, lookup and `db` rows do not allocate from the pool |
 | §3.7 | Apple M5, as above | `zig build bench -Doptimize=ReleaseFast -- --filter nextomic`, best of five invocations with the spread; the pull rows took a single sample per run |
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
+| §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |

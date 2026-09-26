@@ -23,6 +23,7 @@ const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const intern_mod = @import("../intern.zig");
 const string_mod = @import("../string.zig");
+const bignum = @import("../bignum.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
@@ -253,15 +254,15 @@ pub const Conn = struct {
         return s;
     }
 
-    /// Materialise a datom value into the VM heap. Refs, longs and
-    /// instants become fixnums; keywords are interned into the VM;
+    /// Materialise a datom value into the VM heap. Refs become
+    /// fixnums, longs and instants the language's integer (a bignum
+    /// past the fixnum range); keywords are interned into the VM;
     /// uuids become their canonical text; byte arrays become strings.
     pub fn valToValue(self: *Conn, txn: *Txn, heap: *Heap, v: Val) !Value {
         return switch (v) {
             .boolean => |b| value.fromBool(b),
-            .long => |n| value.fromFixnum(n) orelse error.ValueType,
+            .long, .instant => |n| try bignum.fromI64(heap, n),
             .double => |d| value.fromFloat(d),
-            .instant => |n| value.fromFixnum(n) orelse error.ValueType,
             .keyword => |id| blk: {
                 const k = (try self.idents.internOf(txn, id)) orelse return error.Corrupted;
                 break :blk value.fromKeywordId(k);

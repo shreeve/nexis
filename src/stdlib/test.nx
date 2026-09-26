@@ -3,9 +3,10 @@
 ; atoms and throw. Embedded via @embedFile and bootstrapped at VM
 ; startup with nexis.test as the current namespace, after core.nx.
 ;
-; No keyword literal appears in this file: it is compiled at boot,
-; ahead of every keyword a script reads, and a map's layout is a
-; function of intern order. The keywords of the result map are
+; No keyword literal appears in this file, nor a defn- (whose
+; metadata is the keyword :private): it is compiled at boot, ahead of
+; every keyword a script reads, and a map's layout is a function of
+; intern order. The keywords of the result map are
 ; built when run-tests returns; the counters use string keys.
 
 ; ---- registry ----
@@ -73,31 +74,45 @@
 
 ; ---- assertions ----
 
+; What an assertion calls: `is` expands to one call of these, so the
+; judging and the reporting are here once, not in every assertion.
+; Each returns whether the assertion passed; a pass is counted here
+; rather than through `pass!`, one closure call fewer per assertion.
+(defn check= [form expected actual msg]
+  (if (= expected actual) (do (bump! "pass") true) (fail! form expected actual msg)))
+
+(defn check-truthy [form v msg]
+  (if v (do (bump! "pass") true) (fail! form true v msg)))
+
+; The handler of a `thrown?` with a keyword tag: a throw the tag does
+; not take goes on (a throw of the value the catch holds keeps its
+; origin, VM.md §12).
+(defn check-thrown [e tag]
+  (if (nexis.internal/#%catch-matches? e tag) (do (bump! "pass") true) (throw e)))
+
 ; (is (= expected actual) msg?) → reports the two values on failure.
 ; (is (thrown? MATCHER expr) msg?) → passes when expr throws a value
 ;   `(catch MATCHER ...)` would take: a keyword tag or `any`; a value
 ;   the matcher does not take propagates and counts as an error.
 ; (is expr msg?) → passes when expr is truthy.
-; Each returns whether it passed.
+; Each returns whether it passed. The message is evaluated after the
+; values, once.
 (defmacro is [form & more]
   (let* [msg (first more)
          head (if (seq? form) (name (first form)) nil)]
     (cond
       (and (= head "=") (= (count form) 3))
-      `(let* [e# ~(second form) a# ~(third form)]
-         (if (= e# a#)
-           (nexis.test/pass!)
-           (nexis.test/fail! '~form e# a# ~msg)))
+      `(nexis.test/check= '~form ~(second form) ~(third form) ~msg)
       (= head "thrown?")
-      `(try
-         (let* [v# ~(third form)]
-           (nexis.test/fail! '~form '~(second form) v# ~msg))
-         (catch ~(second form) e# (nexis.test/pass!)))
+      (let* [m (second form)
+             tag? (and (keyword? m) (not (and (nil? (namespace m)) (= (name m) "default"))))]
+        `(try
+           (nexis.test/fail! '~form '~m ~(third form) ~msg)
+           ~(if tag?
+              `(catch any e# (nexis.test/check-thrown e# ~m))
+              `(catch ~m e# (nexis.test/pass!)))))
       true
-      `(let* [v# ~form]
-         (if v#
-           (nexis.test/pass!)
-           (nexis.test/fail! '~form true v# ~msg))))))
+      `(nexis.test/check-truthy '~form ~form ~msg))))
 
 ; (testing "description" body...) → runs body with the description
 ; on the context stack, popped on every exit.
