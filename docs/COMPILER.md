@@ -38,7 +38,7 @@ guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
 - A separate resolver or analyzer module: classification and
   capture marking happen inside `lowerForm`.
 - Register allocation beyond a stack of slots (§4.4); inline caches,
-  operand-specialized opcodes, extension instructions.
+  operand-specialized opcodes.
 
 ---
 
@@ -245,28 +245,35 @@ constant pool, Var table, capture descriptors, span table,
   (identical bits: the same immediate or the same heap object), and
   the Var table each Var once; a routine that captures one name from
   several scopes has one upvalue for it.
-- **Limits.** Operand indexes are 12 bits (VM.md §3):
+- **Limits.** Pcs and table indexes are the instruction's 32-bit
+  wide field and slots and upvalues 12-bit operands (VM.md §3):
 
-  | Limit | Error |
-  |---|---|
-  | more than 4096 slots live at once, upvalues, Var-table entries, or call arguments | `SlotOverflow` |
-  | more than 4096 constants or capture descriptors | `ConstantPoolOverflow` |
-  | a jump, `try` handler or `finally` target past pc 4095 | `JumpTargetOutOfRange` |
+  | What one routine holds | Limit | Past it |
+  |---|---|---|
+  | instructions; jump, `try` handler and `finally` targets | 2^32 | none reachable: the tables cannot be allocated first (`OutOfMemory`) |
+  | `try` forms | 2^32 | none reachable |
+  | constants | 2^32; the first 4096 read in place as `c` operands | a constant past 4095 is loaded into a slot with `mov:load-const` |
+  | Var-table entries | 2^32; the first 4096 read in place as `v` operands | a Var past 4095 is loaded into a slot with `var:load-var` |
+  | capture descriptors (the `fn*` forms in it) | 2^32 | none reachable |
+  | slots live at once | 4096 | `SlotOverflow`: `fn NAME: more than 4096 local slots` |
+  | upvalues (distinct captured names) | 4096 | `SlotOverflow`: `fn NAME: more than 4096 captured locals` |
 
-  Straight-line code past pc 4095 that nothing jumps to runs; the
-  limit is on branch targets, so a routine longer than 4096
-  instructions fails only where a form needs such a target (a very
-  long `deftest` body is one). Each error is reported at the
-  innermost form being compiled when it is raised (§7).
+  Slots live at once are the bindings in scope, the temporaries of
+  the form being computed and the block of a call or computed
+  collection, one slot per item.
+  Each error is reported at the innermost form being compiled when it
+  is raised, with a detail naming the routine (`fn NAME`, `anonymous
+  fn` or `top-level form`) and the limit (§7).
 
 **Errors**: `RecurOutsideTail`, `RecurArityMismatch`, `SlotOverflow`,
-`ConstantPoolOverflow`, `JumpTargetOutOfRange`, `InternalCompilerBug`,
-`StackOverflow`.
+`InternalCompilerBug`, `StackOverflow`.
 
 #### 4.5 Codegen invariants
 
-- Instructions are 64-bit primary instructions; the extension form is
-  never emitted.
+- Instructions are 64-bit; a pc, constant, Var, try or
+  capture-descriptor index is the wide field (VM.md §3). A forward
+  jump, and a `try`'s catch and finally pcs, carry the placeholder
+  2^32 − 1 until their target is placed.
 - Var references compile to `v` operands bound to `*Var` pointers at
   compile time (§4.7).
 - A closure's upvalues are numbered 0..N-1 and it captures N cell
@@ -336,13 +343,14 @@ a captured binding is boxed with `closure:box-local` immediately
 
 #### 5.5 `(fn* name? [params... & rest?] body...)`
 
-- The body compiles into a child routine, registered in the current
-  routine's constant pool (`c` operand A of `closure:make`).
-- Every enclosing binding the body references becomes a source in a
-  capture descriptor (operand B): `local_cell_slot(s)` for a cell in
-  the current frame, `inherited_upvalue(u)` for one the current
-  closure captured. `closure:make A=proto B=desc C=dst` builds the
-  closure, kind `function` (VALUE.md kind 24).
+- The body compiles into a child routine, named by a capture
+  descriptor of the current routine (the wide field of
+  `closure:make`).
+- Every enclosing binding the body references becomes a source in
+  that descriptor: `local_cell_slot(s)` for a cell in the current
+  frame, `inherited_upvalue(u)` for one the current closure captured.
+  `closure:make A=dst W=desc` builds the closure, kind `function`
+  (VALUE.md kind 24).
 - The routine records `fixed_arity` and `variadic`; the rest parameter
   is slot `params.len`, filled by the VM at call time (VM.md §6). A
   captured parameter, rest included, is boxed at function entry.
@@ -356,7 +364,7 @@ through a placeholder cell:
 ```
 ; (def f (fn* fact [n] ... (fact (- n 1)) ...)), from nexis disasm
 closure:new-cell    s2  -  -                        ; an uninitialized cell
-closure:make        c0=<routine fact>  #0[s2]  s1   ; captures it
+closure:make        s1  #0<routine fact>[s2]        ; captures it
 closure:init-cell   s2  s1  -                       ; the cell holds the closure
 ```
 
@@ -449,9 +457,9 @@ values nor re-boxes; the body compiles as `do` with the loop's
 
 #### 5.8 `(def name expr?)`
 
-Interns `name` in the current namespace (§4.7), compiles `expr` (nil
-when absent) and emits `var:store-var`, which sets the root, marks the
-Var bound and yields the Var. `defn` is the host macro's `(def name
+Interns `name` in the current namespace (§4.7) and, when `expr` is
+given, emits `var:store-var` of it, which sets the root and marks the
+Var bound; `var:var-object` then yields the Var. `defn` is the host macro's `(def name
 (fn name ...))` (MACROEXPAND.md §10), so the body recurses through the
 self-name.
 
@@ -469,9 +477,9 @@ keyword matchers, a `finally` alone) onto it, with keyword matching as
 a chain of `nexis.internal/#%catch-matches?` tests (MACROEXPAND.md
 §2b).
 
-- `ctrl:try-enter` installs the handler (catch pc, binding slot,
-  optional finally pc); the body runs; `ctrl:try-exit` pops it on the
-  normal path.
+- `ctrl:try-enter` installs the handler: the binding slot, and the
+  routine's `tries` entry for this `try` (catch pc, optional finally
+  pc); the body runs; `ctrl:try-exit` pops it on the normal path.
 - On a throw the VM stores the value in the binding's slot and jumps
   to the catch entry; a captured binding is boxed first thing.
 - The `finally` body sees the enclosing scope, not the catch binding,
@@ -568,7 +576,7 @@ not):
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
 | `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering or inside a quote; a quoted symbol or keyword without an interner, a string or bignum without a heap |
 | `RecurOutsideTail`, `RecurArityMismatch` | §4.4 |
-| `SlotOverflow`, `ConstantPoolOverflow`, `JumpTargetOutOfRange` | the limits of §4.4 |
+| `SlotOverflow` | the limits of §4.4 that remain: slots live at once, upvalues |
 | `MacroDepthExceeded` | 256 expansions in a row (MACROEXPAND.md §6) |
 | `MacroExpansionFailure` | every other expansion error: a malformed macro call, a macro that threw or returned a non-form (MACROEXPAND.md §8) |
 | `StackOverflow` | a form nested past the native stack budget (below) |
@@ -589,7 +597,8 @@ form being lowered or emitted when the error was raised, or the
 symbol's own for `UnresolvedSymbol` (`LowerDiag`). An expansion error
 carries the span of the innermost form the expander failed at
 (`ExpandContext.failure`), and its reason goes to
-`CompileOptions.out_detail`. Forms a macro produced carry the call's
+`CompileOptions.out_detail`; so does a limit's (`LowerDiag.detail`):
+`fn many: more than 4096 local slots`. Forms a macro produced carry the call's
 span, so an error inside an expansion is reported at the call. There
 is no secondary span and no expansion-provenance chain. The CLI's
 rendering of a compile error, and its exit status, are `TOOLING.md`

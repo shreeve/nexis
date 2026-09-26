@@ -1965,6 +1965,40 @@ test "integration: bare vector literal as expression" {
     try expectOutput("[1 2 3]", "[1 2 3]");
 }
 
+/// `open`, then `item` n times with every `{d}` in it replaced by
+/// the item's index, then `close`.
+fn generated(open: []const u8, item: []const u8, n: usize, close: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, open);
+    for (0..n) |i| {
+        var parts = std.mem.splitSequence(u8, item, "{d}");
+        try out.appendSlice(testing.allocator, parts.first());
+        while (parts.next()) |part| {
+            try out.print(testing.allocator, "{d}", .{i});
+            try out.appendSlice(testing.allocator, part);
+        }
+    }
+    try out.appendSlice(testing.allocator, close);
+    return out.toOwnedSlice(testing.allocator);
+}
+
+test "compile: a routine of more than 4096 constants, Vars and closures runs" {
+    // Each distinct literal is a constant, each (def ...) a Var, each
+    // fn a closure of the one routine the let compiles to.
+    const cases = [_]struct { open: []const u8, item: []const u8, close: []const u8, out: []const u8 }{
+        .{ .open = "(let [x 0 a (atom 0)]", .item = " (swap! a + (+ x {d}))", .close = " [@a (+ x 4999) (- x 4999)])", .out = "[12497500 4999 -4999]" },
+        .{ .open = "(let [a (atom [])]", .item = " (swap! a conj \"s{d}\")", .close = " [(count @a) (last @a)])", .out = "[5000 s4999]" },
+        .{ .open = "(let [x 1]", .item = " (def v{d} (+ x {d}))", .close = " [v0 v4999 (+ v4998 1) (var v4999)])", .out = "[1 5000 5000 #'user/v4999]" },
+        .{ .open = "(let [x 1 a (atom [])]", .item = " (swap! a conj (fn [] (+ x {d})))", .close = " [(count @a) ((last @a)) ((first @a))])", .out = "[5000 5000 1]" },
+    };
+    for (cases) |c| {
+        const src = try generated(c.open, c.item, 5000, c.close);
+        defer testing.allocator.free(src);
+        try expectOutputProgram(src, c.out);
+    }
+}
+
 // =============================================================================
 // Catchable VmErrors
 // =============================================================================
@@ -5534,6 +5568,24 @@ test "nexis.test: run-tests counts tests, assertions, failures and errors and re
     ,
         \\[4 4 3 1 [FAIL in user/failing-test (wrong): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply FAIL in user/failing-test (wrong): (empty? [1]) expected: true actual: false FAIL in user/throwing-test: (nexis.test/thrown? :boom (+ 1 1)) expected: :boom actual: 2 ERROR in user/erroring-test: :divide-by-zero Ran 4 tests containing 7 assertions. 3 failures, 1 errors.]]
     );
+}
+
+test "nexis.test: a deftest of 5000 assertions compiles, runs and counts every pass" {
+    // One routine of some 90,000 instructions and more than 4096
+    // constants; the `testing` blocks' finally targets lie past the
+    // 16-bit range.
+    const src = try generated(
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest big
+    ,
+        \\ (nexis.test/testing "t" (nexis.test/is (= {d} (inc (dec {d})))))
+    , 5000,
+        \\)
+        \\(def r (nexis.test/run-tests))
+        \\[(:test r) (:pass r) (:fail r) (:error r)]
+    );
+    defer testing.allocator.free(src);
+    try expectOutputProgram(src, "[1 5000 0 0]");
 }
 
 test "nexis.test: tests register per namespace, replace by name, and run-all-tests spans namespaces" {

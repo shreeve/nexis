@@ -1,0 +1,7 @@
+; A function whose locals outnumber a routine's 4096 slots is a
+; compile error that names the function and the limit.
+(defmacro let-many [n body]
+  `(let ~(vec (mapcat (fn [i] [(symbol (str "a" i)) i]) (range n))) ~body))
+
+(defn many []
+  (let-many 4100 a0))
