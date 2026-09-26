@@ -332,13 +332,7 @@ failing test (AGENTS.md).
 1. **Two connections to one file in one process** share the file's
    environment, but their db-values at one basis are unequal:
    equality is by connection.
-2. **A late `:db/index true` backfills AVET history from current
-   datoms only**: `index-range` over `history` misses a value
-   retracted before the attribute was indexed, which EAVT history
-   still holds. Next: backfill `nx/avet-h` from the attribute's AEVT
-   history, or state in `docs/NEXTOMIC.md` §3 that history AVET starts
-   at the indexing `t`.
-3. **Concurrent writers must share a version**: a connection's schema
+2. **Concurrent writers must share a version**: a connection's schema
    cache trusts the `sys` counter `"sg"`, which a build older than it
    does not bump, so a process of an older build that alters schema
    while a newer one has the file open leaves the newer one enforcing
@@ -346,13 +340,13 @@ failing test (AGENTS.md).
    state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
    unchanged but `t` advanced, check the txlog entries in between for
    attribute-partition datoms.
-4. **The planner's join estimates** come from `treeStat` and
+3. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-5. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+4. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-6. **No datom heap kind**: reads return `[e a v t added]` vectors.
+5. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

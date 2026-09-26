@@ -899,3 +899,84 @@ test "T3 a permutation of tx-data gives the same report or fails alike" {
     try testing.expect(succeeded > 30);
     try testing.expect(failed > 30);
 }
+
+// =============================================================================
+// A late index: the attribute's AVET history, current and history trees,
+// is its whole history, values retracted before the indexing included.
+// =============================================================================
+
+/// The datoms of attribute `a` in `index` for `view`, as
+/// `e|v|t|added` counts; `eavt` walks every datom and keeps `a`'s.
+fn attrSet(arena: Allocator, view: db_mod.DbValue, index: key.Index, a: u32) !std.StringHashMapUnmanaged(u32) {
+    var out: std.StringHashMapUnmanaged(u32) = .empty;
+    const comps: key.Components = if (index == .eavt) .{} else .{ .a = a };
+    for (try view.datoms(arena, index, comps)) |d| {
+        if (d.a != a) continue;
+        const k = try std.fmt.allocPrint(arena, "{d}|{x}|{d}|{}", .{ d.e, try key.valBytes(arena, d.v), d.t, d.added });
+        const g = try out.getOrPut(arena, k);
+        if (!g.found_existing) g.value_ptr.* = 0;
+        g.value_ptr.* += 1;
+    }
+    return out;
+}
+
+test "T4 an attribute indexed late holds its whole history in AVET" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(prng_seed ^ 0xa7e7);
+    const rand = prng.random();
+
+    const tc = try db_mod.TestConn.init("prop_tx_late_index");
+    defer tc.deinit();
+    const attrs = try installSchema(arena, tc);
+    const long_text = "a value past the inline limit, so its AVET rows carry a hash and its EAVT rows the payload: " ++ "x" ** 40;
+    var es: [6]u64 = undefined;
+    for (&es, 0..) |*e, i| {
+        const r = try transact.transactOps(tc.conn, arena, &.{
+            .{ .add = .{ .e = .{ .tempid = .{ .fixnum = -1 } }, .a = .{ .id = attrs.age }, .v = .{ .val = .{ .long = @intCast(i) } } } },
+        }, .{});
+        e.* = r.tempids[0].eid;
+    }
+    var retracted: usize = 0;
+    var indexed_at: u64 = 0;
+    for (0..80) |i| {
+        var ops: std.ArrayList(Op) = .empty;
+        var used: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        for (0..1 + rand.uintLessThan(usize, 3)) |_| {
+            const e = es[rand.uintLessThan(usize, es.len)];
+            if ((try used.getOrPut(arena, e)).found_existing) continue;
+            const ent: transact.Entity = .{ .eid = e };
+            switch (rand.uintLessThan(u8, 4)) {
+                // A card-one overwrite retracts the value it replaces.
+                0, 1 => try ops.append(arena, .{ .add = .{ .e = ent, .a = .{ .id = attrs.age }, .v = .{ .val = .{ .long = rand.uintLessThan(u8, 8) } } } }),
+                2 => try ops.append(arena, .{ .retract_attr = .{ .e = ent, .a = .{ .id = attrs.age } } }),
+                else => try ops.append(arena, .{ .add = .{ .e = ent, .a = .{ .id = attrs.bio }, .v = .{ .val = .{ .string = if (rand.boolean()) long_text else "short" } } } }),
+            }
+        }
+        // Midway both attributes become indexed, beside data of their own.
+        if (i == 40) {
+            for ([_]u32{ attrs.age, attrs.bio }) |a| try ops.append(arena, .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = boot.index }, .v = .{ .val = .{ .boolean = true } } } });
+        }
+        const r = try transact.transactOps(tc.conn, arena, ops.items, .{});
+        if (i == 40) indexed_at = r.t;
+        if (i < 40) for (r.tx_data) |d| {
+            if (!d.added and (d.a == attrs.age or d.a == attrs.bio)) retracted += 1;
+        };
+    }
+    try testing.expect(retracted > 10);
+    const db = try tc.conn.db();
+    for ([_]u32{ attrs.age, attrs.bio }) |a| {
+        errdefer std.debug.print("attribute {d} (seed 0x{x})\n", .{ a, prng_seed ^ 0xa7e7 });
+        var want = try attrSet(arena, db.withHistory(), .eavt, a);
+        var got = try attrSet(arena, db.withHistory(), .avet, a);
+        try expectSameKeys(u32, "history AVET against EAVT", &want, &got);
+        var t: u64 = indexed_at;
+        while (t <= db.basis) : (t += 1) {
+            const view = db.asOf(t);
+            var want_t = try attrSet(arena, view, .aevt, a);
+            var got_t = try attrSet(arena, view, .avet, a);
+            try expectSameKeys(u32, try std.fmt.allocPrint(arena, "AVET as-of {d}", .{t}), &want_t, &got_t);
+        }
+    }
+}

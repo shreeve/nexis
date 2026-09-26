@@ -302,8 +302,11 @@ so there is no queue; emdb's write lock is the transactor.
    - `:db/index true` and `:db/unique` may be added, never retracted
      (`:nextomic/conflict`; an explicit `:db/index false` gives way to
      `true`), and the transaction that adds them backfills AVET from
-     AEVT (an attribute becoming unique while two entities hold one
-     value is `:nextomic/unique`). A unique attribute identifies one
+     the current AEVT rows and `nx/avet-h` from the attribute's whole
+     AEVT history, retractions included, so `index-range` and `datoms`
+     over a history or as-of view find a value retracted before the
+     index existed (an attribute becoming unique while two entities
+     hold one value is `:nextomic/unique`). A unique attribute identifies one
      entity by one value, so it is cardinality one: `:db/unique` on a
      card-many attribute is `:nextomic/tx-data`, and a unique attribute
      becoming card-many `:nextomic/schema`.

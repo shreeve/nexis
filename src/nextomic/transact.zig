@@ -1765,8 +1765,10 @@ const Ctx = struct {
     }
 
     /// Copy every current `(e v t)` of the attribute from AEVT into AVET
-    /// and AVET-h with its original `t`, refusing duplicate values when
-    /// the attribute becomes unique.
+    /// with its original `t`, and every row of its AEVT history into
+    /// AVET-h, retractions and values retracted long before included,
+    /// so a history or as-of view of the index reads what EAVT holds;
+    /// refuse duplicate values when the attribute becomes unique.
     fn backfillAvet(self: *Ctx, attr: *const Attr) !void {
         var becomes_unique = false;
         for (self.overlay.items) |p| {
@@ -1796,9 +1798,15 @@ const Ctx = struct {
             var tb: [key.id_len]u8 = undefined;
             key.writeId(&tb, r.t);
             try self.txn.putInTree(store.trees.cur(.avet), ck, &tb);
-            const hk = try key.keyBytes(self.arena, .avet, r.e, attr.id, r.vbytes, .{ .t = r.t, .added = true });
-            try self.txn.putInTree(store.trees.hist(.avet), hk, &.{});
         }
+        // Collected before the puts: no cursor stays open across a write.
+        var history: std.ArrayList([]const u8) = .empty;
+        var hs = try Store.scan(self.txn, store.trees.hist(.aevt), try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id }));
+        while (hs.next()) |kv| {
+            const parts = try key.unpackKey(.aevt, true, kv.key);
+            try history.append(self.arena, try key.keyBytes(self.arena, .avet, parts.e, attr.id, parts.v, parts.top orelse return error.Corrupted));
+        }
+        for (history.items) |hk| try self.txn.putInTree(store.trees.hist(.avet), hk, &.{});
         // Pending datoms of this attribute belong in AVET too.
         if (self.attrs.get(attr.id)) |c| c.indexed = true;
     }
