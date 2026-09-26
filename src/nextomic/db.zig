@@ -238,12 +238,14 @@ pub const Conn = struct {
     /// The schema serving `basis` inside `txn` (whose `sys["t"]` is
     /// `now`). A cached schema built at a basis `>= basis` serves it
     /// through `attrAt`; one whose schema generation is still the
-    /// store's serves `now` too, since only data was committed since;
-    /// otherwise the cache is rebuilt at `now`.
+    /// store's serves `now` too once the txlog entries committed since
+    /// hold no attribute-partition datom, since only data was committed
+    /// (the entries settle it for a writer of a build that does not
+    /// bump the generation); otherwise the cache is rebuilt at `now`.
     pub fn schemaAt(self: *Conn, txn: *Txn, basis: u64, now: u64) !*Schema {
         if (self.schema_cache) |s| {
             if (s.basis >= basis) return s;
-            if (s.gen == try self.store.readSchemaGen(txn)) {
+            if (s.gen == try self.store.readSchemaGen(txn) and !try self.schemaWritten(txn, s.basis, now)) {
                 s.basis = now;
                 return s;
             }
@@ -253,6 +255,24 @@ pub const Conn = struct {
         const s = try Schema.build(self.gpa, self.store, txn, now);
         self.schema_cache = s;
         return s;
+    }
+
+    /// Whether a transaction in `(after, upto]` wrote a datom on an
+    /// attribute-partition entity. Each entry is read once per
+    /// connection: the cache then serves `upto`.
+    fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var start: [key.id_len]u8 = undefined;
+        key.writeId(&start, after + 1);
+        var end: [key.id_len]u8 = undefined;
+        key.writeId(&end, upto + 1);
+        var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
+        while (s.next()) |kv| {
+            defer _ = arena_state.reset(.retain_capacity);
+            if (try datom_mod.touchesAttrPartition(arena_state.allocator(), kv.value)) return true;
+        }
+        return false;
     }
 
     /// Materialise a datom value into the VM heap. Refs become

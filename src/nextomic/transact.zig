@@ -3506,6 +3506,49 @@ test "another connection's data commits keep the schema cache; its schema change
     try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
 }
 
+test "a schema change that leaves the generation alone, as an older build's does, still rebuilds the cache" {
+    const tc = try TestConn.init("tx_schema_gen_old_build");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const other = try Conn.open(testing.allocator, &tc.interner, tc.td.path.ptr, .{ .sync = .none });
+    defer other.destroy();
+
+    try testing.expect(!(try (try tc.conn.db()).attr(name)).?.many());
+    const store = other.store;
+    const gen = blk: {
+        const txn = try store.beginRead();
+        defer txn.abort();
+        break :blk try store.readSchemaGen(txn);
+    };
+    // A data commit, then the schema change, then "sg" put back.
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } },
+    }, .{});
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .eid = name }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_many } } } },
+    }, .{});
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, gen, .big);
+        try store.sysPut(txn, "sg", &bytes);
+        try txn.commit();
+    }
+    try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
+    // Data-only commits since keep the rebuilt cache.
+    const cached = tc.conn.schema_cache.?;
+    _ = try transactOps(other, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "B" } } } },
+    }, .{});
+    _ = try (try tc.conn.db()).attr(name);
+    try testing.expectEqual(cached, tc.conn.schema_cache.?);
+}
+
 test "the view outlives the scratch arena until destroy" {
     const tc = try TestConn.init("tx_with_view_lifetime");
     defer tc.deinit();

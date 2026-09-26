@@ -332,21 +332,13 @@ failing test (AGENTS.md).
 1. **Two connections to one file in one process** share the file's
    environment, but their db-values at one basis are unequal:
    equality is by connection.
-2. **Concurrent writers must share a version**: a connection's schema
-   cache trusts the `sys` counter `"sg"`, which a build older than it
-   does not bump, so a process of an older build that alters schema
-   while a newer one has the file open leaves the newer one enforcing
-   the old schema. Sequential use across versions is fine. Next:
-   state the rule in `docs/NEXTOMIC.md` §2.3, or, when `"sg"` is
-   unchanged but `t` advanced, check the txlog entries in between for
-   attribute-partition datoms.
-3. **The planner's join estimates** come from `treeStat` and
+2. **The planner's join estimates** come from `treeStat` and
    per-attribute counts; measure `nextomic_q.zig`'s three-way joins in
    ReleaseFast (`docs/PERF.md` §3.7) before changing them.
-4. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
+3. **Full-text lowercases ASCII only**: `Café` and `CAFÉ` are two
    tokens. Case folding needs a table and a rebuild of `nx/fulltext`
    at open.
-5. **No datom heap kind**: reads return `[e a v t added]` vectors.
+4. **No datom heap kind**: reads return `[e a v t added]` vectors.
 
 ### 6.3 Storage
 

@@ -183,7 +183,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
-| `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under, since only data was committed since |
+| `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it when the writer was a build that does not bump the generation, and each is read once per connection |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -445,7 +445,9 @@ history of the attribute partition: every assertion and retraction of
 `:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
 `:db/isComponent` and `:db/fulltext` on an attribute is one event of its
 timeline. The cache serves a later basis while `sys["sg"]` is unchanged
-(§2.3), and is rebuilt when another connection changed the schema. It
+and the txlog entries in between write no attribute-partition datom
+(§2.3), and is rebuilt when another connection, of this build or an
+older one, changed the schema. It
 serves every earlier basis by replaying each attribute's timeline up to
 it: attributes created after it are hidden, and every flag and the
 cardinality read as that basis saw them, so an attribute indexed at one
