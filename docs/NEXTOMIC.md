@@ -335,7 +335,9 @@ during normalisation with `db-before` (a db-value at the connection's
 basis, the state every function in the transaction sees) followed by
 the args, and the tx-data it returns takes the form's place: it is
 normalised like any other tx-data, so it may hold map forms, tempids
-and further calls, to a depth of 16 (`:nextomic/tx-fn` past it). `f` is
+and further calls, in chains up to 1000 calls deep (`transact.max_call_depth`;
+past it `:nextomic/tx-fn` names the limit). The bound stops a function
+that calls itself forever long before the native stack would. `f` is
 a function value, or a symbol naming a var resolved as a query
 function is (§5); anything else is `:nextomic/tx-data`, and an unbound
 symbol `:nextomic/tx-fn` naming it. A nil result is no tx-data. The
@@ -786,7 +788,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/schema` | a schema change the attribute's data or type refuses | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | bare |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | bare |
-| `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit |
+| `:nextomic/tx-fn` | a transaction function that cannot run | `:message`: the unbound symbol, or the depth limit and its value |
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:message`; `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault: the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |

@@ -32,6 +32,11 @@
 (println (t/caught (d/transact! c [[:db.fn/call (fn [db] {:db/id a :user/age 2})]])))
 (println (t/caught (d/transact! c [[:db.fn/call :not-a-function]])))
 (println (t/caught (d/transact! c '[[:db.fn/call no-such-fn]])))
+; A chain of 1000 nested calls runs (speculatively: the store is left
+; alone); an endless one stops at the depth limit, which the message
+; names.
+(defn chain [db n] (if (zero? n) [[:db/add a :user/age 7]] [[:db.fn/call chain (dec n)]]))
+(println (d/with c [[:db.fn/call chain 998]] (fn [db-after report] (count (:tx-data report)))))
 (defn loops [db] [[:db.fn/call loops]])
 (println (t/caught (d/transact! c [[:db.fn/call loops]])))
 (println (t/caught (d/connect "/")))

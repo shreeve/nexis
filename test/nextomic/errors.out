@@ -17,7 +17,8 @@
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 {:error :nextomic/tx-data, :message :db.fn/call takes a function or a symbol naming one}
 {:error :nextomic/tx-fn, :message unknown function: no-such-fn}
-{:error :nextomic/tx-fn, :message transaction functions nest past the depth limit}
+3
+{:error :nextomic/tx-fn, :message transaction functions nest past 1000 calls}
 :db/open-failed
 {:error :nextomic/tx-data, :message a tempid used only as a value, or not at all, names no entity}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
