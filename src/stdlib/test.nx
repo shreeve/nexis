@@ -75,12 +75,14 @@
 
 ; What an assertion calls: `is` expands to one call of these, so the
 ; judging and the reporting are here once, not in every assertion.
-; Each returns whether the assertion passed.
+; Each returns whether the assertion passed; a pass is counted here
+; rather than through `pass!`, so an assertion that passes costs the
+; calls it cost when this code was inlined at every assertion.
 (defn- check= [form expected actual msg]
-  (if (= expected actual) (pass!) (fail! form expected actual msg)))
+  (if (= expected actual) (do (bump! "pass") true) (fail! form expected actual msg)))
 
 (defn- check-truthy [form v msg]
-  (if v (pass!) (fail! form true v msg)))
+  (if v (do (bump! "pass") true) (fail! form true v msg)))
 
 ; The handler of a `thrown?` with a keyword tag: a throw the tag does
 ; not take goes on (a throw of the value the catch holds keeps its
