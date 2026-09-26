@@ -86,7 +86,24 @@ true.
 - `(long x)` is `x` for an integer and the integer part of a finite
   float, toward zero and a bignum when wide (`(long 1e30)` is
   `1000000000000000019884624838656`); NaN and the infinities raise
-  `:invalid-argument`. `(double x)` is the nearest f64 of any number.
+  `:invalid-argument`. `int`, `short` and `byte` are `long` within
+  the range of Java's `int`, `short`, `byte` (a float outside it, or
+  the integer part outside it, is `:invalid-argument`), except that
+  NaN is 0, as Java's casts make it. `(double x)` is the nearest f64
+  of any number; `(float x)` is the same f64 within Java's `float`
+  range (NaN included), else `:invalid-argument`: there is no
+  single-precision value to round to. `(num x)` is a number or nil
+  itself, else `:kind-mismatch`.
+- `+'`, `-'`, `*'`, `inc'` and `dec'` are `+`, `-`, `*`, `inc` and
+  `dec`: every integer operator already promotes. `unchecked-add`,
+  `unchecked-subtract`, `unchecked-multiply`, `unchecked-inc`,
+  `unchecked-dec` and `unchecked-negate` wrap at 64 bits, two's
+  complement, when every argument is within Java's `long` range
+  (`(unchecked-add 9223372036854775807 1)` is
+  `-9223372036854775808`); with a float or a wider integer they
+  compute as the checked operator does, as Clojure's do.
+- `(ratio? x)` is false and `(rational? x)` is `(integer? x)`: there
+  are no ratios or decimals.
 
 #### 2.3 Characters
 
@@ -379,17 +396,19 @@ the db and Nextomic handles print as markers for debugging (`#<fn>`,
   `1e7` and below `1e-3` (`1.0E10`, `1.23456785E7`, `1.0E-4`).
 - `0.0` prints `"0.0"` and `-0.0` prints `"-0.0"`; each reads back to
   its own bits.
-- The infinities print `Infinity` / `-Infinity` and NaN prints `NaN`.
-  The reader has no literal for them (`docs/FORMS.md` §8), so the text
-  reads back as a symbol.
+- Readable mode (`pr-str`, the REPL) prints the infinities `##Inf` /
+  `##-Inf` and NaN `##NaN`, the reader's literals (`docs/FORMS.md`
+  §2), so they round-trip; display mode and `str` of a bare float
+  write Java's `Infinity`, `-Infinity`, `NaN`, as Clojure's `str`
+  does.
 
 #### 6.4 Character print rules
 
 Named: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
 `\backspace`, and `\\` for the backslash. Other printable ASCII
 prints as `\a`; everything else as `\u{HEX}`, uppercase, no leading
-zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set (PLAN §23
-#26).
+zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set, and
+Clojure's `\uXXXX` (PLAN §23 #26).
 
 #### 6.5 String print rules
 
@@ -407,10 +426,10 @@ map or `nil`; it never throws.
 
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
-| `list`, `vector`, `map`, `set`, `record` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `list`, `vector`, `map`, `set`, `record`, `typed-vector` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
-| every other kind: `typed-vector`, `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
+| every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
 - The metadata argument is a map or `nil` (which clears it); anything
   else is `:kind-mismatch`, checked before the target's kind.

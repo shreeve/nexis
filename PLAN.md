@@ -268,7 +268,9 @@ Each item is a commitment; changing one takes an Amendment Log entry
     protocols, db and Nextomic handles) is not; encoding one raises the
     keyword `:unserializable` (`docs/CODEC.md`). Nesting depth is
     unbounded.
-26. **Character and string escapes are unified on `\u{HEX}`.** Named
+26. **Character and string escapes are unified on `\u{HEX}`**, which
+    names any scalar; Clojure's `\uXXXX` (exactly four hex digits) is
+    read too, a surrogate pair in a string spelling one scalar. Named
     chars for the common set; single-char `\a` syntax.
 27. **No block comments.** `;` (line), `#_` (discard the next form),
     `(comment ...)` (a macro that yields nil).
@@ -401,9 +403,9 @@ nil                                  ;; nil
 true, false                          ;; bool
 42, 0x2A, 0b101, 42N                 ;; int (any radix, within i64; N changes nothing)
 18446744073709551616                 ;; bigint (an integer beyond i64, as decimal text)
-3.14, 1e9, 1.5e-3                    ;; real (f64)
+3.14, 1e9, 1.5e-3, ##Inf, ##NaN      ;; real (f64; ##Inf, ##-Inf, ##NaN the symbolic floats)
 "hello"                              ;; string (UTF-8; may span lines)
-\a, \newline, \u{2603}               ;; char (Unicode scalar)
+\a, \newline, \u{2603}, \u2603       ;; char (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>, λ            ;; symbol
 
@@ -455,13 +457,13 @@ all before macroexpansion.
 | `~x` outside `` `...` `` | reader error `:unquote-outside-syntax-quote` |
 | `~@x` outside `` `...` `` | reader error `:unquote-splice-outside-syntax-quote` |
 | `1abc`, `1-2`, `1/2`, `1.`, `3.14M` | reader error `:bad-number-literal` |
-| `"a\qb"`, `"\u{D800}"` | reader error `:invalid-string-escape` |
-| `A`, `\ab`, `\u{110000}` | reader error `:invalid-char-literal` |
+| `"a\qb"`, `"\u{D800}"`, `"\uD800"` | reader error `:invalid-string-escape` |
+| `A`, `\ab`, `\u{110000}`, `\u041` | reader error `:invalid-char-literal` |
 | `foo/bar/baz`, `:foo/bar/baz` | reader error `:invalid-symbol`, `:invalid-keyword` |
 | `^1 x` | reader error `:unknown-reader-construct` (metadata is a keyword, map or symbol) |
 | bytes that are not UTF-8 in a string, symbol or keyword | reader error `:invalid-utf8` |
 | a form nested past the native stack's budget | reader error `:nesting-too-deep` |
-| `#"re"`, `##Inf`, `#?(...)`, `::k` | parse error naming the construct |
+| `#"re"`, `##Infinity`, `#?(...)`, `::k` | parse error naming the construct |
 
 Only statically detectable literal keys and elements count as
 duplicates: `{:a 1 (keyword "a") 2}` reads.
@@ -773,3 +775,14 @@ entry stating the decision and its rationale.
   and 4096 upvalues, whose compile error names the routine and the
   limit. `docs/VM.md` §3, §4, §10, §12 and `docs/COMPILER.md` §4.4 are
   the authority.
+
+- **2026-09-26 — Clojure's `\uXXXX` and the symbolic floats (§23 #26,
+  §28.2, §28.3).** The reader takes Clojure's `\uXXXX` beside
+  `\u{HEX}`: in a char, `\u` and exactly four hex digits naming a
+  scalar; in a string, a UTF-16 unit, a high surrogate followed by a
+  `\uXXXX` low one spelling one scalar and a lone surrogate an
+  `:invalid-string-escape`. `##Inf`, `##-Inf` and `##NaN` read as the
+  real datum, and the printer's readable mode writes them, so every
+  float round-trips through `pr-str` and `read-string`. Clojure source
+  that spells these reads unchanged. `docs/FORMS.md` §2–§3 is the
+  authority.

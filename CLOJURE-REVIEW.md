@@ -164,11 +164,14 @@ are the map for someone who knows Clojure.
   wins.
 - Keywords and symbols, including non-ASCII names; at most one `/`,
   neither side empty; `/` alone is division.
-- Named chars `\newline \space \tab \return \formfeed \backspace`.
+- Named chars `\newline \space \tab \return \formfeed \backspace`,
+  and `\uXXXX` in a char or a string (a surrogate pair in a string is
+  one character).
+- `##Inf`, `##-Inf`, `##NaN`, which `pr-str` prints back.
 - Strings may span lines.
 - `;` line comments and `(comment ...)`.
-- `ns` with a docstring and `(:require [lib :as a :refer [f]])`, and
-  `require`.
+- `ns` with a docstring and `(:require [lib :as a :refer [f]])`,
+  prefix lists (`[app [c :as cc] d]`) included, and `require`.
 
 ### 4.2 Reader divergences
 
@@ -182,11 +185,8 @@ are the map for someone who knows Clojure.
 | `017` | octal 15 | decimal 17 | one decimal spelling |
 | `1.` | `1.0` | `:bad-number-literal` | a real has digits on both sides of the dot |
 | `1abc`, `1-2` | "Invalid number" | `:bad-number-literal` for the whole token | a number token ends where a symbol would |
-| `##NaN`, `##Inf` | symbolic values | parse error | `(/ 0.0 0)` and `(/ 1.0 0)` produce them |
-| `☃` | a char | `:invalid-char-literal`; write `\u{2603}` | one escape form (§23 #26) |
-| `"☃"` | a string escape | `:invalid-string-escape`; write `"\u{2603}"` | the same |
-| `\o377` | an octal char | unsupported | `\u{...}` covers it |
-| String escapes | `\b \f \0`, octal, `\uHHHH` | `\n \t \r \\ \" \u{HEX}` | a narrow set |
+| `\o377` | an octal char | unsupported | `\uHHHH` and `\u{...}` cover it |
+| String escapes | `\b \f`, octal, `\uHHHH` | `\n \t \r \\ \" \uHHHH \u{HEX}` | a narrow set; `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
@@ -206,9 +206,9 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 |---|---|---|---|
 | `(= 1 1.0)` | true | false; `(== 1 1.0)` is true | §23 #11 |
 | NaN `=` NaN | false | true (canonical bits) | `docs/SEMANTICS.md` |
-| integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48 | `docs/BIGNUM.md` |
+| integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48; `+'` and its kin are the same functions, and `unchecked-add` and its kin wrap two longs at 64 bits as Clojure's do | `docs/BIGNUM.md`, `docs/SEMANTICS.md` §2.2 |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
-| `(long x)` | throws beyond 64 bits | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int` checks Java's int range (`:invalid-argument` outside it, and for NaN, which Clojure makes 0); `short`, `byte`, `float`, `bigint` do not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
+| `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` does not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
 | `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
@@ -225,8 +225,14 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
+| `(print ##Inf)`, `(println [##NaN])` | `##Inf`, `[##NaN]` | `Infinity`, `[NaN]`: display mode writes Java's spelling; `pr`, `pr-str` and `str` of a collection write `##Inf` | `docs/STDLIB.md` §5 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
-| `instance?`, `class`, `type` | JVM classes | absent; kind predicates (`string?`, `map?`, ...) | — |
+| `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; a record's name is not a Var, so write `(instance? 'user.P x)` or `(P? x)` | `docs/STDLIB.md` §8 |
+| namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` is `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil | `docs/STDLIB.md` §8 |
+| `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
+| `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
+| `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |
+| `tap>` | taps run on another thread | taps run before `tap>` returns | `docs/STDLIB.md` §8 |
 
 ### 4.4 Absences
 

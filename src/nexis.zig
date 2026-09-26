@@ -140,10 +140,20 @@ pub const Lexer = struct {
                             self.base.pos += 2;
                             return .{ .cat = .var_quote_tok, .pre = pre, .pos = start, .len = 2 };
                         },
+                        // `##Inf`, `##-Inf` and `##NaN` are the
+                        // symbolic floats, a real token the reader
+                        // reads; any other `##` run is one err token.
+                        '#' => {
+                            self.base.pos = start + 2;
+                            self.skipConstituents();
+                            const t = src[start..self.base.pos];
+                            const symbolic = std.mem.eql(u8, t, "##Inf") or std.mem.eql(u8, t, "##-Inf") or std.mem.eql(u8, t, "##NaN");
+                            return self.finish(if (symbolic) .real else .err, start, pre);
+                        },
                         ' ', '\t', '\r', '\n', ',' => {},
-                        // An unsupported dispatch (`#"`, `##Inf`,
-                        // `#?`) is one err token, so the parse error
-                        // names the construct.
+                        // An unsupported dispatch (`#"`, `#?`) is one
+                        // err token, so the parse error names the
+                        // construct.
                         else => |after| {
                             self.base.pos = start + 2;
                             if (isIdentCont(after)) self.skipConstituents();
@@ -238,7 +248,7 @@ pub const Lexer = struct {
     /// any byte, a delimiter included), then every symbol constituent
     /// that follows, as a number token runs (FORMS.md §3). `\u{HEX}`
     /// runs to its `}` first. The reader judges the text, so `\a1` and
-    /// `\u0041` are each one token it rejects, never a char followed by
+    /// `\u041` are each one token it rejects, never a char followed by
     /// another form.
     fn scanChar(self: *Lexer, start: u32, pre: u8) Token {
         const src = self.base.source;

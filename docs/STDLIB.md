@@ -33,7 +33,7 @@ loader's diagnostic.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6; `=` and `hash` SEMANTICS.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; the macros MACROEXPAND.md §2b |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -97,7 +97,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int` only Java's 32-bit `int` range, as Clojure's cast checks | `:kind-mismatch`, `:invalid-argument` (NaN, an infinity; for `int`, out of range) |
+| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, as Clojure's casts check, and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity; NaN for `long`) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |
@@ -210,7 +210,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | `print`, `println`, `print-str`, `println-str` | display |
 | `pr`, `prn`, `pr-str`, `prn-str`; the REPL and `nexis -e` results; error-report payloads | readable |
-| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string or char display; any other value readable, so `(str ["a"])` is `"[\"a\"]"` |
+| `str`, `%s`, `join`, `spit` | nil is empty (`%s` writes `nil`); a string, char or float display (`(str ##Inf)` is `"Infinity"`); any other value readable, so `(str ["a"])` is `"[\"a\"]"` and `(str [##Inf])` `"[##Inf]"` |
 
 **By kind** (both modes unless the row says otherwise):
 
@@ -218,7 +218,7 @@ their elements in the same mode. Who uses which:
 |---|---|
 | nil, booleans | `nil`, `true`, `false` |
 | fixnum, bignum | Decimal, no suffix |
-| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`, `NaN`, `Infinity`, `-Infinity` |
+| float | SEMANTICS.md §6.3: `1.0`, `-0.0`, `1.0E10`, `1.0E-4`; display: `NaN`, `Infinity`, `-Infinity`; readable: `##NaN`, `##Inf`, `##-Inf` |
 | char | display: its UTF-8. readable: `\space`, `\newline`, `\tab`, `\return`, `\formfeed`, `\backspace`, `\\`, printable ASCII as `\x`, anything else `\u{HEX}` (`\u{E9}`) |
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
@@ -296,3 +296,44 @@ tests; `test/golden/cli/` pins `read-line` (`stdin`),
 `*command-line-args*` (`args`) and `exit` (`exit-status`) through
 `bin/nexis`; `test/integration/numbers.zig` pins the float
 spellings.
+
+---
+
+### 8. More of Clojure's core
+
+Functions of `nexis.core` that no kind doc owns, each with Clojure
+1.12's semantics except where a row says otherwise. Sequences are
+eager (PLAN §23 #14): where Clojure returns a lazy seq, these return
+a realized list.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `nfirst` | 1 | `(next (first x))` |
+| `tree-seq` | 3 | `(tree-seq branch? children root)`: every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. An explicit stack, so a tree of any depth walks |
+| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a list |
+| `partitionv`, `partitionv-all` | 2–4, 2–3 | `partition` and `partition-all` with each part a vector |
+| `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
+| `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
+| `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
+| `indexed?` | 1 | True of a vector or typed vector |
+| `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |
+| `delay` | macro | `(delay body...)`: a delay, the record `nexis.core/Delay`, whose body runs the first time it is forced; every later `force` or `deref` (`@d`) returns the same value, or rethrows what the body threw (the body runs once either way) |
+| `force` | 1 | A delay's value, forcing it; anything else itself |
+| `delay?`, `realized?` | 1 | Whether `x` is a delay; whether the delay has been forced (`realized?` of anything else is `:kind-mismatch`) |
+| `Closeable`, `close` | protocol | What `with-open` closes: `close` of a db connection is `db/close`, of a Nextomic connection `nextomic/release`; a record or kind extends it to be closed the same way |
+| `with-open` | macro | `(with-open [name init ...] body...)`: body with each name bound, each closed through `close` in reverse order on every exit, a throw included; the bindings must be symbol and value pairs, else the expansion fails |
+| `tap>` | 1 | Calls every function `add-tap` added with `x`, ignoring any that throws, and returns true. Clojure calls the taps on another thread; one isolate, one thread calls them before `tap>` returns |
+| `add-tap`, `remove-tap` | 1 | Add or remove a tap function; nil |
+| `class` | 1 | The type of `x`: for a record the symbol it prints with (`user.P`), for anything else the keyword `extend-type` names its kind with (`:vector`, `:map`, `:set`, `:list`, `:fixnum`, `:bignum`, `:float`, `:string`, `:typed_vector`, `:function`, `:native_fn`, `:var_`, ...), except that both booleans are `:boolean`; nil for nil |
+| `type` | 1 | `(or (:type (meta x)) (class x))`, as Clojure's |
+| `instance?` | 2 | `(instance? t x)`: whether `(class x)` is `t`, a keyword or symbol (`(instance? :vector [])`, `(instance? 'user.P p)`); there is no hierarchy, so `(instance? :map p)` of a record is false. Any other `t` is `:kind-mismatch` |
+| `var?` | 1 | Whether `x` is a Var |
+| `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
+| `find-ns`, `the-ns`, `ns-name` | 1 | A namespace is its name symbol: `find-ns` returns the symbol when a namespace has that name, else nil; `the-ns` and `ns-name` return it, else throw `:no-such-namespace`. A non-symbol is `:kind-mismatch` |
+| `all-ns` | 0 | Every namespace's name, sorted |
+| `ns-interns`, `ns-publics` | 1 | The map of name symbol to Var of every Var interned in the namespace (the ones it refers to from another excluded), an unbound one a `declare` or a forward reference made included; `ns-publics` leaves out those marked `:private`. `clojure.string` and its kin hold `nexis.string`'s Vars, so ask the `nexis.*` namespace |
+| `resolve`, `ns-resolve` | 1, 2 | `(resolve sym)`, `(ns-resolve ns sym)`: the Var `sym` names in the current namespace or `ns`, resolved as the compiler resolves a global (an unqualified name the namespace's own or referred, then `nexis.core`'s; a qualified one through an alias or a namespace name), else nil. A host macro (`when`, `let`, `defn`, ...) has no Var, so it resolves to nil |
+| `random-uuid` | 0 | A random version-4 UUID. A UUID is its canonical lowercase text, a string, as Nextomic's `:db.type/uuid` values are; there is no `#uuid` literal |
+| `parse-uuid` | 1 | The canonical text of the UUID a string spells as 8-4-4-4-12 hex digits of either case, else nil (Java's lenient short groups included); a non-string is `:kind-mismatch` |
+| `uuid?` | 1 | Whether `x` is a string in the canonical form (so `(uuid? (random-uuid))` is true, and an uppercase spelling is not) |

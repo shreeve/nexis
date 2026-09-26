@@ -259,6 +259,16 @@ pub const Reader = struct {
     }
 
     fn readReal(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        // The symbolic floats `##Inf`, `##-Inf`, `##NaN` (FORMS.md §2).
+        if (std.mem.startsWith(u8, text, "##")) {
+            const symbolic: f64 = if (std.mem.eql(u8, text, "##Inf"))
+                std.math.inf(f64)
+            else if (std.mem.eql(u8, text, "##-Inf"))
+                -std.math.inf(f64)
+            else
+                std.math.nan(f64);
+            return try self.makeForm(.{ .real = symbolic }, span);
+        }
         const value = std.fmt.parseFloat(f64, text) catch
             return self.fail(.bad_number_literal, span, text);
         return try self.makeForm(.{ .real = value }, span);
@@ -500,8 +510,29 @@ pub const Reader = struct {
                 out.appendAssumeCapacity(b);
                 continue;
             }
-            if (body[i - 1] != 'u' or i == body.len or body[i] != '{')
+            if (body[i - 1] != 'u')
                 return self.fail(.invalid_string_escape, span, body[at..i]);
+            if (i == body.len or body[i] != '{') {
+                // Clojure's `\uXXXX` names a UTF-16 unit: a high
+                // surrogate must pair with a `\uXXXX` low one.
+                const escape = body[at..@min(body.len, at + 6)];
+                const unit = hex4(body[i..@min(body.len, i + 4)]) orelse
+                    return self.fail(.invalid_string_escape, span, escape);
+                i += 4;
+                var scalar = unit;
+                if (unit >= 0xD800 and unit <= 0xDBFF) {
+                    const low = if (i + 6 <= body.len and body[i] == '\\' and body[i + 1] == 'u') hex4(body[i + 2 .. i + 6]) else null;
+                    if (low == null or low.? < 0xDC00 or low.? > 0xDFFF)
+                        return self.fail(.invalid_string_escape, span, escape);
+                    scalar = 0x10000 + ((unit - 0xD800) << 10) + (low.? - 0xDC00);
+                    i += 6;
+                }
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(scalar, &utf8) catch
+                    return self.fail(.invalid_string_escape, span, escape);
+                out.appendSliceAssumeCapacity(utf8[0..n]);
+                continue;
+            }
             const close = std.mem.indexOfScalarPos(u8, body, i, '}') orelse
                 return self.fail(.invalid_string_escape, span, body[at..@min(body.len, at + 16)]);
             const escape = body[at .. close + 1];
@@ -613,17 +644,20 @@ fn parseIntLiteral(text: []const u8) ?i64 {
     return @intCast(mag);
 }
 
-/// The scalar a char token's text after `\` names: `u{HEX}`, one
-/// character (a valid UTF-8 sequence), or a name of FORMS.md §3's named
-/// set. `null` for anything else, surrogates and scalars past U+10FFFF
-/// included. Clojure's `uXXXX` and `oNNN` spellings are not accepted:
-/// `\u{HEX}` is the one escape (PLAN §23 decision 26).
+/// The scalar a char token's text after `\` names: `u{HEX}`, Clojure's
+/// `uXXXX` (exactly four hex digits), one character (a valid UTF-8
+/// sequence), or a name of FORMS.md §3's named set. `null` for anything
+/// else, surrogates and scalars past U+10FFFF included; Clojure's octal
+/// `oNNN` is not accepted.
 fn parseCharLiteral(body: []const u8) ?u21 {
     if (body.len == 0) return null;
     if (body.len >= 3 and body[0] == 'u' and body[1] == '{' and body[body.len - 1] == '}') {
         const v = std.fmt.parseInt(u21, body[2 .. body.len - 1], 16) catch return null;
-        if (v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF)) return null;
-        return v;
+        return if (isScalar(v)) v else null;
+    }
+    if (body.len == 5 and body[0] == 'u') {
+        const v = hex4(body[1..5]) orelse return null;
+        return if (isScalar(v)) v else null;
     }
     const n = std.unicode.utf8ByteSequenceLength(body[0]) catch return null;
     if (n == body.len) return std.unicode.utf8Decode(body) catch null;
@@ -633,6 +667,19 @@ fn parseCharLiteral(body: []const u8) ?u21 {
     };
     for (names) |entry| if (std.mem.eql(u8, body, entry[0])) return entry[1];
     return null;
+}
+
+fn isScalar(v: u21) bool {
+    return v <= 0x10FFFF and !(v >= 0xD800 and v <= 0xDFFF);
+}
+
+/// The value of exactly four hex digits, as Clojure's `\uXXXX` reads
+/// them (no sign, no underscore).
+fn hex4(digits: []const u8) ?u21 {
+    if (digits.len != 4) return null;
+    var v: u21 = 0;
+    for (digits) |c| v = v * 16 + (std.fmt.charToDigit(c, 16) catch return null);
+    return v;
 }
 
 fn splitNamespace(text: []const u8) ?Name {
@@ -674,7 +721,7 @@ const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
             .int => |v| h.update(std.mem.asBytes(&v)),
             .bigint, .string => |t| h.update(t),
             // 0.0 and -0.0 are equal under `==`, so they hash alike.
-            .real => |r| h.update(std.mem.asBytes(&(if (r == 0) @as(f64, 0) else r))),
+            .real => |r| h.update(std.mem.asBytes(&(if (r == 0) @as(f64, 0) else if (std.math.isNan(r)) std.math.nan(f64) else r))),
             .char => |c| h.update(std.mem.asBytes(&@as(u32, c))),
             .keyword, .symbol => |n| {
                 h.update(n.ns orelse "");
@@ -698,7 +745,7 @@ pub fn formLiteralEq(a: *const Form, b: *const Form) bool {
         .bool_ => |ab| b.datum == .bool_ and b.datum.bool_ == ab,
         .int => |ai| b.datum == .int and b.datum.int == ai,
         .bigint => |at| b.datum == .bigint and std.mem.eql(u8, at, b.datum.bigint),
-        .real => |ar| b.datum == .real and b.datum.real == ar, // naive: NaN never equals itself
+        .real => |ar| b.datum == .real and (b.datum.real == ar or (std.math.isNan(ar) and std.math.isNan(b.datum.real))), // `=` makes NaN equal NaN
         .char => |ac| b.datum == .char and b.datum.char == ac,
         .string => |s| b.datum == .string and std.mem.eql(u8, s, b.datum.string),
         .keyword => |ak| b.datum == .keyword and nameEq(ak, b.datum.keyword),
@@ -1098,6 +1145,11 @@ test "char literal parsing" {
     try std.testing.expectEqual(@as(u21, 'a'), parseCharLiteral("a").?);
     try std.testing.expectEqual(@as(u21, '\n'), parseCharLiteral("newline").?);
     try std.testing.expectEqual(@as(u21, 0x2603), parseCharLiteral("u{2603}").?);
+    try std.testing.expectEqual(@as(u21, 0x2603), parseCharLiteral("u2603").?);
+    try std.testing.expectEqual(@as(u21, 'A'), parseCharLiteral("u0041").?);
+    try std.testing.expect(parseCharLiteral("uD800") == null);
+    try std.testing.expect(parseCharLiteral("u041") == null);
+    try std.testing.expect(parseCharLiteral("u00411") == null);
     try std.testing.expect(parseCharLiteral("") == null);
     try std.testing.expect(parseCharLiteral("u{}") == null);
 }
@@ -1123,7 +1175,15 @@ test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     try expectReaderError("\"abc \\q def\"", .invalid_string_escape, "\\q");
     try expectReaderError("\"abc \\u{110000} def\"", .invalid_string_escape, "\\u{110000}");
     try expectReaderError("\"abc \\u{D800}\"", .invalid_string_escape, "\\u{D800}");
-    try expectReaderError("\"abc \\u0041\"", .invalid_string_escape, "\\u");
+    // Clojure's `\uXXXX`: exactly four hex digits; a UTF-16 surrogate
+    // pair spells one scalar, a lone surrogate is an error.
+    try expectReads("\"\\u0041\\u00e9!\"", "(string \"A\\u{C3}\\u{A9}!\")\n");
+    try expectReads("\"\\uD83D\\uDE00\"", "(string \"\\u{F0}\\u{9F}\\u{98}\\u{80}\")\n");
+    try expectReaderError("\"abc \\u41\"", .invalid_string_escape, "\\u41");
+    try expectReaderError("\"abc \\u004g\"", .invalid_string_escape, "\\u004g");
+    try expectReaderError("\"\\uD800\"", .invalid_string_escape, "\\uD800");
+    try expectReaderError("\"\\uDE00\\uD83D\"", .invalid_string_escape, "\\uDE00");
+    try expectReaderError("\"\\uD83Dx\"", .invalid_string_escape, "\\uD83D");
     // An unterminated string is a parse error at its opening quote.
     const allocator = std.testing.allocator;
     const src = "(println \"never closed\n(+ 1 2)";
@@ -1136,13 +1196,15 @@ test "strings: may span lines, must be UTF-8, fail at their bad escape" {
 
 test "char literals: one token to the next delimiter, judged whole" {
     try expectReads("[\\u{41} \\newline \\a \\é \\☃ \\( \\\\ \\u \\o]", "(vector (char \\A) (char \\newline) (char \\a) (char \\u{E9}) (char \\u{2603}) (char \\() (char \\\\) (char \\u) (char \\o))\n");
+    try expectReads("[\\u0041 \\u2603]", "(vector (char \\A) (char \\u{2603}))\n");
     // A delimiter or reader macro character ends the token.
     try expectReads("(\\a)[\\b@c]", "(list (char \\a))\n(vector\n  (char \\b)\n  (deref (symbol c)))\n");
-    // Clojure's `\uXXXX` and `\oNNN` spellings, a letter or digit run
-    // after a char, a surrogate and a scalar past U+10FFFF are errors
-    // over the whole token, never a char followed by more forms.
+    // `\u` without exactly four hex digits, Clojure's `\oNNN`, a
+    // letter or digit run after a char, a surrogate and a scalar past
+    // U+10FFFF are errors over the whole token, never a char followed
+    // by more forms.
     const allocator = std.testing.allocator;
-    for ([_][]const u8{ "\\u0041", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src| {
+    for ([_][]const u8{ "\\u041", "\\u00411", "\\uD800", "\\o101", "\\a1", "\\ab", "\\é1", "\\u{D800}", "\\u{110000}", "\\u{41}x" }) |src| {
         var p = parser.Parser.init(allocator, src);
         defer p.deinit();
         var rd = Reader.init(allocator, src);
@@ -1375,11 +1437,20 @@ test "var-quote: #'x reads as the list (var x), whatever form follows" {
     }
 }
 
+test "##Inf, ##-Inf and ##NaN are the symbolic floats" {
+    try expectReads("[##Inf ##-Inf ##NaN]", "(vector (real +inf) (real -inf) (real +nan))\n");
+    try expectReads("(f ##-Inf)", "(list (symbol f) (real -inf))\n");
+    // `=` makes NaN equal NaN, so a literal holds it once.
+    try expectReaderError("#{##NaN ##NaN}", .duplicate_literal_element, "(real +nan)");
+    try expectReaderError("{##Inf 1 ##Inf 2}", .duplicate_literal_key, "(real +inf)");
+}
+
 test "an unsupported construct is one err token, so the parse error names it" {
     const allocator = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "#\"a.*\"", "#\"" }, .{ "##Inf", "##Inf" },   .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
-        .{ "::k", "::k" },      .{ "#?(:clj 1)", "#?" }, .{ "# x", "#" },
+        .{ "#\"a.*\"", "#\"" }, .{ "##Infinity", "##Infinity" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
+        .{ "::k", "::k" },      .{ "#?(:clj 1)", "#?" },         .{ "# x", "#" },
+        .{ "##inf", "##inf" },  .{ "(##NaN1)", "##NaN1" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c[0]);

@@ -184,7 +184,10 @@ const core_natives = table("", .{
     .{ "inc", 1, 1, &fnInc },
     .{ "dec", 1, 1, &fnDec },
     .{ "long", 1, 1, &fnLong },
-    .{ "int", 1, 1, &fnInt },
+    .{ "int", 1, 1, castTo(i32) },
+    .{ "short", 1, 1, castTo(i16) },
+    .{ "byte", 1, 1, castTo(i8) },
+    .{ "float", 1, 1, &fnFloat },
     .{ "char", 1, 1, &fnChar },
     .{ "parse-long", 1, 1, &fnParseLong },
     .{ "parse-double", 1, 1, &fnParseDouble },
@@ -310,6 +313,20 @@ const core_natives = table("", .{
     .{ "associative?", 1, 1, kindPredicate(isAssociative) },
     .{ "fn?", 1, 1, kindPredicate(isFn) },
     .{ "ifn?", 1, 1, kindPredicate(isIfn) },
+    .{ "counted?", 1, 1, kindPredicate(isCounted) },
+    .{ "delay?", 1, 1, &fnDelayQ },
+    // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
+    .{ "class", 1, 1, &fnClass },
+    .{ "var?", 1, 1, kindPredicate(isVar) },
+    .{ "find-ns", 1, 1, &fnFindNs },
+    .{ "all-ns", 0, 0, &fnAllNs },
+    .{ "ns-interns", 1, 1, &fnNsInterns },
+    .{ "ns-publics", 1, 1, &fnNsPublics },
+    .{ "resolve", 1, 1, &fnResolve },
+    .{ "ns-resolve", 2, 2, &fnNsResolve },
+    .{ "random-uuid", 0, 0, &fnRandomUuid },
+    .{ "parse-uuid", 1, 1, &fnParseUuid },
+    .{ "indexed?", 1, 1, kindPredicate(isIndexed) },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector },
     .{ "vec", 1, 1, &fnVec },
@@ -449,6 +466,8 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%kwargs", 1, 1, &fnKwargs },
     // deftest and run-tests: the name of the current namespace.
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
+    // delay: the record a delay is (core.nx `delay`, `force`).
+    .{ "#%delay", 1, 1, &fnDelay },
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
@@ -876,15 +895,34 @@ fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numLong(vm.ensureHeap(), args[0]);
 }
 
-/// `(int x)`: as `long`, within Java's 32-bit `int` range, else
-/// `:invalid-argument`, as Clojure's cast checks.
-fn fnInt(vm: *VM, args: []const Value) VmError!Value {
-    const x = args[0];
-    const min = std.math.minInt(i32);
-    const max = std.math.maxInt(i32);
-    if (x.isFloat() and !(x.asFloat() >= min and x.asFloat() <= max)) return VmError.InvalidArgument;
-    const r = try fnLong(vm, args);
-    return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
+/// `(int x)`, `(short x)`, `(byte x)`: as `long`, within the range of
+/// Java's `T`, else `:invalid-argument`, as Clojure's casts check; NaN
+/// is 0, as Java's cast makes it.
+fn castTo(comptime T: type) *const fn (*VM, []const Value) VmError!Value {
+    return &struct {
+        fn call(vm: *VM, args: []const Value) VmError!Value {
+            const x = args[0];
+            const min = std.math.minInt(T);
+            const max = std.math.maxInt(T);
+            if (x.isFloat()) {
+                const f = x.asFloat();
+                if (std.math.isNan(f)) return value_mod.fromFixnum(0).?;
+                if (!(f >= min and f <= max)) return VmError.InvalidArgument;
+            }
+            const r = try fnLong(vm, args);
+            return if (r.kind() == .fixnum and r.asFixnum() >= min and r.asFixnum() <= max) r else VmError.InvalidArgument;
+        }
+    }.call;
+}
+
+/// `(float x)`: as `double`, within Java's `float` range, else
+/// `:invalid-argument`, as Clojure's cast checks. The one float type
+/// is f64, so the value is not rounded to single precision.
+fn fnFloat(_: *VM, args: []const Value) VmError!Value {
+    const d = try vm_mod.numDouble(args[0]);
+    const f = d.asFloat();
+    if (!std.math.isNan(f) and @abs(f) > std.math.floatMax(f32)) return VmError.InvalidArgument;
+    return d;
 }
 
 /// `(char n)`: the char with code point `n`; a char is itself. A
@@ -2620,7 +2658,7 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 
 fn carriesHeaderMeta(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
+        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector => true,
         else => false,
     };
 }
@@ -2807,6 +2845,17 @@ fn isColl(k: Kind) bool {
         .list, .persistent_vector, .persistent_map, .persistent_set, .record => true,
         else => false,
     };
+}
+fn isVar(k: Kind) bool {
+    return k == .var_;
+}
+/// Clojure's `Counted`: the collections, typed vectors and transients.
+fn isCounted(k: Kind) bool {
+    return isColl(k) or k == .typed_vector or k == .transient;
+}
+/// Clojure's `Indexed`: the vectors, `nth` in constant time.
+fn isIndexed(k: Kind) bool {
+    return k == .persistent_vector or k == .typed_vector;
 }
 fn isSequential(k: Kind) bool {
     return k == .list or k == .persistent_vector;
@@ -3171,9 +3220,209 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
         },
         .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
         .atom => atom_mod.getValue(x),
-        .record => if (isReduced(vm, x)) reducedValue(x) else VmError.NotDerefable,
+        .record => if (isReduced(vm, x)) reducedValue(x) else if (isDelay(vm, x)) forceDelay(vm, x) else VmError.NotDerefable,
         else => VmError.NotDerefable,
     };
+}
+
+// =============================================================================
+// Introspection (STDLIB.md §8)
+// =============================================================================
+//
+// A type is the keyword `extend-type` names a kind with (`:vector`,
+// `:fixnum`, `:string`, ...; `:boolean` for both booleans) or, for a
+// record, the symbol it prints with (`user.P`). A namespace is its
+// name symbol: the registry holds namespaces, not values.
+
+/// `(class x)` → the type of `x` (nil for nil, as Clojure's).
+fn fnClass(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const interner = vm.ensureInterner();
+    const name: []const u8 = switch (x.kind()) {
+        .nil => return value_mod.nilValue(),
+        .true_, .false_ => "boolean",
+        .persistent_vector => "vector",
+        .persistent_map => "map",
+        .persistent_set => "set",
+        .record => {
+            const e = vm.record_registry.items[record_mod.typeId(x)];
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(vm.allocator);
+            if (e.ns_name.len > 0) buf.print(vm.allocator, "{s}.", .{e.ns_name}) catch return VmError.OutOfMemory;
+            buf.appendSlice(vm.allocator, e.type_name) catch return VmError.OutOfMemory;
+            return interner.internSymbolValue(buf.items) catch VmError.OutOfMemory;
+        },
+        else => |k| @tagName(k),
+    };
+    return interner.internKeywordValue(name) catch VmError.OutOfMemory;
+}
+
+fn nsOfSymbol(vm: *VM, v: Value) VmError!?*Namespace {
+    if (v.kind() != .symbol) return VmError.KindMismatch;
+    const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
+    return registry.lookupNs(vm.ensureInterner().symbolName(v.asSymbolId()));
+}
+
+/// The namespace a symbol names, else `:no-such-namespace`, as
+/// `the-ns` has it.
+fn theNs(vm: *VM, v: Value) VmError!*Namespace {
+    return (try nsOfSymbol(vm, v)) orelse vm.throwKeyword("no-such-namespace");
+}
+
+/// `(find-ns sym)` → `sym` when a namespace has that name, else nil.
+fn fnFindNs(vm: *VM, args: []const Value) VmError!Value {
+    return if (try nsOfSymbol(vm, args[0])) |_| args[0] else value_mod.nilValue();
+}
+
+/// `(all-ns)` → the name of every namespace, sorted.
+fn fnAllNs(vm: *VM, _: []const Value) VmError!Value {
+    const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(vm.allocator);
+    var it = registry.map.keyIterator();
+    while (it.next()) |k| names.append(vm.allocator, k.*) catch return VmError.OutOfMemory;
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var syms: std.ArrayList(Value) = .empty;
+    defer syms.deinit(vm.allocator);
+    for (names.items) |n| syms.append(vm.allocator, vm.ensureInterner().internSymbolValue(n) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
+    return buildListFromSlice(vm, syms.items);
+}
+
+/// The map of name symbol → Var of every Var interned in the
+/// namespace `args[0]` names, not those it refers to from another
+/// (a referral is keyed with a copy of the name, MACROEXPAND.md §2b);
+/// only the ones not marked `:private` when `publics`.
+fn nsVars(vm: *VM, ns_sym: Value, publics: bool) VmError!Value {
+    const ns = try theNs(vm, ns_sym);
+    const interner = vm.ensureInterner();
+    const heap = vm.ensureHeap();
+    const private_key = interner.internKeywordValue("private") catch return VmError.OutOfMemory;
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var it = ns.vars.iterator();
+    while (it.next()) |entry| {
+        const v = entry.value_ptr.*;
+        if (entry.key_ptr.*.ptr != v.name.ptr) continue;
+        if (publics and v.meta.kind() == .persistent_map) switch (champ_mod.mapGet(v.meta, private_key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+            .present => |flag| if (flag.isTruthy()) continue,
+            .absent => {},
+        };
+        const sym = interner.internSymbolValue(v.name) catch return VmError.OutOfMemory;
+        m = champ_mod.mapAssoc(heap, m, sym, VM.varToValue(v), &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    }
+    return m;
+}
+
+fn fnNsInterns(vm: *VM, args: []const Value) VmError!Value {
+    return nsVars(vm, args[0], false);
+}
+
+fn fnNsPublics(vm: *VM, args: []const Value) VmError!Value {
+    return nsVars(vm, args[0], true);
+}
+
+/// The Var `sym` names in `ns`, as the compiler resolves a global:
+/// unqualified, the namespace's own or referred name, then
+/// `nexis.core`'s; qualified, the Var of that name in the namespace
+/// the prefix (an alias of `ns`, or a namespace name) names. nil when
+/// there is none, a host macro's name included.
+fn resolveIn(vm: *VM, ns: *Namespace, sym: Value) VmError!Value {
+    if (sym.kind() != .symbol) return VmError.KindMismatch;
+    const text = vm.ensureInterner().symbolName(sym.asSymbolId());
+    const slash = if (text.len > 1) std.mem.indexOfScalar(u8, text, '/') else null;
+    const v = if (slash) |i| blk: {
+        const prefix = text[0..i];
+        const registry = ns.registry orelse break :blk null;
+        const target = registry.lookupNs(ns.lookupAlias(prefix) orelse prefix) orelse break :blk null;
+        break :blk target.lookupLocal(text[i + 1 ..]);
+    } else ns.lookup(text);
+    return if (v) |found| VM.varToValue(found) else value_mod.nilValue();
+}
+
+/// `(resolve sym)` → the Var `sym` names in the current namespace.
+fn fnResolve(vm: *VM, args: []const Value) VmError!Value {
+    return resolveIn(vm, vm.ensureNamespace(), args[0]);
+}
+
+/// `(ns-resolve ns sym)` → the Var `sym` names in `ns`.
+fn fnNsResolve(vm: *VM, args: []const Value) VmError!Value {
+    return resolveIn(vm, try theNs(vm, args[0]), args[1]);
+}
+
+/// `(random-uuid)` → a random (version 4) UUID, as its canonical
+/// lowercase text: a UUID is a string, as Nextomic's `:db.type/uuid`
+/// values are.
+fn fnRandomUuid(vm: *VM, _: []const Value) VmError!Value {
+    var u: [16]u8 = undefined;
+    random(vm).bytes(&u);
+    u[6] = (u[6] & 0x0F) | 0x40;
+    u[8] = (u[8] & 0x3F) | 0x80;
+    var text: [36]u8 = undefined;
+    nextomic_mod.datom.uuidToText(&text, u);
+    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+}
+
+/// `(parse-uuid s)` → the canonical lowercase text of the UUID `s`
+/// spells in 8-4-4-4-12 hex digits of either case, else nil.
+fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const u = nextomic_mod.datom.uuidFromText(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
+    var text: [36]u8 = undefined;
+    nextomic_mod.datom.uuidToText(&text, u);
+    return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
+}
+
+// =============================================================================
+// Delays
+// =============================================================================
+//
+// A delay is the record `nexis.core/Delay` whose `:state` is an atom
+// holding `[:pending thunk]`, `[:ready value]` or `[:failed thrown]`.
+// `force` (core.nx) runs the thunk once and caches its value or its
+// throw, which only nexis code can catch; `deref` of a delay calls it.
+
+/// The type id of `nexis.core/Delay`, registered on first use.
+fn delayType(vm: *VM) VmError!u32 {
+    for (vm.record_registry.items) |e| {
+        if (std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay")) return e.id;
+    }
+    return vm.registerRecordType("nexis.core", "Delay", &.{"state"}) catch VmError.OutOfMemory;
+}
+
+fn isDelay(vm: *const VM, v: Value) bool {
+    if (v.kind() != .record) return false;
+    const e = vm.record_registry.items[record_mod.typeId(v)];
+    return std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay");
+}
+
+/// `(#%delay thunk)` → a pending delay of `thunk` (the `delay` macro).
+fn fnDelay(vm: *VM, args: []const Value) VmError!Value {
+    const type_id = try delayType(vm);
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    const pending = interner.internKeywordValue("pending") catch return VmError.OutOfMemory;
+    const key = interner.internKeywordValue("state") catch return VmError.OutOfMemory;
+    // `Heap.alloc` never collects (GC.md §11.5): the pieces need no
+    // roots on their way into the record.
+    const thunk = vector_mod.fromSlice(heap, &.{ pending, args[0] }) catch return VmError.OutOfMemory;
+    const state = atom_mod.make(heap, thunk) catch return VmError.OutOfMemory;
+    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = champ_mod.mapAssoc(heap, empty, key, state, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+}
+
+fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(isDelay(vm, args[0]));
+}
+
+/// `@d` of a delay: `(nexis.core/force d)`.
+fn forceDelay(vm: *VM, d: Value) VmError!Value {
+    const registry = vm.registry orelse return VmError.NotDerefable;
+    const force = registry.core.lookupLocal("force") orelse return VmError.NotDerefable;
+    return vm.callValue(force.current() orelse return VmError.UnboundVar, &.{d});
 }
 
 // =============================================================================
@@ -3721,7 +3970,12 @@ fn appendStrValue(
     interner: ?*const intern_mod.Interner,
 ) VmError!void {
     if (v.kind() == .nil) return;
-    const mode: format_mod.FormatMode = if (v.kind() == .string or v.kind() == .char) .display else .readable;
+    // A float by itself is Java's `toString` (`Infinity`), as Clojure's
+    // `str` makes it; inside a collection it prints readable (`##Inf`).
+    const mode: format_mod.FormatMode = switch (v.kind()) {
+        .string, .char, .float => .display,
+        else => .readable,
+    };
     // The writer is an Allocating buffer: a failed write is an
     // allocation failure.
     format_mod.format(v, mode, &w.writer, interner) catch |err| switch (err) {
