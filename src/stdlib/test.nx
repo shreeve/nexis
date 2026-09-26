@@ -77,8 +77,7 @@
 ; What an assertion calls: `is` expands to one call of these, so the
 ; judging and the reporting are here once, not in every assertion.
 ; Each returns whether the assertion passed; a pass is counted here
-; rather than through `pass!`, so an assertion that passes costs the
-; calls it cost when this code was inlined at every assertion.
+; rather than through `pass!`, one closure call fewer per assertion.
 (defn check= [form expected actual msg]
   (if (= expected actual) (do (bump! "pass") true) (fail! form expected actual msg)))
 

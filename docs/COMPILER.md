@@ -307,6 +307,48 @@ reported at the instruction that raised it.
 - `(require ...)` runs through the expander and `src/loader.zig`
   (MACROEXPAND.md §8).
 
+#### 4.8 What common forms cost
+
+Instructions `bin/nexis disasm` lists for each form as the whole body
+of `(defn f [a b c m xs] ...)`, its return included (a value in the
+tail is returned in place, §5.5); `g` and `h` are Vars, `pm` a
+protocol method. `test/prop/compile.zig` pins a set of such shapes.
+
+| Form | Instructions |
+|---|---:|
+| `(g (h a) (h b) (h c))` | 12 |
+| `(g a b c)` | 6 |
+| `(str "a" a "b" b)` | 7 |
+| `{:a (inc a) :b (g b) :c c}` | 10 |
+| `(pm a)`, `(:x a)` | 4 |
+| `(is (= 1 (inc (dec a))))` | 8 |
+| `(is (pos? a))` | 8 |
+| `(is (thrown? :x (g a)))` | 16 |
+| `(let [[x y & r] xs] (g x y r))` | 21 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))` | 15 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 20 |
+| `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
+| `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
+| `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |
+| `(condp = a 1 :a 2 :b 3 :c :d)` | 20 |
+| `(when-let [x (g a)] (h x))` | 9 |
+| `(if-let [x (g a)] (h x) (h b))` | 12 |
+| `(and (h a) (h b) (h c))` | 14 |
+| `(-> a (g b) (h) (g c))` | 10 |
+| `(doseq [x xs] (g x))` | 15 |
+| `(for [x xs] (h x))` | 24 |
+| `(dotimes [i a] (g i))` | 9 |
+| `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
+| `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
+| `(assert (pos? a) "a must be positive")` | 10 |
+
+A call's arguments compute straight into its block; an argument that
+is already in a slot (a parameter, a `let` binding) is one `mov:move`
+into it, a constant one `mov:load-const`, the callee one
+`var:load-var`, as the range-call ABI (VM.md §6) needs every one of
+them in the block. A `let` binding that only renames a local costs
+nothing (§4.4).
+
 ---
 
 ### 5. Primitive core lowering
@@ -684,12 +726,15 @@ limits of §4.4, the span table, declared names and the stack guard.
 `bin/nexis` boots one: the `cases` table (source and printed value for
 every primitive-core form, binding and capture shape, `recur` target,
 quoted literal and the host macros the compiler relies on), the
-`failures` table (source and error), inlining, slot reuse, constant
-collections, `eval`'s freeing, the randomized properties (capture at
-nesting depth 1..10, syntax-quote equal to the hand-built shape), and
-a differential test comparing random programs over arithmetic, `if`,
-shadowing `let*`, closures and counting `loop*`s against a reference
-evaluator. `test/integration/eval_pipeline.zig` runs source end to
+`failures` table (source and error), inlining, the instruction counts
+of common shapes (§4.8), slot reuse, constant collections, `eval`'s
+freeing, the randomized properties (capture at nesting depth 1..10,
+syntax-quote equal to the hand-built shape), and a differential test
+comparing random programs over arithmetic, `if` (on a comparison, or
+on an `and` or `or` of comparisons, one negated), shadowing `let*`,
+closures, calls of one and two arguments nested in each other's
+arguments, a call whose argument throws, and counting `loop*`s read
+directly and through `let*` aliases, against a reference evaluator. `test/integration/eval_pipeline.zig` runs source end to
 end through every host macro and every `try` exit path.
 
 #### 9.4 Guarantees the tests pin
