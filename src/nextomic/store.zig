@@ -85,8 +85,16 @@ pub const SyncMode = enum {
     }
 };
 
+/// The size a new store file starts at, and the step emdb extends a
+/// full one by (NEXTOMIC.md §2). emdb reserves its address space up
+/// front, so an extension moves nothing and costs one `ftruncate`; a
+/// small store stays small and a large one carries at most one step
+/// of unused file.
+pub const initial_map_size: u64 = 1 << 20;
+pub const map_grow_step: u64 = 8 << 20;
+
 pub const Options = struct {
-    map_size: u64 = 256 * 1024 * 1024,
+    map_size: u64 = initial_map_size,
     /// False leaves `:db/fulltext` out of the bootstrap, making a store
     /// as one written without the attribute, for the test of its mint
     /// at open.
@@ -248,6 +256,7 @@ pub const Store = struct {
                 .pageSize = db_layer.page_size,
                 .maxNamedTrees = db_layer.max_named_trees,
                 .mapSize = options.map_size,
+                .growStep = map_grow_step,
                 .allocator = allocator,
             }),
             .trees = undefined,
@@ -1070,6 +1079,29 @@ test "open bootstraps once and reopen finds the same ids" {
         try testing.expectEqual(@as(?u32, boot.ident), try store.identIdByName(txn, "db/ident"));
         try testing.expectEqual(@as(u64, boot.idents.len), try store.attrCount(txn, boot.ident));
     }
+}
+
+test "a new store file starts small and grows a step at a time" {
+    var td = try TestDir.init("store_map");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    try testing.expectEqual(initial_map_size, store.file.env.info().mapSize);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Payloads past the first size grow the file in whole steps.
+    const payload = try arena.alloc(u8, 4096);
+    @memset(payload, 'x');
+    const batch = try arena.alloc(Store.Prepared, 512);
+    for (batch, 0..) |*p, i| p.* = .{ .e = (1 << 33) + i, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = 0 }), .payload = payload, .added = true, .avet = false, .vaet = false };
+    const txn = try store.beginWrite(.none);
+    errdefer txn.abort();
+    try store.writeBatch(txn, 2, batch, arena);
+    try txn.commit();
+    const grown = store.file.env.info().mapSize;
+    try testing.expect(grown > initial_map_size and grown < 64 << 20);
+    try testing.expectEqual(0, (grown - initial_map_size) % map_grow_step);
 }
 
 test "a store without :db/fulltext receives it at open, at its next ident id" {

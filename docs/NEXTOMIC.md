@@ -41,9 +41,16 @@ below is a public function or a committed invariant of emdb as it stands
 ## 2. Store layout
 
 `Store.open` opens its own emdb `Env` with the geometry every nexis
-store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128), a
-256 MB initial map and emdb's 64 MB growth step. emdb reads a file's
-page size from its meta and fixes it for the file's life (INV-M05), so
+store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
+new file starts at the map size its opener names
+(`Store.Options.map_size`: 1 MiB, `Store.initial_map_size`, unless
+named; a connection names `nextomic.db.OpenOptions.map_size`, 256 MB)
+and emdb extends a full file 8 MiB at a time (`Store.map_grow_step`).
+emdb reserves the address space when it opens a file, so an extension
+moves no mapping and costs one `ftruncate`; the file's length is the
+map, and its allocated blocks are the pages written. emdb reads a
+file's page size from its meta and fixes it for the file's life
+(INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
 holds on every platform. Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
