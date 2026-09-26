@@ -15,7 +15,7 @@
 //!   - Store `#(...)` as the `anon_fn` datum, rejecting nesting.
 //!   - Read `#'x` as the list `(var x)`.
 //!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
-//!     unquote expansion live in the macroexpander (PLAN §14.2).
+//!     unquote expansion live in the macroexpander (MACROEXPAND.md).
 //!
 //! `readForm` calls `stack.check` on entry, so input nested past the stack's
 //! budget is `:nesting-too-deep`, and each Form's span comes from its
@@ -474,7 +474,7 @@ pub const Reader = struct {
     // String / character / number decoding helpers
     // -------------------------------------------------------------------------
 
-    /// A string body with its escapes decoded (PLAN §7.2). The bytes
+    /// A string body with its escapes decoded (FORMS.md §3). The bytes
     /// must be UTF-8; an escape that fails is the error's detail.
     fn decodeStringEscapes(self: *Reader, body: []const u8, span: SrcSpan) ReaderError![]const u8 {
         if (!std.unicode.utf8ValidateSlice(body)) return self.fail(.invalid_utf8, span, null);
@@ -610,7 +610,7 @@ fn parseIntLiteral(text: []const u8) ?i64 {
 }
 
 /// The scalar a char token's text after `\` names: `u{HEX}`, one
-/// character (a valid UTF-8 sequence), or a name of PLAN §7.2's named
+/// character (a valid UTF-8 sequence), or a name of FORMS.md §3's named
 /// set. `null` for anything else, surrogates and scalars past U+10FFFF
 /// included. Clojure's `uXXXX` and `oNNN` spellings are not accepted:
 /// `\u{HEX}` is the one escape (PLAN §23 decision 26).

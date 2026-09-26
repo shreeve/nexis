@@ -287,10 +287,11 @@ Each item is a commitment; changing one takes an Amendment Log entry
     `meta_symbol` kind number is reserved), so `with-meta` on a symbol
     raises `:no-metadata-on-immediate`. Keyword and symbol hash
     domains are separated.
-33. **Keywords and symbols are callable.** `(:k m)` is `(get m :k)`,
-    `(:k m d)` is `(get m :k d)`, and a symbol in function position
-    looks itself up the same way; maps, sets and vectors are callable
-    as in Clojure.
+33. **Keywords, symbols and Vars are callable.** `(:k m)` is
+    `(get m :k)`, `(:k m d)` is `(get m :k d)`, and a symbol in function
+    position looks itself up the same way; a Var calls its value in
+    force, `(#'inc 1)` is 2; maps, sets and vectors are callable as in
+    Clojure.
 34. **Macros receive their arguments only**: no `&form`, no `&env`.
 35. **`seq` is the core iteration abstraction.** Map lookup, vector
     indexing and typed-vector kernels bypass it where that is clearer.
@@ -733,4 +734,6 @@ entry stating the decision and its rationale.
 - **2026-09-25 — Var-quote reader form (§28.2, §28.3).** `#'x` reads as
   the list `(var x)`, as in Clojure's reader, so Clojure code reads and
   a printed Var (`#'ns/name`) reads back. `docs/FORMS.md` §3 is the
-  authority.
+  authority. §23 #33: a Var is callable, calling its value in force, as
+  Clojure's `Var.invoke`, and `deref` of a Var reads the binding in
+  force (`docs/VM.md` §6).

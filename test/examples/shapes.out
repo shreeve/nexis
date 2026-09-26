@@ -11,13 +11,13 @@ Per-shape reports:
 Aggregate state (atom):
   total area = 9650
 
-Equality probes (5.3a structural eq):
+Equality probes (structural =):
   (= (->Circle 5) (->Circle 5)) => true
   (= (->Circle 5) (->Circle 7)) => false
   records-as-map-keys: lookup by fresh constructor:
     (get label-by-shape (->Circle 5)) => :small-circle
 
-Dispatch table snapshot (5.3d satisfies?):
+Dispatch table snapshot (satisfies?):
   Shape ⊇ Circle    ? true
   Shape ⊇ Triangle  ? true
   Shape ⊇ :fixnum   ? true

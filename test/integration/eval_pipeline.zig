@@ -2676,7 +2676,7 @@ test "nexis.string: lower-case + upper-case: non-ASCII passes through unchanged"
     try expectOutput("(count (nexis.string/lower-case \"HéLLO\"))", "5");
 }
 
-test "nexis.string: trim: six ASCII whitespace chars; both sides" {
+test "nexis.string: trim: whitespace on both sides" {
     try expectOutput("(nexis.string/trim \"   hello   \")", "hello");
     try expectOutput("(nexis.string/trim \"hello\")", "hello");
     try expectOutput("(nexis.string/trim \"\")", "");

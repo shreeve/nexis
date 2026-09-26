@@ -57,13 +57,13 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 152/152 steps succeeded; 1223/1223 tests passed
+Build Summary: 152/152 steps succeeded; 1226/1226 tests passed
 ```
 
-It ran in 38 s wall (212 s CPU) from a warm cache on an Apple-silicon
+It ran in 67 s wall (225 s CPU) from a warm cache on an Apple-silicon
 Mac shared with other builds. Any output besides the summary tree is a
-failure. The largest binaries are `unit` (611 inline tests) and
-`eval_pipeline` (406 programs).
+failure. The largest binaries are `unit` (612 inline tests) and
+`eval_pipeline` (408 programs).
 
 The fastest end-to-end checks:
 

@@ -418,7 +418,7 @@ fn blockSlice(b: *Block) []align(16) u8 {
 
 const testing = std.testing;
 
-test "HeapHeader layout is exactly VALUE.md §4" {
+test "HeapHeader layout is exactly HEAP.md §1" {
     try testing.expectEqual(@as(usize, 16), @sizeOf(HeapHeader));
     try testing.expectEqual(@as(usize, 0), @offsetOf(HeapHeader, "kind"));
     try testing.expectEqual(@as(usize, 2), @offsetOf(HeapHeader, "mark"));

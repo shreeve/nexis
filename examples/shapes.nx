@@ -128,7 +128,7 @@
 (println "  total area =" (deref total-area))
 
 (println "")
-(println "Equality probes (5.3a structural eq):")
+(println "Equality probes (structural =):")
 (println "  (= (->Circle 5) (->Circle 5)) =>" (= (->Circle 5) (->Circle 5)))
 (println "  (= (->Circle 5) (->Circle 7)) =>" (= (->Circle 5) (->Circle 7)))
 (println "  records-as-map-keys: lookup by fresh constructor:")
@@ -136,7 +136,7 @@
          (get label-by-shape (->Circle 5)))
 
 (println "")
-(println "Dispatch table snapshot (5.3d satisfies?):")
+(println "Dispatch table snapshot (satisfies?):")
 (println "  Shape ⊇ Circle    ?" (satisfies? Shape (->Circle 5)))
 (println "  Shape ⊇ Triangle  ?" (satisfies? Shape (->Triangle 6 4)))
 (println "  Shape ⊇ :fixnum   ?" (satisfies? Shape 42))
