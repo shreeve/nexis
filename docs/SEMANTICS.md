@@ -350,14 +350,15 @@ How each kind prints in the `pr-str` and `str` modes is
   modes, as Clojure does; the reader has no tagged literals (PLAN §24
   item 3).
 - Not a durable ref: `#<durable-ref :tree hex:key-bytes>`.
+- A var prints as `#'ns/name`, which reads as `(var ns/name)`: not a
+  value that round-trips, but a form that evaluates to the same Var.
 
 #### 6.2 Kinds that print opaquely
 
-Functions, native fns, vars, transients, atoms, protocols, protocol
-fns and the db and Nextomic handles print as markers for debugging
-(`#<fn>`, `#<native-fn inc>`, `#<atom>`, `#<transient>`, a var as
-`#'ns/name`, a Nextomic handle as `#nextomic/conn "path"` and the
-like) that do not read back. None is serializable either
+Functions, native fns, transients, atoms, protocols, protocol fns and
+the db and Nextomic handles print as markers for debugging (`#<fn>`,
+`#<native-fn inc>`, `#<atom>`, `#<transient>`, a Nextomic handle as
+`#nextomic/conn "path"` and the like) that do not read back. None is serializable either
 (`docs/CODEC.md` §3).
 
 #### 6.3 Numeric print rules

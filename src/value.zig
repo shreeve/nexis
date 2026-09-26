@@ -17,7 +17,7 @@
 //!     constructor that enforces range / canonicalization invariants.
 //!   - `nil == Value{}` — the all-zero bit pattern is a valid `nil`.
 //!   - Every f64 stored in a `Value.float` is canonical form (SEMANTICS
-//!     §3.2). NaN bit patterns are collapsed at construction.
+//!     §2.2). NaN bit patterns are collapsed at construction.
 //!   - `fromChar` rejects UTF-16 surrogate codepoints.
 //!   - `fromFixnum` rejects values outside i48 range (±140 trillion);
 //!     callers that need larger integers must go via the bignum path.
@@ -444,9 +444,9 @@ test "isFalsy: matches !isTruthy across every immediate kind" {
     // Direct positive checks for the falsy kinds.
     try std.testing.expect(nilValue().isFalsy());
     try std.testing.expect(fromBool(false).isFalsy());
-    // Direct negative checks for representative truthy kinds (the
-    // PLAN §6.2 surprise list — values users might assume are
-    // falsy because they're zero/empty in other languages).
+    // Direct negative checks for representative truthy kinds (values
+    // users might assume are falsy because they're zero/empty in other
+    // languages; SEMANTICS §1).
     try std.testing.expect(!fromBool(true).isFalsy());
     try std.testing.expect(!(fromFixnum(0).?).isFalsy());
     try std.testing.expect(!fromFloat(0.0).isFalsy());

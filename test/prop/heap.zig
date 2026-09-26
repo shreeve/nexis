@@ -1,8 +1,8 @@
 //! test/prop/heap.zig — randomized property tests for the heap allocator.
 //!
-//! Covers PLAN §20.2 test #7 ("GC stress: allocate-heavy
-//! workloads interleaved with forced collections; no leaked/corrupted
-//! objects; all live data survives; no dangling headers"). Builds on
+//! GC stress at the allocator: allocate-heavy workloads interleaved
+//! with forced sweeps; no leaked or corrupted objects, all live data
+//! survives, no dangling headers. Builds on
 //! the inline tests in `src/heap.zig`; this file exists to hammer the
 //! alloc/mark/pin/free/sweep operations at scale with deterministic
 //! PRNG-driven workloads and an oracle cross-check.

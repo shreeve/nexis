@@ -1,5 +1,5 @@
 //! test/prop/typed_vector.zig — randomized properties for the typed
-//! vector heap kind (`docs/TYPED_VECTOR.md` §7).
+//! vector heap kind (`docs/TYPED_VECTOR.md` §9).
 //!
 //! Properties:
 //!   T1. Codec round trip for both element types at lengths 0, 1, 31,
@@ -11,6 +11,8 @@
 //!       elements in distinct allocations are `=` and hash alike;
 //!       one changed element, a different length, or the other
 //!       element type breaks `=`.
+//!   T2b. Signed zero and NaN: `-0.0` equals `+0.0`, NaN equals NaN,
+//!       and the hashes agree.
 //!   T3. A typed vector is never `=` to the persistent vector of the
 //!       same numbers, and their hashes differ.
 //!   T4. `nth` reads back every element and fails with

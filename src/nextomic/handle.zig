@@ -186,7 +186,7 @@ pub fn formatDb(v: Value, writer: *std.Io.Writer) !void {
 /// only errors of the VM's set, so `vm.lookup` can cast them back.
 pub const EntityRead = *const fn (vm: *anyopaque, ent: Value, key: Value, default: Value) anyerror!Value;
 
-/// The fields of a lazy entity (NEXTOMIC.md §6).
+/// The fields of a lazy entity (NEXTOMIC.md §6.1).
 pub const EntityShape = struct {
     /// The `nextomic_db` box the entity reads through.
     db: Value,

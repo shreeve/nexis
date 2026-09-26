@@ -1,5 +1,5 @@
 //! test/integration/nextomic_entity.zig — the lazy entity through the
-//! whole pipeline (docs/NEXTOMIC.md §6): a program runs source against
+//! whole pipeline (docs/NEXTOMIC.md §6.1): a program runs source against
 //! a VM with core, `db` and `nextomic` installed, and every access
 //! path of `entity` is checked as a program sees it. The collector
 //! case runs the VM under the stress policy (`vm.GcPolicy.stress`),

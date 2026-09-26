@@ -1,17 +1,16 @@
 //! test/prop/transient.zig — randomized property tests for the
-//! transient wrapper. Together with test/prop/champ.zig (map/set) and
-//! test/prop/vector.zig (vector), this file covers PLAN §20.2
-//! tests #3 (transient equivalence) and #4 (transient ownership).
+//! transient wrapper: transient equivalence and ownership, alongside
+//! test/prop/champ.zig (map/set) and test/prop/vector.zig (vector).
 //!
 //! Properties (TRANSIENT.md §12):
 //!
-//!   T1. Equivalence (test #3): random edit sequences applied via
+//!   T1. Equivalence: random edit sequences applied via
 //!       (transient → N × ...Bang → persistentBang) produce the same
 //!       persistent Value (by `dispatch.equal` AND `dispatch.hashValue`)
 //!       as the direct persistent path. 1000 trials per kind; T1d
 //!       drives random conj!/assoc!/pop! on vectors of up to 1100
 //!       elements, across the first trie boundary.
-//!   T2. Ownership (test #4): frozen transients reject every op with
+//!   T2. Ownership: frozen transients reject every op with
 //!       `error.TransientFrozen`.
 //!   T3. Source immutability: a `...Bang` session on transient
 //!       `t = transientFrom(p)` does NOT mutate the original
@@ -37,7 +36,7 @@ const HeapHeader = heap_mod.HeapHeader;
 const prng_seed: u64 = 0x7472_616E_7369_656E; // "transien" LE
 
 // =============================================================================
-// T1 — Equivalence (PLAN §20.2 test #3)
+// T1 — Equivalence
 // =============================================================================
 
 test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)" {
@@ -74,7 +73,7 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)"
 
         const persistent_from_transient = try transient.persistentBang(t);
 
-        // Equivalence: PLAN §20.2 test #3.
+        // Equivalence: `=` and hash-equal.
         try std.testing.expect(dispatch.equal(persistent_path, persistent_from_transient));
         try std.testing.expectEqual(
             dispatch.hashValue(persistent_path),
@@ -192,7 +191,7 @@ test "T1d: vector equivalence — random conj!/assoc!/pop! ≡ conj/assoc/pop (3
 }
 
 // =============================================================================
-// T2 — Ownership (PLAN §20.2 test #4)
+// T2 — Ownership
 // =============================================================================
 
 test "T2a: map transient post-freeze rejects every op with TransientFrozen" {

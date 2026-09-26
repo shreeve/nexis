@@ -5,7 +5,7 @@
 //! table and the JSON output. `docs/PERF.md` holds the numbers of
 //! record.
 //!
-//! Design (BENCH.md §3):
+//! Design (BENCH.md §3, §10):
 //!
 //!   - Every benchmark produces a distribution (30 samples by
 //!     default).
@@ -85,7 +85,7 @@ pub const Stats = struct {
         };
     }
 
-    /// Nearest rank (BENCH.md §3): the sample at rank ceil(p/100 * n),
+    /// Nearest rank (BENCH.md §10): the sample at rank ceil(p/100 * n),
     /// never interpolated.
     fn percentile(sorted: []const f64, comptime p: u8) f64 {
         const n = sorted.len;
@@ -105,11 +105,11 @@ pub const BenchResult = struct {
     /// collection size). Carried through to the JSON.
     param: ?i64,
     stats: Stats,
-    /// Best-case ops/sec derived from the *median* (not the min,
+    /// Ops/sec derived from the *median* (not the min,
     /// not the mean). BENCH.md §3 requires median as the headline.
     ops_per_sec_median: f64,
     /// How many inner-loop iterations collapsed into each sample
-    /// (adaptive scaling — §1 of this file's doc).
+    /// (the adaptive inner loop of this file's design notes).
     inner_reps: usize,
     /// Warmup iterations discarded before measurement.
     warmup_iters: usize,

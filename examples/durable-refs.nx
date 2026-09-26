@@ -1,8 +1,8 @@
 ; examples/durable-refs.nx — durable identity demo
 ;
-; The OTHER big arc: durable identities are first-class language
-; values, not a library bolted on top. Backed by emdb (LMDB-class
-; B+ tree, MVCC, zero-copy reads).
+; Durable identities are first-class language values, not a library
+; bolted on top. Backed by emdb (LMDB-class B+ tree, MVCC, zero-copy
+; reads).
 ;
 ; This example uses both APIs:
 ;   - auto-ephemeral: db/put-key! / db/get-key

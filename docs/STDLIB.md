@@ -242,8 +242,9 @@ their elements in the same mode. Who uses which:
 | Nextomic handles | `#nextomic/conn "path"`, `#nextomic/db {:basis-t N :mode :current}` (`:as-of N` / `:since N` when set), `#nextomic/entity {:db/id N}` |
 
 A map or set of up to eight entries prints in insertion order, a
-larger one in hash order (CHAMP.md §2). None of the `#<...>`,
-`#'`, `#ns.Type{...}`, `#i64[...]` or `#nextomic/...` forms reads
+larger one in hash order (CHAMP.md §2). A Var's `#'ns/name` reads
+back as `(var ns/name)`, which evaluates to the same Var; none of the
+`#<...>`, `#ns.Type{...}`, `#i64[...]` or `#nextomic/...` forms reads
 back; the codec (CODEC.md) is the serialization layer.
 
 **Limits.** There is no length or depth option (`*print-length*` is
@@ -279,7 +280,7 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 | `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append`) |
 | `read-line` | 0 | The next line of stdin, of any length, without its `\n` or a trailing `\r`; nil at end of input. It shares one buffer with the REPL, so neither loses what the other read | `:io-error` (a read failure) |
 | `nano-time` | 0 | A monotonic clock in nanoseconds, reduced modulo the fixnum maximum, for intervals; the `time` macro prints `"Elapsed time: X msecs"` with `prn` | — |
-| `exit` | 0–1 | Closes every store `db/open` or `nextomic/connect` opened, then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`) | `:kind-mismatch` (non-integer) |
+| `exit` | 0–1 | Closes every store `db/open` opened and every Nextomic connection `connect` made, then ends the process with the status (0 by default; the integer's low eight bits, so `(exit 257)` exits 1 and `(exit -1)` 255). Nothing after it runs, `finally` blocks included, as with Java's `System/exit` (`test/golden/cli/exit-status.nx`) | `:kind-mismatch` (non-integer) |
 | `*command-line-args*` | Var | The arguments after the program as a vector of strings, nil when there are none; `nexis run` binds it (TOOLING.md §1) | — |
 
 The `with-out-str` buffer stack is process-wide (one isolate, one

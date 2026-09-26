@@ -4,7 +4,7 @@
 
 (ns prelude)
 
-; Entity-id partitions (docs/NEXTOMIC.md §2): user entities start at
+; Entity-id partitions (docs/NEXTOMIC.md §2.1): user entities start at
 ; 2^32; a transaction entity is tx-partition + t.
 (def user-partition 4294967296)
 (def tx-partition 70368744177664)

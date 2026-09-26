@@ -57,7 +57,7 @@
 //!
 //! **Limits**: the primitive `try` takes one `(catch any binding
 //! ...)`; the expander lowers several catch clauses and keyword
-//! matchers onto it (MACROEXPAND.md §10).
+//! matchers onto it (MACROEXPAND.md §2b).
 
 const std = @import("std");
 const vm = @import("vm.zig");
@@ -392,10 +392,10 @@ pub const CompileError = error{
     /// cannot address more.
     SlotOverflow,
 
-    /// Symbol reference resolves to NONE of (local, upvalue,
-    /// var, special-form, core-mapping) — per COMPILER.md §4.3.
-    /// Without a namespace, anything that is not a local or an
-    /// upvalue raises this.
+    /// A symbol resolves to nothing COMPILER.md §4.3 classifies: no
+    /// local, upvalue, namespace Var or name the file or line
+    /// defines. Without a namespace, anything that is not a local
+    /// or an upvalue raises this.
     UnresolvedSymbol,
 
     /// Two parameter slots in the same `fn*` carry the same
@@ -413,7 +413,7 @@ pub const CompileError = error{
 
     /// `(recur ...)` appears in a position that is not a tail
     /// position of an enclosing `loop*` or `fn*` body. Per
-    /// PLAN §11.3 + VM.md §11 + COMPILER.md §5.6: `recur` MUST
+    /// COMPILER.md §4.4, §5.6 + VM.md §11: `recur` MUST
     /// be in tail position to preserve the constant-stack
     /// guarantee.
     RecurOutsideTail,
@@ -578,7 +578,7 @@ fn toSourceSpan(span: reader_mod.SrcSpan) vm.SourceSpan {
 /// what a node allocated once the node is compiled.
 ///
 /// **Constant pool**: one entry per identical Value (COMPILER.md
-/// §4.5).
+/// §4.4).
 ///
 /// **Lexical scope**: a stack of `LocalBinding{name, ref}` pairs.
 /// Resolution walks innermost-first (newest entries shadow older).
@@ -903,7 +903,7 @@ const Emitter = struct {
     }
 
     /// The pc of the next instruction, as a jump operand: jump
-    /// targets are 12-bit indexes (VM.md §4), so a target past 4095
+    /// targets are 12-bit indexes (VM.md §3), so a target past 4095
     /// is `JumpTargetOutOfRange` at the form that needs the jump.
     fn nextPc(self: *const Emitter) CompileError!u12 {
         const pc = self.code.items.len;
@@ -1405,7 +1405,7 @@ fn lowerList(
 }
 
 /// How each special form lowers: the expander's `special_forms`
-/// (MACROEXPAND.md §5), less the four it rewrites away (`ns`,
+/// (MACROEXPAND.md §1.1), less the four it rewrites away (`ns`,
 /// `require`, `defmacro`, `set!`), and the `#%` collection
 /// constructors syntax-quote emits.
 const lowerings = std.StaticStringMap(*const fn (std.mem.Allocator, []const *reader_mod.Form, LowerCtx) CompileError!*Tiny).initComptime(.{
@@ -1517,7 +1517,7 @@ fn lowerColl(
 }
 
 /// The collection `items` build, made now when every item is a
-/// constant (PLAN §11.4): the literal is then one constant, however
+/// constant (COMPILER.md §4.4): the literal is then one constant, however
 /// large, instead of a slot and an instruction per item. It is built
 /// on the lowering heap, as the VM builds it at run time, and lives
 /// as long as a routine holding it can run, which marks it
@@ -2426,7 +2426,7 @@ pub fn compileFormWith(
         };
         working_form = expand_mod.expandForm(&mctx, null, form) catch |err| {
             // The expander records the innermost form it failed at
-            // and why (MACROEXPAND.md §6).
+            // and why (MACROEXPAND.md §8).
             if (out_span) |s| s.* = if (mctx.failure) |f| f.span else form.origin;
             if (opts.out_detail) |d| d.* = if (mctx.failure) |f| f.message else null;
             return switch (err) {
@@ -2662,7 +2662,7 @@ fn compileSymbol(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
     //   3. namespace Var (if namespace exists) → var:load-var
     //      (lazy-interns unbound Vars so forward references
     //      work)
-    //   4. error → :unresolved-symbol
+    //   4. otherwise `UnresolvedSymbol`
     //
     // Form lowering does NOT resolve symbols to slots
     // — it preserves names and dispatches operator-position
@@ -2959,7 +2959,7 @@ fn compileRecur(
             if (j != i and try readsName(other, target.names[i])) read_elsewhere = true;
         }
         // Recur args are non-tail (any nested recur would target
-        // the wrong scope; PLAN §11.3).
+        // the wrong scope; COMPILER.md §4.4).
         if (!read_elsewhere and !target.captured_mask[i]) {
             try compileExpr(e, arg, slot, null);
             pending[i] = null;

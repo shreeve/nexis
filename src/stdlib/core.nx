@@ -170,7 +170,7 @@
          (db/abort-read! ~(first binding))
          (throw e#)))))
 
-; Snapshot vocabulary (PLAN.md §15.7).
+; Snapshot vocabulary (docs/DB.md §12).
 ;
 ; A snapshot is an emdb read transaction pinned to the commit
 ; generation that was current when it began. As long as the
@@ -187,7 +187,7 @@
 ; snapshot is an ordinary Value — pass it to functions, store
 ; it, compare it for identity.
 ;
-; Caveat (per PLAN.md §15.7): long-held snapshots prevent emdb
+; Caveat (docs/DB.md §12): long-held snapshots prevent emdb
 ; from reclaiming pages they reference. Don't pin snapshots
 ; you don't intend to release.
 

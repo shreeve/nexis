@@ -1,12 +1,11 @@
 //! test/prop/codec.zig — randomized round-trip property tests for
-//! `src/codec.zig`. Covers PLAN §20.2 test #5 (codec round-trip).
+//! `src/codec.zig`: every serializable value round-trips.
 //!
 //! Properties (CODEC.md §7):
 //!
-//!   C1. **100k randomized Values round-trip** (PLAN §20.2 test #5,
-//!       and test #1 "100k+ randomized equality/hash tests across
-//!       all value kinds"): for every
-//!       serializable kind, nested up to depth 4,
+//!   C1. **100k randomized Values round-trip**, so 100k randomized
+//!       equality/hash checks: for every serializable kind, nested
+//!       up to depth 4,
 //!       `dispatch.equal(v, decode(encode(v)))` AND
 //!       `dispatch.hashValue(v) == dispatch.hashValue(decode(encode(v)))`.
 //!   C2. **Re-encode byte-equality** for canonical-order kinds
@@ -79,11 +78,11 @@ const TestCtx = struct {
 };
 
 // =============================================================================
-// C1. 100k randomized round-trip (PLAN §20.2 test #5)
+// C1. 100k randomized round-trip
 // =============================================================================
 
-// PLAN §20.2 test #1, "100k+ randomized equality/hash tests across all
-// value kinds": each trial encodes a random Value, decodes it and
+// 100k randomized equality/hash checks across the serializable
+// kinds: each trial encodes a random Value, decodes it and
 // asserts structural equality and an equal hash. Each trial's values
 // die with its heap, and the allocator keeps no stack trace per
 // allocation, so 100k trials cost seconds.

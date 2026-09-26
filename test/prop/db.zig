@@ -1,11 +1,11 @@
 //! test/prop/db.zig — randomized round-trip property tests for
-//! `src/db.zig` + emdb integration. Covers PLAN §20.2 test #6
-//! (emdb round-trip).
+//! `src/db.zig` + emdb integration: values written through emdb
+//! read back equal.
 //!
 //! Properties (DB.md §10):
 //!
-//!   D1. **10k random Values across 5 named trees** (PLAN §20.2
-//!       test #6): every trial writes a random Value to a
+//!   D1. **10k random Values across 5 named trees**: every trial
+//!       writes a random Value to a
 //!       `(tree_name, key_bytes)` pair selected from 5 named trees.
 //!       After commit, a fresh read transaction pulls each entry
 //!       back. Assert:
@@ -102,7 +102,7 @@ const TestCtx = struct {
 };
 
 // =============================================================================
-// D1. 10k Values across 5 named trees (PLAN §20.2 test #6)
+// D1. 10k Values across 5 named trees
 // =============================================================================
 
 test "D1: 10000 random Values across 5 trees read back equal after commit" {

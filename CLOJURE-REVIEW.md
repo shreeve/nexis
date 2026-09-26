@@ -46,7 +46,7 @@ the macros live: `let`, `fn`, `loop`, `defn`, `cond`, `->` and the
 other surface forms are host macros written in Zig in the expander,
 complete from the start; `core.clj`'s two-stage bootstrap (a trivial
 `let`, redefined once destructuring exists) has no counterpart.
-`letfn`, `binding`, `case` and the rest of the library macros are in
+`letfn`, `binding` and the rest of the library macros are in
 `src/stdlib/core.nx` (`docs/MACROEXPAND.md`).
 
 ### 1.2 Transient ownership
@@ -67,7 +67,8 @@ and typed-vector kernels stay direct.
 
 `Keyword` implements `IFn` as `get`; so does `Symbol`. In nexis `(:k m)`
 and `(:k m d)` are `get`, a symbol in function position looks itself up
-the same way, and maps, sets and vectors are callable (§23 #33).
+the same way, and maps, sets and vectors are callable (§23 #33). A
+Var is callable as in Clojure: `(#'f x)` calls the Var's value.
 
 ### 1.5 Unbound Vars
 
@@ -78,8 +79,9 @@ effect is the same.
 ### 1.6 Metadata
 
 Metadata never affects `=` or `hash` (§23 #12); `with-meta` returns a
-new value with the map in the heap header. Collections and Vars carry
-it; records, functions, symbols and keywords do not
+new value with the map in the heap header. Collections, records and
+Vars carry it, and `conj`, `assoc` and the other updates keep it, as
+in Clojure; typed vectors, functions, symbols and keywords carry none
 (`docs/SEMANTICS.md` §7).
 
 ### 1.7 Hash-domain separation
@@ -185,7 +187,6 @@ are the map for someone who knows Clojure.
 | `"☃"` | a string escape | `:invalid-string-escape`; write `"\u{2603}"` | the same |
 | `\o377` | an octal char | unsupported | `\u{...}` covers it |
 | String escapes | `\b \f \0`, octal, `\uHHHH` | `\n \t \r \\ \" \u{HEX}` | a narrow set |
-| `#'foo` | `(var foo)` | parse error; write `(var foo)` | a minimal reader |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
@@ -193,7 +194,8 @@ are the map for someone who knows Clojure.
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 | `#!` | a comment to end of line | the CLI treats a first line starting `#!` as a comment; elsewhere a parse error | executable scripts only |
 
-The `#` dispatch set is `#{}`, `#(...)` and `#_`. Clojure's reader
+The `#` dispatch set is `#{}`, `#(...)`, `#_` and `#'` (`#'foo` is
+`(var foo)`). Clojure's reader
 throws ad-hoc exceptions for malformed input; nexis reports a stable
 keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 `:nested-anon-fn`, `:unquote-outside-syntax-quote`, ...; PLAN §28.3).
@@ -206,7 +208,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | NaN `=` NaN | false | true (canonical bits) | `docs/SEMANTICS.md` |
 | integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48 | `docs/BIGNUM.md` |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
-| `(long x)` | throws beyond 64 bits | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int` is `long`; `short`, `byte`, `float`, `bigint` do not exist | `docs/SEMANTICS.md` |
+| `(long x)` | throws beyond 64 bits | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int` checks Java's int range (`:invalid-argument` outside it, and for NaN, which Clojure makes 0); `short`, `byte`, `float`, `bigint` do not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
 | `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
@@ -218,7 +220,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(read-string s)` | the full reader | the first form as data; syntax-quote, unquote and `^meta` are not data and raise `:reader-error` | `docs/MACROEXPAND.md` |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message ... :form form}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
-| `(meta f)`, `(with-meta 'sym m)`, `(with-meta rec m)` | metadata on fns, symbols and records | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
+| `(meta f)`, `(with-meta 'sym m)` | metadata on fns and symbols | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
 | `volatile!`, `vswap!`, `vreset!` | a volatile box | an atom (`atom?` is true) | `docs/ATOM.md` |
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
@@ -231,6 +233,6 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 The deliberate ones are PLAN §4's non-goals: multimethods, STM,
 agents, `core.async`, lazy sequences, regex, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
-targets, Java interop. Library functions that do not exist yet
+targets, Java interop. Library functions that do not exist
 (`sorted-map`, `sorted-set`, transducers and others) are known gaps,
-not decisions (`HANDOFF.md`).
+not decisions (`HANDOFF.md` §6).

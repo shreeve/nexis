@@ -207,7 +207,7 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
   `:no-protocol-impl` on a miss.
 - `var_`: the Var's value in force (the binding under `binding`, else
   the root) is called with the same arguments, as Clojure's
-  `Var.invoke`; `:unbound-var` while it is unbound.
+  `Var.invoke`: `(#'inc 1)` is 2; `:unbound-var` while it is unbound.
 - `keyword`, `symbol`, `persistent_map`, `persistent_set`,
   `persistent_vector`, `transient`: a lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a

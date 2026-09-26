@@ -1,18 +1,18 @@
 //! coll/transient.zig — transient wrapper kind.
 //!
-//! Authoritative spec: `docs/TRANSIENT.md`. Derivative semantics:
-//! `docs/SEMANTICS.md` §2.6 (identity-based equality; not hashable;
-//! not serializable), `docs/VALUE.md` §2.2 (kind 27, local-enum
-//! subkinds 0/1/2), `docs/GC.md` §5 (trace contract), PLAN §9.4
-//! (owner-token + frozen state machine), CLOJURE-REVIEW §1.2 + §2.7
-//! (owner-token epoch vs. Clojure's thread identity).
+//! Authoritative spec: `docs/TRANSIENT.md` (§4 owner token, §5 the
+//! active/frozen states). Derivative semantics: `docs/SEMANTICS.md`
+//! §2.6 (identity equality and hash), `docs/CODEC.md` §3 (not
+//! serializable), `docs/VALUE.md` §2.2 (kind 27, local-enum subkinds
+//! 0/1/2), `docs/GC.md` §5 (trace contract), CLOJURE-REVIEW §1.2, §3.5
+//! (owner token vs. Clojure's thread identity).
 //!
-//! Transients are "shallow" (TRANSIENT.md §1 Option B): mutation ops
+//! Transients are shallow wrappers (TRANSIENT.md §1): mutation ops
 //! call the persistent backing operations (`champ.mapAssoc`,
 //! `champ.setConj`, `vector.conj`, …) underneath, updating the
-//! wrapper's `inner_header` field in place. There is no in-place node
-//! editing (TRANSIENT.md §1 Option A), so a transient op costs what
-//! the persistent op costs, plus the wrapper check.
+//! wrapper's `inner_header` field in place. There is no per-node
+//! in-place editing, so a transient op costs what the persistent op
+//! costs, plus the wrapper check.
 //!
 //! Token discipline enforced at every public entry point:
 //!   - `owner_token == 0` → frozen; all ops return `error.TransientFrozen`.
@@ -397,7 +397,7 @@ pub fn vectorCountBang(t: Value) TransientError!usize {
 // Wrappers have exactly one outgoing heap reference: `inner_header`.
 // Frozen wrappers (owner_token == 0) still trace through
 // inner_header; freezing does NOT sever the GC edge. Metadata is not
-// attachable on transients (VALUE.md §7), so no meta walk.
+// attachable on transients (SEMANTICS.md §7), so no meta walk.
 // =============================================================================
 
 pub fn trace(h: *HeapHeader, visitor: anytype) void {

@@ -285,7 +285,7 @@ const core_natives = table("", .{
     .{ "macroexpand", 1, 1, &fnMacroexpand },
     .{ "read-string", 1, 1, &fnReadString },
     .{ "eval", 1, 1, &fnEval },
-    // Metadata (PLAN §8.5).
+    // Metadata (SEMANTICS.md §7).
     .{ "meta", 1, 1, &fnMeta },
     .{ "with-meta", 2, 2, &fnWithMeta },
     .{ "reset-meta!", 2, 2, &fnResetMeta },
@@ -340,12 +340,9 @@ const core_natives = table("", .{
     .{ "f64-vector", 1, 1, &fnF64Vector },
     .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector) },
     .{ "typed-vector-type", 1, 1, &fnTypedVectorType },
-    // Atom primitives.
-    // Identity-valued in-memory mutable cells. `deref` is
-    // installed above (`&native_db_deref` aliased in
-    // db_fns; we also expose it as bare `deref` here so
-    // `(deref atom-or-var-or-durable-ref)` resolves without the
-    // `db/` prefix). See `docs/ATOM.md`.
+    // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
+    // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
+    // or reduced; `db_natives` installs it again as `db/deref`.
     .{ "deref", 1, 1, &fnDbDeref },
     .{ "atom", 1, 1, &fnAtom },
     .{ "atom?", 1, 1, &fnAtomQ },
@@ -356,7 +353,7 @@ const core_natives = table("", .{
     // satisfies? predicate.
     .{ "satisfies?", 2, 2, &fnSatisfiesQ },
     // Core string ops. Indexing semantics are by Unicode scalar
-    // (codepoint), NOT byte; see `docs/STRING.md` §7.
+    // (codepoint), NOT byte; see `docs/STDLIB.md` §2.
     .{ "str", 0, null, &fnStr },
     .{ "string?", 1, 1, &fnStringQ },
     .{ "subs", 2, 3, &fnSubs },
@@ -372,9 +369,8 @@ const core_natives = table("", .{
     .{ "spit", 2, null, &fnSpit },
     .{ "read-line", 0, 0, &fnReadLine },
     .{ "exit", 0, 1, &fnExit },
-    // db primitives live in the `db` namespace
-    // (installed separately via `installDb`) so they appear as
-    // qualified `(db/open ...)` calls.
+    // The durable-ref natives are `db_natives`, in the `db`
+    // namespace, so they are called as `(db/open ...)`.
 });
 
 const db_natives = table("db", .{
@@ -402,7 +398,7 @@ const db_natives = table("db", .{
     // Tree traversal.
     .{ "scan", 2, 4, &fnDbScan },
     .{ "reduce-tree", 4, 4, &fnDbReduceTree },
-    // Snapshot aliases (PLAN.md §15.7 vocabulary).
+    // Snapshot aliases (DB.md §12).
     .{ "snapshot", 1, 1, &fnDbBeginRead },
     .{ "release-snapshot!", 1, 1, &fnDbAbortRead },
     .{ "snapshot?", 1, 1, &fnDbSnapshotQ },
@@ -1189,7 +1185,7 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // `VmError.ControlTransferred` unchanged so a throw from inside a
 // user fn lands at the outer handler.
 //
-// Rooting (GC.md §3): a collection can run inside any `callValue`.
+// Rooting (GC.md §11.5): a collection can run inside any `callValue`.
 // A native's own arguments are rooted for its whole call (the
 // caller's slots, or the root stack when reached through
 // `callValue`), and so is everything reachable from them. Two kinds
@@ -2330,7 +2326,7 @@ fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
         .record => return champ_mod.mapEmpty(heap) catch VmError.OutOfMemory,
         .persistent_map => champ_mod.mapEmpty(heap),
         .persistent_set => champ_mod.setEmpty(heap),
-        // A typed vector takes no updates (TYPED_VECTOR.md §6).
+        // A typed vector takes no updates (TYPED_VECTOR.md §8).
         .typed_vector => return VmError.KindMismatch,
         else => return value_mod.nilValue(),
     } catch return VmError.OutOfMemory;
@@ -2616,7 +2612,7 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Metadata (PLAN §8.5, SEMANTICS.md §7)
+// Metadata (SEMANTICS.md §7)
 // =============================================================================
 //
 // A list, vector, map, set or record carries its metadata map in the
@@ -3836,18 +3832,16 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
 // nexis.string namespace
 // =============================================================================
 //
-// ASCII-only case conversion + trim; literal-string split / replace;
-// join over nil/list/vector/set. All six fns are byte-preserving for
-// non-ASCII content (case conversion bypasses bytes ≥ 0x80; trim
-// recognizes only six ASCII whitespace chars; split/replace search
-// via `std.mem.indexOf` which is byte-exact, safe for valid UTF-8
-// because continuation bytes can never equal ASCII delimiter bytes
-// and multi-byte delimiters align only at codepoint boundaries).
+// The fifteen natives of `string_natives` (docs/STDLIB.md §3);
+// `capitalize`, `reverse` and `split-lines` are in string.nx. Case
+// mapping is ASCII-only. Searches, `split` and `replace` compare
+// bytes with `std.mem.indexOf`, which on valid UTF-8 matches only at
+// code-point boundaries; indexes count code points.
 //
-// Errors are catchable keywords:
-//   :kind-mismatch          non-string s/sep/match, empty delim/match,
-//                           non-collection arg to join, etc.
-//   :arity-mismatch         enforced by NativeFn descriptor
+// Errors are catchable keywords: `:kind-mismatch` for an argument of
+// the wrong kind, `:utf8-error` for a malformed string a function
+// reads by code point (`split` and `replace` validate every string
+// argument first).
 //
 // GC rooting: each fn allocates output via string.fromBytes /
 // vector.fromSlice while holding only its arguments, which are
@@ -3973,7 +3967,7 @@ fn needleBytes(v: Value, buf: *[4]u8) VmError![]const u8 {
 /// index of the first occurrence of `value` (a string or char) at or
 /// after `from`, nil when there is none; `last-index-of` the last at
 /// or before `from`. Indexes count code points, as `count` and `subs`
-/// do (STRING.md §7).
+/// do (STDLIB.md §2).
 fn fnStringIndexOf(vm: *VM, args: []const Value) VmError!Value {
     return stringSearch(vm, args, false);
 }
@@ -4014,7 +4008,7 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const sep = string_mod.asBytes(args[1]);
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
     // A separator that is not UTF-8 could match the first byte of a
-    // multibyte scalar and split inside it (STRING.md §2).
+    // multibyte scalar and split inside it (STDLIB.md §3).
     if (!std.unicode.utf8ValidateSlice(src)) return VmError.Utf8Error;
     if (!std.unicode.utf8ValidateSlice(sep)) return VmError.Utf8Error;
 
@@ -4329,7 +4323,7 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Record internals (PROTOCOLS.md §4)
+// Record internals (PROTOCOLS.md §7)
 // =============================================================================
 //
 // Four internal helpers installed in `nexis.internal` (NOT auto-
@@ -4411,7 +4405,7 @@ fn fnRecordTypeId(_: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Protocol internals (PROTOCOLS.md §4.1)
+// Protocol internals (PROTOCOLS.md §7)
 // =============================================================================
 //
 // Two helpers installed in `nexis.internal` (alongside the
@@ -4511,14 +4505,10 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
 // =============================================================================
 //
 // `extend-type` / `extend-protocol` macros (in expand.zig) emit
-// qualified calls to these helpers. Type-tag keywords match
-// the `Kind` enum's tag names:
-//
-//   :nil :bool :char :fixnum :bignum :rational :keyword :symbol
-//   :string :list :persistent_vector :persistent_map :persistent_set
-//   :transient_vector :transient_map :transient_set :function
-//   :native_fn :db_connection :db_write_txn :db_read_txn :atom
-//   :record :protocol :protocol_fn :var :durable_ref :error_object
+// qualified calls to these helpers. A type-tag keyword is a field
+// name of the `Kind` enum (`:nil`, `:false_`, `:true_`, `:fixnum`,
+// `:string`, `:persistent_vector`, `:var_`, `:atom`, ...), matched by
+// `typeNameToKind` (PROTOCOLS.md §4.3).
 //
 // Plus the friendly aliases:
 //   :vector → :persistent_vector

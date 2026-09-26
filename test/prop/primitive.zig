@@ -1,7 +1,7 @@
 //! test/prop/primitive.zig — randomized property tests for immediates.
 //!
-//! Covers PLAN §20.2 test #1. It exercises the bedrock invariants of
-//! `identical?`, `=`,
+//! Randomized equality and hash laws over the immediates. It exercises
+//! the bedrock invariants of `identical?`, `=`,
 //! and `hash` across the full immediate kind space, using a deterministic
 //! PRNG so failures are reproducible.
 //!
@@ -171,8 +171,8 @@ test "P6: cross-kind = is false (except within {true_, false_} / {keyword×keywo
         const b = randValue(r);
         if (a.kind() != b.kind() and a.equalImmediate(b)) {
             // There are zero legitimate cross-kind equalities among
-            // immediates; cross-type numeric `==` does not exist
-            // (PLAN §23 #11).
+            // immediates; cross-type numeric equality is `==`, never
+            // `=` (PLAN §23 #11).
             try std.testing.expect(false);
         }
     }

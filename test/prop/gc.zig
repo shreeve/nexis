@@ -1,7 +1,7 @@
 //! test/prop/gc.zig — randomized property tests for the precise
-//! mark-sweep collector. Covers PLAN §20.2 test #7 (GC stress) with
-//! a Collector.collect-driven discipline; `test/prop/heap.zig` covers
-//! the same allocator with hand-marking.
+//! mark-sweep collector: GC stress under a Collector.collect-driven
+//! discipline; `test/prop/heap.zig` covers the same allocator with
+//! hand-marking.
 //!
 //! Properties (GC.md §10 testing):
 //!

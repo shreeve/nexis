@@ -27,8 +27,9 @@
 //! `overflowCount` around each native call and opcode that compares or
 //! hashes and turns a change into the catchable `:stack-overflow`
 //! (SEMANTICS §2.7), rewinding the count as it does so that one
-//! overflow is reported once, by the innermost call that saw it. A map, set or record whose hash was computed past
-//! an overflow keeps no cached hash.
+//! overflow is reported once, by the innermost call that saw it. A
+//! map, set or record whose hash was computed past an overflow keeps
+//! no cached hash.
 
 const std = @import("std");
 const value = @import("value.zig");

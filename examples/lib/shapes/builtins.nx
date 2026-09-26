@@ -5,8 +5,8 @@
 ; the top-level driver requires this so that dispatch over
 ; fixnums / strings / unknown receivers has impls registered.
 ;
-; Phase 5 EXIT demo: §3 of 4 — `extend-protocol` over built-in
-; kinds (5.3d) + `:any` default (5.3d).
+; Part 3 of 4 of the shapes-app demo: `extend-protocol` over built-in
+; kinds + the `:any` default.
 
 (ns lib.shapes.builtins)
 

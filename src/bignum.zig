@@ -130,7 +130,7 @@ pub fn limbCount(v: Value) usize {
 
 /// xxHash3 over {negative_byte, limb_bytes}, truncated to u32.
 /// Cached in `HeapHeader.hash` using the cache-if-nonzero pattern
-/// (VALUE.md §4). Padding bytes inside the body are deliberately
+/// (HEAP.md §1). Padding bytes inside the body are deliberately
 /// excluded — the hash is over semantic content only.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (std.debug.runtime_safety) {

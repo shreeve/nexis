@@ -6,7 +6,8 @@
 ; `let*` bindings (vector), `fn*` params (vector), `loop*`
 ; bindings (vector), `cond` clauses (list of pairs).
 ;
-; Host macros are built with FormBuilder directly; a user writes
+; Host macros build their Forms in Zig (`Builder` in src/expand.zig);
+; a user writes
 ;
 ;   (defmacro unless [test & body]
 ;     \`(if ~test nil (do ~@body)))

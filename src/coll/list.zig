@@ -133,7 +133,7 @@ pub fn ofVector(heap: *Heap, vec: Value, start: usize) !Value {
 /// view block whose body is the metadata-free block `v` reads, and
 /// `tail` and `drop` step onto that block, so the metadata stays on
 /// the view `with-meta` returned and never reaches a rest (LIST.md
-/// §1). Null metadata gives the metadata-free view.
+/// §2). Null metadata gives the metadata-free view.
 pub fn viewWithMeta(heap: *Heap, v: Value, meta: ?*HeapHeader) !Value {
     std.debug.assert(v.kind() == .list and v.subkind() == subkind_view);
     const plain = restBlock(v);

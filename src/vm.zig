@@ -111,8 +111,8 @@ pub const Operand = packed struct(u16) {
     }
 };
 
-/// Instruction kind discriminator — primary vs extension (per PLAN
-/// §12.1). Extension packs 20-bit operand indices for programs that
+/// Instruction kind discriminator — primary vs extension (VM.md
+/// §3). Extension packs 20-bit operand indices for programs that
 /// exceed the 12-bit primary-operand range. Extension is not
 /// implemented: an extension instruction raises `UnimplementedOpcode`.
 pub const InstKind = enum(u4) {
@@ -121,8 +121,7 @@ pub const InstKind = enum(u4) {
     _,
 };
 
-/// Opcode group (6 bits). Full taxonomy per PLAN §12.3 and
-/// VM.md §10. `transient`, `hash`, `tx`, `io` and `simd` have no
+/// Opcode group (6 bits). Full taxonomy per VM.md §10. `transient`, `hash`, `tx`, `io` and `simd` have no
 /// implemented variants; dispatching them raises
 /// `UnimplementedOpcode`.
 pub const Group = enum(u6) {
@@ -162,7 +161,7 @@ pub const Call = enum(u6) {
     _,
 };
 
-/// Variants for the `closure` group. Per VM.md §10.4.
+/// Variants for the `closure` group. Per VM.md §10.5.
 pub const Closure_ = enum(u6) {
     make = 0,
     box_local = 1,
@@ -172,7 +171,7 @@ pub const Closure_ = enum(u6) {
     _,
 };
 
-/// Variants for the `jump` group. Per PLAN §12.3 / VM.md §10.5.
+/// Variants for the `jump` group. Per VM.md §10.6.
 /// `if-true` pairs with `if-false` so the compiler can choose
 /// whichever produces shorter code per branch direction.
 pub const Jump = enum(u6) {
@@ -182,8 +181,8 @@ pub const Jump = enum(u6) {
     _,
 };
 
-/// Variants for the `ctrl` group. Per VM.md §10 group #11 +
-/// §12 try/catch/throw spec.
+/// Variants for the `ctrl` group. Per VM.md §10.9 and the §12
+/// try/catch/throw spec.
 ///
 /// `halt` variant (5) is unused — the top-level `call:return`
 /// path halts the VM. Uncaught throw halts via
@@ -220,7 +219,7 @@ pub const CtrlOp = enum(u6) {
     _,
 };
 
-/// Variants for the `coll` group. Per VM.md §10 group #7. `list`
+/// Variants for the `coll` group. Per VM.md §10.8. `list`
 /// and `concat` are the runtime substrate for syntax-quote's
 /// `(#%list ...)` / `(#%concat ...)` output. Every variant takes
 /// a slot-block (A=base, B=argc, C=dst) and builds a value via
@@ -257,9 +256,10 @@ pub const CollOp = enum(u6) {
     _,
 };
 
-/// Variants for the `var` group. Per VM.md §10 group #6.
+/// Variants for the `var` group. Per VM.md §10.7.
 pub const VarOp = enum(u6) {
-    /// Load the Var's root value into a slot. Traps :unbound-var.
+    /// Load the Var's binding in force, else its root, into a slot.
+    /// Traps :unbound-var.
     load_var = 0,
     /// Set the Var's root, mark bound, return the Var object.
     store_var = 1,
@@ -270,7 +270,7 @@ pub const VarOp = enum(u6) {
     _,
 };
 
-/// Variants for the `cmp` group. Per VM.md §10 group #1
+/// Variants for the `cmp` group. Per VM.md §10.4
 /// (comparisons live in their own group, NOT in `math`, to keep
 /// the arithmetic ISA clean). All five dispatch through
 /// `numCompare`.
@@ -283,7 +283,7 @@ pub const Cmp = enum(u6) {
     _,
 };
 
-/// Variants for the `math` group. Per PLAN §12.3 / VM.md §10.
+/// Variants for the `math` group. Per VM.md §10.3.
 /// Every variant except `pow` dispatches through the numeric
 /// tower; `pow` raises `UnimplementedOpcode`. A variant outside
 /// this enum raises `BytecodeCorruption` ("known opcode, not
@@ -301,7 +301,7 @@ pub const Math = enum(u6) {
     _,
 };
 
-/// Packed 64-bit instruction. Field order matches PLAN §12.1:
+/// Packed 64-bit instruction. Field order matches VM.md §3:
 /// [kind:4][group:6][variant:6][opA:16][opB:16][opC:16].
 pub const Inst = packed struct(u64) {
     kind: InstKind,
@@ -464,7 +464,7 @@ pub const Routine = struct {
     /// closure-construction time.
     upvalue_count: u16 = 0,
     /// Per-routine Var table. The V operand index
-    /// resolves through this table (analogous to const_pool
+    /// resolves through this table (analogous to `consts`
     /// for Values, capture_descs for closure construction).
     /// The compiler (compileSymbol fall-through) interns
     /// each referenced Var in the VM's Namespace and records
@@ -499,7 +499,7 @@ pub const Routine = struct {
 /// A Var holds a mutable cell of a Value with stable identity
 /// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
 /// then `(def x 10)` does NOT create a new Var; the same Var
-/// object's root is updated). Per PLAN §6.1 + VM.md §6.
+/// object's root is updated). Per VM.md §10.7.
 ///
 /// Allocation: a Var lives in VM.runtime_arena for the VM's
 /// life and the Value payload is the raw `*Var`, not a
@@ -1004,7 +1004,7 @@ pub const RecordTypeEntry = struct {
 /// Methods table is indexed by method-name-id (interned symbol
 /// id). Each method's impls map keys on DispatchKey (record
 /// type_id for records, kind tag for built-in kinds — see
-/// dispatchKeyOf in this module).
+/// `DispatchKey.ofValue`).
 pub const ProtocolEntry = struct {
     id: u32,
     ns_name: []const u8,
@@ -1109,15 +1109,15 @@ pub const VmError = error{
     /// number of arguments than the callee closure's routine
     /// declares. Per VM.md §13 `:arity-mismatch` row: the
     /// runtime arity check fires at
-    /// frame transfer, distinct from compile-time arity errors
-    /// in COMPILER.md §4.3.
+    /// frame transfer, distinct from the compile-time
+    /// `RecurArityMismatch` (COMPILER.md §4.4).
     ArityMismatch,
     /// `call:call` target slot did not contain a closure value.
     /// Per VM.md §13 `:not-callable` row.
     NotCallable,
     /// `call:call` references a `call_base` slot such that
     /// `slot[A + argc]` exceeds the frame's slot count. Per
-    /// VM.md §13 `:call-block-out-of-range`. Indicates a
+    /// VM.md §13 (not catchable). Indicates a
     /// compiler bug — call block was not allocated within the
     /// routine's `slot_count`.
     CallBlockOutOfRange,
@@ -1131,24 +1131,24 @@ pub const VmError = error{
     OutOfMemory,
     /// `U` operand index exceeds the current frame's
     /// `upvalues.len`, OR a `closure:make` `inherited_upvalue`
-    /// descriptor source exceeds it. Per VM.md §13
-    /// `:upvalue-out-of-range`.
+    /// descriptor source exceeds it. Per VM.md §13 (not
+    /// catchable).
     UpvalueOutOfRange,
     /// An opcode that requires an `UpvalCell*` in a slot (e.g.,
     /// `closure:get-cell`, `closure:make` `local_cell_slot`
     /// source) found a different Value kind in the slot. Per
-    /// VM.md §13 `:expected-cell`.
+    /// VM.md §13 (not catchable).
     ExpectedCell,
     /// `closure:box-local` invoked on a slot that already holds
     /// an `UpvalCell*` (double-box), OR `closure:init-cell` on
-    /// an already-initialized cell. Per VM.md §13
-    /// `:invalid-cell-state`. Indicates a
+    /// an already-initialized cell. Per VM.md §13 (not
+    /// catchable). Indicates a
     /// compiler bug — should never reach the runtime.
     InvalidCellState,
     /// `closure:get-cell` (or U-operand resolve) read a cell
     /// whose `initialized = false` — a placeholder cell that
-    /// has not yet been filled in. Per VM.md §13
-    /// `:uninitialized-cell`. Indicates a
+    /// has not yet been filled in. Per VM.md §13 (not
+    /// catchable). Indicates a
     /// `closure:init-cell` was emitted out of order or skipped
     /// entirely.
     UninitializedCell,
@@ -1247,10 +1247,6 @@ pub const VmError = error{
     /// `:io-error` because the issue is at the language boundary,
     /// not in the filesystem. Mapped to `:invalid-path`.
     InvalidPath,
-    /// `defrecord` with a record
-    /// type name that already exists in the per-VM registry.
-    /// Rejected to avoid the confusing-state hazard where
-    /// existing instances reference a stale type_id.
     /// Record-introspection ops expected a record
     /// receiver but got something else. Mapped to `:not-a-record`.
     NotARecord,
@@ -1477,18 +1473,17 @@ pub const VM = struct {
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
     nextomic_query_mark: ?*const fn (*anyopaque, *gc_mod.Collector) void = null,
-    /// Zig 0.16 `std.Io` handle for filesystem ops that live
-    /// below the language surface —
-    /// only `(db/open path)` uses it to auto-create the
-    /// path's parent directories (emdb does NOT create parents).
-    /// Set by the CLI (`runFile`/`runRepl`) right after
-    /// `VM.init`; left null in ad-hoc test harnesses (which use
-    /// absolute `/tmp` paths or pre-create dirs explicitly, so
-    /// the auto-create branch is a no-op there).
+    /// Zig 0.16 `std.Io` handle for the natives that reach the
+    /// outside world: printing, `slurp`/`spit`, reading stdin, and
+    /// opening a store (which creates the path's parent
+    /// directories; emdb does not). Set by the CLI's `Runtime.init`
+    /// right after `VM.init`; left null in ad-hoc test harnesses,
+    /// where printing and reading stdin raise `:io-error` and file
+    /// access falls back to the process-wide single-threaded I/O.
     io: ?std.Io = null,
 
-    /// Per-VM record-type
-    /// registry. Lazy-init via `ensureRecordRegistry`. Each
+    /// Per-VM record-type registry, empty until the first
+    /// `registerRecordType`. Each
     /// `defrecord` allocates a new RecordTypeEntry; the
     /// returned dense u32 id is used as `RecordBody.type_id`.
     /// PROTOCOLS.md §3.
@@ -1497,7 +1492,7 @@ pub const VM = struct {
     /// Per-VM protocol registry.
     /// Each `defprotocol` adds an entry; `extend-protocol` /
     /// inline `defrecord` impls mutate `methods[*].impls`. See
-    /// PROTOCOLS.md §3.2.
+    /// PROTOCOLS.md §3.
     protocol_registry: std.ArrayList(ProtocolEntry) = .empty,
     /// Global try-handler stack.
     /// Push on `ctrl:try-enter`, pop on `ctrl:try-exit`,
@@ -1547,7 +1542,7 @@ pub const VM = struct {
     /// High-water marks for the backing stack and frame stack.
     /// Used by `recur`/`loop*` tests to assert
     /// that long-running iteration runs in bounded stack space
-    /// (PLAN §11.3 constant-stack guarantee). Updated on grow
+    /// (VM.md §11 constant-stack guarantee). Updated on grow
     /// operations only — comparing pre/post run-loop values gives
     /// a true maximum, not just the final size (a buggy
     /// implementation could grow and shrink, leaving final size
@@ -2100,7 +2095,7 @@ pub const VM = struct {
     /// call, so a native reached this way holds rooted arguments
     /// exactly as one reached by `call:call` holds them in the
     /// caller's slots. Values a native derives and keeps across a
-    /// nested `callValue` are its own to root (`RootScope`; GC.md §3).
+    /// nested `callValue` are its own to root (`RootScope`; GC.md §11.5).
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         // Every re-entry nests a native call and a run loop on the
         // native stack (§13.1).
@@ -2466,8 +2461,8 @@ pub const VM = struct {
     ///   - `.constant`, `.intern`, `.jump`, `.durable`: read-only
     ///     operand kinds; writing to them is invalid in this
     ///     opcode context, NOT "not wired." Surface
-    ///     `InvalidOperandKind` per VM.md §13's `:invalid-operand-
-    ///     kind` row.
+    ///     `InvalidOperandKind` per VM.md §13's not-catchable
+    ///     table.
     ///   - `.var_`: var writes go through `var:store-var` (a
     ///     dedicated opcode), not the generic store path. Generic
     ///     store with a `.var_` destination is a handler bug.
@@ -2582,11 +2577,10 @@ pub const VM = struct {
     }
 
     /// Runtime error translation to a user-throwable Value.
-    /// Recoverable errors (per VM.md
-    /// §13 "Recoverable via try/catch" column) become keyword
-    /// payloads routed through `unwindThrow`; non-recoverable
-    /// errors (bytecode corruption, OOM, etc.) bubble back out
-    /// unchanged.
+    /// Recoverable errors (VM.md §13's catchable table) become
+    /// keyword payloads routed through `unwindThrow`;
+    /// non-recoverable errors (bytecode corruption, OOM, etc.)
+    /// bubble back out unchanged.
     ///
     /// Translation: each recoverable VmError maps to a keyword
     /// like `:kind-mismatch` (a keyword, not a map).
@@ -2653,7 +2647,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `mov` (VM.md §10 #3)
+    // Group `mov` (VM.md §10.1)
     // -------------------------------------------------------------------------
 
     fn execMov(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -2683,7 +2677,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `call` (VM.md §10 #4)
+    // Group `call` (VM.md §10.2)
     // -------------------------------------------------------------------------
 
     fn execCall(self: *VM, inst: Inst) VmError!void {
@@ -2811,7 +2805,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `closure` (VM.md §10.4)
+    // Group `closure` (VM.md §10.5)
     // -------------------------------------------------------------------------
 
     fn execClosure(self: *VM, inst: Inst) VmError!void {
@@ -2875,7 +2869,7 @@ pub const VM = struct {
     ///
     /// Per VM.md §6. The cell starts with
     /// `initialized = false`; reading it via U-operand or
-    /// `closure:get-cell` before init traps `:uninitialized-cell`.
+    /// `closure:get-cell` before init traps `UninitializedCell`.
     fn execClosureNewCell(self: *VM, inst: Inst) VmError!void {
         if (inst.a.kind != .slot) return VmError.InvalidOperandKind;
         // Initial value doesn't matter (it'll be overwritten by
@@ -2965,7 +2959,7 @@ pub const VM = struct {
                 .local_cell_slot => |s| blk: {
                     const cell_v = (try self.slotPtr(s)).*;
                     // Must be a cell pointer (the
-                    // `:expected-cell` trap). The compiler's
+                    // `ExpectedCell` trap). The compiler's
                     // capture pre-analysis guarantees this in
                     // well-formed bytecode; malformed bytecode
                     // (e.g., descriptor source referencing an
@@ -2987,22 +2981,12 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `math` (VM.md §10 #3 — PLAN §12.3 group 2)
-    //
-    // Every variant except `pow` goes through the numeric tower
-    // (`numAdd` … `numAbs`), which handles fixnum, bignum and float
-    // operands, promotion and contagion; a promoted result lives on
-    // the VM's heap.
-    // -------------------------------------------------------------------------
-
-    // -------------------------------------------------------------------------
-    // Group `jump` (VM.md §10.5 — PLAN §12.3 group 0)
+    // Group `jump` (VM.md §10.6)
     //
     // Jump targets are absolute instruction indices within the
-    // current routine's `code` array. Per VM.md §4.5, the jump
-    // target operand is a "raw index" (kind ignored, index is
-    // the data); the encoding convention is `Operand.jump(N)`
-    // where N is the destination PC.
+    // current routine's `code` array. A target is not a raw
+    // immediate (VM.md §4.5): it must carry kind `j`, written
+    // `Operand.jump(N)` where N is the destination PC.
     // -------------------------------------------------------------------------
 
     fn execJump(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3049,6 +3033,15 @@ pub const VM = struct {
         frame.pc = pc;
     }
 
+    // -------------------------------------------------------------------------
+    // Group `math` (VM.md §10.3)
+    //
+    // Every variant except `pow` goes through the numeric tower
+    // (`numAdd` … `numAbs`), which handles fixnum, bignum and float
+    // operands, promotion and contagion; a promoted result lives on
+    // the VM's heap.
+    // -------------------------------------------------------------------------
+
     fn execMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Math = @enumFromInt(inst.variant);
         // Resolve every source operand BEFORE storing so that
@@ -3083,7 +3076,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `cmp` (VM.md §10 #1)
+    // Group `cmp` (VM.md §10.4)
     // -------------------------------------------------------------------------
 
     fn execCmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3110,7 +3103,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------------------
-    // Group `var` (VM.md §10 #6)
+    // Group `var` (VM.md §10.7)
     // -------------------------------------------------------------------------
 
     fn execVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3124,9 +3117,9 @@ pub const VM = struct {
     }
 
     /// `var:load-var A=dst_slot B=var(index) _` — read the Var
-    /// at `routine.var_table[B.index]` and store its root value
-    /// into `slot[A]`. Traps `:unbound-var` if the
-    /// Var has never been bound by `def`.
+    /// at `routine.var_table[B.index]` and store its binding in
+    /// force, else its root, into `slot[A]`. Traps `:unbound-var`
+    /// if the Var has neither.
     ///
     /// Semantically equivalent to `mov:move A=slot, B=var(idx)`
     /// (the V operand kind goes through the same resolve()
@@ -3177,7 +3170,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------
-    // Group #7: `coll` — collection construction
+    // Group `coll` (VM.md §10.8) — collection construction
     // -------------------------------------------------------------
     //
     // Operand convention (range ABI, mirrors call:call):
@@ -3270,7 +3263,7 @@ pub const VM = struct {
     }
 
     // -------------------------------------------------------------
-    // Group #11: `ctrl` — try / catch / finally / throw
+    // Group `ctrl` (VM.md §10.9) — try / catch / finally / throw
     // -------------------------------------------------------------
     //
     // Per VM.md §12. User-thrown values and the recoverable
@@ -3499,8 +3492,8 @@ pub const VM = struct {
 };
 
 /// Stable taxonomy mapping recoverable VmError
-/// variants to user-visible keyword names. Per VM.md §13
-/// "Recoverable via try/catch" column.
+/// variants to user-visible keyword names. Per VM.md §13's
+/// catchable table.
 ///
 /// Returns null for unrecoverable errors — bytecode
 /// corruption, OOM, handler-state malformation, etc. Those
@@ -3556,7 +3549,7 @@ fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
 }
 
 // =============================================================================
-// Lookup (PLAN §6.5, §8.7)
+// Lookup (SEMANTICS.md §4, VM.md §6)
 //
 // `get` and the invocable-as-lookup kinds share one lookup so that
 // `(get m k)`, `(:k m)` and `(m :k)` cannot drift apart.
@@ -3572,7 +3565,7 @@ pub fn lookup(coll: Value, key: Value, default: Value) VmError!Value {
         .persistent_map => mapLookup(coll, key, default),
         .record => mapLookup(record_mod.fieldsOf(coll), key, default),
         // A lazy entity reads the attribute through the hook its box
-        // carries (docs/NEXTOMIC.md §6); the hook returns only errors
+        // carries (docs/NEXTOMIC.md §6.1); the hook returns only errors
         // of this set.
         .nextomic_entity => nextomic_handle.entityLookup(coll, key, default) catch |err| return @as(VmError, @errorCast(err)),
         .persistent_set => if (champ_mod.setContains(
@@ -3665,7 +3658,7 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 ///
 /// A transient map, set or vector is called, and looked up by a
 /// keyword, as its persistent kind is (TRANSIENT.md §7). Any other
-/// arity is `ArityMismatch` (PLAN §8.7).
+/// arity is `ArityMismatch` (VM.md §6).
 pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
     if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
@@ -3697,7 +3690,7 @@ pub fn callLookup(callee: Value, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Numeric tower (PLAN §8.3, SEMANTICS §2.2, BIGNUM.md §9)
+// Numeric tower (SEMANTICS §2.2, BIGNUM.md §9)
 //
 // Three runtime number kinds take part in arithmetic: `fixnum`
 // (i48), `bignum` and `float` (f64). Contagion follows Clojure: an
@@ -4614,7 +4607,7 @@ test "VM opcodes: jump" {
         .{ .name = "if-false branches on nil", .code = &.{ asm_.loadNil(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
         .{ .name = "if-false branches on false", .code = &.{ asm_.loadFalse(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
         .{ .name = "if-false falls through on true", .code = &.{ asm_.loadTrue(0), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadNil(0), asm_.returnSlot(0) }, .want = .{ .value = true_v } },
-        // 0 is truthy (PLAN §6.2).
+        // 0 is truthy (SEMANTICS.md §1).
         .{ .name = "if-false falls through on 0", .code = &.{ asm_.loadConst(0, 0), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadNil(0), asm_.returnSlot(0) }, .consts = &.{cval(fx(0))}, .want = .{ .value = fx(0) } },
         .{ .name = "if-false on a constant test", .code = &.{ asm_.jumpIfFalse(3, kn(0)), asm_.returnNil(), asm_.returnNil(), asm_.loadTrue(0), asm_.returnSlot(0) }, .consts = &.{cval(false_v)}, .want = .{ .value = true_v } },
         .{ .name = "if-true branches on true", .code = &.{ asm_.loadTrue(0), asm_.jumpIfTrue(3, sl(0)), asm_.returnNil(), asm_.loadFalse(0), asm_.returnSlot(0) }, .want = .{ .value = false_v } },

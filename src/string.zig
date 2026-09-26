@@ -2,8 +2,7 @@
 //!
 //! Authoritative spec: `docs/STRING.md`. Physical storage lives on
 //! `src/heap.zig`; semantic rules come from `docs/SEMANTICS.md` §2.4
-//! (byte equality) and §3.2 (hash). It sets the pattern every heap
-//! kind (bignum, list, persistent_map, …) follows.
+//! (byte equality) and §3.2 (hash).
 //!
 //! **Subkind 1 (heap string) only.** Body is raw UTF-8 bytes with
 //! no length prefix; length recovered from the heap block. SSO
@@ -12,13 +11,14 @@
 //!
 //! Invariants (STRING.md §2):
 //!   - Bytes are copied into a fresh heap allocation on `fromBytes`.
-//!   - No UTF-8 validation at the storage boundary (reader + codec
-//!     are the validators; this module is byte-blob underneath).
+//!   - No UTF-8 validation at the storage boundary (the reader
+//!     produces well-formed UTF-8; the codec keeps bytes as they are;
+//!     this module is byte-blob underneath).
 //!   - No interning, no content dedup — two `fromBytes("foo")` calls
 //!     produce two `*HeapHeader`s that are byte-equal but not pointer-
 //!     identical.
 //!   - Cached hash of 0 is not stored; that string recomputes on next
-//!     access (VALUE.md §4 spec decision).
+//!     access (HEAP.md §1 invariant 3).
 
 const std = @import("std");
 const value = @import("value.zig");
@@ -57,10 +57,10 @@ pub fn fromBytes(heap: *Heap, bytes: []const u8) !Value {
 }
 
 /// Byte view over a string Value. Panics if `v.kind() != .string`.
-/// For subkind 1 this is the body of the heap block. When SSO /
-/// zero-copy subkinds land, the same API returns the logical byte
-/// view regardless of storage; callers must not assume the returned
-/// pointer lives on the runtime heap.
+/// For subkind 1 this is the body of the heap block. Another subkind
+/// would return its logical byte view the same way (STRING.md §1), so
+/// callers must not assume the returned pointer lives on the runtime
+/// heap.
 pub fn asBytes(v: Value) []const u8 {
     std.debug.assert(v.kind() == .string);
     const h = Heap.asHeapHeader(v);
@@ -80,7 +80,7 @@ pub fn byteLen(v: Value) usize {
 /// once the kind switch lands on `.string`. Reads
 /// `HeapHeader.cachedHash`; if uncomputed (zero), computes
 /// `xxHash3(seed, bodyBytes(h))` truncated to u32, stores it in the
-/// cache **only when nonzero** (per VALUE.md §4 spec), and returns it.
+/// cache **only when nonzero** (HEAP.md §1 invariant 3), and returns it.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (std.debug.runtime_safety) {
         std.debug.assert(h.kind == @intFromEnum(Kind.string));
@@ -126,7 +126,7 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 // directly, so an ASCII string costs a vector scan instead of a
 // decode per character, and only the bytes past the run are walked.
 //
-// Frozen contract (STRING.md §7):
+// Frozen contract (STRING.md §3):
 //   - All three return `error.InvalidUtf8` on a malformed body up to
 //     the position asked for. The runtime caller (`stdlib.zig`) maps
 //     that to `:utf8-error` (catchable). The storage layer does not
@@ -392,8 +392,8 @@ test "multiple distinct strings coexist on one heap" {
 }
 
 test "multi-byte UTF-8 code points survive round-trip byte-exact" {
-    // Per SEMANTICS §2.4 strings are byte blobs; no normalization,
-    // no code-point iteration. Still, explicitly pin a few common
+    // Per SEMANTICS §2.4 strings are byte blobs with no
+    // normalization. Still, explicitly pin a few common
     // multi-byte sequences so an accidental byte-vs-code-point bug
     // surfaces here rather than in a downstream reader test.
     var heap = Heap.init(testing.allocator);
