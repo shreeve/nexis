@@ -18,7 +18,7 @@ and symbols as functions).
 **In:** the 64-bit instruction encoding (§3); the operand kinds
 (§4); routines, closures and upvalue cells (§5, §6); the range-call
 ABI and native re-entry (§6); dynamic bindings (§6.5); frames (§7);
-two-level switch dispatch (§8); the heap and the collector's host
+threaded dispatch through a handler table (§8); the heap and the collector's host
 side (§9); the opcode groups (§10); the `recur` guarantee (§11);
 `try` / `catch` / `finally` / `throw` with cross-frame unwinding
 shared by bytecode and natives (§12); execution errors, the error
@@ -257,6 +257,14 @@ and the direct call, so a protocol fn passed to `map` behaves as it
 does in call position. `VM.runRoutine` runs a routine to completion
 the same way (the loader and `eval`).
 
+**Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
+never re-enters the VM and never compares, hashes or prints nested
+data (arithmetic, numeric predicates, `nth`), so nothing under it can
+collect, grow the stack or move the deep-data overflow count (§13.1).
+`call:call` passes it its arguments in place on the stack, and
+`callValue` calls it without the root scope, the stack guard or the
+overflow check. Its arity is checked, and reported, as any native's.
+
 ---
 
 #### 6.5 Dynamic bindings
@@ -314,37 +322,65 @@ pop only from the top.
 
 ### 8. Dispatch
 
-A two-level switch: on the group, then in each handler on the
-variant.
+Threaded code through a handler table. `op_table` holds one handler
+per opcode, indexed by group and variant together (`group | variant
+<< 6`, 4096 entries). A handler runs its instruction, then fetches the
+next one itself and tail-calls that instruction's handler
+(`@call(.always_tail, ...)`), so an instruction costs one indirect
+branch and the native stack does not grow with the instructions run.
 
 ```
-loop:
-  if the last instruction could allocate and a cycle is due: collect   (§9)
-  frame = current frame
+fetch (every handler's last step):
   if frame.pc >= code.len: BytecodeExhausted
   inst = frame.routine.code[frame.pc]; frame.pc += 1
   if inst.kind is not primary: BytecodeCorruption
-  switch inst.group:
-    mov, cmp, jump, var, math     => exec<Group>(frame, inst)
-    call, closure, coll, ctrl     => exec<Group>(inst)
-    transient, hash, tx, io, simd => UnimplementedOpcode
-    other                         => BytecodeCorruption
+  tail-call op_table[inst.group | inst.variant << 6](vm, frame, inst)
 ```
 
-The groups that never push or pop a frame (`mov`, `cmp`, `jump`,
-`var`, `math`) resolve operands through the frame pointer the fetch
-took (`resolveIn`, `storeIn`, `slotPtrIn`); the others re-derive the
-current frame because a call or a native may have grown `frames`.
-`VM.loop` is the one run loop: `run` drives it until the VM halts,
-`callValue` and `runRoutine` until the frame they pushed returns.
-
+- Every variant of `mov`, `jump` and `cmp`, and `math:add`,
+  `math:sub`, `math:mul`, `math:idiv`, `math:mod`, `closure:get-cell`,
+  `var:load-var`, `call:call`, `call:return` and `call:return-nil`,
+  has a handler of its own; every other entry is its group's, which
+  switches on the variant or, where no variant is left, traps as §10
+  says for one outside the enum. A group outside the enum is
+  `BytecodeCorruption`; `transient`, `hash`, `tx`, `io` and `simd`
+  trap `UnimplementedOpcode` for every variant.
+- `VM.loop` is the one run loop: `run` drives it until the VM halts,
+  `callValue` and `runRoutine` until the frame they pushed returns.
+  It enters the chain at the current frame's next instruction, and the
+  chain returns to it only with an error, which it translates to a
+  throw when a handler is in force (§12) or passes on, or once the
+  loop's frame has returned. Only the handlers that can pop or unwind
+  frames or halt (`call:return`, `call:return-nil`, `ctrl:*`) test
+  for that.
+- The handlers of the groups that never push or pop a frame (`mov`,
+  `cmp`, `jump`, `var`, `math`, `closure`, `coll`) run against the
+  frame the fetch took; `call` and `ctrl` re-derive the current frame,
+  since a call or a native may have grown `frames`.
 - The pc advances before the handler runs, so a handler sees the
   next pc: a conditional jump not taken does nothing, a taken one
   overwrites `pc`, and every frame's `pc` in an error trace is one
   past its instruction (§13).
-- Dispatch is a `while` / `switch` loop, not tail-call threading.
-
----
+- The hot handlers read a slot, a constant, an initialized upvalue
+  or a bound Var in place and hand every other operand, a trap
+  included, to the general resolution of §4. Two fixnums compare, add, subtract, multiply,
+  `quot` and `mod` inline when the result is a fixnum; anything else,
+  a promotion or a zero divisor included, goes through the numeric
+  tower (§10.3). `call:call` of a
+  closure with its fixed arity, where the frame chain and the stack's
+  capacity have room, pushes the callee's frame without allocating,
+  and `callValue` enters a closure the same way; a native within its
+  arity is called with its arguments copied to a buffer on the native
+  stack, or read in place by a leaf (§6). Every other call goes through the general entry of §6, with
+  the same traps.
+- **A comparison and its branch.** When the instruction after a
+  `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
+  comparison wrote (the compiler's lowering of an `if` on a
+  comparison, `COMPILER.md` §5.2), the comparison's handler runs the
+  jump too, so the pair costs one dispatch. Nothing is skipped: the
+  slot holds the boolean, `pc` and every trap are what running the two
+  in turn gives, and an error trace names whichever of the two
+  failed. The encoding is unchanged.
 
 ### 9. Memory and the collector
 
@@ -369,10 +405,12 @@ protocol registry's implementations. `VM.gcTrace` traces a closure
 (cells, then routine constants) and a cell (its value).
 
 **Trigger and safe point.** `VM.gcDue` is tested only at an
-instruction fetch in `VM.loop`: at a loop's first fetch and after an
-instruction of a group that can allocate (`math`, `call`, `closure`,
-`coll`, `ctrl`); after `mov`, `cmp`, `jump` or `var` the heap's
-counter cannot have moved. A cycle is due when the heap has allocated
+instruction fetch (§8): where `VM.loop` enters the chain and after
+an instruction that could have allocated, which is `math` through the
+numeric tower, a `call:call` that ran a native or entered a closure
+through the general entry of §6, and every `closure`, `coll` and
+`ctrl` instruction. After any other instruction the heap's counter
+cannot have moved. A cycle is due when the heap has allocated
 `gc_next_at` bytes since the last one: the larger of `gc_threshold`
 and `gc_growth_percent` percent of the bytes that survived
 (`GcPolicy.default` 16 MiB and 100 %; `GcPolicy.stress`, selected by

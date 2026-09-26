@@ -60,7 +60,11 @@ const VmError = vm_mod.VmError;
 // =============================================================================
 //
 // One table per namespace: each native's name, arity and function,
-// once. `table` turns it into static descriptors (immortal, so a
+// once, and `.leaf` after a leaf (`NativeFn.leaf`: arithmetic,
+// predicates and lookups over the arguments alone, none calling back,
+// comparing or hashing nested data; a bignum one makes is a fresh
+// block, and `Heap.alloc` never collects, VM.md §9). `table` turns
+// it into static descriptors (immortal, so a
 // `.native_fn` Value can point at one); a descriptor outside
 // nexis.core is named `ns/name` for traces and printing.
 
@@ -71,6 +75,7 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .min_arity = e[1],
         .max_arity = e[2],
         .call = e[3],
+        .leaf = if (e.len > 4) e[4] == .leaf else false,
     };
     return out;
 }
@@ -159,31 +164,31 @@ const core_natives = table("", .{
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
-    .{ "nth", 2, 3, &fnNth },
+    .{ "nth", 2, 3, &fnNth, .leaf },
     .{ "empty?", 1, 1, &fnEmptyQ },
-    .{ "identity", 1, 1, &fnIdentity },
-    .{ "nil?", 1, 1, &fnNilQ },
-    .{ "some?", 1, 1, &fnSomeQ },
+    .{ "identity", 1, 1, &fnIdentity, .leaf },
+    .{ "nil?", 1, 1, &fnNilQ, .leaf },
+    .{ "some?", 1, 1, &fnSomeQ, .leaf },
     // First-class arithmetic + comparison Vars.
     // Required so `(reduce + 0 xs)` resolves `+` as a Var.
     // `(+ x y)` at the call head is still inlined by the
     // compiler; the Var is only reached through non-head uses.
-    .{ "+", 0, null, &fnAdd },
-    .{ "-", 1, null, &fnSub },
-    .{ "*", 0, null, &fnMul },
+    .{ "+", 0, null, &fnAdd, .leaf },
+    .{ "-", 1, null, &fnSub, .leaf },
+    .{ "*", 0, null, &fnMul, .leaf },
     .{ "/", 1, null, &fnDiv },
     .{ "quot", 2, 2, &fnQuot },
     .{ "rem", 2, 2, &fnRem },
     .{ "mod", 2, 2, &fnMod },
-    .{ "<", 0, null, &fnLt },
-    .{ "<=", 0, null, &fnLte },
-    .{ ">", 0, null, &fnGt },
-    .{ ">=", 0, null, &fnGte },
-    .{ "==", 0, null, &fnNumEq },
+    .{ "<", 0, null, &fnLt, .leaf },
+    .{ "<=", 0, null, &fnLte, .leaf },
+    .{ ">", 0, null, &fnGt, .leaf },
+    .{ ">=", 0, null, &fnGte, .leaf },
+    .{ "==", 0, null, &fnNumEq, .leaf },
     .{ "=", 0, null, &fnEq },
     .{ "not=", 1, null, &fnNotEq },
-    .{ "inc", 1, 1, &fnInc },
-    .{ "dec", 1, 1, &fnDec },
+    .{ "inc", 1, 1, &fnInc, .leaf },
+    .{ "dec", 1, 1, &fnDec, .leaf },
     .{ "long", 1, 1, &fnLong },
     .{ "int", 1, 1, castTo(i32) },
     .{ "short", 1, 1, castTo(i16) },
@@ -206,20 +211,20 @@ const core_natives = table("", .{
     .{ "rand-int", 1, 1, &fnRandInt },
     .{ "format", 1, null, &fnFormat },
     .{ "double", 1, 1, &fnDouble },
-    .{ "max", 1, null, &fnMax },
-    .{ "min", 1, null, &fnMin },
+    .{ "max", 1, null, &fnMax, .leaf },
+    .{ "min", 1, null, &fnMin, .leaf },
     .{ "abs", 1, 1, &fnAbs },
     .{ "number?", 1, 1, &fnNumberQ },
     .{ "integer?", 1, 1, &fnIntegerQ },
     .{ "float?", 1, 1, &fnFloatQ },
     .{ "NaN?", 1, 1, &fnNanQ },
     .{ "infinite?", 1, 1, &fnInfiniteQ },
-    .{ "not", 1, 1, &fnNot },
-    .{ "zero?", 1, 1, &fnZeroQ },
-    .{ "pos?", 1, 1, &fnPosQ },
-    .{ "neg?", 1, 1, &fnNegQ },
-    .{ "odd?", 1, 1, &fnOddQ },
-    .{ "even?", 1, 1, &fnEvenQ },
+    .{ "not", 1, 1, &fnNot, .leaf },
+    .{ "zero?", 1, 1, &fnZeroQ, .leaf },
+    .{ "pos?", 1, 1, &fnPosQ, .leaf },
+    .{ "neg?", 1, 1, &fnNegQ, .leaf },
+    .{ "odd?", 1, 1, &fnOddQ, .leaf },
+    .{ "even?", 1, 1, &fnEvenQ, .leaf },
     // apply + HOFs.
     .{ "apply", 2, null, &fnApply },
     .{ "map", 2, null, &fnMap },
@@ -1258,39 +1263,18 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // for the call that could collect.
 
 /// `(f args...)` for a sequence native's callback. A keyword looking
-/// up a map, a record or nil, and a leaf native (`leaf_natives`), run
-/// here directly: neither can re-enter the VM, collect, or compare or
-/// hash nested structure, so the root scope, the stack guard and the
-/// deep-data check `VM.callValue` puts around a call have nothing to
-/// do. Everything else goes through `callValue`, as does a leaf
-/// native called with an arity it refuses, for its error.
+/// up a map, a record or nil runs here directly: it cannot re-enter
+/// the VM, collect, or compare or hash nested structure, so the root
+/// scope, the stack guard and the deep-data check `VM.callValue` puts
+/// around a call have nothing to do. Everything else goes through
+/// `callValue`, which calls a leaf native as directly
+/// (`NativeFn.leaf`).
 fn callBack(vm: *VM, f: Value, args: []const Value) VmError!Value {
-    switch (f.kind()) {
-        .keyword => if (args.len == 1) switch (args[0].kind()) {
-            .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
-            else => {},
-        },
-        .native_fn => {
-            const native = vm_mod.asNativeFn(f);
-            if (isLeafNative(native.call) and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len)) return native.call(vm, args);
-        },
+    if (f.kind() == .keyword and args.len == 1) switch (args[0].kind()) {
+        .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
         else => {},
-    }
+    };
     return vm.callValue(f, args);
-}
-
-/// The natives `callBack` calls directly: arithmetic and predicates
-/// over their arguments alone. A bignum they make is a fresh block,
-/// and `Heap.alloc` never collects (VM.md §9).
-const leaf_natives = [_]*const fn (*VM, []const Value) VmError!Value{
-    &fnAdd,   &fnSub,  &fnMul,  &fnInc, &fnDec,   &fnMax,   &fnMin,
-    &fnLt,    &fnLte,  &fnGt,   &fnGte, &fnNumEq, &fnEvenQ, &fnOddQ,
-    &fnZeroQ, &fnPosQ, &fnNegQ, &fnNot, &fnNilQ,  &fnSomeQ, &fnIdentity,
-};
-
-fn isLeafNative(call: *const fn (*VM, []const Value) VmError!Value) bool {
-    inline for (leaf_natives) |leaf| if (call == leaf) return true;
-    return false;
 }
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
