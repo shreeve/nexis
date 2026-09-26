@@ -154,13 +154,13 @@ pub const StoreFile = struct {
 
     /// A commit since the last sync left without one: the file's
     /// data or meta may still be only in the operating system's cache.
-    unsynced: bool = false,
+    unsynced: bool,
     /// How the open write transaction's commit syncs.
-    write_sync: emdb.SyncOverride = .full,
+    write_sync: emdb.SyncOverride,
     /// A Nextomic read transaction, every tree loaded, kept from one
     /// read to the next while it is still the file's latest commit
     /// (DB.md §3.4).
-    held: ?*emdb.Txn = null,
+    held: ?*emdb.Txn,
 
     var open_files: ?*StoreFile = null;
 
