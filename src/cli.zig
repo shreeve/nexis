@@ -96,8 +96,17 @@ fn runCommand(init: std.process.Init) !void {
     defer if (builtin.mode == .Debug) {
         _ = debug_allocator.deinit();
     };
-    const allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
+    var allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
     const io = init.io;
+    var max_alloc: MaxAlloc = undefined;
+    if (init.environ_map.get("NEXIS_MAX_ALLOC")) |text| {
+        const max = std.fmt.parseInt(usize, text, 10) catch {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: NEXIS_MAX_ALLOC is not a byte count\n");
+            std.process.exit(1);
+        };
+        max_alloc = .{ .child = allocator, .max = max };
+        allocator = max_alloc.allocator();
+    }
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) usageExit(io);
@@ -127,6 +136,39 @@ fn runCommand(init: std.process.Init) !void {
         std.process.exit(1);
     }
 }
+
+/// `NEXIS_MAX_ALLOC=BYTES`: an allocation, or the growth of one, past
+/// BYTES fails as a request the machine cannot satisfy does, so the
+/// out-of-memory report and the REPL's recovery from it can be tested
+/// without exhausting memory (TOOLING.md §1).
+const MaxAlloc = struct {
+    child: std.mem.Allocator,
+    max: usize,
+
+    fn allocator(self: *MaxAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return if (len > self.max) null else self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return new_len <= self.max and self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        return if (new_len > self.max) null else self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *MaxAlloc = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -240,7 +282,14 @@ const Runtime = struct {
                 try rt.reportRuntimeError(rt.v.traced_error orelse vm.VmError.UncaughtThrow);
                 return 5;
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            // Memory ran out outside a run (reading, compiling,
+            // printing a value): the error has no frame to be at.
+            error.OutOfMemory => {
+                rt.v.error_detail = "";
+                rt.v.error_trace.clearRetainingCapacity();
+                try rt.reportRuntimeError(vm.VmError.OutOfMemory);
+                return 5;
+            },
         }
     }
 

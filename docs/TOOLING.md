@@ -134,6 +134,16 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   longer than 40 frames keeps its innermost 32 and outermost 8 around
   one line `  <N frames elided>`, which has no `at` (VM.md §13), so a
   runaway recursion ending in `StackOverflow` lists 41 lines.
+- Out of memory is a runtime error like the rest: `runtime error:
+  OutOfMemory` at the call whose allocation failed, with its frames
+  (`out-of-memory.err`). No `try` catches it (VM.md §13); what the
+  failed allocation was building is unreachable, so the heap stays
+  usable and the REPL carries on. Memory that runs out while reading,
+  compiling or printing is reported the same way with no position.
+  With `NEXIS_MAX_ALLOC=BYTES` in the environment every allocation, or
+  growth of one, past BYTES fails as a request the machine refuses
+  does; the goldens reach this report through it without exhausting
+  the machine.
 - A form a macro produced reports at the macro call.
 - A frame without a span table (a routine built from hand-written
   bytecode) is listed by name alone; when the innermost frame has none

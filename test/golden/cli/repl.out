@@ -4,6 +4,8 @@ Type `:quit` or hit Ctrl-D to exit.
 user=> #'user/x
 user=> 42
 user=> user=> :divide-by-zero
+user=> user=> :out-of-memory
+user=> 3
 user=> #'user/a
 #'user/b
 3
