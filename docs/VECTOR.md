@@ -142,6 +142,7 @@ stdlib's sequence iterator use it. It is internal, not a language API.
 | `valueFromVectorHeader(h) Value` | the Value for a root header (the transient seam, `docs/TRANSIENT.md` §8) |
 | `copyRoot(heap, h)` | a copy of a root, without metadata, for a transient to own |
 | `conjInPlace(heap, root, elem, edit)`, `assocInPlace(heap, root, i, elem, edit)`, `popInPlace(heap, root, edit)` | the edits of a transient that owns `root` (`docs/TRANSIENT.md` §1): they write the root and the nodes whose header `hash` is `edit` in place, copy any other node on the path once, stamping the copy, and give the shape `conj`, `assoc` and `pop` give; an owned tail grows as `conj` grows a copied one (§2), and `pop` lets go of the element it drops |
+| `openTailInPlace(heap, root, edit) *[32]Value`, `closeTailInPlace(root, len)` | a builder's 32 `conjInPlace`s: for a root the edit owns whose tail is full, the tail joins the trie and a new owned tail's 32 slots, counted, are returned to be written in order; before the vector is read, `closeTailInPlace` sets the tail's length to `len` (1–32). A value in an open slot is reached by the collector at once, which marks every slot of a tail's block (§2) |
 | `trace(h, visitor)` | GC trace (`docs/GC.md` §5) |
 
 `vector.zig` never imports `dispatch`: element hashing and comparison

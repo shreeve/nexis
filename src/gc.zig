@@ -78,11 +78,18 @@ pub const Collector = struct {
     /// traced, so this cycle's marks are incomplete and it must not
     /// sweep.
     overflowed: bool = false,
-    /// True while a drain is running (for the whole of `collect`):
-    /// `mark` only pushes. Outside one, a direct `mark` drains before
-    /// it returns, so a caller marking by hand still gets the
-    /// transitive closure.
+    /// True while a drain is running: `mark` only pushes. Outside
+    /// one, `mark` drains before it returns, so every root `collect`
+    /// marks, and every block a caller marks by hand, has its
+    /// transitive closure marked before the next.
     draining: bool = false,
+    /// How many more levels of blocks the trace running now may
+    /// trace in place: a block it marks is traced there and then,
+    /// while this is above zero, and waits on the worklist once it is
+    /// zero. The drain sets it to `in_place_depth` for each header it
+    /// pops, so a vector of a million small maps, even one inside a
+    /// transient or an atom, queues none of them (GC.md §4).
+    in_place: u8 = 0,
 
     /// What the collector needs from the runtime that owns the heap
     /// (GC.md §3, §5): its roots, and the tracing of the two block
@@ -134,6 +141,15 @@ pub const Collector = struct {
     pub fn mark(self: *Collector, h: *HeapHeader) void {
         if (!self.markHeaderOnce(h)) return;
         if (h.meta == null and isLeafKind(h.kind)) return;
+        if (self.in_place > 0) {
+            // A bounded number of levels: below them what a trace
+            // marks is queued, so the native stack stays bounded
+            // whatever the data's depth.
+            self.in_place -= 1;
+            defer self.in_place += 1;
+            self.trace(h);
+            return;
+        }
         self.gray.append(self.heap.backing, h) catch {
             self.overflowed = true;
             return;
@@ -143,6 +159,11 @@ pub const Collector = struct {
             self.gray.clearRetainingCapacity();
         }
     }
+
+    /// How many levels below a popped header the drain traces in
+    /// place: enough for the elements of a collection held by a
+    /// transient, an atom, a record or a closure's cell.
+    const in_place_depth: u8 = 4;
 
     /// Kinds whose blocks hold no heap reference but their metadata.
     fn isLeafKind(kind: u16) bool {
@@ -157,7 +178,11 @@ pub const Collector = struct {
         const was_draining = self.draining;
         self.draining = true;
         defer self.draining = was_draining;
-        while (self.gray.pop()) |h| self.trace(h);
+        while (self.gray.pop()) |h| {
+            self.in_place = in_place_depth;
+            defer self.in_place = 0;
+            self.trace(h);
+        }
     }
 
     /// Mark `h`'s metadata map and dispatch to the kind's trace.
@@ -260,8 +285,10 @@ pub const Collector = struct {
     }
 
     /// Run a full collection cycle:
-    ///   1. Push each root, then the host's roots when there is a
-    ///      host, and drain the worklist: the transitive closure.
+    ///   1. Mark each root, then the host's roots when there is a
+    ///      host, draining the worklist after each: the transitive
+    ///      closure, one root's at a time, so the worklist holds what
+    ///      one root reaches and never every root at once.
     ///   2. Sweep: end and free every db transaction handle of this
     ///      heap no Value reached (`db.sweepHandles`), then free every
     ///      unmarked, non-pinned heap block.
@@ -272,12 +299,9 @@ pub const Collector = struct {
     /// the memory to the allocation that fails next (GC.md §4).
     pub fn collect(self: *Collector, roots: []const *HeapHeader) usize {
         std.debug.assert(!self.draining);
-        self.draining = true;
+        // Outside a drain, `mark` drains before it returns.
         for (roots) |r| self.mark(r);
         if (self.host) |host| host.roots(host.ctx, self);
-        self.drain();
-        self.draining = false;
-        self.gray.clearRetainingCapacity();
         db_mod.sweepHandles(self.heap, !self.overflowed);
         const freed = if (self.overflowed) self.abandon() else self.heap.sweepUnmarked();
         self.heap.resetAllocationCounter();
@@ -484,6 +508,72 @@ test "collect: vector with deep trie survives end-to-end" {
     for (probe) |idx| {
         try testing.expectEqual(@as(i64, @intCast(idx)), vector.nth(v, idx).asFixnum());
     }
+}
+
+test "collect: a vector's element blocks are traced in place, not queued" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const synth = struct {
+        fn hash(x: Value) u64 {
+            return x.hashImmediate();
+        }
+        fn eq(a: Value, b: Value) bool {
+            return a.tag == b.tag and a.payload == b.payload;
+        }
+    };
+    // 2,000 small maps of immediates, the elements of one vector; the
+    // last also holds a list, which its trace queues.
+    const n: usize = 2000;
+    const elems = try testing.allocator.alloc(Value, n);
+    defer testing.allocator.free(elems);
+    const key = value.fromFixnum(0).?;
+    for (elems, 0..) |*slot, i| {
+        const x = if (i == n - 1) try list.fromSlice(&heap, &.{value.fromFixnum(@intCast(i)).?}) else value.fromFixnum(@intCast(i)).?;
+        slot.* = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), key, x, &synth.hash, &synth.eq);
+    }
+    const v = try vector.fromSlice(&heap, elems);
+    _ = try string.fromBytes(&heap, "orphan");
+    const live = heap.liveCount();
+
+    var gc = Collector.init(&heap);
+    defer gc.deinit();
+    // The orphan string and the 2,000 empty maps the assocs began from.
+    try testing.expectEqual(n + 1, gc.collect(&.{Heap.asHeapHeader(v)}));
+    try testing.expectEqual(live - n - 1, heap.liveCount());
+    // The vector's trace marks each map and traces it there; the
+    // worklist held the vector and the one list, never the maps.
+    try testing.expect(gc.gray.capacity < 64);
+    for (0..n - 1) |i| {
+        try testing.expectEqual(@as(i64, @intCast(i)), champ.mapGet(vector.nth(v, i), key, &synth.hash, &synth.eq).present.asFixnum());
+    }
+    const l = champ.mapGet(vector.nth(v, n - 1), key, &synth.hash, &synth.eq).present;
+    try testing.expectEqual(@as(i64, n - 1), list.head(l).asFixnum());
+
+    // The same vector inside a transient, two levels below the root.
+    const t = try transient_mod.transientFrom(&heap, v);
+    var gc2 = Collector.init(&heap);
+    defer gc2.deinit();
+    try testing.expectEqual(@as(usize, 1), gc2.collect(&.{Heap.asHeapHeader(t)}));
+    try testing.expect(gc2.gray.capacity < 64);
+}
+
+test "collect: each root is traced before the next is marked" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // 2,000 roots, each a one-element vector: the root stack of a
+    // native that keeps its results there.
+    const n: usize = 2000;
+    const roots = try testing.allocator.alloc(*HeapHeader, n);
+    defer testing.allocator.free(roots);
+    for (roots, 0..) |*r, i| r.* = Heap.asHeapHeader(try vector.fromSlice(&heap, &.{value.fromFixnum(@intCast(i)).?}));
+    _ = try string.fromBytes(&heap, "orphan");
+
+    var gc = Collector.init(&heap);
+    defer gc.deinit();
+    try testing.expectEqual(@as(usize, 1), gc.collect(roots));
+    try testing.expect(gc.gray.capacity < 64);
 }
 
 test "collect: persistent set survives (>8 elements exercises CHAMP internals)" {

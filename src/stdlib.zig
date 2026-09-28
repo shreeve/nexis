@@ -1315,20 +1315,19 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// stopping at the shortest collection. Throws inside `f`
 /// propagate via `ControlTransferred`.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
-    const scope = vm.rootScope();
-    defer scope.release();
-    try mapInto(vm, args[0], args[1..], scope);
-    return try buildListFromSlice(vm, scopeItems(scope));
+    var results = Results.init(vm);
+    defer results.release();
+    try mapInto(vm, args[0], args[1..], &results);
+    return results.list();
 }
 
-/// Push `(f x1 x2 ...)` for every position of the shortest of
-/// `colls` on `scope`, which is both the results' root and their
-/// buffer (`scopeItems`).
-fn mapInto(vm: *VM, f: Value, colls: []const Value, scope: vm_mod.RootScope) VmError!void {
+/// Add `(f x1 x2 ...)` for every position of the shortest of `colls`
+/// to `results`, which roots each as it comes.
+fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         var cb = vm_mod.Callback.init(vm, f, 1);
-        while (try it.next()) |x| try scope.push(try cb.call(&.{x}));
+        while (try it.next()) |x| try results.add(try cb.call(&.{x}));
         return;
     }
 
@@ -1341,7 +1340,7 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, scope: vm_mod.RootScope) VmE
         for (iters, 0..) |*it, i| {
             call_args[i] = (try it.next()) orelse break :outer;
         }
-        try scope.push(try callBack(vm, f, call_args));
+        try results.add(try callBack(vm, f, call_args));
     }
 }
 
@@ -1421,17 +1420,17 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
 const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 
 fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
-    const scope = vm.rootScope();
-    defer scope.release();
-    try sieveInto(vm, mode, pred, coll, scope);
-    return try buildListFromSlice(vm, scopeItems(scope));
+    var results = Results.init(vm);
+    defer results.release();
+    try sieveInto(vm, mode, pred, coll, &results);
+    return results.list();
 }
 
-/// Push what `mode` keeps of `coll` on `scope`, the kept values'
-/// root and buffer. An element the walk built (a map's entry) is
-/// rooted as the predicate's argument for its call and by the push
-/// once kept; one dropped is garbage.
-fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, scope: vm_mod.RootScope) VmError!void {
+/// Add what `mode` keeps of `coll` to `results`, which roots each as
+/// it comes. An element the walk built (a map's entry) is rooted as
+/// the predicate's argument for its call and by `results` once kept;
+/// one dropped is garbage.
+fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results) VmError!void {
     var it = try makeSeqIter(vm, coll);
     var cb = vm_mod.Callback.init(vm, pred, 1);
     while (try it.next()) |x| {
@@ -1441,7 +1440,7 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, scope: vm_mod.RootS
             .keep_falsy => if (r.isTruthy()) null else x,
             .keep_result => if (r.isNil()) null else r,
         };
-        if (kept) |v| try scope.push(v);
+        if (kept) |v| try results.add(v);
     }
 }
 
@@ -1977,13 +1976,13 @@ fn fnRange(vm: *VM, args: []const Value) VmError!Value {
     const end: i64 = try requireFixnum(args[if (args.len == 1) 0 else 1]);
     const step: i64 = if (args.len == 3) try requireFixnum(args[2]) else 1;
     if (step == 0) return VmError.InvalidArgument;
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
+    var results = Results.init(vm);
+    defer results.release();
     var i = start;
     while (if (step > 0) i < end else i > end) : (i += step) {
-        items.append(vm.allocator, value_mod.fromFixnum(i) orelse return VmError.ArithmeticOverflow) catch return VmError.OutOfMemory;
+        try results.add(value_mod.fromFixnum(i) orelse return VmError.ArithmeticOverflow);
     }
-    return try buildListFromSlice(vm, items.items);
+    return results.list();
 }
 
 /// `range` over any numbers, through the tower.
@@ -1994,13 +1993,13 @@ fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
     const step = if (args.len == 3) try requireNumber(args[2]) else value_mod.fromFixnum(1).?;
     const sign = (try vm_mod.numSign(step)) orelse return VmError.InvalidArgument;
     if (sign == .eq) return VmError.InvalidArgument;
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
+    var results = Results.init(vm);
+    defer results.release();
     var x = start;
     while (try vm_mod.numCompare(if (sign == .gt) .lt else .gt, x, end)) : (x = try vm_mod.numAdd(heap, x, step)) {
-        items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+        try results.add(x);
     }
-    return try buildListFromSlice(vm, items.items);
+    return results.list();
 }
 
 /// `(concat & colls)` → one list of every element in order.
@@ -2047,31 +2046,31 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
 fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
-    const scope = vm.rootScope();
-    defer scope.release();
-    try mapInto(vm, args[0], args[1..], scope);
-    return vector_mod.fromSlice(vm.ensureHeap(), scopeItems(scope)) catch VmError.OutOfMemory;
+    var results = Results.init(vm);
+    defer results.release();
+    try mapInto(vm, args[0], args[1..], &results);
+    return results.vector();
 }
 
 fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
-    const scope = vm.rootScope();
-    defer scope.release();
-    try sieveInto(vm, .keep_truthy, args[0], args[1], scope);
-    return vector_mod.fromSlice(vm.ensureHeap(), scopeItems(scope)) catch VmError.OutOfMemory;
+    var results = Results.init(vm);
+    defer results.release();
+    try sieveInto(vm, .keep_truthy, args[0], args[1], &results);
+    return results.vector();
 }
 
 /// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
 /// the non-nil `(f i x)`.
 fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
-    const scope = vm.rootScope();
-    defer scope.release();
+    var results = Results.init(vm);
+    defer results.release();
     var it = try makeSeqIter(vm, coll);
     var i: i64 = 0;
     while (try it.next()) |x| : (i += 1) {
         const r = try callBack(vm, f, &.{ value_mod.fromFixnum(i).?, x });
-        if (keep_nil or !r.isNil()) try scope.push(r);
+        if (keep_nil or !r.isNil()) try results.add(r);
     }
-    return try buildListFromSlice(vm, scopeItems(scope));
+    return results.list();
 }
 
 fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
@@ -5227,7 +5226,7 @@ const SeqIter = struct {
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return .{ .state = switch (coll.kind()) {
         .nil => .empty,
-        .list => .{ .list = list_mod.Cursor.init(coll) },
+        .list => if (list_mod.viewCursor(coll)) |c| .{ .vector = c } else .{ .list = list_mod.Cursor.init(coll) },
         .persistent_vector => .{ .vector = vector_mod.Cursor.init(coll) },
         .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
         .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
@@ -5282,6 +5281,92 @@ fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
 /// the cons cells are fewer blocks than a vector's root, tail and
 /// view.
 const view_min = 4;
+
+/// The result of a sequence native that calls back into the VM,
+/// rooted as it is made (docs/GC.md §11.5, class 3). The first 32
+/// values wait on the native's root scope; the 33rd makes them a
+/// transient vector the scope holds instead, and every value from
+/// there on is written into the slots of the vector's open tail
+/// (`vector.openTailInPlace`), which the collector reaches through the
+/// transient. A long result is so built where it ends up, never first
+/// as a buffer on the root stack, and a short one is built at the end
+/// as before.
+const Results = struct {
+    vm: *VM,
+    heap: *heap_mod.Heap,
+    scope: vm_mod.RootScope,
+    /// The transient vector, the scope's one entry, from the 33rd
+    /// value on.
+    building: ?Value = null,
+    /// The open tail's slots, while `building`.
+    slots: *[results_chunk]Value = undefined,
+    /// How many values wait on the scope, or fill the open tail.
+    fill: usize = 0,
+
+    fn init(vm: *VM) Results {
+        return .{ .vm = vm, .heap = vm.ensureHeap(), .scope = vm.rootScope() };
+    }
+
+    fn release(self: *const Results) void {
+        self.scope.release();
+    }
+
+    /// Write `v` into the open tail; anything else (the first 32
+    /// values, a full tail) takes `addOther`, out of the caller's loop.
+    inline fn add(self: *Results, v: Value) VmError!void {
+        if (self.fill < results_chunk and self.building != null) {
+            self.slots[self.fill] = v;
+            self.fill += 1;
+            return;
+        }
+        return self.addOther(v);
+    }
+
+    noinline fn addOther(self: *Results, v: Value) VmError!void {
+        if (self.fill == results_chunk) try self.openTail();
+        if (self.building != null) self.slots[self.fill] = v else try self.scope.push(v);
+        self.fill += 1;
+    }
+
+    /// Open the next 32 slots; the first time, move the values
+    /// waiting on the scope into a transient vector and root that
+    /// instead. `Heap.alloc` never collects, so the values need no
+    /// root while they move.
+    fn openTail(self: *Results) VmError!void {
+        const t = self.building orelse blk: {
+            const first = vector_mod.fromSlice(self.heap, scopeItems(self.scope)) catch return VmError.OutOfMemory;
+            const t = transient_mod.transientFrom(self.heap, first) catch return VmError.OutOfMemory;
+            self.scope.release();
+            try self.scope.push(t);
+            self.building = t;
+            break :blk t;
+        };
+        self.slots = transient_mod.vectorOpenTailBang(self.heap, t) catch return VmError.OutOfMemory;
+        self.fill = 0;
+    }
+
+    /// The vector, its open tail closed at what was written.
+    fn finish(self: *Results, t: Value) VmError!Value {
+        transient_mod.vectorCloseTailBang(t, @intCast(self.fill)) catch return VmError.OutOfMemory;
+        return transient_mod.persistentBang(t) catch VmError.OutOfMemory;
+    }
+
+    /// The result as a list (`buildListFromSlice`'s shape).
+    fn list(self: *Results) VmError!Value {
+        const t = self.building orelse return buildListFromSlice(self.vm, scopeItems(self.scope));
+        return list_mod.ofVector(self.heap, try self.finish(t), 0) catch VmError.OutOfMemory;
+    }
+
+    /// The result as a vector.
+    fn vector(self: *Results) VmError!Value {
+        const t = self.building orelse return vector_mod.fromSlice(self.heap, scopeItems(self.scope)) catch VmError.OutOfMemory;
+        return self.finish(t);
+    }
+};
+
+/// How many values `Results` keeps waiting on the root stack, and
+/// writes into each open tail: one vector leaf's worth.
+const results_chunk = vector_mod.branch_factor;
 
 /// What `scope` holds: a native that roots each result as it makes
 /// it reads them back here as its buffer.

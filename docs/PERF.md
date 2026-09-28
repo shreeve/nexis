@@ -72,7 +72,8 @@ the §3 rows.
 ## 3. Measured rows
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
-§3.6's second column, §3.7, §3.8, §3.12 and §3.13 on an Apple M5;
+§3.6's second column, §3.7, §3.8, §3.12, §3.13 and §3.14 on an
+Apple M5;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -376,8 +377,9 @@ What the rows say:
   babashka's in this table and 0.79× in §3.13's. Its sequences are eager here, lazy and chunked in
   babashka (`docs/BENCH.md` §12); no collection runs in its timed
   phase, whose cost was the calls each element makes (§3.13). Its
-  resident set and `sort`'s are the two above babashka's; every other
-  row holds less.
+  resident set and `sort`'s are the two above babashka's here; §3.14
+  takes the pipeline's under it, 195 MB against 212 MB, and leaves
+  `sort` the one row that holds more.
 - Nextomic is ahead of Datalevin on every phase: creating, opening,
   loading, lookups, joins, aggregates, pull and small transactions.
 - The default-commit rows compare different guarantees. A default
@@ -574,6 +576,80 @@ dispatches per row (`var:load-var`, `mov:load-const`, `mov:move`, two
 `sample` profile), the loop's entry and exit for each callback, and
 the first touch of each row's map (`mapGet`, about an eighth).
 
+### 3.14 The heap of the sequence natives, Apple M5
+
+Where the pipeline's memory went, at `a712a24` (a build with a trace
+of each cycle and of the heap at exit, not committed): the setup runs
+four cycles, at 16, 34, 67 and 134 MB live, in 0.4, 2.2, 4.4–6.8 and
+12.5–15.5 ms; only the first frees anything (358 blocks), and the
+timed phase allocates 25 MB, less than the 134 MB the next cycle
+waits for, so no cycle runs in it. Its peak resident set, 238 MB, was
+the heap's 187 MB (1M maps of 128 bytes, the rows' vector, the
+setup's `range` vector, garbage since its `mapv`, and the phase's
+three result vectors), the root stack's 16.8 MB (the capacity the
+`mapv` left it), the collector's gray worklist, 1.3 M entries
+(10.4 MB: the `mapv`'s results on the root stack and every map a
+vector's trace reached were queued), 6 MB for the process, and about
+17 MB of malloc'd buffers freed but still resident (`range`'s list
+and the growth steps of the two above). The phase's 1.34 G
+instructions were its calls (§3.13); building its three results, a
+push per value and a copy per leaf, was about 5 % of its profile.
+
+Before (`a712a24`) and after this section's changes (§6 "Levers
+pulled"), and against the tree they merge with (`8afd353`, §3.13's
+changes), in instructions retired (`/usr/bin/time -l`, median of
+five, the phase as the whole program minus its setup alone) and peak
+resident set:
+
+| Pipeline program | `a712a24` | `8afd353` | after |
+|---|---:|---:|---:|
+| setup (`mapv` over `range`), instructions | 2,127 M | 2,021 M | 1,984 M |
+| timed phase, instructions | 1,349 M | 879 M | 884 M |
+| setup alone, peak RSS | 213 MB | 212 MB | 170 MB |
+| whole program, peak RSS | 238 MB | 238 MB | 195 MB |
+
+Against babashka, `bench/compare/run.clj --n 10 --max-load 6
+--no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group`
+(`docs/BENCH.md` §12), four runs alternating the builds, after, main,
+after, main; each cell is a run's median time inside the process, the
+first run then the second. The `a712a24` column is one run before
+them, its map-transient row measured after the load passed 6 in
+each of three attempts.
+
+| Workload | nexis `8afd353` | nexis after | babashka | ratio after | RSS `a712a24` → `8afd353` → after | bb RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| map/filter/reduce over 1M maps | 33.4, 35.6 ms | 34.2, 34.4 ms | 42.3–46.7 ms | 0.80, 0.79 | 238 → 238 → 195 MB | 212 MB |
+| `frequencies` and `group-by`, 1M | 80.5, 86.2 ms | 81.5, 81.0 ms | 180–198 ms | 0.45, 0.45 | 99 → 97 → 57 MB | 130–133 MB |
+| map build and read, 1M | 519, 577 ms | 525, 535 ms | 800–895 ms | 0.64, 0.66 | 175 → 175 → 140 MB | 192 MB |
+| map through transients, 1M | 283, 328 ms | 293, 300 ms | 580–644 ms | 0.47, 0.47 | 158 → 156 → 122 MB | 178 MB |
+| sort, 1M ints | 81.5, 87.9 ms | 82.5, 88.2 ms | 198–231 ms | 0.42, 0.38 | 188 → 188 → 155 MB | 113–114 MB |
+| vector conj and nth, 1M | 52.7, 56.9 ms | 51.6, 56.9 ms | 76.0–83.6 ms | 0.67, 0.68 | 101 → 100 → 65 MB | 126 MB |
+| load average at the start | 3.1, 3.9 | 4.6, 3.8 | | | | |
+
+Every answer matched in every run. The time of every row is the same
+before and after within the runs' spread; every row's resident set
+falls by 35–43 MB, the root stack's and the worklist's retained
+capacity and the malloc'd buffers no longer there, and the pipeline's
+is under babashka's. `sort` still holds more: it gathers its elements
+into a malloc'd list and merge-sorts them through two more of pairs,
+80 MB beside its input for a million (§6, "`sort`'s buffers").
+
+The trigger (`docs/GC.md` §7), set by hand on the after build, five
+runs each of the pipeline program, cycles and the phase's time:
+
+| Growth, floor | Cycles | Phase | Peak RSS |
+|---|---:|---:|---:|
+| 100 %, 16 MiB (the default) | 4 | 34.1–35.0 ms | 194 MB |
+| 200 %, 16 MiB | 3 | 34.3–35.6 ms | 194 MB |
+| 100 %, 64 MiB | 2 | 36.6–38.8 ms | 194 MB |
+| 50 %, 16 MiB | 6 | 46.1–53.9 ms | 186 MB |
+| 25 %, 16 MiB | 8 | 41.9–45.3 ms | 178 MB |
+| 10 %, 16 MiB | 11 | 56.6–60.9 ms | 178 MB |
+
+A lower growth brings a cycle, a mark of the 150 MB live, into the
+timed phase and saves at most 16 MB; a higher growth or floor saves
+setup cycles the benchmark does not time and holds the same memory.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -615,11 +691,21 @@ Each lever is a measured change: a before/after from `zig build bench`
   retraction; referring to EAVT-h instead would drop most of a
   text-heavy store's log.
 - **The collector's trigger.** A cycle is due once the heap has
-  allocated its live size again (100 %) or 16 MiB, so a build that
-  grows a large live set re-marks it every few megabytes. A higher
-  floor or growth trades resident memory for marking; the measurement
-  is §3.11's map rows with their RSS.
+  allocated its live size again (100 %) or 16 MiB. A build that grows
+  a large live set is marked at each doubling, about twice its final
+  size in all; the pipeline's setup runs four cycles (§3.14) and its
+  timed phase none. A lower growth brings a cycle into that phase and
+  trades time for resident memory, a higher one or a higher floor
+  changes neither (§3.14's trigger table); the remaining measurement
+  is a program whose live set stays flat while it allocates.
 
+- **`sort`'s buffers.** `sortImpl` gathers the elements into a
+  malloc'd list (16 bytes each) and sorts `{key, val}` pairs through a
+  scratch array of the same size (32 bytes each, twice), 80 MB for
+  §3.11's million ints, all resident at the peak; `(vec sorted)` then
+  gathers the result again. Sorting the values alone when there is no
+  key function, and building the result in place (`Results`), would
+  halve it; the measurement is §3.11's `sort` row with its RSS.
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
 - **Operand-specialized opcodes**, and then **inline caches at call
@@ -686,9 +772,39 @@ Each lever is a measured change: a before/after from `zig build bench`
   42.5 ms (load 3), the inline walk and push 1,043 → 938 M and 43.6 →
   40.3 ms (load 5), the arithmetic 951 → 874 M and 37.6 → 34.2 ms
   (load 7).
+- *Marking in place, one root at a time* (`docs/GC.md` §4): the
+  drain traces what a popped header's trace marks there and then,
+  four levels deep, and `collect` drains after each root. The gray
+  worklist the pipeline's setup grew to 1.3 M entries (10.4 MB, kept
+  between cycles) stays at 17.
+- *Results built in place* (`docs/LIST.md` §1, `docs/VECTOR.md` §5):
+  `map`, `filter` and their kin, `mapv`, `filterv` and `range` write
+  each value past the 32nd into the open tail of the vector they
+  return, never into a buffer on the root stack (16.8 MB kept by the
+  VM after the setup's `mapv`) or a malloc'd list (`range`'s, freed
+  but resident). With the marking above: the pipeline 238 → 195 MB
+  at the same time, `frequencies`/`group-by` 97 → 57 MB, the map build
+  175 → 140 MB, transient maps 156 → 122 MB, `sort` 188 → 155 MB,
+  vector `conj`/`nth` 100 → 65 MB (§3.14).
+- *A built sequence walked as its vector* (`docs/LIST.md` §3,
+  `viewCursor`): the pipeline's phase 1,327 → 1,253 M instructions on
+  the tree before §3.13's changes, which stepped a list inline in the
+  place.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
 
+- *Results through the transient's `conj!`*: `vectorConjBang` for
+  every value, the tail's capacity read from its slab each time, cost
+  the pipeline's phase 85 M instructions (+6 %) over the root-stack
+  buffer it replaced. *A leaf's worth copied from the root stack*
+  (32 values waiting there, then appended whole) cost 17 M over §3.13's
+  build of the same tree. Writing into the open tail copies nothing.
+- *Both of `Results.add`'s paths inline* in the native's loop: the
+  filter stage's fastest of fifteen runs 35.0 ms against 29.1 ms with
+  the rare path (the first 32 values, a full tail) out of line, and
+  the phase's median 39.4 against main's 34.3 ms over 25 alternating
+  runs, at equal instructions. A code-layout effect: the same source
+  with two `getenv` calls added elsewhere ran at main's speed.
 - *Prefetching a vector leaf's heap elements* when the cursor loads
   the leaf, so the pipeline's first touch of each row's map (§3.13)
   would find it in flight: the phase's median 38.2 → 40.3 ms and
@@ -793,3 +909,4 @@ is one invocation's 30-sample median.
 | §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
+| §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |

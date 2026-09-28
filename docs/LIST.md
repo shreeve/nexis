@@ -38,7 +38,15 @@ map or set, and the rest that build a fresh list; `stdlib.zig`
 more, a vector of them and its view at offset 0: a root, a tail and
 one block per 32 elements instead of a cons cell per element, and an
 O(1) `count`. Fewer than four are cons cells, fewer blocks than a
-vector's root, tail and view. `list` always builds cons cells. As
+vector's root, tail and view. `list` always builds cons cells.
+`map`, `filter`, `remove`, `keep`, `map-indexed`, `keep-indexed` and
+`range`, and `mapv` and `filterv`, build the vector as they go
+(`stdlib.zig` `Results`): the 33rd result makes the first 32 a
+transient vector (`docs/TRANSIENT.md` §1), and each later one is
+written into the vector's open tail (`docs/VECTOR.md` §5,
+`openTailInPlace`), so a long result is never gathered whole in a
+buffer first (`test/golden/cli/long-sequences.nx`
+builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
 with any view, a `rest` or `drop` of a built sequence keeps the whole
 vector reachable (§6), where a cons chain's rest frees the cells before
 it.
@@ -109,6 +117,7 @@ reader and macro material; large sequences are vectors.
 | `count(v) usize` | O(1) for a view, O(n) over cons cells |
 | `drop(v, n) Value` | without the first `n` elements, empty when shorter; never allocates |
 | `Cursor.init(v)`, `next() ?Value` | streaming iteration in order |
+| `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`stdlib.zig` `SeqIter`); null for a cons chain or the empty list |
 | `hashSeq(v, elementHash) u64` | §2 invariant 2; `elementHash` is `&dispatch.hashValue` |
 | `equalSeq(a, b, elementEq) bool` | §2 invariant 3; `elementEq` is `&dispatch.equal` |
 | `trace(h, visitor)` | GC trace, §6 |

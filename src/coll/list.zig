@@ -290,6 +290,14 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // `equalSeq` and the stdlib's sequence iterator walk lists with it;
 // once it reaches a view it walks the vector's leaves directly.
 
+/// The cursor over a view's elements: its vector's, from its offset
+/// (§1). Null for a cons chain or the empty list.
+pub fn viewCursor(v: Value) ?vector.Cursor {
+    std.debug.assert(v.kind() == .list);
+    if (v.subkind() != subkind_view) return null;
+    return vector.Cursor.initAt(viewVector(v), viewOffset(v));
+}
+
 pub const Cursor = struct {
     /// The part of the list still to be yielded, until a view is
     /// reached; from then on `view` yields the rest.

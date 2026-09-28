@@ -321,6 +321,21 @@ pub fn vectorConjBang(heap: *Heap, t: Value, elem: Value) EditError!Value {
     return t;
 }
 
+/// For a native building a vector a leaf at a time: 32 slots opened
+/// at the end of the vector, whose tail is full
+/// (`vector.openTailInPlace`). The transient must not be read until
+/// `vectorCloseTailBang` gives the tail its length.
+pub fn vectorOpenTailBang(heap: *Heap, t: Value) EditError!*[vector.branch_factor]Value {
+    const body = try activeBody(t, subkind_transient_vector);
+    return vector.openTailInPlace(heap, body.inner_header, editOf(body));
+}
+
+/// The tail `vectorOpenTailBang` opened holds its first `len` slots.
+pub fn vectorCloseTailBang(t: Value, len: u32) TransientError!void {
+    const body = try activeBody(t, subkind_transient_vector);
+    vector.closeTailInPlace(body.inner_header, len);
+}
+
 /// `(assoc! t idx elem)`: replaces element `idx`, or appends when
 /// `idx` is the count (as Clojure's `assoc!` on a transient vector).
 /// `error.IndexOutOfBounds` beyond that.

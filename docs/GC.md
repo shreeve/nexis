@@ -112,26 +112,33 @@ block, only tests do.
 | `deinit()` | Frees the gray worklist, whose capacity `collect` keeps |
 | `host: ?Host` | `Host.roots(ctx, collector)` marks every root the runtime holds, once per cycle after the explicit roots; `Host.trace(ctx, h, collector)` walks an already-marked `function` or `cell_internal` block |
 | `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db connection), flags a db transaction handle reached (§5), and marks any other Value's header |
-| `mark(h)` | Sets the mark bit once and pushes `h` on the gray worklist, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace; outside `collect` it drains before returning, so a direct call marks the transitive closure |
+| `mark(h)` | Sets the mark bit once and, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace, traces `h` in place when the trace that reached it may (below), else pushes it on the gray worklist; outside a drain it drains before returning, so a direct call marks the transitive closure |
 | `markInternal(h) bool` | Sets the mark bit of a collection-internal node and returns whether this call set it; walks neither the node's `meta` nor its kind: the caller walks the payload |
-| `collect(roots) usize` | Marks the roots and the host's roots, drains the worklist, sweeps the db transaction handles of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
+| `collect(roots) usize` | Marks the roots and the host's roots, each root's transitive closure before the next root, sweeps the db transaction handles of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
 
 `mark` and `markInternal` share one primitive (`markHeaderOnce`), so
 the mark bit has one owner. Nothing in the API can fail: sweeping only
 frees, and a cycle that runs out of memory frees nothing.
 
-**Iterative marking.** The mark phase is a loop, never a recursion on
-the data: `mark` pushes the header on `gray`; the drain pops a header,
-marks its meta map and runs its kind's trace (§5), whose own `mark` and
-`markValue` calls push in turn. A structure nested a million levels
-deep costs a million entries of `gray`, not a million native frames. A
-kind's trace walks its own interior nodes in place with `markInternal`,
-which is bounded: a vector trie is at most seven levels deep, a CHAMP
-tree thirteen, and a list's tail chain is walked in a loop. Marking
-never recurses. If `gray` cannot grow, the header stays marked but
-untraced and the cycle is abandoned: `collect` clears every mark bit
-and frees nothing, and the allocation that next fails ends the program
-with the VM's `OutOfMemory`. The VM keeps `gray` between cycles
+**Iterative marking.** The mark phase is a loop, never an unbounded
+recursion on the data: `mark` pushes the header on `gray`; the drain
+pops a header, marks its meta map and runs its kind's trace (§5). A
+block that trace marks is traced there and then, in place, and so on
+down to four levels below the popped header (`in_place_depth`); what
+the fourth level marks is pushed on `gray`. However deep the data,
+nesting costs entries of `gray`, never more than those four levels of
+native frames, and a wide structure queues only what lies past them:
+a vector of a million small maps, alone or inside a transient, an
+atom or a record, queues none of the maps. A kind's trace walks its
+own interior nodes in place with `markInternal`, which is bounded: a
+vector trie is at most seven levels deep, a CHAMP tree thirteen, and
+a list's tail chain is walked in a loop. `collect` marks one root at a
+time and drains after each, so the worklist holds what one root
+reaches, never every root's children at once (the root stack of a
+native that keeps its values there, §11.5). If `gray` cannot grow,
+the header stays marked but untraced and the cycle is abandoned:
+`collect` clears every mark bit and frees nothing, and the allocation
+that next fails ends the program with the VM's `OutOfMemory`. The VM keeps `gray` between cycles
 (`VM.gc_gray`), so a cycle reuses the capacity the last one grew.
 
 ---
@@ -212,10 +219,12 @@ cell reached along a list's tail may carry metadata of its own, which
 
 ```
 collect(roots):
-    draining = true
-    mark each root; host.roots(...)     // push on gray
-    while gray.pop() |h|: trace(h)      // the transitive closure
-    draining = false; empty gray, keeping its capacity
+    for each root, then host.roots(...):
+        mark(root)                      // push on gray
+        while gray.pop() |h|: trace(h)  // its transitive closure; a
+                                        // block trace marks is traced
+                                        // in place, four levels deep
+    empty gray, keeping its capacity
     db.sweepHandles(heap, !overflowed)  // ends unreached transactions
     freed = heap.sweepUnmarked()        // frees unmarked, unpinned blocks;
                                         // clears the mark on survivors
@@ -360,8 +369,12 @@ The rule each native follows, by what it holds across a further
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
    them on every exit path, a `ControlTransferred` unwind included.
-   `mapInto` (`map`, `mapv`, `mapcat`), `indexedMap` (`map-indexed`,
-   `keep-indexed`), `reductions`, `repeatInto` (`repeatedly`,
+   `Results`, the result builder of `map`, `mapv`, `mapcat`,
+   `map-indexed`, `keep-indexed`, `filter`, `remove`, `keep` and
+   `filterv`: it pushes the first 32 results on its root scope, and
+   from the 33rd roots a transient vector in their place, writing
+   each later result into its open tail, whose every slot the
+   vector's trace marks (§5, `docs/LIST.md` §1); `reductions`, `repeatInto` (`repeatedly`,
    `iterate`), `keyExtremum` (`max-key`, `min-key`: the best key so
    far), `sortImpl` when a key fn is given; the `nextomic/q` hook for
    every user-function result and every heap value the query pipeline
@@ -373,7 +386,9 @@ The rule each native follows, by what it holds across a further
    argument reaches them. The iterator over a map, a record or an
    entity builds each `[k v]` entry, and the one over a typed vector
    boxes each element. `sieveInto` (`filter`, `remove`, `keep`,
-   `filterv`), `whileSplit` (`take-while`, `drop-while`) and
+   `filterv`) passes each element to the predicate, its call's
+   argument, and keeps it in its `Results` before the next call;
+   `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's
    root scope; `sortImpl` (`sort`, `sort-by`) collects the elements and
