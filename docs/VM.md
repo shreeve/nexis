@@ -516,8 +516,10 @@ Every variant but `pow` runs the numeric tower over fixnum, bignum
 and float (SEMANTICS.md §2.2 contagion): an integer result outside
 i48 is a bignum on the VM's heap, and a non-number is
 `:kind-mismatch` with the detail `+ expects numbers, got a string`.
-The arithmetic natives call the same tower functions, so `(+ a b)`
-through a Var and the inlined `math:add` agree exactly. A float
+The arithmetic natives call the same tower functions (`+` of two
+fixnums, and `inc` and `dec` of one, compute inline when the result
+is a fixnum, as the handlers do), so `(+ a b)` through a Var and the
+inlined `math:add` agree exactly. A float
 divisor of zero gives IEEE infinity or NaN for `/`; `quot`, `rem`
 and `mod` raise for either kind (`(mod 1 0.0)` raises, as in
 Clojure).

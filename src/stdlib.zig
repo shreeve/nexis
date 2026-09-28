@@ -830,6 +830,10 @@ fn foldNumbers(vm: *VM, op: BinaryNum, args: []const Value) VmError!Value {
 }
 
 fn fnAdd(vm: *VM, args: []const Value) VmError!Value {
+    // Two fixnums whose sum is one add inline, as `math:add` does.
+    if (args.len == 2 and args[0].isFixnum() and args[1].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() + args[1].asFixnum())) |v| return v;
+    }
     if (args.len == 0) return value_mod.fromFixnum(0).?;
     return foldNumbers(vm, &vm_mod.numAdd, args);
 }
@@ -908,10 +912,16 @@ fn fnNotEq(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnInc(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() + 1)) |v| return v;
+    }
     return vm_mod.numAdd(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
 fn fnDec(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() - 1)) |v| return v;
+    }
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 

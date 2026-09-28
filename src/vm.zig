@@ -4599,6 +4599,7 @@ pub fn numSign(a: value_mod.Value) VmError!?std.math.Order {
 
 /// `even?` / `odd?`: integers only, as in Clojure.
 pub fn numEven(a: value_mod.Value) VmError!bool {
+    if (a.isFixnum()) return a.asFixnum() & 1 == 0;
     if (!isInteger(a)) return VmError.KindMismatch;
     return bignum_mod.isEven(a);
 }

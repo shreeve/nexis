@@ -4566,6 +4566,7 @@ test "map, filter and reduce call their function once per element as a call in p
     try expectOutput("(do (defn walk [n] (if (zero? n) 0 (reduce + (map (fn [_] (walk (dec n))) [1 2])))) (walk 10))", "0");
     try expectOutput("(do (defrecord R [a]) [(map :a [{:a 1} nil 5 #{:a} [1] (sorted-map :a 2) (->R 3) (transient {:a 4})]) (filter 'a [{'a 1} {} nil #{'a}]) (reduce :a {:a 1} [2])])", "[(1 nil nil :a nil 2 3 4) ({a 1} #{a}) 1]");
     try expectOutput("[(map inc [140737488355327 -1 1.5]) (reduce + [140737488355327 1 2]) (filter even? [140737488355328 3 -2])]", "[(140737488355328 0 2.5) 140737488355330 (140737488355328 -2)]");
+    try expectOutput("[(map dec [-140737488355328 0 0.5]) (filter odd? [-3 -2 140737488355329 -140737488355329]) (reduce + [1.5 2]) (apply + [140737488355327 1]) (let [f +] (f -140737488355328 -1)) (map even? [0 -1 -140737488355328])]", "[(-140737488355329 -1 -0.5) (-3 140737488355329 -140737488355329) 3.5 140737488355328 -140737488355329 (true false true)]");
     try expectOutput("[(map {:a 1} [:a :b]) (filter #{2} [1 2]) (map first [[1] [2 3]]) (reduce max [3 9 2]) (reduce conj [] '(1 2))]", "[(1 nil) (2) (1 2) 9 [1 2]]");
 }
 
