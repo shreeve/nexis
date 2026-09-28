@@ -321,13 +321,19 @@ pub fn vectorConjBang(heap: *Heap, t: Value, elem: Value) EditError!Value {
     return t;
 }
 
-/// `vectorConjBang` of each of `chunk`'s elements in turn, when the
-/// vector's tail is full: its tail joins the trie at once and the
-/// chunk becomes the new tail.
-pub fn vectorConjChunkBang(heap: *Heap, t: Value, chunk: *const [vector.branch_factor]Value) EditError!Value {
+/// For a native building a vector a leaf at a time: 32 slots opened
+/// at the end of the vector, whose tail is full
+/// (`vector.openTailInPlace`). The transient must not be read until
+/// `vectorCloseTailBang` gives the tail its length.
+pub fn vectorOpenTailBang(heap: *Heap, t: Value) EditError!*[vector.branch_factor]Value {
     const body = try activeBody(t, subkind_transient_vector);
-    try vector.conjChunkInPlace(heap, body.inner_header, chunk, editOf(body));
-    return t;
+    return vector.openTailInPlace(heap, body.inner_header, editOf(body));
+}
+
+/// The tail `vectorOpenTailBang` opened holds its first `len` slots.
+pub fn vectorCloseTailBang(t: Value, len: u32) TransientError!void {
+    const body = try activeBody(t, subkind_transient_vector);
+    vector.closeTailInPlace(body.inner_header, len);
 }
 
 /// `(assoc! t idx elem)`: replaces element `idx`, or appends when

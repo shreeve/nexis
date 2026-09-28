@@ -371,9 +371,10 @@ The rule each native follows, by what it holds across a further
    them on every exit path, a `ControlTransferred` unwind included.
    `Results`, the result builder of `map`, `mapv`, `mapcat`,
    `map-indexed`, `keep-indexed`, `filter`, `remove`, `keep` and
-   `filterv`: it pushes each result on its root scope, and every 32
-   moves them into a transient vector it roots in their place
-   (`docs/LIST.md` §1); `reductions`, `repeatInto` (`repeatedly`,
+   `filterv`: it pushes the first 32 results on its root scope, and
+   from the 33rd roots a transient vector in their place, writing
+   each later result into its open tail, whose every slot the
+   vector's trace marks (§5, `docs/LIST.md` §1); `reductions`, `repeatInto` (`repeatedly`,
    `iterate`), `keyExtremum` (`max-key`, `min-key`: the best key so
    far), `sortImpl` when a key fn is given; the `nextomic/q` hook for
    every user-function result and every heap value the query pipeline

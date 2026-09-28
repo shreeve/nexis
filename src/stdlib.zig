@@ -5283,79 +5283,78 @@ fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
 const view_min = 4;
 
 /// The result of a sequence native that calls back into the VM,
-/// rooted as it is made (docs/GC.md §11.5, class 3). Values wait on
-/// the native's root scope, a vector leaf's worth at most: the first
-/// full chunk becomes a transient vector the scope holds instead, and
-/// each later one joins it whole (TRANSIENT.md §1). A long result is
-/// so built where it ends up, never first as a buffer on the root
-/// stack, and a short one is built at the end as before.
+/// rooted as it is made (docs/GC.md §11.5, class 3). The first 32
+/// values wait on the native's root scope; the 33rd makes them a
+/// transient vector the scope holds instead, and every value from
+/// there on is written into the slots of the vector's open tail
+/// (`vector.openTailInPlace`), which the collector reaches through the
+/// transient. A long result is so built where it ends up, never first
+/// as a buffer on the root stack, and a short one is built at the end
+/// as before.
 const Results = struct {
     vm: *VM,
     heap: *heap_mod.Heap,
     scope: vm_mod.RootScope,
-    /// The transient vector, the scope's first entry, once a chunk
-    /// filled; the values after it wait for the next.
+    /// The transient vector, the scope's one entry, from the 33rd
+    /// value on.
     building: ?Value = null,
-    /// Where on the root stack the waiting values start.
-    chunk_base: usize,
+    /// The open tail's slots, while `building`.
+    slots: *[results_chunk]Value = undefined,
+    /// How many values wait on the scope, or fill the open tail.
+    fill: usize = 0,
 
     fn init(vm: *VM) Results {
-        const scope = vm.rootScope();
-        return .{ .vm = vm, .heap = vm.ensureHeap(), .scope = scope, .chunk_base = scope.base };
+        return .{ .vm = vm, .heap = vm.ensureHeap(), .scope = vm.rootScope() };
     }
 
     fn release(self: *const Results) void {
         self.scope.release();
     }
 
-    /// The values waiting on the scope.
-    fn pending(self: *const Results) []const Value {
-        return scopeItems(self.scope)[@intFromBool(self.building != null)..];
-    }
-
     inline fn add(self: *Results, v: Value) VmError!void {
-        try self.scope.push(v);
-        if (self.vm.roots.items.len - self.chunk_base == results_chunk) try self.flush();
+        if (self.fill == results_chunk) try self.openTail();
+        if (self.building != null) self.slots[self.fill] = v else try self.scope.push(v);
+        self.fill += 1;
     }
 
-    /// Move a full chunk into the vector. `Heap.alloc` never collects,
-    /// so the values need no root while they move.
-    fn flush(self: *Results) VmError!void {
-        const chunk = self.pending()[0..results_chunk];
-        if (self.building) |t| {
-            _ = transient_mod.vectorConjChunkBang(self.heap, t, chunk) catch return VmError.OutOfMemory;
-            self.vm.roots.shrinkRetainingCapacity(self.scope.base + 1);
-            return;
-        }
-        const first = vector_mod.fromSlice(self.heap, chunk) catch return VmError.OutOfMemory;
-        const t = transient_mod.transientFrom(self.heap, first) catch return VmError.OutOfMemory;
-        self.scope.release();
-        try self.scope.push(t);
-        self.building = t;
-        self.chunk_base = self.scope.base + 1;
+    /// Open the next 32 slots; the first time, move the values
+    /// waiting on the scope into a transient vector and root that
+    /// instead. `Heap.alloc` never collects, so the values need no
+    /// root while they move.
+    fn openTail(self: *Results) VmError!void {
+        const t = self.building orelse blk: {
+            const first = vector_mod.fromSlice(self.heap, scopeItems(self.scope)) catch return VmError.OutOfMemory;
+            const t = transient_mod.transientFrom(self.heap, first) catch return VmError.OutOfMemory;
+            self.scope.release();
+            try self.scope.push(t);
+            self.building = t;
+            break :blk t;
+        };
+        self.slots = transient_mod.vectorOpenTailBang(self.heap, t) catch return VmError.OutOfMemory;
+        self.fill = 0;
     }
 
-    /// The vector, with the values still waiting added.
+    /// The vector, its open tail closed at what was written.
     fn finish(self: *Results, t: Value) VmError!Value {
-        for (self.pending()) |v| _ = transient_mod.vectorConjBang(self.heap, t, v) catch return VmError.OutOfMemory;
+        transient_mod.vectorCloseTailBang(t, @intCast(self.fill)) catch return VmError.OutOfMemory;
         return transient_mod.persistentBang(t) catch VmError.OutOfMemory;
     }
 
     /// The result as a list (`buildListFromSlice`'s shape).
     fn list(self: *Results) VmError!Value {
-        const t = self.building orelse return buildListFromSlice(self.vm, self.pending());
+        const t = self.building orelse return buildListFromSlice(self.vm, scopeItems(self.scope));
         return list_mod.ofVector(self.heap, try self.finish(t), 0) catch VmError.OutOfMemory;
     }
 
     /// The result as a vector.
     fn vector(self: *Results) VmError!Value {
-        const t = self.building orelse return vector_mod.fromSlice(self.heap, self.pending()) catch VmError.OutOfMemory;
+        const t = self.building orelse return vector_mod.fromSlice(self.heap, scopeItems(self.scope)) catch VmError.OutOfMemory;
         return self.finish(t);
     }
 };
 
-/// How many values `Results` keeps waiting on the root stack: one
-/// vector leaf's worth.
+/// How many values `Results` keeps waiting on the root stack, and
+/// writes into each open tail: one vector leaf's worth.
 const results_chunk = vector_mod.branch_factor;
 
 /// What `scope` holds: a native that roots each result as it makes

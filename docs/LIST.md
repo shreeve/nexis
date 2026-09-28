@@ -41,9 +41,11 @@ O(1) `count`. Fewer than four are cons cells, fewer blocks than a
 vector's root, tail and view. `list` always builds cons cells.
 `map`, `filter`, `remove`, `keep`, `map-indexed`, `keep-indexed` and
 `range`, and `mapv` and `filterv`, build the vector as they go
-(`stdlib.zig` `Results`): past 32 results each leaf's worth joins a
-transient vector (`docs/TRANSIENT.md` §1), so a long result is never
-gathered whole in a buffer first (`test/golden/cli/long-sequences.nx`
+(`stdlib.zig` `Results`): the 33rd result makes the first 32 a
+transient vector (`docs/TRANSIENT.md` §1), and each later one is
+written into the vector's open tail (`docs/VECTOR.md` §5,
+`openTailInPlace`), so a long result is never gathered whole in a
+buffer first (`test/golden/cli/long-sequences.nx`
 builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
 with any view, a `rest` or `drop` of a built sequence keeps the whole
 vector reachable (§6), where a cons chain's rest frees the cells before
