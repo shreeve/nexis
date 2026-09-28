@@ -5311,7 +5311,18 @@ const Results = struct {
         self.scope.release();
     }
 
+    /// Write `v` into the open tail; anything else (the first 32
+    /// values, a full tail) takes `addOther`, out of the caller's loop.
     inline fn add(self: *Results, v: Value) VmError!void {
+        if (self.fill < results_chunk and self.building != null) {
+            self.slots[self.fill] = v;
+            self.fill += 1;
+            return;
+        }
+        return self.addOther(v);
+    }
+
+    noinline fn addOther(self: *Results, v: Value) VmError!void {
         if (self.fill == results_chunk) try self.openTail();
         if (self.building != null) self.slots[self.fill] = v else try self.scope.push(v);
         self.fill += 1;
