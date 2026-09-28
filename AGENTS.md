@@ -31,7 +31,7 @@ changes to emdb.
    maps an old "PLAN §N" citation to the document that owns it now.
 3. The spec of the module you touch: `docs/README.md` maps each source
    file to its spec. `docs/NEXTOMIC.md` is authoritative for
-   `src/nextomic/` and the `nextomic` namespace (`../emdb/NEXTOMIC.md`
+   `src/nextomic/` and the `nextomic` namespace (`docs/NEXTOMIC-EMDB.md`
    §1 is the reader's introduction to Datomic; where the rest of that
    note describes Nextomic, `docs/NEXTOMIC.md` wins).
 4. `CLOJURE-REVIEW.md`: what nexis takes, adapts and rejects from
@@ -99,7 +99,7 @@ value kinds; each is a frozen commitment. Amend first.
 ## The owner's rules
 
 - **Zero changes to emdb.** Anything the engine seems to lack is solved
-  on the nexis side (`docs/NEXTOMIC.md` §11; `../emdb/NEXTOMIC.md` §6
+  on the nexis side (`docs/NEXTOMIC.md` §11; `docs/NEXTOMIC-EMDB.md` §6
   lists the temptations to refuse).
 - **Timeless code, comments and docs.** Describe what is; no era
   framing, no "now"/"previously"/"used to", no phase or turn numbers.

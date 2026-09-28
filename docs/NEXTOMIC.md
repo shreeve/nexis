@@ -4,8 +4,8 @@ This is the authoritative design for Nextomic: the storage layout, the
 transaction protocol, the db-value semantics, the query pipeline and the
 Lisp API. Code follows this document; when they disagree, fix one in the
 same commit. The emdb-side view (what the engine already provides and
-what must not be asked of it) is `../emdb/NEXTOMIC.md`; its §1 is the
-reader's introduction to Datomic and Nextomic.
+what must not be asked of it) is [`NEXTOMIC-EMDB.md`](NEXTOMIC-EMDB.md);
+its §1 is the reader's introduction to Datomic and Nextomic.
 
 Nextomic requires **zero changes to emdb**. Every engine capability used
 below is a public function or a committed invariant of emdb as it stands
