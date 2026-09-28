@@ -5157,7 +5157,12 @@ const SeqIter = struct {
     },
     roots: ?vm_mod.RootScope = null,
 
-    fn next(self: *SeqIter) VmError!?Value {
+    inline fn next(self: *SeqIter) VmError!?Value {
+        if (self.state == .vector) return self.state.vector.next();
+        return self.nextOther();
+    }
+
+    fn nextOther(self: *SeqIter) VmError!?Value {
         switch (self.state) {
             .empty => return null,
             .list => |*c| return c.next(),
@@ -5200,7 +5205,7 @@ const SeqIter = struct {
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return .{ .state = switch (coll.kind()) {
         .nil => .empty,
-        .list => .{ .list = list_mod.Cursor.init(coll) },
+        .list => if (list_mod.viewCursor(coll)) |c| .{ .vector = c } else .{ .list = list_mod.Cursor.init(coll) },
         .persistent_vector => .{ .vector = vector_mod.Cursor.init(coll) },
         .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
         .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },

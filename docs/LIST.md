@@ -115,6 +115,7 @@ reader and macro material; large sequences are vectors.
 | `count(v) usize` | O(1) for a view, O(n) over cons cells |
 | `drop(v, n) Value` | without the first `n` elements, empty when shorter; never allocates |
 | `Cursor.init(v)`, `next() ?Value` | streaming iteration in order |
+| `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`stdlib.zig` `SeqIter`); null for a cons chain or the empty list |
 | `hashSeq(v, elementHash) u64` | §2 invariant 2; `elementHash` is `&dispatch.hashValue` |
 | `equalSeq(a, b, elementEq) bool` | §2 invariant 3; `elementEq` is `&dispatch.equal` |
 | `trace(h, visitor)` | GC trace, §6 |

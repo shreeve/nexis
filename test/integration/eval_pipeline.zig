@@ -1654,6 +1654,16 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     try testing.expect(peak < 3 * kept);
 }
 
+test "integration: a sequence native walks a view from its offset, and a cons over one" {
+    try expectOutputProgram(
+        \\(let [v (map inc (range 100))]
+        \\  [(every? (fn [k] (= (map identity (drop k v)) (range (inc k) 101))) (range 0 101))
+        \\   (every? (fn [k] (= (filter even? (nthrest v k)) (filter even? (range (inc k) 101)))) [1 31 32 33 64 99])
+        \\   (= (reduce + (rest v)) 5049) (= (mapv inc (cons 0 (rest v))) (cons 1 (range 3 102)))
+        \\   (= (map inc (rest (rest '(1 2 3 4 5)))) '(4 5 6))])
+    , "[true true true true true]");
+}
+
 test "gc: map, filter and mapv build a long result in place, not on the root stack" {
     var program: Program = undefined;
     try program.init();
