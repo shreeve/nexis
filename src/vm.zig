@@ -3151,9 +3151,10 @@ pub const VM = struct {
     /// `call:call`. The common calls run here: a closure called with
     /// its fixed arity where the frame chain and the stack have room,
     /// whose frame is pushed without allocating, so its callee starts
-    /// without a safe point; and a native within its arity. Every
-    /// other call, and every call that traps, goes through
-    /// `execCallCall`.
+    /// without a safe point; a native within its arity; and a keyword
+    /// or symbol looking itself up in a map, a record or nil, which
+    /// allocates nothing and is no safe point either. Every other
+    /// call, and every call that traps, goes through `execCallCall`.
     fn opCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         fast: {
             if (inst.a.kind != .slot or inst.c.kind != .slot) break :fast;
@@ -3201,6 +3202,23 @@ pub const VM = struct {
                     const caller = self.currentFrame();
                     self.slotAt(caller, inst.c.index).* = result;
                     return self.nextSafe(caller);
+                },
+                // `(:k m)`, `(:k m d)`, `('s m)` on a map, a record or
+                // nil: the lookup `callLookupIn` makes. An immediate
+                // key hashes and compares without the callbacks, so
+                // nothing is allocated and no data is walked.
+                .keyword, .symbol => {
+                    if (argc != 1 and argc != 2) break :fast;
+                    const target = self.stack.items[base];
+                    const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
+                    const result = switch (target.kind()) {
+                        .nil => default,
+                        .persistent_map => mapLookup(target, callee, default),
+                        .record => mapLookup(record_mod.fieldsOf(target), callee, default),
+                        else => break :fast,
+                    };
+                    self.slotAt(frame, inst.c.index).* = result;
+                    return self.next(frame);
                 },
                 else => break :fast,
             }
@@ -6664,6 +6682,51 @@ test "VM dispatch: a leaf native reads its arguments in place and keeps its arit
     try vm.retargetTop(&short_routine);
     try testing.expectError(VmError.ArityMismatch, vm.run());
     try testing.expectEqualStrings("sub takes 2 arguments, got 1", vm.error_detail);
+}
+
+test "VM dispatch: a keyword or symbol called on a map or nil looks up in place, with no safe point" {
+    // [(:k m) (:other m 9) ('s m) (:k nil 7)] with a cycle due at every
+    // safe point: the loop's entry and the vector's construction
+    // collect, and none of the four lookups, which allocate nothing,
+    // is a safe point (§8, §9).
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    const k = try interner.internKeywordValue("k");
+    const other = try interner.internKeywordValue("other");
+    const s = try interner.internSymbolValue("s");
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    m = try champ_mod.mapAssoc(heap, m, s, fx(2), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    const code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 3),
+        asm_.callCall(0, 1, 5), // s5 = (:k m)
+        asm_.loadConst(0, 1),
+        asm_.loadConst(1, 3),
+        asm_.loadConst(2, 4),
+        asm_.callCall(0, 2, 6), // s6 = (:other m 9)
+        asm_.loadConst(0, 2),
+        asm_.loadConst(1, 3),
+        asm_.callCall(0, 1, 7), // s7 = ('s m)
+        asm_.loadConst(0, 0),
+        asm_.loadNil(1),
+        asm_.loadConst(2, 5),
+        asm_.callCall(0, 2, 8), // s8 = (:k nil 7)
+        Inst.primary(.coll, CollOp.vector, sl(5), Operand.slot(4), sl(0)),
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Value{ k, other, s, m, fx(9), fx(7) };
+    const routine = makeRoutine(&code, &consts, 9, "lookups");
+    try vm.retargetTop(&routine);
+    vm.gc_threshold = 0;
+    vm.gc_growth_percent = 0;
+    vm.gc_next_at = 0;
+    const result = try vm.run();
+    try testing.expectEqual(@as(usize, 2), vm.gc_cycles);
+    try testing.expectEqual(@as(usize, 4), vector_mod.count(result));
+    for ([_]i64{ 1, 9, 2, 7 }, 0..) |want, i| try testing.expectEqual(want, vector_mod.nth(result, i).asFixnum());
 }
 
 test "VM dispatch: a native's throw two loops deep reaches the handler below" {

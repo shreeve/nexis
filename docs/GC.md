@@ -246,7 +246,9 @@ before fetching an instruction in its one run loop (`VM.loop`, which
 `run`, `callValue` and `runRoutine` drive), at a loop's first fetch
 and at every fetch after an instruction of a group that can allocate
 (`math`, `call`, `closure`, `coll`, `ctrl`); after `mov`, `cmp`, `jump`
-or `var` the counter cannot have moved. Between two instructions every
+or `var`, and after a `call` of a keyword or symbol looking itself up
+in a map, a record or nil (`docs/VM.md` §8), the counter cannot have
+moved. Between two instructions every
 live value is in one of the roots §3 lists, so a cycle there frees
 nothing live. The second is `callValue` of anything but a closure (a
 native, a protocol fn, a lookup), once its arguments are on the root

@@ -4530,6 +4530,9 @@ test "keyword-as-function: direct calls" {
     try expectOutput("(do (defn field [m] (:x m)) (field {:x 7}))", "7");
     try expectOutput("(let [f :a] (f {:a 9}))", "9");
     try expectOutput("(do (defrecord P [x y]) (:y (->P 1 2)))", "2");
+    // Every receiver in call position, a map, a record and nil looked
+    // up in place and the rest through the general call (VM.md §8).
+    try expectOutput("(do (defrecord Q [x]) (let [q (->Q 1) m {:x 2 'y 3}] [(:x q) (:z q :d) (:x m) ('y m) ('z m :d) (:x nil) (:x [1 2]) (:x [1] :d) (:x #{:x}) (:x (sorted-map :x 4)) (:x (transient {:x 5})) ('y #{'y})]))", "[1 :d 2 3 :d nil nil :d :x 4 5 y]");
 }
 
 test "keyword-as-function: keywords passed to higher-order functions" {
