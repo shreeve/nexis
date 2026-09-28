@@ -1,7 +1,7 @@
 ; bench/compare/db/dtlv-load.clj — the Datalevin twin of nexis-load.nx:
 ; create a store, load 100 departments and 100,000 people with five
 ; attributes each, in batches of 1,000 entities (docs/BENCH.md §12).
-; Mode `durable` commits every transaction in Datalevin's default mode;
+; Mode `default` commits every transaction in Datalevin's default mode;
 ; `nosync` sets the `:nosync` environment flag and syncs once at the
 ; end, and names its phases `create-nosync` and `load-nosync`.
 ; The runner substitutes the store directory for @STORE@ and the mode

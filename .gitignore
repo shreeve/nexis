@@ -20,3 +20,6 @@ bench/*.json
 *.emdb
 *.emdb-lock
 tmp/
+
+# The Clojure CLI's classpath cache for bench/compare/deps.edn.
+bench/compare/.cpcache/

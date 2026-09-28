@@ -13,9 +13,11 @@ Every scorecard row carries one status:
 - `absent` — not in the tree.
 
 A claim that nexis is faster than something, anywhere outside this
-file, cites a `measured` row here or is withdrawn (BENCH.md §1). No
-row here is a same-machine comparison with Clojure; where a Clojure
-figure appears it is an external reference and says so.
+file, cites a `measured` row here or is withdrawn (BENCH.md §1).
+§3.15 is the one same-machine comparison with Clojure on the JVM: the
+same idiomatic programs, run cold and warm, not BENCH.md §5's
+`criterium` comparison; anywhere else a Clojure figure is an external
+reference and says so.
 
 ---
 
@@ -62,18 +64,18 @@ the §3 rows.
 | 15 | Serialization | EDN text, Nippy | binary, LEB128 and ZigZag (`docs/CODEC.md`) | smaller, faster than text | §3.5 | measured |
 | 16 | Concurrency tax | CAS and STM throughout | single isolate, single writer | none paid, by design | — | by design |
 | 17 | SIMD | JIT autovectorization of primitive arrays | `nexis.simd` `sum`, `dot`, `scale` over typed vectors (`docs/TYPED_VECTOR.md`) | ahead on bulk numeric work | — | not measured |
-| 18 | Startup | JVM start | native binary | far ahead | — | not measured |
-| 19 | Compilation | C1/C2 JIT | bytecode, no specialization, no JIT | behind on sustained compute | §3.8 (nexis only) | not measured against Clojure |
+| 18 | Startup | JVM start | native binary | far ahead | §3.11, §3.15 | measured |
+| 19 | Compilation | C1/C2 JIT | bytecode, no specialization, no JIT | behind on sustained compute | §3.8 (nexis only), §3.15 | measured |
 | 20 | Comptime specialization | JIT inlining, escape analysis | CHAMP hashes an immediate key inline; the rest absent (§6) | — | §3.8 | partly absent |
-| 21 | Datalog over datoms | Datomic peer and transactor | Nextomic in process over emdb (`docs/NEXTOMIC.md`) | — | §3.7 | measured |
+| 21 | Datalog over datoms | Datomic peer and transactor | Nextomic in process over emdb (`docs/NEXTOMIC.md`) | — | §3.7, §3.11, §3.15 | measured |
 
 ---
 
 ## 3. Measured rows
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
-§3.6's second column, §3.7, §3.8, §3.12, §3.13 and §3.14 on an
-Apple M5;
+§3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
+an Apple M5; §3.15 on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -649,6 +651,134 @@ A lower growth brings a cycle, a mark of the 150 MB live, into the
 timed phase and saves at most 16 MB; a higher growth or floor saves
 setup cycles the benchmark does not time and holds the same memory.
 
+### 3.15 Linux x86_64: nexis against babashka and JVM Clojure, Nextomic against Datalevin and Datomic
+
+The workloads of §3.11 on an Intel Core Ultra 9 185H under Linux, with
+two more columns on each side: Clojure 1.12.6 on HotSpot (JDK 21) for
+the language, and Datomic Local 1.0.291 and Datomic Pro 1.0.7705
+(dev transactor) for the database, by `bench/compare/run.clj --n 10
+--max-load 4 --pin 0-11` (`docs/BENCH.md` §12): ten rounds, the
+implementations alternating, every process pinned to the six
+performance cores' twelve threads, the frequency governor left at
+`powersave`. Every workload gave the same answers in every run of
+every system. Cells are the median of the time measured inside each
+process; a ratio above 1 means nexis is slower. Provenance: §11.
+
+**Language.** Clojure cold is the program's one run in a fresh JVM, as
+babashka and nexis run it; Clojure warm is the median of ten runs in
+one JVM after twenty discarded ones. The wall columns are the whole
+process, start to exit, of the one-shot runs; RSS is its peak.
+
+| Workload | nexis | babashka 1.13 | Clojure cold | Clojure warm | ÷ bb | ÷ cold | ÷ warm | wall: nexis / bb / Clojure | RSS: nexis / bb / Clojure |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| startup (`-e`) | 7.51 ms | 7.22 ms | 327 ms | — | 1.04 | 0.02 | — | (the cells) | 6 / 32 / 109 MB |
+| loop/recur, 1M | 40.3 ms | 91.3 ms | 21.8 ms | 13.3 ms | 0.44 | 1.84 | 3.02 | 51 ms / 107 ms / 453 ms | 6 / 85 / 135 MB |
+| sort, 1M ints | 143 ms | 331 ms | 201 ms | 147 ms | 0.43 | 0.71 | 0.97 | 203 ms / 443 ms / 662 ms | 137 / 116 / 250 MB |
+| `frequencies` and `group-by`, 1M | 103 ms | 242 ms | 166 ms | 106 ms | 0.42 | 0.62 | 0.97 | 166 ms / 359 ms / 631 ms | 57 / 134 / 268 MB |
+| fib 30 | 73.7 ms | 159 ms | 14.7 ms | 4.60 ms | 0.46 | 5.02 | 16.0 | 84 ms / 174 ms / 439 ms | 6 / 80 / 113 MB |
+| map through transients, 1M | 536 ms | 1.00 s | 452 ms | 358 ms | 0.53 | 1.19 | 1.50 | 554 ms / 1.02 s / 887 ms | 122 / 181 / 314 MB |
+| destructuring loop | 363 ms | 429 ms | 112 ms | 37.7 ms | 0.85 | 3.23 | 9.62 | 376 ms / 444 ms / 557 ms | 25 / 86 / 336 MB |
+| map build and read, 1M | 1.16 s | 1.43 s | 594 ms | 451 ms | 0.81 | 1.95 | 2.56 | 1.17 s / 1.46 s / 1.06 s | 140 / 195 / 576 MB |
+| vector conj and nth, 1M | 131 ms | 121 ms | 67.6 ms | 30.3 ms | 1.08 | 1.93 | 4.31 | 146 ms / 139 ms / 509 ms | 65 / 127 / 260 MB |
+| string build and split, 1 MB | 34.2 ms | 29.5 ms | 59.7 ms | 12.6 ms | 1.16 | 0.57 | 2.71 | 46 ms / 44 ms / 496 ms | 30 / 75 / 136 MB |
+| map/filter/reduce over 1M maps | 75.9 ms | 46.2 ms | 47.2 ms | 22.6 ms | 1.64 | 1.61 | 3.36 | 288 ms / 560 ms / 553 ms | 195 / 214 / 316 MB |
+
+What the language rows say:
+
+- Warm, HotSpot is faster than nexis on eight of the ten programs:
+  1.5× on the transient map, 2.5–4.3× on the map build, string
+  splitting, loops, the pipeline and vectors, 9.6× on the
+  destructuring loop and 16× on `fib`, where a compiled call is a few
+  nanoseconds and a nexis call is an interpreted frame. `sort` and
+  `frequencies`/`group-by` are level (0.97): nexis runs them as Zig
+  natives, and both sides spend the time in the library.
+- Cold, in a fresh JVM, Clojure is still faster inside the timed body
+  on seven of ten (1.2–5×), and slower on `sort`,
+  `frequencies`/`group-by` and string splitting, whose library code
+  the JVM has not compiled yet. Counting the whole process, the JVM's
+  start of about 0.33 s puts nexis ahead on every one-shot program
+  but the persistent map build (1.17 s against 1.06 s).
+- nexis starts in 7.5 ms, level with babashka and 43× faster than
+  `clojure -M` (the CLI's launcher included), and its resident set is
+  below the JVM's on every row, 1.6–22× smaller.
+- Against babashka the picture differs from the Apple host's (§3.11,
+  where nexis leads every row): on this host nexis is ahead on seven
+  rows (0.42–0.85) and behind on vectors (1.08), string splitting
+  (1.16) and the pipeline (1.64), and level at startup. The rows were
+  not measured on one machine under both operating systems, so the
+  difference is the host and the platform together, not either alone.
+
+**Database.** 100 departments and 100,000 people with five attributes.
+The durability of each row (`docs/BENCH.md` §12, traced with `strace`):
+Nextomic's default commit syncs nothing and survives a crash of the
+process; its durable connection issues two `fdatasync` per commit.
+Datalevin's default commit is durable (one `fdatasync` and an
+`O_DSYNC` meta write). Datomic Local's one mode is durable (two
+`fdatasync`). Datomic Pro's dev transactor acknowledges without a sync
+(H2 writes the file in batches), so its commit is closest to
+Nextomic's default and weaker: an unwritten batch can be lost with the
+transactor.
+
+| Phase | Nextomic | Datalevin 1.1 | Datomic Local | Datomic Pro | ÷ Datalevin | ÷ Local | ÷ Pro |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| create a store | 695 μs | 81.0 ms | 129 ms | 985 ms | 0.01 | 0.01 | 0.00 |
+| load, default commit | 636 ms | 3.64 s (durable) | 9.62 s (durable) | 4.82 s | 0.17 | 0.07 | 0.13 |
+| load, every commit durable | 1.45 s | 3.64 s | 9.62 s | — | 0.40 | 0.15 | — |
+| index after the load | (in the load) | (in the load) | — | 2.91 s | | | |
+| open an existing store | 86 μs | 9.34 ms | 35.7 ms | 705 ms | 0.01 | 0.00 | 0.00 |
+| 10k point lookups by a unique attribute | 17.2 ms | 60.3 ms | 269 ms | 249 ms | 0.29 | 0.06 | 0.07 |
+| the same, warm (median of nine passes) | 13.0 ms | 47.5 ms | 140 ms | 11.0 ms | 0.27 | 0.09 | 1.18 |
+| three-clause join, 20 × 1,000 rows | 24.6 ms | 58.2 ms | 230 ms | 133 ms | 0.42 | 0.11 | 0.18 |
+| aggregate query | 34.2 ms | 132 ms | 867 ms | 356 ms | 0.26 | 0.04 | 0.10 |
+| pull of 10k entities with a nested ref | 13.8 ms | 135 ms | 300 ms | 81.8 ms | 0.10 | 0.05 | 0.17 |
+| the same, warm (median of nine passes) | 12.8 ms | 112 ms | 262 ms | 16.0 ms | 0.11 | 0.05 | 0.80 |
+| 1,000 one-datom transactions, default commit | 31.7 ms | 1.98 s (durable) | 5.55 s (durable) | 2.47 s | 0.02 | 0.01 | 0.01 |
+| 1,000 one-datom transactions, every commit durable | 2.24 s | 2.02 s | 5.45 s | — | 1.11 | 0.41 | — |
+| 1,000 one-datom transactions, no per-commit flush | 33.2 ms | 72.9 ms | — | — | 0.46 | — | — |
+| as-of and history query | 3.25 ms | no counterpart | 38.9 ms | 27.7 ms | — | 0.08 | 0.12 |
+| store after the load (allocated) | 137 MB | 42 MB | 25 MB | 18 MB | 3.3 | 5.5 | 7.6 |
+| peak RSS, query process | 128 MB | 668 MB | 1117 MB | 778 MB + 1127 MB transactor | | | |
+
+Datalevin's and Datomic Local's load and default-commit rows are
+already durable, so the durable load row repeats their figure; the
+second and third write batches of the Datomic twins run untimed where
+no mode matches.
+
+What the database rows say:
+
+- Nextomic is ahead of Datomic Local and Datomic Pro on every phase
+  timed cold: 5–25× on lookups, joins, aggregates, pull and the time
+  views, and far more on creating and opening a store; its load is
+  7.6× faster than Datomic Pro's (before Datomic's indexing) and,
+  durable against durable, 6.6× faster than Datomic Local's; small
+  default-commit transactions are 78× faster than Datomic Pro's, whose
+  transactor round trip (2.5 ms a transaction, no sync) is the cost an
+  in-process commit does not pay.
+- Warm, Datomic Pro's peer is faster than Nextomic at point lookups
+  (11.0 ms against 13.0 ms, 1.18) and close on pull (0.80): once the
+  JIT has compiled the peer and its object cache holds the segments,
+  a lookup is a lookup in memory. Its cold figures are 23× and 5×
+  those, which is what a peer that just started pays. Datomic Local's
+  client API stays 10–20× behind even warm.
+- Durable against durable, Nextomic's commit (two `fdatasync`,
+  2.24 ms) is 11 % slower than Datalevin's (one `fdatasync` and an
+  `O_DSYNC` write, 2.02 ms) and 2.4× faster than Datomic Local's
+  (5.45 ms). A durable load of 100,000 entities takes 1.45 s, against
+  3.64 s and 9.62 s.
+- The store is Nextomic's clear loss: 137 MB against Datomic Pro's
+  18 MB and Datomic Local's 25 MB, which keep history too (7.6× and
+  5.5×), and Datalevin's 42 MB without history (3.3×). Datomic Local's
+  `index-eavt` file holds the load in 4.0 MB, about 8 bytes a datom;
+  Nextomic's EAVT holds 26 bytes of key and value a datom plus emdb's
+  10, and again in its history twin (§3.11's per-tree table).
+- Datomic Pro's load returns before it has indexed: the transactor
+  folds the log into its indexes in the background, 2.91 s more for
+  this load, which Nextomic's 636 ms already includes.
+- Memory: Nextomic's query process peaks at 128 MB; Datomic Pro's
+  peer at 778 MB beside a 1.1 GB transactor (the distribution's
+  `-Xms1g -Xmx1g`), Datomic Local at 1.1 GB, all at the JDK's default
+  heap sizing.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -656,8 +786,9 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Rows that do not exist.**
 
-- A JVM Clojure column beside §3.11's babashka one (no JVM Clojure on
-  the measuring host); every JVM Clojure figure here is external.
+- A JVM Clojure column on the Apple host beside §3.11's babashka one,
+  and BENCH.md §5's `criterium` comparison with its arithmetic tiers
+  anywhere; §3.15 runs the shared programs on the Linux host.
 - Garbage-collection rows: steady-state allocation pressure, pause
   times.
 - Allocated bytes for a fixed workload (scorecard #1); §3.11 has peak
@@ -674,7 +805,8 @@ Each lever is a measured change: a before/after from `zig build bench`
   would save part of a `:commit` transaction's cost, about 18 μs in
   all (§3.11), at the price of holding the writer between natives. A `:durable` commit's two device flushes are the other
   cost left; group commit under one flush would divide it.
-- **Store size** (§3.11, 3.1× Datalevin). A history index that holds
+- **Store size** (§3.11, 3.1× Datalevin; §3.15, 7.6× Datomic Pro,
+  which keeps history in about 8 bytes a datom an index). A history index that holds
   only facts no longer current, with `as-of` and `history` merging it
   with the current index, would drop half the index pages of an
   append-mostly store; the readers are `nextomic/db.zig` and
@@ -903,6 +1035,7 @@ is one invocation's 30-sample median.
 | §3.9 | not recorded | revamp, 2026-09-25, ReleaseFast `bin/nexis run`, at the merge of the vector-view change (`7f44db5`) |
 | §3.10 | Apple M5, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | revamp, 2026-09-25: `zig build install -Doptimize=ReleaseFast` at `c4413b1` (before) and at the ws-codegen branch head (after); the probe program run nine times per build, alternating, each loop timed with `nano-time`; the `thrown?` figure a separate program, five runs per build |
 | §3.11 language and database rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0; emdb `ee61850`; shared with concurrent sessions (load average 3.8 at the start and the end) | 2026-09-28 00:52 MDT: `bb bench/compare/run.clj --n 10 --max-load 5` at `7b50fa4`; ten rounds after a discarded warm-up (startup thirty), the implementations alternating, each workload started below a load average of 5 and repeated if the load rose past it; every answer equal; raw results kept with the run (`results.json`) |
+| §3.15 | Intel Core Ultra 9 185H (6 performance cores with 2 threads each, 8 efficiency and 2 low-power cores; 22 logical CPUs), 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, ext4 on NVMe, cpufreq governor `powersave` (left as the host has it); every process pinned with `taskset -c 0-11`, the performance cores' threads (4.8–5.1 GHz maximum); nexis `95791b0` and emdb `e4fd537` (a source snapshot, not a checkout), Zig 0.16.0, ReleaseFast; babashka v1.13.224; Datalevin 1.1.0; Temurin OpenJDK 21.0.12.1, Clojure CLI 1.12.6.1673, Clojure 1.12.6, the JDK's default flags with `-XX:-UsePerfData` and `-Djava.io.tmpdir` (the CLI adds `-XX:-OmitStackTraceInFastThrow`); Datomic Local 1.0.291; Datomic Pro 1.0.7705, dev transactor with its distribution's JVM options and the dev template's memory settings; the owner's workstation in use (1-minute load average 1.2–3.2 during the run, 2.1 at the start, 2.5 at the end) | 2026-09-28 01:51–02:17 MDT: `bb bench/compare/run.clj --n 10 --max-load 4 --pin 0-11 --no-build --impls nexis,bb,clojure,datalevin,datomic-local,datomic-pro --datomic-pro DIR --nexis-commit 95791b0 --emdb-commit e4fd537` with the ws-compare-linux `bench/`; ten rounds after a discarded warm-up (startup thirty), the implementations alternating, the Clojure warm column the median of ten calls after twenty in one JVM; every workload on its first attempt, below the load limit of 4; every answer equal; raw results kept with the run (`results.json`, `src/`). The durability of each system from `strace -f` of 200 one-datom transactions on the same host |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
 | §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |

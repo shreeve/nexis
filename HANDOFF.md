@@ -406,15 +406,22 @@ after numbers in the commit message.
 
 1. A store carried between macOS and Linux (§6.4); CI runs the gate on
    both.
-2. Performance against babashka (`docs/PERF.md` §3.11, §3.13,
-   §3.14): nexis is ahead on every row, the eager
+2. Performance (`docs/PERF.md` §3.11, §3.13–§3.15). On the Apple
+   host nexis is ahead of babashka on every row, the eager
    `map`/`filter`/`reduce` pipeline at 0.76× with 195 MB against
    212 MB (§3.14), and holds more memory than babashka only in `sort`
-   (§6, "`sort`'s buffers"); Nextomic is ahead
-   of Datalevin on every phase with a store 3.1× the size. The levers
-   are `docs/PERF.md` §6 (generational collection, store size, a
-   keyword lookup instruction). Rerun
-   `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12) before
-   and after.
+   (§6, "`sort`'s buffers"). On the Linux host (§3.15) it trails
+   babashka on vectors, string splitting and the pipeline, and warm
+   JVM Clojure on eight of ten programs (1.5–16×, `fib` and
+   destructuring worst), level on `sort` and `frequencies`/`group-by`;
+   it starts 43× sooner than `clojure -M` and holds 1.6–22× less
+   memory. Nextomic is
+   ahead of Datalevin, Datomic Local and Datomic Pro on every phase
+   timed cold, trails a warm Datomic Pro peer on point lookups (1.18×),
+   and its store is the largest: 3.3× Datalevin's, 7.6× Datomic
+   Pro's. The levers are `docs/PERF.md` §6 (store size, generational
+   collection, a keyword lookup instruction).
+   Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
+   before and after.
 3. The open design questions, each an amendment first: laziness
    (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).

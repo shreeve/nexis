@@ -1,5 +1,5 @@
 ; bench/compare/prelude.nx — prepended to every lang/*.clj body for
-; nexis (docs/BENCH.md §12). prelude.bb.clj is its babashka twin; the
+; nexis (docs/BENCH.md §12). prelude.clj is its Clojure twin; the
 ; two differ only in the clock, the string namespace and split's
 ; separator (nexis has no regex, so split takes a string).
 (require '[nexis.string :as s])
