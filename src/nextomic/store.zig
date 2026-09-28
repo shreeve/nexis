@@ -737,39 +737,15 @@ pub const Store = struct {
         }
     };
 
-    /// Share of 2^64 that picks the datoms of the first pass (55 %).
-    const first_pass_share: u64 = 0x8CCC_CCCC_CCCC_CCCD;
-
     /// Write one index's share of a batch to its current or history
-    /// tree (NEXTOMIC.md §2.5). emdb splits a full leaf in half unless
-    /// the new key follows every key on it, when it keeps nine tenths
-    /// on the left. Keys past the tree's last key are appended in
-    /// order and fill their leaves. The rest land between existing
-    /// keys, where writing them in order would leave every leaf behind
-    /// half full: they go in two ascending passes, the first over about
-    /// 55 % of them spread evenly by Fibonacci hashing of the rank, so
-    /// the half-full leaves the first pass leaves behind take the
-    /// second pass's keys between their own.
+    /// tree in ascending key order (NEXTOMIC.md §2.5). emdb takes an
+    /// ascending run of puts without a descent wherever it lands in the
+    /// tree and splits a leaf the run fills right-biased, so the run
+    /// leaves its leaves about nine tenths full, between existing keys
+    /// as at the tree's end.
     fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool) !void {
-        const tree = if (history) self.trees.hist(w.index) else self.trees.cur(w.index);
         var buf: [key.max_key_len]u8 = undefined;
-        var tail = w.sorted.len;
-        {
-            var c = try txn.openCursorForTree(tree);
-            if (c.last()) |last| {
-                while (tail > 0 and std.mem.order(u8, w.keyAt(&buf, tail - 1, history), last.key) == .gt) tail -= 1;
-            } else tail = 0;
-        }
-        inline for (.{ true, false }) |first| {
-            var in_first = true;
-            for (0..tail) |r| {
-                // Equal keys stay in one pass, in batch order.
-                if (r == 0 or !std.mem.eql(u8, w.keys.at(w.sorted[r]), w.keys.at(w.sorted[r - 1])))
-                    in_first = @as(u64, r) *% 0x9E37_79B9_7F4A_7C15 < first_pass_share;
-                if (in_first == first) try self.writeOne(txn, w, r, history, &buf);
-            }
-        }
-        for (tail..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf);
+        for (0..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf);
     }
 
     fn writeOne(self: *Store, txn: *Txn, w: TreeWrite, r: usize, comptime history: bool, buf: *[key.max_key_len]u8) !void {
