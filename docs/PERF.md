@@ -57,7 +57,7 @@ the §3 rows.
 | 10 | Transients | node-owner in-place edit | node-owner in-place edit, the token in an internal node's header (`docs/TRANSIENT.md`) | parity | §3.3 | measured |
 | 11 | GC | generational (G1, ZGC) | precise non-moving mark-sweep (`docs/GC.md` §1) | behind under allocation churn | — | not measured |
 | 12 | Allocator | TLAB bump pointer | `VM.heap` over size-class slabs with free lists, no per-block prefix (`docs/HEAP.md` §2) | behind on construction | §3.2 | measured |
-| 13 | Dispatch | JIT inline caches | threaded code: each handler tail-calls the next through a table indexed by opcode, the hot variants with handlers of their own (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8, §3.12 | measured |
+| 13 | Dispatch | JIT inline caches | threaded code: each handler tail-calls the next through a table indexed by opcode, the hot variants with handlers of their own (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8, §3.12, §3.13 | measured |
 | 14 | Durable state | no stdlib primitive | emdb memory-mapped B+ tree (`docs/DB.md`) | lower latency than an out-of-process store | §3.6 | measured |
 | 15 | Serialization | EDN text, Nippy | binary, LEB128 and ZigZag (`docs/CODEC.md`) | smaller, faster than text | §3.5 | measured |
 | 16 | Concurrency tax | CAS and STM throughout | single isolate, single writer | none paid, by design | — | by design |
@@ -72,8 +72,8 @@ the §3 rows.
 ## 3. Measured rows
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
-§3.6's second column, §3.7 and §3.8 on an Apple M5; §3.9 through
-`bin/nexis`. Every row is ReleaseFast.
+§3.6's second column, §3.7, §3.8, §3.12 and §3.13 on an Apple M5;
+§3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
 section says otherwise.
@@ -373,11 +373,11 @@ What the rows say:
   destructuring, the map build, vector `conj`/`nth` and string
   splitting.
 - The pipeline (`map`/`filter`/`reduce` over a million maps) is 1.15×
-  babashka's. Its sequences are eager here, lazy and chunked in
-  babashka (`docs/BENCH.md` §12); its cost is the filter's closure
-  call per element and the collector re-marking the million live maps
-  (§6, the collector's trigger). Its resident set and `sort`'s are the
-  two above babashka's; every other row holds less.
+  babashka's in this table and 0.79× in §3.13's. Its sequences are eager here, lazy and chunked in
+  babashka (`docs/BENCH.md` §12); no collection runs in its timed
+  phase, whose cost was the calls each element makes (§3.13). Its
+  resident set and `sort`'s are the two above babashka's; every other
+  row holds less.
 - Nextomic is ahead of Datalevin on every phase: creating, opening,
   loading, lookups, joins, aggregates, pull and small transactions.
 - The default-commit rows compare different guarantees. A default
@@ -436,10 +436,10 @@ setup's subtracted, median of five or seven) are the steadier figure.
 | string build and split, 1 MB | 50.8 ms | 30.5 ms | 22.6 ms | 1.35 | 133 → 47 MB | 1.23 G → 0.66 G |
 | destructuring loop | 358 ms | 372 ms | 309 ms | 1.20 | 25 → 25 MB | 10.63 G → 10.30 G |
 
-The pipeline's remaining cost is the filter's closure call per
-element and the collector re-marking the million live maps; the
-destructuring loop's is the VM's calls and the two literals it
-allocates per iteration.
+The pipeline's remaining cost was the calls each element makes
+(§3.13; no collection runs in its timed phase); the destructuring
+loop's is the VM's calls and the two literals it allocates per
+iteration.
 
 **Collections and the heap.** The collection rows rerun on the tree
 with the size-class slabs, in-place transients, native `frequencies`
@@ -504,12 +504,75 @@ second.
 | map/filter/reduce over 1M maps | 105, 71.6 ms | 51.6, 65.2 ms | 45.4, 59.7 ms | 1.14, 1.09 |
 
 nexis is ahead on calls (`fib`), loops, destructuring and `sort`, and
-within about 10 % of babashka on the map build and the pipeline,
-whose remaining cost is allocation and the collector (§3.11). Every
-answer matched in every run. The destructuring loop still calls `+`
+within about 10 % of babashka on the map build, whose remaining cost
+is allocation and the collector (§3.11), and on the pipeline, whose
+cost was its per-element calls (§3.13). Every answer matched in every
+run. The destructuring loop still calls `+`
 with five arguments through its Var and `get`, `nth`, `nthnext` and
 `count` as natives; a native call costs a `var:load-var`, the moves
 into its block and one `call:call`.
+
+### 3.13 Calls from natives, Apple M5
+
+Before and after four changes to what a sequence native pays per
+element (`docs/VM.md` §6 "Repeated calls", §8, §10.3; `docs/LIST.md`
+§1): a keyword or symbol callee looks itself up in place in
+`call:call`; `map`, `filter`, `remove`, `keep` and `reduce` prepare
+their callback once (`vm.Callback`); a vector or a list is stepped,
+and a root pushed, inline in the native's loop; `+` of two fixnums,
+`inc`, `dec`, `even?` and `odd?` of one compute inline. The tree at
+`a712a24` and the ws-pipeline-calls head, one ReleaseFast build of
+each. Provenance: §11.
+
+Where the pipeline's timed phase went, in instructions retired
+(`/usr/bin/time -l`, each stage's program minus the one before it,
+median of five): the filter's closure call through `callValue` cost
+about 190 instructions a row before its body ran; `(:group row)` in
+that body, the general call path (the arguments copied, the overflow
+snapshot, `callLookupIn`, a safe point), about 470; `even?` 130; and
+the walk, the push of each kept row and the result about 180. No
+collection runs in the phase: the setup's last cycle leaves 134 MB
+live, and the phase allocates less than that before the next is due.
+
+| Stage | Before | After |
+|---|---:|---:|
+| `(filter (fn [row] (even? (:group row))))`, 1M rows | 964 M | 683 M |
+| `(map :score)`, 500k rows | 141 M | 94 M |
+| `(map inc)`, 500k | 125 M | 64 M |
+| `(reduce +)`, 500k | 107 M | 57 M |
+| the timed phase | 1,338 M | 898 M |
+
+Against babashka, `bench/compare/run.clj --n 10 --max-load 6
+--no-build --workloads pipeline,fib,loop,destructure` (`docs/BENCH.md`
+§12): two runs per build, after, before, after, before; each cell is
+a run's median time inside the process, the first run then the
+second, with the load average at each run's start.
+
+| Workload | nexis before | nexis after | babashka | ratio before | ratio after |
+|---|---:|---:|---:|---:|---:|
+| map/filter/reduce over 1M maps | 49.6, 52.8 ms | 33.9, 33.7 ms | 42.5–47.3 ms | 1.16, 1.12 | 0.80, 0.79 |
+| fib 30 | 46.7, 58.1 ms | 51.1, 46.9 ms | 102–125 ms | 0.46, 0.46 | 0.45, 0.46 |
+| loop/recur, 1M | 13.4, 15.6 ms | 14.7, 13.4 ms | 57.9–65.1 ms | 0.23, 0.24 | 0.23, 0.22 |
+| destructuring loop | 190, 204 ms | 208, 188 ms | 302–340 ms | 0.61, 0.62 | 0.61, 0.62 |
+| load average at the start | 5.8, 4.1 | 14.2 (each workload waited for it to fall below 6), 4.8 | | | |
+
+The pipeline's resident set is 238 MB both ways. The other rows move
+with the load, babashka's with them, and their ratios do not move.
+The harness's `vm` rows, five invocations of `zig build bench
+-Doptimize=ReleaseFast -- --filter vm` per build, alternating, the
+best 30-sample median with the spread of the five:
+
+| Row | Before | After |
+|---|---:|---:|
+| `vm_loop_10k` | 56.53 μs [56.5–203.6] | 57.39 μs [57.4–99.7] |
+| `vm_global_call_10k` | 143.55 μs [143.6–333.6] | 142.51 μs [142.5–161.0] |
+| `vm_keyword_get_10k` (`(:k m)`, 12-entry map) | 230.92 μs [230.9–434.8] | 172.77 μs [172.8–199.7] |
+
+What is left of the pipeline's phase is the closure body's six
+dispatches per row (`var:load-var`, `mov:load-const`, `mov:move`, two
+`call:call`, `call:return`; about a third of the samples in a
+`sample` profile), the loop's entry and exit for each callback, and
+the first touch of each row's map (`mapGet`, about an eighth).
 
 ## 6. Levers and dead ends
 
@@ -576,6 +639,11 @@ Each lever is a measured change: a before/after from `zig build bench`
   (f)] (g x))` computes `x` into its slot and moves it into `g`'s
   block; computing it into the block directly saves the move for each
   binding used once, as an argument, by the body's call.
+- **A keyword lookup instruction**: `(:k x)` with a constant keyword
+  is `mov:load-const`, `mov:move` and `call:call`, three dispatches
+  for what §3.13's in-place lookup does in one; one instruction
+  naming the keyword constant and the operand would drop two, at the
+  cost of an opcode (an amendment of VM.md §10).
 - **A compare-and-branch instruction**: an `if` on `(< i n)` is
   `cmp:lt` into a slot and `jump:if-false` on it, which the dispatch
   runs as one (`docs/VM.md` §8, §3.12). One encoded instruction would
@@ -603,7 +671,38 @@ Each lever is a measured change: a before/after from `zig build bench`
   under 3× the kept set after (the `eval_pipeline` test); §3.11's
   vector row 150 → 100 MB and 64.7 → 57.2 ms.
 
+- *Calls from natives* (§3.13): a keyword or symbol callee looking
+  itself up in place in `call:call` (`docs/VM.md` §8), a sequence
+  native's callback prepared once (`vm.Callback`, VM.md §6), a vector
+  or list stepped and a root pushed inline in the native's loop, and
+  `+`, `inc`, `dec`, `even?` and `odd?` on fixnums inline (VM.md
+  §10.3). The pipeline's timed phase 1,338 M → 898 M instructions and
+  49.6, 52.8 → 33.9, 33.7 ms against babashka's 42.5–47.3 ms, ratio
+  1.16, 1.12 → 0.80, 0.79;
+  `vm_keyword_get_10k` 230.9 → 172.8 μs. Each step alone, the phase's
+  instructions and its median of ten alternating runs of the
+  pipeline: the keyword lookup 1,343 → 1,142 M and 52.6 → 46.2 ms
+  (load 18), the prepared callback 1,136 → 1,039 M and 47.4 →
+  42.5 ms (load 3), the inline walk and push 1,043 → 938 M and 43.6 →
+  40.3 ms (load 5), the arithmetic 951 → 874 M and 37.6 → 34.2 ms
+  (load 7).
+
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
+
+- *Prefetching a vector leaf's heap elements* when the cursor loads
+  the leaf, so the pipeline's first touch of each row's map (§3.13)
+  would find it in flight: the phase's median 38.2 → 40.3 ms and
+  40.5 → 43.9 ms over two runs of ten, alternating. The maps were
+  allocated in order and the hardware's own prefetch already follows
+  them; 32 prefetches at each leaf only add traffic.
+- *Hot handlers with a check-free fast path*: `mov:move`,
+  `mov:load-const` and `var:load-var` testing their common operand
+  kinds in one branch and handing everything else to the general
+  handler. The pipeline's phase 876 → 854 M instructions, its median
+  40.7 → 39.5 ms at a load of 17, inside the spread. The compiler
+  inlines the general handler back and keeps the stack frame the fast
+  path was meant to drop; a handler without one needs the slow path
+  out of line, which a constant function pointer does not ensure.
 
 - *Keeping the switch loop's frame pointer across instructions*, the
   fetch re-deriving it only after a group that can change `frames`:
@@ -693,3 +792,4 @@ is one invocation's 30-sample median.
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
 | §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
+| §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
