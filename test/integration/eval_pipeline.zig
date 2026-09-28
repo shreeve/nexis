@@ -908,6 +908,12 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(defn g [a b & r] a) (g 1)", .err = vm.VmError.ArityMismatch, .detail = "g takes at least 2 arguments, got 1" },
         .{ .src = "(first 1 2)", .err = vm.VmError.ArityMismatch, .detail = "first takes 1 argument, got 2" },
         .{ .src = "(mapv (fn [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 2 arguments, got 1" },
+        .{ .src = "(map (fn f [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "f takes 2 arguments, got 1" },
+        .{ .src = "(filter (fn [] true) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
+        .{ .src = "(reduce inc [1 2])", .err = vm.VmError.ArityMismatch, .detail = "inc takes 1 argument, got 2" },
+        .{ .src = "(reduce (fn h [a] a) 0 [1])", .err = vm.VmError.ArityMismatch, .detail = "h takes 1 argument, got 2" },
+        .{ .src = "(filter 5 [1])", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
+        .{ .src = "(reduce + [1 \"a\"])", .err = vm.VmError.KindMismatch, .detail = "" },
         .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
         .{ .src = "(map \"s\" [1])", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
         .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
@@ -4545,6 +4551,22 @@ test "keyword-as-function: keywords passed to higher-order functions" {
     try expectOutput("(every? :ok [{:ok 1} {:ok 2}])", "true");
     try expectOutput("((comp :b :a) {:a {:b 4}})", "4");
     try expectOutput("((partial :a) {:a 5})", "5");
+}
+
+test "map, filter and reduce call their function once per element as a call in place would" {
+    // Closures, capturing or not, variadic, throwing and catching,
+    // nested, called at every depth of a recursion; keywords and
+    // symbols over every receiver; leaf natives past the fixnum range
+    // (VM.md §6, "Repeated calls").
+    try expectOutput("(let [n 10] [(map (fn [x] (+ x n)) [1 2 3]) (filter (fn [x] (> x n)) [5 15 25]) (reduce (fn [a x] (+ a x n)) 0 [1 2])])", "[(11 12 13) (15 25) 23]");
+    try expectOutput("[(map (fn [& xs] xs) [1 2]) (map (fn [x & more] [x more]) [1]) (reduce (fn [& xs] (vec xs)) [1 2 3])]", "[((1) (2)) ([1 nil]) [[1 2] 3]]");
+    try expectOutput("[(try (map (fn [x] (throw x)) [1 2]) (catch any e [:caught e])) (map (fn [x] (try (throw x) (catch any e (* e 10)))) [1 2 3])]", "[[:caught 1] (10 20 30)]");
+    try expectOutput("[(try (reduce (fn [a x] (if (= x 3) (throw [:at a]) (+ a x))) [1 2 3 4]) (catch any e e)) (filter (fn [x] (try (odd? x) (catch any e false))) [1 2 :a 3])]", "[[:at 3] (1 3)]");
+    try expectOutput("(map (fn [xs] (reduce + (map inc (filter odd? xs)))) [[1 2 3] [] [5]])", "(6 0 6)");
+    try expectOutput("(do (defn walk [n] (if (zero? n) 0 (reduce + (map (fn [_] (walk (dec n))) [1 2])))) (walk 10))", "0");
+    try expectOutput("(do (defrecord R [a]) [(map :a [{:a 1} nil 5 #{:a} [1] (sorted-map :a 2) (->R 3) (transient {:a 4})]) (filter 'a [{'a 1} {} nil #{'a}]) (reduce :a {:a 1} [2])])", "[(1 nil nil :a nil 2 3 4) ({a 1} #{a}) 1]");
+    try expectOutput("[(map inc [140737488355327 -1 1.5]) (reduce + [140737488355327 1 2]) (filter even? [140737488355328 3 -2])]", "[(140737488355328 0 2.5) 140737488355330 (140737488355328 -2)]");
+    try expectOutput("[(map {:a 1} [:a :b]) (filter #{2} [1 2]) (map first [[1] [2 3]]) (reduce max [3 9 2]) (reduce conj [] '(1 2))]", "[(1 nil) (2) (1 2) 9 [1 2]]");
 }
 
 test "symbol-as-function: a symbol looks itself up as a keyword does" {

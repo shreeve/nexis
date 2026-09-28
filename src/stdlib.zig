@@ -1270,7 +1270,9 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 /// scope, the stack guard and the deep-data check `VM.callValue` puts
 /// around a call have nothing to do. Everything else goes through
 /// `callValue`, which calls a leaf native as directly
-/// (`NativeFn.leaf`).
+/// (`NativeFn.leaf`). `map`, `filter`, `remove`, `keep` and `reduce`,
+/// which call one function once per element with one argument count,
+/// call it through a `vm_mod.Callback` instead (VM.md §6).
 fn callBack(vm: *VM, f: Value, args: []const Value) VmError!Value {
     if (f.kind() == .keyword and args.len == 1) switch (args[0].kind()) {
         .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
@@ -1315,7 +1317,8 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 fn mapInto(vm: *VM, f: Value, colls: []const Value, scope: vm_mod.RootScope) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
-        while (try it.next()) |x| try scope.push(try callBack(vm, f, &.{x}));
+        var cb = vm_mod.Callback.init(vm, f, 1);
+        while (try it.next()) |x| try scope.push(try cb.call(&.{x}));
         return;
     }
 
@@ -1340,8 +1343,9 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[args.len - 1];
     var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
+    var cb = vm_mod.Callback.init(vm, f, 2);
     while (try it.next()) |x| {
-        acc = try callBack(vm, f, &.{ acc, x });
+        acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
     }
     return acc;
@@ -1419,8 +1423,9 @@ fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
 /// once kept; one dropped is garbage.
 fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, scope: vm_mod.RootScope) VmError!void {
     var it = try makeSeqIter(vm, coll);
+    var cb = vm_mod.Callback.init(vm, pred, 1);
     while (try it.next()) |x| {
-        const r = try callBack(vm, pred, &.{x});
+        const r = try cb.call(&.{x});
         const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
             .keep_falsy => if (r.isTruthy()) null else x,

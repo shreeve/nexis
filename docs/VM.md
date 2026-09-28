@@ -257,6 +257,25 @@ and the direct call, so a protocol fn passed to `map` behaves as it
 does in call position. `VM.runRoutine` runs a routine to completion
 the same way (the loader and `eval`).
 
+**Repeated calls.** A native that calls one callee once per element
+with the same argument count (`map` over one collection, `filter`,
+`remove`, `keep`, `reduce`) calls it through a `vm.Callback`, which
+makes at its first call the decisions `callValue` makes at every one
+and cannot change between calls from the same place: the callee's
+kind, its arity against the count, and for a closure the stack guard
+(§13.1), the frame cap and the room the frame chain and the stack
+need, since every call starts from the frame depth and stack length
+the first one found. Each later call of a closure writes the
+arguments and nil locals into the window at that stack length, pushes
+the frame built at the first call and runs the loop to its return; a
+call that finds the depth or the length changed goes through
+`callValue`. A leaf native is called as `callValue` calls it, and a
+keyword or symbol given one argument that is a map, a record or nil
+looks itself up in place (§8); any other callee, and any callee whose
+arity the count does not fit, goes through `callValue` every time, so
+the results, errors, error details, traces and rooting are
+`callValue`'s.
+
 **Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
 never re-enters the VM and never compares, hashes or prints nested
 data (arithmetic, numeric predicates, `nth`), so nothing under it can
@@ -818,9 +837,11 @@ stack, so a VM created on any thread checks against its own stack:
   16 MiB margin for unguarded leaf calls.
 
 The VM checks on entry to `callValue` and `runRoutine`, the two ways
-a native re-enters it, so recursion through `apply`, `map`, `reduce`,
-a protocol impl or `eval` ends in the same catchable `:stack-overflow`
-as runaway bytecode recursion. Each layer maps the error to its own
+a native re-enters it, and at the first call of a closure through a
+`Callback` (§6), whose later calls start from the same native frame,
+so recursion through `apply`, `map`, `reduce`, a protocol impl or
+`eval` ends in the same catchable `:stack-overflow` as runaway
+bytecode recursion. Each layer maps the error to its own
 report: the VM raises `StackOverflow`, the reader a reader error and
 the compiler a compile error. The codec and the collector walk nested
 data with heap stacks and need no guard.

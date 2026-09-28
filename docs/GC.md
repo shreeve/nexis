@@ -256,7 +256,10 @@ stack: a native that calls natives in a loop (`(reduce conj #{} xs)`)
 reaches no closure frame, and without it would run to its end without
 collecting. A native keeps what it holds across `callValue` on its
 root scope already (§11.5), so a cycle there frees nothing live
-either; a leaf native (`docs/VM.md` §6) is called without it.
+either; a leaf native (`docs/VM.md` §6) is called without it, and so
+is a keyword or symbol a `Callback` looks up in a map, a record or nil
+(neither allocates). A `Callback`'s call of a closure reaches the
+loop's entry, the first safe point, as `callValue`'s does.
 `Heap.alloc` never collects: the compiler, a native and one instruction
 (a rest list, a closure and its cells) allocate as many blocks as they
 like with no rooting, and what one instruction allocates is in a slot
