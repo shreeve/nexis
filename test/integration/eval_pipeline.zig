@@ -3073,8 +3073,9 @@ fn expectSyncs(name: []const u8, steps: []const struct { []const u8, []const u8,
 
 test "db/open: a commit syncs nothing unless the connection is :durable; db/sync and db/close sync once" {
     try expectSyncs("durability", &.{
+        // Creating the file syncs its first state before open returns.
+        .{ "(do (def c (db/open \"@STORE@\" {:durability :commit})) nil)", "nil", null },
         .{
-            \\(def c (db/open "@STORE@" {:durability :commit}))
             \\(def d (db/open "@STORE@" {:durability :durable}))
             \\(def r (db/ref c :t :k))
             \\(do (db/put-key! r 1) (with-tx [tx c] (db/put! tx r 2)) [(db/get-key (db/ref d :t :k)) (db/delete-key! (db/ref c :t :j))])
