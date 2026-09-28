@@ -1388,6 +1388,93 @@ pub const DynSave = struct {
     bound: bool,
 };
 
+/// One callee a native calls many times with the same number of
+/// arguments from the same place (`map`, `filter`, `reduce`, ...):
+/// `VM.callValue` with what cannot change between those calls decided
+/// at the first one (VM.md §6, "Repeated calls"). Each call has
+/// `callValue`'s effect, errors and rooting.
+pub const Callback = struct {
+    vm: *VM,
+    callee: Value,
+    argc: u16,
+    mode: Mode = .unprepared,
+    /// For `.closure`: the frame chain's depth and the stack's length
+    /// at the first call, which every later call from the same native
+    /// finds again, and the frame each call pushes.
+    depth: usize = 0,
+    base: usize = 0,
+    frame: Frame = undefined,
+
+    const Mode = enum { unprepared, general, leaf, lookup, closure };
+
+    pub fn init(vm: *VM, callee: Value, argc: u16) Callback {
+        return .{ .vm = vm, .callee = callee, .argc = argc };
+    }
+
+    /// `callee` applied to `args`, of which there are `argc`.
+    pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
+        std.debug.assert(args.len == self.argc);
+        switch (self.mode) {
+            .leaf => return asNativeFn(self.callee).call(self.vm, args),
+            .lookup => switch (args[0].kind()) {
+                .nil => return value_mod.nilValue(),
+                .persistent_map => return mapLookup(args[0], self.callee, value_mod.nilValue()),
+                .record => return mapLookup(record_mod.fieldsOf(args[0]), self.callee, value_mod.nilValue()),
+                else => {},
+            },
+            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
+            .unprepared => return self.prepare(args),
+            .general => {},
+        }
+        return self.vm.callValue(self.callee, args);
+    }
+
+    /// The first call: choose the mode, then make the call.
+    fn prepare(self: *Callback, args: []const Value) VmError!Value {
+        const vm = self.vm;
+        self.mode = .general;
+        switch (self.callee.kind()) {
+            .native_fn => {
+                const native = asNativeFn(self.callee);
+                if (native.leaf and self.argc >= native.min_arity and self.argc <= (native.max_arity orelse self.argc)) self.mode = .leaf;
+            },
+            .keyword, .symbol => if (self.argc == 1) {
+                self.mode = .lookup;
+            },
+            .function => closure: {
+                const closure = VM.asClosure(self.callee);
+                const routine = closure.routine;
+                if (routine.variadic or self.argc != routine.fixed_arity or closure.upvalues.len != routine.upvalue_count or routine.slot_count < self.argc) break :closure;
+                // Every later call starts at this depth of the native
+                // stack, so the guard's answer holds for them all
+                // (§13.1).
+                stack_guard.check() catch return VmError.StackOverflow;
+                const depth = vm.frames.items.len;
+                const base = vm.stack.items.len;
+                const window_end = base + routine.slot_count;
+                if (depth >= vm.max_frames) break :closure;
+                vm.frames.ensureUnusedCapacity(vm.allocator, 1) catch return VmError.OutOfMemory;
+                vm.stack.ensureTotalCapacity(vm.allocator, window_end) catch return VmError.OutOfMemory;
+                if (depth + 1 > vm.frame_high_water) vm.frame_high_water = depth + 1;
+                if (window_end > vm.stack_high_water) vm.stack_high_water = window_end;
+                self.depth = depth;
+                self.base = base;
+                self.frame = .{
+                    .routine = routine,
+                    .base_slot = @intCast(base),
+                    .entry_stack_len = @intCast(base),
+                    .slot_count = routine.slot_count,
+                    .upvalues = closure.upvalues,
+                    .closure = self.callee,
+                };
+                self.mode = .closure;
+            },
+            else => {},
+        }
+        return self.call(args);
+    }
+};
+
 /// A window on the VM's root stack for a native that keeps values
 /// across a call back into the VM: `push` what must survive a
 /// collection, `release` (normally deferred) drops everything the
@@ -1396,8 +1483,12 @@ pub const RootScope = struct {
     vm: *VM,
     base: usize,
 
-    pub fn push(self: RootScope, v: Value) VmError!void {
-        self.vm.roots.append(self.vm.allocator, v) catch return VmError.OutOfMemory;
+    /// Push `v`; within the root stack's capacity, in the caller's
+    /// loop.
+    pub inline fn push(self: RootScope, v: Value) VmError!void {
+        const roots = &self.vm.roots;
+        if (roots.items.len < roots.capacity) return roots.appendAssumeCapacity(v);
+        roots.append(self.vm.allocator, v) catch return VmError.OutOfMemory;
     }
 
     pub fn pushAll(self: RootScope, vs: []const Value) VmError!void {
@@ -2190,6 +2281,28 @@ pub const VM = struct {
         }
         try self.loop(depth);
         // Back at `depth` without a return: a throw went past us.
+        if (!result_cell.done) return VmError.ControlTransferred;
+        return result_cell.value;
+    }
+
+    /// A `Callback`'s call of its closure, from the depth and stack
+    /// length it was prepared at: the arguments go where the window
+    /// begins, the locals start nil, the prepared frame is pushed and
+    /// the loop runs until it returns, as `callValue` does.
+    fn callPrepared(self: *VM, cb: *const Callback, args: []const Value) VmError!Value {
+        const base = cb.base;
+        const slot_count = cb.frame.slot_count;
+        const window = self.stack.items.ptr[base..][0..slot_count];
+        for (args, window[0..args.len]) |arg, *slot| slot.* = arg;
+        nilSlots(window[args.len..]);
+        self.stack.items.len = base + slot_count;
+        var result_cell = HostCallResult{};
+        self.frames.items.len = cb.depth + 1;
+        const frame = &self.frames.items[cb.depth];
+        frame.* = cb.frame;
+        frame.host_result = &result_cell;
+        try self.loop(cb.depth);
+        // Back at the depth without a return: a throw went past us.
         if (!result_cell.done) return VmError.ControlTransferred;
         return result_cell.value;
     }
@@ -3151,9 +3264,10 @@ pub const VM = struct {
     /// `call:call`. The common calls run here: a closure called with
     /// its fixed arity where the frame chain and the stack have room,
     /// whose frame is pushed without allocating, so its callee starts
-    /// without a safe point; and a native within its arity. Every
-    /// other call, and every call that traps, goes through
-    /// `execCallCall`.
+    /// without a safe point; a native within its arity; and a keyword
+    /// or symbol looking itself up in a map, a record or nil, which
+    /// allocates nothing and is no safe point either. Every other
+    /// call, and every call that traps, goes through `execCallCall`.
     fn opCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         fast: {
             if (inst.a.kind != .slot or inst.c.kind != .slot) break :fast;
@@ -3201,6 +3315,23 @@ pub const VM = struct {
                     const caller = self.currentFrame();
                     self.slotAt(caller, inst.c.index).* = result;
                     return self.nextSafe(caller);
+                },
+                // `(:k m)`, `(:k m d)`, `('s m)` on a map, a record or
+                // nil: the lookup `callLookupIn` makes. An immediate
+                // key hashes and compares without the callbacks, so
+                // nothing is allocated and no data is walked.
+                .keyword, .symbol => {
+                    if (argc != 1 and argc != 2) break :fast;
+                    const target = self.stack.items[base];
+                    const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
+                    const result = switch (target.kind()) {
+                        .nil => default,
+                        .persistent_map => mapLookup(target, callee, default),
+                        .record => mapLookup(record_mod.fieldsOf(target), callee, default),
+                        else => break :fast,
+                    };
+                    self.slotAt(frame, inst.c.index).* = result;
+                    return self.next(frame);
                 },
                 else => break :fast,
             }
@@ -4468,6 +4599,7 @@ pub fn numSign(a: value_mod.Value) VmError!?std.math.Order {
 
 /// `even?` / `odd?`: integers only, as in Clojure.
 pub fn numEven(a: value_mod.Value) VmError!bool {
+    if (a.isFixnum()) return a.asFixnum() & 1 == 0;
     if (!isInteger(a)) return VmError.KindMismatch;
     return bignum_mod.isEven(a);
 }
@@ -6664,6 +6796,101 @@ test "VM dispatch: a leaf native reads its arguments in place and keeps its arit
     try vm.retargetTop(&short_routine);
     try testing.expectError(VmError.ArityMismatch, vm.run());
     try testing.expectEqualStrings("sub takes 2 arguments, got 1", vm.error_detail);
+}
+
+test "VM dispatch: a keyword or symbol called on a map or nil looks up in place, with no safe point" {
+    // [(:k m) (:other m 9) ('s m) (:k nil 7)] with a cycle due at every
+    // safe point: the loop's entry and the vector's construction
+    // collect, and none of the four lookups, which allocate nothing,
+    // is a safe point (§8, §9).
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    const k = try interner.internKeywordValue("k");
+    const other = try interner.internKeywordValue("other");
+    const s = try interner.internSymbolValue("s");
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    m = try champ_mod.mapAssoc(heap, m, s, fx(2), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    const code = [_]Inst{
+        asm_.loadConst(0, 0),
+        asm_.loadConst(1, 3),
+        asm_.callCall(0, 1, 5), // s5 = (:k m)
+        asm_.loadConst(0, 1),
+        asm_.loadConst(1, 3),
+        asm_.loadConst(2, 4),
+        asm_.callCall(0, 2, 6), // s6 = (:other m 9)
+        asm_.loadConst(0, 2),
+        asm_.loadConst(1, 3),
+        asm_.callCall(0, 1, 7), // s7 = ('s m)
+        asm_.loadConst(0, 0),
+        asm_.loadNil(1),
+        asm_.loadConst(2, 5),
+        asm_.callCall(0, 2, 8), // s8 = (:k nil 7)
+        Inst.primary(.coll, CollOp.vector, sl(5), Operand.slot(4), sl(0)),
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Value{ k, other, s, m, fx(9), fx(7) };
+    const routine = makeRoutine(&code, &consts, 9, "lookups");
+    try vm.retargetTop(&routine);
+    vm.gc_threshold = 0;
+    vm.gc_growth_percent = 0;
+    vm.gc_next_at = 0;
+    const result = try vm.run();
+    try testing.expectEqual(@as(usize, 2), vm.gc_cycles);
+    try testing.expectEqual(@as(usize, 4), vector_mod.count(result));
+    for ([_]i64{ 1, 9, 2, 7 }, 0..) |want, i| try testing.expectEqual(want, vector_mod.nth(result, i).asFixnum());
+}
+
+test "Callback: repeated calls have callValue's results, errors and frame bookkeeping" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    // (fn [x] (+ x 1)) with a local past its argument, entered through
+    // a prepared frame a thousand times.
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.move(2, 1), asm_.returnSlot(2) };
+    const inc_consts = [_]Value{fx(1)};
+    const inc_routine = Routine{ .code = &inc_code, .consts = &inc_consts, .slot_count = 3, .fixed_arity = 1, .name = "inc1" };
+    const inc_fn = try vm.allocClosure(&inc_routine, 0);
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    var cb = Callback.init(&vm, inc_fn, 1);
+    var i: i64 = 0;
+    while (i < 1000) : (i += 1) {
+        try testing.expectEqual(i + 1, (try cb.call(&.{fx(i)})).asFixnum());
+        try testing.expectEqual(frames, vm.frames.items.len);
+        try testing.expectEqual(stack, vm.stack.items.len);
+    }
+    try testing.expectEqual(frames + 1, vm.frame_high_water);
+    try testing.expect(vm.stack_high_water >= stack + inc_routine.slot_count);
+
+    // A closure of another arity, a leaf native given the wrong count
+    // and a non-callable fail as callValue fails, detail included.
+    var wrong = Callback.init(&vm, inc_fn, 2);
+    try testing.expectError(VmError.ArityMismatch, wrong.call(&.{ fx(1), fx(2) }));
+    try testing.expectEqualStrings("inc1 takes 1 argument, got 2", vm.error_detail);
+    var leaf_short = Callback.init(&vm, nativeFnValue(&dispatch_test_natives.native_sub), 1);
+    try testing.expectError(VmError.ArityMismatch, leaf_short.call(&.{fx(1)}));
+    try testing.expectEqualStrings("sub takes 2 arguments, got 1", vm.error_detail);
+    var number = Callback.init(&vm, fx(5), 1);
+    try testing.expectError(VmError.NotCallable, number.call(&.{fx(1)}));
+    try testing.expectEqualStrings("an integer is not callable", vm.error_detail);
+
+    // A leaf native, and a keyword over every kind of receiver.
+    var sub = Callback.init(&vm, nativeFnValue(&dispatch_test_natives.native_sub), 2);
+    try testing.expectEqual(@as(i64, 42), (try sub.call(&.{ fx(50), fx(8) })).asFixnum());
+    try testing.expectEqual(@as(i64, -1), (try sub.call(&.{ fx(1), fx(2) })).asFixnum());
+    const k = try vm.ensureInterner().internKeywordValue("k");
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    var set = try champ_mod.setEmpty(heap);
+    set = try champ_mod.setConj(heap, set, k, &dispatch_mod.hashValue, &dispatch_mod.equal);
+    var get_k = Callback.init(&vm, k, 1);
+    try testing.expectEqual(@as(i64, 1), (try get_k.call(&.{m})).asFixnum());
+    try testing.expect((try get_k.call(&.{value_mod.nilValue()})).isNil());
+    try testing.expect((try get_k.call(&.{fx(5)})).isNil());
+    try testing.expectEqual(k, try get_k.call(&.{set}));
 }
 
 test "VM dispatch: a native's throw two loops deep reaches the handler below" {
