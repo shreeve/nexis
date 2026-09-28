@@ -214,7 +214,9 @@
                  (str/replace "@MODE@" mode))
         f (str src-dir "/" (str/replace script #"\.clj$" "") (when (= mode "nosync") "-nosync") ".clj")]
     (spit f code)
-    ["dtlv" "exec" code]))
+    ;; dtlv extracts its native libraries (JavaCPP) under ~/.javacpp
+    ;; unless told otherwise
+    ["dtlv" (str "-Dorg.bytedeco.javacpp.cachedir=" tmp-dir "/javacpp") "exec" code]))
 
 (defn pro-classpath []
   (let [d (:datomic-pro opts)]
@@ -294,7 +296,7 @@
                 (cond-> {:dir (or dir root)} env (assoc :extra-env env)))
         wall (- (System/nanoTime) t0)]
     {:label label
-     :cmd (let [c (vec cmd)] (if (= "exec" (get c 1)) ["dtlv" "exec" "<src>"] c))
+     :cmd (let [c (vec cmd)] (if (= "dtlv" (first c)) (conj (pop c) "<src>") c))
      :exit (:exit r)
      :wall_ns wall
      :max_rss_bytes (max-rss (:err r))

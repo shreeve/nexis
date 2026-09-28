@@ -315,7 +315,9 @@ average (`vm.loadavg`, `/proc/loadavg`) to fall under `--max-load` (4)
 before a workload, and a workload during which it rose above that is
 discarded and repeated, up to three attempts, all kept in the JSON.
 `DIR/results.md` is the table, `DIR/results.json` every run, and
-`DIR/src/` the exact programs.
+`DIR/src/` the exact programs. `dtlv` runs with
+`-Dorg.bytedeco.javacpp.cachedir` under `TMPDIR`, so the native
+libraries it extracts land there and not under the home directory.
 
 **The JVM runs.** Every JVM runs with the JDK's defaults (G1, the heap
 sized from the RAM) plus `-XX:-UsePerfData` and `-Djava.io.tmpdir` set
