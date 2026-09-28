@@ -208,6 +208,10 @@ unset (`bin/nexis` refuses any other value at start, `docs/TOOLING.md`
 §1). Nextomic's `connect` takes the same option, and `transact!` a
 per-transaction `:sync` (`docs/NEXTOMIC.md` §3).
 
+Creating a file syncs its first state before `db/open` returns (emdb
+writes and syncs a new file's meta pages), so a new store is on the
+disk whatever the durability; opening an existing file syncs nothing.
+
 `StoreFile` records whether a commit since the file's last sync went
 without one (`unsynced`). A commit that syncs data and meta makes
 every commit before it durable too, and clears it. The file is synced,

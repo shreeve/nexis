@@ -82,7 +82,7 @@ test "contagion: a float operand makes a bignum operation a float" {
     try expectOutput("(quot (* 2 " ++ fm ++ ") 2.0)", "1.40737488355327E14");
     try expectOutput("(mod (* 2 " ++ fm ++ ") 3.0)", "2.0");
     try expectOutput("(mod (- (* 2 " ++ fm ++ ")) 3.0)", "1.0");
-    try expectOutput("(/ (+ " ++ fm ++ " 1) 0.0)", "##Inf");
+    try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0.0) (catch any e e))", ":divide-by-zero");
     try expectOutput("(float? (* (* " ++ fm ++ " " ++ fm ++ ") 1e300))", "true");
 }
 
@@ -95,9 +95,9 @@ test "predicates over bignums" {
 }
 
 test "predicates: NaN is neither zero, positive nor negative; negative zero is zero" {
-    try expectOutput("(let [n (/ 0.0 0.0)] [(zero? n) (pos? n) (neg? n) (NaN? n)])", "[false false false true]");
+    try expectOutput("(let [n ##NaN] [(zero? n) (pos? n) (neg? n) (NaN? n)])", "[false false false true]");
     try expectOutput("[(zero? -0.0) (pos? -0.0) (neg? -0.0) (zero? 0.0) (pos? 1e-300) (neg? -1e-300)]", "[true false false true true true]");
-    try expectOutput("(let [i (/ 1.0 0.0)] [(pos? i) (neg? (- i)) (zero? i)])", "[true true false]");
+    try expectOutput("(let [i ##Inf] [(pos? i) (neg? (- i)) (zero? i)])", "[true true false]");
     try expectOutput("(try (zero? nil) (catch any e e))", ":kind-mismatch");
 }
 
@@ -109,8 +109,8 @@ test "conversions: long truncates a float toward zero at any size, double widens
     try expectOutput("[(long 140737488355328.0) (integer? (long 140737488355328.0)) (= (long 140737488355327.0) 140737488355327)]", "[140737488355328 true true]");
     try expectOutput("[(double 3) (double 1.5) (double 18446744073709551616) (double -140737488355328)]", "[3.0 1.5 1.8446744073709552E19 -1.40737488355328E14]");
     try expectOutput("(float? (double 18446744073709551616))", "true");
-    try expectOutput("(long (/ 0.0 0.0))", "0");
-    try expectOutput("(try (long (/ 1.0 0.0)) (catch any e e))", ":invalid-argument");
+    try expectOutput("(long ##NaN)", "0");
+    try expectOutput("(try (long ##Inf) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (long \"7\") (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (double nil) (catch any e e))", ":kind-mismatch");
 }
@@ -212,7 +212,7 @@ test "nexis.math: floor, ceil and round keep integers and convert floats" {
     try expectOutput("(nexis.math/round 1.0E20)", "100000000000000000000");
     try expectOutput("(nexis.math/floor 100000000000000000000)", "100000000000000000000");
     try expectOutput("(integer? (nexis.math/round 2.5))", "true");
-    try expectOutput("(try (nexis.math/round (/ 1.0 0)) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.math/round ##Inf) (catch any e e))", ":invalid-argument");
 }
 
 test "nexis.math: PI and E" {

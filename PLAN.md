@@ -809,3 +809,15 @@ entry stating the decision and its rationale.
   Clojure, a sorted collection has no transient. `docs/SORTED.md` is
   the authority; `docs/SEMANTICS.md` §3.3, `docs/CODEC.md` §2.8 and
   §3, and `docs/GC.md` §5 carry the rows.
+
+- **2026-09-28 — Division by a float zero raises.** Supersedes the
+  float clause of the 2026-09-18 doubles addendum: `/` by zero raises
+  the catchable `:divide-by-zero` whatever the operands' kinds, as
+  `quot`, `rem` and `mod` already did, and a NaN operand of `/` is its
+  result before the divisor is looked at. This is Clojure 1.12's
+  `Numbers.divide(Object, Object)`, the path of every operand whose
+  type its compiler does not know; nexis has no primitive operand
+  types, so it has no IEEE path. The infinities and NaN remain
+  reachable through overflow and the `##Inf`, `##-Inf` and `##NaN`
+  literals. `docs/SEMANTICS.md` §2.2, `docs/VM.md` §10 (`math:div`)
+  and `CLOJURE-REVIEW.md` §4.3 carry it.

@@ -57,7 +57,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 171/171 steps succeeded; 1364/1364 tests passed
+Build Summary: 171/171 steps succeeded; 1365/1365 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -65,14 +65,17 @@ steps; without it the count is 169 steps. It ran in 63 s wall (256 s
 CPU) from a warm cache on an Apple-silicon Mac shared with other
 builds. Any output besides the summary tree is a
 failure. The largest binaries are `unit` (680 inline tests) and
-`eval_pipeline` (459 programs).
+`eval_pipeline` (460 programs).
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request
 to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64;
 `zig fmt --check` over the tracked Zig files but the generated
 `src/parser.zig`, and `zig build parser-check` against a nexus built
 from `shreeve/nexus`; and a ReleaseFast job that runs a script, the
-benchmark suite once, and the static `x86_64-linux-musl` binary. Each
+benchmark suite once, and the static `x86_64-linux-musl` binary,
+built for x86-64-v2 (`-Dcpu=x86_64_v2`: SSE4.2 and POPCNT, so emdb's
+checksum instructions need no run-time probe; `check-targets` compiles
+at x86-64-v3 so emdb's AVX2 paths compile too). Each
 job checks nexis out into `nexis/` and emdb into `emdb/` beside it.
 emdb is private: the checkout reads it with the repository secret
 `EMDB_TOKEN`, a fine-grained personal access token whose one
@@ -304,11 +307,7 @@ failing test (AGENTS.md).
    `&env`** (§23 #34, §24 #13).
 2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
    design question, so an amendment comes first.
-3. **Float `/` by zero is IEEE** (`docs/SEMANTICS.md` §2.2): `(/ 1.0
-   0.0)` is `##Inf` where Clojure raises `ArithmeticException`. A
-   decision for the owner: Clojure's rule is one arm of `numDiv` and
-   the `numbers`/`eval_pipeline` rows that pin IEEE.
-4. **A routine holds at most 4096 live locals and 4096 captured
+3. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other

@@ -1503,7 +1503,7 @@ test "integration: format widths count characters, %.Ns truncates, fields are bo
     try expectOutput("(format \"[%3s|%-3s|%2s]\" \"é\" \"é\" \"日本\")", "[  é|é  |日本]");
     try expectOutput("(format \"%.2s|%.0s|%.9s|%5.1s|%.1s\" \"héllo\" \"x\" \"ab\" \"éa\" nil)", "hé||ab|    é|n");
     try expectOutput("(let [s (format \"%.400f\" 1e300)] [(count s) (subs s 0 3) (subs s 299 304)])", "[702 100 00.00]");
-    try expectOutput("(format \"%f %.2f %f %5.1f\" (/ 0.0 0.0) (/ 1.0 0.0) (/ -1.0 0.0) 1e-300)", "NaN Infinity -Infinity   0.0");
+    try expectOutput("(format \"%f %.2f %f %5.1f\" ##NaN ##Inf ##-Inf 1e-300)", "NaN Infinity -Infinity   0.0");
     try expectOutput("[(try (format \"%99999999999999999999d\" 1) (catch any e e)) (try (format \"%.99999999999999999999f\" 1.0) (catch any e e)) (try (format \"%2000000s\" \"\") (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
     try expectOutput("[(try (format \"%.2d\" 1) (catch any e e)) (try (format \"%.1x\" 1) (catch any e e)) (try (format \"%.1c\" \\a) (catch any e e))]", "[:invalid-argument :invalid-argument :invalid-argument]");
     try expectOutput("(count (format \"%1048576s\" \"\"))", "1048576");
@@ -3073,8 +3073,9 @@ fn expectSyncs(name: []const u8, steps: []const struct { []const u8, []const u8,
 
 test "db/open: a commit syncs nothing unless the connection is :durable; db/sync and db/close sync once" {
     try expectSyncs("durability", &.{
+        // Creating the file syncs its first state before open returns.
+        .{ "(do (def c (db/open \"@STORE@\" {:durability :commit})) nil)", "nil", null },
         .{
-            \\(def c (db/open "@STORE@" {:durability :commit}))
             \\(def d (db/open "@STORE@" {:durability :durable}))
             \\(def r (db/ref c :t :k))
             \\(do (db/put-key! r 1) (with-tx [tx c] (db/put! tx r 2)) [(db/get-key (db/ref d :t :k)) (db/delete-key! (db/ref c :t :j))])
@@ -4432,14 +4433,23 @@ test "numbers: float literals print like Clojure doubles" {
 }
 
 test "numbers: special floats" {
-    try expectOutput("(/ 1.0 0)", "##Inf");
-    try expectOutput("(/ -1.0 0)", "##-Inf");
-    try expectOutput("(/ 0.0 0.0)", "##NaN");
-    try expectOutput("(NaN? (/ 0.0 0.0))", "true");
+    try expectOutput("(* 2.0 1e308)", "##Inf");
+    try expectOutput("(- ##Inf)", "##-Inf");
+    try expectOutput("(- ##Inf ##Inf)", "##NaN");
+    try expectOutput("(NaN? (- ##Inf ##Inf))", "true");
     try expectOutput("(NaN? 1.5)", "false");
-    try expectOutput("(infinite? (/ 1.0 0))", "true");
+    try expectOutput("(infinite? (* 1e300 1e300))", "true");
     try expectOutput("(infinite? (/ 1 2))", "false");
-    try expectOutput("(let [n (/ 0.0 0.0)] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+    try expectOutput("(let [n ##NaN] [(= n n) (== n n) (< n 1) (> n 1)])", "[true false false false]");
+}
+
+test "numbers: / by zero raises for every kind of number; a NaN operand passes through" {
+    // Clojure's Numbers.divide(Object, Object): a NaN operand is the
+    // result, then any zero divisor raises (SEMANTICS.md §2.2).
+    try expectOutput("(map #(try (/ %1 %2) (catch any e e)) [1.0 -1.0 0.0 1 1.0 1 -0.0] [0 0 0.0 0.0 -0.0 0 0])", "(:divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero)");
+    try expectOutput("[(try (/ 0.0) (catch any e e)) (try (/ 6 2 0.0) (catch any e e)) (try (apply / [1.0 0.0]) (catch any e e)) (let [z 0.0] (try (/ 1.0 z) (catch any e e)))]", "[:divide-by-zero :divide-by-zero :divide-by-zero :divide-by-zero]");
+    try expectOutput("[(NaN? (/ ##NaN 0)) (NaN? (/ ##NaN 0.0)) (NaN? (/ 1.0 ##NaN)) (NaN? (/ 0 ##NaN)) (NaN? (apply / [##NaN 0.0]))]", "[true true true true true]");
+    try expectOutput("[(/ ##Inf 2) (/ 1.0 ##Inf) (/ -1 ##Inf) (/ 1.0 1e-320)]", "[##Inf 0.0 -0.0 ##Inf]");
 }
 
 test "numbers: the promoting and unchecked operators, num, float, ratio? and rational?" {
@@ -4457,7 +4467,7 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
 }
 
 test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
-    try expectOutput("[(= ##Inf (/ 1.0 0)) (= ##-Inf (/ -1.0 0)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
+    try expectOutput("[(= ##Inf (* 2 1e308)) (= ##-Inf (* -2 1e308)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
     try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
     // str of a bare float is Java's spelling; print and a collection, the reader's.
     try expectOutput("(pr-str [(str ##Inf) (str ##-Inf ##NaN) (str [##Inf]) (format \"%s\" ##NaN) (with-out-str (print ##Inf))])", "[\"Infinity\" \"-InfinityNaN\" \"[##Inf]\" \"NaN\" \"##Inf\"]");
@@ -4558,7 +4568,7 @@ test "numbers: float equality and hashing agree with SEMANTICS" {
     try expectOutput("(= 1.5 1.25)", "false");
     try expectOutput("(get {0.0 :zero} -0.0)", ":zero");
     try expectOutput("(get {1 :int} 1.0)", "nil");
-    try expectOutput("(let [n (/ 0.0 0.0)] (get {n :nan} (/ 0.0 0.0)))", ":nan");
+    try expectOutput("(let [n ##NaN] (get {n :nan} (- ##Inf ##Inf)))", ":nan");
     try expectOutput("(contains? #{1.5 2.5} 2.5)", "true");
     try expectOutput("(= [1.0 2.0] [1.0 2.0])", "true");
     try expectOutput("(= [1 2] [1.0 2.0])", "false");
@@ -5323,7 +5333,7 @@ test "typed vectors: constructors, type, printing and the generic natives" {
         .{ .src = "(i64-vector (range 5))", .expected = "#i64[0 1 2 3 4]" },
         .{ .src = "(f64-vector #{1})", .expected = "#f64[1.0]" },
         .{ .src = "(f64-vector (i64-vector [1 2]))", .expected = "#f64[1.0 2.0]" },
-        .{ .src = "(pr-str (f64-vector [10000000000.0 (/ 1.0 0) (/ -1.0 0)]))", .expected = "#f64[1.0E10 ##Inf ##-Inf]" },
+        .{ .src = "(pr-str (f64-vector [10000000000.0 ##Inf ##-Inf]))", .expected = "#f64[1.0E10 ##Inf ##-Inf]" },
         .{ .src = "(i64-vector [140737488355328 -140737488355329])", .expected = "#i64[140737488355328 -140737488355329]" },
         .{ .src = "(nth (i64-vector [140737488355328]) 0)", .expected = "140737488355328" },
         .{ .src = "(i64-vector [9223372036854775807])", .expected = "#i64[9223372036854775807]" },
@@ -5382,7 +5392,7 @@ test "typed vectors: equality, hash and identity" {
         .{ .src = "(= (i64-vector [1 2]) '(1 2))", .expected = "false" },
         .{ .src = "(= (i64-vector []) [])", .expected = "false" },
         .{ .src = "(= (f64-vector [0.0]) (f64-vector [-0.0]))", .expected = "true" },
-        .{ .src = "(= (f64-vector [(/ 0.0 0)]) (f64-vector [(/ 0.0 0)]))", .expected = "true" },
+        .{ .src = "(= (f64-vector [##NaN]) (f64-vector [(- ##Inf ##Inf)]))", .expected = "true" },
         .{ .src = "(= (hash (i64-vector [1 2])) (hash (i64-vector [1 2])))", .expected = "true" },
         .{ .src = "(= (hash (f64-vector [0.0])) (hash (f64-vector [-0.0])))", .expected = "true" },
         .{ .src = "(= (hash (i64-vector [1 2])) (hash [1 2]))", .expected = "false" },
@@ -5472,9 +5482,9 @@ test "typed vectors: a store round trip through the codec" {
         \\  (def r (db/ref conn :tv "k"))
         \\  (with-tx [tx conn] (db/put! tx r (i64-vector [1 -2 140737488355328])))
         \\  (def i (with-read-tx [tx conn] (db/get tx r)))
-        \\  (with-tx [tx conn] (db/put! tx r (f64-vector [0.5 -0.0 (/ 1.0 0)])))
+        \\  (with-tx [tx conn] (db/put! tx r (f64-vector [0.5 -0.0 ##Inf])))
         \\  (def f (with-read-tx [tx conn] (db/get tx r)))
-        \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 (/ 1.0 0)]))])
+        \\  [i (typed-vector-type i) (= i (i64-vector [1 -2 140737488355328])) f (typed-vector-type f) (= f (f64-vector [0.5 0.0 ##Inf]))])
     , "[#i64[1 -2 140737488355328] :i64 true #f64[0.5 -0.0 ##Inf] :f64 true]");
 }
 

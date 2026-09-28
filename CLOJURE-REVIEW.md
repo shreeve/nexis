@@ -226,7 +226,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
-| `(/ 1.0 0.0)`, `(/ 0.0 0.0)` | `ArithmeticException` (Divide by zero) | IEEE: `##Inf`, `##-Inf`, `##NaN`; integer `/` by zero raises `:divide-by-zero` | `docs/SEMANTICS.md` §2.2 |
+| `/` by a float zero | `ArithmeticException` when both operands are boxed (a function's arguments, `apply`); IEEE `##Inf`/`##NaN` when the compiler sees a primitive double operand (a float literal, a double local): `(/ 1.0 0)` at the REPL is `##Inf` | `:divide-by-zero` always, the boxed rule: nexis has no primitive operand types; a NaN operand is the result, as in Clojure | `docs/SEMANTICS.md` §2.2 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
 | `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; `defrecord` binds `P` to that symbol, so `(instance? P x)` reads as in Clojure | `docs/STDLIB.md` §8 |
 | namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` is `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil | `docs/STDLIB.md` §8 |

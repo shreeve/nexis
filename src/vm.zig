@@ -1129,9 +1129,8 @@ pub const VmError = error{
     /// a fixnum. Arithmetic never raises it: an integer result
     /// that leaves the i48 range promotes to a bignum.
     ArithmeticOverflow,
-    /// Integer `/`, or `quot`/`rem`/`mod` of any kind, with a
-    /// zero divisor. Float `/` by zero is IEEE (infinity / NaN)
-    /// and never raises.
+    /// `/`, `quot`, `rem` or `mod` with a zero divisor, integer or
+    /// float; a NaN operand of `/` is its result instead.
     DivideByZero,
     /// `call:call` / `call:tailcall` invocation passed a different
     /// number of arguments than the callee closure's routine
@@ -4489,7 +4488,16 @@ pub fn numDiv(heap: *heap_mod.Heap, a: value_mod.Value, b: value_mod.Value) VmEr
         if (@rem(x, y) == 0) return integerResult(heap, @divTrunc(x, y));
         return value_mod.fromFloat(@as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y)));
     }
-    if (a.isFloat() or b.isFloat()) return value_mod.fromFloat(try toFloat(a) / try toFloat(b));
+    if (a.isFloat() or b.isFloat()) {
+        // Clojure's `Numbers.divide`: a NaN operand is the result,
+        // then a zero divisor raises, a float's as an integer's.
+        const x = try toFloat(a);
+        const y = try toFloat(b);
+        if (std.math.isNan(x)) return a;
+        if (std.math.isNan(y)) return b;
+        if (y == 0) return VmError.DivideByZero;
+        return value_mod.fromFloat(x / y);
+    }
     if (!isInteger(a) or !isInteger(b)) return VmError.KindMismatch;
     if (isZero(b)) return VmError.DivideByZero;
     const exact = bignum_mod.quotExact(heap, a, b) catch return VmError.OutOfMemory;
@@ -5512,6 +5520,13 @@ test "numeric tower: contagion, exact division and integer results" {
     try testing.expectEqual(@as(i64, -2), (try numDiv(h, fx(6), fx(-3))).asFixnum());
     try testing.expectEqual(@as(f64, 2.5), (try numDiv(h, fx(5), fx(2))).asFloat());
     try testing.expectEqual(@as(f64, 2.5), (try numDiv(h, fl(5.0), fx(2))).asFloat());
+    // A zero divisor raises whatever the kinds; a NaN operand is the
+    // result first.
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fl(1.0), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fx(1), fl(0.0)));
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fl(0.0), fl(-0.0)));
+    try testing.expect(std.math.isNan((try numDiv(h, fl(std.math.nan(f64)), fx(0))).asFloat()));
+    try testing.expect(std.math.isNan((try numDiv(h, fx(0), fl(std.math.nan(f64)))).asFloat()));
     // quot / rem / mod: truncated vs floored.
     try testing.expectEqual(@as(i64, -2), (try numQuot(h, fx(-7), fx(3))).asFixnum());
     try testing.expectEqual(@as(i64, -1), (try numRem(h, fx(-7), fx(3))).asFixnum());
@@ -5585,11 +5600,11 @@ test "numeric tower: division by zero" {
     try testing.expectError(VmError.DivideByZero, numDiv(h, over, fx(0)));
     try testing.expectError(VmError.DivideByZero, numQuot(h, over, fx(0)));
     try testing.expectError(VmError.DivideByZero, numMod(h, over, fx(0)));
-    // Float `/` is IEEE.
-    try testing.expect(std.math.isPositiveInf((try numDiv(h, fl(1.0), fx(0))).asFloat()));
-    try testing.expect(std.math.isNegativeInf((try numDiv(h, fx(-1), fl(0.0))).asFloat()));
-    try testing.expect(std.math.isNan((try numDiv(h, fl(0.0), fl(0.0))).asFloat()));
-    try testing.expect(std.math.isPositiveInf((try numDiv(h, over, fl(0.0))).asFloat()));
+    // A float `/` raises as an integer one does.
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fl(1.0), fx(0)));
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fx(-1), fl(0.0)));
+    try testing.expectError(VmError.DivideByZero, numDiv(h, fl(0.0), fl(0.0)));
+    try testing.expectError(VmError.DivideByZero, numDiv(h, over, fl(0.0)));
 }
 
 test "numeric tower: comparison across kinds and NaN" {
