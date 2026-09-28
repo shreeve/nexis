@@ -80,9 +80,14 @@ true.
   wider element to promote to; `nexis.simd/sum` and `dot` promote
   like `(reduce + xs)` (`docs/TYPED_VECTOR.md` §7.2).
 - `zero?`, `pos?` and `neg?` are all false on NaN; `-0.0` is zero.
-- Integer `/` by zero, and `quot` / `rem` / `mod` by zero of any kind,
-  raise `:divide-by-zero`. Float `/` by zero is IEEE: `Infinity`,
-  `-Infinity` or `NaN`.
+- `/`, `quot`, `rem` and `mod` by zero raise `:divide-by-zero`,
+  whatever the kinds: `(/ 1.0 0)`, `(/ 1 0.0)` and `(/ 0.0 -0.0)`
+  raise as `(/ 1 0)` does. A NaN operand of `/` is its result, before
+  the divisor is looked at: `(/ ##NaN 0)` is `##NaN`. This is Clojure's
+  `Numbers.divide` for operands whose types its compiler does not
+  know (`CLOJURE-REVIEW.md` §4.3 has where Clojure's differs). The
+  infinities and NaN come from overflow, `(- ##Inf ##Inf)` and the
+  `##Inf`, `##-Inf` and `##NaN` literals.
 - `even?` / `odd?` take integers only (`:kind-mismatch` on a float).
 - `(long x)` is `x` for an integer and the integer part of a finite
   float, toward zero and a bignum when wide (`(long 1e30)` is

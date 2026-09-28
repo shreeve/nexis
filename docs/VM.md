@@ -505,7 +505,7 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 0 | `math:add` | A=slot, B=any, C=any | `+` |
 | 1 | `math:sub` | A=slot, B=any, C=any | `-` |
 | 2 | `math:mul` | A=slot, B=any, C=any | `*` |
-| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise a float; `:divide-by-zero` for an integer zero divisor |
+| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise a float; `:divide-by-zero` for a zero divisor of any kind, a NaN operand the result first (SEMANTICS.md §2.2) |
 | 4 | `math:idiv` | A=slot, B=any, C=any | `quot`, truncated; `:divide-by-zero` |
 | 5 | `math:mod` | A=slot, B=any, C=any | `mod`, floored (sign of the divisor); `:divide-by-zero` |
 | 6 | `math:pow` | | Traps `UnimplementedOpcode` |

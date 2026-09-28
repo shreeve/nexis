@@ -304,11 +304,7 @@ failing test (AGENTS.md).
    `&env`** (§23 #34, §24 #13).
 2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
    design question, so an amendment comes first.
-3. **Float `/` by zero is IEEE** (`docs/SEMANTICS.md` §2.2): `(/ 1.0
-   0.0)` is `##Inf` where Clojure raises `ArithmeticException`. A
-   decision for the owner: Clojure's rule is one arm of `numDiv` and
-   the `numbers`/`eval_pipeline` rows that pin IEEE.
-4. **A routine holds at most 4096 live locals and 4096 captured
+3. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
    names the routine and the cap (`too-many-locals.err`). Every other
