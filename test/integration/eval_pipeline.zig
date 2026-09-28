@@ -4569,6 +4569,14 @@ test "map, filter and reduce call their function once per element as a call in p
     try expectOutput("[(map {:a 1} [:a :b]) (filter #{2} [1 2]) (map first [[1] [2 3]]) (reduce max [3 9 2]) (reduce conj [] '(1 2))]", "[(1 nil) (2) (1 2) 9 [1 2]]");
 }
 
+test "map, filter and reduce walk every shape of list and every seqable" {
+    // Cons cells, a view, cons cells onto a view, an empty list, a view
+    // at its end, a view carrying metadata and its rest, a built
+    // sequence; then the seqables walked out of line (LIST.md §1).
+    try expectOutput("(let [v (vec (range 40))] [(reduce + (cons 0 (rest v))) (count (map inc (cons -1 (cons -2 (nthrest v 38))))) (filter odd? (list 1 2 3)) (map inc ()) (map inc (nthrest v 40)) (reduce + (with-meta (seq v) {:m 1})) (reduce + (rest (with-meta (seq v) {:m 1}))) (map inc (take 3 (drop 5 v)))])", "[780 4 (1 3) () () 780 780 (6 7 8)]");
+    try expectOutput("(let [v (vec (range 40))] [(filter char? \"ab\") (reduce + (map val {:a 1 :b 2})) (reduce + #{1 2 3}) (map inc (subvec v 38)) (map inc nil) (reduce + (i64-vector [1 2]))])", "[(a b) 3 6 (39 40) () 3]");
+}
+
 test "symbol-as-function: a symbol looks itself up as a keyword does" {
     try expectOutput("('a {'a 1 'b 2})", "1");
     try expectOutput("('c {'a 1} :none)", ":none");

@@ -5163,7 +5163,18 @@ const SeqIter = struct {
     },
     roots: ?vm_mod.RootScope = null,
 
-    fn next(self: *SeqIter) VmError!?Value {
+    /// The next element, null at the end. A vector and a list step
+    /// inline, in the caller's loop; every other state steps in
+    /// `nextOther`.
+    inline fn next(self: *SeqIter) VmError!?Value {
+        switch (self.state) {
+            .vector => |*c| return c.next(),
+            .list => |*c| return c.next(),
+            else => return self.nextOther(),
+        }
+    }
+
+    fn nextOther(self: *SeqIter) VmError!?Value {
         switch (self.state) {
             .empty => return null,
             .list => |*c| return c.next(),

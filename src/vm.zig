@@ -1483,8 +1483,12 @@ pub const RootScope = struct {
     vm: *VM,
     base: usize,
 
-    pub fn push(self: RootScope, v: Value) VmError!void {
-        self.vm.roots.append(self.vm.allocator, v) catch return VmError.OutOfMemory;
+    /// Push `v`; within the root stack's capacity, in the caller's
+    /// loop.
+    pub inline fn push(self: RootScope, v: Value) VmError!void {
+        const roots = &self.vm.roots;
+        if (roots.items.len < roots.capacity) return roots.appendAssumeCapacity(v);
+        roots.append(self.vm.allocator, v) catch return VmError.OutOfMemory;
     }
 
     pub fn pushAll(self: RootScope, vs: []const Value) VmError!void {
