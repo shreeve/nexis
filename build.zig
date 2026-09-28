@@ -519,10 +519,9 @@ fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
 
 /// Every binary on x86_64 compiles through LLVM, whatever the optimize
 /// mode. Zig 0.16's own x86_64 backend, the default for Debug there,
-/// rejects the `"q"` byte-register constraint in emdb's hardware CRC
-/// step (`emdb/src/simd.zig`, compiled when the CPU has SSE4.2); LLVM
-/// accepts it, and release builds use LLVM already. Elsewhere the
-/// compiler chooses.
+/// cannot compile the threaded dispatch's `@call(.always_tail, ...)`
+/// (`docs/VM.md` §6); LLVM can, and release builds use LLVM already.
+/// Elsewhere the compiler chooses.
 fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
     return if (target.result.cpu.arch == .x86_64) true else null;
 }
