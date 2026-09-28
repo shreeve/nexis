@@ -606,9 +606,9 @@ Each lever is a measured change: a before/after from `zig build bench`
   `query/plan.zig`. A transaction that writes less than a leaf's worth
   of keys into a gap (every one-datom transaction, and VAET's and
   AVET's scattered keys) still leaves a half-full leaf behind: emdb
-  splits in half unless the key is the leaf's last, and a split at the
-  insert point after a run of adjacent inserts would fill such leaves
-  too, an engine change Nextomic does not ask for. Shorter integers
+  keeps an ascending run's position within one write transaction
+  (`docs/NEXTOMIC.md` §2.5), so a gap that a stream of small
+  transactions writes one key at a time splits in half each time. Shorter integers
   (a variable-width `t` in current values and in `top`) would save
   about 5 % and change every key and value reader. The txlog repeats
   an out-of-line value's payload for its assertion and its
