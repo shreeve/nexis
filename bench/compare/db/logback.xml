@@ -1,0 +1,10 @@
+<!-- bench/compare/db/logback.xml — the Datomic peer's logging in the
+     comparison (docs/BENCH.md §12): warnings and errors to stderr, no
+     log files. -->
+<configuration>
+  <appender name="ERR" class="ch.qos.logback.core.ConsoleAppender">
+    <target>System.err</target>
+    <encoder><pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern></encoder>
+  </appender>
+  <root level="WARN"><appender-ref ref="ERR"/></root>
+</configuration>

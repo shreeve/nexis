@@ -3,7 +3,8 @@
 How nexis measures itself and what a published performance claim must
 satisfy. §1–§8 and §11 are the frozen contract for any comparison,
 especially with Clojure; §10 describes the harness, `zig build bench`;
-§12 the comparison with babashka and Datalevin, `bench/compare/`.
+§12 the comparison with babashka, JVM Clojure, Datalevin and Datomic,
+`bench/compare/`.
 The numbers of record live in `docs/PERF.md` §3, once each, with their
 provenance in its §11.
 
@@ -205,83 +206,140 @@ A result that cannot be defended under it does not ship.
 
 ---
 
-### 12. Comparisons: babashka and Datalevin
+### 12. Comparisons: babashka, JVM Clojure, Datalevin and Datomic
 
-`bench/compare/` sets nexis beside the two systems that share its
-shape: one native binary that starts at once and runs Clojure-dialect
-programs without a JVM start. **babashka** (`bb`) runs Clojure through
-SCI, an interpreter, inside a GraalVM native image. **Datalevin**'s
+`bench/compare/` sets nexis beside four systems. Two share its shape,
+one native binary that starts at once and runs Clojure-dialect
+programs without a JVM start: **babashka** (`bb`) runs Clojure through
+SCI, an interpreter, inside a GraalVM native image, and **Datalevin**'s
 `dtlv` is a native image of the Datalevin database (DLMDB, an LMDB
 fork, under a Datalog layer); `dtlv exec` interprets the glue code
-with SCI and calls the database natively. Neither is Clojure on
-HotSpot: §5's JVM comparison, with `criterium` and the three
-arithmetic tiers, does not exist yet, and nothing here speaks for it.
-The results of record are `docs/PERF.md` §3.11.
+with SCI and calls the database natively. Two are the reference
+implementations on HotSpot: **Clojure** 1.12 run by the Clojure CLI
+(`clojure -M`), and **Datomic**, both as **Datomic Local**
+(`com.datomic/local`, the client API in the program's own process over
+files in a directory) and as **Datomic Pro** (a peer in the program's
+process, a dev transactor as a second process on the same host, its
+storage H2). The Clojure column runs the same idiomatic programs as
+the others, cold and warmed in one process; it is not §5's
+`criterium` comparison with its three arithmetic tiers, which is not
+measured, and nothing here speaks for it. The results of record are
+`docs/PERF.md` §3.11 (macOS: babashka and Datalevin) and §3.15
+(Linux: all five).
 
-**What runs.** Language workloads, nexis against babashka: process
-start to first output (`-e '(+ 1 2)'`), naive `fib` 30, a 1M-iteration
-`loop`/`recur`, a 1M-entry int-keyed hash map built by `assoc` and
-read back (and the same through a transient), 1M `conj` onto a vector
-and 1M `nth`, a 1.08 MB string built with `join` and `split` back,
-`sort` of 1M ints, `frequencies` and `group-by` over 1M ints, 1M calls
-destructuring a map and a vector, and `filter`/`map`/`reduce` over 1M
-small maps. Database workloads, Nextomic against Datalevin, over 100
+**What runs.** Language workloads, nexis against babashka and Clojure:
+process start to first output (`-e '(+ 1 2)'`), naive `fib` 30, a
+1M-iteration `loop`/`recur`, a 1M-entry int-keyed hash map built by
+`assoc` and read back (and the same through a transient), 1M `conj`
+onto a vector and 1M `nth`, a 1.08 MB string built with `join` and
+`split` back, `sort` of 1M ints, `frequencies` and `group-by` over 1M
+ints, 1M calls destructuring a map and a vector, and
+`filter`/`map`/`reduce` over 1M small maps. Database workloads,
+Nextomic against Datalevin, Datomic Local and Datomic Pro, over 100
 departments and 100,000 people with five attributes each (email,
 unique; name; age; department, a ref; salary):
 
 | Phase | Work |
 |---|---|
 | `create` | create the store, install the schema, transact the departments |
-| `load` | 100 transactions of 1,000 people each, map forms |
-| `open` | reopen the loaded store in a new process |
+| `load` | 100 transactions of 1,000 people each, map forms, in the default commit |
+| `index` | Datomic Pro only: `request-index` and `sync-index` after the load, so the store's size and the queries see indexed data |
+| `open` | reopen the loaded store in a new process (Datomic Pro: a new peer connects) |
 | `lookup-10k` | 10,000 entities by lookup ref on the unique email, one attribute read each |
 | `join3-20x` | a three-clause join (department name → people → names), once for each of 20 departments, 20,000 rows |
 | `aggregate` | `(sum ?s)` of salaries per department `:with` the person, over every person |
-| `pull-10k` | `pull-many` of 10,000 people with a nested ref pattern |
-| `tx-1k-durable` | 1,000 transactions of one datom each, in each system's default commit |
-| `tx-1k-nosync` | the same with the commit's flush off and one sync at the end |
-| `as-of+history` | nexis only: the salary total as of the basis before the writes, and a `history` count |
+| `pull-10k` | a pull of 10,000 people with a nested ref pattern |
+| `lookup-10k-warm`, `pull-10k-warm` | the same two over other people, nine passes in the same process, the median pass |
+| `tx-1k-default` | 1,000 transactions of one datom each, in each system's default commit |
+| `tx-1k-durable` | 1,000 more, each commit on the device before it returns |
+| `tx-1k-nosync` | 1,000 more with the commit's flush off and one sync at the end |
+| `as-of+history` | the salary total as of the basis before the writes, and a `history` count |
+| `create-durable`, `load-durable` | Nextomic only: `create` and `load` through a durable connection |
 | `create-nosync`, `load-nosync` | `create` and `load` with the flush off and one sync at the end |
 
-Datalevin has no time views: `datalevin.core`'s public vars (listed
-by `(ns-publics 'datalevin.core)` under `dtlv exec`) hold no `as-of`,
-`since` or `history`, so that row is nexis alone and says so. The
-store's size after `load` is read with `du` (allocated blocks) and as
-the sum of file lengths.
+Every twin runs all three write batches, the same datoms, so the
+answers and the history agree; a batch a system has no mode for runs
+untimed and its row is n/a. Datalevin has no time views:
+`datalevin.core`'s public vars (listed by `(ns-publics
+'datalevin.core)` under `dtlv exec`) hold no `as-of`, `since` or
+`history`, so that row is n/a for it. The store's size after `load` is
+read with `du` (allocated blocks) and as the sum of file lengths;
+Datomic Pro's is its H2 data directory after `index`, with the
+transactor stopped.
 
 **The same code.** A language workload is one body,
-`bench/compare/lang/NAME.clj`, run by both after a prelude
-(`prelude.nx`, `prelude.bb.clj`) that differs only in the clock, the
-string namespace, and `split`'s separator: nexis has no regex (PLAN
-§24 #9), so it splits on a string where babashka splits on `#","`. The
-database workloads are twin scripts, `db/nexis-*.nx` and
-`db/dtlv-*.clj`, the same data from the same arithmetic, the same
-batches and the same queries, differing only in API spelling.
-Inputs are generated, not random, and the runner fails a workload
-unless every run of every implementation prints the same answer for
-every phase, so every row is equal work.
+`bench/compare/lang/NAME.clj`, run by every implementation after a
+prelude: `prelude.clj` for babashka and Clojure, one file, and
+`prelude.nx`, which differs from it only in the clock, the string
+namespace, and `split`'s separator: nexis has no regex (PLAN §24 #9),
+so it splits on a string where the others split on `#","`. The bodies
+compile without a reflection warning. The database workloads are twin
+scripts, `db/nexis-*.nx`, `db/dtlv-*.clj`, `db/datomic-local-*.clj`
+and `db/datomic-pro-*.clj`, the same data from the same arithmetic,
+the same batches and the same queries, differing only in API spelling:
+Datomic Local's client API has no `entity` and no `pull-many`, so a
+lookup is a `pull` of one attribute and `pull-10k` one `pull` per
+entity, and its `:find` takes relations only, so a scalar answer is
+the first of the first tuple; it has no `:db/index`, every attribute
+being in AVET. Inputs are generated, not random, and the runner fails
+a workload unless every run of every implementation prints the same
+answer for every phase, so every row is equal work.
 
 **Method.** `bb bench/compare/run.clj --out DIR [--n 10]` builds
-`bin/nexis` ReleaseFast and records the host (CPU, cores, RAM, OS),
-the versions (nexis commit and whether `src/` is dirty, Zig, `bb`,
-`dtlv`), the date and the load average before and after. Each
-workload runs once per implementation, discarded, to warm the file
-cache; then `--n` rounds (at least 10; startup 3 × `--n`), the
-implementations alternating and their order rotated each round. Every
-run is a fresh process under `/usr/bin/time -l`. A phase's time is
-read inside the process with the implementation's monotonic clock
-(`nano-time`, `System/nanoTime`, SCI's `system-time`) around the work
-alone, input generation outside it, and each cell reports the median
-with the minimum and the nearest-rank p95. Beside it the runner
-records each process's wall time (spawn to exit, through the `time`
-wrapper) and peak RSS (`maximum resident set size`). A database run
-creates fresh stores, and the query phases run in a second process
-against the store the first built. The runner waits for the 1-minute
-load average to fall under `--max-load` (4) before a workload, and a
-workload during which it rose above that is discarded and repeated,
-up to three attempts, all kept in the JSON. `DIR/results.md` is the
-table, `DIR/results.json` every run, and `DIR/src/` the exact
-programs.
+`bin/nexis` ReleaseFast and records the host (CPU, logical CPUs, RAM,
+OS, kernel, and on Linux the frequency governor and the pinned CPUs'
+maximum clocks), the versions (nexis commit and whether `src/` is
+dirty, the emdb commit, Zig, `bb`, `dtlv`, the JDK, the Clojure CLI,
+the JVM flags, `deps.edn`, Datomic Pro's `VERSION`), the date and the
+load average before and after. `--impls` chooses the implementations
+(`nexis,bb,datalevin` unless given; `clojure`, `datomic-local` and
+`datomic-pro` join them, the last with `--datomic-pro DIR`, the
+unpacked distribution); where `git` cannot name a commit,
+`--nexis-commit` and `--emdb-commit` do. Each workload runs once per
+implementation, discarded, to warm the file cache; then `--n` rounds
+(at least 10; startup 3 × `--n`), the implementations alternating and
+their order rotated each round. Every run is a fresh process under
+`/usr/bin/time` (`-l` on macOS, GNU `-v` on Linux), and with
+`--pin CPUS` under `taskset -c CPUS` (Linux), the same CPUs for every
+implementation, the transactor included. A phase's time is read inside
+the process with the implementation's monotonic clock (`nano-time`,
+`System/nanoTime`, SCI's `system-time`) around the work alone, input
+generation outside it, and each cell reports the median with the
+minimum and the nearest-rank p95. Beside it the runner records each
+process's wall time (spawn to exit, through the wrappers) and peak RSS
+(`maximum resident set size`); the transactor's peak RSS is its
+`VmHWM` from `/proc` before it is stopped. A database run creates
+fresh stores, and the query phases run in a second process against
+the store the first built. The runner waits for the 1-minute load
+average (`vm.loadavg`, `/proc/loadavg`) to fall under `--max-load` (4)
+before a workload, and a workload during which it rose above that is
+discarded and repeated, up to three attempts, all kept in the JSON.
+`DIR/results.md` is the table, `DIR/results.json` every run, and
+`DIR/src/` the exact programs.
+
+**The JVM runs.** Every JVM runs with the JDK's defaults (G1, the heap
+sized from the RAM) plus `-XX:-UsePerfData` and `-Djava.io.tmpdir` set
+to `TMPDIR`, so nothing is written under `/tmp` (the Clojure CLI adds
+its own `-XX:-OmitStackTraceInFastThrow`); the report records the
+flags. Clojure and Datomic Local resolve from
+`bench/compare/deps.edn` (Clojure 1.12.6, `com.datomic/local`
+1.0.291), with the classpath computed once before anything is timed.
+A language workload runs as two Clojure processes per round: `clojure
+-M NAME.clj`, the program's one run in a fresh JVM as babashka runs
+it (the **cold** column), and `clojure -M warm.clj NAME.clj 20 10`,
+which evaluates the program's forms once, makes its timed `let` a
+function, calls it 20 times, discarded, and prints the median of the
+next 10 (the **warm** column, the JIT given its due). Startup is
+`clojure -M -e '(+ 1 2)'`, the CLI's launcher and its cached-classpath
+check included. The Datomic Pro peer runs `java -cp` over the
+distribution's own classpath (`datomic-transactor-pro-*.jar:lib/*`)
+with `db/logback.xml`, warnings to stderr; the transactor is
+`bin/transactor` with the distribution's JVM options (`-Xms1g -Xmx1g`,
+G1, a 50 ms pause goal) and `config/samples/dev-transactor-template.properties`'s
+memory settings, its data and log under the run's store directory. The
+runner starts it before the load and again before the queries, so the
+query peer meets a transactor that reopened the store, and stops it
+after each.
 
 **What is not comparable, and why a row may mislead.**
 
@@ -289,47 +347,94 @@ programs.
   babashka's SCI interprets the program too, but the Clojure library
   it calls (`sort`, `frequencies`, `group-by`, `clojure.string`,
   `reduce`, the persistent collections) is compiled ahead of time into
-  the native image. Where a workload's time is inside library
-  functions, the row compares nexis's library, some of it written in
-  nexis and interpreted, with compiled Java. Datalevin's engine is
-  compiled Java and C; Nextomic's is Zig; both run their glue through
-  an interpreter.
+  the native image. Clojure compiles the program to JVM bytecode,
+  which HotSpot interprets and then compiles; the cold column pays
+  the class loading and the interpreter, the warm column is compiled
+  code. Datalevin's engine is compiled Java and C; Nextomic's is Zig;
+  Datomic's is Java and Clojure on HotSpot, and every Datomic phase is
+  timed in a process that started for the run, so its first phases
+  include class loading and a cold JIT; the `-warm` rows show how much
+  that costs (JIT and the peer's segment cache both warm by then), and
+  a long-running peer would do better on the others.
 - *Sequences.* nexis sequences are eager (PLAN §23 #14): `map` and
-  `filter` build their whole result, where babashka's are lazy and
-  chunked. The pipeline row runs the same code and pays for that.
-- *Transients.* Both edit the nodes a transient owns in place
+  `filter` build their whole result, where babashka's and Clojure's
+  are lazy and chunked. The pipeline row runs the same code and pays
+  for that.
+- *Transients.* All three edit the nodes a transient owns in place
   (`docs/TRANSIENT.md`).
-- *Durability.* A default Nextomic commit (`:commit`, `docs/DB.md`
-  §3.3) syncs nothing: it is atomic and survives a crash of the
-  process, and the file is synced once when the connection is
-  released, outside the timed phase. With `{:durability :durable}`
-  a commit is two `fcntl(F_FULLFSYNC)` calls (data, then meta; emdb's
-  `datasync` on macOS), which ask the drive to empty its write cache.
-  Datalevin 1.1.0's datalog store opens with the LMDB flags
-  `#{:nordahead :notls}` (`get-env-flags`) and its write-ahead log off
-  (`opts` gives `:wal? false`), so a commit syncs as LMDB does. Its
-  measured cost per commit (`docs/PERF.md` §3.11) is a twentieth of one
-  `F_FULLFSYNC` on the same drive, consistent with `fsync(2)`, which on
-  macOS returns before the drive's cache is flushed; the system calls
-  themselves were not traced (that needs root). The `tx-1k-durable`
-  and `load` rows therefore compare different guarantees, each
-  system's default. The `nosync` rows compare the
-  transaction machinery alone: Nextomic's `{:sync :none}` per
-  transaction and `d/sync` at the end; Datalevin's `:nosync`
-  environment flag and `sync` at the end.
+- *Durability.* The rows are grouped by what a commit guarantees when
+  it returns, and what each system does was traced with `strace -f`
+  over 200 one-datom transactions (Linux, `docs/PERF.md` §3.15):
+  - Nextomic's default commit (`:commit`, `docs/DB.md` §3.3) syncs
+    nothing: it is atomic and survives a crash of the process, and the
+    file is synced once when the connection is released, outside the
+    timed phase (one `fdatasync` in the trace). A connection opened
+    `{:durability :durable}` syncs data and meta on every commit: two
+    `fdatasync` on Linux, two `fcntl(F_FULLFSYNC)` on macOS, which
+    ask the drive to empty its write cache.
+  - Datalevin 1.1.0's datalog store opens with the LMDB flags
+    `#{:nordahead :notls}` (`get-env-flags`) and its write-ahead log off
+    (`opts` gives `:wal? false`), so a commit syncs as LMDB does: one
+    `fdatasync` of the data, and the meta page written through a
+    descriptor opened `O_DSYNC`. Its default commit is its durable one,
+    and `tx-1k-durable` is a second batch in it. On the Apple host its
+    measured cost per commit (`docs/PERF.md` §3.11) is a twentieth of
+    one `F_FULLFSYNC`, consistent with `fsync(2)`, which on macOS
+    returns before the drive's cache is flushed (not traced there: it
+    needs root), so there its rows are weaker than Nextomic's durable
+    ones.
+  - Datomic Local's one commit mode syncs its log: two `fdatasync` per
+    transaction. Its default commit is its durable one, and
+    `tx-1k-durable` is a second batch in it; it has no no-sync mode.
+  - Datomic Pro's transactor acknowledges a transaction once dev
+    storage has it, and H2 buffers its writes in memory and writes the
+    file in batches without a sync (no `fsync` or `fdatasync` in the
+    transactor's trace; nine `pwrite64` to the H2 file over 200
+    transactions and about a second). An acknowledged transaction
+    survives a crash of the peer; one H2 has not yet written can be
+    lost with the transactor. Its row is `tx-1k-default` alone. Datomic Pro over a production storage
+    (PostgreSQL, DynamoDB, Cassandra) commits as that storage does and
+    is not measured here.
+
+  The `default` rows therefore compare different guarantees, each
+  system's default, and the `durable` rows the same one. The `nosync`
+  rows compare the transaction machinery alone: Nextomic's `{:sync
+  :none}` per transaction and `d/sync` at the end; Datalevin's
+  `:nosync` environment flag and `sync` at the end.
 - *What a write stores.* Nextomic writes every datom to EAVT and AEVT,
   AVET for unique and indexed attributes, VAET for refs, the four
   history twins of those, and a txlog entry per transaction
-  (`docs/NEXTOMIC.md` §2). Datalevin writes EAV and AVE (every
-  attribute is in AVE; `datoms :ave` answers for an unindexed one) and
-  keeps no history. Load time and store size pay for history on the
-  nexis side. The nexis schema marks `:person/age` indexed, which
-  Datalevin does without being asked.
+  (`docs/NEXTOMIC.md` §2), all before the commit returns. Datalevin
+  writes EAV and AVE (every attribute is in AVE; `datoms :ave` answers
+  for an unindexed one) and keeps no history. Datomic writes the
+  transaction to its log when it commits and folds it into its
+  compressed, immutable index segments (EAVT, AEVT, AVET, VAET, and
+  their history) later, in the background; the `index` row is that
+  work for the whole load, which the `load` row does not include.
+  Load time and store size pay for history on the nexis and Datomic
+  sides. The nexis and Datomic Pro schemas mark `:person/age`
+  indexed, which Datalevin and Datomic Local do without being asked.
 - *Caches.* Nextomic caches a query's parse per VM; Datalevin keeps
-  caches of its own (`opts` shows `:cache-limit 512`). Every timed
-  query in a run has inputs of its own, so no result can come from a
-  result cache.
+  caches of its own (`opts` shows `:cache-limit 512`); a Datomic peer
+  caches index segments in its object cache (half its heap by
+  default). Every timed query in a run has inputs
+  of its own, so no result can come from a result cache; the `-warm`
+  rows go through `entity` and `pull`, not a query.
+- *Processes.* Datomic Pro's transactor is a second JVM on the same
+  host, pinned to the same CPUs; its RSS is reported on its own row
+  and belongs beside the peer's. Its reads cross a local TCP socket to
+  the transactor's H2 server.
 - *Memory.* Peak RSS reflects each collector's policy (nexis's
   non-moving mark-sweep over the process allocator; the native
-  image's collector and its heap sizing) as much as live data.
-- *Startup* includes the `time` wrapper's spawn, the same for both.
+  image's collector and its heap sizing; G1 with a heap sized from
+  the host's RAM) as much as live data.
+- *The host.* A workstation shared with its owner: the load average is
+  recorded, and a workload that saw it rise past `--max-load` is
+  repeated. The frequency governor is left as the host has it (on the
+  Linux host of record, `powersave`, where the clock follows the load),
+  which slows short phases more than long ones for every system alike.
+  Pinning keeps every process on the same class of core (on a hybrid
+  CPU, the performance cores and their threads) and leaves the JVM
+  its compiler and collector threads.
+- *Startup* includes the wrappers' spawn (`time`, `taskset`), the
+  same for all.

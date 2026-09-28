@@ -1,8 +1,8 @@
 ; bench/compare/db/nexis-query.nx — reopen the store nexis-load.nx
 ; built and time the read and write workloads of docs/BENCH.md §12
 ; against it. Usage: nexis run nexis-query.nx STORE
-; Twin: dtlv-query.clj; the same operations and answers, except the
-; time-view phase, which Datalevin has no counterpart for.
+; Twins: dtlv-query.clj, datomic-local-query.clj, datomic-pro-query.clj;
+; the same operations and answers (Datalevin has no time views).
 
 (require '[nextomic :as d])
 
@@ -53,22 +53,57 @@
   (report "pull-10k" (- (nano-time) t0) (str (count res) "/" (reduce + (map :person/age res)) "/"
                              (count (filter (fn [r] (:dept/name (:person/dept r))) res)))))
 
+; The lookups and the pull again over other people (offset p = 1..9,
+; nine passes), each pass timed: the median pass, and the answers'
+; total. Neither goes through a query, so no result cache applies; a
+; JVM has compiled the paths by then.
+(defn median [xs] (nth (vec (sort xs)) (quot (dec (count xs)) 2)))
+
+(let [passes (mapv (fn [p]
+                     (let [t0 (nano-time)
+                           total (loop [i 0 acc 0]
+                                   (if (< i 10000)
+                                     (recur (inc i) (+ acc (:person/age (d/entity db0 [:person/email (email (+ p (* i 10)))]))))
+                                     acc))]
+                       [(- (nano-time) t0) total]))
+                   (range 1 10))]
+  (report "lookup-10k-warm" (median (map first passes)) (reduce + (map second passes))))
+
+(let [pattern [:person/name :person/age {:person/dept [:dept/name]}]
+      passes (mapv (fn [p]
+                     (let [eids (mapv (fn [i] (d/entid db0 [:person/email (email (+ p (* i 10)))])) (range 10000))
+                           t0 (nano-time)
+                           res (d/pull-many db0 pattern eids)
+                           ns (- (nano-time) t0)]
+                       [ns (reduce + (map :person/age res))]))
+                   (range 1 10))]
+  (report "pull-10k-warm" (median (map first passes)) (reduce + (map second passes))))
+
 (def salary-sum-q
   '[:find (sum ?s) . :with ?p :in $ [?em ...] :where [?p :person/email ?em] [?p :person/salary ?s]])
 (def first-1000 (mapv email (range 1000)))
 
-; 1,000 transactions of one datom each, in the default commit
-; (`:commit`: atomic, no sync; docs/DB.md §3.3).
+; Three batches of 1,000 transactions of one datom each, the same
+; writes in every twin: in the default commit (`:commit`: atomic, no
+; sync; docs/DB.md §3.3), through a second connection opened
+; `{:durability :durable}` (each commit syncs data, then meta), and
+; with `:sync :none` and one sync at the end.
 (def t-before (d/basis-t (d/db conn)))
 (let [t0 (nano-time)]
   (dotimes [i 1000]
     (d/transact! conn [[:db/add [:person/email (email i)] :person/salary (inc i)]]))
-  (report "tx-1k-durable" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
+  (report "tx-1k-default" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
 
-; The same 1,000 transactions with sync off, one sync at the end.
+(let [durable (d/connect path {:durability :durable})
+      t0 (nano-time)]
+  (dotimes [i 1000]
+    (d/transact! durable [[:db/add [:person/email (email i)] :person/salary (+ 2 i)]]))
+  (report "tx-1k-durable" (- (nano-time) t0) (d/q salary-sum-q (d/db durable) first-1000))
+  (d/release durable))
+
 (let [t0 (nano-time)]
   (dotimes [i 1000]
-    (d/transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 2 i)]] {:sync :none}))
+    (d/transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 3 i)]] {:sync :none}))
   (d/sync conn)
   (report "tx-1k-nosync" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
 

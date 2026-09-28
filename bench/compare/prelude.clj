@@ -1,5 +1,5 @@
-; bench/compare/prelude.bb.clj — prepended to every lang/*.clj body for
-; babashka (docs/BENCH.md §12); the twin of prelude.nx.
+; bench/compare/prelude.clj — prepended to every lang/*.clj body for
+; babashka and JVM Clojure (docs/BENCH.md §12); the twin of prelude.nx.
 (require '[clojure.string :as s])
 (defn now [] (System/nanoTime))
 (defn split-comma [x] (s/split x #","))

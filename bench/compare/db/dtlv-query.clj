@@ -48,20 +48,54 @@
   (report "pull-10k" (- (system-time) t0) (str (count res) "/" (reduce + (map :person/age res)) "/"
                              (count (filter (fn [r] (:dept/name (:person/dept r))) res)))))
 
+; The lookups and the pull again over other people (offset p = 1..9,
+; nine passes), each pass timed: the median pass, and the answers'
+; total. Neither goes through a query, so no result cache applies; a
+; JVM has compiled the paths by then.
+(defn median [xs] (nth (vec (sort xs)) (quot (dec (count xs)) 2)))
+
+(let [passes (mapv (fn [p]
+                     (let [t0 (system-time)
+                           total (loop [i 0 acc 0]
+                                   (if (< i 10000)
+                                     (recur (inc i) (+ acc (:person/age (entity db0 [:person/email (email (+ p (* i 10)))]))))
+                                     acc))]
+                       [(- (system-time) t0) total]))
+                   (range 1 10))]
+  (report "lookup-10k-warm" (median (map first passes)) (reduce + (map second passes))))
+
+(let [pattern [:person/name :person/age {:person/dept [:dept/name]}]
+      passes (mapv (fn [p]
+                     (let [eids (mapv (fn [i] (entid db0 [:person/email (email (+ p (* i 10)))])) (range 10000))
+                           t0 (system-time)
+                           res (pull-many db0 pattern eids)
+                           ns (- (system-time) t0)]
+                       [ns (reduce + (map :person/age res))]))
+                   (range 1 10))]
+  (report "pull-10k-warm" (median (map first passes)) (reduce + (map second passes))))
+
 (def salary-sum-q
   (quote [:find (sum ?s) . :with ?p :in $ [?em ...] :where [?p :person/email ?em] [?p :person/salary ?s]]))
 (def first-1000 (mapv email (range 1000)))
 
+; The three batches of nexis-query.nx, the same writes: Datalevin's
+; default commit, which syncs; the same again, its durable row; and
+; with the :nosync flag and one sync at the end.
 (let [t0 (system-time)]
   (dotimes [i 1000]
     (transact! conn [[:db/add [:person/email (email i)] :person/salary (inc i)]]))
+  (report "tx-1k-default" (- (system-time) t0) (q salary-sum-q (db conn) first-1000)))
+
+(let [t0 (system-time)]
+  (dotimes [i 1000]
+    (transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 2 i)]]))
   (report "tx-1k-durable" (- (system-time) t0) (q salary-sum-q (db conn) first-1000)))
 
 (let [t0 (system-time)
       kv (datalog-kv conn)]
   (set-env-flags kv #{:nosync} true)
   (dotimes [i 1000]
-    (transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 2 i)]]))
+    (transact! conn [[:db/add [:person/email (email i)] :person/salary (+ 3 i)]]))
   (datalevin.core/sync kv)
   (set-env-flags kv #{:nosync} false)
   (report "tx-1k-nosync" (- (system-time) t0) (q salary-sum-q (db conn) first-1000)))

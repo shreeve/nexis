@@ -1,10 +1,12 @@
 ; bench/compare/db/nexis-load.nx — create a Nextomic store and load
 ; 100 departments and 100,000 people with five attributes each, in
-; batches of 1,000 entities (docs/BENCH.md §12). MODE `durable` commits
+; batches of 1,000 entities (docs/BENCH.md §12). MODE `default` commits
 ; every transaction in the default commit mode (`:commit`, no sync;
-; docs/DB.md §3.3); `nosync` commits with `:sync :none` and syncs once
-; at the end, and names its phases
-; `create-nosync` and `load-nosync`.
+; docs/DB.md §3.3); `durable` opens the connection
+; `{:durability :durable}`, so every commit syncs data and meta, and
+; names its phases `create-durable` and `load-durable`; `nosync`
+; commits with `:sync :none` and syncs once at the end, and names its
+; phases `create-nosync` and `load-nosync`.
 ; Usage: nexis run nexis-load.nx STORE MODE
 ; Twin: dtlv-load.clj; same data, same batches, same answers.
 
@@ -13,8 +15,10 @@
 (def path (first *command-line-args*))
 (def n-people 100000)
 (def batch 1000)
-(def nosync (= "nosync" (second *command-line-args*)))
-(def suffix (if nosync "-nosync" ""))
+(def mode (second *command-line-args*))
+(def nosync (= "nosync" mode))
+(def suffix (case mode "default" "" "durable" "-durable" "nosync" "-nosync"))
+(def conn-opts (if (= "durable" mode) {:durability :durable} {}))
 (def tx-opts (if nosync {:sync :none} {}))
 
 ; ns is taken before the answer is computed: arguments evaluate left
@@ -41,7 +45,7 @@
    :person/salary (+ 30000 (mod (* i 7919) 90001))})
 
 (let [t0 (nano-time)
-      conn (d/connect path)
+      conn (d/connect path conn-opts)
       _ (d/transact! conn schema tx-opts)
       _ (d/transact! conn (mapv (fn [k] {:dept/name (str "d" k)}) (range 100)) tx-opts)
       dept-map (into {} (d/q '[:find ?n ?e :where [?e :dept/name ?n]] (d/db conn)))

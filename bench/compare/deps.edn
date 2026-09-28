@@ -1,0 +1,6 @@
+;; bench/compare/deps.edn — the JVM side of the comparison
+;; (docs/BENCH.md §12): Clojure for the language twins, and Datomic
+;; Local under the :datomic-local alias. Run from this directory.
+{:paths []
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}}
+ :aliases {:datomic-local {:extra-deps {com.datomic/local {:mvn/version "1.0.291"}}}}}
