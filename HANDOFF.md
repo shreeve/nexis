@@ -408,10 +408,10 @@ after numbers in the commit message.
    both.
 2. Performance against babashka (`docs/PERF.md` §3.11, §3.13,
    §3.14): nexis is ahead on every row, the eager
-   `map`/`filter`/`reduce` pipeline at 0.79× with 195 MB against
+   `map`/`filter`/`reduce` pipeline at 0.76× with 195 MB against
    212 MB (§3.14), and holds more memory than babashka only in `sort`
    (§6, "`sort`'s buffers"); Nextomic is ahead
-   of Datalevin on every phase with a store 3.3× the size. The levers
+   of Datalevin on every phase with a store 3.1× the size. The levers
    are `docs/PERF.md` §6 (generational collection, store size, a
    keyword lookup instruction). Rerun
    `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12) before
