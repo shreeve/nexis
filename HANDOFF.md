@@ -241,11 +241,9 @@ nexis in `src/stdlib/*.nx`, embedded and booted in order by
 `docs/README.md` maps every source file to its spec. For the database,
 `docs/NEXTOMIC.md` is authoritative. The engine's contracts are
 `../emdb/SPEC.md` (the INV-* and API-* catalogue Nextomic's design
-cites) and `../emdb/PERFORMANCE.md`. `../emdb/NEXTOMIC.md` is the
-engine maintainers' view and is edited only from the emdb repository;
-one sentence of its §5 still has a db-value hold a read transaction
-and a reader slot, which its own §3 and `docs/NEXTOMIC.md` §4 contradict
-(a db-value holds none).
+cites) and `../emdb/PERFORMANCE.md`. `docs/NEXTOMIC-EMDB.md` is the
+engine-side view: what emdb provides Nextomic, the engine facts that
+shape its keys, and what must not be asked of emdb.
 
 ---
 
