@@ -72,7 +72,10 @@ to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64;
 `zig fmt --check` over the tracked Zig files but the generated
 `src/parser.zig`, and `zig build parser-check` against a nexus built
 from `shreeve/nexus`; and a ReleaseFast job that runs a script, the
-benchmark suite once, and the static `x86_64-linux-musl` binary. Each
+benchmark suite once, and the static `x86_64-linux-musl` binary,
+built for x86-64-v2 (`-Dcpu=x86_64_v2`: SSE4.2 and POPCNT, so emdb's
+checksum instructions need no run-time probe; `check-targets` compiles
+at x86-64-v3 so emdb's AVX2 paths compile too). Each
 job checks nexis out into `nexis/` and emdb into `emdb/` beside it.
 emdb is private: the checkout reads it with the repository secret
 `EMDB_TOKEN`, a fine-grained personal access token whose one
