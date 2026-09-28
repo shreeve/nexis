@@ -830,6 +830,10 @@ fn foldNumbers(vm: *VM, op: BinaryNum, args: []const Value) VmError!Value {
 }
 
 fn fnAdd(vm: *VM, args: []const Value) VmError!Value {
+    // Two fixnums whose sum is one add inline, as `math:add` does.
+    if (args.len == 2 and args[0].isFixnum() and args[1].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() + args[1].asFixnum())) |v| return v;
+    }
     if (args.len == 0) return value_mod.fromFixnum(0).?;
     return foldNumbers(vm, &vm_mod.numAdd, args);
 }
@@ -908,10 +912,16 @@ fn fnNotEq(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnInc(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() + 1)) |v| return v;
+    }
     return vm_mod.numAdd(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
 fn fnDec(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].isFixnum()) {
+        if (value_mod.fromFixnum(args[0].asFixnum() - 1)) |v| return v;
+    }
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
@@ -1270,7 +1280,9 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 /// scope, the stack guard and the deep-data check `VM.callValue` puts
 /// around a call have nothing to do. Everything else goes through
 /// `callValue`, which calls a leaf native as directly
-/// (`NativeFn.leaf`).
+/// (`NativeFn.leaf`). `map`, `filter`, `remove`, `keep` and `reduce`,
+/// which call one function once per element with one argument count,
+/// call it through a `vm_mod.Callback` instead (VM.md §6).
 fn callBack(vm: *VM, f: Value, args: []const Value) VmError!Value {
     if (f.kind() == .keyword and args.len == 1) switch (args[0].kind()) {
         .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
@@ -1315,7 +1327,8 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 fn mapInto(vm: *VM, f: Value, colls: []const Value, scope: vm_mod.RootScope) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
-        while (try it.next()) |x| try scope.push(try callBack(vm, f, &.{x}));
+        var cb = vm_mod.Callback.init(vm, f, 1);
+        while (try it.next()) |x| try scope.push(try cb.call(&.{x}));
         return;
     }
 
@@ -1340,8 +1353,9 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[args.len - 1];
     var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
+    var cb = vm_mod.Callback.init(vm, f, 2);
     while (try it.next()) |x| {
-        acc = try callBack(vm, f, &.{ acc, x });
+        acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
     }
     return acc;
@@ -1419,8 +1433,9 @@ fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
 /// once kept; one dropped is garbage.
 fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, scope: vm_mod.RootScope) VmError!void {
     var it = try makeSeqIter(vm, coll);
+    var cb = vm_mod.Callback.init(vm, pred, 1);
     while (try it.next()) |x| {
-        const r = try callBack(vm, pred, &.{x});
+        const r = try cb.call(&.{x});
         const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
             .keep_falsy => if (r.isTruthy()) null else x,
@@ -5158,7 +5173,18 @@ const SeqIter = struct {
     },
     roots: ?vm_mod.RootScope = null,
 
-    fn next(self: *SeqIter) VmError!?Value {
+    /// The next element, null at the end. A vector and a list step
+    /// inline, in the caller's loop; every other state steps in
+    /// `nextOther`.
+    inline fn next(self: *SeqIter) VmError!?Value {
+        switch (self.state) {
+            .vector => |*c| return c.next(),
+            .list => |*c| return c.next(),
+            else => return self.nextOther(),
+        }
+    }
+
+    fn nextOther(self: *SeqIter) VmError!?Value {
         switch (self.state) {
             .empty => return null,
             .list => |*c| return c.next(),

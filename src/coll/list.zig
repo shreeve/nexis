@@ -301,8 +301,14 @@ pub const Cursor = struct {
         return .{ .current = v };
     }
 
-    pub fn next(self: *Cursor) ?Value {
+    /// The next element, null at the end. Once the walk reaches a
+    /// view it steps the vector's cursor, inline in the caller's loop.
+    pub inline fn next(self: *Cursor) ?Value {
         if (self.view) |*vc| return vc.next();
+        return self.nextCell();
+    }
+
+    fn nextCell(self: *Cursor) ?Value {
         switch (self.current.subkind()) {
             subkind_cons => {
                 const body = consBody(self.current);
