@@ -1654,6 +1654,53 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     try testing.expect(peak < 3 * kept);
 }
 
+test "gc: map, filter and mapv build a long result in place, not on the root stack" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const v = try program.run(
+        \\(let [xs (range 100000)]
+        \\  [(count (mapv inc xs)) (reduce + (map inc xs)) (count (filter even? xs)) (count (filterv odd? xs))
+        \\   (count (remove even? xs)) (count (keep identity xs)) (count (map-indexed vector xs)) (reduce + (map + xs xs))])
+    );
+    const out = try program.format(v);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("[100000 5000050000 50000 50000 50000 100000 100000 9999900000]", out);
+    try testing.expect(program.v.roots.capacity < 1024);
+}
+
+test "gc: a sequence native's result is the same at every length" {
+    // Lengths across the chunk a result is rooted in before it moves
+    // into the vector it is built in, under the stress policy.
+    try expectOutputProgram(
+        \\(defn check [n]
+        \\  (let [xs (range n) ys (vec (range 1 (inc n)))]
+        \\    (and (= xs (loop [i (dec n) acc ()] (if (neg? i) acc (recur (dec i) (cons i acc)))))
+        \\         (= (count ys) n) (= (reduce + 0 ys) (quot (* n (inc n)) 2)) (= (map double xs) (range 0.0 n))
+        \\         (= ys (map inc xs)) (= ys (mapv inc xs)) (= ys (map + xs (repeat n 1)))
+        \\         (= (filter even? ys) (filterv even? ys) (remove odd? ys) (keep #(when (even? %) %) ys))
+        \\         (= (map-indexed (fn [i x] [i x]) ys) (map vector xs ys))
+        \\         (seq? (map inc xs)) (vector? (mapv inc xs)) (seq? (filter even? ys)) (vector? (filterv even? ys))
+        \\         (= (count (filter even? ys)) (quot n 2))
+        \\         (= (map (fn [x] [x]) xs) (map vector xs)))))
+        \\(every? check (range 0 200))
+    , "true");
+    // A collection inside the callbacks while the result is part
+    // rooted, part built.
+    var program: Program = undefined;
+    try program.initWith(.{ .gc_stress = true });
+    defer program.deinit();
+    const v = try program.run(
+        \\(for [n [31 32 33 64 65 100 1100]]
+        \\  (let [xs (range n) boxed (map (fn [x] [x (str x)]) xs) kept (filter (fn [p] (even? (count (conj p 1 2)))) boxed)]
+        \\    [(= (map first boxed) xs) (= (map second boxed) (map str xs)) (= (count kept) n) (= (mapv (fn [[x]] (inc x)) kept) (map inc xs))]))
+    );
+    const out = try program.format(v);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("([true true true true] [true true true true] [true true true true] [true true true true] [true true true true] [true true true true] [true true true true])", out);
+    try testing.expect(program.v.gc_cycles > 0);
+}
+
 test "db: read-line lets every held snapshot go before it waits" {
     var store = try SeamStore.init("read-line-held");
     defer store.deinit();

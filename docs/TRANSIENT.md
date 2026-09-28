@@ -180,7 +180,7 @@ same transient.
 | wrap | `transientFrom(heap, v)`, `persistentBang(t)`, `snapshot(heap, t)`, `restore(t, kept)`, `editToken(t)` |
 | map (0) | `mapAssocBang`, `mapDissocBang`, `mapLocateBang` and `mapPutBang` (one lookup for a read then a store), `mapGetBang` (a `champ.MapLookup`), `mapCountBang` |
 | set (1) | `setConjBang`, `setDisjBang`, `setContainsBang`, `setCountBang` |
-| vector (2) | `vectorConjBang`, `vectorAssocBang` (appends at `idx == count`), `vectorPopBang`, `vectorNthBang`, `vectorCountBang` |
+| vector (2) | `vectorConjBang`, `vectorConjChunkBang` (32 elements onto a full tail, `vector.conjChunkInPlace`), `vectorAssocBang` (appends at `idx == count`), `vectorPopBang`, `vectorNthBang`, `vectorCountBang` |
 | GC | `trace(h, visitor)` |
 
 The module imports `champ.zig` and `vector.zig`, never `dispatch`;
@@ -191,8 +191,8 @@ The module imports `champ.zig` and `vector.zig`, never `dispatch`;
 ### 8. The collection seam
 
 Each collection module owns its in-place edits and the Value for a
-raw root: `vector.copyRoot`, `conjInPlace`, `assocInPlace`,
-`popInPlace` and `valueFromVectorHeader`; `champ.copyRoot`,
+raw root: `vector.copyRoot`, `conjInPlace`, `conjChunkInPlace`,
+`assocInPlace`, `popInPlace` and `valueFromVectorHeader`; `champ.copyRoot`,
 `mapLocate`/`setLocate`, `mapPut`/`setPut`, `mapDrop`/`setDrop` and
 `valueFromMapHeader`/`valueFromSetHeader` (which infer the array-map
 or CHAMP subkind from the body). The transient module calls only these

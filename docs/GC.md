@@ -364,8 +364,11 @@ The rule each native follows, by what it holds across a further
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
    them on every exit path, a `ControlTransferred` unwind included.
-   `mapInto` (`map`, `mapv`, `mapcat`), `indexedMap` (`map-indexed`,
-   `keep-indexed`), `reductions`, `repeatInto` (`repeatedly`,
+   `Results`, the result builder of `map`, `mapv`, `mapcat`,
+   `map-indexed`, `keep-indexed`, `filter`, `remove`, `keep` and
+   `filterv`: it pushes each result on its root scope, and every 32
+   moves them into a transient vector it roots in their place
+   (`docs/LIST.md` §1); `reductions`, `repeatInto` (`repeatedly`,
    `iterate`), `keyExtremum` (`max-key`, `min-key`: the best key so
    far), `sortImpl` when a key fn is given; the `nextomic/q` hook for
    every user-function result and every heap value the query pipeline
@@ -377,7 +380,9 @@ The rule each native follows, by what it holds across a further
    argument reaches them. The iterator over a map, a record or an
    entity builds each `[k v]` entry, and the one over a typed vector
    boxes each element. `sieveInto` (`filter`, `remove`, `keep`,
-   `filterv`), `whileSplit` (`take-while`, `drop-while`) and
+   `filterv`) passes each element to the predicate, its call's
+   argument, and keeps it in its `Results` before the next call;
+   `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's
    root scope; `sortImpl` (`sort`, `sort-by`) collects the elements and

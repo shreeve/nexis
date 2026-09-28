@@ -252,6 +252,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
+            .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },

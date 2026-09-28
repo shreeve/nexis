@@ -496,7 +496,21 @@ pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void
     }
     // A full tail joins the trie as a leaf, owned or not, and a new
     // owned tail starts.
-    const new_tail = try ownedTail(heap, &.{elem}, branch_factor, edit);
+    try startTailInPlace(heap, body, try ownedTail(heap, &.{elem}, branch_factor, edit), 1, edit);
+}
+
+/// Append `chunk`, a leaf's worth of elements, to the vector rooted at
+/// `root`, which the edit owns and whose tail is full: the tail joins
+/// the trie and a new tail holds the chunk, the shape 32 `conj`s give.
+pub fn conjChunkInPlace(heap: *Heap, root: *HeapHeader, chunk: *const [branch_factor]Value, edit: u32) !void {
+    const body = rootBody(root);
+    std.debug.assert(body.tail_len == branch_factor);
+    try startTailInPlace(heap, body, try ownedTail(heap, chunk, branch_factor, edit), branch_factor, edit);
+}
+
+/// Move the full tail of the vector at `body` into its trie and make
+/// `new_tail`, holding `len` elements, its tail.
+fn startTailInPlace(heap: *Heap, body: *RootBody, new_tail: *HeapHeader, len: u32, edit: u32) !void {
     const leaf = body.tail_node.?;
     const leaf_base: u32 = body.count - @as(u32, branch_factor);
     if (body.root_node == null or body.count > capacityAtShift(body.shift)) {
@@ -510,8 +524,8 @@ pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void
         body.root_node = try pushLeafInPlace(heap, body.root_node.?, body.shift, leaf_base, leaf, edit);
     }
     body.tail_node = new_tail;
-    body.tail_len = 1;
-    body.count += 1;
+    body.tail_len = len;
+    body.count += len;
 }
 
 /// `newPath`, every interior owned by the edit.
@@ -1362,4 +1376,25 @@ test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
         try expectSameShape(try rangeVector(&heap, n), v);
         v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
     }
+}
+
+test "conjChunkInPlace builds the shape fromSlice builds, across the shift boundaries" {
+    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = debug.deinit();
+    var heap = Heap.init(debug.allocator());
+    defer heap.deinit();
+    // Past shift 5 (1056), shift 10 (33,824) and into shift 15.
+    const n: usize = 34_000;
+    const elems = try testing.allocator.alloc(Value, n);
+    defer testing.allocator.free(elems);
+    for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
+    const edit: u32 = 7;
+    const root = try copyRoot(&heap, rootHeader(try fromSlice(&heap, elems[0..branch_factor])));
+    var len: usize = branch_factor;
+    while (len + branch_factor <= n) : (len += branch_factor) {
+        try conjChunkInPlace(&heap, root, elems[len..][0..branch_factor], edit);
+        if (len % 1024 == 0 or len == 1024 + 32 or len > 33_700) try expectSameShape(try fromSlice(&heap, elems[0 .. len + branch_factor]), valueFromRoot(root));
+    }
+    while (len < n) : (len += 1) try conjInPlace(&heap, root, elems[len], edit);
+    try expectSameShape(try fromSlice(&heap, elems), valueFromRoot(root));
 }

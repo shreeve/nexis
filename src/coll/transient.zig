@@ -321,6 +321,15 @@ pub fn vectorConjBang(heap: *Heap, t: Value, elem: Value) EditError!Value {
     return t;
 }
 
+/// `vectorConjBang` of each of `chunk`'s elements in turn, when the
+/// vector's tail is full: its tail joins the trie at once and the
+/// chunk becomes the new tail.
+pub fn vectorConjChunkBang(heap: *Heap, t: Value, chunk: *const [vector.branch_factor]Value) EditError!Value {
+    const body = try activeBody(t, subkind_transient_vector);
+    try vector.conjChunkInPlace(heap, body.inner_header, chunk, editOf(body));
+    return t;
+}
+
 /// `(assoc! t idx elem)`: replaces element `idx`, or appends when
 /// `idx` is the count (as Clojure's `assoc!` on a transient vector).
 /// `error.IndexOutOfBounds` beyond that.

@@ -1,0 +1,12 @@
+; The sequence natives build a long result in the heap as they go,
+; never gathered whole in a buffer of their own first. The golden runs
+; with NEXIS_MAX_ALLOC=4194304, which refuses any one allocation past
+; 4 MiB outside the heap's slabs; each result below holds up to a
+; million values, 16 bytes each.
+
+(def xs (range 1000000))
+(println (count xs) (reduce + xs))
+(println (count (map inc xs)) (count (mapv inc xs)) (count (map + xs xs)))
+(println (count (filter even? xs)) (count (filterv odd? xs)) (count (remove even? xs)) (count (keep identity xs)))
+(println (count (map-indexed vector xs)) (count (keep-indexed (fn [i x] (when (even? i) x)) xs)))
+(println (->> xs (filter even?) (map inc) (reduce +)))

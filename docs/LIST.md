@@ -38,7 +38,13 @@ map or set, and the rest that build a fresh list; `stdlib.zig`
 more, a vector of them and its view at offset 0: a root, a tail and
 one block per 32 elements instead of a cons cell per element, and an
 O(1) `count`. Fewer than four are cons cells, fewer blocks than a
-vector's root, tail and view. `list` always builds cons cells. As
+vector's root, tail and view. `list` always builds cons cells.
+`map`, `filter`, `remove`, `keep`, `map-indexed`, `keep-indexed` and
+`range`, and `mapv` and `filterv`, build the vector as they go
+(`stdlib.zig` `Results`): past 32 results each leaf's worth joins a
+transient vector (`docs/TRANSIENT.md` §1), so a long result is never
+gathered whole in a buffer first (`test/golden/cli/long-sequences.nx`
+builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
 with any view, a `rest` or `drop` of a built sequence keeps the whole
 vector reachable (§6), where a cons chain's rest frees the cells before
 it.
