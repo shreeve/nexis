@@ -742,10 +742,11 @@ clause (so a rule head may carry it), and the value it holds is applied
 when the clause runs: a function through `callValue`, a keyword or
 collection as the language applies them, anything else is the VM's
 `:not-callable`. A function is identity-valued in a relation. The `q`
-hook roots every user-function result for the query's life, and every
-heap value the pipeline builds before the result (a `tuple` or
-`fulltext` result bound as one value, an aggregate's vector or set;
-`docs/GC.md` §11.5).
+hook roots, for the query's life, every heap value the pipeline keeps
+across a later call: a function result it binds, a custom aggregate's
+result, and the values it builds itself (a `tuple` or `fulltext`
+result bound as one value, an aggregate's vector or set;
+`docs/GC.md` §11.5); a predicate's result is tested and dropped.
 
 **fulltext.** `[(fulltext $ :attr "needle") [[?e ?v]]]` binds, for a
 string attribute carrying `:db/fulltext` at the view's basis, every

@@ -79,11 +79,11 @@ const Scan = plan_mod.Scan;
 
 /// Calls a user function: `call` by VM symbol, `apply` by the value a
 /// variable in function position holds. `args` are VM values built in
-/// the query's result heap; the result must be a VM value, which the
-/// hook keeps reachable for the query's life. `root` does the same for
-/// a heap value the pipeline builds itself and holds in a relation or
-/// a group across later calls; a host whose calls never collect leaves
-/// it null.
+/// the query's result heap; the result is a VM value. `root` keeps a
+/// value reachable for the query's life: the pipeline passes it every
+/// value it holds in a relation or a group across later calls, a
+/// function's result or a heap value it builds itself; a host whose
+/// calls never collect leaves it null.
 pub const CallHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
@@ -193,8 +193,8 @@ pub const Exec = struct {
         };
     }
 
-    /// `v`, a heap value the pipeline built, kept reachable for the
-    /// query's life: a user function called later may collect.
+    /// `v`, a value the pipeline holds, kept reachable for the query's
+    /// life: a user function called later may collect.
     fn kept(self: *Exec, v: Value) !Value {
         if (self.hook) |h| if (h.root) |root| try root(h.ctx, v);
         return v;
@@ -625,8 +625,8 @@ pub const Exec = struct {
                     .fulltext => .{ .tuples = try self.fulltextHits(b.call.args[0].src, cells[1], cells[2]) },
                     .lt, .le, .gt, .ge, .eq, .ne, .missing => .{ .cell = .{ .boolean = try self.builtinPred(bi, b.call.args, cells) } },
                 },
-                .user => |sym| .{ .value = try self.callUser(sym, cells) },
-                .variable => |f| .{ .value = try self.applyVar(&rel, i, f, cells) },
+                .user => |sym| .{ .value = try self.kept(try self.callUser(sym, cells)) },
+                .variable => |f| .{ .value = try self.kept(try self.applyVar(&rel, i, f, cells)) },
             };
             rel.rowInto(i, row[0..rel.cols.len]);
             try self.bindResult(b, result, row, rel.cols.len, &out);
@@ -1131,7 +1131,7 @@ pub const Exec = struct {
                 const vals = try self.arena.alloc(Value, members.len);
                 for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
                 const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
-                return Cell.fromValue(result);
+                return Cell.fromValue(try self.kept(result));
             },
             .sum, .avg => {
                 var isum: i128 = 0;
