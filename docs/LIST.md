@@ -76,9 +76,11 @@ reader and macro material; large sequences are vectors.
    `finalizeOrdered(acc, count)`), truncated to `u32`; `vector.hashSeq`
    computes the same value for the same elements. The caller mixes in
    the sequential domain byte. A cons cell caches a nonzero result in
-   its header (SEMANTICS §3.1); a view caches nothing, because every
-   offset of it shares one header. A view used over and over as a map
-   key (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
+   its header (SEMANTICS §3.1). A view at offset 0 holds its vector's
+   elements and takes the vector's hash, cached in the vector's root; a
+   view at another offset caches nothing, because every offset of it
+   shares one header. Such a view used over and over as a map key
+   (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
    `vec` of it gives a key that caches its hash.
 3. **Equality.** `equalSeq` walks both lists in lock step through their
    cursors: same length and every pair `=`.
