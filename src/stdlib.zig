@@ -3670,8 +3670,8 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(vm.allocator);
 
-    var maybe_kv = walk.first(start_bytes);
-    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
+    var maybe_kv = walk.first(start_bytes) catch |err| return dbFailure(vm, err);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next() catch |err| return dbFailure(vm, err)) {
         if (end_bytes) |eb| {
             if (std.mem.order(u8, kv.key, eb) != .lt) break;
         }
@@ -3719,8 +3719,8 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     h.held += 1;
     defer h.held -= 1;
 
-    var maybe_kv = walk.first(null);
-    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
+    var maybe_kv = walk.first(null) catch |err| return dbFailure(vm, err);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next() catch |err| return dbFailure(vm, err)) {
         const decoded_v = try decodeEntry(vm, kv);
         const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
         const call_args = [_]Value{ acc, key_v, decoded_v };

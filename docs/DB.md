@@ -84,17 +84,23 @@ tree in the same transaction are a bit test. A tree registered by an
 aborted transaction stays registered and reads as empty.
 
 **Walks.** `db/scan` and `db/reduce-tree` walk a tree with a `Walk`,
-an emdb cursor that decodes each entry before advancing: a multi-page
-value is assembled in the transaction's buffer, valid until the next
-multi-page read on that transaction. emdb leaves undefined what a
-cursor sees once its own tree is written under it, so a walk over a
-write transaction registers on it, and a `put` or `del` to the walked
-tree first copies the entries the walk has yet to visit, keys and
-values, onto the connection's allocator. The walk then goes on over
-the copy: it sees the tree as it was when it began, as a Clojure
-`reduce` never sees its own updates. A walk nothing writes under copies
-nothing; one whose callback writes its tree pays one copy of the rest
-of the tree, at the first such write.
+an emdb cursor that reads keys only (emdb API-C09): each value comes
+whole into one buffer of the walk, decoded before the walk advances,
+so a walk holds only the largest value it has met, where the
+transaction would keep every multi-page value it assembled until it
+ends (API-KV01). A page or a value that cannot be read ends the walk
+with its error, `:db/corrupted` (or `:out-of-memory`), never as a
+shorter walk: emdb's cursor stops as at the end and records why
+(API-C08), and a read transaction, which nexis aborts, would report it
+nowhere. emdb lets a read cursor in a write transaction step on only
+while nothing changes the transaction (API-C06A), so a walk over a
+write transaction registers on it, and any `put` or `del` through the
+transaction, to whichever tree, first copies the entries the walk has
+yet to visit, keys and values, onto the connection's allocator. The
+walk then goes on over the copy: it sees the tree as it was when it
+began, as a Clojure `reduce` never sees its own updates. A walk
+nothing writes under copies nothing; one whose callback writes pays
+one copy of the rest of the tree, at the first write.
 
 **Closing.** `close` aborts every transaction the language holds on
 the connection (§3.2), syncs the file when a commit left it unsynced
@@ -257,8 +263,10 @@ newest commit, and the next operation's read on any connection to the
 file begins by `takeHeld`, which hands it out while no commit, by this
 process or another, has passed it (its snapshot is still the active
 meta page's), and otherwise ends it. One operation uses it at a time:
-a read nested inside another begins its own, since a multi-page value
-lives in its transaction's buffer. A read on the view of a `with` is a
+a read nested inside another begins its own. A read transaction keeps
+every multi-page value its reads assembled until it ends (emdb
+API-KV01), so the held one accumulates those of every operation it
+serves, until a commit passes it or a collection lets it go. A read on the view of a `with` is a
 child of the held write transaction and is never kept.
 
 A held snapshot pins the pages every later commit frees, so it goes:

@@ -600,8 +600,8 @@ pub const WriteTxn = struct {
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
     opened: TreeSet = .empty,
-    /// Walks in progress over this transaction's trees; a write to a
-    /// walked tree copies what the walk has yet to visit first.
+    /// Walks in progress over this transaction's trees; a write
+    /// through the transaction copies what each has yet to visit first.
     walks: ?*Walk = null,
 };
 
@@ -765,22 +765,29 @@ pub fn handleCount() usize {
 // =============================================================================
 
 /// A walk over one named tree of a transaction in key order: `db/scan`
-/// and `db/reduce-tree`. emdb leaves undefined what a cursor sees once
-/// its own tree is written under it, so a write through the
-/// transaction to a tree being walked first copies the entries the
-/// walk has yet to visit (`WriteTxn.walks`): the walk sees the tree as
-/// it was when it began, whatever its callback writes, and a walk no
-/// callback writes under copies nothing. A walk lives on its caller's
-/// stack between `begin` and `end`.
+/// and `db/reduce-tree`. emdb lets a read cursor in a write transaction
+/// step on only while nothing changes the transaction (API-C06A), so
+/// any write through the transaction first copies the entries every
+/// walk on it has yet to visit (`WriteTxn.walks`): the walk sees the
+/// tree as it was when it began, whatever its callback writes, and a
+/// walk no callback writes under copies nothing. The cursor reads keys
+/// only, and each value is copied into one buffer of the walk, so a
+/// walk holds only the largest value and never the transaction's copy
+/// of every one (emdb API-C09). A page or a value that cannot be read
+/// ends the walk with its error, never as a shorter walk (API-C08). A
+/// walk lives on its caller's stack between `begin` and `end`.
 pub const Walk = struct {
     cursor: emdb.Cursor,
-    tree: emdb.TreeId,
     allocator: std.mem.Allocator,
+    /// The value of the entry last returned.
+    value: std.ArrayList(u8) = .empty,
     /// The write transaction the walk is registered on.
     owner: ?*WriteTxn,
     next_walk: ?*Walk = null,
-    /// The entries still to visit once the tree was written: key and
-    /// value bytes back to back, and where each key and value ends.
+    /// `first` has positioned the cursor.
+    started: bool = false,
+    /// The entries still to visit once the transaction was written: key
+    /// and value bytes back to back, and where each key and value ends.
     rest: ?struct {
         bytes: std.ArrayList(u8) = .empty,
         ends: std.ArrayList([2]usize) = .empty,
@@ -791,16 +798,16 @@ pub const Walk = struct {
 
     /// Start a walk over `tree_name` in `txn` (a `*WriteTxn` or
     /// `*ReadTxn`); false when the tree does not exist, and then no
-    /// `end` is due.
+    /// `end` is due. `first` positions it.
     pub fn begin(self: *Walk, txn: anytype, tree_name: []const u8) !bool {
         try validateTreeName(tree_name);
         const id = (try treeId(txn, tree_name, false)) orelse return false;
         self.* = .{
             .cursor = try txn.inner.openCursorForTree(id),
-            .tree = id,
             .allocator = txn.conn.allocator,
             .owner = null,
         };
+        self.cursor.keysOnly = true;
         if (@TypeOf(txn) == *WriteTxn) {
             self.owner = txn;
             self.next_walk = txn.walks;
@@ -819,19 +826,25 @@ pub const Walk = struct {
                 }
             }
         }
+        self.value.deinit(self.allocator);
         if (self.rest) |*r| {
             r.bytes.deinit(self.allocator);
             r.ends.deinit(self.allocator);
         }
     }
 
-    /// The first entry, or the first at or after `start`.
-    pub fn first(self: *Walk, start: ?[]const u8) ?Entry {
-        return if (start) |s| self.cursor.setRange(s) else self.cursor.first();
+    /// The first entry, or the first at or after `start`; null when
+    /// there is none. Called once, before `next` and before any write
+    /// through the transaction.
+    pub fn first(self: *Walk, start: ?[]const u8) !?Entry {
+        self.started = true;
+        const kv = (if (start) |s| self.cursor.setRange(s) else self.cursor.first()) orelse return self.stopped();
+        return try self.entry(kv);
     }
 
-    pub fn next(self: *Walk) ?Entry {
-        const r = if (self.rest) |*r| r else return self.cursor.next();
+    /// The next entry; null at the end.
+    pub fn next(self: *Walk) !?Entry {
+        const r = if (self.rest) |*r| r else return self.step();
         if (r.at == r.ends.items.len) return null;
         const from = if (r.at == 0) 0 else r.ends.items[r.at - 1][1];
         const e = r.ends.items[r.at];
@@ -839,28 +852,53 @@ pub const Walk = struct {
         return .{ .key = r.bytes.items[from..e[0]], .value = r.bytes.items[e[0]..e[1]] };
     }
 
-    /// Copy what the cursor has yet to visit, before the tree changes
-    /// under it. Each value is copied before the cursor moves: a
-    /// multi-page value lives in the transaction's buffer until the
-    /// next multi-page read.
+    fn step(self: *Walk) !?Entry {
+        const kv = self.cursor.next() orelse return self.stopped();
+        return try self.entry(kv);
+    }
+
+    /// Null at the real end; the cursor's error when a page or a value
+    /// stopped it short.
+    fn stopped(self: *Walk) !?Entry {
+        if (self.cursor.failure) |err| return err;
+        return null;
+    }
+
+    /// `kv` with its whole value. A key-only cursor leaves a value on
+    /// overflow pages empty; no stored value is empty, as the codec
+    /// writes at least its version byte, and one read again is the same.
+    fn entry(self: *Walk, kv: Entry) !Entry {
+        if (kv.value.len > 0) return kv;
+        const v = (try self.cursor.readValueInto(self.allocator, &self.value)) orelse return error.InvalidPage;
+        return .{ .key = kv.key, .value = v };
+    }
+
+    /// Copy what the cursor has yet to visit, before the transaction
+    /// changes under it.
     fn copyRest(self: *Walk) !void {
-        self.rest = .{};
-        const r = &self.rest.?;
-        while (self.cursor.next()) |kv| {
+        // Unpositioned, the cursor would read as at its end.
+        std.debug.assert(self.started);
+        var r: @typeInfo(@FieldType(Walk, "rest")).optional.child = .{};
+        errdefer {
+            r.bytes.deinit(self.allocator);
+            r.ends.deinit(self.allocator);
+        }
+        while (try self.step()) |kv| {
             try r.bytes.appendSlice(self.allocator, kv.key);
             const key_end = r.bytes.items.len;
             try r.bytes.appendSlice(self.allocator, kv.value);
             try r.ends.append(self.allocator, .{ key_end, r.bytes.items.len });
         }
+        self.rest = r;
     }
 };
 
-/// Before `txn` writes tree `id`: every walk over it copies what it
-/// has yet to visit.
-fn beforeWrite(txn: *WriteTxn, id: emdb.TreeId) !void {
+/// Before `txn` writes: every walk on it copies what it has yet to
+/// visit.
+fn beforeWrite(txn: *WriteTxn) !void {
     var it = txn.walks;
     while (it) |w| : (it = w.next_walk) {
-        if (w.tree == id and w.rest == null) try w.copyRest();
+        if (w.rest == null) try w.copyRest();
     }
 }
 
@@ -920,12 +958,11 @@ pub fn put(
     v: Value,
 ) !void {
     try validateTreeNameAndKey(tree_name, key_bytes);
-    const tree_id = (try treeId(txn, tree_name, true)).?;
-    // Encode the value via codec, pass the bytes to emdb, free the
-    // codec buffer.
     const encoded = try codec_mod.encode(txn.conn.allocator, txn.conn.interner, v);
     defer txn.conn.allocator.free(encoded);
-    try beforeWrite(txn, tree_id);
+    // Creating the tree changes the transaction too.
+    try beforeWrite(txn);
+    const tree_id = (try treeId(txn, tree_name, true)).?;
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
@@ -984,7 +1021,7 @@ pub fn del(
 ) !bool {
     try validateTreeNameAndKey(tree_name, key_bytes);
     const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
-    try beforeWrite(txn, tree_id);
+    try beforeWrite(txn);
     return try txn.inner.delFromTree(tree_id, key_bytes);
 }
 
@@ -1876,6 +1913,102 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
         defer abortWrite(&wtxn);
         try testing.expect(!(try del(&wtxn, "scratch", "k")));
     }
+}
+
+/// A store at `path` whose tree `t` holds `a`, a value of `big` bytes
+/// of `x` on overflow pages under `b`, and `c`; with `damage`, one byte
+/// in the middle of `b`'s value is changed on the disk, so its page
+/// fails its check.
+fn walkStore(path: [:0]const u8, big: usize, damage: bool) !void {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    {
+        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+        defer shutdown(&conn);
+        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
+        errdefer txn.abort();
+        const t = try txn.openTree("t", true);
+        const bytes = try testing.allocator.alloc(u8, big);
+        defer testing.allocator.free(bytes);
+        @memset(bytes, 'x');
+        try txn.putInTree(t, "a", "1");
+        try txn.putInTree(t, "b", bytes);
+        try txn.putInTree(t, "c", "3");
+        try txn.commit();
+    }
+    if (!damage) return;
+    const io = testing.io;
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .unlimited);
+    defer testing.allocator.free(data);
+    const run: [64]u8 = @splat('x');
+    const at = std.mem.find(u8, data, &run).? + big / 2;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.writePositionalAll(io, "y", at);
+}
+
+test "Walk: a page that fails its check ends the walk with its error, never as a shorter walk" {
+    const path = try tmpDbPath(testing.allocator, "walk_damaged");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    try walkStore(path, 1 << 20, true);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    var walk: Walk = undefined;
+    try testing.expect(try walk.begin(&r, "t"));
+    defer walk.end();
+    try testing.expectEqualStrings("a", (try walk.first(null)).?.key);
+    try testing.expectError(error.InvalidPage, walk.next());
+
+    // A write under a walk copies the rest of it, and meets the same page.
+    var w = try beginWrite(&conn);
+    defer abortWrite(&w);
+    var over: Walk = undefined;
+    try testing.expect(try over.begin(&w, "t"));
+    defer over.end();
+    _ = (try over.first(null)).?;
+    try testing.expectError(error.InvalidPage, put(&w, "u", "k", value.fromFixnum(1).?));
+}
+
+test "Walk: a write to any tree of the transaction copies the rest first; values come whole from overflow pages" {
+    const path = try tmpDbPath(testing.allocator, "walk_copy");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    try walkStore(path, 3 * page_size, false);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+
+    var w = try beginWrite(&conn);
+    defer abortWrite(&w);
+    var walk: Walk = undefined;
+    try testing.expect(try walk.begin(&w, "t"));
+    defer walk.end();
+    try testing.expectEqualStrings("1", (try walk.first(null)).?.value);
+    try testing.expect(walk.rest == null);
+    // Another tree: the cursor may not step past a change anywhere in
+    // the transaction (emdb API-C06A).
+    try put(&w, "u", "k", value.fromFixnum(1).?);
+    try testing.expect(walk.rest != null);
+    try testing.expect(try del(&w, "t", "c"));
+    const b = (try walk.next()).?;
+    try testing.expectEqualStrings("b", b.key);
+    try testing.expectEqual(@as(usize, 3 * page_size), b.value.len);
+    try testing.expect(std.mem.allEqual(u8, b.value, 'x'));
+    try testing.expectEqualStrings("c", (try walk.next()).?.key);
+    try testing.expect(try walk.next() == null);
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {
