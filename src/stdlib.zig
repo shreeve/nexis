@@ -1108,14 +1108,16 @@ fn fnBitClear(vm: *VM, args: []const Value) VmError!Value {
     return integerValue(vm, try intArg(args[0]) & ~try bitMask(args[1]));
 }
 
-/// The generator behind `rand` and `rand-int`, seeded from the clock
-/// at first use. One isolate, one thread.
+/// The generator behind `rand`, `rand-int`, `shuffle` and
+/// `random-uuid`, seeded from the I/O's entropy at first use. One
+/// isolate, one thread.
 var prng: ?std.Random.DefaultPrng = null;
 
 fn random(vm: *VM) std.Random {
     if (prng == null) {
-        const now = std.Io.Clock.real.now(ioOf(vm));
-        prng = std.Random.DefaultPrng.init(@truncate(@as(u128, @bitCast(@as(i128, now.nanoseconds)))));
+        var seed: [8]u8 = undefined;
+        ioOf(vm).random(&seed);
+        prng = std.Random.DefaultPrng.init(std.mem.readInt(u64, &seed, .little));
     }
     return prng.?.random();
 }
@@ -1127,11 +1129,13 @@ fn fnRand(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFloat(r * try asDouble(args[0]));
 }
 
-/// `(rand-int n)` → an integer in [0, n); n must be positive.
+/// `(rand-int n)` → `(int (rand n))`, as Clojure's: an integer in
+/// [0, n), in (n, 0] for a negative `n`, 0 for 0.
 fn fnRandInt(vm: *VM, args: []const Value) VmError!Value {
     const n = try intArg(args[0]);
-    if (n <= 0) return VmError.InvalidArgument;
-    return integerValue(vm, random(vm).intRangeLessThan(i64, 0, n));
+    if (n == 0) return value_mod.fromFixnum(0).?;
+    const m: i64 = @intCast(random(vm).uintLessThan(u64, @abs(n)));
+    return integerValue(vm, if (n > 0) m else -m);
 }
 
 /// `(double x)`: a number as an f64.

@@ -1493,6 +1493,8 @@ test "integration: bit operations" {
 
 test "integration: rand, rand-int, rand-nth, shuffle stay in range" {
     try expectOutput("(let [xs (repeatedly 200 #(rand-int 10))] [(every? #(<= 0 % 9) xs) (every? (fn [_] (< -1 (rand) 1)) (range 50)) (contains? #{:a :b} (rand-nth [:a :b])) (sort (shuffle [3 1 2]))])", "[true true true (1 2 3)]");
+    // rand-int is (int (rand n)), as Clojure's: 0 for 0, (n, 0] below.
+    try expectOutput("[(rand-int 0) (every? #(<= -4 % 0) (repeatedly 100 #(rand-int -5))) (rand-int 1)]", "[0 true 0]");
 }
 
 test "integration: format with %s %d %f %x %% and widths" {
