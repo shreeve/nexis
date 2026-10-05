@@ -470,47 +470,39 @@
 ; Threading macros
 ; ============================================================
 
+; The threading macros below expand once, to one let chain over their
+; steps, as Clojure's do, so a long chain costs linear expansion. Each
+; binds g to every step but the last, which is the body.
+(defn- step-chain [g init steps]
+  `(let [~g ~init ~@(interleave (repeat (count steps) g) (butlast steps))]
+     ~(if (empty? steps) g (last steps))))
+
 ; (cond-> x test step ...) → threads x through each step whose
 ; test is truthy. The tests are ordinary expressions; they are
 ; not threaded, exactly as in Clojure.
 (defmacro cond-> [expr & clauses]
-  (if (empty? clauses)
-    expr
-    `(let* [g# ~expr
-            next# (if ~(first clauses) (-> g# ~(second clauses)) g#)]
-       (cond-> next# ~@(rest (rest clauses))))))
+  (assert (even? (count clauses)))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [[test step]] `(if ~test (-> ~g ~step) ~g)) (partition 2 clauses)))))
 
 (defmacro cond->> [expr & clauses]
-  (if (empty? clauses)
-    expr
-    `(let* [g# ~expr
-            next# (if ~(first clauses) (->> g# ~(second clauses)) g#)]
-       (cond->> next# ~@(rest (rest clauses))))))
+  (assert (even? (count clauses)))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [[test step]] `(if ~test (->> ~g ~step) ~g)) (partition 2 clauses)))))
 
 ; (some-> x f g ...) → threads while the value is non-nil.
 (defmacro some-> [expr & forms]
-  (if (empty? forms)
-    expr
-    `(let* [g# ~expr]
-       (if (nil? g#)
-         nil
-         (some-> (-> g# ~(first forms)) ~@(rest forms))))))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (-> ~g ~step))) forms))))
 
 (defmacro some->> [expr & forms]
-  (if (empty? forms)
-    expr
-    `(let* [g# ~expr]
-       (if (nil? g#)
-         nil
-         (some->> (->> g# ~(first forms)) ~@(rest forms))))))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (->> ~g ~step))) forms))))
 
 ; (as-> x name form ...) → binds name to x, then to each form
 ; in turn.
 (defmacro as-> [expr name & forms]
-  (if (empty? forms)
-    expr
-    `(let* [~name ~expr]
-       (as-> ~(first forms) ~name ~@(rest forms)))))
+  (step-chain name expr forms))
 
 ; ============================================================
 ; More sequence and function helpers

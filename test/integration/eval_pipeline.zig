@@ -5132,6 +5132,25 @@ test "core: macros" {
     });
 }
 
+test "core: cond->, some-> and as-> expand once, to one let chain" {
+    // One let binding the gensym to every step but the last, as
+    // Clojure's, so expansion grows linearly with the steps.
+    try expectOutput("(let [e (macroexpand-1 '(cond-> 1 true inc false dec true inc))] [(count (second e)) (count (filter seq? (second e)))])", "[6 2]");
+    try expectOutput("[(count (second (macroexpand-1 '(some-> 1 inc inc inc)))) (count (second (macroexpand-1 '(as-> 1 x (inc x) (inc x)))))]", "[6 4]");
+    try expectOutput("(try (eval '(cond-> 1 true)) (catch any e :refused))", ":refused");
+    inline for (.{
+        .{ "(cond-> 0", " true inc", "4000" },
+        .{ "(cond->> 0", " true inc", "4000" },
+        .{ "(some-> 0", " inc", "4000" },
+        .{ "(some->> 0", " inc", "4000" },
+        .{ "(as-> 0 x", " (inc x)", "4000" },
+    }) |c| {
+        const src = try generated(c[0], c[1], 4000, ")");
+        defer testing.allocator.free(src);
+        try expectOutput(src, c[2]);
+    }
+}
+
 // =============================================================================
 // VM.throwValue / VM.throwKeyword from native code
 // =============================================================================
