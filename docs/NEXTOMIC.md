@@ -616,7 +616,10 @@ That scan costs the whole database and is the price of `[?e _ ?v]`
 without an attribute; give the attribute when it is known. A constant
 that cannot exist in the store (an unknown ident, a lookup ref with no
 entity, a value of the wrong type for the attribute) makes its scan
-unsatisfiable: it yields nothing and is not an error.
+unsatisfiable: it yields nothing and is not an error. A uuid value is
+its canonical lowercase text in a query, as a constant or a bound
+value: another spelling of it matches nothing (`parse-uuid` gives the
+canonical text).
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.

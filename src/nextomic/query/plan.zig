@@ -1122,7 +1122,11 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Con
                     error.ValueType => return null,
                     else => return err,
                 };
-                return .{ .cell = try marshal.cellOf(ctx.read, ctx.arena, val), .bytes = bytes };
+                const cell = try marshal.cellOf(ctx.read, ctx.arena, val);
+                // A uuid compares as its canonical text, as a bound
+                // variable's does: another spelling names no value.
+                if (val == .uuid and !std.mem.eql(u8, cell.str, c.cell.str)) return null;
+                return .{ .cell = cell, .bytes = bytes };
             }
             return switch (c) {
                 .cell => |cell| .{ .cell = cell },

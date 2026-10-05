@@ -1304,6 +1304,17 @@ test "corpus: every :in form" {
     var in_diag: query.Diag = .{};
     try testing.expectError(error.UnknownAttribute, runEngineDiag(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }, &in_diag));
     try testing.expectEqual(try fx.kwId("nope/attr"), in_diag.attr.?.asKeywordId());
+
+    // A uuid compares as its canonical lowercase text, as a constant
+    // and as an input alike: other spellings name no stored value.
+    _ = try fx.transact("[{:db/ident :thing/uid :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one}]");
+    _ = try fx.transact("[{:thing/uid \"0123abcd-4567-89ef-0123-456789abcdef\"}]");
+    const uv = try fx.db();
+    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid \"0123abcd-4567-89ef-0123-456789abcdef\"]]", &.{nil}, 1);
+    try checkCount(fx, uv, "[:find ?e :where [?e :thing/uid \"0123ABCD-4567-89EF-0123-456789ABCDEF\"]]", &.{nil}, 0);
+    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.str("0123abcd-4567-89ef-0123-456789abcdef") }, 1);
+    try checkCount(fx, uv, "[:find ?e :in $ ?u :where [?e :thing/uid ?u]]", &.{ nil, try fx.str("0123ABCD-4567-89EF-0123-456789ABCDEF") }, 0);
+    try checkCount(fx, uv, "[:find ?e :in $ [?u ...] :where [?e :thing/uid ?u]]", &.{ nil, try fx.read("[\"0123ABCD-4567-89EF-0123-456789ABCDEF\" \"0123abcd-4567-89ef-0123-456789abcdef\"]") }, 1);
 }
 
 test "corpus: not, not-join, or, or-join, and" {
