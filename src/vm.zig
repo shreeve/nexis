@@ -973,17 +973,27 @@ pub const Frame = struct {
 pub const HostCallResult = struct {
     done: bool = false,
     value: Value = value_mod.nilValue(),
+
+    /// The returned value, once the loop is back at the call's depth:
+    /// without a return, a throw went past the call.
+    fn get(self: *const HostCallResult) VmError!Value {
+        return if (self.done) self.value else VmError.ControlTransferred;
+    }
 };
 
 /// One frame of `VM.error_trace`: the routine that was running,
 /// the index of the instruction it was executing (for a caller
 /// frame, the call), that instruction's source span when the
 /// routine carries a span table, and the source the span indexes.
+/// The marker frame a long chain is cut at counts the frames it
+/// stands for in `elided`; its name is fixed text for a host that
+/// does not read the count.
 pub const TraceFrame = struct {
     name: []const u8,
     pc: u32,
     span: ?SourceSpan,
     source: ?*const SourceInfo,
+    elided: usize = 0,
 };
 
 /// Where a throw a handler took was raised (VM.md §12): the value, the
@@ -998,7 +1008,6 @@ pub const ThrowOrigin = struct {
     detail_len: usize = 0,
     trace: [VM.trace_capacity]TraceFrame = undefined,
     trace_len: usize = 0,
-    gap_buf: [48]u8 = undefined,
 };
 
 // =============================================================================
@@ -1420,13 +1429,8 @@ pub const Callback = struct {
     pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
         std.debug.assert(args.len == self.argc);
         switch (self.mode) {
-            .leaf => return asNativeFn(self.callee).call(self.vm, args),
-            .lookup => switch (args[0].kind()) {
-                .nil => return value_mod.nilValue(),
-                .persistent_map => return mapLookup(args[0], self.callee, value_mod.nilValue()),
-                .record => return mapLookup(record_mod.fieldsOf(args[0]), self.callee, value_mod.nilValue()),
-                else => {},
-            },
+            .leaf => if (!self.vm.gcDue()) return asNativeFn(self.callee).call(self.vm, args),
+            .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
             .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
             .unprepared => return self.prepare(args),
             .general => {},
@@ -1453,7 +1457,7 @@ pub const Callback = struct {
                 // Every later call starts at this depth of the native
                 // stack, so the guard's answer holds for them all
                 // (§13.1).
-                stack_guard.check() catch return VmError.StackOverflow;
+                try vm.checkNesting();
                 const depth = vm.frames.items.len;
                 const base = vm.stack.items.len;
                 const window_end = base + routine.slot_count;
@@ -1553,6 +1557,11 @@ pub const VM = struct {
     /// The collector's gray worklist, kept between cycles so each
     /// cycle reuses the capacity the last one grew (GC.md §4).
     gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
+    /// The routines whose constants this cycle has marked, so the
+    /// many closures over one large routine walk its pool once
+    /// (`markRoutineConsts`); emptied at each cycle's start, its
+    /// capacity kept.
+    gc_routines: std.AutoHashMapUnmanaged(*const Routine, void) = .empty,
     /// The root stack (GC.md §3): values a native holds in Zig
     /// locals across a call back into the VM. `callValue` pushes a
     /// native callee's arguments for the call's duration; a native
@@ -1693,9 +1702,14 @@ pub const VM = struct {
     /// recursion is a catchable `:stack-overflow` instead of memory
     /// growing until the process dies (§13).
     max_frames: usize = default_max_frames,
-    /// The text of the marker `recordErrorTrace` puts where it
-    /// leaves frames out.
-    trace_gap: [48]u8 = undefined,
+    /// The most run loops that may nest on the native stack, one per
+    /// call back into the VM from a native (`apply`, `map`, a
+    /// protocol impl) that is still running. A call that would nest
+    /// one more raises `StackOverflow` before the recursion has
+    /// committed much native stack (§13.1).
+    max_nested_runs: usize = default_max_nested_runs,
+    /// The run loops nested now.
+    nested_runs: usize = 0,
     /// What the most recent runtime error was about, for the host's
     /// report: `f takes 1 argument, got 0`, `+ expects numbers, got
     /// a string`. Set where the VM raises the error, empty when the
@@ -1714,6 +1728,7 @@ pub const VM = struct {
     escaped_origin: ?u32 = null,
 
     pub const default_max_frames = 1 << 20;
+    pub const default_max_nested_runs = 100_000;
     /// A trace keeps this many innermost frames and
     /// `trace_outermost` outermost ones; a marker frame counts the
     /// rest.
@@ -1767,6 +1782,7 @@ pub const VM = struct {
         self.dyn_frames.deinit(self.allocator);
         self.roots.deinit(self.allocator);
         self.gc_gray.deinit(self.allocator);
+        self.gc_routines.deinit(self.allocator);
         // Free handler + finally stack backing storage. Both
         // contain POD entries.
         self.handlers.deinit(self.allocator);
@@ -1950,6 +1966,14 @@ pub const VM = struct {
     // The collector's host (VM.md §9, GC.md §3)
     // -------------------------------------------------------------------------
 
+    /// Trigger by `policy` from here on: the next cycle is due after
+    /// `policy.threshold` bytes.
+    pub fn setGcPolicy(self: *VM, policy: GcPolicy) void {
+        self.gc_threshold = policy.threshold;
+        self.gc_growth_percent = policy.growth_percent;
+        self.gc_next_at = policy.threshold;
+    }
+
     /// Whether a cycle is due at this safe point: the VM collects,
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
@@ -1971,6 +1995,7 @@ pub const VM = struct {
         var collector = gc_mod.Collector.init(heap);
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
         collector.gray = self.gc_gray;
+        self.gc_routines.clearRetainingCapacity();
         _ = collector.collect(&.{});
         self.gc_gray = collector.gray;
         self.gc_cycles += 1;
@@ -1994,7 +2019,7 @@ pub const VM = struct {
         // through the closure block (`gcTrace`), marked once however
         // many frames run it; any other frame has no cells.
         for (self.frames.items) |*f| {
-            if (f.closure.isNil()) markRoutineConsts(c, f.routine) else c.markValue(f.closure);
+            if (f.closure.isNil()) self.markRoutineConsts(c, f.routine) else c.markValue(f.closure);
         }
         if (self.registry) |*reg| {
             var it = reg.map.valueIterator();
@@ -2032,21 +2057,29 @@ pub const VM = struct {
     /// The heap constants of `routine` and, recursively, of the
     /// routines in its pool: string and bignum literals live on the
     /// heap and a routine is reachable from every frame running it
-    /// and every closure over it.
-    fn markRoutineConsts(c: *gc_mod.Collector, routine: *const Routine) void {
+    /// and every closure over it. A routine with more than a few
+    /// constants or nested routines is walked once per cycle, however
+    /// many closures reach it; a small one costs less to walk again
+    /// than to look up.
+    fn markRoutineConsts(self: *VM, c: *gc_mod.Collector, routine: *const Routine) void {
+        if (routine.consts.len + routine.capture_descs.len > 8) {
+            const seen = self.gc_routines.getOrPut(self.allocator, routine) catch null;
+            if (seen) |entry| if (entry.found_existing) return;
+        }
         for (routine.consts) |v| c.markValue(v);
-        for (routine.capture_descs) |d| markRoutineConsts(c, d.routine);
+        for (routine.capture_descs) |d| self.markRoutineConsts(c, d.routine);
     }
 
     /// Trace a closure (its cells and its routine's constants) or a
     /// cell (its value); the collector has marked `h` already.
-    fn gcTrace(_: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
+    fn gcTrace(ctx: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
+        const self: *VM = @ptrCast(@alignCast(ctx));
         const k: value_mod.Kind = @fromBackingInt(@intCast(h.kind));
         switch (k) {
             .function => {
                 const closure = heap_mod.Heap.bodyOf(Closure, h);
                 for (closure.upvalues) |cell| c.mark(cellHeader(cell));
-                markRoutineConsts(c, closure.routine);
+                self.markRoutineConsts(c, closure.routine);
             },
             .cell_internal => c.markValue(heap_mod.Heap.bodyOf(UpvalCell, h).value),
             else => unreachable,
@@ -2289,14 +2322,16 @@ pub const VM = struct {
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         if (callee.kind() == .native_fn) {
             const native = asNativeFn(callee);
-            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len)) return native.call(self, args);
+            // A leaf allocates and cannot collect, so a native calling
+            // one per element takes the rooted path below whenever a
+            // cycle is due.
+            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) return native.call(self, args);
         }
-        // Every re-entry nests a native call and a run loop on the
-        // native stack (§13.1).
-        stack_guard.check() catch return VmError.StackOverflow;
+        try self.checkNesting();
         if (callee.kind() != .function) {
             const scope = self.rootScope();
             defer scope.release();
+            try scope.push(callee);
             try scope.pushAll(args);
             // A native called from a native reaches no closure frame's
             // safe point, so a loop of them (`(reduce conj #{} xs)`)
@@ -2324,9 +2359,15 @@ pub const VM = struct {
             };
         }
         try self.loop(depth);
-        // Back at `depth` without a return: a throw went past us.
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
+    }
+
+    /// Every re-entry nests a native call, and most a run loop, on the
+    /// native stack: past the guard or `max_nested_runs` it is
+    /// `StackOverflow` (§13.1).
+    inline fn checkNesting(self: *VM) VmError!void {
+        stack_guard.check() catch return VmError.StackOverflow;
+        if (self.nested_runs >= self.max_nested_runs) return VmError.StackOverflow;
     }
 
     /// A `Callback`'s call of its closure, from the depth and stack
@@ -2346,9 +2387,7 @@ pub const VM = struct {
         frame.* = cb.frame;
         frame.host_result = &result_cell;
         try self.loop(cb.depth);
-        // Back at the depth without a return: a throw went past us.
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
     }
 
     /// Call `callee`, anything but a closure, with `args`, to
@@ -2547,7 +2586,7 @@ pub const VM = struct {
     /// (one installed beneath the nested frame) takes it,
     /// `ControlTransferred`, exactly as `callValue` reports it.
     pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
-        stack_guard.check() catch return VmError.StackOverflow;
+        try self.checkNesting();
         if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
         const base_slot: usize = self.stack.items.len;
         self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
@@ -2565,8 +2604,7 @@ pub const VM = struct {
             self.recordErrorTrace(err);
             return err;
         };
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
     }
 
     /// The fetch-and-dispatch loop, the only one: until the VM
@@ -2583,7 +2621,11 @@ pub const VM = struct {
     fn loop(self: *VM, depth: usize) VmError!void {
         const outer = self.loop_depth;
         self.loop_depth = depth;
-        defer self.loop_depth = outer;
+        self.nested_runs += 1;
+        defer {
+            self.loop_depth = outer;
+            self.nested_runs -= 1;
+        }
         while (self.running()) {
             opEnter(self, self.currentFrame(), undefined) catch |err| switch (err) {
                 // A native's throw was caught below it: frames and pc
@@ -2830,9 +2872,9 @@ pub const VM = struct {
     /// forms on one VM whose namespaces, interner and runtime
     /// values persist between them.
     pub fn retargetTop(self: *VM, routine: *const Routine) VmError!void {
-        // A failed run leaves its frames for the trace;
-        // `resetAfterError` discards them before the next form.
-        std.debug.assert(self.frames.items.len == 1);
+        // A failed run leaves its frames for the trace; a host that
+        // did not discard them has them discarded here.
+        if (self.frames.items.len > 1) self.resetAfterError();
         const top = &self.frames.items[0];
         top.routine = routine;
         top.pc = 0;
@@ -2867,9 +2909,8 @@ pub const VM = struct {
     /// intact here: an uncaught throw and an untranslated `VmError`
     /// both leave the chain as it was. A parked top frame (one
     /// resting on `idle_routine`) is not part of any run and is
-    /// left out. A chain deeper than `trace_innermost +
-    /// trace_outermost` keeps both ends and one marker frame, named
-    /// for the number of frames between them.
+    /// left out. A chain longer than `trace_capacity` keeps both
+    /// ends and one marker frame counting the frames between them.
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
@@ -2880,33 +2921,26 @@ pub const VM = struct {
             @memcpy(self.detail_buf[0..o.detail_len], o.detail_buf[0..o.detail_len]);
             self.error_detail = self.detail_buf[0..o.detail_len];
             self.error_trace.appendSlice(self.allocator, o.trace[0..o.trace_len]) catch return;
-            // The detail and the elision marker's text move to the
-            // VM's own buffers, which outlive the origin.
-            for (self.error_trace.items) |*frame| if (frame.name.ptr == &o.gap_buf) {
-                @memcpy(self.trace_gap[0..frame.name.len], frame.name);
-                frame.name = self.trace_gap[0..frame.name.len];
-            };
             return;
         };
         var buf: [trace_capacity]TraceFrame = undefined;
-        const n = self.captureTrace(&buf, &self.trace_gap);
+        const n = self.captureTrace(&buf);
         self.error_trace.appendSlice(self.allocator, buf[0..n]) catch return;
     }
 
     /// The frame chain as `recordErrorTrace` reports it, into `out`;
-    /// returns how many entries it wrote. The elision marker's text
-    /// goes to `gap`.
-    fn captureTrace(self: *VM, out: []TraceFrame, gap: []u8) usize {
+    /// returns how many entries it wrote.
+    fn captureTrace(self: *VM, out: []TraceFrame) usize {
         const frames = self.frames.items;
         const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
-        const elided = (frames.len - lowest) -| (trace_innermost + trace_outermost);
+        const depth = frames.len - lowest;
+        const elided = if (depth > trace_capacity) depth - (trace_innermost + trace_outermost) else 0;
         var n: usize = 0;
         var i = frames.len;
         while (i > lowest and n < out.len) {
             i -= 1;
             if (elided > 0 and i == frames.len - 1 - trace_innermost) {
-                const name = std.mem.print(gap, "<{d} frames elided>", .{elided}) catch unreachable;
-                out[n] = .{ .name = name, .pc = 0, .span = null, .source = null };
+                out[n] = .{ .name = "<more frames elided>", .pc = 0, .span = null, .source = null, .elided = elided };
                 n += 1;
                 i -= elided - 1;
                 continue;
@@ -2935,7 +2969,7 @@ pub const VM = struct {
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
         o.detail_len = detail.len;
-        o.trace_len = self.captureTrace(&o.trace, &o.gap_buf);
+        o.trace_len = self.captureTrace(&o.trace);
         return @intCast(self.origins.items.len - 1);
     }
 
@@ -2992,7 +3026,16 @@ pub const VM = struct {
         self.unhandled_throw = null;
         self.frames.items[0].routine = &idle_routine;
         @memset(self.stack.items, value_mod.nilValue());
+        // A runaway recursion grew the frame chain and the stack far
+        // past what a form needs; nothing holds into them between
+        // runs, so the memory goes back.
+        if (self.frames.capacity > reset_frames_kept) self.frames.shrinkAndFree(self.allocator, self.frames.items.len);
+        if (self.stack.capacity > reset_frames_kept * 4) self.stack.shrinkAndFree(self.allocator, self.stack.items.len);
     }
+
+    /// The frames, and four times as many stack slots, whose
+    /// capacity `resetAfterError` keeps.
+    const reset_frames_kept = 4096;
 
     /// Runtime error translation to a user-throwable Value.
     /// Recoverable errors (VM.md §13's catchable table) become
@@ -3366,14 +3409,8 @@ pub const VM = struct {
                 // nothing is allocated and no data is walked.
                 .keyword, .symbol => {
                     if (argc != 1 and argc != 2) break :fast;
-                    const target = self.stack.items[base];
                     const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
-                    const result = switch (target.kind()) {
-                        .nil => default,
-                        .persistent_map => mapLookup(target, callee, default),
-                        .record => mapLookup(record_mod.fieldsOf(target), callee, default),
-                        else => break :fast,
-                    };
+                    const result = lookupInPlace(callee, self.stack.items[base], default) orelse break :fast;
                     self.slotAt(frame, inst.c.index).* = result;
                     return self.next(frame);
                 },
@@ -3421,9 +3458,13 @@ pub const VM = struct {
 
         if (call_base + 1 + argc > caller.slot_count) return VmError.CallBlockOutOfRange;
         if (result_dst >= caller.slot_count) return VmError.OperandOutOfRange;
-        const callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
+        var callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
         const args_base: usize = @as(usize, caller.base_slot) + call_base + 1;
         if (args_base + argc > self.stack.items.len) return VmError.BytecodeCorruption;
+        // A Var calls the value in force (Clojure's `Var.invoke`); a
+        // closure there gets a frame like any other, so a recursion
+        // through `#'f` costs no native stack.
+        if (callee.kind() == .var_) callee = asVar(callee).current() orelse return VmError.UnboundVar;
 
         if (callee.kind() == .function) {
             // `caller.pc` is already past this instruction.
@@ -4336,6 +4377,17 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
 }
 
 /// Kinds a `call:call` treats as a lookup rather than a function.
+/// `(k target default)` for a keyword or symbol `k` where it needs no
+/// callback: `target` nil, a hash map or a record; null otherwise.
+inline fn lookupInPlace(k: Value, target: Value, default: Value) ?Value {
+    return switch (target.kind()) {
+        .nil => default,
+        .persistent_map => mapLookup(target, k, default),
+        .record => mapLookup(record_mod.fieldsOf(target), k, default),
+        else => null,
+    };
+}
+
 pub fn isLookupCallable(k: value_mod.Kind) bool {
     return switch (k) {
         .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector, .transient, .sorted_map, .sorted_set => true,
@@ -6815,9 +6867,7 @@ test "VM dispatch: calls and closures under a collection every few kilobytes" {
     routine.capture_descs = &caps;
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    vm.gc_threshold = GcPolicy.stress.threshold;
-    vm.gc_growth_percent = GcPolicy.stress.growth_percent;
-    vm.gc_next_at = GcPolicy.stress.threshold;
+    vm.setGcPolicy(.stress);
     try testing.expectEqual(@as(i64, 125_250), (try vm.run()).asFixnum());
     try testing.expect(vm.gc_cycles > 0);
 }

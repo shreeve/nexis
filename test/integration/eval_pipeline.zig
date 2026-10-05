@@ -883,8 +883,22 @@ test "integration: recursion through a native re-entry ends in a catchable :stac
     try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
 }
 
+test "integration: run loops nest at most max_nested_runs deep" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.max_nested_runs = 50;
+    const g = "(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) ";
+    try harness.expectResult(&program, "", try program.run(g ++ "(g 40)"), "40");
+    try harness.expectResult(&program, "", try program.run("[(try (g 60) (catch any e e)) (try (first (mapv g [60])) (catch any e e)) (g 40)]"), "[:stack-overflow :stack-overflow 40]");
+    try testing.expectEqual(@as(usize, 0), program.v.nested_runs);
+}
+
 test "integration: runaway recursion is a catchable :stack-overflow; deep legitimate recursion runs" {
     try expectOutput("(defn d [n] (if (= n 0) 0 (inc (d (dec n))))) (d 100000)", "100000");
+    // A call through the Var takes a frame, as a call of the closure does.
+    try expectOutput("(defn d [n] (if (= n 0) 0 (inc (#'d (dec n))))) (d 100000)", "100000");
+    try expectOutput("(declare d) (def h #'d) (defn d [n] (if (= n 0) 0 (inc (h (dec n))))) (d 100000)", "100000");
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
@@ -897,7 +911,29 @@ test "integration: runaway recursion is a catchable :stack-overflow; deep legiti
     const trace = program.v.error_trace.items;
     try testing.expectEqual(@as(usize, 41), trace.len);
     try testing.expectEqualStrings("f", trace[0].name);
-    try testing.expectEqualStrings("<19960 frames elided>", trace[32].name);
+    try testing.expectEqual(@as(usize, 19960), trace[32].elided);
+    try testing.expectEqualStrings("test-form", trace[40].name);
+    // A chain of exactly 41 frames is shown whole.
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn g [n] (if (= n 0) (/ 1 0) (+ 1 (g (dec n))))) (g 39)"));
+    try testing.expectEqual(@as(usize, 41), program.v.error_trace.items.len);
+    for (program.v.error_trace.items) |frame| try testing.expectEqual(@as(usize, 0), frame.elided);
+}
+
+test "integration: an elided trace survives the throws caught while it is held" {
+    // Each throw caught inside the finally records an origin of its
+    // own beside the one the finally holds.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run(
+        \\(defn g [n] (if (= n 0) (/ 1 0) (+ 1 (g (dec n)))))
+        \\(try (g 60) (finally (try (throw :a) (catch any e (try (throw :b) (catch any e2 (try (throw :c) (catch any e3 nil))))))))
+    ));
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 41), trace.len);
+    try testing.expectEqualStrings("g", trace[0].name);
+    try testing.expectEqual(@as(usize, 22), trace[32].elided);
     try testing.expectEqualStrings("test-form", trace[40].name);
 }
 
@@ -1658,6 +1694,23 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     const kept = heap.live_bytes - start;
     const peak = heap.peak_live_bytes - start;
     try testing.expect(peak < 3 * kept);
+}
+
+test "gc: a native that calls a leaf native collects once a cycle is due" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+    // Each running product is garbage once reduce has the next.
+    _ = try program.run("(def xs (vec (range 1 3000)))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    _ = try program.run("(def p (reduce * xs))");
+    // The products' sum is about 6 MB; collected as they go, the peak
+    // stays within a few cycle windows of the start.
+    try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
 }
 
 test "integration: a sequence native walks a view from its offset, and a cons over one" {
@@ -6241,6 +6294,22 @@ test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
     const result = try program.run("(+ 1 2)");
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "runtime errors: the next form runs after a failed one, and a deep failure's memory goes back" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn f [] (/ 1 0)) (f)"));
+    try testing.expect(program.v.frames.items.len > 1);
+    try harness.expectResult(&program, "", try program.run("(+ 1 2)"), "3");
+    program.v.max_frames = 20_000;
+    try testing.expectError(vm.VmError.StackOverflow, program.run("(defn d [n] (inc (d n))) (d 1)"));
+    try testing.expect(program.v.frames.capacity >= 20_000);
+    program.v.resetAfterError();
+    try testing.expect(program.v.frames.capacity < 20_000);
+    try testing.expect(program.v.stack.capacity < 20_000);
+    try harness.expectResult(&program, "", try program.run("(+ 1 2)"), "3");
 }
 
 test "runtime errors: resetAfterError drops the dynamic bindings a failed run left in force" {

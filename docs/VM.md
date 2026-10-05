@@ -213,8 +213,11 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
 - `var_`: the Var's value in force (the binding under `binding`, else
   the root) is called with the same arguments, as Clojure's
   `Var.invoke`: `(#'inc 1)` is 2; `:unbound-var` while it is unbound.
+  A closure there takes the frame transfer below, so a recursion
+  through `#'f` costs no native stack.
 - `keyword`, `symbol`, `persistent_map`, `persistent_set`,
-  `persistent_vector`, `transient`: a lookup with an optional default,
+  `persistent_vector`, `sorted_map`, `sorted_set`, `transient`: a
+  lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
   symbol looks itself up exactly as a keyword does, and a transient
   map, set or vector as its persistent kind.
@@ -281,8 +284,11 @@ never re-enters the VM and never compares, hashes or prints nested
 data (arithmetic, numeric predicates, `nth`), so nothing under it can
 collect, grow the stack or move the deep-data overflow count (§13.1).
 `call:call` passes it its arguments in place on the stack, and
-`callValue` calls it without the root scope, the stack guard or the
-overflow check. Its arity is checked, and reported, as any native's.
+`callValue` and a `Callback` call it without the root scope, the stack
+guard or the overflow check while no cycle is due; once one is, the
+call takes `callValue`'s rooted path and its safe point, so a native
+that calls a leaf per element (`(reduce * xs)`) collects as it goes.
+Its arity is checked, and reported, as any native's.
 
 ---
 
@@ -762,7 +768,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | `TransientUsedAfterPersistent` | `:transient-used-after-persistent` | A transient called or looked up after `persistent!` froze it (`docs/TRANSIENT.md` §6) |
 | `Utf8Error`, `InvalidArgument`, `IoError`, `FileNotFound`, `InvalidPath` | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String, math and I/O natives |
 | `NotARecord`, `NoProtocolImpl`, `NoProtocolMethod` | `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method` | Records and protocols (`docs/PROTOCOLS.md`) |
-| `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |
+| `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard, or `VM.max_nested_runs` run loops nested (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |
 
 Natives also throw keywords of their own through `throwKeyword` or a
 thrown map, documented with the native: `:unserializable`
@@ -826,13 +832,16 @@ parked top frame (resting on `idle_routine`) is left out.
 `VM.traced_error` names the error. `runRoutine` records the same way
 when a nested run fails, so a host that learns of the failure
 indirectly (the loader ran a required file while compiling a form)
-reports it with its chain. A chain longer than 40 frames keeps its
-innermost 32 and outermost 8 around one marker frame named `<N
-frames elided>` (no span, no source), so a runaway recursion lists
-41 lines. The next failing run rebuilds the trace. `resetAfterError`
+reports it with its chain. A chain longer than 41 frames keeps its
+innermost 32 and outermost 8 around one marker frame, whose `elided`
+counts the frames it stands for (no span, no source), so
+a runaway recursion lists 41 lines. The next failing run rebuilds the trace. `resetAfterError`
 discards what a failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop` can
-run the next form; the REPL calls it after reporting. The report
+run the next form, and gives back the frame and stack capacity past
+4,096 frames and 16,384 slots that a runaway recursion grew; the REPL
+calls it after reporting, and `retargetTop` calls it when the frames
+of a failed run still stand. The report
 built from the detail and the trace is `docs/TOOLING.md` §1.
 
 #### 13.1 Native stack guard
@@ -864,7 +873,11 @@ a native re-enters it, and at the first call of a closure through a
 `Callback` (§6), whose later calls start from the same native frame,
 so recursion through `apply`, `map`, `reduce`, a protocol impl or
 `eval` ends in the same catchable `:stack-overflow` as runaway
-bytecode recursion. Each layer maps the error to its own
+bytecode recursion. The same checks count the run loops nested on the
+native stack, one per such call still running, against
+`VM.max_nested_runs` (default 100,000; an embedder may set it): past
+it the call is `StackOverflow` too, so a runaway recursion through
+natives stops before it has committed much of a large thread stack. Each layer maps the error to its own
 report: the VM raises `StackOverflow`, the reader a reader error and
 the compiler a compile error. The codec and the collector walk nested
 data with heap stacks and need no guard.

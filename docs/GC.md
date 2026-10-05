@@ -246,10 +246,14 @@ never due.
 **Safe point.** The VM tests `gcDue` in two places. The first is
 before fetching an instruction in its one run loop (`VM.loop`, which
 `run`, `callValue` and `runRoutine` drive), at a loop's first fetch
-and at every fetch after an instruction of a group that can allocate
-(`math`, `call`, `closure`, `coll`, `ctrl`); after `mov`, `cmp`, `jump`
-or `var`, and after a `call` of a keyword or symbol looking itself up
-in a map, a record or nil (`docs/VM.md` §8), the counter cannot have
+and at every fetch after an instruction that could have allocated:
+`math` through the numeric tower (not a fixnum result computed
+inline), a `call:call` that ran a native, a protocol fn or a lookup
+other than the in-place keyword lookup of `docs/VM.md` §8, or entered
+a closure through the general entry of `docs/VM.md` §6 (not the
+direct one), and every `closure` instruction but `get-cell`, and
+every `coll` and `ctrl` instruction. After `mov`, `cmp`, `jump`,
+`var`, `call:return` or `call:return-nil` the counter cannot have
 moved. Between two instructions every
 live value is in one of the roots §3 lists, so a cycle there frees
 nothing live. The second is `callValue` of anything but a closure (a
@@ -258,9 +262,10 @@ stack: a native that calls natives in a loop (`(reduce conj #{} xs)`)
 reaches no closure frame, and without it would run to its end without
 collecting. A native keeps what it holds across `callValue` on its
 root scope already (§11.5), so a cycle there frees nothing live
-either; a leaf native (`docs/VM.md` §6) is called without it, and so
-is a keyword or symbol a `Callback` looks up in a map, a record or nil
-(neither allocates). A `Callback`'s call of a closure reaches the
+either. A leaf native (`docs/VM.md` §6) skips it while no cycle is
+due and takes it once one is, so `(reduce * xs)` collects as it goes;
+a keyword or symbol a `Callback` looks up in a map, a record or nil
+skips it (the lookup does not allocate). A `Callback`'s call of a closure reaches the
 loop's entry, the first safe point, as `callValue`'s does.
 `Heap.alloc` never collects: the compiler, a native and one instruction
 (a rest list, a closure and its cells) allocate as many blocks as they
