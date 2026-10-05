@@ -37,7 +37,8 @@ const intern_mod = @import("intern.zig");
 const db_mod = @import("db.zig");
 const codec_mod = @import("codec.zig");
 const heap_mod = @import("heap.zig");
-const dispatch_mod_alias = @import("dispatch.zig");
+const dispatch_mod = @import("dispatch.zig");
+const dispatch_mod_alias = dispatch_mod;
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
 const format_mod = @import("format.zig");
@@ -806,8 +807,6 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 // `=` is value equality (dispatch.equal, cross-type false);
 // `==` is numeric equality with contagion (`(== 1 1.0)` is true).
 
-const dispatch_mod = @import("dispatch.zig");
-
 fn requireNumber(v: Value) VmError!Value {
     if (!vm_mod.isNumber(v)) return VmError.KindMismatch;
     return v;
@@ -1368,7 +1367,7 @@ fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const key = vm.ensureInterner().internKeywordValue("val") catch return VmError.OutOfMemory;
     const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const fields = champ_mod.mapAssoc(heap, empty, key, args[0], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    const fields = try mapPut(heap, empty, key, args[0]);
     return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
 }
 
@@ -1583,36 +1582,10 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
 fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (coll.kind()) {
-        .persistent_map => champ_mod.mapAssoc(
-            heap,
-            coll,
-            k,
-            v,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        ) catch VmError.OutOfMemory,
-        .nil => blk: {
-            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-            m = champ_mod.mapAssoc(
-                heap,
-                m,
-                k,
-                v,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory;
-            break :blk m;
-        },
+        .persistent_map => mapPut(heap, coll, k, v),
+        .nil => mapPut(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory, k, v),
         .record => blk: {
-            const cur_fields = record_mod.fieldsOf(coll);
-            const new_fields = champ_mod.mapAssoc(
-                heap,
-                cur_fields,
-                k,
-                v,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory;
+            const new_fields = try mapPut(heap, record_mod.fieldsOf(coll), k, v);
             break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
         },
         .persistent_vector => blk: {
@@ -1635,23 +1608,10 @@ fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     var coll = args[0];
     for (args[1..]) |k| {
         coll = switch (coll.kind()) {
-            .persistent_map => champ_mod.mapDissoc(
-                heap,
-                coll,
-                k,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory,
+            .persistent_map => champ_mod.mapDissoc(heap, coll, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory,
             .nil => coll,
             .record => blk: {
-                const cur_fields = record_mod.fieldsOf(coll);
-                const new_fields = champ_mod.mapDissoc(
-                    heap,
-                    cur_fields,
-                    k,
-                    &dispatch_mod.hashValue,
-                    &dispatch_mod.equal,
-                ) catch return VmError.OutOfMemory;
+                const new_fields = champ_mod.mapDissoc(heap, record_mod.fieldsOf(coll), k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
                 break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
             },
             else => return VmError.KindMismatch,
@@ -1667,13 +1627,7 @@ fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
     var coll = args[0];
     for (args[1..]) |x| {
         coll = switch (coll.kind()) {
-            .persistent_set => champ_mod.setDisj(
-                heap,
-                coll,
-                x,
-                &dispatch_mod.hashValue,
-                &dispatch_mod.equal,
-            ) catch return VmError.OutOfMemory,
+            .persistent_set => champ_mod.setDisj(heap, coll, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory,
             .nil => coll,
             else => return VmError.KindMismatch,
         };
@@ -1722,46 +1676,13 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
     const k = args[1];
     return switch (coll.kind()) {
         .nil => value_mod.fromBool(false),
-        .persistent_map => value_mod.fromBool(switch (champ_mod.mapGet(
-            coll,
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) {
-            .present => true,
-            .absent => false,
-        }),
-        .persistent_set => value_mod.fromBool(champ_mod.setContains(
-            coll,
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )),
-        .persistent_vector => blk: {
-            if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
-            const idx = k.asFixnum();
-            if (idx < 0) break :blk value_mod.fromBool(false);
-            const u_idx: usize = @intCast(idx);
-            break :blk value_mod.fromBool(u_idx < vector_mod.count(coll));
-        },
+        .persistent_map => value_mod.fromBool(mapHas(coll, k)),
+        .persistent_set => value_mod.fromBool(champ_mod.setContains(coll, k, &dispatch_mod.hashValue, &dispatch_mod.equal)),
+        .persistent_vector => value_mod.fromBool(isIndex(k, vector_mod.count(coll))),
         .string => value_mod.fromBool((try stringIndex(coll, k)) != null),
         .sorted_map, .sorted_set => value_mod.fromBool((try vm_mod.sortedFind(vm, coll, k)) != null),
-        .typed_vector => blk: {
-            if (k.kind() != .fixnum) break :blk value_mod.fromBool(false);
-            const idx = k.asFixnum();
-            if (idx < 0) break :blk value_mod.fromBool(false);
-            const u_idx: usize = @intCast(idx);
-            break :blk value_mod.fromBool(u_idx < typed_vector_mod.count(coll));
-        },
-        .record => value_mod.fromBool(switch (champ_mod.mapGet(
-            record_mod.fieldsOf(coll),
-            k,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) {
-            .present => true,
-            .absent => false,
-        }),
+        .typed_vector => value_mod.fromBool(isIndex(k, typed_vector_mod.count(coll))),
+        .record => value_mod.fromBool(mapHas(record_mod.fieldsOf(coll), k)),
         .nextomic_entity => value_mod.fromBool(try nextomic_mod.natives.entityHas(vm, coll, k)),
         .transient => value_mod.fromBool(if (coll.subkind() == transient_mod.subkind_transient_set)
             transient_mod.setContainsBang(coll, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err)
@@ -1769,6 +1690,11 @@ fn fnContainsQ(vm: *VM, args: []const Value) VmError!Value {
             (try vm_mod.transientLookup(coll, k)) != null),
         else => return VmError.KindMismatch,
     };
+}
+
+/// Whether `k` is an index of a collection of `n` elements.
+fn isIndex(k: Value, n: usize) bool {
+    return k.kind() == .fixnum and k.asFixnum() >= 0 and @as(usize, @intCast(k.asFixnum())) < n;
 }
 
 fn fnKeys(vm: *VM, args: []const Value) VmError!Value {
@@ -2469,7 +2395,7 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     while (try ks.next()) |k| {
         const entry = try fnFind(vm, &.{ src, k });
         if (entry.isNil()) continue;
-        out = champ_mod.mapAssoc(heap, out, k, vector_mod.nth(entry, 1), &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        out = try mapPut(heap, out, k, vector_mod.nth(entry, 1));
         if (collects) try scope.push(out);
     }
     return out;
@@ -2746,7 +2672,7 @@ fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
     const names = [_][]const u8{ "message", "data", "cause" };
     for (args, 0..) |v, i| {
         const key = interner.internKeywordValue(names[i]) catch return VmError.OutOfMemory;
-        m = champ_mod.mapAssoc(heap, m, key, v, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+        m = try mapPut(heap, m, key, v);
     }
     return m;
 }
@@ -2875,7 +2801,7 @@ fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     v.meta = m;
     if (m.isNil()) return;
     const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
-    switch (champ_mod.mapGet(m, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+    switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
         .present => |flag| if (flag.isTruthy()) {
             v.dynamic = true;
         },
@@ -2981,6 +2907,16 @@ fn isList(k: Kind) bool {
 fn isVector(k: Kind) bool {
     return k == .persistent_vector;
 }
+/// `m` with `k` mapped to `v`, under the runtime's `hash` and `=`.
+fn mapPut(heap: *heap_mod.Heap, m: Value, k: Value, v: Value) VmError!Value {
+    return champ_mod.mapAssoc(heap, m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
+}
+
+/// Whether the hash map `m` has the key `k`.
+fn mapHas(m: Value, k: Value) bool {
+    return champ_mod.mapGet(m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .present;
+}
+
 fn isMap(k: Kind) bool {
     return k == .persistent_map or k == .record or k == .sorted_map;
 }
@@ -3494,12 +3430,12 @@ fn nsVars(vm: *VM, ns_sym: Value, publics: bool) VmError!Value {
     while (it.next()) |entry| {
         const v = entry.value_ptr.*;
         if (entry.key_ptr.*.ptr != v.name.ptr) continue;
-        if (publics and v.meta.kind() == .persistent_map) switch (champ_mod.mapGet(v.meta, private_key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+        if (publics and v.meta.kind() == .persistent_map) switch (champ_mod.mapGet(v.meta, private_key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
             .present => |flag| if (flag.isTruthy()) continue,
             .absent => {},
         };
         const sym = interner.internSymbolValue(v.name) catch return VmError.OutOfMemory;
-        m = champ_mod.mapAssoc(heap, m, sym, VM.varToValue(v), &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+        m = try mapPut(heap, m, sym, VM.varToValue(v));
     }
     return m;
 }
@@ -3598,7 +3534,7 @@ fn fnDelay(vm: *VM, args: []const Value) VmError!Value {
     const thunk = vector_mod.fromSlice(heap, &.{ pending, args[0] }) catch return VmError.OutOfMemory;
     const state = atom_mod.make(heap, thunk) catch return VmError.OutOfMemory;
     const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const fields = champ_mod.mapAssoc(heap, empty, key, state, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+    const fields = try mapPut(heap, empty, key, state);
     return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
 }
 
@@ -4896,20 +4832,20 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 /// Looks up the receiver VM's namespace registry to derive the
 /// effective ns prefix (the current namespace), then calls
 /// `vm.registerRecordType`; redefining a type registers a new one.
+/// The `"ns/name"` a record or protocol registers under, split at the
+/// last `/`; the namespace is "" when there is none.
+fn splitNsName(full: []const u8) struct { ns: []const u8, name: []const u8 } {
+    const i = std.mem.findScalarLast(u8, full, '/') orelse return .{ .ns = "", .name = full };
+    return .{ .ns = full[0..i], .name = full[i + 1 ..] };
+}
+
 fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     const full_name_v = args[0];
     const fields_vec = args[1];
     if (full_name_v.kind() != .string) return VmError.KindMismatch;
     if (fields_vec.kind() != .persistent_vector) return VmError.KindMismatch;
 
-    const full_name = string_mod.asBytes(full_name_v);
-    // Split on the LAST `/` for `ns/name`.
-    var ns_name: []const u8 = "";
-    var type_name: []const u8 = full_name;
-    if (std.mem.findScalarLast(u8, full_name, '/')) |slash_idx| {
-        ns_name = full_name[0..slash_idx];
-        type_name = full_name[slash_idx + 1 ..];
-    }
+    const parts = splitNsName(string_mod.asBytes(full_name_v));
 
     const interner = vm.ensureInterner();
     const n = vector_mod.count(fields_vec);
@@ -4923,7 +4859,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
         field_names[i] = interner.keywordName(id);
     }
 
-    const new_id = vm.registerRecordType(ns_name, type_name, field_names) catch return VmError.OutOfMemory;
+    const new_id = vm.registerRecordType(parts.ns, parts.name, field_names) catch return VmError.OutOfMemory;
     return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
@@ -4953,7 +4889,7 @@ fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
             // being built needs no root.
             var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
             var it = MapEntries.of(args[1]).?;
-            while (it.next()) |e| m = champ_mod.mapAssoc(heap, m, e.key, e.value, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+            while (it.next()) |e| m = try mapPut(heap, m, e.key, e.value);
             break :blk m;
         },
         else => return VmError.KindMismatch,
@@ -5008,13 +4944,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
     if (full_name_v.kind() != .string) return VmError.KindMismatch;
     if (methods_vec.kind() != .persistent_vector) return VmError.KindMismatch;
 
-    const full_name = string_mod.asBytes(full_name_v);
-    var ns_name: []const u8 = "";
-    var proto_name: []const u8 = full_name;
-    if (std.mem.findScalarLast(u8, full_name, '/')) |slash_idx| {
-        ns_name = full_name[0..slash_idx];
-        proto_name = full_name[slash_idx + 1 ..];
-    }
+    const parts = splitNsName(string_mod.asBytes(full_name_v));
 
     const interner = vm.ensureInterner();
     const n = vector_mod.count(methods_vec);
@@ -5028,7 +4958,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
         specs[i] = .{ .name_id = id, .name = interner.keywordName(id) };
     }
 
-    const new_id = vm.registerProtocol(ns_name, proto_name, specs) catch return VmError.OutOfMemory;
+    const new_id = vm.registerProtocol(parts.ns, parts.name, specs) catch return VmError.OutOfMemory;
     return protocol_mod.makeProtocol(vm.ensureHeap(), new_id) catch return VmError.OutOfMemory;
 }
 
@@ -5133,7 +5063,7 @@ fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
     var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
     var i: usize = 0;
     while (i < items.items.len) : (i += 2) {
-        m = champ_mod.mapAssoc(heap, m, items.items[i], items.items[i + 1], &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+        m = try mapPut(heap, m, items.items[i], items.items[i + 1]);
     }
     return m;
 }
@@ -5144,16 +5074,16 @@ fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
 fn fnCatchMatches(vm: *VM, args: []const Value) VmError!Value {
     const v = args[0];
     const tag = args[1];
-    if (dispatch_mod_alias.equal(v, tag)) return value_mod.fromBool(true);
+    if (dispatch_mod.equal(v, tag)) return value_mod.fromBool(true);
     if (v.kind() != .persistent_map and v.kind() != .record) return value_mod.fromBool(false);
     const interner = vm.ensureInterner();
     const error_key = interner.internKeywordValue("error") catch return VmError.OutOfMemory;
-    if (dispatch_mod_alias.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag)) return value_mod.fromBool(true);
+    if (dispatch_mod.equal(try vm_mod.lookup(v, error_key, value_mod.nilValue()), tag)) return value_mod.fromBool(true);
     // An `ex-info` map: its data's `:error`.
     const data_key = interner.internKeywordValue("data") catch return VmError.OutOfMemory;
     const data = try vm_mod.lookup(v, data_key, value_mod.nilValue());
     if (data.kind() != .persistent_map) return value_mod.fromBool(false);
-    return value_mod.fromBool(dispatch_mod_alias.equal(try vm_mod.lookup(data, error_key, value_mod.nilValue()), tag));
+    return value_mod.fromBool(dispatch_mod.equal(try vm_mod.lookup(data, error_key, value_mod.nilValue()), tag));
 }
 
 fn fnExtendDefaultImpl(vm: *VM, args: []const Value) VmError!Value {
