@@ -1376,8 +1376,8 @@ fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isReduced(vm, args[0]));
 }
 
-fn isReduced(vm: *const VM, v: Value) bool {
-    const type_id = vm.reduced_type_id orelse return false;
+fn isReduced(vm: *VM, v: Value) bool {
+    const type_id = vm.home().reduced_type_id orelse return false;
     return v.kind() == .record and record_mod.typeId(v) == type_id;
 }
 
@@ -2801,7 +2801,8 @@ fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
 /// `{:error :compile-error :message "<CompileError>" :form form}`.
 fn fnEval(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
-    return try hooks.eval(hooks.user_data, vm, args[0]);
+    const eval = hooks.eval orelse return vm.throwKeyword("no-compiler");
+    return try eval(hooks.user_data, vm, args[0]);
 }
 
 // =============================================================================
@@ -3059,7 +3060,9 @@ fn isIfn(k: Kind) bool {
 // `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
 // Connection lifetime: each `db/open` allocates a Connection on the
-// VM's allocator and appends it to `vm.db_connections`. `db/close`
+// allocator of the VM that owns the registries (`VM.home`: a macro's
+// sub-VM opens for the VM it compiles for, VM.md §9.1) and appends it
+// to that VM's `db_connections`. `db/close`
 // closes its env and leaves the struct in place; VM.deinit closes
 // whatever is still open and frees every Connection.
 
@@ -3087,14 +3090,15 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    const path_z = vm.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(path_z);
-    const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
-    errdefer vm.allocator.destroy(conn);
-    conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{ .allocator = vm.allocator }) catch |err| return dbFailure(vm, err);
+    const host = vm.home();
+    const path_z = host.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
+    defer host.allocator.free(path_z);
+    const conn = host.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
+    errdefer host.allocator.destroy(conn);
+    conn.* = db_mod.open(host.allocator, host.ensureHeap(), host.ensureInterner(), path_z.ptr, .{ .allocator = host.allocator }) catch |err| return dbFailure(vm, err);
     if (durability) |d| conn.durability = d;
-    vm.db_close_callback = &dbCloseCallback;
-    vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
+    host.db_close_callback = &dbCloseCallback;
+    host.db_connections.append(host.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);
         return VmError.OutOfMemory;
     };
@@ -3430,7 +3434,7 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
         .persistent_map => "map",
         .persistent_set => "set",
         .record => {
-            const e = vm.record_registry.items[record_mod.typeId(x)];
+            const e = vm.recordType(record_mod.typeId(x)) orelse return VmError.InvalidArgument;
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(vm.allocator);
             if (e.ns_name.len > 0) buf.print(vm.allocator, "{s}.", .{e.ns_name}) catch return VmError.OutOfMemory;
@@ -3571,15 +3575,15 @@ fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
 
 /// The type id of `nexis.core/Delay`, registered on first use.
 fn delayType(vm: *VM) VmError!u32 {
-    for (vm.record_registry.items) |e| {
+    for (vm.home().record_registry.items) |e| {
         if (std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay")) return e.id;
     }
     return vm.registerRecordType("nexis.core", "Delay", &.{"state"}) catch VmError.OutOfMemory;
 }
 
-fn isDelay(vm: *const VM, v: Value) bool {
+fn isDelay(vm: *VM, v: Value) bool {
     if (v.kind() != .record) return false;
-    const e = vm.record_registry.items[record_mod.typeId(v)];
+    const e = vm.recordType(record_mod.typeId(v)) orelse return false;
     return std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay");
 }
 
@@ -3605,7 +3609,7 @@ fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
 
 /// `@d` of a delay: `(nexis.core/force d)`.
 fn forceDelay(vm: *VM, d: Value) VmError!Value {
-    const registry = vm.registry orelse return VmError.NotDerefable;
+    const registry = if (vm.home().registry) |*r| r else return VmError.NotDerefable;
     const force = registry.core.lookupLocal("force") orelse return VmError.NotDerefable;
     return vm.callValue(force.current() orelse return VmError.UnboundVar, &.{d});
 }
@@ -4643,13 +4647,24 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 // (`nil`, strings without quotes), `pr`/`prn`/`pr-str` readable form.
 
 /// The `with-out-str` buffers in force, innermost last. One isolate,
-/// one thread; each buffer is on the allocator of the VM that pushed
-/// it.
+/// one thread. The stack and its buffers live on `out_allocator`,
+/// which outlives every VM: a macro's sub-VM, whose allocator dies
+/// with it, prints into a buffer its caller opened.
 var out_stack: std.ArrayList(std.ArrayList(u8)) = .empty;
+const out_allocator = std.heap.smp_allocator;
+
+/// Close every `with-out-str` buffer still open, dropping what was
+/// printed into it: the host calls it where an error no handler can
+/// take (out of memory) ends a run, which skips the `#%pop-out` in
+/// `with-out-str`'s handler, so output after it is not swallowed.
+pub fn discardOutCaptures() void {
+    for (out_stack.items) |*buf| buf.deinit(out_allocator);
+    out_stack.clearAndFree(out_allocator);
+}
 
 fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
     if (out_stack.items.len > 0) {
-        out_stack.items[out_stack.items.len - 1].appendSlice(vm.allocator, bytes) catch return VmError.OutOfMemory;
+        out_stack.items[out_stack.items.len - 1].appendSlice(out_allocator, bytes) catch return VmError.OutOfMemory;
         return;
     }
     const io_handle = vm.io orelse return VmError.IoError;
@@ -4704,15 +4719,15 @@ fn fnPrStr(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(#%push-out)` opens a `with-out-str` buffer; `(#%pop-out)` closes
 /// the innermost one and returns what was printed into it.
-fn fnPushOut(vm: *VM, _: []const Value) VmError!Value {
-    out_stack.append(vm.allocator, .empty) catch return VmError.OutOfMemory;
+fn fnPushOut(_: *VM, _: []const Value) VmError!Value {
+    out_stack.append(out_allocator, .empty) catch return VmError.OutOfMemory;
     return value_mod.nilValue();
 }
 
 fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
     var buf = out_stack.pop() orelse return VmError.InvalidArgument;
-    defer buf.deinit(vm.allocator);
-    if (out_stack.items.len == 0) out_stack.clearAndFree(vm.allocator);
+    defer buf.deinit(out_allocator);
+    if (out_stack.items.len == 0) out_stack.clearAndFree(out_allocator);
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
 }
 
@@ -4841,8 +4856,9 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 /// with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
-    for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
-    if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
+    const host = vm.home();
+    for (host.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    if (host.nextomic_close_callback) |close| for (host.nextomic_connections.items) |conn| close(conn);
     db_mod.StoreFile.syncAll();
     std.process.exit(status);
 }
@@ -4893,13 +4909,38 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
-/// `(#%make-record type-id field-map)` → record Value.
+/// The record type id `v` holds: `:kind-mismatch` unless it is an
+/// integer, `:invalid-argument` unless a `defrecord` registered it.
+/// The `#%` natives are reachable by their qualified names, so each
+/// checks the ids it is given (FORMS.md §8).
+fn recordTypeArg(vm: *VM, v: Value) VmError!u32 {
+    if (v.kind() != .fixnum) return VmError.KindMismatch;
+    const id = std.math.cast(u32, v.asFixnum()) orelse return VmError.InvalidArgument;
+    _ = vm.recordType(id) orelse return VmError.InvalidArgument;
+    return id;
+}
+
+/// `(#%make-record type-id m)` → a record of the type with the
+/// entries of the map `m` (any map, a record's fields, or nil for
+/// none) as its fields.
 fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .fixnum) return VmError.KindMismatch;
-    const id = args[0].asFixnum();
-    if (id < 0) return VmError.KindMismatch;
-    if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
-    return record_mod.make(vm.ensureHeap(), @intCast(id), args[1]) catch return VmError.OutOfMemory;
+    const id = try recordTypeArg(vm, args[0]);
+    const heap = vm.ensureHeap();
+    const fields = switch (args[1].kind()) {
+        .persistent_map => args[1],
+        .record => record_mod.fieldsOf(args[1]),
+        .nil => champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory,
+        .sorted_map => blk: {
+            // `Heap.alloc` never collects (GC.md §11.5): the map
+            // being built needs no root.
+            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+            var it = MapEntries.of(args[1]).?;
+            while (it.next()) |e| m = champ_mod.mapAssoc(heap, m, e.key, e.value, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+            break :blk m;
+        },
+        else => return VmError.KindMismatch,
+    };
+    return record_mod.make(heap, id, fields) catch return VmError.OutOfMemory;
 }
 
 /// `(#%current-ns)` → the name of the current namespace as a string:
@@ -5006,7 +5047,6 @@ fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
 fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .protocol) return VmError.KindMismatch;
     if (args[1].kind() != .keyword) return VmError.KindMismatch;
-    if (args[2].kind() != .fixnum) return VmError.KindMismatch;
     // args[3] is the impl callable: closure / native_fn / etc.
     // We don't validate its kind here — dispatchProtocolMethod
     // calls `callValue` which surfaces NotCallable if it's not
@@ -5014,9 +5054,7 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     // than this scaffolding.
     const protocol_id = protocol_mod.protocolId(args[0]);
     const method_name_id: u32 = args[1].asKeywordId();
-    const type_id_signed = args[2].asFixnum();
-    if (type_id_signed < 0) return VmError.KindMismatch;
-    const type_id: u32 = @intCast(type_id_signed);
+    const type_id = try recordTypeArg(vm, args[2]);
     const key = vm_mod.DispatchKey{ .tag = .record, .id = type_id };
     vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
         error.NoProtocolMethod => return VmError.NoProtocolMethod,

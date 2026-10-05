@@ -125,7 +125,9 @@ method.
 ### 3. VM-side registries
 
 The VM owns two registries, freed by `VM.deinit`; the names in them
-are duped on registration.
+are duped on registration. A macro's sub-VM has none of its own: it
+uses those of the VM it compiles for (`VM.home`, `docs/VM.md` §9.1),
+so a type or protocol id means the same on both.
 
 | Registry | Entry | Holds |
 |---|---|---|
@@ -133,7 +135,10 @@ are duped on registration.
 | `VM.protocol_registry` | `ProtocolEntry` | `id`, `ns_name`, `name`, and `methods`: per method its keyword id, its name (for errors), an `impls` map from `DispatchKey` to a callable, and an optional `default_impl` |
 
 `VM.ensureReducedType` registers one built-in record type,
-`nexis.core/Reduced` with field `:val`, the first time `reduced` runs.
+`nexis.core/Reduced` with field `:val`, the first time `reduced` runs;
+the first `delay` registers `nexis.core/Delay` with field `:state`.
+`VM.recordType(id)` is the entry of a type id, null for one no
+`defrecord` registered.
 
 #### 3.1 Lifetime + redefinition
 
@@ -349,7 +354,7 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | Native | Arity | Returns |
 |---|---|---|
 | `#%register-record-type "ns/Name" [:f ...]` | 2 | fixnum type id |
-| `#%make-record type-id field-map` | 2 | record |
+| `#%make-record type-id m` | 2 | record whose fields are the entries of `m`: a hash or sorted map, a record (its fields) or nil (none), so `map->Counter` takes any map, as Clojure's does |
 | `#%record? x` | 1 | boolean |
 | `#%record-type-id rec` | 1 | fixnum |
 | `#%register-protocol "ns/IFoo" [:m ...]` | 2 | protocol |
@@ -357,6 +362,11 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | `#%extend-record-impl IFoo :m type-id f` | 4 | nil |
 | `#%extend-builtin-impl IFoo :m :kind f` | 4 | nil |
 | `#%extend-default-impl IFoo :m f` | 3 | nil |
+
+The natives are reachable by their qualified names (`docs/FORMS.md`
+§8), so each validates its arguments: a type id that is not an
+integer is `:kind-mismatch`, one no `defrecord` registered
+`:invalid-argument`.
 
 `#%register-record-type` and `#%register-protocol` split the name on
 its last `/` into namespace and name; a name with no `/` has an empty

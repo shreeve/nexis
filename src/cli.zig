@@ -318,6 +318,9 @@ const Runtime = struct {
     /// Report what `evalSource` failed with; the exit status it
     /// carries.
     fn report(rt: *Runtime, err: loader_mod.EvalError) !u8 {
+        // An error no handler takes skips `with-out-str`'s cleanup;
+        // what the REPL prints next must not land in its buffer.
+        stdlib.discardOutCaptures();
         switch (err) {
             error.Diagnosed => {
                 const d = rt.loader.diagnostic.?;

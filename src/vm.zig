@@ -715,6 +715,10 @@ pub const NamespaceRegistry = struct {
     /// carries the heap to the compiler; there is no bundled
     /// compile-context struct.
     heap: ?*heap_mod.Heap = null,
+    /// The VM that owns this registry (`VM.ensureRegistry` sets it):
+    /// the expander reaches it through a namespace to give a macro's
+    /// sub-VM the registries of the VM it compiles for (§9.1).
+    vm: ?*VM = null,
 
     /// Two-phase init: caller stores the empty registry FIRST,
     /// then calls `setupDefaults` on the stable pointer.
@@ -732,6 +736,7 @@ pub const NamespaceRegistry = struct {
             .core = undefined,
             .current = undefined,
             .heap = null,
+            .vm = null,
         };
     }
 
@@ -1014,8 +1019,9 @@ pub const CompilerHooks = struct {
     read_string: *const fn (*anyopaque, *VM, []const u8) VmError!Value,
     /// `form` macroexpanded and compiled in the current namespace
     /// and run on this VM as a nested call (`runRoutine`); the
-    /// value it returns. A form that does not compile throws.
-    eval: *const fn (*anyopaque, *VM, Value) VmError!Value,
+    /// value it returns. A form that does not compile throws. Null
+    /// in a macro's sub-VM (§9.1), where `eval` throws `:no-compiler`.
+    eval: ?*const fn (*anyopaque, *VM, Value) VmError!Value,
 };
 
 /// One entry per `defrecord`.
@@ -1605,6 +1611,13 @@ pub const VM = struct {
     /// access falls back to the process-wide single-threaded I/O.
     io: ?std.Io = null,
 
+    /// The VM whose registries this one uses instead of its own
+    /// (§9.1): a macro's sub-VM runs against the namespaces, record
+    /// types, protocols and store connections of the VM it compiles
+    /// for, so an id or a name means the same in both. Always a VM
+    /// with no owner of its own; it outlives this one.
+    owner: ?*VM = null,
+
     /// Per-VM record-type registry, empty until the first
     /// `registerRecordType`. Each
     /// `defrecord` allocates a new RecordTypeEntry; the
@@ -1819,6 +1832,7 @@ pub const VM = struct {
     /// Otherwise it lazily initializes and returns the
     /// single-namespace slot used by ad-hoc test callers.
     pub fn ensureNamespace(self: *VM) *Namespace {
+        if (self.owner) |o| return o.ensureNamespace();
         if (self.registry) |*reg| return reg.current;
         if (self.namespace == null) {
             self.namespace = Namespace.init(self.allocator, self.runtime_arena.allocator());
@@ -1830,6 +1844,7 @@ pub const VM = struct {
     /// conventional `nexis.core` (auto-referred) and `user`
     /// (default current) namespaces.
     pub fn ensureRegistry(self: *VM) !*NamespaceRegistry {
+        if (self.owner) |o| return o.ensureRegistry();
         if (self.registry == null) {
             self.registry = NamespaceRegistry.initEmpty(
                 self.allocator,
@@ -1842,8 +1857,35 @@ pub const VM = struct {
             // lowering can allocate string-literal Values into
             // it via `namespace.registry.heap`.
             self.registry.?.heap = self.ensureHeap();
+            self.registry.?.vm = self;
         }
         return &self.registry.?;
+    }
+
+    /// The VM whose registries this one uses: its owner, else itself.
+    pub fn home(self: *VM) *VM {
+        return self.owner orelse self;
+    }
+
+    /// Make this fresh VM, which runs a macro over `owner`'s heap and
+    /// interner, use `owner`'s registries too (§9.1). It gets the
+    /// owner's compiler hooks without `eval`: `macroexpand-1` and
+    /// `read-string` touch nothing that outlives the call, while an
+    /// `eval` would compile into this VM's runtime arena and could
+    /// load a file that runs the owner's collector.
+    pub fn borrowRegistries(self: *VM, owner: *VM) void {
+        self.owner = owner.home();
+        if (self.owner.?.compiler_hooks) |hooks| {
+            self.compiler_hooks = hooks;
+            self.compiler_hooks.?.eval = null;
+        }
+    }
+
+    /// The record type `id` names, or null when no `defrecord`
+    /// registered it.
+    pub fn recordType(self: *VM, id: u32) ?*const RecordTypeEntry {
+        const types = self.home().record_registry.items;
+        return if (id < types.len) &types[id] else null;
     }
 
     /// Lazy-initialize the shared Interner on first
@@ -2056,6 +2098,7 @@ pub const VM = struct {
         type_name: []const u8,
         field_names: []const []const u8,
     ) !u32 {
+        if (self.owner) |o| return o.registerRecordType(ns_name, type_name, field_names);
         const new_id: u32 = @intCast(self.record_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
@@ -2072,19 +2115,22 @@ pub const VM = struct {
             fields_dup[i] = try self.allocator.dupe(u8, fname);
             initialized = i + 1;
         }
-        try self.record_registry.append(self.allocator, .{
+        // Nothing fails once the entry is in: it owns the names.
+        try self.record_registry.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
+        self.record_registry.appendAssumeCapacity(.{
             .id = new_id,
             .ns_name = ns_dup,
             .type_name = name_dup,
             .field_names = fields_dup,
         });
-        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
         return new_id;
     }
 
     /// The type id of `nexis.core/Reduced`, the one-field record
     /// (`:val`) that `reduced` builds and `reduce` stops on.
     pub fn ensureReducedType(self: *VM) !u32 {
+        if (self.owner) |o| return o.ensureReducedType();
         if (self.reduced_type_id) |id| return id;
         const id = try self.registerRecordType("nexis.core", "Reduced", &.{"val"});
         self.reduced_type_id = id;
@@ -2103,21 +2149,20 @@ pub const VM = struct {
         protocol_name: []const u8,
         method_specs: []const ProtocolMethodSpec,
     ) !u32 {
+        if (self.owner) |o| return o.registerProtocol(ns_name, protocol_name, method_specs);
         const new_id: u32 = @intCast(self.protocol_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
         const name_dup = try self.allocator.dupe(u8, protocol_name);
         errdefer self.allocator.free(name_dup);
 
-        var methods: std.ArrayList(ProtocolMethod) = .empty;
-        errdefer methods.deinit(self.allocator);
+        var methods: std.ArrayList(ProtocolMethod) = try .initCapacity(self.allocator, method_specs.len);
+        errdefer {
+            for (methods.items) |m| self.allocator.free(m.name);
+            methods.deinit(self.allocator);
+        }
         for (method_specs) |spec| {
-            const m_name = try self.allocator.dupe(u8, spec.name);
-            errdefer self.allocator.free(m_name);
-            try methods.append(self.allocator, .{
-                .name_id = spec.name_id,
-                .name = m_name,
-            });
+            methods.appendAssumeCapacity(.{ .name_id = spec.name_id, .name = try self.allocator.dupe(u8, spec.name) });
         }
         try self.protocol_registry.append(self.allocator, .{
             .id = new_id,
@@ -2129,8 +2174,8 @@ pub const VM = struct {
     }
 
     pub fn protocolById(self: *VM, id: u32) ?*ProtocolEntry {
-        if (id >= self.protocol_registry.items.len) return null;
-        return &self.protocol_registry.items[id];
+        const protocols = self.home().protocol_registry.items;
+        return if (id < protocols.len) &protocols[id] else null;
     }
 
     /// Register an impl `(protocol_id, method_name_id,
@@ -2146,7 +2191,7 @@ pub const VM = struct {
         const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
         for (proto.methods.items) |*method| {
             if (method.name_id == method_name_id) {
-                try method.impls.put(self.allocator, key.canonical(), impl);
+                try method.impls.put(self.home().allocator, key.canonical(), impl);
                 return;
             }
         }
@@ -7024,4 +7069,15 @@ test "VM closure call: same closure called twice — both invocations succeed" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
+}
+
+test "registerRecordType and registerProtocol free exactly what they took when an allocation fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, registerTypeAndProtocol, .{});
+}
+
+fn registerTypeAndProtocol(allocator: std.mem.Allocator) !void {
+    var vm = try VM.init(allocator, &VM.idle_routine);
+    defer vm.deinit();
+    _ = try vm.registerRecordType("user", "Point", &.{ "x", "y" });
+    _ = try vm.registerProtocol("user", "Shape", &.{ .{ .name_id = 0, .name = "area" }, .{ .name_id = 1, .name = "scale" } });
 }

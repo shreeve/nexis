@@ -1195,8 +1195,9 @@ fn callUserMacro(
     for (args, 0..) |a, i| arg_values[i] = try formToValue(ctx, a);
 
     // A fresh sub-VM that never collects, on the calling VM's heap
-    // when the context has it, so a value the macro stores into a
-    // Var outlives the call; the result becomes a Form in
+    // and registries when the context has them, so a value the macro
+    // stores into a Var outlives the call and a type id it makes
+    // means the same to the caller; the result becomes a Form in
     // `ctx.allocator` before the sub-VM goes, and so does the
     // message of a throw it did not catch.
     var sub_vm = vm_mod.VM.init(ctx.allocator, &vm_mod.VM.idle_routine) catch return ExpandError.OutOfMemory;
@@ -1205,6 +1206,7 @@ fn callUserMacro(
     sub_vm.borrowed_heap = ctx.value_heap;
     sub_vm.gc_enabled = false;
     sub_vm.io = ctx.io;
+    if (ctx.namespace) |ns| if (ns.registry) |reg| if (reg.vm) |owner| sub_vm.borrowRegistries(owner);
     const result_value = sub_vm.callValue(macro_var.root, arg_values) catch |err| {
         if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
         if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {

@@ -2193,6 +2193,66 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
+    // A macro body has no `eval` (MACROEXPAND.md §1.2).
+    try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
+}
+
+test "defmacro: a macro body runs against the program's record types, namespaces and protocols" {
+    // `reduced` in a macro registers its type where the program's
+    // records are, so it renames none of them.
+    try expectOutputProgram(
+        \\(defrecord Point [x y])
+        \\(defmacro first-big [& xs] (reduce (fn [a x] (if (> x 10) (reduced x) a)) nil xs))
+        \\[(first-big 1 20 30) (->Point 1 2) (class (->Point 1 2))]
+    , "[20 #user.Point{:x 1, :y 2} user.Point]");
+    // A delay a macro makes is a delay once the macro is gone.
+    try expectOutputProgram(
+        \\(defrecord P [x])
+        \\(def store (atom nil))
+        \\(defmacro m [] (reset! store (delay 42)) nil)
+        \\(m)
+        \\[(delay? @store) (class @store) @@store (class (->P 1))]
+    , "[true nexis.core.Delay 42 user.P]");
+    try expectOutputProgram("(def store (atom nil)) (defmacro m [] (reset! store (delay 42)) nil) (m) (delay? @store)", "true");
+    try expectOutputProgram("(defmacro m [] @(delay 1)) (m)", "1");
+    try expectOutputProgram("(defmacro m [] (str (resolve 'inc))) (m)", "#'nexis.core/inc");
+    try expectOutputProgram("(defmacro m [] (count (all-ns))) (= (m) (count (all-ns)))", "true");
+    try expectOutputProgram("(ns other) (def x 7) (ns user) (defmacro m [] (count (ns-interns 'other))) (m)", "1");
+    try expectOutputProgram(
+        \\(defprotocol Sz (sz [x]))
+        \\(extend-protocol Sz :string (sz [s] (count s)))
+        \\(defmacro m [] (sz "abcd"))
+        \\(m)
+    , "4");
+    // A record a macro builds is the program's type.
+    try expectOutputProgram(
+        \\(def made (atom nil))
+        \\(defrecord Q [a])
+        \\(defmacro mk [] (reset! made (->Q 1)) nil)
+        \\(mk)
+        \\[@made (Q? @made) (class @made)]
+    , "[#user.Q{:a 1} true user.Q]");
+    // `macroexpand-1`, `macroexpand` and `read-string` work in a
+    // macro body.
+    try expectOutputProgram("(defmacro m [x] (macroexpand-1 x)) [(m (when 1 2)) (macroexpand-1 '(m (when 1 2)))]", "[2 (if 1 (do 2) nil)]");
+    try expectOutputProgram("(defmacro m [x] (macroexpand x)) (m (-> 1 inc))", "2");
+    try expectOutputProgram("(defmacro r [s] (read-string s)) (r \"(+ 1 2)\")", "3");
+}
+
+test "defmacro: a store a macro opens belongs to the program" {
+    try expectOutputProgramWithStore("macro-db-open",
+        \\(def store (atom nil))
+        \\(defmacro m [] (reset! store (db/open "@STORE@")) nil)
+        \\(m)
+        \\(let [r (db/ref @store :t :k)] [(db/get-key r) (do (db/put-key! r 4) (db/get-key r))])
+    , "[nil 4]");
+}
+
+test "defmacro: what a macro prints goes to the with-out-str buffer the program opened" {
+    try expectOutputProgram(
+        \\(defmacro m [] (print (apply str (repeat 5000 "m"))) nil)
+        \\(count (with-out-str (print "abc") (eval '(m)) (print (apply str (repeat 5000 "z")))))
+    , "10003");
 }
 
 test "defmacro: parameters destructure and overload clauses dispatch, as for defn" {
@@ -4044,6 +4104,29 @@ test "extend-protocol with bogus type-kw: :invalid-argument" {
         \\      :no-such-kind (bar [x] :nope))
         \\    (catch any e e)))
     , ":invalid-argument");
+}
+
+test "record internals: a type id no defrecord registered is :invalid-argument" {
+    // Qualified, the `#%` names are reachable (FORMS.md §8); each
+    // validates what it is given.
+    try expectOutput("(try (nexis.internal/#%make-record 99999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record 99999999999999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record -1 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(let [mk (resolve (symbol \"nexis.internal\" \"#%make-record\"))] (try (class (mk 77 {:x 1})) (catch any e e)))", ":invalid-argument");
+    try expectOutputProgram(
+        \\(defprotocol IFoo (bar [this]))
+        \\[(try (nexis.internal/#%extend-record-impl IFoo :bar 4096 (fn [x] x)) (catch any e e))
+        \\ (try (nexis.internal/#%extend-record-impl IFoo :bar 99999999999999 (fn [x] x)) (catch any e e))]
+    , "[:invalid-argument :invalid-argument]");
+}
+
+test "defrecord: map->R takes any map, as Clojure's does" {
+    try expectOutputProgram(
+        \\(defrecord P [x z])
+        \\(defrecord Q [x])
+        \\[(map->P (sorted-map :z 2 :x 1)) (map->P nil) (map->P (->Q 5)) (P? (map->P (->Q 5)))
+        \\ (try (map->P [1 2]) (catch any e e))]
+    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true :kind-mismatch]");
 }
 
 // =============================================================================

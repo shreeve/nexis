@@ -102,7 +102,12 @@ otherwise it is an ordinary call. User macros shadow host macros.
    function's arity, each argument Form becomes a Value
    (`formToValue`), and a fresh sub-VM (an idle routine, the
    compile-time interner, the calling VM's heap, collection off,
-   `ctx.io`) calls the macro function through `callValue`. Its
+   `ctx.io`) calls the macro function through `callValue`. The
+   sub-VM uses the registries of the VM that owns `ctx.namespace`'s
+   registry (`docs/VM.md` §9.1): `resolve`, `all-ns`, `in-ns`,
+   `reduced`, `delay`, record constructors, protocol fns and `db/open`
+   in a macro body see and change the program's namespaces, record
+   types, protocols and stores. Its
    result becomes a Form at the call's span (`valueToForm`), or its
    throw or VM error becomes the failure message (§8). The sub-VM is
    released and the result is expanded again in the call's place.
@@ -141,7 +146,9 @@ otherwise it is an ordinary call. User macros shadow host macros.
 9. **The expander at run time.** The natives reach the compiler
    through `vm.CompilerHooks` (`compile.RuntimeHooks`, installed by
    the runtime that boots the VM) and build their values on the VM
-   heap; a VM without hooks throws `:no-compiler`.
+   heap; a VM without hooks throws `:no-compiler`. A macro's sub-VM
+   has `macroexpand-1`, `macroexpand` and `read-string` but not
+   `eval`, which throws `:no-compiler` there (`docs/VM.md` §9.1).
    - `(macroexpand-1 form)` is one macro step (`expandOnce`: a user
      or host macro at the head, never a special form or `#%`
      primitive; the raw output, nothing inside it expanded, no
