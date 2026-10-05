@@ -208,7 +208,8 @@ for inline values and single-page overflow values; a value spanning
 several overflow pages is copied into a buffer of its own that the
 transaction owns (API-KV01). The pointer is valid until the
 transaction's next mutation or its end (API-KV01, INV-FL05). Index trees
-have no values, so this concerns the txlog and schema trees only.
+hold `[t]` or nothing, except the out-of-line payloads on EAVT-h
+assertion rows; those and the txlog entries are the multi-page values.
 
 **Read transactions pin reclamation, not memory.** A read transaction
 holds a reader slot; pages freed after its snapshot are not reused while

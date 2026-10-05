@@ -62,7 +62,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     // anything is deleted, so no cursor walks a tree being changed.
     {
         var s = try Store.scan(txn, store.trees.hist(.eavt), prefix);
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, true, kv.key);
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = parts.top });
             try ts.put(arena, parts.top.?.t, {});
@@ -71,7 +71,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     const history_rows = rows.items.len;
     {
         var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, false, kv.key);
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = null });
             const g = try counts.getOrPut(arena, parts.a);
@@ -195,14 +195,14 @@ test "removeDatoms empties every tree of the entity and reports its transactions
     const pe = try key.prefixBytes(arena, .eavt, .{ .e = e });
     inline for (.{ Index.eavt, Index.aevt, Index.avet, Index.vaet }) |ix| {
         var cur = try Store.scan(txn, store.trees.cur(ix), &.{});
-        while (cur.next()) |kv| try testing.expect((try key.unpackKey(ix, false, kv.key)).e != e);
+        while (try cur.next()) |kv| try testing.expect((try key.unpackKey(ix, false, kv.key)).e != e);
         var hist = try Store.scan(txn, store.trees.hist(ix), &.{});
-        while (hist.next()) |kv| try testing.expect((try key.unpackKey(ix, true, kv.key)).e != e);
+        while (try hist.next()) |kv| try testing.expect((try key.unpackKey(ix, true, kv.key)).e != e);
     }
     var none = try Store.scan(txn, store.trees.cur(.eavt), pe);
-    try testing.expect(none.next() == null);
+    try testing.expect((try none.next()) == null);
     var vaet = try Store.scan(txn, store.trees.cur(.vaet), try key.prefixBytes(arena, .vaet, .{ .v = re }));
-    try testing.expectEqual(f, (try key.unpackKey(.vaet, false, vaet.next().?.key)).e);
+    try testing.expectEqual(f, (try key.unpackKey(.vaet, false, (try vaet.next()).?.key)).e);
     try testing.expectEqual(@as(usize, 0), (try fulltext.search(store, txn, arena, 100, try fulltext.tokens(arena, "two"))).len);
 
     // Attribute-only excision leaves the other attribute alone.
@@ -215,8 +215,8 @@ test "removeDatoms empties every tree of the entity and reports its transactions
     try testing.expectEqualSlices(u64, &.{4}, out2.ts);
     try testing.expectEqual(@as(u64, 1), out2.removed);
     var left = try Store.scan(txn, store.trees.cur(.eavt), try key.prefixBytes(arena, .eavt, .{ .e = g }));
-    try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, left.next().?.key)).a);
-    try testing.expect(left.next() == null);
+    try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, (try left.next()).?.key)).a);
+    try testing.expect((try left.next()) == null);
     var avet = try Store.scan(txn, store.trees.cur(.avet), try key.prefixBytes(arena, .avet, .{ .a = 100 }));
-    try testing.expect(avet.next() == null);
+    try testing.expect((try avet.next()) == null);
 }

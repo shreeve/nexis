@@ -1296,7 +1296,7 @@ const Ctx = struct {
     fn probeAvet(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
         const prefix = try key.prefixBytes(self.arena, .avet, .{ .a = a, .v = vbytes });
         var s = try Store.scan(self.txn, self.conn.store.trees.cur(.avet), prefix);
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             const parts = try key.unpackKey(.avet, false, kv.key);
             if (std.mem.eql(u8, parts.v, vbytes)) return parts.e;
         }
@@ -1491,7 +1491,7 @@ const Ctx = struct {
         scan: Store.Scan,
 
         fn next(self: *LiveScan) !?LiveRow {
-            const kv = self.scan.next() orelse return null;
+            const kv = (try self.scan.next()) orelse return null;
             const parts = try key.unpackKey(self.index, false, kv.key);
             const fk = switch (self.index) {
                 .eavt => kv.key,
@@ -1833,7 +1833,7 @@ const Ctx = struct {
         // Collected before the puts: no cursor stays open across a write.
         var history: std.ArrayList([]const u8) = .empty;
         var hs = try Store.scan(self.txn, store.trees.hist(.aevt), try key.prefixBytes(self.arena, .aevt, .{ .a = attr.id }));
-        while (hs.next()) |kv| {
+        while (try hs.next()) |kv| {
             const parts = try key.unpackKey(.aevt, true, kv.key);
             try history.append(self.arena, try key.keyBytes(self.arena, .avet, parts.e, attr.id, parts.v, parts.top orelse return error.Corrupted));
         }

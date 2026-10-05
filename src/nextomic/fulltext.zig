@@ -305,7 +305,7 @@ pub fn indexRow(store: *Store, txn: *Txn, arena: Allocator, a: u32, e: u64, vbyt
 fn fulltextAttrs(store: *Store, txn: *Txn, arena: Allocator) ![]const u32 {
     var out: std.ArrayList(u32) = .empty;
     var s = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = store.fulltext_aid }));
-    while (s.next()) |kv| {
+    while (try s.next()) |kv| {
         const parts = try key.unpackKey(.aevt, false, kv.key);
         const v = try key.decodeVal(arena, parts.v);
         if (v == .val and v.val == .boolean and v.val.boolean) try out.append(arena, @intCast(parts.e));
@@ -327,12 +327,12 @@ pub fn rebuild(store: *Store, txn: *Txn, arena: Allocator, t: u64) !void {
     // Collected before the writes: no cursor stays open across one.
     var stale: std.ArrayList([]const u8) = .empty;
     var s = try Store.scan(txn, store.trees.fulltext, &.{});
-    while (s.next()) |kv| try stale.append(arena, try arena.dupe(u8, kv.key));
+    while (try s.next()) |kv| try stale.append(arena, try arena.dupe(u8, kv.key));
     for (stale.items) |k| _ = try txn.delFromTree(store.trees.fulltext, k);
     for (try fulltextAttrs(store, txn, arena)) |a| {
         var rows: std.ArrayList(key.Parts) = .empty;
         var r = try Store.scan(txn, store.trees.cur(.aevt), try key.prefixBytes(arena, .aevt, .{ .a = a }));
-        while (r.next()) |kv| {
+        while (try r.next()) |kv| {
             var parts = try key.unpackKey(.aevt, false, kv.key);
             parts.v = try arena.dupe(u8, parts.v);
             try rows.append(arena, parts);
@@ -354,7 +354,7 @@ pub fn search(store: *Store, txn: *Txn, arena: Allocator, a: u32, needle: []cons
     for (needle, 0..) |token, i| {
         var found: std.array_hash_map.Auto(Hit, void) = .empty;
         var s = try Store.scan(txn, store.trees.fulltext, try tokenPrefix(arena, a, token));
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             const hit = try hitOf(kv.key);
             if (i == 0 or hits.contains(hit)) try found.put(arena, hit, {});
         }

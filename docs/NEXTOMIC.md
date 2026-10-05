@@ -962,7 +962,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:message`; `:clause`, the index of the spec |
 | `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own keywords for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | bare |
 | `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | bare |
-| `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, is `:db/corrupted` | bare |
+| `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | bare |
 
 ---
 
@@ -1060,7 +1060,11 @@ out-of-line payload in EAVT-h, read with `Txn.getFromTree` on its
 exact key or with a cursor seek to the fact's latest row. emdb
 returns a value spanning several pages whole, from a cursor or a get,
 assembled in the transaction's buffer and valid until that
-transaction's next such read, so Nextomic copies what it keeps.
+transaction's next mutation or its end (API-KV01), so Nextomic copies
+what it keeps past either. A cursor move that meets a page failing its
+check returns no entry and records the failure (API-C08); every
+Nextomic walk reads that record, so a damaged page is `:db/corrupted`
+(§7), never a short scan.
 
 ---
 

@@ -310,7 +310,7 @@ pub const Conn = struct {
         var end: [key.id_len]u8 = undefined;
         key.writeId(&end, upto + 1);
         var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             defer _ = arena_state.reset(.retain_capacity);
             if (try datom_mod.touchesAttrPartition(arena_state.allocator(), kv.value)) return true;
         }
@@ -620,7 +620,7 @@ pub const DatomScan = struct {
         while (true) {
             switch (self.source) {
                 .current => |*s| {
-                    const kv = s.next() orelse return null;
+                    const kv = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
                     if (kv.value.len < key.id_len) return error.Corrupted;
@@ -694,7 +694,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
 
     var out: std.ArrayList(TxEntry) = .empty;
     var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
-    while (s.next()) |kv| {
+    while (try s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
         const t = try key.readT(kv.key[0..key.id_len]);
         const entry = try datom_mod.decodeTxlog(arena, kv.value, t, ids);

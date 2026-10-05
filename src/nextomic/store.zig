@@ -28,7 +28,12 @@
 //!     assertion row of its fact.
 //!   - A value spanning several pages, from a cursor or `getFromTree`,
 //!     is assembled in the transaction's buffer and valid until the
-//!     next such read; callers copy what they keep.
+//!     transaction's next mutation or its end (emdb API-KV01); callers
+//!     copy what they keep past either.
+//!   - A cursor move that meets a page failing its check returns no
+//!     entry and records why (emdb API-C08); every walk here reads that
+//!     record (`ended`), so a damaged page is an error, never the end
+//!     of a scan.
 
 const std = @import("std");
 const emdb = @import("emdb");
@@ -790,7 +795,10 @@ pub const Store = struct {
         buf[fact_len] = 0x80;
         const probe = buf[0 .. fact_len + 1];
         var c = try txn.openCursorForTree(self.trees.hist(.eavt));
-        const row = (if (c.setRange(probe) != null) c.prev() else c.last()) orelse return null;
+        const row = (if (c.setRange(probe) != null) c.prev() else c.last()) orelse {
+            try ended(&c);
+            return null;
+        };
         if (row.key.len != fact.len + key.top_len or !std.mem.startsWith(u8, row.key, fact)) return null;
         const top = try key.readTop(row.key[fact.len..][0..key.top_len]);
         return if (top.added) try arena.dupe(u8, row.value) else null;
@@ -803,9 +811,15 @@ pub const Store = struct {
         const k = try key.keyBytes(arena, index, e, a, vbytes, top);
         if (index != .eavt or top.added) return txn.getFromTree(self.trees.hist(index), k);
         var c = try txn.openCursorForTree(self.trees.hist(index));
-        const row = c.set(k) orelse return null;
+        const row = c.set(k) orelse {
+            try ended(&c);
+            return null;
+        };
         if (row.value.len > 0) return row.value;
-        const before = c.prev() orelse return error.Corrupted;
+        const before = c.prev() orelse {
+            try ended(&c);
+            return error.Corrupted;
+        };
         const fact_len = k.len - key.top_len;
         if (before.key.len != k.len or !std.mem.eql(u8, before.key[0..fact_len], k[0..fact_len])) return error.Corrupted;
         if (!(try key.readTop(before.key[fact_len..][0..key.top_len])).added) return error.Corrupted;
@@ -816,11 +830,18 @@ pub const Store = struct {
 
     pub const KeyValue = emdb.Cursor.KeyValue;
 
+    /// A cursor move that found no entry: the tree's real end, or the
+    /// page or value the cursor could not read, which it records rather
+    /// than returns (emdb API-C08). A damaged page is an error, never a
+    /// short scan.
+    pub fn ended(c: *const emdb.Cursor) emdb.cursor.OverflowError!void {
+        if (c.failure) |err| return err;
+    }
+
     /// Forward scan of one tree: the keys starting with a prefix (every
     /// key when it is empty), or the keys in `[start, end)` (an absent
     /// `end` runs to the tree's last key). Keys and values borrow the
-    /// transaction's snapshot, a multi-page value only until the next
-    /// multi-page read.
+    /// transaction's snapshot until its next mutation or its end.
     pub const Scan = struct {
         cursor: emdb.Cursor,
         start: []const u8,
@@ -828,7 +849,7 @@ pub const Store = struct {
         started: bool = false,
         done: bool = false,
 
-        pub fn next(self: *Scan) ?KeyValue {
+        pub fn next(self: *Scan) !?KeyValue {
             if (self.done) return null;
             const kv = if (!self.started) blk: {
                 self.started = true;
@@ -840,7 +861,7 @@ pub const Store = struct {
                     .end => |end| if (end) |x| std.mem.order(u8, e.key, x) == .lt else true,
                 };
                 if (inside) return e;
-            }
+            } else try ended(&self.cursor);
             self.done = true;
             return null;
         }
@@ -892,9 +913,9 @@ pub const Store = struct {
         pending: ?HistoryRow = null,
         exhausted: bool = false,
 
-        pub fn next(self: *FoldScan) key.DecodeError!?HistoryRow {
+        pub fn next(self: *FoldScan) !?HistoryRow {
             while (!self.exhausted) {
-                const row = self.inner.next() orelse {
+                const row = (try self.inner.next()) orelse {
                     self.exhausted = true;
                     break;
                 };
@@ -1113,6 +1134,38 @@ test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
     try testing.expectEqual(key.tx_partition_bit - 1, try key.readT(&raw));
 }
 
+test "a page that fails its check ends a scan with an error, never early" {
+    var td = try TestDir.init("store_damaged");
+    defer td.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fact = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
+    (try Store.open(testing.allocator, td.path.ptr, .{})).close();
+    // One byte flipped in every page holding :db/doc's ident row: the
+    // leaves of nx/eavt and nx/eavt-h fail their checksum.
+    const io = testing.io;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, td.path, arena, .unlimited);
+    var at: usize = 0;
+    var damaged: usize = 0;
+    while (std.mem.findPos(u8, bytes, at, fact)) |i| : (at = i + fact.len) {
+        bytes[i + fact.len - 1] ^= 0xFF;
+        damaged += 1;
+    }
+    try testing.expect(damaged >= 2);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = td.path, .data = bytes });
+
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    const txn = try store.beginRead();
+    defer txn.abort();
+    var s = try Store.scan(txn, store.trees.cur(.eavt), &.{});
+    try testing.expectError(error.InvalidPage, s.next());
+    var f = try Store.foldScan(txn, store.trees.hist(.eavt), &.{}, null, .{ .as_of = 1 });
+    try testing.expectError(error.InvalidPage, f.next());
+    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, fact[key.id_len + key.attr_len ..], arena));
+}
+
 test "open bootstraps once and reopen finds the same ids" {
     var td = try TestDir.init("store_boot");
     defer td.deinit();
@@ -1195,7 +1248,7 @@ test "a store without :db/fulltext receives it at open, at its next ident id" {
         defer testing.allocator.free(prefix);
         var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
         var n: usize = 0;
-        while (s.next()) |_| n += 1;
+        while (try s.next()) |_| n += 1;
         try testing.expectEqual(@as(usize, 3), n);
     }
     // Opening again mints nothing more.
@@ -1246,7 +1299,7 @@ test "bootstrap datoms are in every index they belong to" {
     const p = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
     var s = try Store.scan(txn, store.trees.cur(.eavt), p);
     var n: usize = 0;
-    while (s.next()) |kv| : (n += 1) {
+    while (try s.next()) |kv| : (n += 1) {
         try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
         try testing.expectEqual(@as(u64, 1), try key.readId(kv.value[0..key.id_len]));
     }
@@ -1256,17 +1309,17 @@ test "bootstrap datoms are in every index they belong to" {
     const pa = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
     var sa = try Store.scan(txn, store.trees.cur(.avet), pa);
     n = 0;
-    while (sa.next()) |_| n += 1;
+    while (try sa.next()) |_| n += 1;
     try testing.expectEqual(@as(usize, boot.idents.len), n);
     const pv = try key.prefixBytes(arena, .avet, .{ .a = boot.value_type });
     var sv = try Store.scan(txn, store.trees.cur(.avet), pv);
-    try testing.expect(sv.next() == null);
+    try testing.expect((try sv.next()) == null);
 
     // History mirrors current with top = (1 << 1) | 1.
     const ph = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
     var sh = try Store.scan(txn, store.trees.hist(.eavt), ph);
     n = 0;
-    while (sh.next()) |kv| : (n += 1) {
+    while (try sh.next()) |kv| : (n += 1) {
         const parts = try key.unpackKey(.eavt, true, kv.key);
         try testing.expectEqual(@as(u64, 1), parts.top.?.t);
         try testing.expect(parts.top.?.added);
@@ -1277,7 +1330,7 @@ test "bootstrap datoms are in every index they belong to" {
     // Empty prefix walks the whole tree.
     var all = try Store.scan(txn, store.trees.cur(.aevt), &.{});
     n = 0;
-    while (all.next()) |_| n += 1;
+    while (try all.next()) |_| n += 1;
     try testing.expect(n > boot.idents.len);
 }
 
@@ -1364,9 +1417,9 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     try testing.expectEqual(@as(usize, 3), adds);
     // Current trees hold only attribute 101 now.
     var cur = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-    const only = cur.next().?;
+    const only = (try cur.next()).?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
-    try testing.expect(cur.next() == null);
+    try testing.expect((try cur.next()) == null);
 }
 
 /// Share of `tree`'s leaf pages its entries fill, counting emdb's 10
@@ -1470,12 +1523,12 @@ test "a batch holds what writing its datoms one at a time holds" {
         var scans: [2]Store.Scan = undefined;
         for (&scans, txns, [_]*Store{ batched, single }) |*sc, txn, store|
             sc.* = try Store.scanRange(txn, if (history) store.trees.hist(index) else store.trees.cur(index), from, to);
-        while (scans[0].next()) |x| {
-            const y = scans[1].next() orelse return error.TestUnexpectedResult;
+        while (try scans[0].next()) |x| {
+            const y = (try scans[1].next()) orelse return error.TestUnexpectedResult;
             try testing.expectEqualSlices(u8, y.key, x.key);
             try testing.expectEqualSlices(u8, y.value, x.value);
         }
-        try testing.expect(scans[1].next() == null);
+        try testing.expect((try scans[1].next()) == null);
     };
 }
 

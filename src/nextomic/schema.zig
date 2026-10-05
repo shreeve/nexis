@@ -131,7 +131,7 @@ pub const Schema = struct {
         var events: std.ArrayList(Event) = .empty;
         var e: u64 = 0;
         var s = try Store.scanRange(txn, store.trees.hist(.eavt), &start, &end);
-        while (s.next()) |kv| {
+        while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, true, kv.key);
             if (parts.e != e) {
                 try self.add(arena, e, events.items);

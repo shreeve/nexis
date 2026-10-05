@@ -252,7 +252,7 @@ fn tokenRows(fx: *Fx) !usize {
     defer txn.abort();
     var s = try nextomic.Store.scan(txn, store.trees.fulltext, &.{});
     var n: usize = 0;
-    while (s.next()) |_| n += 1;
+    while (try s.next()) |_| n += 1;
     return n;
 }
 
