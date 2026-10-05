@@ -279,6 +279,8 @@ pub const Ctx = struct {
     /// VM symbol ids of the sources, for `explain`.
     source_names: []const u32,
     selected: ir.Src = 0,
+    /// Rule calls expanded so far (`rules.max_calls`).
+    rule_calls: usize = 0,
     /// Nesting of `planSub` calls; 1 while placing the query's own
     /// clauses, whose index a refusal then reports.
     depth: usize = 0,

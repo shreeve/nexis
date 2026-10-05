@@ -824,7 +824,10 @@ arity and one required count, and every call to a rule, in the query or
 inside a rule body, passes that many arguments
 (`:nextomic/query-syntax` otherwise). A call to a non-recursive rule
 inlines the rule's bodies, renamed afresh for that call, as the
-branches of an `or-join` over its arguments. Recursive rules run
+branches of an `or-join` over its arguments. One query expands at most
+10,000 rule calls (`rules.max_calls`; more is `:nextomic/query-syntax`):
+a body that calls a rule twice doubles the expansion per level of the
+call graph, and the plan runs a step per expansion. Recursive rules run
 semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
 with one recursive call bound to delta, others to total, minus total;
 total ∪= new; delta = new } until delta is empty`. A bound argument is

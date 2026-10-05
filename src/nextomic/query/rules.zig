@@ -53,6 +53,13 @@ const Failure = plan_mod.Failure;
 const Bound = plan_mod.Bound;
 const Relation = relation.Relation;
 
+/// The rule calls one query may expand. Each call plans the bodies of
+/// the rule it names afresh, and a body that calls a rule twice doubles
+/// the expansion per level of the call graph: the cap keeps a rule set
+/// from outside to bounded planning, and running a plan takes a step
+/// per expansion.
+pub const max_calls = 10_000;
+
 /// Planner cost of a recursive rule call: after every pattern that
 /// could bind its arguments.
 const recursive_cost: u64 = 1 << 20;
@@ -266,6 +273,8 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bo
 /// arguments, then an `or` (non-recursive) or a `fix` (recursive).
 pub fn planCall(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *Bound, steps: *std.ArrayList(Step), rows: *u64) Failure!void {
     const defs = try defsOf(ctx, name, args);
+    ctx.rule_calls += 1;
+    if (ctx.rule_calls > max_calls) return ctx.syntax("rule calls expand past 10000 in one query; a rule body calling another rule more than once doubles the expansion per level");
     const arg_vars = try ctx.arena.alloc(Var, args.len);
     for (args, arg_vars) |a, *v| {
         v.* = switch (a) {

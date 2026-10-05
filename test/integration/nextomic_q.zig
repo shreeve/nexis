@@ -1423,6 +1423,20 @@ test "corpus: rules" {
         try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, args, &d));
         try testing.expect(d.message.len > 0);
     }
+    // Each call expands its rule afresh: a body that calls the rule below
+    // it twice doubles the expansion per level, past the cap at 20.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        try src.appendSlice(testing.allocator, "[[(r0 ?e) [?e :person/age _]]");
+        for (1..21) |i| try src.print(testing.allocator, " [(r{d} ?e) (r{d} ?e) (r{d} ?e)]", .{ i, i - 1, i - 1 });
+        try src.append(testing.allocator, ']');
+        const doubling = try fx.read(src.items);
+        try checkCount(fx, dbv, "[:find ?e :in $ % :where (r10 ?e)]", &.{ value.nilValue(), doubling }, 6);
+        var dd: query.Diag = .{};
+        try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, "[:find ?e :in $ % :where (r20 ?e)]", &.{ value.nilValue(), doubling }, &dd));
+        try testing.expect(std.mem.startsWith(u8, dd.message, "rule calls expand past 10000"));
+    }
     // A required argument a recursive call changes cannot be pushed into
     // the bottom-up fixpoint, and the refusal says so.
     var d: query.Diag = .{};
