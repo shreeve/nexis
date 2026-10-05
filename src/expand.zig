@@ -426,7 +426,6 @@ fn dispatchList(ctx: *ExpandContext, list_form: *const Form, items: []const *For
 /// alias registered in the current namespace, else itself.
 fn aliasTarget(ctx: *ExpandContext, ns_prefix: []const u8) []const u8 {
     const cur = ctx.namespace orelse return ns_prefix;
-    if (!cur.aliases_initialized) return ns_prefix;
     return cur.lookupAlias(ns_prefix) orelse ns_prefix;
 }
 

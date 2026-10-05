@@ -584,8 +584,6 @@ pub const Namespace = struct {
     /// treating the prefix as a literal namespace name. Aliases
     /// are namespace-local (not inherited via auto-refer).
     aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Always true; the front end reads it.
-    aliases_initialized: bool = true,
     /// Backs the hash maps' internal storage.
     map_allocator: std.mem.Allocator,
     /// Backs the Var struct allocations. Lifetime = VM lifetime.

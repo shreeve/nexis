@@ -145,7 +145,7 @@ pub fn lookup(vm: *VM, sym: u32) !?Value {
     const current = registry.current;
     const found: ?*Var = blk: {
         if (splitQualified(name)) |q| {
-            const ns_name = if (current.aliases_initialized) current.lookupAlias(q.ns) orelse q.ns else q.ns;
+            const ns_name = current.lookupAlias(q.ns) orelse q.ns;
             const ns = registry.lookupNs(ns_name) orelse break :blk null;
             break :blk ns.lookupLocal(q.name);
         }
