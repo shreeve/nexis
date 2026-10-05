@@ -145,7 +145,7 @@ runtime throw) instead of faulting (`docs/VM.md` §13.1).
 
 `src/value.zig`: a 16-byte `{tag, payload}` cell. Immediates are nil,
 booleans, chars, fixnums (i48), floats (f64), keywords and symbols
-(intern ids); heap kinds are numbered 16-40, with 22 (`byte_vector`),
+(intern ids); heap kinds are numbered 16-42, with 22 (`byte_vector`),
 28 and 29 reserved because kind bytes are the codec's wire tags
 (`docs/VALUE.md`). An integer result outside i48 is a bignum and one
 that fits is a fixnum again (`docs/BIGNUM.md`). Equality, hash and
@@ -160,15 +160,17 @@ handle.zig` is the pattern for a kind whose body lives above
 
 `src/coll/` holds CHAMP (`champ.zig`), the vector (`vector.zig`,
 `conj`, `assoc` and `pop` O(log n)), the list and the O(1) seq view of
-a vector (`list.zig`), transients (`transient.zig`, editing the nodes
+a vector (`list.zig`), the sorted map and set (`sorted.zig`, a
+weight-balanced tree), transients (`transient.zig`, editing the nodes
 they own in place) and typed vectors.
 Every runtime value, closure and upvalue cell is a block on the VM's
 `Heap` (`src/heap.zig`), carved from size-class slabs; Vars and
 namespaces are arena objects. `src/gc.zig` is a precise, non-moving
-mark-sweep collector with an iterative mark; the VM enumerates the
-roots and collects at the instruction-fetch safe point once 16 MiB (or
-the live size) has been allocated, 4 KiB under `NEXIS_GC_STRESS`
-(`docs/GC.md`).
+mark-sweep collector with an iterative mark that traces what it marks
+in place; the VM enumerates the roots and collects at its safe points,
+the run loop and a native's call of a native through `callValue`,
+once 16 MiB (or the live size) has been allocated, 4 KiB under
+`NEXIS_GC_STRESS` (`docs/GC.md` §7).
 
 ### 3.4 The db seam
 
@@ -187,6 +189,7 @@ operations while no commit passes it (§3.4); resolves tree ids once per connect
 values whole off cursors, lets a walk see its tree as it began
 whatever its callback writes, holds the transaction a `db/alter!` or
 `db/reduce-tree` callback runs in so the callback cannot finish it,
+syncs a new file's first state before `db/open` returns,
 aborts a transaction the program drops at the next collection that
 finds nothing holding it and every open one at `db/close`, and names
 every engine failure as a `:db/*` keyword (`docs/DB.md`).
@@ -264,7 +267,7 @@ shape its keys, and what must not be asked of emdb.
   through every index, `since` and `history`, across a reopen and an
   aborted transaction. `nextomic_key.zig` sweeps 100,000 pairs per
   value type for `order(enc a, enc b) == cmp(a, b)`. The other
-  fourteen `test/prop` files sweep the collections, the codec round
+  fifteen `test/prop` files sweep the collections, the codec round
   trip (equal and same hash), interning, the heap, the collector and
   the compiler (`test/README.md`).
 - **Language.** `test/integration/eval_pipeline.zig` runs programs
@@ -339,19 +342,22 @@ failing test (AGENTS.md).
 
 ### 6.4 Build and platform
 
-1. **Linux compiles; its test run is CI's.** `zig build
+1. **Linux runs the gate in CI** (x86_64 and arm64), `zig build
    check-targets` compiles and links every binary for x86_64 and
-   aarch64 Linux, glibc and musl, from macOS, and CI runs the gate on
-   Linux x86_64 and arm64; a green CI run on `main` is the first proof
-   that the tests pass there. Still unproven: a store written on one
-   platform and read on the other (the page size is pinned, so the
-   files should be byte-compatible). The runtime thread reserves a
-   1 GiB stack, which a Linux host with strict overcommit
-   (`vm.overcommit_memory=2`) may refuse. The tests that open a
-   read-only store file assume a user who is not root: root may write
-   any file.
+   aarch64 Linux, glibc and musl, from any host, and the comparison
+   harness runs on an x86_64 Linux host (`docs/PERF.md` §3.15).
+   Unproven: a store written on one platform and read on the other
+   (the page size is pinned, so the files should be byte-compatible).
+   The runtime thread reserves a 1 GiB stack, which a Linux host with
+   strict overcommit (`vm.overcommit_memory=2`) may refuse. The tests
+   that open a read-only store file assume a user who is not root:
+   root may write any file.
 2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI
    checks every other tracked Zig file.
+3. **CI builds against unpinned siblings**: it checks out `shreeve/emdb`
+   and `shreeve/nexus` at their default branches, so a change there
+   that breaks the build shows as a red nexis run. Pinning each to a
+   ref, bumped deliberately, is the owner's call.
 
 ---
 
@@ -403,24 +409,25 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. A store carried between macOS and Linux (§6.4); CI runs the gate on
-   both.
-2. Performance (`docs/PERF.md` §3.11, §3.13–§3.15). On the Apple
-   host nexis is ahead of babashka on every row, the eager
-   `map`/`filter`/`reduce` pipeline at 0.76× with 195 MB against
-   212 MB (§3.14), and holds more memory than babashka only in `sort`
-   (§6, "`sort`'s buffers"). On the Linux host (§3.15) it trails
-   babashka on vectors, string splitting and the pipeline, and warm
-   JVM Clojure on eight of ten programs (1.5–16×, `fib` and
-   destructuring worst), level on `sort` and `frequencies`/`group-by`;
-   it starts 43× sooner than `clojure -M` and holds 1.6–22× less
-   memory. Nextomic is
-   ahead of Datalevin, Datomic Local and Datomic Pro on every phase
-   timed cold, trails a warm Datomic Pro peer on point lookups (1.18×),
-   and its store is the largest: 3.3× Datalevin's, 7.6× Datomic
-   Pro's. The levers are `docs/PERF.md` §6 (store size, generational
-   collection, a keyword lookup instruction).
-   Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
-   before and after.
-3. The open design questions, each an amendment first: laziness
-   (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9).
+1. A store carried between macOS and Linux (§6.4): write one on each
+   host and read it on the other, with the Linux host of
+   `docs/PERF.md` §3.15.
+2. Interpreter speed: the instructions each bytecode instruction
+   costs and the dispatches a loop or a call takes, which keep nexis
+   behind babashka on three rows and behind warm JVM Clojure on eight
+   of ten on the Linux host (`docs/PERF.md` §3.15). The levers are
+   frameless fast handlers with a general fallback, operands proven in
+   range once per routine, in-place `recur`, self-calls, and fused
+   compare-and-jump and loop-step instructions (`docs/VM.md` §8, §10;
+   `docs/PERF.md` §6). The owner orders this after the em and emdb
+   work, with em's runtime as the reference.
+3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
+   (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
+4. The open design questions, each an amendment first: laziness
+   (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9). The owner
+   orders these after the em and emdb work.
+
+Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
+before and after any performance change; on the Apple host nexis
+leads babashka on every row (§3.11), and Nextomic leads Datalevin,
+Datomic Local and Datomic Pro on every phase timed cold (§3.15).

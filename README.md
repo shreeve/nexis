@@ -157,6 +157,24 @@ it asks of emdb (nothing), §12 its differences from Datomic.
 A new store file starts at 1 MiB and grows 8 MiB at a time as it
 fills (`docs/NEXTOMIC.md` §2).
 
+## Performance
+
+Measured with provenance in `docs/PERF.md`, by the comparison harness
+`bench/compare/run.clj` (`docs/BENCH.md` §12):
+
+- **Start-up**: about 5 ms and a 6 MB resident set on an Apple M5.
+- **Against babashka**: ahead on all eleven language workloads on the
+  M5 (§3.11); on an Intel Core Ultra 9 185H under Linux, ahead on
+  seven, level on start-up, behind on vectors, string splitting and
+  the `map`/`filter`/`reduce` pipeline (§3.15).
+- **Against JVM Clojure** (the Linux host): warm HotSpot is 1.5–16×
+  faster on eight of ten programs; counting the JVM's start, nexis
+  finishes first on every one-shot program but the map build, in
+  1.6–22× less memory (§3.15).
+- **Nextomic**: ahead of Datalevin, Datomic Local and Datomic Pro on
+  every phase timed cold; a warm Datomic Pro peer is faster at point
+  lookups; its store is the largest, 3.1× Datalevin's (§3.11, §3.15).
+
 ## Differences from Clojure
 
 The semantics port; the platform does not.
