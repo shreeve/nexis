@@ -77,6 +77,13 @@
        (and (= #{[:x/a]} (d/q '[:find ?i :where [?e :db/ident ?i] [(= ?i :x/a)]] (d/db c)))
             (= #{[(d/entid (d/db c) :role/admin)]} (d/q '[:find ?e :where [?e :db/ident :role/admin]] (d/db c)))
             (= :role/admin (d/ident (d/db c) (d/entid (d/db c) :role/admin)))))
+; A schema flag belongs to an attribute: on an entity with no value
+; type and cardinality (a half-written attribute map, an enum ident) it
+; is refused, whatever the flag.
+(println (t/caught (d/transact! c [{:db/ident :x/half :db/unique :db.unique/identity}])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/unique :db.unique/value]])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/index true]])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/isComponent true]])))
 ; A cas whose old value is a keyword the store has never seen fails
 ; as a cas naming that keyword, and mints nothing.
 (d/transact! c [[:db/add a :x/role :role/admin]])

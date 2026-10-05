@@ -1631,115 +1631,115 @@ const Ctx = struct {
 
     // ── schema ────────────────────────────────────────────────────
 
-    /// Attribute entities (NEXTOMIC.md §3 step 5): a new attribute needs
-    /// `:db/valueType` and `:db/cardinality`; `:db/valueType` never
-    /// changes; `:db/cardinality` may go one → many, and many → one
-    /// while no entity holds two values; adding `:db/index` or
-    /// `:db/unique` backfills AVET from AEVT; none of them is retracted.
+    /// What one transaction does to one attribute-partition entity: the
+    /// fields a new attribute asserts and the flags it gains.
+    const SchemaChange = struct {
+        a: u32,
+        /// The attribute as the transaction began, null when the entity
+        /// is not one.
+        existing: ?*const Attr,
+        value_type: ?key.ValueType = null,
+        /// `:db/cardinality` asserted: its value is `many`. On an
+        /// existing attribute it is a change, since re-asserting the
+        /// current value writes nothing.
+        has_card: bool = false,
+        many: bool = false,
+        /// The card-one overwrite's retraction of the old cardinality.
+        card_retracted: bool = false,
+        unique: bool = false,
+        /// `:db/index true` or `:db/unique`: the attribute is in AVET.
+        avet: bool = false,
+        fulltext: bool = false,
+        component: bool = false,
+    };
+
+    /// Attribute entities (NEXTOMIC.md §3 step 5), one record per
+    /// entity: a new attribute needs `:db/valueType` and
+    /// `:db/cardinality`, and so does an entity that gains any schema
+    /// flag; `:db/valueType` never changes; `:db/cardinality` may go one
+    /// → many, and many → one while no entity holds two values; adding
+    /// `:db/index` or `:db/unique` backfills AVET from AEVT, adding
+    /// `:db/fulltext` the tokens tree; none of them is retracted.
     fn applySchema(self: *Ctx) !void {
         if (!self.schema_touched) return;
-        var new_attrs: std.AutoHashMapUnmanaged(u32, struct { value_type: ?key.ValueType = null, has_card: bool = false, many: bool = false }) = .empty;
-        var backfill: std.AutoHashMapUnmanaged(u32, *const Attr) = .empty;
-        var unique_added: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        // Attributes gaining `:db/fulltext true`: existing ones backfill
-        // the tokens tree, new ones must be strings.
-        var fulltext_backfill: std.AutoHashMapUnmanaged(u32, *const Attr) = .empty;
-        var fulltext_new: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        // Attributes gaining `:db/isComponent true`, which must be refs.
-        var components: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        var changes: std.ArrayList(SchemaChange) = .empty;
+        var index: std.AutoHashMapUnmanaged(u32, usize) = .empty;
         const fulltext_aid = self.conn.store.fulltext_aid;
-        // The card-one overwrite of `:db/cardinality` retracts the old
-        // value beside the new one; that retraction is the change, not
-        // a removal.
-        var card_changed: std.AutoHashMapUnmanaged(u32, void) = .empty;
-        for (self.overlay.items) |p| {
-            if (key.isAttrPartition(p.e) and p.attr.id == boot.cardinality and p.added) try card_changed.put(self.arena, @intCast(p.e), {});
-        }
         for (self.overlay.items) |p| {
             if (!key.isAttrPartition(p.e)) continue;
             const a: u32 = @intCast(p.e);
-            const existing = self.schema.attr(a);
+            const g = try index.getOrPut(self.arena, a);
+            if (!g.found_existing) {
+                g.value_ptr.* = changes.items.len;
+                try changes.append(self.arena, .{ .a = a, .existing = self.schema.attr(a) });
+            }
+            const c = &changes.items[g.value_ptr.*];
             if (p.attr.id == fulltext_aid) {
                 // A `false` flag gives way to `true`; `true` stays.
                 if (!p.added and p.v.boolean) return self.conflict(p.e, p.attr.id);
-                if (!p.added or !p.v.boolean) continue;
-                if (existing) |ex| {
-                    if (ex.value_type != .string) return self.schemaRefused(a, null, ":db/fulltext takes a string attribute");
-                    if (!ex.fulltext) try fulltext_backfill.put(self.arena, a, ex);
-                } else try fulltext_new.put(self.arena, a, {});
+                if (p.added and p.v.boolean) c.fulltext = true;
                 continue;
             }
             switch (p.attr.id) {
                 boot.value_type => {
-                    if (!p.added or existing != null) return self.conflict(p.e, p.attr.id);
-                    const g = try new_attrs.getOrPut(self.arena, a);
-                    if (!g.found_existing) g.value_ptr.* = .{};
-                    g.value_ptr.value_type = boot.valueTypeOf(p.v.keyword);
+                    if (!p.added or c.existing != null) return self.conflict(p.e, p.attr.id);
+                    c.value_type = boot.valueTypeOf(p.v.keyword);
                 },
-                boot.cardinality => {
-                    const many = p.v.keyword == boot.card_many;
-                    if (!p.added) {
-                        if (card_changed.get(a) == null) return self.conflict(p.e, p.attr.id);
-                        continue;
-                    }
-                    if (existing) |ex| {
-                        if (many == ex.many()) continue;
-                        if (many and ex.unique != .none) return self.schemaRefused(a, null, "a unique attribute is cardinality one");
-                        if (!many) try self.checkSingleValued(ex);
-                        continue;
-                    }
-                    const g = try new_attrs.getOrPut(self.arena, a);
-                    if (!g.found_existing) g.value_ptr.* = .{};
-                    g.value_ptr.has_card = true;
-                    if (many) g.value_ptr.many = true;
+                boot.cardinality => if (p.added) {
+                    c.has_card = true;
+                    c.many = p.v.keyword == boot.card_many;
+                } else {
+                    c.card_retracted = true;
                 },
-                boot.is_component => if (p.added and p.v.boolean) try components.put(self.arena, a, {}),
+                boot.is_component => if (p.added and p.v.boolean) {
+                    c.component = true;
+                },
                 boot.unique, boot.index => {
                     if (!p.added and (p.attr.id == boot.unique or p.v.boolean)) return self.conflict(p.e, p.attr.id);
                     if (!p.added or (p.attr.id == boot.index and !p.v.boolean)) continue;
-                    if (p.attr.id == boot.unique) try unique_added.put(self.arena, a, {});
-                    if (existing) |ex| {
-                        if (!ex.inAvet()) {
-                            try backfill.put(self.arena, a, ex);
-                        } else if (p.attr.id == boot.unique) {
-                            try self.checkUniqueAvet(ex);
-                        }
-                    }
+                    if (p.attr.id == boot.unique) c.unique = true;
+                    c.avet = true;
                 },
                 else => {},
             }
         }
-        var it = new_attrs.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.value_type == null or !e.value_ptr.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+        for (changes.items) |c| {
+            // The cardinality's retraction is the overwrite's, never a
+            // removal.
+            if (c.card_retracted and !c.has_card) return self.conflict(c.a, boot.cardinality);
+            const vt: key.ValueType, const many: bool = if (c.existing) |ex| .{ ex.value_type, if (c.has_card) c.many else ex.many() } else blk: {
+                const flagged = c.unique or c.avet or c.fulltext or c.component;
+                if (c.value_type == null and !c.has_card and !flagged) continue;
+                if (c.value_type == null or !c.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+                break :blk .{ c.value_type.?, c.many };
+            };
+            if (c.existing) |ex| if (c.has_card) {
+                if (many and ex.unique != .none) return self.schemaRefused(c.a, null, "a unique attribute is cardinality one");
+                if (!many) try self.checkSingleValued(ex);
+            };
+            // A unique attribute identifies one entity by one value, so
+            // it is card-one.
+            if (c.unique and many) return self.malformed("a unique attribute is cardinality one");
+            if (c.fulltext and vt != .string) return self.schemaRefused(c.a, null, ":db/fulltext takes a string attribute");
+            if (c.component and vt != .ref) return self.schemaRefused(c.a, null, ":db/isComponent takes a ref attribute");
         }
-        // A unique attribute identifies one entity by one value, so it
-        // is card-one.
-        var uit = unique_added.keyIterator();
-        while (uit.next()) |a| {
-            const many = if (self.schema.attr(a.*)) |ex| (if (card_changed.get(a.*) != null) !ex.many() else ex.many()) else new_attrs.get(a.*).?.many;
-            if (many) return self.malformed("a unique attribute is cardinality one");
+        for (changes.items) |c| {
+            const ex = c.existing orelse continue;
+            if (c.avet) {
+                if (!ex.inAvet()) {
+                    try self.backfillAvet(ex);
+                } else if (c.unique) {
+                    try self.checkUniqueAvet(ex);
+                }
+            }
+            if (c.fulltext and !ex.fulltext) {
+                try self.backfillFulltext(ex);
+                // Pending string datoms of an attribute that is
+                // full-text from this transaction on belong in the
+                // tokens tree too.
+                if (self.attrs.get(c.a)) |copy| copy.fulltext = true;
+            }
         }
-        var fit = fulltext_new.keyIterator();
-        while (fit.next()) |a| {
-            const n = new_attrs.get(a.*) orelse return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
-            if (n.value_type != .string) return self.schemaRefused(a.*, null, ":db/fulltext takes a string attribute");
-        }
-        var cit = components.keyIterator();
-        while (cit.next()) |a| {
-            const vt = if (self.schema.attr(a.*)) |ex| ex.value_type else if (new_attrs.get(a.*)) |n| n.value_type else null;
-            if (vt != .ref) return self.schemaRefused(a.*, null, ":db/isComponent takes a ref attribute");
-        }
-        var bit = backfill.iterator();
-        while (bit.next()) |e| try self.backfillAvet(e.value_ptr.*);
-        var fbit = fulltext_backfill.iterator();
-        while (fbit.next()) |e| try self.backfillFulltext(e.value_ptr.*);
-        // Pending string datoms of an attribute that is full-text from
-        // this transaction on belong in the tokens tree too.
-        var fkit = fulltext_backfill.keyIterator();
-        while (fkit.next()) |a| if (self.attrs.get(a.*)) |c| {
-            c.fulltext = true;
-        };
     }
 
     /// Index every current string value of the attribute in the tokens

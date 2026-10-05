@@ -345,7 +345,11 @@ so there is no queue; emdb's write lock is the transactor.
    entities, checked here, and take effect for the transactions after
    the one that makes them (the data of the same transaction is
    expanded under the schema it began with). A new attribute needs
-   `:db/valueType` and `:db/cardinality`. What may change afterwards:
+   `:db/valueType` and `:db/cardinality`, and so does any entity that
+   gains `:db/unique`, `:db/index true`, `:db/fulltext true` or
+   `:db/isComponent true`: on an entity that is not an attribute and
+   does not become one (an enum ident, a half-written attribute map)
+   each is `:nextomic/tx-data`. What may change afterwards:
    - `:db/valueType` never (`:nextomic/conflict`).
    - `:db/cardinality`: one → many always; many → one while no entity
      holds two values, in the tree or in the transaction, otherwise
