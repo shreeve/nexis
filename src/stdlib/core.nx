@@ -102,17 +102,18 @@
      v#))
 
 ; (assert x) / (assert x message) → nil when x is truthy, else throws
-; ex-info "Assert failed: <message or the form>" whose data's :error
-; is :assertion-failed. The printed form and the data are built when
-; the macro expands, so the check costs its test and the failure one
-; call.
+; {:error :assertion-failed :message "Assert failed: <message or the
+; form>"}, the shape :pre, :post, case and condp throw. The printed
+; form is built when the macro expands, so the check costs its test
+; and the failure one call of two constants, a conj that makes a
+; fresh map each time.
 (defmacro assert [x & message]
   `(when-not ~x
-     (throw (ex-info ~(cond
-                        (empty? message) (str "Assert failed: " (pr-str x))
-                        (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
-                        true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))
-                     {:error :assertion-failed}))))
+     (throw (conj {:error :assertion-failed}
+                  [:message ~(cond
+                               (empty? message) (str "Assert failed: " (pr-str x))
+                               (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
+                               true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))]))))
 
 ; (time expr) → expr's value, after printing how long it took, as
 ; Clojure's does.
