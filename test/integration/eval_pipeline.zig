@@ -1236,6 +1236,26 @@ test "integration: (ns NAME) switches current namespace" {
     , "100");
 }
 
+/// Run `src` through the loader, as `nexis run` runs a file, and
+/// compare the last form's printed value with `expected`.
+fn expectLoaded(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    const result = try program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() });
+    try harness.expectResult(&program, src, result, expected);
+}
+
+test "loader: a top-level do runs its forms one at a time, as Clojure's eval does" {
+    try expectLoaded("(do (ns foo) (def x 1)) (ns user) [(resolve 'foo/x) (resolve 'user/x)]", "[#'foo/x nil]");
+    try expectLoaded("(do (def k 41) (defmacro m [] (inc k)) (m))", "42");
+    // A macro that expands to a `do` is split the same way.
+    try expectLoaded("(defmacro two [a b] `(do ~a ~b)) (two (def p 1) (defmacro q [] p)) (q)", "1");
+    try expectLoaded("(do (do 1 2) (do))", "nil");
+    try expectLoaded("(do 1 (do 2 3))", "3");
+}
+
 test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
@@ -5335,9 +5355,12 @@ test "eval: def binds in the current namespace; a macro it defines serves a late
     try expectOutputProgram("(ns my.app) (eval '(def z 9)) (ns user) [my.app/z (eval 'my.app/z)]", "[9 9]");
     // `(ns ...)` inside eval switches the current namespace, as at the REPL.
     try expectOutputProgram("(eval '(ns other)) (def w 1) (ns user) other/w", "1");
-    // A `def` after an `(ns ...)` inside one form binds in the
-    // namespace current when the form's compile started, as at the REPL.
-    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) w", "2");
+    // A `do` runs its forms one at a time, as Clojure's eval does:
+    // a `def` after an `(ns ...)` binds in that namespace, and a macro
+    // body sees a `def` made before it.
+    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) [other/w (resolve 'user/w)]", "[2 nil]");
+    try expectOutput("(eval '(do (def k 41) (defmacro mk [] (inc k)) (mk)))", "42");
+    try expectOutput("(eval '(do))", "nil");
 }
 
 test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {

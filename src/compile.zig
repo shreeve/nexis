@@ -2432,31 +2432,56 @@ pub const RuntimeHooks = struct {
             return compileFailure(v, err, "UnsupportedForm", form_value, null);
         var declared = DeclaredNames.init(v.allocator);
         defer declared.deinit();
-        var detail: ?[]const u8 = null;
-        const compiled = compileFormWith(scratch.allocator(), form, .{
-            .out_detail = &detail,
-            .io = v.io,
-            .namespace = self.registry.current,
-            .interner = self.interner,
-            .host_macros = self.host_macros,
-            .persistent_allocator = persistent,
-            .routine_allocator = persistent,
-            .registry = self.registry,
-            .load_callback = self.load_callback,
-            .declared = &declared,
-        }) catch |err| switch (err) {
+        // A `do` runs its forms one at a time, as a loaded file's
+        // top-level `do` does (MACROEXPAND.md §2b).
+        var pending: std.ArrayList(*const reader_mod.Form) = .empty;
+        defer pending.deinit(v.allocator);
+        pending.append(v.allocator, form) catch return vm.VmError.OutOfMemory;
+        var last = value_mod.nilValue();
+        while (pending.pop()) |next| {
+            var detail: ?[]const u8 = null;
+            const opts: CompileOptions = .{
+                .out_detail = &detail,
+                .io = v.io,
+                .namespace = self.registry.current,
+                .interner = self.interner,
+                .host_macros = self.host_macros,
+                .persistent_allocator = persistent,
+                .routine_allocator = persistent,
+                .registry = self.registry,
+                .load_callback = self.load_callback,
+                .declared = &declared,
+            };
+            const top = expandTopLevel(scratch.allocator(), next, opts) catch |err| return evalFailure(v, err, form_value, detail);
+            if (doForms(top)) |body| {
+                last = value_mod.nilValue();
+                var i = body.len;
+                while (i > 0) {
+                    i -= 1;
+                    pending.append(v.allocator, body[i]) catch return vm.VmError.OutOfMemory;
+                }
+                continue;
+            }
+            const compiled = compileFormWith(scratch.allocator(), top, opts) catch |err| return evalFailure(v, err, form_value, detail);
+            const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
+            routine.* = compiled.toRoutine("<eval>");
+            last = try v.runRoutine(routine);
+        }
+        return last;
+    }
+
+    /// What `eval` does when `err` stops it compiling `form`.
+    fn evalFailure(v: *vm.VM, err: CompileError, form: value_mod.Value, detail: ?[]const u8) vm.VmError {
+        return switch (err) {
             // A required file's throw that the caller's handler took:
             // the VM is already at the handler.
-            error.ControlTransferred => return vm.VmError.ControlTransferred,
+            error.ControlTransferred => vm.VmError.ControlTransferred,
             // A required file's form failed with no handler anywhere;
             // its frames are still in place above this call, so the
             // error leaves through the run loop with the full chain.
-            error.RequiredFileFailed => return v.traced_error orelse vm.VmError.UncaughtThrow,
-            else => return compileFailure(v, err, @errorName(err), form_value, detail),
+            error.RequiredFileFailed => v.traced_error orelse vm.VmError.UncaughtThrow,
+            else => compileFailure(v, err, @errorName(err), form, detail),
         };
-        const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
-        routine.* = compiled.toRoutine("<eval>");
-        return v.runRoutine(routine);
     }
 
     /// Out of memory stays an error; anything else the hook could
@@ -2542,6 +2567,66 @@ pub const CompileOptions = struct {
     source: ?*const vm.SourceInfo = null,
 };
 
+const no_macros: expand_mod.HostMacroTable = .{};
+
+/// The heap of `namespace`'s registry, where constants and macro
+/// values live; null without one.
+fn registryHeap(namespace: ?*vm.Namespace) ?*heap_mod.Heap {
+    const registry = (namespace orelse return null).registry orelse return null;
+    return registry.heap;
+}
+
+/// The expander over `opts` (MACROEXPAND.md §1), `defmacro`
+/// compiling through `ceval` when it is given.
+fn expandContext(allocator: std.mem.Allocator, interner: *intern_mod.Interner, opts: CompileOptions, ceval: ?*CompileEvalData) expand_mod.ExpandContext {
+    return .{
+        .allocator = allocator,
+        .interner = interner,
+        .host_macros = opts.host_macros orelse &no_macros,
+        .namespace = opts.namespace,
+        .compile_eval = if (ceval) |data| .{ .user_data = @ptrCast(data), .eval = compileEvalCallback } else null,
+        .registry = opts.registry,
+        .load_callback = opts.load_callback,
+        .value_heap = registryHeap(opts.namespace),
+        .io = opts.io,
+    };
+}
+
+/// An expansion failure as the compile error it is, with the span
+/// and message the expander recorded (MACROEXPAND.md §8).
+fn expandFailure(err: expand_mod.ExpandError, ctx: *const expand_mod.ExpandContext, form: *const reader_mod.Form, opts: CompileOptions) CompileError {
+    if (opts.out_span) |s| s.* = if (ctx.failure) |f| f.span else form.origin;
+    if (opts.out_detail) |d| d.* = if (ctx.failure) |f| f.message else null;
+    return switch (err) {
+        error.ExpansionDepthExceeded => CompileError.MacroDepthExceeded,
+        error.RequiredFileFailed => CompileError.RequiredFileFailed,
+        error.ControlTransferred => CompileError.ControlTransferred,
+        error.OutOfMemory => CompileError.OutOfMemory,
+        else => CompileError.MacroExpansionFailure,
+    };
+}
+
+/// `form` with its head expanded until it names no macro: a
+/// top-level form as a loader or `eval` takes it before compiling it
+/// (MACROEXPAND.md §2b, the loader). A `do` it comes to runs its
+/// forms one at a time (`doForms`), each taken the same way, as
+/// Clojure's `eval` runs them. Without an interner nothing expands.
+pub fn expandTopLevel(allocator: std.mem.Allocator, form: *const reader_mod.Form, opts: CompileOptions) CompileError!*const reader_mod.Form {
+    const interner = opts.interner orelse return form;
+    var ctx = expandContext(allocator, interner, opts, null);
+    return expand_mod.expandHead(&ctx, form) catch |err| expandFailure(err, &ctx, form, opts);
+}
+
+/// The forms of `(do ...)`; null for any other form.
+pub fn doForms(form: *const reader_mod.Form) ?[]const *reader_mod.Form {
+    if (form.datum != .list) return null;
+    const items = form.datum.list;
+    if (items.len == 0 or items[0].datum != .symbol) return null;
+    const head = items[0].datum.symbol;
+    if (head.ns != null or !std.mem.eql(u8, head.name, "do")) return null;
+    return items[1..];
+}
+
 /// Full form-compile entry: macroexpand, lower and emit `form`
 /// under `opts`.
 pub fn compileFormWith(
@@ -2550,68 +2635,33 @@ pub fn compileFormWith(
     opts: CompileOptions,
 ) CompileError!Compiled {
     const namespace = opts.namespace;
-    const interner = opts.interner;
     const out_span = opts.out_span;
     const declared = opts.declared;
     var working_form: *const reader_mod.Form = form;
-    if (interner != null) {
-        const empty_table: expand_mod.HostMacroTable = .{};
-        const table_to_use: *const expand_mod.HostMacroTable =
-            opts.host_macros orelse &empty_table;
-        // The compile-eval callback lets the defmacro handler in
-        // expand.zig compile and run the synthetic
-        // `(def name (fn* ...))` form in a sub-VM; the macro fn
-        // is stored in the persistent allocator so it outlives
-        // the per-form arena.
-        const registry_heap: ?*heap_mod.Heap = if (namespace) |n| (if (n.registry) |r| r.heap else null) else null;
+    if (opts.interner) |interner| {
+        // `defmacro` compiles and runs its `(def name (fn* ...))`
+        // through this, the macro's routines on the persistent
+        // allocator so they outlive the per-form arena.
         var ceval_data = CompileEvalData{
             .persistent_allocator = opts.persistent_allocator orelse allocator,
             .namespace = namespace,
-            .interner = interner.?,
-            .registry_heap = registry_heap,
+            .interner = interner,
+            .registry_heap = registryHeap(namespace),
         };
-        var mctx = expand_mod.ExpandContext{
-            .allocator = allocator,
-            .interner = interner.?,
-            .host_macros = table_to_use,
-            .namespace = namespace,
-            .compile_eval = .{
-                .user_data = @ptrCast(&ceval_data),
-                .eval = compileEvalCallback,
-            },
-            .registry = opts.registry,
-            .load_callback = opts.load_callback,
-            .value_heap = registry_heap,
-            .io = opts.io,
-        };
-        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| {
-            // The expander records the innermost form it failed at
-            // and why (MACROEXPAND.md §8).
-            if (out_span) |s| s.* = if (mctx.failure) |f| f.span else form.origin;
-            if (opts.out_detail) |d| d.* = if (mctx.failure) |f| f.message else null;
-            return switch (err) {
-                error.ExpansionDepthExceeded => CompileError.MacroDepthExceeded,
-                error.RequiredFileFailed => CompileError.RequiredFileFailed,
-                error.ControlTransferred => CompileError.ControlTransferred,
-                error.OutOfMemory => CompileError.OutOfMemory,
-                else => CompileError.MacroExpansionFailure,
-            };
-        };
+        var mctx = expandContext(allocator, interner, opts, &ceval_data);
+        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| return expandFailure(err, &mctx, form, opts);
     }
     // `.string` Form datums lower to `Tiny.literal` on the
     // registry's heap. Without a namespace or a registry there is
     // no heap and a string literal is `UnsupportedFeature`.
-    const lower_heap: ?*heap_mod.Heap = if (namespace) |n|
-        (if (n.registry) |r| r.heap else null)
-    else
-        null;
+    const lower_heap = registryHeap(namespace);
     // Whatever this form defines (including definitions a macro
     // expanded into it) may be referred to anywhere inside it.
     if (declared) |d| try d.declareForm(working_form);
     var diag = LowerDiag{};
     const ctx = LowerCtx{
         .env = null,
-        .interner = interner,
+        .interner = opts.interner,
         .heap = lower_heap,
         .namespace = namespace,
         .declared = declared,

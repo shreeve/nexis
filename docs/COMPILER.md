@@ -832,7 +832,8 @@ compiler as the VM's `macroexpand-1`, `read-string` and `eval`
 (MACROEXPAND.md §1.2). The loader's `evalSource` parses and reads
 every top-level form first, then compiles and runs each before
 compiling the next, sharing the VM's namespace, interner and macro
-table.
+table; `expandTopLevel` and `doForms` let it, and `eval`, run a
+top-level `do` one form at a time (MACROEXPAND.md §2b).
 
 ---
 

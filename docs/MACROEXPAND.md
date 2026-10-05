@@ -161,7 +161,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
      the REPL compiles a line: the current namespace, the registry,
      interner, host macros and loader, a fresh set of declared
      names. It runs the routine on the calling VM as a nested call
-     (`vm.runRoutine`) and returns its value. A `def` inside binds
+     (`vm.runRoutine`) and returns its value; a `do` runs its forms
+     one at a time, as a loaded file's top-level `do` does (§2b). A `def` inside binds
      in the current namespace, a `defmacro` serves a later `eval`,
      `(ns ...)` switches the current namespace, a returned closure
      stays callable, a dynamic binding in force is seen, and `eval`
@@ -234,7 +235,14 @@ innermost-first parent walk, as `compile.LowerEnv` does.
 `load_callback`. `Loader.evalSource` is the one path from text to
 effect for `run`, `repl`, `disasm`, the stdlib bootstrap and
 `require`: parse, read, declare the names the text defines, compile
-and run each top-level form. `(require 'my.app-core.foo)` maps the
+and run each top-level form. A top-level form's head is expanded
+first until it names no macro (`compile.expandTopLevel`); a `do` it
+comes to runs its forms one at a time, each taken the same way, as
+Clojure's `eval` runs them, so an `ns`, `def` or `defmacro` among
+them is in force for the forms after it: `(do (ns foo) (def x 1))`
+defines `foo/x`, and a macro defined in a `do` may use a `def` made
+before it there. Its value is the last form's, nil for `(do)`.
+`disasm`, which runs nothing, compiles each top-level form whole. `(require 'my.app-core.foo)` maps the
 name to `my/app_core/foo.nx` (dots to slashes, dashes to
 underscores) and takes the first match on the load path (the CLI's
 is the working directory, then the directory of the file being run).

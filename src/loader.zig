@@ -226,55 +226,99 @@ pub const Loader = struct {
         defer declared.deinit();
         if (options.declare) for (forms) |form| try declared.declareForm(form);
 
-        var last: Value = @import("value.zig").nilValue();
-        for (forms) |form| {
-            var span: ?reader_mod.SrcSpan = null;
-            var detail: ?[]const u8 = null;
-            self.load_failed = false;
-            const compiled = compile_mod.compileFormWith(options.allocator, form, .{
-                .namespace = self.registry.current,
-                .interner = self.interner,
-                .host_macros = self.host_macros,
-                .out_span = &span,
-                .out_detail = &detail,
-                .io = self.io,
-                .persistent_allocator = self.persistent_allocator,
-                .registry = self.registry,
-                .load_callback = self.callback(),
-                .declared = if (options.declare) &declared else null,
-                .source = info,
-            }) catch |err| return self.compileFailure(info, err, span, detail);
-            // A run that fails leaves its frame for the trace, and
-            // the frame points at the routine.
-            const routine = try options.allocator.create(vm_mod.Routine);
-            routine.* = compiled.toRoutine("<top>");
+        const decl: ?*compile_mod.DeclaredNames = if (options.declare) &declared else null;
+        const nil = @import("value.zig").nilValue();
+        var pending: std.ArrayList(*const reader_mod.Form) = .empty;
+        defer pending.deinit(self.allocator);
+        var last = nil;
+        for (forms) |top| {
             if (options.on_routine) |each| {
+                const routine = try self.compileForm(info, top, options.allocator, decl);
                 each.call(each.ctx, routine) catch |err| return mapCallbackError(err);
                 continue;
             }
-            // A nested call, never a retarget of the top frame: the VM
-            // may be running the program that required this text. A
-            // failure's detail and error are this form's, not an
-            // earlier one's. Out of memory is a runtime error like any
-            // other: what the failed allocation was building is
-            // unreachable, and the report locates the form that asked.
-            self.vm.error_detail = "";
-            self.vm.traced_error = null;
-            last = self.vm.runRoutine(routine) catch |err| switch (err) {
-                error.ControlTransferred => return error.ControlTransferred,
-                else => {
-                    // A run that failed before its first instruction
-                    // (its frame could not be pushed) has no trace.
-                    if (self.vm.traced_error == null) {
-                        self.vm.traced_error = err;
-                        self.vm.error_trace.clearRetainingCapacity();
+            // A top-level `do` runs its forms one at a time, so an
+            // `ns`, `def` or `defmacro` among them is in force for
+            // the ones after it (MACROEXPAND.md §2b).
+            try pending.append(self.allocator, top);
+            while (pending.pop()) |form| {
+                const expanded = try self.expandTopLevel(info, form, options.allocator, decl);
+                if (compile_mod.doForms(expanded)) |body| {
+                    if (decl) |d| try d.declareForm(expanded);
+                    last = nil;
+                    var i = body.len;
+                    while (i > 0) {
+                        i -= 1;
+                        try pending.append(self.allocator, body[i]);
                     }
-                    return error.RunFailed;
-                },
-            };
+                    continue;
+                }
+                last = try self.run(try self.compileForm(info, expanded, options.allocator, decl));
+            }
             if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
         }
         return last;
+    }
+
+    /// The options every compile of `info`'s forms takes.
+    fn compileOptions(self: *Loader, info: *const vm_mod.SourceInfo, decl: ?*compile_mod.DeclaredNames, span: *?reader_mod.SrcSpan, detail: *?[]const u8) compile_mod.CompileOptions {
+        self.load_failed = false;
+        return .{
+            .namespace = self.registry.current,
+            .interner = self.interner,
+            .host_macros = self.host_macros,
+            .out_span = span,
+            .out_detail = detail,
+            .io = self.io,
+            .persistent_allocator = self.persistent_allocator,
+            .registry = self.registry,
+            .load_callback = self.callback(),
+            .declared = decl,
+            .source = info,
+        };
+    }
+
+    /// `compile_mod.expandTopLevel` in the current namespace.
+    fn expandTopLevel(self: *Loader, info: *const vm_mod.SourceInfo, form: *const reader_mod.Form, allocator: std.mem.Allocator, decl: ?*compile_mod.DeclaredNames) EvalError!*const reader_mod.Form {
+        var span: ?reader_mod.SrcSpan = null;
+        var detail: ?[]const u8 = null;
+        return compile_mod.expandTopLevel(allocator, form, self.compileOptions(info, decl, &span, &detail)) catch |err| self.compileFailure(info, err, span, detail);
+    }
+
+    /// `form` compiled in the current namespace into a top-level
+    /// routine on `allocator`.
+    fn compileForm(self: *Loader, info: *const vm_mod.SourceInfo, form: *const reader_mod.Form, allocator: std.mem.Allocator, decl: ?*compile_mod.DeclaredNames) EvalError!*vm_mod.Routine {
+        var span: ?reader_mod.SrcSpan = null;
+        var detail: ?[]const u8 = null;
+        const compiled = compile_mod.compileFormWith(allocator, form, self.compileOptions(info, decl, &span, &detail)) catch |err| return self.compileFailure(info, err, span, detail);
+        // A run that fails leaves its frame for the trace, and the
+        // frame points at the routine.
+        const routine = try allocator.create(vm_mod.Routine);
+        routine.* = compiled.toRoutine("<top>");
+        return routine;
+    }
+
+    /// Run `routine` as a nested call, never a retarget of the top
+    /// frame: the VM may be running the program that required this
+    /// text. A failure's detail and error are this routine's, not an
+    /// earlier one's. Out of memory is a runtime error like any other:
+    /// what the failed allocation was building is unreachable, and the
+    /// report locates the form that asked.
+    fn run(self: *Loader, routine: *const vm_mod.Routine) EvalError!Value {
+        self.vm.error_detail = "";
+        self.vm.traced_error = null;
+        return self.vm.runRoutine(routine) catch |err| switch (err) {
+            error.ControlTransferred => return error.ControlTransferred,
+            else => {
+                // A run that failed before its first instruction (its
+                // frame could not be pushed) has no trace.
+                if (self.vm.traced_error == null) {
+                    self.vm.traced_error = err;
+                    self.vm.error_trace.clearRetainingCapacity();
+                }
+                return error.RunFailed;
+            },
+        };
     }
 
     /// Whether `rest` opens a string literal that no unescaped `"`

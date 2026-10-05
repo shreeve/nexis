@@ -250,6 +250,18 @@ pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
     return try callMacro(ctx, macro, form, items);
 }
 
+/// `form` expanded by `expandOnce` until its head names no macro: a
+/// top-level form as a loader or `eval` takes it (§2b, the loader).
+pub fn expandHead(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+    var f = mutCast(form);
+    var depth: u32 = 0;
+    while (try expandOnce(ctx, f)) |next| : (depth += 1) {
+        if (depth == MAX_EXPANSION_DEPTH) return ctx.failWith(ExpandError.ExpansionDepthExceeded, form.origin, "macro expansion did not finish after {d} expansions in a row", .{MAX_EXPANSION_DEPTH});
+        f = next;
+    }
+    return f;
+}
+
 /// What a list's head names when it is a macro: a user macro Var or
 /// a host macro.
 const Macro = union(enum) {
