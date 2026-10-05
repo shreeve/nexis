@@ -3011,13 +3011,13 @@ fn isIfn(k: Kind) bool {
 /// Throw a db.zig / emdb / codec error to the program as its
 /// keyword (`db.failureName`).
 fn dbFailure(vm: *VM, err: anyerror) VmError {
-    if (err == error.OutOfMemory) return VmError.OutOfMemory;
+    if (err == error.OutOfMemory or err == error.InternTableFull) return VmError.OutOfMemory;
     return vm.throwKeyword(db_mod.failureName(err));
 }
 
 /// The VM's I/O, or the process-wide single-threaded one for a VM
-/// the host gave none (a test harness): opening a store touches the
-/// file system either way.
+/// the host gave none (a test harness): what every native that touches
+/// the file system, the clock or the random source runs on.
 fn ioOf(vm: *VM) std.Io {
     return vm.io orelse std.Io.Threaded.global_single_threaded.io();
 }
@@ -3027,9 +3027,8 @@ fn ioOf(vm: *VM) std.Io {
 /// creates only the file). `d` is `:commit` or `:durable`; without it
 /// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const path = try pathArg(args[0]);
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
-    const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     const host = vm.home();
@@ -3053,7 +3052,7 @@ fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
     if (opts.isNil()) return null;
     if (opts.kind() != .persistent_map) return VmError.KindMismatch;
     const k = vm.ensureInterner().internKeywordValue("durability") catch return VmError.OutOfMemory;
-    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
         .absent => return null,
         .present => |x| x,
     };
@@ -3151,7 +3150,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const conn = try liveConnOf(vm, r);
     var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
-    const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+    const result = db_mod.getRef(&txn, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
     return result orelse default;
 }
 
@@ -3172,10 +3171,7 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const conn = try liveConnOf(vm, r);
     var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
-    const tree = db_mod.refTreeName(r);
-    const key = db_mod.refKeyBytes(r);
-    const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-    return value_mod.fromBool(result != null);
+    return value_mod.fromBool(db_mod.has(&txn, db_mod.refTreeName(r), db_mod.refKeyBytes(r)) catch |err| return dbFailure(vm, err));
 }
 
 // =============================================================================
@@ -3318,7 +3314,7 @@ fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
     const result: ?Value = switch ((try activeTxn(tx_v)).txn) {
-        inline else => |*t| db_mod.getRef(t, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
+        inline else => |*t| db_mod.getRef(t, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err),
     };
     return result orelse default;
 }
@@ -3346,7 +3342,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
             const conn = try liveConnOf(vm, x);
             var txn = try beginRead(vm, conn);
             defer db_mod.abortRead(&txn);
-            const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+            const result = db_mod.getRef(&txn, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
             break :blk result orelse value_mod.nilValue();
         },
         .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
@@ -3569,9 +3565,11 @@ fn forceDelay(vm: *VM, d: Value) VmError!Value {
 // whole tree applying `(f acc key value)` and returns the final
 // accumulator.
 //
-// Keys come back as keyword Values interned from the key bytes
-// (the key model of `db/ref`). Each value is fully decoded onto
-// the heap before the cursor advances. Results are eager.
+// Keys come back as strings of the key bytes: interned keywords would
+// grow the interner, which never shrinks, by every key a walk meets.
+// `db/ref` takes a string key, so a key read back names its ref. Each
+// value is fully decoded onto the heap before the cursor advances.
+// Results are eager.
 
 /// Start `walk` over `tree_name` in the transaction of `h`; false
 /// for an absent tree, which every caller treats as empty.
@@ -3587,8 +3585,8 @@ fn decodeEntry(vm: *VM, kv: db_mod.Walk.Entry) VmError!Value {
         vm.ensureHeap(),
         vm.ensureInterner(),
         kv.value,
-        &dispatch_mod_alias.hashValue,
-        &dispatch_mod_alias.equal,
+        &dispatch_mod.hashValue,
+        &dispatch_mod.equal,
     ) catch |err| return dbFailure(vm, err);
 }
 
@@ -3599,10 +3597,10 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const interner = vm.ensureInterner();
     const tree_name = interner.keywordName(tree_v.asKeywordId());
 
-    // Optional range bounds: a keyword or symbol, whose name is the
-    // key's bytes.
-    const start_bytes: ?[]const u8 = if (args.len >= 3) try boundBytes(vm, args[2]) else null;
-    const end_bytes: ?[]const u8 = if (args.len >= 4) try boundBytes(vm, args[3]) else null;
+    // Optional range bounds: a keyword, symbol or string, whose name
+    // or bytes are the key's, as for `db/ref`.
+    const start_bytes: ?[]const u8 = if (args.len >= 3) try internedName(vm, args[2]) else null;
+    const end_bytes: ?[]const u8 = if (args.len >= 4) try internedName(vm, args[3]) else null;
 
     var walk: db_mod.Walk = undefined;
     if (!try beginWalk(vm, &walk, try activeTxn(tx_v), tree_name)) {
@@ -3613,24 +3611,19 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     var entries: std.ArrayList(Value) = .empty;
     defer entries.deinit(vm.allocator);
 
-    var maybe_kv = walk.first(start_bytes);
-    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
+    var maybe_kv = walk.first(start_bytes) catch |err| return dbFailure(vm, err);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next() catch |err| return dbFailure(vm, err)) {
         if (end_bytes) |eb| {
             if (std.mem.order(u8, kv.key, eb) != .lt) break;
         }
         const decoded_v = try decodeEntry(vm, kv);
-        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const key_v = string_mod.fromBytes(vm.ensureHeap(), kv.key) catch return VmError.OutOfMemory;
         const pair = [_]Value{ key_v, decoded_v };
         const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
         entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
-}
-
-fn boundBytes(vm: *VM, v: Value) VmError![]const u8 {
-    if (v.kind() != .keyword and v.kind() != .symbol) return VmError.KindMismatch;
-    return internedName(vm, v);
 }
 
 /// Predicate for snapshot Values. True if `x` is a
@@ -3662,10 +3655,10 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     h.held += 1;
     defer h.held -= 1;
 
-    var maybe_kv = walk.first(null);
-    while (maybe_kv) |kv| : (maybe_kv = walk.next()) {
+    var maybe_kv = walk.first(null) catch |err| return dbFailure(vm, err);
+    while (maybe_kv) |kv| : (maybe_kv = walk.next() catch |err| return dbFailure(vm, err)) {
         const decoded_v = try decodeEntry(vm, kv);
-        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const key_v = string_mod.fromBytes(vm.ensureHeap(), kv.key) catch return VmError.OutOfMemory;
         const call_args = [_]Value{ acc, key_v, decoded_v };
         acc = try vm.callValue(f, &call_args);
     }
@@ -3691,7 +3684,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
 
     // 1. Read current.
-    const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+    const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
     const current = current_opt orelse value_mod.nilValue();
 
     // 2. Build (f current extra...) arg list. f is the FIRST

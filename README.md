@@ -98,7 +98,7 @@ An error names its position and shows the source:
 
 ```text
 $ echo '(when)' > bad.nx && bin/nexis run bad.nx
-nexis: bad.nx:1:1: MacroExpansionFailure: when: expected a test
+nexis: bad.nx:1:1: compile error: when: expected a test
     (when)
     ^^^^^^
 ```

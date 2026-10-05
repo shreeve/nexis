@@ -6,7 +6,8 @@ usage:
   nexis run FILE [ARG...]  Runs FILE's top-level forms in order;
                            `-` reads the program from stdin.
                            *command-line-args* holds the ARGs.
-  nexis FILE.nx [ARG...]   The same as `run`.
+  nexis FILE [ARG...]      The same as `run`, for a FILE that
+                           ends .nx or names a file.
   nexis -e EXPR [ARG...]   Evaluates EXPR's forms and prints each
                            value that is not nil.
   nexis repl               Interactive read-eval-print loop;

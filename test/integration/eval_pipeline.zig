@@ -3098,10 +3098,13 @@ test "db/scan seeks to the start bound and stops before the end bound" {
         \\  (with-read-tx [t conn]
         \\    [(db/scan t :range :b)
         \\     (db/scan t :range :bb :d)
+        \\     (db/scan t :range "c" 'd)
         \\     (db/scan t :range :e)
         \\     (db/scan t :range :a :a)
-        \\     (db/scan t :none)]))
-    , "[[[:b 2] [:c 3] [:d 4]] [[:c 3]] [] [] []]");
+        \\     (db/scan t :none)
+        \\     (string? (ffirst (db/scan t :range)))
+        \\     (= (db/ref conn :range (ffirst (db/scan t :range))) (db/ref conn :range :a))]))
+    , "[[[b 2] [c 3] [d 4]] [[c 3]] [[c 3]] [] [] [] true true]");
 }
 
 test "storage failures surface as :db/<reason> keywords inside try" {
@@ -3117,6 +3120,15 @@ test "storage failures surface as :db/<reason> keywords inside try" {
         \\   (try (db/open "/nexis-no-such-directory/sub/store.edb")
         \\        (catch any e e))])
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
+}
+
+test "db/open refuses a path with a NUL byte, or an empty one, as spit does" {
+    // The open would stop at the NUL and name a shorter path than the
+    // program checked (DB.md §2).
+    try expectOutputProgramWithStore("seam-path",
+        \\[(try (db/open "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (db/open "") (catch any e e))]
+    , "[:invalid-path :invalid-path]");
 }
 
 test "a value nested 100 000 deep is stored and read back through a durable ref" {
@@ -3257,7 +3269,7 @@ test "db/reduce-tree walks the tree as it was when the walk began, whatever the 
         \\         (db/put! tx (db/ref c :t (str (name k) "x")) v)
         \\         (db/delete! tx (db/ref c :t "k399"))
         \\         (db/alter! tx (db/ref c :t "k100") inc)
-        \\         (when (= k :k100)
+        \\         (when (= k "k100")
         \\           (db/reduce-tree tx :t (fn [a k v] (db/put! tx (db/ref c :t (str (name k) "y")) v) a) nil))
         \\         (+ acc v))
         \\       0)

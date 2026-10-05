@@ -31,7 +31,9 @@ emdb's meta page carries no file id, so `store_id: u128` comes from
 the file's path. `open` resolves the canonical path before emdb opens
 the file: the `realpath` of an existing file, and for a new file the
 `realpath` of its directory joined with its name (a directory that
-does not resolve is `:db/open-failed`). emdb opens the file at that
+does not resolve is `:db/open-failed`). A symlink that names no file
+has that file created first, empty, as emdb would create it through
+the link, so its lock file is named after the file and not the link. emdb opens the file at that
 path, so every spelling of it takes the same lock file. The id is
 computed over the canonical path of the file's `StoreFile` (§3.1), so
 every connection sharing the file shares it. The low
@@ -45,6 +47,10 @@ is stable for an unmoved file and changes when the file is renamed or
 moved; two files with equal contents at different paths are different
 stores. `storeId()` is the accessor; nothing else depends on the
 derivation.
+
+**The path.** A string, not empty, with no NUL byte, else
+`:invalid-path`, as for `slurp` and `spit`: the open would stop at the
+NUL and name a shorter path than the program checked.
 
 **Parent directories.** emdb creates only the file. `(db/open path)`
 creates the missing parent directories first, with the VM's `std.Io`
@@ -68,12 +74,18 @@ while the VM lives. A `db_connection` Value (kind 31) is a pointer to
 it; `db_write_txn` (32) and `db_read_txn` (33) point at a transaction
 handle (§3.2).
 
-**Pinned geometry.** `open` overrides the caller's `pageSize` with
-`db.page_size` (16 KiB) and `maxNamedTrees` with `db.max_named_trees`
-(128). emdb's default page size is the OS page size, and the page
+**Pinned geometry.** `StoreFile.acquire`, which every `open` and
+Nextomic `connect` passes through, overrides the caller's `pageSize`
+with `db.page_size` (16 KiB), `maxNamedTrees` with
+`db.max_named_trees` (128) and `maxReaders` with `db.reader_slots`
+(§3.2). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
+`open` creates a file at `db.initial_map_size` (1 MiB) and has emdb
+extend a full one by `db.map_grow_step` (8 MiB), Nextomic's sizes
+(`docs/NEXTOMIC.md` §2), where emdb's defaults are 256 MiB and 64 MiB:
+a store of one key is a small file.
 
 **Tree handles resolve once per connection.** `treeId(txn, name,
 create)` looks the name up in the connection's cache before asking
@@ -84,17 +96,23 @@ tree in the same transaction are a bit test. A tree registered by an
 aborted transaction stays registered and reads as empty.
 
 **Walks.** `db/scan` and `db/reduce-tree` walk a tree with a `Walk`,
-an emdb cursor that decodes each entry before advancing: a multi-page
-value is assembled in the transaction's buffer, valid until the next
-multi-page read on that transaction. emdb leaves undefined what a
-cursor sees once its own tree is written under it, so a walk over a
-write transaction registers on it, and a `put` or `del` to the walked
-tree first copies the entries the walk has yet to visit, keys and
-values, onto the connection's allocator. The walk then goes on over
-the copy: it sees the tree as it was when it began, as a Clojure
-`reduce` never sees its own updates. A walk nothing writes under copies
-nothing; one whose callback writes its tree pays one copy of the rest
-of the tree, at the first such write.
+an emdb cursor that reads keys only (emdb API-C09): each value comes
+whole into one buffer of the walk, decoded before the walk advances,
+so a walk holds only the largest value it has met, where the
+transaction would keep every multi-page value it assembled until it
+ends (API-KV01). A page or a value that cannot be read ends the walk
+with its error, `:db/corrupted` (or `:out-of-memory`), never as a
+shorter walk: emdb's cursor stops as at the end and records why
+(API-C08), and a read transaction, which nexis aborts, would report it
+nowhere. emdb lets a read cursor in a write transaction step on only
+while nothing changes the transaction (API-C06A), so a walk over a
+write transaction registers on it, and any `put` or `del` through the
+transaction, to whichever tree, first copies the entries the walk has
+yet to visit, keys and values, onto the connection's allocator. The
+walk then goes on over the copy: it sees the tree as it was when it
+began, as a Clojure `reduce` never sees its own updates. A walk
+nothing writes under copies nothing; one whose callback writes pays
+one copy of the rest of the tree, at the first write.
 
 **Closing.** `close` aborts every transaction the language holds on
 the connection (§3.2), syncs the file when a commit left it unsynced
@@ -103,7 +121,8 @@ in place with the open flag false: a ref or connection Value that
 still names it reports the connection closed, and a handle reports its
 transaction closed. A second `close` does nothing. `close` while a
 native holds one of the connection's transactions for a callback, or
-while a Zig-level transaction is open, is refused (`TransactionsOpen`),
+while a Zig-level transaction is open, is refused (`TransactionsOpen`)
+before it ends anything,
 so no emdb transaction outlives its environment and no callback loses
 the transaction its native is using. A sync that fails is reported
 (`:db/sync-failed`) after the connection is closed. `shutdown` ends
@@ -150,7 +169,18 @@ options and allocator, which outlive every connection to the file:
 `db/open` and Nextomic's `connect` both pass the VM's allocator, which
 outlives every connection the VM makes. A file the process may read
 but not write opens read-only, and every write on it is
-`:db/read-only`.
+`:db/read-only`; emdb still opens or creates its lock file, so that
+takes a lock file that exists or a directory the process may write
+(otherwise `:db/open-failed`).
+
+**The lock file.** emdb opens `<path>-lock` for writing through any
+symlink, then sizes and overwrites it. Before the first open of a file
+in the process, `acquire` refuses a lock path that is a symlink or
+anything but a regular file (`:db/open-failed`), so a link planted
+there cannot have the reader table written over the file it names. A
+link planted between that check and emdb's open is still followed: a
+store belongs in a directory that only its owner may write, not in a
+shared one such as `/tmp`.
 
 #### 3.2 Transaction handles
 
@@ -200,8 +230,18 @@ returns is the connection's durability, `db.Durability`:
 
 | Durability | A commit | Lost if the process crashes | Lost if the system crashes |
 |---|---|---|---|
-| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync |
-| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing |
+| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync, where the storage writes in order; where it may reorder writes, possibly the whole store |
+| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing, unless a `:commit` commit to the file followed it with no sync since |
+
+The `:commit` row is emdb's MODE-NOSYNC. A commit that synced nothing
+gives up, until the file's next sync, what every commit before it
+promised about a system crash, wherever writes can reach the disk out
+of order: its meta page can land without its data, and the writers
+after it reuse pages the last synced state still reaches. So a file
+written under both durabilities (two connections, or a Nextomic
+`transact!` with its own `:sync`) is only as safe as its last
+unsynced commit until the next sync. On storage that keeps the order
+of writes only the last unsynced commits are lost.
 
 `(db/open path {:durability d})` sets it for one connection. Without
 it a connection takes the process's: the environment variable
@@ -257,8 +297,10 @@ newest commit, and the next operation's read on any connection to the
 file begins by `takeHeld`, which hands it out while no commit, by this
 process or another, has passed it (its snapshot is still the active
 meta page's), and otherwise ends it. One operation uses it at a time:
-a read nested inside another begins its own, since a multi-page value
-lives in its transaction's buffer. A read on the view of a `with` is a
+a read nested inside another begins its own. A read transaction keeps
+every multi-page value its reads assembled until it ends (emdb
+API-KV01), so the held one accumulates those of every operation it
+serves, until a commit passes it or a collection lets it go. A read on the view of a `with` is a
 child of the held write transaction and is never kept.
 
 A held snapshot pins the pages every later commit frees, so it goes:
@@ -323,6 +365,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `validateTreeName(name) DbError!void` | §6. |
 | `put(*WriteTxn, tree, key, value) !void` | Encodes `value` (CODEC.md) under the opaque `key` bytes; creates the tree. |
 | `get(txn, tree, key, elementHash, elementEq) !?Value` | Either transaction kind; null when the key or the tree is absent. |
+| `has(txn, tree, key) !bool` | Whether the key is present, its value neither read nor decoded (`db/present?`). |
 | `del(*WriteTxn, tree, key) !bool` | Whether the key existed. |
 | `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
 | `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
@@ -394,20 +437,30 @@ None: a ref has no heap children. `conn` points at a non-heap
 | A write on a file opened read-only | `TxnReadOnly` | `:db/read-only` |
 | A second `close` | none | none (nil) |
 | Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
-| Stored bytes that do not decode | any other `CodecError` | `:codec-failed` |
+| Stored bytes that do not decode | any other `CodecError`, `Overflow`, `InvalidListTail`, `EmptyName` | `:codec-failed` |
 
 emdb errors map by `failureName`: `:db/key-too-large` (a key past
 4078 bytes, emdb's bound for the pinned 16 KiB page),
-`:db/value-too-large` (an encoded value past 65 535 overflow pages,
-just under 1 GiB), `:db/max-trees` (a file holds at most 128 named
-trees, Nextomic's twelve among them when it shares the file),
+`:db/value-too-large` (an encoded value past just under 4 GiB, emdb's
+longest overflow chain), `:db/max-trees` (a file holds at most 128
+named trees, Nextomic's twelve among them when it shares the file),
 `:db/not-found`,
-`:db/corrupted` (also a file that is not a store, and a format-version
-mismatch), `:db/map-full`, `:db/mmap-failed`, `:db/open-failed`,
-`:db/page-size-mismatch`, `:db/busy` (a writer already active, the
+`:db/corrupted` (also a file that is not a store, a format-version
+mismatch, and a page that fails its check during a read or a walk),
+`:db/map-full`, `:db/mmap-failed`, `:db/open-failed` (also a lock file
+another emdb version holds), `:db/busy` (a writer already active, the
 environment busy), `:db/readers-full` (every one of the file's 4,096
-reader slots holds a read; §3.2), `:db/txn-aborted`,
-`:db/read-only`, `:db/sync-failed`; anything else is `:db-error`.
+reader slots holds a read; §3.2), `:db/txn-aborted` (a write after a
+caught failure of an earlier one in the same transaction, which only
+abort can end), `:db/read-only`, `:db/sync-failed`, and
+`:db/durability-unknown`: a `:durable` commit whose meta page did not
+sync. That commit is published and every transaction sees it; it is
+durable once a later sync succeeds, and the file counts as unsynced
+(§3.3) until one does. `with-tx` reports it like any failed commit,
+though the commit stands. The emdb errors left are the ones no nexis
+call can meet (options it pins or never sets, operations it never
+calls); they would be `:db-error`, and the inline test "failureName"
+holds the table to `emdb.Error`.
 Nextomic shares these `:db/*` names through the same function.
 
 The natives throw them with `vm.throwKeyword`, so `(catch any e …)`
@@ -477,7 +530,7 @@ and any operation on a closed connection or through a ref of one is
 
 | Form | Arity | Result |
 |---|---|---|
-| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
+| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. An empty path or one with a NUL byte is `:invalid-path` (§2). A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
 | `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3); closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
 | `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3). |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
@@ -485,7 +538,7 @@ and any operation on a closed connection or through a ref of one is
 | `(db/put-key! ref v)` | 2 | nil; one write transaction around one put, committed as the connection's durability says (§3.3), as every commit here is. |
 | `(db/get-key ref)` / `(db/get-key ref default)` | 1–2 | The stored value, or `default` (nil); one read transaction. |
 | `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
-| `(db/present? ref)` | 1 | Whether the key exists. |
+| `(db/present? ref)` | 1 | Whether the key exists; the value is not read, so one whose bytes do not decode is present. |
 | `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (Vars, atoms, delays, reduced too); another kind is `:not-derefable`. |
 | `(db/begin-write conn)` | 1 | A write transaction; while any connection or Nextomic store of the same file holds one, `:db/busy`. |
 | `(db/begin-read conn)` | 1 | A read transaction; with every reader slot of the file taken (§3.2), `:db/readers-full`. |
@@ -495,8 +548,8 @@ and any operation on a closed connection or through a ref of one is
 | `(db/get tx ref)` / `(db/get tx ref default)` | 2–3 | The value through either transaction kind, the transaction's own writes included, or `default`. |
 | `(db/delete! tx ref)` | 2 | Whether the key existed. |
 | `(db/alter! tx ref f & args)` | 3+ | Writes and returns `(apply f current args)`, `current` nil when absent; when `f` throws, nothing is written. |
-| `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, keys as keywords; `start` inclusive, `end` exclusive, each a keyword or symbol. An absent tree is `[]`. |
-| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order, as it was when the walk began whatever `f` writes to it (§3); `init` for an absent tree. |
+| `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, each key a string of its bytes, which `db/ref` takes back; `start` inclusive, `end` exclusive, each a keyword, symbol or string as a ref's key is. An absent tree is `[]`. Keys are not keywords: interning every key a walk meets would grow the interner, which never shrinks, without bound. |
+| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order, `key` a string as `db/scan`'s, as it was when the walk began whatever `f` writes to it (§3); `init` for an absent tree. |
 | `(db/snapshot conn)` / `(db/release-snapshot! snap)` | 1 | `db/begin-read` and `db/abort-read!` under the snapshot names. |
 | `(db/snapshot? x)` | 1 | Whether `x` is a read transaction not yet released. |
 | `(with-tx [tx conn] body…)` | macro | Begins a write, commits after body and returns its value; when body throws, aborts and rethrows. |

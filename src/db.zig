@@ -9,8 +9,8 @@
 //! Responsibilities:
 //!   - `StoreFile`: the one `emdb.Env` of a store file in this
 //!     process, shared by every connection and Nextomic store of it.
-//!   - `Connection` type over a `StoreFile` with
-//!     `store_id = xxHash3-128(realpath(file))`.
+//!   - `Connection` type over a `StoreFile` with a `store_id` hashed
+//!     from the file's canonical path (DB.md §2).
 //!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
 //!     self-contained identity triple (store_id, tree_name,
 //!     key_bytes) and an advisory non-identity `conn: ?*Connection`
@@ -80,10 +80,11 @@ pub const DbError = error{
 };
 
 /// The keyword a storage-layer error surfaces as at the language
-/// level (DB.md §8). Each emdb error set with a distinct cause gets
-/// its own name; the rest share `:db-error`. A value of a kind with
-/// no serialized form is `:unserializable`; bytes that do not decode
-/// are `:codec-failed`.
+/// level (DB.md §8). Each emdb error with a distinct cause gets its
+/// own name; the rest, which nexis never reaches, share `:db-error`
+/// (the inline test "failureName" holds the table to `emdb.Error`). A
+/// value of a kind with no serialized form is `:unserializable`; bytes
+/// that do not decode are `:codec-failed`.
 pub fn failureName(err: anyerror) []const u8 {
     return switch (err) {
         error.KeyTooLarge => "db/key-too-large",
@@ -93,14 +94,14 @@ pub fn failureName(err: anyerror) []const u8 {
         error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
         error.DatabaseFull => "db/map-full",
         error.MmapFailed => "db/mmap-failed",
-        error.OpenFailed => "db/open-failed",
-        error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
+        error.OpenFailed, error.LockFileMismatch => "db/open-failed",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",
         error.ReaderTableFull => "db/readers-full",
         error.HardLinked => "db/hard-linked",
-        error.TxnAborted => "db/txn-aborted",
+        error.TxnBroken => "db/txn-aborted",
         error.TxnReadOnly => "db/read-only",
         error.SyncFailed => "db/sync-failed",
+        error.DurabilityUnknown => "db/durability-unknown",
         error.StoreMismatch => "db/store-mismatch",
         error.ConnectionUnavailable => "db/no-connection",
         error.InvalidTreeName, error.InvalidKey => "db/invalid-key",
@@ -112,6 +113,9 @@ pub fn failureName(err: anyerror) []const u8 {
         error.InvalidLeb128,
         error.InvalidCharScalar,
         error.MalformedPayload,
+        error.Overflow,
+        error.InvalidListTail,
+        error.EmptyName,
         => "codec-failed",
         else => "db-error",
     };
@@ -165,10 +169,13 @@ pub const StoreFile = struct {
     var open_files: ?*StoreFile = null;
 
     /// The open file at `path`, or the file opened (or created) now
-    /// with `options` and `reader_slots` reader slots. A file this
+    /// with `options` and the pinned geometry: `page_size`,
+    /// `max_named_trees` and `reader_slots`, whatever `options` says. A file this
     /// process may read but not write opens read-only.
     pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
         var options = env_options;
+        options.pageSize = page_size;
+        options.maxNamedTrees = max_named_trees;
         options.maxReaders = reader_slots;
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
@@ -184,6 +191,7 @@ pub const StoreFile = struct {
                 }
             }
         }
+        try checkLockFile(allocator, canonical);
         const self = try allocator.create(StoreFile);
         errdefer allocator.destroy(self);
         self.env = emdb.Env.open(canonical.ptr, options) catch |err| switch (err) {
@@ -245,7 +253,12 @@ pub const StoreFile = struct {
     /// and meta makes every commit before it durable too; any other
     /// leaves the file unsynced until `sync`.
     pub fn commit(self: *StoreFile, txn: *emdb.Txn) !void {
-        try txn.commit();
+        txn.commit() catch |err| {
+            // Published and seen by every transaction, but its meta
+            // page did not sync: durable only once a later sync is.
+            if (err == error.DurabilityUnknown) self.unsynced = true;
+            return err;
+        };
         self.unsynced = switch (self.write_sync) {
             // nexis never opens an environment with emdb's `noSync`
             // or `noMetaSync`, so its own setting is a full sync.
@@ -324,7 +337,7 @@ pub const StoreFile = struct {
     /// Whether `txn` reads the file's newest commit, by this process
     /// or any other.
     fn latest(self: *StoreFile, txn: *emdb.Txn) bool {
-        return txn.txnId == self.env.inner.activeMeta().loadTxnId();
+        return txn.txnId == self.env.lastTxnId();
     }
 
     /// A regular file this process may read but not write: the one
@@ -341,6 +354,24 @@ pub const StoreFile = struct {
     }
 };
 
+/// emdb opens `<path>-lock` for writing, creating it, through any
+/// symlink, and sizes and overwrites it: a symlink planted there, or a
+/// device or pipe, would have the reader table written over whatever
+/// it names. Refused as `OpenFailed`. A link planted after this check
+/// is still followed, so a store belongs in a directory only its owner
+/// writes (DB.md §3.1).
+fn checkLockFile(allocator: std.mem.Allocator, canonical: [:0]const u8) !void {
+    const lock = try std.fmt.allocPrintSentinel(allocator, "{s}-lock", .{canonical}, 0);
+    defer allocator.free(lock);
+    if (isSymlink(lock)) return error.OpenFailed;
+    if (FileId.of(std.c.AT.FDCWD, lock.ptr)) |id| if (!id.regular) return error.OpenFailed;
+}
+
+fn isSymlink(path: [*:0]const u8) bool {
+    var buf: [1]u8 = undefined;
+    return std.c.readlink(path, &buf, buf.len) >= 0;
+}
+
 /// The device and inode that name a file whatever path reaches it.
 const FileId = struct {
     dev: u64,
@@ -348,6 +379,7 @@ const FileId = struct {
     /// A regular file with a second name (`StoreFile`). A directory's
     /// links are its entries; emdb refuses it as a store.
     hard_linked: bool,
+    regular: bool,
 
     /// The file at `path` relative to the directory `fd`, or the file
     /// open as `fd` when `path` is empty; null when it cannot be
@@ -364,6 +396,7 @@ const FileId = struct {
                 .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
                 .ino = sx.ino,
                 .hard_linked = linux.S.ISREG(sx.mode) and sx.nlink > 1,
+                .regular = linux.S.ISREG(sx.mode),
             };
         }
         var st: std.c.Stat = undefined;
@@ -373,15 +406,26 @@ const FileId = struct {
             .dev = @bitCast(@as(i64, st.dev)),
             .ino = st.ino,
             .hard_linked = std.c.S.ISREG(st.mode) and st.nlink > 1,
+            .regular = std.c.S.ISREG(st.mode),
         };
     }
 };
 
 /// The absolute path of `path` with every symlink resolved; for a file
-/// not yet created, its resolved directory joined with its name.
+/// not yet created, its resolved directory joined with its name. A
+/// symlink to no file has the file it names created first: emdb would
+/// create it through the link, and name the lock file after the link,
+/// where every later opener of the target names it after the target.
 fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.c.realpath(path, &buf)) |resolved| return allocator.dupeSentinel(u8, std.mem.sliceTo(resolved, 0), 0);
+    if (isSymlink(path)) {
+        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(c_uint, 0o644));
+        if (fd < 0) return error.OpenFailed;
+        _ = std.c.close(fd);
+        const resolved = std.c.realpath(path, &buf) orelse return error.OpenFailed;
+        return allocator.dupeSentinel(u8, std.mem.sliceTo(resolved, 0), 0);
+    }
     const slice = std.mem.sliceTo(path, 0);
     const dir_z = try allocator.dupeSentinel(u8, std.Io.Dir.path.dirname(slice) orelse ".", 0);
     defer allocator.free(dir_z);
@@ -414,9 +458,10 @@ pub const Connection = struct {
     store_id_lo: u64,
     store_id_hi: u64,
 
-    /// Is the env open? Set true by `open()`, false by
-    /// `close()`. Used to defend against double-close + to signal
-    /// `ConnectionUnavailable` for subsequent ops.
+    /// Whether this connection holds its file: true from `open` to
+    /// `close` (the file's environment may stay open for others). A
+    /// second close does nothing; any other use is
+    /// `ConnectionUnavailable`.
     open_flag: bool,
 
     /// Transactions begun and not yet committed or aborted. `close`
@@ -454,6 +499,13 @@ pub const page_size: u32 = 16384;
 /// Named-tree capacity every nexis store is opened with. Bounds
 /// the `TreeId` range, which sizes the per-transaction tree set.
 pub const max_named_trees: u32 = 128;
+
+/// The size a new `db/*` store file starts at, and the step emdb
+/// extends a full one by, as Nextomic's (NEXTOMIC.md §2): emdb reserves
+/// the address space up front, so an extension moves nothing, and a
+/// small store stays small.
+pub const initial_map_size: u64 = 1 << 20;
+pub const map_grow_step: u64 = 8 << 20;
 
 /// Reader slots in a store's lock file, 64 bytes each: how many read
 /// transactions every process sharing the file can hold at once. A
@@ -495,9 +547,10 @@ pub const Durability = enum {
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open` with `pageSize` and `maxNamedTrees` pinned to
-/// `page_size` / `max_named_trees`; a file already open in this
-/// process is shared as it is (`StoreFile`).
+/// `emdb.Env.open` with the size a new file starts at and grows by set
+/// to `initial_map_size` / `map_grow_step`, and the geometry
+/// `StoreFile.acquire` pins; a file already open in this process is
+/// shared as it is (`StoreFile`).
 pub fn open(
     allocator: std.mem.Allocator,
     heap: *Heap,
@@ -506,8 +559,8 @@ pub fn open(
     options: emdb.EnvOptions,
 ) !Connection {
     var env_options = options;
-    env_options.pageSize = page_size;
-    env_options.maxNamedTrees = max_named_trees;
+    env_options.mapSize = initial_map_size;
+    env_options.growStep = map_grow_step;
     const file = try StoreFile.acquire(path, env_options);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
@@ -542,15 +595,19 @@ pub fn open(
 /// closed.
 pub fn close(self: *Connection) (DbError || emdb.Error)!void {
     if (!self.open_flag) return;
+    // Refused before anything ends: a refusal changes nothing.
+    var language: u32 = 0;
     var it = Handle.all;
     while (it) |h| : (it = h.next) {
-        if (h.conn() == self and h.held != 0) return DbError.TransactionsOpen;
+        if (h.conn() != self) continue;
+        if (h.held != 0) return DbError.TransactionsOpen;
+        language += @intFromBool(h.active);
     }
+    if (self.open_txns != language) return DbError.TransactionsOpen;
     it = Handle.all;
     while (it) |h| : (it = h.next) {
         if (h.conn() == self) h.end();
     }
-    if (self.open_txns != 0) return DbError.TransactionsOpen;
     const synced = self.file.sync();
     release(self);
     return synced;
@@ -600,8 +657,8 @@ pub const WriteTxn = struct {
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
     opened: TreeSet = .empty,
-    /// Walks in progress over this transaction's trees; a write to a
-    /// walked tree copies what the walk has yet to visit first.
+    /// Walks in progress over this transaction's trees; a write
+    /// through the transaction copies what each has yet to visit first.
     walks: ?*Walk = null,
 };
 
@@ -765,22 +822,29 @@ pub fn handleCount() usize {
 // =============================================================================
 
 /// A walk over one named tree of a transaction in key order: `db/scan`
-/// and `db/reduce-tree`. emdb leaves undefined what a cursor sees once
-/// its own tree is written under it, so a write through the
-/// transaction to a tree being walked first copies the entries the
-/// walk has yet to visit (`WriteTxn.walks`): the walk sees the tree as
-/// it was when it began, whatever its callback writes, and a walk no
-/// callback writes under copies nothing. A walk lives on its caller's
-/// stack between `begin` and `end`.
+/// and `db/reduce-tree`. emdb lets a read cursor in a write transaction
+/// step on only while nothing changes the transaction (API-C06A), so
+/// any write through the transaction first copies the entries every
+/// walk on it has yet to visit (`WriteTxn.walks`): the walk sees the
+/// tree as it was when it began, whatever its callback writes, and a
+/// walk no callback writes under copies nothing. The cursor reads keys
+/// only, and each value is copied into one buffer of the walk, so a
+/// walk holds only the largest value and never the transaction's copy
+/// of every one (emdb API-C09). A page or a value that cannot be read
+/// ends the walk with its error, never as a shorter walk (API-C08). A
+/// walk lives on its caller's stack between `begin` and `end`.
 pub const Walk = struct {
     cursor: emdb.Cursor,
-    tree: emdb.TreeId,
     allocator: std.mem.Allocator,
+    /// The value of the entry last returned.
+    value: std.ArrayList(u8) = .empty,
     /// The write transaction the walk is registered on.
     owner: ?*WriteTxn,
     next_walk: ?*Walk = null,
-    /// The entries still to visit once the tree was written: key and
-    /// value bytes back to back, and where each key and value ends.
+    /// `first` has positioned the cursor.
+    started: bool = false,
+    /// The entries still to visit once the transaction was written: key
+    /// and value bytes back to back, and where each key and value ends.
     rest: ?struct {
         bytes: std.ArrayList(u8) = .empty,
         ends: std.ArrayList([2]usize) = .empty,
@@ -791,16 +855,16 @@ pub const Walk = struct {
 
     /// Start a walk over `tree_name` in `txn` (a `*WriteTxn` or
     /// `*ReadTxn`); false when the tree does not exist, and then no
-    /// `end` is due.
+    /// `end` is due. `first` positions it.
     pub fn begin(self: *Walk, txn: anytype, tree_name: []const u8) !bool {
         try validateTreeName(tree_name);
         const id = (try treeId(txn, tree_name, false)) orelse return false;
         self.* = .{
             .cursor = try txn.inner.openCursorForTree(id),
-            .tree = id,
             .allocator = txn.conn.allocator,
             .owner = null,
         };
+        self.cursor.keysOnly = true;
         if (@TypeOf(txn) == *WriteTxn) {
             self.owner = txn;
             self.next_walk = txn.walks;
@@ -819,19 +883,25 @@ pub const Walk = struct {
                 }
             }
         }
+        self.value.deinit(self.allocator);
         if (self.rest) |*r| {
             r.bytes.deinit(self.allocator);
             r.ends.deinit(self.allocator);
         }
     }
 
-    /// The first entry, or the first at or after `start`.
-    pub fn first(self: *Walk, start: ?[]const u8) ?Entry {
-        return if (start) |s| self.cursor.setRange(s) else self.cursor.first();
+    /// The first entry, or the first at or after `start`; null when
+    /// there is none. Called once, before `next` and before any write
+    /// through the transaction.
+    pub fn first(self: *Walk, start: ?[]const u8) !?Entry {
+        self.started = true;
+        const kv = (if (start) |s| self.cursor.setRange(s) else self.cursor.first()) orelse return self.stopped();
+        return try self.entry(kv);
     }
 
-    pub fn next(self: *Walk) ?Entry {
-        const r = if (self.rest) |*r| r else return self.cursor.next();
+    /// The next entry; null at the end.
+    pub fn next(self: *Walk) !?Entry {
+        const r = if (self.rest) |*r| r else return self.step();
         if (r.at == r.ends.items.len) return null;
         const from = if (r.at == 0) 0 else r.ends.items[r.at - 1][1];
         const e = r.ends.items[r.at];
@@ -839,28 +909,53 @@ pub const Walk = struct {
         return .{ .key = r.bytes.items[from..e[0]], .value = r.bytes.items[e[0]..e[1]] };
     }
 
-    /// Copy what the cursor has yet to visit, before the tree changes
-    /// under it. Each value is copied before the cursor moves: a
-    /// multi-page value lives in the transaction's buffer until the
-    /// next multi-page read.
+    fn step(self: *Walk) !?Entry {
+        const kv = self.cursor.next() orelse return self.stopped();
+        return try self.entry(kv);
+    }
+
+    /// Null at the real end; the cursor's error when a page or a value
+    /// stopped it short.
+    fn stopped(self: *Walk) !?Entry {
+        if (self.cursor.failure) |err| return err;
+        return null;
+    }
+
+    /// `kv` with its whole value. A key-only cursor leaves a value on
+    /// overflow pages empty; no stored value is empty, as the codec
+    /// writes at least its version byte, and one read again is the same.
+    fn entry(self: *Walk, kv: Entry) !Entry {
+        if (kv.value.len > 0) return kv;
+        const v = (try self.cursor.readValueInto(self.allocator, &self.value)) orelse return error.InvalidPage;
+        return .{ .key = kv.key, .value = v };
+    }
+
+    /// Copy what the cursor has yet to visit, before the transaction
+    /// changes under it.
     fn copyRest(self: *Walk) !void {
-        self.rest = .{};
-        const r = &self.rest.?;
-        while (self.cursor.next()) |kv| {
+        // Unpositioned, the cursor would read as at its end.
+        std.debug.assert(self.started);
+        var r: @typeInfo(@FieldType(Walk, "rest")).optional.child = .{};
+        errdefer {
+            r.bytes.deinit(self.allocator);
+            r.ends.deinit(self.allocator);
+        }
+        while (try self.step()) |kv| {
             try r.bytes.appendSlice(self.allocator, kv.key);
             const key_end = r.bytes.items.len;
             try r.bytes.appendSlice(self.allocator, kv.value);
             try r.ends.append(self.allocator, .{ key_end, r.bytes.items.len });
         }
+        self.rest = r;
     }
 };
 
-/// Before `txn` writes tree `id`: every walk over it copies what it
-/// has yet to visit.
-fn beforeWrite(txn: *WriteTxn, id: emdb.TreeId) !void {
+/// Before `txn` writes: every walk on it copies what it has yet to
+/// visit.
+fn beforeWrite(txn: *WriteTxn) !void {
     var it = txn.walks;
     while (it) |w| : (it = w.next_walk) {
-        if (w.tree == id and w.rest == null) try w.copyRest();
+        if (w.rest == null) try w.copyRest();
     }
 }
 
@@ -920,12 +1015,11 @@ pub fn put(
     v: Value,
 ) !void {
     try validateTreeNameAndKey(tree_name, key_bytes);
-    const tree_id = (try treeId(txn, tree_name, true)).?;
-    // Encode the value via codec, pass the bytes to emdb, free the
-    // codec buffer.
     const encoded = try codec_mod.encode(txn.conn.allocator, txn.conn.interner, v);
     defer txn.conn.allocator.free(encoded);
-    try beforeWrite(txn, tree_id);
+    // Creating the tree changes the transaction too.
+    try beforeWrite(txn);
+    const tree_id = (try treeId(txn, tree_name, true)).?;
     try txn.inner.putInTree(tree_id, key_bytes, encoded);
 }
 
@@ -977,6 +1071,18 @@ pub fn get(
     return null;
 }
 
+/// Whether `key_bytes` is in `tree_name`, through either transaction
+/// kind; the value is neither read nor decoded.
+pub fn has(txn: anytype, tree_name: []const u8, key_bytes: []const u8) !bool {
+    try validateTreeNameAndKey(tree_name, key_bytes);
+    const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
+    var cursor = try txn.inner.openCursorForTree(tree_id);
+    cursor.keysOnly = true;
+    if (cursor.set(key_bytes) != null) return true;
+    if (cursor.failure) |err| return err;
+    return false;
+}
+
 pub fn del(
     txn: *WriteTxn,
     tree_name: []const u8,
@@ -984,7 +1090,7 @@ pub fn del(
 ) !bool {
     try validateTreeNameAndKey(tree_name, key_bytes);
     const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
-    try beforeWrite(txn, tree_id);
+    try beforeWrite(txn);
     return try txn.inner.delFromTree(tree_id, key_bytes);
 }
 
@@ -1006,33 +1112,20 @@ const DurableRefBody = extern struct {
     }
 };
 
-/// Construct a durable-ref heap Value from an active Connection.
-/// The ref's identity triple (`store_id`, `tree_name`, `key_bytes`)
-/// is fixed at construction; the advisory `conn` pointer is set to
-/// the supplied Connection.
+/// A durable ref on `conn`: the identity triple from `conn`'s store,
+/// and `conn` as its advisory connection.
 pub fn ref(
     heap: *Heap,
     conn: *Connection,
     tree_name: []const u8,
     key_bytes: []const u8,
 ) !Value {
-    try validateTreeNameAndKey(tree_name, key_bytes);
-    const body_size = @sizeOf(DurableRefBody) + tree_name.len + key_bytes.len;
-    const h = try heap.alloc(.durable_ref, body_size);
-    const body = bodyOf(h);
-    body.conn = conn;
-    body.store_id_lo = conn.store_id_lo;
-    body.store_id_hi = conn.store_id_hi;
-    body.tree_name_len = @intCast(tree_name.len);
-    body.key_bytes_len = @intCast(key_bytes.len);
-    const inline_bytes = inlineBytesOf(h);
-    @memcpy(inline_bytes[0..tree_name.len], tree_name);
-    @memcpy(inline_bytes[tree_name.len..][0..key_bytes.len], key_bytes);
-    return heap_mod.Heap.valueFromHeader(.durable_ref, h);
+    const r = try refFromBytes(heap, conn.storeId(), tree_name, key_bytes);
+    bodyOf(refHeader(r)).conn = conn;
+    return r;
 }
 
-/// Construct a durable-ref from bytes (no live Connection
-/// context). The `conn` pointer is null, so I/O through this ref is
+/// A durable ref with no connection: I/O through it is
 /// `error.ConnectionUnavailable` (DB.md §4).
 pub fn refFromBytes(
     heap: *Heap,
@@ -1061,10 +1154,6 @@ fn bodyOf(h: *HeapHeader) *DurableRefBody {
     return @ptrCast(@alignCast(body.ptr));
 }
 
-fn bodyOfConst(h: *HeapHeader) *const DurableRefBody {
-    return bodyOf(h);
-}
-
 fn inlineBytesOf(h: *HeapHeader) []u8 {
     const body = heap_mod.Heap.bodyBytes(h);
     std.debug.assert(body.len >= @sizeOf(DurableRefBody));
@@ -1079,26 +1168,26 @@ fn refHeader(v: Value) *HeapHeader {
 // --- Identity accessors (for codec + eq/hash + ref-based ops) ---
 
 pub fn refStoreId(r: Value) u128 {
-    const body = bodyOfConst(refHeader(r));
+    const body = bodyOf(refHeader(r));
     return (@as(u128, body.store_id_hi) << 64) | @as(u128, body.store_id_lo);
 }
 
 pub fn refTreeName(r: Value) []const u8 {
     const h = refHeader(r);
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     return inline_bytes[0..body.tree_name_len];
 }
 
 pub fn refKeyBytes(r: Value) []const u8 {
     const h = refHeader(r);
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     return inline_bytes[body.tree_name_len..][0..body.key_bytes_len];
 }
 
 pub fn refConn(r: Value) ?*Connection {
-    const body = bodyOfConst(refHeader(r));
+    const body = bodyOf(refHeader(r));
     return body.conn;
 }
 
@@ -1146,7 +1235,7 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 /// domain applied by `dispatch.hashValue` on the way out.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     var hasher = std.hash.XxHash3.init(hash_mod.seed);
     // store_id_lo + store_id_hi as LE bytes.
@@ -1166,8 +1255,8 @@ pub fn hashHeader(h: *HeapHeader) u32 {
 /// tree_name, key_bytes). `conn` NOT consulted.
 pub fn refsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     if (a == b) return true;
-    const ab = bodyOfConst(a);
-    const bb = bodyOfConst(b);
+    const ab = bodyOf(a);
+    const bb = bodyOf(b);
     if (ab.store_id_lo != bb.store_id_lo) return false;
     if (ab.store_id_hi != bb.store_id_hi) return false;
     if (ab.tree_name_len != bb.tree_name_len) return false;
@@ -1219,6 +1308,35 @@ fn synthEq(a: Value, b: Value) bool {
         .char => a.asChar() == b.asChar(),
         else => false,
     };
+}
+
+test "failureName: every emdb error nexis can meet has its keyword; every decode error is :codec-failed" {
+    // The engine's errors no nexis call can return: options nexis pins
+    // or never sets, operations it never calls (prepare, child
+    // transactions, backup, restore, dump, rollback), and misuse its
+    // callers rule out.
+    const unreached = [_][]const u8{
+        "InvalidPageSize",   "MapSizeTooLarge",    "PageSizeMismatch", "TxnPrepared",
+        "TxnNotPreparable",  "TxnHasChild",        "Incompatible",     "InvalidCursor",
+        "BackupFormat",      "BackupBaseMismatch", "DumpFormat",       "NoPreviousSnapshot",
+        "TooManyNamedTrees",
+    };
+    inline for (@typeInfo(emdb.Error).error_set.error_names.?) |name| {
+        const named = !std.mem.eql(u8, failureName(@field(emdb.Error, name)), "db-error");
+        const listed = for (unreached) |u| {
+            if (std.mem.eql(u8, u, name)) break true;
+        } else false;
+        if (named == listed) {
+            std.debug.print("emdb error {s}: keyword {s}\n", .{ name, failureName(@field(emdb.Error, name)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    inline for (@typeInfo(codec_mod.DecodeError).error_set.error_names.?) |name| {
+        const expected = if (std.mem.eql(u8, name, "OutOfMemory") or std.mem.eql(u8, name, "InternTableFull"))
+            "db-error"
+        else if (std.mem.eql(u8, name, "UnserializableKind")) "unserializable" else "codec-failed";
+        try testing.expectEqualStrings(expected, failureName(@field(codec_mod.DecodeError, name)));
+    }
 }
 
 test "DurableRefBody layout: 32 bytes header" {
@@ -1379,6 +1497,57 @@ test "open: a store file with a second hard link is refused under either name" {
     defer shutdown(&b);
 }
 
+test "open: a symlink to no file creates the file it names, and the lock file is named after that file" {
+    const path = try tmpDbPath(testing.allocator, "target");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const link = try testing.allocator.printSentinel("{s}/dangling.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
+    defer testing.allocator.free(link);
+    try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(path), link, .{});
+
+    var a = try open(testing.allocator, &heap, &interner, link.ptr, .{ .allocator = testing.allocator });
+    const sid = a.storeId();
+    var w = try beginWrite(&a);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    try close(&a);
+    const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
+    defer testing.allocator.free(link_lock);
+    try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
+    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
+    try testing.expectEqual(sid, b.storeId());
+}
+
+test "open: a symlink or a non-regular file where the lock file goes is refused, and what it names is left alone" {
+    const path = try tmpDbPath(testing.allocator, "planted");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const dir = std.Io.Dir.path.dirname(path).?;
+    const victim = try testing.allocator.printSentinel("{s}/victim.txt", .{dir}, 0);
+    defer testing.allocator.free(victim);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = victim, .data = "precious\n" });
+    const lock = try testing.allocator.printSentinel("{s}-lock", .{path}, 0);
+    defer testing.allocator.free(lock);
+    try std.Io.Dir.cwd().symLink(testing.io, "victim.txt", lock, .{});
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    const kept = try std.Io.Dir.cwd().readFileAlloc(testing.io, victim, testing.allocator, .unlimited);
+    defer testing.allocator.free(kept);
+    try testing.expectEqualStrings("precious\n", kept);
+
+    try testing.expectEqual(@as(c_int, 0), std.c.unlink(lock.ptr));
+    try std.Io.Dir.cwd().createDir(testing.io, lock, .default_dir);
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+}
+
 test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {
     const path = try tmpDbPath(testing.allocator, "readonly");
     defer testing.allocator.free(path);
@@ -1402,6 +1571,51 @@ test "open: a file this process may only read opens read-only; a write is TxnRea
     defer abortRead(&r);
     try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
     try testing.expectError(error.TxnReadOnly, beginWrite(&conn));
+}
+
+test "close: a refusal ends none of the language's transactions" {
+    const path = try tmpDbPath(testing.allocator, "close_refused");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    const h = try Handle.create(.{ .read = try beginRead(&conn) });
+    var zig_level = try beginRead(&conn);
+    try testing.expectError(DbError.TransactionsOpen, close(&conn));
+    try testing.expect(h.active);
+    abortRead(&zig_level);
+    try close(&conn);
+    try testing.expect(!h.active);
+}
+
+test "has: whether a key is present, its value never read" {
+    const path = try tmpDbPath(testing.allocator, "has");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    {
+        // Bytes no decoder takes.
+        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
+        try txn.putInTree(try txn.openTree("t", true), "k", "\xff\xff");
+        try txn.commit();
+    }
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    try testing.expect(try has(&r, "t", "k"));
+    try testing.expect(!try has(&r, "t", "j"));
+    try testing.expect(!try has(&r, "none", "k"));
+    if (get(&r, "t", "k", synthHash, synthEq)) |_| return error.TestUnexpectedResult else |_| {}
 }
 
 test "close: refused while a transaction is open; the connection stays a closed struct" {
@@ -1508,6 +1722,59 @@ test "durability durable: every commit syncs, which leaves nothing for close; a 
     abortRead(&r);
     try close(&reader);
     try testing.expectEqual(after_commit, engineSyncs());
+}
+
+/// Fails the meta sync of the next commit on the data file `fd`: once
+/// the commit is published, `fd` names a pipe, which no sync takes,
+/// until `restore`.
+const MetaSyncFailure = struct {
+    fd: std.c.fd_t,
+    saved: std.c.fd_t = -1,
+    pipe: [2]std.c.fd_t = undefined,
+
+    fn notify(ctx: *anyopaque, step: emdb.txn.CommitStep) void {
+        const self: *MetaSyncFailure = @ptrCast(@alignCast(ctx));
+        if (step != .metaWritten) return;
+        self.saved = std.c.dup(self.fd);
+        _ = std.c.dup2(self.pipe[0], self.fd);
+    }
+
+    fn restore(self: *MetaSyncFailure) void {
+        _ = std.c.dup2(self.saved, self.fd);
+        for ([_]std.c.fd_t{ self.saved, self.pipe[0], self.pipe[1] }) |fd| _ = std.c.close(fd);
+    }
+};
+
+test "durability durable: a commit whose meta sync fails stands, is DurabilityUnknown and leaves the file unsynced" {
+    const path = try tmpDbPath(testing.allocator, "meta_sync");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    conn.durability = .durable;
+    var failure = MetaSyncFailure{ .fd = conn.file.env.inner.dataFile.fd };
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
+    conn.file.env.inner.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
+    var w = try beginWrite(&conn);
+    try put(&w, "t", "k", value.fromFixnum(5).?);
+    const committed = commit(&w);
+    conn.file.env.inner.commitObserver = null;
+    failure.restore();
+    try testing.expectError(error.DurabilityUnknown, committed);
+    try testing.expectEqualStrings("db/durability-unknown", failureName(error.DurabilityUnknown));
+    try testing.expect(conn.file.unsynced);
+    {
+        var r = try beginRead(&conn);
+        defer abortRead(&r);
+        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+    }
+    try sync(&conn);
+    try testing.expect(!conn.file.unsynced);
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
@@ -1659,6 +1926,8 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     try testing.expectEqual(page_size, conn.file.env.options.pageSize);
     try testing.expectEqual(max_named_trees, conn.file.env.options.maxNamedTrees);
     try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.file.env.maxKeySize());
+    try testing.expectEqual(map_grow_step, conn.file.env.options.growStep);
+    try testing.expect(conn.file.env.info().mapSize <= initial_map_size);
 }
 
 test "open: the reader table has reader_slots slots, so more than emdb's default 126 reads run at once" {
@@ -1876,6 +2145,102 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
         defer abortWrite(&wtxn);
         try testing.expect(!(try del(&wtxn, "scratch", "k")));
     }
+}
+
+/// A store at `path` whose tree `t` holds `a`, a value of `big` bytes
+/// of `x` on overflow pages under `b`, and `c`; with `damage`, one byte
+/// in the middle of `b`'s value is changed on the disk, so its page
+/// fails its check.
+fn walkStore(path: [:0]const u8, big: usize, damage: bool) !void {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    {
+        var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+        defer shutdown(&conn);
+        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
+        errdefer txn.abort();
+        const t = try txn.openTree("t", true);
+        const bytes = try testing.allocator.alloc(u8, big);
+        defer testing.allocator.free(bytes);
+        @memset(bytes, 'x');
+        try txn.putInTree(t, "a", "1");
+        try txn.putInTree(t, "b", bytes);
+        try txn.putInTree(t, "c", "3");
+        try txn.commit();
+    }
+    if (!damage) return;
+    const io = testing.io;
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, testing.allocator, .unlimited);
+    defer testing.allocator.free(data);
+    const run: [64]u8 = @splat('x');
+    const at = std.mem.find(u8, data, &run).? + big / 2;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.writePositionalAll(io, "y", at);
+}
+
+test "Walk: a page that fails its check ends the walk with its error, never as a shorter walk" {
+    const path = try tmpDbPath(testing.allocator, "walk_damaged");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    try walkStore(path, 1 << 20, true);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    var walk: Walk = undefined;
+    try testing.expect(try walk.begin(&r, "t"));
+    defer walk.end();
+    try testing.expectEqualStrings("a", (try walk.first(null)).?.key);
+    try testing.expectError(error.InvalidPage, walk.next());
+
+    // A write under a walk copies the rest of it, and meets the same page.
+    var w = try beginWrite(&conn);
+    defer abortWrite(&w);
+    var over: Walk = undefined;
+    try testing.expect(try over.begin(&w, "t"));
+    defer over.end();
+    _ = (try over.first(null)).?;
+    try testing.expectError(error.InvalidPage, put(&w, "u", "k", value.fromFixnum(1).?));
+}
+
+test "Walk: a write to any tree of the transaction copies the rest first; values come whole from overflow pages" {
+    const path = try tmpDbPath(testing.allocator, "walk_copy");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    try walkStore(path, 3 * page_size, false);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+
+    var w = try beginWrite(&conn);
+    defer abortWrite(&w);
+    var walk: Walk = undefined;
+    try testing.expect(try walk.begin(&w, "t"));
+    defer walk.end();
+    try testing.expectEqualStrings("1", (try walk.first(null)).?.value);
+    try testing.expect(walk.rest == null);
+    // Another tree: the cursor may not step past a change anywhere in
+    // the transaction (emdb API-C06A).
+    try put(&w, "u", "k", value.fromFixnum(1).?);
+    try testing.expect(walk.rest != null);
+    try testing.expect(try del(&w, "t", "c"));
+    const b = (try walk.next()).?;
+    try testing.expectEqualStrings("b", b.key);
+    try testing.expectEqual(@as(usize, 3 * page_size), b.value.len);
+    try testing.expect(std.mem.allEqual(u8, b.value, 'x'));
+    try testing.expectEqualStrings("c", (try walk.next()).?.key);
+    try testing.expect(try walk.next() == null);
 }
 
 test "put / get: container values (list, map, set) codec round-trip" {

@@ -40,8 +40,10 @@ below is a public function or a committed invariant of emdb as it stands
 
 ## 2. Store layout
 
-`Store.open` opens its own emdb `Env` with the geometry every nexis
-store shares (`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
+`Store.open` acquires the file's one emdb environment, shared with
+every `db/*` connection and Nextomic store of it (`db.StoreFile`,
+`docs/DB.md` §3.1), with the geometry every nexis store shares
+(`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
 new file starts at the map size its opener names
 (`Store.Options.map_size`: 1 MiB, `Store.initial_map_size`, unless
 named, as `nextomic.db.OpenOptions.map_size` is by default) and emdb
@@ -54,9 +56,9 @@ file's page size from its meta and fixes it for the file's life
 a store is never opened another way and the 4078-byte hard key bound
 holds on every platform. Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
-byte array in EAVT-h or a transaction's txlog entry, is at most 65 535
-overflow pages, just under 1 GiB; past that the engine refuses the
-write as `:db/value-too-large` and the transaction aborts.
+byte array in EAVT-h or a transaction's txlog entry, is at most just
+under 4 GiB, emdb's longest overflow chain; past that the engine
+refuses the write as `:db/value-too-large` and the transaction aborts.
 
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
@@ -462,24 +464,12 @@ card-one rule of step 4, so two cas forms on one `(e a)` in one
 transaction conflict as two values would.
 
 **Durability.** A commit is atomic and seen at once by every
-connection and process sharing the file; whether it is on the disk
-when `transact!` returns is the connection's durability
-(`docs/DB.md` §3.3):
-
-| Durability | A commit | Lost if the process crashes | Lost if the system crashes |
-|---|---|---|---|
-| `:commit` (default) | syncs nothing | nothing | the commits since the file's last sync |
-| `:durable` | syncs data, then meta: two device flushes | nothing | nothing |
-
-`(d/connect path {:durability d})` sets it for one connection; without
-it the connection takes the process's, `NEXIS_DURABILITY` (`commit`
-when unset). When a commit syncs nothing, the file is synced once,
-with one full sync, at `(d/sync conn)`, at `release` (and so at the end
-of `with-conn`), at `exit`, and when the program ends, through
-`bin/nexis`'s normal end or an error it reports; never when nothing was
-written since the last. A process killed by a signal loses nothing it
-committed; a crash of the system can lose the commits since the last
-sync. A commit that syncs makes every commit before it durable too.
+connection and process sharing the file. Whether it is on the disk
+when `transact!` returns, what a crash can lose, and when the file is
+synced (`(d/sync conn)`, `release`, the end of the program) are the
+connection's durability, `docs/DB.md` §3.3, which
+`(d/connect path {:durability d})` sets for one connection; without it
+the connection takes the process's, `NEXIS_DURABILITY`.
 
 A transaction's own `{:sync s}` overrides its connection's for its
 commit: `:full` syncs data and meta, `:no-meta` data alone, `:none`
@@ -1121,18 +1111,20 @@ one writer.
 
 ## 11. emdb: nothing required
 
-The engine's public `Txn.txnId` field is not used: Nextomic's own `t`
-is read from `sys` inside the same snapshot. Index trees carry only
+The engine's public `Txn.txnId` field is not used for time: Nextomic's
+own `t` is read from `sys` inside the same snapshot. Its one use is
+`StoreFile`'s check that a held snapshot is still the file's newest
+commit (`docs/DB.md` §3.4), against `Env.lastTxnId`. Index trees carry only
 `[t]` in current trees and nothing in history trees but an
 out-of-line payload in EAVT-h, read with `Txn.getFromTree` on its
 exact key or with a cursor seek to the fact's latest row. emdb
 returns a value spanning several pages whole, from a cursor or a get,
-assembled in the transaction's buffer and valid until that
-transaction's next mutation or its end (API-KV01), so Nextomic copies
-what it keeps past either. A cursor move that meets a page failing its
-check returns no entry and records the failure (API-C08); every
-Nextomic walk reads that record, so a damaged page is `:db/corrupted`
-(§7), never a short scan.
+assembled in a buffer of the transaction: a read transaction keeps
+every such value until it ends, a write transaction until its next
+mutating call (API-KV01), so Nextomic copies what it keeps. A cursor
+move that meets a page failing its check returns no entry and records
+the failure (API-C08); every Nextomic walk reads that record, so a
+damaged page is `:db/corrupted` (§7), never a short scan.
 
 ---
 
