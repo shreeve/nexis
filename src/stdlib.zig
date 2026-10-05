@@ -3074,8 +3074,8 @@ fn dbFailure(vm: *VM, err: anyerror) VmError {
 }
 
 /// The VM's I/O, or the process-wide single-threaded one for a VM
-/// the host gave none (a test harness): opening a store touches the
-/// file system either way.
+/// the host gave none (a test harness): what every native that touches
+/// the file system, the clock or the random source runs on.
 fn ioOf(vm: *VM) std.Io {
     return vm.io orelse std.Io.Threaded.global_single_threaded.io();
 }
@@ -3110,7 +3110,7 @@ fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
     if (opts.isNil()) return null;
     if (opts.kind() != .persistent_map) return VmError.KindMismatch;
     const k = vm.ensureInterner().internKeywordValue("durability") catch return VmError.OutOfMemory;
-    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal)) {
+    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
         .absent => return null,
         .present => |x| x,
     };
@@ -3208,7 +3208,7 @@ fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const conn = try liveConnOf(vm, r);
     var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
-    const result = db_mod.getRef(&txn, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+    const result = db_mod.getRef(&txn, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
     return result orelse default;
 }
 
@@ -3372,7 +3372,7 @@ fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const default = if (args.len > 2) args[2] else value_mod.nilValue();
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
     const result: ?Value = switch ((try activeTxn(tx_v)).txn) {
-        inline else => |*t| db_mod.getRef(t, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err),
+        inline else => |*t| db_mod.getRef(t, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err),
     };
     return result orelse default;
 }
@@ -3400,7 +3400,7 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
             const conn = try liveConnOf(vm, x);
             var txn = try beginRead(vm, conn);
             defer db_mod.abortRead(&txn);
-            const result = db_mod.getRef(&txn, x, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+            const result = db_mod.getRef(&txn, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
             break :blk result orelse value_mod.nilValue();
         },
         .var_ => vm_mod.VM.asVar(x).current() orelse VmError.UnboundVar,
@@ -3640,8 +3640,8 @@ fn decodeEntry(vm: *VM, kv: db_mod.Walk.Entry) VmError!Value {
         vm.ensureHeap(),
         vm.ensureInterner(),
         kv.value,
-        &dispatch_mod_alias.hashValue,
-        &dispatch_mod_alias.equal,
+        &dispatch_mod.hashValue,
+        &dispatch_mod.equal,
     ) catch |err| return dbFailure(vm, err);
 }
 
@@ -3744,7 +3744,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
 
     // 1. Read current.
-    const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
+    const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
     const current = current_opt orelse value_mod.nilValue();
 
     // 2. Build (f current extra...) arg list. f is the FIRST
