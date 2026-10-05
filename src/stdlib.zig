@@ -2879,14 +2879,14 @@ fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(VM.asVar(args[0]).thread_bound);
 }
 
-/// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefix__N`
-/// (`G__N` by default), N counting up for the process.
+/// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefixN`
+/// (`G__N` by default), N counting up for the process, as Clojure's.
 var gensym_next: u64 = 0;
 
 fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
-    const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G";
+    const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G__";
     gensym_next += 1;
-    const name = vm.allocator.print("{s}__{d}", .{ prefix, gensym_next }) catch return VmError.OutOfMemory;
+    const name = vm.allocator.print("{s}{d}", .{ prefix, gensym_next }) catch return VmError.OutOfMemory;
     defer vm.allocator.free(name);
     return vm.ensureInterner().internSymbolValue(name) catch |err| internFailure(err);
 }

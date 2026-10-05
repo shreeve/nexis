@@ -532,11 +532,13 @@ test "syntax-quote: auto-gensyms stay unique across top-level forms" {
 }
 
 test "gensym takes a prefix of any length" {
+    // As Clojure's: the prefix then the counter; G__ by default.
     try expectOutputProgram(
         \\(let [p (apply str (repeat 1000 "p"))
-        \\      g (name (gensym p))]
-        \\  (= (subs g 0 1002) (str p "__")))
-    , "true");
+        \\      g (name (gensym p))
+        \\      d (name (gensym))]
+        \\  [(= (subs g 0 1000) p) (pos? (parse-long (subs g 1000))) (subs d 0 3) (pos? (parse-long (subs d 3)))])
+    , "[true true G__ true]");
 }
 
 test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
