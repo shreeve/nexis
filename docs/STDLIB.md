@@ -42,7 +42,7 @@ loader's diagnostic.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%push-out` / `#%pop-out` (`with-out-str`, §6) |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6) |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -83,8 +83,10 @@ the names the namespace's own (`MACROEXPAND.md` §2b).
 All in `nexis.core`. Strings index by Unicode scalar (code point),
 never by byte or grapheme: `count`, `nth`, `get`, `subs` and
 `nexis.string/index-of` agree (`(count "🇺🇸")` is 2). A string with
-malformed UTF-8 (reachable only through the codec or a store) makes
-any of them throw `:utf8-error` (STRING.md §2, invariant 4).
+malformed UTF-8 (a string's bytes are not validated: `read-line`,
+`*command-line-args*`, the codec and a store can all bring one in)
+makes any of them throw `:utf8-error` (STRING.md §2, invariant 4); no
+string function panics on one.
 
 | Name | Arity | Semantics | Errors |
 |---|---|---|---|
@@ -97,7 +99,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, as Clojure's casts check, and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity; NaN for `long`) |
+| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity; NaN for `long`) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |
@@ -107,7 +109,7 @@ any of them throw `:utf8-error` (STRING.md §2, invariant 4).
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
 | `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
-| `compare` | 2 | Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6) | — |
+| `compare` | 2 | -1, 0 or 1. Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6). Only the sign is the contract: Clojure's `compare` of two strings is `String.compareTo`'s difference (`(compare "B" "a")` is -31 there, -1 here) | — |
 
 **`format`.** `(format fmt & args)` is a subset of Java's
 `Formatter`, as Clojure's `format` uses it. `fmt` is text with
@@ -116,7 +118,7 @@ argument:
 
 | Conversion | Argument | Text |
 |---|---|---|
-| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"` |
+| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"`, and is `:utf8-error` when a malformed sequence starts within them |
 | `%d` | integer (fixnum or bignum) | Decimal |
 | `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"`. As Java's, the digits are the double's shortest round-trip ones, rounded half up and padded with zeros (`(format "%.2f" 0.125)` is `"0.13"`, `(format "%.20f" 0.1)` `"0.10000000000000000000"`); NaN and the infinities are `NaN`, `Infinity`, `-Infinity` |
 | `%x`, `%X` | integer within 64 bits | Hex of the 64-bit two's complement: `(format "%x" -1)` is `"ffffffffffffffff"`; a larger bignum is `:arithmetic-overflow` |
@@ -155,7 +157,7 @@ the result and write it once; a `replace` that finds nothing returns
 | `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
 | `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
-| `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays) |
+| `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays). A byte that is not part of a well-formed UTF-8 sequence is not whitespace: it stops the trim and stays |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
 | `blank?` | 1 | Whether the argument is nil, empty, or only whitespace as `trim` reads it |
 | `starts-with?`, `ends-with?`, `includes?` | 2 | Whether the second string is a prefix, suffix, substring of the first |
@@ -185,11 +187,11 @@ core collection functions.
 
 | Name | Arity | Semantics |
 |---|---|---|
-| `union` | 0+ | A set of every element of any argument; `(union)` is `#{}`; nil and any seqable are accepted (each is poured `into` the result) |
-| `intersection` | 1+ | The elements of the first set present in every other one; with one argument, that argument unchanged |
+| `union` | 0+ | Every element of any argument, poured `into` the largest, which keeps its kind and metadata: `(union (sorted-set 3 1) #{2})` is a sorted set; `(union)` is `#{}`, one argument is itself (`(union nil)` is nil) |
+| `intersection` | 1+ | The elements of the first set present in every other one, `disj`ed from the smallest, which keeps its kind; with one argument, that argument unchanged |
 | `difference` | 1+ | The first set without the elements of the others; the first must be a set (`disj`), else `:kind-mismatch` |
 | `subset?`, `superset?` | 2 | Whether every element of the first is in the second (`subset?`), or the reverse |
-| `select` | 2 | `(select pred s)`: a set of the elements for which `pred` is truthy |
+| `select` | 2 | `(select pred s)`: `s` without the elements for which `pred` is falsy (`disj`), so of `s`'s kind |
 | `map-invert` | 1 | The map with keys and values swapped; of duplicate values, the key iterated last wins |
 | `rename-keys` | 2 | `(rename-keys m kmap)`: `m` with each key of `kmap` present in `m` renamed to its value |
 
@@ -327,6 +329,9 @@ a realized list.
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
 | `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `doall`, `dorun` | 1 | Sequences are already realized: `doall` returns its argument, `dorun` nil |
+| `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-uuid` and `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
+| `in-ns` | 1 | `(in-ns 'name)`: makes the namespace named by the symbol current, creating it with `nexis.core` referred; nil, where Clojure returns the namespace |
 | `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
 | `indexed?` | 1 | True of a vector or typed vector |
 | `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |

@@ -13,7 +13,7 @@
 (defn true?  [x] (= x true))
 (defn false? [x] (= x false))
 
-; second, third, take, some and every? are natives that walk no
+; second, take, some and every? are natives that walk no
 ; further than they must.
 (defn ffirst [x] (first (first x)))
 (defn nfirst [x] (next (first x)))
@@ -33,12 +33,20 @@
 ; Conditional macros
 ; ============================================================
 
+; Fails the expansion of the binding macro `macro` unless `binding` is
+; [binding test] and `else` holds at most one form, as Clojure's
+; assert-args does.
+(defn- check-binding [macro binding else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)))
+    (throw (ex-info (str macro " requires exactly 2 forms in binding vector") {})))
+  (when (next else)
+    (throw (ex-info (str macro " requires 1 or 2 forms after binding vector") {}))))
+
 ; (if-let [binding test] then else?) → then with binding bound to
 ; test's value when it is truthy, else. The binding may destructure;
 ; any other shape fails to expand, as in Clojure.
 (defmacro if-let [binding then & else]
-  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
-    (throw (ex-info "if-let takes [binding test], then and an optional else" {})))
+  (check-binding "if-let" binding else)
   `(let [temp# ~(second binding)]
      (if temp#
        (let [~(first binding) temp#] ~then)
@@ -46,6 +54,7 @@
 
 ; (when-let [binding test] body...) → body when test is truthy.
 (defmacro when-let [binding & body]
+  (check-binding "when-let" binding nil)
   `(let [temp# ~(second binding)]
      (when temp#
        (let [~(first binding) temp#] ~@body))))
@@ -53,14 +62,14 @@
 ; (if-some [binding test] then else?) / (when-some [binding test]
 ; body...) → as if-let / when-let, but only nil fails: false binds.
 (defmacro if-some [binding then & else]
-  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
-    (throw (ex-info "if-some takes [binding test], then and an optional else" {})))
+  (check-binding "if-some" binding else)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        ~(first else)
        (let [~(first binding) temp#] ~then))))
 
 (defmacro when-some [binding & body]
+  (check-binding "when-some" binding nil)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        nil
@@ -69,6 +78,7 @@
 ; (when-first [x coll] body...) → body with x bound to the first
 ; element, when coll has one.
 (defmacro when-first [binding & body]
+  (check-binding "when-first" binding nil)
   `(let [s# (seq ~(second binding))]
      (when s#
        (let [~(first binding) (first s#)] ~@body))))
@@ -92,17 +102,18 @@
      v#))
 
 ; (assert x) / (assert x message) → nil when x is truthy, else throws
-; ex-info "Assert failed: <message or the form>" whose data's :error
-; is :assertion-failed. The printed form and the data are built when
-; the macro expands, so the check costs its test and the failure one
-; call.
+; {:error :assertion-failed :message "Assert failed: <message or the
+; form>"}, the shape :pre, :post, case and condp throw. The printed
+; form is built when the macro expands, so the check costs its test
+; and the failure one call of two constants, a conj that makes a
+; fresh map each time.
 (defmacro assert [x & message]
   `(when-not ~x
-     (throw (ex-info ~(cond
-                        (empty? message) (str "Assert failed: " (pr-str x))
-                        (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
-                        true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))
-                     {:error :assertion-failed}))))
+     (throw (conj {:error :assertion-failed}
+                  [:message ~(cond
+                               (empty? message) (str "Assert failed: " (pr-str x))
+                               (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
+                               true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))]))))
 
 ; (time expr) → expr's value, after printing how long it took, as
 ; Clojure's does.
@@ -121,10 +132,10 @@
        (nexis.internal/#%pop-out)))
 
 ; (dotimes [name n-expr] body...)
-;   runs body n times with name bound to 0..n-1.
-;   Returns nil.
+;   runs body n times with name bound to 0..n-1, n truncated to an
+;   integer as Clojure's `long` does. Returns nil.
 (defmacro dotimes [binding & body]
-  `(let* [limit# ~(first (rest binding))]
+  `(let* [limit# (long ~(first (rest binding)))]
      (loop* [~(first binding) 0]
        (if (< ~(first binding) limit#)
          (do ~@body
@@ -322,10 +333,15 @@
            (first ks)
            (assoc-in (get m (first ks)) (rest ks) v))))
 
-; (update-in m [k1 k2 ...] f & args) → assoc-in over the
-; result of applying f to the current value.
+; (update-in m [k1 k2 ...] f & args) → m with the value at the path
+; replaced by (apply f value args), walking the path once; an empty
+; path is the one key nil, as Clojure's.
 (defn update-in [m ks f & args]
-  (assoc-in m ks (apply f (cons (get-in m ks) args))))
+  (let* [k (first ks)
+         more (next ks)]
+    (assoc m k (if more
+                 (apply update-in (get m k) more f args)
+                 (apply f (get m k) args)))))
 
 ; ---- sequence breakdown helpers ----
 
@@ -455,47 +471,39 @@
 ; Threading macros
 ; ============================================================
 
+; The threading macros below expand once, to one let chain over their
+; steps, as Clojure's do, so a long chain costs linear expansion. Each
+; binds g to every step but the last, which is the body.
+(defn- step-chain [g init steps]
+  `(let [~g ~init ~@(interleave (repeat (count steps) g) (butlast steps))]
+     ~(if (empty? steps) g (last steps))))
+
 ; (cond-> x test step ...) → threads x through each step whose
 ; test is truthy. The tests are ordinary expressions; they are
 ; not threaded, exactly as in Clojure.
 (defmacro cond-> [expr & clauses]
-  (if (empty? clauses)
-    expr
-    `(let* [g# ~expr
-            next# (if ~(first clauses) (-> g# ~(second clauses)) g#)]
-       (cond-> next# ~@(rest (rest clauses))))))
+  (assert (even? (count clauses)))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [[test step]] `(if ~test (-> ~g ~step) ~g)) (partition 2 clauses)))))
 
 (defmacro cond->> [expr & clauses]
-  (if (empty? clauses)
-    expr
-    `(let* [g# ~expr
-            next# (if ~(first clauses) (->> g# ~(second clauses)) g#)]
-       (cond->> next# ~@(rest (rest clauses))))))
+  (assert (even? (count clauses)))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [[test step]] `(if ~test (->> ~g ~step) ~g)) (partition 2 clauses)))))
 
 ; (some-> x f g ...) → threads while the value is non-nil.
 (defmacro some-> [expr & forms]
-  (if (empty? forms)
-    expr
-    `(let* [g# ~expr]
-       (if (nil? g#)
-         nil
-         (some-> (-> g# ~(first forms)) ~@(rest forms))))))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (-> ~g ~step))) forms))))
 
 (defmacro some->> [expr & forms]
-  (if (empty? forms)
-    expr
-    `(let* [g# ~expr]
-       (if (nil? g#)
-         nil
-         (some->> (->> g# ~(first forms)) ~@(rest forms))))))
+  (let [g (gensym)]
+    (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (->> ~g ~step))) forms))))
 
 ; (as-> x name form ...) → binds name to x, then to each form
 ; in turn.
 (defmacro as-> [expr name & forms]
-  (if (empty? forms)
-    expr
-    `(let* [~name ~expr]
-       (as-> ~(first forms) ~name ~@(rest forms)))))
+  (step-chain name expr forms))
 
 ; ============================================================
 ; More sequence and function helpers
@@ -580,8 +588,8 @@
   [(take-while pred coll) (drop-while pred coll)])
 
 ; (distinct? x & xs) → whether no two arguments are equal.
-(defn distinct? [& xs]
-  (= (count xs) (count (set xs))))
+(defn distinct? [x & xs]
+  (= (inc (count xs)) (count (set (cons x xs)))))
 
 ; (tree-seq branch? children root) → the nodes of the tree under root,
 ; depth first, each before its children; an explicit stack, so the
