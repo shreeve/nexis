@@ -82,7 +82,7 @@ effect is the same.
 Metadata never affects `=` or `hash` (§23 #12); `with-meta` returns a
 new value with the map in the heap header. Collections, records and
 Vars carry it, and `conj`, `assoc` and the other updates keep it, as
-in Clojure; typed vectors, functions, symbols and keywords carry none
+in Clojure; functions, symbols and keywords carry none
 (`docs/SEMANTICS.md` §7).
 
 ### 1.7 Hash-domain separation

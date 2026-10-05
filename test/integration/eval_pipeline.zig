@@ -1665,6 +1665,47 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
 }
 
+/// Run `before`, which wraps the heap's edit clock, from 50 tokens
+/// short of the wrap; then run `after` with the clock moved forward to
+/// there again, so `after`'s transients take the tokens `before`'s took
+/// (TRANSIENT.md §4), and print `after`.
+fn expectAcrossEditClockWrap(before: []const u8, after: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const heap = program.v.ensureHeap();
+    heap.edit_clock = nx.heap.edit_token_max - 50;
+    _ = try program.run(before);
+    try testing.expect(heap.edit_clock < nx.heap.edit_token_max - 50);
+    heap.edit_clock = nx.heap.edit_token_max - 50;
+    try harness.expectResult(&program, after, try program.run(after), expected);
+}
+
+test "integration: group-by's buckets keep their elements across the edit clock's wrap" {
+    // group-by's `f` wraps the clock on its first call: the buckets
+    // are edited under the map's token as it stands after the call.
+    try expectAcrossEditClockWrap(
+        \\(def spin (fn [] (dotimes [_ 100] (transient []))))
+        \\(def b (get (group-by (fn [x] (when (= x 0) (spin)) :k) (range 10)) :k))
+    ,
+        \\(dotimes [_ 49] (assoc! (transient b) 0 :evil))
+        \\b
+    , "[0 1 2 3 4 5 6 7 8 9]");
+}
+
+test "integration: a `!` call that raises across the edit clock's wrap leaves its transient no stale token" {
+    try expectAcrossEditClockWrap(
+        \\(def t (transient {}))
+        \\(dotimes [_ 100] (try (conj! t [:x 1] :bad) (catch any e e)))
+        \\(dotimes [i 40] (conj! t [i i]))
+        \\(def p (persistent! t))
+        \\(dotimes [_ 100] (transient []))
+    ,
+        \\(dotimes [_ 49] (let [u (transient p)] (dotimes [i 40] (assoc! u i :evil))))
+        \\(= p (zipmap (range 40) (range 40)))
+    , "true");
+}
+
 test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
     try expectOutput(
         \\(let [t (transient [])]
@@ -1928,19 +1969,23 @@ test "integration: a :stack-overflow caught inside a callback does not resurface
     , "[:deep [:deep false] [:deep] [:deep] 1 :deep :deep [:deep] :outer]");
 }
 
-test "integration: a transient op that raises leaves the transient as it found it" {
+test "integration: a transient `!` call is a loop: a wrong operand changes nothing, a deep key stops it" {
+    // TRANSIENT.md §6: the edits before a key that hashed or compared
+    // past the stack guard stay, as Clojure's loop over the keys
+    // keeps them; the edits after it do not run.
     try expectOutputOverDeepData(
         \\(let [a deep-a
         \\      s (transient (set (range 20)))
         \\      m (transient (zipmap (range 20) (range 20)))]
         \\  [(try (conj! s 20 a) (catch :stack-overflow e e))
-        \\   (try (assoc! m :x 1 a 2) (catch :stack-overflow e e))
-        \\   (try (dissoc! m 0 a) (catch :stack-overflow e e))
-        \\   (try (disj! s 0 a) (catch :stack-overflow e e))
+        \\   (try (assoc! m :x 1 a 2 :z 3) (catch :stack-overflow e e))
+        \\   (try (dissoc! m 0 a 1) (catch :stack-overflow e e))
+        \\   (try (disj! s 0 a 1) (catch :stack-overflow e e))
         \\   (try (conj! m [:y 1] :not-an-entry) (catch any e e))
+        \\   (try (conj! m [:y 1] [:w]) (catch any e e))
         \\   (count (persistent! s))
-        \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p 0)])])
-    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch 20 [20 nil nil 0]]");
+        \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p :z) (p 0) (p 1)])])
+    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch :arity-mismatch 20 [20 1 nil nil nil 1]]");
 }
 
 test "integration: core.nx composite + HOFs" {

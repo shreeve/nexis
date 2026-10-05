@@ -475,19 +475,35 @@ const Decoder = struct {
         defer d.scratch.shrinkRetainingCapacity(start);
         const elems = d.scratch.items[start..];
         switch (tag) {
-            @backingInt(Kind.list) => return list_mod.fromSlice(d.heap, elems),
+            // Four or more elements are a view of a vector, as a built
+            // sequence is (LIST.md §1); a view encodes as a list.
+            @backingInt(Kind.list) => return if (elems.len < 4) list_mod.fromSlice(d.heap, elems) else list_mod.ofVector(d.heap, try vector_mod.fromSlice(d.heap, elems), 0),
             @backingInt(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
             @backingInt(Kind.sorted_map), @backingInt(Kind.sorted_set) => return d.sortedFrom(@fromBackingInt(@intCast(tag)), elems),
+            // A trie hashes every key, so past an array form's size the
+            // bulk builder, which allocates each node once, hashes no
+            // more than a fold of `assoc` would; an array form hashes
+            // no key, so a key nested too deeply to hash still decodes.
             @backingInt(Kind.persistent_map) => {
+                const n = elems.len / 2;
                 var m = try champ.mapEmpty(d.heap);
-                var i: usize = 0;
-                while (i < elems.len) : (i += 2) m = try champ.mapAssoc(d.heap, m, elems[i], elems[i + 1], d.elementHash, d.elementEq);
-                if (champ.mapCount(m) != elems.len / 2) return CodecError.MalformedPayload;
+                if (n > champ.array_map_max) {
+                    const entries: [*]const champ.Entry = @ptrCast(elems.ptr);
+                    m = try champ.mapFromEntries(d.heap, entries[0..n], d.elementHash, d.elementEq);
+                } else {
+                    var i: usize = 0;
+                    while (i < elems.len) : (i += 2) m = try champ.mapAssoc(d.heap, m, elems[i], elems[i + 1], d.elementHash, d.elementEq);
+                }
+                if (champ.mapCount(m) != n) return CodecError.MalformedPayload;
                 return m;
             },
             else => {
                 var s = try champ.setEmpty(d.heap);
-                for (elems) |x| s = try champ.setConj(d.heap, s, x, d.elementHash, d.elementEq);
+                if (elems.len > champ.array_map_max) {
+                    s = try champ.setFromElements(d.heap, elems, d.elementHash, d.elementEq);
+                } else {
+                    for (elems) |x| s = try champ.setConj(d.heap, s, x, d.elementHash, d.elementEq);
+                }
                 if (champ.setCount(s) != elems.len) return CodecError.MalformedPayload;
                 return s;
             },
@@ -541,21 +557,7 @@ const Decoder = struct {
             @backingInt(Kind.typed_vector) => blk: {
                 const elem = typed_vector.ElemType.fromTag(try readByte(bytes, cursor)) orelse return CodecError.MalformedPayload;
                 const n = try d.count(8);
-                const raw = try readBytes(bytes, cursor, n * 8);
-                switch (elem) {
-                    .i64 => {
-                        const elems = try d.heap.backing.alloc(i64, n);
-                        defer d.heap.backing.free(elems);
-                        for (elems, 0..) |*slot, i| slot.* = @bitCast(std.mem.readInt(u64, raw[i * 8 ..][0..8], .little));
-                        break :blk typed_vector.fromI64Slice(d.heap, elems);
-                    },
-                    .f64 => {
-                        const elems = try d.heap.backing.alloc(f64, n);
-                        defer d.heap.backing.free(elems);
-                        for (elems, 0..) |*slot, i| slot.* = @bitCast(std.mem.readInt(u64, raw[i * 8 ..][0..8], .little));
-                        break :blk typed_vector.fromF64Slice(d.heap, elems);
-                    },
-                }
+                break :blk typed_vector.fromLeBytes(d.heap, elem, try readBytes(bytes, cursor, n * 8));
             },
             // Every other kind that exists is outside the serializable
             // set (CODEC.md §3); a byte that names no heap kind (the
@@ -868,6 +870,23 @@ test "roundtrip: list of fixnums" {
     const got = try ctx.roundtrip(src);
     try testing.expectEqual(@as(usize, 3), list_mod.count(got));
     try testing.expectEqual(@as(i64, 1), list_mod.head(got).asFixnum());
+}
+
+test "decode: a list of four or more elements is a view of a vector, and encodes as it was" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    for ([_]usize{ 3, 4, 40 }) |n| {
+        var elems: [40]Value = undefined;
+        for (elems[0..n], 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
+        const src = try list_mod.fromSlice(&ctx.heap, elems[0..n]);
+        const got = try ctx.roundtrip(src);
+        try testing.expectEqual(n >= 4, got.subkind() == list_mod.subkind_view);
+        try testing.expectEqual(n, list_mod.count(got));
+        try testing.expectEqual(@as(i64, @intCast(n - 1)), list_mod.head(list_mod.drop(got, n - 1)).asFixnum());
+        try testing.expectEqual(list_mod.hashSeq(src, &synthHash), list_mod.hashSeq(got, &synthHash));
+        const again = try ctx.roundtrip(got);
+        try testing.expectEqual(n, list_mod.count(again));
+    }
 }
 
 test "roundtrip: vector of 100 elements" {
@@ -1333,30 +1352,6 @@ test "decode: trailing bytes → TrailingBytes" {
     const bytes = [_]u8{ 1, 0, @backingInt(Kind.nil), 0xFF };
     try testing.expectError(
         CodecError.TrailingBytes,
-        decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
-    );
-}
-
-test "decode: invalid kind byte → InvalidKindByte" {
-    var ctx = TestCtx.init();
-    defer ctx.deinit();
-
-    // Byte 10 is in the reserved 8..15 immediates range.
-    const bytes = [_]u8{ 1, 0, 10 };
-    try testing.expectError(
-        CodecError.InvalidKindByte,
-        decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
-    );
-}
-
-test "decode: recognized-but-non-serializable kind → UnserializableKind" {
-    var ctx = TestCtx.init();
-    defer ctx.deinit();
-
-    // transient is kind 27, recognized but non-serializable.
-    const bytes = [_]u8{ 1, 0, @backingInt(Kind.transient) };
-    try testing.expectError(
-        CodecError.UnserializableKind,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
     );
 }

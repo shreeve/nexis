@@ -48,13 +48,14 @@ written into the vector's open tail (`docs/VECTOR.md` §5,
 buffer first (`test/golden/cli/long-sequences.nx`
 builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
 with any view, a `rest` or `drop` of a built sequence keeps the whole
-vector reachable (§6), where a cons chain's rest frees the cells before
+vector reachable (§4), where a cons chain's rest frees the cells before
 it.
 
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
 `(...)`, is `=` to and hashes as the list of the same elements, can be
 the tail of a cons (`(cons 0 (rest v))`), and the codec encodes it as a
-list (decoding gives cons cells).
+list. Decoding builds a list as the sequence natives do: four or more
+elements are a view of a vector, fewer are cons cells.
 
 **No empty singleton.** Every `empty(heap)` allocates a fresh block.
 Two empty lists are `=`; `identical?` tells them apart by address.
@@ -76,9 +77,11 @@ reader and macro material; large sequences are vectors.
    `finalizeOrdered(acc, count)`), truncated to `u32`; `vector.hashSeq`
    computes the same value for the same elements. The caller mixes in
    the sequential domain byte. A cons cell caches a nonzero result in
-   its header (SEMANTICS §3.1); a view caches nothing, because every
-   offset of it shares one header. A view used over and over as a map
-   key (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
+   its header (SEMANTICS §3.1). A view at offset 0 holds its vector's
+   elements and takes the vector's hash, cached in the vector's root; a
+   view at another offset caches nothing, because every offset of it
+   shares one header. Such a view used over and over as a map key
+   (memoizing on `(rest args)`) is rehashed in O(n) at each lookup;
    `vec` of it gives a key that caches its hash.
 3. **Equality.** `equalSeq` walks both lists in lock step through their
    cursors: same length and every pair `=`.
@@ -120,7 +123,7 @@ reader and macro material; large sequences are vectors.
 | `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`stdlib.zig` `SeqIter`); null for a cons chain or the empty list |
 | `hashSeq(v, elementHash) u64` | §2 invariant 2; `elementHash` is `&dispatch.hashValue` |
 | `equalSeq(a, b, elementEq) bool` | §2 invariant 3; `elementEq` is `&dispatch.equal` |
-| `trace(h, visitor)` | GC trace, §6 |
+| `trace(h, visitor)` | GC trace, §4 |
 
 The callbacks keep `list.zig` out of `dispatch`'s import graph; it
 imports `vector.zig` for the view. Errors besides `InvalidListTail` are
@@ -129,7 +132,7 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
 
 ---
 
-### 6. Interaction with other layers
+### 4. Interaction with other layers
 
 - **GC** (`docs/GC.md` §5). `trace` marks every head and marks each
   following cons cell directly, in a loop, so the collector's recursion

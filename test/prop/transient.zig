@@ -2,7 +2,7 @@
 //! transient wrapper: transient equivalence and ownership, alongside
 //! test/prop/champ.zig (map/set) and test/prop/vector.zig (vector).
 //!
-//! Properties (TRANSIENT.md §12):
+//! Properties (TRANSIENT.md §11):
 //!
 //!   T1. Equivalence: random edit sequences applied via
 //!       (transient → N × ...Bang → persistentBang) produce the same
@@ -724,4 +724,24 @@ test "T6: across the edit clock's wrap, no transient edits a node another owned"
     for (0..200) |i| try std.testing.expectEqual(@as(i64, @intCast(i)), vector.nth(v, i).asFixnum());
     try std.testing.expectEqual(@as(i64, 1), vector.nth(kept, 0).asFixnum());
     try std.testing.expectEqual(@as(i64, -1), vector.nth(try transient.persistentBang(u), 0).asFixnum());
+}
+
+test "T6: a vector grown under a transient map's token across the wrap stays out of every later transient's reach" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    heap.edit_clock = heap_mod.edit_token_max - 3;
+    const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
+    const bucket = try vector.empty(&heap);
+    const spot = try transient.mapLocateBang(t, fx(0), &dispatch.hashValue, &dispatch.equal);
+    try transient.mapPutBang(&heap, t, spot, fx(0), bucket);
+    // Transients made between two edits, as a `group-by` key function
+    // makes them, wrap the clock.
+    for (0..10) |_| _ = try transient.transientFrom(&heap, try vector.empty(&heap));
+    for (0..10) |i| try transient.vectorConjUnderBang(&heap, t, bucket, fx(@intCast(i)));
+    const m = try transient.persistentBang(t);
+    // The tokens the clock handed out before the wrap, again.
+    heap.edit_clock = heap_mod.edit_token_max - 3;
+    for (0..3) |_| _ = try transient.vectorAssocBang(&heap, try transient.transientFrom(&heap, bucket), 0, fx(-1));
+    try std.testing.expect(dispatch.equal(bucket, try vector.fromSlice(&heap, &.{ fx(0), fx(1), fx(2), fx(3), fx(4), fx(5), fx(6), fx(7), fx(8), fx(9) })));
+    try std.testing.expectEqual(@as(usize, 1), champ.mapCount(m));
 }

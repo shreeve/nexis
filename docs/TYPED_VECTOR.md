@@ -36,8 +36,6 @@ the constructors use, `hashHeader`, `equalHeaders`, `trace` and
 - Reader syntax. `#i64[1 2 3]` is how a typed vector prints; the
   reader has no `#i64[` / `#f64[` dispatch and the text is a parse
   error.
-- Metadata: `with-meta` is `:kind-mismatch`, `meta` is nil
-  (SEMANTICS §7).
 - Metal or other off-CPU dispatch, the `simd` opcode group
   (`UnimplementedOpcode`, VM.md §10), and a shared representation with
   Nextomic's `Relation` columns, which are arena-scoped and never VM
@@ -177,7 +175,7 @@ is allocated.
 
 | keyword | raised by |
 |---|---|
-| `:kind-mismatch` | a constructor element of the wrong kind; a non-typed-vector to `typed-vector-type` or a kernel; an update native (`conj`, `assoc`, `pop`, `peek`, `subvec`, `empty`); `with-meta`; mismatched element types in `tv/dot`; a `tv/scale` or `tv/map` value that does not fit the element type |
+| `:kind-mismatch` | a constructor element of the wrong kind; a non-typed-vector to `typed-vector-type` or a kernel; an update native (`conj`, `assoc`, `pop`, `peek`, `subvec`, `empty`); mismatched element types in `tv/dot`; a `tv/scale` or `tv/map` value that does not fit the element type |
 | `:index-out-of-bounds` | `nth` without a default, index outside `0..count` |
 | `:invalid-argument` | `tv/dot` over different lengths |
 | `:arithmetic-overflow` | a `tv/scale` product outside `i64` on an `i64` vector |

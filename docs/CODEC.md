@@ -152,7 +152,11 @@ claim. A count larger than the bytes left could encode is
 `TruncatedInput` before anything is read for it. The elements of every
 list and vector being decoded share one scratch stack, which grows by
 one per element actually decoded: nested headers that each claim the
-rest of the input cost nothing until the input runs out.
+rest of the input cost nothing until the input runs out. A complete
+container is built from its elements in one pass: a vector, and a list
+of four or more as a view of one (`docs/LIST.md` §1), bottom up; a map
+or set by `champ.mapFromEntries`/`setFromElements`, each node
+allocated once; a typed vector straight from its bytes.
 
 #### 2.8 Sorted maps and sets
 
