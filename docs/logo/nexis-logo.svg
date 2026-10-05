@@ -10,9 +10,9 @@
     </linearGradient>
   </defs>
   <rect width="256" height="256" rx="60" fill="url(#nx-bg)"/>
-  <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round">
-    <path d="M104 60 C 66 96, 66 160, 104 196"/>
-    <path d="M152 60 C 190 96, 190 160, 152 196"/>
+  <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M98 66 H 78 V 190 H 98"/>
+    <path d="M158 66 H 178 V 190 H 158"/>
   </g>
   <path d="M109 158 V98 L147 158 V98" fill="none" stroke="#fff" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
   <text class="word" x="300" y="182">nexis</text>
