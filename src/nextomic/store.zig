@@ -248,7 +248,7 @@ pub const boot = struct {
 /// The case folding `nx/fulltext` rows are written under (fulltext.zig
 /// `fold`); 1, folding ASCII only, is what a store without a stamp
 /// holds.
-pub const fulltext_fold: u8 = 2;
+pub const fulltext_fold: u8 = 3;
 
 pub const FulltextStamp = struct { fold: u8, t: u64 };
 

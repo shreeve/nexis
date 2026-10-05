@@ -220,7 +220,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once; it keeps what a read finds only when the read's snapshot is at that generation, so a read older than its own connection's rename (a query function that renames) never puts a retired name back |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
-| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (2, Unicode simple case folding, §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (3, the tokenizer of §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -777,11 +777,14 @@ string attribute carrying `:db/fulltext` at the view's basis, every
 `[e v]` whose value holds every token of the needle, in entity order;
 the attribute and the needle may be variables bound earlier or by
 `:in`. Tokens are the runs of ASCII letters, digits and non-ASCII
-bytes, split on every other byte, each character folded by Unicode
-simple case folding (`CaseFolding.txt`, statuses C and S) for ASCII,
-Latin (Latin-1, Extended-A, the regular pairs of Extended-B, Extended
-Additional), Greek and its extended block, Cyrillic, Armenian,
-Georgian, Glagolitic, Deseret and the letterlike, Roman numeral,
+characters, split on every other ASCII byte and on the non-ASCII
+spaces and punctuation (Latin-1's, General Punctuation, the CJK
+symbols and punctuation, the fullwidth and halfwidth forms of ASCII
+punctuation), each character folded by Unicode simple case folding
+(`CaseFolding.txt`, statuses C and S) for ASCII, Latin (Latin-1,
+Extended-A, Extended-B, Extended Additional), Greek and its extended
+block, Cyrillic and its Extended-C letters, Armenian, Georgian with
+Mtavruli, Glagolitic, Deseret and the letterlike, Roman numeral,
 circled and fullwidth forms, so `Café`, `CAFÉ` and `café` are one
 token, as are `ΣΟΦΙΑΣ` and `σοφιας`; a byte that is not UTF-8 stays as
 it is, and no accent or normalization is removed. A folded run longer
