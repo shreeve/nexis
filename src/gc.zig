@@ -4,10 +4,11 @@
 //! §23 #2, #18). Mark-bit layout: `docs/HEAP.md` §4. Heap / sweep
 //! scaffold: `docs/HEAP.md` and `src/heap.zig`.
 //!
-//! Every heap kind that allocates blocks (string, bignum, list,
-//! persistent_vector, persistent_map, persistent_set, ...) exposes a
-//! `trace` function this collector dispatches to during the mark
-//! phase.
+//! Every heap kind whose blocks hold heap values (the collections,
+//! transient, atom, record, the Nextomic entity) exposes a `trace`
+//! function this collector dispatches to during the mark phase; a
+//! leaf kind (string, bignum, typed vector, durable ref, protocol,
+//! protocol fn, Nextomic connection and db) has nothing to trace.
 //!
 //! Collector contract (GC.md §4):
 //!   - A cycle is `collect(roots)`: the caller's roots, then the
@@ -24,8 +25,8 @@
 //!   - No generational / concurrent phases.
 //!
 //! Imports: the heap, `value.zig`, and each module whose kind has a
-//! block to trace (string, bignum, the collections, transient, db,
-//! atom, record, protocol, `nextomic/handle.zig`); the kind → trace
+//! block to trace (the collections, transient, atom, record,
+//! `nextomic/handle.zig`) or a handle to flag (db); the kind → trace
 //! table is GC.md §5.
 //!
 //! `vm.zig` imports gc.zig and is the collector's host: it
@@ -39,17 +40,14 @@ const std = @import("std");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const string = @import("string.zig");
-const bignum = @import("bignum.zig");
 const list = @import("coll/list.zig");
 const vector = @import("coll/vector.zig");
 const champ = @import("coll/champ.zig");
 const sorted = @import("coll/sorted.zig");
-const typed_vector = @import("coll/typed_vector.zig");
 const transient_mod = @import("coll/transient.zig");
 const db_mod = @import("db.zig");
 const atom_mod = @import("atom.zig");
 const record_mod = @import("record.zig");
-const protocol_mod = @import("protocol.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 
 const Value = value.Value;
@@ -165,7 +163,8 @@ pub const Collector = struct {
     /// transient, an atom, a record or a closure's cell.
     const in_place_depth: u8 = 4;
 
-    /// Kinds whose blocks hold no heap reference but their metadata.
+    /// Kinds whose blocks hold no heap reference but their metadata;
+    /// `trace` has one empty arm for them.
     fn isLeafKind(kind: u16) bool {
         return switch (@as(Kind, @fromBackingInt(@intCast(kind)))) {
             .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => true,
@@ -191,39 +190,17 @@ pub const Collector = struct {
         if (h.meta) |m| self.mark(m);
         const k: Kind = @fromBackingInt(@intCast(h.kind));
         switch (k) {
-            .string => string.trace(h, self),
-            .bignum => bignum.trace(h, self),
+            // The leaves (`isLeafKind`): numbers, bytes or pointers
+            // the VM owns, no heap value but the metadata just marked.
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => {},
             .list => list.trace(h, self),
             .persistent_vector => vector.trace(h, self),
             .persistent_map => champ.traceMap(h, self),
             .persistent_set => champ.traceSet(h, self),
             .sorted_map, .sorted_set => sorted.trace(h, self),
-            // Typed vectors are leaves: unboxed numbers, no children.
-            .typed_vector => typed_vector.trace(h, self),
             .transient => transient_mod.trace(h, self),
-            // Durable refs have no heap children — store_id,
-            // tree_name, key_bytes are all inline body bytes; the
-            // advisory `conn` pointer is NOT heap-managed (per
-            // DB.md §7.3).
-            .durable_ref => db_mod.trace(h, self),
-            // Atom trace walks
-            // the contained value. `in_flight` is a u8, not a
-            // Value. Self-references work via mark-bit short-
-            // circuit in `mark`. ATOM.md §7.
             .atom => atom_mod.trace(h, self),
-            // Record trace walks
-            // the contained field map (type_id is a plain u32,
-            // not a heap value). PROTOCOLS.md §2.1.
             .record => record_mod.trace(h, self),
-            // protocol + protocol_fn are LEAFS
-            // (no inner heap values).
-            .protocol, .protocol_fn => protocol_mod.trace(h, self),
-            // Nextomic handles: the connection box holds a pointer the
-            // VM owns plus inline path text, the db box that pointer
-            // and numbers, so both are leaves; an entity box holds its
-            // db box and the map of its last full read
-            // (nextomic_handle).
-            .nextomic_conn, .nextomic_db => {},
             .nextomic_entity => nextomic_handle.traceEntity(h, self),
             // Closures and upvalue cells: the host lays them out and
             // walks them (VM.md §6, GC.md §5).
@@ -234,24 +211,12 @@ pub const Collector = struct {
                 );
                 host.trace(host.ctx, h, self);
             },
-            // Vars are arena objects the namespace registry roots
-            // (GC.md §3); a `var_` header is a corrupted kind byte.
-            // The remaining reserved kinds have no implementation.
-            // PANIC, not silent no-op, per GC.md §5: a silent no-op
-            // on a kind that SHOULD trace would create invisible
-            // retention bugs.
-            .byte_vector,
-            .var_,
-            .error_,
-            .meta_symbol,
-            => std.debug.panic(
-                "gc.mark: kind {s} is reserved and has no trace implementation; allocating with this kind is a bug",
-                .{@tagName(k)},
-            ),
-            // Immediates + sentinels cannot be heap-allocated; reaching
-            // here means `h.kind` byte is corrupted.
+            // An immediate, a Var (an arena object the namespace
+            // registry roots, GC.md §3) or a reserved kind has no
+            // block: the kind byte is corrupt. A panic, not a silent
+            // no-op, which would hide a block that should trace.
             else => std.debug.panic(
-                "gc.mark: kind byte {d} on heap header {*} is not a valid heap kind — memory corruption or allocator bug",
+                "gc.mark: kind byte {d} on heap header {*} is not a heap kind with a trace: memory corruption or an allocator bug",
                 .{ h.kind, h },
             ),
         }
@@ -291,7 +256,7 @@ pub const Collector = struct {
     ///      one root reaches and never every root at once.
     ///   2. Sweep: end and free every db transaction handle of this
     ///      heap no Value reached (`db.sweepHandles`), then free every
-    ///      unmarked, non-pinned heap block.
+    ///      unmarked heap block.
     ///   3. Clear mark bits on survivors (handled inside sweepUnmarked).
     ///   4. Start a new allocation-counting window on the heap.
     /// Returns the number of blocks freed. A cycle whose worklist
@@ -666,23 +631,6 @@ test "collect: atom whose contained value is unreferenced gets that value swept"
     try testing.expect(freed >= 1);
     try testing.expect(live_after < live_before);
     try testing.expectEqual(replacement.payload, atom_mod.getValue(a).payload);
-}
-
-test "collect: pinned block survives without being in roots" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "pinned");
-    const b = try string.fromBytes(&heap, "not-pinned");
-    Heap.asHeapHeader(a).setPinned();
-    _ = b;
-
-    var gc = Collector.init(&heap);
-    defer gc.deinit();
-    const freed = gc.collect(&.{}); // empty roots
-    try testing.expectEqual(@as(usize, 1), freed); // only `b` freed; `a` pinned
-    try testing.expectEqual(@as(usize, 1), heap.liveCount());
-    try testing.expect(Heap.asHeapHeader(a).isPinned()); // pin flag intact
 }
 
 test "collect: idempotent — second call frees 0 blocks" {

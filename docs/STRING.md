@@ -65,7 +65,6 @@ that builds a string measures it first and writes it once into an
 | `byteLen(v) usize` | The byte length |
 | `hashHeader(h) u32` | Invariants 3 and 7; called by `dispatch.heapHashBase` |
 | `bytesEqual(a, b) bool` | Byte comparison of two string headers; called by `dispatch.equal` |
-| `trace(h, visitor)` | No-op: a string holds no references (GC.md §5) |
 | `codepointCount(v) error{InvalidUtf8}!usize` | Unicode scalars in the body (`std.unicode.utf8CountCodepoints`) |
 | `codepointAt(v, i) error{OutOfBounds, InvalidUtf8}!u21` | The scalar at code-point index `i` |
 | `byteRangeForCodepoints(v, start, end)` | The byte range of code points `[start, end)`; `error.OutOfBounds` when `start > end` or `end` is past the count, `error.InvalidUtf8` on malformed bytes before `end` |

@@ -7,7 +7,7 @@
 //!
 //!   G1. Flat-root sweep: random allocations, random root subset,
 //!       after collect every root's transitive closure survives and
-//!       every other unpinned block is freed.
+//!       every other block is freed.
 //!   G2. Nested reachability graph: 60 random heap objects
 //!       (strings, lists, maps, sets, vectors) nested into each
 //!       other; a random subset declared as roots; after a cycle
@@ -15,9 +15,6 @@
 //!       survive.
 //!   G3. Idempotence: `collect` called twice back-to-back with the
 //!       same roots frees 0 blocks on the second call.
-//!   G4. Pinning: any pinned block survives regardless of root
-//!       membership; clearing the pin before the next collect makes
-//!       it freeable.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -342,42 +339,7 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
 }
 
 // -----------------------------------------------------------------------------
-// G4. Pinning
-// -----------------------------------------------------------------------------
-
-test "G4: pinned block survives without roots; unpinning releases it" {
-    var heap = Heap.init(std.testing.allocator);
-    defer heap.deinit();
-
-    const a = try string.fromBytes(&heap, "pinned");
-    const ah = Heap.asHeapHeader(a);
-    ah.setPinned();
-    _ = try string.fromBytes(&heap, "not-pinned");
-
-    var collector = Collector.init(&heap);
-    defer collector.deinit();
-
-    // First pass: `a` is pinned, other is orphan → other freed, `a` survives.
-    const freed1 = collector.collect(&.{});
-    try std.testing.expectEqual(@as(usize, 1), freed1);
-    try std.testing.expectEqual(@as(usize, 1), heap.liveCount());
-    try std.testing.expect(ah.isPinned()); // pin still set
-
-    // Second pass: still pinned → survives again.
-    const freed2 = collector.collect(&.{});
-    try std.testing.expectEqual(@as(usize, 0), freed2);
-    try std.testing.expectEqual(@as(usize, 1), heap.liveCount());
-
-    // Clear pin. Third pass with empty roots → `a` is now unreachable and
-    // not pinned, so it must be freed.
-    ah.clearPinned();
-    const freed3 = collector.collect(&.{});
-    try std.testing.expectEqual(@as(usize, 1), freed3);
-    try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-// -----------------------------------------------------------------------------
-// G5 (bonus): stress — many collections interleaved with many allocations.
+// G5: stress — many collections interleaved with many allocations.
 // -----------------------------------------------------------------------------
 
 test "G5: repeated allocate-and-collect cycles do not leak" {
@@ -401,7 +363,7 @@ test "G5: repeated allocate-and-collect cycles do not leak" {
             const txt = try std.mem.print(&buf, "c{d}-s{d}", .{ cycle, i });
             _ = try string.fromBytes(&heap, txt);
         }
-        // Keep 3 via roots carried from `held` (which is all pinned-roots).
+        // Keep 3 via roots carried from `held`.
         const fresh = try string.fromBytes(&heap, "keep1");
         try held.append(std.testing.allocator, Heap.asHeapHeader(fresh));
         if (held.items.len > 3) {

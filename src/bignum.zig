@@ -147,14 +147,6 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     return raw;
 }
 
-/// GC trace function (GC.md §5). Bignums are leaf heap kinds — their
-/// bodies are `{negative: u8, _pad, limbs: [N]u64}` with no heap
-/// references.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
-}
-
 /// Semantic equality: same sign, same limb count, same limb bytes.
 /// Padding is not compared. Canonical form (no trailing zeros) is
 /// maintained by the canonicalizer, so equal limb-byte-streams iff

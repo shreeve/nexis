@@ -102,13 +102,6 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     return raw;
 }
 
-/// GC trace function (GC.md §5). Strings are leaf heap kinds — their
-/// bodies are raw UTF-8 bytes with no heap references.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
-}
-
 /// Per-kind equality entry point. Byte-for-byte comparison over two
 /// string headers' bodies. The dispatcher has already verified both
 /// are `.string`; we assert as defense-in-depth in safe builds.

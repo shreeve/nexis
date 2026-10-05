@@ -90,7 +90,7 @@ the block and records its body size. A free slot's kind is `0xDEAD`
 and its `meta` links the free list.
 
 **Sweep.** `sweepUnmarked` walks every class's slabs slot by slot: a
-block neither marked nor pinned is freed (its kind poisoned), a
+block not marked is freed (its kind poisoned), a
 survivor's mark cleared. It rebuilds each class's free list from the
 free slots of the slabs that still hold a block, lowest address first
 within a slab, and takes every slab left empty off its class. It
@@ -126,8 +126,7 @@ at the db layer.
 | `init(backing: Allocator) Heap` | O(1); nothing is allocated until the first block |
 | `deinit()` | Frees every block still live |
 | `alloc(kind, body_size) !*HeapHeader` | A zero-filled block (§1 invariant 4) with `kind` set. `kind` is a heap kind or `cell_internal` (an upvalue cell, `docs/VM.md` §6). Errors: `error.OutOfMemory` when no slab or large block can be had, `error.Overflow` when the block's size overflows `usize`. A zero `body_size` is legal. Never collects |
-| `free(h)` | Releases one block: a slot to its class's free list, a large block to the backing allocator. The kind is poisoned (`0xDEAD`); safe builds panic on a second free |
-| `sweepUnmarked() usize` | Frees every block that is neither marked nor pinned, clears the mark on survivors, rebuilds the free lists and releases empty slabs (§2); returns the count freed. The sweep half of `gc.Collector.collect`; it enumerates no roots |
+| `sweepUnmarked() usize` | Frees every block that is not marked, clears the mark on survivors, rebuilds the free lists and releases empty slabs (§2); returns the count freed. The sweep half of `gc.Collector.collect`; it enumerates no roots |
 | `clearMarks()` | Clears every live block's `marked` bit: a cycle abandoned (`docs/GC.md` §4) |
 | `live_bytes`, `peak_live_bytes`, `allocated_since_collect` | Bytes held by live blocks (a slab block counts its class's size, a large block its allocation), the largest that has been, and bytes allocated since `resetAllocationCounter()`, which the collector's trigger reads (`docs/GC.md` §7) |
 | `slab_count`, `empty_slab_count` | Slabs held, and how many of them are empty and kept (§2) |
@@ -136,12 +135,11 @@ at the db layer.
 | `bodyOf(Body, h) *Body`, `bodyBytes(h) []u8`, `bodySize(h)` | The body, typed (alignment ≤ 16, checked at compile time) or as bytes, as long as `alloc` or the last `resizeInPlace` made it |
 | `bodyCapacity(h)`, `resizeInPlace(h, n) bool` | The longest body the block can take where it stands (its class's size less the header, or a large block's allocation), and a new body size up to it: bytes a longer body gains are zero; false, changing nothing, past the capacity. The transient operations grow and shrink the nodes they own through it (`docs/TRANSIENT.md` §1) |
 | `valueFromHeader(kind, h) Value`, `asHeapHeader(v) *HeapHeader` | Pack a header into a Value with subkind 0, and back. A kind that sets a subkind or view offset packs its own tag (VALUE.md §3) |
-| `liveCount() usize`, `forEachLive(visitor)` | O(n) enumeration for tests and diagnostics; the visitor must not allocate or free |
+| `liveCount() usize`, `forEachLive(visitor)` | O(n) enumeration: `clearMarks`, the retiring of transient edit tokens (`docs/TRANSIENT.md` §4), tests and diagnostics; the visitor may change header bits but must not allocate or sweep |
 
 | `HeapHeader` method | Contract |
 |---|---|
 | `isMarked`, `setMarked`, `clearMarked` | The `marked` bit |
-| `isPinned`, `setPinned`, `clearPinned` | The `pinned` bit |
 | `hasMeta`, `getMeta`, `setMeta` | `setMeta` keeps `flags.has_meta` equal to `meta != null`; `getMeta` asserts it in safe builds. Raw writes to `meta` are not made |
 | `cachedHash() ?u32`, `setCachedHash(u32)` | Null when `hash == 0` (§1 invariant 3) |
 
@@ -154,7 +152,7 @@ at the db layer.
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `marked` | Reached in the current mark phase; cleared by the sweep |
-| 1 | `pinned` | Survives every sweep, marked or not. No runtime module pins a block; tests do |
+| 1 | reserved | 0 |
 | 2 | `large` | The allocator's: a large block (§2), set by `alloc`, never cleared |
 | 3–7 | reserved | 0 |
 
@@ -163,7 +161,9 @@ at the db layer.
 | Bit | Name | Meaning |
 |---|---|---|
 | 0 | `has_meta` | `meta` is non-null |
-| 1–7 | reserved | 0 |
+| 1 | `ascii_known` | A string's: its bytes have been scanned for ASCII (`docs/STRING.md` §3) |
+| 2 | `ascii` | A string's: every byte is ASCII; meaningful with `ascii_known` |
+| 3–7 | reserved | 0 |
 
 ---
 
