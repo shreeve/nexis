@@ -4059,6 +4059,17 @@ test "extend-protocol: built-in kinds" {
     , "[hi-7 35]");
 }
 
+test "extend-protocol: :boolean covers both booleans, :map and :set their sorted kinds" {
+    // As Clojure's Boolean, IPersistentMap and IPersistentSet do; a
+    // later extension of one kind replaces the alias's for that kind.
+    try expectOutputProgram(
+        \\(defprotocol Sh (sh [x]))
+        \\(extend-protocol Sh :boolean (sh [x] [(class x) x]) :map (sh [x] :m) :set (sh [x] :s))
+        \\(extend-protocol Sh :sorted_set (sh [x] :sorted))
+        \\[(sh true) (sh false) (sh {}) (sh (sorted-map 1 2)) (sh #{}) (sh (sorted-set 1))]
+    , "[[:boolean true] [:boolean false] :m :m :s :sorted]");
+}
+
 test "extend-type: record and built-in mixed" {
     try expectOutputProgram(
         \\(do

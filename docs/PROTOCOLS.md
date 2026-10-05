@@ -249,13 +249,13 @@ swapped, so a method's arities take either spelling of §4.2:
 | Type form | Emits | Dispatch key |
 |---|---|---|
 | keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{builtin, kind}`; `:fixnum` and `:bignum` are one key (§3.2) |
-| `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases for `:persistent_vector` / `:persistent_map` / `:persistent_set` |
+| `:boolean` / `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases, each installed on every kind Clojure's type covers: `:true_` and `:false_` (what `class` returns for a boolean); `:persistent_vector`; `:persistent_map` and `:sorted_map`; `:persistent_set` and `:sorted_set` |
 | `:any` | `#%extend-default-impl` | the method's `default_impl` |
 | record symbol `Counter` | `#%extend-record-impl` with `Counter-type-id` | `{record, type_id}` |
 
 The keyword-to-kind mapping is derived from the `Kind` enum's field
 names at compile time, so every kind tag is accepted under its enum
-name (booleans are `:false_` and `:true_`; there is no `:bool`). A
+name (`:false_` and `:true_` name one boolean each). A
 keyword that names no kind and no alias raises `:invalid-argument`
 when the expansion runs; the macro does not validate type names. A
 record symbol no `defrecord` produced fails as an unbound

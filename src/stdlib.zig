@@ -5032,12 +5032,13 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
 // qualified calls to these helpers. A type-tag keyword is a field
 // name of the `Kind` enum (`:nil`, `:false_`, `:true_`, `:fixnum`,
 // `:string`, `:persistent_vector`, `:var_`, `:atom`, ...), matched by
-// `typeNameToKind` (PROTOCOLS.md §4.3).
+// `typeNameToKinds` (PROTOCOLS.md §4.3).
 //
-// Plus the friendly aliases:
-//   :vector → :persistent_vector
-//   :map    → :persistent_map
-//   :set    → :persistent_set
+// Plus the aliases, each of the kinds Clojure's type covers:
+//   :boolean → :true_ and :false_ (what `class` returns for both)
+//   :vector  → :persistent_vector
+//   :map     → :persistent_map and :sorted_map
+//   :set     → :persistent_set and :sorted_set
 //
 // `:any` triggers the default-fallback path (default_impl on the
 // method) and lives in #%extend-default-impl, not the builtin one.
@@ -5053,13 +5054,14 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
     const interner = vm.ensureInterner();
     const type_id_kw: u32 = args[2].asKeywordId();
     const type_name = interner.keywordName(type_id_kw);
-    const kind = typeNameToKind(type_name) orelse return VmError.InvalidArgument;
-    const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @backingInt(kind) };
-
-    vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
-        error.NoProtocolMethod => return VmError.NoProtocolMethod,
-        error.OutOfMemory => return VmError.OutOfMemory,
-    };
+    const kinds = typeNameToKinds(type_name) orelse return VmError.InvalidArgument;
+    for (kinds) |kind| {
+        const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @backingInt(kind) };
+        vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
+            error.NoProtocolMethod => return VmError.NoProtocolMethod,
+            error.OutOfMemory => return VmError.OutOfMemory,
+        };
+    }
     return value_mod.nilValue();
 }
 
@@ -5132,11 +5134,14 @@ fn fnSatisfiesQ(vm: *VM, args: []const Value) VmError!Value {
 /// enum value. Friendly aliases (vector/map/set) are accepted
 /// alongside the canonical Kind enum names. Returns null for
 /// unknown names; the caller raises `:invalid-argument`.
-fn typeNameToKind(name: []const u8) ?value_mod.Kind {
-    if (std.mem.eql(u8, name, "vector")) return .persistent_vector;
-    if (std.mem.eql(u8, name, "map")) return .persistent_map;
-    if (std.mem.eql(u8, name, "set")) return .persistent_set;
-    return std.meta.stringToEnum(value_mod.Kind, name);
+fn typeNameToKinds(name: []const u8) ?[]const Kind {
+    if (std.mem.eql(u8, name, "boolean")) return &.{ .true_, .false_ };
+    if (std.mem.eql(u8, name, "vector")) return &.{.persistent_vector};
+    if (std.mem.eql(u8, name, "map")) return &.{ .persistent_map, .sorted_map };
+    if (std.mem.eql(u8, name, "set")) return &.{ .persistent_set, .sorted_set };
+    const all = comptime std.enums.values(Kind);
+    for (all, 0..) |k, i| if (std.mem.eql(u8, @tagName(k), name)) return all[i..][0..1];
+    return null;
 }
 
 // =============================================================================
