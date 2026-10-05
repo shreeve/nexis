@@ -15,7 +15,7 @@
 //!       matches the oracle's count of un-marked-and-un-pinned blocks;
 //!       survivors have `marked == 0` and `pinned` unchanged.
 //!   H3. Alloc / sweep cycles don't leak across K iterations (the
-//!       DebugAllocator on `std.testing.allocator` is the oracle).
+//!       SafeAllocator behind `std.testing.allocator` is the oracle).
 //!   H4. Body bytes on a sweep survivor are unchanged by the sweep.
 //!   H5. Header side-fields (pinned, cached hash, meta) on a survivor
 //!       are intact after sweep; only the `marked` bit clears.
@@ -225,7 +225,7 @@ test "H3: 50 cycles of alloc + random-mark + sweep, no leaks" {
         }
         _ = heap.sweepUnmarked();
     }
-    // heap.deinit's DebugAllocator leak-check is the oracle here.
+    // heap.deinit's SafeAllocator leak check is the oracle here.
     // Drop remaining live blocks so deinit has nothing left to
     // reconcile against the tracking allocator.
     _ = heap.sweepUnmarked();

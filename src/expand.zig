@@ -143,7 +143,7 @@ pub const ExpandContext = struct {
     /// inner form already did, and return `err`.
     pub fn failWith(self: *ExpandContext, err: ExpandError, span: SrcSpan, comptime fmt: []const u8, args: anytype) ExpandError {
         if (self.failure == null) {
-            const message = std.fmt.allocPrint(self.allocator, fmt, args) catch return ExpandError.OutOfMemory;
+            const message = self.allocator.print(fmt, args) catch return ExpandError.OutOfMemory;
             self.failure = .{ .span = span, .message = message };
         }
         return err;
@@ -169,7 +169,7 @@ pub const ExpandContext = struct {
     /// `ctx.allocator`.
     pub fn gensym(self: *ExpandContext, base: []const u8) ExpandError![]const u8 {
         gensym_counter += 1;
-        return std.fmt.allocPrint(self.allocator, "{s}__{d}__auto__", .{ base, gensym_counter });
+        return self.allocator.print("{s}__{d}__auto__", .{ base, gensym_counter });
     }
 };
 
@@ -771,7 +771,7 @@ fn anonFnForm(
     for (items, body) |it, *b| b.* = try anon.visit(ctx, it);
 
     const params = try ctx.allocator.alloc(*Form, anon.max_positional + @as(usize, if (anon.uses_rest) 2 else 0));
-    for (params[0..anon.max_positional], 1..) |*p, n| p.* = try makeSymbol(ctx, try std.fmt.allocPrint(ctx.allocator, "%{d}", .{n}), origin);
+    for (params[0..anon.max_positional], 1..) |*p, n| p.* = try makeSymbol(ctx, try ctx.allocator.print("%{d}", .{n}), origin);
     if (anon.uses_rest) {
         params[anon.max_positional] = try makeSymbol(ctx, "&", origin);
         params[anon.max_positional + 1] = try makeSymbol(ctx, "%&", origin);
@@ -1050,8 +1050,8 @@ fn requirePrefixList(ctx: *ExpandContext, items: []const *Form) ExpandError!void
         if (prefixList(suffix) != null) return ctx.fail(suffix.origin, "require: a prefix list cannot hold another", .{});
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "require: the namespace must be an unqualified symbol, not {s}", .{describeForm(name_form)});
         const name = name_form.datum.symbol.name;
-        if (std.mem.indexOfScalar(u8, name, '.') != null) return ctx.fail(name_form.origin, "require: {s} is under the prefix {s}, so it cannot contain a period", .{ name, prefix.datum.symbol.name });
-        const full = try makeSymbol(ctx, try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ prefix.datum.symbol.name, name }), name_form.origin);
+        if (std.mem.findScalar(u8, name, '.') != null) return ctx.fail(name_form.origin, "require: {s} is under the prefix {s}, so it cannot contain a period", .{ name, prefix.datum.symbol.name });
+        const full = try makeSymbol(ctx, try ctx.allocator.print("{s}.{s}", .{ prefix.datum.symbol.name, name }), name_form.origin);
         if (suffix.datum == .symbol) {
             try requireSpec(ctx, full);
         } else {
@@ -1222,7 +1222,7 @@ fn callUserMacro(
 fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]const u8 {
     switch (thrown.kind()) {
         .string => return string_mod.asBytes(thrown),
-        .keyword => return std.fmt.allocPrint(ctx.allocator, ":{s}", .{ctx.interner.keywordName(thrown.asKeywordId())}),
+        .keyword => return ctx.allocator.print(":{s}", .{ctx.interner.keywordName(thrown.asKeywordId())}),
         .persistent_map => for ([_][]const u8{ "message", "error" }) |key_name| {
             const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
             switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
@@ -1232,7 +1232,7 @@ fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]co
         },
         else => {},
     }
-    return std.fmt.allocPrint(ctx.allocator, "a {s}", .{@tagName(thrown.kind())});
+    return ctx.allocator.print("a {s}", .{@tagName(thrown.kind())});
 }
 
 /// A form as the data a macro receives (MACROEXPAND.md §1.2): each
@@ -1370,7 +1370,7 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         else => false,
     };
     if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
-        const meta_v = if (m.kind == @intFromEnum(value_mod.Kind.sorted_map)) heap_mod.Heap.valueFromHeader(.sorted_map, m) else champ_mod.valueFromMapHeader(m);
+        const meta_v = if (m.kind == @backingInt(value_mod.Kind.sorted_map)) heap_mod.Heap.valueFromHeader(.sorted_map, m) else champ_mod.valueFromMapHeader(m);
         const meta = try valueToForm(ctx, meta_v, origin);
         return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
     };
@@ -1499,7 +1499,7 @@ const Builder = struct {
     fn named(b: Builder, text: []const u8) ExpandError!*Form {
         const is_kw = text.len > 1 and text[0] == ':';
         const body = if (is_kw) text[1..] else text;
-        const slash = if (body.len > 1) std.mem.indexOfScalar(u8, body, '/') else null;
+        const slash = if (body.len > 1) std.mem.findScalar(u8, body, '/') else null;
         const name: reader_mod.Name = if (slash) |at| .{ .ns = body[0..at], .name = body[at + 1 ..] } else .{ .ns = null, .name = body };
         return makeForm(b.ctx, if (is_kw) .{ .keyword = name } else .{ .symbol = name }, b.origin);
     }
@@ -2276,17 +2276,17 @@ pub const RecordNames = struct {
     pred: []u8,
 
     pub fn typeId(allocator: std.mem.Allocator, rec_name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}-type-id", .{rec_name});
+        return allocator.print("{s}-type-id", .{rec_name});
     }
 
     pub fn init(allocator: std.mem.Allocator, rec_name: []const u8) !RecordNames {
         const type_id = try typeId(allocator, rec_name);
         errdefer allocator.free(type_id);
-        const ctor = try std.fmt.allocPrint(allocator, "->{s}", .{rec_name});
+        const ctor = try allocator.print("->{s}", .{rec_name});
         errdefer allocator.free(ctor);
-        const map_ctor = try std.fmt.allocPrint(allocator, "map->{s}", .{rec_name});
+        const map_ctor = try allocator.print("map->{s}", .{rec_name});
         errdefer allocator.free(map_ctor);
-        const pred = try std.fmt.allocPrint(allocator, "{s}?", .{rec_name});
+        const pred = try allocator.print("{s}?", .{rec_name});
         return .{ .type_id = type_id, .ctor = ctor, .map_ctor = map_ctor, .pred = pred };
     }
 
@@ -2309,7 +2309,7 @@ fn plainName(ctx: *ExpandContext, form: *const Form, comptime what: []const u8) 
 /// form: the registry key of a record type or protocol.
 fn qualifiedNameString(b: Builder, name: []const u8) ExpandError!*Form {
     const ns_name: []const u8 = if (b.ctx.namespace) |ns| ns.name else "";
-    return makeForm(b.ctx, .{ .string = try std.fmt.allocPrint(b.ctx.allocator, "{s}/{s}", .{ ns_name, name }) }, b.origin);
+    return makeForm(b.ctx, .{ .string = try b.ctx.allocator.print("{s}/{s}", .{ ns_name, name }) }, b.origin);
 }
 
 fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
@@ -2346,7 +2346,7 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     // `ns.Name` that `type` returns, so `(instance? P x)` reads as in
     // Clojure; the form's value is that type.
     const ns_name: []const u8 = if (ctx.namespace) |ns| ns.name else "user";
-    const type_sym = try b.item(try std.fmt.allocPrint(ctx.allocator, "{s}.{s}", .{ ns_name, rec_name }));
+    const type_sym = try b.item(try ctx.allocator.print("{s}.{s}", .{ ns_name, rec_name }));
     try out.append(ctx.allocator, try b.list(.{ "def", try b.item(rec_name), try b.list(.{ "quote", type_sym }) }));
     try out.append(ctx.allocator, try b.item(rec_name));
     return makeList(ctx, out.items, b.origin);

@@ -12,6 +12,7 @@
 
 pub const stack = @import("stack.zig");
 pub const bench = @import("bench.zig");
+pub const xxhash3 = @import("xxhash3.zig");
 pub const hash = @import("hash.zig");
 pub const value = @import("value.zig");
 pub const heap = @import("heap.zig");

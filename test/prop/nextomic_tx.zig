@@ -102,7 +102,7 @@ const Model = struct {
     alive: std.ArrayList(u64) = .empty,
 
     fn factKey(self: *Model, e: u64, a: u32, vb: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.arena, "{d}|{d}|{x}", .{ e, a, vb });
+        return self.arena.print("{d}|{d}|{x}", .{ e, a, vb });
     }
 
     fn many(self: *Model, a: u32) bool {
@@ -221,7 +221,7 @@ const Model = struct {
         }
         var out: std.StringHashMapUnmanaged(void) = .empty;
         var it = cur.iterator();
-        while (it.next()) |e| try out.put(arena, try std.fmt.allocPrint(arena, "{s}|{d}", .{ e.key_ptr.*, e.value_ptr.* }), {});
+        while (it.next()) |e| try out.put(arena, try arena.print("{s}|{d}", .{ e.key_ptr.*, e.value_ptr.* }), {});
         return out;
     }
 
@@ -229,7 +229,7 @@ const Model = struct {
         var out: std.StringHashMapUnmanaged(u32) = .empty;
         for (self.log.items) |r| {
             if (r.t > upto) continue;
-            const k = try std.fmt.allocPrint(arena, "{d}|{d}|{x}|{d}|{}", .{ r.e, r.a, r.vb, r.t, r.added });
+            const k = try arena.print("{d}|{d}|{x}|{d}|{}", .{ r.e, r.a, r.vb, r.t, r.added });
             const g = try out.getOrPut(arena, k);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += 1;
@@ -291,7 +291,7 @@ const Gen = struct {
 
     fn freshEmail(self: *Gen) ![]const u8 {
         self.next_email += 1;
-        return std.fmt.allocPrint(self.arena, "u{d}@x", .{self.next_email});
+        return self.arena.print("u{d}@x", .{self.next_email});
     }
 
     fn bio(self: *Gen) ![]const u8 {
@@ -324,7 +324,7 @@ const Gen = struct {
                 0, 1 => {
                     // New entity by tempid.
                     tx.new_count += 1;
-                    const tmp = try std.fmt.allocPrint(self.arena, "n{d}", .{tx.new_count});
+                    const tmp = try self.arena.print("n{d}", .{tx.new_count});
                     const e: transact.Entity = .{ .tempid = .{ .string = tmp } };
                     try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.email }, .v = .{ .val = .{ .string = try self.freshEmail() } } } });
                     try tx.ops.append(self.arena, .{ .add = .{ .e = e, .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.age() } } } });
@@ -342,10 +342,10 @@ const Gen = struct {
                     const em = email orelse continue;
                     try tx.touched.put(self.arena, e, {});
                     tx.new_count += 1;
-                    const tmp = try std.fmt.allocPrint(self.arena, "u{d}", .{tx.new_count});
+                    const tmp = try self.arena.print("u{d}", .{tx.new_count});
                     const t: transact.Entity = .{ .tempid = .{ .string = tmp } };
                     try tx.ops.append(self.arena, .{ .add = .{ .e = t, .a = .{ .id = a.email }, .v = .{ .val = .{ .string = em } } } });
-                    try tx.ops.append(self.arena, .{ .add = .{ .e = t, .a = .{ .id = a.name }, .v = .{ .val = .{ .string = try std.fmt.allocPrint(self.arena, "name{d}", .{self.rand.uintLessThan(u8, 3)}) } } } });
+                    try tx.ops.append(self.arena, .{ .add = .{ .e = t, .a = .{ .id = a.name }, .v = .{ .val = .{ .string = try self.arena.print("name{d}", .{self.rand.uintLessThan(u8, 3)}) } } } });
                 },
                 3, 4 => {
                     // Card-one overwrite (or no-op).
@@ -358,7 +358,7 @@ const Gen = struct {
                     } else if (which == 1) {
                         try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.bio }, .v = .{ .val = .{ .string = try self.bio() } } } });
                     } else {
-                        try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.name }, .v = .{ .val = .{ .string = try std.fmt.allocPrint(self.arena, "name{d}", .{self.rand.uintLessThan(u8, 3)}) } } } });
+                        try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.name }, .v = .{ .val = .{ .string = try self.arena.print("name{d}", .{self.rand.uintLessThan(u8, 3)}) } } } });
                     }
                 },
                 5 => {
@@ -395,7 +395,7 @@ const Gen = struct {
                     if (tx.touched.contains(e)) continue;
                     try tx.touched.put(self.arena, e, {});
                     tx.new_count += 1;
-                    const tmp = try std.fmt.allocPrint(self.arena, "h{d}", .{tx.new_count});
+                    const tmp = try self.arena.print("h{d}", .{tx.new_count});
                     try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.home }, .v = .{ .entity = .{ .tempid = .{ .string = tmp } } } } });
                     try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .tempid = .{ .string = tmp } }, .a = .{ .id = a.city }, .v = .{ .val = .{ .string = if (self.rand.boolean()) "Oslo" else "Rome" } } } });
                 },
@@ -436,13 +436,13 @@ const Gen = struct {
         }
         // Compare with the report as sets of e|a|vb|added.
         var want: std.StringHashMapUnmanaged(void) = .empty;
-        for (p.rows.items) |r| try want.put(self.arena, try std.fmt.allocPrint(self.arena, "{d}|{d}|{x}|{}", .{ r.e, r.a, r.vb, r.added }), {});
+        for (p.rows.items) |r| try want.put(self.arena, try self.arena.print("{d}|{d}|{x}|{}", .{ r.e, r.a, r.vb, r.added }), {});
         var got: std.StringHashMapUnmanaged(void) = .empty;
         for (report.tx_data) |d| {
             if (d.a == boot.tx_instant) continue;
             try testing.expectEqual(report.t, d.t);
             const vb = try key.valBytes(self.arena, d.v);
-            try got.put(self.arena, try std.fmt.allocPrint(self.arena, "{d}|{d}|{x}|{}", .{ d.e, d.a, vb, d.added }), {});
+            try got.put(self.arena, try self.arena.print("{d}|{d}|{x}|{}", .{ d.e, d.a, vb, d.added }), {});
         }
         try expectSameKeys(void, "the replayed model", &want, &got);
         try p.commit();
@@ -517,9 +517,9 @@ fn viewSet(arena: Allocator, db: db_mod.DbValue, index: key.Index, comps: key.Co
         if (!isUser(d.e)) continue;
         const vb = try key.valBytes(arena, d.v);
         const k = if (with_added)
-            try std.fmt.allocPrint(arena, "{d}|{d}|{x}|{d}|{}", .{ d.e, d.a, vb, d.t, d.added })
+            try arena.print("{d}|{d}|{x}|{d}|{}", .{ d.e, d.a, vb, d.t, d.added })
         else
-            try std.fmt.allocPrint(arena, "{d}|{d}|{x}|{d}", .{ d.e, d.a, vb, d.t });
+            try arena.print("{d}|{d}|{x}|{d}", .{ d.e, d.a, vb, d.t });
         const g = try out.getOrPut(arena, k);
         if (!g.found_existing) g.value_ptr.* = 0;
         g.value_ptr.* += 1;
@@ -547,7 +547,7 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
         var want_set = try model.replay(arena, null, t);
         var want = try toCounted(arena, &want_set);
         var got = try viewSet(arena, view, .eavt, .{}, false);
-        const where = try std.fmt.allocPrint(arena, "as-of {d}", .{t});
+        const where = try arena.print("as-of {d}", .{t});
         try expectSameKeys(u32, where, &want, &got);
         var got_aevt = try viewSet(arena, view, .aevt, .{}, false);
         try expectSameKeys(u32, where, &want, &got_aevt);
@@ -573,12 +573,12 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
         var want_since_set = try model.replay(arena, after, t);
         var want_since = try toCounted(arena, &want_since_set);
         var got_since = try viewSet(arena, view.sinceT(after), .eavt, .{}, false);
-        try expectSameKeys(u32, try std.fmt.allocPrint(arena, "since {d} as-of {d}", .{ after, t }), &want_since, &got_since);
+        try expectSameKeys(u32, try arena.print("since {d} as-of {d}", .{ after, t }), &want_since, &got_since);
 
         // history: every row up to t, with its flag.
         var want_hist = try model.historyRows(arena, t);
         var got_hist = try viewSet(arena, view.withHistory(), .eavt, .{}, true);
-        try expectSameKeys(u32, try std.fmt.allocPrint(arena, "history as-of {d}", .{t}), &want_hist, &got_hist);
+        try expectSameKeys(u32, try arena.print("history as-of {d}", .{t}), &want_hist, &got_hist);
     }
     // The plain db equals as-of its basis; the current-tree fast path
     // and the fold agree.
@@ -764,7 +764,7 @@ test "T2 a failed transaction leaves the ident and schema caches as a fresh conn
                 // and a second rename in the same transaction may name it too.
                 0, 1 => try ops.append(arena, .{ .add = .{ .e = .{ .eid = a }, .a = .{ .id = boot.ident }, .v = .{ .keyword = name } } }),
                 // A new attribute under a pool name.
-                2 => try ops.appendSlice(arena, try attrOps(arena, tc, try std.fmt.allocPrint(arena, "t{d}", .{i}), ident_pool[rand.uintLessThan(usize, ident_pool.len)], if (rand.boolean()) boot.type_keyword else boot.type_long, false, false, false)),
+                2 => try ops.appendSlice(arena, try attrOps(arena, tc, try arena.print("t{d}", .{i}), ident_pool[rand.uintLessThan(usize, ident_pool.len)], if (rand.boolean()) boot.type_keyword else boot.type_long, false, false, false)),
                 // Name an attribute by a pool keyword, as an entity and
                 // as an attribute, with a keyword value from the pool.
                 3 => try ops.append(arena, .{ .add = .{ .e = .{ .ident = name }, .a = .{ .id = boot.doc }, .v = .{ .val = .{ .string = "d" } } } }),
@@ -808,8 +808,8 @@ fn outcome(arena: Allocator, tc: *db_mod.TestConn, ops: []const Op) ![]const u8 
     for (r.tx_data) |d| {
         if (d.a == boot.tx_instant) continue;
         const e = try spell(arena, r, d.e);
-        const v = if (d.v == .ref) try spell(arena, r, d.v.ref) else try std.fmt.allocPrint(arena, "{x}", .{try key.valBytes(arena, d.v)});
-        try rows.append(arena, try std.fmt.allocPrint(arena, "{s}|{d}|{s}|{}", .{ e, d.a, v, d.added }));
+        const v = if (d.v == .ref) try spell(arena, r, d.v.ref) else try arena.print("{x}", .{try key.valBytes(arena, d.v)});
+        try rows.append(arena, try arena.print("{s}|{d}|{s}|{}", .{ e, d.a, v, d.added }));
     }
     std.mem.sort([]const u8, rows.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -820,8 +820,8 @@ fn outcome(arena: Allocator, tc: *db_mod.TestConn, ops: []const Op) ![]const u8 
 }
 
 fn spell(arena: Allocator, r: transact.Report, e: u64) ![]const u8 {
-    for (r.tempids) |b| if (b.eid == e) return std.fmt.allocPrint(arena, "tmp:{s}", .{b.key.string});
-    return std.fmt.allocPrint(arena, "{d}", .{e});
+    for (r.tempids) |b| if (b.eid == e) return arena.print("tmp:{s}", .{b.key.string});
+    return arena.print("{d}", .{e});
 }
 
 test "T3 a permutation of tx-data gives the same report or fails alike" {
@@ -884,8 +884,8 @@ test "T3 a permutation of tx-data gives the same report or fails alike" {
             const shuffled = try arena.dupe(Op, ops.items);
             rand.shuffle(Op, shuffled);
             const got = try outcome(arena, tc, shuffled);
-            const failure = std.mem.indexOfScalar(u8, want, '|') == null and want.len > 0 and std.ascii.isUpper(want[0]);
-            const got_failure = std.mem.indexOfScalar(u8, got, '|') == null and got.len > 0 and std.ascii.isUpper(got[0]);
+            const failure = std.mem.findScalar(u8, want, '|') == null and want.len > 0 and std.ascii.isUpper(want[0]);
+            const got_failure = std.mem.findScalar(u8, got, '|') == null and got.len > 0 and std.ascii.isUpper(got[0]);
             // Two independent faults may surface in either order; the
             // outcome is still a failure both ways.
             if (failure and got_failure) continue;
@@ -912,7 +912,7 @@ fn attrSet(arena: Allocator, view: db_mod.DbValue, index: key.Index, a: u32) !st
     const comps: key.Components = if (index == .eavt) .{} else .{ .a = a };
     for (try view.datoms(arena, index, comps)) |d| {
         if (d.a != a) continue;
-        const k = try std.fmt.allocPrint(arena, "{d}|{x}|{d}|{}", .{ d.e, try key.valBytes(arena, d.v), d.t, d.added });
+        const k = try arena.print("{d}|{x}|{d}|{}", .{ d.e, try key.valBytes(arena, d.v), d.t, d.added });
         const g = try out.getOrPut(arena, k);
         if (!g.found_existing) g.value_ptr.* = 0;
         g.value_ptr.* += 1;
@@ -930,7 +930,7 @@ test "T4 an attribute indexed late holds its whole history in AVET" {
     const tc = try db_mod.TestConn.init("prop_tx_late_index");
     defer tc.deinit();
     const attrs = try installSchema(arena, tc);
-    const long_text = "a value past the inline limit, so its AVET rows carry a hash and its EAVT rows the payload: " ++ "x" ** 40;
+    const long_text = "a value past the inline limit, so its AVET rows carry a hash and its EAVT rows the payload: " ++ &@as([40]u8, @splat('x'));
     var es: [6]u64 = undefined;
     for (&es, 0..) |*e, i| {
         const r = try transact.transactOps(tc.conn, arena, &.{
@@ -976,7 +976,7 @@ test "T4 an attribute indexed late holds its whole history in AVET" {
             const view = db.asOf(t);
             var want_t = try attrSet(arena, view, .aevt, a);
             var got_t = try attrSet(arena, view, .avet, a);
-            try expectSameKeys(u32, try std.fmt.allocPrint(arena, "AVET as-of {d}", .{t}), &want_t, &got_t);
+            try expectSameKeys(u32, try arena.print("AVET as-of {d}", .{t}), &want_t, &got_t);
         }
     }
 }

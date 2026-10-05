@@ -81,15 +81,15 @@ pub const Attr = struct {
             const v = if (ev.added) ev.value else 0;
             switch (ev.field) {
                 .value_type => if (ev.added) {
-                    out.value_type = @enumFromInt(ev.value);
+                    out.value_type = @fromBackingInt(@intCast(ev.value));
                     out.since = ev.t;
                     typed = true;
                 },
-                .cardinality => if (ev.added or @intFromEnum(out.cardinality) == ev.value) {
-                    out.cardinality = @enumFromInt(v);
+                .cardinality => if (ev.added or @backingInt(out.cardinality) == ev.value) {
+                    out.cardinality = @fromBackingInt(@intCast(v));
                 },
-                .unique => if (ev.added or @intFromEnum(out.unique) == ev.value) {
-                    out.unique = @enumFromInt(v);
+                .unique => if (ev.added or @backingInt(out.unique) == ev.value) {
+                    out.unique = @fromBackingInt(@intCast(v));
                 },
                 .index => if (ev.added or @intFromBool(out.indexed) == ev.value) {
                     out.indexed = v == 1;
@@ -167,15 +167,15 @@ pub const Schema = struct {
         if (kv != .val) return error.Corrupted;
         const v = kv.val;
         const value: u8 = switch (field) {
-            .value_type => if (v == .keyword) @intFromEnum(boot.valueTypeOf(v.keyword) orelse return error.Corrupted) else return error.Corrupted,
+            .value_type => if (v == .keyword) @backingInt(boot.valueTypeOf(v.keyword) orelse return error.Corrupted) else return error.Corrupted,
             .cardinality => if (v == .keyword) switch (v.keyword) {
-                boot.card_one => @intFromEnum(Cardinality.one),
-                boot.card_many => @intFromEnum(Cardinality.many),
+                boot.card_one => @backingInt(Cardinality.one),
+                boot.card_many => @backingInt(Cardinality.many),
                 else => return error.Corrupted,
             } else return error.Corrupted,
             .unique => if (v == .keyword) switch (v.keyword) {
-                boot.unique_identity => @intFromEnum(Unique.identity),
-                boot.unique_value => @intFromEnum(Unique.value),
+                boot.unique_identity => @backingInt(Unique.identity),
+                boot.unique_value => @backingInt(Unique.value),
                 else => return error.Corrupted,
             } else return error.Corrupted,
             .index, .component, .fulltext => if (v == .boolean) @intFromBool(v.boolean) else return error.Corrupted,

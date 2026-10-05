@@ -102,7 +102,7 @@ pub const HeapHeader = extern struct {
     /// writes that desync the two will trip here rather than silently
     /// corrupt downstream behavior.
     pub inline fn getMeta(self: *const HeapHeader) ?*HeapHeader {
-        if (std.debug.runtime_safety) {
+        if (builtin.optimize.runtimeSafety()) {
             std.debug.assert(self.hasMeta() == (self.meta != null));
         }
         return self.meta;
@@ -456,7 +456,7 @@ pub const Heap = struct {
         std.debug.assert(kind.isHeap() or kind == .cell_internal);
         const total = try std.math.add(usize, @sizeOf(HeapHeader), body_size);
         const h = if (total <= max_small_block) try self.allocSmall(total) else try self.allocLarge(body_size);
-        h.kind = @intFromEnum(kind);
+        h.kind = @backingInt(kind);
         return h;
     }
 
@@ -553,7 +553,7 @@ pub const Heap = struct {
     }
 
     pub fn free(self: *Heap, h: *HeapHeader) void {
-        if (std.debug.runtime_safety and h.kind == poisoned_kind) {
+        if (builtin.optimize.runtimeSafety() and h.kind == poisoned_kind) {
             std.debug.panic("heap.free: double-free detected on *HeapHeader {*}", .{h});
         }
         if (isLarge(h)) {
@@ -632,7 +632,7 @@ pub const Heap = struct {
     pub fn valueFromHeader(kind: value.Kind, h: *HeapHeader) value.Value {
         std.debug.assert(kind.isHeap());
         return .{
-            .tag = @as(u64, @intFromEnum(kind)),
+            .tag = @as(u64, @backingInt(kind)),
             .payload = @intFromPtr(h),
         };
     }
@@ -815,7 +815,7 @@ test "alloc: returns 16-byte-aligned *HeapHeader; header zero-init except kind" 
     const addr = @intFromPtr(h);
     try testing.expectEqual(@as(usize, 0), addr % 16);
 
-    try testing.expectEqual(@as(u16, @intFromEnum(value.Kind.string)), h.kind);
+    try testing.expectEqual(@as(u16, @backingInt(value.Kind.string)), h.kind);
     try testing.expectEqual(@as(u8, 0), h.mark);
     try testing.expectEqual(@as(u8, 0), h.flags);
     try testing.expectEqual(@as(u32, 0), h.hash);

@@ -106,8 +106,8 @@ pub const Builtin = enum {
     }
 
     pub fn fromName(s: []const u8) ?Builtin {
-        inline for (@typeInfo(Builtin).@"enum".fields) |f| {
-            const b: Builtin = @enumFromInt(f.value);
+        inline for (@typeInfo(Builtin).@"enum".field_values) |tag_value| {
+            const b: Builtin = @fromBackingInt(@intCast(tag_value));
             if (std.mem.eql(u8, s, b.name())) return b;
         }
         if (std.mem.eql(u8, s, "!=")) return .ne;
@@ -216,8 +216,8 @@ pub const AggOp = enum {
     }
 
     pub fn fromName(s: []const u8) ?AggOp {
-        inline for (@typeInfo(AggOp).@"enum".fields) |f| {
-            const op: AggOp = @enumFromInt(f.value);
+        inline for (@typeInfo(AggOp).@"enum".field_values) |tag_value| {
+            const op: AggOp = @fromBackingInt(@intCast(tag_value));
             if (op != .custom and std.mem.eql(u8, s, op.name())) return op;
         }
         return null;

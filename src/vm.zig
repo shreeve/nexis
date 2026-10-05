@@ -307,8 +307,8 @@ pub const Inst = packed struct(u64) {
     pub fn primary(g: Group, v: anytype, a: Operand, b: Operand, c: Operand) Inst {
         return .{
             .kind = .primary,
-            .group = @intFromEnum(g),
-            .variant = @intCast(@intFromEnum(v)),
+            .group = @backingInt(g),
+            .variant = @intCast(@backingInt(v)),
             .a = a,
             .b = b,
             .c = c,
@@ -335,7 +335,7 @@ pub const Inst = packed struct(u64) {
     }
 
     pub fn groupOf(self: Inst) Group {
-        return @enumFromInt(self.group);
+        return @fromBackingInt(@intCast(self.group));
     }
 };
 
@@ -1077,15 +1077,15 @@ pub const DispatchKey = struct {
 
     pub fn ofValue(v: value_mod.Value) DispatchKey {
         if (v.kind() == .record) return .{ .tag = .record, .id = record_mod.typeId(v) };
-        return canonical(.{ .tag = .builtin, .id = @intFromEnum(v.kind()) });
+        return canonical(.{ .tag = .builtin, .id = @backingInt(v.kind()) });
     }
 
     /// The integer tower is one type (SEMANTICS §2.2): a bignum
     /// dispatches on the fixnum's key, so an impl for either integer
     /// kind covers every integer whatever its representation.
     pub fn canonical(key: DispatchKey) DispatchKey {
-        if (key.tag == .builtin and key.id == @intFromEnum(value_mod.Kind.bignum)) {
-            return .{ .tag = .builtin, .id = @intFromEnum(value_mod.Kind.fixnum) };
+        if (key.tag == .builtin and key.id == @backingInt(value_mod.Kind.bignum)) {
+            return .{ .tag = .builtin, .id = @backingInt(value_mod.Kind.fixnum) };
         }
         return key;
     }
@@ -1596,7 +1596,7 @@ pub const VM = struct {
     nextomic_query_state: ?*anyopaque = null,
     nextomic_query_close: ?*const fn (*anyopaque) void = null,
     nextomic_query_mark: ?*const fn (*anyopaque, *gc_mod.Collector) void = null,
-    /// Zig 0.16 `std.Io` handle for the natives that reach the
+    /// The `std.Io` handle for the natives that reach the
     /// outside world: printing, `slurp`/`spit`, reading stdin, and
     /// opening a store (which creates the path's parent
     /// directories; emdb does not). Set by the CLI's `Runtime.init`
@@ -1880,7 +1880,7 @@ pub const VM = struct {
     /// `err`, with `error_detail` set to the formatted sentence (cut
     /// to nothing if it does not fit the buffer).
     fn fail(self: *VM, err: VmError, comptime fmt: []const u8, args: anytype) VmError {
-        self.error_detail = std.fmt.bufPrint(&self.detail_buf, fmt, args) catch blk: {
+        self.error_detail = std.mem.print(&self.detail_buf, fmt, args) catch blk: {
             // Too long for the buffer: keep what fits, cut at a
             // character boundary, and mark the cut.
             var w: std.Io.Writer = .fixed(&self.detail_buf);
@@ -1999,7 +1999,7 @@ pub const VM = struct {
     /// Trace a closure (its cells and its routine's constants) or a
     /// cell (its value); the collector has marked `h` already.
     fn gcTrace(_: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
-        const k: value_mod.Kind = @enumFromInt(h.kind);
+        const k: value_mod.Kind = @fromBackingInt(@intCast(h.kind));
         switch (k) {
             .function => {
                 const closure = heap_mod.Heap.bodyOf(Closure, h);
@@ -2563,7 +2563,7 @@ pub const VM = struct {
     /// are immortal arena objects the collector never sweeps.
     pub fn varToValue(v: *Var) Value {
         return Value{
-            .tag = @as(u64, @intFromEnum(value_mod.Kind.var_)),
+            .tag = @as(u64, @backingInt(value_mod.Kind.var_)),
             .payload = @intFromPtr(v),
         };
     }
@@ -2582,7 +2582,7 @@ pub const VM = struct {
         const h = try self.ensureHeap().alloc(.cell_internal, @sizeOf(UpvalCell));
         heap_mod.Heap.bodyOf(UpvalCell, h).* = .{ .value = initial, .initialized = initialized };
         return Value{
-            .tag = @as(u64, @intFromEnum(value_mod.Kind.cell_internal)),
+            .tag = @as(u64, @backingInt(value_mod.Kind.cell_internal)),
             .payload = @intFromPtr(h),
         };
     }
@@ -2860,7 +2860,7 @@ pub const VM = struct {
         while (i > lowest and n < out.len) {
             i -= 1;
             if (elided > 0 and i == frames.len - 1 - trace_innermost) {
-                const name = std.fmt.bufPrint(gap, "<{d} frames elided>", .{elided}) catch unreachable;
+                const name = std.mem.print(gap, "<{d} frames elided>", .{elided}) catch unreachable;
                 out[n] = .{ .name = name, .pc = 0, .span = null, .source = null };
                 n += 1;
                 i -= elided - 1;
@@ -2999,7 +2999,7 @@ pub const VM = struct {
     }
 
     fn opcode(g: Group, variant: anytype) u12 {
-        return @as(u12, @intFromEnum(g)) | @as(u12, @intFromEnum(variant)) << 6;
+        return @as(u12, @backingInt(g)) | @as(u12, @backingInt(variant)) << 6;
     }
 
     /// The handler of every opcode: its group's, which switches on
@@ -3008,7 +3008,7 @@ pub const VM = struct {
     /// variant trap.
     const op_table: [4096]OpHandler = blk: {
         @setEvalBranchQuota(20_000);
-        var t = [_]OpHandler{&opCorrupt} ** 4096;
+        var t: [4096]OpHandler = @splat(&opCorrupt);
         // A group's handler takes the variants without one of their
         // own: every variant of `jump` and `cmp` has one, so theirs
         // are corrupt; `mov` and `call` trap theirs (§10).
@@ -3029,7 +3029,7 @@ pub const VM = struct {
             .{ Group.simd, &opUnimplemented },
         };
         for (groups) |g| {
-            for (0..64) |v| t[@as(u12, @intFromEnum(g[0])) | @as(u12, v) << 6] = g[1];
+            for (0..64) |v| t[@as(u12, @backingInt(g[0])) | @as(u12, v) << 6] = g[1];
         }
         t[opcode(.mov, Mov.move)] = &opMove;
         t[opcode(.mov, Mov.load_const)] = &opLoadConst;
@@ -3462,7 +3462,7 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
 
     fn execClosure(self: *VM, inst: Inst) VmError!void {
-        const variant: Closure_ = @enumFromInt(inst.variant);
+        const variant: Closure_ = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
             .make => try self.execClosureMake(inst),
             .box_local => try self.execClosureBoxLocal(inst),
@@ -3642,7 +3642,7 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
 
     fn execMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const variant: Math = @enumFromInt(inst.variant);
+        const variant: Math = @fromBackingInt(@intCast(inst.variant));
         // Resolve every source operand BEFORE storing so that
         // dst/src aliasing (e.g., math:add s0, s0, c0) is correct.
         const lhs = try self.resolveIn(frame, inst.b);
@@ -3707,7 +3707,7 @@ pub const VM = struct {
     // -------------------------------------------------------------------------
 
     fn execVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const variant: VarOp = @enumFromInt(inst.variant);
+        const variant: VarOp = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
             .load_var => try self.execVarLoadVar(frame, inst),
             .store_var => try self.execVarStoreVar(frame, inst),
@@ -3775,7 +3775,7 @@ pub const VM = struct {
     /// `Heap.alloc` never touches `vm.stack`, so the slice outlives
     /// every allocation here.
     fn execColl(self: *VM, inst: Inst) VmError!void {
-        const variant: CollOp = @enumFromInt(inst.variant);
+        const variant: CollOp = @fromBackingInt(@intCast(inst.variant));
         if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
         const frame = self.currentFrame();
         const argc: usize = inst.b.index;
@@ -3851,7 +3851,7 @@ pub const VM = struct {
     // are catchable; non-recoverable errors bubble out of `run`.
 
     fn execCtrl(self: *VM, inst: Inst) VmError!void {
-        const variant: CtrlOp = @enumFromInt(inst.variant);
+        const variant: CtrlOp = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
             .try_enter => try self.execCtrlTryEnter(inst),
             .try_exit => try self.execCtrlTryExit(inst),
@@ -4281,8 +4281,9 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .error_ => "an error",
         .atom => "an atom",
         else => {
-            inline for (@typeInfo(value_mod.Kind).@"enum".fields) |f| {
-                if (@intFromEnum(k) == f.value) return "a " ++ f.name;
+            const info = @typeInfo(value_mod.Kind).@"enum";
+            inline for (info.field_names, info.field_values) |name, value| {
+                if (@backingInt(k) == value) return "a " ++ name;
             }
             return "a value";
         },
@@ -4544,7 +4545,7 @@ pub const NumCmp = enum(u6) { lt, lte, gt, gte, eq };
 
 comptime {
     for (std.meta.tags(NumCmp)) |tag| {
-        const op: Cmp = @enumFromInt(@intFromEnum(tag));
+        const op: Cmp = @fromBackingInt(@intCast(@backingInt(tag)));
         std.debug.assert(std.mem.startsWith(u8, @tagName(op), @tagName(tag)));
     }
 }
@@ -4977,6 +4978,17 @@ pub const asm_ = struct {
 
 const testing = std.testing;
 
+/// `s` repeated `n` times, for building long test strings.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(2 * n + 1000);
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        break :blk &final;
+    };
+}
+
 test "Inst size: exactly 64 bits packed" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Inst));
     try testing.expectEqual(@as(usize, 2), @sizeOf(Operand));
@@ -5104,7 +5116,7 @@ const sl = Operand.slot;
 const kn = Operand.constant;
 
 fn raw(g: Group, variant: u6, a: Operand, b: Operand, c: Operand) Inst {
-    return .{ .kind = .primary, .group = @intFromEnum(g), .variant = variant, .a = a, .b = b, .c = c };
+    return .{ .kind = .primary, .group = @backingInt(g), .variant = variant, .a = a, .b = b, .c = c };
 }
 
 test "VM opcodes: mov, return and operand resolution" {
@@ -5118,14 +5130,14 @@ test "VM opcodes: mov, return and operand resolution" {
         .{ .name = "return-nil reads no slot", .code = &.{asm_.returnNil()}, .slots = 0, .want = .{ .value = nil_v } },
         .{ .name = "slot out of range", .code = &.{asm_.returnSlot(5)}, .want = .{ .err = VmError.OperandOutOfRange } },
         .{ .name = "constant out of range", .code = &.{ asm_.loadConst(0, 9), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
-        .{ .name = "resolve of an unused operand", .code = &.{ raw(.mov, @intFromEnum(Mov.move), sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "resolve of an unused operand", .code = &.{ raw(.mov, @backingInt(Mov.move), sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.InvalidOperandKind } },
         .{ .name = "no return: bytecode exhausted", .code = &.{asm_.loadNil(0)}, .want = .{ .err = VmError.BytecodeExhausted } },
         .{ .name = "known group with no variants", .code = &.{ raw(.transient, 0, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
         .{ .name = "unrecognized group 60", .code = &.{ .{ .kind = .primary, .group = 60, .variant = 0, .a = Operand.none, .b = Operand.none, .c = Operand.none }, asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "call:call on a fixnum", .code = &.{ asm_.loadConst(0, 0), asm_.callCall(0, 0, 1), asm_.returnSlot(1) }, .consts = &.{fx(42)}, .slots = 2, .want = .{ .err = VmError.NotCallable } },
         // The index is 32 bits: its high half is not ignored.
         .{ .name = "constant index past 65,535", .code = &.{ asm_.loadConst(0, 0x1_0000), asm_.returnSlot(0) }, .consts = &.{fx(1)}, .want = .{ .err = VmError.OperandOutOfRange } },
-        .{ .name = "an instruction of an unassigned kind", .code = &.{ .{ .kind = @enumFromInt(1), .group = 0, .variant = 0, .a = Operand.none, .b = Operand.none, .c = Operand.none }, asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "an instruction of an unassigned kind", .code = &.{ .{ .kind = @fromBackingInt(@intCast(1)), .group = 0, .variant = 0, .a = Operand.none, .b = Operand.none, .c = Operand.none }, asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
     });
 }
 
@@ -5191,14 +5203,14 @@ test "VM opcodes: math and cmp" {
         .{ .name = "dst aliases lhs", .code = &.{ asm_.loadConst(0, 0), add(0, sl(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(40) }, .want = .{ .value = fx(41) } },
         .{ .name = "dst aliases rhs", .code = &.{ asm_.loadConst(0, 1), add(0, kn(0), sl(0)), asm_.returnSlot(0) }, .consts = &.{ fx(40), fx(1) }, .want = .{ .value = fx(41) } },
         .{ .name = "slot+const and const+slot", .code = &.{ asm_.loadConst(0, 0), add(1, sl(0), kn(0)), add(2, kn(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{fx(100)}, .slots = 3, .want = .{ .value = fx(300) } },
-        .{ .name = "a constant destination", .code = &.{ raw(.math, @intFromEnum(Math.add), kn(0), kn(0), kn(1)), asm_.returnNil() }, .consts = &.{ fx(1), fx(2) }, .want = .{ .err = VmError.InvalidOperandKind } },
-        .{ .name = "math:pow is reserved", .code = &.{ raw(.math, @intFromEnum(Math.pow), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "a constant destination", .code = &.{ raw(.math, @backingInt(Math.add), kn(0), kn(0), kn(1)), asm_.returnNil() }, .consts = &.{ fx(1), fx(2) }, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "math:pow is reserved", .code = &.{ raw(.math, @backingInt(Math.pow), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
         .{ .name = "1 < 2", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
         .{ .name = "2 < 1", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(2), fx(1) }, .want = .{ .value = false_v } },
         .{ .name = "2 < 2 is strict", .code = &.{ asm_.cmpLt(0, kn(0), kn(0)), asm_.returnSlot(0) }, .consts = &.{fx(2)}, .want = .{ .value = false_v } },
         .{ .name = "-5 < 3", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(-5), fx(3) }, .want = .{ .value = true_v } },
         .{ .name = "true < 1", .code = &.{ asm_.loadTrue(0), asm_.loadConst(1, 0), asm_.cmpLt(2, sl(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{fx(1)}, .slots = 3, .want = .{ .err = VmError.KindMismatch } },
-        .{ .name = "cmp into a constant", .code = &.{ raw(.cmp, @intFromEnum(Cmp.lt), kn(0), kn(0), kn(0)), asm_.returnNil() }, .consts = &.{fx(1)}, .want = .{ .err = VmError.InvalidOperandKind } },
+        .{ .name = "cmp into a constant", .code = &.{ raw(.cmp, @backingInt(Cmp.lt), kn(0), kn(0), kn(0)), asm_.returnNil() }, .consts = &.{fx(1)}, .want = .{ .err = VmError.InvalidOperandKind } },
         .{ .name = "cmp variant 9", .code = &.{ raw(.cmp, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
     });
 }
@@ -5230,7 +5242,7 @@ test "VM dispatch: a variant outside its group's enum" {
     const none = Operand.none;
     try expectRuns(comptime &[_]RunCase{
         .{ .name = "mov 9", .code = &.{ raw(.mov, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
-        .{ .name = "call:tailcall", .code = &.{ raw(.call, @intFromEnum(Call.tailcall), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "call:tailcall", .code = &.{ raw(.call, @backingInt(Call.tailcall), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
         .{ .name = "call 9", .code = &.{ raw(.call, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
         .{ .name = "jump 9", .code = &.{ raw(.jump, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "math 20", .code = &.{ raw(.math, 20, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
@@ -5238,7 +5250,7 @@ test "VM dispatch: a variant outside its group's enum" {
         .{ .name = "closure 9", .code = &.{ raw(.closure, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "coll 9", .code = &.{ raw(.coll, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "ctrl 4", .code = &.{ raw(.ctrl, 4, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
-        .{ .name = "ctrl:halt", .code = &.{ raw(.ctrl, @intFromEnum(CtrlOp.halt_), sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "ctrl:halt", .code = &.{ raw(.ctrl, @backingInt(CtrlOp.halt_), sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
         .{ .name = "simd 0", .code = &.{ raw(.simd, 0, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
     });
 }
@@ -5450,7 +5462,7 @@ test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
 test "VM error detail: a sentence longer than the buffer is cut with an ellipsis, not dropped" {
     var vm = try VM.init(testing.allocator, &VM.idle_routine);
     defer vm.deinit();
-    const name = "é" ** 150;
+    const name = repeat("é", 150);
     try testing.expectEqual(VmError.ArityMismatch, vm.arityError(name, 1, 1, 0));
     try testing.expect(std.mem.startsWith(u8, vm.error_detail, "éé"));
     try testing.expect(std.mem.endsWith(u8, vm.error_detail, "é…"));
@@ -6305,8 +6317,8 @@ test "VM closure call: call:call with constant operand as A traps :invalid-opera
     const consts = [_]Value{};
     const bad_call: Inst = .{
         .kind = .primary,
-        .group = @intFromEnum(Group.call),
-        .variant = @intFromEnum(Call.call),
+        .group = @backingInt(Group.call),
+        .variant = @backingInt(Call.call),
         .a = Operand.constant(0), // illegal: must be slot
         .b = Operand.slot(0),
         .c = Operand.slot(0),
@@ -6333,8 +6345,8 @@ test "VM closure call: call:call with constant operand as C traps :invalid-opera
     const caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
     const bad_call: Inst = .{
         .kind = .primary,
-        .group = @intFromEnum(Group.call),
-        .variant = @intFromEnum(Call.call),
+        .group = @backingInt(Group.call),
+        .variant = @backingInt(Call.call),
         .a = Operand.slot(0),
         .b = Operand.slot(0),
         .c = Operand.constant(0), // illegal: must be slot

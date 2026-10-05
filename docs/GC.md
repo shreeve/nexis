@@ -333,8 +333,8 @@ stressed VM, and `test/nextomic/gc.nx` does the same through `bin/nexis`
 for query predicates, function bindings and custom aggregates. The
 `db:` test of dropped transactions ends ten thousand unreachable read
 handles and dropped writes under both policies.
-`NEXIS_GC_STRESS=1 zig build test` runs the whole suite with every VM
-under the stress policy.
+`zig build test -Dgc-stress` runs the whole suite with every VM
+under the stress policy (each run gets `NEXIS_GC_STRESS=1`).
 
 ---
 

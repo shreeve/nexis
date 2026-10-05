@@ -85,7 +85,7 @@ pub const Error = std.Io.Writer.Error || error{Utf8Error};
 /// is required for keyword and symbol names and names record types;
 /// if the value tree contains none of those a null interner is safe.
 ///
-/// `writer` is `*std.Io.Writer` (Zig 0.16's canonical writer
+/// `writer` is `*std.Io.Writer` (Zig's canonical writer
 /// interface). Callers obtain one from `std.Io.Writer.fixed(&buf)`,
 /// `std.Io.Writer.Allocating.init(...)`, or any other
 /// `Writer.VTable`-backed adapter (stdout, file, etc.).
@@ -171,7 +171,7 @@ pub fn format(
         // `#i64[1 2 3]` / `#f64[1.0 2.0]` in both modes; the reader
         // has no such dispatch, so the text does not read back.
         .typed_vector => try typed_vector_mod.format(v, writer, formatFloat),
-        else => try writer.print("#<value kind={d}>", .{@intFromEnum(v.kind())}),
+        else => try writer.print("#<value kind={d}>", .{@backingInt(v.kind())}),
     }
 }
 
@@ -201,18 +201,18 @@ pub fn formatFloatJava(f: f64, writer: *std.Io.Writer) Error!void {
     var buf: [64]u8 = undefined;
     const mag = @abs(f);
     if (mag != 0 and (mag >= 1e7 or mag < 1e-3)) {
-        const text = std.fmt.bufPrint(&buf, "{e}", .{f}) catch unreachable;
-        const e_idx = std.mem.indexOfScalar(u8, text, 'e').?;
+        const text = std.mem.print(&buf, "{e}", .{f}) catch unreachable;
+        const e_idx = std.mem.findScalar(u8, text, 'e').?;
         const mantissa = text[0..e_idx];
         try writer.writeAll(mantissa);
-        if (std.mem.indexOfScalar(u8, mantissa, '.') == null) try writer.writeAll(".0");
+        if (std.mem.findScalar(u8, mantissa, '.') == null) try writer.writeAll(".0");
         try writer.writeByte('E');
         try writer.writeAll(text[e_idx + 1 ..]);
         return;
     }
-    const text = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+    const text = std.mem.print(&buf, "{d}", .{f}) catch unreachable;
     try writer.writeAll(text);
-    if (std.mem.indexOfScalar(u8, text, '.') == null) try writer.writeAll(".0");
+    if (std.mem.findScalar(u8, text, '.') == null) try writer.writeAll(".0");
 }
 
 fn formatString(v: Value, mode: FormatMode, writer: *std.Io.Writer) Error!void {
@@ -612,7 +612,7 @@ test "a collection nested past the stack guard prints #<too deep> and counts an 
     const before = dispatch.overflowCount();
     const got = try formatForTest(v, .readable, null);
     defer testing.allocator.free(got);
-    try testing.expect(std.mem.indexOf(u8, got, "[#<too deep>]") != null);
+    try testing.expect(std.mem.find(u8, got, "[#<too deep>]") != null);
     try testing.expect(std.mem.startsWith(u8, got, "[[[") and std.mem.endsWith(u8, got, "]]]"));
     try testing.expect(dispatch.overflowCount() > before);
 }

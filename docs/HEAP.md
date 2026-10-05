@@ -109,8 +109,8 @@ none waits. A slab the pool takes is carved afresh.
 with a 32-byte prefix (the next large block, the allocation's length,
 the body's length) and sets the allocator's `mark` bit (§4). The large
 blocks form one list the sweep walks. The backing allocator is the
-VM's (`VM.ensureHeap`): in `bin/nexis` a `DebugAllocator` (leak check,
-no per-allocation stack trace) in a Debug build and the process
+VM's (`VM.ensureHeap`): in `bin/nexis` a `SafeAllocator` (leak check,
+no per-allocation stack trace) in a debug build and the process
 allocator otherwise (`src/cli.zig`); `NEXIS_MAX_ALLOC` bounds a large
 block, never a slab.
 

@@ -49,7 +49,7 @@ const testing = std.testing;
 pub const AtomBox = extern struct {
     value: Value,
     in_flight: u8,
-    _pad: [7]u8 = [_]u8{0} ** 7,
+    _pad: [7]u8 = @splat(0),
 };
 
 comptime {
@@ -70,7 +70,7 @@ pub fn make(heap: *Heap, init: Value) !Value {
     const body = Heap.bodyOf(AtomBox, h);
     body.value = init;
     body.in_flight = 0;
-    body._pad = [_]u8{0} ** 7;
+    body._pad = @splat(0);
     return Heap.valueFromHeader(.atom, h);
 }
 

@@ -1,5 +1,5 @@
 # nexis CI: the full gate on macOS and Linux, formatting and the parser
-# check, and a ReleaseFast build with a benchmark smoke run and the
+# check, and a speed-optimized build with a benchmark smoke run and the
 # static (musl) Linux binary.
 #
 # nexis builds against emdb as a path dependency (build.zig.zon
@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.16.0
+  ZIG_VERSION: 0.17.0
 
 jobs:
   test:
@@ -92,7 +92,7 @@ jobs:
         run: zig build parser-check --summary all
 
   release:
-    name: ReleaseFast, bench and static binary
+    name: optimized, bench and static binary
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -108,20 +108,20 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
-      - name: ReleaseFast bin/nexis
+      - name: optimized bin/nexis
         working-directory: nexis
         run: |
-          zig build install -Doptimize=ReleaseFast
+          zig build install -Doptimize=fast
           test "$(./bin/nexis -e '(reduce + (range 101))')" = 5050
           ./bin/nexis run examples/shapes-app.nx
       - name: benchmark smoke run
         working-directory: nexis
-        run: zig build bench -Doptimize=ReleaseFast
+        run: zig build bench -Doptimize=fast
       # x86-64-v2 (SSE4.2, POPCNT): the CPU level the shipped binary
       # asks for, Intel Nehalem and AMD Bulldozer or later.
       - name: static x86_64-linux-musl bin/nexis (x86-64-v2)
         working-directory: nexis
         run: |
-          zig build install -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2
+          zig build install -Doptimize=fast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2
           file bin/nexis | tee /dev/stderr | grep -q 'statically linked'
           test "$(./bin/nexis -e '(reduce + (range 101))')" = 5050

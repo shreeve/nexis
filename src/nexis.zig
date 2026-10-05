@@ -11,39 +11,10 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 
-/// Tag enum mirroring the canonical S-expression schema emitted by
-/// `nexis.grammar`. Every variant corresponds to a tagged sexp the generated
-/// parser produces; `src/reader.zig` consumes exactly this set.
-pub const Tag = enum(u8) {
-    // Top-level wrappers
-    program,
-
-    // Atom leaves (Appendix C §28.2 — atom datum variants)
-    int,
-    real,
-    string,
-    char,
-    keyword,
-    symbol,
-
-    // Compound collection literals
-    list,
-    vector,
-    map,
-    set,
-
-    // Reader macros (user-visible conventional tags from PLAN §28.2)
-    quote,
-    @"syntax-quote",
-    unquote,
-    @"unquote-splicing",
-    deref,
-
-    // Internal reader-stage tags consumed and rewritten by src/reader.zig
-    @"anon-fn",
-    @"with-meta-raw",
-    @"var-quote",
-};
+/// The tags `nexis.grammar`'s actions put at the head of a list, as
+/// the generated parser declares them; `src/reader.zig` consumes
+/// exactly this set.
+pub const Tag = parser.Tag;
 
 /// The byte length of a leaf the parser built from a `Lexer` token (see
 /// `Lexer.finish`).
@@ -63,14 +34,6 @@ pub const Lexer = struct {
 
     pub fn init(source: []const u8) Lexer {
         return .{ .base = parser.BaseLexer.init(source) };
-    }
-
-    pub fn text(self: *const Lexer, tok: Token) []const u8 {
-        return self.base.text(tok);
-    }
-
-    pub fn reset(self: *Lexer) void {
-        self.base.reset();
     }
 
     pub fn next(self: *Lexer) Token {

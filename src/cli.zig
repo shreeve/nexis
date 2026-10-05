@@ -93,11 +93,11 @@ fn runCommand(init: std.process.Init) !void {
     // A Debug build keeps the leak check but not the stack trace per
     // allocation, which costs it three orders of magnitude on
     // allocation-heavy programs; a release build uses the process's.
-    var debug_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer if (builtin.mode == .Debug) {
-        _ = debug_allocator.deinit();
+    var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (builtin.optimize == .debug) {
+        _ = safe.deinit();
     };
-    var allocator = if (builtin.mode == .Debug) debug_allocator.allocator() else init.gpa;
+    var allocator = if (builtin.optimize == .debug) safe.allocator() else init.gpa;
     const io = init.io;
     var max_alloc: MaxAlloc = undefined;
     if (init.environ_map.get("NEXIS_MAX_ALLOC")) |text| {
@@ -243,8 +243,8 @@ const Place = struct {
         const all = info.text;
         const at = @min(pos, all.len);
         const bom: usize = if (std.mem.startsWith(u8, all, loader_mod.byte_order_mark)) loader_mod.byte_order_mark.len else 0;
-        const start = if (std.mem.lastIndexOfScalar(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
-        const end = std.mem.indexOfScalarPos(u8, all, at, '\n') orelse all.len;
+        const start = if (std.mem.findScalarLast(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
+        const end = std.mem.findScalarPos(u8, all, at, '\n') orelse all.len;
         const text = std.mem.trimEnd(u8, all[start..end], "\r");
         const offset = @min(at -| start, text.len);
         var chars: usize = 0;
@@ -437,7 +437,7 @@ fn failRead(io: std.Io, path: []const u8, err: anyerror) noreturn {
 
 /// `require` searches the working directory and the file's own.
 fn loadPathsFor(path: []const u8) [2][]const u8 {
-    return .{ ".", if (eql(path, "-")) "." else std.fs.path.dirname(path) orelse "." };
+    return .{ ".", if (eql(path, "-")) "." else std.Io.Dir.path.dirname(path) orelse "." };
 }
 
 /// Run FILE's forms. Like Clojure's script runner, `run` writes only

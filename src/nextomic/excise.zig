@@ -53,7 +53,7 @@ const Row = struct { a: u32, vbytes: []const u8, top: ?key.Top };
 /// attributes AVET and VAET carry. Scratch lives in `arena`.
 pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const Schema, e: u64, a: ?u32) !Outcome {
     var rows: std.ArrayList(Row) = .empty;
-    var ts: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    var ts: std.array_hash_map.Auto(u64, void) = .empty;
     var counts: std.AutoHashMapUnmanaged(u32, u64) = .empty;
     const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e, .a = a });
 
@@ -123,7 +123,7 @@ pub fn rewriteTxlog(store: *Store, txn: *Txn, arena: Allocator, ts: []const u64,
         }
         var marked: std.ArrayList(u64) = .empty;
         try marked.appendSlice(arena, entry.excised);
-        if (std.mem.indexOfScalar(u64, marked.items, e) == null) try marked.append(arena, e);
+        if (std.mem.findScalar(u64, marked.items, e) == null) try marked.append(arena, e);
         const rewritten = try datom_mod.encodeTxlog(arena, entry.instant, kept.items, marked.items, names);
         try store.putTxlog(txn, t, rewritten);
     }

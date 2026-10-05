@@ -97,8 +97,8 @@ returned slices point into the argument.
 ### 4. Internal shape
 
 Each table is a `StringHashMapUnmanaged(u32)` from name to id, an
-`ArrayListUnmanaged([]const u8)` from id to the owned copy of the
-name, and an `ArrayListUnmanaged(u32)` from id to the name's
+`ArrayList([]const u8)` from id to the owned copy of the
+name, and an `ArrayList(u32)` from id to the name's
 `hash.nameHash`; the map's key is the owned copy, never a slice of
 the list's backing array, which moves when the list grows. The hash
 is computed once, at the first intern, so building a Value from an

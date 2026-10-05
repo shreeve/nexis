@@ -67,7 +67,7 @@ fn loadCorpus(fx: *Fx) !void {
         \\ {:db/ident :node/label :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
         \\ {:db/ident :role/admin} {:db/ident :role/user}]
     );
-    const people = try std.fmt.allocPrint(fx.arena(),
+    const people = try fx.arena().print(
         \\[{{:db/id "ann" :person/name "Ann" :person/email "ann@x" :person/age 30 :person/height 1.7 :person/active true :person/tags [:red :blue] :person/role :role/admin :person/bio "{s}"}}
         \\ {{:db/id "bob" :person/name "Bob" :person/email "bob@x" :person/age 25 :person/height 1.8 :person/active false :person/tags [:blue] :person/friend ["ann"] :person/boss "ann" :person/role :role/user}}
         \\ {{:db/id "cy" :person/name "Cy" :person/email "cy@x" :person/age 41 :person/height 1.65 :person/active true :person/tags [:red :green] :person/friend ["ann" "bob"] :person/boss "ann"}}
@@ -925,7 +925,7 @@ fn envEql(a: Env, b: Env) bool {
 }
 
 fn indexOf(vars: []const Var, v: Var) usize {
-    return std.mem.indexOfScalar(Var, vars, v).?;
+    return std.mem.findScalar(Var, vars, v).?;
 }
 
 // =============================================================================
@@ -979,9 +979,9 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     try checkCount(fx, dbv, "[:find ?e :where [?e :person/friend [:person/email \"nobody\"]]]", none, 0);
 
     // Long strings (out of line) match by value.
-    const bio = try std.fmt.allocPrint(fx.arena(), "[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_a});
+    const bio = try fx.arena().print("[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_a});
     try checkCount(fx, dbv, bio, none, 1);
-    const bio_x = try std.fmt.allocPrint(fx.arena(), "[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_x});
+    const bio_x = try fx.arena().print("[:find ?e :where [?e :person/bio \"{s}\"]]", .{long_bio_x});
     try checkCount(fx, dbv, bio_x, none, 0);
     try checkCount(fx, dbv, "[:find ?e ?b :where [?e :person/bio ?b]]", none, 2);
 
@@ -1357,13 +1357,13 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     // Chains round the n1 → n2 → n3 → n1 cycle, narrow and wide: the
     // ends, every variable, the start alone, a count; then rule calls.
     for ([_]usize{ 2, 5, 12, 30 }) |n| {
-        const last = try std.fmt.allocPrint(arena, "?x0 ?x{d}", .{n});
+        const last = try arena.print("?x0 ?x{d}", .{n});
         _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", last, false), none);
         var every: std.Io.Writer.Allocating = .init(arena);
         for (0..n + 1) |i| try every.writer.print("?x{d} ", .{i});
         _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", every.written(), false), none);
         _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", "?x0", false), none);
-        const counted = try std.fmt.allocPrint(arena, "(count ?x{d}) ?x0", .{n});
+        const counted = try arena.print("(count ?x{d}) ?x0", .{n});
         _ = try check(fx, dbv, try chainQuery(arena, n, ":edge/to", counted, false), none);
     }
     try checkCount(fx, dbv, "[:find ?a ?d :in $ % :where (reach-left ?a ?b) (reach-left ?b ?c) (reach-left ?c ?d) [?d :node/label \"n5\"]]", args, 3);
@@ -1393,22 +1393,22 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     defer out.deinit();
     var diag: query.Diag = .{};
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age ?a] [(> ?a 40)] [?e :person/name ?n]]"), dbv, none, &diag, .{ .hook = fx.hook() }, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "2. pred (> ?a 40)") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "2. pred (> ?a 40)") != null);
     // A pattern that takes nothing from the row is the one scan of its
     // constant prefix, whatever the rows: every row reads the same datoms.
-    const first = out.written()[0..std.mem.indexOfScalar(u8, out.written(), '\n').?];
+    const first = out.written()[0..std.mem.findScalar(u8, out.written(), '\n').?];
     try testing.expect(std.mem.startsWith(u8, first, "1. scan [?e :person/age ?a _ _] aevt"));
-    try testing.expect(std.mem.indexOf(u8, first, " hash ") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?a\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "drop ?e\n") != null);
+    try testing.expect(std.mem.find(u8, first, " hash ") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "drop ?a\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "drop ?e\n") != null);
     // A long chain finding every variable parks the ones no later step
     // reads behind a column of row numbers.
     out.clearRetainingCapacity();
     var every: std.Io.Writer.Allocating = .init(arena);
     for (0..13) |i| try every.writer.print("?x{d} ", .{i});
     try query.explain(testing.allocator, fx.interner(), try fx.read(try chainQuery(arena, 12, ":edge/to", every.written(), false)), dbv, none, &diag, .{}, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), " park ?x0 ?x1 ?x2 ?x3 -> ?row\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), " park ?x4 ?row ?x5 ?x6 -> ?row\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), " park ?x0 ?x1 ?x2 ?x3 -> ?row\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), " park ?x4 ?row ?x5 ?x6 -> ?row\n") != null);
 }
 
 test "corpus: as-of, since, history views" {
@@ -1493,7 +1493,7 @@ test "corpus: multiple data sources" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf }, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "scan [$2 ?e") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "scan [$2 ?e") != null);
     try testing.expectError(error.QuerySyntax, query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n :in $ $2 :where [$2 ?e :person/name ?n]]"), now, &.{ nil, before }, &diag, .{}));
     const res = try query.q(testing.allocator, fx.interner(), &fx.heap, try fx.read("[:find ?n . :in $ $2 :where [?e :person/name ?n] [$2 ?e :person/age 25]]"), now, &.{ nil, before }, &diag, .{ .db_of = &nextomic.natives.dbOf });
     try testing.expectEqualStrings("Bob", string_mod.asBytes(res));
@@ -1630,36 +1630,36 @@ test "results materialise as set, scalar, collection, tuple; caches; explain" {
     defer out.deinit();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :in $ % :where [?e :person/age 30] [?e :person/name ?n] (not [?e :person/tags :red]) (admin ?e) [(< 1 2)]]"), dbv, &.{ value.nilValue(), rules_v }, &diag, opts, &out.writer);
     const text = out.written();
-    try testing.expect(std.mem.indexOf(u8, text, "1. pred (< 1 2)") != null);
+    try testing.expect(std.mem.find(u8, text, "1. pred (< 1 2)") != null);
     // The admin rule's body (3 entities) is cheaper than the age scan.
-    try testing.expect(std.mem.indexOf(u8, text, "2. or-join [?e] branches=1") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "scan [?e :person/role :role/admin _ _] aevt est=3") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "not-join [?e]") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/age 30 _ _] eavt est=1") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
+    try testing.expect(std.mem.find(u8, text, "2. or-join [?e] branches=1") != null);
+    try testing.expect(std.mem.find(u8, text, "scan [?e :person/role :role/admin _ _] aevt est=3") != null);
+    try testing.expect(std.mem.find(u8, text, "not-join [?e]") != null);
+    try testing.expect(std.mem.find(u8, text, "scan [?e! :person/age 30 _ _] eavt est=1") != null);
+    try testing.expect(std.mem.find(u8, text, "scan [?e! :person/name ?n _ _] eavt est=1") != null);
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?a :where [?e :person/age ?a] [(identity ?e) ?e2] [?e2 :person/email \"ann@x\"]]"), dbv, none, &diag, opts, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "3. bind (identity ?e) -> ?e2!") != null);
     // Every step ends with its join kind (scans) and estimated rows; a
     // seek per row is `nested`, a constant-prefix scan joined on the
     // shared variables is `hash`.
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?n :where [?e :person/age 30] [?e :person/name ?n]]"), dbv, none, &diag, opts, &out.writer);
     const table = out.written();
-    try testing.expect(std.mem.indexOf(u8, table, "1. scan [?e :person/age 30 _ _] aevt") != null);
-    try testing.expect(std.mem.indexOf(u8, table, "hash    rows~6") != null);
+    try testing.expect(std.mem.find(u8, table, "1. scan [?e :person/age 30 _ _] aevt") != null);
+    try testing.expect(std.mem.find(u8, table, "hash    rows~6") != null);
     var lines = std.mem.splitScalar(u8, table, '\n');
     var steps: usize = 0;
     while (lines.next()) |l| {
         if (l.len == 0 or std.mem.startsWith(u8, l, "rows~")) continue;
         steps += 1;
-        try testing.expect(std.mem.indexOf(u8, l, " rows~") != null);
+        try testing.expect(std.mem.find(u8, l, " rows~") != null);
     }
     try testing.expectEqual(@as(usize, 2), steps);
     // A bound attribute variable seeks per row.
     out.clearRetainingCapacity();
     try query.explain(testing.allocator, fx.interner(), try fx.read("[:find ?v :in $ ?a ?e :where [?e ?a ?v]]"), dbv, &.{ value.nilValue(), try fx.kw("person/name"), value.fromFixnum(1).? }, &diag, opts, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "nested  rows~") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "nested  rows~") != null);
 }
 
 test "transitive closure over a 5k-edge chain" {
@@ -1740,7 +1740,7 @@ test "three-way joins over 10k datoms: every access path returns the rows it sho
     const depts: usize = 20;
     var dept_ops: std.ArrayList(nextomic.Op) = .empty;
     for (0..depts) |i| {
-        const name = try std.fmt.allocPrint(fx.arena(), "d{d}", .{i});
+        const name = try fx.arena().print("d{d}", .{i});
         try dept_ops.append(fx.arena(), .{ .add = .{ .e = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } }, .a = .{ .id = a_dname }, .v = .{ .val = .{ .string = name } } } });
     }
     const dept_report = try nextomic.transact.transactOps(fx.conn(), fx.arena(), dept_ops.items, .{});
@@ -1753,7 +1753,7 @@ test "three-way joins over 10k datoms: every access path returns the rows it sho
     const rnd = prng.random();
     for (0..emps) |i| {
         const me: nextomic.transact.Entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } };
-        const name = try std.fmt.allocPrint(fx.arena(), "emp-{d}", .{i});
+        const name = try fx.arena().print("emp-{d}", .{i});
         try ops.append(fx.arena(), .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
         try ops.append(fx.arena(), .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = 20 + @as(i64, @intCast(rnd.uintLessThan(u32, 45))) } } } });
         try ops.append(fx.arena(), .{ .add = .{ .e = me, .a = .{ .id = a_dept }, .v = .{ .val = .{ .ref = dept_eids[i % depts] } } } });

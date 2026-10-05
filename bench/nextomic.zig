@@ -104,7 +104,7 @@ const Fixture = struct {
     }
 
     fn joinName(a: Allocator, name: anytype) ![]const u8 {
-        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
+        if (name.ns) |ns| return a.print("{s}/{s}", .{ ns, name.name });
         return name.name;
     }
 
@@ -117,7 +117,7 @@ const Fixture = struct {
         const a_dname = try self.attr("dept/name");
         var ops: std.ArrayList(nextomic.Op) = .empty;
         for (0..n) |i| {
-            const name = try std.fmt.allocPrint(self.arena(), "d{d}", .{i});
+            const name = try self.arena().print("d{d}", .{i});
             try ops.append(self.arena(), .{ .add = .{ .e = tempid(i), .a = .{ .id = a_dname }, .v = .{ .val = .{ .string = name } } } });
         }
         const report = try nextomic.transact.transactOps(self.conn, self.arena(), ops.items, .{});
@@ -214,7 +214,7 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
     var prng = std.Random.DefaultPrng.init(7);
     const rnd = prng.random();
     // Employees per age, for the rows each query must return.
-    var of_age = [_]usize{0} ** 65;
+    var of_age: [65]usize = @splat(0);
     var start: usize = 0;
     while (start < emps) : (start += batch) {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -223,7 +223,7 @@ pub fn runQuery(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void
         var ops: std.ArrayList(nextomic.Op) = .empty;
         for (start..start + batch) |i| {
             const me = tempid(i);
-            const name = try std.fmt.allocPrint(arena, "emp-{d}", .{i});
+            const name = try arena.print("emp-{d}", .{i});
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
             const age = 20 + rnd.uintLessThan(u32, 45);
             of_age[age] += 1;
@@ -334,7 +334,7 @@ pub fn runPull(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void 
         var ops: std.ArrayList(nextomic.Op) = .empty;
         for (start..start + batch) |i| {
             const me = tempid(i);
-            const name = try std.fmt.allocPrint(arena, "emp-{d}", .{i});
+            const name = try arena.print("emp-{d}", .{i});
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = @intCast(20 + i % 45) } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_dept }, .v = .{ .val = .{ .ref = depts[i % depts.len] } } } });

@@ -862,11 +862,11 @@ const Emitter = struct {
         if (d.detail != null) return CompileError.SlotOverflow;
         const tail = ": more than " ++ std.fmt.comptimePrint("{d}", .{max_operands}) ++ " " ++ what;
         d.detail = (if (!self.is_fn)
-            std.fmt.allocPrint(self.allocator, "top-level form" ++ tail, .{})
+            self.allocator.print("top-level form" ++ tail, .{})
         else if (self.fn_name) |name|
-            std.fmt.allocPrint(self.allocator, "fn {s}" ++ tail, .{name})
+            self.allocator.print("fn {s}" ++ tail, .{name})
         else
-            std.fmt.allocPrint(self.allocator, "anonymous fn" ++ tail, .{})) catch return CompileError.OutOfMemory;
+            self.allocator.print("anonymous fn" ++ tail, .{})) catch return CompileError.OutOfMemory;
         return CompileError.SlotOverflow;
     }
 
@@ -1372,9 +1372,9 @@ fn unresolved(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: ?reader_mod
     const d = diag orelse return CompileError.UnresolvedSymbol;
     if (span) |sp| d.span = sp;
     if (d.detail == null) d.detail = (if (ns) |n|
-        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}/{s}", .{ n, name })
+        allocator.print("unable to resolve symbol: {s}/{s}", .{ n, name })
     else
-        std.fmt.allocPrint(allocator, "unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
+        allocator.print("unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
     return CompileError.UnresolvedSymbol;
 }
 
@@ -1742,7 +1742,7 @@ fn lowerQuotePayload(
             // qualified-symbol literals like `(quote db/begin-write)`.
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
             if (name.ns) |ns_prefix| {
-                const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ns_prefix, name.name });
+                const full = try allocator.print("{s}/{s}", .{ ns_prefix, name.name });
                 defer allocator.free(full);
                 const v = interner.internSymbolValue(full) catch return CompileError.OutOfMemory;
                 break :blk try allocTiny(allocator, .{ .literal = v });
@@ -3400,7 +3400,7 @@ fn compileRecur(
 }
 
 fn isRecurSlot(target: *const RecurTarget, slot: u12) bool {
-    return std.mem.indexOfScalar(u12, target.binding_slots, slot) != null;
+    return std.mem.findScalar(u12, target.binding_slots, slot) != null;
 }
 
 /// Whether `t` mentions the symbol `name` anywhere, closures and
@@ -4015,7 +4015,7 @@ test "bytecode: a routine references each Var and each captured name once" {
     for (caps.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.sources.len);
     var boxes: usize = 0;
     for (caps.code) |inst| {
-        if (inst.groupOf() == .closure and inst.variant == @intFromEnum(vm.Closure_.box_local)) boxes += 1;
+        if (inst.groupOf() == .closure and inst.variant == @backingInt(vm.Closure_.box_local)) boxes += 1;
     }
     try testing.expectEqual(@as(usize, 1), boxes);
 }
@@ -4042,7 +4042,7 @@ test "bytecode: only a captured binding is boxed, and on every path" {
         try routines.append(arena.allocator(), top);
         while (routines.pop()) |r| {
             for (r.code) |inst| {
-                if (inst.groupOf() == .closure and inst.variant == @intFromEnum(vm.Closure_.box_local)) boxes += 1;
+                if (inst.groupOf() == .closure and inst.variant == @backingInt(vm.Closure_.box_local)) boxes += 1;
             }
             for (r.capture_descs) |d| try routines.append(arena.allocator(), d.routine);
         }
@@ -4077,7 +4077,7 @@ test "bytecode: a try body or handler that always throws has no try-exit" {
         const compiled = try compileSourceWith(arena.allocator(), c.src, .{ .namespace = v.ensureNamespace(), .interner = v.ensureInterner() });
         var exits: usize = 0;
         for (compiled.code) |inst| {
-            if (inst.groupOf() == .ctrl and inst.variant == @intFromEnum(vm.CtrlOp.try_exit)) exits += 1;
+            if (inst.groupOf() == .ctrl and inst.variant == @backingInt(vm.CtrlOp.try_exit)) exits += 1;
         }
         try testing.expectEqual(c.exits, exits);
         try testing.expectEqual(c.want, (try runBare(arena.allocator(), &v, c.src)).asFixnum());
@@ -4174,7 +4174,7 @@ test "wide targets: a routine of more than 100,000 instructions branches, loops 
     for (big.code) |inst| {
         const wide_target = switch (inst.groupOf()) {
             .jump => true,
-            .ctrl => switch (@as(vm.CtrlOp, @enumFromInt(inst.variant))) {
+            .ctrl => switch (@as(vm.CtrlOp, @fromBackingInt(@intCast(inst.variant)))) {
                 .try_exit => true,
                 else => false,
             },
@@ -4211,9 +4211,9 @@ test "routine limits: more than 4096 live slots or captures is SlotOverflow, nam
     const captures = try generatedSource(a, "(let* [", "a{d} {d} ", 2100, try generatedSource(a, "] (fn* [] (let* [", "b{d} {d} ", 2100, try generatedSource(a, "] (fn* inner [] (do", " a{d} b{d}", 2100, ")))))")));
     const cases = [_]struct { src: []const u8, detail: []const u8, at: usize }{
         .{ .src = let_4100, .detail = "top-level form: more than 4096 local slots", .at = 0 },
-        .{ .src = try std.fmt.allocPrint(a, "(fn* many [] {s})", .{let_4100}), .detail = "fn many: more than 4096 local slots", .at = 13 },
-        .{ .src = try std.fmt.allocPrint(a, "(fn* [] {s})", .{let_4100}), .detail = "anonymous fn: more than 4096 local slots", .at = 8 },
-        .{ .src = captures, .detail = "fn inner: more than 4096 captured locals", .at = std.mem.indexOf(u8, captures, " a2048 b2048").? + 1 },
+        .{ .src = try a.print("(fn* many [] {s})", .{let_4100}), .detail = "fn many: more than 4096 local slots", .at = 13 },
+        .{ .src = try a.print("(fn* [] {s})", .{let_4100}), .detail = "anonymous fn: more than 4096 local slots", .at = 8 },
+        .{ .src = captures, .detail = "fn inner: more than 4096 captured locals", .at = std.mem.find(u8, captures, " a2048 b2048").? + 1 },
     };
     for (cases) |c| {
         var span: ?reader_mod.SrcSpan = null;
@@ -4236,7 +4236,7 @@ test "compile span: an error is reported at the innermost form that raised it" {
     for (cases) |c| {
         var span: ?reader_mod.SrcSpan = null;
         try testing.expectError(c.err, compileSourceWith(arena.allocator(), c.src, .{ .out_span = &span }));
-        try testing.expectEqual(std.mem.indexOf(u8, c.src, c.at).?, span.?.pos);
+        try testing.expectEqual(std.mem.find(u8, c.src, c.at).?, span.?.pos);
         try testing.expectEqual(c.at.len, span.?.len);
     }
 }

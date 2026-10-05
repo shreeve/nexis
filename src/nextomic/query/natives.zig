@@ -132,7 +132,7 @@ const Hook = struct {
     fn resolve(self: *Hook, sym: u32) anyerror!Value {
         const vm = self.vm;
         if (try lookup(vm, sym)) |v| return v;
-        const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{vm.ensureInterner().symbolName(sym)});
+        const message = try vm.allocator.print("unknown function: {s}", .{vm.ensureInterner().symbolName(sym)});
         defer vm.allocator.free(message);
         return natives.throwSyntax(vm, "nextomic/query-syntax", message, null);
     }
@@ -163,7 +163,7 @@ const Qualified = struct { ns: []const u8, name: []const u8 };
 /// `ns/name` split at its first `/`; null for a bare name, for `/`
 /// itself and for a name with nothing on one side of the slash.
 fn splitQualified(name: []const u8) ?Qualified {
-    const i = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+    const i = std.mem.findScalar(u8, name, '/') orelse return null;
     if (i == 0 or i + 1 == name.len) return null;
     return .{ .ns = name[0..i], .name = name[i + 1 ..] };
 }

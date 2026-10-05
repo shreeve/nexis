@@ -47,16 +47,16 @@ test "a call's tx-data takes its place; nested calls see one db-before" {
     };
 
     // The datoms land where the form was, after the surrounding forms before it.
-    const r1 = try fx.transactFn(try std.fmt.allocPrint(a, "[[:db/add {d} :person/name \"Anne\"] [:db.fn/call bump-age {d} 5] [:db/add {d} :person/tags :x]]", .{ ann, ann, ann }), &fault);
+    const r1 = try fx.transactFn(try a.print("[[:db/add {d} :person/name \"Anne\"] [:db.fn/call bump-age {d} 5] [:db/add {d} :person/tags :x]]", .{ ann, ann, ann }), &fault);
     try testing.expectEqual(@as(usize, 5), facts(r1).len);
     try testing.expectEqual(age, facts(r1)[2].a);
     try testing.expect(!facts(r1)[2].added);
     try testing.expectEqual(@as(i64, 35), facts(r1)[3].v.long);
-    const after1 = try fx.pullSrc(try fx.db(), "[:person/age]", try std.fmt.allocPrint(a, "{d}", .{ann}));
+    const after1 = try fx.pullSrc(try fx.db(), "[:person/age]", try a.print("{d}", .{ann}));
     try testing.expectEqual(@as(i64, 35), (try fx.getName(after1, "person/age")).?.asFixnum());
 
     // Two nested bumps read the same db-before, so they claim one value.
-    const r2 = try fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/call twice {d}]]", .{ann}), &fault);
+    const r2 = try fx.transactFn(try a.print("[[:db.fn/call twice {d}]]", .{ann}), &fault);
     try testing.expectEqual(@as(usize, 2), facts(r2).len);
     try testing.expectEqual(@as(i64, 36), facts(r2)[1].v.long);
 
@@ -78,21 +78,21 @@ test "cas swaps on a match and names the mismatch" {
     const a = fx.arena();
     var fault: Fault = .{};
 
-    const r1 = try fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/age 30 31]]", .{ann}), &fault);
+    const r1 = try fx.transactFn(try a.print("[[:db.fn/cas {d} :person/age 30 31]]", .{ann}), &fault);
     try testing.expectEqual(@as(usize, 2), facts(r1).len);
     try testing.expectEqual(@as(i64, 31), facts(r1)[1].v.long);
-    try testing.expectError(error.Cas, fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/age 30 32]]", .{ann}), &fault));
+    try testing.expectError(error.Cas, fx.transactFn(try a.print("[[:db.fn/cas {d} :person/age 30 32]]", .{ann}), &fault));
     try testing.expectEqual(@as(i64, 30), fault.cas.?.expected.?.long);
     try testing.expectEqual(@as(i64, 31), fault.cas.?.actual.?.long);
     try testing.expectEqual(try fx.kwId("person/age"), fault.attr.?.asKeywordId());
-    try testing.expectError(error.Cas, fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/age nil 32]]", .{ann}), &fault));
+    try testing.expectError(error.Cas, fx.transactFn(try a.print("[[:db.fn/cas {d} :person/age nil 32]]", .{ann}), &fault));
     try testing.expect(fault.cas.?.expected == null);
     // Absent attribute, nil expected: asserted; card-many refused.
     const r2 = try fx.transactFn("[[:db.fn/cas \"bob\" :person/age nil 7]]", &fault);
     try testing.expectEqual(@as(i64, 7), facts(r2)[0].v.long);
-    try testing.expectError(error.TxData, fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/tags nil :x]]", .{ann}), &fault));
+    try testing.expectError(error.TxData, fx.transactFn(try a.print("[[:db.fn/cas {d} :person/tags nil :x]]", .{ann}), &fault));
     // A cas inside a call form.
-    try testing.expectError(error.Cas, fx.transactFn(try std.fmt.allocPrint(a, "[[:db.fn/cas {d} :person/age 31 33] [:db.fn/cas {d} :person/age 31 34]]", .{ ann, ann }), &fault));
+    try testing.expectError(error.Cas, fx.transactFn(try a.print("[[:db.fn/cas {d} :person/age 31 33] [:db.fn/cas {d} :person/age 31 34]]", .{ ann, ann }), &fault));
     try testing.expectEqual(@as(u64, r2.t), (try fx.db()).basis);
     _ = boot;
 }
@@ -107,7 +107,7 @@ test "a renamed attribute answers to its new ident in every view and query" {
     const r = try fx.transact("[[:db/add :person/name :db/ident :person/full-name]]");
     try testing.expectEqual(@as(usize, 0), facts(r).len);
     const after = try fx.db();
-    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
+    const eid = try a.print("{d}", .{ann});
     // pull and q spell the new name; the old one is unknown.
     const pulled = try fx.pullSrc(after, "[:person/full-name]", eid);
     try testing.expectEqualStrings("Ann", nx.string.asBytes((try fx.getName(pulled, "person/full-name")).?));
@@ -128,12 +128,12 @@ test "cardinality changes apply from the next transaction and keep their history
     defer fx.deinit();
     const ann = try loadPeople(fx);
     const a = fx.arena();
-    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
+    const eid = try a.print("{d}", .{ann});
     var fault: Fault = .{};
 
     const one = try fx.db();
     _ = try fx.transact("[[:db/add :person/name :db/cardinality :db.cardinality/many]]");
-    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/add {d} :person/name \"Annie\"]]", .{ann}));
+    _ = try fx.transact(try a.print("[[:db/add {d} :person/name \"Annie\"]]", .{ann}));
     const many = try fx.db();
     const both = try fx.pullSrc(many, "[:person/name]", eid);
     try testing.expectEqual(@as(usize, 2), nx.vector.count((try fx.getName(both, "person/name")).?));
@@ -146,7 +146,7 @@ test "cardinality changes apply from the next transaction and keep their history
     // Back to one: refused while two values stand, then allowed.
     try testing.expectError(error.Schema, fx.transactFn("[[:db/add :person/name :db/cardinality :db.cardinality/one]]", &fault));
     try testing.expectEqual(@as(?u64, ann), fault.e);
-    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/retract {d} :person/name \"Ann\"] [:db/add :person/name :db/cardinality :db.cardinality/one]]", .{ann}));
+    _ = try fx.transact(try a.print("[[:db/retract {d} :person/name \"Ann\"] [:db/add :person/name :db/cardinality :db.cardinality/one]]", .{ann}));
     const back = try fx.db();
     const name = blk: {
         const txn = try fx.conn().store.beginRead();
@@ -172,7 +172,7 @@ test "a flag declared false turns true later; a component flag reads as each vie
         \\ {:db/ident :t/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
     );
     const r = try fx.transact("[{:db/id \"p\" :t/name \"Red Plum\" :t/home {:t/city \"Oslo\"}}]");
-    const p = try std.fmt.allocPrint(a, "{d}", .{r.tempids[0].eid});
+    const p = try a.print("{d}", .{r.tempids[0].eid});
     const before = try fx.db();
     const name = blk: {
         const txn = try fx.conn().store.beginRead();
@@ -212,8 +212,8 @@ test "excision empties the entity for pull and q on every view, and tx-range rep
     defer fx.deinit();
     const ann = try loadPeople(fx);
     const a = fx.arena();
-    const eid = try std.fmt.allocPrint(a, "{d}", .{ann});
-    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/add {d} :person/tags :red] [:db/add {d} :person/tags :blue] {{:db/id \"bob\" :person/name \"Bob\" :person/email \"bob@x\"}}]", .{ ann, ann }));
+    const eid = try a.print("{d}", .{ann});
+    _ = try fx.transact(try a.print("[[:db/add {d} :person/tags :red] [:db/add {d} :person/tags :blue] {{:db/id \"bob\" :person/name \"Bob\" :person/email \"bob@x\"}}]", .{ ann, ann }));
     const before = try fx.db();
     const hist = before.withHistory();
 
@@ -279,7 +279,7 @@ test "full-text stays in step under assert, retract, backfill and excision, on a
         \\ {:db/id "b" :doc/n 2 :doc/title "Green apple" :doc/body ["tart"]}]
     );
     const doc_a = r.tempids[0].eid;
-    const eid = try std.fmt.allocPrint(a, "{d}", .{doc_a});
+    const eid = try a.print("{d}", .{doc_a});
     // "red apple pie" → red, apple, pie; "green apple" → green, apple.
     try testing.expectEqual(@as(usize, 5), try tokenRows(fx));
     const titled = try fx.db();
@@ -299,7 +299,7 @@ test "full-text stays in step under assert, retract, backfill and excision, on a
     try testing.expectError(error.TxData, fx.q(titled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]"));
 
     // Retracting one value of the many attribute leaves the other's rows.
-    _ = try fx.transact(try std.fmt.allocPrint(a, "[[:db/retract {d} :doc/body \"sweet red filling\"] [:db/add {d} :doc/title \"Red Plum Pie\"]]", .{ doc_a, doc_a }));
+    _ = try fx.transact(try a.print("[[:db/retract {d} :doc/body \"sweet red filling\"] [:db/add {d} :doc/title \"Red Plum Pie\"]]", .{ doc_a, doc_a }));
     try testing.expectEqual(@as(usize, 8), try tokenRows(fx));
     const retracted = try fx.db();
     try testing.expectEqual(@as(usize, 0), count(try fx.q(retracted, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
@@ -362,7 +362,7 @@ test "full-text folds case across scripts; rows of another folding are searched 
             const dbv = try f.db();
             for (list) |c| {
                 errdefer std.debug.print("needle {s}\n", .{c.needle});
-                const src = try std.fmt.allocPrint(f.arena(), "[:find ?e :where [(fulltext $ :doc/title \"{s}\") [[?e ?v]]]]", .{c.needle});
+                const src = try f.arena().print("[:find ?e :where [(fulltext $ :doc/title \"{s}\") [[?e ?v]]]]", .{c.needle});
                 try testing.expectEqual(c.hits, count(try f.q(dbv, src)));
             }
         }

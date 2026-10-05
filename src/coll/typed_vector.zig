@@ -28,6 +28,7 @@
 //! `=` and `hash` fold it into `+0.0` as they do for a float Value.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
@@ -96,8 +97,8 @@ comptime {
 }
 
 fn bodyOf(h: *HeapHeader) *Body {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.typed_vector));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(h.kind == @backingInt(Kind.typed_vector));
     }
     return Heap.bodyOf(Body, h);
 }
@@ -126,14 +127,14 @@ fn alloc(heap: *Heap, elem: ElemType, len: usize) !*HeapHeader {
     const h = try heap.alloc(.typed_vector, body_size);
     const body = bodyOf(h);
     body.len = len;
-    body.elem = @intFromEnum(elem);
+    body.elem = @backingInt(elem);
     return h;
 }
 
 fn valueFrom(h: *HeapHeader, elem: ElemType) Value {
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.typed_vector)) |
-            (@as(u64, @intFromEnum(elem)) << 16),
+        .tag = @as(u64, @backingInt(Kind.typed_vector)) |
+            (@as(u64, @backingInt(elem)) << 16),
         .payload = @intFromPtr(h),
     };
 }
@@ -170,12 +171,12 @@ pub fn fromF64Slice(heap: *Heap, elems: []const f64) !Value {
 /// The element type, read from the Value's subkind.
 pub fn elemType(v: Value) ElemType {
     std.debug.assert(v.kind() == .typed_vector);
-    return @enumFromInt(@as(u8, @intCast(v.subkind())));
+    return @fromBackingInt(@intCast(@as(u8, @intCast(v.subkind()))));
 }
 
 /// The element type, read from the body.
 fn elemTypeOf(h: *HeapHeader) ElemType {
-    return @enumFromInt(bodyOf(h).elem);
+    return @fromBackingInt(@intCast(bodyOf(h).elem));
 }
 
 pub fn count(v: Value) usize {

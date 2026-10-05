@@ -21,6 +21,7 @@
 //!     access (HEAP.md §1 invariant 3).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const hash_mod = @import("hash.zig");
@@ -72,7 +73,7 @@ pub fn allocUninit(heap: *Heap, len: usize) !struct { value: Value, bytes: []u8 
 pub fn asBytes(v: Value) []const u8 {
     std.debug.assert(v.kind() == .string);
     const h = Heap.asHeapHeader(v);
-    if (std.debug.runtime_safety) {
+    if (builtin.optimize.runtimeSafety()) {
         std.debug.assert(v.subkind() == subkind_heap);
     }
     return Heap.bodyBytes(h);
@@ -90,8 +91,8 @@ pub fn byteLen(v: Value) usize {
 /// `xxHash3(seed, bodyBytes(h))` truncated to u32, stores it in the
 /// cache **only when nonzero** (HEAP.md §1 invariant 3), and returns it.
 pub fn hashHeader(h: *HeapHeader) u32 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.string));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(h.kind == @backingInt(Kind.string));
     }
     if (h.cachedHash()) |cached| return cached;
     const bytes = Heap.bodyBytes(h);
@@ -112,9 +113,9 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 /// string headers' bodies. The dispatcher has already verified both
 /// are `.string`; we assert as defense-in-depth in safe builds.
 pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.string));
-        std.debug.assert(b.kind == @intFromEnum(Kind.string));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(a.kind == @backingInt(Kind.string));
+        std.debug.assert(b.kind == @backingInt(Kind.string));
     }
     if (a == b) return true; // same header -> trivially equal
     const ab = Heap.bodyBytes(a);
@@ -317,7 +318,7 @@ pub fn countMatches(hay: []const u8, needle: []const u8) usize {
 /// and zero-copy subkind paths can compose cleanly when they land.
 fn valueFrom(h: *HeapHeader) Value {
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.string)) |
+        .tag = @as(u64, @backingInt(Kind.string)) |
             (@as(u64, subkind_heap) << 16),
         .payload = @intFromPtr(h),
     };
@@ -327,6 +328,17 @@ fn valueFrom(h: *HeapHeader) Value {
 // Inline tests — per-module basics. Randomized sweeps live in
 // test/prop/string.zig.
 // =============================================================================
+
+/// `s` repeated `n` times, for building long test strings.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(2 * n + 1000);
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        break :blk &final;
+    };
+}
 
 test "fromBytes + asBytes: round-trip byte-exact" {
     var heap = Heap.init(testing.allocator);
@@ -452,7 +464,7 @@ test "valueFrom: tag encodes kind + subkind, payload = *HeapHeader" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const v = try fromBytes(&heap, "x");
-    try testing.expectEqual(@intFromEnum(Kind.string), @intFromEnum(v.kind()));
+    try testing.expectEqual(@backingInt(Kind.string), @backingInt(v.kind()));
     try testing.expectEqual(@as(u16, subkind_heap), v.subkind());
     const h = Heap.asHeapHeader(v);
     try testing.expectEqual(@intFromPtr(h), v.payload);
@@ -480,13 +492,13 @@ test "multiple distinct strings coexist on one heap" {
     var values: [8]Value = undefined;
     for (&values, 0..) |*slot, i| {
         var buf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "str-{d}", .{i}) catch unreachable;
+        const s = std.mem.print(&buf, "str-{d}", .{i}) catch unreachable;
         slot.* = try fromBytes(&heap, s);
     }
     try testing.expectEqual(@as(usize, 8), heap.liveCount());
     for (values, 0..) |v, i| {
         var buf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "str-{d}", .{i}) catch unreachable;
+        const s = std.mem.print(&buf, "str-{d}", .{i}) catch unreachable;
         try testing.expectEqualStrings(s, asBytes(v));
     }
 }
@@ -565,11 +577,11 @@ fn expectMatches(hay: []const u8, needle: []const u8, from: usize) !void {
 }
 
 test "Matches: occurrences across block edges, at both ends, overlapping and past the end" {
-    const long = "a,b,,c" ++ ("x" ** 40) ++ ",," ++ ("y," ** 30) ++ "z,";
+    const long = "a,b,,c" ++ repeat("x", 40) ++ ",," ++ repeat("y,", 30) ++ "z,";
     try expectMatches(long, ",", 0);
     try expectMatches(long, ",,", 0);
     try expectMatches(long, "y,y", 0);
-    try expectMatches(long, "x" ** 33, 0);
+    try expectMatches(long, repeat("x", 33), 0);
     try expectMatches(long, ",", 7);
     try expectMatches(long, "z,", 0);
     try expectMatches("aaaa", "aa", 0);

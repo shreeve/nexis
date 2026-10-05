@@ -136,7 +136,7 @@ pub const Fx = struct {
     }
 
     pub fn joinName(a: Allocator, name: anytype) ![]const u8 {
-        if (name.ns) |ns| return std.fmt.allocPrint(a, "{s}/{s}", .{ ns, name.name });
+        if (name.ns) |ns| return a.print("{s}/{s}", .{ ns, name.name });
         return name.name;
     }
 
@@ -167,13 +167,13 @@ pub const Fx = struct {
         const a = self.arena();
         if (std.mem.eql(u8, name, "bump-age")) {
             const e = args[0].asFixnum();
-            const eid_text = try std.fmt.allocPrint(a, "{d}", .{e});
+            const eid_text = try a.print("{d}", .{e});
             const before = try self.pullSrc(db_before, "[:person/age]", eid_text);
             const cur = (try self.getName(before, "person/age")) orelse value.fromFixnum(0).?;
-            return self.read(try std.fmt.allocPrint(a, "[[:db/add {d} :person/age {d}]]", .{ e, cur.asFixnum() + args[1].asFixnum() }));
+            return self.read(try a.print("[[:db/add {d} :person/age {d}]]", .{ e, cur.asFixnum() + args[1].asFixnum() }));
         }
         if (std.mem.eql(u8, name, "twice")) {
-            return self.read(try std.fmt.allocPrint(a, "[[:db.fn/call bump-age {d} 1] [:db.fn/call bump-age {d} 1]]", .{ args[0].asFixnum(), args[0].asFixnum() }));
+            return self.read(try a.print("[[:db.fn/call bump-age {d} 1] [:db.fn/call bump-age {d} 1]]", .{ args[0].asFixnum(), args[0].asFixnum() }));
         }
         if (std.mem.eql(u8, name, "nothing")) return value.nilValue();
         if (std.mem.eql(u8, name, "forever")) return self.read("[[:db.fn/call forever]]");

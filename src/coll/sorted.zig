@@ -535,7 +535,7 @@ pub const Natural = struct {
 /// collection with its entries. Cached in the root header.
 pub fn hashOf(h: *HeapHeader, elementHash: ElementHash) u64 {
     if (h.cachedHash()) |cached| return cached;
-    const kind: Kind = @enumFromInt(h.kind);
+    const kind: Kind = @fromBackingInt(@intCast(h.kind));
     const is_map = kind == .sorted_map;
     var acc: u64 = hash_mod.unordered_init;
     var n: usize = 0;
@@ -577,7 +577,7 @@ pub fn equalInOrder(a: Value, b: Value, elementEq: ElementEq) bool {
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
     const r = Heap.bodyOf(Root, h);
     visitor.markValue(r.comparator);
-    if (r.tree) |t| traceNode(t, h.kind == @intFromEnum(Kind.sorted_map), visitor);
+    if (r.tree) |t| traceNode(t, h.kind == @backingInt(Kind.sorted_map), visitor);
 }
 
 fn traceNode(start: *HeapHeader, is_map: bool, visitor: anytype) void {

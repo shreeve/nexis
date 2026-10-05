@@ -137,7 +137,7 @@ test "I5: density — insertion order assigns dense ids 0..N-1" {
     var i: u32 = 0;
     while (i < N) : (i += 1) {
         var buf: [16]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "sym{d}", .{i}) catch unreachable;
+        const name = std.mem.print(&buf, "sym{d}", .{i}) catch unreachable;
         const id = try it.internSymbol(name);
         try std.testing.expectEqual(i, id);
     }
@@ -234,7 +234,7 @@ test "I9: splitQualified inverts internQualified* at the first slash" {
         for (name_buf[0..name_len]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
         const ns: ?[]const u8 = if (r.boolean()) ns_buf[0..ns_len] else null;
         const name = name_buf[0..name_len];
-        if (ns == null and std.mem.indexOfScalar(u8, name, '/') != null and !std.mem.eql(u8, name, "/")) continue;
+        if (ns == null and std.mem.findScalar(u8, name, '/') != null and !std.mem.eql(u8, name, "/")) continue;
         const kw = try it.internQualifiedKeyword(ns, name);
         const parts = intern.Interner.splitQualified(it.keywordName(kw.asKeywordId()));
         if (ns) |want| try std.testing.expectEqualStrings(want, parts.ns.?) else try std.testing.expect(parts.ns == null);
@@ -282,7 +282,7 @@ test "I11: hash and map order follow the text, not the intern order" {
 
     var names: [40][8]u8 = undefined;
     var slices: [40][]const u8 = undefined;
-    for (&names, &slices, 0..) |*buf, *s, i| s.* = try std.fmt.bufPrint(buf, "k{d}", .{i});
+    for (&names, &slices, 0..) |*buf, *s, i| s.* = try std.mem.print(buf, "k{d}", .{i});
 
     // `a` interns unrelated names first and the names forward; `b`
     // interns them backward, so every name has a different id in each.

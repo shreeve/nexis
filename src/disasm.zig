@@ -78,7 +78,7 @@ fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
 /// §4.5): an argument count whose kind bits the handler ignores.
 fn immediateB(group: vm.Group, variant: u6) bool {
     return switch (group) {
-        .call => variant == @intFromEnum(vm.Call.call) or variant == @intFromEnum(vm.Call.tailcall),
+        .call => variant == @backingInt(vm.Call.call) or variant == @backingInt(vm.Call.tailcall),
         .coll => true,
         else => false,
     };
@@ -91,14 +91,14 @@ const Wide = enum { pc, constant, var_, capture, try_ };
 fn wideField(group: vm.Group, variant: u6) ?Wide {
     return switch (group) {
         .jump => .pc,
-        .ctrl => switch (@as(vm.CtrlOp, @enumFromInt(variant))) {
+        .ctrl => switch (@as(vm.CtrlOp, @fromBackingInt(@intCast(variant)))) {
             .try_enter => .try_,
             .try_exit => .pc,
             else => null,
         },
-        .mov => if (variant == @intFromEnum(vm.Mov.load_const)) .constant else null,
+        .mov => if (variant == @backingInt(vm.Mov.load_const)) .constant else null,
         .var_ => .var_,
-        .closure => if (variant == @intFromEnum(vm.Closure_.make)) .capture else null,
+        .closure => if (variant == @backingInt(vm.Closure_.make)) .capture else null,
         else => null,
     };
 }
@@ -141,7 +141,7 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
         try writer.print("  {d:0>4}  ", .{pc});
         try writeOpcode(inst, writer);
         try writer.writeAll("  ");
-        const group: vm.Group = @enumFromInt(inst.group);
+        const group: vm.Group = @fromBackingInt(@intCast(inst.group));
         try writeOperand(inst.a, routine, interner, false, writer);
         try writer.writeAll("  ");
         if (wideField(group, inst.variant)) |wide| {
@@ -178,7 +178,7 @@ fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
         fixed.print("?{d}", .{inst.group}) catch unreachable;
     }
     fixed.writeAll(":") catch unreachable;
-    const group: vm.Group = @enumFromInt(inst.group);
+    const group: vm.Group = @fromBackingInt(@intCast(inst.group));
     if (variantName(group, inst.variant)) |v| {
         fixed.writeAll(v) catch unreachable;
     } else {
@@ -273,7 +273,7 @@ fn writeConstant(v: value_mod.Value, interner: ?*const intern_mod.Interner, writ
     };
     const text = fixed.buffered();
     if (text.len <= max_constant_width) return writer.writeAll(text);
-    var cut = std.mem.lastIndexOfScalar(u8, text[0..max_constant_width], ' ') orelse max_constant_width;
+    var cut = std.mem.findScalarLast(u8, text[0..max_constant_width], ' ') orelse max_constant_width;
     while (cut > 0 and text[cut] & 0xC0 == 0x80) cut -= 1;
     try writer.print("{s} ...", .{text[0..cut]});
     const items: ?usize = switch (v.kind()) {
@@ -293,12 +293,11 @@ fn writeConstant(v: value_mod.Value, interner: ?*const intern_mod.Interner, writ
 const testing = std.testing;
 
 test "every group the VM defines has a name" {
-    inline for (@typeInfo(vm.Group).@"enum".fields) |field| {
-        const g: vm.Group = @enumFromInt(field.value);
-        const name = groupName(@intFromEnum(g)) orelse return error.TestFailed;
+    for (std.meta.tags(vm.Group)) |g| {
+        const name = groupName(@backingInt(g)) orelse return error.TestFailed;
         // `var_` is spelled `var` in bytecode listings; every other
         // group name is its tag.
-        const expected = if (g == .var_) "var" else field.name;
+        const expected = if (g == .var_) "var" else @tagName(g);
         try testing.expectEqualStrings(expected, name);
     }
     try testing.expect(groupName(group_names.len) == null);
@@ -308,14 +307,14 @@ test "every group the VM defines has a name" {
 /// and the tables name nothing the enums do not define.
 fn expectVariantsNamed(comptime E: type, group: vm.Group) !void {
     var highest: u6 = 0;
-    inline for (@typeInfo(E).@"enum".fields) |field| {
-        const v: u6 = @intCast(field.value);
+    for (std.meta.tags(E)) |e| {
+        const v: u6 = @intCast(@backingInt(e));
         try testing.expect(variantName(group, v) != null);
         if (v > highest) highest = v;
     }
     var v: u6 = 0;
     while (v <= highest) : (v += 1) {
-        const defined = std.enums.tagName(E, @as(E, @enumFromInt(v))) != null;
+        const defined = std.enums.tagName(E, @as(E, @fromBackingInt(@intCast(v)))) != null;
         try testing.expectEqual(defined, variantName(group, v) != null);
     }
     try testing.expect(variantName(group, highest + 1) == null);
@@ -428,13 +427,13 @@ test "a large constant prints as its first 60 bytes and its item count" {
 
 test "an unnamed variant or group prints its number" {
     const code = [_]vm.Inst{
-        .{ .kind = .primary, .group = @intFromEnum(vm.Group.math), .variant = 20, .a = vm.Operand.slot(0), .b = vm.Operand.none, .c = vm.Operand.none },
+        .{ .kind = .primary, .group = @backingInt(vm.Group.math), .variant = 20, .a = vm.Operand.slot(0), .b = vm.Operand.none, .c = vm.Operand.none },
         .{ .kind = .primary, .group = 40, .variant = 1, .a = vm.Operand.none, .b = vm.Operand.none, .c = vm.Operand.none },
     };
     const routine = vm.Routine{ .code = &code, .consts = &.{}, .slot_count = 1, .name = "t" };
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try disassemble(&routine, null, &out.writer);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "math:?20") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "?40:?1") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "math:?20") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "?40:?1") != null);
 }

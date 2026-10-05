@@ -26,6 +26,7 @@
 //!     (BIGNUM.md §2) are all satisfied.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const hash_mod = @import("hash.zig");
@@ -133,8 +134,8 @@ pub fn limbCount(v: Value) usize {
 /// (HEAP.md §1). Padding bytes inside the body are deliberately
 /// excluded — the hash is over semantic content only.
 pub fn hashHeader(h: *HeapHeader) u32 {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.bignum));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(h.kind == @backingInt(Kind.bignum));
     }
     if (h.cachedHash()) |cached| return cached;
 
@@ -159,9 +160,9 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 /// maintained by the canonicalizer, so equal limb-byte-streams iff
 /// equal magnitudes.
 pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(a.kind == @intFromEnum(Kind.bignum));
-        std.debug.assert(b.kind == @intFromEnum(Kind.bignum));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(a.kind == @backingInt(Kind.bignum));
+        std.debug.assert(b.kind == @backingInt(Kind.bignum));
     }
     if (a == b) return true;
     if (headerNegative(a) != headerNegative(b)) return false;
@@ -243,8 +244,9 @@ pub fn add(heap: *Heap, a: Value, b: Value) !Value {
     var sb: [1]Limb = undefined;
     const x = view(a, &sa);
     const y = view(b, &sb);
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const buf = try alloc.alloc(Limb, @max(x.limbs.len, y.limbs.len) + 1);
     defer alloc.free(buf);
     var r = mutable(buf);
@@ -257,8 +259,9 @@ pub fn sub(heap: *Heap, a: Value, b: Value) !Value {
     var sb: [1]Limb = undefined;
     const x = view(a, &sa);
     const y = view(b, &sb);
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const buf = try alloc.alloc(Limb, @max(x.limbs.len, y.limbs.len) + 1);
     defer alloc.free(buf);
     var r = mutable(buf);
@@ -271,8 +274,9 @@ pub fn mul(heap: *Heap, a: Value, b: Value) !Value {
     var sb: [1]Limb = undefined;
     const x = view(a, &sa);
     const y = view(b, &sb);
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const buf = try alloc.alloc(Limb, x.limbs.len + y.limbs.len);
     defer alloc.free(buf);
     var r = mutable(buf);
@@ -294,8 +298,9 @@ fn divide(heap: *Heap, a: Value, b: Value, rounding: Rounding, part: DivPart) !?
     const x = view(a, &sa);
     const y = view(b, &sb);
     std.debug.assert(!y.eqlZero());
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const qbuf = try alloc.alloc(Limb, x.limbs.len + 1);
     defer alloc.free(qbuf);
     const rbuf = try alloc.alloc(Limb, y.limbs.len + 1);
@@ -371,9 +376,10 @@ pub fn toF64(v: Value) f64 {
 pub fn fromF64(heap: *Heap, f: f64) !?Value {
     if (!std.math.isFinite(f)) return null;
     const t = @trunc(f);
-    if (@abs(t) < @as(f64, @floatFromInt(@as(u64, 1) << 47))) return value.fromFixnum(@intFromFloat(t)).?;
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    if (@abs(t) < @as(f64, @floatFromInt(@as(u64, 1) << 47))) return value.fromFixnum(@trunc(t)).?;
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const buf = try alloc.alloc(Limb, bigint.calcLimbLen(t) + 1);
     defer alloc.free(buf);
     var m = mutable(buf);
@@ -456,8 +462,9 @@ fn writePart(
 
 /// `x` through `std`'s conversion, left-padded with zeros to `width`.
 fn writeSmallDecimal(x: bigint.Const, width: usize, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    var sfa = std.heap.stackFallback(scratch_bytes * 8, std.heap.page_allocator);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs * 8]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), std.heap.page_allocator);
+    const alloc = bfa.allocator();
     const digits = alloc.alloc(u8, @max(1, x.sizeInBaseUpperBound(10))) catch return error.WriteFailed;
     defer alloc.free(digits);
     const tmp = alloc.alloc(Limb, bigint.calcToStringLimbsBufferLen(@max(1, x.limbs.len), 10)) catch return error.WriteFailed;
@@ -474,8 +481,9 @@ pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value {
     if (digits.len == 0) return null;
     for (digits) |c| if (c < '0' or c > '9') return null;
     if (digits.len <= 18) return try fromI64(heap, std.fmt.parseInt(i64, text, 10) catch unreachable);
-    var sfa = std.heap.stackFallback(scratch_bytes, heap.backing);
-    const alloc = sfa.get();
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
     const buf = try alloc.alloc(Limb, bigint.calcSetStringLimbCount(10, digits.len));
     defer alloc.free(buf);
     var m = mutable(buf);
@@ -548,7 +556,7 @@ fn canonicalizeToValue(heap: *Heap, negative: bool, input_limbs: []const u64) !V
 
     // Canonicality self-check — catches canonicalizer bugs at
     // construction time rather than later at hash/eq.
-    if (std.debug.runtime_safety) {
+    if (builtin.optimize.runtimeSafety()) {
         std.debug.assert(dst_limbs.len >= 1); // not empty
         std.debug.assert(dst_limbs[dst_limbs.len - 1] != 0); // no trailing zero
     }
@@ -595,7 +603,7 @@ fn headerLimbs(h: *HeapHeader) []const u64 {
 /// through `canonicalizeToValue` only.
 fn valueFrom(h: *HeapHeader) Value {
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.bignum)) |
+        .tag = @as(u64, @backingInt(Kind.bignum)) |
             (@as(u64, subkind_limbs) << 16),
         .payload = @intFromPtr(h),
     };
@@ -1063,11 +1071,11 @@ test "toF64/fromF64: 2^64 round-trips; the fraction truncates; NaN and infinity 
     try testing.expect((try fromF64(&heap, std.math.nan(f64))) == null);
     try testing.expect((try fromF64(&heap, std.math.inf(f64))) == null);
     // 2^200 rounds to the nearest double and back to the same integer.
-    var two200_limbs = [_]u64{0} ** 4;
+    var two200_limbs: [4]u64 = @splat(0);
     two200_limbs[3] = @as(u64, 1) << 8;
     const two200 = try fromLimbs(&heap, false, &two200_limbs);
     try testing.expect(compare((try fromF64(&heap, toF64(two200))).?, two200) == .eq);
-    try testing.expect(std.math.isInf(toF64(try fromLimbs(&heap, false, &([_]u64{1} ** 20)))));
+    try testing.expect(std.math.isInf(toF64(try fromLimbs(&heap, false, &@as([20]u64, @splat(1))))));
 }
 
 test "toI64: fixnums, bignums within i64, and one beyond" {

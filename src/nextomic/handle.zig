@@ -132,7 +132,7 @@ pub fn makeDb(heap: *Heap, shape: DbShape) !Value {
         .has_as_of = @intFromBool(shape.as_of != null),
         .has_since = @intFromBool(shape.since != null),
         .history = @intFromBool(shape.history),
-        ._pad = [_]u8{0} ** 4,
+        ._pad = @splat(0),
     };
     return Heap.valueFromHeader(.nextomic_db, h);
 }

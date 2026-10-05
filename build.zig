@@ -1,17 +1,19 @@
 //! nexis — build configuration.
 //!
 //! Steps:
-//!   zig build install                 bin/nexis and bin/nexis-golden
+//!   zig build [install]               bin/nexis and bin/nexis-golden
 //!   zig build test                    the gate: unit, property, integration and
 //!                                     Nextomic corpora, goldens, test/nextomic
 //!                                     scripts, examples; analyzes the bench
+//!   zig build test -Dgc-stress        the gate with a collection every few kilobytes
+//!   zig build test -Ddurability=durable  the gate with every store commit synced
 //!   zig build quick                   the inner loop: unit tests, the compile and
 //!                                     Nextomic property tests, the eval corpora
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
 //!   zig build nextomic-nx             test/nextomic/*.nx through bin/nexis
 //!   zig build examples                every examples/*.nx through bin/nexis
 //!   zig build golden [-Dupdate=true]  reader and CLI goldens (byte-exact)
-//!   zig build bench [-- ARGS]         the benchmark suite, ReleaseFast
+//!   zig build bench [-- ARGS]         the benchmark suite, optimized for speed
 //!   zig build run -- ARGS             build and run bin/nexis
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
 //!   zig build parser-check            diff src/parser.zig against a fresh generation
@@ -31,6 +33,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const update = b.option(bool, "update", "rewrite the expected-output files the gate compares, instead of comparing") orelse false;
+    const env: RunEnv = .{
+        .gc_stress = b.option(bool, "gc-stress", "run every test and program with a collection every few kilobytes (NEXIS_GC_STRESS)") orelse false,
+        .durability = b.option(RunEnv.Durability, "durability", "the durability of every store commit the tests and programs make (NEXIS_DURABILITY)"),
+    };
 
     const nexis = runtime(b, target, optimize);
 
@@ -51,28 +57,31 @@ pub fn build(b: *std.Build) void {
 
     // Parser generation, through the external nexus tool at ../nexus/bin/nexus.
     const nexus_bin = b.option([]const u8, "nexus", "the nexus parser generator (default ../nexus/bin/nexus)") orelse
-        b.pathJoin(&.{ b.pathFromRoot(".."), "nexus", "bin", "nexus" });
+        b.pathResolve(&.{ rootPath(b), "..", "nexus", "bin", "nexus" });
     const run_nexus = b.addSystemCommand(&.{ nexus_bin, "nexis.grammar", "src/parser.zig" });
     run_nexus.setCwd(b.path("."));
     b.step("parser", "Regenerate src/parser.zig from nexis.grammar").dependOn(&run_nexus.step);
     // The committed src/parser.zig against a generation into the cache;
-    // the gate runs it whenever nexus is there to run.
+    // the gate runs it whenever nexus is there to run. The build
+    // notices a nexus built after it last looked.
     const parser_check_step = b.step("parser-check", "Fail when src/parser.zig differs from what nexus generates from nexis.grammar");
-    if (b.build_root.handle.access(b.graph.io, nexus_bin, .{})) |_| {
+    if (std.Io.Dir.cwd().access(b.graph.io, nexus_bin, .{})) |_| {
+        b.dependOnFileMetadata(.{ .cwd_relative = nexus_bin });
         const generate = b.addSystemCommand(&.{nexus_bin});
-        generate.addFileArg(b.path("nexis.grammar"));
-        const generated = generate.addOutputFileArg("parser.zig");
+        generate.addFileArg2(b.path("nexis.grammar"), .{});
+        const generated = generate.addOutputFileArg2("parser.zig", .{});
         generate.addFileInput(.{ .cwd_relative = nexus_bin });
         generate.expectExitCode(0);
         _ = generate.captureStdOut(.{});
         _ = generate.captureStdErr(.{});
         const compare = b.addSystemCommand(&.{ "sh", "-c", "diff -u \"$1\" \"$2\" >&2 || { echo 'src/parser.zig is stale: run zig build parser' >&2; exit 1; }", "parser-check" });
-        compare.addFileArg(b.path("src/parser.zig"));
-        compare.addFileArg(generated);
+        compare.addFileArg2(b.path("src/parser.zig"), .{});
+        compare.addFileArg2(generated, .{});
         compare.expectExitCode(0);
         parser_check_step.dependOn(&compare.step);
         test_step.dependOn(&compare.step);
     } else |_| {
+        b.graph.poisonCache();
         const skip = b.addSystemCommand(&.{ "echo", b.fmt("parser-check: skipped, no nexus at {s}", .{nexus_bin}) });
         parser_check_step.dependOn(&skip.step);
     }
@@ -85,6 +94,7 @@ pub fn build(b: *std.Build) void {
     // whatever directory `zig build` started in.
     const unit = b.addRunArtifact(bins.unit);
     unit.setCwd(b.path("."));
+    env.apply(unit, env.gc_stress);
     test_step.dependOn(&unit.step);
     quick_step.dependOn(&unit.step);
     // The Nextomic subset, compiled only when `nextomic-test` runs alone.
@@ -95,12 +105,14 @@ pub fn build(b: *std.Build) void {
         .use_llvm = useLlvm(target),
     }));
     nextomic_unit.setCwd(b.path("."));
+    env.apply(nextomic_unit, env.gc_stress);
     nextomic_test_step.dependOn(&nextomic_unit.step);
 
     // Property and integration binaries: one per file, so they run in parallel.
     for (suites, bins.suites) |suite, compile| {
         const run = b.addRunArtifact(compile);
         run.setCwd(b.path("."));
+        env.apply(run, env.gc_stress);
         test_step.dependOn(&run.step);
         if (suite.quick) quick_step.dependOn(&run.step);
         if (suite.nextomic) nextomic_test_step.dependOn(&run.step);
@@ -108,29 +120,22 @@ pub fn build(b: *std.Build) void {
 
     // bin/nexis, the CLI.
     const nexis_exe = bins.nexis;
-    const install_nexis = b.addInstallArtifact(nexis_exe, .{
-        .dest_dir = .{ .override = .{ .custom = ".." } },
-        .dest_sub_path = "bin/nexis",
-    });
-    b.getInstallStep().dependOn(&install_nexis.step);
-    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(&install_nexis.step);
+    const checkout_nexis = toCheckout(b, nexis_exe, "bin/nexis");
+    b.getInstallStep().dependOn(checkout_nexis);
+    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(checkout_nexis);
     const run_nexis = b.addRunArtifact(nexis_exe);
-    if (b.args) |args| run_nexis.addArgs(args);
-    run_nexis.step.dependOn(&install_nexis.step);
+    run_nexis.addPassthruArgs();
+    run_nexis.step.dependOn(checkout_nexis);
     b.step("run", "Build and run nexis (forwards args after `--`)").dependOn(&run_nexis.step);
 
     // The benchmark runner. Its runtime is optimized too, so the numbers
-    // measure release code; `-Doptimize=ReleaseSafe` and the like apply.
-    const bench_optimize: std.builtin.OptimizeMode = if (optimize == .Debug) .ReleaseFast else optimize;
+    // measure release code; `-Doptimize=safe` and the like apply.
+    const bench_optimize: std.lang.Optimize = if (optimize == .debug) .fast else optimize;
     const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize));
-    const install_bench = b.addInstallArtifact(bench_exe, .{
-        .dest_dir = .{ .override = .{ .custom = ".." } },
-        .dest_sub_path = "bin/nexis-bench",
-    });
     const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| run_bench.addArgs(args);
-    run_bench.step.dependOn(&install_bench.step);
-    b.step("bench", "Run the benchmark suite (ReleaseFast)").dependOn(&run_bench.step);
+    run_bench.addPassthruArgs();
+    run_bench.step.dependOn(toCheckout(b, bench_exe, "bin/nexis-bench"));
+    b.step("bench", "Run the benchmark suite (optimized for speed)").dependOn(&run_bench.step);
     // The gate analyzes the suite against the Debug runtime without
     // generating code or running it, so an API change cannot leave the
     // bench broken.
@@ -158,7 +163,7 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .exe = nexis_exe,
         .update = update,
-        .stress = b.graph.environ_map.get("NEXIS_GC_STRESS") != null,
+        .env = env,
     };
 
     // test/nextomic/*.nx: each script's stdout against its `.out`
@@ -197,17 +202,13 @@ pub fn build(b: *std.Build) void {
             .{ .script = script, .expected = second },
         };
         const count: usize = if (exists(b, second)) 2 else 1;
-        scripts.unit(examples_step, b.fmt("examples-{s}", .{name}), programs[0..count], example_libs, scripts.stress);
+        scripts.unit(examples_step, b.fmt("examples-{s}", .{name}), programs[0..count], example_libs, env.gc_stress);
     }
     test_step.dependOn(examples_step);
 
     // Goldens: the reader's Form output (src/golden.zig) and the CLI.
     const golden_exe = bins.golden;
-    const install_golden = b.addInstallArtifact(golden_exe, .{
-        .dest_dir = .{ .override = .{ .custom = ".." } },
-        .dest_sub_path = "bin/nexis-golden",
-    });
-    b.getInstallStep().dependOn(&install_golden.step);
+    b.getInstallStep().dependOn(toCheckout(b, golden_exe, "bin/nexis-golden"));
 
     const golden_step = b.step("golden", "Run the reader and CLI goldens");
     test_step.dependOn(golden_step);
@@ -268,7 +269,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
         };
         for (cases) |case| {
-            const run = scripts.program(scripts.stress);
+            const run = scripts.program(env.gc_stress);
             run.setCwd(b.path("."));
             if (case.max_alloc) |max| run.setEnvironmentVariable("NEXIS_MAX_ALLOC", max);
             run.addArgs(case.args);
@@ -294,18 +295,16 @@ const Scripts = struct {
     b: *std.Build,
     exe: *std.Build.Step.Compile,
     update: bool,
-    /// `NEXIS_GC_STRESS` is set in the build's environment.
-    stress: bool,
+    env: RunEnv,
 
-    /// A run of bin/nexis with an environment of its own: empty, or
-    /// only `NEXIS_GC_STRESS` when `stress`. The step's cache key
-    /// hashes that environment, so a stress build never reuses a
-    /// result a normal build left, and nothing else in the caller's
-    /// environment reaches the program or its key.
+    /// A run of bin/nexis with an environment of its own: empty but
+    /// for what `env` sets, with `NEXIS_GC_STRESS` when `stress`.
+    /// Nothing else in the caller's environment reaches the program
+    /// or its cache key.
     fn program(self: Scripts, stress: bool) *std.Build.Step.Run {
         const r = self.b.addRunArtifact(self.exe);
         r.clearEnvironment();
-        if (stress) r.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
+        self.env.apply(r, stress);
         return r;
     }
 
@@ -323,7 +322,7 @@ const Scripts = struct {
         for (programs) |p| {
             const r = self.program(stress);
             r.addArg("run");
-            r.addFileArg(self.b.path(p.script));
+            r.addFileArg2(self.b.path(p.script), .{});
             r.setCwd(cwd);
             for (inputs) |input| r.addFileInput(self.b.path(input));
             r.has_side_effects = programs.len > 1;
@@ -341,7 +340,7 @@ const Scripts = struct {
     fn freshDir(self: Scripts, name: []const u8) std.Build.LazyPath {
         const mk = self.b.addSystemCommand(&.{ "sh", "-c", "rm -rf \"$1\" && mkdir -p \"$1\"", name });
         mk.has_side_effects = true;
-        const dir = mk.addOutputDirectoryArg("cwd");
+        const dir = mk.addOutputDirectoryArg2("cwd", .{});
         mk.expectExitCode(0);
         return dir;
     }
@@ -362,7 +361,8 @@ const Scripts = struct {
             return;
         }
         step.dependOn(&r.step);
-        const expected = b.build_root.handle.readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 20)) catch |err| {
+        b.dependOnFileContents(b.path(path));
+        const expected = readSource(b, path, 1 << 20) catch |err| {
             r.step.dependOn(&b.addFail(b.fmt("{s}: {t} (write it with -Dupdate=true)", .{ path, err })).step);
             return;
         };
@@ -373,12 +373,54 @@ const Scripts = struct {
     }
 };
 
+/// The runtime environment the build gives the tests and programs it
+/// runs, from its options. The build reads nothing from its own
+/// environment: a variable set on a step is part of the step's cache
+/// key, so a stressed or durable run never replays a normal run's
+/// result.
+const RunEnv = struct {
+    /// `NEXIS_GC_STRESS`: a collection every few kilobytes (docs/GC.md §7).
+    gc_stress: bool,
+    /// `NEXIS_DURABILITY` (docs/DB.md §3.3); unset leaves the runtime's
+    /// default.
+    durability: ?Durability,
+
+    const Durability = enum { commit, durable };
+
+    /// Set the variables on `run`, `NEXIS_GC_STRESS` when `stress`.
+    fn apply(env: RunEnv, run: *std.Build.Step.Run, stress: bool) void {
+        if (stress) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
+        if (env.durability) |d| run.setEnvironmentVariable("NEXIS_DURABILITY", @tagName(d));
+    }
+};
+
+/// A step that copies `exe` to `sub_path` in the checkout, where every
+/// binary the build makes is installed; nothing goes to the prefix.
+fn toCheckout(b: *std.Build, exe: *std.Build.Step.Compile, sub_path: []const u8) *std.Build.Step {
+    const copy = b.addUpdateSourceFiles();
+    copy.addCopyFileToSource(exe.getEmittedBin(), sub_path);
+    return &copy.step;
+}
+
+/// The build root as a path string.
+fn rootPath(b: *std.Build) []const u8 {
+    return b.fmt("{f}", .{b.root});
+}
+
+/// The contents of the file at `path`, relative to the build root.
+fn readSource(b: *std.Build, path: []const u8, limit: usize) ![]u8 {
+    const io = b.graph.io;
+    var root = try b.root.openDir(io, ".", .{});
+    defer root.close(io);
+    return root.readFileAlloc(io, path, b.allocator, .limited(limit));
+}
+
 /// The names under `dir` (relative to the build root) ending in `ext`,
 /// without it, sorted.
 fn listStems(b: *std.Build, dir: []const u8, ext: []const u8) []const []const u8 {
     var stems: std.ArrayList([]const u8) = .empty;
     for (listFiles(b, dir, false)) |path| {
-        const base = std.fs.path.basename(path);
+        const base = std.Io.Dir.path.basename(path);
         if (std.mem.endsWith(u8, base, ext))
             stems.append(b.allocator, base[0 .. base.len - ext.len]) catch @panic("OOM");
     }
@@ -386,18 +428,23 @@ fn listStems(b: *std.Build, dir: []const u8, ext: []const u8) []const []const u8
 }
 
 /// The paths of the files under `dir`, and under its subdirectories
-/// when `recursive`, sorted.
+/// when `recursive`, sorted. A file added or removed there configures
+/// the build again.
 fn listFiles(b: *std.Build, dir: []const u8, recursive: bool) []const []const u8 {
     const io = b.graph.io;
-    var handle = b.build_root.handle.openDir(io, dir, .{ .iterate = true }) catch |err|
+    var handle = b.root.openDir(io, dir, .{ .iterate = true }) catch |err|
         std.debug.panic("cannot open {s}: {t}", .{ dir, err });
     defer handle.close(io);
+    b.dependOnDirectoryContents(b.path(dir));
     var paths: std.ArrayList([]const u8) = .empty;
     var walker = handle.walkSelectively(b.allocator) catch @panic("OOM");
     defer walker.deinit();
     while (walker.next(io) catch |err| std.debug.panic("cannot list {s}: {t}", .{ dir, err })) |entry| switch (entry.kind) {
         .file => paths.append(b.allocator, b.pathJoin(&.{ dir, entry.path })) catch @panic("OOM"),
-        .directory => if (recursive) walker.enter(io, entry) catch |err| std.debug.panic("cannot list {s}: {t}", .{ entry.path, err }),
+        .directory => if (recursive) {
+            walker.enter(io, entry) catch |err| std.debug.panic("cannot list {s}: {t}", .{ entry.path, err });
+            b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ dir, entry.path })));
+        },
         else => {},
     };
     std.mem.sort([]const u8, paths.items, {}, struct {
@@ -408,8 +455,11 @@ fn listFiles(b: *std.Build, dir: []const u8, recursive: bool) []const []const u8
     return paths.items;
 }
 
+/// Whether `path`, relative to the build root, exists. Creating or
+/// deleting it configures the build again.
 fn exists(b: *std.Build, path: []const u8) bool {
-    b.build_root.handle.access(b.graph.io, path, .{}) catch return false;
+    b.dependOnDirectoryContents(b.path(std.Io.Dir.path.dirname(path) orelse "."));
+    b.root.access(b.graph.io, path, .{}) catch return false;
     return true;
 }
 
@@ -466,7 +516,7 @@ const Binaries = struct {
 
 /// Every binary the build compiles for `target`, over the runtime
 /// module `nexis`.
-fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, nexis: *std.Build.Module) Binaries {
+fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) Binaries {
     const harness = b.createModule(.{
         .root_source_file = b.path("test/harness.zig"),
         .target = target,
@@ -482,7 +532,7 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
         });
         module.addImport("nexis", nexis);
         module.addImport("harness", harness);
-        bin.* = b.addTest(.{ .name = std.fs.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
+        bin.* = b.addTest(.{ .name = std.Io.Dir.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
     }
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
@@ -508,7 +558,7 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     };
 }
 
-fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, nexis: *std.Build.Module) *std.Build.Step.Compile {
+fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) *std.Build.Step.Compile {
     const module = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
@@ -519,8 +569,8 @@ fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
 }
 
 /// Every binary on x86_64 compiles through LLVM, whatever the optimize
-/// mode. Zig 0.16's own x86_64 backend, the default for Debug there,
-/// cannot compile the threaded dispatch's `@call(.always_tail, ...)`
+/// mode. Zig's own x86_64 backend, the default for Debug there, cannot
+/// compile the threaded dispatch's `@call(.always_tail, ...)`
 /// (`docs/VM.md` §6); LLVM can, and release builds use LLVM already.
 /// Elsewhere the compiler chooses.
 fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
@@ -530,7 +580,7 @@ fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
 /// The `nexis` module: the whole runtime, rooted at src/root.zig. It
 /// links libc on every target: the runtime and emdb call it, and
 /// Linux, unlike macOS, links it only on request.
-fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -542,13 +592,14 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 }
 
 /// emdb, the storage engine: a path dependency on the sibling checkout.
-fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     return b.dependency("emdb", .{ .target = target, .optimize = optimize }).module("emdb");
 }
 
 /// Check every `@import` under src/ against the layering src/root.zig
 /// declares (PLAN §5, docs/FORMS.md §4). Returns a message naming the
-/// first violation, or null.
+/// first violation, or null. Every file and directory it reads is a
+/// configure input, so an edit under src/ checks the layering again.
 ///
 /// - src/root.zig declares the runtime files bottom-up; a file may import
 ///   only files declared above it. That keeps the graph acyclic and the
@@ -564,9 +615,11 @@ fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 fn checkLayering(b: *std.Build) ?[]const u8 {
     const io = b.graph.io;
     const gpa = b.allocator;
-    var src = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch |err|
+    var src = b.root.openDir(io, "src", .{ .iterate = true }) catch |err|
         return b.fmt("layering: cannot open src/: {t}", .{err});
     defer src.close(io);
+    b.dependOnDirectoryContents(b.path("src"));
+    b.dependOnFileContents(b.path("src/root.zig"));
 
     const root_text = src.readFileAlloc(io, "root.zig", gpa, .limited(1 << 20)) catch |err|
         return b.fmt("layering: cannot read src/root.zig: {t}", .{err});
@@ -578,6 +631,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
     var walker = src.walk(gpa) catch @panic("OOM");
     defer walker.deinit();
     while (walker.next(io) catch |err| return b.fmt("layering: walking src/: {t}", .{err})) |entry| {
+        if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ "src", entry.path })));
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
         const file = b.dupe(entry.path);
         if (std.mem.eql(u8, file, "root.zig")) continue;
@@ -587,12 +641,13 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
         else
             return b.fmt("layering: src/{s} is not declared in src/root.zig", .{file});
 
+        b.dependOnFileContents(b.path(b.pathJoin(&.{ "src", file })));
         const text = src.readFileAlloc(io, file, gpa, .limited(1 << 24)) catch |err|
             return b.fmt("layering: cannot read src/{s}: {t}", .{ file, err });
         for (importPaths(gpa, text)) |rel| {
             if (!std.mem.endsWith(u8, rel, ".zig")) continue;
-            const dir = std.fs.path.dirnamePosix(file) orelse "";
-            const target = std.fs.path.resolvePosix(gpa, &.{ dir, rel }) catch @panic("OOM");
+            const dir = std.Io.Dir.path.dirnamePosix(file) orelse "";
+            const target = std.Io.Dir.path.resolvePosix(gpa, &.{ dir, rel }) catch @panic("OOM");
             const to = layerUnit(target);
             if (std.mem.eql(u8, to, from)) continue;
             if (std.mem.eql(u8, to, "nextomic/root.zig") and !std.mem.eql(u8, from, "stdlib.zig"))
@@ -615,7 +670,7 @@ fn importPaths(gpa: std.mem.Allocator, text: []const u8) []const []const u8 {
     while (i < text.len) : (i += 1) switch (text[i]) {
         // A comment, or a line of a multiline string literal.
         '/', '\\' => if (i + 1 < text.len and text[i + 1] == text[i]) {
-            i = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+            i = std.mem.findScalarPos(u8, text, i, '\n') orelse text.len;
         },
         '"', '\'' => {
             const quote = text[i];
@@ -629,7 +684,7 @@ fn importPaths(gpa: std.mem.Allocator, text: []const u8) []const []const u8 {
             if (j == text.len or text[j] != '(') continue;
             j = skipSpace(text, j + 1);
             if (j == text.len or text[j] != '"') continue;
-            const end = std.mem.indexOfScalarPos(u8, text, j + 1, '"') orelse text.len;
+            const end = std.mem.findScalarPos(u8, text, j + 1, '"') orelse text.len;
             paths.append(gpa, text[j + 1 .. end]) catch @panic("OOM");
             i = end;
         },

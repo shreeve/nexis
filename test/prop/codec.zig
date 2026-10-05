@@ -87,7 +87,7 @@ const TestCtx = struct {
 // die with its heap, and the allocator keeps no stack trace per
 // allocation, so 100k trials cost seconds.
 test "C1: 100000 random Values round-trip with equal hashes" {
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
     var ctx = TestCtx.initWith(allocator);
@@ -285,7 +285,7 @@ test "C5: 500 hostile headers (huge lengths and counts, deep nesting) decode to 
     const kinds = [_]u8{ 6, 7, 16, 17, 18, 19, 20, 21, 23 };
     const lengths = [_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) - 7, 1 << 35, 1 << 20, 3 };
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     var trial: usize = 0;
     while (trial < 500) : (trial += 1) {

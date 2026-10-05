@@ -478,7 +478,7 @@ fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
         _ = try stepVars(arena, s, &scratch);
         for (scratch.items) |v| last_read[v] = n;
     }
-    var asked = try std.DynamicBitSetUnmanaged.initEmpty(arena, n_vars);
+    var asked = try std.bit_set.Dynamic.initEmpty(arena, n_vars);
     for (output) |v| asked.set(v);
 
     const drop = try arena.alloc([]const Var, p.steps.len);

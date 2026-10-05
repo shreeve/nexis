@@ -6,7 +6,7 @@
 //! namespace, and `eval`/`read-string`/`macroexpand-1` wired. Each
 //! program owns a leak-checked allocator without stack traces, so a
 //! fresh VM per assertion costs milliseconds, and a leak still fails
-//! the test: `std.heap.DebugAllocator` logs it as an error.
+//! the test: `std.heap.SafeAllocator` logs it as an error.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -23,7 +23,7 @@ const testing = std.testing;
 const Value = value_mod.Value;
 
 pub const Program = struct {
-    gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }),
+    gpa: std.heap.SafeAllocator,
     /// Where each top-level form of a program compiles; routines
     /// live until the program ends.
     arena: std.heap.ArenaAllocator,
@@ -48,7 +48,7 @@ pub const Program = struct {
     }
 
     pub fn initWith(self: *Program, options: Options) !void {
-        self.gpa = .init;
+        self.gpa = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
         errdefer _ = self.gpa.deinit();
         const gpa = self.gpa.allocator();
         self.arena = std.heap.ArenaAllocator.init(gpa);
@@ -191,7 +191,7 @@ pub const Store = struct {
     pub fn init(name: []const u8) !Store {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/{s}.edb", .{ tmp.sub_path, name });
+        const path = try testing.allocator.print(".zig-cache/tmp/{s}/{s}.edb", .{ tmp.sub_path, name });
         return .{ .tmp = tmp, .path = path };
     }
 

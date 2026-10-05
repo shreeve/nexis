@@ -9,7 +9,7 @@ the known gaps and the order of work.
 
 ## What this project is
 
-**nexis** is a Zig 0.16 Lisp with Clojure semantics on its own runtime
+**nexis** is a Zig Lisp with Clojure semantics on its own runtime
 (reader, macroexpander, compiler, bytecode VM, persistent collections,
 16-byte tagged value, precise GC), durable refs backed by the emdb
 storage engine (`db/*`), and **Nextomic**, a Datomic-class database in
@@ -36,7 +36,7 @@ changes to emdb.
    note describes Nextomic, `docs/NEXTOMIC.md` wins).
 4. `CLOJURE-REVIEW.md`: what nexis takes, adapts and rejects from
    Clojure, and where it differs.
-5. `ZIG-0.16.0.md` before writing Zig: the idioms and traps of this
+5. `ZIG.md` before writing Zig: the idioms and traps of this
    tree.
 
 ---
@@ -51,8 +51,8 @@ changes to emdb.
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 170 steps (168 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
-| `zig build bench [-- --filter nextomic]` | the ReleaseFast benchmark harness (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
+| `zig build test --summary all` | the gate, 171 steps (169 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
+| `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
 | `zig build check-targets` | compiles and links every binary and test binary for x86_64 and aarch64 Linux, glibc and musl (the static binary), from any host; runs nothing |
@@ -60,18 +60,20 @@ changes to emdb.
 - `-Dupdate=true` on `test`, `golden`, `examples` or `nextomic-nx`
   rewrites every expected-output file the step compares; read the diff
   before committing it.
-- `-Doptimize=ReleaseFast` applies to any step. A Debug binary is not
-  a performance measurement.
+- `-Doptimize=fast` applies to any step (`debug`, `safe`, `fast`,
+  `small`). A debug binary is not a performance measurement.
 - The runtime reads three environment variables. `NEXIS_GC_STRESS=1`
   makes every VM collect every 4 KiB of allocation (`docs/GC.md` §7);
-  `NEXIS_GC_STRESS=1 zig build test` proves the natives' rooting.
+  `zig build test -Dgc-stress` sets it on every test and program the
+  gate runs, which proves the natives' rooting.
   `NEXIS_MAX_ALLOC=BYTES` refuses every allocation past BYTES
   (`docs/TOOLING.md` §1); the out-of-memory and REPL goldens set it
   on their runs, which otherwise start from an empty environment.
   `NEXIS_DURABILITY=commit|durable` chooses whether a store commit
   syncs (`docs/DB.md` §3.3; `commit`, no sync, when unset);
-  `NEXIS_DURABILITY=durable zig build test` runs the gate with every
-  commit synced.
+  `zig build test -Ddurability=durable` runs the gate with every
+  commit synced. The build never reads its own environment: these
+  options set the variables on each run, as part of its cache key.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
 
@@ -114,10 +116,10 @@ value kinds; each is a frozen commitment. Amend first.
 - **The full gate before every commit.**
 - **Spec first**: the governing section is written or amended in the
   same commit as the code.
-- **Read the source before asserting**: the installed Zig 0.16 stdlib
+- **Read the source before asserting**: the installed Zig stdlib
   for Zig, Clojure 1.12 (`CLOJURE-REVIEW.md` cites it by tag) for
   Clojure.
-- **Performance claims** are ReleaseFast numbers from
+- **Performance claims** are numbers from an optimized
   `zig build bench`; a comparison with Clojure follows `docs/BENCH.md`.
 - **Commits**: a short imperative subject with an area prefix
   (`vm:`, `nextomic:`, `docs:`, ...), a body citing the governing
@@ -132,9 +134,9 @@ value kinds; each is a frozen commitment. Amend first.
 
 ```
 nexis/
-├── AGENTS.md HANDOFF.md README.md PLAN.md CLOJURE-REVIEW.md ZIG-0.16.0.md
+├── AGENTS.md HANDOFF.md README.md PLAN.md CLOJURE-REVIEW.md ZIG.md
 ├── build.zig, build.zig.zon     emdb is a path dependency (../emdb)
-├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, fmt, parser-check, ReleaseFast
+├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, fmt, parser-check, an optimized build
 ├── nexis.grammar                reader grammar (source of truth for src/parser.zig)
 ├── src/
 │   ├── root.zig                 the `nexis` module: declares every runtime file, bottom-up
@@ -192,11 +194,11 @@ shares only the `:db/*` error names with the `db/*` layer. `build.zig`
   can reach the safe point, is not, and goes on a `vm.rootScope()`
   first. That includes values the native built itself, such as a
   map-entry vector from an iterator (`docs/GC.md` §11.5).
-  `NEXIS_GC_STRESS=1 zig build test` makes every rooting gap show.
+  `zig build test -Dgc-stress` makes every rooting gap show.
 - **Layering.** A new file under `src/` is declared in `src/root.zig`
   (its tests run only then) and imports only what is declared above
   it; the build rejects anything else.
-- **The parser.** `src/parser.zig` is generated by nexus 1.0 from
+- **The parser.** `src/parser.zig` is generated by nexus from
   `nexis.grammar`; token names carry no behaviour, and the scanner is
   hand-written in `src/nexis.zig`, which replaces the generated lexer.
   Edit the grammar or the scanner, run `zig build parser`, and commit
@@ -204,9 +206,10 @@ shares only the `:db/*` error names with the `db/*` layer. `build.zig`
 - **The page size.** emdb's page size is fixed for a file's life;
   `db.zig` and `nextomic/store.zig` pin 16 KiB. Never open a store
   another way.
-- **Zig 0.16.** `init.gpa` is a `DebugAllocator` in Debug;
+- **Zig.** `init.gpa` is a `SafeAllocator` in debug and safe builds;
   `std.ArrayList(T)` is unmanaged and starts `.empty`; every file
-  operation takes `io` (`ZIG-0.16.0.md`).
+  operation takes `io`; `build()` is cached, so it reads nothing
+  undeclared (`ZIG.md`).
 - **Formatting.** `zig fmt --check` the files you touch; only the
   generated `src/parser.zig` fails.
 

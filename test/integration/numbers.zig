@@ -161,7 +161,7 @@ const StorePath = harness.Store;
 test "codec: bignums round-trip through db/put-key! and db/get-key, alone and inside collections" {
     var store = try StorePath.init("bignum-codec");
     defer store.deinit();
-    const src = try std.fmt.allocPrint(testing.allocator,
+    const src = try testing.allocator.print(
         \\(do
         \\  (def conn (db/open "{s}"))
         \\  (def big (db/ref conn :t "big"))

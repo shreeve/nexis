@@ -246,8 +246,8 @@ pub fn fail(vm: *VM, err: anyerror) VmError {
 }
 
 pub fn failWith(vm: *VM, err: anyerror, detail: Detail) VmError {
-    inline for (@typeInfo(VmError).error_set.?) |e| {
-        if (err == @field(anyerror, e.name)) return @field(VmError, e.name);
+    inline for (@typeInfo(VmError).error_set.error_names.?) |name| {
+        if (err == @field(anyerror, name)) return @field(VmError, name);
     }
     const name = errorKeyword(err);
     if (detail.empty()) return vm.throwKeyword(name);
@@ -385,11 +385,11 @@ fn connect(vm: *VM, args: []const Value) !Value {
     var options: db_mod.OpenOptions = .{};
     if (args.len == 2) options.sync = (try syncOption(vm, args[1])) orelse try durabilityOption(vm, args[1]);
 
-    const path_z = try vm.allocator.dupeZ(u8, path);
+    const path_z = try vm.allocator.dupeSentinel(u8, path, 0);
     defer vm.allocator.free(path_z);
     // The engine does not create parent directories; best effort here.
     if (vm.io) |io| {
-        if (std.fs.path.dirname(path)) |dir| {
+        if (std.Io.Dir.path.dirname(path)) |dir| {
             if (dir.len > 0) std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
@@ -565,7 +565,7 @@ const TxHook = struct {
         const vm = self.vm;
         const callee = if (f.kind() == .symbol) (try query_natives.lookup(vm, f.asSymbolId())) orelse {
             const name = vm.ensureInterner().symbolName(f.asSymbolId());
-            const message = try std.fmt.allocPrint(vm.allocator, "unknown function: {s}", .{name});
+            const message = try vm.allocator.print("unknown function: {s}", .{name});
             defer vm.allocator.free(message);
             return throwSyntax(vm, "nextomic/tx-fn", message, null);
         } else f;
@@ -1239,8 +1239,8 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
     for (cases) |c| try testing.expectEqualStrings(c.name, errorKeyword(c.err));
     // The set is total over the storage, transaction and pull errors.
     inline for (.{ db_mod.Error, transact_mod.Error, pull_mod.Error }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            const name = errorKeyword(@field(anyerror, e.name));
+        inline for (@typeInfo(Set).error_set.error_names.?) |error_name| {
+            const name = errorKeyword(@field(anyerror, error_name));
             try testing.expect(std.mem.startsWith(u8, name, "nextomic/"));
         }
     }

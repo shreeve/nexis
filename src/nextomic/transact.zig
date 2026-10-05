@@ -884,7 +884,7 @@ const Ctx = struct {
     fn reverseAttr(self: *Ctx, k: Value) !?*const Attr {
         if (k.kind() != .keyword) return null;
         const name = self.conn.interner.keywordName(k.asKeywordId());
-        const slash = std.mem.indexOfScalar(u8, name, '/') orelse return null;
+        const slash = std.mem.findScalar(u8, name, '/') orelse return null;
         if (slash + 1 >= name.len or name[slash + 1] != '_') return null;
         const forward = try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] });
         const id = (try self.minter.lookupName(forward)) orelse return self.unknownAttr(k);
@@ -2538,7 +2538,7 @@ test "long strings round trip through the payload in every view" {
     const arena = arena_state.allocator();
     try installSchema(tc, arena);
     const bio = try attrId(tc, "user/bio");
-    const long = "L" ** 40_000;
+    const long = &@as([40_000]u8, @splat('L'));
     const r = try transactOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = bio }, .v = .{ .val = .{ .string = long } } } },
     }, .{});
@@ -2866,7 +2866,7 @@ fn transactWithFailure(tc: *TestConn, arena: Allocator, name: u32, tags: u32, wh
         tc.conn.idents.gpa = fa.allocator();
     }
     defer tc.conn.idents.gpa = saved_gpa;
-    const tag = try kw(tc, try std.fmt.allocPrint(arena, "tag/oom-{s}-{d}", .{ @tagName(where), fail_index }));
+    const tag = try kw(tc, try arena.print("tag/oom-{s}-{d}", .{ @tagName(where), fail_index }));
     const before = (try tc.conn.db()).basis;
     const result = transactOps(tc.conn, if (where == .arena) fa.allocator() else tx_arena.allocator(), &.{
         .{ .add = .{ .e = .{ .tempid = .{ .string = "n" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "N" } } } },
@@ -3005,7 +3005,7 @@ test "retractEntity follows a component chain of any length" {
     const n = 20_000;
     var ops: std.ArrayList(Op) = .empty;
     var names: [n + 1][]const u8 = undefined;
-    for (&names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(arena, "c{d}", .{i});
+    for (&names, 0..) |*nm, i| nm.* = try arena.print("c{d}", .{i});
     for (0..n) |i| try ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = names[i] } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = names[i + 1] } } } } });
     try ops.append(arena, .{ .add = .{ .e = .{ .tempid = .{ .string = names[n] } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "end" } } } });
     const r = try transactOps(tc.conn, arena, ops.items, .{});
@@ -3227,8 +3227,8 @@ test "a large transaction's arena stays well under a kilobyte per datom" {
     const ops = try setup.allocator().alloc(Op, entities * per_entity);
     for (0..entities) |i| {
         const id: TempidKey = .{ .fixnum = -@as(i64, @intCast(i + 1)) };
-        const em = try std.fmt.allocPrint(setup.allocator(), "user{d}@example.com", .{i});
-        const nm = try std.fmt.allocPrint(setup.allocator(), "User Number {d}", .{i});
+        const em = try setup.allocator().print("user{d}@example.com", .{i});
+        const nm = try setup.allocator().print("User Number {d}", .{i});
         ops[i * per_entity + 0] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = email }, .v = .{ .val = .{ .string = em } } } };
         ops[i * per_entity + 1] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = name }, .v = .{ .val = .{ .string = nm } } } };
         ops[i * per_entity + 2] = .{ .add = .{ .e = .{ .tempid = id }, .a = .{ .id = age }, .v = .{ .val = .{ .long = @intCast(i % 90) } } } };

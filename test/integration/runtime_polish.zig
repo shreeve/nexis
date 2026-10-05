@@ -80,7 +80,7 @@ test "outside try a storage failure is an uncaught throw of its keyword" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    const src = try std.fmt.allocPrint(testing.allocator,
+    const src = try testing.allocator.print(
         \\(do
         \\  (def conn (db/open "{s}"))
         \\  (def long-key (loop [s "k" n 0] (if (< n 13) (recur (str s s) (inc n)) s)))

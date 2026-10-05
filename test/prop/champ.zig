@@ -194,7 +194,7 @@ fn expectSameOrder(a: Value, b: Value) !void {
 }
 
 test "M2b: assoc/dissoc through multi-level tries keep the canonical layout" {
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     const gpa = debug.allocator();
     var heap = Heap.init(gpa);
@@ -576,7 +576,7 @@ fn collidingHash(v: Value) u64 {
 /// names the same key.
 fn collidingKey(heap: *Heap, i: u32) !Value {
     var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable;
+    const text = std.mem.print(&buf, "collider-{d}", .{i}) catch unreachable;
     return string_mod.fromBytes(heap, text);
 }
 
@@ -757,7 +757,7 @@ test "S2: random conj/disj sequences preserve the element set" {
 test "S2b: conj/disj through multi-level tries keep the canonical layout" {
     // The set side of M2b, keyed by heap strings so every indexing
     // hash goes through `dispatch.hashValue`.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     const gpa = debug.allocator();
     var heap = Heap.init(gpa);
@@ -770,7 +770,7 @@ test "S2b: conj/disj through multi-level tries keep the canonical layout" {
     defer gpa.free(elems);
     for (elems, 0..) |*e, i| {
         var buf: [24]u8 = undefined;
-        e.* = try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "elem-{d}", .{i}) catch unreachable);
+        e.* = try string_mod.fromBytes(&heap, std.mem.print(&buf, "elem-{d}", .{i}) catch unreachable);
     }
     r.shuffle(Value, elems);
     var s = try champ.setEmpty(&heap);

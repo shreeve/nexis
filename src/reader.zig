@@ -495,7 +495,7 @@ pub const Reader = struct {
         // Every escape is at least as long as the bytes it stands for.
         var out = try std.ArrayList(u8).initCapacity(self.allocator(), body.len);
         var i: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, body, i, '\\')) |at| {
+        while (std.mem.findScalarPos(u8, body, i, '\\')) |at| {
             out.appendSliceAssumeCapacity(body[i..at]);
             i = @min(at + 2, body.len);
             const simple: ?u8 = if (at + 1 == body.len) null else switch (body[at + 1]) {
@@ -533,7 +533,7 @@ pub const Reader = struct {
                 out.appendSliceAssumeCapacity(utf8[0..n]);
                 continue;
             }
-            const close = std.mem.indexOfScalarPos(u8, body, i, '}') orelse
+            const close = std.mem.findScalarPos(u8, body, i, '}') orelse
                 return self.fail(.invalid_string_escape, span, body[at..@min(body.len, at + 16)]);
             const escape = body[at .. close + 1];
             i = close + 1;
@@ -689,10 +689,10 @@ fn splitNamespace(text: []const u8) ?Name {
     if (std.mem.eql(u8, text, "/")) {
         return Name{ .ns = null, .name = text };
     }
-    const first = std.mem.indexOfScalar(u8, text, '/') orelse {
+    const first = std.mem.findScalar(u8, text, '/') orelse {
         return Name{ .ns = null, .name = text };
     };
-    const last = std.mem.lastIndexOfScalar(u8, text, '/').?;
+    const last = std.mem.findScalarLast(u8, text, '/').?;
     // At most one `/` separator is permitted; multi-slash names like
     // `foo/bar/baz` are rejected here and surface as :invalid-symbol /
     // :invalid-keyword.
@@ -714,7 +714,7 @@ fn isLiteralKey(f: *const Form) bool {
 /// Literal forms under the reader's literal equality (`formLiteralEq`).
 const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
     pub fn hash(_: @This(), f: *const Form) u64 {
-        var h = std.hash.Wyhash.init(@intFromEnum(f.datum));
+        var h = std.hash.Wyhash.init(@backingInt(f.datum));
         switch (f.datum) {
             .nil => {},
             .bool_ => |b| h.update(&.{@intFromBool(b)}),
@@ -982,19 +982,23 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
 
 test "parsing is linear: a list of n forms costs O(n) parser memory" {
     const allocator = std.testing.allocator;
-    const n = 4000;
     inline for (.{ "[", "" }, .{ "]", "" }) |open, close| {
-        var src: std.ArrayList(u8) = .empty;
-        defer src.deinit(allocator);
-        try src.appendSlice(allocator, open);
-        for (0..n) |i| try src.print(allocator, "{d} ", .{i});
-        try src.appendSlice(allocator, close);
-        var p = parser.Parser.init(allocator, src.items);
-        defer p.deinit();
-        _ = try p.parseProgram();
-        // A few Sexps per element; a list that copied itself on every
-        // append would hold n²/2 of them.
-        try std.testing.expect(p.arena.queryCapacity() < 256 * n);
+        var reserved: [2]usize = undefined;
+        for (&reserved, [_]usize{ 4000, 16000 }) |*bytes, n| {
+            var src: std.ArrayList(u8) = .empty;
+            defer src.deinit(allocator);
+            try src.appendSlice(allocator, open);
+            for (0..n) |i| try src.print(allocator, "{d} ", .{i});
+            try src.appendSlice(allocator, close);
+            var p = parser.Parser.init(allocator, src.items);
+            defer p.deinit();
+            _ = try p.parseProgram();
+            bytes.* = p.arena.queryCapacity();
+        }
+        // Linear: four times the forms take under eight times the
+        // memory the parser reserves. A list that copied itself on every
+        // append would hold n²/2 Sexps and take sixteen times.
+        try std.testing.expect(reserved[1] < 8 * reserved[0]);
     }
 }
 
@@ -1006,7 +1010,7 @@ test "a token longer than 64 KiB reads whole" {
     @memset(body, 'a');
     const shapes = [_][]const u8{ "(\"{s}\")", "(x{s} 1)", "(:k{s} 1)", "(1{s} 1)" };
     inline for (shapes, 0..) |shape, i| {
-        const src = try std.fmt.allocPrint(allocator, shape, .{body});
+        const src = try allocator.print(shape, .{body});
         defer allocator.free(src);
         var p = parser.Parser.init(allocator, src);
         defer p.deinit();
@@ -1190,8 +1194,7 @@ test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     var p = parser.Parser.init(allocator, src);
     defer p.deinit();
     try std.testing.expectError(error.ParseError, p.parseProgram());
-    try std.testing.expectEqual(@as(u32, 9), p.current.pos);
-    try std.testing.expectEqual(@as(u16, 1), p.current.len);
+    try std.testing.expectEqual(parser.Span{ .start = 9, .end = 10 }, p.lastError().?.span);
 }
 
 test "char literals: one token to the next delimiter, judged whole" {
@@ -1456,7 +1459,8 @@ test "an unsupported construct is one err token, so the parse error names it" {
         var p = parser.Parser.init(allocator, c[0]);
         defer p.deinit();
         try std.testing.expectError(error.ParseError, p.parseProgram());
-        try std.testing.expectEqualStrings(c[1], c[0][p.current.pos..][0..p.current.len]);
+        const span = p.lastError().?.span;
+        try std.testing.expectEqualStrings(c[1], c[0][span.start..span.end]);
     }
 }
 

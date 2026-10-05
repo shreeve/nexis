@@ -42,11 +42,11 @@ const testing = std.testing;
 /// formatter in display mode, the one source of truth shared with
 /// `cli.zig` and `stdlib.zig`, so test expectations match REPL
 /// output byte-for-byte.
-fn formatValue(buf: *std.array_list.Managed(u8), v: value_mod.Value, interner: *const intern_mod.Interner) anyerror!void {
-    var w = std.Io.Writer.Allocating.init(buf.allocator);
+fn formatValue(buf: *std.ArrayList(u8), v: value_mod.Value, interner: *const intern_mod.Interner) anyerror!void {
+    var w = std.Io.Writer.Allocating.init(testing.allocator);
     defer w.deinit();
     try format_mod.format(v, .display, &w.writer, interner);
-    try buf.appendSlice(w.written());
+    try buf.appendSlice(testing.allocator, w.written());
 }
 
 /// A VM booted as `bin/nexis` boots one, ready to run one program of
@@ -1744,7 +1744,7 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
 test "integration: =, compare, flatten, hash, set membership and printing of data nested past the stack are :stack-overflow" {
     // One chain of vectors 100k deep, built once: the test's 6 MiB
     // guard (stack.main_thread_budget) stops every walk of it well
-    // before the bottom, in Debug and ReleaseFast alike (a ReleaseFast
+    // before the bottom, in debug and optimized builds alike (an optimized
     // hash or print uses about 160 bytes a level, so about 40k levels
     // reach the guard). `b` is `a` one level down, so `=` and
     // `compare` walk both to the bottom with nothing else to build,
@@ -4404,7 +4404,7 @@ test "integration: stack extent — randomized call chains match direct evaluati
             };
         }
         var expected_buf: [32]u8 = undefined;
-        const expected_str = try std.fmt.bufPrint(&expected_buf, "{d}", .{expected});
+        const expected_str = try std.mem.print(&expected_buf, "{d}", .{expected});
         expectOutput(src.items, expected_str) catch |err| {
             std.debug.print("\n  trial {d} source:\n  {s}\n", .{ trial, src.items });
             return err;
@@ -5034,8 +5034,8 @@ fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
     try throwingProgram(&program);
     defer program.deinit();
     const result = try program.run(src);
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     try formatValue(&buf, result, program.interner);
     testing.expectEqualStrings(expected, buf.items) catch |err| {
         std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
@@ -5085,8 +5085,8 @@ fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
         std.debug.print("\n  source: {s}\n  error: {s} at {?}\n", .{ src, @errorName(err), span });
         return err;
     };
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     try formatValue(&buf, result, program.interner);
     testing.expectEqualStrings(expected, buf.items) catch |err| {
         std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
@@ -5150,7 +5150,7 @@ test "unresolved symbols: a symbol a user macro produced is reported at the macr
     try testing.expectError(compile.CompileError.UnresolvedSymbol, program.runChecked(src, &span));
     const sp = span orelse return error.TestFailed;
     try testing.expect(sp.pos + sp.len <= src.len);
-    try testing.expect(std.mem.indexOf(u8, src[sp.pos .. sp.pos + sp.len], "(b n)") != null);
+    try testing.expect(std.mem.find(u8, src[sp.pos .. sp.pos + sp.len], "(b n)") != null);
 }
 
 test "unresolved symbols: nothing is interned for a rejected form" {
@@ -5505,8 +5505,8 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
 
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     try formatValue(&buf, last_result, program.interner);
     testing.expectEqualStrings(expected, buf.items) catch |err| {
         std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
@@ -5772,8 +5772,8 @@ test "runRoutine: a top-level routine runs as a nested call inside an executing 
     var thrower = try compileRoutineForTest(&program, "(throw :inner)");
     nested_routine = &thrower;
     const caught = try program.run("(try (nested-run) (catch :inner e [:caught e]))");
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     try formatValue(&buf, caught, program.interner);
     try testing.expectEqualStrings("[:caught :inner]", buf.items);
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
@@ -5814,13 +5814,13 @@ const RequireDir = struct {
     fn init(self: *RequireDir, program: *Program, files: []const [2][]const u8) !void {
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
-        self.dir_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{self.tmp.sub_path});
+        self.dir_path = try testing.allocator.print(".zig-cache/tmp/{s}", .{self.tmp.sub_path});
         errdefer testing.allocator.free(self.dir_path);
         const io = std.testing.io;
         for (files) |f| {
-            const path = try std.fs.path.join(testing.allocator, &.{ self.dir_path, f[0] });
+            const path = try std.Io.Dir.path.join(testing.allocator, &.{ self.dir_path, f[0] });
             defer testing.allocator.free(path);
-            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+            if (std.Io.Dir.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
             const file = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer file.close(io);
             try file.writeStreamingAll(io, f[1]);
@@ -6038,8 +6038,8 @@ test "require: a required file's throw that the caller's handler takes reaches t
     try files.init(&program, &.{throwsns});
     defer files.deinit();
     const caught = try program.run("(try (eval '(require 'throwsns)) (catch any e [:caught e]))");
-    var buf: std.array_list.Managed(u8) = .init(testing.allocator);
-    defer buf.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
     try formatValue(&buf, caught, program.interner);
     try testing.expectEqualStrings("[:caught :boom]", buf.items);
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);

@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
     var stats: Stats = .{};
     try walkDir(gpa, io, root, mode, &stats, false);
 
-    const errors_sub = try std.fs.path.join(gpa, &.{ root, "errors" });
+    const errors_sub = try std.Io.Dir.path.join(gpa, &.{ root, "errors" });
     defer gpa.free(errors_sub);
     walkDir(gpa, io, errors_sub, mode, &stats, true) catch |e| switch (e) {
         error.FileNotFound => {},
@@ -91,9 +91,9 @@ fn walkDir(gpa: std.mem.Allocator, io: std.Io, path: []const u8, mode: Mode, sta
 }
 
 fn runCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, mode: Mode, stats: *Stats, is_errors: bool) !void {
-    const src_name = try std.fmt.allocPrint(gpa, "{s}.nx", .{stem});
+    const src_name = try gpa.print("{s}.nx", .{stem});
     defer gpa.free(src_name);
-    const src_path = try std.fs.path.join(gpa, &.{ dir, src_name });
+    const src_path = try std.Io.Dir.path.join(gpa, &.{ dir, src_name });
     defer gpa.free(src_path);
 
     const source = try std.Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .limited(1 << 20));
@@ -125,9 +125,9 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8
     try reader.writeProgram(forms, &al.writer);
     const actual = al.written();
 
-    const sexp_name = try std.fmt.allocPrint(gpa, "{s}.sexp", .{stem});
+    const sexp_name = try gpa.print("{s}.sexp", .{stem});
     defer gpa.free(sexp_name);
-    const sexp_path = try std.fs.path.join(gpa, &.{ dir, sexp_name });
+    const sexp_path = try std.Io.Dir.path.join(gpa, &.{ dir, sexp_name });
     defer gpa.free(sexp_path);
 
     const expected = std.Io.Dir.cwd().readFileAlloc(io, sexp_path, gpa, .limited(1 << 20)) catch |e| switch (e) {
@@ -162,7 +162,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8
 
 fn runErrorCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, mode: Mode, stats: *Stats, p: *parser.Parser, rd: *reader.Reader) !void {
     const tree = p.parseProgram() catch |pe| {
-        const actual = try std.fmt.allocPrint(gpa, ":parser-error {s}", .{@errorName(pe)});
+        const actual = try gpa.print(":parser-error {s}", .{@errorName(pe)});
         defer gpa.free(actual);
         try compareErr(gpa, io, dir, stem, actual, mode, stats);
         return;
@@ -192,9 +192,9 @@ fn runErrorCase(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []con
 }
 
 fn compareErr(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, stem: []const u8, actual: []const u8, mode: Mode, stats: *Stats) !void {
-    const err_name = try std.fmt.allocPrint(gpa, "{s}.err", .{stem});
+    const err_name = try gpa.print("{s}.err", .{stem});
     defer gpa.free(err_name);
-    const err_path = try std.fs.path.join(gpa, &.{ dir, err_name });
+    const err_path = try std.Io.Dir.path.join(gpa, &.{ dir, err_name });
     defer gpa.free(err_path);
 
     const expected = std.Io.Dir.cwd().readFileAlloc(io, err_path, gpa, .limited(1 << 20)) catch |e| switch (e) {

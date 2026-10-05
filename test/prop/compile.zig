@@ -405,20 +405,20 @@ const sq_prng_seed: u64 = 0x7379_6E71_7572_7465; // "synqurte"
 //
 // For each N in 1..10, assert the result equals VALUE.
 
-fn buildNestedClosureSource(buf: *std.array_list.Managed(u8), value: i64, depth: u32) !void {
-    const prefix = try std.fmt.allocPrint(testing.allocator, "(let* [x {d}] ", .{value});
+fn buildNestedClosureSource(buf: *std.ArrayList(u8), value: i64, depth: u32) !void {
+    const prefix = try testing.allocator.print("(let* [x {d}] ", .{value});
     defer testing.allocator.free(prefix);
-    try buf.appendSlice(prefix);
+    try buf.appendSlice(testing.allocator, prefix);
     var d: u32 = 0;
     while (d < depth) : (d += 1) {
-        try buf.appendSlice("((fn* [] ");
+        try buf.appendSlice(testing.allocator, "((fn* [] ");
     }
-    try buf.appendSlice("x");
+    try buf.appendSlice(testing.allocator, "x");
     d = 0;
     while (d < depth) : (d += 1) {
-        try buf.appendSlice("))");
+        try buf.appendSlice(testing.allocator, "))");
     }
-    try buf.appendSlice(")");
+    try buf.appendSlice(testing.allocator, ")");
 }
 
 test "prop capture depth: closure capture depth 1..10 round-trips value" {
@@ -434,8 +434,8 @@ test "prop capture depth: closure capture depth 1..10 round-trips value" {
         var trial: u32 = 0;
         while (trial < 10) : (trial += 1) {
             const v: i64 = @intCast(rand.int(i32));
-            var src: std.array_list.Managed(u8) = .init(testing.allocator);
-            defer src.deinit();
+            var src: std.ArrayList(u8) = .empty;
+            defer src.deinit(testing.allocator);
             try buildNestedClosureSource(&src, v, depth);
             try testing.expectEqual(v, (try program.run(src.items)).asFixnum());
         }
@@ -456,15 +456,14 @@ test "prop capture depth: independent captures don't interfere" {
     while (trial < 20) : (trial += 1) {
         const a: i64 = @intCast(rand.int(i16));
         const b: i64 = @intCast(rand.int(i16));
-        var src: std.array_list.Managed(u8) = .init(testing.allocator);
-        defer src.deinit();
-        const formatted = try std.fmt.allocPrint(
-            testing.allocator,
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(testing.allocator);
+        const formatted = try testing.allocator.print(
             "(let* [a {d} b {d}] (+ ((fn* [] a)) ((fn* [] b))))",
             .{ a, b },
         );
         defer testing.allocator.free(formatted);
-        try src.appendSlice(formatted);
+        try src.appendSlice(testing.allocator, formatted);
         try testing.expectEqual(a + b, (try program.run(src.items)).asFixnum());
     }
 }
@@ -498,31 +497,31 @@ fn listEq(a: Value, b: Value) bool {
     }
 }
 
-fn writeRandomLeaf(buf: *std.array_list.Managed(u8), rand: std.Random) !void {
+fn writeRandomLeaf(buf: *std.ArrayList(u8), rand: std.Random) !void {
     const pick = rand.uintLessThan(u8, 4);
     const s = switch (pick) {
-        0 => try std.fmt.allocPrint(testing.allocator, "{d}", .{rand.int(i16)}),
-        1 => try std.fmt.allocPrint(testing.allocator, "sym{d}", .{rand.uintLessThan(u32, 100)}),
-        2 => try std.fmt.allocPrint(testing.allocator, ":kw{d}", .{rand.uintLessThan(u32, 100)}),
-        else => try std.fmt.allocPrint(testing.allocator, "{d}", .{rand.int(i8)}),
+        0 => try testing.allocator.print("{d}", .{rand.int(i16)}),
+        1 => try testing.allocator.print("sym{d}", .{rand.uintLessThan(u32, 100)}),
+        2 => try testing.allocator.print(":kw{d}", .{rand.uintLessThan(u32, 100)}),
+        else => try testing.allocator.print("{d}", .{rand.int(i8)}),
     };
     defer testing.allocator.free(s);
-    try buf.appendSlice(s);
+    try buf.appendSlice(testing.allocator, s);
 }
 
-fn writeRandomShape(buf: *std.array_list.Managed(u8), rand: std.Random, depth: u32) !void {
+fn writeRandomShape(buf: *std.ArrayList(u8), rand: std.Random, depth: u32) !void {
     if (depth == 0 or rand.uintLessThan(u8, 3) == 0) {
         try writeRandomLeaf(buf, rand);
         return;
     }
     const n = rand.uintLessThan(u8, 5);
-    try buf.append('(');
+    try buf.append(testing.allocator, '(');
     var i: u8 = 0;
     while (i < n) : (i += 1) {
-        if (i > 0) try buf.append(' ');
+        if (i > 0) try buf.append(testing.allocator, ' ');
         try writeRandomShape(buf, rand, depth - 1);
     }
-    try buf.append(')');
+    try buf.append(testing.allocator, ')');
 }
 
 test "prop syntax-quote: syntax-quote ≡ quote of the namespace-qualified shape" {
@@ -537,17 +536,17 @@ test "prop syntax-quote: syntax-quote ≡ quote of the namespace-qualified shape
 
     var trial: u32 = 0;
     while (trial < 100) : (trial += 1) {
-        var shape: std.array_list.Managed(u8) = .init(testing.allocator);
-        defer shape.deinit();
+        var shape: std.ArrayList(u8) = .empty;
+        defer shape.deinit(testing.allocator);
         try writeRandomShape(&shape, rand, 3);
 
         //   q:  (quote SHAPE) with every symbol leaf written user/symN
         //   sq: `SHAPE
         const qualified = try std.mem.replaceOwned(u8, testing.allocator, shape.items, "sym", "user/sym");
         defer testing.allocator.free(qualified);
-        const q_src = try std.fmt.allocPrint(testing.allocator, "(quote {s})", .{qualified});
+        const q_src = try testing.allocator.print("(quote {s})", .{qualified});
         defer testing.allocator.free(q_src);
-        const sq_src = try std.fmt.allocPrint(testing.allocator, "`{s}", .{shape.items});
+        const sq_src = try testing.allocator.print("`{s}", .{shape.items});
         defer testing.allocator.free(sq_src);
 
         const q_result = try program.run(q_src);
@@ -572,15 +571,14 @@ test "prop syntax-quote: syntax-quote with unquoted integer matches hand-built l
     var trial: u32 = 0;
     while (trial < 50) : (trial += 1) {
         const v: i64 = @intCast(rand.int(i16));
-        var src_buf: std.array_list.Managed(u8) = .init(testing.allocator);
-        defer src_buf.deinit();
-        const formatted = try std.fmt.allocPrint(
-            testing.allocator,
+        var src_buf: std.ArrayList(u8) = .empty;
+        defer src_buf.deinit(testing.allocator);
+        const formatted = try testing.allocator.print(
             "(let* [n {d}] `(start ~n end))",
             .{v},
         );
         defer testing.allocator.free(formatted);
-        try src_buf.appendSlice(formatted);
+        try src_buf.appendSlice(testing.allocator, formatted);
         const result = try program.run(src_buf.items);
         try testing.expect(result.kind() == .list);
         // Position 1 = the unquoted n value.
@@ -657,7 +655,7 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
     defer program.deinit();
     const ops = [_][]const u8{ "(+ a b)", "(- a b)", "(* a b)", "(/ a b)", "(quot a b)", "(mod a b)", "(< a b)", "(<= a b)", "(> a b)", "(>= a b)", "(== a b)", "(- a)", "(abs a)", "(inc a)", "(dec a)" };
     for (ops) |op| {
-        const src = try std.fmt.allocPrint(testing.allocator, "(fn* [a b] {s})", .{op});
+        const src = try testing.allocator.print("(fn* [a b] {s})", .{op});
         defer testing.allocator.free(src);
         const compiled = try compileIn(&program, src);
         if (compiled.capture_descs.len != 1) return error.TestFailed;
@@ -799,7 +797,7 @@ test "slots: a routine's frame holds what is live at once, not every temporary i
             return err;
         };
         if (level.result.len == 0) continue;
-        const call = try std.fmt.allocPrint(testing.allocator, "({s} 1 inc)", .{src.items});
+        const call = try testing.allocator.print("({s} 1 inc)", .{src.items});
         defer testing.allocator.free(call);
         try harness.expectResult(&program, level.open, try program.run(call), level.result);
     }
@@ -1326,7 +1324,7 @@ test "prop differential: compiled random programs agree with a reference evaluat
         const e = try genExpr(a, rand, .{}, 5);
         var src: std.Io.Writer.Allocating = .init(a);
         try printExpr(e, &src.writer);
-        const want = try std.fmt.allocPrint(a, "{d}", .{try evalExpr(a, e, .{})});
+        const want = try a.print("{d}", .{try evalExpr(a, e, .{})});
         const got = program.run(src.written()) catch |err| {
             std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ src.written(), @errorName(err) });
             return err;
@@ -1355,7 +1353,7 @@ test "prop differential: the same programs agree when their code starts past pc 
         try src.writer.writeAll("(do (pad) ");
         try printExpr(e, &src.writer);
         try src.writer.writeAll(")");
-        const want = try std.fmt.allocPrint(a, "{d}", .{try evalExpr(a, e, .{})});
+        const want = try a.print("{d}", .{try evalExpr(a, e, .{})});
         const got = program.run(src.written()) catch |err| {
             std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ src.written()[10..], @errorName(err) });
             return err;

@@ -327,7 +327,7 @@ pub const Exec = struct {
                         const first = slotPos(m.slots, v);
                         if (first != pos) {
                             if (!t[pos].eql(t[first])) continue :tuples;
-                        } else cells[std.mem.indexOfScalar(Var, pvars.items, v).?] = t[pos];
+                        } else cells[std.mem.findScalar(Var, pvars.items, v).?] = t[pos];
                     },
                 }
             }
