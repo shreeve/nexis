@@ -594,23 +594,8 @@ fn isHeapKindByte(b: u8) bool {
 
 // ---- Synthetic callbacks ----
 
-fn synthHash(x: Value) u64 {
-    return x.hashImmediate();
-}
-
-fn synthEq(a: Value, b: Value) bool {
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .symbol => a.asSymbolId() == b.asSymbolId(),
-        .char => a.asChar() == b.asChar(),
-        .float => a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat())),
-        else => false,
-    };
-}
+const synthHash = Value.hashImmediate;
+const synthEq = value.testEqual;
 
 // ---- Test helper ----
 

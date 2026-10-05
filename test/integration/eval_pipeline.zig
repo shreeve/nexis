@@ -3371,9 +3371,7 @@ test "db/open: two connections to one file share its writer; a second write is :
     , "[:db/busy :db/busy 2 2]");
 }
 
-fn engineSyncs() u64 {
-    return nx.emdb.platform.File.syncCalls.load(.monotonic);
-}
+const engineSyncs = nx.db.engineSyncs;
 
 /// Run each `[source expected syncs]` step of `steps` on one program
 /// holding `@STORE@`, where `syncs` is how many engine syncs the step

@@ -3530,9 +3530,7 @@ test "two identities naming two entities for one tempid conflict, naming the dat
     try testing.expectEqual(try kw(tc, "user/email"), fault.attr.?.asKeywordId());
 }
 
-fn engineSyncs() u64 {
-    return emdb.platform.File.syncCalls.load(.monotonic);
-}
+const engineSyncs = store_mod.db_layer.engineSyncs;
 
 test "durability: a transaction syncs only when it or its connection asks; sync and release sync what is left once" {
     const tc = try TestConn.init("tx_durability");

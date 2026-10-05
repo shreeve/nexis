@@ -1286,21 +1286,8 @@ fn cleanupDb(path: [:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
-fn synthHash(v: Value) u64 {
-    return v.hashImmediate();
-}
-
-fn synthEq(a: Value, b: Value) bool {
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .char => a.asChar() == b.asChar(),
-        else => false,
-    };
-}
+const synthHash = Value.hashImmediate;
+const synthEq = value.testEqual;
 
 test "failureName: every emdb error nexis can meet has its keyword; every decode error is :codec-failed" {
     // The engine's errors no nexis call can return: options nexis pins
@@ -1630,8 +1617,9 @@ test "close: refused while a transaction is open; the connection stays a closed 
     try testing.expectError(DbError.ConnectionUnavailable, beginRead(&conn));
 }
 
-/// Syncs the engine has issued in this process (data and meta alike).
-fn engineSyncs() u64 {
+/// Syncs the engine has issued in this process (data and meta alike),
+/// for the tests of durability.
+pub fn engineSyncs() u64 {
     return emdb.platform.File.syncCalls.load(.monotonic);
 }
 
