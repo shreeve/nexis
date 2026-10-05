@@ -30,8 +30,7 @@ function given to `sorted-map-by` / `sorted-set-by`. Costs:
 `:kind-mismatch`), `nth`, `peek`, `pop` and sequential destructuring
 of a sorted set (`(let [[a] (seq s)] ...)` destructures its seq).
 
-**Differences.** A sorted map is not a metadata map (`with-meta`
-takes a hash map). A protocol extended to `:map` or `:set` does not
+**Differences.** A protocol extended to `:map` or `:set` does not
 reach a sorted collection, which has kinds of its own: extend
 `:sorted_map` or `:sorted_set` (`docs/PROTOCOLS.md` §4.3). Functions
 that build a fresh map or set (`select-keys`, `set`, `zipmap`,
@@ -195,6 +194,12 @@ one side's entries sorted by key hash (scratch memory outside the
 collected heap). A hash check first answers most unequal pairs and,
 short of a hash collision, the one case those walks would pass: a user
 order that keeps two `=` keys apart.
+
+Clojure differs: its sorted collection looks the other side's keys up
+through its own comparator, so `(= (sorted-set 1) #{1.0})` and `(=
+(sorted-set 1) (sorted-set 1.0))` are true there while `(= #{1.0}
+(sorted-set 1))` is false. Here all three are false: `=` is symmetric
+and agrees with `hash`.
 
 ---
 

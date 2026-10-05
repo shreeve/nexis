@@ -103,7 +103,6 @@ fn allocRoot(heap: *Heap) !*HeapHeader {
     return heap.alloc(.persistent_vector, root_body_size);
 }
 
-/// Fresh zeroed interior node — 32 null child pointers.
 /// A root for an update of the vector rooted at `src`: it carries
 /// `src`'s metadata, as every Clojure collection update does
 /// (SEMANTICS §7).
@@ -113,6 +112,7 @@ fn allocDerivedRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
     return h;
 }
 
+/// Fresh zeroed interior node — 32 null child pointers.
 fn allocInterior(heap: *Heap) !*HeapHeader {
     return heap.alloc(.persistent_vector, interior_body_size);
 }

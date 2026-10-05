@@ -48,7 +48,7 @@ written into the vector's open tail (`docs/VECTOR.md` §5,
 buffer first (`test/golden/cli/long-sequences.nx`
 builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
 with any view, a `rest` or `drop` of a built sequence keeps the whole
-vector reachable (§6), where a cons chain's rest frees the cells before
+vector reachable (§4), where a cons chain's rest frees the cells before
 it.
 
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
@@ -122,7 +122,7 @@ reader and macro material; large sequences are vectors.
 | `viewCursor(v) ?vector.Cursor` | a view's elements as its vector's cursor from its offset, so a walk of a built sequence steps the vector's leaves directly (`stdlib.zig` `SeqIter`); null for a cons chain or the empty list |
 | `hashSeq(v, elementHash) u64` | §2 invariant 2; `elementHash` is `&dispatch.hashValue` |
 | `equalSeq(a, b, elementEq) bool` | §2 invariant 3; `elementEq` is `&dispatch.equal` |
-| `trace(h, visitor)` | GC trace, §6 |
+| `trace(h, visitor)` | GC trace, §4 |
 
 The callbacks keep `list.zig` out of `dispatch`'s import graph; it
 imports `vector.zig` for the view. Errors besides `InvalidListTail` are
@@ -131,7 +131,7 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
 
 ---
 
-### 6. Interaction with other layers
+### 4. Interaction with other layers
 
 - **GC** (`docs/GC.md` §5). `trace` marks every head and marks each
   following cons cell directly, in a loop, so the collector's recursion

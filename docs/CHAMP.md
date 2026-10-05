@@ -38,8 +38,8 @@ is `{k v}` (SEMANTICS §4). An update that changes nothing returns its
 argument; any other update returns a new root carrying the argument's
 metadata (SEMANTICS §7).
 
-**Absent.** Sorted maps and sets, and any other member of the map or
-set equality category. Transients are `src/coll/transient.zig`
+**Absent.** Sorted maps and sets are `src/coll/sorted.zig`
+(`docs/SORTED.md`). Transients are `src/coll/transient.zig`
 (`docs/TRANSIENT.md`); the in-place edits they run are this module's
 (§8.3).
 
@@ -168,6 +168,11 @@ hashes through `Value.hashImmediate`, which is what `dispatch.hashValue`
 computes for it, so a keyword or fixnum key skips the callback. A test
 fixture that shapes the indexing hash through `elementHash` must
 therefore key by heap values (§12.3).
+
+The hash has a fixed seed, so keys can be chosen to share one indexing
+hash: n such keys land in one collision node, a linear list, which
+makes each insert and lookup O(n) and building the map O(n²), as in
+Clojure. Finding each such key takes about 2³² hashes offline.
 
 #### 5.2 Levels
 
@@ -318,6 +323,13 @@ constants are public. Every constructor can fail only with
   ascending slot order, then its children in their stored, descending
   slot order; a collision node's payloads in association order.
 
+#### 8.2 Nil
+
+Nil is a legal key, a legal value and a legal set element: `(assoc {}
+nil nil)` is `{nil nil}`, `(contains? {nil nil} nil)` and `(contains?
+#{nil} nil)` are true. Its hash and equality come from dispatch; the
+module has no nil case.
+
 #### 8.3 In-place edits
 
 A transient's edit (`docs/TRANSIENT.md` §1) is two calls:
@@ -330,18 +342,11 @@ afterwards. They rewrite the nodes whose header `hash` holds the edit
 token and copy any other node on the path, stamping the copy; an
 insert into an owned node grows it in place when its block has room
 (`Heap.resizeInPlace`), and a node an edit grows into a new block
-keeps two payloads of spare room there. The result has the layout `mapAssoc` and
-`mapDissoc` give (§2.2, §5.3-§5.6). `copyRoot` copies a root for a
-transient to own.
+keeps two payloads of spare room there. The result has the layout
+`mapAssoc` and `mapDissoc` give (§2.2, §5.3-§5.6). `copyRoot` copies
+a root for a transient to own.
 
-#### 8.2 Nil
-
-Nil is a legal key, a legal value and a legal set element: `(assoc {}
-nil nil)` is `{nil nil}`, `(contains? {nil nil} nil)` and `(contains?
-#{nil} nil)` are true. Its hash and equality come from dispatch; the
-module has no nil case.
-
-#### 8.3 Panics
+#### 8.4 Panics
 
 `mapGet`, `mapCount`, `mapAssoc` and `mapDissoc` (and their set
 counterparts) assert a map (set) Value of subkind 0 or 1 in safe
