@@ -52,6 +52,10 @@ const RuleSet = ir.RuleSet;
 
 pub const Error = error{ QuerySyntax, OutOfMemory, StackOverflow };
 
+/// The deepest `not`, `or` and `and` clauses nest, in a query or a rule
+/// body.
+pub const max_nesting = 1000;
+
 /// Where a syntax error was found. `clause` is the index into `:where`
 /// (or into the rule vector for rule parsing) when the error is inside
 /// a clause.
@@ -129,6 +133,9 @@ const Parser = struct {
     sources: std.ArrayList(u32) = .empty,
     rule_body: bool = false,
     clause_index: ?usize = null,
+    /// List clauses (`not`, `or`, `and`, a rule call) open around the
+    /// one being parsed; `max_nesting` caps it.
+    nesting: usize = 0,
     /// The `:find` element being parsed, and the source each
     /// `(pull $src ...)` names, resolved once `:in` is known.
     find_index: usize = 0,
@@ -484,6 +491,12 @@ const Parser = struct {
                 try out.append(self.arena, .{ .pattern = try self.parsePattern(parts) });
             },
             .list => {
+                // Planning walks a clause's variables once per level it
+                // sits under, so depth costs its square: the cap keeps a
+                // query value from outside to bounded work.
+                if (self.nesting == max_nesting) return self.fail("clauses nest more than 1000 deep");
+                self.nesting += 1;
+                defer self.nesting -= 1;
                 const parts = try self.elems(x);
                 if (parts.len == 0) return self.fail("empty clause");
                 const head = self.symName(parts[0]) orelse return self.fail("clause head must be a symbol");
@@ -1308,6 +1321,27 @@ test "clauses nested past the stack guard are StackOverflow" {
     defer stack.arm(stack.main_thread_budget);
     var diag: Diag = .{};
     try testing.expectError(error.StackOverflow, parse(testing.allocator, &interner, q, &diag));
+}
+
+test "clauses nest at most max_nesting deep" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    const pattern = b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") });
+    for ([_][]const u8{ "not", "or", "and" }) |head| {
+        var clause = b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) });
+        for (0..max_nesting) |_| clause = b.lst(&.{ b.sym(head), clause });
+        var diag: Diag = .{};
+        const ok = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag);
+        ok.deinit();
+        // 20,000 levels took seconds to parse when the depth had no cap.
+        for (0..20_000) |_| clause = b.lst(&.{ b.sym(head), clause });
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag));
+        try testing.expectEqualStrings("clauses nest more than 1000 deep", diag.message);
+        try testing.expectEqual(@as(?usize, 1), diag.clause);
+    }
 }
 
 test "a full cache replaces its least recently used unpinned parse and marks what it holds" {

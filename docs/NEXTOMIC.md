@@ -567,8 +567,11 @@ db and inputs.
 
 **Parse** → IR `{find, in, where, rules}` with a symbol table; a syntax
 error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
-with the clause index when the error is inside `:where`; clauses nested
-past the native stack guard are the catchable `:stack-overflow`. The IR
+with the clause index when the error is inside `:where`. `not`, `or`,
+`and` and rule-call clauses nest at most 1000 deep (`parse.max_nesting`;
+deeper is `:nextomic/query-syntax`), since planning a clause costs a
+walk of the clauses around it; clauses nested past the native stack
+guard first are the catchable `:stack-overflow`. The IR
 is pure syntax, so it is cached per VM by query value (a hit is the
 same value, or one `=` to it with lists and vectors told apart at every
 depth) and reused across every db and basis; the rule set bound to `%`
