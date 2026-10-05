@@ -2554,7 +2554,10 @@ fn mergeSort(items: []Keyed, scratch: []Keyed, order: SortOrder) VmError!void {
     }) items[k] = scratch[j];
 }
 
-fn sortImpl(vm: *VM, keyfn: ?Value, comparator: ?Value, coll: Value) VmError!Value {
+fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError!Value {
+    // `compare` is the natural order, without a call per comparison,
+    // as sorted collections take it (`comparatorArg`).
+    const comparator: ?Value = if (comparator_arg) |c| (if (c.kind() == .native_fn and comparatorArg(c).isNil()) null else c) else null;
     var items = try collectSeq(vm, coll);
     defer items.deinit(vm.allocator);
     const keyed = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
