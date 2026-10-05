@@ -1307,9 +1307,10 @@ test "integration: missing qualified ns is UnresolvedSymbol" {
 // Embedded core.nx composite layer
 // =============================================================================
 
-test "integration: core.nx second / third / last" {
+test "integration: core.nx second / last" {
     try expectOutput("(second [10 20 30])", "20");
-    try expectOutput("(third [10 20 30])", "30");
+    // nexis.core has no `third`, as Clojure has none.
+    try expectUnresolved("(third [10 20 30])", "third");
     try expectOutput("(last [10 20 30])", "30");
     try expectOutput("(last (list :a :b :c))", ":c");
     try expectOutput("(last (list))", "nil");
@@ -1421,7 +1422,7 @@ test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, s
     try expectOutput("[(partition-by odd? []) (partition-by odd? nil) (dedupe []) (dedupe nil) (take-last 0 [1 2]) (take-last 2 nil) (take-last 2 []) (take-last 5 [1 2])]", "[() () () () nil nil nil (1 2)]");
     try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil [] () (2) (1 2) () () (1) (1 2)]");
     try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
-    try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (third (list 1 2 3))]", "[1 2 (3) nil 3]");
+    try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (second (list 1 2 3))]", "[1 2 (3) nil 2]");
 }
 
 test "integration: core.nx maps: update-vals, update-keys; atoms: reset-vals!, volatile!" {

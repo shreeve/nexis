@@ -329,6 +329,9 @@ a realized list.
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
 | `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
+| `doall`, `dorun` | 1 | Sequences are already realized: `doall` returns its argument, `dorun` nil |
+| `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-uuid` and `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
+| `in-ns` | 1 | `(in-ns 'name)`: makes the namespace named by the symbol current, creating it with `nexis.core` referred; nil, where Clojure returns the namespace |
 | `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
 | `indexed?` | 1 | True of a vector or typed vector |
 | `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |

@@ -13,7 +13,7 @@
 (defn true?  [x] (= x true))
 (defn false? [x] (= x false))
 
-; second, third, take, some and every? are natives that walk no
+; second, take, some and every? are natives that walk no
 ; further than they must.
 (defn ffirst [x] (first (first x)))
 (defn nfirst [x] (next (first x)))

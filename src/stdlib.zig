@@ -160,7 +160,6 @@ const core_natives = table("", .{
     .{ "first", 1, 1, &fnFirst },
     .{ "rest", 1, 1, &fnRest },
     .{ "second", 1, 1, &fnSecond },
-    .{ "third", 1, 1, &fnThird },
     .{ "take", 2, 2, &fnTake },
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
@@ -584,10 +583,6 @@ fn nthOfSeq(vm: *VM, coll: Value, i: usize) VmError!Value {
 
 fn fnSecond(vm: *VM, args: []const Value) VmError!Value {
     return nthOfSeq(vm, args[0], 1);
-}
-
-fn fnThird(vm: *VM, args: []const Value) VmError!Value {
-    return nthOfSeq(vm, args[0], 2);
 }
 
 /// `(take n coll)` → a list of the first `n` elements, all of them
