@@ -170,7 +170,7 @@ pub fn valOf(rd: *Read, arena: Allocator, vt: key.ValueType, v: Value, fault: *F
         },
         .uuid => {
             if (v.kind() != .string) return error.ValueType;
-            return .{ .uuid = datom_mod.uuidFromText(string_mod.asBytes(v)) orelse return error.ValueType };
+            return .{ .uuid = datom_mod.uuidFromCanonical(string_mod.asBytes(v)) orelse return error.ValueType };
         },
         .bytes => {
             if (v.kind() != .string) return error.ValueType;
@@ -200,7 +200,7 @@ pub fn encodeCell(read: *Read, cell: Cell, vt: key.ValueType) Error!?Val {
         .string => if (cell == .str) .{ .string = cell.str } else null,
         .uuid => blk: {
             if (cell != .str) break :blk null;
-            const u = datom_mod.uuidFromText(cell.str) orelse break :blk null;
+            const u = datom_mod.uuidFromCanonical(cell.str) orelse break :blk null;
             break :blk .{ .uuid = u };
         },
         .bytes => if (cell == .str) .{ .bytes = cell.str } else null,

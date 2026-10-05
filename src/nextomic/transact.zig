@@ -1047,7 +1047,7 @@ const Ctx = struct {
             },
             .uuid => {
                 if (v.kind() != .string) return error.ValueType;
-                return .{ .val = .{ .uuid = datom_mod.uuidFromText(string_mod.asBytes(v)) orelse return error.ValueType } };
+                return .{ .val = .{ .uuid = datom_mod.uuidFromCanonical(string_mod.asBytes(v)) orelse return error.ValueType } };
             },
             .bytes => {
                 if (v.kind() != .string) return error.ValueType;

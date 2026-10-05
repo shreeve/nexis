@@ -157,6 +157,12 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x60` | uuid | 16 bytes |
 | `0x70` | bytes | as string, both shapes |
 
+A uuid travels as a string, its canonical text: 36 characters,
+lower-case hex in groups of 8-4-4-4-12 joined by `-`. Any other string
+is `:nextomic/value-type` in tx-data, a lookup ref or a `datoms`
+component, and matches nothing as a query constant or input, so every
+path compares the same bytes.
+
 A long or an instant is any integer in i64, as Datomic's long is: a
 fixnum, or a bignum past the fixnum range (`docs/SEMANTICS.md` §2.2),
 goes in, and a read returns the language's integer for the stored
