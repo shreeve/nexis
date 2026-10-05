@@ -1,85 +1,19 @@
-//! compile.zig — the compiler: `reader.Form` → `Tiny` IR → bytecode.
+//! compile.zig — the compiler: `reader.Form` → `Tiny` IR → bytecode
+//! (docs/COMPILER.md, which owns the lowering of every form).
 //!
-//! Authoritative spec: `docs/COMPILER.md`.
-//!
-//! **Pipeline**: `compileSourceWith` / `compileFormWith` macroexpand
-//! the form (`expand.zig`), lower it to a `Tiny` tree (`lowerForm`),
-//! and compile that tree with `emitRoutine`. `Tiny` is
-//! the only IR; there is no separate Form → bytecode path.
-//!
-//! **Forms lowered**:
-//!
-//!   - nil / bool / int literals →  `mov:load-nil` / `mov:load-true` /
-//!                                  `mov:load-false` / `mov:load-const`
-//!   - keywords, strings, floats, chars, quoted symbols
-//!                               →  `Tiny.literal` (a const-pool Value;
-//!                                  keywords and symbols need an
-//!                                  Interner, strings a Heap)
-//!   - `(+ a b)`, `(< a b)`, `(inc a)` and the other core numeric
-//!     fns at the arity they inline at (`inlined_ops`)
-//!                               →  one `math` / `cmp` instruction
-//!                                  when the operator names
-//!                                  `nexis.core`'s Var, operands read
-//!                                  in place where they can be
-//!   - `(if <test> <then> <else?>)` → `jump:if-false` over then,
-//!                                  unconditional `jump:jmp` past else,
-//!                                  with PC back-patching; an absent
-//!                                  else branch synthesizes nil
-//!   - `<symbol>`                →  lexical local, captured upvalue, or
-//!                                  namespace Var, in that order
-//!                                  (COMPILER.md §4.3)
-//!   - `ns/name`                 →  exact lookup through the namespace
-//!                                  registry (aliases honored)
-//!   - `(let* [n1 v1, ...] body)` → strict left-of-self-visibility
-//!                                  per COMPILER.md §4.3 (binding-i's
-//!                                  RHS sees bindings 1..i-1 only);
-//!                                  `defer scope.restore(mark)`
-//!                                  pops bindings on let-body exit
-//!   - `(do e1 e2 ... eN)`       →  empty → nil; one-expr → compile
-//!                                  to dst; multi-expr → all non-last
-//!                                  to a SHARED discard slot, last
-//!                                  to dst
-//!   - `(fn* name? [params & rest?] body)` → child routine +
-//!                                  `closure:make`; lowering marks
-//!                                  the bindings closures capture, and
-//!                                  they are boxed where they are bound
-//!   - `(letfn* ...)`, `(loop* ...)`, `(recur ...)`, `(def ...)`,
-//!     `(var name)`
-//!   - `(try body (catch any e handler) (finally ...)?)`, `(throw v)`
-//!   - `#%list` / `#%concat` / `#%vector` / `#%map` / `#%set` and bare
-//!     `[...]` / `{...}` / `#{...}` literals → `coll:*` opcodes
-//!
-//! **Architecture**: destination-driven lowering. An `Emitter`
-//! accumulates code + consts + slot_count, and each form's
-//! `compileExpr(emitter, form, dst, recur_target)` writes its result
-//! into the caller-chosen destination slot, so `if`-arms target a
-//! shared dst.
-//!
-//! **Limits**: the primitive `try` takes one `(catch any binding
-//! ...)`; the expander lowers several catch clauses and keyword
-//! matchers onto it (MACROEXPAND.md §2b).
+//! `compileFormWith` macroexpands a form (`expand.zig`), lowers it to a
+//! `Tiny` tree (`lowerForm`), and emits that tree with `emitRoutine`:
+//! destination-driven, each node's `compileExpr(emitter, node, dst,
+//! recur_target)` writing its value into the slot its parent chose.
+//! `Tiny` is the only IR. `RuntimeHooks` is the compiler as `eval`,
+//! `read-string` and `macroexpand-1` reach it at run time.
 
 const std = @import("std");
 const vm = @import("vm.zig");
 const value_mod = @import("value.zig");
-/// Compiler input. `lowerForm` translates a reader.Form tree
-/// into `Tiny`; the backend compiles `Tiny` only (there is no
-/// parallel Form → bytecode path).
 const reader_mod = @import("reader.zig");
-/// Interner for quoted symbols/keywords during Form lowering.
-/// `lowerQuotePayload` interns symbols/keywords through the
-/// VM's shared Interner so identity is stable across compile,
-/// runtime and macroexpand.
 const intern_mod = @import("intern.zig");
-/// Form → Form expander: macros, syntax-quote, anon-fn, and the
-/// #%list/#%concat/#%vector dispatch all live there. Expansion
-/// runs BEFORE lowering whenever `compileFormWith` is given an
-/// Interner; without one, no expansion fires.
 const expand_mod = @import("expand.zig");
-/// Form lowering allocates string-literal Values into a stable
-/// Heap so `Tiny.literal` can carry them across compile → run.
-/// `LowerCtx.heap` is the optional heap; when null, `.string`
-/// Forms raise `UnsupportedFeature`.
 const heap_mod = @import("heap.zig");
 const string_mod = @import("string.zig");
 const bignum_mod = @import("bignum.zig");
@@ -2214,7 +2148,6 @@ fn lowerTry(
     // the OUTER lexical env (NOT the catch binding).
     var finally_tiny: ?*const Tiny = null;
     if (finally_form) |ff| {
-        if (ff.datum != .list or ff.datum.list.len < 1) return CompileError.MalformedForm;
         const fitems = ff.datum.list;
         // (finally body...) — body forms.
         finally_tiny = try lowerBody(allocator, fitems[1..], ctx);
@@ -2904,9 +2837,8 @@ fn callCore(e: *Emitter, name: []const u8, args: []const CoreArg, dst: u12) Comp
 }
 
 fn loadCore(e: *Emitter, name: []const u8, dst: u12) CompileError!void {
-    const ns = e.namespace orelse return e.limit("local slots");
-    const registry = ns.registry orelse return e.limit("local slots");
-    const v = registry.core.lookupLocal(name) orelse return e.limit("local slots");
+    const registry = if (e.namespace) |ns| ns.registry else null;
+    const v = (if (registry) |r| r.core.lookupLocal(name) else null) orelse return unresolved(e.allocator, e.diag, null, "nexis.core", name);
     try e.emit(vm.asm_.varLoadVar(dst, try e.addVarTableEntry(v)));
 }
 
