@@ -4643,13 +4643,24 @@ fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
 // (`nil`, strings without quotes), `pr`/`prn`/`pr-str` readable form.
 
 /// The `with-out-str` buffers in force, innermost last. One isolate,
-/// one thread; each buffer is on the allocator of the VM that pushed
-/// it.
+/// one thread. The stack and its buffers live on `out_allocator`,
+/// which outlives every VM: a macro's sub-VM, whose allocator dies
+/// with it, prints into a buffer its caller opened.
 var out_stack: std.ArrayList(std.ArrayList(u8)) = .empty;
+const out_allocator = std.heap.smp_allocator;
+
+/// Close every `with-out-str` buffer still open, dropping what was
+/// printed into it: the host calls it where an error no handler can
+/// take (out of memory) ends a run, which skips the `#%pop-out` in
+/// `with-out-str`'s handler, so output after it is not swallowed.
+pub fn discardOutCaptures() void {
+    for (out_stack.items) |*buf| buf.deinit(out_allocator);
+    out_stack.clearAndFree(out_allocator);
+}
 
 fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
     if (out_stack.items.len > 0) {
-        out_stack.items[out_stack.items.len - 1].appendSlice(vm.allocator, bytes) catch return VmError.OutOfMemory;
+        out_stack.items[out_stack.items.len - 1].appendSlice(out_allocator, bytes) catch return VmError.OutOfMemory;
         return;
     }
     const io_handle = vm.io orelse return VmError.IoError;
@@ -4704,15 +4715,15 @@ fn fnPrStr(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(#%push-out)` opens a `with-out-str` buffer; `(#%pop-out)` closes
 /// the innermost one and returns what was printed into it.
-fn fnPushOut(vm: *VM, _: []const Value) VmError!Value {
-    out_stack.append(vm.allocator, .empty) catch return VmError.OutOfMemory;
+fn fnPushOut(_: *VM, _: []const Value) VmError!Value {
+    out_stack.append(out_allocator, .empty) catch return VmError.OutOfMemory;
     return value_mod.nilValue();
 }
 
 fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
     var buf = out_stack.pop() orelse return VmError.InvalidArgument;
-    defer buf.deinit(vm.allocator);
-    if (out_stack.items.len == 0) out_stack.clearAndFree(vm.allocator);
+    defer buf.deinit(out_allocator);
+    if (out_stack.items.len == 0) out_stack.clearAndFree(out_allocator);
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
 }
 

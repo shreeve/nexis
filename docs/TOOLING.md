@@ -160,7 +160,8 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   OutOfMemory` at the call whose allocation failed, with its frames
   (`out-of-memory.err`). No `try` catches it (VM.md §13); what the
   failed allocation was building is unreachable, so the heap stays
-  usable and the REPL carries on. Memory that runs out while reading,
+  usable and the REPL carries on; a `with-out-str` capture the error
+  left open is discarded, so the next input prints (`repl.in`). Memory that runs out while reading,
   compiling or printing is reported the same way with no position.
   With `NEXIS_MAX_ALLOC=BYTES` in the environment every allocation, or
   growth of one, past BYTES fails as a request the machine refuses

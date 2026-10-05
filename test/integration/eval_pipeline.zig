@@ -2195,6 +2195,13 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
 }
 
+test "defmacro: what a macro prints goes to the with-out-str buffer the program opened" {
+    try expectOutputProgram(
+        \\(defmacro m [] (print (apply str (repeat 5000 "m"))) nil)
+        \\(count (with-out-str (print "abc") (eval '(m)) (print (apply str (repeat 5000 "z")))))
+    , "10003");
+}
+
 test "defmacro: parameters destructure and overload clauses dispatch, as for defn" {
     try expectOutputProgram("(defmacro m [[a b] & body] `(+ ~a ~b ~@body)) (m [1 2] 3)", "6");
     try expectOutputProgram("(defmacro m ([x] x) ([x y] `(+ ~x ~y))) [(m 1) (m 1 2)]", "[1 3]");

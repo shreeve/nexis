@@ -284,7 +284,13 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 
 The `with-out-str` buffer stack is process-wide (one isolate, one
 thread); `nexis.internal/#%push-out` opens a buffer and `#%pop-out`
-closes the innermost and returns its text.
+closes the innermost and returns its text. The stack and its buffers
+live on one process allocator (`std.heap.smp_allocator`), not a VM's,
+so a macro's sub-VM prints into a buffer the program opened.
+`stdlib.discardOutCaptures` closes every open buffer; the CLI calls it
+where an error no handler takes (out of memory) ends a run, which
+skips `with-out-str`'s `#%pop-out`, so the REPL's next output is not
+swallowed.
 
 **Rooting.** Every native here reads its arguments, which are rooted
 for the call, allocates its result last and never calls back into
