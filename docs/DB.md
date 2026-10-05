@@ -402,20 +402,30 @@ None: a ref has no heap children. `conn` points at a non-heap
 | A write on a file opened read-only | `TxnReadOnly` | `:db/read-only` |
 | A second `close` | none | none (nil) |
 | Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
-| Stored bytes that do not decode | any other `CodecError` | `:codec-failed` |
+| Stored bytes that do not decode | any other `CodecError`, `Overflow`, `InvalidListTail`, `EmptyName` | `:codec-failed` |
 
 emdb errors map by `failureName`: `:db/key-too-large` (a key past
 4078 bytes, emdb's bound for the pinned 16 KiB page),
-`:db/value-too-large` (an encoded value past 65 535 overflow pages,
-just under 1 GiB), `:db/max-trees` (a file holds at most 128 named
-trees, Nextomic's twelve among them when it shares the file),
+`:db/value-too-large` (an encoded value past just under 4 GiB, emdb's
+longest overflow chain), `:db/max-trees` (a file holds at most 128
+named trees, Nextomic's twelve among them when it shares the file),
 `:db/not-found`,
-`:db/corrupted` (also a file that is not a store, and a format-version
-mismatch), `:db/map-full`, `:db/mmap-failed`, `:db/open-failed`,
-`:db/page-size-mismatch`, `:db/busy` (a writer already active, the
+`:db/corrupted` (also a file that is not a store, a format-version
+mismatch, and a page that fails its check during a read or a walk),
+`:db/map-full`, `:db/mmap-failed`, `:db/open-failed` (also a lock file
+another emdb version holds), `:db/busy` (a writer already active, the
 environment busy), `:db/readers-full` (every one of the file's 4,096
-reader slots holds a read; §3.2), `:db/txn-aborted`,
-`:db/read-only`, `:db/sync-failed`; anything else is `:db-error`.
+reader slots holds a read; §3.2), `:db/txn-aborted` (a write after a
+caught failure of an earlier one in the same transaction, which only
+abort can end), `:db/read-only`, `:db/sync-failed`, and
+`:db/durability-unknown`: a `:durable` commit whose meta page did not
+sync. That commit is published and every transaction sees it; it is
+durable once a later sync succeeds, and the file counts as unsynced
+(§3.3) until one does. `with-tx` reports it like any failed commit,
+though the commit stands. The emdb errors left are the ones no nexis
+call can meet (options it pins or never sets, operations it never
+calls); they would be `:db-error`, and the inline test "failureName"
+holds the table to `emdb.Error`.
 Nextomic shares these `:db/*` names through the same function.
 
 The natives throw them with `vm.throwKeyword`, so `(catch any e …)`

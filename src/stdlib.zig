@@ -3069,7 +3069,7 @@ fn isIfn(k: Kind) bool {
 /// Throw a db.zig / emdb / codec error to the program as its
 /// keyword (`db.failureName`).
 fn dbFailure(vm: *VM, err: anyerror) VmError {
-    if (err == error.OutOfMemory) return VmError.OutOfMemory;
+    if (err == error.OutOfMemory or err == error.InternTableFull) return VmError.OutOfMemory;
     return vm.throwKeyword(db_mod.failureName(err));
 }
 

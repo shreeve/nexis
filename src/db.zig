@@ -80,10 +80,11 @@ pub const DbError = error{
 };
 
 /// The keyword a storage-layer error surfaces as at the language
-/// level (DB.md §8). Each emdb error set with a distinct cause gets
-/// its own name; the rest share `:db-error`. A value of a kind with
-/// no serialized form is `:unserializable`; bytes that do not decode
-/// are `:codec-failed`.
+/// level (DB.md §8). Each emdb error with a distinct cause gets its
+/// own name; the rest, which nexis never reaches, share `:db-error`
+/// (the inline test "failureName" holds the table to `emdb.Error`). A
+/// value of a kind with no serialized form is `:unserializable`; bytes
+/// that do not decode are `:codec-failed`.
 pub fn failureName(err: anyerror) []const u8 {
     return switch (err) {
         error.KeyTooLarge => "db/key-too-large",
@@ -93,14 +94,14 @@ pub fn failureName(err: anyerror) []const u8 {
         error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
         error.DatabaseFull => "db/map-full",
         error.MmapFailed => "db/mmap-failed",
-        error.OpenFailed => "db/open-failed",
-        error.PageSizeMismatch, error.InvalidPageSize => "db/page-size-mismatch",
+        error.OpenFailed, error.LockFileMismatch => "db/open-failed",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",
         error.ReaderTableFull => "db/readers-full",
         error.HardLinked => "db/hard-linked",
-        error.TxnAborted => "db/txn-aborted",
+        error.TxnBroken => "db/txn-aborted",
         error.TxnReadOnly => "db/read-only",
         error.SyncFailed => "db/sync-failed",
+        error.DurabilityUnknown => "db/durability-unknown",
         error.StoreMismatch => "db/store-mismatch",
         error.ConnectionUnavailable => "db/no-connection",
         error.InvalidTreeName, error.InvalidKey => "db/invalid-key",
@@ -112,6 +113,9 @@ pub fn failureName(err: anyerror) []const u8 {
         error.InvalidLeb128,
         error.InvalidCharScalar,
         error.MalformedPayload,
+        error.Overflow,
+        error.InvalidListTail,
+        error.EmptyName,
         => "codec-failed",
         else => "db-error",
     };
@@ -245,7 +249,12 @@ pub const StoreFile = struct {
     /// and meta makes every commit before it durable too; any other
     /// leaves the file unsynced until `sync`.
     pub fn commit(self: *StoreFile, txn: *emdb.Txn) !void {
-        try txn.commit();
+        txn.commit() catch |err| {
+            // Published and seen by every transaction, but its meta
+            // page did not sync: durable only once a later sync is.
+            if (err == error.DurabilityUnknown) self.unsynced = true;
+            return err;
+        };
         self.unsynced = switch (self.write_sync) {
             // nexis never opens an environment with emdb's `noSync`
             // or `noMetaSync`, so its own setting is a full sync.
@@ -1258,6 +1267,35 @@ fn synthEq(a: Value, b: Value) bool {
     };
 }
 
+test "failureName: every emdb error nexis can meet has its keyword; every decode error is :codec-failed" {
+    // The engine's errors no nexis call can return: options nexis pins
+    // or never sets, operations it never calls (prepare, child
+    // transactions, backup, restore, dump, rollback), and misuse its
+    // callers rule out.
+    const unreached = [_][]const u8{
+        "InvalidPageSize",   "MapSizeTooLarge",    "PageSizeMismatch", "TxnPrepared",
+        "TxnNotPreparable",  "TxnHasChild",        "Incompatible",     "InvalidCursor",
+        "BackupFormat",      "BackupBaseMismatch", "DumpFormat",       "NoPreviousSnapshot",
+        "TooManyNamedTrees",
+    };
+    inline for (@typeInfo(emdb.Error).error_set.error_names.?) |name| {
+        const named = !std.mem.eql(u8, failureName(@field(emdb.Error, name)), "db-error");
+        const listed = for (unreached) |u| {
+            if (std.mem.eql(u8, u, name)) break true;
+        } else false;
+        if (named == listed) {
+            std.debug.print("emdb error {s}: keyword {s}\n", .{ name, failureName(@field(emdb.Error, name)) });
+            return error.TestUnexpectedResult;
+        }
+    }
+    inline for (@typeInfo(codec_mod.DecodeError).error_set.error_names.?) |name| {
+        const expected = if (std.mem.eql(u8, name, "OutOfMemory") or std.mem.eql(u8, name, "InternTableFull"))
+            "db-error"
+        else if (std.mem.eql(u8, name, "UnserializableKind")) "unserializable" else "codec-failed";
+        try testing.expectEqualStrings(expected, failureName(@field(codec_mod.DecodeError, name)));
+    }
+}
+
 test "DurableRefBody layout: 32 bytes header" {
     try testing.expectEqual(@as(usize, 32), @sizeOf(DurableRefBody));
 }
@@ -1545,6 +1583,59 @@ test "durability durable: every commit syncs, which leaves nothing for close; a 
     abortRead(&r);
     try close(&reader);
     try testing.expectEqual(after_commit, engineSyncs());
+}
+
+/// Fails the meta sync of the next commit on the data file `fd`: once
+/// the commit is published, `fd` names a pipe, which no sync takes,
+/// until `restore`.
+const MetaSyncFailure = struct {
+    fd: std.c.fd_t,
+    saved: std.c.fd_t = -1,
+    pipe: [2]std.c.fd_t = undefined,
+
+    fn notify(ctx: *anyopaque, step: emdb.txn.CommitStep) void {
+        const self: *MetaSyncFailure = @ptrCast(@alignCast(ctx));
+        if (step != .metaWritten) return;
+        self.saved = std.c.dup(self.fd);
+        _ = std.c.dup2(self.pipe[0], self.fd);
+    }
+
+    fn restore(self: *MetaSyncFailure) void {
+        _ = std.c.dup2(self.saved, self.fd);
+        for ([_]std.c.fd_t{ self.saved, self.pipe[0], self.pipe[1] }) |fd| _ = std.c.close(fd);
+    }
+};
+
+test "durability durable: a commit whose meta sync fails stands, is DurabilityUnknown and leaves the file unsynced" {
+    const path = try tmpDbPath(testing.allocator, "meta_sync");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    conn.durability = .durable;
+    var failure = MetaSyncFailure{ .fd = conn.file.env.inner.dataFile.fd };
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
+    conn.file.env.inner.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
+    var w = try beginWrite(&conn);
+    try put(&w, "t", "k", value.fromFixnum(5).?);
+    const committed = commit(&w);
+    conn.file.env.inner.commitObserver = null;
+    failure.restore();
+    try testing.expectError(error.DurabilityUnknown, committed);
+    try testing.expectEqualStrings("db/durability-unknown", failureName(error.DurabilityUnknown));
+    try testing.expect(conn.file.unsynced);
+    {
+        var r = try beginRead(&conn);
+        defer abortRead(&r);
+        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+    }
+    try sync(&conn);
+    try testing.expect(!conn.file.unsynced);
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
