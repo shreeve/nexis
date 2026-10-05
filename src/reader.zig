@@ -269,6 +269,8 @@ pub const Reader = struct {
                 std.math.nan(f64);
             return try self.makeForm(.{ .real = symbolic }, span);
         }
+        // Zig's parser takes `_` between digits; a nexis literal has none.
+        if (std.mem.findScalar(u8, text, '_') != null) return self.fail(.bad_number_literal, span, text);
         const value = std.fmt.parseFloat(f64, text) catch
             return self.fail(.bad_number_literal, span, text);
         return try self.makeForm(.{ .real = value }, span);
@@ -462,8 +464,8 @@ pub const Reader = struct {
         return try self.makeForm(.{ .map = merged[n..] }, span);
     }
 
-    /// Accept `^:kw`, `^{...}`, or `^sym` and append the resulting
-    /// key/value pairs to `entries`.
+    /// Accept `^:kw`, `^{...}`, `^sym`, `^"string"` or `^[...]` and
+    /// append the resulting key/value pairs to `entries`.
     fn appendMetaEntries(self: *Reader, entries: *std.ArrayList(*Form), m: *Form, span: SrcSpan) ReaderError!void {
         switch (m.datum) {
             .keyword => {
@@ -471,16 +473,18 @@ pub const Reader = struct {
                 const tr = try self.makeForm(.{ .bool_ = true }, span);
                 try entries.append(self.allocator(), tr);
             },
-            .symbol => {
-                const tag_kw = try self.makeForm(.{ .keyword = .{ .ns = null, .name = "tag" } }, span);
-                try entries.append(self.allocator(), tag_kw);
+            // `^String x` and `^"String" x` are a `:tag`, `^[long]
+            // f` Clojure's `:param-tags`.
+            .symbol, .string, .vector => {
+                const key = if (m.datum == .vector) "param-tags" else "tag";
+                try entries.append(self.allocator(), try self.makeForm(.{ .keyword = .{ .ns = null, .name = key } }, span));
                 try entries.append(self.allocator(), m);
             },
             .map => |kv| {
                 if (kv.len % 2 != 0) return self.fail(.map_odd_count, m.origin, null);
                 for (kv) |p| try entries.append(self.allocator(), p);
             },
-            else => return self.fail(.unknown_reader_construct, m.origin, "metadata must be a keyword, map, or symbol"),
+            else => return self.fail(.unknown_reader_construct, m.origin, "metadata must be a keyword, map, symbol, string or vector"),
         }
     }
 
@@ -502,12 +506,27 @@ pub const Reader = struct {
                 'n' => '\n',
                 't' => '\t',
                 'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
                 '\\' => '\\',
                 '"' => '"',
                 else => null,
             };
             if (simple) |b| {
                 out.appendAssumeCapacity(b);
+                continue;
+            }
+            // Clojure's octal escape: one to three octal digits, at
+            // most `\377`.
+            if (at + 1 < body.len and body[at + 1] >= '0' and body[at + 1] <= '7') {
+                var end = at + 1;
+                while (end < body.len and end < at + 4 and body[end] >= '0' and body[end] <= '7') end += 1;
+                i = end;
+                const unit = std.fmt.parseInt(u21, body[at + 1 .. end], 8) catch unreachable;
+                if (unit > 0o377) return self.fail(.invalid_string_escape, span, body[at..end]);
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(unit, &utf8) catch unreachable;
+                out.appendSliceAssumeCapacity(utf8[0..n]);
                 continue;
             }
             if (body[i - 1] != 'u')
@@ -537,7 +556,9 @@ pub const Reader = struct {
                 return self.fail(.invalid_string_escape, span, body[at..@min(body.len, at + 16)]);
             const escape = body[at .. close + 1];
             i = close + 1;
-            const scalar = std.fmt.parseInt(u21, body[at + 3 .. close], 16) catch
+            const digits = body[at + 3 .. close];
+            for (digits) |c| if (!std.ascii.isHex(c)) return self.fail(.invalid_string_escape, span, escape);
+            const scalar = std.fmt.parseInt(u21, digits, 16) catch
                 return self.fail(.invalid_string_escape, span, escape);
             var utf8: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(scalar, &utf8) catch
@@ -634,15 +655,14 @@ fn sexpSpan(s: Sexp) SrcSpan {
 
 const IntLiteral = struct { negative: bool, base: u8, digits: []const u8 };
 
-/// Split an integer literal into sign, radix and digits; `null` unless
-/// every digit is valid for the radix.
+/// Split an integer literal into sign (`-` or `+`), radix and digits;
+/// `null` unless every digit is valid for the radix.
 fn splitIntLiteral(text: []const u8) ?IntLiteral {
     if (text.len == 0) return null;
-    var negative = false;
     var t = text;
-    if (t[0] == '-') {
+    const negative = t[0] == '-';
+    if (t[0] == '-' or t[0] == '+') {
         if (t.len == 1) return null;
-        negative = true;
         t = t[1..];
     }
     var base: u8 = 10;
@@ -721,9 +741,15 @@ fn hex4(digits: []const u8) ?u21 {
 fn splitNamespace(text: []const u8) ?Name {
     if (text.len == 0) return null;
     // `/` by itself is the division symbol (only valid unqualified name
-    // that is itself a slash).
+    // that is itself a slash); `ns//` is it qualified, as syntax-quote
+    // writes `nexis.core//` and Clojure reads `clojure.core//`.
     if (std.mem.eql(u8, text, "/")) {
         return Name{ .ns = null, .name = text };
+    }
+    if (text.len > 2 and std.mem.endsWith(u8, text, "//")) {
+        const ns = text[0 .. text.len - 2];
+        if (std.mem.findScalar(u8, ns, '/') != null) return null;
+        return Name{ .ns = ns, .name = "/" };
     }
     const first = std.mem.findScalar(u8, text, '/') orelse {
         return Name{ .ns = null, .name = text };
@@ -987,6 +1013,9 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
         .{ .src = "3.14M", .pos = 0, .text = "3.14M" },
         .{ .src = "1.5N", .pos = 0, .text = "1.5N" },
         .{ .src = "1_000", .pos = 0, .text = "1_000" },
+        .{ .src = "1.0_5", .pos = 0, .text = "1.0_5" },
+        .{ .src = "1e1_0", .pos = 0, .text = "1e1_0" },
+        .{ .src = "+1x", .pos = 0, .text = "+1x" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c.src);
@@ -1015,6 +1044,27 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
     try std.testing.expect(items[1].datum == .deref);
+}
+
+test "signed numbers and digit-led keywords read as in Clojure" {
+    try expectReads("[+5 +0x10 -0x10 +1.5 +9223372036854775808 :1 :2a + +a]",
+        \\(vector (int 5) (int 16) (int -16) (real 1.5) (bigint 9223372036854775808) (keyword :1) (keyword :2a) (symbol +) (symbol +a))
+        \\
+    );
+}
+
+test "metadata: a string is a :tag, a vector :param-tags" {
+    try expectReads("^\"String\" x ^[long] f",
+        \\(with-meta
+        \\  (symbol x)
+        \\  (map (keyword :tag) (string "String")))
+        \\(with-meta
+        \\  (symbol f)
+        \\  (map
+        \\    (keyword :param-tags)
+        \\    (vector (symbol long))))
+        \\
+    );
 }
 
 test "parsing is linear: a list of n forms costs O(n) parser memory" {
@@ -1180,6 +1230,13 @@ test "namespace split" {
     // Multi-slash is invalid (at most one separator)
     try std.testing.expect(splitNamespace("foo/bar/baz") == null);
     try std.testing.expect(splitNamespace("a/b/c/d") == null);
+
+    // The division symbol qualified, as syntax-quote prints it.
+    const d = splitNamespace("nexis.core//").?;
+    try std.testing.expectEqualStrings("nexis.core", d.ns.?);
+    try std.testing.expectEqualStrings("/", d.name);
+    try std.testing.expect(splitNamespace("a/b//") == null);
+    try std.testing.expect(splitNamespace("//") == null);
 }
 
 test "char literal parsing" {
@@ -1225,6 +1282,13 @@ test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     try expectReaderError("\"\\uD800\"", .invalid_string_escape, "\\uD800");
     try expectReaderError("\"\\uDE00\\uD83D\"", .invalid_string_escape, "\\uDE00");
     try expectReaderError("\"\\uD83Dx\"", .invalid_string_escape, "\\uD83D");
+    // `\b`, `\f` and Clojure's octal escapes, at most `\377`; a
+    // `\u{...}` body is hex digits alone.
+    try expectReads("\"\\b\\f\\101\\0\\12x\"", "(string \"\\u{8}\\u{C}A\\u{0}\\nx\")\n");
+    try expectReads("\"\\1234\"", "(string \"S4\")\n");
+    try expectReaderError("\"\\400\"", .invalid_string_escape, "\\400");
+    try expectReaderError("\"\\u{+41}\"", .invalid_string_escape, "\\u{+41}");
+    try expectReaderError("\"\\u{4_1}\"", .invalid_string_escape, "\\u{4_1}");
     // An unterminated string is a parse error at its opening quote.
     const allocator = std.testing.allocator;
     const src = "(println \"never closed\n(+ 1 2)";

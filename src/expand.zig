@@ -778,10 +778,13 @@ const AnonParams = struct {
                 }
                 if (std.mem.eql(u8, name, "%&")) {
                     self.uses_rest = true;
-                } else if (std.fmt.parseUnsigned(u32, name[1..], 10)) |n| {
+                } else if (for (name[1..]) |c| {
+                    if (!std.ascii.isDigit(c)) break false;
+                } else true) {
+                    const n = std.fmt.parseUnsigned(u32, name[1..], 10) catch std.math.maxInt(u32);
                     if (n == 0 or n > 1000) return ctx.fail(form.origin, "#(): no parameter {s}", .{name});
                     self.max_positional = @max(self.max_positional, n);
-                } else |_| {}
+                }
             },
             .anon_fn => return ctx.fail(form.origin, "#() cannot nest", .{}),
             .quote => {},
