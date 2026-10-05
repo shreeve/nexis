@@ -725,7 +725,10 @@ before any qualified one, then by namespace, then by name); a
 comparison across other types (a string against a number, a number
 against a keyword) or of any other value (a vector) is
 `:nextomic/value-type`, as is an input or a
-function result whose shape does not fit its binding form. Any other
+function result whose shape does not fit its binding form. A function
+never binds a variable to nil: a nil result binds nothing under any
+binding form, and a nil element drops its element under `[?x ...]` or
+`[[?a ?b]]` and its row under `[?a ?b]` (a `_` may take nil). Any other
 symbol resolves through the namespace registry as the compiler resolves
 it (an alias-qualified `ns/name` to that namespace's own var, a bare
 name in the current namespace and then its auto-referred parents) and

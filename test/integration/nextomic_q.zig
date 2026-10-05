@@ -869,7 +869,7 @@ const Naive = struct {
     fn unifyTuple(self: *Naive, ts: []const ?Var, v: Value, env: Env) !?Env {
         const e2 = try self.copy(env);
         for (ts, (try seq(self.arena, v))[0..ts.len]) |t, item| if (t) |x| {
-            if (!unify(e2, x, Cell.fromValue(item))) return null;
+            if (item.isNil() or !unify(e2, x, Cell.fromValue(item))) return null;
         };
         return e2;
     }
@@ -881,14 +881,15 @@ const Naive = struct {
                 const e2 = try self.copy(env);
                 if (unify(e2, x, Cell.fromValue(v))) try out.append(self.arena, e2);
             },
-            .collection => |x| for (try seq(self.arena, v)) |item| {
+            .collection => |x| if (!v.isNil()) for (try seq(self.arena, v)) |item| {
+                if (item.isNil()) continue;
                 const e2 = try self.copy(env);
                 if (unify(e2, x, Cell.fromValue(item))) try out.append(self.arena, e2);
             },
             .tuple => |ts| if (!v.isNil()) {
                 if (try self.unifyTuple(ts, v, env)) |e2| try out.append(self.arena, e2);
             },
-            .relation => |ts| for (try seq(self.arena, v)) |row| {
+            .relation => |ts| if (!v.isNil()) for (try seq(self.arena, v)) |row| {
                 if (try self.unifyTuple(ts, row, env)) |e2| try out.append(self.arena, e2);
             },
         }
@@ -1211,6 +1212,21 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?n ?i :in $ ?f :where [?e :person/name ?n] [(?f 2) [?i ...]]]", &.{ nil, try fx.read("range") }, 12);
     try checkCount(fx, dbv, "[:find ?n ?x ?y :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a ?n) [?x ?y]]]", &.{ nil, try fx.read("pair") }, 6);
     try checkCount(fx, dbv, "[:find ?n ?h :in $ ?f :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) [[_ ?h]]]]", &.{ nil, try fx.read("halves") }, 12);
+    // A function never binds a variable to nil: a nil result binds
+    // nothing under every form, a nil element drops its element under
+    // a collection or relation binding and its row under a tuple.
+    const k_x = fx.interner().keywordValue(try fx.kwId("x"));
+    const k_y = fx.interner().keywordValue(try fx.kwId("y"));
+    try checkCount(fx, dbv, "[:find ?n ?x :in $ ?k :where [?e :person/name ?n] [(ground {:x [1 2]}) ?m] [(?k ?m) [?x ...]]]", &.{ nil, k_x }, 12);
+    try checkCount(fx, dbv, "[:find ?n ?x :in $ ?k :where [?e :person/name ?n] [(ground {:x [1 2]}) ?m] [(?k ?m) [?x ...]]]", &.{ nil, k_y }, 0);
+    try checkCount(fx, dbv, "[:find ?n ?x :in $ ?k :where [?e :person/name ?n] [(ground {:x [1 2]}) ?m] [(?k ?m) [[?x _]]]]", &.{ nil, k_y }, 0);
+    try checkCount(fx, dbv, "[:find ?n ?x :in $ ?k :where [?e :person/name ?n] [(ground {:x [1 2]}) ?m] [(?k ?m) [?x _]]]", &.{ nil, k_y }, 0);
+    try checkCount(fx, dbv, "[:find ?n ?x :where [?e :person/name ?n] [(ground nil) [?x ...]]]", &.{nil}, 0);
+    try checkCount(fx, dbv, "[:find ?n ?x :where [?e :person/name ?n] [(pair nil ?n) [?x ...]]]", &.{nil}, 6);
+    try checkCount(fx, dbv, "[:find ?n ?x :where [?e :person/name ?n] [(pair nil ?n) [?y ?x]]]", &.{nil}, 0);
+    try checkCount(fx, dbv, "[:find ?n ?x :where [?e :person/name ?n] [(pair nil ?n) [_ ?x]]]", &.{nil}, 6);
+    try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] [(ground [[nil 1] [2 3]]) [[?y ?z]]]]", &.{nil}, 6);
+    try checkCount(fx, dbv, "[:find ?y :where [(ground [[nil 1] [2 3]]) [[?y ?z]]]]", &.{nil}, 1);
     try checkCount(fx, dbv, "[:find ?n :in $ [?f ...] :where [?e :person/name ?n] [?e :person/age ?a] [(?f ?a) ?r] [(> ?r 41)]]", &.{ nil, try fx.read("[inc identity]") }, 2);
     try checkCount(fx, dbv, "[:find ?n :in $ ?f :where [(ground [1 2]) [?x ...]] [(?f ?x ?x) ?y] [?e :person/age ?a] [(< ?y 3)] [?e :person/name ?n]]", &.{ nil, try fx.read("add") }, 6);
     // The naive fixpoint runs rule bodies with nothing bound, so a rule

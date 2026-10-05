@@ -28,8 +28,10 @@
 //!     symbol goes to the `CallHook` with VM values, as does the value
 //!     of a variable in function position, and its errors propagate
 //!     untouched (the caller closes the `Read` on the way out).
-//!   - A function result of nil drops the row; collection and relation
-//!     bindings fan out one row per element.
+//!   - A function never binds a variable to nil: a nil result binds
+//!     nothing, a nil element drops its element under a collection or
+//!     relation binding and its row under a tuple binding. Collection
+//!     and relation bindings fan out one row per element.
 //!   - `findRows` forms the basis set (distinct tuples over the find and
 //!     `:with` variables) and groups and aggregates it; `materialise`
 //!     applies pull expressions in the same snapshot and copies the
@@ -638,9 +640,8 @@ pub const Exec = struct {
     /// Append the rows `result` binds under `b.out`; `row[0..base]`
     /// holds the input row. An output variable bound before the step
     /// unifies: the row is kept only when the result equals its value.
-    /// A nil result binds nothing under a scalar or tuple form; a
-    /// result that is not the collection its binding form needs is
-    /// `ValueType`.
+    /// Nil binds nothing (see the module contract); a result that is
+    /// not the collection its binding form needs is `ValueType`.
     fn bindResult(self: *Exec, b: *const plan_mod.Bind, result: Result, row: []Cell, base: usize, out: *Relation) anyerror!void {
         switch (b.out) {
             .scalar => |v| {
@@ -658,7 +659,7 @@ pub const Exec = struct {
                     .cell => |y| y,
                     .tuple => |ts| .{ .vm = try self.keptVector(ts) },
                 };
-                if (put(out, row, base, v, c)) try out.append(row);
+                if (c != .nil and put(out, row, base, v, c)) try out.append(row);
             },
             .tuple => |ts| {
                 const cells: []const Cell = switch (result) {
@@ -671,22 +672,28 @@ pub const Exec = struct {
                         break :blk cs;
                     },
                 };
-                if (try fillTuple(out, ts, cells, row, base)) try out.append(row);
+                if (try fillTuple(out, ts, cells, row, base, false)) try out.append(row);
             },
             .relation => |ts| for (try self.elements(result)) |x| {
                 const cells = switch (x) {
                     .cell => |y| try self.cellCells(y),
                     .tuple => |t| t,
                 };
-                if (try fillTuple(out, ts, cells, row, base)) try out.append(row);
+                if (try fillTuple(out, ts, cells, row, base, false)) try out.append(row);
             },
         }
     }
 
-    /// The elements of a result that binds as a collection.
+    /// The elements of a result that binds as a collection; nil has
+    /// none.
     fn elements(self: *Exec, result: Result) ![]const Elem {
         switch (result) {
             .value, .cell => {
+                if (switch (result) {
+                    .value => |x| x.isNil(),
+                    .cell => |x| x == .nil,
+                    else => unreachable,
+                }) return &.{};
                 const cells = switch (result) {
                     .value => |x| try self.valueCells(x),
                     .cell => |x| try self.cellCells(x),
@@ -744,13 +751,14 @@ pub const Exec = struct {
     }
 
     /// Fill the tuple binding `ts` from `items`; false when a bound
-    /// variable disagrees with its element, `ValueType` when there are
-    /// fewer items than the binding names.
-    fn fillTuple(out: *const Relation, ts: []const ?Var, items: []const Cell, row: []Cell, base: usize) !bool {
+    /// variable disagrees with its element, or when `nil_binds` is
+    /// false and a variable's element is nil; `ValueType` when there
+    /// are fewer items than the binding names.
+    fn fillTuple(out: *const Relation, ts: []const ?Var, items: []const Cell, row: []Cell, base: usize, nil_binds: bool) !bool {
         if (items.len < ts.len) return error.ValueType;
         for (ts, items[0..ts.len]) |t, x| {
             const tv = t orelse continue;
-            if (!put(out, row, base, tv, x)) return false;
+            if ((x == .nil and !nil_binds) or !put(out, row, base, tv, x)) return false;
         }
         return true;
     }
@@ -820,14 +828,14 @@ pub const Exec = struct {
                 .tuple => |ts| blk: {
                     var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    if (try fillTuple(&r, ts, try self.valueCells(a), row, 0)) try r.append(row);
+                    if (try fillTuple(&r, ts, try self.valueCells(a), row, 0, true)) try r.append(row);
                     break :blk r;
                 },
                 .relation => |ts| blk: {
                     var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
                     for ((try marshal.collection(self.arena, a)) orelse return error.ValueType) |x| {
-                        if (try fillTuple(&r, ts, try self.valueCells(x), row, 0)) try r.append(row);
+                        if (try fillTuple(&r, ts, try self.valueCells(x), row, 0, true)) try r.append(row);
                     }
                     break :blk try r.dedup();
                 },
