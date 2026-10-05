@@ -11,13 +11,13 @@
   </defs>
   <rect width="256" height="256" rx="60" fill="url(#nt-bg)"/>
   <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round">
-    <path d="M100 60 C 62 96, 62 160, 100 196"/>
-    <path d="M156 60 C 194 96, 194 160, 156 196"/>
+    <path d="M104 60 C 66 96, 66 160, 104 196"/>
+    <path d="M152 60 C 190 96, 190 160, 152 196"/>
   </g>
   <g fill="#fff">
-    <rect x="106" y="94" width="44" height="14" rx="7" opacity="0.4"/>
-    <rect x="106" y="121" width="44" height="14" rx="7" opacity="0.7"/>
-    <rect x="106" y="148" width="44" height="14" rx="7"/>
+    <rect x="101.5" y="90.5" width="53" height="15" rx="7.5" opacity="0.4"/>
+    <rect x="101.5" y="120.5" width="53" height="15" rx="7.5" opacity="0.7"/>
+    <rect x="101.5" y="150.5" width="53" height="15" rx="7.5"/>
   </g>
   <text class="word" x="300" y="182">Nextomic</text>
 </svg>
