@@ -3078,7 +3078,12 @@ fn compileTry(
     try e.tries.append(e.allocator, .{ .catch_pc = unpatched });
     try e.emit(vm.asm_.tryEnter(t, binding_slot));
 
+    // A finally's temporary holds nothing anyone reads until the body
+    // writes it: scratch, as an operand's is.
+    const saved_scratch = e.scratch;
+    if (result != dst) e.scratch = .{ .lo = result, .dst = result };
     try compileExpr(e, body, result, null);
+    e.scratch = saved_scratch;
 
     // A body or handler that always throws or recurs never reaches
     // its try-exit, so it has none.
