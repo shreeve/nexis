@@ -3027,7 +3027,7 @@ fn ioOf(vm: *VM) std.Io {
 /// creates only the file). `d` is `:commit` or `:durable`; without it
 /// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -4660,20 +4660,11 @@ fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(@mod(now.nanoseconds, value_mod.fixnum_max))) orelse VmError.ArithmeticOverflow;
 }
 
-/// A path argument of `slurp` / `spit`: a string, not empty, with
-/// no NUL byte (`:invalid-path`).
-fn pathArg(v: Value) VmError![]const u8 {
-    if (v.kind() != .string) return VmError.KindMismatch;
-    const path = string_mod.asBytes(v);
-    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
-    return path;
-}
-
 /// `(slurp path)` → the file's text. `:file-not-found` for a missing
 /// file, `:utf8-error` for text that is not UTF-8, `:io-error` for
 /// any other failure.
 fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     const slice = std.Io.Dir.cwd().readFileAlloc(ioOf(vm), path, vm.allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
         error.OutOfMemory => return VmError.OutOfMemory,
@@ -4689,7 +4680,7 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
 /// end with `:append`; nil. Parent directories are not created
 /// (`:file-not-found`).
 fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     if (args.len % 2 != 0) return VmError.ArityMismatch;
     var append = false;
     var i: usize = 2;

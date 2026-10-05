@@ -20,8 +20,8 @@
 //! `vals`, `seq`, `count` and `into`. Each opens one read at the
 //! entity's basis and mode, as every other native does.
 //!
-//! Connection lifetime: `connect` registers the `Conn` on
-//! `vm.nextomic_connections`, reusing the struct of a released one in
+//! Connection lifetime: `connect` registers the `Conn` on the owner
+//! VM's `nextomic_connections` (`vm.home()`), reusing the struct of a released one in
 //! its next life (`Conn.reopen`), so the list holds no more structs
 //! than connections were ever open at once; `release` closes it
 //! (idempotent, and `:nextomic/busy` while an operation on it is in
@@ -386,33 +386,35 @@ fn durabilityOption(vm: *VM, v: Value) !?SyncMode {
     return SyncMode.of(durability);
 }
 
+/// The connection is the owner VM's (`vm.home()`), so one a macro
+/// opens outlives the macro's VM, as `db/open`'s does.
 fn connect(vm: *VM, args: []const Value) !Value {
-    if (args[0].kind() != .string) return error.KindMismatch;
-    const path = string_mod.asBytes(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     var options: db_mod.OpenOptions = .{};
     if (args.len == 2) options.sync = (try syncOption(vm, args[1])) orelse try durabilityOption(vm, args[1]);
 
-    const path_z = try vm.allocator.dupeSentinel(u8, path, 0);
-    defer vm.allocator.free(path_z);
+    const host = vm.home();
+    const path_z = try host.allocator.dupeSentinel(u8, path, 0);
+    defer host.allocator.free(path_z);
     // The engine does not create parent directories; best effort here.
-    if (vm.io) |io| {
+    if (host.io) |io| {
         if (std.Io.Dir.path.dirname(path)) |dir| {
             if (dir.len > 0) std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
-    const c = for (vm.nextomic_connections.items) |p| {
+    const c = for (host.nextomic_connections.items) |p| {
         const released: *Conn = @ptrCast(@alignCast(p));
         if (!released.store_closed) continue;
         try released.reopen(path_z.ptr, options);
         break released;
     } else blk: {
-        try vm.nextomic_connections.ensureUnusedCapacity(vm.allocator, 1);
-        const fresh = try Conn.open(vm.allocator, vm.ensureInterner(), path_z.ptr, options);
-        vm.nextomic_close_callback = &closeCallback;
-        vm.nextomic_connections.appendAssumeCapacity(@ptrCast(fresh));
+        try host.nextomic_connections.ensureUnusedCapacity(host.allocator, 1);
+        const fresh = try Conn.open(host.allocator, host.ensureInterner(), path_z.ptr, options);
+        host.nextomic_close_callback = &closeCallback;
+        host.nextomic_connections.appendAssumeCapacity(@ptrCast(fresh));
         break :blk fresh;
     };
-    return handle.makeConn(vm.ensureHeap(), @ptrCast(c), c.gen, path);
+    return handle.makeConn(host.ensureHeap(), @ptrCast(c), c.gen, path);
 }
 
 /// `(release conn)`: idempotent; `:nextomic/busy` while a query, pull,

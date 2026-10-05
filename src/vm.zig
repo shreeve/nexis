@@ -42,6 +42,7 @@ const dispatch_mod = @import("dispatch.zig");
 /// consistent between the compiler, the macroexpander and runtime
 /// values.
 const intern_mod = @import("intern.zig");
+const string_mod = @import("string.zig");
 const protocol_mod = @import("protocol.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
@@ -863,6 +864,17 @@ pub fn asNativeFn(v: Value) *const NativeFn {
 /// descriptor. Typical use: `vm_mod.nativeFnValue(&native_first)`.
 pub fn nativeFnValue(descriptor: *const NativeFn) Value {
     return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
+}
+
+/// A path argument of `slurp`, `spit`, `db/open` and
+/// `nextomic/connect`: a string, not empty, with no NUL byte
+/// (`:invalid-path`): an open would stop at the NUL and name a shorter
+/// path than the program checked (DB.md §2).
+pub fn pathArg(v: Value) VmError![]const u8 {
+    if (v.kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(v);
+    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
+    return path;
 }
 
 // =============================================================================
@@ -4986,7 +4998,7 @@ pub const asm_ = struct {
 
 const testing = std.testing;
 
-const repeat = @import("string.zig").repeat;
+const repeat = string_mod.repeat;
 
 test "Inst size: exactly 64 bits packed" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Inst));

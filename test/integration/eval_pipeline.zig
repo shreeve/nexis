@@ -2490,6 +2490,17 @@ test "defmacro: a store a macro opens belongs to the program" {
     , "[nil 4]");
 }
 
+test "defmacro: a Nextomic connection a macro opens belongs to the program" {
+    try expectOutputProgramWithStore("macro-connect",
+        \\(def keep (atom nil))
+        \\(defmacro m [] (reset! keep (nextomic/connect "@STORE@")) nil)
+        \\(m)
+        \\(nextomic/transact! @keep [{:db/ident :n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+        \\(nextomic/transact! @keep [{:n 4}])
+        \\(nextomic/q '[:find ?v . :where [_ :n ?v]] (nextomic/db @keep))
+    , "4");
+}
+
 test "defmacro: what a macro prints goes to the with-out-str buffer the program opened" {
     try expectOutputProgram(
         \\(defmacro m [] (print (apply str (repeat 5000 "m"))) nil)
@@ -3122,13 +3133,15 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
-test "db/open refuses a path with a NUL byte, or an empty one, as spit does" {
+test "db/open and nextomic/connect refuse a path with a NUL byte, or an empty one, as spit does" {
     // The open would stop at the NUL and name a shorter path than the
     // program checked (DB.md §2).
     try expectOutputProgramWithStore("seam-path",
         \\[(try (db/open "@STORE@\u0000.txt") (catch any e e))
-        \\ (try (db/open "") (catch any e e))]
-    , "[:invalid-path :invalid-path]");
+        \\ (try (db/open "") (catch any e e))
+        \\ (try (nextomic/connect "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (nextomic/connect "") (catch any e e))]
+    , "[:invalid-path :invalid-path :invalid-path :invalid-path]");
 }
 
 test "a value nested 100 000 deep is stored and read back through a durable ref" {

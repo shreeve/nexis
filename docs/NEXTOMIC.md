@@ -493,7 +493,8 @@ held `with`). `release` refuses while the count is nonzero
 (`:nextomic/busy`); closing a connection at teardown while it is busy
 marks it closed at once and frees the store when the last operation
 ends, so no cursor in flight dangles. A connection's struct lives
-until VM teardown, a life at a time: a later `connect` reuses a
+until the teardown of the program's VM (the one a macro runs over too,
+so a connection a macro opens outlives the macro), a life at a time: a later `connect` reuses a
 released one's struct for its next life, so a program that connects
 and releases in a loop holds no more structs than it had connections
 open at once. Every handle, db-value and entity carries the life it
@@ -892,7 +893,7 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 
 | form | semantics |
 |---|---|
-| `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open, cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
+| `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open (an empty path or one with a NUL byte is `:invalid-path`, as for `db/open`, DB.md §2), cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
 | `(d/release conn)` | sync the file when a commit left it unsynced (§3 "Durability"), then close; idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4); a failed sync is `:db/sync-failed`, and the connection is closed |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
