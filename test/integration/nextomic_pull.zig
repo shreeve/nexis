@@ -73,7 +73,7 @@ fn loadCorpus(fx: *Fx) !void {
         \\ {:db/ident :node/label :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
         \\ {:db/ident :level/junior} {:db/ident :level/senior}]
     );
-    const people = try std.fmt.allocPrint(fx.arena(),
+    const people = try fx.arena().print(
         \\[{{:db/id "ann" :person/name "Ann" :person/email "ann@x" :person/age 30 :person/height 1.7 :person/active true :person/tags [:red :blue] :person/level :level/senior :person/bio "{s}"
         \\  :person/house {{:house/name "Villa" :house/rooms [{{:room/name "kitchen" :room/area 12.5}} {{:room/name "hall" :room/area 8.0}}]}}}}
         \\ {{:db/id "bob" :person/name "Bob" :person/email "bob@x" :person/age 25 :person/tags [:blue] :person/friend ["ann"] :person/boss "ann" :person/level :level/junior}}
@@ -190,7 +190,7 @@ const Naive = struct {
 
     fn specOf(self: *Naive, k: Value) !Spec {
         const name = self.fx.interner().keywordName(k.asKeywordId());
-        const slash = std.mem.indexOfScalar(u8, name, '/').?;
+        const slash = std.mem.findScalar(u8, name, '/').?;
         const reverse = name[slash + 1] == '_';
         const forward = if (reverse) try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] }) else name;
         const attr = try self.attrByName(forward);
@@ -259,7 +259,7 @@ const Naive = struct {
     const Sub = union(enum) { none, pattern: Value, recurse: ?u32 };
 
     fn onPath(self: *Naive, e: u64) bool {
-        return std.mem.indexOfScalar(u64, self.path.items, e) != null;
+        return std.mem.findScalar(u64, self.path.items, e) != null;
     }
 
     fn renderRef(self: *Naive, pattern: Value, spec: Spec, sub: Sub, budget: *Budget, target: u64) anyerror!Value {
@@ -709,7 +709,7 @@ test "pull-many [*], a nested pattern and a reverse ref over 2k entities" {
     const depts: usize = 10;
     var dept_ops: std.ArrayList(nextomic.Op) = .empty;
     for (0..depts) |i| {
-        const name = try std.fmt.allocPrint(fx.arena(), "d{d}", .{i});
+        const name = try fx.arena().print("d{d}", .{i});
         try dept_ops.append(fx.arena(), .{ .add = .{ .e = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } }, .a = .{ .id = a_dname }, .v = .{ .val = .{ .string = name } } } });
     }
     const dept_report = try nextomic.transact.transactOps(fx.conn(), fx.arena(), dept_ops.items, .{});
@@ -727,7 +727,7 @@ test "pull-many [*], a nested pattern and a reverse ref over 2k entities" {
         const arena = arena_state.allocator();
         for (start..start + batch) |i| {
             const me: nextomic.transact.Entity = .{ .tempid = .{ .fixnum = -@as(i64, @intCast(i + 1)) } };
-            const name = try std.fmt.allocPrint(arena, "emp-{d}", .{i});
+            const name = try arena.print("emp-{d}", .{i});
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_name }, .v = .{ .val = .{ .string = name } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_age }, .v = .{ .val = .{ .long = @intCast(20 + i % 45) } } } });
             try ops.append(arena, .{ .add = .{ .e = me, .a = .{ .id = a_dept }, .v = .{ .val = .{ .ref = dept_eids[i % depts] } } } });

@@ -11,13 +11,13 @@
 nexis is a reader, a macroexpander, a compiler to 64-bit bytecode, a
 slot VM, persistent collections (CHAMP maps and sets, 32-way vectors,
 lists, transients), a 16-byte tagged value and a precise mark-sweep
-collector, all in Zig 0.16. Under it sit two sibling projects: **emdb**,
+collector, all in Zig. Under it sit two sibling projects: **emdb**,
 a memory-mapped MVCC B+ tree storage engine, and **nexus**, the parser
 generator that builds the reader's grammar.
 
 ## Build and run
 
-Zig 0.16.0 and a sibling checkout of emdb (`../emdb`) are required.
+Zig 0.17.0 and a sibling checkout of emdb (`../emdb`) are required.
 
 ```bash
 zig build install                      # bin/nexis and bin/nexis-golden
@@ -36,7 +36,7 @@ print each value. Exit status is 0 on success, 3 for a parse or reader
 error, 4 for a compile error, 5 for an uncaught runtime error, and `n`
 for `(exit n)` (`docs/TOOLING.md` §1).
 
-`zig build test --summary all` is the gate: 1365 tests in 171 build
+`zig build test --summary all` is the gate: 1368 tests in 171 build
 steps, about a minute from a warm cache. `AGENTS.md` lists every build step.
 
 ## The language
@@ -184,7 +184,7 @@ differences, and `HANDOFF.md` the known gaps.
 | `PLAN.md` | The design decisions (§23), the canonical Form schema (§28) and the Amendment Log |
 | `CLOJURE-REVIEW.md` | What nexis takes, adapts and rejects from Clojure, and where it differs |
 | `docs/` | One spec per module; `docs/README.md` maps module to spec |
-| `ZIG-0.16.0.md` | Zig 0.16 as this tree uses it |
+| `ZIG.md` | Zig as this tree uses it |
 | `src/` | The runtime (one Zig module, `src/root.zig`); `src/stdlib/*.nx` the library written in nexis |
 | `test/`, `examples/`, `bench/` | Tests (`test/README.md`), example programs, the benchmark harness |
 | `nexis.grammar` | The reader grammar; `src/parser.zig` is generated from it by `zig build parser` (needs `../nexus/bin/nexus`) |

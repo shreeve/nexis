@@ -69,11 +69,11 @@ pub const Trees = struct {
     fulltext: TreeId,
 
     pub inline fn cur(self: Trees, index: Index) TreeId {
-        return self.current[@intFromEnum(index)];
+        return self.current[@backingInt(index)];
     }
 
     pub inline fn hist(self: Trees, index: Index) TreeId {
-        return self.history[@intFromEnum(index)];
+        return self.history[@backingInt(index)];
     }
 };
 
@@ -434,12 +434,12 @@ pub const Store = struct {
     fn sysGetInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize) !u64 {
         const raw = (try self.sysGet(txn, name)) orelse return error.Corrupted;
         if (raw.len != width) return error.Corrupted;
-        return std.mem.readInt(std.meta.Int(.unsigned, width * 8), raw[0..width], .big);
+        return std.mem.readInt(@Int(.unsigned, width * 8), raw[0..width], .big);
     }
 
     fn sysPutInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize, n: u64) !void {
         var buf: [width]u8 = undefined;
-        std.mem.writeInt(std.meta.Int(.unsigned, width * 8), &buf, @intCast(n), .big);
+        std.mem.writeInt(@Int(.unsigned, width * 8), &buf, @intCast(n), .big);
         try self.sysPut(txn, name, &buf);
     }
 
@@ -1068,7 +1068,7 @@ pub const TestDir = struct {
     pub fn init(name: []const u8) !TestDir {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const path = try std.fmt.allocPrintSentinel(testing.allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, name }, 0);
+        const path = try testing.allocator.printSentinel(".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, name }, 0);
         return .{ .tmp = tmp, .path = path };
     }
 
@@ -1077,6 +1077,17 @@ pub const TestDir = struct {
         self.tmp.cleanup();
     }
 };
+
+/// `s` repeated `n` times, for building long test strings.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(2 * n + 1000);
+        var buf: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+        const final = buf;
+        break :blk &final;
+    };
+}
 
 test "open bootstraps once and reopen finds the same ids" {
     var td = try TestDir.init("store_boot");
@@ -1362,7 +1373,7 @@ test "batches written between existing keys fill their leaves" {
         const batch = try arena.alloc(Store.Prepared, 5000);
         for (0..2500) |j| {
             const e = (1 << 33) + k;
-            const name = try std.fmt.allocPrint(arena, "name-{d}", .{k});
+            const name = try arena.print("name-{d}", .{k});
             batch[2 * j] = .{ .e = e, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = @intCast(k) }), .added = true, .avet = false, .vaet = false };
             batch[2 * j + 1] = .{ .e = e, .a = 101, .vbytes = try key.valBytes(arena, .{ .string = name }), .added = true, .avet = false, .vaet = false };
             k += 1;
@@ -1423,7 +1434,7 @@ test "a batch holds what writing its datoms one at a time holds" {
     const txns = [2]*Txn{ try batched.beginRead(), try single.beginRead() };
     defer for (txns) |txn| txn.abort();
     for (0..4) |ix| for ([_]bool{ false, true }) |history| {
-        const index: Index = @enumFromInt(ix);
+        const index: Index = @fromBackingInt(@intCast(ix));
         // The bootstrap's datoms differ in their instants: compare the
         // keys the batches can hold.
         var start: [key.id_len]u8 = undefined;
@@ -1459,7 +1470,7 @@ test "an out-of-line value is stored once in the index trees, on its assertion's
     const arena = arena_state.allocator();
 
     const e: u64 = 1 << 33;
-    const long = "a string long enough to leave its index keys for a payload of its own, " ** 3;
+    const long = repeat("a string long enough to leave its index keys for a payload of its own, ", 3);
     const v = try key.valBytes(arena, .{ .string = long });
     const short = try key.valBytes(arena, .{ .long = 7 });
     {
@@ -1556,7 +1567,7 @@ test "long ident names use the heap path" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    const long_name = "ns/" ++ ("x" ** 400);
+    const long_name = "ns/" ++ repeat("x", 400);
     {
         const txn = try store.beginWrite(.none);
         try store.putIdent(txn, long_name, 5000);
@@ -1652,7 +1663,7 @@ test "a copy of a store file is another file: its uuid is shared, its writer is 
     defer td.deinit();
     const a = try Store.open(testing.allocator, td.path.ptr, .{});
     defer a.close();
-    const copy = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/copy.emdb", .{std.fs.path.dirname(td.path).?}, 0);
+    const copy = try testing.allocator.printSentinel("{s}/copy.emdb", .{std.Io.Dir.path.dirname(td.path).?}, 0);
     defer testing.allocator.free(copy);
     try std.Io.Dir.cwd().copyFile(td.path, std.Io.Dir.cwd(), copy, testing.io, .{});
     const b = try Store.open(testing.allocator, copy.ptr, .{});

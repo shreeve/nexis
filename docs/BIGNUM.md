@@ -161,7 +161,7 @@ The semantics match Clojure's `Numbers` for BigInt:
   remainder the same way, so the whole conversion costs about one
   division of the value by its square root instead of one pass per
   nine digits; a million digits print in about a second
-  (ReleaseFast).
+  (`-Doptimize=fast`).
 
 The VM's tower (`src/vm.zig` `numAdd` through `numCompare`) keeps the
 fixnum-by-fixnum fast path in `i64` and calls this module only when a

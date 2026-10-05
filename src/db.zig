@@ -355,7 +355,7 @@ const FileId = struct {
     /// whose glibc versions those symbols, so Linux asks the kernel's
     /// `statx`.
     fn of(fd: std.c.fd_t, path: [*:0]const u8) ?FileId {
-        if (builtin.os.tag == .linux) {
+        if (builtin.target.os.tag == .linux) {
             const linux = std.os.linux;
             var sx: linux.Statx = undefined;
             const flags: u32 = if (path[0] == 0) linux.AT.EMPTY_PATH else 0;
@@ -381,12 +381,12 @@ const FileId = struct {
 /// not yet created, its resolved directory joined with its name.
 fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    if (std.c.realpath(path, &buf)) |resolved| return allocator.dupeZ(u8, std.mem.sliceTo(resolved, 0));
+    if (std.c.realpath(path, &buf)) |resolved| return allocator.dupeSentinel(u8, std.mem.sliceTo(resolved, 0), 0);
     const slice = std.mem.sliceTo(path, 0);
-    const dir_z = try allocator.dupeZ(u8, std.fs.path.dirname(slice) orelse ".");
+    const dir_z = try allocator.dupeSentinel(u8, std.Io.Dir.path.dirname(slice) orelse ".", 0);
     defer allocator.free(dir_z);
     const dir = std.c.realpath(dir_z.ptr, &buf) orelse return error.OpenFailed;
-    return std.fs.path.joinZ(allocator, &.{ std.mem.sliceTo(dir, 0), std.fs.path.basename(slice) });
+    return std.Io.Dir.path.joinZ(allocator, &.{ std.mem.sliceTo(dir, 0), std.Io.Dir.path.basename(slice) });
 }
 
 // =============================================================================
@@ -593,13 +593,13 @@ fn release(self: *Connection) void {
 
 /// One bit per `TreeId` slot: the two core trees plus every named
 /// tree the pinned capacity admits.
-pub const TreeSet = std.bit_set.StaticBitSet(emdb.txn.coreTreeCount + max_named_trees);
+pub const TreeSet = std.bit_set.Static(emdb.txn.coreTreeCount + max_named_trees);
 
 pub const WriteTxn = struct {
     conn: *Connection,
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
-    opened: TreeSet = TreeSet.initEmpty(),
+    opened: TreeSet = .empty,
     /// Walks in progress over this transaction's trees; a write to a
     /// walked tree copies what the walk has yet to visit first.
     walks: ?*Walk = null,
@@ -609,7 +609,7 @@ pub const ReadTxn = struct {
     conn: *Connection,
     inner: *emdb.Txn,
     /// Trees this transaction has loaded; see `treeId`.
-    opened: TreeSet = TreeSet.initEmpty(),
+    opened: TreeSet = .empty,
 };
 
 pub fn beginWrite(conn: *Connection) !WriteTxn {
@@ -1197,11 +1197,11 @@ fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
     var tmp = std.testing.tmpDir(.{});
     tmp.dir.close(std.testing.io);
     tmp.parent_dir.close(std.testing.io);
-    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
+    return allocator.printSentinel(".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    const dir = std.fs.path.dirname(path) orelse return;
+    const dir = std.Io.Dir.path.dirname(path) orelse return;
     std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
@@ -1254,9 +1254,9 @@ test "open: store_id comes from the canonical path, however the path is spelled"
 
     var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     const sid = a.storeId();
-    try testing.expect(std.fs.path.isAbsolute(a.file.path));
+    try testing.expect(std.Io.Dir.path.isAbsolute(a.file.path));
     try close(&a);
-    const dotted = try std.fmt.allocPrintSentinel(testing.allocator, "./{s}", .{path}, 0);
+    const dotted = try testing.allocator.printSentinel("./{s}", .{path}, 0);
     defer testing.allocator.free(dotted);
     var b = try open(testing.allocator, &heap, &interner, dotted.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&b);
@@ -1274,11 +1274,11 @@ test "open: every spelling of one file shares its environment; a second writer i
 
     var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&a);
-    const dotted = try std.fmt.allocPrintSentinel(testing.allocator, "./{s}", .{path}, 0);
+    const dotted = try testing.allocator.printSentinel("./{s}", .{path}, 0);
     defer testing.allocator.free(dotted);
-    const link = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/link.emdb", .{std.fs.path.dirname(path).?}, 0);
+    const link = try testing.allocator.printSentinel("{s}/link.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
     defer testing.allocator.free(link);
-    try std.Io.Dir.cwd().symLink(testing.io, std.fs.path.basename(path), link, .{});
+    try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(path), link, .{});
 
     var same = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&same);
@@ -1292,7 +1292,7 @@ test "open: every spelling of one file shares its environment; a second writer i
     try testing.expectEqual(@as(u32, 4), a.file.refs);
     try testing.expectEqual(a.storeId(), c.storeId());
     // One lock file, beside the file the link names.
-    const link_lock = try std.fmt.allocPrintSentinel(testing.allocator, "{s}-lock", .{link}, 0);
+    const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
     defer testing.allocator.free(link_lock);
     try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
 
@@ -1327,7 +1327,7 @@ test "open: a copy of a store is another file, written beside the original" {
     var w = try beginWrite(&a);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
-    const copy = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/copy.emdb", .{std.fs.path.dirname(path).?}, 0);
+    const copy = try testing.allocator.printSentinel("{s}/copy.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
     defer testing.allocator.free(copy);
     try std.Io.Dir.cwd().copyFile(path, std.Io.Dir.cwd(), copy, testing.io, .{});
 
@@ -1360,7 +1360,7 @@ test "open: a store file with a second hard link is refused under either name" {
 
     var a = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&a);
-    const other = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/other.emdb", .{std.fs.path.dirname(path).?}, 0);
+    const other = try testing.allocator.printSentinel("{s}/other.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
     defer testing.allocator.free(other);
     try testing.expectEqual(@as(c_int, 0), std.c.link(path.ptr, other.ptr));
     // Already open here, and not yet open anywhere: both refused.
@@ -1370,7 +1370,7 @@ test "open: a store file with a second hard link is refused under either name" {
     try testing.expectError(error.HardLinked, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
     try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
     // A directory has links of its own, and is no store.
-    const dir = try testing.allocator.dupeZ(u8, std.fs.path.dirname(path).?);
+    const dir = try testing.allocator.dupeSentinel(u8, std.Io.Dir.path.dirname(path).?, 0);
     defer testing.allocator.free(dir);
     try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, dir.ptr, .{ .allocator = testing.allocator }));
     // One name again: the file opens.
@@ -1709,7 +1709,7 @@ test "open: a file that is not an emdb store is refused without leaking" {
         const io = std.testing.io;
         const file = try std.Io.Dir.cwd().createFile(io, path, .{});
         defer file.close(io);
-        const junk = [_]u8{0xFF} ** (2 * page_size);
+        const junk: [2 * page_size]u8 = @splat(0xFF);
         try file.writeStreamingAll(io, &junk);
     }
 

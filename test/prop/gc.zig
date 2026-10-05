@@ -58,7 +58,7 @@ test "G1: random flat blocks with random root subset" {
         defer gpa.free(headers);
         for (headers, 0..) |*slot, i| {
             var buf: [16]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&buf, "v{d}", .{i});
+            const txt = try std.mem.print(&buf, "v{d}", .{i});
             const s = try string.fromBytes(&heap, txt);
             slot.* = Heap.asHeapHeader(s);
         }
@@ -121,7 +121,7 @@ test "G2: nested graph — exactly the pool members reachable from the roots sur
         if (choice == 0 or i == 0) {
             // String (leaf)
             var buf: [16]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&buf, "s{d}", .{i});
+            const txt = try std.mem.print(&buf, "s{d}", .{i});
             pool[i] = try string.fromBytes(&heap, txt);
         } else if (choice == 1) {
             // List holding up to 3 random earlier pool members.
@@ -258,7 +258,7 @@ test "G3b: a list of half a million cells survives a cycle intact and is freed b
     // No stack trace per allocation: capturing half a million costs
     // more than the cycles under test. A leak still logs an error,
     // which fails the test.
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = gpa.deinit();
     var heap = Heap.init(gpa.allocator());
     defer heap.deinit();
@@ -290,7 +290,7 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
     // The walk is a worklist, so the chain's depth never becomes
     // native recursion depth; a recursive mark faults here long
     // before the end.
-    var gpa: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = gpa.deinit();
     var heap = Heap.init(gpa.allocator());
     defer heap.deinit();
@@ -398,7 +398,7 @@ test "G5: repeated allocate-and-collect cycles do not leak" {
         // Allocate 10 strings this cycle.
         for (0..10) |i| {
             var buf: [16]u8 = undefined;
-            const txt = try std.fmt.bufPrint(&buf, "c{d}-s{d}", .{ cycle, i });
+            const txt = try std.mem.print(&buf, "c{d}-s{d}", .{ cycle, i });
             _ = try string.fromBytes(&heap, txt);
         }
         // Keep 3 via roots carried from `held` (which is all pinned-roots).
@@ -448,7 +448,7 @@ test "G6: a loop that allocates every iteration runs in bounded heap and compute
     var i: i64 = 0;
     while (i < 2000) : (i += 1) {
         var buf: [16]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "item-{d}", .{i});
+        const text = try std.mem.print(&buf, "item-{d}", .{i});
         expected += 64 + @as(i64, @intCast(text.len)) + 1;
     }
     try std.testing.expectEqual(expected, result.asFixnum());

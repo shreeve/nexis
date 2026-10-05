@@ -71,7 +71,7 @@ pub const Diag = struct {
     pub fn set(self: *Diag, clause: ?usize, comptime fmt: []const u8, args: anytype) void {
         self.clause = clause;
         self.attr = null;
-        self.message = std.fmt.bufPrint(&self.buf, fmt, args) catch &self.buf;
+        self.message = std.mem.print(&self.buf, fmt, args) catch &self.buf;
     }
 };
 
@@ -1018,7 +1018,7 @@ test "vector form: find specs, in bindings, where clause kinds" {
 
 test "a formatted message naming a long variable is kept whole" {
     var diag: Diag = .{};
-    const name = "?" ++ "v" ** 300;
+    const name = "?" ++ &@as([300]u8, @splat('v'));
     diag.set(3, "or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ 2, name });
     try testing.expectEqualStrings("or-join branch 2 leaves " ++ name ++ " unbound; every branch binds every join variable", diag.message);
     try testing.expectEqual(@as(?usize, 3), diag.clause);

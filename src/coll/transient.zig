@@ -114,7 +114,7 @@ fn retireEditTokens(heap: *Heap) void {
     const Retire = struct {
         issued: u32 = 0,
         pub fn visit(self: *@This(), h: *HeapHeader) void {
-            switch (@as(Kind, @enumFromInt(h.kind))) {
+            switch (@as(Kind, @fromBackingInt(@intCast(h.kind)))) {
                 .persistent_map, .persistent_set, .persistent_vector => h.hash = 0,
                 .transient => {
                     const body = transientBody(h);
@@ -180,7 +180,7 @@ pub fn transientFrom(heap: *Heap, persistent_v: Value) EditError!Value {
     const h = try heap.alloc(.transient, @sizeOf(TransientBody));
     transientBody(h).* = .{ .owner_token = issueEditToken(heap), .inner_header = root };
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.transient)) | (@as(u64, subkind) << 16),
+        .tag = @as(u64, @backingInt(Kind.transient)) | (@as(u64, subkind) << 16),
         .payload = @intFromPtr(h),
     };
 }

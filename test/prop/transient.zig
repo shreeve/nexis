@@ -156,7 +156,7 @@ test "T1c: vector equivalence — transient × N conj ≡ persistent × N conj (
 }
 
 test "T1d: vector equivalence — random conj!/assoc!/pop! ≡ conj/assoc/pop (300 trials)" {
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -467,7 +467,7 @@ fn fx(i: i64) Value {
     return value.fromFixnum(i).?;
 }
 
-const MapModel = std.AutoArrayHashMapUnmanaged(i64, i64);
+const MapModel = std.array_hash_map.Auto(i64, i64);
 
 /// A collision fixture's hash (test/prop/champ.zig M10): every key's
 /// low 32 bits are one value, so the keys meet in a collision node.
@@ -483,7 +483,7 @@ const MapKeys = struct {
     fn key(self: MapKeys, heap: *Heap, i: i64) !Value {
         if (!self.strings) return fx(i);
         var buf: [32]u8 = undefined;
-        return nx.string.fromBytes(heap, std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable);
+        return nx.string.fromBytes(heap, std.mem.print(&buf, "collider-{d}", .{i}) catch unreachable);
     }
 };
 
@@ -589,7 +589,7 @@ test "T5b: in-place edits through collision nodes keep every persistent map" {
     try std.testing.expectEqual(@as(?u32, 12), champ.mapCollisionCount(try transient.persistentBang(t), 0xDEAD_BEEF));
 }
 
-const SetModel = std.AutoArrayHashMapUnmanaged(i64, void);
+const SetModel = std.array_hash_map.Auto(i64, void);
 
 fn expectSetIs(gpa: std.mem.Allocator, heap: *Heap, s: Value, model: *const SetModel) !void {
     try std.testing.expectEqual(model.count(), champ.setCount(s));

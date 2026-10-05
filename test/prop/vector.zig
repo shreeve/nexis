@@ -117,7 +117,7 @@ test "V2: reduce(conj, empty, elems) ≡ fromSlice(elems)" {
 // -----------------------------------------------------------------------------
 
 test "V2b: random conj/assoc/pop walks match a model across 32, 1056 and 32800" {
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     const gpa = debug.allocator();
     var heap = Heap.init(gpa);
@@ -345,7 +345,7 @@ test "V8: nested vectors — recursive dispatch reaches inner sequences" {
 test "V9: cross-kind equality + hash at shift-boundary sizes up to a three-level trie" {
     // No stack trace per allocation: a list of 32801 cells would spend
     // the test capturing them. A leak still logs an error.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     const gpa = debug.allocator();
     var heap = Heap.init(gpa);
@@ -405,12 +405,12 @@ test "V10: conj, assoc and pop from random earlier versions keep every version's
         const out = if (pick < 7 or model.items.len == 0) blk: {
             next += 1;
             try model.append(gpa, next);
-            break :blk try vector_mod.conj(&heap, v, try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "{d}", .{next}) catch unreachable));
+            break :blk try vector_mod.conj(&heap, v, try string_mod.fromBytes(&heap, std.mem.print(&buf, "{d}", .{next}) catch unreachable));
         } else if (pick < 9) blk: {
             next += 1;
             const i = r.uintLessThan(usize, model.items.len);
             model.items[i] = next;
-            break :blk try vector_mod.assoc(&heap, v, i, try string_mod.fromBytes(&heap, std.fmt.bufPrint(&buf, "{d}", .{next}) catch unreachable));
+            break :blk try vector_mod.assoc(&heap, v, i, try string_mod.fromBytes(&heap, std.mem.print(&buf, "{d}", .{next}) catch unreachable));
         } else blk: {
             _ = model.pop();
             break :blk try vector_mod.pop(&heap, v);
@@ -434,7 +434,7 @@ test "V10: conj, assoc and pop from random earlier versions keep every version's
                 try std.testing.expectEqual(m.items.len, vector_mod.count(x));
                 for (m.items, 0..) |e, i| {
                     const got = string_mod.asBytes(vector_mod.nth(x, i));
-                    try std.testing.expectEqualStrings(std.fmt.bufPrint(&buf, "{d}", .{e}) catch unreachable, got);
+                    try std.testing.expectEqualStrings(std.mem.print(&buf, "{d}", .{e}) catch unreachable, got);
                 }
             }
         }

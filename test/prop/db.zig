@@ -72,11 +72,11 @@ fn tmpDbPath(allocator: std.mem.Allocator, suffix: []const u8) ![:0]u8 {
     var tmp = std.testing.tmpDir(.{});
     tmp.dir.close(std.testing.io);
     tmp.parent_dir.close(std.testing.io);
-    return std.fmt.allocPrintSentinel(allocator, ".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
+    return allocator.printSentinel(".zig-cache/tmp/{s}/{s}.emdb", .{ tmp.sub_path, suffix }, 0);
 }
 
 fn cleanupDb(path: [:0]const u8) void {
-    const dir = std.fs.path.dirname(path) orelse return;
+    const dir = std.Io.Dir.path.dirname(path) orelse return;
     std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 

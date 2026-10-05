@@ -97,7 +97,7 @@ pub const CodecError = error{
 // Varint primitives (unsigned LEB128 + signed ZigZag LEB128)
 // =============================================================================
 
-fn writeUleb128(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u64) !void {
+fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
     var x = v;
     while (true) {
         const byte: u8 = @intCast(x & 0x7F);
@@ -149,7 +149,7 @@ inline fn zigzagDecode(v: u64) i64 {
     return @bitCast(decoded_u);
 }
 
-fn writeIleb128Zigzag(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: i64) !void {
+fn writeIleb128Zigzag(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: i64) !void {
     try writeUleb128(buf, allocator, zigzagEncode(v));
 }
 
@@ -162,7 +162,7 @@ fn readIleb128Zigzag(bytes: []const u8, cursor: *usize) CodecError!i64 {
 // Fixed-width primitives
 // =============================================================================
 
-fn writeU32Le(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u32) !void {
+fn writeU32Le(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void {
     var bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &bytes, v, .little);
     try buf.appendSlice(allocator, &bytes);
@@ -172,7 +172,7 @@ fn readU32Le(bytes: []const u8, cursor: *usize) CodecError!u32 {
     return std.mem.readInt(u32, (try readBytes(bytes, cursor, 4))[0..4], .little);
 }
 
-fn writeU64Le(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, v: u64) !void {
+fn writeU64Le(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, v, .little);
     try buf.appendSlice(allocator, &bytes);
@@ -182,7 +182,7 @@ fn readU64Le(bytes: []const u8, cursor: *usize) CodecError!u64 {
     return std.mem.readInt(u64, (try readBytes(bytes, cursor, 8))[0..8], .little);
 }
 
-fn writeByte(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, b: u8) !void {
+fn writeByte(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, b: u8) !void {
     try buf.append(allocator, b);
 }
 
@@ -193,7 +193,7 @@ fn readByte(bytes: []const u8, cursor: *usize) CodecError!u8 {
     return b;
 }
 
-fn writeBytes(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, src: []const u8) !void {
+fn writeBytes(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, src: []const u8) !void {
     try buf.appendSlice(allocator, src);
 }
 
@@ -263,7 +263,7 @@ pub const DecodeError = CodecError || std.mem.Allocator.Error || intern_mod.Inte
 // =============================================================================
 
 const Encoder = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
+    buf: std.ArrayList(u8) = .empty,
     allocator: std.mem.Allocator,
     interner: *const Interner,
     /// The containers whose elements are still being written,
@@ -349,31 +349,31 @@ const Encoder = struct {
     }
 
     fn header(e: *Encoder, k: Kind, n: usize) Error!void {
-        try e.byte(@intFromEnum(k));
+        try e.byte(@backingInt(k));
         try e.uleb(n);
     }
 
     fn leaf(e: *Encoder, v: Value) Error!void {
         const k = v.kind();
         switch (k) {
-            .nil, .false_, .true_ => try e.byte(@intFromEnum(k)),
+            .nil, .false_, .true_ => try e.byte(@backingInt(k)),
             .char => {
-                try e.byte(@intFromEnum(k));
+                try e.byte(@backingInt(k));
                 try writeU32Le(&e.buf, e.allocator, @as(u32, v.asChar()));
             },
             .fixnum => {
-                try e.byte(@intFromEnum(k));
+                try e.byte(@backingInt(k));
                 try writeIleb128Zigzag(&e.buf, e.allocator, v.asFixnum());
             },
             .float => {
-                try e.byte(@intFromEnum(k));
+                try e.byte(@backingInt(k));
                 try writeU64Le(&e.buf, e.allocator, @bitCast(hash_mod.canonicalizeFloat(v.asFloat())));
             },
             .keyword => try e.named(k, e.interner.keywordName(v.asKeywordId())),
             .symbol => try e.named(k, e.interner.symbolName(v.asSymbolId())),
             .string => try e.named(k, string.asBytes(v)),
             .bignum => {
-                try e.byte(@intFromEnum(k));
+                try e.byte(@backingInt(k));
                 try e.byte(@intFromBool(bignum.isNegative(v)));
                 const limbs = bignum.limbs(v);
                 try e.uleb(limbs.len);
@@ -382,9 +382,9 @@ const Encoder = struct {
             // `[23] [elem tag] [count] [u64 LE × count]`: i64 as two's
             // complement bits, f64 as canonical IEEE bits (CODEC.md §2).
             .typed_vector => {
-                try e.byte(@intFromEnum(k));
+                try e.byte(@backingInt(k));
                 const elem = typed_vector.elemType(v);
-                try e.byte(@intFromEnum(elem));
+                try e.byte(@backingInt(elem));
                 try e.uleb(typed_vector.count(v));
                 switch (elem) {
                     .i64 => for (typed_vector.i64Elems(v)) |x| try writeU64Le(&e.buf, e.allocator, @bitCast(x)),
@@ -406,7 +406,7 @@ const Encoder = struct {
     }
 
     fn named(e: *Encoder, k: Kind, bytes: []const u8) Error!void {
-        try e.byte(@intFromEnum(k));
+        try e.byte(@backingInt(k));
         try e.uleb(bytes.len);
         try e.buf.appendSlice(e.allocator, bytes);
     }
@@ -441,8 +441,8 @@ const Decoder = struct {
         while (true) {
             const tag = try readByte(d.bytes, &d.cursor);
             var v = switch (tag) {
-                @intFromEnum(Kind.list), @intFromEnum(Kind.persistent_vector), @intFromEnum(Kind.persistent_set), @intFromEnum(Kind.sorted_set) => try d.open(tag, try d.count(1)),
-                @intFromEnum(Kind.persistent_map), @intFromEnum(Kind.sorted_map) => try d.open(tag, 2 * try d.count(2)),
+                @backingInt(Kind.list), @backingInt(Kind.persistent_vector), @backingInt(Kind.persistent_set), @backingInt(Kind.sorted_set) => try d.open(tag, try d.count(1)),
+                @backingInt(Kind.persistent_map), @backingInt(Kind.sorted_map) => try d.open(tag, 2 * try d.count(2)),
                 else => try d.leaf(tag),
             } orelse continue;
             // Hand `v` to the innermost open container, closing every
@@ -475,10 +475,10 @@ const Decoder = struct {
         defer d.scratch.shrinkRetainingCapacity(start);
         const elems = d.scratch.items[start..];
         switch (tag) {
-            @intFromEnum(Kind.list) => return list_mod.fromSlice(d.heap, elems),
-            @intFromEnum(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
-            @intFromEnum(Kind.sorted_map), @intFromEnum(Kind.sorted_set) => return d.sortedFrom(@enumFromInt(tag), elems),
-            @intFromEnum(Kind.persistent_map) => {
+            @backingInt(Kind.list) => return list_mod.fromSlice(d.heap, elems),
+            @backingInt(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
+            @backingInt(Kind.sorted_map), @backingInt(Kind.sorted_set) => return d.sortedFrom(@fromBackingInt(@intCast(tag)), elems),
+            @backingInt(Kind.persistent_map) => {
                 var m = try champ.mapEmpty(d.heap);
                 var i: usize = 0;
                 while (i < elems.len) : (i += 2) m = try champ.mapAssoc(d.heap, m, elems[i], elems[i + 1], d.elementHash, d.elementEq);
@@ -517,19 +517,19 @@ const Decoder = struct {
         const bytes = d.bytes;
         const cursor = &d.cursor;
         return switch (tag) {
-            @intFromEnum(Kind.nil) => value.nilValue(),
-            @intFromEnum(Kind.false_) => value.fromBool(false),
-            @intFromEnum(Kind.true_) => value.fromBool(true),
-            @intFromEnum(Kind.char) => value.fromChar(std.math.cast(u21, try readU32Le(bytes, cursor)) orelse
+            @backingInt(Kind.nil) => value.nilValue(),
+            @backingInt(Kind.false_) => value.fromBool(false),
+            @backingInt(Kind.true_) => value.fromBool(true),
+            @backingInt(Kind.char) => value.fromChar(std.math.cast(u21, try readU32Le(bytes, cursor)) orelse
                 return CodecError.InvalidCharScalar) orelse CodecError.InvalidCharScalar,
             // A fixnum kind byte over a number outside i48 is malformed
             // rather than promoted: the kind byte is authoritative.
-            @intFromEnum(Kind.fixnum) => value.fromFixnum(try readIleb128Zigzag(bytes, cursor)) orelse CodecError.MalformedPayload,
-            @intFromEnum(Kind.float) => value.fromFloat(@bitCast(try readU64Le(bytes, cursor))),
-            @intFromEnum(Kind.keyword) => d.interner.internKeywordValue(try readBytes(bytes, cursor, try d.count(1))),
-            @intFromEnum(Kind.symbol) => d.interner.internSymbolValue(try readBytes(bytes, cursor, try d.count(1))),
-            @intFromEnum(Kind.string) => string.fromBytes(d.heap, try readBytes(bytes, cursor, try d.count(1))),
-            @intFromEnum(Kind.bignum) => blk: {
+            @backingInt(Kind.fixnum) => value.fromFixnum(try readIleb128Zigzag(bytes, cursor)) orelse CodecError.MalformedPayload,
+            @backingInt(Kind.float) => value.fromFloat(@bitCast(try readU64Le(bytes, cursor))),
+            @backingInt(Kind.keyword) => d.interner.internKeywordValue(try readBytes(bytes, cursor, try d.count(1))),
+            @backingInt(Kind.symbol) => d.interner.internSymbolValue(try readBytes(bytes, cursor, try d.count(1))),
+            @backingInt(Kind.string) => string.fromBytes(d.heap, try readBytes(bytes, cursor, try d.count(1))),
+            @backingInt(Kind.bignum) => blk: {
                 const sign = try readByte(bytes, cursor);
                 if (sign > 1) return CodecError.MalformedPayload;
                 const limbs = try d.heap.backing.alloc(u64, try d.count(8));
@@ -538,7 +538,7 @@ const Decoder = struct {
                 // `fromLimbs` canonicalizes (CODEC.md §2.6).
                 break :blk bignum.fromLimbs(d.heap, sign == 1, limbs);
             },
-            @intFromEnum(Kind.typed_vector) => blk: {
+            @backingInt(Kind.typed_vector) => blk: {
                 const elem = typed_vector.ElemType.fromTag(try readByte(bytes, cursor)) orelse return CodecError.MalformedPayload;
                 const n = try d.count(8);
                 const raw = try readBytes(bytes, cursor, n * 8);
@@ -579,9 +579,9 @@ const Decoder = struct {
 /// Does `b` name a heap kind? The serializable ones are matched by
 /// the decoder's own arms before this is asked.
 fn isHeapKindByte(b: u8) bool {
-    if (!Kind.isHeap(@enumFromInt(b))) return false;
-    inline for (std.meta.fields(Kind)) |f| {
-        if (f.value == b) return true;
+    if (!Kind.isHeap(@fromBackingInt(@intCast(b)))) return false;
+    for (std.meta.tags(Kind)) |k| {
+        if (@backingInt(k) == b) return true;
     }
     return false;
 }
@@ -640,7 +640,7 @@ const TestCtx = struct {
 test "LEB128 unsigned: roundtrip of 0, 127, 128, 16383, 16384, u64.max" {
     const cases = [_]u64{ 0, 1, 127, 128, 255, 16383, 16384, std.math.maxInt(u32), std.math.maxInt(u64) };
     for (cases) |v| {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         try writeUleb128(&buf, testing.allocator, v);
         var cursor: usize = 0;
@@ -653,7 +653,7 @@ test "LEB128 unsigned: roundtrip of 0, 127, 128, 16383, 16384, u64.max" {
 test "LEB128 signed (ZigZag): roundtrip of fixnum range" {
     const cases = [_]i64{ 0, 1, -1, 42, -42, 127, -128, value.fixnum_max, value.fixnum_min };
     for (cases) |v| {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         try writeIleb128Zigzag(&buf, testing.allocator, v);
         var cursor: usize = 0;
@@ -823,11 +823,11 @@ test "decode canonicalization: bignum with trailing zeros folds to fixnum" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     try writeByte(&buf, testing.allocator, version_major);
     try writeByte(&buf, testing.allocator, version_minor);
-    try writeByte(&buf, testing.allocator, @intFromEnum(Kind.bignum));
+    try writeByte(&buf, testing.allocator, @backingInt(Kind.bignum));
     try writeByte(&buf, testing.allocator, 0); // sign: non-negative
     try writeUleb128(&buf, testing.allocator, 3); // limb_count
     try writeU64Le(&buf, testing.allocator, 42);
@@ -894,7 +894,7 @@ test "roundtrip: map (forces CHAMP) then element-wise check" {
     var kws: [20]Value = undefined;
     for (&kws, 0..) |*slot, i| {
         var buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const name = try std.mem.print(&buf, "k{d}", .{i});
         slot.* = try ctx.interner.internKeywordValue(name);
     }
 
@@ -919,7 +919,7 @@ test "roundtrip: set of 15 keywords" {
     var kws: [15]Value = undefined;
     for (&kws, 0..) |*slot, i| {
         var buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "s{d}", .{i});
+        const name = try std.mem.print(&buf, "s{d}", .{i});
         slot.* = try ctx.interner.internKeywordValue(name);
     }
 
@@ -987,7 +987,7 @@ test "roundtrip: typed vectors of both element types, byte-stable" {
     try testing.expectEqualSlices(u8, b1, b2);
     // `[1 0] [23] [elem = 3] [count = 4] [4 × 8 bytes]`.
     try testing.expectEqual(@as(usize, 2 + 1 + 1 + 1 + 32), b1.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(Kind.typed_vector)), b1[2]);
+    try testing.expectEqual(@as(u8, @backingInt(Kind.typed_vector)), b1[2]);
     try testing.expectEqual(@as(u8, 3), b1[3]);
     try testing.expectEqual(@as(u8, 4), b1[4]);
 }
@@ -995,7 +995,7 @@ test "roundtrip: typed vectors of both element types, byte-stable" {
 test "decode: typed vector with an unknown element tag → MalformedPayload" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.typed_vector), 2, 0 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.typed_vector), 2, 0 };
     try testing.expectError(
         CodecError.MalformedPayload,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1006,7 +1006,7 @@ test "decode: bignum whose limb count exceeds the input → TruncatedInput witho
     var ctx = TestCtx.init();
     defer ctx.deinit();
     // Non-negative sign, limb count 2^56, one limb of input behind it.
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.bignum), 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 1, 0, 0, 0, 0, 0, 0, 0 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.bignum), 0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 1, 0, 0, 0, 0, 0, 0, 0 };
     try testing.expectError(
         CodecError.TruncatedInput,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1018,7 +1018,7 @@ test "decode: typed vector whose count exceeds the input → TruncatedInput with
     var ctx = TestCtx.init();
     defer ctx.deinit();
     // Count 2^56 with eight bytes of elements behind it.
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.typed_vector), 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.typed_vector), 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0, 0, 0, 0, 0, 0, 0, 0 };
     try testing.expectError(
         CodecError.TruncatedInput,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1029,7 +1029,7 @@ test "decode: typed vector whose count exceeds the input → TruncatedInput with
 // ---- Hostile input: lengths, counts and depth come from the bytes ----
 
 /// `[1 0] [kind] [uleb n] [rest]`, into `buf`.
-fn hostile(buf: *std.ArrayListUnmanaged(u8), kind: u8, n: u64, rest: []const u8) ![]const u8 {
+fn hostile(buf: *std.ArrayList(u8), kind: u8, n: u64, rest: []const u8) ![]const u8 {
     try writeByte(buf, testing.allocator, version_major);
     try writeByte(buf, testing.allocator, version_minor);
     try writeByte(buf, testing.allocator, kind);
@@ -1044,9 +1044,9 @@ test "decode: a length near 2^64 is TruncatedInput, not an overflow" {
     // An interned name first, so a wrapped bounds check would hash
     // the bogus slice.
     _ = try ctx.interner.internKeywordValue("k");
-    for ([_]u8{ @intFromEnum(Kind.string), @intFromEnum(Kind.keyword), @intFromEnum(Kind.symbol) }) |kind| {
+    for ([_]u8{ @backingInt(Kind.string), @backingInt(Kind.keyword), @backingInt(Kind.symbol) }) |kind| {
         for ([_]u64{ std.math.maxInt(u64), std.math.maxInt(u64) - 7, std.math.maxInt(u64) - 2 }) |len| {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(testing.allocator);
             const bytes = try hostile(&buf, kind, len, "abc");
             try testing.expectError(CodecError.TruncatedInput, decode(&ctx.heap, &ctx.interner, bytes, &synthHash, &synthEq));
@@ -1058,21 +1058,21 @@ test "decode: a bignum or typed-vector count near 2^64 is TruncatedInput" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
     for ([_]u64{ std.math.maxInt(u64) / 8, std.math.maxInt(u64) / 8 - 1, std.math.maxInt(u64) }) |n| {
-        var b1: std.ArrayListUnmanaged(u8) = .empty;
+        var b1: std.ArrayList(u8) = .empty;
         defer b1.deinit(testing.allocator);
         try writeByte(&b1, testing.allocator, version_major);
         try writeByte(&b1, testing.allocator, version_minor);
-        try writeByte(&b1, testing.allocator, @intFromEnum(Kind.bignum));
+        try writeByte(&b1, testing.allocator, @backingInt(Kind.bignum));
         try writeByte(&b1, testing.allocator, 0);
         try writeUleb128(&b1, testing.allocator, n);
         try writeU64Le(&b1, testing.allocator, 1);
         try testing.expectError(CodecError.TruncatedInput, decode(&ctx.heap, &ctx.interner, b1.items, &synthHash, &synthEq));
 
-        var b2: std.ArrayListUnmanaged(u8) = .empty;
+        var b2: std.ArrayList(u8) = .empty;
         defer b2.deinit(testing.allocator);
         try writeByte(&b2, testing.allocator, version_major);
         try writeByte(&b2, testing.allocator, version_minor);
-        try writeByte(&b2, testing.allocator, @intFromEnum(Kind.typed_vector));
+        try writeByte(&b2, testing.allocator, @backingInt(Kind.typed_vector));
         try writeByte(&b2, testing.allocator, 1);
         try writeUleb128(&b2, testing.allocator, n);
         try writeU64Le(&b2, testing.allocator, 1);
@@ -1087,11 +1087,11 @@ test "decode: a collection count past the input is TruncatedInput before any all
     const kinds = [_]Kind{ .list, .persistent_vector, .persistent_map, .persistent_set };
     for (kinds) |kind| {
         for ([_]u64{ 1 << 35, std.math.maxInt(u64), 3 }) |n| {
-            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(testing.allocator);
             // Two nils: fewer bytes than three map entries, and than
             // any count of 3 or more elements.
-            const bytes = try hostile(&buf, @intFromEnum(kind), n, &.{ 0, 0 });
+            const bytes = try hostile(&buf, @backingInt(kind), n, &.{ 0, 0 });
             try testing.expectError(CodecError.TruncatedInput, decode(&ctx.heap, &ctx.interner, bytes, &synthHash, &synthEq));
             try testing.expectEqual(@as(usize, 0), ctx.heap.liveCount());
         }
@@ -1107,14 +1107,14 @@ test "decode: 200 000 levels of nesting decode, on any stack" {
     defer ctx.interner.deinit();
     const depth = 200_000;
     for ([_]Kind{ .list, .persistent_vector, .persistent_set, .persistent_map }) |kind| {
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         try writeByte(&buf, testing.allocator, version_major);
         try writeByte(&buf, testing.allocator, version_minor);
         // One-element containers around a nil; a map's one entry is
         // `nil` to the next level.
         for (0..depth) |_| {
-            try writeByte(&buf, testing.allocator, @intFromEnum(kind));
+            try writeByte(&buf, testing.allocator, @backingInt(kind));
             try writeByte(&buf, testing.allocator, 1);
             if (kind == .persistent_map) try writeByte(&buf, testing.allocator, 0);
         }
@@ -1145,17 +1145,17 @@ test "decode: nested counts that each claim the rest of the input allocate by wh
         defer heap.deinit();
         var interner = Interner.init(testing.allocator);
         defer interner.deinit();
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(testing.allocator);
         try writeByte(&buf, testing.allocator, version_major);
         try writeByte(&buf, testing.allocator, version_minor);
         // 1000 levels each claiming 3000 elements, then 2000 nils:
         // every level but the deepest few passes the count check.
         for (0..1000) |_| {
-            try writeByte(&buf, testing.allocator, @intFromEnum(kind));
+            try writeByte(&buf, testing.allocator, @backingInt(kind));
             try writeUleb128(&buf, testing.allocator, 3000);
         }
-        try buf.appendNTimes(testing.allocator, @intFromEnum(Kind.nil), 2000);
+        try buf.appendNTimes(testing.allocator, @backingInt(Kind.nil), 2000);
         try testing.expectError(CodecError.TruncatedInput, decode(&heap, &interner, buf.items, &synthHash, &synthEq));
         try testing.expect(counting.allocated_bytes <= 16 * buf.items.len);
     }
@@ -1184,10 +1184,10 @@ test "decode: a map or set whose count disagrees with its distinct entries is Ma
     var ctx = TestCtx.init();
     defer ctx.deinit();
     // {1 1, 1 2}: two entries, one distinct key.
-    const map_bytes = [_]u8{ 1, 0, @intFromEnum(Kind.persistent_map), 2, 4, 2, 4, 2, 4, 2, 4, 4 };
+    const map_bytes = [_]u8{ 1, 0, @backingInt(Kind.persistent_map), 2, 4, 2, 4, 2, 4, 2, 4, 4 };
     try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &map_bytes, &synthHash, &synthEq));
     // #{1 1}.
-    const set_bytes = [_]u8{ 1, 0, @intFromEnum(Kind.persistent_set), 2, 4, 2, 4, 2 };
+    const set_bytes = [_]u8{ 1, 0, @backingInt(Kind.persistent_set), 2, 4, 2, 4, 2 };
     try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &set_bytes, &synthHash, &synthEq));
 }
 
@@ -1199,7 +1199,7 @@ test "decode: every kind byte outside the serializable set is refused with a typ
     while (b < 256) : (b += 1) {
         const byte: u8 = @intCast(b);
         const known = for (serializable) |k| {
-            if (@intFromEnum(k) == byte) break true;
+            if (@backingInt(k) == byte) break true;
         } else false;
         if (known) continue;
         const bytes = [_]u8{ 1, 0, byte };
@@ -1208,7 +1208,7 @@ test "decode: every kind byte outside the serializable set is refused with a typ
     }
     // The identity kinds among them.
     for ([_]Kind{ .atom, .record, .protocol, .protocol_fn, .function, .durable_ref }) |k| {
-        const bytes = [_]u8{ 1, 0, @intFromEnum(k) };
+        const bytes = [_]u8{ 1, 0, @backingInt(k) };
         try testing.expectError(CodecError.UnserializableKind, decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq));
     }
 }
@@ -1246,7 +1246,7 @@ test "roundtrip: a sorted map and set in the natural order come back sorted, ent
     // Written in ascending order: the keyword `:apple` comes first.
     const bytes = try encode(testing.allocator, &ctx.interner, m);
     defer testing.allocator.free(bytes);
-    try testing.expectEqualSlices(u8, &.{ 1, 0, @intFromEnum(Kind.sorted_map), 5, @intFromEnum(Kind.keyword), 5, 'a', 'p', 'p', 'l', 'e' }, bytes[0..11]);
+    try testing.expectEqualSlices(u8, &.{ 1, 0, @backingInt(Kind.sorted_map), 5, @backingInt(Kind.keyword), 5, 'a', 'p', 'p', 'l', 'e' }, bytes[0..11]);
 }
 
 test "encode: a sorted collection with a comparator of its own is unserializable" {
@@ -1260,9 +1260,9 @@ test "encode: a sorted collection with a comparator of its own is unserializable
 test "decode: sorted entries out of order, repeated or without an order are MalformedPayload" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
-    const map_tag = @intFromEnum(Kind.sorted_map);
-    const set_tag = @intFromEnum(Kind.sorted_set);
-    const fixnum = @intFromEnum(Kind.fixnum);
+    const map_tag = @backingInt(Kind.sorted_map);
+    const set_tag = @backingInt(Kind.sorted_set);
+    const fixnum = @backingInt(Kind.fixnum);
     // {2 0, 1 0}: descending keys.
     const descending = [_]u8{ 1, 0, map_tag, 2, fixnum, 4, fixnum, 0, fixnum, 2, fixnum, 0 };
     try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &descending, &synthHash, &synthEq));
@@ -1270,10 +1270,10 @@ test "decode: sorted entries out of order, repeated or without an order are Malf
     const repeated = [_]u8{ 1, 0, set_tag, 2, fixnum, 2, fixnum, 2 };
     try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &repeated, &synthHash, &synthEq));
     // #{1 nil-list}: a list has no natural order.
-    const unordered = [_]u8{ 1, 0, set_tag, 2, fixnum, 2, @intFromEnum(Kind.list), 0 };
+    const unordered = [_]u8{ 1, 0, set_tag, 2, fixnum, 2, @backingInt(Kind.list), 0 };
     try testing.expectError(CodecError.MalformedPayload, decode(&ctx.heap, &ctx.interner, &unordered, &synthHash, &synthEq));
     // One entry needs no comparison, whatever its key.
-    const single = [_]u8{ 1, 0, set_tag, 1, @intFromEnum(Kind.list), 0 };
+    const single = [_]u8{ 1, 0, set_tag, 1, @backingInt(Kind.list), 0 };
     const got = try decode(&ctx.heap, &ctx.interner, &single, &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 1), sorted.count(got));
 }
@@ -1297,7 +1297,7 @@ test "decode: wrong major version → InvalidVersion" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 2, 0, @intFromEnum(Kind.nil) };
+    const bytes = [_]u8{ 2, 0, @backingInt(Kind.nil) };
     try testing.expectError(
         CodecError.InvalidVersion,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1308,7 +1308,7 @@ test "decode: wrong minor version → InvalidVersion" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 1, 5, @intFromEnum(Kind.nil) };
+    const bytes = [_]u8{ 1, 5, @backingInt(Kind.nil) };
     try testing.expectError(
         CodecError.InvalidVersion,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1330,7 +1330,7 @@ test "decode: trailing bytes → TrailingBytes" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.nil), 0xFF };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.nil), 0xFF };
     try testing.expectError(
         CodecError.TrailingBytes,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1354,7 +1354,7 @@ test "decode: recognized-but-non-serializable kind → UnserializableKind" {
     defer ctx.deinit();
 
     // transient is kind 27, recognized but non-serializable.
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.transient) };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.transient) };
     try testing.expectError(
         CodecError.UnserializableKind,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1365,7 +1365,7 @@ test "decode: malformed bignum sign byte → MalformedPayload" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.bignum), 7, 0 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.bignum), 7, 0 };
     try testing.expectError(
         CodecError.MalformedPayload,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1376,7 +1376,7 @@ test "decode: invalid char scalar → InvalidCharScalar (surrogate)" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.char), 0x00, 0xD8, 0x00, 0x00 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.char), 0x00, 0xD8, 0x00, 0x00 };
     try testing.expectError(
         CodecError.InvalidCharScalar,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1387,7 +1387,7 @@ test "decode: invalid char scalar → InvalidCharScalar (out of range)" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.char), 0x00, 0x00, 0x11, 0x00 };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.char), 0x00, 0x00, 0x11, 0x00 };
     try testing.expectError(
         CodecError.InvalidCharScalar,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),
@@ -1399,7 +1399,7 @@ test "decode: truncated body mid-string" {
     defer ctx.deinit();
 
     // String with length 5 but only 3 bytes provided.
-    const bytes = [_]u8{ 1, 0, @intFromEnum(Kind.string), 5, 'a', 'b', 'c' };
+    const bytes = [_]u8{ 1, 0, @backingInt(Kind.string), 5, 'a', 'b', 'c' };
     try testing.expectError(
         CodecError.TruncatedInput,
         decode(&ctx.heap, &ctx.interner, &bytes, &synthHash, &synthEq),

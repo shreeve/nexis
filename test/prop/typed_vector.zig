@@ -176,7 +176,7 @@ test "T2: same elements are = and hash alike; a changed element, length or type 
             .f64 => blk: {
                 const xs = try std.testing.allocator.alloc(i64, len);
                 defer std.testing.allocator.free(xs);
-                for (xs, typed_vector.f64Elems(a)) |*slot, x| slot.* = if (std.math.isFinite(x)) @intFromFloat(@trunc(@min(@max(x, -1e15), 1e15))) else 0;
+                for (xs, typed_vector.f64Elems(a)) |*slot, x| slot.* = if (std.math.isFinite(x)) @trunc(@min(@max(x, -1e15), 1e15)) else 0;
                 break :blk try typed_vector.fromI64Slice(&ctx.heap, xs);
             },
         };

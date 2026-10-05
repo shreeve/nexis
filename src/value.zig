@@ -150,13 +150,13 @@ pub const Kind = enum(u8) {
     /// Does this kind store its entire value inside the tag+payload
     /// (no heap pointer)? Pure predicate — safe to use in tight loops.
     pub inline fn isImmediate(k: Kind) bool {
-        const n: u8 = @intFromEnum(k);
+        const n: u8 = @backingInt(k);
         return n < 16;
     }
 
     /// Does the payload word hold a `*HeapHeader` pointer?
     pub inline fn isHeap(k: Kind) bool {
-        const n: u8 = @intFromEnum(k);
+        const n: u8 = @backingInt(k);
         return n >= 16 and n < 64;
     }
 };
@@ -191,7 +191,7 @@ pub const Value = extern struct {
 
     /// Primary discriminator. Cheap bit-shift on the tag word.
     pub inline fn kind(self: Value) Kind {
-        return @enumFromInt(@as(u8, @truncate(self.tag)));
+        return @fromBackingInt(@intCast(@as(u8, @truncate(self.tag))));
     }
 
     pub inline fn subkind(self: Value) u16 {
@@ -232,7 +232,7 @@ pub const Value = extern struct {
     pub inline fn isTruthy(self: Value) bool {
         // Only `nil` and `false` are falsy (PLAN §23 #13); they sit at
         // kinds 0 and 1.
-        const k = @intFromEnum(self.kind());
+        const k = @backingInt(self.kind());
         return k != 0 and k != 1;
     }
 
@@ -242,7 +242,7 @@ pub const Value = extern struct {
     /// `if (!v.isTruthy())`. Same single-comparison hot path; this
     /// is the language-level truthiness predicate.
     pub inline fn isFalsy(self: Value) bool {
-        const k = @intFromEnum(self.kind());
+        const k = @backingInt(self.kind());
         return k == 0 or k == 1;
     }
 
@@ -321,7 +321,7 @@ pub const Value = extern struct {
     /// hashers; `value.zig` stays below the heap-kind modules.
     pub fn hashImmediate(self: Value) u64 {
         const k = self.kind();
-        const kind_byte: u8 = @intFromEnum(k);
+        const kind_byte: u8 = @backingInt(k);
         const base: u64 = switch (k) {
             // Singletons get fixed, high-entropy constants. Distinct
             // from the `hashU64(kind_byte)` path so a hypothetical
@@ -353,12 +353,12 @@ pub const Value = extern struct {
 /// The all-zero Value. Freshly-allocated memory therefore contains `nil`
 /// without explicit initialization.
 pub inline fn nilValue() Value {
-    return Value{ .tag = @intFromEnum(Kind.nil), .payload = 0 };
+    return Value{ .tag = @backingInt(Kind.nil), .payload = 0 };
 }
 
 pub inline fn fromBool(b: bool) Value {
     const k: Kind = if (b) .true_ else .false_;
-    return Value{ .tag = @intFromEnum(k), .payload = 0 };
+    return Value{ .tag = @backingInt(k), .payload = 0 };
 }
 
 /// UTF-16 surrogate code points are invalid Unicode scalar values and
@@ -368,7 +368,7 @@ pub fn fromChar(scalar: u21) ?Value {
     if (scalar >= 0xD800 and scalar <= 0xDFFF) return null;
     if (scalar > 0x10_FFFF) return null;
     return Value{
-        .tag = @intFromEnum(Kind.char),
+        .tag = @backingInt(Kind.char),
         .payload = @as(u64, scalar),
     };
 }
@@ -378,7 +378,7 @@ pub fn fromChar(scalar: u21) ?Value {
 pub fn fromFixnum(n: i64) ?Value {
     if (!isFixnumRange(n)) return null;
     return Value{
-        .tag = @intFromEnum(Kind.fixnum),
+        .tag = @backingInt(Kind.fixnum),
         .payload = @bitCast(n),
     };
 }
@@ -389,7 +389,7 @@ pub fn fromFixnum(n: i64) ?Value {
 pub fn fromFloat(f: f64) Value {
     const canonical = hash.canonicalizeFloat(f);
     return Value{
-        .tag = @intFromEnum(Kind.float),
+        .tag = @backingInt(Kind.float),
         .payload = @bitCast(canonical),
     };
 }
@@ -399,7 +399,7 @@ pub fn fromFloat(f: f64) Value {
 /// `internKeywordValue`), which is the one place that pairs them.
 pub fn fromKeyword(intern_id: u32, name_hash: u32) Value {
     return Value{
-        .tag = @intFromEnum(Kind.keyword),
+        .tag = @backingInt(Kind.keyword),
         .payload = @as(u64, name_hash) << 32 | intern_id,
     };
 }
@@ -407,7 +407,7 @@ pub fn fromKeyword(intern_id: u32, name_hash: u32) Value {
 /// A symbol, as `fromKeyword`. Symbols carry no metadata (SEMANTICS §7).
 pub fn fromSymbol(intern_id: u32, name_hash: u32) Value {
     return Value{
-        .tag = @intFromEnum(Kind.symbol),
+        .tag = @backingInt(Kind.symbol),
         .payload = @as(u64, name_hash) << 32 | intern_id,
     };
 }
@@ -433,7 +433,7 @@ pub fn testSymbol(id: u32) Value {
 /// `vm.execCallCall`).
 pub fn fromNativeFnPtr(descriptor_ptr: *const anyopaque) Value {
     return Value{
-        .tag = @intFromEnum(Kind.native_fn),
+        .tag = @backingInt(Kind.native_fn),
         .payload = @intFromPtr(descriptor_ptr),
     };
 }

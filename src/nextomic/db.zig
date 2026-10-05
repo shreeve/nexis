@@ -879,7 +879,7 @@ test "a txlog key past the id range is corrupt, not a crash" {
     {
         const txn = try tc.conn.store.beginWrite(.none);
         errdefer txn.abort();
-        try txn.putInTree(tc.conn.store.trees.txlog, &([_]u8{0xFF} ** key.id_len), &.{});
+        try txn.putInTree(tc.conn.store.trees.txlog, &@as([key.id_len]u8, @splat(0xFF)), &.{});
         try txn.commit();
     }
     try testing.expectError(error.Corrupted, txRange(tc.conn, arena_state.allocator(), 1, null));
@@ -931,7 +931,7 @@ test "materialise every value kind into a heap" {
     try testing.expectEqualStrings("db.cardinality/many", tc.interner.keywordName(kw.asKeywordId()));
     const s = try conn.valToValue(txn, &heap, .{ .string = "hi" });
     try testing.expectEqualStrings("hi", string_mod.asBytes(s));
-    const u = try conn.valToValue(txn, &heap, .{ .uuid = [_]u8{0} ** 16 });
+    const u = try conn.valToValue(txn, &heap, .{ .uuid = @splat(0) });
     try testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", string_mod.asBytes(u));
     const b = try conn.valToValue(txn, &heap, .{ .bytes = "\x00\x01" });
     try testing.expectEqualStrings("\x00\x01", string_mod.asBytes(b));

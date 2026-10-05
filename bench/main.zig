@@ -68,7 +68,7 @@ const Runner = bench.Runner;
 // -----------------------------------------------------------------------------
 
 const ScalarCtx = struct {
-    // Volatile-accessed operands so ReleaseFast can't
+    // Volatile-accessed operands so an optimized build can't
     // constant-fold the body into a no-op.
     a_fx: i64 = 7,
     b_fx: i64 = 11,
@@ -80,7 +80,7 @@ const ScalarCtx = struct {
 
 fn benchFixnumAdd(ctx: *ScalarCtx) anyerror!void {
     // Read operands via volatile pointers to force a memory
-    // load per call; otherwise ReleaseFast constant-folds the
+    // load per call; otherwise an optimized build constant-folds the
     // entire body and the row reads 0 ns.
     const ap: *volatile i64 = &ctx.a_fx;
     const bp: *volatile i64 = &ctx.b_fx;
@@ -128,7 +128,8 @@ fn benchHashRawBytes(ctx: *HashCtx) anyerror!void {
     // Raw xxHash3 over bytes — what string.hashHeader calls
     // internally. Measures the hash primitive itself.
     _ = ctx;
-    const s = "the quick brown fox jumps over the lazy dog" ** 4;
+    const fox = "the quick brown fox jumps over the lazy dog";
+    const s = fox ++ fox ++ fox ++ fox;
     const h = hash_mod.hashBytes(s);
     // defeat DCE
     const vp: *volatile u64 = @constCast(&raw_hash_sink);
@@ -357,7 +358,7 @@ fn populateKeysAndVals(
     var i: usize = 0;
     while (i < n) : (i += 1) {
         var buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const name = try std.mem.print(&buf, "k{d}", .{i});
         keys[i] = try interner.internKeywordValue(name);
         vals[i] = value_mod.fromFixnum(@intCast(i)).?;
     }
@@ -458,7 +459,7 @@ const TmpStore = struct {
 
     fn init(alloc: std.mem.Allocator, name: []const u8) !TmpStore {
         const dir = if (std.c.getenv("TMPDIR")) |d| std.mem.span(d) else "/tmp";
-        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/nexis-bench-{d}-{s}.emdb", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid(), name }, 0);
+        const path = try alloc.printSentinel("{s}/nexis-bench-{d}-{s}.emdb", .{ std.mem.trimEnd(u8, dir, "/"), std.c.getpid(), name }, 0);
         remove(path);
         return .{ .path = path };
     }
@@ -470,8 +471,8 @@ const TmpStore = struct {
 
     fn remove(path: [:0]const u8) void {
         _ = std.c.unlink(path.ptr);
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const lock_path = std.fmt.bufPrintSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const lock_path = std.mem.printSentinel(&buf, "{s}-lock", .{path}, 0) catch return;
         _ = std.c.unlink(lock_path.ptr);
     }
 };
@@ -756,10 +757,10 @@ pub fn main(init: std.process.Init) !u8 {
         defer jw.deinit();
         try runner.writeJson(&jw.writer, .{
             .cpu = builtin_cpu_model_str,
-            .os = @tagName(@import("builtin").os.tag),
+            .os = @tagName(@import("builtin").target.os.tag),
             .ram = "",
             .zig_version = @import("builtin").zig_version_string,
-            .optimize_mode = @tagName(@import("builtin").mode),
+            .optimize_mode = @tagName(@import("builtin").optimize),
             .note = note,
         });
         var file = try std.Io.Dir.cwd().createFile(io, p, .{});

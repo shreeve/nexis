@@ -45,9 +45,9 @@ pub const InternError = error{
 
 const Table = struct {
     by_name: std.StringHashMapUnmanaged(u32) = .empty,
-    names: std.ArrayListUnmanaged([]const u8) = .empty,
+    names: std.ArrayList([]const u8) = .empty,
     /// `hash.nameHash` of each name, by id.
-    hashes: std.ArrayListUnmanaged(u32) = .empty,
+    hashes: std.ArrayList(u32) = .empty,
 
     fn deinit(self: *Table, gpa: Allocator) void {
         // Lockstep invariant: `by_name` keys are borrowed slices into
@@ -119,7 +119,7 @@ pub const Interner = struct {
     /// `ns.Type` of each record type, by its dense per-VM type id; an
     /// empty slice for an id not yet named. The printer's source for
     /// `#ns.Type{...}` (INTERN.md §2).
-    record_types: std.ArrayListUnmanaged([]const u8) = .empty,
+    record_types: std.ArrayList([]const u8) = .empty,
 
     pub fn init(gpa: Allocator) Interner {
         return .{ .gpa = gpa };
@@ -138,7 +138,7 @@ pub const Interner = struct {
     /// Name record type `type_id` as `ns.name`, the way Clojure
     /// prints a record's class.
     pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) Allocator.Error!void {
-        const full = try std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns, name });
+        const full = try self.gpa.print("{s}.{s}", .{ ns, name });
         errdefer self.gpa.free(full);
         while (self.record_types.items.len <= type_id) try self.record_types.append(self.gpa, &.{});
         self.gpa.free(self.record_types.items[type_id]);
@@ -173,7 +173,7 @@ pub const Interner = struct {
     /// `splitQualified` is the inverse.
     pub fn internQualifiedKeyword(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
         const ns_prefix = ns orelse return self.internKeywordValue(name);
-        const full = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ ns_prefix, name });
+        const full = try self.gpa.print("{s}/{s}", .{ ns_prefix, name });
         defer self.gpa.free(full);
         return self.internKeywordValue(full);
     }
@@ -181,7 +181,7 @@ pub const Interner = struct {
     /// `internQualifiedKeyword` for symbols.
     pub fn internQualifiedSymbol(self: *Interner, ns: ?[]const u8, name: []const u8) InternError!value.Value {
         const ns_prefix = ns orelse return self.internSymbolValue(name);
-        const full = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ ns_prefix, name });
+        const full = try self.gpa.print("{s}/{s}", .{ ns_prefix, name });
         defer self.gpa.free(full);
         return self.internSymbolValue(full);
     }
@@ -192,7 +192,7 @@ pub const Interner = struct {
     /// an unqualified name (INTERN.md §3).
     pub fn splitQualified(full: []const u8) struct { ns: ?[]const u8, name: []const u8 } {
         if (std.mem.eql(u8, full, "/")) return .{ .ns = null, .name = full };
-        const slash = std.mem.indexOfScalar(u8, full, '/') orelse return .{ .ns = null, .name = full };
+        const slash = std.mem.findScalar(u8, full, '/') orelse return .{ .ns = null, .name = full };
         return .{ .ns = full[0..slash], .name = full[slash + 1 ..] };
     }
 
@@ -380,7 +380,7 @@ test "record type names: named ids print as ns.Type, others are null" {
 
 test "by_name lookups survive names reallocation" {
     // Force enough inserts to grow `names` past its initial capacity
-    // (ArrayListUnmanaged grows geometrically). Every previously-returned
+    // (ArrayList grows geometrically). Every previously-returned
     // id must still resolve, and every name must still be found. This
     // exercises the claim in `docs/INTERN.md` §4 that map keys point at
     // the duped byte buffers, not into `names.items`.
@@ -397,7 +397,7 @@ test "by_name lookups survive names reallocation" {
     var i: u32 = 0;
     while (i < N) : (i += 1) {
         var buf: [16]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "name-{d}", .{i}) catch unreachable;
+        const s = std.mem.print(&buf, "name-{d}", .{i}) catch unreachable;
         const owned = try testing.allocator.dupe(u8, s);
         try names_list.append(testing.allocator, owned);
         const id = try it.internKeyword(owned);

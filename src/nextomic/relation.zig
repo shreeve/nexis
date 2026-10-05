@@ -99,7 +99,7 @@ pub const Cell = union(enum) {
     }
 
     pub fn hash(self: Cell) u64 {
-        const tag: u64 = @intFromEnum(std.meta.activeTag(self));
+        const tag: u64 = @backingInt(std.meta.activeTag(self));
         const base: u64 = switch (self) {
             .nil => 0xB01D_FACE_B01D_FACE,
             .int => |x| hash_mod.hashI64(x),
@@ -503,7 +503,7 @@ pub const Relation = struct {
         const cols = try self.arena.alloc(Column, vars.len);
         var n: usize = 0;
         for (self.vars, self.cols) |v, c| {
-            if (std.mem.indexOfScalar(Var, drop, v) != null) continue;
+            if (std.mem.findScalar(Var, drop, v) != null) continue;
             vars[n] = v;
             cols[n] = c;
             n += 1;
@@ -575,7 +575,7 @@ pub const Relation = struct {
         std.debug.assert(vars.len == src.cols.len);
         var distinct: std.ArrayList(Var) = .empty;
         for (vars) |v| {
-            if (std.mem.indexOfScalar(Var, distinct.items, v) == null) try distinct.append(arena, v);
+            if (std.mem.findScalar(Var, distinct.items, v) == null) try distinct.append(arena, v);
         }
         if (distinct.items.len == vars.len) return .{ .arena = arena, .vars = vars, .cols = src.cols, .rows = src.rows };
         var out = try init(arena, distinct.items);
@@ -583,9 +583,9 @@ pub const Relation = struct {
         var i: usize = 0;
         rows: while (i < src.rows) : (i += 1) {
             for (vars, 0..) |v, pos| {
-                const d = std.mem.indexOfScalar(Var, distinct.items, v).?;
+                const d = std.mem.findScalar(Var, distinct.items, v).?;
                 const c = src.cell(i, pos);
-                if (std.mem.indexOfScalar(Var, vars, v).? == pos) {
+                if (std.mem.findScalar(Var, vars, v).? == pos) {
                     cells[d] = c;
                 } else if (!cells[d].eql(c)) continue :rows;
             }

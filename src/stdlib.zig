@@ -1007,7 +1007,7 @@ fn javaDouble(s: []const u8) ?[]const u8 {
     const sign = @intFromBool(t.len > 0 and (t[0] == '+' or t[0] == '-'));
     const body = t[sign..];
     if (std.mem.eql(u8, body, "NaN") or std.mem.eql(u8, body, "Infinity")) return t;
-    const suffix = body.len > 0 and std.mem.indexOfScalar(u8, "fFdD", body[body.len - 1]) != null;
+    const suffix = body.len > 0 and std.mem.findScalar(u8, "fFdD", body[body.len - 1]) != null;
     const number = t[0 .. t.len - @intFromBool(suffix)];
     const hex = body.len > 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X');
     const isDigit: *const fn (u8) bool = if (hex) &std.ascii.isHex else &std.ascii.isDigit;
@@ -1019,7 +1019,7 @@ fn javaDouble(s: []const u8) ?[]const u8 {
         while (i < number.len and isDigit(number[i])) : (i += 1) mantissa += 1;
     }
     if (mantissa == 0) return null;
-    if (i < number.len and std.mem.indexOfScalar(u8, if (hex) "pP" else "eE", number[i]) != null) {
+    if (i < number.len and std.mem.findScalar(u8, if (hex) "pP" else "eE", number[i]) != null) {
         i += 1;
         if (i < number.len and (number[i] == '+' or number[i] == '-')) i += 1;
         const digits = i;
@@ -2828,7 +2828,7 @@ fn fnMeta(_: *VM, args: []const Value) VmError!Value {
     const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
     // The metadata is a hash map or, when with-meta was given one, a
     // sorted map.
-    if (m.kind == @intFromEnum(Kind.sorted_map)) return heap_mod.Heap.valueFromHeader(.sorted_map, m);
+    if (m.kind == @backingInt(Kind.sorted_map)) return heap_mod.Heap.valueFromHeader(.sorted_map, m);
     return champ_mod.valueFromMapHeader(m);
 }
 
@@ -2958,7 +2958,7 @@ var gensym_next: u64 = 0;
 fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
     const prefix: []const u8 = if (args.len == 1) try internedName(vm, args[0]) else "G";
     gensym_next += 1;
-    const name = std.fmt.allocPrint(vm.allocator, "{s}__{d}", .{ prefix, gensym_next }) catch return VmError.OutOfMemory;
+    const name = vm.allocator.print("{s}__{d}", .{ prefix, gensym_next }) catch return VmError.OutOfMemory;
     defer vm.allocator.free(name);
     return vm.ensureInterner().internSymbolValue(name) catch |err| internFailure(err);
 }
@@ -3086,8 +3086,8 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
     const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
-    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    const path_z = vm.allocator.dupeZ(u8, path) catch return VmError.OutOfMemory;
+    if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const path_z = vm.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
     defer vm.allocator.free(path_z);
     const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
     errdefer vm.allocator.destroy(conn);
@@ -3098,7 +3098,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
         db_mod.shutdown(conn);
         return VmError.OutOfMemory;
     };
-    return .{ .tag = @intFromEnum(Kind.db_connection), .payload = @intFromPtr(conn) };
+    return .{ .tag = @backingInt(Kind.db_connection), .payload = @intFromPtr(conn) };
 }
 
 /// The `:durability` of a `db/open` options map; null when the map is
@@ -3318,13 +3318,13 @@ fn openConn(v: Value) VmError!*db_mod.Connection {
 fn fnDbBeginWrite(vm: *VM, args: []const Value) VmError!Value {
     const txn = try beginWrite(vm, try openConn(args[0]));
     const h = db_mod.Handle.create(.{ .write = txn }) catch return VmError.OutOfMemory;
-    return .{ .tag = @intFromEnum(Kind.db_write_txn), .payload = @intFromPtr(h) };
+    return .{ .tag = @backingInt(Kind.db_write_txn), .payload = @intFromPtr(h) };
 }
 
 fn fnDbBeginRead(vm: *VM, args: []const Value) VmError!Value {
     const txn = try beginRead(vm, try openConn(args[0]));
     const h = db_mod.Handle.create(.{ .read = txn }) catch return VmError.OutOfMemory;
-    return .{ .tag = @intFromEnum(Kind.db_read_txn), .payload = @intFromPtr(h) };
+    return .{ .tag = @backingInt(Kind.db_read_txn), .payload = @intFromPtr(h) };
 }
 
 fn fnDbCommit(vm: *VM, args: []const Value) VmError!Value {
@@ -3517,7 +3517,7 @@ fn fnNsPublics(vm: *VM, args: []const Value) VmError!Value {
 fn resolveIn(vm: *VM, ns: *Namespace, sym: Value) VmError!Value {
     if (sym.kind() != .symbol) return VmError.KindMismatch;
     const text = vm.ensureInterner().symbolName(sym.asSymbolId());
-    const slash = if (text.len > 1) std.mem.indexOfScalar(u8, text, '/') else null;
+    const slash = if (text.len > 1) std.mem.findScalar(u8, text, '/') else null;
     const v = if (slash) |i| blk: {
         const prefix = text[0..i];
         const registry = ns.registry orelse break :blk null;
@@ -4472,7 +4472,7 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
     const from: usize = if (from_arg) |f| @intCast(std.math.clamp(f, 0, @as(i64, @intCast(n)))) else if (last) n else 0;
     const at = string_mod.byteRangeForCodepoints(args[0], from, from) catch return VmError.Utf8Error;
     const byte_at: ?usize = if (last)
-        std.mem.lastIndexOf(u8, src[0..@min(src.len, at.start + needle.len)], needle)
+        std.mem.findLast(u8, src[0..@min(src.len, at.start + needle.len)], needle)
     else
         string_mod.indexOf(src, needle, at.start);
     const b = byte_at orelse return value_mod.nilValue();
@@ -4737,7 +4737,7 @@ fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
 fn pathArg(v: Value) VmError![]const u8 {
     if (v.kind() != .string) return VmError.KindMismatch;
     const path = string_mod.asBytes(v);
-    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return VmError.InvalidPath;
+    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
     return path;
 }
 
@@ -4872,7 +4872,7 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     // Split on the LAST `/` for `ns/name`.
     var ns_name: []const u8 = "";
     var type_name: []const u8 = full_name;
-    if (std.mem.lastIndexOfScalar(u8, full_name, '/')) |slash_idx| {
+    if (std.mem.findScalarLast(u8, full_name, '/')) |slash_idx| {
         ns_name = full_name[0..slash_idx];
         type_name = full_name[slash_idx + 1 ..];
     }
@@ -4952,7 +4952,7 @@ fn fnRegisterProtocol(vm: *VM, args: []const Value) VmError!Value {
     const full_name = string_mod.asBytes(full_name_v);
     var ns_name: []const u8 = "";
     var proto_name: []const u8 = full_name;
-    if (std.mem.lastIndexOfScalar(u8, full_name, '/')) |slash_idx| {
+    if (std.mem.findScalarLast(u8, full_name, '/')) |slash_idx| {
         ns_name = full_name[0..slash_idx];
         proto_name = full_name[slash_idx + 1 ..];
     }
@@ -5055,7 +5055,7 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
     const type_id_kw: u32 = args[2].asKeywordId();
     const type_name = interner.keywordName(type_id_kw);
     const kind = typeNameToKind(type_name) orelse return VmError.InvalidArgument;
-    const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @intFromEnum(kind) };
+    const key = vm_mod.DispatchKey{ .tag = .builtin, .id = @backingInt(kind) };
 
     vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
         error.NoProtocolMethod => return VmError.NoProtocolMethod,
@@ -5137,14 +5137,7 @@ fn typeNameToKind(name: []const u8) ?value_mod.Kind {
     if (std.mem.eql(u8, name, "vector")) return .persistent_vector;
     if (std.mem.eql(u8, name, "map")) return .persistent_map;
     if (std.mem.eql(u8, name, "set")) return .persistent_set;
-    // Iterate over Kind tags at comptime so this stays in sync
-    // with the enum without a hand-maintained table.
-    inline for (std.meta.fields(value_mod.Kind)) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            return @field(value_mod.Kind, field.name);
-        }
-    }
-    return null;
+    return std.meta.stringToEnum(value_mod.Kind, name);
 }
 
 // =============================================================================
@@ -5828,7 +5821,7 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
 const testing = std.testing;
 
 test "stdlib: every core native is bound in nexis.core" {
-    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    var dbg: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = dbg.deinit();
     const ally = dbg.allocator();
     // Var objects normally live in VM.runtime_arena (wholesale

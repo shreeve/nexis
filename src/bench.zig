@@ -137,7 +137,7 @@ const pilot_min_ns: u64 = 1_000_000;
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
-    results: std.ArrayListUnmanaged(BenchResult),
+    results: std.ArrayList(BenchResult),
     opts: RunnerOptions,
 
     pub fn init(allocator: std.mem.Allocator, opts: RunnerOptions) !Runner {
@@ -246,14 +246,14 @@ pub const Runner = struct {
             "\n{s:<48} {s:<28} {s:>10} {s:>14} {s:>14} {s:>14} {s:>16}\n",
             .{ "benchmark", "category", "param", "median", "p5", "p95", "ops/sec" },
         );
-        try writer.print("{s}\n", .{"-" ** 150});
+        try writer.print("{s}\n", .{&@as([150]u8, @splat('-'))});
         var pbuf: [24]u8 = undefined;
         var mbuf: [24]u8 = undefined;
         var p5buf: [24]u8 = undefined;
         var p95buf: [24]u8 = undefined;
         for (self.results.items) |r| {
             const param_str = if (r.param) |p|
-                try std.fmt.bufPrint(&pbuf, "{d}", .{p})
+                try std.mem.print(&pbuf, "{d}", .{p})
             else
                 "-";
             try writer.print(
@@ -339,10 +339,10 @@ pub const Runner = struct {
 // =============================================================================
 
 fn formatDurationInto(buf: []u8, ns: f64) ![]const u8 {
-    if (ns < 1_000) return std.fmt.bufPrint(buf, "{d:.2} ns", .{ns});
-    if (ns < 1_000_000) return std.fmt.bufPrint(buf, "{d:.2} us", .{ns / 1_000.0});
-    if (ns < 1_000_000_000) return std.fmt.bufPrint(buf, "{d:.2} ms", .{ns / 1_000_000.0});
-    return std.fmt.bufPrint(buf, "{d:.2} s", .{ns / 1_000_000_000.0});
+    if (ns < 1_000) return std.mem.print(buf, "{d:.2} ns", .{ns});
+    if (ns < 1_000_000) return std.mem.print(buf, "{d:.2} us", .{ns / 1_000.0});
+    if (ns < 1_000_000_000) return std.mem.print(buf, "{d:.2} ms", .{ns / 1_000_000.0});
+    return std.mem.print(buf, "{d:.2} s", .{ns / 1_000_000_000.0});
 }
 
 // =============================================================================
@@ -413,8 +413,8 @@ test "writeJson escapes the strings it writes" {
     defer runner.deinit();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try runner.writeJson(&out.writer, .{ .cpu = "M5", .os = "macos", .ram = "", .zig_version = "0.16.0", .optimize_mode = "ReleaseFast", .note = "an \"idle\" run\\" });
-    try testing.expect(std.mem.indexOf(u8, out.written(), "\"note\": \"an \\\"idle\\\" run\\\\\"") != null);
+    try runner.writeJson(&out.writer, .{ .cpu = "M5", .os = "macos", .ram = "", .zig_version = "0.17.0", .optimize_mode = "fast", .note = "an \"idle\" run\\" });
+    try testing.expect(std.mem.find(u8, out.written(), "\"note\": \"an \\\"idle\\\" run\\\\\"") != null);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
     defer parsed.deinit();
 }

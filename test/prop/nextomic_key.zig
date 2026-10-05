@@ -166,7 +166,7 @@ test "K3 out-of-line values: digest equality, prefix order, key bound" {
             c.* = 0;
         };
         const ea = try key.valBytes(gpa, .{ .string = sa });
-        try testing.expectEqual(@as(u8, @intFromEnum(key.Tag.string)), ea[0]);
+        try testing.expectEqual(@as(u8, @backingInt(key.Tag.string)), ea[0]);
         try testing.expect(ea.len <= 1 + 2 * key.prefix_len + 2 + key.hash_len);
 
         // Same bytes: same key. Different bytes with the same prefix: same
@@ -204,7 +204,7 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
             4 => .{ .keyword = rand.int(u32) },
             5 => .{ .ref = rand.uintAtMost(u64, key.id_max) },
             6 => .{ .string = randBlob(rand, &buf, key.inline_max) },
-            7 => .{ .uuid = [_]u8{0xAB} ** 16 },
+            7 => .{ .uuid = @splat(0xAB) },
             else => .{ .bytes = randBlob(rand, &buf, key.inline_max) },
         };
         const vb = try key.valBytes(gpa, v);
@@ -217,7 +217,7 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     const gpa = arena.reset();
     // The worst case named in §2.2: a 96-byte string of NULs escapes to
     // 192 bytes and the AVET history key is 210 bytes.
-    const worst = [_]u8{0} ** key.inline_max;
+    const worst: [key.inline_max]u8 = @splat(0);
     const wb = try key.valBytes(gpa, .{ .string = &worst });
     const wk = try key.keyBytes(gpa, .avet, key.id_max, std.math.maxInt(u32), wb, .{ .t = 1, .added = true });
     try testing.expectEqual(@as(usize, 210), wk.len);
@@ -237,7 +237,7 @@ test "K6 values of different types order by type, whatever their contents" {
         const a = randVal(rand, &ba);
         const b = randVal(rand, &bb);
         if (a.valueType() == b.valueType()) continue;
-        const want = std.math.order(@intFromEnum(a.valueType()), @intFromEnum(b.valueType()));
+        const want = std.math.order(@backingInt(a.valueType()), @backingInt(b.valueType()));
         const ea = try key.valBytes(gpa, a);
         const eb = try key.valBytes(gpa, b);
         try testing.expectEqual(want, std.mem.order(u8, ea, eb));

@@ -26,6 +26,7 @@
 //! `&dispatch.hashValue` and `&dispatch.equal` at the kind switch.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
@@ -159,7 +160,7 @@ pub fn isEmpty(v: Value) bool {
 
 /// First element. Panics in safe builds if the list is empty.
 pub fn head(v: Value) Value {
-    if (std.debug.runtime_safety and isEmpty(v)) std.debug.panic("list.head: called on empty list", .{});
+    if (builtin.optimize.runtimeSafety() and isEmpty(v)) std.debug.panic("list.head: called on empty list", .{});
     if (v.subkind() == subkind_view) return vector.nth(viewVector(v), viewOffset(v));
     return consBody(v).head;
 }
@@ -167,7 +168,7 @@ pub fn head(v: Value) Value {
 /// Rest of the list. Always a list Value; never allocates. Panics in
 /// safe builds if the list is empty.
 pub fn tail(v: Value) Value {
-    if (std.debug.runtime_safety and isEmpty(v)) std.debug.panic("list.tail: called on empty list", .{});
+    if (builtin.optimize.runtimeSafety() and isEmpty(v)) std.debug.panic("list.tail: called on empty list", .{});
     if (v.subkind() == subkind_view) return viewAt(restBlock(v), viewOffset(v) + 1);
     return consBody(v).tail;
 }
@@ -338,7 +339,7 @@ pub const Cursor = struct {
 
 fn valueFrom(h: *HeapHeader, sk: u16) Value {
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.list)) | (@as(u64, sk) << 16),
+        .tag = @as(u64, @backingInt(Kind.list)) | (@as(u64, sk) << 16),
         .payload = @intFromPtr(h),
     };
 }

@@ -35,7 +35,7 @@ const testing = std.testing;
 
 pub const ProtocolBody = extern struct {
     id: u32,
-    _pad: [4]u8 = [_]u8{0} ** 4,
+    _pad: [4]u8 = @splat(0),
 };
 
 comptime {
@@ -47,7 +47,7 @@ pub fn makeProtocol(heap: *Heap, id: u32) !Value {
     const h = try heap.alloc(.protocol, @sizeOf(ProtocolBody));
     const body = Heap.bodyOf(ProtocolBody, h);
     body.id = id;
-    body._pad = [_]u8{0} ** 4;
+    body._pad = @splat(0);
     return Heap.valueFromHeader(.protocol, h);
 }
 

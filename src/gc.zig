@@ -167,7 +167,7 @@ pub const Collector = struct {
 
     /// Kinds whose blocks hold no heap reference but their metadata.
     fn isLeafKind(kind: u16) bool {
-        return switch (@as(Kind, @enumFromInt(kind))) {
+        return switch (@as(Kind, @fromBackingInt(@intCast(kind)))) {
             .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => true,
             else => false,
         };
@@ -189,7 +189,7 @@ pub const Collector = struct {
     /// `h` is already marked.
     fn trace(self: *Collector, h: *HeapHeader) void {
         if (h.meta) |m| self.mark(m);
-        const k: Kind = @enumFromInt(h.kind);
+        const k: Kind = @fromBackingInt(@intCast(h.kind));
         switch (k) {
             .string => string.trace(h, self),
             .bignum => bignum.trace(h, self),
@@ -869,7 +869,7 @@ test "host: roots are marked after the explicit roots and closure/cell blocks tr
             c.mark(self.cell);
         }
         fn trace(_: *anyopaque, h: *HeapHeader, c: *Collector) void {
-            std.debug.assert(h.kind == @intFromEnum(Kind.cell_internal));
+            std.debug.assert(h.kind == @backingInt(Kind.cell_internal));
             c.markValue(Heap.bodyOf(Value, h).*);
         }
     };
@@ -892,6 +892,6 @@ test "markValue ignores the pointer kinds that carry no block" {
     // must not dereference it.
     var descriptor: u64 = 0;
     collector.markValue(value.fromNativeFnPtr(@ptrCast(&descriptor)));
-    collector.markValue(.{ .tag = @intFromEnum(Kind.var_), .payload = @intFromPtr(&descriptor) });
+    collector.markValue(.{ .tag = @backingInt(Kind.var_), .payload = @intFromPtr(&descriptor) });
     try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }

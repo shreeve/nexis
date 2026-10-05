@@ -33,6 +33,7 @@
 //! Transients are the separate `src/coll/transient.zig` module.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
@@ -238,7 +239,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         inline fn arrayPayloads(h: *HeapHeader) []P {
             const n = headerOf(ArrayHeader, h).count;
-            if (std.debug.runtime_safety) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
+            if (builtin.optimize.runtimeSafety()) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
             const ptr: [*]P = @ptrCast(@alignCast(afterHeader(h)));
             return ptr[0..n];
         }
@@ -256,7 +257,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         inline fn collisionPayloads(h: *HeapHeader) []P {
             const n = headerOf(CollisionHeader, h).count;
-            if (std.debug.runtime_safety) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
+            if (builtin.optimize.runtimeSafety()) std.debug.assert(Heap.bodyBytes(h).len == 8 + @as(usize, n) * @sizeOf(P));
             const ptr: [*]P = @ptrCast(@alignCast(afterHeader(h)));
             return ptr[0..n];
         }
@@ -306,7 +307,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         fn valueOf(h: *HeapHeader, subkind: u16) Value {
             return .{
-                .tag = @as(u64, @intFromEnum(kind)) | (@as(u64, subkind) << 16),
+                .tag = @as(u64, @backingInt(kind)) | (@as(u64, subkind) << 16),
                 .payload = @intFromPtr(h),
             };
         }
@@ -321,10 +322,10 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// a CHAMP root is 16 bytes, which no array body (8 + n·32 or
         /// 8 + n·16 bytes) can be.
         fn inferSubkind(h: *HeapHeader) u16 {
-            std.debug.assert(h.kind == @intFromEnum(kind));
+            std.debug.assert(h.kind == @backingInt(kind));
             const size = Heap.bodyBytes(h).len;
             if (size == @sizeOf(RootBody)) return subkind_champ_root;
-            if (std.debug.runtime_safety) {
+            if (builtin.optimize.runtimeSafety()) {
                 const n = (size -| @sizeOf(ArrayHeader)) / @sizeOf(P);
                 if (size != @sizeOf(ArrayHeader) + n * @sizeOf(P) or n > array_map_max) {
                     std.debug.panic("champ: body size {d} is no {s} root", .{ size, @tagName(kind) });
@@ -1295,7 +1296,7 @@ pub fn valueFromMapHeader(h: *HeapHeader) Value {
 /// same payloads, no metadata, no cached hash.
 pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
     const size = Heap.bodySize(src);
-    const h = try heap.alloc(@enumFromInt(src.kind), size);
+    const h = try heap.alloc(@fromBackingInt(@intCast(src.kind)), size);
     @memcpy(Heap.bodyBytes(h), Heap.bodyBytes(src));
     return h;
 }
@@ -1504,7 +1505,7 @@ fn collidingHash(x: Value) u64 {
 /// names the same key.
 fn collidingKey(heap: *Heap, i: u32) !Value {
     var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "collider-{d}", .{i}) catch unreachable;
+    const text = std.mem.print(&buf, "collider-{d}", .{i}) catch unreachable;
     return string_mod.fromBytes(heap, text);
 }
 

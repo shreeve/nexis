@@ -50,7 +50,7 @@ const testing = std.testing;
 
 pub const RecordBody = extern struct {
     type_id: u32,
-    _pad: [4]u8 = [_]u8{0} ** 4,
+    _pad: [4]u8 = @splat(0),
     fields: Value,
 };
 
@@ -71,7 +71,7 @@ pub fn make(heap: *Heap, type_id: u32, fields: Value) !Value {
     const h = try heap.alloc(.record, @sizeOf(RecordBody));
     const body = Heap.bodyOf(RecordBody, h);
     body.type_id = type_id;
-    body._pad = [_]u8{0} ** 4;
+    body._pad = @splat(0);
     body.fields = fields;
     return Heap.valueFromHeader(.record, h);
 }

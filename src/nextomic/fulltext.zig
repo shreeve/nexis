@@ -350,9 +350,9 @@ pub const Hit = struct { e: u64, hash: u128 };
 /// tokens.
 pub fn search(store: *Store, txn: *Txn, arena: Allocator, a: u32, needle: []const []const u8) ![]const Hit {
     if (needle.len == 0) return &.{};
-    var hits: std.AutoArrayHashMapUnmanaged(Hit, void) = .empty;
+    var hits: std.array_hash_map.Auto(Hit, void) = .empty;
     for (needle, 0..) |token, i| {
-        var found: std.AutoArrayHashMapUnmanaged(Hit, void) = .empty;
+        var found: std.array_hash_map.Auto(Hit, void) = .empty;
         var s = try Store.scan(txn, store.trees.fulltext, try tokenPrefix(arena, a, token));
         while (s.next()) |kv| {
             const hit = try hitOf(kv.key);
@@ -483,7 +483,7 @@ test "index and search keep rows per value and intersect tokens" {
     try testing.expectEqual(@as(usize, 0), (try search(store, txn, arena, a, try tokens(arena, "wine"))).len);
 
     // An out-of-line value unindexes through its payload.
-    const long_text = try std.mem.concat(arena, u8, &.{ "zebra ", "x" ** 200 });
+    const long_text = try std.mem.concat(arena, u8, &.{ "zebra ", &@as([200]u8, @splat('x')) });
     const vb = try key.valBytes(arena, .{ .string = long_text });
     try store.writeBatch(txn, 2, &.{
         .{ .e = e2, .a = a, .vbytes = vb, .payload = long_text, .added = true, .avet = false, .vaet = false },

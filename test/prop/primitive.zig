@@ -42,10 +42,10 @@ const iterations_per_property: usize = 1_000;
 const prng_seed: u64 = 0x6E65_7869_7350_726F; // "nexisPro" as ASCII big-endian
 
 const Kind = enum { nil_, true_v, false_v, char_v, fixnum_v, float_v, kw_v, sym_v };
-const kind_count: usize = @typeInfo(Kind).@"enum".fields.len;
+const kind_count: usize = @typeInfo(Kind).@"enum".field_names.len;
 
 fn randKind(rand: std.Random) Kind {
-    return @enumFromInt(rand.uintLessThan(u8, kind_count));
+    return @fromBackingInt(@intCast(rand.uintLessThan(u8, kind_count)));
 }
 
 fn randValue(rand: std.Random) Value {
@@ -229,9 +229,9 @@ test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" 
         };
         const domain: u8 = switch (k) {
             .list, .persistent_vector => 0xF0,
-            .sorted_map => @intFromEnum(value.Kind.persistent_map),
-            .sorted_set => @intFromEnum(value.Kind.persistent_set),
-            else => @intFromEnum(k),
+            .sorted_map => @backingInt(value.Kind.persistent_map),
+            .sorted_set => @backingInt(value.Kind.persistent_set),
+            else => @backingInt(k),
         };
         std.testing.expectEqual(identity, dispatch.isIdentityKind(k)) catch |err| {
             std.debug.print("\n  kind {t}: identity\n", .{k});

@@ -330,7 +330,7 @@ test "N10: hashValue(bignum) matches xxHash3 over {sign, limbs} + mixKindDomain"
     hasher.update(&[_]u8{1}); // negative
     hasher.update(std.mem.sliceAsBytes(&limb_arr));
     const base_u32: u32 = @truncate(hasher.final());
-    const expected = hash_mod.mixKindDomain(@as(u64, base_u32), @intFromEnum(value.Kind.bignum));
+    const expected = hash_mod.mixKindDomain(@as(u64, base_u32), @backingInt(value.Kind.bignum));
 
     try std.testing.expectEqual(expected, dispatch.hashValue(v));
 }

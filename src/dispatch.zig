@@ -96,9 +96,9 @@ inline fn isSetKind(k: Kind) bool {
 pub fn domainByte(k: Kind) u8 {
     if (isSequential(k)) return sequential_domain_byte;
     return switch (k) {
-        .sorted_map => @intFromEnum(Kind.persistent_map),
-        .sorted_set => @intFromEnum(Kind.persistent_set),
-        else => @intFromEnum(k),
+        .sorted_map => @backingInt(Kind.persistent_map),
+        .sorted_set => @backingInt(Kind.persistent_set),
+        else => @backingInt(k),
     };
 }
 

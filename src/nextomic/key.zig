@@ -329,35 +329,35 @@ fn unescapeFrom(gpa: Allocator, in: []const u8) !struct { bytes: []u8, consumed:
 /// Append the sortable encoding of `v` (tag byte included).
 pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!void {
     switch (v) {
-        .boolean => |b| try out.append(gpa, @intFromEnum(if (b) Tag.bool_true else Tag.bool_false)),
+        .boolean => |b| try out.append(gpa, @backingInt(if (b) Tag.bool_true else Tag.bool_false)),
         .long => |n| {
-            try out.append(gpa, @intFromEnum(Tag.long));
+            try out.append(gpa, @backingInt(Tag.long));
             try encodeI64(out, gpa, n);
         },
         .double => |d| {
             if (std.math.isNan(d)) return error.ValueType;
-            try out.append(gpa, @intFromEnum(Tag.double));
+            try out.append(gpa, @backingInt(Tag.double));
             try encodeF64(out, gpa, d);
         },
         .instant => |n| {
-            try out.append(gpa, @intFromEnum(Tag.instant));
+            try out.append(gpa, @backingInt(Tag.instant));
             try encodeI64(out, gpa, n);
         },
         .keyword => |id| {
-            try out.append(gpa, @intFromEnum(Tag.keyword));
+            try out.append(gpa, @backingInt(Tag.keyword));
             var buf: [attr_len]u8 = undefined;
             writeAttr(&buf, id);
             try out.appendSlice(gpa, &buf);
         },
         .ref => |eid| {
-            try out.append(gpa, @intFromEnum(Tag.ref));
+            try out.append(gpa, @backingInt(Tag.ref));
             var buf: [id_len]u8 = undefined;
             writeId(&buf, eid);
             try out.appendSlice(gpa, &buf);
         },
         .string => |s| try encodeBlob(out, gpa, s, .string),
         .uuid => |u| {
-            try out.append(gpa, @intFromEnum(Tag.uuid));
+            try out.append(gpa, @backingInt(Tag.uuid));
             try out.appendSlice(gpa, &u);
         },
         .bytes => |b| try encodeBlob(out, gpa, b, .bytes),
@@ -365,7 +365,7 @@ pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!vo
 }
 
 fn encodeBlob(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8, tag: Tag) !void {
-    try out.append(gpa, @intFromEnum(tag));
+    try out.append(gpa, @backingInt(tag));
     if (s.len <= inline_max) {
         try escapeInto(out, gpa, s);
         return;
@@ -492,8 +492,8 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
 }
 
 fn tagFromByte(b: u8) ?Tag {
-    inline for (@typeInfo(Tag).@"enum".fields) |f| {
-        if (f.value == b) return @enumFromInt(b);
+    inline for (@typeInfo(Tag).@"enum".field_values) |value| {
+        if (value == b) return @fromBackingInt(@intCast(b));
     }
     return null;
 }
@@ -545,7 +545,7 @@ pub const Parts = struct {
 /// The VAET value section is the referenced entity id without a tag;
 /// any other value encoding has no place in VAET.
 fn vaetValue(vbytes: []const u8) error{ValueType}![]const u8 {
-    if (vbytes.len != 1 + id_len or vbytes[0] != @intFromEnum(Tag.ref)) return error.ValueType;
+    if (vbytes.len != 1 + id_len or vbytes[0] != @backingInt(Tag.ref)) return error.ValueType;
     return vbytes[1..];
 }
 
@@ -775,11 +775,11 @@ test "string order with NUL against terminator" {
 }
 
 test "long string becomes a digest key" {
-    const s = "x" ** 200;
+    const s = &@as([200]u8, @splat('x'));
     const x = try enc(.{ .string = s });
     defer testing.allocator.free(x);
     try testing.expectEqual(@as(usize, 1 + prefix_len + 2 + hash_len), x.len);
-    try testing.expectEqual(@as(u8, @intFromEnum(Tag.string)), x[0]);
+    try testing.expectEqual(@as(u8, @backingInt(Tag.string)), x[0]);
     const kv = try decodeVal(testing.allocator, x);
     try testing.expect(kv == .string_long);
     try testing.expectEqual(hash128(s), kv.string_long.hash);
@@ -788,8 +788,8 @@ test "long string becomes a digest key" {
 
 test "every fixed-width type round trips" {
     const vals = [_]Val{
-        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 },             .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
-        .{ .keyword = 17 },    .{ .ref = 1 << 40 },  .{ .uuid = [_]u8{9} ** 16 },
+        .{ .boolean = false }, .{ .boolean = true }, .{ .long = -7 },        .{ .double = 2.5 }, .{ .instant = 1_700_000_000_000 },
+        .{ .keyword = 17 },    .{ .ref = 1 << 40 },  .{ .uuid = @splat(9) },
     };
     for (vals) |v| {
         const x = try enc(v);
@@ -850,7 +850,7 @@ test "top packs t and added" {
 }
 
 test "ids and tops read from bytes are range-checked" {
-    const high = [_]u8{0xFF} ** id_len;
+    const high: [id_len]u8 = @splat(0xFF);
     try testing.expectError(error.Corrupted, readId(&high));
     try testing.expectError(error.Corrupted, readTop(&high));
     var buf: [id_len]u8 = undefined;
@@ -860,6 +860,6 @@ test "ids and tops read from bytes are range-checked" {
     var k: [id_len + attr_len + 1]u8 = undefined;
     @memcpy(k[0..id_len], &high);
     writeAttr(k[id_len..][0..attr_len], 1);
-    k[id_len + attr_len] = @intFromEnum(Tag.bool_true);
+    k[id_len + attr_len] = @backingInt(Tag.bool_true);
     try testing.expectError(error.Corrupted, unpackKey(.eavt, false, &k));
 }

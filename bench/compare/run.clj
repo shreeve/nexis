@@ -11,7 +11,7 @@
 ;;                            [--datomic-pro DIR] [--warmup 20] [--timed 10]
 ;;                            [--nexis-commit SHA] [--emdb-commit SHA]
 ;;
-;; Builds bin/nexis ReleaseFast, runs every workload once per
+;; Builds bin/nexis optimized (-Doptimize=fast), runs every workload once per
 ;; implementation to warm the file cache (discarded), then --n rounds,
 ;; the implementations alternating with the order rotated each round.
 ;; Every run is one process under /usr/bin/time (-l on macOS, -v on
@@ -165,7 +165,7 @@
              :nexis_dirty (when commit
                             (not (str/blank? (sh-out "git" "status" "--porcelain" "--" "src" "build.zig" "build.zig.zon"))))
              :emdb_commit (or (try-out "git" "-C" (str root "/../emdb") "rev-parse" "HEAD") (:emdb-commit opts))
-             :nexis_optimize "ReleaseFast"
+             :nexis_optimize "fast"
              :zig (sh-out "zig" "version")}
       (impls :bb) (assoc :bb (sh-out "bb" "--version"))
       (impls :datalevin) (assoc :dtlv (sh-out "dtlv" "--version"))
@@ -619,8 +619,8 @@
 ;; ---------------------------------------------------------------- main
 
 (when (:build opts)
-  (println "building bin/nexis ReleaseFast")
-  (p/shell {:dir root} "zig" "build" "install" "-Doptimize=ReleaseFast"))
+  (println "building bin/nexis -Doptimize=fast")
+  (p/shell {:dir root} "zig" "build" "install" "-Doptimize=fast"))
 
 ;; Resolve the JVM classpaths before anything is timed.
 (when (some impls [:clojure :datomic-local])

@@ -22,6 +22,7 @@
 //! subkind; transients wrap this module from `src/coll/transient.zig`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const value = @import("../value.zig");
 const heap_mod = @import("../heap.zig");
 const hash_mod = @import("../hash.zig");
@@ -187,7 +188,7 @@ inline fn tailOf(body: *const RootBody) []Value {
 /// Wrap a root header into a Value. Only callable on subkind-1 roots.
 fn valueFromRoot(h: *HeapHeader) Value {
     return .{
-        .tag = @as(u64, @intFromEnum(Kind.persistent_vector)) |
+        .tag = @as(u64, @backingInt(Kind.persistent_vector)) |
             (@as(u64, subkind_root) << 16),
         .payload = @intFromPtr(h),
     };
@@ -199,8 +200,8 @@ fn valueFromRoot(h: *HeapHeader) Value {
 /// subkind-1 vector root (no other vector subkind is user-facing),
 /// so no subkind inference is needed.
 pub fn valueFromVectorHeader(h: *HeapHeader) Value {
-    if (std.debug.runtime_safety) {
-        std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
+    if (builtin.optimize.runtimeSafety()) {
+        std.debug.assert(h.kind == @backingInt(Kind.persistent_vector));
     }
     return valueFromRoot(h);
 }
@@ -709,7 +710,7 @@ pub fn isEmpty(v: Value) bool {
 /// O(1) when `i` is in the tail.
 pub fn nth(v: Value, i: usize) Value {
     const h = rootHeader(v);
-    if (std.debug.runtime_safety) {
+    if (builtin.optimize.runtimeSafety()) {
         const n = rootBody(h).count;
         if (i >= n) std.debug.panic("vector.nth: index {d} out of bounds (count {d})", .{ i, n });
     }
@@ -725,7 +726,7 @@ pub fn nth(v: Value, i: usize) Value {
 /// Matches `list.hashSeq` exactly, so equal element sequences produce
 /// equal pre-mix bases across list and vector.
 pub fn hashSeq(h: *HeapHeader, elementHash: *const fn (Value) u64) u64 {
-    std.debug.assert(h.kind == @intFromEnum(Kind.persistent_vector));
+    std.debug.assert(h.kind == @backingInt(Kind.persistent_vector));
     if (h.cachedHash()) |cached| return cached;
     var acc: u64 = hash_mod.ordered_init;
     var c = Cursor.fromHeader(h);
@@ -743,8 +744,8 @@ pub fn equalSeq(
     b: *HeapHeader,
     elementEq: *const fn (Value, Value) bool,
 ) bool {
-    std.debug.assert(a.kind == @intFromEnum(Kind.persistent_vector));
-    std.debug.assert(b.kind == @intFromEnum(Kind.persistent_vector));
+    std.debug.assert(a.kind == @backingInt(Kind.persistent_vector));
+    std.debug.assert(b.kind == @backingInt(Kind.persistent_vector));
     if (a == b) return true;
     var ca = Cursor.fromHeader(a);
     var cb = Cursor.fromHeader(b);
@@ -984,7 +985,7 @@ fn rangeVector(heap: *Heap, n: usize) !Value {
 test "pop: the result has the shape fromSlice builds, at every trie boundary" {
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1001,7 +1002,7 @@ test "pop: the result has the shape fromSlice builds, at every trie boundary" {
 test "pop: from 1057 down to empty, one element at a time" {
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1017,7 +1018,7 @@ test "pop: from 1057 down to empty, one element at a time" {
 test "pop then conj: the trie regrows to the same shape" {
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1095,7 +1096,7 @@ test "assoc: replaces one element in the tail or the trie and leaves the source 
 test "fromSlice + nth: round-trip at large size 32768 (trie depth 2 full) and 32769" {
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1359,7 +1360,7 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
     // Each conj from 32766 on must land on the shape fromSlice builds.
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1381,7 +1382,7 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
 test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
     // Tens of thousands of nodes: a leak still fails the test, but
     // no stack trace is captured per allocation.
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();
@@ -1394,7 +1395,7 @@ test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
 }
 
 test "openTailInPlace builds the shape fromSlice builds, across the shift boundaries" {
-    var debug: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = debug.deinit();
     var heap = Heap.init(debug.allocator());
     defer heap.deinit();

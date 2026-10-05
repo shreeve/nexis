@@ -3,7 +3,7 @@
 > A Lisp where immutable values, transactional durable identity, and
 > historical snapshots are one coherent programming model.
 
-nexis is a Lisp with Clojure semantics on its own Zig 0.16 runtime
+nexis is a Lisp with Clojure semantics on its own Zig runtime
 (reader, macroexpander, compiler, bytecode VM, persistent collections,
 16-byte tagged value, precise GC), shipped as one binary that starts
 instantly, with durable refs over the emdb storage engine and Nextomic,
@@ -311,7 +311,7 @@ Each item is a commitment; changing one takes an Amendment Log entry
     bitmaps, canonical layout. The sorted map and set are a
     weight-balanced tree in a comparator's order (`docs/SORTED.md`).
 38. **Performance is a first-class goal.** A performance claim is a
-    measured ReleaseFast number (`docs/PERF.md`); a comparison with
+    measured number from an optimized build (`docs/PERF.md`); a comparison with
     Clojure is published only from same-machine numbers, the cases
     Clojure wins included (`docs/BENCH.md`).
 
@@ -365,7 +365,7 @@ The numbers are stable; retired risks are removed.
 | 5 | Runaway macro expansion or deep input | The expansion depth limit (256, `MacroDepthExceeded`) and the native stack guard: recursion on user-controlled depth raises `:stack-overflow` (`src/stack.zig`, `docs/VM.md`). |
 | 6 | Tail-call elision hurting debuggability | Only `recur` elides frames (§23 #19). |
 | 7 | emdb changes underneath nexis | emdb is a path dependency (`../emdb`); nexis tests assert nexis's contracts, not engine internals, so a change shows as a failing contract. |
-| 8 | Zig stdlib churn | `build.zig.zon` pins `minimum_zig_version` 0.16.0; `ZIG-0.16.0.md` records the idioms the tree uses. |
+| 8 | Zig stdlib churn | `build.zig.zon` pins `minimum_zig_version`; `ZIG.md` records the idioms the tree uses. |
 | 10 | Scope creep toward Clojure compatibility | §4 is doctrine. |
 | 12 | The codec boundary creeps (functions, Vars, records) | §23 #25 names the serializable set; anything else raises `:unserializable`. |
 | 13 | Numeric corner cases poison equality, hash or codec | `docs/SEMANTICS.md` pins every numeric edge case. |

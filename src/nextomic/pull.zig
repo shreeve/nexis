@@ -371,7 +371,7 @@ const Parser = struct {
     /// default limit and no sub-pattern.
     fn attrSpec(self: *Parser, k: u32) Failure!Spec {
         const name = self.interner.keywordName(k);
-        const slash = std.mem.lastIndexOfScalar(u8, name, '/');
+        const slash = std.mem.findScalarLast(u8, name, '/');
         const local_start = if (slash) |s| s + 1 else 0;
         const reverse = name.len > local_start and name[local_start] == '_';
         const attr_k = if (reverse) blk: {
@@ -865,8 +865,8 @@ test "a recursion past the stack guard is StackOverflow, and the path set stops 
     const n = 100;
     var ops: std.ArrayList(Op) = .empty;
     for (0..n) |i| {
-        const me: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{i}) } };
-        const next: transact_mod.Entity = .{ .tempid = .{ .string = try std.fmt.allocPrint(a, "n{d}", .{(i + 1) % n}) } };
+        const me: transact_mod.Entity = .{ .tempid = .{ .string = try a.print("n{d}", .{i}) } };
+        const next: transact_mod.Entity = .{ .tempid = .{ .string = try a.print("n{d}", .{(i + 1) % n}) } };
         try ops.append(a, .{ .add = .{ .e = me, .a = .{ .id = boss }, .v = .{ .entity = next } } });
     }
     const r = try transact_mod.transactOps(fx.tc.conn, a, ops.items, .{});

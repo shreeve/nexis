@@ -9,7 +9,8 @@ The numbers of record live in `docs/PERF.md` §3, once each, with their
 provenance in its §11.
 
 Two rules come first. A performance claim rests only on measured
-numbers taken under this document, from ReleaseFast builds; a Debug
+numbers taken under this document, from builds optimized for speed
+(`-Doptimize=fast`); a Debug
 build is never a measurement. No comparative benchmark is published
 before real same-machine numbers exist on both sides, and when one is,
 the cases where Clojure wins are published with it (§8).
@@ -139,9 +140,9 @@ warm-up and sampling), `Stats` (the order statistics), `writeTable`
 and `writeJson`. `bench/main.zig` is the suite and its driver;
 `bench/nextomic.zig` holds the Nextomic rows. The step builds
 `bin/nexis-bench` and runs it with the arguments after `--`. The
-runner and the runtime it drives are compiled ReleaseFast when
-`-Doptimize` is left at Debug; an explicit `-Doptimize=ReleaseSafe`,
-`ReleaseSmall` or `ReleaseFast` is used as given.
+runner and the runtime it drives are compiled `fast` when
+`-Doptimize` is left at `debug`; an explicit `-Doptimize=safe`,
+`small` or `fast` is used as given.
 
 ```bash
 zig build bench                                  # every category, table to stdout
@@ -286,7 +287,7 @@ a workload unless every run of every implementation prints the same
 answer for every phase, so every row is equal work.
 
 **Method.** `bb bench/compare/run.clj --out DIR [--n 10]` builds
-`bin/nexis` ReleaseFast and records the host (CPU, logical CPUs, RAM,
+`bin/nexis` with `-Doptimize=fast` and records the host (CPU, logical CPUs, RAM,
 OS, kernel, and on Linux the frequency governor and the pinned CPUs'
 maximum clocks), the versions (nexis commit and whether `src/` is
 dirty, the emdb commit, Zig, `bb`, `dtlv`, the JDK, the Clojure CLI,

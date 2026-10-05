@@ -189,13 +189,14 @@ pub const Loader = struct {
         var parser = reader_mod.parser.Parser.init(self.allocator, text);
         defer parser.deinit();
         const sexp = parser.parseProgram() catch {
-            const pos: u32 = @intCast(@min(parser.current.pos, text.len));
+            const span = parser.lastError().?.span;
+            const pos: u32 = @intCast(@min(span.start, text.len));
             if (pos >= text.len) {
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
             } else if (unterminatedString(text[pos..])) {
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
             } else {
-                const len: u32 = @max(parser.current.len, 1);
+                const len: u32 = @max(span.end - span.start, 1);
                 try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = len }, .label = "", .reading = true }, "parse error: unexpected `{s}`", .{text[pos..@min(text.len, pos + len)]});
             }
             return error.Diagnosed;
@@ -418,7 +419,7 @@ fn nsNameToRelPath(allocator: std.mem.Allocator, ns_name: []const u8) ![]u8 {
 /// owns it.
 fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const []const u8, rel_path: []const u8) !?[]u8 {
     for (load_paths) |dir| {
-        const candidate = try std.fs.path.join(allocator, &.{ dir, rel_path });
+        const candidate = try std.Io.Dir.path.join(allocator, &.{ dir, rel_path });
         std.Io.Dir.cwd().access(io, candidate, .{}) catch {
             allocator.free(candidate);
             continue;
