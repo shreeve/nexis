@@ -9,7 +9,10 @@
 //!     `Minter` and enters the cache through `Minter.commitCache` after
 //!     the commit succeeds, into room reserved before it, so the
 //!     publication cannot fail. `Idents.idOf` and `internOf` remember
-//!     what they read, so they take read transactions only.
+//!     what they read, so they take read transactions only, and only
+//!     through a snapshot at the cache's generation: a read older than
+//!     a rename its own connection committed (a query function that
+//!     renames) would otherwise put the retired name back.
 //!   - A text names at most one id, and an id has one live text. A
 //!     rename (`:db/ident` asserted on an attribute entity) moves the
 //!     old text to the retired names, where it stays reserved: it is
@@ -102,8 +105,14 @@ pub const Idents = struct {
         if (self.by_intern.get(intern_id)) |id| return id;
         const name = self.interner.keywordName(intern_id);
         const id = (try self.store.identIdByName(txn, name)) orelse return null;
-        try self.remember(intern_id, id);
+        try self.rememberRead(txn, intern_id, id);
         return id;
+    }
+
+    /// Record a mapping read through `txn` when its snapshot is at the
+    /// cache's generation, so no rename has passed it.
+    fn rememberRead(self: *Idents, txn: *Txn, intern_id: u32, id: u32) !void {
+        if (try self.store.readIdentGen(txn) == self.gen) try self.remember(intern_id, id);
     }
 
     /// Ident id of `name`, or null.
@@ -118,7 +127,7 @@ pub const Idents = struct {
         if (self.by_ident.get(id)) |k| return k;
         const name = (try self.store.identNameById(txn, id)) orelse return null;
         const intern_id = try self.interner.internKeyword(name);
-        try self.remember(intern_id, id);
+        try self.rememberRead(txn, intern_id, id);
         return intern_id;
     }
 

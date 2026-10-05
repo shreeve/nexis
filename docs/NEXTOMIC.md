@@ -212,7 +212,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
-| `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
+| `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once; it keeps what a read finds only when the read's snapshot is at that generation, so a read older than its own connection's rename (a query function that renames) never puts a retired name back |
 | `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
 | `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (2, Unicode simple case folding, §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
@@ -386,7 +386,9 @@ so there is no queue; emdb's write lock is the transactor.
      (`:nextomic/tx-data` when tx-data tries). The ident's id, its
      datoms and its keyword values are untouched, so the rename writes
      no datom; the transaction's entry holds only its `:db/txInstant`.
-     An ident on a user-partition entity is `:nextomic/conflict`.
+     An ident on a user-partition entity is `:nextomic/conflict`, and
+     so are two renames of one entity in one transaction (two values
+     of its card-one `:db/ident`), which retire neither name.
      An ident is never retracted, from an attribute or any other
      ident entity and by any form (`[:db/retract x :db/ident k]`, the
      bare `[:db/retract x :db/ident]`, a `:db/retractEntity`):

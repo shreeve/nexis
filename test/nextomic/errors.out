@@ -29,9 +29,14 @@ nil
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
 {:error :nextomic/conflict, :e 27, :a :db/ident}
+{:error :nextomic/conflict, :e 26, :a :db/ident}
+ok a conflicting rename leaves the attribute its name
 ok an aborted rename is not cached
 ok the attribute keeps its old name
 :nextomic/value-type
+#{[{:db/id 4294967298, :x/old 1}]}
+ok a rename inside a query leaves the old name unknown
+{:error :nextomic/unknown-attribute, :attr :x/old}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}

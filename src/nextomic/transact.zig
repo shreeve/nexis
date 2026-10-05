@@ -1171,6 +1171,10 @@ const Ctx = struct {
                     break :blk x;
                 }
                 if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
+                // Two renames of one entity are two card-one values of
+                // its `:db/ident`; the first would retire a name no
+                // commit ever showed.
+                if (self.minter.renamed.contains(@intCast(eid))) return self.conflict(eid, boot.ident);
                 self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
                     error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
                     error.IdentTooLong => return self.malformed(ident_too_long),
