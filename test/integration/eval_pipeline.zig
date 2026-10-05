@@ -6355,6 +6355,22 @@ test "nexis.test: is returns whether the assertion passed and deftest yields the
     , "[true false false true]");
 }
 
+test "nexis.test: is, testing and a deftest called directly work outside a run" {
+    // Outside a run an assertion reports and returns but counts
+    // nothing; after a run the last test's name is not in force.
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest t (nexis.test/is (= 1 2)) :ran)
+        \\(def r (nexis.test/run-tests))
+        \\[(nexis.test/is (= 1 1)) (nexis.test/is (= 1 2))
+        \\ (nexis.test/testing "ctx" (nexis.test/is (= 1 1)) (nexis.test/is nil))
+        \\ (t) @nexis.test/counts (:fail r) @log]
+    ,
+        \\[true false false :ran nil 1 [FAIL in user/t: (= 1 2) expected: 1 actual: 2 Ran 1 tests containing 1 assertions. 1 failures, 0 errors. FAIL: (= 1 2) expected: 1 actual: 2 FAIL (ctx): nil expected: true actual: nil FAIL: (= 1 2) expected: 1 actual: 2]]
+    );
+}
+
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {
     try expectOutputWithFiles(&.{}, "(require '[nexis.test :refer :all]) [(fn? run-tests) (fn? check=) (try (eval 'bump!) (catch any e :unresolved)) (try (eval 'run-namespaces) (catch any e :unresolved))]", "[true true :unresolved :unresolved]");
     try expectOutputWithFiles(&.{}, "(require '[nexis.pprint :refer :all]) [(fn? pprint-str) (try (eval 'layout) (catch any e :unresolved)) (nexis.pprint/pprint-str [1])]", "[true :unresolved [1]]");
@@ -6373,7 +6389,7 @@ test "nexis.test: thrown? takes what its catch would take, and a message is eval
         \\ (nexis.test/is (= 1 1) (str "m" (swap! n inc)))
         \\ (nexis.test/is (= 1 2) (str "m" (swap! n inc)))
         \\ @n @log @nexis.test/counts]
-    , "[true true true [:went-on :y] true false 2 [FAIL in /: (= 1 2) expected: 1 actual: 2 ; m2] {:test 0, :pass 4, :fail 1, :error 0}]");
+    , "[true true true [:went-on :y] true false 2 [FAIL: (= 1 2) expected: 1 actual: 2 ; m2] {:test 0, :pass 4, :fail 1, :error 0}]");
 }
 
 test "nexis.pprint: a short collection prints flat, a long one breaks from its column" {

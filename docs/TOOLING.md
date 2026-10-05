@@ -289,6 +289,10 @@ the private helpers.
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs.
+- Outside a run (at the REPL, or a test function called directly) an
+  assertion judges, reports and returns as in one, but counts
+  nothing; its report line names only the descriptions in force
+  (`FAIL (ctx): ...`). A run's end leaves no test current.
 - Every report line goes through the function in the atom
   `nexis.test/out`, `println` unless replaced (a harness without
   stdout collects the lines instead). One line per failure names the
