@@ -236,6 +236,8 @@ test "var-quote: #'x reads as (var x), and a printed Var reads back" {
     // FORMS.md §3: the reader turns `#'x` into the list `(var x)`.
     try expectOutput("[(= (var inc) #'inc) (identical? #'inc #'nexis.core/inc) (@#'inc 1)]", "[true true 2]");
     try expectOutputProgram("(def ^{:doc \"d\"} x 1) [#'x (:doc (meta #'x)) @#'x]", "[#'user/x d 1]");
+    // The metadata map is an expression, macros in it expanded.
+    try expectOutputProgram("(def ^{:k (when true 2) :d @(delay 3)} y 1) [(:k (meta #'y)) (:d (meta #'y))]", "[2 3]");
     try expectOutput("['#'x (read-string \"#' nexis.core/inc\")]", "[(var x) (var nexis.core/inc)]");
     try expectOutput("(= (read-string (pr-str (var inc))) '(var nexis.core/inc))", "true");
     try expectOutput("(identical? (eval (read-string (pr-str #'inc))) #'inc)", "true");
@@ -268,7 +270,12 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     // A docstring may span lines, as in Clojure.
     try expectOutputProgram("(defn ml\n  \"Line one.\n  Line two.\"\n  [] 1)\n[(ml) (:doc (meta (var ml)))]", "[1 Line one.\n  Line two.]");
     // Without metadata a defn's Var carries none.
-    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
+    // Every Var knows its name and namespace, and a defn its arglists.
+    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "{:arglists ([x]), :name plain, :ns user}");
+    try expectOutputProgram("(def x 1) [(:name (meta #'x)) (:ns (meta #'x))]", "[x user]");
+    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns])", "{:name mm, :ns my.app}");
+    // A name qualified with the current namespace is the name itself.
+    try expectOutputProgram("(def user/qq 1) (defn user/ff [] 2) [qq (ff) (:name (meta #'qq))]", "[1 2 qq]");
     // def and defmacro take the same spellings.
     try expectOutputProgram("(def ^:private v 1) [v (:private (meta (var v)))]", "[1 true]");
     try expectOutputProgram("(def ^{:doc \"dv\"} dv \"x\") [dv (:doc (meta (var dv)))]", "[x dv]");
@@ -3948,6 +3955,8 @@ test "defprotocol: a docstring and options before the methods" {
         \\(extend-type :string Named (nm [s] (str "s:" s)))
         \\(nm "a")
     , "s:a");
+    // A method's arities and docstring land on its Var.
+    try expectOutputProgram("(defprotocol Sh (ar [s] [s x] \"Area.\")) (select-keys (meta #'ar) [:doc :arglists :name])", "{:doc Area., :arglists ([s] [s x]), :name ar}");
 }
 
 // =============================================================================
@@ -5796,7 +5805,7 @@ test "gc: sorted collections under a comparator that collects keep every interme
 
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [a (atom [])] (dotimes [i 40] (swap! a (fn [v] (churn i) (conj v (str i))))) [(count @a) (last @a)])", "[40 39]");
-    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (meta (var v))", "{:i 19}");
+    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (:i (meta (var v)))", "19");
     try expectOutputUnderGc(churn ++ "(apply str (map (fn [x] (churn x) (str x)) (range 20)))", "012345678910111213141516171819");
     try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
 }
@@ -5844,7 +5853,7 @@ test "binding: only a dynamic Var can be bound; set! rebinds the innermost bindi
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
     try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
     try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
-    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true, :name *x*, :ns user}");
 }
 
 // =============================================================================

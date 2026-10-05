@@ -614,10 +614,16 @@ fn expandDef(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) 
     };
     const value = try expandAll(ctx, if (items.len == 2) &.{} else items[items.len - 1 ..]);
     const def_form = try b.list(.{ items[0], named.name, value });
-    if (named.meta == null and items.len < 4) return def_form;
     var meta: std.ArrayList(*Form) = .empty;
     if (named.meta) |m| try meta.appendSlice(ctx.allocator, m);
     if (items.len == 4) try meta.appendSlice(ctx.allocator, &.{ try b.kw("doc"), items[2] });
+    // Every Var knows its name and namespace, as in Clojure.
+    if (ctx.namespace) |ns| if (ns.name.len > 0) try meta.appendSlice(ctx.allocator, &.{
+        try b.kw("name"),
+        try b.list(.{ "quote", named.name }),
+        try b.kw("ns"),
+        try b.list(.{ "quote", try makeSymbol(ctx, ns.name, b.origin) }),
+    });
     return withVarMeta(ctx, def_form, meta.items, list_form.origin);
 }
 
@@ -636,8 +642,18 @@ fn splitMetaName(ctx: *ExpandContext, form: *const Form) ExpandError!struct { na
         .with_meta => |wm| .{ wm.target, if (wm.meta.datum == .map) wm.meta.datum.map else null },
         else => .{ form, null },
     };
+    // `user/x` in `user` is `x`, as Clojure takes it.
+    if (target.datum == .symbol) if (target.datum.symbol.ns) |prefix| if (ctx.namespace) |ns| if (std.mem.eql(u8, prefix, ns.name))
+        return .{ .name = try makeSymbol(ctx, target.datum.symbol.name, target.origin), .meta = meta };
     if (target.datum != .symbol or target.datum.symbol.ns != null) return ctx.fail(form.origin, "the name defined must be an unqualified symbol, not {s}", .{describeForm(target)});
     return .{ .name = target, .meta = meta };
+}
+
+/// `name` carrying the map of `meta_items` as `^meta`, which `def`
+/// puts on the Var; `name` itself without any.
+fn withMetaMap(b: Builder, name: *const Form, meta_items: []const *Form) ExpandError!*Form {
+    if (meta_items.len == 0) return mutCast(name);
+    return makeForm(b.ctx, .{ .with_meta = .{ .target = mutCast(name), .meta = try b.map(.{meta_items}) } }, b.origin);
 }
 
 /// The map literal `{k v ...}` of `meta_items` as an expression: a
@@ -660,14 +676,16 @@ fn metaMapExpr(ctx: *ExpandContext, meta_items: []const *Form, origin: SrcSpan) 
 }
 
 /// `def_form` (a `def`, which yields its Var) wrapped so the Var then
-/// carries the map built from `meta_items` (flat k v ...):
+/// carries the map built from `meta_items` (flat k v ...), expanded
+/// here:
 ///   (let* [v# def_form] (nexis.core/reset-meta! v# {k v ...}) v#)
 /// No items: `def_form` itself.
 fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, origin: SrcSpan) ExpandError!*Form {
     if (meta_items.len == 0) return def_form;
     const b = Builder{ .ctx = ctx, .origin = origin };
     const v = try b.gensym("nx");
-    return b.list(.{ "let*", try b.vec(.{ v, def_form }), try b.list(.{ "nexis.core/reset-meta!", v, try metaMapExpr(ctx, meta_items, origin) }), v });
+    const meta = try expandForm(ctx, try metaMapExpr(ctx, meta_items, origin));
+    return b.list(.{ "let*", try b.vec(.{ v, def_form }), try b.list(.{ "nexis.core/reset-meta!", v, meta }), v });
 }
 
 /// Expand `(try body* (catch MATCHER BINDING handler*)* (finally
@@ -1161,8 +1179,7 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
     const fn_form = try fnStar(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
-    const def_form = try b.list(.{ "def", parts.name, fn_form });
-    const expanded = try expandForm(ctx, try withVarMeta(ctx, def_form, parts.meta, origin));
+    const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, parts.meta), fn_form }));
 
     var why: ?Failure = null;
     const result = ceval.eval(ceval.user_data, expanded, &why) catch |err| {
@@ -1963,16 +1980,14 @@ fn defnForm(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, pr
     const parts = try defnParts(ctx, call_form, args, private);
     const origin = call_form.origin;
     const b = Builder{ .ctx = ctx, .origin = origin };
-    const def_form = try b.list(.{ "def", parts.name, try b.list(.{ "nexis.core/fn", parts.name, parts.fn_tail }) });
-    return try withVarMeta(ctx, def_form, parts.meta, origin);
+    return b.list(.{ "def", try withMetaMap(b, parts.name, parts.meta), try b.list(.{ "nexis.core/fn", parts.name, parts.fn_tail }) });
 }
 
 /// The parts of `(defn NAME "doc"? {attrs}? tail)` and of `defmacro`
 /// spelled the same way: the name, the fn tail (a parameter vector
 /// and body, or overload clauses) and the Var metadata, from `^meta`
 /// on the name, `:private true` when `private` (`defn-`), the
-/// docstring and the attribute map, with `:arglists` (quoted) added
-/// when there is any.
+/// docstring and the attribute map, and `:arglists` (quoted).
 const DefnParts = struct {
     name: *const Form,
     fn_tail: []const *Form,
@@ -1998,19 +2013,17 @@ fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, p
     }
     if (rest >= args.len) return ctx.fail(origin, "{s}: expected a parameter vector", .{what});
     const tail = args[rest..];
-    if (meta.items.len > 0) {
-        var lists: std.ArrayList(*Form) = .empty;
-        if (stripMeta(tail[0]).datum == .vector) {
-            try lists.append(ctx.allocator, try stripParams(ctx, tail[0]));
-        } else for (tail) |clause| {
-            if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "{s}: expected ([params] body...), not {s}", .{ what, describeForm(clause) });
-            try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
-        }
-        try meta.appendSlice(ctx.allocator, &.{
-            try makeKeyword(ctx, "arglists", origin),
-            try (Builder{ .ctx = ctx, .origin = origin }).list(.{ "quote", try makeList(ctx, lists.items, origin) }),
-        });
+    var lists: std.ArrayList(*Form) = .empty;
+    if (stripMeta(tail[0]).datum == .vector) {
+        try lists.append(ctx.allocator, try stripParams(ctx, tail[0]));
+    } else for (tail) |clause| {
+        if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "{s}: expected ([params] body...), not {s}", .{ what, describeForm(clause) });
+        try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
     }
+    try meta.appendSlice(ctx.allocator, &.{
+        try makeKeyword(ctx, "arglists", origin),
+        try (Builder{ .ctx = ctx, .origin = origin }).list(.{ "quote", try makeList(ctx, lists.items, origin) }),
+    });
     return .{ .name = named.name, .fn_tail = tail, .meta = meta.items };
 }
 
@@ -2482,7 +2495,17 @@ fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const 
         if (spec.datum != .list or spec.datum.list.len == 0) return ctx.fail(spec.origin, "defprotocol: expected a method signature (name [params]...), not {s}", .{describeForm(spec)});
         const method = try plainName(ctx, spec.datum.list[0], "defprotocol: a method name");
         key.* = try b.kw(method);
-        def.* = try b.list(.{ "def", method, try b.list(.{ "nexis.internal/#%protocol-fn", proto_name, key.* }) });
+        // `(m [this] [this x] "doc")`: the arities and the docstring
+        // land on the method's Var.
+        var lists: std.ArrayList(*Form) = .empty;
+        var meta: std.ArrayList(*Form) = .empty;
+        for (spec.datum.list[1..]) |part| switch (part.datum) {
+            .vector => try lists.append(ctx.allocator, mutCast(part)),
+            .string => try meta.appendSlice(ctx.allocator, &.{ try b.kw("doc"), mutCast(part) }),
+            else => {},
+        };
+        try meta.appendSlice(ctx.allocator, &.{ try b.kw("arglists"), try b.list(.{ "quote", try makeList(ctx, lists.items, b.origin) }) });
+        def.* = try b.list(.{ "def", try withMetaMap(b, spec.datum.list[0], meta.items), try b.list(.{ "nexis.internal/#%protocol-fn", proto_name, key.* }) });
     }
     return b.list(.{
         "do",

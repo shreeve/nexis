@@ -4136,8 +4136,9 @@ test "declared names: lexical bindings, quoted data and same-form definitions re
     defer arena.deinit();
     var v = try vm.VM.init(testing.allocator, &stub_routine);
     defer v.deinit();
-    // A registry brings the heap quoted data is built on.
-    _ = try v.ensureRegistry();
+    // A registry brings the heap quoted data is built on; a `def`
+    // sets its Var's metadata through `nexis.core/reset-meta!`.
+    _ = try (try v.ensureRegistry()).core.intern("reset-meta!");
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const ok_sources = [_][]const u8{

@@ -187,8 +187,9 @@ qualified by the current namespace (`"<ns>/Name"`).
 
 A docstring and `:option value` pairs before the methods are accepted
 and ignored. Each method spec must be a non-empty list headed by an
-unqualified symbol; its parameter vectors (and anything after them)
-are ignored. A method's arities are its impl's own: the registry
+unqualified symbol; its parameter vectors become the method Var's
+`:arglists` and a docstring among them its `:doc`, as in Clojure,
+and dispatch ignores them. A method's arities are its impl's own: the registry
 records none, and whichever impl the dispatcher calls picks the arity
 by the argument count or raises `:arity-mismatch` (§4.2).
 

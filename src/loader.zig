@@ -545,8 +545,10 @@ test "loader: memory that runs out while reading or compiling is OutOfMemory, ne
     defer v.deinit();
     const interner = v.ensureInterner();
     const registry = try v.ensureRegistry();
+    // What a `def` sets its Var's metadata through, when it runs.
+    _ = try registry.core.intern("reset-meta!");
     const no_macros: expand_mod.HostMacroTable = .{};
-    const info = vm_mod.SourceInfo{ .path = "<test>", .text = "(def x [1 2 3 4 5 6 7 8 9]) (def y {:a [x x] :b #{1 2}})" };
+    const info = vm_mod.SourceInfo{ .path = "<test>", .text = "(do 1 [1 2 3 4 5 6 7 8 9] {:a [2 3] :b #{1 2}} '(a b))" };
     var failed_somewhere = false;
     for (0..400) |n| {
         var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = n });
