@@ -33,6 +33,7 @@ const std = @import("std");
 const emdb = @import("emdb");
 const key = @import("key.zig");
 const store_mod = @import("store.zig");
+const string_mod = @import("../string.zig");
 
 const Allocator = std.mem.Allocator;
 const Txn = emdb.Txn;
@@ -78,10 +79,8 @@ pub fn tokens(arena: Allocator, text: []const u8) ![]const []const u8 {
 fn charAt(text: []const u8, i: usize) struct { len: usize, token: bool } {
     const b = text[i];
     if (b < 0x80) return .{ .len = 1, .token = std.ascii.isAlphanumeric(b) };
-    const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .len = 1, .token = true };
-    if (i + n > text.len) return .{ .len = 1, .token = true };
-    const cp = std.unicode.utf8Decode(text[i..][0..n]) catch return .{ .len = 1, .token = true };
-    return .{ .len = n, .token = !separator(cp) };
+    const d = string_mod.decodeAt(text, i) catch return .{ .len = 1, .token = true };
+    return .{ .len = d.len, .token = !separator(d.scalar) };
 }
 
 /// The non-ASCII spaces and punctuation that end a token: Latin-1's
@@ -111,14 +110,12 @@ fn foldRun(arena: Allocator, run: []const u8) ![]const u8 {
             i += 1;
             continue;
         }
-        const n = std.unicode.utf8ByteSequenceLength(b) catch 1;
-        const cp = if (n > 1 and i + n <= run.len) std.unicode.utf8Decode(run[i..][0..n]) catch null else null;
-        if (cp) |c| {
+        if (string_mod.decodeAt(run, i)) |d| {
             var buf: [4]u8 = undefined;
-            const m = std.unicode.utf8Encode(fold(c), &buf) catch unreachable;
+            const m = std.unicode.utf8Encode(fold(d.scalar), &buf) catch unreachable;
             try out.appendSlice(arena, buf[0..m]);
-            i += n;
-        } else {
+            i += d.len;
+        } else |_| {
             try out.append(arena, b);
             i += 1;
         }

@@ -1088,16 +1088,7 @@ pub const TestDir = struct {
     }
 };
 
-/// `s` repeated `n` times, for building long test strings.
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    return comptime blk: {
-        @setEvalBranchQuota(2 * n + 1000);
-        var buf: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-        const final = buf;
-        break :blk &final;
-    };
-}
+const repeat = @import("../string.zig").repeat;
 
 test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
     var td = try TestDir.init("store_ranges");
@@ -1631,7 +1622,7 @@ test "long ident names use the heap path" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    const long_name = "ns/" ++ repeat("x", 400);
+    const long_name = "ns/" ++ @as([400]u8, @splat('x'));
     {
         const txn = try store.beginWrite(.none);
         try store.putIdent(txn, long_name, 5000);

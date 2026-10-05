@@ -3981,7 +3981,7 @@ fn codepointPrefix(text: []const u8, n: usize) VmError!usize {
     var i: usize = 0;
     for (0..n) |_| {
         if (i == text.len) break;
-        i += (scalarAt(text, i) orelse return VmError.Utf8Error).len;
+        i += (string_mod.decodeAt(text, i) catch return VmError.Utf8Error).len;
     }
     return i;
 }
@@ -4274,37 +4274,18 @@ fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn
     var lo: usize = 0;
     var hi: usize = src.len;
     if (left) while (lo < hi) {
-        const sc = scalarAt(src[0..hi], lo) orelse break;
-        if (!isTrimmed(sc.c)) break;
+        const sc = string_mod.decodeAt(src[0..hi], lo) catch break;
+        if (!isTrimmed(sc.scalar)) break;
         lo += sc.len;
     };
     if (right) while (hi > lo) {
         var start = hi - 1;
         while (start > lo and src[start] & 0xC0 == 0x80) start -= 1;
-        const sc = scalarAt(src[0..hi], start) orelse break;
-        if (start + sc.len != hi or !isTrimmed(sc.c)) break;
+        const sc = string_mod.decodeAt(src[0..hi], start) catch break;
+        if (start + sc.len != hi or !isTrimmed(sc.scalar)) break;
         hi = start;
     };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
-}
-
-/// The scalar that starts at `bytes[pos]` and its byte length; null
-/// unless the bytes there are one well-formed UTF-8 sequence (no
-/// overlong form, surrogate or truncated tail). Strings carry their
-/// bytes unvalidated (STRING.md §2), so a native that walks one by
-/// code point decodes through here.
-fn scalarAt(bytes: []const u8, pos: usize) ?struct { c: u21, len: u3 } {
-    const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch return null;
-    if (len > bytes.len - pos) return null;
-    const b = bytes[pos..];
-    const c: u21 = switch (len) {
-        1 => b[0],
-        2 => std.unicode.utf8Decode2(b[0..2].*) catch return null,
-        3 => std.unicode.utf8Decode3(b[0..3].*) catch return null,
-        4 => std.unicode.utf8Decode4(b[0..4].*) catch return null,
-        else => unreachable,
-    };
-    return .{ .c = c, .len = len };
 }
 
 fn isNewline(c: u21) bool {
@@ -4339,8 +4320,8 @@ fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     const src = try stringArg(args[0]);
     var i: usize = 0;
     while (i < src.len) {
-        const sc = scalarAt(src, i) orelse return value_mod.fromBool(false);
-        if (!isJavaWhitespace(sc.c)) return value_mod.fromBool(false);
+        const sc = string_mod.decodeAt(src, i) catch return value_mod.fromBool(false);
+        if (!isJavaWhitespace(sc.scalar)) return value_mod.fromBool(false);
         i += sc.len;
     }
     return value_mod.fromBool(true);
