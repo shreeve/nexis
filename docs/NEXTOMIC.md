@@ -800,7 +800,9 @@ for `.` and `[...]`), not zero.
 (`vars`, typed columns for eids and longs, a column of cells otherwise);
 never a VM value, and never changed once built, so a relation made
 from another shares the columns it keeps (dropping a variable copies
-nothing). Results are copied into the VM heap as a persistent
+nothing). Rows are numbered in 32 bits: a step whose relation would pass
+2^32 − 1 rows (a cross product of two 70,000-row patterns) is
+`:out-of-memory`. Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups
