@@ -131,6 +131,10 @@ test "errors: division by zero and kind mismatch are the catchable keywords" {
     try expectProgramError("(* (+ " ++ fm ++ " 1) \"x\")", vm.VmError.KindMismatch);
 }
 
+test "literals: the least subnormals print as Java's Double.toString does" {
+    try expectOutput("[5e-324 4.9E-324 -1e-323 (str 5e-324) (pr-str 1.5e-323)]", "[4.9E-324 4.9E-324 -9.9E-324 4.9E-324 1.5E-323]");
+}
+
 test "literals: integers beyond the fixnum range read as bignums and print in decimal" {
     try expectOutput("140737488355328", "140737488355328");
     try expectOutput("-140737488355329", "-140737488355329");
