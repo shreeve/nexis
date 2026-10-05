@@ -12,9 +12,10 @@
 // Every native declares its arity in its descriptor and the VM
 // enforces it; a native never indexes `args` past its declared
 // minimum. Any seqable receiver goes through `makeSeqIter`, so
-// nil, lists, vectors, maps, records, sets (hash or sorted) and
-// strings behave the same way in every sequence function. Arithmetic delegates to the
-// VM's numeric tower. nil is the empty sequence, as in Clojure:
+// nil, lists, vectors, typed vectors, maps, records, Nextomic
+// entities, sets (hash or sorted) and strings behave the same way in
+// every sequence function. Arithmetic delegates to the VM's numeric
+// tower. nil is the empty sequence, as in Clojure:
 //   (first nil)   => nil
 //   (rest nil)    => ()
 //   (count nil)   => 0
@@ -604,7 +605,8 @@ fn fnTake(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(some pred coll)` → the first truthy `(pred x)`, else nil;
 /// `(every? pred coll)` → whether `(pred x)` is truthy for every x.
-/// Both stop at the first element that decides.
+/// Both stop at the first element that decides. Rooting: each built
+/// element is only the next call's argument (GC.md §11.5, class 2).
 fn fnSome(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, args[1]);
     while (try it.next()) |x| {
@@ -1310,7 +1312,7 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     }
     // Walk `last` as a seq.
     try appendSeqValues(vm, last, &combined);
-
+    // The built elements are the call's arguments (GC.md §11.5, class 2).
     return try vm.callValue(f, combined.items);
 }
 
@@ -1472,8 +1474,8 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 //   vec          (s)        persistent vector from any seqable
 //   hash-map     (& kvs)    persistent map from k/v pairs
 //   hash-set     (& xs)     persistent set from args
-//   assoc        (m k v)    persistent put (map or vector)
-//   dissoc       (m k)      persistent remove (map only)
+//   assoc        (m k v)    persistent put (map, record or vector)
+//   dissoc       (m k)      persistent remove (map or record)
 //   get          (m k)      lookup (map/set/vector); nil if missing
 //   get          (m k def)  lookup with default
 //   contains?    (m k)      key/element presence check
@@ -1482,8 +1484,8 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 //   conj         (coll & xs) persistent add (list: cons; vector: push;
 //                            map: assoc with [k v] pair; set: include)
 //
-// Map and set iteration order is unspecified. Tests using
-// `keys`/`vals` should compare as sets, not by exact order.
+// A hash map or set iterates in its trie's order, the same for equal
+// collections (STDLIB.md §5).
 
 fn fnVector(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
@@ -1992,7 +1994,7 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
-/// the non-nil `(f i x)`.
+/// the non-nil `(f i x)`. Rooting: `Results` (GC.md §11.5, class 3).
 fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
     var results = Results.init(vm);
     defer results.release();
@@ -2520,6 +2522,8 @@ const SortOrder = struct {
     vm: *VM,
     comparator: ?Value,
 
+    /// `a` and `b` are on `sortImpl`'s root scope (GC.md §11.5,
+    /// class 4).
     fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
         const cmp = self.comparator orelse return (try compareValues(self.vm, a, b)) == .lt;
         const r = try self.vm.callValue(cmp, &.{ a, b });
@@ -2831,6 +2835,7 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     defer vm.allocator.free(call_args);
     call_args[0] = v.meta;
     @memcpy(call_args[1..], args[2..]);
+    // The metadata is the call's argument (GC.md §11.5, class 2).
     const next = try vm.callValue(args[1], call_args);
     if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
     try setVarMeta(vm, v, next);
@@ -3559,6 +3564,7 @@ fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
 fn forceDelay(vm: *VM, d: Value) VmError!Value {
     const registry = if (vm.home().registry) |*r| r else return VmError.NotDerefable;
     const force = registry.core.lookupLocal("force") orelse return VmError.NotDerefable;
+    // `d` is the call's argument (GC.md §11.5, class 2).
     return vm.callValue(force.current() orelse return VmError.UnboundVar, &.{d});
 }
 
@@ -4139,10 +4145,9 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 // Core string ops
 // =============================================================================
 //
-// `(str & xs)` is display-mode stringify+concat. Nil semantics
-// are split: `format(.display, nil)` writes "nil", so `str` /
-// `join` / `spit` each wrap their element path to convert
-// nil → empty BEFORE delegating to the formatter.
+// `(str & xs)` concatenates each argument's text as
+// `appendStrValue` makes it: a string or char displayed, nil empty,
+// anything else as `pr` prints it.
 //
 // GC rooting: str / pr-str allocate the final heap string after
 // walking the args slice, which is rooted for the call, and never
@@ -4306,7 +4311,6 @@ fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
     return mapAsciiCase(vm, args[0], true);
 }
 
-/// The six ASCII whitespace characters: space, tab, LF, VT, FF, CR.
 /// Java's `Character.isWhitespace`, which Clojure's `blank?` and `trim`
 /// use: the Unicode space, line and paragraph separators except the
 /// no-break ones, and the controls tab through CR and FS through US.
@@ -5214,12 +5218,11 @@ const SeqIter = struct {
     }
 };
 
-/// Every seqable receiver: nil, list, vector, map (as `[k v]`
-/// entries), record (its field map), lazy entity (its attributes,
-/// read in one pass), set, sorted map and set (in order) and string
-/// (as chars). A string that is
-/// not valid UTF-8 is `:utf8-error`, as for every other string
-/// operation.
+/// Every seqable receiver: nil, list, vector, typed vector, map (as
+/// `[k v]` entries), record (its field map), lazy entity (its
+/// attributes, read in one pass), set, sorted map and set (in order)
+/// and string (as chars). A string that is not valid UTF-8 is
+/// `:utf8-error`, as for every other string operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return .{ .state = switch (coll.kind()) {
         .nil => .empty,
@@ -5286,8 +5289,8 @@ const view_min = 4;
 /// there on is written into the slots of the vector's open tail
 /// (`vector.openTailInPlace`), which the collector reaches through the
 /// transient. A long result is so built where it ends up, never first
-/// as a buffer on the root stack, and a short one is built at the end
-/// as before.
+/// as a buffer on the root stack; a short one is built at the end from
+/// the scope.
 const Results = struct {
     vm: *VM,
     heap: *heap_mod.Heap,

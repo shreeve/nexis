@@ -42,7 +42,7 @@ loader's diagnostic.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%push-out` / `#%pop-out` (`with-out-str`, §6) |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6) |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -109,7 +109,7 @@ string function panics on one.
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
 | `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
-| `compare` | 2 | Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6) | — |
+| `compare` | 2 | -1, 0 or 1. Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6). Only the sign is the contract: Clojure's `compare` of two strings is `String.compareTo`'s difference (`(compare "B" "a")` is -31 there, -1 here) | — |
 
 **`format`.** `(format fmt & args)` is a subset of Java's
 `Formatter`, as Clojure's `format` uses it. `fmt` is text with
