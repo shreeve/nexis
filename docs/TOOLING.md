@@ -282,8 +282,9 @@ the private helpers.
   `thrown?` with a keyword tag is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
-  `nexis.test`: `(is (= a 1))` is six instructions, the helper, the
-  form, the two values, the message and the call.
+  `nexis.test`: `(is (= a 1))` as a function's body is seven
+  instructions, the helper, the form, the two values, the message, the
+  call and the return (COMPILER.md §4.8).
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
 - `(run-tests)` runs the current namespace's tests in definition

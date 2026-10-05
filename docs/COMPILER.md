@@ -360,7 +360,7 @@ reported at the instruction that raised it.
 Instructions `bin/nexis disasm` lists for each form as the whole body
 of `(defn f [a b c m xs] ...)`, its return included (a value in the
 tail is returned in place, §5.5); `g` and `h` are Vars, `pm` a
-protocol method. `test/prop/compile.zig` pins a set of such shapes.
+protocol method. `test/prop/compile.zig` pins every row.
 
 | Form | Instructions |
 |---|---:|
@@ -372,9 +372,9 @@ protocol method. `test/prop/compile.zig` pins a set of such shapes.
 | `(is (= 1 (inc (dec a))))` | 8 |
 | `(is (pos? a))` | 8 |
 | `(is (thrown? :x (g a)))` | 16 |
-| `(let [[x y & r] xs] (g x y r))` | 21 |
-| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))` | 15 |
-| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 20 |
+| `(let [[x y & r] xs] (g x y r))` | 20 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments (MACROEXPAND.md §10) | 24 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 29 |
 | `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
 | `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
 | `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |

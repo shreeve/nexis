@@ -699,7 +699,7 @@ fn fnCodeLen(program: *harness.Program, src: []const u8) !usize {
     return compiled.capture_descs[0].routine.code.len;
 }
 
-test "codegen: what common shapes cost (COMPILER.md §4.4)" {
+test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
     var program: harness.Program = undefined;
     try program.init();
     defer program.deinit();
@@ -751,6 +751,57 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
             return err;
         };
     }
+}
+
+test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(defn g [& _] 1) (defn h [& _] 1) (defprotocol P (pm [x]))");
+    // Each the whole body of `(fn* [a b c m xs] ...)`, or of the
+    // closure it makes when `inner`.
+    const Row = struct { form: []const u8, len: usize, inner: bool = false };
+    const rows = [_]Row{
+        .{ .form = "(g (h a) (h b) (h c))", .len = 12 },
+        .{ .form = "(g a b c)", .len = 6 },
+        .{ .form = "(str \"a\" a \"b\" b)", .len = 7 },
+        .{ .form = "{:a (inc a) :b (g b) :c c}", .len = 10 },
+        .{ .form = "(pm a)", .len = 4 },
+        .{ .form = "(:x a)", .len = 4 },
+        .{ .form = "(nexis.test/is (= 1 (inc (dec a))))", .len = 8 },
+        .{ .form = "(nexis.test/is (pos? a))", .len = 8 },
+        .{ .form = "(nexis.test/is (thrown? :x (g a)))", .len = 16 },
+        .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
+        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 24 },
+        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 29, .inner = true },
+        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
+        .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },
+        .{ .form = "(case a :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)", .len = 46 },
+        .{ .form = "(condp = a 1 :a 2 :b 3 :c :d)", .len = 20 },
+        .{ .form = "(when-let [x (g a)] (h x))", .len = 9 },
+        .{ .form = "(if-let [x (g a)] (h x) (h b))", .len = 12 },
+        .{ .form = "(and (h a) (h b) (h c))", .len = 14 },
+        .{ .form = "(-> a (g b) (h) (g c))", .len = 10 },
+        .{ .form = "(doseq [x xs] (g x))", .len = 15 },
+        .{ .form = "(for [x xs] (h x))", .len = 24 },
+        .{ .form = "(dotimes [i a] (g i))", .len = 9 },
+        .{ .form = "(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))", .len = 9 },
+        .{ .form = "(try (g a) (catch :x e (h e)) (finally (g b)))", .len = 22 },
+        .{ .form = "(assert (pos? a) \"a must be positive\")", .len = 10 },
+    };
+    var failed = false;
+    for (rows) |row| {
+        const src = try testing.allocator.print("(fn* [a b c m xs] {s})", .{row.form});
+        defer testing.allocator.free(src);
+        const compiled = try compileIn(&program, src);
+        var routine = compiled.capture_descs[0].routine;
+        if (row.inner) routine = routine.capture_descs[0].routine;
+        if (routine.code.len != row.len) {
+            std.debug.print("\n  {s}: {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, routine.code.len, row.len });
+            failed = true;
+        }
+    }
+    try testing.expect(!failed);
 }
 
 test "slots: a routine's frame holds what is live at once, not every temporary it ever used" {
