@@ -40,6 +40,12 @@ These build cleanly and misbehave at run time.
   stack.
 - **A slice from `Writer.Allocating.written()` dies at the next
   write.** Copy it, or take `toOwnedSlice()`, before writing again.
+- **A run step inherits the caller's environment unhashed.** A
+  variable the program reads that the build did not set on the step
+  is not part of its cache key, so a result made under one value
+  replays under another. The build gives every cached run of a
+  binary it builds an empty environment (`build.zig` `RunEnv.apply`)
+  and sets what the run needs on the step.
 
 ---
 

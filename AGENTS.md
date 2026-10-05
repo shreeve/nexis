@@ -73,7 +73,9 @@ changes to emdb.
   syncs (`docs/DB.md` §3.3; `commit`, no sync, when unset);
   `zig build test -Ddurability=durable` runs the gate with every
   commit synced. The build never reads its own environment: these
-  options set the variables on each run, as part of its cache key.
+  options set the variables on each run, as part of its cache key,
+  and every cached run starts from an empty environment, so a
+  variable exported in the shell never reaches a test.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
 

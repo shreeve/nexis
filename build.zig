@@ -297,13 +297,9 @@ const Scripts = struct {
     update: bool,
     env: RunEnv,
 
-    /// A run of bin/nexis with an environment of its own: empty but
-    /// for what `env` sets, with `NEXIS_GC_STRESS` when `stress`.
-    /// Nothing else in the caller's environment reaches the program
-    /// or its cache key.
+    /// A run of bin/nexis, with `NEXIS_GC_STRESS` when `stress`.
     fn program(self: Scripts, stress: bool) *std.Build.Step.Run {
         const r = self.b.addRunArtifact(self.exe);
-        r.clearEnvironment();
         self.env.apply(r, stress);
         return r;
     }
@@ -373,11 +369,13 @@ const Scripts = struct {
     }
 };
 
-/// The runtime environment the build gives the tests and programs it
-/// runs, from its options. The build reads nothing from its own
-/// environment: a variable set on a step is part of the step's cache
-/// key, so a stressed or durable run never replays a normal run's
-/// result.
+/// The environment of every cached run of a binary the build makes,
+/// from its options. The build reads nothing from its own
+/// environment, and none of the caller's reaches a run: the runtime
+/// reads its variables with `getenv`, and an inherited variable is not
+/// part of a run's cache key, so a run would replay a result made
+/// under another setting. A variable set on a run is part of its key,
+/// so a stressed or durable run never replays a normal run's result.
 const RunEnv = struct {
     /// `NEXIS_GC_STRESS`: a collection every few kilobytes (docs/GC.md §7).
     gc_stress: bool,
@@ -387,8 +385,10 @@ const RunEnv = struct {
 
     const Durability = enum { commit, durable };
 
-    /// Set the variables on `run`, `NEXIS_GC_STRESS` when `stress`.
+    /// Give `run` an empty environment, then the variables,
+    /// `NEXIS_GC_STRESS` when `stress`.
     fn apply(env: RunEnv, run: *std.Build.Step.Run, stress: bool) void {
+        run.clearEnvironment();
         if (stress) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
         if (env.durability) |d| run.setEnvironmentVariable("NEXIS_DURABILITY", @tagName(d));
     }
