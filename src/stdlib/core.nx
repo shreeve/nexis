@@ -332,10 +332,15 @@
            (first ks)
            (assoc-in (get m (first ks)) (rest ks) v))))
 
-; (update-in m [k1 k2 ...] f & args) → assoc-in over the
-; result of applying f to the current value.
+; (update-in m [k1 k2 ...] f & args) → m with the value at the path
+; replaced by (apply f value args), walking the path once; an empty
+; path is the one key nil, as Clojure's.
 (defn update-in [m ks f & args]
-  (assoc-in m ks (apply f (cons (get-in m ks) args))))
+  (let* [k (first ks)
+         more (next ks)]
+    (assoc m k (if more
+                 (apply update-in (get m k) more f args)
+                 (apply f (get m k) args)))))
 
 ; ---- sequence breakdown helpers ----
 
@@ -590,8 +595,8 @@
   [(take-while pred coll) (drop-while pred coll)])
 
 ; (distinct? x & xs) → whether no two arguments are equal.
-(defn distinct? [& xs]
-  (= (count xs) (count (set xs))))
+(defn distinct? [x & xs]
+  (= (inc (count xs)) (count (set (cons x xs)))))
 
 ; (tree-seq branch? children root) → the nodes of the tree under root,
 ; depth first, each before its children; an explicit stack, so the

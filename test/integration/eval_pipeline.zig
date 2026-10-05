@@ -1423,7 +1423,9 @@ test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, s
     // are (), take-last of nothing nil; nthrest that drops nothing is
     // coll itself, while drop is always a seq.
     try expectOutput("[(partition-by odd? []) (partition-by odd? nil) (dedupe []) (dedupe nil) (take-last 0 [1 2]) (take-last 2 nil) (take-last 2 []) (take-last 5 [1 2])]", "[() () () () nil nil nil (1 2)]");
-    try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil [] () (2) (1 2) () () (1) (1 2)]");
+    try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil () () (2) (1 2) () () (1) (1 2)]");
+    // As Clojure's: distinct? takes one argument or more.
+    try expectOutput("(try (distinct?) (catch any e e))", ":arity-mismatch");
     try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
     try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (second (list 1 2 3))]", "[1 2 (3) nil 2]");
 }
@@ -4227,6 +4229,11 @@ test "core.nx: merge / update / get-in / assoc-in / update-in" {
     try expectOutputProgram(
         \\(update-in {:a {:b 1}} [:a :b] inc)
     , "{:a {:b 2}}");
+    // An empty path is the one key nil, as Clojure's up; extra
+    // arguments follow the value.
+    try expectOutputProgram(
+        \\[(update-in {} [] identity) (update-in {:a 1} [] assoc :b 2) (update-in {:a {:b 1}} [:a :b] + 10 100) (update-in nil [:a :b] conj 1)]
+    , "[{nil nil} {:a 1, nil {:b 2}} {:a {:b 111}} {:a {:b (1)}}]");
 }
 
 test "core.nx: frequencies / group-by / interpose" {

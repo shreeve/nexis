@@ -345,7 +345,8 @@ Two sequence rules follow Clojure and are easy to get backwards:
   (`(flatten [1 nil [2]])` is `(1 nil 2)`); a non-sequential argument
   (a number, a string, a map, nil) flattens to `()`.
 - A negative count means zero: `(nthrest xs -1)` is `xs` itself (as
-  is `(nthrest xs 0)`, and `(nthrest [] 1)` is `[]`), `(split-at -1
+  is `(nthrest xs 0)`; a vector past its end is `()`, as Clojure 1.12's
+  `IDrop` path makes it: `(nthrest [] 1)` is `()`), `(split-at -1
   xs)` is `[() xs]`, `(take-last -1 xs)` is nil as any `take-last` of
   nothing is, and `(drop -1 xs)`, `(repeat -1 x)` and `(repeatedly -1
   f)` are seqs, `()` when empty.
