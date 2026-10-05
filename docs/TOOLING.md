@@ -12,12 +12,12 @@ samples are the committed goldens under `test/golden/cli/`, which
 | Command | What it does |
 |---|---|
 | `nexis run FILE [ARG...]` | Runs FILE's top-level forms in order and prints only what the program prints. FILE `-` reads the program from stdin (reported as `<stdin>`). |
-| `nexis FILE.nx [ARG...]`, `nexis - [ARG...]` | The same as `run`. |
+| `nexis FILE [ARG...]`, `nexis - [ARG...]` | The same as `run`, for a FILE that ends `.nx` or names an existing file (a `#!` script needs no suffix). |
 | `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms (reported as `<-e>`) and prints each value that is not nil, as `prn` does. |
 | `nexis repl` | The read-eval-print loop below. |
 | `nexis test FILE...` | Reads every file (one that cannot be read stops it before any runs, exit 2), runs each (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. A file's own definitions cannot change the exit status. `require` searches the working directory, then each file's directory. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
-| `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, or a command missing its FILE, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
+| `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm` or `--help` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 
 Every command evaluates through `Loader.evalSource`: parse and read
 every top-level form, then compile and run each before compiling the
@@ -38,12 +38,24 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 | 2 | the file could not be read (`nexis: failed to read 'PATH': ErrorName`) |
 | 3 | parse or reader error |
 | 4 | compile error |
-| 5 | runtime error that no `try` caught |
+| 5 | runtime error that no `try` caught; an error of the command itself, such as output it cannot write or memory to boot (`nexis: runtime error: ErrorName`) |
 | n | `(exit n)` |
 
 However a command ends, through its normal end, `exit` or an error it
 reports, every store file a commit left unsynced is synced once first
 (`docs/DB.md` §3.3).
+
+**A closed pipe.** When what reads the command's stdout closes it (`nexis
+-e '(range 100000)' | head`), the value, disassembly, usage text or
+prompt being written goes nowhere and the command ends there, with no
+report and exit 0, as a JVM Clojure program's does.
+
+**The runtime's stack.** The runtime runs on a thread with a 1 GiB
+stack reservation, committed only as it is touched (`docs/VM.md`
+§13.1). A host that refuses that much (strict overcommit, a small
+memory limit) gets the largest half of it it grants, down to 64 MiB,
+and below that the main thread's own stack; the stack guard is armed
+for whichever runs, so only the depth a program can reach shrinks.
 
 **Environment.** `NEXIS_DURABILITY` is the durability of every store
 connection that names none: `commit` (the default: a commit syncs
@@ -51,7 +63,9 @@ nothing, and the file is synced at close, `sync` and the end of the
 program) or `durable` (every commit syncs); `docs/DB.md` §3.3. Any
 other value stops the command before it runs with `nexis:
 NEXIS_DURABILITY is not commit or durable`, exit 1.
-`NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7.
+`NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7, and
+any value but `1` stops the command with `nexis: NEXIS_GC_STRESS is
+not 1`, exit 1.
 
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,

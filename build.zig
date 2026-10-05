@@ -273,7 +273,10 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
             .{ .args = &.{ "test", cli ++ "test-shadow.nx", cli ++ "lib/test-beside.nx" }, .stdout = "test-shadow.out", .exit_code = 1 },
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
+            .{ .args = &.{ "-e", "1" }, .stderr = "boot-out-of-memory.err", .exit_code = 5, .max_alloc = "4096" },
+            .{ .args = &.{cli ++ "script"}, .stdout = "script.out" },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
+            .{ .args = &.{ "repl", "x" }, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
         };
