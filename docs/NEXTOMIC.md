@@ -574,7 +574,8 @@ walk of the clauses around it; clauses nested past the native stack
 guard first are the catchable `:stack-overflow`. The IR
 is pure syntax, so it is cached per VM by query value (a hit is the
 same value, or one `=` to it with lists and vectors told apart at every
-depth) and reused across every db and basis; the rule set bound to `%`
+depth, set elements and map keys included, and floats by their bits, so
+`0.0` and `-0.0` parse apart) and reused across every db and basis; the rule set bound to `%`
 is cached the same way. A parse borrows from its query, so the VM's
 root walk marks every query value a cache holds (`docs/GC.md` §3); each
 cache holds at most 128 parses, and on a miss replaces the least recently used one no

@@ -893,13 +893,16 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
 }
 
 /// `=` over query values with lists and vectors told apart at every
-/// depth: `[?e :a (:b 1)]` and `[?e :a [:b 1]]` are equal as data but
-/// parse to different clauses. Anything that is not a list, vector or
-/// map compares by `=`.
+/// depth, and floats by their bits: `[?e :a (:b 1)]` and `[?e :a [:b
+/// 1]]` are equal as data but parse to different clauses, as do `0.0`
+/// and `-0.0`. A set element or a map key that is itself a collection
+/// or a float is matched against the other value's own elements and
+/// keys the same way. Anything else compares by `=`.
 fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
     try stack.check();
     if (a.kind() != b.kind()) return false;
     switch (a.kind()) {
+        .float => return @as(u64, @bitCast(a.asFloat())) == @as(u64, @bitCast(b.asFloat())),
         .persistent_vector => {
             const n = vector_mod.count(a);
             if (n != vector_mod.count(b)) return false;
@@ -919,10 +922,27 @@ fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
         .persistent_map => {
             if (champ.mapCount(a) != champ.mapCount(b)) return false;
             var it = champ.mapIter(a);
-            while (it.next()) |e| switch (champ.mapGet(b, e.key, &dispatch.hashValue, &dispatch.equal)) {
-                .absent => return false,
-                .present => |v| if (!try sameShape(e.value, v)) return false,
-            };
+            while (it.next()) |e| {
+                const found = champ.mapFind(b, e.key, &dispatch.hashValue, &dispatch.equal) orelse return false;
+                if (!try sameShape(e.key, found.key) or !try sameShape(e.value, found.value)) return false;
+            }
+            return true;
+        },
+        .persistent_set => {
+            if (champ.setCount(a) != champ.setCount(b)) return false;
+            var it = champ.setIter(a);
+            elems: while (it.next()) |x| {
+                switch (x.kind()) {
+                    .float, .persistent_vector, .list, .persistent_map, .persistent_set => {},
+                    else => {
+                        if (!champ.setContains(b, x, &dispatch.hashValue, &dispatch.equal)) return false;
+                        continue;
+                    },
+                }
+                var jt = champ.setIter(b);
+                while (jt.next()) |y| if (try sameShape(x, y)) continue :elems;
+                return false;
+            }
             return true;
         },
         else => return dispatch.equal(a, b),
@@ -1306,6 +1326,51 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     try testing.expect(pv.where[0].pattern.v.constant == .lookup);
     cache.release(pl);
     cache.release(pv);
+}
+
+test "the cache tells apart values = conflates: -0.0, and lists from vectors in set elements and map keys" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    const set = struct {
+        fn of(h: *heap_mod.Heap, items: []const Value) Value {
+            return champ.setFromElements(h, items, &dispatch.hashValue, &dispatch.equal) catch unreachable;
+        }
+    };
+    try testing.expect(!try sameShape(value.fromFloat(0.0), value.fromFloat(-0.0)));
+    try testing.expect(try sameShape(value.fromFloat(1.5), value.fromFloat(1.5)));
+    const sv = set.of(&heap, &.{ b.vec(&.{ b.int(1), b.int(2) }), b.int(3) });
+    const sl = set.of(&heap, &.{ b.lst(&.{ b.int(1), b.int(2) }), b.int(3) });
+    try testing.expect(dispatch.equal(sv, sl));
+    try testing.expect(!try sameShape(sv, sl));
+    try testing.expect(try sameShape(sv, set.of(&heap, &.{ b.int(3), b.vec(&.{ b.int(1), b.int(2) }) })));
+    const mv = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), b.vec(&.{b.int(1)}), b.kw("a"), &dispatch.hashValue, &dispatch.equal);
+    const ml = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), b.lst(&.{b.int(1)}), b.kw("a"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expect(dispatch.equal(mv, ml));
+    try testing.expect(!try sameShape(mv, ml));
+
+    // Through the cache: each spelling gets its own parse.
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+    var diag: Diag = .{};
+    const ground = struct {
+        fn q(bb: Builder, x: Value) Value {
+            return bb.vec(&.{ bb.kw("find"), bb.sym("?x"), bb.kw("where"), bb.vec(&.{ bb.lst(&.{ bb.sym("ground"), x }), bb.sym("?x") }) });
+        }
+    };
+    const pos = try cache.acquire(&interner, ground.q(b, value.fromFloat(0.0)), &diag);
+    defer cache.release(pos);
+    const neg = try cache.acquire(&interner, ground.q(b, value.fromFloat(-0.0)), &diag);
+    defer cache.release(neg);
+    try testing.expect(pos != neg);
+    try testing.expect(std.math.signbit(neg.where[0].bind.call.args[0].constant.double));
+    const qs = try cache.acquire(&interner, ground.q(b, sv), &diag);
+    defer cache.release(qs);
+    const ql = try cache.acquire(&interner, ground.q(b, sl), &diag);
+    defer cache.release(ql);
+    try testing.expect(qs != ql);
 }
 
 test "clauses nested past the stack guard are StackOverflow" {
