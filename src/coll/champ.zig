@@ -314,7 +314,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         fn newRoot(heap: *Heap, n: usize, node: *HeapHeader) !Value {
             const h = try heap.alloc(kind, @sizeOf(RootBody));
-            headerOf(RootBody, h).* = .{ .count = @intCast(n), ._pad = 0, .root_node = node };
+            headerOf(RootBody, h).* = .{ .count = std.math.cast(u32, n) orelse return error.OutOfMemory, ._pad = 0, .root_node = node };
             return valueOf(h, subkind_champ_root);
         }
 
@@ -424,7 +424,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             var added = false;
             const node = try insertIn(heap, root.root_node, p, indexHashOf(keyOf(p), elementHash), 0, elementHash, elementEq, &added);
             if (node == root.root_node) return v;
-            return newRoot(heap, root.count + @intFromBool(added), node);
+            return newRoot(heap, @as(usize, root.count) + @intFromBool(added), node);
         }
 
         /// `node` (reached at `shift`) with `p` stored; `node` itself
@@ -728,6 +728,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         fn put(heap: *Heap, root: *HeapHeader, spot_in: Spot, p: P, edit: u32) !*HeapHeader {
             var spot = spot_in;
             const array = spot.len == 0;
+            if (!array and spot.at != .present and headerOf(RootBody, root).count == std.math.maxInt(u32)) return error.OutOfMemory;
             switch (spot.at) {
                 .present => {
                     if (sameValue(spot.old, p)) return root;
@@ -1695,6 +1696,25 @@ test "promotion: count 8 stays array-map, count 9 promotes to CHAMP" {
         .present => |v| try testing.expectEqual(@as(i64, 100), v.asFixnum()),
         .absent => try testing.expect(false),
     }
+}
+
+test "a map or set at its largest count refuses a new key as out of memory, and takes a present one" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // A root's count field set to the bound: building one that size
+    // takes 128 GiB.
+    var m = try mapEmpty(&heap);
+    for (0..9) |i| m = try mapAssoc(&heap, m, value.testKeyword(@intCast(i)), value.nilValue(), &synthHash, &synthEq);
+    headerOf(RootBody, Heap.asHeapHeader(m)).count = std.math.maxInt(u32);
+    try testing.expectError(error.OutOfMemory, mapAssoc(&heap, m, value.testKeyword(100), value.nilValue(), &synthHash, &synthEq));
+    _ = try mapAssoc(&heap, m, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
+    const root = try copyRoot(&heap, Heap.asHeapHeader(m));
+    const spot = mapLocate(valueFromMapHeader(root), value.testKeyword(100), &synthHash, &synthEq);
+    try testing.expectError(error.OutOfMemory, mapPut(&heap, root, spot, value.testKeyword(100), value.nilValue(), 1));
+    var s = try setEmpty(&heap);
+    for (0..9) |i| s = try setConj(&heap, s, value.testKeyword(@intCast(i)), &synthHash, &synthEq);
+    headerOf(RootBody, Heap.asHeapHeader(s)).count = std.math.maxInt(u32);
+    try testing.expectError(error.OutOfMemory, setConj(&heap, s, value.testKeyword(100), &synthHash, &synthEq));
 }
 
 test "promotion: duplicate assoc at count 8 does NOT promote" {

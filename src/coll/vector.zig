@@ -44,6 +44,10 @@ pub const branch_mask: u32 = @as(u32, branch_factor) - 1; // 0x1F
 
 pub const subkind_root: u16 = 1;
 
+/// The most elements a vector holds: its count is a `u32` (VECTOR.md
+/// §3). An update past it fails as out of memory, which it would be.
+pub const max_count: u32 = std.math.maxInt(u32);
+
 // =============================================================================
 // Body layouts
 //
@@ -242,6 +246,7 @@ pub fn empty(heap: *Heap) !Value {
 pub fn conj(heap: *Heap, v: Value, elem: Value) !Value {
     const src_h = rootHeader(v);
     const src = rootBody(src_h);
+    if (src.count == max_count) return error.OutOfMemory;
 
     // Path (a): tail has room → grow tail by 1.
     if (src.tail_len < branch_factor) {
@@ -484,6 +489,7 @@ pub fn copyRoot(heap: *Heap, src: *HeapHeader) !*HeapHeader {
 /// Append `elem` to the vector rooted at `root`, which the edit owns.
 pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void {
     const body = rootBody(root);
+    if (body.count == max_count) return error.OutOfMemory;
     if (body.tail_len < branch_factor) {
         // An owned tail with room takes the element; else an owned copy
         // with room to grow, as `conj` sizes one (VECTOR.md §2).
@@ -510,6 +516,7 @@ pub fn conjInPlace(heap: *Heap, root: *HeapHeader, elem: Value, edit: u32) !void
 pub fn openTailInPlace(heap: *Heap, root: *HeapHeader, edit: u32) !*[branch_factor]Value {
     const body = rootBody(root);
     std.debug.assert(body.tail_len == branch_factor);
+    if (body.count > max_count - branch_factor) return error.OutOfMemory;
     const tail = try ownedTail(heap, &.{}, branch_factor, edit);
     try startTailInPlace(heap, body, tail, branch_factor, edit);
     return leafValues(tail);
@@ -650,7 +657,7 @@ fn popTailInPlace(heap: *Heap, node: *HeapHeader, level_shift: u32, last: usize,
 /// left fold of `conj` produces.
 pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
     if (elems.len == 0) return empty(heap);
-    const n = std.math.cast(u32, elems.len) orelse return error.Overflow;
+    const n = std.math.cast(u32, elems.len) orelse return error.OutOfMemory;
     const tail_offset: u32 = (n - 1) & ~branch_mask;
     const tail = try allocTail(heap, n - tail_offset);
     @memcpy(tailValues(tail, n - tail_offset), elems[tail_offset..]);
@@ -1167,6 +1174,22 @@ test "immutability: conj on a vector does not mutate the source" {
     try testing.expectEqual(@as(i64, 1), nth(a, 0).asFixnum());
     try testing.expectEqual(@as(i64, 2), nth(a, 1).asFixnum());
     try testing.expectEqual(@as(i64, 3), nth(a, 2).asFixnum());
+}
+
+test "a vector at its largest count refuses another element as out of memory, unchanged" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // A vector's count field set to the bound: building one that size
+    // takes 64 GiB.
+    const v = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
+    rootBody(rootHeader(v)).count = max_count;
+    try testing.expectError(error.OutOfMemory, conj(&heap, v, value.nilValue()));
+    const root = try copyRoot(&heap, rootHeader(v));
+    try testing.expectError(error.OutOfMemory, conjInPlace(&heap, root, value.nilValue(), 1));
+    rootBody(root).count = max_count - 31;
+    rootBody(root).tail_len = branch_factor;
+    try testing.expectError(error.OutOfMemory, openTailInPlace(&heap, root, 1));
+    try testing.expectEqual(max_count - 31, rootBody(root).count);
 }
 
 test "equalSeq: reflexive and symmetric across distinct allocations" {

@@ -120,7 +120,10 @@ order.
 *HeapHeader` (always an interior); 16 bytes. `root_node` is never null:
 an empty collection is an array form (§5.6). The root's count makes
 `count` O(1) without per-node counts; `assoc` reports through its
-recursion whether it added a key.
+recursion whether it added a key. A map or set holds at most 2³² − 1
+keys, the most the field holds: adding a key past it, persistent or in
+place, fails with `error.OutOfMemory` (out of memory to the language)
+and changes nothing.
 
 #### 4.3 Interior node
 
