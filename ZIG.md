@@ -26,10 +26,13 @@ These build cleanly and misbehave at run time.
   count and logs each leak as an error, which fails a test.
 - **`std.Io.Threaded.global_single_threaded` has a failing
   allocator.** Its `Io` suits leaf syscalls only: any operation that
-  allocates returns `error.OutOfMemory`. The tree uses it for one
-  thing, entropy for a store's UUID (`src/nextomic/store.zig`:
-  `global_single_threaded.io().random(&buf)`). Everything else gets
-  the real `io` threaded from `main`.
+  allocates returns `error.OutOfMemory`. The tree uses it in two
+  places: entropy for a store's UUID (`src/nextomic/store.zig`:
+  `global_single_threaded.io().random(&buf)`), and the `Io` of the
+  natives that read a clock or the file system when the host gave the
+  VM none, as the test harness does (`src/stdlib.zig` `ioOf`: the
+  `rand` seed, `nano-time`, `slurp`, `spit`, `db/open`). Everything
+  else gets the real `io` threaded from `main`.
 - **The native stack is finite and nothing checks it for you.** A
   Zig recursion on user-controlled depth segfaults when it runs out.
   Every such function calls `try stack.check()` on entry
@@ -40,6 +43,10 @@ These build cleanly and misbehave at run time.
   stack.
 - **A slice from `Writer.Allocating.written()` dies at the next
   write.** Copy it, or take `toOwnedSlice()`, before writing again.
+- **`zig build` replays a cached run.** A step whose inputs are
+  unchanged runs nothing: a second gate on the same tree prints no
+  test counts. The count of record comes from a run that ran: a
+  changed input, or `--cache-dir` naming an empty directory.
 - **A run step inherits the caller's environment unhashed.** A
   variable the program reads that the build did not set on the step
   is not part of its cache key, so a result made under one value
@@ -51,9 +58,10 @@ These build cleanly and misbehave at run time.
 
 ## 2. Program entry and `io`
 
-- `src/cli.zig`, `src/golden.zig` and `bench/main.zig` start with
-  `pub fn main(init: std.process.Init) !void`, which carries `gpa`,
-  `io`, `arena` (process lifetime), `environ_map` and `minimal.args`.
+- `src/cli.zig` starts with `pub fn main(init: std.process.Init) !void`,
+  `src/golden.zig` and `bench/main.zig` with `!u8` (the exit status);
+  `init` carries `gpa`, `io`, `arena` (process lifetime),
+  `environ_map` and `minimal.args`.
 - The CLI spawns the runtime thread with
   `std.Thread.spawn(.{ .stack_size = 1 << 30 }, runtimeThread, .{ init, &result })`
   and joins it; `init` is passed by value.
@@ -73,8 +81,9 @@ nothing else.
 
 | Need | Call | Where |
 |---|---|---|
-| monotonic and wall clocks | `var ts: std.c.timespec = undefined; _ = std.c.clock_gettime(.MONOTONIC, &ts);` (`.REALTIME` for wall time) | `src/bench.zig`, `src/nextomic/store.zig`, `src/nextomic/query/exec.zig`, `bench/main.zig` |
+| monotonic and wall clocks | `var ts: std.c.timespec = undefined; _ = std.c.clock_gettime(.MONOTONIC, &ts);` (`.REALTIME` for wall time) | `src/bench.zig`, `src/nextomic/store.zig`, `src/nextomic/query/exec.zig` |
 | an environment variable | `std.c.getenv("NEXIS_GC_STRESS") != null` | `src/vm.zig`, `src/db.zig`, `bench/main.zig` |
+| the process id | `std.c.getpid()` | `bench/main.zig` |
 | unlink a file | `_ = std.c.unlink(path.ptr)` (a sentinel-terminated path) | `bench/main.zig` |
 
 ---

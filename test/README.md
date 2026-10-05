@@ -56,5 +56,13 @@ every build.
 loop (the `unit` binary, the compile and Nextomic property tests, the
 `eval_pipeline`, `runtime_polish` and `numbers` suites) and
 `zig build test --summary all` the gate, whose summary line
-(`HANDOFF.md` §2) is the count of record. Each property and
-integration file is its own binary, so they run in parallel.
+(`HANDOFF.md` §2) is the count of record; a run whose inputs are all
+unchanged replays from the cache and counts no tests, so the count
+comes from a run that ran (`--cache-dir` naming an empty directory).
+Each property and integration file is its own binary, so they run in
+parallel.
+
+To run one binary by hand, `zig build quick --verbose` (or `test`)
+prints each one's `zig test ... --listen=-` command; replace
+`--listen=-` with `--test-no-exec -femit-bin=PATH`, then run PATH from
+the build root, where the tests expect `.zig-cache/tmp/`.
