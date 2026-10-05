@@ -114,7 +114,7 @@ pub fn format(
             try writer.print("{s}", .{it.symbolName(id)});
         },
         .char => try formatChar(v.asChar(), mode, writer),
-        .string => try formatString(v, mode, writer),
+        .string => try formatString(string_mod.asBytes(v), mode, writer),
         .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
             stack.check() catch {
                 dispatch.noteOverflow();
@@ -154,7 +154,11 @@ pub fn format(
         ),
         .durable_ref => try formatDurableRef(v, writer, interner),
         .db_connection => try writer.writeAll("#<db-connection>"),
-        .nextomic_conn => try nextomic_handle.formatConn(v, writer),
+        // The path as a string literal, escaped, in both modes.
+        .nextomic_conn => {
+            try writer.writeAll("#nextomic/conn ");
+            try formatString(nextomic_handle.connPath(v), .readable, writer);
+        },
         .nextomic_db => try nextomic_handle.formatDb(v, writer),
         .nextomic_entity => try nextomic_handle.formatEntity(v, writer),
         .db_write_txn => try writer.writeAll("#<db-write-txn>"),
@@ -237,8 +241,7 @@ pub fn formatFloatJava(f: f64, writer: *std.Io.Writer) Error!void {
     if (std.mem.findScalar(u8, text, '.') == null) try writer.writeAll(".0");
 }
 
-fn formatString(v: Value, mode: FormatMode, writer: *std.Io.Writer) Error!void {
-    const bytes = string_mod.asBytes(v);
+fn formatString(bytes: []const u8, mode: FormatMode, writer: *std.Io.Writer) Error!void {
     if (mode == .display) {
         // Display: raw byte view. Storage is byte-blob (STRING.md §2),
         // so invalid-UTF-8 strings round-trip unchanged. This is the

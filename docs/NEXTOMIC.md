@@ -914,7 +914,9 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 | `(d/sync conn)` | nil once every commit to the file is durable: one full sync (`Env.sync`) when a commit left it unsynced, nothing otherwise |
 | `(d/with-conn [c path opts?] body...)` | macro: connect for the extent of body; released on every exit, a throw keeps propagating |
 
-A connection prints as `#nextomic/conn "path"`, a db-value as
+A connection prints as `#nextomic/conn "path"`, the path a string
+literal as `pr` prints one (a quote or newline in it escaped), a
+db-value as
 `#nextomic/db {:basis-t 7 :mode :current}` (`:as-of`, `:since`,
 `:history` with their bounds), an entity as `#nextomic/entity {:db/id
 4294967296}`: the eid alone, since the attributes are read on access

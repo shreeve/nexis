@@ -1777,6 +1777,15 @@ test "integration: identity kinds are = only to themselves, and two of them hash
     , "[true true true true false true true]");
 }
 
+test "nextomic: a connection prints its path as a string literal" {
+    try expectOutputProgramWithStore("conn-print",
+        \\(def c (nextomic/connect "@STORE@\"q\ny"))
+        \\(def printed [(pr-str c) (str c)])
+        \\(nextomic/release c)
+        \\(let [p (str "#nextomic/conn " (pr-str "@STORE@\"q\ny"))] (= printed [p p]))
+    , "true");
+}
+
 test "integration: delay, force, realized?, delay?" {
     try expectOutput("(let [n (atom 0) d (delay (swap! n inc) :v)] [(realized? d) (delay? d) @d (realized? d) (force d) @d @n (force 3) (delay? 1)])", "[false true :v true :v :v 1 3 false]");
     // A throw is cached: the body runs once and every deref rethrows it.

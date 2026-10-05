@@ -87,12 +87,6 @@ pub fn connPath(v: Value) []const u8 {
     return connPathBytes(Heap.asHeapHeader(v));
 }
 
-pub fn formatConn(v: Value, writer: *std.Io.Writer) !void {
-    try writer.writeAll("#nextomic/conn \"");
-    try writer.writeAll(connPath(v));
-    try writer.writeByte('"');
-}
-
 // =============================================================================
 // Db-value
 // =============================================================================
@@ -366,10 +360,6 @@ test "conn box keeps its path; two boxes are two identities" {
     try testing.expectEqual(@as(u64, 3), connGen(b));
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&target)), connPtr(a));
     try testing.expect(Heap.asHeapHeader(a) != Heap.asHeapHeader(b));
-    var buf: [64]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try formatConn(a, &w);
-    try testing.expectEqualStrings("#nextomic/conn \"/tmp/a.edb\"", w.buffered());
 }
 
 test "db box round trips its shape, compares structurally and prints its mode" {
