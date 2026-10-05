@@ -54,7 +54,8 @@ it.
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
 `(...)`, is `=` to and hashes as the list of the same elements, can be
 the tail of a cons (`(cons 0 (rest v))`), and the codec encodes it as a
-list (decoding gives cons cells).
+list. Decoding builds a list as the sequence natives do: four or more
+elements are a view of a vector, fewer are cons cells.
 
 **No empty singleton.** Every `empty(heap)` allocates a fresh block.
 Two empty lists are `=`; `identical?` tells them apart by address.

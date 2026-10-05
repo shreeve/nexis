@@ -164,6 +164,23 @@ pub fn fromF64Slice(heap: *Heap, elems: []const f64) !Value {
     return valueFrom(h, .f64);
 }
 
+/// A typed vector of `elem` whose elements are `raw`, 8 little-endian
+/// bytes each (the codec's payload, CODEC.md §3), every NaN
+/// canonicalized.
+pub fn fromLeBytes(heap: *Heap, elem: ElemType, raw: []const u8) !Value {
+    std.debug.assert(raw.len % elem_size == 0);
+    const h = try alloc(heap, elem, raw.len / elem_size);
+    switch (elem) {
+        .i64 => for (i64Slice(h), 0..) |*slot, i| {
+            slot.* = std.mem.readInt(i64, raw[i * elem_size ..][0..elem_size], .little);
+        },
+        .f64 => for (f64Slice(h), 0..) |*slot, i| {
+            slot.* = hash_mod.canonicalizeFloat(@bitCast(std.mem.readInt(u64, raw[i * elem_size ..][0..elem_size], .little)));
+        },
+    }
+    return valueFrom(h, elem);
+}
+
 // =============================================================================
 // Public API — accessors
 // =============================================================================
