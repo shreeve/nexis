@@ -9,8 +9,8 @@
 //! Responsibilities:
 //!   - `StoreFile`: the one `emdb.Env` of a store file in this
 //!     process, shared by every connection and Nextomic store of it.
-//!   - `Connection` type over a `StoreFile` with
-//!     `store_id = xxHash3-128(realpath(file))`.
+//!   - `Connection` type over a `StoreFile` with a `store_id` hashed
+//!     from the file's canonical path (DB.md §2).
 //!   - `durable_ref` heap Value kind (VALUE.md §2.2 kind 26) with
 //!     self-contained identity triple (store_id, tree_name,
 //!     key_bytes) and an advisory non-identity `conn: ?*Connection`
@@ -169,10 +169,13 @@ pub const StoreFile = struct {
     var open_files: ?*StoreFile = null;
 
     /// The open file at `path`, or the file opened (or created) now
-    /// with `options` and `reader_slots` reader slots. A file this
+    /// with `options` and the pinned geometry: `page_size`,
+    /// `max_named_trees` and `reader_slots`, whatever `options` says. A file this
     /// process may read but not write opens read-only.
     pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
         var options = env_options;
+        options.pageSize = page_size;
+        options.maxNamedTrees = max_named_trees;
         options.maxReaders = reader_slots;
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
@@ -334,7 +337,7 @@ pub const StoreFile = struct {
     /// Whether `txn` reads the file's newest commit, by this process
     /// or any other.
     fn latest(self: *StoreFile, txn: *emdb.Txn) bool {
-        return txn.txnId == self.env.inner.activeMeta().loadTxnId();
+        return txn.txnId == self.env.lastTxnId();
     }
 
     /// A regular file this process may read but not write: the one
@@ -455,9 +458,10 @@ pub const Connection = struct {
     store_id_lo: u64,
     store_id_hi: u64,
 
-    /// Is the env open? Set true by `open()`, false by
-    /// `close()`. Used to defend against double-close + to signal
-    /// `ConnectionUnavailable` for subsequent ops.
+    /// Whether this connection holds its file: true from `open` to
+    /// `close` (the file's environment may stay open for others). A
+    /// second close does nothing; any other use is
+    /// `ConnectionUnavailable`.
     open_flag: bool,
 
     /// Transactions begun and not yet committed or aborted. `close`
@@ -495,6 +499,13 @@ pub const page_size: u32 = 16384;
 /// Named-tree capacity every nexis store is opened with. Bounds
 /// the `TreeId` range, which sizes the per-transaction tree set.
 pub const max_named_trees: u32 = 128;
+
+/// The size a new `db/*` store file starts at, and the step emdb
+/// extends a full one by, as Nextomic's (NEXTOMIC.md §2): emdb reserves
+/// the address space up front, so an extension moves nothing, and a
+/// small store stays small.
+pub const initial_map_size: u64 = 1 << 20;
+pub const map_grow_step: u64 = 8 << 20;
 
 /// Reader slots in a store's lock file, 64 bytes each: how many read
 /// transactions every process sharing the file can hold at once. A
@@ -536,9 +547,10 @@ pub const Durability = enum {
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open` with `pageSize` and `maxNamedTrees` pinned to
-/// `page_size` / `max_named_trees`; a file already open in this
-/// process is shared as it is (`StoreFile`).
+/// `emdb.Env.open` with the size a new file starts at and grows by set
+/// to `initial_map_size` / `map_grow_step`, and the geometry
+/// `StoreFile.acquire` pins; a file already open in this process is
+/// shared as it is (`StoreFile`).
 pub fn open(
     allocator: std.mem.Allocator,
     heap: *Heap,
@@ -547,8 +559,8 @@ pub fn open(
     options: emdb.EnvOptions,
 ) !Connection {
     var env_options = options;
-    env_options.pageSize = page_size;
-    env_options.maxNamedTrees = max_named_trees;
+    env_options.mapSize = initial_map_size;
+    env_options.growStep = map_grow_step;
     const file = try StoreFile.acquire(path, env_options);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
@@ -583,15 +595,19 @@ pub fn open(
 /// closed.
 pub fn close(self: *Connection) (DbError || emdb.Error)!void {
     if (!self.open_flag) return;
+    // Refused before anything ends: a refusal changes nothing.
+    var language: u32 = 0;
     var it = Handle.all;
     while (it) |h| : (it = h.next) {
-        if (h.conn() == self and h.held != 0) return DbError.TransactionsOpen;
+        if (h.conn() != self) continue;
+        if (h.held != 0) return DbError.TransactionsOpen;
+        language += @intFromBool(h.active);
     }
+    if (self.open_txns != language) return DbError.TransactionsOpen;
     it = Handle.all;
     while (it) |h| : (it = h.next) {
         if (h.conn() == self) h.end();
     }
-    if (self.open_txns != 0) return DbError.TransactionsOpen;
     const synced = self.file.sync();
     release(self);
     return synced;
@@ -1055,6 +1071,18 @@ pub fn get(
     return null;
 }
 
+/// Whether `key_bytes` is in `tree_name`, through either transaction
+/// kind; the value is neither read nor decoded.
+pub fn has(txn: anytype, tree_name: []const u8, key_bytes: []const u8) !bool {
+    try validateTreeNameAndKey(tree_name, key_bytes);
+    const tree_id = (try treeId(txn, tree_name, false)) orelse return false;
+    var cursor = try txn.inner.openCursorForTree(tree_id);
+    cursor.keysOnly = true;
+    if (cursor.set(key_bytes) != null) return true;
+    if (cursor.failure) |err| return err;
+    return false;
+}
+
 pub fn del(
     txn: *WriteTxn,
     tree_name: []const u8,
@@ -1084,33 +1112,20 @@ const DurableRefBody = extern struct {
     }
 };
 
-/// Construct a durable-ref heap Value from an active Connection.
-/// The ref's identity triple (`store_id`, `tree_name`, `key_bytes`)
-/// is fixed at construction; the advisory `conn` pointer is set to
-/// the supplied Connection.
+/// A durable ref on `conn`: the identity triple from `conn`'s store,
+/// and `conn` as its advisory connection.
 pub fn ref(
     heap: *Heap,
     conn: *Connection,
     tree_name: []const u8,
     key_bytes: []const u8,
 ) !Value {
-    try validateTreeNameAndKey(tree_name, key_bytes);
-    const body_size = @sizeOf(DurableRefBody) + tree_name.len + key_bytes.len;
-    const h = try heap.alloc(.durable_ref, body_size);
-    const body = bodyOf(h);
-    body.conn = conn;
-    body.store_id_lo = conn.store_id_lo;
-    body.store_id_hi = conn.store_id_hi;
-    body.tree_name_len = @intCast(tree_name.len);
-    body.key_bytes_len = @intCast(key_bytes.len);
-    const inline_bytes = inlineBytesOf(h);
-    @memcpy(inline_bytes[0..tree_name.len], tree_name);
-    @memcpy(inline_bytes[tree_name.len..][0..key_bytes.len], key_bytes);
-    return heap_mod.Heap.valueFromHeader(.durable_ref, h);
+    const r = try refFromBytes(heap, conn.storeId(), tree_name, key_bytes);
+    bodyOf(refHeader(r)).conn = conn;
+    return r;
 }
 
-/// Construct a durable-ref from bytes (no live Connection
-/// context). The `conn` pointer is null, so I/O through this ref is
+/// A durable ref with no connection: I/O through it is
 /// `error.ConnectionUnavailable` (DB.md §4).
 pub fn refFromBytes(
     heap: *Heap,
@@ -1139,10 +1154,6 @@ fn bodyOf(h: *HeapHeader) *DurableRefBody {
     return @ptrCast(@alignCast(body.ptr));
 }
 
-fn bodyOfConst(h: *HeapHeader) *const DurableRefBody {
-    return bodyOf(h);
-}
-
 fn inlineBytesOf(h: *HeapHeader) []u8 {
     const body = heap_mod.Heap.bodyBytes(h);
     std.debug.assert(body.len >= @sizeOf(DurableRefBody));
@@ -1157,26 +1168,26 @@ fn refHeader(v: Value) *HeapHeader {
 // --- Identity accessors (for codec + eq/hash + ref-based ops) ---
 
 pub fn refStoreId(r: Value) u128 {
-    const body = bodyOfConst(refHeader(r));
+    const body = bodyOf(refHeader(r));
     return (@as(u128, body.store_id_hi) << 64) | @as(u128, body.store_id_lo);
 }
 
 pub fn refTreeName(r: Value) []const u8 {
     const h = refHeader(r);
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     return inline_bytes[0..body.tree_name_len];
 }
 
 pub fn refKeyBytes(r: Value) []const u8 {
     const h = refHeader(r);
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     return inline_bytes[body.tree_name_len..][0..body.key_bytes_len];
 }
 
 pub fn refConn(r: Value) ?*Connection {
-    const body = bodyOfConst(refHeader(r));
+    const body = bodyOf(refHeader(r));
     return body.conn;
 }
 
@@ -1224,7 +1235,7 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 /// domain applied by `dispatch.hashValue` on the way out.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
-    const body = bodyOfConst(h);
+    const body = bodyOf(h);
     const inline_bytes = inlineBytesOf(h);
     var hasher = std.hash.XxHash3.init(hash_mod.seed);
     // store_id_lo + store_id_hi as LE bytes.
@@ -1244,8 +1255,8 @@ pub fn hashHeader(h: *HeapHeader) u32 {
 /// tree_name, key_bytes). `conn` NOT consulted.
 pub fn refsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     if (a == b) return true;
-    const ab = bodyOfConst(a);
-    const bb = bodyOfConst(b);
+    const ab = bodyOf(a);
+    const bb = bodyOf(b);
     if (ab.store_id_lo != bb.store_id_lo) return false;
     if (ab.store_id_hi != bb.store_id_hi) return false;
     if (ab.tree_name_len != bb.tree_name_len) return false;
@@ -1562,6 +1573,51 @@ test "open: a file this process may only read opens read-only; a write is TxnRea
     try testing.expectError(error.TxnReadOnly, beginWrite(&conn));
 }
 
+test "close: a refusal ends none of the language's transactions" {
+    const path = try tmpDbPath(testing.allocator, "close_refused");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    const h = try Handle.create(.{ .read = try beginRead(&conn) });
+    var zig_level = try beginRead(&conn);
+    try testing.expectError(DbError.TransactionsOpen, close(&conn));
+    try testing.expect(h.active);
+    abortRead(&zig_level);
+    try close(&conn);
+    try testing.expect(!h.active);
+}
+
+test "has: whether a key is present, its value never read" {
+    const path = try tmpDbPath(testing.allocator, "has");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+
+    var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&conn);
+    {
+        // Bytes no decoder takes.
+        const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
+        try txn.putInTree(try txn.openTree("t", true), "k", "\xff\xff");
+        try txn.commit();
+    }
+    var r = try beginRead(&conn);
+    defer abortRead(&r);
+    try testing.expect(try has(&r, "t", "k"));
+    try testing.expect(!try has(&r, "t", "j"));
+    try testing.expect(!try has(&r, "none", "k"));
+    if (get(&r, "t", "k", synthHash, synthEq)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
 test "close: refused while a transaction is open; the connection stays a closed struct" {
     const path = try tmpDbPath(testing.allocator, "close_busy");
     defer testing.allocator.free(path);
@@ -1870,6 +1926,8 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     try testing.expectEqual(page_size, conn.file.env.options.pageSize);
     try testing.expectEqual(max_named_trees, conn.file.env.options.maxNamedTrees);
     try testing.expectEqual(emdb.btree.maxKeySize(page_size), conn.file.env.maxKeySize());
+    try testing.expectEqual(map_grow_step, conn.file.env.options.growStep);
+    try testing.expect(conn.file.env.info().mapSize <= initial_map_size);
 }
 
 test "open: the reader table has reader_slots slots, so more than emdb's default 126 reads run at once" {

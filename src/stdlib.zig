@@ -3229,10 +3229,7 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
     const conn = try liveConnOf(vm, r);
     var txn = try beginRead(vm, conn);
     defer db_mod.abortRead(&txn);
-    const tree = db_mod.refTreeName(r);
-    const key = db_mod.refKeyBytes(r);
-    const result = db_mod.get(&txn, tree, key, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch |err| return dbFailure(vm, err);
-    return value_mod.fromBool(result != null);
+    return value_mod.fromBool(db_mod.has(&txn, db_mod.refTreeName(r), db_mod.refKeyBytes(r)) catch |err| return dbFailure(vm, err));
 }
 
 // =============================================================================

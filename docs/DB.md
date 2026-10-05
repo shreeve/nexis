@@ -74,12 +74,18 @@ while the VM lives. A `db_connection` Value (kind 31) is a pointer to
 it; `db_write_txn` (32) and `db_read_txn` (33) point at a transaction
 handle (§3.2).
 
-**Pinned geometry.** `open` overrides the caller's `pageSize` with
-`db.page_size` (16 KiB) and `maxNamedTrees` with `db.max_named_trees`
-(128). emdb's default page size is the OS page size, and the page
+**Pinned geometry.** `StoreFile.acquire`, which every `open` and
+Nextomic `connect` passes through, overrides the caller's `pageSize`
+with `db.page_size` (16 KiB), `maxNamedTrees` with
+`db.max_named_trees` (128) and `maxReaders` with `db.reader_slots`
+(§3.2). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
+`open` creates a file at `db.initial_map_size` (1 MiB) and has emdb
+extend a full one by `db.map_grow_step` (8 MiB), Nextomic's sizes
+(`docs/NEXTOMIC.md` §2), where emdb's defaults are 256 MiB and 64 MiB:
+a store of one key is a small file.
 
 **Tree handles resolve once per connection.** `treeId(txn, name,
 create)` looks the name up in the connection's cache before asking
@@ -115,7 +121,8 @@ in place with the open flag false: a ref or connection Value that
 still names it reports the connection closed, and a handle reports its
 transaction closed. A second `close` does nothing. `close` while a
 native holds one of the connection's transactions for a callback, or
-while a Zig-level transaction is open, is refused (`TransactionsOpen`),
+while a Zig-level transaction is open, is refused (`TransactionsOpen`)
+before it ends anything,
 so no emdb transaction outlives its environment and no callback loses
 the transaction its native is using. A sync that fails is reported
 (`:db/sync-failed`) after the connection is closed. `shutdown` ends
@@ -348,6 +355,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `validateTreeName(name) DbError!void` | §6. |
 | `put(*WriteTxn, tree, key, value) !void` | Encodes `value` (CODEC.md) under the opaque `key` bytes; creates the tree. |
 | `get(txn, tree, key, elementHash, elementEq) !?Value` | Either transaction kind; null when the key or the tree is absent. |
+| `has(txn, tree, key) !bool` | Whether the key is present, its value neither read nor decoded (`db/present?`). |
 | `del(*WriteTxn, tree, key) !bool` | Whether the key existed. |
 | `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
 | `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
@@ -520,7 +528,7 @@ and any operation on a closed connection or through a ref of one is
 | `(db/put-key! ref v)` | 2 | nil; one write transaction around one put, committed as the connection's durability says (§3.3), as every commit here is. |
 | `(db/get-key ref)` / `(db/get-key ref default)` | 1–2 | The stored value, or `default` (nil); one read transaction. |
 | `(db/delete-key! ref)` | 1 | Whether the key existed; one write transaction. |
-| `(db/present? ref)` | 1 | Whether the key exists. |
+| `(db/present? ref)` | 1 | Whether the key exists; the value is not read, so one whose bytes do not decode is present. |
 | `(deref ref)`, `@ref`, `(db/deref ref)` | 1 | The stored value or nil; one read transaction. `db/deref` is the universal `deref` (Vars, atoms, delays, reduced too); another kind is `:not-derefable`. |
 | `(db/begin-write conn)` | 1 | A write transaction; while any connection or Nextomic store of the same file holds one, `:db/busy`. |
 | `(db/begin-read conn)` | 1 | A read transaction; with every reader slot of the file taken (§3.2), `:db/readers-full`. |
