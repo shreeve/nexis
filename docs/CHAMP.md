@@ -388,10 +388,13 @@ does; a map's does unless the value is bit-identical), and how it
 hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
 dissoc, the builder, the iterator and the trace are shared, and the
 public `map*`/`set*` functions are thin wrappers over the two
-instances. Every path copy goes through one primitive, `withSlot`: a
-copy of an interior with one slot made empty, a payload or a child;
-an in-place edit rewrites an owned interior the same way where it
-stands when its block has room (§8.3).
+instances. Every persistent path copy goes through one primitive,
+`withSlot`: a copy of an interior with one slot made empty, a payload
+or a child. An in-place edit changes a slot through
+`withSlotInPlace`, which rewrites an owned interior the same way where
+it stands when its block has room and otherwise copies it through
+`withSlot`; a node on the path the edit does not own is first copied
+whole (`ownPath`, §8.3).
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
