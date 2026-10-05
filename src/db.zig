@@ -1229,23 +1229,16 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 // `src/gc.zig` at the same arm.
 // =============================================================================
 
-/// Identity-triple hash: xxHash3 over (store_id LE bytes ++
-/// tree_name ++ key_bytes). `conn` NOT consulted. Kind-local hash
-/// domain applied by `dispatch.hashValue` on the way out.
+/// Identity-triple hash: the store id's two halves, then xxHash3 over
+/// the tree name and key bytes, through the ordered combine. `conn` NOT
+/// consulted. Kind-local hash domain applied by `dispatch.hashValue`
+/// on the way out.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
     const body = bodyOf(h);
-    const inline_bytes = inlineBytesOf(h);
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    // store_id_lo + store_id_hi as LE bytes.
-    var store_id_bytes: [16]u8 = undefined;
-    std.mem.writeInt(u64, store_id_bytes[0..8], body.store_id_lo, .little);
-    std.mem.writeInt(u64, store_id_bytes[8..16], body.store_id_hi, .little);
-    hasher.update(&store_id_bytes);
-    hasher.update(inline_bytes[0..body.tree_name_len]);
-    hasher.update(inline_bytes[body.tree_name_len..][0..body.key_bytes_len]);
-    const full = hasher.final();
-    const truncated: u32 = @truncate(full);
+    const names = inlineBytesOf(h)[0 .. body.tree_name_len + body.key_bytes_len];
+    const ids = hash_mod.combineOrdered(body.store_id_lo, body.store_id_hi);
+    const truncated: u32 = @truncate(hash_mod.combineOrdered(ids, hash_mod.hashBytes(names)));
     if (truncated != 0) h.setCachedHash(truncated);
     return truncated;
 }

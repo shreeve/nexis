@@ -129,7 +129,8 @@ pub fn limbCount(v: Value) usize {
 // Per-kind hash / equality — called by dispatch
 // =============================================================================
 
-/// xxHash3 over {negative_byte, limb_bytes}, truncated to u32.
+/// The sign (1 negative, 0 not) and xxHash3 of the limb bytes through
+/// `hash.combineOrdered`, truncated to u32.
 /// Cached in `HeapHeader.hash` using the cache-if-nonzero pattern
 /// (HEAP.md §1). Padding bytes inside the body are deliberately
 /// excluded — the hash is over semantic content only.
@@ -139,10 +140,8 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     }
     if (h.cachedHash()) |cached| return cached;
 
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    hasher.update(&[_]u8{if (headerNegative(h)) 1 else 0});
-    hasher.update(std.mem.sliceAsBytes(headerLimbs(h)));
-    const raw: u32 = @truncate(hasher.final());
+    const limb_hash = hash_mod.hashBytes(std.mem.sliceAsBytes(headerLimbs(h)));
+    const raw: u32 = @truncate(hash_mod.combineOrdered(@intFromBool(headerNegative(h)), limb_hash));
     if (raw != 0) h.setCachedHash(raw);
     return raw;
 }
@@ -834,13 +833,10 @@ test "hashHeader: deterministic, caches nonzero, matches xxHash3 over sign+limbs
     // Pre-hash: cache is clear.
     try testing.expectEqual(@as(u32, 0), h.hash);
 
-    // Compute the expected hash by hand: xxHash3 over
-    // {negative_byte} ++ limb_bytes.
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    hasher.update(&[_]u8{1}); // negative
+    // The expected hash by hand: the sign, then xxHash3 over the
+    // limb bytes, through the ordered combine.
     const limb_arr = [_]u64{ big, 7 };
-    hasher.update(std.mem.sliceAsBytes(&limb_arr));
-    const expected: u32 = @truncate(hasher.final());
+    const expected: u32 = @truncate(hash_mod.combineOrdered(1, hash_mod.hashBytes(std.mem.sliceAsBytes(&limb_arr))));
 
     try testing.expectEqual(expected, hashHeader(h));
     try testing.expectEqual(expected, hashHeader(h)); // deterministic, re-reads cache

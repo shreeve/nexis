@@ -410,9 +410,10 @@ equal.
 
 #### 7.2 Hash
 
-64-bit xxHash3, seeded with `hash.seed`, over the `store_id` low and
-high halves as little-endian bytes, then the tree-name bytes, then the
-key bytes; truncated to `u32` and cached in the header when nonzero.
+`hash.combineOrdered` of the `store_id` low half, its high half and
+xxHash3 (seeded with `hash.seed`) of the tree-name bytes followed by
+the key bytes; truncated to `u32` and cached in the header when
+nonzero.
 `dispatch.hashValue` applies the kind's domain on the way out.
 
 #### 7.3 GC trace

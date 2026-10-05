@@ -28,8 +28,9 @@
 //!   N9. Reconstruction round-trip: build a bignum from random limbs,
 //!       read the limbs back, confirm byte-exact equality including
 //!       sign.
-//!   N10. `hashValue` matches the spec formula: xxHash3 over
-//!        {negative_byte, limb_bytes}, kind-domain mixed via dispatch.
+//!   N10. `hashValue` matches the spec formula: the sign and xxHash3
+//!        of the limb bytes, ordered-combined, kind-domain mixed via
+//!        dispatch.
 //!   A1. add/sub/compare against Zig i128 over random pairs; every
 //!       result canonical.
 //!   A2. mul against Zig i128 over random i64 pairs.
@@ -319,7 +320,7 @@ test "N9: fromLimbs + accessors round-trip limbs + sign byte-exact" {
 // N10. hashValue matches spec formula
 // -----------------------------------------------------------------------------
 
-test "N10: hashValue(bignum) matches xxHash3 over {sign, limbs} + mixKindDomain" {
+test "N10: hashValue(bignum) matches combineOrdered(sign, xxHash3(limbs)) + mixKindDomain" {
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
 
@@ -329,10 +330,7 @@ test "N10: hashValue(bignum) matches xxHash3 over {sign, limbs} + mixKindDomain"
     try std.testing.expect(v.kind() == .bignum);
 
     // Compute expected by hand.
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    hasher.update(&[_]u8{1}); // negative
-    hasher.update(std.mem.sliceAsBytes(&limb_arr));
-    const base_u32: u32 = @truncate(hasher.final());
+    const base_u32: u32 = @truncate(hash_mod.combineOrdered(1, hash_mod.hashBytes(std.mem.sliceAsBytes(&limb_arr))));
     const expected = hash_mod.mixKindDomain(@as(u64, base_u32), @backingInt(value.Kind.bignum));
 
     try std.testing.expectEqual(expected, dispatch.hashValue(v));

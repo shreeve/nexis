@@ -81,8 +81,8 @@ a `fields` Value.
 **Equality and hash**: `docs/SEMANTICS.md` §3.3. The record-specific
 rule: two records are `=` when their `type_id`s are equal and their
 field maps are `=`; a record is never `=` to a map. The hash is
-`xxh3(type_id as u32 LE ++ field-map hash as u64 LE)` truncated to
-32 bits, then mixed with kind domain 35 by `dispatch.hashValue`, and
+`combineOrdered(hashU64(type_id), field-map hash)` (`hash.zig`)
+truncated to 32 bits, then mixed with kind domain 35 by `dispatch.hashValue`, and
 cached in the header. Records work as map keys and set members.
 
 **Metadata** (`docs/SEMANTICS.md` §7): a record carries it in its
