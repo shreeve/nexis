@@ -1,10 +1,10 @@
 //! handle.zig — heap bodies of the `nextomic_conn`, `nextomic_db` and
 //! `nextomic_entity` value kinds (NEXTOMIC.md §8).
 //!
-//! This file is its own build module (`nextomic_handle`), below
-//! `dispatch`, `format`, `gc` and `vm`, so those layers can print,
-//! compare, hash, trace and look up the three kinds without importing
-//! the `nextomic` module that sits above them. The `nextomic.Conn`
+//! This file sits below `dispatch`, `format`, `gc` and `vm` in
+//! `src/root.zig`, outside `nextomic/root.zig`, so those layers can
+//! print, compare, hash, trace and look up the three kinds without
+//! importing the rest of Nextomic, which sits above them. The `nextomic.Conn`
 //! behind a connection handle is opaque here; `natives.zig` owns the
 //! cast.
 //!

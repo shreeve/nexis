@@ -26,8 +26,8 @@ below is a public function or a committed invariant of emdb as it stands
    (stored in the `sys` tree, committed atomically with the datoms). The
    engine's `txnId` never appears in a key or an entity id.
 4. **A db-value is a plain value** `{store, basis, mode}` with no open
-   read transaction. Each operation opens a pooled read transaction for
-   its own duration and closes it.
+   read transaction. Each operation begins its read in the file's held
+   snapshot (`docs/DB.md` §3.4) or a fresh one, and ends by keeping it.
 5. **Integer entity ids in partitions**, never durable-refs.
 6. **Schema is datoms** on attribute entities, read as-of the basis.
 7. **`q` is a native function** taking a query value; queries are data,
@@ -94,7 +94,7 @@ still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]` (format 1 also wrote the payload of an out-of-line value after it) |
+| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]`, which a format-1 row of an out-of-line value may follow with its payload (§2.3) |
 | `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
 | `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
 | `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
@@ -133,7 +133,8 @@ attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
 are the same mechanism. They sort by id, not by text. An ident's text
 is a property of its id, not a datom value; a rename (§3 step 5) moves
 the old text to the retired names, which only the txlog decoder reads
-(an entry spells keywords by the names they had when it was written).
+(an entry spells keywords by the names they had when it was written,
+or last rewritten by an excision, §4).
 Since the text is an `nx/idents` key after its prefix byte, a keyword
 the store holds, as an ident or a value, is at most 4077 bytes
 (`idents.max_name_len`); a transaction that would mint a longer one is
@@ -163,10 +164,10 @@ value, a bignum past `±2^47`. An integer outside i64 is
 `:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
 or an `index-range` bound. A key holds every long in the same 8
 bytes, and the txlog spells one past the fixnum range as the codec's
-bignum; neither changes the format number. A build that takes longs in the
-fixnum range only reads such a file's fixnum-range values and refuses
-a wider one, `:nextomic/value-type` from an index and `:db/corrupted`
-from the txlog, never misreading it. String order is UTF-8 byte order,
+bignum; neither changes the format number, and a reader that takes
+fixnum-range longs only refuses a wider one (`:nextomic/value-type`
+from an index, `:db/corrupted` from the txlog) rather than misreading
+it. String order is UTF-8 byte order,
 which is code point order, not UTF-16 order; no Unicode normalization
 is applied.
 Type tags never compare equal across types, so `1` and `1.0` are
@@ -212,8 +213,8 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 | `"eid"` | u48 next user entity id |
 | `"aid"` | u32 next attribute / ident id |
 | `"ig"` | u64 ident generation, bumped by every rename; absent reads as 0. A connection's ident cache remembers the generation it loaded under and reloads at the start of an operation when the store's has moved, so a rename in another connection or process is seen at once |
-| `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it when the writer was a build that does not bump the generation, and each is read once per connection |
-| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (2, Unicode simple case folding, §5 "fulltext") and the `t` they are current at; absent in a store an older build wrote, whose rows fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` an older build committed without stamping) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
+| `"sg"` | u64 schema generation, bumped by every transaction that writes a datom on an attribute-partition entity; absent reads as 0. A connection's schema cache serves a newer basis while the generation is the one it was built under and the txlog entries committed since hold no attribute-partition datom, since only data was committed; the entries settle it for a writer that leaves the generation alone, and each is read once per connection |
+| `"ft"` | `[fold:1][t:6]`: the case folding the `nx/fulltext` rows were written under (2, Unicode simple case folding, §5 "fulltext") and the `t` they are current at; absent means rows that fold ASCII only. Bootstrap and every transaction stamp their `t`; a transaction that finds the stamp stale (another folding, or a `t` committed without a stamp) first rebuilds every row from the current values, as `Conn.open` does, and until a rebuild a search re-tokenises the values instead of reading the rows |
 | `"n"` `[a:4]` | u64 count of the current datoms of attribute `a`, at most `2^47 - 1` (no more than there are ids), kept by every transaction and excision; the planner's estimate (§5) |
 
 ### 2.4 Bootstrap
@@ -476,8 +477,9 @@ transactions are never joined into one emdb transaction (`docs/DB.md`
 
 ## 4. Db-values and time
 
-`(d/db conn)` opens a pooled read transaction, reads `sys["t"]` as the
-basis, closes it, and returns `{store, basis, mode = current}`.
+`(d/db conn)` begins a read in the held snapshot or a fresh one, reads
+`sys["t"]` as the basis, ends by keeping it, and returns `{store,
+basis, mode = current}`.
 
 A connection counts its operations in flight (reads, a `transact!`, a
 held `with`). `release` refuses while the count is nonzero
@@ -532,8 +534,8 @@ history of the attribute partition: every assertion and retraction of
 `:db/isComponent` and `:db/fulltext` on an attribute is one event of its
 timeline. The cache serves a later basis while `sys["sg"]` is unchanged
 and the txlog entries in between write no attribute-partition datom
-(§2.3), and is rebuilt when another connection, of this build or an
-older one, changed the schema. It
+(§2.3), and is rebuilt when another connection changed the schema,
+whether or not its writer moved `sys["sg"]`. It
 serves every earlier basis by replaying each attribute's timeline up to
 it: attributes created after it are hidden, and every flag and the
 cardinality read as that basis saw them, so an attribute indexed at one
@@ -567,7 +569,10 @@ attribute, ident or transaction entity, or a tempid, is
 `:nextomic/tx-data`, an unallocated id `:nextomic/no-entity`. An entity
 excised of everything stays addressable, and excising it again removes
 nothing. Inside a `with` or a transaction function, `excise!` is
-`:nextomic/nested`.
+`:nextomic/nested`. Two things outlive an excision: the text of a
+keyword value is an ident in `nx/idents` (§2.1), not a datom, so a
+keyword the entity held keeps its name there; and the pages the
+excision frees keep their bytes until the engine reuses them.
 
 ---
 
@@ -987,7 +992,7 @@ src/nextomic/
   excise.zig     §4 "Excision": the tree deletes and the txlog rewrite
   fulltext.zig   the case-folding tokenizer and the nx/fulltext rows: put, delete, search, rebuild
   db.zig         Conn, DbValue, datoms, entity, entid/ident, tx-range
-  handle.zig     heap bodies of the three value kinds (its own build module)
+  handle.zig     heap bodies of the three value kinds
   marshal.zig    VM values to and from datom values: the entity, value and cell contracts
   relation.zig   columnar Relation and its Cell
   pull.zig       §6.2
@@ -1004,19 +1009,20 @@ bench/nextomic.zig       the `nextomic` bench category (docs/PERF.md §3.7)
 ```
 
 `src/nextomic/` sits above `dispatch` and `vm` in the one runtime
-module (`src/root.zig`), and only `stdlib` imports it; `cli` installs
-it through `stdlib.installNextomic` and bootstraps `stdlib/nextomic.nx`
-with the `nextomic` namespace current. Nextomic never uses the `db/*`
-layer's connections, tree opens or codec-encoded keys: it holds raw
-`*emdb.Txn` handles and byte keys over its own `Env` (§2) and shares
-with `db.zig` only the geometry constants and `db.failureName`.
+module (`src/root.zig`), and only `stdlib` imports it: `stdlib.boot`
+installs the natives and bootstraps `stdlib/nextomic.nx` with the
+`nextomic` namespace current (`docs/STDLIB.md` §1). Nextomic never uses
+the `db/*` layer's connections, tree opens or codec-encoded keys: it
+holds raw `*emdb.Txn` handles and byte keys over the file's one
+environment (`db.StoreFile`, §2), and shares with `db.zig` only that
+environment, the geometry constants and `db.failureName`.
 
 Value kinds `nextomic_conn`, `nextomic_db` and `nextomic_entity` are
 heap boxes from `handle.zig`, which `dispatch`, `format`, `gc` and `vm`
 import without the rest of Nextomic. The connection box (the `Conn` the
-VM owns on `vm.nextomic_connections`, and the path text) and the db box
-(that pointer, the file's device and inode, basis and mode) are
-collector leaves; the entity box
+VM owns on `vm.nextomic_connections`, the life it was made in, and the
+path text) and the db box (that pointer, the life, the file's device
+and inode, basis and mode) are collector leaves; the entity box
 holds its db box, the eid, the read hook and the map of its last full
 read, and the collector marks the db box and that map (`docs/GC.md`
 §5). `vm.lookup` reaches the hook for `(:attr ent)` and `get`; the

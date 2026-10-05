@@ -78,11 +78,6 @@ needed.
 - **Raw speed.** emdb leads LMDB 1.0.2 on every row of the PERFORMANCE
   §12.2 campaign. Scans and history walks run straight through the
   mapping with SIMD compares and no object deserialization.
-- **No garbage collector in the read path.** Values can point into
-  mapped pages for the life of a query. Big strings and blobs cost
-  nothing to read.
-- **Numbers.** nexis runs aggregations over typed columns with SIMD
-  kernels. Managed-runtime Datomic clones cannot approach that.
 - **Interactive development.** A query expands to a visible plan at the
   REPL in under a millisecond.
 - **Zero engine coupling.** Every piece Nextomic needs is an existing
@@ -98,20 +93,10 @@ with real demand and no dominant player.
 
 ## 2. Context
 
-**nexis**, a Zig-native Clojure-inspired Lisp, includes a Datomic-class
-embedded database library, **Nextomic**, built on top of emdb. The question that prompted
-this note:
-
-> *If anything emdb-shaped were needed for Nextomic, what would it be?*
-
-The answer, after architectural review: **nothing**. Nextomic composes
-named trees, cursors, range scans, prefix deletes and read transactions
-on the nexis side. The full Nextomic design lives in:
-
-- `PLAN.md` §15.11: opportunity statement
-- `docs/NEXTOMIC.md`: architecture
-
-This file captures the emdb-side implications only.
+Nextomic needs nothing emdb-shaped: it composes named trees, cursors,
+range scans, prefix deletes and read transactions on the nexis side.
+`docs/NEXTOMIC.md` is the design; this file captures the emdb-side
+implications only.
 
 ---
 
@@ -193,7 +178,8 @@ path refuses a longer key with `KeyTooLarge`, and `Env.maxKeySize()`
 reports it. The soft bound is the search clue's 256-byte key buffer
 (`clueMaxKey` in `../emdb/src/txn.zig`): a longer key still works but misses the
 clue on every lookup. A string `v` in an index key should therefore be
-capped (a prefix plus a hash, the full string in the txlog value), which
+capped (a prefix plus a hash, the full string in the fact's `nx/eavt-h`
+assertion rows, NEXTOMIC.md §2.2), which
 keeps the datom key under the soft bound and far under the hard one.
 
 **Page size is a per-file decision and it is 16K.** `EnvOptions.pageSize`
@@ -214,20 +200,23 @@ assertion rows; those and the txlog entries are the multi-page values.
 **Read transactions pin reclamation, not memory.** A read transaction
 holds a reader slot; pages freed after its snapshot are not reused while
 it lives (INV-T11, INV-FL02). The pool makes begin and end cheap; it does
-not change this. A db-value holds none (§3): each operation on it opens
-and closes its own, so only a long-running operation pins pages. A dead reader is swept by the writer on its own
-(INV-T14D).
+not change this. A db-value holds none (§3): an operation reads in the
+file's held snapshot, which the next commit lets go (`docs/DB.md` §3.4),
+or in a fresh reader, so only a long-running operation pins pages. A
+dead reader is swept by the writer on its own (INV-T14D).
 
 **One writer, always.** INV-T04. `transact!` serializes on the write lock,
 which is the transactor. A durable commit is two device flushes (D-FULL in
-§12.2: 128 commits per second on the campaign machine); batching or a per-transaction
-`.noMeta` override is the lever, and the design should say which it uses.
+§12.2: 128 commits per second on the campaign machine). Nextomic never
+batches transactions (NEXTOMIC.md §3); the lever is the sync a
+connection or one `transact!` chooses (`:durability`, `:sync`).
 
 **Register trees before workers start.** `openTree` on a name not yet in
 `Env.treeNames` mutates environment state (the thread-safety note on
-`treeNames` in `../emdb/src/txn.zig`). Open all twelve Nextomic trees once at
-connect, in the bootstrap transaction; every later `openTree` from a
-reader only loads per-transaction state and is safe from any thread.
+`treeNames` in `../emdb/src/txn.zig`). Nextomic opens all twelve trees once
+at connect, in a read transaction (a write transaction only creates a
+tree the file lacks); every later `openTree` from a reader only loads
+per-transaction state and is safe from any thread.
 
 ---
 
@@ -273,13 +262,14 @@ transaction as the indexes and committed atomically with them
 
 ### 6.6 Do not ask for concurrent writers
 
-INV-T04 is the transactor. Concurrent `transact!` calls queue on the
-nexis side and batch into one write transaction where throughput matters.
+INV-T04 is the transactor. Nextomic keeps no queue and never joins two
+`transact!` calls into one write transaction (NEXTOMIC.md §3).
 
 ### 6.7 Do not widen the clue buffer or the key bound for long values
 
 Both follow from the page size and the leaf layout. Long strings belong
-in the txlog value; index keys carry a capped prefix and a hash.
+in a value (the `nx/eavt-h` payload); index keys carry a capped prefix
+and a hash.
 
 ---
 
@@ -293,7 +283,6 @@ in the txlog value; index keys carry a capped prefix and a hash.
 - `../emdb/src/emdb.zig`: `EnvOptions`, `Env`, `Env.Info`
 - `../emdb/src/txn.zig`: `Txn`, `SearchClue`, `SyncOverride`, `CommitObserver`
 - `../emdb/src/cursor.zig`: `Cursor`, `WriteCursor`
-- `PLAN.md` §15.11: Nextomic opportunity statement
 - `docs/NEXTOMIC.md`: full Nextomic architecture
 
 ---
