@@ -321,7 +321,7 @@ test "full-text stays in step under assert, retract, backfill and excision, on a
     try testing.expectEqual(@as(usize, 0), count(try fx.q(backfilled, "[:find ?v :where [(fulltext $ :doc/body \"red\") [[?e ?v]]]]")));
 }
 
-/// Leave the tokens tree as a build of another folding would: no stamp,
+/// Leave the tokens tree as another folding would: no stamp,
 /// and a row under an unfolded token for `e`'s value `text`.
 fn staleFulltext(fx: *Fx, a: u32, e: u64, text: []const u8) !void {
     const store = fx.conn().store;

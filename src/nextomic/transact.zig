@@ -1072,8 +1072,8 @@ const Ctx = struct {
     /// the write transaction open with the datoms, txlog and counters
     /// written.
     fn apply(self: *Ctx) !void {
-        // Rows an older build or another folding wrote are replaced
-        // before this transaction adds its own.
+        // Stale rows (another folding, a commit without a stamp) are
+        // replaced before this transaction adds its own.
         if (!try self.conn.store.fulltextFresh(self.txn, self.now)) try fulltext.rebuild(self.conn.store, self.txn, self.arena, self.now);
         try self.bindIdents();
         try self.bindTempids();
@@ -3668,7 +3668,7 @@ test "another connection's data commits keep the schema cache; its schema change
     try testing.expect((try (try tc.conn.db()).attr(name)).?.many());
 }
 
-test "a schema change that leaves the generation alone, as an older build's does, still rebuilds the cache" {
+test "a schema change that leaves the generation alone still rebuilds the cache" {
     const tc = try TestConn.init("tx_schema_gen_old_build");
     defer tc.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

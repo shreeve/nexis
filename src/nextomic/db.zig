@@ -314,8 +314,8 @@ pub const Conn = struct {
     /// through `attrAt`; one whose schema generation is still the
     /// store's serves `now` too once the txlog entries committed since
     /// hold no attribute-partition datom, since only data was committed
-    /// (the entries settle it for a writer of a build that does not
-    /// bump the generation); otherwise the cache is rebuilt at `now`.
+    /// (the entries settle it for a writer that leaves the generation
+    /// alone); otherwise the cache is rebuilt at `now`.
     pub fn schemaAt(self: *Conn, txn: *Txn, basis: u64, now: u64) !*Schema {
         if (self.schema_cache) |s| {
             if (s.basis >= basis) return s;
