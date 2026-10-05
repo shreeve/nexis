@@ -5044,6 +5044,8 @@ test "core: sorting and comparison" {
         .{ .src = "(max-key count [1 2] [1] [1 2 3])", .expected = "[1 2 3]" },
         .{ .src = "(min-key count [1 2] [1] [1 2 3])", .expected = "[1]" },
         .{ .src = "(max-key :k {:k 1 :n :a} {:k 1 :n :b})", .expected = "{:k 1, :n :b}" },
+        // One candidate is the answer, without a call, as Clojure's.
+        .{ .src = "[(max-key count 5) (min-key :k :x)]", .expected = "[5 :x]" },
         .{ .src = "(= (hash [1 2]) (hash '(1 2)))", .expected = "true" },
         .{ .src = "(= (hash 0.0) (hash -0.0))", .expected = "true" },
         .{ .src = "(integer? (hash :a))", .expected = "true" },

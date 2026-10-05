@@ -609,8 +609,9 @@ fn fnTake(vm: *VM, args: []const Value) VmError!Value {
 /// element is only the next call's argument (GC.md §11.5, class 2).
 fn fnSome(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, args[1]);
+    var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        const r = try callBack(vm, args[0], &.{x});
+        const r = try cb.call(&.{x});
         if (r.isTruthy()) return r;
     }
     return value_mod.nilValue();
@@ -618,8 +619,9 @@ fn fnSome(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, args[1]);
+    var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        if (!(try callBack(vm, args[0], &.{x})).isTruthy()) return value_mod.fromBool(false);
+        if (!(try cb.call(&.{x})).isTruthy()) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
 }
@@ -1278,23 +1280,11 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // next call's argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
 // `db/reduce-tree`) needs nothing, because an argument is rooted
 // for the call that could collect.
-
-/// `(f args...)` for a sequence native's callback. A keyword looking
-/// up a map, a record or nil runs here directly: it cannot re-enter
-/// the VM, collect, or compare or hash nested structure, so the root
-/// scope, the stack guard and the deep-data check `VM.callValue` puts
-/// around a call have nothing to do. Everything else goes through
-/// `callValue`, which calls a leaf native as directly
-/// (`NativeFn.leaf`). `map`, `filter`, `remove`, `keep` and `reduce`,
-/// which call one function once per element with one argument count,
-/// call it through a `vm_mod.Callback` instead (VM.md §6).
-fn callBack(vm: *VM, f: Value, args: []const Value) VmError!Value {
-    if (f.kind() == .keyword and args.len == 1) switch (args[0].kind()) {
-        .nil, .persistent_map, .record => return vm_mod.lookup(args[0], f, value_mod.nilValue()),
-        else => {},
-    };
-    return vm.callValue(f, args);
-}
+//
+// A native that calls one function once per element, with one
+// argument count, calls it through a `vm_mod.Callback` (VM.md §6):
+// `callValue`'s effect, errors and rooting, with what cannot change
+// between the calls decided at the first.
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
 /// the last arg seq spliced in after the leading args.
@@ -1341,11 +1331,12 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
     for (colls, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
     const call_args = vm.allocator.alloc(Value, colls.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
+    var cb = vm_mod.Callback.init(vm, f, @intCast(colls.len));
     outer: while (true) {
         for (iters, 0..) |*it, i| {
             call_args[i] = (try it.next()) orelse break :outer;
         }
-        try results.add(try callBack(vm, f, call_args));
+        try results.add(try cb.call(call_args));
     }
 }
 
@@ -1396,7 +1387,7 @@ fn reducedValue(r: Value) Value {
 /// `(reduce-kv f init m)` → `(f acc k v)` over a map's entries or
 /// a vector's index/element pairs.
 fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
-    const f = args[0];
+    var cb = vm_mod.Callback.init(vm, args[0], 3);
     var acc = args[1];
     const coll = args[2];
     switch (coll.kind()) {
@@ -1404,7 +1395,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
         .persistent_map, .record, .sorted_map => {
             var it = MapEntries.of(coll).?;
             while (it.next()) |e| {
-                acc = try callBack(vm, f, &.{ acc, e.key, e.value });
+                acc = try cb.call(&.{ acc, e.key, e.value });
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
@@ -1412,7 +1403,7 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
             var c = vector_mod.Cursor.init(coll);
             var i: i64 = 0;
             while (c.next()) |x| : (i += 1) {
-                acc = try callBack(vm, f, &.{ acc, value_mod.fromFixnum(i).?, x });
+                acc = try cb.call(&.{ acc, value_mod.fromFixnum(i).?, x });
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
@@ -1984,9 +1975,10 @@ fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
     var results = Results.init(vm);
     defer results.release();
     var it = try makeSeqIter(vm, coll);
+    var cb = vm_mod.Callback.init(vm, f, 2);
     var i: i64 = 0;
     while (try it.next()) |x| : (i += 1) {
-        const r = try callBack(vm, f, &.{ value_mod.fromFixnum(i).?, x });
+        const r = try cb.call(&.{ value_mod.fromFixnum(i).?, x });
         if (keep_nil or !r.isNil()) try results.add(r);
     }
     return results.list();
@@ -2117,10 +2109,11 @@ fn whileSplit(vm: *VM, take: bool, pred: Value, coll: Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
     var it = try rootedSeqIter(vm, coll, scope);
+    var cb = vm_mod.Callback.init(vm, pred, 1);
     var dropping = true;
     while (try it.next()) |x| {
         if (dropping) {
-            const r = try vm.callValue(pred, &.{x});
+            const r = try cb.call(&.{x});
             if (r.isTruthy()) {
                 if (take) results.append(vm.allocator, x) catch return VmError.OutOfMemory;
                 continue;
@@ -2270,8 +2263,9 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
     defer results.deinit(vm.allocator);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
     results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
+    var cb = vm_mod.Callback.init(vm, f, 2);
     while (try it.next()) |x| {
-        acc = try vm.callValue(f, &.{ acc, x });
+        acc = try cb.call(&.{ acc, x });
         const stop = isReduced(vm, acc);
         if (stop) acc = reducedValue(acc);
         try scope.push(acc);
@@ -2338,16 +2332,18 @@ fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
 /// `(max-key k x & xs)` / `(min-key k x & xs)` → the x with the
 /// greatest / least `(k x)`; ties go to the later argument.
 fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
-    const k = args[0];
+    // One candidate is the answer without a call, as Clojure's.
+    if (args.len == 2) return args[1];
+    var cb = vm_mod.Callback.init(vm, args[0], 1);
     var best = args[1];
-    var best_key = try vm.callValue(k, &.{best});
+    var best_key = try cb.call(&.{best});
     // The best key so far is the one value kept across the next
     // call (GC.md §11.5); it goes on the root stack when it changes.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(best_key);
     for (args[2..]) |x| {
-        const key = try vm.callValue(k, &.{x});
+        const key = try cb.call(&.{x});
         const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
         if (!keep_best) {
             best = x;
@@ -2505,13 +2501,13 @@ fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
 /// boolean (true = less).
 const SortOrder = struct {
     vm: *VM,
-    comparator: ?Value,
+    comparator: ?*vm_mod.Callback,
 
     /// `a` and `b` are on `sortImpl`'s root scope (GC.md §11.5,
     /// class 4).
     fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
         const cmp = self.comparator orelse return (try compareValues(self.vm, a, b)) == .lt;
-        const r = try self.vm.callValue(cmp, &.{ a, b });
+        const r = try cmp.call(&.{ a, b });
         return switch (r.kind()) {
             .true_ => true,
             .false_, .nil => false,
@@ -2569,12 +2565,17 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError
     // A map's entries were built by the walk and are reachable from
     // nothing else while the key function or comparator runs.
     if (keyfn != null or comparator != null) try scope.pushAll(items.items);
-    for (items.items, 0..) |v, i| {
-        const key = if (keyfn) |kf| try vm.callValue(kf, &.{v}) else v;
-        if (keyfn != null) try scope.push(key);
-        keyed[i] = .{ .key = key, .val = v };
+    if (keyfn) |kf| {
+        var cb = vm_mod.Callback.init(vm, kf, 1);
+        for (items.items, keyed) |v, *k| {
+            k.* = .{ .key = try cb.call(&.{v}), .val = v };
+            try scope.push(k.key);
+        }
+    } else for (items.items, keyed) |v, *k| {
+        k.* = .{ .key = v, .val = v };
     }
-    try mergeSort(keyed, scratch, .{ .vm = vm, .comparator = comparator });
+    var cmp_cb = if (comparator) |c| vm_mod.Callback.init(vm, c, 2) else undefined;
+    try mergeSort(keyed, scratch, .{ .vm = vm, .comparator = if (comparator != null) &cmp_cb else null });
     for (keyed, 0..) |e, i| items.items[i] = e.val;
     return try buildListFromSlice(vm, items.items);
 }
@@ -5789,17 +5790,19 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
         .i64 => {
             const out = vm.allocator.alloc(i64, n) catch return VmError.OutOfMemory;
             defer vm.allocator.free(out);
+            var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, 0..) |*slot, i| {
                 const x = typed_vector_mod.nth(heap, xs, i) catch return VmError.OutOfMemory;
-                slot.* = try i64Elem(try vm.callValue(f, &.{x}));
+                slot.* = try i64Elem(try cb.call(&.{x}));
             }
             return typed_vector_mod.fromI64Slice(heap, out) catch VmError.OutOfMemory;
         },
         .f64 => {
             const out = vm.allocator.alloc(f64, n) catch return VmError.OutOfMemory;
             defer vm.allocator.free(out);
+            var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, typed_vector_mod.f64Elems(xs)) |*slot, x| {
-                slot.* = try f64Elem(try vm.callValue(f, &.{value_mod.fromFloat(x)}));
+                slot.* = try f64Elem(try cb.call(&.{value_mod.fromFloat(x)}));
             }
             return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
         },
