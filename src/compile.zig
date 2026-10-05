@@ -3065,8 +3065,13 @@ fn compileTry(
     binding_captured: bool,
     dst: u12,
 ) CompileError!void {
-    const binding_slot = try e.allocSlot();
     const result: u12 = if (finally_ != null) try e.allocSlot() else dst;
+    // The binding's slot is the one above every slot live here. The VM
+    // writes it only once the body is abandoned, when the body's
+    // temporaries are dead, so the body may use it too, and a nested
+    // `try` takes the same one; the handler claims it.
+    const binding_slot = e.claimSlots(e.slot_top, 1) orelse return e.limit("local slots");
+    e.slot_top -= 1;
 
     // The try's catch and finally pcs are filled in once placed.
     const t = try tableIndex(e.tries.items.len);
@@ -3084,6 +3089,7 @@ fn compileTry(
 
     // The VM stores the thrown value in the binding's slot and jumps
     // here; a captured binding is boxed first thing.
+    if (try e.allocSlot() != binding_slot) return CompileError.InternalCompilerBug;
     const scope_mark = e.scope.mark();
     defer e.scope.restore(scope_mark);
     try e.bindLocal(binding, binding_slot, binding_captured);

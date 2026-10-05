@@ -893,6 +893,33 @@ test "loader: a top-level form's trees are freed once it has run; only its routi
     };
 }
 
+test "slots: a try's catch binding takes a slot only in its handler" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    // Fifty nested trys share one binding slot; with a finally, each
+    // level holds its body's value in a slot of its own until the
+    // finally has run.
+    for ([_][]const u8{ ")", " (finally nil))" }, [_]usize{ 4, 54 }) |close, most| {
+        src.clearRetainingCapacity();
+        try src.appendSlice(testing.allocator, "(fn* [x] ");
+        for (0..50) |_| try src.appendSlice(testing.allocator, "(try (inc ");
+        try src.appendSlice(testing.allocator, "(throw x)");
+        for (0..50) |_| try src.print(testing.allocator, ") (catch any e (inc e)){s}", .{close});
+        try src.appendSlice(testing.allocator, ")");
+        const slots = (try compileIn(&program, src.items)).capture_descs[0].routine.slot_count;
+        testing.expect(slots <= most) catch |err| {
+            std.debug.print("\n  nested try{s}: {d} slots\n", .{ close, slots });
+            return err;
+        };
+        const call = try testing.allocator.print("({s} 1)", .{src.items});
+        defer testing.allocator.free(call);
+        try harness.expectResult(&program, "nested try", try program.run(call), "51");
+    }
+}
+
 /// Sources of `n` operands, clauses or nesting levels, each of a shape
 /// some pass of the front end once walked again at every level.
 const Growing = enum {

@@ -218,7 +218,10 @@ constant pool, Var table, capture descriptors, span table,
   needed after the call (per the range-call ABI, VM.md §6) or by a
   later `closure:make` is never inside it:
   `(let* [x 1, f (g), h (fn* [] x)] h)` keeps `x`'s cell below `(g)`'s
-  block.
+  block. A `try`'s catch binding takes the slot above every slot live
+  at the `try`, but only from its handler on: the VM writes it once
+  the body is abandoned, when the body's temporaries are dead, so the
+  body may use it and nested `try`s share it.
 - **Scratch.** A value computed into a slot that nothing reads before
   the value's last instruction writes it (a fresh temporary for an
   operand, or an item of a block) may use that slot as working space,
