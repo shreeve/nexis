@@ -2099,16 +2099,25 @@ fn lowerDef(
     return try allocTiny(allocator, .{ .def = .{ .name = name, .value = value } });
 }
 
-/// `(var name)` → returns the Var object (NOT its value). Does
-/// not trap on unbound. Maps to Tiny.var_ref.
+/// `(var name)`: the Var itself, bound or not (COMPILER.md §5.9).
+/// With `declared`, a name that resolves to no Var and that the file
+/// does not define is `UnresolvedSymbol`; a local is no Var, as in
+/// Clojure.
 fn lowerVarRef(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
-    _: LowerCtx,
+    ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
     if (args[0].datum != .symbol) return CompileError.ExpectedSymbol;
     const sym = args[0].datum.symbol;
+    if (ctx.declared) |declared| if (ctx.namespace) |ns| {
+        const known = if (sym.ns) |prefix|
+            qualifiedTarget(ns, prefix) != ns or ns.lookupLocal(sym.name) != null or declared.contains(sym.name)
+        else
+            symbolResolves(ctx, declared, sym.name);
+        if (!known) return unresolved(allocator, ctx.diag, args[0].origin, sym.ns, sym.name);
+    };
     return try allocTiny(allocator, .{ .var_ref = .{ .ns = sym.ns, .name = sym.name } });
 }
 

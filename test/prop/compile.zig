@@ -384,6 +384,19 @@ test "failures: a form that fails to compile leaves none of its locals in scope"
     try harness.expectResult(&program, "x", try program.run("x"), "5");
 }
 
+test "failures: (var x) of a name that is no Var, a local included, is UnresolvedSymbol and interns nothing" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(var nope)", null));
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(let* [y 1] (var y))", null));
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(var user/nope)", null));
+    try harness.expectResult(&program, "(resolve 'nope)", try program.run("(resolve 'nope)"), "nil");
+    // A name the file defines later is already its Var.
+    const src = "(do (def g-ref (var g)) (defn g [] 1) (g-ref))";
+    try harness.expectResult(&program, src, try program.runChecked(src, null), "1");
+}
+
 // =============================================================================
 // Properties
 // =============================================================================

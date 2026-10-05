@@ -587,8 +587,12 @@ self-name.
 #### 5.9 `(var name)`, `(var ns/name)`
 
 `var:var-object` into the result slot: the Var itself, bound or not.
-A bare name resolves as a symbol does (§4.3 rules 6-7), a qualified
-one as rule 5.
+A bare name resolves as a symbol does (§4.3 rules 6-8) except that a
+lexical local is no Var (Clojure's rule), so `(let [x 1] #'x)` and
+`#'nope` are `UnresolvedSymbol` when the file's names are declared,
+and intern nothing; a qualified one resolves as rule 5. Without
+declared names (the embedded library sources) an unresolved bare name
+is interned unbound, a forward reference.
 
 #### 5.10 `(try body... (catch any binding handler...) (finally ...)?)`
 
