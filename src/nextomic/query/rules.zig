@@ -19,7 +19,9 @@
 //!     a pass-through position: the component has one rule and every
 //!     recursive call in every body passes the head variable of that
 //!     position through unchanged. Every other bound argument filters
-//!     the result. Pushing elsewhere would lose derivations.
+//!     the result. Pushing elsewhere would lose derivations, so a body
+//!     that needs a required argument which is not pushed is refused,
+//!     naming it.
 //!   - Termination: `total` only grows and every row comes from a
 //!     finite set of datoms and inputs, so the fixpoint is reached.
 //!   - Soundness: a growing fixpoint answers stratified programs only,
@@ -375,7 +377,10 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
             var r = try Renamer.init(ctx, inst.head, def, .{ .names = scc_names, .instances = instances }, src);
             const clauses = try r.clauses(def.body);
             body.* = .{
-                .plan = try plan_mod.planSub(ctx, clauses, input.items, rows, inst.head),
+                .plan = plan_mod.planSub(ctx, clauses, input.items, rows, inst.head) catch |err| switch (err) {
+                    error.QuerySyntax => return unpushedRequired(ctx, inst, def.required, input.items, clauses, rows),
+                    else => return err,
+                },
                 .sites = try r.sites.toOwnedSlice(ctx.arena),
             };
         }
@@ -389,6 +394,27 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
         .pushed = try pushed.toOwnedSlice(ctx.arena),
         .fresh = try plan_mod.newVars(ctx.arena, arg_vars, bound),
     };
+}
+
+/// The refusal for a body of a recursive rule that fails to plan: when
+/// it plans with the rule's required arguments bound, the cause is a
+/// required argument that is not pushed (a recursive call changes it,
+/// or the component has several rules), and the refusal names it;
+/// otherwise the body's own refusal stands.
+fn unpushedRequired(ctx: *Ctx, inst: *const Instance, required: usize, input: []const Var, clauses: []const Clause, rows: u64) Failure {
+    const saved = ctx.diag.*;
+    const missing = for (inst.head[0..required]) |h| {
+        if (!ir.containsVar(input, h)) break h;
+    } else return error.QuerySyntax;
+    const all = try std.mem.concat(ctx.arena, Var, &.{ input, inst.head[0..required] });
+    _ = plan_mod.planSub(ctx, clauses, all, rows, inst.head) catch |err| switch (err) {
+        error.QuerySyntax => {
+            ctx.diag.* = saved;
+            return error.QuerySyntax;
+        },
+        else => return err,
+    };
+    return ctx.syntaxFmt("{s} is a required argument of recursive rule {s}, and a recursive call changes it; a recursive rule can require only an argument every recursive call passes through unchanged", .{ ctx.varName(missing), ctx.interner.symbolName(inst.name) });
 }
 
 /// Copies a rule body into plan variables: head variables map to the

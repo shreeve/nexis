@@ -1423,6 +1423,12 @@ test "corpus: rules" {
         try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, src, args, &d));
         try testing.expect(d.message.len > 0);
     }
+    // A required argument a recursive call changes cannot be pushed into
+    // the bottom-up fixpoint, and the refusal says so.
+    var d: query.Diag = .{};
+    const countdown = try fx.read("[[(cnt [?n] ?out) [(<= ?n 0)] [(ground 0) ?out]] [(cnt [?n] ?out) [(> ?n 0)] [(dec ?n) ?m] (cnt ?m ?o2) [(inc ?o2) ?out]]]");
+    try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, "[:find ?o :in $ % ?k :where (cnt ?k ?o)]", &.{ value.nilValue(), countdown, value.fromFixnum(3).? }, &d));
+    try testing.expectEqualStrings("?n is a required argument of recursive rule cnt, and a recursive call changes it; a recursive rule can require only an argument every recursive call passes through unchanged", d.message);
 }
 
 /// An `n`-clause chain `[?x0 attr ?x1] [?x1 attr ?x2] ...` with `find`

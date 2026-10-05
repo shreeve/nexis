@@ -824,7 +824,12 @@ inlines the rule's bodies, renamed afresh for that call, as the
 branches of an `or-join` over its arguments. Recursive rules run
 semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
 with one recursive call bound to delta, others to total, minus total;
-total ∪= new; delta = new } until delta is empty`. The fixpoint only
+total ∪= new; delta = new } until delta is empty`. A bound argument is
+pushed into the bodies only where the component is one rule and every
+recursive call passes the argument through unchanged; elsewhere it
+filters the result, so a required argument (`[(r [?n] ?out) ...]`) that
+a recursive call changes, and that a body needs bound, is
+`:nextomic/query-syntax` naming it. The fixpoint only
 adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are anti-joins on the shared
