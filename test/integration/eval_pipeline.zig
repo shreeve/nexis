@@ -6506,6 +6506,10 @@ test "syntax-quote qualifies a symbol to the namespace whose own Var it names" {
         \\(defn helper [x] (* x 5))
         \\(m)
     , "10");
+    // A referred or renamed name qualifies to the namespace that owns
+    // its Var, as in Clojure.
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer [twice half] :rename {half hv}]) [`twice `(hv 1)]", "[util/twice (util/half 1)]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.string :refer [join]]) `join", "nexis.string/join");
 }
 
 test "a user macro named like a core macro is the namespace's own" {

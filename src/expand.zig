@@ -2584,9 +2584,9 @@ pub const GensymScope = struct {
 
 /// The construction form of a syntax-quoted `payload`. Symbols
 /// qualify as in Clojure (PLAN §23 #29): an unqualified symbol
-/// becomes `ns/name` for the namespace that holds its Var (the
-/// current namespace, one it refers to, or `nexis.core` for a host
-/// macro), or `<current-ns>/name` when nothing holds it. `name#` is
+/// becomes `ns/name` for the namespace that owns the Var it resolves
+/// to (`nexis.core` for a host macro), or `<current-ns>/name` when it
+/// resolves to nothing. `name#` is
 /// an auto-gensym and stays bare; so do the special forms, `&`, the
 /// catch matcher `any`, `#%` internals and the `%` parameters of
 /// `#()`. A qualified symbol keeps its prefix, with an alias
@@ -2603,8 +2603,8 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
             break :blk if (target.ptr == ns_prefix.ptr) mutCast(payload) else try makeQualifiedSymbol(ctx, target, name.name, payload.origin);
         } else if (name.name.len > 1 and name.name[name.name.len - 1] == '#')
             try makeSymbol(ctx, try scope.lookupOrAllocate(ctx, name.name), payload.origin)
-        else if (syntaxQuoteNamespace(ctx, name.name)) |ns_name|
-            try makeQualifiedSymbol(ctx, ns_name, name.name, payload.origin)
+        else if (syntaxQuoteName(ctx, name.name)) |qualified|
+            try makeForm(ctx, .{ .symbol = qualified }, payload.origin)
         else
             mutCast(payload) }),
         // Evaluated where the construction form runs.
@@ -2660,21 +2660,19 @@ fn isSyntaxQuoteBare(name: []const u8) bool {
     return isSpecialFormName(name) or others.has(name) or std.mem.startsWith(u8, name, "%");
 }
 
-/// The namespace an unqualified symbol qualifies to inside
-/// syntax-quote, or null to leave it bare: the namespace in the
-/// current namespace's refer chain whose own Var it names,
-/// `nexis.core` for a host macro, otherwise the current namespace.
-/// Null without a named namespace.
-fn syntaxQuoteNamespace(ctx: *ExpandContext, name: []const u8) ?[]const u8 {
+/// What an unqualified symbol qualifies to inside syntax-quote, or
+/// null to leave it bare: the Var the name resolves to, by its home
+/// namespace and its own name (a referred or `:rename`d Var's, not
+/// the current namespace's name for it), as Clojure qualifies it;
+/// `nexis.core/name` for a host macro; otherwise the name in the
+/// current namespace. Null without a named namespace.
+fn syntaxQuoteName(ctx: *ExpandContext, name: []const u8) ?reader_mod.Name {
     if (isSyntaxQuoteBare(name)) return null;
     const ns = ctx.namespace orelse return null;
     if (ns.name.len == 0) return null;
-    var cur: ?*const vm_mod.Namespace = ns;
-    while (cur) |n| : (cur = n.parent) {
-        if (n.lookupLocal(name) != null) return n.name;
-    }
-    if (ctx.host_macros.get(name) != null) return "nexis.core";
-    return ns.name;
+    if (ns.lookup(name)) |v| if (v.ns.len > 0) return .{ .ns = v.ns, .name = v.name };
+    if (ctx.host_macros.get(name) != null) return .{ .ns = "nexis.core", .name = name };
+    return .{ .ns = ns.name, .name = name };
 }
 
 /// The construction form of a syntax-quoted collection. Without a

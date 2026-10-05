@@ -367,10 +367,12 @@ from the list with `nexis.core/vec`,
 every seqable (nil, list, vector, map as `[k v]` entries, set).
 
 **Qualification** (PLAN §23 #29, Clojure's rule). An unqualified
-symbol becomes `ns/name`, where `ns` is the namespace whose own Var
-it names, searched from the current namespace along its parent chain
-(`nexis.core` last), or `nexis.core` when it names a host macro; a
-symbol nothing holds qualifies to the current namespace, so
+symbol that resolves to a Var from the current namespace becomes that
+Var's `ns/name`, its home namespace and its own name (a referred Var
+qualifies to its home namespace, a `:rename`d one to its own name, as
+in Clojure); one that names a host macro becomes `nexis.core/name`;
+a symbol that resolves to nothing qualifies to the current namespace,
+so
 `` `(helper) `` written before `(defn helper ...)` still meets it.
 Left bare: auto-gensyms, the special forms and `#%` names (§1.1),
 `catch`, `finally`, `&`, `any`, and every name starting with `%`.
