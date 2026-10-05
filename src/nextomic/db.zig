@@ -395,9 +395,10 @@ pub const DbValue = struct {
         return d;
     }
 
+    /// Narrows like `asOf`: the newer bound wins.
     pub fn sinceT(self: DbValue, t: u64) DbValue {
         var d = self;
-        d.since = t;
+        d.since = if (self.since) |cur| @max(cur, t) else t;
         return d;
     }
 

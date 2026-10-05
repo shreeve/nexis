@@ -2,11 +2,11 @@
 //!
 //! Every native opens what it needs for its own duration: a
 //! transaction, an arena for the storage layer's scratch, and copies
-//! only results into the VM heap. Marshalling runs both ways here:
-//! Lisp values become `key.Val` by the attribute's `:db/valueType`
-//! (integer in i64 → long or instant, double → double, keyword → ident id,
-//! eid/ident/lookup ref → ref, string → string, uuid or bytes text →
-//! their storage form, boolean → boolean) and datom values come back
+//! only results into the VM heap. Lisp values become `key.Val` by the
+//! attribute's `:db/valueType` in `marshal.zig` and `transact.zig`
+//! (integer in i64 → long or instant, double → double, keyword → ident
+//! id, eid/ident/lookup ref → ref, string → string, uuid or bytes text
+//! → their storage form, boolean → boolean); datom values come back
 //! through `Conn.valToValue`.
 //!
 //! Errors: every `nextomic.Error` and storage error becomes a keyword
@@ -45,6 +45,7 @@ const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
+const sorted = @import("../coll/sorted.zig");
 const dispatch = @import("../dispatch.zig");
 const dblayer = @import("../db.zig");
 const emdb = @import("emdb");
@@ -341,15 +342,29 @@ pub fn boxDb(heap: *Heap, d: DbValue) !Value {
     return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .gen = d.gen, .file = d.conn.file, .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
 }
 
+/// The value under keyword `name` in the option map `m`, a hash or a
+/// sorted map as tx-data's map forms are; null when absent or `m` is
+/// nil.
+fn option(vm: *VM, m: Value, name: []const u8) !?Value {
+    if (m.isNil()) return null;
+    const k = try vm.ensureInterner().internKeywordValue(name);
+    switch (m.kind()) {
+        .persistent_map => return switch (champ.mapGet(m, k, &dispatch.hashValue, &dispatch.equal)) {
+            .absent => null,
+            .present => |x| x,
+        },
+        .sorted_map => {
+            var c = sorted.Cursor.init(m);
+            while (c.next()) |e| if (dispatch.equal(e.key, k)) return e.value;
+            return null;
+        },
+        else => return error.KindMismatch,
+    }
+}
+
 /// `{:sync :full | :no-meta | :none}`; nil means the default.
 fn syncOption(vm: *VM, v: Value) !?SyncMode {
-    if (v.isNil()) return null;
-    if (v.kind() != .persistent_map) return error.KindMismatch;
-    const k = try vm.ensureInterner().internKeywordValue("sync");
-    const found = switch (champ.mapGet(v, k, &dispatch.hashValue, &dispatch.equal)) {
-        .absent => return null,
-        .present => |x| x,
-    };
+    const found = (try option(vm, v, "sync")) orelse return null;
     if (found.kind() != .keyword) return error.InvalidArgument;
     const name = vm.ensureInterner().keywordName(found.asKeywordId());
     if (std.mem.eql(u8, name, "full")) return .full;
@@ -365,13 +380,7 @@ fn fnConnect(vm: *VM, args: []const Value) VmError!Value {
 /// `{:durability :commit | :durable}`; nil, or no `:durability`, means
 /// the process's (`NEXIS_DURABILITY`).
 fn durabilityOption(vm: *VM, v: Value) !?SyncMode {
-    if (v.isNil()) return null;
-    if (v.kind() != .persistent_map) return error.KindMismatch;
-    const k = try vm.ensureInterner().internKeywordValue("durability");
-    const found = switch (champ.mapGet(v, k, &dispatch.hashValue, &dispatch.equal)) {
-        .absent => return null,
-        .present => |x| x,
-    };
+    const found = (try option(vm, v, "durability")) orelse return null;
     if (found.kind() != .keyword) return error.InvalidArgument;
     const durability = dblayer.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse return error.InvalidArgument;
     return SyncMode.of(durability);
@@ -436,16 +445,12 @@ fn fnSync(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// Marshalling: Lisp → Val
+// Marshalling: datoms → Lisp
 // =============================================================================
 
 fn fixnum(n: u64) !Value {
     return value.fromFixnum(@intCast(n)) orelse error.ArithmeticOverflow;
 }
-
-// =============================================================================
-// Marshalling: datoms → Lisp
-// =============================================================================
 
 /// One read of the db-value in `arg`, with a scratch arena and a value
 /// builder: the prologue of a native that reads a view.
@@ -586,6 +591,9 @@ const TxHook = struct {
     }
 };
 
+/// The report map is read after the commit, in a read of its own: a
+/// failure there (no reader slot, no memory) surfaces though the
+/// transaction committed.
 fn transactNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     var fault: Fault = .{};
@@ -990,7 +998,7 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
             },
         }
     }
-    const want_t: ?u64 = if (args.len > 5 and !args[5].isNil()) try txOf(args[5]) else null;
+    const want_t: ?u64 = if (args.len > 5 and !args[5].isNil()) try tArg(args[5]) else null;
     const want_added: ?bool = if (args.len > 6 and !args[6].isNil()) (if (args[6].isBool()) args[6].asBool() else return error.KindMismatch) else null;
 
     var out: std.ArrayList(Value) = .empty;
@@ -1004,12 +1012,6 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 }
 
 /// A transaction as a program names it: its t or its entity id.
-fn txOf(v: Value) !u64 {
-    if (v.kind() != .fixnum or v.asFixnum() < 0) return error.KindMismatch;
-    const n: u64 = @intCast(v.asFixnum());
-    return key.txOfEntity(n) orelse n;
-}
-
 const fnIndexRange = wrap(indexRangeNative);
 
 /// `(index-range db attr start end)`: the AVET datoms of an indexed or

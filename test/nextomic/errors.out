@@ -23,7 +23,7 @@
 {:error :nextomic/tx-data, :message a keyword the store holds is at most 4077 bytes long}
 nil
 :db/open-failed
-{:error :nextomic/tx-data, :message a tempid used only as a value, or not at all, names no entity}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
 {:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
 ok a failed transaction leaves the basis alone
@@ -47,6 +47,14 @@ ok a refused ident retraction leaves every name resolving
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute}
+:nextomic/value-type
+:nextomic/no-entity
+{:error :nextomic/tx-data, :message :db.fn/cas never renames; assert the new :db/ident}
+{:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/_secret}
+{:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/a}
+ok an enum ident may start with _
 {:error :nextomic/cas, :attr :x/role, :expected :role/never, :actual :role/admin}
 ok a cas mints no ident for its old value
 :nextomic/closed

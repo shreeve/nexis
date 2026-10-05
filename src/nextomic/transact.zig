@@ -102,8 +102,6 @@ pub const CallHook = struct {
     call: *const fn (ctx: *anyopaque, f: Value, db_before: DbValue, args: []const Value) anyerror!Value,
 };
 
-/// Everything a transaction can fail with: its own errors, the
-/// db-value's, the value contract's and the store's.
 /// A map tx-data form: a hash map or a sorted one, as Datomic takes
 /// any `java.util.Map`.
 fn isMapForm(v: Value) bool {
@@ -130,6 +128,8 @@ const MapEntries = union(enum) {
     }
 };
 
+/// Everything a transaction can fail with: its own errors, the
+/// db-value's, the value contract's and the store's.
 pub const Failure = Error || stack.Error || db_mod.Error || marshal.Error || db_mod.ErrorsOf(Minter.lookup) || db_mod.ErrorsOf(Minter.resolve) || db_mod.ErrorsOf(Minter.lookupName) || db_mod.ErrorsOf(Store.scan) || db_mod.ErrorsOf(Txn.getFromTree) || db_mod.ErrorsOf(Store.currentPayload) || db_mod.ErrorsOf(champ.mapEmpty);
 
 pub const Options = struct {
@@ -558,7 +558,12 @@ const Ctx = struct {
     /// The ident id of keyword `k`, minted when new; a name retired by
     /// a rename is malformed tx-data.
     fn mintKeyword(self: *Ctx, k: u32) !u32 {
-        return self.minter.resolve(k) catch |err| switch (err) {
+        return self.minter.resolve(k) catch |err| self.identRefused(err);
+    }
+
+    /// A name the minter refuses is malformed tx-data.
+    fn identRefused(self: *Ctx, err: anytype) (@TypeOf(err) || error{TxData}) {
+        return switch (err) {
             error.RetiredIdent => self.malformed("a retired ident name is never reused"),
             error.IdentTooLong => self.malformed(ident_too_long),
             else => err,
@@ -623,11 +628,12 @@ const Ctx = struct {
     /// An explicit entity id, as an entity or a ref value, must have been
     /// handed out by its partition's allocator: a user id below the next
     /// user id, an attribute or ident id below the next ident id, a
-    /// transaction entity no newer than this transaction. Anything else
+    /// transaction entity from bootstrap (`t = 1`) to this transaction.
+    /// Anything else
     /// would collide with an id minted later: `error.NoEntity`.
     fn checkEid(self: *Ctx, id: u64) !u64 {
         if (id == 0 or id > key.id_max) return error.NoEntity;
-        if (key.txOfEntity(id)) |t| return if (t <= self.t) id else error.NoEntity;
+        if (key.txOfEntity(id)) |t| return if (t > 0 and t <= self.t) id else error.NoEntity;
         if (key.isAttrPartition(id)) return if (id < self.minter.next_aid) id else error.NoEntity;
         return if (id < self.next_eid) id else error.NoEntity;
     }
@@ -730,11 +736,7 @@ const Ctx = struct {
             },
             .entity => |e| {
                 if (attr.value_type != .ref) return error.ValueType;
-                return switch (try self.entityOf(e)) {
-                    .eid => |id| .{ .val = .{ .ref = id } },
-                    .tempid => |i| .{ .tempid = i },
-                    .lookup => |l| .{ .lookup = l },
-                };
+                return pvalOf(try self.entityOf(e));
             },
             .keyword => |k| {
                 if (attr.value_type != .keyword) return error.ValueType;
@@ -794,6 +796,7 @@ const Ctx = struct {
                 } else if (self.kwIs(op, "db.fn/cas")) {
                     if (n != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
                     const attr = try self.attrFromVm(vector_mod.nth(form, 2));
+                    if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident");
                     const e = try self.entityFromVm(vector_mod.nth(form, 1));
                     const old_v = vector_mod.nth(form, 3);
                     const op_cas = try self.arena.create(CasOp);
@@ -870,21 +873,27 @@ const Ctx = struct {
             if (self.kwIs(entry.key, "db/id")) continue;
             const v = entry.value;
             if (try self.reverseAttr(entry.key)) |attr| {
-                if (isCollection(v) and !try self.isLookupRef(v)) {
-                    for (try collectionElements(self.arena, v)) |el| try self.addReverse(e, attr, el);
-                } else {
-                    try self.addReverse(e, attr, v);
-                }
+                if (try self.elementsOf(v, true)) |els| {
+                    for (els) |el| try self.addReverse(e, attr, el);
+                } else try self.addReverse(e, attr, v);
                 continue;
             }
             const attr = try self.attrFromVm(entry.key);
-            if (attr.many() and isCollection(v) and !(attr.value_type == .ref and try self.isLookupRef(v))) {
-                for (try collectionElements(self.arena, v)) |el| try self.addFromVm(e, attr, el);
-            } else {
-                try self.addFromVm(e, attr, v);
-            }
+            if (attr.many()) if (try self.elementsOf(v, attr.value_type == .ref)) |els| {
+                for (els) |el| try self.addFromVm(e, attr, el);
+                continue;
+            };
+            try self.addFromVm(e, attr, v);
         }
         return e;
+    }
+
+    /// The values the collection `v` stands for, or null when `v` is one
+    /// value: not a collection, or under a ref attribute (`ref`) a
+    /// lookup ref.
+    fn elementsOf(self: *Ctx, v: Value, ref: bool) !?[]Value {
+        if (ref and try self.isLookupRef(v)) return null;
+        return marshal.collection(self.arena, v);
     }
 
     /// The ref attribute a `:ns/_attr` key reverses, or null for any
@@ -892,13 +901,26 @@ const Ctx = struct {
     fn reverseAttr(self: *Ctx, k: Value) !?*const Attr {
         if (k.kind() != .keyword) return null;
         const name = self.conn.interner.keywordName(k.asKeywordId());
-        const slash = std.mem.findScalar(u8, name, '/') orelse return null;
-        if (slash + 1 >= name.len or name[slash + 1] != '_') return null;
+        if (!reverseName(name)) return null;
+        const slash = std.mem.findScalar(u8, name, '/').?;
         const forward = try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] });
         const id = (try self.minter.lookupName(forward)) orelse return self.unknownAttr(k);
         const attr = (try self.attrCopy(id)) orelse return self.unknownAttr(k);
         if (attr.value_type != .ref) return self.malformed("a reverse ref needs a ref attribute");
         return attr;
+    }
+
+    /// `ns/_name`, the reverse of `ns/name` in a map form or a pull
+    /// pattern, which therefore names no attribute.
+    fn reverseName(name: []const u8) bool {
+        const slash = std.mem.findScalar(u8, name, '/') orelse return false;
+        return slash + 1 < name.len and name[slash + 1] == '_';
+    }
+
+    /// `:nextomic/schema` when attribute `a` would be known by a
+    /// reverse-ref name.
+    fn checkAttrName(self: *Ctx, a: u32, k: u32) !void {
+        if (reverseName(self.conn.interner.keywordName(k))) return self.schemaRefused(a, null, "an attribute name never starts with _, which marks a reverse ref");
     }
 
     /// `[referrer attr e]` for one value under a reverse ref: an entity,
@@ -1010,15 +1032,14 @@ const Ctx = struct {
                 return self.keywordValue(attr, v.asKeywordId(), use);
             },
             .ref => {
-                const e = self.entityFromVm(v) catch |err| switch (err) {
-                    error.TxData => return error.ValueType,
-                    else => return err,
-                };
-                return switch (e) {
-                    .eid => |id| .{ .val = .{ .ref = id } },
-                    .tempid => |i| .{ .tempid = i },
-                    .lookup => |l| .{ .lookup = l },
-                };
+                // A malformed lookup ref is malformed tx-data here as in
+                // entity position; a value of no entity kind is the
+                // wrong type.
+                switch (v.kind()) {
+                    .fixnum, .string, .keyword, .persistent_vector => {},
+                    else => return error.ValueType,
+                }
+                return pvalOf(try self.entityFromVm(v));
             },
             .string => {
                 if (v.kind() != .string) return error.ValueType;
@@ -1101,8 +1122,8 @@ const Ctx = struct {
     /// Commit, then publish the mints and update the schema
     /// cache, and report. Everything that can fail (the report's tempid
     /// bindings, the tx-data, room in the ident cache) is prepared
-    /// before the commit; after it only infallible steps remain, so a
-    /// committed transaction is never reported as an error.
+    /// before the commit; after it only infallible steps remain, so
+    /// `commit` never reports a committed transaction as an error.
     fn commit(self: *Ctx) !Report {
         const db_before = self.conn.at(self.now);
         const tempids = try self.userTempids();
@@ -1139,22 +1160,15 @@ const Ctx = struct {
     /// tempid takes the ident's id. On an entity that exists: a keyword
     /// naming it already is a no-op, one naming another entity a
     /// conflict, and a fresh keyword on an attribute-partition entity
-    /// renames it, retiring the old name. A retraction resolves the
-    /// keyword as any value.
+    /// renames it, retiring the old name. Only an assertion carries one:
+    /// a retraction matches its keyword (`keywordValue`), and a cas on
+    /// `:db/ident` is refused as it is read.
     fn bindIdents(self: *Ctx) !void {
         for (self.ops.items) |*op| {
-            const slot: *PVal = switch (op.*) {
-                .add => |*o| if (o.attr.id == boot.ident) &o.v else continue,
-                .retract => |*o| if (o.attr.id == boot.ident) &o.v else continue,
-                .cas => |c| &@constCast(c).new,
-                else => continue,
-            };
+            if (op.* != .add) continue;
+            const slot = &op.add.v;
             if (slot.* != .ident) continue;
             const k = slot.ident;
-            if (op.* != .add) {
-                slot.* = .{ .val = .{ .keyword = try self.mintKeyword(k) } };
-                continue;
-            }
             const existing = try self.minter.lookup(k);
             const e: ?u64 = switch (op.add.e) {
                 .eid => |id| id,
@@ -1175,11 +1189,8 @@ const Ctx = struct {
                 // its `:db/ident`; the first would retire a name no
                 // commit ever showed.
                 if (self.minter.renamed.contains(@intCast(eid))) return self.conflict(eid, boot.ident);
-                self.minter.rename(@intCast(eid), k) catch |err| switch (err) {
-                    error.RetiredIdent => return self.malformed("a retired ident name is never reused"),
-                    error.IdentTooLong => return self.malformed(ident_too_long),
-                    else => return err,
-                };
+                if (self.schema.attr(@intCast(eid)) != null) try self.checkAttrName(@intCast(eid), k);
+                self.minter.rename(@intCast(eid), k) catch |err| return self.identRefused(err);
                 break :blk @intCast(eid);
             };
             slot.* = .{ .val = .{ .keyword = id } };
@@ -1255,24 +1266,23 @@ const Ctx = struct {
             const g = try by_target.getOrPut(self.arena, .{ .a = d.attr.id, .root = self.root(t) });
             if (g.found_existing) try self.unify(d.e, g.value_ptr.*, d.attr.id) else g.value_ptr.* = d.e;
         }
-        // Fresh eids for the rest, each the entity of some op: a tempid
-        // only in value positions would name an entity with no datoms.
+        // Fresh eids for the rest, each the entity of an assertion: a
+        // tempid only in value positions or retractions would name an
+        // entity with no datoms.
         const named = try self.arena.alloc(bool, self.bindings.items.len);
         @memset(named, false);
         for (self.ops.items) |op| {
             const e: Ent = switch (op) {
                 .add => |o| o.e,
-                .retract => |o| o.e,
-                .retract_attr => |o| o.e,
-                .retract_entity => |e| e,
                 .cas => |c| c.e,
+                else => continue,
             };
             if (e == .tempid) named[self.root(e.tempid)] = true;
         }
         for (self.bindings.items, named) |*b, n| {
             if (b.alias != null) continue;
             if (b.eid != null) continue;
-            if (!n) return self.malformed("a tempid used only as a value, or not at all, names no entity");
+            if (!n) return self.malformed("a tempid no assertion stands on names no entity");
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
             self.next_eid += 1;
@@ -1723,6 +1733,7 @@ const Ctx = struct {
                 const flagged = c.unique or c.avet or c.fulltext or c.component;
                 if (c.value_type == null and !c.has_card and !flagged) continue;
                 if (c.value_type == null or !c.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+                if (try self.minter.keywordOf(c.a)) |k| try self.checkAttrName(c.a, k);
                 break :blk .{ c.value_type.?, c.many };
             };
             if (c.existing) |ex| if (c.has_card) {
@@ -1927,17 +1938,6 @@ const Ctx = struct {
         return out.toOwnedSlice(self.arena);
     }
 };
-
-fn isCollection(v: Value) bool {
-    return switch (v.kind()) {
-        .persistent_vector, .persistent_set, .list => true,
-        else => false,
-    };
-}
-
-fn collectionElements(arena: Allocator, v: Value) ![]Value {
-    return (try marshal.collection(arena, v)).?;
-}
 
 // =============================================================================
 // Tests

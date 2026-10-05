@@ -100,6 +100,18 @@
 (println (t/caught (d/transact! c [[:db/add :role/admin :db/unique :db.unique/value]])))
 (println (t/caught (d/transact! c [[:db/add :role/admin :db/index true]])))
 (println (t/caught (d/transact! c [[:db/add :role/admin :db/isComponent true]])))
+; A tempid only in retractions names no entity; a lookup ref on a
+; non-unique attribute is malformed as a ref value as it is as an
+; entity, and nil there is the wrong type; transaction 0 never existed;
+; a cas never renames; an attribute is never named like a reverse ref.
+(println (t/caught (d/transact! c [[:db/retract "zz" :x/a 1] [:db/retractEntity "yy"]])))
+(println (t/caught (d/transact! c [[:db/add a :user/boss [:user/age 1]]])))
+(println (t/caught (d/transact! c [[:db/add a :user/boss nil]])))
+(println (t/caught (d/transact! c [[:db/add t/tx-partition :db/doc "t0"]])))
+(println (t/caught (d/transact! c [[:db.fn/cas :x/a :db/ident :x/a :x/cas]])))
+(println (t/caught (d/transact! c [{:db/ident :x/_secret :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])))
+(println (t/caught (d/transact! c [[:db/add :x/a :db/ident :x/_a]])))
+(t/check "an enum ident may start with _" (map? (d/transact! c [{:db/ident :role/_hidden}])))
 ; A cas whose old value is a keyword the store has never seen fails
 ; as a cas naming that keyword, and mints nothing.
 (d/transact! c [[:db/add a :x/role :role/admin]])

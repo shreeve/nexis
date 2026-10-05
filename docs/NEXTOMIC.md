@@ -270,8 +270,8 @@ so there is no queue; emdb's write lock is the transactor.
    ident, or `"datomic.tx"` for the transaction entity. An explicit
    eid, as an entity or as a ref value, must have been handed out by
    its partition's allocator (a user id below `sys/"eid"`, an ident id
-   below `sys/"aid"`, a transaction entity no newer than this
-   transaction); any other id is `:nextomic/no-entity`, since it would
+   below `sys/"aid"`, a transaction entity from the bootstrap's (`t =
+   1`) to this transaction's); any other id is `:nextomic/no-entity`, since it would
    collide with an id minted later. An allocated entity whose datoms
    were all retracted stays addressable. Attributes resolve through the
    ident cache (unknown → `:nextomic/unknown-attribute`); each `v` is
@@ -303,9 +303,10 @@ so there is no queue; emdb's write lock is the transactor.
    an identity asserted anywhere in the same transaction; claims on an
    entity the transaction creates unify their tempids. Remaining tempids
    take eids from `sys/"eid"`, read once and bumped once; each must be
-   the entity of some form, since a tempid only in value positions (or
-   a map form holding nothing but `:db/id`) would name an entity with
-   no datoms (`:nextomic/tx-data`). Two identities that bind one tempid
+   the entity of some assertion (`:db/add`, a map form's attribute, a
+   cas), since a tempid only in value positions or retractions (or a
+   map form holding nothing but `:db/id`) would name an entity with no
+   datoms (`:nextomic/tx-data`). Two identities that bind one tempid
    to two entities are `:nextomic/conflict` on the first entity's
    attribute. A lookup ref names the committed holder of its `(a v)`,
    else the entity a unique assertion of the same tx-data puts `(a v)`
@@ -339,7 +340,9 @@ so there is no queue; emdb's write lock is the transactor.
    `"datomic.tx"` itself: that instant stands, in the datom and in the
    txlog entry. Instants never go back: an asserted instant earlier
    than the previous transaction's is `:nextomic/tx-data`, and a clock
-   behind it takes the previous instant. `:db/txInstant` on any other
+   behind it takes the previous instant, so an explicit instant later
+   than the clock holds every later transaction's instant at it until
+   the clock passes it. `:db/txInstant` on any other
    entity, or a retraction of one, is `:nextomic/tx-data`, since the
    txlog entry keeps each transaction's instant.
 5. **Schema**: schema changes are ordinary assertions on attribute
@@ -388,7 +391,11 @@ so there is no queue; emdb's write lock is the transactor.
      no datom; the transaction's entry holds only its `:db/txInstant`.
      An ident on a user-partition entity is `:nextomic/conflict`, and
      so are two renames of one entity in one transaction (two values
-     of its card-one `:db/ident`), which retire neither name.
+     of its card-one `:db/ident`), which retire neither name. An
+     attribute's name never has a name part starting with `_`
+     (`:ns/_name`), which a map form and a pull pattern read as the
+     reverse of `:ns/name`: a new attribute or a rename to one is
+     `:nextomic/schema`; an enum ident may carry one.
      An ident is never retracted, from an attribute or any other
      ident entity and by any form (`[:db/retract x :db/ident k]`, the
      bare `[:db/retract x :db/ident]`, a `:db/retractEntity`):
@@ -443,7 +450,8 @@ retracted) is `old`, nil meaning absent; otherwise it is
 matched, as a retraction's value is (step 2): a keyword the store has
 never seen mints nothing and matches no value, so the cas fails with
 `:expected` the keyword as the form wrote it. A card-many
-attribute is `:nextomic/tx-data`. The assertion then follows the
+attribute, or `:db/ident` (a rename is a `:db/add`), is
+`:nextomic/tx-data`. The assertion then follows the
 card-one rule of step 4, so two cas forms on one `(e a)` in one
 transaction conflict as two values would.
 
@@ -470,8 +478,9 @@ sync. A commit that syncs makes every commit before it durable too.
 A transaction's own `{:sync s}` overrides its connection's for its
 commit: `:full` syncs data and meta, `:no-meta` data alone, `:none`
 nothing. At connect `{:sync s}` sets that for every transaction of the
-connection and wins over `:durability`. Any other `:sync` or
-`:durability` value is the VM's `:invalid-argument`. Consecutive
+connection and wins over `:durability`. An option map is a hash map or
+a sorted one, as a map form is. Any other `:sync` or `:durability`
+value is the VM's `:invalid-argument`. Consecutive
 transactions are never joined into one emdb transaction (`docs/DB.md`
 §3.3 "No batching").
 
@@ -516,6 +525,8 @@ Every operation on a db-value opens one read transaction, reads
 - **history**: history trees, every datom with `t ≤ basis`, no fold,
   each with its `added` flag. `history` composes with `as-of` and with
   `since` (`history ∘ since T`: every datom with `T < t ≤ basis`).
+  Repeated bounds narrow: `as-of` keeps the older bound and `since`
+  the newer, so `(since (since db 3) 1)` is `(since db 3)`.
   `q` and `datoms` read a history view; `entity` and `pull` do not
   (`:nextomic/history-view`), since a map of current values has no
   meaning over retracted datoms.
@@ -966,7 +977,7 @@ m)` is the keyword. A key is present only when its value is known.
 | `:nextomic/basis-in-future` | a db-value newer than its file (§4) | bare |
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | bare |
 | `:nextomic/busy` | `release` while an operation is in flight | bare |
-| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute, a nested map nothing could reach, a value-only tempid, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:message`; `:attr` when an attribute is at fault |
+| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:message`; `:attr` when an attribute is at fault |
 | `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:message` and `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | bare |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | bare |
