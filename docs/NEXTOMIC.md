@@ -213,7 +213,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 
 | key | value |
 |---|---|
-| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction asserts or retracts an out-of-line value, whose current EAVT row holds `t` alone and whose retraction rows hold nothing (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place |
+| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction asserts or retracts an out-of-line value, whose current EAVT row holds `t` alone and whose retraction rows hold nothing (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place. A process reads the number when it opens the file: one that already holds the file open when another build raises it reads on under its own format until it reopens |
 | `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |

@@ -131,6 +131,7 @@ pub const Schema = struct {
         var events: std.ArrayList(Event) = .empty;
         var e: u64 = 0;
         var s = try Store.scanRange(txn, store.trees.hist(.eavt), &start, &end);
+        s.cursor.keysOnly = true;
         while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, true, kv.key);
             if (parts.e != e) {
@@ -219,10 +220,6 @@ pub const Schema = struct {
         out.count = p.count;
         return out;
     }
-
-    pub fn count(self: *const Schema) usize {
-        return self.attrs.count();
-    }
 };
 
 // =============================================================================
@@ -241,7 +238,7 @@ test "bootstrap schema has the eight attributes with their shapes" {
 
     const schema = try Schema.build(testing.allocator, store, txn, try store.readT(txn));
     defer schema.deinit();
-    try testing.expectEqual(@as(usize, boot.attrs.len), schema.count());
+    try testing.expectEqual(@as(usize, boot.attrs.len), schema.attrs.count());
     const ident = schema.attr(boot.ident).?;
     try testing.expectEqual(ValueType.keyword, ident.value_type);
     try testing.expectEqual(Unique.identity, ident.unique);
@@ -380,7 +377,7 @@ test "attrAt masks flags that arrived after the asked basis" {
     defer old.deinit();
     try testing.expect(!old.attr(a).?.indexed);
     try testing.expect(!old.attr(r).?.component);
-    try testing.expectEqual(@as(usize, boot.attrs.len + 2), old.count());
+    try testing.expectEqual(@as(usize, boot.attrs.len + 2), old.attrs.count());
 }
 
 test "a flag set and cleared again reads as each basis saw it" {

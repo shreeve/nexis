@@ -62,6 +62,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     // anything is deleted, so no cursor walks a tree being changed.
     {
         var s = try Store.scan(txn, store.trees.hist(.eavt), prefix);
+        s.cursor.keysOnly = true;
         while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, true, kv.key);
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = parts.top });
@@ -71,6 +72,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     const history_rows = rows.items.len;
     {
         var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
+        s.cursor.keysOnly = true;
         while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, false, kv.key);
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = null });

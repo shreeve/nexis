@@ -99,7 +99,6 @@ pub const OpenOptions = struct {
     /// How the connection's commits sync; null takes the process's
     /// durability (`NEXIS_DURABILITY`, NEXTOMIC.md §3).
     sync: ?SyncMode = null,
-    map_size: u64 = store_mod.initial_map_size,
 };
 
 pub const Conn = struct {
@@ -164,7 +163,7 @@ pub const Conn = struct {
 
     fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
         const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
-        const store = try Store.open(self.gpa, path, .{ .map_size = options.map_size, .sync = sync_mode });
+        const store = try Store.open(self.gpa, path, .{ .sync = sync_mode });
         errdefer store.close();
         try refreshFulltext(self.gpa, store, sync_mode);
         const gpa = self.gpa;

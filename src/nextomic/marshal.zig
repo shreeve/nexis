@@ -31,12 +31,12 @@ const value = @import("../value.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
+const string_mod = @import("../string.zig");
 const key = @import("key.zig");
 const datom_mod = @import("datom.zig");
 const db_mod = @import("db.zig");
 const schema_mod = @import("schema.zig");
 const relation = @import("relation.zig");
-
 const idents_mod = @import("idents.zig");
 
 const Allocator = std.mem.Allocator;
@@ -111,7 +111,8 @@ pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
     switch (v.kind()) {
         .fixnum => {
             const n = v.asFixnum();
-            if (n <= 0 or n > @as(i64, @intCast(key.id_max))) return error.NoEntity;
+            // A fixnum is at most `id_max` (§2.1).
+            if (n <= 0) return error.NoEntity;
             return @intCast(n);
         },
         .keyword => return rd.entid(arena, .{ .ident = v.asKeywordId() }),
@@ -232,7 +233,6 @@ pub fn cellOf(read: *Read, arena: Allocator, v: Val) !Cell {
 const testing = std.testing;
 const TestConn = db_mod.TestConn;
 const Heap = @import("../heap.zig").Heap;
-const string_mod = @import("../string.zig");
 const bignum = @import("../bignum.zig");
 const boot = @import("store.zig").boot;
 

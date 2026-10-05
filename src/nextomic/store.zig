@@ -114,7 +114,6 @@ pub const initial_map_size: u64 = 1 << 20;
 pub const map_grow_step: u64 = 8 << 20;
 
 pub const Options = struct {
-    map_size: u64 = initial_map_size,
     /// How the commit that creates, bootstraps or completes the store
     /// syncs.
     sync: SyncMode = .full,
@@ -260,7 +259,6 @@ pub const Store = struct {
     file: *db_layer.StoreFile,
     trees: Trees,
     uuid: [16]u8,
-    is_open: bool,
     /// The id of the `:db/fulltext` attribute in this store.
     fulltext_aid: u32,
 
@@ -278,13 +276,12 @@ pub const Store = struct {
             .file = try db_layer.StoreFile.acquire(path, .{
                 .pageSize = db_layer.page_size,
                 .maxNamedTrees = db_layer.max_named_trees,
-                .mapSize = options.map_size,
+                .mapSize = initial_map_size,
                 .growStep = map_grow_step,
                 .allocator = allocator,
             }),
             .trees = undefined,
             .uuid = @splat(0),
-            .is_open = false,
             .fulltext_aid = boot.fulltext,
         };
         errdefer self.file.release();
@@ -301,17 +298,13 @@ pub const Store = struct {
             }
             try self.file.commit(txn);
         }
-        self.is_open = true;
         return self;
     }
 
     /// Release the file and free the store. Called once; the
     /// connection owns the store.
     pub fn close(self: *Store) void {
-        if (self.is_open) {
-            self.file.release();
-            self.is_open = false;
-        }
+        self.file.release();
         self.allocator.destroy(self);
     }
 
@@ -367,7 +360,6 @@ pub const Store = struct {
 
     /// Begin a read transaction with all twelve trees loaded.
     pub fn beginRead(self: *Store) !*Txn {
-        if (!self.is_open) return error.Closed;
         const txn = try self.file.env.beginRead();
         errdefer txn.abort();
         try self.loadTrees(txn);
@@ -378,7 +370,6 @@ pub const Store = struct {
     /// seeing its uncommitted state, with all twelve trees loaded. The
     /// parent refuses mutations and commit until the child is finished.
     pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
-        if (!self.is_open) return error.Closed;
         const txn = try parent.beginReadChild();
         errdefer txn.abort();
         try self.loadTrees(txn);
@@ -389,7 +380,6 @@ pub const Store = struct {
     /// `error.WriterActive` while any store or `db/*` connection of the
     /// file holds it (`db.StoreFile.beginWrite`).
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
-        if (!self.is_open) return error.Closed;
         const txn = try self.file.beginWrite(.{ .sync = sync_mode.override() });
         errdefer txn.abort();
         try self.loadTrees(txn);
@@ -422,7 +412,6 @@ pub const Store = struct {
     /// Make every commit so far durable: one full sync, when a commit
     /// since the last left the file unsynced.
     pub fn sync(self: *Store) !void {
-        if (!self.is_open) return error.Closed;
         try self.file.sync();
     }
 
@@ -596,8 +585,8 @@ pub const Store = struct {
     }
 
     /// The `nx/fulltext` stamp: the folding its rows were written under
-    /// and the `t` they are current at; null when absent (rows an older
-    /// build wrote, folding ASCII only).
+    /// and the `t` they are current at; null when absent (rows that
+    /// fold ASCII only).
     pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
         const raw = (try self.sysGet(txn, "ft")) orelse return null;
         if (raw.len != 1 + key.id_len) return error.Corrupted;
@@ -671,8 +660,8 @@ pub const Store = struct {
         if (batch.len == 0) return;
         for (batch) |p| {
             if (p.payload != null) {
-                // A build that reads format 1 only would take a current
-                // or retraction row's missing payload for an empty value.
+                // A reader of format 1 alone would take a current or
+                // retraction row's missing payload for an empty value.
                 if (try self.sysGetInt(txn, "format", 2) < format_payload_once) try self.sysPutInt(txn, "format", 2, format_payload_once);
                 break;
             }
@@ -769,12 +758,6 @@ pub const Store = struct {
         var tb: [key.id_len]u8 = undefined;
         key.writeId(&tb, w.t);
         try txn.putInTree(self.trees.cur(w.index), k, &tb);
-    }
-
-    /// The current-tree value of `(e a v)` in `index`, or null.
-    pub fn getCurrent(self: *Store, txn: *Txn, index: Index, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
-        const k = try key.keyBytes(arena, index, e, a, vbytes, null);
-        return txn.getFromTree(self.trees.cur(index), k);
     }
 
     /// The out-of-line payload of the current datom `(e a v)`, copied
@@ -893,11 +876,10 @@ pub const Store = struct {
         }
     };
 
-    /// A history row: the key without `top`, its value, `t` and
-    /// `added`. Slices borrow the transaction's snapshot.
+    /// A history row: the key without `top`, `t` and `added`. The fact
+    /// borrows the transaction's snapshot.
     pub const HistoryRow = struct {
         fact: []const u8,
-        value: []const u8,
         t: u64,
         added: bool,
     };
@@ -923,7 +905,7 @@ pub const Store = struct {
                 const fact_len = row.key.len - key.top_len;
                 const top = try key.readTop(row.key[fact_len..][0..key.top_len]);
                 if (!self.window.contains(top.t)) continue;
-                const r: HistoryRow = .{ .fact = row.key[0..fact_len], .value = row.value, .t = top.t, .added = top.added };
+                const r: HistoryRow = .{ .fact = row.key[0..fact_len], .t = top.t, .added = top.added };
                 if (self.window == .all) return r;
                 if (self.pending) |p| {
                     if (std.mem.eql(u8, p.fact, r.fact)) {
@@ -944,8 +926,13 @@ pub const Store = struct {
         }
     };
 
+    /// The fold reads keys alone: an EAVT-h assertion row's payload is
+    /// read for the one datom that needs it (`getHistory`), never
+    /// assembled for every row the walk passes.
     pub fn foldScan(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
-        return .{ .inner = try scanRange(txn, tree, start, end), .window = window };
+        var inner = try scanRange(txn, tree, start, end);
+        inner.cursor.keysOnly = true;
+        return .{ .inner = inner, .window = window };
     }
 
     /// Number of entries in `tree` at the transaction's snapshot.
@@ -1563,7 +1550,7 @@ test "an out-of-line value is stored once in the index trees, on its assertion's
         const txn = try store.beginRead();
         defer txn.abort();
         try testing.expectEqual(2, try formatOf(store, txn));
-        try testing.expectEqual(key.id_len, (try store.getCurrent(txn, .eavt, e, 101, v, arena)).?.len);
+        try testing.expectEqual(key.id_len, (try txn.getFromTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, null))).?.len);
         try testing.expectEqualStrings(long, (try store.getHistory(txn, .eavt, e, 101, v, .{ .t = 3, .added = true }, arena)).?);
         try testing.expectEqualStrings(long, (try store.currentPayload(txn, e, 101, v, arena)).?);
     }
