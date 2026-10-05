@@ -52,6 +52,10 @@ const RuleSet = ir.RuleSet;
 
 pub const Error = error{ QuerySyntax, OutOfMemory, StackOverflow };
 
+/// The deepest `not`, `or` and `and` clauses nest, in a query or a rule
+/// body.
+pub const max_nesting = 1000;
+
 /// Where a syntax error was found. `clause` is the index into `:where`
 /// (or into the rule vector for rule parsing) when the error is inside
 /// a clause.
@@ -129,6 +133,9 @@ const Parser = struct {
     sources: std.ArrayList(u32) = .empty,
     rule_body: bool = false,
     clause_index: ?usize = null,
+    /// List clauses (`not`, `or`, `and`, a rule call) open around the
+    /// one being parsed; `max_nesting` caps it.
+    nesting: usize = 0,
     /// The `:find` element being parsed, and the source each
     /// `(pull $src ...)` names, resolved once `:in` is known.
     find_index: usize = 0,
@@ -484,6 +491,12 @@ const Parser = struct {
                 try out.append(self.arena, .{ .pattern = try self.parsePattern(parts) });
             },
             .list => {
+                // Planning walks a clause's variables once per level it
+                // sits under, so depth costs its square: the cap keeps a
+                // query value from outside to bounded work.
+                if (self.nesting == max_nesting) return self.fail("clauses nest more than 1000 deep");
+                self.nesting += 1;
+                defer self.nesting -= 1;
                 const parts = try self.elems(x);
                 if (parts.len == 0) return self.fail("empty clause");
                 const head = self.symName(parts[0]) orelse return self.fail("clause head must be a symbol");
@@ -880,13 +893,16 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
 }
 
 /// `=` over query values with lists and vectors told apart at every
-/// depth: `[?e :a (:b 1)]` and `[?e :a [:b 1]]` are equal as data but
-/// parse to different clauses. Anything that is not a list, vector or
-/// map compares by `=`.
+/// depth, and floats by their bits: `[?e :a (:b 1)]` and `[?e :a [:b
+/// 1]]` are equal as data but parse to different clauses, as do `0.0`
+/// and `-0.0`. A set element or a map key that is itself a collection
+/// or a float is matched against the other value's own elements and
+/// keys the same way. Anything else compares by `=`.
 fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
     try stack.check();
     if (a.kind() != b.kind()) return false;
     switch (a.kind()) {
+        .float => return @as(u64, @bitCast(a.asFloat())) == @as(u64, @bitCast(b.asFloat())),
         .persistent_vector => {
             const n = vector_mod.count(a);
             if (n != vector_mod.count(b)) return false;
@@ -906,10 +922,27 @@ fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
         .persistent_map => {
             if (champ.mapCount(a) != champ.mapCount(b)) return false;
             var it = champ.mapIter(a);
-            while (it.next()) |e| switch (champ.mapGet(b, e.key, &dispatch.hashValue, &dispatch.equal)) {
-                .absent => return false,
-                .present => |v| if (!try sameShape(e.value, v)) return false,
-            };
+            while (it.next()) |e| {
+                const found = champ.mapFind(b, e.key, &dispatch.hashValue, &dispatch.equal) orelse return false;
+                if (!try sameShape(e.key, found.key) or !try sameShape(e.value, found.value)) return false;
+            }
+            return true;
+        },
+        .persistent_set => {
+            if (champ.setCount(a) != champ.setCount(b)) return false;
+            var it = champ.setIter(a);
+            elems: while (it.next()) |x| {
+                switch (x.kind()) {
+                    .float, .persistent_vector, .list, .persistent_map, .persistent_set => {},
+                    else => {
+                        if (!champ.setContains(b, x, &dispatch.hashValue, &dispatch.equal)) return false;
+                        continue;
+                    },
+                }
+                var jt = champ.setIter(b);
+                while (jt.next()) |y| if (try sameShape(x, y)) continue :elems;
+                return false;
+            }
             return true;
         },
         else => return dispatch.equal(a, b),
@@ -1295,6 +1328,51 @@ test "rules parse with required groups and arity checks; caches hit by identity 
     cache.release(pv);
 }
 
+test "the cache tells apart values = conflates: -0.0, and lists from vectors in set elements and map keys" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    const set = struct {
+        fn of(h: *heap_mod.Heap, items: []const Value) Value {
+            return champ.setFromElements(h, items, &dispatch.hashValue, &dispatch.equal) catch unreachable;
+        }
+    };
+    try testing.expect(!try sameShape(value.fromFloat(0.0), value.fromFloat(-0.0)));
+    try testing.expect(try sameShape(value.fromFloat(1.5), value.fromFloat(1.5)));
+    const sv = set.of(&heap, &.{ b.vec(&.{ b.int(1), b.int(2) }), b.int(3) });
+    const sl = set.of(&heap, &.{ b.lst(&.{ b.int(1), b.int(2) }), b.int(3) });
+    try testing.expect(dispatch.equal(sv, sl));
+    try testing.expect(!try sameShape(sv, sl));
+    try testing.expect(try sameShape(sv, set.of(&heap, &.{ b.int(3), b.vec(&.{ b.int(1), b.int(2) }) })));
+    const mv = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), b.vec(&.{b.int(1)}), b.kw("a"), &dispatch.hashValue, &dispatch.equal);
+    const ml = try champ.mapAssoc(&heap, try champ.mapEmpty(&heap), b.lst(&.{b.int(1)}), b.kw("a"), &dispatch.hashValue, &dispatch.equal);
+    try testing.expect(dispatch.equal(mv, ml));
+    try testing.expect(!try sameShape(mv, ml));
+
+    // Through the cache: each spelling gets its own parse.
+    var cache = Cache.init(testing.allocator);
+    defer cache.deinit();
+    var diag: Diag = .{};
+    const ground = struct {
+        fn q(bb: Builder, x: Value) Value {
+            return bb.vec(&.{ bb.kw("find"), bb.sym("?x"), bb.kw("where"), bb.vec(&.{ bb.lst(&.{ bb.sym("ground"), x }), bb.sym("?x") }) });
+        }
+    };
+    const pos = try cache.acquire(&interner, ground.q(b, value.fromFloat(0.0)), &diag);
+    defer cache.release(pos);
+    const neg = try cache.acquire(&interner, ground.q(b, value.fromFloat(-0.0)), &diag);
+    defer cache.release(neg);
+    try testing.expect(pos != neg);
+    try testing.expect(std.math.signbit(neg.where[0].bind.call.args[0].constant.double));
+    const qs = try cache.acquire(&interner, ground.q(b, sv), &diag);
+    defer cache.release(qs);
+    const ql = try cache.acquire(&interner, ground.q(b, sl), &diag);
+    defer cache.release(ql);
+    try testing.expect(qs != ql);
+}
+
 test "clauses nested past the stack guard are StackOverflow" {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
@@ -1308,6 +1386,27 @@ test "clauses nested past the stack guard are StackOverflow" {
     defer stack.arm(stack.main_thread_budget);
     var diag: Diag = .{};
     try testing.expectError(error.StackOverflow, parse(testing.allocator, &interner, q, &diag));
+}
+
+test "clauses nest at most max_nesting deep" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const b = Builder{ .heap = &heap, .interner = &interner };
+    const pattern = b.vec(&.{ b.sym("?e"), b.kw("a"), b.sym("?v") });
+    for ([_][]const u8{ "not", "or", "and" }) |head| {
+        var clause = b.vec(&.{ b.sym("?e"), b.kw("a"), b.int(1) });
+        for (0..max_nesting) |_| clause = b.lst(&.{ b.sym(head), clause });
+        var diag: Diag = .{};
+        const ok = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag);
+        ok.deinit();
+        // 20,000 levels took seconds to parse when the depth had no cap.
+        for (0..20_000) |_| clause = b.lst(&.{ b.sym(head), clause });
+        try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag));
+        try testing.expectEqualStrings("clauses nest more than 1000 deep", diag.message);
+        try testing.expectEqual(@as(?usize, 1), diag.clause);
+    }
 }
 
 test "a full cache replaces its least recently used unpinned parse and marks what it holds" {

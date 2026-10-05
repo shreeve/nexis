@@ -266,6 +266,16 @@ pub const Relation = struct {
         index: RowIndex,
     };
 
+    /// Rows are numbered in `u32` (row indexes, join pairs, the rows a
+    /// step keeps): a relation that would hold more is refused as out
+    /// of memory.
+    pub const max_rows: usize = std.math.maxInt(u32);
+
+    fn grow(self: *Relation) !void {
+        if (self.rows == max_rows) return error.OutOfMemory;
+        self.rows += 1;
+    }
+
     /// An empty relation over `vars`, which are copied.
     pub fn init(arena: Allocator, vars: []const Var) !Relation {
         const cols = try arena.alloc(Column, vars.len);
@@ -306,24 +316,24 @@ pub const Relation = struct {
     /// Append one row given as cells in `vars` order.
     pub fn append(self: *Relation, cells: []const Cell) !void {
         std.debug.assert(cells.len == self.cols.len);
+        try self.grow();
         for (self.cols, cells) |*c, v| try c.append(self.arena, v);
-        self.rows += 1;
     }
 
     /// Append row `row` of `src`, whose variables are a superset of
     /// this relation's, in this relation's column order.
     pub fn appendFrom(self: *Relation, src: *const Relation, row: usize, map: []const usize) !void {
         std.debug.assert(map.len == self.cols.len);
+        try self.grow();
         for (self.cols, map) |*c, sc| try c.append(self.arena, src.cell(row, sc));
-        self.rows += 1;
     }
 
     /// Append row `row` of `src`, whose columns are this relation's
     /// columns in the same order.
     pub fn copyRow(self: *Relation, src: *const Relation, row: usize) !void {
         std.debug.assert(src.cols.len == self.cols.len);
+        try self.grow();
         for (self.cols, 0..) |*c, i| try c.append(self.arena, src.cell(row, i));
-        self.rows += 1;
     }
 
     /// Column indexes in `src` of this relation's variables.
@@ -638,6 +648,7 @@ pub const Relation = struct {
         // Room for one match per probing row, the common case of a join
         // on a key, so that neither list regrows in the arena; a cross
         // product knows its size.
+        if (on.len == 0 and std.math.mulWide(usize, self.rows, other.rows) > max_rows) return error.OutOfMemory;
         const pairs = if (on.len == 0) self.rows * other.rows else if (hash_other) self.rows else other.rows;
         try left.ensureTotalCapacityPrecise(arena, pairs);
         try right.ensureTotalCapacityPrecise(arena, pairs);
@@ -655,6 +666,7 @@ pub const Relation = struct {
                 var r = index.first(self.rowHashOn(on_self, i));
                 while (r) |j| : (r = index.after(j)) {
                     if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
+                    if (left.items.len == max_rows) return error.OutOfMemory;
                     try left.append(arena, @intCast(i));
                     try right.append(arena, j);
                 }
@@ -666,6 +678,7 @@ pub const Relation = struct {
                 var r = index.first(other.rowHashOn(on_other, j));
                 while (r) |i| : (r = index.after(i)) {
                     if (!self.rowsEqlOn(on_self, i, other, on_other, j)) continue;
+                    if (left.items.len == max_rows) return error.OutOfMemory;
                     try left.append(arena, i);
                     try right.append(arena, @intCast(j));
                 }
@@ -974,6 +987,16 @@ test "hash join on shared vars and cross product" {
     try testing.expectEqualSlices(Var, &.{ 0, 1 }, seeded.vars);
     // Every row of `people` comes out once, in order: its columns are lent.
     try testing.expectEqual(people.cols[1].cell.items.ptr, seeded.cols[1].cell.items.ptr);
+}
+
+test "a join past max_rows rows is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const a = try Relation.rowNumbers(arena, 0, 1 << 16);
+    // 2^16 × (2^16 + 1) pairs: past u32 before a pair is made.
+    const b = try Relation.rowNumbers(arena, 1, (1 << 16) + 1);
+    try testing.expectError(error.OutOfMemory, a.join(&b, &.{}));
 }
 
 test "join: either side hashed gives one order; dropped columns are not built" {

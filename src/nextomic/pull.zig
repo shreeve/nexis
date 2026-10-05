@@ -234,19 +234,7 @@ const Parser = struct {
     }
 
     fn elems(self: *Parser, v: Value) ![]Value {
-        var out: std.ArrayList(Value) = .empty;
-        switch (v.kind()) {
-            .persistent_vector => {
-                var it = vector_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            .list => {
-                var it = list_mod.Cursor.init(v);
-                while (it.next()) |x| try out.append(self.arena, x);
-            },
-            else => return self.fail("pattern must be a vector"),
-        }
-        return out.toOwnedSlice(self.arena);
+        return (try marshal.sequence(self.arena, v)) orelse self.fail("pattern must be a vector");
     }
 
     fn isSym(self: *Parser, v: Value, name: []const u8) bool {

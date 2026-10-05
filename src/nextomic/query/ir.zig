@@ -311,10 +311,6 @@ pub const Ir = struct {
         gpa.destroy(self);
     }
 
-    pub fn arena(self: *Ir) Allocator {
-        return self.arena_state.allocator();
-    }
-
     pub fn hasAggregates(self: *const Ir) bool {
         for (self.find) |f| if (f == .agg) return true;
         return false;

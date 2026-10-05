@@ -567,23 +567,31 @@ db and inputs.
 
 **Parse** → IR `{find, in, where, rules}` with a symbol table; a syntax
 error throws `{:error :nextomic/query-syntax :message "..." :clause i}`
-with the clause index when the error is inside `:where`; clauses nested
-past the native stack guard are the catchable `:stack-overflow`. The IR
+with the clause index when the error is inside `:where`. `not`, `or`,
+`and` and rule-call clauses nest at most 1000 deep (`parse.max_nesting`;
+deeper is `:nextomic/query-syntax`), since planning a clause costs a
+walk of the clauses around it; clauses nested past the native stack
+guard first are the catchable `:stack-overflow`. The IR
 is pure syntax, so it is cached per VM by query value (a hit is the
 same value, or one `=` to it with lists and vectors told apart at every
-depth) and reused across every db and basis; the rule set bound to `%`
+depth, set elements and map keys included, and floats by their bits, so
+`0.0` and `-0.0` parse apart) and reused across every db and basis; the rule set bound to `%`
 is cached the same way. A parse borrows from its query, so the VM's
 root walk marks every query value a cache holds (`docs/GC.md` §3); each
 cache holds at most 128 parses, and on a miss replaces the least recently used one no
 running query is using (`natives.State`). Constants in data patterns
 are encoded to their sortable bytes, and lookup refs and idents in
 constant positions resolve against the db, at plan time. `:in` inputs resolve
-by the role their variable plays in `:where`: one bound in an entity
-position, or in the value position under a constant ref attribute, may
-be a lookup ref or an ident and becomes its eid (one that names nothing
-matches nothing, so its row is dropped; a lookup ref whose value has the
-wrong type is `:nextomic/value-type`); one in the value position under
-a keyword-valued attribute stays a keyword.
+by the role their variable plays in the plan, rule bodies included: one
+read in an entity position, in the value position under a constant ref
+attribute, or as the entity of `missing?`, `get-else` or `get-some`, may
+be a lookup ref or an ident and becomes its eid; a recursive rule's
+argument plays the roles of the head position it binds. One that names
+nothing stays as it is and matches no datom, so its row stands or falls
+by the clauses around it: no row from a positive pattern, every row
+from `(not [?x :ref ?e])`, the other branches of an `or` (a lookup ref
+whose value has the wrong type is `:nextomic/value-type`). One in the
+value position under a keyword-valued attribute stays a keyword.
 
 **Plan** → ordered steps. Index choice by what is bound when the clause
 runs:
@@ -609,7 +617,10 @@ That scan costs the whole database and is the price of `[?e _ ?v]`
 without an attribute; give the attribute when it is known. A constant
 that cannot exist in the store (an unknown ident, a lookup ref with no
 entity, a value of the wrong type for the attribute) makes its scan
-unsatisfiable: it yields nothing and is not an error.
+unsatisfiable: it yields nothing and is not an error. A uuid value is
+its canonical lowercase text in a query, as a constant or a bound
+value: another spelling of it matches nothing (`parse-uuid` gives the
+canonical text).
 
 Clauses are ordered greedily by estimate given the variables bound so
 far; predicates run at the first point all their variables are bound.
@@ -668,7 +679,7 @@ input; a source input that is neither a db value nor a collection is
   same one. Each is one read transaction for the whole query;
   attributes, idents, lookup refs and keyword values resolve per source,
   and an input in an entity role resolves in the source of the first
-  pattern that gives it that role.
+  step of the plan that reads it so.
 - **A vector, list or set of tuples**: a pattern matches its tuples by
   position (`[e a v tx added]`; a tuple shorter than a position the
   pattern uses matches nothing), compares constants as written (a
@@ -718,7 +729,10 @@ before any qualified one, then by namespace, then by name); a
 comparison across other types (a string against a number, a number
 against a keyword) or of any other value (a vector) is
 `:nextomic/value-type`, as is an input or a
-function result whose shape does not fit its binding form. Any other
+function result whose shape does not fit its binding form. A function
+never binds a variable to nil: a nil result binds nothing under any
+binding form, and a nil element drops its element under `[?x ...]` or
+`[[?a ?b]]` and its row under `[?a ?b]` (a `_` may take nil). Any other
 symbol resolves through the namespace registry as the compiler resolves
 it (an alias-qualified `ns/name` to that namespace's own var, a bare
 name in the current namespace and then its auto-referred parents) and
@@ -732,10 +746,11 @@ clause (so a rule head may carry it), and the value it holds is applied
 when the clause runs: a function through `callValue`, a keyword or
 collection as the language applies them, anything else is the VM's
 `:not-callable`. A function is identity-valued in a relation. The `q`
-hook roots every user-function result for the query's life, and every
-heap value the pipeline builds before the result (a `tuple` or
-`fulltext` result bound as one value, an aggregate's vector or set;
-`docs/GC.md` §11.5).
+hook roots, for the query's life, every heap value the pipeline keeps
+across a later call: a function result it binds, a custom aggregate's
+result, and the values it builds itself (a `tuple` or `fulltext`
+result bound as one value, an aggregate's vector or set;
+`docs/GC.md` §11.5); a predicate's result is tested and dropped.
 
 **fulltext.** `[(fulltext $ :attr "needle") [[?e ?v]]]` binds, for a
 string attribute carrying `:db/fulltext` at the view's basis, every
@@ -782,17 +797,23 @@ form no group, so an aggregate-only query over nothing is empty (nil
 for `.` and `[...]`), not zero.
 
 **Relation** is a Zig-private columnar struct in the query arena
-(`vars`, typed columns for eids and longs, a `Value` column otherwise);
+(`vars`, typed columns for eids and longs, a column of cells otherwise);
 never a VM value, and never changed once built, so a relation made
 from another shares the columns it keeps (dropping a variable copies
-nothing). Results are copied into the VM heap as a persistent
+nothing). Rows are numbered in 32 bits: a step whose relation would pass
+2^32 − 1 rows (a cross product of two 70,000-row patterns) is
+`:out-of-memory`. Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups
-and dedups as `?e` and is applied when the result is copied, in the
-query's own snapshot of the source it names (`$` by default): the
-pattern's map, nil for an entity with no datoms, `:nextomic/value-type`
-when `?e` is not an entity id, `:nextomic/pull-syntax` for a bad
+and dedups as `?e`; its pattern resolves before the plan runs, so a
+bad one fails before any user function is called, and it is applied
+when the result is copied (to the one row `.` and `[...]` keep), in the
+query's own snapshot of the source it names (`$` by default): `?e`
+is an entity id, an ident or a lookup ref, resolved in that source; the
+pattern's map, nil for an entity with no datoms or a reference that
+names nothing, `:nextomic/value-type` when `?e` is any other value,
+`:nextomic/pull-syntax` for a bad
 pattern, `:nextomic/history-view` on a history db. `:keys`, `:strs` or
 `:syms` name every find element (one symbol each, relation find spec
 only) and the result is a vector of maps under those names as keywords,
@@ -803,10 +824,22 @@ arity and one required count, and every call to a rule, in the query or
 inside a rule body, passes that many arguments
 (`:nextomic/query-syntax` otherwise). A call to a non-recursive rule
 inlines the rule's bodies, renamed afresh for that call, as the
-branches of an `or-join` over its arguments. Recursive rules run
+branches of an `or-join` over its arguments. One query expands at most
+10,000 rule calls (`rules.max_calls`; more is `:nextomic/query-syntax`):
+a body that calls a rule twice doubles the expansion per level of the
+call graph, and the plan runs a step per expansion. Recursive rules run
 semi-naive: `total = base bodies; delta = total; repeat { new = ∪ bodies
 with one recursive call bound to delta, others to total, minus total;
-total ∪= new; delta = new } until delta is empty`. The fixpoint only
+total ∪= new; delta = new } until delta is empty`. A bound argument is
+pushed into the bodies only where the component is one rule and every
+recursive call passes the argument through unchanged; elsewhere it
+filters the result, so a required argument (`[(r [?n] ?out) ...]`) that
+a recursive call changes, and that a body needs bound, is
+`:nextomic/query-syntax` naming it. The fixpoint ends when a round adds
+no row, which every rule over datoms, inputs and constants reaches; a
+body that binds a function result (`[(inc ?n) ?m]`) can add new values
+every round, and its rule ends only where a predicate bounds them. The
+fixpoint only
 adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are anti-joins on the shared
