@@ -60,9 +60,6 @@ pub const TransientError = error{
     /// Op called on a frozen transient (owner_token == 0), after
     /// `persistentBang`.
     TransientFrozen,
-    /// Reserved for multi-isolate owner mismatch. No runtime code
-    /// path produces this variant.
-    TransientWrongOwner,
     /// `transientFrom` called on a Value whose kind is not a valid
     /// transient inner (must be .persistent_map / .persistent_set /
     /// .persistent_vector).
@@ -79,8 +76,8 @@ const EditError = TransientError || std.mem.Allocator.Error || error{Overflow};
 // =============================================================================
 
 const TransientBody = extern struct {
-    /// 0 = frozen; nonzero = active, the edit token (a `u32`) its
-    /// nodes carry.
+    /// 0 = frozen; nonzero = active, the edit token (26 bits,
+    /// `heap.edit_token_max`) its nodes carry.
     owner_token: u64,
 
     /// The root the transient owns. Never null on a well-formed
@@ -103,7 +100,9 @@ const TransientBody = extern struct {
 /// heap carries. When the clock would wrap, every map, set and vector
 /// block of the heap forgets its token (a root forgets its cached
 /// hash, which is recomputed) and every active transient takes a new
-/// one, so the clock restarts clear.
+/// one, so the clock restarts clear. That reaches every holder of a
+/// token because a token never leaves a wrapper: each edit reads its
+/// wrapper's at the edit (TRANSIENT.md §4).
 fn issueEditToken(heap: *Heap) u32 {
     if (heap.edit_clock == heap_mod.edit_token_max) retireEditTokens(heap);
     heap.edit_clock += 1;
@@ -162,7 +161,7 @@ fn innerValueForSubkind(subkind: u16, h: *HeapHeader) Value {
 }
 
 // =============================================================================
-// Public API — wrapping, unwrapping, snapshots
+// Public API — wrapping and unwrapping
 // =============================================================================
 
 /// Wrap a persistent map/set/vector Value as a fresh active transient
@@ -193,30 +192,6 @@ pub fn persistentBang(t: Value) TransientError!Value {
     if (body.owner_token == 0) return TransientError.TransientFrozen;
     body.owner_token = 0;
     return innerValueForSubkind(t.subkind(), body.inner_header);
-}
-
-/// A transient's root and token, as `snapshot` left them.
-pub const Snapshot = struct { inner: *HeapHeader, token: u64 };
-
-/// Keep the collection an active transient holds untouched from here
-/// on: the transient continues on a copy of its root under a new
-/// token, so its edits copy every node before writing it. `restore`
-/// puts the kept collection back; a caller whose edits must leave no
-/// trace when one of them raises takes a snapshot first
-/// (TRANSIENT.md §6).
-pub fn snapshot(heap: *Heap, t: Value) EditError!Snapshot {
-    std.debug.assert(t.kind() == .transient);
-    const body = transientBody(Heap.asHeapHeader(t));
-    if (body.owner_token == 0) return TransientError.TransientFrozen;
-    const kept: Snapshot = .{ .inner = body.inner_header, .token = body.owner_token };
-    const root = if (t.subkind() == subkind_transient_vector) try vector.copyRoot(heap, kept.inner) else try champ.copyRoot(heap, kept.inner);
-    body.* = .{ .owner_token = issueEditToken(heap), .inner_header = root };
-    return kept;
-}
-
-pub fn restore(t: Value, kept: Snapshot) void {
-    std.debug.assert(t.kind() == .transient);
-    transientBody(Heap.asHeapHeader(t)).* = .{ .owner_token = kept.token, .inner_header = kept.inner };
 }
 
 // =============================================================================
@@ -259,14 +234,13 @@ pub fn mapPutBang(heap: *Heap, t: Value, spot: champ.MapSpot, key: Value, val: V
     body.inner_header = try champ.mapPut(heap, body.inner_header, spot, key, val, editOf(body));
 }
 
-/// The edit token of an active transient: a native that builds
-/// vectors of its own inside a transient map's values edits them
-/// under it (`group-by`), so `persistent!` freezes them with the map.
-pub fn editToken(t: Value) TransientError!u32 {
-    if (t.kind() != .transient) return TransientError.TransientKindMismatch;
-    const body = transientBody(Heap.asHeapHeader(t));
-    if (body.owner_token == 0) return TransientError.TransientFrozen;
-    return editOf(body);
+/// Append `elem` to `v`, a vector of the native's own that only the
+/// transient map `t` reaches (`group-by`'s buckets), editing it under
+/// `t`'s token so `persistent!` freezes it with the map. The token is
+/// read at the edit: no native holds one (§4).
+pub fn vectorConjUnderBang(heap: *Heap, t: Value, v: Value, elem: Value) EditError!void {
+    const body = try activeBody(t, subkind_transient_map);
+    try vector.conjInPlace(heap, Heap.asHeapHeader(v), elem, editOf(body));
 }
 
 pub fn mapGetBang(t: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) TransientError!champ.MapLookup {
