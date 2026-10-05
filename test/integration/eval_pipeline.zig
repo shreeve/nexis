@@ -236,6 +236,8 @@ test "var-quote: #'x reads as (var x), and a printed Var reads back" {
     // FORMS.md §3: the reader turns `#'x` into the list `(var x)`.
     try expectOutput("[(= (var inc) #'inc) (identical? #'inc #'nexis.core/inc) (@#'inc 1)]", "[true true 2]");
     try expectOutputProgram("(def ^{:doc \"d\"} x 1) [#'x (:doc (meta #'x)) @#'x]", "[#'user/x d 1]");
+    // The metadata map is an expression, macros in it expanded.
+    try expectOutputProgram("(def ^{:k (when true 2) :d @(delay 3)} y 1) [(:k (meta #'y)) (:d (meta #'y))]", "[2 3]");
     try expectOutput("['#'x (read-string \"#' nexis.core/inc\")]", "[(var x) (var nexis.core/inc)]");
     try expectOutput("(= (read-string (pr-str (var inc))) '(var nexis.core/inc))", "true");
     try expectOutput("(identical? (eval (read-string (pr-str #'inc))) #'inc)", "true");
@@ -268,7 +270,12 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     // A docstring may span lines, as in Clojure.
     try expectOutputProgram("(defn ml\n  \"Line one.\n  Line two.\"\n  [] 1)\n[(ml) (:doc (meta (var ml)))]", "[1 Line one.\n  Line two.]");
     // Without metadata a defn's Var carries none.
-    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
+    // Every Var knows its name and namespace, and a defn its arglists.
+    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "{:arglists ([x]), :name plain, :ns user}");
+    try expectOutputProgram("(def x 1) [(:name (meta #'x)) (:ns (meta #'x))]", "[x user]");
+    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns])", "{:name mm, :ns my.app}");
+    // A name qualified with the current namespace is the name itself.
+    try expectOutputProgram("(def user/qq 1) (defn user/ff [] 2) [qq (ff) (:name (meta #'qq))]", "[1 2 qq]");
     // def and defmacro take the same spellings.
     try expectOutputProgram("(def ^:private v 1) [v (:private (meta (var v)))]", "[1 true]");
     try expectOutputProgram("(def ^{:doc \"dv\"} dv \"x\") [dv (:doc (meta (var dv)))]", "[x dv]");
@@ -348,8 +355,11 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     try expectOutput("(^:hint inc 1)", "2");
     try expectOutput("[(meta ^:foo [1 2]) (meta ^{:a (+ 1 2)} {:b 2}) (meta ^:s #{})]", "[{:foo true} {:a 3} {:s true}]");
     try expectOutput("(#(vector ^:m [%]) 1)", "[[1]]");
-    // A macro argument reaches the macro without its metadata.
-    try expectOutputProgram("(defmacro m [x] x) (m ^:foo [1])", "[1]");
+    // A macro argument reaches the macro with its metadata, as in
+    // Clojure, and the collection the macro returns keeps it.
+    try expectOutputProgram("(defmacro m [x] x) [(m ^:foo [1]) (meta (m ^:foo [1]))]", "[[1] {:foo true}]");
+    // A type hint names no class here: `:tag` and `:param-tags` stay symbols.
+    try expectOutputProgram("(defn ^[long String] f [x] x) [(f 1) (:param-tags (meta #'f)) (:tag (meta #'f))]", "[1 [long String] nil]");
     // ^meta inside syntax-quote reaches the definition the macro writes.
     try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
     try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
@@ -432,6 +442,22 @@ test "integration: quote inside a quoted form is the 2-list (quote x)" {
     try expectOutput("(first (rest ''x))", "x");
     try expectOutput("(= ''x '(quote x))", "true");
     try expectOutput("(eval ''x)", "x");
+}
+
+test "quote: reader sugar is the data it stands for, metadata included, as a macro receives it" {
+    try expectOutput("'@x", "(nexis.core/deref x)");
+    try expectOutput("'#(+ % 1)", "(fn* [%1] (+ %1 1))");
+    try expectOutput("(meta '^:m [1])", "{:m true}");
+    try expectOutput("(meta (second '(a ^:x [1])))", "{:x true}");
+    try expectOutput("(meta (quote ^{:k (+ 1 2)} {:a 1}))", "{:k (+ 1 2)}");
+    // A symbol carries no metadata in nexis.
+    try expectOutput("'^:k sym", "sym");
+    try expectOutput("(meta (read-string \"^:k [1]\"))", "{:k true}");
+    try expectOutputProgram("(defmacro mm [x] (meta x)) (mm ^:foo [1])", "{:foo true}");
+    try expectOutputProgram("(defmacro q [x] (list 'quote x)) [(= (q @y) '@y) (= (q #(inc %)) '#(inc %)) (meta (q ^:m [1]))]", "[true true {:m true}]");
+    // A macro may pass a binding vector with metadata on to let or for.
+    try expectOutputProgram("(defmacro my-let [bs & body] `(let ~bs ~@body)) (my-let ^:x [a 1] (inc a))", "2");
+    try expectOutput("(let ^:x [a 1] (for ^:y [b [a]] b))", "(1)");
 }
 
 test "integration: syntax-quote no unquote" {
@@ -677,6 +703,16 @@ test "try: a class-name matcher or :default catches anything, as Exception would
     try expectOutput("(try (throw :x) (catch :default e [:default e]))", "[:default :x]");
     // Clauses still run in order: a tag before a class name wins.
     try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
+}
+
+test "try: a class that names a nexis error catches that error alone, as in Clojure" {
+    try expectOutput("(try (throw (ex-info \"x\" {})) (catch IllegalArgumentException e :iae) (catch Exception e :ex))", ":ex");
+    try expectOutput("(try (inc nil) (catch ArithmeticException e :ae) (catch ClassCastException e :cce))", ":cce");
+    try expectOutput("(try (nth [1] 5) (catch java.lang.IndexOutOfBoundsException e :oob))", ":oob");
+    try expectOutput("(try ((fn [x] x)) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
+    try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
 }
 
 test "fn: a :pre/:post condition map checks arguments and the result" {
@@ -1147,6 +1183,23 @@ test "destructuring: a map pattern after & takes keyword arguments" {
     try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
     try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
     try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+    // With no arguments the rest is nil, and so is `:as`, as in Clojure.
+    try expectOutput("((fn [& {:as m}] m))", "nil");
+}
+
+test "destructuring: every map pattern takes a seq as keyword arguments, as Clojure 1.11 does" {
+    try expectOutput("(let [{:keys [a b]} (list :a 1 :b 2)] [a b])", "[1 2]");
+    try expectOutput("(do (defn f [opts] (let [{:keys [a b]} opts] [a b])) (f (list :a 1 :b 2)))", "[1 2]");
+    try expectOutput("(do (defn g [& opts] (let [{:keys [a]} opts] a)) (g :a 1))", "1");
+    try expectOutput("(do (defn h [{:keys [a]}] a) (h '(:a 1)))", "1");
+    try expectOutput("(let [{:keys [a] :as m} (list {:a 4})] [a m])", "[4 {:a 4}]");
+    // A vector is not a seq: its map pattern looks it up by index.
+    try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
+}
+
+test "destructuring: :as binds before the keys, so an :or default may read it" {
+    try expectOutput("(let [m {:a 5}] (let [{:keys [a] :or {a (:a m 0)} :as m} {}] a))", "0");
+    try expectOutput("(let [{:keys [a] :or {a (count m)} :as m} {:b 1}] a)", "1");
 }
 
 test "destructuring: loop bindings destructure and recur rebinds them" {
@@ -1234,6 +1287,61 @@ test "integration: (ns NAME) switches current namespace" {
         \\(ns user)
         \\my.app/x
     , "100");
+}
+
+/// Run `src` through the loader, as `nexis run` runs a file, and
+/// compare the last form's printed value with `expected`.
+fn expectLoaded(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    const result = try program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() });
+    try harness.expectResult(&program, src, result, expected);
+}
+
+/// Run `src` through the loader and expect it to fail to compile with
+/// the report `label`, located at the source text `at`.
+fn expectLoadFailure(src: []const u8, label: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
+    const d = program.loader.diagnostic.?;
+    try testing.expectEqualStrings(label, d.label);
+    try testing.expectEqualStrings(at, src[d.span.?.pos..][0..d.span.?.len]);
+}
+
+test "loader: a defmacro whose function does not compile is reported where and why, at the definition" {
+    try expectLoadFailure("(defmacro m [] (undefined-fn 1))", "compile error: defmacro m: unable to resolve symbol: undefined-fn", "undefined-fn");
+    try expectLoadFailure("(defmacro m [] (foo/bar 1))", "compile error: defmacro m: unable to resolve symbol: foo/bar", "foo/bar");
+    // A name the file defines later is a forward reference, as in any form.
+    try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
+}
+
+test "loader: a parse error names the delimiter left open" {
+    try expectLoadFailure("(println [1 2 3)", "parse error: unexpected `)`; the `[` at 1:10 is open", ")");
+    try expectLoadFailure("(def x 1)\n(defn f [x]\n  (+ x", "parse error: unclosed `(`", "(");
+    try expectLoadFailure("(def x 1) #{1 2", "parse error: unclosed `#{`", "#{");
+    try expectLoadFailure("(def x 1))", "parse error: unexpected `)`", ")");
+}
+
+test "loader: a top-level do runs its forms one at a time, as Clojure's eval does" {
+    try expectLoaded("(do (ns foo) (def x 1)) (ns user) [(resolve 'foo/x) (resolve 'user/x)]", "[#'foo/x nil]");
+    try expectLoaded("(do (def k 41) (defmacro m [] (inc k)) (m))", "42");
+    // A macro that expands to a `do` is split the same way.
+    try expectLoaded("(defmacro two [a b] `(do ~a ~b)) (two (def p 1) (defmacro q [] p)) (q)", "1");
+    try expectLoaded("(do (do 1 2) (do))", "nil");
+    try expectLoaded("(do 1 (do 2 3))", "3");
+}
+
+test "ns: a clause it refuses leaves the current namespace as it was" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.MacroExpansionFailure, program.run("(ns elsewhere (:import [java.util Date]))"));
+    try testing.expectEqualStrings("user", program.registry.current.name);
 }
 
 test "integration: defn in a namespace + qualified call" {
@@ -2178,7 +2286,7 @@ fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, a
         .registry = program.registry,
         .value_heap = program.v.ensureHeap(),
     };
-    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, null, form));
+    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, form));
     const failure = ctx.failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, failure.message);
     try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
@@ -2192,6 +2300,7 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
+    try expectMacroFailure("(defmacro m [] (atom 1))", "(m)", "a macro returned an atom, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
     // A macro body has no `eval` (MACROEXPAND.md §1.2).
     try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
@@ -2237,6 +2346,9 @@ test "defmacro: a macro body runs against the program's record types, namespaces
     try expectOutputProgram("(defmacro m [x] (macroexpand-1 x)) [(m (when 1 2)) (macroexpand-1 '(m (when 1 2)))]", "[2 (if 1 (do 2) nil)]");
     try expectOutputProgram("(defmacro m [x] (macroexpand x)) (m (-> 1 inc))", "2");
     try expectOutputProgram("(defmacro r [s] (read-string s)) (r \"(+ 1 2)\")", "3");
+    // So does the `defmacro`'s own definition: its metadata may call
+    // `resolve` or `reduced`.
+    try expectOutputProgram("(defmacro m {:k (str (resolve 'inc)) :r @(reduced 2)} [] 1) [(:k (meta #'m)) (:r (meta #'m)) (m)]", "[#'nexis.core/inc 2 1]");
 }
 
 test "defmacro: a store a macro opens belongs to the program" {
@@ -3851,6 +3963,8 @@ test "defprotocol: a docstring and options before the methods" {
         \\(extend-type :string Named (nm [s] (str "s:" s)))
         \\(nm "a")
     , "s:a");
+    // A method's arities and docstring land on its Var.
+    try expectOutputProgram("(defprotocol Sh (ar [s] [s x] \"Area.\")) (select-keys (meta #'ar) [:doc :arglists :name])", "{:doc Area., :arglists ([s] [s x]), :name ar}");
 }
 
 // =============================================================================
@@ -4093,6 +4207,31 @@ test "extend-protocol with :vector / :map friendly aliases" {
         \\    :map (bar [m] :m))
         \\  [(bar []) (bar {})])
     , "[:v :m]");
+}
+
+test "extend-protocol and extend-type: nil and Clojure class names, as Clojure code spells them" {
+    try expectOutputProgram(
+        \\(defprotocol Hello (hi [x]))
+        \\(extend-protocol Hello
+        \\  nil (hi [_] :nil)
+        \\  String (hi [s] [:s s])
+        \\  Long (hi [n] [:n n])
+        \\  clojure.lang.IPersistentVector (hi [v] :v)
+        \\  Boolean (hi [b] [:b b])
+        \\  Object (hi [_] :obj))
+        \\[(hi nil) (hi "a") (hi 1) (hi 100000000000000000000) (hi [1]) (hi true) (hi false) (hi :k)]
+    , "[:nil [:s a] [:n 1] [:n 100000000000000000000] :v [:b true] [:b false] :obj]");
+    try expectOutputProgram("(defprotocol Q (q [x])) (extend-type nil Q (q [_] :none)) (q nil)", ":none");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
+    try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
+}
+
+test "extend-type: a record another namespace defines, by alias, by refer or by its type symbol" {
+    const rec = [2][]const u8{ "rec.nx", "(ns rec)\n(defrecord R [a])\n" };
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :as r]) (defprotocol P (p [x])) (extend-type r/R P (p [x] (:a x))) (p (r/->R 5))", "5");
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :refer [R ->R]]) (defprotocol P (p [x])) (extend-type R P (p [x] (inc (:a x)))) (p (->R 5))", "6");
+    try expectOutputWithFiles(&.{rec}, "(require 'rec) (defprotocol P (p [x])) (extend-protocol P rec.R (p [x] (dec (:a x)))) (p (rec/->R 5))", "4");
 }
 
 test "extend-protocol with bogus type-kw: :invalid-argument" {
@@ -5306,6 +5445,14 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
     // Nesting past the stack budget is a reader error, not a fault.
     try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
+    // What follows the first form is never read, so it may not read at
+    // all, and costs nothing: a bad first form fails once, not at every
+    // later cut of the text.
+    try expectOutput("(read-string \"(a) ) \\\"\")", "(a)");
+    try expectOutput("(try (read-string (apply str \"{:a 1 :a 2}\" (repeat 100000 \" x\"))) (catch :reader-error e :bad))", ":bad");
+    try expectOutput("(try (read-string (apply str \"#_\" (repeat 100000 \" #_\"))) (catch :reader-error e :bad))", ":bad");
+    // A `\u{...}` char is one token, never cut short to `\u`.
+    try expectOutput("(try (read-string \"\\\\u{110000}\") (catch :reader-error e :bad))", ":bad");
 }
 
 // =============================================================================
@@ -5335,9 +5482,12 @@ test "eval: def binds in the current namespace; a macro it defines serves a late
     try expectOutputProgram("(ns my.app) (eval '(def z 9)) (ns user) [my.app/z (eval 'my.app/z)]", "[9 9]");
     // `(ns ...)` inside eval switches the current namespace, as at the REPL.
     try expectOutputProgram("(eval '(ns other)) (def w 1) (ns user) other/w", "1");
-    // A `def` after an `(ns ...)` inside one form binds in the
-    // namespace current when the form's compile started, as at the REPL.
-    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) w", "2");
+    // A `do` runs its forms one at a time, as Clojure's eval does:
+    // a `def` after an `(ns ...)` binds in that namespace, and a macro
+    // body sees a `def` made before it.
+    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) [other/w (resolve 'user/w)]", "[2 nil]");
+    try expectOutput("(eval '(do (def k 41) (defmacro mk [] (inc k)) (mk)))", "42");
+    try expectOutput("(eval '(do))", "nil");
 }
 
 test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {
@@ -5663,7 +5813,7 @@ test "gc: sorted collections under a comparator that collects keep every interme
 
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [a (atom [])] (dotimes [i 40] (swap! a (fn [v] (churn i) (conj v (str i))))) [(count @a) (last @a)])", "[40 39]");
-    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (meta (var v))", "{:i 19}");
+    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (:i (meta (var v)))", "19");
     try expectOutputUnderGc(churn ++ "(apply str (map (fn [x] (churn x) (str x)) (range 20)))", "012345678910111213141516171819");
     try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
 }
@@ -5711,7 +5861,7 @@ test "binding: only a dynamic Var can be bound; set! rebinds the innermost bindi
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
     try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
     try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
-    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true, :name *x*, :ns user}");
 }
 
 // =============================================================================
@@ -6016,6 +6166,11 @@ test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags
     try expectOutputWithFiles(&.{utilns}, "(require '[util :as-alias ua]) (require 'util) (ua/twice 3)", "6");
 }
 
+test "require: a file's ns form is found as the reader reads it, comments and discards before it" {
+    try expectOutputWithFiles(&.{.{ "appa.nx", "(ns ; the app\n  appa)\n(def x 1)\n" }}, "(require 'appa) appa/x", "1");
+    try expectOutputWithFiles(&.{.{ "appb.nx", "#_(old)\n(ns ^{:doc \"b {}\"} appb)\n(def y 2)\n" }}, "(require 'appb) appb/y", "2");
+}
+
 test "require: Clojure's library namespaces name nexis's" {
     try expectOutputWithFiles(&.{},
         \\(ns t (:require [clojure.string :as str :refer [trim]] clojure.test))
@@ -6066,7 +6221,7 @@ fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []
             .load_callback = dir.callback(),
             .value_heap = program.v.ensureHeap(),
         };
-        _ = expand_mod.expandForm(&ctx, null, form) catch {
+        _ = expand_mod.expandForm(&ctx, form) catch {
             failure = ctx.failure;
             break;
         };
@@ -6170,7 +6325,7 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     defer files.deinit();
     const Case = struct { src: []const u8, label: []const u8, file: ?[]const u8 = null, line: u32 = 0 };
     const cases = [_]Case{
-        .{ .src = "(require 'broken)", .label = "parse error: unexpected end of input", .file = "broken.nx", .line = 3 },
+        .{ .src = "(require 'broken)", .label = "parse error: unclosed `(`", .file = "broken.nx", .line = 2 },
         .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
@@ -6435,6 +6590,10 @@ test "syntax-quote qualifies a symbol to the namespace whose own Var it names" {
         \\(defn helper [x] (* x 5))
         \\(m)
     , "10");
+    // A referred or renamed name qualifies to the namespace that owns
+    // its Var, as in Clojure.
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer [twice half] :rename {half hv}]) [`twice `(hv 1)]", "[util/twice (util/half 1)]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.string :refer [join]]) `join", "nexis.string/join");
 }
 
 test "a user macro named like a core macro is the namespace's own" {

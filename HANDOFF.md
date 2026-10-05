@@ -121,8 +121,8 @@ Form {datum, origin}
                         sub-VM, syntax-quote with auto-gensym
 expanded Form
    │  src/compile.zig   lowerForm → Tiny IR → 64-bit bytecode: slot reuse, constant
-   ▼                    dedupe, captures marked while lowering, 15 arithmetic and
-                        comparison fns inlined when the name is nexis.core's own Var
+   ▼                    dedupe, captures marked while lowering, 14 arithmetic and
+                        comparison fns and `not` inlined when the name is nexis.core's own Var
 bytecode
    │  src/vm.zig        slot VM with group dispatch, closures, recur, try/catch/finally,
    ▼                    re-entrant callValue, a frame cap (2^20), a PC → span table

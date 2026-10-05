@@ -384,6 +384,26 @@ test "failures: a form that fails to compile leaves none of its locals in scope"
     try harness.expectResult(&program, "x", try program.run("x"), "5");
 }
 
+test "failures: (var x) of a name that is no Var, a local included, is UnresolvedSymbol and interns nothing" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(var nope)", null));
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(let* [y 1] (var y))", null));
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(var user/nope)", null));
+    try harness.expectResult(&program, "(resolve 'nope)", try program.run("(resolve 'nope)"), "nil");
+    // A name the file defines later is already its Var.
+    const src = "(do (def g-ref (var g)) (defn g [] 1) (g-ref))";
+    try harness.expectResult(&program, src, try program.runChecked(src, null), "1");
+}
+
+test "failures: a def inside quoted data declares nothing" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(def q (quote (def zz 1))) zz", null));
+}
+
 // =============================================================================
 // Properties
 // =============================================================================
@@ -679,7 +699,7 @@ fn fnCodeLen(program: *harness.Program, src: []const u8) !usize {
     return compiled.capture_descs[0].routine.code.len;
 }
 
-test "codegen: what common shapes cost (COMPILER.md §4.4)" {
+test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
     var program: harness.Program = undefined;
     try program.init();
     defer program.deinit();
@@ -731,6 +751,57 @@ test "codegen: what common shapes cost (COMPILER.md §4.4)" {
             return err;
         };
     }
+}
+
+test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(defn g [& _] 1) (defn h [& _] 1) (defprotocol P (pm [x]))");
+    // Each the whole body of `(fn* [a b c m xs] ...)`, or of the
+    // closure it makes when `inner`.
+    const Row = struct { form: []const u8, len: usize, inner: bool = false };
+    const rows = [_]Row{
+        .{ .form = "(g (h a) (h b) (h c))", .len = 12 },
+        .{ .form = "(g a b c)", .len = 6 },
+        .{ .form = "(str \"a\" a \"b\" b)", .len = 7 },
+        .{ .form = "{:a (inc a) :b (g b) :c c}", .len = 10 },
+        .{ .form = "(pm a)", .len = 4 },
+        .{ .form = "(:x a)", .len = 4 },
+        .{ .form = "(nexis.test/is (= 1 (inc (dec a))))", .len = 8 },
+        .{ .form = "(nexis.test/is (pos? a))", .len = 8 },
+        .{ .form = "(nexis.test/is (thrown? :x (g a)))", .len = 16 },
+        .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
+        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 24 },
+        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 29, .inner = true },
+        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
+        .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },
+        .{ .form = "(case a :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)", .len = 46 },
+        .{ .form = "(condp = a 1 :a 2 :b 3 :c :d)", .len = 20 },
+        .{ .form = "(when-let [x (g a)] (h x))", .len = 9 },
+        .{ .form = "(if-let [x (g a)] (h x) (h b))", .len = 12 },
+        .{ .form = "(and (h a) (h b) (h c))", .len = 14 },
+        .{ .form = "(-> a (g b) (h) (g c))", .len = 10 },
+        .{ .form = "(doseq [x xs] (g x))", .len = 15 },
+        .{ .form = "(for [x xs] (h x))", .len = 24 },
+        .{ .form = "(dotimes [i a] (g i))", .len = 9 },
+        .{ .form = "(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))", .len = 9 },
+        .{ .form = "(try (g a) (catch :x e (h e)) (finally (g b)))", .len = 22 },
+        .{ .form = "(assert (pos? a) \"a must be positive\")", .len = 10 },
+    };
+    var failed = false;
+    for (rows) |row| {
+        const src = try testing.allocator.print("(fn* [a b c m xs] {s})", .{row.form});
+        defer testing.allocator.free(src);
+        const compiled = try compileIn(&program, src);
+        var routine = compiled.capture_descs[0].routine;
+        if (row.inner) routine = routine.capture_descs[0].routine;
+        if (routine.code.len != row.len) {
+            std.debug.print("\n  {s}: {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, routine.code.len, row.len });
+            failed = true;
+        }
+    }
+    try testing.expect(!failed);
 }
 
 test "slots: a routine's frame holds what is live at once, not every temporary it ever used" {
@@ -848,6 +919,147 @@ test "eval: a form's lowering is freed once its routine is compiled" {
         std.debug.print("\n  {d} bytes kept per eval\n", .{per_eval});
         return err;
     };
+}
+
+test "loader: a top-level form's trees are freed once it has run; only its routines stay" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    // As the REPL and `require` load: routines on the runtime arena.
+    const runtime = program.v.runtime_arena.allocator();
+    const info = nx.vm.SourceInfo{ .path = "<test>", .text =
+        \\(defn f [x] (let [{:keys [a b] :or {a 1}} x] (when (and a b) (cond (> a b) a :else (case b 1 :one 2 :two :many)))))
+        \\(defmacro m [x] `(let [y# ~x] (if (map? y#) (f y#) y#)))
+        \\(m {:a 2 :b 1})
+    };
+    _ = try program.loader.evalSource(&info, .{ .allocator = runtime });
+    const before = program.v.runtime_arena.queryCapacity();
+    for (0..100) |_| _ = try program.loader.evalSource(&info, .{ .allocator = runtime });
+    // A few kilobytes of routines per pass, not the Form and Tiny
+    // trees and the Emitter's scratch they were compiled from.
+    const per_pass = (program.v.runtime_arena.queryCapacity() - before) / 100;
+    testing.expect(per_pass < 8192) catch |err| {
+        std.debug.print("\n  {d} bytes kept per pass\n", .{per_pass});
+        return err;
+    };
+}
+
+test "slots: a try's catch binding takes a slot only in its handler" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    // Fifty nested trys share one binding slot; with a finally, each
+    // level holds its body's value in a slot of its own until the
+    // finally has run.
+    for ([_][]const u8{ ")", " (finally nil))" }, [_]usize{ 4, 54 }) |close, most| {
+        src.clearRetainingCapacity();
+        try src.appendSlice(testing.allocator, "(fn* [x] ");
+        for (0..50) |_| try src.appendSlice(testing.allocator, "(try (inc ");
+        try src.appendSlice(testing.allocator, "(throw x)");
+        for (0..50) |_| try src.print(testing.allocator, ") (catch any e (inc e)){s}", .{close});
+        try src.appendSlice(testing.allocator, ")");
+        const slots = (try compileIn(&program, src.items)).capture_descs[0].routine.slot_count;
+        testing.expect(slots <= most) catch |err| {
+            std.debug.print("\n  nested try{s}: {d} slots\n", .{ close, slots });
+            return err;
+        };
+        const call = try testing.allocator.print("({s} 1)", .{src.items});
+        defer testing.allocator.free(call);
+        try harness.expectResult(&program, "nested try", try program.run(call), "51");
+    }
+}
+
+/// Sources of `n` operands, clauses or nesting levels, each of a shape
+/// some pass of the front end once walked again at every level.
+const Growing = enum {
+    /// The expander re-listed the rest of the operands at each step.
+    and_operands,
+    /// Whether the then arm of each `if` falls through.
+    then_nested_if,
+    /// Whether the rest of each and-shaped `let*` reads its name.
+    and_shape,
+    /// Each `case` constant against every other, for a duplicate.
+    case_constants,
+
+    fn source(shape: Growing, allocator: std.mem.Allocator, n: usize) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        switch (shape) {
+            .and_operands => {
+                try out.appendSlice(allocator, "(let* [x 1] (if (and");
+                for (0..n) |_| try out.appendSlice(allocator, " x");
+                try out.appendSlice(allocator, ") 1 2))");
+            },
+            .then_nested_if => {
+                try out.appendSlice(allocator, "(let* [x 1 y ");
+                for (0..n) |_| try out.appendSlice(allocator, "(if x ");
+                try out.appendSlice(allocator, "x");
+                for (0..n) |_| try out.appendSlice(allocator, " 2)");
+                try out.appendSlice(allocator, "] y)");
+            },
+            .and_shape => {
+                try out.appendSlice(allocator, "(let* [x 1] (if ");
+                for (0..n) |i| try out.print(allocator, "(let* [g{d} x] (if g{d} ", .{ i, i });
+                try out.appendSlice(allocator, "x");
+                for (0..n) |k| try out.print(allocator, " g{d}))", .{n - 1 - k});
+                try out.appendSlice(allocator, " 1 2))");
+            },
+            .case_constants => {
+                try out.appendSlice(allocator, "(case 5");
+                for (0..n) |i| try out.print(allocator, " :k{d} {d}", .{ i, i });
+                try out.appendSlice(allocator, " 0)");
+            },
+        }
+        return out.toOwnedSlice(allocator);
+    }
+};
+
+/// The least thread CPU time of three runs of `src`, each compiled
+/// and run on a fresh program, in nanoseconds.
+fn bestRunNanos(src: []const u8) !u64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        var program: harness.Program = undefined;
+        try program.init();
+        defer program.deinit();
+        const start = std.Io.Clock.cpu_thread.now(testing.io);
+        _ = try program.run(src);
+        best = @min(best, @as(u64, @intCast(start.durationTo(std.Io.Clock.cpu_thread.now(testing.io)).nanoseconds)));
+    }
+    return best;
+}
+
+fn growthRatios(failed: *bool) void {
+    nx.stack.arm(480 << 20);
+    for (std.enums.values(Growing)) |shape| {
+        var nanos: [2]u64 = undefined;
+        for (&nanos, [_]usize{ 2500, 10_000 }) |*t, n| {
+            const src = shape.source(std.heap.page_allocator, n) catch return;
+            defer std.heap.page_allocator.free(src);
+            t.* = bestRunNanos(src) catch |err| {
+                std.debug.print("\n  {t} at {d}: {s}\n", .{ shape, n, @errorName(err) });
+                failed.* = true;
+                return;
+            };
+        }
+        // Four times the input takes about four times as long when the
+        // cost is linear, sixteen when it is quadratic.
+        const ratio = @as(f64, @floatFromInt(nanos[1])) / @as(f64, @floatFromInt(@max(nanos[0], 1)));
+        if (ratio > 9) {
+            std.debug.print("\n  {t}: {d} ns at 2500, {d} ns at 10000 ({d:.1}x)\n", .{ shape, nanos[0], nanos[1], ratio });
+            failed.* = true;
+        }
+    }
+}
+
+test "compile time grows linearly in operands, clauses and nesting" {
+    // Deep nesting needs a deep stack, as the CLI's runtime thread has.
+    var failed = false;
+    const thread = try std.Thread.spawn(.{ .stack_size = 512 << 20 }, growthRatios, .{&failed});
+    thread.join();
+    try testing.expect(!failed);
 }
 
 // =============================================================================

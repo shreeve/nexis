@@ -187,8 +187,9 @@ qualified by the current namespace (`"<ns>/Name"`).
 
 A docstring and `:option value` pairs before the methods are accepted
 and ignored. Each method spec must be a non-empty list headed by an
-unqualified symbol; its parameter vectors (and anything after them)
-are ignored. A method's arities are its impl's own: the registry
+unqualified symbol; its parameter vectors become the method Var's
+`:arglists` and a docstring among them its `:doc`, as in Clojure,
+and dispatch ignores them. A method's arities are its impl's own: the registry
 records none, and whichever impl the dispatcher calls picks the arity
 by the argument count or raises `:arity-mismatch` (§4.2).
 
@@ -251,7 +252,9 @@ swapped, so a method's arities take either spelling of §4.2:
 | keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{builtin, kind}`; `:fixnum` and `:bignum` are one key (§3.2) |
 | `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases for `:persistent_vector` / `:persistent_map` / `:persistent_set` |
 | `:any` | `#%extend-default-impl` | the method's `default_impl` |
-| record symbol `Counter` | `#%extend-record-impl` with `Counter-type-id` | `{record, type_id}` |
+| `nil` | `#%extend-builtin-impl` with `:nil` | `{builtin, nil}` |
+| a Clojure class name, bare or under `java.lang.`, `java.util.` or `clojure.lang.`: `Object` (`:any`), `String`, `Long`/`Integer`/`BigInt` (`:fixnum`), `Double` (`:float`), `Number` (both), `Boolean` (`:true_` and `:false_`), `Character`, `Keyword`, `Symbol`, `IPersistentVector`, `IPersistentMap`/`Map` (`:map` and `:sorted_map`), `IPersistentSet`/`Set`, `ISeq`/`IPersistentList` (`:list`), `IFn` (`:function` and `:native_fn`), `Atom`, `Var` | the impl for each kind it stands for, so code written for Clojure extends the same values | as for the keywords |
+| record symbol `Counter`, `alias/Counter`, a referred `Counter`, or its type symbol `ns.Counter` | `#%extend-record-impl` with `Counter-type-id` in the record's namespace | `{record, type_id}` |
 
 The keyword-to-kind mapping is derived from the `Kind` enum's field
 names at compile time, so every kind tag is accepted under its enum
@@ -259,7 +262,10 @@ name (booleans are `:false_` and `:true_`; there is no `:bool`). A
 keyword that names no kind and no alias raises `:invalid-argument`
 when the expansion runs; the macro does not validate type names. A
 record symbol no `defrecord` produced fails as an unbound
-`<Name>-type-id`.
+`<Name>-type-id`, and a dotted name whose prefix is no namespace (a
+Java class nexis does not have) at expansion. A `defrecord` method
+group headed `Object` (`toString`, `equals`, `hashCode`) is refused:
+nexis has no classes.
 
 #### 4.4 `satisfies?`
 
@@ -377,7 +383,6 @@ namespace.
 ### 8. Absences
 
 - No `Counter.` constructor syntax; `->Counter` is the constructor.
-- `defrecord` does not bind the type name (§0).
 - No default impl inside `defprotocol`; defaults are installed with
   `extend-protocol ... :any`.
 - No arity check at the protocol fn: the impl checks its own (§4.1).

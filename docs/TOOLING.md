@@ -93,9 +93,13 @@ nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
              ^^^
 ```
 
-The label is ``parse error: unexpected `)` `` or `parse error: unexpected
-end of input` at the token the parser stopped on, or `parse error:
-unterminated string` at the `"` of a string literal no quote closes;
+The label is ``parse error: unexpected `)` `` at the token the parser
+stopped on, naming the delimiter still open when the token is a closer
+of another kind (``unexpected `)`; the `[` at 1:10 is open``);
+``parse error: unclosed `(` `` at the innermost delimiter the text
+leaves open, or `parse error: unexpected end of input` at the end when
+none is; or `parse error: unterminated string` at the `"` of a string
+literal no quote closes;
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span
@@ -193,7 +197,7 @@ pins the listing of `examples/sum10.nx`:
 
 ```
 routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=println  ; 4:2
+  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
   0001  mov:load-const      s3  c0=0  ; 5:13
   0002  mov:load-const      s4  c0=0  ; 5:19
   0003  cmp:lt              s5  s3  c1=10  ; 6:9
@@ -223,7 +227,7 @@ into a temporary because `(+ acc i)` still reads `i` (COMPILER.md
   constant shows its value as `pr-str` prints it (`c2=1`), cut at a
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
-  var its name (`v0=println`). Operand B of `call:call`,
+  var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
   `call:tailcall` and every `coll:*` is a raw immediate (VM.md §4.5)
   and prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
@@ -278,8 +282,9 @@ the private helpers.
   `thrown?` with a keyword tag is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
-  `nexis.test`: `(is (= a 1))` is six instructions, the helper, the
-  form, the two values, the message and the call.
+  `nexis.test`: `(is (= a 1))` as a function's body is seven
+  instructions, the helper, the form, the two values, the message, the
+  call and the return (COMPILER.md §4.8).
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
 - `(run-tests)` runs the current namespace's tests in definition

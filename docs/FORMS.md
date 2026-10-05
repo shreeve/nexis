@@ -68,9 +68,10 @@ foo, ns/foo, set!, ->>               ;; symbol
 |---|---|
 | `^:kw x` | `(with-meta x {:kw true})` |
 | `^{:a 1} x` | `(with-meta x {:a 1})` |
-| `^sym x` | `(with-meta x {:tag sym})` |
+| `^sym x`, `^"String" x` | `(with-meta x {:tag sym})`, `(with-meta x {:tag "String"})` |
+| `^[long] f` | `(with-meta f {:param-tags [long]})`, as Clojure 1.12 reads it |
 | `^:a ^:b x` | one `with-meta`, the chain's maps merged; on a duplicate literal key the outer (leftmost) `^` wins, and keys sit in the order of their last occurrence |
-| `^42 x` | `:unknown-reader-construct` "metadata must be a keyword, map, or symbol" |
+| `^42 x` | `:unknown-reader-construct` "metadata must be a keyword, map, symbol, string or vector" |
 | `#_ x y` | `x` is dropped by the parser; only `y` remains |
 | `'#_ x y`, `^:m #_ x y` | the prefix takes the form after the dropped one: `(quote y)`, `(with-meta y {:m true})` |
 | `#_ #_ x y z` | each `#_` drops one form: only `z` remains |
@@ -85,10 +86,16 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `#{1 1 2}` | `:duplicate-literal-element`, detail the element |
 | `{:a}` | `:map-odd-count` |
 | `42N`, `0xFFN`, `18446744073709551616N` | the integer, as without the suffix |
-| `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M` | `:bad-number-literal`, detail the token |
+| `+5`, `+0x10`, `+1.5` | the number: a leading `+` is a sign, as in Clojure |
+| `1abc`, `1-2`, `1.5x`, `1/2`, `1.`, `0x`, `3.14M`, `1_000`, `1.0_5` | `:bad-number-literal`, detail the token |
+| `:1`, `:2a` | a keyword: one may start with a digit, as in Clojure |
+| `nexis.core//` | the symbol `/` qualified, as syntax-quote prints it (`clojure.core//` in Clojure) |
 | `"one⏎two"` | a string may span lines; the newline is part of it |
 | `"\u00e9"`, `"\uD83D\uDE00"` | Clojure's escape: `\u` and exactly four hex digits name a UTF-16 unit, and a high surrogate followed by a `\uXXXX` low one spells one scalar (`"é"`, `"😀"`) |
-| `"a\qb"`, `"\u{D800}"`, `"\u41"`, `"\uD800"`, `"\uDE00\uD83D"` | `:invalid-string-escape`, detail the escape |
+| `"\n"`, `"\t"`, `"\r"`, `"\b"`, `"\f"`, `"\\"`, `"\""` | newline, tab, return, backspace, formfeed, backslash and quote, the escapes a string may hold besides `\u` and octal |
+| `"\0"`, `"\101"`, `"\377"` | Clojure's octal escape: one to three octal digits, at most `\377`, naming U+0000 to U+00FF (`"\101"` is `"A"`) |
+| `"\u{2603}"` | the scalar the hex digits name (PLAN §23 #26) |
+| `"a\qb"`, `"\400"`, `"\u{D800}"`, `"\u{+41}"`, `"\u41"`, `"\uD800"`, `"\uDE00\uD83D"` | `:invalid-string-escape`, detail the escape |
 | `λ`, `ns.é/π`, `:ключ` | a symbol or keyword may hold any non-ASCII UTF-8 character |
 | a UTF-8 byte-order mark (U+FEFF) | skipped when it starts the source, as whitespace; anywhere else a symbol constituent, as in Clojure |
 | a string, symbol or keyword that is not UTF-8 | `:invalid-utf8` |
@@ -105,7 +112,7 @@ foo, ns/foo, set!, ->>               ;; symbol
 on the first error and produces no partial tree.
 
 **Number token boundary.** A token that begins with a digit, or with
-`-` and a digit, ends where a symbol would: at whitespace, a comma,
+`-` or `+` and a digit, ends where a symbol would: at whitespace, a comma,
 a delimiter (`( ) [ ] { }`), `"`, `;`, a reader macro character
 (`' ` ~ @ ^ \`) or the end of input. The lexer never splits `1abc`
 into `1` and `abc` or `1-2` into `1` and `-2`; the reader reads the

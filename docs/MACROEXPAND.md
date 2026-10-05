@@ -58,6 +58,7 @@ fields:
 | `value_heap` | the calling VM's heap, where macro arguments and results live; else a lazily created heap on `allocator` |
 | `io` | given to a user macro's sub-VM so its body can print |
 | `failure` | the span and message of the innermost failure (§8) |
+| `lexical` | the lexical names in scope where the walk is (§3) |
 
 `ctx.gensym(base)` makes `<base>__<N>__auto__` (§4).
 
@@ -71,7 +72,7 @@ For a list whose head is an unqualified symbol:
    `def`, `set!`, `try`, `defmacro`, `ns`, `require`), each with its
    own walker, and every `#%` name (`#%list`, `#%concat`, ...),
    whose arguments expand as a call's do.
-2. A name bound in the lexical `ExpandEnv` is an ordinary call (§3).
+2. A name a binding form around the call binds is an ordinary call (§3).
 3. **User macro**: `namespace.lookup(name)` yields a bound Var with
    `macro = true` → §1.2. Any other Var it yields that is not
    `nexis.core`'s (one the namespace defines or excludes, or a
@@ -115,18 +116,28 @@ otherwise it is an ordinary call. User macros shadow host macros.
    to save and restore. The macro routine's Var table points into
    the caller's namespace and its constants are caller-interned, so
    the sub-VM needs no namespace of its own.
-5. **Persistent storage**: `compile_eval` allocates the macro
-   function from `CompileOptions.persistent_allocator` (the VM's
-   runtime arena for the CLI and the REPL), so the closure outlives
-   the per-form compile arena.
+5. **Persistent storage**: `compile_eval` compiles the definition on
+   the enclosing form's compile allocator with its routines on
+   `CompileOptions.persistent_allocator` (the VM's runtime arena for
+   the CLI and the REPL), so the macro outlives the form while its
+   trees do not, and runs it on a sub-VM over the calling VM's heap
+   and registries, released once it has run; the closure is on that
+   heap, rooted by the Var. The definition compiles with the
+   enclosing form's declared names: a name in the body that resolves
+   to nothing is reported at the `defmacro` (`defmacro m: unable to
+   resolve symbol: x`, at `x`), as Clojure reports it.
 6. **Form ↔ Value.** Form → Value (`formToValue`): nil, booleans,
    integers (a fixnum, or a bignum past the fixnum range or for a
    `bigint`), reals, chars, strings, symbols and keywords (interned,
    qualified by their full name), lists, vectors, maps and sets;
-   `'x` as `(quote x)`, `@x` as `(deref x)`, `#()` as the `fn*`
-   form it stands for, and `^m x` as `x` (the metadata is dropped).
-   Only a syntax-quote, unquote or unquote-splicing is refused, as
-   `MalformedMacroCall` at the argument. Value → Form
+   `'x` as `(quote x)`, `@x` as `(nexis.core/deref x)`, `#()` as the
+   `fn*` form it stands for, `^m coll` as the list, vector, map or
+   set carrying `m` (on anything else, a symbol included, the
+   metadata is dropped), and the marker list a sorted collection
+   travels as (below) as the collection. Only a syntax-quote, unquote
+   or unquote-splicing is refused, as `MalformedMacroCall` at the
+   argument. `quote` makes its constant (`COMPILER.md` §5.1) and
+   `read-string` its value the same way. Value → Form
    (`valueToForm`): nil, booleans, fixnums, bignums (an `int` within
    i64, else a `bigint`), floats, chars, strings, symbols, keywords,
    lists (including a vector's seq view), vectors, maps and sets; the
@@ -156,12 +167,16 @@ otherwise it is an ordinary call. User macros shadow host macros.
      it until the head is not a macro. A failure throws
      `:macro-expansion-failure`.
    - `(read-string s)` reads the first form of `s` as data; a reader
-     error throws `:reader-error`.
+     error throws `:reader-error`. Only the text up to the end of the
+     first form is scanned and read (`reader.firstFormEnd`), so what
+     follows it is ignored, as in Clojure, even text that would not
+     read.
    - `(eval form)` converts the value to a Form, then compiles it as
      the REPL compiles a line: the current namespace, the registry,
      interner, host macros and loader, a fresh set of declared
      names. It runs the routine on the calling VM as a nested call
-     (`vm.runRoutine`) and returns its value. A `def` inside binds
+     (`vm.runRoutine`) and returns its value; a `do` runs its forms
+     one at a time, as a loaded file's top-level `do` does (§2b). A `def` inside binds
      in the current namespace, a `defmacro` serves a later `eval`,
      `(ns ...)` switches the current namespace, a returned closure
      stays callable, a dynamic binding in force is seen, and `eval`
@@ -212,33 +227,41 @@ name in `(def x ...)`) or miss bodies that are.
 | `quote` | Opaque: the payload is not walked (§7). |
 | `syntax_quote` (datum) | Rewritten per §5. |
 | `anon_fn` (datum) | Rewritten to `fn*` per §9. |
-| `let*`, `loop*` | Binding names are not expanded. Each right-hand side expands in the env of the bindings before it; the body with all of them. |
-| `fn*` | The parameter vector and self-name are not expanded; the body expands with the params, rest param and self-name in the env. |
-| `letfn*` | Names and parameter vectors are not expanded. Every name enters the env first; each function body expands with that env plus its params; then the body. |
-| `def` | The name is not expanded and does not enter the env (Vars are not lexical); the value expands. |
+| `let*`, `loop*` | Binding names are not expanded. Each right-hand side expands with the bindings before it in scope; the body with all of them. |
+| `fn*` | The parameter vector and self-name are not expanded; the body expands with the params, rest param and self-name in scope. |
+| `letfn*` | Names and parameter vectors are not expanded. Every name enters scope first; each function body expands with them and its params in scope; then the body. |
+| `def` | The name is not expanded and does not enter scope (Vars are not lexical); the value expands. |
 | `var` | Opaque. |
 | `if`, `do`, `recur`, `throw`, `#%` constructors, ordinary calls | Every sub-form expands in the current env. |
-| `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded. `target` must be a symbol; one bound in the lexical env is refused (a local has no thread binding). The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time (`VM.md` §6.5). |
-| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`, any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes), `:default` (also `any`), or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in the env) and the finally body expand; matchers and bindings do not. |
+| `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded. `target` must be a symbol; a lexical name is refused (a local has no thread binding). The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time (`VM.md` §6.5). |
+| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`; a class name that names a nexis error, which takes that error's tags (`ArithmeticException` `:divide-by-zero`; `IndexOutOfBoundsException`, `ArrayIndexOutOfBoundsException` and `StringIndexOutOfBoundsException` `:index-out-of-bounds`; `ClassCastException` `:kind-mismatch`; `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause` and `:arity-mismatch`; `ArityException` `:arity-mismatch`; `AssertionError` `:assertion-failed`; `StackOverflowError` `:stack-overflow`; bare or under `java.lang.` or `clojure.lang.`); any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes); `:default` (also `any`); or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in scope) and the finally body expand; matchers and bindings do not. |
 | `defmacro` | §1.2; replaced by `(var name)`. |
 | `ns` | `(ns NAME "doc"? {attrs}? clause*)` switches `registry.current` to `NAME` at expansion time, creating it (parent `nexis.core`) when unregistered, then runs each `(:require spec*)` clause as `require` does. `(:refer-clojure :exclude [names])` interns each name `nexis.core` or the host macro table holds as an unbound Var of the namespace, so the name resolves, inlines and expands as the namespace's own from then on (a use before the namespace defines it is `:unbound-var` at run time; `nexis.core/name` still reaches core's); `(:refer-clojure)` alone does nothing, and `:only` or `:rename` is `MalformedMacroCall`. `(:gen-class)` is accepted and does nothing; the docstring and attribute map are accepted and not kept; any other clause (`:import`, `:use`) is `MalformedMacroCall`. Replaced by `nil`. |
 | `require` | `(require spec*)`: each spec, quoted or not, is `ns-name` or `[ns-name option*]`, loaded at expansion time through `load_callback` and replaced by `nil`. `:as a` aliases the namespace; `:as-alias a` aliases it without loading; `:refer [x y]` maps `x` and `y` in the current namespace to that namespace's Vars (the same Vars: a later `def` there is seen here); `:refer :all` maps every Var not marked `:private`; `:rename {x z}` names a referred `x` as `z`. A prefix list, a vector whose second element is not a keyword or any list, requires each suffix under its prefix, as Clojure's does: `[app c [d :as dd]]` and `(app c [d :as dd])` are the specs `app.c` and `[app.d :as dd]`; a suffix holding a period, a suffix that is itself a prefix list, and a suffix other than a symbol or vector are `MalformedMacroCall`. A keyword spec (`:reload`) is a flag and changes nothing. Referring a name the current namespace defines itself, and `def` of a name that refers to another namespace's Var, are `MalformedMacroCall` (Clojure's rule); a missing Var or unknown option is reported by name. |
 | Non-symbol head | An ordinary call: head and arguments expand. |
-| `^meta` | On a vector, map or set literal: `(nexis.core/with-meta coll {meta})`, the map evaluated like any map literal except that a symbol under `:tag` is quoted, so `(meta ^:foo [1])` is `{:foo true}`. On anything else in expression position (a symbol, a call) it is a hint and is dropped. In every binding position (`let`, `loop`, `let*`, `loop*`, `fn` and `fn*` names and patterns, a parameter vector as a return hint, `:keys` entries, `defrecord` fields, a `catch` binding) it is dropped: `(defn f ^long [^String s] ...)` is `(defn f [s] ...)`. On the name of `def`, `defn` or `defmacro` it becomes the Var's metadata, `^String` as `{:tag String}` with the tag quoted. |
+| `^meta` | On a vector, map or set literal: `(nexis.core/with-meta coll {meta})`, the map evaluated like any map literal except that a symbol under `:tag` and the vector under `:param-tags` are quoted, so `(meta ^:foo [1])` is `{:foo true}`. On anything else in expression position (a symbol, a call) it is a hint and is dropped. In every binding position (`let`, `loop`, `let*`, `loop*`, `fn` and `fn*` names and patterns, a parameter vector as a return hint, `:keys` entries, `defrecord` fields, a `catch` binding) it is dropped: `(defn f ^long [^String s] ...)` is `(defn f [s] ...)`. On the name of `def`, `defn` or `defmacro` it becomes the Var's metadata, `^String` as `{:tag String}` with the tag quoted. |
 
 Every sub-form is expanded exactly once, so a user macro runs once
-per call site. `ExpandEnv` tracks lexical names with an
-innermost-first parent walk, as `compile.LowerEnv` does.
+per call site.
 
 **The loader** (`src/loader.zig`). `require` reaches it through
 `load_callback`. `Loader.evalSource` is the one path from text to
 effect for `run`, `repl`, `disasm`, the stdlib bootstrap and
 `require`: parse, read, declare the names the text defines, compile
-and run each top-level form. `(require 'my.app-core.foo)` maps the
+and run each top-level form. A top-level form's head is expanded
+first until it names no macro (`compile.expandTopLevel`); a `do` it
+comes to runs its forms one at a time, each taken the same way, as
+Clojure's `eval` runs them, so an `ns`, `def` or `defmacro` among
+them is in force for the forms after it: `(do (ns foo) (def x 1))`
+defines `foo/x`, and a macro defined in a `do` may use a `def` made
+before it there. Its value is the last form's, nil for `(do)`.
+`disasm`, which runs nothing, compiles each top-level form whole. `(require 'my.app-core.foo)` maps the
 name to `my/app_core/foo.nx` (dots to slashes, dashes to
 underscores) and takes the first match on the load path (the CLI's
 is the working directory, then the directory of the file being run).
-The file's first form must be `(ns my.app-core.foo ...)`; the
+The file's first form, as the reader reads it (comments and `#_`
+discards before it, `^meta` on the name), must be `(ns my.app-core.foo
+...)`, or nothing of the file runs; the
 caller's namespace is restored afterwards. A namespace loads once; a
 require of one still loading is `require: cyclic require of N`. The
 namespaces the stdlib installs have no file (`markLoaded`), and
@@ -259,11 +282,13 @@ operator in the compiler:
   (when 1 2))   ; [1 2]: a call of the local, not the macro
 ```
 
-`ExpandEnv` holds the names bound by `let*`, `loop*`, `fn*`,
-`letfn*` and `catch` (and so by the host macros that expand to
-them), and macro lookup requires `!env.contains(name)`. Special
-forms cannot be shadowed: they are recognised before the env is
-consulted.
+`ExpandContext.lexical` counts, for each name, the binding forms
+around the walk that bind it: `let*`, `loop*`, `fn*`, `letfn*` and
+`catch` (and so the host macros that expand to them). Each opens a
+`Scope` that adds its names and takes them out when it closes, so
+whether a name is lexical is one lookup however deep the forms nest,
+and macro lookup requires that it is not. Special forms cannot be
+shadowed: they are recognised before the names are consulted.
 
 ---
 
@@ -348,10 +373,12 @@ from the list with `nexis.core/vec`,
 every seqable (nil, list, vector, map as `[k v]` entries, set).
 
 **Qualification** (PLAN §23 #29, Clojure's rule). An unqualified
-symbol becomes `ns/name`, where `ns` is the namespace whose own Var
-it names, searched from the current namespace along its parent chain
-(`nexis.core` last), or `nexis.core` when it names a host macro; a
-symbol nothing holds qualifies to the current namespace, so
+symbol that resolves to a Var from the current namespace becomes that
+Var's `ns/name`, its home namespace and its own name (a referred Var
+qualifies to its home namespace, a `:rename`d one to its own name, as
+in Clojure); one that names a host macro becomes `nexis.core/name`;
+a symbol that resolves to nothing qualifies to the current namespace,
+so
 `` `(helper) `` written before `(defn helper ...)` still meets it.
 Left bare: auto-gensyms, the special forms and `#%` names (§1.1),
 `catch`, `finally`, `&`, `any`, and every name starting with `%`.
@@ -371,8 +398,8 @@ be captured by the user's bindings. Syntax-quote builds collections
 with the `#%` special forms, which the compiler recognises before
 any binding (`COMPILER.md` §4.3), and every core function a host
 macro's output calls is the qualified `nexis.core/name` (§10b):
-destructuring uses `nexis.core/nth`, `nthnext` and `get`; overload
-dispatch `count`, `=`, `<`, `not` and `nthnext`; `case` `=`; `for`
+destructuring uses `nexis.core/nth`, `nthnext`, `get` and `seq?`;
+overload dispatch `first`, `nth`, `nthnext`, `count`, `==` and `>=`; `case` `=`; `for`
 `seq`, `first`, `next` and `conj`; `defrecord` `get` and `=`;
 `case` and `condp` report through `str`; `@x` is `deref`, in a
 macro's arguments too. So
@@ -495,21 +522,21 @@ Nested `#()` never reaches the expander: the reader rejects it.
 
 | Macro | Expands to |
 |---|---|
-| `let` | `let*` with destructuring: a vector pattern binds each element by `nth`, `& r` to `(nthnext src i)`, the seq of the source past the `i` elements before it (so `(let [[a & r] [1]] r)` is nil and `(let [[& r] [1 2]] r)` is `(1 2)`, as in Clojure) and `:as` to the source; a map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors (an entry's own namespace or a `:p/keys` group namespace qualifies the key; a keyword entry in `:keys` is the key), `:or` defaults for an absent key and `:as`; patterns nest; plain symbols pass through. |
-| `fn` | `fn*` with destructured params: a pattern param becomes a gensym and the body is wrapped in a destructuring `let`; a map pattern after `&` takes keyword arguments (the rest seq becomes the map `nexis.internal/#%kwargs` builds from alternating keys and values or one trailing map). Overload clauses `(fn name? ([x] ...) ([x y] ...) ([x & r] ...))` lower to one variadic `fn*` that binds the argument count and tests the fixed arities in source order (`nexis.core/==` on the count, one inlined compare), then the variadic clause (`>=`), then throws `:arity-mismatch`; a clause binds its first param to `first` of the arguments and the others by `nth`, in range once the count has matched; a clause's rest is `nthnext` of the arguments past its fixed params, so an empty rest is nil for every `fn` (`VM.md` §6); at most one variadic clause, with no fixed arity above it and none repeated (Clojure's rules). Each clause binds its params through `loop`, so `recur` in a clause's tail re-enters that clause (a variadic clause's rest param receives the one seq passed), a pattern param destructures again on every iteration, a `recur` count that differs from the clause's param count is `RecurArityMismatch`, and a `loop` inside the clause owns the `recur`s in its body. A named `fn` may call itself. A body whose first form is a map with `:pre` and/or `:post` vectors, followed by more forms, is a condition map, as in Clojure: each `:pre` condition is checked before the body and each `:post` after it with `%` bound to the result; a failure throws `{:error :assertion-failed :message "Assert failed: <condition>"}`. |
-| `defn` | `(def name (fn name ...))`, so params destructure and overloads work as for `fn`. `^meta` on the name, a docstring after it (`:doc`) and an attribute map after that land on the Var: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x]))}) v#)`; with none of them the Var's metadata stays nil. `def` and `defmacro` take `^meta` and a docstring the same way. |
+| `let` | `let*` with destructuring: a vector pattern binds each element by `nth`, `& r` to `(nthnext src i)`, the seq of the source past the `i` elements before it (so `(let [[a & r] [1]] r)` is nil and `(let [[& r] [1 2]] r)` is `(1 2)`, as in Clojure) and `:as` to the source; a map pattern binds `{a :k}`, `:keys` / `:strs` / `:syms` vectors (an entry's own namespace or a `:p/keys` group namespace qualifies the key; a keyword entry in `:keys` is the key), `:or` defaults for an absent key and `:as`, bound before the keys so a default may read it; a map pattern over a seq takes it as keyword arguments, as Clojure 1.11 does: `(if (seq? src) (nexis.internal/#%kwargs src) src)`, where `#%kwargs` builds the map from alternating keys and values or is the one trailing map; patterns nest; plain symbols pass through. |
+| `fn` | `fn*` with destructured params: a pattern param becomes a gensym and the body is wrapped in a destructuring `let`; so a map pattern after `&` takes keyword arguments (`let`'s rule for a map pattern over a seq; with no arguments the rest is nil, and so is its `:as`). Overload clauses `(fn name? ([x] ...) ([x y] ...) ([x & r] ...))` lower to one variadic `fn*` that binds the argument count and tests the fixed arities in source order (`nexis.core/==` on the count, one inlined compare), then the variadic clause (`>=`), then throws `:arity-mismatch`; a clause binds its first param to `first` of the arguments and the others by `nth`, in range once the count has matched; a clause's rest is `nthnext` of the arguments past its fixed params, so an empty rest is nil for every `fn` (`VM.md` §6); at most one variadic clause, with no fixed arity above it and none repeated (Clojure's rules). Each clause binds its params through `loop`, so `recur` in a clause's tail re-enters that clause (a variadic clause's rest param receives the one seq passed), a pattern param destructures again on every iteration, a `recur` count that differs from the clause's param count is `RecurArityMismatch`, and a `loop` inside the clause owns the `recur`s in its body. A named `fn` may call itself. A body whose first form is a map with `:pre` and/or `:post` vectors, followed by more forms, is a condition map, as in Clojure: each `:pre` condition is checked before the body and each `:post` after it with `%` bound to the result; a failure throws `{:error :assertion-failed :message "Assert failed: <condition>"}`. |
+| `defn` | `(def ^{meta} name (fn name ...))`, so params destructure and overloads work as for `fn`. `^meta` on the name, a docstring after it (`:doc`), an attribute map after that and the `:arglists` land on the Var, and `def` adds the Var's `:name` and `:ns` (the namespace's name symbol), as Clojure does: `(defn f "doc" {:k 1} [x] ...)` → `(let* [v# (def f (fn f [x] ...))] (nexis.core/reset-meta! v# {:doc "doc" :k 1 :arglists (quote ([x])) :name (quote f) :ns (quote user)}) v#)`. `def` and `defmacro` take `^meta` and a docstring the same way, and every `def` sets `:name` and `:ns`. A name qualified with the current namespace (`(def user/x 1)` in `user`) is the bare name. |
 | `defn-` | `defn` with `:private true` in the Var's metadata, which `(require '[ns :refer :all])` skips. |
 | `loop` | `loop*`; each pattern binds a gensym and destructures again on every iteration, so `recur` rebinds the gensyms. |
 | `when`, `when-not` | `(if test (do body...) nil)`, `(if test nil (do body...))` |
-| `and` | `(and)` → `true`; `(and x)` → `x`; `(and x y ...)` → `(let* [g x] (if g (and y ...) g))`: the first falsy value or the last. |
-| `or` | `(or)` → `nil`; `(or x)` → `x`; `(or x y ...)` → `(let* [g x] (if g g (or y ...)))`: the first truthy value or the last. |
+| `and` | `(and)` → `true`; `(and x)` → `x`; `(and x y ...)` → `(let* [g x] (if g A g))`, `A` the same expansion of `(and y ...)`, the whole chain built in one step from the last operand back: the first falsy value or the last. |
+| `or` | `(or)` → `nil`; `(or x)` → `x`; `(or x y ...)` → `(let* [g x] (if g g O))`, `O` the expansion of `(or y ...)`, built the same way: the first truthy value or the last. |
 | `cond` | Nested `if`; an odd argument count fails. `:else` works by truthiness: a last test that is a truthy literal (a keyword, `true`, a number, a string, a char) is no test, its value the innermost `else`. |
 | `case` | Keys are constants, never evaluated: a symbol key is that symbol, a vector or map key that literal, a list `(k1 k2)` groups alternatives; they are compared with `=`. With fewer than three constants, `(let* [g expr] (if (= g 'k1) v1 ...))`; with three or more, one hashed lookup finds the clause, `(let* [g expr i (get '{k1 0 k2 1 ...} g -1)] (if (== i 0) v1 (if (== i 1) v2 ...)))`, each test one inlined compare (`g` is bound only when there is no default, for the throw). The map's lookup is `=`'s equality and hash. Two constants that are `=` but spelled differently (`[1]`, a grouped `(1)`) would share a key where the chain lets the first clause win, so a case with two compound constants, or two bignums, keeps the chain. The map lists the constants in clause order, so they are interned in source order, ahead of the clauses' results. A constant given twice, alone or in a group, is `MalformedMacroCall` "case: duplicate test constant" at the second, as in Clojure; constants of different kinds (`1`, `1.0`, `\1`) are distinct. With no trailing default, no match throws `{:error :no-matching-clause :message "No matching clause: <expr>" :value expr}`. |
 | `condp` | `pred` and `expr` evaluated once; clauses become `(if (p c e) v ...)` with `case`'s default policy. A clause `c :>> f` calls `f` on the predicate's truthy result. |
 | `for` | Eager: one `loop*` per binding pair, each pair followed by any number of `:let [b]`, `:when t` and `:while t`; a pattern destructures through `let`. `:when` skips the element, `:while` ends the loop it follows (outer loops carry on). The loops fill a vector returned as a seq, `()` when empty: a list, as Clojure's `for` gives, built eagerly (PLAN §23 #14). |
 | `->`, `->>` | Thread the value as the first (`->`) or last (`->>`) argument of each step, left to right; a step that is not a list is called with the value alone; an empty-list step fails. |
-| `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is not bound. An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
-| `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ...)`; a docstring and `:option value` pairs before the methods are ignored, as are method signatures past the name (`PROTOCOLS.md` §4.1). |
+| `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is bound to the record's type, the symbol `ns.T` (`(def T 'ns.T)`), which is the form's value (`PROTOCOLS.md` §0). An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
+| `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ...)`; a docstring and `:option value` pairs before the methods are ignored; a method's parameter vectors become its Var's `:arglists` and a docstring among them its `:doc` (`PROTOCOLS.md` §4.1). |
 | `extend-type`, `extend-protocol` | Install impls in the protocol registry, a method's arities spelled as for `defrecord` (`PROTOCOLS.md` §4.2–4.3). |
 
 `&form` and `&env` are not passed to any macro (PLAN §23 #34).
