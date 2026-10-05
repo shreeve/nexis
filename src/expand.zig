@@ -641,16 +641,20 @@ fn splitMetaName(ctx: *ExpandContext, form: *const Form) ExpandError!struct { na
 }
 
 /// The map literal `{k v ...}` of `meta_items` as an expression: a
-/// symbol under `:tag` (a type hint, `^String x`) is quoted, since
-/// it names a class nexis does not have.
+/// symbol under `:tag` (a type hint, `^String x`) and the vector under
+/// `:param-tags` (`^[long] f`) are quoted, since they name classes
+/// nexis does not have.
 fn metaMapExpr(ctx: *ExpandContext, meta_items: []const *Form, origin: SrcSpan) ExpandError!*Form {
     const b = Builder{ .ctx = ctx, .origin = origin };
     const items = try ctx.allocator.dupe(*Form, meta_items);
     var i: usize = 1;
     while (i < items.len) : (i += 2) {
         const key = items[i - 1];
-        const is_tag = key.datum == .keyword and key.datum.keyword.ns == null and std.mem.eql(u8, key.datum.keyword.name, "tag");
-        if (is_tag and items[i].datum == .symbol) items[i] = try b.list(.{ "quote", items[i] });
+        if (key.datum != .keyword or key.datum.keyword.ns != null) continue;
+        const name = key.datum.keyword.name;
+        const hint = (std.mem.eql(u8, name, "tag") and items[i].datum == .symbol) or
+            (std.mem.eql(u8, name, "param-tags") and items[i].datum == .vector);
+        if (hint) items[i] = try b.list(.{ "quote", items[i] });
     }
     return b.map(.{items});
 }

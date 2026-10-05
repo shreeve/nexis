@@ -348,8 +348,11 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     try expectOutput("(^:hint inc 1)", "2");
     try expectOutput("[(meta ^:foo [1 2]) (meta ^{:a (+ 1 2)} {:b 2}) (meta ^:s #{})]", "[{:foo true} {:a 3} {:s true}]");
     try expectOutput("(#(vector ^:m [%]) 1)", "[[1]]");
-    // A macro argument reaches the macro without its metadata.
-    try expectOutputProgram("(defmacro m [x] x) (m ^:foo [1])", "[1]");
+    // A macro argument reaches the macro with its metadata, as in
+    // Clojure, and the collection the macro returns keeps it.
+    try expectOutputProgram("(defmacro m [x] x) [(m ^:foo [1]) (meta (m ^:foo [1]))]", "[[1] {:foo true}]");
+    // A type hint names no class here: `:tag` and `:param-tags` stay symbols.
+    try expectOutputProgram("(defn ^[long String] f [x] x) [(f 1) (:param-tags (meta #'f)) (:tag (meta #'f))]", "[1 [long String] nil]");
     // ^meta inside syntax-quote reaches the definition the macro writes.
     try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
     try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
