@@ -1479,6 +1479,15 @@ test "corpus: multiple data sources" {
     const ann_ref = try fx.read("[:person/email \"ann@x\"]");
     try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, ann_ref }, 1);
     try checkCount(fx, now, "[:find ?a :in $ $2 ?e :where [$2 ?e :person/age ?a]]", &.{ nil, before, try fx.read("[:person/email \"flo@x\"]") }, 0);
+    // A rule called on a later source with an unbound argument reads
+    // an attribute the first source lacks, in its estimate as in its run.
+    _ = try fx.transact("[{:db/ident :extra/x :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]");
+    _ = try fx.transact("[{:extra/x \"hi\"}]");
+    const later = try nextomic.natives.boxDb(&fx.heap, try fx.db());
+    const xv = try fx.read("[[(xv ?e ?v) [?e :extra/x ?v]] [(xr ?e ?v) [?e :extra/x ?v]] [(xr ?e ?v) [?m :extra/x ?v] (xr ?m ?e)]]");
+    try checkCount(fx, now, "[:find ?v :in $ $2 % :where ($2 xv ?e ?v)]", &.{ nil, later, xv }, 1);
+    try checkCount(fx, now, "[:find ?v :in $ $2 % :where (or ($2 xv ?e ?v) [?e :person/name ?v])]", &.{ nil, later, xv }, 7);
+    try checkCount(fx, now, "[:find ?v :in $ $2 % :where ($2 xr ?e ?v)]", &.{ nil, later, xv }, 1);
     // Three sources.
     try checkCount(fx, now, "[:find ?n :in $ $2 $3 :where [?e :person/name ?n] [$2 ?e :person/age 25] [$3 ?e :person/age 26 _ true]]", &.{ nil, before, hist }, 1);
     // Errors: an undeclared source, a missing input, an input that is not a db.

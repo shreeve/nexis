@@ -235,9 +235,9 @@ fn defsOf(ctx: *Ctx, name: u32, args: []const ir.Arg) ![]const ir.Rule {
     return defs;
 }
 
-/// The planner's cost for calling `name`, or null while a required
-/// argument is unbound.
-pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *const Bound) Failure!?u64 {
+/// The planner's cost for calling `name` on source `src` (null: the
+/// default), or null while a required argument is unbound.
+pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, src: ?ir.Src, bound: *const Bound) Failure!?u64 {
     const defs = try defsOf(ctx, name, args);
     for (args[0..defs[0].required]) |a| {
         if (a == .variable and !bound.has(a.variable)) return null;
@@ -252,7 +252,7 @@ pub fn callEstimate(ctx: *Ctx, name: u32, args: []const ir.Arg, bound: *const Bo
         for (def.head, args) |h, a| {
             if (a != .variable or bound.has(a.variable)) try head_bound.add(ctx.arena, h);
         }
-        total +|= (try plan_mod.clausesEstimate(ctx, def.body, &head_bound)) orelse body_cost;
+        total +|= (try plan_mod.clausesEstimate(ctx, def.body, &head_bound, src)) orelse body_cost;
     }
     return total;
 }

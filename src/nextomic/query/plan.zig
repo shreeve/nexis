@@ -736,12 +736,12 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
 /// The estimate of a source clause given `bound`.
 fn estimate(ctx: *Ctx, c: Clause, bound: *const Bound) Failure!Cost {
     const rows: ?u64 = switch (c) {
-        .pattern => |pat| patternEstimate(ctx, pat, bound) catch |err| switch (err) {
+        .pattern => |pat| patternEstimate(ctx, pat, bound, null) catch |err| switch (err) {
             error.UnboundPattern => return .unbound_pattern,
             else => return err,
         },
-        .@"or" => |o| if (allBound(o.required, bound)) try orEstimate(ctx, o, bound) else null,
-        .rule => |r| try rules_mod.callEstimate(ctx, r.name, r.args, bound),
+        .@"or" => |o| if (allBound(o.required, bound)) try orEstimate(ctx, o, bound, null) else null,
+        .rule => |r| try rules_mod.callEstimate(ctx, r.name, r.args, r.src, bound),
         .source => 0,
         else => null,
     };
@@ -901,23 +901,24 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     return .{ .@"or" = .{ .join = join, .bound = try bound_join.toOwnedSlice(ctx.arena), .fresh = fresh, .branches = plans } };
 }
 
-fn orEstimate(ctx: *Ctx, o: anytype, bound: *const Bound) Failure!u64 {
+fn orEstimate(ctx: *Ctx, o: anytype, bound: *const Bound, src: ?ir.Src) Failure!u64 {
     var total: u64 = 0;
-    for (o.branches) |br| total +|= (try clausesEstimate(ctx, br, bound)) orelse 1;
+    for (o.branches) |br| total +|= (try clausesEstimate(ctx, br, bound, src)) orelse 1;
     return total;
 }
 
-/// The smallest pattern estimate among `clauses` given `bound`; null
-/// when none of them is a pattern or `or` that can run.
-pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: *const Bound) Failure!?u64 {
+/// The smallest pattern estimate among `clauses` given `bound`, a
+/// pattern that names no source reading `src` (null: `$`); null when
+/// none of them is a pattern or `or` that can run.
+pub fn clausesEstimate(ctx: *Ctx, clauses: []const Clause, bound: *const Bound, src: ?ir.Src) Failure!?u64 {
     var best: ?u64 = null;
     for (clauses) |c| {
         const est: u64 = switch (c) {
-            .pattern => |p| patternEstimate(ctx, p, bound) catch |err| switch (err) {
+            .pattern => |p| patternEstimate(ctx, p, bound, src) catch |err| switch (err) {
                 error.UnboundPattern => continue,
                 else => return err,
             },
-            .@"or" => |o| try orEstimate(ctx, o, bound),
+            .@"or" => |o| try orEstimate(ctx, o, bound, src),
             else => continue,
         };
         best = @min(best orelse est, est);
@@ -1013,8 +1014,10 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) !Choice {
     return error.UnboundPattern;
 }
 
-fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) !u64 {
-    try ctx.select(p.src);
+/// `src` is the source the pattern reads when it names none: a rule
+/// body's patterns read the source of the call.
+fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound, src: ?ir.Src) !u64 {
+    try ctx.select(p.src orelse src);
     if (ctx.coll) |rows| return @max(1, rows.len);
     return (try choose(ctx, p, bound)).estimate;
 }
