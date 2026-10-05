@@ -2,13 +2,34 @@
 ; persistent sets, Clojure's clojure.set (which names this namespace).
 ; Embedded via @embedFile and bootstrapped with nexis.set current.
 
-; (union & sets) → every element of any of the sets.
-(defn union [& sets]
-  (reduce (fn [acc s] (into acc s)) #{} sets))
+; coll with the element `k` maximizes first (the last of equals).
+(defn- bubble-max-key [k coll]
+  (let [m (apply max-key k coll)]
+    (cons m (remove (fn [x] (identical? m x)) coll))))
 
-; (intersection s & sets) → the elements of s in every other set.
-(defn intersection [s & sets]
-  (reduce (fn [acc t] (set (filter (fn [x] (contains? t x)) acc))) s sets))
+; (union & sets) → every element of any of the sets, poured into the
+; largest, so its kind and metadata stay.
+(defn union
+  ([] #{})
+  ([s1] s1)
+  ([s1 s2]
+   (if (< (count s1) (count s2)) (into s2 s1) (into s1 s2)))
+  ([s1 s2 & sets]
+   (let [bubbled (bubble-max-key count (conj sets s2 s1))]
+     (reduce into (first bubbled) (rest bubbled)))))
+
+; (intersection s & sets) → the elements of s in every other set,
+; removed from the smallest.
+(defn intersection
+  ([s1] s1)
+  ([s1 s2]
+   (if (< (count s2) (count s1))
+     (recur s2 s1)
+     (reduce (fn [result item] (if (contains? s2 item) result (disj result item)))
+             s1 s1)))
+  ([s1 s2 & sets]
+   (let [bubbled (bubble-max-key (fn [s] (- (count s))) (conj sets s2 s1))]
+     (reduce intersection (first bubbled) (rest bubbled)))))
 
 ; (difference s & sets) → the elements of s in none of the others.
 (defn difference [s & sets]
@@ -22,9 +43,9 @@
 (defn superset? [a b]
   (subset? b a))
 
-; (select pred s) → the elements of s for which pred is truthy.
+; (select pred s) → s without the elements for which pred is falsy.
 (defn select [pred s]
-  (set (filter pred s)))
+  (reduce (fn [acc k] (if (pred k) acc (disj acc k))) s s))
 
 ; (map-invert m) → m with its keys and values swapped.
 (defn map-invert [m]

@@ -187,11 +187,11 @@ core collection functions.
 
 | Name | Arity | Semantics |
 |---|---|---|
-| `union` | 0+ | A set of every element of any argument; `(union)` is `#{}`; nil and any seqable are accepted (each is poured `into` the result) |
-| `intersection` | 1+ | The elements of the first set present in every other one; with one argument, that argument unchanged |
+| `union` | 0+ | Every element of any argument, poured `into` the largest, which keeps its kind and metadata: `(union (sorted-set 3 1) #{2})` is a sorted set; `(union)` is `#{}`, one argument is itself (`(union nil)` is nil) |
+| `intersection` | 1+ | The elements of the first set present in every other one, `disj`ed from the smallest, which keeps its kind; with one argument, that argument unchanged |
 | `difference` | 1+ | The first set without the elements of the others; the first must be a set (`disj`), else `:kind-mismatch` |
 | `subset?`, `superset?` | 2 | Whether every element of the first is in the second (`subset?`), or the reverse |
-| `select` | 2 | `(select pred s)`: a set of the elements for which `pred` is truthy |
+| `select` | 2 | `(select pred s)`: `s` without the elements for which `pred` is falsy (`disj`), so of `s`'s kind |
 | `map-invert` | 1 | The map with keys and values swapped; of duplicate values, the key iterated last wins |
 | `rename-keys` | 2 | `(rename-keys m kmap)`: `m` with each key of `kmap` present in `m` renamed to its value |
 

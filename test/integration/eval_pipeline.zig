@@ -3393,9 +3393,13 @@ test "nexis.string: capitalize, reverse, triml, trimr, trim-newline, split-lines
 }
 
 test "nexis.set: union, intersection, difference, subset?, superset?, select, map-invert, rename-keys" {
-    try expectOutput("[(nexis.set/union #{1 2} #{2 3}) (nexis.set/union) (nexis.set/intersection #{1 2 3} #{2 3 4} #{3 2}) (nexis.set/difference #{1 2 3} #{2} #{3})]", "[#{1 2 3} #{} #{2 3} #{1}]");
+    try expectOutput("[(nexis.set/union #{1 2} #{2 3}) (nexis.set/union) (nexis.set/intersection #{1 2 3} #{2 3 4} #{3 2}) (nexis.set/difference #{1 2 3} #{2} #{3})]", "[#{1 2 3} #{} #{3 2} #{1}]");
     try expectOutput("[(nexis.set/subset? #{1} #{1 2}) (nexis.set/subset? #{3} #{1 2}) (nexis.set/superset? #{1 2} #{2}) (nexis.set/select odd? #{1 2 3})]", "[true false true #{1 3}]");
     try expectOutput("[(nexis.set/map-invert {:a 1}) (= {:z 1 :b 2} (nexis.set/rename-keys {:a 1 :b 2} {:a :z}))]", "[{1 :a} true]");
+    // As Clojure's: the largest (union) or smallest (intersection,
+    // select's own) argument keeps its kind and metadata.
+    try expectOutput("[(nexis.set/union (sorted-set 3 1 5) #{2}) (nexis.set/union nil) (nexis.set/union #{1} (sorted-set 4 2 3) #{5}) (meta (nexis.set/union (with-meta #{1 2} {:m 1}) #{3}))]", "[#{1 2 3 5} nil #{1 2 3 4 5} {:m 1}]");
+    try expectOutput("[(nexis.set/intersection (sorted-set 3 1 2) #{1 2 3 4}) (nexis.set/intersection #{1 2 3 4} (sorted-set 2 1) #{1 2 9}) (nexis.set/select odd? (sorted-set 5 4 3 2 1))]", "[#{1 2 3} #{1 2} #{1 3 5}]");
 }
 
 test "nexis.string: replace: literal, all-non-overlapping" {
