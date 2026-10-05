@@ -179,7 +179,7 @@ at the db layer.
 - **Collector.** `gc.Collector.collect` marks from the roots through
   each kind's `trace`, then calls `sweepUnmarked` and
   `resetAllocationCounter` (`docs/GC.md`). The VM runs a cycle only at
-  its instruction-fetch safe point, never inside `alloc`.
+  its safe points (`docs/GC.md` §7), never inside `alloc`.
 - **Interner.** Keyword and symbol names are interner allocations, not
   heap blocks (`docs/INTERN.md`).
 - **Codec.** Builds values through the per-kind constructors; the heap

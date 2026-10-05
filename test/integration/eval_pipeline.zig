@@ -955,6 +955,12 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
         .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
         .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
+        .{ .src = "({} 1 2 3)", .err = vm.VmError.ArityMismatch, .detail = "a map takes 1 to 2 arguments, got 3" },
+        .{ .src = "(:a)", .err = vm.VmError.ArityMismatch, .detail = "a keyword takes 1 to 2 arguments, got 0" },
+        .{ .src = "(#{1} 1 2)", .err = vm.VmError.ArityMismatch, .detail = "a set takes 1 argument, got 2" },
+        .{ .src = "([1 2] 5)", .err = vm.VmError.IndexOutOfBounds, .detail = "index 5 is out of bounds for a vector of 2" },
+        .{ .src = "([1 2] :a)", .err = vm.VmError.KindMismatch, .detail = "a vector takes an integer index, got a keyword" },
+        .{ .src = "(+ 1 (i64-vector [1]))", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a typed vector" },
     };
     for (cases) |case| {
         var program: Program = undefined;

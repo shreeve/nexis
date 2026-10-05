@@ -330,6 +330,7 @@ collector root (§9).
 | `upvalues` | The closure's cell array (shared, not owned) |
 | `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block and its cells alive for the frame's life |
 | `return_dst`, `return_pc` | Where the caller receives the result and resumes |
+| `host_result` | For a frame `callValue`, `runRoutine` or a `Callback` pushed: the cell its return writes instead of a caller's slot (`HostCallResult`) |
 
 A frame is pushed by `call:call` and by `callValue` / `runRoutine`,
 and popped by a return or discarded by a throw that unwinds past it.
@@ -421,36 +422,17 @@ heap. Vars, namespaces and routines live in `VM.runtime_arena` or the
 compiler's persistent allocator for the VM's life. `VM.deinit` frees
 the heap block by block and the arena wholesale.
 
-**The VM hosts the collector** (`docs/GC.md` §3, §7). `VM.gcRoots`
-marks, in order: the whole backing stack (every slot, which needs no
-per-PC liveness map); each frame's closure (its trace reaches the
-cells and routine constants) or, for a frame without one, its
-routine's constants, recursively through nested routines; every Var
-of every namespace (`root`, `meta`, `thread_value`); the saved
-dynamic bindings; the root stack (`vm.roots`); the values of pending
-`finally` throws; the values of throw origins (`vm.origins`, §12);
-`vm.unhandled_throw`; `vm.result`; and the
-protocol registry's implementations. `VM.gcTrace` traces a closure
-(cells, then routine constants) and a cell (its value).
-
-**Trigger and safe point.** `VM.gcDue` is tested only at an
-instruction fetch (§8): where `VM.loop` enters the chain and after
-an instruction that could have allocated, which is `math` through the
-numeric tower, a `call:call` that ran a native, a protocol fn or a
-lookup other than the in-place keyword lookup of §8, or entered a
-closure through the general entry of §6, and every `closure`, `coll`
-and `ctrl` instruction. After any other instruction the heap's counter
-cannot have moved. A cycle is due when the heap has allocated
-`gc_next_at` bytes since the last one: the larger of `gc_threshold`
-and `gc_growth_percent` percent of the bytes that survived
-(`GcPolicy.default` 16 MiB and 100 %; `GcPolicy.stress`, selected by
-`NEXIS_GC_STRESS`, 4 KiB and 0 %). `Heap.alloc` never collects, so
-what the VM or a native builds within one instruction needs no
-rooting; a native that keeps a callback's result across a further
-call into the VM roots it (`docs/GC.md` §11.5). A VM over a borrowed
-heap (the expander's macro sub-VMs) has `gc_enabled = false`.
-`VM.collectGarbage` runs one cycle and sizes the next window;
-`gc_cycles` counts them.
+**The VM hosts the collector.** `VM.gcRoots` marks the roots
+`docs/GC.md` §3 lists, and `VM.gcTrace` traces a closure (cells, then
+routine constants) and a cell (its value). When a cycle is due and
+the safe points that run one (instruction fetches after an
+instruction that could allocate, and `callValue` of anything but a
+closure) are `docs/GC.md` §7. `Heap.alloc` never collects, so what
+the VM or a native builds within one instruction needs no rooting; a
+native that keeps a value across a call into the VM roots it
+(`docs/GC.md` §11.5). A VM over a borrowed heap (the expander's macro
+sub-VMs) has `gc_enabled = false`. `VM.collectGarbage` runs one cycle
+and sizes the next window; `gc_cycles` counts them.
 
 #### 9.1 Sub-VMs
 
@@ -501,8 +483,9 @@ Group and variant numbers are the enums in `src/vm.zig` (`Group`,
 
 A group number outside the enum is `BytecodeCorruption`; an
 undispatched group traps `UnimplementedOpcode`. A variant number
-outside its group's enum is `BytecodeCorruption`, except in `mov`
-and `call`, where it traps `UnimplementedOpcode`.
+outside its group's enum is `BytecodeCorruption` in every group; a
+reserved variant inside it (`call:tailcall`, `math:pow`, `ctrl:halt`)
+traps `UnimplementedOpcode`.
 
 #### 10.1 `mov`
 
