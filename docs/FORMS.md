@@ -237,8 +237,12 @@ These describe the reader as it is; they are not language commitments.
   is a `bigint` of canonical decimal text. The compiler lifts an `int`
   outside the i48 fixnum range, and every `bigint`, into a bignum
   constant (`COMPILER.md` §4.3).
-- **`#%` names are unreachable.** The lexer accepts `#` only before
-  `{`, `(`, `_`, `'` and in `##Inf`, `##-Inf`, `##NaN`, so no user symbol begins with `#%` and the
-  printer's `#%anon-fn` head cannot collide with one.
+- **`#%` names.** The lexer accepts `#` only before `{`, `(`, `_`,
+  `'` and in `##Inf`, `##-Inf`, `##NaN`, so no unqualified symbol a
+  program writes begins with `#%` and the printer's `#%anon-fn` head
+  cannot collide with one. A qualified name reaches the internal
+  natives (`nexis.internal/#%make-record`), as `symbol`, `resolve` and
+  `eval` do; the reader is not their guard: every internal native
+  validates its arguments (`docs/PROTOCOLS.md` §7).
 - **Nested `#()`** is rejected because nesting would make the `%`
   placeholders ambiguous.

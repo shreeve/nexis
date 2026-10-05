@@ -354,7 +354,7 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | Native | Arity | Returns |
 |---|---|---|
 | `#%register-record-type "ns/Name" [:f ...]` | 2 | fixnum type id |
-| `#%make-record type-id field-map` | 2 | record |
+| `#%make-record type-id m` | 2 | record whose fields are the entries of `m`: a hash or sorted map, a record (its fields) or nil (none), so `map->Counter` takes any map, as Clojure's does |
 | `#%record? x` | 1 | boolean |
 | `#%record-type-id rec` | 1 | fixnum |
 | `#%register-protocol "ns/IFoo" [:m ...]` | 2 | protocol |
@@ -362,6 +362,11 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | `#%extend-record-impl IFoo :m type-id f` | 4 | nil |
 | `#%extend-builtin-impl IFoo :m :kind f` | 4 | nil |
 | `#%extend-default-impl IFoo :m f` | 3 | nil |
+
+The natives are reachable by their qualified names (`docs/FORMS.md`
+§8), so each validates its arguments: a type id that is not an
+integer is `:kind-mismatch`, one no `defrecord` registered
+`:invalid-argument`.
 
 `#%register-record-type` and `#%register-protocol` split the name on
 its last `/` into namespace and name; a name with no `/` has an empty

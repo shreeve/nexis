@@ -3434,7 +3434,7 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
         .persistent_map => "map",
         .persistent_set => "set",
         .record => {
-            const e = vm.record_registry.items[record_mod.typeId(x)];
+            const e = vm.recordType(record_mod.typeId(x)) orelse return VmError.InvalidArgument;
             var buf: std.ArrayList(u8) = .empty;
             defer buf.deinit(vm.allocator);
             if (e.ns_name.len > 0) buf.print(vm.allocator, "{s}.", .{e.ns_name}) catch return VmError.OutOfMemory;
@@ -4909,13 +4909,38 @@ fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(new_id)) orelse VmError.ArithmeticOverflow;
 }
 
-/// `(#%make-record type-id field-map)` → record Value.
+/// The record type id `v` holds: `:kind-mismatch` unless it is an
+/// integer, `:invalid-argument` unless a `defrecord` registered it.
+/// The `#%` natives are reachable by their qualified names, so each
+/// checks the ids it is given (FORMS.md §8).
+fn recordTypeArg(vm: *VM, v: Value) VmError!u32 {
+    if (v.kind() != .fixnum) return VmError.KindMismatch;
+    const id = std.math.cast(u32, v.asFixnum()) orelse return VmError.InvalidArgument;
+    _ = vm.recordType(id) orelse return VmError.InvalidArgument;
+    return id;
+}
+
+/// `(#%make-record type-id m)` → a record of the type with the
+/// entries of the map `m` (any map, a record's fields, or nil for
+/// none) as its fields.
 fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .fixnum) return VmError.KindMismatch;
-    const id = args[0].asFixnum();
-    if (id < 0) return VmError.KindMismatch;
-    if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
-    return record_mod.make(vm.ensureHeap(), @intCast(id), args[1]) catch return VmError.OutOfMemory;
+    const id = try recordTypeArg(vm, args[0]);
+    const heap = vm.ensureHeap();
+    const fields = switch (args[1].kind()) {
+        .persistent_map => args[1],
+        .record => record_mod.fieldsOf(args[1]),
+        .nil => champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory,
+        .sorted_map => blk: {
+            // `Heap.alloc` never collects (GC.md §11.5): the map
+            // being built needs no root.
+            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+            var it = MapEntries.of(args[1]).?;
+            while (it.next()) |e| m = champ_mod.mapAssoc(heap, m, e.key, e.value, &dispatch_mod_alias.hashValue, &dispatch_mod_alias.equal) catch return VmError.OutOfMemory;
+            break :blk m;
+        },
+        else => return VmError.KindMismatch,
+    };
+    return record_mod.make(heap, id, fields) catch return VmError.OutOfMemory;
 }
 
 /// `(#%current-ns)` → the name of the current namespace as a string:
@@ -5022,7 +5047,6 @@ fn fnProtocolFn(vm: *VM, args: []const Value) VmError!Value {
 fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .protocol) return VmError.KindMismatch;
     if (args[1].kind() != .keyword) return VmError.KindMismatch;
-    if (args[2].kind() != .fixnum) return VmError.KindMismatch;
     // args[3] is the impl callable: closure / native_fn / etc.
     // We don't validate its kind here — dispatchProtocolMethod
     // calls `callValue` which surfaces NotCallable if it's not
@@ -5030,9 +5054,7 @@ fn fnExtendRecordImpl(vm: *VM, args: []const Value) VmError!Value {
     // than this scaffolding.
     const protocol_id = protocol_mod.protocolId(args[0]);
     const method_name_id: u32 = args[1].asKeywordId();
-    const type_id_signed = args[2].asFixnum();
-    if (type_id_signed < 0) return VmError.KindMismatch;
-    const type_id: u32 = @intCast(type_id_signed);
+    const type_id = try recordTypeArg(vm, args[2]);
     const key = vm_mod.DispatchKey{ .tag = .record, .id = type_id };
     vm.extendProtocol(protocol_id, method_name_id, key, args[3]) catch |err| switch (err) {
         error.NoProtocolMethod => return VmError.NoProtocolMethod,

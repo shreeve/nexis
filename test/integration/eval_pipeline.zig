@@ -4106,6 +4106,29 @@ test "extend-protocol with bogus type-kw: :invalid-argument" {
     , ":invalid-argument");
 }
 
+test "record internals: a type id no defrecord registered is :invalid-argument" {
+    // Qualified, the `#%` names are reachable (FORMS.md §8); each
+    // validates what it is given.
+    try expectOutput("(try (nexis.internal/#%make-record 99999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record 99999999999999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record -1 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(let [mk (resolve (symbol \"nexis.internal\" \"#%make-record\"))] (try (class (mk 77 {:x 1})) (catch any e e)))", ":invalid-argument");
+    try expectOutputProgram(
+        \\(defprotocol IFoo (bar [this]))
+        \\[(try (nexis.internal/#%extend-record-impl IFoo :bar 4096 (fn [x] x)) (catch any e e))
+        \\ (try (nexis.internal/#%extend-record-impl IFoo :bar 99999999999999 (fn [x] x)) (catch any e e))]
+    , "[:invalid-argument :invalid-argument]");
+}
+
+test "defrecord: map->R takes any map, as Clojure's does" {
+    try expectOutputProgram(
+        \\(defrecord P [x z])
+        \\(defrecord Q [x])
+        \\[(map->P (sorted-map :z 2 :x 1)) (map->P nil) (map->P (->Q 5)) (P? (map->P (->Q 5)))
+        \\ (try (map->P [1 2]) (catch any e e))]
+    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true :kind-mismatch]");
+}
+
 // =============================================================================
 // Broader core.nx stdlib
 // =============================================================================
