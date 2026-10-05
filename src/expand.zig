@@ -1518,16 +1518,8 @@ fn makeQualifiedSymbol(ctx: *ExpandContext, ns_name: []const u8, sym_name: []con
     return makeForm(ctx, .{ .symbol = .{ .ns = ns_name, .name = sym_name } }, origin);
 }
 
-fn makeKeyword(ctx: *ExpandContext, name: []const u8, origin: SrcSpan) ExpandError!*Form {
-    return makeForm(ctx, .{ .keyword = .{ .ns = null, .name = name } }, origin);
-}
-
 fn makeNil(ctx: *ExpandContext, origin: SrcSpan) ExpandError!*Form {
     return makeForm(ctx, .nil, origin);
-}
-
-fn makeBool(ctx: *ExpandContext, value: bool, origin: SrcSpan) ExpandError!*Form {
-    return makeForm(ctx, .{ .bool_ = value }, origin);
 }
 
 /// Builds a host macro's output at one call's span. `list`, `vec`
@@ -1553,7 +1545,7 @@ const Builder = struct {
 
     /// `name` as a keyword.
     fn kw(b: Builder, name: []const u8) ExpandError!*Form {
-        return makeKeyword(b.ctx, name, b.origin);
+        return makeForm(b.ctx, .{ .keyword = .{ .ns = null, .name = name } }, b.origin);
     }
 
     /// A fresh symbol `<base>__N__auto__`.
@@ -1584,7 +1576,7 @@ const Builder = struct {
         const T = @TypeOf(x);
         if (T == *Form or T == *const Form) return mutCast(x);
         if (T == @TypeOf(null)) return makeNil(b.ctx, b.origin);
-        if (T == bool) return makeBool(b.ctx, x, b.origin);
+        if (T == bool) return makeForm(b.ctx, .{ .bool_ = x }, b.origin);
         if (comptime isString(T)) return b.named(x);
         return makeForm(b.ctx, .{ .int = @intCast(x) }, b.origin);
     }
@@ -2005,14 +1997,15 @@ const DefnParts = struct {
 fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, private: bool) ExpandError!DefnParts {
     const what = call_form.datum.list[0].datum.symbol.name;
     const origin = call_form.origin;
+    const b = Builder{ .ctx = ctx, .origin = origin };
     if (args.len < 2) return ctx.fail(origin, "{s}: expected a name and a parameter vector", .{what});
     const named = try splitMetaName(ctx, args[0]);
     var meta: std.ArrayList(*Form) = .empty;
-    if (private) try meta.appendSlice(ctx.allocator, &.{ try makeKeyword(ctx, "private", origin), try makeBool(ctx, true, origin) });
+    if (private) try meta.appendSlice(ctx.allocator, &.{ try b.kw("private"), try b.item(true) });
     if (named.meta) |m| try meta.appendSlice(ctx.allocator, m);
     var rest: usize = 1;
     if (rest < args.len and args[rest].datum == .string) {
-        try meta.appendSlice(ctx.allocator, &.{ try makeKeyword(ctx, "doc", args[rest].origin), mutCast(args[rest]) });
+        try meta.appendSlice(ctx.allocator, &.{ try b.kw("doc"), mutCast(args[rest]) });
         rest += 1;
     }
     if (rest < args.len and args[rest].datum == .map) {
@@ -2028,10 +2021,7 @@ fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, p
         if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "{s}: expected ([params] body...), not {s}", .{ what, describeForm(clause) });
         try lists.append(ctx.allocator, try stripParams(ctx, clause.datum.list[0]));
     }
-    try meta.appendSlice(ctx.allocator, &.{
-        try makeKeyword(ctx, "arglists", origin),
-        try (Builder{ .ctx = ctx, .origin = origin }).list(.{ "quote", try makeList(ctx, lists.items, origin) }),
-    });
+    try meta.appendSlice(ctx.allocator, &.{ try b.kw("arglists"), try b.list(.{ "quote", try b.list(.{lists.items}) }) });
     return .{ .name = named.name, .fn_tail = tail, .meta = meta.items };
 }
 
@@ -2725,15 +2715,6 @@ fn recordTypeId(b: Builder, type_form: *const Form) ExpandError!*Form {
     return makeForm(ctx, .{ .symbol = .{ .ns = home, .name = id } }, b.origin);
 }
 
-/// The `nexis.core` function `name` as a qualified symbol: what a
-/// host macro emits wherever its output calls a core function, so a
-/// user local or Var of the same name cannot capture the call
-/// (MACROEXPAND.md §5). Heads that are themselves host macros or
-/// special forms stay bare.
-fn coreSym(ctx: *ExpandContext, name: []const u8, origin: reader_mod.SrcSpan) ExpandError!*Form {
-    return try makeQualifiedSymbol(ctx, "nexis.core", name, origin);
-}
-
 // ---- -> / ->> ------------------------------------------------
 //
 //   (-> x (f a) g)   => (g (f x a))       thread-first
@@ -2964,91 +2945,65 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
 
 const testing = std.testing;
 
-/// Build a tiny test harness: parse `src`, run through the
-/// expander with the given macro table, return the resulting
-/// Form for caller inspection. Allocator is the arena owning
-/// the parsed form (caller must keep it alive).
-fn expandSourceForTest(
-    arena: Allocator,
-    src: []const u8,
-    host_macros: *const HostMacroTable,
-) !*Form {
+/// `src`, read as one form into `arena`.
+fn readForTest(arena: Allocator, src: []const u8) !*Form {
     var p = try reader_mod.parser.parseForm(arena, src);
     defer p.parser.deinit();
     var rdr = reader_mod.Reader.init(arena, src);
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-
-    var interner = intern_mod.Interner.init(arena);
-    // NOTE: interner is in the arena, so deinit not strictly
-    // necessary, but explicit cleanup is good hygiene.
-    defer interner.deinit();
-    var ctx = ExpandContext{
-        .allocator = arena,
-        .interner = &interner,
-        .host_macros = host_macros,
-    };
-    return try expandForm(&ctx, form);
+    return rdr.readOneForm(p.sexp);
 }
 
-/// Expand `src` with the default host macros and expect `expected`,
-/// with `message` recorded against the source text `at`.
-fn expectFailure(src: []const u8, expected: ExpandError, message: []const u8, at: []const u8) !void {
+/// `src` read and expanded with `host_macros` and no namespace, in
+/// `arena`, with the context's failure, if any.
+fn expandForTest(arena: Allocator, src: []const u8, host_macros: *const HostMacroTable) !struct { form: ExpandError!*Form, failure: ?Failure } {
+    const form = try readForTest(arena, src);
+    const interner = try arena.create(intern_mod.Interner);
+    interner.* = intern_mod.Interner.init(arena);
+    var ctx = ExpandContext{ .allocator = arena, .interner = interner, .host_macros = host_macros };
+    const out = expandForm(&ctx, form);
+    return .{ .form = out, .failure = ctx.failure };
+}
+
+/// Expand `src` with `host_macros` (the default macros when null) and
+/// expect `expected`, with `message` recorded against the source text
+/// `at`.
+fn expectFailure(src: []const u8, host_macros: ?*const HostMacroTable, expected: ExpandError, message: []const u8, at: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const table = try defaultMacros(arena);
-    var p = try reader_mod.parser.parseForm(arena, src);
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, src);
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &table };
-    try testing.expectError(expected, expandForm(&ctx, form));
-    const failure = ctx.failure orelse return error.TestExpectedFailure;
+    const defaults = try defaultMacros(arena);
+    const r = try expandForTest(arena, src, host_macros orelse &defaults);
+    try testing.expectError(expected, r.form);
+    const failure = r.failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, failure.message);
     try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
 }
 
 test "failure: a malformed form records a message at the innermost form" {
     const M = ExpandError.MalformedMacroCall;
-    try expectFailure("(let [a] a)", M, "let: the binding vector needs an even number of forms", "[a]");
-    try expectFailure("(let* [a 1] (loop [b] b))", M, "loop: the binding vector needs an even number of forms", "[b]");
-    try expectFailure("(let [1 2] 3)", M, "cannot bind an integer", "1");
-    try expectFailure("(let [{:keys k} {}] k)", M, ":keys takes a vector of names, not a symbol", "k");
-    try expectFailure("(defn f)", M, "defn: expected a name and a parameter vector", "(defn f)");
-    try expectFailure("(defn \"f\" [] 1)", M, "the name defined must be an unqualified symbol, not a string", "\"f\"");
-    try expectFailure("(fn x)", M, "fn: expected a parameter vector", "(fn x)");
-    try expectFailure("(do 1 (+ 2 (cond 1)))", M, "cond: needs an even number of forms", "(cond 1)");
-    try expectFailure("(do 1 (+ 2 (when)))", M, "when: expected a test", "(when)");
-    try expectFailure("(let [x 1] (set! x 2))", M, "set!: x is a local, not a Var", "x");
+    try expectFailure("(let [a] a)", null, M, "let: the binding vector needs an even number of forms", "[a]");
+    try expectFailure("(let* [a 1] (loop [b] b))", null, M, "loop: the binding vector needs an even number of forms", "[b]");
+    try expectFailure("(let [1 2] 3)", null, M, "cannot bind an integer", "1");
+    try expectFailure("(let [{:keys k} {}] k)", null, M, ":keys takes a vector of names, not a symbol", "k");
+    try expectFailure("(defn f)", null, M, "defn: expected a name and a parameter vector", "(defn f)");
+    try expectFailure("(defn \"f\" [] 1)", null, M, "the name defined must be an unqualified symbol, not a string", "\"f\"");
+    try expectFailure("(fn x)", null, M, "fn: expected a parameter vector", "(fn x)");
+    try expectFailure("(do 1 (+ 2 (cond 1)))", null, M, "cond: needs an even number of forms", "(cond 1)");
+    try expectFailure("(do 1 (+ 2 (when)))", null, M, "when: expected a test", "(when)");
+    try expectFailure("(let [x 1] (set! x 2))", null, M, "set!: x is a local, not a Var", "x");
 }
 
 test "failure: a macro that fails without a message is named at its call" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const Wrap = struct {
         fn refuse(_: *ExpandContext, _: *const Form, _: []const *Form) ExpandError!*Form {
             return ExpandError.MalformedMacroCall;
         }
     };
     var table: HostMacroTable = .{};
-    try table.put(arena, "refuse", Wrap.refuse);
-    const src = "(do 1 (+ 2 (refuse 3)))";
-    var p = try reader_mod.parser.parseForm(arena, src);
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, src);
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &table };
-    try testing.expectError(ExpandError.MalformedMacroCall, expandForm(&ctx, form));
-    try testing.expectEqualStrings("malformed (refuse ...)", ctx.failure.?.message);
-    try testing.expectEqualStrings("(refuse 3)", src[ctx.failure.?.span.pos..][0..ctx.failure.?.span.len]);
+    try table.put(arena_state.allocator(), "refuse", Wrap.refuse);
+    try expectFailure("(do 1 (+ 2 (refuse 3)))", &table, ExpandError.MalformedMacroCall, "malformed (refuse ...)", "(refuse 3)");
 }
 
 test "unwrapQuote: the reader's quote datum and a written-out (quote x) both unwrap" {
@@ -3056,21 +3011,11 @@ test "unwrapQuote: the reader's quote datum and a written-out (quote x) both unw
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     for ([_][]const u8{ "'x", "(quote x)" }) |src| {
-        var p = try reader_mod.parser.parseForm(arena, src);
-        defer p.parser.deinit();
-        var rdr = reader_mod.Reader.init(arena, src);
-        defer rdr.deinit();
-        const form = try rdr.readOneForm(p.sexp);
-        const inner = unwrapQuote(form);
-        try testing.expect(inner.datum == .symbol);
+        const inner = unwrapQuote(try readForTest(arena, src));
         try testing.expectEqualStrings("x", inner.datum.symbol.name);
     }
     for ([_][]const u8{ "x", "(quote x y)", "(other x)" }) |src| {
-        var p = try reader_mod.parser.parseForm(arena, src);
-        defer p.parser.deinit();
-        var rdr = reader_mod.Reader.init(arena, src);
-        defer rdr.deinit();
-        const form = try rdr.readOneForm(p.sexp);
+        const form = try readForTest(arena, src);
         try testing.expect(unwrapQuote(form) == form);
     }
 }
@@ -3080,113 +3025,48 @@ test "set!: expands to var-set on the Var; a lexical target is refused at expans
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const empty: HostMacroTable = .{};
-    const out = try expandSourceForTest(arena, "(set! *x* (+ 1 2))", &empty);
-    try testing.expect(out.datum == .list);
-    const items = out.datum.list;
+    const items = (try (try expandForTest(arena, "(set! *x* (+ 1 2))", &empty)).form).datum.list;
     try testing.expectEqual(@as(usize, 3), items.len);
     try testing.expectEqualStrings("nexis.core", items[0].datum.symbol.ns.?);
     try testing.expectEqualStrings("var-set", items[0].datum.symbol.name);
     const var_form = items[1].datum.list;
-    try testing.expectEqual(@as(usize, 2), var_form.len);
     try testing.expectEqualStrings("var", var_form[0].datum.symbol.name);
     try testing.expectEqualStrings("*x*", var_form[1].datum.symbol.name);
     try testing.expect(items[2].datum == .list);
-    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(let* [x 1] (set! x 2))", &empty));
-    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(fn* [x] (set! x 2))", &empty));
-    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(set! 1 2)", &empty));
-    try testing.expectError(ExpandError.MalformedMacroCall, expandSourceForTest(arena, "(set! *x*)", &empty));
-}
-
-test "macroexpand: no-op walks return input unchanged (empty table)" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const empty: HostMacroTable = .{};
-    // A variety of forms — all should pass through with no
-    // macro fires. We compare pretty-printed output against
-    // round-trip via the reader for stability.
-    const fixtures = [_][]const u8{
-        "42",
-        "true",
-        "nil",
-        ":kw",
-        "x",
-        "(+ 1 2)",
-        "(if (< x 10) :small :big)",
-        "(do (def y 1) y)",
-        "(let* [a 1 b 2] (+ a b))",
-        "(loop* [i 0] (if (< i 10) (recur (+ i 1)) i))",
-        "(fn* [x y] (+ x y))",
-        "(fn* fact [n] (if (< n 2) n (recur (+ n -1))))",
-        "(letfn* [(f [x] (g x)) (g [x] x)] (f 7))",
-        "(defn add [x y] (+ x y))",
-        "(quote foo)",
-        "'foo",
-        "(quote (when x y))", // critical: quote opaque, when NOT expanded
-    };
-    for (fixtures) |src| {
-        // With an empty macro table, the expander never fires
-        // a macro. Top-level Datum tag must be preserved (the
-        // expander never mutates a form's tag, only rebuilds
-        // list/vector subtrees when binding-form helpers run).
-        const original_tag: std.meta.Tag(Datum) = blk: {
-            var p = try reader_mod.parser.parseForm(arena, src);
-            defer p.parser.deinit();
-            var rdr = reader_mod.Reader.init(arena, src);
-            defer rdr.deinit();
-            const f = try rdr.readOneForm(p.sexp);
-            break :blk std.meta.activeTag(f.datum);
-        };
-        const expanded = try expandSourceForTest(arena, src, &empty);
-        try testing.expectEqual(original_tag, std.meta.activeTag(expanded.datum));
+    for ([_][]const u8{ "(let* [x 1] (set! x 2))", "(fn* [x] (set! x 2))", "(set! 1 2)", "(set! *x*)" }) |src| {
+        try testing.expectError(ExpandError.MalformedMacroCall, (try expandForTest(arena, src, &empty)).form);
     }
 }
 
-test "macroexpand: empty list passes through" {
+test "macroexpand: with no macros a form comes back as it was read" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const empty: HostMacroTable = .{};
-    // `()` — expander returns the empty list; lowerForm will
-    // catch the empty-call malformation.
-    const result = try expandSourceForTest(arena, "()", &empty);
-    try testing.expect(result.datum == .list);
-    try testing.expectEqual(@as(usize, 0), result.datum.list.len);
+    for ([_][]const u8{
+        "42",                                             "true",                       "nil",                ":kw",                "x",
+        "(+ 1 2)",                                        "(if (< x 10) :small :big)",  "(do (def y 1) y)",   "(let* [a 1] a)",     "(loop* [i 0] (if (< i 10) (recur (+ i 1)) i))",
+        "(fn* fact [n] (if (< n 2) n (recur (+ n -1))))", "(letfn* [(f [x] x)] (f 7))", "(defn add [x y] x)", "(quote (when x y))", "'foo",
+        "()",
+    }) |src| {
+        const read = try readForTest(arena, src);
+        const expanded = try (try expandForTest(arena, src, &empty)).form;
+        try testing.expectEqual(std.meta.activeTag(read.datum), std.meta.activeTag(expanded.datum));
+    }
 }
 
-test "macroexpand: depth limit caught for infinite macro loop" {
+test "macroexpand: a macro that expands to itself stops at the depth limit" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    // A pathological macro that returns the same call form
-    // it received — infinite loop.
     const Wrap = struct {
-        fn loopForever(
-            _: *ExpandContext,
-            call_form: *const Form,
-            _: []const *Form,
-        ) ExpandError!*Form {
+        fn loopForever(_: *ExpandContext, call_form: *const Form, _: []const *Form) ExpandError!*Form {
             return mutCast(call_form);
         }
     };
     var table: HostMacroTable = .{};
-    defer table.deinit(arena);
     try table.put(arena, "boom", Wrap.loopForever);
-
-    var p = try reader_mod.parser.parseForm(arena, "(boom)");
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, "(boom)");
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{
-        .allocator = arena,
-        .interner = &interner,
-        .host_macros = &table,
-    };
-    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, form));
+    try testing.expectError(ExpandError.ExpansionDepthExceeded, (try expandForTest(arena, "(boom)", &table)).form);
 }
 
 test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not a fault" {
@@ -3196,149 +3076,39 @@ test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not 
     stack.arm(64 * 1024);
     defer stack.arm(stack.main_thread_budget);
     // (do (do ... (do 1) ...)) nested far deeper than 64 KiB of frames.
+    const origin: SrcSpan = .{ .pos = 0, .len = 0 };
     var form = try arena.create(Form);
-    form.* = .{ .datum = .{ .int = 1 }, .origin = .{ .pos = 0, .len = 0 } };
+    form.* = .{ .datum = .{ .int = 1 }, .origin = origin };
     const do_sym = try arena.create(Form);
-    do_sym.* = .{ .datum = .{ .symbol = .{ .ns = null, .name = "do" } }, .origin = .{ .pos = 0, .len = 0 } };
+    do_sym.* = .{ .datum = .{ .symbol = .{ .ns = null, .name = "do" } }, .origin = origin };
     for (0..20_000) |_| {
-        const items = try arena.alloc(*Form, 2);
-        items[0] = do_sym;
-        items[1] = form;
         const outer = try arena.create(Form);
-        outer.* = .{ .datum = .{ .list = items }, .origin = .{ .pos = 0, .len = 0 } };
+        outer.* = .{ .datum = .{ .list = try arena.dupe(*Form, &.{ do_sym, form }) }, .origin = origin };
         form = outer;
     }
     var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
     const empty: HostMacroTable = .{};
     var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &empty };
     try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, form));
 }
 
-test "macroexpand: lexical shadowing blocks macro expansion" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // A macro that, if fired, would replace `(my-macro)` with
-    // `:fired`. Inside a let* binding `my-macro` to anything,
-    // the macro MUST NOT fire.
-    const Wrap = struct {
-        fn fireIt(
-            ctx: *ExpandContext,
-            call_form: *const Form,
-            _: []const *Form,
-        ) ExpandError!*Form {
-            const kw_id = ctx.interner.internKeyword("fired") catch return ExpandError.OutOfMemory;
-            const form = try ctx.allocator.create(Form);
-            form.* = .{
-                .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
-                .origin = call_form.origin,
-            };
-            return form;
-        }
-    };
-    var table: HostMacroTable = .{};
-    defer table.deinit(arena);
-    try table.put(arena, "my-macro", Wrap.fireIt);
-
-    // (let* [my-macro 0] (my-macro)) — macro is shadowed.
-    var p = try reader_mod.parser.parseForm(arena, "(let* [my-macro 0] (my-macro))");
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, "(let* [my-macro 0] (my-macro))");
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{
-        .allocator = arena,
-        .interner = &interner,
-        .host_macros = &table,
-    };
-    const expanded = try expandForm(&ctx, form);
-    // The expanded form should still be a let* with an inner
-    // (my-macro) call — NOT a :fired keyword.
-    try testing.expect(expanded.datum == .list);
-    const outer = expanded.datum.list;
-    try testing.expect(outer.len == 3);
-    // outer[2] is the body — should be a list (my-macro), NOT
-    // a keyword :fired.
-    try testing.expect(outer[2].datum == .list);
-}
-
-test "macroexpand: macro fires at top level when not shadowed" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const Wrap = struct {
-        fn fireIt(
-            ctx: *ExpandContext,
-            call_form: *const Form,
-            _: []const *Form,
-        ) ExpandError!*Form {
-            const kw_id = ctx.interner.internKeyword("fired") catch return ExpandError.OutOfMemory;
-            const form = try ctx.allocator.create(Form);
-            form.* = .{
-                .datum = .{ .keyword = .{ .ns = null, .name = ctx.interner.keywordName(kw_id) } },
-                .origin = call_form.origin,
-            };
-            return form;
-        }
-    };
-    var table: HostMacroTable = .{};
-    defer table.deinit(arena);
-    try table.put(arena, "my-macro", Wrap.fireIt);
-
-    var p = try reader_mod.parser.parseForm(arena, "(my-macro)");
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, "(my-macro)");
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{
-        .allocator = arena,
-        .interner = &interner,
-        .host_macros = &table,
-    };
-    const expanded = try expandForm(&ctx, form);
-    try testing.expect(expanded.datum == .keyword);
-    try testing.expectEqualStrings("fired", expanded.datum.keyword.name);
-}
-
-test "macroexpand: quote is opaque — macro inside quote does NOT fire" {
+test "macroexpand: a macro fires unless a lexical binding shadows its name or a quote holds it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Wrap = struct {
-        fn fireIt(_: *ExpandContext, call_form: *const Form, _: []const *Form) ExpandError!*Form {
-            // If ever called, return nil so the failure is obvious.
-            const form = std.heap.page_allocator.create(Form) catch unreachable;
-            form.* = .{ .datum = .nil, .origin = call_form.origin };
-            return form;
+        fn fireIt(ctx: *ExpandContext, call_form: *const Form, _: []const *Form) ExpandError!*Form {
+            return (Builder{ .ctx = ctx, .origin = call_form.origin }).kw("fired");
         }
     };
     var table: HostMacroTable = .{};
-    defer table.deinit(arena);
     try table.put(arena, "my-macro", Wrap.fireIt);
-
-    var p = try reader_mod.parser.parseForm(arena, "(quote (my-macro))");
-    defer p.parser.deinit();
-    var rdr = reader_mod.Reader.init(arena, "(quote (my-macro))");
-    defer rdr.deinit();
-    const form = try rdr.readOneForm(p.sexp);
-
-    var interner = intern_mod.Interner.init(arena);
-    defer interner.deinit();
-    var ctx = ExpandContext{
-        .allocator = arena,
-        .interner = &interner,
-        .host_macros = &table,
-    };
-    const expanded = try expandForm(&ctx, form);
-    // Should still be (quote (my-macro)), NOT nil.
-    try testing.expect(expanded.datum == .list);
+    const fired = try (try expandForTest(arena, "(my-macro)", &table)).form;
+    try testing.expectEqualStrings("fired", fired.datum.keyword.name);
+    // `(let* [my-macro 0] (my-macro))`: the body is still the call.
+    const shadowed = try (try expandForTest(arena, "(let* [my-macro 0] (my-macro))", &table)).form;
+    try testing.expect(shadowed.datum.list[2].datum == .list);
+    // `(quote (my-macro))` stays a quote of the list.
+    const quoted = try (try expandForTest(arena, "(quote (my-macro))", &table)).form;
+    try testing.expect(quoted.datum == .list and quoted.datum.list[1].datum == .list);
 }

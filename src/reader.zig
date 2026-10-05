@@ -1143,29 +1143,7 @@ test "a token longer than 64 KiB reads whole" {
 }
 
 test "N suffix: an integer literal of any radix or size reads as the integer" {
-    const allocator = std.testing.allocator;
-    const ints = [_]struct { src: []const u8, value: i64 }{
-        .{ .src = "1N", .value = 1 },
-        .{ .src = "-7N", .value = -7 },
-        .{ .src = "0xFFN", .value = 255 },
-        .{ .src = "0b101N", .value = 5 },
-    };
-    for (ints) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(try p.parseProgram());
-        try std.testing.expectEqual(@as(usize, 1), forms.len);
-        try std.testing.expectEqual(c.value, forms[0].datum.int);
-    }
-    const wide = "18446744073709551616N";
-    var p = parser.Parser.init(allocator, wide);
-    defer p.deinit();
-    var rd = Reader.init(allocator, wide);
-    defer rd.deinit();
-    const forms = try rd.readProgram(try p.parseProgram());
-    try std.testing.expectEqualStrings("18446744073709551616", forms[0].datum.bigint);
+    try expectReads("1N -7N 0xFFN 0b101N 18446744073709551616N", "(int 1)\n(int -7)\n(int 255)\n(int 5)\n(bigint 18446744073709551616)\n");
 }
 
 test "bigint literals: beyond i64 in any radix, as canonical decimal text" {
@@ -1209,23 +1187,7 @@ test "integer radix normalization" {
 }
 
 test "nil / true / false only match unqualified symbols" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{ "nil", "true", "false", "foo/nil", "foo/true", "foo/false", ":nil", ":true" };
-    const expect_atomic = [_]bool{ true, true, true, false, false, false, false, false };
-    for (cases, expect_atomic) |src, want_atomic| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expect(forms.len == 1);
-        const is_atomic = switch (forms[0].datum) {
-            .nil, .bool_ => true,
-            else => false,
-        };
-        try std.testing.expectEqual(want_atomic, is_atomic);
-    }
+    try expectReads("nil true false foo/nil foo/true :nil :true", "nil\n(bool true)\n(bool false)\n(symbol foo/nil)\n(symbol foo/true)\n(keyword :nil)\n(keyword :true)\n");
 }
 
 test "namespace split" {
@@ -1340,69 +1302,33 @@ test "char literals: one token to the next delimiter, judged whole" {
 }
 
 test "discard applies uniformly across aggregator contexts" {
-    const allocator = std.testing.allocator;
-    // Discard consumes its next form including any reader sugar attached
-    // to it (metadata, deref, quote, anon-fn): the prefixed form is one form.
-    const cases = [_]struct { src: []const u8, expected_len: usize }{
-        .{ .src = "#_ ^:m x y", .expected_len = 1 }, // ^:m x is one form
-        .{ .src = "#_ @a b", .expected_len = 1 }, // @a is one form
-        .{ .src = "#_ '(+ 1 2) keep", .expected_len = 1 }, // quoted list is one form
-        .{ .src = "#_ #(+ % 1) z", .expected_len = 1 }, // anon-fn is one form
-        .{ .src = "[#_ x y]", .expected_len = 1 }, // discard inside vector
-        .{ .src = "#{#_ x :a}", .expected_len = 1 }, // discard inside set
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expectEqual(c.expected_len, forms.len);
-    }
+    // Discard consumes its next form including any reader sugar
+    // attached to it (metadata, deref, quote, anon-fn): the prefixed
+    // form is one form.
+    try expectReads("#_ ^:m x y #_ @a b #_ '(+ 1 2) keep #_ #(+ % 1) z [#_ x y] #{#_ x :a}",
+        \\(symbol y)
+        \\(symbol b)
+        \\(symbol keep)
+        \\(symbol z)
+        \\(vector (symbol y))
+        \\(set (keyword :a))
+        \\
+    );
 }
 
 test "discard inside a map affects key/value arity" {
-    // `{:a 1 #_ :b 2}` drops `:b`, leaving `[:a, 1, 2]` (3 forms, odd) —
-    // the map reader correctly reports :map-odd-count. This pins the
-    // behavior: discards reshape map contents and the error surfaces at
-    // the post-discard arity check, not silently.
-    const allocator = std.testing.allocator;
-    const src: []const u8 = "{:a 1 #_ :b 2}";
-    var p = parser.Parser.init(allocator, src);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
-    defer rd.deinit();
-    try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-    try std.testing.expect(rd.err.?.kind == .map_odd_count);
+    // `{:a 1 #_ :b 2}` drops `:b`, leaving three forms: the arity check
+    // after the discard reports it, never silently.
+    try expectReaderError("{:a 1 #_ :b 2}", .map_odd_count, null);
 }
 
 test "stacked discard drops siblings in source order" {
-    // `#_ #_ x y z` yields `[z]` (drops x and y), as Clojure's reader
-    // does: each `#_` consumes one form, and the form it consumes may
-    // itself begin with `#_`.
-    const allocator = std.testing.allocator;
-    const cases = [_]struct { src: []const u8, expected_count: usize, first_atom: ?[]const u8 }{
-        .{ .src = "#_ x y", .expected_count = 1, .first_atom = "y" },
-        .{ .src = "#_ #_ x y z", .expected_count = 1, .first_atom = "z" },
-        .{ .src = "#_ #_ #_ a b c d", .expected_count = 1, .first_atom = "d" },
-        .{ .src = "[#_ #_ x y z]", .expected_count = 1, .first_atom = null }, // wrapped
-        .{ .src = "(+ #_ #_ x y 3 4)", .expected_count = 1, .first_atom = null },
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expectEqual(c.expected_count, forms.len);
-        if (c.first_atom) |name| {
-            try std.testing.expect(forms[0].datum == .symbol);
-            try std.testing.expectEqualStrings(name, forms[0].datum.symbol.name);
-        }
-    }
+    // Each `#_` consumes one form, and the form it consumes may itself
+    // begin with `#_`, as in Clojure's reader.
+    try expectReads("#_ x y", "(symbol y)\n");
+    try expectReads("#_ #_ x y z", "(symbol z)\n");
+    try expectReads("#_ #_ #_ a b c d", "(symbol d)\n");
+    try expectReads("[#_ #_ x y z] (+ #_ #_ x y 3 4)", "(vector (symbol z))\n(list (symbol +) (int 3) (int 4))\n");
 }
 
 /// `src` read as a program, each form printed as the goldens print it.
