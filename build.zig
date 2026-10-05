@@ -86,7 +86,8 @@ pub fn build(b: *std.Build) void {
         parser_check_step.dependOn(&skip.step);
     }
 
-    const bins = binaries(b, target, optimize, nexis);
+    const suites = listSuites(b);
+    const bins = binaries(b, target, optimize, nexis, suites);
 
     // Every inline `test` block of the runtime, in one binary.
     // Every test binary runs from the build root, so the stores its
@@ -147,11 +148,12 @@ pub fn build(b: *std.Build) void {
     const check_targets_step = b.step("check-targets", "Compile and link every binary and test binary for Linux (x86_64 and aarch64, glibc and musl)");
     for (linux_targets) |t| {
         const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
-        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize));
-        for ([_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit } ++ cross_bins.suites) |compile| {
+        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize), suites);
+        const named = [_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit };
+        for ([_][]const *std.Build.Step.Compile{ &named, cross_bins.suites }) |set| for (set) |compile| {
             _ = compile.getEmittedBin();
             check_targets_step.dependOn(&compile.step);
-        }
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -454,34 +456,31 @@ fn exists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
-/// The property and integration test files, each its own binary.
-const Suite = struct { path: []const u8, quick: bool = false, nextomic: bool = false };
-const suites = [_]Suite{
-    .{ .path = "test/prop/primitive.zig" },
-    .{ .path = "test/prop/intern.zig" },
-    .{ .path = "test/prop/heap.zig" },
-    .{ .path = "test/prop/string.zig" },
-    .{ .path = "test/prop/list.zig" },
-    .{ .path = "test/prop/bignum.zig" },
-    .{ .path = "test/prop/vector.zig" },
-    .{ .path = "test/prop/champ.zig" },
-    .{ .path = "test/prop/sorted.zig" },
-    .{ .path = "test/prop/gc.zig" },
-    .{ .path = "test/prop/transient.zig" },
-    .{ .path = "test/prop/codec.zig" },
-    .{ .path = "test/prop/typed_vector.zig" },
-    .{ .path = "test/prop/db.zig" },
-    .{ .path = "test/prop/compile.zig", .quick = true },
-    .{ .path = "test/prop/nextomic_key.zig", .quick = true, .nextomic = true },
-    .{ .path = "test/prop/nextomic_tx.zig", .quick = true, .nextomic = true },
-    .{ .path = "test/integration/eval_pipeline.zig", .quick = true },
-    .{ .path = "test/integration/runtime_polish.zig", .quick = true },
-    .{ .path = "test/integration/numbers.zig", .quick = true },
-    .{ .path = "test/integration/nextomic_q.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_pull.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_fn.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_entity.zig", .nextomic = true },
-};
+/// A property or integration test file, its own binary.
+const Suite = struct { path: []const u8, quick: bool, nextomic: bool };
+
+/// The suites `zig build quick` runs besides `unit`.
+const quick_suites = [_][]const u8{ "compile", "nextomic_key", "nextomic_tx", "eval_pipeline", "runtime_polish", "numbers" };
+
+/// Every `.zig` file in test/prop and test/integration but the
+/// fixtures the suites import (`_fx.zig`), so a new suite runs without
+/// a line here. The Nextomic suites (`nextomic_*`) also run under
+/// `nextomic-test`.
+fn listSuites(b: *std.Build) []const Suite {
+    var list: std.ArrayList(Suite) = .empty;
+    for ([_][]const u8{ "test/prop", "test/integration" }) |dir| for (listFiles(b, dir, false)) |path| {
+        if (!std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, "_fx.zig")) continue;
+        const name = std.Io.Dir.path.stem(path);
+        list.append(b.allocator, .{
+            .path = path,
+            .quick = for (quick_suites) |q| {
+                if (std.mem.eql(u8, q, name)) break true;
+            } else false,
+            .nextomic = std.mem.startsWith(u8, name, "nextomic_"),
+        }) catch @panic("OOM");
+    };
+    return list.items;
+}
 
 /// The targets `check-targets` compiles for: Linux on both
 /// architectures, glibc and musl (the static binary). x86_64 is
@@ -502,20 +501,21 @@ const Binaries = struct {
     /// mode: the gate's check that it compiles.
     bench: *std.Build.Step.Compile,
     unit: *std.Build.Step.Compile,
-    suites: [suites.len]*std.Build.Step.Compile,
+    /// One per `suites` entry, in order.
+    suites: []*std.Build.Step.Compile,
 };
 
 /// Every binary the build compiles for `target`, over the runtime
 /// module `nexis`.
-fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) Binaries {
+fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module, suites: []const Suite) Binaries {
     const harness = b.createModule(.{
         .root_source_file = b.path("test/harness.zig"),
         .target = target,
         .optimize = optimize,
     });
     harness.addImport("nexis", nexis);
-    var suite_bins: [suites.len]*std.Build.Step.Compile = undefined;
-    for (suites, &suite_bins) |suite, *bin| {
+    const suite_bins = b.allocator.alloc(*std.Build.Step.Compile, suites.len) catch @panic("OOM");
+    for (suites, suite_bins) |suite, *bin| {
         const module = b.createModule(.{
             .root_source_file = b.path(suite.path),
             .target = target,

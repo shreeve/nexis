@@ -34,7 +34,8 @@ The q and pull corpora each end with a 10k-datom twin of a
 `zig build bench` scenario (`bench/nextomic.zig`) that checks its row
 counts.
 
-Run with `zig build test`; `eval_pipeline`, `runtime_polish` and
-`numbers` also run under `zig build quick` and the Nextomic suites under
-`zig build nextomic-test`. Language-level scripts live in
+Each `.zig` file here but the fixture is its own binary, found by
+the build. Run with `zig build test`; `eval_pipeline`, `runtime_polish`
+and `numbers` also run under `zig build quick` and the Nextomic suites
+under `zig build nextomic-test`. Language-level scripts live in
 `test/nextomic/*.nx` (run by `zig build nextomic-nx`).

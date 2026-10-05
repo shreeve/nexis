@@ -8,11 +8,16 @@ the directories below hold what crosses modules.
 | Path | What | Run via |
 |---|---|---|
 | `src/**/*.zig` (inline `test` blocks) | Per-module unit tests, compiled into one `unit` binary rooted at `src/root.zig` (a file's tests run once `src/root.zig` declares it; the build's layering check rejects an undeclared file) | `zig build test`, `zig build quick` |
-| `test/prop/` | Cross-module property tests (17 files: primitive, intern, heap, string, list, bignum, vector, champ, sorted, transient, typed_vector, gc, codec, db, compile, nextomic_key, nextomic_tx) | `zig build test` (`compile`, `nextomic_key` and `nextomic_tx` also via `zig build quick`) |
+| `test/prop/` | Cross-module property tests (primitive, intern, heap, string, list, bignum, vector, champ, sorted, transient, typed_vector, gc, codec, db, compile, nextomic_key, nextomic_tx) | `zig build test` (`compile`, `nextomic_key` and `nextomic_tx` also via `zig build quick`) |
 | `test/golden/` | Reader goldens (`src/golden.zig` prints what the reader makes of each `.nx`: its Form program, pinned to `.sexp`, or for `errors/*.nx` the refusal, pinned to `.err`) and CLI goldens (`cli/`: what `bin/nexis` prints for a runtime error, a reader error, a disassembly, a script, a REPL session and the usage errors, stream by stream, with the exit code) | `zig build golden` (or `zig build test`) |
 | `test/nextomic/` | Nextomic end-to-end scripts (`.nx` run through `bin/nexis` ↔ `.out` expected stdout), each from a fresh directory that holds the stores it creates; `prelude.nx` (shared `check`/`caught` and the partition constants) is found beside the script; `<name>-1`/`<name>-2` share one directory, so `persist-2` reads the store `persist-1` wrote | `zig build nextomic-nx` (or `zig build test`) |
 | `test/integration/` | End-to-end source-to-execution suites (`eval_pipeline.zig`, `runtime_polish.zig`, `numbers.zig`), the Nextomic query corpus (`nextomic_q.zig`, checked against a naive evaluator), pull corpus (`nextomic_pull.zig`, checked against `entity()` and `datoms(.vaet)`), the shared fixture (`nextomic_fx.zig`), transaction functions and schema alteration (`nextomic_fn.zig`) and the lazy entity (`nextomic_entity.zig`) | `zig build test` (Nextomic ones also via `zig build nextomic-test`) |
 | `examples/`, `test/examples/` | Every `examples/*.nx` runs through `bin/nexis` from a fresh directory, its stdout pinned to `test/examples/<name>.out`; an example with a `<name>.2.out` runs a second time over the store the first left | `zig build examples` (or `zig build test`) |
+
+Every `.zig` file in `test/prop/` and `test/integration/` is a suite
+of its own, found by the build; a `_fx.zig` file is a fixture the
+suites import. `build.zig` names only the suites `zig build quick`
+runs; the `nextomic_*` suites also run under `zig build nextomic-test`.
 
 Property and integration files import the runtime as one module:
 `const nx = @import("nexis");` then `nx.vm`, `nx.nextomic` and so on.
