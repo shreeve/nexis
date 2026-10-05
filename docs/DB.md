@@ -60,8 +60,10 @@ A plain Zig struct, not a Value: it holds its file's `StoreFile`
 (§3.1), the non-owning allocator, heap and interner the codec needs,
 the two `store_id` halves, an open flag, a count of
 open transactions, the tree-handle cache and its durability (§3.3). The stdlib allocates each
-one on the VM's allocator, records it in `vm.db_connections`, and
-frees it only at VM teardown, so no address a Value holds is reused
+one on the allocator of the VM that owns the registries (`VM.home`: a
+macro's sub-VM opens for the VM it compiles for, `docs/VM.md` §9.1),
+records it in that VM's `db_connections`, and frees it only at that
+VM's teardown, so no address a Value holds is reused
 while the VM lives. A `db_connection` Value (kind 31) is a pointer to
 it; `db_write_txn` (32) and `db_read_txn` (33) point at a transaction
 handle (§3.2).

@@ -17,8 +17,8 @@ barrier and no finalizer on a block (§9); the one resource the
 collector ends is a db transaction the program dropped (§5).
 
 A VM over a borrowed heap (the sub-VMs the expander runs macros on,
-which allocate on the heap of the VM whose Vars they use) never
-collects: it cannot enumerate the owner's roots. The collector also
+which allocate on the heap, and use the registries, of the VM whose
+Vars they use, `docs/VM.md` §9.1) never collects: it cannot enumerate the owner's roots. The collector also
 runs over a bare heap with explicit roots and no host in the tests
 (§10).
 

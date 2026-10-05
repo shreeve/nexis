@@ -1376,8 +1376,8 @@ fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isReduced(vm, args[0]));
 }
 
-fn isReduced(vm: *const VM, v: Value) bool {
-    const type_id = vm.reduced_type_id orelse return false;
+fn isReduced(vm: *VM, v: Value) bool {
+    const type_id = vm.home().reduced_type_id orelse return false;
     return v.kind() == .record and record_mod.typeId(v) == type_id;
 }
 
@@ -2801,7 +2801,8 @@ fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
 /// `{:error :compile-error :message "<CompileError>" :form form}`.
 fn fnEval(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
-    return try hooks.eval(hooks.user_data, vm, args[0]);
+    const eval = hooks.eval orelse return vm.throwKeyword("no-compiler");
+    return try eval(hooks.user_data, vm, args[0]);
 }
 
 // =============================================================================
@@ -3059,7 +3060,9 @@ fn isIfn(k: Kind) bool {
 // `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
 //
 // Connection lifetime: each `db/open` allocates a Connection on the
-// VM's allocator and appends it to `vm.db_connections`. `db/close`
+// allocator of the VM that owns the registries (`VM.home`: a macro's
+// sub-VM opens for the VM it compiles for, VM.md §9.1) and appends it
+// to that VM's `db_connections`. `db/close`
 // closes its env and leaves the struct in place; VM.deinit closes
 // whatever is still open and frees every Connection.
 
@@ -3087,14 +3090,15 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    const path_z = vm.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(path_z);
-    const conn = vm.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
-    errdefer vm.allocator.destroy(conn);
-    conn.* = db_mod.open(vm.allocator, vm.ensureHeap(), vm.ensureInterner(), path_z.ptr, .{ .allocator = vm.allocator }) catch |err| return dbFailure(vm, err);
+    const host = vm.home();
+    const path_z = host.allocator.dupeSentinel(u8, path, 0) catch return VmError.OutOfMemory;
+    defer host.allocator.free(path_z);
+    const conn = host.allocator.create(db_mod.Connection) catch return VmError.OutOfMemory;
+    errdefer host.allocator.destroy(conn);
+    conn.* = db_mod.open(host.allocator, host.ensureHeap(), host.ensureInterner(), path_z.ptr, .{ .allocator = host.allocator }) catch |err| return dbFailure(vm, err);
     if (durability) |d| conn.durability = d;
-    vm.db_close_callback = &dbCloseCallback;
-    vm.db_connections.append(vm.allocator, @ptrCast(conn)) catch {
+    host.db_close_callback = &dbCloseCallback;
+    host.db_connections.append(host.allocator, @ptrCast(conn)) catch {
         db_mod.shutdown(conn);
         return VmError.OutOfMemory;
     };
@@ -3571,15 +3575,15 @@ fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
 
 /// The type id of `nexis.core/Delay`, registered on first use.
 fn delayType(vm: *VM) VmError!u32 {
-    for (vm.record_registry.items) |e| {
+    for (vm.home().record_registry.items) |e| {
         if (std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay")) return e.id;
     }
     return vm.registerRecordType("nexis.core", "Delay", &.{"state"}) catch VmError.OutOfMemory;
 }
 
-fn isDelay(vm: *const VM, v: Value) bool {
+fn isDelay(vm: *VM, v: Value) bool {
     if (v.kind() != .record) return false;
-    const e = vm.record_registry.items[record_mod.typeId(v)];
+    const e = vm.recordType(record_mod.typeId(v)) orelse return false;
     return std.mem.eql(u8, e.ns_name, "nexis.core") and std.mem.eql(u8, e.type_name, "Delay");
 }
 
@@ -3605,7 +3609,7 @@ fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
 
 /// `@d` of a delay: `(nexis.core/force d)`.
 fn forceDelay(vm: *VM, d: Value) VmError!Value {
-    const registry = vm.registry orelse return VmError.NotDerefable;
+    const registry = if (vm.home().registry) |*r| r else return VmError.NotDerefable;
     const force = registry.core.lookupLocal("force") orelse return VmError.NotDerefable;
     return vm.callValue(force.current() orelse return VmError.UnboundVar, &.{d});
 }
@@ -4852,8 +4856,9 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
 /// with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
-    for (vm.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
-    if (vm.nextomic_close_callback) |close| for (vm.nextomic_connections.items) |conn| close(conn);
+    const host = vm.home();
+    for (host.db_connections.items) |conn| db_mod.shutdown(@ptrCast(@alignCast(conn)));
+    if (host.nextomic_close_callback) |close| for (host.nextomic_connections.items) |conn| close(conn);
     db_mod.StoreFile.syncAll();
     std.process.exit(status);
 }

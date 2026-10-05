@@ -446,6 +446,27 @@ heap (the expander's macro sub-VMs) has `gc_enabled = false`.
 `VM.collectGarbage` runs one cycle and sizes the next window;
 `gc_cycles` counts them.
 
+#### 9.1 Sub-VMs
+
+A user macro runs on a fresh sub-VM (`docs/MACROEXPAND.md` §1.2) that
+borrows the heap (`borrowed_heap`) and the interner
+(`borrowed_interner`) of the VM it compiles for, its **owner**, and
+through `VM.borrowRegistries` that VM's registries too: `owner` points
+at it, and `VM.home()` (the owner, else the VM itself) is where every
+registry access goes. The namespace registry (`ensureRegistry`,
+`ensureNamespace`), the record types (`registerRecordType`,
+`recordType`, `ensureReducedType`, the `Delay` type), the protocols
+(`registerProtocol`, `protocolById`, `extendProtocol`) and the store
+connections `db/open` makes are the owner's, so a type id, a protocol
+id or a namespace means the same in every VM that shares a heap, and
+whatever a macro registers, and every value it stores, lives as long
+as the owner. The owner is found through the namespace the macro
+expands in (`NamespaceRegistry.vm`, set by `ensureRegistry`). A sub-VM
+gets the owner's compiler hooks without `eval` (`CompilerHooks.eval`
+is null, and `eval` throws `:no-compiler`): `eval` would compile into
+the sub-VM's runtime arena, which dies with it, and a `require` it ran
+would run the owner's collector over values only the sub-VM holds.
+
 ---
 
 ### 10. Opcode groups
@@ -870,8 +891,8 @@ callback that catches it returns normally through `mapv`, `reduce`,
   construction and the equality natives; the VM has no equality or
   hash logic of its own.
 - `src/coll/*.zig`: `coll:*` delegates directly.
-- `src/protocol.zig`, `src/record.zig`: per-VM registries;
-  `protocol_fn` dispatch in `call:call`.
+- `src/protocol.zig`, `src/record.zig`: the registries of
+  `VM.home()` (§9.1); `protocol_fn` dispatch in `call:call`.
 - `src/codec.zig`, `src/db.zig`, `src/nextomic/*`: reached only
   through natives; the VM tracks open `db` and Nextomic connections
   so `VM.deinit` closes them.

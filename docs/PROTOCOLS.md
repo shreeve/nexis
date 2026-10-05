@@ -125,7 +125,9 @@ method.
 ### 3. VM-side registries
 
 The VM owns two registries, freed by `VM.deinit`; the names in them
-are duped on registration.
+are duped on registration. A macro's sub-VM has none of its own: it
+uses those of the VM it compiles for (`VM.home`, `docs/VM.md` §9.1),
+so a type or protocol id means the same on both.
 
 | Registry | Entry | Holds |
 |---|---|---|
@@ -133,7 +135,10 @@ are duped on registration.
 | `VM.protocol_registry` | `ProtocolEntry` | `id`, `ns_name`, `name`, and `methods`: per method its keyword id, its name (for errors), an `impls` map from `DispatchKey` to a callable, and an optional `default_impl` |
 
 `VM.ensureReducedType` registers one built-in record type,
-`nexis.core/Reduced` with field `:val`, the first time `reduced` runs.
+`nexis.core/Reduced` with field `:val`, the first time `reduced` runs;
+the first `delay` registers `nexis.core/Delay` with field `:state`.
+`VM.recordType(id)` is the entry of a type id, null for one no
+`defrecord` registered.
 
 #### 3.1 Lifetime + redefinition
 
