@@ -2135,15 +2135,14 @@ fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
         const end = @min(at + un, items.items.len);
         group.clearRetainingCapacity();
         group.appendSlice(vm.allocator, items.items[at..end]) catch return VmError.OutOfMemory;
-        if (group.items.len < un) {
-            if (pad != null) {
-                var pi: usize = 0;
-                while (group.items.len < un and pi < pad_items.items.len) : (pi += 1) {
-                    group.append(vm.allocator, pad_items.items[pi]) catch return VmError.OutOfMemory;
-                }
-            } else if (!all) break;
-        }
+        const short = group.items.len < un;
+        if (short and pad != null) {
+            const fill = @min(un - group.items.len, pad_items.items.len);
+            group.appendSlice(vm.allocator, pad_items.items[0..fill]) catch return VmError.OutOfMemory;
+        } else if (short and !all) break;
         groups.append(vm.allocator, try buildListFromSlice(vm, group.items)) catch return VmError.OutOfMemory;
+        // The padded group is the last, as in Clojure.
+        if (short and pad != null) break;
     }
     return try buildListFromSlice(vm, groups.items);
 }

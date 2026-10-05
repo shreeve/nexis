@@ -4911,6 +4911,9 @@ test "core: sequence functions" {
         .{ .src = "(partition 2 [1 2 3 4 5])", .expected = "((1 2) (3 4))" },
         .{ .src = "(partition 2 1 [1 2 3])", .expected = "((1 2) (2 3))" },
         .{ .src = "(partition 3 3 [:pad] [1 2 3 4])", .expected = "((1 2 3) (4 :pad))" },
+        // A padded group ends the partition, as Clojure's does.
+        .{ .src = "(partition 3 1 [:p] [1 2 3 4])", .expected = "((1 2 3) (2 3 4) (3 4 :p))" },
+        .{ .src = "[(partition 3 1 [] [1 2]) (partitionv 2 1 [:p] [1 2 3])]", .expected = "[((1 2)) ([1 2] [2 3] [3 :p])]" },
         .{ .src = "(partition-all 2 [1 2 3 4 5])", .expected = "((1 2) (3 4) (5))" },
         .{ .src = "(partition-all 2 3 [1 2 3 4 5])", .expected = "((1 2) (4 5))" },
         .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = ":invalid-argument" },
