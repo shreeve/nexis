@@ -287,11 +287,6 @@ pub const With = struct {
         self.ctx.abort();
     }
 
-    /// `finish`: the view is the connection's, freed with it.
-    pub fn destroy(self: *With) void {
-        self.finish();
-    }
-
     /// The protocol after normalisation: apply, then open the view over
     /// the held transaction.
     fn speculate(self: *With) !void {
