@@ -2968,10 +2968,13 @@ test "db/scan seeks to the start bound and stops before the end bound" {
         \\  (with-read-tx [t conn]
         \\    [(db/scan t :range :b)
         \\     (db/scan t :range :bb :d)
+        \\     (db/scan t :range "c" 'd)
         \\     (db/scan t :range :e)
         \\     (db/scan t :range :a :a)
-        \\     (db/scan t :none)]))
-    , "[[[:b 2] [:c 3] [:d 4]] [[:c 3]] [] [] []]");
+        \\     (db/scan t :none)
+        \\     (string? (ffirst (db/scan t :range)))
+        \\     (= (db/ref conn :range (ffirst (db/scan t :range))) (db/ref conn :range :a))]))
+    , "[[[b 2] [c 3] [d 4]] [[c 3]] [[c 3]] [] [] [] true true]");
 }
 
 test "storage failures surface as :db/<reason> keywords inside try" {
@@ -3136,7 +3139,7 @@ test "db/reduce-tree walks the tree as it was when the walk began, whatever the 
         \\         (db/put! tx (db/ref c :t (str (name k) "x")) v)
         \\         (db/delete! tx (db/ref c :t "k399"))
         \\         (db/alter! tx (db/ref c :t "k100") inc)
-        \\         (when (= k :k100)
+        \\         (when (= k "k100")
         \\           (db/reduce-tree tx :t (fn [a k v] (db/put! tx (db/ref c :t (str (name k) "y")) v) a) nil))
         \\         (+ acc v))
         \\       0)

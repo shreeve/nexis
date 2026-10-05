@@ -538,8 +538,8 @@ and any operation on a closed connection or through a ref of one is
 | `(db/get tx ref)` / `(db/get tx ref default)` | 2–3 | The value through either transaction kind, the transaction's own writes included, or `default`. |
 | `(db/delete! tx ref)` | 2 | Whether the key existed. |
 | `(db/alter! tx ref f & args)` | 3+ | Writes and returns `(apply f current args)`, `current` nil when absent; when `f` throws, nothing is written. |
-| `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, keys as keywords; `start` inclusive, `end` exclusive, each a keyword or symbol. An absent tree is `[]`. |
-| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order, as it was when the walk began whatever `f` writes to it (§3); `init` for an absent tree. |
+| `(db/scan tx tree)` / `(… start)` / `(… start end)` | 2–4 | An eager vector of `[key value]` in key-byte order, each key a string of its bytes, which `db/ref` takes back; `start` inclusive, `end` exclusive, each a keyword, symbol or string as a ref's key is. An absent tree is `[]`. Keys are not keywords: interning every key a walk meets would grow the interner, which never shrinks, without bound. |
+| `(db/reduce-tree tx tree f init)` | 4 | `(f acc key value)` over the whole tree in key order, `key` a string as `db/scan`'s, as it was when the walk began whatever `f` writes to it (§3); `init` for an absent tree. |
 | `(db/snapshot conn)` / `(db/release-snapshot! snap)` | 1 | `db/begin-read` and `db/abort-read!` under the snapshot names. |
 | `(db/snapshot? x)` | 1 | Whether `x` is a read transaction not yet released. |
 | `(with-tx [tx conn] body…)` | macro | Begins a write, commits after body and returns its value; when body throws, aborts and rethrows. |

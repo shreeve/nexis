@@ -3622,9 +3622,11 @@ fn forceDelay(vm: *VM, d: Value) VmError!Value {
 // whole tree applying `(f acc key value)` and returns the final
 // accumulator.
 //
-// Keys come back as keyword Values interned from the key bytes
-// (the key model of `db/ref`). Each value is fully decoded onto
-// the heap before the cursor advances. Results are eager.
+// Keys come back as strings of the key bytes: interned keywords would
+// grow the interner, which never shrinks, by every key a walk meets.
+// `db/ref` takes a string key, so a key read back names its ref. Each
+// value is fully decoded onto the heap before the cursor advances.
+// Results are eager.
 
 /// Start `walk` over `tree_name` in the transaction of `h`; false
 /// for an absent tree, which every caller treats as empty.
@@ -3652,10 +3654,10 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     const interner = vm.ensureInterner();
     const tree_name = interner.keywordName(tree_v.asKeywordId());
 
-    // Optional range bounds: a keyword or symbol, whose name is the
-    // key's bytes.
-    const start_bytes: ?[]const u8 = if (args.len >= 3) try boundBytes(vm, args[2]) else null;
-    const end_bytes: ?[]const u8 = if (args.len >= 4) try boundBytes(vm, args[3]) else null;
+    // Optional range bounds: a keyword, symbol or string, whose name
+    // or bytes are the key's, as for `db/ref`.
+    const start_bytes: ?[]const u8 = if (args.len >= 3) try internedName(vm, args[2]) else null;
+    const end_bytes: ?[]const u8 = if (args.len >= 4) try internedName(vm, args[3]) else null;
 
     var walk: db_mod.Walk = undefined;
     if (!try beginWalk(vm, &walk, try activeTxn(tx_v), tree_name)) {
@@ -3672,18 +3674,13 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
             if (std.mem.order(u8, kv.key, eb) != .lt) break;
         }
         const decoded_v = try decodeEntry(vm, kv);
-        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const key_v = string_mod.fromBytes(vm.ensureHeap(), kv.key) catch return VmError.OutOfMemory;
         const pair = [_]Value{ key_v, decoded_v };
         const pair_vec = vector_mod.fromSlice(vm.ensureHeap(), &pair) catch return VmError.OutOfMemory;
         entries.append(vm.allocator, pair_vec) catch return VmError.OutOfMemory;
     }
 
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
-}
-
-fn boundBytes(vm: *VM, v: Value) VmError![]const u8 {
-    if (v.kind() != .keyword and v.kind() != .symbol) return VmError.KindMismatch;
-    return internedName(vm, v);
 }
 
 /// Predicate for snapshot Values. True if `x` is a
@@ -3718,7 +3715,7 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     var maybe_kv = walk.first(null) catch |err| return dbFailure(vm, err);
     while (maybe_kv) |kv| : (maybe_kv = walk.next() catch |err| return dbFailure(vm, err)) {
         const decoded_v = try decodeEntry(vm, kv);
-        const key_v = interner.internKeywordValue(kv.key) catch return VmError.OutOfMemory;
+        const key_v = string_mod.fromBytes(vm.ensureHeap(), kv.key) catch return VmError.OutOfMemory;
         const call_args = [_]Value{ acc, key_v, decoded_v };
         acc = try vm.callValue(f, &call_args);
     }
