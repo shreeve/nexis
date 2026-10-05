@@ -1,6 +1,13 @@
-# nexis CI: the full gate on macOS and Linux, formatting and the parser
-# check, and a speed-optimized build with a benchmark smoke run and the
-# static (musl) Linux binary.
+# nexis CI: the full gate on macOS and Linux, the gate again with a
+# collection every few kilobytes and every store commit synced,
+# formatting and the parser check, and a speed-optimized build with a
+# benchmark smoke run and the static (musl) Linux binaries.
+#
+# `zig build check-targets` is not a job. The test jobs build every
+# binary natively on x86_64 and aarch64 Linux (glibc) and on macOS, and
+# the release job links bin/nexis statically against musl for both
+# architectures; check-targets would add only the musl test binaries,
+# at the cost of compiling all 28 binaries for four targets.
 #
 # nexis builds against emdb as a path dependency (build.zig.zon
 # `.path = "../emdb"`), so every job checks nexis out into `nexis/` and
@@ -58,6 +65,32 @@ jobs:
         working-directory: nexis
         run: zig build test --summary all
 
+  # The gate under the collector's stress policy (docs/GC.md §7), where
+  # a native that keeps a value unrooted across an allocation fails, and
+  # with every commit synced (docs/DB.md §3.3), the durability the
+  # plain gate never takes. The two settings are independent, so one
+  # run covers both.
+  stress:
+    name: test (gc-stress, durable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          path: emdb
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      - name: zig build test -Dgc-stress -Ddurability=durable
+        working-directory: nexis
+        run: zig build test -Dgc-stress -Ddurability=durable --summary all
+
   lint:
     name: fmt and parser
     runs-on: ubuntu-latest
@@ -83,7 +116,7 @@ jobs:
           cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
       - name: zig fmt --check (src/parser.zig is generated)
         working-directory: nexis
-        run: git ls-files -z '*.zig' ':!:src/parser.zig' | xargs -0 zig fmt --check
+        run: git ls-files -z '*.zig' '*.zig.zon' ':!:src/parser.zig' | xargs -0 zig fmt --check
       - name: build nexus
         working-directory: nexus
         run: zig build
@@ -125,3 +158,9 @@ jobs:
           zig build install -Doptimize=fast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v2
           file bin/nexis | tee /dev/stderr | grep -q 'statically linked'
           test "$(./bin/nexis -e '(reduce + (range 101))')" = 5050
+      # Built, not run: this job runs on x86_64.
+      - name: static aarch64-linux-musl nexis
+        working-directory: nexis
+        run: |
+          zig build install -Doptimize=fast -Dtarget=aarch64-linux-musl --prefix "$RUNNER_TEMP/aarch64"
+          file "$RUNNER_TEMP/aarch64/bin/nexis" | tee /dev/stderr | grep -q 'statically linked'
