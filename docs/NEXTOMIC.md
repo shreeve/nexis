@@ -803,7 +803,9 @@ nothing). Results are copied into the VM heap as a persistent
 set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups
-and dedups as `?e` and is applied when the result is copied, in the
+and dedups as `?e`; its pattern resolves before the plan runs, so a
+bad one fails before any user function is called, and it is applied
+when the result is copied (to the one row `.` and `[...]` keep), in the
 query's own snapshot of the source it names (`$` by default): `?e`
 is an entity id, an ident or a lookup ref, resolved in that source; the
 pattern's map, nil for an entity with no datoms or a reference that

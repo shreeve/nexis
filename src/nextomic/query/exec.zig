@@ -34,7 +34,8 @@
 //!     and relation bindings fan out one row per element.
 //!   - `findRows` forms the basis set (distinct tuples over the find and
 //!     `:with` variables) and groups and aggregates it; `materialise`
-//!     applies pull expressions in the same snapshot and copies the
+//!     applies pull expressions in the same snapshot, their patterns
+//!     resolved before the plan ran (`preparePulls`), and copies the
 //!     result into the VM heap as the find spec and `:keys` ask.
 //!
 //! Every function on a path to the call hook is `anyerror`: the hook
@@ -115,6 +116,9 @@ pub const Exec = struct {
     /// The constant-prefix scans run so far, reused by a later pattern
     /// that reads the same datoms (`Scanned`).
     scans: std.ArrayList(Scanned) = .empty,
+    /// The pull find elements' resolved patterns, by find position
+    /// (`preparePulls`).
+    pulls: ?[]?pull_mod.Prepared = null,
 
     /// Run `p` from `input`, which binds at least `p.input`. A parked
     /// relation (`plan.Park`) keeps the columns it set aside, and its
@@ -1196,7 +1200,12 @@ pub const Exec = struct {
     /// vector of values, one value, or one vector. Pull expressions are
     /// applied here, in the query's own snapshot.
     pub fn materialise(self: *Exec, query: *const Ir, rows_in: []const []const Cell) anyerror!Value {
-        const rows = try self.pullColumns(query, rows_in);
+        // `.` and `[...]` keep the first row only: no other is pulled.
+        const first = switch (query.find_spec) {
+            .scalar, .tuple => rows_in.len > 1,
+            .relation, .collection => false,
+        };
+        const rows = try self.pullColumns(query, if (first) rows_in[0..1] else rows_in);
         if (query.keys) |keys| return self.rowMaps(keys, rows);
         switch (query.find_spec) {
             .relation => {
@@ -1226,19 +1235,11 @@ pub const Exec = struct {
         return vector_mod.fromSlice(self.heap, vals);
     }
 
-    /// `rows` with every `(pull ?e pattern)` column replaced by the
-    /// pattern's map for the row's entity: an entity id, an ident or a
-    /// lookup ref, resolved in the pull's source (nil for an entity
-    /// with no datoms, or a reference that names nothing); any other
-    /// cell is `ValueType`. Each
-    /// pattern is resolved once; a syntax error leaves its reason in
-    /// the diagnostic.
-    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
-        var any = false;
-        for (query.find) |f| if (f == .pull) {
-            any = true;
-        };
-        if (!any) return rows;
+    /// Resolve every `(pull ?e pattern)` find element's pattern against
+    /// its source, once, before the plan runs, so a bad pattern fails
+    /// before any user function has run; a syntax error leaves its
+    /// reason in the diagnostic.
+    pub fn preparePulls(self: *Exec, query: *const Ir) anyerror!void {
         var scratch: Diag = .{};
         const diag = self.diag orelse &scratch;
         const prepared = try self.arena.alloc(?pull_mod.Prepared, query.find.len);
@@ -1253,6 +1254,20 @@ pub const Exec = struct {
             };
             p.* = try pull_mod.Prepared.prepare(self.arena, try self.readOf(f.pull.src), self.heap, self.interner, pattern, diag);
         }
+        self.pulls = prepared;
+    }
+
+    /// `rows` with every `(pull ?e pattern)` column replaced by the
+    /// pattern's map for the row's entity: an entity id, an ident or a
+    /// lookup ref, resolved in the pull's source (nil for an entity
+    /// with no datoms, or a reference that names nothing); any other
+    /// cell is `ValueType`.
+    fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
+        if (self.pulls == null) try self.preparePulls(query);
+        const prepared = self.pulls.?;
+        for (prepared) |p| {
+            if (p != null) break;
+        } else return rows;
         const out = try self.arena.alloc([]const Cell, rows.len);
         for (rows, out) |row, *o| {
             const cells = try self.arena.dupe(Cell, row);

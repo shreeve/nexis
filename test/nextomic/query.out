@@ -100,6 +100,7 @@ nil
 (Ann Bob Cy Di Edward Flo)
 {:error :nextomic/query-syntax, :message :keys, :strs and :syms take one name per :find element}
 {:error :nextomic/unknown-attribute, :attr :nope/attr}
+{:error :nextomic/unknown-attribute, :attr :nope/attr} 0
 :nextomic/history-view
 {:db/id 4294967298, :person/name Cy, :person/age 41}
 {:db/id 4294967298, :person/name Cy}

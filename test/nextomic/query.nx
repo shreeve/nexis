@@ -223,6 +223,10 @@
 (println (sort (map (fn [m] (get m 'n)) (d/q '[:find ?n (count ?e) :syms n c :where [?e :person/name ?n]] db))))
 (println (t/caught (d/q '[:find ?n ?a :keys name :where [?e :person/name ?n] [?e :person/age ?a]] db)))
 (println (t/caught (d/q '[:find (pull ?e [:nope/attr]) :where [?e :person/age 30]] db)))
+;; A bad pull pattern fails before any user function runs.
+(def pulled (atom 0))
+(defn count-pull! [e] (swap! pulled inc) true)
+(println (t/caught (d/q '[:find (pull ?e [:nope/attr]) :where [?e :person/age 30] [(user/count-pull! ?e)]] db)) @pulled)
 (println (t/caught (d/q '[:find (pull ?e [:person/name]) :where [?e :person/age 30]] (d/history db))))
 (println (d/q '[:find (pull ?e ?p) . :in $ ?p :where [?e :person/email "cy@x"]] db [:person/name :person/age]))
 ;; The entity of a pull is an id, an ident or a lookup ref; one that
