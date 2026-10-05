@@ -734,3 +734,59 @@ fn errorKeyword(rt: *Runtime) Value {
     const name = vm.vmErrorToKeywordName(err) orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
     return rt.v.ensureInterner().internKeywordValue(name) catch value_mod.nilValue();
 }
+
+// =============================================================================
+// Inline tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "cli: Balance: brackets count outside strings, comments and character literals" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "(+ 1 2)", true },
+        .{ "(str \"(\"", false },
+        .{ "\"a\\\"b\"", true },
+        .{ "\"open", false },
+        .{ "[\\( \\) \\\"]", true },
+        .{ "(a ; ) closes nothing\n", false },
+        .{ "; a \" in a comment\n(a)", true },
+        .{ ")", true },
+        .{ "(a))", true },
+    };
+    for (cases) |case| {
+        var balance: Balance = .{};
+        balance.scan(case[0]);
+        try testing.expectEqual(case[1], balance.complete());
+    }
+}
+
+test "cli: Balance: a form scanned a line at a time" {
+    var balance: Balance = .{};
+    balance.scan("(defn f [x]\n");
+    try testing.expect(!balance.complete());
+    balance.scan("  \"[\" (* 2 x))\n");
+    try testing.expect(balance.complete());
+}
+
+test "cli: Place: the line, the column in code points with a tab as one, past a byte-order mark" {
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(a)\n\t\u{e9} (b)\r\nz" };
+    const first = Place.of(&info, 3);
+    try testing.expectEqual(@as(usize, 1), first.line);
+    try testing.expectEqual(@as(usize, 1), first.col);
+    try testing.expectEqualStrings("(a)", first.text);
+    try testing.expectEqual(@as(usize, 0), first.offset);
+    const second = Place.of(&info, 11);
+    try testing.expectEqual(@as(usize, 2), second.line);
+    try testing.expectEqual(@as(usize, 4), second.col);
+    try testing.expectEqualStrings("\t\u{e9} (b)", second.text);
+    try testing.expectEqual(@as(usize, 4), second.offset);
+    const past = Place.of(&info, 1000);
+    try testing.expectEqual(@as(usize, 3), past.line);
+    try testing.expectEqualStrings("z", past.text);
+}
+
+test "cli: width: one column per code point, a tab's width for a tab" {
+    try testing.expectEqual(@as(usize, 0), width(""));
+    try testing.expectEqual(@as(usize, 1 + tab.len + 1), width("\u{e9}\tx"));
+    try testing.expectEqual(@as(usize, 2), width("\u{1F600}!"));
+}
