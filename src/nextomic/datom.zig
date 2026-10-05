@@ -277,6 +277,17 @@ pub fn uuidToText(out: *[36]u8, u: [16]u8) void {
     }
 }
 
+/// The uuid whose canonical text `s` is (lower-case hex, 8-4-4-4-12),
+/// or null for any other string: Nextomic takes one text per uuid, so
+/// a string compares alike wherever a uuid is matched (NEXTOMIC.md
+/// §2.2).
+pub fn uuidFromCanonical(s: []const u8) ?[16]u8 {
+    for (s) |c| if (c >= 'A' and c <= 'F') return null;
+    return uuidFromText(s);
+}
+
+/// The uuid `s` spells in 8-4-4-4-12 hex digits of either case, or
+/// null (`parse-uuid`).
 pub fn uuidFromText(s: []const u8) ?[16]u8 {
     if (s.len != 36) return null;
     var out: [16]u8 = undefined;
@@ -410,4 +421,7 @@ test "uuid text round trip" {
     try testing.expectEqualStrings("ff000102-0304-0506-0708-090a0b0c0d0e", &text);
     try testing.expectEqualSlices(u8, &u, &uuidFromText(&text).?);
     try testing.expect(uuidFromText("nope") == null);
+    // One text per uuid: upper-case hex is not its text.
+    try testing.expect(uuidFromCanonical("0123ABCD-4567-89EF-0123-456789ABCDEF") == null);
+    try testing.expectEqualSlices(u8, &u, &uuidFromCanonical(&text).?);
 }

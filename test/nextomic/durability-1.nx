@@ -21,6 +21,7 @@
 (t/check "the first connection sees the second's commit at once" (= 3 (d/basis-t (d/db c))))
 (t/check "sync is nil" (and (nil? (d/sync c)) (nil? (d/sync k))))
 (t/check "release is nil" (nil? (d/release c2)))
+(t/check "an option map may be a sorted map" (nil? (d/release (d/connect "commit.edb" (sorted-map :sync :full :durability :commit)))))
 
 (t/check "an unknown durability is :invalid-argument"
          (= :invalid-argument (t/caught (d/connect "other.edb" {:durability :batch}))))

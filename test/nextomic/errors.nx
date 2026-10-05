@@ -59,10 +59,26 @@
 (d/transact! c [{:db/ident :x/a :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
                 {:db/ident :x/b :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
 (println (t/caught (d/transact! c [[:db/add :x/a :db/ident :x/new] [:db/add :x/b :db/ident :x/new]])))
+; Two renames of one attribute in one transaction conflict, and retire
+; neither name.
+(println (t/caught (d/transact! c [[:db/add :x/a :db/ident :x/p] [:db/add :x/a :db/ident :x/q]])))
+(t/check "a conflicting rename leaves the attribute its name" (= :x/a (d/ident (d/db c) (d/entid (d/db c) :x/a))))
 (d/transact! c2 [{:db/ident :x/new :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
 (t/check "an aborted rename is not cached" (= (d/entid (d/db c2) :x/new) (d/entid (d/db c) :x/new)))
 (t/check "the attribute keeps its old name" (= :x/a (d/ident (d/db c) (d/entid (d/db c) :x/a))))
 (println (t/caught (d/transact! c [{:db/id "e" :x/new 5}])))
+; A read older than its own connection's rename (a query whose function
+; renames the attribute the query reads) leaves nothing in the cache:
+; the connection then knows the attribute by its new name only.
+(d/transact! c [{:db/ident :x/old :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+(def o (get (:tempids (d/transact! c [{:db/id "o" :x/old 1}])) "o"))
+(defn rename-old [] (d/transact! c [[:db/add :x/old :db/ident :x/renamed]]) 1)
+(println (d/q '[:find (pull ?e [:x/old]) :in $ ?f :where [(?f) ?z] [?e :x/old _]] (d/db c) rename-old))
+(t/check "a rename inside a query leaves the old name unknown"
+       (and (nil? (d/entid (d/db c) :x/old))
+            (= :x/renamed (d/ident (d/db c) (d/entid (d/db c) :x/renamed)))
+            (nil? (get (d/schema (d/db c)) :x/old))))
+(println (t/caught (d/transact! c [{:db/id o :x/old 5}])))
 
 ; An ident is never retracted, from an attribute or an enum, by any
 ; form: a name leaves only by a rename, and resolves as before.
@@ -77,6 +93,25 @@
        (and (= #{[:x/a]} (d/q '[:find ?i :where [?e :db/ident ?i] [(= ?i :x/a)]] (d/db c)))
             (= #{[(d/entid (d/db c) :role/admin)]} (d/q '[:find ?e :where [?e :db/ident :role/admin]] (d/db c)))
             (= :role/admin (d/ident (d/db c) (d/entid (d/db c) :role/admin)))))
+; A schema flag belongs to an attribute: on an entity with no value
+; type and cardinality (a half-written attribute map, an enum ident) it
+; is refused, whatever the flag.
+(println (t/caught (d/transact! c [{:db/ident :x/half :db/unique :db.unique/identity}])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/unique :db.unique/value]])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/index true]])))
+(println (t/caught (d/transact! c [[:db/add :role/admin :db/isComponent true]])))
+; A tempid only in retractions names no entity; a lookup ref on a
+; non-unique attribute is malformed as a ref value as it is as an
+; entity, and nil there is the wrong type; transaction 0 never existed;
+; a cas never renames; an attribute is never named like a reverse ref.
+(println (t/caught (d/transact! c [[:db/retract "zz" :x/a 1] [:db/retractEntity "yy"]])))
+(println (t/caught (d/transact! c [[:db/add a :user/boss [:user/age 1]]])))
+(println (t/caught (d/transact! c [[:db/add a :user/boss nil]])))
+(println (t/caught (d/transact! c [[:db/add t/tx-partition :db/doc "t0"]])))
+(println (t/caught (d/transact! c [[:db.fn/cas :x/a :db/ident :x/a :x/cas]])))
+(println (t/caught (d/transact! c [{:db/ident :x/_secret :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])))
+(println (t/caught (d/transact! c [[:db/add :x/a :db/ident :x/_a]])))
+(t/check "an enum ident may start with _" (map? (d/transact! c [{:db/ident :role/_hidden}])))
 ; A cas whose old value is a keyword the store has never seen fails
 ; as a cas naming that keyword, and mints nothing.
 (d/transact! c [[:db/add a :x/role :role/admin]])

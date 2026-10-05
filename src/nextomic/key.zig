@@ -211,6 +211,13 @@ pub fn readId(in: *const [id_len]u8) DecodeError!u64 {
     return if (id > id_max) error.Corrupted else id;
 }
 
+/// A transaction number read from the file: below the tx-partition
+/// bit, as every `t` is (§2.1).
+pub fn readT(in: *const [id_len]u8) DecodeError!u64 {
+    const t = std.mem.readInt(u48, in, .big);
+    return if (t >= tx_partition_bit) error.Corrupted else t;
+}
+
 pub fn writeAttr(out: *[attr_len]u8, a: u32) void {
     std.mem.writeInt(u32, out, a, .big);
 }

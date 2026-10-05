@@ -15,6 +15,7 @@ ok as-of before the schema has no attribute
 []
 ok since shows the reasserted tag, not the untouched one
 ok since after the last change is empty
+ok a second since keeps the newer bound
 #nextomic/db {:basis-t 7 :mode :history}
 [[Draft 3 true] [Draft 4 false] [Final 4 true] [Final 7 false]]
 [[:red 3 true] [:red 5 false] [:red 6 true] [:blue 3 true]]
