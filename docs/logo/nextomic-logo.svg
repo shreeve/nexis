@@ -1,7 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 970 256" role="img" aria-label="Nextomic">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 950 256" role="img" aria-label="Nextomic">
   <style>
     .word { fill: #111827; font: 700 150px "Inter", "SF Pro Display", "Helvetica Neue", Arial, sans-serif; letter-spacing: -4px; }
-    @media (prefers-color-scheme: dark) { .word { fill: #F3F4F6; } }
+    .tail { fill: #6B7280; }
+    @media (prefers-color-scheme: dark) { .word { fill: #F3F4F6; } .tail { fill: #9CA3AF; } }
   </style>
   <defs>
     <linearGradient id="nt-bg" x1="0" y1="0" x2="1" y2="1">
@@ -19,5 +20,5 @@
     <rect x="101.5" y="120.5" width="53" height="15" rx="7.5" opacity="0.7"/>
     <rect x="101.5" y="150.5" width="53" height="15" rx="7.5"/>
   </g>
-  <text class="word" x="300" y="182">Nextomic</text>
+  <text class="word" x="300" y="182">nex<tspan class="tail">tomic</tspan></text>
 </svg>
