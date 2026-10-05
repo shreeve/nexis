@@ -457,6 +457,9 @@ const Ctx = struct {
     av_claims: std.StringHashMapUnmanaged(u64) = .empty,
 
     next_eid: u64,
+    /// The first user id this transaction mints: an entity at or past
+    /// it has no committed datom, so expansion probes nothing for it.
+    first_fresh: u64,
     eid_bumped: bool = false,
     /// Any datom on an attribute-partition entity.
     schema_touched: bool = false,
@@ -493,6 +496,7 @@ const Ctx = struct {
         const now = try conn.store.readT(txn);
         if (now + 1 >= key.tx_partition_bit) return error.DatabaseFull;
         const schema = try conn.schemaAt(txn, now, now);
+        const next_eid = try conn.store.readNextEid(txn);
         return .{
             .conn = conn,
             .arena = arena,
@@ -505,7 +509,8 @@ const Ctx = struct {
             .minter = try Minter.init(&conn.idents, txn, arena),
             .fault = options.fault,
             .hook = options.hook,
-            .next_eid = try conn.store.readNextEid(txn),
+            .next_eid = next_eid,
+            .first_fresh = next_eid,
         };
     }
 
@@ -1477,7 +1482,9 @@ const Ctx = struct {
             if (!self.overlay.items[i].added) return self.conflict(e, attr.id);
             return;
         }
-        const already = (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
+        // An entity this transaction minted has no committed datom.
+        const fresh = e >= self.first_fresh and e < key.user_partition_end;
+        const already = !fresh and (try self.txn.getFromTree(self.conn.store.trees.cur(.eavt), fk)) != null;
         if (!attr.many()) {
             // One value per (e a) per transaction, whether it is
             // pending or was current already.
@@ -1485,9 +1492,9 @@ const Ctx = struct {
             if (self.one_adds.get(ea)) |seen| return if (std.mem.eql(u8, seen, vb)) {} else self.conflict(e, attr.id);
             try self.one_adds.put(self.arena, ea, vb);
             if (already) return self.kept.put(self.arena, fk, {});
-            if (try self.currentOne(e, attr.id)) |old| {
+            if (!fresh) if (try self.currentOne(e, attr.id)) |old| {
                 try self.pushRetract(e, attr, old.val, old.vbytes);
-            }
+            };
             try self.push(e, attr, v, vb, true, fk);
             return;
         }
