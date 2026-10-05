@@ -1264,6 +1264,26 @@ fn expectLoaded(src: []const u8, expected: []const u8) !void {
     try harness.expectResult(&program, src, result, expected);
 }
 
+/// Run `src` through the loader and expect it to fail to compile with
+/// the report `label`, located at the source text `at`.
+fn expectLoadFailure(src: []const u8, label: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
+    const d = program.loader.diagnostic.?;
+    try testing.expectEqualStrings(label, d.label);
+    try testing.expectEqualStrings(at, src[d.span.?.pos..][0..d.span.?.len]);
+}
+
+test "loader: a defmacro whose function does not compile is reported where and why, at the definition" {
+    try expectLoadFailure("(defmacro m [] (undefined-fn 1))", "compile error: defmacro m: unable to resolve symbol: undefined-fn", "undefined-fn");
+    try expectLoadFailure("(defmacro m [] (foo/bar 1))", "compile error: defmacro m: unable to resolve symbol: foo/bar", "foo/bar");
+    // A name the file defines later is a forward reference, as in any form.
+    try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
+}
+
 test "loader: a top-level do runs its forms one at a time, as Clojure's eval does" {
     try expectLoaded("(do (ns foo) (def x 1)) (ns user) [(resolve 'foo/x) (resolve 'user/x)]", "[#'foo/x nil]");
     try expectLoaded("(do (def k 41) (defmacro m [] (inc k)) (m))", "42");
@@ -2274,6 +2294,9 @@ test "defmacro: a macro body runs against the program's record types, namespaces
     try expectOutputProgram("(defmacro m [x] (macroexpand-1 x)) [(m (when 1 2)) (macroexpand-1 '(m (when 1 2)))]", "[2 (if 1 (do 2) nil)]");
     try expectOutputProgram("(defmacro m [x] (macroexpand x)) (m (-> 1 inc))", "2");
     try expectOutputProgram("(defmacro r [s] (read-string s)) (r \"(+ 1 2)\")", "3");
+    // So does the `defmacro`'s own definition: its metadata may call
+    // `resolve` or `reduced`.
+    try expectOutputProgram("(defmacro m {:k (str (resolve 'inc)) :r @(reduced 2)} [] 1) [(:k (meta #'m)) (:r (meta #'m)) (m)]", "[#'nexis.core/inc 2 1]");
 }
 
 test "defmacro: a store a macro opens belongs to the program" {

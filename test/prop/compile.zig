@@ -863,6 +863,29 @@ test "eval: a form's lowering is freed once its routine is compiled" {
     };
 }
 
+test "loader: a top-level form's trees are freed once it has run; only its routines stay" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    // As the REPL and `require` load: routines on the runtime arena.
+    const runtime = program.v.runtime_arena.allocator();
+    const info = nx.vm.SourceInfo{ .path = "<test>", .text =
+        \\(defn f [x] (let [{:keys [a b] :or {a 1}} x] (when (and a b) (cond (> a b) a :else (case b 1 :one 2 :two :many)))))
+        \\(defmacro m [x] `(let [y# ~x] (if (map? y#) (f y#) y#)))
+        \\(m {:a 2 :b 1})
+    };
+    _ = try program.loader.evalSource(&info, .{ .allocator = runtime });
+    const before = program.v.runtime_arena.queryCapacity();
+    for (0..100) |_| _ = try program.loader.evalSource(&info, .{ .allocator = runtime });
+    // A few kilobytes of routines per pass, not the Form and Tiny
+    // trees and the Emitter's scratch they were compiled from.
+    const per_pass = (program.v.runtime_arena.queryCapacity() - before) / 100;
+    testing.expect(per_pass < 8192) catch |err| {
+        std.debug.print("\n  {d} bytes kept per pass\n", .{per_pass});
+        return err;
+    };
+}
+
 /// Sources of `n` operands, clauses or nesting levels, each of a shape
 /// some pass of the front end once walked again at every level.
 const Growing = enum {

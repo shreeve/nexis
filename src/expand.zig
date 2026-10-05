@@ -48,27 +48,15 @@ pub const ExpandError = error{
     OutOfMemory,
 };
 
-/// Callback for compile-time evaluation of arbitrary Form
-/// trees. Used by `defmacro` to
-/// compile the equivalent `(def name (fn* name [params] body))`
-/// form and evaluate it via a fresh sub-VM. The callback lives
-/// outside expand.zig (in compile.zig) so the expander doesn't
-/// need to depend on the compile backend — passing this through
-/// as a context-pointer + fn-pointer pair avoids the cycle.
-///
-/// Implementation contract:
-///   - `eval(user_data, form, out_vm)` returns the runtime Value
-///     produced by compiling + running `form`.
-///   - The returned Value may reference `out_vm.runtime_arena`.
-///   - The caller MUST keep `out_vm` alive until done reading
-///     the result; the helper does NOT call `out_vm.deinit`.
+/// How `defmacro` compiles and runs the `(def name (fn* ...))` it
+/// builds, already expanded (`compile.zig`, so the expander does not
+/// depend on the compiler): `eval` returns the value of running
+/// `form` in a sub-VM. A form that does not compile sets `failure`
+/// when the compiler located it, with what it said (empty when it
+/// said nothing).
 pub const CompileEvalContext = struct {
     user_data: *anyopaque,
-    eval: *const fn (
-        user_data: *anyopaque,
-        form: *const Form,
-        out_vm: *vm_mod.VM,
-    ) anyerror!value_mod.Value,
+    eval: *const fn (user_data: *anyopaque, form: *const Form, failure: *?Failure) anyerror!value_mod.Value,
 };
 
 /// Callback used by `(require ...)` to load a namespace from
@@ -1134,13 +1122,12 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const def_form = try b.list(.{ "def", parts.name, fn_form });
     const expanded = try expandForm(ctx, try withVarMeta(ctx, def_form, parts.meta, origin));
 
-    // The sub-VM is not released: the macro's closure lives in its
-    // allocator (the persistent one the compiler gives), which the
-    // calling VM frees at teardown.
-    var sub_vm: vm_mod.VM = undefined;
-    const result = ceval.eval(ceval.user_data, expanded, &sub_vm) catch |err| {
+    var why: ?Failure = null;
+    const result = ceval.eval(ceval.user_data, expanded, &why) catch |err| {
         if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
-        return ctx.fail(origin, "defmacro {s}: the macro function did not compile: {s}", .{ name, @errorName(err) });
+        const at = if (why) |w| w.span else origin;
+        if (why) |w| if (w.message.len > 0) return ctx.fail(at, "defmacro {s}: {s}", .{ name, w.message });
+        return ctx.fail(at, "defmacro {s}: the macro function did not compile: {s}", .{ name, @errorName(err) });
     };
     if (result.kind() != .var_) return ctx.fail(origin, "defmacro {s}: the definition yielded no Var", .{name});
     vm_mod.VM.asVar(result).macro = true;

@@ -81,9 +81,9 @@ freeing is the caller's arena drop.
 
 | Caller | Trees | Routines |
 |---|---|---|
-| `nexis run FILE` | one arena for the whole file | the same arena |
-| REPL | the runtime's persistent arena (a line's closures are called from later lines, and `Tiny.symbol` slices borrow from the line's text) | the same |
+| the loader (`nexis run`, the REPL, `require`, the library boot) | a scratch arena per top-level form, freed once it has run | the caller's: one arena for a run's file, the runtime's persistent arena for the REPL, a load and the boot (a line's closures are called from later lines) |
 | `eval` | a scratch arena freed when `eval` returns | the runtime's persistent arena: a closure the form returns, a Var it defines and a frame an escaping throw leaves outlive the call |
+| `defmacro` | the enclosing form's | the persistent allocator, where the macro outlives the form |
 
 Literal Values that reach run time (strings, bignums, keywords,
 symbols, collections of constants) are built through the heap and

@@ -116,10 +116,16 @@ otherwise it is an ordinary call. User macros shadow host macros.
    to save and restore. The macro routine's Var table points into
    the caller's namespace and its constants are caller-interned, so
    the sub-VM needs no namespace of its own.
-5. **Persistent storage**: `compile_eval` allocates the macro
-   function from `CompileOptions.persistent_allocator` (the VM's
-   runtime arena for the CLI and the REPL), so the closure outlives
-   the per-form compile arena.
+5. **Persistent storage**: `compile_eval` compiles the definition on
+   the enclosing form's compile allocator with its routines on
+   `CompileOptions.persistent_allocator` (the VM's runtime arena for
+   the CLI and the REPL), so the macro outlives the form while its
+   trees do not, and runs it on a sub-VM over the calling VM's heap
+   and registries, released once it has run; the closure is on that
+   heap, rooted by the Var. The definition compiles with the
+   enclosing form's declared names: a name in the body that resolves
+   to nothing is reported at the `defmacro` (`defmacro m: unable to
+   resolve symbol: x`, at `x`), as Clojure reports it.
 6. **Form ↔ Value.** Form → Value (`formToValue`): nil, booleans,
    integers (a fixnum, or a bignum past the fixnum range or for a
    `bigint`), reals, chars, strings, symbols and keywords (interned,

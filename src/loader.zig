@@ -84,10 +84,11 @@ pub fn Each(comptime T: type) type {
 }
 
 pub const EvalOptions = struct {
-    /// Where Form trees and compiled routines go. Routines must
-    /// outlive every closure and trace made from them: a file's run
-    /// passes an arena that lives as long as the run, a load or the
-    /// REPL the VM's runtime arena.
+    /// Where compiled routines go. They must outlive every closure
+    /// and trace made from them: a file's run passes an arena that
+    /// lives as long as the run, a load or the REPL the VM's runtime
+    /// arena. The Form and Tiny trees of a top-level form are scratch,
+    /// freed once it has run.
     allocator: std.mem.Allocator,
     /// Every symbol must resolve to a name that exists or that the
     /// text defines, as in a file; without it an unresolved symbol
@@ -232,8 +233,10 @@ pub const Loader = struct {
         defer pending.deinit(self.allocator);
         var last = nil;
         for (forms) |top| {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
             if (options.on_routine) |each| {
-                const routine = try self.compileForm(info, top, options.allocator, decl);
+                const routine = try self.compileForm(info, top, scratch.allocator(), options.allocator, decl);
                 each.call(each.ctx, routine) catch |err| return mapCallbackError(err);
                 continue;
             }
@@ -242,7 +245,7 @@ pub const Loader = struct {
             // the ones after it (MACROEXPAND.md §2b).
             try pending.append(self.allocator, top);
             while (pending.pop()) |form| {
-                const expanded = try self.expandTopLevel(info, form, options.allocator, decl);
+                const expanded = try self.expandTopLevel(info, form, scratch.allocator(), decl);
                 if (compile_mod.doForms(expanded)) |body| {
                     if (decl) |d| try d.declareForm(expanded);
                     last = nil;
@@ -253,7 +256,7 @@ pub const Loader = struct {
                     }
                     continue;
                 }
-                last = try self.run(try self.compileForm(info, expanded, options.allocator, decl));
+                last = try self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl));
             }
             if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
         }
@@ -285,15 +288,17 @@ pub const Loader = struct {
         return compile_mod.expandTopLevel(allocator, form, self.compileOptions(info, decl, &span, &detail)) catch |err| self.compileFailure(info, err, span, detail);
     }
 
-    /// `form` compiled in the current namespace into a top-level
-    /// routine on `allocator`.
-    fn compileForm(self: *Loader, info: *const vm_mod.SourceInfo, form: *const reader_mod.Form, allocator: std.mem.Allocator, decl: ?*compile_mod.DeclaredNames) EvalError!*vm_mod.Routine {
+    /// `form` compiled in the current namespace on `scratch` into a
+    /// top-level routine on `out`.
+    fn compileForm(self: *Loader, info: *const vm_mod.SourceInfo, form: *const reader_mod.Form, scratch: std.mem.Allocator, out: std.mem.Allocator, decl: ?*compile_mod.DeclaredNames) EvalError!*vm_mod.Routine {
         var span: ?reader_mod.SrcSpan = null;
         var detail: ?[]const u8 = null;
-        const compiled = compile_mod.compileFormWith(allocator, form, self.compileOptions(info, decl, &span, &detail)) catch |err| return self.compileFailure(info, err, span, detail);
+        var opts = self.compileOptions(info, decl, &span, &detail);
+        opts.routine_allocator = out;
+        const compiled = compile_mod.compileFormWith(scratch, form, opts) catch |err| return self.compileFailure(info, err, span, detail);
         // A run that fails leaves its frame for the trace, and the
         // frame points at the routine.
-        const routine = try allocator.create(vm_mod.Routine);
+        const routine = try out.create(vm_mod.Routine);
         routine.* = compiled.toRoutine("<top>");
         return routine;
     }

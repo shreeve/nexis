@@ -2242,45 +2242,46 @@ fn lowerThrow(
     return try allocTiny(allocator, .{ .throw_ = value });
 }
 
-/// What `compileEvalCallback` compiles a `defmacro`'s function with.
+/// What `compileEvalCallback` compiles a `defmacro`'s function with:
+/// the options of the form the `defmacro` is in.
 const CompileEvalData = struct {
-    /// Where the macro's routines go: they must outlive every later
-    /// form that expands the macro (typically the VM's runtime
-    /// arena).
-    persistent_allocator: std.mem.Allocator,
-    namespace: ?*vm.Namespace,
-    interner: *intern_mod.Interner,
-    /// The user VM's heap through its namespace registry; the
-    /// sub-VM allocates on it.
-    registry_heap: ?*heap_mod.Heap,
+    /// The enclosing form's compile allocator: the trees and the
+    /// sub-VM's working storage.
+    allocator: std.mem.Allocator,
+    opts: CompileOptions,
 };
 
 /// The expander's compile-eval callback (`defmacro`): compile `form`,
-/// the already-expanded `(def name (fn* ...))`, with no macro table,
-/// and run it on a fresh sub-VM written through `out_vm`. It compiles
-/// on the persistent allocator, so the macro's closure outlives the
-/// per-form compile arena. The result may reference
-/// `out_vm.runtime_arena`: the caller takes what it needs and deinits
-/// `out_vm` (`expand.CompileEvalContext`).
-fn compileEvalCallback(
-    user_data: *anyopaque,
-    form: *const reader_mod.Form,
-    out_vm: *vm.VM,
-) anyerror!value_mod.Value {
+/// the already-expanded `(def name (fn* ...))`, and run it on a fresh
+/// sub-VM over the user VM's heap and registries (`docs/VM.md` §9.1).
+/// The routines go to the persistent allocator, so the macro outlives
+/// the form; the closure lands on the user VM's heap, where the Var
+/// that roots it lives, and the sub-VM, which never collects, goes
+/// once it has run. Without that heap the closure is the sub-VM's
+/// own, which then stays.
+fn compileEvalCallback(user_data: *anyopaque, form: *const reader_mod.Form, failure: *?expand_mod.Failure) anyerror!value_mod.Value {
     const data: *CompileEvalData = @ptrCast(@alignCast(user_data));
-    const compiled = try compileFormWith(data.persistent_allocator, form, .{
-        .namespace = data.namespace,
-        .interner = data.interner,
-    });
-    const routine_storage = try data.persistent_allocator.create(vm.Routine);
-    routine_storage.* = compiled.toRoutine("defmacro-eval");
-    out_vm.* = try vm.VM.init(data.persistent_allocator, routine_storage);
-    out_vm.borrowed_interner = data.interner;
-    // The macro closure lands on the user VM's heap, where the Var
-    // that roots it lives; a sub-VM never collects.
-    out_vm.borrowed_heap = data.registry_heap;
-    out_vm.gc_enabled = false;
-    return try out_vm.run();
+    const persistent = data.opts.persistent_allocator orelse data.allocator;
+    var span: ?reader_mod.SrcSpan = null;
+    var detail: ?[]const u8 = null;
+    var opts = data.opts;
+    opts.routine_allocator = persistent;
+    opts.out_span = &span;
+    opts.out_detail = &detail;
+    const compiled = compileExpanded(data.allocator, form, opts) catch |err| {
+        failure.* = .{ .span = span orelse form.origin, .message = detail orelse "" };
+        return err;
+    };
+    const routine = try persistent.create(vm.Routine);
+    routine.* = compiled.toRoutine("defmacro-eval");
+    const heap = registryHeap(opts.namespace);
+    var sub = try vm.VM.init(if (heap != null) data.allocator else persistent, routine);
+    defer if (heap != null) sub.deinit();
+    sub.borrowed_interner = opts.interner;
+    sub.borrowed_heap = heap;
+    sub.gc_enabled = false;
+    if (opts.namespace) |n| if (n.registry) |r| if (r.vm) |owner| sub.borrowRegistries(owner);
+    return sub.run();
 }
 
 /// The compiler as `macroexpand-1`, `read-string` and `eval` reach
@@ -2583,23 +2584,22 @@ pub fn compileFormWith(
     form: *const reader_mod.Form,
     opts: CompileOptions,
 ) CompileError!Compiled {
+    const interner = opts.interner orelse return compileExpanded(allocator, form, opts);
+    var ceval_data = CompileEvalData{ .allocator = allocator, .opts = opts };
+    var mctx = expandContext(allocator, interner, opts, &ceval_data);
+    const expanded = expand_mod.expandForm(&mctx, form) catch |err| return expandFailure(err, &mctx, form, opts);
+    return compileExpanded(allocator, expanded, opts);
+}
+
+/// Lower and emit `working_form`, already expanded, under `opts`.
+fn compileExpanded(
+    allocator: std.mem.Allocator,
+    working_form: *const reader_mod.Form,
+    opts: CompileOptions,
+) CompileError!Compiled {
     const namespace = opts.namespace;
     const out_span = opts.out_span;
     const declared = opts.declared;
-    var working_form: *const reader_mod.Form = form;
-    if (opts.interner) |interner| {
-        // `defmacro` compiles and runs its `(def name (fn* ...))`
-        // through this, the macro's routines on the persistent
-        // allocator so they outlive the per-form arena.
-        var ceval_data = CompileEvalData{
-            .persistent_allocator = opts.persistent_allocator orelse allocator,
-            .namespace = namespace,
-            .interner = interner,
-            .registry_heap = registryHeap(namespace),
-        };
-        var mctx = expandContext(allocator, interner, opts, &ceval_data);
-        working_form = expand_mod.expandForm(&mctx, form) catch |err| return expandFailure(err, &mctx, form, opts);
-    }
     // `.string` Form datums lower to `Tiny.literal` on the
     // registry's heap. Without a namespace or a registry there is
     // no heap and a string literal is `UnsupportedFeature`.
