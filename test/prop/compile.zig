@@ -903,9 +903,9 @@ const Growing = enum {
         errdefer out.deinit(allocator);
         switch (shape) {
             .and_operands => {
-                try out.appendSlice(allocator, "(let* [x 1] (and");
+                try out.appendSlice(allocator, "(let* [x 1] (if (and");
                 for (0..n) |_| try out.appendSlice(allocator, " x");
-                try out.appendSlice(allocator, "))");
+                try out.appendSlice(allocator, ") 1 2))");
             },
             .then_nested_if => {
                 try out.appendSlice(allocator, "(let* [x 1 y ");
