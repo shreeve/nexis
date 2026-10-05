@@ -1,7 +1,7 @@
 //! nexis — build configuration.
 //!
 //! Steps:
-//!   zig build [install]               bin/nexis
+//!   zig build [install]               bin/nexis (`--prefix DIR`: DIR/bin/nexis)
 //!   zig build test                    the gate: unit, property, integration and
 //!                                     Nextomic corpora, goldens, test/nextomic
 //!                                     scripts, examples; analyzes the bench
@@ -13,6 +13,7 @@
 //!   zig build nextomic-nx             test/nextomic/*.nx through bin/nexis
 //!   zig build examples                every examples/*.nx through bin/nexis
 //!   zig build golden [-Dupdate=true]  reader and CLI goldens (byte-exact)
+//!   zig build nexis                   bin/nexis alone
 //!   zig build bench [-- ARGS]         the benchmark suite, optimized for speed
 //!   zig build run -- ARGS             build and run bin/nexis
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
@@ -119,14 +120,16 @@ pub fn build(b: *std.Build) void {
         if (suite.nextomic) nextomic_test_step.dependOn(&run.step);
     }
 
-    // bin/nexis, the CLI.
+    // bin/nexis, the CLI. `run` and `bench` are never cached (they
+    // take the arguments after `--`), so they keep the caller's
+    // environment: NEXIS_MAX_ALLOC and the like reach the program.
     const nexis_exe = bins.nexis;
-    const checkout_nexis = toCheckout(b, nexis_exe, "bin/nexis");
-    b.getInstallStep().dependOn(checkout_nexis);
-    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(checkout_nexis);
+    const install_nexis = install(b, nexis_exe);
+    b.getInstallStep().dependOn(install_nexis);
+    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(install_nexis);
     const run_nexis = b.addRunArtifact(nexis_exe);
     run_nexis.addPassthruArgs();
-    run_nexis.step.dependOn(checkout_nexis);
+    run_nexis.step.dependOn(install_nexis);
     b.step("run", "Build and run nexis (forwards args after `--`)").dependOn(&run_nexis.step);
 
     // The benchmark runner. Its runtime is optimized too, so the numbers
@@ -135,7 +138,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize));
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.addPassthruArgs();
-    run_bench.step.dependOn(toCheckout(b, bench_exe, "bin/nexis-bench"));
+    run_bench.step.dependOn(install(b, bench_exe));
     b.step("bench", "Run the benchmark suite (optimized for speed)").dependOn(&run_bench.step);
     // The gate analyzes the suite against the Debug runtime without
     // generating code or running it, so an API change cannot leave the
@@ -395,11 +398,25 @@ const RunEnv = struct {
     }
 };
 
-/// A step that copies `exe` to `sub_path` in the checkout, where every
-/// binary the build makes is installed; nothing goes to the prefix.
-fn toCheckout(b: *std.Build, exe: *std.Build.Step.Compile, sub_path: []const u8) *std.Build.Step {
-    const copy = b.addUpdateSourceFiles();
-    copy.addCopyFileToSource(exe.getEmittedBin(), sub_path);
+/// A step that installs `exe` as `bin/<name>` in the checkout when
+/// the install prefix is the default (`zig-out`), where the docs, the
+/// examples and CI run it, and as `<prefix>/bin/<name>` when
+/// `--prefix` names another, leaving the checkout's binary alone.
+/// `build()` cannot see the prefix, so the step compares it when it
+/// runs. The new binary replaces the old by rename, never by a write
+/// into a file a running process may have mapped.
+fn install(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
+    const script =
+        \\dest=$1; [ "$dest" = "$2" ] && dest=$3
+        \\mkdir -p "$dest" || exit 1
+        \\cmp -s "$4" "$dest/$5" || { cp "$4" "$dest/.$5.new" && mv -f "$dest/.$5.new" "$dest/$5"; }
+    ;
+    const copy = b.addSystemCommand(&.{ "sh", "-c", script, "install" });
+    copy.addDirectoryArg2(.{ .relative = .{ .base = .install_bin } }, .{ .make_absolute = true });
+    copy.addArgs(&.{ b.pathJoin(&.{ rootPath(b), "zig-out", "bin" }), b.pathJoin(&.{ rootPath(b), "bin" }) });
+    copy.addArtifactArg(exe);
+    copy.addArg(exe.name);
+    copy.has_side_effects = true;
     return &copy.step;
 }
 

@@ -45,7 +45,9 @@ changes to emdb.
 
 | Step | What it runs |
 |---|---|
-| `zig build install` | `bin/nexis` |
+| `zig build install` | `bin/nexis` in the checkout; `--prefix DIR` installs `DIR/bin/nexis` instead and leaves the checkout's alone |
+| `zig build nexis` | `bin/nexis` alone, as `install` does |
+| `zig build run -- ARGS` | builds `bin/nexis` and runs it with ARGS, in the caller's environment |
 | `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish` and `numbers` integration tests |
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
