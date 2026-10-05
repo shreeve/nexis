@@ -120,6 +120,18 @@ pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
     return result;
 }
 
+/// The length from which `build` makes a vector view: below it, the
+/// cons cells are fewer blocks than a vector's root, tail and view.
+pub const view_min = 4;
+
+/// A fresh list of `elems`, in order: `view_min` or more (up to a
+/// vector's 2^32 - 1) are a fresh vector and its view, a few blocks
+/// for any length and an O(1) `count` (§1); fewer are cons cells.
+pub fn build(heap: *Heap, elems: []const Value) !Value {
+    if (elems.len < view_min or elems.len > std.math.maxInt(u32)) return fromSlice(heap, elems);
+    return ofVector(heap, try vector.fromSlice(heap, elems), 0);
+}
+
 /// The elements of the vector `vec` from index `start` on, as a
 /// list: one 16-byte block whatever the vector's length. `start ==
 /// count(vec)` gives an empty list.

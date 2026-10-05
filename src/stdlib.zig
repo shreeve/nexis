@@ -39,7 +39,6 @@ const db_mod = @import("db.zig");
 const codec_mod = @import("codec.zig");
 const heap_mod = @import("heap.zig");
 const dispatch_mod = @import("dispatch.zig");
-const dispatch_mod_alias = dispatch_mod;
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
 const format_mod = @import("format.zig");
@@ -5182,21 +5181,11 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
     }
 }
 
-/// A fresh list of `items`, in order: `view_min` or more are a
-/// vector and its view (LIST.md §1), a few blocks for any length and
-/// an O(1) `count`; fewer are cons cells. Nothing built needs a root:
-/// `Heap.alloc` never collects (VM.md §9).
+/// A fresh list of `items` (`list.build`). Nothing built needs a
+/// root: `Heap.alloc` never collects (VM.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    if (items.len < view_min or items.len > std.math.maxInt(u32)) return list_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
-    const vec = vector_mod.fromSlice(heap, items) catch return VmError.OutOfMemory;
-    return list_mod.ofVector(heap, vec, 0) catch VmError.OutOfMemory;
+    return list_mod.build(vm.ensureHeap(), items) catch VmError.OutOfMemory;
 }
-
-/// The length from which a built list is a vector view: below it,
-/// the cons cells are fewer blocks than a vector's root, tail and
-/// view.
-const view_min = 4;
 
 /// The result of a sequence native that calls back into the VM,
 /// rooted as it is made (docs/GC.md §11.5, class 3). The first 32

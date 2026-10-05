@@ -33,9 +33,9 @@ a view; the cursor walks the vector's leaves directly
 
 **Built sequences.** The eager sequence natives (`map`, `filter`,
 `remove`, `keep`, `map-indexed`, `range`, `concat`, `take`, `seq` of a
-map or set, and the rest that build a fresh list; `stdlib.zig`
-`buildListFromSlice`) gather their results and return, for four or
-more, a vector of them and its view at offset 0: a root, a tail and
+map or set, and the rest that build a fresh list) gather their
+results and return, through `list.build`, for four or more
+(`list.view_min`), a vector of them and its view at offset 0: a root, a tail and
 one block per 32 elements instead of a cons cell per element, and an
 O(1) `count`. Fewer than four are cons cells, fewer blocks than a
 vector's root, tail and view. `list` always builds cons cells.
@@ -54,8 +54,9 @@ it.
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
 `(...)`, is `=` to and hashes as the list of the same elements, can be
 the tail of a cons (`(cons 0 (rest v))`), and the codec encodes it as a
-list. Decoding builds a list as the sequence natives do: four or more
-elements are a view of a vector, fewer are cons cells.
+list. Decoding builds a list as the sequence natives do, through
+`list.build`: four or more elements are a view of a vector, fewer are
+cons cells.
 
 **No empty singleton.** Every `empty(heap)` allocates a fresh block.
 Two empty lists are `=`; `identical?` tells them apart by address.
