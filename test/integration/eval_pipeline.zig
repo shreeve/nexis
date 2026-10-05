@@ -2275,6 +2275,7 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
+    try expectMacroFailure("(defmacro m [] (atom 1))", "(m)", "a macro returned an atom, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
     // A macro body has no `eval` (MACROEXPAND.md §1.2).
     try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
