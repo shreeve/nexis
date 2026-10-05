@@ -4494,7 +4494,7 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     }
     pieces.append(vm.allocator, string_mod.fromBytes(heap, src[start..]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
     if (limit == 0 and src.len > 0) {
-        while (pieces.items.len > 0 and string_mod.byteLen(pieces.items[pieces.items.len - 1]) == 0) _ = pieces.pop();
+        while (pieces.items.len > 0 and string_mod.byteLen(pieces.getLast()) == 0) _ = pieces.pop();
     }
     return vector_mod.fromSlice(heap, pieces.items) catch VmError.OutOfMemory;
 }
@@ -4634,10 +4634,7 @@ pub fn discardOutCaptures() void {
 }
 
 fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
-    if (out_stack.items.len > 0) {
-        out_stack.items[out_stack.items.len - 1].appendSlice(out_allocator, bytes) catch return VmError.OutOfMemory;
-        return;
-    }
+    if (out_stack.lastPtr()) |top| return top.appendSlice(out_allocator, bytes) catch VmError.OutOfMemory;
     const io_handle = vm.io orelse return VmError.IoError;
     std.Io.File.stdout().writeStreamingAll(io_handle, bytes) catch return VmError.IoError;
 }
