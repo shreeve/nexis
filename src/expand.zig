@@ -2238,12 +2238,14 @@ fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const 
 //   (defrecord Counter [n] IFoo (bar [this y] ...) IBar (baz [this] ...))
 //   → (do
 //       (def Counter-type-id (nexis.internal/#%register-record-type "<ns>/Counter" [:n]))
-//       (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id (assoc {} :n n)))
+//       (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id {:n n}))
 //       (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m))
 //       (defn Counter? [x] (and (nexis.internal/#%record? x)
 //                               (= Counter-type-id (nexis.internal/#%record-type-id x))))
 //       (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id (fn [this y] ...))
-//       (nexis.internal/#%extend-record-impl IBar :baz Counter-type-id (fn [this] ...)))
+//       (nexis.internal/#%extend-record-impl IBar :baz Counter-type-id (fn [this] ...))
+//       (def Counter '<ns>.Counter)
+//       Counter)
 //
 // After the field vector, a bare symbol names the protocol the method
 // clauses `(name [params] body...)` that follow implement.

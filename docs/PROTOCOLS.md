@@ -377,7 +377,6 @@ namespace.
 ### 8. Absences
 
 - No `Counter.` constructor syntax; `->Counter` is the constructor.
-- `defrecord` does not bind the type name (§0).
 - No default impl inside `defprotocol`; defaults are installed with
   `extend-protocol ... :any`.
 - No arity check at the protocol fn: the impl checks its own (§4.1).

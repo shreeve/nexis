@@ -23,7 +23,7 @@ guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
   constant pool, Var table, capture-descriptor table and span table.
 - Var linking at compile time through the current namespace and the
   namespace registry; `require` file loading is `src/loader.zig`
-  (MACROEXPAND.md §8).
+  (MACROEXPAND.md §2b).
 - The primitive core: `quote`, `if`, `do`, `let*`, `fn*`, `letfn*`,
   `loop*`, `recur`, `def`, `var`, `try` / `catch` / `finally`,
   `throw`, and the constructors `#%list`, `#%concat`, `#%vector`,
@@ -124,8 +124,8 @@ and a reused subform its own (MACROEXPAND.md §4b).
    expander's `special_forms` (MACROEXPAND.md §1.1) less the four it
    rewrites away (`ns`, `require`, `defmacro`, `set!`), plus the `#%`
    constructors; a test holds the two tables to that.
-2. **Inlined core fn**: a call of one of 15 core fns at one arity
-   (`inlined_ops`) lowers to one `math` or `cmp` instruction
+2. **Inlined core fn**: a call of one of 14 core fns at one of the
+   15 (fn, arity) pairs of `inlined_ops` (`-` inlines at two) lowers to one `math` or `cmp` instruction
    (`Tiny.prim`), which runs the numeric-tower helper the fn itself
    runs (VM.md §10), so results and errors are the fn's:
 
@@ -319,8 +319,9 @@ constant pool, Var table, capture descriptors, span table,
 
 - Instructions are 64-bit; a pc, constant, Var, try or
   capture-descriptor index is the wide field (VM.md §3). A forward
-  jump, and a `try`'s catch and finally pcs, carry the placeholder
-  2^32 − 1 until their target is placed.
+  jump and a `try`'s catch pc carry the placeholder 2^32 − 1 until
+  their target is placed; a `try`'s finally pc is null until then
+  (`vm.Try.finally_pc`).
 - Var references compile to `v` operands bound to `*Var` pointers at
   compile time (§4.7).
 - A closure's upvalues are numbered 0..N-1 and it captures N cell
@@ -349,7 +350,7 @@ reported at the instruction that raised it.
   forward references work and a redefinition is visible to callers
   already compiled.
 - `(require ...)` runs through the expander and `src/loader.zig`
-  (MACROEXPAND.md §8).
+  (MACROEXPAND.md §2b).
 
 #### 4.8 What common forms cost
 

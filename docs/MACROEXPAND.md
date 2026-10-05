@@ -392,8 +392,8 @@ be captured by the user's bindings. Syntax-quote builds collections
 with the `#%` special forms, which the compiler recognises before
 any binding (`COMPILER.md` §4.3), and every core function a host
 macro's output calls is the qualified `nexis.core/name` (§10b):
-destructuring uses `nexis.core/nth`, `nthnext` and `get`; overload
-dispatch `count`, `=`, `<`, `not` and `nthnext`; `case` `=`; `for`
+destructuring uses `nexis.core/nth`, `nthnext`, `get` and `seq?`;
+overload dispatch `first`, `nth`, `nthnext`, `count`, `==` and `>=`; `case` `=`; `for`
 `seq`, `first`, `next` and `conj`; `defrecord` `get` and `=`;
 `case` and `condp` report through `str`; `@x` is `deref`, in a
 macro's arguments too. So
@@ -529,7 +529,7 @@ Nested `#()` never reaches the expander: the reader rejects it.
 | `condp` | `pred` and `expr` evaluated once; clauses become `(if (p c e) v ...)` with `case`'s default policy. A clause `c :>> f` calls `f` on the predicate's truthy result. |
 | `for` | Eager: one `loop*` per binding pair, each pair followed by any number of `:let [b]`, `:when t` and `:while t`; a pattern destructures through `let`. `:when` skips the element, `:while` ends the loop it follows (outer loops carry on). The loops fill a vector returned as a seq, `()` when empty: a list, as Clojure's `for` gives, built eagerly (PLAN §23 #14). |
 | `->`, `->>` | Thread the value as the first (`->`) or last (`->>`) argument of each step, left to right; a step that is not a list is called with the value alone; an empty-list step fails. |
-| `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is not bound. An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
+| `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is bound to the record's type, the symbol `ns.T` (`(def T 'ns.T)`), which is the form's value (`PROTOCOLS.md` §0). An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
 | `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ...)`; a docstring and `:option value` pairs before the methods are ignored, as are method signatures past the name (`PROTOCOLS.md` §4.1). |
 | `extend-type`, `extend-protocol` | Install impls in the protocol registry, a method's arities spelled as for `defrecord` (`PROTOCOLS.md` §4.2–4.3). |
 
