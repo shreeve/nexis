@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Nextomic">
+  <defs>
+    <linearGradient id="nt-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0FA88F"/>
+      <stop offset="1" stop-color="#1E7FE0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="60" fill="url(#nt-bg)"/>
+  <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round">
+    <path d="M100 60 C 62 96, 62 160, 100 196"/>
+    <path d="M156 60 C 194 96, 194 160, 156 196"/>
+  </g>
+  <g fill="#fff">
+    <rect x="106" y="94" width="44" height="14" rx="7" opacity="0.4"/>
+    <rect x="106" y="121" width="44" height="14" rx="7" opacity="0.7"/>
+    <rect x="106" y="148" width="44" height="14" rx="7"/>
+  </g>
+</svg>

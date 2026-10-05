@@ -1,4 +1,4 @@
-# nexis
+<p align="center"><img src="docs/logo/nexis-logo.svg" alt="nexis" width="360"></p>
 
 > **Clojure's language on a Zig-native runtime, with a Datomic-class
 > database inside.** Persistent collections, macros, keywords,
@@ -7,6 +7,56 @@
 > Nextomic, immutable facts with time, Datalog, `as-of`, `since` and
 > `history`, in one file. **Not a Clojure port**: no Java interop, no
 > STM, one isolate, one thread.
+
+## What you can do with it
+
+Reach for nexis wherever you would write a Clojure script or a small
+program with its own database, and would rather not start a JVM or run
+a server. It is one binary that starts in about 5 ms, and its database
+lives in the same process and in one file you can copy, back up or
+throw away.
+
+- **Scripts and one-liners.** Clojure as you write it, at shell speed:
+
+  ```bash
+  ./bin/nexis -e '(->> (range 10) (filter odd?) (map #(* % %)) (reduce +))'   # 165
+  ```
+
+- **Programs that remember.** Durable refs (`db/*`) keep named values
+  on disk with transactions and rollback; `examples/todo-app.nx` is a
+  to-do tracker whose second run starts where the first left off.
+- **A database with a memory.** Nextomic keeps every fact it has ever
+  been told. Ask about the present, ask how things stood at any earlier
+  moment, or try a change without keeping it:
+
+  ```clojure
+  (require '[nextomic :as d])
+  (def conn (d/connect "people.edb"))
+  (d/transact! conn [{:db/ident :person/name :db/valueType :db.type/string
+                      :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                     {:db/ident :person/age :db/valueType :db.type/long
+                      :db/cardinality :db.cardinality/one}])
+  (d/transact! conn [{:person/name "Ada" :person/age 36} {:person/name "Alan" :person/age 41}])
+  (def before (d/db conn))                                   ; a snapshot that never changes
+  (d/transact! conn [{:person/name "Ada" :person/age 37}])   ; upserts Ada by name
+  (d/q '[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a] [(> ?a 36)]] (d/db conn))
+  ;; => #{[Ada 37] [Alan 41]}
+  (:person/age (d/entity before [:person/name "Ada"]))       ;; => 36: the past is still there
+  ```
+
+It suits local-first tools and command-line programs that need real
+history (audit trails, "what did this look like last Tuesday", undo),
+small services and batch jobs where a database server would be
+overkill, and exploring data at a REPL against a file. It does not run
+Java libraries, and it is single-threaded.
+
+**Five minutes in:** build it (below), run `./bin/nexis repl` and try
+the lines under [The language](#the-language); run
+`./bin/nexis run examples/nextomic-app.nx` for a fuller database tour
+(a clinic chart with patients, visits, notes and time travel); browse
+`examples/README.md` for the other programs.
+
+## How it is built
 
 nexis is a reader, a macroexpander, a compiler to 64-bit bytecode, a
 slot VM, persistent collections (CHAMP maps and sets, 32-way vectors,
@@ -20,7 +70,7 @@ generator that builds the reader's grammar.
 Zig 0.17.0 and a sibling checkout of emdb (`../emdb`) are required.
 
 ```bash
-zig build install                      # bin/nexis and bin/nexis-golden
+zig build install                      # bin/nexis
 
 ./bin/nexis run examples/hello.nx      # run a file (also: bin/nexis FILE.nx)
 ./bin/nexis -e '(reduce + (range 101))'  # evaluate an expression: 5050
@@ -36,8 +86,8 @@ print each value. Exit status is 0 on success, 3 for a parse or reader
 error, 4 for a compile error, 5 for an uncaught runtime error, and `n`
 for `(exit n)` (`docs/TOOLING.md` §1).
 
-`zig build test --summary all` is the gate: 1368 tests in 171 build
-steps, about a minute from a warm cache. `AGENTS.md` lists every build step.
+`zig build test --summary all` is the gate; `HANDOFF.md` §2 carries its
+count of record and `AGENTS.md` lists every build step.
 
 ## The language
 
@@ -112,6 +162,8 @@ The namespaces that come with the binary are `nexis.core`
 under `zig build examples` (`examples/README.md`).
 
 ## Nextomic
+
+<p><img src="docs/logo/nextomic-logo.svg" alt="Nextomic" width="300"></p>
 
 Nextomic is a Datomic-class database inside the binary. A fact is a
 datom `[e a v t added]`; the store keeps every fact it ever learned; a
