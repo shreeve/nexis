@@ -474,11 +474,11 @@ fn expandLetStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Fo
 }
 
 /// The binding vector of a `(let [n v ...] ...)`-shaped form: a
-/// vector of name/value pairs.
+/// vector of name/value pairs, any `^meta` on it dropped.
 fn bindingVector(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError![]const *Form {
     const head = if (items[0].datum == .symbol) items[0].datum.symbol.name else "";
-    if (items.len < 2 or items[1].datum != .vector) return ctx.fail(list_form.origin, "{s}: expected a binding vector", .{head});
-    const bindings = items[1].datum.vector;
+    if (items.len < 2 or stripMeta(items[1]).datum != .vector) return ctx.fail(list_form.origin, "{s}: expected a binding vector", .{head});
+    const bindings = stripMeta(items[1]).datum.vector;
     if (bindings.len % 2 != 0) return ctx.fail(items[1].origin, "{s}: the binding vector needs an even number of forms", .{head});
     return bindings;
 }
@@ -1205,12 +1205,15 @@ fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]co
     return ctx.allocator.print("a {s}", .{@tagName(thrown.kind())});
 }
 
-/// A form as the data a macro receives (MACROEXPAND.md §1.2): each
-/// literal as its value, a symbol or keyword interned (qualified
-/// ones by their full `ns/name`), a list, vector, map or set as that
-/// collection, `'x` as `(quote x)`, `@x` as `(deref x)`, `#()` as
-/// the `fn*` form it stands for and `^m x` as `x`. A syntax-quote or
-/// an unquote is not data.
+/// A form as data (MACROEXPAND.md §1.2): what a macro receives as an
+/// argument, `quote` makes a constant of and `read-string` returns.
+/// Each literal is its value, a symbol or keyword interned (qualified
+/// ones by their full `ns/name`), a list, vector, map or set that
+/// collection, `'x` the list `(quote x)`, `@x` `(nexis.core/deref x)`,
+/// `#()` the `fn*` form it stands for, `^m coll` the collection
+/// carrying `m` (on anything else the metadata is dropped), and the
+/// marker list a sorted collection travels as (`valueToForm`) the
+/// collection itself. A syntax-quote or an unquote is not data.
 pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
     try checkStack();
     const heap = try ctx.heapForArgs();
@@ -1226,6 +1229,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         .symbol => |name| ctx.interner.internQualifiedSymbol(name.ns, name.name) catch return oom,
         .keyword => |name| ctx.interner.internQualifiedKeyword(name.ns, name.name) catch return oom,
         .list, .vector, .set, .map => |items| blk: {
+            if (form.datum == .list) if (sortedMarker(items)) |set| break :blk try sortedValue(ctx, form, set, items[1..]);
             const values = try ctx.allocator.alloc(value_mod.Value, items.len);
             defer ctx.allocator.free(values);
             for (items, values) |item, *v| v.* = try formToValue(ctx, item);
@@ -1239,9 +1243,52 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         .quote => |inner| try callForm(ctx, "quote", inner),
         .deref => |inner| try callForm(ctx, "nexis.core/deref", inner),
         .anon_fn => |items| try formToValue(ctx, try anonFnForm(ctx, form, items)),
-        .with_meta => |wm| try formToValue(ctx, wm.target),
+        .with_meta => |wm| blk: {
+            const target = try formToValue(ctx, wm.target);
+            switch (target.kind()) {
+                // A collection made just now: no one else holds it.
+                .list, .persistent_vector, .persistent_map, .persistent_set => {
+                    const meta = try formToValue(ctx, wm.meta);
+                    heap_mod.Heap.asHeapHeader(target).setMeta(heap_mod.Heap.asHeapHeader(meta));
+                },
+                else => {},
+            }
+            break :blk target;
+        },
         .syntax_quote, .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} is not data a macro can take", .{describeForm(form)}),
     };
+}
+
+/// Whether `items` is the marker list a sorted collection travels as
+/// in a form (`valueToForm`): `(nexis.internal/#%sorted-set x ...)`
+/// true, `(nexis.internal/#%sorted-map k v ...)` false, any other
+/// list null.
+fn sortedMarker(items: []const *const Form) ?bool {
+    if (items.len == 0 or items[0].datum != .symbol) return null;
+    const sym = items[0].datum.symbol;
+    if (!std.mem.eql(u8, sym.ns orelse return null, "nexis.internal")) return null;
+    if (std.mem.eql(u8, sym.name, "#%sorted-set")) return true;
+    if (std.mem.eql(u8, sym.name, "#%sorted-map")) return false;
+    return null;
+}
+
+/// The sorted set or map, in the natural order, that the marker
+/// list `form`, whose items after the head are `items`, stands for.
+fn sortedValue(ctx: *ExpandContext, form: *const Form, set: bool, items: []const *const Form) ExpandError!value_mod.Value {
+    if (!set and items.len % 2 != 0) return ctx.fail(form.origin, "a sorted map needs pairs", .{});
+    const heap = try ctx.heapForArgs();
+    const order = sorted_mod.Natural{ .interner = ctx.interner };
+    var acc = sorted_mod.empty(heap, if (set) .sorted_set else .sorted_map, value_mod.nilValue()) catch return ExpandError.OutOfMemory;
+    var i: usize = 0;
+    while (i < items.len) : (i += if (set) 1 else 2) {
+        const k = try formToValue(ctx, items[i]);
+        const next = if (set) sorted_mod.conj(heap, acc, k, order) else sorted_mod.assoc(heap, acc, k, try formToValue(ctx, items[i + 1]), order);
+        acc = next catch |err| switch (err) {
+            error.OutOfMemory => return ExpandError.OutOfMemory,
+            else => return ctx.fail(items[i].origin, "the keys of a sorted collection must compare", .{}),
+        };
+    }
+    return acc;
 }
 
 /// The list `(head x)` as data, `x` converted by `formToValue`.
@@ -2185,8 +2232,8 @@ fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
 // any earlier `:let`.
 
 fn expandFor(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
-    if (args.len != 2 or args[0].datum != .vector) return ctx.fail(call_form.origin, "for: expected a binding vector and one body form", .{});
-    const bindings = args[0].datum.vector;
+    if (args.len != 2 or stripMeta(args[0]).datum != .vector) return ctx.fail(call_form.origin, "for: expected a binding vector and one body form", .{});
+    const bindings = stripMeta(args[0]).datum.vector;
     if (bindings.len == 0 or bindings.len % 2 != 0) return ctx.fail(args[0].origin, "for: the binding vector needs pairs", .{});
     if (bindings[0].datum == .keyword) return ctx.fail(bindings[0].origin, "for: a modifier needs a binding before it", .{});
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };

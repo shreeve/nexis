@@ -434,6 +434,22 @@ test "integration: quote inside a quoted form is the 2-list (quote x)" {
     try expectOutput("(eval ''x)", "x");
 }
 
+test "quote: reader sugar is the data it stands for, metadata included, as a macro receives it" {
+    try expectOutput("'@x", "(nexis.core/deref x)");
+    try expectOutput("'#(+ % 1)", "(fn* [%1] (+ %1 1))");
+    try expectOutput("(meta '^:m [1])", "{:m true}");
+    try expectOutput("(meta (second '(a ^:x [1])))", "{:x true}");
+    try expectOutput("(meta (quote ^{:k (+ 1 2)} {:a 1}))", "{:k (+ 1 2)}");
+    // A symbol carries no metadata in nexis.
+    try expectOutput("'^:k sym", "sym");
+    try expectOutput("(meta (read-string \"^:k [1]\"))", "{:k true}");
+    try expectOutputProgram("(defmacro mm [x] (meta x)) (mm ^:foo [1])", "{:foo true}");
+    try expectOutputProgram("(defmacro q [x] (list 'quote x)) [(= (q @y) '@y) (= (q #(inc %)) '#(inc %)) (meta (q ^:m [1]))]", "[true true {:m true}]");
+    // A macro may pass a binding vector with metadata on to let or for.
+    try expectOutputProgram("(defmacro my-let [bs & body] `(let ~bs ~@body)) (my-let ^:x [a 1] (inc a))", "2");
+    try expectOutput("(let ^:x [a 1] (for ^:y [b [a]] b))", "(1)");
+}
+
 test "integration: syntax-quote no unquote" {
     try expectOutput("`(1 2 3)", "(1 2 3)");
     // An unqualified symbol with no Var resolves to the current

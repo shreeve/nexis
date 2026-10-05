@@ -130,10 +130,14 @@ otherwise it is an ordinary call. User macros shadow host macros.
    integers (a fixnum, or a bignum past the fixnum range or for a
    `bigint`), reals, chars, strings, symbols and keywords (interned,
    qualified by their full name), lists, vectors, maps and sets;
-   `'x` as `(quote x)`, `@x` as `(deref x)`, `#()` as the `fn*`
-   form it stands for, and `^m x` as `x` (the metadata is dropped).
-   Only a syntax-quote, unquote or unquote-splicing is refused, as
-   `MalformedMacroCall` at the argument. Value → Form
+   `'x` as `(quote x)`, `@x` as `(nexis.core/deref x)`, `#()` as the
+   `fn*` form it stands for, `^m coll` as the list, vector, map or
+   set carrying `m` (on anything else, a symbol included, the
+   metadata is dropped), and the marker list a sorted collection
+   travels as (below) as the collection. Only a syntax-quote, unquote
+   or unquote-splicing is refused, as `MalformedMacroCall` at the
+   argument. `quote` makes its constant (`COMPILER.md` §5.1) and
+   `read-string` its value the same way. Value → Form
    (`valueToForm`): nil, booleans, fixnums, bignums (an `int` within
    i64, else a `bigint`), floats, chars, strings, symbols, keywords,
    lists (including a vector's seq view), vectors, maps and sets; the

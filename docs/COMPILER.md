@@ -404,13 +404,19 @@ What each form lowers to, in terms of the opcodes of VM.md §10.
 
 #### 5.1 `(quote x)`
 
-- nil, booleans and fixnums use the ordinary `Tiny` variants.
-- Symbols and keywords are interned; strings and bignums built on the
-  heap; each is a constant.
-- A compound payload is quoted element by element
-  (`lowerQuotePayload`) and is one constant (§4.4). A quote inside
-  the payload is data: `'(a 'b)` is `(a (quote b))`. Syntax-quote,
-  unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
+- A self-evaluating scalar lowers as itself (nil, booleans and fixnums
+  the ordinary `Tiny` variants; keywords interned, strings and
+  bignums built on the heap, each a constant); a symbol is interned.
+- Any other payload is one constant (§4.4): the value
+  `expand.formToValue` makes of it, exactly what a macro receives as
+  an argument (MACROEXPAND.md §1.2 item 6), built on the lowering
+  heap. A quote inside the payload is data, `'(a 'b)` is `(a (quote
+  b))`; `'@x` is `(nexis.core/deref x)`; `'#(+ % 1)` is `(fn* [%1] (+
+  %1 1))`; `'^:m [1]` is `[1]` carrying `{:m true}` (metadata on
+  anything but a list, vector, map or set is dropped: a symbol
+  carries none); the marker list a sorted collection travels as
+  (MACROEXPAND.md §5) is the collection. A syntax-quote or unquote
+  inside a quoted form, and a quoted compound without a heap, are
   `UnsupportedFeature`.
 
 #### 5.2 `(if test then else?)`
@@ -709,7 +715,7 @@ not):
 | `DuplicateParam`, `DuplicateBinding` | a repeated parameter; a repeated `letfn*` name |
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
-| `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering or inside a quote; a quoted symbol or keyword without an interner, a string or bignum without a heap |
+| `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering, a syntax-quote or unquote inside a quote; a quoted symbol or keyword without an interner, a string, bignum or quoted compound without a heap |
 | `RecurOutsideTail`, `RecurArityMismatch` | §4.4 |
 | `SlotOverflow` | the limits of §4.4 that remain: slots live at once, upvalues |
 | `MacroDepthExceeded` | 256 expansions in a row (MACROEXPAND.md §6) |

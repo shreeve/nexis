@@ -21,7 +21,6 @@ const stack = @import("stack.zig");
 const list_mod = @import("coll/list.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
-const sorted_mod = @import("coll/sorted.zig");
 const dispatch_mod = @import("dispatch.zig");
 
 pub const Inst = vm.Inst;
@@ -48,14 +47,14 @@ pub const Tiny = union(enum) {
     /// lexical binding; exact, with no parent-chain walk.
     qualified_symbol: struct { ns: []const u8, name: []const u8 },
     /// A constant Value: a keyword, string, float, char, bignum, quoted
-    /// symbol, or a collection of constants built at lowering. It
+    /// data, or a collection of constants built at lowering. It
     /// lives in the routine's constant pool, which keeps a heap
     /// Value alive for as long as the routine can run.
     literal: value_mod.Value,
     /// A collection built from its evaluated items: the internal
     /// `#%list`, `#%concat`, `#%vector`, `#%map` and `#%set` forms
-    /// syntax-quote emits, `[...]`, `{...}` and `#{...}` literals,
-    /// and quoted compound data. Map items are flat key, value pairs.
+    /// syntax-quote emits and `[...]`, `{...}` and `#{...}` literals.
+    /// Map items are flat key, value pairs.
     /// Emits one `coll:<op>` over a slot block (VM.md §10): a later
     /// duplicate map key wins, set duplicates collapse, and each
     /// `concat` item must be seqable.
@@ -1384,11 +1383,11 @@ fn lowerDatum(
         },
         // `{k1 v1 ...}`, `#{a b}` and `[a b]` as expressions: each
         // item is an expression, evaluated left to right.
-        .map => |items| try lowerColl(allocator, .map, items, ctx, false),
-        .set => |items| try lowerColl(allocator, .set, items, ctx, false),
-        .vector => |items| try lowerColl(allocator, .vector, items, ctx, false),
+        .map => |items| try lowerColl(allocator, .map, items, ctx),
+        .set => |items| try lowerColl(allocator, .set, items, ctx),
+        .vector => |items| try lowerColl(allocator, .vector, items, ctx),
         // Reader macros / meta.
-        .quote => |inner| try lowerQuotePayload(allocator, inner, ctx),
+        .quote => |inner| try lowerQuoted(allocator, inner, ctx),
         .syntax_quote, .unquote, .unquote_splicing => return CompileError.UnsupportedFeature,
         // `@x`, `#(...)` and `^{...}` are rewritten by the
         // expander; the lowerer rejects the raw reader forms.
@@ -1418,7 +1417,7 @@ fn lowerList(
     items: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
-    if (items.len == 0) return try lowerColl(allocator, .list, &.{}, ctx, false);
+    if (items.len == 0) return try lowerColl(allocator, .list, &.{}, ctx);
     // Head-symbol dispatch only fires when head is an unqualified
     // symbol. Qualified symbols (`foo/x`) and non-symbol heads
     // (calls of computed values) fall through to ordinary call.
@@ -1448,7 +1447,7 @@ fn lowerList(
 /// `require`, `defmacro`, `set!`), and the `#%` collection
 /// constructors syntax-quote emits.
 const lowerings = std.StaticStringMap(*const fn (std.mem.Allocator, []const *reader_mod.Form, LowerCtx) CompileError!*Tiny).initComptime(.{
-    .{ "do", &lowerDo },
+    .{ "do", &lowerBody },
     .{ "if", &lowerIf },
     .{ "quote", &lowerQuote },
     .{ "let*", &lowerLetStar },
@@ -1481,25 +1480,9 @@ fn lowerLoopStar(allocator: std.mem.Allocator, args: []const *reader_mod.Form, c
 fn lowerCollForm(comptime op: vm.CollOp) fn (std.mem.Allocator, []const *reader_mod.Form, LowerCtx) CompileError!*Tiny {
     return struct {
         fn lower(allocator: std.mem.Allocator, args: []const *reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
-            return lowerColl(allocator, op, args, ctx, false);
+            return lowerColl(allocator, op, args, ctx);
         }
     }.lower;
-}
-
-/// `(do exprs...)`. Empty `(do)` lowers to `Tiny.do_` with an
-/// empty slice (backend synthesizes nil). Multi-expression do
-/// passes through as `Tiny.do_` (backend evaluates non-last for
-/// effect, returns last).
-fn lowerDo(
-    allocator: std.mem.Allocator,
-    body_items: []const *reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
-    const exprs = try allocator.alloc(*const Tiny, body_items.len);
-    for (body_items, 0..) |item, i| {
-        exprs[i] = try lowerForm(allocator, item, ctx);
-    }
-    return try allocTiny(allocator, .{ .do_ = exprs });
 }
 
 /// `(if test then)` or `(if test then else)`. Missing else
@@ -1533,34 +1516,25 @@ fn lowerNot(allocator: std.mem.Allocator, arg: *const reader_mod.Form, ctx: Lowe
     } });
 }
 
-/// `(quote x)`. Scalars that already map to Tiny variants are
-/// lowered to those variants directly (saves const-pool entries
-/// for fixnums/bools/nil). Quoted symbols, keywords and compound
-/// collections become `Tiny.literal` through the Interner (see
-/// `lowerQuotePayload`).
 fn lowerQuote(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
     ctx: LowerCtx,
 ) CompileError!*Tiny {
     if (args.len != 1) return CompileError.MalformedForm;
-    return lowerQuotePayload(allocator, args[0], ctx);
+    return lowerQuoted(allocator, args[0], ctx);
 }
 
-/// A `Tiny.coll` of `op` over `forms`: each lowered as an
-/// expression, or as quoted data when `quoted`.
+/// A `Tiny.coll` of `op` over `forms`, each lowered as an expression.
 fn lowerColl(
     allocator: std.mem.Allocator,
     op: vm.CollOp,
     forms: []const *reader_mod.Form,
     ctx: LowerCtx,
-    quoted: bool,
 ) CompileError!*Tiny {
     if (op == .map and forms.len % 2 != 0) return CompileError.MalformedForm;
     const items = try allocator.alloc(*const Tiny, forms.len);
-    for (forms, items) |form, *item| {
-        item.* = if (quoted) try lowerQuotePayload(allocator, form, ctx) else try lowerForm(allocator, form, ctx);
-    }
+    for (forms, items) |form, *item| item.* = try lowerForm(allocator, form, ctx);
     if (try constantColl(allocator, op, items, ctx)) |v| return try allocTiny(allocator, .{ .literal = v });
     return try allocTiny(allocator, .{ .coll = .{ .op = op, .items = items } });
 }
@@ -1577,16 +1551,19 @@ fn constantColl(allocator: std.mem.Allocator, op: vm.CollOp, items: []const *con
     if (op == .concat) return null;
     const values = try allocator.alloc(Value, items.len);
     defer allocator.free(values);
-    for (items, values) |item, *v| {
-        v.* = switch (item.*) {
-            .nil => value_mod.nilValue(),
-            .bool => |b| value_mod.fromBool(b),
-            .int => |n| value_mod.fromFixnum(n) orelse return null,
-            .literal => |l| l,
-            else => return null,
-        };
-    }
+    for (items, values) |item, *v| v.* = try constValue(item) orelse return null;
     return buildColl(heap, op, values) catch CompileError.OutOfMemory;
+}
+
+/// The constant `t` is, if it is one.
+fn constValue(t: *const Tiny) CompileError!?Value {
+    return switch (t.*) {
+        .nil => value_mod.nilValue(),
+        .bool => |b| value_mod.fromBool(b),
+        .int => |n| value_mod.fromFixnum(n) orelse CompileError.IntegerOutOfFixnumRange,
+        .literal => |v| v,
+        else => null,
+    };
 }
 
 fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value {
@@ -1610,126 +1587,39 @@ fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value 
     }
 }
 
-/// `(quote x)` and `'x`: `x` as data. Symbols and keywords are
-/// interned (`UnsupportedFeature` without an interner), strings and
-/// bignums built on the heap; a compound collection quotes each
-/// element and so becomes one constant (`lowerColl`). A quote inside
-/// the payload is the 2-list `(quote x)`, as `formToValue` renders
-/// it. Quoted reader macros (`'@x`, `'#(...)`, `'^{...}`,
-/// syntax-quote) are `UnsupportedFeature`.
-/// Whether `items` is the marker list a sorted collection travels as
-/// in a form, `(nexis.internal/#%sorted-map k v ...)` or
-/// `(nexis.internal/#%sorted-set x ...)` (MACROEXPAND.md §5): true
-/// for a set, false for a map, null for any other list.
-fn sortedMarker(items: []const *const reader_mod.Form) ?bool {
-    if (items.len == 0 or items[0].datum != .symbol) return null;
-    const sym = items[0].datum.symbol;
-    const ns = sym.ns orelse return null;
-    if (!std.mem.eql(u8, ns, "nexis.internal")) return null;
-    if (std.mem.eql(u8, sym.name, "#%sorted-set")) return true;
-    if (std.mem.eql(u8, sym.name, "#%sorted-map")) return false;
-    return null;
-}
-
-/// A quoted sorted-collection marker as the collection itself, in the
-/// natural order: quoting it yields the collection, as quoting the
-/// value would in Clojure.
-fn lowerQuotedSorted(allocator: std.mem.Allocator, set: bool, items: []const *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
-    const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-    const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-    if (!set and items.len % 2 != 0) return CompileError.MalformedForm;
-    const order = sorted_mod.Natural{ .interner = interner };
-    var acc = sorted_mod.empty(h, if (set) .sorted_set else .sorted_map, value_mod.nilValue()) catch return CompileError.OutOfMemory;
-    var i: usize = 0;
-    while (i < items.len) : (i += if (set) 1 else 2) {
-        const k = try quotedLiteral(allocator, items[i], ctx);
-        const next = if (set)
-            sorted_mod.conj(h, acc, k, order)
-        else
-            sorted_mod.assoc(h, acc, k, try quotedLiteral(allocator, items[i + 1], ctx), order);
-        acc = next catch |err| switch (err) {
-            error.OutOfMemory => return CompileError.OutOfMemory,
-            else => return CompileError.MalformedForm,
-        };
-    }
-    return allocTiny(allocator, .{ .literal = acc });
-}
-
-/// Quoted data `item` as the constant it lowers to.
-fn quotedLiteral(allocator: std.mem.Allocator, item: *const reader_mod.Form, ctx: LowerCtx) CompileError!Value {
-    const t = try lowerQuotePayload(allocator, item, ctx);
-    return switch (t.*) {
-        .nil => value_mod.nilValue(),
-        .bool => |b| value_mod.fromBool(b),
-        .int => |n| value_mod.fromFixnum(n) orelse CompileError.MalformedForm,
-        .literal => |v| v,
-        else => CompileError.UnsupportedForm,
-    };
-}
-
-fn lowerQuotePayload(
-    allocator: std.mem.Allocator,
-    payload: *const reader_mod.Form,
-    ctx: LowerCtx,
-) CompileError!*Tiny {
+/// `(quote x)` and `'x`: `x` as data. A self-evaluating scalar lowers
+/// as itself and a symbol as the interned symbol; anything else is
+/// one constant, the value `expand.formToValue` makes of it, exactly
+/// what a macro receives as an argument (MACROEXPAND.md §1.2): `'x`
+/// inside it is `(quote x)`, `@x` is `(nexis.core/deref x)`, `#()` the
+/// `fn*` form it stands for, `^m coll` the collection carrying `m`,
+/// and the marker list a sorted collection travels as the collection
+/// itself. It is built on the lowering heap, so a quoted compound
+/// without one, and a syntax-quote or unquote inside, is
+/// `UnsupportedFeature`.
+fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
     try stack.check();
-    return switch (payload.datum) {
-        .nil => try allocTiny(allocator, .nil),
-        .bool_ => |b| try allocTiny(allocator, .{ .bool = b }),
-        .int => |n| try lowerInt(allocator, n, ctx),
-        .bigint => |text| try lowerBigInt(allocator, text, ctx),
-        .symbol => |name| blk: {
-            // Qualified symbols intern the full
-            // `ns/name` string; valueToForm splits it back into
-            // ns + name on the way out. This lets macros emit
-            // qualified-symbol literals like `(quote db/begin-write)`.
+    switch (payload.datum) {
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword => return lowerDatum(allocator, payload, ctx),
+        .symbol => |name| {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            if (name.ns) |ns_prefix| {
-                const full = try allocator.print("{s}/{s}", .{ ns_prefix, name.name });
-                defer allocator.free(full);
-                const v = interner.internSymbolValue(full) catch return CompileError.OutOfMemory;
-                break :blk try allocTiny(allocator, .{ .literal = v });
-            }
-            const v = interner.internSymbolValue(name.name) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
+            const v = interner.internQualifiedSymbol(name.ns, name.name) catch return CompileError.OutOfMemory;
+            return allocTiny(allocator, .{ .literal = v });
         },
-        .keyword => |name| blk: {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const v = interner.internQualifiedKeyword(name.ns, name.name) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // Quoted compound data: each element is quoted data too.
-        .list => |items| if (sortedMarker(items)) |set|
-            try lowerQuotedSorted(allocator, set, items[1..], ctx)
-        else
-            try lowerColl(allocator, .list, items, ctx, true),
-        .vector => |items| try lowerColl(allocator, .vector, items, ctx, true),
-        .map => |items| try lowerColl(allocator, .map, items, ctx, true),
-        .set => |items| try lowerColl(allocator, .set, items, ctx, true),
-        // Quoting a self-evaluating literal yields the literal.
-        .real => |f| try allocTiny(allocator, .{ .literal = value_mod.fromFloat(f) }),
-        .char => |c| try allocTiny(allocator, .{
-            .literal = value_mod.fromChar(c) orelse return CompileError.MalformedForm,
-        }),
-        .string => |bytes| blk: {
-            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
-            const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
-            break :blk try allocTiny(allocator, .{ .literal = v });
-        },
-        // `'(a 'b)` is `(a (quote b))`: the inner quote is data, the
-        // 2-list `formToValue` renders it as, a constant like any
-        // other quoted list.
-        .quote => |inner| blk: {
-            const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
-            const quote_sym = interner.internSymbolValue("quote") catch return CompileError.OutOfMemory;
-            const tiny_items = try allocator.alloc(*const Tiny, 2);
-            tiny_items[0] = try allocTiny(allocator, .{ .literal = quote_sym });
-            tiny_items[1] = try lowerQuotePayload(allocator, inner, ctx);
-            if (try constantColl(allocator, .list, tiny_items, ctx)) |v| break :blk try allocTiny(allocator, .{ .literal = v });
-            break :blk try allocTiny(allocator, .{ .coll = .{ .op = .list, .items = tiny_items } });
-        },
-        else => return CompileError.UnsupportedFeature,
+        else => {},
+    }
+    var expander = expand_mod.ExpandContext{
+        .allocator = allocator,
+        .interner = ctx.interner orelse return CompileError.UnsupportedFeature,
+        .host_macros = &no_macros,
+        .value_heap = ctx.heap orelse return CompileError.UnsupportedFeature,
     };
+    const v = expand_mod.formToValue(&expander, payload) catch |err| return switch (err) {
+        error.OutOfMemory => CompileError.OutOfMemory,
+        error.ExpansionDepthExceeded => CompileError.StackOverflow,
+        else => CompileError.UnsupportedFeature,
+    };
+    return allocTiny(allocator, .{ .literal = v });
 }
 
 /// An integer literal: `Tiny.int` in the fixnum range, otherwise a
@@ -2904,11 +2794,8 @@ fn compileOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!Ope
 
 /// `t` as an operand read in place, or null when it needs code.
 fn directOperand(e: *Emitter, t: *const Tiny, allow_var: bool) CompileError!?Operand {
+    if (try constValue(t)) |v| return e.constOperand(v);
     switch (t.*) {
-        .nil => return e.constOperand(value_mod.nilValue()),
-        .bool => |b| return e.constOperand(value_mod.fromBool(b)),
-        .int => |n| return e.constOperand(value_mod.fromFixnum(n) orelse return CompileError.IntegerOutOfFixnumRange),
-        .literal => |v| return e.constOperand(v),
         .qualified_symbol => |q| {
             if (!allow_var) return null;
             return varOperand(try qualifiedVarIndex(e, q.ns, q.name));
@@ -4185,13 +4072,19 @@ test "stack guard: a form nested past the stack budget is StackOverflow, not a c
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var v = try vm.VM.init(testing.allocator, &stub_routine);
+    defer v.deinit();
+    const registry = try v.ensureRegistry();
     for ([_]bool{ false, true }) |quoted| {
         const deep = try nestedVectorForm(a, 100_000, quoted);
         var declared = DeclaredNames.init(testing.allocator);
         defer declared.deinit();
-        try testing.expectError(CompileError.StackOverflow, compileFormWith(a, deep, .{ .declared = &declared }));
+        // Quoted data is a constant built on the heap; the expander,
+        // which an interner brings in, passes a quote through.
+        const opts: CompileOptions = if (quoted) .{ .declared = &declared, .namespace = registry.current, .interner = v.ensureInterner() } else .{ .declared = &declared };
+        try testing.expectError(CompileError.StackOverflow, compileFormWith(a, deep, opts));
         const shallow = try nestedVectorForm(a, 100, quoted);
-        _ = try compileFormWith(a, shallow, .{ .declared = &declared });
+        _ = try compileFormWith(a, shallow, opts);
     }
     // A hand-built Tiny tree reaches the Emitter without lowering;
     // a one-form `do` allocates no slot, so only depth can fail it.
@@ -4243,6 +4136,8 @@ test "declared names: lexical bindings, quoted data and same-form definitions re
     defer arena.deinit();
     var v = try vm.VM.init(testing.allocator, &stub_routine);
     defer v.deinit();
+    // A registry brings the heap quoted data is built on.
+    _ = try v.ensureRegistry();
     var host_macros = try expand_mod.defaultMacros(testing.allocator);
     defer host_macros.deinit(testing.allocator);
     const ok_sources = [_][]const u8{
