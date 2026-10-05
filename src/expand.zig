@@ -1313,7 +1313,7 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         .with_meta => |wm| blk: {
             const target = try formToValue(ctx, wm.target);
             switch (target.kind()) {
-                // A collection made just now: no one else holds it.
+                // A collection this call made: no one else holds it.
                 .list, .persistent_vector, .persistent_map, .persistent_set => {
                     const meta = try formToValue(ctx, wm.meta);
                     heap_mod.Heap.asHeapHeader(target).setMeta(heap_mod.Heap.asHeapHeader(meta));
