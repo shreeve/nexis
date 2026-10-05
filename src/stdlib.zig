@@ -943,7 +943,9 @@ fn castTo(comptime T: type) *const fn (*VM, []const Value) VmError!Value {
             const min = std.math.minInt(T);
             const max = std.math.maxInt(T);
             if (x.isFloat()) {
-                const f = x.asFloat();
+                // Truncated first, then range-checked, as Clojure's
+                // boxed cast (`longCast`, then the narrowing check).
+                const f = @trunc(x.asFloat());
                 if (std.math.isNan(f)) return value_mod.fromFixnum(0).?;
                 if (!(f >= min and f <= max)) return VmError.InvalidArgument;
             }

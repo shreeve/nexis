@@ -1464,13 +1464,16 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
     // int checks Java's 32-bit int range, as Clojure's cast does.
     try expectOutput("[(int 2147483647) (int -2147483648) (int -3.9) (int -2147483647.9)]", "[2147483647 -2147483648 -3 -2147483647]");
-    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483648.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    // A float is truncated, then range-checked: Clojure's boxed cast
+    // (longCast, then the narrowing check), the rule nexis follows.
+    try expectOutput("[(int 2147483647.5) (byte 127.5) (byte -128.5) (short -32768.5)]", "[2147483647 127 -128 -32768]");
     // NaN casts to 0, as Java's (int) and Clojure's int make it.
     try expectOutput("[(int ##NaN) (short ##NaN) (byte ##NaN)]", "[0 0 0]");
     // short and byte check their Java ranges the same way.
     try expectOutput("[(byte 127) (byte -128) (byte 1.9) (byte \\a) (short 32767) (short -32768) (short -1.5) (short \\a)]", "[127 -128 1 97 32767 -32768 -1 97]");
-    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 127.5 -128.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
-    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32767.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 128.5 -129.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
+    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32768.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
     try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
