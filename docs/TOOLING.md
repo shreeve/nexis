@@ -82,8 +82,9 @@ form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
-and `*e` is the thrown value, or for a VM error its keyword
-(`DivideByZero` is `:divide-by-zero`); a parse, reader or compile
+and `*e` is the thrown value, or for a VM error the keyword `catch`
+sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
+out of memory, which no `catch` sees, `:out-of-memory`); a parse, reader or compile
 error is reported and leaves `*e` as it was. `:quit` or `:q` alone
 on a line at the start of a form, or end of input, exits. Every
 input's text is kept for the session, so a function defined in one

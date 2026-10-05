@@ -6596,8 +6596,12 @@ test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [] (/ 1 0))\n(f)" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
     try testing.expect(program.v.frames.items.len > 1);
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
     program.v.resetAfterError();
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    // A later failure the run loop never sees (a host callback's) must
+    // not report this one.
+    try testing.expect(program.v.traced_error == null);
     const result = try program.run("(+ 1 2)");
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }

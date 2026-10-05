@@ -820,7 +820,8 @@ innermost 32 and outermost 8 around one marker frame, whose `elided`
 counts the frames it stands for (no span, no source), so
 a runaway recursion lists 41 lines. The next failing run rebuilds the trace. `resetAfterError`
 discards what a failed run left (the frames above the top-level one,
-handlers, pending finallys, the unhandled throw) so `retargetTop` can
+handlers, pending finallys, the unhandled throw, `traced_error`) so
+`retargetTop` can
 run the next form, and gives back the frame and stack capacity past
 4,096 frames and 16,384 slots that a runaway recursion grew; the REPL
 calls it after reporting, and `retargetTop` calls it when the frames

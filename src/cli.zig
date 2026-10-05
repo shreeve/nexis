@@ -727,21 +727,10 @@ const Balance = struct {
 };
 
 /// The keyword a caught runtime error would be (`DivideByZero` is
-/// `:divide-by-zero`), for `*e`.
+/// `:divide-by-zero`), for `*e`; one no `catch` sees is named the same
+/// way (`:out-of-memory`).
 fn errorKeyword(rt: *Runtime) Value {
     const err = rt.v.traced_error orelse return value_mod.nilValue();
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (@errorName(err), 0..) |c, i| {
-        if (n + 2 > buf.len) break;
-        if (std.ascii.isUpper(c)) {
-            if (i > 0) {
-                buf[n] = '-';
-                n += 1;
-            }
-            buf[n] = std.ascii.toLower(c);
-        } else buf[n] = c;
-        n += 1;
-    }
-    return rt.v.ensureInterner().internKeywordValue(buf[0..n]) catch value_mod.nilValue();
+    const name = vm.vmErrorToKeywordName(err) orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
+    return rt.v.ensureInterner().internKeywordValue(name) catch value_mod.nilValue();
 }

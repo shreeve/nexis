@@ -2997,9 +2997,10 @@ pub const VM = struct {
 
     /// Discard what a failed run left behind (the frames above the
     /// top-level one, handlers, pending finallys, the dynamic
-    /// bindings a `binding` form had in force and the unhandled
-    /// throw) so the next `retargetTop` starts from a clean VM. The
-    /// error trace stays until the next failing run replaces it.
+    /// bindings a `binding` form had in force, the unhandled throw and
+    /// `traced_error`) so the next `retargetTop` starts from a clean
+    /// VM and a later failure outside a run never reports this one.
+    /// The error trace stays until the next failing run replaces it.
     pub fn resetAfterError(self: *VM) void {
         while (self.frames.items.len > 1) _ = self.popFrame();
         self.handlers.clearRetainingCapacity();
@@ -3008,6 +3009,7 @@ pub const VM = struct {
         self.escaped_origin = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
+        self.traced_error = null;
         self.frames.items[0].routine = &idle_routine;
         @memset(self.stack.items, value_mod.nilValue());
         // A runaway recursion grew the frame chain and the stack far
@@ -4152,7 +4154,7 @@ pub const VM = struct {
 /// Returns null for unrecoverable errors — bytecode
 /// corruption, OOM, handler-state malformation, etc. Those
 /// propagate to the caller unchanged.
-fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
+pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     return switch (err) {
         // Recoverable per VM.md §13.
         VmError.KindMismatch => "kind-mismatch",
