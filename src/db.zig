@@ -23,7 +23,7 @@
 //!     keys are **opaque byte slices**, values
 //!     are codec-encoded via `src/codec.zig`.
 //!   - `putRef` / `getRef` / `delRef` ref-based convenience.
-//!   - Per-kind hash / equality / trace helpers consumed by
+//!   - Per-kind hash / equality helpers consumed by
 //!     `src/dispatch.zig` and `src/gc.zig`.
 //!
 //! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
@@ -1224,7 +1224,7 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 }
 
 // =============================================================================
-// Per-kind hash / equality / trace (DB.md §7)
+// Per-kind hash / equality (DB.md §7)
 //
 // Consumed by `src/dispatch.zig` at the `.durable_ref` arm and by
 // `src/gc.zig` at the same arm.
@@ -1265,14 +1265,6 @@ pub fn refsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     const b_bytes = inlineBytesOf(b);
     const total_len = ab.tree_name_len + ab.key_bytes_len;
     return std.mem.eql(u8, a_bytes[0..total_len], b_bytes[0..total_len]);
-}
-
-/// GC trace — no-op per DB.md §7.3. `conn` is not a heap Value;
-/// tree_name and key_bytes are inline body bytes. Metadata is
-/// handled centrally by the collector.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
 }
 
 // =============================================================================

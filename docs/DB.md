@@ -370,7 +370,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
 | `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
 | `refStoreId` / `refTreeName` / `refKeyBytes` / `refConn` | The ref's fields. |
-| `hashHeader` / `refsEqual` / `trace` | §7. |
+| `hashHeader` / `refsEqual` | §7. |
 | `failureName(anyerror) []const u8` | The keyword a failure surfaces as (§8). |
 
 Keys are opaque byte slices, never codec-encoded; values are
@@ -506,8 +506,8 @@ whose callback writes, deletes and walks the tree under it),
 ### 11. Module graph
 
 `db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
-`emdb`. `dispatch.zig` and `gc.zig` call its hash, equality and trace
-helpers at their `.durable_ref` arms, and `gc.zig` its `markHandle`
+`emdb`. `dispatch.zig` calls its hash and equality helpers at its
+`.durable_ref` arm, and `gc.zig` its `markHandle`
 and `sweepHandles` (§3.2); `format.zig` reads a ref's
 tree name and key bytes to print it; `stdlib.zig` holds the natives;
 Nextomic imports it only for `failureName`, the geometry constants
