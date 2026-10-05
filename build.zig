@@ -641,7 +641,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
     while (walker.next(io) catch |err| return b.fmt("layering: walking src/: {t}", .{err})) |entry| {
         if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ "src", entry.path })));
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
-        const file = b.dupe(entry.path);
+        const file = b.graph.dupeString(entry.path);
         if (std.mem.eql(u8, file, "root.zig")) continue;
         const from = layerUnit(file);
         const from_rank = rank.get(from) orelse if (isExecutableRoot(file))
@@ -655,7 +655,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
         for (importPaths(gpa, text)) |rel| {
             if (!std.mem.endsWith(u8, rel, ".zig")) continue;
             const dir = std.Io.Dir.path.dirnamePosix(file) orelse "";
-            const target = std.Io.Dir.path.resolvePosix(gpa, &.{ dir, rel }) catch @panic("OOM");
+            const target = std.Io.Dir.path.resolveAllocPosix(gpa, &.{ dir, rel }) catch @panic("OOM");
             const to = layerUnit(target);
             if (std.mem.eql(u8, to, from)) continue;
             if (std.mem.eql(u8, to, "nextomic/root.zig") and !std.mem.eql(u8, from, "stdlib.zig"))
