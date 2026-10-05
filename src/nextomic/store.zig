@@ -485,7 +485,9 @@ pub const Store = struct {
         const k = countKey(a);
         const raw = (try self.sysGet(txn, &k)) orelse return 0;
         if (raw.len != 8) return error.Corrupted;
-        return std.mem.readInt(u64, raw[0..8], .big);
+        // No attribute holds more current datoms than there are ids.
+        const n = std.mem.readInt(u64, raw[0..8], .big);
+        return if (n > key.id_max) error.Corrupted else n;
     }
 
     pub fn writeAttrCount(self: *Store, txn: *Txn, a: u32, n: u64) !void {
@@ -594,7 +596,7 @@ pub const Store = struct {
     pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
         const raw = (try self.sysGet(txn, "ft")) orelse return null;
         if (raw.len != 1 + key.id_len) return error.Corrupted;
-        return .{ .fold = raw[0], .t = try key.readId(raw[1..][0..key.id_len]) };
+        return .{ .fold = raw[0], .t = try key.readT(raw[1..][0..key.id_len]) };
     }
 
     /// Stamp the rows current at `t` under `fulltext_fold`.
@@ -1087,6 +1089,28 @@ fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
         const final = buf;
         break :blk &final;
     };
+}
+
+test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
+    var td = try TestDir.init("store_ranges");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    const txn = try store.beginWrite(.none);
+    defer txn.abort();
+    // No attribute holds more current datoms than there are ids.
+    try store.writeAttrCount(txn, boot.doc, key.id_max + 1);
+    try testing.expectError(error.Corrupted, store.attrCount(txn, boot.doc));
+    var stamp: [1 + key.id_len]u8 = undefined;
+    stamp[0] = fulltext_fold;
+    key.writeId(stamp[1..][0..key.id_len], key.tx_partition_bit | 1);
+    try store.sysPut(txn, "ft", &stamp);
+    try testing.expectError(error.Corrupted, store.readFulltextStamp(txn));
+    var raw: [key.id_len]u8 = undefined;
+    key.writeId(&raw, key.tx_partition_bit);
+    try testing.expectError(error.Corrupted, key.readT(&raw));
+    key.writeId(&raw, key.tx_partition_bit - 1);
+    try testing.expectEqual(key.tx_partition_bit - 1, try key.readT(&raw));
 }
 
 test "open bootstraps once and reopen finds the same ids" {

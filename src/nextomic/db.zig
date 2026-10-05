@@ -624,7 +624,7 @@ pub const DatomScan = struct {
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
                     if (kv.value.len < key.id_len) return error.Corrupted;
-                    const t = try key.readId(kv.value[0..key.id_len]);
+                    const t = try key.readT(kv.value[0..key.id_len]);
                     return try self.materialise(parts, t, true);
                 },
                 .folded => |*s| {
@@ -696,7 +696,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
     while (s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
-        const t = try key.readId(kv.key[0..key.id_len]);
+        const t = try key.readT(kv.key[0..key.id_len]);
         const entry = try datom_mod.decodeTxlog(arena, kv.value, t, ids);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
@@ -894,6 +894,31 @@ test "basis in the future is refused" {
     var db = try tc.conn.db();
     db.basis = 99;
     try testing.expectError(error.BasisInFuture, db.datoms(arena, .eavt, .{ .e = 1 }));
+}
+
+test "a t out of its range in a current row or a txlog key is Corrupted" {
+    const tc = try TestConn.init("db_t_range");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const store = tc.conn.store;
+    // A current EAVT row of :db/doc whose `[t:6]` is 2^46 | 1, and a
+    // txlog key 2^46 | 2: both pass the id range, neither is a `t`.
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        const k = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
+        var tb: [key.id_len]u8 = undefined;
+        key.writeId(&tb, key.tx_partition_bit | 1);
+        try txn.putInTree(store.trees.cur(.eavt), k, &tb);
+        key.writeId(&tb, key.tx_partition_bit | 2);
+        try txn.putInTree(store.trees.txlog, &tb, (try store.getTxlog(txn, 1)).?);
+        try store.commit(txn);
+    }
+    const db = try tc.conn.db();
+    try testing.expectError(error.Corrupted, db.datoms(arena, .eavt, .{ .e = boot.doc }));
+    try testing.expectError(error.Corrupted, txRange(tc.conn, arena, 0, null));
 }
 
 test "a VAET component must be a ref value" {
