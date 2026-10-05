@@ -7,8 +7,8 @@
   </defs>
   <rect width="256" height="256" rx="60" fill="url(#nt-bg)"/>
   <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M98 66 H 78 V 190 H 98"/>
-    <path d="M158 66 H 178 V 190 H 158"/>
+    <path d="M92 66 H 72 V 190 H 92"/>
+    <path d="M164 66 H 184 V 190 H 164"/>
   </g>
   <g fill="#fff">
     <rect x="101.5" y="90.5" width="53" height="15" rx="7.5" opacity="0.4"/>
