@@ -1372,6 +1372,9 @@ test "integration: core.nx if-let / when-let destructure, and if-let's else is o
     try expectProgramError("(if-let [x 1 y 2] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(if-some [x 1] x 2 3)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(if-some (x 1) x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-let [a 1 b 2] [a b])", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-some [a] a)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-first (x [1]) x)", compile.CompileError.MacroExpansionFailure);
 }
 
 test "integration: core.nx if-some / when-some bind false; when-first binds the first element" {
@@ -2195,6 +2198,8 @@ fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, a
 test "defmacro: a failing macro call names the macro and the cause, at the call" {
     try expectMacroFailure("(defmacro m [] (throw (ex-info \"bad macro input\" {:x 1})))", "(do 1 (m))", "macro m threw bad macro input", "(m)");
     try expectMacroFailure("(defmacro m [] (throw :nope))", "(when true (m))", "macro m threw :nope", "(m)");
+    try expectMacroFailure("", "(when-let [a 1 b 2] [a b])", "macro when-let threw when-let requires exactly 2 forms in binding vector", "(when-let [a 1 b 2] [a b])");
+    try expectMacroFailure("", "(if-some [a 1] a 2 3)", "macro if-some threw if-some requires 1 or 2 forms after binding vector", "(if-some [a 1] a 2 3)");
     try expectMacroFailure("(defmacro m [a] a)", "(do (m))", "macro m takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes 2 or more arguments, got 1", "(m 1)");
     try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
@@ -5094,6 +5099,8 @@ test "core: macros" {
         .{ .src = "(-> 5 inc (* 2) (- 1))", .expected = "11" },
         .{ .src = "(->> [1 2 3] (map inc) (filter odd?) (reduce +))", .expected = "3" },
         .{ .src = "(dotimes [i 3] i)", .expected = "nil" },
+        // The count is truncated, as Clojure's (long n).
+        .{ .src = "(let [a (atom [])] (dotimes [i 2.5] (swap! a conj i)) @a)", .expected = "[0 1]" },
         .{ .src = "(when-let [x 1] (inc x))", .expected = "2" },
         .{ .src = "(if-let [x nil] x :none)", .expected = ":none" },
     });

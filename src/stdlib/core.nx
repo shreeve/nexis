@@ -33,12 +33,20 @@
 ; Conditional macros
 ; ============================================================
 
+; Fails the expansion of the binding macro `macro` unless `binding` is
+; [binding test] and `else` holds at most one form, as Clojure's
+; assert-args does.
+(defn- check-binding [macro binding else]
+  (when (or (not (vector? binding)) (not= 2 (count binding)))
+    (throw (ex-info (str macro " requires exactly 2 forms in binding vector") {})))
+  (when (next else)
+    (throw (ex-info (str macro " requires 1 or 2 forms after binding vector") {}))))
+
 ; (if-let [binding test] then else?) → then with binding bound to
 ; test's value when it is truthy, else. The binding may destructure;
 ; any other shape fails to expand, as in Clojure.
 (defmacro if-let [binding then & else]
-  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
-    (throw (ex-info "if-let takes [binding test], then and an optional else" {})))
+  (check-binding "if-let" binding else)
   `(let [temp# ~(second binding)]
      (if temp#
        (let [~(first binding) temp#] ~then)
@@ -46,6 +54,7 @@
 
 ; (when-let [binding test] body...) → body when test is truthy.
 (defmacro when-let [binding & body]
+  (check-binding "when-let" binding nil)
   `(let [temp# ~(second binding)]
      (when temp#
        (let [~(first binding) temp#] ~@body))))
@@ -53,14 +62,14 @@
 ; (if-some [binding test] then else?) / (when-some [binding test]
 ; body...) → as if-let / when-let, but only nil fails: false binds.
 (defmacro if-some [binding then & else]
-  (when (or (not (vector? binding)) (not= 2 (count binding)) (next else))
-    (throw (ex-info "if-some takes [binding test], then and an optional else" {})))
+  (check-binding "if-some" binding else)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        ~(first else)
        (let [~(first binding) temp#] ~then))))
 
 (defmacro when-some [binding & body]
+  (check-binding "when-some" binding nil)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        nil
@@ -69,6 +78,7 @@
 ; (when-first [x coll] body...) → body with x bound to the first
 ; element, when coll has one.
 (defmacro when-first [binding & body]
+  (check-binding "when-first" binding nil)
   `(let [s# (seq ~(second binding))]
      (when s#
        (let [~(first binding) (first s#)] ~@body))))
@@ -121,10 +131,10 @@
        (nexis.internal/#%pop-out)))
 
 ; (dotimes [name n-expr] body...)
-;   runs body n times with name bound to 0..n-1.
-;   Returns nil.
+;   runs body n times with name bound to 0..n-1, n truncated to an
+;   integer as Clojure's `long` does. Returns nil.
 (defmacro dotimes [binding & body]
-  `(let* [limit# ~(first (rest binding))]
+  `(let* [limit# (long ~(first (rest binding)))]
      (loop* [~(first binding) 0]
        (if (< ~(first binding) limit#)
          (do ~@body
