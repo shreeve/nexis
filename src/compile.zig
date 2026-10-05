@@ -23,10 +23,10 @@ const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const dispatch_mod = @import("dispatch.zig");
 
-pub const Inst = vm.Inst;
-pub const Routine = vm.Routine;
-pub const Operand = vm.Operand;
-pub const Value = value_mod.Value;
+const Inst = vm.Inst;
+const Routine = vm.Routine;
+const Operand = vm.Operand;
+const Value = value_mod.Value;
 
 // =============================================================================
 // Tiny — the compiler's IR: the special forms, with every symbol
@@ -34,7 +34,7 @@ pub const Value = value_mod.Value;
 // compile allocator (tests build small trees as `&Tiny{ ... }`).
 // =============================================================================
 
-pub const Tiny = union(enum) {
+const Tiny = union(enum) {
     nil,
     bool: bool,
     /// An integer in the i48 fixnum range; lowering makes a wider
@@ -142,7 +142,7 @@ pub const Tiny = union(enum) {
 /// The operation of a `Tiny.prim`: the VM's `math` and `cmp`
 /// variants that run the same numeric-tower helpers as the core
 /// fns they stand for (VM.md §10).
-pub const PrimOp = enum {
+const PrimOp = enum {
     add,
     sub,
     mul,
@@ -201,7 +201,7 @@ const inlined_ops = [_]Inlined{
 
 /// One binding in a `letfn*` form. Each is a function
 /// definition (mutually visible across the binding group).
-pub const FnBinding = struct {
+const FnBinding = struct {
     name: []const u8,
     params: []const []const u8,
     /// `& rest` binding name, when the fn is variadic.
@@ -212,13 +212,13 @@ pub const FnBinding = struct {
 };
 
 /// The sequential bindings and body of a `let*` or `loop*`.
-pub const Scope = struct {
+const Scope = struct {
     bindings: []const Binding,
     body: *const Tiny,
 };
 
 /// One binding in a `let*` form.
-pub const Binding = struct {
+const Binding = struct {
     name: []const u8,
     value: *const Tiny,
     /// Whether a closure in the binding's scope captures it
@@ -239,7 +239,7 @@ pub const Binding = struct {
 ///   .cell_slot(s)    → emit `closure:get-cell dst, slot(s)`
 ///   .upvalue(u)      → emit `mov:move dst, u:u` (resolve(u)
 ///                      deref's the cell at runtime)
-pub const BindingRef = union(enum) {
+const BindingRef = union(enum) {
     /// Ordinary slot; binding's value lives directly in
     /// `slot[s]`. Most bindings stay here.
     direct_slot: u12,
@@ -299,7 +299,7 @@ fn ScopeTable(comptime T: type) type {
 /// Routine-level capture cache entry. Maps a captured name to its upvalue index, so repeat references
 /// to the same outer name from different lexical scopes share
 /// a single upvalue/descriptor entry.
-pub const CapturedName = struct {
+const CapturedName = struct {
     name: []const u8,
     upvalue: u12,
 };
@@ -320,7 +320,7 @@ pub const CapturedName = struct {
 ///     must NOT escape to the outer loop/fn)
 ///   - `loop*` body: REPLACE with new loop target
 ///   - all other positions: pass `null` (recur invalid here)
-pub const RecurTarget = struct {
+const RecurTarget = struct {
     entry_pc: u32,
     /// The slots `recur` rebinds, in argument order: a loop's
     /// bindings, or a fn's fixed params followed by its rest
@@ -530,7 +530,7 @@ pub const Compiled = struct {
 /// node from the `Tiny` pointer with `@fieldParentPtr`, so a tree
 /// compiled with spans must consist of these nodes only; hand-built
 /// `&Tiny{...}` trees compile without spans.
-pub const TinyNode = struct {
+const TinyNode = struct {
     span: ?reader_mod.SrcSpan = null,
     tiny: Tiny,
 };
@@ -1035,7 +1035,7 @@ fn transfersAway(inst: Inst) bool {
 /// Compile a `Tiny` tree built by hand: no namespace (every symbol
 /// must be lexical) and no span table. Source and Form callers use
 /// `compileSourceWith` / `compileFormWith`.
-pub fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
+fn compileTiny(allocator: std.mem.Allocator, form: *const Tiny) CompileError!Compiled {
     return emitRoutine(allocator, form, .{});
 }
 
@@ -1138,7 +1138,7 @@ const LowerCtx = struct {
 
 /// Where lowering failed, when it can say more precisely than
 /// "somewhere in this top-level form".
-pub const LowerDiag = struct {
+const LowerDiag = struct {
     span: ?reader_mod.SrcSpan = null,
     /// Why, when a routine limit was reached: the routine and the
     /// limit, on the compile allocator.
