@@ -1150,7 +1150,12 @@ test "destructuring: a map pattern after & takes keyword arguments" {
     try expectOutput("(do (defn kw [& {:keys [a]}] a) (kw :a 1))", "1");
     try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
     try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
-    try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+    // As Clojure 1.11's: one trailing argument is the map itself,
+    // whatever it is, and no arguments leave nil to destructure.
+    try expectOutput("[((fn [& {:keys [a]}] a) :a) ((fn [& {:as m}] m)) (try ((fn [& {:keys [a]}] a) :a 1 :b) (catch any e e))]", "[nil nil :invalid-argument]");
+    // #%kwargs itself: a non-seq is itself, a seq of one its element,
+    // the empty seq {}, a longer seq the map of its pairs.
+    try expectOutput("[(nexis.internal/#%kwargs '(:a)) (nexis.internal/#%kwargs [1 2]) (nexis.internal/#%kwargs nil) (nexis.internal/#%kwargs ()) (nexis.internal/#%kwargs {:a 1}) (nexis.internal/#%kwargs '(:a 1 :b 2))]", "[:a [1 2] nil {} {:a 1} {:a 1, :b 2}]");
 }
 
 test "destructuring: loop bindings destructure and recur rebinds them" {

@@ -5055,14 +5055,16 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(#%kwargs rest)` → the map a `& {...}` pattern destructures:
-/// `rest` as alternating keys and values, a single trailing map
-/// as itself, nil or empty as `{}`; an odd count is
-/// `:invalid-argument`.
+/// `(#%kwargs x)` → what a map pattern destructures, as Clojure 1.11
+/// makes it: a value that is not a seq (a map, a vector, nil) is
+/// itself; a seq of one element is that element (a trailing map), the
+/// empty seq `{}`, and a longer seq alternating keys and values the
+/// map of them, an odd count `:invalid-argument`.
 fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .list) return args[0];
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
-    if (items.items.len == 1 and isMap(items.items[0].kind())) return items.items[0];
+    if (items.items.len == 1) return items.items[0];
     if (items.items.len % 2 != 0) return VmError.InvalidArgument;
     const heap = vm.ensureHeap();
     var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
