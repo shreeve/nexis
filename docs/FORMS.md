@@ -222,6 +222,10 @@ pin them where they show: error carets and `nexis disasm` annotations.
   the error keyword, then ` :detail "..."` when the reader gives one,
   or `:parser-error ParseError` for input the grammar rejects, e.g.
   `:duplicate-literal-key :detail "(keyword :a)"`.
+- `src/golden.zig` prints either to stdout for one `.nx`, exiting 0
+  for a program that reads and 3 (the CLI's reader-error status) for
+  one the reader refuses; the build runs it once per file and checks
+  the status as well as the output.
 
 A golden diff is a reader regression. `zig build golden -Dupdate=true`
 rewrites the expected files; use it only for an intended change and

@@ -1,7 +1,7 @@
 //! nexis — build configuration.
 //!
 //! Steps:
-//!   zig build [install]               bin/nexis and bin/nexis-golden
+//!   zig build [install]               bin/nexis (`--prefix DIR`: DIR/bin/nexis)
 //!   zig build test                    the gate: unit, property, integration and
 //!                                     Nextomic corpora, goldens, test/nextomic
 //!                                     scripts, examples; analyzes the bench
@@ -13,6 +13,7 @@
 //!   zig build nextomic-nx             test/nextomic/*.nx through bin/nexis
 //!   zig build examples                every examples/*.nx through bin/nexis
 //!   zig build golden [-Dupdate=true]  reader and CLI goldens (byte-exact)
+//!   zig build nexis                   bin/nexis alone
 //!   zig build bench [-- ARGS]         the benchmark suite, optimized for speed
 //!   zig build run -- ARGS             build and run bin/nexis
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
@@ -86,7 +87,8 @@ pub fn build(b: *std.Build) void {
         parser_check_step.dependOn(&skip.step);
     }
 
-    const bins = binaries(b, target, optimize, nexis);
+    const suites = listSuites(b);
+    const bins = binaries(b, target, optimize, nexis, suites);
 
     // Every inline `test` block of the runtime, in one binary.
     // Every test binary runs from the build root, so the stores its
@@ -118,14 +120,16 @@ pub fn build(b: *std.Build) void {
         if (suite.nextomic) nextomic_test_step.dependOn(&run.step);
     }
 
-    // bin/nexis, the CLI.
+    // bin/nexis, the CLI. `run` and `bench` are never cached (they
+    // take the arguments after `--`), so they keep the caller's
+    // environment: NEXIS_MAX_ALLOC and the like reach the program.
     const nexis_exe = bins.nexis;
-    const checkout_nexis = toCheckout(b, nexis_exe, "bin/nexis");
-    b.getInstallStep().dependOn(checkout_nexis);
-    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(checkout_nexis);
+    const install_nexis = install(b, nexis_exe);
+    b.getInstallStep().dependOn(install_nexis);
+    b.step("nexis", "Build bin/nexis (the CLI runner)").dependOn(install_nexis);
     const run_nexis = b.addRunArtifact(nexis_exe);
     run_nexis.addPassthruArgs();
-    run_nexis.step.dependOn(checkout_nexis);
+    run_nexis.step.dependOn(install_nexis);
     b.step("run", "Build and run nexis (forwards args after `--`)").dependOn(&run_nexis.step);
 
     // The benchmark runner. Its runtime is optimized too, so the numbers
@@ -134,7 +138,7 @@ pub fn build(b: *std.Build) void {
     const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize));
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.addPassthruArgs();
-    run_bench.step.dependOn(toCheckout(b, bench_exe, "bin/nexis-bench"));
+    run_bench.step.dependOn(install(b, bench_exe));
     b.step("bench", "Run the benchmark suite (optimized for speed)").dependOn(&run_bench.step);
     // The gate analyzes the suite against the Debug runtime without
     // generating code or running it, so an API change cannot leave the
@@ -147,11 +151,12 @@ pub fn build(b: *std.Build) void {
     const check_targets_step = b.step("check-targets", "Compile and link every binary and test binary for Linux (x86_64 and aarch64, glibc and musl)");
     for (linux_targets) |t| {
         const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
-        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize));
-        for ([_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit } ++ cross_bins.suites) |compile| {
+        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize), suites);
+        const named = [_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit };
+        for ([_][]const *std.Build.Step.Compile{ &named, cross_bins.suites }) |set| for (set) |compile| {
             _ = compile.getEmittedBin();
             check_targets_step.dependOn(&compile.step);
-        }
+        };
     }
 
     // -------------------------------------------------------------------------
@@ -206,27 +211,30 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(examples_step);
 
-    // Goldens: the reader's Form output (src/golden.zig) and the CLI.
-    const golden_exe = bins.golden;
-    b.getInstallStep().dependOn(toCheckout(b, golden_exe, "bin/nexis-golden"));
-
+    // Reader goldens (src/golden.zig, docs/FORMS.md §5): each
+    // test/golden/<name>.nx reads, its Form program pinned to
+    // <name>.sexp; each test/golden/errors/<name>.nx is refused with
+    // status 3, the refusal pinned to <name>.err.
     const golden_step = b.step("golden", "Run the reader and CLI goldens");
     test_step.dependOn(golden_step);
-    const run_golden = b.addRunArtifact(golden_exe);
-    run_golden.addArg(if (update) "--update" else "--verify");
-    run_golden.addArg("test/golden");
-    run_golden.setCwd(b.path("."));
-    if (update) run_golden.has_side_effects = true else run_golden.expectExitCode(0);
-    for (listFiles(b, "test/golden", false)) |path| run_golden.addFileInput(b.path(path));
-    for (listFiles(b, "test/golden/errors", false)) |path| run_golden.addFileInput(b.path(path));
-    golden_step.dependOn(&run_golden.step);
+    for ([_]struct { dir: []const u8, ext: []const u8, status: u8 }{
+        .{ .dir = "test/golden", .ext = ".sexp", .status = 0 },
+        .{ .dir = "test/golden/errors", .ext = ".err", .status = 3 },
+    }) |set| for (listStems(b, set.dir, ".nx")) |name| {
+        const run = b.addRunArtifact(bins.golden);
+        env.apply(run, false);
+        run.addFileArg2(b.path(b.fmt("{s}/{s}.nx", .{ set.dir, name })), .{ .make_absolute = true });
+        run.expectExitCode(set.status);
+        scripts.pin(golden_step, run, b.fmt("{s}/{s}{s}", .{ set.dir, name, set.ext }), .stdout);
+    };
 
     // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
     // runtime error's stderr (exit 5), a reader error's stderr (exit
     // 3), a compile error's (exit 4), a disassembly, scripts' stdout
     // (with arguments, from stdin, an explicit exit status), `nexis
-    // test`, a REPL session and the usage errors. Each runs from the build root, so the paths in
-    // the output are the relative ones committed.
+    // test`, a REPL session and the usage errors. Each runs from the
+    // build root, so the paths in the output are the relative ones
+    // committed.
     {
         const CliGolden = struct {
             args: []const []const u8,
@@ -297,13 +305,9 @@ const Scripts = struct {
     update: bool,
     env: RunEnv,
 
-    /// A run of bin/nexis with an environment of its own: empty but
-    /// for what `env` sets, with `NEXIS_GC_STRESS` when `stress`.
-    /// Nothing else in the caller's environment reaches the program
-    /// or its cache key.
+    /// A run of bin/nexis, with `NEXIS_GC_STRESS` when `stress`.
     fn program(self: Scripts, stress: bool) *std.Build.Step.Run {
         const r = self.b.addRunArtifact(self.exe);
-        r.clearEnvironment();
         self.env.apply(r, stress);
         return r;
     }
@@ -322,7 +326,7 @@ const Scripts = struct {
         for (programs) |p| {
             const r = self.program(stress);
             r.addArg("run");
-            r.addFileArg2(self.b.path(p.script), .{});
+            r.addFileArg2(self.b.path(p.script), .{ .make_absolute = true });
             r.setCwd(cwd);
             for (inputs) |input| r.addFileInput(self.b.path(input));
             r.has_side_effects = programs.len > 1;
@@ -346,8 +350,8 @@ const Scripts = struct {
     }
 
     /// Make `step` compare `r`'s `stream` with the file at `path`, or
-    /// rewrite the file. A missing file fails the step, not the
-    /// configure.
+    /// rewrite the file. The run reads the file when it runs, so a
+    /// missing or different file fails that run alone.
     fn pin(self: Scripts, step: *std.Build.Step, r: *std.Build.Step.Run, path: []const u8, stream: enum { stdout, stderr }) void {
         const b = self.b;
         if (self.update) {
@@ -361,23 +365,21 @@ const Scripts = struct {
             return;
         }
         step.dependOn(&r.step);
-        b.dependOnFileContents(b.path(path));
-        const expected = readSource(b, path, 1 << 20) catch |err| {
-            r.step.dependOn(&b.addFail(b.fmt("{s}: {t} (write it with -Dupdate=true)", .{ path, err })).step);
-            return;
-        };
-        switch (stream) {
-            .stdout => r.expectStdOutEqual(expected),
-            .stderr => r.expectStdErrEqual(expected),
-        }
+        if (!exists(b, path)) r.step.dependOn(&b.addFail(b.fmt("{s} is missing: write it with -Dupdate=true", .{path})).step);
+        r.addCheck(switch (stream) {
+            .stdout => .{ .expect_stdout_snapshot = b.path(path) },
+            .stderr => .{ .expect_stderr_snapshot = b.path(path) },
+        });
     }
 };
 
-/// The runtime environment the build gives the tests and programs it
-/// runs, from its options. The build reads nothing from its own
-/// environment: a variable set on a step is part of the step's cache
-/// key, so a stressed or durable run never replays a normal run's
-/// result.
+/// The environment of every cached run of a binary the build makes,
+/// from its options. The build reads nothing from its own
+/// environment, and none of the caller's reaches a run: the runtime
+/// reads its variables with `getenv`, and an inherited variable is not
+/// part of a run's cache key, so a run would replay a result made
+/// under another setting. A variable set on a run is part of its key,
+/// so a stressed or durable run never replays a normal run's result.
 const RunEnv = struct {
     /// `NEXIS_GC_STRESS`: a collection every few kilobytes (docs/GC.md §7).
     gc_stress: bool,
@@ -387,32 +389,40 @@ const RunEnv = struct {
 
     const Durability = enum { commit, durable };
 
-    /// Set the variables on `run`, `NEXIS_GC_STRESS` when `stress`.
+    /// Give `run` an empty environment, then the variables,
+    /// `NEXIS_GC_STRESS` when `stress`.
     fn apply(env: RunEnv, run: *std.Build.Step.Run, stress: bool) void {
+        run.clearEnvironment();
         if (stress) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
         if (env.durability) |d| run.setEnvironmentVariable("NEXIS_DURABILITY", @tagName(d));
     }
 };
 
-/// A step that copies `exe` to `sub_path` in the checkout, where every
-/// binary the build makes is installed; nothing goes to the prefix.
-fn toCheckout(b: *std.Build, exe: *std.Build.Step.Compile, sub_path: []const u8) *std.Build.Step {
-    const copy = b.addUpdateSourceFiles();
-    copy.addCopyFileToSource(exe.getEmittedBin(), sub_path);
+/// A step that installs `exe` as `bin/<name>` in the checkout when
+/// the install prefix is the default (`zig-out`), where the docs, the
+/// examples and CI run it, and as `<prefix>/bin/<name>` when
+/// `--prefix` names another, leaving the checkout's binary alone.
+/// `build()` cannot see the prefix, so the step compares it when it
+/// runs. The new binary replaces the old by rename, never by a write
+/// into a file a running process may have mapped.
+fn install(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
+    const script =
+        \\dest=$1; [ "$dest" = "$2" ] && dest=$3
+        \\mkdir -p "$dest" || exit 1
+        \\cmp -s "$4" "$dest/$5" || { cp "$4" "$dest/.$5.new" && mv -f "$dest/.$5.new" "$dest/$5"; }
+    ;
+    const copy = b.addSystemCommand(&.{ "sh", "-c", script, "install" });
+    copy.addDirectoryArg2(.{ .relative = .{ .base = .install_bin } }, .{ .make_absolute = true });
+    copy.addArgs(&.{ b.pathJoin(&.{ rootPath(b), "zig-out", "bin" }), b.pathJoin(&.{ rootPath(b), "bin" }) });
+    copy.addArtifactArg(exe);
+    copy.addArg(exe.name);
+    copy.has_side_effects = true;
     return &copy.step;
 }
 
 /// The build root as a path string.
 fn rootPath(b: *std.Build) []const u8 {
     return b.fmt("{f}", .{b.root});
-}
-
-/// The contents of the file at `path`, relative to the build root.
-fn readSource(b: *std.Build, path: []const u8, limit: usize) ![]u8 {
-    const io = b.graph.io;
-    var root = try b.root.openDir(io, ".", .{});
-    defer root.close(io);
-    return root.readFileAlloc(io, path, b.allocator, .limited(limit));
 }
 
 /// The names under `dir` (relative to the build root) ending in `ext`,
@@ -463,34 +473,31 @@ fn exists(b: *std.Build, path: []const u8) bool {
     return true;
 }
 
-/// The property and integration test files, each its own binary.
-const Suite = struct { path: []const u8, quick: bool = false, nextomic: bool = false };
-const suites = [_]Suite{
-    .{ .path = "test/prop/primitive.zig" },
-    .{ .path = "test/prop/intern.zig" },
-    .{ .path = "test/prop/heap.zig" },
-    .{ .path = "test/prop/string.zig" },
-    .{ .path = "test/prop/list.zig" },
-    .{ .path = "test/prop/bignum.zig" },
-    .{ .path = "test/prop/vector.zig" },
-    .{ .path = "test/prop/champ.zig" },
-    .{ .path = "test/prop/sorted.zig" },
-    .{ .path = "test/prop/gc.zig" },
-    .{ .path = "test/prop/transient.zig" },
-    .{ .path = "test/prop/codec.zig" },
-    .{ .path = "test/prop/typed_vector.zig" },
-    .{ .path = "test/prop/db.zig" },
-    .{ .path = "test/prop/compile.zig", .quick = true },
-    .{ .path = "test/prop/nextomic_key.zig", .quick = true, .nextomic = true },
-    .{ .path = "test/prop/nextomic_tx.zig", .quick = true, .nextomic = true },
-    .{ .path = "test/integration/eval_pipeline.zig", .quick = true },
-    .{ .path = "test/integration/runtime_polish.zig", .quick = true },
-    .{ .path = "test/integration/numbers.zig", .quick = true },
-    .{ .path = "test/integration/nextomic_q.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_pull.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_fn.zig", .nextomic = true },
-    .{ .path = "test/integration/nextomic_entity.zig", .nextomic = true },
-};
+/// A property or integration test file, its own binary.
+const Suite = struct { path: []const u8, quick: bool, nextomic: bool };
+
+/// The suites `zig build quick` runs besides `unit`.
+const quick_suites = [_][]const u8{ "compile", "nextomic_key", "nextomic_tx", "eval_pipeline", "runtime_polish", "numbers" };
+
+/// Every `.zig` file in test/prop and test/integration but the
+/// fixtures the suites import (`_fx.zig`), so a new suite runs without
+/// a line here. The Nextomic suites (`nextomic_*`) also run under
+/// `nextomic-test`.
+fn listSuites(b: *std.Build) []const Suite {
+    var list: std.ArrayList(Suite) = .empty;
+    for ([_][]const u8{ "test/prop", "test/integration" }) |dir| for (listFiles(b, dir, false)) |path| {
+        if (!std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, "_fx.zig")) continue;
+        const name = std.Io.Dir.path.stem(path);
+        list.append(b.allocator, .{
+            .path = path,
+            .quick = for (quick_suites) |q| {
+                if (std.mem.eql(u8, q, name)) break true;
+            } else false,
+            .nextomic = std.mem.startsWith(u8, name, "nextomic_"),
+        }) catch @panic("OOM");
+    };
+    return list.items;
+}
 
 /// The targets `check-targets` compiles for: Linux on both
 /// architectures, glibc and musl (the static binary). x86_64 is
@@ -511,20 +518,21 @@ const Binaries = struct {
     /// mode: the gate's check that it compiles.
     bench: *std.Build.Step.Compile,
     unit: *std.Build.Step.Compile,
-    suites: [suites.len]*std.Build.Step.Compile,
+    /// One per `suites` entry, in order.
+    suites: []*std.Build.Step.Compile,
 };
 
 /// Every binary the build compiles for `target`, over the runtime
 /// module `nexis`.
-fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) Binaries {
+fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module, suites: []const Suite) Binaries {
     const harness = b.createModule(.{
         .root_source_file = b.path("test/harness.zig"),
         .target = target,
         .optimize = optimize,
     });
     harness.addImport("nexis", nexis);
-    var suite_bins: [suites.len]*std.Build.Step.Compile = undefined;
-    for (suites, &suite_bins) |suite, *bin| {
+    const suite_bins = b.allocator.alloc(*std.Build.Step.Compile, suites.len) catch @panic("OOM");
+    for (suites, suite_bins) |suite, *bin| {
         const module = b.createModule(.{
             .root_source_file = b.path(suite.path),
             .target = target,
@@ -633,7 +641,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
     while (walker.next(io) catch |err| return b.fmt("layering: walking src/: {t}", .{err})) |entry| {
         if (entry.kind == .directory) b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ "src", entry.path })));
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".zig")) continue;
-        const file = b.dupe(entry.path);
+        const file = b.graph.dupeString(entry.path);
         if (std.mem.eql(u8, file, "root.zig")) continue;
         const from = layerUnit(file);
         const from_rank = rank.get(from) orelse if (isExecutableRoot(file))
@@ -647,7 +655,7 @@ fn checkLayering(b: *std.Build) ?[]const u8 {
         for (importPaths(gpa, text)) |rel| {
             if (!std.mem.endsWith(u8, rel, ".zig")) continue;
             const dir = std.Io.Dir.path.dirnamePosix(file) orelse "";
-            const target = std.Io.Dir.path.resolvePosix(gpa, &.{ dir, rel }) catch @panic("OOM");
+            const target = std.Io.Dir.path.resolveAllocPosix(gpa, &.{ dir, rel }) catch @panic("OOM");
             const to = layerUnit(target);
             if (std.mem.eql(u8, to, from)) continue;
             if (std.mem.eql(u8, to, "nextomic/root.zig") and !std.mem.eql(u8, from, "stdlib.zig"))
