@@ -3085,9 +3085,8 @@ fn ioOf(vm: *VM) std.Io {
 /// creates only the file). `d` is `:commit` or `:durable`; without it
 /// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const path = try pathArg(args[0]);
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
-    const path = string_mod.asBytes(args[0]);
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     const host = vm.home();

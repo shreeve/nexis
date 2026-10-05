@@ -188,6 +188,7 @@ pub const StoreFile = struct {
                 }
             }
         }
+        try checkLockFile(allocator, canonical);
         const self = try allocator.create(StoreFile);
         errdefer allocator.destroy(self);
         self.env = emdb.Env.open(canonical.ptr, options) catch |err| switch (err) {
@@ -350,6 +351,24 @@ pub const StoreFile = struct {
     }
 };
 
+/// emdb opens `<path>-lock` for writing, creating it, through any
+/// symlink, and sizes and overwrites it: a symlink planted there, or a
+/// device or pipe, would have the reader table written over whatever
+/// it names. Refused as `OpenFailed`. A link planted after this check
+/// is still followed, so a store belongs in a directory only its owner
+/// writes (DB.md §3.1).
+fn checkLockFile(allocator: std.mem.Allocator, canonical: [:0]const u8) !void {
+    const lock = try std.fmt.allocPrintSentinel(allocator, "{s}-lock", .{canonical}, 0);
+    defer allocator.free(lock);
+    if (isSymlink(lock)) return error.OpenFailed;
+    if (FileId.of(std.c.AT.FDCWD, lock.ptr)) |id| if (!id.regular) return error.OpenFailed;
+}
+
+fn isSymlink(path: [*:0]const u8) bool {
+    var buf: [1]u8 = undefined;
+    return std.c.readlink(path, &buf, buf.len) >= 0;
+}
+
 /// The device and inode that name a file whatever path reaches it.
 const FileId = struct {
     dev: u64,
@@ -357,6 +376,7 @@ const FileId = struct {
     /// A regular file with a second name (`StoreFile`). A directory's
     /// links are its entries; emdb refuses it as a store.
     hard_linked: bool,
+    regular: bool,
 
     /// The file at `path` relative to the directory `fd`, or the file
     /// open as `fd` when `path` is empty; null when it cannot be
@@ -373,6 +393,7 @@ const FileId = struct {
                 .dev = @as(u64, sx.dev_major) << 32 | sx.dev_minor,
                 .ino = sx.ino,
                 .hard_linked = linux.S.ISREG(sx.mode) and sx.nlink > 1,
+                .regular = linux.S.ISREG(sx.mode),
             };
         }
         var st: std.c.Stat = undefined;
@@ -382,15 +403,26 @@ const FileId = struct {
             .dev = @bitCast(@as(i64, st.dev)),
             .ino = st.ino,
             .hard_linked = std.c.S.ISREG(st.mode) and st.nlink > 1,
+            .regular = std.c.S.ISREG(st.mode),
         };
     }
 };
 
 /// The absolute path of `path` with every symlink resolved; for a file
-/// not yet created, its resolved directory joined with its name.
+/// not yet created, its resolved directory joined with its name. A
+/// symlink to no file has the file it names created first: emdb would
+/// create it through the link, and name the lock file after the link,
+/// where every later opener of the target names it after the target.
 fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.c.realpath(path, &buf)) |resolved| return allocator.dupeSentinel(u8, std.mem.sliceTo(resolved, 0), 0);
+    if (isSymlink(path)) {
+        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(c_uint, 0o644));
+        if (fd < 0) return error.OpenFailed;
+        _ = std.c.close(fd);
+        const resolved = std.c.realpath(path, &buf) orelse return error.OpenFailed;
+        return allocator.dupeSentinel(u8, std.mem.sliceTo(resolved, 0), 0);
+    }
     const slice = std.mem.sliceTo(path, 0);
     const dir_z = try allocator.dupeSentinel(u8, std.Io.Dir.path.dirname(slice) orelse ".", 0);
     defer allocator.free(dir_z);
@@ -1452,6 +1484,57 @@ test "open: a store file with a second hard link is refused under either name" {
     try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
     var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&b);
+}
+
+test "open: a symlink to no file creates the file it names, and the lock file is named after that file" {
+    const path = try tmpDbPath(testing.allocator, "target");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const link = try testing.allocator.printSentinel("{s}/dangling.emdb", .{std.Io.Dir.path.dirname(path).?}, 0);
+    defer testing.allocator.free(link);
+    try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(path), link, .{});
+
+    var a = try open(testing.allocator, &heap, &interner, link.ptr, .{ .allocator = testing.allocator });
+    const sid = a.storeId();
+    var w = try beginWrite(&a);
+    try put(&w, "t", "k", value.fromFixnum(1).?);
+    try commit(&w);
+    try close(&a);
+    const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
+    defer testing.allocator.free(link_lock);
+    try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
+    var b = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&b);
+    try testing.expectEqual(sid, b.storeId());
+}
+
+test "open: a symlink or a non-regular file where the lock file goes is refused, and what it names is left alone" {
+    const path = try tmpDbPath(testing.allocator, "planted");
+    defer testing.allocator.free(path);
+    defer cleanupDb(path);
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var interner = Interner.init(testing.allocator);
+    defer interner.deinit();
+    const dir = std.Io.Dir.path.dirname(path).?;
+    const victim = try testing.allocator.printSentinel("{s}/victim.txt", .{dir}, 0);
+    defer testing.allocator.free(victim);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = victim, .data = "precious\n" });
+    const lock = try testing.allocator.printSentinel("{s}-lock", .{path}, 0);
+    defer testing.allocator.free(lock);
+    try std.Io.Dir.cwd().symLink(testing.io, "victim.txt", lock, .{});
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
+    const kept = try std.Io.Dir.cwd().readFileAlloc(testing.io, victim, testing.allocator, .unlimited);
+    defer testing.allocator.free(kept);
+    try testing.expectEqualStrings("precious\n", kept);
+
+    try testing.expectEqual(@as(c_int, 0), std.c.unlink(lock.ptr));
+    try std.Io.Dir.cwd().createDir(testing.io, lock, .default_dir);
+    try testing.expectError(error.OpenFailed, open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator }));
 }
 
 test "open: a file this process may only read opens read-only; a write is TxnReadOnly" {

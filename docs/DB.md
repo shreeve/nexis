@@ -31,7 +31,9 @@ emdb's meta page carries no file id, so `store_id: u128` comes from
 the file's path. `open` resolves the canonical path before emdb opens
 the file: the `realpath` of an existing file, and for a new file the
 `realpath` of its directory joined with its name (a directory that
-does not resolve is `:db/open-failed`). emdb opens the file at that
+does not resolve is `:db/open-failed`). A symlink that names no file
+has that file created first, empty, as emdb would create it through
+the link, so its lock file is named after the file and not the link. emdb opens the file at that
 path, so every spelling of it takes the same lock file. The id is
 computed over the canonical path of the file's `StoreFile` (§3.1), so
 every connection sharing the file shares it. The low
@@ -45,6 +47,10 @@ is stable for an unmoved file and changes when the file is renamed or
 moved; two files with equal contents at different paths are different
 stores. `storeId()` is the accessor; nothing else depends on the
 derivation.
+
+**The path.** A string, not empty, with no NUL byte, else
+`:invalid-path`, as for `slurp` and `spit`: the open would stop at the
+NUL and name a shorter path than the program checked.
 
 **Parent directories.** emdb creates only the file. `(db/open path)`
 creates the missing parent directories first, with the VM's `std.Io`
@@ -156,7 +162,18 @@ options and allocator, which outlive every connection to the file:
 `db/open` and Nextomic's `connect` both pass the VM's allocator, which
 outlives every connection the VM makes. A file the process may read
 but not write opens read-only, and every write on it is
-`:db/read-only`.
+`:db/read-only`; emdb still opens or creates its lock file, so that
+takes a lock file that exists or a directory the process may write
+(otherwise `:db/open-failed`).
+
+**The lock file.** emdb opens `<path>-lock` for writing through any
+symlink, then sizes and overwrites it. Before the first open of a file
+in the process, `acquire` refuses a lock path that is a symlink or
+anything but a regular file (`:db/open-failed`), so a link planted
+there cannot have the reader table written over the file it names. A
+link planted between that check and emdb's open is still followed: a
+store belongs in a directory that only its owner may write, not in a
+shared one such as `/tmp`.
 
 #### 3.2 Transaction handles
 
@@ -495,7 +512,7 @@ and any operation on a closed connection or through a ref of one is
 
 | Form | Arity | Result |
 |---|---|---|
-| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
+| `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. An empty path or one with a NUL byte is `:invalid-path` (§2). A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
 | `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3); closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
 | `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3). |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |

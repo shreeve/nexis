@@ -2989,6 +2989,15 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
+test "db/open refuses a path with a NUL byte, or an empty one, as spit does" {
+    // The open would stop at the NUL and name a shorter path than the
+    // program checked (DB.md §2).
+    try expectOutputProgramWithStore("seam-path",
+        \\[(try (db/open "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (db/open "") (catch any e e))]
+    , "[:invalid-path :invalid-path]");
+}
+
 test "a value nested 100 000 deep is stored and read back through a durable ref" {
     // CODEC.md §2.7: the codec bounds no nesting depth.
     try expectOutputProgramWithStore("seam-deep",
