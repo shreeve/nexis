@@ -685,8 +685,10 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
 /// matches a thrown value equal to TAG or a map whose `:error` entry
 /// is TAG (the shape of Nextomic's error maps and the
 /// no-matching-clause map), or, for code written for Clojure, a
-/// class name (`Exception`, `Throwable`, any symbol) or `:default`,
-/// which match every value as `any` does: nexis has no classes.
+/// class name or `:default`: a class that names a nexis error
+/// (`ArithmeticException`, `catchTags`) matches those error tags, and
+/// any other (`Exception`, `Throwable`) every value, as `any` does:
+/// nexis has no classes.
 /// Clauses are tried in order; a value no clause matches is
 /// rethrown, so it unwinds through the `finally` to the enclosing
 /// `try`. With no clause at all the handler is the rethrow, which
@@ -722,15 +724,21 @@ fn expandTry(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) 
         defer scope.close();
         try scope.bind(binding.datum.symbol.name);
         const clause_body = try b.list(.{ "let*", try b.vec(.{ binding, g }), try expandAll(ctx, clause[3..]) });
-        const is_any = matcher.datum == .symbol or
-            (matcher.datum == .keyword and matcher.datum.keyword.ns == null and std.mem.eql(u8, matcher.datum.keyword.name, "default"));
-        if (is_any) {
-            handler = clause_body;
-        } else if (matcher.datum == .keyword) {
-            handler = try b.list(.{ "if", try b.list(.{ "nexis.internal/#%catch-matches?", g, matcher }), clause_body, handler });
-        } else {
-            return ctx.fail(matcher.origin, "catch: expected any, a class name or a keyword tag, not {s}", .{describeForm(matcher)});
-        }
+        const test_form = switch (matcher.datum) {
+            .keyword => |kw| if (kw.ns == null and std.mem.eql(u8, kw.name, "default")) null else try catchTest(b, g, matcher),
+            // `(if (#%catch-matches? g t1) true ... (#%catch-matches? g tn))`
+            .symbol => |sym| if ((if (sym.ns == null) catchTags(sym.name) else null)) |tags| blk: {
+                var chain = try catchTest(b, g, try b.kw(tags[tags.len - 1]));
+                var t = tags.len - 1;
+                while (t > 0) {
+                    t -= 1;
+                    chain = try b.list(.{ "if", try catchTest(b, g, try b.kw(tags[t])), true, chain });
+                }
+                break :blk chain;
+            } else null,
+            else => return ctx.fail(matcher.origin, "catch: expected any, a class name or a keyword tag, not {s}", .{describeForm(matcher)}),
+        };
+        handler = if (test_form) |tf| try b.list(.{ "if", tf, clause_body, handler }) else clause_body;
     }
     const catch_form = try b.list(.{ "catch", "any", g, handler });
     if (finally_form) |ff| {
@@ -738,6 +746,33 @@ fn expandTry(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) 
         return b.list(.{ items[0], new_body, catch_form, try makeList(ctx, try b.items(.{ fin[0], try expandAll(ctx, fin[1..]) }), ff.origin) });
     }
     return b.list(.{ items[0], new_body, catch_form });
+}
+
+/// `(nexis.internal/#%catch-matches? g tag)`.
+fn catchTest(b: Builder, g: *Form, tag: *const Form) ExpandError!*Form {
+    return b.list(.{ "nexis.internal/#%catch-matches?", g, tag });
+}
+
+/// The error tags a Clojure exception class stands for, so a clause
+/// written for Clojure takes the nexis errors that class names (an
+/// arithmetic error is `:divide-by-zero`); null for any other class,
+/// which takes every value.
+fn catchTags(name: []const u8) ?[]const []const u8 {
+    const classes = std.StaticStringMap([]const []const u8).initComptime(.{
+        .{ "ArithmeticException", &[_][]const u8{"divide-by-zero"} },
+        .{ "IndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
+        .{ "ArrayIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
+        .{ "StringIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
+        .{ "ClassCastException", &[_][]const u8{"kind-mismatch"} },
+        .{ "IllegalArgumentException", &[_][]const u8{ "invalid-argument", "no-matching-clause", "arity-mismatch" } },
+        .{ "ArityException", &[_][]const u8{"arity-mismatch"} },
+        .{ "AssertionError", &[_][]const u8{"assertion-failed"} },
+        .{ "StackOverflowError", &[_][]const u8{"stack-overflow"} },
+    });
+    for ([_][]const u8{ "java.lang.", "clojure.lang." }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return classes.get(name[prefix.len..]);
+    }
+    return classes.get(name);
 }
 
 /// The `(fn* [%1 ...] (body...))` form a `#(body...)` literal

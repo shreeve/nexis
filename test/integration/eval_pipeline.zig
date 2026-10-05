@@ -698,6 +698,16 @@ test "try: a class-name matcher or :default catches anything, as Exception would
     try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
 }
 
+test "try: a class that names a nexis error catches that error alone, as in Clojure" {
+    try expectOutput("(try (throw (ex-info \"x\" {})) (catch IllegalArgumentException e :iae) (catch Exception e :ex))", ":ex");
+    try expectOutput("(try (inc nil) (catch ArithmeticException e :ae) (catch ClassCastException e :cce))", ":cce");
+    try expectOutput("(try (nth [1] 5) (catch java.lang.IndexOutOfBoundsException e :oob))", ":oob");
+    try expectOutput("(try ((fn [x] x)) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
+    try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
+}
+
 test "fn: a :pre/:post condition map checks arguments and the result" {
     try expectOutput("((fn [x] {:pre [(pos? x)]} (* 2 x)) 3)", "6");
     try expectOutput("(try ((fn [x] {:pre [(pos? x) (< x 10)]} x) -1) (catch :assertion-failed e (:message e)))", "Assert failed: (pos? x)");
