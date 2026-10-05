@@ -1856,9 +1856,7 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = 1 << 16;
-    program.v.gc_growth_percent = 0;
-    program.v.gc_next_at = 1 << 16;
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
     // reduce calls the conj native for every element with no
     // closure frame in between; each persistent set conj leaves the
     // replaced path behind as garbage.
@@ -3230,9 +3228,7 @@ fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: [
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = policy.threshold;
-    program.v.gc_growth_percent = policy.growth_percent;
-    program.v.gc_next_at = policy.threshold;
+    program.v.setGcPolicy(policy);
     var last = value_mod.nilValue();
     for (steps) |step| {
         const src = try store.source(step);
@@ -5936,9 +5932,7 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = vm.GcPolicy.stress.threshold;
-    program.v.gc_growth_percent = vm.GcPolicy.stress.growth_percent;
-    program.v.gc_next_at = vm.GcPolicy.stress.threshold;
+    program.v.setGcPolicy(.stress);
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
 
