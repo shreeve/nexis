@@ -1897,6 +1897,22 @@ test "gc: a native that calls a leaf native collects once a cycle is due" {
     try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
 }
 
+test "gc: a product of many integers in one call keeps no partial product" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def xs (vec (range 1 3000))) (def p (reduce * xs))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    // One call of `*`, a leaf no collection runs inside: the partial
+    // products would sum to about 6 MB.
+    try harness.expectResult(&program, "", try program.run("(= (apply * xs) p)"), "true");
+    try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+    try harness.expectResult(&program, "", try program.run("[(apply * 1 2 3 (range 4 30)) (* 4611686018427387904 2 3.0) (* 2 4611686018427387904 -1) (try (* 4611686018427387904 2 :x) (catch any e e))]"), "[8841761993739701954543616000000 2.7670116110564327E19 -9223372036854775808 :kind-mismatch]");
+}
+
 test "integration: a sequence native walks a view from its offset, and a cons over one" {
     try expectOutputProgram(
         \\(let [v (map inc (range 100))]

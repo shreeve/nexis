@@ -89,6 +89,7 @@ is canonical (§1).
 | `isInteger(v)` | fixnum or bignum |
 | `view(v, scratch)` | the integer as a `std.math.big.int.Const` in place; `scratch` backs a fixnum's one limb |
 | `add`, `sub`, `mul` | exact |
+| `product(heap, first, rest)` | `first` times every integer of `rest`, exact; the partial products stay in scratch buffers (§8) |
 | `quot`, `rem`, `mod` | §8 |
 | `quotExact(heap, a, b)` | the quotient when the division is exact, null otherwise |
 | `quotientF64(heap, a, b)` | `a / b` as the nearest double, ties to even, for operands of any size (§8) |
@@ -144,7 +145,12 @@ cell. A result is computed into a scratch buffer (on the stack up to 64
 limbs, from the heap's backing allocator beyond) and copied onto the
 heap once through the canonicalizer, so `(- (+ a b) b)` is a fixnum
 again whenever `a` was, and a zero result is `fixnum(0)` whatever the
-operands' signs.
+operands' signs. `product` multiplies a run of integers in two scratch
+buffers that take turns as the running product, so only the result
+reaches the heap: `*` over many integers is one native call, inside
+which nothing is collected, and a fold through `mul` would leave every
+partial product there. `*` hands it the rest of its arguments once its
+product is a bignum and every argument left is an integer.
 
 The semantics match Clojure's `Numbers` for BigInt:
 

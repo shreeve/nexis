@@ -275,6 +275,38 @@ pub fn mul(heap: *Heap, a: Value, b: Value) !Value {
     return fromMutable(heap, r);
 }
 
+/// `first` times every integer of `rest`, the running product kept in
+/// two scratch buffers that take turns: only the result reaches the
+/// heap. A fold through `mul` would leave every partial product there,
+/// and a native's garbage is not collected before it returns (VM.md
+/// §9).
+pub fn product(heap: *Heap, first: Value, rest: []const Value) !Value {
+    const alloc = heap.backing;
+    var sa: [1]Limb = undefined;
+    const a = view(first, &sa);
+    var cur = try alloc.dupe(Limb, a.limbs);
+    defer alloc.free(cur);
+    var spare: []Limb = &.{};
+    defer alloc.free(spare);
+    var acc: bigint.Mutable = .{ .limbs = cur, .len = a.limbs.len, .positive = a.positive };
+    for (rest) |x| {
+        var sx: [1]Limb = undefined;
+        const y = view(x, &sx);
+        const need = acc.len + y.limbs.len;
+        if (spare.len < need) {
+            alloc.free(spare);
+            spare = &.{};
+            spare = try alloc.alloc(Limb, need + need / 2);
+        }
+        var r = mutable(spare);
+        r.mulNoAlias(acc.toConst(), y, alloc);
+        spare = cur;
+        cur = r.limbs;
+        acc = r;
+    }
+    return fromMutable(heap, acc);
+}
+
 const DivPart = enum { quotient, remainder, exact_quotient };
 const Rounding = enum { truncated, floored };
 

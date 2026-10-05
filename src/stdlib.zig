@@ -845,7 +845,19 @@ fn fnSub(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnMul(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(1).?;
-    return foldNumbers(vm, &vm_mod.numMul, args);
+    // From the last argument that is not an integer on, the product is
+    // exact in any order: once it is a bignum, `bignum.product` makes
+    // the rest off the heap, where a fold would leave every partial
+    // product.
+    var ints = args.len;
+    while (ints > 0 and vm_mod.isInteger(args[ints - 1])) ints -= 1;
+    const heap = vm.ensureHeap();
+    var acc = try requireNumber(args[0]);
+    for (args[1..], 1..) |x, i| {
+        if (i >= ints and acc.kind() == .bignum) return bignum_mod.product(heap, acc, args[i..]) catch VmError.OutOfMemory;
+        acc = try vm_mod.numMul(heap, acc, x);
+    }
+    return acc;
 }
 
 fn fnDiv(vm: *VM, args: []const Value) VmError!Value {
