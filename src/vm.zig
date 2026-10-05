@@ -5023,16 +5023,7 @@ pub const asm_ = struct {
 
 const testing = std.testing;
 
-/// `s` repeated `n` times, for building long test strings.
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    return comptime blk: {
-        @setEvalBranchQuota(2 * n + 1000);
-        var buf: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-        const final = buf;
-        break :blk &final;
-    };
-}
+const repeat = @import("string.zig").repeat;
 
 test "Inst size: exactly 64 bits packed" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Inst));

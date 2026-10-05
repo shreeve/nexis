@@ -229,7 +229,7 @@ const class_info: [class_count]ClassInfo = blk: {
             .size = size,
             .slots = @intCast(slots),
             .first = @intCast(std.mem.alignForward(usize, slab_header_bytes + 2 * slots, 16)),
-            .recip = ((@as(u64, 1) << 32) + size - 1) / size,
+            .recip = @divCeil(@as(u64, 1) << 32, size),
         };
     }
     break :blk infos;

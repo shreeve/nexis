@@ -84,13 +84,15 @@ boundaries.
 
 The code-point helpers are what the language's indexing is built on:
 a string indexes by Unicode scalar, not by byte and not by grapheme
-cluster. `codepointAt` and `byteRangeForCodepoints` find the ASCII
-run at the start of the body sixteen bytes at a time and index inside
-it directly, decoding only the bytes past it, so on an ASCII string
-`nth` and `subs` cost a vector scan to the index. `codepointCount`
-skips the same ASCII run and counts only past it. The code-point
-count is not cached; `count` of a string is an O(n) scan. The stdlib
-maps `error.InvalidUtf8` to `:utf8-error`.
+cluster. The first of them called on a string scans its bytes,
+sixteen at a time, for a byte past ASCII and keeps the answer in the
+header's `ascii_known` and `ascii` flags (`docs/HEAP.md` §4); a body
+never changes once built. On an ASCII string `count`, `nth` and `subs`
+are then O(1): a code-point index is a byte index. On any other
+string `codepointAt` and `byteRangeForCodepoints` index the leading
+ASCII run directly and decode only past it, and `codepointCount`
+counts past the same run: O(n). The stdlib maps `error.InvalidUtf8`
+to `:utf8-error`.
 
 `test/prop/string.zig` checks the kind: S1–S3 equality and hash
 (reflexive, symmetric, transitive; equal implies equal hash; never
@@ -124,17 +126,3 @@ across block edges and over random text.
   collation: the runtime carries no Unicode tables; `nexis.string`'s
   case functions are ASCII-only (STDLIB.md §3).
 - String interning and a mutable string builder.
-
----
-
-### 7. Language-level operations
-
-STDLIB.md §2, over the code-point helpers of §3.
-
-### 8. `nexis.string` namespace
-
-STDLIB.md §3.
-
-### 9. Printing and I/O
-
-STDLIB.md §5 (`src/format.zig`) and §6.
