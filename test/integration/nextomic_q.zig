@@ -131,7 +131,7 @@ fn runEngineDiag(fx: *Fx, arena: Allocator, dbv: DbValue, src: []const u8, args:
     var ctx = try query.plan.Ctx.init(arena, sources, fx.interner(), parsed, rules, diag);
     const p = try query.plan.plan(&ctx, parsed);
     var ex = query.Exec{ .arena = arena, .sources = sources, .heap = &fx.heap, .interner = fx.interner(), .hook = fx.hook(), .diag = diag };
-    const input = try ex.inputRelation(parsed, args);
+    const input = try ex.inputRelation(parsed, p, args);
     const rel = try ex.runPlan(p, input);
     return ex.findRows(parsed, rel);
 }
@@ -237,6 +237,8 @@ const Naive = struct {
     facts: std.AutoHashMapUnmanaged(u64, std.ArrayList(Row)) = .empty,
     /// Attribute types per source, by attribute id.
     attr_types: []std.AutoHashMapUnmanaged(u32, key.ValueType),
+    /// Per rule name, the role of each head position (`ruleRoles`).
+    head_roles: std.AutoHashMapUnmanaged(u32, []InputRole) = .empty,
 
     fn factKey(name: u32, src: ir.Src) u64 {
         return (@as(u64, name) << 32) | src;
@@ -306,21 +308,20 @@ const Naive = struct {
             envs = next;
         }
 
-        // Entity-role inputs resolve to entity ids.
+        // Entity-role inputs resolve to entity ids; one that names
+        // nothing stays as it is and matches no datom.
+        try self.ruleRoles();
         const roles = try arena.alloc(InputRole, parsed.vars.len);
         @memset(roles, .{});
-        try self.inputRoles(parsed.where, roles);
-        var resolved: std.ArrayList(Env) = .empty;
-        envs: for (envs.items) |e| {
+        try self.inputRoles(parsed.where, roles, 0);
+        for (envs.items) |e| {
             for (roles, 0..) |r, v| {
                 if (!r.entity or r.keyword) continue;
                 const c = e[v] orelse continue;
                 if (c != .keyword and c != .vm) continue;
-                e[v] = .{ .int = @intCast((try self.inputEntity(c, r.src)) orelse continue :envs) };
+                if (try self.inputEntity(c, r.src)) |id| e[v] = .{ .int = @intCast(id) };
             }
-            try resolved.append(arena, e);
         }
-        envs = resolved;
 
         var solved: std.ArrayList(Env) = .empty;
         for (envs.items) |e| try self.solve(parsed.where, e, &solved, 0);
@@ -623,24 +624,74 @@ const Naive = struct {
         role.entity = true;
     }
 
-    /// Mark the variables in an entity position or a ref attribute's
-    /// value position, and those in a keyword attribute's value position.
-    fn inputRoles(self: *Naive, clauses: []const ir.Clause, roles: []InputRole) !void {
+    /// Mark the variables in an entity position, a ref attribute's
+    /// value position or the entity argument of `missing?`, `get-else`
+    /// and `get-some`, and those in a keyword attribute's value
+    /// position; an argument of a rule call plays the roles of its head
+    /// position (`head_roles`). `src` is the source an unprefixed
+    /// clause reads.
+    fn inputRoles(self: *Naive, clauses: []const ir.Clause, roles: []InputRole, src: ir.Src) !void {
         for (clauses) |c| switch (c) {
             .pattern => |p| {
-                const src = p.src orelse 0;
-                if (p.e.asVar()) |v| markEntity(&roles[v], src);
+                const s = p.src orelse src;
+                if (p.e.asVar()) |v| markEntity(&roles[v], s);
                 const v = p.v.asVar() orelse continue;
                 if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try self.connOf(src).idents.idOf(self.reads[src].txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try self.reads[src].attr(id)) orelse continue;
-                if (at.value_type == .ref) markEntity(&roles[v], src);
+                const id = (try self.connOf(s).idents.idOf(self.reads[s].txn, p.a.constant.cell.keyword)) orelse continue;
+                const at = (try self.reads[s].attr(id)) orelse continue;
+                if (at.value_type == .ref) markEntity(&roles[v], s);
                 if (at.value_type == .keyword) roles[v].keyword = true;
             },
-            .not => |n| try self.inputRoles(n.body, roles),
-            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles),
-            else => {},
+            .pred, .bind => {
+                const call = if (c == .pred) c.pred else c.bind.call;
+                if (call.f != .builtin) continue;
+                switch (call.f.builtin) {
+                    .missing, .get_else, .get_some => if (call.args[1] == .variable) markEntity(&roles[call.args[1].variable], call.args[0].src orelse src),
+                    else => {},
+                }
+            },
+            .not => |n| try self.inputRoles(n.body, roles, src),
+            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles, src),
+            .rule => |r| {
+                const head = self.head_roles.get(r.name) orelse continue;
+                for (r.args, head) |a, h| {
+                    if (a != .variable) continue;
+                    if (h.entity) markEntity(&roles[a.variable], r.src orelse src);
+                    if (h.keyword) roles[a.variable].keyword = true;
+                }
+            },
+            .source => {},
         };
+    }
+
+    /// The roles of every rule's head positions, to a fixpoint over the
+    /// rules' bodies.
+    fn ruleRoles(self: *Naive) !void {
+        for (self.rules.rules) |r| {
+            if (self.head_roles.contains(r.name)) continue;
+            const head = try self.arena.alloc(InputRole, r.head.len);
+            @memset(head, .{});
+            try self.head_roles.put(self.arena, r.name, head);
+        }
+        const roles = try self.arena.alloc(InputRole, self.rules.vars.len);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.rules.rules) |r| {
+                @memset(roles, .{});
+                try self.inputRoles(r.body, roles, 0);
+                for (r.head, self.head_roles.get(r.name).?) |h, *hr| {
+                    if (roles[h].entity and !hr.entity) {
+                        hr.entity = true;
+                        changed = true;
+                    }
+                    if (roles[h].keyword and !hr.keyword) {
+                        hr.keyword = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
     }
 
     fn inputEntity(self: *Naive, c: Cell, src: ir.Src) !?u64 {
@@ -1191,7 +1242,7 @@ test "corpus: every :in form" {
     try checkCount(fx, dbv, "[:find ?x ?y :in $ [?x ...] [?y ...]]", &.{ nil, try fx.read("[1 2]"), try fx.read("[3 4 3]") }, 4);
     // A lookup ref or an ident bound to a variable in an entity position, or
     // in the value position of a ref attribute, is the entity id; one that
-    // resolves to nothing binds nothing. Keyword-attribute values stay
+    // names nothing matches nothing. Keyword-attribute values stay
     // keywords.
     const ann_ref = try fx.read("[:person/email \"ann@x\"]");
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, ann_ref }, 1);
@@ -1207,6 +1258,26 @@ test "corpus: every :in form" {
     try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/email 5]") }));
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, fx.interner().keywordValue(try fx.kwId("role/nobody")) }, 0);
     try checkCount(fx, dbv, "[:find ?n :in $ ?e :where (not [?e :person/age 30]) [?e :person/name ?n]]", &.{ nil, ann_ref }, 0);
+    // A reference that names nothing leaves its row to the clauses
+    // around it: under not, or and missing? it is never matched.
+    const nobody = try fx.read("[:person/email \"nobody@x\"]");
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?x :person/name ?n] (not [?x :person/friend ?e])]", &.{ nil, nobody }, 6);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?x :person/name ?n] (not [?x :person/friend ?e])]", &.{ nil, ann_ref }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?x :person/name ?n] (not-join [?x ?e] [?x :person/friend ?e])]", &.{ nil, fx.interner().keywordValue(try fx.kwId("role/nobody")) }, 6);
+    try checkCount(fx, dbv, "[:find ?n :in $ ?e :where [?x :person/name ?n] (or-join [?x ?e] [?x :person/friend ?e] [?x :person/age 30])]", &.{ nil, nobody }, 2);
+    try checkCount(fx, dbv, "[:find ?n ?e :in $ [?e ...] :where [?x :person/name ?n] (not [?x :person/friend ?e])]", &.{ nil, try fx.read("[[:person/email \"nobody@x\"] [:person/email \"ann@x\"]]") }, 10);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [(missing? $ ?e :person/age)]]", &.{ nil, nobody }, 1);
+    try checkCount(fx, dbv, "[:find ?e :in $ ?e :where [(missing? $ ?e :person/age)]]", &.{ nil, ann_ref }, 0);
+    try checkCount(fx, dbv, "[:find ?a :in $ ?e :where [(get-else $ ?e :person/age 0) ?a]]", &.{ nil, ann_ref }, 1);
+    // An input reaches an entity role through a rule's body, recursive
+    // or not, and resolves there.
+    const knows = try fx.read("[[(friend ?a ?b) [?a :person/friend ?b]] [(friend ?a ?b) [?b :person/friend ?a]] [(knows ?a ?b) [?a :person/friend ?b]] [(knows ?a ?b) [?a :person/friend ?m] (knows ?m ?b)] [(via ?a ?b) (knows ?a ?b)]]");
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?a :where (friend ?a ?b) [?b :person/name ?n]]", &.{ nil, knows, ann_ref }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?a :where (knows ?a ?b) [?b :person/name ?n]]", &.{ nil, knows, try fx.read("[:person/email \"di@x\"]") }, 2);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?b :where (knows ?a ?b) [?a :person/name ?n]]", &.{ nil, knows, ann_ref }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?b :where (via ?a ?b) [?a :person/name ?n]]", &.{ nil, knows, ann_ref }, 4);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?b :where (knows ?a ?b) [?a :person/name ?n]]", &.{ nil, knows, nobody }, 0);
+    try checkCount(fx, dbv, "[:find ?n :in $ % ?b :where [?a :person/name ?n] (not (knows ?a ?b))]", &.{ nil, knows, nobody }, 6);
     try testing.expectError(error.TxData, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:person/name \"Ann\"]") }));
     try testing.expectError(error.UnknownAttribute, runEngine(fx, fx.arena(), dbv, "[:find ?n :in $ ?e :where [?e :person/name ?n]]", &.{ nil, try fx.read("[:nope/attr \"Ann\"]") }));
     // Wrong input count and shape.

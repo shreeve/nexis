@@ -225,6 +225,12 @@
 (println (t/caught (d/q '[:find (pull ?e [:nope/attr]) :where [?e :person/age 30]] db)))
 (println (t/caught (d/q '[:find (pull ?e [:person/name]) :where [?e :person/age 30]] (d/history db))))
 (println (d/q '[:find (pull ?e ?p) . :in $ ?p :where [?e :person/email "cy@x"]] db [:person/name :person/age]))
+;; The entity of a pull is an id, an ident or a lookup ref; one that
+;; names nothing pulls as nil.
+(println (d/q '[:find (pull ?e [:person/name]) . :in $ ?e] db [:person/email "cy@x"]))
+(println (d/q '[:find (pull ?e [:db/ident]) . :in $ ?e] db :person/name))
+(println (d/q '[:find (pull ?e [:person/name]) . :in $ ?e] db [:person/email "nobody@x"]))
+(println (t/caught (d/q '[:find (pull ?e [:person/name]) . :in $ ?e] db "cy@x")))
 (println (d/q '[:find [(pull $then ?e [:person/name]) (pull ?e [:person/name])] :in $ $then :where [?e :person/email "ed@x"]]
               db (d/as-of db (:tx people))))
 (println (t/caught (d/q '[:find (pull ?e ?p) :where [?e :person/age 30] [(ground [:person/name]) ?p]] db)))

@@ -7,8 +7,9 @@
 //!     them after the result is materialised, on success or error. A
 //!     scan, `missing?` and `get-else` read the source their clause
 //!     names; an input resolves its idents and lookup refs in the
-//!     source of the first pattern that gives it an entity role; a pull
-//!     expression reads the source it names, `$` by default.
+//!     source of the first step of the plan that reads it as an entity
+//!     (`Roles`), rule bodies included; a pull expression reads the
+//!     source it names, `$` by default.
 //!   - A scan seeks by the constants and bound variables that lead its
 //!     index and post-filters everything else; `tx` binds the
 //!     transaction entity id and `added` the datom's flag. The mode of
@@ -791,13 +792,15 @@ pub const Exec = struct {
     // ── inputs ────────────────────────────────────────────────────
 
     /// The relation the `:in` bindings of `q` make of `args`, one per
-    /// binding. A lookup ref or an ident bound to a variable in an
-    /// entity position, or in the value position of a ref attribute,
-    /// becomes the entity id, and a row whose reference resolves to
-    /// nothing is dropped; a keyword bound to a variable that is also a
-    /// keyword attribute's value stays a keyword. An input that is not
-    /// the collection its binding form needs is `ValueType`.
-    pub fn inputRelation(self: *Exec, q: *const Ir, args: []const Value) anyerror!Relation {
+    /// binding, for the plan `p`. A lookup ref or an ident bound to a
+    /// variable the plan reads in an entity position, or in the value
+    /// position of a ref attribute, becomes the entity id; one that
+    /// names nothing stays as it is, so it matches no datom and the
+    /// clauses around it decide the row. A keyword bound to a variable
+    /// that is also a keyword attribute's value stays a keyword. An
+    /// input that is not the collection its binding form needs is
+    /// `ValueType`.
+    pub fn inputRelation(self: *Exec, q: *const Ir, p: *const Plan, args: []const Value) anyerror!Relation {
         const in = q.in;
         std.debug.assert(args.len == in.len);
         var rel = try Relation.unit(self.arena);
@@ -811,7 +814,7 @@ pub const Exec = struct {
                 },
                 .collection => |v| blk: {
                     var r = try Relation.init(self.arena, &.{v});
-                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| try r.append(&.{Cell.fromValue(x)});
+                    for ((try marshal.collection(self.arena, a)) orelse return error.ValueType) |x| try r.append(&.{Cell.fromValue(x)});
                     break :blk try r.dedup();
                 },
                 .tuple => |ts| blk: {
@@ -823,7 +826,7 @@ pub const Exec = struct {
                 .relation => |ts| blk: {
                     var r = try Relation.init(self.arena, try (ir.Binding{ .tuple = ts }).vars(self.arena));
                     const row = try self.arena.alloc(Cell, r.vars.len);
-                    for ((try self.seqElems(a)) orelse return error.ValueType) |x| {
+                    for ((try marshal.collection(self.arena, a)) orelse return error.ValueType) |x| {
                         if (try fillTuple(&r, ts, try self.valueCells(x), row, 0)) try r.append(row);
                     }
                     break :blk try r.dedup();
@@ -831,64 +834,133 @@ pub const Exec = struct {
             };
             rel = try rel.join(&part, &.{});
         }
-        return self.resolveInputs(q, rel);
+        return self.resolveInputs(p, rel);
     }
 
-    /// `src` is the source of the first pattern that put the variable
-    /// in an entity role; its idents and lookups resolve there.
-    const InputRole = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
+    /// How the plan reads a variable: as an entity, resolved in `src`,
+    /// the source of the first step that reads it so; as a keyword.
+    const Role = struct { entity: bool = false, keyword: bool = false, src: ir.Src = 0 };
+
+    const Roles = struct {
+        arena: Allocator,
+        of: std.AutoHashMapUnmanaged(Var, Role) = .empty,
+        /// `[arg, head]`: a rule's argument plays the roles of the head
+        /// variable it binds.
+        links: std.ArrayList([2]Var) = .empty,
+        /// The run-time sources of recursive calls, and the rule head
+        /// each one's slot joins with.
+        sources: std.ArrayList(*const plan_mod.Source) = .empty,
+        sites: std.ArrayList(struct { slot: *plan_mod.SourceSlot, head: []const Var }) = .empty,
+
+        fn get(self: *Roles, v: Var) Role {
+            return self.of.get(v) orelse .{};
+        }
+
+        fn entity(self: *Roles, v: Var, src: ?ir.Src) !void {
+            const r = try self.of.getOrPut(self.arena, v);
+            if (!r.found_existing) r.value_ptr.* = .{};
+            if (!r.value_ptr.entity) r.value_ptr.src = src orelse 0;
+            r.value_ptr.entity = true;
+        }
+
+        fn keyword(self: *Roles, v: Var) !void {
+            const r = try self.of.getOrPut(self.arena, v);
+            if (!r.found_existing) r.value_ptr.* = .{};
+            r.value_ptr.keyword = true;
+        }
+
+        /// Add `from`'s roles to `to`'s; true when that changed them.
+        fn merge(self: *Roles, to: Var, from: Role) !bool {
+            const before = self.get(to);
+            if (from.entity and !before.entity) try self.entity(to, from.src);
+            if (from.keyword and !before.keyword) try self.keyword(to);
+            const after = self.get(to);
+            return after.entity != before.entity or after.keyword != before.keyword;
+        }
+
+        /// Record the roles every step of `p` gives its variables.
+        fn walk(self: *Roles, p: *const Plan) !void {
+            try stack.check();
+            for (p.steps) |*s| switch (s.*) {
+                .scan => |*sc| {
+                    if (slotVar(sc.e)) |v| try self.entity(v, sc.src);
+                    const v = slotVar(sc.v) orelse continue;
+                    const at = sc.attr orelse continue;
+                    if (at.value_type == .ref) try self.entity(v, sc.src);
+                    if (at.value_type == .keyword) try self.keyword(v);
+                },
+                .pred => |*pr| try self.call(pr.call),
+                .bind => |*b| try self.call(b.call),
+                .not => |*n| try self.walk(n.sub),
+                .@"or" => |*o| for (o.branches) |br| try self.walk(br),
+                .fix => |*f| {
+                    for (f.args, f.instances[f.target].head) |a, h| try self.links.append(self.arena, .{ a, h });
+                    for (f.instances) |inst| for (inst.bodies) |body| {
+                        for (body.sites) |site| try self.sites.append(self.arena, .{ .slot = site.slot, .head = f.instances[site.callee].head });
+                        try self.walk(body.plan);
+                    };
+                },
+                .source => |*src| try self.sources.append(self.arena, src),
+                .match => {},
+            };
+        }
+
+        /// The entity argument of `missing?`, `get-else` and `get-some`.
+        fn call(self: *Roles, c: ir.Call) !void {
+            if (c.f != .builtin) return;
+            switch (c.f.builtin) {
+                .missing, .get_else, .get_some => if (c.args[1] == .variable) try self.entity(c.args[1].variable, c.args[0].src),
+                else => {},
+            }
+        }
+
+        /// Carry the roles of rule heads to the arguments that bind
+        /// them, through every recursive call, until nothing changes.
+        fn settle(self: *Roles) !void {
+            for (self.sources.items) |src| for (self.sites.items) |site| {
+                if (site.slot != src.slot) continue;
+                for (src.vars, site.head) |a, h| try self.links.append(self.arena, .{ a, h });
+            };
+            var changed = true;
+            while (changed) {
+                changed = false;
+                for (self.links.items) |l| changed = (try self.merge(l[0], self.get(l[1]))) or changed;
+            }
+        }
+
+        fn slotVar(slot: plan_mod.Slot) ?Var {
+            return switch (slot) {
+                .bound, .fresh, .same => |v| v,
+                .blank, .constant => null,
+            };
+        }
+    };
 
     /// `rel` with the entity-role columns resolved (see `inputRelation`).
-    fn resolveInputs(self: *Exec, q: *const Ir, rel: Relation) anyerror!Relation {
-        const roles = try self.arena.alloc(InputRole, q.vars.len);
-        @memset(roles, .{});
-        try self.inputRoles(q.where, roles);
+    fn resolveInputs(self: *Exec, p: *const Plan, rel: Relation) anyerror!Relation {
+        var roles: Roles = .{ .arena = self.arena };
+        try roles.walk(p);
+        try roles.settle();
         var cols: std.ArrayList(usize) = .empty;
-        for (rel.vars, 0..) |v, i| if (roles[v].entity and !roles[v].keyword) try cols.append(self.arena, i);
+        for (rel.vars, 0..) |v, i| {
+            const r = roles.get(v);
+            if (r.entity and !r.keyword) try cols.append(self.arena, i);
+        }
         if (cols.items.len == 0) return rel;
 
         var out = try Relation.init(self.arena, rel.vars);
         const row = try self.arena.alloc(Cell, rel.vars.len);
         var i: usize = 0;
-        rows: while (i < rel.rows) : (i += 1) {
+        while (i < rel.rows) : (i += 1) {
             rel.rowInto(i, row);
             for (cols.items) |c| {
                 if (row[c] != .keyword and row[c] != .vm) continue;
-                const e = (try self.inputEntity(self.sources[roles[rel.vars[c]].src].db, row[c])) orelse continue :rows;
-                row[c] = .{ .int = @intCast(e) };
+                const read = self.sources[roles.get(rel.vars[c]).src].db;
+                if (try self.inputEntity(read, row[c])) |e| row[c] = .{ .int = @intCast(e) };
             }
             try out.append(row);
         }
         return out;
-    }
-
-    /// Mark the variables in an entity position or a ref attribute's
-    /// value position, and those in a keyword attribute's value position.
-    fn inputRoles(self: *Exec, clauses: []const ir.Clause, roles: []InputRole) anyerror!void {
-        for (clauses) |c| switch (c) {
-            .pattern => |p| {
-                // A collection's tuples are taken as they are.
-                const read = switch (self.sources[p.src orelse 0]) {
-                    .db => |r| r,
-                    .coll => continue,
-                };
-                if (p.e.asVar()) |v| markEntity(&roles[v], p.src orelse 0);
-                const v = p.v.asVar() orelse continue;
-                if (p.a != .constant or p.a.constant != .cell or p.a.constant.cell != .keyword) continue;
-                const id = (try read.db.conn.idents.idOf(read.txn, p.a.constant.cell.keyword)) orelse continue;
-                const at = (try read.attr(@intCast(id))) orelse continue;
-                if (at.value_type == .ref) markEntity(&roles[v], p.src orelse 0);
-                if (at.value_type == .keyword) roles[v].keyword = true;
-            },
-            .not => |n| try self.inputRoles(n.body, roles),
-            .@"or" => |o| for (o.branches) |b| try self.inputRoles(b, roles),
-            .pred, .bind, .rule, .source => {},
-        };
-    }
-
-    fn markEntity(role: *InputRole, src: ir.Src) void {
-        if (!role.entity) role.src = src;
-        role.entity = true;
     }
 
     /// The entity an ident or lookup-ref input names in `read` (the
@@ -1147,8 +1219,10 @@ pub const Exec = struct {
     }
 
     /// `rows` with every `(pull ?e pattern)` column replaced by the
-    /// pattern's map for the row's entity (nil for an entity with no
-    /// datoms); a cell that is not an entity id is `ValueType`. Each
+    /// pattern's map for the row's entity: an entity id, an ident or a
+    /// lookup ref, resolved in the pull's source (nil for an entity
+    /// with no datoms, or a reference that names nothing); any other
+    /// cell is `ValueType`. Each
     /// pattern is resolved once; a syntax error leaves its reason in
     /// the diagnostic.
     fn pullColumns(self: *Exec, query: *const Ir, rows: []const []const Cell) anyerror![]const []const Cell {
@@ -1176,8 +1250,11 @@ pub const Exec = struct {
             const cells = try self.arena.dupe(Cell, row);
             for (prepared, cells) |*p, *c| {
                 const pr = &(p.* orelse continue);
-                const e = c.asEid() orelse return error.ValueType;
-                c.* = .{ .vm = try pr.eid(e) };
+                const e = c.asEid() orelse switch (c.*) {
+                    .keyword, .vm => try self.inputEntity(pr.puller.read, c.*),
+                    else => return error.ValueType,
+                };
+                c.* = .{ .vm = if (e) |id| try pr.eid(id) else value.nilValue() };
             }
             o.* = cells;
         }

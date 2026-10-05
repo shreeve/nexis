@@ -581,12 +581,16 @@ cache holds at most 128 parses, and on a miss replaces the least recently used o
 running query is using (`natives.State`). Constants in data patterns
 are encoded to their sortable bytes, and lookup refs and idents in
 constant positions resolve against the db, at plan time. `:in` inputs resolve
-by the role their variable plays in `:where`: one bound in an entity
-position, or in the value position under a constant ref attribute, may
-be a lookup ref or an ident and becomes its eid (one that names nothing
-matches nothing, so its row is dropped; a lookup ref whose value has the
-wrong type is `:nextomic/value-type`); one in the value position under
-a keyword-valued attribute stays a keyword.
+by the role their variable plays in the plan, rule bodies included: one
+read in an entity position, in the value position under a constant ref
+attribute, or as the entity of `missing?`, `get-else` or `get-some`, may
+be a lookup ref or an ident and becomes its eid; a recursive rule's
+argument plays the roles of the head position it binds. One that names
+nothing stays as it is and matches no datom, so its row stands or falls
+by the clauses around it: no row from a positive pattern, every row
+from `(not [?x :ref ?e])`, the other branches of an `or` (a lookup ref
+whose value has the wrong type is `:nextomic/value-type`). One in the
+value position under a keyword-valued attribute stays a keyword.
 
 **Plan** → ordered steps. Index choice by what is bound when the clause
 runs:
@@ -671,7 +675,7 @@ input; a source input that is neither a db value nor a collection is
   same one. Each is one read transaction for the whole query;
   attributes, idents, lookup refs and keyword values resolve per source,
   and an input in an entity role resolves in the source of the first
-  pattern that gives it that role.
+  step of the plan that reads it so.
 - **A vector, list or set of tuples**: a pattern matches its tuples by
   position (`[e a v tx added]`; a tuple shorter than a position the
   pattern uses matches nothing), compares constants as written (a
@@ -793,9 +797,11 @@ set of vectors (or the `.`, `[...]`, `[[...]]` find specs). A find
 element `(pull ?e pattern)` or `(pull $src ?e pattern)` (a pattern
 vector, §6.2, or a variable a scalar `:in` input binds to one) groups
 and dedups as `?e` and is applied when the result is copied, in the
-query's own snapshot of the source it names (`$` by default): the
-pattern's map, nil for an entity with no datoms, `:nextomic/value-type`
-when `?e` is not an entity id, `:nextomic/pull-syntax` for a bad
+query's own snapshot of the source it names (`$` by default): `?e`
+is an entity id, an ident or a lookup ref, resolved in that source; the
+pattern's map, nil for an entity with no datoms or a reference that
+names nothing, `:nextomic/value-type` when `?e` is any other value,
+`:nextomic/pull-syntax` for a bad
 pattern, `:nextomic/history-view` on a history db. `:keys`, `:strs` or
 `:syms` name every find element (one symbol each, relation find spec
 only) and the result is a vector of maps under those names as keywords,

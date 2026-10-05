@@ -175,7 +175,7 @@ pub fn q(gpa: Allocator, interner: *Interner, heap: *Heap, query: Value, db: ?Db
     defer pr.deinit();
     const parsed = pr.parsed.query;
     var ex = exec.Exec{ .arena = pr.arena_state.allocator(), .sources = pr.sources.items, .heap = heap, .interner = interner, .hook = options.hook, .diag = diag, .args = args };
-    const rel = try ex.runPlan(pr.plan, try ex.inputRelation(parsed, args));
+    const rel = try ex.runPlan(pr.plan, try ex.inputRelation(parsed, pr.plan, args));
     return ex.materialise(parsed, try ex.findRows(parsed, rel));
 }
 
