@@ -395,11 +395,14 @@ dissoc, the builder, the iterator and the trace are shared, and the
 public `map*`/`set*` functions are thin wrappers over the two
 instances. Every persistent path copy goes through one primitive,
 `withSlot`: a copy of an interior with one slot made empty, a payload
-or a child. An in-place edit changes a slot through
-`withSlotInPlace`, which rewrites an owned interior the same way where
-it stands when its block has room and otherwise copies it through
-`withSlot`; a node on the path the edit does not own is first copied
-whole (`ownPath`, §8.3).
+or a child. An in-place edit (§8.3) copies a node on its path that it
+does not own whole (`ownPath`), then rewrites the owned interior where
+it stands: a payload into an empty slot when its block has room
+(`insertData`, else a copy through `withSlot`), a payload into a child
+(`dataToChild`), a payload out (`removeData`), or a lone payload pulled
+up into a child's slot (`withSlotInPlace`). The three specialized
+rewrites are each a pair of moves, which a general rewrite in their
+place does not match.
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
