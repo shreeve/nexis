@@ -7,8 +7,9 @@
 //! are pre-encoded to their sortable bytes when the attribute's type is
 //! known. Invariants:
 //!   - Steps are ordered greedily: cost-free steps (predicates, function
-//!     bindings, `not`, filtering `or`) run as soon as their variables
-//!     are bound; among sources (patterns, `or`, rule calls) the one with
+//!     bindings, `not`, an `or`, a rule call or a run-time source whose
+//!     variables are all bound) run as soon as their variables are
+//!     bound; among sources (patterns, `or`, rule calls) the one with
 //!     the smallest estimate given the variables bound so far runs next.
 //!     An estimate is kept until one of the clause's own variables is
 //!     bound, so placing n clauses costs O(n) estimates, not O(n²).
@@ -256,9 +257,9 @@ pub const DbSource = struct {
 /// every sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
-    /// The selected source's `Read`; `select` switches it. Undefined
-    /// while a collection is selected (`coll`).
-    read: *Read,
+    /// The selected source's `Read`, null while a collection is
+    /// selected (`coll`); `select` switches it and `db` reads it.
+    read: ?*Read,
     /// The selected source's tuples when it is a collection.
     coll: ?[]const []const Cell = null,
     interner: *Interner,
@@ -295,7 +296,7 @@ pub const Ctx = struct {
             .db => |r| .{ .read = r },
             .coll => |rows| .{ .read = null, .coll = rows },
         };
-        var ctx: Ctx = .{ .arena = arena, .read = undefined, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
+        var ctx: Ctx = .{ .arena = arena, .read = null, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
         if (dbs.len > 0) ctx.enter(0);
         return ctx;
     }
@@ -313,7 +314,7 @@ pub const Ctx = struct {
 
     fn enter(self: *Ctx, next: ir.Src) void {
         self.selected = next;
-        self.read = self.dbs[next].read orelse undefined;
+        self.read = self.dbs[next].read;
         self.coll = self.dbs[next].coll;
         self.attr_cache = self.dbs[next].attr_cache;
         self.aevt_entries = self.dbs[next].aevt_entries;
@@ -323,7 +324,13 @@ pub const Ctx = struct {
     /// `get-else`, `get-some`, `fulltext`.
     pub fn selectDb(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
         try self.select(src);
-        if (self.coll != null) return self.syntax("this clause reads a db value, and its source is a collection");
+        _ = try self.db();
+    }
+
+    /// The selected source's `Read`; `QuerySyntax` when it is a
+    /// collection.
+    pub fn db(self: *Ctx) error{QuerySyntax}!*Read {
+        return self.read orelse self.syntax("this clause reads a db value, and its source is a collection");
     }
 
     /// `QuerySyntax` with its reason and the top-level clause it was
@@ -358,8 +365,9 @@ pub const Ctx = struct {
     /// The attribute named by VM keyword `kw` as this view sees it.
     pub fn attrByKeyword(self: *Ctx, kw: u32) !?Attr {
         if (self.attr_cache.get(kw)) |a| return a;
-        const id = try self.read.db.conn.idents.idOf(self.read.txn, kw);
-        const attr: ?Attr = if (id) |a| try self.read.attr(a) else null;
+        const read = try self.db();
+        const id = try read.db.conn.idents.idOf(read.txn, kw);
+        const attr: ?Attr = if (id) |a| try read.attr(a) else null;
         try self.attr_cache.put(self.arena, kw, attr);
         return attr;
     }
@@ -368,9 +376,10 @@ pub const Ctx = struct {
     /// over every datom.
     pub fn aevtEntries(self: *Ctx) !u64 {
         if (self.aevt_entries) |n| return n;
-        const store = self.read.db.conn.store;
-        const tree = if (self.read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
-        const n = try store_mod.Store.treeEntries(self.read.txn, tree);
+        const read = try self.db();
+        const store = read.db.conn.store;
+        const tree = if (read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
+        const n = try store_mod.Store.treeEntries(read.txn, tree);
         self.aevt_entries = n;
         return n;
     }
@@ -378,7 +387,7 @@ pub const Ctx = struct {
     /// Datoms per attribute, the AEVT estimate for an attribute known
     /// only at run time.
     pub fn entriesPerAttr(self: *Ctx) !u64 {
-        const attrs = (try self.read.schema()).attrs.count();
+        const attrs = (try (try self.db()).schema()).attrs.count();
         return @max(1, (try self.aevtEntries()) / @max(1, attrs));
     }
 
@@ -963,7 +972,7 @@ fn patternAttr(ctx: *Ctx, a: ir.Term) !?Attr {
                 // An int cell holds any i64; an id is a fixnum, as transact takes it.
                 const id = value.fromFixnum(n) orelse return ctx.syntax("an attribute is a keyword or an id");
                 if (n <= 0 or n >= key.attr_partition_end) return ctx.unknownAttr(id);
-                return (try ctx.read.attr(@intCast(n))) orelse ctx.unknownAttr(id);
+                return (try (try ctx.db()).attr(@intCast(n))) orelse ctx.unknownAttr(id);
             },
             else => return ctx.syntax("an attribute is a keyword or an id"),
         },
@@ -1031,18 +1040,23 @@ fn planPattern(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Step {
     var slots: [5]Slot = undefined;
     for (p.terms(), &slots) |t, *slot| slot.* = switch (t) {
         .blank => .blank,
-        .variable => |v| blk: {
-            if (bound.has(v)) break :blk .{ .bound = v };
-            if (ir.containsVar(fresh.items, v)) break :blk .{ .same = v };
-            try fresh.append(ctx.arena, v);
-            break :blk .{ .fresh = v };
-        },
+        .variable => |v| try varSlot(ctx, v, bound, &fresh),
         .constant => |c| switch (c) {
             .cell => |cell| .{ .constant = .{ .cell = cell } },
             .lookup => return ctx.syntax("a lookup ref needs a db source; this source is a collection"),
         },
     };
     return .{ .match = .{ .src = ctx.selected, .slots = slots, .fresh = try fresh.toOwnedSlice(ctx.arena), .rows = rows } };
+}
+
+/// The slot of variable `v` in a pattern: bound before the step, a
+/// repeat of one this pattern binds, or one it binds (added to
+/// `fresh`).
+fn varSlot(ctx: *Ctx, v: Var, bound: *const Bound, fresh: *std.ArrayList(Var)) !Slot {
+    if (bound.has(v)) return .{ .bound = v };
+    if (ir.containsVar(fresh.items, v)) return .{ .same = v };
+    try fresh.append(ctx.arena, v);
+    return .{ .fresh = v };
 }
 
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
@@ -1061,12 +1075,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
     for (terms, 0..) |t, i| {
         slots[i] = switch (t) {
             .blank => .blank,
-            .variable => |v| blk: {
-                if (bound.has(v)) break :blk .{ .bound = v };
-                if (ir.containsVar(fresh.items, v)) break :blk .{ .same = v };
-                try fresh.append(ctx.arena, v);
-                break :blk .{ .fresh = v };
-            },
+            .variable => |v| try varSlot(ctx, v, bound, &fresh),
             .constant => |c| blk: {
                 const resolved = try resolveConst(ctx, c, i, attr) orelse {
                     unsat = true;
@@ -1077,12 +1086,13 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
         };
     }
 
-    const history = ctx.read.db.history;
+    const read = try ctx.db();
+    const history = read.db.history;
     const dedup = slots[0] == .blank or slots[1] == .blank or slots[2] == .blank or
         (history and (slots[3] == .blank or slots[4] == .blank));
-    const store = ctx.read.db.conn.store;
-    const tree = if (ctx.read.fast()) store.trees.cur(choice.index) else store.trees.hist(choice.index);
-    const entries = try store_mod.Store.treeEntries(ctx.read.txn, tree);
+    const store = read.db.conn.store;
+    const tree = if (read.fast()) store.trees.cur(choice.index) else store.trees.hist(choice.index);
+    const entries = try store_mod.Store.treeEntries(read.txn, tree);
 
     return .{
         .src = ctx.selected,
@@ -1122,7 +1132,7 @@ fn resolveConst(ctx: *Ctx, c: ir.Constant, pos: usize, attr: ?Attr) Failure!?Con
                     error.ValueType => return null,
                     else => return err,
                 };
-                const cell = try marshal.cellOf(ctx.read, ctx.arena, val);
+                const cell = try marshal.cellOf(try ctx.db(), ctx.arena, val);
                 // A uuid compares as its canonical text, as a bound
                 // variable's does: another spelling names no value.
                 if (val == .uuid and !std.mem.eql(u8, cell.str, c.cell.str)) return null;
@@ -1165,8 +1175,8 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) Failure!?u64 {
             .keyword => |kw| {
                 // An ident names an entity whatever the view's window; the
                 // window filters the entity's datoms, not its name.
-                const id = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, kw)) orelse return null;
-                return id;
+                const read = try ctx.db();
+                return (try read.db.conn.idents.idOf(read.txn, kw)) orelse null;
             },
             else => return ctx.syntax("an entity is an id, an ident or a lookup ref"),
         },
@@ -1174,7 +1184,7 @@ pub fn resolveEntity(ctx: *Ctx, c: ir.Constant) Failure!?u64 {
             const at = (try ctx.attrByKeyword(l.attr)) orelse return ctx.unknownAttr(ctx.interner.keywordValue(l.attr));
             if (at.unique == .none) return ctx.syntax("a lookup ref needs a unique attribute");
             const val = (try resolveTyped(ctx, .{ .cell = l.v }, at.value_type)) orelse return null;
-            return ctx.read.entid(ctx.arena, .{ .lookup = .{ .a = at.id, .v = val } }) catch |err| switch (err) {
+            return (try ctx.db()).entid(ctx.arena, .{ .lookup = .{ .a = at.id, .v = val } }) catch |err| switch (err) {
                 error.ValueType, error.TxData => null,
                 else => err,
             };
@@ -1192,11 +1202,12 @@ pub fn resolveTyped(ctx: *Ctx, c: ir.Constant, vt: key.ValueType) Failure!?key.V
             return .{ .ref = eid };
         },
         .cell => |cell| {
+            const read = try ctx.db();
             if (vt == .ref and cell == .keyword) {
-                const eid = (try ctx.read.db.conn.idents.idOf(ctx.read.txn, cell.keyword)) orelse return null;
+                const eid = (try read.db.conn.idents.idOf(read.txn, cell.keyword)) orelse return null;
                 return .{ .ref = eid };
             }
-            return try marshal.encodeCell(ctx.read, cell, vt);
+            return try marshal.encodeCell(read, cell, vt);
         },
     }
 }

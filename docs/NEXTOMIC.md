@@ -797,7 +797,7 @@ form no group, so an aggregate-only query over nothing is empty (nil
 for `.` and `[...]`), not zero.
 
 **Relation** is a Zig-private columnar struct in the query arena
-(`vars`, typed columns for eids and longs, a `Value` column otherwise);
+(`vars`, typed columns for eids and longs, a column of cells otherwise);
 never a VM value, and never changed once built, so a relation made
 from another shares the columns it keeps (dropping a variable copies
 nothing). Results are copied into the VM heap as a persistent
@@ -830,7 +830,11 @@ pushed into the bodies only where the component is one rule and every
 recursive call passes the argument through unchanged; elsewhere it
 filters the result, so a required argument (`[(r [?n] ?out) ...]`) that
 a recursive call changes, and that a body needs bound, is
-`:nextomic/query-syntax` naming it. The fixpoint only
+`:nextomic/query-syntax` naming it. The fixpoint ends when a round adds
+no row, which every rule over datoms, inputs and constants reaches; a
+body that binds a function result (`[(inc ?n) ?m]`) can add new values
+every round, and its rule ends only where a predicate bounds them. The
+fixpoint only
 adds rows, so it answers stratified rules only: a recursive component
 whose rules call one another inside a `not` is `:nextomic/query-syntax`
 naming the rule. `not`/`not-join` are anti-joins on the shared

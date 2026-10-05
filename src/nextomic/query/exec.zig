@@ -252,7 +252,7 @@ pub const Exec = struct {
     }
 
     fn execScan(self: *Exec, s: *const Scan, rel: Relation, drop: []const Var) anyerror!Relation {
-        if (s.unsatisfiable or rel.rows == 0) return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, s.fresh }))).without(drop);
+        if (s.unsatisfiable or rel.rows == 0) return self.none(rel, s.fresh, drop);
         if (!plan_mod.nestedLoop(s, rel.rows)) return rel.join(&(try self.scanned(s)), drop);
 
         // One seek per input row; `picked` names the input row of each
@@ -284,22 +284,18 @@ pub const Exec = struct {
     /// per query for each shape.
     fn scanned(self: *Exec, s: *const Scan) anyerror!Relation {
         const slots = s.slots();
-        var pvars: std.ArrayList(Var) = .empty;
-        for (slots) |slot| switch (slot) {
-            .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
-            else => {},
-        };
+        const pvars = try self.patternVars(slots);
         const shape = shapeOf(slots);
         const index = s.hash_index.?;
         for (self.scans.items) |c| {
             if (c.src != s.src or c.index != index) continue;
             for (c.shape, shape) |a, b| {
                 if (!a.eql(b)) break;
-            } else return .{ .arena = self.arena, .vars = pvars.items, .cols = c.rel.cols, .rows = c.rel.rows, .indexes = c.rel.indexes };
+            } else return .{ .arena = self.arena, .vars = pvars, .cols = c.rel.cols, .rows = c.rel.rows, .indexes = c.rel.indexes };
         }
-        var rows = try Relation.init(self.arena, pvars.items);
-        const srcs = try self.arena.alloc(usize, pvars.items.len);
-        for (pvars.items, srcs) |v, *src| src.* = slotPos(slots, v);
+        var rows = try Relation.init(self.arena, pvars);
+        const srcs = try self.arena.alloc(usize, pvars.len);
+        for (pvars, srcs) |v, *src| src.* = slotPos(slots, v);
         var wants: [5]?Cell = undefined;
         for (slots, &wants) |slot, *w| w.* = if (slot == .constant) slot.constant.cell else null;
         try self.scanInto(s, index, wants, srcs, &rows, false);
@@ -315,13 +311,9 @@ pub const Exec = struct {
     /// the bound variables. A tuple shorter than a position the pattern
     /// uses matches nothing.
     fn execMatch(self: *Exec, m: *const plan_mod.Match, rel: Relation, drop: []const Var) anyerror!Relation {
-        var pvars: std.ArrayList(Var) = .empty;
-        for (m.slots) |slot| switch (slot) {
-            .bound, .fresh => |v| try ir.addVar(self.arena, &pvars, v),
-            else => {},
-        };
-        var matched = try Relation.init(self.arena, pvars.items);
-        const cells = try self.arena.alloc(Cell, pvars.items.len);
+        const pvars = try self.patternVars(m.slots);
+        var matched = try Relation.init(self.arena, pvars);
+        const cells = try self.arena.alloc(Cell, pvars.len);
         tuples: for (m.rows) |t| {
             for (m.slots, 0..) |slot, pos| {
                 if (slot == .blank) continue;
@@ -334,13 +326,28 @@ pub const Exec = struct {
                         const first = slotPos(m.slots, v);
                         if (first != pos) {
                             if (!t[pos].eql(t[first])) continue :tuples;
-                        } else cells[std.mem.findScalar(Var, pvars.items, v).?] = t[pos];
+                        } else cells[std.mem.findScalar(Var, pvars, v).?] = t[pos];
                     },
                 }
             }
             try matched.append(cells);
         }
         return rel.join(&(try matched.dedup()), drop);
+    }
+
+    /// The variables of a pattern's slots, in order of first position.
+    fn patternVars(self: *Exec, slots: [5]plan_mod.Slot) ![]const Var {
+        var out: std.ArrayList(Var) = .empty;
+        for (slots) |slot| switch (slot) {
+            .bound, .fresh => |v| try ir.addVar(self.arena, &out, v),
+            else => {},
+        };
+        return out.items;
+    }
+
+    /// The empty result of a step over `rel` that binds `fresh`.
+    fn none(self: *Exec, rel: Relation, fresh: []const Var, drop: []const Var) !Relation {
+        return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, fresh }))).without(drop);
     }
 
     /// The first position whose slot names `v`.
@@ -723,7 +730,7 @@ pub const Exec = struct {
     /// The elements of a collection value as cells; `ValueType` for
     /// anything but a vector, list or set.
     fn valueCells(self: *Exec, v: Value) ![]const Cell {
-        const items = (try self.seqElems(v)) orelse return error.ValueType;
+        const items = (try marshal.collection(self.arena, v)) orelse return error.ValueType;
         const out = try self.arena.alloc(Cell, items.len);
         for (items, out) |x, *c| c.* = Cell.fromValue(x);
         return out;
@@ -767,11 +774,6 @@ pub const Exec = struct {
         return true;
     }
 
-    /// The elements of a vector, list or set value, or null.
-    pub fn seqElems(self: *Exec, v: Value) !?[]Value {
-        return marshal.collection(self.arena, v);
-    }
-
     // ── not, or, source ───────────────────────────────────────────
 
     fn execNot(self: *Exec, n: *const plan_mod.Not, rel: Relation) anyerror!Relation {
@@ -782,7 +784,7 @@ pub const Exec = struct {
     }
 
     fn execOr(self: *Exec, o: *const plan_mod.Or, rel: Relation, drop: []const Var) anyerror!Relation {
-        if (rel.rows == 0) return (try Relation.init(self.arena, try std.mem.concat(self.arena, Var, &.{ rel.vars, o.fresh }))).without(drop);
+        if (rel.rows == 0) return self.none(rel, o.fresh, drop);
         const input = if (o.bound.len == 0) try Relation.unit(self.arena) else try rel.project(o.bound, true);
         // Every branch's rows go into one set, each hashed once.
         const acc = try relation.Accumulator.create(self.arena, o.join);

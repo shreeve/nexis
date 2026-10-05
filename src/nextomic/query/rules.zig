@@ -22,8 +22,11 @@
 //!     the result. Pushing elsewhere would lose derivations, so a body
 //!     that needs a required argument which is not pushed is refused,
 //!     naming it.
-//!   - Termination: `total` only grows and every row comes from a
-//!     finite set of datoms and inputs, so the fixpoint is reached.
+//!   - Termination: `total` only grows, so the fixpoint is reached when
+//!     every value a body binds comes from the datoms, the inputs or
+//!     constants, a finite set. A function binding can make new values
+//!     each round (`[(inc ?n) ?m]` with no bound on `?m`), and then the
+//!     fixpoint runs until memory runs out.
 //!   - Soundness: a growing fixpoint answers stratified programs only,
 //!     so a component whose rules call one another inside `not` is
 //!     refused before it runs.

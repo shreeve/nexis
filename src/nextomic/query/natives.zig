@@ -4,7 +4,8 @@
 //! `(q query & inputs)` runs `query.q` and returns the materialised
 //! result; `(explain query & inputs)` returns the plan as a string.
 //! The inputs follow `:in` positionally (`[$]` when the query has no
-//! `:in`): a db value for each source, the rules for `%`, and values
+//! `:in`): a db value or a collection of tuples for each source, the
+//! rules for `%`, and values
 //! for `?x`, `[?x ...]`, `[?a ?b]` and `[[?a ?b]]`. The arg-map form
 //! `(q {:query query :args [inputs...]})` is the same call.
 //!
