@@ -2072,13 +2072,15 @@ pub const VM = struct {
             fields_dup[i] = try self.allocator.dupe(u8, fname);
             initialized = i + 1;
         }
-        try self.record_registry.append(self.allocator, .{
+        // Nothing fails once the entry is in: it owns the names.
+        try self.record_registry.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
+        self.record_registry.appendAssumeCapacity(.{
             .id = new_id,
             .ns_name = ns_dup,
             .type_name = name_dup,
             .field_names = fields_dup,
         });
-        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
         return new_id;
     }
 
@@ -2109,15 +2111,13 @@ pub const VM = struct {
         const name_dup = try self.allocator.dupe(u8, protocol_name);
         errdefer self.allocator.free(name_dup);
 
-        var methods: std.ArrayList(ProtocolMethod) = .empty;
-        errdefer methods.deinit(self.allocator);
+        var methods: std.ArrayList(ProtocolMethod) = try .initCapacity(self.allocator, method_specs.len);
+        errdefer {
+            for (methods.items) |m| self.allocator.free(m.name);
+            methods.deinit(self.allocator);
+        }
         for (method_specs) |spec| {
-            const m_name = try self.allocator.dupe(u8, spec.name);
-            errdefer self.allocator.free(m_name);
-            try methods.append(self.allocator, .{
-                .name_id = spec.name_id,
-                .name = m_name,
-            });
+            methods.appendAssumeCapacity(.{ .name_id = spec.name_id, .name = try self.allocator.dupe(u8, spec.name) });
         }
         try self.protocol_registry.append(self.allocator, .{
             .id = new_id,
@@ -7024,4 +7024,15 @@ test "VM closure call: same closure called twice — both invocations succeed" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
+}
+
+test "registerRecordType and registerProtocol free exactly what they took when an allocation fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, registerTypeAndProtocol, .{});
+}
+
+fn registerTypeAndProtocol(allocator: std.mem.Allocator) !void {
+    var vm = try VM.init(allocator, &VM.idle_routine);
+    defer vm.deinit();
+    _ = try vm.registerRecordType("user", "Point", &.{ "x", "y" });
+    _ = try vm.registerProtocol("user", "Shape", &.{ .{ .name_id = 0, .name = "area" }, .{ .name_id = 1, .name = "scale" } });
 }
