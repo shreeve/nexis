@@ -271,6 +271,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "exit-status.nx" }, .stdout = "exit-status.out", .exit_code = 3 },
             .{ .args = &.{ "run", "-", "x" }, .stdin = "stdin.in", .stdout = "stdin.out" },
             .{ .args = &.{ "test", cli ++ "tests.nx" }, .stdout = "tests.out", .exit_code = 1 },
+            .{ .args = &.{ "test", cli ++ "test-shadow.nx", cli ++ "lib/test-beside.nx" }, .stdout = "test-shadow.out", .exit_code = 1 },
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },

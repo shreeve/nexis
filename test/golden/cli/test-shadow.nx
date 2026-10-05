@@ -1,0 +1,6 @@
+; `nexis test` with two files: this one redefines `get` in the
+; namespace the runner counts failures in, which changes no exit
+; status, and lib/test-beside.nx requires a file beside itself.
+(require '[nexis.test :as t])
+(defn get [m k] 0)
+(t/deftest shadowed (t/is (= 1 2)))

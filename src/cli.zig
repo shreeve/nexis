@@ -479,24 +479,34 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
     _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
 }
 
-/// `nexis test FILE...`: run each file, then `run-all-tests`; exit 1
-/// when an assertion failed or a test threw.
+/// `nexis test FILE...`: read every file, then run each and
+/// `run-all-tests`; exit 1 when an assertion failed or a test threw. A
+/// file that cannot be read stops the command before any runs.
+/// `require` searches the working directory and each file's own.
 fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8) !void {
-    const load_paths = loadPathsFor(paths[0]);
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    for (paths) |path| {
-        const text = readProgram(io, arena.allocator(), path);
-        const info = try arena.allocator().create(vm.SourceInfo);
-        info.* = .{ .path = path, .text = text };
+    const infos = try arena.allocator().alloc(vm.SourceInfo, paths.len);
+    var load_paths: std.ArrayList([]const u8) = .empty;
+    try load_paths.append(arena.allocator(), ".");
+    for (paths, infos) |path, *info| {
+        info.* = .{ .path = if (eql(path, "-")) "<stdin>" else path, .text = readProgram(io, arena.allocator(), path) };
+        const dir = loadPathsFor(path)[1];
+        for (load_paths.items) |p| {
+            if (eql(p, dir)) break;
+        } else try load_paths.append(arena.allocator(), dir);
+    }
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, load_paths.items);
+    defer rt.deinit();
+    for (infos) |*info| {
         const saved = rt.registry.current;
         _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
         rt.registry.current = saved;
     }
-    const info = vm.SourceInfo{ .path = "<test>", .text = "(let [r (nexis.test/run-all-tests)] (+ (get r :fail) (get r :error)))" };
+    // Every name qualified: a test file may define its own `get` or `+`
+    // in the namespace this runs in.
+    const info = vm.SourceInfo{ .path = "<test>", .text = "(nexis.core/let [r (nexis.test/run-all-tests)] (nexis.core/+ (nexis.core/get r :fail) (nexis.core/get r :error)))" };
     const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
     if (!bad.isFixnum() or bad.asFixnum() != 0) exitSynced(1);
 }
