@@ -1510,41 +1510,26 @@ fn fnVec(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
+/// `(hash-map k v ...)`, `(hash-set x ...)`: built at once, each node
+/// allocated once (CHAMP.md §8.1); a later duplicate key's value wins.
 fn fnHashMap(vm: *VM, args: []const Value) VmError!Value {
     if (args.len % 2 != 0) return VmError.ArityMismatch;
-    const heap = vm.ensureHeap();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    var i: usize = 0;
-    while (i < args.len) : (i += 2) {
-        m = champ_mod.mapAssoc(
-            heap,
-            m,
-            args[i],
-            args[i + 1],
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        ) catch return VmError.OutOfMemory;
-    }
-    return m;
+    // Flat key, value pairs are `Entry`s laid end to end.
+    const entries: [*]const champ_mod.Entry = @ptrCast(args.ptr);
+    return champ_mod.mapFromEntries(vm.ensureHeap(), entries[0 .. args.len / 2], &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
 fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var s = champ_mod.setEmpty(heap) catch return VmError.OutOfMemory;
-    for (args) |x| {
-        s = champ_mod.setConj(
-            heap,
-            s,
-            x,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        ) catch return VmError.OutOfMemory;
-    }
-    return s;
+    return champ_mod.setFromElements(vm.ensureHeap(), args, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
-/// `(set coll)` → the elements of any seqable as a set.
+/// `(set coll)` → the elements of any seqable as a hash set; a set
+/// itself without its metadata, as Clojure's.
 fn fnSet(vm: *VM, args: []const Value) VmError!Value {
+    if (isSet(args[0].kind())) {
+        if (heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null) return args[0];
+        return fnWithMeta(vm, &.{ args[0], value_mod.nilValue() });
+    }
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
     return fnHashSet(vm, items.items);
@@ -2114,15 +2099,15 @@ fn fnInterleave(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(zipmap keys vals)` → map pairing keys with vals positionally.
 fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var entries: std.ArrayList(champ_mod.Entry) = .empty;
+    defer entries.deinit(vm.allocator);
     var ks = try makeSeqIter(vm, args[0]);
     var vs = try makeSeqIter(vm, args[1]);
     while (try ks.next()) |k| {
         const v = (try vs.next()) orelse break;
-        m = champ_mod.mapAssoc(heap, m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        entries.append(vm.allocator, .{ .key = k, .value = v }) catch return VmError.OutOfMemory;
     }
-    return m;
+    return champ_mod.mapFromEntries(vm.ensureHeap(), entries.items, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
 /// `(take-while pred coll)` / `(drop-while pred coll)`.

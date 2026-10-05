@@ -1852,6 +1852,8 @@ test "integration: hash-map / hash-set" {
     // hash-map iteration order is unspecified (HAMT); test via count + get
     try expectOutput("(count (hash-map :a 1 :b 2 :c 3))", "3");
     try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
+    // set of a set is that set, as Clojure's: a sorted one stays sorted.
+    try expectOutput("[(sorted? (set (sorted-set 3 1))) (let [s #{1}] (identical? s (set s))) (= #{1 3} (set [3 1 3])) (= #{1 2} (hash-set 1 1 2)) (hash-map :a 1 :a 2) (= {:a 3 :b 2} (zipmap [:a :b :a] [1 2 3]))]", "[true true true true {:a 2} true]");
 }
 
 // =============================================================================
