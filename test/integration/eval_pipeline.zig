@@ -314,6 +314,8 @@ test "metadata: every update of a collection keeps it, as in Clojure; rest and t
     try expectOutput(m ++ "(mapv meta [(assoc-in (with-meta {:a {:b 1}} m) [:a :b] 2) (update (with-meta {:a 1} m) :a inc) (merge (with-meta {:a 1} m) {:b 2}) (update (with-meta [1] m) 0 inc)])", "[{:m 1} {:m 1} {:m 1} {:m 1}]");
     // rest, next and a list's pop are the elements after the first, which carry no metadata of their own.
     try expectOutput(m ++ "(mapv meta [(rest (with-meta [1 2 3] m)) (next (with-meta [1 2 3] m)) (rest (with-meta '(1 2) m)) (pop (with-meta '(1 2) m)) (seq (with-meta [1 2] m))])", "[nil nil nil nil nil]");
+    // vec and set build a fresh collection, which carries none, as Clojure's.
+    try expectOutput(m ++ "(let [v (with-meta [1] m)] [(meta (vec v)) (meta (set (with-meta #{1} m))) (= v (vec v)) (meta v) (let [w [1 2]] (identical? w (vec w)))])", "[nil nil true {:m 1} true]");
     // transient and persistent! drop it; into keeps its target's.
     try expectOutput(m ++ "(mapv meta [(persistent! (conj! (transient (with-meta [1] m)) 2)) (persistent! (transient (with-meta #{1} m))) (persistent! (assoc! (transient (with-meta {} m)) :a 1))])", "[nil nil nil]");
     try expectOutput(m ++ "(let [v (conj (with-meta [1] m) 2)] [(= v [1 2]) (= (hash v) (hash [1 2])) v])", "[true true [1 2]]");
@@ -1335,6 +1337,8 @@ test "integration: core.nx take / drop" {
     try expectOutput("(take 3 [1 2 3 4 5])", "(1 2 3)");
     try expectOutput("(take 0 [1 2 3])", "()");
     try expectOutput("(take 10 [1 2 3])", "(1 2 3)");
+    // A bignum count takes all or none, as Clojure's take counts down any integer.
+    try expectOutput("[(take 100000000000000000000 [1 2]) (take -100000000000000000000 [1])]", "[(1 2) ()]");
     try expectOutput("(drop 2 [1 2 3 4 5])", "(3 4 5)");
     try expectOutput("(drop 10 [1 2 3])", "()");
     try expectOutput("(drop 0 (list :a :b))", "(:a :b)");
@@ -5284,6 +5288,9 @@ test "ex-info: a map thrown and caught, read back with ex-data and ex-message" {
         "[m {:a 1} :why true]",
     );
     try expectOutputProgram("[(ex-data 1) (ex-message :k) (ex-data {:x 1}) (:cause (ex-info \"m\" {}))]", "[nil nil nil nil]");
+    // As Clojure's: nil data is {}, a nil message stays nil, and data
+    // that is not a map or a message that is not a string is refused.
+    try expectOutputProgram("[(ex-data (ex-info \"x\" nil)) (ex-message (ex-info nil {})) (ex-data (ex-info \"s\" (sorted-map :a 1))) (try (ex-info \"x\" 1) (catch any e e)) (try (ex-info 1 {}) (catch any e e))]", "[{} nil {:a 1} :kind-mismatch :kind-mismatch]");
     // A tag catches an ex-info map through the `:error` of its data.
     try expectOutputProgram(
         "(try (throw (ex-info \"nf\" {:error :not-found :id 3})) (catch :other e :no) (catch :not-found e [(ex-message e) (:id (ex-data e))]))",

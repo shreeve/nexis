@@ -215,7 +215,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`) or a record name | `docs/PROTOCOLS.md` |
 | `(catch Exception e ...)` | by class | a class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
-| `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument) | `docs/MACROEXPAND.md` |
+| `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument); as Clojure's, `msg` is a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch` | `docs/MACROEXPAND.md` |
 | `(case x ...)` with no match | `IllegalArgumentException` | throws `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` the same | `docs/MACROEXPAND.md` |
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions` and `reduce-kv` honour it | `src/stdlib/core.nx` |
 | `(read-string s)` | the full reader | the first form as data; syntax-quote, unquote and `^meta` are not data and raise `:reader-error` | `docs/MACROEXPAND.md` |

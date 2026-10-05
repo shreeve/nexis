@@ -586,9 +586,12 @@ fn fnSecond(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(take n coll)` → a list of the first `n` elements, all of them
-/// when there are fewer; walks no further than `n`.
+/// when there are fewer; walks no further than `n`. As Clojure's
+/// counts down any integer, a bignum `n` takes all or none.
 fn fnTake(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireCount(args[0]);
+    const n: usize = if (args[0].kind() != .bignum)
+        try requireCount(args[0])
+    else if (bignum_mod.isNegative(args[0])) 0 else std.math.maxInt(usize);
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
     var it = try makeSeqIter(vm, args[1]);
@@ -1494,7 +1497,9 @@ fn fnVec(vm: *VM, args: []const Value) VmError!Value {
             const heap = vm.ensureHeap();
             return vector_mod.empty(heap) catch VmError.OutOfMemory;
         },
-        .persistent_vector => s,
+        // A fresh vector carries no metadata (SEMANTICS §7), as
+        // Clojure's `vec` clears it.
+        .persistent_vector => if (heap_mod.Heap.asHeapHeader(s).getMeta() == null) s else fnWithMeta(vm, &.{ s, value_mod.nilValue() }),
         else => blk: {
             var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
@@ -2664,14 +2669,21 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(ex-info msg data)` / `(ex-info msg data cause)` → the map
 /// `{:message msg :data data}` (+ `:cause`) for `throw`; `catch`
-/// takes it by `any` or by the `:error` of its data. Keys are
-/// interned at the call, not at boot.
+/// takes it by `any` or by the `:error` of its data. As Clojure's,
+/// `msg` is a string or nil and `data` a map, nil meaning `{}`;
+/// anything else is `:kind-mismatch`. Keys are interned at the call,
+/// not at boot.
 fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const interner = vm.ensureInterner();
+    if (!args[0].isNil() and args[0].kind() != .string) return VmError.KindMismatch;
+    if (!args[1].isNil() and !isMap(args[1].kind())) return VmError.KindMismatch;
     var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    var fields: [3]Value = undefined;
+    @memcpy(fields[0..args.len], args);
+    if (args[1].isNil()) fields[1] = m;
     const names = [_][]const u8{ "message", "data", "cause" };
-    for (args, 0..) |v, i| {
+    for (fields[0..args.len], 0..) |v, i| {
         const key = interner.internKeywordValue(names[i]) catch return VmError.OutOfMemory;
         m = try mapPut(heap, m, key, v);
     }
