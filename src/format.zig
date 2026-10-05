@@ -138,18 +138,12 @@ pub fn format(
             const nf = vm_mod.asNativeFn(v);
             try writer.print("#<native-fn {s}>", .{nf.name});
         },
-        // Identity-valued kinds format opaquely in BOTH modes per
-        // — they have no canonical source form, so
-        // readable mode's output is intentionally not reader-
-        // round-trippable. The codec is the serialization layer;
-        // these kinds throw `:unserializable` there.
+        // Identity-valued kinds format opaquely in both modes: they
+        // have no source form, so readable output does not read
+        // back. The codec refuses them as `:unserializable`.
         .atom => try writer.writeAll("#<atom>"),
-        // Protocols + protocol_fn are opaque
-        // identity-valued. Format prints `#<protocol id=N>` and
-        // `#<protocol-fn proto=P method=M>` (interned-name
-        // resolution lives in the VM and is intentionally not
-        // wired into format.zig to keep this module dependency-
-        // free of the VM internals).
+        // A protocol's name lives in the VM's protocol registry,
+        // which the printer is not given, so both print their ids.
         .protocol => try writer.print("#<protocol id={d}>", .{protocol_mod.protocolId(v)}),
         .protocol_fn => try writer.print(
             "#<protocol-fn proto={d} method={d}>",
@@ -201,7 +195,35 @@ pub fn formatFloatJava(f: f64, writer: *std.Io.Writer) Error!void {
     var buf: [64]u8 = undefined;
     const mag = @abs(f);
     if (mag != 0 and (mag >= 1e7 or mag < 1e-3)) {
-        const text = std.mem.print(&buf, "{e}", .{f}) catch unreachable;
+        var text = std.mem.print(&buf, "{e}", .{f}) catch unreachable;
+        // A one-digit shortest form: Java takes the closest of the
+        // one- and two-digit decimals that read back as `f`. Only the
+        // least subnormals tell them apart: 4.9E-324, not 5.0E-324.
+        const sign_len: usize = @intFromBool(f < 0);
+        if (std.mem.findScalar(u8, text, 'e').? == sign_len + 1) {
+            var exp = std.fmt.parseInt(i32, text[sign_len + 2 ..], 10) catch unreachable;
+            // `mag` over 10^(exp - 1), in f128, whose range and
+            // precision hold it closely enough to round to two digits;
+            // the one-digit form may have rounded up a power of ten.
+            var scale: f128 = 1;
+            for (0..@abs(exp - 1)) |_| scale *= 10;
+            var scaled = if (exp - 1 < 0) @as(f128, mag) * scale else @as(f128, mag) / scale;
+            if (scaled < 10) {
+                scaled *= 10;
+                exp -= 1;
+            }
+            var digits: u32 = @intFromFloat(@round(scaled));
+            if (digits == 100) {
+                digits = 10;
+                exp += 1;
+            }
+            var two_buf: [32]u8 = undefined;
+            const two = std.mem.print(&two_buf, "{s}{d}.{d}e{d}", .{ text[0..sign_len], digits / 10, digits % 10, exp }) catch unreachable;
+            if ((std.fmt.parseFloat(f64, two) catch f + 1) == f) {
+                @memcpy(buf[0..two.len], two);
+                text = buf[0..two.len];
+            }
+        }
         const e_idx = std.mem.findScalar(u8, text, 'e').?;
         const mantissa = text[0..e_idx];
         try writer.writeAll(mantissa);
@@ -300,11 +322,11 @@ fn formatVector(
     interner: ?*const intern_mod.Interner,
 ) Error!void {
     try writer.writeByte('[');
-    const n = vector_mod.count(v);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (i > 0) try writer.writeByte(' ');
-        try format(vector_mod.nth(v, i), mode, writer, interner);
+    var it = vector_mod.Cursor.init(v);
+    var first = true;
+    while (it.next()) |x| : (first = false) {
+        if (!first) try writer.writeByte(' ');
+        try format(x, mode, writer, interner);
     }
     try writer.writeByte(']');
 }
@@ -391,18 +413,18 @@ fn formatDurableRef(
     writer: *std.Io.Writer,
     _: ?*const intern_mod.Interner,
 ) Error!void {
-    // Identity-triple shape: store_id is u128 (large but stable);
-    // tree_name + key_bytes are typically short strings.
-    // KEY BYTES are arbitrary (any byte 0x00..0xFF
-    // is legal), so printing them raw can sneak control chars,
-    // `>`, newlines, or invalid UTF-8 into the output and break
-    // the opaque-token envelope. Hex-encode them so the printed
-    // form is always one-line, single-byte-per-nybble, and safe
-    // in any terminal.
-    const tree = db_mod.refTreeName(v);
-    const key = db_mod.refKeyBytes(v);
-    try writer.print("#<durable-ref :{s} hex:", .{tree});
-    for (key) |b| try writer.print("{X:0>2}", .{b});
+    // The tree name and the key bytes may hold any byte, so neither
+    // is printed raw: a control character, a space, `>` or invalid
+    // UTF-8 would break the one-line opaque token. The key is hex;
+    // the tree, usually a plain name, keeps its printable ASCII and
+    // writes any other byte, and `\`, as `\xHH`.
+    try writer.writeAll("#<durable-ref :");
+    for (db_mod.refTreeName(v)) |b| switch (b) {
+        '!'...'=', '?'...'[', ']'...'~' => try writer.writeByte(b),
+        else => try writer.print("\\x{X:0>2}", .{b}),
+    };
+    try writer.writeAll(" hex:");
+    for (db_mod.refKeyBytes(v)) |b| try writer.print("{X:0>2}", .{b});
     try writer.writeByte('>');
 }
 
@@ -453,6 +475,12 @@ test "floats: NaN and the infinities print as the reader reads them in either mo
         .{ .f = -std.math.inf(f64), .printed = "##-Inf", .java = "-Infinity" },
         .{ .f = std.math.nan(f64), .printed = "##NaN", .java = "NaN" },
         .{ .f = 2.5, .printed = "2.5", .java = "2.5" },
+        .{ .f = 5e-324, .printed = "4.9E-324", .java = "4.9E-324" },
+        .{ .f = -1e-323, .printed = "-9.9E-324", .java = "-9.9E-324" },
+        .{ .f = 1.5e-323, .printed = "1.5E-323", .java = "1.5E-323" },
+        .{ .f = 1e-5, .printed = "1.0E-5", .java = "1.0E-5" },
+        .{ .f = 1e23, .printed = "1.0E23", .java = "1.0E23" },
+        .{ .f = 1.7976931348623157e308, .printed = "1.7976931348623157E308", .java = "1.7976931348623157E308" },
     };
     for (cases) |c| {
         for ([_]FormatMode{ .display, .readable }) |mode| {
@@ -599,6 +627,22 @@ test "records: #ns.Type{...} in both modes once the interner names the type; opa
     const display = try formatForTest(r, .display, &it);
     defer testing.allocator.free(display);
     try testing.expectEqualStrings("#user.P{:x 1, :y a}", display);
+}
+
+test "a durable ref prints its tree's odd bytes escaped and its key in hex" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    const plain = try db_mod.refFromBytes(&heap, 1, "users", "k1");
+    const odd = try db_mod.refFromBytes(&heap, 1, "a b>\\\n\u{e9}", "\x00>");
+    const cases = [_]struct { v: Value, expect: []const u8 }{
+        .{ .v = plain, .expect = "#<durable-ref :users hex:6B31>" },
+        .{ .v = odd, .expect = "#<durable-ref :a\\x20b\\x3E\\x5C\\x0A\\xC3\\xA9 hex:003E>" },
+    };
+    for (cases) |c| {
+        const got = try formatForTest(c.v, .readable, null);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c.expect, got);
+    }
 }
 
 test "a collection nested past the stack guard prints #<too deep> and counts an overflow" {

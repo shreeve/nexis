@@ -7,17 +7,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
-## Bugs
-
-1. **`(long ##NaN)`: the spec and the code disagree.**
-   `docs/SEMANTICS.md` §2.2 says `(long x)` raises `:invalid-argument`
-   for NaN and the infinities. The code returns 0 for NaN, and
-   `test/integration/numbers.zig` pins `(long ##NaN)` as `"0"`; the
-   infinities raise as written. The code is Clojure's: `RT.longCast(double)`
-   (Clojure 1.12.0) throws only when `x < Long.MIN_VALUE ||
-   x > Long.MAX_VALUE`, which NaN fails both of, and casts NaN to 0.
-   Fix the spec: NaN is 0, the infinities raise.
-
 ## Performance
 
 2. **Small transactions.** 20,000 `transact!` calls of one entity with

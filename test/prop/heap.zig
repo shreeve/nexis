@@ -4,23 +4,23 @@
 //! with forced sweeps; no leaked or corrupted objects, all live data
 //! survives, no dangling headers. Builds on
 //! the inline tests in `src/heap.zig`; this file exists to hammer the
-//! alloc/mark/pin/free/sweep operations at scale with deterministic
+//! alloc/mark/sweep operations at scale with deterministic
 //! PRNG-driven workloads and an oracle cross-check.
 //!
 //! Properties (HEAP.md §1 + §2 invariants):
-//!   H1. Alloc / explicit-free oracle consistency — random alloc/free
-//!       sequences keep `liveCount` and `forEachLive` in lockstep with
-//!       an external oracle ArrayList of live pointers.
-//!   H2. Sweep preserves exactly the marked ∪ pinned set; `freed`
-//!       matches the oracle's count of un-marked-and-un-pinned blocks;
-//!       survivors have `marked == 0` and `pinned` unchanged.
+//!   H1. Alloc / sweep oracle consistency — random allocations and
+//!       drops keep `liveCount` in lockstep with an external oracle
+//!       ArrayList of live pointers through repeated sweeps.
+//!   H2. Sweep preserves exactly the marked set; `freed` matches the
+//!       oracle's count of unmarked blocks; survivors have
+//!       `marked == 0`.
 //!   H3. Alloc / sweep cycles don't leak across K iterations (the
 //!       SafeAllocator behind `std.testing.allocator` is the oracle).
 //!   H4. Body bytes on a sweep survivor are unchanged by the sweep.
-//!   H5. Header side-fields (pinned, cached hash, meta) on a survivor
-//!       are intact after sweep; only the `marked` bit clears.
-//!   H6. Interleaved alloc + explicit-free + mark + pin + sweep never
-//!       corrupts the live list — oracle cross-check after every step.
+//!   H5. Header side-fields (cached hash, meta) on a survivor are
+//!       intact after sweep; only the `marked` bit clears.
+//!   H6. Interleaved alloc + mark + sweep never corrupts the live
+//!       set — oracle cross-check after every step.
 //!   H7. Zero-body and 64 KiB allocations coexist through many cycles.
 //!   H8. Read-only `forEachLive` visits exactly `liveCount` distinct
 //!       blocks, and only blocks the oracle tracks as live.
@@ -41,8 +41,8 @@ const prng_seed: u64 = 0x6865_6170_5F70_726F; // "heap_pro" ASCII LE
 // -----------------------------------------------------------------------------
 // Oracle: tracks the expected live set as an ArrayList of *HeapHeader.
 // Entries are removed (via swap-remove for O(1)) when the corresponding
-// block is explicitly freed or swept. The test never dereferences a
-// pointer removed from the oracle.
+// block is dropped or swept. The test never dereferences a pointer
+// removed from the oracle.
 // -----------------------------------------------------------------------------
 
 const Oracle = struct {
@@ -102,10 +102,10 @@ fn verifyBody(h: *HeapHeader, seed: u8) !void {
 }
 
 // -----------------------------------------------------------------------------
-// H1. Alloc / explicit-free oracle consistency.
+// H1. Alloc / sweep oracle consistency.
 // -----------------------------------------------------------------------------
 
-test "H1: alloc + free oracle consistency over 2000 random ops" {
+test "H1: alloc + drop + sweep oracle consistency over 2000 random ops" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -116,37 +116,36 @@ test "H1: alloc + free oracle consistency over 2000 random ops" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
     const r = prng.random();
 
+    var dropped: usize = 0;
     var i: usize = 0;
     while (i < 2000) : (i += 1) {
-        // 60% alloc, 40% free (if non-empty). Biased toward growth so
-        // the oracle exercises a full range of sizes, not just churn.
-        const do_free = oracle.count() > 0 and r.uintLessThan(u8, 10) < 4;
-        if (do_free) {
-            const idx = r.uintLessThan(usize, oracle.count());
-            const h = oracle.removeAt(idx);
-            heap.free(h);
+        // 60% alloc, 35% drop (if non-empty), 5% sweep. Biased toward
+        // growth so the oracle exercises a full range of sizes.
+        const roll = r.uintLessThan(u8, 100);
+        if (roll < 35 and oracle.count() > 0) {
+            _ = oracle.removeAt(r.uintLessThan(usize, oracle.count()));
+            dropped += 1;
+        } else if (roll < 40) {
+            for (oracle.live.items) |h| h.setMarked();
+            try std.testing.expectEqual(dropped, heap.sweepUnmarked());
+            dropped = 0;
         } else {
             const kind = randHeapKind(r);
             const body_size = r.uintLessThan(usize, 64);
             const h = try heap.alloc(kind, body_size);
             try oracle.add(gpa, h);
         }
-        try std.testing.expectEqual(oracle.count(), heap.liveCount());
+        try std.testing.expectEqual(oracle.count() + dropped, heap.liveCount());
     }
-    // Drain the rest explicitly; deinit will otherwise handle it, but
-    // we want to exercise the free path on every allocation.
-    while (oracle.count() > 0) {
-        const h = oracle.removeAt(oracle.count() - 1);
-        heap.free(h);
-    }
+    try std.testing.expectEqual(oracle.count() + dropped, heap.sweepUnmarked());
     try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
 }
 
 // -----------------------------------------------------------------------------
-// H2. Sweep preserves exactly the marked ∪ pinned set.
+// H2. Sweep preserves exactly the marked set.
 // -----------------------------------------------------------------------------
 
-test "H2: sweep frees exactly the un-marked-and-un-pinned set" {
+test "H2: sweep frees exactly the unmarked set" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -162,19 +161,14 @@ test "H2: sweep frees exactly the un-marked-and-un-pinned set" {
     defer gpa.free(headers);
     const expected_survive = try gpa.alloc(bool, N);
     defer gpa.free(expected_survive);
-    const expected_pinned = try gpa.alloc(bool, N);
-    defer gpa.free(expected_pinned);
 
     for (headers) |*slot| {
         slot.* = try heap.alloc(.string, r.uintLessThan(usize, 32));
     }
     for (headers, 0..) |h, i| {
         const marked = r.boolean();
-        const pinned = r.boolean();
         if (marked) h.setMarked();
-        if (pinned) h.setPinned();
-        expected_survive[i] = marked or pinned;
-        expected_pinned[i] = pinned;
+        expected_survive[i] = marked;
     }
 
     var expected_freed: usize = 0;
@@ -186,20 +180,11 @@ test "H2: sweep frees exactly the un-marked-and-un-pinned set" {
     try std.testing.expectEqual(expected_freed, freed);
     try std.testing.expectEqual(N - expected_freed, heap.liveCount());
 
-    // Full per-index cross-check: every surviving header still has
-    // its original pinned bit, the marked bit cleared. Non-survivors
-    // are not dereferenced — their storage is gone.
+    // Full per-index cross-check: every surviving header has its
+    // marked bit cleared. Non-survivors are not dereferenced — their
+    // storage is gone.
     for (headers, 0..) |h, i| {
-        if (expected_survive[i]) {
-            try std.testing.expect(!h.isMarked());
-            try std.testing.expectEqual(expected_pinned[i], h.isPinned());
-        }
-    }
-
-    // Clear pinned bits on survivors so heap.deinit reclaims them
-    // cleanly against the testing-allocator leak tracker.
-    for (headers, 0..) |h, i| {
-        if (expected_survive[i]) h.clearPinned();
+        if (expected_survive[i]) try std.testing.expect(!h.isMarked());
     }
 }
 
@@ -274,16 +259,14 @@ test "H4: body bytes survive a sweep cycle on a marked object" {
 // H5. Header side-fields on a survivor are intact after sweep.
 // -----------------------------------------------------------------------------
 
-test "H5: pinned / cachedHash / meta preserved across sweep; marked clears" {
+test "H5: cachedHash / meta preserved across sweep; marked clears" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
 
-    // Survivor carries all three side-fields. Pin it (ensures survival
-    // independent of mark). Also set a cached hash and attach meta.
+    // The survivor carries a cached hash and a meta map.
     const m = try heap.alloc(.persistent_map, 0);
     const h = try heap.alloc(.string, 0);
-    h.setPinned();
     h.setMarked();
     h.setCachedHash(0xABCD_1234);
     h.setMeta(m);
@@ -294,29 +277,22 @@ test "H5: pinned / cachedHash / meta preserved across sweep; marked clears" {
         _ = try heap.alloc(.bignum, 0);
     }
     // `m` also needs to survive so `h.meta` stays valid post-sweep.
-    m.setPinned();
+    m.setMarked();
 
     const freed = heap.sweepUnmarked();
     try std.testing.expectEqual(@as(usize, 16), freed);
 
-    try std.testing.expect(h.isPinned());
     try std.testing.expect(!h.isMarked()); // cleared by sweep
     try std.testing.expectEqual(@as(?u32, 0xABCD_1234), h.cachedHash());
     try std.testing.expect(h.hasMeta());
     try std.testing.expectEqual(@as(?*HeapHeader, m), h.getMeta());
-
-    // Clear pinned flags so heap.deinit reclaims everything cleanly
-    // against the testing allocator's leak tracker.
-    h.clearPinned();
-    m.clearPinned();
-    h.setMeta(null); // drop the cross-reference before teardown
 }
 
 // -----------------------------------------------------------------------------
 // H6. Interleaved workload oracle-check after every op.
 // -----------------------------------------------------------------------------
 
-test "H6: alloc + free + mark + pin + sweep interleaved, oracle-verified" {
+test "H6: alloc + mark + sweep interleaved, oracle-verified" {
     const gpa = std.testing.allocator;
     var heap = Heap.init(gpa);
     defer heap.deinit();
@@ -330,29 +306,22 @@ test "H6: alloc + free + mark + pin + sweep interleaved, oracle-verified" {
     var step: usize = 0;
     while (step < 1500) : (step += 1) {
         // Operation probabilities chosen so the live set oscillates
-        // rather than drifting to zero or maxing out: 50% alloc, 15%
-        // free, 15% mark, 10% pin, 10% sweep.
+        // rather than drifting to zero or maxing out: 50% alloc, 35%
+        // mark, 15% sweep.
         const roll = r.uintLessThan(u8, 100);
         if (roll < 50) {
             const h = try heap.alloc(.string, r.uintLessThan(usize, 48));
             try oracle.add(gpa, h);
-        } else if (roll < 65 and oracle.count() > 0) {
-            const idx = r.uintLessThan(usize, oracle.count());
-            const h = oracle.removeAt(idx);
-            heap.free(h);
-        } else if (roll < 80 and oracle.count() > 0) {
+        } else if (roll < 85 and oracle.count() > 0) {
             const idx = r.uintLessThan(usize, oracle.count());
             oracle.live.items[idx].setMarked();
-        } else if (roll < 90 and oracle.count() > 0) {
-            const idx = r.uintLessThan(usize, oracle.count());
-            oracle.live.items[idx].setPinned();
         } else {
-            // Sweep: rebuild the oracle to hold only marked-or-pinned
-            // survivors (which is what the heap will keep).
+            // Sweep: rebuild the oracle to hold only marked survivors
+            // (which is what the heap will keep).
             var kept: Oracle = .{};
             defer kept.deinit(gpa);
             for (oracle.live.items) |h| {
-                if (h.isMarked() or h.isPinned()) {
+                if (h.isMarked()) {
                     try kept.add(gpa, h);
                 }
             }
@@ -368,9 +337,6 @@ test "H6: alloc + free + mark + pin + sweep interleaved, oracle-verified" {
         }
         try std.testing.expectEqual(oracle.count(), heap.liveCount());
     }
-
-    // Teardown: clear pins, drop remaining; heap.deinit handles the rest.
-    for (oracle.live.items) |h| h.clearPinned();
 }
 
 // -----------------------------------------------------------------------------

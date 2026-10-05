@@ -39,8 +39,8 @@ options: any extra argument is `:arity-mismatch`.
 
 ### 2. Storage
 
-An atom is a heap block of kind 34 on the heap's live list, reclaimed
-by sweep when unreachable. Its body, `AtomBox`, is 24 bytes: the
+An atom is a heap block of kind 34, freed by the sweep when
+unreachable. Its body, `AtomBox`, is 24 bytes: the
 contained `value` (16 bytes), the `in_flight` re-entrancy byte, and
 padding. `atom.make` allocates it; `getValue` and `setValue` read and
 write the value; `tryEnterCritical` and `exitCritical` own the flag.

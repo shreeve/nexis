@@ -102,13 +102,6 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     return raw;
 }
 
-/// GC trace function (GC.md §5). Strings are leaf heap kinds — their
-/// bodies are raw UTF-8 bytes with no heap references.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
-}
-
 /// Per-kind equality entry point. Byte-for-byte comparison over two
 /// string headers' bodies. The dispatcher has already verified both
 /// are `.string`; we assert as defense-in-depth in safe builds.
@@ -140,7 +133,9 @@ pub fn bytesEqual(a: *HeapHeader, b: *HeapHeader) bool {
 //     the position asked for. The runtime caller (`stdlib.zig`) maps
 //     that to `:utf8-error` (catchable). The storage layer does not
 //     pre-validate bytes (a codec round trip keeps them byte-exact).
-//   - Codepoint count is NOT cached on the HeapHeader.
+//   - Codepoint count is not cached; whether the string is all ASCII
+//     is, in the header's flags, so count and index are O(1) on an
+//     ASCII string.
 
 /// Length of the ASCII run at the start of `bytes`.
 fn asciiPrefixLen(bytes: []const u8) usize {
@@ -154,23 +149,45 @@ fn asciiPrefixLen(bytes: []const u8) usize {
     return i;
 }
 
-/// One validated scalar at `bytes[pos..]`, and its byte length.
-fn decodeAt(bytes: []const u8, pos: usize) error{InvalidUtf8}!struct { scalar: u21, len: u3 } {
+/// One validated scalar at `bytes[pos..]` (`pos` within `bytes`), and
+/// its byte length: a lone continuation byte, a truncated sequence, an
+/// overlong form, a surrogate and a scalar past U+10FFFF are
+/// `error.InvalidUtf8`.
+pub fn decodeAt(bytes: []const u8, pos: usize) error{InvalidUtf8}!struct { scalar: u21, len: u3 } {
     const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch return error.InvalidUtf8;
     if (len > bytes.len - pos) return error.InvalidUtf8;
-    // utf8Decode rejects lone continuation bytes, overlong forms and
-    // surrogates.
-    const scalar = std.unicode.utf8Decode(bytes[pos..][0..len]) catch return error.InvalidUtf8;
+    const at = bytes[pos..];
+    const scalar: u21 = switch (len) {
+        1 => at[0],
+        2 => std.unicode.utf8Decode2(at[0..2].*) catch return error.InvalidUtf8,
+        3 => std.unicode.utf8Decode3(at[0..3].*) catch return error.InvalidUtf8,
+        4 => std.unicode.utf8Decode4(at[0..4].*) catch return error.InvalidUtf8,
+        else => unreachable,
+    };
     return .{ .scalar = scalar, .len = len };
 }
 
-/// Total number of Unicode codepoints in `v`. O(byteLen). Returns
+/// Whether every byte of `v` is ASCII, so a codepoint index is a
+/// byte index. The first call scans; the answer is kept in the
+/// header's flags, as the bytes never change.
+fn isAscii(v: Value) bool {
+    const h = Heap.asHeapHeader(v);
+    if (h.flags & heap_mod.flag_ascii_known == 0) {
+        const bytes = Heap.bodyBytes(h);
+        h.flags |= heap_mod.flag_ascii_known;
+        if (asciiPrefixLen(bytes) == bytes.len) h.flags |= heap_mod.flag_ascii;
+    }
+    return h.flags & heap_mod.flag_ascii != 0;
+}
+
+/// Total number of Unicode codepoints in `v`: O(1) for an ASCII
+/// string after the first call, O(byteLen) otherwise. Returns
 /// `error.InvalidUtf8` if the body contains an invalid byte
 /// sequence.
 pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
     const bytes = asBytes(v);
+    if (isAscii(v)) return bytes.len;
     const ascii = asciiPrefixLen(bytes);
-    if (ascii == bytes.len) return ascii;
     return ascii + (std.unicode.utf8CountCodepoints(bytes[ascii..]) catch return error.InvalidUtf8);
 }
 
@@ -179,6 +196,7 @@ pub fn codepointCount(v: Value) error{InvalidUtf8}!usize {
 /// byte sequence anywhere up to position `i`.
 pub fn codepointAt(v: Value, i: usize) error{ OutOfBounds, InvalidUtf8 }!u21 {
     const bytes = asBytes(v);
+    if (isAscii(v)) return if (i < bytes.len) bytes[i] else error.OutOfBounds;
     const ascii = asciiPrefixLen(bytes[0..@min(bytes.len, i +| 1)]);
     if (i < ascii) return bytes[i];
     var byte_pos = ascii;
@@ -207,6 +225,7 @@ pub fn byteRangeForCodepoints(
 ) error{ OutOfBounds, InvalidUtf8 }!struct { start: usize, end: usize } {
     if (start > end) return error.OutOfBounds;
     const bytes = asBytes(v);
+    if (isAscii(v)) return if (end <= bytes.len) .{ .start = start, .end = end } else error.OutOfBounds;
     const ascii = asciiPrefixLen(bytes[0..@min(bytes.len, end)]);
     if (end <= ascii) return .{ .start = start, .end = end };
     var byte_start: ?usize = if (start <= ascii) start else null;
@@ -314,8 +333,7 @@ pub fn countMatches(hay: []const u8, needle: []const u8) usize {
 // =============================================================================
 
 /// Pack a fully-constructed `.string` header into a Value with the
-/// correct kind, subkind, and zeroed flags/aux. Factored so the SSO
-/// and zero-copy subkind paths can compose cleanly when they land.
+/// correct kind, subkind, and zeroed flags/aux.
 fn valueFrom(h: *HeapHeader) Value {
     return .{
         .tag = @as(u64, @backingInt(Kind.string)) |
@@ -329,8 +347,9 @@ fn valueFrom(h: *HeapHeader) Value {
 // test/prop/string.zig.
 // =============================================================================
 
-/// `s` repeated `n` times, for building long test strings.
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+/// `s` repeated `n` times, for building long test strings; the tree's
+/// one copy (`vm.zig` and the Nextomic store tests use it too).
+pub fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
     return comptime blk: {
         @setEvalBranchQuota(2 * n + 1000);
         var buf: [s.len * n]u8 = undefined;
@@ -577,11 +596,11 @@ fn expectMatches(hay: []const u8, needle: []const u8, from: usize) !void {
 }
 
 test "Matches: occurrences across block edges, at both ends, overlapping and past the end" {
-    const long = "a,b,,c" ++ repeat("x", 40) ++ ",," ++ repeat("y,", 30) ++ "z,";
+    const long = "a,b,,c" ++ @as([40]u8, @splat('x')) ++ ",," ++ repeat("y,", 30) ++ "z,";
     try expectMatches(long, ",", 0);
     try expectMatches(long, ",,", 0);
     try expectMatches(long, "y,y", 0);
-    try expectMatches(long, repeat("x", 33), 0);
+    try expectMatches(long, &@as([33]u8, @splat('x')), 0);
     try expectMatches(long, ",", 7);
     try expectMatches(long, "z,", 0);
     try expectMatches("aaaa", "aa", 0);
@@ -639,6 +658,23 @@ test "codepointCount: ASCII + multi-byte sequences" {
         const v = try fromBytes(&heap, c.s);
         try testing.expectEqual(c.count, try codepointCount(v));
     }
+}
+
+test "codepointCount: an ASCII string is scanned once, then counted and indexed by its length" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const ascii = try fromBytes(&heap, "hello");
+    const h = Heap.asHeapHeader(ascii);
+    try testing.expectEqual(@as(u8, 0), h.flags);
+    try testing.expectEqual(@as(usize, 5), try codepointCount(ascii));
+    try testing.expectEqual(heap_mod.flag_ascii_known | heap_mod.flag_ascii, h.flags);
+    try testing.expectEqual(@as(u21, 'o'), try codepointAt(ascii, 4));
+    try testing.expectError(error.OutOfBounds, codepointAt(ascii, 5));
+    try testing.expectError(error.OutOfBounds, byteRangeForCodepoints(ascii, 0, 6));
+    const mixed = try fromBytes(&heap, "h\u{e9}llo");
+    try testing.expectEqual(@as(u21, 0xe9), try codepointAt(mixed, 1));
+    try testing.expectEqual(heap_mod.flag_ascii_known, Heap.asHeapHeader(mixed).flags);
+    try testing.expectEqual(@as(usize, 5), try codepointCount(mixed));
 }
 
 test "codepointCount: invalid UTF-8 returns error" {

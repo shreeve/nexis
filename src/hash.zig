@@ -72,17 +72,14 @@ pub inline fn nameHash(name: []const u8) u32 {
     return @truncate(hashBytes(name));
 }
 
-/// Hash a 64-bit signed integer in a fixed (little-endian) byte order.
-/// This is the canonical int hasher used by fixnum and (for small
-/// values) bignum canonicalizations.
+/// Hash a 64-bit signed integer: its two's-complement bits through
+/// `hashU64`. The fixnum hasher.
 pub fn hashI64(n: i64) u64 {
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(i64, &buf, n, .little);
-    return hashBytes(&buf);
+    return hashU64(@bitCast(n));
 }
 
-/// Hash an unsigned 64-bit integer (used for name hashes, store-ids,
-/// bignum limb blocks, etc.) in fixed-endian.
+/// Hash an unsigned 64-bit integer in a fixed (little-endian) byte
+/// order: name hashes, identity pointers, counts, Nextomic db fields.
 pub fn hashU64(n: u64) u64 {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, n, .little);
@@ -176,9 +173,8 @@ pub inline fn finalizeUnordered(h: u64, count: usize) u64 {
 // Convenience: seed + starting values
 // -----------------------------------------------------------------------------
 
-/// Initial accumulator for `combineOrdered`. Equivalent to hashing the
-/// empty byte slice — the identity for subsequent `combineOrdered`
-/// calls.
+/// Initial accumulator for `combineOrdered`, Clojure's starting value
+/// for an ordered collection hash.
 pub const ordered_init: u64 = 1;
 
 /// Initial accumulator for `combineUnordered`. Zero is the additive

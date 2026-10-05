@@ -213,8 +213,11 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
 - `var_`: the Var's value in force (the binding under `binding`, else
   the root) is called with the same arguments, as Clojure's
   `Var.invoke`: `(#'inc 1)` is 2; `:unbound-var` while it is unbound.
+  A closure there takes the frame transfer below, so a recursion
+  through `#'f` costs no native stack.
 - `keyword`, `symbol`, `persistent_map`, `persistent_set`,
-  `persistent_vector`, `transient`: a lookup with an optional default,
+  `persistent_vector`, `sorted_map`, `sorted_set`, `transient`: a
+  lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
   symbol looks itself up exactly as a keyword does, and a transient
   map, set or vector as its persistent kind.
@@ -281,8 +284,11 @@ never re-enters the VM and never compares, hashes or prints nested
 data (arithmetic, numeric predicates, `nth`), so nothing under it can
 collect, grow the stack or move the deep-data overflow count (§13.1).
 `call:call` passes it its arguments in place on the stack, and
-`callValue` calls it without the root scope, the stack guard or the
-overflow check. Its arity is checked, and reported, as any native's.
+`callValue` and a `Callback` call it without the root scope, the stack
+guard or the overflow check while no cycle is due; once one is, the
+call takes `callValue`'s rooted path and its safe point, so a native
+that calls a leaf per element (`(reduce * xs)`) collects as it goes.
+Its arity is checked, and reported, as any native's.
 
 ---
 
@@ -324,6 +330,7 @@ collector root (§9).
 | `upvalues` | The closure's cell array (shared, not owned) |
 | `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block and its cells alive for the frame's life |
 | `return_dst`, `return_pc` | Where the caller receives the result and resumes |
+| `host_result` | For a frame `callValue`, `runRoutine` or a `Callback` pushed: the cell its return writes instead of a caller's slot (`HostCallResult`) |
 
 A frame is pushed by `call:call` and by `callValue` / `runRoutine`,
 and popped by a return or discarded by a throw that unwinds past it.
@@ -415,36 +422,17 @@ heap. Vars, namespaces and routines live in `VM.runtime_arena` or the
 compiler's persistent allocator for the VM's life. `VM.deinit` frees
 the heap block by block and the arena wholesale.
 
-**The VM hosts the collector** (`docs/GC.md` §3, §7). `VM.gcRoots`
-marks, in order: the whole backing stack (every slot, which needs no
-per-PC liveness map); each frame's closure (its trace reaches the
-cells and routine constants) or, for a frame without one, its
-routine's constants, recursively through nested routines; every Var
-of every namespace (`root`, `meta`, `thread_value`); the saved
-dynamic bindings; the root stack (`vm.roots`); the values of pending
-`finally` throws; the values of throw origins (`vm.origins`, §12);
-`vm.unhandled_throw`; `vm.result`; and the
-protocol registry's implementations. `VM.gcTrace` traces a closure
-(cells, then routine constants) and a cell (its value).
-
-**Trigger and safe point.** `VM.gcDue` is tested only at an
-instruction fetch (§8): where `VM.loop` enters the chain and after
-an instruction that could have allocated, which is `math` through the
-numeric tower, a `call:call` that ran a native, a protocol fn or a
-lookup other than the in-place keyword lookup of §8, or entered a
-closure through the general entry of §6, and every `closure`, `coll`
-and `ctrl` instruction. After any other instruction the heap's counter
-cannot have moved. A cycle is due when the heap has allocated
-`gc_next_at` bytes since the last one: the larger of `gc_threshold`
-and `gc_growth_percent` percent of the bytes that survived
-(`GcPolicy.default` 16 MiB and 100 %; `GcPolicy.stress`, selected by
-`NEXIS_GC_STRESS`, 4 KiB and 0 %). `Heap.alloc` never collects, so
-what the VM or a native builds within one instruction needs no
-rooting; a native that keeps a callback's result across a further
-call into the VM roots it (`docs/GC.md` §11.5). A VM over a borrowed
-heap (the expander's macro sub-VMs) has `gc_enabled = false`.
-`VM.collectGarbage` runs one cycle and sizes the next window;
-`gc_cycles` counts them.
+**The VM hosts the collector.** `VM.gcRoots` marks the roots
+`docs/GC.md` §3 lists, and `VM.gcTrace` traces a closure (cells, then
+routine constants) and a cell (its value). When a cycle is due and
+the safe points that run one (instruction fetches after an
+instruction that could allocate, and `callValue` of anything but a
+closure) are `docs/GC.md` §7. `Heap.alloc` never collects, so what
+the VM or a native builds within one instruction needs no rooting; a
+native that keeps a value across a call into the VM roots it
+(`docs/GC.md` §11.5). A VM over a borrowed heap (the expander's macro
+sub-VMs) has `gc_enabled = false`. `VM.collectGarbage` runs one cycle
+and sizes the next window; `gc_cycles` counts them.
 
 #### 9.1 Sub-VMs
 
@@ -495,8 +483,9 @@ Group and variant numbers are the enums in `src/vm.zig` (`Group`,
 
 A group number outside the enum is `BytecodeCorruption`; an
 undispatched group traps `UnimplementedOpcode`. A variant number
-outside its group's enum is `BytecodeCorruption`, except in `mov`
-and `call`, where it traps `UnimplementedOpcode`.
+outside its group's enum is `BytecodeCorruption` in every group; a
+reserved variant inside it (`call:tailcall`, `math:pow`, `ctrl:halt`)
+traps `UnimplementedOpcode`.
 
 #### 10.1 `mov`
 
@@ -526,7 +515,7 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 0 | `math:add` | A=slot, B=any, C=any | `+` |
 | 1 | `math:sub` | A=slot, B=any, C=any | `-` |
 | 2 | `math:mul` | A=slot, B=any, C=any | `*` |
-| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise a float; `:divide-by-zero` for a zero divisor of any kind, a NaN operand the result first (SEMANTICS.md §2.2) |
+| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise the nearest float; `:divide-by-zero` for a zero divisor of any kind, a NaN operand the result first (SEMANTICS.md §2.2) |
 | 4 | `math:idiv` | A=slot, B=any, C=any | `quot`, truncated; `:divide-by-zero` |
 | 5 | `math:mod` | A=slot, B=any, C=any | `mod`, floored (sign of the divisor); `:divide-by-zero` |
 | 6 | `math:pow` | | Traps `UnimplementedOpcode` |
@@ -540,10 +529,10 @@ i48 is a bignum on the VM's heap, and a non-number is
 The arithmetic natives call the same tower functions (`+` of two
 fixnums, and `inc` and `dec` of one, compute inline when the result
 is a fixnum, as the handlers do), so `(+ a b)` through a Var and the
-inlined `math:add` agree exactly. A float
-divisor of zero gives IEEE infinity or NaN for `/`; `quot`, `rem`
-and `mod` raise for either kind (`(mod 1 0.0)` raises, as in
-Clojure).
+inlined `math:add` agree exactly. `/`, `quot`, `rem` and `mod`
+raise for a zero divisor of either kind (`(/ 1.0 0)` and `(mod 1
+0.0)` raise, as in Clojure); a NaN operand of `/` is its result
+first.
 
 #### 10.4 `cmp`
 
@@ -749,12 +738,12 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
 | `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
-| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map, set, vector or transient |
+| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map or set (hash or sorted), vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
 | `NoThreadBinding` | `:no-thread-binding` | `set!` on a dynamic Var with no binding in force |
 | `ArithmeticOverflow` | `:arithmetic-overflow` | A count or identifier the runtime produces does not fit a fixnum; arithmetic never raises it (results promote to bignums) |
-| `DivideByZero` | `:divide-by-zero` | `/` with an integer zero divisor; `quot`, `rem`, `mod` with a zero divisor of either kind |
+| `DivideByZero` | `:divide-by-zero` | `/`, `quot`, `rem`, `mod` with a zero divisor of either kind |
 | `IndexOutOfBounds` | `:index-out-of-bounds` | `nth` and friends past the end |
 | `DbError`, `DbClosed`, `InvalidDurableRef`, `CodecFailed`, `TxClosed` | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |
 | `NotDerefable` | `:not-derefable` | `deref` of a value that is not a durable ref, Var, atom, delay or `reduced` |
@@ -762,7 +751,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | `TransientUsedAfterPersistent` | `:transient-used-after-persistent` | A transient called or looked up after `persistent!` froze it (`docs/TRANSIENT.md` §6) |
 | `Utf8Error`, `InvalidArgument`, `IoError`, `FileNotFound`, `InvalidPath` | `:utf8-error`, `:invalid-argument`, `:io-error`, `:file-not-found`, `:invalid-path` | String, math and I/O natives |
 | `NotARecord`, `NoProtocolImpl`, `NoProtocolMethod` | `:not-a-record`, `:no-protocol-impl`, `:no-protocol-method` | Records and protocols (`docs/PROTOCOLS.md`) |
-| `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |
+| `StackOverflow` | `:stack-overflow` | A call would push frame number `VM.max_frames` (default 2^20; an embedder may set it); a native re-entering the VM finds the native stack past the guard, or `VM.max_nested_runs` run loops nested (§13.1); or `=`, `hash` or printing inside a call or opcode met data nested past the guard (SEMANTICS.md §2.7). Runaway recursion ends in well under a second; legitimate recursion a hundred thousand calls deep runs |
 
 Natives also throw keywords of their own through `throwKeyword` or a
 thrown map, documented with the native: `:unserializable`
@@ -826,13 +815,16 @@ parked top frame (resting on `idle_routine`) is left out.
 `VM.traced_error` names the error. `runRoutine` records the same way
 when a nested run fails, so a host that learns of the failure
 indirectly (the loader ran a required file while compiling a form)
-reports it with its chain. A chain longer than 40 frames keeps its
-innermost 32 and outermost 8 around one marker frame named `<N
-frames elided>` (no span, no source), so a runaway recursion lists
-41 lines. The next failing run rebuilds the trace. `resetAfterError`
+reports it with its chain. A chain longer than 41 frames keeps its
+innermost 32 and outermost 8 around one marker frame, whose `elided`
+counts the frames it stands for (no span, no source), so
+a runaway recursion lists 41 lines. The next failing run rebuilds the trace. `resetAfterError`
 discards what a failed run left (the frames above the top-level one,
 handlers, pending finallys, the unhandled throw) so `retargetTop` can
-run the next form; the REPL calls it after reporting. The report
+run the next form, and gives back the frame and stack capacity past
+4,096 frames and 16,384 slots that a runaway recursion grew; the REPL
+calls it after reporting, and `retargetTop` calls it when the frames
+of a failed run still stand. The report
 built from the detail and the trace is `docs/TOOLING.md` §1.
 
 #### 13.1 Native stack guard
@@ -864,7 +856,11 @@ a native re-enters it, and at the first call of a closure through a
 `Callback` (§6), whose later calls start from the same native frame,
 so recursion through `apply`, `map`, `reduce`, a protocol impl or
 `eval` ends in the same catchable `:stack-overflow` as runaway
-bytecode recursion. Each layer maps the error to its own
+bytecode recursion. The same checks count the run loops nested on the
+native stack, one per such call still running, against
+`VM.max_nested_runs` (default 100,000; an embedder may set it): past
+it the call is `StackOverflow` too, so a runaway recursion through
+natives stops before it has committed much of a large thread stack. Each layer maps the error to its own
 report: the VM raises `StackOverflow`, the reader a reader error and
 the compiler a compile error. The codec and the collector walk nested
 data with heap stacks and need no guard.
