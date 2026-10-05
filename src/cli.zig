@@ -291,10 +291,8 @@ const Place = struct {
         const start = if (std.mem.findScalarLast(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
         const end = std.mem.findScalarPos(u8, all, at, '\n') orelse all.len;
         const text = std.mem.trimEnd(u8, all[start..end], "\r");
-        const offset = @min(at -| start, text.len);
-        var chars: usize = 0;
-        for (text[0..offset]) |c| chars += @intFromBool(c & 0xC0 != 0x80);
-        return .{ .line = 1 + std.mem.count(u8, all[0..at], "\n"), .col = 1 + chars, .text = text, .offset = offset };
+        const lc = info.lineCol(pos);
+        return .{ .line = lc.line, .col = lc.col, .text = text, .offset = @min(at -| start, text.len) };
     }
 };
 
@@ -435,10 +433,10 @@ const Runtime = struct {
         var stderr = std.Io.File.stderr().writerStreaming(rt.io, &buf);
         const w = &stderr.interface;
         for (trace) |frame| {
-            // The marker the VM leaves where it cut a deep chain
-            // (`<N frames elided>`) is no frame to be "at".
-            if (frame.source == null and std.mem.endsWith(u8, frame.name, " frames elided>")) {
-                try w.print("  {s}\n", .{frame.name});
+            // The marker the VM leaves where it cut a deep chain is
+            // no frame to be "at".
+            if (frame.elided > 0) {
+                try w.print("  <{d} frames elided>\n", .{frame.elided});
             } else if (frame.source) |src| {
                 if (frame.span) |span| {
                     const at = Place.of(src, span.pos);

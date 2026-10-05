@@ -171,9 +171,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   `eval` runs `<eval>` (listed by name alone: it has no source). A
   caller's position is its call. A closure a native called back
   (`map`, `reduce`) is its own frame; the native has none. A chain
-  longer than 40 frames keeps its innermost 32 and outermost 8 around
-  one line `  <N frames elided>`, which has no `at` (VM.md §13), so a
-  runaway recursion ending in `StackOverflow` lists 41 lines.
+  longer than 41 frames keeps its innermost 32 and outermost 8 around
+  one line `  <N frames elided>`, N the frames between them, which has
+  no `at` (VM.md §13; `deep-trace.err`), so a runaway recursion ending
+  in `StackOverflow` lists 41 lines.
 - Out of memory is a runtime error like the rest: `runtime error:
   OutOfMemory` at the call whose allocation failed, with its frames
   (`out-of-memory.err`). No `try` catches it (VM.md §13); what the
