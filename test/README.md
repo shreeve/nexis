@@ -28,17 +28,22 @@ test.
 Every expected-output file the gate compares (`.sexp`, `.err`,
 `.out`, `.disasm`) is rewritten from the current binary by
 `zig build test -Dupdate=true` (or the narrower `golden`, `examples`,
-`nextomic-nx` steps); read the diff before committing it. A missing
-expected file fails its step and names the flag.
+`nextomic-nx` steps); read the diff before committing it. Each run
+reads its expected file when it runs: a mismatch fails that run with
+the first differing line, and a missing file fails it and names the
+flag.
 
-A program run is cached on the contents of everything it reads: the
-binary, the script, its expected output, the files it loads
-(`prelude.nx`, every file under `examples/lib/`, `test/golden/cli/lib/`)
-and its environment, which is empty but for `NEXIS_GC_STRESS` (always
-set for `test/nextomic/`, elsewhere under `-Dgc-stress`) and
-`NEXIS_DURABILITY` (under `-Ddurability`). A change to any of them re-runs it, in a directory emptied
-that build. The two runs that share a store (`persist-1`/`persist-2`,
-an example with a `.2.out`) both run on every build.
+A run is cached on the contents of everything it reads: the binary,
+the script, its expected output, the files it loads (`prelude.nx`,
+every file under `examples/lib/`, `test/golden/cli/lib/`) and its
+environment. Every test binary and program runs with an environment
+of its own, empty but for `NEXIS_GC_STRESS` (always set for
+`test/nextomic/`, elsewhere under `-Dgc-stress`) and
+`NEXIS_DURABILITY` (under `-Ddurability`); nothing exported in the
+shell reaches it. A change to any of them re-runs it, a program in a
+directory emptied that build. The two runs that share a store
+(`persist-1`/`persist-2`, an example with a `.2.out`) both run on
+every build.
 
 ## Running
 

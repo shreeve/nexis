@@ -318,7 +318,7 @@ const Scripts = struct {
         for (programs) |p| {
             const r = self.program(stress);
             r.addArg("run");
-            r.addFileArg2(self.b.path(p.script), .{});
+            r.addFileArg2(self.b.path(p.script), .{ .make_absolute = true });
             r.setCwd(cwd);
             for (inputs) |input| r.addFileInput(self.b.path(input));
             r.has_side_effects = programs.len > 1;
@@ -342,8 +342,8 @@ const Scripts = struct {
     }
 
     /// Make `step` compare `r`'s `stream` with the file at `path`, or
-    /// rewrite the file. A missing file fails the step, not the
-    /// configure.
+    /// rewrite the file. The run reads the file when it runs, so a
+    /// missing or different file fails that run alone.
     fn pin(self: Scripts, step: *std.Build.Step, r: *std.Build.Step.Run, path: []const u8, stream: enum { stdout, stderr }) void {
         const b = self.b;
         if (self.update) {
@@ -357,15 +357,11 @@ const Scripts = struct {
             return;
         }
         step.dependOn(&r.step);
-        b.dependOnFileContents(b.path(path));
-        const expected = readSource(b, path, 1 << 20) catch |err| {
-            r.step.dependOn(&b.addFail(b.fmt("{s}: {t} (write it with -Dupdate=true)", .{ path, err })).step);
-            return;
-        };
-        switch (stream) {
-            .stdout => r.expectStdOutEqual(expected),
-            .stderr => r.expectStdErrEqual(expected),
-        }
+        if (!exists(b, path)) r.step.dependOn(&b.addFail(b.fmt("{s} is missing: write it with -Dupdate=true", .{path})).step);
+        r.addCheck(switch (stream) {
+            .stdout => .{ .expect_stdout_snapshot = b.path(path) },
+            .stderr => .{ .expect_stderr_snapshot = b.path(path) },
+        });
     }
 };
 
@@ -405,14 +401,6 @@ fn toCheckout(b: *std.Build, exe: *std.Build.Step.Compile, sub_path: []const u8)
 /// The build root as a path string.
 fn rootPath(b: *std.Build) []const u8 {
     return b.fmt("{f}", .{b.root});
-}
-
-/// The contents of the file at `path`, relative to the build root.
-fn readSource(b: *std.Build, path: []const u8, limit: usize) ![]u8 {
-    const io = b.graph.io;
-    var root = try b.root.openDir(io, ".", .{});
-    defer root.close(io);
-    return root.readFileAlloc(io, path, b.allocator, .limited(limit));
 }
 
 /// The names under `dir` (relative to the build root) ending in `ext`,

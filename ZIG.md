@@ -103,15 +103,17 @@ nothing else.
   two checkouts are siblings.
 - `build()` runs only when `build.zig`, a `-D` option or a declared
   input changes. Every file it reads is declared:
-  `b.dependOnFileContents` for the expected outputs and the sources
-  `checkLayering` reads, `b.dependOnDirectoryContents` for each
-  directory it lists. A check for a file that may not exist depends on
-  its directory's entries (`exists`).
+  `b.dependOnFileContents` for the sources `checkLayering` reads,
+  `b.dependOnDirectoryContents` for each directory it lists. A check
+  for a file that may not exist depends on its directory's entries
+  (`exists`). A run reads the files it is compared with when it runs
+  (`expect_stdout_snapshot`, `expect_stderr_snapshot`), so they are
+  its inputs, never the configuration's.
 - `build()` never reads its own environment. What a run needs comes
   from an option and is set on the step (`RunEnv`: `-Dgc-stress`,
   `-Ddurability`), so it is part of the step's cache key.
 - `b.addFail(message)` makes a step that fails with a message; the
-  layering check uses it.
+  layering check and a missing expected file use it.
 - `zig build install` copies `bin/nexis` and `bin/nexis-golden` into
   the checkout's `bin/` (`toCheckout`: the build cannot see the
   install prefix) and installs nothing to the prefix.
