@@ -257,14 +257,15 @@ pub fn excise(conn: *Conn, arena: Allocator, e: Value, a: ?Value, options: Optio
 /// lock is held until `finish`; meanwhile `transact` and `with` on the
 /// connection, and any write through the view, are `error.Nested`.
 /// The `With` and its scratch live in the caller's arena, which must
-/// outlive `finish`; the view is allocated on the connection's
-/// allocator so that db-values naming it may outlive the arena, and
-/// `destroy` frees it.
+/// outlive `finish`. The view is the connection's (`Conn.view`), made by
+/// its first `with` and reused, in a new life, by every later one, so
+/// a db-value naming an earlier scope's view stays `error.Closed` and
+/// a program running `with` in a loop holds one view.
 pub const With = struct {
     ctx: Ctx,
     /// The view: the connection's store and interner, its own ident and
-    /// schema caches, reads through `ctx.txn`. Allocated on the
-    /// connection's allocator; closed by `finish`, freed by `destroy`.
+    /// schema caches, reads through `ctx.txn`. Closed by `finish`, freed
+    /// with the connection.
     view: *Conn,
     report: Report,
     finished: bool = false,
@@ -286,12 +287,9 @@ pub const With = struct {
         self.ctx.abort();
     }
 
-    /// `finish`, then free the view. Nothing may name the view
-    /// afterwards: a db-value that escaped the scope reads freed
-    /// memory. Once per `With`.
+    /// `finish`: the view is the connection's, freed with it.
     pub fn destroy(self: *With) void {
         self.finish();
-        self.view.destroy();
     }
 
     /// The protocol after normalisation: apply, then open the view over
@@ -299,25 +297,35 @@ pub const With = struct {
     fn speculate(self: *With) !void {
         const conn = self.ctx.conn;
         try self.ctx.apply();
-        const view = try conn.gpa.create(Conn);
-        errdefer conn.gpa.destroy(view);
+        const tempids = try self.ctx.userTempids();
+        var idents = try conn.idents.clone();
+        errdefer idents.deinit();
+        const view = conn.view orelse blk: {
+            const v = try conn.gpa.create(Conn);
+            v.* = .{ .gpa = conn.gpa, .store = conn.store, .interner = conn.interner, .idents = undefined, .sync_mode = .none, .is_open = false, .store_closed = true, .owns_store = false };
+            conn.view = v;
+            break :blk v;
+        };
+        // The last scope's finish closed it once the reads it lent ended.
+        if (!view.store_closed) return error.Busy;
+        const gen = view.gen + 1;
         view.* = .{
             .gpa = conn.gpa,
             .store = conn.store,
             .interner = conn.interner,
-            .idents = try conn.idents.clone(),
+            .idents = idents,
             .sync_mode = self.ctx.sync_mode,
             .is_open = true,
             .owns_store = false,
             .overlay = self.ctx.txn,
+            .gen = gen,
         };
-        errdefer view.idents.deinit();
         self.view = view;
         self.report = .{
-            .db_before = .{ .conn = conn, .basis = self.ctx.now },
-            .db_after = .{ .conn = view, .basis = self.ctx.t },
+            .db_before = conn.at(self.ctx.now),
+            .db_after = view.at(self.ctx.t),
             .t = self.ctx.t,
-            .tempids = try self.ctx.userTempids(),
+            .tempids = tempids,
             .tx_data = self.ctx.tx_data,
         };
         self.finished = false;
@@ -833,7 +841,7 @@ const Ctx = struct {
         const n = vector_mod.count(form);
         const args = try self.arena.alloc(Value, n - 2);
         for (args, 2..) |*a, i| a.* = vector_mod.nth(form, i);
-        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const db_before = self.conn.at(self.now);
         const result = try hook.call(hook.ctx, f, db_before, args);
         if (result.isNil()) return;
         self.call_depth += 1;
@@ -1096,7 +1104,7 @@ const Ctx = struct {
     /// before the commit; after it only infallible steps remain, so a
     /// committed transaction is never reported as an error.
     fn commit(self: *Ctx) !Report {
-        const db_before: DbValue = .{ .conn = self.conn, .basis = self.now };
+        const db_before = self.conn.at(self.now);
         const tempids = try self.userTempids();
         try self.minter.reserveCache();
         try self.conn.store.commit(self.txn);
@@ -1117,7 +1125,7 @@ const Ctx = struct {
         }
         return .{
             .db_before = db_before,
-            .db_after = .{ .conn = self.conn, .basis = self.t },
+            .db_after = self.conn.at(self.t),
             .t = self.t,
             .tempids = tempids,
             .tx_data = self.tx_data,
@@ -2590,7 +2598,7 @@ test "with: the view sees the speculative state, the connection does not" {
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = home }, .v = .{ .entity = .{ .tempid = .{ .string = "h" } } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "h" } }, .a = .{ .id = city }, .v = .{ .val = .{ .string = "Oslo" } } } },
     }, .{});
-    defer w.destroy();
+    defer w.finish();
 
     // The report.
     try testing.expectEqual(before.basis + 1, w.report.t);
@@ -2698,7 +2706,7 @@ test "with: errors surface without holding the write transaction; schema changes
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.value_type }, .v = .{ .val = .{ .keyword = boot.type_string } } } },
         .{ .add = .{ .e = .{ .tempid = .{ .string = "nick" } }, .a = .{ .id = boot.cardinality }, .v = .{ .val = .{ .keyword = boot.card_one } } } },
     }, .{});
-    defer w.destroy();
+    defer w.finish();
     const nick: u32 = @intCast(w.report.tempids[0].eid);
     try testing.expectEqual(key.ValueType.string, (try w.db().attr(nick)).?.value_type);
     try testing.expectEqual(@as(?u64, nick), try w.db().entid(arena, .{ .ident = try kw(tc, "user/nick") }));
@@ -2730,7 +2738,7 @@ test "with: Lisp tx-data" {
     });
     const clock = store_mod.nowMillis() + 7_000;
     const w = try with(tc.conn, arena, try vector_mod.fromSlice(&heap, &.{add}), .{ .now_ms = clock });
-    defer w.destroy();
+    defer w.finish();
     const z = w.report.tempids[0].eid;
     const ent = try w.db().entity(arena, z);
     try testing.expectEqual(@as(usize, 1), ent.len);
@@ -3618,7 +3626,7 @@ test "reads share the file's held snapshot until a commit passes it; a with view
     try testing.expectEqual(r.t + 1, w.db().basis);
     try testing.expectEqual(@as(usize, 1), (try w.db().datoms(arena, .eavt, .{ .e = e })).len);
     try testing.expect(file.held == null);
-    w.destroy();
+    w.finish();
     try testing.expectEqual(r.t, (try tc.conn.db()).basis);
 }
 
@@ -3692,7 +3700,7 @@ test "a schema change that leaves the generation alone, as an older build's does
     try testing.expectEqual(cached, tc.conn.schema_cache.?);
 }
 
-test "the view outlives the scratch arena until destroy" {
+test "the view outlives the scratch arena; the next with reuses it, and an escaped db-value stays closed" {
     const tc = try TestConn.init("tx_with_view_lifetime");
     defer tc.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3716,7 +3724,17 @@ test "the view outlives the scratch arena until destroy" {
     try testing.expectError(error.Closed, escaped.entity(arena, a));
     try testing.expect(tc.conn.speculative == null);
     try testing.expectEqual(@as(usize, 0), (try (try tc.conn.db()).entity(arena, a)).len);
-    escaped.conn.destroy();
+
+    // Every with of the connection reads through the one view; the
+    // earlier scope's db-value names an earlier life of it, so it stays
+    // closed while the next scope reads.
+    const w2 = try withOps(tc.conn, arena, &.{
+        .{ .add = .{ .e = .{ .tempid = .{ .string = "b" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Bea" } } } },
+    }, .{});
+    defer w2.finish();
+    try testing.expectEqual(escaped.conn, w2.view);
+    try testing.expectError(error.Closed, escaped.entity(arena, a));
+    try testing.expectEqual(@as(usize, 1), (try w2.db().entity(arena, w2.report.tempids[0].eid)).len);
 }
 
 test "a held with keeps the store open until finish; a closed connection refuses writes" {
@@ -3731,7 +3749,7 @@ test "a held with keeps the store open until finish; a closed connection refuses
     const w = try withOps(tc.conn, arena, &.{
         .{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "Ann" } } } },
     }, .{});
-    defer w.destroy();
+    defer w.finish();
     const a = w.report.tempids[0].eid;
     try testing.expectError(error.Busy, tc.conn.release());
     tc.conn.close();
@@ -3947,7 +3965,7 @@ test "excision removes an entity's datoms from every view and rewrites the txlog
     try testing.expectEqual(basis, (try tc.conn.db()).basis);
     // Inside a held `with`, excision is nested.
     const w = try withOps(tc.conn, arena, &.{}, .{});
-    defer w.destroy();
+    defer w.finish();
     try testing.expectError(error.Nested, excise(tc.conn, arena, value.fromFixnum(@intCast(b)).?, null, .{}));
 }
 

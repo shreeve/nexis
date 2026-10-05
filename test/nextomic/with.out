@@ -26,6 +26,8 @@ ok a speculative db-value never equals the committed one at its t
 :boom
 ok the basis is still the committed one
 ok the connection writes again after the throw
+ok an ended scope's db-value equals no later scope's
+ok and stays closed in it
 ok the view has the new attribute
 ok and its ident
 ok the connection does not

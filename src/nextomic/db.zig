@@ -135,16 +135,41 @@ pub const Conn = struct {
     /// database. Null on the view of a speculative `with`, whose
     /// uncommitted state is its own.
     file: ?[2]u64 = null,
+    /// Which life of this struct is current: `reopen` starts a released
+    /// connection's next one, and every `with` the view's next one. A
+    /// db-value or handle made in an earlier life finds the connection
+    /// closed (`error.Closed`).
+    gen: u64 = 0,
+    /// The view every speculative `with` on this connection reads
+    /// through, made by the first and reused by each later one; freed
+    /// with the connection.
+    view: ?*Conn = null,
 
     /// Open or create the store at `path`; bootstrap on first open.
     /// `interner` is the VM's keyword table and outlives the connection.
     pub fn open(gpa: Allocator, interner: *Interner, path: [*:0]const u8, options: OpenOptions) !*Conn {
         const self = try gpa.create(Conn);
         errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .store = undefined, .interner = interner, .idents = undefined, .sync_mode = .none, .is_open = false, .store_closed = true };
+        try self.openIn(path, options, 0);
+        return self;
+    }
+
+    /// Open `path` in the struct of this released connection, as its
+    /// next life: its handles and db-values from before stay closed.
+    pub fn reopen(self: *Conn, path: [*:0]const u8, options: OpenOptions) !void {
+        std.debug.assert(self.store_closed);
+        try self.openIn(path, options, self.gen + 1);
+    }
+
+    fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
         const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
-        const store = try Store.open(gpa, path, .{ .map_size = options.map_size, .sync = sync_mode });
+        const store = try Store.open(self.gpa, path, .{ .map_size = options.map_size, .sync = sync_mode });
         errdefer store.close();
-        try refreshFulltext(gpa, store, sync_mode);
+        try refreshFulltext(self.gpa, store, sync_mode);
+        const gpa = self.gpa;
+        const interner = self.interner;
+        const view = self.view;
         self.* = .{
             .gpa = gpa,
             .store = store,
@@ -153,8 +178,9 @@ pub const Conn = struct {
             .sync_mode = sync_mode,
             .is_open = true,
             .file = .{ store.file.id.dev, store.file.id.ino },
+            .gen = gen,
+            .view = view,
         };
-        return self;
     }
 
     /// Rebuild `nx/fulltext` when its rows are stale and some attribute
@@ -213,10 +239,12 @@ pub const Conn = struct {
         self.store_closed = true;
     }
 
-    /// Free the `Conn`: teardown, when nothing references it any more.
+    /// Free the `Conn` and its view: teardown, when nothing references
+    /// them any more.
     pub fn destroy(self: *Conn) void {
         self.is_open = false;
         if (!self.store_closed) self.closeStore();
+        if (self.view) |v| v.destroy();
         self.gpa.destroy(self);
     }
 
@@ -261,7 +289,12 @@ pub const Conn = struct {
     pub fn db(self: *Conn) !DbValue {
         const txn = try self.beginReadTxn();
         defer self.endReadTxn(txn);
-        return .{ .conn = self, .basis = try self.store.readT(txn) };
+        return self.at(try self.store.readT(txn));
+    }
+
+    /// The plain db-value at `basis`, in this connection's current life.
+    pub fn at(self: *Conn, basis: u64) DbValue {
+        return .{ .conn = self, .gen = self.gen, .basis = basis };
     }
 
     /// Make every commit so far durable.
@@ -348,6 +381,8 @@ pub const Conn = struct {
 
 pub const DbValue = struct {
     conn: *Conn,
+    /// The life of `conn` this value was taken in (`Conn.gen`).
+    gen: u64 = 0,
     /// The `t` this value was taken at.
     basis: u64,
     as_of: ?u64 = null,
@@ -386,6 +421,7 @@ pub const DbValue = struct {
 
     /// Open a read transaction for one operation and check the basis.
     pub fn beginRead(self: DbValue) !Read {
+        if (self.gen != self.conn.gen) return error.Closed;
         const txn = try self.conn.beginReadTxn();
         errdefer self.conn.endReadTxn(txn);
         const now = try self.conn.store.readT(txn);
@@ -757,6 +793,21 @@ pub const TestConn = struct {
         testing.allocator.destroy(self);
     }
 };
+
+test "a released connection reopens in its own struct; db-values of its earlier life stay closed" {
+    const tc = try TestConn.init("db_reopen");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const old = try tc.conn.db();
+    try tc.conn.release();
+    const before = tc.conn;
+    try tc.conn.reopen(tc.td.path.ptr, .{ .sync = .none });
+    try testing.expectEqual(before, tc.conn);
+    try testing.expectError(error.Closed, old.datoms(arena, .eavt, .{ .e = boot.doc }));
+    try testing.expectEqual(@as(usize, 3), (try (try tc.conn.db()).datoms(arena, .eavt, .{ .e = boot.doc })).len);
+}
 
 test "a connection creates a new store file at the store's initial map size" {
     const tc = try TestConn.init("db_map_size");

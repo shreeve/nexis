@@ -779,7 +779,7 @@ test "T2 a failed transaction leaves the ident and schema caches as a fresh conn
         var fault: db_mod.Fault = .{};
         const speculative = rand.uintLessThan(u8, 4) == 0;
         if (speculative) {
-            if (transact.withOps(tc.conn, arena, ops.items, .{ .fault = &fault })) |w| w.destroy() else |_| {}
+            if (transact.withOps(tc.conn, arena, ops.items, .{ .fault = &fault })) |w| w.finish() else |_| {}
         } else if (transact.transactOps(tc.conn, arena, ops.items, .{ .fault = &fault })) |r| {
             committed += 1;
             for (r.tempids) |b| {
@@ -802,7 +802,7 @@ test "T2 a failed transaction leaves the ident and schema caches as a fresh conn
 /// tempids take eids in first-seen order.
 fn outcome(arena: Allocator, tc: *db_mod.TestConn, ops: []const Op) ![]const u8 {
     const w = transact.withOps(tc.conn, arena, ops, .{ .now_ms = 1 }) catch |err| return @errorName(err);
-    defer w.destroy();
+    defer w.finish();
     const r = w.report;
     var rows: std.ArrayList([]const u8) = .empty;
     for (r.tx_data) |d| {

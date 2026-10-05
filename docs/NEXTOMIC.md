@@ -483,10 +483,17 @@ A connection counts its operations in flight (reads, a `transact!`, a
 held `with`). `release` refuses while the count is nonzero
 (`:nextomic/busy`); closing a connection at teardown while it is busy
 marks it closed at once and frees the store when the last operation
-ends, so no cursor in flight dangles. A released connection keeps its
-struct for as long as db-values and entities can name it; every
-operation through them, except an entity's `:db/id`, is
-`:nextomic/closed`.
+ends, so no cursor in flight dangles. A connection's struct lives
+until VM teardown, a life at a time: a later `connect` reuses a
+released one's struct for its next life, so a program that connects
+and releases in a loop holds no more structs than it had connections
+open at once. Every handle, db-value and entity carries the life it
+was made in, so every operation through one of a released life,
+except an entity's `:db/id`, is `:nextomic/closed`, and `release` on
+its handle is a no-op. A speculative `with` reads through its
+connection's one view the same way, a life per scope: a `db-after`
+that outlives its scope is `:nextomic/closed`, inside a later scope
+too.
 
 Every operation on a db-value opens one read transaction, reads
 `sys["t"]` as `now`, and:
@@ -870,7 +877,7 @@ file shares its environment and its `t`, so one basis and mode name
 the same datoms through any of them, as Datomic's peer hands every
 `connect` to one database the same connection. The view of a
 speculative `with` reads uncommitted datoms at a `t` a later commit
-reuses, so its db-values equal only its own. Entities are values,
+reuses, so its db-values equal only its own scope's. Entities are values,
 equal when their db-values are equal and their eids agree, and hash
 accordingly.
 

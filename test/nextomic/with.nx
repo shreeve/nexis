@@ -83,6 +83,14 @@
 (t/check "the basis is still the committed one" (= (:tx committed) (d/basis-t (d/db c))))
 (t/check "the connection writes again after the throw" (= (inc (:tx committed)) (:tx (d/transact! c [[:db/add ann :person/tags :blue]]))))
 
+; Every with on a connection reads through one view, a life per scope:
+; a db-value of an ended scope equals none of a later scope's, at the
+; same basis too, and stays closed while the later scope reads.
+(def first-view (d/with c [] (fn [db-after report] db-after)))
+(d/with c [] (fn [db-after report]
+  (t/check "an ended scope's db-value equals no later scope's" (not= first-view db-after))
+  (t/check "and stays closed in it" (= :nextomic/closed (t/caught (d/datoms first-view :eavt ann))))))
+
 ; A speculative schema attribute exists in the view only.
 (d/with c [{:db/id "nick" :db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]
   (fn [db-after report]

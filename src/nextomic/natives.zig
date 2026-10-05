@@ -21,19 +21,19 @@
 //! entity's basis and mode, as every other native does.
 //!
 //! Connection lifetime: `connect` registers the `Conn` on
-//! `vm.nextomic_connections`; `release` closes it (idempotent, and
-//! `:nextomic/busy` while an operation on it is in flight) and leaves
-//! the struct allocated so db-values still pointing at it raise
-//! `:nextomic/closed`; VM teardown destroys every connection through
+//! `vm.nextomic_connections`, reusing the struct of a released one in
+//! its next life (`Conn.reopen`), so the list holds no more structs
+//! than connections were ever open at once; `release` closes it
+//! (idempotent, and `:nextomic/busy` while an operation on it is in
+//! flight). Every handle and db box carries the life it was made in:
+//! one from an earlier life raises `:nextomic/closed`. A `with` reads
+//! through its connection's one view the same way, a life per scope.
+//! VM teardown destroys every connection, and its view, through
 //! `closeCallback`.
 //!
 //! Per-VM state (`State`): the parsed-query caches, whose query values
-//! a var in `nexis.internal` keeps reachable, and the view of every
-//! finished `with` scope, created on first use and destroyed at VM
-//! teardown through `vm.nextomic_query_close`. A view outlives its
-//! scope the way a released connection's struct does, so a db-value
-//! that escaped the scope answers `:nextomic/closed`; the scope's
-//! scratch is freed when the native returns.
+//! the VM's root walk marks (`markState`), created on first use and
+//! destroyed at VM teardown through `vm.nextomic_query_close`.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -153,9 +153,6 @@ pub const State = struct {
     gpa: Allocator,
     ir_cache: query.Cache,
     rules_cache: query.RulesCache,
-    /// The views of finished `with` scopes: closed, kept allocated for
-    /// the db-values that name them, destroyed at VM teardown.
-    views: std.ArrayList(*Conn) = .empty,
 };
 
 /// The VM's state, created on first use.
@@ -183,8 +180,6 @@ fn markState(ptr: *anyopaque, c: *gc.Collector) void {
 
 fn closeState(ptr: *anyopaque) void {
     const s: *State = @ptrCast(@alignCast(ptr));
-    for (s.views.items) |view| view.destroy();
-    s.views.deinit(s.gpa);
     s.ir_cache.deinit();
     s.rules_cache.deinit();
     s.gpa.destroy(s);
@@ -319,14 +314,17 @@ fn closeCallback(ptr: *anyopaque) void {
     c.destroy();
 }
 
-fn connOf(v: Value) !*Conn {
+/// The connection behind a handle; null when the handle's life ended
+/// with a `release` and a later `connect` reuses the struct.
+fn connOf(v: Value) !?*Conn {
     if (v.kind() != .nextomic_conn) return error.KindMismatch;
-    return @ptrCast(@alignCast(handle.connPtr(v)));
+    const c: *Conn = @ptrCast(@alignCast(handle.connPtr(v)));
+    return if (c.gen == handle.connGen(v)) c else null;
 }
 
 /// The connection behind an open handle.
 fn openConn(v: Value) !*Conn {
-    const c = try connOf(v);
+    const c = (try connOf(v)) orelse return error.Closed;
     if (!c.is_open) return error.Closed;
     return c;
 }
@@ -335,12 +333,12 @@ pub fn dbOf(v: Value) !DbValue {
     if (v.kind() != .nextomic_db) return error.KindMismatch;
     const s = handle.dbShape(v);
     const c: *Conn = @ptrCast(@alignCast(s.conn));
-    if (!c.is_open) return error.Closed;
-    return .{ .conn = c, .basis = s.basis, .as_of = s.as_of, .since = s.since, .history = s.history };
+    if (!c.is_open or c.gen != s.gen) return error.Closed;
+    return .{ .conn = c, .gen = s.gen, .basis = s.basis, .as_of = s.as_of, .since = s.since, .history = s.history };
 }
 
 pub fn boxDb(heap: *Heap, d: DbValue) !Value {
-    return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .file = d.conn.file, .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
+    return handle.makeDb(heap, .{ .conn = @ptrCast(d.conn), .gen = d.gen, .file = d.conn.file, .basis = d.basis, .as_of = d.as_of, .since = d.since, .history = d.history });
 }
 
 /// `{:sync :full | :no-meta | :none}`; nil means the default.
@@ -393,18 +391,26 @@ fn connect(vm: *VM, args: []const Value) !Value {
             if (dir.len > 0) std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
-    const c = try Conn.open(vm.allocator, vm.ensureInterner(), path_z.ptr, options);
-    errdefer c.destroy();
-    vm.nextomic_close_callback = &closeCallback;
-    try vm.nextomic_connections.append(vm.allocator, @ptrCast(c));
-    return handle.makeConn(vm.ensureHeap(), @ptrCast(c), path);
+    const c = for (vm.nextomic_connections.items) |p| {
+        const released: *Conn = @ptrCast(@alignCast(p));
+        if (!released.store_closed) continue;
+        try released.reopen(path_z.ptr, options);
+        break released;
+    } else blk: {
+        try vm.nextomic_connections.ensureUnusedCapacity(vm.allocator, 1);
+        const fresh = try Conn.open(vm.allocator, vm.ensureInterner(), path_z.ptr, options);
+        vm.nextomic_close_callback = &closeCallback;
+        vm.nextomic_connections.appendAssumeCapacity(@ptrCast(fresh));
+        break :blk fresh;
+    };
+    return handle.makeConn(vm.ensureHeap(), @ptrCast(c), c.gen, path);
 }
 
 /// `(release conn)`: idempotent; `:nextomic/busy` while a query, pull,
 /// transaction or `with` on the connection is in flight, so nothing
 /// running holds cursors into a freed store.
 fn fnRelease(vm: *VM, args: []const Value) VmError!Value {
-    const c = connOf(args[0]) catch |err| return fail(vm, err);
+    const c = (connOf(args[0]) catch |err| return fail(vm, err)) orelse return value.nilValue();
     c.release() catch |err| return fail(vm, err);
     return value.nilValue();
 }
@@ -659,14 +665,12 @@ const fnWith = wrap(withNative);
 /// `(with conn tx-data f)`: apply tx-data in a held write transaction,
 /// call `f` with a db-value over the uncommitted state and the report
 /// `transact!` would have returned, then abort. Whatever `f` raises
-/// propagates after the abort. The view goes on the VM state, since
-/// `db-after` and every db-value derived from it name it; the scope's
-/// scratch is freed on return.
+/// propagates after the abort. `db-after` and every db-value derived
+/// from it name the connection's view in this scope's life, closed
+/// once the scope ends; the scope's scratch is freed on return.
 fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const c = try openConn(args[0]);
     const f = args[2];
-    const st = try state(vm);
-    try st.views.ensureUnusedCapacity(vm.allocator, 1);
     var fault: Fault = .{};
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
@@ -676,7 +680,6 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     var tx_hook = TxHook.init(vm);
     defer tx_hook.deinit();
     const w = try transact_mod.with(c, arena, args[1], .{ .fault = &fault, .hook = tx_hook.hook() });
-    st.views.appendAssumeCapacity(w.view);
     defer w.finish();
 
     const report = try reportMap(vm, w.view, arena, w.report);
