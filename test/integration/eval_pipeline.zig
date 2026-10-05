@@ -4182,6 +4182,31 @@ test "extend-protocol with :vector / :map friendly aliases" {
     , "[:v :m]");
 }
 
+test "extend-protocol and extend-type: nil and Clojure class names, as Clojure code spells them" {
+    try expectOutputProgram(
+        \\(defprotocol Hello (hi [x]))
+        \\(extend-protocol Hello
+        \\  nil (hi [_] :nil)
+        \\  String (hi [s] [:s s])
+        \\  Long (hi [n] [:n n])
+        \\  clojure.lang.IPersistentVector (hi [v] :v)
+        \\  Boolean (hi [b] [:b b])
+        \\  Object (hi [_] :obj))
+        \\[(hi nil) (hi "a") (hi 1) (hi 100000000000000000000) (hi [1]) (hi true) (hi false) (hi :k)]
+    , "[:nil [:s a] [:n 1] [:n 100000000000000000000] :v [:b true] [:b false] :obj]");
+    try expectOutputProgram("(defprotocol Q (q [x])) (extend-type nil Q (q [_] :none)) (q nil)", ":none");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
+    try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
+}
+
+test "extend-type: a record another namespace defines, by alias, by refer or by its type symbol" {
+    const rec = [2][]const u8{ "rec.nx", "(ns rec)\n(defrecord R [a])\n" };
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :as r]) (defprotocol P (p [x])) (extend-type r/R P (p [x] (:a x))) (p (r/->R 5))", "5");
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :refer [R ->R]]) (defprotocol P (p [x])) (extend-type R P (p [x] (inc (:a x)))) (p (->R 5))", "6");
+    try expectOutputWithFiles(&.{rec}, "(require 'rec) (defprotocol P (p [x])) (extend-protocol P rec.R (p [x] (dec (:a x)))) (p (rec/->R 5))", "4");
+}
+
 test "extend-protocol with bogus type-kw: :invalid-argument" {
     try expectOutputProgram(
         \\(do

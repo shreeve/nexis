@@ -2468,7 +2468,7 @@ const ExtendAnchor = union(enum) {
 };
 
 fn expandExtendType(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
-    if (args.len < 1 or (args[0].datum != .symbol and args[0].datum != .keyword)) return ctx.fail(call_form.origin, "extend-type: expected a type", .{});
+    if (args.len < 1 or (args[0].datum != .symbol and args[0].datum != .keyword and args[0].datum != .nil)) return ctx.fail(call_form.origin, "extend-type: expected a type", .{});
     return extendForm(ctx, call_form, args[1..], .{ .type_ = args[0] });
 }
 
@@ -2501,7 +2501,9 @@ fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: 
             start += 1;
             continue;
         }
-        const other = current orelse return b.ctx.fail(clause.origin, "a method needs a protocol name before it", .{});
+        const other = current orelse return b.ctx.fail(clause.origin, "a method needs {s} before it", .{if (anchor == .protocol) "a type" else "a protocol name"});
+        if (anchor == .record and other.datum == .symbol and std.mem.eql(u8, other.datum.symbol.name, "Object"))
+            return b.ctx.fail(other.origin, "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", .{});
         var end = start;
         while (end < clauses.len and !isExtendHeader(clauses[end], anchor)) : (end += 1) {
             const c = clauses[end];
@@ -2539,7 +2541,7 @@ fn extendClauses(b: Builder, clauses: []const *Form, anchor: ExtendAnchor, out: 
 /// Whether `clause` names the protocol (or, for `extend-protocol`,
 /// the type) the methods after it belong to.
 fn isExtendHeader(clause: *const Form, anchor: ExtendAnchor) bool {
-    return clause.datum == .symbol or (clause.datum == .keyword and anchor == .protocol);
+    return clause.datum == .symbol or (anchor == .protocol and (clause.datum == .keyword or clause.datum == .nil));
 }
 
 /// The position in `methods` of the first clause named `name`.
@@ -2561,21 +2563,100 @@ fn methodArities(ctx: *ExpandContext, method: *const Form, out: *std.ArrayList(*
     }
 }
 
-/// The call installing `impl` as `protocol`'s method for a type: a
-/// kind keyword (`:string`), `:any` (the default impl) or a record
-/// symbol (through its `<Name>-type-id`).
+/// The call installing `impl` as `protocol`'s method for a type
+/// (PROTOCOLS.md §4.3): a kind keyword (`:string`), `:any` (the
+/// default impl), nil, a Clojure class name nexis has a kind for
+/// (`classKinds`), or a record (through its `<Name>-type-id`). A
+/// class that stands for several kinds installs the impl for each.
 fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_key: *Form, impl: *Form) ExpandError!*Form {
-    switch (type_form.datum) {
-        .keyword => |kw| {
-            if (std.mem.eql(u8, kw.name, "any")) return b.list(.{ "nexis.internal/#%extend-default-impl", protocol, method_key, impl });
-            return b.list(.{ "nexis.internal/#%extend-builtin-impl", protocol, method_key, try b.kw(kw.name), impl });
-        },
-        .symbol => |sym| {
-            const type_id = try RecordNames.typeId(b.ctx.allocator, sym.name);
-            return b.list(.{ "nexis.internal/#%extend-record-impl", protocol, method_key, type_id, impl });
-        },
-        else => return b.ctx.fail(type_form.origin, "expected a record name or a kind keyword, not {s}", .{describeForm(type_form)}),
+    const kinds: []const []const u8 = switch (type_form.datum) {
+        .nil => &[_][]const u8{"nil"},
+        .keyword => |kw| try b.ctx.allocator.dupe([]const u8, &[_][]const u8{kw.name}),
+        .symbol => |sym| (if (sym.ns == null) classKinds(sym.name) else null) orelse
+            return b.list(.{ "nexis.internal/#%extend-record-impl", protocol, method_key, try recordTypeId(b, type_form), impl }),
+        else => return b.ctx.fail(type_form.origin, "expected a record name, a class or a kind keyword, not {s}", .{describeForm(type_form)}),
+    };
+    if (kinds.len == 1) return extendKind(b, protocol, method_key, kinds[0], impl);
+    const f = try b.gensym("impl");
+    var calls: std.ArrayList(*Form) = .empty;
+    for (kinds) |k| try calls.append(b.ctx.allocator, try extendKind(b, protocol, method_key, k, f));
+    return b.list(.{ "let*", try b.vec(.{ f, impl }), calls.items });
+}
+
+/// The call installing `impl` for the kind keyword `kind`, `any` the
+/// default impl.
+fn extendKind(b: Builder, protocol: *const Form, method_key: *Form, kind: []const u8, impl: *Form) ExpandError!*Form {
+    if (std.mem.eql(u8, kind, "any")) return b.list(.{ "nexis.internal/#%extend-default-impl", protocol, method_key, impl });
+    return b.list(.{ "nexis.internal/#%extend-builtin-impl", protocol, method_key, try b.kw(kind), impl });
+}
+
+/// The kinds a Clojure class name stands for, so protocol code
+/// written for Clojure extends the same values (`Object` is every
+/// value: the default impl); null for a name that is no such class.
+fn classKinds(name: []const u8) ?[]const []const u8 {
+    const classes = std.StaticStringMap([]const []const u8).initComptime(.{
+        .{ "Object", &[_][]const u8{"any"} },
+        .{ "String", &[_][]const u8{"string"} },
+        .{ "CharSequence", &[_][]const u8{"string"} },
+        .{ "Long", &[_][]const u8{"fixnum"} },
+        .{ "Integer", &[_][]const u8{"fixnum"} },
+        .{ "Short", &[_][]const u8{"fixnum"} },
+        .{ "Byte", &[_][]const u8{"fixnum"} },
+        .{ "BigInteger", &[_][]const u8{"fixnum"} },
+        .{ "BigInt", &[_][]const u8{"fixnum"} },
+        .{ "Double", &[_][]const u8{"float"} },
+        .{ "Float", &[_][]const u8{"float"} },
+        .{ "Number", &[_][]const u8{ "fixnum", "float" } },
+        .{ "Boolean", &[_][]const u8{ "true_", "false_" } },
+        .{ "Character", &[_][]const u8{"char"} },
+        .{ "Keyword", &[_][]const u8{"keyword"} },
+        .{ "Symbol", &[_][]const u8{"symbol"} },
+        .{ "IPersistentVector", &[_][]const u8{"vector"} },
+        .{ "PersistentVector", &[_][]const u8{"vector"} },
+        .{ "IPersistentMap", &[_][]const u8{ "map", "sorted_map" } },
+        .{ "PersistentHashMap", &[_][]const u8{"map"} },
+        .{ "PersistentArrayMap", &[_][]const u8{"map"} },
+        .{ "Map", &[_][]const u8{ "map", "sorted_map" } },
+        .{ "IPersistentSet", &[_][]const u8{ "set", "sorted_set" } },
+        .{ "PersistentHashSet", &[_][]const u8{"set"} },
+        .{ "Set", &[_][]const u8{ "set", "sorted_set" } },
+        .{ "ISeq", &[_][]const u8{"list"} },
+        .{ "IPersistentList", &[_][]const u8{"list"} },
+        .{ "PersistentList", &[_][]const u8{"list"} },
+        .{ "IFn", &[_][]const u8{ "function", "native_fn" } },
+        .{ "Fn", &[_][]const u8{ "function", "native_fn" } },
+        .{ "Atom", &[_][]const u8{"atom"} },
+        .{ "Var", &[_][]const u8{"var_"} },
+    });
+    for ([_][]const u8{ "java.lang.", "java.util.", "clojure.lang." }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return classes.get(name[prefix.len..]);
     }
+    return classes.get(name);
+}
+
+/// The `<Name>-type-id` symbol of the record `type_form` names: `R`
+/// in the namespace that defines it (the current one, or the home of
+/// a Var `R` this namespace refers to), `alias/R` in the namespace
+/// the alias names, or `ns.R`, the type symbol `type` returns, in
+/// `ns`. A dotted name whose prefix is no namespace names a class
+/// nexis does not have.
+fn recordTypeId(b: Builder, type_form: *const Form) ExpandError!*Form {
+    const ctx = b.ctx;
+    const sym = type_form.datum.symbol;
+    var home = sym.ns;
+    var name = sym.name;
+    if (home == null) if (std.mem.findScalarLast(u8, name, '.')) |dot| {
+        home = name[0..dot];
+        name = name[dot + 1 ..];
+        if (ctx.registry) |reg| if (reg.lookupNs(home.?) == null)
+            return ctx.fail(type_form.origin, "{s} names no record and no class nexis has; extend a kind keyword such as :string", .{sym.name});
+    };
+    if (home == null) if (ctx.namespace) |ns| if (ns.lookup(name)) |v| if (v.ns.len > 0 and !std.mem.eql(u8, v.ns, ns.name)) {
+        home = v.ns;
+        name = v.name;
+    };
+    const id = try RecordNames.typeId(ctx.allocator, name);
+    return makeForm(ctx, .{ .symbol = .{ .ns = home, .name = id } }, b.origin);
 }
 
 /// The `nexis.core` function `name` as a qualified symbol: what a
