@@ -41,6 +41,9 @@
 //!       `(a*b) rem b = 0`, `(a+b)-b = a`, `neg(neg a) = a`,
 //!       `abs(a) = abs(neg a)`, order agrees with the sign of `a-b`.
 //!   A6. Decimal text round-trips; toF64/fromF64 round-trips below 2^53.
+//!   A7. quotientF64 is IEEE division below 2^53, unchanged when both
+//!       operands are scaled by one wide factor, and exact in its
+//!       power-of-two scaling down to the subnormals.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -336,7 +339,7 @@ test "N10: hashValue(bignum) matches xxHash3 over {sign, limbs} + mixKindDomain"
 }
 
 // -----------------------------------------------------------------------------
-// Arithmetic (BIGNUM.md §9)
+// Arithmetic (BIGNUM.md §8)
 // -----------------------------------------------------------------------------
 
 /// Every value the tower produces is canonical: a fixnum when it fits
@@ -548,5 +551,36 @@ test "A6: decimal text and doubles round-trip" {
         const off = try bignum.abs(&heap, try bignum.sub(&heap, rounded, a));
         const scaled = try bignum.mul(&heap, off, try bignum.fromI64(&heap, 1 << 52));
         try std.testing.expect(bignum.compare(scaled, try bignum.abs(&heap, a)) != .gt);
+    }
+}
+
+test "A7: quotientF64 is the correctly rounded quotient at every scale" {
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 17);
+    const r = prng.random();
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const x: i64 = r.intRangeAtMost(i64, -(1 << 53), 1 << 53);
+        var y: i64 = r.intRangeAtMost(i64, -(1 << 53), 1 << 53);
+        if (y == 0) y = 1;
+        const xv = try bignum.fromI64(&heap, x);
+        const yv = try bignum.fromI64(&heap, y);
+        // Both operands are exact doubles, so IEEE division is the oracle.
+        const expected = @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(y));
+        try std.testing.expectEqual(expected, try bignum.quotientF64(&heap, xv, yv));
+        // A common factor, however wide, changes nothing.
+        const w = try randWide(&heap, r);
+        try std.testing.expectEqual(expected, try bignum.quotientF64(&heap, try bignum.mul(&heap, xv, w), try bignum.mul(&heap, yv, w)));
+        // A power of two on either side scales the quotient exactly,
+        // into the subnormals.
+        const e = r.intRangeAtMost(u16, 0, 1200);
+        var limbs: [19]u64 = @splat(0);
+        limbs[e / 64] = @as(u64, 1) << @intCast(e % 64);
+        const p = try bignum.fromLimbs(&heap, false, limbs[0 .. e / 64 + 1]);
+        const xd = std.math.ldexp(@as(f64, @floatFromInt(x)), e);
+        if (!std.math.isInf(xd)) try std.testing.expectEqual(xd / @as(f64, @floatFromInt(y)), try bignum.quotientF64(&heap, try bignum.mul(&heap, xv, p), yv));
+        const yd = std.math.ldexp(@as(f64, @floatFromInt(y)), e);
+        if (!std.math.isInf(yd)) try std.testing.expectEqual(@as(f64, @floatFromInt(x)) / yd, try bignum.quotientF64(&heap, xv, try bignum.mul(&heap, yv, p)));
     }
 }

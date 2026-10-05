@@ -526,7 +526,7 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 0 | `math:add` | A=slot, B=any, C=any | `+` |
 | 1 | `math:sub` | A=slot, B=any, C=any | `-` |
 | 2 | `math:mul` | A=slot, B=any, C=any | `*` |
-| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise a float; `:divide-by-zero` for a zero divisor of any kind, a NaN operand the result first (SEMANTICS.md §2.2) |
+| 3 | `math:div` | A=slot, B=any, C=any | `/`: an exact integer quotient stays an integer, otherwise the nearest float; `:divide-by-zero` for a zero divisor of any kind, a NaN operand the result first (SEMANTICS.md §2.2) |
 | 4 | `math:idiv` | A=slot, B=any, C=any | `quot`, truncated; `:divide-by-zero` |
 | 5 | `math:mod` | A=slot, B=any, C=any | `mod`, floored (sign of the divisor); `:divide-by-zero` |
 | 6 | `math:pow` | | Traps `UnimplementedOpcode` |
@@ -540,10 +540,10 @@ i48 is a bignum on the VM's heap, and a non-number is
 The arithmetic natives call the same tower functions (`+` of two
 fixnums, and `inc` and `dec` of one, compute inline when the result
 is a fixnum, as the handlers do), so `(+ a b)` through a Var and the
-inlined `math:add` agree exactly. A float
-divisor of zero gives IEEE infinity or NaN for `/`; `quot`, `rem`
-and `mod` raise for either kind (`(mod 1 0.0)` raises, as in
-Clojure).
+inlined `math:add` agree exactly. `/`, `quot`, `rem` and `mod`
+raise for a zero divisor of either kind (`(/ 1.0 0)` and `(mod 1
+0.0)` raise, as in Clojure); a NaN operand of `/` is its result
+first.
 
 #### 10.4 `cmp`
 
@@ -749,12 +749,12 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
 | `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
-| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map, set, vector or transient |
+| `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map or set (hash or sorted), vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
 | `NoThreadBinding` | `:no-thread-binding` | `set!` on a dynamic Var with no binding in force |
 | `ArithmeticOverflow` | `:arithmetic-overflow` | A count or identifier the runtime produces does not fit a fixnum; arithmetic never raises it (results promote to bignums) |
-| `DivideByZero` | `:divide-by-zero` | `/` with an integer zero divisor; `quot`, `rem`, `mod` with a zero divisor of either kind |
+| `DivideByZero` | `:divide-by-zero` | `/`, `quot`, `rem`, `mod` with a zero divisor of either kind |
 | `IndexOutOfBounds` | `:index-out-of-bounds` | `nth` and friends past the end |
 | `DbError`, `DbClosed`, `InvalidDurableRef`, `CodecFailed`, `TxClosed` | `:db-error`, `:db-closed`, `:invalid-durable-ref`, `:codec-failed`, `:tx-closed` | Storage natives (`docs/DB.md`) |
 | `NotDerefable` | `:not-derefable` | `deref` of a value that is not a durable ref, Var, atom, delay or `reduced` |

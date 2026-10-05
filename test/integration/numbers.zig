@@ -1,5 +1,5 @@
 //! test/integration/numbers.zig — the numeric tower end to end
-//! (SEMANTICS.md §2.2, BIGNUM.md §9): fixnum promotion and bignum
+//! (SEMANTICS.md §2.2, BIGNUM.md §8): fixnum promotion and bignum
 //! demotion through every operator and predicate, contagion with
 //! f64, and the errors a program can catch.
 
@@ -41,6 +41,11 @@ test "promotion: a result that leaves i48 is a bignum, and the reverse step is a
     try expectOutput("(let [a (* " ++ fm ++ " " ++ fm ++ ")] (= (mod (- a) a) 0))", "true");
     try expectOutput("(let [a (* " ++ fm ++ " " ++ fm ++ ")] (float? (/ a 2)))", "true");
     try expectOutput("(let [a (* " ++ fm ++ " " ++ fm ++ ")] (/ a 2))", "9.903520314282901E27");
+    // An inexact quotient is the nearest double, however far past
+    // f64's range the operands are.
+    try expectOutput("(let [a (reduce * (repeat 400 10)) b (* 3 (reduce * (repeat 399 10)))] [(/ a b) (/ (- a) b)])", "[3.3333333333333335 -3.3333333333333335]");
+    try expectOutput("(/ (+ 1 (reduce * (repeat 400 10))) (reduce * (repeat 100 10)))", "1.0E300");
+    try expectOutput("(/ 1 (reduce * (repeat 400 10)))", "0.0");
     try expectOutput("(let [a (* " ++ fm ++ " " ++ fm ++ ")] (= (* a a) (* (* a " ++ fm ++ ") (* a " ++ fm ++ "))))", "false");
     try expectOutput("(let [a (* " ++ fm ++ " " ++ fm ++ ")] (= (* a a) (* (* a " ++ fm ++ ") " ++ fm ++ ")))", "true");
 }

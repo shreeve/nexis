@@ -165,7 +165,7 @@ pub fn limbsEqual(a: *HeapHeader, b: *HeapHeader) bool {
 }
 
 // =============================================================================
-// Arithmetic, ordering and conversion (BIGNUM.md §9)
+// Arithmetic, ordering and conversion (BIGNUM.md §8)
 //
 // Every function accepts any member of the integer tower (fixnum or
 // bignum) for each integer operand and returns a canonical Value:
@@ -362,6 +362,58 @@ pub fn toF64(v: Value) f64 {
     return view(v, &s).toFloat(f64, .nearest_even)[0];
 }
 
+/// `a / b` for integers of any size, `b` non-zero, as the nearest
+/// f64 (ties to even). The quotient is taken to 55 or 56 bits with a
+/// sticky bit for the remainder and rounded once, at 53 bits or at the
+/// subnormal grid, so operands beyond f64's range still give the
+/// finite quotient and none is rounded before the division.
+pub fn quotientF64(heap: *Heap, a: Value, b: Value) !f64 {
+    var sa: [1]Limb = undefined;
+    var sb: [1]Limb = undefined;
+    const x = view(a, &sa);
+    const y = view(b, &sb);
+    std.debug.assert(!y.eqlZero());
+    if (x.eqlZero()) return 0.0;
+    // A·2^k / B lies in [2^54, 2^56).
+    const k: isize = 55 + @as(isize, @intCast(y.bitCountAbs())) - @as(isize, @intCast(x.bitCountAbs()));
+    const sign: f64 = if (x.positive == y.positive) 1.0 else -1.0;
+    if (k < -1100) return sign * std.math.inf(f64);
+    if (k > 1134) return sign * 0.0;
+    const up: usize = @intCast(@max(k, 0));
+    const down: usize = @intCast(@max(-k, 0));
+    var stack: [scratch_limbs]Limb = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+    const alloc = bfa.allocator();
+    const xs_buf = try alloc.alloc(Limb, x.limbs.len + up / @bitSizeOf(Limb) + 1);
+    defer alloc.free(xs_buf);
+    const ys_buf = try alloc.alloc(Limb, y.limbs.len + down / @bitSizeOf(Limb) + 1);
+    defer alloc.free(ys_buf);
+    var xs = mutable(xs_buf);
+    var ys = mutable(ys_buf);
+    xs.shiftLeft(x.abs(), up);
+    ys.shiftLeft(y.abs(), down);
+    const qbuf = try alloc.alloc(Limb, xs.len + 1);
+    defer alloc.free(qbuf);
+    const rbuf = try alloc.alloc(Limb, ys.len + 1);
+    defer alloc.free(rbuf);
+    const tmp = try alloc.alloc(Limb, bigint.calcDivLimbsBufferLen(xs.len, ys.len));
+    defer alloc.free(tmp);
+    var q = mutable(qbuf);
+    var r = mutable(rbuf);
+    q.divTrunc(&r, xs.toConst(), ys.toConst(), tmp);
+    const quotient = q.toConst().toInt(u64) catch unreachable;
+    const n: isize = 64 - @as(isize, @clz(quotient));
+    // Drop the bits below the 53rd, or below 2^-1074 for a subnormal.
+    const s: isize = @max(n - 53, k - 1074);
+    if (s > n) return sign * 0.0;
+    const shift: u6 = @intCast(s);
+    var m = quotient >> shift;
+    const rest = quotient & ((@as(u64, 1) << shift) - 1);
+    const half = @as(u64, 1) << (shift - 1);
+    if (rest > half or (rest == half and (!r.toConst().eqlZero() or m & 1 == 1))) m += 1;
+    return sign * std.math.ldexp(@as(f64, @floatFromInt(m)), @intCast(s - k));
+}
+
 /// The integer part of a finite f64 (rounding toward zero), in
 /// canonical form; `null` for NaN and the infinities, which have no
 /// integer value.
@@ -409,7 +461,7 @@ pub fn formatDecimal(v: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void 
 /// faster one.
 const split_limbs = 32;
 
-/// Divide and conquer (BIGNUM.md §9): split `x` at a power of ten
+/// Divide and conquer (BIGNUM.md §8): split `x` at a power of ten
 /// 10^(9·2^i) into a high and a low half and write each, the low half
 /// zero-padded to its full width. Each level's divisions cost about
 /// half the level above's, so the whole conversion costs about one
@@ -996,6 +1048,34 @@ test "quotExact: the quotient only when the remainder is zero" {
     try testing.expect((try quotExact(&heap, a, fx(7))) == null);
     try testing.expect((try quotExact(&heap, fx(6), fx(3))).?.asFixnum() == 2);
     try testing.expect((try quotExact(&heap, fx(6), fx(4))) == null);
+}
+
+test "quotientF64: operands past f64's range, signs, and rounding at the subnormal grid" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var digits: [402]u8 = @splat('0');
+    digits[0] = '1';
+    const e400 = (try parseDecimal(&heap, digits[0..401])).?;
+    const e399 = (try parseDecimal(&heap, digits[0..400])).?;
+    const e100 = (try parseDecimal(&heap, digits[0..101])).?;
+    digits[400] = '1';
+    const e400_1 = (try parseDecimal(&heap, digits[0..401])).?;
+    try testing.expectEqual(@as(f64, 10.0 / 3.0), try quotientF64(&heap, e400, try mul(&heap, fx(3), e399)));
+    try testing.expectEqual(@as(f64, -10.0 / 3.0), try quotientF64(&heap, e400, try mul(&heap, fx(-3), e399)));
+    try testing.expectEqual(@as(f64, 1e300), try quotientF64(&heap, e400_1, e100));
+    try testing.expect(std.math.isPositiveInf(try quotientF64(&heap, e400_1, fx(3))));
+    try testing.expect(std.math.isNegativeInf(try quotientF64(&heap, e400_1, fx(-3))));
+    try testing.expectEqual(@as(f64, 0.0), try quotientF64(&heap, fx(1), e400));
+    // Powers of two around 2^-1074, the least subnormal: ties go to even.
+    var two_limbs: [17]u64 = @splat(0);
+    two_limbs[16] = 1 << 50;
+    const p1074 = try fromLimbs(&heap, false, &two_limbs);
+    const tiny = std.math.floatTrueMin(f64);
+    try testing.expectEqual(tiny, try quotientF64(&heap, fx(1), p1074));
+    try testing.expectEqual(@as(f64, 0.0), try quotientF64(&heap, fx(1), try mul(&heap, fx(2), p1074)));
+    try testing.expectEqual(tiny, try quotientF64(&heap, fx(3), try mul(&heap, fx(4), p1074)));
+    try testing.expectEqual(2 * tiny, try quotientF64(&heap, fx(3), try mul(&heap, fx(2), p1074)));
+    try testing.expectEqual(-2 * tiny, try quotientF64(&heap, fx(-3), try mul(&heap, fx(2), p1074)));
 }
 
 test "quot: fixnum_min / -1 is the one fixnum quotient that promotes" {

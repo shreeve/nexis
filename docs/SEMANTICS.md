@@ -67,8 +67,10 @@ true.
   is `1.5`, `(max 1 2.0)` is `2.0`. A bignum operand widens to the
   nearest f64.
 - `/` on two integers yields an integer when the division is exact
-  and a float otherwise: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`. There
-  are no rationals (PLAN §23 #10).
+  and otherwise the f64 nearest the true quotient (ties to even),
+  whatever the operands' size: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`,
+  and `10^400` over `3·10^399` is `3.3333333333333335`. There are no
+  rationals (PLAN §23 #10).
 - An integer result outside the fixnum range is a bignum, exact at any
   size: `(+ 140737488355327 1)` is `140737488355328`, and `(- (+
   140737488355327 1) 1)` is the fixnum again. `quot`, `rem`, `mod`,
@@ -91,8 +93,9 @@ true.
 - `even?` / `odd?` take integers only (`:kind-mismatch` on a float).
 - `(long x)` is `x` for an integer and the integer part of a finite
   float, toward zero and a bignum when wide (`(long 1e30)` is
-  `1000000000000000019884624838656`); NaN and the infinities raise
-  `:invalid-argument`. `int`, `short` and `byte` are `long` within
+  `1000000000000000019884624838656`); the infinities raise
+  `:invalid-argument` and NaN is 0, as Clojure's `RT.longCast`
+  makes them. `int`, `short` and `byte` are `long` within
   the range of Java's `int`, `short`, `byte` (a float outside it, or
   the integer part outside it, is `:invalid-argument`), except that
   NaN is 0, as Java's casts make it. `(double x)` is the nearest f64

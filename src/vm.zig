@@ -4388,7 +4388,7 @@ pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value 
 }
 
 // =============================================================================
-// Numeric tower (SEMANTICS §2.2, BIGNUM.md §9)
+// Numeric tower (SEMANTICS §2.2, BIGNUM.md §8)
 //
 // Three runtime number kinds take part in arithmetic: `fixnum`
 // (i48), `bignum` and `float` (f64). Contagion follows Clojure: an
@@ -4398,10 +4398,9 @@ pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value 
 // one fits (BIGNUM.md §1), so `=` and `hash` agree for every integer
 // whatever its history. Two fixnums stay in i64 and touch the heap
 // only on promotion. `/` on two integers yields an integer when the
-// division is exact and a float otherwise (there are no rationals,
-// PLAN §23 #10). Integer division by zero and `quot`/`rem`/`mod` by
-// zero raise `DivideByZero`; float `/` by zero follows IEEE and
-// yields an infinity or NaN.
+// division is exact and the float nearest the quotient otherwise
+// (there are no rationals, PLAN §23 #10). `/`, `quot`, `rem` and
+// `mod` raise `DivideByZero` for a zero divisor of either kind.
 //
 // These are the single implementation behind the `math:*` and
 // `cmp:*` opcodes and the arithmetic natives in stdlib.zig. The heap
@@ -4547,7 +4546,8 @@ pub fn numDiv(heap: *heap_mod.Heap, a: value_mod.Value, b: value_mod.Value) VmEr
     if (!isInteger(a) or !isInteger(b)) return VmError.KindMismatch;
     if (isZero(b)) return VmError.DivideByZero;
     const exact = bignum_mod.quotExact(heap, a, b) catch return VmError.OutOfMemory;
-    return exact orelse value_mod.fromFloat(bignum_mod.toF64(a) / bignum_mod.toF64(b));
+    if (exact) |q| return q;
+    return value_mod.fromFloat(bignum_mod.quotientF64(heap, a, b) catch return VmError.OutOfMemory);
 }
 
 /// `quot`: truncated division. A zero divisor of either kind raises.
