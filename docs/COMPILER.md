@@ -416,16 +416,18 @@ What each form lowers to, in terms of the opcodes of VM.md §10.
 
 `test` is read in place when it can be (§4.4); `jump:if-false` to
 the else label; `then` into the result slot; `jump:jmp` to the end,
-unless every path through `then` ends in `recur` or `throw` or the
-else branch is the local already in the result slot, which emits
-nothing (`(if c (+ acc 1) acc)` as a `recur` argument); the else
-branch (nil when absent).
+unless control cannot reach the end of `then` (its every path ends in
+a jump, return or throw: the Emitter clears `reachable` after each
+and sets it at every label) or the else branch is the local already
+in the result slot, which emits nothing (`(if c (+ acc 1) acc)` as a
+`recur` argument); the else branch (nil when absent).
 
 The test is compiled as branches rather than as a value: a `not`
 (`(if x false true)`, §4.3 rule 2) branches on `x` the other way, and
 an `and` or an `or` in the shape the expander gives them
 (`(let* [g x] (if g rest g))`, `(let* [g x] (if g g rest))`,
-MACROEXPAND.md §10) branches on `x` and then on `rest`, jumping to the
+MACROEXPAND.md §10, where lowering counted exactly the two reads of
+`g` shown) branches on `x` and then on `rest`, jumping to the
 else arm (or past it, with `jump:if-true`) as soon as the answer is
 known, so none of the three is ever made as a value:
 `(if (and a (not b)) x y)` with `a` and `b` locals is
@@ -663,13 +665,16 @@ when a closure first captures, would be unsound: in `(if false (fn*
 later same-frame `closure:get-cell` would trap `ExpectedCell` on a
 valid program.
 
-1. **Marking.** `LowerEnv` mirrors every scope the `Emitter` will
-   have (`let*` / `loop*` bindings, `fn*` parameters and self-name,
-   `letfn*` names, the catch binding), each entry recording the `fn*`
-   depth it was made at and pointing at its Tiny node's `captured`
-   flag. Lowering a symbol finds its innermost binding; one made at a
-   smaller `fn*` depth is captured and its flag is set. One pass,
-   O(scope depth) per symbol.
+1. **Marking.** Lowering's scope table (`LowerCtx.lexicals`) mirrors
+   every scope the `Emitter` will have (`let*` / `loop*` bindings,
+   `fn*` parameters and self-name, `letfn*` names, the catch
+   binding), each entry recording the `fn*` depth it was made at and
+   pointing at its Tiny node's `captured` flag. Lowering a symbol
+   finds its innermost binding; one made at a smaller `fn*` depth is
+   captured and its flag is set. One pass; each name maps to its
+   innermost binding, which records the one it shadows, so a lookup
+   is one probe however deep the scopes nest, in lowering and in the
+   Emitter alike.
 2. **Binding.** A marked binding is boxed as it is bound and pushed
    as `.cell_slot(s)`; every other one is `.direct_slot(s)`; a marked
    self-name gets a placeholder cell (§5.5). The instruction is in
@@ -843,6 +848,6 @@ top-level `do` one form at a time (MACROEXPAND.md §2b).
 
 ### 11. Left to the implementation
 
-The Zig shapes of `Tiny`, `Compiled`, `LowerEnv` and the `Emitter`,
+The Zig shapes of `Tiny`, `Compiled`, the scope tables and the `Emitter`,
 and the frame stack's backing storage, are not part of this contract;
 any representation that keeps the invariants above conforms.

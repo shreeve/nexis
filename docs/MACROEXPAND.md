@@ -58,6 +58,7 @@ fields:
 | `value_heap` | the calling VM's heap, where macro arguments and results live; else a lazily created heap on `allocator` |
 | `io` | given to a user macro's sub-VM so its body can print |
 | `failure` | the span and message of the innermost failure (§8) |
+| `lexical` | the lexical names in scope where the walk is (§3) |
 
 `ctx.gensym(base)` makes `<base>__<N>__auto__` (§4).
 
@@ -71,7 +72,7 @@ For a list whose head is an unqualified symbol:
    `def`, `set!`, `try`, `defmacro`, `ns`, `require`), each with its
    own walker, and every `#%` name (`#%list`, `#%concat`, ...),
    whose arguments expand as a call's do.
-2. A name bound in the lexical `ExpandEnv` is an ordinary call (§3).
+2. A name a binding form around the call binds is an ordinary call (§3).
 3. **User macro**: `namespace.lookup(name)` yields a bound Var with
    `macro = true` → §1.2. Any other Var it yields that is not
    `nexis.core`'s (one the namespace defines or excludes, or a
@@ -216,14 +217,14 @@ name in `(def x ...)`) or miss bodies that are.
 | `quote` | Opaque: the payload is not walked (§7). |
 | `syntax_quote` (datum) | Rewritten per §5. |
 | `anon_fn` (datum) | Rewritten to `fn*` per §9. |
-| `let*`, `loop*` | Binding names are not expanded. Each right-hand side expands in the env of the bindings before it; the body with all of them. |
-| `fn*` | The parameter vector and self-name are not expanded; the body expands with the params, rest param and self-name in the env. |
-| `letfn*` | Names and parameter vectors are not expanded. Every name enters the env first; each function body expands with that env plus its params; then the body. |
-| `def` | The name is not expanded and does not enter the env (Vars are not lexical); the value expands. |
+| `let*`, `loop*` | Binding names are not expanded. Each right-hand side expands with the bindings before it in scope; the body with all of them. |
+| `fn*` | The parameter vector and self-name are not expanded; the body expands with the params, rest param and self-name in scope. |
+| `letfn*` | Names and parameter vectors are not expanded. Every name enters scope first; each function body expands with them and its params in scope; then the body. |
+| `def` | The name is not expanded and does not enter scope (Vars are not lexical); the value expands. |
 | `var` | Opaque. |
 | `if`, `do`, `recur`, `throw`, `#%` constructors, ordinary calls | Every sub-form expands in the current env. |
-| `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded. `target` must be a symbol; one bound in the lexical env is refused (a local has no thread binding). The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time (`VM.md` §6.5). |
-| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`, any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes), `:default` (also `any`), or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in the env) and the finally body expand; matchers and bindings do not. |
+| `set!` | `(set! target v)` → `(nexis.core/var-set (var target) v)` with `v` expanded. `target` must be a symbol; a lexical name is refused (a local has no thread binding). The Var's own checks (`:not-dynamic`, `:no-thread-binding`) happen at run time (`VM.md` §6.5). |
+| `try` | `(try body* (catch M b h*)* (finally f*)?)` becomes the primitive `(try body* (catch any g <chain>) (finally f*)?)`. The chain tries the clauses in order, `(if (nexis.internal/#%catch-matches? g M) (let* [b g] h*) ...)`, and ends in `(throw g)`, so a value no clause takes unwinds through the `finally`. A matcher is `any`, any other symbol (a class name such as `Exception`, taken as `any` since nexis has no classes), `:default` (also `any`), or a keyword `:tag`, which takes a thrown value equal to `:tag`, a map or record whose `:error` is `:tag`, or an `ex-info` map whose data's `:error` is `:tag`. Any other matcher, a catch or finally before the body's end, or a binding that is not an unqualified symbol is `MalformedMacroCall`. No clause: a finally-only `try`; neither clause: `(do body*)`. The body, each handler (its binding in scope) and the finally body expand; matchers and bindings do not. |
 | `defmacro` | §1.2; replaced by `(var name)`. |
 | `ns` | `(ns NAME "doc"? {attrs}? clause*)` switches `registry.current` to `NAME` at expansion time, creating it (parent `nexis.core`) when unregistered, then runs each `(:require spec*)` clause as `require` does. `(:refer-clojure :exclude [names])` interns each name `nexis.core` or the host macro table holds as an unbound Var of the namespace, so the name resolves, inlines and expands as the namespace's own from then on (a use before the namespace defines it is `:unbound-var` at run time; `nexis.core/name` still reaches core's); `(:refer-clojure)` alone does nothing, and `:only` or `:rename` is `MalformedMacroCall`. `(:gen-class)` is accepted and does nothing; the docstring and attribute map are accepted and not kept; any other clause (`:import`, `:use`) is `MalformedMacroCall`. Replaced by `nil`. |
 | `require` | `(require spec*)`: each spec, quoted or not, is `ns-name` or `[ns-name option*]`, loaded at expansion time through `load_callback` and replaced by `nil`. `:as a` aliases the namespace; `:as-alias a` aliases it without loading; `:refer [x y]` maps `x` and `y` in the current namespace to that namespace's Vars (the same Vars: a later `def` there is seen here); `:refer :all` maps every Var not marked `:private`; `:rename {x z}` names a referred `x` as `z`. A prefix list, a vector whose second element is not a keyword or any list, requires each suffix under its prefix, as Clojure's does: `[app c [d :as dd]]` and `(app c [d :as dd])` are the specs `app.c` and `[app.d :as dd]`; a suffix holding a period, a suffix that is itself a prefix list, and a suffix other than a symbol or vector are `MalformedMacroCall`. A keyword spec (`:reload`) is a flag and changes nothing. Referring a name the current namespace defines itself, and `def` of a name that refers to another namespace's Var, are `MalformedMacroCall` (Clojure's rule); a missing Var or unknown option is reported by name. |
@@ -231,8 +232,7 @@ name in `(def x ...)`) or miss bodies that are.
 | `^meta` | On a vector, map or set literal: `(nexis.core/with-meta coll {meta})`, the map evaluated like any map literal except that a symbol under `:tag` is quoted, so `(meta ^:foo [1])` is `{:foo true}`. On anything else in expression position (a symbol, a call) it is a hint and is dropped. In every binding position (`let`, `loop`, `let*`, `loop*`, `fn` and `fn*` names and patterns, a parameter vector as a return hint, `:keys` entries, `defrecord` fields, a `catch` binding) it is dropped: `(defn f ^long [^String s] ...)` is `(defn f [s] ...)`. On the name of `def`, `defn` or `defmacro` it becomes the Var's metadata, `^String` as `{:tag String}` with the tag quoted. |
 
 Every sub-form is expanded exactly once, so a user macro runs once
-per call site. `ExpandEnv` tracks lexical names with an
-innermost-first parent walk, as `compile.LowerEnv` does.
+per call site.
 
 **The loader** (`src/loader.zig`). `require` reaches it through
 `load_callback`. `Loader.evalSource` is the one path from text to
@@ -270,11 +270,13 @@ operator in the compiler:
   (when 1 2))   ; [1 2]: a call of the local, not the macro
 ```
 
-`ExpandEnv` holds the names bound by `let*`, `loop*`, `fn*`,
-`letfn*` and `catch` (and so by the host macros that expand to
-them), and macro lookup requires `!env.contains(name)`. Special
-forms cannot be shadowed: they are recognised before the env is
-consulted.
+`ExpandContext.lexical` counts, for each name, the binding forms
+around the walk that bind it: `let*`, `loop*`, `fn*`, `letfn*` and
+`catch` (and so the host macros that expand to them). Each opens a
+`Scope` that adds its names and takes them out when it closes, so
+whether a name is lexical is one lookup however deep the forms nest,
+and macro lookup requires that it is not. Special forms cannot be
+shadowed: they are recognised before the names are consulted.
 
 ---
 
@@ -512,8 +514,8 @@ Nested `#()` never reaches the expander: the reader rejects it.
 | `defn-` | `defn` with `:private true` in the Var's metadata, which `(require '[ns :refer :all])` skips. |
 | `loop` | `loop*`; each pattern binds a gensym and destructures again on every iteration, so `recur` rebinds the gensyms. |
 | `when`, `when-not` | `(if test (do body...) nil)`, `(if test nil (do body...))` |
-| `and` | `(and)` → `true`; `(and x)` → `x`; `(and x y ...)` → `(let* [g x] (if g (and y ...) g))`: the first falsy value or the last. |
-| `or` | `(or)` → `nil`; `(or x)` → `x`; `(or x y ...)` → `(let* [g x] (if g g (or y ...)))`: the first truthy value or the last. |
+| `and` | `(and)` → `true`; `(and x)` → `x`; `(and x y ...)` → `(let* [g x] (if g A g))`, `A` the same expansion of `(and y ...)`, the whole chain built in one step from the last operand back: the first falsy value or the last. |
+| `or` | `(or)` → `nil`; `(or x)` → `x`; `(or x y ...)` → `(let* [g x] (if g g O))`, `O` the expansion of `(or y ...)`, built the same way: the first truthy value or the last. |
 | `cond` | Nested `if`; an odd argument count fails. `:else` works by truthiness: a last test that is a truthy literal (a keyword, `true`, a number, a string, a char) is no test, its value the innermost `else`. |
 | `case` | Keys are constants, never evaluated: a symbol key is that symbol, a vector or map key that literal, a list `(k1 k2)` groups alternatives; they are compared with `=`. With fewer than three constants, `(let* [g expr] (if (= g 'k1) v1 ...))`; with three or more, one hashed lookup finds the clause, `(let* [g expr i (get '{k1 0 k2 1 ...} g -1)] (if (== i 0) v1 (if (== i 1) v2 ...)))`, each test one inlined compare (`g` is bound only when there is no default, for the throw). The map's lookup is `=`'s equality and hash. Two constants that are `=` but spelled differently (`[1]`, a grouped `(1)`) would share a key where the chain lets the first clause win, so a case with two compound constants, or two bignums, keeps the chain. The map lists the constants in clause order, so they are interned in source order, ahead of the clauses' results. A constant given twice, alone or in a group, is `MalformedMacroCall` "case: duplicate test constant" at the second, as in Clojure; constants of different kinds (`1`, `1.0`, `\1`) are distinct. With no trailing default, no match throws `{:error :no-matching-clause :message "No matching clause: <expr>" :value expr}`. |
 | `condp` | `pred` and `expr` evaluated once; clauses become `(if (p c e) v ...)` with `case`'s default policy. A clause `c :>> f` calls `f` on the predicate's truthy result. |

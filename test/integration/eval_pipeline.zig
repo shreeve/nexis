@@ -2215,7 +2215,7 @@ fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, a
         .registry = program.registry,
         .value_heap = program.v.ensureHeap(),
     };
-    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, null, form));
+    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, form));
     const failure = ctx.failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, failure.message);
     try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
@@ -6114,7 +6114,7 @@ fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []
             .load_callback = dir.callback(),
             .value_heap = program.v.ensureHeap(),
         };
-        _ = expand_mod.expandForm(&ctx, null, form) catch {
+        _ = expand_mod.expandForm(&ctx, form) catch {
             failure = ctx.failure;
             break;
         };

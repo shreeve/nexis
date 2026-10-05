@@ -863,6 +863,97 @@ test "eval: a form's lowering is freed once its routine is compiled" {
     };
 }
 
+/// Sources of `n` operands, clauses or nesting levels, each of a shape
+/// some pass of the front end once walked again at every level.
+const Growing = enum {
+    /// The expander re-listed the rest of the operands at each step.
+    and_operands,
+    /// Whether the then arm of each `if` falls through.
+    then_nested_if,
+    /// Whether the rest of each and-shaped `let*` reads its name.
+    and_shape,
+    /// Each `case` constant against every other, for a duplicate.
+    case_constants,
+
+    fn source(shape: Growing, allocator: std.mem.Allocator, n: usize) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        switch (shape) {
+            .and_operands => {
+                try out.appendSlice(allocator, "(let* [x 1] (and");
+                for (0..n) |_| try out.appendSlice(allocator, " x");
+                try out.appendSlice(allocator, "))");
+            },
+            .then_nested_if => {
+                try out.appendSlice(allocator, "(let* [x 1 y ");
+                for (0..n) |_| try out.appendSlice(allocator, "(if x ");
+                try out.appendSlice(allocator, "x");
+                for (0..n) |_| try out.appendSlice(allocator, " 2)");
+                try out.appendSlice(allocator, "] y)");
+            },
+            .and_shape => {
+                try out.appendSlice(allocator, "(let* [x 1] (if ");
+                for (0..n) |i| try out.print(allocator, "(let* [g{d} x] (if g{d} ", .{ i, i });
+                try out.appendSlice(allocator, "x");
+                for (0..n) |k| try out.print(allocator, " g{d}))", .{n - 1 - k});
+                try out.appendSlice(allocator, " 1 2))");
+            },
+            .case_constants => {
+                try out.appendSlice(allocator, "(case 5");
+                for (0..n) |i| try out.print(allocator, " :k{d} {d}", .{ i, i });
+                try out.appendSlice(allocator, " 0)");
+            },
+        }
+        return out.toOwnedSlice(allocator);
+    }
+};
+
+/// The least thread CPU time of three runs of `src`, each compiled
+/// and run on a fresh program, in nanoseconds.
+fn bestRunNanos(src: []const u8) !u64 {
+    var best: u64 = std.math.maxInt(u64);
+    for (0..3) |_| {
+        var program: harness.Program = undefined;
+        try program.init();
+        defer program.deinit();
+        const start = std.Io.Clock.cpu_thread.now(testing.io);
+        _ = try program.run(src);
+        best = @min(best, @as(u64, @intCast(start.durationTo(std.Io.Clock.cpu_thread.now(testing.io)).nanoseconds)));
+    }
+    return best;
+}
+
+fn growthRatios(failed: *bool) void {
+    nx.stack.arm(480 << 20);
+    for (std.enums.values(Growing)) |shape| {
+        var nanos: [2]u64 = undefined;
+        for (&nanos, [_]usize{ 2500, 10_000 }) |*t, n| {
+            const src = shape.source(std.heap.page_allocator, n) catch return;
+            defer std.heap.page_allocator.free(src);
+            t.* = bestRunNanos(src) catch |err| {
+                std.debug.print("\n  {t} at {d}: {s}\n", .{ shape, n, @errorName(err) });
+                failed.* = true;
+                return;
+            };
+        }
+        // Four times the input takes about four times as long when the
+        // cost is linear, sixteen when it is quadratic.
+        const ratio = @as(f64, @floatFromInt(nanos[1])) / @as(f64, @floatFromInt(@max(nanos[0], 1)));
+        if (ratio > 9) {
+            std.debug.print("\n  {t}: {d} ns at 2500, {d} ns at 10000 ({d:.1}x)\n", .{ shape, nanos[0], nanos[1], ratio });
+            failed.* = true;
+        }
+    }
+}
+
+test "compile time grows linearly in operands, clauses and nesting" {
+    // Deep nesting needs a deep stack, as the CLI's runtime thread has.
+    var failed = false;
+    const thread = try std.Thread.spawn(.{ .stack_size = 512 << 20 }, growthRatios, .{&failed});
+    thread.join();
+    try testing.expect(!failed);
+}
+
 // =============================================================================
 // Differential: random programs against a reference evaluator
 // =============================================================================

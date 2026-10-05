@@ -138,6 +138,15 @@ pub const ExpandContext = struct {
     /// Set by the first (innermost) failure of an expansion that
     /// returns an error; the message lives in `allocator`.
     failure: ?Failure = null,
+    /// The lexical names in scope where the walk is, each with how
+    /// many enclosing binding forms bind it (`Scope`); empty at the
+    /// top of a form.
+    lexical: std.StringHashMapUnmanaged(u32) = .empty,
+
+    /// Whether `name` is bound by a binding form around the walk.
+    fn isLexical(self: *const ExpandContext, name: []const u8) bool {
+        return (self.lexical.get(name) orelse 0) > 0;
+    }
 
     /// Record why expanding the form at `span` failed, unless an
     /// inner form already did, and return `err`.
@@ -192,23 +201,25 @@ pub const MacroFn = *const fn (
 /// an empty table disables host expansion.
 pub const HostMacroTable = std.StringHashMapUnmanaged(MacroFn);
 
-/// Lexical-name set for macro-shadowing tracking. Mirrors
-/// `compile.LowerEnv` exactly so the two stay aligned.
-/// Innermost-first lookup via parent walk.
-pub const ExpandEnv = struct {
-    lexical_names: NameSet = .{},
-    parent: ?*const ExpandEnv = null,
+/// The names one binding form (`let*`, `loop*`, `fn*`, `letfn*`, a
+/// `catch`) puts in scope for the forms inside it (§3): it adds them
+/// to `ExpandContext.lexical` and takes them out again when it
+/// closes, so whether a name is lexical is one lookup however deep
+/// the forms nest.
+const Scope = struct {
+    ctx: *ExpandContext,
+    added: std.ArrayList([]const u8) = .empty,
 
-    const NameSet = std.StringHashMapUnmanaged(void);
-
-    pub fn contains(self: *const ExpandEnv, name: []const u8) bool {
-        if (self.lexical_names.contains(name)) return true;
-        if (self.parent) |p| return p.contains(name);
-        return false;
+    fn bind(self: *Scope, name: []const u8) ExpandError!void {
+        try self.added.ensureUnusedCapacity(self.ctx.allocator, 1);
+        const entry = try self.ctx.lexical.getOrPut(self.ctx.allocator, name);
+        entry.value_ptr.* = if (entry.found_existing) entry.value_ptr.* + 1 else 1;
+        self.added.appendAssumeCapacity(name);
     }
 
-    pub fn deinit(self: *ExpandEnv, allocator: Allocator) void {
-        self.lexical_names.deinit(allocator);
+    fn close(self: *Scope) void {
+        for (self.added.items) |name| self.ctx.lexical.getPtr(name).?.* -= 1;
+        self.added.deinit(self.ctx.allocator);
     }
 };
 
@@ -230,12 +241,8 @@ pub const MAX_EXPANSION_DEPTH: u32 = 256;
 ///
 /// Empty `ctx.host_macros` table → output structurally identical
 /// to input.
-pub fn expandForm(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    form: *const Form,
-) ExpandError!*Form {
-    return expandFormDepth(ctx, env, form, 0);
+pub fn expandForm(ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+    return expandFormDepth(ctx, form, 0);
 }
 
 /// One macro step, the way `macroexpand-1` sees it: when `form` is
@@ -246,7 +253,7 @@ pub fn expandForm(
 pub fn expandOnce(ctx: *ExpandContext, form: *const Form) ExpandError!?*Form {
     if (form.datum != .list) return null;
     const items = form.datum.list;
-    const macro = findMacro(ctx, null, items) orelse return null;
+    const macro = findMacro(ctx, items) orelse return null;
     return try callMacro(ctx, macro, form, items);
 }
 
@@ -275,7 +282,7 @@ const Macro = union(enum) {
 /// unqualified head that is not a special form or `#%` primitive and
 /// not lexically bound names a macro Var of the current namespace or
 /// its refers, else a host macro.
-fn findMacro(ctx: *ExpandContext, env: ?*const ExpandEnv, items: []const *Form) ?Macro {
+fn findMacro(ctx: *ExpandContext, items: []const *Form) ?Macro {
     if (items.len == 0 or items[0].datum != .symbol) return null;
     const head = items[0].datum.symbol;
     if (head.ns) |ns_prefix| {
@@ -287,7 +294,7 @@ fn findMacro(ctx: *ExpandContext, env: ?*const ExpandEnv, items: []const *Form) 
         return null;
     }
     if (isSpecialFormName(head.name)) return null;
-    if (env) |e| if (e.contains(head.name)) return null;
+    if (ctx.isLexical(head.name)) return null;
     if (ctx.namespace) |ns| if (ns.lookup(head.name)) |v| {
         if (v.macro and v.bound) return .{ .user = v };
         // A Var of the name other than `nexis.core`'s (the
@@ -330,7 +337,7 @@ pub const special_forms = std.StaticStringMap(SpecialForm).initComptime(.{
     .{ "require", &expandRequire },
 });
 
-const SpecialForm = *const fn (ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form;
+const SpecialForm = *const fn (ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form;
 
 /// Whether `name` heads a special form or is an internal `#%`
 /// primitive (`#%list`, `#%vector`, ...), whose arguments expand as
@@ -345,20 +352,15 @@ fn isSpecialFormName(name: []const u8) bool {
 
 /// `form` expanded, `depth` being how many macro expansions in a row
 /// produced it at this position; its sub-forms start again at 0.
-fn expandFormDepth(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    form: *const Form,
-    depth: u32,
-) ExpandError!*Form {
+fn expandFormDepth(ctx: *ExpandContext, form: *const Form, depth: u32) ExpandError!*Form {
     if (depth > MAX_EXPANSION_DEPTH) return ctx.failWith(ExpandError.ExpansionDepthExceeded, form.origin, "macro expansion did not finish after {d} expansions in a row", .{MAX_EXPANSION_DEPTH});
     try checkStack();
     const b = Builder{ .ctx = ctx, .origin = form.origin };
     return switch (form.datum) {
         .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => mutCast(form),
-        .list => |items| try expandList(ctx, env, form, items, depth),
+        .list => |items| try expandList(ctx, form, items, depth),
         // Collection literals are expressions: their items expand.
-        .vector, .map, .set => try mapChildren(ctx, form, Walk{ .env = env }),
+        .vector, .map, .set => try mapChildren(ctx, form, Walk{}),
         // Opaque (§7): `(quote (when x y))` does not expand `when`.
         .quote => mutCast(form),
         // §5: the construction form, then expanded like any form so
@@ -366,26 +368,26 @@ fn expandFormDepth(
         .syntax_quote => |payload| blk: {
             var scope = GensymScope{};
             defer scope.deinit(ctx.allocator);
-            break :blk try expandFormDepth(ctx, env, try syntaxQuote(ctx, &scope, payload), depth);
+            break :blk try expandFormDepth(ctx, try syntaxQuote(ctx, &scope, payload), depth);
         },
         // The reader refuses these outside syntax-quote; a macro
         // could still produce one.
         .unquote, .unquote_splicing => ctx.fail(form.origin, "{s} outside syntax-quote", .{describeForm(form)}),
-        .anon_fn => |items| try expandFormDepth(ctx, env, try anonFnForm(ctx, form, items), depth),
+        .anon_fn => |items| try expandFormDepth(ctx, try anonFnForm(ctx, form, items), depth),
         // `^meta` on a collection literal attaches to the value, as
         // `with-meta` does; on anything else (a symbol, a call) it
         // is a hint and is dropped.
         .with_meta => |wm| switch (wm.target.datum) {
             .vector, .map, .set => try b.list(.{
                 "nexis.core/with-meta",
-                try expandForm(ctx, env, wm.target),
-                try expandForm(ctx, env, try metaMapExpr(ctx, wm.meta.datum.map, wm.meta.origin)),
+                try expandForm(ctx, wm.target),
+                try expandForm(ctx, try metaMapExpr(ctx, wm.meta.datum.map, wm.meta.origin)),
             }),
-            else => try expandFormDepth(ctx, env, wm.target, depth),
+            else => try expandFormDepth(ctx, wm.target, depth),
         },
         // `@x` is `(nexis.core/deref x)`, qualified so that neither a
         // local nor a Var named `deref` captures it.
-        .deref => |inner| try b.list(.{ "nexis.core/deref", try expandForm(ctx, env, inner) }),
+        .deref => |inner| try b.list(.{ "nexis.core/deref", try expandForm(ctx, inner) }),
     };
 }
 
@@ -407,14 +409,8 @@ inline fn checkStack() ExpandError!void {
 
 /// Expand a list form; a failure no inner form explained is
 /// recorded against this one.
-fn expandList(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-    depth: u32,
-) ExpandError!*Form {
-    return dispatchList(ctx, env, list_form, items, depth) catch |err| {
+fn expandList(ctx: *ExpandContext, list_form: *const Form, items: []const *Form, depth: u32) ExpandError!*Form {
+    return dispatchList(ctx, list_form, items, depth) catch |err| {
         if (ctx.failure != null) return err;
         const head = if (items.len > 0 and items[0].datum == .symbol) items[0].datum.symbol.name else "";
         return switch (err) {
@@ -428,20 +424,14 @@ fn expandList(
 /// A special form walks by its own rule; a macro call expands and
 /// its output is expanded again, one step deeper; anything else is
 /// a call, whose head and arguments expand.
-fn dispatchList(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-    depth: u32,
-) ExpandError!*Form {
+fn dispatchList(ctx: *ExpandContext, list_form: *const Form, items: []const *Form, depth: u32) ExpandError!*Form {
     if (items.len > 0 and items[0].datum == .symbol and items[0].datum.symbol.ns == null) {
-        if (special_forms.get(items[0].datum.symbol.name)) |walk| return walk(ctx, env, list_form, items);
+        if (special_forms.get(items[0].datum.symbol.name)) |walk| return walk(ctx, list_form, items);
     }
-    if (findMacro(ctx, env, items)) |macro| {
-        return expandFormDepth(ctx, env, try callMacro(ctx, macro, list_form, items), depth + 1);
+    if (findMacro(ctx, items)) |macro| {
+        return expandFormDepth(ctx, try callMacro(ctx, macro, list_form, items), depth + 1);
     }
-    return mapChildren(ctx, list_form, Walk{ .env = env });
+    return mapChildren(ctx, list_form, Walk{});
 }
 
 /// The namespace name `ns_prefix` stands for: the target of an
@@ -457,41 +447,41 @@ fn aliasTarget(ctx: *ExpandContext, ns_prefix: []const u8) []const u8 {
 // =============================================================================
 
 /// `quote` and `var`: nothing inside is expanded.
-fn opaqueForm(_: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, _: []const *Form) ExpandError!*Form {
+fn opaqueForm(_: *ExpandContext, list_form: *const Form, _: []const *Form) ExpandError!*Form {
     return mutCast(list_form);
 }
 
-/// `do`, `recur`, `throw` and a call: every sub-form expands under
-/// the same env.
-fn walkCall(ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, _: []const *Form) ExpandError!*Form {
-    return mapChildren(ctx, list_form, Walk{ .env = env });
+/// `do`, `recur`, `throw` and a call: every sub-form expands in the
+/// same scope.
+fn walkCall(ctx: *ExpandContext, list_form: *const Form, _: []const *Form) ExpandError!*Form {
+    return mapChildren(ctx, list_form, Walk{});
 }
 
-fn expandIf(ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+fn expandIf(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 3 or items.len > 4) return ctx.fail(list_form.origin, "if: expected a test, a then and an optional else", .{});
-    return mapChildren(ctx, list_form, Walk{ .env = env });
+    return mapChildren(ctx, list_form, Walk{});
 }
 
 /// `let*` / `loop*`: each value expands with the names bound before
-/// it in the env, the body with all of them; the names do not
-/// expand, and lose any `^hint`.
-fn expandLetStar(ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+/// it in scope, the body with all of them; the names do not expand,
+/// and lose any `^hint`.
+fn expandLetStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const head = items[0].datum.symbol.name;
     const bindings = try ctx.allocator.dupe(*Form, try bindingVector(ctx, list_form, items));
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
+    var scope: Scope = .{ .ctx = ctx };
+    defer scope.close();
     var i: usize = 0;
     while (i < bindings.len) : (i += 2) {
         const name = stripMeta(bindings[i]);
         if (name.datum != .symbol or name.datum.symbol.ns != null) return ctx.fail(name.origin, "{s}: cannot bind {s}", .{ head, describeForm(name) });
         bindings[i] = name;
-        bindings[i + 1] = try expandForm(ctx, &local, bindings[i + 1]);
-        try local.lexical_names.put(ctx.allocator, name.datum.symbol.name, {});
+        bindings[i + 1] = try expandForm(ctx, bindings[i + 1]);
+        try scope.bind(name.datum.symbol.name);
     }
     return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{
         items[0],
         try makeVector(ctx, bindings, items[1].origin),
-        try expandAll(ctx, &local, items[2..]),
+        try expandAll(ctx, items[2..]),
     }), list_form.origin);
 }
 
@@ -505,55 +495,56 @@ fn bindingVector(ctx: *ExpandContext, list_form: *const Form, items: []const *Fo
     return bindings;
 }
 
-/// Add the plain names of a parameter vector (not `&`) to `env`.
-fn bindParams(ctx: *ExpandContext, env: *ExpandEnv, params: []const *Form) ExpandError!void {
+/// Put the plain names of a parameter vector (not `&`) in `scope`.
+fn bindParams(scope: *Scope, params: []const *Form) ExpandError!void {
     for (params) |p| {
         if (p.datum != .symbol or p.datum.symbol.ns != null or isAmpersand(p)) continue;
-        try env.lexical_names.put(ctx.allocator, p.datum.symbol.name, {});
+        try scope.bind(p.datum.symbol.name);
     }
 }
 
 /// `(fn* name? [params] body...)`: the body expands with the name
-/// and the parameters in the env; the parameter vector does not
-/// expand and loses its hints.
-fn expandFnStar(ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+/// and the parameters in scope; the parameter vector does not expand
+/// and loses its hints.
+fn expandFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const name: []const *Form = if (items.len > 1 and items[1].datum == .symbol) items[1..2] else &.{};
     const rest = items[1 + name.len ..];
     if (rest.len == 0) return ctx.fail(list_form.origin, "fn*: expected a parameter vector", .{});
     const params = try stripParams(ctx, rest[0]);
     if (params.datum != .vector) return ctx.fail(params.origin, "fn*: expected a parameter vector, not {s}", .{describeForm(params)});
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
-    try bindParams(ctx, &local, name);
-    try bindParams(ctx, &local, params.datum.vector);
-    return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{ items[0], name, params, try expandAll(ctx, &local, rest[1..]) }), list_form.origin);
+    var scope: Scope = .{ .ctx = ctx };
+    defer scope.close();
+    try bindParams(&scope, name);
+    try bindParams(&scope, params.datum.vector);
+    return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{ items[0], name, params, try expandAll(ctx, rest[1..]) }), list_form.origin);
 }
 
 /// `(letfn* [(name params-or-clauses body...) ...] body...)`: every
-/// name is in the env of every fn body and of the letfn body; an
-/// entry goes through the `fn` expansion first, so overload clauses
-/// and destructuring work as for `fn`.
-fn expandLetFnStar(ctx: *ExpandContext, env: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+/// name is in scope in every fn body and in the letfn body; an entry
+/// goes through the `fn` expansion first, so overload clauses and
+/// destructuring work as for `fn`.
+fn expandLetFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 2 or items[1].datum != .vector) return ctx.fail(list_form.origin, "letfn*: expected a vector of fn bindings", .{});
     const entries = items[1].datum.vector;
-    var local: ExpandEnv = .{ .parent = env };
-    defer local.deinit(ctx.allocator);
+    var scope: Scope = .{ .ctx = ctx };
+    defer scope.close();
     for (entries) |entry| {
         if (entry.datum != .list or entry.datum.list.len < 2) return ctx.fail(entry.origin, "letfn*: expected (name [params] body...), not {s}", .{describeForm(entry)});
         _ = try plainName(ctx, entry.datum.list[0], "letfn*: a name");
-        try bindParams(ctx, &local, entry.datum.list[0..1]);
+        try bindParams(&scope, entry.datum.list[0..1]);
     }
     const new_entries = try ctx.allocator.alloc(*Form, entries.len);
     for (entries, new_entries) |entry, *out| {
-        // The entry as `(fn* name [params] body...)`, expanded under
-        // `local`, is `(name [params] body...)` behind its head.
-        const fn_form = try expandFnStar(ctx, &local, entry, (try fnStar(ctx, entry, entry.datum.list)).datum.list);
+        // The entry as `(fn* name [params] body...)`, expanded with
+        // every name in scope, is `(name [params] body...)` behind its
+        // head.
+        const fn_form = try expandFnStar(ctx, entry, (try fnStar(ctx, entry, entry.datum.list)).datum.list);
         out.* = try makeList(ctx, fn_form.datum.list[1..], entry.origin);
     }
     return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{
         items[0],
         try makeVector(ctx, new_entries, items[1].origin),
-        try expandAll(ctx, &local, items[2..]),
+        try expandAll(ctx, items[2..]),
     }), list_form.origin);
 }
 
@@ -622,12 +613,7 @@ fn stripParams(ctx: *ExpandContext, params: *const Form) ExpandError!*Form {
 
 // ---- def / defn -----------------------------------------------------------
 
-fn expandDef(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
+fn expandDef(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     // (def name) | (def name value) | (def name "doc" value); the
     // name may carry `^meta`, which lands on the Var.
     if (items.len < 2 or items.len > 4) return ctx.fail(list_form.origin, "def: expected a name, an optional docstring and a value", .{});
@@ -638,7 +624,7 @@ fn expandDef(
     if (ctx.namespace) |ns| if (ns.vars.getEntry(name)) |entry| if (!isOwnVar(entry)) {
         return ctx.fail(named.name.origin, "def: {s} already refers to a Var of another namespace", .{name});
     };
-    const value = try expandAll(ctx, env, if (items.len == 2) &.{} else items[items.len - 1 ..]);
+    const value = try expandAll(ctx, if (items.len == 2) &.{} else items[items.len - 1 ..]);
     const def_form = try b.list(.{ items[0], named.name, value });
     if (named.meta == null and items.len < 4) return def_form;
     var meta: std.ArrayList(*Form) = .empty;
@@ -647,10 +633,10 @@ fn expandDef(
     return withVarMeta(ctx, def_form, meta.items, list_form.origin);
 }
 
-/// Each of `forms` expanded under `env`.
-fn expandAll(ctx: *ExpandContext, env: ?*const ExpandEnv, forms: []const *Form) ExpandError![]*Form {
+/// Each of `forms` expanded.
+fn expandAll(ctx: *ExpandContext, forms: []const *Form) ExpandError![]*Form {
     const out = try ctx.allocator.alloc(*Form, forms.len);
-    for (forms, out) |f, *o| o.* = try expandForm(ctx, env, f);
+    for (forms, out) |f, *o| o.* = try expandForm(ctx, f);
     return out;
 }
 
@@ -713,15 +699,10 @@ fn withVarMeta(ctx: *ExpandContext, def_form: *Form, meta_items: []const *Form, 
 /// rethrown, so it unwinds through the `finally` to the enclosing
 /// `try`. With no clause at all the handler is the rethrow, which
 /// is finally-only `try`; with neither catch nor finally the form is
-/// `(do body...)`. The body, each handler (with its binding in the
-/// env) and the finally body are expanded; matchers and bindings are
-/// not.
-fn expandTry(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
+/// `(do body...)`. The body, each handler (with its binding in
+/// scope) and the finally body are expanded; matchers and bindings
+/// are not.
+fn expandTry(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const b = Builder{ .ctx = ctx, .origin = list_form.origin };
     // Body forms, then catch clauses, then an optional finally.
     var end = items.len;
@@ -732,7 +713,7 @@ fn expandTry(
     const body = items[1..catch_start];
     const catches = items[catch_start..end];
     for (body) |f| if (isClauseHead(f, "catch") or isClauseHead(f, "finally")) return ctx.fail(f.origin, "try: catch and finally come after the body, finally last", .{});
-    const new_body = try expandAll(ctx, env, body);
+    const new_body = try expandAll(ctx, body);
     if (catches.len == 0 and finally_form == null) return b.list(.{ "do", new_body });
 
     const g = try b.gensym("caught");
@@ -745,10 +726,10 @@ fn expandTry(
         const matcher = clause[1];
         const binding = stripMeta(clause[2]);
         if (binding.datum != .symbol or binding.datum.symbol.ns != null) return ctx.fail(binding.origin, "catch: the binding must be an unqualified symbol, not {s}", .{describeForm(binding)});
-        var handler_env: ExpandEnv = .{ .parent = env };
-        defer handler_env.deinit(ctx.allocator);
-        try handler_env.lexical_names.put(ctx.allocator, binding.datum.symbol.name, {});
-        const clause_body = try b.list(.{ "let*", try b.vec(.{ binding, g }), try expandAll(ctx, &handler_env, clause[3..]) });
+        var scope: Scope = .{ .ctx = ctx };
+        defer scope.close();
+        try scope.bind(binding.datum.symbol.name);
+        const clause_body = try b.list(.{ "let*", try b.vec(.{ binding, g }), try expandAll(ctx, clause[3..]) });
         const is_any = matcher.datum == .symbol or
             (matcher.datum == .keyword and matcher.datum.keyword.ns == null and std.mem.eql(u8, matcher.datum.keyword.name, "default"));
         if (is_any) {
@@ -762,7 +743,7 @@ fn expandTry(
     const catch_form = try b.list(.{ "catch", "any", g, handler });
     if (finally_form) |ff| {
         const fin = ff.datum.list;
-        return b.list(.{ items[0], new_body, catch_form, try makeList(ctx, try b.items(.{ fin[0], try expandAll(ctx, env, fin[1..]) }), ff.origin) });
+        return b.list(.{ items[0], new_body, catch_form, try makeList(ctx, try b.items(.{ fin[0], try expandAll(ctx, fin[1..]) }), ff.origin) });
     }
     return b.list(.{ items[0], new_body, catch_form });
 }
@@ -862,13 +843,11 @@ fn mapChildren(ctx: *ExpandContext, form: *const Form, visitor: anytype) ExpandE
 }
 
 /// The visitor `mapChildren` expands each child with: the sub-forms
-/// of calls, `do`, `if`, `recur` and collection literals, all under
-/// one env.
+/// of calls, `do`, `if`, `recur` and collection literals, all in one
+/// scope.
 const Walk = struct {
-    env: ?*const ExpandEnv,
-
-    fn visit(self: Walk, ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
-        return expandForm(ctx, self.env, form);
+    fn visit(_: Walk, ctx: *ExpandContext, form: *const Form) ExpandError!*Form {
+        return expandForm(ctx, form);
     }
 };
 
@@ -893,7 +872,7 @@ const Walk = struct {
 /// accepted and does nothing (there is no class to generate). The
 /// docstring and attribute map are accepted and not kept. The form
 /// is replaced by nil.
-fn expandNs(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const origin = list_form.origin;
     if (items.len < 2) return ctx.fail(origin, "ns: expected a namespace name", .{});
     const name_form = stripMeta(items[1]);
@@ -957,7 +936,7 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
 /// and changes nothing. What a namespace name loads, including the
 /// Clojure library names that stand for nexis namespaces, is the
 /// loader's (`loader.zig`).
-fn expandRequire(ctx: *ExpandContext, _: ?*const ExpandEnv, list_form: *const Form, items: []const *Form) ExpandError!*Form {
+fn expandRequire(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 2) return ctx.fail(list_form.origin, "require: expected a namespace", .{});
     for (items[1..]) |spec| try requireSpec(ctx, spec);
     return try makeNil(ctx, list_form.origin);
@@ -1129,20 +1108,15 @@ fn unwrapQuote(form: *const Form) *const Form {
 /// `(nexis.core/var-set (var target) v)`. A target that is a
 /// lexical name is refused here, at compile time, because a local
 /// has no binding to rebind (VM.md §6.5).
-fn expandSetBang(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
+fn expandSetBang(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len != 3) return ctx.fail(list_form.origin, "set!: expected a Var name and a value", .{});
     const target = items[1];
     if (target.datum != .symbol) return ctx.fail(target.origin, "set!: expected a Var name, not {s}", .{describeForm(target)});
-    if (target.datum.symbol.ns == null) if (env) |e| if (e.contains(target.datum.symbol.name)) {
+    if (target.datum.symbol.ns == null and ctx.isLexical(target.datum.symbol.name)) {
         return ctx.fail(target.origin, "set!: {s} is a local, not a Var", .{target.datum.symbol.name});
-    };
+    }
     const b = Builder{ .ctx = ctx, .origin = list_form.origin };
-    return b.list(.{ "nexis.core/var-set", try b.list(.{ "var", target }), try expandForm(ctx, env, items[2]) });
+    return b.list(.{ "nexis.core/var-set", try b.list(.{ "var", target }), try expandForm(ctx, items[2]) });
 }
 
 /// `(defmacro NAME ...)`, spelled like `defn` (docstring, attribute
@@ -1150,12 +1124,7 @@ fn expandSetBang(
 /// `(def NAME (fn NAME ...))`, fully expanded, is compiled and run
 /// through `ctx.compile_eval`, and the Var it yields is marked a
 /// macro. The form is replaced by `(var NAME)`.
-fn expandDefmacro(
-    ctx: *ExpandContext,
-    env: ?*const ExpandEnv,
-    list_form: *const Form,
-    items: []const *Form,
-) ExpandError!*Form {
+fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const origin = list_form.origin;
     const parts = try defnParts(ctx, list_form, items[1..], false);
     const name = parts.name.datum.symbol.name;
@@ -1163,7 +1132,7 @@ fn expandDefmacro(
     const b = Builder{ .ctx = ctx, .origin = origin };
     const fn_form = try fnStar(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
     const def_form = try b.list(.{ "def", parts.name, fn_form });
-    const expanded = try expandForm(ctx, env, try withVarMeta(ctx, def_form, parts.meta, origin));
+    const expanded = try expandForm(ctx, try withVarMeta(ctx, def_form, parts.meta, origin));
 
     // The sub-VM is not released: the macro's closure lives in its
     // allocator (the persistent one the compiler gives), which the
@@ -1964,8 +1933,8 @@ fn defnParts(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, p
 //
 //   (when t body...)      => (if t (do body...) nil)
 //   (when-not t body...)  => (if t nil (do body...))
-//   (and) => true   (and x) => x   (and x y ...) => (let* [g x] (if g (and y ...) g))
-//   (or)  => nil    (or x)  => x   (or x y ...)  => (let* [g x] (if g g (or y ...)))
+//   (and) => true   (and x) => x   (and x y ...) => (let* [g x] (if g <and of y ...> g))
+//   (or)  => nil    (or x)  => x   (or x y ...)  => (let* [g x] (if g g <or of y ...>))
 //   (cond t1 e1 t2 e2 ...) => (if t1 e1 (if t2 e2 ... nil))
 //
 // `and` and `or` return the deciding value itself and bind the
@@ -1992,15 +1961,21 @@ fn expandOr(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) Ex
     return andOr(ctx, call_form, args, .or_);
 }
 
+/// The whole chain at once, from the last operand back, so `n`
+/// operands cost O(n), as `cond` does.
 fn andOr(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, comptime op: enum { and_, or_ }) ExpandError!*Form {
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const name = if (op == .and_) "and" else "or";
     if (args.len == 0) return if (op == .and_) b.item(true) else b.item(null);
-    if (args.len == 1) return mutCast(args[0]);
-    const rest = if (args.len == 2) mutCast(args[1]) else try b.list(.{ name, args[1..] });
-    const g = try b.gensym(name);
-    const test_form = if (op == .and_) try b.list(.{ "if", g, rest, g }) else try b.list(.{ "if", g, g, rest });
-    return b.list(.{ "let*", try b.vec(.{ g, args[0] }), test_form });
+    var chain = mutCast(args[args.len - 1]);
+    var i = args.len - 1;
+    while (i > 0) {
+        i -= 1;
+        const g = try b.gensym(name);
+        const test_form = if (op == .and_) try b.list(.{ "if", g, chain, g }) else try b.list(.{ "if", g, g, chain });
+        chain = try b.list(.{ "let*", try b.vec(.{ g, args[i] }), test_form });
+    }
+    return chain;
 }
 
 fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
@@ -2061,12 +2036,20 @@ fn expandCase(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
     const g = try b.gensym("case");
     const clauses = args[1..];
     var keys: std.ArrayList(*const Form) = .empty;
+    // Atoms are found again by hash; compound constants, which are
+    // rare, by comparing them pairwise.
+    var atoms: reader_mod.LiteralSet = .empty;
+    var compounds: std.ArrayList(*const Form) = .empty;
     var k: usize = 0;
     while (k + 1 < clauses.len) : (k += 2) {
         const key = clauses[k];
         const alternatives: []const *Form = if (key.datum == .list) key.datum.list else &.{key};
         for (alternatives) |alt| {
-            for (keys.items) |seen| if (try sameConstant(seen, alt)) return ctx.fail(alt.origin, "case: duplicate test constant", .{});
+            const seen = if (reader_mod.isLiteralKey(alt)) (try atoms.getOrPut(ctx.allocator, alt)).found_existing else for (compounds.items) |c| {
+                if (try sameConstant(c, alt)) break true;
+            } else false;
+            if (seen) return ctx.fail(alt.origin, "case: duplicate test constant", .{});
+            if (!reader_mod.isLiteralKey(alt)) try compounds.append(ctx.allocator, alt);
             try keys.append(ctx.allocator, alt);
         }
     }
@@ -2808,7 +2791,7 @@ fn expandSourceForTest(
         .interner = &interner,
         .host_macros = host_macros,
     };
-    return try expandForm(&ctx, null, form);
+    return try expandForm(&ctx, form);
 }
 
 /// Expand `src` with the default host macros and expect `expected`,
@@ -2826,7 +2809,7 @@ fn expectFailure(src: []const u8, expected: ExpandError, message: []const u8, at
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
     var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &table };
-    try testing.expectError(expected, expandForm(&ctx, null, form));
+    try testing.expectError(expected, expandForm(&ctx, form));
     const failure = ctx.failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, failure.message);
     try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
@@ -2866,7 +2849,7 @@ test "failure: a macro that fails without a message is named at its call" {
     var interner = intern_mod.Interner.init(arena);
     defer interner.deinit();
     var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &table };
-    try testing.expectError(ExpandError.MalformedMacroCall, expandForm(&ctx, null, form));
+    try testing.expectError(ExpandError.MalformedMacroCall, expandForm(&ctx, form));
     try testing.expectEqualStrings("malformed (refuse ...)", ctx.failure.?.message);
     try testing.expectEqualStrings("(refuse 3)", src[ctx.failure.?.span.pos..][0..ctx.failure.?.span.len]);
 }
@@ -3006,7 +2989,7 @@ test "macroexpand: depth limit caught for infinite macro loop" {
         .interner = &interner,
         .host_macros = &table,
     };
-    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
+    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, form));
 }
 
 test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not a fault" {
@@ -3032,7 +3015,7 @@ test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not 
     defer interner.deinit();
     const empty: HostMacroTable = .{};
     var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &empty };
-    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, null, form));
+    try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, form));
 }
 
 test "macroexpand: lexical shadowing blocks macro expansion" {
@@ -3076,7 +3059,7 @@ test "macroexpand: lexical shadowing blocks macro expansion" {
         .interner = &interner,
         .host_macros = &table,
     };
-    const expanded = try expandForm(&ctx, null, form);
+    const expanded = try expandForm(&ctx, form);
     // The expanded form should still be a let* with an inner
     // (my-macro) call — NOT a :fired keyword.
     try testing.expect(expanded.datum == .list);
@@ -3124,7 +3107,7 @@ test "macroexpand: macro fires at top level when not shadowed" {
         .interner = &interner,
         .host_macros = &table,
     };
-    const expanded = try expandForm(&ctx, null, form);
+    const expanded = try expandForm(&ctx, form);
     try testing.expect(expanded.datum == .keyword);
     try testing.expectEqualStrings("fired", expanded.datum.keyword.name);
 }
@@ -3158,7 +3141,7 @@ test "macroexpand: quote is opaque — macro inside quote does NOT fire" {
         .interner = &interner,
         .host_macros = &table,
     };
-    const expanded = try expandForm(&ctx, null, form);
+    const expanded = try expandForm(&ctx, form);
     // Should still be (quote (my-macro)), NOT nil.
     try testing.expect(expanded.datum == .list);
 }

@@ -33,7 +33,7 @@
 //!   - `(let* [n1 v1, ...] body)` → strict left-of-self-visibility
 //!                                  per COMPILER.md §4.3 (binding-i's
 //!                                  RHS sees bindings 1..i-1 only);
-//!                                  `defer scope.shrinkRetainingCapacity(mark)`
+//!                                  `defer scope.restore(mark)`
 //!                                  pops bindings on let-body exit
 //!   - `(do e1 e2 ... eN)`       →  empty → nil; one-expr → compile
 //!                                  to dst; multi-expr → all non-last
@@ -291,6 +291,9 @@ pub const Binding = struct {
     /// Whether a closure in the binding's scope captures it
     /// (COMPILER.md §6.1).
     captured: bool = false,
+    /// How many symbols in the binding's scope read it, as lowering
+    /// resolved them (`and`/`or` shapes, §5.2).
+    refs: u32 = 0,
 };
 
 /// How a lexical binding is realized in the current routine's
@@ -317,11 +320,48 @@ pub const BindingRef = union(enum) {
     upvalue: u12,
 };
 
-/// One entry in the Emitter's lexical scope stack.
-pub const LocalBinding = struct {
-    name: []const u8,
-    ref: BindingRef,
-};
+/// The lexical names in force where lowering or emitting is, each
+/// holding a `T`: every name maps to its innermost binding, which
+/// records the one it shadows, so a lookup is one probe however deep
+/// the scopes nest, and `restore` unbinds exactly what was bound since
+/// a `mark` (COMPILER.md §4.3).
+fn ScopeTable(comptime T: type) type {
+    return struct {
+        entries: std.ArrayList(Entry) = .empty,
+        innermost: std.StringHashMapUnmanaged(u32) = .empty,
+
+        const Self = @This();
+        const Entry = struct { name: []const u8, value: T, shadows: ?u32 };
+
+        fn bind(self: *Self, allocator: std.mem.Allocator, name: []const u8, value: T) CompileError!void {
+            try self.entries.ensureUnusedCapacity(allocator, 1);
+            const slot = try self.innermost.getOrPut(allocator, name);
+            const shadows: ?u32 = if (slot.found_existing) slot.value_ptr.* else null;
+            slot.value_ptr.* = @intCast(self.entries.items.len);
+            self.entries.appendAssumeCapacity(.{ .name = name, .value = value, .shadows = shadows });
+        }
+
+        fn lookup(self: *const Self, name: []const u8) ?T {
+            return self.entries.items[self.innermost.get(name) orelse return null].value;
+        }
+
+        fn mark(self: *const Self) usize {
+            return self.entries.items.len;
+        }
+
+        fn restore(self: *Self, to: usize) void {
+            while (self.entries.items.len > to) {
+                const e = self.entries.pop().?;
+                if (e.shadows) |i| self.innermost.getPtr(e.name).?.* = i else _ = self.innermost.remove(e.name);
+            }
+        }
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.entries.deinit(allocator);
+            self.innermost.deinit(allocator);
+        }
+    };
+}
 
 /// Routine-level capture cache entry. Maps a captured name to its upvalue index, so repeat references
 /// to the same outer name from different lexical scopes share
@@ -609,15 +649,13 @@ const HeldVar = struct { var_: *vm.Var, slot: u12 };
 /// **Constant pool**: one entry per identical Value (COMPILER.md
 /// §4.4).
 ///
-/// **Lexical scope**: a stack of `LocalBinding{name, ref}` pairs.
-/// Resolution walks innermost-first (newest entries shadow older).
-/// Bindings push at let* binding-time (after the RHS is compiled,
-/// per COMPILER.md §4.3's strict left-of-self rule) and pop at
-/// let-body exit via `defer scope.shrinkRetainingCapacity(mark)` —
-/// `defer` rather than success-path restore so an error mid-body
-/// doesn't leak scope into a recovering caller. Nested function
-/// compilation resolves free names through the `parent` chain
-/// (capture analysis at function boundaries).
+/// **Lexical scope**: a `ScopeTable` of each local's `BindingRef`.
+/// Bindings are made at let* binding-time (after the RHS is compiled,
+/// per COMPILER.md §4.3's strict left-of-self rule) and unmade at
+/// let-body exit via `defer scope.restore(mark)`, `defer` so an error
+/// mid-body leaves no scope behind for a recovering caller. Nested
+/// function compilation resolves free names through the `parent`
+/// chain (capture analysis at function boundaries).
 const Emitter = struct {
     /// Scratch: what compiling needs and nothing after it.
     allocator: std.mem.Allocator,
@@ -630,7 +668,7 @@ const Emitter = struct {
     value_consts: std.AutoHashMapUnmanaged([2]u64, u32) = .empty,
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     tries: std.ArrayList(vm.Try) = .empty,
-    scope: std.ArrayList(LocalBinding) = .empty,
+    scope: ScopeTable(BindingRef) = .{},
     /// The next free slot. Slots are a stack: `compileExpr` frees
     /// every slot a node allocated once the node is compiled, so a
     /// slot lives as long as the value in it is needed (bindings to
@@ -707,6 +745,11 @@ const Emitter = struct {
     held: [8]HeldVar = undefined,
     held_len: u8 = 0,
     held_pc: usize = 0,
+    /// Whether control can reach the next instruction: false after a
+    /// jump, return, throw or `try` exit until the next label
+    /// (`nextPc`), so a form that never falls through needs no jump
+    /// past what follows it.
+    reachable: bool = true,
     /// Whether this routine is a `fn*`'s, and its name when it has
     /// one: what a limit error names.
     is_fn: bool = false,
@@ -744,10 +787,7 @@ const Emitter = struct {
     /// reaches a closure over it (COMPILER.md §6.1).
     fn bindLocal(self: *Emitter, name: []const u8, slot: u12, captured: bool) CompileError!void {
         if (captured) try self.emit(vm.asm_.closureBoxLocal(slot));
-        try self.scope.append(self.allocator, .{
-            .name = name,
-            .ref = if (captured) .{ .cell_slot = slot } else .{ .direct_slot = slot },
-        });
+        try self.scope.bind(self.allocator, name, if (captured) .{ .cell_slot = slot } else .{ .direct_slot = slot });
     }
 
     /// Resolve `name` to a `BindingRef` via innermost-shadow
@@ -757,13 +797,7 @@ const Emitter = struct {
     /// BindingRef so callers can dispatch on direct/cell/upvalue
     /// at emit time.
     fn resolveLocalRef(self: *const Emitter, name: []const u8) ?BindingRef {
-        var i = self.scope.items.len;
-        while (i > 0) {
-            i -= 1;
-            const b = self.scope.items[i];
-            if (std.mem.eql(u8, b.name, name)) return b.ref;
-        }
-        return null;
+        return self.scope.lookup(name);
     }
 
     /// Walk self, then parents, to resolve `name` into a
@@ -957,6 +991,7 @@ const Emitter = struct {
             }
         }
         try self.code.append(self.allocator, inst);
+        if (transfersAway(inst)) self.reachable = false;
     }
 
     /// The pc of the next instruction, a jump or handler target.
@@ -964,6 +999,7 @@ const Emitter = struct {
     /// before it is not what a read there sees on every path.
     fn nextPc(self: *Emitter) CompileError!u32 {
         self.held_len = 0;
+        self.reachable = true;
         return tableIndex(self.code.items.len);
     }
 
@@ -1046,6 +1082,19 @@ const Emitter = struct {
     }
 };
 
+/// Whether control never passes from `inst` to the instruction after
+/// it: a jump, a return, a throw, or a `try` or `finally` exit.
+fn transfersAway(inst: Inst) bool {
+    if (inst.kind != .primary) return false;
+    const is = struct {
+        fn op(i: Inst, g: vm.Group, v: anytype) bool {
+            return i.group == @backingInt(g) and i.variant == @backingInt(v);
+        }
+    }.op;
+    return is(inst, .jump, vm.Jump.jmp) or is(inst, .call, vm.Call.@"return") or is(inst, .call, vm.Call.return_nil) or
+        is(inst, .ctrl, vm.CtrlOp.throw_) or is(inst, .ctrl, vm.CtrlOp.try_exit) or is(inst, .ctrl, vm.CtrlOp.finally_exit);
+}
+
 // =============================================================================
 // Public API
 // =============================================================================
@@ -1099,14 +1148,14 @@ fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOption
 // (`emitRoutine`), so the entire codegen pipeline
 // (RecurTarget threading, variadic rest, Var fall-through, etc.) runs
 // on the one Tiny path. Lowering also marks every binding a closure
-// captures (`LowerEnv`).
+// captures (`Lexical`).
 //
 // Lowering covers literals, symbols, list dispatch (ordinary calls,
 // special forms, the inlined core fns when not shadowed),
 // binding/fn forms (let*, fn*, letfn*, loop*, recur), var forms
 // (def, var), try/throw, quote, and collection literals. The
-// lowering env (`LowerEnv`) tracks lexical-name shadowing for
-// intrinsic dispatch.
+// lexical bindings in force (`LowerCtx.lexicals`) decide shadowing
+// for intrinsic dispatch.
 
 /// Allocate and initialize a Tiny node on the given allocator.
 /// Used by `lowerForm` to build the IR tree. The arena passed to
@@ -1118,25 +1167,16 @@ fn allocTiny(allocator: std.mem.Allocator, value: Tiny) CompileError!*Tiny {
     return &node.tiny;
 }
 
-/// Form-lowering context bundle. Passes both the lexical environment (for intrinsic shadowing)
-/// and the Interner (for quoted-symbol/quoted-keyword Value
-/// construction) through every `lower*` helper. Small (2
-/// pointers); copied by value at each level — child contexts
-/// override `env` while inheriting `interner`.
-///
-/// Why a bundle: every helper that recurses into `lowerForm`
-/// needs to pass BOTH. Threading two parallel parameters through
-/// ~15 helpers is mechanical churn that this struct collapses to
-/// one parameter.
-pub const LowerCtx = struct {
-    env: ?*const LowerEnv = null,
+/// What every `lower*` helper is given, copied by value at each
+/// level: the lexical bindings in force, the interner and heap that
+/// constants are made with, and how names that are not lexical
+/// resolve.
+const LowerCtx = struct {
+    lexicals: *ScopeTable(Lexical),
     interner: ?*intern_mod.Interner = null,
-    /// Heap for allocating string-literal Values during Form →
-    /// Tiny lowering. Strings reach the lowerer as `Datum.string`
-    /// ([]const u8 in the reader's arena) and need a stable Heap
-    /// so the resulting Value can live in `Tiny.literal` for the
-    /// artifact's lifetime. When null, `.string` Forms lower to
-    /// `UnsupportedFeature`.
+    /// The heap string, bignum and collection constants are built
+    /// on, where the routine's constant pool keeps them alive; null
+    /// makes them `UnsupportedFeature`.
     heap: ?*heap_mod.Heap = null,
     /// The namespace symbols resolve in. With `declared` set, a
     /// symbol that is neither lexically bound, resolvable here
@@ -1148,18 +1188,16 @@ pub const LowerCtx = struct {
     /// How many `fn*` bodies enclose the form being lowered.
     fn_depth: u32 = 0,
 
-    /// Create a child context with a new env; everything else
-    /// carries over.
-    pub fn withEnv(self: LowerCtx, env: ?*const LowerEnv) LowerCtx {
-        var copy = self;
-        copy.env = env;
-        return copy;
+    /// Bring `name` into scope at this context's `fn*` depth, its
+    /// captures recorded in `captured` and, for a `let*` or `loop*`
+    /// binding, its reads counted in `refs`.
+    fn bind(self: LowerCtx, allocator: std.mem.Allocator, name: []const u8, captured: *bool, refs: ?*u32) CompileError!void {
+        try self.lexicals.bind(allocator, name, .{ .captured = captured, .refs = refs, .fn_depth = self.fn_depth });
     }
 
-    /// The context of a `fn*` body whose parameters `env` binds.
-    fn inFnBody(self: LowerCtx, env: *const LowerEnv) LowerCtx {
+    /// The context of a `fn*` body.
+    fn inFnBody(self: LowerCtx) LowerCtx {
         var copy = self;
-        copy.env = env;
         copy.fn_depth += 1;
         return copy;
     }
@@ -1249,57 +1287,30 @@ pub const DeclaredNames = struct {
     }
 };
 
-/// The lexical scopes lowering is inside, innermost first: every
-/// binding a `let*`, `loop*`, `fn*` (parameters and self-name),
-/// `letfn*` or `catch` makes, mirroring the Emitter's scope exactly.
-/// Lowering resolves each symbol against it for two reasons: a
-/// lexical name is not a Var, so it shadows an inlined core fn and
-/// the declared-name check (special forms stay reserved:
-/// `(let* [if 1] (if true 2 3))` is still `if`); and a reference
-/// from inside a `fn*` to a binding made outside it is a capture,
-/// which sets the binding's `captured` flag in its Tiny node, so the
-/// Emitter boxes it when it is bound (COMPILER.md §6.1).
-pub const LowerEnv = struct {
-    parent: ?*const LowerEnv = null,
-    /// The `fn*` nesting depth these bindings are made at.
-    fn_depth: u32 = 0,
-    /// Bindings made at this level, in order; later ones shadow.
-    locals: std.ArrayList(Local) = .empty,
-
-    const Local = struct {
-        name: []const u8,
-        /// Where the binding's Tiny node records a capture.
-        captured: *bool,
-    };
-
-    fn bind(self: *LowerEnv, allocator: std.mem.Allocator, name: []const u8, captured: *bool) CompileError!void {
-        try self.locals.append(allocator, .{ .name = name, .captured = captured });
-    }
-
-    /// The innermost binding of `name` and the depth it was made at.
-    fn lookup(self: *const LowerEnv, name: []const u8) ?struct { local: Local, fn_depth: u32 } {
-        var env: ?*const LowerEnv = self;
-        while (env) |e| : (env = e.parent) {
-            var i = e.locals.items.len;
-            while (i > 0) {
-                i -= 1;
-                if (std.mem.eql(u8, e.locals.items[i].name, name)) return .{ .local = e.locals.items[i], .fn_depth = e.fn_depth };
-            }
-        }
-        return null;
-    }
-
-    fn deinit(self: *LowerEnv, allocator: std.mem.Allocator) void {
-        self.locals.deinit(allocator);
-    }
+/// A binding lowering is inside of: one a `let*`, `loop*`, `fn*`
+/// (parameters and self-name), `letfn*` or `catch` makes, mirroring
+/// the Emitter's scope exactly. Lowering resolves each symbol against
+/// them for two reasons: a lexical name is not a Var, so it shadows an
+/// inlined core fn and the declared-name check (special forms stay
+/// reserved: `(let* [if 1] (if true 2 3))` is still `if`); and a
+/// reference from inside a `fn*` to a binding made outside it is a
+/// capture, which sets the binding's `captured` flag in its Tiny node,
+/// so the Emitter boxes it when it is bound (COMPILER.md §6.1).
+const Lexical = struct {
+    /// Where the binding's Tiny node records a capture.
+    captured: *bool,
+    /// Where a `let*` or `loop*` binding counts its readers.
+    refs: ?*u32,
+    /// The `fn*` nesting depth the binding is made at.
+    fn_depth: u32,
 };
 
 /// Whether `name` is lexically bound here; a binding made outside
 /// the innermost `fn*` is marked captured.
 fn resolveLexical(ctx: LowerCtx, name: []const u8) bool {
-    const env = ctx.env orelse return false;
-    const hit = env.lookup(name) orelse return false;
-    if (hit.fn_depth < ctx.fn_depth) hit.local.captured.* = true;
+    const hit = ctx.lexicals.lookup(name) orelse return false;
+    if (hit.fn_depth < ctx.fn_depth) hit.captured.* = true;
+    if (hit.refs) |n| n.* += 1;
     return true;
 }
 
@@ -1331,9 +1342,7 @@ fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespac
 /// Var only when the form is emitted). Without a namespace registry
 /// there is nothing to shadow it.
 fn namesCore(ctx: LowerCtx, name: []const u8) bool {
-    if (ctx.env) |env| {
-        if (env.lookup(name) != null) return false;
-    }
+    if (ctx.lexicals.lookup(name) != null) return false;
     const ns = ctx.namespace orelse return true;
     const registry = ns.registry orelse return true;
     const core_var = registry.core.lookupLocal(name) orelse return false;
@@ -1461,8 +1470,8 @@ fn lowerDatum(
 //
 // Operator-position head-symbol dispatch. Special forms are
 // RESERVED (recognized regardless of lexical bindings). Inlineable
-// core fns are checked against the LowerEnv — if the name is
-// lexically shadowed, fall through to ordinary call lowering.
+// core fns are checked against the lexical bindings: if the name
+// is lexically shadowed, fall through to ordinary call lowering.
 // Everything else lowers to `Tiny.call`.
 
 /// Lower a list form. The list represents either a call (head is
@@ -1855,8 +1864,8 @@ fn lowerCall(
 // =============================================================================
 //
 // `let*`, `fn*`, `letfn*`, `loop*`, `recur`. Each binding form
-// lowers its body in a child `LowerEnv` holding its names, which
-// mirrors the Emitter's scope (see `LowerEnv`).
+// lowers its body with its names bound in `LowerCtx.lexicals`, which
+// mirrors the Emitter's scope (see `Lexical`).
 
 /// Lower a sequence of body forms into a single Tiny expression.
 /// Multi-form bodies wrap in `Tiny.do_`; single-form bodies pass
@@ -1950,16 +1959,16 @@ fn lowerScope(
     const binding_vec = try expectVector(args[0]);
     if (binding_vec.len % 2 != 0) return CompileError.MalformedForm;
     const bindings = try allocator.alloc(Binding, binding_vec.len / 2);
-    var local = LowerEnv{ .parent = ctx.env, .fn_depth = ctx.fn_depth };
-    defer local.deinit(allocator);
+    const mark = ctx.lexicals.mark();
+    defer ctx.lexicals.restore(mark);
     for (bindings, 0..) |*b, i| {
         b.* = .{
             .name = try expectUnqualifiedSymbol(binding_vec[i * 2]),
-            .value = try lowerForm(allocator, binding_vec[i * 2 + 1], ctx.withEnv(&local)),
+            .value = try lowerForm(allocator, binding_vec[i * 2 + 1], ctx),
         };
-        try local.bind(allocator, b.name, &b.captured);
+        try ctx.bind(allocator, b.name, &b.captured, &b.refs);
     }
-    return .{ .bindings = bindings, .body = try lowerBody(allocator, args[1..], ctx.withEnv(&local)) };
+    return .{ .bindings = bindings, .body = try lowerBody(allocator, args[1..], ctx) };
 }
 
 /// `(recur args...)`. No binding form; just lowers args and
@@ -2000,10 +2009,10 @@ fn lowerFnStar(
     // The self-name belongs to the enclosing scope, so the body's
     // references to it are captures of a placeholder cell.
     var self_referenced = false;
-    var self_env = LowerEnv{ .parent = ctx.env, .fn_depth = ctx.fn_depth };
-    defer self_env.deinit(allocator);
-    if (self_name) |n| try self_env.bind(allocator, n, &self_referenced);
-    const fn_body = try lowerFnBody(allocator, parsed, args[pos + 1 ..], ctx.withEnv(&self_env));
+    const mark = ctx.lexicals.mark();
+    defer ctx.lexicals.restore(mark);
+    if (self_name) |n| try ctx.bind(allocator, n, &self_referenced, null);
+    const fn_body = try lowerFnBody(allocator, parsed, args[pos + 1 ..], ctx);
     return try allocTiny(allocator, .{ .fn_star = .{
         .name = self_name,
         .params = parsed.params,
@@ -2025,11 +2034,12 @@ fn lowerFnBody(
     const count = params.params.len + @intFromBool(params.rest_param != null);
     const captured = try allocator.alloc(bool, count);
     @memset(captured, false);
-    var env = LowerEnv{ .parent = ctx.env, .fn_depth = ctx.fn_depth + 1 };
-    defer env.deinit(allocator);
-    for (params.params, 0..) |p, i| try env.bind(allocator, p, &captured[i]);
-    if (params.rest_param) |rp| try env.bind(allocator, rp, &captured[count - 1]);
-    return .{ .body = try lowerBody(allocator, body, ctx.inFnBody(&env)), .captured = captured };
+    const body_ctx = ctx.inFnBody();
+    const mark = ctx.lexicals.mark();
+    defer ctx.lexicals.restore(mark);
+    for (params.params, 0..) |p, i| try body_ctx.bind(allocator, p, &captured[i], null);
+    if (params.rest_param) |rp| try body_ctx.bind(allocator, rp, &captured[count - 1], null);
+    return .{ .body = try lowerBody(allocator, body, body_ctx), .captured = captured };
 }
 
 /// `(letfn* [(name [params] body...) ...] body...)`. Each
@@ -2048,8 +2058,8 @@ fn lowerLetFnStar(
     // Every name is in scope for every fn body and the body. Their
     // cells always exist (COMPILER.md §5.6b), so no flag is needed.
     var names_captured = false;
-    var local = LowerEnv{ .parent = ctx.env, .fn_depth = ctx.fn_depth };
-    defer local.deinit(allocator);
+    const mark = ctx.lexicals.mark();
+    defer ctx.lexicals.restore(mark);
     const parsed = try allocator.alloc(ParsedParams, binding_vec.len);
     for (binding_vec, 0..) |entry, i| {
         const entry_items = switch (entry.datum) {
@@ -2059,15 +2069,15 @@ fn lowerLetFnStar(
         if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
         parsed[i] = try parseParams(allocator, try expectVector(entry_items[1]));
-        try local.bind(allocator, name, &names_captured);
+        try ctx.bind(allocator, name, &names_captured, null);
         bindings[i] = .{ .name = name, .params = parsed[i].params, .rest_param = parsed[i].rest_param, .body = undefined };
     }
     for (binding_vec, bindings, parsed) |entry, *b, params| {
-        const fn_body = try lowerFnBody(allocator, params, entry.datum.list[2..], ctx.withEnv(&local));
+        const fn_body = try lowerFnBody(allocator, params, entry.datum.list[2..], ctx);
         b.body = fn_body.body;
         b.captured = fn_body.captured;
     }
-    const body = try lowerBody(allocator, args[1..], ctx.withEnv(&local));
+    const body = try lowerBody(allocator, args[1..], ctx);
     return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
 }
 
@@ -2080,7 +2090,7 @@ fn lowerLetFnStar(
 // rebind, and the named-fn placeholder pattern. This layer is
 // purely Form-side dispatch + structural validation.
 //
-// LowerEnv does NOT add def names: a Var is not lexical.
+// A `def` binds no lexical name: a Var is not lexical.
 // `namesCore` consults the namespace and the declared names instead.
 
 /// `(def name)` or `(def name value)`. Per Tiny.def shape, the
@@ -2190,14 +2200,15 @@ fn lowerTry(
     const body_items = args[0 .. end - 1];
     const body = try lowerBody(allocator, body_items, ctx);
 
-    // Handler env: outer env + binding name. The binding is
-    // visible in operator position for intrinsic-shadowing
-    // (matches the LowerEnv discipline elsewhere).
+    // The handler sees the binding, in operator position too; the
+    // finally does not.
     var binding_captured = false;
-    var handler_env: LowerEnv = .{ .parent = ctx.env, .fn_depth = ctx.fn_depth };
-    defer handler_env.deinit(allocator);
-    try handler_env.bind(allocator, binding, &binding_captured);
-    const handler_body = try lowerBody(allocator, handler_items, ctx.withEnv(&handler_env));
+    const handler_body = blk: {
+        const mark = ctx.lexicals.mark();
+        defer ctx.lexicals.restore(mark);
+        try ctx.bind(allocator, binding, &binding_captured, null);
+        break :blk try lowerBody(allocator, handler_items, ctx);
+    };
 
     // Lower the finally body if present. It sees
     // the OUTER lexical env (NOT the catch binding).
@@ -2587,7 +2598,7 @@ pub fn compileFormWith(
             .registry_heap = registryHeap(namespace),
         };
         var mctx = expandContext(allocator, interner, opts, &ceval_data);
-        working_form = expand_mod.expandForm(&mctx, null, form) catch |err| return expandFailure(err, &mctx, form, opts);
+        working_form = expand_mod.expandForm(&mctx, form) catch |err| return expandFailure(err, &mctx, form, opts);
     }
     // `.string` Form datums lower to `Tiny.literal` on the
     // registry's heap. Without a namespace or a registry there is
@@ -2597,8 +2608,10 @@ pub fn compileFormWith(
     // expanded into it) may be referred to anywhere inside it.
     if (declared) |d| try d.declareForm(working_form);
     var diag = LowerDiag{};
+    var lexicals: ScopeTable(Lexical) = .{};
+    defer lexicals.deinit(allocator);
     const ctx = LowerCtx{
-        .env = null,
+        .lexicals = &lexicals,
         .interner = opts.interner,
         .heap = lower_heap,
         .namespace = namespace,
@@ -3130,11 +3143,11 @@ fn compileLetStar(
 ) CompileError!void {
     // Restored by `defer` so an error mid-body leaves no scope
     // behind for a recovering caller.
-    const mark = e.scope.items.len;
-    defer e.scope.shrinkRetainingCapacity(mark);
+    const mark = e.scope.mark();
+    defer e.scope.restore(mark);
     for (bindings) |b| {
         if (try aliasSlot(e, b, body, recur_target)) |slot| {
-            try e.scope.append(e.allocator, .{ .name = b.name, .ref = .{ .direct_slot = slot } });
+            try e.scope.bind(e.allocator, b.name, .{ .direct_slot = slot });
             continue;
         }
         const slot = try e.allocSlot();
@@ -3240,20 +3253,20 @@ fn compileTry(
 
     // A body or handler that always throws or recurs never reaches
     // its try-exit, so it has none.
-    const body_exit_pc: ?usize = if (neverFallsThrough(body)) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
+    const body_exit_pc: ?usize = if (!e.reachable) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
 
     // Catch entry.
     e.tries.items[t].catch_pc = try e.nextPc();
 
     // The VM stores the thrown value in the binding's slot and jumps
     // here; a captured binding is boxed first thing.
-    const scope_mark = e.scope.items.len;
-    defer e.scope.shrinkRetainingCapacity(scope_mark);
+    const scope_mark = e.scope.mark();
+    defer e.scope.restore(scope_mark);
     try e.bindLocal(binding, binding_slot, binding_captured);
     try compileExpr(e, handler, result, null);
-    e.scope.shrinkRetainingCapacity(scope_mark);
+    e.scope.restore(scope_mark);
 
-    const catch_exit_pc: ?usize = if (neverFallsThrough(handler)) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
+    const catch_exit_pc: ?usize = if (!e.reachable) null else try e.emitPlaceholder(vm.asm_.tryExit(unpatched));
 
     // Optional finally block + finally-exit.
     if (finally_) |fin_body| {
@@ -3296,8 +3309,8 @@ fn compileLoopStar(
     dst: u12,
     returns: bool,
 ) CompileError!void {
-    const mark = e.scope.items.len;
-    defer e.scope.shrinkRetainingCapacity(mark);
+    const mark = e.scope.mark();
+    defer e.scope.restore(mark);
 
     const binding_slots = try e.allocator.alloc(u12, bindings.len);
     defer e.allocator.free(binding_slots);
@@ -3484,7 +3497,7 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
             try compileBranch(e, i.test_, false, &skip);
             try compileEffect(e, i.then);
             if (else_inert) return patchJumpsHere(e, skip.items);
-            const end_jmp_pc: ?usize = if (neverFallsThrough(i.then)) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
+            const end_jmp_pc: ?usize = if (!e.reachable) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
             try patchJumpsHere(e, skip.items);
             try compileEffect(e, i.else_.?);
             if (end_jmp_pc) |pc| try e.patchJumpHere(pc);
@@ -3644,8 +3657,8 @@ fn compileLetFnStar(
         }
     }
 
-    const scope_mark = e.scope.items.len;
-    defer e.scope.shrinkRetainingCapacity(scope_mark);
+    const scope_mark = e.scope.mark();
+    defer e.scope.restore(scope_mark);
 
     // 1. Allocate placeholder cells for each binding;
     // push each into scope as .cell_slot. Cells must exist
@@ -3656,7 +3669,7 @@ fn compileLetFnStar(
     for (bindings, cell_slots) |b, *s| {
         s.* = try e.allocSlot();
         try e.emit(vm.asm_.closureNewCell(s.*));
-        try e.scope.append(e.allocator, .{ .name = b.name, .ref = .{ .cell_slot = s.* } });
+        try e.scope.bind(e.allocator, b.name, .{ .cell_slot = s.* });
     }
 
     // 2. Compile each fn (constructing closures). We
@@ -3731,7 +3744,7 @@ fn compileIf(
     // nothing.
     const returns = if (recur_target) |t| t.returns else false;
     const else_empty = if (else_form) |ef| isSlot(e, ef, dst) else false;
-    const end_jmp_pc: ?usize = if (returns or neverFallsThrough(then_form) or else_empty) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
+    const end_jmp_pc: ?usize = if (!e.reachable or else_empty) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
     try patchJumpsHere(e, if_false.items);
     if (else_form) |ef| {
         try compileExpr(e, ef, dst, recur_target);
@@ -3769,7 +3782,7 @@ fn compileBranch(e: *Emitter, t: *const Tiny, jump_when: bool, jumps: *Jumps) Co
     if (t.* == .if_ and t.if_.else_ != null and t.if_.then.* == .bool and t.if_.else_.?.* == .bool and t.if_.then.bool != t.if_.else_.?.bool) {
         return compileBranch(e, t.if_.test_, if (t.if_.then.bool) jump_when else !jump_when, jumps);
     }
-    if (try andOr(t)) |ao| {
+    if (andOr(t)) |ao| {
         if (ao.is_and != jump_when) {
             // Either operand alone decides a jump: an and that is
             // false, an or that is true.
@@ -3795,13 +3808,15 @@ const AndOr = struct { is_and: bool, first: *const Tiny, rest: *const Tiny };
 
 /// `t` as the operands of an `and` or an `or`, when it has the shape
 /// the expander gives them (MACROEXPAND.md §10): `(let* [g x] (if g
-/// rest g))` or `(let* [g x] (if g g rest))`, `rest` not naming `g`.
-fn andOr(t: *const Tiny) CompileError!?AndOr {
+/// rest g))` or `(let* [g x] (if g g rest))`, `rest` not reading `g`:
+/// lowering counted two reads of `g`, the test and the arm that is
+/// `g` itself.
+fn andOr(t: *const Tiny) ?AndOr {
     const l = switch (t.*) {
         .let_star => |l| l,
         else => return null,
     };
-    if (l.bindings.len != 1) return null;
+    if (l.bindings.len != 1 or l.bindings[0].refs != 2) return null;
     const g = l.bindings[0].name;
     const i = switch (l.body.*) {
         .if_ => |i| i,
@@ -3809,27 +3824,13 @@ fn andOr(t: *const Tiny) CompileError!?AndOr {
     };
     const else_form = i.else_ orelse return null;
     if (!namesSymbol(i.test_, g)) return null;
-    if (namesSymbol(else_form, g) and !try readsName(i.then, g)) return .{ .is_and = true, .first = l.bindings[0].value, .rest = i.then };
-    if (namesSymbol(i.then, g) and !try readsName(else_form, g)) return .{ .is_and = false, .first = l.bindings[0].value, .rest = else_form };
+    if (namesSymbol(else_form, g)) return .{ .is_and = true, .first = l.bindings[0].value, .rest = i.then };
+    if (namesSymbol(i.then, g)) return .{ .is_and = false, .first = l.bindings[0].value, .rest = else_form };
     return null;
 }
 
 fn namesSymbol(t: *const Tiny, name: []const u8) bool {
     return t.* == .symbol and std.mem.eql(u8, t.symbol, name);
-}
-
-/// Whether control never reaches the end of `t`'s code: every path
-/// through it ends in `recur` or `throw`.
-fn neverFallsThrough(t: *const Tiny) bool {
-    return switch (t.*) {
-        .recur, .throw_ => true,
-        .if_ => |i| neverFallsThrough(i.then) and (if (i.else_) |x| neverFallsThrough(x) else false),
-        .do_ => |items| items.len > 0 and neverFallsThrough(items[items.len - 1]),
-        .let_star => |l| neverFallsThrough(l.body),
-        .letfn_star => |l| neverFallsThrough(l.body),
-        .try_ => |x| neverFallsThrough(x.body) and neverFallsThrough(x.handler),
-        else => false,
-    };
 }
 
 // =============================================================================

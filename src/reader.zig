@@ -740,15 +740,16 @@ fn splitNamespace(text: []const u8) ?Name {
 /// A Form is a "literal key" eligible for static duplicate detection iff it
 /// is an atom (nil/bool/int/real/char/string/keyword/symbol) AND its value
 /// is compile-time known. Every atom is treated as literal.
-fn isLiteralKey(f: *const Form) bool {
+pub fn isLiteralKey(f: *const Form) bool {
     return switch (f.datum) {
         .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => true,
         else => false,
     };
 }
 
-/// Literal forms under the reader's literal equality (`formLiteralEq`).
-const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
+/// Literal forms (`isLiteralKey`) under the reader's literal equality
+/// (`formLiteralEq`).
+pub const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
     pub fn hash(_: @This(), f: *const Form) u64 {
         var h = std.hash.Wyhash.init(@backingInt(f.datum));
         switch (f.datum) {
