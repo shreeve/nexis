@@ -77,15 +77,14 @@ handle (§3.2).
 **Pinned geometry.** `StoreFile.acquire`, which every `open` and
 Nextomic `connect` passes through, overrides the caller's `pageSize`
 with `db.page_size` (16 KiB), `maxNamedTrees` with
-`db.max_named_trees` (128) and `maxReaders` with `db.reader_slots`
-(§3.2). emdb's default page size is the OS page size, and the page
+`db.max_named_trees` (128), `maxReaders` with `db.reader_slots`
+(§3.2), `mapSize` with `db.initial_map_size` (1 MiB) and `growStep`
+with `db.map_grow_step` (8 MiB). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
-`open` creates a file at `db.initial_map_size` (1 MiB) and has emdb
-extend a full one by `db.map_grow_step` (8 MiB), Nextomic's sizes
-(`docs/NEXTOMIC.md` §2), where emdb's defaults are 256 MiB and 64 MiB:
-a store of one key is a small file.
+The map sizes, where emdb's defaults are 256 MiB and 64 MiB, keep a
+store of one key a small file, whichever layer opens it first.
 
 **Tree handles resolve once per connection.** `treeId(txn, name,
 create)` looks the name up in the connection's cache before asking

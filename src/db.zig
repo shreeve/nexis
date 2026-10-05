@@ -170,13 +170,16 @@ pub const StoreFile = struct {
 
     /// The open file at `path`, or the file opened (or created) now
     /// with `options` and the pinned geometry: `page_size`,
-    /// `max_named_trees` and `reader_slots`, whatever `options` says. A file this
-    /// process may read but not write opens read-only.
+    /// `max_named_trees`, `reader_slots`, `initial_map_size` and
+    /// `map_grow_step`, whatever `options` says. A file this process
+    /// may read but not write opens read-only.
     pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
         var options = env_options;
         options.pageSize = page_size;
         options.maxNamedTrees = max_named_trees;
         options.maxReaders = reader_slots;
+        options.mapSize = initial_map_size;
+        options.growStep = map_grow_step;
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
@@ -500,10 +503,11 @@ pub const page_size: u32 = 16384;
 /// the `TreeId` range, which sizes the per-transaction tree set.
 pub const max_named_trees: u32 = 128;
 
-/// The size a new `db/*` store file starts at, and the step emdb
-/// extends a full one by, as Nextomic's (NEXTOMIC.md §2): emdb reserves
-/// the address space up front, so an extension moves nothing, and a
-/// small store stays small.
+/// The size a new store file starts at, and the step emdb extends a
+/// full one by (DB.md §2, NEXTOMIC.md §2): emdb reserves the address
+/// space up front, so an extension moves nothing and costs one
+/// `ftruncate`; a small store stays small and a large one carries at
+/// most one step of unused file.
 pub const initial_map_size: u64 = 1 << 20;
 pub const map_grow_step: u64 = 8 << 20;
 
@@ -547,9 +551,7 @@ pub const Durability = enum {
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open` with the size a new file starts at and grows by set
-/// to `initial_map_size` / `map_grow_step`, and the geometry
-/// `StoreFile.acquire` pins; a file already open in this process is
+/// `emdb.Env.open` with the geometry `StoreFile.acquire` pins; a file already open in this process is
 /// shared as it is (`StoreFile`).
 pub fn open(
     allocator: std.mem.Allocator,
@@ -558,10 +560,7 @@ pub fn open(
     path: [*:0]const u8,
     options: emdb.EnvOptions,
 ) !Connection {
-    var env_options = options;
-    env_options.mapSize = initial_map_size;
-    env_options.growStep = map_grow_step;
-    const file = try StoreFile.acquire(path, env_options);
+    const file = try StoreFile.acquire(path, options);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
     // second salted so the halves are independent.

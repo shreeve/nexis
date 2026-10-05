@@ -42,12 +42,10 @@ below is a public function or a committed invariant of emdb as it stands
 
 `Store.open` acquires the file's one emdb environment, shared with
 every `db/*` connection and Nextomic store of it (`db.StoreFile`,
-`docs/DB.md` §3.1), with the geometry every nexis store shares
-(`db.page_size` = 16 KiB, `db.max_named_trees` = 128). A
-new file starts at the map size its opener names
-(`Store.Options.map_size`: 1 MiB, `Store.initial_map_size`, unless
-named, as `nextomic.db.OpenOptions.map_size` is by default) and emdb
-extends a full file 8 MiB at a time (`Store.map_grow_step`).
+`docs/DB.md` §3.1), with the geometry `StoreFile.acquire` pins for every nexis store
+(`db.page_size` = 16 KiB, `db.max_named_trees` = 128,
+`db.reader_slots`): a new file starts at 1 MiB (`db.initial_map_size`)
+and emdb extends a full file 8 MiB at a time (`db.map_grow_step`).
 emdb reserves the address space when it opens a file, so an extension
 moves no mapping and costs one `ftruncate`; the file's length is the
 map, and its allocated blocks are the pages written. emdb reads a
