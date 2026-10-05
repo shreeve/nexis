@@ -20,6 +20,7 @@
 //!   - `-0.0` is stored as `+0.0`; NaN is refused with `error.ValueType`.
 
 const std = @import("std");
+const xxhash3 = @import("../xxhash3.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -245,8 +246,8 @@ pub fn readTop(in: *const [top_len]u8) DecodeError!Top {
 const hash_seed_hi: u64 = 0x9E37_79B9_7F4A_7C15;
 
 pub fn hash128(bytes: []const u8) u128 {
-    const lo = std.hash.XxHash3.hash(0, bytes);
-    const hi = std.hash.XxHash3.hash(hash_seed_hi, bytes);
+    const lo = xxhash3.hash(0, bytes);
+    const hi = xxhash3.hash(hash_seed_hi, bytes);
     return (@as(u128, hi) << 64) | @as(u128, lo);
 }
 
@@ -712,6 +713,15 @@ const testing = std.testing;
 
 fn enc(v: Val) ![]u8 {
     return valBytes(testing.allocator, v);
+}
+
+test "hash128: stored digests keep their values" {
+    // Long strings and fulltext rows carry these digests on disk
+    // (NEXTOMIC.md §2.2), so a change to any of them is a format change.
+    try testing.expectEqual(@as(u128, 0x602b0e2cd6662c8b2d06800538d394c2), hash128(""));
+    try testing.expectEqual(@as(u128, 0xa4c931c08d47c66c21ac2147387893df), hash128("person/name"));
+    try testing.expectEqual(@as(u128, 0x7cd1c442390e2ce274b315dfe47d3377), hash128("a string longer than sixteen bytes, for the mid path"));
+    try testing.expectEqual(@as(u128, 0xd7aa4e081cbf1f58a5d1b4607dc83554), hash128(&@as([300]u8, @splat('x'))));
 }
 
 test "tags order types" {

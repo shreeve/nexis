@@ -178,7 +178,9 @@ order across the threshold whenever two values differ within their
 first 64 bytes. When two values agree on those 64 bytes, an out-of-line
 one sorts after the inline value that is those bytes alone and before
 any longer inline one (its `0x00 0x01` precedes every content byte),
-and two out-of-line values order by hash (two seeded xxh3-64 lanes).
+and two out-of-line values order by hash (`key.hash128`: two XXH3-64
+lanes, seeds 0 and `0x9E3779B97F4A7C15`, through `src/xxhash3.zig`;
+its test pins the digests, since stores hold them).
 The decoder tells the shapes apart by the bare `0x00`: an inline value
 ends there, an out-of-line one continues with `0x01` and the hash.
 Range predicates compare decoded values, never index keys, so they are

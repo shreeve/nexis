@@ -214,7 +214,9 @@ A hash is a per-kind **base**, then domain-mixed:
 for list and vector. The mix keeps kinds whose bases coincide
 (`fixnum(65)`, `char(65)`, `symbol(65)`, `keyword(65)`) apart, and
 subsumes Clojure's keyword-only `^ 0x9E3779B9` offset. `xxh3` below is
-xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`).
+xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
+`src/xxhash3.zig`, whose values are the reference XXH3-64's
+(`std.hash.XxHash3`'s), its tests pinning the published vectors.
 
 - **nil** `0xB01DFACEB01DFACE`; **false** `0`; **true**
   `0x1111111111111111`.

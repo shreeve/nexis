@@ -9,14 +9,16 @@
 //! §6 pins the contract (`(= x y) ⇒ (hash x) = (hash y)`). This file is
 //! the implementation, not the spec.
 //!
-//! Algorithm: xxHash3-64 from `std.hash.XxHash3`, for speed and
-//! distribution; Clojure uses Murmur3 (CLOJURE-REVIEW §2.3).
+//! Algorithm: xxHash3-64 (`src/xxhash3.zig`, `std.hash.XxHash3`'s
+//! values), for speed and distribution; Clojure uses Murmur3
+//! (CLOJURE-REVIEW §2.3).
 //!
 //! Collection combine functions match Clojure's structural hashing so
 //! that the cross-category sequential equality rule (SEMANTICS §2.6) yields
 //! equal hashes for `(list 1 2 3)` and `[1 2 3]` by construction.
 
 const std = @import("std");
+const xxhash3 = @import("xxhash3.zig");
 
 /// Fixed xxHash3 seed: the ASCII bytes "nexis1/1" read as a
 /// little-endian u64. Hashes are stable within a process only
@@ -59,7 +61,7 @@ pub const positive_zero_bits: u64 = 0x0000_0000_0000_0000;
 /// Hash raw bytes. 64-bit output; the caller truncates or folds as
 /// needed.
 pub inline fn hashBytes(bytes: []const u8) u64 {
-    return std.hash.XxHash3.hash(seed, bytes);
+    return xxhash3.hash(seed, bytes);
 }
 
 /// The 32-bit hash of a keyword's or symbol's text: the low word of

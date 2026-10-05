@@ -128,14 +128,17 @@ fn benchHashRawBytes(ctx: *HashCtx) anyerror!void {
     // Raw xxHash3 over bytes — what string.hashHeader calls
     // internally. Measures the hash primitive itself.
     _ = ctx;
-    const fox = "the quick brown fox jumps over the lazy dog";
-    const s = fox ++ fox ++ fox ++ fox;
-    const h = hash_mod.hashBytes(s);
+    // Read through a volatile pointer, so the hash of a constant is
+    // not computed at compile time.
+    const sp: *const volatile []const u8 = &raw_hash_input;
+    const h = hash_mod.hashBytes(sp.*);
     // defeat DCE
     const vp: *volatile u64 = @constCast(&raw_hash_sink);
     vp.* = h;
 }
 var raw_hash_sink: u64 = 0;
+const fox = "the quick brown fox jumps over the lazy dog";
+var raw_hash_input: []const u8 = fox ++ fox ++ fox ++ fox;
 
 // -----------------------------------------------------------------------------
 // Collection construction — build from empty by N-fold conj/assoc
