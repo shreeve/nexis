@@ -114,8 +114,8 @@ nothing else.
   `-Ddurability`), so it is part of the step's cache key.
 - `b.addFail(message)` makes a step that fails with a message; the
   layering check and a missing expected file use it.
-- `zig build install` copies `bin/nexis` and `bin/nexis-golden` into
-  the checkout's `bin/` (`toCheckout`: the build cannot see the
+- `zig build install` copies `bin/nexis` into the checkout's
+  `bin/` (`toCheckout`: the build cannot see the
   install prefix) and installs nothing to the prefix.
 - `zig fmt --check` before a commit; the generated `src/parser.zig` is
   the one file that does not pass.

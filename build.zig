@@ -1,7 +1,7 @@
 //! nexis — build configuration.
 //!
 //! Steps:
-//!   zig build [install]               bin/nexis and bin/nexis-golden
+//!   zig build [install]               bin/nexis
 //!   zig build test                    the gate: unit, property, integration and
 //!                                     Nextomic corpora, goldens, test/nextomic
 //!                                     scripts, examples; analyzes the bench
@@ -206,27 +206,30 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(examples_step);
 
-    // Goldens: the reader's Form output (src/golden.zig) and the CLI.
-    const golden_exe = bins.golden;
-    b.getInstallStep().dependOn(toCheckout(b, golden_exe, "bin/nexis-golden"));
-
+    // Reader goldens (src/golden.zig, docs/FORMS.md §5): each
+    // test/golden/<name>.nx reads, its Form program pinned to
+    // <name>.sexp; each test/golden/errors/<name>.nx is refused with
+    // status 3, the refusal pinned to <name>.err.
     const golden_step = b.step("golden", "Run the reader and CLI goldens");
     test_step.dependOn(golden_step);
-    const run_golden = b.addRunArtifact(golden_exe);
-    run_golden.addArg(if (update) "--update" else "--verify");
-    run_golden.addArg("test/golden");
-    run_golden.setCwd(b.path("."));
-    if (update) run_golden.has_side_effects = true else run_golden.expectExitCode(0);
-    for (listFiles(b, "test/golden", false)) |path| run_golden.addFileInput(b.path(path));
-    for (listFiles(b, "test/golden/errors", false)) |path| run_golden.addFileInput(b.path(path));
-    golden_step.dependOn(&run_golden.step);
+    for ([_]struct { dir: []const u8, ext: []const u8, status: u8 }{
+        .{ .dir = "test/golden", .ext = ".sexp", .status = 0 },
+        .{ .dir = "test/golden/errors", .ext = ".err", .status = 3 },
+    }) |set| for (listStems(b, set.dir, ".nx")) |name| {
+        const run = b.addRunArtifact(bins.golden);
+        env.apply(run, false);
+        run.addFileArg2(b.path(b.fmt("{s}/{s}.nx", .{ set.dir, name })), .{ .make_absolute = true });
+        run.expectExitCode(set.status);
+        scripts.pin(golden_step, run, b.fmt("{s}/{s}{s}", .{ set.dir, name, set.ext }), .stdout);
+    };
 
     // test/golden/cli: what bin/nexis prints, pinned byte for byte: a
     // runtime error's stderr (exit 5), a reader error's stderr (exit
     // 3), a compile error's (exit 4), a disassembly, scripts' stdout
     // (with arguments, from stdin, an explicit exit status), `nexis
-    // test`, a REPL session and the usage errors. Each runs from the build root, so the paths in
-    // the output are the relative ones committed.
+    // test`, a REPL session and the usage errors. Each runs from the
+    // build root, so the paths in the output are the relative ones
+    // committed.
     {
         const CliGolden = struct {
             args: []const []const u8,
