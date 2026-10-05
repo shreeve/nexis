@@ -1,10 +1,10 @@
 ## REGEX.md — regular expressions
 
 The regex engine (`src/regex.zig`): the syntax it accepts, how it
-matches, the limits that bound it, its Unicode data, and where its
-results differ from `java.util.regex`. Patterns are Java's syntax
-minus every construct that needs backtracking; matching is linear in
-the input.
+matches, the limits that bound it, its Unicode data, where its results
+differ from `java.util.regex`, and the differential test against it.
+Patterns are Java's syntax minus every construct that needs
+backtracking; matching is linear in the input.
 
 ---
 
@@ -313,3 +313,26 @@ Java without `(?U)`.
    The match itself always agrees.
 4. **Not carried:** Unicode scripts, blocks and binary properties,
    `(?U)`, `(?c)`, `\X`, `\N{...}` and `\b{g}`.
+
+---
+
+### 7. The differential test
+
+`test/regex/corpus.json` holds 9 000 cases, each `[pattern, input,
+result]`: random patterns from a grammar of the supported constructs
+(three seeds, nesting to depth 5) and random inputs over ASCII,
+accented and astral letters, line terminators, a combining mark and
+the case-folding special cases, with Java's every find and its groups
+(`null` for a group that did not take part), `"ERR"` when Java
+refuses the pattern, or `"TIMEOUT"` when Java runs past a second.
+`test/regex/corpus.clj` generates it through `bb`:
+
+```
+bb test/regex/corpus.clj > test/regex/corpus.json
+```
+
+The suite `test/regex/regex.zig` runs the engine on every line and
+compares every match and every group; the gate never needs a JVM. An
+empty Java match between the halves of a surrogate pair is dropped
+from the expected result (§6 #2), and a case where a Java match
+starts or ends inside a pair is not generated.

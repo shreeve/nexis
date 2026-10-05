@@ -483,13 +483,13 @@ const Suite = struct { path: []const u8, quick: bool, nextomic: bool };
 /// The suites `zig build quick` runs besides `unit`.
 const quick_suites = [_][]const u8{ "compile", "nextomic_key", "nextomic_tx", "eval_pipeline", "runtime_polish", "numbers" };
 
-/// Every `.zig` file in test/prop and test/integration but the
+/// Every `.zig` file in test/prop, test/integration and test/regex but the
 /// fixtures the suites import (`_fx.zig`), so a new suite runs without
 /// a line here. The Nextomic suites (`nextomic_*`) also run under
 /// `nextomic-test`.
 fn listSuites(b: *std.Build) []const Suite {
     var list: std.ArrayList(Suite) = .empty;
-    for ([_][]const u8{ "test/prop", "test/integration" }) |dir| for (listFiles(b, dir, false)) |path| {
+    for ([_][]const u8{ "test/prop", "test/integration", "test/regex" }) |dir| for (listFiles(b, dir, false)) |path| {
         if (!std.mem.endsWith(u8, path, ".zig") or std.mem.endsWith(u8, path, "_fx.zig")) continue;
         const name = std.Io.Dir.path.stem(path);
         list.append(b.allocator, .{
