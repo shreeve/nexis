@@ -97,7 +97,7 @@ pub const CodecError = error{
 // Varint primitives (unsigned LEB128 + signed ZigZag LEB128)
 // =============================================================================
 
-fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
+inline fn writeUleb128(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !void {
     var x = v;
     while (true) {
         const byte: u8 = @intCast(x & 0x7F);
@@ -348,7 +348,7 @@ const Encoder = struct {
         }
     }
 
-    fn header(e: *Encoder, k: Kind, n: usize) Error!void {
+    inline fn header(e: *Encoder, k: Kind, n: usize) Error!void {
         try e.byte(@backingInt(k));
         try e.uleb(n);
     }
@@ -397,15 +397,15 @@ const Encoder = struct {
         }
     }
 
-    fn byte(e: *Encoder, b: u8) Error!void {
+    inline fn byte(e: *Encoder, b: u8) Error!void {
         try e.buf.append(e.allocator, b);
     }
 
-    fn uleb(e: *Encoder, n: usize) Error!void {
+    inline fn uleb(e: *Encoder, n: usize) Error!void {
         try writeUleb128(&e.buf, e.allocator, n);
     }
 
-    fn named(e: *Encoder, k: Kind, bytes: []const u8) Error!void {
+    inline fn named(e: *Encoder, k: Kind, bytes: []const u8) Error!void {
         try e.byte(@backingInt(k));
         try e.uleb(bytes.len);
         try e.buf.appendSlice(e.allocator, bytes);
