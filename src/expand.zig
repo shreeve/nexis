@@ -1568,7 +1568,7 @@ fn expandLetRename(ctx: *ExpandContext, call_form: *const Form, args: []const *F
 
 /// `(fn name? [params] body...)` → `(fn* name? [params'] body...)`:
 /// a pattern parameter becomes a gensym that `(let [pattern gensym
-/// ...] body...)` destructures, and a map pattern after `&` takes
+/// ...] body...)` destructures, so a map pattern after `&` takes
 /// keyword arguments. Overload clauses `(fn name? ([p] b) ...)` go
 /// through `multiArityFn`.
 fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
@@ -1583,13 +1583,10 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
 
     const params = try ctx.allocator.dupe(*Form, params_form.datum.vector);
     var patterns: std.ArrayList(*Form) = .empty;
-    var after_amp = false;
     for (params) |*p| {
-        if (isAmpersand(p.*)) {
-            after_amp = true;
-        } else if (p.*.datum != .symbol) {
+        if (p.*.datum != .symbol) {
             const g = try b.gensym("nx");
-            try patterns.appendSlice(ctx.allocator, &.{ p.*, if (after_amp) try restSource(b, p.*, g) else g });
+            try patterns.appendSlice(ctx.allocator, &.{ p.*, g });
             p.* = g;
         }
     }
@@ -1737,7 +1734,7 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
             // single-arity fn's (VM.md §6).
             const rest = if (a.fixed == 0) args else try b.list(.{ "nexis.core/nthnext", args, a.fixed });
             const pattern = a.params[a.fixed + 1];
-            try bindings.appendSlice(ctx.allocator, &.{ pattern, try restSource(b, pattern, rest) });
+            try bindings.appendSlice(ctx.allocator, &.{ pattern, rest });
         }
         const test_form = try b.list(.{ if (a.variadic) "nexis.core/>=" else "nexis.core/==", n, a.fixed });
         // `loop`, not `loop*`, so a pattern parameter destructures
@@ -1759,10 +1756,18 @@ fn destructurePair(b: Builder, hinted_pattern: *const Form, expr: *const Form, o
             if (sym.ns != null) return ctx.fail(pattern.origin, "cannot bind the qualified symbol {s}/{s}", .{ sym.ns.?, sym.name });
             try out.appendSlice(ctx.allocator, &.{ pattern, mutCast(expr) });
         },
-        .vector, .map => {
+        .vector => {
             const g = try b.gensym("nx");
             try out.appendSlice(ctx.allocator, &.{ g, mutCast(expr) });
-            if (pattern.datum == .vector) try destructureVector(b, pattern.datum.vector, g, out) else try destructureMap(b, pattern.datum.map, g, out);
+            try destructureVector(b, pattern.datum.vector, g, out);
+        },
+        // A seq is keyword arguments, as in Clojure: `k v ...`, or one
+        // trailing map, is the map `nexis.internal/#%kwargs` builds.
+        .map => {
+            const g = try b.gensym("nx");
+            const as_map = try b.list(.{ "if", try b.list(.{ "nexis.core/seq?", g }), try b.list(.{ "nexis.internal/#%kwargs", g }), g });
+            try out.appendSlice(ctx.allocator, &.{ g, mutCast(expr), g, as_map });
+            try destructureMap(b, pattern.datum.map, g, out);
         },
         else => return ctx.fail(pattern.origin, "cannot bind {s}", .{describeForm(pattern)}),
     }
@@ -1784,7 +1789,7 @@ fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.Arr
                 try destructurePair(b, target, src, out);
             } else {
                 const rest = try b.list(.{ "nexis.core/nthnext", src, i });
-                try destructurePair(b, target, try restSource(b, target, rest), out);
+                try destructurePair(b, target, rest, out);
             }
             i += 1;
         } else {
@@ -1793,8 +1798,10 @@ fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.Arr
     }
 }
 
-/// A map pattern over `src`:
+/// A map pattern over `src`, a map (`destructurePair` turns a seq
+/// into one):
 ///
+///   {... :as name}     name src, before the keys
 ///   {:keys [a b]}      a (get src :a), b (get src :b)
 ///   {:keys [p/a :b]}   a (get src :p/a), b (get src :b)
 ///   {:p/keys [a]}      a (get src :p/a)
@@ -1802,7 +1809,6 @@ fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.Arr
 ///   {:syms [a]}        a (get src 'a); {:p/syms [a]} (get src 'p/a)
 ///   {a :a-key}         a (get src :a-key)
 ///   {... :or {a 10}}   a (get src ... 10), the default when absent
-///   {... :as name}     name src
 fn destructureMap(b: Builder, entries: []const *Form, src: *Form, out: *std.ArrayList(*Form)) ExpandError!void {
     const ctx = b.ctx;
     if (entries.len % 2 != 0) return ctx.fail(b.origin, "destructuring: a map pattern needs pairs", .{});
@@ -1821,6 +1827,8 @@ fn destructureMap(b: Builder, entries: []const *Form, src: *Form, out: *std.Arra
             as_name = v;
         }
     }
+    // `:as` binds before the keys, so an `:or` default may read it.
+    if (as_name) |n| try out.appendSlice(ctx.allocator, &.{ mutCast(n), src });
     i = 0;
     while (i < entries.len) : (i += 2) {
         const k = entries[i];
@@ -1846,7 +1854,6 @@ fn destructureMap(b: Builder, entries: []const *Form, src: *Form, out: *std.Arra
         const default = if (k.datum == .symbol) lookupDefault(defaults, k.datum.symbol.name) else null;
         try destructurePair(b, k, try getCall(b, src, v, default), out);
     }
-    if (as_name) |n| try out.appendSlice(ctx.allocator, &.{ mutCast(n), src });
 }
 
 const KeyGroup = enum { keys, strs, syms };
@@ -1874,15 +1881,6 @@ fn destructureKeyEntry(b: Builder, group: KeyGroup, group_ns: ?[]const u8, entry
 fn getCall(b: Builder, src: *Form, key: *const Form, default: ?*const Form) ExpandError!*Form {
     if (default) |d| return b.list(.{ "nexis.core/get", src, key, d });
     return b.list(.{ "nexis.core/get", src, key });
-}
-
-/// The source a rest pattern destructures: a map pattern after `&`
-/// takes keyword arguments, so the rest seq becomes the map
-/// `nexis.internal/#%kwargs` builds from it (`k v k v ...`, or one
-/// trailing map); any other pattern takes the seq itself.
-fn restSource(b: Builder, rest_pattern: *const Form, rest: *Form) ExpandError!*Form {
-    if (stripMeta(rest_pattern).datum != .map) return rest;
-    return b.list(.{ "nexis.internal/#%kwargs", rest });
 }
 
 /// The `:or` default for the local `name`, if any.

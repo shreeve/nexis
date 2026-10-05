@@ -1147,6 +1147,23 @@ test "destructuring: a map pattern after & takes keyword arguments" {
     try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
     try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
     try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+    // With no arguments the rest is nil, and so is `:as`, as in Clojure.
+    try expectOutput("((fn [& {:as m}] m))", "nil");
+}
+
+test "destructuring: every map pattern takes a seq as keyword arguments, as Clojure 1.11 does" {
+    try expectOutput("(let [{:keys [a b]} (list :a 1 :b 2)] [a b])", "[1 2]");
+    try expectOutput("(do (defn f [opts] (let [{:keys [a b]} opts] [a b])) (f (list :a 1 :b 2)))", "[1 2]");
+    try expectOutput("(do (defn g [& opts] (let [{:keys [a]} opts] a)) (g :a 1))", "1");
+    try expectOutput("(do (defn h [{:keys [a]}] a) (h '(:a 1)))", "1");
+    try expectOutput("(let [{:keys [a] :as m} (list {:a 4})] [a m])", "[4 {:a 4}]");
+    // A vector is not a seq: its map pattern looks it up by index.
+    try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
+}
+
+test "destructuring: :as binds before the keys, so an :or default may read it" {
+    try expectOutput("(let [m {:a 5}] (let [{:keys [a] :or {a (:a m 0)} :as m} {}] a))", "0");
+    try expectOutput("(let [{:keys [a] :or {a (count m)} :as m} {:b 1}] a)", "1");
 }
 
 test "destructuring: loop bindings destructure and recur rebinds them" {
