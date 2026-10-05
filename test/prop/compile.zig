@@ -784,7 +784,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(-> a (g b) (h) (g c))", .len = 10 },
         .{ .form = "(doseq [x xs] (g x))", .len = 15 },
         .{ .form = "(for [x xs] (h x))", .len = 24 },
-        .{ .form = "(dotimes [i a] (g i))", .len = 9 },
+        .{ .form = "(dotimes [i a] (g i))", .len = 12 },
         .{ .form = "(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))", .len = 9 },
         .{ .form = "(try (g a) (catch :x e (h e)) (finally (g b)))", .len = 22 },
         .{ .form = "(assert (pos? a) \"a must be positive\")", .len = 10 },
