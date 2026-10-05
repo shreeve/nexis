@@ -397,6 +397,13 @@ test "failures: (var x) of a name that is no Var, a local included, is Unresolve
     try harness.expectResult(&program, src, try program.runChecked(src, null), "1");
 }
 
+test "failures: a def inside quoted data declares nothing" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.UnresolvedSymbol, program.runChecked("(def q (quote (def zz 1))) zz", null));
+}
+
 // =============================================================================
 // Properties
 // =============================================================================

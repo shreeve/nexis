@@ -1192,9 +1192,14 @@ pub const DeclaredNames = struct {
             },
             else => return,
         };
-        for (items) |item| try self.declareForm(item);
-        if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) return;
+        if (items.len < 2 or items[0].datum != .symbol or items[0].datum.symbol.ns != null) {
+            for (items) |item| try self.declareForm(item);
+            return;
+        }
         const head = items[0].datum.symbol.name;
+        // Quoted data defines nothing.
+        if (std.mem.eql(u8, head, "quote")) return;
+        for (items) |item| try self.declareForm(item);
         // `^meta` on the name wraps it in with_meta.
         const name_form = if (items[1].datum == .with_meta) items[1].datum.with_meta.target else items[1];
         if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return;

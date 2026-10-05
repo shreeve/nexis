@@ -926,20 +926,28 @@ fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) E
     const name_form = stripMeta(items[1]);
     if (name_form.datum != .symbol or name_form.datum.symbol.ns != null) return ctx.fail(name_form.origin, "ns: the name must be an unqualified symbol, not {s}", .{describeForm(name_form)});
     const reg = ctx.registry orelse return ctx.fail(origin, "ns: namespaces cannot be switched here", .{});
-    reg.switchTo(name_form.datum.symbol.name) catch return ExpandError.OutOfMemory;
     var clauses = items[2..];
     if (clauses.len > 0 and clauses[0].datum == .string) clauses = clauses[1..];
     if (clauses.len > 0 and clauses[0].datum == .map) clauses = clauses[1..];
+    // Every clause is checked before the namespace switches, so a bad
+    // one leaves the program where it was.
     for (clauses) |clause| {
         const clause_items: []const *Form = if (clause.datum == .list) clause.datum.list else &.{};
         if (clause_items.len == 0 or clause_items[0].datum != .keyword) return ctx.fail(clause.origin, "ns: expected a clause like (:require ...), not {s}", .{describeForm(clause)});
+        const kind = clause_items[0].datum.keyword.name;
+        const known = for ([_][]const u8{ "require", "refer-clojure", "gen-class" }) |k| {
+            if (std.mem.eql(u8, kind, k)) break true;
+        } else false;
+        if (!known) return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
+    }
+    reg.switchTo(name_form.datum.symbol.name) catch return ExpandError.OutOfMemory;
+    for (clauses) |clause| {
+        const clause_items = clause.datum.list;
         const kind = clause_items[0].datum.keyword.name;
         if (std.mem.eql(u8, kind, "require")) {
             for (clause_items[1..]) |spec| try requireSpec(ctx, spec);
         } else if (std.mem.eql(u8, kind, "refer-clojure")) {
             try referClojure(ctx, reg, clause_items[1..]);
-        } else if (!std.mem.eql(u8, kind, "gen-class")) {
-            return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
         }
     }
     return try makeNil(ctx, origin);

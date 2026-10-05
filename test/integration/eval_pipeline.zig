@@ -1336,6 +1336,14 @@ test "loader: a top-level do runs its forms one at a time, as Clojure's eval doe
     try expectLoaded("(do 1 (do 2 3))", "3");
 }
 
+test "ns: a clause it refuses leaves the current namespace as it was" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.MacroExpansionFailure, program.run("(ns elsewhere (:import [java.util Date]))"));
+    try testing.expectEqualStrings("user", program.registry.current.name);
+}
+
 test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
