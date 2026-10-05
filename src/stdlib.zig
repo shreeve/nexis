@@ -4021,7 +4021,7 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
                 switch (conv) {
                     's' => {
                         if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner);
-                        if (precision) |p| piece.shrinkRetainingCapacity(codepointPrefix(piece.written(), p));
+                        if (precision) |p| piece.shrinkRetainingCapacity(try codepointPrefix(piece.written(), p));
                     },
                     'd' => {
                         if (!vm_mod.isInteger(a)) return VmError.KindMismatch;
@@ -4076,11 +4076,15 @@ fn formatField(fmt: []const u8, i: *usize) VmError!usize {
     return n;
 }
 
-/// The byte length of the first `n` code points of `text`.
-fn codepointPrefix(text: []const u8, n: usize) usize {
-    var it = std.unicode.Utf8View.initUnchecked(text).iterator();
-    for (0..n) |_| _ = it.nextCodepointSlice() orelse break;
-    return it.i;
+/// The byte length of the first `n` code points of `text`;
+/// `:utf8-error` when a malformed sequence starts within them.
+fn codepointPrefix(text: []const u8, n: usize) VmError!usize {
+    var i: usize = 0;
+    for (0..n) |_| {
+        if (i == text.len) break;
+        i += (scalarAt(text, i) orelse return VmError.Utf8Error).len;
+    }
+    return i;
 }
 
 /// `%f`: `x` with `precision` decimals from its shortest round-trip
@@ -4373,20 +4377,37 @@ fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn
     var lo: usize = 0;
     var hi: usize = src.len;
     if (left) while (lo < hi) {
-        const len = std.unicode.utf8ByteSequenceLength(src[lo]) catch break;
-        if (len > hi - lo) break;
-        const c = std.unicode.utf8Decode(src[lo..][0..len]) catch break;
-        if (!isTrimmed(c)) break;
-        lo += len;
+        const sc = scalarAt(src[0..hi], lo) orelse break;
+        if (!isTrimmed(sc.c)) break;
+        lo += sc.len;
     };
     if (right) while (hi > lo) {
         var start = hi - 1;
         while (start > lo and src[start] & 0xC0 == 0x80) start -= 1;
-        const c = std.unicode.utf8Decode(src[start..hi]) catch break;
-        if (!isTrimmed(c)) break;
+        const sc = scalarAt(src[0..hi], start) orelse break;
+        if (start + sc.len != hi or !isTrimmed(sc.c)) break;
         hi = start;
     };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
+}
+
+/// The scalar that starts at `bytes[pos]` and its byte length; null
+/// unless the bytes there are one well-formed UTF-8 sequence (no
+/// overlong form, surrogate or truncated tail). Strings carry their
+/// bytes unvalidated (STRING.md §2), so a native that walks one by
+/// code point decodes through here.
+fn scalarAt(bytes: []const u8, pos: usize) ?struct { c: u21, len: u3 } {
+    const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch return null;
+    if (len > bytes.len - pos) return null;
+    const b = bytes[pos..];
+    const c: u21 = switch (len) {
+        1 => b[0],
+        2 => std.unicode.utf8Decode2(b[0..2].*) catch return null,
+        3 => std.unicode.utf8Decode3(b[0..3].*) catch return null,
+        4 => std.unicode.utf8Decode4(b[0..4].*) catch return null,
+        else => unreachable,
+    };
+    return .{ .c = c, .len = len };
 }
 
 fn isNewline(c: u21) bool {
@@ -4421,11 +4442,9 @@ fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     const src = try stringArg(args[0]);
     var i: usize = 0;
     while (i < src.len) {
-        const len = std.unicode.utf8ByteSequenceLength(src[i]) catch return value_mod.fromBool(false);
-        if (len > src.len - i) return value_mod.fromBool(false);
-        const c = std.unicode.utf8Decode(src[i..][0..len]) catch return value_mod.fromBool(false);
-        if (!isJavaWhitespace(c)) return value_mod.fromBool(false);
-        i += len;
+        const sc = scalarAt(src, i) orelse return value_mod.fromBool(false);
+        if (!isJavaWhitespace(sc.c)) return value_mod.fromBool(false);
+        i += sc.len;
     }
     return value_mod.fromBool(true);
 }
@@ -5889,6 +5908,50 @@ test "stdlib: a string that is not UTF-8 seqs as :utf8-error" {
     try testing.expectError(VmError.Utf8Error, fnSeq(&vm, &.{bad}));
     const good = try string_mod.fromBytes(vm.ensureHeap(), "é");
     try testing.expectEqual(@as(u21, 0xE9), (try fnFirst(&vm, &.{good})).asChar());
+}
+
+test "stdlib: malformed UTF-8 never panics a string native or format" {
+    var stub_code = [_]vm_mod.Inst{vm_mod.asm_.returnNil()};
+    const stub = vm_mod.Routine{ .code = &stub_code, .consts = &.{}, .slot_count = 1 };
+    var vm = try VM.init(testing.allocator, &stub);
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    // A truncated tail, a stray continuation, a lone lead, an invalid
+    // byte, a surrogate, an overlong form, each with whitespace around.
+    const malformed = [_][]const u8{ "ab\xe2\x82", "\x82ab", "\xe2\x82", "a\xffb", "\xed\xa0\x80", "\xc0\xaf", " \xe2\x82 ", "\xe2\x82\n", " \x82" };
+    var pool: [malformed.len + 4]Value = undefined;
+    for (malformed, 0..) |m, i| pool[i] = try string_mod.fromBytes(heap, m);
+    pool[malformed.len] = try string_mod.fromBytes(heap, "a b");
+    pool[malformed.len + 1] = try string_mod.fromBytes(heap, "");
+    pool[malformed.len + 2] = value_mod.fromFixnum(1).?;
+    pool[malformed.len + 3] = value_mod.fromChar('a').?;
+    for (&string_natives) |*d| {
+        const max = d.max_arity orelse 3;
+        for (d.min_arity..max + 1) |arity| {
+            var idx: [3]usize = @splat(0);
+            while (true) {
+                var args: [3]Value = undefined;
+                for (0..arity) |k| args[k] = pool[idx[k]];
+                _ = d.call(&vm, args[0..arity]) catch {};
+                var k: usize = 0;
+                while (k < arity) : (k += 1) {
+                    idx[k] += 1;
+                    if (idx[k] < pool.len) break;
+                    idx[k] = 0;
+                }
+                if (k == arity) break;
+            }
+        }
+    }
+    for ([_][]const u8{ "%.1s", "%.3s", "%5s", "%-5s|" }) |f| {
+        const fmt = try string_mod.fromBytes(heap, f);
+        for (pool[0..malformed.len]) |m| if (fnFormat(&vm, &.{ fmt, m })) |_| {} else |e| try testing.expectEqual(VmError.Utf8Error, e);
+    }
+    // Bytes that are not UTF-8 stop a trim and are never trimmed.
+    const t = try fnStringTrim(&vm, &.{try string_mod.fromBytes(heap, " \xe2\x82 \x82 ")});
+    try testing.expectEqualStrings("\xe2\x82 \x82", string_mod.asBytes(t));
+    const nl = try fnStringTrimNewline(&vm, &.{pool[7]});
+    try testing.expectEqualStrings("\xe2\x82", string_mod.asBytes(nl));
 }
 
 test "stdlib: name of a string is the string itself" {

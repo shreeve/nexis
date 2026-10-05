@@ -83,8 +83,10 @@ the names the namespace's own (`MACROEXPAND.md` §2b).
 All in `nexis.core`. Strings index by Unicode scalar (code point),
 never by byte or grapheme: `count`, `nth`, `get`, `subs` and
 `nexis.string/index-of` agree (`(count "🇺🇸")` is 2). A string with
-malformed UTF-8 (reachable only through the codec or a store) makes
-any of them throw `:utf8-error` (STRING.md §2, invariant 4).
+malformed UTF-8 (a string's bytes are not validated: `read-line`,
+`*command-line-args*`, the codec and a store can all bring one in)
+makes any of them throw `:utf8-error` (STRING.md §2, invariant 4); no
+string function panics on one.
 
 | Name | Arity | Semantics | Errors |
 |---|---|---|---|
@@ -116,7 +118,7 @@ argument:
 
 | Conversion | Argument | Text |
 |---|---|---|
-| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"` |
+| `%s` | any | As `str` makes it, except nil is `nil` (Java prints `null`); a precision keeps that many characters: `(format "%.2s" "héllo")` is `"hé"`, and is `:utf8-error` when a malformed sequence starts within them |
 | `%d` | integer (fixnum or bignum) | Decimal |
 | `%f` | any number | Fixed-point with `precision` decimals, 6 by default: `(format "%.2f" 3.14159)` is `"3.14"`. As Java's, the digits are the double's shortest round-trip ones, rounded half up and padded with zeros (`(format "%.2f" 0.125)` is `"0.13"`, `(format "%.20f" 0.1)` `"0.10000000000000000000"`); NaN and the infinities are `NaN`, `Infinity`, `-Infinity` |
 | `%x`, `%X` | integer within 64 bits | Hex of the 64-bit two's complement: `(format "%x" -1)` is `"ffffffffffffffff"`; a larger bignum is `:arithmetic-overflow` |
@@ -155,7 +157,7 @@ the result and write it once; a `replace` that finds nothing returns
 | `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
 | `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
-| `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays) |
+| `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays). A byte that is not part of a well-formed UTF-8 sequence is not whitespace: it stops the trim and stays |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
 | `blank?` | 1 | Whether the argument is nil, empty, or only whitespace as `trim` reads it |
 | `starts-with?`, `ends-with?`, `includes?` | 2 | Whether the second string is a prefix, suffix, substring of the first |
