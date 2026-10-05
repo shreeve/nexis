@@ -571,6 +571,42 @@ pub const Reader = struct {
 // Pure helpers (no Reader state)
 // -----------------------------------------------------------------------------
 
+/// Where the first form of `text` ends, by the scanner's tokens: past
+/// its last token, with the `#_` discards and `^meta` before it; null
+/// when the text ends first or holds a token the scanner rejects.
+/// `read-string` parses and reads just this much, so the text after
+/// the first form is never scanned, as Clojure never reads it.
+pub fn firstFormEnd(text: []const u8) ?u32 {
+    var lexer = nexis.Lexer.init(text);
+    // Forms still to come before the first one is complete: a `^`
+    // takes two (the metadata and the target), a `#_` one more.
+    var need: usize = 1;
+    var depth: usize = 0;
+    while (true) {
+        const t = lexer.next();
+        switch (t.cat) {
+            .eof, .err => return null,
+            .lparen, .lbracket, .lbrace, .hash_lbrace, .hash_lparen => {
+                depth += 1;
+                continue;
+            },
+            .rparen, .rbracket, .rbrace => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth > 0) continue;
+            },
+            .caret, .hash_discard => {
+                if (depth == 0) need += 1;
+                continue;
+            },
+            .quote_tok, .syntax_quote_tok, .unquote_tok, .unquote_splicing_tok, .deref_tok, .var_quote_tok => continue,
+            else => if (depth > 0) continue,
+        }
+        need -= 1;
+        if (need == 0) return lexer.base.pos;
+    }
+}
+
 fn tokenSpan(r: parser.Src) SrcSpan {
     return .{ .pos = r.pos, .len = nexis.srcLen(r) };
 }
@@ -1333,6 +1369,32 @@ test "discard: #_ drops the next form wherever a form may stand" {
         defer rd.deinit();
         const f = try rd.readOneForm(try p.parseForm());
         try std.testing.expectEqualStrings("x", f.datum.symbol.name);
+    }
+}
+
+test "firstFormEnd: the first form's tokens, discards and metadata included, and no further" {
+    const cases = [_]struct { text: []const u8, end: ?usize }{
+        .{ .text = "1 2", .end = 1 },
+        .{ .text = "  (a [b] {c d}) )))", .end = 15 },
+        .{ .text = "#_ x y z", .end = 6 },
+        .{ .text = "^:k ^{:a 1} [1] tail", .end = 15 },
+        .{ .text = "'#_a b c", .end = 6 },
+        .{ .text = "@x #(", .end = 2 },
+        .{ .text = "\\u{110000} x", .end = 10 },
+        .{ .text = "\"a b\" c", .end = 5 },
+        .{ .text = "{:a 1 :a 2} unreadable \"", .end = 11 },
+        .{ .text = "", .end = null },
+        .{ .text = "; only a comment", .end = null },
+        .{ .text = "(a b", .end = null },
+        .{ .text = ") x", .end = null },
+        .{ .text = "#_ #_ a", .end = null },
+        .{ .text = "\"open", .end = null },
+    };
+    for (cases) |c| {
+        const end = firstFormEnd(c.text);
+        if (c.end) |e| {
+            try std.testing.expectEqual(@as(?u32, @intCast(e)), end);
+        } else try std.testing.expectEqual(@as(?u32, null), end);
     }
 }
 

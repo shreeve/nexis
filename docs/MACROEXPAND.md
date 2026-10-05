@@ -156,7 +156,10 @@ otherwise it is an ordinary call. User macros shadow host macros.
      it until the head is not a macro. A failure throws
      `:macro-expansion-failure`.
    - `(read-string s)` reads the first form of `s` as data; a reader
-     error throws `:reader-error`.
+     error throws `:reader-error`. Only the text up to the end of the
+     first form is scanned and read (`reader.firstFormEnd`), so what
+     follows it is ignored, as in Clojure, even text that would not
+     read.
    - `(eval form)` converts the value to a Form, then compiles it as
      the REPL compiles a line: the current namespace, the registry,
      interner, host macros and loader, a fresh set of declared

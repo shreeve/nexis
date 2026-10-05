@@ -5343,6 +5343,14 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
     // Nesting past the stack budget is a reader error, not a fault.
     try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
+    // What follows the first form is never read, so it may not read at
+    // all, and costs nothing: a bad first form fails once, not at every
+    // later cut of the text.
+    try expectOutput("(read-string \"(a) ) \\\"\")", "(a)");
+    try expectOutput("(try (read-string (apply str \"{:a 1 :a 2}\" (repeat 100000 \" x\"))) (catch :reader-error e :bad))", ":bad");
+    try expectOutput("(try (read-string (apply str \"#_\" (repeat 100000 \" #_\"))) (catch :reader-error e :bad))", ":bad");
+    // A `\u{...}` char is one token, never cut short to `\u`.
+    try expectOutput("(try (read-string \"\\\\u{110000}\") (catch :reader-error e :bad))", ":bad");
 }
 
 // =============================================================================
