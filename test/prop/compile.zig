@@ -1336,7 +1336,9 @@ test "prop differential: compiled random programs agree with a reference evaluat
 test "prop differential: the same programs agree when their code starts past pc 65,536" {
     // A 70,000-instruction prefix puts every branch, loop entry and
     // handler of the top-level routine past the 16-bit range, so the
-    // program runs on wide jump and handler targets (VM.md §3).
+    // programs run on wide jump and handler targets (VM.md §3). They
+    // share one routine, each an element of one vector, so the prefix
+    // expands and compiles once.
     var prng = std.Random.DefaultPrng.init(diff_prng_seed ^ 0xFFFF);
     const rand = prng.random();
     var program: harness.Program = undefined;
@@ -1344,20 +1346,28 @@ test "prop differential: the same programs agree when their code starts past pc 
     defer program.deinit();
     _ = try program.run("(defmacro pad [] (cons 'do (repeat 70000 '(inc 1))))");
     _ = try program.run(helpers);
-    for (0..30) |_| {
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src: std.Io.Writer.Allocating = .init(a);
+    var want: std.Io.Writer.Allocating = .init(a);
+    try src.writer.writeAll("(do (pad) [");
+    try want.writer.writeAll("[");
+    for (0..30) |i| {
         const e = try genExpr(a, rand, .{}, 5);
-        var src: std.Io.Writer.Allocating = .init(a);
-        try src.writer.writeAll("(do (pad) ");
+        if (i > 0) {
+            try src.writer.writeAll(" ");
+            try want.writer.writeAll(" ");
+        }
         try printExpr(e, &src.writer);
-        try src.writer.writeAll(")");
-        const want = try a.print("{d}", .{try evalExpr(a, e, .{})});
-        const got = program.run(src.written()) catch |err| {
-            std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ src.written()[10..], @errorName(err) });
-            return err;
-        };
-        try harness.expectResult(&program, src.written()[10..], got, want);
+        try want.writer.print("{d}", .{try evalExpr(a, e, .{})});
     }
+    try src.writer.writeAll("])");
+    try want.writer.writeAll("]");
+    const shown = src.written()["(do (pad) ".len..];
+    const got = program.run(src.written()) catch |err| {
+        std.debug.print("\n  source: {s}\n  error:  {s}\n", .{ shown, @errorName(err) });
+        return err;
+    };
+    try harness.expectResult(&program, shown, got, want.written());
 }
