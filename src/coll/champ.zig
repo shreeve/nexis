@@ -1178,7 +1178,7 @@ const SetTrie = Trie(Value, .persistent_set);
 
 /// Per-entry hash (CHAMP.md §7.1): two ordered combines, no finalize,
 /// no inner domain mix. SEMANTICS.md §3.2 pins this formula.
-inline fn entryHash(e: Entry, elementHash: ElementHash) u64 {
+pub inline fn entryHash(e: Entry, elementHash: ElementHash) u64 {
     var acc: u64 = hash_mod.ordered_init;
     acc = hash_mod.combineOrdered(acc, elementHash(e.key));
     acc = hash_mod.combineOrdered(acc, elementHash(e.value));

@@ -31,6 +31,7 @@ const intern_mod = @import("../intern.zig");
 const string_mod = @import("../string.zig");
 const bignum_mod = @import("../bignum.zig");
 const vector_mod = @import("vector.zig");
+const champ = @import("champ.zig");
 const stack = @import("../stack.zig");
 
 const Value = value.Value;
@@ -336,20 +337,6 @@ pub fn find(v: Value, key: Value, cmp: anytype) @TypeOf(cmp).Error!?Entry {
     return null;
 }
 
-/// The least entry, or null when `v` is empty.
-pub fn first(v: Value) ?Entry {
-    var h = rootOf(v).tree orelse return null;
-    while (node(h).left) |l| h = l;
-    return entryOf(h, v.kind() == .sorted_map);
-}
-
-/// The greatest entry, or null when `v` is empty.
-pub fn last(v: Value) ?Entry {
-    var h = rootOf(v).tree orelse return null;
-    while (node(h).right) |r| h = r;
-    return entryOf(h, v.kind() == .sorted_map);
-}
-
 /// The entry at position `i` of the ascending order, `i < count(v)`;
 /// O(log n) through the subtree sizes.
 pub fn entryAt(v: Value, i: usize) Entry {
@@ -541,11 +528,7 @@ pub fn hashOf(h: *HeapHeader, elementHash: ElementHash) u64 {
     var n: usize = 0;
     var it = Iter.init(Heap.valueFromHeader(kind, h), true);
     while (it.next()) |e| : (n += 1) {
-        const x = if (is_map) blk: {
-            var eh: u64 = hash_mod.ordered_init;
-            eh = hash_mod.combineOrdered(eh, elementHash(e.key));
-            break :blk hash_mod.combineOrdered(eh, elementHash(e.value));
-        } else elementHash(e.key);
+        const x = if (is_map) champ.entryHash(.{ .key = e.key, .value = e.value }, elementHash) else elementHash(e.key);
         acc = hash_mod.combineUnordered(acc, x);
     }
     const truncated: u32 = @truncate(hash_mod.finalizeUnordered(acc, n));
@@ -710,8 +693,8 @@ test "walks: both directions, from a bound, by position, least and greatest" {
     try testing.expectEqual(@as(i64, 40), e.next().?.key.asFixnum());
     var past = try Iter.from(m, fx(99), true, FixOrder{});
     try testing.expect(past.next() == null);
-    try testing.expectEqual(@as(i64, 0), first(m).?.key.asFixnum());
-    try testing.expectEqual(@as(i64, 98), last(m).?.key.asFixnum());
+    try testing.expectEqual(@as(i64, 0), entryAt(m, 0).key.asFixnum());
+    try testing.expectEqual(@as(i64, 98), entryAt(m, 49).key.asFixnum());
     var cur = Cursor.init(m);
     var n: usize = 0;
     while (cur.next()) |_| n += 1;
@@ -725,7 +708,7 @@ test "a set node stops before the value slot" {
     s = try conj(&heap, s, fx(1), FixOrder{});
     const tree = rootOf(s).tree.?;
     try testing.expectEqual(@as(usize, set_node_bytes), Heap.bodyBytes(tree).len);
-    try testing.expect(first(s).?.value.isNil());
+    try testing.expect(entryAt(s, 0).value.isNil());
 }
 
 test "the natural order: nil first, numbers across the tower, vectors by count, other kinds apart" {

@@ -132,8 +132,8 @@ is O(n). `Iter.from(v, key, ascending, cmp)` is Clojure's `seqFrom`:
 ascending, the entries from the least key not below `key`; descending,
 from the greatest key not above it. `Cursor` walks ascending by
 position through the subtree sizes, O(log n) a step in a few words;
-the codec keeps one per open container. `first`, `last` and
-`entryAt(v, i)` answer in O(log n).
+the codec keeps one per open container. `entryAt(v, i)`, the entry at
+position `i`, answers in O(log n).
 
 `subseq` and `rsubseq` are Clojure's:
 
