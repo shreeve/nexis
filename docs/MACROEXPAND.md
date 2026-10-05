@@ -259,7 +259,9 @@ before it there. Its value is the last form's, nil for `(do)`.
 name to `my/app_core/foo.nx` (dots to slashes, dashes to
 underscores) and takes the first match on the load path (the CLI's
 is the working directory, then the directory of the file being run).
-The file's first form must be `(ns my.app-core.foo ...)`; the
+The file's first form, as the reader reads it (comments and `#_`
+discards before it, `^meta` on the name), must be `(ns my.app-core.foo
+...)`, or nothing of the file runs; the
 caller's namespace is restored afterwards. A namespace loads once; a
 require of one still loading is `require: cyclic require of N`. The
 namespaces the stdlib installs have no file (`markLoaded`), and

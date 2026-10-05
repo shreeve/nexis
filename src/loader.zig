@@ -99,6 +99,11 @@ pub const EvalOptions = struct {
     on_routine: ?Each(*const vm_mod.Routine) = null,
     /// Each form's value as it runs (the REPL prints it).
     on_value: ?Each(Value) = null,
+    /// The namespace the text must declare in its first form, `(ns
+    /// NAME ...)` with `^meta` on the name allowed: a required file
+    /// that declares another name, or none, is refused before any of
+    /// it runs.
+    expect_ns: ?[]const u8 = null,
 };
 
 pub const Loader = struct {
@@ -189,26 +194,18 @@ pub const Loader = struct {
         }
         var parser = reader_mod.parser.Parser.init(self.allocator, text);
         defer parser.deinit();
-        const sexp = parser.parseProgram() catch {
-            const span = parser.lastError().?.span;
-            const pos: u32 = @intCast(@min(span.start, text.len));
-            if (pos >= text.len) {
-                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
-            } else if (unterminatedString(text[pos..])) {
-                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
-            } else {
-                const len: u32 = @max(span.end - span.start, 1);
-                try self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = len }, .label = "", .reading = true }, "parse error: unexpected `{s}`", .{text[pos..@min(text.len, pos + len)]});
-            }
+        const sexp = parser.parseProgram() catch |err| {
+            // Out of memory while parsing is the out-of-memory report
+            // (TOOLING.md §1), not a syntax error.
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const failure = parser.lastError() orelse return error.OutOfMemory;
+            try self.parseFailure(info, failure.span.start, failure.span.end);
             return error.Diagnosed;
         };
         var rdr = reader_mod.Reader.init(self.allocator, text);
         defer rdr.deinit();
-        const forms = rdr.readProgram(sexp) catch |err| {
-            const e = rdr.err orelse {
-                try self.diagnose(.{ .label = "", .reading = true }, "reader error: {s}", .{@errorName(err)});
-                return error.Diagnosed;
-            };
+        const forms = rdr.readProgram(sexp) catch {
+            const e = rdr.err orelse return error.OutOfMemory;
             // Kinds are spelled with underscores in Zig and dashes in
             // nexis; the detail is the user's own text.
             var kind_buf: [64]u8 = undefined;
@@ -227,6 +224,11 @@ pub const Loader = struct {
         defer declared.deinit();
         if (options.declare) for (forms) |form| try declared.declareForm(form);
 
+        if (options.expect_ns) |name| if (!opensWithNs(forms, name)) {
+            try self.diagnose(.{ .source = info, .span = .{ .pos = 0, .len = 1 }, .label = "" }, "require: {s} does not begin with (ns {s})", .{ info.path, name });
+            return error.Diagnosed;
+        };
+
         const decl: ?*compile_mod.DeclaredNames = if (options.declare) &declared else null;
         const nil = @import("value.zig").nilValue();
         var pending: std.ArrayList(*const reader_mod.Form) = .empty;
@@ -237,7 +239,7 @@ pub const Loader = struct {
             defer scratch.deinit();
             if (options.on_routine) |each| {
                 const routine = try self.compileForm(info, top, scratch.allocator(), options.allocator, decl);
-                each.call(each.ctx, routine) catch |err| return mapCallbackError(err);
+                each.call(each.ctx, routine) catch |err| return self.callbackFailure(err);
                 continue;
             }
             // A top-level `do` runs its forms one at a time, so an
@@ -258,7 +260,7 @@ pub const Loader = struct {
                 }
                 last = try self.run(try self.compileForm(info, expanded, scratch.allocator(), options.allocator, decl));
             }
-            if (options.on_value) |each| each.call(each.ctx, last) catch |err| return mapCallbackError(err);
+            if (options.on_value) |each| each.call(each.ctx, last) catch |err| return self.callbackFailure(err);
         }
         return last;
     }
@@ -326,6 +328,29 @@ pub const Loader = struct {
         };
     }
 
+    /// Diagnose the parse error the parser reports at `start`..`end`:
+    /// at the end of the text, the innermost delimiter still open (more
+    /// input may close it, so the REPL reads another line); at a closer
+    /// that closes none of the right kind, the one still open.
+    fn parseFailure(self: *Loader, info: *const vm_mod.SourceInfo, start: u32, end: u32) EvalError!void {
+        const text = info.text;
+        const pos: u32 = @intCast(@min(start, text.len));
+        const open = try reader_mod.openDelimiter(self.allocator, text, pos);
+        if (pos >= text.len) {
+            if (open) |o| return self.diagnose(.{ .source = info, .span = o, .label = "", .reading = true, .incomplete = true }, "parse error: unclosed `{s}`", .{text[o.pos..][0..o.len]});
+            return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
+        }
+        if (unterminatedString(text[pos..])) return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
+        const token = text[pos..@min(text.len, pos + @max(end -| start, 1))];
+        const at: Diagnostic = .{ .source = info, .span = .{ .pos = pos, .len = @intCast(token.len) }, .label = "", .reading = true };
+        const closer = token.len == 1 and std.mem.findScalar(u8, ")]}", token[0]) != null;
+        if (closer) if (open) |o| {
+            const where = info.lineCol(o.pos);
+            return self.diagnose(at, "parse error: unexpected `{s}`; the `{s}` at {d}:{d} is open", .{ token, text[o.pos..][0..o.len], where.line, where.col });
+        };
+        return self.diagnose(at, "parse error: unexpected `{s}`", .{token});
+    }
+
     /// Whether `rest` opens a string literal that no unescaped `"`
     /// closes: the parser stops at the opening quote, and more input
     /// may complete it.
@@ -340,8 +365,14 @@ pub const Loader = struct {
         return true;
     }
 
-    fn mapCallbackError(err: anyerror) EvalError {
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.RunFailed;
+    /// A failure of an `on_value` or `on_routine` callback (the REPL
+    /// or `-e` printing a value, `disasm` printing a routine): out of
+    /// memory as itself, anything else, such as a closed stdout, as a
+    /// diagnostic naming it, never a runtime error the VM did not have.
+    fn callbackFailure(self: *Loader, err: anyerror) EvalError {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        self.diagnose(.{ .label = "" }, "cannot write the result: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
+        return error.Diagnosed;
     }
 
     fn compileFailure(self: *Loader, info: *const vm_mod.SourceInfo, err: anyerror, span: ?reader_mod.SrcSpan, detail: ?[]const u8) EvalError {
@@ -415,11 +446,7 @@ pub const Loader = struct {
         const saved_current = self.registry.current;
         defer self.registry.current = saved_current;
 
-        if (!startsWithNs(source, ns_name)) {
-            try self.diagnose(.{ .source = info, .span = .{ .pos = 0, .len = 1 }, .label = "" }, "require: {s} does not begin with (ns {s})", .{ path, ns_name });
-            return LoadError.LoadFailed;
-        }
-        _ = self.evalSource(info, .{ .allocator = self.persistent_allocator }) catch |err| return switch (err) {
+        _ = self.evalSource(info, .{ .allocator = self.persistent_allocator, .expect_ns = ns_name }) catch |err| return switch (err) {
             error.Diagnosed => LoadError.LoadFailed,
             error.RunFailed => LoadError.RunFailed,
             error.ControlTransferred => LoadError.ControlTransferred,
@@ -437,6 +464,9 @@ pub const Loader = struct {
             return LoadError.LoadFailed;
         };
         const ns = try self.registry.getOrCreate(name, self.registry.core);
+        // The target's own key storage, so each entry counts as the
+        // counterpart's own Var (expand.isOwnVar): `:refer :all` from
+        // it refers them all.
         var it = target.vars.iterator();
         while (it.next()) |entry| try ns.vars.put(ns.map_allocator, entry.key_ptr.*, entry.value_ptr.*);
         try self.loaded.put(ns.name, {});
@@ -478,62 +508,16 @@ fn searchLoadPaths(allocator: std.mem.Allocator, io: std.Io, load_paths: []const
     return null;
 }
 
-/// Whether `source`'s first form is `(ns NAME ...)` with NAME the
-/// requested namespace, `^meta` before it allowed: a file that
-/// declares another name, or none, is refused before any of it runs.
-/// Only the head and the name are looked at; the rest of the form is
-/// the expander's.
-fn startsWithNs(source: []const u8, ns_name: []const u8) bool {
-    var i: usize = 0;
-    while (i < source.len) {
-        switch (source[i]) {
-            ' ', '\t', '\r', '\n', ',' => i += 1,
-            ';' => while (i < source.len and source[i] != '\n') {
-                i += 1;
-            },
-            else => break,
-        }
-    }
-    const rest = source[i..];
-    if (!std.mem.startsWith(u8, rest, "(ns")) return false;
-    var after = std.mem.trimStart(u8, rest[3..], " \t\r\n,");
-    if (after.len == rest.len - 3) return false;
-    while (after.len > 0 and after[0] == '^') {
-        after = std.mem.trimStart(u8, after[metaLen(after)..], " \t\r\n,");
-    }
-    if (!std.mem.startsWith(u8, after, ns_name)) return false;
-    if (after.len == ns_name.len) return false;
-    return switch (after[ns_name.len]) {
-        ' ', '\t', '\r', '\n', ',', ')', '"', '(', '^', '{' => true,
-        else => false,
-    };
-}
-
-/// The length of the `^meta` that opens `text`: a map to its closing
-/// brace (braces in strings and char literals aside), else a keyword
-/// or symbol token; all of `text` when the map is not closed.
-fn metaLen(text: []const u8) usize {
-    var i: usize = 1;
-    if (i < text.len and text[i] == '{') {
-        var depth: usize = 0;
-        var in_string = false;
-        while (i < text.len) : (i += 1) switch (text[i]) {
-            '\\' => i += 1,
-            '"' => in_string = !in_string,
-            '{' => depth += @intFromBool(!in_string),
-            '}' => if (!in_string) {
-                depth -= 1;
-                if (depth == 0) return i + 1;
-            },
-            else => {},
-        };
-        return text.len;
-    }
-    while (i < text.len) : (i += 1) switch (text[i]) {
-        ' ', '\t', '\r', '\n', ',', ')', '(', '"' => break,
-        else => {},
-    };
-    return i;
+/// Whether `forms` opens with `(ns NAME ...)`, `^meta` on NAME allowed.
+fn opensWithNs(forms: []const *reader_mod.Form, name: []const u8) bool {
+    if (forms.len == 0 or forms[0].datum != .list) return false;
+    const items = forms[0].datum.list;
+    if (items.len < 2 or items[0].datum != .symbol) return false;
+    const head = items[0].datum.symbol;
+    if (head.ns != null or !std.mem.eql(u8, head.name, "ns")) return false;
+    var n = items[1];
+    while (n.datum == .with_meta) n = n.datum.with_meta.target;
+    return n.datum == .symbol and n.datum.symbol.ns == null and std.mem.eql(u8, n.datum.symbol.name, name);
 }
 
 // =============================================================================
@@ -556,17 +540,23 @@ test "loader: namespace names map to relative paths" {
     }
 }
 
-test "loader: a file must open with (ns NAME ...)" {
-    try testing.expect(startsWithNs("(ns app.a)", "app.a"));
-    try testing.expect(startsWithNs("; header\n\n(ns app.a \"doc\" (:require [b]))", "app.a"));
-    try testing.expect(startsWithNs("(ns\n  app.a\n  (:require [app.b :as b]))", "app.a"));
-    try testing.expect(!startsWithNs("(ns app.ab)", "app.a"));
-    try testing.expect(!startsWithNs("(nsx app.a)", "app.a"));
-    try testing.expect(!startsWithNs("(def x 1)", "app.a"));
-    try testing.expect(!startsWithNs("", "app.a"));
-    // Metadata on the name, as Clojure allows it.
-    try testing.expect(startsWithNs("(ns ^:no-doc app.a)", "app.a"));
-    try testing.expect(startsWithNs("(ns ^:no-doc ^{:doc \"a {b} \\\" }\" :k \\}}\n  app.a (:require [b]))", "app.a"));
-    try testing.expect(!startsWithNs("(ns ^:no-doc app.ab)", "app.a"));
-    try testing.expect(!startsWithNs("(ns ^{:doc \"x\"", "app.a"));
+test "loader: memory that runs out while reading or compiling is OutOfMemory, never a crash" {
+    var v = try vm_mod.VM.init(testing.allocator, &vm_mod.VM.idle_routine);
+    defer v.deinit();
+    const interner = v.ensureInterner();
+    const registry = try v.ensureRegistry();
+    const no_macros: expand_mod.HostMacroTable = .{};
+    const info = vm_mod.SourceInfo{ .path = "<test>", .text = "(def x [1 2 3 4 5 6 7 8 9]) (def y {:a [x x] :b #{1 2}})" };
+    var failed_somewhere = false;
+    for (0..400) |n| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = n });
+        var loader = Loader.init(failing.allocator(), v.runtime_arena.allocator(), testing.io, &.{}, &v, interner, registry, &no_macros);
+        defer loader.deinit();
+        _ = loader.evalSource(&info, .{ .allocator = v.runtime_arena.allocator() }) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failed_somewhere = true;
+            continue;
+        };
+    }
+    try testing.expect(failed_somewhere);
 }

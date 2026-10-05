@@ -93,9 +93,13 @@ nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
              ^^^
 ```
 
-The label is ``parse error: unexpected `)` `` or `parse error: unexpected
-end of input` at the token the parser stopped on, or `parse error:
-unterminated string` at the `"` of a string literal no quote closes;
+The label is ``parse error: unexpected `)` `` at the token the parser
+stopped on, naming the delimiter still open when the token is a closer
+of another kind (``unexpected `)`; the `[` at 1:10 is open``);
+``parse error: unclosed `(` `` at the innermost delimiter the text
+leaves open, or `parse error: unexpected end of input` at the end when
+none is; or `parse error: unterminated string` at the `"` of a string
+literal no quote closes;
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span

@@ -1303,6 +1303,13 @@ test "loader: a defmacro whose function does not compile is reported where and w
     try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
 }
 
+test "loader: a parse error names the delimiter left open" {
+    try expectLoadFailure("(println [1 2 3)", "parse error: unexpected `)`; the `[` at 1:10 is open", ")");
+    try expectLoadFailure("(def x 1)\n(defn f [x]\n  (+ x", "parse error: unclosed `(`", "(");
+    try expectLoadFailure("(def x 1) #{1 2", "parse error: unclosed `#{`", "#{");
+    try expectLoadFailure("(def x 1))", "parse error: unexpected `)`", ")");
+}
+
 test "loader: a top-level do runs its forms one at a time, as Clojure's eval does" {
     try expectLoaded("(do (ns foo) (def x 1)) (ns user) [(resolve 'foo/x) (resolve 'user/x)]", "[#'foo/x nil]");
     try expectLoaded("(do (def k 41) (defmacro m [] (inc k)) (m))", "42");
@@ -6106,6 +6113,11 @@ test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags
     try expectOutputWithFiles(&.{utilns}, "(require '[util :as-alias ua]) (require 'util) (ua/twice 3)", "6");
 }
 
+test "require: a file's ns form is found as the reader reads it, comments and discards before it" {
+    try expectOutputWithFiles(&.{.{ "appa.nx", "(ns ; the app\n  appa)\n(def x 1)\n" }}, "(require 'appa) appa/x", "1");
+    try expectOutputWithFiles(&.{.{ "appb.nx", "#_(old)\n(ns ^{:doc \"b {}\"} appb)\n(def y 2)\n" }}, "(require 'appb) appb/y", "2");
+}
+
 test "require: Clojure's library namespaces name nexis's" {
     try expectOutputWithFiles(&.{},
         \\(ns t (:require [clojure.string :as str :refer [trim]] clojure.test))
@@ -6260,7 +6272,7 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     defer files.deinit();
     const Case = struct { src: []const u8, label: []const u8, file: ?[]const u8 = null, line: u32 = 0 };
     const cases = [_]Case{
-        .{ .src = "(require 'broken)", .label = "parse error: unexpected end of input", .file = "broken.nx", .line = 3 },
+        .{ .src = "(require 'broken)", .label = "parse error: unclosed `(`", .file = "broken.nx", .line = 2 },
         .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },

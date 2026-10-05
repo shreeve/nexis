@@ -592,6 +592,25 @@ pub const Reader = struct {
 // Pure helpers (no Reader state)
 // -----------------------------------------------------------------------------
 
+/// The innermost delimiter (`(`, `[`, `{`, `#{`, `#(`) the scanner's
+/// tokens before `pos` leave open, which a parse error at `pos` reports
+/// as the one unclosed or mismatched.
+pub fn openDelimiter(allocator: std.mem.Allocator, text: []const u8, pos: u32) error{OutOfMemory}!?SrcSpan {
+    var lexer = nexis.Lexer.init(text);
+    var open: std.ArrayList(SrcSpan) = .empty;
+    defer open.deinit(allocator);
+    while (true) {
+        const t = lexer.next();
+        if (t.cat == .eof or t.pos >= pos) break;
+        switch (t.cat) {
+            .lparen, .lbracket, .lbrace, .hash_lbrace, .hash_lparen => try open.append(allocator, .{ .pos = t.pos, .len = t.len }),
+            .rparen, .rbracket, .rbrace => _ = open.pop(),
+            else => {},
+        }
+    }
+    return open.pop();
+}
+
 /// Where the first form of `text` ends, by the scanner's tokens: past
 /// its last token, with the `#_` discards and `^meta` before it; null
 /// when the text ends first or holds a token the scanner rejects.
