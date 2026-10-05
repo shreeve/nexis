@@ -230,8 +230,18 @@ returns is the connection's durability, `db.Durability`:
 
 | Durability | A commit | Lost if the process crashes | Lost if the system crashes |
 |---|---|---|---|
-| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync |
-| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing |
+| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync, where the storage writes in order; where it may reorder writes, possibly the whole store |
+| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing, unless a `:commit` commit to the file followed it with no sync since |
+
+The `:commit` row is emdb's MODE-NOSYNC. A commit that synced nothing
+gives up, until the file's next sync, what every commit before it
+promised about a system crash, wherever writes can reach the disk out
+of order: its meta page can land without its data, and the writers
+after it reuse pages the last synced state still reaches. So a file
+written under both durabilities (two connections, or a Nextomic
+`transact!` with its own `:sync`) is only as safe as its last
+unsynced commit until the next sync. On storage that keeps the order
+of writes only the last unsynced commits are lost.
 
 `(db/open path {:durability d})` sets it for one connection. Without
 it a connection takes the process's: the environment variable
