@@ -101,10 +101,7 @@ pub const Program = struct {
     /// after every lazy seq in it is realized, as the REPL prints a
     /// result.
     pub fn format(self: *Program, v: Value) ![]u8 {
-        const scope = self.v.rootScope();
-        defer scope.release();
-        try scope.push(v);
-        try nx.seq.realizeAll(&self.v, v);
+        try self.v.realizeOutside(v);
         var w = std.Io.Writer.Allocating.init(testing.allocator);
         errdefer w.deinit();
         try format_mod.format(v, .display, &w.writer, self.interner);

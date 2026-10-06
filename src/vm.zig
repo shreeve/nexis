@@ -31,6 +31,7 @@ const heap_mod = @import("heap.zig");
 const gc_mod = @import("gc.zig");
 const bignum_mod = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
+const lazy_mod = @import("coll/lazy.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
@@ -869,6 +870,13 @@ pub const LazyOps = struct {
 
 pub var lazy_ops: ?*const LazyOps = null;
 
+/// What an isolated realization failed with: a thrown value, or an
+/// error its barrier could not catch (docs/LAZY.md §6).
+pub const ParkedRealize = union(enum) {
+    thrown: Value,
+    err: VmError,
+};
+
 /// Unpack the descriptor pointer from a `.native_fn` Value.
 pub fn asNativeFn(v: Value) *const NativeFn {
     std.debug.assert(v.kind() == .native_fn);
@@ -1568,6 +1576,15 @@ pub const VM = struct {
     /// Cycles run so far; tests read it to prove a collection
     /// happened.
     gc_cycles: usize = 0,
+    /// While nonzero, no cycle is due: a lazy block is being realized
+    /// in isolation under `=` or `hash`, whose callers hold unrooted
+    /// nodes (docs/LAZY.md §6).
+    gc_hold: u32 = 0,
+    /// The failure of an isolated realization, kept until the native
+    /// call or opcode that compared or hashed raises it
+    /// (`checkDeepData`); a root while it is kept. The first failure
+    /// wins, and later isolated realizations fail at once.
+    parked_realize: ?ParkedRealize = null,
     /// The collector's gray worklist, kept between cycles so each
     /// cycle reuses the capacity the last one grew (GC.md §4).
     gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
@@ -1991,7 +2008,7 @@ pub const VM = struct {
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
     inline fn gcDue(self: *VM) bool {
-        if (!self.gc_enabled or self.borrowed_heap != null) return false;
+        if (!self.gc_enabled or self.borrowed_heap != null or self.gc_hold != 0) return false;
         const h = &(self.heap orelse return false);
         return h.allocated_since_collect >= self.gc_next_at;
     }
@@ -2046,6 +2063,10 @@ pub const VM = struct {
             .normal => {},
         };
         if (self.unhandled_throw) |v| c.markValue(v);
+        if (self.parked_realize) |p| switch (p) {
+            .thrown => |v| c.markValue(v),
+            .err => {},
+        };
         for (self.origins.items) |o| c.markValue(o.value);
         c.markValue(self.result);
         for (self.protocol_registry.items) |*proto| {
@@ -2411,10 +2432,10 @@ pub const VM = struct {
     /// value in force, as Clojure's `Var.invoke`), or a lookup
     /// (`callLookup`). Anything else is `NotCallable`.
     fn callDirect(self: *VM, callee: Value, args: []const Value) VmError!Value {
-        const overflows = dispatch_mod.overflowCount();
+        const overflows = dispatch_mod.spoilCount();
         // A call that fails spoils nothing its caller sees, so the
         // overflows under it are consumed with it.
-        errdefer dispatch_mod.rewindOverflows(overflows);
+        errdefer dispatch_mod.rewindSpoils(overflows);
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
@@ -2438,17 +2459,84 @@ pub const VM = struct {
     }
 
     /// `=`, `hash` and printing answer `false`, `0` or `#<too deep>`
-    /// past the stack guard and count an overflow (dispatch.zig);
-    /// a call or opcode that compared or hashed across one raises the
-    /// catchable `:stack-overflow` instead of returning that answer
-    /// (SEMANTICS §2.7). The raise consumes the overflows it reports,
-    /// so an enclosing native whose callback caught the throw does not
-    /// raise it again.
-    fn checkDeepData(self: *VM, overflows_before: u64) VmError!void {
-        if (dispatch_mod.overflowCount() != overflows_before) {
-            dispatch_mod.rewindOverflows(overflows_before);
+    /// past the stack guard, or at a lazy block they could not realize,
+    /// and count a spoil (dispatch.zig); a call or opcode that compared
+    /// or hashed across one raises instead of returning that answer: the
+    /// parked failure of the isolated realization (docs/LAZY.md §6), a
+    /// thrown value or an error, else the catchable `:stack-overflow`
+    /// (SEMANTICS §2.7). The raise consumes the spoils it reports, so an
+    /// enclosing native whose callback caught the throw does not raise
+    /// it again.
+    pub fn checkDeepData(self: *VM, spoils_before: u64) VmError!void {
+        if (dispatch_mod.spoilCount() != spoils_before) {
+            dispatch_mod.rewindSpoils(spoils_before);
+            if (self.parked_realize) |p| {
+                self.parked_realize = null;
+                return switch (p) {
+                    .thrown => |v| self.throwValue(v),
+                    .err => |e| e,
+                };
+            }
             return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Realizing lazy seqs (docs/LAZY.md §6)
+    // -------------------------------------------------------------------------
+
+    /// Make this VM the one `=` and `hash` realize a lazy block on, until
+    /// the returned host is restored.
+    pub fn installLazyHost(self: *VM) ?lazy_mod.Host {
+        const saved = lazy_mod.host;
+        lazy_mod.host = .{ .ctx = @ptrCast(self), .realize = &realizeIsolated };
+        return saved;
+    }
+
+    /// The seq of `lz`, realized in isolation for `dispatch`, which has
+    /// no VM and no error path and whose callers hold unrooted nodes: no
+    /// cycle runs while the body does, and its throw is caught by the
+    /// barrier `nexis.core/realize-caught`, a closure, and parked with
+    /// any error the barrier cannot catch. Null on a failure, at once
+    /// while one is parked.
+    fn realizeIsolated(ctx: *anyopaque, lz: Value) ?Value {
+        const self: *VM = @ptrCast(@alignCast(ctx));
+        if (self.parked_realize != null) return null;
+        const barrier = blk: {
+            const registry = if (self.home().registry) |*r| r else break :blk null;
+            const v = registry.core.lookupLocal("realize-caught") orelse break :blk null;
+            break :blk v.current();
+        } orelse {
+            self.parked_realize = .{ .err = VmError.UnboundVar };
+            return null;
+        };
+        self.gc_hold += 1;
+        defer self.gc_hold -= 1;
+        const r = self.callValue(barrier, &.{lz}) catch |err| {
+            self.parked_realize = .{ .err = err };
+            return null;
+        };
+        // `[true seq]` or `[false thrown]`.
+        if (vector_mod.nth(r, 0).isTruthy()) return vector_mod.nth(r, 1);
+        self.parked_realize = .{ .thrown = vector_mod.nth(r, 1) };
+        return null;
+    }
+
+    /// Realize every lazy seq in `v`, a value the host holds outside
+    /// any run (a REPL or `-e` result it is about to print, a test's
+    /// result): with this VM installed for `=` and `hash` and the error
+    /// trace recorded as a failing run's would be.
+    pub fn realizeOutside(self: *VM, v: Value) VmError!void {
+        const ops = lazy_ops orelse return;
+        const scope = self.rootScope();
+        defer scope.release();
+        try scope.push(v);
+        const saved = self.installLazyHost();
+        defer lazy_mod.host = saved;
+        ops.realize_all(self, v) catch |err| {
+            self.recordErrorTrace(err);
+            return err;
+        };
     }
 
     /// Where a closure frame's value goes when it returns.
@@ -2602,6 +2690,8 @@ pub const VM = struct {
     /// `ControlTransferred`, exactly as `callValue` reports it.
     pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
         try self.checkNesting();
+        const saved = self.installLazyHost();
+        defer lazy_mod.host = saved;
         if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
         const base_slot: usize = self.stack.items.len;
         self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
@@ -2902,6 +2992,8 @@ pub const VM = struct {
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
         self.error_detail = "";
+        const saved = self.installLazyHost();
+        defer lazy_mod.host = saved;
         self.loop(0) catch |err| {
             self.recordErrorTrace(err);
             return err;
@@ -3034,6 +3126,7 @@ pub const VM = struct {
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
         self.traced_error = null;
+        self.parked_realize = null;
         self.frames.items[0].routine = &idle_routine;
         @memset(self.stack.items, value_mod.nilValue());
         // A runaway recursion grew the frame chain and the stack far
@@ -3214,9 +3307,10 @@ pub const VM = struct {
         return self.nextSafe(frame);
     }
 
-    fn opColl(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opColl(self: *VM, _: *Frame, inst: Inst) VmError!void {
         try self.execColl(inst);
-        return self.nextSafe(frame);
+        // Hashing a lazy key realizes it, which may grow the frames.
+        return self.nextSafe(self.currentFrame());
     }
 
     fn opCtrl(self: *VM, _: *Frame, inst: Inst) VmError!void {
@@ -3406,9 +3500,9 @@ pub const VM = struct {
                     if (base + max_native_args <= self.stack.capacity) {
                         buf = self.stack.items.ptr[base..][0..max_native_args].*;
                     } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
-                    const overflows = dispatch_mod.overflowCount();
+                    const overflows = dispatch_mod.spoilCount();
                     const result = native.call(self, buf[0..argc]) catch |err| {
-                        dispatch_mod.rewindOverflows(overflows);
+                        dispatch_mod.rewindSpoils(overflows);
                         return err;
                     };
                     try self.checkDeepData(overflows);
@@ -3891,11 +3985,21 @@ pub const VM = struct {
         if (inst.a.index + argc > frame.slot_count) return VmError.OperandOutOfRange;
         const start = @as(usize, frame.base_slot) + inst.a.index;
         if (start + argc > self.stack.items.len) return VmError.BytecodeCorruption;
-        const args = self.stack.items[start..][0..argc];
+        // Hashing or comparing a lazy seq realizes it in isolation, which
+        // runs code that may grow the stack and the frames (docs/LAZY.md
+        // §6): the arguments are copied off the stack, which keeps them
+        // rooted, and the frame is read again after.
+        var buf: [16]Value = undefined;
+        const args: []Value = if (argc <= buf.len)
+            buf[0..argc]
+        else
+            self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
+        defer if (argc > buf.len) self.allocator.free(args);
+        @memcpy(args, self.stack.items[start..][0..argc]);
         const heap = self.ensureHeap();
         const hash = &dispatch_mod.hashValue;
         const eql = &dispatch_mod.equal;
-        const overflows = dispatch_mod.overflowCount();
+        const overflows = dispatch_mod.spoilCount();
         const result: Value = switch (variant) {
             .list => list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
             .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
@@ -3918,7 +4022,7 @@ pub const VM = struct {
             _ => return VmError.BytecodeCorruption,
         };
         try self.checkDeepData(overflows);
-        (try self.slotPtrIn(frame, inst.c.index)).* = result;
+        (try self.slotPtrIn(self.currentFrame(), inst.c.index)).* = result;
     }
 
     /// Append the elements of the seqable `v` to `out`; a map

@@ -1970,6 +1970,19 @@ test "gc: a sequence native's result is the same at every length" {
     try testing.expect(program.v.gc_cycles > 0);
 }
 
+test "db: a lazy seq is stored as the list it realizes to" {
+    try expectOutputProgramWithStore("lazy-put",
+        \\(def conn (db/open "@STORE@"))
+        \\(def r (db/ref conn :t "k"))
+        \\(with-tx [tx conn] (db/put! tx r (lazy-seq [1 2])))
+        \\(db/put-key! (db/ref conn :t "j") {:a (lazy-seq [3])})
+        \\(with-tx [tx conn] (db/alter! tx (db/ref conn :t "i") (fn [_] (lazy-seq (list 4)))))
+        \\(def got [(with-read-tx [tx conn] (db/get tx r)) (db/get-key (db/ref conn :t "j")) (db/get-key (db/ref conn :t "i"))])
+        \\(db/close conn)
+        \\[got (map class got)]
+    , "[[(1 2) {:a (3)} (4)] (:list :map :list)]");
+}
+
 test "db: read-line lets every held snapshot go before it waits" {
     var store = try SeamStore.init("read-line-held");
     defer store.deinit();
@@ -2186,6 +2199,23 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     // nth is a leaf; over a lazy seq it is re-issued as a full call.
     try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
     try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+}
+
+test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {
+    try expectOutput("[(get {(lazy-seq [1 2]) :a} [1 2]) (contains? #{[1 2]} (lazy-seq [1 2])) (= {:k (lazy-seq [1])} {:k [1]}) (pr-str [(lazy-seq [1])]) (= (hash (lazy-seq [2 3])) (hash [2 3])) (= (hash [(lazy-seq [2 3])]) (hash [[2 3]])) (str (lazy-seq [1 2]))]", "[:a true true [(1)] true true (1 2)]");
+    // A nested body's throw surfaces from the native or opcode that
+    // compared or hashed; the first of two wins.
+    try expectOutput("(try (= [(lazy-seq (throw :x))] [[1]]) (catch any e e))", ":x");
+    try expectOutput("(try #{(lazy-seq (throw :y)) []} (catch any e e))", ":y");
+    try expectOutput("(try {[] 1 (lazy-seq (throw :z)) 2} (catch any e e))", ":z");
+    try expectOutput("(try (hash [(lazy-seq (throw :a)) (lazy-seq (throw :b))]) (catch any e e))", ":a");
+    try expectOutput("[(try (hash [(lazy-seq (throw :a))]) (catch any e e)) (= [(lazy-seq [1])] [[1]]) (contains? #{[1]} (lazy-seq [1]))]", "[:a true true]");
+    // = walks in step: an infinite seq against a finite one ends.
+    try expectOutput("(do (defn nat [n] (lazy-seq (cons n (nat (inc n))))) [(= (nat 0) [0 1]) (= [0 1] (nat 0)) (= [(nat 0)] [[0 1]]) (not= (nat 0) '(0))])", "[false false false true]");
+    // An in-place edit of a transient realizes its key first, so the
+    // body's own edit of the transient is complete before it starts.
+    try expectOutput("(let [t (transient {})] (assoc! t (lazy-seq (assoc! t :x 1) [1]) 2) (persistent! t))", "{:x 1, (1) 2}");
+    try expectOutput("(let [t (transient #{})] (persistent! (conj! t (lazy-seq [1]) [1] (lazy-seq [2]))))", "#{(1) (2)}");
 }
 
 test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
@@ -6026,6 +6056,31 @@ test "gc: a native walking a lazy seq that collects at every step keeps what it 
     // A body that returns the next block forwards to it: a long run of
     // them costs no native stack, and each block stays reachable.
     try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
+}
+
+test "gc: = and hash realize a lazy key in isolation, with no cycle inside the build" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.stress);
+    _ = try program.run(churn ++ "(def ks (mapv (fn [i] (lazy-seq (churn i) [i (str i)])) (range 20)))");
+    const ks = program.registry.current.lookupLocal("ks").?.root;
+    const heap = program.v.ensureHeap();
+    const saved = program.v.installLazyHost();
+    defer nx.lazy.host = saved;
+    // Nothing roots the maps built here: no cycle may run while a
+    // key's body churns the heap.
+    const cycles = program.v.gc_cycles;
+    var m = try nx.champ.mapEmpty(heap);
+    for (0..20) |i| m = try nx.champ.mapAssoc(heap, m, nx.vector.nth(ks, i), value_mod.fromFixnum(@intCast(i)).?, &nx.dispatch.hashValue, &nx.dispatch.equal);
+    try testing.expectEqual(cycles, program.v.gc_cycles);
+    try testing.expectEqual(@as(usize, 20), nx.champ.mapCount(m));
+    const key = try nx.vector.fromSlice(heap, &.{ value_mod.fromFixnum(13).?, try nx.string.fromBytes(heap, "13") });
+    switch (nx.champ.mapGet(m, key, &nx.dispatch.hashValue, &nx.dispatch.equal)) {
+        .present => |v| try testing.expectEqual(@as(i64, 13), v.asFixnum()),
+        .absent => return error.TestUnexpectedResult,
+    }
+    try testing.expect(program.v.parked_realize == null);
 }
 
 test "gc: a vector view alone keeps its vector alive across cycles" {

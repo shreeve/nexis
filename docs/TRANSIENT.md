@@ -184,7 +184,7 @@ seqable (`seq` of one is `:kind-mismatch`).
 
 **Zig API** (`src/coll/transient.zig`). Map and set operations take the
 `elementHash`/`elementEq` callbacks their persistent counterparts take,
-and the edits the overflow count (`dispatch.overflowCount`) they check
+and the edits the spoil count (`dispatch.spoilCount`) they check
 their lookup against; mutating operations take the heap and return the
 same transient.
 

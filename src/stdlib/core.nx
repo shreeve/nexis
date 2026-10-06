@@ -34,6 +34,12 @@
 (defmacro lazy-cat [& colls]
   `(concat ~@(map (fn* [c] `(lazy-seq ~c)) colls)))
 
+; The barrier through which = and hash realize a lazy block they meet
+; (docs/LAZY.md §6): [true seq], or [false thrown] for a throw, which
+; the VM parks.
+(defn- realize-caught [s]
+  (try [true (nexis.internal/#%force s)] (catch any e [false e])))
+
 ; (drop n coll) → a seq of coll without its first n elements, () when
 ; none are left.
 (defn drop [n s]

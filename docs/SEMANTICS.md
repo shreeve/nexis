@@ -183,14 +183,16 @@ collection.
 
 `=`, `hash` and printing recurse on nesting depth on the native stack.
 Past the stack guard (`src/stack.zig`) they do not fault: the step that
-ran out answers `false`, `0` or a `#<too deep>` marker and counts an
-overflow (`dispatch.overflowCount`), and the VM turns a count that
-changed across a native call or opcode into the catchable
-`:stack-overflow` (`docs/VM.md` §13.1). The raise consumes the
-overflows it reports, as does a native call that fails, so one overflow
-raises once: a callback that catches it returns normally to the native
-that called it. A map, set or record whose hash
-was computed past an overflow keeps no cached hash, so the wrong answer
+ran out answers `false`, `0` or a `#<too deep>` marker and counts a
+spoil (`dispatch.spoilCount`), and the VM turns a count that changed
+across a native call or opcode into the catchable `:stack-overflow`
+(`docs/VM.md` §13.1). A lazy seq nested in what `=` or `hash` walks,
+whose body throws while they realize it, spoils the answer the same
+way, and the VM raises the parked throw instead (`docs/LAZY.md` §6).
+The raise consumes the spoils it reports, as does a native call that
+fails, so one spoil raises once: a callback that catches it returns
+normally to the native that called it. A map, set or record whose hash
+was computed past a spoil keeps no cached hash, so the wrong answer
 never outlives the throw. The codec walks nesting with a heap stack
 and has no depth bound (`docs/CODEC.md` §2.7).
 

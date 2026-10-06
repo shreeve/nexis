@@ -367,10 +367,13 @@ pub const Loader = struct {
 
     /// A failure of an `on_value` or `on_routine` callback (the REPL
     /// or `-e` printing a value, `disasm` printing a routine): out of
-    /// memory as itself, anything else, such as a closed stdout, as a
-    /// diagnostic naming it, never a runtime error the VM did not have.
+    /// memory as itself, a runtime error realizing the value to print
+    /// as one, anything else, such as a closed stdout, as a diagnostic
+    /// naming it, never a runtime error the VM did not have.
     fn callbackFailure(self: *Loader, err: anyerror) EvalError {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        // Realizing a printed result failed (docs/LAZY.md §8).
+        if (err == error.RunFailed) return error.RunFailed;
         self.diagnose(.{ .label = "" }, "cannot write the result: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }

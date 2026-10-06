@@ -504,6 +504,8 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%delay", 1, 1, &fnDelay },
     // lazy-seq: an unrealized block over the body's function (core.nx).
     .{ "#%lazy-seq", 1, 1, &fnLazySeq },
+    // The force under realize-caught (core.nx, docs/LAZY.md §6).
+    .{ "#%force", 1, 1, &fnForce },
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
@@ -3258,7 +3260,10 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     var txn = try beginWrite(vm, conn);
     db_mod.putRef(&txn, r, v) catch |err| {
         db_mod.abortWrite(&txn);
-        return dbFailure(vm, err);
+        if (err != error.Unrealized) return dbFailure(vm, err);
+        // Realized outside the transaction, which is begun again.
+        try seq_mod.realizeAll(vm, v);
+        return fnDbPutKey(vm, args);
     };
     db_mod.commit(&txn) catch |err| return dbFailure(vm, err);
     return value_mod.nilValue();
@@ -3423,8 +3428,18 @@ fn fnDbPut(vm: *VM, args: []const Value) VmError!Value {
     const r = args[1];
     const v = args[2];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    db_mod.putRef(txn, r, v) catch |err| return dbFailure(vm, err);
+    try putRealizing(vm, txn, r, v);
     return value_mod.nilValue();
+}
+
+/// `db.putRef`, realizing `v` and encoding it again when the codec
+/// finds a lazy seq in it that has not run (docs/LAZY.md §8).
+fn putRealizing(vm: *VM, txn: *db_mod.WriteTxn, r: Value, v: Value) VmError!void {
+    db_mod.putRef(txn, r, v) catch |err| {
+        if (err != error.Unrealized) return dbFailure(vm, err);
+        try seq_mod.realizeAll(vm, v);
+        db_mod.putRef(txn, r, v) catch |again| return dbFailure(vm, again);
+    };
 }
 
 /// `(db/get tx ref)` or `(db/get tx ref default)` — read through
@@ -3705,6 +3720,11 @@ fn fnLazySeq(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_thunk, args[0..1]);
 }
 
+/// `(#%force s)` → the seq of `s`, any seqable.
+fn fnForce(vm: *VM, args: []const Value) VmError!Value {
+    return seq_mod.seqOf(vm, args[0]);
+}
+
 /// `@d` of a delay: `(nexis.core/force d)`.
 fn forceDelay(vm: *VM, d: Value) VmError!Value {
     const registry = if (vm.home().registry) |*r| r else return VmError.NotDerefable;
@@ -3858,12 +3878,15 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     //    propagate UNCHANGED so the with-tx's catch can abort. NO
     //    write on error.
     h.held += 1;
-    const called = vm.callValue(f, call_args);
-    h.held -= 1;
-    const new_value = try called;
+    defer h.held -= 1;
+    const new_value = try vm.callValue(f, call_args);
 
-    // 4. Write.
-    db_mod.putRef(&h.txn.write, r, new_value) catch |err| return dbFailure(vm, err);
+    // 4. Write; a lazy result is realized with the transaction still
+    //    held, and rooted while it is.
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(new_value);
+    try putRealizing(vm, &h.txn.write, r, new_value);
     return new_value;
 }
 
@@ -3913,16 +3936,21 @@ fn fnPersistentBang(vm: *VM, args: []const Value) VmError!Value {
 // several edits stops there, the edits before it kept (TRANSIENT.md
 // §6, SEMANTICS §2.7).
 
+// A key or element is realized before the in-place edit starts
+// (docs/LAZY.md §6), so no code runs in the middle of an edit of a
+// transient the code can reach.
 fn assocBang(vm: *VM, t: Value, k: Value, v: Value) VmError!void {
-    const before = dispatch_mod.overflowCount();
-    _ = transient_mod.mapAssocBang(vm.ensureHeap(), t, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.overflowCount) catch |err| return transientFailure(vm, err);
-    if (dispatch_mod.overflowCount() != before) return VmError.StackOverflow;
+    try seq_mod.realizeAll(vm, k);
+    const before = dispatch_mod.spoilCount();
+    _ = transient_mod.mapAssocBang(vm.ensureHeap(), t, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.spoilCount) catch |err| return transientFailure(vm, err);
+    try vm.checkDeepData(before);
 }
 
 fn conjBangSet(vm: *VM, t: Value, x: Value) VmError!void {
-    const before = dispatch_mod.overflowCount();
-    _ = transient_mod.setConjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.overflowCount) catch |err| return transientFailure(vm, err);
-    if (dispatch_mod.overflowCount() != before) return VmError.StackOverflow;
+    try seq_mod.realizeAll(vm, x);
+    const before = dispatch_mod.spoilCount();
+    _ = transient_mod.setConjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.spoilCount) catch |err| return transientFailure(vm, err);
+    try vm.checkDeepData(before);
 }
 
 /// `(conj! t x & xs)`; `(conj!)` is a transient vector, `(conj! t)` t.
@@ -3962,7 +3990,11 @@ fn conjBangMap(vm: *VM, t: Value, x: Value) VmError!void {
             var it = MapEntries.of(x).?;
             while (it.next()) |e| try assocBang(vm, t, e.key, e.value);
         },
-        .persistent_vector => try assocBang(vm, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1)),
+        .persistent_vector => {
+            // The entry is the argument; its key is realized through it.
+            try seq_mod.realizeAll(vm, x);
+            try assocBang(vm, t, vector_mod.nth(x, 0), vector_mod.nth(x, 1));
+        },
         else => {},
     }
 }
@@ -4000,9 +4032,10 @@ fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
     const t = args[0];
     if (try requireTransient(t) != transient_mod.subkind_transient_map) return VmError.KindMismatch;
     for (args[1..]) |k| {
-        const before = dispatch_mod.overflowCount();
-        _ = transient_mod.mapDissocBang(vm.ensureHeap(), t, k, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.overflowCount) catch |err| return transientFailure(vm, err);
-        if (dispatch_mod.overflowCount() != before) return VmError.StackOverflow;
+        try seq_mod.realizeAll(vm, k);
+        const before = dispatch_mod.spoilCount();
+        _ = transient_mod.mapDissocBang(vm.ensureHeap(), t, k, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.spoilCount) catch |err| return transientFailure(vm, err);
+        try vm.checkDeepData(before);
     }
     return t;
 }
@@ -4012,9 +4045,10 @@ fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
     const t = args[0];
     if (try requireTransient(t) != transient_mod.subkind_transient_set) return VmError.KindMismatch;
     for (args[1..]) |x| {
-        const before = dispatch_mod.overflowCount();
-        _ = transient_mod.setDisjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.overflowCount) catch |err| return transientFailure(vm, err);
-        if (dispatch_mod.overflowCount() != before) return VmError.StackOverflow;
+        try seq_mod.realizeAll(vm, x);
+        const before = dispatch_mod.spoilCount();
+        _ = transient_mod.setDisjBang(vm.ensureHeap(), t, x, &dispatch_mod.hashValue, &dispatch_mod.equal, &dispatch_mod.spoilCount) catch |err| return transientFailure(vm, err);
+        try vm.checkDeepData(before);
     }
     return t;
 }
@@ -4079,7 +4113,7 @@ fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
                 next += 1;
                 switch (conv) {
                     's' => {
-                        if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(&piece, a, interner);
+                        if (a.isNil()) w.writeAll("nil") catch return VmError.OutOfMemory else try appendStrValue(vm, &piece, a);
                         if (precision) |p| piece.shrinkRetainingCapacity(try codepointPrefix(piece.written(), p));
                     },
                     'd' => {
@@ -4263,11 +4297,15 @@ fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
 /// prints it, so the strings inside a collection keep their quotes.
 /// Used by `str`, `join` and `spit`.
 fn appendStrValue(
+    vm: *VM,
     w: *std.Io.Writer.Allocating,
     v: Value,
-    interner: ?*const intern_mod.Interner,
 ) VmError!void {
     if (v.kind() == .nil) return;
+    const interner = vm.ensureInterner();
+    // The printer runs no code: every lazy seq in `v` is realized
+    // first, in native context (docs/LAZY.md §8).
+    try seq_mod.realizeAll(vm, v);
     // A float by itself is Java's `toString` (`Infinity`), as Clojure's
     // `str` makes it; inside a collection it prints readable (`##Inf`).
     if (v.isFloat()) return format_mod.formatFloatJava(v.asFloat(), &w.writer) catch return VmError.OutOfMemory;
@@ -4336,8 +4374,7 @@ fn fnStr(vm: *VM, args: []const Value) VmError!Value {
 fn strFormatted(vm: *VM, args: []const Value) VmError!Value {
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    const interner = vm.ensureInterner();
-    for (args) |x| try appendStrValue(&w, x, interner);
+    for (args) |x| try appendStrValue(vm, &w, x);
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
 
@@ -4597,13 +4634,12 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     if (try joinPlain(vm, sep, coll)) |joined| return joined;
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    const interner = vm.ensureInterner();
     var it = try makeSeqIter(vm, coll);
     var first = true;
     while (try it.next()) |x| {
         if (!first) w.writer.writeAll(sep) catch return VmError.OutOfMemory;
         first = false;
-        try appendStrValue(&w, x, interner);
+        try appendStrValue(vm, &w, x);
     }
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch VmError.OutOfMemory;
 }
@@ -4730,6 +4766,9 @@ fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
 /// failure.
 fn formatArgs(vm: *VM, w: *std.Io.Writer.Allocating, args: []const Value, mode: format_mod.FormatMode) VmError!void {
     const interner = vm.ensureInterner();
+    // The printer runs no code: every lazy seq is realized first, in
+    // native context (docs/LAZY.md §8).
+    for (args) |x| try seq_mod.realizeAll(vm, x);
     for (args, 0..) |x, i| {
         if (i > 0) w.writer.writeAll(" ") catch return VmError.OutOfMemory;
         format_mod.format(x, mode, &w.writer, interner) catch |err| switch (err) {
@@ -4831,7 +4870,7 @@ fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
     }
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    try appendStrValue(&w, args[1], vm.ensureInterner());
+    try appendStrValue(vm, &w, args[1]);
     const io = ioOf(vm);
     const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = !append }) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,

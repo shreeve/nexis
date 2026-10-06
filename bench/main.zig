@@ -225,7 +225,7 @@ fn benchTransientMapAssoc(ctx: *BuildCtx) anyerror!void {
     var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        t = try transient_mod.mapAssocBang(&heap, t, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+        t = try transient_mod.mapAssocBang(&heap, t, ctx.keys[i], ctx.vals[i], &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
     }
     const m = try transient_mod.persistentBang(t);
     std.mem.doNotOptimizeAway(m);
@@ -238,7 +238,7 @@ fn benchTransientSetConj(ctx: *BuildCtx) anyerror!void {
     var t = try transient_mod.transientFrom(&heap, base);
     var i: usize = 0;
     while (i < ctx.n) : (i += 1) {
-        t = try transient_mod.setConjBang(&heap, t, ctx.keys[i], &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+        t = try transient_mod.setConjBang(&heap, t, ctx.keys[i], &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
     }
     const s = try transient_mod.persistentBang(t);
     std.mem.doNotOptimizeAway(s);

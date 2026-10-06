@@ -217,25 +217,33 @@ pub fn realizeAll(vm: *VM, root: Value) VmError!void {
     if (!mayHoldLazy(root.kind())) return;
     var work: std.ArrayList(Value) = .empty;
     defer work.deinit(vm.allocator);
+    // Shared structure is walked once; the root's elements alone (a
+    // vector key of scalars) allocate nothing.
     var seen: std.AutoHashMapUnmanaged(u128, void) = .empty;
     defer seen.deinit(vm.allocator);
-    work.append(vm.allocator, root) catch return VmError.OutOfMemory;
+    try pushParts(vm, root, &work);
     while (work.pop()) |v| {
         const key = @as(u128, v.tag) << 64 | v.payload;
         if ((seen.getOrPut(vm.allocator, key) catch return VmError.OutOfMemory).found_existing) continue;
-        switch (v.kind()) {
-            .persistent_map, .sorted_map, .record => {
-                var it = champOrSorted(v);
-                while (it.next()) |e| {
-                    if (mayHoldLazy(e.key.kind())) work.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
-                    if (mayHoldLazy(e.value.kind())) work.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
-                }
-            },
-            else => {
-                var it = try SeqIter.init(vm, v);
-                while (try it.next()) |x| if (mayHoldLazy(x.kind())) work.append(vm.allocator, x) catch return VmError.OutOfMemory;
-            },
-        }
+        try pushParts(vm, v, &work);
+    }
+}
+
+/// Walk `v`, realizing it if it is a lazy seq, and push the parts that
+/// may hold one.
+fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value)) VmError!void {
+    switch (v.kind()) {
+        .persistent_map, .sorted_map, .record => {
+            var it = champOrSorted(v);
+            while (it.next()) |e| {
+                if (mayHoldLazy(e.key.kind())) work.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
+                if (mayHoldLazy(e.value.kind())) work.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+            }
+        },
+        else => {
+            var it = try SeqIter.init(vm, v);
+            while (try it.next()) |x| if (mayHoldLazy(x.kind())) work.append(vm.allocator, x) catch return VmError.OutOfMemory;
+        },
     }
 }
 

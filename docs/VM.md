@@ -282,7 +282,7 @@ the results, errors, error details, traces and rooting are
 **Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
 never re-enters the VM and never compares, hashes or prints nested
 data (arithmetic, numeric predicates, `nth`), so nothing under it can
-collect, grow the stack or move the deep-data overflow count (§13.1).
+collect, grow the stack or move the spoil count (§13.1).
 `call:call` passes it its arguments in place on the stack, and
 `callValue` and a `Callback` call it without the root scope, the stack
 guard or the overflow check while no cycle is due; once one is, the
@@ -440,7 +440,14 @@ the VM or a native builds within one instruction needs no rooting; a
 native that keeps a value across a call into the VM roots it
 (`docs/GC.md` §11.5). A VM over a borrowed heap (the expander's macro
 sub-VMs) has `gc_enabled = false`. `VM.collectGarbage` runs one cycle
-and sizes the next window; `gc_cycles` counts them.
+and sizes the next window; `gc_cycles` counts them. While `gc_hold` is
+nonzero no cycle is due: a lazy block is being realized in isolation
+under `=` or `hash`, whose callers hold unrooted nodes, and the
+failure of such a realization waits in `parked_realize`, a root, until
+the native call or opcode that compared or hashed raises it
+(`docs/LAZY.md` §6). A `coll` opcode copies its operands off the stack
+and reads its frame again after building, since realizing a lazy key
+runs code that may grow both.
 
 #### 9.1 Sub-VMs
 
@@ -876,10 +883,11 @@ data with heap stacks and need no guard.
 
 `=`, `hash` and printing cannot return an error to their many callers,
 so past the guard they answer `false`, `0` or `#<too deep>` and count
-an overflow (`dispatch.overflowCount`). `callDirect` snapshots the
+a spoil (`dispatch.spoilCount`). `callDirect` snapshots the
 count around every native call, and `coll:*` around its construction;
-a count that moved raises `:stack-overflow` and rewinds the count to
-the snapshot, and a native call that fails rewinds it too. An overflow
+a count that moved raises the failure an isolated realization parked
+(`docs/LAZY.md` §6), else `:stack-overflow`, and rewinds the count to
+the snapshot, and a native call that fails rewinds it too. A spoil
 is therefore reported once, by the innermost call that saw it: a
 callback that catches it returns normally through `mapv`, `reduce`,
 `swap!` or any other native that called it (SEMANTICS §2.7).

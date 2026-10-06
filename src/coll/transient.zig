@@ -40,7 +40,7 @@ const testing = std.testing;
 const ElementHash = *const fn (Value) u64;
 const ElementEq = *const fn (Value, Value) bool;
 /// The count of comparisons and hashes that ran past the stack guard
-/// (`dispatch.overflowCount`, SEMANTICS §2.7): an edit whose lookup
+/// (`dispatch.spoilCount`, SEMANTICS §2.7): an edit whose lookup
 /// raised it changes nothing.
 const Overflows = *const fn () u64;
 

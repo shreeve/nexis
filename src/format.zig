@@ -118,7 +118,7 @@ pub fn format(
         .string => try formatString(string_mod.asBytes(v), mode, writer),
         .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
             stack.check() catch {
-                dispatch.noteOverflow();
+                dispatch.noteSpoiled();
                 return writer.writeAll("#<too deep>");
             };
             switch (v.kind()) {
@@ -706,10 +706,10 @@ test "a collection nested past the stack guard prints #<too deep> and counts an 
 
     defer stack.arm(stack.main_thread_budget);
     stack.arm(64 * 1024);
-    const before = dispatch.overflowCount();
+    const before = dispatch.spoilCount();
     const got = try formatForTest(v, .readable, null);
     defer testing.allocator.free(got);
     try testing.expect(std.mem.find(u8, got, "[#<too deep>]") != null);
     try testing.expect(std.mem.startsWith(u8, got, "[[[") and std.mem.endsWith(u8, got, "]]]"));
-    try testing.expect(dispatch.overflowCount() > before);
+    try testing.expect(dispatch.spoilCount() > before);
 }

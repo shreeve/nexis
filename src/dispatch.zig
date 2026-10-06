@@ -25,16 +25,18 @@
 //!     module's structural rule, and mixes its own kind byte into its
 //!     hash.
 //!
-//! **Native stack.** `=` and `hash` recurse on nesting depth. Each
+//! **Spoiled answers.** `=` and `hash` recurse on nesting depth. Each
 //! structural step checks the stack guard (`stack.zig`); a value too
 //! deep for the stack that remains makes the step answer `false` or
-//! `0` and counts an overflow instead of faulting. The callers of `=`
-//! and `hash` are too many to thread an error through, so the VM reads
-//! `overflowCount` around each native call and opcode that compares or
-//! hashes and turns a change into the catchable `:stack-overflow`
-//! (SEMANTICS §2.7), rewinding the count as it does so that one
-//! overflow is reported once, by the innermost call that saw it. A
-//! map, set or record whose hash was computed past an overflow keeps
+//! `0` and counts a spoil instead of faulting. A lazy block that could
+//! not be realized in isolation (its body threw, which the VM parks)
+//! spoils the answer the same way. The callers of `=` and `hash` are
+//! too many to thread an error through, so the VM reads `spoilCount`
+//! around each native call and opcode that compares or hashes and
+//! turns a change into the parked throw, or else the catchable
+//! `:stack-overflow` (SEMANTICS §2.7), rewinding the count as it does
+//! so that one spoil is reported once, by the innermost call that saw
+//! it. A map, set or record whose hash was computed past a spoil keeps
 //! no cached hash.
 
 const std = @import("std");
@@ -107,31 +109,32 @@ pub fn domainByte(k: Kind) u8 {
 }
 
 // =============================================================================
-// Native-stack overflows
+// Spoiled answers
 // =============================================================================
 
 /// Per thread, as the guard it counts the hits of (`stack.zig`).
-threadlocal var overflow_count: u64 = 0;
+threadlocal var spoil_count: u64 = 0;
 
 /// How many times `equal`, `hashValue` or the printer ran out of
-/// native stack on this thread. A caller that sees the count change
-/// across a call knows the call's answer is meaningless and raises
-/// `:stack-overflow` instead.
-pub fn overflowCount() u64 {
-    return overflow_count;
+/// native stack, or met a lazy block they could not realize, on this
+/// thread. A caller that sees the count change across a call knows the
+/// call's answer is meaningless and raises instead.
+pub fn spoilCount() u64 {
+    return spoil_count;
 }
 
-/// Record that a recursion on data depth stopped at the stack guard.
-pub fn noteOverflow() void {
-    overflow_count +%= 1;
+/// Record that a recursion on data depth stopped at the stack guard,
+/// or that a lazy block could not be realized.
+pub fn noteSpoiled() void {
+    spoil_count +%= 1;
 }
 
-/// Consume the overflows counted since `before`: the caller has turned
+/// Consume the spoils counted since `before`: the caller has turned
 /// them into a throw (or abandoned the answer they spoiled), so a
 /// caller further out that took its snapshot earlier must not see them
 /// again.
-pub fn rewindOverflows(before: u64) void {
-    overflow_count = before;
+pub fn rewindSpoils(before: u64) void {
+    spoil_count = before;
 }
 
 // =============================================================================
@@ -152,11 +155,11 @@ pub fn heapHashBase(v: Value) u64 {
     std.debug.assert(k.isHeap());
     if (isIdentityKind(k)) return hash_mod.hashU64(v.payload);
     stack.check() catch {
-        noteOverflow();
+        noteSpoiled();
         return 0;
     };
     const h = Heap.asHeapHeader(v);
-    const overflows_before = overflow_count;
+    const spoils_before = spoil_count;
     const base: u64 = switch (k) {
         .string => string.hashHeader(h),
         .bignum => bignum.hashHeader(h),
@@ -175,7 +178,7 @@ pub fn heapHashBase(v: Value) u64 {
         .nextomic_entity => nextomic_handle.entityHash(h),
         else => std.debug.panic("dispatch.hashValue: kind {s} is never constructed", .{@tagName(k)}),
     };
-    if (overflow_count != overflows_before) h.setCachedHash(0);
+    if (spoil_count != spoils_before) h.setCachedHash(0);
     return base;
 }
 
@@ -197,7 +200,7 @@ pub fn equal(a: Value, b: Value) bool {
     // Distinct identity values: the bit test above already said no.
     if (isIdentityKind(ka)) return false;
     stack.check() catch {
-        noteOverflow();
+        noteSpoiled();
         return false;
     };
     const ah = Heap.asHeapHeader(a);
@@ -228,7 +231,7 @@ pub fn equal(a: Value, b: Value) bool {
 /// when their orders differ.
 fn mixedEqual(a: Value, b: Value) bool {
     stack.check() catch {
-        noteOverflow();
+        noteSpoiled();
         return false;
     };
     if (collCount(a) != collCount(b)) return false;
@@ -320,7 +323,7 @@ fn sortedByScan(a: Value, b: Value) bool {
 /// A list against a vector: one streaming walk over both.
 fn sequentialEqual(a: Value, b: Value) bool {
     stack.check() catch {
-        noteOverflow();
+        noteSpoiled();
         return false;
     };
     const l, const v = if (a.kind() == .list) .{ a, b } else .{ b, a };
@@ -350,7 +353,7 @@ const SeqWalk = union(enum) {
             .seq => |*c| while (true) {
                 return c.next() catch {
                     if (lazy.realizeIsolated(c.pending()) == null) {
-                        noteOverflow();
+                        noteSpoiled();
                         return error.Spoiled;
                     }
                     continue;
@@ -365,7 +368,7 @@ const SeqWalk = union(enum) {
 /// finite one is decided at the finite one's end.
 fn walkEqual(a: Value, b: Value) bool {
     stack.check() catch {
-        noteOverflow();
+        noteSpoiled();
         return false;
     };
     var wa = SeqWalk.init(a);
@@ -479,11 +482,11 @@ test "a lazy cons over a list and a chunked cons equal the list and hash alike" 
     try expectSame(empty_seq, try vector.empty(&heap));
     try expectDifferent(empty_seq, value.nilValue());
     // A block whose body cannot run here spoils the answer.
-    const n0 = overflowCount();
+    const n0 = spoilCount();
     const pending = try lazy.unrealized(&heap, 0, &.{value.nilValue()});
     try testing.expect(!equal(pending, want));
-    try testing.expect(overflowCount() > n0);
-    rewindOverflows(n0);
+    try testing.expect(spoilCount() > n0);
+    rewindSpoils(n0);
 }
 
 test "maps and sets: equal across insertion orders and subkinds; never equal to each other or to a sequence" {
@@ -564,16 +567,16 @@ test "stack guard: = and hash on data too deep for the stack count an overflow i
     defer stack.arm(stack.main_thread_budget);
     stack.arm(64 * 1024);
     const shallow = try nest(&heap, 3);
-    const n0 = overflowCount();
+    const n0 = spoilCount();
     try testing.expect(equal(shallow, try nest(&heap, 3)));
     _ = hashValue(shallow);
-    try testing.expectEqual(n0, overflowCount());
+    try testing.expectEqual(n0, spoilCount());
 
     try testing.expect(!equal(deep_a, deep_b));
-    try testing.expect(overflowCount() > n0);
-    const n1 = overflowCount();
+    try testing.expect(spoilCount() > n0);
+    const n1 = spoilCount();
     _ = hashValue(m);
-    try testing.expect(overflowCount() > n1);
+    try testing.expect(spoilCount() > n1);
     // The map computed its hash past the overflow and keeps none.
     try testing.expect(Heap.asHeapHeader(m).cachedHash() == null);
 }

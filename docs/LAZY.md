@@ -180,3 +180,94 @@ end, as `LazySeq.equiv` walks.
 depth, walking its seqs, vectors, maps, sets and records with an
 explicit stack: what the code that runs no code needs before it
 walks a value.
+
+---
+
+### 6. Where realization happens
+
+**Native context.** A native, an opcode, the expander or a host that
+holds a VM realizes through `seq.force` and the walks built on it
+(§4, §5). Running a body may collect: every such call is a call back
+into the VM for `docs/GC.md` §11.5, class 5. Errors are ordinary
+`VmError`s, `ControlTransferred` included.
+
+**Isolated context.** `=` and `hash` (`src/dispatch.zig`) have neither
+a VM nor an error path, and their callers (CHAMP, the sorted tree,
+transients, a map or set literal, the Nextomic relation code) hold
+unrooted nodes. A lazy block they meet is realized through
+`lazy.realizeIsolated`:
+
+- `lazy.host`, per thread, names the innermost running VM. `VM.run`
+  and `VM.runRoutine` install themselves and restore the previous host
+  on return, so a macro's sub-VM realizes on itself, sharing its
+  owner's heap; `VM.realizeOutside` installs the VM for a host that
+  realizes a value outside any run.
+- The VM raises `gc_hold`, under which no cycle is due, so the
+  callers' unrooted nodes are safe, and calls the closure
+  `nexis.core/realize-caught`, `(fn [s] (try [true (#%force s)] (catch
+  any e [false e])))`. A throw is caught inside it, so nothing unwinds
+  past the native that was comparing.
+- A failure (a caught value, or an error the barrier cannot catch) is
+  parked on the VM (`parked_realize`, a root while it is parked; the
+  first wins, and later isolated realizations fail at once) and counts
+  a spoil (`dispatch.noteSpoiled`): `=` answers false, `hash` 0, and
+  no hash is cached, as for a value nested past the stack guard
+  (`docs/SEMANTICS.md` §2.7).
+- Every native call and opcode that compares or hashes already
+  snapshots the spoil count (`VM.callDirect`, the native path of
+  `call:call`, the `coll` opcodes, the transient natives). When the
+  count moved, it raises the parked failure, a thrown value through
+  `throwValue` or an error as itself, and `:stack-overflow` when none
+  is parked (`VM.checkDeepData`).
+
+What a program sees: `(get {(lazy-seq [1 2]) :a} [1 2])` is `:a`, and
+`(try (= [(lazy-seq (throw :x))] [[1]]) (catch any e e))` is `:x`.
+The one wart: a native that compares or hashes a lazy seq nested
+inside other structure whose body throws finishes its own loop, with
+spoiled answers, before the throw surfaces, because `dispatch` cannot
+stop it. Natives confine it to nested seqs: `=` walks its own
+arguments in native context (§5), and the transient natives (`conj!`,
+`assoc!`, `dissoc!`, `disj!`) realize the key or element they are
+given (`seq.realizeAll`) before the in-place edit starts, so no code
+runs in the middle of an edit of a transient the code can reach: `(let
+[t (transient {})] (assoc! t (lazy-seq (assoc! t :x 1) [1]) 2))`
+completes the inner `assoc!` before the outer one begins. A key
+already in a hashed collection was realized when it was hashed.
+
+A coll opcode that hashes copies its operands off the stack before it
+builds, and reads its frame again after: running a body can grow the
+stack and the frames.
+
+**Never realized by**: `compare` (a lazy seq has no natural order:
+`:kind-mismatch`, as a list), `identical?`, `meta`, `class`, `seq?` and
+the other kind predicates, and `realized?`.
+
+---
+
+### 8. Printing, storage and the codec
+
+**Printing.** The printer (`src/format.zig`) runs no code: a block
+whose body has not run prints as `...` (`(0 ...)`), which an error
+report shows when the value it names holds one. Everything that prints
+a value a program will see realizes it first, in native context
+(`seq.realizeAll`): `pr`, `prn`, `print`, `println`, `pr-str`, `str`,
+`format`'s `%s`, `nexis.string/join` and `spit`, and the REPL and `-e`
+before they print a result (`VM.realizeOutside`). A throw while a
+result realizes is reported as an evaluation's runtime error, with its
+trace, and the REPL binds it to `*e` and goes on. A lazy seq prints as
+a list, `(lazy-seq nil)` as `()`; `str` of one is its printed text
+(Clojure's is `clojure.lang.LazySeq@` and a hash).
+
+**The codec** never realizes (`docs/CODEC.md` §3): a realized lazy seq
+is written as the list of its elements, and one any block of which has
+not run is `error.Unrealized`, on which the storage native
+(`db/put!`, `db/put-key!`, `db/alter!`'s result) realizes the value and
+encodes it again; `db/put-key!` realizes it outside the transaction
+and begins the write again. Decoding gives a list, `=` to the seq and
+hashed alike.
+
+**`db/*`.** The storage natives stay eager: `db/scan` returns a
+realized list. A lazy seq whose body reads a transaction realizes when
+it is walked: walked after `with-tx` or `with-read-tx` closed it, it
+raises `:tx-closed`, as `line-seq` outside `with-open` does in
+Clojure. `doall` or `mapv` inside the block is the remedy.
