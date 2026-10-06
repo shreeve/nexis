@@ -54,17 +54,28 @@ changes to emdb.
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 206 steps (204 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
+| `zig build test --summary all` | the gate, 212 steps (210 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
 | `zig build check-targets` | compiles and links every binary and test binary for x86_64 and aarch64 Linux, glibc and musl (the static binary), from any host; runs nothing |
+| `zig build codegen` | disassembles the fast dispatch handlers of the arm64 and x86-64 Linux release builds (`test/codegen.sh`) and fails when one keeps a stack frame or calls anything (`docs/VM.md` §8); needs an LLVM objdump (Xcode's on macOS), and says so and passes without one |
 
 - `-Dupdate=true` on `test`, `golden`, `examples` or `nextomic-nx`
   rewrites every expected-output file the step compares; read the diff
   before committing it.
 - `-Doptimize=fast` applies to any step (`debug`, `safe`, `fast`,
   `small`). A debug binary is not a performance measurement.
+- Every runtime the build compiles embeds the stdlib image, which the
+  build makes first by running `nexis-imagegen` (`src/imagegen.zig`,
+  a debug build for the host) over the embedded sources; an edit to a
+  `src/stdlib/*.nx` file or to any file the generator compiles makes a
+  new one (`docs/STDLIB.md` §1).
+- `-Dopcodes=true` builds a `bin/nexis` that counts every dispatch by
+  opcode and every native call and prints them as CSV on stderr at
+  exit (`docs/TOOLING.md` §1); the micro kit, `bench/micro/run.clj`,
+  measures what an iteration of each `bench/micro/*.nx` costs
+  (`docs/BENCH.md` §13).
 - The runtime reads three environment variables. `NEXIS_GC_STRESS=1`
   makes every VM collect every 4 KiB of allocation (`docs/GC.md` §7);
   `zig build test -Dgc-stress` sets it on every test and program the
@@ -142,7 +153,7 @@ nexis/
 ├── AGENTS.md HANDOFF.md README.md PLAN.md CLOJURE-REVIEW.md ZIG.md
 ├── TODO.md                      problems found and not yet fixed
 ├── build.zig, build.zig.zon     emdb is a path dependency (../emdb)
-├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, fmt, parser-check, an optimized build
+├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, codegen, fmt, parser-check, an optimized build
 ├── nexis.grammar                reader grammar (source of truth for src/parser.zig)
 ├── src/
 │   ├── root.zig                 the `nexis` module: declares every runtime file, bottom-up
@@ -158,7 +169,9 @@ nexis/
 │   ├── db.zig                   emdb connections, durable refs, transaction handles
 │   ├── stdlib.zig, stdlib/*.nx  native tables; core nextomic test pprint math string set .nx embedded at build
 │   ├── loader.zig disasm.zig bench.zig
-│   ├── cli.zig golden.zig       the two executable roots
+│   ├── image.zig                the stdlib image: writer, loader and comparison (docs/STDLIB.md §1)
+│   ├── cli.zig golden.zig       the CLI's and the golden runner's executable roots
+│   ├── imagegen.zig             the build's image generator, an executable run on the host
 │   └── nextomic/                root key datom store idents schema transact excise fulltext db handle
 │                                marshal relation pull natives query.zig query/{ir,parse,plan,exec,rules,natives}
 ├── docs/                        one spec per module (docs/README.md maps them)
@@ -166,13 +179,15 @@ nexis/
 │   ├── harness.zig              the pipeline harness the property and integration tests share
 │   ├── prop/ integration/       property sweeps; end-to-end suites and Nextomic corpora
 │   ├── golden/                  reader goldens, reader-error cases, CLI goldens
+│   ├── codegen.sh               the codegen check of the fast dispatch handlers
 │   ├── nextomic/                end-to-end .nx scripts and their .out
 │   ├── regex/                   the engine against java.util.regex: corpus.json, its bb generators, the suite
 │   └── examples/                the pinned output of every examples/*.nx
 ├── examples/                    working .nx programs (examples/README.md)
 ├── bench/                       main.zig (the harness), nextomic.zig (its Nextomic scenarios),
 │                                compare/ (nexis against babashka and JVM Clojure, Nextomic
-│                                against Datalevin and Datomic; docs/BENCH.md §12)
+│                                against Datalevin and Datomic; docs/BENCH.md §12),
+│                                micro/ (the interpreter's micro kit; docs/BENCH.md §13)
 └── bin/                         build output
 ```
 
