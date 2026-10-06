@@ -8,6 +8,8 @@
 const std = @import("std");
 const reader_mod = @import("reader.zig");
 const intern_mod = @import("intern.zig");
+const seq_mod = @import("seq.zig");
+const lazy_mod = @import("coll/lazy.zig");
 const vm_mod = @import("vm.zig");
 const value_mod = @import("value.zig");
 const list_mod = @import("coll/list.zig");
@@ -1249,7 +1251,18 @@ fn callUserMacro(
         if (sub_vm.error_detail.len > 0) return ctx.fail(span, "macro {s} failed: {s}: {s}", .{ name, @errorName(err), sub_vm.error_detail });
         return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
     };
-    return try valueToForm(ctx, result_value, span);
+    // The form is data: every lazy seq in it is realized, on the
+    // sub-VM, and made a list (docs/LAZY.md §8).
+    const saved = sub_vm.installLazyHost();
+    defer lazy_mod.host = saved;
+    const listed = seq_mod.asLists(&sub_vm, result_value) catch |err| {
+        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
+        if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
+            return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
+        };
+        return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
+    };
+    return try valueToForm(ctx, listed, span);
 }
 
 /// A thrown value in a failure message: a string as itself, a

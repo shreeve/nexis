@@ -2218,6 +2218,15 @@ test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere
     try expectOutput("(let [t (transient #{})] (persistent! (conj! t (lazy-seq [1]) [1] (lazy-seq [2]))))", "#{(1) (2)}");
 }
 
+test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
+    try expectOutput("(do (defmacro m [] (lazy-seq (list '+ 1 2))) (m))", "3");
+    try expectOutput("(do (defmacro m2 [] (list 'quote (lazy-seq [1 (lazy-seq [2])]))) [(m2) (class (m2)) (class (second (m2)))])", "[(1 (2)) :list :list]");
+    try expectOutput("(eval (lazy-seq (list '+ 1 2)))", "3");
+    try expectOutput("(let [xs (lazy-seq [1 2])] `(a ~@xs))", "(user/a 1 2)");
+    try expectOutput("(let [n (atom 0) xs (lazy-seq (swap! n inc) [1 2])] [`(~@xs ~@xs) @n])", "[(1 2 1 2) 1]");
+    try expectOutput("(try (let [xs (lazy-seq (throw :splice))] `(a ~@xs)) (catch any e e))", ":splice");
+}
+
 test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
     try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");

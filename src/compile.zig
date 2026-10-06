@@ -13,6 +13,7 @@ const vm = @import("vm.zig");
 const value_mod = @import("value.zig");
 const reader_mod = @import("reader.zig");
 const intern_mod = @import("intern.zig");
+const seq_mod = @import("seq.zig");
 const expand_mod = @import("expand.zig");
 const heap_mod = @import("heap.zig");
 const string_mod = @import("string.zig");
@@ -2151,7 +2152,8 @@ pub const RuntimeHooks = struct {
         defer arena.deinit();
         var ctx = self.context(arena.allocator(), v);
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
-        const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
+        // A form is data: its lazy seqs are realized and made lists.
+        const form = expand_mod.valueToForm(&ctx, try seq_mod.asLists(v, form_value), origin) catch |err|
             return failure(v, err, "macro-expansion-failure");
         const expanded = expand_mod.expandOnce(&ctx, form) catch |err|
             return failure(v, err, "macro-expansion-failure");
@@ -2206,7 +2208,8 @@ pub const RuntimeHooks = struct {
         defer scratch.deinit();
         var ctx = self.context(scratch.allocator(), v);
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
-        const form = expand_mod.valueToForm(&ctx, form_value, origin) catch |err|
+        // A form is data: its lazy seqs are realized and made lists.
+        const form = expand_mod.valueToForm(&ctx, try seq_mod.asLists(v, form_value), origin) catch |err|
             return compileFailure(v, err, "UnsupportedForm", form_value, null);
         var declared = DeclaredNames.init(v.allocator);
         defer declared.deinit();

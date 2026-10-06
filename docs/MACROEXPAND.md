@@ -109,7 +109,9 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `reduced`, `delay`, record constructors, protocol fns and `db/open`
    in a macro body see and change the program's namespaces, record
    types, protocols and stores. Its
-   result becomes a Form at the call's span (`valueToForm`), or its
+   result, every lazy seq in it realized on the sub-VM and made a list
+   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form at the call's
+   span (`valueToForm`), or its
    throw or VM error becomes the failure message (§8). The sub-VM is
    released and the result is expanded again in the call's place.
 4. **A fresh sub-VM per call**: no handler, finally or halted state
@@ -140,7 +142,9 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `read-string` its value the same way. Value → Form
    (`valueToForm`): nil, booleans, fixnums, bignums (an `int` within
    i64, else a `bigint`), floats, chars, strings, symbols, keywords,
-   lists (including a vector's seq view), vectors, maps and sets; the
+   lists (including a vector's seq view), vectors, maps and sets, after
+   every lazy seq in the value is realized and made a list (a macro's
+   result, `eval`'s and `macroexpand`'s argument); the
    list `(nexis.internal/#%meta x m)` becomes `^m x` (§5). A sorted map
    or set in the natural order becomes the list
    `(nexis.internal/#%sorted-map k v ...)` or `(nexis.internal/#%sorted-set x ...)`,

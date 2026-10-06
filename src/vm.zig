@@ -4011,6 +4011,13 @@ pub const VM = struct {
             },
             .set => champ_mod.setFromElements(heap, args, hash, eql) catch return VmError.OutOfMemory,
             .concat => blk: {
+                // A lazy part's spine is realized before anything is
+                // gathered: realizing runs code that may collect, and
+                // the gathered elements are rooted by nothing.
+                for (args) |arg| if (arg.kind() == .lazy_seq) {
+                    const ops = lazy_ops orelse return VmError.KindMismatch;
+                    try ops.realize_spine(self, arg);
+                };
                 var elements: std.ArrayList(Value) = .empty;
                 defer elements.deinit(self.allocator);
                 for (args) |arg| self.appendSeqable(&elements, arg) catch |err| return switch (err) {
@@ -4033,6 +4040,11 @@ pub const VM = struct {
             .list => {
                 var node = v;
                 while (node.kind() == .list and !list_mod.isEmpty(node)) : (node = list_mod.tail(node)) try out.append(self.allocator, list_mod.head(node));
+            },
+            // Realized by `execColl` before it gathers.
+            .lazy_seq => {
+                var c = lazy_mod.Cursor.init(v);
+                while (c.next() catch return error.KindMismatch) |x| try out.append(self.allocator, x);
             },
             .persistent_vector => {
                 const n = vector_mod.count(v);

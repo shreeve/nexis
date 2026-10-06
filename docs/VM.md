@@ -613,7 +613,7 @@ Every variant is `A=arg_base B=argc (immediate) C=dst` and reads
 | # | Name | Semantics |
 |---|---|---|
 | 0 | `coll:list` | The list of the values |
-| 1 | `coll:concat` | Each value is nil, a list, a vector, a map (its `[k v]` entries) or a set, else `:kind-mismatch`; the result is the list of all their elements left to right. The runtime of syntax-quote's `~@` |
+| 1 | `coll:concat` | Each value is nil, a list, a lazy seq (its spine realized first, `docs/LAZY.md` §8), a vector, a map (its `[k v]` entries) or a set, else `:kind-mismatch`; the result is the list of all their elements left to right. The runtime of syntax-quote's `~@` |
 | 2 | `coll:vector` | The vector of the values |
 | 3 | `coll:map` | Flat `k v` pairs (`argc` even, else `BytecodeCorruption`); a later duplicate key wins |
 | 4 | `coll:set` | The set of the values; duplicates collapse |

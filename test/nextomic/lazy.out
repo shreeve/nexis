@@ -1,0 +1,9 @@
+ok transact! takes lazy tx-data and a lazy many value
+ok q takes a lazy collection input
+ok q takes a lazy query
+ok a transaction function may return lazy tx-data
+ok a :where function's lazy result binds as a collection
+ok a pull pattern may be built lazily
+ok with takes lazy tx-data
+ok a lazy tx-data whose body throws aborts before the transaction
+:done

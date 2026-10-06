@@ -271,3 +271,14 @@ realized list. A lazy seq whose body reads a transaction realizes when
 it is walked: walked after `with-tx` or `with-read-tx` closed it, it
 raises `:tx-closed`, as `line-seq` outside `with-open` does in
 Clojure. `doall` or `mapv` inside the block is the remedy.
+
+**Code that walks a value as data.** The expander making a macro's
+result, `eval`'s or `macroexpand`'s argument a form, and the Nextomic
+natives over their arguments and over what a transaction or query
+function returns, take the value through `seq.asLists`: every lazy seq
+in it is realized and replaced by the list of its elements, the
+collections on the way to one copied (keeping their metadata) and
+everything else shared, so the code after it knows lists only and runs
+no code. A sorted collection is shared as it is, since rebuilding one
+could run its comparator. `` `(a ~@xs) `` realizes `xs`'s spine before
+it splices (`coll:concat`, `docs/VM.md` §10.8).

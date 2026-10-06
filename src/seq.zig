@@ -21,6 +21,7 @@ const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
 const string_mod = @import("string.zig");
 const record_mod = @import("record.zig");
+const dispatch_mod = @import("dispatch.zig");
 const stack_guard = @import("stack.zig");
 const vm_mod = @import("vm.zig");
 
@@ -214,37 +215,141 @@ pub fn realizeSpine(vm: *VM, x: Value, limit: ?usize) VmError!void {
 /// `root` must be rooted; everything the walk holds is reachable from
 /// it.
 pub fn realizeAll(vm: *VM, root: Value) VmError!void {
-    if (!mayHoldLazy(root.kind())) return;
+    _ = try realizeAllFound(vm, root);
+}
+
+/// `realizeAll`, answering whether `root` holds a lazy seq.
+fn realizeAllFound(vm: *VM, root: Value) VmError!bool {
+    if (!mayHoldLazy(root.kind())) return false;
     var work: std.ArrayList(Value) = .empty;
     defer work.deinit(vm.allocator);
     // Shared structure is walked once; the root's elements alone (a
     // vector key of scalars) allocate nothing.
     var seen: std.AutoHashMapUnmanaged(u128, void) = .empty;
     defer seen.deinit(vm.allocator);
-    try pushParts(vm, root, &work);
+    var found = root.kind() == .lazy_seq;
+    try pushParts(vm, root, &work, &found);
     while (work.pop()) |v| {
         const key = @as(u128, v.tag) << 64 | v.payload;
         if ((seen.getOrPut(vm.allocator, key) catch return VmError.OutOfMemory).found_existing) continue;
-        try pushParts(vm, v, &work);
+        try pushParts(vm, v, &work, &found);
     }
+    return found;
 }
 
 /// Walk `v`, realizing it if it is a lazy seq, and push the parts that
 /// may hold one.
-fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value)) VmError!void {
+fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value), found: *bool) VmError!void {
     switch (v.kind()) {
         .persistent_map, .sorted_map, .record => {
             var it = champOrSorted(v);
             while (it.next()) |e| {
-                if (mayHoldLazy(e.key.kind())) work.append(vm.allocator, e.key) catch return VmError.OutOfMemory;
-                if (mayHoldLazy(e.value.kind())) work.append(vm.allocator, e.value) catch return VmError.OutOfMemory;
+                for ([_]Value{ e.key, e.value }) |x| if (mayHoldLazy(x.kind())) {
+                    if (x.kind() == .lazy_seq) found.* = true;
+                    work.append(vm.allocator, x) catch return VmError.OutOfMemory;
+                };
             }
         },
         else => {
             var it = try SeqIter.init(vm, v);
-            while (try it.next()) |x| if (mayHoldLazy(x.kind())) work.append(vm.allocator, x) catch return VmError.OutOfMemory;
+            while (try it.next()) |x| if (mayHoldLazy(x.kind())) {
+                if (x.kind() == .lazy_seq) found.* = true;
+                work.append(vm.allocator, x) catch return VmError.OutOfMemory;
+            };
         },
     }
+}
+
+/// `v` with every lazy seq in it realized and made the list of its
+/// elements, at any depth: for code that walks a value as data and
+/// knows lists, not lazy seqs (the expander making a macro's result a
+/// form, the Nextomic parsers and marshaller; docs/LAZY.md §8). `v`
+/// itself when it holds none; otherwise a copy of the collections on
+/// the way to one, sharing the rest, each keeping its metadata. A
+/// sorted collection is shared as it is: rebuilding one could run its
+/// comparator. `v` must be rooted; the copy is not.
+pub fn asLists(vm: *VM, v: Value) VmError!Value {
+    if (!try realizeAllFound(vm, v)) return v;
+    // Nothing below runs code: every lazy seq is realized, and
+    // `Heap.alloc` never collects.
+    return listify(vm.ensureHeap(), v) catch |err| switch (err) {
+        error.StackOverflow => VmError.StackOverflow,
+        else => VmError.OutOfMemory,
+    };
+}
+
+const ListifyError = error{ StackOverflow, OutOfMemory, Unrealized };
+
+fn listify(heap: *heap_mod.Heap, v: Value) ListifyError!Value {
+    try stack_guard.check();
+    const hash = &dispatch_mod.hashValue;
+    const eql = &dispatch_mod.equal;
+    switch (v.kind()) {
+        .lazy_seq, .list => {
+            var items: std.ArrayList(Value) = .empty;
+            defer items.deinit(heap.backing);
+            var changed = v.kind() == .lazy_seq;
+            var c = lazy.Cursor.init(v);
+            while (try c.next()) |x| {
+                const y = try listify(heap, x);
+                changed = changed or !y.identicalTo(x);
+                try items.append(heap.backing, y);
+            }
+            if (!changed) return v;
+            const out = list_mod.build(heap, items.items) catch return error.OutOfMemory;
+            if (v.kind() == .list) keepMeta(v, out);
+            return out;
+        },
+        .persistent_vector => {
+            const n = vector_mod.count(v);
+            const items = try heap.backing.alloc(Value, n);
+            defer heap.backing.free(items);
+            var changed = false;
+            for (items, 0..) |*slot, i| {
+                const x = vector_mod.nth(v, i);
+                slot.* = try listify(heap, x);
+                changed = changed or !slot.identicalTo(x);
+            }
+            if (!changed) return v;
+            const out = vector_mod.fromSlice(heap, items) catch return error.OutOfMemory;
+            keepMeta(v, out);
+            return out;
+        },
+        .persistent_map, .record => {
+            const m = if (v.kind() == .record) record_mod.fieldsOf(v) else v;
+            var out = champ_mod.mapEmpty(heap) catch return error.OutOfMemory;
+            var changed = false;
+            var it = champ_mod.mapIter(m);
+            while (it.next()) |e| {
+                const k = try listify(heap, e.key);
+                const x = try listify(heap, e.value);
+                changed = changed or !k.identicalTo(e.key) or !x.identicalTo(e.value);
+                out = champ_mod.mapAssoc(heap, out, k, x, hash, eql) catch return error.OutOfMemory;
+            }
+            if (!changed) return v;
+            if (v.kind() == .record) return record_mod.withFields(heap, v, out) catch error.OutOfMemory;
+            keepMeta(v, out);
+            return out;
+        },
+        .persistent_set => {
+            var out = champ_mod.setEmpty(heap) catch return error.OutOfMemory;
+            var changed = false;
+            var it = champ_mod.setIter(v);
+            while (it.next()) |x| {
+                const y = try listify(heap, x);
+                changed = changed or !y.identicalTo(x);
+                out = champ_mod.setConj(heap, out, y, hash, eql) catch return error.OutOfMemory;
+            }
+            if (!changed) return v;
+            keepMeta(v, out);
+            return out;
+        },
+        else => return v,
+    }
+}
+
+fn keepMeta(from: Value, to: Value) void {
+    heap_mod.Heap.asHeapHeader(to).setMeta(heap_mod.Heap.asHeapHeader(from).getMeta());
 }
 
 fn mayHoldLazy(k: Kind) bool {
