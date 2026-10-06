@@ -313,8 +313,9 @@ the results, errors, error details, traces and rooting are
 
 **Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
 never re-enters the VM and never compares, hashes or prints nested
-data (arithmetic, numeric predicates, the lookups below), so nothing
-under it can collect, grow the stack or move the spoil count (§13.1).
+data (arithmetic, numeric and kind predicates, the lookups below), so
+nothing under it can collect, grow the stack or move the spoil count
+(§13.1).
 `call:call` passes it its arguments in place on the stack, and
 `callValue` and a `Callback` call it without the root scope, the stack
 guard or the overflow check while no cycle is due; once one is, the
