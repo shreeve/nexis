@@ -79,8 +79,10 @@ comments and character literals it opens or closes, and the text is
 read only when they balance, so pasting a form of n lines costs
 O(n). It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
-whatever its size. `*1`, `*2` and `*3` hold the last three values. A
-runtime error is reported on stderr, the frames, handlers and
+whatever its size, realizing a lazy seq in it first (`docs/LAZY.md`
+§8): a throw while it does is that input's runtime error, as one in
+the evaluation would be, and so it is for `nexis -e`. `*1`, `*2` and
+`*3` hold the last three values. A runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
 and `*e` is the thrown value, or for a VM error the keyword `catch`
 sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
@@ -301,15 +303,31 @@ the private helpers.
   `nexis.test`: `(is (= a 1))` as a function's body is seven
   instructions, the helper, the form, the two values, the message, the
   call and the return (COMPILER.md §4.8).
+- `(are [x y] (= x (f y)) 2 1 3 2)` is `(do (is (= 2 (f 1))) (is
+  (= 3 (f 2))))`: the template once per group of values, each
+  substituted for the names of the vector through
+  `nexis.walk/postwalk-replace`, as Clojure's `are` does through
+  `clojure.template/do-template`. A number of values that is not a
+  multiple of the names' (or values with no names) fails the
+  expansion with Clojure's message; `(are [] true)` is nil.
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
+- `(use-fixtures :once f...)` and `(use-fixtures :each f...)` set the
+  current namespace's fixtures, a later call replacing the earlier of
+  its kind; any other kind is `:invalid-argument`. A fixture is a
+  function of the function it wraps, which it calls: the `:once`
+  fixtures wrap the run of the namespace's tests, the `:each`
+  fixtures each test, the first given outermost
+  (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
+  test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
   order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
   every namespace that registered a test, in first-registration
   order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
-  test still runs.
+  test still runs. `(successful? summary)` is whether a summary has
+  no failure and no error.
 - Outside a run (at the REPL, or a test function called directly) an
   assertion judges, reports and returns as in one, but counts
   nothing; its report line names only the descriptions in force
@@ -346,14 +364,22 @@ collection one element per line, each laid out from its own column.
 Records and empty collections print flat. `test/golden/cli/pprint.out`
 pins the layout.
 
-**`nexis.math`** (`src/stdlib.zig` `math_natives`, `src/stdlib/math.nx`
-for `PI` and `E`):
+**`nexis.math`** is Clojure's `clojure.math`, which names it in
+`require` (`src/stdlib.zig` `math_natives`, `src/stdlib/math.nx` for
+`PI`, `E`, `floor-div` and `floor-mod`):
 
 | Name | Result |
 |---|---|
 | `sqrt`, `pow` | over doubles; a float for any number in the tower: `(sqrt 16)` is `4.0`, `(pow 2 10)` is `1024.0` |
+| `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp`, `expm1`, `log`, `log10`, `log1p`, `cbrt`, `hypot` | Java's `Math` method of the name over doubles, a float for any number; NaN and the infinities as IEEE and Java give them, never an error (`(log 0)` is `##-Inf`, `(asin 2)` `##NaN`, `(hypot ##Inf ##NaN)` `##Inf`). The results are the platform library's (Zig's `std.math` and the C library's `sin`, `cos`, `tan`, `exp`, `log`, `log10`), within an ulp of Java's, which leaves the last bit to the implementation too: `(log 3)` is `1.0986122886681098` here and `1.0986122886681096` on the JVM |
+| `signum` | `-1.0`, `1.0`, or a zero or NaN itself, as `Math/signum` |
+| `to-radians`, `to-degrees` | one multiplication by Java's constant, so Java's result to the bit: `(to-degrees PI)` is `180.0` |
+| `floor-div`, `floor-mod` | `Math/floorDiv` and `Math/floorMod` of the arguments as longs (a float truncated, as Clojure casts it): the quotient toward negative infinity and the remainder with the divisor's sign; any integer size; a zero divisor is `:divide-by-zero` |
 | `floor`, `ceil` | an integer unchanged; a float's floor or ceiling as a float: `(floor 2.7)` is `2.0` |
 | `round` | an integer unchanged; a float's nearest integer, halves up, as a fixnum or bignum, as Java's `Math/round`: `(round 2.5)` is `3`, `(round -2.5)` is `-2`, `(round 0.49999999999999994)` is `0`; NaN and the infinities are `:invalid-argument` |
 | `PI`, `E` | the doubles |
 
-`abs` is `nexis.core/abs`. `test/integration/numbers.zig` pins each.
+`abs` is `nexis.core/abs`. Absent from `clojure.math`: `rint`,
+`IEEE-remainder`, `copy-sign`, `ulp`, `next-after`, `next-up`,
+`next-down`, `scalb`, `get-exponent`, `random` and the `-exact`
+functions. `test/integration/numbers.zig` pins each.

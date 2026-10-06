@@ -7,6 +7,14 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
+## Gaps
+
+14. **Nextomic refuses a datom form written as a list.** `[(list
+    :db/add e a v)]` is `:nextomic/tx-data` ("a form is a vector or a
+    map"); Datomic accepts any sequential form, and a lazy seq of forms
+    is already converted at the boundary. Accept a list where a vector
+    form is accepted (`docs/NEXTOMIC.md` §3).
+
 ## Performance
 
 2. **Small transactions.** 20,000 `transact!` calls of one entity with
@@ -28,6 +36,24 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    write. The commit protocol is emdb's; nexis changes nothing in emdb
    (`AGENTS.md`), so this is the engine owner's call.
 
+13. **A lazy seq a slot holds keeps what it realized.** The VM
+    roots every slot of its stack, so a lazy seq passed to a native
+    that walks it stays realized, from its head, until the call
+    returns and the slot is reused (`docs/LAZY.md` §9): `(reduce +
+    (map inc (filter even? (map inc (range 3000000)))))` peaks at 201
+    MB, and a prototype that clears a native call's argument block
+    after it returns brought it to 63 MB. In `bench/compare`'s
+    `freq-group` the lazy `map` that `frequencies` counts is live
+    during the phase's one cycle, so it peaks at 60 MB against the
+    eager build's 40 MB (`docs/PERF.md` §3.11). The pipeline row's
+    resident set is not this: no cycle runs in its phase, and the same
+    prototype left it unchanged. Clearing a call's argument slots
+    after it returns, letting a consuming native drop its seq
+    argument's slot once its own cursor holds the walk, and clearing a
+    local's slot after its last use would give Clojure's
+    constant-memory streaming; each changes the rooting rule
+    (`docs/GC.md` §11.5) and is measured with the interpreter-speed
+    work.
 ## Store size
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's
@@ -55,6 +81,24 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    Zig is older than `build.zig.zon`'s `minimum_zig_version`; install
    the matching Zig there before rerunning `bench/compare/run.clj`
    (each download is the owner's to approve).
+
+## Deferred design
+
+Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
+
+10. **Multimethods.** `defmulti`, `defmethod`, `remove-method`,
+    `methods`, `prefer-method` with `:default`, and hierarchies
+    (`derive`, `isa?`, `parents`, `ancestors`, `descendants`,
+    `make-hierarchy`). Deferred by the owner to the next revamp
+    (PLAN §4 lists them as absent).
+11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). A macro
+    receives the call's Form (its span and metadata) and the map of
+    locals in scope. Deferred by the owner to the next revamp.
+12. **FileMan on Nextomic.** VistA's FileMan data gains Nextomic's time
+    model: every fact kept, as-of reads, provenance on each change.
+    `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
+    ways to combine them (a temporal mirror first) and a first
+    demonstration. The capture hook belongs to em's repository.
 
 ## Divergences by design, not bugs
 

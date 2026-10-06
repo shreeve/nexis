@@ -373,10 +373,30 @@ What the rows say:
 - nexis is ahead of babashka on every row: 2–4× on loops, calls
   (`fib`), `sort`, transient maps and `frequencies`/`group-by`,
   1.3–1.6× on destructuring, the map build, vector `conj`/`nth`,
-  string splitting and the `map`/`filter`/`reduce` pipeline, whose
-  sequences are eager here and lazy and chunked in babashka
-  (`docs/BENCH.md` §12). It starts in about 5 ms with a 6 MB resident
+  string splitting and the `map`/`filter`/`reduce` pipeline, measured
+  with eager sequences. It starts in about 5 ms with a 6 MB resident
   set.
+- Sequences are lazy and chunked, as babashka's (`docs/BENCH.md`
+  §12). Against the eager build `3f1f9c6`, at `c20942f`, 7
+  interleaved rounds (§11):
+  - The pipeline's timed phase retires 4.1% more instructions (949 M
+    against 912 M) and takes 16% longer (41.8 against 36.2 ms, 171.8 M
+    cycles against 148.6 M), with a resident set 2.5% smaller (189
+    against 194 MB). Each stage caches the chunks it realizes: 94,000
+    chunk steps of two blocks each, and the phase grows the resident
+    set by 36 MB where the eager build's vectors grew it by 25 MB; no
+    cycle runs in the phase, so every block is fresh memory. Fusing
+    the stages into the `reduce` would avoid the chunks, but runs a
+    function again when the same seq is also held and walked
+    elsewhere, where Clojure caches, so nexis does not.
+  - `sort` peaks at the eager build's 154 MB. `frequencies` and
+    `group-by` peak at 60 MB against 40 MB: the lazy `map` that
+    `frequencies` counts stays reachable from the call's argument
+    while the phase's one cycle runs, where the eager build's cycle
+    ran before its mapped vector existed (TODO.md #13).
+  - Startup retires 48.4 M instructions against 37.6 M (6.7 against
+    5.9 ms): the embedded library is 66 KB against 44 KB, at about
+    0.5 M instructions a KB.
 - Its resident set is below babashka's on every row but `sort`, which
   sorts through about 80 MB of buffers outside the heap (§6).
 - Nextomic is ahead of Datalevin on every phase: creating, opening,
@@ -1038,6 +1058,7 @@ is one invocation's 30-sample median.
 | §3.15 | Intel Core Ultra 9 185H (6 performance cores with 2 threads each, 8 efficiency and 2 low-power cores; 22 logical CPUs), 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, ext4 on NVMe, cpufreq governor `powersave` (left as the host has it); every process pinned with `taskset -c 0-11`, the performance cores' threads (4.8–5.1 GHz maximum); nexis `95791b0` and emdb `e4fd537` (a source snapshot, not a checkout), Zig 0.16.0, ReleaseFast; babashka v1.13.224; Datalevin 1.1.0; Temurin OpenJDK 21.0.12.1, Clojure CLI 1.12.6.1673, Clojure 1.12.6, the JDK's default flags with `-XX:-UsePerfData` and `-Djava.io.tmpdir` (the CLI adds `-XX:-OmitStackTraceInFastThrow`); Datomic Local 1.0.291; Datomic Pro 1.0.7705, dev transactor with its distribution's JVM options and the dev template's memory settings; the owner's workstation in use (1-minute load average 1.2–3.2 during the run, 2.1 at the start, 2.5 at the end) | 2026-09-28 01:51–02:17 MDT: `bb bench/compare/run.clj --n 10 --max-load 4 --pin 0-11 --no-build --impls nexis,bb,clojure,datalevin,datomic-local,datomic-pro --datomic-pro DIR --nexis-commit 95791b0 --emdb-commit e4fd537` with the ws-compare-linux `bench/`; ten rounds after a discarded warm-up (startup thirty), the implementations alternating, the Clojure warm column the median of ten calls after twenty in one JVM; every workload on its first attempt, below the load limit of 4; every answer equal; raw results kept with the run (`results.json`, `src/`). The durability of each system from `strace -f` of 200 one-datom transactions on the same host |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | the same host, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
+| §3.11 lazy sequences against the eager build | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast; shared with concurrent builds (load average 3.4–5.6) | 2026-10-06, perf-regress: the `bench/compare` bodies of `pipeline`, `sort` and `freq-group` after `prelude.nx`, and `-e nil`, run by `bin/nexis` built with `zig build install -Doptimize=fast` at `3f1f9c6`, `240c2b4` and `c20942f`, 7 interleaved rounds under `/usr/bin/time -l`; a phase's instructions and cycles are its program's minus the same program without the timed part, its time the program's own `nano-time` figure, the resident set the process's maximum; medians |
 | §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |

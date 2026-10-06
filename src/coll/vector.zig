@@ -922,6 +922,18 @@ fn pushLeaf(
 
 /// The leaf or the tail holding index `i`. Both start at a multiple
 /// of 32, so `i & branch_mask` indexes into the result.
+/// The elements from index `i` (below the count) to the end of the
+/// leaf or tail that holds it: a 32-aligned slice of the vector's own
+/// storage, read without allocating.
+pub fn chunkFrom(v: Value, i: usize) []const Value {
+    const body = rootBody(rootHeader(v));
+    std.debug.assert(i < body.count);
+    const leaf = chunkFor(body, i);
+    const base = i & ~@as(usize, branch_mask);
+    const end = @min(leaf.len, body.count - base);
+    return leaf[i - base .. end];
+}
+
 fn chunkFor(body: *const RootBody, i: usize) []const Value {
     if (i >= body.count - body.tail_len) return tailOf(body);
     return leafValues(leafFor(body, i));

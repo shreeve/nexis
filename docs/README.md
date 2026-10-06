@@ -19,6 +19,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/regex.zig`, `src/regex_tables.zig` | [`REGEX.md`](REGEX.md) | Regular expressions: Java's syntax without backtracking, a Pike VM in linear time, Java's Unicode tables (generated) |
 | `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Arbitrary-precision integers |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Lists: cons, empty, O(1) vector view |
+| `src/coll/lazy.zig`, `src/seq.zig` | [`LAZY.md`](LAZY.md) | Lazy seqs: the shapes, realizing them, walking any seqable |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector: 32-way trie with a tail |
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map and set |
 | `src/coll/sorted.zig` | [`SORTED.md`](SORTED.md) | Sorted map and set: a weight-balanced tree, the natural order, `subseq` |
@@ -32,10 +33,11 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/expand.zig`, `src/loader.zig` | [`MACROEXPAND.md`](MACROEXPAND.md) | Macroexpander, syntax-quote, host macros; §2b namespaces and the loader |
 | `src/compile.zig` | [`COMPILER.md`](COMPILER.md) | Form → Tiny → bytecode, recur and capture lowering |
 | `src/vm.zig` | [`VM.md`](VM.md) | Bytecode format, opcodes, frames, try/throw, execution errors |
-| `src/stdlib.zig`, `src/stdlib/*.nx`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, text, `nexis.string`, `nexis.set`, printing, I/O |
+| `src/stdlib.zig`, `src/stdlib/*.nx`, `src/format.zig` | [`STDLIB.md`](STDLIB.md) | Namespaces and embedded sources, text, `nexis.string`, `nexis.set`, `nexis.walk`, `nexis.edn`, printing, I/O |
 | `src/cli.zig`, `src/disasm.zig`, `src/stdlib/{test,pprint,math}.nx` | [`TOOLING.md`](TOOLING.md) | Commands, REPL, error report, disassembler, test runner, pprint, math |
 | `src/db.zig` | [`DB.md`](DB.md) | emdb connection, durable refs, the `db/*` surface |
 | `src/nextomic/` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database (authoritative): store, transactions, time, query, pull, API, errors |
 | — | [`NEXTOMIC-EMDB.md`](NEXTOMIC-EMDB.md) | What Nextomic relies on in emdb, the engine facts that shape its keys, and what not to ask of emdb |
+| — | [`FILEMAN-NEXTOMIC.md`](FILEMAN-NEXTOMIC.md) | A design note, not a spec: VistA's FileMan data on Nextomic's time model (`TODO.md` #12) |
 | `src/bench.zig`, `bench/` | [`BENCH.md`](BENCH.md) | Benchmark method and harness |
 | — | [`PERF.md`](PERF.md) | Measured numbers, levers, non-goals |

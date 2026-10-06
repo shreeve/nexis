@@ -24,7 +24,7 @@ differ, PLAN wins.
 | Maps and sets | array map, then Bagwell HAMT | array map to 8 entries, then CHAMP (§23 #37) |
 | Vector | 32-way trie with a tail | the same (§23 #30) |
 | Numbers | long, BigInt, Ratio, BigDecimal, double | fixnum + bignum, f64; no ratio or decimal (§23 #10) |
-| Sequences | lazy | eager; sequence functions return lists (§23 #14) |
+| Sequences | lazy, chunked by 32 | lazy, chunked where Clojure's are, no locals clearing (§23 #14, `docs/LAZY.md`) |
 | Identity | Vars, atoms, refs (STM), agents | Vars, atoms, durable refs over emdb; no STM or agents (§23 #5, #6) |
 | Polymorphism | protocols, records, multimethods | protocols and records; no multimethods (§23 #8, #9) |
 | Transactions | STM `dosync` | emdb read and write transactions, lexically scoped |
@@ -210,15 +210,20 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48; `+'` and its kin are the same functions, and `unchecked-add` and its kin wrap two longs at 64 bits as Clojure's do | `docs/BIGNUM.md`, `docs/SEMANTICS.md` §2.2 |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
 | `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` does not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
-| `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
-| `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
+| the seq of a map, set, string, or of a list `sort` or `keys` builds | walked one element at a time | a vector's view past three elements, so `map` over it takes 32 at a time | `docs/LAZY.md` §9 |
+| a lazy seq a local holds | let go as it is walked (locals clearing) | kept, with what it realized, until the slot is reused | `docs/LAZY.md` §9 |
+| `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
+| `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
+| a `lazy-seq` body that throws | runs again on the next walk (babashka caches an empty seq) | runs again, as JVM Clojure | `docs/LAZY.md` §4 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |
 | `(catch Exception e ...)` | by class | a class that names a nexis error takes that error's tag (`ArithmeticException` `:divide-by-zero`, `IndexOutOfBoundsException` `:index-out-of-bounds`, `ClassCastException` `:kind-mismatch`, `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause` and `:arity-mismatch`, `AssertionError` `:assertion-failed`, `StackOverflowError` `:stack-overflow`); any other class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
 | `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument); as Clojure's, `msg` is a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch` | `docs/MACROEXPAND.md` |
 | `(case x ...)` with no match | `IllegalArgumentException` | throws `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` the same | `docs/MACROEXPAND.md` |
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions` and `reduce-kv` honour it | `src/stdlib/core.nx` |
-| `(read-string s)` | the full reader | the first form as data, `^meta` on a collection kept (on a symbol dropped); syntax-quote and unquote are not data and raise `:reader-error` | `docs/MACROEXPAND.md` |
+| `(read-string s)`, `(read-string opts s)` | the full reader; `opts` takes `:eof`, `:read-cond` and `:features` | the first form as data, `^meta` on a collection kept (on a symbol dropped); syntax-quote and unquote are not data and raise `:reader-error`; `opts` takes `:eof`, the value of a string that holds no form | `docs/STDLIB.md` §2 |
+| `clojure.math` | doubles in and out; `floor` and `ceil` of a long give a double | `nexis.math`: the same functions over doubles, except that `floor` and `ceil` give an integer back unchanged (`(floor 3)` is `3`, Clojure's `3.0`); the last bit of a transcendental result is the platform library's | `docs/TOOLING.md` §4 |
+| `clojure.edn/read-string` | the EDN reader: no reader sugar, tagged literals through `:readers` and `:default` | `nexis.edn/read-string`, the nexis reader with `{:eof nil}`: `'x`, `@x` and `#()` read as the forms they stand for, and a tagged literal is a `:reader-error` whatever `:readers` holds (there are none, PLAN §4); nothing is evaluated | `docs/STDLIB.md` §4 |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message ... :form form}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
 | `(meta f)`, `(with-meta 'sym m)` | metadata on fns and symbols | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
@@ -230,7 +235,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `/` by a float zero | `ArithmeticException` when both operands are boxed (a function's arguments, `apply`); IEEE `##Inf`/`##NaN` when the compiler sees a primitive double operand (a float literal, a double local): `(/ 1.0 0)` at the REPL is `##Inf` | `:divide-by-zero` always, the boxed rule: nexis has no primitive operand types; a NaN operand is the result, as in Clojure | `docs/SEMANTICS.md` §2.2 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
 | `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; `defrecord` binds `P` to that symbol, so `(instance? P x)` reads as in Clojure | `docs/STDLIB.md` §8 |
-| namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` is `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil | `docs/STDLIB.md` §8 |
+| namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` and `*ns*` in `user` are `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil; a `binding` of `*ns*` does not change where `eval` compiles | `docs/STDLIB.md` §8 |
 | `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
 | `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |
@@ -239,8 +244,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 ### 4.4 Absences
 
 The deliberate ones are PLAN §4's non-goals: multimethods, STM,
-agents, `core.async`, lazy sequences, regex, reader conditionals,
+agents, `core.async`, regex, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
-targets, Java interop. Library functions that do not exist
-(transducers and others) are known gaps, not decisions
+targets, Java interop. Library functions that do not exist are known gaps, not decisions
 (`HANDOFF.md` §6).

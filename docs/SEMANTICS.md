@@ -139,7 +139,7 @@ qualified and an unqualified keyword are different names. `(= 'foo
 
 | Rule | `=` | `hash` |
 |---|---|---|
-| **sequential** (list, vector) | element-wise, across the two kinds | ordered combine; one shared domain byte `0xF0` |
+| **sequential** (list, vector, lazy seq) | element-wise, across the three kinds | ordered combine; one shared domain byte `0xF0` |
 | **identity** | the same value only | the pointer; the collector never moves a block |
 | **own-kind structural** | within the kind only, by the kind's structural rule | the kind's own hash; domain byte = the kind number |
 | **map, set** (hash map and sorted map; hash set and sorted set) | entry-wise, across the two kinds | unordered combine; the hash kind's number, 18 or 19 |
@@ -147,6 +147,12 @@ qualified and an unqualified keyword are different names. `(= 'foo
 - `(= (list 1 2 3) [1 2 3])` is true, and the hashes agree; a vector
   view (`(rest [1 2 3])`) is a list and follows the same rule.
 - `(= (list) [])` is true; `(= () nil)` is false.
+- A lazy seq is `=` to the list of its elements and hashes as it
+  (`LazySeq.equiv`, `hasheq`): `(= (map inc [1 2]) [2 3])` is true,
+  `(= (lazy-seq nil) [])` true and `(= (lazy-seq nil) nil)` false.
+  Comparing walks both sides in step, so a lazy seq against a shorter
+  one is decided at the shorter one's end, whether or not the lazy one
+  ends (`docs/LAZY.md` §6).
 - `(= [1 2 3] #{1 2 3})` and `(= {:a 1} [:a 1])` are false.
 - Maps compare entry-wise across their array-map and CHAMP layouts
   (subkinds of one kind) and the sorted map (a kind of its own); sets
@@ -177,14 +183,16 @@ collection.
 
 `=`, `hash` and printing recurse on nesting depth on the native stack.
 Past the stack guard (`src/stack.zig`) they do not fault: the step that
-ran out answers `false`, `0` or a `#<too deep>` marker and counts an
-overflow (`dispatch.overflowCount`), and the VM turns a count that
-changed across a native call or opcode into the catchable
-`:stack-overflow` (`docs/VM.md` §13.1). The raise consumes the
-overflows it reports, as does a native call that fails, so one overflow
-raises once: a callback that catches it returns normally to the native
-that called it. A map, set or record whose hash
-was computed past an overflow keeps no cached hash, so the wrong answer
+ran out answers `false`, `0` or a `#<too deep>` marker and counts a
+spoil (`dispatch.spoilCount`), and the VM turns a count that changed
+across a native call or opcode into the catchable `:stack-overflow`
+(`docs/VM.md` §13.1). A lazy seq nested in what `=` or `hash` walks,
+whose body throws while they realize it, spoils the answer the same
+way, and the VM raises the parked throw instead (`docs/LAZY.md` §6).
+The raise consumes the spoils it reports, as does a native call that
+fails, so one spoil raises once: a callback that catches it returns
+normally to the native that called it. A map, set or record whose hash
+was computed past a spoil keeps no cached hash, so the wrong answer
 never outlives the throw. The codec walks nesting with a heap stack
 and has no depth bound (`docs/CODEC.md` §2.7).
 
@@ -285,8 +293,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 17 | `bignum` | own kind | 17 | sign and limbs | sign and limbs, cached |
 | 18 | `persistent_map` | map | 18 | entry-wise, both layouts and with a sorted map | unordered, cached |
 | 19 | `persistent_set` | set | 19 | element-wise, both layouts and with a sorted set | unordered, cached |
-| 20 | `persistent_vector` | sequential | `0xF0` | element-wise with any list or vector | ordered, cached |
-| 21 | `list` (all three subkinds) | sequential | `0xF0` | element-wise with any list or vector | ordered; cached except a view |
+| 20 | `persistent_vector` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered, cached |
+| 21 | `list` (all three subkinds) | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a view |
 | 23 | `typed_vector` | own kind | 23 | element type and elements | ordered, cached |
 | 24 | `function` | identity | 24 | same value | pointer |
 | 25 | `var_` | identity | 25 | same value | pointer |
@@ -303,6 +311,7 @@ domain its hash lands in. `dispatch.zig` is its code
 | 40 | `nextomic_entity` | own kind | 40 | db-value and eid | same fields, cached |
 | 41 | `sorted_map` | map | 18 | entry-wise with any map | unordered, cached |
 | 42 | `sorted_set` | set | 19 | element-wise with any set | unordered, cached |
+| 43 | `lazy_seq` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a chunked cons |
 
 The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
 are never constructed; `dispatch` panics on one. A kind module
@@ -333,6 +342,10 @@ absent, not an error: `(get 5 :k)` is `nil`, `(get 5 :k :d)` is `:d`.
 A vector or string index out of range or not an integer is absent as
 well.
 
+A lazy seq follows the same rules (`docs/LAZY.md` §4): `(seq (lazy-seq
+nil))` is `nil`, `(rest (lazy-seq nil))` is `()`, and `count`, `nth`
+and `empty?` walk it, realizing as far as they read.
+
 `rest` of a one-element sequence is `()` and `next` is `nil`; the rest
 binding of a sequential destructure and of a variadic parameter is
 `nil` when nothing is left (`(let [[a & r] [1]] r)` is `nil`), as in
@@ -341,9 +354,10 @@ Clojure.
 The seq of a vector is a view, not a copy: `seq`, `rest`, `next`,
 `nthrest`, `nthnext` and `drop` of a vector take O(1) time and space
 whatever its length (`docs/LIST.md` §1), so `(loop [v v] (when (seq v)
-... (recur (pop v))))` is linear. The eager sequence functions (`map`,
-`filter`, `keep`, `range`, ...) return the same view over a vector of
-their results once there are four or more (`docs/LIST.md` §1). The
+... (recur (pop v))))` is linear. The eager sequence functions that
+build a list (`sort`, `reverse`, the seq of a map, ...) return the same
+view over a vector of their results once there are four or more
+(`docs/LIST.md` §1). The
 view is a list to everything else: `seq?` and `list?` are true, it prints as `(...)`, it is `=` to
 and hashes as the list of the same elements, and the codec encodes it
 as a list.
@@ -395,7 +409,9 @@ How each kind prints in the `pr-str` and `str` modes is
   symbol (as text, re-interned on read).
 - `list` (a vector view included), `vector`, `map`, `set`,
   recursively. A sorted map or set reads back as the hash map or set
-  with its entries, which is `=` to it and hashes alike.
+  with its entries, which is `=` to it and hashes alike; a lazy seq,
+  realized to print, reads back as the list of its elements, `=` to it
+  (`docs/LAZY.md` §8).
 - Not a typed vector: it prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
 - Not a record: it prints as `#ns.Type{:field value, ...}` in both
@@ -456,6 +472,7 @@ map or `nil`; it never throws.
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
 | `list`, `vector`, `map`, `set` (hash or sorted), `record`, `typed-vector` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `lazy-seq` | a new realized lazy block carrying the map whose seq is the argument's, realizing one step (`LazySeq.withMeta`), so no `rest` carries it (`docs/LAZY.md` §4) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
 | every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |

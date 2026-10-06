@@ -6,9 +6,10 @@
 //! identity hash).
 //!
 //! Responsibilities:
-//!   - `AtomBox` heap body: `{ value: Value, in_flight: u8, _pad }`.
+//!   - `AtomBox` heap body: `{ value, validator, watches, in_flight, _pad }`.
 //!   - `make(heap, init)` — allocate a fresh atom holding `init`.
-//!   - `getValue` / `setValue` — body accessors used by the native fns.
+//!   - `getValue` / `setValue` — body accessors used by the native fns;
+//!     `body` for the validator and the watches.
 //!   - `tryEnterCritical` / `exitCritical` — `in_flight` flag for
 //!     `swap!` / `reset!` / `compare-and-set!` re-entrancy detection.
 //!   - `trace` — GC walks the contained value.
@@ -19,10 +20,9 @@
 //! map key become unequal to itself after a mutation (SEMANTICS.md
 //! §2.6).
 //!
-//! GC rooting: `swap-vals!` allocates a result vector AFTER the
-//! atom write, with no safe point in between: a cycle runs only at
-//! the VM's instruction fetch and `heap.alloc` never collects
-//! (`docs/GC.md` §7, §11.5).
+//! GC rooting: the natives in `src/stdlib.zig` call the validator
+//! and the watches through `vm.callValue`, a safe point; they root
+//! the values the atom does not hold across those calls (ATOM.md §7).
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -40,21 +40,25 @@ const testing = std.testing;
 // =============================================================================
 
 /// In-memory mutable cell. Held in the heap body of a `Kind.atom`
-/// allocation. `value` is the current contained Value; `in_flight`
-/// is the re-entrancy guard set by `swap!` / `reset!` /
-/// `compare-and-set!` / `swap-vals!` for the duration of their
-/// critical section.
+/// allocation. `value` is the current contained Value; `validator`
+/// the function every new state must satisfy, or nil; `watches` the
+/// hash map of key → watch function, or nil when it has none;
+/// `in_flight` the re-entrancy guard set by `swap!` / `reset!` /
+/// `compare-and-set!` / `swap-vals!` while they compute and validate
+/// the new state.
 ///
 /// The padding makes the body a multiple of 8 bytes.
 pub const AtomBox = extern struct {
     value: Value,
+    validator: Value,
+    watches: Value,
     in_flight: u8,
     _pad: [7]u8 = @splat(0),
 };
 
 comptime {
     std.debug.assert(@alignOf(AtomBox) <= 16);
-    std.debug.assert(@sizeOf(AtomBox) == 24);
+    std.debug.assert(@sizeOf(AtomBox) == 56);
 }
 
 // =============================================================================
@@ -67,11 +71,14 @@ comptime {
 /// before the next GC.
 pub fn make(heap: *Heap, init: Value) !Value {
     const h = try heap.alloc(.atom, @sizeOf(AtomBox));
-    const body = Heap.bodyOf(AtomBox, h);
-    body.value = init;
-    body.in_flight = 0;
-    body._pad = @splat(0);
+    Heap.bodyOf(AtomBox, h).* = .{ .value = init, .validator = value_mod.nilValue(), .watches = value_mod.nilValue(), .in_flight = 0 };
     return Heap.valueFromHeader(.atom, h);
+}
+
+/// The body of the atom `v`, for the validator and the watches.
+pub inline fn body(v: Value) *AtomBox {
+    std.debug.assert(v.kind() == .atom);
+    return Heap.bodyOf(AtomBox, Heap.asHeapHeader(v));
 }
 
 /// Read the contained value. Caller must already know `v.kind() ==
@@ -101,10 +108,9 @@ pub inline fn setValue(v: Value, new: Value) void {
 /// The flag exists purely to detect a user fn (passed to `swap!` or
 /// `swap-vals!`) re-entering a mutating op on the same atom.
 pub inline fn tryEnterCritical(v: Value) bool {
-    std.debug.assert(v.kind() == .atom);
-    const body = Heap.bodyOf(AtomBox, Heap.asHeapHeader(v));
-    if (body.in_flight == 1) return false;
-    body.in_flight = 1;
+    const b = body(v);
+    if (b.in_flight == 1) return false;
+    b.in_flight = 1;
     return true;
 }
 
@@ -114,21 +120,21 @@ pub inline fn tryEnterCritical(v: Value) bool {
 /// throw-safety, and the read+write is harmless if the slot is
 /// already 0).
 pub inline fn exitCritical(v: Value) void {
-    std.debug.assert(v.kind() == .atom);
-    const body = Heap.bodyOf(AtomBox, Heap.asHeapHeader(v));
-    body.in_flight = 0;
+    body(v).in_flight = 0;
 }
 
 // =============================================================================
 // GC trace
 // =============================================================================
 
-/// Mark the contained value. `in_flight` is a `u8` — not a Value —
-/// so there's nothing else to walk. The `meta` chain is handled
-/// centrally by the collector before `trace` is invoked.
+/// Mark the contained value, the validator and the watches map.
+/// The `meta` chain is handled centrally by the collector before
+/// `trace` is invoked.
 pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    const body = Heap.bodyOf(AtomBox, h);
-    visitor.markValue(body.value);
+    const b = Heap.bodyOf(AtomBox, h);
+    visitor.markValue(b.value);
+    visitor.markValue(b.validator);
+    visitor.markValue(b.watches);
 }
 
 // =============================================================================
@@ -136,7 +142,7 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // =============================================================================
 
 test "AtomBox: ABI invariants" {
-    try testing.expectEqual(@as(usize, 24), @sizeOf(AtomBox));
+    try testing.expectEqual(@as(usize, 56), @sizeOf(AtomBox));
     try testing.expect(@alignOf(AtomBox) <= 16);
 }
 
@@ -167,14 +173,14 @@ test "tryEnterCritical / exitCritical: re-entrancy guard" {
     exitCritical(a);
 }
 
-test "trace: visits the contained value via markValue" {
+test "trace: visits the contained value, the validator and the watches via markValue" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
     const a = try make(&heap, value_mod.fromFixnum(7).?);
 
-    // Stub visitor records every markValue call. Trace must invoke
-    // markValue exactly once with the contained value.
+    // Stub visitor records every markValue call. Trace must mark
+    // the contained value, then the validator and the watches.
     var recorded: [4]Value = undefined;
     var count: usize = 0;
     const Visitor = struct {
@@ -189,7 +195,7 @@ test "trace: visits the contained value via markValue" {
     };
     trace(Heap.asHeapHeader(a), Visitor{ .recorded_ptr = &recorded, .count_ptr = &count });
 
-    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqual(value_mod.fromFixnum(7).?.payload, recorded[0].payload);
 }
 
@@ -218,7 +224,7 @@ test "trace: self-referential atom does not stack-overflow the visitor" {
     };
     trace(Heap.asHeapHeader(a), Visitor{ .recorded_ptr = &recorded, .count_ptr = &count });
 
-    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(usize, 3), count);
     try testing.expectEqual(a.payload, recorded[0].payload);
     try testing.expectEqual(a.tag, recorded[0].tag);
 }

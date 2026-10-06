@@ -35,6 +35,7 @@ const hash_mod = @import("hash.zig");
 const string = @import("string.zig");
 const bignum = @import("bignum.zig");
 const list_mod = @import("coll/list.zig");
+const lazy_mod = @import("coll/lazy.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ = @import("coll/champ.zig");
 const sorted = @import("coll/sorted.zig");
@@ -211,6 +212,11 @@ fn readBytes(bytes: []const u8, cursor: *usize, len: usize) CodecError![]const u
 // Public API
 // =============================================================================
 
+/// What `encode` can fail with: a codec error, memory, or a lazy seq
+/// whose body has not run, which the codec never runs (CODEC.md §3):
+/// the caller realizes the value and encodes it again.
+pub const EncodeError = CodecError || std.mem.Allocator.Error || error{Unrealized};
+
 /// Encode `v` to a freshly-allocated byte slice. Caller frees.
 /// Returns `UnserializableKind` if `v` is not in the
 /// serializable set (CODEC.md §1).
@@ -218,7 +224,7 @@ pub fn encode(
     allocator: std.mem.Allocator,
     interner: *const Interner,
     v: Value,
-) (CodecError || std.mem.Allocator.Error)![]u8 {
+) EncodeError![]u8 {
     var e: Encoder = .{ .allocator = allocator, .interner = interner };
     defer e.stack.deinit(allocator);
     errdefer e.buf.deinit(allocator);
@@ -270,13 +276,16 @@ const Encoder = struct {
     /// innermost last.
     stack: std.ArrayList(Open) = .empty,
 
-    const Error = CodecError || std.mem.Allocator.Error;
+    const Error = EncodeError;
 
     /// A container being written and where its walk stands. A map
     /// yields each entry's key, then holds its value for the next
     /// step.
     const Open = union(enum) {
         list: list_mod.Cursor,
+        /// A lazy seq, counted before it opened: every block of it is
+        /// realized and nothing runs in between.
+        lazy: lazy_mod.Cursor,
         vector: vector_mod.Cursor,
         map: struct { iter: champ.MapIter, value: ?Value = null },
         set: champ.SetIter,
@@ -286,6 +295,7 @@ const Encoder = struct {
         fn next(o: *Open) ?Value {
             return switch (o.*) {
                 .list => |*c| c.next(),
+                .lazy => |*c| c.next() catch unreachable,
                 .vector => |*c| c.next(),
                 .set => |*it| it.next(),
                 .sorted_set => |*c| if (c.next()) |e| e.key else null,
@@ -316,6 +326,14 @@ const Encoder = struct {
                 .list => {
                     try e.header(.list, list_mod.count(v));
                     try e.stack.append(e.allocator, .{ .list = list_mod.Cursor.init(v) });
+                },
+                // Written as the list it realized to; it decodes as one.
+                .lazy_seq => {
+                    var n: usize = 0;
+                    var c = lazy_mod.Cursor.init(v);
+                    while (try c.next()) |_| n += 1;
+                    try e.header(.list, n);
+                    try e.stack.append(e.allocator, .{ .lazy = lazy_mod.Cursor.init(v) });
                 },
                 .persistent_vector => {
                     try e.header(.persistent_vector, vector_mod.count(v));
@@ -855,6 +873,27 @@ test "roundtrip: list of fixnums" {
     const got = try ctx.roundtrip(src);
     try testing.expectEqual(@as(usize, 3), list_mod.count(got));
     try testing.expectEqual(@as(i64, 1), list_mod.head(got).asFixnum());
+}
+
+test "a realized lazy seq encodes byte for byte as the list of its elements; an unrealized one is Unrealized; byte 43 decodes as UnserializableKind" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const items = [_]Value{ value.fromFixnum(1).?, value.fromFixnum(2).?, value.fromFixnum(3).? };
+    const as_list = try list_mod.fromSlice(&ctx.heap, &items);
+    const cc = try lazy_mod.chunkedOf(&ctx.heap, items[1..], value.nilValue());
+    const lz = try lazy_mod.realizedWithMeta(&ctx.heap, try lazy_mod.cons(&ctx.heap, items[0], cc), null);
+    const want = try encode(testing.allocator, &ctx.interner, as_list);
+    defer testing.allocator.free(want);
+    const got = try encode(testing.allocator, &ctx.interner, lz);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, want, got);
+    const back = try decode(&ctx.heap, &ctx.interner, got, &synthHash, &synthEq);
+    try testing.expect(back.kind() == .list);
+    try testing.expectEqual(@as(usize, 3), list_mod.count(back));
+    const pending = try lazy_mod.unrealized(&ctx.heap, 0, &.{value.nilValue()});
+    try testing.expectError(error.Unrealized, encode(testing.allocator, &ctx.interner, try lazy_mod.cons(&ctx.heap, items[0], pending)));
+    const wire = [_]u8{ version_major, version_minor, @backingInt(Kind.lazy_seq), 0 };
+    try testing.expectError(CodecError.UnserializableKind, decode(&ctx.heap, &ctx.interner, &wire, &synthHash, &synthEq));
 }
 
 test "decode: a list of four or more elements is a view of a vector, and encodes as it was" {

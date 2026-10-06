@@ -170,9 +170,11 @@ and a reused subform its own (MACROEXPAND.md §4b).
 - A `fn*` self-name (`(fn* name [params] body)`) is a lexical local
   bound to the closure itself, so recursion needs no Var (rule 3 wins
   over rules 5-7).
-- A name repeated in one parameter list, or a rest parameter that
-  repeats a fixed one, is `DuplicateParam`; a name repeated in one
-  `letfn*` is `DuplicateBinding`. `&` is never a parameter name:
+- A name repeated in one parameter list, the rest parameter
+  included, names its last occurrence, as in Clojure: each takes its
+  argument's slot, and the later binding shadows the earlier
+  (`(fn* [_ _ old new] ...)`). A name repeated in one `letfn*` is
+  `DuplicateBinding`. `&` is never a parameter name:
   `(fn* [a b & r] body)` lowers with `rest_param = "r"`, and a
   `letfn*` binding takes a rest parameter the same way.
 - Every binding a closure captures is marked as the reference is
@@ -185,7 +187,7 @@ and a reused subform its own (MACROEXPAND.md §4b).
   constant; `IntegerOutOfFixnumRange` is only for a hand-built
   `Tiny.int` outside it.
 
-**Errors**: `UnresolvedSymbol`, `DuplicateParam`, `DuplicateBinding`,
+**Errors**: `UnresolvedSymbol`, `DuplicateBinding`,
 `MalformedForm`, `ExpectedSymbol`, `ExpectedVector`,
 `UnsupportedFeature`, `StackOverflow`.
 
@@ -384,7 +386,7 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(and (h a) (h b) (h c))` | 14 |
 | `(-> a (g b) (h) (g c))` | 10 |
 | `(doseq [x xs] (g x))` | 15 |
-| `(for [x xs] (h x))` | 24 |
+| `(for [x xs] (h x))`, a call of `map` over a closure (MACROEXPAND.md §10) | 5 |
 | `(dotimes [i a] (g i))`, its count truncated once by `long` | 12 |
 | `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
 | `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
@@ -715,7 +717,7 @@ not):
 | Variant | Raised for |
 |---|---|
 | `UnresolvedSymbol` | a symbol that resolves to nothing (§4.3); the detail names it |
-| `DuplicateParam`, `DuplicateBinding` | a repeated parameter; a repeated `letfn*` name |
+| `DuplicateBinding` | a repeated `letfn*` name |
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
 | `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering, a syntax-quote or unquote inside a quote; a quoted symbol or keyword without an interner, a string, bignum or quoted compound without a heap |

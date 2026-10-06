@@ -20,6 +20,8 @@ user=>   #_=>   #_=>   #_=> #'user/s
 user=> 23
 user=> ["a" \b "c d"]
 user=> 8891
-user=> nil
+user=> (1 2)
+user=> user=> :boom
+user=> user=> nil
 other=> "in other"
 other=> other=> 

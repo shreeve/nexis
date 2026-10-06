@@ -64,7 +64,7 @@
 (println "")
 
 (println "Per-shape reports (cross-namespace dispatch):")
-(for [s shapes]
+(doseq [s shapes]
   (println "  " (report s)))
 
 (println "")

@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 197/197 steps succeeded; 1436/1436 tests passed
+Build Summary: 199/199 steps succeeded; 1475/1475 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 195 steps. Any output besides the
+steps; without it the count is 197 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -114,8 +114,8 @@ Sexp
    │  src/reader.zig    canonical Form tree (PLAN §28): spans, merged ^meta, #() as the
    ▼                    anon-fn datum, syntax-quote marker, reader errors
 Form {datum, origin}
-   │  src/expand.zig    macros to a fixpoint: 19 host macros in Zig (let fn defn defn-
-   ▼                    loop when when-not and or cond -> ->> case condp for defrecord
+   │  src/expand.zig    macros to a fixpoint: 18 host macros in Zig (let fn defn defn-
+   ▼                    loop when when-not and or cond -> ->> case condp defrecord
                         defprotocol extend-type extend-protocol), the try, ns, require,
                         defmacro and set! rules, user macros run in a compile-time
                         sub-VM, syntax-quote with auto-gensym
@@ -232,9 +232,11 @@ only results into the VM heap; a Nextomic error is a map
 ### 3.6 Namespaces
 
 `nexis.core` (auto-referred), `db`, `nextomic`, `nexis.string`,
-`nexis.set`, `nexis.test`, `nexis.pprint`, `nexis.math`, `nexis.simd`
-and `nexis.internal`, with `clojure.string`, `clojure.set`,
-`clojure.test` and `clojure.pprint` accepted as names in `require`.
+`nexis.set`, `nexis.walk`, `nexis.edn`, `nexis.test`, `nexis.pprint`,
+`nexis.math`, `nexis.simd` and `nexis.internal`, with
+`clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
+`clojure.math`, `clojure.test` and `clojure.pprint` accepted as names
+in `require`.
 The native tables are in `src/stdlib.zig`, the library written in
 nexis in `src/stdlib/*.nx`, embedded and booted in order by
 `stdlib.boot` (`docs/STDLIB.md` §1).
@@ -304,9 +306,12 @@ failing test (AGENTS.md).
 
 ### 6.1 Language and runtime
 
-1. **Sequences are eager** (§23 #14; open question §24 #2):
-   `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
-   is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
+1. **A lazy seq keeps its head** (`docs/LAZY.md` §9): the VM roots
+   every slot until it is reused, so a seq a local or a call's
+   argument holds keeps what it realized. Clearing a call's argument
+   block after it returns, and a local at its last use, would give
+   Clojure's constant-memory streaming; it is a compiler change with a
+   cost on every call, to be measured. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
 2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
    design question, so an amendment comes first.
@@ -423,8 +428,8 @@ after numbers in the commit message.
    work, with em's runtime as the reference.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
-4. The open design questions, each an amendment first: laziness
-   (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9). The owner
+4. The open design questions, each an amendment first:
+   `&form`/`&env` (§24 #13), regex (§24 #9). The owner
    orders these after the em and emdb work.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)

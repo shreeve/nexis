@@ -131,7 +131,13 @@ pub const Kind = enum(u8) {
     /// Sorted set (docs/SORTED.md), laid out as `sorted_map` without
     /// the values.
     sorted_set = 42,
-    // 43..63 reserved for heap kinds.
+    /// Lazy seq (docs/LAZY.md): an unrealized-or-realized lazy block,
+    /// a cons cell whose rest may be lazy, or a chunked cons over a
+    /// chunk; the subkind and the header's flags bits 1–2 name the
+    /// shape. Sequential: equal to, and hashed as, the list of its
+    /// elements.
+    lazy_seq = 43,
+    // 44..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an

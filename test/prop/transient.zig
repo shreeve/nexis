@@ -71,11 +71,11 @@ test "T1a: map equivalence — transient × N ≡ persistent × N (1000 trials)"
                 // assoc
                 const val = value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?;
                 persistent_path = try champ.mapAssoc(&heap, persistent_path, key, val, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.mapAssocBang(&heap, t, key, val, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.mapAssocBang(&heap, t, key, val, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             } else {
                 // dissoc
                 persistent_path = try champ.mapDissoc(&heap, persistent_path, key, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.mapDissocBang(&heap, t, key, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.mapDissocBang(&heap, t, key, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             }
         }
 
@@ -109,10 +109,10 @@ test "T1b: set equivalence — transient × N ≡ persistent × N (1000 trials)"
             const elem = value.fromFixnum(r.intRangeAtMost(i64, 0, 19)).?;
             if (r.boolean()) {
                 persistent_path = try champ.setConj(&heap, persistent_path, elem, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.setConjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.setConjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             } else {
                 persistent_path = try champ.setDisj(&heap, persistent_path, elem, &dispatch.hashValue, &dispatch.equal);
-                _ = try transient.setDisjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.setDisjBang(&heap, t, elem, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             }
         }
 
@@ -209,11 +209,11 @@ test "T2a: map transient post-freeze rejects every op with TransientFrozen" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.mapDissocBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.mapDissocBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
@@ -237,11 +237,11 @@ test "T2b: set transient post-freeze rejects every op" {
     _ = try transient.persistentBang(t);
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setConjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.setConjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
-        transient.setDisjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.setDisjBang(&heap, t, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientFrozen,
@@ -276,20 +276,20 @@ test "T2d: kind-mismatch routing yields TransientKindMismatch for every family" 
     // map ops on non-map transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.mapAssocBang(&heap, t_set, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.mapAssocBang(&heap, t_vec, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.mapAssocBang(&heap, t_vec, value.testKeyword(1), value.fromFixnum(1).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     // set ops on non-set transients.
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_map, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.setConjBang(&heap, t_map, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     try std.testing.expectError(
         transient.TransientError.TransientKindMismatch,
-        transient.setConjBang(&heap, t_vec, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount),
+        transient.setConjBang(&heap, t_vec, value.testKeyword(1), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount),
     );
     // vector ops on non-vector transients.
     try std.testing.expectError(
@@ -339,10 +339,10 @@ test "T3a: transient session does NOT mutate source persistent map" {
             const pick = r.uintLessThan(u8, 2);
             if (pick == 0) {
                 const k = value.testKeyword(r.intRangeAtMost(u32, 0, 100));
-                t = try transient.mapAssocBang(&heap, t, k, value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                t = try transient.mapAssocBang(&heap, t, k, value.fromFixnum(r.intRangeAtMost(i64, -100, 100)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             } else {
                 const k = value.testKeyword(r.intRangeAtMost(u32, 0, 30));
-                t = try transient.mapDissocBang(&heap, t, k, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                t = try transient.mapDissocBang(&heap, t, k, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
             }
         }
         _ = try transient.persistentBang(t);
@@ -400,7 +400,7 @@ test "T4: transient wrapper as sole root keeps inner structure alive" {
     var t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        t = try transient.mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+        t = try transient.mapAssocBang(&heap, t, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
     }
 
     var collector = gc.Collector.init(&heap);
@@ -428,7 +428,7 @@ test "T4b: frozen transient still traces inner_header (inner survives via wrappe
     defer heap.deinit();
 
     const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
-    _ = try transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+    _ = try transient.mapAssocBang(&heap, t, value.testKeyword(1), value.fromFixnum(100).?, &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
     const frozen_persistent = try transient.persistentBang(t);
 
     // Keep BOTH the wrapper AND the returned persistent Value as
@@ -515,10 +515,10 @@ fn randomMapEdit(heap: *Heap, r: std.Random, keys: MapKeys, key_max: i64, t: Val
     const kv = try keys.key(heap, k);
     if (r.uintLessThan(u8, 4) < 3) {
         const v = r.intRangeAtMost(i64, -1000, 1000);
-        _ = try transient.mapAssocBang(heap, t, kv, fx(v), keys.hash, &dispatch.equal, &dispatch.overflowCount);
+        _ = try transient.mapAssocBang(heap, t, kv, fx(v), keys.hash, &dispatch.equal, &dispatch.spoilCount);
         try model.put(gpa, k, v);
     } else {
-        _ = try transient.mapDissocBang(heap, t, kv, keys.hash, &dispatch.equal, &dispatch.overflowCount);
+        _ = try transient.mapDissocBang(heap, t, kv, keys.hash, &dispatch.equal, &dispatch.spoilCount);
         _ = model.orderedRemove(k);
     }
 }
@@ -585,7 +585,7 @@ test "T5b: in-place edits through collision nodes keep every persistent map" {
     try mapPersistenceRounds(&heap, prng.random(), keys, 24, 14, 40);
     // The fixture reaches the collision layer.
     const t = try transient.transientFrom(&heap, try champ.mapEmpty(&heap));
-    for (0..12) |i| _ = try transient.mapAssocBang(&heap, t, try keys.key(&heap, @intCast(i)), fx(@intCast(i)), keys.hash, &dispatch.equal, &dispatch.overflowCount);
+    for (0..12) |i| _ = try transient.mapAssocBang(&heap, t, try keys.key(&heap, @intCast(i)), fx(@intCast(i)), keys.hash, &dispatch.equal, &dispatch.spoilCount);
     try std.testing.expectEqual(@as(?u32, 12), champ.mapCollisionCount(try transient.persistentBang(t), 0xDEAD_BEEF));
 }
 
@@ -625,10 +625,10 @@ test "T5c: persistent sets never change under in-place edits of transients over 
         for (0..r.uintLessThan(usize, 500)) |_| {
             const k = r.intRangeAtMost(i64, 0, 1200);
             if (r.uintLessThan(u8, 3) < 2) {
-                _ = try transient.setConjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.setConjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
                 try model.put(gpa, k, {});
             } else {
-                _ = try transient.setDisjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.overflowCount);
+                _ = try transient.setDisjBang(&heap, t, fx(k), &dispatch.hashValue, &dispatch.equal, &dispatch.spoilCount);
                 _ = model.orderedRemove(k);
             }
         }

@@ -2,9 +2,9 @@
 (+ x 2)
 (/ 1 0)
 *e
-(count (repeat 100000000 0))
+(count (vec (repeat 100000000 0)))
 *e
-(with-out-str (print "y") (count (repeat 100000000 0)))
+(with-out-str (print "y") (count (vec (repeat 100000000 0))))
 (println "after")
 (+ 1 2)
 (def a 1) (def b 2) (+ a b)
@@ -23,6 +23,10 @@ four \\")
 (count s)
 ["a" \b "c d"]
 (count (pr-str (range 2000)))
+(lazy-seq [1 2])
+(lazy-seq (throw :boom))
+*e
+(throw (lazy-seq (println "ran") [1]))
 (ns other)
 (str "in " 'other)
 )

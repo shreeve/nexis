@@ -116,7 +116,8 @@ Each line prints the value after `;; =>` when run with `bin/nexis`
 (* 1000000000 1000000000)                   ;; => 1000000000000000000, a bignum
 (try (/ 1 0) (catch any e e))               ;; => :divide-by-zero
 
-(map inc [1 2 3])                           ;; => (2 3 4), eager
+(map inc [1 2 3])                           ;; => (2 3 4), lazy
+(take 3 (iterate #(* 2 %) 1))               ;; => (1 2 4)
 (for [x (range 3) :when (odd? x)] [x (* x x)]) ;; => ([1 1])
 (-> {:a 1} (assoc :b 2) (update :a inc))    ;; => {:a 2, :b 2}
 (persistent! (reduce conj! (transient []) (range 5))) ;; => [0 1 2 3 4]
@@ -155,10 +156,11 @@ nexis: bad.nx:1:1: compile error: when: expected a test
 
 The namespaces that come with the binary are `nexis.core`
 (auto-referred), `db` (durable refs), `nextomic`, `nexis.string`,
-`nexis.set`, `nexis.test`, `nexis.pprint`, `nexis.math` and
-`nexis.simd` (typed-vector kernels); `clojure.string`, `clojure.set`,
-`clojure.test` and `clojure.pprint` are accepted as their names in
-`require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
+`nexis.set`, `nexis.walk`, `nexis.edn`, `nexis.test`,
+`nexis.pprint`, `nexis.math` and `nexis.simd` (typed-vector kernels);
+`clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
+`clojure.math`, `clojure.test` and `clojure.pprint` are accepted as
+their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
 under `zig build examples` (`examples/README.md`).
 
 ## Nextomic
@@ -235,8 +237,9 @@ The semantics port; the platform does not.
   `import`, and no JVM libraries.
 - **No STM, agents or threads**: immutable values, atoms and emdb
   transactions are the concurrency story.
-- **Eager sequences**: `map`, `filter` and `for` return lists, and
-  `(range)` or `(iterate f x)` need a count.
+- **Lazy sequences keep their head**: a lazy seq that a local or a
+  call's argument holds keeps what it realized until its slot is
+  reused; there is no locals clearing (`docs/LAZY.md` §9).
 - **Numbers** are fixnum + bignum and f64: `(= 1 1.0)` is false, and
   an inexact integer `/` is a float, not a ratio.
 - **Exceptions are values**: `(catch :tag e ...)` matches a keyword or

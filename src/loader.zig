@@ -16,8 +16,9 @@
 //! `(ns my.app.foo ...)`, and restores the caller's namespace. A
 //! namespace loads once; a require of one still loading is a cycle.
 //! The namespaces the stdlib installs have no file (`markLoaded`),
-//! and `clojure.string`, `clojure.set`, `clojure.test` and
-//! `clojure.pprint` name their nexis counterparts' Vars.
+//! and the Clojure library namespaces `clojure_names` lists
+//! (`clojure.string` and the rest) name their nexis counterparts'
+//! Vars.
 //!
 //! The expander reaches the loader through `ExpandContext
 //! .load_callback`, so it depends on neither this file nor the
@@ -367,10 +368,13 @@ pub const Loader = struct {
 
     /// A failure of an `on_value` or `on_routine` callback (the REPL
     /// or `-e` printing a value, `disasm` printing a routine): out of
-    /// memory as itself, anything else, such as a closed stdout, as a
-    /// diagnostic naming it, never a runtime error the VM did not have.
+    /// memory as itself, a runtime error realizing the value to print
+    /// as one, anything else, such as a closed stdout, as a diagnostic
+    /// naming it, never a runtime error the VM did not have.
     fn callbackFailure(self: *Loader, err: anyerror) EvalError {
         if (err == error.OutOfMemory) return error.OutOfMemory;
+        // Realizing a printed result failed (docs/LAZY.md §8).
+        if (err == error.RunFailed) return error.RunFailed;
         self.diagnose(.{ .label = "" }, "cannot write the result: {s}", .{@errorName(err)}) catch return error.OutOfMemory;
         return error.Diagnosed;
     }
@@ -480,6 +484,9 @@ const clojure_names = [_][2][]const u8{
     .{ "clojure.set", "nexis.set" },
     .{ "clojure.test", "nexis.test" },
     .{ "clojure.pprint", "nexis.pprint" },
+    .{ "clojure.walk", "nexis.walk" },
+    .{ "clojure.edn", "nexis.edn" },
+    .{ "clojure.math", "nexis.math" },
 };
 
 /// `my.app-core.foo` → `my/app_core/foo.nx`. Caller owns the slice.

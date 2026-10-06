@@ -48,12 +48,13 @@ changes to emdb.
 | `zig build install` | `bin/nexis` in the checkout; `--prefix DIR` installs `DIR/bin/nexis` instead and leaves the checkout's alone |
 | `zig build nexis` | `bin/nexis` alone, as `install` does |
 | `zig build run -- ARGS` | builds `bin/nexis` and runs it with ARGS, in the caller's environment |
+| `zig build compile` | compiles every binary and test binary the gate runs, without running them (a caller can give the compile phase more cores than the single-threaded test runs that follow) |
 | `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish` and `numbers` integration tests |
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 197 steps (195 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
+| `zig build test --summary all` | the gate, 199 steps (197 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |

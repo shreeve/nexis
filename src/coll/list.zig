@@ -306,6 +306,19 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 // `equalSeq` and the stdlib's sequence iterator walk lists with it;
 // once it reaches a view it walks the vector's leaves directly.
 
+/// The elements of a view from its offset to the end of the vector
+/// leaf (or tail) that holds it: what a chunked producer takes at once
+/// (docs/LAZY.md §7), its next chunk starting at the next leaf
+/// boundary. Null for a cons chain or the empty list.
+pub fn viewChunk(v: Value) ?[]const Value {
+    std.debug.assert(v.kind() == .list);
+    if (v.subkind() != subkind_view) return null;
+    const vec = viewVector(v);
+    const at = viewOffset(v);
+    if (at >= vector.count(vec)) return null;
+    return vector.chunkFrom(vec, at);
+}
+
 /// The cursor over a view's elements: its vector's, from its offset
 /// (§1). Null for a cons chain or the empty list.
 pub fn viewCursor(v: Value) ?vector.Cursor {
