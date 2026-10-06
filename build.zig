@@ -125,6 +125,16 @@ pub fn build(b: *std.Build) void {
         if (suite.nextomic) nextomic_test_step.dependOn(&run.step);
     }
 
+    // Every native binary the gate runs, compiled and not run, so a
+    // caller can give the compile phase a share of the machine of its
+    // own and run the single-threaded tests on less.
+    const compile_step = b.step("compile", "Compile every binary and test binary the gate runs, without running them");
+    const gate_bins = [_]*std.Build.Step.Compile{ bins.nexis, bins.golden, bins.bench, bins.unit, bins.cli_unit };
+    for ([_][]const *std.Build.Step.Compile{ &gate_bins, bins.suites }) |set| for (set) |compile| {
+        _ = compile.getEmittedBin();
+        compile_step.dependOn(&compile.step);
+    };
+
     // bin/nexis, the CLI. `run` and `bench` are never cached (they
     // take the arguments after `--`), so they keep the caller's
     // environment: NEXIS_MAX_ALLOC and the like reach the program.
