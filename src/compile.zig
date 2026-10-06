@@ -369,12 +369,6 @@ pub const CompileError = error{
     /// or an upvalue raises this.
     UnresolvedSymbol,
 
-    /// Two parameter slots in the same `fn*` carry the same
-    /// name. Clojure semantics: not allowed (unlike `let*` where
-    /// sequential bindings can shadow within the same form per
-    /// COMPILER.md §4.3).
-    DuplicateParam,
-
     /// Two bindings in the same `letfn*` group carry the same
     /// name. Unlike `let*` (sequential shadowing allowed),
     /// `letfn*` names are mutually visible — duplicates
@@ -3370,11 +3364,6 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     defer parent.allocator.free(names);
     @memcpy(names[0..f.params.len], f.params);
     if (f.rest_param) |rp| names[count - 1] = rp;
-    // A name twice in one parameter list is an error, the rest
-    // parameter included.
-    for (names, 0..) |p, i| {
-        for (names[0..i]) |q| if (std.mem.eql(u8, p, q)) return CompileError.DuplicateParam;
-    }
 
     var self_cell_slot: u12 = 0;
     if (f.self_referenced) {
@@ -3731,8 +3720,6 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(def)", .err = CompileError.MalformedForm },
         .{ .src = "(def 42 5)", .err = CompileError.ExpectedSymbol },
         .{ .src = "(var)", .err = CompileError.MalformedForm },
-        .{ .src = "(fn* [x x] x)", .err = CompileError.DuplicateParam },
-        .{ .src = "(fn* [a & a] a)", .err = CompileError.DuplicateParam },
         .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = CompileError.DuplicateBinding },
         .{ .src = "(recur)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (let* [x (recur 1)] x))", .err = CompileError.RecurOutsideTail },
@@ -4055,7 +4042,6 @@ test "compile span: an error is reported at the innermost form that raised it" {
         .{ .src = "(fn* [x] (let* [y 1] (+ 1 (recur 2))))", .at = "(recur 2)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(fn* [x] (do 1 (recur 1 2)))", .at = "(recur 1 2)", .err = CompileError.RecurArityMismatch },
         .{ .src = "(do 1 (let* [x 1] (if)))", .at = "(if)", .err = CompileError.MalformedForm },
-        .{ .src = "(let* [f (fn* [a a] a)] f)", .at = "(fn* [a a] a)", .err = CompileError.DuplicateParam },
     };
     for (cases) |c| {
         var span: ?reader_mod.SrcSpan = null;

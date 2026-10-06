@@ -1147,6 +1147,13 @@ test "multi-arity fn: a nested loop in a clause owns its recur, and a wrong-coun
     try expectProgramError("(defn bad ([n] (recur)))", compile.CompileError.RecurArityMismatch);
 }
 
+test "fn: a parameter name repeated binds its last occurrence, as in Clojure" {
+    try expectOutput("[((fn [x x] x) 1 2) ((fn [a & a] a) 1 2) ((fn [_ _ o n] [o n]) 1 2 3 4)]", "[2 (2) [3 4]]");
+    // A closure over the name, and recur, see the last binding too.
+    try expectOutput("[(((fn [x x] (fn [] x)) 1 2)) ((fn [x x] (if (< x 5) (recur x (inc x)) x)) 0 0)]", "[2 5]");
+    try expectOutput("(let [a (atom 0)] (add-watch a :k (fn [_ _ old new] (when (< new 10) (reset! a (+ old new 10))))) (reset! a 1) (remove-watch a :k) @a)", "11");
+}
+
 test "named fn: the name is the function itself inside its body" {
     try expectOutput("((fn f [n] (if (pos? n) (f (dec n)) :done)) 3)", ":done");
     try expectOutput("(let [g (fn f [n] (if (zero? n) 1 (* n (f (dec n)))))] (g 5))", "120");
