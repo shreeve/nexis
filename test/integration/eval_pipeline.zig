@@ -2278,6 +2278,9 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
     // 32 elements, the last what is left.
     try expectOutput("(let [r (range 70) s (seq r)] [(realized? r) (count (seq r)) (first (drop 64 r)) (last r) (= r (vec (range 70))) (= (hash r) (hash (vec (range 70))))])", "[true 70 64 69 true true]");
     try expectOutput("(take 2 (drop 140737488355326 (range 140737488355320 140737488355330)))", "()");
+    // A native that walks an unrealized range computes its elements, as
+    // Clojure's `LongRange` iterator does; `doall` realizes it.
+    try expectOutput("(let [r (range 100)] [(count (mapv inc r)) (count (filterv odd? r)) (count (frequencies r)) (count (group-by odd? r)) (apply + r) (realized? r) (do (doall r) (realized? r))])", "[100 50 100 2 4950 false true]");
 }
 
 test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {

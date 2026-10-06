@@ -307,12 +307,14 @@ the function with no allocation and caching nothing
 Clojure's docstring says, since a later walk calls it again. `count`
 of a range or a finite repeat is its arithmetic count, `nth` its
 arithmetic element, `drop` and `nthrest` a new range or repeat from the
-index, and the
-eager gatherers (`vec`, `into`, `set`, `sort`, `apply`, ...) take its
-elements without making a cell. `(reduce + (range 100000000))`
-allocates nothing, and `(count (range 1e12))` is O(1). Recomputing is
-invisible: a range's elements are numbers. A range that has been
-walked is a realized chain, walked as any other.
+index, and every native that walks an unrealized range (`vec`, `into`,
+`set`, `sort`, `apply`, `mapv`, `filterv`, `frequencies`, `group-by`,
+...) computes its elements without making a cell, as Clojure's
+`LongRange` iterator does; `doall` and `dorun` realize it.
+`(reduce + (range 100000000))` allocates nothing, and `(count (range
+1e12))` is O(1). Recomputing is invisible: a range's elements are
+numbers. A range that has been realized (by `seq`, `first`, a producer
+over it, `doall`) is a realized chain, walked as any other.
 
 ---
 

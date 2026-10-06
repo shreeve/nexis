@@ -5528,20 +5528,6 @@ fn collectSeq(vm: *VM, coll: Value) VmError!std.ArrayList(Value) {
 /// Append every element of `seq` to `out`. Used by `apply` to
 /// splice the trailing seq into the args list.
 fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void {
-    if (seq_mod.pureOf(seq)) |p| switch (p) {
-        // A finite range's elements, computed: nothing is realized.
-        .range => |r| {
-            const n: usize = @intCast(seq_mod.rangeCount(r.start, r.end, r.step));
-            out.ensureUnusedCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
-            var x = r.start;
-            for (0..n) |_| {
-                out.appendAssumeCapacity(value_mod.fromFixnum(x).?);
-                x += r.step;
-            }
-            return;
-        },
-        else => {},
-    };
     var it = try makeSeqIter(vm, seq);
     while (try it.next()) |e| {
         out.append(vm.allocator, e) catch return VmError.OutOfMemory;
