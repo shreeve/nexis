@@ -475,6 +475,153 @@ pub const Routine = struct {
     /// The source the spans index into.
     source: ?*const SourceInfo = null,
 
+    /// Prove the routine, and every routine its capture descriptors
+    /// build, fit to run (VM.md §5): every instruction `primary` with
+    /// an assigned opcode, every operand inside the table it indexes
+    /// and of a kind its position takes, every call or collection
+    /// block inside the frame, every jump, `try` and capture inside
+    /// the routine, and the last instruction one that never falls
+    /// through, so execution cannot run off the code. The dispatch
+    /// trusts all of it (§8). On an error `failure` names the routine
+    /// and the instruction.
+    pub fn verify(self: *const Routine, failure: *VerifyFailure) VmError!void {
+        stack_guard.check() catch return VmError.StackOverflow;
+        // The code's end is reported at its last instruction, as a run
+        // that falls off it is (§13).
+        failure.* = .{ .routine = self, .pc = @intCast(self.code.len -| 1) };
+        const code = self.code;
+        if (code.len == 0 or !neverFallsThrough(code[code.len - 1])) return VmError.BytecodeExhausted;
+        for (code, 0..) |inst, i| {
+            failure.pc = @intCast(i);
+            try self.verifyInst(inst);
+        }
+        for (self.capture_descs) |desc| try desc.routine.verify(failure);
+    }
+
+    fn neverFallsThrough(inst: Inst) bool {
+        const op = VM.opIndex(inst);
+        return op == VM.opcode(.jump, Jump.jmp) or op == VM.opcode(.call, Call.@"return") or
+            op == VM.opcode(.call, Call.return_nil) or op == VM.opcode(.ctrl, CtrlOp.throw_) or
+            op == VM.opcode(.ctrl, CtrlOp.try_exit) or op == VM.opcode(.ctrl, CtrlOp.finally_exit);
+    }
+
+    /// What an operand position holds: nothing read, a destination
+    /// slot, a slot read as such (a call block's base, a cell), a value
+    /// read through any operand kind, or a raw count (§4.5).
+    const Role = enum { none, dst, slot, src, raw };
+    /// What a wide field (§3) indexes.
+    const WideRole = enum { pc, constant, var_, capture, try_ };
+    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false };
+
+    /// The shape of the opcode at `op`, null for one with no
+    /// operands to prove: an unimplemented one traps where it runs.
+    fn shapeOf(op: u12) ?Shape {
+        const g: Group = @fromBackingInt(@as(u6, @truncate(op)));
+        const v: u6 = @truncate(op >> 6);
+        return switch (g) {
+            .jump => switch (@as(Jump, @fromBackingInt(v))) {
+                .jmp => .{ .wide = .pc },
+                .if_true, .if_false => .{ .a = .src, .wide = .pc },
+                _ => null,
+            },
+            .cmp => .{ .a = .dst, .b = .src, .c = .src },
+            .math => switch (@as(Math, @fromBackingInt(v))) {
+                .neg, .abs => .{ .a = .dst, .b = .src },
+                .pow, _ => null,
+                else => .{ .a = .dst, .b = .src, .c = .src },
+            },
+            .mov => switch (@as(Mov, @fromBackingInt(v))) {
+                .move => .{ .a = .dst, .b = .src },
+                .load_const => .{ .a = .dst, .wide = .constant },
+                .load_nil, .load_true, .load_false => .{ .a = .dst },
+                _ => null,
+            },
+            .call => switch (@as(Call, @fromBackingInt(v))) {
+                .call => .{ .a = .slot, .b = .raw, .c = .dst, .block = true },
+                .@"return" => .{ .a = .src },
+                .return_nil, .tailcall, _ => null,
+            },
+            .closure => switch (@as(Closure_, @fromBackingInt(v))) {
+                .make => .{ .a = .dst, .wide = .capture },
+                .box_local, .new_cell => .{ .a = .slot },
+                .init_cell => .{ .a = .slot, .b = .src },
+                .get_cell => .{ .a = .dst, .b = .slot },
+                _ => null,
+            },
+            .var_ => switch (@as(VarOp, @fromBackingInt(v))) {
+                .load_var, .var_object => .{ .a = .dst, .wide = .var_ },
+                .store_var => .{ .a = .src, .wide = .var_ },
+                _ => null,
+            },
+            .coll => .{ .a = .slot, .b = .raw, .c = .dst, .block = true },
+            .ctrl => switch (@as(CtrlOp, @fromBackingInt(v))) {
+                .try_enter => .{ .a = .slot, .wide = .try_ },
+                .try_exit => .{ .wide = .pc },
+                .throw_ => .{ .a = .src },
+                .finally_exit, .halt_, _ => null,
+            },
+            else => null,
+        };
+    }
+
+    fn verifyInst(self: *const Routine, inst: Inst) VmError!void {
+        if (inst.kind != .primary) return VmError.BytecodeCorruption;
+        const op = VM.opIndex(inst);
+        if (VM.op_table[op] == &VM.opCorrupt) return VmError.BytecodeCorruption;
+        const shape = shapeOf(op) orelse return;
+        try self.verifyOperand(inst.a, shape.a);
+        if (shape.wide) |w| {
+            const i = inst.wide();
+            const len = switch (w) {
+                .pc => self.code.len,
+                .constant => self.consts.len,
+                .var_ => self.var_table.len,
+                .capture => self.capture_descs.len,
+                .try_ => self.tries.len,
+            };
+            if (i >= len) return VmError.OperandOutOfRange;
+            if (w == .try_) {
+                const t = self.tries[i];
+                if (t.catch_pc >= self.code.len or (t.finally_pc orelse 0) >= self.code.len) return VmError.OperandOutOfRange;
+            }
+            if (w == .capture) {
+                const desc = self.capture_descs[i];
+                if (desc.sources.len != desc.routine.upvalue_count) return VmError.CaptureCountMismatch;
+                for (desc.sources) |source| switch (source) {
+                    .local_cell_slot => |slot| if (slot >= self.slot_count) return VmError.OperandOutOfRange,
+                    .inherited_upvalue => |u| if (u >= self.upvalue_count) return VmError.UpvalueOutOfRange,
+                };
+            }
+            return;
+        }
+        try self.verifyOperand(inst.b, shape.b);
+        try self.verifyOperand(inst.c, shape.c);
+        // `call:call`'s callee and arguments, a `coll` opcode's elements.
+        if (shape.block) {
+            const end = @as(u32, inst.a.index) + inst.b.index + @intFromBool(inst.groupOf() == .call);
+            if (end > self.slot_count) return if (inst.groupOf() == .call) VmError.CallBlockOutOfRange else VmError.OperandOutOfRange;
+        }
+    }
+
+    fn verifyOperand(self: *const Routine, op: Operand, role: Role) VmError!void {
+        switch (role) {
+            .none, .raw => {},
+            .dst, .slot => {
+                if (op.kind != .slot) return VmError.InvalidOperandKind;
+                if (op.index >= self.slot_count) return VmError.OperandOutOfRange;
+            },
+            // Another kind traps where it is read, as `resolveOther`
+            // says.
+            .src => switch (op.kind) {
+                .slot => if (op.index >= self.slot_count) return VmError.OperandOutOfRange,
+                .constant => if (op.index >= self.consts.len) return VmError.OperandOutOfRange,
+                .var_ => if (op.index >= self.var_table.len) return VmError.OperandOutOfRange,
+                .upvalue => if (op.index >= self.upvalue_count) return VmError.UpvalueOutOfRange,
+                else => {},
+            },
+        }
+    }
+
     /// The source span of the instruction at `pc`, or null when the
     /// table has no entry at or before it.
     pub fn spanAt(self: *const Routine, pc: u32) ?SourceSpan {
@@ -488,6 +635,10 @@ pub const Routine = struct {
         return self.spans[lo - 1].span;
     }
 };
+
+/// Where `Routine.verify` found a routine unfit to run: the routine and
+/// the instruction.
+pub const VerifyFailure = struct { routine: *const Routine, pc: u32 };
 
 /// A Var holds a mutable cell of a Value with stable identity
 /// across rebinds (matches Clojure's `def` semantics: `(def x 5)`
@@ -2365,6 +2516,13 @@ pub const VM = struct {
     /// `upvalues` array; the caller fills it before the Value can
     /// reach a slot. `asClosure()` is the matched accessor.
     pub fn allocClosure(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
+        // The dispatch trusts the routine (§8): a closure's comes from
+        // a verified routine's capture descriptor, and a debug build
+        // checks it.
+        if (std.debug.runtime_safety) {
+            var failure: VerifyFailure = undefined;
+            routine.verify(&failure) catch |err| std.debug.panic("closure over an unverified routine {s}: {t} at {d}", .{ routine.name, err, failure.pc });
+        }
         const heap = self.ensureHeap();
         const body_size = @sizeOf(Closure) + upvalue_count * @sizeOf(*UpvalCell);
         const h = try heap.alloc(.function, body_size);
@@ -2754,7 +2912,7 @@ pub const VM = struct {
         try self.checkNesting();
         const saved = self.installLazyHost();
         defer lazy_mod.host = saved;
-        if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
+        try self.verifyTop(routine);
         const base_slot: usize = self.stack.items.len;
         self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
         var result_cell = HostCallResult{};
@@ -2943,22 +3101,45 @@ pub const VM = struct {
         return null;
     }
 
-    /// Whether `op` is a slot of `frame`, where a fast handler stores.
-    inline fn slotIn(frame: *const Frame, op: Operand) bool {
-        return op.kind == .slot and op.index < frame.slot_count;
+    /// A value read a word at a time. A handler stores a value as two
+    /// 8-byte words, and a load that takes a whole word, or both, gets
+    /// it from the store while it is in flight; a load of part of a
+    /// word (the kind byte) or of both words at once waits until the
+    /// store reaches the cache, which a loop carrying a value through
+    /// its slots pays at every instruction. Volatile, or the optimizer
+    /// narrows the tag's load to its byte and joins a copy's words
+    /// into one 16-byte load (em `src/runtime.zig` storeNum and
+    /// loadWords make the same point).
+    inline fn loadWords(src: *const Value) Value {
+        return .{ .tag = @as(*const volatile u64, &src.tag).*, .payload = @as(*const volatile u64, &src.payload).* };
     }
 
-    /// `peek` for a fast handler, whose every other operand goes to the
-    /// general handler. A flag, not a null pointer, says which: the
-    /// pointers are never tested for null.
+    /// `dst.* = src.*` a word at a time (`loadWords`).
+    inline fn copyWords(dst: *Value, src: *const Value) void {
+        const v = loadWords(src);
+        @as(*volatile u64, &dst.tag).* = v.tag;
+        @as(*volatile u64, &dst.payload).* = v.payload;
+    }
+
+    /// Slot `op` of `frame`, an operand verification proved a slot
+    /// inside the frame (§5).
+    inline fn verifiedSlot(self: *VM, frame: *const Frame, op: Operand) *Value {
+        std.debug.assert(op.kind == .slot and op.index < frame.slot_count);
+        return self.slotAt(frame, op.index);
+    }
+
+    /// `peek` for a fast handler, of an operand verification proved
+    /// inside its table, whose every other operand goes to the general
+    /// handler. A flag, not a null pointer, says which: the pointers
+    /// are never tested for null.
     inline fn fastOperand(self: *VM, frame: *const Frame, op: Operand) struct { ptr: *const Value, ok: bool } {
-        if (op.kind == .slot and op.index < frame.slot_count) return .{ .ptr = self.slotAt(frame, op.index), .ok = true };
-        if (op.kind == .constant and op.index < frame.routine.consts.len) return .{ .ptr = &frame.routine.consts[op.index], .ok = true };
-        if (op.kind == .upvalue and op.index < frame.upvalues.len) {
+        if (op.kind == .slot) return .{ .ptr = self.verifiedSlot(frame, op), .ok = true };
+        if (op.kind == .constant) return .{ .ptr = &frame.routine.consts[op.index], .ok = true };
+        if (op.kind == .upvalue) {
             const cell = frame.upvalues[op.index];
             if (cell.initialized) return .{ .ptr = &cell.value, .ok = true };
         }
-        if (op.kind == .var_ and op.index < frame.routine.var_table.len) {
+        if (op.kind == .var_) {
             const v = frame.routine.var_table[op.index];
             if (v.thread_bound) return .{ .ptr = &v.thread_value, .ok = true };
             if (v.bound) return .{ .ptr = &v.root, .ok = true };
@@ -3085,6 +3266,7 @@ pub const VM = struct {
     /// the frame chain in `error_trace` first.
     pub fn run(self: *VM) VmError!Value {
         self.error_detail = "";
+        try self.verifyTop(self.frames.items[0].routine);
         const saved = self.installLazyHost();
         defer lazy_mod.host = saved;
         self.loop(0) catch |err| {
@@ -3093,6 +3275,22 @@ pub const VM = struct {
         };
         self.frames.items[0].routine = &idle_routine;
         return self.result;
+    }
+
+    /// Verify a routine that runs as a top-level frame, which has no
+    /// upvalues, and every routine under it (`Routine.verify`), before
+    /// any of it runs: a failure is reported as a run's error is, its
+    /// trace one frame naming the instruction.
+    fn verifyTop(self: *VM, routine: *const Routine) VmError!void {
+        if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
+        var failure: VerifyFailure = undefined;
+        routine.verify(&failure) catch |err| {
+            self.error_trace.clearRetainingCapacity();
+            self.traced_error = err;
+            const r = failure.routine;
+            self.error_trace.append(self.allocator, .{ .name = r.name, .pc = failure.pc, .span = r.spanAt(failure.pc), .source = r.source }) catch {};
+            return err;
+        };
     }
 
     /// Where `err` left the run: every frame, innermost first, with
@@ -3377,16 +3575,8 @@ pub const VM = struct {
     /// the pc after it. The frame's `pc` is written only on the way out
     /// with an error, so the trace names the instruction as §13 says.
     inline fn nextAt(self: *VM, frame: *Frame, pc: usize) VmError!void {
-        const code = frame.routine.code;
-        if (pc >= code.len) {
-            frame.pc = @intCast(pc);
-            return VmError.BytecodeExhausted;
-        }
-        const inst = code.ptr[pc];
-        if (inst.kind != .primary) {
-            frame.pc = @intCast(pc + 1);
-            return VmError.BytecodeCorruption;
-        }
+        const inst = frame.routine.code[pc];
+        std.debug.assert(inst.kind == .primary);
         if (counting) opcode_counts[opIndex(inst)] += 1;
         return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst, pc + 1 });
     }
@@ -3677,36 +3867,30 @@ pub const VM = struct {
     // reads it.
 
     fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
-        const dst = self.slotAt(frame, inst.a.index);
+        const dst = self.verifiedSlot(frame, inst.a);
         const v = self.fastOperand(frame, inst.b);
         if (!v.ok) return self.general(frame, inst, pc);
-        dst.* = v.ptr.*;
+        copyWords(dst, v.ptr);
         return self.nextAt(frame, pc);
     }
 
     fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        const consts = frame.routine.consts;
-        const i = inst.wide();
-        if (!slotIn(frame, inst.a) or i >= consts.len) return self.general(frame, inst, pc);
-        self.slotAt(frame, inst.a.index).* = consts[i];
+        copyWords(self.verifiedSlot(frame, inst.a), &frame.routine.consts[inst.wide()]);
         return self.nextAt(frame, pc);
     }
 
     fn fastLoad(comptime v: Value) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
-                self.slotAt(frame, inst.a.index).* = v;
+                self.verifiedSlot(frame, inst.a).* = v;
                 return self.nextAt(frame, pc);
             }
         }.run;
     }
 
     fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        const target = inst.wide();
-        if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
-        return self.nextAt(frame, target);
+        _ = pc;
+        return self.nextAt(frame, inst.wide());
     }
 
     /// `jump:if-true` (`when`) and `jump:if-false`.
@@ -3715,10 +3899,7 @@ pub const VM = struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
                 const v = self.fastOperand(frame, inst.a);
                 if (!v.ok) return self.general(frame, inst, pc);
-                if (v.ptr.isTruthy() != when) return self.nextAt(frame, pc);
-                const target = inst.wide();
-                if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
-                return self.nextAt(frame, target);
+                return self.nextAt(frame, if (loadWords(v.ptr).isTruthy() == when) inst.wide() else pc);
             }
         }.run;
     }
@@ -3728,30 +3909,21 @@ pub const VM = struct {
     fn fastCmp(comptime c: NumCmp) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
-                const dst = self.slotAt(frame, inst.a.index);
+                const dst = self.verifiedSlot(frame, inst.a);
                 const lhs = self.fastOperand(frame, inst.b);
                 if (!lhs.ok) return self.general(frame, inst, pc);
                 const rhs = self.fastOperand(frame, inst.c);
                 if (!rhs.ok) return self.general(frame, inst, pc);
-                if (!lhs.ptr.isFixnum() or !rhs.ptr.isFixnum()) return self.general(frame, inst, pc);
-                const holds_ = ordered(i64, c, lhs.ptr.asFixnum(), rhs.ptr.asFixnum());
-                const code = frame.routine.code;
+                const l = loadWords(lhs.ptr);
+                const r = loadWords(rhs.ptr);
+                if (!l.isFixnum() or !r.isFixnum()) return self.general(frame, inst, pc);
+                const holds_ = ordered(i64, c, l.asFixnum(), r.asFixnum());
+                // A comparison never ends the code (§5).
+                const j = frame.routine.code[pc];
+                const lo: u32 = @truncate(@as(u64, @bitCast(j)));
+                const if_true = lo == condJumpKey(.if_true, inst.a);
                 var after = pc;
-                if (pc < code.len) {
-                    const j = code.ptr[pc];
-                    const lo: u32 = @truncate(@as(u64, @bitCast(j)));
-                    const if_true = lo == condJumpKey(.if_true, inst.a);
-                    if (if_true or lo == condJumpKey(.if_false, inst.a)) {
-                        after = pc + 1;
-                        if (holds_ == if_true) {
-                            after = j.wide();
-                            // A target outside the code traps in the
-                            // general handler.
-                            if (after >= code.len) return self.general(frame, inst, pc);
-                        }
-                    }
-                }
+                if (if_true or lo == condJumpKey(.if_false, inst.a)) after = if (holds_ == if_true) j.wide() else pc + 1;
                 dst.* = value_mod.fromBool(holds_);
                 return self.nextAt(frame, after);
             }
@@ -3762,38 +3934,35 @@ pub const VM = struct {
     fn fastMath(comptime op: Math) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
-                const dst = self.slotAt(frame, inst.a.index);
+                const dst = self.verifiedSlot(frame, inst.a);
                 const lhs = self.fastOperand(frame, inst.b);
                 if (!lhs.ok) return self.general(frame, inst, pc);
                 const rhs = self.fastOperand(frame, inst.c);
                 if (!rhs.ok) return self.general(frame, inst, pc);
-                if (!lhs.ptr.isFixnum() or !rhs.ptr.isFixnum()) return self.general(frame, inst, pc);
-                dst.* = fixnumResult(op, lhs.ptr.asFixnum(), rhs.ptr.asFixnum()) orelse return self.general(frame, inst, pc);
+                const l = loadWords(lhs.ptr);
+                const r = loadWords(rhs.ptr);
+                if (!l.isFixnum() or !r.isFixnum()) return self.general(frame, inst, pc);
+                dst.* = fixnumResult(op, l.asFixnum(), r.asFixnum()) orelse return self.general(frame, inst, pc);
                 return self.nextAt(frame, pc);
             }
         }.run;
     }
 
     fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        const var_table = frame.routine.var_table;
-        const i = inst.wide();
-        if (!slotIn(frame, inst.a) or i >= var_table.len) return self.general(frame, inst, pc);
-        const v = var_table[i];
+        const v = frame.routine.var_table[inst.wide()];
         // Through a pointer: a choice between two values is copied
         // through the stack.
         const value: *const Value = if (v.thread_bound) &v.thread_value else if (v.bound) &v.root else return self.general(frame, inst, pc);
-        self.slotAt(frame, inst.a.index).* = value.*;
+        copyWords(self.verifiedSlot(frame, inst.a), value);
         return self.nextAt(frame, pc);
     }
 
     fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        if (!slotIn(frame, inst.a) or !slotIn(frame, inst.b)) return self.general(frame, inst, pc);
-        const cell_v = self.slotAt(frame, inst.b.index).*;
+        const cell_v = loadWords(self.verifiedSlot(frame, inst.b));
         if (cell_v.kind() != .cell_internal) return self.general(frame, inst, pc);
         const cell = heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(cell_v.payload));
         if (!cell.initialized) return self.general(frame, inst, pc);
-        self.slotAt(frame, inst.a.index).* = cell.value;
+        copyWords(self.verifiedSlot(frame, inst.a), &cell.value);
         return self.nextAt(frame, pc);
     }
 
@@ -3803,11 +3972,10 @@ pub const VM = struct {
     /// A native and a keyword or symbol go on to handlers of their own,
     /// out of line: each calls out, and a call needs a stack frame.
     fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        if (inst.a.kind != .slot or inst.c.kind != .slot) return self.general(frame, inst, pc);
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
-        if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) return self.general(frame, inst, pc);
-        const callee = self.slotAt(frame, inst.a.index).*;
+        std.debug.assert(call_base + 1 + argc <= frame.slot_count);
+        const callee = loadWords(self.verifiedSlot(frame, inst.a));
         switch (callee.kind()) {
             .function => {
                 const base: usize = @as(usize, frame.base_slot) + call_base + 1;
@@ -3881,12 +4049,12 @@ pub const VM = struct {
         if (frame.host_result != null or n < 2) return self.general(frame, inst, pc);
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
-        if (dst >= caller.slot_count) return self.general(frame, inst, pc);
+        std.debug.assert(dst < caller.slot_count);
         std.debug.assert(caller.pc == frame.return_pc);
         const resume_pc = frame.return_pc;
         self.stack.items.len = frame.entry_stack_len;
         self.frames.items.len = n - 1;
-        self.slotAt(caller, dst).* = v.*;
+        copyWords(self.slotAt(caller, dst), v);
         if (!self.running()) return;
         return self.nextAt(caller, resume_pc);
     }
@@ -7337,6 +7505,59 @@ const dispatch_test_natives = struct {
     const native_sub = NativeFn{ .name = "sub", .min_arity = 2, .max_arity = 2, .call = &sub, .leaf = true };
     const native_refuse = NativeFn{ .name = "refuse", .min_arity = 1, .max_arity = 1, .call = &refuse, .leaf = true };
 };
+
+test "Routine.verify: the routines it refuses, each at its instruction" {
+    // What the dispatch trusts once a routine is verified (§5, §8):
+    // each case breaks one promise, and `run` refuses it before any
+    // instruction runs, with a trace naming the instruction.
+    const r = asm_.returnNil();
+    const bad_kind: Inst = @bitCast(@as(u64, @bitCast(asm_.loadNil(0))) | 1);
+    const child_bad = Routine{ .code = &.{ asm_.move(0, 7), r }, .consts = &.{}, .slot_count = 1, .name = "child" };
+    const child_caps = [_]CaptureDescriptor{.{ .routine = &child_bad, .sources = &.{} }};
+    const counted = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "counted" };
+    const counted_caps = [_]CaptureDescriptor{.{ .routine = &counted, .sources = &.{} }};
+    const tries = [_]Try{.{ .catch_pc = 5 }};
+    const consts = [_]Value{fx(1)};
+    const Case = struct { name: []const u8, code: []const Inst, slots: u16 = 2, caps: []const CaptureDescriptor = &.{}, err: VmError, where: []const u8 = "t", pc: u32 };
+    for ([_]Case{
+        .{ .name = "no code", .code = &.{}, .err = VmError.BytecodeExhausted, .pc = 0 },
+        .{ .name = "the code falls off its end", .code = &.{ asm_.loadNil(0), asm_.loadNil(1) }, .err = VmError.BytecodeExhausted, .pc = 1 },
+        .{ .name = "a comparison ends the code", .code = &.{asm_.cmpLt(0, kn(0), kn(0))}, .err = VmError.BytecodeExhausted, .pc = 0 },
+        .{ .name = "not a primary instruction", .code = &.{ bad_kind, r }, .err = VmError.BytecodeCorruption, .pc = 0 },
+        .{ .name = "a variant outside its group", .code = &.{ r, raw(.mov, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a jump past the code", .code = &.{ asm_.jumpJmp(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a branch past the code", .code = &.{ asm_.jumpIfTrue(9, kn(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a destination past the frame", .code = &.{ asm_.loadNil(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a destination not a slot", .code = &.{ asm_.moveFrom(0, sl(0)), Inst.primary(.mov, Mov.move, kn(0), sl(0), Operand.none), r }, .err = VmError.InvalidOperandKind, .pc = 1 },
+        .{ .name = "a slot read past the frame", .code = &.{ asm_.mathAdd(0, sl(0), sl(2)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a constant past the pool", .code = &.{ asm_.moveFrom(0, kn(1)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a wide constant past the pool", .code = &.{ asm_.loadConst(0, 1), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a Var past the table", .code = &.{ asm_.varLoadVar(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "an upvalue the routine has not", .code = &.{ asm_.moveFrom(0, Operand.upvalue(0)), r }, .err = VmError.UpvalueOutOfRange, .pc = 0 },
+        .{ .name = "a call block past the frame", .code = &.{ asm_.callCall(0, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
+        .{ .name = "a collection block past the frame", .code = &.{ asm_.collList(1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
+        .{ .name = "a capture count that is not the routine's", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &counted_caps, .err = VmError.CaptureCountMismatch, .pc = 0 },
+        .{ .name = "a routine under it", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &child_caps, .err = VmError.OperandOutOfRange, .where = "child", .pc = 0 },
+    }) |case| {
+        errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
+        const routine = Routine{ .code = case.code, .consts = &consts, .capture_descs = case.caps, .tries = &tries, .slot_count = case.slots, .name = "t" };
+        var failure: VerifyFailure = undefined;
+        try testing.expectError(case.err, routine.verify(&failure));
+        try testing.expectEqualStrings(case.where, failure.routine.name);
+        try testing.expectEqual(case.pc, failure.pc);
+        var vm = try VM.init(testing.allocator, &routine);
+        defer vm.deinit();
+        try testing.expectError(case.err, vm.run());
+        try testing.expectEqual(@as(usize, 1), vm.error_trace.items.len);
+        try testing.expectEqual(case.pc, vm.error_trace.items[0].pc);
+    }
+    // A top-level routine has no upvalues to read.
+    var vm = try VM.init(testing.allocator, &counted);
+    defer vm.deinit();
+    try testing.expectError(VmError.CaptureCountMismatch, vm.run());
+}
 
 test "VM dispatch: a trap after fast instructions names its instruction in every frame" {
     // The fast handlers keep pc in a register (§8): whatever ran fast

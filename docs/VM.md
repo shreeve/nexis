@@ -131,6 +131,28 @@ Routines carry no metadata map. Two routines compiled from the same
 source are not required to be identical; `=` on two closures
 compares identity.
 
+**Verified before it runs.** `Routine.verify` proves a routine, and
+every routine its capture descriptors build, fit to run: every
+instruction `primary` with an assigned opcode (a defined but
+unexecuted one, §10, passes and traps where it runs); every operand
+inside the table it indexes (a slot below `slot_count`, a constant,
+a Var, an upvalue below `upvalue_count`) and a destination a slot;
+every wide field inside its table, a jump target, a `try`'s catch and
+finally pcs and `ctrl:try-exit`'s continuation inside the code; every
+`call:call` and `coll:*` block inside the frame; every capture
+descriptor's sources inside the frame and the routine's upvalues, as
+many as the child's `upvalue_count`; and the last instruction one
+that never falls through (`jump:jmp`, `call:return`,
+`call:return-nil`, `ctrl:throw`, `ctrl:try-exit`,
+`ctrl:finally-exit`), so execution cannot run off the code. `run` and
+`runRoutine` verify the routine they run as a top-level frame, which
+has no upvalues, and so every routine a closure built under it can
+be; a routine that fails runs nothing, and its error leaves `run` or
+`runRoutine` with a one-frame trace naming the instruction (§13). The
+dispatch trusts what verification proved (§8). `allocClosure`, the
+only way to a closure, verifies its routine again in a debug build,
+so a closure over a routine no run verified is an assertion there.
+
 ---
 
 ### 6. Closure
@@ -367,11 +389,20 @@ it, which stays in a register from handler to handler.
 
 ```
 fetch at pc (every handler's last step):
-  if pc >= code.len: frame.pc = pc; BytecodeExhausted
   inst = frame.routine.code[pc]
-  if inst.kind is not primary: frame.pc = pc + 1; BytecodeCorruption
   tail-call fast_table[inst.group | inst.variant << 6](vm, frame, inst, pc + 1)
 ```
+
+The fetch checks nothing: verification (§5) proved every pc it can
+reach inside the code and every instruction `primary`, and the fast
+handlers read their operands, jump and fill call blocks without the
+bounds verification proved. The general handlers keep their checks.
+A fast handler reads a slot's value as two whole 8-byte words, the
+way a handler stores one, never its kind byte alone or both words in
+one 16-byte load: a load the size of a store in flight takes its data
+from the store, and any other waits for the store to reach the cache,
+which a loop carrying a value from slot to slot would pay at every
+instruction.
 
 - `op_table` holds every opcode's **general handler**, which takes
   every case and raises every trap. Every variant of `mov`, `jump` and
@@ -824,13 +855,13 @@ run):
 | Error | When |
 |---|---|
 | `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an `i` or `e` operand where a value is read, a store to `u` |
-| `OperandOutOfRange` | An operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target past the code |
-| `InvalidOperandKind` | An operand kind the position does not accept: `resolve` of unused, `store` to a constant, a destination that is not a slot |
-| `BytecodeExhausted` | `pc` ran past the code |
-| `BytecodeCorruption` | An instruction kind other than `primary`; an unrecognized group, variant or operand-kind bit pattern (§10); a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
-| `CallBlockOutOfRange` | A call block past the frame's slot count |
-| `CaptureCountMismatch` | A capture descriptor's source count differs from the child's `upvalue_count` |
-| `UpvalueOutOfRange` | A `u` index or `inherited_upvalue` source past the closure's upvalue count |
+| `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target or a `try`'s pc past the code |
+| `InvalidOperandKind` | Verification: a destination that is not a slot. Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
+| `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10). Where it runs: an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `CallBlockOutOfRange` | Verification: a call block past the frame's slot count |
+| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: a closure's cell count differs from its routine's |
+| `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |
 | `InvalidCellState` | `box-local` on a boxed slot; `init-cell` on an initialized cell |
 | `UninitializedCell` | `get-cell` or a `u` resolve of a placeholder not yet filled |
@@ -863,7 +894,9 @@ describes an earlier error.
 chain in `VM.error_trace`, innermost first, one
 `TraceFrame{name, pc, span, source}` per frame: the routine's name,
 the index of the instruction the frame was executing (the failing
-instruction innermost, the `call:call` in each caller), that
+instruction innermost, the `call:call` in each caller; for a routine
+verification refused, its one frame names the instruction it refused,
+the last one for code that runs off its end), that
 instruction's span from the routine's table (null without one) and
 the routine's `source`. Neither an untranslated `VmError` nor an
 uncaught throw pops a frame, so the chain is complete, including the

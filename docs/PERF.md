@@ -832,6 +832,35 @@ instruction to the next. With `pc` in a register the chain is gone.
 chain through `frame.pc` and its loop's chain through the slots (`i`
 written by one handler and read by the next) bound it.
 
+Verified once per routine (`docs/VM.md` §5, §8), the fetch and the
+fast handlers check no bound, and the fast handlers read a slot's
+value a word at a time, as it was stored. Seven interleaved rounds
+against the hot-section build, load 7–8:
+
+| Program | Before | Verified |
+|---|---:|---:|
+| `count` | 158.0 [156.5–158.2] / 16.8 [15.1–20.2] | 117.0 [116.4–117.5] / 12.6 [10.3–17.1] |
+| `acc` | 254.9 / 27.0 | 188.1 / 26.1 |
+| `fib`, per call | 377.1 / 50.7 | 302.5 / 50.6 |
+| `gcall` | 379.1 / 41.3 | 302.1 / 36.7 |
+| `lc` | 188.1 / 20.9 | 139.1 / 21.6 |
+| `mv` | 194.1 / 21.2 | 142.9 / 17.7 |
+| `lv` | 194.1 / 21.0 | 145.0 / 20.2 |
+| `kw` | 393.2 / 44.9 | 320.1 / 41.8 |
+| `leaf` | 493.2 / 62.9 | 401.0 / 52.3 |
+| `getnl` | 633.1 / 74.5 | 536.3 / 81.5 |
+
+Without the word reads the same build retired the same instructions
+and lost cycles where a loop carries a value through its slots (`acc`
+28.6 → 39.7, `lv` 23.9 → 29.6 cycles, 25 rounds): a handler reading a slot's
+kind byte, or both words in one 16-byte load, right after the handler
+before it stored the value as two words, waits for the store to reach
+the cache; the slower handlers before had left it time to. `lc` and
+`lv` stay bimodal across runs (`lc` 9.6–38.7 cycles in fifteen
+rounds against 17.2–21.3 before, medians 24.0 and 19.6), as the
+address of the stack against the constant pool or the Var changes
+from run to run: the next measurement is where the slots sit.
+
 The fast handlers in a section of their own, each on a cache line, in
 seven rounds at a load of 14: cycles a unit `count` 18.2 → 17.6, `acc`
 29.9 → 27.7, `fib` 50.6 → 49.9, `gcall` 42.1 → 40.1, `mv` 21.9 → 20.1,
@@ -986,7 +1015,8 @@ Each lever is a measured change: a before/after from `zig build bench`
   Through the table: the counting loop 210 → 175 instructions an
   iteration, a `fib` call 488.5 → 414.5; with `pc` passed from handler
   to handler in a register, 159 and 379, and the counting loop's
-  cycles 23.6 → 17.4.
+  cycles 23.6 → 17.4; with routines verified once and slots read by
+  words, 117 and 302.5, 12.6 cycles.
 - *A built sequence walked as its vector* (`docs/LIST.md` §3,
   `viewCursor`): the pipeline's phase 1,327 → 1,253 M instructions on
   the tree before §3.13's changes, which stepped a list inline in the
@@ -1105,4 +1135,4 @@ is one invocation's 30-sample median.
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
 | §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |
-| §3.16 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast; emdb `847c5d8`; shared with concurrent builds (load average 8–15 at the starts and the ends) | revamp, 2026-10-06, speed-v: `bin/nexis` built by `zig build install -Doptimize=fast` at `305eee3` (one table), `390d571` (fast handlers) and the `pc` commit, each pair in its own run; `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,mv,lv,kw,leaf,getnl` under the machine's core queue, one core; raw JSON in the revamp ledger (`.git/revamp/r2/bench/speed-v/`) |
+| §3.16 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast; emdb `847c5d8`; shared with concurrent builds (load average 8–15 at the starts and the ends) | revamp, 2026-10-06, speed-v: `bin/nexis` built by `zig build install -Doptimize=fast` at `305eee3` (one table), `390d571` (fast handlers) and the `pc` commit, each pair in its own run; `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,mv,lv,kw,leaf,getnl` under the machine's core queue, one core; the verified build against the hot-section build `1cc9e23` in seven rounds, and fifteen and twenty-five for the rows the text cites; raw JSON in the revamp ledger (`.git/revamp/r2/bench/speed-v/`) |
