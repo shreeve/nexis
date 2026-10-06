@@ -2948,6 +2948,24 @@ pub const VM = struct {
         return op.kind == .slot and op.index < frame.slot_count;
     }
 
+    /// `peek` for a fast handler, whose every other operand goes to the
+    /// general handler. A flag, not a null pointer, says which: the
+    /// pointers are never tested for null.
+    inline fn fastOperand(self: *VM, frame: *const Frame, op: Operand) struct { ptr: *const Value, ok: bool } {
+        if (op.kind == .slot and op.index < frame.slot_count) return .{ .ptr = self.slotAt(frame, op.index), .ok = true };
+        if (op.kind == .constant and op.index < frame.routine.consts.len) return .{ .ptr = &frame.routine.consts[op.index], .ok = true };
+        if (op.kind == .upvalue and op.index < frame.upvalues.len) {
+            const cell = frame.upvalues[op.index];
+            if (cell.initialized) return .{ .ptr = &cell.value, .ok = true };
+        }
+        if (op.kind == .var_ and op.index < frame.routine.var_table.len) {
+            const v = frame.routine.var_table[op.index];
+            if (v.thread_bound) return .{ .ptr = &v.thread_value, .ok = true };
+            if (v.bound) return .{ .ptr = &v.root, .ok = true };
+        }
+        return .{ .ptr = undefined, .ok = false };
+    }
+
     /// `resolveIn` of the operands its inline cases leave, into `out`.
     noinline fn resolveOther(self: *VM, frame: *const Frame, op: Operand, out: *Value) VmError!void {
         out.* = switch (op.kind) {
@@ -3528,6 +3546,27 @@ pub const VM = struct {
         return (lo & 0xFFFF) | @as(u32, @as(u16, @bitCast(test_op))) << 16;
     }
 
+    /// `op` of two fixnums when the result is a fixnum; null for a
+    /// promotion or a zero divisor, which the numeric tower takes. The
+    /// operands are i48: a sum or difference cannot leave i64, a
+    /// product that does is not a fixnum, and only `(quot fixnum_min
+    /// -1)` leaves i48 by division.
+    inline fn fixnumResult(comptime op: Math, x: i64, y: i64) ?Value {
+        const r = switch (op) {
+            .add => x + y,
+            .sub => x - y,
+            .mul => blk: {
+                const p = @mulWithOverflow(x, y);
+                if (p[1] != 0) return null;
+                break :blk p[0];
+            },
+            .idiv => if (y != 0) @divTrunc(x, y) else return null,
+            .mod => if (y != 0) @mod(x, y) else return null,
+            else => comptime unreachable,
+        };
+        return value_mod.fromFixnum(r);
+    }
+
     /// `cmp:<c>` through the numeric tower. When the next instruction
     /// is a conditional jump on the slot just written, the compiler's
     /// lowering of an `if` on a comparison, it runs here too: the pair
@@ -3622,20 +3661,21 @@ pub const VM = struct {
         return self.next(self.currentFrame());
     }
 
-    // The fast handlers. Each reads its operands in place (`peek`, a
-    // slot tested apart so that its pointer is not tested for null),
-    // stores only to a slot of its frame, calls nothing and allocates
-    // nothing, so it ends at no safe point, and hands any other case to
-    // its general handler, or to a part of its own out of line, before
-    // it has changed anything. `pc` stays in a register: the frame's
-    // `pc` is written only before a frame is pushed or a native called,
-    // where a return or an error trace reads it.
+    // The fast handlers. Each reads its operands in place
+    // (`fastOperand`), stores only to a slot of its frame, calls
+    // nothing and allocates nothing, so it ends at no safe point, and
+    // hands any other case to its general handler, or to a part of its
+    // own out of line, before it has changed anything. `pc` stays in a
+    // register: the frame's `pc` is written only before a frame is
+    // pushed or a native called, where a return or an error trace
+    // reads it.
 
     fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
         const dst = self.slotAt(frame, inst.a.index);
-        const v = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
-        dst.* = v.*;
+        const v = self.fastOperand(frame, inst.b);
+        if (!v.ok) return self.general(frame, inst, pc);
+        dst.* = v.ptr.*;
         return self.nextAt(frame, pc);
     }
 
@@ -3667,8 +3707,9 @@ pub const VM = struct {
     fn fastBranch(comptime when: bool) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
-                const v = if (slotIn(frame, inst.a)) self.slotAt(frame, inst.a.index) else self.peek(frame, inst.a) orelse return self.general(frame, inst, pc);
-                if (v.isTruthy() != when) return self.nextAt(frame, pc);
+                const v = self.fastOperand(frame, inst.a);
+                if (!v.ok) return self.general(frame, inst, pc);
+                if (v.ptr.isTruthy() != when) return self.nextAt(frame, pc);
                 const target = inst.wide();
                 if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
                 return self.nextAt(frame, target);
@@ -3683,10 +3724,12 @@ pub const VM = struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
                 if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 const dst = self.slotAt(frame, inst.a.index);
-                const lhs = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
-                const rhs = if (slotIn(frame, inst.c)) self.slotAt(frame, inst.c.index) else self.peek(frame, inst.c) orelse return self.general(frame, inst, pc);
-                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst, pc);
-                const holds_ = ordered(i64, c, lhs.asFixnum(), rhs.asFixnum());
+                const lhs = self.fastOperand(frame, inst.b);
+                if (!lhs.ok) return self.general(frame, inst, pc);
+                const rhs = self.fastOperand(frame, inst.c);
+                if (!rhs.ok) return self.general(frame, inst, pc);
+                if (!lhs.ptr.isFixnum() or !rhs.ptr.isFixnum()) return self.general(frame, inst, pc);
+                const holds_ = ordered(i64, c, lhs.ptr.asFixnum(), rhs.ptr.asFixnum());
                 const code = frame.routine.code;
                 var after = pc;
                 if (pc < code.len) {
@@ -3715,27 +3758,12 @@ pub const VM = struct {
             fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
                 if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 const dst = self.slotAt(frame, inst.a.index);
-                const lhs = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
-                const rhs = if (slotIn(frame, inst.c)) self.slotAt(frame, inst.c.index) else self.peek(frame, inst.c) orelse return self.general(frame, inst, pc);
-                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst, pc);
-                const x = lhs.asFixnum();
-                const y = rhs.asFixnum();
-                // i48 operands: a sum or difference cannot leave i64,
-                // and a product that does is not a fixnum. Only
-                // `(quot fixnum_min -1)` leaves i48 by division.
-                const r = switch (op) {
-                    .add => x + y,
-                    .sub => x - y,
-                    .mul => blk: {
-                        const p = @mulWithOverflow(x, y);
-                        if (p[1] != 0) return self.general(frame, inst, pc);
-                        break :blk p[0];
-                    },
-                    .idiv => if (y != 0) @divTrunc(x, y) else return self.general(frame, inst, pc),
-                    .mod => if (y != 0) @mod(x, y) else return self.general(frame, inst, pc),
-                    else => comptime unreachable,
-                };
-                dst.* = value_mod.fromFixnum(r) orelse return self.general(frame, inst, pc);
+                const lhs = self.fastOperand(frame, inst.b);
+                if (!lhs.ok) return self.general(frame, inst, pc);
+                const rhs = self.fastOperand(frame, inst.c);
+                if (!rhs.ok) return self.general(frame, inst, pc);
+                if (!lhs.ptr.isFixnum() or !rhs.ptr.isFixnum()) return self.general(frame, inst, pc);
+                dst.* = fixnumResult(op, lhs.ptr.asFixnum(), rhs.ptr.asFixnum()) orelse return self.general(frame, inst, pc);
                 return self.nextAt(frame, pc);
             }
         }.run;
@@ -3828,8 +3856,9 @@ pub const VM = struct {
     /// caller's slot and continue in the caller, whose `pc` the call
     /// left at its return point.
     fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
-        const v = if (slotIn(frame, inst.a)) self.slotAt(frame, inst.a.index) else self.peek(frame, inst.a) orelse return self.general(frame, inst, pc);
-        return self.returnFast(frame, inst, pc, v);
+        const v = self.fastOperand(frame, inst.a);
+        if (!v.ok) return self.general(frame, inst, pc);
+        return self.returnFast(frame, inst, pc, v.ptr);
     }
 
     fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
