@@ -332,7 +332,7 @@ collector root (§9).
 
 | Field | Contents |
 |---|---|
-| `routine`, `pc` | The routine and the index of the next instruction |
+| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument |
 | `base_slot`, `slot_count` | The window into the shared backing stack (`vm.stack`); `slot[i]` is `stack[base_slot + i]` |
 | `entry_stack_len` | The stack length before the window grew; a return or an unwind restores it |
 | `upvalues` | The closure's cell array (shared, not owned) |
@@ -361,14 +361,16 @@ variant together (`group | variant << 6`, 4096 entries). A handler
 runs its instruction, then fetches the next one itself and tail-calls
 that instruction's handler (`@call(.always_tail, ...)`), so an
 instruction costs one indirect branch and the native stack does not
-grow with the instructions run.
+grow with the instructions run. A handler is called with the VM, the
+frame, the instruction and `pc`, the index of the instruction after
+it, which stays in a register from handler to handler.
 
 ```
-fetch (every handler's last step):
-  if frame.pc >= code.len: BytecodeExhausted
-  inst = frame.routine.code[frame.pc]; frame.pc += 1
-  if inst.kind is not primary: BytecodeCorruption
-  tail-call fast_table[inst.group | inst.variant << 6](vm, frame, inst)
+fetch at pc (every handler's last step):
+  if pc >= code.len: frame.pc = pc; BytecodeExhausted
+  inst = frame.routine.code[pc]
+  if inst.kind is not primary: frame.pc = pc + 1; BytecodeCorruption
+  tail-call fast_table[inst.group | inst.variant << 6](vm, frame, inst, pc + 1)
 ```
 
 - `op_table` holds every opcode's **general handler**, which takes
@@ -392,7 +394,11 @@ fetch (every handler's last step):
   every safe point and every allocation is the general handler's. The
   table indexed at run time is what keeps the optimizer from inlining
   the general handler, and the stack frame it needs, back into the
-  fast one. Release builds keep no frame pointer, so a fast handler
+  fast one. A case that calls out, a leaf native or a keyword
+  looking itself up, goes on to a part of its own out of line: a call
+  in return position that is never inlined, which a release build
+  makes a tail call, so the stack frame the part needs is not the fast
+  handler's. Release builds keep no frame pointer, so a fast handler
   has no frame record to push either.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns.
@@ -410,9 +416,16 @@ fetch (every handler's last step):
   and each native call (`docs/TOOLING.md` §1); any other build
   compiles the counting out.
 - The pc advances before the handler runs, so a handler sees the
-  next pc: a conditional jump not taken does nothing, a taken one
-  overwrites `pc`, and every frame's `pc` in an error trace is one
-  past its instruction (§13).
+  next pc: a conditional jump not taken fetches at it, a taken one at
+  its target. The frame's `pc` field is written only where something
+  reads it: every general handler writes it on entry, before anything
+  that can raise, call out, reach a safe point or end the chain, and
+  goes on from the field; a fast handler writes it only before it
+  pushes a frame (the return and a trace through the callee read it)
+  or calls a native, and otherwise fetches at the `pc` it was passed.
+  So every frame's `pc` in an error trace is one past its instruction
+  (§13), and a frame's `pc` under a frame it called is its return
+  point.
 - The fast handlers read a slot, a constant, an initialized upvalue
   or a bound Var in place and leave every other operand, a trap
   included, to the general handler's resolution (§4). Two fixnums

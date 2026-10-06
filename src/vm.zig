@@ -49,6 +49,7 @@ const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 const stack_guard = @import("stack.zig");
 const build_options = @import("build_options");
+const builtin = @import("builtin");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -2793,7 +2794,7 @@ pub const VM = struct {
             self.nested_runs -= 1;
         }
         while (self.running()) {
-            opEnter(self, self.currentFrame(), undefined) catch |err| switch (err) {
+            opEnter(self, self.currentFrame(), undefined, undefined) catch |err| switch (err) {
                 // A native's throw was caught below it: frames and pc
                 // are already at the handler.
                 VmError.ControlTransferred => {},
@@ -3265,7 +3266,7 @@ pub const VM = struct {
     // back into the fast one.
     // -------------------------------------------------------------------------
 
-    const OpHandler = *const fn (*VM, *Frame, Inst) VmError!void;
+    const OpHandler = *const fn (*VM, *Frame, Inst, usize) VmError!void;
 
     /// An instruction's index into the tables: its group and variant
     /// bits, `group | variant << 6`.
@@ -3348,23 +3349,39 @@ pub const VM = struct {
         break :blk t;
     };
 
-    /// Fetch `frame`'s next instruction and tail-call its handler.
+    /// Fetch the instruction at `frame.pc` and tail-call its handler:
+    /// the fetch of a handler that worked on `frame.pc` (§8).
     inline fn next(self: *VM, frame: *Frame) VmError!void {
+        return self.nextAt(frame, frame.pc);
+    }
+
+    /// Fetch the instruction at `pc` and tail-call its handler with
+    /// the pc after it. The frame's `pc` is written only on the way out
+    /// with an error, so the trace names the instruction as §13 says.
+    inline fn nextAt(self: *VM, frame: *Frame, pc: usize) VmError!void {
         const code = frame.routine.code;
-        const pc = frame.pc;
-        if (pc >= code.len) return VmError.BytecodeExhausted;
-        const inst = code[pc];
-        frame.pc = pc + 1;
-        if (inst.kind != .primary) return VmError.BytecodeCorruption;
+        if (pc >= code.len) {
+            frame.pc = @intCast(pc);
+            return VmError.BytecodeExhausted;
+        }
+        const inst = code.ptr[pc];
+        if (inst.kind != .primary) {
+            frame.pc = @intCast(pc + 1);
+            return VmError.BytecodeCorruption;
+        }
         if (counting) opcode_counts[opIndex(inst)] += 1;
-        return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst });
+        return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst, pc + 1 });
     }
 
     /// `next` after an instruction that could allocate: the safe
     /// point (§9).
     inline fn nextSafe(self: *VM, frame: *Frame) VmError!void {
+        return self.nextSafeAt(frame, frame.pc);
+    }
+
+    inline fn nextSafeAt(self: *VM, frame: *Frame, pc: usize) VmError!void {
         if (self.gcDue()) self.collectGarbage();
-        return self.next(frame);
+        return self.nextAt(frame, pc);
     }
 
     /// `next` after an instruction that could pop or unwind frames or
@@ -3375,23 +3392,33 @@ pub const VM = struct {
         return self.next(self.currentFrame());
     }
 
+    /// How a fast handler hands its instruction to a part of its own
+    /// kept out of line, one that calls out and so needs a stack frame
+    /// (em `src/runtime.zig` `outOfLine`): a call in return position
+    /// never inlined, which a release build makes a tail call; inlined,
+    /// the part's frame would be the fast handler's. A debug build
+    /// makes a tail call only when told to.
+    const out_of_line: std.lang.CallModifier = if (builtin.optimize == .debug) .always_tail else .never_inline;
+
     /// A fast handler's way out: `inst`'s general handler, which takes
     /// the case from the start.
-    inline fn general(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst });
+    inline fn general(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst, pc });
     }
 
     /// Where `loop` enters the chain: a safe point, then the current
     /// frame's next instruction.
-    fn opEnter(self: *VM, frame: *Frame, _: Inst) VmError!void {
+    fn opEnter(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
         return self.nextSafe(frame);
     }
 
-    fn opCorrupt(_: *VM, _: *Frame, _: Inst) VmError!void {
+    fn opCorrupt(_: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         return VmError.BytecodeCorruption;
     }
 
-    fn opUnimplemented(_: *VM, _: *Frame, _: Inst) VmError!void {
+    fn opUnimplemented(_: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         return VmError.UnimplementedOpcode;
     }
 
@@ -3401,28 +3428,33 @@ pub const VM = struct {
     // and `coll` allocate on the heap only; `call` and `ctrl` may
     // change the frame chain.
 
-    fn opVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execVar(frame, inst);
         return self.next(frame);
     }
 
-    fn opMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opMath(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execMath(frame, inst);
         return self.nextSafe(frame);
     }
 
-    fn opClosure(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opClosure(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execClosure(inst);
         return self.nextSafe(frame);
     }
 
-    fn opColl(self: *VM, _: *Frame, inst: Inst) VmError!void {
+    fn opColl(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execColl(inst);
         // Hashing a lazy key realizes it, which may grow the frames.
         return self.nextSafe(self.currentFrame());
     }
 
-    fn opCtrl(self: *VM, _: *Frame, inst: Inst) VmError!void {
+    fn opCtrl(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execCtrl(inst);
         return self.nextFrame();
     }
@@ -3430,7 +3462,8 @@ pub const VM = struct {
     // The general handlers of the hot variants: the same effect and
     // traps as their group's, without its switch.
 
-    fn opMove(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         var tmp: Value = undefined;
         try self.storeIn(frame, inst.a, (try self.operandPtr(frame, inst.b, &tmp)).*);
         return self.next(frame);
@@ -3439,14 +3472,16 @@ pub const VM = struct {
     /// `mov:load-nil`, `mov:load-true`, `mov:load-false`.
     fn loadHandler(comptime v: Value) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                frame.pc = @intCast(pc);
                 try self.storeIn(frame, inst.a, v);
                 return self.next(frame);
             }
         }.run;
     }
 
-    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         const consts = frame.routine.consts;
         const i = inst.wide();
         if (i >= consts.len) return VmError.OperandOutOfRange;
@@ -3454,29 +3489,34 @@ pub const VM = struct {
         return self.next(frame);
     }
 
-    fn opJmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try applyJump(frame, inst.wide());
         return self.next(frame);
     }
 
-    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         var tmp: Value = undefined;
         if ((try self.operandPtr(frame, inst.a, &tmp)).isFalsy()) try applyJump(frame, inst.wide());
         return self.next(frame);
     }
 
-    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         var tmp: Value = undefined;
         if ((try self.operandPtr(frame, inst.a, &tmp)).isTruthy()) try applyJump(frame, inst.wide());
         return self.next(frame);
     }
 
-    fn opGetCell(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execClosureGetCell(frame, inst);
         return self.next(frame);
     }
 
-    fn opLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.execVarLoadVar(frame, inst);
         return self.next(frame);
     }
@@ -3495,7 +3535,8 @@ pub const VM = struct {
     /// running the two in turn leaves.
     fn cmpHandler(comptime c: NumCmp) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                frame.pc = @intCast(pc);
                 var lhs_tmp: Value = undefined;
                 var rhs_tmp: Value = undefined;
                 const lhs = try self.operandPtr(frame, inst.b, &lhs_tmp);
@@ -3525,7 +3566,8 @@ pub const VM = struct {
     /// its arguments copied to a buffer on the native stack; every
     /// other call, and every call that traps, goes through
     /// `execCallCall`.
-    fn opCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         buffered: {
             if (inst.a.kind != .slot or inst.c.kind != .slot) break :buffered;
             const call_base: u32 = inst.a.index;
@@ -3564,7 +3606,8 @@ pub const VM = struct {
         return self.nextSafe(self.currentFrame());
     }
 
-    fn opReturn(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         // Read the value while the callee frame is still active;
         // popping first would invalidate the slot.
         try self.returnValue(try self.resolveIn(frame, inst.a));
@@ -3572,61 +3615,63 @@ pub const VM = struct {
         return self.next(self.currentFrame());
     }
 
-    fn opReturnNil(self: *VM, _: *Frame, _: Inst) VmError!void {
+    fn opReturnNil(self: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
         try self.returnValue(value_mod.nilValue());
         if (!self.running()) return;
         return self.next(self.currentFrame());
     }
 
-    // The fast handlers. Each reads its operands in place (`peek`),
-    // stores only to a slot of its frame, calls nothing but a leaf
-    // native, and hands any other case to its general handler before
-    // it has changed anything. None allocates, so none ends at a safe
-    // point but the leaf call's.
+    // The fast handlers. Each reads its operands in place (`peek`, a
+    // slot tested apart so that its pointer is not tested for null),
+    // stores only to a slot of its frame, calls nothing and allocates
+    // nothing, so it ends at no safe point, and hands any other case to
+    // its general handler, or to a part of its own out of line, before
+    // it has changed anything. `pc` stays in a register: the frame's
+    // `pc` is written only before a frame is pushed or a native called,
+    // where a return or an error trace reads it.
 
-    fn fastMove(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        if (!slotIn(frame, inst.a)) return self.general(frame, inst);
-        const v = self.peek(frame, inst.b) orelse return self.general(frame, inst);
-        self.slotAt(frame, inst.a.index).* = v.*;
-        return self.next(frame);
+    fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
+        const dst = self.slotAt(frame, inst.a.index);
+        const v = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
+        dst.* = v.*;
+        return self.nextAt(frame, pc);
     }
 
-    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         const consts = frame.routine.consts;
         const i = inst.wide();
-        if (!slotIn(frame, inst.a) or i >= consts.len) return self.general(frame, inst);
+        if (!slotIn(frame, inst.a) or i >= consts.len) return self.general(frame, inst, pc);
         self.slotAt(frame, inst.a.index).* = consts[i];
-        return self.next(frame);
+        return self.nextAt(frame, pc);
     }
 
     fn fastLoad(comptime v: Value) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 self.slotAt(frame, inst.a.index).* = v;
-                return self.next(frame);
+                return self.nextAt(frame, pc);
             }
         }.run;
     }
 
-    fn fastJmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         const target = inst.wide();
-        if (target >= frame.routine.code.len) return self.general(frame, inst);
-        frame.pc = target;
-        return self.next(frame);
+        if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
+        return self.nextAt(frame, target);
     }
 
     /// `jump:if-true` (`when`) and `jump:if-false`.
     fn fastBranch(comptime when: bool) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-                const v = self.peek(frame, inst.a) orelse return self.general(frame, inst);
-                if (v.isTruthy() == when) {
-                    const target = inst.wide();
-                    if (target >= frame.routine.code.len) return self.general(frame, inst);
-                    frame.pc = target;
-                }
-                return self.next(frame);
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                const v = if (slotIn(frame, inst.a)) self.slotAt(frame, inst.a.index) else self.peek(frame, inst.a) orelse return self.general(frame, inst, pc);
+                if (v.isTruthy() != when) return self.nextAt(frame, pc);
+                const target = inst.wide();
+                if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
+                return self.nextAt(frame, target);
             }
         }.run;
     }
@@ -3635,27 +3680,31 @@ pub const VM = struct {
     /// it.
     fn fastCmp(comptime c: NumCmp) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
-                const lhs = self.peek(frame, inst.b) orelse return self.general(frame, inst);
-                const rhs = self.peek(frame, inst.c) orelse return self.general(frame, inst);
-                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst);
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
+                const dst = self.slotAt(frame, inst.a.index);
+                const lhs = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
+                const rhs = if (slotIn(frame, inst.c)) self.slotAt(frame, inst.c.index) else self.peek(frame, inst.c) orelse return self.general(frame, inst, pc);
+                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst, pc);
                 const holds_ = ordered(i64, c, lhs.asFixnum(), rhs.asFixnum());
                 const code = frame.routine.code;
-                var pc = frame.pc;
+                var after = pc;
                 if (pc < code.len) {
-                    const j = code[pc];
+                    const j = code.ptr[pc];
                     const lo: u32 = @truncate(@as(u64, @bitCast(j)));
-                    if (lo == condJumpKey(.if_false, inst.a) or lo == condJumpKey(.if_true, inst.a)) {
-                        const taken = holds_ == (lo == condJumpKey(.if_true, inst.a));
-                        pc = if (taken) j.wide() else pc + 1;
-                        // A target outside the code traps in the general handler.
-                        if (taken and pc >= code.len) return self.general(frame, inst);
+                    const if_true = lo == condJumpKey(.if_true, inst.a);
+                    if (if_true or lo == condJumpKey(.if_false, inst.a)) {
+                        after = pc + 1;
+                        if (holds_ == if_true) {
+                            after = j.wide();
+                            // A target outside the code traps in the
+                            // general handler.
+                            if (after >= code.len) return self.general(frame, inst, pc);
+                        }
                     }
                 }
-                self.slotAt(frame, inst.a.index).* = value_mod.fromBool(holds_);
-                frame.pc = pc;
-                return self.next(frame);
+                dst.* = value_mod.fromBool(holds_);
+                return self.nextAt(frame, after);
             }
         }.run;
     }
@@ -3663,11 +3712,12 @@ pub const VM = struct {
     /// `math:<op>` of two fixnums whose result is a fixnum.
     fn fastMath(comptime op: Math) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
-                const lhs = self.peek(frame, inst.b) orelse return self.general(frame, inst);
-                const rhs = self.peek(frame, inst.c) orelse return self.general(frame, inst);
-                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst);
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
+                const dst = self.slotAt(frame, inst.a.index);
+                const lhs = if (slotIn(frame, inst.b)) self.slotAt(frame, inst.b.index) else self.peek(frame, inst.b) orelse return self.general(frame, inst, pc);
+                const rhs = if (slotIn(frame, inst.c)) self.slotAt(frame, inst.c.index) else self.peek(frame, inst.c) orelse return self.general(frame, inst, pc);
+                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst, pc);
                 const x = lhs.asFixnum();
                 const y = rhs.asFixnum();
                 // i48 operands: a sum or difference cannot leave i64,
@@ -3678,111 +3728,132 @@ pub const VM = struct {
                     .sub => x - y,
                     .mul => blk: {
                         const p = @mulWithOverflow(x, y);
-                        if (p[1] != 0) return self.general(frame, inst);
+                        if (p[1] != 0) return self.general(frame, inst, pc);
                         break :blk p[0];
                     },
-                    .idiv => if (y != 0) @divTrunc(x, y) else return self.general(frame, inst),
-                    .mod => if (y != 0) @mod(x, y) else return self.general(frame, inst),
+                    .idiv => if (y != 0) @divTrunc(x, y) else return self.general(frame, inst, pc),
+                    .mod => if (y != 0) @mod(x, y) else return self.general(frame, inst, pc),
                     else => comptime unreachable,
                 };
-                self.slotAt(frame, inst.a.index).* = value_mod.fromFixnum(r) orelse return self.general(frame, inst);
-                return self.next(frame);
+                dst.* = value_mod.fromFixnum(r) orelse return self.general(frame, inst, pc);
+                return self.nextAt(frame, pc);
             }
         }.run;
     }
 
-    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         const var_table = frame.routine.var_table;
         const i = inst.wide();
-        if (!slotIn(frame, inst.a) or i >= var_table.len) return self.general(frame, inst);
+        if (!slotIn(frame, inst.a) or i >= var_table.len) return self.general(frame, inst, pc);
         const v = var_table[i];
-        const value = if (v.thread_bound) v.thread_value else if (v.bound) v.root else return self.general(frame, inst);
-        self.slotAt(frame, inst.a.index).* = value;
-        return self.next(frame);
+        // Through a pointer: a choice between two values is copied
+        // through the stack.
+        const value: *const Value = if (v.thread_bound) &v.thread_value else if (v.bound) &v.root else return self.general(frame, inst, pc);
+        self.slotAt(frame, inst.a.index).* = value.*;
+        return self.nextAt(frame, pc);
     }
 
-    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        if (!slotIn(frame, inst.a) or !slotIn(frame, inst.b)) return self.general(frame, inst);
+    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        if (!slotIn(frame, inst.a) or !slotIn(frame, inst.b)) return self.general(frame, inst, pc);
         const cell_v = self.slotAt(frame, inst.b.index).*;
-        if (cell_v.kind() != .cell_internal) return self.general(frame, inst);
+        if (cell_v.kind() != .cell_internal) return self.general(frame, inst, pc);
         const cell = heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(cell_v.payload));
-        if (!cell.initialized) return self.general(frame, inst);
+        if (!cell.initialized) return self.general(frame, inst, pc);
         self.slotAt(frame, inst.a.index).* = cell.value;
-        return self.next(frame);
+        return self.nextAt(frame, pc);
     }
 
     /// `call:call` of a closure with its fixed arity where the frame
     /// chain and the stack's capacity have room, whose frame is pushed
-    /// without allocating, so its callee starts without a safe point;
-    /// of a leaf native within its arity, on its arguments in place;
-    /// and of a keyword or symbol looking itself up in a map, a record
-    /// or nil, which allocates nothing and is no safe point either.
-    fn fastCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        if (inst.a.kind != .slot or inst.c.kind != .slot) return self.general(frame, inst);
+    /// without allocating, so its callee starts without a safe point.
+    /// A native and a keyword or symbol go on to handlers of their own,
+    /// out of line: each calls out, and a call needs a stack frame.
+    fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        if (inst.a.kind != .slot or inst.c.kind != .slot) return self.general(frame, inst, pc);
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
-        if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) return self.general(frame, inst);
+        if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) return self.general(frame, inst, pc);
         const callee = self.slotAt(frame, inst.a.index).*;
-        const base: usize = @as(usize, frame.base_slot) + call_base + 1;
         switch (callee.kind()) {
             .function => {
+                const base: usize = @as(usize, frame.base_slot) + call_base + 1;
                 const callee_frame = self.enterClosureDirect(callee, base, argc, .{
                     .return_dst = inst.c.index,
-                    .return_pc = frame.pc,
-                }) orelse return self.general(frame, inst);
-                return self.next(callee_frame);
+                    .return_pc = @intCast(pc),
+                }) orelse return self.general(frame, inst, pc);
+                // The caller's place, for a trace through the callee
+                // and for its return.
+                frame.pc = @intCast(pc);
+                return self.nextAt(callee_frame, 0);
             },
-            .native_fn => {
-                const native = asNativeFn(callee);
-                if (!native.leaf or argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst);
-                // Nothing can grow the stack under a leaf, so it reads
-                // its arguments where they are.
-                const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
-                    VmError.NeedsReentry => return self.general(frame, inst),
-                    else => return err,
-                };
-                countNative(native);
-                self.slotAt(frame, inst.c.index).* = result;
-                return self.nextSafe(frame);
-            },
-            // `(:k m)`, `(:k m d)`, `('s m)` on a map, a record or
-            // nil: the lookup `callLookupIn` makes. An immediate key
-            // hashes and compares without the callbacks, so nothing is
-            // allocated and no data is walked.
-            .keyword, .symbol => {
-                if (argc != 1 and argc != 2) return self.general(frame, inst);
-                const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
-                const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst);
-                self.slotAt(frame, inst.c.index).* = result;
-                return self.next(frame);
-            },
-            else => return self.general(frame, inst),
+            .native_fn => return @call(out_of_line, callLeaf, .{ self, frame, inst, pc }),
+            .keyword, .symbol => return @call(out_of_line, callLookup, .{ self, frame, inst, pc }),
+            else => return self.general(frame, inst, pc),
         }
     }
 
+    /// `fastCall` of a leaf native within its arity, on its arguments
+    /// in place: nothing can grow the stack under a leaf.
+    fn callLeaf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        const native = asNativeFn(self.slotAt(frame, inst.a.index).*);
+        const argc: u32 = inst.b.index;
+        if (!native.leaf or argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst, pc);
+        const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
+        frame.pc = @intCast(pc);
+        const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
+            VmError.NeedsReentry => return self.general(frame, inst, pc),
+            else => return err,
+        };
+        countNative(native);
+        self.slotAt(frame, inst.c.index).* = result;
+        return self.nextSafeAt(frame, pc);
+    }
+
+    /// `fastCall` of a keyword or symbol, `(:k m)`, `(:k m d)`, `('s m)`,
+    /// on a map, a record or nil: the lookup `callLookupIn` makes. An
+    /// immediate key hashes and compares without the callbacks, so
+    /// nothing is allocated and no data is walked.
+    fn callLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        const argc: u32 = inst.b.index;
+        if (argc != 1 and argc != 2) return self.general(frame, inst, pc);
+        const callee = self.slotAt(frame, inst.a.index).*;
+        const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
+        const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
+        const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst, pc);
+        self.slotAt(frame, inst.c.index).* = result;
+        return self.nextAt(frame, pc);
+    }
+
     /// `call:return` from a frame `call:call` pushed: pop it, write the
-    /// caller's slot and continue in the caller.
-    fn fastReturn(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        const v = self.peek(frame, inst.a) orelse return self.general(frame, inst);
-        return self.returnFast(frame, inst, v.*);
+    /// caller's slot and continue in the caller, whose `pc` the call
+    /// left at its return point.
+    fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        const v = if (slotIn(frame, inst.a)) self.slotAt(frame, inst.a.index) else self.peek(frame, inst.a) orelse return self.general(frame, inst, pc);
+        return self.returnFast(frame, inst, pc, v);
     }
 
-    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        return self.returnFast(frame, inst, value_mod.nilValue());
+    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        return self.returnFast(frame, inst, pc, &nil_value);
     }
 
-    inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, v: Value) VmError!void {
+    const nil_value = value_mod.nilValue();
+
+    /// The returned value by pointer: the slot it is read from stays
+    /// in place while the frame pops, and a value passed by copy goes
+    /// through the stack.
+    inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, pc: usize, v: *const Value) VmError!void {
         const n = self.frames.items.len;
-        if (frame.host_result != null or n < 2) return self.general(frame, inst);
+        if (frame.host_result != null or n < 2) return self.general(frame, inst, pc);
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
-        if (dst >= caller.slot_count) return self.general(frame, inst);
-        caller.pc = frame.return_pc;
+        if (dst >= caller.slot_count) return self.general(frame, inst, pc);
+        std.debug.assert(caller.pc == frame.return_pc);
+        const resume_pc = frame.return_pc;
         self.stack.items.len = frame.entry_stack_len;
         self.frames.items.len = n - 1;
-        self.slotAt(caller, dst).* = v;
+        self.slotAt(caller, dst).* = v.*;
         if (!self.running()) return;
-        return self.next(caller);
+        return self.nextAt(caller, resume_pc);
     }
 
     // -------------------------------------------------------------------------
@@ -7220,10 +7291,60 @@ const dispatch_test_natives = struct {
     fn sub(_: *VM, args: []const Value) VmError!Value {
         return fx(args[0].asFixnum() - args[1].asFixnum());
     }
+    fn refuse(_: *VM, _: []const Value) VmError!Value {
+        return VmError.KindMismatch;
+    }
     const native_boom = NativeFn{ .name = "boom", .min_arity = 0, .max_arity = 0, .call = &boom };
     const native_call = NativeFn{ .name = "call", .min_arity = 1, .max_arity = null, .call = &callArg };
     const native_sub = NativeFn{ .name = "sub", .min_arity = 2, .max_arity = 2, .call = &sub, .leaf = true };
+    const native_refuse = NativeFn{ .name = "refuse", .min_arity = 1, .max_arity = 1, .call = &refuse, .leaf = true };
 };
+
+test "VM dispatch: a trap after fast instructions names its instruction in every frame" {
+    // The fast handlers keep pc in a register (§8): whatever ran fast
+    // before a trap, each frame of the trace is one past its own
+    // instruction (§13). The child adds a fixnum, then `true`, which
+    // the fast handler hands to the general one.
+    const child_code = [_]Inst{
+        asm_.loadConst(1, 0),
+        asm_.mathAdd(2, sl(0), sl(1)),
+        asm_.mathAdd(2, sl(2), kn(1)),
+        asm_.returnSlot(2),
+    };
+    const child_consts = [_]Value{ fx(1), true_v };
+    const child = Routine{ .code = &child_code, .consts = &child_consts, .slot_count = 3, .fixed_arity = 1, .name = "child" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &child, .sources = &.{} }};
+    const consts = [_]Value{ fx(5), true_v, nativeFnValue(&dispatch_test_natives.native_refuse) };
+    // A trap in a callee the fast call:call entered: the caller is at
+    // its call.
+    const in_callee = [_]Inst{ asm_.closureMake(0, 0), asm_.loadConst(1, 0), asm_.jumpJmp(3), asm_.callCall(0, 1, 2), asm_.returnSlot(2) };
+    // The callee returns (a mov in place of its trap) and the caller
+    // traps after it: the return resumed the caller's pc.
+    const child_ok_code = [_]Inst{ asm_.loadConst(1, 0), asm_.mathAdd(2, sl(0), sl(1)), asm_.returnSlot(2) };
+    const child_ok = Routine{ .code = &child_ok_code, .consts = &child_consts, .slot_count = 3, .fixed_arity = 1, .name = "child" };
+    const caps_ok = [_]CaptureDescriptor{.{ .routine = &child_ok, .sources = &.{} }};
+    const after_return = [_]Inst{ asm_.closureMake(0, 0), asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.mathAdd(3, sl(2), kn(0)), asm_.mathAdd(3, sl(3), kn(1)), asm_.returnSlot(3) };
+    // A leaf native that refuses its argument, called by the fast call:call.
+    const in_leaf = [_]Inst{ asm_.loadConst(0, 2), asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) };
+    // The code runs out after fast instructions.
+    const exhausted = [_]Inst{ asm_.loadNil(0), asm_.loadConst(1, 0), asm_.move(2, 1) };
+    for ([_]struct { []const Inst, []const CaptureDescriptor, VmError, []const struct { []const u8, u32 } }{
+        .{ &in_callee, &caps, VmError.KindMismatch, &.{ .{ "child", 2 }, .{ "parent", 3 } } },
+        .{ &after_return, &caps_ok, VmError.KindMismatch, &.{.{ "parent", 4 }} },
+        .{ &in_leaf, &.{}, VmError.KindMismatch, &.{.{ "parent", 2 }} },
+        .{ &exhausted, &.{}, VmError.BytecodeExhausted, &.{.{ "parent", 2 }} },
+    }) |case| {
+        const routine = Routine{ .code = case[0], .consts = &consts, .capture_descs = case[1], .slot_count = 4, .name = "parent" };
+        var vm = try VM.init(testing.allocator, &routine);
+        defer vm.deinit();
+        try testing.expectError(case[2], vm.run());
+        try testing.expectEqual(case[3].len, vm.error_trace.items.len);
+        for (case[3], vm.error_trace.items) |want, got| {
+            try testing.expectEqualStrings(want[0], got.name);
+            try testing.expectEqual(want[1], got.pc);
+        }
+    }
+}
 
 test "VM dispatch: a leaf native reads its arguments in place and keeps its arity" {
     // (sub 50 8) by call:call and by callValue; then (sub 1) by each.
