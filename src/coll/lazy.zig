@@ -435,23 +435,23 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
         const next: Value = switch (shapeOfHeader(cell)) {
             .lazy => blk: {
                 const body = Heap.bodyOf(LazyBody, cell);
-                for (body.args()) |a| visitor.markValue(a);
+                for (body.args()) |a| if (a.kind().isHeap()) visitor.markValue(a);
                 break :blk body.result;
             },
             .cons => blk: {
                 const body = Heap.bodyOf(ConsBody, cell);
-                visitor.markValue(body.first);
+                if (body.first.kind().isHeap()) visitor.markValue(body.first);
                 break :blk body.more;
             },
+            // The chunk is marked and walked here, as a vector's leaf is
+            // by its trie walk: a chunk carries no metadata.
             .chunked => blk: {
                 const body = Heap.bodyOf(ConsBody, cell);
-                visitor.markValue(body.first);
+                const ch = Heap.asHeapHeader(body.first);
+                if (visitor.markInternal(ch)) traceChunk(ch, visitor);
                 break :blk body.more;
             },
-            .chunk => {
-                for (Heap.bodyOf(ChunkBody, cell).items()) |x| visitor.markValue(x);
-                return;
-            },
+            .chunk => return traceChunk(cell, visitor),
         };
         if (next.kind() != .lazy_seq) return visitor.markValue(next);
         const nh = Heap.asHeapHeader(next);
@@ -459,6 +459,12 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
         if (nh.meta) |m| visitor.mark(m);
         cell = nh;
     }
+}
+
+/// A chunk's elements; its immediates, most of a chunk of numbers, are
+/// skipped inline.
+fn traceChunk(ch: *HeapHeader, visitor: anytype) void {
+    for (Heap.bodyOf(ChunkBody, ch).items()) |x| if (x.kind().isHeap()) visitor.markValue(x);
 }
 
 // =============================================================================
