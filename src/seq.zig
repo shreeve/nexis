@@ -75,6 +75,18 @@ pub const op_keep_indexed: u16 = 10;
 /// `(map f c1 c2 ...)`: `{f, c1, c2, ...}`, or `{f, [c1 c2 ...]}` past
 /// five colls, one element at a time, as Clojure's.
 pub const op_map_n: u16 = 11;
+/// `(iterate f x)`: `{f, x}`, whose first element is `x` itself; every
+/// later one is `{f, prev}` under `op_iterate_next`, which calls `f`
+/// when the element is first needed, as Clojure's `Iterate`.
+pub const op_iterate: u16 = 12;
+pub const op_iterate_next: u16 = 13;
+/// `(repeat n x)`: `{n, x}`, `n` at least 1.
+pub const op_repeat_n: u16 = 14;
+/// `(repeatedly f)`: `{f}`; `(repeatedly n f)`: `{f, n}`.
+pub const op_repeatedly: u16 = 15;
+/// `(cycle coll)`: `{all, current}`, both seqs of `coll`; `all` is not
+/// nil.
+pub const op_cycle: u16 = 16;
 
 const steps = [_]Step{
     stepThunk,
@@ -89,7 +101,53 @@ const steps = [_]Step{
     stepSieve(.map_indexed),
     stepSieve(.keep_indexed),
     stepMapN,
+    stepIterate,
+    stepIterateNext,
+    stepRepeatN,
+    stepRepeatedly,
+    stepCycle,
 };
+
+fn stepIterate(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const heap = vm.ensureHeap();
+    const more = try make(vm, op_iterate_next, a[0..2]);
+    return lazy.cons(heap, a[1], more) catch VmError.OutOfMemory;
+}
+
+fn stepIterateNext(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const y = try vm.callValue(a[0], a[1..2]);
+    // `Heap.alloc` never collects: `y` needs no root while the next
+    // block and the cell are made.
+    const heap = vm.ensureHeap();
+    const more = try make(vm, op_iterate_next, &.{ a[0], y });
+    return lazy.cons(heap, y, more) catch VmError.OutOfMemory;
+}
+
+fn stepRepeatN(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const n = a[0].asFixnum();
+    const more = if (n > 1) try make(vm, op_repeat_n, &.{ fixnum(n - 1), a[1] }) else value_mod.nilValue();
+    return lazy.cons(vm.ensureHeap(), a[1], more) catch VmError.OutOfMemory;
+}
+
+fn stepRepeatedly(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    if (a.len == 2 and a[1].asFixnum() <= 0) return value_mod.nilValue();
+    const y = try vm.callValue(a[0], &.{});
+    const more = if (a.len == 2) try make(vm, op_repeatedly, &.{ a[0], fixnum(a[1].asFixnum() - 1) }) else try make(vm, op_repeatedly, a[0..1]);
+    return lazy.cons(vm.ensureHeap(), y, more) catch VmError.OutOfMemory;
+}
+
+fn stepCycle(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    a[1] = try seqOf(vm, a[1]);
+    const s = if (a[1].isNil()) a[0] else a[1];
+    const fr = firstRest(s);
+    const more = try make(vm, op_cycle, &.{ a[0], fr.rest });
+    return lazy.cons(vm.ensureHeap(), fr.first, more) catch VmError.OutOfMemory;
+}
 
 /// What the chunked one-function producers do with each element.
 const Sieve = enum {
@@ -367,6 +425,10 @@ pub const Pure = union(enum) {
     range: struct { start: i64, end: i64, step: i64 },
     range_inf: Value,
     repeat: Value,
+    repeat_n: struct { n: i64, x: Value },
+    iterate: struct { f: Value, x: Value },
+    /// A cycle's whole seq, walked again and again.
+    cycle: Value,
 };
 
 pub fn pureOf(coll: Value) ?Pure {
@@ -376,6 +438,10 @@ pub fn pureOf(coll: Value) ?Pure {
         op_range => .{ .range = .{ .start = a[0].asFixnum(), .end = a[1].asFixnum(), .step = a[2].asFixnum() } },
         op_range_inf => .{ .range_inf = a[0] },
         op_repeat => .{ .repeat = a[0] },
+        op_repeat_n => .{ .repeat_n = .{ .n = a[0].asFixnum(), .x = a[1] } },
+        op_iterate => .{ .iterate = .{ .f = a[0], .x = a[1] } },
+        // A cycle that has not begun its walk, where `current` is `all`.
+        op_cycle => if (a[1].identicalTo(a[0])) .{ .cycle = a[0] } else null,
         else => null,
     };
 }
@@ -504,6 +570,7 @@ pub fn next(vm: *VM, x: Value) VmError!Value {
 pub fn countOf(vm: *VM, x: Value) VmError!usize {
     if (pureOf(x)) |p| switch (p) {
         .range => |r| return @intCast(rangeCount(r.start, r.end, r.step)),
+        .repeat_n => |r| return @intCast(r.n),
         else => {},
     };
     var it = try SeqIter.init(vm, x);
@@ -517,6 +584,7 @@ pub fn nthOf(vm: *VM, x: Value, i: usize) VmError!?Value {
     if (pureOf(x)) |p| switch (p) {
         .range => |r| return if (i < rangeCount(r.start, r.end, r.step)) fixnum(r.start + @as(i64, @intCast(i)) * r.step) else null,
         .repeat => |v| return v,
+        .repeat_n => |r| return if (i < r.n) r.x else null,
         else => {},
     };
     var it = try SeqIter.init(vm, x);

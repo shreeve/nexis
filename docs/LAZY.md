@@ -269,6 +269,10 @@ inside a call marks everything (`docs/GC.md`
 | `map` of several colls | lazy | no, as Clojure's | each source's seq taken as the step runs |
 | `filter`, `remove`, `keep` | lazy | when the source is | a chunk that keeps nothing forwards to the next block |
 | `map-indexed`, `keep-indexed` | lazy | when the source is | the index runs in the block |
+| `iterate` | lazy, infinite | no | `f` is called when its element is first needed, as `Iterate`: `(second (iterate f x))` calls it once |
+| `repeat` | lazy; `(repeat x)` infinite, one cell whose rest is its own block; `(repeat n x)` `()` for `n` at most 0 | no | |
+| `repeatedly` | lazy; infinite without a count | no | each call when its element is first needed |
+| `cycle` | lazy, infinite; `()` of an empty coll | no | `coll`'s seq is taken at the call, as Clojure's |
 
 **Chunked sources** are the seqs that hand out a slice of their
 elements and the seq after them without allocating: a vector's view
@@ -287,11 +291,15 @@ size. Over an unchunked source, two blocks per element, as Clojure's
 objects.
 
 **Pure producers compute without realizing.** While a block of a
-fixnum `range`, of `(range)` or of `repeat` is unrealized, `reduce`
-runs over the elements it would hold, calling the function with no
-allocation and caching nothing (`LongRange.reduce`, `Repeat.reduce`);
-`count` of a range is its arithmetic count, `nth` its arithmetic
-element, `drop` and `nthrest` a new range from the index, and the
+fixnum `range`, of `(range)`, of `repeat`, of `iterate` or of `cycle`
+is unrealized, `reduce` runs over the elements it would hold, calling
+the function with no allocation and caching nothing
+(`LongRange.reduce`, `Repeat.reduce`, `Iterate.reduce`,
+`Cycle.reduce`); `iterate`'s `f` "must be free of side effects", as
+Clojure's docstring says, since a later walk calls it again. `count`
+of a range or a finite repeat is its arithmetic count, `nth` its
+arithmetic element, `drop` and `nthrest` a new range or repeat from the
+index, and the
 eager gatherers (`vec`, `into`, `set`, `sort`, `apply`, ...) take its
 elements without making a cell. `(reduce + (range 100000000))`
 allocates nothing, and `(count (range 1e12))` is O(1). Recomputing is

@@ -2276,6 +2276,15 @@ test "gc: a realized map block lets its source go; an abandoned one keeps it unt
     try testing.expect(held - heap.liveCount() > 3000);
 }
 
+test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
+    try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
+    try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");
+    try expectOutput("(let [n (atom 0) s (repeatedly (fn [] (swap! n inc)))] [(first s) @n (doall (take 3 s)) @n])", "[1 1 (1 2 3) 3]");
+    try expectOutput("[(repeat 3 :x) (repeat 0 :x) (repeat -1 :x) (count (repeat 1000000000 :x)) (nth (repeat 5 :y) 4) (drop 3 (repeat 5 :z)) (realized? (repeat 3 1)) (class (cycle [1]))]", "[(:x :x :x) () () 1000000000 :y (:z :z) false :lazy_seq]");
+    try expectOutput("[(reduce (fn [a x] (if (> a 100) (reduced a) (+ a x))) (iterate inc 1)) (reduce + 0 (repeat 4 5)) (reduce (fn [a x] (if (> a 6) (reduced a) (+ a x))) (cycle [1 2]))]", "[105 20 7]");
+    try expectOutput("(let [n (atom 0) c (cycle (map (fn [x] (swap! n inc) x) [1 2 3]))] [(take 7 c) @n])", "[(1 2 3 1 2 3 1) 3]");
+}
+
 test "lazy: reduce over an unrealized range allocates nothing" {
     var program: Program = undefined;
     try program.init();
@@ -5408,12 +5417,12 @@ test "core: sequence functions" {
         .{ .src = "(repeat 3 :x)", .expected = "(:x :x :x)" },
         .{ .src = "(repeat 0 :x)", .expected = "()" },
         .{ .src = "(do (def n (atom 0)) (repeatedly 3 (fn [] (swap! n inc))))", .expected = "(1 2 3)" },
-        .{ .src = "(iterate inc 0 5)", .expected = "(0 1 2 3 4)" },
-        .{ .src = "(iterate (fn [x] (* 2 x)) 1 4)", .expected = "(1 2 4 8)" },
-        .{ .src = "(iterate inc 0 0)", .expected = "()" },
+        .{ .src = "(take 5 (iterate inc 0))", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(take 4 (iterate (fn [x] (* 2 x)) 1))", .expected = "(1 2 4 8)" },
+        .{ .src = "(take 0 (iterate inc 0))", .expected = "()" },
         // The count is not reserved up front: a callback that throws
         // ends a huge count at once.
-        .{ .src = "[(try (repeatedly 9999999999999 #(throw :stop)) (catch :stop e e)) (try (iterate (fn [x] (throw :stop)) 0 9999999999999) (catch :stop e e))]", .expected = "[:stop :stop]" },
+        .{ .src = "[(try (doall (repeatedly 9999999999999 #(throw :stop))) (catch :stop e e)) (try (doall (take 9999999999999 (iterate (fn [x] (throw :stop)) 0))) (catch :stop e e))]", .expected = "[:stop :stop]" },
         .{ .src = "(empty? [])", .expected = "true" },
         .{ .src = "(empty? \"\")", .expected = "true" },
         .{ .src = "(not-empty [1])", .expected = "[1]" },
@@ -6093,7 +6102,7 @@ test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive c
     try expectOutputUnderGc(churn ++ "(sort-by (fn [x] (churn x) (str (- 10 x))) (range 12))", "(11 10 9 0 8 7 6 5 4 3 2 1)");
     try expectOutputUnderGc(churn ++ "(apply max-key (fn [x] (churn x) (count (str x))) (range 30))", "29");
     try expectOutputUnderGc(churn ++ "(count (repeatedly 30 (fn [] (churn 1) (str \"r\"))))", "30");
-    try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
+    try expectOutputUnderGc(churn ++ "(last (take 20 (iterate (fn [s] (churn s) (str s \"x\")) \"\")))", "xxxxxxxxxxxxxxxxxxx");
 }
 
 /// A seq of `n` strings whose every step churns the heap: a walk of it

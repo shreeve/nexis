@@ -265,9 +265,10 @@ const core_natives = table("", .{
     .{ "drop-last", 1, 2, &fnDropLast },
     .{ "flatten", 1, 1, &fnFlatten },
     .{ "reductions", 2, 3, &fnReductions },
-    .{ "repeat", 2, 2, &fnRepeat },
-    .{ "repeatedly", 2, 2, &fnRepeatedly },
-    .{ "iterate", 3, 3, &fnIterate },
+    .{ "repeat", 1, 2, &fnRepeat },
+    .{ "repeatedly", 1, 2, &fnRepeatedly },
+    .{ "iterate", 2, 2, &fnIterate },
+    .{ "cycle", 1, 1, &fnCycle },
     .{ "max-key", 2, null, &fnMaxKey },
     .{ "min-key", 2, null, &fnMinKey },
     .{ "select-keys", 2, 2, &fnSelectKeys },
@@ -1475,6 +1476,49 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
+        .repeat_n => |r| {
+            var acc = init orelse r.x;
+            var i: i64 = if (init == null) 1 else 0;
+            while (i < r.n) : (i += 1) {
+                vm.roots.items[scope.base] = acc;
+                acc = try cb.call(&.{ acc, r.x });
+                if (isReduced(vm, acc)) return reducedValue(acc);
+            }
+            return acc;
+        },
+        // `x` and its successor wait in a second root slot while `f`
+        // runs, as `Iterate.reduce` walks.
+        .iterate => |it| {
+            try scope.push(it.x);
+            var x = it.x;
+            var acc = init orelse blk: {
+                x = try vm.callValue(it.f, &.{x});
+                break :blk it.x;
+            };
+            var step = vm_mod.Callback.init(vm, it.f, 1);
+            while (true) {
+                vm.roots.items[scope.base] = acc;
+                vm.roots.items[scope.base + 1] = x;
+                acc = try cb.call(&.{ acc, x });
+                if (isReduced(vm, acc)) return reducedValue(acc);
+                vm.roots.items[scope.base] = acc;
+                x = try step.call(&.{x});
+            }
+        },
+        .cycle => |all| {
+            var acc: ?Value = init;
+            while (true) {
+                var it = try makeSeqIter(vm, all);
+                while (try it.next()) |x| {
+                    if (acc) |a| {
+                        vm.roots.items[scope.base] = a;
+                        const r = try cb.call(&.{ a, x });
+                        if (isReduced(vm, r)) return reducedValue(r);
+                        acc = r;
+                    } else acc = x;
+                }
+            }
+        },
     }
 }
 
@@ -2351,7 +2395,11 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
                     return seq_mod.makeRange(vm, r.start + @as(i64, @intCast(count)) * r.step, r.end, r.step);
                 },
                 .repeat => return args[0],
-                .range_inf => {},
+                .repeat_n => |r| {
+                    if (count >= r.n) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+                    return seq_mod.make(vm, seq_mod.op_repeat_n, &.{ value_mod.fromFixnum(r.n - @as(i64, @intCast(count))).?, r.x });
+                },
+                .range_inf, .iterate, .cycle => {},
             };
             var xs = args[0];
             for (0..count) |_| {
@@ -2448,55 +2496,38 @@ fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
 /// `(repeat n x)` → n copies of x. `(repeatedly n f)` → n results
 /// of `(f)`. `(iterate f x n)` → the first n of x, (f x), (f (f x))
 /// … — the count is explicit because sequences are eager.
+/// `(repeat x)` → the infinite lazy seq of `x`, one cell whose rest is
+/// itself; `(repeat n x)` → `n` of them, `()` for `n` at most 0
+/// (docs/LAZY.md §7).
 fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
-    var producer = struct {
-        x: Value,
-        fn next(self: *@This(), _: *VM) VmError!Value {
-            return self.x;
-        }
-    }{ .x = args[1] };
-    return repeatInto(vm, try requireCount(args[0]), &producer);
+    if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeat, args[0..1]);
+    const n = try requireCount(args[0]);
+    if (n == 0) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+    return seq_mod.make(vm, seq_mod.op_repeat_n, &.{ value_mod.fromFixnum(@intCast(@min(n, @as(usize, @intCast(value_mod.fixnum_max))))).?, args[1] });
 }
 
+/// `(repeatedly f)` → the infinite lazy seq of `(f)` calls, each made
+/// when its element is first needed; `(repeatedly n f)` → `n` of them.
 fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
-    var producer = struct {
-        f: Value,
-        fn next(self: *@This(), vm_: *VM) VmError!Value {
-            return vm_.callValue(self.f, &.{});
-        }
-    }{ .f = args[1] };
-    return repeatInto(vm, try requireCount(args[0]), &producer);
+    if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeatedly, args[0..1]);
+    const n = try requireCount(args[0]);
+    return seq_mod.make(vm, seq_mod.op_repeatedly, &.{ args[1], value_mod.fromFixnum(@intCast(@min(n, @as(usize, @intCast(value_mod.fixnum_max))))).? });
 }
 
+/// `(iterate f x)` → the infinite lazy seq `x`, `(f x)`, `(f (f x))`
+/// ..., each call made when its element is first needed.
 fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
-    var producer = struct {
-        f: Value,
-        x: Value,
-        started: bool = false,
-        fn next(self: *@This(), vm_: *VM) VmError!Value {
-            if (self.started) self.x = try vm_.callValue(self.f, &.{self.x});
-            self.started = true;
-            return self.x;
-        }
-    }{ .f = args[0], .x = args[1] };
-    return repeatInto(vm, try requireCount(args[2]), &producer);
+    return seq_mod.make(vm, seq_mod.op_iterate, args[0..2]);
 }
 
-/// The list of `n` successive `producer.next(vm)` results. The list
-/// grows as they come rather than reserving `n` slots, so a huge count
-/// fails only when memory does, and a producer that throws first
-/// throws.
-fn repeatInto(vm: *VM, n: usize, producer: anytype) VmError!Value {
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    const scope = vm.rootScope();
-    defer scope.release();
-    for (0..n) |_| {
-        const r = try producer.next(vm);
-        try scope.push(r);
-        results.append(vm.allocator, r) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, results.items);
+/// `(cycle coll)` → the infinite lazy seq of `coll`'s elements over and
+/// over, `()` when it has none; `coll`'s seq is taken at the call, as
+/// Clojure's.
+fn fnCycle(vm: *VM, args: []const Value) VmError!Value {
+    const s = try seq_mod.seqOf(vm, args[0]);
+    if (s.isNil()) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+    // `Heap.alloc` never collects: the seq needs no root on its way in.
+    return seq_mod.make(vm, seq_mod.op_cycle, &.{ s, s });
 }
 
 /// `(max-key k x & xs)` / `(min-key k x & xs)` → the x with the
