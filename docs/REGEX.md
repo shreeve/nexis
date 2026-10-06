@@ -336,3 +336,44 @@ compares every match and every group; the gate never needs a JVM. An
 empty Java match between the halves of a surrogate pair is dropped
 from the expected result (§6 #2), and a case where a Java match
 starts or ends inside a pair is not generated.
+
+---
+
+### 8. Patterns and matchers as values
+
+Two heap kinds carry regular expressions into the language
+(`docs/VALUE.md` §2.2).
+
+**`regex` (44)**, a pattern. `regex.make(heap, gpa, source)` compiles
+the source in a scratch arena and copies the program into one block:
+the `Program` and the source slice first, then the instructions, the
+ranges, the source text, the group names, the literal and the prefix,
+which the program's slices point at. A block never moves, so the
+pointers into it stay valid for its life. The block holds no Value:
+the collector treats it as a leaf, and the sweep frees it as it frees
+a string. A pattern is immutable.
+
+**`matcher` (45)**, the search state of `re-matcher`:
+`MatcherBox{pattern, input, next, last_end, state}` followed by two
+slots per group and two for the whole match, the spans of the last
+match (`none` for a group that did not take part). `re-find` on a
+matcher runs `Finder.find` from `next` with `\G` at `last_end` and
+writes the result back into the block; `pattern` and `input` never
+change, so the update needs no barrier. A search that fails leaves the
+matcher failed: every later `re-find` is nil and `re-groups` is
+`:invalid-argument`, as Java's matcher reports "No match found". The
+collector marks the pattern and the string (`regex.traceMatcher`).
+
+Both are identity kinds, as `java.util.regex.Pattern` and `Matcher`
+are (neither overrides `equals`): `=` only to themselves and hashed
+by their pointer (`docs/SEMANTICS.md` §3.3), so `(= #"a" #"a")` is
+false and `(let [p #"a"] (= p p))` true, as in Clojure. A pattern
+prints as `#"source"` in both modes with Clojure's `print-method`
+escaping: a backslash and the character after it are written as they
+are, a bare `"` as `\"`, and inside `\Q...\E` as `\E\"\Q`. `str` and
+`%s` of a pattern give its source (`Pattern.toString`); inside a
+collection it prints `#"..."`. A matcher prints `#<matcher #"source">`.
+`type` and `class` give `:regex` and `:matcher`. Neither takes
+metadata (`:kind-mismatch`) nor serializes (`:unserializable`,
+`docs/CODEC.md` §3): a decoded pattern could never be `=` to the one
+encoded.

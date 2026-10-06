@@ -80,6 +80,8 @@ pub fn isIdentityKind(k: Kind) bool {
         .protocol,
         .protocol_fn,
         .nextomic_conn,
+        .regex,
+        .matcher,
         => true,
         else => false,
     };
@@ -546,6 +548,24 @@ test "identity kinds: equal to themselves only, hash stable across mutation, tra
     try expectSame(t, t);
     try expectDifferent(t, try transient.transientFrom(&heap, try vector.empty(&heap)));
     try testing.expect(!equal(t, try vector.empty(&heap)));
+}
+
+test "patterns and matchers: equal to themselves only, the hash stable inside a collection" {
+    const regex = @import("regex.zig");
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const p = (try regex.make(&heap, testing.allocator, "a")).ok;
+    const q = (try regex.make(&heap, testing.allocator, "a")).ok;
+    try expectSame(p, p);
+    try expectDifferent(p, q);
+    const s = try string.fromBytes(&heap, "aa");
+    const m = try regex.makeMatcher(&heap, p, s);
+    const before = hashValue(m);
+    try testing.expect(try regex.matcherFind(testing.allocator, m));
+    try testing.expectEqual(before, hashValue(m));
+    try expectDifferent(m, try regex.makeMatcher(&heap, p, s));
+    try expectSame(try vector.fromSlice(&heap, &.{ p, m }), try vector.fromSlice(&heap, &.{ p, m }));
+    try expectDifferent(try vector.fromSlice(&heap, &.{p}), try vector.fromSlice(&heap, &.{q}));
 }
 
 /// `depth` one-element vectors around a nil.

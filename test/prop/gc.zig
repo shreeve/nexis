@@ -15,6 +15,8 @@
 //!       survive.
 //!   G3. Idempotence: `collect` called twice back-to-back with the
 //!       same roots frees 0 blocks on the second call.
+//!   G4. A matcher reaches its pattern and its string: rooted by the
+//!       matcher alone, both survive and the matcher still searches.
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -334,6 +336,33 @@ test "G3c: a chain of 300,000 nested vectors, maps, atoms and meta maps survives
     }
     // A string level takes two steps: to its meta map, then through it.
     try std.testing.expectEqual(depth + depth / 4, steps);
+    _ = collector.collect(&.{});
+    try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
+}
+
+// -----------------------------------------------------------------------------
+// G4. A matcher holds its pattern and its string (GC.md §5)
+// -----------------------------------------------------------------------------
+
+test "G4: a matcher keeps its pattern and its string alive across a cycle, and still searches" {
+    const regex = nx.regex;
+    var heap = Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const m = blk: {
+        const p = (try regex.make(&heap, std.testing.allocator, "(\\d)+")).ok;
+        const s = try string.fromBytes(&heap, "a12b3");
+        break :blk try regex.makeMatcher(&heap, p, s);
+    };
+    _ = (try regex.make(&heap, std.testing.allocator, "orphan")).ok;
+    _ = try string.fromBytes(&heap, "orphan");
+
+    var collector = Collector.init(&heap);
+    defer collector.deinit();
+    try std.testing.expectEqual(@as(usize, 2), collector.collect(&.{Heap.asHeapHeader(m)}));
+    try std.testing.expectEqual(@as(usize, 3), heap.liveCount());
+    try std.testing.expect(try regex.matcherFind(std.testing.allocator, m));
+    try std.testing.expectEqual([2]usize{ 1, 3 }, regex.matcherGroup(m, 0).?);
+    try std.testing.expectEqual([2]usize{ 2, 3 }, regex.matcherGroup(m, 1).?);
     _ = collector.collect(&.{});
     try std.testing.expectEqual(@as(usize, 0), heap.liveCount());
 }

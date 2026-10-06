@@ -137,7 +137,15 @@ pub const Kind = enum(u8) {
     /// shape. Sequential: equal to, and hashed as, the list of its
     /// elements.
     lazy_seq = 43,
-    // 44..63 reserved for heap kinds.
+    /// Regular expression (docs/REGEX.md §8): the compiled program and
+    /// the source text, inline in one leaf block. Identity-valued, as
+    /// `java.util.regex.Pattern` is.
+    regex = 44,
+    /// Regex matcher (docs/REGEX.md §8): `re-matcher`'s search state
+    /// over one pattern and one string, advanced in place by
+    /// `re-find`. Identity-valued, as `java.util.regex.Matcher` is.
+    matcher = 45,
+    // 46..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
     /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an

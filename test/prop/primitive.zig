@@ -224,7 +224,7 @@ test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" 
     const dispatch = nx.dispatch;
     for (std.enums.values(value.Kind)) |k| {
         const identity = switch (k) {
-            .function, .var_, .transient, .native_fn, .db_connection, .db_write_txn, .db_read_txn, .atom, .protocol, .protocol_fn, .nextomic_conn => true,
+            .function, .var_, .transient, .native_fn, .db_connection, .db_write_txn, .db_read_txn, .atom, .protocol, .protocol_fn, .nextomic_conn, .regex, .matcher => true,
             else => false,
         };
         const domain: u8 = switch (k) {

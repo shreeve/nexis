@@ -173,7 +173,9 @@ qualified and an unqualified keyword are different names. `(= 'foo
   equal db-values, and the connection otherwise; an entity compares
   by its db-value and eid.
 
-Identity kinds are mutable, process-local or code. Two atoms holding
+Identity kinds are mutable, process-local or code. A pattern is an
+identity kind as Java's `Pattern` is: `(= #"a" #"a")` is false, as in
+Clojure (`docs/REGEX.md` §8). Two atoms holding
 equal values are not `=`, and an atom's hash does not change when its
 value does, so a map key never becomes unequal to itself. A transient
 hashes by identity and may be a map key; it equals no persistent
@@ -312,6 +314,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 41 | `sorted_map` | map | 18 | entry-wise with any map | unordered, cached |
 | 42 | `sorted_set` | set | 19 | element-wise with any set | unordered, cached |
 | 43 | `lazy_seq` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a chunked cons |
+| 44 | `regex` | identity | 44 | same value | pointer |
+| 45 | `matcher` | identity | 45 | same value | pointer |
 
 The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
 are never constructed; `dispatch` panics on one. A kind module
@@ -420,12 +424,15 @@ How each kind prints in the `pr-str` and `str` modes is
 - Not a durable ref: `#<durable-ref :tree hex:key-bytes>`.
 - A var prints as `#'ns/name`, which reads as `(var ns/name)`: not a
   value that round-trips, but a form that evaluates to the same Var.
+- A pattern prints as `#"source"`, which reads back as a new pattern
+  with the same source: not `=` to it (identity), as in Clojure.
 
 #### 6.2 Kinds that print opaquely
 
 Functions, native fns, transients, atoms, protocols, protocol fns and
 the db and Nextomic handles print as markers for debugging (`#<fn>`,
-`#<native-fn inc>`, `#<atom>`, `#<transient>`, a Nextomic handle as
+`#<native-fn inc>`, `#<atom>`, `#<transient>`, a matcher as
+`#<matcher #"source">`, a Nextomic handle as
 `#nextomic/conn "path"` and the like) that do not read back. None is serializable either
 (`docs/CODEC.md` §3).
 
@@ -475,7 +482,7 @@ map or `nil`; it never throws.
 | `lazy-seq` | a new realized lazy block carrying the map whose seq is the argument's, realizing one step (`LazySeq.withMeta`), so no `rest` carries it (`docs/LAZY.md` §4) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
-| every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
+| every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, `regex`, `matcher`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
 - The metadata argument is a map, hash or sorted, or `nil` (which
   clears it); anything else is `:kind-mismatch`, checked before the

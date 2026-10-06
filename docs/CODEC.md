@@ -188,12 +188,13 @@ is `UnserializableKind`: the comparator is code.
 | `atom` (34) | no | A mutable identity (`docs/ATOM.md` §6). |
 | `record` (35), `protocol` (36), `protocol_fn` (37) | no | Type and protocol ids are dense per-VM numbers (`docs/PROTOCOLS.md` §0). |
 | `nextomic_conn` (38), `nextomic_db` (39), `nextomic_entity` (40) | no | They name a Nextomic connection the VM owns (`docs/NEXTOMIC.md` §6). |
+| `regex` (44), `matcher` (45) | no | Identity kinds: a decoded pattern could never be `=` to the one encoded, and EDN has no regex (`docs/REGEX.md` §8). |
 | `byte_vector` (22), `error_` (28), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
 
 Encoding any kind marked no is `UnserializableKind`. Decoding a kind byte that names a heap kind
 outside the set (every "no" row above, and 43) is `UnserializableKind` too;
 a byte that names no kind (the reserved immediates 8–15, the reserved
-heap bytes 44–63, the runtime-private sentinels 64 and up) is
+heap bytes 46–63, the runtime-private sentinels 64 and up) is
 `InvalidKindByte`. No silent stubs, no lossy round trips.
 
 **At the language level** (`db.failureName`, `docs/DB.md` §8)
