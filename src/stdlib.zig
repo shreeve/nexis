@@ -415,7 +415,7 @@ const core_natives = table("", .{
     .{ "contains?", 2, 2, &fnContainsQ },
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
-    .{ "conj", 0, null, &fnConj },
+    .{ "conj", 0, null, &fnConjLeaf, .leaf, &fnConj },
     .{ "frequencies", 1, 1, &fnFrequencies },
     .{ "group-by", 2, 2, &fnGroupBy },
     // Transients (docs/TRANSIENT.md): each `!` edits the nodes the
@@ -2117,6 +2117,17 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
         },
         .sorted_set => try sortedAddAll(vm, coll, xs),
         else => return VmError.KindMismatch,
+    };
+}
+
+/// `conj` as a leaf (VM.md §6): onto nil, a list or a vector, which
+/// only allocates; any other collection hashes or realizes, and goes
+/// the general way.
+fn fnConjLeaf(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len < 2) return fnConj(vm, args);
+    return switch (args[0].kind()) {
+        .nil, .list, .persistent_vector => fnConj(vm, args),
+        else => VmError.NeedsReentry,
     };
 }
 

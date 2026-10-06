@@ -321,7 +321,11 @@ nothing under it can collect, grow the stack or move the spoil count
 guard or the overflow check while no cycle is due; once one is, the
 call takes `callValue`'s rooted path and its safe point, so a native
 that calls a leaf per element (`(reduce * xs)`) collects as it goes.
-Its arity is checked, and reported, as any native's.
+Its arity is checked, and reported, as any native's. A leaf may
+allocate (`conj` onto a vector): `Heap.alloc` never collects (§9), and
+the call site reaches a safe point after it, `call:call` at the next
+fetch and `callValue` and a `Callback` by taking the rooted path once a
+cycle is due.
 A leaf may refuse a receiver it could handle only by running code or
 walking nested data. Its leaf body returns the internal
 `VmError.NeedsReentry` before it touches anything, and the three leaf
@@ -336,6 +340,7 @@ body instead of `call`. The error never escapes a call site.
 | `get` | a sorted collection (its comparator), a Nextomic entity (the store), and a hash map, set, record or transient searched by a key on the heap (its hash and `=` may realize a lazy seq or walk nested data) |
 | `count` | a lazy seq (realized to its end) and a Nextomic entity |
 | `nthnext` | anything but nil, a list and a vector |
+| `conj` | anything but nil, a list and a vector (a map or set hashes, a lazy seq is realized) |
 
 ---
 
