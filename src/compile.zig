@@ -78,11 +78,14 @@ const Tiny = union(enum) {
     throw_: *const Tiny,
     /// A call of a core arithmetic or comparison fn that the VM
     /// runs as one `math` or `cmp` instruction (COMPILER.md §4.3
-    /// rule 2); `rhs` is null for the unary ops.
+    /// rule 2); `rhs` is null for the unary ops. `more` are the
+    /// arguments past two of `+`, `*` or `-`, folded left once every
+    /// argument is computed, one instruction each.
     prim: struct {
         op: PrimOp,
         lhs: *const Tiny,
         rhs: ?*const Tiny = null,
+        more: []const *const Tiny = &.{},
     },
     /// `(if test then else?)`; a missing else is nil.
     if_: struct {
@@ -179,14 +182,14 @@ const PrimOp = enum {
     }
 };
 
-/// The core fns inlined as a `Tiny.prim`, at the one arity each
-/// inlines at; `inc` and `dec` are `+` and `-` with a constant 1.
-/// Every other arity is an ordinary call.
-const Inlined = struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false };
+/// The core fns inlined as a `Tiny.prim`, at the arity each inlines
+/// at, or at any arity from it when `fold`; `inc` and `dec` are `+`
+/// and `-` with a constant 1. Every other arity is an ordinary call.
+const Inlined = struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false, fold: bool = false };
 const inlined_ops = [_]Inlined{
-    .{ .name = "+", .argc = 2, .op = .add },
-    .{ .name = "-", .argc = 2, .op = .sub },
-    .{ .name = "*", .argc = 2, .op = .mul },
+    .{ .name = "+", .argc = 2, .op = .add, .fold = true },
+    .{ .name = "-", .argc = 2, .op = .sub, .fold = true },
+    .{ .name = "*", .argc = 2, .op = .mul, .fold = true },
     .{ .name = "/", .argc = 2, .op = .div },
     .{ .name = "quot", .argc = 2, .op = .quot },
     .{ .name = "mod", .argc = 2, .op = .mod },
@@ -1700,7 +1703,8 @@ fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) Co
 /// The inlined core fn `name` is at `argc` arguments, if any.
 fn inlinedOp(name: []const u8, argc: usize) ?Inlined {
     for (inlined_ops) |in| {
-        if (in.argc == argc and std.mem.eql(u8, in.name, name)) return in;
+        const fits = in.argc == argc or (in.fold and argc > in.argc);
+        if (fits and std.mem.eql(u8, in.name, name)) return in;
     }
     return null;
 }
@@ -1715,11 +1719,13 @@ fn lowerPrim(
     const lhs = try lowerForm(allocator, args[0], ctx);
     const rhs: ?*const Tiny = if (in.one)
         try allocTiny(allocator, .{ .int = 1 })
-    else if (args.len == 2)
+    else if (args.len >= 2)
         try lowerForm(allocator, args[1], ctx)
     else
         null;
-    return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs } });
+    const more = try allocator.alloc(*const Tiny, if (args.len > 2) args.len - 2 else 0);
+    for (more, 2..) |*m, i| m.* = try lowerForm(allocator, args[i], ctx);
+    return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs, .more = more } });
 }
 
 /// Ordinary function call `(callee args...)`. Lowers head as
@@ -2610,7 +2616,7 @@ fn compileExpr(
         .coll => |c| try compileColl(e, c.op, c.items, dst),
         .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, t.binding_captured, dst),
         .throw_ => |value| try compileThrow(e, value),
-        .prim => |p| try compilePrim(e, p.op, p.lhs, p.rhs, dst),
+        .prim => |p| if (p.more.len == 0) try compilePrim(e, p.op, p.lhs, p.rhs, dst) else try compileFold(e, p.op, p.lhs, p.rhs.?, p.more, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst, recur_target),
         .do_ => |exprs| try compileDo(e, exprs, dst, recur_target),
@@ -2824,6 +2830,33 @@ fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst
     const a = try primOperand(e, lhs, rhs == null or isLeaf(rhs.?), dst, &free_dst);
     const b = if (rhs) |r| try primOperand(e, r, true, dst, &free_dst) else Operand.none;
     try e.emit(op.inst(dst, a, b));
+}
+
+/// `(+ a b c ...)`, `*` or `-` likewise: every argument computed in
+/// order (`compileOperand`), as the fn's call would compute them,
+/// then a left fold over their values, the running value in a slot
+/// nothing reads and the last instruction writing `dst`
+/// (COMPILER.md §4.3). An argument reads a Var in place only when no
+/// later argument runs code that could change it.
+fn compileFold(e: *Emitter, op: PrimOp, first: *const Tiny, second: *const Tiny, more: []const *const Tiny, dst: u12) CompileError!void {
+    const args = try e.allocator.alloc(*const Tiny, 2 + more.len);
+    defer e.allocator.free(args);
+    args[0] = first;
+    args[1] = second;
+    @memcpy(args[2..], more);
+    const ops = try e.allocator.alloc(Operand, args.len);
+    defer e.allocator.free(ops);
+    for (args, ops, 1..) |arg, *o, i| {
+        const leaves_after = for (args[i..]) |later| {
+            if (!isLeaf(later)) break false;
+        } else true;
+        o.* = try compileOperand(e, arg, leaves_after);
+    }
+    const free_dst = if (e.scratch) |s| s.dst == dst else false;
+    const acc = if (free_dst) dst else try e.allocSlot();
+    try e.emit(op.inst(acc, ops[0], ops[1]));
+    for (ops[2 .. ops.len - 1]) |o| try e.emit(op.inst(acc, Operand.slot(acc), o));
+    try e.emit(op.inst(dst, Operand.slot(acc), ops[ops.len - 1]));
 }
 
 /// `compileOperand`, or `t` computed into `dst` when `free_dst` says
@@ -3373,7 +3406,10 @@ fn cannotFail(e: *const Emitter, t: *const Tiny, target: *const RecurTarget) Com
         .quot, .mod => if (p.rhs.?.* != .int or p.rhs.?.int == 0) return false,
         else => return false,
     }
-    return try holdsNumber(e, p.lhs, target) and (if (p.rhs) |r| try holdsNumber(e, r, target) else true);
+    if (!try holdsNumber(e, p.lhs, target)) return false;
+    if (p.rhs) |r| if (!try holdsNumber(e, r, target)) return false;
+    for (p.more) |m| if (!try holdsNumber(e, m, target)) return false;
+    return true;
 }
 
 /// Whether `t` evaluates to a number without failing: a number
@@ -3520,7 +3556,7 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
         .coll => |c| any(c.items, name),
         .do_ => |items| any(items, name),
         .recur => |r| any(r.args, name),
-        .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false),
+        .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false) or try any(p.more, name),
         .if_ => |i| try readsName(i.test_, name) or try readsName(i.then, name) or (if (i.else_) |x| try readsName(x, name) else false),
         .let_star, .loop_star => |l| blk: {
             for (l.bindings) |b| if (try readsName(b.value, name)) break :blk true;

@@ -124,15 +124,22 @@ and a reused subform its own (MACROEXPAND.md §4b).
    expander's `special_forms` (MACROEXPAND.md §1.1) less the four it
    rewrites away (`ns`, `require`, `defmacro`, `set!`), plus the `#%`
    constructors; a test holds the two tables to that.
-2. **Inlined core fn**: a call of one of 14 core fns at one of the
-   15 (fn, arity) pairs of `inlined_ops` (`-` inlines at two) lowers to one `math` or `cmp` instruction
-   (`Tiny.prim`), which runs the numeric-tower helper the fn itself
+2. **Inlined core fn**: a call of one of 14 core fns at an arity
+   `inlined_ops` lists lowers to `math` or `cmp` instructions
+   (`Tiny.prim`), which run the numeric-tower helpers the fn itself
    runs (VM.md §10), so results and errors are the fn's:
 
    | Arity | Fns |
    |---|---|
+   | 3 or more | `+` `-` `*`, one instruction per argument after the first |
    | 2 | `+` `-` `*` `/` `quot` `mod` `<` `<=` `>` `>=` `==` |
    | 1 | `-` (negate), `abs`, `inc` and `dec` (`+` / `-` with a constant 1) |
+
+   Past two arguments every argument is computed, in order, before a
+   left fold over their values, as the fn's call computes them:
+   `(+ a b c)` is `(+ (+ a b) c)` once `a`, `b` and `c` are known, so
+   an argument's effect comes before any fold's error, and a Var
+   argument is read in place only when no later argument runs code.
 
    `(not x)` inlines the same way, as `(if x false true)`, which is
    what the fn computes; as an `if` test it is a branch (§5.2).

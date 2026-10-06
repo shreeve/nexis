@@ -189,6 +189,13 @@ const cases = [_]Case{
     .{ .src = "(loop* [i 0 acc []] (if (< i 3) (do (try (throw i) (catch any e nil) (finally nil)) (recur (inc i) (conj acc (try (if (odd? i) (throw i) i) (catch any e (- e)))))) acc))", .out = "[0 -1 2]" },
     .{ .src = "(loop* [s [1 2 3] acc 0] (if (seq s) (recur (next s) (+ acc (first s))) acc))", .out = "6" },
     .{ .src = "(loop* [x 3 acc []] (if x (recur (if (pos? x) (dec x) nil) (conj acc x)) acc))", .out = "[3 2 1 0]" },
+    // `+`, `*` and `-` past two arguments: every argument is computed,
+    // in order, before the left fold over their values, as the fn's
+    // call computes them, promotion and contagion included.
+    .{ .src = "(let* [big 140737488355327] [(+ big big big) (* big big big) (- 0 big big 1) (+ 1 2.5 big) (* 2 3 0.5) (- 10 1 2 3)])", .out = "[422212465065981 2787593149816268471570079086250062495350783 -281474976710655 1.407374883553305E14 3.0 4]" },
+    .{ .src = "(let* [log (atom [])] (try (+ (do (swap! log conj 1) \"x\") (do (swap! log conj 2) 2) (do (swap! log conj 3) 3)) (catch any e [e @log])))", .out = "[:kind-mismatch [1 2 3]]" },
+    .{ .src = "(let* [log (atom [])] (try (* 2 (do (swap! log conj 1) nil) (do (swap! log conj 2) (throw :later))) (catch any e [e @log])))", .out = "[:later [1 2]]" },
+    .{ .src = "(do (def x 1) [(+ x x (do (def x 10) x)) (+ x 1 2)])", .out = "[12 13]" },
     // Variadic fns and recur into them.
     .{ .src = "((fn* [a & r] a) 1 2 3)", .out = "1" },
     .{ .src = "((fn* [a & r] r) 1 2 3)", .out = "(2 3)" },
@@ -701,9 +708,20 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
         // The op, then the return of its result.
         try testing.expectEqual(@as(usize, 2), body.code.len);
     }
+    // `+`, `*` and `-` past two arguments fold left: one instruction
+    // per argument after the first.
+    for ([_][]const u8{ "(+ a b c d)", "(* a b c d)", "(- a b c d)" }) |op| {
+        const src = try testing.allocator.print("(fn* [a b c d] {s})", .{op});
+        defer testing.allocator.free(src);
+        const body = (try compileIn(&program, src)).capture_descs[0].routine;
+        try testing.expectEqual(@as(usize, 0), body.var_table.len);
+        try testing.expectEqual(@as(usize, 4), body.code.len);
+    }
     // Every other arity is a call.
-    const call = try compileIn(&program, "(fn* [a b c] (+ a b c))");
-    for (call.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.routine.var_table.len);
+    for ([_][]const u8{ "(fn* [a b c] (/ a b c))", "(fn* [a] (+ a))", "(fn* [] (*))", "(fn* [a b c] (< a b c))" }) |src| {
+        const call = try compileIn(&program, src);
+        for (call.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.routine.var_table.len);
+    }
 }
 
 /// The instructions of the one `fn*` routine `src` compiles to.
