@@ -1389,6 +1389,21 @@ test "clauses nested past the stack guard are StackOverflow" {
 }
 
 test "clauses nest at most max_nesting deep" {
+    // A query max_nesting deep must parse, so it needs the deep stack the
+    // CLI's runtime thread has: a test thread's default budget runs out
+    // first where debug frames are large (Linux on aarch64).
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{ .stack_size = 64 << 20 }, nestingCap, .{&result});
+    thread.join();
+    try result;
+}
+
+fn nestingCap(result: *anyerror!void) void {
+    stack.arm((64 << 20) - (1 << 20));
+    result.* = nestingCapChecks();
+}
+
+fn nestingCapChecks() !void {
     var heap = heap_mod.Heap.init(testing.allocator);
     defer heap.deinit();
     var interner = Interner.init(testing.allocator);
