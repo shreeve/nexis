@@ -861,6 +861,14 @@ rounds against 17.2–21.3 before, medians 24.0 and 19.6), as the
 address of the stack against the constant pool or the Var changes
 from run to run: the next measurement is where the slots sit.
 
+The fast `call:return` filling the cell of a frame a native pushed
+(a `Callback`, `callValue`) instead of handing it to the general
+handler, five rounds: a closure callback's element `cbred` 264.1 →
+229.2 instructions (42.4 → 45.2 cycles, ranges overlapping), `cb`
+285.7 → 250.6 (49.9 → 42.8), `lazy` 369.7 → 334.7 (76.0 → 70.3);
+`fib` 302.5 → 297.5 a call, the call's own return no longer testing
+whether the loop's frame has returned.
+
 The fast handlers in a section of their own, each on a cache line, in
 seven rounds at a load of 14: cycles a unit `count` 18.2 → 17.6, `acc`
 29.9 → 27.7, `fib` 50.6 → 49.9, `gcall` 42.1 → 40.1, `mv` 21.9 → 20.1,

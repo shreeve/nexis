@@ -480,8 +480,10 @@ instruction.
   called with one or two arguments on a map, a record or nil looks
   itself up in place, as `VM.lookup` does, with no copy and no safe
   point (the key is an immediate, so the lookup neither allocates nor
-  walks nested data). `call:return` from a frame `call:call` pushed
-  pops it and continues in the caller. The general `call:call` calls
+  walks nested data). `call:return` from any frame but the top-level
+  one pops it and continues in the caller, or fills the cell of the
+  host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
+  ends the chain. The general `call:call` calls
   any other native within its arity with its arguments copied to a
   buffer on the native stack; every other call goes through the
   general entry of §6, with the same traps.

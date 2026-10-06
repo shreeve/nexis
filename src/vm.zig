@@ -4026,9 +4026,9 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    /// `call:return` from a frame `call:call` pushed: pop it, write the
-    /// caller's slot and continue in the caller, whose `pc` the call
-    /// left at its return point.
+    /// `call:return` from any frame but the top-level one: pop it, and
+    /// write the caller's slot and continue in the caller, whose `pc`
+    /// the call left at its return point, or fill the host's cell.
     fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const v = self.fastOperand(frame, inst.a);
         if (!v.ok) return self.general(frame, inst, pc);
@@ -4046,7 +4046,19 @@ pub const VM = struct {
     /// through the stack.
     inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, pc: usize, v: *const Value) VmError!void {
         const n = self.frames.items.len;
-        if (frame.host_result != null or n < 2) return self.general(frame, inst, pc);
+        if (frame.host_result != null or n < 2) {
+            @branchHint(.unlikely);
+            // A frame `callValue`, `runRoutine` or a `Callback` pushed
+            // hands its value to its cell, and the chain ends with the
+            // loop's frame.
+            const hr = frame.host_result orelse return self.general(frame, inst, pc);
+            copyWords(&hr.value, v);
+            hr.done = true;
+            self.stack.items.len = frame.entry_stack_len;
+            self.frames.items.len = n - 1;
+            if (!self.running()) return;
+            return self.next(self.currentFrame());
+        }
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
         std.debug.assert(dst < caller.slot_count);
@@ -4055,7 +4067,9 @@ pub const VM = struct {
         self.stack.items.len = frame.entry_stack_len;
         self.frames.items.len = n - 1;
         copyWords(self.slotAt(caller, dst), v);
-        if (!self.running()) return;
+        // A frame a call pushed sits above the loop's, which is still
+        // running.
+        std.debug.assert(self.running());
         return self.nextAt(caller, resume_pc);
     }
 
