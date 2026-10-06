@@ -7,6 +7,14 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
+## Gaps
+
+14. **Nextomic refuses a datom form written as a list.** `[(list
+    :db/add e a v)]` is `:nextomic/tx-data` ("a form is a vector or a
+    map"); Datomic accepts any sequential form, and a lazy seq of forms
+    is already converted at the boundary. Accept a list where a vector
+    form is accepted (`docs/NEXTOMIC.md` §3).
+
 ## Performance
 
 2. **Small transactions.** 20,000 `transact!` calls of one entity with
@@ -28,6 +36,15 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    write. The commit protocol is emdb's; nexis changes nothing in emdb
    (`AGENTS.md`), so this is the engine owner's call.
 
+13. **A lazy seq a slot holds keeps what it realized.** The VM roots
+    every slot of its stack, so the intermediate seqs of
+    `(->> xs (filter p) (map f) (reduce +))` stay realized until their
+    slots are reused: the pipeline row of `docs/PERF.md` §3.11 peaks
+    at 209 MB against the eager build's 199 MB (`docs/LAZY.md` R8).
+    Clearing a call's argument slots after it returns, and a local's
+    slot after its last use, would give Clojure's constant-memory
+    streaming; it is a compiler change to measure with the
+    interpreter-speed work.
 ## Store size
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's
