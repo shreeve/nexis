@@ -355,17 +355,93 @@
                  (apply update-in (get m k) more f args)
                  (apply f (get m k) args)))))
 
-; ---- sequence breakdown helpers ----
+; ---- lazy sequence functions (docs/LAZY.md §7), Clojure 1.12's ----
 
-; (interpose sep coll) → coll with sep between each pair of
-; adjacent elements. Returns a list.
+; (interleave c1 c2 ...) → the first of each coll, then the second of
+; each, ..., ending with the shortest.
+(defn interleave
+  ([] ())
+  ([c1] (lazy-seq c1))
+  ([c1 c2]
+   (lazy-seq
+     (let [s1 (seq c1) s2 (seq c2)]
+       (when (and s1 s2)
+         (cons (first s1) (cons (first s2) (interleave (rest s1) (rest s2))))))))
+  ([c1 c2 & colls]
+   (lazy-seq
+     (let [ss (map seq (conj colls c2 c1))]
+       (when (every? identity ss)
+         (concat (map first ss) (apply interleave (map rest ss))))))))
+
+; (interpose sep coll) → coll with sep between each pair of adjacent
+; elements.
 (defn interpose [sep coll]
-  (if (empty? coll)
-    (list)
-    (loop* [s (rest coll) acc (list (first coll))]
-      (if (empty? s)
-        (reverse acc)
-        (recur (rest s) (cons (first s) (cons sep acc)))))))
+  (drop 1 (interleave (repeat sep) coll)))
+
+; (take-nth n coll) → every nth element, starting with the first.
+(defn take-nth [n coll]
+  (lazy-seq
+    (when-let [s (seq coll)]
+      (cons (first s) (take-nth n (drop n s))))))
+
+; (partition-by f coll) → coll split each time (f x) changes.
+(defn partition-by [f coll]
+  (lazy-seq
+    (when-let [s (seq coll)]
+      (let [fst (first s)
+            fv (f fst)
+            run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
+        (cons run (partition-by f (lazy-seq (drop (count run) s))))))))
+
+; (tree-seq branch? children root) → the lazy seq of the nodes of the
+; tree under root, depth first, each before its children. Realizing a
+; node calls branch? and children on it, as Clojure's does; the seqs of
+; children still to visit wait on an explicit stack, so the depth of the
+; tree costs no native stack.
+(defn tree-seq [branch? children root]
+  (let [walk (fn walk [node stack]
+               (lazy-seq
+                 (cons node
+                       (let [stack (if (branch? node) (cons (children node) stack) stack)]
+                         (lazy-seq
+                           (loop [stack stack]
+                             (when (seq stack)
+                               (if-let [s (seq (first stack))]
+                                 (walk (first s) (cons (rest s) (rest stack)))
+                                 (recur (rest stack))))))))))]
+    (walk root ())))
+
+; (flatten coll) → every non-sequential leaf of a list or vector, depth
+; first; nil leaves are kept. Anything that is not sequential, nil
+; included, flattens to ().
+(defn flatten [x]
+  (filter (complement sequential?) (rest (tree-seq sequential? seq x))))
+
+; (reductions f coll) / (reductions f init coll) → every intermediate
+; accumulator of the fold, stopping at a reduced one.
+(defn reductions
+  ([f coll]
+   (lazy-seq
+     (if-let [s (seq coll)]
+       (reductions f (first s) (rest s))
+       (list (f)))))
+  ([f init coll]
+   (if (reduced? init)
+     (list @init)
+     (cons init
+           (lazy-seq
+             (when-let [s (seq coll)]
+               (reductions f (f init (first s)) (rest s))))))))
+
+; (drop-last coll) / (drop-last n coll) → coll without its last n
+; elements, one by default.
+(defn drop-last
+  ([coll] (drop-last 1 coll))
+  ([n coll] (map (fn [x _] x) coll (drop n coll))))
+
+; (split-at n coll) → [(take n coll) (drop n coll)].
+(defn split-at [n coll]
+  [(take n coll) (drop n coll)])
 
 ; ============================================================
 ; Function combinators
@@ -573,38 +649,19 @@
 (defn run! [f coll]
   (reduce (fn [_ x] (f x) nil) nil coll))
 
-; (partition-by f coll) → coll split each time (f x) changes.
-(defn partition-by [f coll]
-  (loop [s (seq coll) acc [] run [] k nil]
-    (if s
-      (let [x (first s) fx (f x)]
-        (if (or (empty? run) (= fx k))
-          (recur (next s) acc (conj run x) fx)
-          (recur (next s) (conj acc (seq run)) [x] fx)))
-      (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
-
-; (take-nth n coll) → every nth element, starting with the first.
-(defn take-nth [n coll]
-  (keep-indexed (fn [i x] (when (zero? (rem i n)) x)) coll))
 
 ; (split-with pred coll) → [(take-while pred coll) (drop-while pred coll)].
 (defn split-with [pred coll]
   [(take-while pred coll) (drop-while pred coll)])
 
+; (sequence coll) → coll when it is a seq, else its seq, () when empty.
+(defn sequence [coll]
+  (if (seq? coll) coll (or (seq coll) ())))
+
 ; (distinct? x & xs) → whether no two arguments are equal.
 (defn distinct? [x & xs]
   (= (inc (count xs)) (count (set (cons x xs)))))
 
-; (tree-seq branch? children root) → the nodes of the tree under root,
-; depth first, each before its children; an explicit stack, so the
-; depth of the tree costs no native stack.
-(defn tree-seq [branch? children root]
-  (loop [stack (list root) acc (transient [])]
-    (if (seq stack)
-      (let [node (first stack) more (rest stack)]
-        (recur (if (branch? node) (into more (reverse (children node))) more)
-               (conj! acc node)))
-      (seq (persistent! acc)))))
 
 ; (replace smap coll) → coll with each element that is a key of smap
 ; (a map, or a vector by index) replaced by its value: a vector of a

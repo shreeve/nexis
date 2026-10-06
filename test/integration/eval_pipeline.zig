@@ -1613,7 +1613,7 @@ test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
     try expectOutput("[(nfirst [[1 2 3] 4]) (nfirst nil) (nfirst [[1]])]", "[(2 3) nil nil]");
     try expectOutput("(tree-seq seq? identity '((1 2 (3)) (4)))", "(((1 2 (3)) (4)) (1 2 (3)) 1 2 (3) 3 (4) 4)");
     try expectOutput("[(tree-seq map? vals {:a {:b 1} :c 2}) (tree-seq vector? seq []) (tree-seq vector? seq 1)]", "[({:a {:b 1}, :c 2} {:b 1} 1 2) ([]) (1)]");
-    try expectOutput("(try (tree-seq nil nil 1) (catch any e e))", ":not-callable");
+    try expectOutput("(try (doall (tree-seq nil nil 1)) (catch any e e))", ":not-callable");
     // Deep trees walk without the native stack.
     try expectOutput("(count (tree-seq vector? seq (reduce (fn [t _] [t]) 0 (range 100000))))", "100001");
     try expectOutput("[(replace {1 :a 2 :b} [1 2 3]) (replace {1 :a} '(1 2 1)) (replace [:a :b] [0 1 0 5]) (replace {} nil) (replace {1 2} #{1 3}) (meta (replace {} ^:m [1]))]", "[[:a :b 3] (:a 2 :a) [:a :b :a 5] () (2 3) {:m true}]");
@@ -2007,7 +2007,7 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
-test "integration: =, compare, flatten, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+test "integration: =, compare, hash, set membership and printing of data nested past the stack are :stack-overflow; flatten walks it" {
     // One chain of vectors 100k deep, built once: the test's 6 MiB
     // guard (stack.main_thread_budget) stops every walk of it well
     // before the bottom, in debug and optimized builds alike (an optimized
@@ -2021,11 +2021,11 @@ test "integration: =, compare, flatten, hash, set membership and printing of dat
         \\      b (nth a 0)]
         \\  [(try (= a b) (catch :stack-overflow e :deep))
         \\   (try (compare a b) (catch :stack-overflow e :deep))
-        \\   (try (flatten a) (catch :stack-overflow e :deep))
+        \\   (flatten a)
         \\   (try (hash a) (catch :stack-overflow e :deep))
         \\   (try #{a b} (catch :stack-overflow e :deep))
         \\   (try (pr-str a) (catch :stack-overflow e :deep))])
-    , "[:deep :deep :deep :deep :deep :deep]");
+    , "[:deep :deep () :deep :deep :deep]");
 }
 
 test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
@@ -2296,6 +2296,13 @@ test "lazy: concat, mapcat, take, drop, take-while, drop-while, partition, parti
     // A concat nested deep enough to exhaust the stack is the catchable
     // :stack-overflow when it is walked.
     try expectOutput("(try (first (reduce concat [] (map vector (range 200000)))) (catch :stack-overflow e :deep))", ":deep");
+}
+
+test "lazy: interleave, interpose, take-nth, partition-by, tree-seq, flatten, reductions and drop-last are lazy" {
+    // Expected values from babashka.
+    try expectOutput("[(take 6 (interleave (range) (repeat :x))) (take 3 (tree-seq seq? seq '((1 2) (3)))) (take 3 (reductions + (range))) (take 4 (interpose :s (range)))]", "[(0 :x 1 :x 2 :x) (((1 2) (3)) (1 2) 1) (0 1 3) (0 :s 1 :s)]");
+    try expectOutput("(pr-str [(interleave) (interleave [1 2]) (interleave [1 2] [:a :b :c] [\"x\" \"y\"]) (take-nth 2 (range 7)) (partition-by odd? [1 3 2 4 5]) (flatten [1 [2 [3 nil]] '(4)]) (flatten nil) (reductions + [1 2 3]) (reductions + []) (reductions + 10 [1 2]) (drop-last [1 2 3]) (drop-last 2 [1 2 3]) (split-at 2 [1 2 3]) (split-with odd? [1 3 2 5]) (sequence [1 2]) (sequence []) (replace {1 :a} '(1 2 1))])", "[() (1 2) (1 :a \"x\" 2 :b \"y\") (0 2 4 6) ((1 3) (2 4) (5)) (1 2 3 nil 4) () (1 3 6) (0) (10 11 13) (1 2) (1) [(1 2) (3)] [(1 3) (2 5)] (1 2) () (:a 2 :a)]");
+    try expectOutput("[(class (interleave [1] [2])) (realized? (take-nth 2 [1 2 3])) (first (partition-by odd? (range))) (take 3 (flatten (repeat [1 [2]])))]", "[:lazy_seq false (0) (1 2 1)]");
 }
 
 test "lazy: reduce over an unrealized range allocates nothing" {

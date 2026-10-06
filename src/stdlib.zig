@@ -49,7 +49,6 @@ const protocol_mod = @import("protocol.zig");
 const nextomic_mod = @import("nextomic/root.zig");
 const transient_mod = @import("coll/transient.zig");
 const loader_mod = @import("loader.zig");
-const stack_guard = @import("stack.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -253,7 +252,6 @@ const core_natives = table("", .{
     .{ "dedupe", 1, 1, &fnDedupe },
     .{ "partition", 2, 4, &fnPartition },
     .{ "partition-all", 2, 3, &fnPartitionAll },
-    .{ "interleave", 0, null, &fnInterleave },
     .{ "zipmap", 2, 2, &fnZipmap },
     .{ "take-while", 2, 2, &fnTakeWhile },
     .{ "drop-while", 2, 2, &fnDropWhile },
@@ -262,11 +260,7 @@ const core_natives = table("", .{
     .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "nthnext", 2, 2, &fnNthnext },
-    .{ "split-at", 2, 2, &fnSplitAt },
     .{ "take-last", 2, 2, &fnTakeLast },
-    .{ "drop-last", 1, 2, &fnDropLast },
-    .{ "flatten", 1, 1, &fnFlatten },
-    .{ "reductions", 2, 3, &fnReductions },
     .{ "repeat", 1, 2, &fnRepeat },
     .{ "repeatedly", 1, 2, &fnRepeatedly },
     .{ "iterate", 2, 2, &fnIterate },
@@ -2195,33 +2189,6 @@ fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
     return partitionImpl(vm, true, args);
 }
 
-/// `(interleave & colls)` → round-robin elements until the
-/// shortest collection runs out.
-fn fnInterleave(vm: *VM, args: []const Value) VmError!Value {
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    // Each source's built entries wait on the scope while another's
-    // lazy steps may collect (GC.md §11.5, class 5).
-    const scope = vm.rootScope();
-    defer scope.release();
-    if (args.len > 0) {
-        const iters = vm.allocator.alloc(SeqIter, args.len) catch return VmError.OutOfMemory;
-        defer vm.allocator.free(iters);
-        for (args, 0..) |c, i| iters[i] = try rootedSeqIter(vm, c, scope);
-        outer: while (true) {
-            const mark = results.items.len;
-            for (iters) |*it| {
-                const x = (try it.next()) orelse {
-                    results.shrinkRetainingCapacity(mark);
-                    break :outer;
-                };
-                results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-            }
-        }
-    }
-    return try buildListFromSlice(vm, results.items);
-}
-
 /// `(zipmap keys vals)` → map pairing keys with vals positionally.
 fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     var entries: std.ArrayList(champ_mod.Entry) = .empty;
@@ -2345,19 +2312,7 @@ fn fnNthnext(vm: *VM, args: []const Value) VmError!Value {
     return fnSeq(vm, &.{try fnNthrest(vm, args)});
 }
 
-/// `(split-at n coll)` → `[(take n coll) (drop n coll)]`.
-fn fnSplitAt(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireCount(args[0]);
-    var items = try collectSeq(vm, args[1]);
-    defer items.deinit(vm.allocator);
-    const at = @min(n, items.items.len);
-    const head = try buildListFromSlice(vm, items.items[0..at]);
-    const tail = try buildListFromSlice(vm, items.items[at..]);
-    return vector_mod.fromSlice(vm.ensureHeap(), &.{ head, tail }) catch VmError.OutOfMemory;
-}
-
-/// `(take-last n coll)` / `(drop-last n coll)`; `take-last` of
-/// nothing is nil, as Clojure's.
+/// `(take-last n coll)`; of nothing it is nil, as Clojure's.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[0]);
     var items = try collectSeq(vm, args[1]);
@@ -2367,57 +2322,6 @@ fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 
-fn fnDropLast(vm: *VM, args: []const Value) VmError!Value {
-    const n = if (args.len == 1) 1 else try requireCount(args[0]);
-    var items = try collectSeq(vm, args[args.len - 1]);
-    defer items.deinit(vm.allocator);
-    const drop = @min(n, items.items.len);
-    return try buildListFromSlice(vm, items.items[0 .. items.items.len - drop]);
-}
-
-/// `(flatten coll)` → every non-sequential leaf of a list or
-/// vector, depth first; nil leaves are kept. Anything that is not
-/// sequential, nil included, flattens to `()`.
-fn fnFlatten(vm: *VM, args: []const Value) VmError!Value {
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    if (isSequential(args[0].kind())) try flattenInto(vm, args[0], &results);
-    return try buildListFromSlice(vm, results.items);
-}
-
-fn flattenInto(vm: *VM, v: Value, out: *std.ArrayList(Value)) VmError!void {
-    stack_guard.check() catch return VmError.StackOverflow;
-    if (!isSequential(v.kind())) return out.append(vm.allocator, v) catch VmError.OutOfMemory;
-    var it = try makeSeqIter(vm, v);
-    while (try it.next()) |x| try flattenInto(vm, x, out);
-}
-
-/// `(reductions f coll)` / `(reductions f init coll)` → every
-/// intermediate accumulator of the fold.
-fn fnReductions(vm: *VM, args: []const Value) VmError!Value {
-    const f = args[0];
-    const scope = vm.rootScope();
-    defer scope.release();
-    var it = try rootedSeqIter(vm, args[args.len - 1], scope);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try buildListFromSlice(vm, &.{try vm.callValue(f, &.{})});
-    results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
-    var cb = vm_mod.Callback.init(vm, f, 2);
-    while (try it.next()) |x| {
-        acc = try cb.call(&.{ acc, x });
-        const stop = isReduced(vm, acc);
-        if (stop) acc = reducedValue(acc);
-        try scope.push(acc);
-        results.append(vm.allocator, acc) catch return VmError.OutOfMemory;
-        if (stop) break;
-    }
-    return try buildListFromSlice(vm, results.items);
-}
-
-/// `(repeat n x)` → n copies of x. `(repeatedly n f)` → n results
-/// of `(f)`. `(iterate f x n)` → the first n of x, (f x), (f (f x))
-/// … — the count is explicit because sequences are eager.
 /// `(repeat x)` → the infinite lazy seq of `x`, one cell whose rest is
 /// itself; `(repeat n x)` → `n` of them, `()` for `n` at most 0
 /// (docs/LAZY.md §7).

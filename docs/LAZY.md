@@ -280,6 +280,7 @@ inside a call marks everything (`docs/GC.md`
 | `partition`, `partition-all` | lazy | no | each part a realized lazy seq over a list of its elements (Clojure's `(doall (take n s))`), so `list?` of one is false |
 | `distinct` | lazy | no | the elements seen in a persistent set in the block, which a step that throws and runs again finds as it was |
 | `dedupe` | lazy | 32 outputs at a time, as Clojure's `sequence` over its transducer | |
+| `interleave`, `interpose`, `take-nth`, `partition-by`, `tree-seq`, `flatten`, `reductions`, `drop-last`, `split-at`, `split-with`, `replace` of a seq, `random-sample`, `partitionv`, `partitionv-all`, `sequence` | lazy | as Clojure's (none but through the functions they are built on) | Clojure 1.12's definitions, in `src/stdlib/core.nx` with `lazy-seq`: bytecode and two blocks per element, where a native producer has none; none is in a benchmark |
 
 **Chunked sources** are the seqs that hand out a slice of their
 elements and the seq after them without allocating: a vector's view

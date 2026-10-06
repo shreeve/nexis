@@ -324,8 +324,8 @@ returns a realized list where Clojure returns a lazy seq.
 | Name | Arity | Semantics |
 |---|---|---|
 | `nfirst` | 1 | `(next (first x))` |
-| `tree-seq` | 3 | `(tree-seq branch? children root)`: every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. An explicit stack, so a tree of any depth walks |
-| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a list |
+| `tree-seq` | 3 | `(tree-seq branch? children root)`: the lazy seq of every node, depth first, each before its children; `children` of a node for which `branch?` is truthy gives its children. Realizing a node calls `branch?` and `children` on it, as Clojure's does; the children still to visit wait on an explicit stack, so a tree of any depth walks |
+| `replace` | 2 | `(replace smap coll)`: each element that `smap` (a map, or a vector by index) has as a key replaced by its value; a vector of a vector, keeping its metadata, else a lazy seq |
 | `partitionv`, `partitionv-all` | 2–4, 2–3 | `partition` and `partition-all` with each part a vector |
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
