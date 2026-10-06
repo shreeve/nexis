@@ -2,7 +2,10 @@
 
 The regex engine (`src/regex.zig`): the syntax it accepts, how it
 matches, the limits that bound it, its Unicode data, where its results
-differ from `java.util.regex`, and the differential test against it.
+differ from `java.util.regex`, and the differential test against it;
+then the language over it: the pattern and matcher values, the
+`re-*` functions, the `#"..."` literal and the patterns
+`nexis.string` takes (§8–§11).
 Patterns are Java's syntax minus every construct that needs
 backtracking; matching is linear in the input.
 

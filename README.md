@@ -115,6 +115,8 @@ Each line prints the value after `;; =>` when run with `bin/nexis`
 (== 1 1.0)                                  ;; => true
 (* 1000000000 1000000000)                   ;; => 1000000000000000000, a bignum
 (try (/ 1 0) (catch any e e))               ;; => :divide-by-zero
+(re-seq #"(\w+)=(\d+)" "a=1 b=22")           ;; => (["a=1" "a" "1"] ["b=22" "b" "22"])
+(nexis.string/replace "2026-10-06" #"(\d+)-(\d+)-(\d+)" "$3/$2/$1") ;; => "06/10/2026"
 
 (map inc [1 2 3])                           ;; => (2 3 4), lazy
 (take 3 (iterate #(* 2 %) 1))               ;; => (1 2 4)
@@ -160,7 +162,7 @@ The namespaces that come with the binary are `nexis.core`
 `nexis.pprint`, `nexis.math` and `nexis.simd` (typed-vector kernels);
 `clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
 `clojure.math`, `clojure.test` and `clojure.pprint` are accepted as
-their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
+their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 25 programs that run
 under `zig build examples` (`examples/README.md`).
 
 ## Nextomic
@@ -240,6 +242,9 @@ The semantics port; the platform does not.
 - **Lazy sequences keep their head**: a lazy seq that a local or a
   call's argument holds keeps what it realized until its slot is
   reused; there is no locals clearing (`docs/LAZY.md` §9).
+- **Regular expressions** match in linear time: Java's syntax without
+  backreferences, lookaround, atomic groups or possessive quantifiers,
+  which are `:invalid-regex` (`docs/REGEX.md`).
 - **Numbers** are fixnum + bignum and f64: `(= 1 1.0)` is false, and
   an inexact integer `/` is a float, not a ratio.
 - **Exceptions are values**: `(catch :tag e ...)` matches a keyword or

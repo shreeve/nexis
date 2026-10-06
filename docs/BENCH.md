@@ -271,9 +271,8 @@ transactor stopped.
 **The same code.** A language workload is one body,
 `bench/compare/lang/NAME.clj`, run by every implementation after a
 prelude: `prelude.clj` for babashka and Clojure, one file, and
-`prelude.nx`, which differs from it only in the clock, the string
-namespace, and `split`'s separator: nexis has no regex (PLAN §24 #9),
-so it splits on a string where the others split on `#","`. The bodies
+`prelude.nx`, which differs from it only in the clock and the string
+namespace. The bodies
 compile without a reflection warning. The database workloads are twin
 scripts, `db/nexis-*.nx`, `db/dtlv-*.clj`, `db/datomic-local-*.clj`
 and `db/datomic-pro-*.clj`, the same data from the same arithmetic,
