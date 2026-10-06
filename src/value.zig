@@ -12,9 +12,10 @@
 //!
 //! Design invariants enforced here (VALUE.md §3):
 //!   - One canonical constructor per immediate kind.
-//!   - Raw `tag` / `payload` writes are package-private (only `Value`'s
-//!     own fns mutate them). Users always build Values through a
-//!     constructor that enforces range / canonicalization invariants.
+//!   - An immediate is built through its constructor here, which
+//!     enforces range and canonicalization; a heap Value through its
+//!     kind's module (VALUE.md §3). Zig has no private fields, so
+//!     this is a convention the tree keeps, not a guard.
 //!   - `nil == Value{}` — the all-zero bit pattern is a valid `nil`.
 //!   - Every f64 stored in a `Value.float` is canonical form (SEMANTICS
 //!     §2.2). NaN bit patterns are collapsed at construction.
@@ -111,9 +112,9 @@ pub const Kind = enum(u8) {
     /// explicitly or by the VM's teardown; identity-valued.
     nextomic_conn = 38,
     /// Nextomic db-value (docs/NEXTOMIC.md §4). The heap body is the
-    /// inline `DbBox` `{conn, basis, as-of, since, history}` of
+    /// inline `DbBox` `{conn, file, basis, as-of, since, history}` of
     /// src/nextomic/handle.zig; a plain value with no open transaction,
-    /// compared and hashed structurally.
+    /// compared and hashed structurally (SEMANTICS §2.6).
     nextomic_db = 39,
     /// Nextomic lazy entity (docs/NEXTOMIC.md §6). The heap body is
     /// the `EntityBox` of src/nextomic/handle.zig: the db box the
@@ -133,7 +134,6 @@ pub const Kind = enum(u8) {
     // 43..63 reserved for heap kinds.
 
     // ---- Runtime-private sentinels (never escape public API) ----
-    unbound = 64,
     /// Lazy boxing: a slot's stored Value is the `*HeapHeader` of an
     /// upvalue cell block (a heap block of this kind whose body is
     /// `vm.UpvalCell`) rather than an ordinary user value. Set by
@@ -426,6 +426,25 @@ pub fn testSymbol(id: u32) Value {
     return fromSymbol(id, id);
 }
 
+/// `=` over immediates, for the tests of the modules below `dispatch`
+/// (the collections, the codec, durable refs), with `hashImmediate` as
+/// the hash: the same bits, or the same kind and value, any NaN equal
+/// to any NaN. A heap value equals only itself.
+pub fn testEqual(a: Value, b: Value) bool {
+    if (!@import("builtin").is_test) @compileError("testEqual is for tests");
+    if (a.tag == b.tag and a.payload == b.payload) return true;
+    if (a.kind() != b.kind()) return false;
+    return switch (a.kind()) {
+        .nil, .false_, .true_ => true,
+        .fixnum => a.asFixnum() == b.asFixnum(),
+        .keyword => a.asKeywordId() == b.asKeywordId(),
+        .symbol => a.asSymbolId() == b.asSymbolId(),
+        .char => a.asChar() == b.asChar(),
+        .float => a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat())),
+        else => false,
+    };
+}
+
 /// Pack a STATIC `NativeFn` descriptor pointer into a Value of kind `.native_fn`. The
 /// descriptor lives in static storage (no heap, no GC, no
 /// lifetime concern). The runtime treats the Value as
@@ -547,8 +566,8 @@ test "kind predicates cover the immediate family" {
     try std.testing.expect(!Kind.nil.isHeap());
     try std.testing.expect(Kind.string.isHeap());
     try std.testing.expect(!Kind.string.isImmediate());
-    try std.testing.expect(!Kind.unbound.isImmediate());
-    try std.testing.expect(!Kind.unbound.isHeap());
+    try std.testing.expect(!Kind.cell_internal.isImmediate());
+    try std.testing.expect(!Kind.cell_internal.isHeap());
 }
 
 test "identicalTo: bit-equality over the full Value" {

@@ -1,0 +1,3 @@
+#!/usr/bin/env nexis
+; Run by its path alone: a script needs no .nx suffix.
+(println "a script with no suffix")

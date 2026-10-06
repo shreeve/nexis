@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 950 256" role="img" aria-label="Nextomic">
+  <style>
+    .word { fill: #111827; font: 700 150px "Inter", "SF Pro Display", "Helvetica Neue", Arial, sans-serif; letter-spacing: -4px; }
+    .tail { fill: #6B7280; }
+    @media (prefers-color-scheme: dark) { .word { fill: #F3F4F6; } .tail { fill: #9CA3AF; } }
+  </style>
+  <defs>
+    <linearGradient id="nt-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0FA88F"/>
+      <stop offset="1" stop-color="#1E7FE0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="60" fill="url(#nt-bg)"/>
+  <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M92 66 H 72 V 190 H 92"/>
+    <path d="M164 66 H 184 V 190 H 164"/>
+  </g>
+  <g fill="#fff">
+    <rect x="101.5" y="90.5" width="53" height="15" rx="7.5" opacity="0.4"/>
+    <rect x="101.5" y="120.5" width="53" height="15" rx="7.5" opacity="0.7"/>
+    <rect x="101.5" y="150.5" width="53" height="15" rx="7.5"/>
+  </g>
+  <text class="word" x="300" y="182">nex<tspan class="tail">tomic</tspan></text>
+</svg>

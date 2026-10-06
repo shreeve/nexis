@@ -16,6 +16,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/dispatch.zig`, `src/hash.zig`, `src/xxhash3.zig` | [`SEMANTICS.md`](SEMANTICS.md) §2, §3, §3.3 | Cross-kind `=` and hash; the kind → equality category → hash domain table; XXH3-64 |
 | `src/intern.zig` | [`INTERN.md`](INTERN.md) | Symbol and keyword interning |
 | `src/string.zig` | [`STRING.md`](STRING.md) | String heap kind |
+| `src/regex.zig`, `src/regex_tables.zig` | [`REGEX.md`](REGEX.md) | Regular expressions: Java's syntax without backtracking, a Pike VM in linear time, Java's Unicode tables (generated) |
 | `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Arbitrary-precision integers |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Lists: cons, empty, O(1) vector view |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector: 32-way trie with a tail |

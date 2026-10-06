@@ -28,6 +28,7 @@ const std = @import("std");
 pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
 const stack = @import("stack.zig");
+const string_mod = @import("string.zig");
 
 pub const Tag = nexis.Tag;
 pub const Sexp = parser.Sexp;
@@ -269,6 +270,8 @@ pub const Reader = struct {
                 std.math.nan(f64);
             return try self.makeForm(.{ .real = symbolic }, span);
         }
+        // Zig's parser takes `_` between digits; a nexis literal has none.
+        if (std.mem.findScalar(u8, text, '_') != null) return self.fail(.bad_number_literal, span, text);
         const value = std.fmt.parseFloat(f64, text) catch
             return self.fail(.bad_number_literal, span, text);
         return try self.makeForm(.{ .real = value }, span);
@@ -462,8 +465,8 @@ pub const Reader = struct {
         return try self.makeForm(.{ .map = merged[n..] }, span);
     }
 
-    /// Accept `^:kw`, `^{...}`, or `^sym` and append the resulting
-    /// key/value pairs to `entries`.
+    /// Accept `^:kw`, `^{...}`, `^sym`, `^"string"` or `^[...]` and
+    /// append the resulting key/value pairs to `entries`.
     fn appendMetaEntries(self: *Reader, entries: *std.ArrayList(*Form), m: *Form, span: SrcSpan) ReaderError!void {
         switch (m.datum) {
             .keyword => {
@@ -471,16 +474,18 @@ pub const Reader = struct {
                 const tr = try self.makeForm(.{ .bool_ = true }, span);
                 try entries.append(self.allocator(), tr);
             },
-            .symbol => {
-                const tag_kw = try self.makeForm(.{ .keyword = .{ .ns = null, .name = "tag" } }, span);
-                try entries.append(self.allocator(), tag_kw);
+            // `^String x` and `^"String" x` are a `:tag`, `^[long]
+            // f` Clojure's `:param-tags`.
+            .symbol, .string, .vector => {
+                const key = if (m.datum == .vector) "param-tags" else "tag";
+                try entries.append(self.allocator(), try self.makeForm(.{ .keyword = .{ .ns = null, .name = key } }, span));
                 try entries.append(self.allocator(), m);
             },
             .map => |kv| {
                 if (kv.len % 2 != 0) return self.fail(.map_odd_count, m.origin, null);
                 for (kv) |p| try entries.append(self.allocator(), p);
             },
-            else => return self.fail(.unknown_reader_construct, m.origin, "metadata must be a keyword, map, or symbol"),
+            else => return self.fail(.unknown_reader_construct, m.origin, "metadata must be a keyword, map, symbol, string or vector"),
         }
     }
 
@@ -502,12 +507,27 @@ pub const Reader = struct {
                 'n' => '\n',
                 't' => '\t',
                 'r' => '\r',
+                'b' => 0x08,
+                'f' => 0x0C,
                 '\\' => '\\',
                 '"' => '"',
                 else => null,
             };
             if (simple) |b| {
                 out.appendAssumeCapacity(b);
+                continue;
+            }
+            // Clojure's octal escape: one to three octal digits, at
+            // most `\377`.
+            if (at + 1 < body.len and body[at + 1] >= '0' and body[at + 1] <= '7') {
+                var end = at + 1;
+                while (end < body.len and end < at + 4 and body[end] >= '0' and body[end] <= '7') end += 1;
+                i = end;
+                const unit = std.fmt.parseInt(u21, body[at + 1 .. end], 8) catch unreachable;
+                if (unit > 0o377) return self.fail(.invalid_string_escape, span, body[at..end]);
+                var utf8: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(unit, &utf8) catch unreachable;
+                out.appendSliceAssumeCapacity(utf8[0..n]);
                 continue;
             }
             if (body[i - 1] != 'u')
@@ -537,7 +557,9 @@ pub const Reader = struct {
                 return self.fail(.invalid_string_escape, span, body[at..@min(body.len, at + 16)]);
             const escape = body[at .. close + 1];
             i = close + 1;
-            const scalar = std.fmt.parseInt(u21, body[at + 3 .. close], 16) catch
+            const digits = body[at + 3 .. close];
+            for (digits) |c| if (!std.ascii.isHex(c)) return self.fail(.invalid_string_escape, span, escape);
+            const scalar = std.fmt.parseInt(u21, digits, 16) catch
                 return self.fail(.invalid_string_escape, span, escape);
             var utf8: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(scalar, &utf8) catch
@@ -571,6 +593,61 @@ pub const Reader = struct {
 // Pure helpers (no Reader state)
 // -----------------------------------------------------------------------------
 
+/// The innermost delimiter (`(`, `[`, `{`, `#{`, `#(`) the scanner's
+/// tokens before `pos` leave open, which a parse error at `pos` reports
+/// as the one unclosed or mismatched.
+pub fn openDelimiter(allocator: std.mem.Allocator, text: []const u8, pos: u32) error{OutOfMemory}!?SrcSpan {
+    var lexer = nexis.Lexer.init(text);
+    var open: std.ArrayList(SrcSpan) = .empty;
+    defer open.deinit(allocator);
+    while (true) {
+        const t = lexer.next();
+        if (t.cat == .eof or t.pos >= pos) break;
+        switch (t.cat) {
+            .lparen, .lbracket, .lbrace, .hash_lbrace, .hash_lparen => try open.append(allocator, .{ .pos = t.pos, .len = t.len }),
+            .rparen, .rbracket, .rbrace => _ = open.pop(),
+            else => {},
+        }
+    }
+    return open.pop();
+}
+
+/// Where the first form of `text` ends, by the scanner's tokens: past
+/// its last token, with the `#_` discards and `^meta` before it; null
+/// when the text ends first or holds a token the scanner rejects.
+/// `read-string` parses and reads just this much, so the text after
+/// the first form is never scanned, as Clojure never reads it.
+pub fn firstFormEnd(text: []const u8) ?u32 {
+    var lexer = nexis.Lexer.init(text);
+    // Forms still to come before the first one is complete: a `^`
+    // takes two (the metadata and the target), a `#_` one more.
+    var need: usize = 1;
+    var depth: usize = 0;
+    while (true) {
+        const t = lexer.next();
+        switch (t.cat) {
+            .eof, .err => return null,
+            .lparen, .lbracket, .lbrace, .hash_lbrace, .hash_lparen => {
+                depth += 1;
+                continue;
+            },
+            .rparen, .rbracket, .rbrace => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth > 0) continue;
+            },
+            .caret, .hash_discard => {
+                if (depth == 0) need += 1;
+                continue;
+            },
+            .quote_tok, .syntax_quote_tok, .unquote_tok, .unquote_splicing_tok, .deref_tok, .var_quote_tok => continue,
+            else => if (depth > 0) continue,
+        }
+        need -= 1;
+        if (need == 0) return lexer.base.pos;
+    }
+}
+
 fn tokenSpan(r: parser.Src) SrcSpan {
     return .{ .pos = r.pos, .len = nexis.srcLen(r) };
 }
@@ -598,15 +675,14 @@ fn sexpSpan(s: Sexp) SrcSpan {
 
 const IntLiteral = struct { negative: bool, base: u8, digits: []const u8 };
 
-/// Split an integer literal into sign, radix and digits; `null` unless
-/// every digit is valid for the radix.
+/// Split an integer literal into sign (`-` or `+`), radix and digits;
+/// `null` unless every digit is valid for the radix.
 fn splitIntLiteral(text: []const u8) ?IntLiteral {
     if (text.len == 0) return null;
-    var negative = false;
     var t = text;
-    if (t[0] == '-') {
+    const negative = t[0] == '-';
+    if (t[0] == '-' or t[0] == '+') {
         if (t.len == 1) return null;
-        negative = true;
         t = t[1..];
     }
     var base: u8 = 10;
@@ -660,7 +736,7 @@ fn parseCharLiteral(body: []const u8) ?u21 {
         return if (isScalar(v)) v else null;
     }
     const n = std.unicode.utf8ByteSequenceLength(body[0]) catch return null;
-    if (n == body.len) return std.unicode.utf8Decode(body) catch null;
+    if (n == body.len) return (string_mod.decodeAt(body, 0) catch return null).scalar;
     const names = [_]struct { []const u8, u21 }{
         .{ "newline", '\n' }, .{ "space", ' ' },     .{ "tab", '\t' },
         .{ "return", '\r' },  .{ "formfeed", 0x0C }, .{ "backspace", 0x08 },
@@ -685,9 +761,15 @@ fn hex4(digits: []const u8) ?u21 {
 fn splitNamespace(text: []const u8) ?Name {
     if (text.len == 0) return null;
     // `/` by itself is the division symbol (only valid unqualified name
-    // that is itself a slash).
+    // that is itself a slash); `ns//` is it qualified, as syntax-quote
+    // writes `nexis.core//` and Clojure reads `clojure.core//`.
     if (std.mem.eql(u8, text, "/")) {
         return Name{ .ns = null, .name = text };
+    }
+    if (text.len > 2 and std.mem.endsWith(u8, text, "//")) {
+        const ns = text[0 .. text.len - 2];
+        if (std.mem.findScalar(u8, ns, '/') != null) return null;
+        return Name{ .ns = ns, .name = "/" };
     }
     const first = std.mem.findScalar(u8, text, '/') orelse {
         return Name{ .ns = null, .name = text };
@@ -704,15 +786,16 @@ fn splitNamespace(text: []const u8) ?Name {
 /// A Form is a "literal key" eligible for static duplicate detection iff it
 /// is an atom (nil/bool/int/real/char/string/keyword/symbol) AND its value
 /// is compile-time known. Every atom is treated as literal.
-fn isLiteralKey(f: *const Form) bool {
+pub fn isLiteralKey(f: *const Form) bool {
     return switch (f.datum) {
         .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => true,
         else => false,
     };
 }
 
-/// Literal forms under the reader's literal equality (`formLiteralEq`).
-const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
+/// Literal forms (`isLiteralKey`) under the reader's literal equality
+/// (`formLiteralEq`).
+pub const LiteralSet = std.HashMapUnmanaged(*const Form, void, struct {
     pub fn hash(_: @This(), f: *const Form) u64 {
         var h = std.hash.Wyhash.init(@backingInt(f.datum));
         switch (f.datum) {
@@ -950,6 +1033,9 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
         .{ .src = "3.14M", .pos = 0, .text = "3.14M" },
         .{ .src = "1.5N", .pos = 0, .text = "1.5N" },
         .{ .src = "1_000", .pos = 0, .text = "1_000" },
+        .{ .src = "1.0_5", .pos = 0, .text = "1.0_5" },
+        .{ .src = "1e1_0", .pos = 0, .text = "1e1_0" },
+        .{ .src = "+1x", .pos = 0, .text = "+1x" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c.src);
@@ -978,6 +1064,27 @@ test "number token boundary: a digit-led run is one token the reader rejects" {
     try std.testing.expectEqual(@as(usize, 2), items.len);
     try std.testing.expectEqual(@as(i64, 1), items[0].datum.int);
     try std.testing.expect(items[1].datum == .deref);
+}
+
+test "signed numbers and digit-led keywords read as in Clojure" {
+    try expectReads("[+5 +0x10 -0x10 +1.5 +9223372036854775808 :1 :2a + +a]",
+        \\(vector (int 5) (int 16) (int -16) (real 1.5) (bigint 9223372036854775808) (keyword :1) (keyword :2a) (symbol +) (symbol +a))
+        \\
+    );
+}
+
+test "metadata: a string is a :tag, a vector :param-tags" {
+    try expectReads("^\"String\" x ^[long] f",
+        \\(with-meta
+        \\  (symbol x)
+        \\  (map (keyword :tag) (string "String")))
+        \\(with-meta
+        \\  (symbol f)
+        \\  (map
+        \\    (keyword :param-tags)
+        \\    (vector (symbol long))))
+        \\
+    );
 }
 
 test "parsing is linear: a list of n forms costs O(n) parser memory" {
@@ -1037,29 +1144,7 @@ test "a token longer than 64 KiB reads whole" {
 }
 
 test "N suffix: an integer literal of any radix or size reads as the integer" {
-    const allocator = std.testing.allocator;
-    const ints = [_]struct { src: []const u8, value: i64 }{
-        .{ .src = "1N", .value = 1 },
-        .{ .src = "-7N", .value = -7 },
-        .{ .src = "0xFFN", .value = 255 },
-        .{ .src = "0b101N", .value = 5 },
-    };
-    for (ints) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(try p.parseProgram());
-        try std.testing.expectEqual(@as(usize, 1), forms.len);
-        try std.testing.expectEqual(c.value, forms[0].datum.int);
-    }
-    const wide = "18446744073709551616N";
-    var p = parser.Parser.init(allocator, wide);
-    defer p.deinit();
-    var rd = Reader.init(allocator, wide);
-    defer rd.deinit();
-    const forms = try rd.readProgram(try p.parseProgram());
-    try std.testing.expectEqualStrings("18446744073709551616", forms[0].datum.bigint);
+    try expectReads("1N -7N 0xFFN 0b101N 18446744073709551616N", "(int 1)\n(int -7)\n(int 255)\n(int 5)\n(bigint 18446744073709551616)\n");
 }
 
 test "bigint literals: beyond i64 in any radix, as canonical decimal text" {
@@ -1103,23 +1188,7 @@ test "integer radix normalization" {
 }
 
 test "nil / true / false only match unqualified symbols" {
-    const allocator = std.testing.allocator;
-    const cases = [_][]const u8{ "nil", "true", "false", "foo/nil", "foo/true", "foo/false", ":nil", ":true" };
-    const expect_atomic = [_]bool{ true, true, true, false, false, false, false, false };
-    for (cases, expect_atomic) |src, want_atomic| {
-        var p = parser.Parser.init(allocator, src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expect(forms.len == 1);
-        const is_atomic = switch (forms[0].datum) {
-            .nil, .bool_ => true,
-            else => false,
-        };
-        try std.testing.expectEqual(want_atomic, is_atomic);
-    }
+    try expectReads("nil true false foo/nil foo/true :nil :true", "nil\n(bool true)\n(bool false)\n(symbol foo/nil)\n(symbol foo/true)\n(keyword :nil)\n(keyword :true)\n");
 }
 
 test "namespace split" {
@@ -1143,6 +1212,13 @@ test "namespace split" {
     // Multi-slash is invalid (at most one separator)
     try std.testing.expect(splitNamespace("foo/bar/baz") == null);
     try std.testing.expect(splitNamespace("a/b/c/d") == null);
+
+    // The division symbol qualified, as syntax-quote prints it.
+    const d = splitNamespace("nexis.core//").?;
+    try std.testing.expectEqualStrings("nexis.core", d.ns.?);
+    try std.testing.expectEqualStrings("/", d.name);
+    try std.testing.expect(splitNamespace("a/b//") == null);
+    try std.testing.expect(splitNamespace("//") == null);
 }
 
 test "char literal parsing" {
@@ -1188,6 +1264,13 @@ test "strings: may span lines, must be UTF-8, fail at their bad escape" {
     try expectReaderError("\"\\uD800\"", .invalid_string_escape, "\\uD800");
     try expectReaderError("\"\\uDE00\\uD83D\"", .invalid_string_escape, "\\uDE00");
     try expectReaderError("\"\\uD83Dx\"", .invalid_string_escape, "\\uD83D");
+    // `\b`, `\f` and Clojure's octal escapes, at most `\377`; a
+    // `\u{...}` body is hex digits alone.
+    try expectReads("\"\\b\\f\\101\\0\\12x\"", "(string \"\\u{8}\\u{C}A\\u{0}\\nx\")\n");
+    try expectReads("\"\\1234\"", "(string \"S4\")\n");
+    try expectReaderError("\"\\400\"", .invalid_string_escape, "\\400");
+    try expectReaderError("\"\\u{+41}\"", .invalid_string_escape, "\\u{+41}");
+    try expectReaderError("\"\\u{4_1}\"", .invalid_string_escape, "\\u{4_1}");
     // An unterminated string is a parse error at its opening quote.
     const allocator = std.testing.allocator;
     const src = "(println \"never closed\n(+ 1 2)";
@@ -1220,69 +1303,33 @@ test "char literals: one token to the next delimiter, judged whole" {
 }
 
 test "discard applies uniformly across aggregator contexts" {
-    const allocator = std.testing.allocator;
-    // Discard consumes its next form including any reader sugar attached
-    // to it (metadata, deref, quote, anon-fn): the prefixed form is one form.
-    const cases = [_]struct { src: []const u8, expected_len: usize }{
-        .{ .src = "#_ ^:m x y", .expected_len = 1 }, // ^:m x is one form
-        .{ .src = "#_ @a b", .expected_len = 1 }, // @a is one form
-        .{ .src = "#_ '(+ 1 2) keep", .expected_len = 1 }, // quoted list is one form
-        .{ .src = "#_ #(+ % 1) z", .expected_len = 1 }, // anon-fn is one form
-        .{ .src = "[#_ x y]", .expected_len = 1 }, // discard inside vector
-        .{ .src = "#{#_ x :a}", .expected_len = 1 }, // discard inside set
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expectEqual(c.expected_len, forms.len);
-    }
+    // Discard consumes its next form including any reader sugar
+    // attached to it (metadata, deref, quote, anon-fn): the prefixed
+    // form is one form.
+    try expectReads("#_ ^:m x y #_ @a b #_ '(+ 1 2) keep #_ #(+ % 1) z [#_ x y] #{#_ x :a}",
+        \\(symbol y)
+        \\(symbol b)
+        \\(symbol keep)
+        \\(symbol z)
+        \\(vector (symbol y))
+        \\(set (keyword :a))
+        \\
+    );
 }
 
 test "discard inside a map affects key/value arity" {
-    // `{:a 1 #_ :b 2}` drops `:b`, leaving `[:a, 1, 2]` (3 forms, odd) —
-    // the map reader correctly reports :map-odd-count. This pins the
-    // behavior: discards reshape map contents and the error surfaces at
-    // the post-discard arity check, not silently.
-    const allocator = std.testing.allocator;
-    const src: []const u8 = "{:a 1 #_ :b 2}";
-    var p = parser.Parser.init(allocator, src);
-    defer p.deinit();
-    const tree = try p.parseProgram();
-    var rd = Reader.init(allocator, src);
-    defer rd.deinit();
-    try std.testing.expectError(error.ReaderFailure, rd.readProgram(tree));
-    try std.testing.expect(rd.err.?.kind == .map_odd_count);
+    // `{:a 1 #_ :b 2}` drops `:b`, leaving three forms: the arity check
+    // after the discard reports it, never silently.
+    try expectReaderError("{:a 1 #_ :b 2}", .map_odd_count, null);
 }
 
 test "stacked discard drops siblings in source order" {
-    // `#_ #_ x y z` yields `[z]` (drops x and y), as Clojure's reader
-    // does: each `#_` consumes one form, and the form it consumes may
-    // itself begin with `#_`.
-    const allocator = std.testing.allocator;
-    const cases = [_]struct { src: []const u8, expected_count: usize, first_atom: ?[]const u8 }{
-        .{ .src = "#_ x y", .expected_count = 1, .first_atom = "y" },
-        .{ .src = "#_ #_ x y z", .expected_count = 1, .first_atom = "z" },
-        .{ .src = "#_ #_ #_ a b c d", .expected_count = 1, .first_atom = "d" },
-        .{ .src = "[#_ #_ x y z]", .expected_count = 1, .first_atom = null }, // wrapped
-        .{ .src = "(+ #_ #_ x y 3 4)", .expected_count = 1, .first_atom = null },
-    };
-    for (cases) |c| {
-        var p = parser.Parser.init(allocator, c.src);
-        defer p.deinit();
-        const tree = try p.parseProgram();
-        var rd = Reader.init(allocator, c.src);
-        defer rd.deinit();
-        const forms = try rd.readProgram(tree);
-        try std.testing.expectEqual(c.expected_count, forms.len);
-        if (c.first_atom) |name| {
-            try std.testing.expect(forms[0].datum == .symbol);
-            try std.testing.expectEqualStrings(name, forms[0].datum.symbol.name);
-        }
-    }
+    // Each `#_` consumes one form, and the form it consumes may itself
+    // begin with `#_`, as in Clojure's reader.
+    try expectReads("#_ x y", "(symbol y)\n");
+    try expectReads("#_ #_ x y z", "(symbol z)\n");
+    try expectReads("#_ #_ #_ a b c d", "(symbol d)\n");
+    try expectReads("[#_ #_ x y z] (+ #_ #_ x y 3 4)", "(vector (symbol z))\n(list (symbol +) (int 3) (int 4))\n");
 }
 
 /// `src` read as a program, each form printed as the goldens print it.
@@ -1333,6 +1380,32 @@ test "discard: #_ drops the next form wherever a form may stand" {
         defer rd.deinit();
         const f = try rd.readOneForm(try p.parseForm());
         try std.testing.expectEqualStrings("x", f.datum.symbol.name);
+    }
+}
+
+test "firstFormEnd: the first form's tokens, discards and metadata included, and no further" {
+    const cases = [_]struct { text: []const u8, end: ?usize }{
+        .{ .text = "1 2", .end = 1 },
+        .{ .text = "  (a [b] {c d}) )))", .end = 15 },
+        .{ .text = "#_ x y z", .end = 6 },
+        .{ .text = "^:k ^{:a 1} [1] tail", .end = 15 },
+        .{ .text = "'#_a b c", .end = 6 },
+        .{ .text = "@x #(", .end = 2 },
+        .{ .text = "\\u{110000} x", .end = 10 },
+        .{ .text = "\"a b\" c", .end = 5 },
+        .{ .text = "{:a 1 :a 2} unreadable \"", .end = 11 },
+        .{ .text = "", .end = null },
+        .{ .text = "; only a comment", .end = null },
+        .{ .text = "(a b", .end = null },
+        .{ .text = ") x", .end = null },
+        .{ .text = "#_ #_ a", .end = null },
+        .{ .text = "\"open", .end = null },
+    };
+    for (cases) |c| {
+        const end = firstFormEnd(c.text);
+        if (c.end) |e| {
+            try std.testing.expectEqual(@as(?u32, @intCast(e)), end);
+        } else try std.testing.expectEqual(@as(?u32, null), end);
     }
 }
 

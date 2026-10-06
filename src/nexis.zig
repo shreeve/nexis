@@ -130,8 +130,8 @@ pub const Lexer = struct {
             '\\' => return self.scanChar(start, pre),
             ':' => return self.scanKeyword(start, pre),
             '0'...'9' => return self.scanNumber(start, pre, false),
-            '-' => {
-                // `-` followed by digit begins a negative number.
+            '-', '+' => {
+                // A sign followed by a digit begins a number.
                 if (start + 1 < src.len and isAsciiDigit(src[start + 1])) {
                     return self.scanNumber(start, pre, true);
                 }
@@ -252,7 +252,8 @@ pub const Lexer = struct {
             self.skipConstituents();
             return self.finish(.err, start, pre);
         }
-        if (!isIdentStart(first) and first != '-') return self.single(.err, start, pre);
+        // `:1` is a keyword, as in Clojure.
+        if (!isIdentStart(first) and first != '-' and !isAsciiDigit(first)) return self.single(.err, start, pre);
         self.skipConstituents();
         return self.finish(.keyword, start, pre);
     }
@@ -269,7 +270,7 @@ pub const Lexer = struct {
         return self.finish(.ident, start, pre);
     }
 
-    /// A number token: `-?`, then `0x`/`0b` and radix digits, or decimal
+    /// A number token: a sign, then `0x`/`0b` and radix digits, or decimal
     /// digits with an optional fraction and exponent. The token ends
     /// where a symbol would, at whitespace, a delimiter or a reader
     /// macro character; the symbol constituents that follow the digits
@@ -277,9 +278,9 @@ pub const Lexer = struct {
     /// each reach the reader as one number-shaped token, never as a
     /// number followed by a symbol, and the reader judges the text
     /// (FORMS.md §3, "Number token boundary").
-    fn scanNumber(self: *Lexer, start: u32, pre: u8, has_minus: bool) Token {
+    fn scanNumber(self: *Lexer, start: u32, pre: u8, signed: bool) Token {
         const src = self.base.source;
-        self.base.pos = if (has_minus) start + 1 else start;
+        self.base.pos = if (signed) start + 1 else start;
         var is_real = false;
 
         // Hex `0x...` / binary `0b...`.

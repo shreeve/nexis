@@ -306,6 +306,9 @@ test "S7: codepoint count, index and range agree with a reference decode" {
         if (len > 0 and r.uintLessThan(u8, 16) == 0) buf[r.uintLessThan(usize, len)] = 0x80 | r.int(u8);
         const bytes = buf[0..len];
         const v = try string.fromBytes(&heap, bytes);
+        // The first call scans for ASCII and keeps the answer; any of
+        // the three may be first.
+        if (r.boolean()) _ = string.codepointAt(v, r.uintAtMost(usize, len)) catch {};
         const ref = referenceOffsets(bytes, &offsets) orelse {
             try std.testing.expectError(error.InvalidUtf8, string.codepointCount(v));
             continue;

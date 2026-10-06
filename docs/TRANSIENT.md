@@ -25,8 +25,9 @@ the next with room for 32, and writes a leaf or interior it owns
 directly; a map or set transient replaces a value where it lies,
 inserts a payload into an owned node that has room in its block
 (`Heap.resizeInPlace`, `docs/HEAP.md` §3), and gives a node it grows
-two payloads of spare room so the next inserts land in place. A persistent collection never changes: no transient owns a node
-it can reach.
+two payloads of spare room so the next inserts land in place. A
+persistent collection never changes: no transient owns a node it can
+reach.
 
 The layout a transient builds is the one the persistent operations
 build for the same contents: the same vector trie (VECTOR.md §3), the
@@ -68,7 +69,7 @@ root's kind, so no operation inspects the inner header's kind.
 ### 3. Wrapper layout
 
 Body 16 bytes: `owner_token: u64` at offset 0 (0 = frozen, nonzero =
-active: the edit token, a `u32`) and `inner_header: *HeapHeader` at
+active: the edit token, 26 bits, §4) and `inner_header: *HeapHeader` at
 offset 8, the root the transient owns, never null. An edit that
 outgrows an array form, promotes it or empties a trie replaces the
 root. A transient never carries metadata.
@@ -87,10 +88,23 @@ never reissued while a node carries it: when the clock would wrap,
 every map, set and vector block of the heap forgets its token (a root
 forgets its cached hash, recomputed on the next use) and every active
 transient takes a new token from 1, so no transient edits a node
-another one owned. The runtime is single-threaded per VM, so a nonzero
-token is an aliveness signal: `persistent!` is the only way a
-transient loses its owner. `TransientWrongOwner` is in the error set
-for an isolate-epoch check; no code path returns it.
+another one owned.
+
+That reaches every token because a token lives only in its wrapper and
+on the nodes it stamps: no code outside `transient.zig` reads one, and
+each edit reads its wrapper's token at the edit, after anything it
+calls that can issue a token. A native that grows a vector of its own
+inside a transient map's values (`group-by`'s buckets) does it through
+`vectorConjUnderBang`, which reads the map's token the same way. A
+token kept across a call that can issue one would be stale after a
+wrap: the nodes it stamped would carry a token the clock hands out
+again, and the transient taking it would edit them in place, inside a
+persistent value by then. The wrap's tests set `edit_clock` near
+`edit_token_max` instead of issuing 2²⁶ tokens.
+
+The runtime is single-threaded per VM, so a nonzero token is an
+aliveness signal: `persistent!` is the only way a transient loses its
+owner.
 
 ---
 
@@ -116,23 +130,22 @@ a frozen wrapper still traces its inner root (§10).
 | `TransientKindMismatch` | a non-transient Value, or the wrong family (`dissoc!` on a vector transient) | `:kind-mismatch` |
 | `InvalidTransientInner` | `transient` of anything but a hash map, hash set or vector (a sorted collection has no transient, as in Clojure) | `:kind-mismatch` |
 | `IndexOutOfBounds` | `pop!` of an empty vector; `assoc!` past the count | `:index-out-of-bounds` |
-| `TransientWrongOwner` | never (§4) | — |
 
 These are ordinary branches, checked in every build mode. The stdlib
 also checks the family before calling in (`transientFailure` in
 `src/stdlib.zig` maps the Zig errors).
 
-A `!` call that raises leaves the transient as it found it, whichever
-of its operands raised, including when an operand hashed or compared
-past the stack guard, which the VM raises as `:stack-overflow` once the
-native returns (`docs/SEMANTICS.md` §2.7). A call of one map or set
-edit changes nothing unless its lookup ran clean; a vector call checks
-every index before its first write. A map or set call of several edits
-takes a snapshot first (`snapshot`): the transient continues on a copy
-of its root under a new token, so every node it edits is copied and
-the kept collection stays as it was, and the native restores the kept
-root and token on an error or an overflow. Memory running out in the
-middle of a vector or map call of several edits is not undone: the
+A `!` call of several operands is a loop of edits, as Clojure's
+`assoc!`, `dissoc!` and `disj!` of several keys are. It checks the shape
+of every operand before its first edit, so an operand of the wrong
+shape changes nothing: a vector `assoc!` checks every index
+(`:kind-mismatch`, `:index-out-of-bounds`), a map `conj!` every operand
+(a `[k v]` vector, a map, a record or nil; else `:arity-mismatch` or
+`:kind-mismatch`). A map or set edit changes nothing unless its lookup
+ran clean: one whose key hashed or compared past the stack guard
+raises `:stack-overflow` (`docs/SEMANTICS.md` §2.7), and the call stops
+there with the edits before it kept, as a loop that throws keeps them.
+Memory running out in the middle of a call is not undone either: the
 error is not catchable (`docs/VM.md` §13), and the edits done before it
 stay.
 
@@ -177,8 +190,8 @@ same transient.
 
 | Family | Functions |
 |---|---|
-| wrap | `transientFrom(heap, v)`, `persistentBang(t)`, `snapshot(heap, t)`, `restore(t, kept)`, `editToken(t)` |
-| map (0) | `mapAssocBang`, `mapDissocBang`, `mapLocateBang` and `mapPutBang` (one lookup for a read then a store), `mapGetBang` (a `champ.MapLookup`), `mapCountBang` |
+| wrap | `transientFrom(heap, v)`, `persistentBang(t)` |
+| map (0) | `mapAssocBang`, `mapDissocBang`, `mapLocateBang` and `mapPutBang` (one lookup for a read then a store), `vectorConjUnderBang` (a vector inside the map's values, grown under its token, §4), `mapGetBang` (a `champ.MapLookup`), `mapCountBang` |
 | set (1) | `setConjBang`, `setDisjBang`, `setContainsBang`, `setCountBang` |
 | vector (2) | `vectorConjBang`, `vectorOpenTailBang` and `vectorCloseTailBang` (a native's builder: 32 slots opened past a full tail and written in place, then the tail's length, `vector.openTailInPlace`), `vectorAssocBang` (appends at `idx == count`), `vectorPopBang`, `vectorNthBang`, `vectorCountBang` |
 | GC | `trace(h, visitor)` |
@@ -224,7 +237,7 @@ nothing of tokens: an owned node is an ordinary block.
 
 ---
 
-### 12. Testing
+### 11. Testing
 
 `test/prop/transient.zig`: T1a-T1d equivalence (random edit sequences
 through a transient and through the persistent operations give `=` and
@@ -239,6 +252,7 @@ relatives, two at once, edit in place, through collision nodes and
 across the vector's trie boundaries, with collections in between; T6
 the edit clock's wrap. Inline tests in `transient.zig` cover the
 wrapper and that an edit of owned nodes allocates nothing;
-`test/integration/eval_pipeline.zig` ("transients", and the `gc:` tests
-of `group-by` and transient builds under the stress policy) covers the
-language surface.
+`test/integration/eval_pipeline.zig` ("transients", the wrap of the
+clock under `group-by` and under a `!` call that raises, and the `gc:`
+tests of `group-by` and transient builds under the stress policy)
+covers the language surface.

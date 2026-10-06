@@ -5,7 +5,8 @@ print/read contract and metadata: what `src/value.zig`, `src/hash.zig`
 and `src/dispatch.zig` implement. The frozen decisions behind them are
 PLAN §23 #10–#14, #32 and #36; PLAN wins on an apparent conflict. PLAN
 §25 risk #13 (numeric corner cases poisoning equality, hash or codec)
-is mitigated by pinning every edge case here.
+is mitigated by pinning every edge case here. What the language
+deliberately leaves out is PLAN §4 and §24.
 
 ---
 
@@ -67,8 +68,10 @@ true.
   is `1.5`, `(max 1 2.0)` is `2.0`. A bignum operand widens to the
   nearest f64.
 - `/` on two integers yields an integer when the division is exact
-  and a float otherwise: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`. There
-  are no rationals (PLAN §23 #10).
+  and otherwise the f64 nearest the true quotient (ties to even),
+  whatever the operands' size: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`,
+  and `10^400` over `3·10^399` is `3.3333333333333335`. There are no
+  rationals (PLAN §23 #10).
 - An integer result outside the fixnum range is a bignum, exact at any
   size: `(+ 140737488355327 1)` is `140737488355328`, and `(- (+
   140737488355327 1) 1)` is the fixnum again. `quot`, `rem`, `mod`,
@@ -91,8 +94,9 @@ true.
 - `even?` / `odd?` take integers only (`:kind-mismatch` on a float).
 - `(long x)` is `x` for an integer and the integer part of a finite
   float, toward zero and a bignum when wide (`(long 1e30)` is
-  `1000000000000000019884624838656`); NaN and the infinities raise
-  `:invalid-argument`. `int`, `short` and `byte` are `long` within
+  `1000000000000000019884624838656`); the infinities raise
+  `:invalid-argument` and NaN is 0, as Clojure's `RT.longCast`
+  makes them. `int`, `short` and `byte` are `long` within
   the range of Java's `int`, `short`, `byte` (a float outside it, or
   the integer part outside it, is `:invalid-argument`), except that
   NaN is 0, as Java's casts make it. `(double x)` is the nearest f64
@@ -157,8 +161,11 @@ qualified and an unqualified keyword are different names. `(= 'foo
   [1.0 2.0]))` are false.
 - A durable ref compares by its identity triple (store id, tree, key
   bytes), never by the value it points at (PLAN §23 #7). A Nextomic
-  db-value compares by connection, basis and mode (`as-of`, `since`,
-  `history`); an entity by its db-value and eid.
+  db-value compares by its source, basis and mode (`as-of`, `since`,
+  `history`): the source is the store file's identity (device and
+  inode) when the db has one, so two connections to one file give
+  equal db-values, and the connection otherwise; an entity compares
+  by its db-value and eid.
 
 Identity kinds are mutable, process-local or code. Two atoms holding
 equal values are not `=`, and an atom's hash does not change when its
@@ -231,8 +238,8 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
   of the text alone, never of the intern id, so the order of a map or
   set a keyword keys does not depend on which names the process
   interned first. The kinds differ by domain.
-- **string**: `xxh3` of the bytes. **bignum**: `xxh3` of the sign byte
-  and the limbs.
+- **string**: `xxh3` of the bytes. **bignum**: the ordered combine
+  below of the sign (1 negative, 0 not) and `xxh3` of the limbs.
 - **Ordered combine** (list, vector): `h = 1; for each x: h = 31*h +
   hash(x)`; finalize `h = 31*h + xxh3(count)`. `list.hashSeq` and
   `vector.hashSeq` compute the same value for the same elements.
@@ -247,12 +254,14 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
 - **typed vector**: ordered combine over the element-type code, then
   each element (`xxh3` of the i64, or the float rule), finalized with
   the length.
-- **record**: `xxh3` of the type id (4 bytes) and the field map's hash
-  (8 bytes).
-- **durable ref**: `xxh3` of store id, tree name and key bytes; the
-  value it points at is never read.
-- **Nextomic db-value**: ordered combine of the connection pointer,
-  basis, `as-of`, `since` and `history`; **entity**: the db-value's
+- **record**: the ordered combine of `xxh3` of the type id (8 bytes)
+  and the field map's hash.
+- **durable ref**: the ordered combine of the store id's two halves and
+  `xxh3` of the tree name and key bytes; the value it points at is
+  never read.
+- **Nextomic db-value**: ordered combine of the source (the file's
+  device and inode, else the connection pointer), basis, `as-of`,
+  `since` and `history`; **entity**: the db-value's
   hash combined with the eid.
 - **Identity kinds**: `xxh3` of the pointer (the payload).
 
@@ -290,7 +299,7 @@ domain its hash lands in. `dispatch.zig` is its code
 | 36 | `protocol` | identity | 36 | same value | pointer |
 | 37 | `protocol_fn` | identity | 37 | same value | pointer |
 | 38 | `nextomic_conn` | identity | 38 | same value | pointer |
-| 39 | `nextomic_db` | own kind | 39 | connection, basis, mode | same fields, cached |
+| 39 | `nextomic_db` | own kind | 39 | source (file identity, else connection), basis, mode | same fields, cached |
 | 40 | `nextomic_entity` | own kind | 40 | db-value and eid | same fields, cached |
 | 41 | `sorted_map` | map | 18 | entry-wise with any map | unordered, cached |
 | 42 | `sorted_set` | set | 19 | element-wise with any set | unordered, cached |
@@ -345,7 +354,8 @@ Two sequence rules follow Clojure and are easy to get backwards:
   (`(flatten [1 nil [2]])` is `(1 nil 2)`); a non-sequential argument
   (a number, a string, a map, nil) flattens to `()`.
 - A negative count means zero: `(nthrest xs -1)` is `xs` itself (as
-  is `(nthrest xs 0)`, and `(nthrest [] 1)` is `[]`), `(split-at -1
+  is `(nthrest xs 0)`; a vector past its end is `()`, as Clojure 1.12's
+  `IDrop` path makes it: `(nthrest [] 1)` is `()`), `(split-at -1
   xs)` is `[() xs]`, `(take-last -1 xs)` is nil as any `take-last` of
   nothing is, and `(drop -1 xs)`, `(repeat -1 x)` and `(repeatedly -1
   f)` are seqs, `()` when empty.
@@ -472,22 +482,3 @@ map or `nil`; it never throws.
   collection (`mapv`, `vec` of a seq, `set`, `zipmap`) carry none.
 - Metadata never takes part in `=`, `hash`, printing or the codec:
   `(= v (with-meta v m))` is true and the two hash alike.
-
----
-
-### 8. Open questions and absences
-
-What the language deliberately leaves out, from the code; changing any
-of these is a PLAN amendment first (AGENTS.md).
-
-- **Laziness** (PLAN §24 item 2; §23 #14). Every sequence function is
-  eager: `map`, `filter`, `for` and friends return realized lists
-  (`mapv` and `filterv` vectors), and `(range)` or `(iterate f x)`
-  without a bound is `:arity-mismatch`.
-- **Schema or spec** (PLAN §24 item 5): none.
-- **`&form` and `&env`** (PLAN §24 item 13; §23 #34): a macro receives
-  its arguments only.
-- **Tagged literals** (PLAN §24 item 3): none; records and typed
-  vectors do not read back (§6.1).
-- **Protocols and records exist** (PLAN §23 #8, `docs/PROTOCOLS.md`);
-  multimethods do not (§23 #9).

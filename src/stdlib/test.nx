@@ -37,21 +37,23 @@
 ; Every report line goes through the function in `out`; a program
 ; that wants the lines instead of the printing replaces it.
 (def out (atom println))
-; {:test n :pass n :fail n :error n} while a run is on.
+; {:test n :pass n :fail n :error n} while a run is on, nil outside
+; one, where an assertion reports and returns but counts nothing.
 (def counts (atom nil))
-; {:ns name :name name} of the running test.
+; {:ns name :name name} of the running test, nil outside a run.
 (def current (atom nil))
 ; The `testing` descriptions in force, outermost first.
 (def contexts (atom []))
 
 (defn- emit! [line] (@out line))
-(defn- bump! [k] (swap! counts update k inc))
+(defn- bump! [k] (when @counts (swap! counts update k inc)))
 
-(defn- describe-current []
-  (str (:ns @current) "/" (:name @current)
-       (if (empty? @contexts)
-         ""
-         (str " (" (apply str (interpose " > " @contexts)) ")"))))
+; " in ns/test (outer > inner)", without the parts not in force.
+(defn- where []
+  (let* [c @current
+         ctxs @contexts]
+    (str (if c (str " in " (:ns c) "/" (:name c)) "")
+         (if (empty? ctxs) "" (str " (" (apply str (interpose " > " ctxs)) ")")))))
 
 ; The three outcomes of an assertion or a test. `pass!` is true and
 ; `fail!` false so `is` yields what it asserted.
@@ -59,7 +61,7 @@
 
 (defn fail! [form expected actual msg]
   (bump! :fail)
-  (emit! (str "FAIL in " (describe-current) ": " (pr-str form)
+  (emit! (str "FAIL" (where) ": " (pr-str form)
               " expected: " (pr-str expected)
               " actual: " (pr-str actual)
               (if msg (str " ; " msg) "")))
@@ -67,7 +69,7 @@
 
 (defn- error! [e]
   (bump! :error)
-  (emit! (str "ERROR in " (describe-current) ": " (pr-str e))))
+  (emit! (str "ERROR" (where) ": " (pr-str e))))
 
 ; ---- assertions ----
 
@@ -99,12 +101,12 @@
          head (if (seq? form) (name (first form)) nil)]
     (cond
       (and (= head "=") (= (count form) 3))
-      `(nexis.test/check= '~form ~(second form) ~(third form) ~msg)
+      `(nexis.test/check= '~form ~(second form) ~(nth form 2) ~msg)
       (= head "thrown?")
       (let* [m (second form)
              tag? (and (keyword? m) (not= m :default))]
         `(try
-           (nexis.test/fail! '~form '~m ~(third form) ~msg)
+           (nexis.test/fail! '~form '~m ~(nth form 2 nil) ~msg)
            ~(if tag?
               `(catch any e# (nexis.test/check-thrown e# ~m))
               `(catch ~m e# (nexis.test/pass!)))))
@@ -133,14 +135,19 @@
 ; threw.
 (defn- run-namespaces [ns-names]
   (reset! counts {:test 0 :pass 0 :fail 0 :error 0})
-  (doseq [n ns-names]
-    (doseq [entry (get @tests n [])]
-      (run-test n entry)))
-  (let* [c @counts]
-    (emit! (str "Ran " (:test c) " tests containing "
-                (+ (:pass c) (:fail c)) " assertions."))
-    (emit! (str (:fail c) " failures, " (:error c) " errors."))
-    c))
+  (try
+    (doseq [n ns-names]
+      (doseq [entry (get @tests n [])]
+        (run-test n entry)))
+    (let* [c @counts]
+      (emit! (str "Ran " (:test c) " tests containing "
+                  (+ (:pass c) (:fail c)) " assertions."))
+      (emit! (str (:fail c) " failures, " (:error c) " errors."))
+      c)
+    (finally
+      (reset! counts nil)
+      (reset! current nil)
+      (reset! contexts []))))
 
 ; (run-tests) → the current namespace's tests; (run-tests 'my.ns) →
 ; that namespace's.

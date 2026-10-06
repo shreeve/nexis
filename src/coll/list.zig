@@ -120,6 +120,18 @@ pub fn fromSlice(heap: *Heap, elems: []const Value) !Value {
     return result;
 }
 
+/// The length from which `build` makes a vector view: below it, the
+/// cons cells are fewer blocks than a vector's root, tail and view.
+pub const view_min = 4;
+
+/// A fresh list of `elems`, in order: `view_min` or more (up to a
+/// vector's 2^32 - 1) are a fresh vector and its view, a few blocks
+/// for any length and an O(1) `count` (§1); fewer are cons cells.
+pub fn build(heap: *Heap, elems: []const Value) !Value {
+    if (elems.len < view_min or elems.len > std.math.maxInt(u32)) return fromSlice(heap, elems);
+    return ofVector(heap, try vector.fromSlice(heap, elems), 0);
+}
+
 /// The elements of the vector `vec` from index `start` on, as a
 /// list: one 16-byte block whatever the vector's length. `start ==
 /// count(vec)` gives an empty list.
@@ -218,9 +230,12 @@ pub fn drop(v: Value, n: usize) Value {
 /// `dispatch.hashValue` applies the sequential-category domain byte
 /// on the way out. `vector.hashSeq` computes the same value for the
 /// same elements. A cons cell caches the result in its header; a
-/// view does not, because every offset of it shares one header.
+/// view at offset 0 has its vector's elements, so it takes the
+/// vector's cached hash; a view at another offset caches nothing,
+/// because every offset of it shares one header.
 pub fn hashSeq(v: Value, elementHash: *const fn (Value) u64) u64 {
     std.debug.assert(v.kind() == .list);
+    if (v.subkind() == subkind_view and viewOffset(v) == 0) return vector.hashSeq(Heap.asHeapHeader(viewVector(v)), elementHash);
     const h = Heap.asHeapHeader(v);
     const cacheable = v.subkind() != subkind_view;
     if (cacheable) if (h.cachedHash()) |cached| return cached;
@@ -545,7 +560,7 @@ test "hashSeq caches its result in the head cell's header" {
     try testing.expectEqual(first, hashSeq(l, &callbackHashImmediateOnly));
 }
 
-test "hashSeq: a view hashes as the list of its elements and caches nothing" {
+test "hashSeq: a view hashes as the list of its elements; at offset 0 through its vector's cache" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var elems: [40]Value = undefined;
@@ -558,6 +573,7 @@ test "hashSeq: a view hashes as the list of its elements and caches nothing" {
         try testing.expectEqual(expected, hashSeq(at, &callbackHashImmediateOnly));
     }
     try testing.expect(Heap.asHeapHeader(view).cachedHash() == null);
+    try testing.expectEqual(@as(?u32, @intCast(hashSeq(view, &callbackHashImmediateOnly))), Heap.asHeapHeader(vec).cachedHash());
 }
 
 test "hashSeq: equal lists produce equal base hashes (different allocations)" {

@@ -114,10 +114,11 @@ the codec writes is `docs/CODEC.md`.
 
 | # | Sentinel | Use |
 |---|---|---|
-| 64 | `unbound` | Reserved: never constructed. A Var with no root has `bound = false` and a nil root; loading it raises `:unbound-var` (`docs/VM.md` §13) |
 | 66 | `cell_internal` | A slot whose binding is boxed: the payload is the `*HeapHeader` of an upvalue-cell block of this kind (`docs/VM.md` §6). The compiler's scope records that the slot holds a cell, so user code never reads one; the collector traces the block through the VM |
 
-Kind 65 is a reserved gap. A sentinel never reaches user code. `=` on
+Kinds 64 and 65 are a reserved gap: a Var with no root has
+`bound = false` and a nil root, and loading it raises `:unbound-var`
+(`docs/VM.md` §13), with no sentinel kind. A sentinel never reaches user code. `=` on
 one compares bits; hashing one panics.
 
 ---
@@ -143,7 +144,10 @@ panic would hide the range check from the type system.
 A heap-kind Value is built by its kind's module, which allocates the
 block and packs kind, subkind and pointer (`Heap.valueFromHeader`, or
 the module's own `valueFrom` where a subkind or view offset is set).
-Nothing else writes a tag.
+Two other writers reuse a tag they were given or own the kind: the
+`with-meta` family copies a Value's tag onto its copied block, and
+the db natives build the connection and transaction-handle Values,
+whose payload is no heap block.
 
 The predicates are `isNil`, `isBool`, `isChar`, `isFixnum`, `isFloat`,
 `isKeyword`, `isSymbol`, and `isTruthy` / `isFalsy` (only `nil` and
@@ -151,19 +155,7 @@ The predicates are `isNil`, `isBool`, `isChar`, `isFixnum`, `isFloat`,
 
 ---
 
-### 4. HeapHeader
-
-The header in front of every heap block, its layout and its bits are
-`docs/HEAP.md` §1 and §4.
-
-### 5. GC bits
-
-The mark byte's bits are `docs/HEAP.md` §4; the collector is
-`docs/GC.md`.
-
----
-
-### 6. Equality and hash obligations
+### 4. Equality and hash obligations
 
 For every `x` and `y`:
 
@@ -182,7 +174,7 @@ checks both implications over randomized immediates (P1–P7); each heap
 kind's property file (`test/prop/string.zig`, `list.zig`, `vector.zig`,
 `champ.zig`, ...) checks them for that kind.
 
-### 7. Elsewhere
+### 5. Elsewhere
 
 Per-kind body layouts are in each kind's doc; the wire format is
 `docs/CODEC.md`; the collector is `docs/GC.md`.

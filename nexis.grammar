@@ -1,4 +1,4 @@
-# nexis.grammar — reader grammar for nexis (nexus 1.0).
+# nexis.grammar — reader grammar for nexis, the input of the nexus parser generator.
 #
 # `zig build parser` generates src/parser.zig from this file. The parser
 # produces a raw `Sexp` tree that `src/reader.zig` normalizes into the

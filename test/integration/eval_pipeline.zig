@@ -236,6 +236,8 @@ test "var-quote: #'x reads as (var x), and a printed Var reads back" {
     // FORMS.md §3: the reader turns `#'x` into the list `(var x)`.
     try expectOutput("[(= (var inc) #'inc) (identical? #'inc #'nexis.core/inc) (@#'inc 1)]", "[true true 2]");
     try expectOutputProgram("(def ^{:doc \"d\"} x 1) [#'x (:doc (meta #'x)) @#'x]", "[#'user/x d 1]");
+    // The metadata map is an expression, macros in it expanded.
+    try expectOutputProgram("(def ^{:k (when true 2) :d @(delay 3)} y 1) [(:k (meta #'y)) (:d (meta #'y))]", "[2 3]");
     try expectOutput("['#'x (read-string \"#' nexis.core/inc\")]", "[(var x) (var nexis.core/inc)]");
     try expectOutput("(= (read-string (pr-str (var inc))) '(var nexis.core/inc))", "true");
     try expectOutput("(identical? (eval (read-string (pr-str #'inc))) #'inc)", "true");
@@ -268,7 +270,12 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     // A docstring may span lines, as in Clojure.
     try expectOutputProgram("(defn ml\n  \"Line one.\n  Line two.\"\n  [] 1)\n[(ml) (:doc (meta (var ml)))]", "[1 Line one.\n  Line two.]");
     // Without metadata a defn's Var carries none.
-    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "nil");
+    // Every Var knows its name and namespace, and a defn its arglists.
+    try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "{:arglists ([x]), :name plain, :ns user}");
+    try expectOutputProgram("(def x 1) [(:name (meta #'x)) (:ns (meta #'x))]", "[x user]");
+    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns])", "{:name mm, :ns my.app}");
+    // A name qualified with the current namespace is the name itself.
+    try expectOutputProgram("(def user/qq 1) (defn user/ff [] 2) [qq (ff) (:name (meta #'qq))]", "[1 2 qq]");
     // def and defmacro take the same spellings.
     try expectOutputProgram("(def ^:private v 1) [v (:private (meta (var v)))]", "[1 true]");
     try expectOutputProgram("(def ^{:doc \"dv\"} dv \"x\") [dv (:doc (meta (var dv)))]", "[x dv]");
@@ -314,6 +321,8 @@ test "metadata: every update of a collection keeps it, as in Clojure; rest and t
     try expectOutput(m ++ "(mapv meta [(assoc-in (with-meta {:a {:b 1}} m) [:a :b] 2) (update (with-meta {:a 1} m) :a inc) (merge (with-meta {:a 1} m) {:b 2}) (update (with-meta [1] m) 0 inc)])", "[{:m 1} {:m 1} {:m 1} {:m 1}]");
     // rest, next and a list's pop are the elements after the first, which carry no metadata of their own.
     try expectOutput(m ++ "(mapv meta [(rest (with-meta [1 2 3] m)) (next (with-meta [1 2 3] m)) (rest (with-meta '(1 2) m)) (pop (with-meta '(1 2) m)) (seq (with-meta [1 2] m))])", "[nil nil nil nil nil]");
+    // vec and set build a fresh collection, which carries none, as Clojure's.
+    try expectOutput(m ++ "(let [v (with-meta [1] m)] [(meta (vec v)) (meta (set (with-meta #{1} m))) (= v (vec v)) (meta v) (let [w [1 2]] (identical? w (vec w)))])", "[nil nil true {:m 1} true]");
     // transient and persistent! drop it; into keeps its target's.
     try expectOutput(m ++ "(mapv meta [(persistent! (conj! (transient (with-meta [1] m)) 2)) (persistent! (transient (with-meta #{1} m))) (persistent! (assoc! (transient (with-meta {} m)) :a 1))])", "[nil nil nil]");
     try expectOutput(m ++ "(let [v (conj (with-meta [1] m) 2)] [(= v [1 2]) (= (hash v) (hash [1 2])) v])", "[true true [1 2]]");
@@ -348,8 +357,11 @@ test "metadata: hints in binding positions are dropped, ^meta on a collection li
     try expectOutput("(^:hint inc 1)", "2");
     try expectOutput("[(meta ^:foo [1 2]) (meta ^{:a (+ 1 2)} {:b 2}) (meta ^:s #{})]", "[{:foo true} {:a 3} {:s true}]");
     try expectOutput("(#(vector ^:m [%]) 1)", "[[1]]");
-    // A macro argument reaches the macro without its metadata.
-    try expectOutputProgram("(defmacro m [x] x) (m ^:foo [1])", "[1]");
+    // A macro argument reaches the macro with its metadata, as in
+    // Clojure, and the collection the macro returns keeps it.
+    try expectOutputProgram("(defmacro m [x] x) [(m ^:foo [1]) (meta (m ^:foo [1]))]", "[[1] {:foo true}]");
+    // A type hint names no class here: `:tag` and `:param-tags` stay symbols.
+    try expectOutputProgram("(defn ^[long String] f [x] x) [(f 1) (:param-tags (meta #'f)) (:tag (meta #'f))]", "[1 [long String] nil]");
     // ^meta inside syntax-quote reaches the definition the macro writes.
     try expectOutputProgram("(defmacro defp [n] `(def ^:private ~n 1)) (defp hidden) [hidden (:private (meta (var hidden)))]", "[1 true]");
     try expectOutputProgram("(defmacro lethint [v] `(let [^String x# ~v] x#)) (lethint 5)", "5");
@@ -432,6 +444,22 @@ test "integration: quote inside a quoted form is the 2-list (quote x)" {
     try expectOutput("(first (rest ''x))", "x");
     try expectOutput("(= ''x '(quote x))", "true");
     try expectOutput("(eval ''x)", "x");
+}
+
+test "quote: reader sugar is the data it stands for, metadata included, as a macro receives it" {
+    try expectOutput("'@x", "(nexis.core/deref x)");
+    try expectOutput("'#(+ % 1)", "(fn* [%1] (+ %1 1))");
+    try expectOutput("(meta '^:m [1])", "{:m true}");
+    try expectOutput("(meta (second '(a ^:x [1])))", "{:x true}");
+    try expectOutput("(meta (quote ^{:k (+ 1 2)} {:a 1}))", "{:k (+ 1 2)}");
+    // A symbol carries no metadata in nexis.
+    try expectOutput("'^:k sym", "sym");
+    try expectOutput("(meta (read-string \"^:k [1]\"))", "{:k true}");
+    try expectOutputProgram("(defmacro mm [x] (meta x)) (mm ^:foo [1])", "{:foo true}");
+    try expectOutputProgram("(defmacro q [x] (list 'quote x)) [(= (q @y) '@y) (= (q #(inc %)) '#(inc %)) (meta (q ^:m [1]))]", "[true true {:m true}]");
+    // A macro may pass a binding vector with metadata on to let or for.
+    try expectOutputProgram("(defmacro my-let [bs & body] `(let ~bs ~@body)) (my-let ^:x [a 1] (inc a))", "2");
+    try expectOutput("(let ^:x [a 1] (for ^:y [b [a]] b))", "(1)");
 }
 
 test "integration: syntax-quote no unquote" {
@@ -532,11 +560,13 @@ test "syntax-quote: auto-gensyms stay unique across top-level forms" {
 }
 
 test "gensym takes a prefix of any length" {
+    // As Clojure's: the prefix then the counter; G__ by default.
     try expectOutputProgram(
         \\(let [p (apply str (repeat 1000 "p"))
-        \\      g (name (gensym p))]
-        \\  (= (subs g 0 1002) (str p "__")))
-    , "true");
+        \\      g (name (gensym p))
+        \\      d (name (gensym))]
+        \\  [(= (subs g 0 1000) p) (pos? (parse-long (subs g 1000))) (subs d 0 3) (pos? (parse-long (subs d 3)))])
+    , "[true true G__ true]");
 }
 
 test "syntax-quote: a nested syntax-quote writes macro-writing macros" {
@@ -677,6 +707,16 @@ test "try: a class-name matcher or :default catches anything, as Exception would
     try expectOutput("(try (throw :x) (catch :default e [:default e]))", "[:default :x]");
     // Clauses still run in order: a tag before a class name wins.
     try expectOutput("(try (throw :a) (catch :a e 1) (catch Exception e 2))", "1");
+}
+
+test "try: a class that names a nexis error catches that error alone, as in Clojure" {
+    try expectOutput("(try (throw (ex-info \"x\" {})) (catch IllegalArgumentException e :iae) (catch Exception e :ex))", ":ex");
+    try expectOutput("(try (inc nil) (catch ArithmeticException e :ae) (catch ClassCastException e :cce))", ":cce");
+    try expectOutput("(try (nth [1] 5) (catch java.lang.IndexOutOfBoundsException e :oob))", ":oob");
+    try expectOutput("(try ((fn [x] x)) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
+    try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
+    try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
 }
 
 test "fn: a :pre/:post condition map checks arguments and the result" {
@@ -883,8 +923,22 @@ test "integration: recursion through a native re-entry ends in a catchable :stac
     try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
 }
 
+test "integration: run loops nest at most max_nested_runs deep" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.max_nested_runs = 50;
+    const g = "(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) ";
+    try harness.expectResult(&program, "", try program.run(g ++ "(g 40)"), "40");
+    try harness.expectResult(&program, "", try program.run("[(try (g 60) (catch any e e)) (try (first (mapv g [60])) (catch any e e)) (g 40)]"), "[:stack-overflow :stack-overflow 40]");
+    try testing.expectEqual(@as(usize, 0), program.v.nested_runs);
+}
+
 test "integration: runaway recursion is a catchable :stack-overflow; deep legitimate recursion runs" {
     try expectOutput("(defn d [n] (if (= n 0) 0 (inc (d (dec n))))) (d 100000)", "100000");
+    // A call through the Var takes a frame, as a call of the closure does.
+    try expectOutput("(defn d [n] (if (= n 0) 0 (inc (#'d (dec n))))) (d 100000)", "100000");
+    try expectOutput("(declare d) (def h #'d) (defn d [n] (if (= n 0) 0 (inc (h (dec n))))) (d 100000)", "100000");
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
@@ -897,7 +951,29 @@ test "integration: runaway recursion is a catchable :stack-overflow; deep legiti
     const trace = program.v.error_trace.items;
     try testing.expectEqual(@as(usize, 41), trace.len);
     try testing.expectEqualStrings("f", trace[0].name);
-    try testing.expectEqualStrings("<19960 frames elided>", trace[32].name);
+    try testing.expectEqual(@as(usize, 19960), trace[32].elided);
+    try testing.expectEqualStrings("test-form", trace[40].name);
+    // A chain of exactly 41 frames is shown whole.
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn g [n] (if (= n 0) (/ 1 0) (+ 1 (g (dec n))))) (g 39)"));
+    try testing.expectEqual(@as(usize, 41), program.v.error_trace.items.len);
+    for (program.v.error_trace.items) |frame| try testing.expectEqual(@as(usize, 0), frame.elided);
+}
+
+test "integration: an elided trace survives the throws caught while it is held" {
+    // Each throw caught inside the finally records an origin of its
+    // own beside the one the finally holds.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.UncaughtThrow, program.run(
+        \\(defn g [n] (if (= n 0) (/ 1 0) (+ 1 (g (dec n)))))
+        \\(try (g 60) (finally (try (throw :a) (catch any e (try (throw :b) (catch any e2 (try (throw :c) (catch any e3 nil))))))))
+    ));
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 41), trace.len);
+    try testing.expectEqualStrings("g", trace[0].name);
+    try testing.expectEqual(@as(usize, 22), trace[32].elided);
     try testing.expectEqualStrings("test-form", trace[40].name);
 }
 
@@ -919,6 +995,12 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
         .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
         .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
+        .{ .src = "({} 1 2 3)", .err = vm.VmError.ArityMismatch, .detail = "a map takes 1 to 2 arguments, got 3" },
+        .{ .src = "(:a)", .err = vm.VmError.ArityMismatch, .detail = "a keyword takes 1 to 2 arguments, got 0" },
+        .{ .src = "(#{1} 1 2)", .err = vm.VmError.ArityMismatch, .detail = "a set takes 1 argument, got 2" },
+        .{ .src = "([1 2] 5)", .err = vm.VmError.IndexOutOfBounds, .detail = "index 5 is out of bounds for a vector of 2" },
+        .{ .src = "([1 2] :a)", .err = vm.VmError.KindMismatch, .detail = "a vector takes an integer index, got a keyword" },
+        .{ .src = "(+ 1 (i64-vector [1]))", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a typed vector" },
     };
     for (cases) |case| {
         var program: Program = undefined;
@@ -1146,7 +1228,27 @@ test "destructuring: a map pattern after & takes keyword arguments" {
     try expectOutput("(do (defn kw [& {:keys [a]}] a) (kw :a 1))", "1");
     try expectOutput("(let [[x & {:keys [k]}] [1 :k 2]] [x k])", "[1 2]");
     try expectOutput("(do (defn ma ([x] x) ([x & {:keys [a]}] [x a])) [(ma 1) (ma 1 :a 2)])", "[1 [1 2]]");
-    try expectOutput("(try ((fn [& {:keys [a]}] a) :a) (catch any e e))", ":invalid-argument");
+    // As Clojure 1.11's: one trailing argument is the map itself,
+    // whatever it is, and no arguments leave nil to destructure.
+    try expectOutput("[((fn [& {:keys [a]}] a) :a) ((fn [& {:as m}] m)) (try ((fn [& {:keys [a]}] a) :a 1 :b) (catch any e e))]", "[nil nil :invalid-argument]");
+    // #%kwargs itself: a non-seq is itself, a seq of one its element,
+    // the empty seq {}, a longer seq the map of its pairs.
+    try expectOutput("[(nexis.internal/#%kwargs '(:a)) (nexis.internal/#%kwargs [1 2]) (nexis.internal/#%kwargs nil) (nexis.internal/#%kwargs ()) (nexis.internal/#%kwargs {:a 1}) (nexis.internal/#%kwargs '(:a 1 :b 2))]", "[:a [1 2] nil {} {:a 1} {:a 1, :b 2}]");
+}
+
+test "destructuring: every map pattern takes a seq as keyword arguments, as Clojure 1.11 does" {
+    try expectOutput("(let [{:keys [a b]} (list :a 1 :b 2)] [a b])", "[1 2]");
+    try expectOutput("(do (defn f [opts] (let [{:keys [a b]} opts] [a b])) (f (list :a 1 :b 2)))", "[1 2]");
+    try expectOutput("(do (defn g [& opts] (let [{:keys [a]} opts] a)) (g :a 1))", "1");
+    try expectOutput("(do (defn h [{:keys [a]}] a) (h '(:a 1)))", "1");
+    try expectOutput("(let [{:keys [a] :as m} (list {:a 4})] [a m])", "[4 {:a 4}]");
+    // A vector is not a seq: its map pattern looks it up by index.
+    try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
+}
+
+test "destructuring: :as binds before the keys, so an :or default may read it" {
+    try expectOutput("(let [m {:a 5}] (let [{:keys [a] :or {a (:a m 0)} :as m} {}] a))", "0");
+    try expectOutput("(let [{:keys [a] :or {a (count m)} :as m} {:b 1}] a)", "1");
 }
 
 test "destructuring: loop bindings destructure and recur rebinds them" {
@@ -1236,6 +1338,61 @@ test "integration: (ns NAME) switches current namespace" {
     , "100");
 }
 
+/// Run `src` through the loader, as `nexis run` runs a file, and
+/// compare the last form's printed value with `expected`.
+fn expectLoaded(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    const result = try program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() });
+    try harness.expectResult(&program, src, result, expected);
+}
+
+/// Run `src` through the loader and expect it to fail to compile with
+/// the report `label`, located at the source text `at`.
+fn expectLoadFailure(src: []const u8, label: []const u8, at: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = src };
+    try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
+    const d = program.loader.diagnostic.?;
+    try testing.expectEqualStrings(label, d.label);
+    try testing.expectEqualStrings(at, src[d.span.?.pos..][0..d.span.?.len]);
+}
+
+test "loader: a defmacro whose function does not compile is reported where and why, at the definition" {
+    try expectLoadFailure("(defmacro m [] (undefined-fn 1))", "compile error: defmacro m: unable to resolve symbol: undefined-fn", "undefined-fn");
+    try expectLoadFailure("(defmacro m [] (foo/bar 1))", "compile error: defmacro m: unable to resolve symbol: foo/bar", "foo/bar");
+    // A name the file defines later is a forward reference, as in any form.
+    try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
+}
+
+test "loader: a parse error names the delimiter left open" {
+    try expectLoadFailure("(println [1 2 3)", "parse error: unexpected `)`; the `[` at 1:10 is open", ")");
+    try expectLoadFailure("(def x 1)\n(defn f [x]\n  (+ x", "parse error: unclosed `(`", "(");
+    try expectLoadFailure("(def x 1) #{1 2", "parse error: unclosed `#{`", "#{");
+    try expectLoadFailure("(def x 1))", "parse error: unexpected `)`", ")");
+}
+
+test "loader: a top-level do runs its forms one at a time, as Clojure's eval does" {
+    try expectLoaded("(do (ns foo) (def x 1)) (ns user) [(resolve 'foo/x) (resolve 'user/x)]", "[#'foo/x nil]");
+    try expectLoaded("(do (def k 41) (defmacro m [] (inc k)) (m))", "42");
+    // A macro that expands to a `do` is split the same way.
+    try expectLoaded("(defmacro two [a b] `(do ~a ~b)) (two (def p 1) (defmacro q [] p)) (q)", "1");
+    try expectLoaded("(do (do 1 2) (do))", "nil");
+    try expectLoaded("(do 1 (do 2 3))", "3");
+}
+
+test "ns: a clause it refuses leaves the current namespace as it was" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(error.MacroExpansionFailure, program.run("(ns elsewhere (:import [java.util Date]))"));
+    try testing.expectEqualStrings("user", program.registry.current.name);
+}
+
 test "integration: defn in a namespace + qualified call" {
     try expectOutputProgram(
         \\(ns my.app)
@@ -1305,9 +1462,10 @@ test "integration: missing qualified ns is UnresolvedSymbol" {
 // Embedded core.nx composite layer
 // =============================================================================
 
-test "integration: core.nx second / third / last" {
+test "integration: core.nx second / last" {
     try expectOutput("(second [10 20 30])", "20");
-    try expectOutput("(third [10 20 30])", "30");
+    // nexis.core has no `third`, as Clojure has none.
+    try expectUnresolved("(third [10 20 30])", "third");
     try expectOutput("(last [10 20 30])", "30");
     try expectOutput("(last (list :a :b :c))", ":c");
     try expectOutput("(last (list))", "nil");
@@ -1332,6 +1490,8 @@ test "integration: core.nx take / drop" {
     try expectOutput("(take 3 [1 2 3 4 5])", "(1 2 3)");
     try expectOutput("(take 0 [1 2 3])", "()");
     try expectOutput("(take 10 [1 2 3])", "(1 2 3)");
+    // A bignum count takes all or none, as Clojure's take counts down any integer.
+    try expectOutput("[(take 100000000000000000000 [1 2]) (take -100000000000000000000 [1])]", "[(1 2) ()]");
     try expectOutput("(drop 2 [1 2 3 4 5])", "(3 4 5)");
     try expectOutput("(drop 10 [1 2 3])", "()");
     try expectOutput("(drop 0 (list :a :b))", "(:a :b)");
@@ -1369,6 +1529,9 @@ test "integration: core.nx if-let / when-let destructure, and if-let's else is o
     try expectProgramError("(if-let [x 1 y 2] x)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(if-some [x 1] x 2 3)", compile.CompileError.MacroExpansionFailure);
     try expectProgramError("(if-some (x 1) x)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-let [a 1 b 2] [a b])", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-some [a] a)", compile.CompileError.MacroExpansionFailure);
+    try expectProgramError("(when-first (x [1]) x)", compile.CompileError.MacroExpansionFailure);
 }
 
 test "integration: core.nx if-some / when-some bind false; when-first binds the first element" {
@@ -1385,7 +1548,9 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutputProgram("(def y 5) (defonce y 6) y", "5");
     try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
-    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") {:error :assertion-failed}]");
+    // The shape :pre and :post throw: {:error :assertion-failed :message ...}.
+    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed nil]");
+    try expectOutput("(= (try (assert (pos? -1)) (catch any e e)) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc e :message \"Assert failed: (pos? -1)\"))))", "true");
     try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
 }
@@ -1417,9 +1582,11 @@ test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, s
     // are (), take-last of nothing nil; nthrest that drops nothing is
     // coll itself, while drop is always a seq.
     try expectOutput("[(partition-by odd? []) (partition-by odd? nil) (dedupe []) (dedupe nil) (take-last 0 [1 2]) (take-last 2 nil) (take-last 2 []) (take-last 5 [1 2])]", "[() () () () nil nil nil (1 2)]");
-    try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil [] () (2) (1 2) () () (1) (1 2)]");
+    try expectOutput("[(nthrest [1 2] 0) (nthrest [1 2] -1) (nthrest nil 1) (nthrest [] 1) (nthrest [1] 2) (nthrest (list 1 2) 1) (drop 0 [1 2]) (drop 0 nil) (drop 5 [1]) (drop -1 [1]) (nthnext [1 2] 0)]", "[[1 2] [1 2] nil () () (2) (1 2) () () (1) (1 2)]");
+    // As Clojure's: distinct? takes one argument or more.
+    try expectOutput("(try (distinct?) (catch any e e))", ":arity-mismatch");
     try expectOutput("[(distinct? 1 2 3) (distinct? 1 2 1) (doall (map inc [1])) (dorun [1]) (rseq [1 2 3]) (rseq []) (nthnext [1 2 3] 2) (nthnext [1] 1)]", "[true false (2) nil (3 2 1) nil (3) nil]");
-    try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (third (list 1 2 3))]", "[1 2 (3) nil 3]");
+    try expectOutput("[(ffirst [[1 2]]) (fnext [1 2 3]) (nnext [1 2 3]) (second #{9}) (second (list 1 2 3))]", "[1 2 (3) nil 2]");
 }
 
 test "integration: core.nx maps: update-vals, update-keys; atoms: reset-vals!, volatile!" {
@@ -1464,13 +1631,16 @@ test "integration: char and int conversion, parse-long, parse-double, parse-bool
     try expectOutput("[(int \\A) (char 97) (int 3.9) (long \\a) (char \\b)]", "[65 a 3 97 b]");
     // int checks Java's 32-bit int range, as Clojure's cast does.
     try expectOutput("[(int 2147483647) (int -2147483648) (int -3.9) (int -2147483647.9)]", "[2147483647 -2147483648 -3 -2147483647]");
-    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483647.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (int %) (catch any e e)) [2147483648 2147483648.5 -2147483649.0 1e300 99999999999999999999 ##Inf])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument)");
+    // A float is truncated, then range-checked: Clojure's boxed cast
+    // (longCast, then the narrowing check), the rule nexis follows.
+    try expectOutput("[(int 2147483647.5) (byte 127.5) (byte -128.5) (short -32768.5)]", "[2147483647 127 -128 -32768]");
     // NaN casts to 0, as Java's (int) and Clojure's int make it.
     try expectOutput("[(int ##NaN) (short ##NaN) (byte ##NaN)]", "[0 0 0]");
     // short and byte check their Java ranges the same way.
     try expectOutput("[(byte 127) (byte -128) (byte 1.9) (byte \\a) (short 32767) (short -32768) (short -1.5) (short \\a)]", "[127 -128 1 97 32767 -32768 -1 97]");
-    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 127.5 -128.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
-    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32767.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
+    try expectOutput("(map #(try (byte %) (catch any e e)) [128 -129 128.5 -129.5 \\é 99999999999999999999 ##-Inf nil \"1\"])", "(:invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :invalid-argument :kind-mismatch :kind-mismatch)");
+    try expectOutput("(map #(try (short %) (catch any e e)) [32768 -32769 32768.5])", "(:invalid-argument :invalid-argument :invalid-argument)");
     try expectOutput("[(parse-long \"42\") (parse-long \"-7\") (parse-long \"4x\") (parse-long \" 1\") (parse-double \"1.5\") (parse-double \"x\") (parse-boolean \"true\") (parse-boolean \"no\")]", "[42 -7 nil nil 1.5 nil true nil]");
     try expectOutput("(try (char -1) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (parse-long 1) (catch any e e))", ":kind-mismatch");
@@ -1488,6 +1658,8 @@ test "integration: bit operations" {
 
 test "integration: rand, rand-int, rand-nth, shuffle stay in range" {
     try expectOutput("(let [xs (repeatedly 200 #(rand-int 10))] [(every? #(<= 0 % 9) xs) (every? (fn [_] (< -1 (rand) 1)) (range 50)) (contains? #{:a :b} (rand-nth [:a :b])) (sort (shuffle [3 1 2]))])", "[true true true (1 2 3)]");
+    // rand-int is (int (rand n)), as Clojure's: 0 for 0, (n, 0] below.
+    try expectOutput("[(rand-int 0) (every? #(<= -4 % 0) (repeatedly 100 #(rand-int -5))) (rand-int 1)]", "[0 true 0]");
 }
 
 test "integration: format with %s %d %f %x %% and widths" {
@@ -1535,6 +1707,47 @@ test "integration: transients: transient, conj!, assoc!, dissoc!, disj!, pop!, p
     try expectOutput("[(pop [1 2 3]) (pop [1]) (count (reduce (fn [v _] (pop v)) (vec (range 2000)) (range 1990)))]", "[[1 2] [] 10]");
 }
 
+/// Run `before`, which wraps the heap's edit clock, from 50 tokens
+/// short of the wrap; then run `after` with the clock moved forward to
+/// there again, so `after`'s transients take the tokens `before`'s took
+/// (TRANSIENT.md §4), and print `after`.
+fn expectAcrossEditClockWrap(before: []const u8, after: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const heap = program.v.ensureHeap();
+    heap.edit_clock = nx.heap.edit_token_max - 50;
+    _ = try program.run(before);
+    try testing.expect(heap.edit_clock < nx.heap.edit_token_max - 50);
+    heap.edit_clock = nx.heap.edit_token_max - 50;
+    try harness.expectResult(&program, after, try program.run(after), expected);
+}
+
+test "integration: group-by's buckets keep their elements across the edit clock's wrap" {
+    // group-by's `f` wraps the clock on its first call: the buckets
+    // are edited under the map's token as it stands after the call.
+    try expectAcrossEditClockWrap(
+        \\(def spin (fn [] (dotimes [_ 100] (transient []))))
+        \\(def b (get (group-by (fn [x] (when (= x 0) (spin)) :k) (range 10)) :k))
+    ,
+        \\(dotimes [_ 49] (assoc! (transient b) 0 :evil))
+        \\b
+    , "[0 1 2 3 4 5 6 7 8 9]");
+}
+
+test "integration: a `!` call that raises across the edit clock's wrap leaves its transient no stale token" {
+    try expectAcrossEditClockWrap(
+        \\(def t (transient {}))
+        \\(dotimes [_ 100] (try (conj! t [:x 1] :bad) (catch any e e)))
+        \\(dotimes [i 40] (conj! t [i i]))
+        \\(def p (persistent! t))
+        \\(dotimes [_ 100] (transient []))
+    ,
+        \\(dotimes [_ 49] (let [u (transient p)] (dotimes [i 40] (assoc! u i :evil))))
+        \\(= p (zipmap (range 40) (range 40)))
+    , "true");
+}
+
 test "integration: a transient hashes by identity, so it can be a set member or map key (SEMANTICS §2.6)" {
     try expectOutput(
         \\(let [t (transient [])]
@@ -1562,6 +1775,15 @@ test "integration: identity kinds are = only to themselves, and two of them hash
         \\(nextomic/release n)
         \\seen
     , "[true true true true false true true]");
+}
+
+test "nextomic: a connection prints its path as a string literal" {
+    try expectOutputProgramWithStore("conn-print",
+        \\(def c (nextomic/connect "@STORE@\"q\ny"))
+        \\(def printed [(pr-str c) (str c)])
+        \\(nextomic/release c)
+        \\(let [p (str "#nextomic/conn " (pr-str "@STORE@\"q\ny"))] (= printed [p p]))
+    , "true");
 }
 
 test "integration: delay, force, realized?, delay?" {
@@ -1643,9 +1865,7 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = 1 << 16;
-    program.v.gc_growth_percent = 0;
-    program.v.gc_next_at = 1 << 16;
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
     // reduce calls the conj native for every element with no
     // closure frame in between; each persistent set conj leaves the
     // replaced path behind as garbage.
@@ -1658,6 +1878,39 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     const kept = heap.live_bytes - start;
     const peak = heap.peak_live_bytes - start;
     try testing.expect(peak < 3 * kept);
+}
+
+test "gc: a native that calls a leaf native collects once a cycle is due" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+    // Each running product is garbage once reduce has the next.
+    _ = try program.run("(def xs (vec (range 1 3000)))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    _ = try program.run("(def p (reduce * xs))");
+    // The products' sum is about 6 MB; collected as they go, the peak
+    // stays within a few cycle windows of the start.
+    try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+}
+
+test "gc: a product of many integers in one call keeps no partial product" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def xs (vec (range 1 3000))) (def p (reduce * xs))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    // One call of `*`, a leaf no collection runs inside: the partial
+    // products would sum to about 6 MB.
+    try harness.expectResult(&program, "", try program.run("(= (apply * xs) p)"), "true");
+    try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+    try harness.expectResult(&program, "", try program.run("[(apply * 1 2 3 (range 4 30)) (* 4611686018427387904 2 3.0) (* 2 4611686018427387904 -1) (try (* 4611686018427387904 2 :x) (catch any e e))]"), "[8841761993739701954543616000000 2.7670116110564327E19 -9223372036854775808 :kind-mismatch]");
 }
 
 test "integration: a sequence native walks a view from its offset, and a cons over one" {
@@ -1798,19 +2051,23 @@ test "integration: a :stack-overflow caught inside a callback does not resurface
     , "[:deep [:deep false] [:deep] [:deep] 1 :deep :deep [:deep] :outer]");
 }
 
-test "integration: a transient op that raises leaves the transient as it found it" {
+test "integration: a transient `!` call is a loop: a wrong operand changes nothing, a deep key stops it" {
+    // TRANSIENT.md §6: the edits before a key that hashed or compared
+    // past the stack guard stay, as Clojure's loop over the keys
+    // keeps them; the edits after it do not run.
     try expectOutputOverDeepData(
         \\(let [a deep-a
         \\      s (transient (set (range 20)))
         \\      m (transient (zipmap (range 20) (range 20)))]
         \\  [(try (conj! s 20 a) (catch :stack-overflow e e))
-        \\   (try (assoc! m :x 1 a 2) (catch :stack-overflow e e))
-        \\   (try (dissoc! m 0 a) (catch :stack-overflow e e))
-        \\   (try (disj! s 0 a) (catch :stack-overflow e e))
+        \\   (try (assoc! m :x 1 a 2 :z 3) (catch :stack-overflow e e))
+        \\   (try (dissoc! m 0 a 1) (catch :stack-overflow e e))
+        \\   (try (disj! s 0 a 1) (catch :stack-overflow e e))
         \\   (try (conj! m [:y 1] :not-an-entry) (catch any e e))
+        \\   (try (conj! m [:y 1] [:w]) (catch any e e))
         \\   (count (persistent! s))
-        \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p 0)])])
-    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch 20 [20 nil nil 0]]");
+        \\   (let [p (persistent! m)] [(count p) (p :x) (p :y) (p :z) (p 0) (p 1)])])
+    , "[:stack-overflow :stack-overflow :stack-overflow :stack-overflow :kind-mismatch :arity-mismatch 20 [20 1 nil nil nil 1]]");
 }
 
 test "integration: core.nx composite + HOFs" {
@@ -1835,6 +2092,8 @@ test "integration: hash-map / hash-set" {
     // hash-map iteration order is unspecified (HAMT); test via count + get
     try expectOutput("(count (hash-map :a 1 :b 2 :c 3))", "3");
     try expectOutput("(get (hash-map :a 1 :b 2) :a)", "1");
+    // set of a set is that set, as Clojure's: a sorted one stays sorted.
+    try expectOutput("[(sorted? (set (sorted-set 3 1))) (let [s #{1}] (identical? s (set s))) (= #{1 3} (set [3 1 3])) (= #{1 2} (hash-set 1 1 2)) (hash-map :a 1 :a 2) (= {:a 3 :b 2} (zipmap [:a :b :a] [1 2 3]))]", "[true true true true {:a 2} true]");
 }
 
 // =============================================================================
@@ -2178,7 +2437,7 @@ fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, a
         .registry = program.registry,
         .value_heap = program.v.ensureHeap(),
     };
-    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, null, form));
+    try testing.expectError(error.MalformedMacroCall, expand_mod.expandForm(&ctx, form));
     const failure = ctx.failure orelse return error.TestExpectedFailure;
     try testing.expectEqualStrings(message, failure.message);
     try testing.expectEqualStrings(at, src[failure.span.pos..][0..failure.span.len]);
@@ -2187,12 +2446,89 @@ fn expectMacroFailure(setup: []const u8, src: []const u8, message: []const u8, a
 test "defmacro: a failing macro call names the macro and the cause, at the call" {
     try expectMacroFailure("(defmacro m [] (throw (ex-info \"bad macro input\" {:x 1})))", "(do 1 (m))", "macro m threw bad macro input", "(m)");
     try expectMacroFailure("(defmacro m [] (throw :nope))", "(when true (m))", "macro m threw :nope", "(m)");
+    try expectMacroFailure("", "(when-let [a 1 b 2] [a b])", "macro when-let threw when-let requires exactly 2 forms in binding vector", "(when-let [a 1 b 2] [a b])");
+    try expectMacroFailure("", "(if-some [a 1] a 2 3)", "macro if-some threw if-some requires 1 or 2 forms after binding vector", "(if-some [a 1] a 2 3)");
     try expectMacroFailure("(defmacro m [a] a)", "(do (m))", "macro m takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes 2 or more arguments, got 1", "(m 1)");
     try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
+    try expectMacroFailure("(defmacro m [] (atom 1))", "(m)", "a macro returned an atom, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
+    // A macro body has no `eval` (MACROEXPAND.md §1.2).
+    try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
+}
+
+test "defmacro: a macro body runs against the program's record types, namespaces and protocols" {
+    // `reduced` in a macro registers its type where the program's
+    // records are, so it renames none of them.
+    try expectOutputProgram(
+        \\(defrecord Point [x y])
+        \\(defmacro first-big [& xs] (reduce (fn [a x] (if (> x 10) (reduced x) a)) nil xs))
+        \\[(first-big 1 20 30) (->Point 1 2) (class (->Point 1 2))]
+    , "[20 #user.Point{:x 1, :y 2} user.Point]");
+    // A delay a macro makes is a delay once the macro is gone.
+    try expectOutputProgram(
+        \\(defrecord P [x])
+        \\(def store (atom nil))
+        \\(defmacro m [] (reset! store (delay 42)) nil)
+        \\(m)
+        \\[(delay? @store) (class @store) @@store (class (->P 1))]
+    , "[true nexis.core.Delay 42 user.P]");
+    try expectOutputProgram("(def store (atom nil)) (defmacro m [] (reset! store (delay 42)) nil) (m) (delay? @store)", "true");
+    try expectOutputProgram("(defmacro m [] @(delay 1)) (m)", "1");
+    try expectOutputProgram("(defmacro m [] (str (resolve 'inc))) (m)", "#'nexis.core/inc");
+    try expectOutputProgram("(defmacro m [] (count (all-ns))) (= (m) (count (all-ns)))", "true");
+    try expectOutputProgram("(ns other) (def x 7) (ns user) (defmacro m [] (count (ns-interns 'other))) (m)", "1");
+    try expectOutputProgram(
+        \\(defprotocol Sz (sz [x]))
+        \\(extend-protocol Sz :string (sz [s] (count s)))
+        \\(defmacro m [] (sz "abcd"))
+        \\(m)
+    , "4");
+    // A record a macro builds is the program's type.
+    try expectOutputProgram(
+        \\(def made (atom nil))
+        \\(defrecord Q [a])
+        \\(defmacro mk [] (reset! made (->Q 1)) nil)
+        \\(mk)
+        \\[@made (Q? @made) (class @made)]
+    , "[#user.Q{:a 1} true user.Q]");
+    // `macroexpand-1`, `macroexpand` and `read-string` work in a
+    // macro body.
+    try expectOutputProgram("(defmacro m [x] (macroexpand-1 x)) [(m (when 1 2)) (macroexpand-1 '(m (when 1 2)))]", "[2 (if 1 (do 2) nil)]");
+    try expectOutputProgram("(defmacro m [x] (macroexpand x)) (m (-> 1 inc))", "2");
+    try expectOutputProgram("(defmacro r [s] (read-string s)) (r \"(+ 1 2)\")", "3");
+    // So does the `defmacro`'s own definition: its metadata may call
+    // `resolve` or `reduced`.
+    try expectOutputProgram("(defmacro m {:k (str (resolve 'inc)) :r @(reduced 2)} [] 1) [(:k (meta #'m)) (:r (meta #'m)) (m)]", "[#'nexis.core/inc 2 1]");
+}
+
+test "defmacro: a store a macro opens belongs to the program" {
+    try expectOutputProgramWithStore("macro-db-open",
+        \\(def store (atom nil))
+        \\(defmacro m [] (reset! store (db/open "@STORE@")) nil)
+        \\(m)
+        \\(let [r (db/ref @store :t :k)] [(db/get-key r) (do (db/put-key! r 4) (db/get-key r))])
+    , "[nil 4]");
+}
+
+test "defmacro: a Nextomic connection a macro opens belongs to the program" {
+    try expectOutputProgramWithStore("macro-connect",
+        \\(def keep (atom nil))
+        \\(defmacro m [] (reset! keep (nextomic/connect "@STORE@")) nil)
+        \\(m)
+        \\(nextomic/transact! @keep [{:db/ident :n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+        \\(nextomic/transact! @keep [{:n 4}])
+        \\(nextomic/q '[:find ?v . :where [_ :n ?v]] (nextomic/db @keep))
+    , "4");
+}
+
+test "defmacro: what a macro prints goes to the with-out-str buffer the program opened" {
+    try expectOutputProgram(
+        \\(defmacro m [] (print (apply str (repeat 5000 "m"))) nil)
+        \\(count (with-out-str (print "abc") (eval '(m)) (print (apply str (repeat 5000 "z")))))
+    , "10003");
 }
 
 test "defmacro: parameters destructure and overload clauses dispatch, as for defn" {
@@ -2796,10 +3132,13 @@ test "db/scan seeks to the start bound and stops before the end bound" {
         \\  (with-read-tx [t conn]
         \\    [(db/scan t :range :b)
         \\     (db/scan t :range :bb :d)
+        \\     (db/scan t :range "c" 'd)
         \\     (db/scan t :range :e)
         \\     (db/scan t :range :a :a)
-        \\     (db/scan t :none)]))
-    , "[[[:b 2] [:c 3] [:d 4]] [[:c 3]] [] [] []]");
+        \\     (db/scan t :none)
+        \\     (string? (ffirst (db/scan t :range)))
+        \\     (= (db/ref conn :range (ffirst (db/scan t :range))) (db/ref conn :range :a))]))
+    , "[[[b 2] [c 3] [d 4]] [[c 3]] [[c 3]] [] [] [] true true]");
 }
 
 test "storage failures surface as :db/<reason> keywords inside try" {
@@ -2815,6 +3154,17 @@ test "storage failures surface as :db/<reason> keywords inside try" {
         \\   (try (db/open "/nexis-no-such-directory/sub/store.edb")
         \\        (catch any e e))])
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
+}
+
+test "db/open and nextomic/connect refuse a path with a NUL byte, or an empty one, as spit does" {
+    // The open would stop at the NUL and name a shorter path than the
+    // program checked (DB.md §2).
+    try expectOutputProgramWithStore("seam-path",
+        \\[(try (db/open "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (db/open "") (catch any e e))
+        \\ (try (nextomic/connect "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (nextomic/connect "") (catch any e e))]
+    , "[:invalid-path :invalid-path :invalid-path :invalid-path]");
 }
 
 test "a value nested 100 000 deep is stored and read back through a durable ref" {
@@ -2903,9 +3253,7 @@ fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: [
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = policy.threshold;
-    program.v.gc_growth_percent = policy.growth_percent;
-    program.v.gc_next_at = policy.threshold;
+    program.v.setGcPolicy(policy);
     var last = value_mod.nilValue();
     for (steps) |step| {
         const src = try store.source(step);
@@ -2955,7 +3303,7 @@ test "db/reduce-tree walks the tree as it was when the walk began, whatever the 
         \\         (db/put! tx (db/ref c :t (str (name k) "x")) v)
         \\         (db/delete! tx (db/ref c :t "k399"))
         \\         (db/alter! tx (db/ref c :t "k100") inc)
-        \\         (when (= k :k100)
+        \\         (when (= k "k100")
         \\           (db/reduce-tree tx :t (fn [a k v] (db/put! tx (db/ref c :t (str (name k) "y")) v) a) nil))
         \\         (+ acc v))
         \\       0)
@@ -3048,9 +3396,7 @@ test "db/open: two connections to one file share its writer; a second write is :
     , "[:db/busy :db/busy 2 2]");
 }
 
-fn engineSyncs() u64 {
-    return nx.emdb.platform.File.syncCalls.load(.monotonic);
-}
+const engineSyncs = nx.db.engineSyncs;
 
 /// Run each `[source expected syncs]` step of `steps` on one program
 /// holding `@STORE@`, where `syncs` is how many engine syncs the step
@@ -3333,9 +3679,13 @@ test "nexis.string: capitalize, reverse, triml, trimr, trim-newline, split-lines
 }
 
 test "nexis.set: union, intersection, difference, subset?, superset?, select, map-invert, rename-keys" {
-    try expectOutput("[(nexis.set/union #{1 2} #{2 3}) (nexis.set/union) (nexis.set/intersection #{1 2 3} #{2 3 4} #{3 2}) (nexis.set/difference #{1 2 3} #{2} #{3})]", "[#{1 2 3} #{} #{2 3} #{1}]");
+    try expectOutput("[(nexis.set/union #{1 2} #{2 3}) (nexis.set/union) (nexis.set/intersection #{1 2 3} #{2 3 4} #{3 2}) (nexis.set/difference #{1 2 3} #{2} #{3})]", "[#{1 2 3} #{} #{3 2} #{1}]");
     try expectOutput("[(nexis.set/subset? #{1} #{1 2}) (nexis.set/subset? #{3} #{1 2}) (nexis.set/superset? #{1 2} #{2}) (nexis.set/select odd? #{1 2 3})]", "[true false true #{1 3}]");
     try expectOutput("[(nexis.set/map-invert {:a 1}) (= {:z 1 :b 2} (nexis.set/rename-keys {:a 1 :b 2} {:a :z}))]", "[{1 :a} true]");
+    // As Clojure's: the largest (union) or smallest (intersection,
+    // select's own) argument keeps its kind and metadata.
+    try expectOutput("[(nexis.set/union (sorted-set 3 1 5) #{2}) (nexis.set/union nil) (nexis.set/union #{1} (sorted-set 4 2 3) #{5}) (meta (nexis.set/union (with-meta #{1 2} {:m 1}) #{3}))]", "[#{1 2 3 5} nil #{1 2 3 4 5} {:m 1}]");
+    try expectOutput("[(nexis.set/intersection (sorted-set 3 1 2) #{1 2 3 4}) (nexis.set/intersection #{1 2 3 4} (sorted-set 2 1) #{1 2 9}) (nexis.set/select odd? (sorted-set 5 4 3 2 1))]", "[#{1 2 3} #{1 2} #{1 3 5}]");
 }
 
 test "nexis.string: replace: literal, all-non-overlapping" {
@@ -3791,6 +4141,8 @@ test "defprotocol: a docstring and options before the methods" {
         \\(extend-type :string Named (nm [s] (str "s:" s)))
         \\(nm "a")
     , "s:a");
+    // A method's arities and docstring land on its Var.
+    try expectOutputProgram("(defprotocol Sh (ar [s] [s x] \"Area.\")) (select-keys (meta #'ar) [:doc :arglists :name])", "{:doc Area., :arglists ([s] [s x]), :name ar}");
 }
 
 // =============================================================================
@@ -3976,6 +4328,17 @@ test "extend-protocol: built-in kinds" {
     , "[hi-7 35]");
 }
 
+test "extend-protocol: :boolean covers both booleans, :map and :set their sorted kinds" {
+    // As Clojure's Boolean, IPersistentMap and IPersistentSet do; a
+    // later extension of one kind replaces the alias's for that kind.
+    try expectOutputProgram(
+        \\(defprotocol Sh (sh [x]))
+        \\(extend-protocol Sh :boolean (sh [x] [(class x) x]) :map (sh [x] :m) :set (sh [x] :s))
+        \\(extend-protocol Sh :sorted_set (sh [x] :sorted))
+        \\[(sh true) (sh false) (sh {}) (sh (sorted-map 1 2)) (sh #{}) (sh (sorted-set 1))]
+    , "[[:boolean true] [:boolean false] :m :m :s :sorted]");
+}
+
 test "extend-type: record and built-in mixed" {
     try expectOutputProgram(
         \\(do
@@ -4035,6 +4398,31 @@ test "extend-protocol with :vector / :map friendly aliases" {
     , "[:v :m]");
 }
 
+test "extend-protocol and extend-type: nil and Clojure class names, as Clojure code spells them" {
+    try expectOutputProgram(
+        \\(defprotocol Hello (hi [x]))
+        \\(extend-protocol Hello
+        \\  nil (hi [_] :nil)
+        \\  String (hi [s] [:s s])
+        \\  Long (hi [n] [:n n])
+        \\  clojure.lang.IPersistentVector (hi [v] :v)
+        \\  Boolean (hi [b] [:b b])
+        \\  Object (hi [_] :obj))
+        \\[(hi nil) (hi "a") (hi 1) (hi 100000000000000000000) (hi [1]) (hi true) (hi false) (hi :k)]
+    , "[:nil [:s a] [:n 1] [:n 100000000000000000000] :v [:b true] [:b false] :obj]");
+    try expectOutputProgram("(defprotocol Q (q [x])) (extend-type nil Q (q [_] :none)) (q nil)", ":none");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
+    try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
+    try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
+}
+
+test "extend-type: a record another namespace defines, by alias, by refer or by its type symbol" {
+    const rec = [2][]const u8{ "rec.nx", "(ns rec)\n(defrecord R [a])\n" };
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :as r]) (defprotocol P (p [x])) (extend-type r/R P (p [x] (:a x))) (p (r/->R 5))", "5");
+    try expectOutputWithFiles(&.{rec}, "(require '[rec :refer [R ->R]]) (defprotocol P (p [x])) (extend-type R P (p [x] (inc (:a x)))) (p (->R 5))", "6");
+    try expectOutputWithFiles(&.{rec}, "(require 'rec) (defprotocol P (p [x])) (extend-protocol P rec.R (p [x] (dec (:a x)))) (p (rec/->R 5))", "4");
+}
+
 test "extend-protocol with bogus type-kw: :invalid-argument" {
     try expectOutputProgram(
         \\(do
@@ -4044,6 +4432,29 @@ test "extend-protocol with bogus type-kw: :invalid-argument" {
         \\      :no-such-kind (bar [x] :nope))
         \\    (catch any e e)))
     , ":invalid-argument");
+}
+
+test "record internals: a type id no defrecord registered is :invalid-argument" {
+    // Qualified, the `#%` names are reachable (FORMS.md §8); each
+    // validates what it is given.
+    try expectOutput("(try (nexis.internal/#%make-record 99999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record 99999999999999 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.internal/#%make-record -1 {}) (catch any e e))", ":invalid-argument");
+    try expectOutput("(let [mk (resolve (symbol \"nexis.internal\" \"#%make-record\"))] (try (class (mk 77 {:x 1})) (catch any e e)))", ":invalid-argument");
+    try expectOutputProgram(
+        \\(defprotocol IFoo (bar [this]))
+        \\[(try (nexis.internal/#%extend-record-impl IFoo :bar 4096 (fn [x] x)) (catch any e e))
+        \\ (try (nexis.internal/#%extend-record-impl IFoo :bar 99999999999999 (fn [x] x)) (catch any e e))]
+    , "[:invalid-argument :invalid-argument]");
+}
+
+test "defrecord: map->R takes any map, as Clojure's does" {
+    try expectOutputProgram(
+        \\(defrecord P [x z])
+        \\(defrecord Q [x])
+        \\[(map->P (sorted-map :z 2 :x 1)) (map->P nil) (map->P (->Q 5)) (P? (map->P (->Q 5)))
+        \\ (try (map->P [1 2]) (catch any e e))]
+    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true :kind-mismatch]");
 }
 
 // =============================================================================
@@ -4127,6 +4538,11 @@ test "core.nx: merge / update / get-in / assoc-in / update-in" {
     try expectOutputProgram(
         \\(update-in {:a {:b 1}} [:a :b] inc)
     , "{:a {:b 2}}");
+    // An empty path is the one key nil, as Clojure's up; extra
+    // arguments follow the value.
+    try expectOutputProgram(
+        \\[(update-in {} [] identity) (update-in {:a 1} [] assoc :b 2) (update-in {:a {:b 1}} [:a :b] + 10 100) (update-in nil [:a :b] conj 1)]
+    , "[{nil nil} {:a 1, nil {:b 2}} {:a {:b 111}} {:a {:b (1)}}]");
 }
 
 test "core.nx: frequencies / group-by / interpose" {
@@ -4828,6 +5244,9 @@ test "core: sequence functions" {
         .{ .src = "(partition 2 [1 2 3 4 5])", .expected = "((1 2) (3 4))" },
         .{ .src = "(partition 2 1 [1 2 3])", .expected = "((1 2) (2 3))" },
         .{ .src = "(partition 3 3 [:pad] [1 2 3 4])", .expected = "((1 2 3) (4 :pad))" },
+        // A padded group ends the partition, as Clojure's does.
+        .{ .src = "(partition 3 1 [:p] [1 2 3 4])", .expected = "((1 2 3) (2 3 4) (3 4 :p))" },
+        .{ .src = "[(partition 3 1 [] [1 2]) (partitionv 2 1 [:p] [1 2 3])]", .expected = "[((1 2)) ([1 2] [2 3] [3 :p])]" },
         .{ .src = "(partition-all 2 [1 2 3 4 5])", .expected = "((1 2) (3 4) (5))" },
         .{ .src = "(partition-all 2 3 [1 2 3 4 5])", .expected = "((1 2) (4 5))" },
         .{ .src = "(try (partition 0 [1]) (catch any e e))", .expected = ":invalid-argument" },
@@ -4917,6 +5336,8 @@ test "core: sorting and comparison" {
         .{ .src = "(max-key count [1 2] [1] [1 2 3])", .expected = "[1 2 3]" },
         .{ .src = "(min-key count [1 2] [1] [1 2 3])", .expected = "[1]" },
         .{ .src = "(max-key :k {:k 1 :n :a} {:k 1 :n :b})", .expected = "{:k 1, :n :b}" },
+        // One candidate is the answer, without a call, as Clojure's.
+        .{ .src = "[(max-key count 5) (min-key :k :x)]", .expected = "[5 :x]" },
         .{ .src = "(= (hash [1 2]) (hash '(1 2)))", .expected = "true" },
         .{ .src = "(= (hash 0.0) (hash -0.0))", .expected = "true" },
         .{ .src = "(integer? (hash :a))", .expected = "true" },
@@ -4996,9 +5417,30 @@ test "core: macros" {
         .{ .src = "(-> 5 inc (* 2) (- 1))", .expected = "11" },
         .{ .src = "(->> [1 2 3] (map inc) (filter odd?) (reduce +))", .expected = "3" },
         .{ .src = "(dotimes [i 3] i)", .expected = "nil" },
+        // The count is truncated, as Clojure's (long n).
+        .{ .src = "(let [a (atom [])] (dotimes [i 2.5] (swap! a conj i)) @a)", .expected = "[0 1]" },
         .{ .src = "(when-let [x 1] (inc x))", .expected = "2" },
         .{ .src = "(if-let [x nil] x :none)", .expected = ":none" },
     });
+}
+
+test "core: cond->, some-> and as-> expand once, to one let chain" {
+    // One let binding the gensym to every step but the last, as
+    // Clojure's, so expansion grows linearly with the steps.
+    try expectOutput("(let [e (macroexpand-1 '(cond-> 1 true inc false dec true inc))] [(count (second e)) (count (filter seq? (second e)))])", "[6 2]");
+    try expectOutput("[(count (second (macroexpand-1 '(some-> 1 inc inc inc)))) (count (second (macroexpand-1 '(as-> 1 x (inc x) (inc x)))))]", "[6 4]");
+    try expectOutput("(try (eval '(cond-> 1 true)) (catch any e :refused))", ":refused");
+    inline for (.{
+        .{ "(cond-> 0", " true inc", "4000" },
+        .{ "(cond->> 0", " true inc", "4000" },
+        .{ "(some-> 0", " inc", "4000" },
+        .{ "(some->> 0", " inc", "4000" },
+        .{ "(as-> 0 x", " (inc x)", "4000" },
+    }) |c| {
+        const src = try generated(c[0], c[1], 4000, ")");
+        defer testing.allocator.free(src);
+        try expectOutput(src, c[2]);
+    }
 }
 
 // =============================================================================
@@ -5172,6 +5614,9 @@ test "ex-info: a map thrown and caught, read back with ex-data and ex-message" {
         "[m {:a 1} :why true]",
     );
     try expectOutputProgram("[(ex-data 1) (ex-message :k) (ex-data {:x 1}) (:cause (ex-info \"m\" {}))]", "[nil nil nil nil]");
+    // As Clojure's: nil data is {}, a nil message stays nil, and data
+    // that is not a map or a message that is not a string is refused.
+    try expectOutputProgram("[(ex-data (ex-info \"x\" nil)) (ex-message (ex-info nil {})) (ex-data (ex-info \"s\" (sorted-map :a 1))) (try (ex-info \"x\" 1) (catch any e e)) (try (ex-info 1 {}) (catch any e e))]", "[{} nil {:a 1} :kind-mismatch :kind-mismatch]");
     // A tag catches an ex-info map through the `:error` of its data.
     try expectOutputProgram(
         "(try (throw (ex-info \"nf\" {:error :not-found :id 3})) (catch :other e :no) (catch :not-found e [(ex-message e) (:id (ex-data e))]))",
@@ -5223,6 +5668,14 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(count (name (read-string (apply str (repeat 70000 \"b\")))))", "70000");
     // Nesting past the stack budget is a reader error, not a fault.
     try expectOutput("(try (read-string (str (apply str (repeat 200000 \"(\")) (apply str (repeat 200000 \")\")))) (catch :reader-error e :deep))", ":deep");
+    // What follows the first form is never read, so it may not read at
+    // all, and costs nothing: a bad first form fails once, not at every
+    // later cut of the text.
+    try expectOutput("(read-string \"(a) ) \\\"\")", "(a)");
+    try expectOutput("(try (read-string (apply str \"{:a 1 :a 2}\" (repeat 100000 \" x\"))) (catch :reader-error e :bad))", ":bad");
+    try expectOutput("(try (read-string (apply str \"#_\" (repeat 100000 \" #_\"))) (catch :reader-error e :bad))", ":bad");
+    // A `\u{...}` char is one token, never cut short to `\u`.
+    try expectOutput("(try (read-string \"\\\\u{110000}\") (catch :reader-error e :bad))", ":bad");
 }
 
 // =============================================================================
@@ -5252,9 +5705,12 @@ test "eval: def binds in the current namespace; a macro it defines serves a late
     try expectOutputProgram("(ns my.app) (eval '(def z 9)) (ns user) [my.app/z (eval 'my.app/z)]", "[9 9]");
     // `(ns ...)` inside eval switches the current namespace, as at the REPL.
     try expectOutputProgram("(eval '(ns other)) (def w 1) (ns user) other/w", "1");
-    // A `def` after an `(ns ...)` inside one form binds in the
-    // namespace current when the form's compile started, as at the REPL.
-    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) w", "2");
+    // A `do` runs its forms one at a time, as Clojure's eval does:
+    // a `def` after an `(ns ...)` binds in that namespace, and a macro
+    // body sees a `def` made before it.
+    try expectOutputProgram("(eval '(do (ns other) (def w 2))) (ns user) [other/w (resolve 'user/w)]", "[2 nil]");
+    try expectOutput("(eval '(do (def k 41) (defmacro mk [] (inc k)) (mk)))", "42");
+    try expectOutput("(eval '(do))", "nil");
 }
 
 test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {
@@ -5499,9 +5955,7 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = vm.GcPolicy.stress.threshold;
-    program.v.gc_growth_percent = vm.GcPolicy.stress.growth_percent;
-    program.v.gc_next_at = vm.GcPolicy.stress.threshold;
+    program.v.setGcPolicy(.stress);
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
 
@@ -5580,7 +6034,7 @@ test "gc: sorted collections under a comparator that collects keep every interme
 
 test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [a (atom [])] (dotimes [i 40] (swap! a (fn [v] (churn i) (conj v (str i))))) [(count @a) (last @a)])", "[40 39]");
-    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (meta (var v))", "{:i 19}");
+    try expectOutputUnderGc(churn ++ "(def v 1) (dotimes [i 20] (alter-meta! (var v) (fn [m] (churn i) (assoc m :i (str i))))) (:i (meta (var v)))", "19");
     try expectOutputUnderGc(churn ++ "(apply str (map (fn [x] (churn x) (str x)) (range 20)))", "012345678910111213141516171819");
     try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
 }
@@ -5628,7 +6082,7 @@ test "binding: only a dynamic Var can be bound; set! rebinds the innermost bindi
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* 2] (binding [*x* 3] (set! *x* 4)) *x*)", "2");
     try expectOutputProgram("(def ^:dynamic *x* 1) (try (set! *x* 5) (catch :no-thread-binding e [e *x*]))", "[:no-thread-binding 1]");
     try expectOutputProgram("(def plain 1) (try (set! plain 5) (catch :not-dynamic e [e plain]))", "[:not-dynamic 1]");
-    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true}");
+    try expectOutputProgram("(def ^:dynamic *x* 1) (meta (var *x*))", "{:dynamic true, :name *x*, :ns user}");
 }
 
 // =============================================================================
@@ -5933,6 +6387,11 @@ test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags
     try expectOutputWithFiles(&.{utilns}, "(require '[util :as-alias ua]) (require 'util) (ua/twice 3)", "6");
 }
 
+test "require: a file's ns form is found as the reader reads it, comments and discards before it" {
+    try expectOutputWithFiles(&.{.{ "appa.nx", "(ns ; the app\n  appa)\n(def x 1)\n" }}, "(require 'appa) appa/x", "1");
+    try expectOutputWithFiles(&.{.{ "appb.nx", "#_(old)\n(ns ^{:doc \"b {}\"} appb)\n(def y 2)\n" }}, "(require 'appb) appb/y", "2");
+}
+
 test "require: Clojure's library namespaces name nexis's" {
     try expectOutputWithFiles(&.{},
         \\(ns t (:require [clojure.string :as str :refer [trim]] clojure.test))
@@ -5983,7 +6442,7 @@ fn expectRequireFailure(files: []const [2][]const u8, setup: []const u8, src: []
             .load_callback = dir.callback(),
             .value_heap = program.v.ensureHeap(),
         };
-        _ = expand_mod.expandForm(&ctx, null, form) catch {
+        _ = expand_mod.expandForm(&ctx, form) catch {
             failure = ctx.failure;
             break;
         };
@@ -6087,7 +6546,7 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     defer files.deinit();
     const Case = struct { src: []const u8, label: []const u8, file: ?[]const u8 = null, line: u32 = 0 };
     const cases = [_]Case{
-        .{ .src = "(require 'broken)", .label = "parse error: unexpected end of input", .file = "broken.nx", .line = 3 },
+        .{ .src = "(require 'broken)", .label = "parse error: unclosed `(`", .file = "broken.nx", .line = 2 },
         .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
@@ -6154,10 +6613,30 @@ test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [] (/ 1 0))\n(f)" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
     try testing.expect(program.v.frames.items.len > 1);
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
     program.v.resetAfterError();
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    // A later failure the run loop never sees (a host callback's) must
+    // not report this one.
+    try testing.expect(program.v.traced_error == null);
     const result = try program.run("(+ 1 2)");
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
+}
+
+test "runtime errors: the next form runs after a failed one, and a deep failure's memory goes back" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    try testing.expectError(vm.VmError.DivideByZero, program.run("(defn f [] (/ 1 0)) (f)"));
+    try testing.expect(program.v.frames.items.len > 1);
+    try harness.expectResult(&program, "", try program.run("(+ 1 2)"), "3");
+    program.v.max_frames = 20_000;
+    try testing.expectError(vm.VmError.StackOverflow, program.run("(defn d [n] (inc (d n))) (d 1)"));
+    try testing.expect(program.v.frames.capacity >= 20_000);
+    program.v.resetAfterError();
+    try testing.expect(program.v.frames.capacity < 20_000);
+    try testing.expect(program.v.stack.capacity < 20_000);
+    try harness.expectResult(&program, "", try program.run("(+ 1 2)"), "3");
 }
 
 test "runtime errors: resetAfterError drops the dynamic bindings a failed run left in force" {
@@ -6272,6 +6751,22 @@ test "nexis.test: is returns whether the assertion passed and deftest yields the
     , "[true false false true]");
 }
 
+test "nexis.test: is, testing and a deftest called directly work outside a run" {
+    // Outside a run an assertion reports and returns but counts
+    // nothing; after a run the last test's name is not in force.
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest t (nexis.test/is (= 1 2)) :ran)
+        \\(def r (nexis.test/run-tests))
+        \\[(nexis.test/is (= 1 1)) (nexis.test/is (= 1 2))
+        \\ (nexis.test/testing "ctx" (nexis.test/is (= 1 1)) (nexis.test/is nil))
+        \\ (t) @nexis.test/counts (:fail r) @log]
+    ,
+        \\[true false false :ran nil 1 [FAIL in user/t: (= 1 2) expected: 1 actual: 2 Ran 1 tests containing 1 assertions. 1 failures, 0 errors. FAIL: (= 1 2) expected: 1 actual: 2 FAIL (ctx): nil expected: true actual: nil FAIL: (= 1 2) expected: 1 actual: 2]]
+    );
+}
+
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {
     try expectOutputWithFiles(&.{}, "(require '[nexis.test :refer :all]) [(fn? run-tests) (fn? check=) (try (eval 'bump!) (catch any e :unresolved)) (try (eval 'run-namespaces) (catch any e :unresolved))]", "[true true :unresolved :unresolved]");
     try expectOutputWithFiles(&.{}, "(require '[nexis.pprint :refer :all]) [(fn? pprint-str) (try (eval 'layout) (catch any e :unresolved)) (nexis.pprint/pprint-str [1])]", "[true :unresolved [1]]");
@@ -6290,7 +6785,7 @@ test "nexis.test: thrown? takes what its catch would take, and a message is eval
         \\ (nexis.test/is (= 1 1) (str "m" (swap! n inc)))
         \\ (nexis.test/is (= 1 2) (str "m" (swap! n inc)))
         \\ @n @log @nexis.test/counts]
-    , "[true true true [:went-on :y] true false 2 [FAIL in /: (= 1 2) expected: 1 actual: 2 ; m2] {:test 0, :pass 4, :fail 1, :error 0}]");
+    , "[true true true [:went-on :y] true false 2 [FAIL: (= 1 2) expected: 1 actual: 2 ; m2] {:test 0, :pass 4, :fail 1, :error 0}]");
 }
 
 test "nexis.pprint: a short collection prints flat, a long one breaks from its column" {
@@ -6352,6 +6847,10 @@ test "syntax-quote qualifies a symbol to the namespace whose own Var it names" {
         \\(defn helper [x] (* x 5))
         \\(m)
     , "10");
+    // A referred or renamed name qualifies to the namespace that owns
+    // its Var, as in Clojure.
+    try expectOutputWithFiles(&.{utilns}, "(require '[util :refer [twice half] :rename {half hv}]) [`twice `(hv 1)]", "[util/twice (util/half 1)]");
+    try expectOutputWithFiles(&.{}, "(require '[clojure.string :refer [join]]) `join", "nexis.string/join");
 }
 
 test "a user macro named like a core macro is the namespace's own" {

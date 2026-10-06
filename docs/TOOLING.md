@@ -12,12 +12,12 @@ samples are the committed goldens under `test/golden/cli/`, which
 | Command | What it does |
 |---|---|
 | `nexis run FILE [ARG...]` | Runs FILE's top-level forms in order and prints only what the program prints. FILE `-` reads the program from stdin (reported as `<stdin>`). |
-| `nexis FILE.nx [ARG...]`, `nexis - [ARG...]` | The same as `run`. |
+| `nexis FILE [ARG...]`, `nexis - [ARG...]` | The same as `run`, for a FILE that ends `.nx` or names an existing file (a `#!` script needs no suffix). |
 | `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms (reported as `<-e>`) and prints each value that is not nil, as `prn` does. |
 | `nexis repl` | The read-eval-print loop below. |
-| `nexis test FILE...` | Runs each file (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. |
+| `nexis test FILE...` | Reads every file (one that cannot be read stops it before any runs, exit 2), runs each (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. A file's own definitions cannot change the exit status. `require` searches the working directory, then each file's directory. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
-| `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, or a command missing its FILE, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
+| `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm` or `--help` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 
 Every command evaluates through `Loader.evalSource`: parse and read
 every top-level form, then compile and run each before compiling the
@@ -38,12 +38,24 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 | 2 | the file could not be read (`nexis: failed to read 'PATH': ErrorName`) |
 | 3 | parse or reader error |
 | 4 | compile error |
-| 5 | runtime error that no `try` caught |
+| 5 | runtime error that no `try` caught; an error of the command itself, such as output it cannot write or memory to boot (`nexis: runtime error: ErrorName`) |
 | n | `(exit n)` |
 
 However a command ends, through its normal end, `exit` or an error it
 reports, every store file a commit left unsynced is synced once first
 (`docs/DB.md` §3.3).
+
+**A closed pipe.** When what reads the command's stdout closes it (`nexis
+-e '(range 100000)' | head`), the value, disassembly, usage text or
+prompt being written goes nowhere and the command ends there, with no
+report and exit 0, as a JVM Clojure program's does.
+
+**The runtime's stack.** The runtime runs on a thread with a 1 GiB
+stack reservation, committed only as it is touched (`docs/VM.md`
+§13.1). A host that refuses that much (strict overcommit, a small
+memory limit) gets the largest half of it it grants, down to 64 MiB,
+and below that the main thread's own stack; the stack guard is armed
+for whichever runs, so only the depth a program can reach shrinks.
 
 **Environment.** `NEXIS_DURABILITY` is the durability of every store
 connection that names none: `commit` (the default: a commit syncs
@@ -51,7 +63,9 @@ nothing, and the file is synced at close, `sync` and the end of the
 program) or `durable` (every commit syncs); `docs/DB.md` §3.3. Any
 other value stops the command before it runs with `nexis:
 NEXIS_DURABILITY is not commit or durable`, exit 1.
-`NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7.
+`NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7, and
+any value but `1` stops the command with `nexis: NEXIS_GC_STRESS is
+not 1`, exit 1.
 
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
@@ -68,8 +82,9 @@ form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
-and `*e` is the thrown value, or for a VM error its keyword
-(`DivideByZero` is `:divide-by-zero`); a parse, reader or compile
+and `*e` is the thrown value, or for a VM error the keyword `catch`
+sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
+out of memory, which no `catch` sees, `:out-of-memory`); a parse, reader or compile
 error is reported and leaves `*e` as it was. `:quit` or `:q` alone
 on a line at the start of a form, or end of input, exits. Every
 input's text is kept for the session, so a function defined in one
@@ -93,9 +108,13 @@ nexis: test/golden/cli/bad-number.nx:5:10: reader error: :bad-number-literal 1-2
              ^^^
 ```
 
-The label is ``parse error: unexpected `)` `` or `parse error: unexpected
-end of input` at the token the parser stopped on, or `parse error:
-unterminated string` at the `"` of a string literal no quote closes;
+The label is ``parse error: unexpected `)` `` at the token the parser
+stopped on, naming the delimiter still open when the token is a closer
+of another kind (``unexpected `)`; the `[` at 1:10 is open``);
+``parse error: unclosed `(` `` at the innermost delimiter the text
+leaves open, or `parse error: unexpected end of input` at the end when
+none is; or `parse error: unterminated string` at the `"` of a string
+literal no quote closes;
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span
@@ -153,14 +172,16 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   `eval` runs `<eval>` (listed by name alone: it has no source). A
   caller's position is its call. A closure a native called back
   (`map`, `reduce`) is its own frame; the native has none. A chain
-  longer than 40 frames keeps its innermost 32 and outermost 8 around
-  one line `  <N frames elided>`, which has no `at` (VM.md §13), so a
-  runaway recursion ending in `StackOverflow` lists 41 lines.
+  longer than 41 frames keeps its innermost 32 and outermost 8 around
+  one line `  <N frames elided>`, N the frames between them, which has
+  no `at` (VM.md §13; `deep-trace.err`), so a runaway recursion ending
+  in `StackOverflow` lists 41 lines.
 - Out of memory is a runtime error like the rest: `runtime error:
   OutOfMemory` at the call whose allocation failed, with its frames
   (`out-of-memory.err`). No `try` catches it (VM.md §13); what the
   failed allocation was building is unreachable, so the heap stays
-  usable and the REPL carries on. Memory that runs out while reading,
+  usable and the REPL carries on; a `with-out-str` capture the error
+  left open is discarded, so the next input prints (`repl.in`). Memory that runs out while reading,
   compiling or printing is reported the same way with no position.
   With `NEXIS_MAX_ALLOC=BYTES` in the environment every allocation, or
   growth of one, past BYTES fails as a request the machine refuses
@@ -192,7 +213,7 @@ pins the listing of `examples/sum10.nx`:
 
 ```
 routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=println  ; 4:2
+  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
   0001  mov:load-const      s3  c0=0  ; 5:13
   0002  mov:load-const      s4  c0=0  ; 5:19
   0003  cmp:lt              s5  s3  c1=10  ; 6:9
@@ -222,7 +243,7 @@ into a temporary because `(+ acc i)` still reads `i` (COMPILER.md
   constant shows its value as `pr-str` prints it (`c2=1`), cut at a
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
-  var its name (`v0=println`). Operand B of `call:call`,
+  var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
   `call:tailcall` and every `coll:*` is a raw immediate (VM.md §4.5)
   and prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
@@ -277,8 +298,9 @@ the private helpers.
   `thrown?` with a keyword tag is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
-  `nexis.test`: `(is (= a 1))` is six instructions, the helper, the
-  form, the two values, the message and the call.
+  `nexis.test`: `(is (= a 1))` as a function's body is seven
+  instructions, the helper, the form, the two values, the message, the
+  call and the return (COMPILER.md §4.8).
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
 - `(run-tests)` runs the current namespace's tests in definition
@@ -288,6 +310,10 @@ the private helpers.
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
   test still runs.
+- Outside a run (at the REPL, or a test function called directly) an
+  assertion judges, reports and returns as in one, but counts
+  nothing; its report line names only the descriptions in force
+  (`FAIL (ctx): ...`). A run's end leaves no test current.
 - Every report line goes through the function in the atom
   `nexis.test/out`, `println` unless replaced (a harness without
   stdout collects the lines instead). One line per failure names the

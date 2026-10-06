@@ -111,6 +111,11 @@ Trie boundaries follow from invariant 3: 33 elements give the first
 leaf (shift 5); 1056 fills a shift-5 trie (1024 + a full tail); 1057
 grows the shift to 10; 32800 fills it; 32801 grows it to 15.
 
+A vector holds at most 2³² − 1 elements (`max_count`), the most its
+count field holds: an append past it, persistent or in place, and
+`fromSlice` of a longer slice fail with `error.OutOfMemory`, which the
+language reports as out of memory, before anything changes.
+
 ---
 
 ### 4. Cursor

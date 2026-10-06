@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="nexis">
+  <defs>
+    <linearGradient id="nx-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5B5BF7"/>
+      <stop offset="1" stop-color="#8B3DF0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="60" fill="url(#nx-bg)"/>
+  <g fill="none" stroke="#fff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M92 66 H 72 V 190 H 92"/>
+    <path d="M164 66 H 184 V 190 H 164"/>
+  </g>
+  <path d="M109 158 V98 L147 158 V98" fill="none" stroke="#fff" stroke-width="15" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

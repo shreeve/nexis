@@ -1,1 +1,1 @@
-:unknown-reader-construct :detail "metadata must be a keyword, map, or symbol"
+:unknown-reader-construct :detail "metadata must be a keyword, map, symbol, string or vector"

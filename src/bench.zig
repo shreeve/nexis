@@ -241,7 +241,7 @@ pub const Runner = struct {
     // Human-readable output
     // =========================================================================
 
-    pub fn writeTable(self: Runner, writer: anytype) !void {
+    pub fn writeTable(self: Runner, writer: *std.Io.Writer) !void {
         try writer.print(
             "\n{s:<48} {s:<28} {s:>10} {s:>14} {s:>14} {s:>14} {s:>16}\n",
             .{ "benchmark", "category", "param", "median", "p5", "p95", "ops/sec" },
@@ -285,7 +285,7 @@ pub const Runner = struct {
         note: []const u8 = "",
     };
 
-    pub fn writeJson(self: Runner, writer: anytype, host: HostInfo) !void {
+    pub fn writeJson(self: Runner, writer: *std.Io.Writer, host: HostInfo) !void {
         try writer.writeAll("{\n");
         var wall_ts: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.REALTIME, &wall_ts);

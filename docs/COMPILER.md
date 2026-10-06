@@ -23,7 +23,7 @@ guarantees, not the Zig shape of `Tiny`, `Compiled` or the `Emitter`
   constant pool, Var table, capture-descriptor table and span table.
 - Var linking at compile time through the current namespace and the
   namespace registry; `require` file loading is `src/loader.zig`
-  (MACROEXPAND.md §8).
+  (MACROEXPAND.md §2b).
 - The primitive core: `quote`, `if`, `do`, `let*`, `fn*`, `letfn*`,
   `loop*`, `recur`, `def`, `var`, `try` / `catch` / `finally`,
   `throw`, and the constructors `#%list`, `#%concat`, `#%vector`,
@@ -81,9 +81,9 @@ freeing is the caller's arena drop.
 
 | Caller | Trees | Routines |
 |---|---|---|
-| `nexis run FILE` | one arena for the whole file | the same arena |
-| REPL | the runtime's persistent arena (a line's closures are called from later lines, and `Tiny.symbol` slices borrow from the line's text) | the same |
+| the loader (`nexis run`, the REPL, `require`, the library boot) | a scratch arena per top-level form, freed once it has run | the caller's: one arena for a run's file, the runtime's persistent arena for the REPL, a load and the boot (a line's closures are called from later lines) |
 | `eval` | a scratch arena freed when `eval` returns | the runtime's persistent arena: a closure the form returns, a Var it defines and a frame an escaping throw leaves outlive the call |
+| `defmacro` | the enclosing form's | the persistent allocator, where the macro outlives the form |
 
 Literal Values that reach run time (strings, bignums, keywords,
 symbols, collections of constants) are built through the heap and
@@ -124,8 +124,8 @@ and a reused subform its own (MACROEXPAND.md §4b).
    expander's `special_forms` (MACROEXPAND.md §1.1) less the four it
    rewrites away (`ns`, `require`, `defmacro`, `set!`), plus the `#%`
    constructors; a test holds the two tables to that.
-2. **Inlined core fn**: a call of one of 15 core fns at one arity
-   (`inlined_ops`) lowers to one `math` or `cmp` instruction
+2. **Inlined core fn**: a call of one of 14 core fns at one of the
+   15 (fn, arity) pairs of `inlined_ops` (`-` inlines at two) lowers to one `math` or `cmp` instruction
    (`Tiny.prim`), which runs the numeric-tower helper the fn itself
    runs (VM.md §10), so results and errors are the fn's:
 
@@ -218,7 +218,10 @@ constant pool, Var table, capture descriptors, span table,
   needed after the call (per the range-call ABI, VM.md §6) or by a
   later `closure:make` is never inside it:
   `(let* [x 1, f (g), h (fn* [] x)] h)` keeps `x`'s cell below `(g)`'s
-  block.
+  block. A `try`'s catch binding takes the slot above every slot live
+  at the `try`, but only from its handler on: the VM writes it once
+  the body is abandoned, when the body's temporaries are dead, so the
+  body may use it and nested `try`s share it.
 - **Scratch.** A value computed into a slot that nothing reads before
   the value's last instruction writes it (a fresh temporary for an
   operand, or an item of a block) may use that slot as working space,
@@ -319,8 +322,9 @@ constant pool, Var table, capture descriptors, span table,
 
 - Instructions are 64-bit; a pc, constant, Var, try or
   capture-descriptor index is the wide field (VM.md §3). A forward
-  jump, and a `try`'s catch and finally pcs, carry the placeholder
-  2^32 − 1 until their target is placed.
+  jump and a `try`'s catch pc carry the placeholder 2^32 − 1 until
+  their target is placed; a `try`'s finally pc is null until then
+  (`vm.Try.finally_pc`).
 - Var references compile to `v` operands bound to `*Var` pointers at
   compile time (§4.7).
 - A closure's upvalues are numbered 0..N-1 and it captures N cell
@@ -349,14 +353,14 @@ reported at the instruction that raised it.
   forward references work and a redefinition is visible to callers
   already compiled.
 - `(require ...)` runs through the expander and `src/loader.zig`
-  (MACROEXPAND.md §8).
+  (MACROEXPAND.md §2b).
 
 #### 4.8 What common forms cost
 
 Instructions `bin/nexis disasm` lists for each form as the whole body
 of `(defn f [a b c m xs] ...)`, its return included (a value in the
 tail is returned in place, §5.5); `g` and `h` are Vars, `pm` a
-protocol method. `test/prop/compile.zig` pins a set of such shapes.
+protocol method. `test/prop/compile.zig` pins every row.
 
 | Form | Instructions |
 |---|---:|
@@ -368,9 +372,9 @@ protocol method. `test/prop/compile.zig` pins a set of such shapes.
 | `(is (= 1 (inc (dec a))))` | 8 |
 | `(is (pos? a))` | 8 |
 | `(is (thrown? :x (g a)))` | 16 |
-| `(let [[x y & r] xs] (g x y r))` | 21 |
-| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))` | 15 |
-| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 20 |
+| `(let [[x y & r] xs] (g x y r))` | 20 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments (MACROEXPAND.md §10) | 24 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 29 |
 | `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
 | `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
 | `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |
@@ -381,7 +385,7 @@ protocol method. `test/prop/compile.zig` pins a set of such shapes.
 | `(-> a (g b) (h) (g c))` | 10 |
 | `(doseq [x xs] (g x))` | 15 |
 | `(for [x xs] (h x))` | 24 |
-| `(dotimes [i a] (g i))` | 9 |
+| `(dotimes [i a] (g i))`, its count truncated once by `long` | 12 |
 | `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
 | `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
 | `(assert (pos? a) "a must be positive")` | 10 |
@@ -403,29 +407,37 @@ What each form lowers to, in terms of the opcodes of VM.md §10.
 
 #### 5.1 `(quote x)`
 
-- nil, booleans and fixnums use the ordinary `Tiny` variants.
-- Symbols and keywords are interned; strings and bignums built on the
-  heap; each is a constant.
-- A compound payload is quoted element by element
-  (`lowerQuotePayload`) and is one constant (§4.4). A quote inside
-  the payload is data: `'(a 'b)` is `(a (quote b))`. Syntax-quote,
-  unquote, `@x`, `#(...)` and `^meta` inside a quoted form are
+- A self-evaluating scalar lowers as itself (nil, booleans and fixnums
+  the ordinary `Tiny` variants; keywords interned, strings and
+  bignums built on the heap, each a constant); a symbol is interned.
+- Any other payload is one constant (§4.4): the value
+  `expand.formToValue` makes of it, exactly what a macro receives as
+  an argument (MACROEXPAND.md §1.2 item 6), built on the lowering
+  heap. A quote inside the payload is data, `'(a 'b)` is `(a (quote
+  b))`; `'@x` is `(nexis.core/deref x)`; `'#(+ % 1)` is `(fn* [%1] (+
+  %1 1))`; `'^:m [1]` is `[1]` carrying `{:m true}` (metadata on
+  anything but a list, vector, map or set is dropped: a symbol
+  carries none); the marker list a sorted collection travels as
+  (MACROEXPAND.md §5) is the collection. A syntax-quote or unquote
+  inside a quoted form, and a quoted compound without a heap, are
   `UnsupportedFeature`.
 
 #### 5.2 `(if test then else?)`
 
 `test` is read in place when it can be (§4.4); `jump:if-false` to
 the else label; `then` into the result slot; `jump:jmp` to the end,
-unless every path through `then` ends in `recur` or `throw` or the
-else branch is the local already in the result slot, which emits
-nothing (`(if c (+ acc 1) acc)` as a `recur` argument); the else
-branch (nil when absent).
+unless control cannot reach the end of `then` (its every path ends in
+a jump, return or throw: the Emitter clears `reachable` after each
+and sets it at every label) or the else branch is the local already
+in the result slot, which emits nothing (`(if c (+ acc 1) acc)` as a
+`recur` argument); the else branch (nil when absent).
 
 The test is compiled as branches rather than as a value: a `not`
 (`(if x false true)`, §4.3 rule 2) branches on `x` the other way, and
 an `and` or an `or` in the shape the expander gives them
 (`(let* [g x] (if g rest g))`, `(let* [g x] (if g g rest))`,
-MACROEXPAND.md §10) branches on `x` and then on `rest`, jumping to the
+MACROEXPAND.md §10, where lowering counted exactly the two reads of
+`g` shown) branches on `x` and then on `rest`, jumping to the
 else arm (or past it, with `jump:if-true`) as soon as the answer is
 known, so none of the three is ever made as a value:
 `(if (and a (not b)) x y)` with `a` and `b` locals is
@@ -587,8 +599,12 @@ self-name.
 #### 5.9 `(var name)`, `(var ns/name)`
 
 `var:var-object` into the result slot: the Var itself, bound or not.
-A bare name resolves as a symbol does (§4.3 rules 6-7), a qualified
-one as rule 5.
+A bare name resolves as a symbol does (§4.3 rules 6-8) except that a
+lexical local is no Var (Clojure's rule), so `(let [x 1] #'x)` and
+`#'nope` are `UnresolvedSymbol` when the file's names are declared,
+and intern nothing; a qualified one resolves as rule 5. Without
+declared names (the embedded library sources) an unresolved bare name
+is interned unbound, a forward reference.
 
 #### 5.10 `(try body... (catch any binding handler...) (finally ...)?)`
 
@@ -659,13 +675,16 @@ when a closure first captures, would be unsound: in `(if false (fn*
 later same-frame `closure:get-cell` would trap `ExpectedCell` on a
 valid program.
 
-1. **Marking.** `LowerEnv` mirrors every scope the `Emitter` will
-   have (`let*` / `loop*` bindings, `fn*` parameters and self-name,
-   `letfn*` names, the catch binding), each entry recording the `fn*`
-   depth it was made at and pointing at its Tiny node's `captured`
-   flag. Lowering a symbol finds its innermost binding; one made at a
-   smaller `fn*` depth is captured and its flag is set. One pass,
-   O(scope depth) per symbol.
+1. **Marking.** Lowering's scope table (`LowerCtx.lexicals`) mirrors
+   every scope the `Emitter` will have (`let*` / `loop*` bindings,
+   `fn*` parameters and self-name, `letfn*` names, the catch
+   binding), each entry recording the `fn*` depth it was made at and
+   pointing at its Tiny node's `captured` flag. Lowering a symbol
+   finds its innermost binding; one made at a smaller `fn*` depth is
+   captured and its flag is set. One pass; each name maps to its
+   innermost binding, which records the one it shadows, so a lookup
+   is one probe however deep the scopes nest, in lowering and in the
+   Emitter alike.
 2. **Binding.** A marked binding is boxed as it is bound and pushed
    as `.cell_slot(s)`; every other one is `.direct_slot(s)`; a marked
    self-name gets a placeholder cell (§5.5). The instruction is in
@@ -699,7 +718,7 @@ not):
 | `DuplicateParam`, `DuplicateBinding` | a repeated parameter; a repeated `letfn*` name |
 | `MalformedForm` | a special form of the wrong shape (`(if)`, `(quote)`, an odd `#%map`) |
 | `ExpectedSymbol`, `ExpectedVector` | a binding name that is not a symbol; a binding or parameter spec that is not a vector |
-| `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering or inside a quote; a quoted symbol or keyword without an interner, a string or bignum without a heap |
+| `UnsupportedFeature` | a non-`any` catch matcher; a syntax-quote, `#(...)`, `@x` or `^meta` datum reaching lowering, a syntax-quote or unquote inside a quote; a quoted symbol or keyword without an interner, a string, bignum or quoted compound without a heap |
 | `RecurOutsideTail`, `RecurArityMismatch` | §4.4 |
 | `SlotOverflow` | the limits of §4.4 that remain: slots live at once, upvalues |
 | `MacroDepthExceeded` | 256 expansions in a row (MACROEXPAND.md §6) |
@@ -832,12 +851,13 @@ compiler as the VM's `macroexpand-1`, `read-string` and `eval`
 (MACROEXPAND.md §1.2). The loader's `evalSource` parses and reads
 every top-level form first, then compiles and runs each before
 compiling the next, sharing the VM's namespace, interner and macro
-table.
+table; `expandTopLevel` and `doForms` let it, and `eval`, run a
+top-level `do` one form at a time (MACROEXPAND.md §2b).
 
 ---
 
 ### 11. Left to the implementation
 
-The Zig shapes of `Tiny`, `Compiled`, `LowerEnv` and the `Emitter`,
+The Zig shapes of `Tiny`, `Compiled`, the scope tables and the `Emitter`,
 and the frame stack's backing storage, are not part of this contract;
 any representation that keeps the invariants above conforms.

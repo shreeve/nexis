@@ -5,6 +5,8 @@ user=> #'user/x
 user=> 42
 user=> user=> :divide-by-zero
 user=> user=> :out-of-memory
+user=> user=> after
+nil
 user=> 3
 user=> #'user/a
 #'user/b

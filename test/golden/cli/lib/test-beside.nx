@@ -1,0 +1,4 @@
+; Required from its own directory, which the first file named to
+; `nexis test` does not share.
+(require '[nexis.test :as t] '[beside :as b])
+(t/deftest beside (t/is (= 42 b/answer)))

@@ -41,6 +41,8 @@
 (println (vals-of (d/since db7 3) doc :doc/title))
 (t/check "since shows the reasserted tag, not the untouched one" (= [:red] (vals-of (d/since db7 4) doc :doc/tags)))
 (t/check "since after the last change is empty" (nil? (d/entity (d/since db7 7) doc)))
+(t/check "a second since keeps the newer bound" (and (= (d/since db7 4) (d/since (d/since db7 4) 1))
+                                                    (= (d/since db7 4) (d/since (d/since db7 1) 4))))
 
 ; history: every assertion and retraction with its t and added flag.
 (println (d/history db7))

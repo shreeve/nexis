@@ -82,7 +82,7 @@ effect is the same.
 Metadata never affects `=` or `hash` (§23 #12); `with-meta` returns a
 new value with the map in the heap header. Collections, records and
 Vars carry it, and `conj`, `assoc` and the other updates keep it, as
-in Clojure; typed vectors, functions, symbols and keywords carry none
+in Clojure; functions, symbols and keywords carry none
 (`docs/SEMANTICS.md` §7).
 
 ### 1.7 Hash-domain separation
@@ -213,15 +213,16 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
 | `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
-| `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`) or a record name | `docs/PROTOCOLS.md` |
-| `(catch Exception e ...)` | by class | a class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
-| `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument) | `docs/MACROEXPAND.md` |
+| `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |
+| `(catch Exception e ...)` | by class | a class that names a nexis error takes that error's tag (`ArithmeticException` `:divide-by-zero`, `IndexOutOfBoundsException` `:index-out-of-bounds`, `ClassCastException` `:kind-mismatch`, `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause` and `:arity-mismatch`, `AssertionError` `:assertion-failed`, `StackOverflowError` `:stack-overflow`); any other class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
+| `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument); as Clojure's, `msg` is a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch` | `docs/MACROEXPAND.md` |
 | `(case x ...)` with no match | `IllegalArgumentException` | throws `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` the same | `docs/MACROEXPAND.md` |
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions` and `reduce-kv` honour it | `src/stdlib/core.nx` |
-| `(read-string s)` | the full reader | the first form as data; syntax-quote, unquote and `^meta` are not data and raise `:reader-error` | `docs/MACROEXPAND.md` |
+| `(read-string s)` | the full reader | the first form as data, `^meta` on a collection kept (on a symbol dropped); syntax-quote and unquote are not data and raise `:reader-error` | `docs/MACROEXPAND.md` |
 | `(eval form)` | binds `*ns*` | compiles in the current namespace as the REPL does; a compile error is the catchable map `{:error :compile-error :message ... :form form}` | `docs/MACROEXPAND.md` |
 | `(macroexpand form)` | with `&env` | no lexical environment; subforms never expand | `docs/MACROEXPAND.md` |
 | `(meta f)`, `(with-meta 'sym m)` | metadata on fns and symbols | nil; `:no-metadata-on-immediate` | `docs/SEMANTICS.md` §7 |
+| `(meta #'f)` | `:name`, `:ns`, `:arglists`, `:line`, `:column`, `:file` | `:name`, `:ns` (the namespace's name symbol), `:arglists` for a `defn` or `defmacro`, and what the definition carries; no `:line`, `:column` or `:file` | `docs/MACROEXPAND.md` §10 |
 | `volatile!`, `vswap!`, `vreset!` | a volatile box | an atom (`atom?` is true) | `docs/ATOM.md` |
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |

@@ -36,7 +36,8 @@ const Usage =
     \\  nexis run FILE [ARG...]  Runs FILE's top-level forms in order;
     \\                           `-` reads the program from stdin.
     \\                           *command-line-args* holds the ARGs.
-    \\  nexis FILE.nx [ARG...]   The same as `run`.
+    \\  nexis FILE [ARG...]      The same as `run`, for a FILE that
+    \\                           ends .nx or names a file.
     \\  nexis -e EXPR [ARG...]   Evaluates EXPR's forms and prints each
     \\                           value that is not nil.
     \\  nexis repl               Interactive read-eval-print loop;
@@ -71,28 +72,47 @@ const Usage =
 /// The runtime's thread stack. Reading, printing, hashing and comparing
 /// nested data recurse on the native stack, guarded by `stack.check`
 /// (docs/VM.md §13.1), so the runtime runs on a thread whose stack is a
-/// large virtual reservation: pages are committed only when touched.
+/// large virtual reservation: pages are committed only when touched. A
+/// host that refuses the reservation (strict overcommit, a small memory
+/// limit) gets the largest half of it it grants, down to
+/// `min_runtime_stack_size`, and below that the main thread's stack,
+/// the guard armed for whichever runs.
 const runtime_stack_size = 1 << 30;
+const min_runtime_stack_size = 64 << 20;
 /// Headroom below the guard's limit for unguarded leaf calls.
 const runtime_stack_margin = 16 << 20;
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init) void {
     var result: anyerror!void = {};
-    const thread = try std.Thread.spawn(.{ .stack_size = runtime_stack_size }, runtimeThread, .{ init, &result });
-    thread.join();
-    return result;
+    var size: usize = runtime_stack_size;
+    while (size >= min_runtime_stack_size) : (size /= 2) {
+        const thread = std.Thread.spawn(.{ .stack_size = size }, runtimeThread, .{ init, size, &result }) catch continue;
+        thread.join();
+        break;
+    } else {
+        stack_guard.arm(stack_guard.main_thread_budget);
+        result = runCommand(init);
+    }
+    // What a command cannot report itself: an output it cannot write,
+    // memory to boot a runtime.
+    result catch |err| {
+        std.Io.File.stderr().writeStreamingAll(init.io, "nexis: runtime error: ") catch {};
+        std.Io.File.stderr().writeStreamingAll(init.io, @errorName(err)) catch {};
+        std.Io.File.stderr().writeStreamingAll(init.io, "\n") catch {};
+        exitSynced(5);
+    };
 }
 
-fn runtimeThread(init: std.process.Init, result: *anyerror!void) void {
-    stack_guard.arm(runtime_stack_size - runtime_stack_margin);
+fn runtimeThread(init: std.process.Init, stack_size: usize, result: *anyerror!void) void {
+    stack_guard.arm(stack_size - runtime_stack_margin);
     result.* = runCommand(init);
 }
 
 fn runCommand(init: std.process.Init) !void {
     // Every heap block the VM allocates goes through this allocator.
     // A Debug build keeps the leak check but not the stack trace per
-    // allocation, which costs it three orders of magnitude on
-    // allocation-heavy programs; a release build uses the process's.
+    // allocation, which makes allocation-heavy programs about a hundred
+    // times slower (ZIG.md); a release build uses the process's.
     var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer if (builtin.optimize == .debug) {
         _ = safe.deinit();
@@ -108,6 +128,12 @@ fn runCommand(init: std.process.Init) !void {
         max_alloc = .{ .child = allocator, .max = max };
         allocator = max_alloc.allocator();
     }
+    if (init.environ_map.get("NEXIS_GC_STRESS")) |text| {
+        if (!eql(text, "1")) {
+            try std.Io.File.stderr().writeStreamingAll(io, "nexis: NEXIS_GC_STRESS is not 1\n");
+            std.process.exit(1);
+        }
+    }
     if (init.environ_map.get("NEXIS_DURABILITY")) |text| {
         if (db.Durability.parse(text) == null) {
             try std.Io.File.stderr().writeStreamingAll(io, "nexis: NEXIS_DURABILITY is not commit or durable\n");
@@ -122,19 +148,21 @@ fn runCommand(init: std.process.Init) !void {
         if (args.len < 3) usageExit(io);
         try runFile(io, allocator, args[2], args[3..]);
     } else if (eql(cmd, "repl")) {
+        if (args.len > 2) usageExit(io);
         try runRepl(io, allocator);
     } else if (eql(cmd, "test")) {
         if (args.len < 3) usageExit(io);
         try runTests(io, allocator, args[2..]);
     } else if (eql(cmd, "disasm") or eql(cmd, "--disasm")) {
-        if (args.len < 3) usageExit(io);
+        if (args.len != 3) usageExit(io);
         try disasmFile(io, allocator, args[2]);
     } else if (eql(cmd, "-e")) {
         if (args.len < 3) usageExit(io);
         try evalExpr(io, allocator, args[2], args[3..]);
     } else if (eql(cmd, "--help") or eql(cmd, "-h")) {
-        try std.Io.File.stdout().writeStreamingAll(io, Usage);
-    } else if (std.mem.endsWith(u8, cmd, ".nx") or eql(cmd, "-")) {
+        if (args.len > 2) usageExit(io);
+        try writeStdout(io, Usage);
+    } else if (std.mem.endsWith(u8, cmd, ".nx") or eql(cmd, "-") or isFile(io, cmd)) {
         try runFile(io, allocator, cmd, args[2..]);
     } else {
         try std.Io.File.stderr().writeStreamingAll(io, "nexis: unknown command '");
@@ -179,6 +207,23 @@ const MaxAlloc = struct {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// Whether `path` names a regular file: a script with no `.nx` suffix,
+/// run by its `#!` line.
+fn isFile(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .file;
+}
+
+/// Write `bytes` to stdout. A reader that closed the pipe has all it
+/// wants: the command ends there, quietly and successfully, as a
+/// Clojure program's does (TOOLING.md §1).
+fn writeStdout(io: std.Io, bytes: []const u8) !void {
+    std.Io.File.stdout().writeStreamingAll(io, bytes) catch |err| switch (err) {
+        error.BrokenPipe => exitSynced(0),
+        else => return err,
+    };
 }
 
 /// End the process with `status` where the runtime is not torn down
@@ -246,10 +291,8 @@ const Place = struct {
         const start = if (std.mem.findScalarLast(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
         const end = std.mem.findScalarPos(u8, all, at, '\n') orelse all.len;
         const text = std.mem.trimEnd(u8, all[start..end], "\r");
-        const offset = @min(at -| start, text.len);
-        var chars: usize = 0;
-        for (text[0..offset]) |c| chars += @intFromBool(c & 0xC0 != 0x80);
-        return .{ .line = 1 + std.mem.count(u8, all[0..at], "\n"), .col = 1 + chars, .text = text, .offset = offset };
+        const lc = info.lineCol(pos);
+        return .{ .line = lc.line, .col = lc.col, .text = text, .offset = @min(at -| start, text.len) };
     }
 };
 
@@ -278,9 +321,17 @@ const Runtime = struct {
         errdefer rt.host_macros.deinit(allocator);
         rt.loader = loader_mod.Loader.init(allocator, rt.v.runtime_arena.allocator(), io, load_paths, &rt.v, interner, registry, &rt.host_macros);
         errdefer rt.loader.deinit();
-        // A failure here is a bug in an embedded source, not in the
+        // Memory that runs out is reported as at any other time; any
+        // other failure is a bug in an embedded source, not in the
         // user's program: no half-booted runtime is worth running.
         stdlib.boot(&rt.loader) catch |err| {
+            const traced = if (rt.v.traced_error) |t| t == error.OutOfMemory else false;
+            if (err == error.OutOfMemory or traced) {
+                rt.v.error_detail = "";
+                rt.v.error_trace.clearRetainingCapacity();
+                rt.reportRuntimeError(vm.VmError.OutOfMemory) catch {};
+                std.process.exit(5);
+            }
             const d = rt.loader.diagnostic;
             std.debug.panic("nexis: stdlib bootstrap failed: {s} {s}", .{ @errorName(err), if (d) |x| x.label else "" });
         };
@@ -318,6 +369,9 @@ const Runtime = struct {
     /// Report what `evalSource` failed with; the exit status it
     /// carries.
     fn report(rt: *Runtime, err: loader_mod.EvalError) !u8 {
+        // An error no handler takes skips `with-out-str`'s cleanup;
+        // what the REPL prints next must not land in its buffer.
+        stdlib.discardOutCaptures();
         switch (err) {
             error.Diagnosed => {
                 const d = rt.loader.diagnostic.?;
@@ -379,10 +433,10 @@ const Runtime = struct {
         var stderr = std.Io.File.stderr().writerStreaming(rt.io, &buf);
         const w = &stderr.interface;
         for (trace) |frame| {
-            // The marker the VM leaves where it cut a deep chain
-            // (`<N frames elided>`) is no frame to be "at".
-            if (frame.source == null and std.mem.endsWith(u8, frame.name, " frames elided>")) {
-                try w.print("  {s}\n", .{frame.name});
+            // The marker the VM leaves where it cut a deep chain is
+            // no frame to be "at".
+            if (frame.elided > 0) {
+                try w.print("  <{d} frames elided>\n", .{frame.elided});
             } else if (frame.source) |src| {
                 if (frame.span) |span| {
                     const at = Place.of(src, span.pos);
@@ -402,7 +456,7 @@ const Runtime = struct {
             error.WriteFailed => return error.OutOfMemory,
         };
         try out.writer.writeAll("\n");
-        try std.Io.File.stdout().writeStreamingAll(rt.io, out.written());
+        try writeStdout(rt.io, out.written());
     }
 };
 
@@ -476,24 +530,34 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
     _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
 }
 
-/// `nexis test FILE...`: run each file, then `run-all-tests`; exit 1
-/// when an assertion failed or a test threw.
+/// `nexis test FILE...`: read every file, then run each and
+/// `run-all-tests`; exit 1 when an assertion failed or a test threw. A
+/// file that cannot be read stops the command before any runs.
+/// `require` searches the working directory and each file's own.
 fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8) !void {
-    const load_paths = loadPathsFor(paths[0]);
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    for (paths) |path| {
-        const text = readProgram(io, arena.allocator(), path);
-        const info = try arena.allocator().create(vm.SourceInfo);
-        info.* = .{ .path = path, .text = text };
+    const infos = try arena.allocator().alloc(vm.SourceInfo, paths.len);
+    var load_paths: std.ArrayList([]const u8) = .empty;
+    try load_paths.append(arena.allocator(), ".");
+    for (paths, infos) |path, *info| {
+        info.* = .{ .path = if (eql(path, "-")) "<stdin>" else path, .text = readProgram(io, arena.allocator(), path) };
+        const dir = loadPathsFor(path)[1];
+        for (load_paths.items) |p| {
+            if (eql(p, dir)) break;
+        } else try load_paths.append(arena.allocator(), dir);
+    }
+    var rt: Runtime = undefined;
+    try rt.init(io, allocator, load_paths.items);
+    defer rt.deinit();
+    for (infos) |*info| {
         const saved = rt.registry.current;
         _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
         rt.registry.current = saved;
     }
-    const info = vm.SourceInfo{ .path = "<test>", .text = "(let [r (nexis.test/run-all-tests)] (+ (get r :fail) (get r :error)))" };
+    // Every name qualified: a test file may define its own `get` or `+`
+    // in the namespace this runs in.
+    const info = vm.SourceInfo{ .path = "<test>", .text = "(nexis.core/let [r (nexis.test/run-all-tests)] (nexis.core/+ (nexis.core/get r :fail) (nexis.core/get r :error)))" };
     const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
     if (!bad.isFixnum() or bad.asFixnum() != 0) exitSynced(1);
 }
@@ -528,7 +592,7 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     var each = Disasm{ .rt = &rt, .out = &out.writer };
     const info = vm.SourceInfo{ .path = path, .text = text };
     _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| exitSynced(try rt.report(err));
-    try std.Io.File.stdout().writeStreamingAll(io, out.written());
+    try writeStdout(io, out.written());
 }
 
 /// The interactive loop: read lines until they hold complete forms,
@@ -536,7 +600,6 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
 /// `*1` (the previous ones to `*2` and `*3`); an error is printed,
 /// bound to `*e`, and the loop continues. `:quit`, `:q` or EOF exits.
 fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
-    const stdout = std.Io.File.stdout();
     const load_paths = [_][]const u8{"."};
     var rt: Runtime = undefined;
     try rt.init(io, allocator, &load_paths);
@@ -544,7 +607,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const nil = value_mod.nilValue();
     for ([_][]const u8{ "*1", "*2", "*3", "*e" }) |name| try rt.setCoreVar(name, nil);
 
-    try stdout.writeStreamingAll(io,
+    try writeStdout(io,
         \\nexis repl
         \\Type `:quit` or hit Ctrl-D to exit.
         \\
@@ -572,13 +635,13 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     while (true) {
         const ns = rt.registry.current.name;
         if (pending.items.len == 0) {
-            try stdout.writeStreamingAll(io, ns);
-            try stdout.writeStreamingAll(io, "=> ");
+            try writeStdout(io, ns);
+            try writeStdout(io, "=> ");
         } else {
             // `#_=> `, right-aligned under `ns=> `.
             var pad: [64]u8 = @splat(' ');
-            try stdout.writeStreamingAll(io, pad[0..@min(ns.len -| 2, pad.len)]);
-            try stdout.writeStreamingAll(io, "#_=> ");
+            try writeStdout(io, pad[0..@min(ns.len -| 2, pad.len)]);
+            try writeStdout(io, "#_=> ");
         }
         // A wait of any length: no held read may pin pages meanwhile.
         db.StoreFile.dropAllHeld();
@@ -588,7 +651,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             try std.Io.File.stderr().writeStreamingAll(io, "\n");
             return;
         } orelse {
-            try stdout.writeStreamingAll(io, "\n");
+            try writeStdout(io, "\n");
             return;
         };
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
@@ -664,21 +727,66 @@ const Balance = struct {
 };
 
 /// The keyword a caught runtime error would be (`DivideByZero` is
-/// `:divide-by-zero`), for `*e`.
+/// `:divide-by-zero`), for `*e`; one no `catch` sees is named the same
+/// way (`:out-of-memory`).
 fn errorKeyword(rt: *Runtime) Value {
     const err = rt.v.traced_error orelse return value_mod.nilValue();
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (@errorName(err), 0..) |c, i| {
-        if (n + 2 > buf.len) break;
-        if (std.ascii.isUpper(c)) {
-            if (i > 0) {
-                buf[n] = '-';
-                n += 1;
-            }
-            buf[n] = std.ascii.toLower(c);
-        } else buf[n] = c;
-        n += 1;
+    const name = vm.vmErrorToKeywordName(err) orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
+    return rt.v.ensureInterner().internKeywordValue(name) catch value_mod.nilValue();
+}
+
+// =============================================================================
+// Inline tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "cli: Balance: brackets count outside strings, comments and character literals" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "(+ 1 2)", true },
+        .{ "(str \"(\"", false },
+        .{ "\"a\\\"b\"", true },
+        .{ "\"open", false },
+        .{ "[\\( \\) \\\"]", true },
+        .{ "(a ; ) closes nothing\n", false },
+        .{ "; a \" in a comment\n(a)", true },
+        .{ ")", true },
+        .{ "(a))", true },
+    };
+    for (cases) |case| {
+        var balance: Balance = .{};
+        balance.scan(case[0]);
+        try testing.expectEqual(case[1], balance.complete());
     }
-    return rt.v.ensureInterner().internKeywordValue(buf[0..n]) catch value_mod.nilValue();
+}
+
+test "cli: Balance: a form scanned a line at a time" {
+    var balance: Balance = .{};
+    balance.scan("(defn f [x]\n");
+    try testing.expect(!balance.complete());
+    balance.scan("  \"[\" (* 2 x))\n");
+    try testing.expect(balance.complete());
+}
+
+test "cli: Place: the line, the column in code points with a tab as one, past a byte-order mark" {
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(a)\n\t\u{e9} (b)\r\nz" };
+    const first = Place.of(&info, 3);
+    try testing.expectEqual(@as(usize, 1), first.line);
+    try testing.expectEqual(@as(usize, 1), first.col);
+    try testing.expectEqualStrings("(a)", first.text);
+    try testing.expectEqual(@as(usize, 0), first.offset);
+    const second = Place.of(&info, 11);
+    try testing.expectEqual(@as(usize, 2), second.line);
+    try testing.expectEqual(@as(usize, 4), second.col);
+    try testing.expectEqualStrings("\t\u{e9} (b)", second.text);
+    try testing.expectEqual(@as(usize, 4), second.offset);
+    const past = Place.of(&info, 1000);
+    try testing.expectEqual(@as(usize, 3), past.line);
+    try testing.expectEqualStrings("z", past.text);
+}
+
+test "cli: width: one column per code point, a tab's width for a tab" {
+    try testing.expectEqual(@as(usize, 0), width(""));
+    try testing.expectEqual(@as(usize, 1 + tab.len + 1), width("\u{e9}\tx"));
+    try testing.expectEqual(@as(usize, 2), width("\u{1F600}!"));
 }

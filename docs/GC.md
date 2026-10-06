@@ -17,8 +17,8 @@ barrier and no finalizer on a block (§9); the one resource the
 collector ends is a db transaction the program dropped (§5).
 
 A VM over a borrowed heap (the sub-VMs the expander runs macros on,
-which allocate on the heap of the VM whose Vars they use) never
-collects: it cannot enumerate the owner's roots. The collector also
+which allocate on the heap, and use the registries, of the VM whose
+Vars they use, `docs/VM.md` §9.1) never collects: it cannot enumerate the owner's roots. The collector also
 runs over a bare heap with explicit roots and no host in the tests
 (§10).
 
@@ -57,7 +57,7 @@ A heap block that points into storage the collector does not own
 ### 3. Roots
 
 A root is a block or Value the collector starts marking from; anything
-not reachable from one and not pinned is freed. There are two sources:
+not reachable from one is freed. There are two sources:
 the `roots` slice `collect` takes (the tests' fixtures) and the host's
 `Host.roots` callback, which the VM implements as `VM.gcRoots`. The
 VM's roots, in the order it marks them:
@@ -84,8 +84,9 @@ VM's roots, in the order it marks them:
    `thread_value`, covered by 3.
 5. **The root stack** (`vm.roots`): what `callValue` and natives push
    under the rooting rule (§11.5).
-6. **Pending `finally` throws** (`vm.finally_stack`), **the unhandled
-   throw** and **the halt result** (`vm.result`).
+6. **Pending `finally` throws** (`vm.finally_stack`), **the values of
+   throw origins** handlers still hold (`vm.origins`, `docs/VM.md` §12),
+   **the unhandled throw** and **the halt result** (`vm.result`).
 7. **The protocol registry**: every method implementation and default.
 8. **The Nextomic query caches**: the query value of every entry in the
    per-VM parse and rule caches, through the hook the Nextomic natives
@@ -96,11 +97,6 @@ The interner holds no heap values (keywords and symbols are
 immediates). Open db and Nextomic connections hold none either; a
 durable ref, a transaction handle or a Nextomic db-value or entity is
 reachable from wherever the program keeps it.
-
-**Pinned is not a root.** A pinned block (`HeapHeader.isPinned`)
-survives every sweep whether or not it is reachable. The heap provides
-the bit and `sweepUnmarked` honours it; no runtime module pins a
-block, only tests do.
 
 ---
 
@@ -131,22 +127,25 @@ native frames, and a wide structure queues only what lies past them:
 a vector of a million small maps, alone or inside a transient, an
 atom or a record, queues none of the maps. A kind's trace walks its
 own interior nodes in place with `markInternal`, which is bounded: a
-vector trie is at most seven levels deep, a CHAMP tree thirteen, and
+vector trie is at most seven levels deep, a CHAMP tree seven interior
+levels and a collision node, and
 a list's tail chain is walked in a loop. `collect` marks one root at a
 time and drains after each, so the worklist holds what one root
 reaches, never every root's children at once (the root stack of a
 native that keeps its values there, §11.5). If `gray` cannot grow,
 the header stays marked but untraced and the cycle is abandoned:
 `collect` clears every mark bit and frees nothing, and the allocation
-that next fails ends the program with the VM's `OutOfMemory`. The VM keeps `gray` between cycles
+that next fails raises the VM's `OutOfMemory`, a runtime error like
+any other (`docs/TOOLING.md` §1). The VM keeps `gray` between cycles
 (`VM.gc_gray`), so a cycle reuses the capacity the last one grew.
 
 ---
 
 ### 5. Per-kind trace contract
 
-Each heap kind's module exports `trace(h, visitor)` (CHAMP, which hosts
-two kinds, exports `traceMap` and `traceSet`). The visitor is
+Each heap kind whose blocks hold heap values has its module export
+`trace(h, visitor)` (CHAMP, which hosts two kinds, exports `traceMap`
+and `traceSet`); a leaf kind has none. The visitor is
 duck-typed: `markValue`, `mark`, `markInternal`, which `gc.Collector`
 provides. The rules:
 
@@ -157,29 +156,23 @@ provides. The rules:
    node's payload only when the call returns true. Interior nodes are
    ordinary blocks for the sweep; "internal" only means they are
    reached through their owner's trace, not through the kind switch.
-5. **A leaf kind's trace does nothing**, and is still exported.
 
 The dispatch in `Collector.trace`:
 
 | Kind | Trace | Walks |
 |---|---|---|
-| `string`, `bignum` | `string.trace`, `bignum.trace` | nothing (bytes, limbs) |
+| `string`, `bignum`, `typed_vector`, `durable_ref`, `protocol`, `protocol_fn`, `nextomic_conn`, `nextomic_db` | none: the leaves | nothing: bytes, limbs, unboxed elements, inline store id, tree and key (a durable ref's advisory connection pointer is not a heap block, `docs/DB.md` §7.3), ids, or a VM-owned pointer with inline text and numbers |
 | `list` | `list.trace` | subkind 0 (cons): every head, and the tail chain in a loop (cells through `markInternal`, a cell's meta through `mark`); subkind 1 (empty): nothing; subkind 2 (vector view): its vector, through `markValue`, also when the view ends a cons chain |
 | `persistent_vector` | `vector.trace` | the tail node, every slot of its block (vectors sharing a tail use different lengths of it, `docs/VECTOR.md` §2), and the trie, interior and leaf nodes through `markInternal` |
 | `persistent_map`, `persistent_set` | `champ.traceMap`, `champ.traceSet` | the array-form entries, or the CHAMP trie with interior and collision nodes through `markInternal` |
 | `sorted_map`, `sorted_set` | `sorted.trace` | the comparator, then every tree node through `markInternal` and its key and value through `markValue`, recursing to the tree's height (`docs/SORTED.md` §2) |
-| `typed_vector` | `typed_vector.trace` | nothing (unboxed elements) |
 | `transient` | `transient.trace` | the wrapped collection (`docs/TRANSIENT.md` §10) |
-| `durable_ref` | `db.trace` | nothing: store id, tree and key are inline bytes, and the advisory connection pointer is not a heap block (`docs/DB.md` §7.3) |
 | `atom` | `atom.trace` | the contained value (`docs/ATOM.md` §7) |
 | `record` | `record.trace` | the field map |
-| `protocol`, `protocol_fn` | `protocol.trace` | nothing |
-| `nextomic_conn`, `nextomic_db` | none | nothing: a VM-owned pointer plus inline text and numbers |
 | `nextomic_entity` | `nextomic_handle.traceEntity` | the db-value box and the map of the entity's last full read |
-| `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, recursively through nested routines (`docs/VM.md` §6) |
+| `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |
-| `byte_vector`, `error_`, `meta_symbol` | panic | reserved, never allocated |
-| `var_` | panic | not a block: its payload is an arena `*Var` |
+| anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `error_`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
 
 **Transaction handles.** A `db_write_txn` or `db_read_txn` Value
 points at a `db.Handle`, which is not a block but holds an emdb
@@ -226,7 +219,7 @@ collect(roots):
                                         // in place, four levels deep
     empty gray, keeping its capacity
     db.sweepHandles(heap, !overflowed)  // ends unreached transactions
-    freed = heap.sweepUnmarked()        // frees unmarked, unpinned blocks;
+    freed = heap.sweepUnmarked()        // frees unmarked blocks;
                                         // clears the mark on survivors
                                         // (or, if gray could not grow:
                                         // clear every mark, free nothing)
@@ -253,10 +246,14 @@ never due.
 **Safe point.** The VM tests `gcDue` in two places. The first is
 before fetching an instruction in its one run loop (`VM.loop`, which
 `run`, `callValue` and `runRoutine` drive), at a loop's first fetch
-and at every fetch after an instruction of a group that can allocate
-(`math`, `call`, `closure`, `coll`, `ctrl`); after `mov`, `cmp`, `jump`
-or `var`, and after a `call` of a keyword or symbol looking itself up
-in a map, a record or nil (`docs/VM.md` §8), the counter cannot have
+and at every fetch after an instruction that could have allocated:
+`math` through the numeric tower (not a fixnum result computed
+inline), a `call:call` that ran a native, a protocol fn or a lookup
+other than the in-place keyword lookup of `docs/VM.md` §8, or entered
+a closure through the general entry of `docs/VM.md` §6 (not the
+direct one), and every `closure` instruction but `get-cell`, and
+every `coll` and `ctrl` instruction. After `mov`, `cmp`, `jump`,
+`var`, `call:return` or `call:return-nil` the counter cannot have
 moved. Between two instructions every
 live value is in one of the roots §3 lists, so a cycle there frees
 nothing live. The second is `callValue` of anything but a closure (a
@@ -265,9 +262,10 @@ stack: a native that calls natives in a loop (`(reduce conj #{} xs)`)
 reaches no closure frame, and without it would run to its end without
 collecting. A native keeps what it holds across `callValue` on its
 root scope already (§11.5), so a cycle there frees nothing live
-either; a leaf native (`docs/VM.md` §6) is called without it, and so
-is a keyword or symbol a `Callback` looks up in a map, a record or nil
-(neither allocates). A `Callback`'s call of a closure reaches the
+either. A leaf native (`docs/VM.md` §6) skips it while no cycle is
+due and takes it once one is, so `(reduce * xs)` collects as it goes;
+a keyword or symbol a `Callback` looks up in a map, a record or nil
+skips it (the lookup does not allocate). A `Callback`'s call of a closure reaches the
 loop's entry, the first safe point, as `callValue`'s does.
 `Heap.alloc` never collects: the compiler, a native and one instruction
 (a rest list, a closure and its cells) allocate as many blocks as they
@@ -319,10 +317,10 @@ already marked, so the walk stops there.
 
 The inline tests in `src/gc.zig` cover the primitives and small graphs
 of every traced kind (roots, nesting, CHAMP and vector interior nodes,
-atoms, pins, idempotence, metadata). `test/prop/gc.zig` G1–G6b drive
+atoms, idempotence, metadata). `test/prop/gc.zig` G1–G6b drive
 randomized graphs against a reachability model, a half-million-cell
 list (G3b) and a 300,000-level chain of vectors, maps, atoms and meta
-maps (G3c) through a cycle, pins (G4), repeated cycles without leaks
+maps (G3c) through a cycle, repeated cycles without leaks
 (G5), and programs that allocate on every step of a loop on a VM under
 `GcPolicy.stress` (G6, G6b). `test/prop/heap.zig` H2, H3 and H6 test
 the sweep primitive with hand-set marks, and `test/prop/transient.zig`

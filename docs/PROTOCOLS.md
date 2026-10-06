@@ -81,8 +81,8 @@ a `fields` Value.
 **Equality and hash**: `docs/SEMANTICS.md` §3.3. The record-specific
 rule: two records are `=` when their `type_id`s are equal and their
 field maps are `=`; a record is never `=` to a map. The hash is
-`xxh3(type_id as u32 LE ++ field-map hash as u64 LE)` truncated to
-32 bits, then mixed with kind domain 35 by `dispatch.hashValue`, and
+`combineOrdered(hashU64(type_id), field-map hash)` (`hash.zig`)
+truncated to 32 bits, then mixed with kind domain 35 by `dispatch.hashValue`, and
 cached in the header. Records work as map keys and set members.
 
 **Metadata** (`docs/SEMANTICS.md` §7): a record carries it in its
@@ -125,7 +125,9 @@ method.
 ### 3. VM-side registries
 
 The VM owns two registries, freed by `VM.deinit`; the names in them
-are duped on registration.
+are duped on registration. A macro's sub-VM has none of its own: it
+uses those of the VM it compiles for (`VM.home`, `docs/VM.md` §9.1),
+so a type or protocol id means the same on both.
 
 | Registry | Entry | Holds |
 |---|---|---|
@@ -133,7 +135,10 @@ are duped on registration.
 | `VM.protocol_registry` | `ProtocolEntry` | `id`, `ns_name`, `name`, and `methods`: per method its keyword id, its name (for errors), an `impls` map from `DispatchKey` to a callable, and an optional `default_impl` |
 
 `VM.ensureReducedType` registers one built-in record type,
-`nexis.core/Reduced` with field `:val`, the first time `reduced` runs.
+`nexis.core/Reduced` with field `:val`, the first time `reduced` runs;
+the first `delay` registers `nexis.core/Delay` with field `:state`.
+`VM.recordType(id)` is the entry of a type id, null for one no
+`defrecord` registered.
 
 #### 3.1 Lifetime + redefinition
 
@@ -182,8 +187,9 @@ qualified by the current namespace (`"<ns>/Name"`).
 
 A docstring and `:option value` pairs before the methods are accepted
 and ignored. Each method spec must be a non-empty list headed by an
-unqualified symbol; its parameter vectors (and anything after them)
-are ignored. A method's arities are its impl's own: the registry
+unqualified symbol; its parameter vectors become the method Var's
+`:arglists` and a docstring among them its `:doc`, as in Clojure,
+and dispatch ignores them. A method's arities are its impl's own: the registry
 records none, and whichever impl the dispatcher calls picks the arity
 by the argument count or raises `:arity-mismatch` (§4.2).
 
@@ -244,17 +250,22 @@ swapped, so a method's arities take either spelling of §4.2:
 | Type form | Emits | Dispatch key |
 |---|---|---|
 | keyword naming a `Kind` tag (`:nil`, `:false_`, `:true_`, `:char`, `:fixnum`, `:float`, `:keyword`, `:symbol`, `:string`, `:bignum`, `:list`, `:function`, `:native_fn`, `:atom`, `:record`, ...) | `#%extend-builtin-impl` | `{builtin, kind}`; `:fixnum` and `:bignum` are one key (§3.2) |
-| `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases for `:persistent_vector` / `:persistent_map` / `:persistent_set` |
+| `:boolean` / `:vector` / `:map` / `:set` | `#%extend-builtin-impl` | aliases, each installed on every kind Clojure's type covers: `:true_` and `:false_` (what `class` returns for a boolean); `:persistent_vector`; `:persistent_map` and `:sorted_map`; `:persistent_set` and `:sorted_set` |
 | `:any` | `#%extend-default-impl` | the method's `default_impl` |
-| record symbol `Counter` | `#%extend-record-impl` with `Counter-type-id` | `{record, type_id}` |
+| `nil` | `#%extend-builtin-impl` with `:nil` | `{builtin, nil}` |
+| a Clojure class name, bare or under `java.lang.`, `java.util.` or `clojure.lang.`: `Object` (`:any`), `String`, `Long`/`Integer`/`BigInt` (`:fixnum`), `Double` (`:float`), `Number` (both), `Boolean` (`:true_` and `:false_`), `Character`, `Keyword`, `Symbol`, `IPersistentVector`, `IPersistentMap`/`Map` (`:map` and `:sorted_map`), `IPersistentSet`/`Set`, `ISeq`/`IPersistentList` (`:list`), `IFn` (`:function` and `:native_fn`), `Atom`, `Var` | the impl for each kind it stands for, so code written for Clojure extends the same values | as for the keywords |
+| record symbol `Counter`, `alias/Counter`, a referred `Counter`, or its type symbol `ns.Counter` | `#%extend-record-impl` with `Counter-type-id` in the record's namespace | `{record, type_id}` |
 
 The keyword-to-kind mapping is derived from the `Kind` enum's field
 names at compile time, so every kind tag is accepted under its enum
-name (booleans are `:false_` and `:true_`; there is no `:bool`). A
+name (`:false_` and `:true_` name one boolean each). A
 keyword that names no kind and no alias raises `:invalid-argument`
 when the expansion runs; the macro does not validate type names. A
 record symbol no `defrecord` produced fails as an unbound
-`<Name>-type-id`.
+`<Name>-type-id`, and a dotted name whose prefix is no namespace (a
+Java class nexis does not have) at expansion. A `defrecord` method
+group headed `Object` (`toString`, `equals`, `hashCode`) is refused:
+nexis has no classes.
 
 #### 4.4 `satisfies?`
 
@@ -349,7 +360,7 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | Native | Arity | Returns |
 |---|---|---|
 | `#%register-record-type "ns/Name" [:f ...]` | 2 | fixnum type id |
-| `#%make-record type-id field-map` | 2 | record |
+| `#%make-record type-id m` | 2 | record whose fields are the entries of `m`: a hash or sorted map, a record (its fields) or nil (none), so `map->Counter` takes any map, as Clojure's does |
 | `#%record? x` | 1 | boolean |
 | `#%record-type-id rec` | 1 | fixnum |
 | `#%register-protocol "ns/IFoo" [:m ...]` | 2 | protocol |
@@ -357,6 +368,11 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | `#%extend-record-impl IFoo :m type-id f` | 4 | nil |
 | `#%extend-builtin-impl IFoo :m :kind f` | 4 | nil |
 | `#%extend-default-impl IFoo :m f` | 3 | nil |
+
+The natives are reachable by their qualified names (`docs/FORMS.md`
+§8), so each validates its arguments: a type id that is not an
+integer is `:kind-mismatch`, one no `defrecord` registered
+`:invalid-argument`.
 
 `#%register-record-type` and `#%register-protocol` split the name on
 its last `/` into namespace and name; a name with no `/` has an empty
@@ -367,7 +383,6 @@ namespace.
 ### 8. Absences
 
 - No `Counter.` constructor syntax; `->Counter` is the constructor.
-- `defrecord` does not bind the type name (§0).
 - No default impl inside `defprotocol`; defaults are installed with
   `extend-protocol ... :any`.
 - No arity check at the protocol fn: the impl checks its own (§4.1).

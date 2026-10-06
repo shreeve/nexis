@@ -107,15 +107,7 @@ pub fn withFields(heap: *Heap, v: Value, new_fields: Value) !Value {
 pub fn hashHeader(h: *HeapHeader, fieldHash: *const fn (v: Value) u64) u32 {
     if (h.cachedHash()) |cached| return cached;
     const body = Heap.bodyOf(RecordBody, h);
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    var id_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &id_bytes, body.type_id, .little);
-    hasher.update(&id_bytes);
-    const fh = fieldHash(body.fields);
-    var fh_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &fh_bytes, fh, .little);
-    hasher.update(&fh_bytes);
-    const truncated: u32 = @truncate(hasher.final());
+    const truncated: u32 = @truncate(hash_mod.combineOrdered(hash_mod.hashU64(body.type_id), fieldHash(body.fields)));
     if (truncated != 0) h.setCachedHash(truncated);
     return truncated;
 }

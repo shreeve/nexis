@@ -4,7 +4,8 @@
 //! `(q query & inputs)` runs `query.q` and returns the materialised
 //! result; `(explain query & inputs)` returns the plan as a string.
 //! The inputs follow `:in` positionally (`[$]` when the query has no
-//! `:in`): a db value for each source, the rules for `%`, and values
+//! `:in`): a db value or a collection of tuples for each source, the
+//! rules for `%`, and values
 //! for `?x`, `[?x ...]`, `[?a ?b]` and `[[?a ?b]]`. The arg-map form
 //! `(q {:query query :args [inputs...]})` is the same call.
 //!
@@ -15,12 +16,13 @@
 //! the parse a running query uses, so a nested `q` in a callback can
 //! neither free nor replace it (NEXTOMIC.md §5 "Parse").
 //!
-//! Rooting: a value a user function returns to the pipeline may end up
-//! in a relation cell that the next call back into the VM must not see
-//! collected, so the hook pushes every result on a root scope that
-//! lives as long as the `q` call (GC.md §11.5); `root` pushes the heap
-//! values the pipeline builds itself (a `tuple` bound as one value, an
-//! aggregate's vector or set) the same way.
+//! Rooting: a value the pipeline keeps in a relation cell or a group
+//! (a function's result it binds, a custom aggregate's result, a
+//! `tuple` bound as one value, an aggregate's vector or set) must
+//! survive the next call back into the VM, so `root` pushes it on a
+//! root scope that lives as long as the `q` call (GC.md §11.5). An
+//! immediate needs no root and is not pushed, nor is a predicate's
+//! result, which is tested and dropped.
 //!
 //! Functions: a predicate or function-binding symbol that is not a
 //! built-in resolves through the namespace registry the way the
@@ -88,7 +90,7 @@ const native_explain = NativeFn{ .name = "nextomic/explain", .min_arity = 1, .ma
 
 const Hook = struct {
     vm: *VM,
-    /// Roots every result a callback returns for the query's life.
+    /// Roots every value the pipeline keeps, for the query's life.
     scope: vm_mod.RootScope,
 
     fn init(vm: *VM) Hook {
@@ -105,15 +107,12 @@ const Hook = struct {
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
-        const callee = try self.resolve(sym);
-        const result = try self.vm.callValue(callee, args);
-        try self.scope.push(result);
-        return result;
+        return self.vm.callValue(try self.resolve(sym), args);
     }
 
     fn root(ctx: *anyopaque, v: Value) anyerror!void {
         const self: *Hook = @ptrCast(@alignCast(ctx));
-        try self.scope.push(v);
+        if (v.kind().isHeap()) try self.scope.push(v);
     }
 
     /// Apply the value a variable in function position holds: a
@@ -122,9 +121,7 @@ const Hook = struct {
     fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
         if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookupIn(self.vm, f, args);
-        const result = try self.vm.callValue(f, args);
-        try self.scope.push(result);
-        return result;
+        return self.vm.callValue(f, args);
     }
 
     /// The bound value the symbol names, or a thrown
@@ -148,7 +145,7 @@ pub fn lookup(vm: *VM, sym: u32) !?Value {
     const current = registry.current;
     const found: ?*Var = blk: {
         if (splitQualified(name)) |q| {
-            const ns_name = if (current.aliases_initialized) current.lookupAlias(q.ns) orelse q.ns else q.ns;
+            const ns_name = current.lookupAlias(q.ns) orelse q.ns;
             const ns = registry.lookupNs(ns_name) orelse break :blk null;
             break :blk ns.lookupLocal(q.name);
         }

@@ -23,21 +23,38 @@
 {:error :nextomic/tx-data, :message a keyword the store holds is at most 4077 bytes long}
 nil
 :db/open-failed
-{:error :nextomic/tx-data, :message a tempid used only as a value, or not at all, names no entity}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
 {:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
 ok a failed transaction leaves the basis alone
 ok the store still works after every failure
 {:error :nextomic/conflict, :e 27, :a :db/ident}
+{:error :nextomic/conflict, :e 26, :a :db/ident}
+ok a conflicting rename leaves the attribute its name
 ok an aborted rename is not cached
 ok the attribute keeps its old name
 :nextomic/value-type
+#{[{:db/id 4294967298, :x/old 1}]}
+ok a rename inside a query leaves the old name unknown
+{:error :nextomic/unknown-attribute, :attr :x/old}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :x/a}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 ok a refused ident retraction leaves every name resolving
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute}
+:nextomic/value-type
+:nextomic/no-entity
+{:error :nextomic/tx-data, :message :db.fn/cas never renames; assert the new :db/ident}
+{:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/_secret}
+{:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/a}
+ok an enum ident may start with _
 {:error :nextomic/cas, :attr :x/role, :expected :role/never, :actual :role/admin}
 ok a cas mints no ident for its old value
 :nextomic/closed

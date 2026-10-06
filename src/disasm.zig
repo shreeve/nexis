@@ -234,11 +234,14 @@ fn writeConst(index: u32, routine: *const vm.Routine, interner: ?*const intern_m
 
 fn writeVar(index: u32, routine: *const vm.Routine, writer: *Writer) Writer.Error!void {
     try writer.print("v{d}", .{index});
-    if (index < routine.var_table.len) try writer.print("={s}", .{routine.var_table[index].name});
+    if (index >= routine.var_table.len) return;
+    // Qualified, so two namespaces' Vars of one name read apart.
+    const v = routine.var_table[index];
+    if (v.ns.len > 0) try writer.print("={s}/{s}", .{ v.ns, v.name }) else try writer.print("={s}", .{v.name});
 }
 
 /// One operand: its kind letter and index, then what the index
-/// names when the routine can say (`c0=42`, `v1=inc`); `-` for an
+/// names when the routine can say (`c0=42`, `v1=nexis.core/inc`); `-` for an
 /// unused operand, `#n` for a raw immediate.
 fn writeOperand(op: vm.Operand, routine: *const vm.Routine, interner: ?*const intern_mod.Interner, immediate: bool, writer: *Writer) Writer.Error!void {
     if (immediate) {

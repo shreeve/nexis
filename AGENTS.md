@@ -45,13 +45,15 @@ changes to emdb.
 
 | Step | What it runs |
 |---|---|
-| `zig build install` | `bin/nexis` and `bin/nexis-golden` |
+| `zig build install` | `bin/nexis` in the checkout; `--prefix DIR` installs `DIR/bin/nexis` instead and leaves the checkout's alone |
+| `zig build nexis` | `bin/nexis` alone, as `install` does |
+| `zig build run -- ARGS` | builds `bin/nexis` and runs it with ARGS, in the caller's environment |
 | `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish` and `numbers` integration tests |
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
-| `zig build golden` | the reader goldens and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 171 steps (169 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
+| `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
+| `zig build test --summary all` | the gate, 197 steps (195 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
@@ -73,7 +75,9 @@ changes to emdb.
   syncs (`docs/DB.md` §3.3; `commit`, no sync, when unset);
   `zig build test -Ddurability=durable` runs the gate with every
   commit synced. The build never reads its own environment: these
-  options set the variables on each run, as part of its cache key.
+  options set the variables on each run, as part of its cache key,
+  and every cached run starts from an empty environment, so a
+  variable exported in the shell never reaches a test.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
 

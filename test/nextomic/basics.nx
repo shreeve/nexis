@@ -73,6 +73,13 @@
        (= "a portrait" (:db/doc (get (d/schema (d/db c)) :person/photo)) (:db/doc (d/entity (d/db c) :person/photo))))
 (t/check "the doc is absent from the view before it" (nil? (:db/doc (get (d/schema (:db-before r1)) :person/photo))))
 (def ann (get (:tempids r1) "ann"))
+; A uuid's text is canonical, lower-case: upper-case hex is the wrong
+; type in tx-data and matches nothing as a query constant or input.
+(println (t/caught (d/transact! c [[:db/add ann :person/uuid "0123ABCD-4567-89EF-0123-456789ABCDEF"]])))
+(t/check "an upper-case uuid matches nothing"
+       (and (empty? (d/q '[:find ?e :where [?e :person/uuid "0123ABCD-4567-89EF-0123-456789ABCDEF"]] (d/db c)))
+            (empty? (d/q '[:find ?e :in $ ?u :where [?e :person/uuid ?u]] (d/db c) "0123ABCD-4567-89EF-0123-456789ABCDEF"))
+            (= #{[ann]} (d/q '[:find ?e :in $ ?u :where [?e :person/uuid ?u]] (d/db c) "0123abcd-4567-89ef-0123-456789abcdef"))))
 (def bob (get (:tempids r1) "bob"))
 (println (d/entity (d/db c) ann))
 (println (d/touch (d/entity (d/db c) ann)))

@@ -1,5 +1,5 @@
 routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
-  0000  var:load-var        s1  v0=println  ; 4:2
+  0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
   0001  mov:load-const      s3  c0=0  ; 5:13
   0002  mov:load-const      s4  c0=0  ; 5:19
   0003  cmp:lt              s5  s3  c1=10  ; 6:9

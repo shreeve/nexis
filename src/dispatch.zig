@@ -106,10 +106,11 @@ pub fn domainByte(k: Kind) u8 {
 // Native-stack overflows
 // =============================================================================
 
-var overflow_count: u64 = 0;
+/// Per thread, as the guard it counts the hits of (`stack.zig`).
+threadlocal var overflow_count: u64 = 0;
 
 /// How many times `equal`, `hashValue` or the printer ran out of
-/// native stack in this process. A caller that sees the count change
+/// native stack on this thread. A caller that sees the count change
 /// across a call knows the call's answer is meaningless and raises
 /// `:stack-overflow` instead.
 pub fn overflowCount() u64 {

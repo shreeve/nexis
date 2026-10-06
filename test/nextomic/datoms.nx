@@ -33,6 +33,7 @@
 (println (map (fn [[e a v tx added]] [v added]) (d/datoms (d/history db) :avet :item/qty nil nil (:tx r2) true)))
 (println (t/caught (d/datoms db :eavt bolt nil nil "tx")))
 (println (t/caught (d/datoms db :eavt bolt nil nil nil 1)))
+(println (t/caught (d/datoms db :eavt bolt nil nil -1)))
 
 ; --- index-range ----------------------------------------------------------
 

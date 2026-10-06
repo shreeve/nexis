@@ -33,4 +33,16 @@
   (d/sync c)
   (t/check "nested with-conn on another store"
          (= 1 (d/with-conn [c2 "with-conn-2.edb"] (d/basis-t (d/db c2))))))
+; A connect after a release may take the released connection's place:
+; the old handle and its db-values stay closed, and releasing the old
+; handle again leaves the new connection alone.
+(def old (d/connect "with-conn.edb"))
+(def old-db (d/db old))
+(d/release old)
+(d/with-conn [c "with-conn.edb"]
+  (t/check "the old handle stays closed" (= :nextomic/closed (t/caught (d/db old))))
+  (t/check "and its db-value" (= :nextomic/closed (t/caught (d/datoms old-db :aevt :note/text))))
+  (d/release old)
+  (t/check "releasing the old handle leaves the new connection open"
+         (= 1 (count (d/datoms (d/db c) :aevt :note/text)))))
 (println :with-conn-done)

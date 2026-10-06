@@ -14,7 +14,8 @@
 //!
 //! Surface: `fromI64Slice` / `fromF64Slice` / `count` / `elemType` /
 //! `i64Elems` / `f64Elems` / `nth` / `hashHeader` / `equalHeaders` /
-//! `trace` / `format`. There is no `conj`, `assoc` or `pop`: a typed
+//! `format`; a typed vector is a leaf the collector does not trace
+//! (GC.md §5). There is no `conj`, `assoc` or `pop`: a typed
 //! vector is built whole and read; every derived vector is a fresh
 //! allocation made by a kernel or a constructor. `u8` elements are
 //! the province of `Kind.byte_vector` (22), which has no
@@ -164,6 +165,23 @@ pub fn fromF64Slice(heap: *Heap, elems: []const f64) !Value {
     return valueFrom(h, .f64);
 }
 
+/// A typed vector of `elem` whose elements are `raw`, 8 little-endian
+/// bytes each (the codec's payload, CODEC.md §3), every NaN
+/// canonicalized.
+pub fn fromLeBytes(heap: *Heap, elem: ElemType, raw: []const u8) !Value {
+    std.debug.assert(raw.len % elem_size == 0);
+    const h = try alloc(heap, elem, raw.len / elem_size);
+    switch (elem) {
+        .i64 => for (i64Slice(h), 0..) |*slot, i| {
+            slot.* = std.mem.readInt(i64, raw[i * elem_size ..][0..elem_size], .little);
+        },
+        .f64 => for (f64Slice(h), 0..) |*slot, i| {
+            slot.* = hash_mod.canonicalizeFloat(@bitCast(std.mem.readInt(u64, raw[i * elem_size ..][0..elem_size], .little)));
+        },
+    }
+    return valueFrom(h, elem);
+}
+
 // =============================================================================
 // Public API — accessors
 // =============================================================================
@@ -280,17 +298,6 @@ pub fn equalHeaders(a: *HeapHeader, b: *HeapHeader) bool {
             return true;
         },
     }
-}
-
-// =============================================================================
-// GC trace (GC.md §5)
-// =============================================================================
-
-/// Typed vectors are leaf heap kinds: the body is unboxed numbers
-/// with no heap references. Exported for uniformity.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
 }
 
 // =============================================================================
@@ -483,26 +490,4 @@ test "ElemType.fromTag accepts only the implemented tags" {
     try testing.expectEqual(@as(?ElemType, null), ElemType.fromTag(0));
     try testing.expectEqual(@as(?ElemType, null), ElemType.fromTag(2));
     try testing.expectEqual(@as(?ElemType, null), ElemType.fromTag(4));
-}
-
-test "trace is a no-op: the visitor is never called" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromI64Slice(&heap, &.{ 1, 2 });
-    const Visitor = struct {
-        calls: usize = 0,
-        pub fn markValue(self: *@This(), _: Value) void {
-            self.calls += 1;
-        }
-        pub fn mark(self: *@This(), _: *HeapHeader) void {
-            self.calls += 1;
-        }
-        pub fn markInternal(self: *@This(), _: *HeapHeader) bool {
-            self.calls += 1;
-            return true;
-        }
-    };
-    var visitor: Visitor = .{};
-    trace(header(v), &visitor);
-    try testing.expectEqual(@as(usize, 0), visitor.calls);
 }

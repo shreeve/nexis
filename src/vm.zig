@@ -42,6 +42,7 @@ const dispatch_mod = @import("dispatch.zig");
 /// consistent between the compiler, the macroexpander and runtime
 /// values.
 const intern_mod = @import("intern.zig");
+const string_mod = @import("string.zig");
 const protocol_mod = @import("protocol.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
@@ -254,7 +255,9 @@ pub const VarOp = enum(u6) {
     /// Load the Var's binding in force, else its root, into a slot.
     /// Traps :unbound-var.
     load_var = 0,
-    /// Set the Var's root, mark bound, return the Var object.
+    /// Set the Var's root to the value of operand A and mark it
+    /// bound; writes no slot. `def` is `store-var` then
+    /// `var-object` (VM.md §10.7).
     store_var = 1,
     /// Load the Var object itself (not its value) into a slot.
     /// Does NOT trap on unbound — taking a reference to an
@@ -401,37 +404,17 @@ pub const SourceInfo = struct {
 
     pub const LineCol = struct { line: u32, col: u32 };
 
-    /// 1-based line and column of byte offset `pos`; an offset past
-    /// the end lands on the last position.
+    /// 1-based line and column of byte offset `pos`, the column in
+    /// code points and past a leading byte-order mark, as an error
+    /// report shows it; an offset past the end lands on the last
+    /// position.
     pub fn lineCol(self: *const SourceInfo, pos: u32) LineCol {
-        var line: u32 = 1;
+        const before = self.text[0..@min(pos, self.text.len)];
+        const bom = "\xEF\xBB\xBF";
+        const start = if (std.mem.findScalarLast(u8, before, '\n')) |nl| nl + 1 else if (std.mem.startsWith(u8, before, bom)) bom.len else 0;
         var col: u32 = 1;
-        const cap: usize = @min(pos, self.text.len);
-        for (self.text[0..cap]) |ch| {
-            if (ch == '\n') {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-        }
-        return .{ .line = line, .col = col };
-    }
-
-    /// The text of 1-based `line` without its newline; empty past
-    /// the end.
-    pub fn lineText(self: *const SourceInfo, line: u32) []const u8 {
-        var current: u32 = 1;
-        var start: usize = 0;
-        for (self.text, 0..) |ch, i| {
-            if (ch == '\n') {
-                if (current == line) return self.text[start..i];
-                current += 1;
-                start = i + 1;
-            }
-        }
-        if (current == line) return self.text[start..];
-        return "";
+        for (before[start..]) |c| col += @intFromBool(c & 0xC0 != 0x80);
+        return .{ .line = @intCast(1 + std.mem.count(u8, before, "\n")), .col = col };
     }
 };
 
@@ -600,13 +583,12 @@ pub const Namespace = struct {
     /// (`compileQualifiedSymbol`) checks aliases BEFORE
     /// treating the prefix as a literal namespace name. Aliases
     /// are namespace-local (not inherited via auto-refer).
-    aliases: std.StringHashMap([]const u8) = undefined,
-    aliases_initialized: bool = false,
-    /// Backs the HashMap's internal storage.
+    aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Backs the hash maps' internal storage.
     map_allocator: std.mem.Allocator,
     /// Backs the Var struct allocations. Lifetime = VM lifetime.
     var_allocator: std.mem.Allocator,
-    vars: std.StringHashMapUnmanaged(*Var) = .{},
+    vars: std.StringHashMapUnmanaged(*Var) = .empty,
 
     pub fn init(
         map_allocator: std.mem.Allocator,
@@ -615,8 +597,6 @@ pub const Namespace = struct {
         return .{
             .map_allocator = map_allocator,
             .var_allocator = var_allocator,
-            .aliases = std.StringHashMap([]const u8).init(map_allocator),
-            .aliases_initialized = true,
         };
     }
 
@@ -625,7 +605,7 @@ pub const Namespace = struct {
         // VM.deinit. Only the hash map's internal storage
         // belongs to us here.
         self.vars.deinit(self.map_allocator);
-        if (self.aliases_initialized) self.aliases.deinit();
+        self.aliases.deinit(self.map_allocator);
         self.* = undefined;
     }
 
@@ -639,7 +619,7 @@ pub const Namespace = struct {
     pub fn putAlias(self: *Namespace, alias_name: []const u8, target_ns_name: []const u8) !void {
         const owned_alias = try self.var_allocator.dupe(u8, alias_name);
         const owned_target = try self.var_allocator.dupe(u8, target_ns_name);
-        try self.aliases.put(owned_alias, owned_target);
+        try self.aliases.put(self.map_allocator, owned_alias, owned_target);
     }
 
     /// Resolve an alias name. Returns the target
@@ -715,6 +695,10 @@ pub const NamespaceRegistry = struct {
     /// carries the heap to the compiler; there is no bundled
     /// compile-context struct.
     heap: ?*heap_mod.Heap = null,
+    /// The VM that owns this registry (`VM.ensureRegistry` sets it):
+    /// the expander reaches it through a namespace to give a macro's
+    /// sub-VM the registries of the VM it compiles for (§9.1).
+    vm: ?*VM = null,
 
     /// Two-phase init: caller stores the empty registry FIRST,
     /// then calls `setupDefaults` on the stable pointer.
@@ -732,6 +716,7 @@ pub const NamespaceRegistry = struct {
             .core = undefined,
             .current = undefined,
             .heap = null,
+            .vm = null,
         };
     }
 
@@ -830,7 +815,7 @@ pub const UpvalCell = struct {
 /// `function` whose tail holds the cell pointers; `upvalues`
 /// points into that tail, which is safe because the collector
 /// never moves a block. `Value.payload` is the block's
-/// `*HeapHeader`, as for every heap kind (VALUE.md §4). The
+/// `*HeapHeader`, as for every heap kind (HEAP.md §1). The
 /// collector traces a closure by its cells and by the heap
 /// constants of its routine (`VM.gcTrace`).
 pub const Closure = struct {
@@ -877,6 +862,17 @@ pub fn asNativeFn(v: Value) *const NativeFn {
 /// descriptor. Typical use: `vm_mod.nativeFnValue(&native_first)`.
 pub fn nativeFnValue(descriptor: *const NativeFn) Value {
     return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
+}
+
+/// A path argument of `slurp`, `spit`, `db/open` and
+/// `nextomic/connect`: a string, not empty, with no NUL byte
+/// (`:invalid-path`): an open would stop at the NUL and name a shorter
+/// path than the program checked (DB.md §2).
+pub fn pathArg(v: Value) VmError![]const u8 {
+    if (v.kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(v);
+    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
+    return path;
 }
 
 // =============================================================================
@@ -968,17 +964,27 @@ pub const Frame = struct {
 pub const HostCallResult = struct {
     done: bool = false,
     value: Value = value_mod.nilValue(),
+
+    /// The returned value, once the loop is back at the call's depth:
+    /// without a return, a throw went past the call.
+    fn get(self: *const HostCallResult) VmError!Value {
+        return if (self.done) self.value else VmError.ControlTransferred;
+    }
 };
 
 /// One frame of `VM.error_trace`: the routine that was running,
 /// the index of the instruction it was executing (for a caller
 /// frame, the call), that instruction's source span when the
 /// routine carries a span table, and the source the span indexes.
+/// The marker frame a long chain is cut at counts the frames it
+/// stands for in `elided`; its name is fixed text for a host that
+/// does not read the count.
 pub const TraceFrame = struct {
     name: []const u8,
     pc: u32,
     span: ?SourceSpan,
     source: ?*const SourceInfo,
+    elided: usize = 0,
 };
 
 /// Where a throw a handler took was raised (VM.md §12): the value, the
@@ -993,7 +999,6 @@ pub const ThrowOrigin = struct {
     detail_len: usize = 0,
     trace: [VM.trace_capacity]TraceFrame = undefined,
     trace_len: usize = 0,
-    gap_buf: [48]u8 = undefined,
 };
 
 // =============================================================================
@@ -1014,8 +1019,9 @@ pub const CompilerHooks = struct {
     read_string: *const fn (*anyopaque, *VM, []const u8) VmError!Value,
     /// `form` macroexpanded and compiled in the current namespace
     /// and run on this VM as a nested call (`runRoutine`); the
-    /// value it returns. A form that does not compile throws.
-    eval: *const fn (*anyopaque, *VM, Value) VmError!Value,
+    /// value it returns. A form that does not compile throws. Null
+    /// in a macro's sub-VM (§9.1), where `eval` throws `:no-compiler`.
+    eval: ?*const fn (*anyopaque, *VM, Value) VmError!Value,
 };
 
 /// One entry per `defrecord`.
@@ -1118,12 +1124,12 @@ pub const VmError = error{
     /// bytecode corruption or bytecode from a nexis VM
     /// that this VM doesn't understand.
     BytecodeCorruption,
-    /// `math:*` (or other kind-sensitive op) received an operand
-    /// of a kind the op does not accept (e.g., a non-numeric
-    /// operand to `math:add`, a non-list operand to
-    /// `coll:concat`). Mirrors the `:kind-mismatch` user-visible
-    /// error kind from VM.md §13; reusing that taxonomy keeps a
-    /// parallel "type-error" category from drifting in.
+    /// An opcode or native received an operand of a kind it does
+    /// not accept (a non-number to `math:add`, a non-integer index
+    /// to a vector called as a function). Mirrors the
+    /// `:kind-mismatch` user-visible error kind from VM.md §13;
+    /// reusing that taxonomy keeps a parallel "type-error"
+    /// category from drifting in.
     KindMismatch,
     /// A count or identifier the runtime produces does not fit in
     /// a fixnum. Arithmetic never raises it: an integer result
@@ -1132,15 +1138,14 @@ pub const VmError = error{
     /// `/`, `quot`, `rem` or `mod` with a zero divisor, integer or
     /// float; a NaN operand of `/` is its result instead.
     DivideByZero,
-    /// `call:call` / `call:tailcall` invocation passed a different
-    /// number of arguments than the callee closure's routine
-    /// declares. Per VM.md §13 `:arity-mismatch` row: the
-    /// runtime arity check fires at
-    /// frame transfer, distinct from the compile-time
+    /// A call passed a number of arguments its callee does not
+    /// take: a closure's routine, a native's descriptor, a
+    /// collection or keyword called as a function (VM.md §13
+    /// `:arity-mismatch` row). Distinct from the compile-time
     /// `RecurArityMismatch` (COMPILER.md §4.4).
     ArityMismatch,
-    /// `call:call` target slot did not contain a closure value.
-    /// Per VM.md §13 `:not-callable` row.
+    /// A call's callee is none of the callable kinds (VM.md §6;
+    /// §13 `:not-callable` row).
     NotCallable,
     /// `call:call` references a `call_base` slot such that
     /// `slot[A + argc]` exceeds the frame's slot count. Per
@@ -1414,13 +1419,8 @@ pub const Callback = struct {
     pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
         std.debug.assert(args.len == self.argc);
         switch (self.mode) {
-            .leaf => return asNativeFn(self.callee).call(self.vm, args),
-            .lookup => switch (args[0].kind()) {
-                .nil => return value_mod.nilValue(),
-                .persistent_map => return mapLookup(args[0], self.callee, value_mod.nilValue()),
-                .record => return mapLookup(record_mod.fieldsOf(args[0]), self.callee, value_mod.nilValue()),
-                else => {},
-            },
+            .leaf => if (!self.vm.gcDue()) return asNativeFn(self.callee).call(self.vm, args),
+            .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
             .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
             .unprepared => return self.prepare(args),
             .general => {},
@@ -1447,7 +1447,7 @@ pub const Callback = struct {
                 // Every later call starts at this depth of the native
                 // stack, so the guard's answer holds for them all
                 // (§13.1).
-                stack_guard.check() catch return VmError.StackOverflow;
+                try vm.checkNesting();
                 const depth = vm.frames.items.len;
                 const base = vm.stack.items.len;
                 const window_end = base + routine.slot_count;
@@ -1547,6 +1547,11 @@ pub const VM = struct {
     /// The collector's gray worklist, kept between cycles so each
     /// cycle reuses the capacity the last one grew (GC.md §4).
     gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
+    /// The routines whose constants this cycle has marked, so the
+    /// many closures over one large routine walk its pool once
+    /// (`markRoutineConsts`); emptied at each cycle's start, its
+    /// capacity kept.
+    gc_routines: std.AutoHashMapUnmanaged(*const Routine, void) = .empty,
     /// The root stack (GC.md §3): values a native holds in Zig
     /// locals across a call back into the VM. `callValue` pushes a
     /// native callee's arguments for the call's duration; a native
@@ -1604,6 +1609,13 @@ pub const VM = struct {
     /// where printing and reading stdin raise `:io-error` and file
     /// access falls back to the process-wide single-threaded I/O.
     io: ?std.Io = null,
+
+    /// The VM whose registries this one uses instead of its own
+    /// (§9.1): a macro's sub-VM runs against the namespaces, record
+    /// types, protocols and store connections of the VM it compiles
+    /// for, so an id or a name means the same in both. Always a VM
+    /// with no owner of its own; it outlives this one.
+    owner: ?*VM = null,
 
     /// Per-VM record-type registry, empty until the first
     /// `registerRecordType`. Each
@@ -1680,9 +1692,14 @@ pub const VM = struct {
     /// recursion is a catchable `:stack-overflow` instead of memory
     /// growing until the process dies (§13).
     max_frames: usize = default_max_frames,
-    /// The text of the marker `recordErrorTrace` puts where it
-    /// leaves frames out.
-    trace_gap: [48]u8 = undefined,
+    /// The most run loops that may nest on the native stack, one per
+    /// call back into the VM from a native (`apply`, `map`, a
+    /// protocol impl) that is still running. A call that would nest
+    /// one more raises `StackOverflow` before the recursion has
+    /// committed much native stack (§13.1).
+    max_nested_runs: usize = default_max_nested_runs,
+    /// The run loops nested now.
+    nested_runs: usize = 0,
     /// What the most recent runtime error was about, for the host's
     /// report: `f takes 1 argument, got 0`, `+ expects numbers, got
     /// a string`. Set where the VM raises the error, empty when the
@@ -1701,6 +1718,7 @@ pub const VM = struct {
     escaped_origin: ?u32 = null,
 
     pub const default_max_frames = 1 << 20;
+    pub const default_max_nested_runs = 100_000;
     /// A trace keeps this many innermost frames and
     /// `trace_outermost` outermost ones; a marker frame counts the
     /// rest.
@@ -1754,6 +1772,7 @@ pub const VM = struct {
         self.dyn_frames.deinit(self.allocator);
         self.roots.deinit(self.allocator);
         self.gc_gray.deinit(self.allocator);
+        self.gc_routines.deinit(self.allocator);
         // Free handler + finally stack backing storage. Both
         // contain POD entries.
         self.handlers.deinit(self.allocator);
@@ -1819,6 +1838,7 @@ pub const VM = struct {
     /// Otherwise it lazily initializes and returns the
     /// single-namespace slot used by ad-hoc test callers.
     pub fn ensureNamespace(self: *VM) *Namespace {
+        if (self.owner) |o| return o.ensureNamespace();
         if (self.registry) |*reg| return reg.current;
         if (self.namespace == null) {
             self.namespace = Namespace.init(self.allocator, self.runtime_arena.allocator());
@@ -1830,6 +1850,7 @@ pub const VM = struct {
     /// conventional `nexis.core` (auto-referred) and `user`
     /// (default current) namespaces.
     pub fn ensureRegistry(self: *VM) !*NamespaceRegistry {
+        if (self.owner) |o| return o.ensureRegistry();
         if (self.registry == null) {
             self.registry = NamespaceRegistry.initEmpty(
                 self.allocator,
@@ -1842,8 +1863,35 @@ pub const VM = struct {
             // lowering can allocate string-literal Values into
             // it via `namespace.registry.heap`.
             self.registry.?.heap = self.ensureHeap();
+            self.registry.?.vm = self;
         }
         return &self.registry.?;
+    }
+
+    /// The VM whose registries this one uses: its owner, else itself.
+    pub fn home(self: *VM) *VM {
+        return self.owner orelse self;
+    }
+
+    /// Make this fresh VM, which runs a macro over `owner`'s heap and
+    /// interner, use `owner`'s registries too (§9.1). It gets the
+    /// owner's compiler hooks without `eval`: `macroexpand-1` and
+    /// `read-string` touch nothing that outlives the call, while an
+    /// `eval` would compile into this VM's runtime arena and could
+    /// load a file that runs the owner's collector.
+    pub fn borrowRegistries(self: *VM, owner: *VM) void {
+        self.owner = owner.home();
+        if (self.owner.?.compiler_hooks) |hooks| {
+            self.compiler_hooks = hooks;
+            self.compiler_hooks.?.eval = null;
+        }
+    }
+
+    /// The record type `id` names, or null when no `defrecord`
+    /// registered it.
+    pub fn recordType(self: *VM, id: u32) ?*const RecordTypeEntry {
+        const types = self.home().record_registry.items;
+        return if (id < types.len) &types[id] else null;
     }
 
     /// Lazy-initialize the shared Interner on first
@@ -1861,9 +1909,8 @@ pub const VM = struct {
     }
 
     /// The heap this VM allocates on: the borrowed one when set,
-    /// else its own, initialized on first use. The Heap is just an
-    /// allocator wrapper with a live-list; init is O(1) and there's
-    /// no cost before the first use.
+    /// else its own, initialized on first use: `Heap.init` maps no
+    /// slab, so a VM that never builds a value pays nothing.
     pub fn ensureHeap(self: *VM) *heap_mod.Heap {
         if (self.borrowed_heap) |h| return h;
         if (self.heap == null) {
@@ -1908,6 +1955,14 @@ pub const VM = struct {
     // The collector's host (VM.md §9, GC.md §3)
     // -------------------------------------------------------------------------
 
+    /// Trigger by `policy` from here on: the next cycle is due after
+    /// `policy.threshold` bytes.
+    pub fn setGcPolicy(self: *VM, policy: GcPolicy) void {
+        self.gc_threshold = policy.threshold;
+        self.gc_growth_percent = policy.growth_percent;
+        self.gc_next_at = policy.threshold;
+    }
+
     /// Whether a cycle is due at this safe point: the VM collects,
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
@@ -1929,6 +1984,7 @@ pub const VM = struct {
         var collector = gc_mod.Collector.init(heap);
         collector.host = .{ .ctx = @ptrCast(self), .roots = &gcRoots, .trace = &gcTrace };
         collector.gray = self.gc_gray;
+        self.gc_routines.clearRetainingCapacity();
         _ = collector.collect(&.{});
         self.gc_gray = collector.gray;
         self.gc_cycles += 1;
@@ -1952,7 +2008,7 @@ pub const VM = struct {
         // through the closure block (`gcTrace`), marked once however
         // many frames run it; any other frame has no cells.
         for (self.frames.items) |*f| {
-            if (f.closure.isNil()) markRoutineConsts(c, f.routine) else c.markValue(f.closure);
+            if (f.closure.isNil()) self.markRoutineConsts(c, f.routine) else c.markValue(f.closure);
         }
         if (self.registry) |*reg| {
             var it = reg.map.valueIterator();
@@ -1990,21 +2046,29 @@ pub const VM = struct {
     /// The heap constants of `routine` and, recursively, of the
     /// routines in its pool: string and bignum literals live on the
     /// heap and a routine is reachable from every frame running it
-    /// and every closure over it.
-    fn markRoutineConsts(c: *gc_mod.Collector, routine: *const Routine) void {
+    /// and every closure over it. A routine with more than a few
+    /// constants or nested routines is walked once per cycle, however
+    /// many closures reach it; a small one costs less to walk again
+    /// than to look up.
+    fn markRoutineConsts(self: *VM, c: *gc_mod.Collector, routine: *const Routine) void {
+        if (routine.consts.len + routine.capture_descs.len > 8) {
+            const seen = self.gc_routines.getOrPut(self.allocator, routine) catch null;
+            if (seen) |entry| if (entry.found_existing) return;
+        }
         for (routine.consts) |v| c.markValue(v);
-        for (routine.capture_descs) |d| markRoutineConsts(c, d.routine);
+        for (routine.capture_descs) |d| self.markRoutineConsts(c, d.routine);
     }
 
     /// Trace a closure (its cells and its routine's constants) or a
     /// cell (its value); the collector has marked `h` already.
-    fn gcTrace(_: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
+    fn gcTrace(ctx: *anyopaque, h: *heap_mod.HeapHeader, c: *gc_mod.Collector) void {
+        const self: *VM = @ptrCast(@alignCast(ctx));
         const k: value_mod.Kind = @fromBackingInt(@intCast(h.kind));
         switch (k) {
             .function => {
                 const closure = heap_mod.Heap.bodyOf(Closure, h);
                 for (closure.upvalues) |cell| c.mark(cellHeader(cell));
-                markRoutineConsts(c, closure.routine);
+                self.markRoutineConsts(c, closure.routine);
             },
             .cell_internal => c.markValue(heap_mod.Heap.bodyOf(UpvalCell, h).value),
             else => unreachable,
@@ -2056,6 +2120,7 @@ pub const VM = struct {
         type_name: []const u8,
         field_names: []const []const u8,
     ) !u32 {
+        if (self.owner) |o| return o.registerRecordType(ns_name, type_name, field_names);
         const new_id: u32 = @intCast(self.record_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
@@ -2072,19 +2137,22 @@ pub const VM = struct {
             fields_dup[i] = try self.allocator.dupe(u8, fname);
             initialized = i + 1;
         }
-        try self.record_registry.append(self.allocator, .{
+        // Nothing fails once the entry is in: it owns the names.
+        try self.record_registry.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
+        self.record_registry.appendAssumeCapacity(.{
             .id = new_id,
             .ns_name = ns_dup,
             .type_name = name_dup,
             .field_names = fields_dup,
         });
-        try self.ensureInterner().nameRecordType(new_id, ns_name, type_name);
         return new_id;
     }
 
     /// The type id of `nexis.core/Reduced`, the one-field record
     /// (`:val`) that `reduced` builds and `reduce` stops on.
     pub fn ensureReducedType(self: *VM) !u32 {
+        if (self.owner) |o| return o.ensureReducedType();
         if (self.reduced_type_id) |id| return id;
         const id = try self.registerRecordType("nexis.core", "Reduced", &.{"val"});
         self.reduced_type_id = id;
@@ -2103,21 +2171,20 @@ pub const VM = struct {
         protocol_name: []const u8,
         method_specs: []const ProtocolMethodSpec,
     ) !u32 {
+        if (self.owner) |o| return o.registerProtocol(ns_name, protocol_name, method_specs);
         const new_id: u32 = @intCast(self.protocol_registry.items.len);
         const ns_dup = try self.allocator.dupe(u8, ns_name);
         errdefer self.allocator.free(ns_dup);
         const name_dup = try self.allocator.dupe(u8, protocol_name);
         errdefer self.allocator.free(name_dup);
 
-        var methods: std.ArrayList(ProtocolMethod) = .empty;
-        errdefer methods.deinit(self.allocator);
+        var methods: std.ArrayList(ProtocolMethod) = try .initCapacity(self.allocator, method_specs.len);
+        errdefer {
+            for (methods.items) |m| self.allocator.free(m.name);
+            methods.deinit(self.allocator);
+        }
         for (method_specs) |spec| {
-            const m_name = try self.allocator.dupe(u8, spec.name);
-            errdefer self.allocator.free(m_name);
-            try methods.append(self.allocator, .{
-                .name_id = spec.name_id,
-                .name = m_name,
-            });
+            methods.appendAssumeCapacity(.{ .name_id = spec.name_id, .name = try self.allocator.dupe(u8, spec.name) });
         }
         try self.protocol_registry.append(self.allocator, .{
             .id = new_id,
@@ -2129,8 +2196,8 @@ pub const VM = struct {
     }
 
     pub fn protocolById(self: *VM, id: u32) ?*ProtocolEntry {
-        if (id >= self.protocol_registry.items.len) return null;
-        return &self.protocol_registry.items[id];
+        const protocols = self.home().protocol_registry.items;
+        return if (id < protocols.len) &protocols[id] else null;
     }
 
     /// Register an impl `(protocol_id, method_name_id,
@@ -2146,7 +2213,7 @@ pub const VM = struct {
         const proto = self.protocolById(protocol_id) orelse return error.NoProtocolMethod;
         for (proto.methods.items) |*method| {
             if (method.name_id == method_name_id) {
-                try method.impls.put(self.allocator, key.canonical(), impl);
+                try method.impls.put(self.home().allocator, key.canonical(), impl);
                 return;
             }
         }
@@ -2244,14 +2311,16 @@ pub const VM = struct {
     pub fn callValue(self: *VM, callee: Value, args: []const Value) VmError!Value {
         if (callee.kind() == .native_fn) {
             const native = asNativeFn(callee);
-            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len)) return native.call(self, args);
+            // A leaf allocates and cannot collect, so a native calling
+            // one per element takes the rooted path below whenever a
+            // cycle is due.
+            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) return native.call(self, args);
         }
-        // Every re-entry nests a native call and a run loop on the
-        // native stack (§13.1).
-        stack_guard.check() catch return VmError.StackOverflow;
+        try self.checkNesting();
         if (callee.kind() != .function) {
             const scope = self.rootScope();
             defer scope.release();
+            try scope.push(callee);
             try scope.pushAll(args);
             // A native called from a native reaches no closure frame's
             // safe point, so a loop of them (`(reduce conj #{} xs)`)
@@ -2279,9 +2348,15 @@ pub const VM = struct {
             };
         }
         try self.loop(depth);
-        // Back at `depth` without a return: a throw went past us.
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
+    }
+
+    /// Every re-entry nests a native call, and most a run loop, on the
+    /// native stack: past the guard or `max_nested_runs` it is
+    /// `StackOverflow` (§13.1).
+    inline fn checkNesting(self: *VM) VmError!void {
+        stack_guard.check() catch return VmError.StackOverflow;
+        if (self.nested_runs >= self.max_nested_runs) return VmError.StackOverflow;
     }
 
     /// A `Callback`'s call of its closure, from the depth and stack
@@ -2301,9 +2376,7 @@ pub const VM = struct {
         frame.* = cb.frame;
         frame.host_result = &result_cell;
         try self.loop(cb.depth);
-        // Back at the depth without a return: a throw went past us.
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
     }
 
     /// Call `callee`, anything but a closure, with `args`, to
@@ -2502,7 +2575,7 @@ pub const VM = struct {
     /// (one installed beneath the nested frame) takes it,
     /// `ControlTransferred`, exactly as `callValue` reports it.
     pub fn runRoutine(self: *VM, routine: *const Routine) VmError!Value {
-        stack_guard.check() catch return VmError.StackOverflow;
+        try self.checkNesting();
         if (routine.upvalue_count != 0) return VmError.CaptureCountMismatch;
         const base_slot: usize = self.stack.items.len;
         self.stack.appendNTimes(self.allocator, value_mod.nilValue(), routine.slot_count) catch return VmError.OutOfMemory;
@@ -2520,8 +2593,7 @@ pub const VM = struct {
             self.recordErrorTrace(err);
             return err;
         };
-        if (!result_cell.done) return VmError.ControlTransferred;
-        return result_cell.value;
+        return result_cell.get();
     }
 
     /// The fetch-and-dispatch loop, the only one: until the VM
@@ -2538,7 +2610,11 @@ pub const VM = struct {
     fn loop(self: *VM, depth: usize) VmError!void {
         const outer = self.loop_depth;
         self.loop_depth = depth;
-        defer self.loop_depth = outer;
+        self.nested_runs += 1;
+        defer {
+            self.loop_depth = outer;
+            self.nested_runs -= 1;
+        }
         while (self.running()) {
             opEnter(self, self.currentFrame(), undefined) catch |err| switch (err) {
                 // A native's throw was caught below it: frames and pc
@@ -2598,19 +2674,12 @@ pub const VM = struct {
     /// Pointer to the currently-executing frame. **Single-shot use
     /// only**: a `frames.append()` in any code path between fetch
     /// and use will invalidate this pointer. For multi-step access,
-    /// read the relevant fields into locals or use `currentFrameIdx`.
+    /// read the relevant fields into locals or the frame's index.
     inline fn currentFrame(self: *VM) *Frame {
         // Empty frame stack is a VM invariant violation, not a
         // recoverable runtime condition.
         std.debug.assert(self.frames.items.len > 0);
         return &self.frames.items[self.frames.items.len - 1];
-    }
-
-    /// Index of the currently-executing frame. Stable across
-    /// `frames.append()` for the existing frames (a new frame
-    /// pushes at len; the prior current frame keeps its index).
-    inline fn currentFrameIdx(self: *const VM) usize {
-        return self.frames.items.len - 1;
     }
 
     /// Resolve a slot operand to a pointer into the backing stack.
@@ -2785,9 +2854,9 @@ pub const VM = struct {
     /// forms on one VM whose namespaces, interner and runtime
     /// values persist between them.
     pub fn retargetTop(self: *VM, routine: *const Routine) VmError!void {
-        // A failed run leaves its frames for the trace;
-        // `resetAfterError` discards them before the next form.
-        std.debug.assert(self.frames.items.len == 1);
+        // A failed run leaves its frames for the trace; a host that
+        // did not discard them has them discarded here.
+        if (self.frames.items.len > 1) self.resetAfterError();
         const top = &self.frames.items[0];
         top.routine = routine;
         top.pc = 0;
@@ -2822,9 +2891,8 @@ pub const VM = struct {
     /// intact here: an uncaught throw and an untranslated `VmError`
     /// both leave the chain as it was. A parked top frame (one
     /// resting on `idle_routine`) is not part of any run and is
-    /// left out. A chain deeper than `trace_innermost +
-    /// trace_outermost` keeps both ends and one marker frame, named
-    /// for the number of frames between them.
+    /// left out. A chain longer than `trace_capacity` keeps both
+    /// ends and one marker frame counting the frames between them.
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
@@ -2835,33 +2903,26 @@ pub const VM = struct {
             @memcpy(self.detail_buf[0..o.detail_len], o.detail_buf[0..o.detail_len]);
             self.error_detail = self.detail_buf[0..o.detail_len];
             self.error_trace.appendSlice(self.allocator, o.trace[0..o.trace_len]) catch return;
-            // The detail and the elision marker's text move to the
-            // VM's own buffers, which outlive the origin.
-            for (self.error_trace.items) |*frame| if (frame.name.ptr == &o.gap_buf) {
-                @memcpy(self.trace_gap[0..frame.name.len], frame.name);
-                frame.name = self.trace_gap[0..frame.name.len];
-            };
             return;
         };
         var buf: [trace_capacity]TraceFrame = undefined;
-        const n = self.captureTrace(&buf, &self.trace_gap);
+        const n = self.captureTrace(&buf);
         self.error_trace.appendSlice(self.allocator, buf[0..n]) catch return;
     }
 
     /// The frame chain as `recordErrorTrace` reports it, into `out`;
-    /// returns how many entries it wrote. The elision marker's text
-    /// goes to `gap`.
-    fn captureTrace(self: *VM, out: []TraceFrame, gap: []u8) usize {
+    /// returns how many entries it wrote.
+    fn captureTrace(self: *VM, out: []TraceFrame) usize {
         const frames = self.frames.items;
         const lowest: usize = if (frames[0].routine == &idle_routine) 1 else 0;
-        const elided = (frames.len - lowest) -| (trace_innermost + trace_outermost);
+        const depth = frames.len - lowest;
+        const elided = if (depth > trace_capacity) depth - (trace_innermost + trace_outermost) else 0;
         var n: usize = 0;
         var i = frames.len;
         while (i > lowest and n < out.len) {
             i -= 1;
             if (elided > 0 and i == frames.len - 1 - trace_innermost) {
-                const name = std.mem.print(gap, "<{d} frames elided>", .{elided}) catch unreachable;
-                out[n] = .{ .name = name, .pc = 0, .span = null, .source = null };
+                out[n] = .{ .name = "<more frames elided>", .pc = 0, .span = null, .source = null, .elided = elided };
                 n += 1;
                 i -= elided - 1;
                 continue;
@@ -2890,7 +2951,7 @@ pub const VM = struct {
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
         o.detail_len = detail.len;
-        o.trace_len = self.captureTrace(&o.trace, &o.gap_buf);
+        o.trace_len = self.captureTrace(&o.trace);
         return @intCast(self.origins.items.len - 1);
     }
 
@@ -2934,9 +2995,10 @@ pub const VM = struct {
 
     /// Discard what a failed run left behind (the frames above the
     /// top-level one, handlers, pending finallys, the dynamic
-    /// bindings a `binding` form had in force and the unhandled
-    /// throw) so the next `retargetTop` starts from a clean VM. The
-    /// error trace stays until the next failing run replaces it.
+    /// bindings a `binding` form had in force, the unhandled throw and
+    /// `traced_error`) so the next `retargetTop` starts from a clean
+    /// VM and a later failure outside a run never reports this one.
+    /// The error trace stays until the next failing run replaces it.
     pub fn resetAfterError(self: *VM) void {
         while (self.frames.items.len > 1) _ = self.popFrame();
         self.handlers.clearRetainingCapacity();
@@ -2945,9 +3007,19 @@ pub const VM = struct {
         self.escaped_origin = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
+        self.traced_error = null;
         self.frames.items[0].routine = &idle_routine;
         @memset(self.stack.items, value_mod.nilValue());
+        // A runaway recursion grew the frame chain and the stack far
+        // past what a form needs; nothing holds into them between
+        // runs, so the memory goes back.
+        if (self.frames.capacity > reset_frames_kept) self.frames.shrinkAndFree(self.allocator, self.frames.items.len);
+        if (self.stack.capacity > reset_frames_kept * 4) self.stack.shrinkAndFree(self.allocator, self.stack.items.len);
     }
+
+    /// The frames, and four times as many stack slots, whose
+    /// capacity `resetAfterError` keeps.
+    const reset_frames_kept = 4096;
 
     /// Runtime error translation to a user-throwable Value.
     /// Recoverable errors (VM.md §13's catchable table) become
@@ -3010,14 +3082,15 @@ pub const VM = struct {
         @setEvalBranchQuota(20_000);
         var t: [4096]OpHandler = @splat(&opCorrupt);
         // A group's handler takes the variants without one of their
-        // own: every variant of `jump` and `cmp` has one, so theirs
-        // are corrupt; `mov` and `call` trap theirs (§10).
+        // own: every variant of `jump`, `cmp`, `mov` and `call` but
+        // the reserved `tailcall` has one, so the rest are corrupt
+        // (§10).
         const groups = .{
             .{ Group.jump, &opCorrupt },
             .{ Group.cmp, &opCorrupt },
             .{ Group.math, &opMath },
-            .{ Group.mov, &opUnimplemented },
-            .{ Group.call, &opUnimplemented },
+            .{ Group.mov, &opCorrupt },
+            .{ Group.call, &opCorrupt },
             .{ Group.closure, &opClosure },
             .{ Group.var_, &opVar },
             .{ Group.coll, &opColl },
@@ -3050,6 +3123,7 @@ pub const VM = struct {
         t[opcode(.call, Call.call)] = &opCall;
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
+        t[opcode(.call, Call.tailcall)] = &opUnimplemented;
         break :blk t;
     };
 
@@ -3321,14 +3395,8 @@ pub const VM = struct {
                 // nothing is allocated and no data is walked.
                 .keyword, .symbol => {
                     if (argc != 1 and argc != 2) break :fast;
-                    const target = self.stack.items[base];
                     const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
-                    const result = switch (target.kind()) {
-                        .nil => default,
-                        .persistent_map => mapLookup(target, callee, default),
-                        .record => mapLookup(record_mod.fieldsOf(target), callee, default),
-                        else => break :fast,
-                    };
+                    const result = lookupInPlace(callee, self.stack.items[base], default) orelse break :fast;
                     self.slotAt(frame, inst.c.index).* = result;
                     return self.next(frame);
                 },
@@ -3376,9 +3444,13 @@ pub const VM = struct {
 
         if (call_base + 1 + argc > caller.slot_count) return VmError.CallBlockOutOfRange;
         if (result_dst >= caller.slot_count) return VmError.OperandOutOfRange;
-        const callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
+        var callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
         const args_base: usize = @as(usize, caller.base_slot) + call_base + 1;
         if (args_base + argc > self.stack.items.len) return VmError.BytecodeCorruption;
+        // A Var calls the value in force (Clojure's `Var.invoke`); a
+        // closure there gets a frame like any other, so a recursion
+        // through `#'f` costs no native stack.
+        if (callee.kind() == .var_) callee = asVar(callee).current() orelse return VmError.UnboundVar;
 
         if (callee.kind() == .function) {
             // `caller.pc` is already past this instruction.
@@ -3466,7 +3538,8 @@ pub const VM = struct {
         switch (variant) {
             .make => try self.execClosureMake(inst),
             .box_local => try self.execClosureBoxLocal(inst),
-            .get_cell => try self.execClosureGetCell(self.currentFrame(), inst),
+            // `op_table` routes `get-cell` to `opGetCell`.
+            .get_cell => unreachable,
             .new_cell => try self.execClosureNewCell(inst),
             .init_cell => try self.execClosureInitCell(inst),
             _ => return VmError.BytecodeCorruption,
@@ -3643,6 +3716,12 @@ pub const VM = struct {
 
     fn execMath(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: Math = @fromBackingInt(@intCast(inst.variant));
+        // The variant traps before any operand is read (§10.3).
+        switch (variant) {
+            .pow => return VmError.UnimplementedOpcode,
+            _ => return VmError.BytecodeCorruption,
+            else => {},
+        }
         // Resolve every source operand BEFORE storing so that
         // dst/src aliasing (e.g., math:add s0, s0, c0) is correct.
         const lhs = try self.resolveIn(frame, inst.b);
@@ -3709,7 +3788,8 @@ pub const VM = struct {
     fn execVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         const variant: VarOp = @fromBackingInt(@intCast(inst.variant));
         switch (variant) {
-            .load_var => try self.execVarLoadVar(frame, inst),
+            // `op_table` routes `load-var` to `opLoadVar`.
+            .load_var => unreachable,
             .store_var => try self.execVarStoreVar(frame, inst),
             .var_object => try self.execVarVarObject(frame, inst),
             _ => return VmError.BytecodeCorruption,
@@ -3893,8 +3973,7 @@ pub const VM = struct {
     fn execCtrlTryExit(self: *VM, inst: Inst) VmError!void {
         const post_pc = inst.wide();
 
-        if (self.handlers.items.len == 0) return VmError.InvalidHandlerState;
-        const top = self.handlers.items[self.handlers.items.len - 1];
+        const top = self.handlers.last() orelse return VmError.InvalidHandlerState;
         const frame_index = self.frames.items.len - 1;
         if (top.frame_index != frame_index) return VmError.InvalidHandlerState;
 
@@ -4073,7 +4152,7 @@ pub const VM = struct {
 /// Returns null for unrecoverable errors — bytecode
 /// corruption, OOM, handler-state malformation, etc. Those
 /// propagate to the caller unchanged.
-fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
+pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     return switch (err) {
         // Recoverable per VM.md §13.
         VmError.KindMismatch => "kind-mismatch",
@@ -4280,10 +4359,26 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
         .var_ => "a var",
         .error_ => "an error",
         .atom => "an atom",
+        .db_write_txn => "a db write transaction",
+        .db_read_txn => "a db read transaction",
+        .nextomic_conn => "a Nextomic connection",
+        .nextomic_db => "a Nextomic db",
+        .nextomic_entity => "a Nextomic entity",
+        .cell_internal => "a cell",
         else => {
             const info = @typeInfo(value_mod.Kind).@"enum";
             inline for (info.field_names, info.field_values) |name, value| {
-                if (@backingInt(k) == value) return "a " ++ name;
+                // The tag name with its underscores as spaces:
+                // "a typed vector", "a durable ref".
+                const phrase = comptime blk: {
+                    var buf: [name.len]u8 = name[0..name.len].*;
+                    for (&buf) |*c| if (c.* == '_') {
+                        c.* = ' ';
+                    };
+                    const final = buf;
+                    break :blk "a " ++ &final;
+                };
+                if (@backingInt(k) == value) return phrase;
             }
             return "a value";
         },
@@ -4291,6 +4386,17 @@ pub fn kindPhrase(k: value_mod.Kind) []const u8 {
 }
 
 /// Kinds a `call:call` treats as a lookup rather than a function.
+/// `(k target default)` for a keyword or symbol `k` where it needs no
+/// callback: `target` nil, a hash map or a record; null otherwise.
+inline fn lookupInPlace(k: Value, target: Value, default: Value) ?Value {
+    return switch (target.kind()) {
+        .nil => default,
+        .persistent_map => mapLookup(target, k, default),
+        .record => mapLookup(record_mod.fieldsOf(target), k, default),
+        else => null,
+    };
+}
+
 pub fn isLookupCallable(k: value_mod.Kind) bool {
     return switch (k) {
         .keyword, .symbol, .persistent_map, .persistent_set, .persistent_vector, .transient, .sorted_map, .sorted_set => true,
@@ -4312,30 +4418,34 @@ pub fn isLookupCallable(k: value_mod.Kind) bool {
 /// or set as a map or set is, through its comparator on `vm`. Any
 /// other arity is `ArityMismatch` (VM.md §6). A caller with no VM
 /// reaches a sorted key by `=` (`lookupIn`).
-pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value {
-    if (args.len < 1 or args.len > 2) return VmError.ArityMismatch;
+pub fn callLookupIn(vm: *VM, callee: Value, args: []const Value) VmError!Value {
+    const phrase = kindPhrase(callee.kind());
+    // A set and a transient vector or set take the key alone.
+    const max: usize = switch (callee.kind()) {
+        .persistent_set, .sorted_set, .persistent_vector => 1,
+        .transient => if (callee.subkind() == transient_mod.subkind_transient_map) 2 else 1,
+        else => 2,
+    };
+    if (args.len < 1 or args.len > max) return vm.arityError(phrase, 1, max, args.len);
     const default = if (args.len == 2) args[1] else value_mod.nilValue();
     return switch (callee.kind()) {
         .keyword, .symbol => switch (args[0].kind()) {
             .nil, .persistent_map, .record, .persistent_set, .persistent_vector, .nextomic_entity, .transient, .sorted_map, .sorted_set => lookupIn(vm, args[0], callee, default),
             else => default,
         },
-        .persistent_map, .sorted_map => lookupIn(vm, callee, args[0], default),
-        .persistent_set, .sorted_set => if (args.len == 1) lookupIn(vm, callee, args[0], default) else VmError.ArityMismatch,
+        .persistent_map, .sorted_map, .persistent_set, .sorted_set => lookupIn(vm, callee, args[0], default),
         .transient => switch (callee.subkind()) {
-            transient_mod.subkind_transient_map => lookup(callee, args[0], default),
-            transient_mod.subkind_transient_set => if (args.len == 1) lookup(callee, args[0], default) else VmError.ArityMismatch,
+            transient_mod.subkind_transient_map, transient_mod.subkind_transient_set => lookup(callee, args[0], default),
             else => blk: {
-                if (args.len != 1) return VmError.ArityMismatch;
-                if (args[0].kind() != .fixnum) return VmError.KindMismatch;
-                break :blk (try transientLookup(callee, args[0])) orelse VmError.IndexOutOfBounds;
+                if (args[0].kind() != .fixnum) return vm.fail(VmError.KindMismatch, "{s} takes an integer index, got {s}", .{ phrase, kindPhrase(args[0].kind()) });
+                break :blk (try transientLookup(callee, args[0])) orelse vm.fail(VmError.IndexOutOfBounds, "index {d} is out of bounds for {s}", .{ args[0].asFixnum(), phrase });
             },
         },
         .persistent_vector => blk: {
-            if (args.len != 1) return VmError.ArityMismatch;
-            if (args[0].kind() != .fixnum) return VmError.KindMismatch;
+            if (args[0].kind() != .fixnum) return vm.fail(VmError.KindMismatch, "{s} takes an integer index, got {s}", .{ phrase, kindPhrase(args[0].kind()) });
             const idx = args[0].asFixnum();
-            if (idx < 0 or @as(usize, @intCast(idx)) >= vector_mod.count(callee)) return VmError.IndexOutOfBounds;
+            const n = vector_mod.count(callee);
+            if (idx < 0 or @as(usize, @intCast(idx)) >= n) return vm.fail(VmError.IndexOutOfBounds, "index {d} is out of bounds for a vector of {d}", .{ idx, n });
             break :blk vector_mod.nth(callee, @intCast(idx));
         },
         else => VmError.NotCallable,
@@ -4343,7 +4453,7 @@ pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value 
 }
 
 // =============================================================================
-// Numeric tower (SEMANTICS §2.2, BIGNUM.md §9)
+// Numeric tower (SEMANTICS §2.2, BIGNUM.md §8)
 //
 // Three runtime number kinds take part in arithmetic: `fixnum`
 // (i48), `bignum` and `float` (f64). Contagion follows Clojure: an
@@ -4353,10 +4463,9 @@ pub fn callLookupIn(vm: ?*VM, callee: Value, args: []const Value) VmError!Value 
 // one fits (BIGNUM.md §1), so `=` and `hash` agree for every integer
 // whatever its history. Two fixnums stay in i64 and touch the heap
 // only on promotion. `/` on two integers yields an integer when the
-// division is exact and a float otherwise (there are no rationals,
-// PLAN §23 #10). Integer division by zero and `quot`/`rem`/`mod` by
-// zero raise `DivideByZero`; float `/` by zero follows IEEE and
-// yields an infinity or NaN.
+// division is exact and the float nearest the quotient otherwise
+// (there are no rationals, PLAN §23 #10). `/`, `quot`, `rem` and
+// `mod` raise `DivideByZero` for a zero divisor of either kind.
 //
 // These are the single implementation behind the `math:*` and
 // `cmp:*` opcodes and the arithmetic natives in stdlib.zig. The heap
@@ -4502,7 +4611,8 @@ pub fn numDiv(heap: *heap_mod.Heap, a: value_mod.Value, b: value_mod.Value) VmEr
     if (!isInteger(a) or !isInteger(b)) return VmError.KindMismatch;
     if (isZero(b)) return VmError.DivideByZero;
     const exact = bignum_mod.quotExact(heap, a, b) catch return VmError.OutOfMemory;
-    return exact orelse value_mod.fromFloat(bignum_mod.toF64(a) / bignum_mod.toF64(b));
+    if (exact) |q| return q;
+    return value_mod.fromFloat(bignum_mod.quotientF64(heap, a, b) catch return VmError.OutOfMemory);
 }
 
 /// `quot`: truncated division. A zero divisor of either kind raises.
@@ -4670,87 +4780,39 @@ pub const asm_ = struct {
     }
 
     pub fn move(slot_dst: u12, slot_src: u12) Inst {
-        return Inst.primary(
-            .mov,
-            Mov.move,
-            Operand.slot(slot_dst),
-            Operand.slot(slot_src),
-            Operand.none,
-        );
+        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
     }
 
     pub fn loadNil(slot_dst: u12) Inst {
-        return Inst.primary(
-            .mov,
-            Mov.load_nil,
-            Operand.slot(slot_dst),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.mov, Mov.load_nil, Operand.slot(slot_dst), Operand.none, Operand.none);
     }
 
     pub fn loadTrue(slot_dst: u12) Inst {
-        return Inst.primary(
-            .mov,
-            Mov.load_true,
-            Operand.slot(slot_dst),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.mov, Mov.load_true, Operand.slot(slot_dst), Operand.none, Operand.none);
     }
 
     pub fn loadFalse(slot_dst: u12) Inst {
-        return Inst.primary(
-            .mov,
-            Mov.load_false,
-            Operand.slot(slot_dst),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.mov, Mov.load_false, Operand.slot(slot_dst), Operand.none, Operand.none);
     }
 
     pub fn returnSlot(slot_src: u12) Inst {
-        return Inst.primary(
-            .call,
-            Call.@"return",
-            Operand.slot(slot_src),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.call, Call.@"return", Operand.slot(slot_src), Operand.none, Operand.none);
     }
 
     pub fn returnNil() Inst {
-        return Inst.primary(
-            .call,
-            Call.return_nil,
-            Operand.none,
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.call, Call.return_nil, Operand.none, Operand.none, Operand.none);
     }
 
     /// math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
     /// `b` and `c` may be any kind that `resolve` accepts.
     pub fn mathAdd(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(
-            .math,
-            Math.add,
-            Operand.slot(slot_dst),
-            lhs,
-            rhs,
-        );
+        return Inst.primary(.math, Math.add, Operand.slot(slot_dst), lhs, rhs);
     }
 
     /// cmp:lt dst lhs rhs   ; slot[dst] := bool(resolve(lhs) < resolve(rhs))
     /// Non-numeric operands trap :kind-mismatch.
     pub fn cmpLt(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(
-            .cmp,
-            Cmp.lt,
-            Operand.slot(slot_dst),
-            lhs,
-            rhs,
-        );
+        return Inst.primary(.cmp, Cmp.lt, Operand.slot(slot_dst), lhs, rhs);
     }
 
     /// var:load-var dst W  ; slot[dst] := var_table[W]'s value
@@ -4812,25 +4874,13 @@ pub const asm_ = struct {
     /// dispatch (.normal jumps post_pc, .throwing continues
     /// unwind).
     pub fn finallyExit() Inst {
-        return Inst.primary(
-            .ctrl,
-            CtrlOp.finally_exit,
-            Operand.none,
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.ctrl, CtrlOp.finally_exit, Operand.none, Operand.none, Operand.none);
     }
 
     /// ctrl:throw value_operand _ _   ; throw the resolved value.
     /// Operand kind may be slot, constant, or var.
     pub fn throwOp(value: Operand) Inst {
-        return Inst.primary(
-            .ctrl,
-            CtrlOp.throw_,
-            value,
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.ctrl, CtrlOp.throw_, value, Operand.none, Operand.none);
     }
 
     /// coll:vector arg_base argc dst  ; slot[dst] := vector
@@ -4910,65 +4960,35 @@ pub const asm_ = struct {
     /// binding read; `move(dst, slot_src)` is the slot-to-slot
     /// case.
     pub fn moveFrom(slot_dst: u12, src: Operand) Inst {
-        return Inst.primary(
-            .mov,
-            Mov.move,
-            Operand.slot(slot_dst),
-            src,
-            Operand.none,
-        );
+        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), src, Operand.none);
     }
 
     /// `closure:box-local A=slot` — wrap slot[A]'s current value
     /// into a fresh `UpvalCell`, replacing slot[A] with the cell
     /// pointer. Emission timing per COMPILER.md §6.1.
     pub fn closureBoxLocal(slot_idx: u12) Inst {
-        return Inst.primary(
-            .closure,
-            Closure_.box_local,
-            Operand.slot(slot_idx),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.closure, Closure_.box_local, Operand.slot(slot_idx), Operand.none, Operand.none);
     }
 
     /// `closure:get-cell A=dst_slot B=cell_slot` — read the
     /// contents of an `UpvalCell` whose pointer lives in slot[B];
     /// write to slot[A]. Same-frame read of a boxed local.
     pub fn closureGetCell(dst: u12, cell_slot: u12) Inst {
-        return Inst.primary(
-            .closure,
-            Closure_.get_cell,
-            Operand.slot(dst),
-            Operand.slot(cell_slot),
-            Operand.none,
-        );
+        return Inst.primary(.closure, Closure_.get_cell, Operand.slot(dst), Operand.slot(cell_slot), Operand.none);
     }
 
     /// `closure:new-cell A=slot` — allocate an uninitialized
     /// UpvalCell, store cell pointer at slot[A]. Placeholder
     /// cell for letfn* / named fn*.
     pub fn closureNewCell(slot_idx: u12) Inst {
-        return Inst.primary(
-            .closure,
-            Closure_.new_cell,
-            Operand.slot(slot_idx),
-            Operand.none,
-            Operand.none,
-        );
+        return Inst.primary(.closure, Closure_.new_cell, Operand.slot(slot_idx), Operand.none, Operand.none);
     }
 
     /// `closure:init-cell A=cell_slot B=value_op` — fill
     /// uninitialized cell at slot[A] with resolve(B); set
     /// initialized=true. letfn* / named fn* finalize.
     pub fn closureInitCell(cell_slot: u12, value: Operand) Inst {
-        return Inst.primary(
-            .closure,
-            Closure_.init_cell,
-            Operand.slot(cell_slot),
-            value,
-            Operand.none,
-        );
+        return Inst.primary(.closure, Closure_.init_cell, Operand.slot(cell_slot), value, Operand.none);
     }
 };
 
@@ -4978,16 +4998,7 @@ pub const asm_ = struct {
 
 const testing = std.testing;
 
-/// `s` repeated `n` times, for building long test strings.
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    return comptime blk: {
-        @setEvalBranchQuota(2 * n + 1000);
-        var buf: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-        const final = buf;
-        break :blk &final;
-    };
-}
+const repeat = string_mod.repeat;
 
 test "Inst size: exactly 64 bits packed" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Inst));
@@ -5119,6 +5130,15 @@ fn raw(g: Group, variant: u6, a: Operand, b: Operand, c: Operand) Inst {
     return .{ .kind = .primary, .group = @backingInt(g), .variant = variant, .a = a, .b = b, .c = c };
 }
 
+test "SourceInfo.lineCol: columns count code points, past a byte-order mark" {
+    const info = SourceInfo{ .path = "t.nx", .text = "(str \"\u{e9}\u{e9}\u{e9}\u{e9}\" (/ 1 0))\n\u{20ac}x" };
+    try testing.expectEqual(SourceInfo.LineCol{ .line = 1, .col = 13 }, info.lineCol(16));
+    try testing.expectEqual(SourceInfo.LineCol{ .line = 2, .col = 2 }, info.lineCol(@intCast(info.text.len - 1)));
+    try testing.expectEqual(SourceInfo.LineCol{ .line = 2, .col = 3 }, info.lineCol(1000));
+    const marked = SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(x)" };
+    try testing.expectEqual(SourceInfo.LineCol{ .line = 1, .col = 1 }, marked.lineCol(3));
+}
+
 test "VM opcodes: mov, return and operand resolution" {
     try expectRuns(comptime &[_]RunCase{
         .{ .name = "load-nil", .code = &.{ asm_.loadNil(0), asm_.returnSlot(0) }, .want = .{ .value = nil_v } },
@@ -5205,6 +5225,8 @@ test "VM opcodes: math and cmp" {
         .{ .name = "slot+const and const+slot", .code = &.{ asm_.loadConst(0, 0), add(1, sl(0), kn(0)), add(2, kn(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{fx(100)}, .slots = 3, .want = .{ .value = fx(300) } },
         .{ .name = "a constant destination", .code = &.{ raw(.math, @backingInt(Math.add), kn(0), kn(0), kn(1)), asm_.returnNil() }, .consts = &.{ fx(1), fx(2) }, .want = .{ .err = VmError.InvalidOperandKind } },
         .{ .name = "math:pow is reserved", .code = &.{ raw(.math, @backingInt(Math.pow), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "math:pow traps before its operands are read", .code = &.{ raw(.math, @backingInt(Math.pow), sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "math 15", .code = &.{ raw(.math, 15, sl(0), Operand.none, Operand.none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "1 < 2", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
         .{ .name = "2 < 1", .code = &.{ asm_.cmpLt(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(2), fx(1) }, .want = .{ .value = false_v } },
         .{ .name = "2 < 2 is strict", .code = &.{ asm_.cmpLt(0, kn(0), kn(0)), asm_.returnSlot(0) }, .consts = &.{fx(2)}, .want = .{ .value = false_v } },
@@ -5241,9 +5263,9 @@ test "VM opcodes: jump" {
 test "VM dispatch: a variant outside its group's enum" {
     const none = Operand.none;
     try expectRuns(comptime &[_]RunCase{
-        .{ .name = "mov 9", .code = &.{ raw(.mov, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "mov 9", .code = &.{ raw(.mov, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "call:tailcall", .code = &.{ raw(.call, @backingInt(Call.tailcall), sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
-        .{ .name = "call 9", .code = &.{ raw(.call, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.UnimplementedOpcode } },
+        .{ .name = "call 9", .code = &.{ raw(.call, 9, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "jump 9", .code = &.{ raw(.jump, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "math 20", .code = &.{ raw(.math, 20, sl(0), sl(0), sl(0)), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
         .{ .name = "var 9", .code = &.{ raw(.var_, 9, sl(0), none, none), asm_.returnNil() }, .want = .{ .err = VmError.BytecodeCorruption } },
@@ -6779,9 +6801,7 @@ test "VM dispatch: calls and closures under a collection every few kilobytes" {
     routine.capture_descs = &caps;
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-    vm.gc_threshold = GcPolicy.stress.threshold;
-    vm.gc_growth_percent = GcPolicy.stress.growth_percent;
-    vm.gc_next_at = GcPolicy.stress.threshold;
+    vm.setGcPolicy(.stress);
     try testing.expectEqual(@as(i64, 125_250), (try vm.run()).asFixnum());
     try testing.expect(vm.gc_cycles > 0);
 }
@@ -7024,4 +7044,15 @@ test "VM closure call: same closure called twice — both invocations succeed" {
     defer vm.deinit();
     const result = try vm.run();
     try testing.expectEqual(@as(i64, 17), result.asFixnum());
+}
+
+test "registerRecordType and registerProtocol free exactly what they took when an allocation fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, registerTypeAndProtocol, .{});
+}
+
+fn registerTypeAndProtocol(allocator: std.mem.Allocator) !void {
+    var vm = try VM.init(allocator, &VM.idle_routine);
+    defer vm.deinit();
+    _ = try vm.registerRecordType("user", "Point", &.{ "x", "y" });
+    _ = try vm.registerProtocol("user", "Shape", &.{ .{ .name_id = 0, .name = "area" }, .{ .name_id = 1, .name = "scale" } });
 }

@@ -81,15 +81,6 @@ pub const HeapHeader = extern struct {
     pub inline fn clearMarked(self: *HeapHeader) void {
         self.mark &= ~mark_bit_marked;
     }
-    pub inline fn isPinned(self: *const HeapHeader) bool {
-        return (self.mark & mark_bit_pinned) != 0;
-    }
-    pub inline fn setPinned(self: *HeapHeader) void {
-        self.mark |= mark_bit_pinned;
-    }
-    pub inline fn clearPinned(self: *HeapHeader) void {
-        self.mark &= ~mark_bit_pinned;
-    }
 
     // ---- Metadata ----
 
@@ -176,18 +167,20 @@ pub inline fn setNodeAux(h: *HeapHeader, aux: u6) void {
 // =============================================================================
 
 pub const mark_bit_marked: u8 = 1 << 0;
-pub const mark_bit_pinned: u8 = 1 << 1;
 /// The block is a large block (HEAP.md §2): the allocator's own bit,
 /// set when the block is allocated and never cleared.
 const mark_bit_large: u8 = 1 << 2;
-// Bits 3..7 reserved.
+// Bit 1 and bits 3..7 reserved.
 
 pub const flag_has_meta: u8 = 1 << 0;
-// Bits 1..7 reserved.
+/// A string's: whether its bytes have been scanned for ASCII, and
+/// whether they all were (STRING.md §3).
+pub const flag_ascii_known: u8 = 1 << 1;
+pub const flag_ascii: u8 = 1 << 2;
+// Bits 3..7 reserved.
 
-/// The kind of a free slot, and of a freed block: outside the `Kind`
-/// range, so a sweep tells a free slot from a block and a second free
-/// of one block is caught.
+/// The kind of a free slot and of a swept block: outside the `Kind`
+/// range, so a sweep and `forEachLive` tell a free slot from a block.
 const poisoned_kind: u16 = 0xDEAD;
 
 // =============================================================================
@@ -236,7 +229,7 @@ const class_info: [class_count]ClassInfo = blk: {
             .size = size,
             .slots = @intCast(slots),
             .first = @intCast(std.mem.alignForward(usize, slab_header_bytes + 2 * slots, 16)),
-            .recip = ((@as(u64, 1) << 32) + size - 1) / size,
+            .recip = @divCeil(@as(u64, 1) << 32, size),
         };
     }
     break :blk infos;
@@ -552,30 +545,6 @@ pub const Heap = struct {
         self.allocated_since_collect = 0;
     }
 
-    pub fn free(self: *Heap, h: *HeapHeader) void {
-        if (builtin.optimize.runtimeSafety() and h.kind == poisoned_kind) {
-            std.debug.panic("heap.free: double-free detected on *HeapHeader {*}", .{h});
-        }
-        if (isLarge(h)) {
-            const large = Large.of(h);
-            var link = &self.large_head;
-            while (link.*) |l| : (link = &l.next) {
-                if (l == large) break;
-            } else std.debug.panic("heap.free: block {*} not found among the large blocks", .{h});
-            link.* = large.next;
-            self.live_bytes -= large.len;
-            self.backing.free(large.bytes());
-            return;
-        }
-        const slab = Slab.of(h);
-        const cls = &self.classes[slab.class];
-        h.kind = poisoned_kind;
-        h.meta = cls.free;
-        cls.free = h;
-        slab.live -= 1;
-        self.live_bytes -= slab.info().size;
-    }
-
     // ---- Body accessors ----
 
     /// Typed body pointer. The body sits at a 16-byte-aligned address
@@ -663,11 +632,10 @@ pub const Heap = struct {
         return n;
     }
 
-    /// Read-only traversal. Invokes `visitor.visit(*HeapHeader)` for
-    /// every live block, strictly for observation — diagnostics, GC
-    /// mark-phase tracing, stats collection. The visitor must NOT call
-    /// `heap.free` / `heap.alloc` / `heap.sweepUnmarked` during the
-    /// walk; mutation invalidates the iterator.
+    /// `visitor.visit(*HeapHeader)` for every live block: `clearMarks`,
+    /// the retiring of transient edit tokens, tests and diagnostics.
+    /// The visitor may change a block's header bits but must not call
+    /// `alloc` or `sweepUnmarked`, which invalidate the walk.
     pub fn forEachLive(self: *const Heap, visitor: anytype) void {
         for (self.classes) |cls| {
             var cur = cls.slabs;
@@ -701,12 +669,8 @@ pub const Heap = struct {
     /// number of blocks freed. Rebuilds each class's free list in
     /// address order within a slab, and keeps or hands back every
     /// slab left empty (HEAP.md §2).
-    ///
-    /// `pinned` blocks survive regardless of mark state (GC.md §3); no
-    /// runtime module pins a block, only tests do.
     pub fn sweepUnmarked(self: *Heap) usize {
         var freed: usize = 0;
-        const keep = mark_bit_marked | mark_bit_pinned;
         for (&self.classes) |*cls| {
             cls.free = null;
             var link = &cls.slabs;
@@ -720,7 +684,7 @@ pub const Heap = struct {
                     i -= 1;
                     const h = slab.slot(i);
                     if (h.kind != poisoned_kind) {
-                        if (h.mark & keep != 0) {
+                        if (h.isMarked()) {
                             h.mark &= ~mark_bit_marked;
                             live += 1;
                             continue;
@@ -750,7 +714,7 @@ pub const Heap = struct {
         var link = &self.large_head;
         while (link.*) |l| {
             const h = l.header();
-            if (h.mark & keep != 0) {
+            if (h.isMarked()) {
                 h.mark &= ~mark_bit_marked;
                 link = &l.next;
                 continue;
@@ -822,7 +786,6 @@ test "alloc: returns 16-byte-aligned *HeapHeader; header zero-init except kind" 
     try testing.expectEqual(@as(?*HeapHeader, null), h.meta);
     try testing.expect(h.cachedHash() == null);
     try testing.expect(!h.isMarked());
-    try testing.expect(!h.isPinned());
 
     try testing.expectEqual(@as(usize, 1), heap.liveCount());
 }
@@ -866,24 +829,7 @@ test "Value ↔ *HeapHeader pointer round-trip" {
     try testing.expectEqual(h, back);
 }
 
-test "free: removes from live list; liveCount drops" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try heap.alloc(.string, 0);
-    const b = try heap.alloc(.bignum, 0);
-    const c = try heap.alloc(.list, 0);
-    try testing.expectEqual(@as(usize, 3), heap.liveCount());
-
-    heap.free(b);
-    try testing.expectEqual(@as(usize, 2), heap.liveCount());
-    heap.free(a);
-    try testing.expectEqual(@as(usize, 1), heap.liveCount());
-    heap.free(c);
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "mark / pinned helpers round-trip" {
+test "mark helpers round-trip" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const h = try heap.alloc(.string, 0);
@@ -893,17 +839,6 @@ test "mark / pinned helpers round-trip" {
     try testing.expect(h.isMarked());
     h.clearMarked();
     try testing.expect(!h.isMarked());
-
-    try testing.expect(!h.isPinned());
-    h.setPinned();
-    try testing.expect(h.isPinned());
-    // Marked and pinned are independent bits.
-    h.setMarked();
-    try testing.expect(h.isPinned() and h.isMarked());
-    h.clearPinned();
-    try testing.expect(!h.isPinned() and h.isMarked());
-
-    heap.free(h);
 }
 
 test "meta helpers update has_meta flag in lockstep" {
@@ -954,22 +889,6 @@ test "sweepUnmarked: unmarked freed, marked survive and are reset" {
     // Survivors had their marked bit cleared.
     try testing.expect(!a.isMarked());
     try testing.expect(!c.isMarked());
-}
-
-test "sweepUnmarked: pinned objects always survive" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const pinned = try heap.alloc(.durable_ref, 0);
-    const transient_obj = try heap.alloc(.string, 0);
-    pinned.setPinned();
-    // Neither is marked.
-
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 1), freed);
-    try testing.expectEqual(@as(usize, 1), heap.liveCount());
-    try testing.expect(pinned.isPinned());
-    _ = transient_obj; // freed
 }
 
 test "sweepUnmarked: all unmarked -> fully drained heap" {
@@ -1029,7 +948,6 @@ test "alloc: body_size = 0 is legal" {
     defer heap.deinit();
     const h = try heap.alloc(.list, 0);
     try testing.expectEqual(@as(usize, 0), Heap.bodyBytes(h).len);
-    heap.free(h);
 }
 
 test "alloc: overflow in total_size rejects with error.Overflow" {
@@ -1067,16 +985,16 @@ test "hasMeta: stays coherent with flag_has_meta through setMeta" {
     try testing.expectEqual(@as(?*HeapHeader, null), a.getMeta());
 }
 
-test "sweepUnmarked: free head + next consecutively, survivor preserved" {
+test "sweepUnmarked: the blocks after the survivor in a slab are freed together" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
 
-    // Alloc order prepends to head; so this writes head = c -> b -> a.
+    // Three neighbouring slots of the 16-byte class.
     const a = try heap.alloc(.string, 0);
-    _ = try heap.alloc(.bignum, 0); // b — head->next after c is allocated
-    _ = try heap.alloc(.list, 0); // c — current head
+    _ = try heap.alloc(.bignum, 0);
+    _ = try heap.alloc(.list, 0);
 
-    // Mark only `a` (the tail). Head (c) and its next (b) both sweep.
+    // Mark only `a`; its two neighbours sweep.
     a.setMarked();
     const freed = heap.sweepUnmarked();
     try testing.expectEqual(@as(usize, 2), freed);
@@ -1101,18 +1019,6 @@ test "sweepUnmarked: alternating survive / free / survive / free" {
     try testing.expectEqual(@as(usize, 2), heap.liveCount());
     try testing.expect(!hs[0].isMarked());
     try testing.expect(!hs[2].isMarked());
-}
-
-test "sweepUnmarked: pinned + marked stays pinned, mark clears" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const h = try heap.alloc(.durable_ref, 0);
-    h.setPinned();
-    h.setMarked();
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 0), freed);
-    try testing.expect(h.isPinned());
-    try testing.expect(!h.isMarked());
 }
 
 test "forEachLive: read-only traversal is callable through *const Heap" {
@@ -1166,7 +1072,7 @@ test "alloc stress: 256 allocations, sweep half, deinit the rest" {
     }
 }
 
-test "byte counters: alloc adds, free and sweep subtract, peak holds, the window resets" {
+test "byte counters: alloc adds, the sweep subtracts, peak holds, the window resets" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     try testing.expectEqual(@as(usize, 0), heap.live_bytes);
@@ -1174,28 +1080,26 @@ test "byte counters: alloc adds, free and sweep subtract, peak holds, the window
     // A block counts its class's size: 16 + 16 and 16 + 48 bytes fill
     // the 32- and 64-byte classes exactly.
     const a = try heap.alloc(.string, 16);
-    const b = try heap.alloc(.string, 48);
+    _ = try heap.alloc(.string, 48);
     try testing.expectEqual(@as(usize, 96), heap.live_bytes);
     try testing.expectEqual(@as(usize, 96), heap.peak_live_bytes);
     try testing.expectEqual(@as(usize, 96), heap.allocated_since_collect);
 
-    heap.free(b);
-    try testing.expectEqual(@as(usize, 32), heap.live_bytes);
-    try testing.expectEqual(@as(usize, 96), heap.peak_live_bytes);
-
     heap.resetAllocationCounter();
     try testing.expectEqual(@as(usize, 0), heap.allocated_since_collect);
 
-    _ = try heap.alloc(.list, 0); // unmarked: swept
+    _ = try heap.alloc(.list, 0); // unmarked, as b: swept
     a.setMarked();
     _ = heap.sweepUnmarked();
     try testing.expectEqual(@as(usize, 32), heap.live_bytes);
+    try testing.expectEqual(@as(usize, 112), heap.peak_live_bytes);
     try testing.expectEqual(@as(usize, 16), heap.allocated_since_collect);
 
     // A large block counts its allocation, prefix included.
-    const big = try heap.alloc(.string, max_small_block);
+    _ = try heap.alloc(.string, max_small_block);
     try testing.expectEqual(@as(usize, 32 + @sizeOf(Large) + 16 + max_small_block), heap.live_bytes);
-    heap.free(big);
+    a.setMarked();
+    _ = heap.sweepUnmarked();
     try testing.expectEqual(@as(usize, 32), heap.live_bytes);
 }
 
@@ -1265,8 +1169,9 @@ test "slabs: a freed slot is reused, a sweep hands empty slabs back beyond the o
     try testing.expectEqual(Slab.of(keep.?), Slab.of(again));
     try testing.expectEqual(@as(usize, Heap.empty_slabs_kept_min), heap.empty_slab_count);
 
-    // A freed block's slot is the next one handed out in its class.
-    heap.free(again);
+    // A swept block's slot is the next one handed out in its class.
+    keep.?.setMarked();
+    try testing.expectEqual(@as(usize, 1), heap.sweepUnmarked());
     try testing.expectEqual(again, try heap.alloc(.persistent_vector, 500));
 }
 
