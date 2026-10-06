@@ -170,7 +170,10 @@ otherwise it is an ordinary call. User macros shadow host macros.
      error throws `:reader-error`. Only the text up to the end of the
      first form is scanned and read (`reader.firstFormEnd`), so what
      follows it is ignored, as in Clojure, even text that would not
-     read.
+     read. A text with no first form is read whole, to tell one that
+     holds no form (the hook answers null, and `read-string` gives
+     its `:eof` option, `docs/STDLIB.md` §2) from one that ends inside
+     a form.
    - `(eval form)` converts the value to a Form, then compiles it as
      the REPL compiles a line: the current namespace, the registry,
      interner, host macros and loader, a fresh set of declared

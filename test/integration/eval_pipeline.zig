@@ -5785,6 +5785,36 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"\\\\u{110000}\") (catch :reader-error e :bad))", ":bad");
 }
 
+test "read-string: an options map's :eof is the value of a string that holds no form" {
+    try expectOutput(
+        \\[(read-string {:eof :x} "") (read-string {:eof :x} "  ; c\n #_ 1 #_ 'a") (read-string {:eof nil} " ")
+        \\ (read-string {:eof :x :other 1} "1 2") (read-string {} "[2]")]
+    , "[:x :x nil 1 [2]]");
+    // Without :eof, an empty string is a reader error; a form left
+    // open, a prefix or metadata with nothing after it is one even
+    // with :eof, as in Clojure.
+    try expectOutput(
+        \\(mapv (fn [s] (try (read-string {:eof :x} s) (catch :reader-error e :bad))) ["(" "'" "^:k" "#_" ")"])
+    , "[:bad :bad :bad :bad :bad]");
+    try expectOutput(
+        \\[(try (read-string {} "") (catch any e e)) (try (read-string 1 "1") (catch any e e)) (try (read-string {:eof 1} 2) (catch any e e))]
+    , "[:reader-error :kind-mismatch :kind-mismatch]");
+}
+
+test "edn: nexis.edn/read-string reads one value as data and evaluates nothing" {
+    try expectOutput(
+        \\(pr-str [(nexis.edn/read-string "{:a [1 2.5 \"s\" \\c sym nil true #{:k}]} ignored")
+        \\         (nexis.edn/read-string "(+ 1 2)") (nexis.edn/read-string "") (nexis.edn/read-string nil)
+        \\         (nexis.edn/read-string {:eof :done} " ; nothing") (nexis.edn/read-string {:eof :done} nil)])
+    , "[{:a [1 2.5 \"s\" \\c sym nil true #{:k}]} (+ 1 2) nil nil :done nil]");
+    // No tagged literals: a tag is a reader error whatever :readers says.
+    try expectOutput(
+        \\[(try (nexis.edn/read-string "#inst \"2020\"") (catch any e e))
+        \\ (try (nexis.edn/read-string {:readers {'foo inc}} "#foo 1") (catch any e e))
+        \\ (try (nexis.edn/read-string {} "") (catch any e e)) (read-string "[1]")]
+    , "[:reader-error :reader-error :reader-error [1]]");
+}
+
 // =============================================================================
 // eval: a form as data, compiled and run on the calling VM
 // (MACROEXPAND.md §1.2 item 9, COMPILER.md §7)
@@ -6701,8 +6731,8 @@ test "require: the clojure.* library names reach the nexis namespaces" {
     var files: RequireDir = undefined;
     try files.init(&program, &.{});
     defer files.deinit();
-    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1]))]");
-    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2]]");
+    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w] '[clojure.edn :as edn])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1])) (eval '(edn/read-string \"[:e]\"))]");
+    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2] [:e]]");
 }
 
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {

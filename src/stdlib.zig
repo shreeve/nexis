@@ -142,6 +142,8 @@ const embedded = [_]Embedded{
     .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx") } },
     // Clojure's clojure.walk; before test.nx, whose `are` uses it.
     .{ .ns = "nexis.walk", .info = .{ .path = "walk.nx", .text = @embedFile("stdlib/walk.nx") } },
+    // Clojure's clojure.edn.
+    .{ .ns = "nexis.edn", .info = .{ .path = "edn.nx", .text = @embedFile("stdlib/edn.nx") } },
     // deftest, is, testing, run-tests (docs/TOOLING.md §3).
     .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx") } },
     // pprint, pprint-str (docs/TOOLING.md §4).
@@ -296,7 +298,7 @@ const core_natives = table("", .{
     // The compiler at run time.
     .{ "macroexpand-1", 1, 1, &fnMacroexpand1 },
     .{ "macroexpand", 1, 1, &fnMacroexpand },
-    .{ "read-string", 1, 1, &fnReadString },
+    .{ "read-string", 1, 2, &fnReadString },
     .{ "eval", 1, 1, &fnEval },
     // Metadata (SEMANTICS.md §7).
     .{ "meta", 1, 1, &fnMeta },
@@ -2737,12 +2739,24 @@ fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
     return form;
 }
 
-/// `(read-string s)` → the first form of `s` as data; a string
-/// that does not read throws `:reader-error`.
+/// `(read-string s)`, `(read-string opts s)` → the first form of `s`
+/// as data. A string that holds no form is the value of `:eof` in the
+/// map `opts` when it has the key, else `:reader-error`, as is text
+/// that does not read (STDLIB.md §2).
 fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const s = args[args.len - 1];
+    const opts = if (args.len == 2) args[0] else value_mod.nilValue();
+    if (s.kind() != .string or (args.len == 2 and opts.kind() != .persistent_map)) return VmError.KindMismatch;
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
-    return try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(args[0]));
+    if (try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(s))) |form| return form;
+    if (args.len == 2) {
+        const eof = vm.ensureInterner().internKeywordValue("eof") catch return VmError.OutOfMemory;
+        switch (champ_mod.mapGet(opts, eof, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+            .present => |v| return v,
+            .absent => {},
+        }
+    }
+    return vm.throwKeyword("reader-error");
 }
 
 /// `(eval form)` → the value of `form` compiled in the current

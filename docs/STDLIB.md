@@ -23,8 +23,8 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
    `math_natives` into `nexis.math`, `internal_natives` into
    `nexis.internal`, and `src/nextomic/natives.zig` into `nextomic`.
 3. The embedded sources, each evaluated with its namespace current:
-   `core.nx`, `nextomic.nx`, `walk.nx`, `test.nx`, `pprint.nx`,
-   `math.nx`, `string.nx`, `set.nx`.
+   `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
+   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -39,6 +39,7 @@ loader's diagnostic.
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
 | `nexis.set` | — | `set.nx` | §4 |
 | `nexis.walk` | — | `walk.nx` | §4 |
+| `nexis.edn` | — | `edn.nx` | §4 |
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`) | TOOLING.md §4 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
@@ -55,10 +56,10 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts five Clojure library namespaces:
+`src/loader.zig`) accepts six Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
 `clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
-`clojure.walk` → `nexis.walk`.
+`clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`.
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
@@ -110,7 +111,7 @@ string function panics on one.
 | `parse-double` | 1 | The float a string spells in the grammar Clojure's `parse-double` admits (Java's `Double/valueOf`): control or space bytes around an optional sign and `NaN`, `Infinity`, a decimal with an optional exponent (`"1e3"`, `".5"`, `"5."`) or a hex significand with its binary exponent (`"0x1p3"`), the last two with an optional `f`, `F`, `d` or `D` suffix; anything else nil (`"inf"`, `"nan"`, `"1_000"`, `"0x10"`) | `:kind-mismatch` |
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
-| `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
+| `read-string` | 1–2 | `(read-string s)`, `(read-string opts s)`: the first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored. A string that holds no form (only whitespace, comments and `#_` discards) is the value of `:eof` in the map `opts` when it has that key; other keys are ignored | `:kind-mismatch` (a non-string, or `opts` not a map), `:reader-error` (no form and no `:eof`, a form left open, or text that does not read) |
 | `compare` | 2 | -1, 0 or 1. Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6). Only the sign is the contract: Clojure's `compare` of two strings is `String.compareTo`'s difference (`(compare "B" "a")` is -31 there, -1 here) | — |
 
 **`format`.** `(format fmt & args)` is a subset of Java's
@@ -182,7 +183,7 @@ mapping, normalization and grapheme segmentation are absent
 
 ---
 
-### 4. `nexis.set` and `nexis.walk`
+### 4. `nexis.set`, `nexis.walk` and `nexis.edn`
 
 **`nexis.set`** is Clojure's `clojure.set`, written in
 `src/stdlib/set.nx` over the core collection functions.
@@ -222,6 +223,17 @@ VM's frames, so a form nested past the frame cap is a catchable
 | `macroexpand-all` | 1 | Every list in the form `macroexpand`ed, outermost first (a host macro's expansion is the expander's, so `when` gives `(if c (do ...) nil)`) |
 
 `postwalk-demo` and `prewalk-demo` are absent.
+
+**`nexis.edn`** is Clojure's `clojure.edn`, in `src/stdlib/edn.nx`:
+`(read-string s)` and `(read-string opts s)` are `nexis.core`'s
+`read-string` with `{:eof nil}` unless `opts` give an `:eof`, so a
+string with no form is nil, and nil for a nil `s`. Nothing is
+evaluated (the reader has no `#=`). It reads nexis's syntax, which
+EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
+it stands for, where Clojure's EDN reader refuses it, and the reader
+has no tagged literals (PLAN §4), so a tag is a `:reader-error` and
+`:readers` and `:default` have nothing to apply to. There is no `read`
+from a stream.
 
 ---
 

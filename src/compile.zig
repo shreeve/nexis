@@ -2154,14 +2154,16 @@ pub const RuntimeHooks = struct {
             return failure(v, err, "macro-expansion-failure");
     }
 
-    /// The first form of `source`, as data.
-    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!value_mod.Value {
+    /// The first form of `source`, as data; null when it holds none.
+    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!?value_mod.Value {
         const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
         var arena = std.heap.ArenaAllocator.init(v.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const form = readFirstForm(a, source) catch |err|
-            return failure(v, err, "reader-error");
+        const form = readFirstForm(a, source) catch |err| switch (err) {
+            error.NoForm => return null,
+            else => return failure(v, err, "reader-error"),
+        };
         var ctx = self.context(a, v);
         return expand_mod.formToValue(&ctx, form) catch |err|
             return failure(v, err, "reader-error");
@@ -2173,10 +2175,21 @@ pub const RuntimeHooks = struct {
     /// and the cost is the first form's.
     fn readFirstForm(a: std.mem.Allocator, source: []const u8) !*reader_mod.Form {
         const text = source[0..@min(source.len, reader_mod.max_source_len)];
-        const end = reader_mod.firstFormEnd(text) orelse return error.ReaderFailure;
+        const end = reader_mod.firstFormEnd(text) orelse
+            return if (try holdsNoForm(a, text)) error.NoForm else error.ReaderFailure;
         const p = try reader_mod.parser.parseForm(a, text[0..end]);
         var reader = reader_mod.Reader.init(a, text[0..end]);
         return reader.readOneForm(p.sexp);
+    }
+
+    /// Whether `text`, which has no first form, holds no form at all:
+    /// it reads as a program of none (whitespace, comments and whole
+    /// discards), rather than ending inside one.
+    fn holdsNoForm(a: std.mem.Allocator, text: []const u8) !bool {
+        const p = reader_mod.parser.parseProgram(a, text) catch |err| return if (err == error.OutOfMemory) err else false;
+        var reader = reader_mod.Reader.init(a, text);
+        const forms = reader.readProgram(p.sexp) catch |err| return if (err == error.OutOfMemory) err else false;
+        return forms.len == 0;
     }
 
     /// `(eval form)`: `form_value` as a Form, compiled the way the

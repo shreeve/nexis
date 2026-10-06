@@ -1025,9 +1025,10 @@ pub const CompilerHooks = struct {
     /// One macro step on `form`: the expansion when `form` is a
     /// macro call, null when it is not. Expansion failures throw.
     expand_once: *const fn (*anyopaque, *VM, Value) VmError!?Value,
-    /// The first form of `source` as a value; a form that does not
-    /// read throws `:reader-error`.
-    read_string: *const fn (*anyopaque, *VM, []const u8) VmError!Value,
+    /// The first form of `source` as a value, null when it holds
+    /// none (only whitespace, comments and discards); a form that
+    /// does not read throws `:reader-error`.
+    read_string: *const fn (*anyopaque, *VM, []const u8) VmError!?Value,
     /// `form` macroexpanded and compiled in the current namespace
     /// and run on this VM as a nested call (`runRoutine`); the
     /// value it returns. A form that does not compile throws. Null

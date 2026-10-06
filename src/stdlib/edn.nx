@@ -1,0 +1,12 @@
+; src/stdlib/edn.nx — the `nexis.edn` namespace, Clojure's clojure.edn
+; (which names this namespace; docs/STDLIB.md §4). Embedded via
+; @embedFile and bootstrapped with nexis.edn current.
+
+; (read-string s), (read-string opts s) → the first value of the
+; string s as data, never evaluated: nexis.core/read-string with
+; {:eof nil} unless opts give an :eof; nil for a nil s. The reader
+; has no tagged literals, so :readers and :default find nothing to
+; read and a tag is a :reader-error.
+(defn read-string
+  ([s] (read-string {:eof nil} s))
+  ([opts s] (when s (nexis.core/read-string opts s))))
