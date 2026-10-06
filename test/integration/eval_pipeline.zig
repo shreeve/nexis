@@ -1858,6 +1858,26 @@ test "integration: resolve and ns-resolve name a Var through the namespace's nam
     , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 :kind-mismatch :no-such-namespace]");
 }
 
+test "vars: alter-var-root sets a Var's root through a function, beneath a binding too" {
+    try expectOutputProgram("(def x 1) (defn f [] x) [(alter-var-root #'x + 10 5) x (f) (try (alter-var-root 1 inc) (catch any e e))]", "[16 16 16 :kind-mismatch]");
+    try expectOutputProgram("(def ^:dynamic *d* 1) [(binding [*d* 2] [(alter-var-root #'*d* inc) *d*]) *d*]", "[[2 2] 2]");
+    // An unbound Var's root is nil to the function, and bound after.
+    try expectOutputProgram("(def u) [(alter-var-root #'u (constantly 3)) u]", "[3 3]");
+}
+
+test "vars: with-redefs sets roots for its body and restores them on every exit" {
+    try expectOutputProgram("(defn f [] :f) (defn g [] (f)) (def n 1) [(with-redefs [f (fn [] :redef) n 2] [(f) (g) n]) (f) n]", "[[:redef :redef 2] :f 1]");
+    try expectOutputProgram("(defn f [] :f) [(try (with-redefs [f (fn [] :r)] (throw :boom)) (catch any e e)) (f)]", "[:boom :f]");
+    try expectOutputProgram("(def x 1) [(with-redefs-fn {#'x 5} (fn [] x)) x]", "[5 1]");
+    try expectOutput("(with-redefs [rand-int (constantly 4)] (rand-int 100))", "4");
+}
+
+test "vars: *ns* is the current namespace's name symbol where a form is compiled and run; flush is a no-op" {
+    try expectOutputProgram("(ns app.core) (def here *ns*) (defmacro m [] (list 'quote (ns-name *ns*))) [here (= \"app.core\" (str *ns*)) (m) (ns-name *ns*)]", "[app.core true app.core app.core]");
+    try expectOutputProgram("(in-ns 'other) (def a *ns*) (in-ns 'user) [other/a *ns* (do (in-ns 'x) (let [n *ns*] (in-ns 'user) n))]", "[other user x]");
+    try expectOutput("[(flush) (var? #'*ns*) *ns*]", "[nil true user]");
+}
+
 test "integration: a UUID is its canonical string" {
     try expectOutput("(let [u (random-uuid)] [(uuid? u) (string? u) (count u) (subs u 14 15) (contains? #{\\8 \\9 \\a \\b} (nth u 19)) (= u (parse-uuid u)) (not= u (random-uuid))])", "[true true 36 4 true true true]");
     try expectOutput("(pr-str [(parse-uuid \"0123ABCD-4567-89EF-0123-456789ABCDEF\") (parse-uuid \"nope\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdef0\") (parse-uuid \"0123abcd+4567-89ef-0123-456789abcdef\") (parse-uuid \"0123abcd-4567-89ef-0123-456789abcdeg\")])", "[\"0123abcd-4567-89ef-0123-456789abcdef\" nil nil nil nil]");

@@ -307,6 +307,7 @@ const core_natives = table("", .{
     .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings },
     .{ "var-set", 2, 2, &fnVarSet },
     .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
+    .{ "alter-var-root", 2, null, &fnAlterVarRoot },
     .{ "boolean", 1, 1, &fnBoolean },
     .{ "list?", 1, 1, kindPredicate(isList) },
     .{ "seq?", 1, 1, kindPredicate(isList) },
@@ -2900,6 +2901,23 @@ fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
     return args[1];
 }
 
+/// `(alter-var-root v f & args)` → sets the root of the Var `v` to
+/// `(apply f root args)` and returns it; a `binding` in force is left
+/// as it is. An unbound Var's root is nil to `f`, and bound after.
+fn fnAlterVarRoot(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = v.root;
+    @memcpy(call_args[1..], args[2..]);
+    // The root is the call's argument (GC.md §11.5, class 2).
+    const next = try vm.callValue(args[1], call_args);
+    v.root = next;
+    v.bound = true;
+    return next;
+}
+
 /// `(thread-bound? v)` → whether a `binding` of `v` is in force.
 fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_) return VmError.KindMismatch;
@@ -4947,6 +4965,7 @@ fn fnInNs(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .symbol) return VmError.KindMismatch;
     const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
     registry.switchTo(vm.ensureInterner().symbolName(args[0].asSymbolId())) catch return VmError.OutOfMemory;
+    registry.publishCurrent(vm.ensureInterner()) catch return VmError.OutOfMemory;
     return value_mod.nilValue();
 }
 

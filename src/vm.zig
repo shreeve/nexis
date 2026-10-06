@@ -771,6 +771,17 @@ pub const NamespaceRegistry = struct {
         self.current = ns;
     }
 
+    /// Set the root of `nexis.core/*ns*`, once `core.nx` defines it,
+    /// to the current namespace's name symbol (a namespace is its
+    /// name, STDLIB.md §8). The compiler calls this before it
+    /// expands each form and `in-ns` after it switches, so a macro
+    /// and the code a form runs read the namespace the form is
+    /// compiled in.
+    pub fn publishCurrent(self: *NamespaceRegistry, interner: *intern_mod.Interner) !void {
+        const v = self.core.lookupLocal("*ns*") orelse return;
+        v.root = try interner.internSymbolValue(self.current.name);
+    }
+
     fn makeNamespace(
         self: *NamespaceRegistry,
         name: []const u8,

@@ -229,8 +229,32 @@
 ; §2b): it rebinds the innermost binding of *a* to v through var-set
 ; and returns v, :not-dynamic outside a dynamic Var, :no-thread-binding
 ; outside any binding of it, and refuses a lexical name at compile
-; time. The root binding never changes here; def is the only root
-; write.
+; time. The root binding never changes here; def and alter-var-root
+; write roots.
+
+; (with-redefs-fn {#'v val ...} f) → calls f with each Var's root set
+; to its value, every root restored on every exit. A root write, not
+; a binding: every caller sees it, and a Var need not be dynamic.
+(defn with-redefs-fn [binding-map func]
+  (let* [root-bind (fn* [m] (reduce-kv (fn* [_ v x] (alter-var-root v (constantly x))) nil m))
+         old-vals (reduce-kv (fn* [m v _] (assoc m v (alter-var-root v identity))) {} binding-map)]
+    (try
+      (root-bind binding-map)
+      (func)
+      (finally (root-bind old-vals)))))
+
+; (with-redefs [name val ...] body...) → body with the roots of the
+; Vars the names resolve to set to the values, as with-redefs-fn.
+(defmacro with-redefs [bindings & body]
+  `(with-redefs-fn
+     (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
+                         (partition 2 bindings)))
+     (fn [] ~@body)))
+
+; The namespace a form is compiled in, as its name symbol: the
+; compiler sets the root before it expands each top-level form, and
+; in-ns when it switches (STDLIB.md §8).
+(def ^:dynamic *ns* 'nexis.core)
 
 ; ============================================================
 ; Function combinators and collection helpers
@@ -819,6 +843,8 @@
 ; ============================================================
 
 (defn newline [] (print "\n"))
+; Every print writes through at once (STDLIB.md §6): nothing to flush.
+(defn flush [] nil)
 (defn print-str [& xs] (with-out-str (apply print xs)))
 (defn println-str [& xs] (with-out-str (apply println xs)))
 (defn prn-str [& xs] (with-out-str (apply prn xs)))

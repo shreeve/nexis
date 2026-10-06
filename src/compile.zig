@@ -2385,8 +2385,16 @@ fn expandFailure(err: expand_mod.ExpandError, ctx: *const expand_mod.ExpandConte
 /// Clojure's `eval` runs them. Without an interner nothing expands.
 pub fn expandTopLevel(allocator: std.mem.Allocator, form: *const reader_mod.Form, opts: CompileOptions) CompileError!*const reader_mod.Form {
     const interner = opts.interner orelse return form;
+    try publishNamespace(opts, interner);
     var ctx = expandContext(allocator, interner, opts, null);
     return expand_mod.expandHead(&ctx, form) catch |err| expandFailure(err, &ctx, form, opts);
+}
+
+/// `*ns*` names the namespace a form is expanded in
+/// (`NamespaceRegistry.publishCurrent`).
+fn publishNamespace(opts: CompileOptions, interner: *intern_mod.Interner) CompileError!void {
+    const registry = opts.registry orelse return;
+    registry.publishCurrent(interner) catch return CompileError.OutOfMemory;
 }
 
 /// The forms of `(do ...)`; null for any other form.
@@ -2407,6 +2415,7 @@ pub fn compileFormWith(
     opts: CompileOptions,
 ) CompileError!Compiled {
     const interner = opts.interner orelse return compileExpanded(allocator, form, opts);
+    try publishNamespace(opts, interner);
     var ceval_data = CompileEvalData{ .allocator = allocator, .opts = opts };
     var mctx = expandContext(allocator, interner, opts, &ceval_data);
     const expanded = expand_mod.expandForm(&mctx, form) catch |err| return expandFailure(err, &mctx, form, opts);
