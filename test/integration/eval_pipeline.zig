@@ -2253,6 +2253,7 @@ test "leaf natives: what a leaf body refuses goes the general way from every cal
     try expectOutput("[(conj [1] 2) (conj nil 1) (conj (list 1) 0) (conj #{} [1]) (conj {} [:a 1]) (conj (map inc [1]) 0) (apply conj [#{} 1]) (mapv conj [[] #{} {} (sorted-set)] [1 [2] [:k 3] 4]) (reduce conj [] (range 3)) (reduce conj #{} [1 1 2])]", "[[1 2] (1) (0 1) #{[1]} {:a 1} (0 2) #{1} [[1] #{[2]} {:k 3} #{4}] [0 1 2] #{1 2}]");
     try expectOutput("(do (defrecord P [x]) [(assoc {} :a 1) (assoc nil 1 2 3 4) (assoc [1 2] 2 3) (assoc {} [1] :v \"k\" :w) (:x (assoc (->P 1) :x 2)) (assoc (sorted-map 2 :b) 1 :a) (try (assoc [1] 5 :x) (catch any e e)) (apply assoc [{} [2] 3]) (mapv assoc [{} (sorted-map) [0]] [:a 1 0] [1 2 3])])", "[{:a 1} {1 2, 3 4} [1 2 3] {[1] :v, k :w} 2 {1 :a, 2 :b} :index-out-of-bounds {[2] 3} [{:a 1} {1 2} [3]]]");
     try expectOutput("(let [t (transient {}) v (transient [])] (assoc! t :a 1 [1] 2) (assoc! v 0 :x) (apply assoc! [t \"k\" 3]) (mapv assoc! [t v] [:b 1] [4 :y]) [(persistent! t) (persistent! v) (try (assoc! (transient #{}) 1 1) (catch any e e)) (try (assoc! t :c 1) (catch any e e))])", "[{:a 1, [1] 2, k 3, :b 4} [:x :y] :kind-mismatch :transient-used-after-persistent]");
+    try expectOutput("(pr-str [(str) (str nil 1 \\c \"s\") (str [1 (map inc [1])] :k 1.5) (apply str [1 :a]) (mapv str [1 nil (list 2) :k])])", "[\"\" \"1cs\" \"[1 (2)]:k1.5\" \"1:a\" [\"1\" \"\" \"(2)\" \":k\"]]");
 }
 
 test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {

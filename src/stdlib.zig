@@ -460,7 +460,7 @@ const core_natives = table("", .{
     .{ "satisfies?", 2, 2, &fnSatisfiesQ },
     // Core string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STDLIB.md` §2.
-    .{ "str", 0, null, &fnStr },
+    .{ "str", 0, null, &fnStrLeaf, .leaf, &fnStr },
     .{ "string?", 1, 1, &fnStringQ },
     .{ "subs", 2, 3, &fnSubs },
     // Regular expressions (docs/REGEX.md §9); `re-seq` is core.nx's.
@@ -4728,9 +4728,22 @@ fn writePlainStr(v: Value, out: []u8) []u8 {
 /// length; one string alone is itself, as in Clojure. Anything else
 /// goes through the printer.
 fn fnStr(vm: *VM, args: []const Value) VmError!Value {
+    return (try strPlain(vm, args)) orelse strFormatted(vm, args);
+}
+
+/// `str` as a leaf (VM.md §6): of nil, strings, chars and fixnums,
+/// whose text is written without walking anything; anything else goes
+/// the general way.
+fn fnStrLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return (try strPlain(vm, args)) orelse VmError.NeedsReentry;
+}
+
+/// `str` of `args` when each is nil, a string, a char or a fixnum;
+/// null otherwise.
+fn strPlain(vm: *VM, args: []const Value) VmError!?Value {
     if (args.len == 1 and args[0].kind() == .string) return args[0];
     var len: usize = 0;
-    for (args) |x| len += plainStrLen(x) orelse return strFormatted(vm, args);
+    for (args) |x| len += plainStrLen(x) orelse return null;
     const out = string_mod.allocUninit(vm.ensureHeap(), len) catch return VmError.OutOfMemory;
     var rest = out.bytes;
     for (args) |x| rest = writePlainStr(x, rest);
