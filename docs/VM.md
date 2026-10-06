@@ -252,7 +252,9 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
   lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
   symbol looks itself up exactly as a keyword does, and a transient
-  map, set or vector as its persistent kind.
+  map, set or vector as its persistent kind. A set, as `get` of one,
+  gives back the element it holds equal to `x`, which may differ from
+  `x` (`(#{'(1)} [1])` is `(1)`), as Clojure's does.
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 

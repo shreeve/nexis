@@ -1368,7 +1368,14 @@ pub fn setCount(s: Value) usize {
 }
 
 pub fn setContains(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) bool {
-    return SetTrie.find(s, elem, elementHash, elementEq) != null;
+    return setGet(s, elem, elementHash, elementEq) != null;
+}
+
+/// The element of `s` equal to `elem`, as `s` holds it, or null: what
+/// `(get s elem)` returns, which may differ from `elem` itself (a list
+/// for a vector key, a different number type).
+pub fn setGet(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) ?Value {
+    return SetTrie.find(s, elem, elementHash, elementEq);
 }
 
 /// `s` with `elem`; `s` itself when `elem` is already present.

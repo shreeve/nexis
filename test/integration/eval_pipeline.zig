@@ -2389,6 +2389,9 @@ test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get [10 20 30] 1)", "20");
     try expectOutput("(get [10 20 30] 99 :oob)", ":oob");
     try expectOutput("(get #{1 2 3} 2)", "2");
+    // A set gives back the element it holds, not the key it was asked
+    // with, wherever the two are equal and differ (babashka agrees).
+    try expectOutput("[(get #{(lazy-seq [1])} [1]) (#{(list 1)} [1]) (get #{} [1] :nf) (get (transient #{(list 1)}) [1]) ((transient #{(list 1)}) [1]) (some #{(list 1)} [[1]]) (get #{(list 1)} [2] :nf)]", "[(1) (1) :nf (1) (1) (1) :nf]");
     try expectOutput("(get nil :anything :fallback)", ":fallback");
 }
 

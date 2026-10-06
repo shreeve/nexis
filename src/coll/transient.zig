@@ -276,8 +276,14 @@ pub fn setDisjBang(heap: *Heap, t: Value, elem: Value, elementHash: ElementHash,
 }
 
 pub fn setContainsBang(t: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) TransientError!bool {
+    return try setGetBang(t, elem, elementHash, elementEq) != null;
+}
+
+/// The element of transient set `t` equal to `elem`, as it holds it
+/// (`champ.setGet`), or null.
+pub fn setGetBang(t: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) TransientError!?Value {
     const body = try activeBody(t, subkind_transient_set);
-    return champ.setContains(champ.valueFromSetHeader(body.inner_header), elem, elementHash, elementEq);
+    return champ.setGet(champ.valueFromSetHeader(body.inner_header), elem, elementHash, elementEq);
 }
 
 pub fn setCountBang(t: Value) TransientError!usize {

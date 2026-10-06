@@ -4962,12 +4962,8 @@ pub fn lookupIn(vm: ?*VM, coll: Value, key: Value, default: Value) VmError!Value
         // carries (docs/NEXTOMIC.md §6.1); the hook returns only errors
         // of this set.
         .nextomic_entity => nextomic_handle.entityLookup(coll, key, default) catch |err| return @as(VmError, @errorCast(err)),
-        .persistent_set => if (champ_mod.setContains(
-            coll,
-            key,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) key else default,
+        // The element the set holds, which may differ from an equal key.
+        .persistent_set => champ_mod.setGet(coll, key, &dispatch_mod.hashValue, &dispatch_mod.equal) orelse default,
         .persistent_vector => blk: {
             if (key.kind() != .fixnum) break :blk default;
             const idx = key.asFixnum();
@@ -4995,7 +4991,7 @@ fn transientFind(t: Value, k: Value) transient_mod.TransientError!?Value {
             .present => |v| v,
             .absent => null,
         },
-        transient_mod.subkind_transient_set => return if (try transient_mod.setContainsBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) k else null,
+        transient_mod.subkind_transient_set => return transient_mod.setGetBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => {
             if (k.kind() != .fixnum or k.asFixnum() < 0 or @as(usize, @intCast(k.asFixnum())) >= try transient_mod.vectorCountBang(t)) return null;
             return try transient_mod.vectorNthBang(t, @intCast(k.asFixnum()));
