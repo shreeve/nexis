@@ -1,0 +1,2 @@
+; An unterminated regex literal is a parse error at its opening `#"`.
+(println #"never closed)

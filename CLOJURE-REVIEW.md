@@ -191,12 +191,12 @@ are the map for someone who knows Clojure.
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
 | `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
-| `#"re"` | a regex | parse error | no regex (§24 #9) |
+| `#"re"` | a `Pattern` | a pattern, compiled when the source is read; a construct that needs backtracking is `:invalid-regex` | a linear-time engine (`docs/REGEX.md`) |
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 | `#!` | a comment to end of line | the CLI treats a first line starting `#!` as a comment; elsewhere a parse error | executable scripts only |
 
-The `#` dispatch set is `#{}`, `#(...)`, `#_` and `#'` (`#'foo` is
-`(var foo)`). Clojure's reader
+The `#` dispatch set is `#{}`, `#(...)`, `#_`, `#'` (`#'foo` is
+`(var foo)`) and `#"..."`. Clojure's reader
 throws ad-hoc exceptions for malformed input; nexis reports a stable
 keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 `:nested-anon-fn`, `:unquote-outside-syntax-quote`, ...; PLAN §28.3).
@@ -240,11 +240,14 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
 | `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |
 | `tap>` | taps run on another thread | taps run before `tap>` returns | `docs/STDLIB.md` §8 |
+| regular expressions | `java.util.regex`, a backtracking matcher | Java's syntax matched in linear time: backreferences, lookaround, atomic groups, possessive quantifiers, Unicode scripts, blocks and binary properties and `(?U)` are `:invalid-regex`; a pattern past 10 000 instructions or a bound past 1000 is too; an empty match advances one code point, not one UTF-16 unit; a capture inside a repeated group comes from the path that matched | `docs/REGEX.md` §6 |
+| `(re-pattern "(")`, `(replace s re "$2")` | `PatternSyntaxException`, `IndexOutOfBoundsException` | `{:error :invalid-regex :message M :pattern P :index I}`, `{:error :invalid-replacement :message M}` with Java's sentences | `docs/REGEX.md` §9, §11 |
+| `(split s ",")` | `split` takes a pattern only | a string separator splits on its occurrences, as a pattern matching only it would | `docs/STDLIB.md` §3 |
 
 ### 4.4 Absences
 
 The deliberate ones are PLAN §4's non-goals: multimethods, STM,
-agents, `core.async`, regex, reader conditionals,
+agents, `core.async`, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
 targets, Java interop. Library functions that do not exist are known gaps, not decisions
 (`HANDOFF.md` §6).

@@ -896,6 +896,20 @@ test "a realized lazy seq encodes byte for byte as the list of its elements; an 
     try testing.expectError(CodecError.UnserializableKind, decode(&ctx.heap, &ctx.interner, &wire, &synthHash, &synthEq));
 }
 
+test "a pattern and a matcher are unserializable; bytes 44 and 45 decode as UnserializableKind, 46 as InvalidKindByte" {
+    const regex = @import("regex.zig");
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const p = (try regex.make(&ctx.heap, testing.allocator, "a+")).ok;
+    const m = try regex.makeMatcher(&ctx.heap, p, try string.fromBytes(&ctx.heap, "aa"));
+    try testing.expectError(CodecError.UnserializableKind, encode(testing.allocator, &ctx.interner, p));
+    try testing.expectError(CodecError.UnserializableKind, encode(testing.allocator, &ctx.interner, m));
+    for ([_]struct { u8, CodecError }{ .{ 44, CodecError.UnserializableKind }, .{ 45, CodecError.UnserializableKind }, .{ 46, CodecError.InvalidKindByte } }) |c| {
+        const wire = [_]u8{ version_major, version_minor, c[0] };
+        try testing.expectError(c[1], decode(&ctx.heap, &ctx.interner, &wire, &synthHash, &synthEq));
+    }
+}
+
 test "decode: a list of four or more elements is a view of a vector, and encodes as it was" {
     var ctx = TestCtx.init();
     defer ctx.deinit();

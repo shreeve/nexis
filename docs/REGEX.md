@@ -2,7 +2,10 @@
 
 The regex engine (`src/regex.zig`): the syntax it accepts, how it
 matches, the limits that bound it, its Unicode data, where its results
-differ from `java.util.regex`, and the differential test against it.
+differ from `java.util.regex`, and the differential test against it;
+then the language over it: the pattern and matcher values, the
+`re-*` functions, the `#"..."` literal and the patterns
+`nexis.string` takes (§8–§11).
 Patterns are Java's syntax minus every construct that needs
 backtracking; matching is linear in the input.
 
@@ -336,3 +339,133 @@ compares every match and every group; the gate never needs a JVM. An
 empty Java match between the halves of a surrogate pair is dropped
 from the expected result (§6 #2), and a case where a Java match
 starts or ends inside a pair is not generated.
+
+---
+
+### 8. Patterns and matchers as values
+
+Two heap kinds carry regular expressions into the language
+(`docs/VALUE.md` §2.2).
+
+**`regex` (44)**, a pattern. `regex.make(heap, gpa, source)` compiles
+the source in a scratch arena and copies the program into one block:
+the `Program` and the source slice first, then the instructions, the
+ranges, the source text, the group names, the literal and the prefix,
+which the program's slices point at. A block never moves, so the
+pointers into it stay valid for its life. The block holds no Value:
+the collector treats it as a leaf, and the sweep frees it as it frees
+a string. A pattern is immutable.
+
+**`matcher` (45)**, the search state of `re-matcher`:
+`MatcherBox{pattern, input, next, last_end, state}` followed by two
+slots per group and two for the whole match, the spans of the last
+match (`none` for a group that did not take part). `re-find` on a
+matcher runs `Finder.find` from `next` with `\G` at `last_end` and
+writes the result back into the block; `pattern` and `input` never
+change, so the update needs no barrier. A search that fails leaves the
+matcher failed: every later `re-find` is nil and `re-groups` is
+`:invalid-argument`, as Java's matcher reports "No match found". The
+collector marks the pattern and the string (`regex.traceMatcher`).
+
+Both are identity kinds, as `java.util.regex.Pattern` and `Matcher`
+are (neither overrides `equals`): `=` only to themselves and hashed
+by their pointer (`docs/SEMANTICS.md` §3.3), so `(= #"a" #"a")` is
+false and `(let [p #"a"] (= p p))` true, as in Clojure. A pattern
+prints as `#"source"` in both modes with Clojure's `print-method`
+escaping: a backslash and the character after it are written as they
+are, a bare `"` as `\"`, and inside `\Q...\E` as `\E\"\Q`. `str` and
+`%s` of a pattern give its source (`Pattern.toString`); inside a
+collection it prints `#"..."`. A matcher prints `#<matcher #"source">`.
+`type` and `class` give `:regex` and `:matcher`. Neither takes
+metadata (`:kind-mismatch`) nor serializes (`:unserializable`,
+`docs/CODEC.md` §3): a decoded pattern could never be `=` to the one
+encoded.
+
+---
+
+### 9. The functions
+
+In `nexis.core`, with Clojure 1.12's results (the natives are in
+`src/stdlib.zig`, `re-seq` in `core.nx`). A **match** is the matched
+string when the pattern has no groups, else the vector `[whole g1 g2
+...]` with nil for a group that did not take part, as Clojure's
+`re-groups` builds it. Each function validates its string argument
+as UTF-8 once (`:utf8-error`, as `nexis.string` does); a matcher's
+string is validated when the matcher is made. A string where a
+pattern is needed is `:kind-mismatch`, as Clojure's cast to `Pattern`
+fails.
+
+| Name | Arity | Result |
+|---|---|---|
+| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points where the compiler stopped (`catch :invalid-regex` takes it) |
+| `re-matcher` | 2 | `(re-matcher re s)`: a fresh matcher (§8) |
+| `re-find` | 1–2 | `(re-find m)`: the next match of the matcher, or nil; `(re-find re s)`: the first match of `re` in `s`, or nil |
+| `re-matches` | 2 | The match of the whole of `s` (`Matcher.matches`: `(re-matches #"a\|ab" "ab")` is `"ab"`), or nil |
+| `re-groups` | 1 | The matcher's last match; `:invalid-argument` ("re-groups: no match found") when its last search failed or it has not searched |
+| `re-seq` | 2 | Every match, left to right, as a lazy seq that finds one match per element (Clojure's definition over `re-matcher` and `re-find`, unchunked); nil when nothing matches. An empty match advances one code point (§3.5): `(re-seq #"a*" "baaa")` is `("" "aaa" "")` |
+
+Each search allocates the engine's scratch space (§1) for its program
+on the VM's allocator and frees it before it returns, so `re-find` on
+a matcher costs O(m·k) memory per call and holds none between calls.
+
+---
+
+### 10. The literal
+
+`#"..."` is the reader's `regex` datum (`docs/FORMS.md` §2, PLAN
+§28.2): the text between `#"` and the closing `"`, with no escape
+processing, as Clojure's `RegexReader` hands it to `Pattern.compile`.
+The scanner (`src/nexis.zig`) runs a regex token as it runs a string,
+a backslash taking the byte after it, so `#"\""` holds `\"` and
+`#"\\"` holds `\\`; an unterminated one is a parse error at its `#"`.
+The reader compiles the text once (`regex.compile`, nothing on the
+heap) and reports one that does not compile as `:invalid-regex` over
+the literal's span, the detail the sentence and the code-point index
+(`Unclosed group at index 1`).
+
+The compiler lifts the datum into a pattern constant of the routine,
+made on the compile heap as a string literal is: each evaluation of
+one `#"a"` returns the same pattern, as Clojure's constant does, and
+two literals in the source are two patterns. `quote` and a macro's
+arguments see a pattern value (`formToValue`), and a macro may return
+a pattern, which becomes the literal of its source again
+(`valueToForm`). `read-string` gives a pattern, and its
+`:reader-error` covers an invalid one. Two regex literals are never
+duplicate keys: `#{#"a" #"a"}` reads, a set of two patterns.
+
+---
+
+### 11. Patterns in `nexis.string`
+
+`split`, `replace` and `replace-first` take a pattern where they take
+a literal string (`docs/STDLIB.md` §3), with the results of Java's
+`Pattern.split`, `Matcher.replaceAll` and `replaceFirst` and of
+Clojure's `replace-by`, all over the find loop of §3.5. A literal
+pattern (`#","`) searches with `string.Matches`, the SIMD search the
+string separators use.
+
+- **`split`**: a match that is empty at the start of the input makes
+  no leading piece; a positive limit keeps at most that many pieces,
+  the last the rest of the input; a limit of 0 (the default) drops the
+  trailing empty pieces, a negative one keeps them; an input with no
+  match is `[s]`. `(split "abc" #"")` is `["a" "b" "c"]`.
+- **A replacement string** is read as `Matcher.appendReplacement`
+  reads it (`regex.parseReplacement`), once, at the first match, so a
+  replacement no match uses is never judged: `$n` takes the longest
+  run of digits that names a group, the first digit always counting
+  (with one group, `"$12"` is group 1 and then `2`); `${name}` a named
+  group; `\x` the code point `x`; a group that did not take part
+  inserts nothing. Java's errors are thrown as `{:error
+  :invalid-replacement :message M}` with Java's sentences: `No group
+  2`, `Illegal group reference`, `Illegal group reference: group index
+  is missing`, `character to be escaped is missing`, `No group with
+  name {y}`, `named capturing group has 0 length name`, `capturing
+  group name {1x} starts with digit character`, `named capturing group
+  is missing trailing '}'`.
+- **A replacement function** is called with each match (a string, or
+  the groups vector) and must return a string (`:kind-mismatch`
+  otherwise; anything not callable is `:not-callable`). The result
+  grows in a Zig buffer and the match is the call's argument, so no
+  heap value is held across the call (`docs/GC.md` §11.5).
+- A replace that finds nothing returns `s` itself.
+- `re-quote-replacement` puts a backslash before each `\` and `$`.

@@ -773,6 +773,9 @@ thrown map, documented with the native: `:unserializable`
 (`docs/CODEC.md`), the `:db/*` and `:nextomic/*` errors
 (`docs/DB.md`, `docs/NEXTOMIC.md`),
 `:transient-used-after-persistent` (`docs/TRANSIENT.md`),
+`:invalid-regex` (a map, from `re-pattern`; `docs/REGEX.md` §9),
+`:invalid-replacement` (a map, from a pattern `replace`;
+`docs/REGEX.md` §11),
 `:no-metadata-on-immediate` (`docs/SEMANTICS.md` §7) and
 `:no-compiler` (`docs/MACROEXPAND.md` §1.2).
 

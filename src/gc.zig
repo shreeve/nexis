@@ -48,6 +48,7 @@ const sorted = @import("coll/sorted.zig");
 const transient_mod = @import("coll/transient.zig");
 const db_mod = @import("db.zig");
 const atom_mod = @import("atom.zig");
+const regex = @import("regex.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 
@@ -168,7 +169,7 @@ pub const Collector = struct {
     /// `trace` has one empty arm for them.
     fn isLeafKind(kind: u16) bool {
         return switch (@as(Kind, @fromBackingInt(@intCast(kind)))) {
-            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => true,
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex => true,
             else => false,
         };
     }
@@ -193,7 +194,7 @@ pub const Collector = struct {
         switch (k) {
             // The leaves (`isLeafKind`): numbers, bytes or pointers
             // the VM owns, no heap value but the metadata just marked.
-            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => {},
+            .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db, .regex => {},
             .list => list.trace(h, self),
             .lazy_seq => lazy.trace(h, self),
             .persistent_vector => vector.trace(h, self),
@@ -202,6 +203,7 @@ pub const Collector = struct {
             .sorted_map, .sorted_set => sorted.trace(h, self),
             .transient => transient_mod.trace(h, self),
             .atom => atom_mod.trace(h, self),
+            .matcher => regex.traceMatcher(h, self),
             .record => record_mod.trace(h, self),
             .nextomic_entity => nextomic_handle.traceEntity(h, self),
             // Closures and upvalue cells: the host lays them out and

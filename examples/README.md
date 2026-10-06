@@ -30,6 +30,7 @@ files.
 | `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing |
 | `macro-author.nx` | Synthesizing a `(let* [x 99] x)` form with a vector syntax-quote |
 | `try-catch.nx` | `try` / `catch` / `throw` across frames; catch by keyword tag; `finally` alone |
+| `regex.nx` | `#"..."` patterns: `re-find`, `re-matches`, a lazy `re-seq`, a matcher with `re-groups`, named groups, `split` / `replace` / `replace-first` with patterns, `$n` and `${name}` replacements and a function replacement, the `(?i)` and `(?iu)` flags and `\p{Lu}`, `:invalid-regex` and `:invalid-replacement`, and a pattern that stalls a backtracking engine finishing in linear time |
 | `metadata.nx` | `defn` docstrings and attribute maps, `(doc f)`, `^:private`, `with-meta` / `vary-meta` on collections |
 | `binding.nx` | `^:dynamic` Vars and `binding`: nested extents, a function called inside one seeing the binding in force, restoration on throw, `set!` on the innermost binding, `:not-dynamic` |
 | `maps-sets.nx` | `{...}` and `#{...}` literals |

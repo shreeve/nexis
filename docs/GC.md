@@ -161,7 +161,7 @@ The dispatch in `Collector.trace`:
 
 | Kind | Trace | Walks |
 |---|---|---|
-| `string`, `bignum`, `typed_vector`, `durable_ref`, `protocol`, `protocol_fn`, `nextomic_conn`, `nextomic_db` | none: the leaves | nothing: bytes, limbs, unboxed elements, inline store id, tree and key (a durable ref's advisory connection pointer is not a heap block, `docs/DB.md` §7.3), ids, or a VM-owned pointer with inline text and numbers |
+| `string`, `bignum`, `typed_vector`, `durable_ref`, `protocol`, `protocol_fn`, `nextomic_conn`, `nextomic_db`, `regex` | none: the leaves | nothing: bytes, limbs, unboxed elements, inline store id, tree and key (a durable ref's advisory connection pointer is not a heap block, `docs/DB.md` §7.3), ids, a VM-owned pointer with inline text and numbers, or a compiled pattern's inline program and source |
 | `list` | `list.trace` | subkind 0 (cons): every head, and the tail chain in a loop (cells through `markInternal`, a cell's meta through `mark`); subkind 1 (empty): nothing; subkind 2 (vector view): its vector, through `markValue`, also when the view ends a cons chain |
 | `lazy_seq` | `lazy.trace` | by the shape in the header's flags (`docs/LAZY.md` §3): a lazy block's producer arguments, a cons's first element, a chunked cons's every slot (unwritten ones are nil), each heap value through `markValue`; the chain (a lazy block's `result`, a cons's or chunked cons's `more`) in a loop, through `markInternal`, so a chain of any length costs no worklist; a list at the chain's end through `markValue` |
 | `persistent_vector` | `vector.trace` | the tail node, every slot of its block (vectors sharing a tail use different lengths of it, `docs/VECTOR.md` §2), and the trie, interior and leaf nodes through `markInternal` |
@@ -170,6 +170,7 @@ The dispatch in `Collector.trace`:
 | `transient` | `transient.trace` | the wrapped collection (`docs/TRANSIENT.md` §10) |
 | `atom` | `atom.trace` | the contained value, the validator and the watches map (`docs/ATOM.md` §7) |
 | `record` | `record.trace` | the field map |
+| `matcher` | `regex.traceMatcher` | the pattern and the string (`docs/REGEX.md` §8) |
 | `nextomic_entity` | `nextomic_handle.traceEntity` | the db-value box and the map of the entity's last full read |
 | `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |

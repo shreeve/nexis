@@ -1,0 +1,7 @@
+ok a literal pattern in a function clause filters
+ok a pattern bound through :in is the function's argument
+ok a function clause binds a pattern's matches as a collection
+ok the same query with its pattern runs twice from the cache
+ok a pattern as a datom value is :nextomic/value-type
+ok a pattern where a keyword value belongs is :nextomic/value-type too
+:done

@@ -23,10 +23,3 @@
 ; text of its value (str), the rest kept.
 (defn escape [s cmap]
   (apply str (map (fn [c] (if-some [r (cmap c)] r c)) s)))
-
-; (replace-first s match replacement) → s with the first occurrence of
-; match (a string or char, as replace takes) replaced, else s.
-(defn replace-first [s match replacement]
-  (if-some [i (index-of s match)]
-    (str (subs s 0 i) replacement (subs s (+ i (count (str match)))))
-    s))

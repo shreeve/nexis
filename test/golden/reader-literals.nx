@@ -34,6 +34,15 @@
   span lines"
 
 ; ----------------------------------------------------------------------
+; Regex literals — the text between the quotes as written
+
+#"a\d+"
+#"\""
+#"\\"
+#"é[😀]"
+#{#"a" #"a"}
+
+; ----------------------------------------------------------------------
 ; Characters — single, named, and unicode-escaped
 
 \a

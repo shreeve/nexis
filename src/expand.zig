@@ -20,6 +20,7 @@ const heap_mod = @import("heap.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
 const string_mod = @import("string.zig");
+const regex_mod = @import("regex.zig");
 const dispatch = @import("dispatch.zig");
 
 const Form = reader_mod.Form;
@@ -347,7 +348,7 @@ fn expandFormDepth(ctx: *ExpandContext, form: *const Form, depth: u32) ExpandErr
     try checkStack();
     const b = Builder{ .ctx = ctx, .origin = form.origin };
     return switch (form.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword, .symbol => mutCast(form),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword, .symbol => mutCast(form),
         .list => |items| try expandList(ctx, form, items, depth),
         // Collection literals are expressions: their items expand.
         .vector, .map, .set => try mapChildren(ctx, form, Walk{}),
@@ -559,6 +560,7 @@ fn describeForm(form: *const Form) []const u8 {
         .real => "a real",
         .char => "a char",
         .string => "a string",
+        .regex => "a regex",
         .keyword => "a keyword",
         .symbol => |sym| if (sym.ns != null) "a qualified symbol" else "a symbol",
         .list => "a list",
@@ -1305,6 +1307,14 @@ pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod
         .real => |f| value_mod.fromFloat(f),
         .char => |c| value_mod.fromChar(c) orelse ctx.fail(form.origin, "no char U+{X}", .{c}),
         .string => |bytes| string_mod.fromBytes(heap, bytes) catch return oom,
+        // The reader compiled it once already, so it compiles here.
+        .regex => |text| switch (regex_mod.make(heap, ctx.allocator, text) catch |err| return switch (err) {
+            error.OutOfMemory => oom,
+            error.StackOverflow => ExpandError.ExpansionDepthExceeded,
+        }) {
+            .ok => |p| p,
+            .err => |e| ctx.fail(form.origin, "{s}", .{e.msg}),
+        },
         .symbol => |name| ctx.interner.internQualifiedSymbol(name.ns, name.name) catch return oom,
         .keyword => |name| ctx.interner.internQualifiedKeyword(name.ns, name.name) catch return oom,
         .list, .vector, .set, .map => |items| blk: {
@@ -1414,6 +1424,9 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) Exp
         .float => .{ .real = v.asFloat() },
         .char => .{ .char = v.asChar() },
         .string => .{ .string = try ctx.allocator.dupe(u8, string_mod.asBytes(v)) },
+        // A macro may return a pattern, as Clojure's may: the literal
+        // of its source, a new pattern where it is evaluated.
+        .regex => .{ .regex = try ctx.allocator.dupe(u8, regex_mod.sourceOf(v)) },
         .symbol => .{ .symbol = nameOf(ctx.interner.symbolName(v.asSymbolId())) },
         .keyword => .{ .keyword = nameOf(ctx.interner.keywordName(v.asKeywordId())) },
         .list => blk: {
@@ -2104,7 +2117,7 @@ fn expandCond(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) 
 /// keyword, `true`, a number, a string or a char.
 fn isTruthyLiteral(form: *const Form) bool {
     return switch (form.datum) {
-        .keyword, .int, .bigint, .real, .string, .char => true,
+        .keyword, .int, .bigint, .real, .string, .regex, .char => true,
         .bool_ => |v| v,
         else => false,
     };
@@ -2755,7 +2768,7 @@ fn syntaxQuote(ctx: *ExpandContext, scope: *GensymScope, payload: *const Form) E
     const b = Builder{ .ctx = ctx, .origin = payload.origin };
     return switch (payload.datum) {
         // Self-evaluating: no quote needed.
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword => mutCast(payload),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword => mutCast(payload),
         .symbol => |name| b.list(.{ "quote", if (name.ns) |ns_prefix| blk: {
             const target = aliasTarget(ctx, ns_prefix);
             break :blk if (target.ptr == ns_prefix.ptr) mutCast(payload) else try makeQualifiedSymbol(ctx, target, name.name, payload.origin);

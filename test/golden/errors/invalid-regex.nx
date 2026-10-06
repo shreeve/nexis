@@ -1,0 +1,3 @@
+; A regex literal that does not compile is a reader error at the
+; literal, its detail the compiler's sentence and the index.
+#"("

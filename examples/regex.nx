@@ -1,0 +1,53 @@
+; examples/regex.nx — regular expressions (docs/REGEX.md)
+;
+;   - #"..." is a pattern literal; re-find, re-matches, re-seq and a
+;     matcher with re-find / re-groups, as in Clojure
+;   - a match is a string, or [whole group1 ...] when the pattern has
+;     groups; a group that did not take part is nil
+;   - nexis.string/split, replace and replace-first take a pattern;
+;     a replacement reads $1 and ${name}, or is a function of the match
+;   - an invalid pattern is :invalid-regex; matching is linear in the
+;     input, so a pattern that makes a backtracking engine stall
+;     finishes at once
+
+(require '[clojure.string :as str])
+
+(def log "2026-10-06 GET /index.html 200\n2026-10-06 POST /login 302\n2026-10-07 GET /missing 404")
+
+; The first match, and the whole-string match with its groups.
+(println (re-find #"\d{4}-\d\d-\d\d" log))
+(println (re-matches #"(\w+) (/\S*) (\d{3})" "GET /index.html 200"))
+(println (re-matches #"\d+" "12x"))
+
+; Every match, lazily: the paths, and the status of each request.
+(println (re-seq #"/\S*" log))
+(println (map (fn [[_ method code]] [method code]) (re-seq #"(?m)^\S+ (\w+) \S+ (\d+)$" log)))
+(println (first (re-seq #"\d" (apply str (repeat 1000000 "7")))))
+
+; A matcher walks the matches one re-find at a time.
+(let [m (re-matcher #"(?<key>\w+)=(?<val>\w+)" "a=1, b=2")]
+  (println (re-find m) (re-groups m) (re-find m) (re-find m)))
+
+; Strings with patterns.
+(println (str/split "a1b22c333d" #"\d+"))
+(println (str/split "one  two   three" #"\s+" 2))
+(println (str/replace "2026-10-06" #"(?<y>\d+)-(?<m>\d+)-(?<d>\d+)" "${d}/${m}/${y}"))
+(println (str/replace "hello world" #"\b\w" str/upper-case))
+(println (str/replace-first "a.b.c" #"\." "!"))
+(println (str/replace "cost: 5" #"\d" (str/re-quote-replacement "$9")))
+
+; Case-insensitive and Unicode-aware, by flags.
+(println (re-seq #"(?i)é|k" "É é K k"))
+(println (re-seq #"(?iu)é" "É é"))
+(println (re-seq #"\p{Lu}\p{Ll}+" "Zoë Ångström and Łukasz"))
+
+; Patterns are values: identity equality, printed as literals.
+(println (pr-str #"a\"b") (str #"a\d") (= #"a" #"a") (let [p #"a"] (= p p)))
+
+; Errors are values to catch.
+(println (try (re-pattern "(unclosed") (catch :invalid-regex e [(:message e) (:index e)])))
+(println (try (re-pattern "(a)\\1") (catch :invalid-regex e (:message e))))
+(println (try (str/replace "x" #"x" "$2") (catch :invalid-replacement e (:message e))))
+
+; Linear time: (a|aa)*c over 100,000 a's has no match, found at once.
+(println (re-find #"(a|aa)*c" (apply str (repeat 100000 \a))))

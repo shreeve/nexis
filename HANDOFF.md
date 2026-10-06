@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 199/199 steps succeeded; 1475/1475 tests passed
+Build Summary: 206/206 steps succeeded; 1493/1493 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 197 steps. Any output besides the
+steps; without it the count is 204 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -145,7 +145,7 @@ runtime throw) instead of faulting (`docs/VM.md` §13.1).
 
 `src/value.zig`: a 16-byte `{tag, payload}` cell. Immediates are nil,
 booleans, chars, fixnums (i48), floats (f64), keywords and symbols
-(intern ids); heap kinds are numbered 16-42, with 22 (`byte_vector`),
+(intern ids); heap kinds are numbered 16-45, with 22 (`byte_vector`),
 28 and 29 reserved because kind bytes are the codec's wire tags
 (`docs/VALUE.md`). An integer result outside i48 is a bignum and one
 that fits is a fixnum again (`docs/BIGNUM.md`). Equality, hash and
@@ -264,6 +264,9 @@ shape its keys, and what must not be asked of emdb.
   every pattern against a reference interpreter over `entity` and
   `datoms`, on current, as-of and `with` views. Both end with a
   10k-datom twin of a `bench/nextomic.zig` scenario.
+  `test/regex/regex.zig` runs the regex engine on 9 000 generated
+  patterns and inputs and compares every match and group with what
+  `java.util.regex` found (`docs/REGEX.md` §7).
 - **Property laws.** `test/prop/nextomic_tx.zig` replays random
   transactions against an in-memory model and checks every basis
   through every index, `since` and `history`, across a reopen and an
@@ -283,7 +286,7 @@ shape its keys, and what must not be asked of emdb.
   `persist-2` share one store across two processes. Every
   `examples/*.nx` is pinned the same way, the store-backed ones twice.
 - **Goldens.** `test/golden/` pins the reader's Form output
-  byte-for-byte, fifteen reader-error cases, and under `cli/` what
+  byte-for-byte, eighteen reader-error cases, and under `cli/` what
   `bin/nexis` prints for runtime, reader and macro errors, a
   disassembly, script output, stdin, arguments, exit statuses, a REPL
   session, deep recursion, a source file with a byte-order mark,
@@ -313,8 +316,11 @@ failing test (AGENTS.md).
    Clojure's constant-memory streaming; it is a compiler change with a
    cost on every call, to be measured. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
-2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
-   design question, so an amendment comes first.
+2. **Regular expressions lack Unicode scripts, blocks and binary
+   properties** (`\p{IsLatin}`, `\p{InGreek}`, `\p{IsAlphabetic}`),
+   `(?U)`, `\X` and `\N{...}` (`docs/REGEX.md` §2), each refused with a
+   sentence. The next step for each is a table generated from Java's,
+   as `test/regex/tables.clj` generates the general categories.
 3. **A routine holds at most 4096 live locals and 4096 captured
    locals**, the two routine caps the 12-bit slot and upvalue
    operands leave (COMPILER.md §4.4); past either the compile error
@@ -428,9 +434,8 @@ after numbers in the commit message.
    work, with em's runtime as the reference.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
-4. The open design questions, each an amendment first:
-   `&form`/`&env` (§24 #13), regex (§24 #9). The owner
-   orders these after the em and emdb work.
+4. The open design question, an amendment first: `&form`/`&env`
+   (§24 #13). The owner orders it after the em and emdb work.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis

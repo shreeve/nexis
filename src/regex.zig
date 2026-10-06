@@ -22,8 +22,13 @@ const builtin = @import("builtin");
 const stack = @import("stack.zig");
 const string = @import("string.zig");
 const tables = @import("regex_tables.zig");
+const value_mod = @import("value.zig");
+const heap_mod = @import("heap.zig");
 
 const Allocator = std.mem.Allocator;
+const Value = value_mod.Value;
+const Heap = heap_mod.Heap;
+const HeapHeader = heap_mod.HeapHeader;
 
 /// The largest bound a counted repetition may name.
 pub const max_repeat = 1000;
@@ -1727,8 +1732,13 @@ pub const Finder = struct {
     next: usize = 0,
     last_end: usize = 0,
     done: bool = false,
+    /// A literal program's occurrences, found a 32-byte block at a time
+    /// across finds rather than from each find's start again, so
+    /// `split` and `replace` on `#","` cost what they cost on `","`.
+    occurrences: ?string.Matches = null,
 
     pub fn find(f: *Finder) bool {
+        if (f.vm.prog.literal) |lit| if (lit.len > 0) return f.findLiteral(lit);
         if (f.done or f.next > f.hay.len or !f.vm.exec(f.hay, f.next, f.last_end, false)) {
             f.done = true;
             return false;
@@ -1739,7 +1749,257 @@ pub const Finder = struct {
         f.next = if (s != e) e else if (e < f.hay.len) e + decode(f.hay, e).len else e + 1;
         return true;
     }
+
+    /// A non-empty literal never matches empty, so each search starts
+    /// where the last occurrence ended, as the iterator does.
+    fn findLiteral(f: *Finder, lit: []const u8) bool {
+        if (f.done) return false;
+        if (f.occurrences == null) f.occurrences = .init(f.hay, lit, @min(f.next, f.hay.len));
+        const at = f.occurrences.?.next() orelse {
+            f.done = true;
+            return false;
+        };
+        f.vm.best[0] = at;
+        f.vm.best[1] = at + lit.len;
+        f.last_end = at + lit.len;
+        f.next = f.last_end;
+        return true;
+    }
 };
+
+// =============================================================================
+// Patterns and matchers as values (docs/REGEX.md §8)
+// =============================================================================
+
+/// The body of a `regex` block: the program, whose slices point into
+/// the same block after it (a block never moves, docs/GC.md §1), and
+/// the source text. A leaf: it holds no Value.
+const PatternBody = struct {
+    prog: Program,
+    source: []const u8,
+};
+
+pub const Made = union(enum) { ok: Value, err: SyntaxError };
+
+/// Compile `source` in a scratch arena on `gpa` and copy the program
+/// and the source into one `regex` block. A syntax error is `.err`.
+pub fn make(heap: *Heap, gpa: Allocator, source: []const u8) (Allocator.Error || stack.Error)!Made {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const p = switch (try compile(arena.allocator(), source, .{})) {
+        .ok => |p| p,
+        .err => |e| return .{ .err = e },
+    };
+    const literal = p.literal orelse &.{};
+    const size = @sizeOf(PatternBody) + p.insts.len * @sizeOf(Inst) + p.ranges.len * @sizeOf(Range) +
+        source.len + p.names.len + literal.len + p.prefix.len;
+    const h = heap.alloc(.regex, size) catch return error.OutOfMemory;
+    const body = Heap.bodyOf(PatternBody, h);
+    var tail: [*]u8 = @as([*]u8, @ptrCast(body)) + @sizeOf(PatternBody);
+    body.* = .{ .prog = p, .source = &.{} };
+    body.prog.insts = copyInto(Inst, &tail, p.insts);
+    body.prog.ranges = copyInto(Range, &tail, p.ranges);
+    body.source = copyInto(u8, &tail, source);
+    body.prog.names = copyInto(u8, &tail, p.names);
+    if (p.literal != null) body.prog.literal = copyInto(u8, &tail, literal);
+    body.prog.prefix = copyInto(u8, &tail, p.prefix);
+    return .{ .ok = Heap.valueFromHeader(.regex, h) };
+}
+
+/// `items` copied to `tail`, which moves past them. Instructions and
+/// ranges come first, so `tail` is aligned for them.
+fn copyInto(comptime T: type, tail: *[*]u8, items: []const T) []const T {
+    const dst: [*]T = @ptrCast(@alignCast(tail.*));
+    @memcpy(dst[0..items.len], items);
+    tail.* += items.len * @sizeOf(T);
+    return dst[0..items.len];
+}
+
+/// The program of the pattern `v`.
+pub fn programOf(v: Value) *const Program {
+    std.debug.assert(v.kind() == .regex);
+    return &Heap.bodyOf(PatternBody, Heap.asHeapHeader(v)).prog;
+}
+
+/// The source text of the pattern `v`, as written.
+pub fn sourceOf(v: Value) []const u8 {
+    std.debug.assert(v.kind() == .regex);
+    return Heap.bodyOf(PatternBody, Heap.asHeapHeader(v)).source;
+}
+
+/// The body of a `matcher` block, followed by `2 * (ngroups + 1)`
+/// slots: the spans of the last match's groups, `none` for a group
+/// that did not take part. `pattern` and `input` never change, so
+/// `re-find` updates the block in place.
+pub const MatcherBox = extern struct {
+    pattern: Value,
+    /// A string, validated as UTF-8 when the matcher is made.
+    input: Value,
+    /// Where the next search starts.
+    next: u64,
+    /// The end of the last match, where `\G` holds.
+    last_end: u64,
+    state: State,
+    _pad: [7]u8 = @splat(0),
+
+    pub const State = enum(u8) { fresh, matched, failed };
+};
+
+/// A fresh matcher of `pattern` over the string `input`.
+pub fn makeMatcher(heap: *Heap, pattern: Value, input: Value) Allocator.Error!Value {
+    const nslots = 2 * (programOf(pattern).ngroups + 1);
+    const h = heap.alloc(.matcher, @sizeOf(MatcherBox) + nslots * @sizeOf(u64)) catch return error.OutOfMemory;
+    Heap.bodyOf(MatcherBox, h).* = .{ .pattern = pattern, .input = input, .next = 0, .last_end = 0, .state = .fresh };
+    return Heap.valueFromHeader(.matcher, h);
+}
+
+pub fn matcherBox(v: Value) *MatcherBox {
+    std.debug.assert(v.kind() == .matcher);
+    return Heap.bodyOf(MatcherBox, Heap.asHeapHeader(v));
+}
+
+/// The span slots of the matcher `v`'s last match.
+fn matcherSlots(v: Value) []u64 {
+    const b = matcherBox(v);
+    const n = 2 * (programOf(b.pattern).ngroups + 1);
+    const slots: [*]u64 = @ptrCast(@alignCast(@as([*]u8, @ptrCast(b)) + @sizeOf(MatcherBox)));
+    return slots[0..n];
+}
+
+/// Java's `Matcher.find` on the matcher `v`: the next match, recorded
+/// in the matcher, or false. A matcher whose search failed fails every
+/// later search, as Java's does.
+pub fn matcherFind(gpa: Allocator, v: Value) Allocator.Error!bool {
+    const b = matcherBox(v);
+    if (b.state == .failed) return false;
+    var vm: Vm = try .init(gpa, programOf(b.pattern), true);
+    defer vm.deinit(gpa);
+    var f: Finder = .{ .vm = &vm, .hay = string.asBytes(b.input), .next = b.next, .last_end = b.last_end };
+    if (!f.find()) {
+        b.state = .failed;
+        return false;
+    }
+    b.* = .{ .pattern = b.pattern, .input = b.input, .next = f.next, .last_end = f.last_end, .state = .matched };
+    const slots = matcherSlots(v);
+    for (0..slots.len / 2) |g| {
+        const span = vm.group(g) orelse .{ none, none };
+        slots[2 * g] = span[0];
+        slots[2 * g + 1] = span[1];
+    }
+    return true;
+}
+
+/// The span of group `g` of the matcher `v`'s last match, or null when
+/// the group did not take part. The matcher has matched.
+pub fn matcherGroup(v: Value, g: usize) ?[2]usize {
+    std.debug.assert(matcherBox(v).state == .matched);
+    const slots = matcherSlots(v);
+    if (slots[2 * g] == none) return null;
+    return .{ slots[2 * g], slots[2 * g + 1] };
+}
+
+/// The collector's walk of a matcher: its pattern and its string.
+pub fn traceMatcher(h: *HeapHeader, visitor: anytype) void {
+    const b = Heap.bodyOf(MatcherBox, h);
+    visitor.markValue(b.pattern);
+    visitor.markValue(b.input);
+}
+
+// =============================================================================
+// Replacement strings (docs/REGEX.md §11)
+// =============================================================================
+
+/// A piece of a parsed replacement: literal text, or a group's match.
+pub const Piece = union(enum) { text: []const u8, group: u32 };
+
+pub const Parsed = union(enum) { ok: []const Piece, err: []const u8 };
+
+/// `repl` as `Matcher.appendReplacement` reads it against `prog`:
+/// `$n` the longest run of digits naming a group (the first digit
+/// always counts), `${name}` a named group, `\x` the code point `x`
+/// itself, anything else as it is. An error is Java's sentence,
+/// allocated in `arena` with the pieces.
+pub fn parseReplacement(arena: Allocator, prog: *const Program, repl: []const u8) Allocator.Error!Parsed {
+    var pieces: std.ArrayList(Piece) = .empty;
+    var i: usize = 0;
+    var run: usize = 0;
+    while (i < repl.len) {
+        const c = repl[i];
+        if (c != '\\' and c != '$') {
+            i += 1;
+            continue;
+        }
+        if (run < i) try pieces.append(arena, .{ .text = repl[run..i] });
+        i += 1;
+        if (c == '\\') {
+            if (i == repl.len) return .{ .err = "character to be escaped is missing" };
+            const n = decode(repl, i).len;
+            try pieces.append(arena, .{ .text = repl[i..][0..n] });
+            i += n;
+        } else {
+            if (i == repl.len) return .{ .err = "Illegal group reference: group index is missing" };
+            var g: u32 = undefined;
+            if (repl[i] == '{') {
+                const start = i + 1;
+                i = start;
+                while (i < repl.len and std.ascii.isAlphanumeric(repl[i])) i += 1;
+                const name = repl[start..i];
+                if (name.len == 0) return .{ .err = "named capturing group has 0 length name" };
+                if (i == repl.len or repl[i] != '}') return .{ .err = "named capturing group is missing trailing '}'" };
+                if (std.ascii.isDigit(name[0])) return .{ .err = try arena.print("capturing group name {{{s}}} starts with digit character", .{name}) };
+                g = prog.groupIndex(name) orelse return .{ .err = try arena.print("No group with name {{{s}}}", .{name}) };
+                i += 1;
+            } else {
+                if (!std.ascii.isDigit(repl[i])) return .{ .err = "Illegal group reference" };
+                g = repl[i] - '0';
+                i += 1;
+                while (i < repl.len and std.ascii.isDigit(repl[i])) : (i += 1) {
+                    const longer = @as(u64, g) * 10 + (repl[i] - '0');
+                    if (longer > prog.ngroups) break;
+                    g = @intCast(longer);
+                }
+                if (g > prog.ngroups) return .{ .err = try arena.print("No group {d}", .{g}) };
+            }
+            try pieces.append(arena, .{ .group = g });
+        }
+        run = i;
+    }
+    if (run < repl.len) try pieces.append(arena, .{ .text = repl[run..] });
+    return .{ .ok = pieces.items };
+}
+
+/// Java's `Matcher.quoteReplacement`: `s` with a backslash before each
+/// `\` and `$`, so a replacement reads it literally.
+pub fn quoteReplacement(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (s) |c| {
+        if (c == '\\' or c == '$') try out.append(gpa, '\\');
+        try out.append(gpa, c);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Clojure's `print-method` for a pattern: `#"`, the source with each
+/// backslash and the character after it as they are and a bare `"`
+/// escaped (`\E\"\Q` inside `\Q...\E`), then `"`.
+pub fn writeLiteral(w: *std.Io.Writer, source: []const u8) std.Io.Writer.Error!void {
+    try w.writeAll("#\"");
+    var quoted = false;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        const c = source[i];
+        if (c == '\\' and i + 1 < source.len) {
+            const e = source[i + 1];
+            try w.writeAll(source[i..][0..2]);
+            quoted = if (quoted) e != 'E' else e == 'Q';
+            i += 1;
+        } else if (c == '"') {
+            try w.writeAll(if (quoted) "\\E\\\"\\Q" else "\\\"");
+        } else try w.writeByte(c);
+    }
+    try w.writeByte('"');
+}
 
 // =============================================================================
 // Tests (expected results are java.util.regex's, through bb)
@@ -2134,6 +2394,36 @@ test "regex: re-matches needs the whole input and prefers the first such path" {
     try testing.expect(vm.exec("a", 0, 0, true));
     try testing.expect(vm.group(2) == null);
     try testing.expectEqual(@as(?u32, 1), prog.groupIndex("x") orelse 1);
+}
+
+test "regex: a replacement string reads $n, ${name} and escapes as Java's appendReplacement does" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prog = (try compile(a, "(a)(?<year>\\d+)", .{})).ok;
+    const ok = (try parseReplacement(a, &prog, "<$1>${year}\\$$12é")).ok;
+    try testing.expectEqual(@as(usize, 7), ok.len);
+    try testing.expectEqualStrings("<", ok[0].text);
+    try testing.expectEqual(@as(u32, 1), ok[1].group);
+    try testing.expectEqualStrings(">", ok[2].text);
+    try testing.expectEqual(@as(u32, 2), ok[3].group);
+    try testing.expectEqualStrings("$", ok[4].text);
+    try testing.expectEqual(@as(u32, 1), ok[5].group);
+    try testing.expectEqualStrings("2é", ok[6].text);
+    const errors = [_][2][]const u8{
+        .{ "$3", "No group 3" },
+        .{ "x$", "Illegal group reference: group index is missing" },
+        .{ "$x", "Illegal group reference" },
+        .{ "x\\", "character to be escaped is missing" },
+        .{ "${y}", "No group with name {y}" },
+        .{ "${}", "named capturing group has 0 length name" },
+        .{ "${1x}", "capturing group name {1x} starts with digit character" },
+        .{ "${ab", "named capturing group is missing trailing '}'" },
+    };
+    for (errors) |e| try testing.expectEqualStrings(e[1], (try parseReplacement(a, &prog, e[0])).err);
+    const quoted = try quoteReplacement(testing.allocator, "a$1\\b");
+    defer testing.allocator.free(quoted);
+    try testing.expectEqualStrings("a\\$1\\\\b", quoted);
 }
 
 test "regex: a named group is found by name" {

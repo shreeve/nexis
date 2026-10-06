@@ -53,6 +53,7 @@ const string_mod = @import("string.zig");
 const heap_mod = @import("heap.zig");
 const vm_mod = @import("vm.zig");
 const atom_mod = @import("atom.zig");
+const regex_mod = @import("regex.zig");
 const bignum_mod = @import("bignum.zig");
 const typed_vector_mod = @import("coll/typed_vector.zig");
 const db_mod = @import("db.zig");
@@ -171,6 +172,14 @@ pub fn format(
         // `#i64[1 2 3]` / `#f64[1.0 2.0]` in both modes; the reader
         // has no such dispatch, so the text does not read back.
         .typed_vector => try typed_vector_mod.format(v, writer, formatFloat),
+        // `#"source"` in both modes, as Clojure prints a pattern; it
+        // reads back as a new pattern, never an `=` one (identity).
+        .regex => try regex_mod.writeLiteral(writer, regex_mod.sourceOf(v)),
+        .matcher => {
+            try writer.writeAll("#<matcher ");
+            try regex_mod.writeLiteral(writer, regex_mod.sourceOf(regex_mod.matcherBox(v).pattern));
+            try writer.writeByte('>');
+        },
         else => try writer.print("#<value kind={d}>", .{@backingInt(v.kind())}),
     }
 }
@@ -696,6 +705,31 @@ test "a durable ref prints its tree's odd bytes escaped and its key in hex" {
         defer testing.allocator.free(got);
         try testing.expectEqualStrings(c.expect, got);
     }
+}
+
+test "a pattern prints as #\"...\" with Clojure's escaping in both modes; a matcher as #<matcher ...>" {
+    var heap = heap_mod.Heap.init(testing.allocator);
+    defer heap.deinit();
+    const cases = [_]struct { source: []const u8, expect: []const u8 }{
+        .{ .source = "a\\d+", .expect = "#\"a\\d+\"" },
+        .{ .source = "a\"b", .expect = "#\"a\\\"b\"" },
+        .{ .source = "a\\\"b", .expect = "#\"a\\\"b\"" },
+        .{ .source = "\\Q\"\\E\"", .expect = "#\"\\Q\\E\\\"\\Q\\E\\\"\"" },
+        .{ .source = "é😀", .expect = "#\"é😀\"" },
+    };
+    for (cases) |c| {
+        const v = (try regex_mod.make(&heap, testing.allocator, c.source)).ok;
+        for ([_]FormatMode{ .display, .readable }) |mode| {
+            const got = try formatForTest(v, mode, null);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(c.expect, got);
+        }
+    }
+    const p = (try regex_mod.make(&heap, testing.allocator, "x\"")).ok;
+    const m = try regex_mod.makeMatcher(&heap, p, try string_mod.fromBytes(&heap, "x"));
+    const got = try formatForTest(m, .readable, null);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("#<matcher #\"x\\\"\">", got);
 }
 
 test "a collection nested past the stack guard prints #<too deep> and counts an overflow" {
