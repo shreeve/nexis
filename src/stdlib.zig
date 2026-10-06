@@ -423,7 +423,7 @@ const core_natives = table("", .{
     .{ "transient", 1, 1, &fnTransient },
     .{ "persistent!", 1, 1, &fnPersistentBang },
     .{ "conj!", 0, null, &fnConjBang },
-    .{ "assoc!", 3, null, &fnAssocBang },
+    .{ "assoc!", 3, null, &fnAssocBangLeaf, .leaf, &fnAssocBang },
     .{ "dissoc!", 2, null, &fnDissocBang },
     .{ "disj!", 2, null, &fnDisjBang },
     .{ "pop!", 1, 1, &fnPopBang },
@@ -4289,6 +4289,22 @@ fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
     var i: usize = 1;
     while (i < args.len) : (i += 2) try assocBang(vm, t, args[i], args[i + 1]);
     return t;
+}
+
+/// `assoc!` as a leaf (VM.md §6): into a transient vector, and into a
+/// transient map by keys off the heap; anything else goes the general
+/// way.
+fn fnAssocBangLeaf(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .transient) return VmError.NeedsReentry;
+    switch (args[0].subkind()) {
+        transient_mod.subkind_transient_vector => {},
+        transient_mod.subkind_transient_map => {
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) if (args[i].kind().isHeap()) return VmError.NeedsReentry;
+        },
+        else => return VmError.NeedsReentry,
+    }
+    return fnAssocBang(vm, args);
 }
 
 /// `(dissoc! t k & ks)` on a transient map.

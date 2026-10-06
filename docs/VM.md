@@ -342,6 +342,7 @@ body instead of `call`. The error never escapes a call site.
 | `nthnext` | anything but nil, a list and a vector |
 | `conj` | anything but nil, a list and a vector (a map or set hashes, a lazy seq is realized) |
 | `assoc` | anything but a vector, nil, a hash map and a record, and any of the last three by a key on the heap |
+| `assoc!` | anything but a transient vector and a transient map, and the map by a key on the heap |
 
 ---
 
