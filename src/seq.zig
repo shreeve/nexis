@@ -72,8 +72,8 @@ pub const op_keep: u16 = 8;
 /// `(map-indexed f coll)`, `(keep-indexed f coll)`: `{f, coll, index}`.
 pub const op_map_indexed: u16 = 9;
 pub const op_keep_indexed: u16 = 10;
-/// `(map f c1 c2 ...)`: `{f, [c1 c2 ...]}`, one element at a time, as
-/// Clojure's.
+/// `(map f c1 c2 ...)`: `{f, c1, c2, ...}`, or `{f, [c1 c2 ...]}` past
+/// five colls, one element at a time, as Clojure's.
 pub const op_map_n: u16 = 11;
 
 const steps = [_]Step{
@@ -252,34 +252,44 @@ fn stepSieve(comptime mode: Sieve) Step {
 /// here.
 fn stepMapN(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);
-    const colls = a[1];
-    const n = vector_mod.count(colls);
+    // Up to `lazy.max_args - 1` colls sit in the block itself, each
+    // replaced by its seq as the step takes it, which keeps it rooted
+    // while the next is forced; more are a vector, whose seqs wait on a
+    // root scope.
+    const in_block = a.len > 2;
+    const n = if (in_block) a.len - 1 else vector_mod.count(a[1]);
     const scope = vm.rootScope();
     defer scope.release();
+    var buf: [2 * map_n_inline]Value = undefined;
+    const pair = if (2 * n <= buf.len) buf[0 .. 2 * n] else vm.allocator.alloc(Value, 2 * n) catch return VmError.OutOfMemory;
+    defer if (2 * n > buf.len) vm.allocator.free(pair);
+    const firsts = pair[0..n];
+    const rests = pair[n..];
     for (0..n) |i| {
-        const s = try seqOf(vm, vector_mod.nth(colls, i));
+        const s = try seqOf(vm, if (in_block) a[1 + i] else vector_mod.nth(a[1], i));
         if (s.isNil()) return s;
-        try scope.push(s);
+        if (in_block) a[1 + i] = s else try scope.push(s);
     }
-    const seqs = vm.roots.items[scope.base..][0..n];
-    const firsts = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(firsts);
-    const rests = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(rests);
-    for (seqs, firsts, rests) |s, *f, *r| {
-        const fr = firstRest(s);
-        f.* = fr.first;
-        r.* = fr.rest;
+    for (0..n) |i| {
+        const fr = firstRest(if (in_block) a[1 + i] else vm.roots.items[scope.base + i]);
+        firsts[i] = fr.first;
+        rests[i] = fr.rest;
     }
-    // The rests reach from the seqs on the scope; the firsts are the
-    // call's arguments.
+    // The rests reach from the seqs; the firsts are the call's arguments.
     const y = try vm.callValue(a[0], firsts);
+    // Nothing below runs code, and `Heap.alloc` never collects.
     const heap = vm.ensureHeap();
-    try scope.push(y);
-    const more_colls = vector_mod.fromSlice(heap, rests) catch return VmError.OutOfMemory;
-    const following = try make(vm, op_map_n, &.{ a[0], more_colls });
+    const following = if (in_block) blk: {
+        var next_args: [lazy.max_args]Value = undefined;
+        next_args[0] = a[0];
+        @memcpy(next_args[1 .. n + 1], rests);
+        break :blk try make(vm, op_map_n, next_args[0 .. n + 1]);
+    } else try make(vm, op_map_n, &.{ a[0], vector_mod.fromSlice(heap, rests) catch return VmError.OutOfMemory });
     return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
 }
+
+/// How many colls `(map f c1 c2 ...)` keeps in its block.
+pub const map_n_inline = lazy.max_args - 1;
 
 /// `(lazy-seq body...)`: the body's function, called with no arguments.
 fn stepThunk(vm: *VM, lz: Value) VmError!Value {

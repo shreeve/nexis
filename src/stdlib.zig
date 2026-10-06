@@ -1371,6 +1371,7 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// time over one chunked collection, one element at a time otherwise.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 2) return seq_mod.make(vm, seq_mod.op_map, args[0..2]);
+    if (args.len - 1 <= seq_mod.map_n_inline) return seq_mod.make(vm, seq_mod.op_map_n, args);
     const colls = vector_mod.fromSlice(vm.ensureHeap(), args[1..]) catch return VmError.OutOfMemory;
     return seq_mod.make(vm, seq_mod.op_map_n, &.{ args[0], colls });
 }
