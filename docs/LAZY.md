@@ -354,3 +354,67 @@ everything else shared, so the code after it knows lists only and runs
 no code. A sorted collection is shared as it is, since rebuilding one
 could run its comparator. `` `(a ~@xs) `` realizes `xs`'s spine before
 it splices (`coll:concat`, `docs/VM.md` §10.8).
+
+---
+
+### 9. Where nexis differs from Clojure
+
+- **Chunking of built seqs.** The seq of a map, a set, a string or a
+  sorted collection, and the list an eager function builds (`sort`,
+  `reverse`, `keys`, ...) once it has four or more elements, is a
+  vector's view, so mapping over it takes 32 at a time where Clojure
+  walks one at a time. It shows only through side effects in the
+  mapped function, which Clojure's docstrings disclaim.
+- **`apply` realizes its last argument**: `(apply f (range))` does not
+  end, where Clojure's variadic rest can stay lazy. `mapcat` is lazy,
+  so prefer it to `(apply concat ...)` over an unbounded seq.
+- **`str` of a lazy seq** is its printed text, `"(2 3)"`, where
+  Clojure's is `clojure.lang.LazySeq@` and a hash.
+- **Arguments are checked at the call**: `(take :a xs)` and `(partition
+  0 xs)` raise when called; Clojure raises when the seq is realized, or
+  returns an infinite seq of `()` for `(partition 0 xs)`.
+- **Holding the head.** The VM roots every slot of its stack
+  (`docs/VM.md` §9), so a lazy seq a local or a call's argument holds
+  keeps what it realized until the slot is reused: `(reduce + (map inc
+  (range 100000000)))` realizes and keeps the mapped seq, where
+  Clojure's locals clearing lets it go as it walks; `(reduce + (range
+  100000000))` itself allocates nothing (§7). Clearing a `call:call`
+  argument block after the call and a local at its last use would give
+  Clojure's constant-memory streaming; it is a compiler change with a
+  cost on every call, measured separately.
+- `counted?` of a range is false (Clojure's `LongRange` is counted);
+  `realized?` of a cons or a chunked cons is true (Clojure's throws).
+- **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
+  one, made a list (§8), is not one; Datomic takes any list.
+- **`eduction`** is `sequence` over the composed transducers: a cached
+  lazy seq, where Clojure's `Eduction` runs the transform again on
+  every reduce. Only side effects in the transform tell them apart.
+
+---
+
+### 10. Transducers
+
+`transduce`, `completing`, `cat`, `halt-when`, `eduction`, `into`
+with a transducer (`(into to xform from)`) and `sequence` with one are
+Clojure 1.12's (`src/stdlib/core.nx`), and so are the transducer
+arities: `(map f)`, `(filter p)`, `(remove p)`, `(keep f)`, `(take n)`,
+`(take-while p)`, `(drop n)`, `(drop-while p)`, `(map-indexed f)`,
+`(keep-indexed f)`, `(partition-all n)`, `(partition-by f)`, `(mapcat
+f)`, `(interpose sep)`, `(distinct)` and `(dedupe)`. The ones whose
+other arities are natives reach the `xf-` function of their name in
+`core.nx`; a stateful one keeps its state in volatiles, one per
+application of the transducer to a reducing function. A reduction
+stops at a `reduced` value as `reduce` does.
+
+`(sequence xform coll)` is a producer (§7, `op_sequence`): the
+transducer applied once to `conj!`, each step runs it over the
+source's elements into a transient vector until 32 outputs or more are
+waiting, the source ends, or a step returns a reduced value, and
+hands them out as one chunk; at the end it runs the completion arity
+once, so `partition-all`'s last part comes out. It realizes the source
+as far as the outputs need, as Clojure's `TransformerIterator` pulls
+it. `(sequence xform c1 c2 ...)` runs the transducer over `(map vector
+c1 c2 ...)`, its reducing function called with each tuple's elements.
+A call through the transducer costs a closure call per element where
+the native producers call their function directly, so `(sequence (map
+f) xs)` is slower than `(map f xs)`.

@@ -1025,9 +1025,9 @@ test "integration: a throw that leaves through a catch or a finally is reported 
     const cases = [_]Case{
         // A runtime error through a finally, a catch no clause of
         // which matches, and a catch that throws it again.
-        .{ .src = f ++ "(defn h [] (try (f) (finally 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
-        .{ .src = f ++ "(defn h [] (try (f) (catch :nope e 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
-        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw e)))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (finally 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch :nope e 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw e)))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
         // A thrown value the same ways, and through both at once.
         .{ .src = f ++ "(defn h [] (try (g) (catch :nope e 1) (finally 2))) (h)", .err = vm.VmError.UncaughtThrow, .at = "g" },
         // A catch that catches another throw inside it still rethrows
@@ -2303,6 +2303,16 @@ test "lazy: interleave, interpose, take-nth, partition-by, tree-seq, flatten, re
     try expectOutput("[(take 6 (interleave (range) (repeat :x))) (take 3 (tree-seq seq? seq '((1 2) (3)))) (take 3 (reductions + (range))) (take 4 (interpose :s (range)))]", "[(0 :x 1 :x 2 :x) (((1 2) (3)) (1 2) 1) (0 1 3) (0 :s 1 :s)]");
     try expectOutput("(pr-str [(interleave) (interleave [1 2]) (interleave [1 2] [:a :b :c] [\"x\" \"y\"]) (take-nth 2 (range 7)) (partition-by odd? [1 3 2 4 5]) (flatten [1 [2 [3 nil]] '(4)]) (flatten nil) (reductions + [1 2 3]) (reductions + []) (reductions + 10 [1 2]) (drop-last [1 2 3]) (drop-last 2 [1 2 3]) (split-at 2 [1 2 3]) (split-with odd? [1 3 2 5]) (sequence [1 2]) (sequence []) (replace {1 :a} '(1 2 1))])", "[() (1 2) (1 :a \"x\" 2 :b \"y\") (0 2 4 6) ((1 3) (2 4) (5)) (1 2 3 nil 4) () (1 3 6) (0) (10 11 13) (1 2) (1) [(1 2) (3)] [(1 3) (2 5)] (1 2) () (:a 2 :a)]");
     try expectOutput("[(class (interleave [1] [2])) (realized? (take-nth 2 [1 2 3])) (first (partition-by odd? (range))) (take 3 (flatten (repeat [1 [2]])))]", "[:lazy_seq false (0) (1 2 1)]");
+}
+
+test "lazy: transducers, transduce, into and sequence with an xform, eduction, completing, cat and halt-when" {
+    // Expected values from babashka.
+    try expectOutput("[(transduce (map inc) + [1 2 3]) (transduce (filter odd?) + 10 [1 2 3]) (into [] (comp (map inc) (filter even?)) (range 6)) (= #{2 3} (into #{} (map inc) [1 1 2])) (into '() (map inc) [1 2]) (sequence (map inc) [1 2 3]) (sequence (comp (take 2) (map inc)) (range)) (into [] cat [[1 2] [3]]) (into [] (mapcat reverse) [[1 2] [3 4]])]", "[9 14 [2 4 6] true (3 2) (2 3 4) (1 2) [1 2 3] [2 1 4 3]]");
+    try expectOutput("[(into [] (partition-all 2) [1 2 3]) (into [] (partition-by odd?) [1 3 2 4 5]) (into [] (dedupe) [1 1 2 2 1]) (into [] (distinct) [1 2 1 3]) (into [] (interpose :s) [1 2 3]) (into [] (keep #(when (odd? %) (* % %))) [1 2 3]) (into [] (map-indexed vector) [:a :b]) (into [] (keep-indexed #(when (odd? %1) %2)) [:a :b :c :d])]", "[[[1 2] [3]] [[1 3] [2 4] [5]] [1 2 1] [1 2 3] [1 :s 2 :s 3] [1 9] [[0 :a] [1 :b]] [:b :d]]");
+    try expectOutput("[(into [] (take-while neg?) [-1 -2 3 -4]) (into [] (drop-while neg?) [-1 -2 3 -4]) (into [] (drop 2) [1 2 3]) (into [] (remove odd?) [1 2 3 4]) (transduce (halt-when #(> % 2)) conj [] [1 2 3 4]) ((completing +) 5) (sequence (map +) [1 2] [10 20 30]) (eduction (map inc) [1 2]) (into [] (map inc) (range 3))]", "[[-1 -2] [3 -4] [3] [2 4] 3 5 (11 22) (2 3) [1 2 3]]");
+    // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
+    // one input past them), its completion once.
+    try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");
 }
 
 test "lazy: reduce over an unrealized range allocates nothing" {

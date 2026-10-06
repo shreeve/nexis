@@ -164,8 +164,8 @@ const core_natives = table("", .{
     .{ "first", 1, 1, &fnFirst },
     .{ "rest", 1, 1, &fnRest },
     .{ "second", 1, 1, &fnSecond },
-    .{ "take", 2, 2, &fnTake },
-    .{ "drop", 2, 2, &fnDrop },
+    .{ "take", 1, 2, &fnTake },
+    .{ "drop", 1, 2, &fnDrop },
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
@@ -232,29 +232,29 @@ const core_natives = table("", .{
     .{ "even?", 1, 1, &fnEvenQ, .leaf },
     // apply + HOFs.
     .{ "apply", 2, null, &fnApply },
-    .{ "map", 2, null, &fnMap },
+    .{ "map", 1, null, &fnMap },
     .{ "reduce", 2, 3, &fnReduce },
     .{ "reduce-kv", 3, 3, &fnReduceKv },
-    .{ "filter", 2, 2, &fnFilter },
-    .{ "remove", 2, 2, &fnRemove },
-    .{ "keep", 2, 2, &fnKeep },
+    .{ "filter", 1, 2, &fnFilter },
+    .{ "remove", 1, 2, &fnRemove },
+    .{ "keep", 1, 2, &fnKeep },
     .{ "seq", 1, 1, &fnSeq },
     .{ "next", 1, 1, &fnNext },
     .{ "range", 0, 3, &fnRange },
     .{ "concat", 0, null, &fnConcat },
-    .{ "mapcat", 2, null, &fnMapcat },
-    .{ "into", 0, 2, &fnInto },
+    .{ "mapcat", 1, null, &fnMapcat },
+    .{ "into", 0, 3, &fnInto },
     .{ "mapv", 2, null, &fnMapv },
     .{ "filterv", 2, 2, &fnFilterv },
-    .{ "map-indexed", 2, 2, &fnMapIndexed },
-    .{ "keep-indexed", 2, 2, &fnKeepIndexed },
-    .{ "distinct", 1, 1, &fnDistinct },
-    .{ "dedupe", 1, 1, &fnDedupe },
+    .{ "map-indexed", 1, 2, &fnMapIndexed },
+    .{ "keep-indexed", 1, 2, &fnKeepIndexed },
+    .{ "distinct", 0, 1, &fnDistinct },
+    .{ "dedupe", 0, 1, &fnDedupe },
     .{ "partition", 2, 4, &fnPartition },
-    .{ "partition-all", 2, 3, &fnPartitionAll },
+    .{ "partition-all", 1, 3, &fnPartitionAll },
     .{ "zipmap", 2, 2, &fnZipmap },
-    .{ "take-while", 2, 2, &fnTakeWhile },
-    .{ "drop-while", 2, 2, &fnDropWhile },
+    .{ "take-while", 1, 2, &fnTakeWhile },
+    .{ "drop-while", 1, 2, &fnDropWhile },
     .{ "butlast", 1, 1, &fnButlast },
     .{ "last", 1, 1, &fnLast },
     .{ "reverse", 1, 1, &fnReverse },
@@ -511,6 +511,8 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%lazy-seq", 1, 1, &fnLazySeq },
     // The force under realize-caught (core.nx, docs/LAZY.md §6).
     .{ "#%force", 1, 1, &fnForce },
+    // sequence with a transducer (core.nx, docs/LAZY.md §10).
+    .{ "#%sequence", 2, 3, &fnSequenceXform },
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
@@ -626,12 +628,14 @@ fn lazyCount(v: Value) VmError!Value {
 /// `(take n coll)` → the lazy seq of the first `n` elements, one at a
 /// time (docs/LAZY.md §7).
 fn fnTake(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-take", args);
     return seq_mod.make(vm, seq_mod.op_take, &.{ try lazyCount(args[0]), args[1] });
 }
 
 /// `(drop n coll)` → the lazy seq of `coll` without its first `n`
 /// elements, walked when it is realized.
 fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-drop", args);
     return seq_mod.make(vm, seq_mod.op_drop, &.{ try lazyCount(args[0]), args[1] });
 }
 
@@ -1377,6 +1381,7 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// at the shortest collection (docs/LAZY.md §7): a chunk of 32 at a
 /// time over one chunked collection, one element at a time otherwise.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-map", args);
     if (args.len == 2) return seq_mod.make(vm, seq_mod.op_map, args[0..2]);
     if (args.len - 1 <= seq_mod.map_n_inline) return seq_mod.make(vm, seq_mod.op_map_n, args);
     const colls = vector_mod.fromSlice(vm.ensureHeap(), args[1..]) catch return VmError.OutOfMemory;
@@ -1609,14 +1614,17 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results) 
 /// truthy; `(remove pred coll)` where it is falsy; `(keep f coll)` the
 /// non-nil `(f x)` (docs/LAZY.md §7).
 fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-filter", args);
     return seq_mod.make(vm, seq_mod.op_filter, args[0..2]);
 }
 
 fn fnRemove(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-remove", args);
     return seq_mod.make(vm, seq_mod.op_remove, args[0..2]);
 }
 
 fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-keep", args);
     return seq_mod.make(vm, seq_mod.op_keep, args[0..2]);
 }
 
@@ -2094,14 +2102,17 @@ fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
 /// `(mapcat f & colls)` → the concatenation of `(map f & colls)`, a
 /// producer over the lazy seq of colls, so an infinite one works.
 fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-mapcat", args);
     const mapped = try fnMap(vm, args);
     return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), mapped });
 }
 
 /// `(into to from)` → `to` with every element of `from` conj'd;
-/// `(into)` is `[]` and `(into to)` is `to`.
+/// `(into)` is `[]` and `(into to)` is `to`; `(into to xform from)`
+/// through a transducer (docs/LAZY.md §10).
 fn fnInto(vm: *VM, args: []const Value) VmError!Value {
     if (args.len < 2) return fnConj(vm, args);
+    if (args.len == 3) return callCore(vm, "into-xform", args);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return args[0];
@@ -2155,16 +2166,19 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
 /// `(map-indexed f coll)` → the lazy seq of `(f i x)`;
 /// `(keep-indexed f coll)` the non-nil ones (docs/LAZY.md §7).
 fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-map-indexed", args);
     return seq_mod.make(vm, seq_mod.op_map_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-keep-indexed", args);
     return seq_mod.make(vm, seq_mod.op_keep_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 /// `(distinct coll)` → the lazy seq of first occurrences, in order,
 /// one at a time.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return transducer(vm, "xf-distinct", args);
     const seen = champ_mod.setEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
     return seq_mod.make(vm, seq_mod.op_distinct, &.{ args[0], seen });
 }
@@ -2172,6 +2186,7 @@ fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
 /// `(dedupe coll)` → the lazy seq of `coll` without consecutive
 /// duplicates, 32 at a time.
 fn fnDedupe(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return transducer(vm, "xf-dedupe", args);
     return seq_mod.make(vm, seq_mod.op_dedupe, &.{ args[0], value_mod.nilValue(), value_mod.fromBool(false) });
 }
 
@@ -2194,6 +2209,7 @@ fn fnPartition(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-partition-all", args);
     return partitionImpl(vm, true, args);
 }
 
@@ -2217,10 +2233,12 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
 /// `(take-while pred coll)` / `(drop-while pred coll)` → lazy seqs
 /// (docs/LAZY.md §7).
 fn fnTakeWhile(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-take-while", args);
     return seq_mod.make(vm, seq_mod.op_take_while, args[0..2]);
 }
 
 fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) return transducer(vm, "xf-drop-while", args);
     return seq_mod.make(vm, seq_mod.op_drop_while, args[0..2]);
 }
 
@@ -3695,6 +3713,33 @@ fn fnChunkCons(vm: *VM, args: []const Value) VmError!Value {
     for (lazy_mod.chunkItems(chunked)) |*slot| slot.* = it.next().?;
     lazy_mod.finishChunked(chunked, n, more);
     return chunked;
+}
+
+/// The transducer arity of a sequence native: the `xf-` function of its
+/// name in core.nx, called with the arguments (docs/LAZY.md §10).
+fn transducer(vm: *VM, comptime name: []const u8, args: []const Value) VmError!Value {
+    return callCore(vm, name, args);
+}
+
+/// The function `name` of nexis.core, private ones included, called
+/// with `args`, the native's own arguments (GC.md §11.5, class 2).
+fn callCore(vm: *VM, name: []const u8, args: []const Value) VmError!Value {
+    const registry = if (vm.home().registry) |*r| r else return VmError.UnboundVar;
+    const v = registry.core.lookupLocal(name) orelse return VmError.UnboundVar;
+    return vm.callValue(v.current() orelse return VmError.UnboundVar, args);
+}
+
+/// `(#%sequence xform coll)` / `(#%sequence xform tuples true)` → the
+/// lazy seq of `coll` through the transducer, 32 outputs at a time
+/// (docs/LAZY.md §10); the second form calls the reducing function with
+/// each tuple's elements.
+fn fnSequenceXform(vm: *VM, args: []const Value) VmError!Value {
+    const conj_bang = comptime for (&core_natives, 0..) |*d, i| {
+        if (std.mem.eql(u8, d.name, "conj!")) break i;
+    } else @compileError("no conj! native");
+    const rf = try vm.callValue(args[0], &.{vm_mod.nativeFnValue(&core_natives[conj_bang])});
+    // `Heap.alloc` never collects: `rf` needs no root on its way in.
+    return seq_mod.make(vm, seq_mod.op_sequence, &.{ rf, args[1], value_mod.fromBool(false), value_mod.fromBool(args.len == 3 and args[2].isTruthy()) });
 }
 
 /// `(#%lazy-seq f)` → an unrealized lazy block whose body calls `f`

@@ -16,6 +16,7 @@ const heap_mod = @import("heap.zig");
 const list_mod = @import("coll/list.zig");
 const lazy = @import("coll/lazy.zig");
 const vector_mod = @import("coll/vector.zig");
+const transient_mod = @import("coll/transient.zig");
 const typed_vector_mod = @import("coll/typed_vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
@@ -108,6 +109,11 @@ pub const op_distinct: u16 = 23;
 /// `(dedupe coll)`: `{coll, last, seen-one}`, 32 elements of output at
 /// a time, as Clojure's `sequence` over its transducer.
 pub const op_dedupe: u16 = 24;
+/// `(sequence xform coll)`: `{rf, coll, done, spread}`, `rf` the
+/// transducer applied to `conj!`, `done` true once the source ended or
+/// `rf` returned a reduced value, `spread` true when each element is a
+/// tuple of the colls to pass `rf` as separate arguments (§10).
+pub const op_sequence: u16 = 25;
 
 const steps = [_]Step{
     stepThunk,
@@ -135,7 +141,82 @@ const steps = [_]Step{
     stepPartition,
     stepDistinct,
     stepDedupe,
+    stepSequence,
 };
+
+/// Whether `v` is a `reduced` value, and the value inside: the record
+/// type the VM registers for it (`VM.reduced_type_id`).
+fn unreduced(vm: *VM, v: Value) ?Value {
+    const id = vm.home().reduced_type_id orelse return null;
+    if (v.kind() != .record or record_mod.typeId(v) != id) return null;
+    var it = champ_mod.mapIter(record_mod.fieldsOf(v));
+    return (it.next() orelse return null).value;
+}
+
+/// The transient vector a step accumulates into, rooted in the block's
+/// result field; the outputs a step hands out are its elements.
+fn stepSequence(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    if (a[2].isTruthy()) return value_mod.nilValue();
+    const heap = vm.ensureHeap();
+    const empty = vector_mod.empty(heap) catch return VmError.OutOfMemory;
+    var acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
+    lazy.setScratch(lz, acc);
+    var cur = a[1];
+    var done = false;
+    var args: [lazy.chunk_size + 1]Value = undefined;
+    // Pull inputs until a chunk's worth of outputs waits, the source
+    // ends, or `rf` stops the reduction; the position is a local, so a
+    // step that throws runs again from the block's own state.
+    while (true) {
+        if (acc.kind() != .transient) return VmError.KindMismatch;
+        const n = transient_mod.vectorCountBang(acc) catch return VmError.KindMismatch;
+        if (n >= lazy.chunk_size) break;
+        cur = try seqOf(vm, cur);
+        if (cur.isNil()) {
+            done = true;
+            break;
+        }
+        const fr = firstRest(cur);
+        args[0] = acc;
+        var argc: usize = 2;
+        if (a[3].isTruthy()) {
+            const tuple = fr.first;
+            const k = vector_mod.count(tuple);
+            if (k + 1 > args.len) return VmError.ArityMismatch;
+            for (0..k) |i| args[1 + i] = vector_mod.nth(tuple, i);
+            argc = k + 1;
+        } else args[1] = fr.first;
+        const r = try vm.callValue(a[0], args[0..argc]);
+        cur = fr.rest;
+        if (unreduced(vm, r)) |inner| {
+            acc = inner;
+            lazy.setScratch(lz, acc);
+            done = true;
+            break;
+        }
+        acc = r;
+        lazy.setScratch(lz, acc);
+    }
+    // The completion arity runs once, at the end: `partition-all`'s last
+    // part comes out there.
+    if (done) {
+        acc = try vm.callValue(a[0], &.{acc});
+        if (unreduced(vm, acc)) |inner| acc = inner;
+        lazy.setScratch(lz, acc);
+    }
+    if (acc.kind() != .transient) return VmError.KindMismatch;
+    const out = transient_mod.persistentBang(acc) catch return VmError.OutOfMemory;
+    // Nothing below runs code, and `Heap.alloc` never collects.
+    const following = if (done) value_mod.nilValue() else try make(vm, op_sequence, &.{ a[0], cur, value_mod.fromBool(false), a[3] });
+    const n = vector_mod.count(out);
+    if (n == 0) return following;
+    const c = lazy.allocChunked(heap, n) catch return VmError.OutOfMemory;
+    var it = vector_mod.Cursor.init(out);
+    for (lazy.chunkItems(c)) |*slot| slot.* = it.next().?;
+    lazy.finishChunked(c, n, following);
+    return c;
+}
 
 fn stepConcat(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);

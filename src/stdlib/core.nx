@@ -375,8 +375,9 @@
 
 ; (interpose sep coll) → coll with sep between each pair of adjacent
 ; elements.
-(defn interpose [sep coll]
-  (drop 1 (interleave (repeat sep) coll)))
+(defn interpose
+  ([sep] (xf-interpose sep))
+  ([sep coll] (drop 1 (interleave (repeat sep) coll))))
 
 ; (take-nth n coll) → every nth element, starting with the first.
 (defn take-nth [n coll]
@@ -385,13 +386,15 @@
       (cons (first s) (take-nth n (drop n s))))))
 
 ; (partition-by f coll) → coll split each time (f x) changes.
-(defn partition-by [f coll]
+(defn partition-by
+  ([f] (xf-partition-by f))
+  ([f coll]
   (lazy-seq
     (when-let [s (seq coll)]
       (let [fst (first s)
             fv (f fst)
             run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
-        (cons run (partition-by f (lazy-seq (drop (count run) s))))))))
+        (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
 
 ; (tree-seq branch? children root) → the lazy seq of the nodes of the
 ; tree under root, depth first, each before its children. Realizing a
@@ -736,9 +739,13 @@
 (defn split-with [pred coll]
   [(take-while pred coll) (drop-while pred coll)])
 
-; (sequence coll) → coll when it is a seq, else its seq, () when empty.
-(defn sequence [coll]
-  (if (seq? coll) coll (or (seq coll) ())))
+; (sequence coll) → coll when it is a seq, else its seq, () when
+; empty; (sequence xform coll) → the lazy seq of coll through the
+; transducer, 32 outputs at a time (docs/LAZY.md §10).
+(defn sequence
+  ([coll] (if (seq? coll) coll (or (seq coll) ())))
+  ([xform coll] (nexis.internal/#%sequence xform coll))
+  ([xform coll & colls] (nexis.internal/#%sequence xform (apply map vector coll colls) true)))
 
 ; (distinct? x & xs) → whether no two arguments are equal.
 (defn distinct? [x & xs]
@@ -869,6 +876,213 @@
 ; (printf fmt & args) → prints (format fmt args...); nil.
 (defn printf [fmt & args]
   (print (apply format fmt args)))
+
+; ============================================================
+; Transducers (docs/LAZY.md §10), Clojure 1.12's
+; ============================================================
+;
+; The one-argument arities of map, filter, remove, keep, take,
+; take-while, drop, drop-while, map-indexed, keep-indexed,
+; partition-all, mapcat, and the no-argument ones of distinct and
+; dedupe, are natives that call the xf- function of their name here.
+
+(defn- xf-map [f]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (rf result (f input)))
+         ([result input & inputs] (rf result (apply f input inputs))))))
+
+(defn- xf-filter [pred]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (if (pred input) (rf result input) result)))))
+
+(defn- xf-remove [pred] (xf-filter (complement pred)))
+
+(defn- xf-keep [f]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (let [v (f input)] (if (nil? v) result (rf result v)))))))
+
+(defn- xf-take [n]
+  (fn* [rf]
+    (let [nv (volatile! n)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [n @nv
+                  nn (vswap! nv dec)
+                  result (if (pos? n) (rf result input) result)]
+              (if (not (pos? nn)) (ensure-reduced result) result)))))))
+
+(defn- xf-take-while [pred]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (if (pred input) (rf result input) (reduced result))))))
+
+(defn- xf-drop [n]
+  (fn* [rf]
+    (let [nv (volatile! n)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [n @nv]
+              (vswap! nv dec)
+              (if (pos? n) result (rf result input))))))))
+
+(defn- xf-drop-while [pred]
+  (fn* [rf]
+    (let [dv (volatile! true)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (and @dv (pred input))
+              result
+              (do (vreset! dv nil) (rf result input))))))))
+
+(defn- xf-map-indexed [f]
+  (fn* [rf]
+    (let [i (volatile! -1)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input] (rf result (f (vswap! i inc) input)))))))
+
+(defn- xf-keep-indexed [f]
+  (fn* [rf]
+    (let [iv (volatile! -1)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [i (vswap! iv inc) v (f i input)]
+              (if (nil? v) result (rf result v))))))))
+
+(defn- xf-partition-all [n]
+  (fn* [rf]
+    (let [a (volatile! [])]
+      (fn ([] (rf))
+           ([result]
+            (let [result (if (empty? @a)
+                           result
+                           (let [v @a] (vreset! a []) (unreduced (rf result v))))]
+              (rf result)))
+           ([result input]
+            (let [v (vswap! a conj input)]
+              (if (= n (count v))
+                (do (vreset! a []) (rf result v))
+                result)))))))
+
+(defn- xf-partition-by [f]
+  (fn* [rf]
+    (let [a (volatile! []) pv (volatile! :nexis.core/none)]
+      (fn ([] (rf))
+           ([result]
+            (let [result (if (empty? @a)
+                           result
+                           (let [v @a] (vreset! a []) (unreduced (rf result v))))]
+              (rf result)))
+           ([result input]
+            (let [pval @pv val (f input)]
+              (vreset! pv val)
+              (if (or (identical? pval :nexis.core/none) (= val pval))
+                (do (vswap! a conj input) result)
+                (let [v @a]
+                  (vreset! a [])
+                  (let [ret (rf result v)]
+                    (when-not (reduced? ret) (vswap! a conj input))
+                    ret)))))))))
+
+(defn- xf-distinct []
+  (fn* [rf]
+    (let [seen (volatile! #{})]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (contains? @seen input)
+              result
+              (do (vswap! seen conj input) (rf result input))))))))
+
+(defn- xf-dedupe []
+  (fn* [rf]
+    (let [pv (volatile! :nexis.core/none)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [prior @pv]
+              (vreset! pv input)
+              (if (= prior input) result (rf result input))))))))
+
+(defn- xf-interpose [sep]
+  (fn* [rf]
+    (let [started (volatile! false)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if @started
+              (let [sepr (rf result sep)]
+                (if (reduced? sepr) sepr (rf sepr input)))
+              (do (vreset! started true) (rf result input))))))))
+
+(defn- preserving-reduced [rf]
+  (fn* [a b] (let [ret (rf a b)] (if (reduced? ret) (reduced ret) ret))))
+
+; (cat rf) → a transducer that concatenates each input, a collection.
+(defn cat [rf]
+  (let [rrf (preserving-reduced rf)]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (reduce rrf result input)))))
+
+(defn- xf-mapcat [f] (comp (xf-map f) cat))
+
+; (completing f) / (completing f cf) → f with a completion arity, cf
+; (identity by default).
+(defn completing
+  ([f] (completing f identity))
+  ([f cf]
+   (fn ([] (f))
+        ([x] (cf x))
+        ([x y] (f x y)))))
+
+; (transduce xform f coll) / (transduce xform f init coll) → reduce
+; with (xform f), then its completion.
+(defn transduce
+  ([xform f coll] (transduce xform f (f) coll))
+  ([xform f init coll]
+   (let [f (xform f)
+         ret (reduce f init coll)]
+     (f ret))))
+
+; (into to xform from): the native into's arity with a transducer.
+(defn- into-xform [to xform from]
+  (if (contains? #{:vector :map :set} (class to))
+    (with-meta (persistent! (transduce xform conj! (transient to) from)) (meta to))
+    (transduce xform conj to from)))
+
+; (eduction xform* coll) → the seq of coll through the composed
+; transducers, as sequence makes it.
+(defn eduction [& xforms]
+  (sequence (apply comp (butlast xforms)) (last xforms)))
+
+; (halt-when pred) / (halt-when pred retf) → a transducer that ends the
+; reduction at the first input pred holds of, with that input, or
+; (retf result input).
+(defn halt-when
+  ([pred] (halt-when pred nil))
+  ([pred retf]
+   (fn* [rf]
+     (fn ([] (rf))
+          ([result]
+           (if (and (map? result) (contains? result :nexis.core/halt))
+             (:nexis.core/halt result)
+             (rf result)))
+          ([result input]
+           (if (pred input)
+             (reduced {:nexis.core/halt (if retf (retf (rf result) input) input)})
+             (rf result input)))))))
 
 ; ============================================================
 ; Types, namespaces, UUIDs (docs/STDLIB.md §8)
