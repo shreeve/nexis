@@ -168,7 +168,9 @@ cons cell or a list through the cursor, and at a block whose body has
 not run it forces the block (§4) and steps on into its cached seq.
 `reduce`, `into`, `vec`, `count`, `apply`, `str`, `doall` and every
 other native that walks a seqable walk a lazy seq a chunk at a time
-this way.
+this way. `reduce` takes each chunk as a slice
+(`SeqIter.nextChunk`), its inner loop calling the function over the
+slice.
 
 The iterator holds only positions inside the chain its argument heads,
 which the forced blocks cache, so it roots nothing of its own; what the

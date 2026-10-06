@@ -1512,15 +1512,14 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     var cb = vm_mod.Callback.init(vm, f, 2);
     // The accumulator is the next call's argument, and a lazy `coll`'s
     // next step may collect before that call (GC.md §11.5, class 5):
-    // it waits in one root slot.
+    // it goes into a root slot before such a step.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(acc);
-    while (try it.next()) |x| {
+    while (try it.nextChunk(scope.base, acc)) |xs| for (xs) |x| {
         acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
-        vm.roots.items[scope.base] = acc;
-    }
+    };
     return acc;
 }
 

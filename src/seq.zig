@@ -1109,6 +1109,8 @@ pub const SeqIter = struct {
         string: std.unicode.Utf8Iterator,
     },
     roots: ?vm_mod.RootScope = null,
+    /// The element `nextChunk` hands out alone.
+    one: [1]Value = undefined,
 
     /// Every seqable receiver. A string that is not valid UTF-8 is
     /// `:utf8-error`, as for every other string operation.
@@ -1161,6 +1163,37 @@ pub const SeqIter = struct {
             } else return self.nextOther(),
             else => return self.nextOther(),
         }
+    }
+
+    /// The next run of elements, null at the end: the rest of a
+    /// vector's leaf or of a lazy chunk, or one element, so a walker's
+    /// inner loop runs over a slice. The slice lies in a block the walk
+    /// reaches from its argument, or in the iterator, and stays valid
+    /// across calls back into the VM (the collector moves nothing).
+    /// `held` is what the walker keeps across the walk where no
+    /// argument reaches it (`reduce`'s accumulator): it is written to
+    /// the root stack at `slot` only before a step that may run code
+    /// and collect, not on every element (docs/GC.md §11.5).
+    pub fn nextChunk(self: *SeqIter, slot: usize, held: Value) VmError!?[]const Value {
+        switch (self.state) {
+            .vector => |*c| {
+                if (c.index >= c.count) return null;
+                _ = c.next();
+                const from = c.index - 1 - c.chunk_base;
+                const to = @min(c.chunk.len, c.count - c.chunk_base);
+                c.index = c.chunk_base + to;
+                return c.chunk[from..to];
+            },
+            .lazy => |*c| if (c.items.len > 0) {
+                const xs = c.items;
+                c.items = &.{};
+                return xs;
+            },
+            else => {},
+        }
+        self.vm.roots.items[slot] = held;
+        self.one[0] = (try self.nextOther()) orelse return null;
+        return &self.one;
     }
 
     fn nextOther(self: *SeqIter) VmError!?Value {

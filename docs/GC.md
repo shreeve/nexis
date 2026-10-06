@@ -409,7 +409,8 @@ The rule each native follows, by what it holds across a further
    from its arguments or on a root scope: a realized chain is cached
    in the block that heads it, so the elements already walked reach
    from the argument the walk started at, but a callback result
-   (`reduce`'s accumulator, which waits in a root slot between calls),
+   (`reduce`'s accumulator, which goes into a root slot before each
+   step that may run code, `SeqIter.nextChunk`),
    a value the native built (`frequencies`' transient, `select-keys`'
    result) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,

@@ -6312,6 +6312,9 @@ const chain = "(defn chain [n] (lazy-seq (churn n) (when (pos? n) (cons (str n) 
 
 test "gc: a native walking a lazy seq that collects at every step keeps what it built" {
     try expectOutputUnderGc(churn ++ chain ++ "(reduce (fn [acc x] (str acc x)) \"\" (chain 30))", "302928272625242322212019181716151413121110987654321");
+    // The same over chunks: the accumulator lives across each step that
+    // makes the next chunk.
+    try expectOutputUnderGc(churn ++ "(= (reduce (fn [acc x] (str acc x)) \"\" (map (fn [x] (churn x) x) (vec (range 70)))) (apply str (range 70)))", "true");
     try expectOutputUnderGc(churn ++ chain ++ "(let [f (frequencies (map count (chain 30)))] [(f 1) (f 2)])", "[9 21]");
     try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [z (zipmap m (chain 40))] [(count z) (count (set (vals z))) (every? vector? (keys z))])", "[40 40 true]");
     try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (concat m (chain 40))] [(count c) (vector? (first c)) (last c)])", "[80 true 1]");
