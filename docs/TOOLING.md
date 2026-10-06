@@ -67,6 +67,17 @@ NEXIS_DURABILITY is not commit or durable`, exit 1.
 any value but `1` stops the command with `nexis: NEXIS_GC_STRESS is
 not 1`, exit 1.
 
+**Dispatch counts.** A binary built with `-Dopcodes=true` counts every
+dispatch by opcode (a comparison that runs its branch is one,
+`docs/VM.md` §8) and every native called through the VM's call paths
+(an instruction, `callValue`, a `Callback`), and writes them to stderr
+as CSV when the process exits, however it exits: `opcode,dispatches`
+then `group:variant,N` rows, then `native,calls` and `name,N` rows,
+each most first. The counts start after the standard library's boot,
+so they are the program's. Without the option the counting is compiled
+out; the gate analyzes the counting build so it cannot rot.
+`docs/BENCH.md` §13 uses it.
+
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold
@@ -220,19 +231,20 @@ routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0002  mov:load-const      s4  c0=0  ; 5:19
   0003  cmp:lt              s5  s3  c1=10  ; 6:9
   0004  jump:if-false       s5  j0009  ; 6:5
-  0005  math:add            s5  s3  c2=1  ; 7:14
-  0006  math:add            s4  s4  s3  ; 7:22
-  0007  mov:move            s3  s5  -  ; 7:7
-  0008  jump:jmp            -  j0003
+  0005  math:add            s4  s4  s3  ; 7:22
+  0006  math:add            s3  s3  c2=1  ; 7:14
+  0007  cmp:lt              s5  s3  c1=10  ; 6:9
+  0008  jump:if-true        s5  j0005  ; 6:5
   0009  mov:move            s2  s4  -  ; 8:7
   0010  call:call           s1  #1  s0  ; 4:1
   0011  call:return         s0  -  -
 ```
 
-The loop is pcs 3-8, six instructions per iteration: the inlined `<`
-and `+` read their operands in place, and `recur` computes `(+ i 1)`
-into a temporary because `(+ acc i)` still reads `i` (COMPILER.md
-§4.4, §5.6).
+The loop is pcs 5-8, four instructions and three dispatches per
+iteration: the inlined `<` and `+` read their operands in place,
+`recur` computes `(+ acc i)` before `(+ i 1)`, which cannot fail, so
+neither waits in a temporary, and it repeats the loop's test,
+branching back while it holds (COMPILER.md §5.6, §5.7).
 
 - The header: the routine's name, the path and position of the form
   it was lowered from, its slot count, its fixed arity (`+rest` when

@@ -7,6 +7,8 @@
 //!                                     scripts, examples; analyzes the bench
 //!   zig build test -Dgc-stress        the gate with a collection every few kilobytes
 //!   zig build test -Ddurability=durable  the gate with every store commit synced
+//!   zig build install -Dopcodes=true  bin/nexis printing its dispatch and native
+//!                                     call counts at exit (docs/TOOLING.md §1)
 //!   zig build quick                   the inner loop: unit tests, the compile and
 //!                                     Nextomic property tests, the eval corpora
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
@@ -19,6 +21,9 @@
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
 //!   zig build parser-check            diff src/parser.zig against a fresh generation
 //!                                     (part of `test` when nexus is present)
+//!   zig build codegen                 disassemble the fast dispatch handlers of the
+//!                                     arm64 and x86-64 release builds: no stack
+//!                                     frame, no call (docs/VM.md §8)
 //!   zig build check-targets           compile and link every binary for Linux
 //!                                     (x86_64 and aarch64, glibc and musl)
 //!
@@ -39,7 +44,8 @@ pub fn build(b: *std.Build) void {
         .durability = b.option(RunEnv.Durability, "durability", "the durability of every store commit the tests and programs make (NEXIS_DURABILITY)"),
     };
 
-    const nexis = runtime(b, target, optimize);
+    const image = stdlibImage(b);
+    const nexis = runtime(b, target, optimize, image);
 
     const test_step = b.step("test", "Run everything: unit, property, golden, Nextomic corpora, test/nextomic scripts, examples");
     const quick_step = b.step("quick", "The inner loop: unit tests, compile and Nextomic property tests, eval corpora");
@@ -88,7 +94,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const suites = listSuites(b);
-    const bins = binaries(b, target, optimize, nexis, suites);
+    const bins = binaries(b, target, optimize, nexis, image, suites);
 
     // Every inline `test` block of the runtime, in one binary.
     // Every test binary runs from the build root, so the stores its
@@ -150,7 +156,7 @@ pub fn build(b: *std.Build) void {
     // The benchmark runner. Its runtime is optimized too, so the numbers
     // measure release code; `-Doptimize=safe` and the like apply.
     const bench_optimize: std.lang.Optimize = if (optimize == .debug) .fast else optimize;
-    const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize));
+    const bench_exe = benchExe(b, target, bench_optimize, runtime(b, target, bench_optimize, image));
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.addPassthruArgs();
     run_bench.step.dependOn(install(b, bench_exe));
@@ -159,6 +165,14 @@ pub fn build(b: *std.Build) void {
     // generating code or running it, so an API change cannot leave the
     // bench broken.
     test_step.dependOn(&bins.bench.step);
+    // The same for the counting CLI (`-Dopcodes=true`), so the code a
+    // default build compiles out cannot rot.
+    const counted = cliModule(b, target, optimize);
+    const counted_options = b.addOptions();
+    counted_options.addOption(bool, "opcodes", true);
+    counted.addOptions("build_options", counted_options);
+    counted.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
+    test_step.dependOn(&b.addExecutable(.{ .name = "nexis-counted", .root_module = counted, .use_llvm = useLlvm(target) }).step);
 
     // Every binary above, compiled and linked for each Linux target the
     // release supports; nothing runs. The musl builds are the static
@@ -166,12 +180,29 @@ pub fn build(b: *std.Build) void {
     const check_targets_step = b.step("check-targets", "Compile and link every binary and test binary for Linux (x86_64 and aarch64, glibc and musl)");
     for (linux_targets) |t| {
         const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
-        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize), suites);
+        const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize, image), image, suites);
         const named = [_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit, cross_bins.cli_unit };
         for ([_][]const *std.Build.Step.Compile{ &named, cross_bins.suites }) |set| for (set) |compile| {
             _ = compile.getEmittedBin();
             check_targets_step.dependOn(&compile.step);
         };
+    }
+
+    // The codegen check (docs/VM.md §8): the release builds for arm64
+    // and x86-64, disassembled, with no fast dispatch handler that keeps
+    // a stack frame or calls anything.
+    const codegen_step = b.step("codegen", "Check that no fast dispatch handler of the arm64 and x86-64 release builds keeps a stack frame or calls");
+    for (linux_targets[0..2]) |t| {
+        const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
+        const module = cliModule(b, cross, .fast);
+        module.addOptions("build_options", runtimeOptions(b));
+        module.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
+        const check = b.addSystemCommand(&.{ "sh", "test/codegen.sh", t.triple });
+        check.addArtifactArg(b.addExecutable(.{ .name = "nexis", .root_module = module, .use_llvm = useLlvm(cross) }));
+        check.addFileInput(b.path("test/codegen.sh"));
+        check.setCwd(b.path("."));
+        check.stdio = .inherit;
+        codegen_step.dependOn(&check.step);
     }
 
     // -------------------------------------------------------------------------
@@ -547,7 +578,7 @@ const Binaries = struct {
 
 /// Every binary the build compiles for `target`, over the runtime
 /// module `nexis`.
-fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module, suites: []const Suite) Binaries {
+fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module, image: std.Build.LazyPath, suites: []const Suite) Binaries {
     const harness = b.createModule(.{
         .root_source_file = b.path("test/harness.zig"),
         .target = target,
@@ -565,13 +596,9 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         module.addImport("harness", harness);
         bin.* = b.addTest(.{ .name = std.Io.Dir.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
     }
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    cli_mod.addImport("emdb", emdbModule(b, target, optimize));
+    const cli_mod = cliModule(b, target, optimize);
+    cli_mod.addOptions("build_options", runtimeOptions(b));
+    cli_mod.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
     return .{
         .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) }),
         .golden = b.addExecutable(.{
@@ -590,6 +617,20 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         .cli_unit = b.addTest(.{ .name = "cli-unit", .root_module = cli_mod, .filters = &.{"cli: "}, .use_llvm = useLlvm(target) }),
         .suites = suite_bins,
     };
+}
+
+/// The module of bin/nexis, rooted at src/cli.zig, without its
+/// `build_options`.
+fn cliModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .omit_frame_pointer = omitFramePointer(optimize),
+    });
+    module.addImport("emdb", emdbModule(b, target, optimize));
+    return module;
 }
 
 fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) *std.Build.Step.Compile {
@@ -611,23 +652,74 @@ fn useLlvm(target: std.Build.ResolvedTarget) ?bool {
     return if (target.result.cpu.arch == .x86_64) true else null;
 }
 
-/// The `nexis` module: the whole runtime, rooted at src/root.zig. It
-/// links libc on every target: the runtime and emdb call it, and
-/// Linux, unlike macOS, links it only on request.
-fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+/// The `nexis` module: the whole runtime, rooted at src/root.zig, with
+/// the stdlib image `image` embedded. It links libc on every target:
+/// the runtime and emdb call it, and Linux, unlike macOS, links it
+/// only on request.
+fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, image: std.Build.LazyPath) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .omit_frame_pointer = omitFramePointer(optimize),
     });
     module.addImport("emdb", emdbModule(b, target, optimize));
+    module.addOptions("build_options", runtimeOptions(b));
+    module.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
     return module;
+}
+
+/// The stdlib image every runtime embeds (docs/STDLIB.md §1):
+/// src/imagegen.zig, built for the host over a runtime with no image,
+/// boots the embedded sources, writes their image and checks that it
+/// loads back to the same state. It depends on every source file the
+/// generator compiles, the `.nx` sources among them, so a change to
+/// the library or the compiler makes a new one; it is the same for
+/// every target, all of them 64-bit little-endian.
+fn stdlibImage(b: *std.Build) std.Build.LazyPath {
+    const host = b.graph.host;
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/imagegen.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    module.addImport("emdb", emdbModule(b, host, .debug));
+    module.addOptions("build_options", runtimeOptions(b));
+    module.addAnonymousImport("stdlib_image", .{ .root_source_file = b.addWriteFiles().add("none.image", "") });
+    const generate = b.addRunArtifact(b.addExecutable(.{ .name = "nexis-imagegen", .root_module = module, .use_llvm = useLlvm(host) }));
+    generate.clearEnvironment();
+    generate.expectExitCode(0);
+    return generate.addOutputFileArg("stdlib.image");
+}
+
+var runtime_options: ?*std.Build.Step.Options = null;
+
+/// The runtime's `build_options`, made once for every module that
+/// compiles src/vm.zig: `opcodes`, whether every dispatch and native
+/// call is counted and the CLI prints the counts at exit
+/// (docs/TOOLING.md §1).
+fn runtimeOptions(b: *std.Build) *std.Build.Step.Options {
+    if (runtime_options) |o| return o;
+    const o = b.addOptions();
+    o.addOption(bool, "opcodes", b.option(bool, "opcodes", "count every dispatch by opcode and every native call; bin/nexis prints the counts at exit") orelse false);
+    runtime_options = o;
+    return o;
 }
 
 /// emdb, the storage engine: a path dependency on the sibling checkout.
 fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
-    return b.dependency("emdb", .{ .target = target, .optimize = optimize }).module("emdb");
+    const module = b.dependency("emdb", .{ .target = target, .optimize = optimize }).module("emdb");
+    module.omit_frame_pointer = omitFramePointer(optimize);
+    return module;
+}
+
+/// A release build keeps no frame pointer, so a dispatch handler that
+/// needs no stack has no frame record to push (docs/VM.md §8); a debug
+/// build keeps the compiler's default.
+fn omitFramePointer(optimize: std.lang.Optimize) ?bool {
+    return if (optimize == .debug) null else true;
 }
 
 /// Check every `@import` under src/ against the layering src/root.zig
@@ -644,8 +736,9 @@ fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
 ///   src/nextomic/ except handle.zig to src/nextomic/root.zig. Imports
 ///   inside a unit are free.
 /// - Only src/stdlib.zig (and src/root.zig) import the Nextomic unit.
-/// - src/cli.zig and src/golden.zig are executable roots above
-///   everything; every other file must be declared, so its tests run.
+/// - src/cli.zig, src/golden.zig and src/imagegen.zig are executable
+///   roots above everything; every other file must be declared, so its
+///   tests run.
 fn checkLayering(b: *std.Build) ?[]const u8 {
     const io = b.graph.io;
     const gpa = b.allocator;
@@ -741,7 +834,7 @@ fn layerUnit(file: []const u8) []const u8 {
 }
 
 fn isExecutableRoot(file: []const u8) bool {
-    return std.mem.eql(u8, file, "cli.zig") or std.mem.eql(u8, file, "golden.zig");
+    return std.mem.eql(u8, file, "cli.zig") or std.mem.eql(u8, file, "golden.zig") or std.mem.eql(u8, file, "imagegen.zig");
 }
 
 test "importPaths: every @import in order, in any spacing, never one inside a comment or string" {

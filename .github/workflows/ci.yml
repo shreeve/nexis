@@ -1,7 +1,8 @@
-# nexis CI: the full gate on macOS and Linux, the gate again with a
-# collection every few kilobytes and every store commit synced,
-# formatting and the parser check, and a speed-optimized build with a
-# benchmark smoke run and the static (musl) Linux binaries.
+# nexis CI: the full gate on macOS and Linux, the codegen check of the
+# fast dispatch handlers on macOS, the gate again with a collection
+# every few kilobytes and every store commit synced, formatting and the
+# parser check, and a speed-optimized build with a benchmark smoke run
+# and the static (musl) Linux binaries.
 #
 # `zig build check-targets` is not a job. The test jobs build every
 # binary natively on x86_64 and aarch64 Linux (glibc) and on macOS, and
@@ -64,6 +65,13 @@ jobs:
       - name: zig build test
         working-directory: nexis
         run: zig build test --summary all
+      # The codegen check (docs/VM.md §8) disassembles the arm64 and
+      # x86-64 Linux release builds with an LLVM objdump: the macOS
+      # runner's, from Xcode's tools.
+      - name: zig build codegen
+        if: runner.os == 'macOS'
+        working-directory: nexis
+        run: zig build codegen --summary all
 
   # The gate under the collector's stress policy (docs/GC.md §7), where
   # a native that keeps a value unrooted across an allocation fails, and

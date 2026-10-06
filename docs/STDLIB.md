@@ -22,14 +22,68 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 2. `db_natives` into `db`, `string_natives` into `nexis.string`,
    `math_natives` into `nexis.math`, `internal_natives` into
    `nexis.internal`, and `src/nextomic/natives.zig` into `nextomic`.
-3. The embedded sources, each evaluated with its namespace current:
-   `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
+3. The image of the embedded sources is loaded (below). Without one,
+   the sources themselves are evaluated, each with its namespace
+   current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
    `pprint.nx`, `math.nx`, `string.nx`, `set.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
-A failure in step 3 is a bug in an embedded file and panics with the
-loader's diagnostic.
+A failure in step 3 is a bug in an embedded file or the image and
+panics with the loader's diagnostic or the image's error.
+
+**The image.** Evaluating the sources at every start would read,
+expand, compile and run 66 KB of nexis; instead the build does it once
+and every binary loads the result (`src/image.zig`). `zig build` runs
+`src/imagegen.zig`, built for the host over a runtime without an
+image: it boots the sources (`stdlib.writeImage`), writes the image of
+what they left, loads that image into a second runtime and compares
+the two (`image.verify`), failing the build on any difference. Every
+runtime module embeds the file as `stdlib_image`. A change to a source
+or to any runtime file the generator compiles makes a new image; one
+image serves every target, all 64-bit little-endian.
+
+The image holds the state the boot leaves: each namespace, its parent
+and aliases, and its map of names to Vars rebuilt at the capacity it
+had and in an order that puts every entry back in its slot, so the map
+iterates as after the boot (`ns-interns`, `:refer :all`); each Var's
+root, metadata and flags (natives the sources did not touch are left as
+step 2 installed them); the record types and protocols and their
+implementations; the routines the closures run, with their code,
+constants, Var tables, captures, `try` table and spans into the
+embedded text, so an error inside a library function reports the same
+`file:line:col`; the heap values all of these reach, with their
+metadata and sharing (a cell or atom is made empty, and filled once
+everything it can reach exists); and how many names the boot
+generated, so `gensym` and the expander's auto-gensyms count on from
+where they would have; the names inside the library's own code are
+those of a first boot in the process, as the build's was. Keywords
+and symbols are written as text and interned again, natives as the
+Var step 2 installed them in.
+
+The loader makes each closure before the routine it runs is read, so
+it verifies the routines (`Routine.verifyAlone`, `docs/VM.md` §5)
+once the image is whole: in debug and safe builds every routine, and
+one that does not verify fails the load with `UnfitRoutine` instead
+of reaching the dispatch, which trusts verified code (VM.md §8). A
+release build trusts them: the only image it loads is the one it
+embeds (an image whose header differs is not loaded), byte for byte
+the image the generator, a debug build, loaded and verified before
+the binary was built, and verifying it again would cost every start
+0.35 M instructions, 1.6% (`docs/PERF.md` §3.18).
+
+It is an internal format of one build, not the codec: no other build
+reads it, and nothing in it is compatible across versions (PLAN §23
+#25 governs the codec alone). Its header carries a format number and
+a fingerprint of the sources and of the layouts it writes; an image
+whose header differs from this build's is not loaded, and the sources
+boot instead. A struct the image writes field by field (a routine, a
+Var, a capture descriptor) gaining a field fails to compile until
+`image.zig` carries it, and the writer fails the build on a value it
+cannot carry: a kind outside the image's set (strings, bignums,
+regexes, vectors, lists of cons cells, hash maps and sets, closures,
+cells, atoms, records, protocols and their functions), a list view, a
+Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|

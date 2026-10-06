@@ -12,7 +12,7 @@
 //!
 //!     ProtocolFnBody extern struct {
 //!         protocol_id: u32,
-//!         method_name_id: u32,   // interned symbol id of method
+//!         method_name_id: u32,   // interned keyword id of the method's name
 //!     }
 //!
 //! Both are identity kinds (`dispatch.isIdentityKind`): equal to

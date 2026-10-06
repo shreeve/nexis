@@ -1,0 +1,3 @@
+; bench/micro/leaf.nx N: count plus a call of a leaf native (max).
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 acc 0] (if (< i n) (recur (inc i) (max acc i)) acc))))

@@ -78,11 +78,14 @@ const Tiny = union(enum) {
     throw_: *const Tiny,
     /// A call of a core arithmetic or comparison fn that the VM
     /// runs as one `math` or `cmp` instruction (COMPILER.md §4.3
-    /// rule 2); `rhs` is null for the unary ops.
+    /// rule 2); `rhs` is null for the unary ops. `more` are the
+    /// arguments past two of `+`, `*` or `-`, folded left once every
+    /// argument is computed, one instruction each.
     prim: struct {
         op: PrimOp,
         lhs: *const Tiny,
         rhs: ?*const Tiny = null,
+        more: []const *const Tiny = &.{},
     },
     /// `(if test then else?)`; a missing else is nil.
     if_: struct {
@@ -179,14 +182,14 @@ const PrimOp = enum {
     }
 };
 
-/// The core fns inlined as a `Tiny.prim`, at the one arity each
-/// inlines at; `inc` and `dec` are `+` and `-` with a constant 1.
-/// Every other arity is an ordinary call.
-const Inlined = struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false };
+/// The core fns inlined as a `Tiny.prim`, at the arity each inlines
+/// at, or at any arity from it when `fold`; `inc` and `dec` are `+`
+/// and `-` with a constant 1. Every other arity is an ordinary call.
+const Inlined = struct { name: []const u8, argc: usize, op: PrimOp, one: bool = false, fold: bool = false };
 const inlined_ops = [_]Inlined{
-    .{ .name = "+", .argc = 2, .op = .add },
-    .{ .name = "-", .argc = 2, .op = .sub },
-    .{ .name = "*", .argc = 2, .op = .mul },
+    .{ .name = "+", .argc = 2, .op = .add, .fold = true },
+    .{ .name = "-", .argc = 2, .op = .sub, .fold = true },
+    .{ .name = "*", .argc = 2, .op = .mul, .fold = true },
     .{ .name = "/", .argc = 2, .op = .div },
     .{ .name = "quot", .argc = 2, .op = .quot },
     .{ .name = "mod", .argc = 2, .op = .mod },
@@ -342,6 +345,28 @@ const RecurTarget = struct {
     /// falling through to the return after the body (COMPILER.md
     /// §5.5). True for a `fn*`'s target and a `loop*` in its tail.
     returns: bool = false,
+    /// Per binding: whether it holds a number on every iteration
+    /// (`numericBindings`), so arithmetic on it cannot fail.
+    numeric: []const bool = &.{},
+    /// The test at the entry, which a `recur` in an arm of the
+    /// entry's `if` repeats instead of jumping back to it.
+    bottom: ?BottomTest = null,
+};
+
+/// A target's entry test, `(if test then else)` at its entry pc, as
+/// a `recur` repeats it at the loop's bottom (COMPILER.md §5.7): the
+/// `len` instructions from the entry, the jump to the else arm last,
+/// with their spans, so the iteration branches back once instead of
+/// jumping to the entry and testing there. The then arm starts right
+/// after them.
+const BottomTest = struct {
+    entry_pc: u32,
+    len: u32,
+    /// Where the `recur` is. In the then arm it branches back to the
+    /// then arm when the test would not jump, and jumps to the else
+    /// arm (patched from the list) when it would; in the else arm,
+    /// at its pc, the other way round.
+    arm: union(enum) { then: *Jumps, else_: u32 },
 };
 
 // =============================================================================
@@ -967,6 +992,24 @@ const Emitter = struct {
     /// next instruction.
     fn patchJumpHere(self: *Emitter, at: usize) CompileError!void {
         self.code.items[at].setWide(try self.nextPc());
+    }
+
+    /// The span the instruction at `pc` carries.
+    fn spanAt(self: *const Emitter, pc: usize) ?reader_mod.SrcSpan {
+        var i = self.span_table.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.span_table.items[i];
+            if (entry.pc <= pc) return .{ .pos = entry.span.pos, .len = entry.span.len };
+        }
+        return null;
+    }
+
+    /// Remove the last instruction, which nothing targets.
+    fn dropLast(self: *Emitter) void {
+        _ = self.code.pop();
+        const spans = &self.span_table.items;
+        if (spans.len > 0 and spans.*[spans.len - 1].pc == self.code.items.len) _ = self.span_table.pop();
     }
 
     /// Emit `inst`, whose target is still to be patched; return its
@@ -1660,7 +1703,8 @@ fn lowerBigInt(allocator: std.mem.Allocator, text: []const u8, ctx: LowerCtx) Co
 /// The inlined core fn `name` is at `argc` arguments, if any.
 fn inlinedOp(name: []const u8, argc: usize) ?Inlined {
     for (inlined_ops) |in| {
-        if (in.argc == argc and std.mem.eql(u8, in.name, name)) return in;
+        const fits = in.argc == argc or (in.fold and argc > in.argc);
+        if (fits and std.mem.eql(u8, in.name, name)) return in;
     }
     return null;
 }
@@ -1675,11 +1719,13 @@ fn lowerPrim(
     const lhs = try lowerForm(allocator, args[0], ctx);
     const rhs: ?*const Tiny = if (in.one)
         try allocTiny(allocator, .{ .int = 1 })
-    else if (args.len == 2)
+    else if (args.len >= 2)
         try lowerForm(allocator, args[1], ctx)
     else
         null;
-    return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs } });
+    const more = try allocator.alloc(*const Tiny, if (args.len > 2) args.len - 2 else 0);
+    for (more, 2..) |*m, i| m.* = try lowerForm(allocator, args[i], ctx);
+    return try allocTiny(allocator, .{ .prim = .{ .op = in.op, .lhs = lhs, .rhs = rhs, .more = more } });
 }
 
 /// Ordinary function call `(callee args...)`. Lowers head as
@@ -2570,7 +2616,7 @@ fn compileExpr(
         .coll => |c| try compileColl(e, c.op, c.items, dst),
         .try_ => |t| try compileTry(e, t.body, t.binding, t.handler, t.finally_, t.binding_captured, dst),
         .throw_ => |value| try compileThrow(e, value),
-        .prim => |p| try compilePrim(e, p.op, p.lhs, p.rhs, dst),
+        .prim => |p| if (p.more.len == 0) try compilePrim(e, p.op, p.lhs, p.rhs, dst) else try compileFold(e, p.op, p.lhs, p.rhs.?, p.more, dst),
         .if_ => |i| try compileIf(e, i.test_, i.then, i.else_, dst, recur_target),
         .let_star => |l| try compileLetStar(e, l.bindings, l.body, dst, recur_target),
         .do_ => |exprs| try compileDo(e, exprs, dst, recur_target),
@@ -2784,6 +2830,33 @@ fn compilePrim(e: *Emitter, op: PrimOp, lhs: *const Tiny, rhs: ?*const Tiny, dst
     const a = try primOperand(e, lhs, rhs == null or isLeaf(rhs.?), dst, &free_dst);
     const b = if (rhs) |r| try primOperand(e, r, true, dst, &free_dst) else Operand.none;
     try e.emit(op.inst(dst, a, b));
+}
+
+/// `(+ a b c ...)`, `*` or `-` likewise: every argument computed in
+/// order (`compileOperand`), as the fn's call would compute them,
+/// then a left fold over their values, the running value in a slot
+/// nothing reads and the last instruction writing `dst`
+/// (COMPILER.md §4.3). An argument reads a Var in place only when no
+/// later argument runs code that could change it.
+fn compileFold(e: *Emitter, op: PrimOp, first: *const Tiny, second: *const Tiny, more: []const *const Tiny, dst: u12) CompileError!void {
+    const args = try e.allocator.alloc(*const Tiny, 2 + more.len);
+    defer e.allocator.free(args);
+    args[0] = first;
+    args[1] = second;
+    @memcpy(args[2..], more);
+    const ops = try e.allocator.alloc(Operand, args.len);
+    defer e.allocator.free(ops);
+    for (args, ops, 1..) |arg, *o, i| {
+        const leaves_after = for (args[i..]) |later| {
+            if (!isLeaf(later)) break false;
+        } else true;
+        o.* = try compileOperand(e, arg, leaves_after);
+    }
+    const free_dst = if (e.scratch) |s| s.dst == dst else false;
+    const acc = if (free_dst) dst else try e.allocSlot();
+    try e.emit(op.inst(acc, ops[0], ops[1]));
+    for (ops[2 .. ops.len - 1]) |o| try e.emit(op.inst(acc, Operand.slot(acc), o));
+    try e.emit(op.inst(dst, Operand.slot(acc), ops[ops.len - 1]));
 }
 
 /// `compileOperand`, or `t` computed into `dst` when `free_dst` says
@@ -3193,12 +3266,16 @@ fn compileLoopStar(
     const names = try e.allocator.alloc([]const u8, bindings.len);
     defer e.allocator.free(names);
     for (bindings, names) |b, *n| n.* = b.name;
+    const numeric = try e.allocator.alloc(bool, bindings.len);
+    defer e.allocator.free(numeric);
+    try numericBindings(e.allocator, bindings, names, body, numeric);
     const loop_target = RecurTarget{
         .entry_pc = entry_pc,
         .binding_slots = binding_slots,
         .captured_mask = captured_mask,
         .names = names,
         .returns = returns,
+        .numeric = numeric,
     };
 
     // 5. Compile body with the loop target installed. The
@@ -3210,17 +3287,16 @@ fn compileLoopStar(
 
 /// Lower `(recur args...)` per COMPILER.md §5.6 + VM.md §11:
 /// rebind the target's bindings to the arguments as one parallel
-/// assignment, then `jump:jmp` to the target's entry. No `call` is
-/// emitted and `dst` is never written.
+/// assignment, then go back to the target's entry, or repeat its test
+/// (`BottomTest`). No `call` is emitted and `dst` is never written.
 ///
-/// An argument no other argument reads the binding of, for a
-/// binding no closure captures, is computed straight into the
-/// binding's slot: nothing evaluated after it can observe the
-/// change. Every other argument is read in place when it is a
-/// constant, an upvalue or a slot no rebinding overwrites, and is
-/// computed into a fresh slot otherwise; the moves into the
-/// bindings follow, a captured binding getting a fresh cell per
-/// iteration (the value is boxed in its fresh slot, then
+/// An argument for a binding no closure captures is computed straight
+/// into the binding's slot once every other argument that reads the
+/// binding is computed (`nextRecurArg`). Every other argument is read
+/// in place when it is a constant, an upvalue or a slot no rebinding
+/// overwrites, and is computed into a fresh slot otherwise; the moves
+/// into the bindings follow, a captured binding getting a fresh cell
+/// per iteration (the value is boxed in its fresh slot, then
 /// installed), since mutating the shared cell would change what
 /// earlier closures see.
 fn compileRecur(
@@ -3231,17 +3307,35 @@ fn compileRecur(
     const target = recur_target orelse return CompileError.RecurOutsideTail;
     if (args.len != target.binding_slots.len) return CompileError.RecurArityMismatch;
 
-    const pending = try e.allocator.alloc(?Operand, args.len);
+    const n = args.len;
+    const reads = try e.allocator.alloc(bool, n * n);
+    defer e.allocator.free(reads);
+    for (args, 0..) |arg, j| {
+        for (target.names, 0..) |name, m| reads[j * n + m] = j != m and try readsName(arg, name);
+    }
+    const state = try e.allocator.alloc(RecurArg, n);
+    defer e.allocator.free(state);
+    for (args, target.captured_mask, state) |arg, captured, *s| {
+        s.* = .{ .temp = captured, .safe = try cannotFail(e, arg, target) };
+    }
+    const pending = try e.allocator.alloc(?Operand, n);
     defer e.allocator.free(pending);
-    for (args, 0..) |arg, i| {
+    for (0..n) |_| {
+        const i = nextRecurArg(state, reads) orelse first: {
+            // Every argument left waits for another: the first takes a
+            // fresh slot, so nothing waits for it.
+            const first = for (state, 0..) |s, k| {
+                if (!s.done) break k;
+            } else unreachable;
+            state[first].temp = true;
+            break :first first;
+        };
+        state[i].done = true;
+        const arg = args[i];
         const slot = target.binding_slots[i];
-        var read_elsewhere = false;
-        for (args, 0..) |other, j| {
-            if (j != i and try readsName(other, target.names[i])) read_elsewhere = true;
-        }
         // Recur args are non-tail (any nested recur would target
         // the wrong scope; COMPILER.md §4.4).
-        if (!read_elsewhere and !target.captured_mask[i]) {
+        if (!state[i].temp) {
             try compileExpr(e, arg, slot, null);
             pending[i] = null;
             continue;
@@ -3266,7 +3360,180 @@ fn compileRecur(
         if (op.kind == .slot and op.index == slot) continue;
         try e.emit(vm.asm_.moveFrom(slot, op));
     }
+    if (target.bottom) |b| return repeatTest(e, b);
     try e.emit(vm.asm_.jumpJmp(target.entry_pc));
+}
+
+/// Where a `recur` argument stands: computed yet, going through a
+/// fresh slot (a captured binding's, or one that breaks a cycle of
+/// arguments reading each other's bindings), and whether computing
+/// it can fail or do anything else another argument could observe.
+const RecurArg = struct { done: bool = false, temp: bool, safe: bool };
+
+/// The first argument still to compute that may be computed now: when
+/// it goes into its binding's slot, every other argument reading that
+/// binding is computed; and when an argument before it is still to
+/// compute, one of the two cannot fail, so computing them out of
+/// order changes nothing a program can see (COMPILER.md §5.6).
+fn nextRecurArg(state: []const RecurArg, reads: []const bool) ?usize {
+    const n = state.len;
+    next: for (state, 0..) |s, k| {
+        if (s.done) continue;
+        if (!s.temp) for (state, 0..) |other, j| {
+            if (!other.done and reads[j * n + k]) continue :next;
+        };
+        if (!s.safe) for (state[0..k]) |before| {
+            if (!before.done and !before.safe) continue :next;
+        };
+        return k;
+    }
+    return null;
+}
+
+/// Whether evaluating `t` can neither fail nor do anything else: a
+/// literal, a local, or `+`, `-`, `*`, negation or `abs` of numbers,
+/// or a quotient or modulus of a number by a nonzero integer
+/// literal. Arithmetic on numbers fails only when memory runs out.
+fn cannotFail(e: *const Emitter, t: *const Tiny, target: *const RecurTarget) CompileError!bool {
+    try stack.check();
+    if (isInert(e, t)) return true;
+    const p = switch (t.*) {
+        .prim => |p| p,
+        else => return false,
+    };
+    switch (p.op) {
+        .add, .sub, .mul, .neg, .abs => {},
+        .quot, .mod => if (p.rhs.?.* != .int or p.rhs.?.int == 0) return false,
+        else => return false,
+    }
+    if (!try holdsNumber(e, p.lhs, target)) return false;
+    if (p.rhs) |r| if (!try holdsNumber(e, r, target)) return false;
+    for (p.more) |m| if (!try holdsNumber(e, m, target)) return false;
+    return true;
+}
+
+/// Whether `t` evaluates to a number without failing: a number
+/// literal, a binding of `target` that holds a number on every
+/// iteration, or arithmetic that `cannotFail`.
+fn holdsNumber(e: *const Emitter, t: *const Tiny, target: *const RecurTarget) CompileError!bool {
+    return switch (t.*) {
+        .int => true,
+        .literal => |v| vm.isNumber(v),
+        .prim => try cannotFail(e, t, target),
+        .symbol => |name| switch (e.resolveLocalRef(name) orelse return false) {
+            .direct_slot, .cell_slot => |slot| for (target.binding_slots, 0..) |s, k| {
+                if (s == slot) break k < target.numeric.len and target.numeric[k];
+            } else false,
+            .upvalue => false,
+        },
+        else => false,
+    };
+}
+
+/// Per binding of a `loop*`: whether it holds a number on every
+/// iteration, because its initial value and its every `recur`
+/// argument is a number (`makesNumber`). The largest such set: start
+/// from the bindings whose initial value is one and drop a binding
+/// while some `recur` can give it anything else.
+fn numericBindings(allocator: std.mem.Allocator, bindings: []const Binding, names: []const []const u8, body: *const Tiny, numeric: []bool) CompileError!void {
+    for (bindings, numeric) |b, *n| n.* = try makesNumber(b.value, &.{}, &.{}, &.{});
+    var shadowed: std.ArrayList([]const u8) = .empty;
+    defer shadowed.deinit(allocator);
+    while (try dropNonNumeric(allocator, body, names, numeric, &shadowed)) {}
+}
+
+/// Clear `numeric` for each binding a `recur` in a tail of `t` can
+/// rebind to anything but a number; whether any was cleared.
+/// `shadowed` holds the names bound between the loop and `t`.
+fn dropNonNumeric(allocator: std.mem.Allocator, t: *const Tiny, names: []const []const u8, numeric: []bool, shadowed: *std.ArrayList([]const u8)) CompileError!bool {
+    try stack.check();
+    switch (t.*) {
+        .recur => |r| {
+            if (r.args.len != names.len) return false;
+            var dropped = false;
+            for (r.args, numeric) |arg, *n| {
+                if (n.* and !try makesNumber(arg, names, numeric, shadowed.items)) {
+                    n.* = false;
+                    dropped = true;
+                }
+            }
+            return dropped;
+        },
+        .if_ => |i| {
+            const then = try dropNonNumeric(allocator, i.then, names, numeric, shadowed);
+            const other = if (i.else_) |x| try dropNonNumeric(allocator, x, names, numeric, shadowed) else false;
+            return then or other;
+        },
+        .do_ => |items| return items.len > 0 and try dropNonNumeric(allocator, items[items.len - 1], names, numeric, shadowed),
+        inline .let_star, .letfn_star => |l| {
+            const mark = shadowed.items.len;
+            defer shadowed.shrinkRetainingCapacity(mark);
+            for (l.bindings) |b| try shadowed.append(allocator, b.name);
+            return dropNonNumeric(allocator, l.body, names, numeric, shadowed);
+        },
+        else => return false,
+    }
+}
+
+/// Whether `t`, wherever it returns, returns a number: a number
+/// literal, arithmetic (whose result is a number whenever it has
+/// one), a binding in `names` marked `numeric` and not `shadowed`, or
+/// an `if` whose arms both are.
+fn makesNumber(t: *const Tiny, names: []const []const u8, numeric: []const bool, shadowed: []const []const u8) CompileError!bool {
+    try stack.check();
+    return switch (t.*) {
+        .int => true,
+        .literal => |v| vm.isNumber(v),
+        .prim => |p| switch (p.op) {
+            .lt, .lte, .gt, .gte, .num_eq => false,
+            else => true,
+        },
+        .symbol => |name| for (shadowed) |s| {
+            if (std.mem.eql(u8, s, name)) break false;
+        } else for (0..names.len) |i| {
+            const k = names.len - 1 - i;
+            if (std.mem.eql(u8, names[k], name)) break numeric[k];
+        } else false,
+        .if_ => |i| if (i.else_) |x| try makesNumber(i.then, names, numeric, shadowed) and try makesNumber(x, names, numeric, shadowed) else false,
+        else => false,
+    };
+}
+
+/// The target's test, repeated at a `recur` (`BottomTest`).
+fn repeatTest(e: *Emitter, b: BottomTest) CompileError!void {
+    const saved_span = e.current_span;
+    const then_pc = b.entry_pc + b.len;
+    for (b.entry_pc..then_pc) |pc| {
+        var copy = e.code.items[pc];
+        if (pc == then_pc - 1) switch (b.arm) {
+            .then => {
+                const if_false = copy.variant == @backingInt(vm.Jump.if_false);
+                copy.variant = @backingInt(if (if_false) vm.Jump.if_true else vm.Jump.if_false);
+                copy.setWide(then_pc);
+            },
+            .else_ => |else_pc| copy.setWide(else_pc),
+        };
+        e.current_span = e.spanAt(pc) orelse saved_span;
+        try e.emit(copy);
+    }
+    e.current_span = saved_span;
+    switch (b.arm) {
+        .then => |exits| try exits.append(e.allocator, try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched))),
+        .else_ => try e.emit(vm.asm_.jumpJmp(then_pc)),
+    }
+}
+
+/// The test of the `if` starting at `entry_pc`, just emitted with its
+/// one jump to the else arm in `jumps`, as a `recur` can repeat it:
+/// a jump on an operand read in place, or a comparison into a slot
+/// and a jump on that slot (the pair the VM runs as one dispatch).
+fn bottomTest(e: *Emitter, entry_pc: u32, jumps: []const usize) CompileError!?BottomTest {
+    const code = e.code.items[entry_pc..];
+    if (jumps.len != 1 or code.len > 2 or jumps[0] != e.code.items.len - 1) return null;
+    if (code.len == 2 and (code[0].groupOf() != .cmp or @as(u16, @bitCast(code[0].a)) != @as(u16, @bitCast(code[1].a)))) return null;
+    // The then arm starts here, a target of every repeated test.
+    _ = try e.nextPc();
+    return .{ .entry_pc = entry_pc, .len = @intCast(code.len), .arm = undefined };
 }
 
 fn isRecurSlot(target: *const RecurTarget, slot: u12) bool {
@@ -3289,7 +3556,7 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
         .coll => |c| any(c.items, name),
         .do_ => |items| any(items, name),
         .recur => |r| any(r.args, name),
-        .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false),
+        .prim => |p| try readsName(p.lhs, name) or (if (p.rhs) |r| try readsName(r, name) else false) or try any(p.more, name),
         .if_ => |i| try readsName(i.test_, name) or try readsName(i.then, name) or (if (i.else_) |x| try readsName(x, name) else false),
         .let_star, .loop_star => |l| blk: {
             for (l.bindings) |b| if (try readsName(b.value, name)) break :blk true;
@@ -3599,9 +3866,21 @@ fn compileIf(
     // The test is non-tail and branched on (`compileBranch`).
     var if_false: Jumps = .empty;
     defer if_false.deinit(e.allocator);
+    const at_entry = if (recur_target) |t| t.bottom == null and e.code.items.len == t.entry_pc else false;
     try compileBranch(e, test_form, false, &if_false);
+    // An if at a target's entry: a recur in either arm repeats its
+    // test (COMPILER.md §5.7).
+    var exits: Jumps = .empty;
+    defer exits.deinit(e.allocator);
+    const bottom = if (at_entry) try bottomTest(e, recur_target.?.entry_pc, if_false.items) else null;
+    var then_target: RecurTarget = undefined;
+    if (bottom) |b| {
+        then_target = recur_target.?.*;
+        then_target.bottom = b;
+        then_target.bottom.?.arm = .{ .then = &exits };
+    }
     // Both arms inherit tail position.
-    try compileExpr(e, then_form, dst, recur_target);
+    try compileExpr(e, then_form, dst, if (bottom != null) &then_target else recur_target);
     // An arm that always jumps away (recur, throw) or returns needs
     // no jump past the else arm, nor does an else arm that is `dst`
     // itself (`(if c (+ acc 1) acc)` into acc's slot), which emits
@@ -3609,9 +3888,21 @@ fn compileIf(
     const returns = if (recur_target) |t| t.returns else false;
     const else_empty = if (else_form) |ef| isSlot(e, ef, dst) else false;
     const end_jmp_pc: ?usize = if (!e.reachable or else_empty) null else try e.emitPlaceholder(vm.asm_.jumpJmp(unpatched));
+    // A recur last in the then arm falls through to the else arm.
+    if (exits.items.len > 0 and exits.items[exits.items.len - 1] == e.code.items.len - 1) {
+        _ = exits.pop();
+        e.dropLast();
+    }
     try patchJumpsHere(e, if_false.items);
+    try patchJumpsHere(e, exits.items);
+    var else_target: RecurTarget = undefined;
+    if (bottom) |b| {
+        else_target = recur_target.?.*;
+        else_target.bottom = b;
+        else_target.bottom.?.arm = .{ .else_ = try e.nextPc() };
+    }
     if (else_form) |ef| {
-        try compileExpr(e, ef, dst, recur_target);
+        try compileExpr(e, ef, dst, if (bottom != null) &else_target else recur_target);
     } else {
         try e.emit(if (returns) vm.asm_.returnNil() else vm.asm_.loadNil(dst));
     }
@@ -4279,6 +4570,30 @@ test "span table: a nested routine carries its own table, origin and name" {
     // after it carries the fn's.
     const last = r.spanAt(@intCast(r.code.len - 2)) orelse return error.TestFailed;
     try testing.expectEqualStrings("(* x x)", src[last.pos .. last.pos + last.len]);
+}
+
+test "span table: a loop's test repeated at its recur carries the test's spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "(loop* [i 0] (if (< i 3) (recur (inc i)) i))";
+    const info = vm.SourceInfo{ .path = "t.nx", .text = src };
+    const routine = (try compileSourceWith(arena.allocator(), src, .{ .source = &info })).toRoutine("t");
+    // Each instruction of the test, at the entry and at the recur,
+    // names `(< i 3)` or the `if` it branches for.
+    var seen: [2][2][]const u8 = undefined;
+    var n: usize = 0;
+    for (routine.code, 0..) |inst, pc| {
+        if (inst.groupOf() != .cmp) continue;
+        for (0..2) |k| {
+            const span = routine.spanAt(@intCast(pc + k)) orelse return error.TestFailed;
+            seen[n][k] = src[span.pos .. span.pos + span.len];
+        }
+        n += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("(< i 3)", seen[0][0]);
+    try testing.expectEqualStrings(src[13 .. src.len - 1], seen[0][1]);
+    for (0..2) |k| try testing.expectEqualStrings(seen[0][k], seen[1][k]);
 }
 
 test "span table: a hand-built Tiny compiles with no table" {

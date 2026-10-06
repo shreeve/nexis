@@ -131,6 +131,38 @@ Routines carry no metadata map. Two routines compiled from the same
 source are not required to be identical; `=` on two closures
 compares identity.
 
+**Verified before it runs.** `Routine.verify` proves a routine, and
+every routine its capture descriptors build, fit to run: every
+instruction `primary` with an assigned opcode (a defined but
+unexecuted one, §10, passes and traps where it runs); every operand
+inside the table it indexes (a slot below `slot_count`, a constant,
+a Var, an upvalue below `upvalue_count`) and a destination a slot;
+every wide field inside its table, a jump target, a `try`'s catch and
+finally pcs and `ctrl:try-exit`'s continuation inside the code; every
+`call:call` and `coll:*` block inside the frame; every capture
+descriptor's sources inside the frame and the routine's upvalues, as
+many as the child's `upvalue_count`; and the last instruction one
+that never falls through (`jump:jmp`, `call:return`,
+`call:return-nil`, `ctrl:throw`, `ctrl:try-exit`,
+`ctrl:finally-exit`), so execution cannot run off the code. `run` and
+`runRoutine` verify the routine they run as a top-level frame, which
+has no upvalues, and so every routine a closure built under it can
+be; a routine that fails runs nothing, and its error leaves `run` or
+`runRoutine` with a one-frame trace naming the instruction (§13). The
+stdlib image's loader verifies each routine it loads in debug and safe
+builds, and the image a release build loads is the one the build's
+generator loaded and verified (`docs/STDLIB.md` §1). The dispatch
+trusts what verification proved (§8). `allocClosure` verifies its
+routine again in a debug build, so a closure over a routine nothing
+verified is an assertion there; the image loader alone uses
+`allocClosureUnverified`, since it makes each closure before the
+routine it runs is read, and verifies every routine (`verifyAlone`,
+each once) when the image is whole. Verification never traps: a
+routine longer than a pc can name is `BytecodeCorruption` before any
+of it is read, and capture descriptors that lead back to their own
+routine, which no compiler makes, end in the stack guard's
+`StackOverflow`.
+
 ---
 
 ### 6. Closure
@@ -332,7 +364,7 @@ collector root (§9).
 
 | Field | Contents |
 |---|---|
-| `routine`, `pc` | The routine and the index of the next instruction |
+| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument |
 | `base_slot`, `slot_count` | The window into the shared backing stack (`vm.stack`); `slot[i]` is `stack[base_slot + i]` |
 | `entry_stack_len` | The stack length before the window grew; a return or an unwind restores it |
 | `upvalues` | The closure's cell array (shared, not owned) |
@@ -356,29 +388,69 @@ pop only from the top.
 
 ### 8. Dispatch
 
-Threaded code through a handler table. `op_table` holds one handler
-per opcode, indexed by group and variant together (`group | variant
-<< 6`, 4096 entries). A handler runs its instruction, then fetches the
-next one itself and tail-calls that instruction's handler
-(`@call(.always_tail, ...)`), so an instruction costs one indirect
-branch and the native stack does not grow with the instructions run.
+Threaded code through two handler tables, each indexed by group and
+variant together (`group | variant << 6`, 4096 entries). A handler
+runs its instruction, then fetches the next one itself and tail-calls
+that instruction's handler (`@call(.always_tail, ...)`), so an
+instruction costs one indirect branch and the native stack does not
+grow with the instructions run. A handler is called with the VM, the
+frame, the instruction and `pc`, the index of the instruction after
+it, which stays in a register from handler to handler.
 
 ```
-fetch (every handler's last step):
-  if frame.pc >= code.len: BytecodeExhausted
-  inst = frame.routine.code[frame.pc]; frame.pc += 1
-  if inst.kind is not primary: BytecodeCorruption
-  tail-call op_table[inst.group | inst.variant << 6](vm, frame, inst)
+fetch at pc (every handler's last step):
+  inst = frame.routine.code[pc]
+  tail-call fast_table[inst.group | inst.variant << 6](vm, frame, inst, pc + 1)
 ```
 
-- Every variant of `mov`, `jump` and `cmp`, and `math:add`,
-  `math:sub`, `math:mul`, `math:idiv`, `math:mod`, `closure:get-cell`,
-  `var:load-var`, `call:call`, `call:return` and `call:return-nil`,
-  has a handler of its own; every other entry is its group's, which
-  switches on the variant or, where no variant is left, traps as §10
-  says for one outside the enum. A group outside the enum is
-  `BytecodeCorruption`; `transient`, `hash`, `tx`, `io` and `simd`
-  trap `UnimplementedOpcode` for every variant.
+The fetch checks nothing: verification (§5) proved every pc it can
+reach inside the code and every instruction `primary`, and the fast
+handlers read their operands, jump and fill call blocks without the
+bounds verification proved. The general handlers keep their checks.
+A fast handler reads a slot's value as two whole 8-byte words, the
+way a handler stores one, never its kind byte alone or both words in
+one 16-byte load: a load the size of a store in flight takes its data
+from the store, and any other waits for the store to reach the cache,
+which a loop carrying a value from slot to slot would pay at every
+instruction.
+
+- `op_table` holds every opcode's **general handler**, which takes
+  every case and raises every trap. Every variant of `mov`, `jump` and
+  `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
+  `call:return` and `call:return-nil`, has a general handler of its
+  own; every other entry is its group's, which switches on the
+  variant or, where no variant is left, traps as §10 says for one
+  outside the enum. A group outside the enum is `BytecodeCorruption`;
+  `transient`, `hash`, `tx`, `io` and `simd` trap
+  `UnimplementedOpcode` for every variant.
+- `fast_table`, the table the fetch reads, is `op_table` with a
+  **fast handler** over each hot opcode: every variant of `mov`,
+  `jump` and `cmp`, `math:add`, `math:sub`, `math:mul`, `math:idiv`,
+  `math:mod`, `var:load-var`, `closure:get-cell`, `call:call`,
+  `call:return` and `call:return-nil`. A fast handler takes its
+  instruction's common case, reading its operands in place and storing
+  only to a slot of its frame, with no call but its tail call and no
+  stack frame; on any other case it tail-calls the general handler
+  through `op_table` before it has changed anything, so every trap,
+  every safe point and every allocation is the general handler's. The
+  table indexed at run time is what keeps the optimizer from inlining
+  the general handler, and the stack frame it needs, back into the
+  fast one. A case that calls out, a leaf native or a keyword
+  looking itself up, goes on to a part of its own out of line: a call
+  in return position that is never inlined, which a release build
+  makes a tail call, so the stack frame the part needs is not the fast
+  handler's. Release builds keep no frame pointer, so a fast handler
+  has no frame record to push either. The fast handlers sit together
+  in a section of their own, each on a cache line of its own, so code
+  growing elsewhere does not move them against each other.
+  `zig build codegen` holds the rule: it disassembles the arm64 and
+  x86-64 release builds and fails when a fast handler (`vm.VM.fast*`)
+  calls anything or, on arm64, names the stack pointer
+  (`test/codegen.sh`, with an LLVM objdump). On x86-64, whose System
+  V convention leaves a handler nine scratch registers, four of them
+  its arguments, the comparisons, the arithmetic and `call:call` save
+  one to six registers with `push` and `pop`; no handler there may
+  reserve or address stack, and the check lists what each saves.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns.
   It enters the chain at the current frame's next instruction, and the
@@ -391,25 +463,39 @@ fetch (every handler's last step):
   `cmp`, `jump`, `var`, `math`, `closure`, `coll`) run against the
   frame the fetch took; `call` and `ctrl` re-derive the current frame,
   since a call or a native may have grown `frames`.
+- A build with `-Dopcodes=true` counts each fetch by its opcode index
+  and each native call (`docs/TOOLING.md` §1); any other build
+  compiles the counting out.
 - The pc advances before the handler runs, so a handler sees the
-  next pc: a conditional jump not taken does nothing, a taken one
-  overwrites `pc`, and every frame's `pc` in an error trace is one
-  past its instruction (§13).
-- The hot handlers read a slot, a constant, an initialized upvalue
-  or a bound Var in place and hand every other operand, a trap
-  included, to the general resolution of §4. Two fixnums compare, add, subtract, multiply,
-  `quot` and `mod` inline when the result is a fixnum; anything else,
-  a promotion or a zero divisor included, goes through the numeric
-  tower (§10.3). `call:call` of a
+  next pc: a conditional jump not taken fetches at it, a taken one at
+  its target. The frame's `pc` field is written only where something
+  reads it: every general handler writes it on entry, before anything
+  that can raise, call out, reach a safe point or end the chain, and
+  goes on from the field; a fast handler writes it only before it
+  pushes a frame (the return and a trace through the callee read it)
+  or calls a native, and otherwise fetches at the `pc` it was passed.
+  So every frame's `pc` in an error trace is one past its instruction
+  (§13), and a frame's `pc` under a frame it called is its return
+  point.
+- The fast handlers read a slot, a constant, an initialized upvalue
+  or a bound Var in place and leave every other operand, a trap
+  included, to the general handler's resolution (§4). Two fixnums
+  compare, add, subtract, multiply, `quot` and `mod` there when the
+  result is a fixnum; anything else, a promotion or a zero divisor
+  included, goes through the numeric tower (§10.3). `call:call` of a
   closure with its fixed arity, where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
-  and `callValue` enters a closure the same way; a native within its
-  arity is called with its arguments copied to a buffer on the native
-  stack, or read in place by a leaf (§6); a keyword or symbol called
-  with one or two arguments on a map, a record or nil looks itself up
-  in place, as `VM.lookup` does, with no copy and no safe point (the
-  key is an immediate, so the lookup neither allocates nor walks
-  nested data). Every other call goes through the general entry of
+  and `callValue` enters a closure the same way; a leaf native within
+  its arity reads its arguments in place (§6), and any other native
+  within its arity and `max_native_args` (8) arguments gets them
+  copied to a buffer on the native stack; a keyword or symbol
+  called with one or two arguments on a map, a record or nil looks
+  itself up in place, as `VM.lookup` does, with no copy and no safe
+  point (the key is an immediate, so the lookup neither allocates nor
+  walks nested data). `call:return` from any frame but the top-level
+  one pops it and continues in the caller, or fills the cell of the
+  host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
+  ends the chain. Every other call goes through the general entry of
   §6, with the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
@@ -643,8 +729,12 @@ count (a variadic `fn*`'s rest param is one binding and receives the
 seq passed), raising `RecurOutsideTail` or `RecurArityMismatch`
 (`COMPILER.md` §4.4), and lowers it (`COMPILER.md` §5.6) to a
 parallel assignment of the new values into the binding slots (a
-fresh cell per captured binding, §6) and a `jump:jmp` to the
-target's entry. No call opcode is emitted.
+fresh cell per captured binding, §6) and a jump back into the target:
+a `jump:jmp` to its entry, or, where the body begins with an `if` on a
+simple test, that test repeated and a `jump:if-true` or
+`jump:if-false` past the entry's own (`COMPILER.md` §5.7), which a
+comparison runs with its branch in one dispatch (§8). No call opcode
+is emitted.
 
 **Guarantee.** A `recur` loop runs in constant stack space: no frame
 is pushed and the backing stack does not grow. It allocates nothing
@@ -785,13 +875,13 @@ run):
 | Error | When |
 |---|---|
 | `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an `i` or `e` operand where a value is read, a store to `u` |
-| `OperandOutOfRange` | An operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target past the code |
-| `InvalidOperandKind` | An operand kind the position does not accept: `resolve` of unused, `store` to a constant, a destination that is not a slot |
-| `BytecodeExhausted` | `pc` ran past the code |
-| `BytecodeCorruption` | An instruction kind other than `primary`; an unrecognized group, variant or operand-kind bit pattern (§10); a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
-| `CallBlockOutOfRange` | A call block past the frame's slot count |
-| `CaptureCountMismatch` | A capture descriptor's source count differs from the child's `upvalue_count` |
-| `UpvalueOutOfRange` | A `u` index or `inherited_upvalue` source past the closure's upvalue count |
+| `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target or a `try`'s pc past the code |
+| `InvalidOperandKind` | Verification: a destination that is not a slot. Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
+| `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10). Where it runs: an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `CallBlockOutOfRange` | Verification: a call block past the frame's slot count |
+| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: a closure's cell count differs from its routine's |
+| `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |
 | `InvalidCellState` | `box-local` on a boxed slot; `init-cell` on an initialized cell |
 | `UninitializedCell` | `get-cell` or a `u` resolve of a placeholder not yet filled |
@@ -824,7 +914,9 @@ describes an earlier error.
 chain in `VM.error_trace`, innermost first, one
 `TraceFrame{name, pc, span, source}` per frame: the routine's name,
 the index of the instruction the frame was executing (the failing
-instruction innermost, the `call:call` in each caller), that
+instruction innermost, the `call:call` in each caller; for a routine
+verification refused, its one frame names the instruction it refused,
+the last one for code that runs off its end), that
 instruction's span from the routine's table (null without one) and
 the routine's `source`. Neither an untranslated `VmError` nor an
 uncaught throw pops a frame, so the chain is complete, including the

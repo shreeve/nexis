@@ -1,0 +1,3 @@
+; bench/micro/lazy3.nx N: a lazy pipeline over a range: instructions and peak RSS.
+(let [n (parse-long (first *command-line-args*))]
+  (println (reduce + (map inc (filter even? (map inc (range n)))))))
