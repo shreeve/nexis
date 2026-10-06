@@ -1,0 +1,30 @@
+; test/nextomic/regex.nx — patterns in Nextomic (docs/NEXTOMIC.md,
+; docs/REGEX.md §8): a pattern in a query's function clause is a
+; constant passed to the function, as in Datomic; a pattern bound
+; through :in works the same way; a pattern is never a datom value.
+; Runs from a scratch directory; the store is fresh.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def c (d/connect "regex.edb"))
+(d/transact! c [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                 :db/unique :db.unique/identity}
+                {:db/ident :p/tag :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}])
+(d/transact! c [{:p/name "Alice"} {:p/name "Anna"} {:p/name "Bob"} {:p/name "carol"}])
+(def db (d/db c))
+
+(t/check "a literal pattern in a function clause filters"
+         (= #{["Alice"] ["Anna"]} (d/q '[:find ?n :where [?e :p/name ?n] [(re-find #"^A" ?n)]] db)))
+(t/check "a pattern bound through :in is the function's argument"
+         (= #{["Bob"]} (d/q '[:find ?n :in $ ?re :where [?e :p/name ?n] [(re-matches ?re ?n)]] db #"B.b")))
+(t/check "a function clause binds a pattern's matches as a collection"
+         (= #{["n"]} (d/q '[:find ?c :where [?e :p/name "Anna"] [(re-seq #"n" ?n0) [?c ...]] [?e :p/name ?n0]] db)))
+(t/check "the same query with its pattern runs twice from the cache"
+         (let [q '[:find (count ?e) . :where [?e :p/name ?n] [(re-find #"(?i)^[ab]" ?n)]]]
+           (= 3 (d/q q db) (d/q q db))))
+(t/check "a pattern as a datom value is :nextomic/value-type"
+         (= :nextomic/value-type (t/caught (d/transact! c [{:p/name #"x"}]))))
+(t/check "a pattern where a keyword value belongs is :nextomic/value-type too"
+         (= :nextomic/value-type (t/caught (d/transact! c [[:db/add [:p/name "Bob"] :p/tag #"k"]]))))
+(println :done)

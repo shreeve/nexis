@@ -769,7 +769,13 @@ Function position also takes a variable, `[(?pred ?x)]` or `[(?f ?x)
 clause (so a rule head may carry it), and the value it holds is applied
 when the clause runs: a function through `callValue`, a keyword or
 collection as the language applies them, anything else is the VM's
-`:not-callable`. A function is identity-valued in a relation. The `q`
+`:not-callable`. A function is identity-valued in a relation. A
+pattern (`docs/REGEX.md` §8) is a constant like any other value, so
+Datomic's `[(re-find #"^A" ?name)]` filters by it and `[(re-matches ?re
+?name)]` takes one bound through `:in`; as an identity value it is
+`=` only to itself in a relation, and it is never a datom value: a
+pattern in tx-data is `:nextomic/value-type` whatever the attribute's
+type (`test/nextomic/regex.nx`). The `q`
 hook roots, for the query's life, every heap value the pipeline keeps
 across a later call: a function result it binds, a custom aggregate's
 result, and the values it builds itself (a `tuple` or `fulltext`
