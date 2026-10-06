@@ -6710,6 +6710,26 @@ test "stdlib: an image holding a routine that does not verify is refused, not lo
     try testing.expectError(error.UnfitRoutine, image_mod.load(&rt.v, bytes, &embedded));
 }
 
+test "stdlib: an image holding a closure whose cells are not its routine's upvalues is refused" {
+    if (!image_mod.verify_routines) return error.SkipZigTest;
+    // `interpose`'s routine, the last record that names it, made to
+    // take one upvalue more than its closure (the Var's root) carries.
+    const bytes = try testing.allocator.dupe(u8, image);
+    defer testing.allocator.free(bytes);
+    const name = "interpose";
+    var record: [4 + name.len]u8 = undefined;
+    std.mem.writeInt(u32, record[0..4], name.len, .little);
+    @memcpy(record[4..], name);
+    const at = (std.mem.findLast(u8, bytes, &record) orelse return error.TestUnexpectedResult) + record.len + 2 + 2 + 1;
+    const count = std.mem.readInt(u16, bytes[at..][0..2], .little);
+    std.mem.writeInt(u16, bytes[at..][0..2], count + 1, .little);
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try installNatives(rt.loader.registry);
+    try testing.expectError(error.UnfitRoutine, image_mod.load(&rt.v, bytes, &embedded));
+}
+
 test "stdlib: the image refuses what it cannot carry" {
     const gpa = testing.allocator;
     var a: ImageTestRuntime = undefined;

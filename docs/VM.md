@@ -261,8 +261,12 @@ A closure call checks `argc` against `fixed_arity` / `variadic`
 at the caller's `slot[A + 1]` (`callee_base = caller_base + A + 1`),
 so the callee's slot 0 is its first argument and nothing is copied.
 The backing stack grows to `callee_base + slot_count`; the frame
-records the stack length on entry (`entry_stack_len`), the caller's
-pc and the result slot. For a variadic routine the call machinery
+records the stack length on entry (`entry_stack_len`) and the result
+slot, and the caller's own `pc`, which nothing changes while the
+callee runs, holds its return point. A closure carries one cell for
+each upvalue of its routine (`closure:make` of a verified descriptor
+builds it so, and the stdlib image's loader checks its closures when
+it verifies its routines), so a call does not count them. For a variadic routine the call machinery
 builds a list of the excess arguments at `slot[fixed_arity]`, nil
 when there are none (so `(if more ...)` tests for extra arguments,
 as in Clojure), and resets the slots above it to nil. The frame's
@@ -364,16 +368,17 @@ collector root (§9).
 
 | Field | Contents |
 |---|---|
-| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument |
-| `base_slot`, `slot_count` | The window into the shared backing stack (`vm.stack`); `slot[i]` is `stack[base_slot + i]` |
+| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument. Under a frame it called, the caller's `pc` is its return point |
+| `base_slot` | The window into the shared backing stack (`vm.stack`): `slot[i]` is `stack[base_slot + i]` for `i` below the routine's `slot_count` |
 | `entry_stack_len` | The stack length before the window grew; a return or an unwind restores it |
 | `upvalues` | The closure's cell array (shared, not owned) |
 | `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block and its cells alive for the frame's life |
-| `return_dst`, `return_pc` | Where the caller receives the result and resumes |
+| `return_dst` | Where the caller receives the result |
 | `host_result` | For a frame `callValue`, `runRoutine` or a `Callback` pushed: the cell its return writes instead of a caller's slot (`HostCallResult`) |
 
-A frame is pushed by `call:call` and by `callValue` / `runRoutine`,
-and popped by a return or discarded by a throw that unwinds past it.
+A frame is 64 bytes, one cache line. It is pushed by `call:call` and
+by `callValue` / `runRoutine`, and popped by a return or discarded by
+a throw that unwinds past it.
 `try` handlers are not per-frame: they live on one VM-wide stack
 keyed by frame index (§12).
 
@@ -407,6 +412,10 @@ The fetch checks nothing: verification (§5) proved every pc it can
 reach inside the code and every instruction `primary`, and the fast
 handlers read their operands, jump and fill call blocks without the
 bounds verification proved. The general handlers keep their checks.
+Debug and safe builds assert what verification proved; a release
+build neither checks nor assumes it, since an assumed bound read
+through the frame's routine changes the fast handlers' code for the
+worse (`docs/PERF.md` §3.21).
 A fast handler reads a slot's value as two whole 8-byte words, the
 way a handler stores one, never its kind byte alone or both words in
 one 16-byte load: a load the size of a store in flight takes its data
@@ -740,9 +749,11 @@ is emitted.
 is pushed and the backing stack does not grow. It allocates nothing
 per iteration for bindings no closure captures, and one cell per
 captured binding per iteration. What the body allocates is its own.
-`VM.stack_high_water` and `VM.frame_high_water` move only on growth,
-so a test comparing them around a loop sees the true maximum;
-`src/compile.zig` pins a 10k-iteration loop leaving both unchanged.
+`VM.stack_high_water` and `VM.frame_high_water` move wherever a frame
+is pushed, in builds with runtime safety (a release build keeps the
+stores off its calls and leaves them at their start), so a test
+comparing them around a loop sees the true maximum; `src/compile.zig`
+pins a 10k-iteration loop leaving both unchanged.
 
 ---
 
@@ -880,7 +891,7 @@ run):
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
 | `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10). Where it runs: an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block past the frame's slot count |
-| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: a closure's cell count differs from its routine's |
+| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |
 | `InvalidCellState` | `box-local` on a boxed slot; `init-cell` on an initialized cell |

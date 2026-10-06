@@ -2892,7 +2892,6 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     const routine = compiled.toRoutine("catchable-no-handler");
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
     if (v.stack.items.len < routine.slot_count) {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }
