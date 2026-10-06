@@ -409,7 +409,7 @@ const core_natives = table("", .{
     .{ "set", 1, 1, &fnSet },
     .{ "subvec", 2, 3, &fnSubvec },
     .{ "identical?", 2, 2, &fnIdenticalQ },
-    .{ "assoc", 3, null, &fnAssoc },
+    .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc },
     .{ "dissoc", 1, null, &fnDissoc },
     .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet },
     .{ "contains?", 2, 2, &fnContainsQ },
@@ -1884,6 +1884,22 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
         coll = try assocOne(vm, coll, args[i], args[i + 1]);
     }
     return coll;
+}
+
+/// `assoc` as a leaf (VM.md §6): into a vector, and into nil, a hash
+/// map or a record by keys off the heap, which hash without walking
+/// anything; a key on the heap or any other collection goes the
+/// general way.
+fn fnAssocLeaf(vm: *VM, args: []const Value) VmError!Value {
+    switch (args[0].kind()) {
+        .persistent_vector => {},
+        .nil, .persistent_map, .record => {
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) if (args[i].kind().isHeap()) return VmError.NeedsReentry;
+        },
+        else => return VmError.NeedsReentry,
+    }
+    return fnAssoc(vm, args);
 }
 
 fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {

@@ -2251,6 +2251,7 @@ test "leaf natives: what a leaf body refuses goes the general way from every cal
     try expectOutput("(let [s (map inc [1 2 3])] [(count s) (count (lazy-seq nil)) (apply count [s]) (mapv count [s [1] \"ab\" nil {:a 1}])])", "[3 0 3 [3 1 2 0 1]]");
     try expectOutput("(let [s (map inc [1 2 3])] [(nthnext s 1) (nthnext [1 2 3] 2) (nthnext [1] 1) (nthnext (list 1 2) 1) (apply nthnext [s 2]) (mapv nthnext [s #{1} \"ab\" {:a 1}] [2 0 1 0])])", "[(3 4) (3) nil (2) (4) [(4) (1) (b) ([:a 1])]]");
     try expectOutput("[(conj [1] 2) (conj nil 1) (conj (list 1) 0) (conj #{} [1]) (conj {} [:a 1]) (conj (map inc [1]) 0) (apply conj [#{} 1]) (mapv conj [[] #{} {} (sorted-set)] [1 [2] [:k 3] 4]) (reduce conj [] (range 3)) (reduce conj #{} [1 1 2])]", "[[1 2] (1) (0 1) #{[1]} {:a 1} (0 2) #{1} [[1] #{[2]} {:k 3} #{4}] [0 1 2] #{1 2}]");
+    try expectOutput("(do (defrecord P [x]) [(assoc {} :a 1) (assoc nil 1 2 3 4) (assoc [1 2] 2 3) (assoc {} [1] :v \"k\" :w) (:x (assoc (->P 1) :x 2)) (assoc (sorted-map 2 :b) 1 :a) (try (assoc [1] 5 :x) (catch any e e)) (apply assoc [{} [2] 3]) (mapv assoc [{} (sorted-map) [0]] [:a 1 0] [1 2 3])])", "[{:a 1} {1 2, 3 4} [1 2 3] {[1] :v, k :w} 2 {1 :a, 2 :b} :index-out-of-bounds {[2] 3} [{:a 1} {1 2} [3]]]");
 }
 
 test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {
