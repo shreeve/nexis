@@ -2919,6 +2919,15 @@ pub const VM = struct {
     /// through the pointer, so the value never passes through an
     /// error union.
     inline fn operandPtr(self: *VM, frame: *const Frame, op: Operand, tmp: *Value) VmError!*const Value {
+        if (self.peek(frame, op)) |p| return p;
+        try self.resolveOther(frame, op, tmp);
+        return tmp;
+    }
+
+    /// Where an operand that needs no work is read in place: a slot, a
+    /// constant, an initialized upvalue or a bound Var; null for every
+    /// other operand, which `resolveOther` reads, its trap included.
+    inline fn peek(self: *VM, frame: *const Frame, op: Operand) ?*const Value {
         if (op.kind == .slot and op.index < frame.slot_count) return self.slotAt(frame, op.index);
         if (op.kind == .constant and op.index < frame.routine.consts.len) return &frame.routine.consts[op.index];
         if (op.kind == .upvalue and op.index < frame.upvalues.len) {
@@ -2930,8 +2939,12 @@ pub const VM = struct {
             if (v.thread_bound) return &v.thread_value;
             if (v.bound) return &v.root;
         }
-        try self.resolveOther(frame, op, tmp);
-        return tmp;
+        return null;
+    }
+
+    /// Whether `op` is a slot of `frame`, where a fast handler stores.
+    inline fn slotIn(frame: *const Frame, op: Operand) bool {
+        return op.kind == .slot and op.index < frame.slot_count;
     }
 
     /// `resolveIn` of the operands its inline cases leave, into `out`.
@@ -3233,18 +3246,28 @@ pub const VM = struct {
     //
     // Threaded code: a handler runs its instruction, fetches the next
     // one itself and tail-calls that instruction's handler through
-    // `op_table`, indexed by group and variant together, so an
+    // `fast_table`, indexed by group and variant together, so an
     // instruction costs one indirect branch and the native stack does
     // not grow with the instructions run. A handler returns only to
     // leave the chain: with an error, which `loop` translates or
     // passes on, or once `running` says the loop's frame has returned.
     // Every handler has the one signature `@call(.always_tail, ...)`
     // requires of caller and callee.
+    //
+    // Two tables. `op_table` holds every opcode's general handler,
+    // which takes every case and raises every trap. `fast_table` is
+    // `op_table` with the hot opcodes' fast handlers over it: a fast
+    // handler takes the common case with no call but its tail call
+    // and no stack frame, and hands every other case, before it has
+    // changed anything, to the general handler through `op_table`.
+    // Reaching it through a table indexed at run time is what keeps
+    // the optimizer from inlining the general handler, and its frame,
+    // back into the fast one.
     // -------------------------------------------------------------------------
 
     const OpHandler = *const fn (*VM, *Frame, Inst) VmError!void;
 
-    /// An instruction's index into `op_table`: its group and variant
+    /// An instruction's index into the tables: its group and variant
     /// bits, `group | variant << 6`.
     inline fn opIndex(inst: Inst) u12 {
         return @truncate(@as(u64, @bitCast(inst)) >> 4);
@@ -3254,10 +3277,10 @@ pub const VM = struct {
         return @as(u12, @backingInt(g)) | @as(u12, @backingInt(variant)) << 6;
     }
 
-    /// The handler of every opcode: its group's, which switches on
-    /// the variant, or one of its own for the hot variants. A group
-    /// outside the enum is corrupt; the groups with no executed
-    /// variant trap.
+    /// The general handler of every opcode: its group's, which
+    /// switches on the variant, or one of its own for the hot
+    /// variants. A group outside the enum is corrupt; the groups with
+    /// no executed variant trap.
     const op_table: [4096]OpHandler = blk: {
         @setEvalBranchQuota(20_000);
         var t: [4096]OpHandler = @splat(&opCorrupt);
@@ -3293,17 +3316,35 @@ pub const VM = struct {
         t[opcode(.jump, Jump.if_false)] = &opIfFalse;
         t[opcode(.jump, Jump.if_true)] = &opIfTrue;
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = cmpHandler(c);
-        t[opcode(.math, Math.add)] = mathHandler(.add);
-        t[opcode(.math, Math.sub)] = mathHandler(.sub);
-        t[opcode(.math, Math.mul)] = mathHandler(.mul);
-        t[opcode(.math, Math.idiv)] = mathHandler(.idiv);
-        t[opcode(.math, Math.mod)] = mathHandler(.mod);
         t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
         t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
         t[opcode(.call, Call.call)] = &opCall;
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
+        break :blk t;
+    };
+
+    /// The table the fetch dispatches through: `op_table` with the
+    /// fast handlers over it.
+    const fast_table: [4096]OpHandler = blk: {
+        @setEvalBranchQuota(20_000);
+        var t = op_table;
+        t[opcode(.mov, Mov.move)] = &fastMove;
+        t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
+        t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
+        t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
+        t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
+        t[opcode(.jump, Jump.jmp)] = &fastJmp;
+        t[opcode(.jump, Jump.if_false)] = fastBranch(false);
+        t[opcode(.jump, Jump.if_true)] = fastBranch(true);
+        for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = fastCmp(c);
+        for ([_]Math{ .add, .sub, .mul, .idiv, .mod }) |m| t[opcode(.math, m)] = fastMath(m);
+        t[opcode(.var_, VarOp.load_var)] = &fastLoadVar;
+        t[opcode(.closure, Closure_.get_cell)] = &fastGetCell;
+        t[opcode(.call, Call.call)] = &fastCall;
+        t[opcode(.call, Call.@"return")] = &fastReturn;
+        t[opcode(.call, Call.return_nil)] = &fastReturnNil;
         break :blk t;
     };
 
@@ -3316,7 +3357,7 @@ pub const VM = struct {
         frame.pc = pc + 1;
         if (inst.kind != .primary) return VmError.BytecodeCorruption;
         if (counting) opcode_counts[opIndex(inst)] += 1;
-        return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst });
+        return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst });
     }
 
     /// `next` after an instruction that could allocate: the safe
@@ -3332,6 +3373,12 @@ pub const VM = struct {
         if (!self.running()) return;
         if (self.gcDue()) self.collectGarbage();
         return self.next(self.currentFrame());
+    }
+
+    /// A fast handler's way out: `inst`'s general handler, which takes
+    /// the case from the start.
+    inline fn general(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst });
     }
 
     /// Where `loop` enters the chain: a safe point, then the current
@@ -3380,8 +3427,8 @@ pub const VM = struct {
         return self.nextFrame();
     }
 
-    // The hot variants' own handlers: the same effect and traps as
-    // their group's, without its switch.
+    // The general handlers of the hot variants: the same effect and
+    // traps as their group's, without its switch.
 
     fn opMove(self: *VM, frame: *Frame, inst: Inst) VmError!void {
         var tmp: Value = undefined;
@@ -3434,19 +3481,18 @@ pub const VM = struct {
         return self.next(frame);
     }
 
-    /// The low half of a conditional jump testing `test_op`: what
-    /// `cmpHandler` looks for after its comparison.
+    /// The low half of a conditional jump testing `test_op`: what a
+    /// comparison looks for after it.
     fn condJumpKey(variant: Jump, test_op: Operand) u32 {
         const lo: u32 = @truncate(@as(u64, @bitCast(Inst.primaryWide(.jump, variant, Operand.none, 0))));
         return (lo & 0xFFFF) | @as(u32, @as(u16, @bitCast(test_op))) << 16;
     }
 
-    /// `cmp:<c>`: two fixnums compare inline, anything else through
-    /// the numeric tower. When the next instruction is a conditional
-    /// jump on the slot just written, the compiler's lowering of an
-    /// `if` on a comparison, it runs here too: the pair costs one
-    /// dispatch, and pc, the slot and every trap are what running
-    /// the two in turn leaves.
+    /// `cmp:<c>` through the numeric tower. When the next instruction
+    /// is a conditional jump on the slot just written, the compiler's
+    /// lowering of an `if` on a comparison, it runs here too: the pair
+    /// costs one dispatch, and pc, the slot and every trap are what
+    /// running the two in turn leaves.
     fn cmpHandler(comptime c: NumCmp) OpHandler {
         return &struct {
             fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
@@ -3454,10 +3500,7 @@ pub const VM = struct {
                 var rhs_tmp: Value = undefined;
                 const lhs = try self.operandPtr(frame, inst.b, &lhs_tmp);
                 const rhs = try self.operandPtr(frame, inst.c, &rhs_tmp);
-                const holds_ = if (lhs.isFixnum() and rhs.isFixnum())
-                    ordered(i64, c, lhs.asFixnum(), rhs.asFixnum())
-                else
-                    try self.compareNumbers(c, lhs.*, rhs.*);
+                const holds_ = try self.compareNumbers(c, lhs.*, rhs.*);
                 try self.storeIn(frame, inst.a, value_mod.fromBool(holds_));
                 const code = frame.routine.code;
                 if (frame.pc < code.len) {
@@ -3477,118 +3520,43 @@ pub const VM = struct {
         }.run;
     }
 
-    /// `math:<op>` for `+`, `-`, `*`, `quot` and `mod`: two fixnums
-    /// whose result is a fixnum compute inline and allocate nothing;
-    /// anything else, a promotion or a zero divisor included, goes
-    /// through the numeric tower.
-    fn mathHandler(comptime op: Math) OpHandler {
-        return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-                var lhs_tmp: Value = undefined;
-                var rhs_tmp: Value = undefined;
-                const lhs_p = try self.operandPtr(frame, inst.b, &lhs_tmp);
-                const rhs_p = try self.operandPtr(frame, inst.c, &rhs_tmp);
-                if (lhs_p.isFixnum() and rhs_p.isFixnum()) {
-                    const x = lhs_p.asFixnum();
-                    const y = rhs_p.asFixnum();
-                    // i48 operands: a sum or difference cannot leave
-                    // i64, and a product that does is not a fixnum.
-                    const r = switch (op) {
-                        .add => x + y,
-                        .sub => x - y,
-                        .mul => blk: {
-                            const p = @mulWithOverflow(x, y);
-                            break :blk if (p[1] == 0) p[0] else value_mod.fixnum_max + 1;
-                        },
-                        // Only `(quot fixnum_min -1)` leaves i48.
-                        .idiv => if (y != 0) @divTrunc(x, y) else value_mod.fixnum_max + 1,
-                        .mod => if (y != 0) @mod(x, y) else value_mod.fixnum_max + 1,
-                        else => comptime unreachable,
-                    };
-                    if (value_mod.fromFixnum(r)) |v| {
-                        try self.storeIn(frame, inst.a, v);
-                        return self.next(frame);
-                    }
-                }
-                try self.storeIn(frame, inst.a, try self.arithmetic(op, lhs_p.*, rhs_p.*));
-                return self.nextSafe(frame);
-            }
-        }.run;
-    }
-
-    /// `call:call`. The common calls run here: a closure called with
-    /// its fixed arity where the frame chain and the stack have room,
-    /// whose frame is pushed without allocating, so its callee starts
-    /// without a safe point; a native within its arity; and a keyword
-    /// or symbol looking itself up in a map, a record or nil, which
-    /// allocates nothing and is no safe point either. Every other
-    /// call, and every call that traps, goes through `execCallCall`.
+    /// `call:call` past the fast handler's cases: a native that is not
+    /// a leaf, within its arity and `max_native_args`, is called with
+    /// its arguments copied to a buffer on the native stack; every
+    /// other call, and every call that traps, goes through
+    /// `execCallCall`.
     fn opCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
-        fast: {
-            if (inst.a.kind != .slot or inst.c.kind != .slot) break :fast;
+        buffered: {
+            if (inst.a.kind != .slot or inst.c.kind != .slot) break :buffered;
             const call_base: u32 = inst.a.index;
             const argc: u32 = inst.b.index;
-            if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) break :fast;
+            if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) break :buffered;
             const callee = self.slotAt(frame, inst.a.index).*;
+            if (callee.kind() != .native_fn) break :buffered;
+            const native = asNativeFn(callee);
+            const max: usize = native.max_arity orelse max_native_args;
+            if (native.leaf or argc < native.min_arity or argc > max or argc > max_native_args) break :buffered;
             const base: usize = @as(usize, frame.base_slot) + call_base + 1;
-            switch (callee.kind()) {
-                .function => {
-                    const callee_frame = self.enterClosureDirect(callee, base, argc, .{
-                        .return_dst = inst.c.index,
-                        .return_pc = frame.pc,
-                    }) orelse break :fast;
-                    return self.next(callee_frame);
-                },
-                .native_fn => {
-                    const native = asNativeFn(callee);
-                    if (native.leaf) {
-                        if (argc < native.min_arity or argc > (native.max_arity orelse argc)) break :fast;
-                        // Nothing can grow the stack under a leaf, so
-                        // it reads its arguments where they are.
-                        const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
-                            VmError.NeedsReentry => break :fast,
-                            else => return err,
-                        };
-                        countNative(native);
-                        self.slotAt(frame, inst.c.index).* = result;
-                        return self.nextSafe(frame);
-                    }
-                    const max: usize = native.max_arity orelse max_native_args;
-                    if (argc < native.min_arity or argc > max or argc > max_native_args) break :fast;
-                    // The arguments are copied off the stack, which the
-                    // native may grow by re-entering the VM; the slots
-                    // keep them rooted. A whole buffer copies inline
-                    // where the stack's capacity covers it.
-                    var buf: [max_native_args]Value = undefined;
-                    if (base + max_native_args <= self.stack.capacity) {
-                        buf = self.stack.items.ptr[base..][0..max_native_args].*;
-                    } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
-                    countNative(native);
-                    const overflows = dispatch_mod.spoilCount();
-                    const result = native.call(self, buf[0..argc]) catch |err| {
-                        dispatch_mod.rewindSpoils(overflows);
-                        return err;
-                    };
-                    try self.checkDeepData(overflows);
-                    // The native may have grown `frames`: the caller is
-                    // the current frame again, not necessarily at `frame`.
-                    const caller = self.currentFrame();
-                    self.slotAt(caller, inst.c.index).* = result;
-                    return self.nextSafe(caller);
-                },
-                // `(:k m)`, `(:k m d)`, `('s m)` on a map, a record or
-                // nil: the lookup `callLookupIn` makes. An immediate
-                // key hashes and compares without the callbacks, so
-                // nothing is allocated and no data is walked.
-                .keyword, .symbol => {
-                    if (argc != 1 and argc != 2) break :fast;
-                    const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
-                    const result = lookupInPlace(callee, self.stack.items[base], default) orelse break :fast;
-                    self.slotAt(frame, inst.c.index).* = result;
-                    return self.next(frame);
-                },
-                else => break :fast,
-            }
+            // The arguments are copied off the stack, which the
+            // native may grow by re-entering the VM; the slots keep
+            // them rooted. A whole buffer copies inline where the
+            // stack's capacity covers it.
+            var buf: [max_native_args]Value = undefined;
+            if (base + max_native_args <= self.stack.capacity) {
+                buf = self.stack.items.ptr[base..][0..max_native_args].*;
+            } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+            countNative(native);
+            const overflows = dispatch_mod.spoilCount();
+            const result = native.call(self, buf[0..argc]) catch |err| {
+                dispatch_mod.rewindSpoils(overflows);
+                return err;
+            };
+            try self.checkDeepData(overflows);
+            // The native may have grown `frames`: the caller is the
+            // current frame again, not necessarily at `frame`.
+            const caller = self.currentFrame();
+            self.slotAt(caller, inst.c.index).* = result;
+            return self.nextSafe(caller);
         }
         try self.execCallCall(frame, inst);
         // A call pushes a frame or runs a callee to completion, so the
@@ -3608,6 +3576,213 @@ pub const VM = struct {
         try self.returnValue(value_mod.nilValue());
         if (!self.running()) return;
         return self.next(self.currentFrame());
+    }
+
+    // The fast handlers. Each reads its operands in place (`peek`),
+    // stores only to a slot of its frame, calls nothing but a leaf
+    // native, and hands any other case to its general handler before
+    // it has changed anything. None allocates, so none ends at a safe
+    // point but the leaf call's.
+
+    fn fastMove(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        if (!slotIn(frame, inst.a)) return self.general(frame, inst);
+        const v = self.peek(frame, inst.b) orelse return self.general(frame, inst);
+        self.slotAt(frame, inst.a.index).* = v.*;
+        return self.next(frame);
+    }
+
+    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        const consts = frame.routine.consts;
+        const i = inst.wide();
+        if (!slotIn(frame, inst.a) or i >= consts.len) return self.general(frame, inst);
+        self.slotAt(frame, inst.a.index).* = consts[i];
+        return self.next(frame);
+    }
+
+    fn fastLoad(comptime v: Value) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
+                self.slotAt(frame, inst.a.index).* = v;
+                return self.next(frame);
+            }
+        }.run;
+    }
+
+    fn fastJmp(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        const target = inst.wide();
+        if (target >= frame.routine.code.len) return self.general(frame, inst);
+        frame.pc = target;
+        return self.next(frame);
+    }
+
+    /// `jump:if-true` (`when`) and `jump:if-false`.
+    fn fastBranch(comptime when: bool) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                const v = self.peek(frame, inst.a) orelse return self.general(frame, inst);
+                if (v.isTruthy() == when) {
+                    const target = inst.wide();
+                    if (target >= frame.routine.code.len) return self.general(frame, inst);
+                    frame.pc = target;
+                }
+                return self.next(frame);
+            }
+        }.run;
+    }
+
+    /// Two fixnums, with the branch that follows as `cmpHandler` runs
+    /// it.
+    fn fastCmp(comptime c: NumCmp) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
+                const lhs = self.peek(frame, inst.b) orelse return self.general(frame, inst);
+                const rhs = self.peek(frame, inst.c) orelse return self.general(frame, inst);
+                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst);
+                const holds_ = ordered(i64, c, lhs.asFixnum(), rhs.asFixnum());
+                const code = frame.routine.code;
+                var pc = frame.pc;
+                if (pc < code.len) {
+                    const j = code[pc];
+                    const lo: u32 = @truncate(@as(u64, @bitCast(j)));
+                    if (lo == condJumpKey(.if_false, inst.a) or lo == condJumpKey(.if_true, inst.a)) {
+                        const taken = holds_ == (lo == condJumpKey(.if_true, inst.a));
+                        pc = if (taken) j.wide() else pc + 1;
+                        // A target outside the code traps in the general handler.
+                        if (taken and pc >= code.len) return self.general(frame, inst);
+                    }
+                }
+                self.slotAt(frame, inst.a.index).* = value_mod.fromBool(holds_);
+                frame.pc = pc;
+                return self.next(frame);
+            }
+        }.run;
+    }
+
+    /// `math:<op>` of two fixnums whose result is a fixnum.
+    fn fastMath(comptime op: Math) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+                if (!slotIn(frame, inst.a)) return self.general(frame, inst);
+                const lhs = self.peek(frame, inst.b) orelse return self.general(frame, inst);
+                const rhs = self.peek(frame, inst.c) orelse return self.general(frame, inst);
+                if (!lhs.isFixnum() or !rhs.isFixnum()) return self.general(frame, inst);
+                const x = lhs.asFixnum();
+                const y = rhs.asFixnum();
+                // i48 operands: a sum or difference cannot leave i64,
+                // and a product that does is not a fixnum. Only
+                // `(quot fixnum_min -1)` leaves i48 by division.
+                const r = switch (op) {
+                    .add => x + y,
+                    .sub => x - y,
+                    .mul => blk: {
+                        const p = @mulWithOverflow(x, y);
+                        if (p[1] != 0) return self.general(frame, inst);
+                        break :blk p[0];
+                    },
+                    .idiv => if (y != 0) @divTrunc(x, y) else return self.general(frame, inst),
+                    .mod => if (y != 0) @mod(x, y) else return self.general(frame, inst),
+                    else => comptime unreachable,
+                };
+                self.slotAt(frame, inst.a.index).* = value_mod.fromFixnum(r) orelse return self.general(frame, inst);
+                return self.next(frame);
+            }
+        }.run;
+    }
+
+    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        const var_table = frame.routine.var_table;
+        const i = inst.wide();
+        if (!slotIn(frame, inst.a) or i >= var_table.len) return self.general(frame, inst);
+        const v = var_table[i];
+        const value = if (v.thread_bound) v.thread_value else if (v.bound) v.root else return self.general(frame, inst);
+        self.slotAt(frame, inst.a.index).* = value;
+        return self.next(frame);
+    }
+
+    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        if (!slotIn(frame, inst.a) or !slotIn(frame, inst.b)) return self.general(frame, inst);
+        const cell_v = self.slotAt(frame, inst.b.index).*;
+        if (cell_v.kind() != .cell_internal) return self.general(frame, inst);
+        const cell = heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(cell_v.payload));
+        if (!cell.initialized) return self.general(frame, inst);
+        self.slotAt(frame, inst.a.index).* = cell.value;
+        return self.next(frame);
+    }
+
+    /// `call:call` of a closure with its fixed arity where the frame
+    /// chain and the stack's capacity have room, whose frame is pushed
+    /// without allocating, so its callee starts without a safe point;
+    /// of a leaf native within its arity, on its arguments in place;
+    /// and of a keyword or symbol looking itself up in a map, a record
+    /// or nil, which allocates nothing and is no safe point either.
+    fn fastCall(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        if (inst.a.kind != .slot or inst.c.kind != .slot) return self.general(frame, inst);
+        const call_base: u32 = inst.a.index;
+        const argc: u32 = inst.b.index;
+        if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) return self.general(frame, inst);
+        const callee = self.slotAt(frame, inst.a.index).*;
+        const base: usize = @as(usize, frame.base_slot) + call_base + 1;
+        switch (callee.kind()) {
+            .function => {
+                const callee_frame = self.enterClosureDirect(callee, base, argc, .{
+                    .return_dst = inst.c.index,
+                    .return_pc = frame.pc,
+                }) orelse return self.general(frame, inst);
+                return self.next(callee_frame);
+            },
+            .native_fn => {
+                const native = asNativeFn(callee);
+                if (!native.leaf or argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst);
+                // Nothing can grow the stack under a leaf, so it reads
+                // its arguments where they are.
+                const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
+                    VmError.NeedsReentry => return self.general(frame, inst),
+                    else => return err,
+                };
+                countNative(native);
+                self.slotAt(frame, inst.c.index).* = result;
+                return self.nextSafe(frame);
+            },
+            // `(:k m)`, `(:k m d)`, `('s m)` on a map, a record or
+            // nil: the lookup `callLookupIn` makes. An immediate key
+            // hashes and compares without the callbacks, so nothing is
+            // allocated and no data is walked.
+            .keyword, .symbol => {
+                if (argc != 1 and argc != 2) return self.general(frame, inst);
+                const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
+                const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst);
+                self.slotAt(frame, inst.c.index).* = result;
+                return self.next(frame);
+            },
+            else => return self.general(frame, inst),
+        }
+    }
+
+    /// `call:return` from a frame `call:call` pushed: pop it, write the
+    /// caller's slot and continue in the caller.
+    fn fastReturn(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        const v = self.peek(frame, inst.a) orelse return self.general(frame, inst);
+        return self.returnFast(frame, inst, v.*);
+    }
+
+    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst) VmError!void {
+        return self.returnFast(frame, inst, value_mod.nilValue());
+    }
+
+    inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, v: Value) VmError!void {
+        const n = self.frames.items.len;
+        if (frame.host_result != null or n < 2) return self.general(frame, inst);
+        const caller = &self.frames.items[n - 2];
+        const dst = frame.return_dst;
+        if (dst >= caller.slot_count) return self.general(frame, inst);
+        caller.pc = frame.return_pc;
+        self.stack.items.len = frame.entry_stack_len;
+        self.frames.items.len = n - 1;
+        self.slotAt(caller, dst).* = v;
+        if (!self.running()) return;
+        return self.next(caller);
     }
 
     // -------------------------------------------------------------------------

@@ -604,6 +604,7 @@ fn cliModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .omit_frame_pointer = omitFramePointer(optimize),
     });
     module.addImport("emdb", emdbModule(b, target, optimize));
     return module;
@@ -637,6 +638,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .omit_frame_pointer = omitFramePointer(optimize),
     });
     module.addImport("emdb", emdbModule(b, target, optimize));
     module.addOptions("build_options", runtimeOptions(b));
@@ -659,7 +661,16 @@ fn runtimeOptions(b: *std.Build) *std.Build.Step.Options {
 
 /// emdb, the storage engine: a path dependency on the sibling checkout.
 fn emdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
-    return b.dependency("emdb", .{ .target = target, .optimize = optimize }).module("emdb");
+    const module = b.dependency("emdb", .{ .target = target, .optimize = optimize }).module("emdb");
+    module.omit_frame_pointer = omitFramePointer(optimize);
+    return module;
+}
+
+/// A release build keeps no frame pointer, so a dispatch handler that
+/// needs no stack has no frame record to push (docs/VM.md §8); a debug
+/// build keeps the compiler's default.
+fn omitFramePointer(optimize: std.lang.Optimize) ?bool {
+    return if (optimize == .debug) null else true;
 }
 
 /// Check every `@import` under src/ against the layering src/root.zig

@@ -356,29 +356,44 @@ pop only from the top.
 
 ### 8. Dispatch
 
-Threaded code through a handler table. `op_table` holds one handler
-per opcode, indexed by group and variant together (`group | variant
-<< 6`, 4096 entries). A handler runs its instruction, then fetches the
-next one itself and tail-calls that instruction's handler
-(`@call(.always_tail, ...)`), so an instruction costs one indirect
-branch and the native stack does not grow with the instructions run.
+Threaded code through two handler tables, each indexed by group and
+variant together (`group | variant << 6`, 4096 entries). A handler
+runs its instruction, then fetches the next one itself and tail-calls
+that instruction's handler (`@call(.always_tail, ...)`), so an
+instruction costs one indirect branch and the native stack does not
+grow with the instructions run.
 
 ```
 fetch (every handler's last step):
   if frame.pc >= code.len: BytecodeExhausted
   inst = frame.routine.code[frame.pc]; frame.pc += 1
   if inst.kind is not primary: BytecodeCorruption
-  tail-call op_table[inst.group | inst.variant << 6](vm, frame, inst)
+  tail-call fast_table[inst.group | inst.variant << 6](vm, frame, inst)
 ```
 
-- Every variant of `mov`, `jump` and `cmp`, and `math:add`,
-  `math:sub`, `math:mul`, `math:idiv`, `math:mod`, `closure:get-cell`,
-  `var:load-var`, `call:call`, `call:return` and `call:return-nil`,
-  has a handler of its own; every other entry is its group's, which
-  switches on the variant or, where no variant is left, traps as §10
-  says for one outside the enum. A group outside the enum is
-  `BytecodeCorruption`; `transient`, `hash`, `tx`, `io` and `simd`
-  trap `UnimplementedOpcode` for every variant.
+- `op_table` holds every opcode's **general handler**, which takes
+  every case and raises every trap. Every variant of `mov`, `jump` and
+  `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
+  `call:return` and `call:return-nil`, has a general handler of its
+  own; every other entry is its group's, which switches on the
+  variant or, where no variant is left, traps as §10 says for one
+  outside the enum. A group outside the enum is `BytecodeCorruption`;
+  `transient`, `hash`, `tx`, `io` and `simd` trap
+  `UnimplementedOpcode` for every variant.
+- `fast_table`, the table the fetch reads, is `op_table` with a
+  **fast handler** over each hot opcode: every variant of `mov`,
+  `jump` and `cmp`, `math:add`, `math:sub`, `math:mul`, `math:idiv`,
+  `math:mod`, `var:load-var`, `closure:get-cell`, `call:call`,
+  `call:return` and `call:return-nil`. A fast handler takes its
+  instruction's common case, reading its operands in place and storing
+  only to a slot of its frame, with no call but its tail call and no
+  stack frame; on any other case it tail-calls the general handler
+  through `op_table` before it has changed anything, so every trap,
+  every safe point and every allocation is the general handler's. The
+  table indexed at run time is what keeps the optimizer from inlining
+  the general handler, and the stack frame it needs, back into the
+  fast one. Release builds keep no frame pointer, so a fast handler
+  has no frame record to push either.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns.
   It enters the chain at the current frame's next instruction, and the
@@ -398,22 +413,24 @@ fetch (every handler's last step):
   next pc: a conditional jump not taken does nothing, a taken one
   overwrites `pc`, and every frame's `pc` in an error trace is one
   past its instruction (§13).
-- The hot handlers read a slot, a constant, an initialized upvalue
-  or a bound Var in place and hand every other operand, a trap
-  included, to the general resolution of §4. Two fixnums compare, add, subtract, multiply,
-  `quot` and `mod` inline when the result is a fixnum; anything else,
-  a promotion or a zero divisor included, goes through the numeric
-  tower (§10.3). `call:call` of a
+- The fast handlers read a slot, a constant, an initialized upvalue
+  or a bound Var in place and leave every other operand, a trap
+  included, to the general handler's resolution (§4). Two fixnums
+  compare, add, subtract, multiply, `quot` and `mod` there when the
+  result is a fixnum; anything else, a promotion or a zero divisor
+  included, goes through the numeric tower (§10.3). `call:call` of a
   closure with its fixed arity, where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
-  and `callValue` enters a closure the same way; a native within its
-  arity is called with its arguments copied to a buffer on the native
-  stack, or read in place by a leaf (§6); a keyword or symbol called
-  with one or two arguments on a map, a record or nil looks itself up
-  in place, as `VM.lookup` does, with no copy and no safe point (the
-  key is an immediate, so the lookup neither allocates nor walks
-  nested data). Every other call goes through the general entry of
-  §6, with the same traps.
+  and `callValue` enters a closure the same way; a leaf native within
+  its arity reads its arguments in place (§6); a keyword or symbol
+  called with one or two arguments on a map, a record or nil looks
+  itself up in place, as `VM.lookup` does, with no copy and no safe
+  point (the key is an immediate, so the lookup neither allocates nor
+  walks nested data). `call:return` from a frame `call:call` pushed
+  pops it and continues in the caller. The general `call:call` calls
+  any other native within its arity with its arguments copied to a
+  buffer on the native stack; every other call goes through the
+  general entry of §6, with the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
   comparison wrote (the compiler's lowering of an `if` on a

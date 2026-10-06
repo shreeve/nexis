@@ -59,7 +59,7 @@ the §3 rows.
 | 10 | Transients | node-owner in-place edit | node-owner in-place edit, the token in an internal node's header (`docs/TRANSIENT.md`) | parity | §3.3 | measured |
 | 11 | GC | generational (G1, ZGC) | precise non-moving mark-sweep (`docs/GC.md` §1) | behind under allocation churn | — | not measured |
 | 12 | Allocator | TLAB bump pointer | `VM.heap` over size-class slabs with free lists, no per-block prefix (`docs/HEAP.md` §2) | behind on construction | §3.2 | measured |
-| 13 | Dispatch | JIT inline caches | threaded code: each handler tail-calls the next through a table indexed by opcode, the hot variants with handlers of their own (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8, §3.12, §3.13 | measured |
+| 13 | Dispatch | JIT inline caches | threaded code: each handler tail-calls the next through a table indexed by opcode, frameless fast handlers for the hot opcodes over the general ones (`docs/VM.md` §8); no inline caches | behind at warm steady state | §3.8, §3.12, §3.13 | measured |
 | 14 | Durable state | no stdlib primitive | emdb memory-mapped B+ tree (`docs/DB.md`) | lower latency than an out-of-process store | §3.6 | measured |
 | 15 | Serialization | EDN text, Nippy | binary, LEB128 and ZigZag (`docs/CODEC.md`) | smaller, faster than text | §3.5 | measured |
 | 16 | Concurrency tax | CAS and STM throughout | single isolate, single writer | none paid, by design | — | by design |
@@ -74,8 +74,8 @@ the §3 rows.
 ## 3. Measured rows
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
-§3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5; §3.15 on an Intel Core Ultra 9 185H under Linux;
+§3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13, §3.14 and
+§3.16 on an Apple M5; §3.15 on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -799,6 +799,34 @@ What the database rows say:
   `-Xms1g -Xmx1g`), Datomic Local at 1.1 GB, all at the JDK's default
   heap sizing.
 
+### 3.16 Fast dispatch, Apple M5
+
+The cost of one iteration or call of the micro programs
+(`bench/micro/`, `docs/BENCH.md` §13) in machine instructions retired
+and cycles, before and after each step of the fast dispatch
+(`docs/VM.md` §8): the median of five interleaved rounds, each
+program at two sizes, with the range of the rounds in brackets.
+Instructions are reproducible to a tenth; cycles moved with the load
+(12 to 15 on a shared host). Provenance: §11.
+
+| Program | Before: one table | Frameless fast handlers |
+|---|---:|---:|
+| `count` (3 dispatches) | 209.9 [208.6–210.1] / 23.6 cycles [19.3–32.1] | 175.0 [174.3–175.1] / 18.9 [16.9–26.5] |
+| `acc` (5) | 353.0 [353.0–353.1] / 34.8 [31.1–41.1] | 282.1 [281.9–282.3] / 37.3 [34.2–40.3] |
+| `fib`, per call | 488.5 [488.1–488.8] / 76.8 [73.0–85.4] | 414.5 [414.3–414.9] / 59.6 [52.2–61.7] |
+| `gcall` | 496.1 [495.9–496.2] / 57.5 [43.9–61.5] | 426.0 [426.0–426.1] / 47.2 [46.0–56.1] |
+| `lc` (`count` + `mov:load-const`) | 255.0 / 26.4 | 207.0 / 27.2 |
+| `mv` (+ `mov:move`) | 267.0 / 30.4 | 215.0 / 24.9 |
+| `lv` (+ `var:load-var`) | 260.0 / 29.1 | 218.0 / 27.5 |
+| `kw` (+ a keyword lookup) | 477.1 / 63.4 | 408.1 / 46.5 |
+| `leaf` (+ a leaf native call) | 625.2 / 74.6 | 524.1 / 69.1 |
+| `getnl` (+ a native call through its buffer) | 730.0 / 87.7 | 668.2 / 85.8 |
+
+`acc`'s cycles did not fall with its instructions: its loop carries
+`i` through a slot written by one handler and read by the next, two
+8-byte stores and a 16-byte load, and the store-to-load forwarding,
+not the instruction count, bounds it.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -860,7 +888,7 @@ Each lever is a measured change: a before/after from `zig build bench`
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
 - **Operand-specialized opcodes**, and then **inline caches at call
-  sites**: the hot handlers test their operands' kinds at run time
+  sites**: the fast handlers test their operands' kinds at run time
   (`docs/VM.md` §8); an opcode per kind pair drops the tests at the
   cost of instruction rows.
 - **`+` and `*` inlined at any arity**: `(+ a b x y z)` calls the
@@ -937,6 +965,15 @@ Each lever is a measured change: a before/after from `zig build bench`
   at the same time, `frequencies`/`group-by` 97 → 57 MB, the map build
   175 → 140 MB, transient maps 156 → 122 MB, `sort` 188 → 155 MB,
   vector `conj`/`nth` 100 → 65 MB (§3.14).
+- *Frameless fast handlers* (`docs/VM.md` §8, §3.16): the hot
+  opcodes' fast handlers over the general table, reaching the general
+  handler through the table indexed at run time, and release builds
+  without a frame pointer. A first attempt tail-called the general
+  handler through a constant function pointer; the compiler inlined
+  it back and kept the stack frame the fast path was meant to drop
+  (the pipeline's phase 876 → 854 M instructions, inside the spread).
+  Through the table: the counting loop 210 → 175 instructions an
+  iteration, a `fib` call 488.5 → 414.5.
 - *A built sequence walked as its vector* (`docs/LIST.md` §3,
   `viewCursor`): the pipeline's phase 1,327 → 1,253 M instructions on
   the tree before §3.13's changes, which stepped a list inline in the
@@ -962,14 +999,6 @@ Each lever is a measured change: a before/after from `zig build bench`
   40.5 → 43.9 ms over two runs of ten, alternating. The maps were
   allocated in order and the hardware's own prefetch already follows
   them; 32 prefetches at each leaf only add traffic.
-- *Hot handlers with a check-free fast path*: `mov:move`,
-  `mov:load-const` and `var:load-var` testing their common operand
-  kinds in one branch and handing everything else to the general
-  handler. The pipeline's phase 876 → 854 M instructions, its median
-  40.7 → 39.5 ms at a load of 17, inside the spread. The compiler
-  inlines the general handler back and keeps the stack frame the fast
-  path was meant to drop; a handler without one needs the slow path
-  out of line, which a constant function pointer does not ensure.
 
 - *Keeping the switch loop's frame pointer across instructions*, the
   fetch re-deriving it only after a group that can change `frames`:
@@ -1063,3 +1092,4 @@ is one invocation's 30-sample median.
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
 | §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |
+| §3.16 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast; emdb `847c5d8`; shared with concurrent builds (load average 12–15 at the start and the end) | revamp, 2026-10-06, speed-v: `bin/nexis` built by `zig build install -Doptimize=fast` at `305eee3` (one table) and at the fast-handler commit; `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,mv,lv,kw,leaf,getnl` under the machine's core queue, one core; raw JSON in the revamp ledger (`.git/revamp/r2/bench/speed-v/`) |
