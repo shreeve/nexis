@@ -1192,6 +1192,18 @@ The database rows (`run.clj --only db`, after, before, after, before,
 load 4.2 → 5.5) moved within their spread: `aggregate` 17.8, 19.6 →
 17.9, 18.0 ms, `lookup-10k` 10.6, 10.8 → 10.1, 10.1 ms.
 
+**The deep-data check inline.** Every call of a native that is not a
+leaf compares the spoil counter before and after (`VM.checkDeepData`,
+§13.1 of `docs/VM.md`). Out of line, the check saved six register
+pairs before reading the counter; inline, the common case is the read
+and a compare, and the raise is a call of its own. Load 5.2 → 5.3:
+`getnl` 500.0 → 476.0 instructions an iteration (64.4 → 61.9 cycles),
+every other program of the kit within a tenth; the `bench/compare`
+programs `destructure` 4,260 → 4,099 M (−3.8%), `map-transient`
+2,138 → 2,071 M, `map-build-read` 3,727 → 3,679 M, `vector-conj-nth`
+1,127 → 1,103 M, `string-split` 339 → 331 M, `pipeline` 2,542 →
+2,522 M, the rest unchanged; the phases within their ranges.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`

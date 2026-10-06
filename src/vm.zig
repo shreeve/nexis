@@ -2735,18 +2735,22 @@ pub const VM = struct {
     /// (SEMANTICS §2.7). The raise consumes the spoils it reports, so an
     /// enclosing native whose callback caught the throw does not raise
     /// it again.
-    pub fn checkDeepData(self: *VM, spoils_before: u64) VmError!void {
-        if (dispatch_mod.spoilCount() != spoils_before) {
-            dispatch_mod.rewindSpoils(spoils_before);
-            if (self.parked_realize) |p| {
-                self.parked_realize = null;
-                return switch (p) {
-                    .thrown => |v| self.throwValue(v),
-                    .err => |e| e,
-                };
-            }
-            return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
+    pub inline fn checkDeepData(self: *VM, spoils_before: u64) VmError!void {
+        // Inline, the common case costs a read of the counter; the raise
+        // saves the registers it needs only when it runs.
+        if (dispatch_mod.spoilCount() != spoils_before) return self.raiseDeepData(spoils_before);
+    }
+
+    noinline fn raiseDeepData(self: *VM, spoils_before: u64) VmError {
+        dispatch_mod.rewindSpoils(spoils_before);
+        if (self.parked_realize) |p| {
+            self.parked_realize = null;
+            return switch (p) {
+                .thrown => |v| self.throwValue(v),
+                .err => |e| e,
+            };
         }
+        return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
     }
 
     // -------------------------------------------------------------------------
