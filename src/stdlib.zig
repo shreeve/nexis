@@ -4968,10 +4968,13 @@ fn stringSearch(vm: *VM, args: []const Value, last: bool) VmError!Value {
 ///   - Invalid UTF-8 in either string → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
-    if (args[1].kind() == .regex) return splitPattern(vm, args[0], args[1], limit);
-    if (args[0].kind() != .string or args[1].kind() != .string) return VmError.KindMismatch;
+    // A pattern that is a literal of a byte or more splits as that
+    // string does: `Pattern.split`'s one zero-width rule cannot apply.
+    const literal: ?[]const u8 = if (args[1].kind() == .regex) regex_mod.programOf(args[1]).literal else null;
+    if (args[1].kind() == .regex and (literal == null or literal.?.len == 0)) return splitPattern(vm, args[0], args[1], limit);
+    if (args[0].kind() != .string or (literal == null and args[1].kind() != .string)) return VmError.KindMismatch;
     const src = string_mod.asBytes(args[0]);
-    const sep = string_mod.asBytes(args[1]);
+    const sep = literal orelse string_mod.asBytes(args[1]);
     // A separator that is not UTF-8 could match the first byte of a
     // multibyte scalar and split inside it (STDLIB.md §3). Validated
     // once here, the pieces are made from their bytes as they are.
@@ -4997,7 +5000,9 @@ fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
         pieces.append(vm.allocator, string_mod.fromBytes(heap, src[start..at]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
         start = at + sep.len;
     }
-    pieces.append(vm.allocator, string_mod.fromBytes(heap, src[start..]) catch return VmError.OutOfMemory) catch return VmError.OutOfMemory;
+    // The rest from the start is `s` itself, as `Pattern.split` returns it.
+    const rest = if (start == 0) args[0] else string_mod.fromBytes(heap, src[start..]) catch return VmError.OutOfMemory;
+    pieces.append(vm.allocator, rest) catch return VmError.OutOfMemory;
     if (limit == 0 and src.len > 0) {
         while (pieces.items.len > 0 and string_mod.byteLen(pieces.getLast()) == 0) _ = pieces.pop();
     }

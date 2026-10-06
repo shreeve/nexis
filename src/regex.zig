@@ -1732,8 +1732,13 @@ pub const Finder = struct {
     next: usize = 0,
     last_end: usize = 0,
     done: bool = false,
+    /// A literal program's occurrences, found a 32-byte block at a time
+    /// across finds rather than from each find's start again, so
+    /// `split` and `replace` on `#","` cost what they cost on `","`.
+    occurrences: ?string.Matches = null,
 
     pub fn find(f: *Finder) bool {
+        if (f.vm.prog.literal) |lit| if (lit.len > 0) return f.findLiteral(lit);
         if (f.done or f.next > f.hay.len or !f.vm.exec(f.hay, f.next, f.last_end, false)) {
             f.done = true;
             return false;
@@ -1742,6 +1747,22 @@ pub const Finder = struct {
         const e = f.vm.best[1];
         f.last_end = e;
         f.next = if (s != e) e else if (e < f.hay.len) e + decode(f.hay, e).len else e + 1;
+        return true;
+    }
+
+    /// A non-empty literal never matches empty, so each search starts
+    /// where the last occurrence ended, as the iterator does.
+    fn findLiteral(f: *Finder, lit: []const u8) bool {
+        if (f.done) return false;
+        if (f.occurrences == null) f.occurrences = .init(f.hay, lit, @min(f.next, f.hay.len));
+        const at = f.occurrences.?.next() orelse {
+            f.done = true;
+            return false;
+        };
+        f.vm.best[0] = at;
+        f.vm.best[1] = at + lit.len;
+        f.last_end = at + lit.len;
+        f.next = f.last_end;
         return true;
     }
 };
