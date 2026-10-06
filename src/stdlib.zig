@@ -218,7 +218,7 @@ const core_natives = table("", .{
     .{ "drop", 1, 2, &fnDrop },
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
-    .{ "count", 1, 1, &fnCount },
+    .{ "count", 1, 1, &fnCountLeaf, .leaf, &fnCount },
     .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
     .{ "empty?", 1, 1, &fnEmptyQ },
     .{ "identity", 1, 1, &fnIdentity, .leaf },
@@ -781,6 +781,15 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
+}
+
+/// `count` as a leaf (VM.md §6): a lazy seq (realized to its end) and
+/// an entity (read from the store) go the general way.
+fn fnCountLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .lazy_seq, .nextomic_entity => VmError.NeedsReentry,
+        else => fnCount(vm, args),
+    };
 }
 
 /// `(nth coll n)` → element at index `n`. Throws on out-of-

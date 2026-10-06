@@ -333,6 +333,7 @@ body instead of `call`. The error never escapes a call site.
 |---|---|
 | `nth` | a lazy seq, whose walk realizes it (`docs/LAZY.md` §4) |
 | `get` | a sorted collection (its comparator), a Nextomic entity (the store), and a hash map, set, record or transient searched by a key on the heap (its hash and `=` may realize a lazy seq or walk nested data) |
+| `count` | a lazy seq (realized to its end) and a Nextomic entity |
 
 ---
 
