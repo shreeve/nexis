@@ -23,7 +23,7 @@
 //!     keys are **opaque byte slices**, values
 //!     are codec-encoded via `src/codec.zig`.
 //!   - `putRef` / `getRef` / `delRef` ref-based convenience.
-//!   - Per-kind hash / equality / trace helpers consumed by
+//!   - Per-kind hash / equality helpers consumed by
 //!     `src/dispatch.zig` and `src/gc.zig`.
 //!
 //! Scope (DB.md §1): explicit-transaction primitives. No `alter!`,
@@ -170,13 +170,16 @@ pub const StoreFile = struct {
 
     /// The open file at `path`, or the file opened (or created) now
     /// with `options` and the pinned geometry: `page_size`,
-    /// `max_named_trees` and `reader_slots`, whatever `options` says. A file this
-    /// process may read but not write opens read-only.
+    /// `max_named_trees`, `reader_slots`, `initial_map_size` and
+    /// `map_grow_step`, whatever `options` says. A file this process
+    /// may read but not write opens read-only.
     pub fn acquire(path: [*:0]const u8, env_options: emdb.EnvOptions) !*StoreFile {
         var options = env_options;
         options.pageSize = page_size;
         options.maxNamedTrees = max_named_trees;
         options.maxReaders = reader_slots;
+        options.mapSize = initial_map_size;
+        options.growStep = map_grow_step;
         const allocator = options.allocator;
         const canonical = try canonicalPath(allocator, path);
         errdefer allocator.free(canonical);
@@ -500,10 +503,11 @@ pub const page_size: u32 = 16384;
 /// the `TreeId` range, which sizes the per-transaction tree set.
 pub const max_named_trees: u32 = 128;
 
-/// The size a new `db/*` store file starts at, and the step emdb
-/// extends a full one by, as Nextomic's (NEXTOMIC.md §2): emdb reserves
-/// the address space up front, so an extension moves nothing, and a
-/// small store stays small.
+/// The size a new store file starts at, and the step emdb extends a
+/// full one by (DB.md §2, NEXTOMIC.md §2): emdb reserves the address
+/// space up front, so an extension moves nothing and costs one
+/// `ftruncate`; a small store stays small and a large one carries at
+/// most one step of unused file.
 pub const initial_map_size: u64 = 1 << 20;
 pub const map_grow_step: u64 = 8 << 20;
 
@@ -547,9 +551,7 @@ pub const Durability = enum {
 /// Open (or create) a database file at `path`. `allocator` /
 /// `heap` / `interner` are non-owning references; caller
 /// guarantees their lifetimes. `options` is passed through to
-/// `emdb.Env.open` with the size a new file starts at and grows by set
-/// to `initial_map_size` / `map_grow_step`, and the geometry
-/// `StoreFile.acquire` pins; a file already open in this process is
+/// `emdb.Env.open` with the geometry `StoreFile.acquire` pins; a file already open in this process is
 /// shared as it is (`StoreFile`).
 pub fn open(
     allocator: std.mem.Allocator,
@@ -558,10 +560,7 @@ pub fn open(
     path: [*:0]const u8,
     options: emdb.EnvOptions,
 ) !Connection {
-    var env_options = options;
-    env_options.mapSize = initial_map_size;
-    env_options.growStep = map_grow_step;
-    const file = try StoreFile.acquire(path, env_options);
+    const file = try StoreFile.acquire(path, options);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
     // second salted so the halves are independent.
@@ -1224,29 +1223,22 @@ pub fn delRef(txn: *WriteTxn, r: Value) !bool {
 }
 
 // =============================================================================
-// Per-kind hash / equality / trace (DB.md §7)
+// Per-kind hash / equality (DB.md §7)
 //
 // Consumed by `src/dispatch.zig` at the `.durable_ref` arm and by
 // `src/gc.zig` at the same arm.
 // =============================================================================
 
-/// Identity-triple hash: xxHash3 over (store_id LE bytes ++
-/// tree_name ++ key_bytes). `conn` NOT consulted. Kind-local hash
-/// domain applied by `dispatch.hashValue` on the way out.
+/// Identity-triple hash: the store id's two halves, then xxHash3 over
+/// the tree name and key bytes, through the ordered combine. `conn` NOT
+/// consulted. Kind-local hash domain applied by `dispatch.hashValue`
+/// on the way out.
 pub fn hashHeader(h: *HeapHeader) u32 {
     if (h.cachedHash()) |cached| return cached;
     const body = bodyOf(h);
-    const inline_bytes = inlineBytesOf(h);
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    // store_id_lo + store_id_hi as LE bytes.
-    var store_id_bytes: [16]u8 = undefined;
-    std.mem.writeInt(u64, store_id_bytes[0..8], body.store_id_lo, .little);
-    std.mem.writeInt(u64, store_id_bytes[8..16], body.store_id_hi, .little);
-    hasher.update(&store_id_bytes);
-    hasher.update(inline_bytes[0..body.tree_name_len]);
-    hasher.update(inline_bytes[body.tree_name_len..][0..body.key_bytes_len]);
-    const full = hasher.final();
-    const truncated: u32 = @truncate(full);
+    const names = inlineBytesOf(h)[0 .. body.tree_name_len + body.key_bytes_len];
+    const ids = hash_mod.combineOrdered(body.store_id_lo, body.store_id_hi);
+    const truncated: u32 = @truncate(hash_mod.combineOrdered(ids, hash_mod.hashBytes(names)));
     if (truncated != 0) h.setCachedHash(truncated);
     return truncated;
 }
@@ -1265,14 +1257,6 @@ pub fn refsEqual(a: *HeapHeader, b: *HeapHeader) bool {
     const b_bytes = inlineBytesOf(b);
     const total_len = ab.tree_name_len + ab.key_bytes_len;
     return std.mem.eql(u8, a_bytes[0..total_len], b_bytes[0..total_len]);
-}
-
-/// GC trace — no-op per DB.md §7.3. `conn` is not a heap Value;
-/// tree_name and key_bytes are inline body bytes. Metadata is
-/// handled centrally by the collector.
-pub fn trace(h: *HeapHeader, visitor: anytype) void {
-    _ = h;
-    _ = visitor;
 }
 
 // =============================================================================
@@ -1294,21 +1278,8 @@ fn cleanupDb(path: [:0]const u8) void {
     std.Io.Dir.cwd().deleteTree(std.testing.io, dir) catch {};
 }
 
-fn synthHash(v: Value) u64 {
-    return v.hashImmediate();
-}
-
-fn synthEq(a: Value, b: Value) bool {
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .char => a.asChar() == b.asChar(),
-        else => false,
-    };
-}
+const synthHash = Value.hashImmediate;
+const synthEq = value.testEqual;
 
 test "failureName: every emdb error nexis can meet has its keyword; every decode error is :codec-failed" {
     // The engine's errors no nexis call can return: options nexis pins
@@ -1638,8 +1609,9 @@ test "close: refused while a transaction is open; the connection stays a closed 
     try testing.expectError(DbError.ConnectionUnavailable, beginRead(&conn));
 }
 
-/// Syncs the engine has issued in this process (data and meta alike).
-fn engineSyncs() u64 {
+/// Syncs the engine has issued in this process (data and meta alike),
+/// for the tests of durability.
+pub fn engineSyncs() u64 {
     return emdb.platform.File.syncCalls.load(.monotonic);
 }
 

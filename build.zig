@@ -99,6 +99,11 @@ pub fn build(b: *std.Build) void {
     env.apply(unit, env.gc_stress);
     test_step.dependOn(&unit.step);
     quick_step.dependOn(&unit.step);
+    // The inline tests of src/cli.zig, an executable root the runtime
+    // module does not reach.
+    const cli_unit = b.addRunArtifact(bins.cli_unit);
+    test_step.dependOn(&cli_unit.step);
+    quick_step.dependOn(&cli_unit.step);
     // The Nextomic subset, compiled only when `nextomic-test` runs alone.
     const nextomic_unit = b.addRunArtifact(b.addTest(.{
         .name = "nextomic-unit",
@@ -152,7 +157,7 @@ pub fn build(b: *std.Build) void {
     for (linux_targets) |t| {
         const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
         const cross_bins = binaries(b, cross, optimize, runtime(b, cross, optimize), suites);
-        const named = [_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit };
+        const named = [_]*std.Build.Step.Compile{ cross_bins.nexis, cross_bins.golden, cross_bins.bench, cross_bins.unit, cross_bins.cli_unit };
         for ([_][]const *std.Build.Step.Compile{ &named, cross_bins.suites }) |set| for (set) |compile| {
             _ = compile.getEmittedBin();
             check_targets_step.dependOn(&compile.step);
@@ -260,6 +265,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
             .{ .args = &.{ "-e", "\xEF\xBB\xBF(nope)" }, .stderr = "bom-expr.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
+            .{ .args = &.{ "run", cli ++ "deep-trace.nx" }, .stderr = "deep-trace.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
@@ -522,6 +528,8 @@ const Binaries = struct {
     /// mode: the gate's check that it compiles.
     bench: *std.Build.Step.Compile,
     unit: *std.Build.Step.Compile,
+    /// The inline tests of src/cli.zig.
+    cli_unit: *std.Build.Step.Compile,
     /// One per `suites` entry, in order.
     suites: []*std.Build.Step.Compile,
 };
@@ -566,6 +574,9 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         }),
         .bench = benchExe(b, target, optimize, nexis),
         .unit = b.addTest(.{ .name = "unit", .root_module = nexis, .use_llvm = useLlvm(target) }),
+        // The runtime's own tests run in `unit`; this binary reaches
+        // them too, through the files cli.zig imports.
+        .cli_unit = b.addTest(.{ .name = "cli-unit", .root_module = cli_mod, .filters = &.{"cli: "}, .use_llvm = useLlvm(target) }),
         .suites = suite_bins,
     };
 }

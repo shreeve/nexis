@@ -1268,7 +1268,7 @@ fn symbolResolves(ctx: LowerCtx, declared: *const DeclaredNames, name: []const u
 /// under it.
 fn qualifiedTarget(ns: *const vm.Namespace, ns_prefix: []const u8) ?*vm.Namespace {
     const registry = ns.registry orelse return null;
-    const effective = if (ns.aliases_initialized) (ns.lookupAlias(ns_prefix) orelse ns_prefix) else ns_prefix;
+    const effective = ns.lookupAlias(ns_prefix) orelse ns_prefix;
     return registry.lookupNs(effective);
 }
 

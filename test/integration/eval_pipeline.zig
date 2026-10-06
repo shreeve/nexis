@@ -1777,6 +1777,15 @@ test "integration: identity kinds are = only to themselves, and two of them hash
     , "[true true true true false true true]");
 }
 
+test "nextomic: a connection prints its path as a string literal" {
+    try expectOutputProgramWithStore("conn-print",
+        \\(def c (nextomic/connect "@STORE@\"q\ny"))
+        \\(def printed [(pr-str c) (str c)])
+        \\(nextomic/release c)
+        \\(let [p (str "#nextomic/conn " (pr-str "@STORE@\"q\ny"))] (= printed [p p]))
+    , "true");
+}
+
 test "integration: delay, force, realized?, delay?" {
     try expectOutput("(let [n (atom 0) d (delay (swap! n inc) :v)] [(realized? d) (delay? d) @d (realized? d) (force d) @d @n (force 3) (delay? 1)])", "[false true :v true :v :v 1 3 false]");
     // A throw is cached: the body runs once and every deref rethrows it.
@@ -1856,9 +1865,7 @@ test "gc: a native that calls a native through callValue reaches a safe point" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = 1 << 16;
-    program.v.gc_growth_percent = 0;
-    program.v.gc_next_at = 1 << 16;
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
     // reduce calls the conj native for every element with no
     // closure frame in between; each persistent set conj leaves the
     // replaced path behind as garbage.
@@ -1888,6 +1895,22 @@ test "gc: a native that calls a leaf native collects once a cycle is due" {
     // The products' sum is about 6 MB; collected as they go, the peak
     // stays within a few cycle windows of the start.
     try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+}
+
+test "gc: a product of many integers in one call keeps no partial product" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def xs (vec (range 1 3000))) (def p (reduce * xs))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    // One call of `*`, a leaf no collection runs inside: the partial
+    // products would sum to about 6 MB.
+    try harness.expectResult(&program, "", try program.run("(= (apply * xs) p)"), "true");
+    try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+    try harness.expectResult(&program, "", try program.run("[(apply * 1 2 3 (range 4 30)) (* 4611686018427387904 2 3.0) (* 2 4611686018427387904 -1) (try (* 4611686018427387904 2 :x) (catch any e e))]"), "[8841761993739701954543616000000 2.7670116110564327E19 -9223372036854775808 :kind-mismatch]");
 }
 
 test "integration: a sequence native walks a view from its offset, and a cons over one" {
@@ -2488,6 +2511,17 @@ test "defmacro: a store a macro opens belongs to the program" {
         \\(m)
         \\(let [r (db/ref @store :t :k)] [(db/get-key r) (do (db/put-key! r 4) (db/get-key r))])
     , "[nil 4]");
+}
+
+test "defmacro: a Nextomic connection a macro opens belongs to the program" {
+    try expectOutputProgramWithStore("macro-connect",
+        \\(def keep (atom nil))
+        \\(defmacro m [] (reset! keep (nextomic/connect "@STORE@")) nil)
+        \\(m)
+        \\(nextomic/transact! @keep [{:db/ident :n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+        \\(nextomic/transact! @keep [{:n 4}])
+        \\(nextomic/q '[:find ?v . :where [_ :n ?v]] (nextomic/db @keep))
+    , "4");
 }
 
 test "defmacro: what a macro prints goes to the with-out-str buffer the program opened" {
@@ -3122,13 +3156,15 @@ test "storage failures surface as :db/<reason> keywords inside try" {
     , "[:db/key-too-large :db/key-too-large :db/open-failed]");
 }
 
-test "db/open refuses a path with a NUL byte, or an empty one, as spit does" {
+test "db/open and nextomic/connect refuse a path with a NUL byte, or an empty one, as spit does" {
     // The open would stop at the NUL and name a shorter path than the
     // program checked (DB.md §2).
     try expectOutputProgramWithStore("seam-path",
         \\[(try (db/open "@STORE@\u0000.txt") (catch any e e))
-        \\ (try (db/open "") (catch any e e))]
-    , "[:invalid-path :invalid-path]");
+        \\ (try (db/open "") (catch any e e))
+        \\ (try (nextomic/connect "@STORE@\u0000.txt") (catch any e e))
+        \\ (try (nextomic/connect "") (catch any e e))]
+    , "[:invalid-path :invalid-path :invalid-path :invalid-path]");
 }
 
 test "a value nested 100 000 deep is stored and read back through a durable ref" {
@@ -3217,9 +3253,7 @@ fn expectDroppedTxns(policy: vm.GcPolicy, steps: []const []const u8, expected: [
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = policy.threshold;
-    program.v.gc_growth_percent = policy.growth_percent;
-    program.v.gc_next_at = policy.threshold;
+    program.v.setGcPolicy(policy);
     var last = value_mod.nilValue();
     for (steps) |step| {
         const src = try store.source(step);
@@ -3362,9 +3396,7 @@ test "db/open: two connections to one file share its writer; a second write is :
     , "[:db/busy :db/busy 2 2]");
 }
 
-fn engineSyncs() u64 {
-    return nx.emdb.platform.File.syncCalls.load(.monotonic);
-}
+const engineSyncs = nx.db.engineSyncs;
 
 /// Run each `[source expected syncs]` step of `steps` on one program
 /// holding `@STORE@`, where `syncs` is how many engine syncs the step
@@ -5923,9 +5955,7 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    program.v.gc_threshold = vm.GcPolicy.stress.threshold;
-    program.v.gc_growth_percent = vm.GcPolicy.stress.growth_percent;
-    program.v.gc_next_at = vm.GcPolicy.stress.threshold;
+    program.v.setGcPolicy(.stress);
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
 
@@ -6583,8 +6613,12 @@ test "runtime errors: resetAfterError leaves the VM ready for the next form" {
     const info = vm.SourceInfo{ .path = "t.nx", .text = "(defn f [] (/ 1 0))\n(f)" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
     try testing.expect(program.v.frames.items.len > 1);
+    try testing.expectEqual(vm.VmError.DivideByZero, program.v.traced_error.?);
     program.v.resetAfterError();
     try testing.expectEqual(@as(usize, 1), program.v.frames.items.len);
+    // A later failure the run loop never sees (a host callback's) must
+    // not report this one.
+    try testing.expect(program.v.traced_error == null);
     const result = try program.run("(+ 1 2)");
     try testing.expectEqual(@as(i64, 3), result.asFixnum());
 }

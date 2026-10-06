@@ -21,8 +21,7 @@ The module provides construction from a Zig slice (`fromI64Slice`,
 `fromF64Slice`, both copying their argument), `count`, `elemType`, the
 element slices for kernels (`i64Elems`, `f64Elems`), `nth` (the element
 as a Value), the element conversions `i64FromValue` / `f64FromValue`
-the constructors use, `hashHeader`, `equalHeaders`, `trace` and
-`format`. The language surface is §7.
+the constructors use, `hashHeader`, `equalHeaders` and `format`. The language surface is §7.
 
 **Absent.**
 
@@ -64,7 +63,8 @@ stored in `elem`:
 2. `elem` is 1 or 3 and equals the Value's subkind.
 3. An `f64` element is canonical: every NaN written at construction or
    decode is `hash.canonical_nan_bits`. `-0.0` is stored as is.
-4. The block has no heap references: `trace` is a no-op (GC.md §5).
+4. The block has no heap references: a leaf the collector does not
+   trace (GC.md §5).
 5. The block is never mutated after construction.
 
 ---
@@ -188,7 +188,7 @@ is allocated.
 Inline tests in `src/coll/typed_vector.zig` cover layout and alignment,
 construction, NaN canonicalization, `nth` (fixnum, bignum promotion,
 float, out of bounds), equality and hash (signed zero and NaN
-included), `format`, `ElemType.fromTag` and the no-op trace.
+included), `format` and `ElemType.fromTag`.
 `test/prop/typed_vector.zig`: T1 codec round trip of both element types
 at lengths 0, 1, 31, 32, 33 and 1000 (equality, hash, bit-exact
 elements, byte-stable re-encode); T2 equality and hash agreement and

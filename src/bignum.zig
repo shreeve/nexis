@@ -129,7 +129,8 @@ pub fn limbCount(v: Value) usize {
 // Per-kind hash / equality — called by dispatch
 // =============================================================================
 
-/// xxHash3 over {negative_byte, limb_bytes}, truncated to u32.
+/// The sign (1 negative, 0 not) and xxHash3 of the limb bytes through
+/// `hash.combineOrdered`, truncated to u32.
 /// Cached in `HeapHeader.hash` using the cache-if-nonzero pattern
 /// (HEAP.md §1). Padding bytes inside the body are deliberately
 /// excluded — the hash is over semantic content only.
@@ -139,10 +140,8 @@ pub fn hashHeader(h: *HeapHeader) u32 {
     }
     if (h.cachedHash()) |cached| return cached;
 
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    hasher.update(&[_]u8{if (headerNegative(h)) 1 else 0});
-    hasher.update(std.mem.sliceAsBytes(headerLimbs(h)));
-    const raw: u32 = @truncate(hasher.final());
+    const limb_hash = hash_mod.hashBytes(std.mem.sliceAsBytes(headerLimbs(h)));
+    const raw: u32 = @truncate(hash_mod.combineOrdered(@intFromBool(headerNegative(h)), limb_hash));
     if (raw != 0) h.setCachedHash(raw);
     return raw;
 }
@@ -274,6 +273,38 @@ pub fn mul(heap: *Heap, a: Value, b: Value) !Value {
     var r = mutable(buf);
     r.mulNoAlias(x, y, alloc);
     return fromMutable(heap, r);
+}
+
+/// `first` times every integer of `rest`, the running product kept in
+/// two scratch buffers that take turns: only the result reaches the
+/// heap. A fold through `mul` would leave every partial product there,
+/// and a native's garbage is not collected before it returns (VM.md
+/// §9).
+pub fn product(heap: *Heap, first: Value, rest: []const Value) !Value {
+    const alloc = heap.backing;
+    var sa: [1]Limb = undefined;
+    const a = view(first, &sa);
+    var cur = try alloc.dupe(Limb, a.limbs);
+    defer alloc.free(cur);
+    var spare: []Limb = &.{};
+    defer alloc.free(spare);
+    var acc: bigint.Mutable = .{ .limbs = cur, .len = a.limbs.len, .positive = a.positive };
+    for (rest) |x| {
+        var sx: [1]Limb = undefined;
+        const y = view(x, &sx);
+        const need = acc.len + y.limbs.len;
+        if (spare.len < need) {
+            alloc.free(spare);
+            spare = &.{};
+            spare = try alloc.alloc(Limb, need + need / 2);
+        }
+        var r = mutable(spare);
+        r.mulNoAlias(acc.toConst(), y, alloc);
+        spare = cur;
+        cur = r.limbs;
+        acc = r;
+    }
+    return fromMutable(heap, acc);
 }
 
 const DivPart = enum { quotient, remainder, exact_quotient };
@@ -834,13 +865,10 @@ test "hashHeader: deterministic, caches nonzero, matches xxHash3 over sign+limbs
     // Pre-hash: cache is clear.
     try testing.expectEqual(@as(u32, 0), h.hash);
 
-    // Compute the expected hash by hand: xxHash3 over
-    // {negative_byte} ++ limb_bytes.
-    var hasher = std.hash.XxHash3.init(hash_mod.seed);
-    hasher.update(&[_]u8{1}); // negative
+    // The expected hash by hand: the sign, then xxHash3 over the
+    // limb bytes, through the ordered combine.
     const limb_arr = [_]u64{ big, 7 };
-    hasher.update(std.mem.sliceAsBytes(&limb_arr));
-    const expected: u32 = @truncate(hasher.final());
+    const expected: u32 = @truncate(hash_mod.combineOrdered(1, hash_mod.hashBytes(std.mem.sliceAsBytes(&limb_arr))));
 
     try testing.expectEqual(expected, hashHeader(h));
     try testing.expectEqual(expected, hashHeader(h)); // deterministic, re-reads cache

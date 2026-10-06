@@ -39,7 +39,6 @@ const db_mod = @import("db.zig");
 const codec_mod = @import("codec.zig");
 const heap_mod = @import("heap.zig");
 const dispatch_mod = @import("dispatch.zig");
-const dispatch_mod_alias = dispatch_mod;
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
 const format_mod = @import("format.zig");
@@ -846,7 +845,19 @@ fn fnSub(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnMul(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return value_mod.fromFixnum(1).?;
-    return foldNumbers(vm, &vm_mod.numMul, args);
+    // From the last argument that is not an integer on, the product is
+    // exact in any order: once it is a bignum, `bignum.product` makes
+    // the rest off the heap, where a fold would leave every partial
+    // product.
+    var ints = args.len;
+    while (ints > 0 and vm_mod.isInteger(args[ints - 1])) ints -= 1;
+    const heap = vm.ensureHeap();
+    var acc = try requireNumber(args[0]);
+    for (args[1..], 1..) |x, i| {
+        if (i >= ints and acc.kind() == .bignum) return bignum_mod.product(heap, acc, args[i..]) catch VmError.OutOfMemory;
+        acc = try vm_mod.numMul(heap, acc, x);
+    }
+    return acc;
 }
 
 fn fnDiv(vm: *VM, args: []const Value) VmError!Value {
@@ -3027,7 +3038,7 @@ fn ioOf(vm: *VM) std.Io {
 /// creates only the file). `d` is `:commit` or `:durable`; without it
 /// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
     const io = ioOf(vm);
     if (std.Io.Dir.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -3981,7 +3992,7 @@ fn codepointPrefix(text: []const u8, n: usize) VmError!usize {
     var i: usize = 0;
     for (0..n) |_| {
         if (i == text.len) break;
-        i += (scalarAt(text, i) orelse return VmError.Utf8Error).len;
+        i += (string_mod.decodeAt(text, i) catch return VmError.Utf8Error).len;
     }
     return i;
 }
@@ -4274,37 +4285,18 @@ fn trimString(vm: *VM, s: Value, left: bool, right: bool, comptime isTrimmed: fn
     var lo: usize = 0;
     var hi: usize = src.len;
     if (left) while (lo < hi) {
-        const sc = scalarAt(src[0..hi], lo) orelse break;
-        if (!isTrimmed(sc.c)) break;
+        const sc = string_mod.decodeAt(src[0..hi], lo) catch break;
+        if (!isTrimmed(sc.scalar)) break;
         lo += sc.len;
     };
     if (right) while (hi > lo) {
         var start = hi - 1;
         while (start > lo and src[start] & 0xC0 == 0x80) start -= 1;
-        const sc = scalarAt(src[0..hi], start) orelse break;
-        if (start + sc.len != hi or !isTrimmed(sc.c)) break;
+        const sc = string_mod.decodeAt(src[0..hi], start) catch break;
+        if (start + sc.len != hi or !isTrimmed(sc.scalar)) break;
         hi = start;
     };
     return string_mod.fromBytes(vm.ensureHeap(), src[lo..hi]) catch return VmError.OutOfMemory;
-}
-
-/// The scalar that starts at `bytes[pos]` and its byte length; null
-/// unless the bytes there are one well-formed UTF-8 sequence (no
-/// overlong form, surrogate or truncated tail). Strings carry their
-/// bytes unvalidated (STRING.md §2), so a native that walks one by
-/// code point decodes through here.
-fn scalarAt(bytes: []const u8, pos: usize) ?struct { c: u21, len: u3 } {
-    const len = std.unicode.utf8ByteSequenceLength(bytes[pos]) catch return null;
-    if (len > bytes.len - pos) return null;
-    const b = bytes[pos..];
-    const c: u21 = switch (len) {
-        1 => b[0],
-        2 => std.unicode.utf8Decode2(b[0..2].*) catch return null,
-        3 => std.unicode.utf8Decode3(b[0..3].*) catch return null,
-        4 => std.unicode.utf8Decode4(b[0..4].*) catch return null,
-        else => unreachable,
-    };
-    return .{ .c = c, .len = len };
 }
 
 fn isNewline(c: u21) bool {
@@ -4339,8 +4331,8 @@ fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     const src = try stringArg(args[0]);
     var i: usize = 0;
     while (i < src.len) {
-        const sc = scalarAt(src, i) orelse return value_mod.fromBool(false);
-        if (!isJavaWhitespace(sc.c)) return value_mod.fromBool(false);
+        const sc = string_mod.decodeAt(src, i) catch return value_mod.fromBool(false);
+        if (!isJavaWhitespace(sc.scalar)) return value_mod.fromBool(false);
         i += sc.len;
     }
     return value_mod.fromBool(true);
@@ -4660,20 +4652,11 @@ fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(@mod(now.nanoseconds, value_mod.fixnum_max))) orelse VmError.ArithmeticOverflow;
 }
 
-/// A path argument of `slurp` / `spit`: a string, not empty, with
-/// no NUL byte (`:invalid-path`).
-fn pathArg(v: Value) VmError![]const u8 {
-    if (v.kind() != .string) return VmError.KindMismatch;
-    const path = string_mod.asBytes(v);
-    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
-    return path;
-}
-
 /// `(slurp path)` → the file's text. `:file-not-found` for a missing
 /// file, `:utf8-error` for text that is not UTF-8, `:io-error` for
 /// any other failure.
 fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     const slice = std.Io.Dir.cwd().readFileAlloc(ioOf(vm), path, vm.allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return VmError.FileNotFound,
         error.OutOfMemory => return VmError.OutOfMemory,
@@ -4689,7 +4672,7 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
 /// end with `:append`; nil. Parent directories are not created
 /// (`:file-not-found`).
 fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
-    const path = try pathArg(args[0]);
+    const path = try vm_mod.pathArg(args[0]);
     if (args.len % 2 != 0) return VmError.ArityMismatch;
     var append = false;
     var i: usize = 2;
@@ -5210,21 +5193,11 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
     }
 }
 
-/// A fresh list of `items`, in order: `view_min` or more are a
-/// vector and its view (LIST.md §1), a few blocks for any length and
-/// an O(1) `count`; fewer are cons cells. Nothing built needs a root:
-/// `Heap.alloc` never collects (VM.md §9).
+/// A fresh list of `items` (`list.build`). Nothing built needs a
+/// root: `Heap.alloc` never collects (VM.md §9).
 fn buildListFromSlice(vm: *VM, items: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    if (items.len < view_min or items.len > std.math.maxInt(u32)) return list_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
-    const vec = vector_mod.fromSlice(heap, items) catch return VmError.OutOfMemory;
-    return list_mod.ofVector(heap, vec, 0) catch VmError.OutOfMemory;
+    return list_mod.build(vm.ensureHeap(), items) catch VmError.OutOfMemory;
 }
-
-/// The length from which a built list is a vector view: below it,
-/// the cons cells are fewer blocks than a vector's root, tail and
-/// view.
-const view_min = 4;
 
 /// The result of a sequence native that calls back into the VM,
 /// rooted as it is made (docs/GC.md §11.5, class 3). The first 32

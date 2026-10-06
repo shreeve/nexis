@@ -77,15 +77,14 @@ handle (§3.2).
 **Pinned geometry.** `StoreFile.acquire`, which every `open` and
 Nextomic `connect` passes through, overrides the caller's `pageSize`
 with `db.page_size` (16 KiB), `maxNamedTrees` with
-`db.max_named_trees` (128) and `maxReaders` with `db.reader_slots`
-(§3.2). emdb's default page size is the OS page size, and the page
+`db.max_named_trees` (128), `maxReaders` with `db.reader_slots`
+(§3.2), `mapSize` with `db.initial_map_size` (1 MiB) and `growStep`
+with `db.map_grow_step` (8 MiB). emdb's default page size is the OS page size, and the page
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
-`open` creates a file at `db.initial_map_size` (1 MiB) and has emdb
-extend a full one by `db.map_grow_step` (8 MiB), Nextomic's sizes
-(`docs/NEXTOMIC.md` §2), where emdb's defaults are 256 MiB and 64 MiB:
-a store of one key is a small file.
+The map sizes, where emdb's defaults are 256 MiB and 64 MiB, keep a
+store of one key a small file, whichever layer opens it first.
 
 **Tree handles resolve once per connection.** `treeId(txn, name,
 create)` looks the name up in the connection's cache before asking
@@ -370,7 +369,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 | `ref(heap, conn, tree, key) !Value` / `refFromBytes(heap, store_id, tree, key) !Value` | §4. |
 | `putRef` / `getRef` / `delRef` | The same through a ref's tree and key, after checking the ref belongs to the transaction's store (§8). |
 | `refStoreId` / `refTreeName` / `refKeyBytes` / `refConn` | The ref's fields. |
-| `hashHeader` / `refsEqual` / `trace` | §7. |
+| `hashHeader` / `refsEqual` | §7. |
 | `failureName(anyerror) []const u8` | The keyword a failure surfaces as (§8). |
 
 Keys are opaque byte slices, never codec-encoded; values are
@@ -411,9 +410,10 @@ equal.
 
 #### 7.2 Hash
 
-64-bit xxHash3, seeded with `hash.seed`, over the `store_id` low and
-high halves as little-endian bytes, then the tree-name bytes, then the
-key bytes; truncated to `u32` and cached in the header when nonzero.
+`hash.combineOrdered` of the `store_id` low half, its high half and
+xxHash3 (seeded with `hash.seed`) of the tree-name bytes followed by
+the key bytes; truncated to `u32` and cached in the header when
+nonzero.
 `dispatch.hashValue` applies the kind's domain on the way out.
 
 #### 7.3 GC trace
@@ -506,8 +506,8 @@ whose callback writes, deletes and walks the tree under it),
 ### 11. Module graph
 
 `db.zig` imports `value`, `heap`, `intern`, `hash`, `codec` and
-`emdb`. `dispatch.zig` and `gc.zig` call its hash, equality and trace
-helpers at their `.durable_ref` arms, and `gc.zig` its `markHandle`
+`emdb`. `dispatch.zig` calls its hash and equality helpers at its
+`.durable_ref` arm, and `gc.zig` its `markHandle`
 and `sweepHandles` (§3.2); `format.zig` reads a ref's
 tree name and key bytes to print it; `stdlib.zig` holds the natives;
 Nextomic imports it only for `failureName`, the geometry constants

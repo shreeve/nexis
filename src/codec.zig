@@ -475,9 +475,9 @@ const Decoder = struct {
         defer d.scratch.shrinkRetainingCapacity(start);
         const elems = d.scratch.items[start..];
         switch (tag) {
-            // Four or more elements are a view of a vector, as a built
-            // sequence is (LIST.md §1); a view encodes as a list.
-            @backingInt(Kind.list) => return if (elems.len < 4) list_mod.fromSlice(d.heap, elems) else list_mod.ofVector(d.heap, try vector_mod.fromSlice(d.heap, elems), 0),
+            // Built as a built sequence is (LIST.md §1); a view
+            // encodes as a list.
+            @backingInt(Kind.list) => return list_mod.build(d.heap, elems),
             @backingInt(Kind.persistent_vector) => return vector_mod.fromSlice(d.heap, elems),
             @backingInt(Kind.sorted_map), @backingInt(Kind.sorted_set) => return d.sortedFrom(@fromBackingInt(@intCast(tag)), elems),
             // A trie hashes every key, so past an array form's size the
@@ -594,23 +594,8 @@ fn isHeapKindByte(b: u8) bool {
 
 // ---- Synthetic callbacks ----
 
-fn synthHash(x: Value) u64 {
-    return x.hashImmediate();
-}
-
-fn synthEq(a: Value, b: Value) bool {
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .symbol => a.asSymbolId() == b.asSymbolId(),
-        .char => a.asChar() == b.asChar(),
-        .float => a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat())),
-        else => false,
-    };
-}
+const synthHash = Value.hashImmediate;
+const synthEq = value.testEqual;
 
 // ---- Test helper ----
 

@@ -291,10 +291,8 @@ const Place = struct {
         const start = if (std.mem.findScalarLast(u8, all[0..at], '\n')) |nl| nl + 1 else bom;
         const end = std.mem.findScalarPos(u8, all, at, '\n') orelse all.len;
         const text = std.mem.trimEnd(u8, all[start..end], "\r");
-        const offset = @min(at -| start, text.len);
-        var chars: usize = 0;
-        for (text[0..offset]) |c| chars += @intFromBool(c & 0xC0 != 0x80);
-        return .{ .line = 1 + std.mem.count(u8, all[0..at], "\n"), .col = 1 + chars, .text = text, .offset = offset };
+        const lc = info.lineCol(pos);
+        return .{ .line = lc.line, .col = lc.col, .text = text, .offset = @min(at -| start, text.len) };
     }
 };
 
@@ -435,10 +433,10 @@ const Runtime = struct {
         var stderr = std.Io.File.stderr().writerStreaming(rt.io, &buf);
         const w = &stderr.interface;
         for (trace) |frame| {
-            // The marker the VM leaves where it cut a deep chain
-            // (`<N frames elided>`) is no frame to be "at".
-            if (frame.source == null and std.mem.endsWith(u8, frame.name, " frames elided>")) {
-                try w.print("  {s}\n", .{frame.name});
+            // The marker the VM leaves where it cut a deep chain is
+            // no frame to be "at".
+            if (frame.elided > 0) {
+                try w.print("  <{d} frames elided>\n", .{frame.elided});
             } else if (frame.source) |src| {
                 if (frame.span) |span| {
                     const at = Place.of(src, span.pos);
@@ -729,21 +727,66 @@ const Balance = struct {
 };
 
 /// The keyword a caught runtime error would be (`DivideByZero` is
-/// `:divide-by-zero`), for `*e`.
+/// `:divide-by-zero`), for `*e`; one no `catch` sees is named the same
+/// way (`:out-of-memory`).
 fn errorKeyword(rt: *Runtime) Value {
     const err = rt.v.traced_error orelse return value_mod.nilValue();
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (@errorName(err), 0..) |c, i| {
-        if (n + 2 > buf.len) break;
-        if (std.ascii.isUpper(c)) {
-            if (i > 0) {
-                buf[n] = '-';
-                n += 1;
-            }
-            buf[n] = std.ascii.toLower(c);
-        } else buf[n] = c;
-        n += 1;
+    const name = vm.vmErrorToKeywordName(err) orelse if (err == vm.VmError.OutOfMemory) "out-of-memory" else @errorName(err);
+    return rt.v.ensureInterner().internKeywordValue(name) catch value_mod.nilValue();
+}
+
+// =============================================================================
+// Inline tests
+// =============================================================================
+
+const testing = std.testing;
+
+test "cli: Balance: brackets count outside strings, comments and character literals" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "(+ 1 2)", true },
+        .{ "(str \"(\"", false },
+        .{ "\"a\\\"b\"", true },
+        .{ "\"open", false },
+        .{ "[\\( \\) \\\"]", true },
+        .{ "(a ; ) closes nothing\n", false },
+        .{ "; a \" in a comment\n(a)", true },
+        .{ ")", true },
+        .{ "(a))", true },
+    };
+    for (cases) |case| {
+        var balance: Balance = .{};
+        balance.scan(case[0]);
+        try testing.expectEqual(case[1], balance.complete());
     }
-    return rt.v.ensureInterner().internKeywordValue(buf[0..n]) catch value_mod.nilValue();
+}
+
+test "cli: Balance: a form scanned a line at a time" {
+    var balance: Balance = .{};
+    balance.scan("(defn f [x]\n");
+    try testing.expect(!balance.complete());
+    balance.scan("  \"[\" (* 2 x))\n");
+    try testing.expect(balance.complete());
+}
+
+test "cli: Place: the line, the column in code points with a tab as one, past a byte-order mark" {
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "\xEF\xBB\xBF(a)\n\t\u{e9} (b)\r\nz" };
+    const first = Place.of(&info, 3);
+    try testing.expectEqual(@as(usize, 1), first.line);
+    try testing.expectEqual(@as(usize, 1), first.col);
+    try testing.expectEqualStrings("(a)", first.text);
+    try testing.expectEqual(@as(usize, 0), first.offset);
+    const second = Place.of(&info, 11);
+    try testing.expectEqual(@as(usize, 2), second.line);
+    try testing.expectEqual(@as(usize, 4), second.col);
+    try testing.expectEqualStrings("\t\u{e9} (b)", second.text);
+    try testing.expectEqual(@as(usize, 4), second.offset);
+    const past = Place.of(&info, 1000);
+    try testing.expectEqual(@as(usize, 3), past.line);
+    try testing.expectEqualStrings("z", past.text);
+}
+
+test "cli: width: one column per code point, a tab's width for a tab" {
+    try testing.expectEqual(@as(usize, 0), width(""));
+    try testing.expectEqual(@as(usize, 1 + tab.len + 1), width("\u{e9}\tx"));
+    try testing.expectEqual(@as(usize, 2), width("\u{1F600}!"));
 }

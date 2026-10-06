@@ -3,7 +3,7 @@
 //!
 //! Invariants:
 //!   - The environment is opened with the geometry every nexis store
-//!     shares (`db.page_size`, `db.max_named_trees`); the page size is
+//!     shares, which `db.StoreFile.acquire` pins; the page size is
 //!     fixed for the file's life.
 //!   - All twelve trees are opened at open and their `TreeId`s are
 //!     cached for the store's life (tree registration is the only
@@ -104,14 +104,6 @@ pub const SyncMode = enum {
         };
     }
 };
-
-/// The size a new store file starts at, and the step emdb extends a
-/// full one by (NEXTOMIC.md §2). emdb reserves its address space up
-/// front, so an extension moves nothing and costs one `ftruncate`; a
-/// small store stays small and a large one carries at most one step
-/// of unused file.
-pub const initial_map_size: u64 = 1 << 20;
-pub const map_grow_step: u64 = 8 << 20;
 
 pub const Options = struct {
     /// How the commit that creates, bootstraps or completes the store
@@ -273,13 +265,7 @@ pub const Store = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .file = try db_layer.StoreFile.acquire(path, .{
-                .pageSize = db_layer.page_size,
-                .maxNamedTrees = db_layer.max_named_trees,
-                .mapSize = initial_map_size,
-                .growStep = map_grow_step,
-                .allocator = allocator,
-            }),
+            .file = try db_layer.StoreFile.acquire(path, .{ .allocator = allocator }),
             .trees = undefined,
             .uuid = @splat(0),
             .fulltext_aid = boot.fulltext,
@@ -1088,16 +1074,7 @@ pub const TestDir = struct {
     }
 };
 
-/// `s` repeated `n` times, for building long test strings.
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
-    return comptime blk: {
-        @setEvalBranchQuota(2 * n + 1000);
-        var buf: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-        const final = buf;
-        break :blk &final;
-    };
-}
+const repeat = @import("../string.zig").repeat;
 
 test "a count, a fulltext stamp or a t read out of its range is Corrupted" {
     var td = try TestDir.init("store_ranges");
@@ -1190,7 +1167,7 @@ test "a new store file starts small and grows a step at a time" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    try testing.expectEqual(initial_map_size, store.file.env.info().mapSize);
+    try testing.expectEqual(db_layer.initial_map_size, store.file.env.info().mapSize);
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1204,8 +1181,8 @@ test "a new store file starts small and grows a step at a time" {
     try store.writeBatch(txn, 2, batch, arena);
     try txn.commit();
     const grown = store.file.env.info().mapSize;
-    try testing.expect(grown > initial_map_size and grown < 64 << 20);
-    try testing.expectEqual(0, (grown - initial_map_size) % map_grow_step);
+    try testing.expect(grown > db_layer.initial_map_size and grown < 64 << 20);
+    try testing.expectEqual(0, (grown - db_layer.initial_map_size) % db_layer.map_grow_step);
 }
 
 test "a store without :db/fulltext receives it at open, at its next ident id" {
@@ -1631,7 +1608,7 @@ test "long ident names use the heap path" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    const long_name = "ns/" ++ repeat("x", 400);
+    const long_name = "ns/" ++ @as([400]u8, @splat('x'));
     {
         const txn = try store.beginWrite(.none);
         try store.putIdent(txn, long_name, 5000);
@@ -1711,7 +1688,7 @@ test "a db/* connection and a store of one file share one writer" {
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
     defer store.close();
-    const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .pageSize = db_layer.page_size, .allocator = testing.allocator });
+    const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
     defer file.release();
     try testing.expect(file == store.file);
     const kv = try file.beginWrite(.{});

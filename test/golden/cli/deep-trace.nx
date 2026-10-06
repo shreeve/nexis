@@ -1,0 +1,4 @@
+; A chain of 102 frames is cut to its innermost 32 and outermost 8
+; around one line counting the 62 between them (TOOLING.md §1).
+(defn down [n] (if (= n 0) (/ 1 n) (inc (down (dec n)))))
+(down 100)

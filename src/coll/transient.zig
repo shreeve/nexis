@@ -364,25 +364,13 @@ pub fn trace(h: *HeapHeader, visitor: anytype) void {
 
 // ---- Synthetic element callbacks ----
 
-fn synthHash(x: Value) u64 {
-    return x.hashImmediate();
-}
+const synthHash = Value.hashImmediate;
 
 fn noOverflows() u64 {
     return 0;
 }
 
-fn synthEq(a: Value, b: Value) bool {
-    if (a.tag == b.tag and a.payload == b.payload) return true;
-    if (a.kind() != b.kind()) return false;
-    return switch (a.kind()) {
-        .nil, .false_, .true_ => true,
-        .fixnum => a.asFixnum() == b.asFixnum(),
-        .keyword => a.asKeywordId() == b.asKeywordId(),
-        .char => a.asChar() == b.asChar(),
-        else => false,
-    };
-}
+const synthEq = value.testEqual;
 
 // ---- transientFrom / subkind-enum wiring ----
 

@@ -82,8 +82,9 @@ form and prints each value on stdout as `prn` does, nil included,
 whatever its size. `*1`, `*2` and `*3` hold the last three values. A
 runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
-and `*e` is the thrown value, or for a VM error its keyword
-(`DivideByZero` is `:divide-by-zero`); a parse, reader or compile
+and `*e` is the thrown value, or for a VM error the keyword `catch`
+sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
+out of memory, which no `catch` sees, `:out-of-memory`); a parse, reader or compile
 error is reported and leaves `*e` as it was. `:quit` or `:q` alone
 on a line at the start of a form, or end of input, exits. Every
 input's text is kept for the session, so a function defined in one
@@ -171,9 +172,10 @@ nexis: test/golden/cli/divide-by-zero.nx:5:3: runtime error: DivideByZero
   `eval` runs `<eval>` (listed by name alone: it has no source). A
   caller's position is its call. A closure a native called back
   (`map`, `reduce`) is its own frame; the native has none. A chain
-  longer than 40 frames keeps its innermost 32 and outermost 8 around
-  one line `  <N frames elided>`, which has no `at` (VM.md §13), so a
-  runaway recursion ending in `StackOverflow` lists 41 lines.
+  longer than 41 frames keeps its innermost 32 and outermost 8 around
+  one line `  <N frames elided>`, N the frames between them, which has
+  no `at` (VM.md §13; `deep-trace.err`), so a runaway recursion ending
+  in `StackOverflow` lists 41 lines.
 - Out of memory is a runtime error like the rest: `runtime error:
   OutOfMemory` at the call whose allocation failed, with its frames
   (`out-of-memory.err`). No `try` catches it (VM.md §13); what the

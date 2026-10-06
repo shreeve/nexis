@@ -812,7 +812,7 @@ test "a released connection reopens in its own struct; db-values of its earlier 
 test "a connection creates a new store file at the store's initial map size" {
     const tc = try TestConn.init("db_map_size");
     defer tc.deinit();
-    try testing.expectEqual(store_mod.initial_map_size, tc.conn.store.file.env.info().mapSize);
+    try testing.expectEqual(store_mod.db_layer.initial_map_size, tc.conn.store.file.env.info().mapSize);
 }
 
 test "db at bootstrap: datoms, entity, entid, ident, tx-range" {

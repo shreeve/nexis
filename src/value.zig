@@ -426,6 +426,25 @@ pub fn testSymbol(id: u32) Value {
     return fromSymbol(id, id);
 }
 
+/// `=` over immediates, for the tests of the modules below `dispatch`
+/// (the collections, the codec, durable refs), with `hashImmediate` as
+/// the hash: the same bits, or the same kind and value, any NaN equal
+/// to any NaN. A heap value equals only itself.
+pub fn testEqual(a: Value, b: Value) bool {
+    if (!@import("builtin").is_test) @compileError("testEqual is for tests");
+    if (a.tag == b.tag and a.payload == b.payload) return true;
+    if (a.kind() != b.kind()) return false;
+    return switch (a.kind()) {
+        .nil, .false_, .true_ => true,
+        .fixnum => a.asFixnum() == b.asFixnum(),
+        .keyword => a.asKeywordId() == b.asKeywordId(),
+        .symbol => a.asSymbolId() == b.asSymbolId(),
+        .char => a.asChar() == b.asChar(),
+        .float => a.asFloat() == b.asFloat() or (std.math.isNan(a.asFloat()) and std.math.isNan(b.asFloat())),
+        else => false,
+    };
+}
+
 /// Pack a STATIC `NativeFn` descriptor pointer into a Value of kind `.native_fn`. The
 /// descriptor lives in static storage (no heap, no GC, no
 /// lifetime concern). The runtime treats the Value as

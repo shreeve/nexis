@@ -28,6 +28,7 @@ const std = @import("std");
 pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
 const stack = @import("stack.zig");
+const string_mod = @import("string.zig");
 
 pub const Tag = nexis.Tag;
 pub const Sexp = parser.Sexp;
@@ -735,7 +736,7 @@ fn parseCharLiteral(body: []const u8) ?u21 {
         return if (isScalar(v)) v else null;
     }
     const n = std.unicode.utf8ByteSequenceLength(body[0]) catch return null;
-    if (n == body.len) return std.unicode.utf8Decode(body) catch null;
+    if (n == body.len) return (string_mod.decodeAt(body, 0) catch return null).scalar;
     const names = [_]struct { []const u8, u21 }{
         .{ "newline", '\n' }, .{ "space", ' ' },     .{ "tab", '\t' },
         .{ "return", '\r' },  .{ "formfeed", 0x0C }, .{ "backspace", 0x08 },

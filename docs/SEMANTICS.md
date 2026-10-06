@@ -238,8 +238,8 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
   of the text alone, never of the intern id, so the order of a map or
   set a keyword keys does not depend on which names the process
   interned first. The kinds differ by domain.
-- **string**: `xxh3` of the bytes. **bignum**: `xxh3` of the sign byte
-  and the limbs.
+- **string**: `xxh3` of the bytes. **bignum**: the ordered combine
+  below of the sign (1 negative, 0 not) and `xxh3` of the limbs.
 - **Ordered combine** (list, vector): `h = 1; for each x: h = 31*h +
   hash(x)`; finalize `h = 31*h + xxh3(count)`. `list.hashSeq` and
   `vector.hashSeq` compute the same value for the same elements.
@@ -254,10 +254,11 @@ xxHash3-64 seeded with the ASCII bytes `"nexis1/1"` (`hash.seed`):
 - **typed vector**: ordered combine over the element-type code, then
   each element (`xxh3` of the i64, or the float rule), finalized with
   the length.
-- **record**: `xxh3` of the type id (4 bytes) and the field map's hash
-  (8 bytes).
-- **durable ref**: `xxh3` of store id, tree name and key bytes; the
-  value it points at is never read.
+- **record**: the ordered combine of `xxh3` of the type id (8 bytes)
+  and the field map's hash.
+- **durable ref**: the ordered combine of the store id's two halves and
+  `xxh3` of the tree name and key bytes; the value it points at is
+  never read.
 - **Nextomic db-value**: ordered combine of the source (the file's
   device and inode, else the connection pointer), basis, `as-of`,
   `since` and `history`; **entity**: the db-value's

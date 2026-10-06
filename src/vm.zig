@@ -42,6 +42,7 @@ const dispatch_mod = @import("dispatch.zig");
 /// consistent between the compiler, the macroexpander and runtime
 /// values.
 const intern_mod = @import("intern.zig");
+const string_mod = @import("string.zig");
 const protocol_mod = @import("protocol.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
@@ -583,8 +584,6 @@ pub const Namespace = struct {
     /// treating the prefix as a literal namespace name. Aliases
     /// are namespace-local (not inherited via auto-refer).
     aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
-    /// Always true; the front end reads it.
-    aliases_initialized: bool = true,
     /// Backs the hash maps' internal storage.
     map_allocator: std.mem.Allocator,
     /// Backs the Var struct allocations. Lifetime = VM lifetime.
@@ -863,6 +862,17 @@ pub fn asNativeFn(v: Value) *const NativeFn {
 /// descriptor. Typical use: `vm_mod.nativeFnValue(&native_first)`.
 pub fn nativeFnValue(descriptor: *const NativeFn) Value {
     return value_mod.fromNativeFnPtr(@ptrCast(descriptor));
+}
+
+/// A path argument of `slurp`, `spit`, `db/open` and
+/// `nextomic/connect`: a string, not empty, with no NUL byte
+/// (`:invalid-path`): an open would stop at the NUL and name a shorter
+/// path than the program checked (DB.md §2).
+pub fn pathArg(v: Value) VmError![]const u8 {
+    if (v.kind() != .string) return VmError.KindMismatch;
+    const path = string_mod.asBytes(v);
+    if (path.len == 0 or std.mem.findScalar(u8, path, 0) != null) return VmError.InvalidPath;
+    return path;
 }
 
 // =============================================================================
@@ -2985,9 +2995,10 @@ pub const VM = struct {
 
     /// Discard what a failed run left behind (the frames above the
     /// top-level one, handlers, pending finallys, the dynamic
-    /// bindings a `binding` form had in force and the unhandled
-    /// throw) so the next `retargetTop` starts from a clean VM. The
-    /// error trace stays until the next failing run replaces it.
+    /// bindings a `binding` form had in force, the unhandled throw and
+    /// `traced_error`) so the next `retargetTop` starts from a clean
+    /// VM and a later failure outside a run never reports this one.
+    /// The error trace stays until the next failing run replaces it.
     pub fn resetAfterError(self: *VM) void {
         while (self.frames.items.len > 1) _ = self.popFrame();
         self.handlers.clearRetainingCapacity();
@@ -2996,6 +3007,7 @@ pub const VM = struct {
         self.escaped_origin = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
+        self.traced_error = null;
         self.frames.items[0].routine = &idle_routine;
         @memset(self.stack.items, value_mod.nilValue());
         // A runaway recursion grew the frame chain and the stack far
@@ -4140,7 +4152,7 @@ pub const VM = struct {
 /// Returns null for unrecoverable errors — bytecode
 /// corruption, OOM, handler-state malformation, etc. Those
 /// propagate to the caller unchanged.
-fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
+pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
     return switch (err) {
         // Recoverable per VM.md §13.
         VmError.KindMismatch => "kind-mismatch",
@@ -4986,7 +4998,7 @@ pub const asm_ = struct {
 
 const testing = std.testing;
 
-const repeat = @import("string.zig").repeat;
+const repeat = string_mod.repeat;
 
 test "Inst size: exactly 64 bits packed" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Inst));

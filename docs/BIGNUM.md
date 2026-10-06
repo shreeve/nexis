@@ -89,6 +89,7 @@ is canonical (§1).
 | `isInteger(v)` | fixnum or bignum |
 | `view(v, scratch)` | the integer as a `std.math.big.int.Const` in place; `scratch` backs a fixnum's one limb |
 | `add`, `sub`, `mul` | exact |
+| `product(heap, first, rest)` | `first` times every integer of `rest`, exact; the partial products stay in scratch buffers (§8) |
 | `quot`, `rem`, `mod` | §8 |
 | `quotExact(heap, a, b)` | the quotient when the division is exact, null otherwise |
 | `quotientF64(heap, a, b)` | `a / b` as the nearest double, ties to even, for operands of any size (§8) |
@@ -107,8 +108,8 @@ is canonical (§1).
 
 ### 5. Hash
 
-`hashHeader` is xxHash3 (the runtime seed) over the sign byte followed
-by the limb bytes, never the padding; truncated to `u32` and cached in
+`hashHeader` is `hash.combineOrdered` of the sign (1 negative, 0 not)
+and xxHash3 (the runtime seed) of the limb bytes, never the padding; truncated to `u32` and cached in
 the header when nonzero (the HEAP.md cache rule).
 `dispatch.hashValue` mixes the kind's domain in on top (SEMANTICS
 §3.3).
@@ -144,7 +145,12 @@ cell. A result is computed into a scratch buffer (on the stack up to 64
 limbs, from the heap's backing allocator beyond) and copied onto the
 heap once through the canonicalizer, so `(- (+ a b) b)` is a fixnum
 again whenever `a` was, and a zero result is `fixnum(0)` whatever the
-operands' signs.
+operands' signs. `product` multiplies a run of integers in two scratch
+buffers that take turns as the running product, so only the result
+reaches the heap: `*` over many integers is one native call, inside
+which nothing is collected, and a fold through `mul` would leave every
+partial product there. `*` hands it the rest of its arguments once its
+product is a bignum and every argument left is an integer.
 
 The semantics match Clojure's `Numbers` for BigInt:
 
@@ -187,8 +193,8 @@ allocation) and a bignum outside it; N2 `fromI64(i64.min)`; N3 and N4
 `fromLimbs` canonicalizes a fixnum-range magnitude and any zero; N5 no
 trailing zero limbs; N6 equality laws; N7 equal bignums share
 `hashValue`; N8 never `=` to a non-bignum; N9 limbs and sign round-trip
-byte-exact; N10 the hash is xxHash3 over sign and limbs under the kind
-domain; A1 and A2 `add`, `sub`, `compare` and `mul` agree with `i128`;
+byte-exact; N10 the hash is the sign combined with xxHash3 of the limbs,
+under the kind domain; A1 and A2 `add`, `sub`, `compare` and `mul` agree with `i128`;
 A3 `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and `@mod`
 on every sign combination; A4 the fixnum boundary crossed both ways;
 A5 algebraic identities on multi-limb values; A6 decimal text and

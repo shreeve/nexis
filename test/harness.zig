@@ -66,11 +66,7 @@ pub const Program = struct {
         try stdlib.boot(&self.loader);
         self.hooks = .{ .host_macros = &self.host_macros, .registry = self.registry, .interner = self.interner };
         self.hooks.install(&self.v);
-        if (options.gc_stress) {
-            self.v.gc_threshold = vm.GcPolicy.stress.threshold;
-            self.v.gc_growth_percent = vm.GcPolicy.stress.growth_percent;
-            self.v.gc_next_at = vm.GcPolicy.stress.threshold;
-        }
+        if (options.gc_stress) self.v.setGcPolicy(.stress);
     }
 
     /// Release the program; a leak logs an error, which fails the test.
