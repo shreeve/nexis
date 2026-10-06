@@ -68,10 +68,12 @@ const VmError = vm_mod.VmError;
 // once, and `.leaf` after a leaf (`NativeFn.leaf`: arithmetic,
 // predicates and lookups over the arguments alone, none calling back,
 // comparing or hashing nested data; a bignum one makes is a fresh
-// block, and `Heap.alloc` never collects, VM.md §9). `table` turns
-// it into static descriptors (immortal, so a
-// `.native_fn` Value can point at one); a descriptor outside
-// nexis.core is named `ns/name` for traces and printing.
+// block, and `Heap.alloc` never collects, VM.md §9), and after that
+// the full body when the leaf body refuses some receivers with
+// `NeedsReentry` (`NativeFn.general`). `table` turns it into static
+// descriptors (immortal, so a `.native_fn` Value can point at one); a
+// descriptor outside nexis.core is named `ns/name` for traces and
+// printing.
 
 fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]NativeFn {
     var out: [entries.len]NativeFn = undefined;
@@ -409,7 +411,7 @@ const core_natives = table("", .{
     .{ "identical?", 2, 2, &fnIdenticalQ },
     .{ "assoc", 3, null, &fnAssoc },
     .{ "dissoc", 1, null, &fnDissoc },
-    .{ "get", 2, 3, &fnGet },
+    .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet },
     .{ "contains?", 2, 2, &fnContainsQ },
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
@@ -1942,6 +1944,19 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     // (SORTED.md §6).
     if (sorted_mod.isSortedKind(args[0].kind())) return vm_mod.lookupIn(vm, args[0], args[1], default);
     return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
+}
+
+/// `get` as a leaf (VM.md §6). It refuses what only `fnGet` may run:
+/// a sorted collection (its comparator), an entity (the store), and a
+/// hashed collection searched by a key on the heap, whose hash and `=`
+/// may realize a lazy seq or walk nested data.
+fn fnGetLeaf(vm: *VM, args: []const Value) VmError!Value {
+    switch (args[0].kind()) {
+        .sorted_map, .sorted_set, .nextomic_entity => return VmError.NeedsReentry,
+        .persistent_map, .persistent_set, .record, .transient => if (args[1].kind().isHeap()) return VmError.NeedsReentry,
+        else => {},
+    }
+    return fnGet(vm, args);
 }
 
 /// The element at fixnum index `k` of typed vector `tv`, or null

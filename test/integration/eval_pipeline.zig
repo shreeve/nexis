@@ -2244,6 +2244,12 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
 }
 
+test "leaf natives: what a leaf body refuses goes the general way from every call site" {
+    // An instruction, `apply` (callValue) and `mapv` (a Callback) each
+    // call the leaf, and re-issue what it refuses (VM.md §6).
+    try expectOutput("(let [s (sorted-map-by > 1 :a 2 :b) m {[1] :v \"k\" :w} k [1]] [(get s 2) (get m k) (get m \"k\") (get m [2] :d) (get #{\"s\"} \"s\") (apply get [s 1]) (apply get [m k]) (mapv get [s m m {:x 1}] [1 k \"k\" :x])])", "[:b :v :w :d s :a :v [:a :v :w 1]]");
+}
+
 test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {
     try expectOutput("[(get {(lazy-seq [1 2]) :a} [1 2]) (contains? #{[1 2]} (lazy-seq [1 2])) (= {:k (lazy-seq [1])} {:k [1]}) (pr-str [(lazy-seq [1])]) (= (hash (lazy-seq [2 3])) (hash [2 3])) (= (hash [(lazy-seq [2 3])]) (hash [[2 3]])) (str (lazy-seq [1 2]))]", "[:a true true [(1)] true true (1 2)]");
     // A nested body's throw surfaces from the native or opcode that
