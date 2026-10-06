@@ -433,6 +433,14 @@ instruction.
   has no frame record to push either. The fast handlers sit together
   in a section of their own, each on a cache line of its own, so code
   growing elsewhere does not move them against each other.
+  `zig build codegen` holds the rule: it disassembles the arm64 and
+  x86-64 release builds and fails when a fast handler (`vm.VM.fast*`)
+  calls anything or, on arm64, names the stack pointer
+  (`test/codegen.sh`, with an LLVM objdump). On x86-64, whose System
+  V convention leaves a handler nine scratch registers, four of them
+  its arguments, the comparisons, the arithmetic and `call:call` save
+  one to six registers with `push` and `pop`; no handler there may
+  reserve or address stack, and the check lists what each saves.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns.
   It enters the chain at the current frame's next instruction, and the

@@ -21,6 +21,9 @@
 //!   zig build parser                  regenerate src/parser.zig from nexis.grammar
 //!   zig build parser-check            diff src/parser.zig against a fresh generation
 //!                                     (part of `test` when nexus is present)
+//!   zig build codegen                 disassemble the fast dispatch handlers of the
+//!                                     arm64 and x86-64 release builds: no stack
+//!                                     frame, no call (docs/VM.md §8)
 //!   zig build check-targets           compile and link every binary for Linux
 //!                                     (x86_64 and aarch64, glibc and musl)
 //!
@@ -181,6 +184,22 @@ pub fn build(b: *std.Build) void {
             _ = compile.getEmittedBin();
             check_targets_step.dependOn(&compile.step);
         };
+    }
+
+    // The codegen check (docs/VM.md §8): the release builds for arm64
+    // and x86-64, disassembled, with no fast dispatch handler that keeps
+    // a stack frame or calls anything.
+    const codegen_step = b.step("codegen", "Check that no fast dispatch handler of the arm64 and x86-64 release builds keeps a stack frame or calls");
+    for (linux_targets[0..2]) |t| {
+        const cross = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = t.triple, .cpu_features = t.cpu }) catch unreachable);
+        const module = cliModule(b, cross, .fast);
+        module.addOptions("build_options", runtimeOptions(b));
+        const check = b.addSystemCommand(&.{ "sh", "test/codegen.sh", t.triple });
+        check.addArtifactArg(b.addExecutable(.{ .name = "nexis", .root_module = module, .use_llvm = useLlvm(cross) }));
+        check.addFileInput(b.path("test/codegen.sh"));
+        check.setCwd(b.path("."));
+        check.stdio = .inherit;
+        codegen_step.dependOn(&check.step);
     }
 
     // -------------------------------------------------------------------------

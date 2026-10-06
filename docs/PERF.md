@@ -949,6 +949,13 @@ Each lever is a measured change: a before/after from `zig build bench`
   for what §3.13's in-place lookup does in one; one instruction
   naming the keyword constant and the operand would drop two, at the
   cost of an opcode (an amendment of VM.md §10).
+- **Frameless fast handlers on x86-64**: the comparisons, the
+  arithmetic and `call:call` save one to six callee-saved registers there
+  (`zig build codegen`), where System V leaves nine scratch registers
+  and the handler's arguments take four. The `preserve_none` calling
+  convention (`x86_64_preserve_none`, every register scratch) for
+  every handler would remove the saves; it needs an x86-64 host to
+  run the gate and to measure.
 - **A compare-and-branch instruction**: an `if` on `(< i n)` is
   `cmp:lt` into a slot and `jump:if-false` on it, which the dispatch
   runs as one (`docs/VM.md` §8, §3.12). One encoded instruction would
