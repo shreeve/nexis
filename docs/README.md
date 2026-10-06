@@ -37,5 +37,6 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/db.zig` | [`DB.md`](DB.md) | emdb connection, durable refs, the `db/*` surface |
 | `src/nextomic/` | [`NEXTOMIC.md`](NEXTOMIC.md) | The database (authoritative): store, transactions, time, query, pull, API, errors |
 | — | [`NEXTOMIC-EMDB.md`](NEXTOMIC-EMDB.md) | What Nextomic relies on in emdb, the engine facts that shape its keys, and what not to ask of emdb |
+| — | [`FILEMAN-NEXTOMIC.md`](FILEMAN-NEXTOMIC.md) | A design note, not a spec: VistA's FileMan data on Nextomic's time model (`TODO.md` #12) |
 | `src/bench.zig`, `bench/` | [`BENCH.md`](BENCH.md) | Benchmark method and harness |
 | — | [`PERF.md`](PERF.md) | Measured numbers, levers, non-goals |

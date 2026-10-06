@@ -56,6 +56,24 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    the matching Zig there before rerunning `bench/compare/run.clj`
    (each download is the owner's to approve).
 
+## Deferred design
+
+Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
+
+10. **Multimethods.** `defmulti`, `defmethod`, `remove-method`,
+    `methods`, `prefer-method` with `:default`, and hierarchies
+    (`derive`, `isa?`, `parents`, `ancestors`, `descendants`,
+    `make-hierarchy`). Deferred by the owner to the next revamp
+    (PLAN §4 lists them as absent).
+11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). A macro
+    receives the call's Form (its span and metadata) and the map of
+    locals in scope. Deferred by the owner to the next revamp.
+12. **FileMan on Nextomic.** VistA's FileMan data gains Nextomic's time
+    model: every fact kept, as-of reads, provenance on each change.
+    `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
+    ways to combine them (a temporal mirror first) and a first
+    demonstration. The capture hook belongs to em's repository.
+
 ## Divergences by design, not bugs
 
 9. **`/` by a float zero.** nexis always raises `:divide-by-zero`,
