@@ -429,3 +429,40 @@ a pattern, which becomes the literal of its source again
 (`valueToForm`). `read-string` gives a pattern, and its
 `:reader-error` covers an invalid one. Two regex literals are never
 duplicate keys: `#{#"a" #"a"}` reads, a set of two patterns.
+
+---
+
+### 11. Patterns in `nexis.string`
+
+`split`, `replace` and `replace-first` take a pattern where they take
+a literal string (`docs/STDLIB.md` §3), with the results of Java's
+`Pattern.split`, `Matcher.replaceAll` and `replaceFirst` and of
+Clojure's `replace-by`, all over the find loop of §3.5. A literal
+pattern (`#","`) searches with `string.Matches`, the SIMD search the
+string separators use.
+
+- **`split`**: a match that is empty at the start of the input makes
+  no leading piece; a positive limit keeps at most that many pieces,
+  the last the rest of the input; a limit of 0 (the default) drops the
+  trailing empty pieces, a negative one keeps them; an input with no
+  match is `[s]`. `(split "abc" #"")` is `["a" "b" "c"]`.
+- **A replacement string** is read as `Matcher.appendReplacement`
+  reads it (`regex.parseReplacement`), once, at the first match, so a
+  replacement no match uses is never judged: `$n` takes the longest
+  run of digits that names a group, the first digit always counting
+  (with one group, `"$12"` is group 1 and then `2`); `${name}` a named
+  group; `\x` the code point `x`; a group that did not take part
+  inserts nothing. Java's errors are thrown as `{:error
+  :invalid-replacement :message M}` with Java's sentences: `No group
+  2`, `Illegal group reference`, `Illegal group reference: group index
+  is missing`, `character to be escaped is missing`, `No group with
+  name {y}`, `named capturing group has 0 length name`, `capturing
+  group name {1x} starts with digit character`, `named capturing group
+  is missing trailing '}'`.
+- **A replacement function** is called with each match (a string, or
+  the groups vector) and must return a string (`:kind-mismatch`
+  otherwise; anything not callable is `:not-callable`). The result
+  grows in a Zig buffer and the match is the call's argument, so no
+  heap value is held across the call (`docs/GC.md` §11.5).
+- A replace that finds nothing returns `s` itself.
+- `re-quote-replacement` puts a backslash before each `\` and `$`.

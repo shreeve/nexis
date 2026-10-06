@@ -144,12 +144,12 @@ surplus arguments are ignored. `printf` (§6) prints the result.
 
 ### 3. `nexis.string`
 
-The natives are in `string_natives`; `capitalize`, `reverse` and
-`split-lines` are in `src/stdlib/string.nx`. Every function takes
-strings, not chars or nil, except where the table says so; any
-other kind is `:kind-mismatch`. There are no regular expressions:
-`split` and `replace` take a literal string (`replace` also a char).
-Searches compare bytes 32 at a time (`string.Matches`, STRING.md §3),
+The natives are in `string_natives`; `capitalize`, `reverse`,
+`split-lines` and `escape` are in `src/stdlib/string.nx`. Every
+function takes strings, not chars or nil, except where the table says
+so; any other kind is `:kind-mismatch`. `split`, `replace` and
+`replace-first` take a pattern (`docs/REGEX.md` §11) or a literal
+string (the replaces also a char). Searches compare bytes 32 at a time (`string.Matches`, STRING.md §3),
 which on valid UTF-8 match only at code-point boundaries. `split`
 validates its arguments once and makes each piece from its bytes;
 `join` of nil, strings, chars and fixnums and every `replace` measure
@@ -167,22 +167,21 @@ the result and write it once; a `replace` that finds nothing returns
 | `starts-with?`, `ends-with?`, `includes?` | 2 | Whether the second string is a prefix, suffix, substring of the first |
 | `index-of` | 2–3 | `(index-of s x)`, `(index-of s x from)`: the code-point index of the first occurrence of `x` (a string or a char) at or after `from`, nil when there is none; `from` is clamped to `[0, (count s)]`; `(index-of "héllo" "l")` is 2 |
 | `last-index-of` | 2–3 | The code-point index of the last occurrence starting at or before `from` (default the count; clamped to it, and nil when negative, as Java's `lastIndexOf`), nil when there is none; the empty string is found at `from` |
-| `split` | 2–3 | `(split s sep)`, `(split s sep limit)`: a vector of the pieces between occurrences of `sep`, as Clojure's `split` with a pattern that matches only `sep`. With no limit (or 0) trailing empty pieces are dropped (`(split "a,b,," ",")` is `["a" "b"]`, `(split ",," ",")` is `[]`, `(split "" ",")` is `[""]`); a positive limit splits at most `limit − 1` times and keeps the rest whole; a negative one keeps every trailing empty piece. An empty `sep` splits between code points, as Clojure's `#""` does (`(split "abc" "")` is `["a" "b" "c"]`) |
+| `split` | 2–3 | `(split s sep)`, `(split s sep limit)`: a vector of the pieces between the matches of the pattern `sep`, Java's `Pattern.split`: a match that is empty at the start makes no leading piece (`(split "1a1" #"1")` is `["" "a"]`), no match at all gives `[s]`, and the limit works as below. A string `sep` is a nexis extension: the pieces between occurrences of `sep`, as Clojure's `split` with a pattern that matches only `sep`. With no limit (or 0) trailing empty pieces are dropped (`(split "a,b,," ",")` is `["a" "b"]`, `(split ",," ",")` is `[]`, `(split "" ",")` is `[""]`); a positive limit splits at most `limit − 1` times and keeps the rest whole; a negative one keeps every trailing empty piece. An empty `sep` splits between code points, as Clojure's `#""` does (`(split "abc" "")` is `["a" "b" "c"]`) |
 | `split-lines` | 1 | The lines of `s`, split at `\n` or `\r\n`, trailing empty lines dropped |
 | `join` | 1–2 | `(join coll)`, `(join sep coll)`: the elements of any seqable, each as `str` makes it (nil empty), separated by `sep`: `(join ", " ["a" nil 1])` is `"a, , 1"`; a map joins its entries (`"[:a 1]"`), a string its chars; nil is `""`. A set joins in its iteration order |
-| `replace-first` | 3 | `(replace-first s match replacement)`: the first occurrence of `match` (a string or a char) replaced by `replacement`, else `s` itself; an empty `match` is found at the start (`string.nx`) |
+| `replace-first` | 3 | `(replace-first s match replacement)`: the first match replaced, else `s` itself. A pattern `match` takes what `replace` takes; a string or char `match` is found as it is, an empty one at the start, and `replacement` is a string or char |
+| `re-quote-replacement` | 1 | `s` with a backslash before each `\` and `$`, so a pattern `replace` inserts it literally (`Matcher.quoteReplacement`) |
 | `escape` | 2 | `(escape s cmap)`: `s` with each character that `cmap` maps to a non-nil value replaced by that value's text (`str`), the rest kept: `(escape "a<b" {\< "&lt;"})` is `"a&lt;b"` (`string.nx`) |
-| `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. `match` and `replacement` are both strings or both chars (`(replace "a.b" \. \/)`); an empty `match` is found before every code point and at the end (`(replace "ab" "" "-")` is `"-a-b-"`), as Java's `String.replace`. The replacement is literal (`$1` is two characters) |
+| `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. `match` and `replacement` are both strings or both chars (`(replace "a.b" \. \/)`); an empty `match` is found before every code point and at the end (`(replace "ab" "" "-")` is `"-a-b-"`), as Java's `String.replace`, and the replacement is literal. A pattern `match` is Java's `replaceAll`: a string replacement reads `$1` and `${name}` as groups and `\$` as `$` (`(replace "a1b2" #"(\d)" "<$1>")` is `"a<1>b<2>"`; one Java refuses throws `{:error :invalid-replacement :message M}` with Java's sentence, `No group 2`), and a function replacement is called with each match (a string, or the groups vector) and must return a string (`:kind-mismatch`) |
 
-Errors beyond `:kind-mismatch`: `split` and `replace` validate every
+Errors beyond `:kind-mismatch`: `split` and the replaces validate every
 string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
-Absent from Clojure's `clojure.string`: `re-quote-replacement`, and
-every pattern argument. Full Unicode case
-mapping, normalization and grapheme segmentation are absent
-(STRING.md §6).
+Full Unicode case mapping, normalization and grapheme segmentation
+are absent (STRING.md §6).
 
 ---
 

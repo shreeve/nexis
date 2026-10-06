@@ -4065,6 +4065,36 @@ test "regex: #\"...\" is a pattern constant; quote, macros and read-string see a
     , "[\"12\" #\"a\\\"b\" #\"x\" :regex \"a\\\\d\" \"a\" \"bb\" true false 2 2 true #\"a+\" :regex :reader-error]");
 }
 
+test "regex: nexis.string/split on a pattern is Java's Pattern.split" {
+    try expectOutput(
+        \\(pr-str [(nexis.string/split "a1b2c" #"\d") (nexis.string/split "1a1" #"1") (nexis.string/split "abc" #"") (nexis.string/split "a b  c" #"\s+" 2) (nexis.string/split "a,b,," #"," -1) (nexis.string/split "" #",")
+        \\         (nexis.string/split "a,b,," #",") (nexis.string/split ",a" #",") (nexis.string/split "abc" #"x") (nexis.string/split "aXbXc" #"X" 1) (nexis.string/split "a1b2c3" #"\d" 2) (nexis.string/split "é😀b" #"")
+        \\         (nexis.string/split " a b " #" ") (nexis.string/split "a1b" #"\d" 0) (nexis.string/split "a1b1" #"\d" 5) (let [x "abc"] (identical? x (first (nexis.string/split x #"z"))))])
+    , "[[\"a\" \"b\" \"c\"] [\"\" \"a\"] [\"a\" \"b\" \"c\"] [\"a\" \"b  c\"] [\"a\" \"b\" \"\" \"\"] [\"\"] [\"a\" \"b\"] [\"\" \"a\"] [\"abc\"] [\"aXbXc\"] [\"a\" \"b2c3\"] [\"é\" \"😀\" \"b\"] [\"\" \"a\" \"b\"] [\"a\" \"b\"] [\"a\" \"b\" \"\"] true]");
+}
+
+test "regex: nexis.string/replace and replace-first take a pattern with a $n and ${name} replacement, or a function of the match" {
+    try expectOutput(
+        \\(pr-str [(nexis.string/replace "a1b2" #"(\d)" "<$1>") (nexis.string/replace "a1" #"(\d)" "$12") (nexis.string/replace "2024-10" #"(?<y>\d+)-(?<m>\d+)" "${m}/${y}") (nexis.string/replace "a1" #"\d" "\\$")
+        \\         (nexis.string/replace "abc" #"x" "$") (nexis.string/replace "aaa" #"a*" "-") (nexis.string/replace "abc" #"" "-") (let [x "abc"] (identical? x (nexis.string/replace x #"z" "y")))
+        \\         (nexis.string/replace "a1b22" #"\d+" (fn [m] (str "<" m ">"))) (nexis.string/replace "a1b2" #"([a-z])(\d)" (fn [[_ l d]] (str d l))) (nexis.string/replace "a1" #"(x)?\d" pr-str)
+        \\         (nexis.string/replace-first "a1b2" #"\d" "X") (nexis.string/replace-first "a1b2" #"(\d)" "<$1>") (nexis.string/replace-first "a1b2" #"\d" (fn [m] (str m m))) (nexis.string/replace-first "abc" #"z" "y")
+        \\         (nexis.string/replace-first "a-b-c" "-" "+") (nexis.string/replace-first "abc" \b \x) (nexis.string/replace-first "abc" "" "-") (nexis.string/replace-first "aébé" "é" "E")
+        \\         (nexis.string/re-quote-replacement "a$1\\b") (nexis.string/replace "x" #"x" (nexis.string/re-quote-replacement "$1\\"))])
+    , "[\"a<1>b<2>\" \"a12\" \"10/2024\" \"a$\" \"abc\" \"--\" \"-a-b-c-\" true \"a<1>b<22>\" \"1a2b\" \"a[\\\"1\\\" nil]\" \"aXb2\" \"a<1>b2\" \"a11b2\" \"abc\" \"a+b-c\" \"axc\" \"-abc\" \"aEbé\" \"a\\\\$1\\\\\\\\b\" \"$1\\\\\"]");
+}
+
+test "regex: a replacement Java refuses throws :invalid-replacement with its sentence; a function must return a string" {
+    try expectOutput(
+        \\(pr-str (for [r ["$2" "x$" "$x" "x\\" "${y}" "${}" "${1x}" "${ab"]]
+        \\          (try (nexis.string/replace "a1" #"(\d)" r) (catch :invalid-replacement e (:message e)))))
+    , "(\"No group 2\" \"Illegal group reference: group index is missing\" \"Illegal group reference\" \"character to be escaped is missing\" \"No group with name {y}\" \"named capturing group has 0 length name\" \"capturing group name {1x} starts with digit character\" \"named capturing group is missing trailing '}'\")");
+    try expectOutput(
+        \\(map #(try (%) (catch any e e))
+        \\     [#(nexis.string/replace "a1" #"\d" (fn [m] 5)) #(nexis.string/replace "a" #"a" 1) #(nexis.string/split "a" #"a" "x") #(nexis.string/replace-first "a" #"a" \b) #(nexis.string/replace-first "abc" "b" 1) #(nexis.string/re-quote-replacement 1)])
+    , "(:kind-mismatch :not-callable :kind-mismatch :not-callable :kind-mismatch :kind-mismatch)");
+}
+
 test "regex: an invalid pattern throws :invalid-regex with the sentence and the index; a wrong kind is :kind-mismatch" {
     try expectOutput(
         \\(pr-str (for [p ["(" "a{2,1}" "é(" "(?=a)" "a)"]]
@@ -6345,6 +6375,11 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
 /// garbage, so a cycle runs inside the native while it holds earlier
 /// results, and the results must still be intact afterwards.
 const churn = "(defn churn [x] (count (apply str (map (fn [i] (str x i)) (range 200))))) ";
+
+test "gc: a pattern replace keeps its result across the cycles its function's allocations run" {
+    try expectOutputUnderGc(churn ++ "(let [s (apply str (repeat 40 \"a1b2 \")) r (nexis.string/replace s #\"([a-z])(\\d)\" (fn [[_ l d]] (churn d) (str d l)))] [(count r) (subs r 0 10)])", "[200 1a2b 1a2b ]");
+    try expectOutputUnderGc(churn ++ "(count (re-seq #\"\\d\" (apply str (map (fn [i] (churn i) (str i)) (range 40)))))", "70");
+}
 
 test "gc: map, filter, keep, map-indexed and mapv keep their earlier results across cycles" {
     try expectOutputUnderGc(churn ++ "(let [xs (map (fn [x] (churn x) (str x \"!\")) (range 60))] [(count xs) (first xs) (last xs)])", "[60 0! 59!]");

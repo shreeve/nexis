@@ -1884,6 +1884,81 @@ pub fn traceMatcher(h: *HeapHeader, visitor: anytype) void {
     visitor.markValue(b.input);
 }
 
+// =============================================================================
+// Replacement strings (docs/REGEX.md §11)
+// =============================================================================
+
+/// A piece of a parsed replacement: literal text, or a group's match.
+pub const Piece = union(enum) { text: []const u8, group: u32 };
+
+pub const Parsed = union(enum) { ok: []const Piece, err: []const u8 };
+
+/// `repl` as `Matcher.appendReplacement` reads it against `prog`:
+/// `$n` the longest run of digits naming a group (the first digit
+/// always counts), `${name}` a named group, `\x` the code point `x`
+/// itself, anything else as it is. An error is Java's sentence,
+/// allocated in `arena` with the pieces.
+pub fn parseReplacement(arena: Allocator, prog: *const Program, repl: []const u8) Allocator.Error!Parsed {
+    var pieces: std.ArrayList(Piece) = .empty;
+    var i: usize = 0;
+    var run: usize = 0;
+    while (i < repl.len) {
+        const c = repl[i];
+        if (c != '\\' and c != '$') {
+            i += 1;
+            continue;
+        }
+        if (run < i) try pieces.append(arena, .{ .text = repl[run..i] });
+        i += 1;
+        if (c == '\\') {
+            if (i == repl.len) return .{ .err = "character to be escaped is missing" };
+            const n = decode(repl, i).len;
+            try pieces.append(arena, .{ .text = repl[i..][0..n] });
+            i += n;
+        } else {
+            if (i == repl.len) return .{ .err = "Illegal group reference: group index is missing" };
+            var g: u32 = undefined;
+            if (repl[i] == '{') {
+                const start = i + 1;
+                i = start;
+                while (i < repl.len and std.ascii.isAlphanumeric(repl[i])) i += 1;
+                const name = repl[start..i];
+                if (name.len == 0) return .{ .err = "named capturing group has 0 length name" };
+                if (i == repl.len or repl[i] != '}') return .{ .err = "named capturing group is missing trailing '}'" };
+                if (std.ascii.isDigit(name[0])) return .{ .err = try arena.print("capturing group name {{{s}}} starts with digit character", .{name}) };
+                g = prog.groupIndex(name) orelse return .{ .err = try arena.print("No group with name {{{s}}}", .{name}) };
+                i += 1;
+            } else {
+                if (!std.ascii.isDigit(repl[i])) return .{ .err = "Illegal group reference" };
+                g = repl[i] - '0';
+                i += 1;
+                while (i < repl.len and std.ascii.isDigit(repl[i])) : (i += 1) {
+                    const longer = @as(u64, g) * 10 + (repl[i] - '0');
+                    if (longer > prog.ngroups) break;
+                    g = @intCast(longer);
+                }
+                if (g > prog.ngroups) return .{ .err = try arena.print("No group {d}", .{g}) };
+            }
+            try pieces.append(arena, .{ .group = g });
+        }
+        run = i;
+    }
+    if (run < repl.len) try pieces.append(arena, .{ .text = repl[run..] });
+    return .{ .ok = pieces.items };
+}
+
+/// Java's `Matcher.quoteReplacement`: `s` with a backslash before each
+/// `\` and `$`, so a replacement reads it literally.
+pub fn quoteReplacement(gpa: Allocator, s: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (s) |c| {
+        if (c == '\\' or c == '$') try out.append(gpa, '\\');
+        try out.append(gpa, c);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// Clojure's `print-method` for a pattern: `#"`, the source with each
 /// backslash and the character after it as they are and a bare `"`
 /// escaped (`\E\"\Q` inside `\Q...\E`), then `"`.
@@ -2298,6 +2373,36 @@ test "regex: re-matches needs the whole input and prefers the first such path" {
     try testing.expect(vm.exec("a", 0, 0, true));
     try testing.expect(vm.group(2) == null);
     try testing.expectEqual(@as(?u32, 1), prog.groupIndex("x") orelse 1);
+}
+
+test "regex: a replacement string reads $n, ${name} and escapes as Java's appendReplacement does" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prog = (try compile(a, "(a)(?<year>\\d+)", .{})).ok;
+    const ok = (try parseReplacement(a, &prog, "<$1>${year}\\$$12é")).ok;
+    try testing.expectEqual(@as(usize, 7), ok.len);
+    try testing.expectEqualStrings("<", ok[0].text);
+    try testing.expectEqual(@as(u32, 1), ok[1].group);
+    try testing.expectEqualStrings(">", ok[2].text);
+    try testing.expectEqual(@as(u32, 2), ok[3].group);
+    try testing.expectEqualStrings("$", ok[4].text);
+    try testing.expectEqual(@as(u32, 1), ok[5].group);
+    try testing.expectEqualStrings("2é", ok[6].text);
+    const errors = [_][2][]const u8{
+        .{ "$3", "No group 3" },
+        .{ "x$", "Illegal group reference: group index is missing" },
+        .{ "$x", "Illegal group reference" },
+        .{ "x\\", "character to be escaped is missing" },
+        .{ "${y}", "No group with name {y}" },
+        .{ "${}", "named capturing group has 0 length name" },
+        .{ "${1x}", "capturing group name {1x} starts with digit character" },
+        .{ "${ab", "named capturing group is missing trailing '}'" },
+    };
+    for (errors) |e| try testing.expectEqualStrings(e[1], (try parseReplacement(a, &prog, e[0])).err);
+    const quoted = try quoteReplacement(testing.allocator, "a$1\\b");
+    defer testing.allocator.free(quoted);
+    try testing.expectEqualStrings("a\\$1\\\\b", quoted);
 }
 
 test "regex: a named group is found by name" {
