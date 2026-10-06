@@ -229,8 +229,32 @@
 ; §2b): it rebinds the innermost binding of *a* to v through var-set
 ; and returns v, :not-dynamic outside a dynamic Var, :no-thread-binding
 ; outside any binding of it, and refuses a lexical name at compile
-; time. The root binding never changes here; def is the only root
-; write.
+; time. The root binding never changes here; def and alter-var-root
+; write roots.
+
+; (with-redefs-fn {#'v val ...} f) → calls f with each Var's root set
+; to its value, every root restored on every exit. A root write, not
+; a binding: every caller sees it, and a Var need not be dynamic.
+(defn with-redefs-fn [binding-map func]
+  (let* [root-bind (fn* [m] (reduce-kv (fn* [_ v x] (alter-var-root v (constantly x))) nil m))
+         old-vals (reduce-kv (fn* [m v _] (assoc m v (alter-var-root v identity))) {} binding-map)]
+    (try
+      (root-bind binding-map)
+      (func)
+      (finally (root-bind old-vals)))))
+
+; (with-redefs [name val ...] body...) → body with the roots of the
+; Vars the names resolve to set to the values, as with-redefs-fn.
+(defmacro with-redefs [bindings & body]
+  `(with-redefs-fn
+     (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
+                         (partition 2 bindings)))
+     (fn [] ~@body)))
+
+; The namespace a form is compiled in, as its name symbol: the
+; compiler sets the root before it expands each top-level form, and
+; in-ns when it switches (STDLIB.md §8).
+(def ^:dynamic *ns* 'nexis.core)
 
 ; ============================================================
 ; Function combinators and collection helpers
@@ -677,6 +701,8 @@
 (defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
 (defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
 (defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
+(defn qualified-ident? [x] (boolean (and (ident? x) (namespace x))))
+(defn simple-ident? [x] (and (ident? x) (nil? (namespace x))))
 ; int? and its kin: an integer in Java's long range, as Clojure's are
 ; true of a Long and not a BigInt.
 (defn int? [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
@@ -716,6 +742,18 @@
 ; No rationals (PLAN §23 #10): the rationals are the integers.
 (defn ratio? [_] false)
 (defn rational? [x] (integer? x))
+; No decimals and no instants either (PLAN §4).
+(defn decimal? [_] false)
+(defn inst? [_] false)
+; One integer domain: a BigInt is an integer, so these truncate as long.
+(defn bigint [x] (long x))
+(defn biginteger [x] (long x))
+; Java's bit operations not among the natives.
+(defn bit-and-not [x y & more] (reduce (fn [a b] (bit-and a (bit-not b))) x (cons y more)))
+(defn bit-flip [x n] (if (bit-test x n) (bit-clear x n) (bit-set x n)))
+; A map small enough to keep its insertion order prints in it
+; (docs/CHAMP.md §2), which is what array-map promises.
+(defn array-map [& kvs] (apply hash-map kvs))
 (defn parse-boolean [s]
   (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 
@@ -746,6 +784,17 @@
 ; A namespace is its name symbol.
 (defn the-ns [x] (or (find-ns x) (throw :no-such-namespace)))
 (defn ns-name [x] (the-ns x))
+
+; (var-get v) → the value of the Var v; (find-var 'ns/name) → the Var
+; the qualified symbol names, nil when the namespace has none.
+(defn var-get [v] (if (var? v) (deref v) (throw :kind-mismatch)))
+(defn find-var [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
+
+; (load-string s) → the value of the last form of s, each read and
+; evaluated in turn in the current namespace, as a top-level do runs
+; them; (load-file path) of the file's text.
+(defn load-string [s] (eval (read-string (str "(do " s "\n)"))))
+(defn load-file [path] (load-string (slurp path)))
 
 ; (uuid? x) → whether x is a UUID's canonical text, as random-uuid
 ; and parse-uuid make it.
@@ -819,6 +868,8 @@
 ; ============================================================
 
 (defn newline [] (print "\n"))
+; Every print writes through at once (STDLIB.md §6): nothing to flush.
+(defn flush [] nil)
 (defn print-str [& xs] (with-out-str (apply print xs)))
 (defn println-str [& xs] (with-out-str (apply println xs)))
 (defn prn-str [& xs] (with-out-str (apply prn xs)))

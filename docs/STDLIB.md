@@ -23,8 +23,8 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
    `math_natives` into `nexis.math`, `internal_natives` into
    `nexis.internal`, and `src/nextomic/natives.zig` into `nextomic`.
 3. The embedded sources, each evaluated with its namespace current:
-   `core.nx`, `nextomic.nx`, `test.nx`, `pprint.nx`, `math.nx`,
-   `string.nx`, `set.nx`.
+   `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
+   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -38,7 +38,9 @@ loader's diagnostic.
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
 | `nexis.set` | — | `set.nx` | §4 |
-| `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`) | TOOLING.md §4 |
+| `nexis.walk` | — | `walk.nx` | §4 |
+| `nexis.edn` | — | `edn.nx` | §4 |
+| `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
@@ -54,9 +56,11 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts four Clojure library namespaces:
+`src/loader.zig`) accepts seven Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
-`clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`.
+`clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
+`clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`,
+`clojure.math` → `nexis.math`.
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
@@ -108,7 +112,7 @@ string function panics on one.
 | `parse-double` | 1 | The float a string spells in the grammar Clojure's `parse-double` admits (Java's `Double/valueOf`): control or space bytes around an optional sign and `NaN`, `Infinity`, a decimal with an optional exponent (`"1e3"`, `".5"`, `"5."`) or a hex significand with its binary exponent (`"0x1p3"`), the last two with an optional `f`, `F`, `d` or `D` suffix; anything else nil (`"inf"`, `"nan"`, `"1_000"`, `"0x10"`) | `:kind-mismatch` |
 | `parse-boolean` | 1 | `"true"` and `"false"` to booleans, any other string nil (`core.nx`) | `:kind-mismatch` |
 | `format` | 1+ | Below | Below |
-| `read-string` | 1 | The first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored | `:kind-mismatch`, `:reader-error` (no form, or text that does not read) |
+| `read-string` | 1–2 | `(read-string s)`, `(read-string opts s)`: the first form of the string as data (the reader of `docs/FORMS.md`); text after it is ignored. A string that holds no form (only whitespace, comments and `#_` discards) is the value of `:eof` in the map `opts` when it has that key; other keys are ignored | `:kind-mismatch` (a non-string, or `opts` not a map), `:reader-error` (no form and no `:eof`, a form left open, or text that does not read) |
 | `compare` | 2 | -1, 0 or 1. Of two strings: byte order of their UTF-8, which is code-point order; `sort` and sorted collections use it (the whole order is SORTED.md §6). Only the sign is the contract: Clojure's `compare` of two strings is `String.compareTo`'s difference (`(compare "B" "a")` is -31 there, -1 here) | — |
 
 **`format`.** `(format fmt & args)` is a subset of Java's
@@ -166,6 +170,8 @@ the result and write it once; a `replace` that finds nothing returns
 | `split` | 2–3 | `(split s sep)`, `(split s sep limit)`: a vector of the pieces between occurrences of `sep`, as Clojure's `split` with a pattern that matches only `sep`. With no limit (or 0) trailing empty pieces are dropped (`(split "a,b,," ",")` is `["a" "b"]`, `(split ",," ",")` is `[]`, `(split "" ",")` is `[""]`); a positive limit splits at most `limit − 1` times and keeps the rest whole; a negative one keeps every trailing empty piece. An empty `sep` splits between code points, as Clojure's `#""` does (`(split "abc" "")` is `["a" "b" "c"]`) |
 | `split-lines` | 1 | The lines of `s`, split at `\n` or `\r\n`, trailing empty lines dropped |
 | `join` | 1–2 | `(join coll)`, `(join sep coll)`: the elements of any seqable, each as `str` makes it (nil empty), separated by `sep`: `(join ", " ["a" nil 1])` is `"a, , 1"`; a map joins its entries (`"[:a 1]"`), a string its chars; nil is `""`. A set joins in its iteration order |
+| `replace-first` | 3 | `(replace-first s match replacement)`: the first occurrence of `match` (a string or a char) replaced by `replacement`, else `s` itself; an empty `match` is found at the start (`string.nx`) |
+| `escape` | 2 | `(escape s cmap)`: `s` with each character that `cmap` maps to a non-nil value replaced by that value's text (`str`), the rest kept: `(escape "a<b" {\< "&lt;"})` is `"a&lt;b"` (`string.nx`) |
 | `replace` | 3 | `(replace s match replacement)`: every non-overlapping occurrence of `match`, left to right, replaced; the scan resumes after each match, so `(replace "aaa" "aa" "x")` is `"xa"`. `match` and `replacement` are both strings or both chars (`(replace "a.b" \. \/)`); an empty `match` is found before every code point and at the end (`(replace "ab" "" "-")` is `"-a-b-"`), as Java's `String.replace`. The replacement is literal (`$1` is two characters) |
 
 Errors beyond `:kind-mismatch`: `split` and `replace` validate every
@@ -173,17 +179,17 @@ string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
-Absent from Clojure's `clojure.string`: `replace-first`, `escape`,
-`re-quote-replacement`, and every pattern argument. Full Unicode case
+Absent from Clojure's `clojure.string`: `re-quote-replacement`, and
+every pattern argument. Full Unicode case
 mapping, normalization and grapheme segmentation are absent
 (STRING.md §6).
 
 ---
 
-### 4. `nexis.set`
+### 4. `nexis.set`, `nexis.walk` and `nexis.edn`
 
-Clojure's `clojure.set`, written in `src/stdlib/set.nx` over the
-core collection functions.
+**`nexis.set`** is Clojure's `clojure.set`, written in
+`src/stdlib/set.nx` over the core collection functions.
 
 | Name | Arity | Semantics |
 |---|---|---|
@@ -197,6 +203,40 @@ core collection functions.
 
 `index`, `project`, `join` and `rename` (the relational functions)
 are absent.
+
+**`nexis.walk`** is Clojure's `clojure.walk`, written in
+`src/stdlib/walk.nx`. `walk` rebuilds a form in its own kind: a list
+(every seq is a list, SEMANTICS.md §4) as a list with the form's
+metadata, a record by `conj`ing its walked entries onto it, so it
+keeps its type, and any other collection by pouring the walked
+elements `into` `(empty form)`, so a sorted collection keeps its
+comparator and every collection its metadata. A map's elements are
+its `[k v]` entries, which are vectors (§8 `map-entry?`), so the
+function sees each entry as a vector. A typed vector, like every
+value that is not a collection, is a leaf. The walks recurse on the
+VM's frames, so a form nested past the frame cap is a catchable
+`:stack-overflow`.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `walk` | 3 | `(walk inner outer form)`: `outer` of `form` rebuilt from `inner` of each element, as above; a leaf is `(outer form)` |
+| `postwalk`, `prewalk` | 2 | `f` of every subform: `postwalk` children first, each parent rebuilt from what `f` returned for them; `prewalk` the parent first, walking into what `f` returned |
+| `postwalk-replace`, `prewalk-replace` | 2 | `(postwalk-replace smap form)`: every subform that is a key of `smap` replaced by its value |
+| `keywordize-keys`, `stringify-keys` | 1 | Every string key of every map a keyword; every keyword key its name. A record or sorted map in the form becomes a hash map, as in Clojure |
+| `macroexpand-all` | 1 | Every list in the form `macroexpand`ed, outermost first (a host macro's expansion is the expander's, so `when` gives `(if c (do ...) nil)`) |
+
+`postwalk-demo` and `prewalk-demo` are absent.
+
+**`nexis.edn`** is Clojure's `clojure.edn`, in `src/stdlib/edn.nx`:
+`(read-string s)` and `(read-string opts s)` are `nexis.core`'s
+`read-string` with `{:eof nil}` unless `opts` give an `:eof`, so a
+string with no form is nil, and nil for a nil `s`. Nothing is
+evaluated (the reader has no `#=`). It reads nexis's syntax, which
+EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
+it stands for, where Clojure's EDN reader refuses it, and the reader
+has no tagged literals (PLAN §4), so a tag is a `:reader-error` and
+`:readers` and `:default` have nothing to apply to. There is no `read`
+from a stream.
 
 ---
 
@@ -276,6 +316,7 @@ buffered, so nothing is lost at `exit`). A VM with no `io` throws
 | `print-str`, `println-str`, `prn-str` | 0+ | What `print`, `println`, `prn` would write, as a string (`core.nx`, through `with-out-str`) | — |
 | `printf` | 1+ | `(print (apply format fmt args))` (`core.nx`) | as `format` |
 | `newline` | 0 | `(print "\n")` (`core.nx`) | — |
+| `flush` | 0 | nil: every print writes through at once, so there is nothing to flush (`core.nx`) | — |
 | `with-out-str` | macro | The body's printed output as a string; nothing reaches stdout. Captures nest; a throw discards the buffer and propagates | — |
 | `slurp` | 1 | The whole file at a path (relative to the working directory) as a string; no size cap; the text must be UTF-8 | `:kind-mismatch` (non-string path), `:invalid-path` (empty, or holding a NUL byte), `:file-not-found`, `:utf8-error`, `:io-error` (a directory, a permission, any other failure) |
 | `spit` | 2+ | `(spit path x)` writes `(str x)` (nil: an empty file), replacing the file; `(spit path x :append true)` writes after its end. Parent directories are not created (`db/open` is the one call that creates them). nil | as `slurp`, and `:file-not-found` for a missing parent; `:arity-mismatch` (an odd option list), `:invalid-argument` (an option other than `:append`) |
@@ -346,6 +387,17 @@ a realized list.
 | `type` | 1 | `(or (:type (meta x)) (class x))`, as Clojure's |
 | `instance?` | 2 | `(instance? t x)`: whether `(class x)` is `t`, a keyword or symbol (`(instance? :vector [])`, `(instance? 'user.P p)`); there is no hierarchy, so `(instance? :map p)` of a record is false. Any other `t` is `:kind-mismatch` |
 | `var?` | 1 | Whether `x` is a Var |
+| `var-get` | 1 | The value of the Var (`deref`); a non-Var is `:kind-mismatch` |
+| `find-var` | 1 | `(find-var 'ns/name)`: the Var the qualified symbol names, nil when the namespace has none; `:no-such-namespace` when there is no such namespace |
+| `load-string`, `load-file` | 1 | Read and evaluate each form of the string (of the file's text) in turn in the current namespace, as a top-level `do` runs them through `eval`; the last form's value, nil for none |
+| `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
+| `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
+| `decimal?`, `inst?` | 1 | false: there are no decimals and no instants (PLAN §4) |
+| `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
+| `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
+| `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
+| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included. An unbound Var is left bound to nil. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
+| `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
 | `find-ns`, `the-ns`, `ns-name` | 1 | A namespace is its name symbol: `find-ns` returns the symbol when a namespace has that name, else nil; `the-ns` and `ns-name` return it, else throw `:no-such-namespace`. A non-symbol is `:kind-mismatch` |
 | `all-ns` | 0 | Every namespace's name, sorted |

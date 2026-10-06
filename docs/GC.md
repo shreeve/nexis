@@ -167,7 +167,7 @@ The dispatch in `Collector.trace`:
 | `persistent_map`, `persistent_set` | `champ.traceMap`, `champ.traceSet` | the array-form entries, or the CHAMP trie with interior and collision nodes through `markInternal` |
 | `sorted_map`, `sorted_set` | `sorted.trace` | the comparator, then every tree node through `markInternal` and its key and value through `markValue`, recursing to the tree's height (`docs/SORTED.md` §2) |
 | `transient` | `transient.trace` | the wrapped collection (`docs/TRANSIENT.md` §10) |
-| `atom` | `atom.trace` | the contained value (`docs/ATOM.md` §7) |
+| `atom` | `atom.trace` | the contained value, the validator and the watches map (`docs/ATOM.md` §7) |
 | `record` | `record.trace` | the field map |
 | `nextomic_entity` | `nextomic_handle.traceEntity` | the db-value box and the map of the entity's last full read |
 | `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
@@ -358,11 +358,12 @@ The rule each native follows, by what it holds across a further
 
 1. **An argument, or anything reachable from one**: nothing to do.
    The string natives, the printers, `buildListFromSlice`, `swap-vals!`
-   (its `[old new]` vector is built after the callback, with no safe
-   point in between) and every native that never calls back in.
+   (its `[old new]` vector is built after the last callback, with no
+   safe point in between) and every native that never calls back in.
 2. **Only the next callback's argument**: nothing to do, since
    `callValue` roots it for the call. `reduce`, `reduce-kv`, `swap!`,
-   `alter-meta!`, `db/alter!` and `db/reduce-tree` (its decoded value
+   an atom's validator and its watches (the old and new states are
+   their arguments), `alter-meta!`, `db/alter!` and `db/reduce-tree` (its decoded value
    is the call's argument and is not kept), `some` and `every?`.
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
@@ -379,7 +380,9 @@ The rule each native follows, by what it holds across a further
    builds (a tuple or full-text result bound as one value, an
    aggregate's vector or set); and the Nextomic transaction-function
    hook (`transact`, `with`) for the db-value each call receives and
-   every tx-data a function returns, for the transaction's life.
+   every tx-data a function returns, for the transaction's life; and
+   the atom mutators, for the watches map they run through, which a
+   watch that adds or removes one replaces (`docs/ATOM.md` §4.8).
 4. **Values a native builds itself and keeps across callbacks**: no
    argument reaches them. The iterator over a map, a record or an
    entity builds each `[k v]` entry, and the one over a typed vector

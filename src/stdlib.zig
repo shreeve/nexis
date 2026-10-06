@@ -140,6 +140,10 @@ const embedded = [_]Embedded{
     .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx") } },
     // Sugar over the Nextomic natives (`with-conn`).
     .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx") } },
+    // Clojure's clojure.walk; before test.nx, whose `are` uses it.
+    .{ .ns = "nexis.walk", .info = .{ .path = "walk.nx", .text = @embedFile("stdlib/walk.nx") } },
+    // Clojure's clojure.edn.
+    .{ .ns = "nexis.edn", .info = .{ .path = "edn.nx", .text = @embedFile("stdlib/edn.nx") } },
     // deftest, is, testing, run-tests (docs/TOOLING.md §3).
     .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx") } },
     // pprint, pprint-str (docs/TOOLING.md §4).
@@ -294,7 +298,7 @@ const core_natives = table("", .{
     // The compiler at run time.
     .{ "macroexpand-1", 1, 1, &fnMacroexpand1 },
     .{ "macroexpand", 1, 1, &fnMacroexpand },
-    .{ "read-string", 1, 1, &fnReadString },
+    .{ "read-string", 1, 2, &fnReadString },
     .{ "eval", 1, 1, &fnEval },
     // Metadata (SEMANTICS.md §7).
     .{ "meta", 1, 1, &fnMeta },
@@ -307,6 +311,7 @@ const core_natives = table("", .{
     .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings },
     .{ "var-set", 2, 2, &fnVarSet },
     .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
+    .{ "alter-var-root", 2, null, &fnAlterVarRoot },
     .{ "boolean", 1, 1, &fnBoolean },
     .{ "list?", 1, 1, kindPredicate(isList) },
     .{ "seq?", 1, 1, kindPredicate(isList) },
@@ -381,12 +386,16 @@ const core_natives = table("", .{
     // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
     // or reduced; `db_natives` installs it again as `db/deref`.
     .{ "deref", 1, 1, &fnDbDeref },
-    .{ "atom", 1, 1, &fnAtom },
+    .{ "atom", 1, null, &fnAtom },
     .{ "atom?", 1, 1, &fnAtomQ },
     .{ "reset!", 2, 2, &fnResetBang },
     .{ "swap!", 2, null, &fnSwapBang },
     .{ "swap-vals!", 2, null, &fnSwapValsBang },
     .{ "compare-and-set!", 3, 3, &fnCompareAndSetBang },
+    .{ "set-validator!", 2, 2, &fnSetValidator },
+    .{ "get-validator", 1, 1, &fnGetValidator },
+    .{ "add-watch", 3, 3, &fnAddWatch },
+    .{ "remove-watch", 2, 2, &fnRemoveWatch },
     // satisfies? predicate.
     .{ "satisfies?", 2, 2, &fnSatisfiesQ },
     // Core string ops. Indexing semantics are by Unicode scalar
@@ -466,6 +475,26 @@ const math_natives = table("nexis.math", .{
     .{ "floor", 1, 1, &fnMathFloor },
     .{ "ceil", 1, 1, &fnMathCeil },
     .{ "round", 1, 1, &fnMathRound },
+    .{ "sin", 1, 1, mathOf1(builtinSin) },
+    .{ "cos", 1, 1, mathOf1(builtinCos) },
+    .{ "tan", 1, 1, mathOf1(builtinTan) },
+    .{ "asin", 1, 1, mathOf1(std.math.asin) },
+    .{ "acos", 1, 1, mathOf1(std.math.acos) },
+    .{ "atan", 1, 1, mathOf1(std.math.atan) },
+    .{ "atan2", 2, 2, mathOf2(std.math.atan2) },
+    .{ "sinh", 1, 1, mathOf1(std.math.sinh) },
+    .{ "cosh", 1, 1, mathOf1(std.math.cosh) },
+    .{ "tanh", 1, 1, mathOf1(std.math.tanh) },
+    .{ "exp", 1, 1, mathOf1(builtinExp) },
+    .{ "expm1", 1, 1, mathOf1(std.math.expm1) },
+    .{ "log", 1, 1, mathOf1(builtinLog) },
+    .{ "log10", 1, 1, mathOf1(builtinLog10) },
+    .{ "log1p", 1, 1, mathOf1(std.math.log1p) },
+    .{ "cbrt", 1, 1, mathOf1(std.math.cbrt) },
+    .{ "hypot", 2, 2, mathOf2(std.math.hypot) },
+    .{ "signum", 1, 1, mathOf1(signum) },
+    .{ "to-radians", 1, 1, mathOf1(toRadians) },
+    .{ "to-degrees", 1, 1, mathOf1(toDegrees) },
 });
 
 const internal_natives = table("nexis.internal", .{
@@ -1186,6 +1215,65 @@ fn fnAbs(vm: *VM, args: []const Value) VmError!Value {
 
 fn asDouble(v: Value) VmError!f64 {
     return (try vm_mod.numDouble(v)).asFloat();
+}
+
+/// A `nexis.math` function of one or two doubles, as Java's `Math`
+/// method of its name: any number in, a float out; NaN and the
+/// infinities pass through as IEEE has them, never an error.
+fn mathOf1(comptime f: anytype) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(_: *VM, args: []const Value) VmError!Value {
+            return value_mod.fromFloat(f(@as(f64, try asDouble(args[0]))));
+        }
+    }.call;
+}
+
+fn mathOf2(comptime f: anytype) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(_: *VM, args: []const Value) VmError!Value {
+            return value_mod.fromFloat(f(@as(f64, try asDouble(args[0])), @as(f64, try asDouble(args[1]))));
+        }
+    }.call;
+}
+
+fn builtinSin(x: f64) f64 {
+    return @sin(x);
+}
+
+fn builtinCos(x: f64) f64 {
+    return @cos(x);
+}
+
+fn builtinTan(x: f64) f64 {
+    return @tan(x);
+}
+
+fn builtinExp(x: f64) f64 {
+    return @exp(x);
+}
+
+fn builtinLog(x: f64) f64 {
+    return @log(x);
+}
+
+fn builtinLog10(x: f64) f64 {
+    return @log10(x);
+}
+
+/// Java's `Math/signum`: a zero (either sign) and NaN are themselves,
+/// anything else 1.0 with its sign.
+fn signum(x: f64) f64 {
+    return if (x == 0 or std.math.isNan(x)) x else std.math.copysign(@as(f64, 1.0), x);
+}
+
+/// Java's `Math/toRadians` and `Math/toDegrees`: one multiplication
+/// by the constant Java rounds, so the results are Java's to the bit.
+fn toRadians(x: f64) f64 {
+    return x * 0.017453292519943295;
+}
+
+fn toDegrees(x: f64) f64 {
+    return x * 57.29577951308232;
 }
 
 fn fnMathSqrt(_: *VM, args: []const Value) VmError!Value {
@@ -2730,12 +2818,24 @@ fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
     return form;
 }
 
-/// `(read-string s)` → the first form of `s` as data; a string
-/// that does not read throws `:reader-error`.
+/// `(read-string s)`, `(read-string opts s)` → the first form of `s`
+/// as data. A string that holds no form is the value of `:eof` in the
+/// map `opts` when it has the key, else `:reader-error`, as is text
+/// that does not read (STDLIB.md §2).
 fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .string) return VmError.KindMismatch;
+    const s = args[args.len - 1];
+    const opts = if (args.len == 2) args[0] else value_mod.nilValue();
+    if (s.kind() != .string or (args.len == 2 and opts.kind() != .persistent_map)) return VmError.KindMismatch;
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
-    return try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(args[0]));
+    if (try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(s))) |form| return form;
+    if (args.len == 2) {
+        const eof = vm.ensureInterner().internKeywordValue("eof") catch return VmError.OutOfMemory;
+        switch (champ_mod.mapGet(opts, eof, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+            .present => |v| return v,
+            .absent => {},
+        }
+    }
+    return vm.throwKeyword("reader-error");
 }
 
 /// `(eval form)` → the value of `form` compiled in the current
@@ -2762,12 +2862,12 @@ fn carriesHeaderMeta(k: Kind) bool {
     };
 }
 
-/// `(meta x)` → the metadata map of a list, vector, map, set, record
-/// or Var; nil for anything else or when none is attached.
+/// `(meta x)` → the metadata map of a list, vector, map, set, record,
+/// atom or Var; nil for anything else or when none is attached.
 fn fnMeta(_: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .var_) return VM.asVar(x).meta;
-    if (!carriesHeaderMeta(x.kind())) return value_mod.nilValue();
+    if (!carriesHeaderMeta(x.kind()) and x.kind() != .atom) return value_mod.nilValue();
     const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
     // The metadata is a hash map or, when with-meta was given one, a
     // sorted map.
@@ -2803,13 +2903,22 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
 }
 
-/// `(reset-meta! v m)` → sets the Var's metadata to `m` (a map or
-/// nil) and returns it.
+/// `(reset-meta! r m)` → sets the metadata of the Var or atom `r`
+/// to `m` (a map or nil) in place and returns it.
 fn fnResetMeta(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .var_) return VmError.KindMismatch;
-    if (!args[1].isNil() and args[1].kind() != .persistent_map) return VmError.KindMismatch;
-    try setVarMeta(vm, VM.asVar(args[0]), args[1]);
+    try setRefMeta(vm, args[0], args[1]);
     return args[1];
+}
+
+/// The metadata of a reference, the kinds whose metadata changes in
+/// place (a Var, an atom), as Clojure's `IReference`.
+fn setRefMeta(vm: *VM, r: Value, m: Value) VmError!void {
+    if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
+    switch (r.kind()) {
+        .var_ => try setVarMeta(vm, VM.asVar(r), m),
+        .atom => heap_mod.Heap.asHeapHeader(r).setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m)),
+        else => return VmError.KindMismatch,
+    }
 }
 
 /// Store `m` as `v`'s metadata; `:dynamic true` in it marks the
@@ -2826,19 +2935,17 @@ fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     }
 }
 
-/// `(alter-meta! v f & args)` → sets the Var's metadata to
-/// `(apply f (meta v) args)` and returns it.
+/// `(alter-meta! r f & args)` → sets the metadata of the Var or atom
+/// `r` to `(apply f (meta r) args)` and returns it.
 fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .var_) return VmError.KindMismatch;
-    const v = VM.asVar(args[0]);
+    if (args[0].kind() != .var_ and args[0].kind() != .atom) return VmError.KindMismatch;
     const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
-    call_args[0] = v.meta;
+    call_args[0] = try fnMeta(vm, args[0..1]);
     @memcpy(call_args[1..], args[2..]);
     // The metadata is the call's argument (GC.md §11.5, class 2).
     const next = try vm.callValue(args[1], call_args);
-    if (!next.isNil() and next.kind() != .persistent_map) return VmError.KindMismatch;
-    try setVarMeta(vm, v, next);
+    try setRefMeta(vm, args[0], next);
     return next;
 }
 
@@ -2887,6 +2994,23 @@ fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
     if (!v.thread_bound) return VmError.NoThreadBinding;
     v.thread_value = args[1];
     return args[1];
+}
+
+/// `(alter-var-root v f & args)` → sets the root of the Var `v` to
+/// `(apply f root args)` and returns it; a `binding` in force is left
+/// as it is. An unbound Var's root is nil to `f`, and bound after.
+fn fnAlterVarRoot(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(call_args);
+    call_args[0] = v.root;
+    @memcpy(call_args[1..], args[2..]);
+    // The root is the call's argument (GC.md §11.5, class 2).
+    const next = try vm.callValue(args[1], call_args);
+    v.root = next;
+    v.bound = true;
+    return next;
 }
 
 /// `(thread-bound? v)` → whether a `binding` of `v` is in force.
@@ -4014,57 +4138,104 @@ fn formatFixed(vm: *VM, w: *std.Io.Writer, x: f64, precision: usize) VmError!voi
 // Atoms (see docs/ATOM.md)
 // =============================================================================
 //
-// All six fns enforce identity-equality / identity-hash invariants
-// by going through `atom_mod`'s typed accessors. Re-entrancy is
-// detected via `atom_mod.tryEnterCritical` + a `defer` pairing on
-// `exitCritical` so the flag clears on every exit path — normal
-// return, recoverable VmError, OutOfMemory, ControlTransferred.
-//
-// `vm.callValue` is the reentrant call point (same shape as
-// `fnDbAlter`, `fnApply`, `fnMap`). Rollback-on-throw is ensured
-// by ordering: the atom is written ONLY after `callValue` returns
-// normally (steps 3 → 4 in each function). If `callValue` throws
-// or control-transfers, the write never executes.
+// Each mutator marks the atom in flight (`atom_mod.tryEnterCritical`,
+// cleared by a `defer` on every exit path) while it computes and
+// validates the new state, writes it only after every call back into
+// the VM has returned, then clears the flag and runs the watches
+// (ATOM.md §4). A throw or control transfer before the write leaves
+// the atom unchanged.
 
+/// `(atom init & {:keys [meta validator]})`: a key it does not take
+/// is ignored and a key with no value is `:invalid-argument`, as in
+/// Clojure. The initial value must satisfy the validator.
 fn fnAtom(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    return atom_mod.make(heap, args[0]) catch return VmError.OutOfMemory;
+    const opts = args[1..];
+    if (opts.len % 2 != 0) return VmError.InvalidArgument;
+    const interner = vm.ensureInterner();
+    const meta_key = interner.internKeywordValue("meta") catch return VmError.OutOfMemory;
+    const validator_key = interner.internKeywordValue("validator") catch return VmError.OutOfMemory;
+    var meta = value_mod.nilValue();
+    var validator = value_mod.nilValue();
+    var i: usize = 0;
+    while (i < opts.len) : (i += 2) {
+        if (opts[i].identicalTo(meta_key)) meta = opts[i + 1];
+        if (opts[i].identicalTo(validator_key)) validator = opts[i + 1];
+    }
+    if (!meta.isNil() and meta.kind() != .persistent_map) return VmError.KindMismatch;
+    try validate(vm, validator, args[0]);
+    const a = atom_mod.make(vm.ensureHeap(), args[0]) catch return VmError.OutOfMemory;
+    atom_mod.body(a).validator = validator;
+    if (!meta.isNil()) heap_mod.Heap.asHeapHeader(a).setMeta(heap_mod.Heap.asHeapHeader(meta));
+    return a;
 }
 
 fn fnAtomQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].kind() == .atom);
 }
 
-fn fnResetBang(_: *VM, args: []const Value) VmError!Value {
+/// Clojure's `ARef.validate`: a falsy answer from the validator is
+/// `:invalid-reference-state`; a throw out of it propagates. `state`
+/// is the call's argument, so rooted while the validator runs.
+fn validate(vm: *VM, validator: Value, state: Value) VmError!void {
+    if (validator.isNil()) return;
+    if (!(try vm.callValue(validator, &.{state})).isTruthy()) return vm.throwKeyword("invalid-reference-state");
+}
+
+/// Clojure's `ARef.notifyWatches`: each watch called with
+/// `(key atom old new)` after the change, in the watches map's order.
+/// The map is rooted here, since a watch that adds or removes one
+/// replaces the atom's map; `old` and `new` are every call's
+/// arguments, and nothing collects between two calls (GC.md §11.5).
+fn notifyWatches(vm: *VM, a: Value, old: Value, new: Value) VmError!void {
+    const watches = atom_mod.body(a).watches;
+    if (watches.isNil()) return;
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(watches);
+    var it = champ_mod.mapIter(watches);
+    while (it.next()) |e| _ = try vm.callValue(e.value, &.{ e.key, a, old, new });
+}
+
+fn fnResetBang(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     const new_val = args[1];
     if (a.kind() != .atom) return VmError.KindMismatch;
-    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
-    defer atom_mod.exitCritical(a);
-    atom_mod.setValue(a, new_val);
+    const old = blk: {
+        if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+        defer atom_mod.exitCritical(a);
+        try validate(vm, atom_mod.body(a).validator, new_val);
+        const old = atom_mod.getValue(a);
+        atom_mod.setValue(a, new_val);
+        break :blk old;
+    };
+    try notifyWatches(vm, a, old, new_val);
     return new_val;
 }
 
 /// `(swap! a f & args)` → sets `a` to `(apply f @a args)` and
 /// returns it; `swap-vals!` returns `[old new]`. Nothing is written
-/// when `f` throws or control transfers.
+/// when `f` or the validator throws or control transfers.
 fn swapImpl(vm: *VM, args: []const Value, pair: bool) VmError!Value {
     const a = args[0];
     if (a.kind() != .atom) return VmError.KindMismatch;
-    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
-    defer atom_mod.exitCritical(a);
     const old = atom_mod.getValue(a);
-    const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(call_args);
-    call_args[0] = old;
-    @memcpy(call_args[1..], args[2..]);
-    const new_val = try vm.callValue(args[1], call_args);
-    // `old` is the atom's value, hence rooted, throughout the
-    // callback; the [old new] vector is built after `setValue` with
-    // no safe point in between (a cycle runs only between
-    // instructions, VM.md §9).
-    atom_mod.setValue(a, new_val);
+    const new_val = blk: {
+        if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+        defer atom_mod.exitCritical(a);
+        const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
+        defer vm.allocator.free(call_args);
+        call_args[0] = old;
+        @memcpy(call_args[1..], args[2..]);
+        // `old` is the atom's value, hence rooted, until the write.
+        const new_val = try vm.callValue(args[1], call_args);
+        try validate(vm, atom_mod.body(a).validator, new_val);
+        atom_mod.setValue(a, new_val);
+        break :blk new_val;
+    };
+    try notifyWatches(vm, a, old, new_val);
     if (!pair) return new_val;
+    // No safe point between the last call and this allocation (a
+    // cycle runs only between instructions, VM.md §9).
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ old, new_val }) catch VmError.OutOfMemory;
 }
 
@@ -4076,25 +4247,62 @@ fn fnSwapValsBang(vm: *VM, args: []const Value) VmError!Value {
     return swapImpl(vm, args, true);
 }
 
-fn fnCompareAndSetBang(_: *VM, args: []const Value) VmError!Value {
+/// `identical?` semantics, not structural `=`: bit identity for an
+/// immediate, the same block for a heap value (ATOM.md §4.6). The
+/// new value is validated before the comparison, as in Clojure.
+fn fnCompareAndSetBang(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     const old = args[1];
     const new_val = args[2];
-
     if (a.kind() != .atom) return VmError.KindMismatch;
-    if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
-    defer atom_mod.exitCritical(a);
-
-    // identical? semantics, not structural `=`. Matches Clojure's
-    // documented "identical to oldval" CAS contract. For
-    // immediates, bit-identity. For heap kinds, pointer-identity
-    // (HeapHeader). See ATOM.md §4.6.
-    const current = atom_mod.getValue(a);
-    if (current.tag == old.tag and current.payload == old.payload) {
+    {
+        if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
+        defer atom_mod.exitCritical(a);
+        try validate(vm, atom_mod.body(a).validator, new_val);
+        if (!atom_mod.getValue(a).identicalTo(old)) return value_mod.fromBool(false);
         atom_mod.setValue(a, new_val);
-        return value_mod.fromBool(true);
     }
-    return value_mod.fromBool(false);
+    try notifyWatches(vm, a, old, new_val);
+    return value_mod.fromBool(true);
+}
+
+/// `(set-validator! a f)` → nil once the current value satisfies `f`
+/// (nil removes the validator); a value that does not leaves the old
+/// validator in place.
+fn fnSetValidator(vm: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    try validate(vm, args[1], atom_mod.getValue(a));
+    atom_mod.body(a).validator = args[1];
+    return value_mod.nilValue();
+}
+
+fn fnGetValidator(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .atom) return VmError.KindMismatch;
+    return atom_mod.body(args[0]).validator;
+}
+
+/// `(add-watch a key f)` → `a`, with `f` its watch under `key` (an
+/// `=` key replaces the watch it names).
+fn fnAddWatch(vm: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    const heap = vm.ensureHeap();
+    const b = atom_mod.body(a);
+    const watches = if (b.watches.isNil()) champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory else b.watches;
+    b.watches = try mapPut(heap, watches, args[1], args[2]);
+    return a;
+}
+
+/// `(remove-watch a key)` → `a`, without the watch under `key`.
+fn fnRemoveWatch(vm: *VM, args: []const Value) VmError!Value {
+    const a = args[0];
+    if (a.kind() != .atom) return VmError.KindMismatch;
+    const b = atom_mod.body(a);
+    if (b.watches.isNil()) return a;
+    const rest = champ_mod.mapDissoc(vm.ensureHeap(), b.watches, args[1], &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+    b.watches = if (champ_mod.mapCount(rest) == 0) value_mod.nilValue() else rest;
+    return a;
 }
 
 // =============================================================================
@@ -4852,6 +5060,7 @@ fn fnInNs(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .symbol) return VmError.KindMismatch;
     const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
     registry.switchTo(vm.ensureInterner().symbolName(args[0].asSymbolId())) catch return VmError.OutOfMemory;
+    registry.publishCurrent(vm.ensureInterner()) catch return VmError.OutOfMemory;
     return value_mod.nilValue();
 }
 

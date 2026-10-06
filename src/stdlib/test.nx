@@ -1,7 +1,8 @@
 ; src/stdlib/test.nx — the `nexis.test` namespace (docs/TOOLING.md
-; §3): deftest, is, testing, run-tests and run-all-tests over
-; atoms and throw. Embedded via @embedFile and bootstrapped at VM
-; startup with nexis.test as the current namespace, after core.nx.
+; §3): deftest, is, are, testing, use-fixtures, run-tests and
+; run-all-tests over atoms and throw. Embedded via @embedFile and
+; bootstrapped at VM startup with nexis.test as the current
+; namespace, after core.nx and walk.nx.
 ; The helpers the macros call (register!, check=, check-truthy,
 ; check-thrown, pass!, fail!) are public, since an expansion names
 ; them from the caller's namespace; the rest are private.
@@ -113,12 +114,47 @@
       true
       `(nexis.test/check-truthy '~form ~form ~msg))))
 
+; (are [x y] (= x y) 1 1 2 2) → (do (is (= 1 1)) (is (= 2 2))): the
+; assertion once per group of values, each substituted for the names
+; of argv, as Clojure's are through clojure.template/do-template.
+(defmacro are [argv expr & args]
+  (cond
+    (empty? args) (if (empty? argv) nil (throw (ex-info "The number of args doesn't match are's argv." {})))
+    (or (empty? argv) (not (zero? (mod (count args) (count argv)))))
+    (throw (ex-info "The number of args doesn't match are's argv." {}))
+    :else
+    `(do ~@(map (fn [vals] `(is ~(nexis.walk/postwalk-replace (zipmap argv vals) expr)))
+                (partition (count argv) args)))))
+
 ; (testing "description" body...) → runs body with the description
 ; on the context stack, popped on every exit.
 (defmacro testing [desc & body]
   `(do (swap! nexis.test/contexts conj ~desc)
        (try (do ~@body)
             (finally (swap! nexis.test/contexts pop)))))
+
+; ---- fixtures ----
+
+; namespace name → {:once f :each f}, each the composition of the
+; fixtures use-fixtures gave for that kind.
+(def fixtures (atom {}))
+
+; (compose-fixtures f1 f2) → the fixture that runs f2 inside f1;
+; (join-fixtures fs) → all of fs, the first outermost.
+(defn compose-fixtures [f1 f2]
+  (fn [g] (f1 (fn [] (f2 g)))))
+
+(defn join-fixtures [fs]
+  (reduce compose-fixtures (fn [g] (g)) fs))
+
+; (use-fixtures :once f...) wraps every run of the current namespace's
+; tests; (use-fixtures :each f...) wraps each of its tests. A fixture
+; is a function of the function it wraps, which it calls; a later
+; call for the same kind replaces the earlier.
+(defn use-fixtures [kind & fs]
+  (when-not (contains? #{:once :each} kind) (throw :invalid-argument))
+  (swap! fixtures assoc-in [(nexis.internal/#%current-ns) kind] (join-fixtures fs))
+  nil)
 
 ; ---- running ----
 
@@ -137,8 +173,11 @@
   (reset! counts {:test 0 :pass 0 :fail 0 :error 0})
   (try
     (doseq [n ns-names]
-      (doseq [entry (get @tests n [])]
-        (run-test n entry)))
+      (let* [fx (get @fixtures n)
+             each (get fx :each (fn [g] (g)))]
+        ((get fx :once (fn [g] (g)))
+         (fn [] (doseq [entry (get @tests n [])]
+                  (each (fn [] (run-test n entry))))))))
     (let* [c @counts]
       (emit! (str "Ran " (:test c) " tests containing "
                   (+ (:pass c) (:fail c)) " assertions."))
@@ -154,6 +193,11 @@
 (defn run-tests
   ([] (run-namespaces [(nexis.internal/#%current-ns)]))
   ([ns] (run-namespaces [(name ns)])))
+
+; (successful? summary) → whether a run's summary has no failure and
+; no error.
+(defn successful? [summary]
+  (and (zero? (get summary :fail 0)) (zero? (get summary :error 0))))
 
 ; (run-all-tests) → every namespace that registered a test.
 (defn run-all-tests []

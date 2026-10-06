@@ -229,3 +229,31 @@ test "nexis.math: PI and E" {
     try expectOutput("nexis.math/E", "2.718281828459045");
     try expectOutput("(nexis.math/round (* 2 nexis.math/PI))", "6");
 }
+
+test "nexis.math: the trigonometric, hyperbolic, exponential and logarithmic functions are Java's Math" {
+    try expectOutput(
+        \\[(nexis.math/sin 0) (nexis.math/cos 0) (nexis.math/tan 0) (nexis.math/asin 1) (nexis.math/acos 1) (nexis.math/atan 1) (nexis.math/atan2 1 1) (nexis.math/atan2 0.0 -0.0)
+        \\ (nexis.math/sinh 0) (nexis.math/cosh 0) (nexis.math/tanh 0) (nexis.math/tanh ##Inf) (nexis.math/exp 0) (nexis.math/expm1 0) (nexis.math/log 1) (nexis.math/log10 1000)
+        \\ (nexis.math/log1p 0) (nexis.math/cbrt 27) (nexis.math/cbrt -8) (nexis.math/hypot 3 4)]
+    , "[0.0 1.0 0.0 1.5707963267948966 0.0 0.7853981633974483 0.7853981633974483 3.141592653589793 0.0 1.0 0.0 1.0 1.0 0.0 0.0 3.0 0.0 3.0 -2.0 5.0]");
+    try expectOutput(
+        \\[(nexis.math/sin 1) (nexis.math/cos 1) (nexis.math/tan 1) (nexis.math/acos 0.5) (nexis.math/atan2 1 2)
+        \\ (nexis.math/sinh 1) (nexis.math/cosh 1) (nexis.math/tanh 1) (nexis.math/log 10) (nexis.math/log 2)
+        \\ (nexis.math/exp 2) (nexis.math/cbrt 2) (nexis.math/expm1 1.0E-10) (nexis.math/log1p 1.0E-10)]
+    , "[0.8414709848078965 0.5403023058681398 1.5574077246549023 1.0471975511965979 0.4636476090008061 1.1752011936438014 1.543080634815244 0.7615941559557649 2.302585092994046 0.6931471805599453 7.38905609893065 1.2599210498948732 1.00000000005E-10 9.999999999500001E-11]");
+    // NaN and the infinities as Java gives them: no error.
+    try expectOutput(
+        \\[(nexis.math/log 0) (nexis.math/log -1) (nexis.math/asin 2) (nexis.math/sin ##Inf) (nexis.math/exp 1000)
+        \\ (nexis.math/hypot ##Inf ##NaN) (nexis.math/sinh 1000) (nexis.math/log10 0)]
+    , "[##-Inf ##NaN ##NaN ##NaN ##Inf ##Inf ##Inf ##-Inf]");
+    try expectOutput("(try (nexis.math/sin \"a\") (catch any e e))", ":kind-mismatch");
+}
+
+test "nexis.math: signum, to-radians, to-degrees, floor-div and floor-mod" {
+    try expectOutput("[(nexis.math/signum -2.5) (nexis.math/signum 3) (nexis.math/signum 0) (nexis.math/signum -0.0) (NaN? (nexis.math/signum ##NaN))]", "[-1.0 1.0 0.0 -0.0 true]");
+    try expectOutput("[(nexis.math/to-radians 180) (nexis.math/to-degrees nexis.math/PI) (nexis.math/to-degrees 1) (nexis.math/to-radians 1)]", "[3.141592653589793 180.0 57.29577951308232 0.017453292519943295]");
+    // Of longs, as Java's Math/floorDiv: a float is truncated first.
+    try expectOutput("[(nexis.math/floor-div 7 2) (nexis.math/floor-div -7 2) (nexis.math/floor-div 7 -2) (nexis.math/floor-div -7 -2) (nexis.math/floor-div 7.9 2)]", "[3 -4 -4 3 3]");
+    try expectOutput("[(nexis.math/floor-mod -7 2) (nexis.math/floor-mod 7 -2) (nexis.math/floor-mod 7 2) (nexis.math/floor-div 100000000000000000001 -2)]", "[1 -1 1 -50000000000000000001]");
+    try expectOutput("[(try (nexis.math/floor-div 1 0) (catch any e e)) (try (nexis.math/floor-mod 1 0) (catch any e e))]", "[:divide-by-zero :divide-by-zero]");
+}

@@ -1147,6 +1147,13 @@ test "multi-arity fn: a nested loop in a clause owns its recur, and a wrong-coun
     try expectProgramError("(defn bad ([n] (recur)))", compile.CompileError.RecurArityMismatch);
 }
 
+test "fn: a parameter name repeated binds its last occurrence, as in Clojure" {
+    try expectOutput("[((fn [x x] x) 1 2) ((fn [a & a] a) 1 2) ((fn [_ _ o n] [o n]) 1 2 3 4)]", "[2 (2) [3 4]]");
+    // A closure over the name, and recur, see the last binding too.
+    try expectOutput("[(((fn [x x] (fn [] x)) 1 2)) ((fn [x x] (if (< x 5) (recur x (inc x)) x)) 0 0)]", "[2 5]");
+    try expectOutput("(let [a (atom 0)] (add-watch a :k (fn [_ _ old new] (when (< new 10) (reset! a (+ old new 10))))) (reset! a 1) (remove-watch a :k) @a)", "11");
+}
+
 test "named fn: the name is the function itself inside its body" {
     try expectOutput("((fn f [n] (if (pos? n) (f (dec n)) :done)) 3)", ":done");
     try expectOutput("(let [g (fn f [n] (if (zero? n) 1 (* n (f (dec n)))))] (g 5))", "120");
@@ -1621,6 +1628,22 @@ test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
     try expectOutput("[(random-sample 0 [1 2 3]) (random-sample 1 [1 2 3]) (every? #{1 2 3} (random-sample 0.5 [1 2 3]))]", "[() (1 2 3) true]");
 }
 
+test "core: array-map, bit-and-not, bit-flip, the ident predicates, bigint, decimal?, inst?" {
+    try expectOutput(
+        \\[(array-map) (array-map :a 1 :b 2 :a 3) (bit-and-not 15 4) (bit-and-not 15 4 1) (bit-flip 5 1) (bit-flip 0 63)
+        \\ (qualified-ident? :a/b) (qualified-ident? 'a) (qualified-ident? "a/b") (simple-ident? :a) (simple-ident? 'a/b) (simple-ident? 1)
+        \\ (bigint 1.9) (bigint -2.5) (biginteger 7) (bigint 100000000000000000000) (decimal? 1.0) (inst? 1)]
+    , "[{} {:a 3, :b 2} 11 10 7 -9223372036854775808 true false false true false false 1 -2 7 100000000000000000000 false false]");
+}
+
+test "core: var-get, find-var, load-string" {
+    try expectOutputProgram(
+        \\(def x 4)
+        \\[(var-get #'x) (find-var 'user/x) (find-var 'nexis.core/inc) (find-var 'user/nope) (try (find-var 'nope/x) (catch any e e))
+        \\ (try (var-get 1) (catch any e e)) (load-string "(def zz 2) (+ zz x) ; c") zz (load-string "")]
+    , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
+}
+
 test "core: partitionv, partitionv-all, splitv-at" {
     try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
     try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
@@ -1849,6 +1872,26 @@ test "integration: resolve and ns-resolve name a Var through the namespace's nam
         \\ (ns-resolve 'app.util 'x) (ns-resolve 'app.util 'own) (ns-resolve 'app.util 'inc) (resolve 'when) (@(resolve 'inc) 1)
         \\ (try (resolve "x") (catch any e e)) (try (ns-resolve 'nope 'x) (catch any e e))]
     , "[#'nexis.core/first #'app.util/x #'app.util/x #'app.util/x #'nexis.string/join #'user/own nil nil nil #'app.util/x nil #'nexis.core/inc nil 2 :kind-mismatch :no-such-namespace]");
+}
+
+test "vars: alter-var-root sets a Var's root through a function, beneath a binding too" {
+    try expectOutputProgram("(def x 1) (defn f [] x) [(alter-var-root #'x + 10 5) x (f) (try (alter-var-root 1 inc) (catch any e e))]", "[16 16 16 :kind-mismatch]");
+    try expectOutputProgram("(def ^:dynamic *d* 1) [(binding [*d* 2] [(alter-var-root #'*d* inc) *d*]) *d*]", "[[2 2] 2]");
+    // An unbound Var's root is nil to the function, and bound after.
+    try expectOutputProgram("(def u) [(alter-var-root #'u (constantly 3)) u]", "[3 3]");
+}
+
+test "vars: with-redefs sets roots for its body and restores them on every exit" {
+    try expectOutputProgram("(defn f [] :f) (defn g [] (f)) (def n 1) [(with-redefs [f (fn [] :redef) n 2] [(f) (g) n]) (f) n]", "[[:redef :redef 2] :f 1]");
+    try expectOutputProgram("(defn f [] :f) [(try (with-redefs [f (fn [] :r)] (throw :boom)) (catch any e e)) (f)]", "[:boom :f]");
+    try expectOutputProgram("(def x 1) [(with-redefs-fn {#'x 5} (fn [] x)) x]", "[5 1]");
+    try expectOutput("(with-redefs [rand-int (constantly 4)] (rand-int 100))", "4");
+}
+
+test "vars: *ns* is the current namespace's name symbol where a form is compiled and run; flush is a no-op" {
+    try expectOutputProgram("(ns app.core) (def here *ns*) (defmacro m [] (list 'quote (ns-name *ns*))) [here (= \"app.core\" (str *ns*)) (m) (ns-name *ns*)]", "[app.core true app.core app.core]");
+    try expectOutputProgram("(in-ns 'other) (def a *ns*) (in-ns 'user) [other/a *ns* (do (in-ns 'x) (let [n *ns*] (in-ns 'user) n))]", "[other user x]");
+    try expectOutput("[(flush) (var? #'*ns*) *ns*]", "[nil true user]");
 }
 
 test "integration: a UUID is its canonical string" {
@@ -2935,6 +2978,86 @@ test "atom: @-lowering is not lexically shadowable" {
     // lexical-binding case above is the load-bearing one.
 }
 
+test "atom: a validator refuses a new state with :invalid-reference-state and the atom keeps its value" {
+    try expectOutput(
+        \\(let [a (atom 1 :validator pos?)]
+        \\  [(try (swap! a dec) (catch :invalid-reference-state e e))
+        \\   (try (reset! a 0) (catch any e e))
+        \\   (try (swap-vals! a - 5) (catch any e e))
+        \\   (try (reset-vals! a -1) (catch any e e))
+        \\   (try (compare-and-set! a 99 -1) (catch any e e))
+        \\   (swap! a inc) @a])
+    , "[:invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state 2 2]");
+    try expectOutput("(try (atom -1 :validator pos?) (catch any e e))", ":invalid-reference-state");
+    try expectOutput(
+        \\(let [a (atom 1)]
+        \\  [(try (set-validator! a neg?) (catch any e e)) (get-validator a)
+        \\   (set-validator! a pos?) (= pos? (get-validator a))
+        \\   (set-validator! a nil) (reset! a -5)])
+    , "[:invalid-reference-state nil nil true nil -5]");
+    // A validator's own throw propagates, and nothing is written.
+    try expectOutput("(let [a (atom 1 :validator (fn [x] (if (= x 3) (throw :boom) true)))] [(try (reset! a 3) (catch any e e)) @a])", "[:boom 1]");
+    try expectOutput("(try (set-validator! 1 pos?) (catch any e e))", ":kind-mismatch");
+}
+
+test "atom: watches see key, atom, old and new after every change, and may change the atom" {
+    try expectOutput(
+        \\(let [a (atom 1) l (atom [])]
+        \\  (add-watch a :k (fn [k r o n] (swap! l conj [k (= r a) o n])))
+        \\  (swap! a inc) (reset! a 5) (compare-and-set! a 5 6) (compare-and-set! a 5 7)
+        \\  (swap-vals! a inc) (reset-vals! a 0) (reset! a 0)
+        \\  @l)
+    , "[[:k true 1 2] [:k true 2 5] [:k true 5 6] [:k true 6 7] [:k true 7 0] [:k true 0 0]]");
+    try expectOutput(
+        \\(let [a (atom 0) n (atom 0)]
+        \\  [(= a (add-watch a :x (fn [& _] (swap! n + 1))))
+        \\   (do (add-watch a :y (fn [& _] (swap! n + 10))) (swap! a inc) @n)
+        \\   (do (add-watch a :x (fn [& _] (swap! n + 100))) (swap! a inc) @n)
+        \\   (= a (remove-watch a :y)) (do (swap! a inc) @n)
+        \\   (do (remove-watch a :x) (remove-watch a :absent) (swap! a inc) @n)])
+    , "[true 11 121 true 221 221]");
+    // A watch runs after the change is made, so it may change the
+    // atom again; a throw out of a watch leaves the change made.
+    try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [_ r _o n] (when (< n 5) (swap! r inc)))) (swap! a inc) @a)", "5");
+    try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [& _] (throw :w))) [(try (swap! a inc) (catch any e e)) @a])", "[:w 2]");
+    try expectOutput("[(try (add-watch 1 :k inc) (catch any e e)) (try (remove-watch [] :k) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+}
+
+test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
+    try expectOutput("(let [a (atom 1 :meta {:m 1})] [(meta a) @a])", "[{:m 1} 1]");
+    try expectOutput("(let [a (atom 1)] [(reset-meta! a {:x 1}) (alter-meta! a assoc :y 2) (meta a) (reset-meta! a nil) (meta a)])", "[{:x 1} {:x 1, :y 2} {:x 1, :y 2} nil nil]");
+    // Options in any order; a key `atom` does not take is ignored, as
+    // in Clojure; a key with no value is :invalid-argument.
+    try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} :invalid-reference-state]");
+    try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[:invalid-argument :kind-mismatch]");
+}
+
+test "atom: the values a validator and the watches see stay alive across their calls" {
+    // Every swap! builds a fresh state the atom does not hold while
+    // the validator runs; each callback allocates.
+    try expectOutput(
+        \\(let [a (atom [] :validator (fn [v] (count (vec (range 200))) (vector? v)))
+        \\      seen (atom 0)]
+        \\  (add-watch a :w1 (fn [_k _r o n] (count (vec (range 300))) (when (= (count n) (inc (count o))) (swap! seen inc))))
+        \\  (add-watch a :w2 (fn [_k _r o n] (count (mapv str (range 50))) (swap! seen + (count (str (last n))))))
+        \\  (dotimes [i 200] (swap! a (fn [v] (conj v (str "item-" i)))))
+        \\  [(count @a) (= (nth @a 199) "item-199") @seen])
+    , "[200 true 1690]");
+    // Each watch replaces the atom's watches map, so the map the
+    // mutator is running through is held by nothing else; the
+    // garbage each watch makes is maps of its shape, which reuse its
+    // nodes if they are swept.
+    try expectOutput(
+        \\(let [a (atom 0) calls (atom 0)
+        \\      w (fn w [k r _o _n]
+        \\          (swap! calls inc) (remove-watch r k) (add-watch r k w)
+        \\          (dotimes [_ 20] (reduce (fn [m i] (assoc m i i)) {} (range 8))))]
+        \\  (doseq [k (range 8)] (add-watch a k w))
+        \\  (dotimes [_ 50] (swap! a inc))
+        \\  [@a @calls])
+    , "[50 400]");
+}
+
 test "atom: self-reference does not break equality / count" {
     // An atom holding itself satisfies (= @a a). Pins the
     // GC self-reference safety + cycle behavior at the
@@ -3604,6 +3727,14 @@ test "nexis.string: split: empty delim and non-string args" {
     try expectOutput("(pr-str [(nexis.string/split \"abc\" \"\") (nexis.string/split \"héb\" \"\" -1) (nexis.string/split \"abc\" \"\" 2) (nexis.string/split \"\" \"\")])", "[[\"a\" \"b\" \"c\"] [\"h\" \"é\" \"b\" \"\"] [\"a\" \"bc\"] [\"\"]]");
     try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
+}
+
+test "nexis.string: escape and replace-first, with a literal match" {
+    try expectOutput(
+        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {})
+        \\         (nexis.string/replace-first "a-b-c" "-" "+") (nexis.string/replace-first "abc" \b \x) (nexis.string/replace-first "abc" "z" "y")
+        \\         (nexis.string/replace-first "abc" "" "-") (nexis.string/replace-first "héllo" "l" "L")])
+    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
 }
 
 test "nexis.string: split: returns a vector" {
@@ -5678,6 +5809,36 @@ test "read-string: forms as data, the first form only, errors thrown" {
     try expectOutput("(try (read-string \"\\\\u{110000}\") (catch :reader-error e :bad))", ":bad");
 }
 
+test "read-string: an options map's :eof is the value of a string that holds no form" {
+    try expectOutput(
+        \\[(read-string {:eof :x} "") (read-string {:eof :x} "  ; c\n #_ 1 #_ 'a") (read-string {:eof nil} " ")
+        \\ (read-string {:eof :x :other 1} "1 2") (read-string {} "[2]")]
+    , "[:x :x nil 1 [2]]");
+    // Without :eof, an empty string is a reader error; a form left
+    // open, a prefix or metadata with nothing after it is one even
+    // with :eof, as in Clojure.
+    try expectOutput(
+        \\(mapv (fn [s] (try (read-string {:eof :x} s) (catch :reader-error e :bad))) ["(" "'" "^:k" "#_" ")"])
+    , "[:bad :bad :bad :bad :bad]");
+    try expectOutput(
+        \\[(try (read-string {} "") (catch any e e)) (try (read-string 1 "1") (catch any e e)) (try (read-string {:eof 1} 2) (catch any e e))]
+    , "[:reader-error :kind-mismatch :kind-mismatch]");
+}
+
+test "edn: nexis.edn/read-string reads one value as data and evaluates nothing" {
+    try expectOutput(
+        \\(pr-str [(nexis.edn/read-string "{:a [1 2.5 \"s\" \\c sym nil true #{:k}]} ignored")
+        \\         (nexis.edn/read-string "(+ 1 2)") (nexis.edn/read-string "") (nexis.edn/read-string nil)
+        \\         (nexis.edn/read-string {:eof :done} " ; nothing") (nexis.edn/read-string {:eof :done} nil)])
+    , "[{:a [1 2.5 \"s\" \\c sym nil true #{:k}]} (+ 1 2) nil nil :done nil]");
+    // No tagged literals: a tag is a reader error whatever :readers says.
+    try expectOutput(
+        \\[(try (nexis.edn/read-string "#inst \"2020\"") (catch any e e))
+        \\ (try (nexis.edn/read-string {:readers {'foo inc}} "#foo 1") (catch any e e))
+        \\ (try (nexis.edn/read-string {} "") (catch any e e)) (read-string "[1]")]
+    , "[:reader-error :reader-error :reader-error [1]]");
+}
+
 // =============================================================================
 // eval: a form as data, compiled and run on the calling VM
 // (MACROEXPAND.md §1.2 item 9, COMPILER.md §7)
@@ -6567,15 +6728,35 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     try testing.expectEqualStrings("user", program.registry.current.name);
 }
 
-test "require: clojure.string, clojure.set, clojure.test and clojure.pprint name the nexis namespaces" {
+test "walk: nexis.walk is Clojure's clojure.walk; records and sorted collections keep their kind" {
+    try expectOutputProgram(
+        \\(defrecord P [a b])
+        \\(def bump (fn [x] (if (number? x) (inc x) x)))
+        \\[(nexis.walk/postwalk bump (->P 1 [2 3])) (nexis.walk/postwalk bump (sorted-map-by > 1 2 3 4))
+        \\ (nexis.walk/postwalk identity (sorted-set-by > 1 2 3)) (nexis.walk/prewalk bump '(1 (2 #{3})))
+        \\ (meta (nexis.walk/postwalk identity (with-meta '(1 2) {:a 1}))) (meta (nexis.walk/prewalk identity (with-meta [1 2] {:a 1})))
+        \\ (nexis.walk/walk inc vec [1 2]) (nexis.walk/walk inc identity '(1 2)) (nexis.walk/postwalk bump (i64-vector [1 2]))]
+    , "[#user.P{:a 2, :b [3 4]} {4 5, 2 3} #{3 2 1} (2 (3 #{4})) {:a 1} {:a 1} [2 3] (2 3) #i64[1 2]]");
+    try expectOutput(
+        \\[(nexis.walk/keywordize-keys {"a" {"b" 1} :c [{"d" 2}]}) (nexis.walk/stringify-keys {:a {:b 1} 'c 2})
+        \\ (nexis.walk/postwalk-replace {:a :b} [:a {:a :a} '(:a)]) (nexis.walk/prewalk-replace {[1 2] :x} [[1 2] 3])]
+    , "[{:a {:b 1}, :c [{:d 2}]} {a {b 1}, c 2} [:b {:b :b} (:b)] [:x 3]]");
+    // postwalk visits children before their parent, prewalk the
+    // parent first; a map's entries are visited as [k v] vectors.
+    try expectOutput("(let [l (atom [])] (nexis.walk/postwalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[:a 1 [1] [:a [1]] {:a [1]}]");
+    try expectOutput("(let [l (atom [])] (nexis.walk/prewalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[{:a [1]} [:a [1]] :a [1] 1]");
+    try expectOutput("(nexis.walk/macroexpand-all '(when a (-> b c)))", "(if a (do (c b)) nil)");
+}
+
+test "require: the clojure.* library names reach the nexis namespaces" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
     var files: RequireDir = undefined;
     try files.init(&program, &.{});
     defer files.deinit();
-    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test)) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests))]");
-    try harness.expectResult(&program, "clojure.string", r, "[a,b true]");
+    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w] '[clojure.edn :as edn] '[clojure.math :as m])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1])) (eval '(edn/read-string \"[:e]\")) (eval '(m/signum -3))]");
+    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2] [:e] -1.0]");
 }
 
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {
@@ -6765,6 +6946,37 @@ test "nexis.test: is, testing and a deftest called directly work outside a run" 
     ,
         \\[true false false :ran nil 1 [FAIL in user/t: (= 1 2) expected: 1 actual: 2 Ran 1 tests containing 1 assertions. 1 failures, 0 errors. FAIL: (= 1 2) expected: 1 actual: 2 FAIL (ctx): nil expected: true actual: nil FAIL: (= 1 2) expected: 1 actual: 2]]
     );
+}
+
+test "nexis.test: are substitutes each group of values into its template, as clojure.template does" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest t
+        \\  (nexis.test/are [x y] (= x (inc y)) 2 1 3 2 5 3)
+        \\  (nexis.test/are [s] (string? s) "a" "b"))
+        \\(def r (nexis.test/run-tests))
+        \\[(:pass r) (:fail r) @log (macroexpand-1 '(nexis.test/are [a b] (= a b) 1 1 2 2)) (nexis.test/are [] true)]
+    ,
+        \\[4 1 [FAIL in user/t: (= 5 (inc 3)) expected: 5 actual: 4 Ran 1 tests containing 5 assertions. 1 failures, 0 errors.] (do (nexis.test/is (= 1 1)) (nexis.test/is (= 2 2))) nil]
+    );
+    try expectMacroFailure("", "(nexis.test/are [x y] (= x y) 1 2 3)", "macro are threw The number of args doesn't match are's argv.", "(nexis.test/are [x y] (= x y) 1 2 3)");
+}
+
+test "nexis.test: use-fixtures wraps a namespace's run (:once) and each test (:each); successful? reads a summary" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest a (swap! log conj :a))
+        \\(nexis.test/deftest b (swap! log conj :b))
+        \\(nexis.test/use-fixtures :once (fn [f] (swap! log conj :once) (f) (swap! log conj :once-end)))
+        \\(nexis.test/use-fixtures :each (fn [f] (swap! log conj :outer) (f)) (fn [f] (swap! log conj :inner) (f) (swap! log conj :done)))
+        \\(ns other)
+        \\(nexis.test/deftest c (swap! user/log conj :c))
+        \\(def r (nexis.test/run-all-tests))
+        \\[@user/log (:test r) (nexis.test/successful? r) (nexis.test/successful? {:fail 1 :error 0})
+        \\ (try (nexis.test/use-fixtures :always identity) (catch any e e))]
+    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false :invalid-argument]");
 }
 
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {

@@ -16,8 +16,9 @@
 //! `(ns my.app.foo ...)`, and restores the caller's namespace. A
 //! namespace loads once; a require of one still loading is a cycle.
 //! The namespaces the stdlib installs have no file (`markLoaded`),
-//! and `clojure.string`, `clojure.set`, `clojure.test` and
-//! `clojure.pprint` name their nexis counterparts' Vars.
+//! and the Clojure library namespaces `clojure_names` lists
+//! (`clojure.string` and the rest) name their nexis counterparts'
+//! Vars.
 //!
 //! The expander reaches the loader through `ExpandContext
 //! .load_callback`, so it depends on neither this file nor the
@@ -480,6 +481,9 @@ const clojure_names = [_][2][]const u8{
     .{ "clojure.set", "nexis.set" },
     .{ "clojure.test", "nexis.test" },
     .{ "clojure.pprint", "nexis.pprint" },
+    .{ "clojure.walk", "nexis.walk" },
+    .{ "clojure.edn", "nexis.edn" },
+    .{ "clojure.math", "nexis.math" },
 };
 
 /// `my.app-core.foo` → `my/app_core/foo.nx`. Caller owns the slice.

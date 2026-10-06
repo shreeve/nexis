@@ -369,12 +369,6 @@ pub const CompileError = error{
     /// or an upvalue raises this.
     UnresolvedSymbol,
 
-    /// Two parameter slots in the same `fn*` carry the same
-    /// name. Clojure semantics: not allowed (unlike `let*` where
-    /// sequential bindings can shadow within the same form per
-    /// COMPILER.md §4.3).
-    DuplicateParam,
-
     /// Two bindings in the same `letfn*` group carry the same
     /// name. Unlike `let*` (sequential shadowing allowed),
     /// `letfn*` names are mutually visible — duplicates
@@ -2160,14 +2154,16 @@ pub const RuntimeHooks = struct {
             return failure(v, err, "macro-expansion-failure");
     }
 
-    /// The first form of `source`, as data.
-    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!value_mod.Value {
+    /// The first form of `source`, as data; null when it holds none.
+    fn readStringHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!?value_mod.Value {
         const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
         var arena = std.heap.ArenaAllocator.init(v.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const form = readFirstForm(a, source) catch |err|
-            return failure(v, err, "reader-error");
+        const form = readFirstForm(a, source) catch |err| switch (err) {
+            error.NoForm => return null,
+            else => return failure(v, err, "reader-error"),
+        };
         var ctx = self.context(a, v);
         return expand_mod.formToValue(&ctx, form) catch |err|
             return failure(v, err, "reader-error");
@@ -2179,10 +2175,21 @@ pub const RuntimeHooks = struct {
     /// and the cost is the first form's.
     fn readFirstForm(a: std.mem.Allocator, source: []const u8) !*reader_mod.Form {
         const text = source[0..@min(source.len, reader_mod.max_source_len)];
-        const end = reader_mod.firstFormEnd(text) orelse return error.ReaderFailure;
+        const end = reader_mod.firstFormEnd(text) orelse
+            return if (try holdsNoForm(a, text)) error.NoForm else error.ReaderFailure;
         const p = try reader_mod.parser.parseForm(a, text[0..end]);
         var reader = reader_mod.Reader.init(a, text[0..end]);
         return reader.readOneForm(p.sexp);
+    }
+
+    /// Whether `text`, which has no first form, holds no form at all:
+    /// it reads as a program of none (whitespace, comments and whole
+    /// discards), rather than ending inside one.
+    fn holdsNoForm(a: std.mem.Allocator, text: []const u8) !bool {
+        const p = reader_mod.parser.parseProgram(a, text) catch |err| return if (err == error.OutOfMemory) err else false;
+        var reader = reader_mod.Reader.init(a, text);
+        const forms = reader.readProgram(p.sexp) catch |err| return if (err == error.OutOfMemory) err else false;
+        return forms.len == 0;
     }
 
     /// `(eval form)`: `form_value` as a Form, compiled the way the
@@ -2391,8 +2398,16 @@ fn expandFailure(err: expand_mod.ExpandError, ctx: *const expand_mod.ExpandConte
 /// Clojure's `eval` runs them. Without an interner nothing expands.
 pub fn expandTopLevel(allocator: std.mem.Allocator, form: *const reader_mod.Form, opts: CompileOptions) CompileError!*const reader_mod.Form {
     const interner = opts.interner orelse return form;
+    try publishNamespace(opts, interner);
     var ctx = expandContext(allocator, interner, opts, null);
     return expand_mod.expandHead(&ctx, form) catch |err| expandFailure(err, &ctx, form, opts);
+}
+
+/// `*ns*` names the namespace a form is expanded in
+/// (`NamespaceRegistry.publishCurrent`).
+fn publishNamespace(opts: CompileOptions, interner: *intern_mod.Interner) CompileError!void {
+    const registry = opts.registry orelse return;
+    registry.publishCurrent(interner) catch return CompileError.OutOfMemory;
 }
 
 /// The forms of `(do ...)`; null for any other form.
@@ -2413,6 +2428,7 @@ pub fn compileFormWith(
     opts: CompileOptions,
 ) CompileError!Compiled {
     const interner = opts.interner orelse return compileExpanded(allocator, form, opts);
+    try publishNamespace(opts, interner);
     var ceval_data = CompileEvalData{ .allocator = allocator, .opts = opts };
     var mctx = expandContext(allocator, interner, opts, &ceval_data);
     const expanded = expand_mod.expandForm(&mctx, form) catch |err| return expandFailure(err, &mctx, form, opts);
@@ -3370,11 +3386,6 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     defer parent.allocator.free(names);
     @memcpy(names[0..f.params.len], f.params);
     if (f.rest_param) |rp| names[count - 1] = rp;
-    // A name twice in one parameter list is an error, the rest
-    // parameter included.
-    for (names, 0..) |p, i| {
-        for (names[0..i]) |q| if (std.mem.eql(u8, p, q)) return CompileError.DuplicateParam;
-    }
 
     var self_cell_slot: u12 = 0;
     if (f.self_referenced) {
@@ -3731,8 +3742,6 @@ test "compile errors: each malformed program fails with its variant" {
         .{ .src = "(def)", .err = CompileError.MalformedForm },
         .{ .src = "(def 42 5)", .err = CompileError.ExpectedSymbol },
         .{ .src = "(var)", .err = CompileError.MalformedForm },
-        .{ .src = "(fn* [x x] x)", .err = CompileError.DuplicateParam },
-        .{ .src = "(fn* [a & a] a)", .err = CompileError.DuplicateParam },
         .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = CompileError.DuplicateBinding },
         .{ .src = "(recur)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(loop* [i 0] (let* [x (recur 1)] x))", .err = CompileError.RecurOutsideTail },
@@ -4055,7 +4064,6 @@ test "compile span: an error is reported at the innermost form that raised it" {
         .{ .src = "(fn* [x] (let* [y 1] (+ 1 (recur 2))))", .at = "(recur 2)", .err = CompileError.RecurOutsideTail },
         .{ .src = "(fn* [x] (do 1 (recur 1 2)))", .at = "(recur 1 2)", .err = CompileError.RecurArityMismatch },
         .{ .src = "(do 1 (let* [x 1] (if)))", .at = "(if)", .err = CompileError.MalformedForm },
-        .{ .src = "(let* [f (fn* [a a] a)] f)", .at = "(fn* [a a] a)", .err = CompileError.DuplicateParam },
     };
     for (cases) |c| {
         var span: ?reader_mod.SrcSpan = null;
