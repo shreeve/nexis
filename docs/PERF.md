@@ -64,7 +64,7 @@ the §3 rows.
 | 15 | Serialization | EDN text, Nippy | binary, LEB128 and ZigZag (`docs/CODEC.md`) | smaller, faster than text | §3.5 | measured |
 | 16 | Concurrency tax | CAS and STM throughout | single isolate, single writer | none paid, by design | — | by design |
 | 17 | SIMD | JIT autovectorization of primitive arrays | `nexis.simd` `sum`, `dot`, `scale` over typed vectors (`docs/TYPED_VECTOR.md`) | ahead on bulk numeric work | — | not measured |
-| 18 | Startup | JVM start | native binary | far ahead | §3.11, §3.15 | measured |
+| 18 | Startup | JVM start | native binary, the library loaded from a precompiled image | far ahead | §3.11, §3.15, §3.16 | measured |
 | 19 | Compilation | C1/C2 JIT | bytecode, no specialization, no JIT | behind on sustained compute | §3.8 (nexis only), §3.15 | measured |
 | 20 | Comptime specialization | JIT inlining, escape analysis | CHAMP hashes an immediate key inline; the rest absent (§6) | — | §3.8 | partly absent |
 | 21 | Datalog over datoms | Datomic peer and transactor | Nextomic in process over emdb (`docs/NEXTOMIC.md`) | — | §3.7, §3.11, §3.15 | measured |
@@ -75,7 +75,7 @@ the §3 rows.
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
 §3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5; §3.15 on an Intel Core Ultra 9 185H under Linux;
+an Apple M5, as is §3.16; §3.15 on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -799,6 +799,32 @@ What the database rows say:
   `-Xms1g -Xmx1g`), Datomic Local at 1.1 GB, all at the JDK's default
   heap sizing.
 
+### 3.16 The stdlib image, Apple M5
+
+Startup before and after booting the library from its precompiled
+image instead of its sources (`docs/STDLIB.md` §1): `bin/nexis` built
+at `b0ba2ae` (before) and at `587f87f` (after), 21 interleaved rounds
+of each command under `/usr/bin/time -l`; medians, the instruction
+range in brackets. Provenance: §11.
+
+| Command | Instructions | Cycles | Wall | Resident set |
+|---|---:|---:|---:|---:|
+| `-e nil` before | 48.54 M [48.40–56.23] | 14.24 M | 5.91 ms | 5.96 MB |
+| `-e nil` after | 21.44 M [21.34–25.24] | 6.57 M | 4.07 ms | 3.62 MB |
+| `-e '(+ 1 2)'` before | 48.50 M [48.43–48.92] | 14.11 M | 5.66 ms | 6.00 MB |
+| `-e '(+ 1 2)'` after | 21.48 M [21.39–21.81] | 6.49 M | 3.85 ms | 3.74 MB |
+
+- Loading the image (192 KB: 352 routines, 6,276 instructions, 1,524
+  heap values, 502 names) retires about 2.5 M instructions: the names
+  0.74 M, the namespaces and Vars 0.29 M, the heap values 0.92 M, the
+  routines 0.54 M. Booting the sources retired 29.4 M, about 0.45 M a
+  KB of `.nx`; with the image, library code costs its loading, not
+  its compilation, at every start.
+- The 18.9 M left run before the library: a Zig program on this host
+  whose `main` takes `std.process.Init` retires 17.2 M and does
+  nothing, one whose `main` takes no argument 10.8 M, and
+  `/usr/bin/true` 7.9 M.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -889,6 +915,11 @@ Each lever is a measured change: a before/after from `zig build bench`
   amendment.
 
 **Levers pulled.**
+
+- *The stdlib image* (`docs/STDLIB.md` §1): the build boots the
+  embedded sources once and every binary loads what they left;
+  startup 48.5 → 21.4 M instructions, 5.9 → 4.1 ms, 6.0 → 3.6 MB
+  (§3.16).
 
 - *Commit without a sync by default* (`docs/DB.md` §3.3): §3.11's
   1,000 default-commit transactions 3.42 s → 17.7 ms, the
@@ -1063,3 +1094,4 @@ is one invocation's 30-sample median.
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
 | §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |
+| §3.16, §6 "The stdlib image" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `847c5d8`; shared with concurrent sessions (load average 3.97 at the start, 3.89 at the end) | 2026-10-06 12:22 MDT, speed-b: `bin/nexis` built by `zig build install -Doptimize=fast` at `b0ba2ae` (before) and `587f87f` (after); `cmds.py OUT 21 'A=… -e nil' 'B=… -e nil'` and the same for `-e '(+ 1 2)'`, under `tools/heavy` (1 core); the load phases from a probe build returning after each phase, five runs each, the median; raw results in the revamp ledger (`bench/speed-b/`) |
