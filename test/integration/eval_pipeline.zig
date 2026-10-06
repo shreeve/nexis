@@ -2285,6 +2285,19 @@ test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" 
     try expectOutput("(let [n (atom 0) c (cycle (map (fn [x] (swap! n inc) x) [1 2 3]))] [(take 7 c) @n])", "[(1 2 3 1 2 3 1) 3]");
 }
 
+test "lazy: concat, mapcat, take, drop, take-while, drop-while, partition, partition-all, distinct and dedupe are lazy" {
+    // Expected values from babashka.
+    try expectOutput("[(take 5 (mapcat (fn [x] [x x]) (range))) (take 3 (drop 5 (range))) (take-while neg? (range)) (take 3 (drop-while #(< % 10) (range))) (take 2 (partition 2 (range))) (take 3 (distinct (cycle [1 2 3 1])))]", "[(0 0 1 1 2) (5 6 7) () (10 11 12) ((0 1) (2 3)) (1 2 3)]");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (take 100 (range)))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (filter (fn [x] (swap! n inc) (odd? x)) (concat [1 2 3] (range 100)))) @n)", "3");
+    try expectOutput("[(list? (first (partition 2 [1 2]))) (partition 3 3 [:a] [1 2 3 4]) (partition-all 2 [1 2 3]) (partition 2 1 [1 2 3]) (dedupe [1 1 2 1 1]) (distinct [1 2 1 3]) (take 2 [1 2 3]) (drop 2 [1 2 3]) (drop -1 [1 2]) (take -1 [1 2]) (concat) (concat [1] nil [2 3] (list 4)) (mapcat reverse [[1 2] [3 4]])]", "[false ((1 2 3) (4 :a)) ((1 2) (3)) ((1 2) (2 3)) (1 2 1) (1 2 3) (1 2) (3) (1 2) () () (1 2 3 4) (2 1 4 3)]");
+    try expectOutput("(let [x (lazy-cat [1 2] (do (throw :never) []))] (take 2 x))", "(1 2)");
+    try expectOutput("[(realized? (take 2 [1 2])) (class (drop 1 [1 2])) (count (drop 999990 (range 1000000))) (first (drop 3 (map inc (range))))]", "[false :lazy_seq 10 4]");
+    // A concat nested deep enough to exhaust the stack is the catchable
+    // :stack-overflow when it is walked.
+    try expectOutput("(try (first (reduce concat [] (map vector (range 200000)))) (catch :stack-overflow e :deep))", ":deep");
+}
+
 test "lazy: reduce over an unrealized range allocates nothing" {
     var program: Program = undefined;
     try program.init();

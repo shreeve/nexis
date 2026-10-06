@@ -40,10 +40,6 @@
 (defn- realize-caught [s]
   (try [true (nexis.internal/#%force s)] (catch any e [false e])))
 
-; (drop n coll) → a seq of coll without its first n elements, () when
-; none are left.
-(defn drop [n s]
-  (or (seq (nthrest s n)) (list)))
 
 ; ============================================================
 ; Conditional macros
@@ -586,10 +582,6 @@
           (recur (next s) acc (conj run x) fx)
           (recur (next s) (conj acc (seq run)) [x] fx)))
       (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
-
-; (dedupe coll) → coll without consecutive duplicates.
-(defn dedupe [coll]
-  (or (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)) (list)))
 
 ; (take-nth n coll) → every nth element, starting with the first.
 (defn take-nth [n coll]

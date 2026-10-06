@@ -166,6 +166,7 @@ const core_natives = table("", .{
     .{ "rest", 1, 1, &fnRest },
     .{ "second", 1, 1, &fnSecond },
     .{ "take", 2, 2, &fnTake },
+    .{ "drop", 2, 2, &fnDrop },
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
@@ -249,6 +250,7 @@ const core_natives = table("", .{
     .{ "map-indexed", 2, 2, &fnMapIndexed },
     .{ "keep-indexed", 2, 2, &fnKeepIndexed },
     .{ "distinct", 1, 1, &fnDistinct },
+    .{ "dedupe", 1, 1, &fnDedupe },
     .{ "partition", 2, 4, &fnPartition },
     .{ "partition-all", 2, 3, &fnPartitionAll },
     .{ "interleave", 0, null, &fnInterleave },
@@ -612,21 +614,23 @@ fn fnSecond(vm: *VM, args: []const Value) VmError!Value {
     return nthOfSeq(vm, args[0], 1);
 }
 
-/// `(take n coll)` → a list of the first `n` elements, all of them
-/// when there are fewer; walks no further than `n`. As Clojure's
-/// counts down any integer, a bignum `n` takes all or none.
+/// A count of `take` or `drop`: any integer, negative ones none; a
+/// bignum is all or none, as Clojure's counts one down.
+fn lazyCount(v: Value) VmError!Value {
+    if (v.kind() == .bignum) return value_mod.fromFixnum(if (bignum_mod.isNegative(v)) 0 else value_mod.fixnum_max).?;
+    return value_mod.fromFixnum(@intCast(try requireCount(v))).?;
+}
+
+/// `(take n coll)` → the lazy seq of the first `n` elements, one at a
+/// time (docs/LAZY.md §7).
 fn fnTake(vm: *VM, args: []const Value) VmError!Value {
-    const n: usize = if (args[0].kind() != .bignum)
-        try requireCount(args[0])
-    else if (bignum_mod.isNegative(args[0])) 0 else std.math.maxInt(usize);
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
-    var it = try makeSeqIter(vm, args[1]);
-    while (items.items.len < n) {
-        const x = (try it.next()) orelse break;
-        items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, items.items);
+    return seq_mod.make(vm, seq_mod.op_take, &.{ try lazyCount(args[0]), args[1] });
+}
+
+/// `(drop n coll)` → the lazy seq of `coll` without its first `n`
+/// elements, walked when it is realized.
+fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
+    return seq_mod.make(vm, seq_mod.op_drop, &.{ try lazyCount(args[0]), args[1] });
 }
 
 /// `(some pred coll)` → the first truthy `(pred x)`, else nil;
@@ -2074,37 +2078,22 @@ fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_range_num, &.{ start, end, step });
 }
 
-/// `(concat & colls)` → one list of every element in order.
+/// `(concat & colls)` → the lazy seq of every element in order,
+/// passing a chunked coll's chunks through (docs/LAZY.md §7).
 fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
-    // A map's entries wait on the scope while a later lazy argument's
-    // steps may collect (GC.md §11.5, class 5).
-    const scope = vm.rootScope();
-    defer scope.release();
-    for (args) |c| {
-        var it = try rootedSeqIter(vm, c, scope);
-        while (try it.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, items.items);
+    const heap = vm.ensureHeap();
+    if (args.len == 0) return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), value_mod.nilValue() });
+    // `Heap.alloc` never collects: the list of the later colls needs no
+    // root on its way into the block.
+    const rest = list_mod.fromSlice(heap, args[1..]) catch return VmError.OutOfMemory;
+    return seq_mod.make(vm, seq_mod.op_concat, &.{ args[0], rest });
 }
 
-/// `(mapcat f & colls)` → `(apply concat (map f & colls))`.
+/// `(mapcat f & colls)` → the concatenation of `(map f & colls)`, a
+/// producer over the lazy seq of colls, so an infinite one works.
 fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
     const mapped = try fnMap(vm, args);
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
-    // Walking a lazy part may collect (GC.md §11.5, class 5): the
-    // mapped list and the entries the walk builds wait on the scope.
-    const scope = vm.rootScope();
-    defer scope.release();
-    try scope.push(mapped);
-    var it = try makeSeqIter(vm, mapped);
-    while (try it.next()) |sub| {
-        var parts = try rootedSeqIter(vm, sub, scope);
-        while (try parts.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, items.items);
+    return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), mapped });
 }
 
 /// `(into to from)` → `to` with every element of `from` conj'd;
@@ -2171,76 +2160,31 @@ fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_keep_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
-/// `(distinct coll)` → first occurrences, in order.
+/// `(distinct coll)` → the lazy seq of first occurrences, in order,
+/// one at a time.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
-    var seen: ValueSet = .empty;
-    defer seen.deinit(vm.allocator);
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    var it = try makeSeqIter(vm, args[0]);
-    while (try it.next()) |x| {
-        const entry = seen.getOrPut(vm.allocator, x) catch return VmError.OutOfMemory;
-        if (entry.found_existing) continue;
-        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, results.items);
+    const seen = champ_mod.setEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
+    return seq_mod.make(vm, seq_mod.op_distinct, &.{ args[0], seen });
 }
 
-/// A scratch set of Values under the language's hash and equality,
-/// on the VM allocator; freed when the native returns.
-const ValueSet = std.HashMapUnmanaged(Value, void, struct {
-    pub fn hash(_: @This(), v: Value) u64 {
-        return dispatch_mod.hashValue(v);
-    }
-    pub fn eql(_: @This(), a: Value, b: Value) bool {
-        return dispatch_mod.equal(a, b);
-    }
-}, std.hash_map.default_max_load_percentage);
+/// `(dedupe coll)` → the lazy seq of `coll` without consecutive
+/// duplicates, 32 at a time.
+fn fnDedupe(vm: *VM, args: []const Value) VmError!Value {
+    return seq_mod.make(vm, seq_mod.op_dedupe, &.{ args[0], value_mod.nilValue(), value_mod.fromBool(false) });
+}
 
 /// `(partition n coll)` / `(partition n step coll)` /
-/// `(partition n step pad coll)` → list of n-element lists; a
-/// short tail is dropped unless `pad` supplies its missing
-/// elements. `(partition-all n coll)` / `(partition-all n step
-/// coll)` keeps the short tail.
+/// `(partition n step pad coll)` → the lazy seq of n-element parts; a
+/// short tail is dropped unless `pad` supplies its missing elements.
+/// `(partition-all n coll)` / `(partition-all n step coll)` keeps the
+/// short tail (docs/LAZY.md §7).
 fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
     const n = try requireFixnum(args[0]);
     if (n <= 0) return VmError.InvalidArgument;
     const step: i64 = if (args.len >= 3) try requireFixnum(args[1]) else n;
     if (step <= 0) return VmError.InvalidArgument;
-    const pad: ?Value = if (args.len == 4) args[2] else null;
-    // The source's built entries wait on the scope while a lazy pad
-    // is walked (GC.md §11.5, class 5).
-    const scope = vm.rootScope();
-    defer scope.release();
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
-    var src = try rootedSeqIter(vm, args[args.len - 1], scope);
-    while (try src.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    var pad_items: std.ArrayList(Value) = .empty;
-    defer pad_items.deinit(vm.allocator);
-    if (pad) |pv| try appendSeqValues(vm, pv, &pad_items);
-
-    var groups: std.ArrayList(Value) = .empty;
-    defer groups.deinit(vm.allocator);
-    var group: std.ArrayList(Value) = .empty;
-    defer group.deinit(vm.allocator);
-    const un: usize = @intCast(n);
-    const ustep: usize = @intCast(step);
-    var at: usize = 0;
-    while (at < items.items.len) : (at += ustep) {
-        const end = @min(at + un, items.items.len);
-        group.clearRetainingCapacity();
-        group.appendSlice(vm.allocator, items.items[at..end]) catch return VmError.OutOfMemory;
-        const short = group.items.len < un;
-        if (short and pad != null) {
-            const fill = @min(un - group.items.len, pad_items.items.len);
-            group.appendSlice(vm.allocator, pad_items.items[0..fill]) catch return VmError.OutOfMemory;
-        } else if (short and !all) break;
-        groups.append(vm.allocator, try buildListFromSlice(vm, group.items)) catch return VmError.OutOfMemory;
-        // The padded group is the last, as in Clojure.
-        if (short and pad != null) break;
-    }
-    return try buildListFromSlice(vm, groups.items);
+    const mode: i64 = if (all) 2 else if (args.len == 4) 1 else 0;
+    return seq_mod.make(vm, seq_mod.op_partition, &.{ value_mod.fromFixnum(n).?, value_mod.fromFixnum(step).?, if (args.len == 4) args[2] else value_mod.nilValue(), args[args.len - 1], value_mod.fromFixnum(mode).? });
 }
 
 fn fnPartition(vm: *VM, args: []const Value) VmError!Value {
@@ -2295,36 +2239,14 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     return champ_mod.mapFromEntries(vm.ensureHeap(), entries.items, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
-/// `(take-while pred coll)` / `(drop-while pred coll)`.
-fn whileSplit(vm: *VM, take: bool, pred: Value, coll: Value) VmError!Value {
-    var results: std.ArrayList(Value) = .empty;
-    defer results.deinit(vm.allocator);
-    const scope = vm.rootScope();
-    defer scope.release();
-    var it = try rootedSeqIter(vm, coll, scope);
-    var cb = vm_mod.Callback.init(vm, pred, 1);
-    var dropping = true;
-    while (try it.next()) |x| {
-        if (dropping) {
-            const r = try cb.call(&.{x});
-            if (r.isTruthy()) {
-                if (take) results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-                continue;
-            }
-            dropping = false;
-            if (take) break;
-        }
-        results.append(vm.allocator, x) catch return VmError.OutOfMemory;
-    }
-    return try buildListFromSlice(vm, results.items);
-}
-
+/// `(take-while pred coll)` / `(drop-while pred coll)` → lazy seqs
+/// (docs/LAZY.md §7).
 fn fnTakeWhile(vm: *VM, args: []const Value) VmError!Value {
-    return whileSplit(vm, true, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_take_while, args[0..2]);
 }
 
 fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
-    return whileSplit(vm, false, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_drop_while, args[0..2]);
 }
 
 /// `(butlast coll)` → all but the last element, nil when fewer

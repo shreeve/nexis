@@ -87,6 +87,27 @@ pub const op_repeatedly: u16 = 15;
 /// `(cycle coll)`: `{all, current}`, both seqs of `coll`; `all` is not
 /// nil.
 pub const op_cycle: u16 = 16;
+/// `(concat ...)`, `(mapcat ...)`: `{coll, colls}`, the coll being
+/// walked and the seqable of those after it; a chunked source's chunk
+/// is copied into a chunked cons of its own.
+pub const op_concat: u16 = 17;
+/// `(take n coll)`: `{n, coll}`.
+pub const op_take: u16 = 18;
+/// `(drop n coll)`: `{n, coll}`; the walk runs at realization.
+pub const op_drop: u16 = 19;
+/// `(take-while pred coll)`, `(drop-while pred coll)`: `{pred, coll}`.
+pub const op_take_while: u16 = 20;
+pub const op_drop_while: u16 = 21;
+/// `(partition n step coll)`, with a pad, `partition-all`: `{n, step,
+/// pad, coll, mode}`, mode 0 `partition`, 1 with a pad, 2
+/// `partition-all`.
+pub const op_partition: u16 = 22;
+/// `(distinct coll)`: `{coll, seen}`, `seen` a persistent set, which a
+/// step that throws and runs again finds as it was.
+pub const op_distinct: u16 = 23;
+/// `(dedupe coll)`: `{coll, last, seen-one}`, 32 elements of output at
+/// a time, as Clojure's `sequence` over its transducer.
+pub const op_dedupe: u16 = 24;
 
 const steps = [_]Step{
     stepThunk,
@@ -106,7 +127,186 @@ const steps = [_]Step{
     stepRepeatN,
     stepRepeatedly,
     stepCycle,
+    stepConcat,
+    stepTake,
+    stepDrop,
+    stepTakeWhile,
+    stepDropWhile,
+    stepPartition,
+    stepDistinct,
+    stepDedupe,
 };
+
+fn stepConcat(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    // Empty colls are skipped here; what the walk has passed goes back
+    // into the block, which keeps it reachable while the next is forced.
+    while (true) {
+        a[0] = try seqOf(vm, a[0]);
+        if (!a[0].isNil()) break;
+        a[1] = try seqOf(vm, a[1]);
+        if (a[1].isNil()) return a[1];
+        const fr = firstRest(a[1]);
+        a[0] = fr.first;
+        a[1] = fr.rest;
+    }
+    const s = a[0];
+    const heap = vm.ensureHeap();
+    if (chunkOf(s)) |ch| {
+        const following = try make(vm, op_concat, &.{ ch.after, a[1] });
+        return lazy.chunkedOf(heap, ch.items, following) catch VmError.OutOfMemory;
+    }
+    const fr = firstRest(s);
+    const following = try make(vm, op_concat, &.{ fr.rest, a[1] });
+    return lazy.cons(heap, fr.first, following) catch VmError.OutOfMemory;
+}
+
+fn stepTake(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const n = a[0].asFixnum();
+    if (n <= 0) return value_mod.nilValue();
+    a[1] = try seqOf(vm, a[1]);
+    if (a[1].isNil()) return a[1];
+    const fr = firstRest(a[1]);
+    const more = if (n > 1) try make(vm, op_take, &.{ fixnum(n - 1), fr.rest }) else value_mod.nilValue();
+    return lazy.cons(vm.ensureHeap(), fr.first, more) catch VmError.OutOfMemory;
+}
+
+/// `coll` without its first `n` elements, walking: a list's view and
+/// an unrealized range or repeat jump at once.
+pub fn dropFrom(vm: *VM, coll: Value, n: usize) VmError!Value {
+    if (pureOf(coll)) |p| switch (p) {
+        .range => |r| {
+            const left = rangeCount(r.start, r.end, r.step);
+            if (n >= left) return value_mod.nilValue();
+            return make(vm, op_range, &.{ fixnum(r.start + @as(i64, @intCast(n)) * r.step), fixnum(r.end), fixnum(r.step) });
+        },
+        .repeat => return coll,
+        .repeat_n => |r| {
+            if (n >= r.n) return value_mod.nilValue();
+            return make(vm, op_repeat_n, &.{ fixnum(r.n - @as(i64, @intCast(n))), r.x });
+        },
+        else => {},
+    };
+    var xs = coll;
+    var left = n;
+    while (left > 0) {
+        const s = try seqOf(vm, xs);
+        if (s.isNil()) return s;
+        if (s.kind() == .list) return list_mod.drop(s, left);
+        xs = firstRest(s).rest;
+        left -= 1;
+    }
+    return xs;
+}
+
+fn stepDrop(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    return dropFrom(vm, a[1], @intCast(@max(a[0].asFixnum(), 0)));
+}
+
+fn stepTakeWhile(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    a[1] = try seqOf(vm, a[1]);
+    if (a[1].isNil()) return a[1];
+    const fr = firstRest(a[1]);
+    if (!(try vm.callValue(a[0], &.{fr.first})).isTruthy()) return value_mod.nilValue();
+    const more = try make(vm, op_take_while, &.{ a[0], fr.rest });
+    return lazy.cons(vm.ensureHeap(), fr.first, more) catch VmError.OutOfMemory;
+}
+
+fn stepDropWhile(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    var cb = vm_mod.Callback.init(vm, a[0], 1);
+    while (true) {
+        a[1] = try seqOf(vm, a[1]);
+        if (a[1].isNil()) return a[1];
+        const fr = firstRest(a[1]);
+        if (!(try cb.call(&.{fr.first})).isTruthy()) return a[1];
+        a[1] = fr.rest;
+    }
+}
+
+fn stepPartition(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const n: usize = @intCast(a[0].asFixnum());
+    const mode = a[4].asFixnum();
+    a[3] = try seqOf(vm, a[3]);
+    const s = a[3];
+    if (s.isNil()) return s;
+    // The part's elements reach from `s`; the pad's from the block.
+    var items: std.ArrayList(Value) = .empty;
+    defer items.deinit(vm.allocator);
+    var it = try SeqIter.init(vm, s);
+    while (items.items.len < n) {
+        const x = (try it.next()) orelse break;
+        items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
+    const short = items.items.len < n;
+    if (short and mode == 0) return value_mod.nilValue();
+    if (short and mode == 1) {
+        var pad = try SeqIter.init(vm, a[2]);
+        while (items.items.len < n) {
+            const x = (try pad.next()) orelse break;
+            items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+        }
+    }
+    const after = if (short and mode == 1) value_mod.nilValue() else try dropFrom(vm, s, @intCast(a[1].asFixnum()));
+    // Nothing below runs code, and `Heap.alloc` never collects.
+    const heap = vm.ensureHeap();
+    const elems = list_mod.build(heap, items.items) catch return VmError.OutOfMemory;
+    const part = lazy.realizedWithMeta(heap, elems, null) catch return VmError.OutOfMemory;
+    if (short and mode == 1) return list_mod.cons(heap, part, list_mod.empty(heap) catch return VmError.OutOfMemory) catch VmError.OutOfMemory;
+    const more = try make(vm, op_partition, &.{ a[0], a[1], a[2], after, a[4] });
+    return lazy.cons(heap, part, more) catch VmError.OutOfMemory;
+}
+
+fn stepDistinct(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const heap = vm.ensureHeap();
+    while (true) {
+        a[0] = try seqOf(vm, a[0]);
+        if (a[0].isNil()) return a[0];
+        const fr = firstRest(a[0]);
+        if (champ_mod.setContains(a[1], fr.first, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+            a[0] = fr.rest;
+            continue;
+        }
+        const seen = champ_mod.setConj(heap, a[1], fr.first, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+        const more = try make(vm, op_distinct, &.{ fr.rest, seen });
+        return lazy.cons(heap, fr.first, more) catch VmError.OutOfMemory;
+    }
+}
+
+fn stepDedupe(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const heap = vm.ensureHeap();
+    const c = lazy.allocChunked(heap, lazy.chunk_size) catch return VmError.OutOfMemory;
+    lazy.setScratch(lz, c);
+    const out = lazy.chunkItems(c);
+    // The walk's position and the last element are locals: a step that
+    // throws runs again from the block's own state. Both reach from it.
+    var cur = a[0];
+    var last = a[1];
+    var seen_one = a[2].isTruthy();
+    var n: usize = 0;
+    while (n < out.len) {
+        cur = try seqOf(vm, cur);
+        if (cur.isNil()) break;
+        const fr = firstRest(cur);
+        if (!seen_one or !dispatch_mod.equal(fr.first, last)) {
+            out[n] = fr.first;
+            n += 1;
+            last = fr.first;
+            seen_one = true;
+        }
+        cur = fr.rest;
+    }
+    if (n == 0) return value_mod.nilValue();
+    const more = if (cur.isNil()) cur else try make(vm, op_dedupe, &.{ cur, last, value_mod.fromBool(true) });
+    lazy.finishChunked(c, n, more);
+    return c;
+}
 
 fn stepIterate(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);

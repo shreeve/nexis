@@ -273,6 +273,13 @@ inside a call marks everything (`docs/GC.md`
 | `repeat` | lazy; `(repeat x)` infinite, one cell whose rest is its own block; `(repeat n x)` `()` for `n` at most 0 | no | |
 | `repeatedly` | lazy; infinite without a count | no | each call when its element is first needed |
 | `cycle` | lazy, infinite; `()` of an empty coll | no | `coll`'s seq is taken at the call, as Clojure's |
+| `concat`, `lazy-cat` (macro) | lazy | a chunked coll's chunks, copied | one block per coll or chunk; a concat nested in a concat forces it as it walks, a native recursion per level (the stack guard stops a deep one, `(reduce concat [] ...)`, with `:stack-overflow`) |
+| `mapcat` | lazy | as `concat` | a producer over the lazy seq of `(map f colls)`, so an infinite outer seq works where `(apply concat ...)` would realize it |
+| `take`, `take-while` | lazy | no | |
+| `drop`, `drop-while` | lazy | the source's own cells, after the walk | the walk runs at realization; `drop` of a view or of an unrealized range or repeat jumps at once |
+| `partition`, `partition-all` | lazy | no | each part a realized lazy seq over a list of its elements (Clojure's `(doall (take n s))`), so `list?` of one is false |
+| `distinct` | lazy | no | the elements seen in a persistent set in the block, which a step that throws and runs again finds as it was |
+| `dedupe` | lazy | 32 outputs at a time, as Clojure's `sequence` over its transducer | |
 
 **Chunked sources** are the seqs that hand out a slice of their
 elements and the seq after them without allocating: a vector's view
