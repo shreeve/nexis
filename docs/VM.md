@@ -476,17 +476,17 @@ instruction.
   closure with its fixed arity, where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
   and `callValue` enters a closure the same way; a leaf native within
-  its arity reads its arguments in place (§6); a keyword or symbol
+  its arity reads its arguments in place (§6), and any other native
+  within its arity and `max_native_args` (8) arguments gets them
+  copied to a buffer on the native stack; a keyword or symbol
   called with one or two arguments on a map, a record or nil looks
   itself up in place, as `VM.lookup` does, with no copy and no safe
   point (the key is an immediate, so the lookup neither allocates nor
   walks nested data). `call:return` from any frame but the top-level
   one pops it and continues in the caller, or fills the cell of the
   host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
-  ends the chain. The general `call:call` calls
-  any other native within its arity with its arguments copied to a
-  buffer on the native stack; every other call goes through the
-  general entry of §6, with the same traps.
+  ends the chain. Every other call goes through the general entry of
+  §6, with the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
   comparison wrote (the compiler's lowering of an `if` on a

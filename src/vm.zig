@@ -3796,45 +3796,10 @@ pub const VM = struct {
         }.run;
     }
 
-    /// `call:call` past the fast handler's cases: a native that is not
-    /// a leaf, within its arity and `max_native_args`, is called with
-    /// its arguments copied to a buffer on the native stack; every
-    /// other call, and every call that traps, goes through
-    /// `execCallCall`.
+    /// `call:call` past the fast handler's cases, through the general
+    /// entry of §6 with its traps.
     fn opCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         frame.pc = @intCast(pc);
-        buffered: {
-            if (inst.a.kind != .slot or inst.c.kind != .slot) break :buffered;
-            const call_base: u32 = inst.a.index;
-            const argc: u32 = inst.b.index;
-            if (call_base + 1 + argc > frame.slot_count or inst.c.index >= frame.slot_count) break :buffered;
-            const callee = self.slotAt(frame, inst.a.index).*;
-            if (callee.kind() != .native_fn) break :buffered;
-            const native = asNativeFn(callee);
-            const max: usize = native.max_arity orelse max_native_args;
-            if (native.leaf or argc < native.min_arity or argc > max or argc > max_native_args) break :buffered;
-            const base: usize = @as(usize, frame.base_slot) + call_base + 1;
-            // The arguments are copied off the stack, which the
-            // native may grow by re-entering the VM; the slots keep
-            // them rooted. A whole buffer copies inline where the
-            // stack's capacity covers it.
-            var buf: [max_native_args]Value = undefined;
-            if (base + max_native_args <= self.stack.capacity) {
-                buf = self.stack.items.ptr[base..][0..max_native_args].*;
-            } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
-            countNative(native);
-            const overflows = dispatch_mod.spoilCount();
-            const result = native.call(self, buf[0..argc]) catch |err| {
-                dispatch_mod.rewindSpoils(overflows);
-                return err;
-            };
-            try self.checkDeepData(overflows);
-            // The native may have grown `frames`: the caller is the
-            // current frame again, not necessarily at `frame`.
-            const caller = self.currentFrame();
-            self.slotAt(caller, inst.c.index).* = result;
-            return self.nextSafe(caller);
-        }
         try self.execCallCall(frame, inst);
         // A call pushes a frame or runs a callee to completion, so the
         // loop's frame is still running.
@@ -3995,11 +3960,13 @@ pub const VM = struct {
     }
 
     /// `fastCall` of a leaf native within its arity, on its arguments
-    /// in place: nothing can grow the stack under a leaf.
+    /// in place: nothing can grow the stack under a leaf. Any other
+    /// native goes on to `callBuffered`.
     fn callLeaf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
-        const native = asNativeFn(self.slotAt(frame, inst.a.index).*);
+        const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
+        if (!native.leaf) return @call(out_of_line, callBuffered, .{ self, frame, inst, pc });
         const argc: u32 = inst.b.index;
-        if (!native.leaf or argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst, pc);
+        if (argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
@@ -4007,8 +3974,39 @@ pub const VM = struct {
             else => return err,
         };
         countNative(native);
-        self.slotAt(frame, inst.c.index).* = result;
+        self.verifiedSlot(frame, inst.c).* = result;
         return self.nextSafeAt(frame, pc);
+    }
+
+    /// `callLeaf` of a native that is not a leaf, within its arity and
+    /// `max_native_args` arguments, on a copy of them in a buffer on
+    /// the native stack: it may re-enter the VM and grow the stack,
+    /// whose slots keep them rooted.
+    fn callBuffered(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
+        const argc: u32 = inst.b.index;
+        const max: usize = native.max_arity orelse max_native_args;
+        if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
+        const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
+        frame.pc = @intCast(pc);
+        // A whole buffer copies inline where the stack's capacity
+        // covers it.
+        var buf: [max_native_args]Value = undefined;
+        if (base + max_native_args <= self.stack.capacity) {
+            buf = self.stack.items.ptr[base..][0..max_native_args].*;
+        } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+        countNative(native);
+        const overflows = dispatch_mod.spoilCount();
+        const result = native.call(self, buf[0..argc]) catch |err| {
+            dispatch_mod.rewindSpoils(overflows);
+            return err;
+        };
+        try self.checkDeepData(overflows);
+        // The native may have grown `frames`: the caller is the current
+        // frame again, not necessarily at `frame`.
+        const caller = self.currentFrame();
+        self.slotAt(caller, inst.c.index).* = result;
+        return self.nextSafe(caller);
     }
 
     /// `fastCall` of a keyword or symbol, `(:k m)`, `(:k m d)`, `('s m)`,
