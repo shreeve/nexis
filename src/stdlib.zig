@@ -2174,8 +2174,9 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
     try scope.push(t);
     var it = try makeSeqIter(vm, args[1]);
+    var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
-        const k = try vm.callValue(f, &.{x});
+        const k = try cb.call(&.{x});
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
             const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;

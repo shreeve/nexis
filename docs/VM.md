@@ -298,7 +298,8 @@ the same way (the loader and `eval`).
 
 **Repeated calls.** A native that calls one callee once per element
 with the same argument count (`map` over one collection, `filter`,
-`remove`, `keep`, `reduce`) calls it through a `vm.Callback`, which
+`remove`, `keep`, `reduce`, `group-by`) calls it through a
+`vm.Callback`, which
 makes at its first call the decisions `callValue` makes at every one
 and cannot change between calls from the same place: the callee's
 kind, its arity against the count, and for a closure the stack guard
@@ -306,9 +307,14 @@ kind, its arity against the count, and for a closure the stack guard
 need, since every call starts from the frame depth and stack length
 the first one found. Each later call of a closure writes the
 arguments and nil locals into the window at that stack length, pushes
-the frame built at the first call and runs the loop to its return; a
-call that finds the depth or the length changed goes through
-`callValue`. A leaf native is called as `callValue` calls it, and a
+the frame built at the first call and runs it as the loop would: the
+loop's depth and nesting are set, the safe point of the loop's entry
+taken, and the chain entered at the callee's first instruction, the
+frame the loop's first pass would run, so the pass needs no test. A
+pass that ends without an error has returned; one that ends with an
+error goes on to the loop, which takes the error as its own pass
+would (§8, §12). A call that finds the depth or the length changed
+goes through `callValue`. A leaf native is called as `callValue` calls it, and a
 keyword or symbol given one argument that is a map, a record or nil
 looks itself up in place (§8); any other callee, and any callee whose
 arity the count does not fit, goes through `callValue` every time, so
@@ -461,13 +467,15 @@ instruction.
   one to six registers with `push` and `pop`; no handler there may
   reserve or address stack, and the check lists what each saves.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
-  `callValue` and `runRoutine` until the frame they pushed returns.
-  It enters the chain at the current frame's next instruction, and the
-  chain returns to it only with an error, which it translates to a
-  throw when a handler is in force (§12) or passes on, or once the
-  loop's frame has returned. Only the handlers that can pop or unwind
-  frames or halt (`call:return`, `call:return-nil`, `ctrl:*`) test
-  for that.
+  `callValue` and `runRoutine` until the frame they pushed returns (a
+  `Callback` makes the first pass itself, §6). It enters the chain at
+  the current frame's next instruction, and the chain returns to it
+  only with an error, which it translates to a throw when a handler is
+  in force (§12) or passes on, or once the loop's frame has returned.
+  Only the handlers that can pop or unwind frames or halt
+  (`call:return`, `call:return-nil`, `ctrl:*`) test for that; the
+  return of a frame a host pushed ends the chain without the test,
+  since the host's loop runs at that frame's depth.
 - The handlers of the groups that never push or pop a frame (`mov`,
   `cmp`, `jump`, `var`, `math`, `closure`, `coll`) run against the
   frame the fetch took; `call` and `ctrl` re-derive the current frame,

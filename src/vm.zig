@@ -1208,7 +1208,8 @@ pub const HostCallResult = struct {
     /// The returned value, once the loop is back at the call's depth:
     /// without a return, a throw went past the call.
     fn get(self: *const HostCallResult) VmError!Value {
-        return if (self.done) self.value else VmError.ControlTransferred;
+        if (!self.done) return VmError.ControlTransferred;
+        return self.value;
     }
 };
 
@@ -2234,9 +2235,11 @@ pub const VM = struct {
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
     inline fn gcDue(self: *VM) bool {
-        if (!self.gc_enabled or self.borrowed_heap != null or self.gc_hold != 0) return false;
+        // The counter first: below the limit, as at nearly every safe
+        // point, nothing else is read.
         const h = &(self.heap orelse return false);
-        return h.allocated_since_collect >= self.gc_next_at;
+        if (h.allocated_since_collect < self.gc_next_at) return false;
+        return self.gc_enabled and self.borrowed_heap == null and self.gc_hold == 0;
     }
 
     /// Run one collection cycle over this VM's heap from this VM's
@@ -2655,20 +2658,38 @@ pub const VM = struct {
     /// A `Callback`'s call of its closure, from the depth and stack
     /// length it was prepared at: the arguments go where the window
     /// begins, the locals start nil, the prepared frame is pushed and
-    /// the loop runs until it returns, as `callValue` does.
+    /// runs until it returns, as `callValue`'s would under `loop`. The
+    /// loop's first pass is entered here at the callee's first
+    /// instruction, after the safe point `loop`'s entry is: the frame
+    /// is the one it would run, so the pass needs no test, and a pass
+    /// that ends without an error has returned. Only an error goes on
+    /// to the loop, which takes it as its own pass would.
     fn callPrepared(self: *VM, cb: *const Callback, args: []const Value) VmError!Value {
         const base = cb.base;
-        const slot_count = cb.frame.routine.slot_count;
-        const window = self.stack.items.ptr[base..][0..slot_count];
+        const routine = cb.frame.routine;
+        const window = self.stack.items.ptr[base..][0..routine.slot_count];
         for (args, window[0..args.len]) |arg, *slot| slot.* = arg;
         nilSlots(window[args.len..]);
-        self.stack.items.len = base + slot_count;
+        self.stack.items.len = base + routine.slot_count;
         var result_cell = HostCallResult{};
         self.frames.items.len = cb.depth + 1;
         const frame = &self.frames.items[cb.depth];
         frame.* = cb.frame;
         frame.host_result = &result_cell;
-        try self.loop(cb.depth);
+        const outer = self.loop_depth;
+        self.loop_depth = cb.depth;
+        self.nested_runs += 1;
+        defer {
+            self.loop_depth = outer;
+            self.nested_runs -= 1;
+        }
+        if (self.gcDue()) self.collectGarbage();
+        const first = routine.code[0];
+        if (counting) opcode_counts[opIndex(first)] += 1;
+        fast_table[opIndex(first)](self, frame, first, 1) catch |err| {
+            try self.settle(err);
+            try self.drive();
+        };
         return result_cell.get();
     }
 
@@ -2971,13 +2992,22 @@ pub const VM = struct {
             self.loop_depth = outer;
             self.nested_runs -= 1;
         }
-        while (self.running()) {
-            opEnter(self, self.currentFrame(), undefined, undefined) catch |err| switch (err) {
-                // A native's throw was caught below it: frames and pc
-                // are already at the handler.
-                VmError.ControlTransferred => {},
-                else => try self.handleRuntimeError(err),
-            };
+        try self.drive();
+    }
+
+    /// `loop`'s passes through the chain, at the depth it set.
+    fn drive(self: *VM) VmError!void {
+        while (self.running()) opEnter(self, self.currentFrame(), undefined, undefined) catch |err| try self.settle(err);
+    }
+
+    /// What ends a pass with `err`: the throw a handler takes it as, or
+    /// the error the loop leaves with.
+    inline fn settle(self: *VM, err: VmError) VmError!void {
+        switch (err) {
+            // A native's throw was caught below it: frames and pc are
+            // already at the handler.
+            VmError.ControlTransferred => {},
+            else => try self.handleRuntimeError(err),
         }
     }
 
@@ -4084,8 +4114,10 @@ pub const VM = struct {
             hr.done = true;
             self.stack.items.len = frame.entry_stack_len;
             self.frames.items.len = n - 1;
-            if (!self.running()) return;
-            return self.next(self.currentFrame());
+            // The host runs the loop at the depth it pushed the frame at,
+            // so the frame was the loop's.
+            std.debug.assert(!self.running());
+            return;
         }
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
@@ -7820,6 +7852,48 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
     try testing.expect((try get_k.call(&.{value_mod.nilValue()})).isNil());
     try testing.expect((try get_k.call(&.{fx(5)})).isNil());
     try testing.expectEqual(k, try get_k.call(&.{set}));
+}
+
+test "Callback: an error in the callee is caught where a handler stands, else leaves its frame standing" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] (try (+ x 1) (catch any e e))): the error leaves the
+    // callee's first pass, and the loop runs the catch to the return.
+    const caught_code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.mathAdd(2, sl(0), kn(0)),
+        asm_.tryExit(5),
+        asm_.move(2, 1), // 3: the catch
+        asm_.tryExit(5),
+        asm_.returnSlot(2),
+    };
+    const one = [_]Value{fx(1)};
+    const tries = [_]Try{.{ .catch_pc = 3 }};
+    const caught = Routine{ .code = &caught_code, .consts = &one, .tries = &tries, .slot_count = 3, .fixed_arity = 1, .name = "caught" };
+    var cb = Callback.init(&vm, try vm.allocClosure(&caught, 0), 1);
+    const frames = vm.frames.items.len;
+    try testing.expectEqual(@as(i64, 6), (try cb.call(&.{fx(5)})).asFixnum());
+    const kw = try cb.call(&.{value_mod.nilValue()});
+    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(kw.asKeywordId()));
+    try testing.expectEqual(@as(i64, 8), (try cb.call(&.{fx(7)})).asFixnum());
+    try testing.expectEqual(frames, vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+
+    // (fn [x] (+ x 1)) given nil, with no handler: the error leaves with
+    // the callee's frame standing at the failing instruction, as a run
+    // loop leaves it for the trace.
+    const plain_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const plain = Routine{ .code = &plain_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "plain" };
+    var bad = Callback.init(&vm, try vm.allocClosure(&plain, 0), 1);
+    try testing.expectEqual(@as(i64, 3), (try bad.call(&.{fx(2)})).asFixnum());
+    try testing.expectError(VmError.KindMismatch, bad.call(&.{value_mod.nilValue()}));
+    try testing.expectEqual(frames + 1, vm.frames.items.len);
+    try testing.expectEqual(&plain, vm.frames.items[frames].routine);
+    try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
 }
 
 test "VM dispatch: a native's throw two loops deep reaches the handler below" {
