@@ -6924,6 +6924,37 @@ test "nexis.test: is, testing and a deftest called directly work outside a run" 
     );
 }
 
+test "nexis.test: are substitutes each group of values into its template, as clojure.template does" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest t
+        \\  (nexis.test/are [x y] (= x (inc y)) 2 1 3 2 5 3)
+        \\  (nexis.test/are [s] (string? s) "a" "b"))
+        \\(def r (nexis.test/run-tests))
+        \\[(:pass r) (:fail r) @log (macroexpand-1 '(nexis.test/are [a b] (= a b) 1 1 2 2)) (nexis.test/are [] true)]
+    ,
+        \\[4 1 [FAIL in user/t: (= 5 (inc 3)) expected: 5 actual: 4 Ran 1 tests containing 5 assertions. 1 failures, 0 errors.] (do (nexis.test/is (= 1 1)) (nexis.test/is (= 2 2))) nil]
+    );
+    try expectMacroFailure("", "(nexis.test/are [x y] (= x y) 1 2 3)", "macro are threw The number of args doesn't match are's argv.", "(nexis.test/are [x y] (= x y) 1 2 3)");
+}
+
+test "nexis.test: use-fixtures wraps a namespace's run (:once) and each test (:each); successful? reads a summary" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] nil))
+        \\(nexis.test/deftest a (swap! log conj :a))
+        \\(nexis.test/deftest b (swap! log conj :b))
+        \\(nexis.test/use-fixtures :once (fn [f] (swap! log conj :once) (f) (swap! log conj :once-end)))
+        \\(nexis.test/use-fixtures :each (fn [f] (swap! log conj :outer) (f)) (fn [f] (swap! log conj :inner) (f) (swap! log conj :done)))
+        \\(ns other)
+        \\(nexis.test/deftest c (swap! user/log conj :c))
+        \\(def r (nexis.test/run-all-tests))
+        \\[@user/log (:test r) (nexis.test/successful? r) (nexis.test/successful? {:fail 1 :error 0})
+        \\ (try (nexis.test/use-fixtures :always identity) (catch any e e))]
+    , "[[:once :outer :inner :a :done :outer :inner :b :done :once-end :c] 3 true false :invalid-argument]");
+}
+
 test "nexis.test, nexis.pprint: :refer :all brings the API, not the private helpers" {
     try expectOutputWithFiles(&.{}, "(require '[nexis.test :refer :all]) [(fn? run-tests) (fn? check=) (try (eval 'bump!) (catch any e :unresolved)) (try (eval 'run-namespaces) (catch any e :unresolved))]", "[true true :unresolved :unresolved]");
     try expectOutputWithFiles(&.{}, "(require '[nexis.pprint :refer :all]) [(fn? pprint-str) (try (eval 'layout) (catch any e :unresolved)) (nexis.pprint/pprint-str [1])]", "[true :unresolved [1]]");

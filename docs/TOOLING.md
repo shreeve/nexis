@@ -301,15 +301,31 @@ the private helpers.
   `nexis.test`: `(is (= a 1))` as a function's body is seven
   instructions, the helper, the form, the two values, the message, the
   call and the return (COMPILER.md §4.8).
+- `(are [x y] (= x (f y)) 2 1 3 2)` is `(do (is (= 2 (f 1))) (is
+  (= 3 (f 2))))`: the template once per group of values, each
+  substituted for the names of the vector through
+  `nexis.walk/postwalk-replace`, as Clojure's `are` does through
+  `clojure.template/do-template`. A number of values that is not a
+  multiple of the names' (or values with no names) fails the
+  expansion with Clojure's message; `(are [] true)` is nil.
 - `(testing "description" body...)` pushes the description for the
   extent of `body`, popped on every exit; descriptions nest.
+- `(use-fixtures :once f...)` and `(use-fixtures :each f...)` set the
+  current namespace's fixtures, a later call replacing the earlier of
+  its kind; any other kind is `:invalid-argument`. A fixture is a
+  function of the function it wraps, which it calls: the `:once`
+  fixtures wrap the run of the namespace's tests, the `:each`
+  fixtures each test, the first given outermost
+  (`join-fixtures`, `compose-fixtures`). A fixture's throw is not a
+  test's and propagates out of the run, as in Clojure.
 - `(run-tests)` runs the current namespace's tests in definition
   order, `(run-tests 'my.ns)` a named namespace's, `(run-all-tests)`
   every namespace that registered a test, in first-registration
   order. Each returns `{:test n :pass n :fail n :error n}`: tests
   run, assertions passed, assertions failed, tests that threw. A
   test's throw is caught by `any` and counted as an error; the next
-  test still runs.
+  test still runs. `(successful? summary)` is whether a summary has
+  no failure and no error.
 - Outside a run (at the REPL, or a test function called directly) an
   assertion judges, reports and returns as in one, but counts
   nothing; its report line names only the descriptions in force
