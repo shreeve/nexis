@@ -1,0 +1,3 @@
+nexis: test/golden/cli/invalid-regex.nx:4:19: reader error: :invalid-regex Unclosed group at index 4
+    (println (re-find #"(a|b" "ab"))
+                      ^^^^^^^

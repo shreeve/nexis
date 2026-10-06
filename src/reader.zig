@@ -29,6 +29,7 @@ pub const parser = @import("parser.zig");
 const nexis = @import("nexis.zig");
 const stack = @import("stack.zig");
 const string_mod = @import("string.zig");
+const regex = @import("regex.zig");
 
 pub const Tag = nexis.Tag;
 pub const Sexp = parser.Sexp;
@@ -74,6 +75,10 @@ pub const Datum = union(enum) {
     char: u21,
     /// Decoded UTF-8 bytes (escapes processed). Owned by the reader arena.
     string: []const u8,
+    /// A regex literal's text between `#"` and `"`, with no escape
+    /// processing (a backslash and the byte after it as written),
+    /// borrowed from the source. Checked to compile.
+    regex: []const u8,
     keyword: Name,
     symbol: Name,
     list: []const *Form,
@@ -127,6 +132,8 @@ pub const ErrorKind = enum {
     invalid_utf8,
     /// Nesting deeper than the native stack's budget (`src/stack.zig`).
     nesting_too_deep,
+    /// A regex literal that does not compile (`docs/REGEX.md` §2).
+    invalid_regex,
 };
 
 pub const Error = struct {
@@ -192,13 +199,14 @@ pub const Reader = struct {
             return self.fail(.unknown_reader_construct, sexpSpan(s), null);
         const tag: Tag = items[0].tag;
         switch (tag) {
-            .int, .real, .string, .char, .keyword, .symbol => {
+            .int, .real, .string, .regex, .char, .keyword, .symbol => {
                 const span = tokenSpan(items[1].src);
                 const text = self.source[span.pos..][0..span.len];
                 return switch (tag) {
                     .int => self.readInt(text, span),
                     .real => self.readReal(text, span),
                     .string => self.readString(text, span),
+                    .regex => self.readRegex(text, span),
                     .char => self.readChar(text, span),
                     .keyword => self.readKeyword(text, span),
                     .symbol => self.readSymbol(text, span),
@@ -285,6 +293,29 @@ pub const Reader = struct {
         const body = raw[1 .. raw.len - 1];
         const decoded = try self.decodeStringEscapes(body, span);
         return try self.makeForm(.{ .string = decoded }, span);
+    }
+
+    /// `#"..."`: the text between the quotes as it is, as Clojure's
+    /// `RegexReader` passes it to `Pattern.compile`; compiled once here
+    /// so a bad pattern is a reader error at the literal, its detail
+    /// the compiler's sentence and the code-point index it stopped at.
+    fn readRegex(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
+        const body = text[2 .. text.len - 1];
+        if (!std.unicode.utf8ValidateSlice(body)) return self.fail(.invalid_utf8, span, null);
+        var scratch: std.heap.ArenaAllocator = .init(self.arena.child_allocator);
+        defer scratch.deinit();
+        const compiled = regex.compile(scratch.allocator(), body, .{}) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.StackOverflow => self.fail(.nesting_too_deep, span, null),
+        };
+        switch (compiled) {
+            .ok => return try self.makeForm(.{ .regex = body }, span),
+            .err => |e| {
+                const index = std.unicode.utf8CountCodepoints(body[0..e.offset]) catch e.offset;
+                const detail = try scratch.allocator().print("{s} at index {d}", .{ e.msg, index });
+                return self.fail(.invalid_regex, span, detail);
+            },
+        }
     }
 
     fn readChar(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
@@ -873,7 +904,8 @@ fn writeFormIndent(f: *const Form, w: *std.Io.Writer, indent: u32) std.Io.Writer
         .bigint => |t| try w.print("(bigint {s})", .{t}),
         .real => |r| try writeReal(r, w),
         .char => |c| try writeCharAtom(c, w),
-        .string => |s| try writeStringAtom(s, w),
+        .string => |s| try writeStringAtom("string", s, w),
+        .regex => |s| try writeStringAtom("regex", s, w),
         .keyword => |k| try writeKeywordAtom(k, w),
         .symbol => |s| try writeSymbolAtom(s, w),
         .list => |xs| try writeCompound("list", xs, w, indent),
@@ -968,8 +1000,8 @@ fn writeCharAtom(c: u21, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeByte(')');
 }
 
-fn writeStringAtom(s: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("(string \"");
+fn writeStringAtom(tag: []const u8, s: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.print("({s} \"", .{tag});
     for (s) |b| {
         switch (b) {
             '"' => try w.writeAll("\\\""),
@@ -1524,9 +1556,9 @@ test "##Inf, ##-Inf and ##NaN are the symbolic floats" {
 test "an unsupported construct is one err token, so the parse error names it" {
     const allocator = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "#\"a.*\"", "#\"" }, .{ "##Infinity", "##Infinity" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
-        .{ "::k", "::k" },      .{ "#?(:clj 1)", "#?" },         .{ "# x", "#" },
-        .{ "##inf", "##inf" },  .{ "(##NaN1)", "##NaN1" },
+        .{ "#\"a.*", "#\"" },  .{ "##Infinity", "##Infinity" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
+        .{ "::k", "::k" },     .{ "#?(:clj 1)", "#?" },         .{ "# x", "#" },
+        .{ "##inf", "##inf" }, .{ "(##NaN1)", "##NaN1" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c[0]);
@@ -1535,6 +1567,14 @@ test "an unsupported construct is one err token, so the parse error names it" {
         const span = p.lastError().?.span;
         try std.testing.expectEqualStrings(c[1], c[0][span.start..span.end]);
     }
+}
+
+test "a regex literal keeps its text as written and must compile" {
+    try expectReads("#\"a\\d+\" #\"\\\"\" #\"é\"", "(regex \"a\\\\d+\")\n(regex \"\\\\\\\"\")\n(regex \"\\u{C3}\\u{A9}\")\n");
+    try expectReaderError("#\"(\"", .invalid_regex, "Unclosed group at index 1");
+    try expectReaderError("#\"é{2,1}\"", .invalid_regex, "Illegal repetition range at index 5");
+    try expectReaderError("#\"(?=a)\"", .invalid_regex, "lookahead and lookbehind are not supported at index 0");
+    try expectReaderError("#\"a\xff\"", .invalid_utf8, null);
 }
 
 test "symbols and keywords take any UTF-8 character" {

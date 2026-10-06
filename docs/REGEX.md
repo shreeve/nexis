@@ -404,3 +404,28 @@ fails.
 Each search allocates the engine's scratch space (§1) for its program
 on the VM's allocator and frees it before it returns, so `re-find` on
 a matcher costs O(m·k) memory per call and holds none between calls.
+
+---
+
+### 10. The literal
+
+`#"..."` is the reader's `regex` datum (`docs/FORMS.md` §2, PLAN
+§28.2): the text between `#"` and the closing `"`, with no escape
+processing, as Clojure's `RegexReader` hands it to `Pattern.compile`.
+The scanner (`src/nexis.zig`) runs a regex token as it runs a string,
+a backslash taking the byte after it, so `#"\""` holds `\"` and
+`#"\\"` holds `\\`; an unterminated one is a parse error at its `#"`.
+The reader compiles the text once (`regex.compile`, nothing on the
+heap) and reports one that does not compile as `:invalid-regex` over
+the literal's span, the detail the sentence and the code-point index
+(`Unclosed group at index 1`).
+
+The compiler lifts the datum into a pattern constant of the routine,
+made on the compile heap as a string literal is: each evaluation of
+one `#"a"` returns the same pattern, as Clojure's constant does, and
+two literals in the source are two patterns. `quote` and a macro's
+arguments see a pattern value (`formToValue`), and a macro may return
+a pattern, which becomes the literal of its source again
+(`valueToForm`). `read-string` gives a pattern, and its
+`:reader-error` covers an invalid one. Two regex literals are never
+duplicate keys: `#{#"a" #"a"}` reads, a set of two patterns.

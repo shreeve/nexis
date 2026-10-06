@@ -17,6 +17,7 @@ const seq_mod = @import("seq.zig");
 const expand_mod = @import("expand.zig");
 const heap_mod = @import("heap.zig");
 const string_mod = @import("string.zig");
+const regex_mod = @import("regex.zig");
 const bignum_mod = @import("bignum.zig");
 const stack = @import("stack.zig");
 const list_mod = @import("coll/list.zig");
@@ -1381,6 +1382,20 @@ fn lowerDatum(
             const v = string_mod.fromBytes(h, bytes) catch return CompileError.OutOfMemory;
             break :blk try allocTiny(allocator, .{ .literal = v });
         },
+        // A regex literal is a pattern constant of the routine, as a
+        // string is, so each evaluation of one `#"..."` gives the same
+        // pattern, as Clojure's constant does (docs/REGEX.md §10).
+        .regex => |text| blk: {
+            const h = ctx.heap orelse return CompileError.UnsupportedFeature;
+            const made = regex_mod.make(h, allocator, text) catch |err| return switch (err) {
+                error.OutOfMemory => CompileError.OutOfMemory,
+                error.StackOverflow => CompileError.StackOverflow,
+            };
+            break :blk try allocTiny(allocator, .{ .literal = switch (made) {
+                .ok => |p| p,
+                .err => return CompileError.MalformedForm,
+            } });
+        },
         // `{k1 v1 ...}`, `#{a b}` and `[a b]` as expressions: each
         // item is an expression, evaluated left to right.
         .map => |items| try lowerColl(allocator, .map, items, ctx),
@@ -1600,7 +1615,7 @@ fn buildColl(heap: *heap_mod.Heap, op: vm.CollOp, values: []const Value) !Value 
 fn lowerQuoted(allocator: std.mem.Allocator, payload: *const reader_mod.Form, ctx: LowerCtx) CompileError!*Tiny {
     try stack.check();
     switch (payload.datum) {
-        .nil, .bool_, .int, .bigint, .real, .char, .string, .keyword => return lowerDatum(allocator, payload, ctx),
+        .nil, .bool_, .int, .bigint, .real, .char, .string, .regex, .keyword => return lowerDatum(allocator, payload, ctx),
         .symbol => |name| {
             const interner = ctx.interner orelse return CompileError.UnsupportedFeature;
             const v = interner.internQualifiedSymbol(name.ns, name.name) catch return CompileError.OutOfMemory;

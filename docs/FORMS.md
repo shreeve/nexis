@@ -39,6 +39,7 @@ true, false                          ;; bool
 3.14, 1e9, 1.5e-3                    ;; real    (f64)
 ##Inf, ##-Inf, ##NaN                 ;; real    (the symbolic floats)
 "hello"                              ;; string  (escapes decoded, UTF-8)
+#"a\d+", #"\""                       ;; regex   (the text between the quotes, no escape processing)
 \a, \newline, \u{2603}, \u2603       ;; char    (Unicode scalar)
 :foo, :ns/foo                        ;; keyword
 foo, ns/foo, set!, ->>               ;; symbol
@@ -54,6 +55,11 @@ foo, ns/foo, set!, ->>               ;; symbol
 - `nil`, `true` and `false` lex as symbols and become their own datums.
 - `syntax_quote` is a marker. Auto-qualification, auto-gensym `x#` and
   unquote handling belong to the macroexpander (`MACROEXPAND.md` §5).
+- `regex` holds the text between `#"` and `"` as written: a backslash
+  and the character after it are kept, as Clojure's `RegexReader`
+  passes them to `Pattern.compile`. The reader compiles it once to
+  check it (§3); the compiler lifts it into a pattern constant and
+  `quote` and macros see a pattern value (`docs/REGEX.md` §10).
 - `#'x` has no datum of its own: it reads as the list `(var x)` (§3).
 - `anon_fn` holds the body forms only; `%`, `%1`, `%&` inside stay
   ordinary symbols. The macroexpander rewrites it to `(fn* [%1 ...]
@@ -104,7 +110,10 @@ foo, ns/foo, set!, ->>               ;; symbol
 | `\u041`, `\u00411`, `\uD800`, `\o101`, `\a1`, `\ab`, `\u{D800}`, `\u{110000}` | `:invalid-char-literal`, detail the token |
 | `##Inf`, `##-Inf`, `##NaN` | the reals positive infinity, negative infinity and NaN |
 | `foo/bar/baz`, `:foo/bar/baz` | `:invalid-symbol`, `:invalid-keyword`, detail the token |
-| `#"re"`, `##Infinity`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
+| `#"a\d"` | the `regex` datum of the text `a\d`: a backslash and the character after it are kept as written, so `#"\""` holds `\"` |
+| `#"("`, `#"a{2,1}"`, `#"(?=a)"` | `:invalid-regex`, detail the compiler's sentence and the code-point index in the pattern (`"Unclosed group at index 1"`), the span the literal |
+| `#"abc` with no closing quote | parse error at the `#"` |
+| `##Infinity`, `#?(...)`, `#!`, `::k`, `#%x`, `:` | parse error naming the token (`` unexpected `##Infinity` ``): none is in the reader (`CLOJURE-REVIEW.md` §4) |
 | a form nested past the native stack's budget | `:nesting-too-deep` (`src/stack.zig`) |
 | a source text past 4 GiB (`reader.max_source_len`, 2^32 - 1 bytes) | reader error naming the bound and the size, before a byte is read: positions are `u32` offsets |
 
@@ -132,7 +141,9 @@ set (§5), so `\a1` and `\u041` fail whole.
 **Duplicate detection.** Only literal keys and elements count:
 `{:a 1 (keyword "a") 2}` reads, since the second key is a runtime value.
 Literal equality compares integers by value, `bigint` by text, strings
-byte for byte, keywords and symbols by name. `1` and `1.0` differ
+byte for byte, keywords and symbols by name. A `regex` is equal to
+nothing, so `#{#"a" #"a"}` reads, as in Clojure, where each literal
+is a distinct `Pattern`. `1` and `1.0` differ
 (`(= 1 1.0)` is false, PLAN §23 #11), `:a` and `a` differ, and reals
 compare with `==` except that NaN equals NaN, as `=` has it, so
 `{0.0 x -0.0 y}` and `#{##NaN ##NaN}` are duplicates. Detection
@@ -151,7 +162,7 @@ The pipeline and its one-way stage boundaries (PLAN §5, §28.4;
 | Stage | Input → output | Responsibilities |
 |---|---|---|
 | Parser (`src/parser.zig`, generated from `nexis.grammar`; scanner `src/nexis.zig`) | source → `Sexp` with token spans | Tokenizing and the LALR(1) parse; drops `#_` and its form. No normalization. |
-| Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, every reader error. |
+| Reader (`src/reader.zig`) | `Sexp` → `Form` | §3: typed atoms, spans, metadata merge, `anon_fn`, the `syntax-quote` marker, the `regex` datum and its validation, every reader error. |
 | Macroexpander (`src/expand.zig`) | `Form` → expanded `Form` | Macros to a fixpoint, `syntax-quote`, `anon_fn` → `fn*`, destructuring. A macro receives its arguments only; there is no `&form` or `&env` (PLAN §23 #34). `MACROEXPAND.md`. |
 | Compiler (`src/compile.zig`) | expanded `Form` → Tiny tree → bytecode | Resolves each symbol to a slot, capture, Var or special form in `lowerForm`; there is no separate resolver. `COMPILER.md`. |
 
@@ -171,14 +182,14 @@ deterministic:
   spaces past the parent. There is no width-aware wrapping.
 - Atoms carry their datum tag, so a symbol and a keyword are never
   confused: `nil`, `(bool true)`, `(int N)`, `(bigint N)`, `(real R)`,
-  `(string "S")`, `(char C)`, `(keyword :K)`, `(symbol S)`.
+  `(string "S")`, `(regex "S")`, `(char C)`, `(keyword :K)`, `(symbol S)`.
 - Integers print in decimal whatever the source radix. Reals use Zig's
   `{d}` format (`1e9` prints `1000000000`); NaN and the infinities print
   `+nan`, `+inf`, `-inf`.
 - Chars: the named set `\newline \space \tab \return \formfeed
   \backspace`, printable ASCII as itself (`\a`, `\(`), anything else as
   `\u{HEX}` in uppercase hex.
-- Strings escape `\" \\ \n \t \r`; every other byte outside printable
+- Strings and regexes escape `\" \\ \n \t \r`; every other byte outside printable
   ASCII prints as `\u{HEX}` of that byte, so `"☃"` prints
   `\u{E2}\u{98}\u{83}`. The output is stable; it is not source that
   reads back as the same string.
@@ -249,7 +260,7 @@ These describe the reader as it is; they are not language commitments.
   outside the i48 fixnum range, and every `bigint`, into a bignum
   constant (`COMPILER.md` §4.3).
 - **`#%` names.** The lexer accepts `#` only before `{`, `(`, `_`,
-  `'` and in `##Inf`, `##-Inf`, `##NaN`, so no unqualified symbol a
+  `'`, `"` and in `##Inf`, `##-Inf`, `##NaN`, so no unqualified symbol a
   program writes begins with `#%` and the printer's `#%anon-fn` head
   cannot collide with one. A qualified name reaches the internal
   natives (`nexis.internal/#%make-record`), as `symbol`, `resolve` and

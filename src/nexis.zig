@@ -113,9 +113,12 @@ pub const Lexer = struct {
                             const symbolic = std.mem.eql(u8, t, "##Inf") or std.mem.eql(u8, t, "##-Inf") or std.mem.eql(u8, t, "##NaN");
                             return self.finish(if (symbolic) .real else .err, start, pre);
                         },
+                        // `#"..."`, a regex literal: scanned as a
+                        // string is, the reader keeps its text.
+                        '"' => return self.scanString(start, start + 1, .regex, pre),
                         ' ', '\t', '\r', '\n', ',' => {},
-                        // An unsupported dispatch (`#"`, `#?`) is one
-                        // err token, so the parse error names the
+                        // An unsupported dispatch (`#?`, `#inst`) is
+                        // one err token, so the parse error names the
                         // construct.
                         else => |after| {
                             self.base.pos = start + 2;
@@ -126,7 +129,7 @@ pub const Lexer = struct {
                 }
                 return self.single(.err, start, pre);
             },
-            '"' => return self.scanString(start, pre),
+            '"' => return self.scanString(start, start, .string, pre),
             '\\' => return self.scanChar(start, pre),
             ':' => return self.scanKeyword(start, pre),
             '0'...'9' => return self.scanNumber(start, pre, false),
@@ -188,23 +191,26 @@ pub const Lexer = struct {
         };
     }
 
-    /// A string token runs to the closing `"`, across lines; the reader
-    /// decodes the escapes. An unterminated string is an `err` token of
-    /// its opening quote alone, so the parse error points there.
-    fn scanString(self: *Lexer, start: u32, pre: u8) Token {
+    /// A string token (or a regex token, from the `#` at `start` and
+    /// the quote at `quote`) runs to the closing `"`, across lines, a
+    /// backslash taking the byte after it; the reader decodes the
+    /// escapes. An unterminated one is an `err` token of its opening
+    /// `"` or `#"` alone, so the parse error points there.
+    fn scanString(self: *Lexer, start: u32, quote: u32, cat: TokenCat, pre: u8) Token {
         const src = self.base.source;
-        var pos = start + 1;
+        var pos = quote + 1;
         while (pos < src.len) : (pos += 1) {
             switch (src[pos]) {
                 '"' => {
                     self.base.pos = pos + 1;
-                    return self.finish(.string, start, pre);
+                    return self.finish(cat, start, pre);
                 },
                 '\\' => pos += 1,
                 else => {},
             }
         }
-        return self.single(.err, start, pre);
+        self.base.pos = quote + 1;
+        return self.finish(.err, start, pre);
     }
 
     /// A char token: `\`, one character (a whole UTF-8 sequence, or

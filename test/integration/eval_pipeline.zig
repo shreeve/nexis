@@ -4054,6 +4054,17 @@ test "regex: a pattern is an identity value that prints as #\"...\" and whose st
     try expectOutput("[(try (with-meta (re-pattern \"a\") {}) (catch any e e)) (meta (re-pattern \"a\")) (seqable? (re-pattern \"a\"))]", "[:kind-mismatch nil false]");
 }
 
+test "regex: #\"...\" is a pattern constant; quote, macros and read-string see a pattern value" {
+    try expectOutput(
+        \\(defmacro finder [p] (list 're-find p "xay"))
+        \\(defmacro made [] (re-pattern "b+"))
+        \\(pr-str [(re-find #"\d+" "ab12") #"a\"b" '#"x" (class '#"x") (str #"a\d") (finder #"a") (re-find (made) "abbc")
+        \\         (let [f (fn [] #"a")] (identical? (f) (f))) (= #"a" #"a") (count #{#"a" #"a"}) (count {#"a" 1 #"a" 2})
+        \\         (loop [i 0 ps []] (if (< i 3) (recur (inc i) (conj ps #"z")) (apply identical? (take 2 ps))))
+        \\         (read-string "#\"a+\"") (class (read-string "#\"a+\"")) (try (read-string "#\"(\"") (catch any e e))])
+    , "[\"12\" #\"a\\\"b\" #\"x\" :regex \"a\\\\d\" \"a\" \"bb\" true false 2 2 true #\"a+\" :regex :reader-error]");
+}
+
 test "regex: an invalid pattern throws :invalid-regex with the sentence and the index; a wrong kind is :kind-mismatch" {
     try expectOutput(
         \\(pr-str (for [p ["(" "a{2,1}" "é(" "(?=a)" "a)"]]

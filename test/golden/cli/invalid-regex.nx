@@ -1,0 +1,4 @@
+; A regex literal that does not compile: a reader error at the
+; literal, with the compiler's sentence and the index in the pattern.
+
+(println (re-find #"(a|b" "ab"))

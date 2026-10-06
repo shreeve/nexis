@@ -276,6 +276,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "require-runtime-error.nx" }, .stderr = "require-runtime-error.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "bad-number.nx" }, .stderr = "bad-number.err", .exit_code = 3 },
             .{ .args = &.{ "run", cli ++ "duplicate-key.nx" }, .stderr = "duplicate-key.err", .exit_code = 3 },
+            .{ .args = &.{ "run", cli ++ "invalid-regex.nx" }, .stderr = "invalid-regex.err", .exit_code = 3 },
             .{ .args = &.{ "run", cli ++ "macro-failure.nx" }, .stderr = "macro-failure.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "too-many-locals.nx" }, .stderr = "too-many-locals.err", .exit_code = 4 },
             .{ .args = &.{ "run", cli ++ "bom.nx" }, .stderr = "bom.err", .exit_code = 4 },
