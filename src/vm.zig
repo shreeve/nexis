@@ -850,7 +850,24 @@ pub const NativeFn = struct {
     /// place, unrooted, and skips the stack guard and the overflow
     /// check (VM.md §6).
     leaf: bool = false,
+    /// What a call that is not a leaf call runs instead of `call`: the
+    /// full body of a leaf whose leaf body refuses some receivers with
+    /// `VmError.NeedsReentry` (`nth` of a lazy seq, which may run
+    /// code). A leaf call site re-issues such a call through the
+    /// general path, arguments copied and rooted (VM.md §6).
+    general: ?*const fn (vm: *VM, args: []const Value) VmError!Value = null,
 };
+
+/// What realizing a lazy seq takes, which `src/seq.zig` implements
+/// above this file (docs/LAZY.md §6): set once, when the core natives
+/// are installed.
+pub const LazyOps = struct {
+    force: *const fn (vm: *VM, lz: Value) VmError!Value,
+    realize_spine: *const fn (vm: *VM, x: Value) VmError!void,
+    realize_all: *const fn (vm: *VM, x: Value) VmError!void,
+};
+
+pub var lazy_ops: ?*const LazyOps = null;
 
 /// Unpack the descriptor pointer from a `.native_fn` Value.
 pub fn asNativeFn(v: Value) *const NativeFn {
@@ -1231,6 +1248,11 @@ pub const VmError = error{
     /// loop catches it and continues dispatch (PC + frame state
     /// have already been adjusted by unwindThrow).
     ControlTransferred,
+    /// A leaf native's leaf body refusing a receiver it could only
+    /// handle by running code (`nth` of a lazy seq): the call site
+    /// re-issues the call through the general path, which runs
+    /// `NativeFn.general` (VM.md §6). Never escapes a call site.
+    NeedsReentry,
     /// V-operand resolve (or `var:load-var`) read a Var whose
     /// `bound = false` — the Var was interned (e.g., by a
     /// forward reference in another `defn`) but no `def` has
@@ -1419,7 +1441,9 @@ pub const Callback = struct {
     pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
         std.debug.assert(args.len == self.argc);
         switch (self.mode) {
-            .leaf => if (!self.vm.gcDue()) return asNativeFn(self.callee).call(self.vm, args),
+            .leaf => if (!self.vm.gcDue()) {
+                if (asNativeFn(self.callee).call(self.vm, args)) |r| return r else |err| if (err != VmError.NeedsReentry) return err;
+            },
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
             .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
             .unprepared => return self.prepare(args),
@@ -2314,7 +2338,9 @@ pub const VM = struct {
             // A leaf allocates and cannot collect, so a native calling
             // one per element takes the rooted path below whenever a
             // cycle is due.
-            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) return native.call(self, args);
+            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) {
+                if (native.call(self, args)) |r| return r else |err| if (err != VmError.NeedsReentry) return err;
+            }
         }
         try self.checkNesting();
         if (callee.kind() != .function) {
@@ -2396,7 +2422,7 @@ pub const VM = struct {
                 if (args.len < native.min_arity or args.len > (max orelse args.len)) {
                     return self.arityError(native.name, native.min_arity, max, args.len);
                 }
-                break :blk try native.call(self, args);
+                break :blk try (native.general orelse native.call)(self, args);
             },
             .protocol_fn => try self.dispatchProtocolMethod(callee, args),
             .var_ => try self.callValue(asVar(callee).current() orelse return VmError.UnboundVar, args),
@@ -3363,7 +3389,10 @@ pub const VM = struct {
                         if (argc < native.min_arity or argc > (native.max_arity orelse argc)) break :fast;
                         // Nothing can grow the stack under a leaf, so
                         // it reads its arguments where they are.
-                        const result = try native.call(self, self.stack.items[base..][0..argc]);
+                        const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
+                            VmError.NeedsReentry => break :fast,
+                            else => return err,
+                        };
                         self.slotAt(frame, inst.c.index).* = result;
                         return self.nextSafe(frame);
                     }
@@ -4198,6 +4227,7 @@ pub fn vmErrorToKeywordName(err: VmError) ?[]const u8 {
         VmError.CallBlockOutOfRange,
         VmError.InvalidHandlerState,
         VmError.ControlTransferred,
+        VmError.NeedsReentry,
         => null,
     };
 }

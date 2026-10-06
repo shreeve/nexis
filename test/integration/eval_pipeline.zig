@@ -2171,6 +2171,32 @@ test "integration: cons onto any seqable" {
     try expectOutput("[(cons 1 #{2}) (cons 1 {:a 1}) (cons 1 \"ab\") (cons 0 [1 2]) (cons 0 nil) (cons 0 (list))]", "[(1 2) (1 [:a 1]) (1 a b) (0 1 2) (0) (0)]");
 }
 
+test "lazy: lazy-seq runs its body once, when first walked, and caches what it returned" {
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [1 2])] [(realized? s) (first s) (rest s) @n (realized? s) (seq (lazy-seq nil)) (lazy-seq nil) (= (lazy-seq nil) []) (= (lazy-seq nil) nil) (seq? s) (list? s) (class s)])", "[false 1 (2) 1 true nil () true false true false :lazy_seq]");
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (cons 1 (lazy-seq (swap! n inc) nil)))] [(first s) @n (count s) @n (next s) (rest s) (nth s 0) (nth s 3 :d) (empty? s) (count (lazy-seq nil)) (empty? (lazy-seq nil))])", "[1 1 1 2 nil () 1 :d false 0 true]");
+    try expectOutput("[(coll? (lazy-seq nil)) (sequential? (lazy-seq nil)) (counted? (lazy-seq nil)) (seqable? (lazy-seq nil)) (vector? (lazy-seq nil)) (instance? :lazy_seq (lazy-seq nil))]", "[true true false true false true]");
+    // A body that throws stays unrealized and runs again, as JVM
+    // Clojure 1.12's LazySeq does (babashka's does not).
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x :x 2 false]");
+    // A body may refer to its own seq; one that forces it recurses
+    // until the stack guard stops it.
+    try expectOutput("(do (def s (lazy-seq (cons 1 s))) (take 3 s))", "(1 1 1)");
+    try expectOutput("(do (def t (lazy-seq (seq t))) (try (seq t) (catch :stack-overflow e :deep)))", ":deep");
+    try expectOutput("(do (def u (lazy-seq u)) [(seq u) (count u)])", "[nil 0]");
+    // nth is a leaf; over a lazy seq it is re-issued as a full call.
+    try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
+    try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+}
+
+test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
+    try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");
+    try expectOutput("(let [s (with-meta (lazy-seq [1 2]) {:m 1})] [(meta s) s (meta (rest s)) (meta (next s)) (= s [1 2])])", "[{:m 1} (1 2) nil nil true]");
+    try expectOutput("(let [n (atom 0) f (fn f [i] (lazy-seq (swap! n inc) (when (< i 5) (cons i (f (inc i)))))) s (f 0)] [(realized? s) (do (dorun 2 s) @n) (identical? s (doall s)) @n (dorun s) (doall 2 [1 2 3])])", "[false 3 true 6 nil [1 2 3]]");
+    try expectOutput("(take 4 (lazy-cat [1 2] [3] (list 4 5)))", "(1 2 3 4)");
+    try expectOutput("[(realized? (delay 1)) (let [d (delay 1)] @d (realized? d)) (try (realized? 1) (catch any e e))]", "[false true :kind-mismatch]");
+}
+
 test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get {:a 1} :a)", "1");
     try expectOutput("(get {:a 1} :missing)", "nil");
@@ -5958,14 +5984,7 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     program.v.setGcPolicy(.stress);
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, last_result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, last_result, expected);
 }
 
 /// Every callback of these programs allocates a few kilobytes of
@@ -5988,6 +6007,25 @@ test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive c
     try expectOutputUnderGc(churn ++ "(apply max-key (fn [x] (churn x) (count (str x))) (range 30))", "29");
     try expectOutputUnderGc(churn ++ "(count (repeatedly 30 (fn [] (churn 1) (str \"r\"))))", "30");
     try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
+}
+
+/// A seq of `n` strings whose every step churns the heap: a walk of it
+/// collects between any two elements.
+const chain = "(defn chain [n] (lazy-seq (churn n) (when (pos? n) (cons (str n) (chain (dec n)))))) (defn ints [n] (lazy-seq (churn n) (when (pos? n) (cons n (ints (dec n)))))) ";
+
+test "gc: a native walking a lazy seq that collects at every step keeps what it built" {
+    try expectOutputUnderGc(churn ++ chain ++ "(reduce (fn [acc x] (str acc x)) \"\" (chain 30))", "302928272625242322212019181716151413121110987654321");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [f (frequencies (map count (chain 30)))] [(f 1) (f 2)])", "[9 21]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [z (zipmap m (chain 40))] [(count z) (count (set (vals z))) (every? vector? (keys z))])", "[40 40 true]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (concat m (chain 40))] [(count c) (vector? (first c)) (last c)])", "[80 true 1]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (interleave m (chain 40))] [(count c) (vector? (first c)) (second c)])", "[80 true 40]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [p (partition 3 3 (chain 5) m)] [(count p) (vector? (first (first p))) (rest (last p))])", "[14 true (5 4)]");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [c (mapcat (fn [i] (chain 3)) (range 10))] [(count c) (first c)])", "[30 3]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "[(count (select-keys m (ints 50))) (count (set (chain 40))) (vec (take 3 (i64-vector (ints 30)))) (count (f64-vector (ints 30))) (count (into [] (chain 40))) (count (vec (chain 40)))]", "[39 40 [30 29 28] 30 40 40]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(apply str (chain 12)) (count (sort (chain 40))) (nth (chain 40) 39) (last (chain 40)) (count (reverse (chain 40)))]", "[121110987654321 40 1 1 40]");
+    // A body that returns the next block forwards to it: a long run of
+    // them costs no native stack, and each block stays reachable.
+    try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
 }
 
 test "gc: a vector view alone keeps its vector alive across cycles" {

@@ -29,6 +29,8 @@ const std = @import("std");
 const value_mod = @import("value.zig");
 const vm_mod = @import("vm.zig");
 const list_mod = @import("coll/list.zig");
+const lazy_mod = @import("coll/lazy.zig");
+const seq_mod = @import("seq.zig");
 const vector_mod = @import("coll/vector.zig");
 const typed_vector_mod = @import("coll/typed_vector.zig");
 const bignum_mod = @import("bignum.zig");
@@ -77,6 +79,7 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .max_arity = e[2],
         .call = e[3],
         .leaf = if (e.len > 4) e[4] == .leaf else false,
+        .general = if (e.len > 5) e[5] else null,
     };
     return out;
 }
@@ -101,6 +104,8 @@ fn installTable(ns: *Namespace, natives: []const NativeFn) !void {
 /// kernels (docs/TYPED_VECTOR.md §7.2) into the registry that owns
 /// `ns`, if any.
 pub fn installCore(ns: *Namespace) !void {
+    vm_mod.lazy_ops = &seq_mod.ops;
+    seq_mod.entity_map = &nextomic_mod.natives.entityMap;
     try installTable(ns, &core_natives);
     if (ns.registry) |registry| try installTable(try registry.getOrCreate("nexis.simd", ns), &simd_natives);
 }
@@ -164,7 +169,7 @@ const core_natives = table("", .{
     .{ "some", 2, 2, &fnSome },
     .{ "every?", 2, 2, &fnEveryQ },
     .{ "count", 1, 1, &fnCount },
-    .{ "nth", 2, 3, &fnNth, .leaf },
+    .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
     .{ "empty?", 1, 1, &fnEmptyQ },
     .{ "identity", 1, 1, &fnIdentity, .leaf },
     .{ "nil?", 1, 1, &fnNilQ, .leaf },
@@ -309,7 +314,7 @@ const core_natives = table("", .{
     .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
     .{ "boolean", 1, 1, &fnBoolean },
     .{ "list?", 1, 1, kindPredicate(isList) },
-    .{ "seq?", 1, 1, kindPredicate(isList) },
+    .{ "seq?", 1, 1, kindPredicate(isSeq) },
     .{ "vector?", 1, 1, kindPredicate(isVector) },
     .{ "map?", 1, 1, kindPredicate(isMap) },
     .{ "set?", 1, 1, kindPredicate(isSet) },
@@ -324,6 +329,10 @@ const core_natives = table("", .{
     .{ "ifn?", 1, 1, kindPredicate(isIfn) },
     .{ "counted?", 1, 1, kindPredicate(isCounted) },
     .{ "delay?", 1, 1, &fnDelayQ },
+    // Lazy seqs (docs/LAZY.md).
+    .{ "realized?", 1, 1, &fnRealizedQ },
+    .{ "doall", 1, 2, &fnDoall },
+    .{ "dorun", 1, 2, &fnDorun },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
     .{ "class", 1, 1, &fnClass },
     .{ "var?", 1, 1, kindPredicate(isVar) },
@@ -493,6 +502,8 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
     // delay: the record a delay is (core.nx `delay`, `force`).
     .{ "#%delay", 1, 1, &fnDelay },
+    // lazy-seq: an unrealized block over the body's function (core.nx).
+    .{ "#%lazy-seq", 1, 1, &fnLazySeq },
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
@@ -514,27 +525,38 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
     return list_mod.fromSlice(vm.ensureHeap(), args) catch VmError.OutOfMemory;
 }
 
-/// `(list* a b ... seq)` → list of the leading args followed by
-/// every element of `seq`; nil when there is nothing at all, the
-/// way Clojure's returns a nil seq.
+/// `(list* a b ... s)` → the leading args consed onto `(seq s)`, the
+/// last arg's seq itself when there are none: nil for an empty `s`,
+/// as Clojure's.
 fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
-    var items: std.ArrayList(Value) = .empty;
-    defer items.deinit(vm.allocator);
-    items.appendSlice(vm.allocator, args[0 .. args.len - 1]) catch return VmError.OutOfMemory;
-    try appendSeqValues(vm, args[args.len - 1], &items);
-    if (items.items.len == 0) return value_mod.nilValue();
-    return try buildListFromSlice(vm, items.items);
+    var result = try seq_mod.seqOf(vm, args[args.len - 1]);
+    var i = args.len - 1;
+    while (i > 0) {
+        i -= 1;
+        result = try consOnto(vm, args[i], result);
+    }
+    return result;
 }
 
-/// `(cons x s)` → a list of `x` followed by the elements of `s`,
-/// any seqable; a list tail is shared, anything else is copied.
+/// `(cons x s)` → `x` in front of the seq of `s`, any seqable: a list
+/// cell onto nil, a list or a vector's view; a lazy seq's cons cell
+/// onto a lazy seq, which is not realized (LAZY.md §4).
 fn fnCons(vm: *VM, args: []const Value) VmError!Value {
-    const tail = if (args[1].kind() == .list) args[1] else blk: {
-        var items = try collectSeq(vm, args[1]);
-        defer items.deinit(vm.allocator);
-        break :blk try buildListFromSlice(vm, items.items);
+    const s = args[1];
+    return switch (s.kind()) {
+        .nil, .list, .lazy_seq => consOnto(vm, args[0], s),
+        else => consOnto(vm, args[0], try seq_mod.seqOf(vm, s)),
     };
-    return list_mod.cons(vm.ensureHeap(), args[0], tail) catch VmError.OutOfMemory;
+}
+
+/// `x` in front of `s`: nil, a list or a lazy seq.
+fn consOnto(vm: *VM, x: Value, s: Value) VmError!Value {
+    const heap = vm.ensureHeap();
+    return switch (s.kind()) {
+        .nil => list_mod.cons(heap, x, list_mod.empty(heap) catch return VmError.OutOfMemory),
+        .list => list_mod.cons(heap, x, s),
+        else => lazy_mod.cons(heap, x, s),
+    } catch VmError.OutOfMemory;
 }
 
 /// `(first s)` → head of the seq, or nil if empty/nil.
@@ -544,6 +566,7 @@ fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
         .nil => value_mod.nilValue(),
         .list => if (list_mod.isEmpty(s)) value_mod.nilValue() else list_mod.head(s),
         .persistent_vector => if (vector_mod.isEmpty(s)) value_mod.nilValue() else vector_mod.nth(s, 0),
+        .lazy_seq => seq_mod.first(vm, s),
         else => blk: {
             var it = try makeSeqIter(vm, s);
             break :blk (try it.next()) orelse value_mod.nilValue();
@@ -564,6 +587,7 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
         else
             list_mod.tail(s),
         .persistent_vector => list_mod.ofVector(heap, s, @min(1, vector_mod.count(s))) catch VmError.OutOfMemory,
+        .lazy_seq => seq_mod.rest(vm, s),
         else => blk: {
             var items = try collectSeq(vm, s);
             defer items.deinit(vm.allocator);
@@ -627,6 +651,7 @@ fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(next s)` → `(seq (rest s))`: nil when nothing follows.
 fn fnNext(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .lazy_seq) return seq_mod.next(vm, args[0]);
     const r = try fnRest(vm, args);
     return if (list_mod.isEmpty(r)) value_mod.nilValue() else r;
 }
@@ -636,19 +661,7 @@ fn fnNext(vm: *VM, args: []const Value) VmError!Value {
 /// returned as is; a vector gives an O(1) view, LIST.md §1). Maps
 /// yield `[k v]` entries, strings chars.
 fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
-    const c = args[0];
-    switch (c.kind()) {
-        .list => return if (list_mod.isEmpty(c)) value_mod.nilValue() else c,
-        .persistent_vector => return if (vector_mod.isEmpty(c))
-            value_mod.nilValue()
-        else
-            list_mod.ofVector(vm.ensureHeap(), c, 0) catch VmError.OutOfMemory,
-        else => {},
-    }
-    var items = try collectSeq(vm, c);
-    defer items.deinit(vm.allocator);
-    if (items.items.len == 0) return value_mod.nilValue();
-    return try buildListFromSlice(vm, items.items);
+    return seq_mod.seqOf(vm, args[0]);
 }
 
 /// `(count coll)` → element count. nil → 0. Lists, vectors,
@@ -668,6 +681,7 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         .transient => @intCast(try transientCount(vm, c)),
+        .lazy_seq => @intCast(try seq_mod.countOf(vm, c)),
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
@@ -697,6 +711,8 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     switch (coll.kind()) {
         .nil, .list, .persistent_vector, .typed_vector, .string => {},
         .transient => if (coll.subkind() != transient_mod.subkind_transient_vector) return VmError.KindMismatch,
+        // Walking a lazy seq may run code: not in a leaf (VM.md §6).
+        .lazy_seq => return VmError.NeedsReentry,
         else => return VmError.KindMismatch,
     }
     const idx = idx_v.asFixnum();
@@ -752,6 +768,18 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
+/// `nth` called other than as a leaf: a lazy seq is walked, realizing
+/// as far as the index; everything else is the leaf's.
+fn fnNthGeneral(vm: *VM, args: []const Value) VmError!Value {
+    const coll = args[0];
+    if (coll.kind() != .lazy_seq) return fnNth(vm, args);
+    if (args[1].kind() != .fixnum) return VmError.KindMismatch;
+    const has_default = args.len > 2;
+    const idx = args[1].asFixnum();
+    const found = if (idx < 0) null else try seq_mod.nthOf(vm, coll, @intCast(idx));
+    return found orelse if (has_default) args[2] else VmError.IndexOutOfBounds;
+}
+
 /// `(empty? coll)` → true if coll has zero elements. nil →
 /// true (matches Clojure). Strings: byte-length test (O(1)) —
 /// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed. A
@@ -771,6 +799,7 @@ fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
         .sorted_map, .sorted_set => sorted_mod.count(c) == 0,
         .string => string_mod.byteLen(c) == 0,
         .transient => try transientCount(vm, c) == 0,
+        .lazy_seq => (try seq_mod.seqOf(vm, c)).isNil(),
         else => return VmError.KindMismatch,
     };
     return value_mod.fromBool(is_empty);
@@ -909,13 +938,30 @@ fn fnNumEq(_: *VM, args: []const Value) VmError!Value {
     return chainCompare(.eq, args);
 }
 
-fn fnEq(_: *VM, args: []const Value) VmError!Value {
+fn fnEq(vm: *VM, args: []const Value) VmError!Value {
     if (args.len < 2) return value_mod.fromBool(true);
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 1) {
-        if (!dispatch_mod.equal(args[i], args[i + 1])) return value_mod.fromBool(false);
+        if (!try equalTop(vm, args[i], args[i + 1])) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
+}
+
+/// `=` of two arguments. Two sequential values of which one is a lazy
+/// seq are walked in step here, in native context (LAZY.md §6): their
+/// bodies' throws propagate, and an infinite seq against a finite one
+/// is decided at the finite one's end, as `LazySeq.equiv` walks. Their
+/// elements, and every other pair, are `dispatch.equal`'s.
+fn equalTop(vm: *VM, a: Value, b: Value) VmError!bool {
+    const lazy_pair = (a.kind() == .lazy_seq or b.kind() == .lazy_seq) and isSequential(a.kind()) and isSequential(b.kind());
+    if (!lazy_pair or a.identicalTo(b)) return dispatch_mod.equal(a, b);
+    var ia = try makeSeqIter(vm, a);
+    var ib = try makeSeqIter(vm, b);
+    while (true) {
+        const x = (try ia.next()) orelse return (try ib.next()) == null;
+        const y = (try ib.next()) orelse return false;
+        if (!dispatch_mod.equal(x, y)) return false;
+    }
 }
 
 fn fnNotEq(vm: *VM, args: []const Value) VmError!Value {
@@ -1360,9 +1406,16 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     var cb = vm_mod.Callback.init(vm, f, 2);
+    // The accumulator is the next call's argument, and a lazy `coll`'s
+    // next step may collect before that call (GC.md §11.5, class 5):
+    // it waits in one root slot.
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(acc);
     while (try it.next()) |x| {
         acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
+        vm.roots.items[scope.base] = acc;
     }
     return acc;
 }
@@ -1751,6 +1804,12 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
             }
             break :blk result;
         },
+        // `(cons x (seq s))`, realizing one step, as `LazySeq.cons`.
+        .lazy_seq => blk: {
+            var result = try seq_mod.seqOf(vm, coll);
+            for (xs) |x| result = try consOnto(vm, x, result);
+            break :blk result;
+        },
         .persistent_vector, .persistent_map, .persistent_set => if (xs.len >= conj_in_place_min) try conjInPlace(vm, coll, xs) else switch (coll.kind()) {
             .persistent_vector => blk: {
                 var result = coll;
@@ -1838,6 +1897,10 @@ fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
 fn fnFrequencies(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
+    // A lazy argument's next step may collect (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(t);
     var it = try makeSeqIter(vm, args[0]);
     while (try it.next()) |x| {
         const spot = transient_mod.mapLocateBang(t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
@@ -1927,7 +1990,14 @@ fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
 fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
-    for (args) |c| try appendSeqValues(vm, c, &items);
+    // A map's entries wait on the scope while a later lazy argument's
+    // steps may collect (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    for (args) |c| {
+        var it = try rootedSeqIter(vm, c, scope);
+        while (try it.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
     return try buildListFromSlice(vm, items.items);
 }
 
@@ -1936,8 +2006,16 @@ fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
     const mapped = try fnMap(vm, args);
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
+    // Walking a lazy part may collect (GC.md §11.5, class 5): the
+    // mapped list and the entries the walk builds wait on the scope.
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(mapped);
     var it = try makeSeqIter(vm, mapped);
-    while (try it.next()) |sub| try appendSeqValues(vm, sub, &items);
+    while (try it.next()) |sub| {
+        var parts = try rootedSeqIter(vm, sub, scope);
+        while (try parts.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
+    }
     return try buildListFromSlice(vm, items.items);
 }
 
@@ -2040,8 +2118,14 @@ fn partitionImpl(vm: *VM, all: bool, args: []const Value) VmError!Value {
     const step: i64 = if (args.len >= 3) try requireFixnum(args[1]) else n;
     if (step <= 0) return VmError.InvalidArgument;
     const pad: ?Value = if (args.len == 4) args[2] else null;
-    var items = try collectSeq(vm, args[args.len - 1]);
+    // The source's built entries wait on the scope while a lazy pad
+    // is walked (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    var items: std.ArrayList(Value) = .empty;
     defer items.deinit(vm.allocator);
+    var src = try rootedSeqIter(vm, args[args.len - 1], scope);
+    while (try src.next()) |x| items.append(vm.allocator, x) catch return VmError.OutOfMemory;
     var pad_items: std.ArrayList(Value) = .empty;
     defer pad_items.deinit(vm.allocator);
     if (pad) |pv| try appendSeqValues(vm, pv, &pad_items);
@@ -2082,10 +2166,14 @@ fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
 fn fnInterleave(vm: *VM, args: []const Value) VmError!Value {
     var results: std.ArrayList(Value) = .empty;
     defer results.deinit(vm.allocator);
+    // Each source's built entries wait on the scope while another's
+    // lazy steps may collect (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
     if (args.len > 0) {
         const iters = vm.allocator.alloc(SeqIter, args.len) catch return VmError.OutOfMemory;
         defer vm.allocator.free(iters);
-        for (args, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
+        for (args, 0..) |c, i| iters[i] = try rootedSeqIter(vm, c, scope);
         outer: while (true) {
             const mark = results.items.len;
             for (iters) |*it| {
@@ -2104,8 +2192,12 @@ fn fnInterleave(vm: *VM, args: []const Value) VmError!Value {
 fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     var entries: std.ArrayList(champ_mod.Entry) = .empty;
     defer entries.deinit(vm.allocator);
-    var ks = try makeSeqIter(vm, args[0]);
-    var vs = try makeSeqIter(vm, args[1]);
+    // Either side's built entries wait on the scope while the other's
+    // lazy steps may collect (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    var ks = try rootedSeqIter(vm, args[0], scope);
+    var vs = try rootedSeqIter(vm, args[1], scope);
     while (try ks.next()) |k| {
         const v = (try vs.next()) orelse break;
         entries.append(vm.allocator, .{ .key = k, .value = v }) catch return VmError.OutOfMemory;
@@ -2200,6 +2292,16 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
         .persistent_vector => {
             const v = args[0];
             return list_mod.ofVector(vm.ensureHeap(), v, @min(count, vector_mod.count(v))) catch VmError.OutOfMemory;
+        },
+        // Clojure's loop: `rest` while the seq is not empty, so what
+        // is left is not realized.
+        .lazy_seq => {
+            var xs = args[0];
+            for (0..count) |_| {
+                if ((try seq_mod.seqOf(vm, xs)).isNil()) break;
+                xs = try seq_mod.rest(vm, xs);
+            }
+            return xs;
         },
         else => {},
     }
@@ -2384,12 +2486,12 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
         .nil, .persistent_map, .record, .persistent_vector, .sorted_map => {},
         else => return VmError.KindMismatch,
     }
-    // A sorted source's comparator can collect inside `find`: the
-    // result so far and the keys the walk built are kept rooted
-    // (GC.md §11.5, class 4).
+    // A sorted source's comparator can collect inside `find`, and a
+    // lazy key seq's next step can (GC.md §11.5, classes 4 and 5): the
+    // result so far and the keys the walk built are kept rooted.
     const scope = vm.rootScope();
     defer scope.release();
-    const collects = src.kind() == .sorted_map and !sorted_mod.comparatorOf(src).isNil();
+    const collects = (src.kind() == .sorted_map and !sorted_mod.comparatorOf(src).isNil()) or args[1].kind() == .lazy_seq;
     if (collects) try scope.push(out);
     var ks = if (collects) try rootedSeqIter(vm, args[1], scope) else try makeSeqIter(vm, args[1]);
     while (try ks.next()) |k| {
@@ -2478,6 +2580,8 @@ fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
         .sorted_map, .sorted_set => sorted_mod.empty(heap, args[0].kind(), sorted_mod.comparatorOf(args[0])),
         // A typed vector takes no updates (TYPED_VECTOR.md §8).
         .typed_vector => return VmError.KindMismatch,
+        // `LazySeq.empty` is the empty list, without metadata.
+        .lazy_seq => return list_mod.empty(heap) catch VmError.OutOfMemory,
         else => return value_mod.nilValue(),
     } catch return VmError.OutOfMemory;
     heap_mod.Heap.asHeapHeader(e).setMeta(heap_mod.Heap.asHeapHeader(args[0]).getMeta());
@@ -2757,7 +2861,7 @@ fn fnEval(vm: *VM, args: []const Value) VmError!Value {
 
 fn carriesHeaderMeta(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector, .sorted_map, .sorted_set => true,
+        .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .typed_vector, .sorted_map, .sorted_set => true,
         else => false,
     };
 }
@@ -2793,6 +2897,9 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     const meta_h: ?*heap_mod.HeapHeader = if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m);
     // Every rest of a vector view shares its block (LIST.md §2).
     if (x.kind() == .list and x.subkind() == list_mod.subkind_view) return list_mod.viewWithMeta(vm.ensureHeap(), x, meta_h) catch VmError.OutOfMemory;
+    // A realized block over the seq, as `LazySeq.withMeta` is
+    // `new LazySeq(meta, seq())`: no rest carries the metadata.
+    if (x.kind() == .lazy_seq) return lazy_mod.realizedWithMeta(vm.ensureHeap(), try seq_mod.seqOf(vm, x), meta_h) catch VmError.OutOfMemory;
     const h = heap_mod.Heap.asHeapHeader(x);
     const body = heap_mod.Heap.bodyBytes(h);
     const copy = vm.ensureHeap().alloc(x.kind(), body.len) catch return VmError.OutOfMemory;
@@ -2922,6 +3029,9 @@ fn kindPredicate(comptime pred: fn (Kind) bool) *const fn (*VM, []const Value) V
 fn isList(k: Kind) bool {
     return k == .list;
 }
+fn isSeq(k: Kind) bool {
+    return k == .list or k == .lazy_seq;
+}
 fn isVector(k: Kind) bool {
     return k == .persistent_vector;
 }
@@ -2955,23 +3065,24 @@ fn isBoolean(k: Kind) bool {
 }
 fn isColl(k: Kind) bool {
     return switch (k) {
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => true,
+        .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => true,
         else => false,
     };
 }
 fn isVar(k: Kind) bool {
     return k == .var_;
 }
-/// Clojure's `Counted`: the collections, typed vectors and transients.
+/// Clojure's `Counted`: the collections but a lazy seq, typed vectors
+/// and transients.
 fn isCounted(k: Kind) bool {
-    return isColl(k) or k == .typed_vector or k == .transient;
+    return (isColl(k) and k != .lazy_seq) or k == .typed_vector or k == .transient;
 }
 /// Clojure's `Indexed`: the vectors, `nth` in constant time.
 fn isIndexed(k: Kind) bool {
     return k == .persistent_vector or k == .typed_vector;
 }
 fn isSequential(k: Kind) bool {
-    return k == .list or k == .persistent_vector;
+    return k == .list or k == .persistent_vector or k == .lazy_seq;
 }
 fn isAssociative(k: Kind) bool {
     return k == .persistent_map or k == .persistent_vector or k == .record or k == .sorted_map;
@@ -3554,6 +3665,44 @@ fn fnDelay(vm: *VM, args: []const Value) VmError!Value {
 
 fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isDelay(vm, args[0]));
+}
+
+/// `(realized? x)` → whether a lazy block's body has run (a cons or a
+/// chunked cons is realized), or whether a delay has been forced;
+/// `:kind-mismatch` for anything else.
+fn fnRealizedQ(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    if (x.kind() == .lazy_seq) {
+        return value_mod.fromBool(lazy_mod.shapeOf(x) != .lazy or lazy_mod.state(x) == .realized);
+    }
+    if (!isDelay(vm, x)) return VmError.KindMismatch;
+    const key = vm.ensureInterner().internKeywordValue("state") catch return VmError.OutOfMemory;
+    const state = atom_mod.getValue(try vm_mod.lookup(x, key, value_mod.nilValue()));
+    const pending = vm.ensureInterner().internKeywordValue("pending") catch return VmError.OutOfMemory;
+    return value_mod.fromBool(!vector_mod.nth(state, 0).identicalTo(pending));
+}
+
+/// `(doall coll)` / `(doall n coll)` → coll, its first n elements (all
+/// of them) realized; `(dorun ...)` the same walk, returning nil.
+fn fnDoall(vm: *VM, args: []const Value) VmError!Value {
+    try realizeArg(vm, args);
+    return args[args.len - 1];
+}
+
+fn fnDorun(vm: *VM, args: []const Value) VmError!Value {
+    try realizeArg(vm, args);
+    return value_mod.nilValue();
+}
+
+fn realizeArg(vm: *VM, args: []const Value) VmError!void {
+    const limit: ?usize = if (args.len == 2) try requireCount(args[0]) else null;
+    try seq_mod.realizeSpine(vm, args[args.len - 1], limit);
+}
+
+/// `(#%lazy-seq f)` → an unrealized lazy block whose body calls `f`
+/// (the `lazy-seq` macro, LAZY.md §4).
+fn fnLazySeq(vm: *VM, args: []const Value) VmError!Value {
+    return seq_mod.make(vm, seq_mod.op_thunk, args[0..1]);
 }
 
 /// `@d` of a delay: `(nexis.core/force d)`.
@@ -5079,100 +5228,16 @@ fn typeNameToKinds(name: []const u8) ?[]const Kind {
 // Helpers
 // =============================================================================
 
-/// Walks any seqable: nil, list, vector, map or record (as `[k v]`
-/// entries), set, string (as chars).
-///
-/// A map entry and a boxed typed-vector element are built by the
-/// iterator, so no argument reaches them (docs/GC.md §11.5). A native
-/// that keeps what the iterator yields across a call back into the VM
-/// iterates with `rootedSeqIter`, which pushes each such value on the
-/// native's `RootScope`.
-const SeqIter = struct {
-    state: union(enum) {
-        empty,
-        list: list_mod.Cursor,
-        vector: vector_mod.Cursor,
-        typed: struct { v: Value, idx: usize, count: usize, heap: *heap_mod.Heap },
-        map: struct { it: champ_mod.MapIter, heap: *heap_mod.Heap },
-        set: champ_mod.SetIter,
-        sorted: struct { it: sorted_mod.Iter, heap: *heap_mod.Heap },
-        string: std.unicode.Utf8Iterator,
-    },
-    roots: ?vm_mod.RootScope = null,
+/// Every seqable receiver (`seq.SeqIter`, LAZY.md §5).
+const SeqIter = seq_mod.SeqIter;
 
-    /// The next element, null at the end. A vector and a list step
-    /// inline, in the caller's loop; every other state steps in
-    /// `nextOther`.
-    inline fn next(self: *SeqIter) VmError!?Value {
-        switch (self.state) {
-            .vector => |*c| return c.next(),
-            .list => |*c| return c.next(),
-            else => return self.nextOther(),
-        }
-    }
-
-    fn nextOther(self: *SeqIter) VmError!?Value {
-        switch (self.state) {
-            .empty => return null,
-            .list => |*c| return c.next(),
-            .vector => |*c| return c.next(),
-            .typed => |*tv| {
-                if (tv.idx >= tv.count) return null;
-                const e = typed_vector_mod.nth(tv.heap, tv.v, tv.idx) catch return VmError.OutOfMemory;
-                tv.idx += 1;
-                return try self.built(e);
-            },
-            .map => |*m| {
-                const e = m.it.next() orelse return null;
-                return try self.built(vector_mod.fromSlice(m.heap, &.{ e.key, e.value }) catch return VmError.OutOfMemory);
-            },
-            .set => |*it| return it.next(),
-            .sorted => |*st| {
-                const e = st.it.next() orelse return null;
-                if (!st.it.is_map) return e.key;
-                return try self.built(vector_mod.fromSlice(st.heap, &.{ e.key, e.value }) catch return VmError.OutOfMemory);
-            },
-            .string => |*utf8| {
-                const scalar = utf8.nextCodepoint() orelse return null;
-                return value_mod.fromChar(scalar) orelse VmError.Utf8Error;
-            },
-        }
-    }
-
-    fn built(self: *SeqIter, v: Value) VmError!Value {
-        if (self.roots) |scope| try scope.push(v);
-        return v;
-    }
-};
-
-/// Every seqable receiver: nil, list, vector, typed vector, map (as
-/// `[k v]` entries), record (its field map), lazy entity (its
-/// attributes, read in one pass), set, sorted map and set (in order)
-/// and string (as chars). A string that is not valid UTF-8 is
-/// `:utf8-error`, as for every other string operation.
 fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
-    return .{ .state = switch (coll.kind()) {
-        .nil => .empty,
-        .list => if (list_mod.viewCursor(coll)) |c| .{ .vector = c } else .{ .list = list_mod.Cursor.init(coll) },
-        .persistent_vector => .{ .vector = vector_mod.Cursor.init(coll) },
-        .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll), .heap = vm.ensureHeap() } },
-        .persistent_map => .{ .map = .{ .it = champ_mod.mapIter(coll), .heap = vm.ensureHeap() } },
-        .record => .{ .map = .{ .it = champ_mod.mapIter(record_mod.fieldsOf(coll)), .heap = vm.ensureHeap() } },
-        .nextomic_entity => .{ .map = .{ .it = champ_mod.mapIter(try nextomic_mod.natives.entityMap(vm, coll)), .heap = vm.ensureHeap() } },
-        .persistent_set => .{ .set = champ_mod.setIter(coll) },
-        .sorted_map, .sorted_set => .{ .sorted = .{ .it = sorted_mod.Iter.init(coll, true), .heap = vm.ensureHeap() } },
-        .string => .{
-            .string = (std.unicode.Utf8View.init(string_mod.asBytes(coll)) catch return VmError.Utf8Error).iterator(),
-        },
-        else => return VmError.KindMismatch,
-    } };
+    return SeqIter.init(vm, coll);
 }
 
 /// `makeSeqIter` whose built values stay rooted in `scope`.
 fn rootedSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
-    var it = try makeSeqIter(vm, coll);
-    it.roots = scope;
-    return it;
+    return SeqIter.rooted(vm, coll, scope);
 }
 
 /// Materialize a seqable into an owned list of Values. The

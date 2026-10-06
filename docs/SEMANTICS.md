@@ -340,6 +340,10 @@ absent, not an error: `(get 5 :k)` is `nil`, `(get 5 :k :d)` is `:d`.
 A vector or string index out of range or not an integer is absent as
 well.
 
+A lazy seq follows the same rules (`docs/LAZY.md` §4): `(seq (lazy-seq
+nil))` is `nil`, `(rest (lazy-seq nil))` is `()`, and `count`, `nth`
+and `empty?` walk it, realizing as far as they read.
+
 `rest` of a one-element sequence is `()` and `next` is `nil`; the rest
 binding of a sequential destructure and of a variadic parameter is
 `nil` when nothing is left (`(let [[a & r] [1]] r)` is `nil`), as in
@@ -463,6 +467,7 @@ map or `nil`; it never throws.
 | Kind | `with-meta` / `vary-meta` | `meta` |
 |---|---|---|
 | `list`, `vector`, `map`, `set` (hash or sorted), `record`, `typed-vector` | a copy of the root block carrying the map; every node below the root is shared. A vector view gets one new view block that carries the map and wraps the metadata-free one, so its `rest` carries none (`docs/LIST.md` §2) | the map or `nil` |
+| `lazy-seq` | a new realized lazy block carrying the map whose seq is the argument's, realizing one step (`LazySeq.withMeta`), so no `rest` carries it (`docs/LAZY.md` §4) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
 | every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |

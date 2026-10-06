@@ -316,9 +316,9 @@ spellings.
 ### 8. More of Clojure's core
 
 Functions of `nexis.core` that no kind doc owns, each with Clojure
-1.12's semantics except where a row says otherwise. Sequences are
-eager (PLAN §23 #14): where Clojure returns a lazy seq, these return
-a realized list.
+1.12's semantics except where a row says otherwise. Lazy seqs are
+`docs/LAZY.md`'s; a sequence function that §7 there does not list
+returns a realized list where Clojure returns a lazy seq.
 
 | Name | Arity | Semantics |
 |---|---|---|
@@ -329,15 +329,17 @@ a realized list.
 | `splitv-at` | 2 | `[(vec (take n coll)) (drop n coll)]` |
 | `bounded-count` | 2 | `(count coll)` of a counted collection, else the count of at most the first `n` elements (`(bounded-count 2 "abcd")` is 2) |
 | `random-sample` | 2 | `(random-sample prob coll)`: each element kept with probability `prob` (`rand`) |
-| `doall`, `dorun` | 1 | Sequences are already realized: `doall` returns its argument, `dorun` nil |
+| `lazy-seq` | macro | `(lazy-seq body...)`: a lazy seq whose body runs once, when the seq is first walked, its result cached; a body that throws runs again on the next walk (`docs/LAZY.md` §4) |
+| `lazy-cat` | macro | `(lazy-cat coll...)`: `(concat (lazy-seq coll) ...)` |
+| `doall`, `dorun` | 1–2 | Walk the seq, realizing it (the first `n` steps with a count, as Clojure's `next` loop); `doall` returns its argument, `dorun` nil |
 | `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-uuid` and `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
 | `in-ns` | 1 | `(in-ns 'name)`: makes the namespace named by the symbol current, creating it with `nexis.core` referred; nil, where Clojure returns the namespace |
-| `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil and strings |
+| `counted?` | 1 | True of a list, vector, map, set, record, typed vector or transient; false of nil, strings and lazy seqs |
 | `indexed?` | 1 | True of a vector or typed vector |
 | `map-entry?` | 1 | True of a two-element vector: a map's entries are vectors (`(map-entry? [1 2])` is true, where Clojure's is false) |
 | `delay` | macro | `(delay body...)`: a delay, the record `nexis.core/Delay`, whose body runs the first time it is forced; every later `force` or `deref` (`@d`) returns the same value, or rethrows what the body threw (the body runs once either way) |
 | `force` | 1 | A delay's value, forcing it; anything else itself |
-| `delay?`, `realized?` | 1 | Whether `x` is a delay; whether the delay has been forced (`realized?` of anything else is `:kind-mismatch`) |
+| `delay?`, `realized?` | 1 | Whether `x` is a delay; whether the delay has been forced, or a lazy seq's body has run (`docs/LAZY.md` §4; `realized?` of anything else is `:kind-mismatch`) |
 | `Closeable`, `close` | protocol | What `with-open` closes: `close` of a db connection is `db/close`, of a Nextomic connection `nextomic/release`; a record or kind extends it to be closed the same way |
 | `with-open` | macro | `(with-open [name init ...] body...)`: body with each name bound, each closed through `close` in reverse order on every exit, a throw included; the bindings must be symbol and value pairs, else the expansion fails |
 | `tap>` | 1 | Calls every function `add-tap` added with `x`, ignoring any that throws, and returns true. Clojure calls the taps on another thread; one isolate, one thread calls them before `tap>` returns |

@@ -37,6 +37,7 @@ pub const nextomic_handle = @import("nextomic/handle.zig");
 pub const gc = @import("gc.zig");
 pub const dispatch = @import("dispatch.zig");
 pub const vm = @import("vm.zig");
+pub const seq = @import("seq.zig");
 pub const reader = @import("reader.zig");
 pub const expand = @import("expand.zig");
 pub const compile = @import("compile.zig");

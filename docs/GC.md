@@ -397,6 +397,19 @@ The rule each native follows, by what it holds across a further
    A native that only passes a built value to the next call (`map`,
    `some`, `every?`, `reduce` over a map) is class 2 for it.
 
+5. **Realization**: walking a lazy seq runs its bodies
+   (`docs/LAZY.md` §4), which may collect at every step, so every
+   `seq.SeqIter.next` over a seqable that may be lazy is a call back
+   into the VM. What a native holds across the walk must be reachable
+   from its arguments or on a root scope: a realized chain is cached
+   in the block that heads it, so the elements already walked reach
+   from the argument the walk started at, but a callback result
+   (`reduce`'s accumulator, which waits in a root slot between calls),
+   a value the native built (`frequencies`' transient, `select-keys`'
+   result) and a value another iterator built (the entries of a map
+   walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
+   `partition`'s pad, which walk with `rootedSeqIter`) are not.
+
 A new native that calls back into the VM states its class next to its
 `callValue`.
 

@@ -24,6 +24,16 @@
 ; Sequence transforms
 ; ============================================================
 
+; (lazy-seq body...) → a lazy seq whose body runs once, when the seq is
+; first walked, and whose result is cached (docs/LAZY.md §4).
+(defmacro lazy-seq [& body]
+  `(nexis.internal/#%lazy-seq (fn* [] ~@body)))
+
+; (lazy-cat coll...) → the concatenation of the colls, each expression
+; evaluated only when the walk reaches it.
+(defmacro lazy-cat [& colls]
+  `(concat ~@(map (fn* [c] `(lazy-seq ~c)) colls)))
+
 ; (drop n coll) → a seq of coll without its first n elements, () when
 ; none are left.
 (defn drop [n s]
@@ -561,10 +571,6 @@
 (defn run! [f coll]
   (reduce (fn [_ x] (f x) nil) nil coll))
 
-; Sequences are eager, so doall and dorun only return.
-(defn doall [coll] coll)
-(defn dorun [coll] nil)
-
 ; (partition-by f coll) → coll split each time (f x) changes.
 (defn partition-by [f coll]
   (loop [s (seq coll) acc [] run [] k nil]
@@ -777,10 +783,6 @@
             (reset! state [:failed e])
             (throw e)))))
     x))
-
-; (realized? d) → whether the delay has been forced.
-(defn realized? [x]
-  (if (delay? x) (not= :pending (first @(:state x))) (throw :kind-mismatch)))
 
 ; What with-open closes: a db connection, a Nextomic connection, and
 ; any type extended to it (Java's Closeable).

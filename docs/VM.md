@@ -289,6 +289,14 @@ guard or the overflow check while no cycle is due; once one is, the
 call takes `callValue`'s rooted path and its safe point, so a native
 that calls a leaf per element (`(reduce * xs)`) collects as it goes.
 Its arity is checked, and reported, as any native's.
+A leaf may refuse a receiver it could handle only by running code:
+`nth` of a lazy seq, whose walk realizes it (`docs/LAZY.md` §4). Its
+leaf body returns the internal `VmError.NeedsReentry` before it touches
+anything, and the three leaf call sites (`call:call`'s in-place path,
+`callValue`'s and a `Callback`'s) re-issue the call through the general
+path, arguments copied off the stack and rooted, which runs the
+descriptor's `general` body instead of `call`. The error never escapes
+a call site.
 
 ---
 
