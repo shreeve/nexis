@@ -1,0 +1,4 @@
+; bench/micro/cbbase.nx N: the setup the callback programs share: a vector of n numbers.
+(let [n (parse-long (first *command-line-args*))
+      v (vec (range n))]
+  (println (count v)))

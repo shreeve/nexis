@@ -1,0 +1,3 @@
+; bench/micro/kw.nx N: count plus a keyword looking itself up in a map.
+(let [n (parse-long (first *command-line-args*)) m {:a 1 :b 2}]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (:b m)) k))))

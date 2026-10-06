@@ -1,0 +1,4 @@
+; bench/micro/cb.nx N: mapv over a closure; subtract cbbase.
+(let [n (parse-long (first *command-line-args*))
+      v (vec (range n))]
+  (println (count (mapv (fn [x] x) v))))

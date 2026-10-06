@@ -1,0 +1,4 @@
+; bench/micro/gcall.nx N: count plus a call of a defn returning its argument.
+(defn f [x] x)
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (f 7)) k))))

@@ -1,0 +1,4 @@
+; bench/micro/getnl.nx N: count plus a call of a native that is not a leaf (get).
+(let [n (parse-long (first *command-line-args*))
+      v [1 2 3 4]]
+  (println (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (get v 3))) acc))))

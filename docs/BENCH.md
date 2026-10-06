@@ -4,7 +4,7 @@ How nexis measures itself and what a published performance claim must
 satisfy. §1–§8 and §11 are the frozen contract for any comparison,
 especially with Clojure; §10 describes the harness, `zig build bench`;
 §12 the comparison with babashka, JVM Clojure, Datalevin and Datomic,
-`bench/compare/`.
+`bench/compare/`; §13 the interpreter's micro kit, `bench/micro/`.
 The numbers of record live in `docs/PERF.md` §3, once each, with their
 provenance in its §11.
 
@@ -441,3 +441,45 @@ after each.
   its compiler and collector threads.
 - *Startup* includes the wrappers' spawn (`time`, `taskset`), the
   same for all.
+
+### 13. The micro kit: `bench/micro/`
+
+What one iteration, call or element of a small program costs the
+interpreter, in machine instructions retired and cycles, for one or
+more builds side by side: the evidence each dispatch, call and
+callback lever of `docs/PERF.md` §6 is judged by.
+
+```bash
+bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nexis
+```
+
+- **Programs.** `bench/micro/*.nx`, each taking its size as its one
+  argument; the first line of each says what it measures. `count` is
+  the counting loop; `lc`, `lv`, `mv`, `kw`, `leaf`, `getnl` and
+  `gcall` add one `mov:load-const`, `var:load-var`, `mov:move`, keyword
+  lookup, leaf native call, other native call or closure call to it;
+  `acc` adds `(+ acc i)`; `fib` counts calls; `cbsum`, `cbred`, `cb`
+  and `lazy` call a native over a vector with a callback, and `cbbase`
+  is the setup they share; `lazy3` is a lazy pipeline over a range,
+  for its peak RSS.
+- **Two sizes.** Each program runs at two sizes (5 M and 10 M
+  iterations; `fib` 27 and 30, 2,056,916 calls apart; the callback
+  programs 1 M and 2 M), and its cost per unit is `(I(hi) − I(lo)) /
+  units`, so startup, compilation and printing cancel exactly. The
+  callback programs also print their cost less `cbbase`'s when it runs
+  too.
+- **Rounds.** Every round runs every binary, program and size once, the
+  order rotated by one each round; a cost is the median of the rounds'
+  pairs, with their range. Instructions are reproducible to about a
+  tenth of an instruction; cycles move with the load and with code
+  layout, and some builds' cycles are bimodal, which a report states
+  rather than averages away. The runner prints the load average at the
+  start and the end and says when two runs' answers differ.
+- **Counters** come from `/usr/bin/time -l`, so the kit runs on macOS.
+  Each run is one process; `--out FILE.json` keeps every run's
+  instructions, cycles, peak RSS, wall time and output.
+- **Dispatch counts.** A build with `-Dopcodes=true` prints how many
+  times each opcode was dispatched and each native called
+  (`docs/TOOLING.md` §1), which says how many dispatches an iteration
+  is and which instructions and natives a workload spends them on.
+

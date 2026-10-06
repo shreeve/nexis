@@ -83,6 +83,7 @@ const min_runtime_stack_size = 64 << 20;
 const runtime_stack_margin = 16 << 20;
 
 pub fn main(init: std.process.Init) void {
+    if (vm.counting) _ = atexit(&printCounts);
     var result: anyerror!void = {};
     var size: usize = runtime_stack_size;
     while (size >= min_runtime_stack_size) : (size /= 2) {
@@ -234,6 +235,70 @@ fn exitSynced(status: u8) noreturn {
     std.process.exit(status);
 }
 
+extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
+
+/// A `-Dopcodes=true` build's counts, on stderr as CSV at exit however
+/// the process ends: the dispatches by opcode, then the calls by
+/// native, each most first. The runtime's boot is left out
+/// (TOOLING.md §1).
+fn printCounts() callconv(.c) void {
+    const Order = struct {
+        fn opcodes(_: void, a: u12, b: u12) bool {
+            return vm.opcode_counts[a] > vm.opcode_counts[b];
+        }
+        fn natives(_: void, a: vm.NativeCount, b: vm.NativeCount) bool {
+            return a.calls > b.calls;
+        }
+    };
+    var line: [160]u8 = undefined;
+    var order: [4096]u12 = undefined;
+    for (&order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u12, &order, {}, Order.opcodes);
+    writeStderr("opcode,dispatches\n");
+    for (order) |i| {
+        if (vm.opcode_counts[i] == 0) break;
+        var name: [64]u8 = undefined;
+        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ opcodeName(i, &name), vm.opcode_counts[i] }) catch continue);
+    }
+    var natives = vm.native_counts;
+    std.mem.sort(vm.NativeCount, &natives, {}, Order.natives);
+    writeStderr("native,calls\n");
+    for (natives) |e| {
+        const native = e.native orelse break;
+        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ native.name, e.calls }) catch continue);
+    }
+}
+
+fn writeStderr(bytes: []const u8) void {
+    _ = std.c.write(2, bytes.ptr, bytes.len);
+}
+
+/// `group:variant` for an opcode index (VM.md §8), from the variant
+/// enums' tag names with `-` for `_`, as the disassembler spells them.
+fn opcodeName(index: u12, buf: []u8) []const u8 {
+    const group: vm.Group = @fromBackingInt(@as(u6, @truncate(index)));
+    const variant: u6 = @truncate(index >> 6);
+    const v: ?[]const u8 = switch (group) {
+        .jump => std.enums.tagName(vm.Jump, @fromBackingInt(variant)),
+        .cmp => std.enums.tagName(vm.Cmp, @fromBackingInt(variant)),
+        .math => std.enums.tagName(vm.Math, @fromBackingInt(variant)),
+        .mov => std.enums.tagName(vm.Mov, @fromBackingInt(variant)),
+        .call => std.enums.tagName(vm.Call, @fromBackingInt(variant)),
+        .closure => std.enums.tagName(vm.Closure_, @fromBackingInt(variant)),
+        .var_ => std.enums.tagName(vm.VarOp, @fromBackingInt(variant)),
+        .coll => std.enums.tagName(vm.CollOp, @fromBackingInt(variant)),
+        .ctrl => std.enums.tagName(vm.CtrlOp, @fromBackingInt(variant)),
+        else => null,
+    };
+    const g = std.enums.tagName(vm.Group, group) orelse "?";
+    const text = if (v) |name|
+        std.fmt.bufPrint(buf, "{s}:{s}", .{ std.mem.trimEnd(u8, g, "_"), std.mem.trimEnd(u8, name, "_") }) catch return "?"
+    else
+        std.fmt.bufPrint(buf, "{s}:?{d}", .{ std.mem.trimEnd(u8, g, "_"), variant }) catch return "?";
+    std.mem.replaceScalar(u8, text, '_', '-');
+    return text;
+}
+
 fn usageExit(io: std.Io) noreturn {
     std.Io.File.stderr().writeStreamingAll(io, Usage) catch {};
     std.process.exit(1);
@@ -306,6 +371,25 @@ const Runtime = struct {
     /// What `macroexpand-1`, `read-string` and `eval` call into.
     hooks: compile.RuntimeHooks,
 
+    /// A booted runtime on the heap. On the thread's stack the VM's
+    /// fields, which every instruction reads, sit at a fixed distance
+    /// from the frames of the natives under a callback, and a native's
+    /// store a multiple of 4 KiB from a field makes the next handler's
+    /// load of the field wait for it (docs/PERF.md §3.16).
+    /// `load_paths` must outlive it.
+    fn create(io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !*Runtime {
+        const rt = try allocator.create(Runtime);
+        errdefer allocator.destroy(rt);
+        try rt.init(io, allocator, load_paths);
+        return rt;
+    }
+
+    fn destroy(rt: *Runtime) void {
+        const allocator = rt.allocator;
+        rt.deinit();
+        allocator.destroy(rt);
+    }
+
     /// Boot in place: the runtime keeps pointers into itself.
     /// `load_paths` must outlive it.
     fn init(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
@@ -337,6 +421,7 @@ const Runtime = struct {
         };
         rt.hooks = .{ .host_macros = &rt.host_macros, .registry = registry, .interner = interner, .load_callback = rt.loader.callback() };
         rt.hooks.install(&rt.v);
+        if (vm.counting) vm.resetCounts();
     }
 
     fn deinit(rt: *Runtime) void {
@@ -503,9 +588,8 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, args: []c
     const text = readProgram(io, allocator, path);
     defer allocator.free(text);
     const load_paths = loadPathsFor(path);
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
+    const rt = try Runtime.create(io, allocator, &load_paths);
+    defer rt.destroy();
     try rt.setArgs(args);
     // One arena for the file's Form trees and routines, released
     // together at the end.
@@ -518,9 +602,8 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, args: []c
 /// `nexis -e EXPR`: EXPR's forms, each non-nil value printed.
 fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []const []const u8) !void {
     const load_paths = [_][]const u8{"."};
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
+    const rt = try Runtime.create(io, allocator, &load_paths);
+    defer rt.destroy();
     try rt.setArgs(args);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -530,7 +613,7 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
             if (!v.isNil()) try @as(*Runtime, @ptrCast(@alignCast(ctx))).printReadably(v);
         }
     };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
 }
 
 /// `nexis test FILE...`: read every file, then run each and
@@ -550,9 +633,8 @@ fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8)
             if (eql(p, dir)) break;
         } else try load_paths.append(arena.allocator(), dir);
     }
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, load_paths.items);
-    defer rt.deinit();
+    const rt = try Runtime.create(io, allocator, load_paths.items);
+    defer rt.destroy();
     for (infos) |*info| {
         const saved = rt.registry.current;
         _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
@@ -574,9 +656,8 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     const text = readProgram(io, allocator, path);
     defer allocator.free(text);
     const load_paths = loadPathsFor(path);
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
+    const rt = try Runtime.create(io, allocator, &load_paths);
+    defer rt.destroy();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -592,7 +673,7 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
             try disasm_mod.disassemble(routine, self.rt.v.ensureInterner(), self.out);
         }
     };
-    var each = Disasm{ .rt = &rt, .out = &out.writer };
+    var each = Disasm{ .rt = rt, .out = &out.writer };
     const info = vm.SourceInfo{ .path = path, .text = text };
     _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| exitSynced(try rt.report(err));
     try writeStdout(io, out.written());
@@ -604,9 +685,8 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
 /// bound to `*e`, and the loop continues. `:quit`, `:q` or EOF exits.
 fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
     const load_paths = [_][]const u8{"."};
-    var rt: Runtime = undefined;
-    try rt.init(io, allocator, &load_paths);
-    defer rt.deinit();
+    const rt = try Runtime.create(io, allocator, &load_paths);
+    defer rt.destroy();
     const nil = value_mod.nilValue();
     for ([_][]const u8{ "*1", "*2", "*3", "*e" }) |name| try rt.setCoreVar(name, nil);
 
@@ -628,7 +708,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
             try self.rt.printReadably(v);
         }
     };
-    var results = Results{ .rt = &rt };
+    var results = Results{ .rt = rt };
 
     // The text of the form being read, a line at a time; copied to
     // the session once it is complete.
@@ -675,7 +755,7 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         info.* = .{ .path = "<repl>", .text = try rt.persistent().dupe(u8, std.mem.trimEnd(u8, pending.items, "\n")) };
         _ = rt.loader.evalSource(info, .{ .allocator = rt.persistent(), .on_value = .{ .ctx = &results, .call = &Results.call } }) catch |err| {
             if (err == error.Diagnosed and rt.loader.diagnostic.?.incomplete) continue;
-            const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorKeyword(&rt) else nil;
+            const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorKeyword(rt) else nil;
             _ = try rt.report(err);
             // The frames, handlers and bindings an aborted run left
             // must not leak into the next input.
@@ -743,6 +823,18 @@ fn errorKeyword(rt: *Runtime) Value {
 // =============================================================================
 
 const testing = std.testing;
+
+test "cli: opcodeName: the disassembler's spelling of every opcode index" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("cmp:lt", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.lt)) << 6, &buf));
+    try std.testing.expectEqualStrings("cmp:eq-num", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.eq_num)) << 6, &buf));
+    try std.testing.expectEqualStrings("mov:load-const", opcodeName(@as(u12, @backingInt(vm.Group.mov)) | @as(u12, @backingInt(vm.Mov.load_const)) << 6, &buf));
+    try std.testing.expectEqualStrings("var:load-var", opcodeName(@as(u12, @backingInt(vm.Group.var_)) | @as(u12, @backingInt(vm.VarOp.load_var)) << 6, &buf));
+    try std.testing.expectEqualStrings("call:return", opcodeName(@as(u12, @backingInt(vm.Group.call)) | @as(u12, @backingInt(vm.Call.@"return")) << 6, &buf));
+    try std.testing.expectEqualStrings("ctrl:throw", opcodeName(@as(u12, @backingInt(vm.Group.ctrl)) | @as(u12, @backingInt(vm.CtrlOp.throw_)) << 6, &buf));
+    try std.testing.expectEqualStrings("math:?63", opcodeName(@as(u12, @backingInt(vm.Group.math)) | @as(u12, 63) << 6, &buf));
+    try std.testing.expectEqualStrings("simd:?0", opcodeName(@backingInt(vm.Group.simd), &buf));
+}
 
 test "cli: Balance: brackets count outside strings, comments and character literals" {
     const cases = [_]struct { []const u8, bool }{

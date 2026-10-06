@@ -1,0 +1,4 @@
+; bench/micro/cbred.nx N: reduce with a closure as its callback; subtract cbbase.
+(let [n (parse-long (first *command-line-args*))
+      v (vec (range n))]
+  (println (reduce (fn [a x] (+ a x)) 0 v)))
