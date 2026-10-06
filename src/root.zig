@@ -44,6 +44,7 @@ pub const compile = @import("compile.zig");
 pub const format = @import("format.zig");
 pub const loader = @import("loader.zig");
 pub const disasm = @import("disasm.zig");
+pub const image = @import("image.zig");
 pub const nextomic = @import("nextomic/root.zig");
 pub const stdlib = @import("stdlib.zig");
 

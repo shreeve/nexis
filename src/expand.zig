@@ -175,8 +175,10 @@ pub const ExpandContext = struct {
 
 /// The auto-gensym counter. A context lives for one top-level form,
 /// but a name it generates may be defined as a Var that later forms
-/// see, so the counter is process-wide (one isolate, one thread).
-var gensym_counter: u64 = 0;
+/// see, so the counter is process-wide (one isolate, one thread). A
+/// boot from the stdlib image advances it as booting the sources
+/// does (docs/STDLIB.md §1).
+pub var gensym_counter: u64 = 0;
 
 /// Host-Zig macro callback. Takes the call form (head + args)
 /// and produces a rewritten form. The result is then re-fed to

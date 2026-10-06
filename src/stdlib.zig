@@ -50,6 +50,8 @@ const protocol_mod = @import("protocol.zig");
 const nextomic_mod = @import("nextomic/root.zig");
 const transient_mod = @import("coll/transient.zig");
 const loader_mod = @import("loader.zig");
+const image_mod = @import("image.zig");
+const expand_mod = @import("expand.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -111,13 +113,47 @@ pub fn installCore(ns: *Namespace) !void {
 }
 
 /// Install every namespace of the standard library into the
-/// loader's registry, bootstrap the embedded sources into theirs,
-/// and mark each namespace there loaded, so a `require` of one only
-/// aliases it. The CLI and the test harness boot through here. A
-/// failure is a bug in an embedded source; `loader.diagnostic` says
-/// where.
+/// loader's registry, load the embedded sources' image into theirs
+/// (or boot the sources when this build has no image of them), and
+/// mark each namespace there loaded, so a `require` of one only
+/// aliases it (docs/STDLIB.md §1). The CLI and the test harness boot
+/// through here. A failure is a bug in an embedded source or the
+/// image; `loader.diagnostic` says where a source failed.
 pub fn boot(loader: *loader_mod.Loader) !void {
-    const registry = loader.registry;
+    return bootFrom(loader, image);
+}
+
+/// `boot` from the image `bytes`, or from the sources when `bytes`
+/// is no image of them.
+pub fn bootFrom(loader: *loader_mod.Loader, bytes: []const u8) !void {
+    try installNatives(loader.registry);
+    if (image_mod.matches(bytes, &embedded)) {
+        const counted = try image_mod.load(loader.vm, bytes, &embedded);
+        expand_mod.gensym_counter += counted.auto_gensyms;
+        gensym_next += counted.gensyms;
+    } else try bootSources(loader);
+    try markLoaded(loader);
+}
+
+/// Boot the embedded sources as `boot` does, then return the image of
+/// what they left (`image_mod.write`), or fail with `why` saying what
+/// it cannot carry. The build's image generator calls this.
+pub fn writeImage(loader: *loader_mod.Loader, gpa: std.mem.Allocator, why: *[]const u8) ![]u8 {
+    try installNatives(loader.registry);
+    var natives = try image_mod.NativeIndex.scan(gpa, loader.registry);
+    defer natives.deinit(gpa);
+    const before: image_mod.Counted = .{ .auto_gensyms = expand_mod.gensym_counter, .gensyms = gensym_next };
+    try bootSources(loader);
+    try markLoaded(loader);
+    const counted: image_mod.Counted = .{ .auto_gensyms = expand_mod.gensym_counter - before.auto_gensyms, .gensyms = gensym_next - before.gensyms };
+    return image_mod.write(gpa, loader.vm, &natives, &embedded, counted, why);
+}
+
+/// The image the build made of `embedded` (`src/imagegen.zig`); empty
+/// in the generator's own build, which boots the sources.
+pub const image: []const u8 = @embedFile("stdlib_image");
+
+fn installNatives(registry: *vm_mod.NamespaceRegistry) !void {
     const core = registry.core;
     try installCore(core);
     try installTable(try registry.getOrCreate("db", core), &db_natives);
@@ -125,13 +161,21 @@ pub fn boot(loader: *loader_mod.Loader) !void {
     try installTable(try registry.getOrCreate("nexis.math", core), &math_natives);
     try installTable(try registry.getOrCreate("nexis.internal", core), &internal_natives);
     try nextomic_mod.natives.install(try registry.getOrCreate("nextomic", core));
+}
+
+/// Evaluate each embedded source in its namespace, in order.
+fn bootSources(loader: *loader_mod.Loader) !void {
+    const registry = loader.registry;
     const saved = registry.current;
     defer registry.current = saved;
     for (&embedded) |*e| {
-        registry.current = try registry.getOrCreate(e.ns, core);
+        registry.current = try registry.getOrCreate(e.ns, registry.core);
         _ = try loader.evalSource(&e.info, .{ .allocator = loader.persistent_allocator, .declare = false });
     }
-    var names = registry.map.keyIterator();
+}
+
+fn markLoaded(loader: *loader_mod.Loader) !void {
+    var names = loader.registry.map.keyIterator();
     while (names.next()) |name| try loader.markLoaded(name.*);
 }
 
@@ -139,8 +183,7 @@ pub fn boot(loader: *loader_mod.Loader) !void {
 /// time and bootstrapped in this order, each with its namespace
 /// current, after the natives are installed: each file may use the
 /// natives and the files before it.
-const Embedded = struct { ns: []const u8, info: vm_mod.SourceInfo };
-const embedded = [_]Embedded{
+pub const embedded = [_]image_mod.Source{
     // nexis.core's macros and functions over the natives.
     .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx") } },
     // Sugar over the Nextomic natives (`with-conn`).
@@ -3075,7 +3118,8 @@ fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefixN`
-/// (`G__N` by default), N counting up for the process, as Clojure's.
+/// (`G__N` by default), N counting up for the process, as Clojure's;
+/// a boot from the image advances it as booting the sources does.
 var gensym_next: u64 = 0;
 
 fn fnGensym(vm: *VM, args: []const Value) VmError!Value {
@@ -6484,4 +6528,175 @@ test "stdlib: decimalLen agrees with printInt at every power of ten and the i64 
         x *%= 10;
     }
     for ([_]i64{ std.math.maxInt(i64), std.math.minInt(i64) }) |v| try std.testing.expectEqual(std.fmt.printInt(&buf, v, 10, .lower, .{}), decimalLen(v));
+}
+
+/// A runtime the image tests boot: a VM with its registry, the host
+/// macros and a loader, on an allocator that checks for leaks.
+const ImageTestRuntime = struct {
+    gpa: std.heap.SafeAllocator,
+    v: VM,
+    host_macros: expand_mod.HostMacroTable,
+    loader: loader_mod.Loader,
+
+    /// In place: the loader keeps pointers into the runtime.
+    fn init(rt: *ImageTestRuntime) !void {
+        rt.gpa = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        const gpa = rt.gpa.allocator();
+        rt.v = try VM.init(gpa, &VM.idle_routine);
+        const interner = rt.v.ensureInterner();
+        const registry = try rt.v.ensureRegistry();
+        rt.host_macros = try expand_mod.defaultMacros(gpa);
+        rt.loader = loader_mod.Loader.init(gpa, rt.v.runtime_arena.allocator(), testing.io, &.{}, &rt.v, interner, registry, &rt.host_macros);
+    }
+
+    fn deinit(rt: *ImageTestRuntime) void {
+        rt.loader.deinit();
+        rt.host_macros.deinit(rt.gpa.allocator());
+        rt.v.deinit();
+        if (rt.gpa.deinit() != 0) @panic("the runtime leaked");
+    }
+
+    /// `src`'s value printed, evaluated in `ns`.
+    fn eval(rt: *ImageTestRuntime, ns: []const u8, src: []const u8) ![]u8 {
+        const saved = rt.loader.registry.current;
+        defer rt.loader.registry.current = saved;
+        rt.loader.registry.current = try rt.loader.registry.getOrCreate(ns, rt.loader.registry.core);
+        const info: vm_mod.SourceInfo = .{ .path = "<test>", .text = src };
+        const v = try rt.loader.evalSource(&info, .{ .allocator = rt.v.runtime_arena.allocator() });
+        var w = std.Io.Writer.Allocating.init(testing.allocator);
+        errdefer w.deinit();
+        try format_mod.format(v, .readable, &w.writer, rt.v.ensureInterner());
+        return w.toOwnedSlice();
+    }
+};
+
+/// `bootFrom` as the first boot of a process: the names it generates
+/// count from zero, as the build's boot that wrote the image did.
+fn bootFirst(loader: *loader_mod.Loader, bytes: []const u8) !void {
+    const saved = .{ expand_mod.gensym_counter, gensym_next };
+    expand_mod.gensym_counter = 0;
+    gensym_next = 0;
+    defer {
+        expand_mod.gensym_counter = @max(expand_mod.gensym_counter, saved[0]);
+        gensym_next = @max(gensym_next, saved[1]);
+    }
+    try bootFrom(loader, bytes);
+}
+
+fn expectVerified(a: *VM, b: *VM) !void {
+    var why: []const u8 = "";
+    image_mod.verify(testing.allocator, a, b, &why) catch |err| {
+        std.debug.print("image differs: {s}\n", .{why});
+        testing.allocator.free(why);
+        return err;
+    };
+}
+
+test "stdlib: the embedded image loads what booting the sources leaves" {
+    try testing.expect(image_mod.matches(image, &embedded));
+    var a: ImageTestRuntime = undefined;
+    try a.init();
+    defer a.deinit();
+    try bootFirst(&a.loader, "");
+    var b: ImageTestRuntime = undefined;
+    try b.init();
+    defer b.deinit();
+    try boot(&b.loader);
+    try expectVerified(&a.v, &b.v);
+    // An image from another build boots the sources.
+    var other = try testing.allocator.dupe(u8, image);
+    defer testing.allocator.free(other);
+    other[magic_offset] +%= 1;
+    try testing.expect(!image_mod.matches(other, &embedded));
+    var c: ImageTestRuntime = undefined;
+    try c.init();
+    defer c.deinit();
+    try bootFirst(&c.loader, other);
+    try expectVerified(&a.v, &c.v);
+}
+
+/// Where the fingerprint of an image starts: past the magic and the
+/// format number.
+const magic_offset = 12;
+
+test "stdlib: an image carries every kind of value it writes, with its sharing" {
+    const extra: image_mod.Source = .{ .ns = "image.test", .info = .{ .path = "image_test.nx", .text =
+        \\(def big 123456789012345678901234567890)
+        \\(def re #"a+b")
+        \\(defrecord P [x y])
+        \\(def p (->P 1 [2 3]))
+        \\(defprotocol Shape (area [s]) (label [s]))
+        \\(extend-protocol Shape P (area [s] (:x s)) :any (label [_] :other))
+        \\(def shared (let [c (atom [])] [(fn [x] (swap! c conj x)) (fn [] @c)]))
+        \\(def data ^{:tag :v} [1 2.5 \c "s" :k :q/k 'sym 'q/sym '(1 ^:m (2 3)) #{1 2} {:a {:b [nil true false]}} -0.0])
+        \\(defn count-down [n] (if (zero? n) :done (recur (dec n))))
+        \\(def self-ref (fn me [n] (if (zero? n) 0 (+ 1 (me (dec n))))))
+        \\(def ^:dynamic *d* 1)
+        \\(def ^:private hidden (list 1 2 3))
+        \\(defmacro twice [x] `(do ~x ~x))
+        \\(def same-twice [data data])
+    } };
+    const sources = embedded ++ [_]image_mod.Source{extra};
+    const gpa = testing.allocator;
+
+    var a: ImageTestRuntime = undefined;
+    try a.init();
+    defer a.deinit();
+    try installNatives(a.loader.registry);
+    var natives = try image_mod.NativeIndex.scan(gpa, a.loader.registry);
+    defer natives.deinit(gpa);
+    try bootSources(&a.loader);
+    a.loader.registry.current = try a.loader.registry.getOrCreate(extra.ns, a.loader.registry.core);
+    _ = try a.loader.evalSource(&sources[sources.len - 1].info, .{ .allocator = a.v.runtime_arena.allocator() });
+    a.loader.registry.current = a.loader.registry.core;
+    var why: []const u8 = "";
+    const bytes = try image_mod.write(gpa, &a.v, &natives, &sources, .{ .auto_gensyms = 0, .gensyms = 0 }, &why);
+    defer gpa.free(bytes);
+
+    var b: ImageTestRuntime = undefined;
+    try b.init();
+    defer b.deinit();
+    try installNatives(b.loader.registry);
+    _ = try image_mod.load(&b.v, bytes, &sources);
+    try expectVerified(&a.v, &b.v);
+
+    // What the loaded values do.
+    const probe =
+        \\[((first shared) 5) ((first shared) 6) ((second shared) )
+        \\ (area p) (label 1) (re-find re "xaab") (+ big 1) (count-down 3) (self-ref 4)
+        \\ (meta data) (meta (nth (nth data 8) 1)) (identical? (first same-twice) (second same-twice))
+        \\ (let [n (atom 0)] (twice (swap! n inc)) @n) (:dynamic (meta #'*d*)) (count (ns-publics 'image.test))]
+    ;
+    const want = try a.eval("image.test", probe);
+    defer gpa.free(want);
+    const got = try b.eval("image.test", probe);
+    defer gpa.free(got);
+    try testing.expectEqualStrings(want, got);
+}
+
+test "stdlib: a truncated image fails to load as Corrupt, never a crash" {
+    var cut: usize = 64;
+    while (cut < image.len) : (cut += image.len / 23) {
+        var rt: ImageTestRuntime = undefined;
+        try rt.init();
+        defer rt.deinit();
+        try installNatives(rt.loader.registry);
+        try testing.expectError(error.Corrupt, image_mod.load(&rt.v, image[0..cut], &embedded));
+    }
+}
+
+test "stdlib: the image refuses what it cannot carry" {
+    const gpa = testing.allocator;
+    var a: ImageTestRuntime = undefined;
+    try a.init();
+    defer a.deinit();
+    try installNatives(a.loader.registry);
+    var natives = try image_mod.NativeIndex.scan(gpa, a.loader.registry);
+    defer natives.deinit(gpa);
+    try bootSources(&a.loader);
+    const sorted = try a.eval("nexis.core", "(def image-test-sorted (sorted-map 1 2))");
+    gpa.free(sorted);
+    var why: []const u8 = "";
+    try testing.expectError(error.Unsupported, image_mod.write(gpa, &a.v, &natives, &embedded, .{ .auto_gensyms = 0, .gensyms = 0 }, &why));
+    try testing.expectEqualStrings("sorted_map", why);
 }
