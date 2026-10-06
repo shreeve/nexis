@@ -149,9 +149,19 @@ that never falls through (`jump:jmp`, `call:return`,
 has no upvalues, and so every routine a closure built under it can
 be; a routine that fails runs nothing, and its error leaves `run` or
 `runRoutine` with a one-frame trace naming the instruction (§13). The
-dispatch trusts what verification proved (§8). `allocClosure`, the
-only way to a closure, verifies its routine again in a debug build,
-so a closure over a routine no run verified is an assertion there.
+stdlib image's loader verifies each routine it loads in debug and safe
+builds, and the image a release build loads is the one the build's
+generator loaded and verified (`docs/STDLIB.md` §1). The dispatch
+trusts what verification proved (§8). `allocClosure` verifies its
+routine again in a debug build, so a closure over a routine nothing
+verified is an assertion there; the image loader alone uses
+`allocClosureUnverified`, since it makes each closure before the
+routine it runs is read, and verifies every routine (`verifyAlone`,
+each once) when the image is whole. Verification never traps: a
+routine longer than a pc can name is `BytecodeCorruption` before any
+of it is read, and capture descriptors that lead back to their own
+routine, which no compiler makes, end in the stack guard's
+`StackOverflow`.
 
 ---
 

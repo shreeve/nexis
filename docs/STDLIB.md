@@ -61,6 +61,17 @@ those of a first boot in the process, as the build's was. Keywords
 and symbols are written as text and interned again, natives as the
 Var step 2 installed them in.
 
+The loader makes each closure before the routine it runs is read, so
+it verifies the routines (`Routine.verifyAlone`, `docs/VM.md` §5)
+once the image is whole: in debug and safe builds every routine, and
+one that does not verify fails the load with `UnfitRoutine` instead
+of reaching the dispatch, which trusts verified code (VM.md §8). A
+release build trusts them: the only image it loads is the one it
+embeds (an image whose header differs is not loaded), byte for byte
+the image the generator, a debug build, loaded and verified before
+the binary was built, and verifying it again would cost every start
+0.35 M instructions, 1.6% (`docs/PERF.md` §3.18).
+
 It is an internal format of one build, not the codec: no other build
 reads it, and nothing in it is compatible across versions (PLAN §23
 #25 governs the codec alone). Its header carries a format number and

@@ -6685,6 +6685,31 @@ test "stdlib: a truncated image fails to load as Corrupt, never a crash" {
     }
 }
 
+test "stdlib: an image holding a routine that does not verify is refused, not loaded" {
+    if (!image_mod.verify_routines) return error.SkipZigTest;
+    // The first instruction of `interpose`'s routine, the last record
+    // that names it, made other than primary: the image is otherwise
+    // whole, and only the routine's verification can tell.
+    const bytes = try testing.allocator.dupe(u8, image);
+    defer testing.allocator.free(bytes);
+    const name = "interpose";
+    var record: [4 + name.len]u8 = undefined;
+    std.mem.writeInt(u32, record[0..4], name.len, .little);
+    @memcpy(record[4..], name);
+    var at = (std.mem.findLast(u8, bytes, &record) orelse return error.TestUnexpectedResult) + record.len;
+    at += 2 + 2 + 1 + 2; // slot count, fixed arity, variadic, upvalue count
+    at += 1 + @as(usize, if (bytes[at] != 0) 8 else 0); // the origin
+    at += 4; // the source
+    try testing.expect(std.mem.readInt(u32, bytes[at..][0..4], .little) > 0);
+    at += 4;
+    bytes[at] |= 1; // the instruction's kind, its low four bits
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try installNatives(rt.loader.registry);
+    try testing.expectError(error.UnfitRoutine, image_mod.load(&rt.v, bytes, &embedded));
+}
+
 test "stdlib: the image refuses what it cannot carry" {
     const gpa = testing.allocator;
     var a: ImageTestRuntime = undefined;

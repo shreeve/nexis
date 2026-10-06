@@ -483,19 +483,33 @@ pub const Routine = struct {
     /// the routine, and the last instruction one that never falls
     /// through, so execution cannot run off the code. The dispatch
     /// trusts all of it (§8). On an error `failure` names the routine
-    /// and the instruction.
+    /// and the instruction. Whatever the routine holds, verification
+    /// returns an error and never traps.
     pub fn verify(self: *const Routine, failure: *VerifyFailure) VmError!void {
         stack_guard.check() catch return VmError.StackOverflow;
+        try self.verifyAlone(failure);
+        for (self.capture_descs) |desc| try desc.routine.verify(failure);
+    }
+
+    /// `verify` of this routine without the routines its capture
+    /// descriptors build: for a loader that verifies every routine it
+    /// made, each once (`image.zig`).
+    pub fn verifyAlone(self: *const Routine, failure: *VerifyFailure) VmError!void {
+        const code = self.code;
+        // A pc is 32 bits (§3): a longer routine is refused before any
+        // of it is read.
+        if (code.len > std.math.maxInt(u32)) {
+            failure.* = .{ .routine = self, .pc = 0 };
+            return VmError.BytecodeCorruption;
+        }
         // The code's end is reported at its last instruction, as a run
         // that falls off it is (§13).
-        failure.* = .{ .routine = self, .pc = @intCast(self.code.len -| 1) };
-        const code = self.code;
+        failure.* = .{ .routine = self, .pc = @intCast(code.len -| 1) };
         if (code.len == 0 or !neverFallsThrough(code[code.len - 1])) return VmError.BytecodeExhausted;
         for (code, 0..) |inst, i| {
             failure.pc = @intCast(i);
             try self.verifyInst(inst);
         }
-        for (self.capture_descs) |desc| try desc.routine.verify(failure);
     }
 
     fn neverFallsThrough(inst: Inst) bool {
@@ -2523,6 +2537,13 @@ pub const VM = struct {
             var failure: VerifyFailure = undefined;
             routine.verify(&failure) catch |err| std.debug.panic("closure over an unverified routine {s}: {t} at {d}", .{ routine.name, err, failure.pc });
         }
+        return self.allocClosureUnverified(routine, upvalue_count);
+    }
+
+    /// `allocClosure` without its check, for the image loader, which
+    /// makes closures before the routines they run are complete and
+    /// verifies every routine once the image is (`image.zig`, §5).
+    pub fn allocClosureUnverified(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
         const heap = self.ensureHeap();
         const body_size = @sizeOf(Closure) + upvalue_count * @sizeOf(*UpvalCell);
         const h = try heap.alloc(.function, body_size);
@@ -7569,6 +7590,66 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
     var vm = try VM.init(testing.allocator, &counted);
     defer vm.deinit();
     try testing.expectError(VmError.CaptureCountMismatch, vm.run());
+}
+
+test "Routine.verify: any routine at all passes or is refused, never a trap" {
+    var failure: VerifyFailure = undefined;
+    // More instructions than a pc can name: refused before any is read
+    // (the slice runs far past the one instruction behind it).
+    const one = [_]Inst{asm_.returnNil()};
+    const huge = Routine{ .code = @as([*]const Inst, &one)[0 .. @as(usize, std.math.maxInt(u32)) + 2], .consts = &.{}, .slot_count = 1, .name = "huge" };
+    try testing.expectError(VmError.BytecodeCorruption, huge.verify(&failure));
+    try testing.expectEqualStrings("huge", failure.routine.name);
+    // A routine whose capture builds itself, which no compiler makes:
+    // `verify` descends until the stack guard stops it, `verifyAlone`
+    // proves the routine itself.
+    stack_guard.armIfUnarmed(stack_guard.main_thread_budget);
+    var cyclic = Routine{ .code = &.{ asm_.closureMake(0, 0), asm_.returnNil() }, .consts = &.{}, .slot_count = 1, .name = "cyclic" };
+    const cyclic_caps = [_]CaptureDescriptor{.{ .routine = &cyclic, .sources = &.{} }};
+    cyclic.capture_descs = &cyclic_caps;
+    try testing.expectError(VmError.StackOverflow, cyclic.verify(&failure));
+    try cyclic.verifyAlone(&failure);
+    // Random words, biased toward primary instructions of assigned
+    // groups with small operands so every check is reached; a refusal
+    // names an instruction of the routine.
+    var prng = std.Random.DefaultPrng.init(0x7e51f1ed);
+    const rand = prng.random();
+    const consts = [_]Value{ fx(1), fx(2) };
+    const tries = [_]Try{ .{ .catch_pc = 3 }, .{ .catch_pc = 70, .finally_pc = 1 } };
+    const leaf = Routine{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "leaf" };
+    var sources: [2]CaptureSource = undefined;
+    const caps = [_]CaptureDescriptor{.{ .routine = &leaf, .sources = sources[0..1] }};
+    var code: [48]Inst = undefined;
+    var verified: usize = 0;
+    for (0..20_000) |_| {
+        const len = rand.uintAtMost(usize, code.len);
+        for (code[0..len]) |*inst| {
+            var bits = rand.int(u64);
+            if (rand.uintLessThan(u8, 8) != 0) {
+                const op: u64 = rand.uintLessThan(u64, 14) | rand.uintLessThan(u64, 10) << 6;
+                bits = bits & ~@as(u64, 0xFFFF) | op << 4;
+            }
+            if (rand.boolean()) bits &= 0x00F3_00F3_00F3_FFFF;
+            inst.* = @bitCast(bits);
+        }
+        if (len > 0 and rand.boolean()) code[len - 1] = asm_.returnNil();
+        for (&sources) |*s| s.* = if (rand.boolean()) .{ .local_cell_slot = rand.int(u4) } else .{ .inherited_upvalue = rand.int(u2) };
+        const routine = Routine{
+            .code = code[0..len],
+            .consts = &consts,
+            .capture_descs = &caps,
+            .tries = &tries,
+            .slot_count = rand.uintAtMost(u16, 20),
+            .upvalue_count = rand.uintAtMost(u16, 3),
+            .name = "random",
+        };
+        routine.verify(&failure) catch {
+            try testing.expect(failure.pc < @max(len, 1));
+            continue;
+        };
+        verified += 1;
+    }
+    try testing.expect(verified > 0);
 }
 
 test "VM dispatch: a trap after fast instructions names its instruction in every frame" {

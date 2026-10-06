@@ -163,6 +163,8 @@ pub const LoadError = error{
     /// The image is not well formed, or does not describe this
     /// runtime: an image from this build never is.
     Corrupt,
+    /// A routine the image carries does not verify (docs/VM.md §5).
+    UnfitRoutine,
 };
 
 const In = struct {
@@ -825,12 +827,23 @@ fn metaOf(h: *HeapHeader) Value {
 // Loading
 // =============================================================================
 
+/// Whether `load` verifies every routine it read (docs/STDLIB.md §1):
+/// in debug and safe builds, the build's generator among them, which
+/// loads every image a binary embeds before the binary is built. A
+/// release build loads only those bytes (`matches` refuses any other
+/// image) and trusts them; verifying costs it 0.35 M instructions, 1.6%
+/// of a start (docs/PERF.md §3.18).
+pub const verify_routines = std.debug.runtime_safety;
+
 /// Load the image `bytes`, which `matches` accepted for `sources`,
 /// into `vm`, whose natives are installed and which has run nothing:
 /// afterwards it holds what booting `sources` would have left.
 /// Nothing in it reaches a safe point, so nothing it builds needs
-/// rooting until the Vars hold it. Returns what the boot generated,
-/// for the caller to advance its counters by.
+/// rooting until the Vars hold it. Its closures are made before the
+/// routines they run are read, so each routine is verified once the
+/// image is whole (`verify_routines`), and one that does not verify
+/// fails the load with `UnfitRoutine`. Returns what the boot
+/// generated, for the caller to advance its counters by.
 pub fn load(vm: *VM, bytes: []const u8, sources: []const Source) LoadError!Counted {
     var scratch: std.heap.ArenaAllocator = .init(vm.allocator);
     defer scratch.deinit();
@@ -884,6 +897,10 @@ const Loader = struct {
         try l.readAliases();
         try l.readImpls();
         if (l.in.pos != l.in.bytes.len) return error.Corrupt;
+        if (verify_routines) for (l.routines) |*r| {
+            var failure: vm_mod.VerifyFailure = undefined;
+            r.verifyAlone(&failure) catch return error.UnfitRoutine;
+        };
         return counted;
     }
 
@@ -979,7 +996,9 @@ const Loader = struct {
     }
 
     fn readObjects(l: *Loader, totals: Totals) LoadError!void {
+        // Each routine is empty until `readRoutines` reads it.
         l.routines = try l.arena.alloc(Routine, totals.routines);
+        @memset(l.routines, .{ .code = &.{}, .consts = &.{}, .slot_count = 0 });
         l.objects = try l.scratch.alloc(Value, totals.objects);
         var elems: std.ArrayList(Value) = .empty;
         var entries: std.ArrayList(champ_mod.Entry) = .empty;
@@ -1025,7 +1044,7 @@ const Loader = struct {
                     .function => blk: {
                         const routine = &l.routines[try l.in.index(l.routines.len)];
                         const n = try l.in.int(u32);
-                        const f = try mem(l.vm.allocClosure(routine, n));
+                        const f = try mem(l.vm.allocClosureUnverified(routine, n));
                         const cells: []*UpvalCell = @constCast(VM.asClosure(f).upvalues);
                         for (cells) |*c| {
                             const cell = l.objects[try check(try l.in.int(u32), i)];

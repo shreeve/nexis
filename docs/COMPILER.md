@@ -338,6 +338,14 @@ constant pool, Var table, capture descriptors, span table,
   compile time (§4.7).
 - A closure's upvalues are numbered 0..N-1 and it captures N cell
   pointers at construction.
+- `Routine.verify` (VM.md §5) is the check on these invariants and on
+  every operand the emitter writes: the VM verifies each top-level
+  routine, and every routine under it, before any of it runs, and the
+  stdlib image's generator each routine of the image (STDLIB.md §1).
+  A routine that breaks one (a jump left at its placeholder, an
+  operand past its table, code that can fall off its end) is refused
+  there with the instruction named, never run by a dispatch that
+  trusts it (VM.md §8).
 
 #### 4.6 Spans
 
