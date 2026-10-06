@@ -309,7 +309,7 @@ const core_natives = table("", .{
     .{ "last", 1, 1, &fnLast },
     .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
-    .{ "nthnext", 2, 2, &fnNthnext },
+    .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext },
     .{ "take-last", 2, 2, &fnTakeLast },
     .{ "repeat", 1, 2, &fnRepeat },
     .{ "repeatedly", 1, 2, &fnRepeatedly },
@@ -2499,6 +2499,15 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
 /// destructuring rest (`[a b & more]`) costs one block.
 fn fnNthnext(vm: *VM, args: []const Value) VmError!Value {
     return fnSeq(vm, &.{try fnNthrest(vm, args)});
+}
+
+/// `nthnext` as a leaf (VM.md §6): of nil, a list or a vector; any
+/// other seqable goes the general way.
+fn fnNthnextLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .nil, .list, .persistent_vector => fnNthnext(vm, args),
+        else => VmError.NeedsReentry,
+    };
 }
 
 /// `(take-last n coll)`; of nothing it is nil, as Clojure's.
