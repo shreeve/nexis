@@ -68,7 +68,9 @@ changes to emdb.
 - The runtime reads three environment variables. `NEXIS_GC_STRESS=1`
   makes every VM collect every 4 KiB of allocation (`docs/GC.md` §7);
   `zig build test -Dgc-stress` sets it on every test and program the
-  gate runs, which proves the natives' rooting.
+  gate runs but `long-sequences.nx` (a million-value live set makes
+  every collection mark it, which is quadratic), which proves the
+  natives' rooting.
   `NEXIS_MAX_ALLOC=BYTES` refuses every allocation past BYTES
   (`docs/TOOLING.md` §1); the out-of-memory and REPL goldens set it
   on their runs, which otherwise start from an empty environment.

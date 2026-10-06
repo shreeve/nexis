@@ -260,6 +260,12 @@ pub fn build(b: *std.Build) void {
             stdin: ?[]const u8 = null,
             /// `NEXIS_MAX_ALLOC` for the run (TOOLING.md §1).
             max_alloc: ?[]const u8 = null,
+            /// Run under `-Dgc-stress` too. A program that keeps a large
+            /// live set while it allocates is quadratic there (every
+            /// collection marks the whole set), so it opts out; the
+            /// natives it exercises meet the collector's stress policy
+            /// in eval_pipeline.
+            stress: bool = true,
         };
         const cli = "test/golden/cli/";
         const cases = [_]CliGolden{
@@ -277,7 +283,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "unicode-columns.nx" }, .stderr = "unicode-columns.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "deep-trace.nx" }, .stderr = "deep-trace.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
-            .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304" },
+            .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304", .stress = false },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
@@ -297,7 +303,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
         };
         for (cases) |case| {
-            const run = scripts.program(env.gc_stress);
+            const run = scripts.program(env.gc_stress and case.stress);
             run.setCwd(b.path("."));
             if (case.max_alloc) |max| run.setEnvironmentVariable("NEXIS_MAX_ALLOC", max);
             run.addArgs(case.args);
