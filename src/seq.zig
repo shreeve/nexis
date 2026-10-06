@@ -377,9 +377,9 @@ const Sieve = enum {
 /// A slice of a chunked seq's elements and the seq after them, read
 /// without allocating: the leaf of a vector view from its offset, or a
 /// chunked cons's chunk from its offset (LAZY.md §7).
-const Chunk = struct { items: []const Value, after: Value };
+pub const Chunk = struct { items: []const Value, after: Value };
 
-fn chunkOf(s: Value) ?Chunk {
+pub fn chunkOf(s: Value) ?Chunk {
     switch (s.kind()) {
         .list => {
             const items = list_mod.viewChunk(s) orelse return null;

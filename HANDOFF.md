@@ -114,8 +114,8 @@ Sexp
    │  src/reader.zig    canonical Form tree (PLAN §28): spans, merged ^meta, #() as the
    ▼                    anon-fn datum, syntax-quote marker, reader errors
 Form {datum, origin}
-   │  src/expand.zig    macros to a fixpoint: 19 host macros in Zig (let fn defn defn-
-   ▼                    loop when when-not and or cond -> ->> case condp for defrecord
+   │  src/expand.zig    macros to a fixpoint: 18 host macros in Zig (let fn defn defn-
+   ▼                    loop when when-not and or cond -> ->> case condp defrecord
                         defprotocol extend-type extend-protocol), the try, ns, require,
                         defmacro and set! rules, user macros run in a compile-time
                         sub-VM, syntax-quote with auto-gensym

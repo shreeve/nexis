@@ -330,6 +330,14 @@ const core_natives = table("", .{
     .{ "realized?", 1, 1, &fnRealizedQ },
     .{ "doall", 1, 2, &fnDoall },
     .{ "dorun", 1, 2, &fnDorun },
+    .{ "chunked-seq?", 1, 1, &fnChunkedSeqQ },
+    .{ "chunk-first", 1, 1, &fnChunkFirst },
+    .{ "chunk-rest", 1, 1, &fnChunkRest },
+    .{ "chunk-next", 1, 1, &fnChunkNext },
+    .{ "chunk-buffer", 1, 1, &fnChunkBuffer },
+    .{ "chunk-append", 2, 2, &fnChunkAppend },
+    .{ "chunk", 1, 1, &fnChunk },
+    .{ "chunk-cons", 2, 2, &fnChunkCons },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
     .{ "class", 1, 1, &fnClass },
     .{ "var?", 1, 1, kindPredicate(isVar) },
@@ -3624,6 +3632,69 @@ fn fnDorun(vm: *VM, args: []const Value) VmError!Value {
 fn realizeArg(vm: *VM, args: []const Value) VmError!void {
     const limit: ?usize = if (args.len == 2) try requireCount(args[0]) else null;
     try seq_mod.realizeSpine(vm, args[args.len - 1], limit);
+}
+
+// The chunk functions, for library code written against Clojure's
+// (docs/LAZY.md §7): a chunk is a vector here, and a chunk buffer a
+// transient vector; `chunk-cons` copies the vector into a chunk block.
+
+/// `(chunked-seq? s)` → whether `s` is a seq that hands out chunks: a
+/// chunked cons or a vector's view.
+fn fnChunkedSeqQ(_: *VM, args: []const Value) VmError!Value {
+    return value_mod.fromBool(seq_mod.chunkOf(args[0]) != null);
+}
+
+fn chunkArg(s: Value) VmError!seq_mod.Chunk {
+    return seq_mod.chunkOf(s) orelse VmError.KindMismatch;
+}
+
+/// `(chunk-first s)` → the elements of `s`'s first chunk, a vector.
+fn fnChunkFirst(vm: *VM, args: []const Value) VmError!Value {
+    return vector_mod.fromSlice(vm.ensureHeap(), (try chunkArg(args[0])).items) catch VmError.OutOfMemory;
+}
+
+/// `(chunk-rest s)` → what follows the first chunk, `()` when nothing.
+fn fnChunkRest(vm: *VM, args: []const Value) VmError!Value {
+    const after = (try chunkArg(args[0])).after;
+    if (after.isNil()) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+    return after;
+}
+
+/// `(chunk-next s)` → the seq after the first chunk, nil when nothing.
+fn fnChunkNext(vm: *VM, args: []const Value) VmError!Value {
+    return seq_mod.seqOf(vm, (try chunkArg(args[0])).after);
+}
+
+/// `(chunk-buffer n)` → an empty transient vector to append to.
+fn fnChunkBuffer(vm: *VM, args: []const Value) VmError!Value {
+    _ = try requireFixnum(args[0]);
+    return fnTransient(vm, &.{vector_mod.empty(vm.ensureHeap()) catch return VmError.OutOfMemory});
+}
+
+/// `(chunk-append b x)` → `(conj! b x)`.
+fn fnChunkAppend(vm: *VM, args: []const Value) VmError!Value {
+    return fnConjBang(vm, args);
+}
+
+/// `(chunk b)` → the buffer's elements, a vector.
+fn fnChunk(vm: *VM, args: []const Value) VmError!Value {
+    return fnPersistentBang(vm, args);
+}
+
+/// `(chunk-cons c rest)` → the elements of `c` (a vector) in front of
+/// `rest`, or `rest` itself when `c` is empty, as Clojure's.
+fn fnChunkCons(vm: *VM, args: []const Value) VmError!Value {
+    const c = args[0];
+    if (c.kind() != .persistent_vector) return VmError.KindMismatch;
+    const n = vector_mod.count(c);
+    if (n == 0) return args[1];
+    const more = if (lazy_mod.isMore(args[1])) args[1] else try seq_mod.seqOf(vm, args[1]);
+    // `Heap.alloc` never collects: the chunk needs no root on its way in.
+    const chunked = lazy_mod.allocChunked(vm.ensureHeap(), n) catch return VmError.OutOfMemory;
+    var it = vector_mod.Cursor.init(c);
+    for (lazy_mod.chunkItems(chunked)) |*slot| slot.* = it.next().?;
+    lazy_mod.finishChunked(chunked, n, more);
+    return chunked;
 }
 
 /// `(#%lazy-seq f)` → an unrealized lazy block whose body calls `f`

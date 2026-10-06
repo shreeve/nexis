@@ -555,6 +555,88 @@
                  (let [~pat (first ~s)] ~inner)
                  nil))))))))
 
+; (for [binding coll modifiers... binding coll ...] body) → the lazy
+; seq of body for each binding, the last varying fastest, as Clojure
+; 1.12's for (docs/LAZY.md §7): one iterator per binding, each a
+; lazy-seq over the seq of its coll; the innermost walks a chunk at a
+; time where its coll is chunked, applying :let [b], :when t (skip the
+; element) and :while t (end that binding's walk) inside the chunk; an
+; outer one concatenates the inner seq onto the walk of its rest. One
+; binding and no modifiers is (map (fn [binding] body) coll).
+(defmacro for [seq-exprs body-expr]
+  (when (or (not (vector? seq-exprs)) (zero? (count seq-exprs)) (odd? (count seq-exprs)))
+    (throw (ex-info "for requires an even number of forms in the binding vector" {})))
+  (when (keyword? (first seq-exprs))
+    (throw (ex-info "for: a modifier needs a binding before it" {})))
+  (if (= 2 (count seq-exprs))
+    `(map (fn* [x#] (let [~(first seq-exprs) x#] ~body-expr)) ~(second seq-exprs))
+    (let [groups (reduce (fn* [groups pair]
+                           (if (keyword? (first pair))
+                             (conj (pop groups) (conj (peek groups) pair))
+                             (conj groups [(first pair) (second pair)])))
+                         [] (partition 2 seq-exprs))
+          check (fn* [k]
+                  (when-not (contains? #{:let :when :while} k)
+                    (throw (ex-info (str "for: unknown modifier " k) {}))))
+          emit-bind
+          (fn emit-bind [groups]
+            (let [group (first groups)
+                  bind (first group)
+                  mod-pairs (drop 2 group)
+                  next-groups (next groups)
+                  giter (gensym "iter__")
+                  gxs (gensym "s__")
+                  do-mod (fn do-mod [mods]
+                           (let [k (first (first mods)) v (second (first mods))]
+                             (when k (check k))
+                             (cond
+                               (= k :let) `(let ~v ~(do-mod (rest mods)))
+                               (= k :while) `(when ~v ~(do-mod (rest mods)))
+                               (= k :when) `(if ~v ~(do-mod (rest mods)) (recur (rest ~gxs)))
+                               next-groups `(let [iterys# ~(emit-bind next-groups)
+                                                  fs# (seq (iterys# ~(second (first next-groups))))]
+                                              (if fs#
+                                                (concat fs# (~giter (rest ~gxs)))
+                                                (recur (rest ~gxs))))
+                               true `(cons ~body-expr (~giter (rest ~gxs))))))]
+              (if next-groups
+                `(fn ~giter [~gxs]
+                   (lazy-seq
+                     (loop [~gxs ~gxs]
+                       (when-first [~bind ~gxs]
+                         ~(do-mod mod-pairs)))))
+                (let [gi (gensym "i__")
+                      gb (gensym "b__")
+                      gc (gensym "c__")
+                      gsize (gensym "size__")
+                      do-cmod (fn do-cmod [mods]
+                                (let [k (first (first mods)) v (second (first mods))]
+                                  (when k (check k))
+                                  (cond
+                                    (= k :let) `(let ~v ~(do-cmod (rest mods)))
+                                    (= k :while) `(when ~v ~(do-cmod (rest mods)))
+                                    (= k :when) `(if ~v ~(do-cmod (rest mods)) (recur (inc ~gi)))
+                                    true `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi))))))]
+                  `(fn ~giter [~gxs]
+                     (lazy-seq
+                       (loop [~gxs ~gxs]
+                         (when-let [~gxs (seq ~gxs)]
+                           (if (chunked-seq? ~gxs)
+                             (let [~gc (chunk-first ~gxs)
+                                   ~gsize (count ~gc)
+                                   ~gb (chunk-buffer ~gsize)]
+                               (if (loop [~gi 0]
+                                     (if (< ~gi ~gsize)
+                                       (let [~bind (nth ~gc ~gi)]
+                                         ~(do-cmod mod-pairs))
+                                       true))
+                                 (chunk-cons (chunk ~gb) (~giter (chunk-rest ~gxs)))
+                                 (chunk-cons (chunk ~gb) nil)))
+                             (let [~bind (first ~gxs)]
+                               ~(do-mod mod-pairs)))))))))))]
+      `(let [iter# ~(emit-bind groups)]
+         (iter# ~(second seq-exprs))))))
+
 ; ============================================================
 ; Threading macros
 ; ============================================================

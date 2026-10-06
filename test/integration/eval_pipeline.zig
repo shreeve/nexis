@@ -4149,6 +4149,13 @@ test "for: :while ends its loop, patterns destructure, modifiers compose" {
     try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
 }
 
+test "for: lazy, 32 at a time over a chunked innermost source, as Clojure's" {
+    // Expected values from babashka.
+    try expectOutput("[(take 3 (for [x (range) :when (odd? x)] x)) (let [n (atom 0)] (first (for [x (range 3) y (range 100)] (do (swap! n inc) [x y]))) @n) (for [x (range 3) :while (< x 2) y [:a]] [x y]) (let [n (atom 0)] (first (for [x (range 100)] (do (swap! n inc) x))) @n) (let [n (atom 0)] (first (for [x (range 100) :when (odd? x)] (do (swap! n inc) x))) @n)]", "[(1 3 5) 32 ([0 :a] [1 :a]) 32 16]");
+    try expectOutput("[(class (for [x [1]] x)) (take 4 (for [x (range) y (range x)] [x y]))]", "[:lazy_seq ([1 0] [2 0] [2 1] [3 0])]");
+    try expectOutput("[(chunked-seq? (seq [1 2])) (chunked-seq? (list 1 2)) (count (chunk-first (seq [1 2 3]))) (nth (chunk-first (seq [1 2 3])) 2) (chunk-rest (seq [1 2])) (chunk-next (seq [1 2])) (let [b (chunk-buffer 2)] (chunk-append b 1) (chunk-append b 2) (chunk-cons (chunk b) (list 3))) (chunked-seq? (map inc [1 2]))]", "[true false 3 3 () nil (1 2 3) false]");
+}
+
 test "doseq: :when, :while and :let modifiers, destructuring, nil result" {
     try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :when (odd? x)] (swap! a conj x)) @a)", "[1 3]");
     try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3)] (swap! a conj x)) @a)", "[1 2]");

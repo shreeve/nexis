@@ -384,7 +384,7 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(and (h a) (h b) (h c))` | 14 |
 | `(-> a (g b) (h) (g c))` | 10 |
 | `(doseq [x xs] (g x))` | 15 |
-| `(for [x xs] (h x))` | 24 |
+| `(for [x xs] (h x))`, a call of `map` over a closure (MACROEXPAND.md §10) | 5 |
 | `(dotimes [i a] (g i))`, its count truncated once by `long` | 12 |
 | `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
 | `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
