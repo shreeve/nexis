@@ -2935,6 +2935,86 @@ test "atom: @-lowering is not lexically shadowable" {
     // lexical-binding case above is the load-bearing one.
 }
 
+test "atom: a validator refuses a new state with :invalid-reference-state and the atom keeps its value" {
+    try expectOutput(
+        \\(let [a (atom 1 :validator pos?)]
+        \\  [(try (swap! a dec) (catch :invalid-reference-state e e))
+        \\   (try (reset! a 0) (catch any e e))
+        \\   (try (swap-vals! a - 5) (catch any e e))
+        \\   (try (reset-vals! a -1) (catch any e e))
+        \\   (try (compare-and-set! a 99 -1) (catch any e e))
+        \\   (swap! a inc) @a])
+    , "[:invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state :invalid-reference-state 2 2]");
+    try expectOutput("(try (atom -1 :validator pos?) (catch any e e))", ":invalid-reference-state");
+    try expectOutput(
+        \\(let [a (atom 1)]
+        \\  [(try (set-validator! a neg?) (catch any e e)) (get-validator a)
+        \\   (set-validator! a pos?) (= pos? (get-validator a))
+        \\   (set-validator! a nil) (reset! a -5)])
+    , "[:invalid-reference-state nil nil true nil -5]");
+    // A validator's own throw propagates, and nothing is written.
+    try expectOutput("(let [a (atom 1 :validator (fn [x] (if (= x 3) (throw :boom) true)))] [(try (reset! a 3) (catch any e e)) @a])", "[:boom 1]");
+    try expectOutput("(try (set-validator! 1 pos?) (catch any e e))", ":kind-mismatch");
+}
+
+test "atom: watches see key, atom, old and new after every change, and may change the atom" {
+    try expectOutput(
+        \\(let [a (atom 1) l (atom [])]
+        \\  (add-watch a :k (fn [k r o n] (swap! l conj [k (= r a) o n])))
+        \\  (swap! a inc) (reset! a 5) (compare-and-set! a 5 6) (compare-and-set! a 5 7)
+        \\  (swap-vals! a inc) (reset-vals! a 0) (reset! a 0)
+        \\  @l)
+    , "[[:k true 1 2] [:k true 2 5] [:k true 5 6] [:k true 6 7] [:k true 7 0] [:k true 0 0]]");
+    try expectOutput(
+        \\(let [a (atom 0) n (atom 0)]
+        \\  [(= a (add-watch a :x (fn [& _] (swap! n + 1))))
+        \\   (do (add-watch a :y (fn [& _] (swap! n + 10))) (swap! a inc) @n)
+        \\   (do (add-watch a :x (fn [& _] (swap! n + 100))) (swap! a inc) @n)
+        \\   (= a (remove-watch a :y)) (do (swap! a inc) @n)
+        \\   (do (remove-watch a :x) (remove-watch a :absent) (swap! a inc) @n)])
+    , "[true 11 121 true 221 221]");
+    // A watch runs after the change is made, so it may change the
+    // atom again; a throw out of a watch leaves the change made.
+    try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [_ r _o n] (when (< n 5) (swap! r inc)))) (swap! a inc) @a)", "5");
+    try expectOutput("(let [a (atom 1)] (add-watch a :k (fn [& _] (throw :w))) [(try (swap! a inc) (catch any e e)) @a])", "[:w 2]");
+    try expectOutput("[(try (add-watch 1 :k inc) (catch any e e)) (try (remove-watch [] :k) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+}
+
+test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
+    try expectOutput("(let [a (atom 1 :meta {:m 1})] [(meta a) @a])", "[{:m 1} 1]");
+    try expectOutput("(let [a (atom 1)] [(reset-meta! a {:x 1}) (alter-meta! a assoc :y 2) (meta a) (reset-meta! a nil) (meta a)])", "[{:x 1} {:x 1, :y 2} {:x 1, :y 2} nil nil]");
+    // Options in any order; a key `atom` does not take is ignored, as
+    // in Clojure; a key with no value is :invalid-argument.
+    try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} :invalid-reference-state]");
+    try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[:invalid-argument :kind-mismatch]");
+}
+
+test "atom: the values a validator and the watches see stay alive across their calls" {
+    // Every swap! builds a fresh state the atom does not hold while
+    // the validator runs; each callback allocates.
+    try expectOutput(
+        \\(let [a (atom [] :validator (fn [v] (count (vec (range 200))) (vector? v)))
+        \\      seen (atom 0)]
+        \\  (add-watch a :w1 (fn [_k _r o n] (count (vec (range 300))) (when (= (count n) (inc (count o))) (swap! seen inc))))
+        \\  (add-watch a :w2 (fn [_k _r o n] (count (mapv str (range 50))) (swap! seen + (count (str (last n))))))
+        \\  (dotimes [i 200] (swap! a (fn [v] (conj v (str "item-" i)))))
+        \\  [(count @a) (= (nth @a 199) "item-199") @seen])
+    , "[200 true 1690]");
+    // Each watch replaces the atom's watches map, so the map the
+    // mutator is running through is held by nothing else; the
+    // garbage each watch makes is maps of its shape, which reuse its
+    // nodes if they are swept.
+    try expectOutput(
+        \\(let [a (atom 0) calls (atom 0)
+        \\      w (fn w [k r _o _n]
+        \\          (swap! calls inc) (remove-watch r k) (add-watch r k w)
+        \\          (dotimes [_ 20] (reduce (fn [m i] (assoc m i i)) {} (range 8))))]
+        \\  (doseq [k (range 8)] (add-watch a k w))
+        \\  (dotimes [_ 50] (swap! a inc))
+        \\  [@a @calls])
+    , "[50 400]");
+}
+
 test "atom: self-reference does not break equality / count" {
     // An atom holding itself satisfies (= @a a). Pins the
     // GC self-reference safety + cycle behavior at the

@@ -160,7 +160,6 @@ oversight; widening this list or removing a row takes an amendment.
 | Content-addressed values | Changes hash stability and identity semantics (§24 #6). |
 | Time-travel debugging | As-of reads on durable state exist (§23 #22); execution replay does not. |
 | Full hygienic macros | Auto-gensym and syntax-quote qualification only (§23 #16). |
-| Validators, watches | Atoms are plain cells (`docs/ATOM.md`). |
 | Type inference, gradual typing | Dynamic typing only (§24 #5). |
 | Native code generation (JIT, AOT) | Bytecode only (§24 #4). |
 | Java interop, FFI beyond Zig | No host language; natives are Zig. |
@@ -821,3 +820,15 @@ entry stating the decision and its rationale.
   reachable through overflow and the `##Inf`, `##-Inf` and `##NaN`
   literals. `docs/SEMANTICS.md` §2.2, `docs/VM.md` §10 (`math:div`)
   and `CLOJURE-REVIEW.md` §4.3 carry it.
+
+- **2026-10-05 — Atom validators, watches and metadata.** Supersedes
+  the last clause of the 2026-05-18 atoms entry and the §4 non-goal
+  row. An atom carries a validator, a map of watches and a metadata
+  map, with Clojure 1.12's surface: the `:validator` and `:meta`
+  options of `atom`, `set-validator!`, `get-validator`, `add-watch`,
+  `remove-watch`, and `meta`, `reset-meta!` and `alter-meta!` on an
+  atom. Every new state is validated before it is written (a falsy
+  answer is the catchable `:invalid-reference-state`) and every write
+  runs the watches after it. With one thread none of this needs
+  synchronization, and the in-flight rule (`docs/ATOM.md` §4.4) is
+  unchanged. `docs/ATOM.md` §4.8–§4.9 is the authority.
