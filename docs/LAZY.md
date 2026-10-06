@@ -418,3 +418,30 @@ c1 c2 ...)`, its reducing function called with each tuple's elements.
 A call through the transducer costs a closure call per element where
 the native producers call their function directly, so `(sequence (map
 f) xs)` is slower than `(map f xs)`.
+
+---
+
+### 11. What changes for a program written against eager sequences
+
+- **Nothing runs until something walks the result.** `(map println
+  xs)` at a script's top level prints nothing; use `run!`, `doseq` or
+  `dorun`. `(with-out-str (map print xs))` is `""`, and `(time (map f
+  xs))` times nothing. A `for` used as a loop for its effects is a
+  `doseq`.
+- **Errors surface where the seq is walked.** `(try (map f xs) (catch
+  ...))` does not catch what `f` throws: the throw comes when the result
+  is printed or consumed. Realize it inside the `try` (`doall`, `vec`,
+  `mapv`).
+- **Dynamic bindings and transactions are read at realization.** A lazy
+  seq built inside `binding`, `with-tx`, `with-read-tx` or
+  `with-snapshot` and walked outside sees the outer binding, or raises
+  `:tx-closed`. Realize it inside.
+- **`iterate` takes two arguments**: `(iterate f x n)` is
+  `:arity-mismatch`; write `(take n (iterate f x))`. `(range s e 0)`
+  repeats `s` where it raised `:invalid-argument`.
+- `(list? (map f xs))` is false (`seq?` is true) and `(class (map f
+  xs))` is `:lazy_seq`; code that asked `list?` to find a sequence asks
+  `seq?` or `sequential?`, and `extend-type :list` does not cover a lazy
+  seq: extend `:lazy_seq` too. `counted?` of a lazy seq is false;
+  `count` walks it (O(1) of an unrealized range). `peek` and `pop` of
+  one are `:kind-mismatch`, as of Clojure's `LazySeq`.

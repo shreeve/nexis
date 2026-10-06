@@ -57,7 +57,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 197/197 steps succeeded; 1436/1436 tests passed
+Build Summary: 199/199 steps succeeded; 1453/1453 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -304,9 +304,12 @@ failing test (AGENTS.md).
 
 ### 6.1 Language and runtime
 
-1. **Sequences are eager** (§23 #14; open question §24 #2):
-   `(range)`, `(iterate f x)` and `(repeat x)` need a count, and there
-   is no `lazy-seq` and no transducer arity. **Macros get no `&form` or
+1. **A lazy seq keeps its head** (`docs/LAZY.md` §9): the VM roots
+   every slot until it is reused, so a seq a local or a call's
+   argument holds keeps what it realized. Clearing a call's argument
+   block after it returns, and a local at its last use, would give
+   Clojure's constant-memory streaming; it is a compiler change with a
+   cost on every call, to be measured. **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
 2. **Regex is absent** (§24 #9, `CLOJURE-REVIEW.md` §4.4): an open
    design question, so an amendment comes first.
@@ -423,8 +426,8 @@ after numbers in the commit message.
    work, with em's runtime as the reference.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
-4. The open design questions, each an amendment first: laziness
-   (§24 #2), `&form`/`&env` (§24 #13), regex (§24 #9). The owner
+4. The open design questions, each an amendment first:
+   `&form`/`&env` (§24 #13), regex (§24 #9). The owner
    orders these after the em and emdb work.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)

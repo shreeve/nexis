@@ -373,9 +373,11 @@ What the rows say:
 - nexis is ahead of babashka on every row: 2–4× on loops, calls
   (`fib`), `sort`, transient maps and `frequencies`/`group-by`,
   1.3–1.6× on destructuring, the map build, vector `conj`/`nth`,
-  string splitting and the `map`/`filter`/`reduce` pipeline, whose
-  sequences are eager here and lazy and chunked in babashka
-  (`docs/BENCH.md` §12). It starts in about 5 ms with a 6 MB resident
+  string splitting and the `map`/`filter`/`reduce` pipeline, measured
+  with eager sequences; nexis's are lazy and chunked as babashka's
+  since (`docs/BENCH.md` §12): the pipeline's timed phase retires
+  2.9% more instructions in the same median time, with a 4.8% larger
+  resident set, on 7 interleaved pairs of the two builds. It starts in about 5 ms with a 6 MB resident
   set.
 - Its resident set is below babashka's on every row but `sort`, which
   sorts through about 80 MB of buffers outside the heap (§6).

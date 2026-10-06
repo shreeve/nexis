@@ -359,10 +359,11 @@ after each.
   include class loading and a cold JIT; the `-warm` rows show how much
   that costs (JIT and the peer's segment cache both warm by then), and
   a long-running peer would do better on the others.
-- *Sequences.* nexis sequences are eager (PLAN §23 #14): `map` and
-  `filter` build their whole result, where babashka's and Clojure's
-  are lazy and chunked. The pipeline row runs the same code and pays
-  for that.
+- *Sequences.* All three are lazy and chunked by 32 (`docs/LAZY.md`):
+  `filter`, `map` and `map` realize a chunk at a time as `reduce`
+  walks. nexis's VM keeps the intermediate seqs in its slots until the
+  call returns (no locals clearing), so the pipeline row holds all
+  three realized, as Clojure's would not.
 - *Transients.* All three edit the nodes a transient owns in place
   (`docs/TRANSIENT.md`).
 - *Durability.* The rows are grouped by what a commit guarantees when

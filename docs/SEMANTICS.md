@@ -409,7 +409,9 @@ How each kind prints in the `pr-str` and `str` modes is
   symbol (as text, re-interned on read).
 - `list` (a vector view included), `vector`, `map`, `set`,
   recursively. A sorted map or set reads back as the hash map or set
-  with its entries, which is `=` to it and hashes alike.
+  with its entries, which is `=` to it and hashes alike; a lazy seq,
+  realized to print, reads back as the list of its elements, `=` to it
+  (`docs/LAZY.md` §8).
 - Not a typed vector: it prints as `#i64[1 2 3]` / `#f64[1.0 2.0]`,
   which the reader rejects at the `#`; the codec is its round trip.
 - Not a record: it prints as `#ns.Type{:field value, ...}` in both

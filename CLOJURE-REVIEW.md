@@ -24,7 +24,7 @@ differ, PLAN wins.
 | Maps and sets | array map, then Bagwell HAMT | array map to 8 entries, then CHAMP (§23 #37) |
 | Vector | 32-way trie with a tail | the same (§23 #30) |
 | Numbers | long, BigInt, Ratio, BigDecimal, double | fixnum + bignum, f64; no ratio or decimal (§23 #10) |
-| Sequences | lazy | eager; sequence functions return lists (§23 #14) |
+| Sequences | lazy, chunked by 32 | lazy, chunked where Clojure's are, no locals clearing (§23 #14, `docs/LAZY.md`) |
 | Identity | Vars, atoms, refs (STM), agents | Vars, atoms, durable refs over emdb; no STM or agents (§23 #5, #6) |
 | Polymorphism | protocols, records, multimethods | protocols and records; no multimethods (§23 #8, #9) |
 | Transactions | STM `dosync` | emdb read and write transactions, lexically scoped |
@@ -210,8 +210,11 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48; `+'` and its kin are the same functions, and `unchecked-add` and its kin wrap two longs at 64 bits as Clojure's do | `docs/BIGNUM.md`, `docs/SEMANTICS.md` §2.2 |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
 | `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` does not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
-| `map`, `filter`, `for`, `keys`, `cons` | lazy seqs | eager lists; no `lazy-seq`, no transducer arities | §23 #14 |
-| `(range)`, `(iterate f x)`, `(repeat x)`, `(repeatedly f)` | infinite | arity errors; pass a count: `(range n)`, `(iterate f x n)`, `(repeat n x)`, `(repeatedly n f)` | §23 #14 |
+| the seq of a map, set, string, or of a list `sort` or `keys` builds | walked one element at a time | a vector's view past three elements, so `map` over it takes 32 at a time | `docs/LAZY.md` §9 |
+| a lazy seq a local holds | let go as it is walked (locals clearing) | kept, with what it realized, until the slot is reused | `docs/LAZY.md` §9 |
+| `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
+| `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
+| a `lazy-seq` body that throws | runs again on the next walk (babashka caches an empty seq) | runs again, as JVM Clojure | `docs/LAZY.md` §4 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |
 | `(catch Exception e ...)` | by class | a class that names a nexis error takes that error's tag (`ArithmeticException` `:divide-by-zero`, `IndexOutOfBoundsException` `:index-out-of-bounds`, `ClassCastException` `:kind-mismatch`, `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause` and `:arity-mismatch`, `AssertionError` `:assertion-failed`, `StackOverflowError` `:stack-overflow`); any other class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
@@ -239,8 +242,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 ### 4.4 Absences
 
 The deliberate ones are PLAN §4's non-goals: multimethods, STM,
-agents, `core.async`, lazy sequences, regex, reader conditionals,
+agents, `core.async`, regex, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
-targets, Java interop. Library functions that do not exist
-(transducers and others) are known gaps, not decisions
+targets, Java interop. Library functions that do not exist are known gaps, not decisions
 (`HANDOFF.md` §6).

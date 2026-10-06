@@ -145,7 +145,8 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
   `coll:list` opcode, which builds them with `cons` (`docs/VM.md`
   §10.8).
 - **Printer.** `src/format.zig` prints every subkind as `(...)`.
-- **Absent.** Lazy sequences (PLAN §23 #14): `seq` of a vector is the view
-  of §1, of every other collection a fresh list, a view once it holds
-  four elements (§1, built sequences). Destructive list
-  operations. Transients of lists.
+- **Absent.** Destructive list operations. Transients of lists. A
+  list is always realized: a cell whose rest may be lazy is a lazy
+  seq's cons (`docs/LAZY.md` §1). `seq` of a vector is the view of §1,
+  of every other collection a fresh list, a view once it holds four
+  elements (§1, built sequences).
