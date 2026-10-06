@@ -790,11 +790,18 @@ fn forwardEnd(lz: Value) Value {
 /// lazy block is its forced seq; a vector is an O(1) view
 /// (`docs/LIST.md` §1); any other seqable is a fresh list of its
 /// elements. Anything else is `:kind-mismatch`.
-pub fn seqOf(vm: *VM, x: Value) VmError!Value {
+pub inline fn seqOf(vm: *VM, x: Value) VmError!Value {
     switch (x.kind()) {
         .nil => return x,
         .list => return if (list_mod.isEmpty(x)) value_mod.nilValue() else x,
         .lazy_seq => return if (lazy.shapeOf(x) == .lazy) force(vm, x) else x,
+        else => return seqOfOther(vm, x),
+    }
+}
+
+/// `seqOf` of a vector or any other seqable, out of the callers' lines.
+fn seqOfOther(vm: *VM, x: Value) VmError!Value {
+    switch (x.kind()) {
         .persistent_vector => return if (vector_mod.isEmpty(x))
             value_mod.nilValue()
         else
