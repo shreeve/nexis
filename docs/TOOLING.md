@@ -67,6 +67,17 @@ NEXIS_DURABILITY is not commit or durable`, exit 1.
 any value but `1` stops the command with `nexis: NEXIS_GC_STRESS is
 not 1`, exit 1.
 
+**Dispatch counts.** A binary built with `-Dopcodes=true` counts every
+dispatch by opcode (a comparison that runs its branch is one,
+`docs/VM.md` §8) and every native called through the VM's call paths
+(an instruction, `callValue`, a `Callback`), and writes them to stderr
+as CSV when the process exits, however it exits: `opcode,dispatches`
+then `group:variant,N` rows, then `native,calls` and `name,N` rows,
+each most first. The counts start after the standard library's boot,
+so they are the program's. Without the option the counting is compiled
+out; the gate analyzes the counting build so it cannot rot.
+`docs/BENCH.md` §13 uses it.
+
 **The REPL** prints a banner (`nexis repl`, then ``Type `:quit` or hit
 Ctrl-D to exit.``) and prompts with the current namespace (`user=> `,
 `other=> ` after `(ns other)`). It reads lines until they hold

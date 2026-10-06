@@ -48,6 +48,7 @@ const protocol_mod = @import("protocol.zig");
 const record_mod = @import("record.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 const stack_guard = @import("stack.zig");
+const build_options = @import("build_options");
 const Value = value_mod.Value;
 
 // =============================================================================
@@ -881,6 +882,43 @@ pub const LazyOps = struct {
 
 pub var lazy_ops: ?*const LazyOps = null;
 
+// =============================================================================
+// Dispatch and native-call counts (`-Dopcodes=true`, docs/TOOLING.md §1)
+// =============================================================================
+
+/// Whether this build counts every dispatch by opcode and every native
+/// call by native. Off, the counting is compiled out.
+pub const counting = build_options.opcodes;
+
+/// Dispatches by opcode index (`group | variant << 6`, VM.md §8). A
+/// comparison that runs its branch is one dispatch.
+pub var opcode_counts: [4096]u64 = @splat(0);
+
+/// Native calls by native, an open-addressed table keyed by the
+/// descriptor's address; a native past its capacity goes uncounted.
+pub var native_counts: [2048]NativeCount = @splat(.{});
+
+pub const NativeCount = struct { native: ?*const NativeFn = null, calls: u64 = 0 };
+
+pub fn resetCounts() void {
+    opcode_counts = @splat(0);
+    native_counts = @splat(.{});
+}
+
+inline fn countNative(native: *const NativeFn) void {
+    if (!counting) return;
+    var i = (@intFromPtr(native) >> 3) % native_counts.len;
+    for (0..native_counts.len) |_| {
+        const e = &native_counts[i];
+        if (e.native == null) e.native = native;
+        if (e.native == native) {
+            e.calls += 1;
+            return;
+        }
+        i = (i + 1) % native_counts.len;
+    }
+}
+
 /// What an isolated realization failed with: a thrown value, or an
 /// error its barrier could not catch (docs/LAZY.md §6).
 pub const ParkedRealize = union(enum) {
@@ -1465,7 +1503,11 @@ pub const Callback = struct {
         std.debug.assert(args.len == self.argc);
         switch (self.mode) {
             .leaf => if (!self.vm.gcDue()) {
-                if (asNativeFn(self.callee).call(self.vm, args)) |r| return r else |err| if (err != VmError.NeedsReentry) return err;
+                const native = asNativeFn(self.callee);
+                if (native.call(self.vm, args)) |r| {
+                    countNative(native);
+                    return r;
+                } else |err| if (err != VmError.NeedsReentry) return err;
             },
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
             .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
@@ -2375,7 +2417,10 @@ pub const VM = struct {
             // one per element takes the rooted path below whenever a
             // cycle is due.
             if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) {
-                if (native.call(self, args)) |r| return r else |err| if (err != VmError.NeedsReentry) return err;
+                if (native.call(self, args)) |r| {
+                    countNative(native);
+                    return r;
+                } else |err| if (err != VmError.NeedsReentry) return err;
             }
         }
         try self.checkNesting();
@@ -2458,6 +2503,7 @@ pub const VM = struct {
                 if (args.len < native.min_arity or args.len > (max orelse args.len)) {
                     return self.arityError(native.name, native.min_arity, max, args.len);
                 }
+                countNative(native);
                 break :blk try (native.general orelse native.call)(self, args);
             },
             .protocol_fn => try self.dispatchProtocolMethod(callee, args),
@@ -3269,6 +3315,7 @@ pub const VM = struct {
         const inst = code[pc];
         frame.pc = pc + 1;
         if (inst.kind != .primary) return VmError.BytecodeCorruption;
+        if (counting) opcode_counts[opIndex(inst)] += 1;
         return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst });
     }
 
@@ -3502,6 +3549,7 @@ pub const VM = struct {
                             VmError.NeedsReentry => break :fast,
                             else => return err,
                         };
+                        countNative(native);
                         self.slotAt(frame, inst.c.index).* = result;
                         return self.nextSafe(frame);
                     }
@@ -3515,6 +3563,7 @@ pub const VM = struct {
                     if (base + max_native_args <= self.stack.capacity) {
                         buf = self.stack.items.ptr[base..][0..max_native_args].*;
                     } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+                    countNative(native);
                     const overflows = dispatch_mod.spoilCount();
                     const result = native.call(self, buf[0..argc]) catch |err| {
                         dispatch_mod.rewindSpoils(overflows);

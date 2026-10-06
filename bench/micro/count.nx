@@ -1,0 +1,3 @@
+; bench/micro/count.nx N: the counting loop: cmp/jump, math:add, jump:jmp an iteration.
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0] (if (< i n) (recur (inc i)) i))))

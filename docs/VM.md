@@ -391,6 +391,9 @@ fetch (every handler's last step):
   `cmp`, `jump`, `var`, `math`, `closure`, `coll`) run against the
   frame the fetch took; `call` and `ctrl` re-derive the current frame,
   since a call or a native may have grown `frames`.
+- A build with `-Dopcodes=true` counts each fetch by its opcode index
+  and each native call (`docs/TOOLING.md` §1); any other build
+  compiles the counting out.
 - The pc advances before the handler runs, so a handler sees the
   next pc: a conditional jump not taken does nothing, a taken one
   overwrites `pc`, and every frame's `pc` in an error trace is one

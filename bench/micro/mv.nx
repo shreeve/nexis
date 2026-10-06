@@ -1,0 +1,3 @@
+; bench/micro/mv.nx N: count plus one mov:move.
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) n) k))))

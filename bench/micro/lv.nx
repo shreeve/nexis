@@ -1,0 +1,4 @@
+; bench/micro/lv.nx N: count plus one var:load-var.
+(def g 7)
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) g) k))))

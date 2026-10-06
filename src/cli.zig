@@ -83,6 +83,7 @@ const min_runtime_stack_size = 64 << 20;
 const runtime_stack_margin = 16 << 20;
 
 pub fn main(init: std.process.Init) void {
+    if (vm.counting) _ = atexit(&printCounts);
     var result: anyerror!void = {};
     var size: usize = runtime_stack_size;
     while (size >= min_runtime_stack_size) : (size /= 2) {
@@ -234,6 +235,70 @@ fn exitSynced(status: u8) noreturn {
     std.process.exit(status);
 }
 
+extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
+
+/// A `-Dopcodes=true` build's counts, on stderr as CSV at exit however
+/// the process ends: the dispatches by opcode, then the calls by
+/// native, each most first. The runtime's boot is left out
+/// (TOOLING.md §1).
+fn printCounts() callconv(.c) void {
+    const Order = struct {
+        fn opcodes(_: void, a: u12, b: u12) bool {
+            return vm.opcode_counts[a] > vm.opcode_counts[b];
+        }
+        fn natives(_: void, a: vm.NativeCount, b: vm.NativeCount) bool {
+            return a.calls > b.calls;
+        }
+    };
+    var line: [160]u8 = undefined;
+    var order: [4096]u12 = undefined;
+    for (&order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u12, &order, {}, Order.opcodes);
+    writeStderr("opcode,dispatches\n");
+    for (order) |i| {
+        if (vm.opcode_counts[i] == 0) break;
+        var name: [64]u8 = undefined;
+        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ opcodeName(i, &name), vm.opcode_counts[i] }) catch continue);
+    }
+    var natives = vm.native_counts;
+    std.mem.sort(vm.NativeCount, &natives, {}, Order.natives);
+    writeStderr("native,calls\n");
+    for (natives) |e| {
+        const native = e.native orelse break;
+        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ native.name, e.calls }) catch continue);
+    }
+}
+
+fn writeStderr(bytes: []const u8) void {
+    _ = std.c.write(2, bytes.ptr, bytes.len);
+}
+
+/// `group:variant` for an opcode index (VM.md §8), from the variant
+/// enums' tag names with `-` for `_`, as the disassembler spells them.
+fn opcodeName(index: u12, buf: []u8) []const u8 {
+    const group: vm.Group = @fromBackingInt(@as(u6, @truncate(index)));
+    const variant: u6 = @truncate(index >> 6);
+    const v: ?[]const u8 = switch (group) {
+        .jump => std.enums.tagName(vm.Jump, @fromBackingInt(variant)),
+        .cmp => std.enums.tagName(vm.Cmp, @fromBackingInt(variant)),
+        .math => std.enums.tagName(vm.Math, @fromBackingInt(variant)),
+        .mov => std.enums.tagName(vm.Mov, @fromBackingInt(variant)),
+        .call => std.enums.tagName(vm.Call, @fromBackingInt(variant)),
+        .closure => std.enums.tagName(vm.Closure_, @fromBackingInt(variant)),
+        .var_ => std.enums.tagName(vm.VarOp, @fromBackingInt(variant)),
+        .coll => std.enums.tagName(vm.CollOp, @fromBackingInt(variant)),
+        .ctrl => std.enums.tagName(vm.CtrlOp, @fromBackingInt(variant)),
+        else => null,
+    };
+    const g = std.enums.tagName(vm.Group, group) orelse "?";
+    const text = if (v) |name|
+        std.fmt.bufPrint(buf, "{s}:{s}", .{ std.mem.trimEnd(u8, g, "_"), std.mem.trimEnd(u8, name, "_") }) catch return "?"
+    else
+        std.fmt.bufPrint(buf, "{s}:?{d}", .{ std.mem.trimEnd(u8, g, "_"), variant }) catch return "?";
+    std.mem.replaceScalar(u8, text, '_', '-');
+    return text;
+}
+
 fn usageExit(io: std.Io) noreturn {
     std.Io.File.stderr().writeStreamingAll(io, Usage) catch {};
     std.process.exit(1);
@@ -337,6 +402,7 @@ const Runtime = struct {
         };
         rt.hooks = .{ .host_macros = &rt.host_macros, .registry = registry, .interner = interner, .load_callback = rt.loader.callback() };
         rt.hooks.install(&rt.v);
+        if (vm.counting) vm.resetCounts();
     }
 
     fn deinit(rt: *Runtime) void {
@@ -743,6 +809,18 @@ fn errorKeyword(rt: *Runtime) Value {
 // =============================================================================
 
 const testing = std.testing;
+
+test "cli: opcodeName: the disassembler's spelling of every opcode index" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("cmp:lt", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.lt)) << 6, &buf));
+    try std.testing.expectEqualStrings("cmp:eq-num", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.eq_num)) << 6, &buf));
+    try std.testing.expectEqualStrings("mov:load-const", opcodeName(@as(u12, @backingInt(vm.Group.mov)) | @as(u12, @backingInt(vm.Mov.load_const)) << 6, &buf));
+    try std.testing.expectEqualStrings("var:load-var", opcodeName(@as(u12, @backingInt(vm.Group.var_)) | @as(u12, @backingInt(vm.VarOp.load_var)) << 6, &buf));
+    try std.testing.expectEqualStrings("call:return", opcodeName(@as(u12, @backingInt(vm.Group.call)) | @as(u12, @backingInt(vm.Call.@"return")) << 6, &buf));
+    try std.testing.expectEqualStrings("ctrl:throw", opcodeName(@as(u12, @backingInt(vm.Group.ctrl)) | @as(u12, @backingInt(vm.CtrlOp.throw_)) << 6, &buf));
+    try std.testing.expectEqualStrings("math:?63", opcodeName(@as(u12, @backingInt(vm.Group.math)) | @as(u12, 63) << 6, &buf));
+    try std.testing.expectEqualStrings("simd:?0", opcodeName(@backingInt(vm.Group.simd), &buf));
+}
 
 test "cli: Balance: brackets count outside strings, comments and character literals" {
     const cases = [_]struct { []const u8, bool }{

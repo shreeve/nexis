@@ -7,6 +7,8 @@
 //!                                     scripts, examples; analyzes the bench
 //!   zig build test -Dgc-stress        the gate with a collection every few kilobytes
 //!   zig build test -Ddurability=durable  the gate with every store commit synced
+//!   zig build install -Dopcodes=true  bin/nexis printing its dispatch and native
+//!                                     call counts at exit (docs/TOOLING.md §1)
 //!   zig build quick                   the inner loop: unit tests, the compile and
 //!                                     Nextomic property tests, the eval corpora
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
@@ -159,6 +161,13 @@ pub fn build(b: *std.Build) void {
     // generating code or running it, so an API change cannot leave the
     // bench broken.
     test_step.dependOn(&bins.bench.step);
+    // The same for the counting CLI (`-Dopcodes=true`), so the code a
+    // default build compiles out cannot rot.
+    const counted = cliModule(b, target, optimize);
+    const counted_options = b.addOptions();
+    counted_options.addOption(bool, "opcodes", true);
+    counted.addOptions("build_options", counted_options);
+    test_step.dependOn(&b.addExecutable(.{ .name = "nexis-counted", .root_module = counted, .use_llvm = useLlvm(target) }).step);
 
     // Every binary above, compiled and linked for each Linux target the
     // release supports; nothing runs. The musl builds are the static
@@ -565,13 +574,8 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         module.addImport("harness", harness);
         bin.* = b.addTest(.{ .name = std.Io.Dir.path.stem(suite.path), .root_module = module, .use_llvm = useLlvm(target) });
     }
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    cli_mod.addImport("emdb", emdbModule(b, target, optimize));
+    const cli_mod = cliModule(b, target, optimize);
+    cli_mod.addOptions("build_options", runtimeOptions(b));
     return .{
         .nexis = b.addExecutable(.{ .name = "nexis", .root_module = cli_mod, .use_llvm = useLlvm(target) }),
         .golden = b.addExecutable(.{
@@ -590,6 +594,19 @@ fn binaries(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.
         .cli_unit = b.addTest(.{ .name = "cli-unit", .root_module = cli_mod, .filters = &.{"cli: "}, .use_llvm = useLlvm(target) }),
         .suites = suite_bins,
     };
+}
+
+/// The module of bin/nexis, rooted at src/cli.zig, without its
+/// `build_options`.
+fn cliModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    module.addImport("emdb", emdbModule(b, target, optimize));
+    return module;
 }
 
 fn benchExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, nexis: *std.Build.Module) *std.Build.Step.Compile {
@@ -622,7 +639,22 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
         .link_libc = true,
     });
     module.addImport("emdb", emdbModule(b, target, optimize));
+    module.addOptions("build_options", runtimeOptions(b));
     return module;
+}
+
+var runtime_options: ?*std.Build.Step.Options = null;
+
+/// The runtime's `build_options`, made once for every module that
+/// compiles src/vm.zig: `opcodes`, whether every dispatch and native
+/// call is counted and the CLI prints the counts at exit
+/// (docs/TOOLING.md §1).
+fn runtimeOptions(b: *std.Build) *std.Build.Step.Options {
+    if (runtime_options) |o| return o;
+    const o = b.addOptions();
+    o.addOption(bool, "opcodes", b.option(bool, "opcodes", "count every dispatch by opcode and every native call; bin/nexis prints the counts at exit") orelse false);
+    runtime_options = o;
+    return o;
 }
 
 /// emdb, the storage engine: a path dependency on the sibling checkout.
