@@ -68,7 +68,9 @@ inline test in `src/`) and `eval_pipeline` (the language corpus);
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request
 to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64,
-and once more under `-Dgc-stress -Ddurability=durable`;
+and once more under `-Dgc-stress -Ddurability=durable`; `zig build
+codegen` on macOS, whose Xcode tools carry the LLVM objdump it
+disassembles the Linux release builds with (`docs/VM.md` §8);
 `zig fmt --check` over the tracked Zig files but the generated
 `src/parser.zig`, and `zig build parser-check` against a nexus built
 from `shreeve/nexus`; and an optimized (`-Doptimize=fast`) job that runs a script, the
