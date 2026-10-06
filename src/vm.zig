@@ -1288,7 +1288,8 @@ pub const ProtocolEntry = struct {
 };
 
 pub const ProtocolMethod = struct {
-    /// Interned symbol id (matches ProtocolFnBody.method_name_id).
+    /// The method's name, an interned keyword id (matches
+    /// ProtocolFnBody.method_name_id).
     name_id: u32,
     /// Short copy of the method name string (owned by VM allocator)
     /// so error messages can reach the user without a re-intern.
