@@ -8,6 +8,8 @@
 const std = @import("std");
 const reader_mod = @import("reader.zig");
 const intern_mod = @import("intern.zig");
+const seq_mod = @import("seq.zig");
+const lazy_mod = @import("coll/lazy.zig");
 const vm_mod = @import("vm.zig");
 const value_mod = @import("value.zig");
 const list_mod = @import("coll/list.zig");
@@ -1249,7 +1251,18 @@ fn callUserMacro(
         if (sub_vm.error_detail.len > 0) return ctx.fail(span, "macro {s} failed: {s}: {s}", .{ name, @errorName(err), sub_vm.error_detail });
         return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
     };
-    return try valueToForm(ctx, result_value, span);
+    // The form is data: every lazy seq in it is realized, on the
+    // sub-VM, and made a list (docs/LAZY.md §8).
+    const saved = sub_vm.installLazyHost();
+    defer lazy_mod.host = saved;
+    const listed = seq_mod.asLists(&sub_vm, result_value) catch |err| {
+        if (err == error.OutOfMemory) return ExpandError.OutOfMemory;
+        if (err == error.UncaughtThrow) if (sub_vm.unhandled_throw) |thrown| {
+            return ctx.fail(span, "macro {s} threw {s}", .{ name, try describeThrown(ctx, thrown) });
+        };
+        return ctx.fail(span, "macro {s} failed: {s}", .{ name, @errorName(err) });
+    };
+    return try valueToForm(ctx, listed, span);
 }
 
 /// A thrown value in a failure message: a string as itself, a
@@ -2292,53 +2305,6 @@ fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
 // as is), `:when` skips the element, and both see the pattern and
 // any earlier `:let`.
 
-fn expandFor(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
-    if (args.len != 2 or stripMeta(args[0]).datum != .vector) return ctx.fail(call_form.origin, "for: expected a binding vector and one body form", .{});
-    const bindings = stripMeta(args[0]).datum.vector;
-    if (bindings.len == 0 or bindings.len % 2 != 0) return ctx.fail(args[0].origin, "for: the binding vector needs pairs", .{});
-    if (bindings[0].datum == .keyword) return ctx.fail(bindings[0].origin, "for: a modifier needs a binding before it", .{});
-    const b = Builder{ .ctx = ctx, .origin = call_form.origin };
-    // The vector the loops fill, as a seq; `()` when empty.
-    const s = try b.gensym("nx");
-    return b.list(.{ "let*", try b.vec(.{ s, try b.list(.{ "nexis.core/seq", try forLevel(b, bindings, try b.vec(.{}), args[1]) }) }), try b.list(.{ "if", s, s, try b.list(.{}) }) });
-}
-
-/// The loop for the binding pair at the head of `bindings` (with
-/// the modifiers after it), accumulating onto `outer_acc`.
-fn forLevel(b: Builder, bindings: []const *Form, outer_acc: *Form, body: *const Form) ExpandError!*Form {
-    var end: usize = 2;
-    while (end < bindings.len and bindings[end].datum == .keyword) end += 2;
-    const s = try b.gensym("nx");
-    const acc = try b.gensym("nx");
-    const next_s = try b.list(.{ "nexis.core/next", s });
-
-    var inner = try b.list(.{ "recur", next_s, if (end < bindings.len)
-        try forLevel(b, bindings[end..], acc, body)
-    else
-        try b.list(.{ "nexis.core/conj", acc, body }) });
-    var m = end;
-    while (m > 2) {
-        m -= 2;
-        const key = bindings[m].datum.keyword;
-        const value = bindings[m + 1];
-        if (key.ns != null) return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}/{s}", .{ key.ns.?, key.name });
-        inner = if (std.mem.eql(u8, key.name, "let"))
-            try b.list(.{ "nexis.core/let", value, inner })
-        else if (std.mem.eql(u8, key.name, "when"))
-            try b.list(.{ "if", value, inner, try b.list(.{ "recur", next_s, acc }) })
-        else if (std.mem.eql(u8, key.name, "while"))
-            try b.list(.{ "if", value, inner, acc })
-        else
-            return b.ctx.fail(bindings[m].origin, "for: unknown modifier :{s}", .{key.name});
-    }
-    const with_elem = try b.list(.{ "nexis.core/let", try b.vec(.{ bindings[0], try b.list(.{ "nexis.core/first", s }) }), inner });
-    return b.list(.{
-        "loop*",
-        try b.vec(.{ s, try b.list(.{ "nexis.core/seq", bindings[1] }), acc, outer_acc }),
-        try b.list(.{ "if", s, with_elem, acc }),
-    });
-}
-
 // ---- defrecord / defprotocol / extend-type / extend-protocol ----
 //
 // PROTOCOLS.md §4.
@@ -2929,7 +2895,6 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
     try table.put(allocator, "->>", expandThreadLast);
     try table.put(allocator, "case", expandCase);
     try table.put(allocator, "condp", expandCondp);
-    try table.put(allocator, "for", expandFor);
     // defrecord (records + inline protocol clauses).
     try table.put(allocator, "defrecord", expandDefrecord);
     try table.put(allocator, "defprotocol", expandDefprotocol);

@@ -447,8 +447,11 @@ const Runtime = struct {
         try w.flush();
     }
 
-    /// `v` as `pr` prints it, then a newline, on stdout.
+    /// `v` as `pr` prints it, then a newline, on stdout. Every lazy seq
+    /// in it is realized first (docs/LAZY.md §8); a throw while it is
+    /// is a runtime error, reported as an evaluation's.
     fn printReadably(rt: *Runtime, v: Value) !void {
+        rt.v.realizeOutside(v) catch |err| return if (err == vm.VmError.OutOfMemory) error.OutOfMemory else error.RunFailed;
         var out: std.Io.Writer.Allocating = .init(rt.allocator);
         defer out.deinit();
         format_mod.format(v, .readable, &out.writer, rt.v.ensureInterner()) catch |err| switch (err) {

@@ -984,14 +984,14 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(defn g [a b & r] a) (g 1)", .err = vm.VmError.ArityMismatch, .detail = "g takes at least 2 arguments, got 1" },
         .{ .src = "(first 1 2)", .err = vm.VmError.ArityMismatch, .detail = "first takes 1 argument, got 2" },
         .{ .src = "(mapv (fn [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 2 arguments, got 1" },
-        .{ .src = "(map (fn f [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "f takes 2 arguments, got 1" },
-        .{ .src = "(filter (fn [] true) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
+        .{ .src = "(doall (map (fn f [a b] a) [1]))", .err = vm.VmError.ArityMismatch, .detail = "f takes 2 arguments, got 1" },
+        .{ .src = "(doall (filter (fn [] true) [1]))", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
         .{ .src = "(reduce inc [1 2])", .err = vm.VmError.ArityMismatch, .detail = "inc takes 1 argument, got 2" },
         .{ .src = "(reduce (fn h [a] a) 0 [1])", .err = vm.VmError.ArityMismatch, .detail = "h takes 1 argument, got 2" },
-        .{ .src = "(filter 5 [1])", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
+        .{ .src = "(doall (filter 5 [1]))", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
         .{ .src = "(reduce + [1 \"a\"])", .err = vm.VmError.KindMismatch, .detail = "" },
         .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
-        .{ .src = "(map \"s\" [1])", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
+        .{ .src = "(doall (map \"s\" [1]))", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
         .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
         .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
         .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
@@ -1025,9 +1025,9 @@ test "integration: a throw that leaves through a catch or a finally is reported 
     const cases = [_]Case{
         // A runtime error through a finally, a catch no clause of
         // which matches, and a catch that throws it again.
-        .{ .src = f ++ "(defn h [] (try (f) (finally 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
-        .{ .src = f ++ "(defn h [] (try (f) (catch :nope e 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
-        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw e)))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 2 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (finally 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch :nope e 1))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
+        .{ .src = f ++ "(defn h [] (try (f) (catch any e (throw e)))) (h)", .err = vm.VmError.ArityMismatch, .detail = "into takes 0 to 3 arguments, got 4", .at = "f" },
         // A thrown value the same ways, and through both at once.
         .{ .src = f ++ "(defn h [] (try (g) (catch :nope e 1) (finally 2))) (h)", .err = vm.VmError.UncaughtThrow, .at = "g" },
         // A catch that catches another throw inside it still rethrows
@@ -1620,7 +1620,7 @@ test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
     try expectOutput("[(nfirst [[1 2 3] 4]) (nfirst nil) (nfirst [[1]])]", "[(2 3) nil nil]");
     try expectOutput("(tree-seq seq? identity '((1 2 (3)) (4)))", "(((1 2 (3)) (4)) (1 2 (3)) 1 2 (3) 3 (4) 4)");
     try expectOutput("[(tree-seq map? vals {:a {:b 1} :c 2}) (tree-seq vector? seq []) (tree-seq vector? seq 1)]", "[({:a {:b 1}, :c 2} {:b 1} 1 2) ([]) (1)]");
-    try expectOutput("(try (tree-seq nil nil 1) (catch any e e))", ":not-callable");
+    try expectOutput("(try (doall (tree-seq nil nil 1)) (catch any e e))", ":not-callable");
     // Deep trees walk without the native stack.
     try expectOutput("(count (tree-seq vector? seq (reduce (fn [t _] [t]) 0 (range 100000))))", "100001");
     try expectOutput("[(replace {1 :a 2 :b} [1 2 3]) (replace {1 :a} '(1 2 1)) (replace [:a :b] [0 1 0 5]) (replace {} nil) (replace {1 2} #{1 3}) (meta (replace {} ^:m [1]))]", "[[:a :b 3] (:a 2 :a) [:a :b :a 5] () (2 3) {:m true}]");
@@ -2013,6 +2013,19 @@ test "gc: a sequence native's result is the same at every length" {
     try testing.expect(program.v.gc_cycles > 0);
 }
 
+test "db: a lazy seq is stored as the list it realizes to" {
+    try expectOutputProgramWithStore("lazy-put",
+        \\(def conn (db/open "@STORE@"))
+        \\(def r (db/ref conn :t "k"))
+        \\(with-tx [tx conn] (db/put! tx r (lazy-seq [1 2])))
+        \\(db/put-key! (db/ref conn :t "j") {:a (lazy-seq [3])})
+        \\(with-tx [tx conn] (db/alter! tx (db/ref conn :t "i") (fn [_] (lazy-seq (list 4)))))
+        \\(def got [(with-read-tx [tx conn] (db/get tx r)) (db/get-key (db/ref conn :t "j")) (db/get-key (db/ref conn :t "i"))])
+        \\(db/close conn)
+        \\[got (map class got)]
+    , "[[(1 2) {:a (3)} (4)] (:list :map :list)]");
+}
+
 test "db: read-line lets every held snapshot go before it waits" {
     var store = try SeamStore.init("read-line-held");
     defer store.deinit();
@@ -2037,7 +2050,7 @@ test "integration: *command-line-args* is nil without arguments; read-line needs
     try expectOutput("[*command-line-args* (try (read-line) (catch any e e))]", "[nil :io-error]");
 }
 
-test "integration: =, compare, flatten, hash, set membership and printing of data nested past the stack are :stack-overflow" {
+test "integration: =, compare, hash, set membership and printing of data nested past the stack are :stack-overflow; flatten walks it" {
     // One chain of vectors 100k deep, built once: the test's 6 MiB
     // guard (stack.main_thread_budget) stops every walk of it well
     // before the bottom, in debug and optimized builds alike (an optimized
@@ -2051,11 +2064,11 @@ test "integration: =, compare, flatten, hash, set membership and printing of dat
         \\      b (nth a 0)]
         \\  [(try (= a b) (catch :stack-overflow e :deep))
         \\   (try (compare a b) (catch :stack-overflow e :deep))
-        \\   (try (flatten a) (catch :stack-overflow e :deep))
+        \\   (flatten a)
         \\   (try (hash a) (catch :stack-overflow e :deep))
         \\   (try #{a b} (catch :stack-overflow e :deep))
         \\   (try (pr-str a) (catch :stack-overflow e :deep))])
-    , "[:deep :deep :deep :deep :deep :deep]");
+    , "[:deep :deep () :deep :deep :deep]");
 }
 
 test "integration: a record prints as #ns.Type{...}; defrecord and defprotocol may be redefined" {
@@ -2214,6 +2227,158 @@ test "integration: cons onto any seqable" {
     try expectOutput("[(cons 1 #{2}) (cons 1 {:a 1}) (cons 1 \"ab\") (cons 0 [1 2]) (cons 0 nil) (cons 0 (list))]", "[(1 2) (1 [:a 1]) (1 a b) (0 1 2) (0) (0)]");
 }
 
+test "lazy: lazy-seq runs its body once, when first walked, and caches what it returned" {
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [1 2])] [(realized? s) (first s) (rest s) @n (realized? s) (seq (lazy-seq nil)) (lazy-seq nil) (= (lazy-seq nil) []) (= (lazy-seq nil) nil) (seq? s) (list? s) (class s)])", "[false 1 (2) 1 true nil () true false true false :lazy_seq]");
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (cons 1 (lazy-seq (swap! n inc) nil)))] [(first s) @n (count s) @n (next s) (rest s) (nth s 0) (nth s 3 :d) (empty? s) (count (lazy-seq nil)) (empty? (lazy-seq nil))])", "[1 1 1 2 nil () 1 :d false 0 true]");
+    try expectOutput("[(coll? (lazy-seq nil)) (sequential? (lazy-seq nil)) (counted? (lazy-seq nil)) (seqable? (lazy-seq nil)) (vector? (lazy-seq nil)) (instance? :lazy_seq (lazy-seq nil))]", "[true true false true false true]");
+    // A body that throws stays unrealized and runs again, as JVM
+    // Clojure 1.12's LazySeq does (babashka's does not).
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x :x 2 false]");
+    // A body may refer to its own seq; one that forces it recurses
+    // until the stack guard stops it.
+    try expectOutput("(do (def s (lazy-seq (cons 1 s))) (take 3 s))", "(1 1 1)");
+    try expectOutput("(do (def t (lazy-seq (seq t))) (try (seq t) (catch :stack-overflow e :deep)))", ":deep");
+    try expectOutput("(do (def u (lazy-seq u)) [(seq u) (count u)])", "[nil 0]");
+    // nth is a leaf; over a lazy seq it is re-issued as a full call.
+    try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
+    try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+}
+
+test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {
+    try expectOutput("[(get {(lazy-seq [1 2]) :a} [1 2]) (contains? #{[1 2]} (lazy-seq [1 2])) (= {:k (lazy-seq [1])} {:k [1]}) (pr-str [(lazy-seq [1])]) (= (hash (lazy-seq [2 3])) (hash [2 3])) (= (hash [(lazy-seq [2 3])]) (hash [[2 3]])) (str (lazy-seq [1 2]))]", "[:a true true [(1)] true true (1 2)]");
+    // A nested body's throw surfaces from the native or opcode that
+    // compared or hashed; the first of two wins.
+    try expectOutput("(try (= [(lazy-seq (throw :x))] [[1]]) (catch any e e))", ":x");
+    try expectOutput("(try #{(lazy-seq (throw :y)) []} (catch any e e))", ":y");
+    try expectOutput("(try {[] 1 (lazy-seq (throw :z)) 2} (catch any e e))", ":z");
+    try expectOutput("(try (hash [(lazy-seq (throw :a)) (lazy-seq (throw :b))]) (catch any e e))", ":a");
+    try expectOutput("[(try (hash [(lazy-seq (throw :a))]) (catch any e e)) (= [(lazy-seq [1])] [[1]]) (contains? #{[1]} (lazy-seq [1]))]", "[:a true true]");
+    // = walks in step: an infinite seq against a finite one ends.
+    try expectOutput("(do (defn nat [n] (lazy-seq (cons n (nat (inc n))))) [(= (nat 0) [0 1]) (= [0 1] (nat 0)) (= [(nat 0)] [[0 1]]) (not= (nat 0) '(0))])", "[false false false true]");
+    // An in-place edit of a transient realizes its key first, so the
+    // body's own edit of the transient is complete before it starts.
+    try expectOutput("(let [t (transient {})] (assoc! t (lazy-seq (assoc! t :x 1) [1]) 2) (persistent! t))", "{:x 1, (1) 2}");
+    try expectOutput("(let [t (transient #{})] (persistent! (conj! t (lazy-seq [1]) [1] (lazy-seq [2]))))", "#{(1) (2)}");
+}
+
+test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
+    try expectOutput("(do (defmacro m [] (lazy-seq (list '+ 1 2))) (m))", "3");
+    try expectOutput("(do (defmacro m2 [] (list 'quote (lazy-seq [1 (lazy-seq [2])]))) [(m2) (class (m2)) (class (second (m2)))])", "[(1 (2)) :list :list]");
+    try expectOutput("(eval (lazy-seq (list '+ 1 2)))", "3");
+    try expectOutput("(let [xs (lazy-seq [1 2])] `(a ~@xs))", "(user/a 1 2)");
+    try expectOutput("(let [n (atom 0) xs (lazy-seq (swap! n inc) [1 2])] [`(~@xs ~@xs) @n])", "[(1 2 1 2) 1]");
+    try expectOutput("(try (let [xs (lazy-seq (throw :splice))] `(a ~@xs)) (catch any e e))", ":splice");
+}
+
+test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, reduces, indexes and drops without realizing" {
+    try expectOutput("[(realized? (range 10)) (take 3 (range)) (take 3 (range 0 10 0)) (range 3 3 0) (count (range 1000000000000)) (reduce + (range 1000000)) (nth (range 10 100) 5) (drop 3 (range 6))]", "[false (0 1 2) (0 0 0) () 1000000000000 499999500000 15 (3 4 5)]");
+    try expectOutput("[(range 0) (class (range 0)) (seq (range 5 5)) (range 5 0 -2) (count (range 0 10 3)) (count (range 10 0 -3)) (nth (range 5) 7 :x) (try (nth (range 5) 7) (catch any e e)) (vec (range 3)) (into #{} (range 3)) (range 0 1 0.25) (range 3.0) (take 2 (range 1.5 1.5 0))]", "[() :list nil (5 3 1) 4 4 :x :index-out-of-bounds [0 1 2] #{0 1 2} (0 0.25 0.5 0.75) (0 1 2) ()]");
+    try expectOutput("[(reduce (fn [a x] (if (> x 10) (reduced a) (+ a x))) (range)) (reduce (fn [a x] (if (> a 10) (reduced a) (+ a x))) (range 1 2 0)) (reduce + 100 (range 3)) (reduce + (range 1 2)) (reduce (fn [a x] (if (= x 2) (reduced [a x]) x)) 0 (range 2 10 0))]", "[55 11 103 1 [0 2]]");
+    // A realized range is walked, not recomputed; the first chunk is
+    // 32 elements, the last what is left.
+    try expectOutput("(let [r (range 70) s (seq r)] [(realized? r) (count (seq r)) (first (drop 64 r)) (last r) (= r (vec (range 70))) (= (hash r) (hash (vec (range 70))))])", "[true 70 64 69 true true]");
+    try expectOutput("(take 2 (drop 140737488355326 (range 140737488355320 140737488355330)))", "()");
+}
+
+test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
+    // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (range 100))) @n)", "32");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (apply list (range 100)))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x y] (swap! n inc) x) (range 100) (range 100))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (filter (fn [x] (swap! n inc) (> x 40)) (range 100))) @n)", "64");
+    try expectOutput("(let [n (atom 0)] (first (map-indexed (fn [i x] (swap! n inc) x) (vec (range 50)))) @n)", "32");
+    try expectOutput("[(list? (map inc [1])) (seq? (map inc [1])) (class (filter odd? [1])) (realized? (map inc [1])) (let [s (map inc [1])] (first s) (realized? s))]", "[false true :lazy_seq false true]");
+    try expectOutput("[(take 3 (map inc (range))) (first (filter #(> % 1000) (range))) (take 2 (keep #(when (odd? %) %) (range))) (take 2 (remove even? (range))) (take 3 (map-indexed vector (range 10 20))) (take 2 (keep-indexed #(when (odd? %1) %2) (range 10 20)))]", "[(1 2 3) 1001 (1 3) (1 3) ([0 10] [1 11] [2 12]) (11 13)]");
+    try expectOutput("[(map + [1 2] [10 20 30]) (map str \"ab\" [1 2]) (map vector {:a 1} [2]) (map inc #{1}) (map inc nil) (filter odd? nil) (map list [1 2] (range))]", "[(11 22) (a1 b2) ([[:a 1] 2]) (2) () () ((1 0) (2 1))]");
+    // A filter skipping a long run of an unchunked source forwards
+    // from block to block in one loop: no native stack.
+    try expectOutput("(first (filter #(> % 100000) (range)))", "100001");
+    // A function's throw surfaces where the seq is walked.
+    try expectOutput("(let [s (map (fn [x] (throw :m)) [1])] [(realized? s) (try (doall s) (catch any e e)) (realized? s)])", "[false :m false]");
+}
+
+test "gc: a realized map block lets its source go; an abandoned one keeps it until dropped" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const heap = program.v.ensureHeap();
+    _ = try program.run("(def v (vec (range 100000)))");
+    program.v.collectGarbage();
+    _ = try program.run("(def m (doall (map inc v)))");
+    program.v.collectGarbage();
+    const with_source = heap.liveCount();
+    _ = try program.run("(def v nil)");
+    program.v.collectGarbage();
+    // The vector's leaves and nodes: nothing of the realized map holds them.
+    try testing.expect(with_source - heap.liveCount() > 3000);
+    _ = try program.run("(def v (vec (range 100000))) (def h (map inc v)) (first h) (def v nil)");
+    program.v.collectGarbage();
+    const held = heap.liveCount();
+    _ = try program.run("(def h nil)");
+    program.v.collectGarbage();
+    try testing.expect(held - heap.liveCount() > 3000);
+}
+
+test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
+    try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
+    try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");
+    try expectOutput("(let [n (atom 0) s (repeatedly (fn [] (swap! n inc)))] [(first s) @n (doall (take 3 s)) @n])", "[1 1 (1 2 3) 3]");
+    try expectOutput("[(repeat 3 :x) (repeat 0 :x) (repeat -1 :x) (count (repeat 1000000000 :x)) (nth (repeat 5 :y) 4) (drop 3 (repeat 5 :z)) (realized? (repeat 3 1)) (class (cycle [1]))]", "[(:x :x :x) () () 1000000000 :y (:z :z) false :lazy_seq]");
+    try expectOutput("[(reduce (fn [a x] (if (> a 100) (reduced a) (+ a x))) (iterate inc 1)) (reduce + 0 (repeat 4 5)) (reduce (fn [a x] (if (> a 6) (reduced a) (+ a x))) (cycle [1 2]))]", "[105 20 7]");
+    try expectOutput("(let [n (atom 0) c (cycle (map (fn [x] (swap! n inc) x) [1 2 3]))] [(take 7 c) @n])", "[(1 2 3 1 2 3 1) 3]");
+}
+
+test "lazy: concat, mapcat, take, drop, take-while, drop-while, partition, partition-all, distinct and dedupe are lazy" {
+    // Expected values from babashka.
+    try expectOutput("[(take 5 (mapcat (fn [x] [x x]) (range))) (take 3 (drop 5 (range))) (take-while neg? (range)) (take 3 (drop-while #(< % 10) (range))) (take 2 (partition 2 (range))) (take 3 (distinct (cycle [1 2 3 1])))]", "[(0 0 1 1 2) (5 6 7) () (10 11 12) ((0 1) (2 3)) (1 2 3)]");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (take 100 (range)))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (filter (fn [x] (swap! n inc) (odd? x)) (concat [1 2 3] (range 100)))) @n)", "3");
+    try expectOutput("[(list? (first (partition 2 [1 2]))) (partition 3 3 [:a] [1 2 3 4]) (partition-all 2 [1 2 3]) (partition 2 1 [1 2 3]) (dedupe [1 1 2 1 1]) (distinct [1 2 1 3]) (take 2 [1 2 3]) (drop 2 [1 2 3]) (drop -1 [1 2]) (take -1 [1 2]) (concat) (concat [1] nil [2 3] (list 4)) (mapcat reverse [[1 2] [3 4]])]", "[false ((1 2 3) (4 :a)) ((1 2) (3)) ((1 2) (2 3)) (1 2 1) (1 2 3) (1 2) (3) (1 2) () () (1 2 3 4) (2 1 4 3)]");
+    try expectOutput("(let [x (lazy-cat [1 2] (do (throw :never) []))] (take 2 x))", "(1 2)");
+    try expectOutput("[(realized? (take 2 [1 2])) (class (drop 1 [1 2])) (count (drop 999990 (range 1000000))) (first (drop 3 (map inc (range))))]", "[false :lazy_seq 10 4]");
+    // A concat nested deep enough to exhaust the stack is the catchable
+    // :stack-overflow when it is walked.
+    try expectOutput("(try (first (reduce concat [] (map vector (range 200000)))) (catch :stack-overflow e :deep))", ":deep");
+}
+
+test "lazy: interleave, interpose, take-nth, partition-by, tree-seq, flatten, reductions and drop-last are lazy" {
+    // Expected values from babashka.
+    try expectOutput("[(take 6 (interleave (range) (repeat :x))) (take 3 (tree-seq seq? seq '((1 2) (3)))) (take 3 (reductions + (range))) (take 4 (interpose :s (range)))]", "[(0 :x 1 :x 2 :x) (((1 2) (3)) (1 2) 1) (0 1 3) (0 :s 1 :s)]");
+    try expectOutput("(pr-str [(interleave) (interleave [1 2]) (interleave [1 2] [:a :b :c] [\"x\" \"y\"]) (take-nth 2 (range 7)) (partition-by odd? [1 3 2 4 5]) (flatten [1 [2 [3 nil]] '(4)]) (flatten nil) (reductions + [1 2 3]) (reductions + []) (reductions + 10 [1 2]) (drop-last [1 2 3]) (drop-last 2 [1 2 3]) (split-at 2 [1 2 3]) (split-with odd? [1 3 2 5]) (sequence [1 2]) (sequence []) (replace {1 :a} '(1 2 1))])", "[() (1 2) (1 :a \"x\" 2 :b \"y\") (0 2 4 6) ((1 3) (2 4) (5)) (1 2 3 nil 4) () (1 3 6) (0) (10 11 13) (1 2) (1) [(1 2) (3)] [(1 3) (2 5)] (1 2) () (:a 2 :a)]");
+    try expectOutput("[(class (interleave [1] [2])) (realized? (take-nth 2 [1 2 3])) (first (partition-by odd? (range))) (take 3 (flatten (repeat [1 [2]])))]", "[:lazy_seq false (0) (1 2 1)]");
+}
+
+test "lazy: transducers, transduce, into and sequence with an xform, eduction, completing, cat and halt-when" {
+    // Expected values from babashka.
+    try expectOutput("[(transduce (map inc) + [1 2 3]) (transduce (filter odd?) + 10 [1 2 3]) (into [] (comp (map inc) (filter even?)) (range 6)) (= #{2 3} (into #{} (map inc) [1 1 2])) (into '() (map inc) [1 2]) (sequence (map inc) [1 2 3]) (sequence (comp (take 2) (map inc)) (range)) (into [] cat [[1 2] [3]]) (into [] (mapcat reverse) [[1 2] [3 4]])]", "[9 14 [2 4 6] true (3 2) (2 3 4) (1 2) [1 2 3] [2 1 4 3]]");
+    try expectOutput("[(into [] (partition-all 2) [1 2 3]) (into [] (partition-by odd?) [1 3 2 4 5]) (into [] (dedupe) [1 1 2 2 1]) (into [] (distinct) [1 2 1 3]) (into [] (interpose :s) [1 2 3]) (into [] (keep #(when (odd? %) (* % %))) [1 2 3]) (into [] (map-indexed vector) [:a :b]) (into [] (keep-indexed #(when (odd? %1) %2)) [:a :b :c :d])]", "[[[1 2] [3]] [[1 3] [2 4] [5]] [1 2 1] [1 2 3] [1 :s 2 :s 3] [1 9] [[0 :a] [1 :b]] [:b :d]]");
+    try expectOutput("[(into [] (take-while neg?) [-1 -2 3 -4]) (into [] (drop-while neg?) [-1 -2 3 -4]) (into [] (drop 2) [1 2 3]) (into [] (remove odd?) [1 2 3 4]) (transduce (halt-when #(> % 2)) conj [] [1 2 3 4]) ((completing +) 5) (sequence (map +) [1 2] [10 20 30]) (eduction (map inc) [1 2]) (into [] (map inc) (range 3))]", "[[-1 -2] [3 -4] [3] [2 4] 3 5 (11 22) (2 3) [1 2 3]]");
+    // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
+    // one input past them), its completion once.
+    try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");
+}
+
+test "lazy: reduce over an unrealized range allocates nothing" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def r (range 10000000))");
+    const heap = program.v.ensureHeap();
+    const live = heap.liveCount();
+    const total = try program.run("(reduce + r)");
+    try testing.expectEqual(@as(i64, 49999995000000), total.asFixnum());
+    try testing.expectEqual(live, heap.liveCount());
+}
+
+test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
+    try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");
+    try expectOutput("(let [s (with-meta (lazy-seq [1 2]) {:m 1})] [(meta s) s (meta (rest s)) (meta (next s)) (= s [1 2])])", "[{:m 1} (1 2) nil nil true]");
+    try expectOutput("(let [n (atom 0) f (fn f [i] (lazy-seq (swap! n inc) (when (< i 5) (cons i (f (inc i)))))) s (f 0)] [(realized? s) (do (dorun 2 s) @n) (identical? s (doall s)) @n (dorun s) (doall 2 [1 2 3])])", "[false 3 true 6 nil [1 2 3]]");
+    try expectOutput("(take 4 (lazy-cat [1 2] [3] (list 4 5)))", "(1 2 3 4)");
+    try expectOutput("[(realized? (delay 1)) (let [d (delay 1)] @d (realized? d)) (try (realized? 1) (catch any e e))]", "[false true :kind-mismatch]");
+}
+
 test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get {:a 1} :a)", "1");
     try expectOutput("(get {:a 1} :missing)", "nil");
@@ -2320,12 +2485,12 @@ test "integration: map (eager) on list + vector" {
 test "integration: a built sequence is a list to every consumer, whatever its length" {
     // LIST.md §1: four or more results are a vector's view, fewer
     // are cons cells; nothing tells them apart.
-    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[true true true]");
+    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[false true false]");
     try expectOutput("(map inc (range 6))", "(1 2 3 4 5 6)");
     try expectOutput("(keep (fn [x] (when (odd? x) (str x x))) (range 9))", "(11 33 55 77)");
     try expectOutput("[(= (map inc (range 5)) '(1 2 3 4 5)) (= (hash (map inc (range 5))) (hash '(1 2 3 4 5))) (= (remove odd? (range 10)) [0 2 4 6 8])]", "[true true true]");
     try expectOutput("[(conj (map inc (range 5)) 0) (cons :a (filter even? (range 10))) (rest (map inc (range 5))) (next (map inc (range 1)))]", "[(0 1 2 3 4 5) (:a 0 2 4 6 8) (2 3 4 5) nil]");
-    try expectOutput("[(peek (map inc (range 5))) (pop (map inc (range 5))) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[1 (2 3 4 5) 8 7 99999]");
+    try expectOutput("[(try (peek (map inc (range 5))) (catch any e e)) (try (pop (map inc (range 5))) (catch any e e)) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[:kind-mismatch :kind-mismatch 8 7 99999]");
     try expectOutput("[(meta (with-meta (filter odd? (range 9)) {:a 1})) (meta (map inc (range 9))) (with-meta (map inc (range 5)) {:b 2})]", "[{:a 1} nil (1 2 3 4 5)]");
     try expectOutput("[(map inc []) (filter odd? [2 4 6 8]) (seq (map inc [])) (empty? (remove any? (range 5)))]", "[() () nil true]");
     try expectOutput("(let [xs (map inc (range 5))] {xs :v (vec xs) :w})", "{(1 2 3 4 5) :w}");
@@ -2363,7 +2528,7 @@ test "integration: reduce with user lambda" {
 
 test "integration: throw inside map propagates to outer catch" {
     try expectOutput(
-        \\(try (map (fn* [x] (throw :boom)) [1 2 3])
+        \\(try (doall (map (fn* [x] (throw :boom)) [1 2 3]))
         \\     (catch any e e))
     , ":boom");
 }
@@ -4125,6 +4290,13 @@ test "for: :while ends its loop, patterns destructure, modifiers compose" {
     try expectProgramError("(for [x] x)", compile.CompileError.MacroExpansionFailure);
 }
 
+test "for: lazy, 32 at a time over a chunked innermost source, as Clojure's" {
+    // Expected values from babashka.
+    try expectOutput("[(take 3 (for [x (range) :when (odd? x)] x)) (let [n (atom 0)] (first (for [x (range 3) y (range 100)] (do (swap! n inc) [x y]))) @n) (for [x (range 3) :while (< x 2) y [:a]] [x y]) (let [n (atom 0)] (first (for [x (range 100)] (do (swap! n inc) x))) @n) (let [n (atom 0)] (first (for [x (range 100) :when (odd? x)] (do (swap! n inc) x))) @n)]", "[(1 3 5) 32 ([0 :a] [1 :a]) 32 16]");
+    try expectOutput("[(class (for [x [1]] x)) (take 4 (for [x (range) y (range x)] [x y]))]", "[:lazy_seq ([1 0] [2 0] [2 1] [3 0])]");
+    try expectOutput("[(chunked-seq? (seq [1 2])) (chunked-seq? (list 1 2)) (count (chunk-first (seq [1 2 3]))) (nth (chunk-first (seq [1 2 3])) 2) (chunk-rest (seq [1 2])) (chunk-next (seq [1 2])) (let [b (chunk-buffer 2)] (chunk-append b 1) (chunk-append b 2) (chunk-cons (chunk b) (list 3))) (chunked-seq? (map inc [1 2]))]", "[true false 3 3 () nil (1 2 3) false]");
+}
+
 test "doseq: :when, :while and :let modifiers, destructuring, nil result" {
     try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :when (odd? x)] (swap! a conj x)) @a)", "[1 3]");
     try expectOutput("(let [a (atom [])] (doseq [x [1 2 3] :while (< x 3)] (swap! a conj x)) @a)", "[1 2]");
@@ -5174,7 +5346,7 @@ test "map, filter and reduce call their function once per element as a call in p
     // (VM.md §6, "Repeated calls").
     try expectOutput("(let [n 10] [(map (fn [x] (+ x n)) [1 2 3]) (filter (fn [x] (> x n)) [5 15 25]) (reduce (fn [a x] (+ a x n)) 0 [1 2])])", "[(11 12 13) (15 25) 23]");
     try expectOutput("[(map (fn [& xs] xs) [1 2]) (map (fn [x & more] [x more]) [1]) (reduce (fn [& xs] (vec xs)) [1 2 3])]", "[((1) (2)) ([1 nil]) [[1 2] 3]]");
-    try expectOutput("[(try (map (fn [x] (throw x)) [1 2]) (catch any e [:caught e])) (map (fn [x] (try (throw x) (catch any e (* e 10)))) [1 2 3])]", "[[:caught 1] (10 20 30)]");
+    try expectOutput("[(try (doall (map (fn [x] (throw x)) [1 2])) (catch any e [:caught e])) (map (fn [x] (try (throw x) (catch any e (* e 10)))) [1 2 3])]", "[[:caught 1] (10 20 30)]");
     try expectOutput("[(try (reduce (fn [a x] (if (= x 3) (throw [:at a]) (+ a x))) [1 2 3 4]) (catch any e e)) (filter (fn [x] (try (odd? x) (catch any e false))) [1 2 :a 3])]", "[[:at 3] (1 3)]");
     try expectOutput("(map (fn [xs] (reduce + (map inc (filter odd? xs)))) [[1 2 3] [] [5]])", "(6 0 6)");
     try expectOutput("(do (defn walk [n] (if (zero? n) 0 (reduce + (map (fn [_] (walk (dec n))) [1 2])))) (walk 10))", "0");
@@ -5301,7 +5473,7 @@ test "core: reduce, range, assoc, dissoc, conj" {
         .{ .src = "(range 5 2)", .expected = "()" },
         .{ .src = "(range 0 10 3)", .expected = "(0 3 6 9)" },
         .{ .src = "(range 5 0 -2)", .expected = "(5 3 1)" },
-        .{ .src = "(try (range 0 1 0) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(take 3 (range 0 1 0))", .expected = "(0 0 0)" },
         .{ .src = "(assoc [1 2 3] 1 :x)", .expected = "[1 :x 3]" },
         .{ .src = "(assoc [1 2 3] 3 :end)", .expected = "[1 2 3 :end]" },
         .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = ":index-out-of-bounds" },
@@ -5413,12 +5585,12 @@ test "core: sequence functions" {
         .{ .src = "(repeat 3 :x)", .expected = "(:x :x :x)" },
         .{ .src = "(repeat 0 :x)", .expected = "()" },
         .{ .src = "(do (def n (atom 0)) (repeatedly 3 (fn [] (swap! n inc))))", .expected = "(1 2 3)" },
-        .{ .src = "(iterate inc 0 5)", .expected = "(0 1 2 3 4)" },
-        .{ .src = "(iterate (fn [x] (* 2 x)) 1 4)", .expected = "(1 2 4 8)" },
-        .{ .src = "(iterate inc 0 0)", .expected = "()" },
+        .{ .src = "(take 5 (iterate inc 0))", .expected = "(0 1 2 3 4)" },
+        .{ .src = "(take 4 (iterate (fn [x] (* 2 x)) 1))", .expected = "(1 2 4 8)" },
+        .{ .src = "(take 0 (iterate inc 0))", .expected = "()" },
         // The count is not reserved up front: a callback that throws
         // ends a huge count at once.
-        .{ .src = "[(try (repeatedly 9999999999999 #(throw :stop)) (catch :stop e e)) (try (iterate (fn [x] (throw :stop)) 0 9999999999999) (catch :stop e e))]", .expected = "[:stop :stop]" },
+        .{ .src = "[(try (doall (repeatedly 9999999999999 #(throw :stop))) (catch :stop e e)) (try (doall (take 9999999999999 (iterate (fn [x] (throw :stop)) 0))) (catch :stop e e))]", .expected = "[:stop :stop]" },
         .{ .src = "(empty? [])", .expected = "true" },
         .{ .src = "(empty? \"\")", .expected = "true" },
         .{ .src = "(not-empty [1])", .expected = "[1]" },
@@ -5606,14 +5778,7 @@ fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
     var program: Program = undefined;
     try throwingProgram(&program);
     defer program.deinit();
-    const result = try program.run(src);
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, try program.run(src), expected);
 }
 
 test "native throw: caught by the innermost handler wherever the native runs" {
@@ -5622,7 +5787,7 @@ test "native throw: caught by the innermost handler wherever the native runs" {
     try expectThrowingOutput("(try (boom-with 42) (catch any e (inc e)))", "43");
     // Through a closure, a higher-order native, apply and nesting.
     try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", ":boom");
-    try expectThrowingOutput("(try (map (fn [x] (boom-with x)) [1 2]) (catch any e e))", "1");
+    try expectThrowingOutput("(try (doall (map (fn [x] (boom-with x)) [1 2])) (catch any e e))", "1");
     try expectThrowingOutput("(try (reduce (fn [a x] (if (= x 3) (boom-with a) (+ a x))) 0 [1 2 3 4]) (catch any e e))", "3");
     try expectThrowingOutput("(try (apply boom []) (catch any e e))", ":boom");
     try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again :boom]");
@@ -5658,13 +5823,7 @@ fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
         std.debug.print("\n  source: {s}\n  error: {s} at {?}\n", .{ src, @errorName(err), span });
         return err;
     };
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, result, expected);
 }
 
 /// The program must fail to compile with `UnresolvedSymbol`, and the
@@ -6119,14 +6278,7 @@ fn expectOutputUnderGc(src: []const u8, expected: []const u8) !void {
     program.v.setGcPolicy(.stress);
     const last_result = try program.run(src);
     try testing.expect(program.v.gc_cycles > 0);
-
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, last_result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, last_result, expected);
 }
 
 /// Every callback of these programs allocates a few kilobytes of
@@ -6148,7 +6300,51 @@ test "gc: reduce, reductions, sort-by, max-key, repeatedly and iterate survive c
     try expectOutputUnderGc(churn ++ "(sort-by (fn [x] (churn x) (str (- 10 x))) (range 12))", "(11 10 9 0 8 7 6 5 4 3 2 1)");
     try expectOutputUnderGc(churn ++ "(apply max-key (fn [x] (churn x) (count (str x))) (range 30))", "29");
     try expectOutputUnderGc(churn ++ "(count (repeatedly 30 (fn [] (churn 1) (str \"r\"))))", "30");
-    try expectOutputUnderGc(churn ++ "(last (iterate (fn [s] (churn s) (str s \"x\")) \"\" 20))", "xxxxxxxxxxxxxxxxxxx");
+    try expectOutputUnderGc(churn ++ "(last (take 20 (iterate (fn [s] (churn s) (str s \"x\")) \"\")))", "xxxxxxxxxxxxxxxxxxx");
+}
+
+/// A seq of `n` strings whose every step churns the heap: a walk of it
+/// collects between any two elements.
+const chain = "(defn chain [n] (lazy-seq (churn n) (when (pos? n) (cons (str n) (chain (dec n)))))) (defn ints [n] (lazy-seq (churn n) (when (pos? n) (cons n (ints (dec n)))))) ";
+
+test "gc: a native walking a lazy seq that collects at every step keeps what it built" {
+    try expectOutputUnderGc(churn ++ chain ++ "(reduce (fn [acc x] (str acc x)) \"\" (chain 30))", "302928272625242322212019181716151413121110987654321");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [f (frequencies (map count (chain 30)))] [(f 1) (f 2)])", "[9 21]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [z (zipmap m (chain 40))] [(count z) (count (set (vals z))) (every? vector? (keys z))])", "[40 40 true]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (concat m (chain 40))] [(count c) (vector? (first c)) (last c)])", "[80 true 1]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (interleave m (chain 40))] [(count c) (vector? (first c)) (second c)])", "[80 true 40]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [p (partition 3 3 (chain 5) m)] [(count p) (vector? (first (first p))) (rest (last p))])", "[14 true (5 4)]");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [c (mapcat (fn [i] (chain 3)) (range 10))] [(count c) (first c)])", "[30 3]");
+    try expectOutputUnderGc(churn ++ chain ++ zmap ++ "[(count (select-keys m (ints 50))) (count (set (chain 40))) (vec (take 3 (i64-vector (ints 30)))) (count (f64-vector (ints 30))) (count (into [] (chain 40))) (count (vec (chain 40)))]", "[39 40 [30 29 28] 30 40 40]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(apply str (chain 12)) (count (sort (chain 40))) (nth (chain 40) 39) (last (chain 40)) (count (reverse (chain 40)))]", "[121110987654321 40 1 1 40]");
+    // A body that returns the next block forwards to it: a long run of
+    // them costs no native stack, and each block stays reachable.
+    try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
+}
+
+test "gc: = and hash realize a lazy key in isolation, with no cycle inside the build" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.stress);
+    _ = try program.run(churn ++ "(def ks (mapv (fn [i] (lazy-seq (churn i) [i (str i)])) (range 20)))");
+    const ks = program.registry.current.lookupLocal("ks").?.root;
+    const heap = program.v.ensureHeap();
+    const saved = program.v.installLazyHost();
+    defer nx.lazy.host = saved;
+    // Nothing roots the maps built here: no cycle may run while a
+    // key's body churns the heap.
+    const cycles = program.v.gc_cycles;
+    var m = try nx.champ.mapEmpty(heap);
+    for (0..20) |i| m = try nx.champ.mapAssoc(heap, m, nx.vector.nth(ks, i), value_mod.fromFixnum(@intCast(i)).?, &nx.dispatch.hashValue, &nx.dispatch.equal);
+    try testing.expectEqual(cycles, program.v.gc_cycles);
+    try testing.expectEqual(@as(usize, 20), nx.champ.mapCount(m));
+    const key = try nx.vector.fromSlice(heap, &.{ value_mod.fromFixnum(13).?, try nx.string.fromBytes(heap, "13") });
+    switch (nx.champ.mapGet(m, key, &nx.dispatch.hashValue, &nx.dispatch.equal)) {
+        .present => |v| try testing.expectEqual(@as(i64, 13), v.asFixnum()),
+        .absent => return error.TestUnexpectedResult,
+    }
+    try testing.expect(program.v.parked_realize == null);
 }
 
 test "gc: a vector view alone keeps its vector alive across cycles" {
@@ -6324,10 +6520,10 @@ test "runtime errors: a closure called back from a native is the frame named fn"
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    const info = vm.SourceInfo{ .path = "t.nx", .text = "(map (fn [x] (/ 1 x)) [1 0])" };
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(mapv (fn [x] (/ 1 x)) [1 0])" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
-    try expectFrame(&program, &info, 0, "fn", 1, 14, "(/ 1 x)");
-    try expectFrame(&program, &info, 1, "<top>", 1, 1, "(map (fn [x] (/ 1 x)) [1 0])");
+    try expectFrame(&program, &info, 0, "fn", 1, 15, "(/ 1 x)");
+    try expectFrame(&program, &info, 1, "<top>", 1, 1, "(mapv (fn [x] (/ 1 x)) [1 0])");
 }
 
 /// Compile one form of `src` into a routine the caller owns, the

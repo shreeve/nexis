@@ -889,6 +889,18 @@ of the wrong type is `:nextomic/value-type`; any other kind is the VM's
 `entid` and `entity`, matches nothing in `datoms`, and is
 `:nextomic/no-entity` from `pull`.
 
+A lazy seq is a list to every native (`docs/LAZY.md` §8): each native
+realizes its arguments and walks every lazy seq in them as the list of
+its elements (`seq.asLists`) before it opens a transaction or a read,
+so tx-data, a query, its inputs and a pull pattern may be built
+lazily wherever a list is taken (a datom form and a lookup ref are
+vectors, so a lazy one is not), and no code runs while store state is
+in flight; a body's throw propagates from the native before it
+starts. A
+transaction function's result and a query function's are realized the
+same way before Nextomic reads them. Nextomic returns no lazy seq: `q`,
+`datoms`, `tx-range` and `history` are realized.
+
 | form | semantics |
 |---|---|
 | `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open (an empty path or one with a NUL byte is `:invalid-path`, as for `db/open`, DB.md §2), cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |

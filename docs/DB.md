@@ -479,7 +479,11 @@ second while the first holds the writer is `:db/busy`.
 
 Values are CODEC.md bytes. A durable ref inside a stored value is
 `:unserializable`: the kind is not in the serializable set
-(CODEC.md §3).
+(CODEC.md §3). A lazy seq is stored as the list it realizes to: the
+codec runs no code, so `db/put!`, `db/put-key!` and `db/alter!` realize
+a value the codec finds unrealized and encode it again (`db/put-key!`
+outside its transaction), and it reads back as a list
+(`docs/LAZY.md` §8).
 
 ---
 

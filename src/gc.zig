@@ -41,6 +41,7 @@ const value = @import("value.zig");
 const heap_mod = @import("heap.zig");
 const string = @import("string.zig");
 const list = @import("coll/list.zig");
+const lazy = @import("coll/lazy.zig");
 const vector = @import("coll/vector.zig");
 const champ = @import("coll/champ.zig");
 const sorted = @import("coll/sorted.zig");
@@ -194,6 +195,7 @@ pub const Collector = struct {
             // the VM owns, no heap value but the metadata just marked.
             .string, .bignum, .typed_vector, .durable_ref, .protocol, .protocol_fn, .nextomic_conn, .nextomic_db => {},
             .list => list.trace(h, self),
+            .lazy_seq => lazy.trace(h, self),
             .persistent_vector => vector.trace(h, self),
             .persistent_map => champ.traceMap(h, self),
             .persistent_set => champ.traceSet(h, self),
@@ -539,6 +541,35 @@ test "collect: each root is traced before the next is marked" {
     defer gc.deinit();
     try testing.expectEqual(@as(usize, 1), gc.collect(roots));
     try testing.expect(gc.gray.capacity < 64);
+}
+
+test "collect: a chain of realized lazy cells survives a cycle and an unreachable one is swept; a long chain marks without growing the worklist" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    // (0 1 ... n-1): cons cells behind realized blocks, a chunked cons
+    // and a list at the end.
+    const n = 1_000_000;
+    var s = try list.fromSlice(&heap, &.{value.fromFixnum(n).?});
+    s = try lazy.chunkedOf(&heap, &.{ value.fromFixnum(n - 2).?, value.fromFixnum(n - 1).? }, s);
+    var i: i64 = n - 2;
+    while (i > 0) {
+        i -= 1;
+        s = try lazy.realizedWithMeta(&heap, try lazy.cons(&heap, value.fromFixnum(i).?, s), null);
+    }
+    const garbage = try lazy.cons(&heap, value.fromFixnum(-1).?, try lazy.unrealized(&heap, 0, &.{try list.fromSlice(&heap, &.{value.fromFixnum(7).?})}));
+    _ = garbage;
+    const live = heap.liveCount();
+    var gc = Collector.init(&heap);
+    defer gc.deinit();
+    // The garbage: a cons, its unrealized block, the list it holds
+    // (one cell and its empty tail).
+    try testing.expectEqual(@as(usize, 4), gc.collect(&.{Heap.asHeapHeader(s)}));
+    try testing.expectEqual(live - 4, heap.liveCount());
+    try testing.expect(gc.gray.capacity < 64);
+    var c = lazy.Cursor.init(s);
+    var k: i64 = 0;
+    while (try c.next()) |x| : (k += 1) try testing.expectEqual(k, x.asFixnum());
+    try testing.expectEqual(@as(i64, n + 1), k);
 }
 
 test "collect: persistent set survives (>8 elements exercises CHAMP internals)" {

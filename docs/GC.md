@@ -163,6 +163,7 @@ The dispatch in `Collector.trace`:
 |---|---|---|
 | `string`, `bignum`, `typed_vector`, `durable_ref`, `protocol`, `protocol_fn`, `nextomic_conn`, `nextomic_db` | none: the leaves | nothing: bytes, limbs, unboxed elements, inline store id, tree and key (a durable ref's advisory connection pointer is not a heap block, `docs/DB.md` §7.3), ids, or a VM-owned pointer with inline text and numbers |
 | `list` | `list.trace` | subkind 0 (cons): every head, and the tail chain in a loop (cells through `markInternal`, a cell's meta through `mark`); subkind 1 (empty): nothing; subkind 2 (vector view): its vector, through `markValue`, also when the view ends a cons chain |
+| `lazy_seq` | `lazy.trace` | by the shape in the header's flags (`docs/LAZY.md` §3): a lazy block's producer arguments, a cons's first element, a chunked cons's every slot (unwritten ones are nil), each heap value through `markValue`; the chain (a lazy block's `result`, a cons's or chunked cons's `more`) in a loop, through `markInternal`, so a chain of any length costs no worklist; a list at the chain's end through `markValue` |
 | `persistent_vector` | `vector.trace` | the tail node, every slot of its block (vectors sharing a tail use different lengths of it, `docs/VECTOR.md` §2), and the trie, interior and leaf nodes through `markInternal` |
 | `persistent_map`, `persistent_set` | `champ.traceMap`, `champ.traceSet` | the array-form entries, or the CHAMP trie with interior and collision nodes through `markInternal` |
 | `sorted_map`, `sorted_set` | `sorted.trace` | the comparator, then every tree node through `markInternal` and its key and value through `markValue`, recursing to the tree's height (`docs/SORTED.md` §2) |
@@ -368,9 +369,7 @@ The rule each native follows, by what it holds across a further
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
    them on every exit path, a `ControlTransferred` unwind included.
-   `Results`, the result builder of `map`, `mapv`, `mapcat`,
-   `map-indexed`, `keep-indexed`, `filter`, `remove`, `keep` and
-   `filterv`: it pushes the first 32 results on its root scope, and
+   `Results`, the result builder of `mapv` and `filterv`: it pushes the first 32 results on its root scope, and
    from the 33rd roots a transient vector in their place, writing
    each later result into its open tail, whose every slot the
    vector's trace marks (§5, `docs/LIST.md` §1); `reductions`, `repeatInto` (`repeatedly`,
@@ -386,9 +385,9 @@ The rule each native follows, by what it holds across a further
 4. **Values a native builds itself and keeps across callbacks**: no
    argument reaches them. The iterator over a map, a record or an
    entity builds each `[k v]` entry, and the one over a typed vector
-   boxes each element. `sieveInto` (`filter`, `remove`, `keep`,
-   `filterv`) passes each element to the predicate, its call's
-   argument, and keeps it in its `Results` before the next call;
+   boxes each element. `sieveInto` (`filterv`) passes each element to the predicate,
+   its call's argument, and keeps it in its `Results` before the next
+   call;
    `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's
@@ -398,6 +397,19 @@ The rule each native follows, by what it holds across a further
    every group, and stores each element and key before its next call.
    A native that only passes a built value to the next call (`map`,
    `some`, `every?`, `reduce` over a map) is class 2 for it.
+
+5. **Realization**: walking a lazy seq runs its bodies
+   (`docs/LAZY.md` §4), which may collect at every step, so every
+   `seq.SeqIter.next` over a seqable that may be lazy is a call back
+   into the VM. What a native holds across the walk must be reachable
+   from its arguments or on a root scope: a realized chain is cached
+   in the block that heads it, so the elements already walked reach
+   from the argument the walk started at, but a callback result
+   (`reduce`'s accumulator, which waits in a root slot between calls),
+   a value the native built (`frequencies`' transient, `select-keys`'
+   result) and a value another iterator built (the entries of a map
+   walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
+   `partition`'s pad, which walk with `rootedSeqIter`) are not.
 
 A new native that calls back into the VM states its class next to its
 `callValue`.

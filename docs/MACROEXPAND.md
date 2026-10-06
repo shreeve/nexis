@@ -109,7 +109,9 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `reduced`, `delay`, record constructors, protocol fns and `db/open`
    in a macro body see and change the program's namespaces, record
    types, protocols and stores. Its
-   result becomes a Form at the call's span (`valueToForm`), or its
+   result, every lazy seq in it realized on the sub-VM and made a list
+   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form at the call's
+   span (`valueToForm`), or its
    throw or VM error becomes the failure message (§8). The sub-VM is
    released and the result is expanded again in the call's place.
 4. **A fresh sub-VM per call**: no handler, finally or halted state
@@ -140,7 +142,9 @@ otherwise it is an ordinary call. User macros shadow host macros.
    `read-string` its value the same way. Value → Form
    (`valueToForm`): nil, booleans, fixnums, bignums (an `int` within
    i64, else a `bigint`), floats, chars, strings, symbols, keywords,
-   lists (including a vector's seq view), vectors, maps and sets; the
+   lists (including a vector's seq view), vectors, maps and sets, after
+   every lazy seq in the value is realized and made a list (a macro's
+   result, `eval`'s and `macroexpand`'s argument); the
    list `(nexis.internal/#%meta x m)` becomes `^m x` (§5). A sorted map
    or set in the natural order becomes the list
    `(nexis.internal/#%sorted-map k v ...)` or `(nexis.internal/#%sorted-set x ...)`,
@@ -537,7 +541,6 @@ Nested `#()` never reaches the expander: the reader rejects it.
 | `cond` | Nested `if`; an odd argument count fails. `:else` works by truthiness: a last test that is a truthy literal (a keyword, `true`, a number, a string, a char) is no test, its value the innermost `else`. |
 | `case` | Keys are constants, never evaluated: a symbol key is that symbol, a vector or map key that literal, a list `(k1 k2)` groups alternatives; they are compared with `=`. With fewer than three constants, `(let* [g expr] (if (= g 'k1) v1 ...))`; with three or more, one hashed lookup finds the clause, `(let* [g expr i (get '{k1 0 k2 1 ...} g -1)] (if (== i 0) v1 (if (== i 1) v2 ...)))`, each test one inlined compare (`g` is bound only when there is no default, for the throw). The map's lookup is `=`'s equality and hash. Two constants that are `=` but spelled differently (`[1]`, a grouped `(1)`) would share a key where the chain lets the first clause win, so a case with two compound constants, or two bignums, keeps the chain. The map lists the constants in clause order, so they are interned in source order, ahead of the clauses' results. A constant given twice, alone or in a group, is `MalformedMacroCall` "case: duplicate test constant" at the second, as in Clojure; constants of different kinds (`1`, `1.0`, `\1`) are distinct. With no trailing default, no match throws `{:error :no-matching-clause :message "No matching clause: <expr>" :value expr}`. |
 | `condp` | `pred` and `expr` evaluated once; clauses become `(if (p c e) v ...)` with `case`'s default policy. A clause `c :>> f` calls `f` on the predicate's truthy result. |
-| `for` | Eager: one `loop*` per binding pair, each pair followed by any number of `:let [b]`, `:when t` and `:while t`; a pattern destructures through `let`. `:when` skips the element, `:while` ends the loop it follows (outer loops carry on). The loops fill a vector returned as a seq, `()` when empty: a list, as Clojure's `for` gives, built eagerly (PLAN §23 #14). |
 | `->`, `->>` | Thread the value as the first (`->`) or last (`->>`) argument of each step, left to right; a step that is not a list is called with the value alone; an empty-list step fails. |
 | `defrecord` | Registers the record type and defines `T-type-id`, `->T`, `map->T`, `T?` and one impl per method under the protocol named by the preceding bare symbol, its arities written `(m [params] body) (m [params] body)` or `(m ([params] body) ...)` and gathered into one overloaded `fn` (`PROTOCOLS.md` §4.2). `T` itself is bound to the record's type, the symbol `ns.T` (`(def T 'ns.T)`), which is the form's value (`PROTOCOLS.md` §0). An inline method sees the record's fields as locals unless a parameter shadows one: `(defrecord Rect [w h] Shape (area [_] (* w h)))`. `DeclaredNames` knows the defined names, so a form may refer to `->T` before the `defrecord`. |
 | `defprotocol` | `(do (def IFoo (nexis.internal/#%register-protocol "<ns>/IFoo" [:bar ...])) (def bar (nexis.internal/#%protocol-fn IFoo :bar)) ...)`; a docstring and `:option value` pairs before the methods are ignored; a method's parameter vectors become its Var's `:arglists` and a docstring among them its `:doc` (`PROTOCOLS.md` §4.1). |
@@ -551,8 +554,11 @@ with `defmacro` (`STDLIB.md` §1):
 - `core.nx`: `if-let`, `when-let`, `if-some`, `when-some`,
   `when-first`, `if-not`, `comment` (nil; the body is never
   compiled), `doto`, `defonce`, `assert`, `time`, `with-out-str`,
-  `dotimes`, `while`, `doseq` (`for`'s modifiers, for effect,
-  yielding nil), `letfn`, `declare`, `doc` (prints a Var's
+  `dotimes`, `while`, `for` (Clojure 1.12's: a lazy seq, one
+  iterator per binding, the innermost walking a chunk at a time where
+  its coll is chunked, `:let`, `:when` and `:while` inside the chunk;
+  one binding and no modifiers is `map`, `docs/LAZY.md` §7), `doseq`
+  (`for`'s modifiers, for effect, yielding nil), `letfn`, `declare`, `doc` (prints a Var's
   `:arglists` and `:doc`), `cond->`, `cond->>`, `some->`, `some->>`,
   `as->`, `vswap!`, `binding` (`(do (push-thread-bindings ...) (try
   body (finally (pop-thread-bindings))))`, `VM.md` §6.5),

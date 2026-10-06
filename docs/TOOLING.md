@@ -79,8 +79,10 @@ comments and character literals it opens or closes, and the text is
 read only when they balance, so pasting a form of n lines costs
 O(n). It evaluates every
 form and prints each value on stdout as `prn` does, nil included,
-whatever its size. `*1`, `*2` and `*3` hold the last three values. A
-runtime error is reported on stderr, the frames, handlers and
+whatever its size, realizing a lazy seq in it first (`docs/LAZY.md`
+§8): a throw while it does is that input's runtime error, as one in
+the evaluation would be, and so it is for `nexis -e`. `*1`, `*2` and
+`*3` hold the last three values. A runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
 and `*e` is the thrown value, or for a VM error the keyword `catch`
 sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;

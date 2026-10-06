@@ -31,25 +31,25 @@ which is why the offset lives in the Value. `head` is the vector's
 a view; the cursor walks the vector's leaves directly
 (`vector.Cursor.initAt`).
 
-**Built sequences.** The eager sequence natives (`map`, `filter`,
-`remove`, `keep`, `map-indexed`, `range`, `concat`, `take`, `seq` of a
-map or set, and the rest that build a fresh list) gather their
-results and return, through `list.build`, for four or more
-(`list.view_min`), a vector of them and its view at offset 0: a root, a tail and
-one block per 32 elements instead of a cons cell per element, and an
-O(1) `count`. Fewer than four are cons cells, fewer blocks than a
-vector's root, tail and view. `list` always builds cons cells.
-`map`, `filter`, `remove`, `keep`, `map-indexed`, `keep-indexed` and
-`range`, and `mapv` and `filterv`, build the vector as they go
-(`stdlib.zig` `Results`): the 33rd result makes the first 32 a
-transient vector (`docs/TRANSIENT.md` §1), and each later one is
-written into the vector's open tail (`docs/VECTOR.md` §5,
+**Built sequences.** The sequence natives that build a fresh list
+eagerly (`seq` of a map, a set or a string, `sort`, `reverse`, `keys`,
+`vals`, and the rest that return a list rather than a lazy seq,
+`docs/LAZY.md` §7) gather their results and return, through
+`list.build`, for four or more (`list.view_min`), a vector of them and
+its view at offset 0: a root, a tail and one block per 32 elements
+instead of a cons cell per element, and an O(1) `count`. Fewer than
+four are cons cells, fewer blocks than a vector's root, tail and view.
+`list` always builds cons cells. `mapv` and `filterv` build their
+vector as they go (`stdlib.zig` `Results`): the 33rd result makes the
+first 32 a transient vector (`docs/TRANSIENT.md` §1), and each later
+one is written into the vector's open tail (`docs/VECTOR.md` §5,
 `openTailInPlace`), so a long result is never gathered whole in a
-buffer first (`test/golden/cli/long-sequences.nx`
-builds a million elements under a 4 MiB `NEXIS_MAX_ALLOC`). As
-with any view, a `rest` or `drop` of a built sequence keeps the whole
-vector reachable (§4), where a cons chain's rest frees the cells before
-it.
+buffer first (`test/golden/cli/long-sequences.nx` builds a million
+elements under a 4 MiB `NEXIS_MAX_ALLOC`). As with any view, a `rest`
+or `drop` of a built sequence keeps the whole vector reachable (§4),
+where a cons chain's rest frees the cells before it. A view is a
+chunked source for the lazy producers: `map` over one takes a vector
+leaf at a time (`viewChunk`).
 
 A view is a list to every consumer: it is `seq?` and `list?`, prints as
 `(...)`, is `=` to and hashes as the list of the same elements, can be
@@ -145,7 +145,8 @@ nil-returning `first`, `rest` and `next` are stdlib natives on top.
   `coll:list` opcode, which builds them with `cons` (`docs/VM.md`
   §10.8).
 - **Printer.** `src/format.zig` prints every subkind as `(...)`.
-- **Absent.** Lazy sequences (PLAN §23 #14): `seq` of a vector is the view
-  of §1, of every other collection a fresh list, a view once it holds
-  four elements (§1, built sequences). Destructive list
-  operations. Transients of lists.
+- **Absent.** Destructive list operations. Transients of lists. A
+  list is always realized: a cell whose rest may be lazy is a lazy
+  seq's cons (`docs/LAZY.md` §1). `seq` of a vector is the view of §1,
+  of every other collection a fresh list, a view once it holds four
+  elements (§1, built sequences).

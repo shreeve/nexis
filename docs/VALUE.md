@@ -22,12 +22,13 @@ NEON and SSE.
 | `0..7` | `kind: u8` | The primary discriminator (§2) |
 | `8..15` | reserved | 0 |
 | `16..31` | `subkind: u16` | The sub-type within a heap kind (§2.2); 0 for immediates |
-| `32..63` | list-view offset | For `kind = list` and `subkind = 2` (a vector view), the index of the view's first element in its vector (`docs/LIST.md` §1); 0 otherwise |
+| `32..63` | offset | For `kind = list` and `subkind = 2` (a vector view), the index of the view's first element in its vector (`docs/LIST.md` §1); for `kind = lazy_seq` and `subkind = 2` (a chunked cons), the index of its first element in its chunk (`docs/LAZY.md` §2); 0 otherwise |
 
 `Value.kind()` and `.subkind()` read the fields by shift. Metadata and
 the cached hash of a heap object live in its header (`docs/HEAP.md`
 §1), not in the tag. Two views of one vector at different offsets
-differ in the tag, so `identical?` tells them apart.
+differ in the tag, so `identical?` tells them apart; so do two offsets
+of one chunked cons.
 
 #### 1.2 Payload word interpretation
 
@@ -49,7 +50,7 @@ Kind numbers are frozen: the VM switches on them and the codec writes
 them as wire tags (`docs/CODEC.md` §9). A kind number is never reused
 or renumbered; a retired kind leaves a reserved gap. `Kind.isImmediate`
 is `kind < 16`, `Kind.isHeap` is `16 <= kind < 64`. Values 8–15 are
-reserved for immediates, 43–63 for heap kinds, 64 and above for
+reserved for immediates, 44–63 for heap kinds, 64 and above for
 runtime-private sentinels (§2.3).
 
 #### 2.1 Immediates (the payload is the value)
@@ -105,6 +106,7 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 40 | `nextomic_entity` | Nextomic lazy entity (`docs/NEXTOMIC.md` §6) | The db-value box, the eid and the map of its last full read |
 | 41 | `sorted_map` | Sorted map: a weight-balanced tree in its comparator's order (`docs/SORTED.md`) | 0 = root: the comparator and the tree. Tree nodes are blocks of this kind that no Value points at (`docs/SORTED.md` §2) |
 | 42 | `sorted_set` | Sorted set, laid out as the sorted map without values | As for the sorted map |
+| 43 | `lazy_seq` | Lazy seq (`docs/LAZY.md`) | 0 = lazy block (unrealized, forwarding or realized), 1 = cons cell whose rest may be lazy, 2 = chunked cons: the body is the rest and the chunk's elements, the offset is in tag bits 32..63 |
 
 The equality category and hash domain of every kind are SEMANTICS
 §3.3; what each block's trace walks is `docs/GC.md` §5; which kinds

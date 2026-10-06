@@ -53,6 +53,7 @@ const dispatch = @import("../../dispatch.zig");
 const natives = @import("../natives.zig");
 const marshal = @import("../marshal.zig");
 const query = @import("../query.zig");
+const seq_mod = @import("../../seq.zig");
 
 const Value = value.Value;
 const VM = vm_mod.VM;
@@ -107,7 +108,17 @@ const Hook = struct {
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
-        return self.vm.callValue(try self.resolve(sym), args);
+        return self.listed(try self.vm.callValue(try self.resolve(sym), args));
+    }
+
+    /// A function's result, realized and made lists as the query's
+    /// inputs are (docs/LAZY.md §8), rooted for the query's life.
+    fn listed(self: *Hook, r: Value) anyerror!Value {
+        if (!r.kind().isHeap()) return r;
+        try self.scope.push(r);
+        const l = try seq_mod.asLists(self.vm, r);
+        if (!l.identicalTo(r)) try self.scope.push(l);
+        return l;
     }
 
     fn root(ctx: *anyopaque, v: Value) anyerror!void {
@@ -121,7 +132,7 @@ const Hook = struct {
     fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
         if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookupIn(self.vm, f, args);
-        return self.vm.callValue(f, args);
+        return self.listed(try self.vm.callValue(f, args));
     }
 
     /// The bound value the symbol names, or a thrown
@@ -170,8 +181,10 @@ fn splitQualified(name: []const u8) ?Qualified {
 // =============================================================================
 
 fn fnQ(vm: *VM, args: []const Value) VmError!Value {
+    const listed = try natives.ListedArgs.of(vm, args);
+    defer listed.deinit(vm);
     var diag: Diag = .{};
-    return qNative(vm, args, &diag) catch |err| natives.failDiag(vm, err, &diag);
+    return qNative(vm, listed.args, &diag) catch |err| natives.failDiag(vm, err, &diag);
 }
 
 fn qNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {
@@ -222,8 +235,10 @@ fn argMap(vm: *VM, arena: std.mem.Allocator, args: []const Value, diag: *Diag) !
 }
 
 fn fnExplain(vm: *VM, args: []const Value) VmError!Value {
+    const listed = try natives.ListedArgs.of(vm, args);
+    defer listed.deinit(vm);
     var diag: Diag = .{};
-    return explainNative(vm, args, &diag) catch |err| natives.failDiag(vm, err, &diag);
+    return explainNative(vm, listed.args, &diag) catch |err| natives.failDiag(vm, err, &diag);
 }
 
 fn explainNative(vm: *VM, call_args: []const Value, diag: *Diag) !Value {

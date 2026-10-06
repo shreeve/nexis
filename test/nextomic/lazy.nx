@@ -1,0 +1,40 @@
+; test/nextomic/lazy.nx — lazy seqs as Nextomic's inputs: every value
+; a native takes, and every result a transaction or query function
+; returns, is realized and walked as a list (docs/LAZY.md §8). Runs
+; from a scratch directory; the store is fresh.
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def c (d/connect "lazy.edb"))
+(d/transact! c (lazy-seq [{:db/ident :p/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                           :db/unique :db.unique/identity}
+                          {:db/ident :p/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                          {:db/ident :p/likes :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}]))
+
+(def r (d/transact! c (lazy-seq [{:p/name "a" :p/age 30 :p/likes (lazy-seq [:x :y])}
+                                 [:db/add "b" :p/name "b"]])))
+(t/check "transact! takes lazy tx-data and a lazy many value"
+         (= #{:x :y} (:p/likes (d/entity (:db-after r) [:p/name "a"]))))
+
+(def db (d/db c))
+(t/check "q takes a lazy collection input"
+         (= #{["a"] ["b"]} (d/q '[:find ?n :in $ [?n ...] :where [?e :p/name ?n]] db (lazy-seq ["a" "b" "z"]))))
+(t/check "q takes a lazy query"
+         (= #{["a"]} (d/q (lazy-seq '[:find ?n :where [?e :p/age 30] [?e :p/name ?n]]) db)))
+
+(defn names [db] (lazy-seq (map (fn [n] {:p/name n :p/age 1}) ["c" "d"])))
+(d/transact! c [[:db.fn/call names]])
+(t/check "a transaction function may return lazy tx-data"
+         (= 1 (:p/age (d/entity (d/db c) [:p/name "d"]))))
+
+(defn upto [n] (lazy-seq (range n)))
+(t/check "a :where function's lazy result binds as a collection"
+         (= #{[0] [1] [2]} (d/q '[:find ?x :where [(upto 3) [?x ...]]] (d/db c))))
+(t/check "a pull pattern may be built lazily"
+         (= (d/pull (d/db c) [:p/name :p/age] [:p/name "a"]) (d/pull (d/db c) (lazy-seq [:p/name :p/age]) [:p/name "a"])))
+(t/check "with takes lazy tx-data"
+         (= 2 (d/with c (lazy-seq [{:p/name "e" :p/age 2}]) (fn [db _] (:p/age (d/entity db [:p/name "e"]))))))
+(t/check "a lazy tx-data whose body throws aborts before the transaction"
+         (= :boom (t/caught (d/transact! c (lazy-seq (throw :boom))))))
+(println :done)

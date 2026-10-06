@@ -228,7 +228,7 @@ test "K1: every kind's equality category and hash domain are SEMANTICS §3.3's" 
             else => false,
         };
         const domain: u8 = switch (k) {
-            .list, .persistent_vector => 0xF0,
+            .list, .persistent_vector, .lazy_seq => 0xF0,
             .sorted_map => @backingInt(value.Kind.persistent_map),
             .sorted_set => @backingInt(value.Kind.persistent_set),
             else => @backingInt(k),

@@ -120,7 +120,7 @@
    :unknown-shape])
 
 (println "Per-shape reports:")
-(for [s shapes]
+(doseq [s shapes]
   (println "  " (report s)))
 
 (println "")

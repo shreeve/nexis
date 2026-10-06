@@ -24,10 +24,22 @@
 ; Sequence transforms
 ; ============================================================
 
-; (drop n coll) → a seq of coll without its first n elements, () when
-; none are left.
-(defn drop [n s]
-  (or (seq (nthrest s n)) (list)))
+; (lazy-seq body...) → a lazy seq whose body runs once, when the seq is
+; first walked, and whose result is cached (docs/LAZY.md §4).
+(defmacro lazy-seq [& body]
+  `(nexis.internal/#%lazy-seq (fn* [] ~@body)))
+
+; (lazy-cat coll...) → the concatenation of the colls, each expression
+; evaluated only when the walk reaches it.
+(defmacro lazy-cat [& colls]
+  `(concat ~@(map (fn* [c] `(lazy-seq ~c)) colls)))
+
+; The barrier through which = and hash realize a lazy block they meet
+; (docs/LAZY.md §6): [true seq], or [false thrown] for a throw, which
+; the VM parks.
+(defn- realize-caught [s]
+  (try [true (nexis.internal/#%force s)] (catch any e [false e])))
+
 
 ; ============================================================
 ; Conditional macros
@@ -367,17 +379,96 @@
                  (apply update-in (get m k) more f args)
                  (apply f (get m k) args)))))
 
-; ---- sequence breakdown helpers ----
+; ---- lazy sequence functions (docs/LAZY.md §7), Clojure 1.12's ----
 
-; (interpose sep coll) → coll with sep between each pair of
-; adjacent elements. Returns a list.
-(defn interpose [sep coll]
-  (if (empty? coll)
-    (list)
-    (loop* [s (rest coll) acc (list (first coll))]
-      (if (empty? s)
-        (reverse acc)
-        (recur (rest s) (cons (first s) (cons sep acc)))))))
+; (interleave c1 c2 ...) → the first of each coll, then the second of
+; each, ..., ending with the shortest.
+(defn interleave
+  ([] ())
+  ([c1] (lazy-seq c1))
+  ([c1 c2]
+   (lazy-seq
+     (let [s1 (seq c1) s2 (seq c2)]
+       (when (and s1 s2)
+         (cons (first s1) (cons (first s2) (interleave (rest s1) (rest s2))))))))
+  ([c1 c2 & colls]
+   (lazy-seq
+     (let [ss (map seq (conj colls c2 c1))]
+       (when (every? identity ss)
+         (concat (map first ss) (apply interleave (map rest ss))))))))
+
+; (interpose sep coll) → coll with sep between each pair of adjacent
+; elements.
+(defn interpose
+  ([sep] (xf-interpose sep))
+  ([sep coll] (drop 1 (interleave (repeat sep) coll))))
+
+; (take-nth n coll) → every nth element, starting with the first.
+(defn take-nth [n coll]
+  (lazy-seq
+    (when-let [s (seq coll)]
+      (cons (first s) (take-nth n (drop n s))))))
+
+; (partition-by f coll) → coll split each time (f x) changes.
+(defn partition-by
+  ([f] (xf-partition-by f))
+  ([f coll]
+  (lazy-seq
+    (when-let [s (seq coll)]
+      (let [fst (first s)
+            fv (f fst)
+            run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
+        (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
+
+; (tree-seq branch? children root) → the lazy seq of the nodes of the
+; tree under root, depth first, each before its children. Realizing a
+; node calls branch? and children on it, as Clojure's does; the seqs of
+; children still to visit wait on an explicit stack, so the depth of the
+; tree costs no native stack.
+(defn tree-seq [branch? children root]
+  (let [walk (fn walk [node stack]
+               (lazy-seq
+                 (cons node
+                       (let [stack (if (branch? node) (cons (children node) stack) stack)]
+                         (lazy-seq
+                           (loop [stack stack]
+                             (when (seq stack)
+                               (if-let [s (seq (first stack))]
+                                 (walk (first s) (cons (rest s) (rest stack)))
+                                 (recur (rest stack))))))))))]
+    (walk root ())))
+
+; (flatten coll) → every non-sequential leaf of a list or vector, depth
+; first; nil leaves are kept. Anything that is not sequential, nil
+; included, flattens to ().
+(defn flatten [x]
+  (filter (complement sequential?) (rest (tree-seq sequential? seq x))))
+
+; (reductions f coll) / (reductions f init coll) → every intermediate
+; accumulator of the fold, stopping at a reduced one.
+(defn reductions
+  ([f coll]
+   (lazy-seq
+     (if-let [s (seq coll)]
+       (reductions f (first s) (rest s))
+       (list (f)))))
+  ([f init coll]
+   (if (reduced? init)
+     (list @init)
+     (cons init
+           (lazy-seq
+             (when-let [s (seq coll)]
+               (reductions f (f init (first s)) (rest s))))))))
+
+; (drop-last coll) / (drop-last n coll) → coll without its last n
+; elements, one by default.
+(defn drop-last
+  ([coll] (drop-last 1 coll))
+  ([n coll] (map (fn [x _] x) coll (drop n coll))))
+
+; (split-at n coll) → [(take n coll) (drop n coll)].
+(defn split-at [n coll]
+  [(take n coll) (drop n coll)])
 
 ; ============================================================
 ; Function combinators
@@ -491,6 +582,88 @@
                  (let [~pat (first ~s)] ~inner)
                  nil))))))))
 
+; (for [binding coll modifiers... binding coll ...] body) → the lazy
+; seq of body for each binding, the last varying fastest, as Clojure
+; 1.12's for (docs/LAZY.md §7): one iterator per binding, each a
+; lazy-seq over the seq of its coll; the innermost walks a chunk at a
+; time where its coll is chunked, applying :let [b], :when t (skip the
+; element) and :while t (end that binding's walk) inside the chunk; an
+; outer one concatenates the inner seq onto the walk of its rest. One
+; binding and no modifiers is (map (fn [binding] body) coll).
+(defmacro for [seq-exprs body-expr]
+  (when (or (not (vector? seq-exprs)) (zero? (count seq-exprs)) (odd? (count seq-exprs)))
+    (throw (ex-info "for requires an even number of forms in the binding vector" {})))
+  (when (keyword? (first seq-exprs))
+    (throw (ex-info "for: a modifier needs a binding before it" {})))
+  (if (= 2 (count seq-exprs))
+    `(map (fn* [x#] (let [~(first seq-exprs) x#] ~body-expr)) ~(second seq-exprs))
+    (let [groups (reduce (fn* [groups pair]
+                           (if (keyword? (first pair))
+                             (conj (pop groups) (conj (peek groups) pair))
+                             (conj groups [(first pair) (second pair)])))
+                         [] (partition 2 seq-exprs))
+          check (fn* [k]
+                  (when-not (contains? #{:let :when :while} k)
+                    (throw (ex-info (str "for: unknown modifier " k) {}))))
+          emit-bind
+          (fn emit-bind [groups]
+            (let [group (first groups)
+                  bind (first group)
+                  mod-pairs (drop 2 group)
+                  next-groups (next groups)
+                  giter (gensym "iter__")
+                  gxs (gensym "s__")
+                  do-mod (fn do-mod [mods]
+                           (let [k (first (first mods)) v (second (first mods))]
+                             (when k (check k))
+                             (cond
+                               (= k :let) `(let ~v ~(do-mod (rest mods)))
+                               (= k :while) `(when ~v ~(do-mod (rest mods)))
+                               (= k :when) `(if ~v ~(do-mod (rest mods)) (recur (rest ~gxs)))
+                               next-groups `(let [iterys# ~(emit-bind next-groups)
+                                                  fs# (seq (iterys# ~(second (first next-groups))))]
+                                              (if fs#
+                                                (concat fs# (~giter (rest ~gxs)))
+                                                (recur (rest ~gxs))))
+                               true `(cons ~body-expr (~giter (rest ~gxs))))))]
+              (if next-groups
+                `(fn ~giter [~gxs]
+                   (lazy-seq
+                     (loop [~gxs ~gxs]
+                       (when-first [~bind ~gxs]
+                         ~(do-mod mod-pairs)))))
+                (let [gi (gensym "i__")
+                      gb (gensym "b__")
+                      gc (gensym "c__")
+                      gsize (gensym "size__")
+                      do-cmod (fn do-cmod [mods]
+                                (let [k (first (first mods)) v (second (first mods))]
+                                  (when k (check k))
+                                  (cond
+                                    (= k :let) `(let ~v ~(do-cmod (rest mods)))
+                                    (= k :while) `(when ~v ~(do-cmod (rest mods)))
+                                    (= k :when) `(if ~v ~(do-cmod (rest mods)) (recur (inc ~gi)))
+                                    true `(do (chunk-append ~gb ~body-expr) (recur (inc ~gi))))))]
+                  `(fn ~giter [~gxs]
+                     (lazy-seq
+                       (loop [~gxs ~gxs]
+                         (when-let [~gxs (seq ~gxs)]
+                           (if (chunked-seq? ~gxs)
+                             (let [~gc (chunk-first ~gxs)
+                                   ~gsize (count ~gc)
+                                   ~gb (chunk-buffer ~gsize)]
+                               (if (loop [~gi 0]
+                                     (if (< ~gi ~gsize)
+                                       (let [~bind (nth ~gc ~gi)]
+                                         ~(do-cmod mod-pairs))
+                                       true))
+                                 (chunk-cons (chunk ~gb) (~giter (chunk-rest ~gxs)))
+                                 (chunk-cons (chunk ~gb) nil)))
+                             (let [~bind (first ~gxs)]
+                               ~(do-mod mod-pairs)))))))))))]
+      `(let [iter# ~(emit-bind groups)]
+         (iter# ~(second seq-exprs))))))
+
 ; ============================================================
 ; Threading macros
 ; ============================================================
@@ -585,46 +758,23 @@
 (defn run! [f coll]
   (reduce (fn [_ x] (f x) nil) nil coll))
 
-; Sequences are eager, so doall and dorun only return.
-(defn doall [coll] coll)
-(defn dorun [coll] nil)
-
-; (partition-by f coll) → coll split each time (f x) changes.
-(defn partition-by [f coll]
-  (loop [s (seq coll) acc [] run [] k nil]
-    (if s
-      (let [x (first s) fx (f x)]
-        (if (or (empty? run) (= fx k))
-          (recur (next s) acc (conj run x) fx)
-          (recur (next s) (conj acc (seq run)) [x] fx)))
-      (or (seq (if (empty? run) acc (conj acc (seq run)))) (list)))))
-
-; (dedupe coll) → coll without consecutive duplicates.
-(defn dedupe [coll]
-  (or (seq (reduce (fn [acc x] (if (and (seq acc) (= x (peek acc))) acc (conj acc x))) [] coll)) (list)))
-
-; (take-nth n coll) → every nth element, starting with the first.
-(defn take-nth [n coll]
-  (keep-indexed (fn [i x] (when (zero? (rem i n)) x)) coll))
 
 ; (split-with pred coll) → [(take-while pred coll) (drop-while pred coll)].
 (defn split-with [pred coll]
   [(take-while pred coll) (drop-while pred coll)])
 
+; (sequence coll) → coll when it is a seq, else its seq, () when
+; empty; (sequence xform coll) → the lazy seq of coll through the
+; transducer, 32 outputs at a time (docs/LAZY.md §10).
+(defn sequence
+  ([coll] (if (seq? coll) coll (or (seq coll) ())))
+  ([xform coll] (nexis.internal/#%sequence xform coll))
+  ([xform coll & colls] (nexis.internal/#%sequence xform (apply map vector coll colls) true)))
+
 ; (distinct? x & xs) → whether no two arguments are equal.
 (defn distinct? [x & xs]
   (= (inc (count xs)) (count (set (cons x xs)))))
 
-; (tree-seq branch? children root) → the nodes of the tree under root,
-; depth first, each before its children; an explicit stack, so the
-; depth of the tree costs no native stack.
-(defn tree-seq [branch? children root]
-  (loop [stack (list root) acc (transient [])]
-    (if (seq stack)
-      (let [node (first stack) more (rest stack)]
-        (recur (if (branch? node) (into more (reverse (children node))) more)
-               (conj! acc node)))
-      (seq (persistent! acc)))))
 
 ; (replace smap coll) → coll with each element that is a key of smap
 ; (a map, or a vector by index) replaced by its value: a vector of a
@@ -766,6 +916,213 @@
   (print (apply format fmt args)))
 
 ; ============================================================
+; Transducers (docs/LAZY.md §10), Clojure 1.12's
+; ============================================================
+;
+; The one-argument arities of map, filter, remove, keep, take,
+; take-while, drop, drop-while, map-indexed, keep-indexed,
+; partition-all, mapcat, and the no-argument ones of distinct and
+; dedupe, are natives that call the xf- function of their name here.
+
+(defn- xf-map [f]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (rf result (f input)))
+         ([result input & inputs] (rf result (apply f input inputs))))))
+
+(defn- xf-filter [pred]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (if (pred input) (rf result input) result)))))
+
+(defn- xf-remove [pred] (xf-filter (complement pred)))
+
+(defn- xf-keep [f]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (let [v (f input)] (if (nil? v) result (rf result v)))))))
+
+(defn- xf-take [n]
+  (fn* [rf]
+    (let [nv (volatile! n)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [n @nv
+                  nn (vswap! nv dec)
+                  result (if (pos? n) (rf result input) result)]
+              (if (not (pos? nn)) (ensure-reduced result) result)))))))
+
+(defn- xf-take-while [pred]
+  (fn* [rf]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (if (pred input) (rf result input) (reduced result))))))
+
+(defn- xf-drop [n]
+  (fn* [rf]
+    (let [nv (volatile! n)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [n @nv]
+              (vswap! nv dec)
+              (if (pos? n) result (rf result input))))))))
+
+(defn- xf-drop-while [pred]
+  (fn* [rf]
+    (let [dv (volatile! true)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (and @dv (pred input))
+              result
+              (do (vreset! dv nil) (rf result input))))))))
+
+(defn- xf-map-indexed [f]
+  (fn* [rf]
+    (let [i (volatile! -1)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input] (rf result (f (vswap! i inc) input)))))))
+
+(defn- xf-keep-indexed [f]
+  (fn* [rf]
+    (let [iv (volatile! -1)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [i (vswap! iv inc) v (f i input)]
+              (if (nil? v) result (rf result v))))))))
+
+(defn- xf-partition-all [n]
+  (fn* [rf]
+    (let [a (volatile! [])]
+      (fn ([] (rf))
+           ([result]
+            (let [result (if (empty? @a)
+                           result
+                           (let [v @a] (vreset! a []) (unreduced (rf result v))))]
+              (rf result)))
+           ([result input]
+            (let [v (vswap! a conj input)]
+              (if (= n (count v))
+                (do (vreset! a []) (rf result v))
+                result)))))))
+
+(defn- xf-partition-by [f]
+  (fn* [rf]
+    (let [a (volatile! []) pv (volatile! :nexis.core/none)]
+      (fn ([] (rf))
+           ([result]
+            (let [result (if (empty? @a)
+                           result
+                           (let [v @a] (vreset! a []) (unreduced (rf result v))))]
+              (rf result)))
+           ([result input]
+            (let [pval @pv val (f input)]
+              (vreset! pv val)
+              (if (or (identical? pval :nexis.core/none) (= val pval))
+                (do (vswap! a conj input) result)
+                (let [v @a]
+                  (vreset! a [])
+                  (let [ret (rf result v)]
+                    (when-not (reduced? ret) (vswap! a conj input))
+                    ret)))))))))
+
+(defn- xf-distinct []
+  (fn* [rf]
+    (let [seen (volatile! #{})]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (contains? @seen input)
+              result
+              (do (vswap! seen conj input) (rf result input))))))))
+
+(defn- xf-dedupe []
+  (fn* [rf]
+    (let [pv (volatile! :nexis.core/none)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (let [prior @pv]
+              (vreset! pv input)
+              (if (= prior input) result (rf result input))))))))
+
+(defn- xf-interpose [sep]
+  (fn* [rf]
+    (let [started (volatile! false)]
+      (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if @started
+              (let [sepr (rf result sep)]
+                (if (reduced? sepr) sepr (rf sepr input)))
+              (do (vreset! started true) (rf result input))))))))
+
+(defn- preserving-reduced [rf]
+  (fn* [a b] (let [ret (rf a b)] (if (reduced? ret) (reduced ret) ret))))
+
+; (cat rf) → a transducer that concatenates each input, a collection.
+(defn cat [rf]
+  (let [rrf (preserving-reduced rf)]
+    (fn ([] (rf))
+         ([result] (rf result))
+         ([result input] (reduce rrf result input)))))
+
+(defn- xf-mapcat [f] (comp (xf-map f) cat))
+
+; (completing f) / (completing f cf) → f with a completion arity, cf
+; (identity by default).
+(defn completing
+  ([f] (completing f identity))
+  ([f cf]
+   (fn ([] (f))
+        ([x] (cf x))
+        ([x y] (f x y)))))
+
+; (transduce xform f coll) / (transduce xform f init coll) → reduce
+; with (xform f), then its completion.
+(defn transduce
+  ([xform f coll] (transduce xform f (f) coll))
+  ([xform f init coll]
+   (let [f (xform f)
+         ret (reduce f init coll)]
+     (f ret))))
+
+; (into to xform from): the native into's arity with a transducer.
+(defn- into-xform [to xform from]
+  (if (contains? #{:vector :map :set} (class to))
+    (with-meta (persistent! (transduce xform conj! (transient to) from)) (meta to))
+    (transduce xform conj to from)))
+
+; (eduction xform* coll) → the seq of coll through the composed
+; transducers, as sequence makes it.
+(defn eduction [& xforms]
+  (sequence (apply comp (butlast xforms)) (last xforms)))
+
+; (halt-when pred) / (halt-when pred retf) → a transducer that ends the
+; reduction at the first input pred holds of, with that input, or
+; (retf result input).
+(defn halt-when
+  ([pred] (halt-when pred nil))
+  ([pred retf]
+   (fn* [rf]
+     (fn ([] (rf))
+          ([result]
+           (if (and (map? result) (contains? result :nexis.core/halt))
+             (:nexis.core/halt result)
+             (rf result)))
+          ([result input]
+           (if (pred input)
+             (reduced {:nexis.core/halt (if retf (retf (rf result) input) input)})
+             (rf result input)))))))
+
+; ============================================================
 ; Types, namespaces, UUIDs (docs/STDLIB.md §8)
 ; ============================================================
 
@@ -826,10 +1183,6 @@
             (reset! state [:failed e])
             (throw e)))))
     x))
-
-; (realized? d) → whether the delay has been forced.
-(defn realized? [x]
-  (if (delay? x) (not= :pending (first @(:state x))) (throw :kind-mismatch)))
 
 ; What with-open closes: a db connection, a Nextomic connection, and
 ; any type extended to it (Java's Closeable).

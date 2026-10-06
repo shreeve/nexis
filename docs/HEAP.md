@@ -163,6 +163,7 @@ at the db layer.
 | 0 | `has_meta` | `meta` is non-null |
 | 1 | `ascii_known` | A string's: its bytes have been scanned for ASCII (`docs/STRING.md` §3) |
 | 2 | `ascii` | A string's: every byte is ASCII; meaningful with `ascii_known` |
+| 1–2 | shape | A `lazy_seq` block's: 0 lazy block, 1 cons, 2 chunked cons (`docs/LAZY.md` §2), which the collector reads to tell the bodies apart |
 | 3–7 | reserved | 0 |
 
 ---

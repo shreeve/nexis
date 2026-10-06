@@ -60,6 +60,7 @@ const pull_mod = @import("pull.zig");
 const query = @import("query.zig");
 const query_natives = @import("query/natives.zig");
 const marshal = @import("marshal.zig");
+const seq_mod = @import("../seq.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -487,11 +488,47 @@ const Scope = struct {
 fn wrap(comptime native: anytype) fn (*VM, []const Value) VmError!Value {
     return struct {
         fn call(vm: *VM, args: []const Value) VmError!Value {
+            const listed = try ListedArgs.of(vm, args);
+            defer listed.deinit(vm);
             var detail: Detail = .{};
-            return native(vm, args, &detail) catch |err| failWith(vm, err, detail);
+            return native(vm, listed.args, &detail) catch |err| failWith(vm, err, detail);
         }
     }.call;
 }
+
+/// A native's arguments with every lazy seq in them realized and made
+/// a list (`seq.asLists`, docs/LAZY.md §8), before the native opens a
+/// transaction or a read: the parsers, the marshaller and the pull
+/// walk lists and run no code. The arguments themselves when none
+/// holds a lazy seq; otherwise a copy, each value rooted for the call.
+pub const ListedArgs = struct {
+    args: []const Value,
+    owned: ?[]Value = null,
+    scope: vm_mod.RootScope,
+
+    pub fn of(vm: *VM, args: []const Value) VmError!ListedArgs {
+        const scope = vm.rootScope();
+        var copy: ?[]Value = null;
+        errdefer if (copy) |c| vm.allocator.free(c);
+        errdefer scope.release();
+        for (args, 0..) |a, i| {
+            const l = try seq_mod.asLists(vm, a);
+            if (l.identicalTo(a)) continue;
+            if (copy == null) {
+                copy = vm.allocator.dupe(Value, args) catch return VmError.OutOfMemory;
+            }
+            copy.?[i] = l;
+            // A later argument's realization may collect.
+            try scope.push(l);
+        }
+        return .{ .args = copy orelse args, .owned = copy, .scope = scope };
+    }
+
+    pub fn deinit(self: ListedArgs, vm: *VM) void {
+        if (self.owned) |c| vm.allocator.free(c);
+        self.scope.release();
+    }
+};
 
 const Builder = struct {
     vm: *VM,
@@ -589,7 +626,9 @@ const TxHook = struct {
         @memcpy(all[1..], args);
         const result = try vm.callValue(callee, all);
         try self.scope.push(result);
-        return result;
+        const listed = try seq_mod.asLists(vm, result);
+        try self.scope.push(listed);
+        return listed;
     }
 };
 
@@ -702,8 +741,10 @@ fn withNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
 // =============================================================================
 
 fn fnPull(vm: *VM, args: []const Value) VmError!Value {
+    const listed = try ListedArgs.of(vm, args);
+    defer listed.deinit(vm);
     var diag: Diag = .{};
-    return pullNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
+    return pullNative(vm, listed.args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull db pattern e)`: the pattern's map for `e`; nil when the
@@ -714,8 +755,10 @@ fn pullNative(vm: *VM, args: []const Value, diag: *Diag) !Value {
 }
 
 fn fnPullMany(vm: *VM, args: []const Value) VmError!Value {
+    const listed = try ListedArgs.of(vm, args);
+    defer listed.deinit(vm);
     var diag: Diag = .{};
-    return pullManyNative(vm, args, &diag) catch |err| failDiag(vm, err, &diag);
+    return pullManyNative(vm, listed.args, &diag) catch |err| failDiag(vm, err, &diag);
 }
 
 /// `(pull-many db pattern es)`: one result per entity of the vector
