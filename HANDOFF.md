@@ -57,18 +57,18 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 171/171 steps succeeded; 1368/1368 tests passed
+Build Summary: 197/197 steps succeeded; 1436/1436 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 169 steps. It ran in 66 s wall (188 s
-CPU) from an empty `--cache-dir` on an Apple-silicon Mac shared with
-other builds. Any output besides the summary tree is a
-failure. The largest binaries are `unit` (683 inline tests) and
-`eval_pipeline` (460 programs).
+steps; without it the count is 195 steps. Any output besides the
+summary tree is a failure. The largest binaries are `unit` (every
+inline test in `src/`) and `eval_pipeline` (the language corpus);
+`cli-unit` runs `src/cli.zig`'s own tests.
 
 CI (`.github/workflows/ci.yml`) runs on every push and pull request
-to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64;
+to `main`: the gate on macOS arm64 and on Linux x86_64 and arm64,
+and once more under `-Dgc-stress -Ddurability=durable`;
 `zig fmt --check` over the tracked Zig files but the generated
 `src/parser.zig`, and `zig build parser-check` against a nexus built
 from `shreeve/nexus`; and an optimized (`-Doptimize=fast`) job that runs a script, the
