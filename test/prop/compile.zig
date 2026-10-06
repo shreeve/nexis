@@ -173,6 +173,29 @@ const cases = [_]Case{
     .{ .src = "(loop [a 1 n 0] (if (< n 1) (recur (try (try (throw :x) (catch any e 5) (finally (throw :boom))) (catch any e a)) (inc n)) a))", .out = "1" },
     .{ .src = "(do (defn f [a n] (if (< n 1) (recur (try (try 5 (finally (throw :boom))) (catch any e a)) (inc n)) a)) (f 1 0))", .out = "1" },
     .{ .src = "(loop [a 1 n 0] (if (< n 1) (recur (if (pos? a) (try (try 5 (finally (throw :boom))) (catch any e a)) 0) (inc n)) a))", .out = "1" },
+    // Recur arguments run in order; only one that cannot fail is
+    // moved after a later one (COMPILER.md §5.6), so an argument's
+    // effect or error still comes first: i is no number once a recur
+    // passes a string, and the let's i shadows the loop's.
+    .{ .src = "(let* [log (atom [])] (loop* [i 0 acc 0] (if (< i 2) (recur (do (swap! log conj [:i i]) (inc i)) (do (swap! log conj [:acc i]) (+ acc i))) @log)))", .out = "[[:i 0] [:acc 0] [:i 1] [:acc 1]]" },
+    .{ .src = "(try (loop* [i 0 n 0] (if (< n 1) (recur \"s\" (inc n)) (if (< n 2) (recur (inc i) (if (string? i) (throw :second) (inc n))) i))) (catch any e (if (= e :second) :reordered :in-order)))", .out = ":in-order" },
+    .{ .src = "(try (loop* [i 0 acc 0] (if (< i 1) (let* [i \"s\"] (recur (inc i) (if (string? i) (throw :second) acc))) acc)) (catch any e (if (= e :second) :reordered :in-order)))", .out = ":in-order" },
+    .{ .src = "(loop* [i 0 acc 0] (if (< i 4) (recur (inc i) (+ acc i)) [i acc]))", .out = "[4 6]" },
+    .{ .src = "(loop* [a 0 b 1 i 0] (if (< i 5) (recur b (+ a b) (inc i)) [a b]))", .out = "[5 8]" },
+    // The test a recur repeats at the loop's bottom: either arm, a
+    // negated test, a try before the recur, a test of a binding.
+    .{ .src = "(loop* [i 0] (if (>= i 3) i (recur (inc i))))", .out = "3" },
+    .{ .src = "(loop* [i 0 acc []] (if (not (< i 3)) acc (if (odd? i) (recur (inc i) (conj acc :odd)) (recur (inc i) (conj acc i)))))", .out = "[0 :odd 2]" },
+    .{ .src = "(loop* [i 0 acc []] (if (< i 3) (do (try (throw i) (catch any e nil) (finally nil)) (recur (inc i) (conj acc (try (if (odd? i) (throw i) i) (catch any e (- e)))))) acc))", .out = "[0 -1 2]" },
+    .{ .src = "(loop* [s [1 2 3] acc 0] (if (seq s) (recur (next s) (+ acc (first s))) acc))", .out = "6" },
+    .{ .src = "(loop* [x 3 acc []] (if x (recur (if (pos? x) (dec x) nil) (conj acc x)) acc))", .out = "[3 2 1 0]" },
+    // `+`, `*` and `-` past two arguments: every argument is computed,
+    // in order, before the left fold over their values, as the fn's
+    // call computes them, promotion and contagion included.
+    .{ .src = "(let* [big 140737488355327] [(+ big big big) (* big big big) (- 0 big big 1) (+ 1 2.5 big) (* 2 3 0.5) (- 10 1 2 3)])", .out = "[422212465065981 2787593149816268471570079086250062495350783 -281474976710655 1.407374883553305E14 3.0 4]" },
+    .{ .src = "(let* [log (atom [])] (try (+ (do (swap! log conj 1) \"x\") (do (swap! log conj 2) 2) (do (swap! log conj 3) 3)) (catch any e [e @log])))", .out = "[:kind-mismatch [1 2 3]]" },
+    .{ .src = "(let* [log (atom [])] (try (* 2 (do (swap! log conj 1) nil) (do (swap! log conj 2) (throw :later))) (catch any e [e @log])))", .out = "[:later [1 2]]" },
+    .{ .src = "(do (def x 1) [(+ x x (do (def x 10) x)) (+ x 1 2)])", .out = "[12 13]" },
     // Variadic fns and recur into them.
     .{ .src = "((fn* [a & r] a) 1 2 3)", .out = "1" },
     .{ .src = "((fn* [a & r] r) 1 2 3)", .out = "(2 3)" },
@@ -685,9 +708,20 @@ test "inlining: core arithmetic and comparison run as one instruction each" {
         // The op, then the return of its result.
         try testing.expectEqual(@as(usize, 2), body.code.len);
     }
+    // `+`, `*` and `-` past two arguments fold left: one instruction
+    // per argument after the first.
+    for ([_][]const u8{ "(+ a b c d)", "(* a b c d)", "(- a b c d)" }) |op| {
+        const src = try testing.allocator.print("(fn* [a b c d] {s})", .{op});
+        defer testing.allocator.free(src);
+        const body = (try compileIn(&program, src)).capture_descs[0].routine;
+        try testing.expectEqual(@as(usize, 0), body.var_table.len);
+        try testing.expectEqual(@as(usize, 4), body.code.len);
+    }
     // Every other arity is a call.
-    const call = try compileIn(&program, "(fn* [a b c] (+ a b c))");
-    for (call.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.routine.var_table.len);
+    for ([_][]const u8{ "(fn* [a b c] (/ a b c))", "(fn* [a] (+ a))", "(fn* [] (*))", "(fn* [a b c] (< a b c))" }) |src| {
+        const call = try compileIn(&program, src);
+        for (call.capture_descs) |d| try testing.expectEqual(@as(usize, 1), d.routine.var_table.len);
+    }
 }
 
 /// The instructions of the one `fn*` routine `src` compiles to.
@@ -718,7 +752,8 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         // shared return, a leaf returned in place.
         .{ .src = "(fn* [a] (if a (a) a))", .len = 5 },
         .{ .src = "(fn* [a] (if a 1))", .len = 3 },
-        .{ .src = "(fn* [n] (loop* [i 0] (if (< i n) (recur (inc i)) i)))", .len = 6 },
+        // The recur repeats the loop's test (COMPILER.md §5.7).
+        .{ .src = "(fn* [n] (loop* [i 0] (if (< i n) (recur (inc i)) i)))", .len = 7 },
         // Arguments compute straight into the call block.
         .{ .src = "(fn* [a] (a (inc a) (a) 1))", .len = 7 },
         // An assertion is one call: helper, quoted form, values,
@@ -746,6 +781,57 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         const len = try fnCodeLen(&program, shape.src);
         testing.expectEqual(shape.len, len) catch |err| {
             std.debug.print("\n  {s}: {d} instructions\n", .{ shape.src, len });
+            return err;
+        };
+    }
+}
+
+/// The instructions one iteration of `routine`'s loop runs: from the
+/// target of its last backward branch, or of its last backward jump
+/// when it branches back on no test, to that instruction.
+fn iterationLen(routine: *const nx.vm.Routine) ?usize {
+    var back: ?usize = null;
+    for (routine.code, 0..) |inst, pc| {
+        if (inst.groupOf() != .jump or inst.wide() > pc) continue;
+        const branch = inst.variant != @backingInt(nx.vm.Jump.jmp);
+        if (branch or back == null or routine.code[back.?].variant == @backingInt(nx.vm.Jump.jmp)) back = pc;
+    }
+    const pc = back orelse return null;
+    return pc - routine.code[pc].wide() + 1;
+}
+
+test "codegen: a loop's iteration is its body and its test, the recur's arguments ordered so none waits in a temporary (COMPILER.md §5.6, §5.7)" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const Shape = struct { src: []const u8, len: usize };
+    const shapes = [_]Shape{
+        // The counting loop: the step, then the test and its branch
+        // back, which the VM runs as one dispatch.
+        .{ .src = "(fn* [n] (loop* [i 0] (if (< i n) (recur (inc i)) i)))", .len = 3 },
+        // (inc i) cannot fail, i being a number on every iteration,
+        // so it is computed after (+ acc i), which reads i: no
+        // temporary, no move.
+        .{ .src = "(fn* [n] (loop* [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)))", .len = 4 },
+        .{ .src = "(fn* [n] (loop* [acc 0 i 0] (if (< i n) (recur (+ acc i) (inc i)) acc)))", .len = 4 },
+        .{ .src = "(fn* [n] (loop* [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (mod (* i i) 7))) acc)))", .len = 6 },
+        // A recur in the else arm branches back on the test as it is.
+        .{ .src = "(fn* [n] (loop* [i 0] (if (>= i n) i (recur (inc i)))))", .len = 3 },
+        .{ .src = "(fn* [n] (loop* [i 0] (if (not (< i n)) i (recur (inc i)))))", .len = 3 },
+        // A test that reads a binding in place; the fn's own params.
+        .{ .src = "(fn* [s] (loop* [x s] (if x (recur (next x)) x)))", .len = 4 },
+        .{ .src = "(fn* [i n] (if (< i n) (recur (inc i) n) i))", .len = 3 },
+        // A swap needs one temporary, not two.
+        .{ .src = "(fn* [n] (loop* [a 0 b 1 i 0] (if (< i n) (recur b a (inc i)) a)))", .len = 6 },
+        // A body that does more than test first keeps its jump back
+        // to the entry.
+        .{ .src = "(fn* [n] (loop* [i 0] (let* [j (inc i)] (if (< j n) (recur j) j))))", .len = 5 },
+    };
+    for (shapes) |shape| {
+        const compiled = try compileIn(&program, shape.src);
+        const len = iterationLen(compiled.capture_descs[0].routine) orelse return error.TestFailed;
+        testing.expectEqual(shape.len, len) catch |err| {
+            std.debug.print("\n  {s}: {d} instructions an iteration\n", .{ shape.src, len });
             return err;
         };
     }
@@ -782,7 +868,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(-> a (g b) (h) (g c))", .len = 10 },
         .{ .form = "(doseq [x xs] (g x))", .len = 15 },
         .{ .form = "(for [x xs] (h x))", .len = 5 },
-        .{ .form = "(dotimes [i a] (g i))", .len = 12 },
+        .{ .form = "(dotimes [i a] (g i))", .len = 13 },
         .{ .form = "(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))", .len = 9 },
         .{ .form = "(try (g a) (catch :x e (h e)) (finally (g b)))", .len = 22 },
         .{ .form = "(assert (pos? a) \"a must be positive\")", .len = 10 },

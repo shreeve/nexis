@@ -124,15 +124,22 @@ and a reused subform its own (MACROEXPAND.md §4b).
    expander's `special_forms` (MACROEXPAND.md §1.1) less the four it
    rewrites away (`ns`, `require`, `defmacro`, `set!`), plus the `#%`
    constructors; a test holds the two tables to that.
-2. **Inlined core fn**: a call of one of 14 core fns at one of the
-   15 (fn, arity) pairs of `inlined_ops` (`-` inlines at two) lowers to one `math` or `cmp` instruction
-   (`Tiny.prim`), which runs the numeric-tower helper the fn itself
+2. **Inlined core fn**: a call of one of 14 core fns at an arity
+   `inlined_ops` lists lowers to `math` or `cmp` instructions
+   (`Tiny.prim`), which run the numeric-tower helpers the fn itself
    runs (VM.md §10), so results and errors are the fn's:
 
    | Arity | Fns |
    |---|---|
+   | 3 or more | `+` `-` `*`, one instruction per argument after the first |
    | 2 | `+` `-` `*` `/` `quot` `mod` `<` `<=` `>` `>=` `==` |
    | 1 | `-` (negate), `abs`, `inc` and `dec` (`+` / `-` with a constant 1) |
+
+   Past two arguments every argument is computed, in order, before a
+   left fold over their values, as the fn's call computes them:
+   `(+ a b c)` is `(+ (+ a b) c)` once `a`, `b` and `c` are known, so
+   an argument's effect comes before any fold's error, and a Var
+   argument is read in place only when no later argument runs code.
 
    `(not x)` inlines the same way, as `(if x false true)`, which is
    what the fn computes; as an `if` test it is a branch (§5.2).
@@ -387,7 +394,7 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(-> a (g b) (h) (g c))` | 10 |
 | `(doseq [x xs] (g x))` | 15 |
 | `(for [x xs] (h x))`, a call of `map` over a closure (MACROEXPAND.md §10) | 5 |
-| `(dotimes [i a] (g i))`, its count truncated once by `long` | 12 |
+| `(dotimes [i a] (g i))`, its count truncated once by `long` | 13 |
 | `(loop [i 0 acc 0] (if (< i a) (recur (inc i) (+ acc i)) acc))` | 9 |
 | `(try (g a) (catch :x e (h e)) (finally (g b)))` | 22 |
 | `(assert (pos? a) "a must be positive")` | 10 |
@@ -399,7 +406,9 @@ into it, a constant one `mov:load-const`, the callee one
 level read the same Var, §4.4), as the range-call ABI (VM.md §6)
 needs every one of them in the block; the ones that run no code are
 written after the ones that do. A `let` binding that only renames a
-local costs nothing (§4.4).
+local costs nothing (§4.4). A loop whose body starts with its test
+repeats the test at each `recur` (§5.7), so the `loop` row runs 4 of
+its 9 instructions an iteration and the `dotimes` row 6 of its 13.
 
 ---
 
@@ -516,18 +525,33 @@ semantics: every argument sees the bindings as they were before the
 `recur` (a sequential move would corrupt `(loop* [a 1 b 2] (recur b
 a))`).
 
-- An argument for an uncaptured binding that no other argument
-  mentions compiles straight into the binding's slot: the slot is
-  written only as the argument's last act (§4.4), so a handler inside
-  the argument reads the old value, as in
+- An argument for an uncaptured binding compiles straight into the
+  binding's slot once every other argument that mentions the binding
+  is computed: the slot is written only as the argument's last act
+  (§4.4), so a handler inside the argument reads the old value, as in
   `(recur (try (try 5 (finally (throw :x))) (catch any e a)) ...)`,
   which rebinds `a` to itself.
-- Every other argument is read in place when it is a constant, an
+- The arguments are computed in order, except that an argument is
+  computed before an earlier one when one of the two cannot fail and
+  does nothing else: a literal, a local, or `+`, `-`, `*`, negation or
+  `abs` of numbers, or `quot` or `mod` of a number by a nonzero
+  integer literal (arithmetic on numbers fails only when memory runs
+  out). A number here is a number literal, or a binding of a `loop*`
+  that holds one on every iteration: its initial value and its every
+  `recur` argument is a number literal, arithmetic (whose result is a
+  number whenever it has one), such a binding not shadowed, or an `if`
+  whose arms both are. So `(recur (inc i) (+ acc i))` computes
+  `(+ acc i)` into `acc`'s slot, then `(inc i)` into `i`'s: no
+  temporary, no move. An argument's effect or error still comes
+  before a later one's.
+- When every argument left waits for another, as in `(recur b a)`,
+  the first of them is read in place when it is a constant, an
   upvalue or a slot no rebinding overwrites, and otherwise compiles
-  into a fresh temporary; the moves into the binding slots follow once
-  every argument is computed.
-- `jump:jmp` to the target's entry. No call is emitted, so the loop
-  runs in constant stack (VM.md §11).
+  into a fresh temporary; its move into the binding follows once
+  every argument is computed, as a captured binding's does (below).
+- Then the jump back: `jump:jmp` to the target's entry, or the
+  entry's test repeated (§5.7). No call is emitted, so the loop runs
+  in constant stack (VM.md §11).
 
 **Captured bindings get a fresh cell per iteration**, never a
 mutated one:
@@ -548,7 +572,7 @@ temporary, is boxed there, and the fresh cell replaces the old one:
 math:add          s_tmp, ...           ; the new value
 closure:box-local s_tmp                ; a fresh cell holding it
 mov:move          s_i, s_tmp           ; install the cell
-jump:jmp          L_entry
+jump:jmp          L_entry              ; or the entry's test (§5.7)
 ```
 
 That cell is the one per-iteration allocation a captured binding
@@ -589,6 +613,32 @@ Bindings as `let*`, captured ones boxed. The entry label is placed
 after that prelude, so a `recur` neither re-evaluates the initial
 values nor re-boxes; the body compiles as `do` with the loop's
 `RecurTarget`.
+
+**The test at the bottom.** When the code at a target's entry (a
+`loop*`'s, or a `fn*`'s that `recur` re-enters) is an `if` whose test
+is one jump on an operand read in place, or a comparison into a slot
+and a jump on that slot (the pair VM.md §8 runs as one dispatch), a
+`recur` in either arm repeats that test instead of jumping back to
+it: the same instructions with the same spans, the jump branching
+back to the start of the `recur`'s own arm when the test sends
+control there (`jump:if-true` from the then arm, the test's own jump
+from the else arm), and a `jump:jmp` to the other arm otherwise,
+which a `recur` last in the then arm leaves out, falling through to
+the else arm. The entry test runs once, for the first iteration. A
+counting loop is two dispatches an iteration and this one three:
+
+```
+; (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)), n in s1
+mov:load-const  s4  c0=0
+mov:load-const  s5  c0=0
+cmp:lt          s6  s4  s1          ; the entry test
+jump:if-false   s6  j0008
+math:add        s5  s5  s4          ; (+ acc i), which reads i, first
+math:add        s4  s4  c1=1        ; (inc i), which cannot fail
+cmp:lt          s6  s4  s1          ; the test again
+jump:if-true    s6  j0004           ; back to the then arm
+mov:move        s3  s5              ; the else arm
+```
 
 #### 5.8 `(def name expr?)`
 
