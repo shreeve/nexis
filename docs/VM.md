@@ -399,7 +399,9 @@ fetch at pc (every handler's last step):
   in return position that is never inlined, which a release build
   makes a tail call, so the stack frame the part needs is not the fast
   handler's. Release builds keep no frame pointer, so a fast handler
-  has no frame record to push either.
+  has no frame record to push either. The fast handlers sit together
+  in a section of their own, each on a cache line of its own, so code
+  growing elsewhere does not move them against each other.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns.
   It enters the chain at the current frame's next instruction, and the
@@ -676,8 +678,12 @@ count (a variadic `fn*`'s rest param is one binding and receives the
 seq passed), raising `RecurOutsideTail` or `RecurArityMismatch`
 (`COMPILER.md` §4.4), and lowers it (`COMPILER.md` §5.6) to a
 parallel assignment of the new values into the binding slots (a
-fresh cell per captured binding, §6) and a `jump:jmp` to the
-target's entry. No call opcode is emitted.
+fresh cell per captured binding, §6) and a jump back into the target:
+a `jump:jmp` to its entry, or, where the body begins with an `if` on a
+simple test, that test repeated and a `jump:if-true` or
+`jump:if-false` past the entry's own (`COMPILER.md` §5.7), which a
+comparison runs with its branch in one dispatch (§8). No call opcode
+is emitted.
 
 **Guarantee.** A `recur` loop runs in constant stack space: no frame
 is pushed and the backing stack does not grow. It allocates nothing

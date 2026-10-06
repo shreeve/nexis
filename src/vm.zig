@@ -3416,6 +3416,12 @@ pub const VM = struct {
     /// never inlined, which a release build makes a tail call; inlined,
     /// the part's frame would be the fast handler's. A debug build
     /// makes a tail call only when told to.
+    /// The fast handlers' section and alignment: together, apart from
+    /// the rest of the code, each on a cache line of its own, so code
+    /// growing elsewhere does not move them against each other.
+    const hot_section = if (builtin.target.os.tag.isDarwin()) "__TEXT,__text_hot,regular,pure_instructions" else ".text.hot";
+    const hot_align = 64;
+
     const out_of_line: std.lang.CallModifier = if (builtin.optimize == .debug) .always_tail else .never_inline;
 
     /// A fast handler's way out: `inst`'s general handler, which takes
@@ -3670,7 +3676,7 @@ pub const VM = struct {
     // pushed or a native called, where a return or an error trace
     // reads it.
 
-    fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
         const dst = self.slotAt(frame, inst.a.index);
         const v = self.fastOperand(frame, inst.b);
@@ -3679,7 +3685,7 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const consts = frame.routine.consts;
         const i = inst.wide();
         if (!slotIn(frame, inst.a) or i >= consts.len) return self.general(frame, inst, pc);
@@ -3689,7 +3695,7 @@ pub const VM = struct {
 
     fn fastLoad(comptime v: Value) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
                 if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 self.slotAt(frame, inst.a.index).* = v;
                 return self.nextAt(frame, pc);
@@ -3697,7 +3703,7 @@ pub const VM = struct {
         }.run;
     }
 
-    fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const target = inst.wide();
         if (target >= frame.routine.code.len) return self.general(frame, inst, pc);
         return self.nextAt(frame, target);
@@ -3706,7 +3712,7 @@ pub const VM = struct {
     /// `jump:if-true` (`when`) and `jump:if-false`.
     fn fastBranch(comptime when: bool) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
                 const v = self.fastOperand(frame, inst.a);
                 if (!v.ok) return self.general(frame, inst, pc);
                 if (v.ptr.isTruthy() != when) return self.nextAt(frame, pc);
@@ -3721,7 +3727,7 @@ pub const VM = struct {
     /// it.
     fn fastCmp(comptime c: NumCmp) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
                 if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 const dst = self.slotAt(frame, inst.a.index);
                 const lhs = self.fastOperand(frame, inst.b);
@@ -3755,7 +3761,7 @@ pub const VM = struct {
     /// `math:<op>` of two fixnums whose result is a fixnum.
     fn fastMath(comptime op: Math) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
                 if (!slotIn(frame, inst.a)) return self.general(frame, inst, pc);
                 const dst = self.slotAt(frame, inst.a.index);
                 const lhs = self.fastOperand(frame, inst.b);
@@ -3769,7 +3775,7 @@ pub const VM = struct {
         }.run;
     }
 
-    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const var_table = frame.routine.var_table;
         const i = inst.wide();
         if (!slotIn(frame, inst.a) or i >= var_table.len) return self.general(frame, inst, pc);
@@ -3781,7 +3787,7 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         if (!slotIn(frame, inst.a) or !slotIn(frame, inst.b)) return self.general(frame, inst, pc);
         const cell_v = self.slotAt(frame, inst.b.index).*;
         if (cell_v.kind() != .cell_internal) return self.general(frame, inst, pc);
@@ -3796,7 +3802,7 @@ pub const VM = struct {
     /// without allocating, so its callee starts without a safe point.
     /// A native and a keyword or symbol go on to handlers of their own,
     /// out of line: each calls out, and a call needs a stack frame.
-    fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         if (inst.a.kind != .slot or inst.c.kind != .slot) return self.general(frame, inst, pc);
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
@@ -3855,13 +3861,13 @@ pub const VM = struct {
     /// `call:return` from a frame `call:call` pushed: pop it, write the
     /// caller's slot and continue in the caller, whose `pc` the call
     /// left at its return point.
-    fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const v = self.fastOperand(frame, inst.a);
         if (!v.ok) return self.general(frame, inst, pc);
         return self.returnFast(frame, inst, pc, v.ptr);
     }
 
-    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         return self.returnFast(frame, inst, pc, &nil_value);
     }
 
@@ -5770,6 +5776,9 @@ test "VM dispatch: a comparison and the conditional jump on its slot" {
         .{ .name = "if-false taken", .code = &.{ lt(0, kn(1), kn(0)), asm_.jumpIfFalse(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = fx(20) } },
         .{ .name = "if-true taken", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfTrue(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = fx(20) } },
         .{ .name = "if-true not taken", .code = &.{ lt(0, kn(1), kn(0)), asm_.jumpIfTrue(3, sl(0)), asm_.returnSlot(0), asm_.loadConst(0, 2), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2), fx(20) }, .want = .{ .value = false_v } },
+        // A loop tested at its bottom, as a `recur` that repeats its
+        // loop's test lowers: the branch taken goes back.
+        .{ .name = "a branch back while it holds", .code = &.{ asm_.loadConst(0, 0), asm_.mathAdd(0, sl(0), kn(1)), lt(1, sl(0), kn(2)), asm_.jumpIfTrue(1, sl(1)), asm_.returnSlot(0) }, .consts = &.{ fx(0), fx(1), fx(5) }, .slots = 2, .want = .{ .value = fx(5) } },
         // The jump taken still leaves the comparison in its slot.
         .{ .name = "the slot keeps the boolean", .code = &.{ lt(0, kn(0), kn(1)), asm_.jumpIfTrue(2, sl(0)), asm_.returnSlot(0) }, .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
         // Floats compare through the tower, then branch the same way.

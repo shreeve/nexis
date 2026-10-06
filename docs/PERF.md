@@ -832,6 +832,12 @@ instruction to the next. With `pc` in a register the chain is gone.
 chain through `frame.pc` and its loop's chain through the slots (`i`
 written by one handler and read by the next) bound it.
 
+The fast handlers in a section of their own, each on a cache line, in
+seven rounds at a load of 14: cycles a unit `count` 18.2 → 17.6, `acc`
+29.9 → 27.7, `fib` 50.6 → 49.9, `gcall` 42.1 → 40.1, `mv` 21.9 → 20.1,
+`lv` 22.6 → 21.0, the instructions unchanged; every median lower,
+every range overlapping the other's.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
