@@ -1412,7 +1412,10 @@ pub const FinallyContinuation = struct {
 /// The collector's trigger settings (GC.md §7). `default` is what
 /// a VM starts with; `stress` is what `NEXIS_GC_STRESS` in the
 /// environment selects so a run collects every few kilobytes and
-/// every rooting gap shows.
+/// every rooting gap shows. Its 2 % keeps that true for any heap
+/// under about 200 KiB live (a booted standard library leaves 95 KiB)
+/// and spaces cycles out over a large live
+/// set, which every 4 KiB cycle would otherwise re-mark and re-sweep.
 pub const GcPolicy = struct {
     /// Bytes allocated since the last cycle before the next is due,
     /// at least.
@@ -1423,7 +1426,7 @@ pub const GcPolicy = struct {
     growth_percent: usize,
 
     pub const default: GcPolicy = .{ .threshold = 16 * 1024 * 1024, .growth_percent = 100 };
-    pub const stress: GcPolicy = .{ .threshold = 4096, .growth_percent = 0 };
+    pub const stress: GcPolicy = .{ .threshold = 4096, .growth_percent = 2 };
 };
 
 /// One entry of the dynamic-binding stack: what `v`'s thread
@@ -6962,6 +6965,25 @@ test "VM dispatch: calls and closures under a collection every few kilobytes" {
     vm.setGcPolicy(.stress);
     try testing.expectEqual(@as(i64, 125_250), (try vm.run()).asFixnum());
     try testing.expect(vm.gc_cycles > 0);
+}
+
+test "GcPolicy.stress: a large live set spaces the next cycle out by its size" {
+    // Collecting every 4 KiB re-marks and re-sweeps whatever is live, so
+    // a program holding a large set would make the stress run quadratic.
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    vm.setGcPolicy(.stress);
+    const heap = vm.ensureHeap();
+    const items = try testing.allocator.alloc(Value, 100_000);
+    defer testing.allocator.free(items);
+    for (items, 0..) |*x, i| x.* = fx(@intCast(i));
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(try vector_mod.fromSlice(heap, items));
+    vm.collectGarbage();
+    try testing.expect(heap.live_bytes > 1 << 20);
+    try testing.expectEqual(heap.live_bytes / 100 * GcPolicy.stress.growth_percent, vm.gc_next_at);
+    try testing.expect(vm.gc_next_at > 4 * GcPolicy.stress.threshold);
 }
 
 const dispatch_test_natives = struct {

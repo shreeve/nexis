@@ -790,11 +790,18 @@ fn forwardEnd(lz: Value) Value {
 /// lazy block is its forced seq; a vector is an O(1) view
 /// (`docs/LIST.md` §1); any other seqable is a fresh list of its
 /// elements. Anything else is `:kind-mismatch`.
-pub fn seqOf(vm: *VM, x: Value) VmError!Value {
+pub inline fn seqOf(vm: *VM, x: Value) VmError!Value {
     switch (x.kind()) {
         .nil => return x,
         .list => return if (list_mod.isEmpty(x)) value_mod.nilValue() else x,
         .lazy_seq => return if (lazy.shapeOf(x) == .lazy) force(vm, x) else x,
+        else => return seqOfOther(vm, x),
+    }
+}
+
+/// `seqOf` of a vector or any other seqable, out of the callers' lines.
+fn seqOfOther(vm: *VM, x: Value) VmError!Value {
+    switch (x.kind()) {
         .persistent_vector => return if (vector_mod.isEmpty(x))
             value_mod.nilValue()
         else
@@ -878,7 +885,7 @@ pub fn nthOf(vm: *VM, x: Value, i: usize) VmError!?Value {
 /// step after the last element walked.
 pub fn realizeSpine(vm: *VM, x: Value, limit: ?usize) VmError!void {
     const n = limit orelse {
-        var it = try SeqIter.init(vm, x);
+        var it = try SeqIter.realizing(vm, x);
         while (try it.next()) |_| {}
         return;
     };
@@ -933,7 +940,7 @@ fn pushParts(vm: *VM, v: Value, work: *std.ArrayList(Value), found: *bool) VmErr
             }
         },
         else => {
-            var it = try SeqIter.init(vm, v);
+            var it = try SeqIter.realizing(vm, v);
             while (try it.next()) |x| if (mayHoldLazy(x.kind())) {
                 if (x.kind() == .lazy_seq) found.* = true;
                 work.append(vm.allocator, x) catch return VmError.OutOfMemory;
@@ -1078,7 +1085,10 @@ fn champOrSorted(v: Value) Entries {
 /// A lazy seq is walked through its realized chain, each block forced
 /// as the walk reaches it: native context, so a step may collect. The
 /// iterator holds only positions inside a chain its argument heads,
-/// which the forced blocks cache, so it roots nothing of its own. A
+/// which the forced blocks cache, so it roots nothing of its own. An
+/// unrealized fixnum range is computed instead, caching nothing, as
+/// Clojure's `LongRange` iterates (LAZY.md §7); `realizing` walks it
+/// as any other lazy seq, for `doall` and `realizeAll`. A
 /// map entry and a boxed typed-vector element are built by the
 /// iterator, so no argument reaches them (docs/GC.md §11.5): a native
 /// that keeps one across a call back into the VM, or across the next
@@ -1090,6 +1100,7 @@ pub const SeqIter = struct {
         empty,
         list: list_mod.Cursor,
         lazy: lazy.Cursor,
+        range: struct { x: i64, step: i64, left: u64 },
         vector: vector_mod.Cursor,
         typed: struct { v: Value, idx: usize, count: usize },
         map: champ_mod.MapIter,
@@ -1098,10 +1109,21 @@ pub const SeqIter = struct {
         string: std.unicode.Utf8Iterator,
     },
     roots: ?vm_mod.RootScope = null,
+    /// The element `nextChunk` hands out alone.
+    one: [1]Value = undefined,
 
     /// Every seqable receiver. A string that is not valid UTF-8 is
     /// `:utf8-error`, as for every other string operation.
     pub fn init(vm: *VM, coll: Value) VmError!SeqIter {
+        if (pureOf(coll)) |p| if (p == .range) {
+            const r = p.range;
+            return .{ .vm = vm, .state = .{ .range = .{ .x = r.start, .step = r.step, .left = rangeCount(r.start, r.end, r.step) } } };
+        };
+        return realizing(vm, coll);
+    }
+
+    /// `init` that realizes an unrealized range as it walks it.
+    pub fn realizing(vm: *VM, coll: Value) VmError!SeqIter {
         return .{ .vm = vm, .state = switch (coll.kind()) {
             .nil => .empty,
             .list => if (list_mod.viewCursor(coll)) |c| .{ .vector = c } else .{ .list = list_mod.Cursor.init(coll) },
@@ -1143,11 +1165,49 @@ pub const SeqIter = struct {
         }
     }
 
+    /// The next run of elements, null at the end: the rest of a
+    /// vector's leaf or of a lazy chunk, or one element, so a walker's
+    /// inner loop runs over a slice. The slice lies in a block the walk
+    /// reaches from its argument, or in the iterator, and stays valid
+    /// across calls back into the VM (the collector moves nothing).
+    /// `held` is what the walker keeps across the walk where no
+    /// argument reaches it (`reduce`'s accumulator): it is written to
+    /// the root stack at `slot` only before a step that may run code
+    /// and collect, not on every element (docs/GC.md §11.5).
+    pub fn nextChunk(self: *SeqIter, slot: usize, held: Value) VmError!?[]const Value {
+        switch (self.state) {
+            .vector => |*c| {
+                if (c.index >= c.count) return null;
+                _ = c.next();
+                const from = c.index - 1 - c.chunk_base;
+                const to = @min(c.chunk.len, c.count - c.chunk_base);
+                c.index = c.chunk_base + to;
+                return c.chunk[from..to];
+            },
+            .lazy => |*c| if (c.items.len > 0) {
+                const xs = c.items;
+                c.items = &.{};
+                return xs;
+            },
+            else => {},
+        }
+        self.vm.roots.items[slot] = held;
+        self.one[0] = (try self.nextOther()) orelse return null;
+        return &self.one;
+    }
+
     fn nextOther(self: *SeqIter) VmError!?Value {
         switch (self.state) {
             .empty => return null,
             .list => |*c| return c.next(),
             .vector => |*c| return c.next(),
+            .range => |*r| {
+                if (r.left == 0) return null;
+                const x = r.x;
+                r.x += r.step;
+                r.left -= 1;
+                return fixnum(x);
+            },
             .lazy => |*c| while (true) {
                 return c.next() catch {
                     _ = try force(self.vm, c.pending());

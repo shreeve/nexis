@@ -240,8 +240,12 @@ and `gc_growth_percent` percent of `Heap.live_bytes` after the sweep,
 so a large live set is not re-marked every few kilobytes. Every VM
 starts with `GcPolicy.default` (16 MiB, 100 %). With `NEXIS_GC_STRESS`
 set in the environment every VM starts with `GcPolicy.stress` (4 KiB,
-0 %): a cycle becomes due every few kilobytes, which is how the suite
-proves the rooting rules. A test can set the three fields on its VM to
+2 %): a cycle becomes due every few kilobytes while under about
+200 KiB is live (a booted standard library leaves 95 KiB), which is
+how the suite proves the rooting rules, and a large live set spaces
+cycles out by 2 % of itself, so a program that
+holds a million values stays linear rather than re-marking them every
+4 KiB. A test can set the three fields on its VM to
 the same effect. A VM with `gc_enabled = false` or a borrowed heap is
 never due.
 
@@ -406,7 +410,8 @@ The rule each native follows, by what it holds across a further
    from its arguments or on a root scope: a realized chain is cached
    in the block that heads it, so the elements already walked reach
    from the argument the walk started at, but a callback result
-   (`reduce`'s accumulator, which waits in a root slot between calls),
+   (`reduce`'s accumulator, which goes into a root slot before each
+   step that may run code, `SeqIter.nextChunk`),
    a value the native built (`frequencies`' transient, `select-keys`'
    result) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,

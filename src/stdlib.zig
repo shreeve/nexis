@@ -1521,15 +1521,14 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     var cb = vm_mod.Callback.init(vm, f, 2);
     // The accumulator is the next call's argument, and a lazy `coll`'s
     // next step may collect before that call (GC.md §11.5, class 5):
-    // it waits in one root slot.
+    // it goes into a root slot before such a step.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(acc);
-    while (try it.next()) |x| {
+    while (try it.nextChunk(scope.base, acc)) |xs| for (xs) |x| {
         acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
-        vm.roots.items[scope.base] = acc;
-    }
+    };
     return acc;
 }
 
@@ -5800,19 +5799,18 @@ fn collectSeq(vm: *VM, coll: Value) VmError!std.ArrayList(Value) {
 /// Append every element of `seq` to `out`. Used by `apply` to
 /// splice the trailing seq into the args list.
 fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void {
-    if (seq_mod.pureOf(seq)) |p| switch (p) {
-        // A finite range's elements, computed: nothing is realized.
-        .range => |r| {
-            const n: usize = @intCast(seq_mod.rangeCount(r.start, r.end, r.step));
-            out.ensureUnusedCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
-            var x = r.start;
-            for (0..n) |_| {
-                out.appendAssumeCapacity(value_mod.fromFixnum(x).?);
-                x += r.step;
-            }
-            return;
-        },
-        else => {},
+    // An unrealized range's elements in one reserved pass, which the
+    // iterator would compute one call at a time (docs/LAZY.md §7).
+    if (seq_mod.pureOf(seq)) |p| if (p == .range) {
+        const r = p.range;
+        const n: usize = @intCast(seq_mod.rangeCount(r.start, r.end, r.step));
+        out.ensureUnusedCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
+        var x = r.start;
+        for (0..n) |_| {
+            out.appendAssumeCapacity(value_mod.fromFixnum(x).?);
+            x += r.step;
+        }
+        return;
     };
     var it = try makeSeqIter(vm, seq);
     while (try it.next()) |e| {

@@ -2278,6 +2278,9 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
     // 32 elements, the last what is left.
     try expectOutput("(let [r (range 70) s (seq r)] [(realized? r) (count (seq r)) (first (drop 64 r)) (last r) (= r (vec (range 70))) (= (hash r) (hash (vec (range 70))))])", "[true 70 64 69 true true]");
     try expectOutput("(take 2 (drop 140737488355326 (range 140737488355320 140737488355330)))", "()");
+    // A native that walks an unrealized range computes its elements, as
+    // Clojure's `LongRange` iterator does; `doall` realizes it.
+    try expectOutput("(let [r (range 100)] [(count (mapv inc r)) (count (filterv odd? r)) (count (frequencies r)) (count (group-by odd? r)) (apply + r) (realized? r) (do (doall r) (realized? r))])", "[100 50 100 2 4950 false true]");
 }
 
 test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
@@ -6404,6 +6407,9 @@ const chain = "(defn chain [n] (lazy-seq (churn n) (when (pos? n) (cons (str n) 
 
 test "gc: a native walking a lazy seq that collects at every step keeps what it built" {
     try expectOutputUnderGc(churn ++ chain ++ "(reduce (fn [acc x] (str acc x)) \"\" (chain 30))", "302928272625242322212019181716151413121110987654321");
+    // The same over chunks: the accumulator lives across each step that
+    // makes the next chunk.
+    try expectOutputUnderGc(churn ++ "(= (reduce (fn [acc x] (str acc x)) \"\" (map (fn [x] (churn x) x) (vec (range 70)))) (apply str (range 70)))", "true");
     try expectOutputUnderGc(churn ++ chain ++ "(let [f (frequencies (map count (chain 30)))] [(f 1) (f 2)])", "[9 21]");
     try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [z (zipmap m (chain 40))] [(count z) (count (set (vals z))) (every? vector? (keys z))])", "[40 40 true]");
     try expectOutputUnderGc(churn ++ chain ++ zmap ++ "(let [c (concat m (chain 40))] [(count c) (vector? (first c)) (last c)])", "[80 true 1]");
