@@ -140,6 +140,8 @@ const embedded = [_]Embedded{
     .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx") } },
     // Sugar over the Nextomic natives (`with-conn`).
     .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx") } },
+    // Clojure's clojure.walk; before test.nx, whose `are` uses it.
+    .{ .ns = "nexis.walk", .info = .{ .path = "walk.nx", .text = @embedFile("stdlib/walk.nx") } },
     // deftest, is, testing, run-tests (docs/TOOLING.md §3).
     .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx") } },
     // pprint, pprint-str (docs/TOOLING.md §4).

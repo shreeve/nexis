@@ -6674,15 +6674,35 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
     try testing.expectEqualStrings("user", program.registry.current.name);
 }
 
-test "require: clojure.string, clojure.set, clojure.test and clojure.pprint name the nexis namespaces" {
+test "walk: nexis.walk is Clojure's clojure.walk; records and sorted collections keep their kind" {
+    try expectOutputProgram(
+        \\(defrecord P [a b])
+        \\(def bump (fn [x] (if (number? x) (inc x) x)))
+        \\[(nexis.walk/postwalk bump (->P 1 [2 3])) (nexis.walk/postwalk bump (sorted-map-by > 1 2 3 4))
+        \\ (nexis.walk/postwalk identity (sorted-set-by > 1 2 3)) (nexis.walk/prewalk bump '(1 (2 #{3})))
+        \\ (meta (nexis.walk/postwalk identity (with-meta '(1 2) {:a 1}))) (meta (nexis.walk/prewalk identity (with-meta [1 2] {:a 1})))
+        \\ (nexis.walk/walk inc vec [1 2]) (nexis.walk/walk inc identity '(1 2)) (nexis.walk/postwalk bump (i64-vector [1 2]))]
+    , "[#user.P{:a 2, :b [3 4]} {4 5, 2 3} #{3 2 1} (2 (3 #{4})) {:a 1} {:a 1} [2 3] (2 3) #i64[1 2]]");
+    try expectOutput(
+        \\[(nexis.walk/keywordize-keys {"a" {"b" 1} :c [{"d" 2}]}) (nexis.walk/stringify-keys {:a {:b 1} 'c 2})
+        \\ (nexis.walk/postwalk-replace {:a :b} [:a {:a :a} '(:a)]) (nexis.walk/prewalk-replace {[1 2] :x} [[1 2] 3])]
+    , "[{:a {:b 1}, :c [{:d 2}]} {a {b 1}, c 2} [:b {:b :b} (:b)] [:x 3]]");
+    // postwalk visits children before their parent, prewalk the
+    // parent first; a map's entries are visited as [k v] vectors.
+    try expectOutput("(let [l (atom [])] (nexis.walk/postwalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[:a 1 [1] [:a [1]] {:a [1]}]");
+    try expectOutput("(let [l (atom [])] (nexis.walk/prewalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[{:a [1]} [:a [1]] :a [1] 1]");
+    try expectOutput("(nexis.walk/macroexpand-all '(when a (-> b c)))", "(if a (do (c b)) nil)");
+}
+
+test "require: the clojure.* library names reach the nexis namespaces" {
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
     var files: RequireDir = undefined;
     try files.init(&program, &.{});
     defer files.deinit();
-    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test)) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests))]");
-    try harness.expectResult(&program, "clojure.string", r, "[a,b true]");
+    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1]))]");
+    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2]]");
 }
 
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {

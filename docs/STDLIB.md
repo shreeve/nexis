@@ -23,8 +23,8 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
    `math_natives` into `nexis.math`, `internal_natives` into
    `nexis.internal`, and `src/nextomic/natives.zig` into `nextomic`.
 3. The embedded sources, each evaluated with its namespace current:
-   `core.nx`, `nextomic.nx`, `test.nx`, `pprint.nx`, `math.nx`,
-   `string.nx`, `set.nx`.
+   `core.nx`, `nextomic.nx`, `walk.nx`, `test.nx`, `pprint.nx`,
+   `math.nx`, `string.nx`, `set.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -38,6 +38,7 @@ loader's diagnostic.
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
 | `nexis.set` | — | `set.nx` | §4 |
+| `nexis.walk` | — | `walk.nx` | §4 |
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`) | TOOLING.md §4 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
@@ -54,9 +55,10 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts four Clojure library namespaces:
+`src/loader.zig`) accepts five Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
-`clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`.
+`clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
+`clojure.walk` → `nexis.walk`.
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
@@ -180,10 +182,10 @@ mapping, normalization and grapheme segmentation are absent
 
 ---
 
-### 4. `nexis.set`
+### 4. `nexis.set` and `nexis.walk`
 
-Clojure's `clojure.set`, written in `src/stdlib/set.nx` over the
-core collection functions.
+**`nexis.set`** is Clojure's `clojure.set`, written in
+`src/stdlib/set.nx` over the core collection functions.
 
 | Name | Arity | Semantics |
 |---|---|---|
@@ -197,6 +199,29 @@ core collection functions.
 
 `index`, `project`, `join` and `rename` (the relational functions)
 are absent.
+
+**`nexis.walk`** is Clojure's `clojure.walk`, written in
+`src/stdlib/walk.nx`. `walk` rebuilds a form in its own kind: a list
+(every seq is a list, SEMANTICS.md §4) as a list with the form's
+metadata, a record by `conj`ing its walked entries onto it, so it
+keeps its type, and any other collection by pouring the walked
+elements `into` `(empty form)`, so a sorted collection keeps its
+comparator and every collection its metadata. A map's elements are
+its `[k v]` entries, which are vectors (§8 `map-entry?`), so the
+function sees each entry as a vector. A typed vector, like every
+value that is not a collection, is a leaf. The walks recurse on the
+VM's frames, so a form nested past the frame cap is a catchable
+`:stack-overflow`.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `walk` | 3 | `(walk inner outer form)`: `outer` of `form` rebuilt from `inner` of each element, as above; a leaf is `(outer form)` |
+| `postwalk`, `prewalk` | 2 | `f` of every subform: `postwalk` children first, each parent rebuilt from what `f` returned for them; `prewalk` the parent first, walking into what `f` returned |
+| `postwalk-replace`, `prewalk-replace` | 2 | `(postwalk-replace smap form)`: every subform that is a key of `smap` replaced by its value |
+| `keywordize-keys`, `stringify-keys` | 1 | Every string key of every map a keyword; every keyword key its name. A record or sorted map in the form becomes a hash map, as in Clojure |
+| `macroexpand-all` | 1 | Every list in the form `macroexpand`ed, outermost first (a host macro's expansion is the expander's, so `when` gives `(if c (do ...) nil)`) |
+
+`postwalk-demo` and `prewalk-demo` are absent.
 
 ---
 

@@ -265,8 +265,9 @@ discards before it, `^meta` on the name), must be `(ns my.app-core.foo
 caller's namespace is restored afterwards. A namespace loads once; a
 require of one still loading is `require: cyclic require of N`. The
 namespaces the stdlib installs have no file (`markLoaded`), and
-`clojure.string`, `clojure.set`, `clojure.test` and `clojure.pprint`
-are namespaces sharing the Vars of their `nexis.*` counterparts, so
+the Clojure library names `docs/STDLIB.md` §1 lists (`clojure.string`
+and the rest) are namespaces sharing the Vars of their `nexis.*`
+counterparts, so
 `(require '[clojure.string :as str :refer [join]])` works. A file
 that is missing, unreadable or does not compile is reported by the
 loader's own diagnostic, located in that file when it has a place; a

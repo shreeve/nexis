@@ -155,10 +155,11 @@ nexis: bad.nx:1:1: compile error: when: expected a test
 
 The namespaces that come with the binary are `nexis.core`
 (auto-referred), `db` (durable refs), `nextomic`, `nexis.string`,
-`nexis.set`, `nexis.test`, `nexis.pprint`, `nexis.math` and
-`nexis.simd` (typed-vector kernels); `clojure.string`, `clojure.set`,
-`clojure.test` and `clojure.pprint` are accepted as their names in
-`require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
+`nexis.set`, `nexis.walk`, `nexis.test`, `nexis.pprint`,
+`nexis.math` and `nexis.simd` (typed-vector kernels);
+`clojure.string`, `clojure.set`, `clojure.walk`, `clojure.test` and
+`clojure.pprint` are accepted as their names in `require`
+(`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
 under `zig build examples` (`examples/README.md`).
 
 ## Nextomic
