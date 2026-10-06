@@ -45,6 +45,7 @@ const std = @import("std");
 const value_mod = @import("value.zig");
 const intern_mod = @import("intern.zig");
 const list_mod = @import("coll/list.zig");
+const lazy_mod = @import("coll/lazy.zig");
 const vector_mod = @import("coll/vector.zig");
 const champ_mod = @import("coll/champ.zig");
 const sorted_mod = @import("coll/sorted.zig");
@@ -115,13 +116,14 @@ pub fn format(
         },
         .char => try formatChar(v.asChar(), mode, writer),
         .string => try formatString(string_mod.asBytes(v), mode, writer),
-        .list, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
+        .list, .lazy_seq, .persistent_vector, .persistent_map, .persistent_set, .record, .sorted_map, .sorted_set => {
             stack.check() catch {
                 dispatch.noteOverflow();
                 return writer.writeAll("#<too deep>");
             };
             switch (v.kind()) {
                 .list => try formatList(v, mode, writer, interner),
+                .lazy_seq => try formatLazy(v, mode, writer, interner),
                 .persistent_vector => try formatVector(v, mode, writer, interner),
                 .persistent_map => try formatMap(v, mode, writer, interner),
                 .persistent_set => try formatSet(v, mode, writer, interner),
@@ -318,6 +320,30 @@ fn formatList(
     try writer.writeByte(')');
 }
 
+/// A lazy seq prints as a list of its elements. Up to a block whose
+/// body has not run, which the printer never runs: there it writes
+/// `...` and closes the list.
+fn formatLazy(
+    v: Value,
+    mode: FormatMode,
+    writer: *std.Io.Writer,
+    interner: ?*const intern_mod.Interner,
+) Error!void {
+    try writer.writeByte('(');
+    var it = lazy_mod.Cursor.init(v);
+    var first = true;
+    while (true) : (first = false) {
+        const x = it.next() catch {
+            if (!first) try writer.writeByte(' ');
+            try writer.writeAll("...");
+            break;
+        } orelse break;
+        if (!first) try writer.writeByte(' ');
+        try format(x, mode, writer, interner);
+    }
+    try writer.writeByte(')');
+}
+
 fn formatVector(
     v: Value,
     mode: FormatMode,
@@ -443,6 +469,30 @@ fn formatForTest(v: Value, mode: FormatMode, interner: ?*const intern_mod.Intern
     errdefer w.deinit();
     try format(v, mode, &w.writer, interner);
     return try w.toOwnedSlice();
+}
+
+test "a chunked cons prints its offset onward; an unrealized block prints as ..." {
+    var heap = heap_mod.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const fx = struct {
+        fn f(n: i64) Value {
+            return value_mod.fromFixnum(n).?;
+        }
+    }.f;
+    const cc = try lazy_mod.chunkedCons(&heap, try lazy_mod.chunkOf(&heap, &.{ fx(1), fx(2), fx(3) }), try list_mod.fromSlice(&heap, &.{fx(4)}));
+    const pending = try lazy_mod.unrealized(&heap, 0, &.{value_mod.nilValue()});
+    const cases = [_]struct { v: Value, expect: []const u8 }{
+        .{ .v = cc, .expect = "(1 2 3 4)" },
+        .{ .v = lazy_mod.atOffset(cc, 2), .expect = "(3 4)" },
+        .{ .v = try lazy_mod.realizedWithMeta(&heap, value_mod.nilValue(), null), .expect = "()" },
+        .{ .v = try lazy_mod.cons(&heap, fx(0), pending), .expect = "(0 ...)" },
+        .{ .v = pending, .expect = "(...)" },
+    };
+    for (cases) |c| {
+        const got = try formatForTest(c.v, .readable, null);
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings(c.expect, got);
+    }
 }
 
 test "display: scalar Values" {

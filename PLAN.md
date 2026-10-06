@@ -123,8 +123,10 @@ Every architectural decision is checkable against these.
    quote/unquote/deref/metadata.
 8. **Interactive development is first-class.** REPL redefinition,
    `macroexpand`, the disassembler and `doc` are part of the language.
-9. **Explicit, predictable performance.** No hidden laziness, no
-   surprise boxing, no implicit allocation in hot loops.
+9. **Explicit, predictable performance.** Laziness is Clojure's,
+   visible in a lazy seq's kind and in `realized?`, and chunked where
+   Clojure chunks; no surprise boxing, no implicit allocation in hot
+   loops.
 10. **Separation of concerns.** Form, runtime Value and durable encoding
     are three layers (§5). They share conventions; they never fuse.
 11. **Boring first.** Start with the simplest thing known to work.
@@ -151,7 +153,6 @@ oversight; widening this list or removing a row takes an amendment.
 | Reader conditionals `#?(...)` | One compile target. |
 | Tagged literals `#inst`, `#uuid` | Rich literals are functions or macros (§24 #3). |
 | Rationals, decimals | The number tower is fixnum + bignum + f64 (§23 #10). |
-| Lazy sequences | Every sequence function is eager (§23 #14; §24 #2). |
 | Forcing every fast path through `seq` | `seq` is the iteration abstraction (§23 #35); map lookup, vector indexing and typed-vector kernels stay direct. |
 | Regular expressions | No regex literal and no regex library (§24 #9). |
 | Multiple compile targets | Zig-native only. |
@@ -223,10 +224,17 @@ Each item is a commitment; changing one takes an Amendment Log entry
 11. **`(= 1 1.0)` is `false`.** Cross-type numeric equality is `==`.
 12. **Metadata never affects equality or hash.**
 13. **Only `nil` and `false` are falsy.**
-14. **Eager.** Every sequence function returns a realized collection:
-    `map`, `filter`, `for` and friends return lists; there are no lazy
-    sequences, so `(range)` and `(iterate f x)` without a bound are
-    arity errors (`(range n)`, `(iterate f x n)`).
+14. **Lazy sequences, as Clojure's.** `lazy-seq` makes a lazy seq
+    whose body runs once, when the seq is first walked, and whose
+    result is cached; a body that throws leaves it unrealized. The
+    sequence functions return lazy seqs where Clojure's do, chunked
+    by 32 where Clojure's chunk (`map`, `filter`, `keep`, `concat`,
+    `for`, a finite `range`, ...) and one element at a time elsewhere
+    (`take`, `iterate`, `interleave`, ...); `(range)`, `(iterate f x)`,
+    `(repeat x)`, `(repeatedly f)` and `(cycle coll)` are infinite.
+    Functions that consume a whole collection (`reduce`, `into`, `vec`,
+    `mapv`, `count`, `apply`, printing, `=`) realize what they walk
+    (`docs/LAZY.md`).
 15. **The reader is minimal.** Sugar is macros.
 16. **Syntax-quote has auto-gensym, not full hygiene.**
 17. **Three representations (Form, Value, encoded) are kept distinct**
@@ -263,8 +271,9 @@ Each item is a commitment; changing one takes an Amendment Log entry
     see and produce Forms (§5).
 25. **Serialization has a fixed scope.** Serializable: nil, bool,
     char, fixnum, bignum, f64, string, keyword and symbol (as text),
-    list, vector, map, set, typed vector, and sorted map and sorted
-    set in the natural order. Everything else (functions, Vars, atoms,
+    list, vector, map, set, typed vector, a lazy seq (written as the
+    list it realizes to), and sorted map and sorted set in the natural
+    order. Everything else (functions, Vars, atoms,
     transients, durable refs, byte vectors, records, protocols, db and
     Nextomic handles, a sorted collection with a comparator of its
     own) is not; encoding one raises the keyword `:unserializable`
@@ -303,8 +312,8 @@ Each item is a commitment; changing one takes an Amendment Log entry
 34. **Macros receive their arguments only**: no `&form`, no `&env`.
 35. **`seq` is the core iteration abstraction.** Map lookup, vector
     indexing and typed-vector kernels bypass it where that is clearer.
-36. **Sequential equality crosses types.** Lists, vectors and their
-    seq views are equal when element-wise equal; maps and sets are
+36. **Sequential equality crosses types.** Lists, vectors, lazy seqs
+    and their seq views are equal when element-wise equal; maps and sets are
     categories of their own, each spanning its hash and sorted kinds;
     hashes are built so the invariant holds.
 37. **CHAMP is the persistent map and set**: separate data and node
@@ -332,9 +341,6 @@ lives in one place:
 Deliberately undecided. The numbers are stable; closed questions are
 removed.
 
-- **#2 Laziness.** Every sequence function is eager and returns a list
-  (§23 #14). Whether a lazy `seq` or a separate stream abstraction ever
-  lands is open.
 - **#3 Tagged literals.** A `#inst`-style literal would be a
   macro-based reader extension, not a reader feature.
 - **#4 AOT and bytecode caches.** Programs compile from source on every
@@ -821,3 +827,39 @@ entry stating the decision and its rationale.
   reachable through overflow and the `##Inf`, `##-Inf` and `##NaN`
   literals. `docs/SEMANTICS.md` §2.2, `docs/VM.md` §10 (`math:div`)
   and `CLOJURE-REVIEW.md` §4.3 carry it.
+
+- **2026-10-05 — Lazy sequences (§3 #9, §4, §23 #14, #25, #36; §24 #2).**
+  Sequences are lazy as Clojure 1.12's are; §23 #14's eager rule and
+  §24 #2 are withdrawn. Heap kind 43, `lazy_seq`, joins
+  `docs/VALUE.md` §2.2: a lazy seq whose body runs once, on the first
+  `seq`, `first`, `next`, `count` or walk, its result cached, a throw
+  leaving it unrealized so the next walk runs the body again
+  (`LazySeq.java` 1.12.0); a cons cell whose rest may be unrealized;
+  and a chunked cons over a chunk of up to 32 elements. `lazy-seq`,
+  `lazy-cat`, `doall`, `dorun`, `realized?` and the chunk functions
+  exist; `map`, `filter`, `remove`, `keep`, `map-indexed`,
+  `keep-indexed`, `concat`, `mapcat`, `for`, `dedupe` and a finite
+  `range` realize a chunk of 32 at a time where their source is
+  chunked, and every other sequence function realizes one element at
+  a time, where Clojure's does; `(range)`, `(iterate f x)`,
+  `(repeat x)`, `(repeatedly f)` and `(cycle coll)` are infinite, and
+  `(range start end 0)` repeats `start`. Consumers that need every
+  element realize what they walk; `mapv`, `filterv`, `into`, `vec`,
+  `set`, `reduce` and the other eager functions are unchanged, and
+  `reduce` and `count` over an unrealized `range` and `reduce` over an
+  unrealized `repeat`, `iterate` or `cycle` compute without realizing.
+  A lazy seq is sequential (§23 #36): `=` to and hashed as the list of
+  its elements, printed as one, and written by the codec as the list
+  it realizes to (§23 #25), which decodes as a list. Kind byte 43 never
+  appears on the wire. Reason: Clojure programs are written against
+  lazy, possibly infinite sequences (`(take n (iterate f x))`,
+  `(first (filter p (range)))`, a `for` over an unbounded source);
+  eager evaluation made them arity errors or non-terminating, and the
+  owner's goal is Clojure semantics. Chunked Zig producers keep the
+  measured pipeline cost (`docs/PERF.md` §3.11). `docs/LAZY.md` is the
+  authority; `docs/VALUE.md` §1.1 and §2.2 (tag bits 32..63 also carry
+  a chunked cons's offset), `docs/HEAP.md` §4 (flags bits 1–2, a
+  `lazy_seq` block's shape), `docs/SEMANTICS.md` §2.6, §3.3, §4, §6.1,
+  §7, `docs/GC.md` §5 and §11.5, `docs/VM.md` §6, §9 and §13.1,
+  `docs/CODEC.md` §3, `docs/STDLIB.md` §8 and `CLOJURE-REVIEW.md` carry
+  it.

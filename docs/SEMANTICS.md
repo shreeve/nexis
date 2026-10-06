@@ -139,7 +139,7 @@ qualified and an unqualified keyword are different names. `(= 'foo
 
 | Rule | `=` | `hash` |
 |---|---|---|
-| **sequential** (list, vector) | element-wise, across the two kinds | ordered combine; one shared domain byte `0xF0` |
+| **sequential** (list, vector, lazy seq) | element-wise, across the three kinds | ordered combine; one shared domain byte `0xF0` |
 | **identity** | the same value only | the pointer; the collector never moves a block |
 | **own-kind structural** | within the kind only, by the kind's structural rule | the kind's own hash; domain byte = the kind number |
 | **map, set** (hash map and sorted map; hash set and sorted set) | entry-wise, across the two kinds | unordered combine; the hash kind's number, 18 or 19 |
@@ -147,6 +147,12 @@ qualified and an unqualified keyword are different names. `(= 'foo
 - `(= (list 1 2 3) [1 2 3])` is true, and the hashes agree; a vector
   view (`(rest [1 2 3])`) is a list and follows the same rule.
 - `(= (list) [])` is true; `(= () nil)` is false.
+- A lazy seq is `=` to the list of its elements and hashes as it
+  (`LazySeq.equiv`, `hasheq`): `(= (map inc [1 2]) [2 3])` is true,
+  `(= (lazy-seq nil) [])` true and `(= (lazy-seq nil) nil)` false.
+  Comparing walks both sides in step, so a lazy seq against a shorter
+  one is decided at the shorter one's end, whether or not the lazy one
+  ends (`docs/LAZY.md` §6).
 - `(= [1 2 3] #{1 2 3})` and `(= {:a 1} [:a 1])` are false.
 - Maps compare entry-wise across their array-map and CHAMP layouts
   (subkinds of one kind) and the sorted map (a kind of its own); sets
@@ -285,8 +291,8 @@ domain its hash lands in. `dispatch.zig` is its code
 | 17 | `bignum` | own kind | 17 | sign and limbs | sign and limbs, cached |
 | 18 | `persistent_map` | map | 18 | entry-wise, both layouts and with a sorted map | unordered, cached |
 | 19 | `persistent_set` | set | 19 | element-wise, both layouts and with a sorted set | unordered, cached |
-| 20 | `persistent_vector` | sequential | `0xF0` | element-wise with any list or vector | ordered, cached |
-| 21 | `list` (all three subkinds) | sequential | `0xF0` | element-wise with any list or vector | ordered; cached except a view |
+| 20 | `persistent_vector` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered, cached |
+| 21 | `list` (all three subkinds) | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a view |
 | 23 | `typed_vector` | own kind | 23 | element type and elements | ordered, cached |
 | 24 | `function` | identity | 24 | same value | pointer |
 | 25 | `var_` | identity | 25 | same value | pointer |
@@ -303,6 +309,7 @@ domain its hash lands in. `dispatch.zig` is its code
 | 40 | `nextomic_entity` | own kind | 40 | db-value and eid | same fields, cached |
 | 41 | `sorted_map` | map | 18 | entry-wise with any map | unordered, cached |
 | 42 | `sorted_set` | set | 19 | element-wise with any set | unordered, cached |
+| 43 | `lazy_seq` | sequential | `0xF0` | element-wise with any list, vector or lazy seq | ordered; cached except a chunked cons |
 
 The reserved kinds (22 `byte_vector`, 28 `error_`, 29 `meta_symbol`)
 are never constructed; `dispatch` panics on one. A kind module

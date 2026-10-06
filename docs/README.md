@@ -19,6 +19,7 @@ canonical Form schema in [`PLAN.md`](../PLAN.md) §23 and §28.
 | `src/regex.zig`, `src/regex_tables.zig` | [`REGEX.md`](REGEX.md) | Regular expressions: Java's syntax without backtracking, a Pike VM in linear time, Java's Unicode tables (generated) |
 | `src/bignum.zig` | [`BIGNUM.md`](BIGNUM.md) | Arbitrary-precision integers |
 | `src/coll/list.zig` | [`LIST.md`](LIST.md) | Lists: cons, empty, O(1) vector view |
+| `src/coll/lazy.zig` | [`LAZY.md`](LAZY.md) | Lazy seqs: the shapes and their walk |
 | `src/coll/vector.zig` | [`VECTOR.md`](VECTOR.md) | Persistent vector: 32-way trie with a tail |
 | `src/coll/champ.zig` | [`CHAMP.md`](CHAMP.md) | Persistent map and set |
 | `src/coll/sorted.zig` | [`SORTED.md`](SORTED.md) | Sorted map and set: a weight-balanced tree, the natural order, `subseq` |

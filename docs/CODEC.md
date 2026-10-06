@@ -179,6 +179,7 @@ is `UnserializableKind`: the comparator is code.
 | `nil` `false_` `true_` `char` `fixnum` `float` `keyword` `symbol` (0–7) | yes | |
 | `string` (16), `bignum` (17), `persistent_map` (18), `persistent_set` (19), `persistent_vector` (20), `list` (21), `typed_vector` (23) | yes | |
 | `sorted_map` (41), `sorted_set` (42) | in the natural order | A comparator of its own is code (§2.8). |
+| `lazy_seq` (43) | as the list it realized to, kind byte 21 | The codec never runs code: a lazy seq any block of which has not run is `error.Unrealized`, and the storage native that encodes realizes the value and encodes again (`docs/LAZY.md` §8). It decodes as a list, `=` to the seq and hashed alike; byte 43 is never written. |
 | `function` (24), `native_fn` (30) | no | Code, upvalues and VM state are process-local. |
 | `var_` (25) | no | An identity with process-local mutation; store its value instead. |
 | `durable_ref` (26) | no | A ref names a connection only its own process has (`docs/DB.md` §9). |
@@ -190,9 +191,9 @@ is `UnserializableKind`: the comparator is code.
 | `byte_vector` (22), `error_` (28), `meta_symbol` (29) | no | Reserved numbers; never constructed. |
 
 Encoding any kind marked no is `UnserializableKind`. Decoding a kind byte that names a heap kind
-outside the set (every "no" row above) is `UnserializableKind` too;
+outside the set (every "no" row above, and 43) is `UnserializableKind` too;
 a byte that names no kind (the reserved immediates 8–15, the reserved
-heap bytes 43–63, the runtime-private sentinels 64 and up) is
+heap bytes 44–63, the runtime-private sentinels 64 and up) is
 `InvalidKindByte`. No silent stubs, no lossy round trips.
 
 **At the language level** (`db.failureName`, `docs/DB.md` §8)

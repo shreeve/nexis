@@ -12,9 +12,12 @@
 //!     protocols, Nextomic connections) are equal to themselves only
 //!     and hash their pointer. The collector never moves a block, so
 //!     the pointer is stable for the value's life.
-//!   - **Sequential kinds** (list, vector) compare element-wise across
-//!     kinds and share one hash domain byte, so `(= '(1 2) [1 2])` and
-//!     their hashes agree.
+//!   - **Sequential kinds** (list, vector, lazy seq) compare
+//!     element-wise across kinds and share one hash domain byte, so
+//!     `(= '(1 2) [1 2])` and their hashes agree. A lazy block whose
+//!     body has not run is realized in isolation (`lazy.realizeIsolated`,
+//!     docs/LAZY.md §6); one that cannot be spoils the answer as an
+//!     overflow does.
 //!   - **Maps and sets** compare entry-wise across their hash and
 //!     sorted kinds and hash in the hash kind's domain, so `(=
 //!     (sorted-map 1 2) {1 2})` and their hashes agree.
@@ -41,6 +44,7 @@ const hash_mod = @import("hash.zig");
 const stack = @import("stack.zig");
 const string = @import("string.zig");
 const list = @import("coll/list.zig");
+const lazy = @import("coll/lazy.zig");
 const vector = @import("coll/vector.zig");
 const nextomic_handle = @import("nextomic/handle.zig");
 const bignum = @import("bignum.zig");
@@ -80,7 +84,7 @@ pub fn isIdentityKind(k: Kind) bool {
 }
 
 inline fn isSequential(k: Kind) bool {
-    return k == .list or k == .persistent_vector;
+    return k == .list or k == .persistent_vector or k == .lazy_seq;
 }
 
 inline fn isMapKind(k: Kind) bool {
@@ -157,6 +161,7 @@ pub fn heapHashBase(v: Value) u64 {
         .string => string.hashHeader(h),
         .bignum => bignum.hashHeader(h),
         .list => list.hashSeq(v, &hashValue),
+        .lazy_seq => lazyHash(v),
         .persistent_vector => vector.hashSeq(h, &hashValue),
         .persistent_map => champ.hashMap(h, &hashValue),
         .persistent_set => champ.hashSet(h, &hashValue),
@@ -184,7 +189,7 @@ pub fn equal(a: Value, b: Value) bool {
     const ka = a.kind();
     const kb = b.kind();
     if (ka != kb) {
-        if (isSequential(ka) and isSequential(kb)) return sequentialEqual(a, b);
+        if (isSequential(ka) and isSequential(kb)) return if (ka == .lazy_seq or kb == .lazy_seq) walkEqual(a, b) else sequentialEqual(a, b);
         if ((isMapKind(ka) and isMapKind(kb)) or (isSetKind(ka) and isSetKind(kb))) return mixedEqual(a, b);
         return false;
     }
@@ -201,6 +206,7 @@ pub fn equal(a: Value, b: Value) bool {
         .string => string.bytesEqual(ah, bh),
         .bignum => bignum.limbsEqual(ah, bh),
         .list => list.equalSeq(a, b, &equal),
+        .lazy_seq => walkEqual(a, b),
         .persistent_vector => vector.equalSeq(ah, bh, &equal),
         .persistent_map => champ.equalMap(ah, bh, &hashValue, &equal),
         .persistent_set => champ.equalSet(ah, bh, &hashValue, &equal),
@@ -327,6 +333,67 @@ fn sequentialEqual(a: Value, b: Value) bool {
     }
 }
 
+/// The elements of any sequential value, a lazy block met on the way
+/// realized in isolation; `error.Spoiled` when one could not be, the
+/// spoil already counted.
+const SeqWalk = union(enum) {
+    vector: vector.Cursor,
+    seq: lazy.Cursor,
+
+    fn init(v: Value) SeqWalk {
+        return if (v.kind() == .persistent_vector) .{ .vector = vector.Cursor.init(v) } else .{ .seq = lazy.Cursor.init(v) };
+    }
+
+    fn next(self: *SeqWalk) error{Spoiled}!?Value {
+        switch (self.*) {
+            .vector => |*c| return c.next(),
+            .seq => |*c| while (true) {
+                return c.next() catch {
+                    if (lazy.realizeIsolated(c.pending()) == null) {
+                        noteOverflow();
+                        return error.Spoiled;
+                    }
+                    continue;
+                };
+            },
+        }
+    }
+};
+
+/// Two sequential values, at least one a lazy seq: one streaming walk
+/// over both, as `LazySeq.equiv` walks, so an infinite seq against a
+/// finite one is decided at the finite one's end.
+fn walkEqual(a: Value, b: Value) bool {
+    stack.check() catch {
+        noteOverflow();
+        return false;
+    };
+    var wa = SeqWalk.init(a);
+    var wb = SeqWalk.init(b);
+    while (true) {
+        const x = (wa.next() catch return false) orelse return (wb.next() catch return false) == null;
+        const y = (wb.next() catch return false) orelse return false;
+        if (!equal(x, y)) return false;
+    }
+}
+
+/// A lazy seq's ordered hash, the list's of the same elements
+/// (`LazySeq.hasheq` is `hashOrdered`). A lazy block and a cons cache
+/// it in their header; a chunked cons, whose offsets share one header,
+/// caches nothing.
+fn lazyHash(v: Value) u64 {
+    const h = Heap.asHeapHeader(v);
+    const cacheable = lazy.shapeOf(v) != .chunked;
+    if (cacheable) if (h.cachedHash()) |cached| return cached;
+    var acc: u64 = hash_mod.ordered_init;
+    var n: usize = 0;
+    var w = SeqWalk.init(v);
+    while (w.next() catch return 0) |x| : (n += 1) acc = hash_mod.combineOrdered(acc, hashValue(x));
+    const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, n));
+    if (cacheable and truncated != 0) h.setCachedHash(truncated);
+    return truncated;
+}
+
 // =============================================================================
 // Tests — the routing rules. Each kind's own structural rule is tested
 // in its module; the randomized laws live in test/prop.
@@ -391,6 +458,32 @@ test "list and vector: equal across kinds with one hash; length and element kind
     const nested_l = try list.fromSlice(&heap, &.{ fx(1), try list.fromSlice(&heap, &.{fx(2)}) });
     const nested_v = try vector.fromSlice(&heap, &.{ fx(1), try vector.fromSlice(&heap, &.{fx(2)}) });
     try expectSame(nested_l, nested_v);
+}
+
+test "a lazy cons over a list and a chunked cons equal the list and hash alike" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const items = [_]Value{ fx(1), fx(2), fx(3), fx(4) };
+    const want = try list.fromSlice(&heap, &items);
+    // (1 . ([2 3] . (4))) behind a realized block.
+    const tail = try list.fromSlice(&heap, items[3..]);
+    const cc = try lazy.chunkedCons(&heap, try lazy.chunkOf(&heap, items[1..3]), tail);
+    const c = try lazy.cons(&heap, fx(1), try lazy.realizedWithMeta(&heap, cc, null));
+    try expectSame(c, want);
+    try expectSame(c, try vector.fromSlice(&heap, &items));
+    try expectSame(lazy.atOffset(cc, 1), try list.fromSlice(&heap, items[2..]));
+    try expectDifferent(cc, want);
+    // An empty realized block is () and [], never nil.
+    const empty_seq = try lazy.realizedWithMeta(&heap, value.nilValue(), null);
+    try expectSame(empty_seq, try list.empty(&heap));
+    try expectSame(empty_seq, try vector.empty(&heap));
+    try expectDifferent(empty_seq, value.nilValue());
+    // A block whose body cannot run here spoils the answer.
+    const n0 = overflowCount();
+    const pending = try lazy.unrealized(&heap, 0, &.{value.nilValue()});
+    try testing.expect(!equal(pending, want));
+    try testing.expect(overflowCount() > n0);
+    rewindOverflows(n0);
 }
 
 test "maps and sets: equal across insertion orders and subkinds; never equal to each other or to a sequence" {

@@ -23,6 +23,7 @@ pub const regex = @import("regex.zig");
 pub const atom = @import("atom.zig");
 pub const vector = @import("coll/vector.zig");
 pub const list = @import("coll/list.zig");
+pub const lazy = @import("coll/lazy.zig");
 pub const bignum = @import("bignum.zig");
 pub const protocol = @import("protocol.zig");
 pub const typed_vector = @import("coll/typed_vector.zig");
