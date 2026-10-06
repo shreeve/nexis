@@ -43,6 +43,7 @@ const heap_mod = @import("heap.zig");
 const dispatch_mod = @import("dispatch.zig");
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
+const regex_mod = @import("regex.zig");
 const format_mod = @import("format.zig");
 const record_mod = @import("record.zig");
 const protocol_mod = @import("protocol.zig");
@@ -417,6 +418,12 @@ const core_natives = table("", .{
     .{ "str", 0, null, &fnStr },
     .{ "string?", 1, 1, &fnStringQ },
     .{ "subs", 2, 3, &fnSubs },
+    // Regular expressions (docs/REGEX.md §9); `re-seq` is core.nx's.
+    .{ "re-pattern", 1, 1, &fnRePattern },
+    .{ "re-matcher", 2, 2, &fnReMatcher },
+    .{ "re-find", 1, 2, &fnReFind },
+    .{ "re-matches", 2, 2, &fnReMatches },
+    .{ "re-groups", 1, 1, &fnReGroups },
     // Printing + I/O.
     .{ "print", 0, null, &fnPrint },
     .{ "println", 0, null, &fnPrintln },
@@ -4545,6 +4552,8 @@ fn appendStrValue(
     // A float by itself is Java's `toString` (`Infinity`), as Clojure's
     // `str` makes it; inside a collection it prints readable (`##Inf`).
     if (v.isFloat()) return format_mod.formatFloatJava(v.asFloat(), &w.writer) catch return VmError.OutOfMemory;
+    // A pattern by itself is its source (`Pattern.toString`).
+    if (v.kind() == .regex) return w.writer.writeAll(regex_mod.sourceOf(v)) catch return VmError.OutOfMemory;
     const mode: format_mod.FormatMode = switch (v.kind()) {
         .string, .char => .display,
         else => .readable,
@@ -4650,6 +4659,135 @@ fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
     };
     const src_bytes = string_mod.asBytes(s);
     return string_mod.fromBytes(vm.ensureHeap(), src_bytes[byte_range.start..byte_range.end]) catch return VmError.OutOfMemory;
+}
+
+// =============================================================================
+// Regular expressions (docs/REGEX.md §9)
+// =============================================================================
+//
+// A match is the matched string when the pattern has no groups, else
+// the vector `[whole g1 g2 ...]` with nil for a group that did not
+// take part (Clojure's `re-groups`). Each native validates its string
+// once (`:utf8-error`, as `nexis.string` does); a matcher's string is
+// validated when the matcher is made. The engine's scratch space is
+// on `vm.allocator`, freed before the native returns.
+//
+// GC rooting: the strings and the vector a match builds are fresh
+// blocks gathered before anything else allocates; `Heap.alloc` never
+// collects, and no native here calls back into the VM.
+
+/// The pattern `v`, or `:kind-mismatch`, as Clojure's cast to
+/// `Pattern` fails.
+fn patternArg(v: Value) VmError!Value {
+    if (v.kind() != .regex) return VmError.KindMismatch;
+    return v;
+}
+
+/// The bytes of the string `v`, validated as UTF-8.
+fn utf8Arg(v: Value) VmError![]const u8 {
+    const s = try stringArg(v);
+    if (!std.unicode.utf8ValidateSlice(s)) return VmError.Utf8Error;
+    return s;
+}
+
+/// A match as Clojure's `re-groups` gives it, from `group(g)`, the
+/// span of group `g` or null.
+fn matchValue(vm: *VM, hay: []const u8, ngroups: usize, ctx: anytype, comptime group: fn (@TypeOf(ctx), usize) ?[2]usize) VmError!Value {
+    const heap = vm.ensureHeap();
+    const span = group(ctx, 0).?;
+    if (ngroups == 0) return string_mod.fromBytes(heap, hay[span[0]..span[1]]) catch VmError.OutOfMemory;
+    const items = vm.allocator.alloc(Value, ngroups + 1) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(items);
+    for (items, 0..) |*item, g| item.* = if (group(ctx, g)) |s|
+        string_mod.fromBytes(heap, hay[s[0]..s[1]]) catch return VmError.OutOfMemory
+    else
+        value_mod.nilValue();
+    return vector_mod.fromSlice(heap, items) catch VmError.OutOfMemory;
+}
+
+fn vmGroup(vm: *const regex_mod.Vm, g: usize) ?[2]usize {
+    return vm.group(g);
+}
+
+fn matcherGroup(m: Value, g: usize) ?[2]usize {
+    return regex_mod.matcherGroup(m, g);
+}
+
+/// `(re-pattern s)` → the pattern `s` compiles to, or `s` itself when
+/// it is a pattern. A syntax error throws `{:error :invalid-regex
+/// :message M :pattern s :index I}`, `I` counting code points as
+/// Java's index counts chars.
+fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() == .regex) return args[0];
+    const source = try utf8Arg(args[0]);
+    const made = regex_mod.make(vm.ensureHeap(), vm.allocator, source) catch |err| return switch (err) {
+        error.OutOfMemory => VmError.OutOfMemory,
+        error.StackOverflow => VmError.StackOverflow,
+    };
+    switch (made) {
+        .ok => |p| return p,
+        .err => |e| {
+            const heap = vm.ensureHeap();
+            const interner = vm.ensureInterner();
+            const index = std.unicode.utf8CountCodepoints(source[0..e.offset]) catch e.offset;
+            const fields = [_]struct { []const u8, Value }{
+                .{ "error", interner.internKeywordValue("invalid-regex") catch return VmError.OutOfMemory },
+                .{ "message", string_mod.fromBytes(heap, e.msg) catch return VmError.OutOfMemory },
+                .{ "pattern", args[0] },
+                .{ "index", value_mod.fromFixnum(@intCast(index)).? },
+            };
+            var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+            for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
+            return vm.throwValue(m);
+        },
+    }
+}
+
+/// `(re-matcher re s)` → a fresh matcher of `re` over `s`.
+fn fnReMatcher(vm: *VM, args: []const Value) VmError!Value {
+    const p = try patternArg(args[0]);
+    _ = try utf8Arg(args[1]);
+    return regex_mod.makeMatcher(vm.ensureHeap(), p, args[1]) catch VmError.OutOfMemory;
+}
+
+/// `(re-find m)` → the next match of the matcher `m`, or nil;
+/// `(re-find re s)` → the first match of `re` in `s`, or nil.
+fn fnReFind(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) {
+        const m = args[0];
+        if (m.kind() != .matcher) return VmError.KindMismatch;
+        if (!(regex_mod.matcherFind(vm.allocator, m) catch return VmError.OutOfMemory)) return value_mod.nilValue();
+        return reGroups(vm, m);
+    }
+    return searchOnce(vm, args, false);
+}
+
+/// `(re-matches re s)` → the match of all of `s` (Java's `matches`),
+/// or nil.
+fn fnReMatches(vm: *VM, args: []const Value) VmError!Value {
+    return searchOnce(vm, args, true);
+}
+
+fn searchOnce(vm: *VM, args: []const Value, whole: bool) VmError!Value {
+    const prog = regex_mod.programOf(try patternArg(args[0]));
+    const hay = try utf8Arg(args[1]);
+    var rvm = regex_mod.Vm.init(vm.allocator, prog, prog.ngroups > 0) catch return VmError.OutOfMemory;
+    defer rvm.deinit(vm.allocator);
+    if (!rvm.exec(hay, 0, 0, whole)) return value_mod.nilValue();
+    return matchValue(vm, hay, prog.ngroups, &rvm, vmGroup);
+}
+
+/// `(re-groups m)` → the last match of the matcher `m`;
+/// `:invalid-argument` when it has none.
+fn fnReGroups(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .matcher) return VmError.KindMismatch;
+    return reGroups(vm, args[0]);
+}
+
+fn reGroups(vm: *VM, m: Value) VmError!Value {
+    const b = regex_mod.matcherBox(m);
+    if (b.state != .matched) return vm.fail(VmError.InvalidArgument, "re-groups: no match found", .{});
+    return matchValue(vm, string_mod.asBytes(b.input), regex_mod.programOf(b.pattern).ngroups, m, matcherGroup);
 }
 
 // =============================================================================

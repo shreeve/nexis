@@ -377,3 +377,30 @@ collection it prints `#"..."`. A matcher prints `#<matcher #"source">`.
 metadata (`:kind-mismatch`) nor serializes (`:unserializable`,
 `docs/CODEC.md` §3): a decoded pattern could never be `=` to the one
 encoded.
+
+---
+
+### 9. The functions
+
+In `nexis.core`, with Clojure 1.12's results (the natives are in
+`src/stdlib.zig`, `re-seq` in `core.nx`). A **match** is the matched
+string when the pattern has no groups, else the vector `[whole g1 g2
+...]` with nil for a group that did not take part, as Clojure's
+`re-groups` builds it. Each function validates its string argument
+as UTF-8 once (`:utf8-error`, as `nexis.string` does); a matcher's
+string is validated when the matcher is made. A string where a
+pattern is needed is `:kind-mismatch`, as Clojure's cast to `Pattern`
+fails.
+
+| Name | Arity | Result |
+|---|---|---|
+| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points where the compiler stopped (`catch :invalid-regex` takes it) |
+| `re-matcher` | 2 | `(re-matcher re s)`: a fresh matcher (§8) |
+| `re-find` | 1–2 | `(re-find m)`: the next match of the matcher, or nil; `(re-find re s)`: the first match of `re` in `s`, or nil |
+| `re-matches` | 2 | The match of the whole of `s` (`Matcher.matches`: `(re-matches #"a\|ab" "ab")` is `"ab"`), or nil |
+| `re-groups` | 1 | The matcher's last match; `:invalid-argument` ("re-groups: no match found") when its last search failed or it has not searched |
+| `re-seq` | 2 | Every match, left to right, as a lazy seq that finds one match per element (Clojure's definition over `re-matcher` and `re-find`, unchunked); nil when nothing matches. An empty match advances one code point (§3.5): `(re-seq #"a*" "baaa")` is `("" "aaa" "")` |
+
+Each search allocates the engine's scratch space (§1) for its program
+on the VM's allocator and frees it before it returns, so `re-find` on
+a matcher costs O(m·k) memory per call and holds none between calls.

@@ -844,6 +844,16 @@
 (defmacro vswap! [v f & args]
   `(swap! ~v ~f ~@args))
 
+; (re-seq re s) → the matches of re in s, left to right, as a lazy seq
+; that finds one match per element; nil when there is none
+; (docs/REGEX.md §9). Clojure's definition, with re-find's result in
+; place of a second re-groups.
+(defn re-seq [re s]
+  (let [m (re-matcher re s)]
+    ((fn step []
+       (when-some [g (re-find m)]
+         (cons g (lazy-seq (step))))))))
+
 ; ---- predicates ----
 (defn any? [_] true)
 (defn ident? [x] (or (keyword? x) (symbol? x)))

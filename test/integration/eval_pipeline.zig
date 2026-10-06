@@ -4017,6 +4017,55 @@ test "nexis.string: replace: UTF-8 boundary safety" {
 }
 
 // =============================================================================
+// Regular expressions (docs/REGEX.md §9); expected results are bb's
+// =============================================================================
+
+test "regex: re-find and re-matches give the match, or the groups vector with nil for a group that did not take part" {
+    try expectOutput(
+        \\(pr-str [(re-find (re-pattern "\\d+") "ab123cd45") (re-find (re-pattern "(\\w)(\\d)?") "x") (re-find (re-pattern "z") "abc") (re-find (re-pattern "") "")
+        \\         (re-matches (re-pattern "a|ab") "ab") (re-matches (re-pattern "(a)(b)?") "a") (re-matches (re-pattern "\\d+") "12x") (re-matches (re-pattern "(?<y>\\d{4})-(\\d\\d)") "2024-10")
+        \\         (re-find (re-pattern ".") "😀") (re-find (re-pattern "(?i)É") "é") (re-find (re-pattern "(?iu)É") "é")])
+    , "[\"123\" [\"x\" \"x\" nil] nil \"\" \"ab\" [\"a\" \"a\" nil] nil [\"2024-10\" \"2024\" \"10\"] \"😀\" nil \"é\"]");
+}
+
+test "regex: re-seq is lazy, one match per element, nil when nothing matches; an empty match advances one code point" {
+    try expectOutput(
+        \\(pr-str [(re-seq (re-pattern "a*") "baaa") (re-seq (re-pattern "x") "abc") (re-seq (re-pattern "(\\d)(x)?") "1x2") (re-seq (re-pattern "") "aé")
+        \\         (count (re-seq (re-pattern "\\w+") (apply str (repeat 1000 "ab "))))
+        \\         (let [s (re-seq (re-pattern "\\d") "a1b2")] [(first s) (realized? (rest s)) (class s)])
+        \\         (take 2 (re-seq (re-pattern "\\d") (apply str (repeat 1000000 "1"))))])
+    , "[(\"\" \"aaa\" \"\") nil ([\"1x\" \"1\" \"x\"] [\"2\" \"2\" nil]) (\"\" \"\" \"\") 1000 [\"1\" false :lazy_seq] (\"1\" \"1\")]");
+}
+
+test "regex: a matcher advances with re-find, re-groups repeats its last match, and a failed search stays failed" {
+    try expectOutput(
+        \\(let [m (re-matcher (re-pattern "a(b)?") "a ab")]
+        \\  (pr-str [(re-find m) (re-groups m) (re-find m) (re-find m) (re-find m) (try (re-groups m) (catch any e e))]))
+    , "[[\"a\" nil] [\"a\" nil] [\"ab\" \"b\"] nil nil :invalid-argument]");
+    try expectOutput("(try (re-groups (re-matcher (re-pattern \"a\") \"a\")) (catch any e e))", ":invalid-argument");
+}
+
+test "regex: a pattern is an identity value that prints as #\"...\" and whose str is its source" {
+    try expectOutput(
+        \\(pr-str [(str (re-pattern "a\\d")) (str [(re-pattern "a")]) (format "%s|%s" (re-pattern "x+") 1) (re-pattern "é\"")
+        \\         (= (re-pattern "a") (re-pattern "a")) (let [p (re-pattern "a")] [(= p p) (identical? p (re-pattern p)) (count (hash-set p p))])
+        \\         (class (re-pattern "a")) (type (re-matcher (re-pattern "a") "")) (re-matcher (re-pattern "a\\d") "")])
+    , "[\"a\\\\d\" \"[#\\\"a\\\"]\" \"x+|1\" #\"é\\\"\" false [true true 1] :regex :matcher #<matcher #\"a\\d\">]");
+    try expectOutput("[(try (with-meta (re-pattern \"a\") {}) (catch any e e)) (meta (re-pattern \"a\")) (seqable? (re-pattern \"a\"))]", "[:kind-mismatch nil false]");
+}
+
+test "regex: an invalid pattern throws :invalid-regex with the sentence and the index; a wrong kind is :kind-mismatch" {
+    try expectOutput(
+        \\(pr-str (for [p ["(" "a{2,1}" "é(" "(?=a)" "a)"]]
+        \\          (try (re-pattern p) (catch :invalid-regex e [(:message e) (:index e) (= p (:pattern e))]))))
+    , "([\"Unclosed group\" 1 true] [\"Illegal repetition range\" 5 true] [\"Unclosed group\" 2 true] [\"lookahead and lookbehind are not supported\" 0 true] [\"Unmatched closing ')'\" 1 true])");
+    try expectOutput(
+        \\(map #(try (%) (catch any e e))
+        \\     [#(re-find "a" "a") #(re-seq "a" "a") #(re-matches "a" "a") #(re-pattern 1) #(re-find (re-pattern "a") 1) #(re-matcher (re-pattern "a") nil) #(re-find 1) #(re-groups (re-pattern "a"))])
+    , "(:kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch :kind-mismatch)");
+}
+
+// =============================================================================
 // Printing + I/O
 // =============================================================================
 //

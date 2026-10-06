@@ -276,6 +276,8 @@ their elements in the same mode. Who uses which:
 | function, native fn | `#<fn>`, `#<native-fn NAME>` (`NAME` is `ns/name` outside `nexis.core`: `#<native-fn nexis.string/join>`) |
 | var | `#'ns/name`, as Clojure prints one (`#'nexis.core/inc`, `#'user/x`) |
 | atom, transient | `#<atom>`, `#<transient>` |
+| regex | `#"source"`, with Clojure's escaping of `"` (`docs/REGEX.md` §8); `str` and `%s` of a bare pattern write its source, as `Pattern.toString` does |
+| matcher | `#<matcher #"source">` |
 | protocol, protocol fn | `#<protocol id=N>`, `#<protocol-fn proto=N method=M>` |
 | durable ref | `#<durable-ref :tree hex:KEY>`, the key bytes in upper-case hex |
 | db connection, transactions | `#<db-connection>`, `#<db-write-txn>`, `#<db-read-txn>` |
@@ -412,3 +414,4 @@ returns a realized list where Clojure returns a lazy seq.
 | `random-uuid` | 0 | A random version-4 UUID. A UUID is its canonical lowercase text, a string, as Nextomic's `:db.type/uuid` values are; there is no `#uuid` literal |
 | `parse-uuid` | 1 | The canonical text of the UUID a string spells as 8-4-4-4-12 hex digits of either case, else nil (Java's lenient short groups included); a non-string is `:kind-mismatch` |
 | `uuid?` | 1 | Whether `x` is a string in the canonical form (so `(uuid? (random-uuid))` is true, and an uppercase spelling is not) |
+| `re-pattern`, `re-matcher`, `re-find`, `re-matches`, `re-groups`, `re-seq` | 1, 2, 1–2, 2, 1, 2 | Clojure's regular expressions, over the linear-time engine of `docs/REGEX.md`, which owns their rows (§9 there): `(re-find #"\d+" "ab12")` is `"12"`, `(re-seq #"(\w)=(\d)" "a=1 b=2")` is `(["a=1" "a" "1"] ["b=2" "b" "2"])`, lazy |

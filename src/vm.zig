@@ -1979,7 +1979,7 @@ pub const VM = struct {
 
     /// `err`, with `error_detail` set to the formatted sentence (cut
     /// to nothing if it does not fit the buffer).
-    fn fail(self: *VM, err: VmError, comptime fmt: []const u8, args: anytype) VmError {
+    pub fn fail(self: *VM, err: VmError, comptime fmt: []const u8, args: anytype) VmError {
         self.error_detail = std.mem.print(&self.detail_buf, fmt, args) catch blk: {
             // Too long for the buffer: keep what fits, cut at a
             // character boundary, and mark the cut.
