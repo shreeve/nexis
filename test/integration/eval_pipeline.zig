@@ -6731,8 +6731,8 @@ test "require: the clojure.* library names reach the nexis namespaces" {
     var files: RequireDir = undefined;
     try files.init(&program, &.{});
     defer files.deinit();
-    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w] '[clojure.edn :as edn])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1])) (eval '(edn/read-string \"[:e]\"))]");
-    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2] [:e]]");
+    const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w] '[clojure.edn :as edn] '[clojure.math :as m])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1])) (eval '(edn/read-string \"[:e]\")) (eval '(m/signum -3))]");
+    try harness.expectResult(&program, "clojure.string", r, "[a,b true [2] [:e] -1.0]");
 }
 
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {

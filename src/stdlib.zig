@@ -475,6 +475,26 @@ const math_natives = table("nexis.math", .{
     .{ "floor", 1, 1, &fnMathFloor },
     .{ "ceil", 1, 1, &fnMathCeil },
     .{ "round", 1, 1, &fnMathRound },
+    .{ "sin", 1, 1, mathOf1(builtinSin) },
+    .{ "cos", 1, 1, mathOf1(builtinCos) },
+    .{ "tan", 1, 1, mathOf1(builtinTan) },
+    .{ "asin", 1, 1, mathOf1(std.math.asin) },
+    .{ "acos", 1, 1, mathOf1(std.math.acos) },
+    .{ "atan", 1, 1, mathOf1(std.math.atan) },
+    .{ "atan2", 2, 2, mathOf2(std.math.atan2) },
+    .{ "sinh", 1, 1, mathOf1(std.math.sinh) },
+    .{ "cosh", 1, 1, mathOf1(std.math.cosh) },
+    .{ "tanh", 1, 1, mathOf1(std.math.tanh) },
+    .{ "exp", 1, 1, mathOf1(builtinExp) },
+    .{ "expm1", 1, 1, mathOf1(std.math.expm1) },
+    .{ "log", 1, 1, mathOf1(builtinLog) },
+    .{ "log10", 1, 1, mathOf1(builtinLog10) },
+    .{ "log1p", 1, 1, mathOf1(std.math.log1p) },
+    .{ "cbrt", 1, 1, mathOf1(std.math.cbrt) },
+    .{ "hypot", 2, 2, mathOf2(std.math.hypot) },
+    .{ "signum", 1, 1, mathOf1(signum) },
+    .{ "to-radians", 1, 1, mathOf1(toRadians) },
+    .{ "to-degrees", 1, 1, mathOf1(toDegrees) },
 });
 
 const internal_natives = table("nexis.internal", .{
@@ -1195,6 +1215,65 @@ fn fnAbs(vm: *VM, args: []const Value) VmError!Value {
 
 fn asDouble(v: Value) VmError!f64 {
     return (try vm_mod.numDouble(v)).asFloat();
+}
+
+/// A `nexis.math` function of one or two doubles, as Java's `Math`
+/// method of its name: any number in, a float out; NaN and the
+/// infinities pass through as IEEE has them, never an error.
+fn mathOf1(comptime f: anytype) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(_: *VM, args: []const Value) VmError!Value {
+            return value_mod.fromFloat(f(@as(f64, try asDouble(args[0]))));
+        }
+    }.call;
+}
+
+fn mathOf2(comptime f: anytype) *const fn (*VM, []const Value) VmError!Value {
+    return struct {
+        fn call(_: *VM, args: []const Value) VmError!Value {
+            return value_mod.fromFloat(f(@as(f64, try asDouble(args[0])), @as(f64, try asDouble(args[1]))));
+        }
+    }.call;
+}
+
+fn builtinSin(x: f64) f64 {
+    return @sin(x);
+}
+
+fn builtinCos(x: f64) f64 {
+    return @cos(x);
+}
+
+fn builtinTan(x: f64) f64 {
+    return @tan(x);
+}
+
+fn builtinExp(x: f64) f64 {
+    return @exp(x);
+}
+
+fn builtinLog(x: f64) f64 {
+    return @log(x);
+}
+
+fn builtinLog10(x: f64) f64 {
+    return @log10(x);
+}
+
+/// Java's `Math/signum`: a zero (either sign) and NaN are themselves,
+/// anything else 1.0 with its sign.
+fn signum(x: f64) f64 {
+    return if (x == 0 or std.math.isNan(x)) x else std.math.copysign(@as(f64, 1.0), x);
+}
+
+/// Java's `Math/toRadians` and `Math/toDegrees`: one multiplication
+/// by the constant Java rounds, so the results are Java's to the bit.
+fn toRadians(x: f64) f64 {
+    return x * 0.017453292519943295;
+}
+
+fn toDegrees(x: f64) f64 {
+    return x * 57.29577951308232;
 }
 
 fn fnMathSqrt(_: *VM, args: []const Value) VmError!Value {

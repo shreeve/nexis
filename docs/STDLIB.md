@@ -40,7 +40,7 @@ loader's diagnostic.
 | `nexis.set` | — | `set.nx` | §4 |
 | `nexis.walk` | — | `walk.nx` | §4 |
 | `nexis.edn` | — | `edn.nx` | §4 |
-| `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`) | TOOLING.md §4 |
+| `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
@@ -56,10 +56,11 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts six Clojure library namespaces:
+`src/loader.zig`) accepts seven Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
 `clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
-`clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`.
+`clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`,
+`clojure.math` → `nexis.math`.
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`

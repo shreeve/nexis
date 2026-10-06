@@ -235,7 +235,8 @@ only results into the VM heap; a Nextomic error is a map
 `nexis.set`, `nexis.walk`, `nexis.edn`, `nexis.test`, `nexis.pprint`,
 `nexis.math`, `nexis.simd` and `nexis.internal`, with
 `clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
-`clojure.test` and `clojure.pprint` accepted as names in `require`.
+`clojure.math`, `clojure.test` and `clojure.pprint` accepted as names
+in `require`.
 The native tables are in `src/stdlib.zig`, the library written in
 nexis in `src/stdlib/*.nx`, embedded and booted in order by
 `stdlib.boot` (`docs/STDLIB.md` §1).

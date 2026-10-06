@@ -158,8 +158,8 @@ The namespaces that come with the binary are `nexis.core`
 `nexis.set`, `nexis.walk`, `nexis.edn`, `nexis.test`,
 `nexis.pprint`, `nexis.math` and `nexis.simd` (typed-vector kernels);
 `clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
-`clojure.test` and `clojure.pprint` are accepted as their names in
-`require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
+`clojure.math`, `clojure.test` and `clojure.pprint` are accepted as
+their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 24 programs that run
 under `zig build examples` (`examples/README.md`).
 
 ## Nextomic
