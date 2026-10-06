@@ -1366,14 +1366,13 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     return try vm.callValue(f, combined.items);
 }
 
-/// `(map f coll & colls)` → eager list of `(f x1 x2 ...)`,
-/// stopping at the shortest collection. Throws inside `f`
-/// propagate via `ControlTransferred`.
+/// `(map f coll & colls)` → the lazy seq of `(f x1 x2 ...)`, ending
+/// at the shortest collection (docs/LAZY.md §7): a chunk of 32 at a
+/// time over one chunked collection, one element at a time otherwise.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
-    var results = Results.init(vm);
-    defer results.release();
-    try mapInto(vm, args[0], args[1..], &results);
-    return results.list();
+    if (args.len == 2) return seq_mod.make(vm, seq_mod.op_map, args[0..2]);
+    const colls = vector_mod.fromSlice(vm.ensureHeap(), args[1..]) catch return VmError.OutOfMemory;
+    return seq_mod.make(vm, seq_mod.op_map_n, &.{ args[0], colls });
 }
 
 /// Add `(f x1 x2 ...)` for every position of the shortest of `colls`
@@ -1534,15 +1533,8 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
     return acc;
 }
 
-/// Shared body of `filter` / `remove` / `keep`.
+/// What `filterv` keeps.
 const Sieve = enum { keep_truthy, keep_falsy, keep_result };
-
-fn sieve(vm: *VM, mode: Sieve, pred: Value, coll: Value) VmError!Value {
-    var results = Results.init(vm);
-    defer results.release();
-    try sieveInto(vm, mode, pred, coll, &results);
-    return results.list();
-}
 
 /// Add what `mode` keeps of `coll` to `results`, which roots each as
 /// it comes. An element the walk built (a map's entry) is rooted as
@@ -1562,19 +1554,19 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results) 
     }
 }
 
-/// `(filter pred coll)` → eager list of x where `(pred x)` is truthy.
+/// `(filter pred coll)` → the lazy seq of x where `(pred x)` is
+/// truthy; `(remove pred coll)` where it is falsy; `(keep f coll)` the
+/// non-nil `(f x)` (docs/LAZY.md §7).
 fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
-    return sieve(vm, .keep_truthy, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_filter, args[0..2]);
 }
 
-/// `(remove pred coll)` → eager list of x where `(pred x)` is falsy.
 fn fnRemove(vm: *VM, args: []const Value) VmError!Value {
-    return sieve(vm, .keep_falsy, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_remove, args[0..2]);
 }
 
-/// `(keep f coll)` → eager list of the non-nil `(f x)` results.
 fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
-    return sieve(vm, .keep_result, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_keep, args[0..2]);
 }
 
 // =============================================================================
@@ -2096,9 +2088,24 @@ fn fnInto(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
 fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
+    // Over several colls, one's lazy step may collect while another's
+    // element waits for the call: a coll whose walk would build its
+    // elements (a map's entries) is walked as its seq, rooted here
+    // before `Results` opens its own scope (GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    const colls = vm.allocator.dupe(Value, args[1..]) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(colls);
+    if (colls.len > 1) for (colls) |*c| switch (c.kind()) {
+        .nil, .list, .lazy_seq, .persistent_vector, .persistent_set, .string => {},
+        else => {
+            c.* = try seq_mod.seqOf(vm, c.*);
+            try scope.push(c.*);
+        },
+    };
     var results = Results.init(vm);
     defer results.release();
-    try mapInto(vm, args[0], args[1..], &results);
+    try mapInto(vm, args[0], colls, &results);
     return results.vector();
 }
 
@@ -2109,27 +2116,14 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
     return results.vector();
 }
 
-/// `(map-indexed f coll)` → `(f i x)`; `(keep-indexed f coll)` →
-/// the non-nil `(f i x)`. Rooting: `Results` (GC.md §11.5, class 3).
-fn indexedMap(vm: *VM, keep_nil: bool, f: Value, coll: Value) VmError!Value {
-    var results = Results.init(vm);
-    defer results.release();
-    var it = try makeSeqIter(vm, coll);
-    var cb = vm_mod.Callback.init(vm, f, 2);
-    var i: i64 = 0;
-    while (try it.next()) |x| : (i += 1) {
-        const r = try cb.call(&.{ value_mod.fromFixnum(i).?, x });
-        if (keep_nil or !r.isNil()) try results.add(r);
-    }
-    return results.list();
-}
-
+/// `(map-indexed f coll)` → the lazy seq of `(f i x)`;
+/// `(keep-indexed f coll)` the non-nil ones (docs/LAZY.md §7).
 fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
-    return indexedMap(vm, true, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_map_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
-    return indexedMap(vm, false, args[0], args[1]);
+    return seq_mod.make(vm, seq_mod.op_keep_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 /// `(distinct coll)` → first occurrences, in order.

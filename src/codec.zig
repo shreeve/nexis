@@ -880,7 +880,7 @@ test "a realized lazy seq encodes byte for byte as the list of its elements; an 
     defer ctx.deinit();
     const items = [_]Value{ value.fromFixnum(1).?, value.fromFixnum(2).?, value.fromFixnum(3).? };
     const as_list = try list_mod.fromSlice(&ctx.heap, &items);
-    const cc = try lazy_mod.chunkedCons(&ctx.heap, try lazy_mod.chunkOf(&ctx.heap, items[1..]), value.nilValue());
+    const cc = try lazy_mod.chunkedOf(&ctx.heap, items[1..], value.nilValue());
     const lz = try lazy_mod.realizedWithMeta(&ctx.heap, try lazy_mod.cons(&ctx.heap, items[0], cc), null);
     const want = try encode(testing.allocator, &ctx.interner, as_list);
     defer testing.allocator.free(want);

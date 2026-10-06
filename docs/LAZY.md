@@ -12,15 +12,14 @@ are. Kind number and tag layout: `docs/VALUE.md` §2.2. Header bits:
 
 A lazy seq is a sequence whose elements are computed when something
 walks it, once, and cached. It is sequential: `=` to, and hashed as,
-the list of its elements, and printed as one. The kind has three user
-shapes and one internal block:
+the list of its elements, and printed as one. The kind has three
+shapes:
 
 - a **lazy block**, Clojure's `LazySeq`: a body that has not run, or
   the seq it ran to;
 - a **cons** cell whose rest may be a lazy seq, Clojure's `Cons`;
-- a **chunked cons** over a chunk of up to 32 elements, Clojure's
-  `ChunkedCons`;
-- the **chunk** a chunked cons reads, never a user value.
+- a **chunked cons**, a chunk of up to 32 elements in front of a rest,
+  Clojure's `ChunkedCons` and its `ArrayChunk` in one block.
 
 `list` stays fully realized: a cons cell of kind `list` always has a
 `list` tail (`docs/LIST.md` §2), so every walker of a list runs no
@@ -38,9 +37,12 @@ bits 1–2; bit 0 stays `has_meta`.
 | Shape | Name | Body | Meaning |
 |---|---|---|---|
 | 0 | lazy | `{ result: Value, op: u16, state: u8, argc: u8, _: u32, _: u64, args: [argc]Value }`, 32 + 16·argc B | `op` 0 is a `lazy-seq` body (`args[0]`, any callable, called with no arguments); every other op is a producer (`src/seq.zig`) whose state is `args`. `state` is 0 unrealized, 1 forwarding (`result` is the lazy block the body returned, §4), 2 realized (`result` is nil or a non-empty seq) |
-| 1 | cons | `{ first: Value, more: Value }`, 32 B | `more` is nil, a list (any subkind) or a lazy seq that is not a chunk |
-| 2 | chunked cons | `{ chunk: Value, more: Value }`, 32 B; the offset into the chunk in tag bits 32..63 | the chunk's elements from the offset on, then `more`. Its `rest` inside the chunk is the same block at the next offset and allocates nothing |
-| 3 | chunk | `{ count: u32, cap: u32, _: u64, items: [cap]Value }` | held by chunked cons cells; never a user Value. A fresh chunk is zero-filled, so unwritten slots are nil |
+| 1 | cons | `{ first: Value, more: Value }`, 32 B | `more` is nil, a list (any subkind) or a lazy seq |
+| 2 | chunked cons | `{ more: Value, count: u32, cap: u32, _: u64, items: [cap]Value }`, 32 + 16·cap B; the offset of its first element in tag bits 32..63 | the chunk's elements from the offset on, then `more`. Its `rest` inside the chunk is the same block at the next offset and allocates nothing. A fresh one is zero-filled, so unwritten slots are nil; a producer fills it in place and closes it with its count and `more` |
+
+Shape 3 is unused. The chunk lives in the chunked cons's own block, as
+a vector's elements live in its leaf: a chunk costs one block and 48
+bytes of header and fields beside its elements.
 
 **The normal form of a realized result** is nil (the empty seq) or a
 non-empty seq: a non-empty list, a cons or a chunked cons. Never an
@@ -62,14 +64,15 @@ again.
 `lazy.trace` walks a chain in a loop, as `list.trace` walks cons
 cells. At each block it marks what the block holds as values (a lazy
 block's producer arguments, a cons's first element, a chunked cons's
-chunk) and marks the next block of the chain (a lazy block's `result`,
+elements, immediates skipped inline as a vector leaf's trace skips
+them) and marks the next block of the chain (a lazy block's `result`,
 a cons's or chunked cons's `more`) itself, through `markInternal`, so
 a chain of a million cells costs no worklist and no recursion
 (`src/gc.zig` "a chain of realized lazy cells"). The walk stops at
 nil, at a list (marked as a value; its own trace walks its cells) or
-at a block already marked. A chunk marks every slot of its capacity:
-a producer filling one in place may be interrupted by a collection,
-and the unwritten slots are nil. A realized or forwarding block holds
+at a block already marked. A chunked cons marks every slot of its
+capacity: a producer filling one in place may be interrupted by a
+collection, and the unwritten slots are nil. A realized or forwarding block holds
 no producer arguments: realizing clears them, so a source the
 producer held is garbage once nothing else holds it.
 
@@ -253,14 +256,35 @@ A step returns a raw result: a new cell whose rest is a fresh
 unrealized block carrying the advanced state, nil, or a block to
 forward to (§4). A step that calls back into the VM keeps what it holds
 in its own block (the seq it took of its source goes back into `args`
-before the first call; the chunk it fills sits in an argument while
-it fills), so a collection inside a call marks everything (`docs/GC.md`
+before the first call; the chunked cons it fills sits in the block's
+result field while it fills, `lazy.setScratch`), so a collection
+inside a call marks everything (`docs/GC.md`
 §11.5, classes 3 and 5).
 
 | Function | Result | Chunked | Notes |
 |---|---|---|---|
 | `range` finite | lazy; `()` when empty | yes, 32 | fixnums computed, the tower for other numbers (`(range 0 1 0.25)`); `(range s e 0)` is `(repeat s)`, `()` when `s` is `e` |
 | `(range)` | lazy, infinite | no, as Clojure's `(iterate inc' 0)` | promotes past the fixnum range |
+| `map` of one coll | lazy | when the source is | |
+| `map` of several colls | lazy | no, as Clojure's | each source's seq taken as the step runs |
+| `filter`, `remove`, `keep` | lazy | when the source is | a chunk that keeps nothing forwards to the next block |
+| `map-indexed`, `keep-indexed` | lazy | when the source is | the index runs in the block |
+
+**Chunked sources** are the seqs that hand out a slice of their
+elements and the seq after them without allocating: a vector's view
+(the leaf from its offset to the leaf's end, the rest the view at the
+next leaf boundary, the same block) and a chunked cons (its chunk from
+its offset, the rest its `more`). The seq of a map, a set or a string
+is a view of a fresh vector once it has four elements, so it is
+chunked where Clojure's is not (§9). The chunked step fills a chunk
+through one prepared `vm.Callback`, as `Results` fills an open tail:
+`(map :score rows)` keeps its in-place lookup and `(map inc xs)` its
+direct leaf call. Per 32 elements it allocates two blocks, the
+chunked cons and the next lazy block; `filter`, `remove`, `keep` and
+`keep-indexed` gather what they keep first (a source element needs no
+root, a result waits on a root scope) and make the chunk its exact
+size. Over an unchunked source, two blocks per element, as Clojure's
+objects.
 
 **Pure producers compute without realizing.** While a block of a
 fixnum `range`, of `(range)` or of `repeat` is unrealized, `reduce`

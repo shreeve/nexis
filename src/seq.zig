@@ -61,6 +61,20 @@ pub const op_range_inf: u16 = 3;
 /// `(repeat x)`: `{x}`. Its seq is one cons cell whose rest is the
 /// block itself, so walking it allocates nothing.
 pub const op_repeat: u16 = 4;
+/// `(map f coll)`: `{f, coll}`, a chunk of 32 where the source is
+/// chunked (§7).
+pub const op_map: u16 = 5;
+/// `(filter pred coll)`, `(remove pred coll)`, `(keep f coll)`:
+/// `{f, coll}`.
+pub const op_filter: u16 = 6;
+pub const op_remove: u16 = 7;
+pub const op_keep: u16 = 8;
+/// `(map-indexed f coll)`, `(keep-indexed f coll)`: `{f, coll, index}`.
+pub const op_map_indexed: u16 = 9;
+pub const op_keep_indexed: u16 = 10;
+/// `(map f c1 c2 ...)`: `{f, [c1 c2 ...]}`, one element at a time, as
+/// Clojure's.
+pub const op_map_n: u16 = 11;
 
 const steps = [_]Step{
     stepThunk,
@@ -68,7 +82,204 @@ const steps = [_]Step{
     stepRangeNum,
     stepRangeInf,
     stepRepeat,
+    stepSieve(.map),
+    stepSieve(.filter),
+    stepSieve(.remove),
+    stepSieve(.keep),
+    stepSieve(.map_indexed),
+    stepSieve(.keep_indexed),
+    stepMapN,
 };
+
+/// What the chunked one-function producers do with each element.
+const Sieve = enum {
+    map,
+    filter,
+    remove,
+    keep,
+    map_indexed,
+    keep_indexed,
+
+    fn op(comptime self: Sieve) u16 {
+        return switch (self) {
+            .map => op_map,
+            .filter => op_filter,
+            .remove => op_remove,
+            .keep => op_keep,
+            .map_indexed => op_map_indexed,
+            .keep_indexed => op_keep_indexed,
+        };
+    }
+
+    fn indexed(comptime self: Sieve) bool {
+        return self == .map_indexed or self == .keep_indexed;
+    }
+};
+
+/// A slice of a chunked seq's elements and the seq after them, read
+/// without allocating: the leaf of a vector view from its offset, or a
+/// chunked cons's chunk from its offset (LAZY.md §7).
+const Chunk = struct { items: []const Value, after: Value };
+
+fn chunkOf(s: Value) ?Chunk {
+    switch (s.kind()) {
+        .list => {
+            const items = list_mod.viewChunk(s) orelse return null;
+            return .{ .items = items, .after = list_mod.drop(s, items.len) };
+        },
+        .lazy_seq => {
+            if (lazy.shapeOf(s) != .chunked) return null;
+            return .{ .items = lazy.chunkRest(s), .after = lazy.more(s) };
+        },
+        else => return null,
+    }
+}
+
+/// The first element of a non-empty seq and the rest after it, as it
+/// stands: nothing is forced and nothing allocated.
+fn firstRest(s: Value) struct { first: Value, rest: Value } {
+    if (s.kind() == .list) return .{ .first = list_mod.head(s), .rest = list_mod.tail(s) };
+    if (lazy.shapeOf(s) == .chunked) {
+        const at = lazy.chunkOffset(s) + 1;
+        const after = if (at < lazy.chunkedCount(s)) lazy.atOffset(s, at) else lazy.more(s);
+        return .{ .first = lazy.first(s), .rest = after };
+    }
+    return .{ .first = lazy.first(s), .rest = lazy.more(s) };
+}
+
+/// The step of `map`, `filter`, `remove`, `keep`, `map-indexed` and
+/// `keep-indexed`. Over a chunked source a whole chunk is done at once,
+/// through one prepared `vm.Callback`, into a chunk this block holds
+/// in its result field while it fills (`lazy.setScratch`), so a cycle
+/// inside a call marks what is written. Over any other source, one element; a filter that keeps
+/// nothing returns the next block, which `force` runs in its stead
+/// (§4), costing no native stack.
+fn stepSieve(comptime mode: Sieve) Step {
+    return &struct {
+        fn step(vm: *VM, lz: Value) VmError!Value {
+            const a = lazy.args(lz);
+            // The source's seq goes back into the block before any call,
+            // which may collect: it is the seq the elements come from.
+            a[1] = try seqOf(vm, a[1]);
+            const s = a[1];
+            if (s.isNil()) return s;
+            const heap = vm.ensureHeap();
+            var cb = vm_mod.Callback.init(vm, a[0], if (comptime mode.indexed()) 2 else 1);
+            var index: i64 = if (comptime mode.indexed()) a[2].asFixnum() else 0;
+            if (chunkOf(s)) |whole| {
+                // A chunk `chunk-cons` made of a longer vector is taken
+                // 32 at a time.
+                const ch: Chunk = if (whole.items.len <= lazy.chunk_size) whole else .{
+                    .items = whole.items[0..lazy.chunk_size],
+                    .after = lazy.atOffset(s, lazy.chunkOffset(s) + lazy.chunk_size),
+                };
+                var buf: [lazy.chunk_size]Value = undefined;
+                const n = switch (comptime mode) {
+                    // Every result is kept: they go straight into the
+                    // chunk, rooted in the block while it fills.
+                    .map, .map_indexed => {
+                        const c = lazy.allocChunked(heap, ch.items.len) catch return VmError.OutOfMemory;
+                        lazy.setScratch(lz, c);
+                        const out = lazy.chunkItems(c);
+                        for (ch.items, out) |x, *slot| slot.* = (try apply(mode, &cb, &index, x)).?;
+                        const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
+                        lazy.finishChunked(c, ch.items.len, following);
+                        return c;
+                    },
+                    // What is kept is a source element, rooted with the
+                    // source: it waits in a buffer, and the chunk is made
+                    // to its size.
+                    .filter, .remove => blk: {
+                        var n: usize = 0;
+                        for (ch.items) |x| if (try apply(mode, &cb, &index, x)) |y| {
+                            buf[n] = y;
+                            n += 1;
+                        };
+                        break :blk n;
+                    },
+                    // What is kept is a result: it waits on a root scope.
+                    .keep, .keep_indexed => blk: {
+                        const scope = vm.rootScope();
+                        defer scope.release();
+                        for (ch.items) |x| if (try apply(mode, &cb, &index, x)) |y| try scope.push(y);
+                        const kept = vm.roots.items[scope.base..];
+                        @memcpy(buf[0..kept.len], kept);
+                        break :blk kept.len;
+                    },
+                };
+                // `Heap.alloc` never collects: the kept values need no
+                // root while the chunk and the next block are made.
+                const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
+                if (n == 0) return following;
+                return lazy.chunkedOf(heap, buf[0..n], following) catch VmError.OutOfMemory;
+            }
+            const fr = firstRest(s);
+            const kept = try apply(mode, &cb, &index, fr.first);
+            // `Heap.alloc` never collects: the kept value needs no root
+            // while the next block is made.
+            const following = try make(vm, mode.op(), &nextArgs(mode, a[0], fr.rest, index));
+            const y = kept orelse return following;
+            return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
+        }
+
+        fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
+            switch (m) {
+                .map => return try cb.call(&.{x}),
+                .filter => return if ((try cb.call(&.{x})).isTruthy()) x else null,
+                .remove => return if ((try cb.call(&.{x})).isTruthy()) null else x,
+                .keep => {
+                    const r = try cb.call(&.{x});
+                    return if (r.isNil()) null else r;
+                },
+                .map_indexed, .keep_indexed => {
+                    const r = try cb.call(&.{ fixnum(index.*), x });
+                    index.* += 1;
+                    return if (m == .keep_indexed and r.isNil()) null else r;
+                },
+            }
+        }
+
+        fn nextArgs(comptime m: Sieve, f: Value, src: Value, index: i64) [if (m.indexed()) 3 else 2]Value {
+            if (comptime m.indexed()) return .{ f, src, fixnum(index) };
+            return .{ f, src };
+        }
+    }.step;
+}
+
+/// `(map f c1 c2 ...)`: the first of every source, or the end at the
+/// first empty one. The seqs wait on a root scope while the others are
+/// forced, since the seq of a map, a set or a string is a list made
+/// here.
+fn stepMapN(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const colls = a[1];
+    const n = vector_mod.count(colls);
+    const scope = vm.rootScope();
+    defer scope.release();
+    for (0..n) |i| {
+        const s = try seqOf(vm, vector_mod.nth(colls, i));
+        if (s.isNil()) return s;
+        try scope.push(s);
+    }
+    const seqs = vm.roots.items[scope.base..][0..n];
+    const firsts = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(firsts);
+    const rests = vm.allocator.alloc(Value, n) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(rests);
+    for (seqs, firsts, rests) |s, *f, *r| {
+        const fr = firstRest(s);
+        f.* = fr.first;
+        r.* = fr.rest;
+    }
+    // The rests reach from the seqs on the scope; the firsts are the
+    // call's arguments.
+    const y = try vm.callValue(a[0], firsts);
+    const heap = vm.ensureHeap();
+    try scope.push(y);
+    const more_colls = vector_mod.fromSlice(heap, rests) catch return VmError.OutOfMemory;
+    const following = try make(vm, op_map_n, &.{ a[0], more_colls });
+    return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
+}
 
 /// `(lazy-seq body...)`: the body's function, called with no arguments.
 fn stepThunk(vm: *VM, lz: Value) VmError!Value {
@@ -92,23 +303,24 @@ fn stepRange(vm: *VM, lz: Value) VmError!Value {
     const n = rangeCount(start, a[1].asFixnum(), step);
     const k: usize = @intCast(@min(n, lazy.chunk_size));
     const heap = vm.ensureHeap();
-    const c = lazy.allocChunk(heap, k) catch return VmError.OutOfMemory;
+    const c = lazy.allocChunked(heap, k) catch return VmError.OutOfMemory;
     var x = start;
     for (lazy.chunkItems(c)[0..k]) |*slot| {
         slot.* = fixnum(x);
         x += step;
     }
-    lazy.setChunkCount(c, k);
-    // `x` is inside the range when elements are left.
+    // `x` is inside the range when elements are left. `Heap.alloc`
+    // never collects: the chunk needs no root while the block is made.
     const more = if (n > k) try make(vm, op_range, &.{ fixnum(x), a[1], a[2] }) else value_mod.nilValue();
-    return lazy.chunkedCons(heap, c, more) catch VmError.OutOfMemory;
+    lazy.finishChunked(c, k, more);
+    return c;
 }
 
 fn stepRangeNum(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);
     const heap = vm.ensureHeap();
     const ascending = (try vm_mod.numSign(a[2])).? == .gt;
-    const c = lazy.allocChunk(heap, lazy.chunk_size) catch return VmError.OutOfMemory;
+    const c = lazy.allocChunked(heap, lazy.chunk_size) catch return VmError.OutOfMemory;
     const items = lazy.chunkItems(c);
     var x = a[0];
     var k: usize = 0;
@@ -118,11 +330,11 @@ fn stepRangeNum(vm: *VM, lz: Value) VmError!Value {
         items[k] = x;
         x = try vm_mod.numAdd(heap, x, a[2]);
     }
-    lazy.setChunkCount(c, k);
     const more_left = try vm_mod.numCompare(if (ascending) .lt else .gt, x, a[1]);
     const more = if (more_left) try make(vm, op_range_num, &.{ x, a[1], a[2] }) else value_mod.nilValue();
     if (k == 0) return more;
-    return lazy.chunkedCons(heap, c, more) catch VmError.OutOfMemory;
+    lazy.finishChunked(c, k, more);
+    return c;
 }
 
 fn stepRangeInf(vm: *VM, lz: Value) VmError!Value {
@@ -225,11 +437,7 @@ pub fn seqOf(vm: *VM, x: Value) VmError!Value {
     switch (x.kind()) {
         .nil => return x,
         .list => return if (list_mod.isEmpty(x)) value_mod.nilValue() else x,
-        .lazy_seq => return switch (lazy.shapeOf(x)) {
-            .lazy => force(vm, x),
-            .cons, .chunked => x,
-            .chunk => VmError.KindMismatch,
-        },
+        .lazy_seq => return if (lazy.shapeOf(x) == .lazy) force(vm, x) else x,
         .persistent_vector => return if (vector_mod.isEmpty(x))
             value_mod.nilValue()
         else
@@ -267,7 +475,7 @@ pub fn rest(vm: *VM, x: Value) VmError!Value {
             .cons => lazy.more(s),
             .chunked => blk: {
                 const at = lazy.chunkOffset(s) + 1;
-                if (at < lazy.chunkCount(lazy.chunkOfCons(s))) return lazy.atOffset(s, at);
+                if (at < lazy.chunkedCount(s)) return lazy.atOffset(s, at);
                 break :blk lazy.more(s);
             },
             else => unreachable,
@@ -538,7 +746,7 @@ pub const SeqIter = struct {
         return .{ .vm = vm, .state = switch (coll.kind()) {
             .nil => .empty,
             .list => if (list_mod.viewCursor(coll)) |c| .{ .vector = c } else .{ .list = list_mod.Cursor.init(coll) },
-            .lazy_seq => if (lazy.shapeOf(coll) == .chunk) return VmError.KindMismatch else .{ .lazy = lazy.Cursor.init(coll) },
+            .lazy_seq => .{ .lazy = lazy.Cursor.init(coll) },
             .persistent_vector => .{ .vector = vector_mod.Cursor.init(coll) },
             .typed_vector => .{ .typed = .{ .v = coll, .idx = 0, .count = typed_vector_mod.count(coll) } },
             .persistent_map => .{ .map = champ_mod.mapIter(coll) },

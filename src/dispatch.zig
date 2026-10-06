@@ -470,7 +470,7 @@ test "a lazy cons over a list and a chunked cons equal the list and hash alike" 
     const want = try list.fromSlice(&heap, &items);
     // (1 . ([2 3] . (4))) behind a realized block.
     const tail = try list.fromSlice(&heap, items[3..]);
-    const cc = try lazy.chunkedCons(&heap, try lazy.chunkOf(&heap, items[1..3]), tail);
+    const cc = try lazy.chunkedOf(&heap, items[1..3], tail);
     const c = try lazy.cons(&heap, fx(1), try lazy.realizedWithMeta(&heap, cc, null));
     try expectSame(c, want);
     try expectSame(c, try vector.fromSlice(&heap, &items));

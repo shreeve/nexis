@@ -479,7 +479,7 @@ test "a chunked cons prints its offset onward; an unrealized block prints as ...
             return value_mod.fromFixnum(n).?;
         }
     }.f;
-    const cc = try lazy_mod.chunkedCons(&heap, try lazy_mod.chunkOf(&heap, &.{ fx(1), fx(2), fx(3) }), try list_mod.fromSlice(&heap, &.{fx(4)}));
+    const cc = try lazy_mod.chunkedOf(&heap, &.{ fx(1), fx(2), fx(3) }, try list_mod.fromSlice(&heap, &.{fx(4)}));
     const pending = try lazy_mod.unrealized(&heap, 0, &.{value_mod.nilValue()});
     const cases = [_]struct { v: Value, expect: []const u8 }{
         .{ .v = cc, .expect = "(1 2 3 4)" },

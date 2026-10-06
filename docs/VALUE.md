@@ -106,7 +106,7 @@ three db handles) the payload is a 16-byte-aligned `*HeapHeader`
 | 40 | `nextomic_entity` | Nextomic lazy entity (`docs/NEXTOMIC.md` §6) | The db-value box, the eid and the map of its last full read |
 | 41 | `sorted_map` | Sorted map: a weight-balanced tree in its comparator's order (`docs/SORTED.md`) | 0 = root: the comparator and the tree. Tree nodes are blocks of this kind that no Value points at (`docs/SORTED.md` §2) |
 | 42 | `sorted_set` | Sorted set, laid out as the sorted map without values | As for the sorted map |
-| 43 | `lazy_seq` | Lazy seq (`docs/LAZY.md`) | 0 = lazy block (unrealized, forwarding or realized), 1 = cons cell whose rest may be lazy, 2 = chunked cons: the body is the chunk and the rest, the offset is in tag bits 32..63. Chunks are blocks of this kind (shape 3) that no user Value points at |
+| 43 | `lazy_seq` | Lazy seq (`docs/LAZY.md`) | 0 = lazy block (unrealized, forwarding or realized), 1 = cons cell whose rest may be lazy, 2 = chunked cons: the body is the rest and the chunk's elements, the offset is in tag bits 32..63 |
 
 The equality category and hash domain of every kind are SEMANTICS
 §3.3; what each block's trace walks is `docs/GC.md` §5; which kinds

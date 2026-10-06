@@ -984,14 +984,14 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(defn g [a b & r] a) (g 1)", .err = vm.VmError.ArityMismatch, .detail = "g takes at least 2 arguments, got 1" },
         .{ .src = "(first 1 2)", .err = vm.VmError.ArityMismatch, .detail = "first takes 1 argument, got 2" },
         .{ .src = "(mapv (fn [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 2 arguments, got 1" },
-        .{ .src = "(map (fn f [a b] a) [1])", .err = vm.VmError.ArityMismatch, .detail = "f takes 2 arguments, got 1" },
-        .{ .src = "(filter (fn [] true) [1])", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
+        .{ .src = "(doall (map (fn f [a b] a) [1]))", .err = vm.VmError.ArityMismatch, .detail = "f takes 2 arguments, got 1" },
+        .{ .src = "(doall (filter (fn [] true) [1]))", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
         .{ .src = "(reduce inc [1 2])", .err = vm.VmError.ArityMismatch, .detail = "inc takes 1 argument, got 2" },
         .{ .src = "(reduce (fn h [a] a) 0 [1])", .err = vm.VmError.ArityMismatch, .detail = "h takes 1 argument, got 2" },
-        .{ .src = "(filter 5 [1])", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
+        .{ .src = "(doall (filter 5 [1]))", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
         .{ .src = "(reduce + [1 \"a\"])", .err = vm.VmError.KindMismatch, .detail = "" },
         .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
-        .{ .src = "(map \"s\" [1])", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
+        .{ .src = "(doall (map \"s\" [1]))", .err = vm.VmError.NotCallable, .detail = "a string is not callable" },
         .{ .src = "(+ 1 \"a\")", .err = vm.VmError.KindMismatch, .detail = "+ expects numbers, got a string" },
         .{ .src = "(< nil 1)", .err = vm.VmError.KindMismatch, .detail = "< expects numbers, got nil" },
         .{ .src = "(defprotocol P (m [x])) (m 1)", .err = vm.VmError.NoProtocolImpl, .detail = "no impl of m for an integer" },
@@ -2237,6 +2237,45 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
     try expectOutput("(take 2 (drop 140737488355326 (range 140737488355320 140737488355330)))", "()");
 }
 
+test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
+    // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (range 100))) @n)", "32");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (apply list (range 100)))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (map (fn [x y] (swap! n inc) x) (range 100) (range 100))) @n)", "1");
+    try expectOutput("(let [n (atom 0)] (first (filter (fn [x] (swap! n inc) (> x 40)) (range 100))) @n)", "64");
+    try expectOutput("(let [n (atom 0)] (first (map-indexed (fn [i x] (swap! n inc) x) (vec (range 50)))) @n)", "32");
+    try expectOutput("[(list? (map inc [1])) (seq? (map inc [1])) (class (filter odd? [1])) (realized? (map inc [1])) (let [s (map inc [1])] (first s) (realized? s))]", "[false true :lazy_seq false true]");
+    try expectOutput("[(take 3 (map inc (range))) (first (filter #(> % 1000) (range))) (take 2 (keep #(when (odd? %) %) (range))) (take 2 (remove even? (range))) (take 3 (map-indexed vector (range 10 20))) (take 2 (keep-indexed #(when (odd? %1) %2) (range 10 20)))]", "[(1 2 3) 1001 (1 3) (1 3) ([0 10] [1 11] [2 12]) (11 13)]");
+    try expectOutput("[(map + [1 2] [10 20 30]) (map str \"ab\" [1 2]) (map vector {:a 1} [2]) (map inc #{1}) (map inc nil) (filter odd? nil) (map list [1 2] (range))]", "[(11 22) (a1 b2) ([[:a 1] 2]) (2) () () ((1 0) (2 1))]");
+    // A filter skipping a long run of an unchunked source forwards
+    // from block to block in one loop: no native stack.
+    try expectOutput("(first (filter #(> % 100000) (range)))", "100001");
+    // A function's throw surfaces where the seq is walked.
+    try expectOutput("(let [s (map (fn [x] (throw :m)) [1])] [(realized? s) (try (doall s) (catch any e e)) (realized? s)])", "[false :m false]");
+}
+
+test "gc: a realized map block lets its source go; an abandoned one keeps it until dropped" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const heap = program.v.ensureHeap();
+    _ = try program.run("(def v (vec (range 100000)))");
+    program.v.collectGarbage();
+    _ = try program.run("(def m (doall (map inc v)))");
+    program.v.collectGarbage();
+    const with_source = heap.liveCount();
+    _ = try program.run("(def v nil)");
+    program.v.collectGarbage();
+    // The vector's leaves and nodes: nothing of the realized map holds them.
+    try testing.expect(with_source - heap.liveCount() > 3000);
+    _ = try program.run("(def v (vec (range 100000))) (def h (map inc v)) (first h) (def v nil)");
+    program.v.collectGarbage();
+    const held = heap.liveCount();
+    _ = try program.run("(def h nil)");
+    program.v.collectGarbage();
+    try testing.expect(held - heap.liveCount() > 3000);
+}
+
 test "lazy: reduce over an unrealized range allocates nothing" {
     var program: Program = undefined;
     try program.init();
@@ -2364,12 +2403,12 @@ test "integration: map (eager) on list + vector" {
 test "integration: a built sequence is a list to every consumer, whatever its length" {
     // LIST.md §1: four or more results are a vector's view, fewer
     // are cons cells; nothing tells them apart.
-    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[true true true]");
+    try expectOutput("[(list? (map inc (range 9))) (seq? (filter odd? (range 9))) (list? (map inc [1 2]))]", "[false true false]");
     try expectOutput("(map inc (range 6))", "(1 2 3 4 5 6)");
     try expectOutput("(keep (fn [x] (when (odd? x) (str x x))) (range 9))", "(11 33 55 77)");
     try expectOutput("[(= (map inc (range 5)) '(1 2 3 4 5)) (= (hash (map inc (range 5))) (hash '(1 2 3 4 5))) (= (remove odd? (range 10)) [0 2 4 6 8])]", "[true true true]");
     try expectOutput("[(conj (map inc (range 5)) 0) (cons :a (filter even? (range 10))) (rest (map inc (range 5))) (next (map inc (range 1)))]", "[(0 1 2 3 4 5) (:a 0 2 4 6 8) (2 3 4 5) nil]");
-    try expectOutput("[(peek (map inc (range 5))) (pop (map inc (range 5))) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[1 (2 3 4 5) 8 7 99999]");
+    try expectOutput("[(try (peek (map inc (range 5))) (catch any e e)) (try (pop (map inc (range 5))) (catch any e e)) (nth (map inc (range 10)) 7) (count (map-indexed vector (range 7))) (last (range 100000))]", "[:kind-mismatch :kind-mismatch 8 7 99999]");
     try expectOutput("[(meta (with-meta (filter odd? (range 9)) {:a 1})) (meta (map inc (range 9))) (with-meta (map inc (range 5)) {:b 2})]", "[{:a 1} nil (1 2 3 4 5)]");
     try expectOutput("[(map inc []) (filter odd? [2 4 6 8]) (seq (map inc [])) (empty? (remove any? (range 5)))]", "[() () nil true]");
     try expectOutput("(let [xs (map inc (range 5))] {xs :v (vec xs) :w})", "{(1 2 3 4 5) :w}");
@@ -2407,7 +2446,7 @@ test "integration: reduce with user lambda" {
 
 test "integration: throw inside map propagates to outer catch" {
     try expectOutput(
-        \\(try (map (fn* [x] (throw :boom)) [1 2 3])
+        \\(try (doall (map (fn* [x] (throw :boom)) [1 2 3]))
         \\     (catch any e e))
     , ":boom");
 }
@@ -5130,7 +5169,7 @@ test "map, filter and reduce call their function once per element as a call in p
     // (VM.md §6, "Repeated calls").
     try expectOutput("(let [n 10] [(map (fn [x] (+ x n)) [1 2 3]) (filter (fn [x] (> x n)) [5 15 25]) (reduce (fn [a x] (+ a x n)) 0 [1 2])])", "[(11 12 13) (15 25) 23]");
     try expectOutput("[(map (fn [& xs] xs) [1 2]) (map (fn [x & more] [x more]) [1]) (reduce (fn [& xs] (vec xs)) [1 2 3])]", "[((1) (2)) ([1 nil]) [[1 2] 3]]");
-    try expectOutput("[(try (map (fn [x] (throw x)) [1 2]) (catch any e [:caught e])) (map (fn [x] (try (throw x) (catch any e (* e 10)))) [1 2 3])]", "[[:caught 1] (10 20 30)]");
+    try expectOutput("[(try (doall (map (fn [x] (throw x)) [1 2])) (catch any e [:caught e])) (map (fn [x] (try (throw x) (catch any e (* e 10)))) [1 2 3])]", "[[:caught 1] (10 20 30)]");
     try expectOutput("[(try (reduce (fn [a x] (if (= x 3) (throw [:at a]) (+ a x))) [1 2 3 4]) (catch any e e)) (filter (fn [x] (try (odd? x) (catch any e false))) [1 2 :a 3])]", "[[:at 3] (1 3)]");
     try expectOutput("(map (fn [xs] (reduce + (map inc (filter odd? xs)))) [[1 2 3] [] [5]])", "(6 0 6)");
     try expectOutput("(do (defn walk [n] (if (zero? n) 0 (reduce + (map (fn [_] (walk (dec n))) [1 2])))) (walk 10))", "0");
@@ -5562,14 +5601,7 @@ fn expectThrowingOutput(src: []const u8, expected: []const u8) !void {
     var program: Program = undefined;
     try throwingProgram(&program);
     defer program.deinit();
-    const result = try program.run(src);
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, try program.run(src), expected);
 }
 
 test "native throw: caught by the innermost handler wherever the native runs" {
@@ -5578,7 +5610,7 @@ test "native throw: caught by the innermost handler wherever the native runs" {
     try expectThrowingOutput("(try (boom-with 42) (catch any e (inc e)))", "43");
     // Through a closure, a higher-order native, apply and nesting.
     try expectThrowingOutput("(try ((fn [] (boom))) (catch any e e))", ":boom");
-    try expectThrowingOutput("(try (map (fn [x] (boom-with x)) [1 2]) (catch any e e))", "1");
+    try expectThrowingOutput("(try (doall (map (fn [x] (boom-with x)) [1 2])) (catch any e e))", "1");
     try expectThrowingOutput("(try (reduce (fn [a x] (if (= x 3) (boom-with a) (+ a x))) 0 [1 2 3 4]) (catch any e e))", "3");
     try expectThrowingOutput("(try (apply boom []) (catch any e e))", ":boom");
     try expectThrowingOutput("(try (try (boom) (catch any e (boom-with [:again e]))) (catch any e e))", "[:again :boom]");
@@ -5614,13 +5646,7 @@ fn expectCheckedOutput(src: []const u8, expected: []const u8) !void {
         std.debug.print("\n  source: {s}\n  error: {s} at {?}\n", .{ src, @errorName(err), span });
         return err;
     };
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(testing.allocator);
-    try formatValue(&buf, result, program.interner);
-    testing.expectEqualStrings(expected, buf.items) catch |err| {
-        std.debug.print("\n  source:   {s}\n  expected: {s}\n  actual:   {s}\n", .{ src, expected, buf.items });
-        return err;
-    };
+    try harness.expectResult(&program, src, result, expected);
 }
 
 /// The program must fail to compile with `UnresolvedSymbol`, and the
@@ -6287,10 +6313,10 @@ test "runtime errors: a closure called back from a native is the frame named fn"
     var program: Program = undefined;
     try program.init();
     defer program.deinit();
-    const info = vm.SourceInfo{ .path = "t.nx", .text = "(map (fn [x] (/ 1 x)) [1 0])" };
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(mapv (fn [x] (/ 1 x)) [1 0])" };
     try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
-    try expectFrame(&program, &info, 0, "fn", 1, 14, "(/ 1 x)");
-    try expectFrame(&program, &info, 1, "<top>", 1, 1, "(map (fn [x] (/ 1 x)) [1 0])");
+    try expectFrame(&program, &info, 0, "fn", 1, 15, "(/ 1 x)");
+    try expectFrame(&program, &info, 1, "<top>", 1, 1, "(mapv (fn [x] (/ 1 x)) [1 0])");
 }
 
 /// Compile one form of `src` into a routine the caller owns, the

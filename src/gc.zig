@@ -550,7 +550,7 @@ test "collect: a chain of realized lazy cells survives a cycle and an unreachabl
     // and a list at the end.
     const n = 1_000_000;
     var s = try list.fromSlice(&heap, &.{value.fromFixnum(n).?});
-    s = try lazy.chunkedCons(&heap, try lazy.chunkOf(&heap, &.{ value.fromFixnum(n - 2).?, value.fromFixnum(n - 1).? }), s);
+    s = try lazy.chunkedOf(&heap, &.{ value.fromFixnum(n - 2).?, value.fromFixnum(n - 1).? }, s);
     var i: i64 = n - 2;
     while (i > 0) {
         i -= 1;
