@@ -32,15 +32,15 @@ a view; the cursor walks the vector's leaves directly
 (`vector.Cursor.initAt`).
 
 **Built sequences.** The eager sequence natives (`map`, `filter`,
-`remove`, `keep`, `map-indexed`, `range`, `concat`, `take`, `seq` of a
+`remove`, `keep`, `map-indexed`, `concat`, `take`, `seq` of a
 map or set, and the rest that build a fresh list) gather their
 results and return, through `list.build`, for four or more
 (`list.view_min`), a vector of them and its view at offset 0: a root, a tail and
 one block per 32 elements instead of a cons cell per element, and an
 O(1) `count`. Fewer than four are cons cells, fewer blocks than a
 vector's root, tail and view. `list` always builds cons cells.
-`map`, `filter`, `remove`, `keep`, `map-indexed`, `keep-indexed` and
-`range`, and `mapv` and `filterv`, build the vector as they go
+`map`, `filter`, `remove`, `keep`, `map-indexed` and `keep-indexed`,
+and `mapv` and `filterv`, build the vector as they go
 (`stdlib.zig` `Results`): the 33rd result makes the first 32 a
 transient vector (`docs/TRANSIENT.md` §1), and each later one is
 written into the vector's open tail (`docs/VECTOR.md` §5,

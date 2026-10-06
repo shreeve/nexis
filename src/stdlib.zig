@@ -240,7 +240,7 @@ const core_natives = table("", .{
     .{ "keep", 2, 2, &fnKeep },
     .{ "seq", 1, 1, &fnSeq },
     .{ "next", 1, 1, &fnNext },
-    .{ "range", 1, 3, &fnRange },
+    .{ "range", 0, 3, &fnRange },
     .{ "concat", 0, null, &fnConcat },
     .{ "mapcat", 2, null, &fnMapcat },
     .{ "into", 0, 2, &fnInto },
@@ -775,6 +775,7 @@ fn fnNth(vm: *VM, args: []const Value) VmError!Value {
 fn fnNthGeneral(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     if (coll.kind() != .lazy_seq) return fnNth(vm, args);
+    // `seq.nthOf` computes an unrealized range's element.
     if (args[1].kind() != .fixnum) return VmError.KindMismatch;
     const has_default = args.len > 2;
     const idx = args[1].asFixnum();
@@ -1405,6 +1406,7 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
 fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
+    if (seq_mod.pureOf(coll)) |p| return reducePure(vm, f, if (args.len == 3) args[1] else null, p);
     var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     var cb = vm_mod.Callback.init(vm, f, 2);
@@ -1420,6 +1422,60 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
         vm.roots.items[scope.base] = acc;
     }
     return acc;
+}
+
+/// `reduce` over an unrealized range or repeat, computing the
+/// elements instead of realizing them (docs/LAZY.md §7): nothing is
+/// allocated but what `f` allocates, and nothing is cached. Such a seq
+/// is never empty. The accumulator waits in a root slot between calls,
+/// as `fnReduce`'s.
+fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
+    var cb = vm_mod.Callback.init(vm, f, 2);
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(value_mod.nilValue());
+    const heap = vm.ensureHeap();
+    switch (p) {
+        .range => |r| {
+            const n = seq_mod.rangeCount(r.start, r.end, r.step);
+            var x = r.start;
+            var acc = init orelse blk: {
+                x += r.step;
+                break :blk value_mod.fromFixnum(r.start).?;
+            };
+            var i: u64 = if (init == null) 1 else 0;
+            while (i < n) : ({
+                i += 1;
+                x += r.step;
+            }) {
+                vm.roots.items[scope.base] = acc;
+                acc = try cb.call(&.{ acc, value_mod.fromFixnum(x).? });
+                if (isReduced(vm, acc)) return reducedValue(acc);
+            }
+            return acc;
+        },
+        .range_inf => |start| {
+            var x = start;
+            var acc = init orelse blk: {
+                x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
+                break :blk start;
+            };
+            while (true) {
+                vm.roots.items[scope.base] = acc;
+                acc = try cb.call(&.{ acc, x });
+                if (isReduced(vm, acc)) return reducedValue(acc);
+                x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
+            }
+        },
+        .repeat => |x| {
+            var acc = init orelse x;
+            while (true) {
+                vm.roots.items[scope.base] = acc;
+                acc = try cb.call(&.{ acc, x });
+                if (isReduced(vm, acc)) return reducedValue(acc);
+            }
+        },
+    }
 }
 
 /// `(reduced x)` → a value `reduce` returns at once, unwrapped;
@@ -1950,42 +2006,35 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
 // with `buildListFromSlice`; vector-producing variants (`mapv`,
 // `filterv`, `vec`) go through `vector_mod.fromSlice`.
 
-/// `(range end)` / `(range start end)` / `(range start end step)`
-/// → the list start, start+step, ... up to but not including end.
-/// Any number works; the elements follow the tower's contagion
-/// (`(range 0 1 0.25)` is `(0 0.25 0.5 0.75)`, `(range 3.0)` is
-/// `(0 1 2)`). A zero step is `:invalid-argument` (there is no
-/// infinite sequence to return).
+/// `(range)` / `(range end)` / `(range start end)` / `(range start
+/// end step)` → the lazy seq start, start+step, ... up to but not
+/// including end (docs/LAZY.md §7): `(range)` counts from 0 for ever,
+/// one element at a time; a finite range realizes 32 at a time, and
+/// is `()` when empty. Any number works; the elements follow the
+/// tower's contagion (`(range 0 1 0.25)` is `(0 0.25 0.5 0.75)`,
+/// `(range 3.0)` is `(0 1 2)`). A zero step repeats `start` for ever,
+/// `()` when `start` is `end`, as Clojure's.
 fn fnRange(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 0) return seq_mod.make(vm, seq_mod.op_range_inf, &.{value_mod.fromFixnum(0).?});
     for (args) |a| if (a.kind() != .fixnum) return rangeNumbers(vm, args);
     const start: i64 = if (args.len == 1) 0 else try requireFixnum(args[0]);
     const end: i64 = try requireFixnum(args[if (args.len == 1) 0 else 1]);
     const step: i64 = if (args.len == 3) try requireFixnum(args[2]) else 1;
-    if (step == 0) return VmError.InvalidArgument;
-    var results = Results.init(vm);
-    defer results.release();
-    var i = start;
-    while (if (step > 0) i < end else i > end) : (i += step) {
-        try results.add(value_mod.fromFixnum(i) orelse return VmError.ArithmeticOverflow);
-    }
-    return results.list();
+    if (step == 0) return if (start == end) list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory else seq_mod.make(vm, seq_mod.op_repeat, args[0..1]);
+    return seq_mod.makeRange(vm, start, end, step);
 }
 
 /// `range` over any numbers, through the tower.
 fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
     const start = if (args.len == 1) value_mod.fromFixnum(0).? else try requireNumber(args[0]);
     const end = try requireNumber(args[if (args.len == 1) 0 else 1]);
     const step = if (args.len == 3) try requireNumber(args[2]) else value_mod.fromFixnum(1).?;
     const sign = (try vm_mod.numSign(step)) orelse return VmError.InvalidArgument;
-    if (sign == .eq) return VmError.InvalidArgument;
-    var results = Results.init(vm);
-    defer results.release();
-    var x = start;
-    while (try vm_mod.numCompare(if (sign == .gt) .lt else .gt, x, end)) : (x = try vm_mod.numAdd(heap, x, step)) {
-        try results.add(x);
-    }
-    return results.list();
+    const empty = list_mod.empty(vm.ensureHeap()) catch return VmError.OutOfMemory;
+    if (try vm_mod.numCompare(.eq, start, end)) return empty;
+    if (sign == .eq) return seq_mod.make(vm, seq_mod.op_repeat, &.{start});
+    if (!try vm_mod.numCompare(if (sign == .gt) .lt else .gt, start, end)) return empty;
+    return seq_mod.make(vm, seq_mod.op_range_num, &.{ start, end, step });
 }
 
 /// `(concat & colls)` → one list of every element in order.
@@ -2298,6 +2347,17 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
         // Clojure's loop: `rest` while the seq is not empty, so what
         // is left is not realized.
         .lazy_seq => {
+            // An unrealized range drops arithmetically, as Clojure's
+            // `IDrop` range does.
+            if (seq_mod.pureOf(args[0])) |p| switch (p) {
+                .range => |r| {
+                    const left = seq_mod.rangeCount(r.start, r.end, r.step);
+                    if (count >= left) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+                    return seq_mod.makeRange(vm, r.start + @as(i64, @intCast(count)) * r.step, r.end, r.step);
+                },
+                .repeat => return args[0],
+                .range_inf => {},
+            };
             var xs = args[0];
             for (0..count) |_| {
                 if ((try seq_mod.seqOf(vm, xs)).isNil()) break;
@@ -5291,6 +5351,20 @@ fn collectSeq(vm: *VM, coll: Value) VmError!std.ArrayList(Value) {
 /// Append every element of `seq` to `out`. Used by `apply` to
 /// splice the trailing seq into the args list.
 fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void {
+    if (seq_mod.pureOf(seq)) |p| switch (p) {
+        // A finite range's elements, computed: nothing is realized.
+        .range => |r| {
+            const n: usize = @intCast(seq_mod.rangeCount(r.start, r.end, r.step));
+            out.ensureUnusedCapacity(vm.allocator, n) catch return VmError.OutOfMemory;
+            var x = r.start;
+            for (0..n) |_| {
+                out.appendAssumeCapacity(value_mod.fromFixnum(x).?);
+                x += r.step;
+            }
+            return;
+        },
+        else => {},
+    };
     var it = try makeSeqIter(vm, seq);
     while (try it.next()) |e| {
         out.append(vm.allocator, e) catch return VmError.OutOfMemory;

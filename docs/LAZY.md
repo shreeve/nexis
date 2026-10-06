@@ -244,6 +244,38 @@ the other kind predicates, and `realized?`.
 
 ---
 
+### 7. Producers
+
+A producer is a Zig step function selected by a lazy block's `op`
+(`src/seq.zig`), whose state is the block's `args`: `force` runs it as
+it runs a `lazy-seq` body, with no closure and no bytecode in between.
+A step returns a raw result: a new cell whose rest is a fresh
+unrealized block carrying the advanced state, nil, or a block to
+forward to (§4). A step that calls back into the VM keeps what it holds
+in its own block (the seq it took of its source goes back into `args`
+before the first call; the chunk it fills sits in an argument while
+it fills), so a collection inside a call marks everything (`docs/GC.md`
+§11.5, classes 3 and 5).
+
+| Function | Result | Chunked | Notes |
+|---|---|---|---|
+| `range` finite | lazy; `()` when empty | yes, 32 | fixnums computed, the tower for other numbers (`(range 0 1 0.25)`); `(range s e 0)` is `(repeat s)`, `()` when `s` is `e` |
+| `(range)` | lazy, infinite | no, as Clojure's `(iterate inc' 0)` | promotes past the fixnum range |
+
+**Pure producers compute without realizing.** While a block of a
+fixnum `range`, of `(range)` or of `repeat` is unrealized, `reduce`
+runs over the elements it would hold, calling the function with no
+allocation and caching nothing (`LongRange.reduce`, `Repeat.reduce`);
+`count` of a range is its arithmetic count, `nth` its arithmetic
+element, `drop` and `nthrest` a new range from the index, and the
+eager gatherers (`vec`, `into`, `set`, `sort`, `apply`, ...) take its
+elements without making a cell. `(reduce + (range 100000000))`
+allocates nothing, and `(count (range 1e12))` is O(1). Recomputing is
+invisible: a range's elements are numbers. A range that has been
+walked is a realized chain, walked as any other.
+
+---
+
 ### 8. Printing, storage and the codec
 
 **Printing.** The printer (`src/format.zig`) runs no code: a block

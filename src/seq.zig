@@ -48,15 +48,121 @@ pub var entity_map: ?*const fn (vm: *VM, ent: Value) VmError!Value = null;
 /// block's `args`.
 const Step = *const fn (vm: *VM, lz: Value) VmError!Value;
 
+/// The producers (LAZY.md §7), indexed by a block's `op`.
 pub const op_thunk: u16 = 0;
+/// A finite range of fixnums, a chunk of 32 at a time: `{start, end, step}`.
+pub const op_range: u16 = 1;
+/// A finite range over the numeric tower, a chunk of 32 at a time:
+/// `{start, end, step}`.
+pub const op_range_num: u16 = 2;
+/// `(range)`, one element at a time, as Clojure's `(iterate inc' 0)`:
+/// `{n}`.
+pub const op_range_inf: u16 = 3;
+/// `(repeat x)`: `{x}`. Its seq is one cons cell whose rest is the
+/// block itself, so walking it allocates nothing.
+pub const op_repeat: u16 = 4;
 
 const steps = [_]Step{
     stepThunk,
+    stepRange,
+    stepRangeNum,
+    stepRangeInf,
+    stepRepeat,
 };
 
 /// `(lazy-seq body...)`: the body's function, called with no arguments.
 fn stepThunk(vm: *VM, lz: Value) VmError!Value {
     return vm.callValue(lazy.args(lz)[0], &.{});
+}
+
+/// How many fixnums `(range start end step)` holds; `step` is not 0.
+pub fn rangeCount(start: i64, end: i64, step: i64) u64 {
+    if (step > 0) return if (start >= end) 0 else @intCast(@divFloor(end - start - 1, step) + 1);
+    return if (start <= end) 0 else @intCast(@divFloor(start - end - 1, -step) + 1);
+}
+
+fn fixnum(n: i64) Value {
+    return value_mod.fromFixnum(n).?;
+}
+
+fn stepRange(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const start = a[0].asFixnum();
+    const step = a[2].asFixnum();
+    const n = rangeCount(start, a[1].asFixnum(), step);
+    const k: usize = @intCast(@min(n, lazy.chunk_size));
+    const heap = vm.ensureHeap();
+    const c = lazy.allocChunk(heap, k) catch return VmError.OutOfMemory;
+    var x = start;
+    for (lazy.chunkItems(c)[0..k]) |*slot| {
+        slot.* = fixnum(x);
+        x += step;
+    }
+    lazy.setChunkCount(c, k);
+    // `x` is inside the range when elements are left.
+    const more = if (n > k) try make(vm, op_range, &.{ fixnum(x), a[1], a[2] }) else value_mod.nilValue();
+    return lazy.chunkedCons(heap, c, more) catch VmError.OutOfMemory;
+}
+
+fn stepRangeNum(vm: *VM, lz: Value) VmError!Value {
+    const a = lazy.args(lz);
+    const heap = vm.ensureHeap();
+    const ascending = (try vm_mod.numSign(a[2])).? == .gt;
+    const c = lazy.allocChunk(heap, lazy.chunk_size) catch return VmError.OutOfMemory;
+    const items = lazy.chunkItems(c);
+    var x = a[0];
+    var k: usize = 0;
+    // Nothing here runs code, and `Heap.alloc` never collects: the
+    // elements need no root while the chunk fills.
+    while (k < items.len and try vm_mod.numCompare(if (ascending) .lt else .gt, x, a[1])) : (k += 1) {
+        items[k] = x;
+        x = try vm_mod.numAdd(heap, x, a[2]);
+    }
+    lazy.setChunkCount(c, k);
+    const more_left = try vm_mod.numCompare(if (ascending) .lt else .gt, x, a[1]);
+    const more = if (more_left) try make(vm, op_range_num, &.{ x, a[1], a[2] }) else value_mod.nilValue();
+    if (k == 0) return more;
+    return lazy.chunkedCons(heap, c, more) catch VmError.OutOfMemory;
+}
+
+fn stepRangeInf(vm: *VM, lz: Value) VmError!Value {
+    const n = lazy.args(lz)[0];
+    const heap = vm.ensureHeap();
+    const more = try make(vm, op_range_inf, &.{try vm_mod.numAdd(heap, n, fixnum(1))});
+    return lazy.cons(heap, n, more) catch VmError.OutOfMemory;
+}
+
+fn stepRepeat(vm: *VM, lz: Value) VmError!Value {
+    return lazy.cons(vm.ensureHeap(), lazy.args(lz)[0], lz) catch VmError.OutOfMemory;
+}
+
+/// What an unrealized block of a pure producer computes, read without
+/// realizing it: `reduce`, `count`, `nth`, `drop` and the eager
+/// gatherers compute over it directly, allocating and caching nothing,
+/// as Clojure's `LongRange`, `Repeat` and `Iterate` reduce (LAZY.md
+/// §7). Null for anything else.
+pub const Pure = union(enum) {
+    range: struct { start: i64, end: i64, step: i64 },
+    range_inf: Value,
+    repeat: Value,
+};
+
+pub fn pureOf(coll: Value) ?Pure {
+    if (coll.kind() != .lazy_seq or lazy.shapeOf(coll) != .lazy or lazy.state(coll) != .unrealized) return null;
+    const a = lazy.args(coll);
+    return switch (lazy.op(coll)) {
+        op_range => .{ .range = .{ .start = a[0].asFixnum(), .end = a[1].asFixnum(), .step = a[2].asFixnum() } },
+        op_range_inf => .{ .range_inf = a[0] },
+        op_repeat => .{ .repeat = a[0] },
+        else => null,
+    };
+}
+
+/// The fixnum range from `start` by `step` up to `end`: `()` when it
+/// is empty, else an unrealized block.
+pub fn makeRange(vm: *VM, start: i64, end: i64, step: i64) VmError!Value {
+    if (rangeCount(start, end, step) == 0) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
+    return make(vm, op_range, &.{ fixnum(start), fixnum(end), fixnum(step) });
 }
 
 /// A new unrealized block running producer `op` over `args`.
@@ -178,6 +284,10 @@ pub fn next(vm: *VM, x: Value) VmError!Value {
 
 /// How many elements `x` has, walking (and realizing) it.
 pub fn countOf(vm: *VM, x: Value) VmError!usize {
+    if (pureOf(x)) |p| switch (p) {
+        .range => |r| return @intCast(rangeCount(r.start, r.end, r.step)),
+        else => {},
+    };
     var it = try SeqIter.init(vm, x);
     var n: usize = 0;
     while (try it.next()) |_| n += 1;
@@ -186,6 +296,11 @@ pub fn countOf(vm: *VM, x: Value) VmError!usize {
 
 /// The element at `i` of a seq, or null past its end.
 pub fn nthOf(vm: *VM, x: Value, i: usize) VmError!?Value {
+    if (pureOf(x)) |p| switch (p) {
+        .range => |r| return if (i < rangeCount(r.start, r.end, r.step)) fixnum(r.start + @as(i64, @intCast(i)) * r.step) else null,
+        .repeat => |v| return v,
+        else => {},
+    };
     var it = try SeqIter.init(vm, x);
     for (0..i) |_| _ = (try it.next()) orelse return null;
     return it.next();

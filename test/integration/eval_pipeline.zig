@@ -2227,6 +2227,28 @@ test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
     try expectOutput("(try (let [xs (lazy-seq (throw :splice))] `(a ~@xs)) (catch any e e))", ":splice");
 }
 
+test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, reduces, indexes and drops without realizing" {
+    try expectOutput("[(realized? (range 10)) (take 3 (range)) (take 3 (range 0 10 0)) (range 3 3 0) (count (range 1000000000000)) (reduce + (range 1000000)) (nth (range 10 100) 5) (drop 3 (range 6))]", "[false (0 1 2) (0 0 0) () 1000000000000 499999500000 15 (3 4 5)]");
+    try expectOutput("[(range 0) (class (range 0)) (seq (range 5 5)) (range 5 0 -2) (count (range 0 10 3)) (count (range 10 0 -3)) (nth (range 5) 7 :x) (try (nth (range 5) 7) (catch any e e)) (vec (range 3)) (into #{} (range 3)) (range 0 1 0.25) (range 3.0) (take 2 (range 1.5 1.5 0))]", "[() :list nil (5 3 1) 4 4 :x :index-out-of-bounds [0 1 2] #{0 1 2} (0 0.25 0.5 0.75) (0 1 2) ()]");
+    try expectOutput("[(reduce (fn [a x] (if (> x 10) (reduced a) (+ a x))) (range)) (reduce (fn [a x] (if (> a 10) (reduced a) (+ a x))) (range 1 2 0)) (reduce + 100 (range 3)) (reduce + (range 1 2)) (reduce (fn [a x] (if (= x 2) (reduced [a x]) x)) 0 (range 2 10 0))]", "[55 11 103 1 [0 2]]");
+    // A realized range is walked, not recomputed; the first chunk is
+    // 32 elements, the last what is left.
+    try expectOutput("(let [r (range 70) s (seq r)] [(realized? r) (count (seq r)) (first (drop 64 r)) (last r) (= r (vec (range 70))) (= (hash r) (hash (vec (range 70))))])", "[true 70 64 69 true true]");
+    try expectOutput("(take 2 (drop 140737488355326 (range 140737488355320 140737488355330)))", "()");
+}
+
+test "lazy: reduce over an unrealized range allocates nothing" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def r (range 10000000))");
+    const heap = program.v.ensureHeap();
+    const live = heap.liveCount();
+    const total = try program.run("(reduce + r)");
+    try testing.expectEqual(@as(i64, 49999995000000), total.asFixnum());
+    try testing.expectEqual(live, heap.liveCount());
+}
+
 test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
     try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");
@@ -5235,7 +5257,7 @@ test "core: reduce, range, assoc, dissoc, conj" {
         .{ .src = "(range 5 2)", .expected = "()" },
         .{ .src = "(range 0 10 3)", .expected = "(0 3 6 9)" },
         .{ .src = "(range 5 0 -2)", .expected = "(5 3 1)" },
-        .{ .src = "(try (range 0 1 0) (catch any e e))", .expected = ":invalid-argument" },
+        .{ .src = "(take 3 (range 0 1 0))", .expected = "(0 0 0)" },
         .{ .src = "(assoc [1 2 3] 1 :x)", .expected = "[1 :x 3]" },
         .{ .src = "(assoc [1 2 3] 3 :end)", .expected = "[1 2 3 :end]" },
         .{ .src = "(try (assoc [1 2 3] 4 :x) (catch any e e))", .expected = ":index-out-of-bounds" },
