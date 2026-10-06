@@ -1628,6 +1628,22 @@ test "core: nfirst, tree-seq, replace, bounded-count, random-sample" {
     try expectOutput("[(random-sample 0 [1 2 3]) (random-sample 1 [1 2 3]) (every? #{1 2 3} (random-sample 0.5 [1 2 3]))]", "[() (1 2 3) true]");
 }
 
+test "core: array-map, bit-and-not, bit-flip, the ident predicates, bigint, decimal?, inst?" {
+    try expectOutput(
+        \\[(array-map) (array-map :a 1 :b 2 :a 3) (bit-and-not 15 4) (bit-and-not 15 4 1) (bit-flip 5 1) (bit-flip 0 63)
+        \\ (qualified-ident? :a/b) (qualified-ident? 'a) (qualified-ident? "a/b") (simple-ident? :a) (simple-ident? 'a/b) (simple-ident? 1)
+        \\ (bigint 1.9) (bigint -2.5) (biginteger 7) (bigint 100000000000000000000) (decimal? 1.0) (inst? 1)]
+    , "[{} {:a 3, :b 2} 11 10 7 -9223372036854775808 true false false true false false 1 -2 7 100000000000000000000 false false]");
+}
+
+test "core: var-get, find-var, load-string" {
+    try expectOutputProgram(
+        \\(def x 4)
+        \\[(var-get #'x) (find-var 'user/x) (find-var 'nexis.core/inc) (find-var 'user/nope) (try (find-var 'nope/x) (catch any e e))
+        \\ (try (var-get 1) (catch any e e)) (load-string "(def zz 2) (+ zz x) ; c") zz (load-string "")]
+    , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
+}
+
 test "core: partitionv, partitionv-all, splitv-at" {
     try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
     try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
@@ -3711,6 +3727,14 @@ test "nexis.string: split: empty delim and non-string args" {
     try expectOutput("(pr-str [(nexis.string/split \"abc\" \"\") (nexis.string/split \"héb\" \"\" -1) (nexis.string/split \"abc\" \"\" 2) (nexis.string/split \"\" \"\")])", "[[\"a\" \"b\" \"c\"] [\"h\" \"é\" \"b\" \"\"] [\"a\" \"bc\"] [\"\"]]");
     try expectOutput("(try (nexis.string/split \"abc\" 42) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.string/split 1 \",\") (catch any e e))", ":kind-mismatch");
+}
+
+test "nexis.string: escape and replace-first, with a literal match" {
+    try expectOutput(
+        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {})
+        \\         (nexis.string/replace-first "a-b-c" "-" "+") (nexis.string/replace-first "abc" \b \x) (nexis.string/replace-first "abc" "z" "y")
+        \\         (nexis.string/replace-first "abc" "" "-") (nexis.string/replace-first "héllo" "l" "L")])
+    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
 }
 
 test "nexis.string: split: returns a vector" {
