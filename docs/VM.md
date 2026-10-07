@@ -143,7 +143,10 @@ finally pcs and `ctrl:try-exit`'s continuation inside the code; every
 every `call:lookup-or`'s two slots inside the frame; every
 `call:self`'s count the routine's own fixed arity, in a routine with
 no rest parameter; every `call:lookup` and `call:lookup-or` key a
-keyword or symbol constant; every capture
+keyword or symbol constant; every quickened instruction's operands of
+the kinds its form promises, a fixnum constant holding a fixnum, and
+a comparison quickened with its jump followed by that jump on its
+slot (§10.10); every capture
 descriptor's sources inside the frame and the routine's upvalues, as
 many as the child's `upvalue_count`; and the last instruction one
 that never falls through (`jump:jmp`, `call:return`,
@@ -494,7 +497,8 @@ instruction.
   `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
   `call:self`, `call:return` and `call:return-nil`, has a general
   handler of its own, and `call:lookup` and `call:lookup-or` share
-  one; every other entry is its group's, which switches on the
+  one; a quickened variant's (§10.10) runs the instruction as its base
+  opcode, through the base's; every other entry is its group's, which switches on the
   variant or, where no variant is left, traps as §10 says for one
   outside the enum. A group outside the enum is `BytecodeCorruption`;
   `transient`, `hash`, `tx`, `io` and `simd` trap
@@ -504,7 +508,9 @@ instruction.
   `jump` and `cmp`, `math:add`, `math:sub`, `math:mul`, `math:idiv`,
   `math:mod`, `var:load-var`, `closure:get-cell`, `call:call`,
   `call:self`, `call:lookup`, `call:lookup-or`, `call:return` and
-  `call:return-nil`. A fast handler takes its
+  `call:return-nil`, and every quickened variant (§10.10), whose fast
+  handler reads its operands as its form says, with no kind to
+  decode. A fast handler takes its
   instruction's common case, reading its operands in place and storing
   only to a slot of its frame, with no call but its tail call and no
   stack frame; on any other case it tail-calls the general handler
@@ -801,6 +807,37 @@ Maps and sets hash and compare through `src/dispatch.zig`.
 | 5 | `ctrl:halt` | | Traps `UnimplementedOpcode` |
 
 Variant 4 is unassigned.
+
+#### 10.10 Quickened variants
+
+A quickened variant is a hot opcode specialized to the operand kinds
+it was found with, so its fast handler (§8) decodes no operand kind.
+It has its base opcode's operands and meaning; only the variant
+number differs, so an instruction's pc, span and trace are its base's.
+`vm.quicken` rewrites a routine's code into them, and the compiler
+quickens every routine it finishes (`COMPILER.md` §4.5), the stdlib
+image's included (`STDLIB.md` §1); a routine built by hand keeps its
+base opcodes unless it is quickened. Verification proves what each
+form promises (§5), so the fast handler trusts it as it trusts the
+rest; past the fast handler's case the instruction goes to its base
+opcode's general handler, with every trap and safe point.
+
+| Group | Variants | Base | Form |
+|---|---|---|---|
+| `math` | 32 + base | `add`, `sub`, `mul`, `idiv`, `mod` | B and C slots |
+| `math` | 40 + base | the same | B a constant holding a fixnum, C a slot |
+| `math` | 48 + base | the same | B a slot, C a constant holding a fixnum |
+| `cmp` | 16 + 8k + base | every variant | k = 2t + f: f 0 for B and C slots, 1 for B a slot and C a fixnum constant; t 0 alone, 1 followed by a `jump:if-true` testing A, 2 by a `jump:if-false` testing A |
+| `mov` | 32, 33 | `move` | B a slot; B an upvalue |
+| `call` | 32 | `return` | A a slot |
+
+A comparison quickened with its jump runs the pair as one dispatch
+(§8) without looking for the jump: verification proved it is there.
+The disassembler names a quickened variant after its base, with its
+operand kinds (`s` a slot, `c` a fixnum constant, `u` an upvalue) and
+the jump it runs: `math:add.sc`, `math:mul.cs`, `cmp:lt.ss+if-true`,
+`mov:move.s`, `mov:move.u`, `call:return.s` (`TOOLING.md` §2). Every other number in these
+ranges is unassigned.
 
 ---
 

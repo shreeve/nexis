@@ -1029,7 +1029,8 @@ const Emitter = struct {
         return pc;
     }
 
-    /// The routine's code, pools and span table, copied onto `out`.
+    /// The routine's code, pools and span table, copied onto `out`,
+    /// the code quickened (VM.md §10.10).
     ///
     /// Ownership transfer is errdefer-safe: if
     /// any `toOwnedSlice` fails after a previous one succeeded,
@@ -1040,6 +1041,7 @@ const Emitter = struct {
         errdefer self.out.free(code);
         const consts = try self.out.dupe(Value, self.consts.items);
         errdefer self.out.free(consts);
+        vm.quicken(code, consts);
         const caps = try self.out.dupe(vm.CaptureDescriptor, self.capture_descs.items);
         errdefer self.out.free(caps);
         const tries = try self.out.dupe(vm.Try, self.tries.items);

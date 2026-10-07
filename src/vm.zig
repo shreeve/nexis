@@ -309,6 +309,137 @@ pub const Math = enum(u6) {
     _,
 };
 
+/// A quickened variant (VM.md §10.10): a hot opcode specialized to
+/// the operand kinds `quicken` found it with, so its fast handler
+/// decodes no operand kind. It reads the operands of its base opcode,
+/// whose general handler runs it past the fast handler's case, and
+/// verification proves what the specialization promises (§5).
+pub const Quick = struct {
+    /// The base opcode's variant.
+    base: u6,
+    form: Form,
+    then: Then = .none,
+
+    pub const Form = enum(u3) {
+        /// `mov:move` and `call:return`: the value read is a slot.
+        slot,
+        /// `math` and `cmp`: B and C are slots.
+        slot_slot,
+        /// `math` and `cmp`: B is a slot, C a constant holding a fixnum.
+        slot_fixnum,
+        /// `math`: B is a constant holding a fixnum, C a slot.
+        fixnum_slot,
+        /// `mov:move`: the value read is an upvalue.
+        upvalue,
+    };
+
+    /// The conditional jump after a quickened comparison, testing the
+    /// comparison's slot: the pair it runs as one dispatch (§8).
+    pub const Then = enum(u2) { none, if_true, if_false };
+
+    /// The `math` variants with quickened forms: those with a fast
+    /// handler.
+    const math_bases = [_]Math{ .add, .sub, .mul, .idiv, .mod };
+
+    /// The variant `q` takes in `group`, or null when `group` has no
+    /// such quickened variant. `math`, `mov` and `call` keep their
+    /// quickened variants at 32-63 and `cmp` at 16-63, so each group's
+    /// base variants keep the numbers below.
+    pub fn variant(group: Group, q: Quick) ?u6 {
+        switch (group) {
+            .math => {
+                if (q.then != .none or std.mem.findScalar(Math, &math_bases, @fromBackingInt(q.base)) == null) return null;
+                return switch (q.form) {
+                    .slot_slot => 32 + q.base,
+                    .fixnum_slot => 40 + q.base,
+                    .slot_fixnum => 48 + q.base,
+                    .slot, .upvalue => null,
+                };
+            },
+            .cmp => {
+                if (q.base > @backingInt(Cmp.eq_num) or (q.form != .slot_slot and q.form != .slot_fixnum)) return null;
+                const k: u6 = @as(u6, @backingInt(q.then)) * 2 + @intFromBool(q.form == .slot_fixnum);
+                return 16 + 8 * k + q.base;
+            },
+            .mov => return if (q.base != @backingInt(Mov.move) or q.then != .none) null else switch (q.form) {
+                .slot => 32,
+                .upvalue => 33,
+                else => null,
+            },
+            .call => return if (q.base == @backingInt(Call.@"return") and q.form == .slot and q.then == .none) 32 else null,
+            else => return null,
+        }
+    }
+
+    /// Every quickened variant by opcode index (`VM.opIndex`).
+    const table: [4096]?Quick = blk: {
+        @setEvalBranchQuota(100_000);
+        var t: [4096]?Quick = @splat(null);
+        for ([_]Group{ .math, .cmp, .mov, .call }) |g| {
+            for (0..64) |base| for (std.meta.tags(Form)) |form| for (std.meta.tags(Then)) |then| {
+                const q = Quick{ .base = base, .form = form, .then = then };
+                if (variant(g, q)) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = q;
+            };
+        }
+        break :blk t;
+    };
+
+    /// The quickened variant at opcode index `op`, or null for any
+    /// other opcode.
+    pub fn of(op: u12) ?Quick {
+        return table[op];
+    }
+};
+
+/// Rewrite each instruction of `code` whose operands a quickened
+/// variant takes into that variant (VM.md §10.10): a `math` or `cmp`
+/// instruction of slots, or of a slot and a fixnum constant from
+/// `consts` (a comparison followed by a conditional jump on its slot
+/// says so too), a `math` instruction of a fixnum constant and a
+/// slot, a `mov:move` reading a slot or an upvalue, and a
+/// `call:return` reading a slot.
+/// Only the variant changes: an instruction keeps its operands, so
+/// its pc, span and trace are the ones it had.
+pub fn quicken(code: []Inst, consts: []const Value) void {
+    for (code, 0..) |*inst, pc| {
+        if (inst.kind != .primary) continue;
+        const group = inst.groupOf();
+        var q = Quick{ .base = inst.variant, .form = .slot };
+        switch (group) {
+            .mov => q.form = switch (inst.b.kind) {
+                .slot => .slot,
+                .upvalue => .upvalue,
+                else => continue,
+            },
+            .call => if (inst.a.kind != .slot) continue,
+            .math, .cmp => {
+                const fixnum = struct {
+                    fn at(op: Operand, pool: []const Value) bool {
+                        return op.kind == .constant and op.index < pool.len and pool[op.index].isFixnum();
+                    }
+                }.at;
+                const b = inst.b;
+                const c = inst.c;
+                q.form = if (b.kind == .slot and c.kind == .slot)
+                    .slot_slot
+                else if (b.kind == .slot and fixnum(c, consts))
+                    .slot_fixnum
+                else if (fixnum(b, consts) and c.kind == .slot)
+                    .fixnum_slot
+                else
+                    continue;
+                if (group == .cmp and pc + 1 < code.len) {
+                    const next: u32 = @truncate(@as(u64, @bitCast(code[pc + 1])));
+                    if (next == VM.condJumpKey(.if_true, inst.a)) q.then = .if_true;
+                    if (next == VM.condJumpKey(.if_false, inst.a)) q.then = .if_false;
+                }
+            },
+            else => continue,
+        }
+        inst.variant = Quick.variant(group, q) orelse continue;
+    }
+}
+
 /// Packed 64-bit instruction. Field order matches VM.md §3:
 /// [kind:4][group:6][variant:6][opA:16][opB:16][opC:16].
 pub const Inst = packed struct(u64) {
@@ -517,31 +648,60 @@ pub const Routine = struct {
         if (code.len == 0 or !neverFallsThrough(code[code.len - 1])) return VmError.BytecodeExhausted;
         for (code, 0..) |inst, i| {
             failure.pc = @intCast(i);
-            try self.verifyInst(inst);
+            try self.verifyInst(inst, i);
         }
     }
 
     fn neverFallsThrough(inst: Inst) bool {
-        const op = VM.opIndex(inst);
+        const op = baseOp(VM.opIndex(inst));
         return op == VM.opcode(.jump, Jump.jmp) or op == VM.opcode(.call, Call.@"return") or
             op == VM.opcode(.call, Call.return_nil) or op == VM.opcode(.ctrl, CtrlOp.throw_) or
             op == VM.opcode(.ctrl, CtrlOp.try_exit) or op == VM.opcode(.ctrl, CtrlOp.finally_exit);
     }
 
+    /// The base opcode of a quickened one (§10.10), else `op` itself.
+    fn baseOp(op: u12) u12 {
+        const q = Quick.of(op) orelse return op;
+        return (op & 0x3F) | @as(u12, q.base) << 6;
+    }
+
     /// What an operand position holds: nothing read, a destination
     /// slot, a slot read as such (a call block's base, a cell), a value
-    /// read through any operand kind, a raw count (§4.5), or a keyword
-    /// or symbol constant.
-    const Role = enum { none, dst, slot, src, raw, key };
+    /// read through any operand kind, a raw count (§4.5), a keyword or
+    /// symbol constant, a constant holding a fixnum, or an upvalue.
+    const Role = enum { none, dst, slot, src, raw, key, fixnum, upvalue };
     /// What a wide field (§3) indexes.
     const WideRole = enum { pc, constant, var_, capture, try_ };
     /// `block`: A and B name a call or collection block; `pair`: B
-    /// names two slots.
-    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false };
+    /// names two slots; `then`: the next instruction is the
+    /// conditional jump on A that a quickened comparison runs.
+    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false, then: Quick.Then = .none };
 
     /// The shape of the opcode at `op`, null for one with no
-    /// operands to prove: an unimplemented one traps where it runs.
+    /// operands to prove: an unimplemented one traps where it runs. A
+    /// quickened opcode has its base's shape with the kinds its form
+    /// promises (§10.10).
     fn shapeOf(op: u12) ?Shape {
+        if (Quick.of(op)) |q| {
+            var shape = baseShapeOf(baseOp(op)).?;
+            switch (q.form) {
+                .slot => if (shape.b == .src) {
+                    shape.b = .slot;
+                } else {
+                    shape.a = .slot;
+                },
+                .upvalue => shape.b = .upvalue,
+                .slot_slot => shape = .{ .a = .dst, .b = .slot, .c = .slot },
+                .slot_fixnum => shape = .{ .a = .dst, .b = .slot, .c = .fixnum },
+                .fixnum_slot => shape = .{ .a = .dst, .b = .fixnum, .c = .slot },
+            }
+            shape.then = q.then;
+            return shape;
+        }
+        return baseShapeOf(op);
+    }
+
+    fn baseShapeOf(op: u12) ?Shape {
         const g: Group = @fromBackingInt(@as(u6, @truncate(op)));
         const v: u6 = @truncate(op >> 6);
         return switch (g) {
@@ -592,12 +752,17 @@ pub const Routine = struct {
         };
     }
 
-    fn verifyInst(self: *const Routine, inst: Inst) VmError!void {
+    fn verifyInst(self: *const Routine, inst: Inst, pc: usize) VmError!void {
         if (inst.kind != .primary) return VmError.BytecodeCorruption;
         const op = VM.opIndex(inst);
         if (VM.op_table[op] == &VM.opCorrupt) return VmError.BytecodeCorruption;
         const shape = shapeOf(op) orelse return;
         try self.verifyOperand(inst.a, shape.a);
+        if (shape.then != .none) {
+            const variant: Jump = if (shape.then == .if_true) .if_true else .if_false;
+            if (pc + 1 >= self.code.len) return VmError.BytecodeExhausted;
+            if (@as(u32, @truncate(@as(u64, @bitCast(self.code[pc + 1])))) != VM.condJumpKey(variant, inst.a)) return VmError.BytecodeCorruption;
+        }
         if (shape.wide) |w| {
             const i = inst.wide();
             const len = switch (w) {
@@ -644,11 +809,15 @@ pub const Routine = struct {
                 if (op.kind != .slot) return VmError.InvalidOperandKind;
                 if (op.index >= self.slot_count) return VmError.OperandOutOfRange;
             },
-            .key => {
+            .key, .fixnum => {
                 if (op.kind != .constant) return VmError.InvalidOperandKind;
                 if (op.index >= self.consts.len) return VmError.OperandOutOfRange;
                 const k = self.consts[op.index].kind();
-                if (k != .keyword and k != .symbol) return VmError.InvalidOperandKind;
+                if (if (role == .key) k != .keyword and k != .symbol else k != .fixnum) return VmError.InvalidOperandKind;
+            },
+            .upvalue => {
+                if (op.kind != .upvalue) return VmError.InvalidOperandKind;
+                if (op.index >= self.upvalue_count) return VmError.UpvalueOutOfRange;
             },
             // Another kind traps where it is read, as `resolveOther`
             // says.
@@ -3645,6 +3814,9 @@ pub const VM = struct {
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
+        for (0..4096) |op| {
+            if (Quick.of(op) != null) t[op] = &opQuickened;
+        }
         break :blk t;
     };
 
@@ -3671,6 +3843,29 @@ pub const VM = struct {
         t[opcode(.call, Call.lookup_or)] = &fastLookup;
         t[opcode(.call, Call.@"return")] = &fastReturn;
         t[opcode(.call, Call.return_nil)] = &fastReturnNil;
+        for (0..4096) |op| {
+            const q = Quick.of(op) orelse continue;
+            t[op] = switch (@as(Group, @fromBackingInt(@as(u6, @truncate(op))))) {
+                .math => switch (q.form) {
+                    inline .slot_slot, .slot_fixnum, .fixnum_slot => |form| switch (@as(Math, @fromBackingInt(q.base))) {
+                        inline .add, .sub, .mul, .idiv, .mod => |m| fastMathQuick(m, form),
+                        else => unreachable,
+                    },
+                    .slot, .upvalue => unreachable,
+                },
+                .cmp => switch (q.form) {
+                    inline .slot_slot, .slot_fixnum => |form| switch (q.then) {
+                        inline else => |then| switch (@as(NumCmp, @fromBackingInt(q.base))) {
+                            inline else => |c| fastCmpQuick(c, form, then),
+                        },
+                    },
+                    else => unreachable,
+                },
+                .mov => if (q.form == .upvalue) &fastMoveUpvalue else &fastMoveSlot,
+                .call => &fastReturnSlot,
+                else => unreachable,
+            };
+        }
         break :blk t;
     };
 
@@ -3733,6 +3928,14 @@ pub const VM = struct {
     /// frame's next instruction.
     fn opEnter(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
         return self.nextSafe(frame);
+    }
+
+    /// A quickened instruction past its fast handler's case: its base
+    /// opcode's general handler, which reads the same operands (§10.10).
+    fn opQuickened(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        var base = inst;
+        base.variant = @truncate(Routine.baseOp(opIndex(inst)) >> 6);
+        return @call(.always_tail, op_table[opIndex(base)], .{ self, frame, base, pc });
     }
 
     fn opCorrupt(_: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
@@ -4062,6 +4265,71 @@ pub const VM = struct {
                 return self.nextAt(frame, pc);
             }
         }.run;
+    }
+
+    /// An operand of a quickened `math` or `cmp` (§10.10) as a fixnum:
+    /// the constant verification proved one (`constant`), else a
+    /// slot's value when it holds one, null when it does not.
+    inline fn quickFixnum(self: *VM, frame: *const Frame, op: Operand, comptime constant: bool) ?i64 {
+        if (constant) {
+            const c = &frame.routine.consts[op.index];
+            proved(op.kind == .constant and c.isFixnum());
+            return @bitCast(c.payload);
+        }
+        const v = loadWords(self.verifiedSlot(frame, op));
+        return if (v.isFixnum()) v.asFixnum() else null;
+    }
+
+    /// `fastMath` of a quickened instruction, whose operands it reads
+    /// with no kind to decode.
+    fn fastMathQuick(comptime op: Math, comptime form: Quick.Form) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+                const dst = self.verifiedSlot(frame, inst.a);
+                const l = self.quickFixnum(frame, inst.b, form == .fixnum_slot) orelse return self.general(frame, inst, pc);
+                const r = self.quickFixnum(frame, inst.c, form == .slot_fixnum) orelse return self.general(frame, inst, pc);
+                dst.* = fixnumResult(op, l, r) orelse return self.general(frame, inst, pc);
+                return self.nextAt(frame, pc);
+            }
+        }.run;
+    }
+
+    /// `fastCmp` of a quickened instruction: no kind to decode, and the
+    /// jump after it, when its form says there is one, run without
+    /// looking for it.
+    fn fastCmpQuick(comptime c: NumCmp, comptime form: Quick.Form, comptime then: Quick.Then) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+                const dst = self.verifiedSlot(frame, inst.a);
+                const l = self.quickFixnum(frame, inst.b, false) orelse return self.general(frame, inst, pc);
+                const r = self.quickFixnum(frame, inst.c, form == .slot_fixnum) orelse return self.general(frame, inst, pc);
+                const holds_ = ordered(i64, c, l, r);
+                const after = switch (then) {
+                    .none => pc,
+                    .if_true => if (holds_) frame.routine.code[pc].wide() else pc + 1,
+                    .if_false => if (holds_) pc + 1 else frame.routine.code[pc].wide(),
+                };
+                dst.* = value_mod.fromBool(holds_);
+                return self.nextAt(frame, after);
+            }
+        }.run;
+    }
+
+    fn fastMoveSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        copyWords(self.verifiedSlot(frame, inst.a), self.verifiedSlot(frame, inst.b));
+        return self.nextAt(frame, pc);
+    }
+
+    fn fastMoveUpvalue(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        proved(inst.b.kind == .upvalue and inst.b.index < frame.upvalues.len);
+        const cell = frame.upvalues[inst.b.index];
+        if (!cell.initialized) return self.general(frame, inst, pc);
+        copyWords(self.verifiedSlot(frame, inst.a), &cell.value);
+        return self.nextAt(frame, pc);
+    }
+
+    fn fastReturnSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        return self.returnFast(frame, inst, pc, self.verifiedSlot(frame, inst.a));
     }
 
     fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
@@ -6237,6 +6505,189 @@ test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
     });
 }
 
+test "quicken: the instructions it specializes, and those it leaves" {
+    const consts = [_]Value{ fx(1), fl(1.5), true_v };
+    const sub = Inst.primary(.math, Math.sub, sl(0), sl(1), kn(0));
+    const div = Inst.primary(.math, Math.div, sl(0), sl(1), sl(2));
+    const lte = Inst.primary(.cmp, Cmp.lte, sl(0), sl(1), kn(0));
+    const Case = struct { Inst, ?Quick, ?Inst };
+    for ([_]Case{
+        .{ asm_.mathAdd(0, sl(1), sl(2)), .{ .base = @backingInt(Math.add), .form = .slot_slot }, null },
+        .{ sub, .{ .base = @backingInt(Math.sub), .form = .slot_fixnum }, null },
+        .{ asm_.cmpLt(0, sl(1), sl(2)), .{ .base = @backingInt(Cmp.lt), .form = .slot_slot }, null },
+        .{ lte, .{ .base = @backingInt(Cmp.lte), .form = .slot_fixnum, .then = .if_true }, asm_.jumpIfTrue(0, sl(0)) },
+        .{ lte, .{ .base = @backingInt(Cmp.lte), .form = .slot_fixnum, .then = .if_false }, asm_.jumpIfFalse(0, sl(0)) },
+        .{ asm_.move(0, 1), .{ .base = @backingInt(Mov.move), .form = .slot }, null },
+        .{ asm_.moveFrom(0, Operand.upvalue(0)), .{ .base = @backingInt(Mov.move), .form = .upvalue }, null },
+        .{ Inst.primary(.math, Math.mul, sl(0), kn(0), sl(1)), .{ .base = @backingInt(Math.mul), .form = .fixnum_slot }, null },
+        .{ asm_.returnSlot(1), .{ .base = @backingInt(Call.@"return"), .form = .slot }, null },
+        // A jump testing another slot is not the comparison's.
+        .{ lte, .{ .base = @backingInt(Cmp.lte), .form = .slot_fixnum }, asm_.jumpIfTrue(0, sl(1)) },
+        // Left as they are: an operand of another kind, a constant not
+        // a fixnum or past the pool, an opcode with no fast handler.
+        .{ asm_.mathAdd(0, kn(0), kn(0)), null, null },
+        .{ asm_.cmpLt(0, kn(0), sl(1)), null, null },
+        .{ asm_.mathAdd(0, sl(1), kn(1)), null, null },
+        .{ asm_.cmpLt(0, sl(1), kn(2)), null, null },
+        .{ asm_.cmpLt(0, sl(1), kn(3)), null, null },
+        .{ asm_.mathAdd(0, sl(1), Operand.varRef(0)), null, null },
+        .{ asm_.moveFrom(0, kn(0)), null, null },
+        .{ Inst.primary(.call, Call.@"return", kn(0), Operand.none, Operand.none), null, null },
+        .{ div, null, null },
+        .{ asm_.loadNil(0), null, null },
+    }) |case| {
+        var code = [_]Inst{ case[0], case[2] orelse asm_.returnNil() };
+        quicken(&code, &consts);
+        const after = code[0];
+        try testing.expectEqual(@as(u64, @bitCast(case[0])) >> 16, @as(u64, @bitCast(after)) >> 16);
+        try testing.expectEqual(case[1], Quick.of(VM.opIndex(after)));
+        if (case[1]) |q| try testing.expectEqual(q.base, @as(u6, @truncate(Routine.baseOp(VM.opIndex(after)) >> 6)));
+        // Quickening twice changes nothing more.
+        quicken(&code, &consts);
+        try testing.expectEqual(after, code[0]);
+    }
+}
+
+test "Quick: every quickened opcode decodes to its form and back" {
+    var n: usize = 0;
+    for (0..4096) |op| {
+        const q = Quick.of(@intCast(op)) orelse continue;
+        const group: Group = @fromBackingInt(@as(u6, @truncate(op)));
+        try testing.expectEqual(@as(?u6, @truncate(op >> 6)), Quick.variant(group, q));
+        // The base is an opcode with a fast handler of its own.
+        const base = Routine.baseOp(@intCast(op));
+        try testing.expect(VM.op_table[base] != &VM.opCorrupt and VM.fast_table[base] != VM.op_table[base]);
+        try testing.expect(VM.op_table[op] == &VM.opQuickened);
+        n += 1;
+    }
+    // math: five operators in three forms; cmp: five in six; mov:move
+    // in two and call:return in one.
+    try testing.expectEqual(@as(usize, 5 * 3 + 5 * 6 + 3), n);
+}
+
+test "VM dispatch: a quickened instruction runs as its base, every case and trap" {
+    // Each operator over operand pairs that take the fast handler and
+    // pairs that leave it (a promotion, a zero divisor, a float, a
+    // non-number), run as written and quickened: the result, or the
+    // error, its detail and the instruction it names, are the same.
+    const values = [_]Value{ fx(0), fx(1), fx(-7), fx(7), fx(value_mod.fixnum_max), fx(value_mod.fixnum_min), fl(2.5), true_v, nil_v };
+    const Outcome = struct {
+        value: ?Value = null,
+        err: ?VmError = null,
+        detail: [96]u8 = undefined,
+        detail_len: usize = 0,
+        pc: u32 = 0,
+
+        fn of(code: []const Inst, consts: []const Value) !@This() {
+            const routine = makeRoutine(code, consts, 3, "q");
+            var vm = try VM.init(testing.allocator, &routine);
+            defer vm.deinit();
+            var out: @This() = .{};
+            const v = vm.run() catch |err| {
+                out.err = err;
+                out.detail_len = @min(vm.error_detail.len, out.detail.len);
+                @memcpy(out.detail[0..out.detail_len], vm.error_detail[0..out.detail_len]);
+                out.pc = vm.error_trace.items[0].pc;
+                return out;
+            };
+            // A bignum lives on the VM's heap: compare it as text.
+            out.value = if (v.isFixnum() or v.isFloat() or v.isBool()) v else blk: {
+                var w = std.Io.Writer.fixed(&out.detail);
+                try bignum_mod.formatDecimal(v, &w);
+                out.detail_len = w.buffered().len;
+                break :blk nil_v;
+            };
+            return out;
+        }
+
+        fn expectSame(a: @This(), b: @This()) !void {
+            try testing.expectEqual(a.err, b.err);
+            try testing.expectEqual(a.pc, b.pc);
+            try testing.expectEqualStrings(a.detail[0..a.detail_len], b.detail[0..b.detail_len]);
+            if (a.value) |v| try testing.expect(dispatch_mod.equal(v, b.value.?)) else try testing.expect(b.value == null);
+        }
+    };
+    var quickened: usize = 0;
+    // B and C slots, C a fixnum constant, B a fixnum constant.
+    for (values) |x| for (values) |y| for ([_]u2{ 0, 1, 2 }) |layout| {
+        if (layout == 1 and !y.isFixnum() or layout == 2 and !x.isFixnum()) continue;
+        const consts = [_]Value{ x, y, fx(99) };
+        const lhs = if (layout == 2) kn(0) else sl(0);
+        const rhs = if (layout == 1) kn(1) else sl(1);
+        var ops: [5 + 5 * 3][4]Inst = undefined;
+        var k: usize = 0;
+        for ([_]Math{ .add, .sub, .mul, .idiv, .mod }) |m| {
+            ops[k] = .{ Inst.primary(.math, m, sl(2), lhs, rhs), asm_.returnSlot(2), asm_.returnNil(), asm_.returnNil() };
+            k += 1;
+        }
+        // A comparison has no form for a constant B.
+        if (layout != 2) for (std.meta.tags(Cmp)) |c| {
+            const cmp = Inst.primary(.cmp, c, sl(2), sl(0), rhs);
+            // The jump goes to pc 5 of the routine below, which loads 99.
+            ops[k] = .{ cmp, asm_.returnSlot(2), asm_.returnNil(), asm_.returnNil() };
+            ops[k + 1] = .{ cmp, asm_.jumpIfTrue(5, sl(2)), asm_.returnSlot(2), asm_.returnNil() };
+            ops[k + 2] = .{ cmp, asm_.jumpIfFalse(5, sl(2)), asm_.returnSlot(2), asm_.returnNil() };
+            k += 3;
+        };
+        for (ops[0..k]) |body| {
+            var code = [_]Inst{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), body[0], body[1], body[2], asm_.loadConst(2, 2), asm_.returnSlot(2) };
+            const plain = try Outcome.of(&code, &consts);
+            quicken(&code, &consts);
+            try testing.expect(Quick.of(VM.opIndex(code[2])) != null);
+            quickened += 1;
+            errdefer std.debug.print("quickened {any} of {any} and {any}\n", .{ Quick.of(VM.opIndex(code[2])), x, y });
+            try Outcome.expectSame(plain, try Outcome.of(&code, &consts));
+        }
+    };
+    try testing.expect(quickened > 1000);
+}
+
+test "Routine.verify: a quickened instruction proves what its form promises" {
+    const r = asm_.returnNil();
+    const consts = [_]Value{ fx(1), fl(1.5) };
+    const quick = struct {
+        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
+            return raw(g, Quick.variant(g, q).?, a, b, c);
+        }
+    }.of;
+    const add_ss: Quick = .{ .base = @backingInt(Math.add), .form = .slot_slot };
+    const add_sc: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum };
+    const lt_then: Quick = .{ .base = @backingInt(Cmp.lt), .form = .slot_slot, .then = .if_false };
+    const move_s: Quick = .{ .base = @backingInt(Mov.move), .form = .slot };
+    const move_u: Quick = .{ .base = @backingInt(Mov.move), .form = .upvalue };
+    const mul_cs: Quick = .{ .base = @backingInt(Math.mul), .form = .fixnum_slot };
+    const return_s: Quick = .{ .base = @backingInt(Call.@"return"), .form = .slot };
+    const none = Operand.none;
+    const Case = struct { name: []const u8, code: []const Inst, err: ?VmError };
+    for ([_]Case{
+        .{ .name = "slots and a fixnum", .code = &.{ quick(.math, add_ss, sl(0), sl(0), sl(1)), quick(.math, add_sc, sl(0), sl(1), kn(0)), r }, .err = null },
+        .{ .name = "a comparison and its jump", .code = &.{ quick(.cmp, lt_then, sl(0), sl(0), sl(1)), asm_.jumpIfFalse(2, sl(0)), r }, .err = null },
+        .{ .name = "a move and a return of slots", .code = &.{ quick(.mov, move_s, sl(0), sl(1), none), quick(.call, return_s, sl(0), none, none) }, .err = null },
+        .{ .name = "a constant where a slot is promised", .code = &.{ quick(.math, add_ss, sl(0), sl(0), kn(0)), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a slot past the frame", .code = &.{ quick(.math, add_ss, sl(0), sl(2), sl(0)), r }, .err = VmError.OperandOutOfRange },
+        .{ .name = "a constant not a fixnum", .code = &.{ quick(.math, add_sc, sl(0), sl(0), kn(1)), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a slot where a fixnum constant is promised", .code = &.{ quick(.math, add_sc, sl(0), sl(0), sl(1)), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a fixnum constant past the pool", .code = &.{ quick(.math, add_sc, sl(0), sl(0), kn(2)), r }, .err = VmError.OperandOutOfRange },
+        .{ .name = "no jump after the comparison", .code = &.{ quick(.cmp, lt_then, sl(0), sl(0), sl(1)), asm_.loadNil(0), r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "the other jump", .code = &.{ quick(.cmp, lt_then, sl(0), sl(0), sl(1)), asm_.jumpIfTrue(2, sl(0)), r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "a jump on another slot", .code = &.{ quick(.cmp, lt_then, sl(0), sl(0), sl(1)), asm_.jumpIfFalse(2, sl(1)), r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "a move of a constant", .code = &.{ quick(.mov, move_s, sl(0), kn(0), none), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a fixnum and a slot", .code = &.{ quick(.math, mul_cs, sl(0), kn(0), sl(1)), r }, .err = null },
+        .{ .name = "a slot where a fixnum constant leads", .code = &.{ quick(.math, mul_cs, sl(0), sl(0), sl(1)), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a move of an upvalue the routine has not", .code = &.{ quick(.mov, move_u, sl(0), Operand.upvalue(0), none), r }, .err = VmError.UpvalueOutOfRange },
+        .{ .name = "a move of a slot where an upvalue is promised", .code = &.{ quick(.mov, move_u, sl(0), sl(0), none), r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a return of a constant", .code = &.{quick(.call, return_s, kn(0), none, none)}, .err = VmError.InvalidOperandKind },
+    }) |case| {
+        errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
+        const routine = Routine{ .code = case.code, .consts = &consts, .slot_count = 2, .name = "t" };
+        var failure: VerifyFailure = undefined;
+        if (case.err) |err| {
+            try testing.expectError(err, routine.verify(&failure));
+            try testing.expectEqual(@as(u32, 0), failure.pc);
+        } else try routine.verify(&failure);
+    }
+}
+
 test "VM jump: targets and constants past the 16-bit range" {
     // 70,000 instructions: the jump at pc 0 lands at pc 69,997,
     // which loads constant 69,000 and returns it.
@@ -7544,10 +7995,17 @@ test "VM cells: U-operand resolve on uninitialized cell traps :uninitialized-cel
         .slot_count = 3,
     };
 
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UninitializedCell, res);
+    // As written, then with the read quickened (`mov:move.u`, §10.10).
+    for (0..2) |pass| {
+        if (pass == 1) {
+            quicken(&child_code, &.{});
+            try testing.expect(Quick.of(VM.opIndex(child_code[0])).?.form == .upvalue);
+        }
+        var vm = try VM.init(testing.allocator, &parent_routine);
+        defer vm.deinit();
+        try testing.expectError(VmError.UninitializedCell, vm.run());
+        try testing.expectEqual(@as(u32, 0), vm.error_trace.items[0].pc);
+    }
 }
 
 test "VM cells: closure:init-cell flips initialized=true and stores value" {

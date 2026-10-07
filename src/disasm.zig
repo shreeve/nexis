@@ -142,12 +142,13 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
         try writeOpcode(inst, writer);
         try writer.writeAll("  ");
         const group: vm.Group = @fromBackingInt(@intCast(inst.group));
+        const variant = if (quickOf(inst)) |q| q.base else inst.variant;
         try writeOperand(inst.a, routine, interner, false, writer);
         try writer.writeAll("  ");
-        if (wideField(group, inst.variant)) |wide| {
+        if (wideField(group, variant)) |wide| {
             try writeWide(wide, inst.wide(), routine, interner, writer);
         } else {
-            try writeOperand(inst.b, routine, interner, immediateB(group, inst.variant), writer);
+            try writeOperand(inst.b, routine, interner, immediateB(group, variant), writer);
             try writer.writeAll("  ");
             try writeOperand(inst.c, routine, interner, false, writer);
         }
@@ -167,27 +168,66 @@ fn disassembleRoutine(routine: *const vm.Routine, interner: ?*const intern_mod.I
     }
 }
 
-/// `group:variant`, padded to a column; an unnamed group or variant
-/// prints its number after `?`.
+/// The quickened variant `inst` carries (VM.md §10.10), if any.
+fn quickOf(inst: vm.Inst) ?vm.Quick {
+    return vm.Quick.of(@as(u12, inst.group) | @as(u12, inst.variant) << 6);
+}
+
+/// What a quickened variant's name adds to its base's: the operand
+/// kinds it proves (`s` a slot, `c` a fixnum constant, `u` an
+/// upvalue) and the jump a comparison runs with it.
+fn quickSuffix(q: vm.Quick) []const u8 {
+    return switch (q.form) {
+        .slot => ".s",
+        .upvalue => ".u",
+        .fixnum_slot => ".cs",
+        .slot_slot => switch (q.then) {
+            .none => ".ss",
+            .if_true => ".ss+if-true",
+            .if_false => ".ss+if-false",
+        },
+        .slot_fixnum => switch (q.then) {
+            .none => ".sc",
+            .if_true => ".sc+if-true",
+            .if_false => ".sc+if-false",
+        },
+    };
+}
+
+/// `group:variant`, padded to a column, a quickened variant as its
+/// base's name and its suffix (`math:add.sc`); an unnamed group or
+/// variant prints its number after `?`.
 fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     var buf: [32]u8 = undefined;
-    var fixed = Writer.fixed(&buf);
-    if (groupName(inst.group)) |g| {
-        fixed.writeAll(g) catch unreachable;
-    } else {
-        fixed.print("?{d}", .{inst.group}) catch unreachable;
-    }
-    fixed.writeAll(":") catch unreachable;
-    const group: vm.Group = @fromBackingInt(@intCast(inst.group));
-    if (variantName(group, inst.variant)) |v| {
-        fixed.writeAll(v) catch unreachable;
-    } else {
-        fixed.print("?{d}", .{inst.variant}) catch unreachable;
-    }
-    const text = fixed.buffered();
+    const text = opcodeName(@as(u12, inst.group) | @as(u12, inst.variant) << 6, &buf);
     try writer.writeAll(text);
     var pad: usize = text.len;
     while (pad < 18) : (pad += 1) try writer.writeAll(" ");
+}
+
+/// The name of the opcode at index `op` (group | variant << 6), in
+/// `buf`: `group:variant`, a quickened variant as its base's name and
+/// its suffix (`math:add.sc`), and `?N` for what the tables do not
+/// name. The CLI's `-Dopcodes` histogram names its rows with it.
+pub fn opcodeName(op: u12, buf: []u8) []const u8 {
+    var fixed = Writer.fixed(buf);
+    const group_bits: u6 = @truncate(op);
+    const variant: u6 = @truncate(op >> 6);
+    if (groupName(group_bits)) |g| {
+        fixed.writeAll(g) catch return "?";
+    } else {
+        fixed.print("?{d}", .{group_bits}) catch return "?";
+    }
+    fixed.writeAll(":") catch return "?";
+    const group: vm.Group = @fromBackingInt(group_bits);
+    const quick = vm.Quick.of(op);
+    if (variantName(group, if (quick) |q| q.base else variant)) |v| {
+        fixed.writeAll(v) catch return "?";
+        if (quick) |q| fixed.writeAll(quickSuffix(q)) catch return "?";
+    } else {
+        fixed.print("?{d}", .{variant}) catch return "?";
+    }
+    return fixed.buffered();
 }
 
 /// A wide field: a pc as `jNNNN`, a constant as `cN=value`, a Var
@@ -370,6 +410,39 @@ test "a listing shows every operand kind, immediates, constants and wide fields"
         \\  0008  ctrl:try-exit       -  j0011
         \\  0009  jump:jmp            -  j0003
         \\  0010  call:return         s1  -  -
+        \\
+    , out.written());
+}
+
+test "a quickened instruction shows its base's name, its form and its operands" {
+    const consts = [_]value_mod.Value{value_mod.fromFixnum(1).?};
+    var code = [_]vm.Inst{
+        vm.asm_.mathAdd(0, vm.Operand.slot(0), vm.Operand.constant(0)),
+        vm.asm_.mathAdd(0, vm.Operand.slot(0), vm.Operand.slot(1)),
+        vm.asm_.cmpLt(1, vm.Operand.slot(0), vm.Operand.slot(2)),
+        vm.asm_.jumpIfTrue(0, vm.Operand.slot(1)),
+        vm.asm_.cmpLt(1, vm.Operand.slot(0), vm.Operand.constant(0)),
+        vm.asm_.move(2, 0),
+        vm.Inst.primary(.math, vm.Math.mul, vm.Operand.slot(2), vm.Operand.constant(0), vm.Operand.slot(1)),
+        vm.asm_.moveFrom(2, vm.Operand.upvalue(0)),
+        vm.asm_.returnSlot(2),
+    };
+    vm.quicken(&code, &consts);
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 3, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassemble(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=3 arity=0 upvalues=0
+        \\  0000  math:add.sc         s0  s0  c0=1
+        \\  0001  math:add.ss         s0  s0  s1
+        \\  0002  cmp:lt.ss+if-true   s1  s0  s2
+        \\  0003  jump:if-true        s1  j0000
+        \\  0004  cmp:lt.sc           s1  s0  c0=1
+        \\  0005  mov:move.s          s2  s0  -
+        \\  0006  math:mul.cs         s2  c0=1  s1
+        \\  0007  mov:move.u          s2  u0  -
+        \\  0008  call:return.s       s2  -  -
         \\
     , out.written());
 }

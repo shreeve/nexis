@@ -276,27 +276,7 @@ fn writeStderr(bytes: []const u8) void {
 /// `group:variant` for an opcode index (VM.md §8), from the variant
 /// enums' tag names with `-` for `_`, as the disassembler spells them.
 fn opcodeName(index: u12, buf: []u8) []const u8 {
-    const group: vm.Group = @fromBackingInt(@as(u6, @truncate(index)));
-    const variant: u6 = @truncate(index >> 6);
-    const v: ?[]const u8 = switch (group) {
-        .jump => std.enums.tagName(vm.Jump, @fromBackingInt(variant)),
-        .cmp => std.enums.tagName(vm.Cmp, @fromBackingInt(variant)),
-        .math => std.enums.tagName(vm.Math, @fromBackingInt(variant)),
-        .mov => std.enums.tagName(vm.Mov, @fromBackingInt(variant)),
-        .call => std.enums.tagName(vm.Call, @fromBackingInt(variant)),
-        .closure => std.enums.tagName(vm.Closure_, @fromBackingInt(variant)),
-        .var_ => std.enums.tagName(vm.VarOp, @fromBackingInt(variant)),
-        .coll => std.enums.tagName(vm.CollOp, @fromBackingInt(variant)),
-        .ctrl => std.enums.tagName(vm.CtrlOp, @fromBackingInt(variant)),
-        else => null,
-    };
-    const g = std.enums.tagName(vm.Group, group) orelse "?";
-    const text = if (v) |name|
-        std.fmt.bufPrint(buf, "{s}:{s}", .{ std.mem.trimEnd(u8, g, "_"), std.mem.trimEnd(u8, name, "_") }) catch return "?"
-    else
-        std.fmt.bufPrint(buf, "{s}:?{d}", .{ std.mem.trimEnd(u8, g, "_"), variant }) catch return "?";
-    std.mem.replaceScalar(u8, text, '_', '-');
-    return text;
+    return disasm_mod.opcodeName(index, buf);
 }
 
 fn usageExit(io: std.Io) noreturn {
@@ -834,6 +814,16 @@ test "cli: opcodeName: the disassembler's spelling of every opcode index" {
     try std.testing.expectEqualStrings("ctrl:throw", opcodeName(@as(u12, @backingInt(vm.Group.ctrl)) | @as(u12, @backingInt(vm.CtrlOp.throw_)) << 6, &buf));
     try std.testing.expectEqualStrings("math:?63", opcodeName(@as(u12, @backingInt(vm.Group.math)) | @as(u12, 63) << 6, &buf));
     try std.testing.expectEqualStrings("simd:?0", opcodeName(@backingInt(vm.Group.simd), &buf));
+    // A quickened variant is named as the disassembler names it: its
+    // base and the operand kinds it proves (`math:add.sc`).
+    var quickened: usize = 0;
+    for (0..4096) |i| if (vm.Quick.of(@intCast(i)) != null) {
+        quickened += 1;
+        const name = opcodeName(@intCast(i), &buf);
+        try std.testing.expect(std.mem.indexOfScalar(u8, name, '?') == null);
+        try std.testing.expect(std.mem.indexOfScalar(u8, name, '.') != null);
+    };
+    try std.testing.expect(quickened > 0);
 }
 
 test "cli: Balance: brackets count outside strings, comments and character literals" {
