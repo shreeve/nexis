@@ -40,7 +40,7 @@ throw away.
   (def before (d/db conn))                                   ; a snapshot that never changes
   (d/transact! conn [{:person/name "Ada" :person/age 37}])   ; upserts Ada by name
   (d/q '[:find ?n ?a :where [?e :person/name ?n] [?e :person/age ?a] [(> ?a 36)]] (d/db conn))
-  ;; => #{[Ada 37] [Alan 41]}
+  ;; => #{["Ada" 37] ["Alan" 41]}
   (:person/age (d/entity before [:person/name "Ada"]))       ;; => 36: the past is still there
   ```
 
