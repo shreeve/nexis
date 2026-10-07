@@ -273,7 +273,7 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     // Every Var knows its name and namespace, and a defn its arglists.
     try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "{:arglists ([x]), :name plain, :ns user}");
     try expectOutputProgram("(def x 1) [(:name (meta #'x)) (:ns (meta #'x))]", "[x user]");
-    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns])", "{:name mm, :ns my.app}");
+    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns :macro])", "{:name mm, :ns my.app, :macro true}");
     // A name qualified with the current namespace is the name itself.
     try expectOutputProgram("(def user/qq 1) (defn user/ff [] 2) [qq (ff) (:name (meta #'qq))]", "[1 2 qq]");
     // def and defmacro take the same spellings.
@@ -717,6 +717,9 @@ test "try: a class that names a nexis error catches that error alone, as in Cloj
     try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
     try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
     try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
+    // Calling a value that is no function is a ClassCastException in
+    // Clojure; an overflow an ArithmeticException.
+    try expectOutput("[(try (1 2) (catch ClassCastException e :cce)) (try (bit-and 1 10000000000000000000) (catch ArithmeticException e :ae))]", "[:cce :ae]");
 }
 
 test "fn: a :pre/:post condition map checks arguments and the result" {

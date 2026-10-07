@@ -782,11 +782,11 @@ fn catchTest(b: Builder, g: *Form, tag: *const Form) ExpandError!*Form {
 /// which takes every value.
 fn catchTags(name: []const u8) ?[]const []const u8 {
     const classes = std.StaticStringMap([]const []const u8).initComptime(.{
-        .{ "ArithmeticException", &[_][]const u8{"divide-by-zero"} },
+        .{ "ArithmeticException", &[_][]const u8{ "divide-by-zero", "arithmetic-overflow" } },
         .{ "IndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
         .{ "ArrayIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
         .{ "StringIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
-        .{ "ClassCastException", &[_][]const u8{"kind-mismatch"} },
+        .{ "ClassCastException", &[_][]const u8{ "kind-mismatch", "not-callable" } },
         .{ "IllegalArgumentException", &[_][]const u8{ "invalid-argument", "no-matching-clause", "arity-mismatch" } },
         .{ "ArityException", &[_][]const u8{"arity-mismatch"} },
         .{ "AssertionError", &[_][]const u8{"assertion-failed"} },
@@ -1220,7 +1220,9 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
     const fn_form = try fnStar(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
-    const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, parts.meta), fn_form }));
+    // The Var's metadata says it is a macro, as Clojure's does.
+    const meta = try std.mem.concat(ctx.allocator, *Form, &.{ parts.meta, &.{ try b.kw("macro"), try makeForm(ctx, .{ .bool_ = true }, origin) } });
+    const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, meta), fn_form }));
 
     var why: ?Failure = null;
     const result = ceval.eval(ceval.user_data, expanded, &why) catch |err| {
