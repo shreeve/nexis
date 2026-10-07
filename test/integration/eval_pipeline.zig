@@ -1402,6 +1402,20 @@ test "ns: a clause it refuses leaves the current namespace as it was" {
     defer program.deinit();
     try testing.expectError(error.MacroExpansionFailure, program.run("(ns elsewhere (:import [java.util Date]))"));
     try testing.expectEqualStrings("user", program.registry.current.name);
+    // A clause's options and specs are checked before the switch too.
+    for ([_][]const u8{
+        "(ns bar (:refer-clojure :only [map]))",
+        "(ns bar (:refer-clojure :exclude [map] :rename {}))",
+        "(ns baz (:require [x :bogus 1]))",
+        "(ns baz (:require [x :refer y]))",
+        "(ns baz (:require [x :refer [1]]))",
+        "(ns baz (:require [x :as]))",
+        "(ns baz (:require \"x\"))",
+        "(ns baz (:require (pre [a.b])))",
+    }) |src| {
+        try testing.expectError(error.MacroExpansionFailure, program.run(src));
+        try testing.expectEqualStrings("user", program.registry.current.name);
+    }
 }
 
 test "integration: defn in a namespace + qualified call" {
@@ -6943,6 +6957,15 @@ test "ns: (:refer-clojure :exclude [names]) leaves those names to the namespace"
     try expectOutputProgram("(defn when [x] [:mine x]) (when 1)", "[:mine 1]");
     try expectMacroFailure("", "(ns ex (:refer-clojure :only [inc]))", "ns: (:refer-clojure :only ...) is not supported; :exclude is", ":only");
     try expectMacroFailure("", "(ns ex (:refer-clojure :exclude inc))", "ns: :exclude takes a vector of symbols, not a symbol", "inc");
+}
+
+test "ns: a name :exclude leaves to the namespace may be referred from another, as in Clojure" {
+    const lib = [2][]const u8{ "lib.nx", "(ns lib (:refer-clojure :exclude [+ when]))\n(defn + [a b] (str a b))\n(defmacro when [t x] `(if ~t [:lib ~x]))\n" };
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+ when]) (:require [lib :refer [+ when]])) [(+ 1 2) (when true 3) (nexis.core/+ 1 2)]", "[12 [:lib 3] 3]");
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+])) (require '[lib :refer :all]) (+ 1 2)", "12");
+    // A Var the namespace defined is still its own: a referral of the
+    // name is refused.
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+])) (defn + [a b] [a b]) (try (eval '(require '[lib :refer [+]])) (catch any e :refused)) (+ 1 2)", "[1 2]");
 }
 
 test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
