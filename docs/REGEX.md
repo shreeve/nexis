@@ -7,7 +7,8 @@ then the language over it: the pattern and matcher values, the
 `re-*` functions, the `#"..."` literal and the patterns
 `nexis.string` takes (§8–§11).
 Patterns are Java's syntax minus every construct that needs
-backtracking; matching is linear in the input.
+backtracking; one search is linear in the input times the size of the
+pattern, and finding every match can be quadratic (§3.5).
 
 ---
 
@@ -222,8 +223,10 @@ before the search's start. Line terminators are `\n`, `\r`, `\r\n`
 | `\b`, `\B` | the code points on either side differ (agree) in being word characters: ASCII `[A-Za-z0-9_]`, or a non-spacing mark whose base character is a letter or digit (Java's `Bound`) |
 | `\G` | `pos` is where the previous match ended (the search's start for the first) |
 
-The base of a run of non-spacing marks is found once per run, so
-`\b` stays linear on a long run of marks.
+The base of a run of non-spacing marks is found once per run, and
+the run is kept across the searches of one input (a find loop, and
+a matcher's `re-find` calls), so `\b` stays linear on a long run of
+marks.
 
 #### 3.5 The find loop
 
@@ -232,23 +235,40 @@ previous match ended, `\G` holds there, and after an empty match the
 next search starts one code point later (Java: one UTF-16 unit). So
 `a*` on `baaa` finds `""`, `"aaa"`, `""`.
 
+Each search is linear (§3.2), but the loop is not: after a
+lower-priority thread matches, a search keeps the higher-priority
+threads alive to see whether one matches too, possibly to the end of
+the input, and then reports a short match. So k finds can each scan
+to the end: `split`, `replace` and `re-seq` of `x*y|x` over n `x`s
+cost O(n²). RE2 and Rust's `regex`, leftmost-first Pike VMs too,
+iterate with the same bound.
+
 ---
 
 ### 4. Limits
 
-Java has none of these; they make a hostile pattern an error rather
-than a slow search.
+Java has none of these. They bound what compiling a pattern costs, in
+time and memory, and the constant of a search: a search costs
+O(n·m·k) (§3.2) with m·k at most 2^20 slot words, so it stays linear
+in the input but a pattern near the limits is slow per byte (350
+`(.?)` groups take about 0.25 ms a byte in a debug build). They do
+not turn every slow search into an error.
 
 | Limit | Value | Sentence |
 |---|---|---|
 | a repetition bound | 1000 | `repetition count exceeds 1000` |
 | program size, after every repetition is expanded | 10 000 instructions | `the pattern compiles to more than 10000 instructions` |
 | program size × slots | 2^20 slot words | `the pattern has too many groups for its size` |
+| AST nodes compiled, after every repetition is expanded (a body that compiles to nothing, such as `(?:)` or `x{0}`, still counts) | 1 000 000 | `the pattern expands to more than 1000000 nodes` |
+| ranges in the classes of one program, each distinct set stored once | 65 536 | `the pattern's classes hold more than 65536 ranges` |
+| memory compiling the pattern takes (its AST, the sets its classes build, the program) | 16 MiB + 32 bytes per byte of the pattern | `the pattern needs too much memory to compile` |
 | nesting of groups and classes | 250 | `groups nest too deeply` |
 
-A literal pattern has no instructions and no limit on its length. The
-parser counts both group and class depth and calls `stack.check()`,
-so a deep pattern is an error, never a fault.
+A literal pattern has no instructions, and its memory limit grows
+with its length, so a literal of any length compiles. A class unites
+its items in a list merged as it doubles, so a class of n items costs
+O(n log n). The parser counts both group and class depth and calls
+`stack.check()`, so a deep pattern is an error, never a fault.
 
 ---
 
@@ -299,9 +319,9 @@ Java without `(?U)`.
 
 ### 6. Differences from `java.util.regex`
 
-1. **No backtracking constructs** (§2): in exchange no pattern takes
-   more than linear time, and the limits of §4 refuse what Java
-   would accept and run slowly.
+1. **No backtracking constructs** (§2): in exchange one search is
+   linear in the input (§3.2; a find loop can be quadratic, §3.5),
+   and the limits of §4 refuse patterns Java would accept.
 2. **An empty match advances by a code point**, Java's by a UTF-16
    unit: Java finds an extra empty match inside a surrogate pair
    (`""` on `"a😀"` finds four empty matches in Java, three here).
@@ -321,11 +341,12 @@ Java without `(?U)`.
 
 ### 7. The differential test
 
-`test/regex/corpus.json` holds 9 000 cases, each `[pattern, input,
-result]`: random patterns from a grammar of the supported constructs
-(three seeds, nesting to depth 5) and random inputs over ASCII,
-accented and astral letters, line terminators, a combining mark and
-the case-folding special cases, with Java's every find and its groups
+`test/regex/corpus.json` holds 9 000 random cases and then a few
+hand-written regressions, each `[pattern, input, result]`: random
+patterns from a grammar of the supported constructs (three seeds,
+nesting to depth 5) and random inputs over ASCII, accented and astral
+letters, line terminators, a combining mark and the case-folding
+special cases, with Java's every find and its groups
 (`null` for a group that did not take part), `"ERR"` when Java
 refuses the pattern, or `"TIMEOUT"` when Java runs past a second.
 `test/regex/corpus.clj` generates it through `bb`:
@@ -351,15 +372,17 @@ Two heap kinds carry regular expressions into the language
 the source in a scratch arena and copies the program into one block:
 the `Program` and the source slice first, then the instructions, the
 ranges, the source text, the group names, the literal and the prefix,
-which the program's slices point at. A block never moves, so the
-pointers into it stay valid for its life. The block holds no Value:
+which the program's slices point at; a syntax error's sentence is
+copied out of the arena onto `gpa`, the caller's to free. A block
+never moves, so the pointers into it stay valid for its life. The block holds no Value:
 the collector treats it as a leaf, and the sweep frees it as it frees
 a string. A pattern is immutable.
 
 **`matcher` (45)**, the search state of `re-matcher`:
-`MatcherBox{pattern, input, next, last_end, state}` followed by two
-slots per group and two for the whole match, the spans of the last
-match (`none` for a group that did not take part). `re-find` on a
+`MatcherBox{pattern, input, next, last_end, marks, state}` followed
+by two slots per group and two for the whole match, the spans of the
+last match (`none` for a group that did not take part); `marks` is
+the `\b` cache of §3.4. `re-find` on a
 matcher runs `Finder.find` from `next` with `\G` at `last_end` and
 writes the result back into the block; `pattern` and `input` never
 change, so the update needs no barrier. A search that fails leaves the
@@ -397,7 +420,7 @@ fails.
 
 | Name | Arity | Result |
 |---|---|---|
-| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points where the compiler stopped (`catch :invalid-regex` takes it) |
+| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points Java reports for the sentence (Java's is one before its cursor: `a)` and `*a` are 0, `[z-a]` 3, `\p{Foo}` 6), or the start of a construct §2 refuses (`catch :invalid-regex` takes it) |
 | `re-matcher` | 2 | `(re-matcher re s)`: a fresh matcher (§8) |
 | `re-find` | 1–2 | `(re-find m)`: the next match of the matcher, or nil; `(re-find re s)`: the first match of `re` in `s`, or nil |
 | `re-matches` | 2 | The match of the whole of `s` (`Matcher.matches`: `(re-matches #"a\|ab" "ab")` is `"ab"`), or nil |

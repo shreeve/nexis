@@ -1,4 +1,4 @@
-//! regex.zig — regular expressions in Java's syntax, matched in linear time.
+//! regex.zig — regular expressions in Java's syntax, each search in linear time.
 //!
 //! Authoritative spec: `docs/REGEX.md`. `compile` parses a pattern
 //! into an AST in an arena, resolving every character class to a
@@ -10,7 +10,7 @@
 //! Nothing backtracks: a search adds each (instruction, position)
 //! pair at most once, so it costs O(n·m·k) for n input bytes, m
 //! instructions and k slots, and the limits `compile` enforces bound
-//! m and m·k. Constructs that need backtracking are refused when the
+//! m and m·k. A find loop can be quadratic (docs/REGEX.md §3.5). Constructs that need backtracking are refused when the
 //! pattern compiles, with a sentence naming them.
 //!
 //! The Unicode data, the case mappings `(?iu)` folds by and the
@@ -34,8 +34,18 @@ const HeapHeader = heap_mod.HeapHeader;
 pub const max_repeat = 1000;
 /// The largest program, counted after every repetition is expanded.
 pub const max_insts = 10_000;
+/// The most AST nodes the compiler visits, after every repetition is
+/// expanded: a body that compiles to nothing still costs its nodes.
+pub const max_nodes = 1_000_000;
 /// The largest program size times capture slots: one thread list's slot words.
 pub const max_slot_words = 1 << 20;
+/// The most code-point ranges the classes of one program store, each
+/// distinct set once.
+pub const max_ranges = 1 << 16;
+/// The memory compiling a pattern may take: this, plus `budget_per_byte`
+/// for each byte of the pattern, so a literal of any length compiles.
+pub const budget_base = 16 << 20;
+pub const budget_per_byte = 32;
 /// The deepest nesting of groups and character classes.
 pub const max_nest = 250;
 
@@ -118,6 +128,55 @@ pub const Compiled = union(enum) { ok: Program, err: SyntaxError };
 /// Compile `source` with `flags`, allocating in `arena`. A syntax
 /// error or a pattern past a limit is `.err`, never a Zig error.
 pub fn compile(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Error || stack.Error)!Compiled {
+    var budget: Budget = .{ .child = arena, .left = budget_base +| budget_per_byte *| source.len };
+    return compileIn(budget.allocator(), source, flags) catch |e| switch (e) {
+        error.OutOfMemory => if (budget.spent) .{ .err = .{ .msg = "the pattern needs too much memory to compile", .offset = 0 } } else e,
+        else => e,
+    };
+}
+
+/// An allocator that refuses past `left` bytes: what one pattern's
+/// sets and nodes may take while it compiles (docs/REGEX.md §4).
+const Budget = struct {
+    child: Allocator,
+    left: usize,
+    spent: bool = false,
+
+    fn allocator(b: *Budget) Allocator {
+        return .{ .ptr = b, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn take(b: *Budget, n: usize) bool {
+        if (n > b.left) {
+            b.spent = true;
+            return false;
+        }
+        b.left -= n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return if (b.take(len)) b.child.rawAlloc(len, alignment, ret) else null;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return (len <= memory.len or b.take(len - memory.len)) and b.child.rawResize(memory, alignment, len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return if (len <= memory.len or b.take(len - memory.len)) b.child.rawRemap(memory, alignment, len, ret) else null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        b.child.rawFree(memory, alignment, ret);
+    }
+};
+
+fn compileIn(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Error || stack.Error)!Compiled {
     if (!std.unicode.utf8ValidateSlice(source)) return .{ .err = .{ .msg = "the pattern is not valid UTF-8", .offset = 0 } };
     var p: Parser = .{ .arena = arena, .src = source, .flags = flags };
     try p.unquote();
@@ -141,6 +200,8 @@ pub fn compile(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Er
     const prog = c.program(root, p.ngroups, p.names.items) catch |e| return switch (e) {
         error.TooBig => .{ .err = .{ .msg = "the pattern compiles to more than 10000 instructions", .offset = 0 } },
         error.TooManySlots => .{ .err = .{ .msg = "the pattern has too many groups for its size", .offset = 0 } },
+        error.TooManyNodes => .{ .err = .{ .msg = "the pattern expands to more than 1000000 nodes", .offset = 0 } },
+        error.TooManyRanges => .{ .err = .{ .msg = "the pattern's classes hold more than 65536 ranges", .offset = 0 } },
         error.OutOfMemory => error.OutOfMemory,
         error.StackOverflow => error.StackOverflow,
     };
@@ -209,13 +270,32 @@ fn normalize(rs: []Range) []Range {
     return rs[0 .. n + 1];
 }
 
-fn unite(arena: Allocator, x: ?[]const Range, y: []const Range) Allocator.Error![]const Range {
-    const a = x orelse return y;
-    const out = try arena.alloc(Range, a.len + y.len);
-    @memcpy(out[0..a.len], a);
-    @memcpy(out[a.len..], y);
-    return normalize(out);
-}
+/// A union built one operand at a time, null until the first (an
+/// empty union differs from none). Operands are appended and merged
+/// when the list has doubled, so a class of n items costs O(n log n),
+/// not a copy of the union per item.
+const Union = struct {
+    list: ?std.ArrayList(Range) = null,
+    merged: usize = 0,
+
+    fn add(u: *Union, arena: Allocator, set: []const Range) Allocator.Error!void {
+        if (u.list == null) u.list = .empty;
+        const l = &u.list.?;
+        try l.appendSlice(arena, set);
+        if (l.items.len > 2 * u.merged + 64) {
+            l.items = normalize(l.items);
+            u.merged = l.items.len;
+        }
+    }
+
+    /// The union so far, a copy later operands leave alone.
+    fn get(u: *Union, arena: Allocator) Allocator.Error!?[]const Range {
+        const l = if (u.list) |*l| l else return null;
+        l.items = normalize(l.items);
+        u.merged = l.items.len;
+        return try arena.dupe(Range, l.items);
+    }
+};
 
 fn intersect(arena: Allocator, a: []const Range, b: []const Range) Allocator.Error![]const Range {
     var out: std.ArrayList(Range) = .empty;
@@ -381,7 +461,7 @@ const Node = union(enum) {
     /// A run of literal code points: Java's slice when it holds two or
     /// more, which `(?iu)` folds by a different rule than one.
     lit: struct { cps: []const u21, fold: Fold },
-    class: struct { ranges: []const Range, offset: ?u32 = null },
+    class: []const Range,
     assert: Assert,
     /// `\R`.
     line_end,
@@ -402,6 +482,10 @@ const Repeat = struct {
     ques: bool,
     /// The hidden slot of a nullable body, shared by every copy.
     hidden: ?u32 = null,
+    /// The body can match empty; it is `deterministic`. Found once,
+    /// when the repetition is parsed, so neither walks a body again.
+    body_nullable: bool,
+    body_deterministic: bool,
 };
 
 fn nullable(n: *const Node) stack.Error!bool {
@@ -417,7 +501,7 @@ fn nullable(n: *const Node) stack.Error!bool {
         .alt => |items| for (items) |i| {
             if (try nullable(i)) break true;
         } else false,
-        .repeat => |r| r.min == 0 or try nullable(r.body),
+        .repeat => |r| r.min == 0 or r.body_nullable,
     };
 }
 
@@ -432,7 +516,7 @@ fn deterministic(n: *const Node) stack.Error!bool {
             if (!try deterministic(i)) break false;
         } else true,
         .alt => false,
-        .repeat => |r| !r.ques and r.min == r.max and try deterministic(r.body),
+        .repeat => |r| !r.ques and r.min == r.max and r.body_deterministic,
     };
 }
 
@@ -497,6 +581,12 @@ const Parser = struct {
 
     fn failf(p: *Parser, at: usize, comptime fmt: []const u8, args: anytype) Fail {
         return p.fail(at, try p.arena.print(fmt, args));
+    }
+
+    /// The code point before `cursor`: where Java reports most of its
+    /// errors, its index being one less than its cursor.
+    fn before(p: *const Parser, cursor: usize) usize {
+        return if (cursor == 0) 0 else prevStart(p.src, cursor);
     }
 
     fn node(p: *Parser, n: Node) Fail!*Node {
@@ -605,7 +695,7 @@ const Parser = struct {
 
     fn parse(p: *Parser) Fail!*Node {
         const root = try p.alternation();
-        if (p.peek() != null) return p.fail(p.pos, "Unmatched closing ')'");
+        if (p.peek() != null) return p.fail(p.before(p.pos), "Unmatched closing ')'");
         return root;
     }
 
@@ -645,7 +735,11 @@ const Parser = struct {
                         (if (p.flags.m) .dollar_unix_m else .dollar_unix)
                     else if (p.flags.m) .dollar_m else .dollar });
                 },
-                '*', '+', '?' => return p.failf(p.pos + 1, "Dangling meta character '{c}'", .{@as(u8, @intCast(c))}),
+                '*', '+', '?' => {
+                    p.pos += 1;
+                    p.skipSpace();
+                    return p.failf(p.before(p.pos), "Dangling meta character '{c}'", .{@as(u8, @intCast(c))});
+                },
                 // Java reads an empty atom here, which a valid bound repeats.
                 '{' => try p.node(.empty),
                 else => try p.run(),
@@ -660,7 +754,7 @@ const Parser = struct {
     }
 
     fn classNode(p: *Parser, set: []const Range) Fail!*Node {
-        return p.node(.{ .class = .{ .ranges = set } });
+        return p.node(.{ .class = set });
     }
 
     /// A run of literal characters, as Java's `atom` collects one: it
@@ -755,7 +849,7 @@ const Parser = struct {
             'x' => return .{ .lit = try p.hex() },
             'u' => return .{ .lit = try p.unicode() },
             'c' => {
-                if (p.pos >= p.src.len) return p.fail(p.pos, "Illegal control escape sequence");
+                if (p.pos >= p.src.len) return p.fail(p.before(p.pos), "Illegal control escape sequence");
                 const d = decode(p.src, p.pos);
                 p.pos += d.len;
                 return .{ .lit = d.c ^ 64 };
@@ -771,7 +865,7 @@ const Parser = struct {
             'H' => try complement(p.arena, &sets.hspace),
             'V' => try complement(p.arena, &sets.vspace),
             else => if (cp.c < 0x80 and std.ascii.isAlphanumeric(@intCast(cp.c)))
-                return p.fail(at, "Illegal/unsupported escape sequence")
+                return p.fail(p.before(p.pos), "Illegal/unsupported escape sequence")
             else
                 return .{ .lit = cp.c },
         };
@@ -807,7 +901,7 @@ const Parser = struct {
         var v: u32 = 0;
         while (p.digit(16)) |d| {
             v = v * 16 + d;
-            if (v > 0x10FFFF) return p.fail(p.pos, "Hexadecimal codepoint is too big");
+            if (v > 0x10FFFF) return p.fail(p.before(p.pos), "Hexadecimal codepoint is too big");
         }
         if (!p.rawIs(p.pos, '}')) return p.fail(p.pos, "Unclosed hexadecimal escape sequence");
         p.pos += 1;
@@ -863,7 +957,15 @@ const Parser = struct {
             greedy = false;
         } else if (p.peek() == '+') return p.fail(p.pos, "possessive quantifiers are not supported");
         if (min > max_repeat or (max != inf and max > max_repeat)) return p.fail(at, "repetition count exceeds 1000");
-        return p.node(.{ .repeat = .{ .body = atom, .min = min, .max = max, .greedy = greedy, .ques = c == '?' } });
+        return p.node(.{ .repeat = .{
+            .body = atom,
+            .min = min,
+            .max = max,
+            .greedy = greedy,
+            .ques = c == '?',
+            .body_nullable = try nullable(atom),
+            .body_deterministic = try deterministic(atom),
+        } });
     }
 
     fn count(p: *Parser) Fail!u32 {
@@ -953,7 +1055,7 @@ const Parser = struct {
         const name = p.src[start..p.pos];
         if (!p.rawIs(p.pos, '>')) return p.fail(p.pos, "named capturing group is missing trailing '>'");
         p.pos += 1;
-        if (findName(p.names.items, name) != null) return p.failf(p.pos, "Named capturing group <{s}> is already defined", .{name});
+        if (findName(p.names.items, name) != null) return p.failf(p.before(p.pos), "Named capturing group <{s}> is already defined", .{name});
         p.ngroups += 1;
         var head: [8]u8 = undefined;
         std.mem.writeInt(u32, head[0..4], p.ngroups, .little);
@@ -974,9 +1076,9 @@ const Parser = struct {
         p.depth += 1;
         defer p.depth -= 1;
         if (p.depth > max_nest) return p.fail(at, "groups nest too deeply");
-        var prev: ?[]const Range = null;
+        var prev: Union = .{};
         var curr: ?[]const Range = null;
-        var gathered: []const Range = &.{};
+        var gathered: Union = .{};
         var has_bits = false;
         var negate = false;
         if (bracket and p.rawIs(p.pos, '^')) {
@@ -984,55 +1086,55 @@ const Parser = struct {
             negate = true;
         }
         while (true) {
-            const c = p.peek() orelse return p.fail(at, "Unclosed character class");
+            const c = p.peek() orelse return p.fail(p.before(p.src.len), "Unclosed character class");
             switch (c) {
                 '[' => {
                     p.pos += 1;
                     const inner = try p.class(true);
                     curr = inner;
-                    prev = try unite(p.arena, prev, inner);
+                    try prev.add(p.arena, inner);
                     continue;
                 },
                 '&' => if (p.rawIs(p.pos + 1, '&')) {
                     p.pos += 2;
-                    var right: ?[]const Range = null;
+                    var right: Union = .{};
                     while (true) {
-                        const d = p.peek() orelse return p.fail(at, "Unclosed character class");
+                        const d = p.peek() orelse return p.fail(p.before(p.src.len), "Unclosed character class");
                         if (d == ']' or d == '&') break;
                         const operand = if (d == '[') blk: {
                             p.pos += 1;
                             break :blk try p.class(true);
                         } else try p.class(false);
-                        right = try unite(p.arena, right, operand);
+                        try right.add(p.arena, operand);
                     }
+                    const low = try gathered.get(p.arena) orelse &.{};
                     if (has_bits) {
-                        if (prev) |pv| prev = try unite(p.arena, pv, gathered) else {
-                            prev = gathered;
-                            curr = gathered;
-                        }
+                        if (prev.list == null) curr = low;
+                        try prev.add(p.arena, low);
                         has_bits = false;
                     }
-                    if (right) |r| curr = r;
-                    if (prev) |pv| {
-                        prev = try intersect(p.arena, pv, curr orelse gathered);
-                    } else prev = right orelse return p.fail(p.pos, "Bad class syntax");
+                    if (try right.get(p.arena)) |r| curr = r;
+                    if (try prev.get(p.arena)) |pv| {
+                        prev = .{};
+                        try prev.add(p.arena, try intersect(p.arena, pv, curr orelse low));
+                    } else if (right.list != null) prev = right else return p.fail(p.before(p.pos), "Bad class syntax");
                     continue;
                 },
-                ']' => if (prev != null or has_bits) {
+                ']' => if (prev.list != null or has_bits) {
                     if (bracket) p.pos += 1;
-                    var set = prev orelse gathered;
-                    if (prev != null and has_bits) set = try unite(p.arena, set, gathered);
+                    if (has_bits) try prev.add(p.arena, try gathered.get(p.arena) orelse &.{});
+                    const set = try prev.get(p.arena) orelse &.{};
                     return if (negate) try complement(p.arena, set) else set;
                 },
                 else => {},
             }
             const item = try p.classItem(c);
             if (item.bits) {
-                gathered = try unite(p.arena, gathered, item.set);
+                try gathered.add(p.arena, item.set);
                 has_bits = true;
             } else {
                 curr = item.set;
-                prev = try unite(p.arena, prev, item.set);
+                try prev.add(p.arena, item.set);
             }
         }
     }
@@ -1055,10 +1157,10 @@ const Parser = struct {
             if (d == '\\') {
                 switch (try p.escape(true, true)) {
                     .lit => |cp| hi = cp,
-                    else => return p.fail(p.pos, "Illegal character range"),
+                    else => return p.fail(p.before(p.pos), "Illegal character range"),
                 }
             } else p.advance();
-            if (hi < lo) return p.fail(p.pos, "Illegal character range");
+            if (hi < lo) return p.fail(p.before(p.pos), "Illegal character range");
             return .{ .set = try p.foldRange(lo, hi), .bits = false };
         }
         // Java's BitClass takes these unless (?iu) must fold them past Latin-1.
@@ -1124,11 +1226,11 @@ const Parser = struct {
             } else for ([_][]const u8{ "sc", "script", "blk", "block" }) |k| {
                 if (std.ascii.eqlIgnoreCase(key, k)) return p.fail(at, unsupported_property);
             }
-            return p.failf(at, "Unknown Unicode property {{name=<{s}>, value=<{s}>}}", .{ key, value });
+            return p.failf(p.before(p.pos), "Unknown Unicode property {{name=<{s}>, value=<{s}>}}", .{ try std.ascii.allocLowerString(p.arena, key), value });
         }
         if (std.mem.startsWith(u8, name, "In") or std.mem.startsWith(u8, name, "java")) return p.fail(at, unsupported_property);
         if (std.mem.startsWith(u8, name, "Is")) return (try p.categorySet(name[2..])) orelse return p.fail(at, unsupported_property);
-        return (try p.named(name)) orelse return p.failf(at, "Unknown character property name {{{s}}}", .{name});
+        return (try p.named(name)) orelse return p.failf(p.before(p.pos), "Unknown character property name {{{s}}}", .{name});
     }
 
     /// A general category, a POSIX class or `all`, by the names Java's
@@ -1201,9 +1303,12 @@ const Compiler = struct {
     arena: Allocator,
     insts: std.ArrayList(Inst) = .empty,
     ranges: std.ArrayList(Range) = .empty,
+    /// The offset in `ranges` of each distinct set, keyed by its bytes.
+    sets: std.array_hash_map.String(u32) = .empty,
     nhidden: u32 = 0,
+    nodes: u32 = 0,
 
-    const Fail = error{ TooBig, TooManySlots, OutOfMemory, StackOverflow };
+    const Fail = error{ TooBig, TooManySlots, TooManyNodes, TooManyRanges, OutOfMemory, StackOverflow };
 
     fn emit(c: *Compiler, inst: Inst) Fail!u32 {
         if (c.insts.items.len >= max_insts) return error.TooBig;
@@ -1240,7 +1345,7 @@ const Compiler = struct {
             .literal = null,
             .prefix = try prefixOf(c.arena, insts),
             .first_bytes = try firstBytes(c.arena, insts, c.ranges.items),
-            .anchored = anchoredAt(insts),
+            .anchored = try anchoredAt(c.arena, insts),
         };
     }
 
@@ -1248,6 +1353,8 @@ const Compiler = struct {
     /// one unit, where a trailing `\R` takes `\r\n` whenever it can.
     fn node(c: *Compiler, n: *Node, atomic: bool) Fail!void {
         try stack.check();
+        c.nodes += 1;
+        if (c.nodes > max_nodes) return error.TooManyNodes;
         switch (n.*) {
             .empty => {},
             .lit => |l| for (l.cps) |cp| {
@@ -1256,15 +1363,7 @@ const Compiler = struct {
                     _ = try c.emit(.{ .op = .char, .a = set[0][0] });
                 } else try c.class(set);
             },
-            .class => |*k| {
-                const offset = k.offset orelse blk: {
-                    const at: u32 = @intCast(c.ranges.items.len);
-                    try c.ranges.appendSlice(c.arena, k.ranges);
-                    k.offset = at;
-                    break :blk at;
-                };
-                _ = try c.emit(.{ .op = .class, .a = offset, .b = @intCast(k.ranges.len) });
-            },
+            .class => |set| try c.class(set),
             .assert => |a| _ = try c.emit(.{ .op = .assert, .a = @backingInt(a) }),
             .line_end => try c.lineEnd(atomic),
             .group => |g| {
@@ -1289,10 +1388,16 @@ const Compiler = struct {
         }
     }
 
+    /// A class instruction over `set`, which the range table holds once
+    /// however many instructions test it.
     fn class(c: *Compiler, set: []const Range) Fail!void {
-        const at: u32 = @intCast(c.ranges.items.len);
-        try c.ranges.appendSlice(c.arena, set);
-        _ = try c.emit(.{ .op = .class, .a = at, .b = @intCast(set.len) });
+        const gop = try c.sets.getOrPut(c.arena, std.mem.sliceAsBytes(set));
+        if (!gop.found_existing) {
+            if (c.ranges.items.len + set.len > max_ranges) return error.TooManyRanges;
+            gop.value_ptr.* = @intCast(c.ranges.items.len);
+            try c.ranges.appendSlice(c.arena, set);
+        }
+        _ = try c.emit(.{ .op = .class, .a = gop.value_ptr.*, .b = @intCast(set.len) });
     }
 
     /// `\r\n | [\n\x0B\f\r\x85  ]`; atomic, `\r` alone only
@@ -1331,12 +1436,12 @@ const Compiler = struct {
     /// instructions its predecessor did not visit at that position.
     fn repeat(c: *Compiler, r: *Repeat) Fail!void {
         const body = r.body;
-        const atomic = body.* == .line_end or (body.* == .group and !r.ques and try deterministic(body));
+        const atomic = body.* == .line_end or (body.* == .group and !r.ques and r.body_deterministic);
         var exits: std.ArrayList(u32) = .empty;
         if (r.ques) {
             try c.loopSplit(c.here() + 1, r.greedy, &exits);
             try c.node(body, atomic);
-        } else if (try nullable(body) and try deterministic(body)) {
+        } else if (r.body_nullable and r.body_deterministic) {
             for (0..r.min) |_| try c.node(body, atomic);
             // Java tries one more greedy iteration, which cannot move the
             // match: it keeps the captures of groups inside the body and
@@ -1346,7 +1451,7 @@ const Compiler = struct {
                 try c.node(if (body.* == .group) body.group.body else body, atomic);
             }
         } else {
-            const hidden: ?u32 = if (!try nullable(body)) null else r.hidden orelse blk: {
+            const hidden: ?u32 = if (!r.body_nullable) null else r.hidden orelse blk: {
                 r.hidden = c.nhidden;
                 c.nhidden += 1;
                 break :blk r.hidden;
@@ -1438,13 +1543,27 @@ fn firstBytes(arena: Allocator, insts: []const Inst, ranges: []const Range) Allo
     return if (ascii) null else set;
 }
 
-fn anchoredAt(insts: []const Inst) bool {
-    for (insts[1..]) |in| switch (in.op) {
-        .save, .mark => {},
-        .assert => return in.a == @backingInt(Assert.begin),
-        else => return false,
-    };
-    return false;
+/// Every path from the start passes `\A` or `^` before it consumes a
+/// code point or matches, so a match can start only at offset 0.
+fn anchoredAt(arena: Allocator, insts: []const Inst) Allocator.Error!bool {
+    const seen = try arena.alloc(bool, insts.len);
+    @memset(seen, false);
+    var todo: std.ArrayList(u32) = .empty;
+    try todo.append(arena, 1);
+    while (todo.pop()) |pc| {
+        if (seen[pc]) continue;
+        seen[pc] = true;
+        const in = insts[pc];
+        switch (in.op) {
+            .char, .class, .match => return false,
+            .assert => if (in.a != @backingInt(Assert.begin)) try todo.append(arena, pc + 1),
+            .split => try todo.appendSlice(arena, &.{ in.a, in.b }),
+            .jmp => try todo.append(arena, in.a),
+            .if_empty => try todo.appendSlice(arena, &.{ pc + 1, in.b }),
+            .save, .mark => try todo.append(arena, pc + 1),
+        }
+    }
+    return true;
 }
 
 // =============================================================================
@@ -1478,6 +1597,10 @@ const List = struct {
     }
 };
 
+/// A run `[lo, hi)` of non-spacing marks whose base character is (or
+/// is not) a letter or digit, for `\b`.
+pub const Marks = struct { lo: usize = 1, hi: usize = 0, base: bool = false };
+
 /// The scratch space of searches with one program, reused across them.
 pub const Vm = struct {
     prog: *const Program,
@@ -1489,10 +1612,12 @@ pub const Vm = struct {
     stack: []Frame,
     /// The slots of the last match.
     best: []usize,
-    /// A run `[lo, hi)` of non-spacing marks whose base character is
-    /// (or is not) a letter or digit, for `\b`.
-    marks: struct { lo: usize = 1, hi: usize = 0, base: bool = false } = .{},
-    /// Closure steps, counted in tests to pin the linear bound.
+    /// The `\b` cache of the input `marks_of`, kept across its
+    /// searches so a find loop walks back over a run of marks once.
+    marks: Marks = .{},
+    marks_of: []const u8 = &.{},
+    /// Closure steps and steps back over marks, counted in tests to
+    /// pin the linear bound.
     visits: u64 = 0,
 
     /// `groups`: record every group, else only the whole match.
@@ -1540,7 +1665,10 @@ pub const Vm = struct {
             vm.best[1] = vm.best[0] + lit.len;
             return true;
         }
-        vm.marks = .{};
+        if (vm.marks_of.ptr != hay.ptr or vm.marks_of.len != hay.len) {
+            vm.marks = .{};
+            vm.marks_of = hay;
+        }
         const k = vm.k;
         var clist = &vm.lists[0];
         var nlist = &vm.lists[1];
@@ -1550,7 +1678,13 @@ pub const Vm = struct {
         var matched = false;
         while (true) {
             if (!matched and (pos == from or !anchored)) {
-                if (clist.len == 0 and !anchored) pos = vm.skip(hay, pos) orelse break;
+                if (clist.len == 0 and !anchored) {
+                    // Threads that died at `pos` marked the list; at
+                    // another position those marks are stale.
+                    const next = vm.skip(hay, pos) orelse break;
+                    if (next != pos) clist.clear();
+                    pos = next;
+                }
                 @memset(vm.cap, none);
                 vm.add(clist, 0, hay, pos, last_end);
             }
@@ -1705,6 +1839,7 @@ pub const Vm = struct {
         var q = at;
         var base = false;
         while (q > 0) {
+            if (builtin.is_test) vm.visits += 1;
             const s = prevStart(hay, q);
             if (m.lo <= s and s < m.hi) {
                 base = m.base;
@@ -1782,13 +1917,15 @@ const PatternBody = struct {
 pub const Made = union(enum) { ok: Value, err: SyntaxError };
 
 /// Compile `source` in a scratch arena on `gpa` and copy the program
-/// and the source into one `regex` block. A syntax error is `.err`.
+/// and the source into one `regex` block. A syntax error is `.err`,
+/// its message allocated on `gpa` and owned by the caller: the
+/// sentence may be formatted in the arena, which dies here.
 pub fn make(heap: *Heap, gpa: Allocator, source: []const u8) (Allocator.Error || stack.Error)!Made {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const p = switch (try compile(arena.allocator(), source, .{})) {
         .ok => |p| p,
-        .err => |e| return .{ .err = e },
+        .err => |e| return .{ .err = .{ .msg = try gpa.dupe(u8, e.msg), .offset = e.offset } },
     };
     const literal = p.literal orelse &.{};
     const size = @sizeOf(PatternBody) + p.insts.len * @sizeOf(Inst) + p.ranges.len * @sizeOf(Range) +
@@ -1839,8 +1976,13 @@ pub const MatcherBox = extern struct {
     next: u64,
     /// The end of the last match, where `\G` holds.
     last_end: u64,
+    /// The `\b` cache of the input (`Marks`), carried from one
+    /// `re-find` to the next.
+    marks_lo: u64 = 1,
+    marks_hi: u64 = 0,
     state: State,
-    _pad: [7]u8 = @splat(0),
+    marks_base: bool = false,
+    _pad: [6]u8 = @splat(0),
 
     pub const State = enum(u8) { fresh, matched, failed };
 };
@@ -1874,12 +2016,21 @@ pub fn matcherFind(gpa: Allocator, v: Value) Allocator.Error!bool {
     if (b.state == .failed) return false;
     var vm: Vm = try .init(gpa, programOf(b.pattern), true);
     defer vm.deinit(gpa);
-    var f: Finder = .{ .vm = &vm, .hay = string.asBytes(b.input), .next = b.next, .last_end = b.last_end };
-    if (!f.find()) {
+    const hay = string.asBytes(b.input);
+    vm.marks = .{ .lo = b.marks_lo, .hi = b.marks_hi, .base = b.marks_base };
+    vm.marks_of = hay;
+    var f: Finder = .{ .vm = &vm, .hay = hay, .next = b.next, .last_end = b.last_end };
+    const found = f.find();
+    b.marks_lo = vm.marks.lo;
+    b.marks_hi = vm.marks.hi;
+    b.marks_base = vm.marks.base;
+    if (!found) {
         b.state = .failed;
         return false;
     }
-    b.* = .{ .pattern = b.pattern, .input = b.input, .next = f.next, .last_end = f.last_end, .state = .matched };
+    b.next = f.next;
+    b.last_end = f.last_end;
+    b.state = .matched;
     const slots = matcherSlots(v);
     for (0..slots.len / 2) |g| {
         const span = vm.group(g) orelse .{ none, none };
@@ -2287,7 +2438,7 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
         .{ "\\p{L", "Unclosed character family" },
         .{ "\\pX", "Unknown character property name {X}" },
         .{ "\\p{gc=X}", "Unknown Unicode property {name=<gc>, value=<X>}" },
-        .{ "\\p{foo=L}", "Unknown Unicode property {name=<foo>, value=<L>}" },
+        .{ "\\p{Foo=L}", "Unknown Unicode property {name=<foo>, value=<L>}" },
         .{ "(?<1x>a)", "capturing group name does not start with a Latin letter" },
         .{ "(?<x_y>a)", "named capturing group is missing trailing '>'" },
         .{ "(?<x>a)(?<x>b)", "Named capturing group <x> is already defined" },
@@ -2303,6 +2454,31 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
             return e;
         };
     }
+}
+
+test "regex: a syntax error's offset is the code point Java's index names" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Each index is java.util.regex's, through bb.
+    const cases = [_]struct { []const u8, usize }{
+        .{ "a)", 0 },        .{ "\u{e9})", 0 },         .{ "(?x) a )", 6 },        .{ "*a", 0 },
+        .{ "a**", 2 },       .{ "\u{e9}+?*", 3 },       .{ "(?x) * ", 6 },         .{ "\\c", 1 },
+        .{ "\u{e9}\\c", 2 }, .{ "\\y", 1 },             .{ "[\\y]", 2 },           .{ "\\E", 1 },
+        .{ "[\\A]", 2 },     .{ "\\x{110000}", 8 },     .{ "(?<a>x)(?<a>y)", 11 }, .{ "[^]", 2 },
+        .{ "[a&&", 3 },      .{ "[\u{e9}", 1 },         .{ "[\u{1F600}", 1 },      .{ "[&&]", 2 },
+        .{ "[z-a]", 3 },     .{ "[\u{fc}-\u{e9}]", 3 }, .{ "[z-\\x{61}]", 8 },     .{ "[a-\\d]", 4 },
+        .{ "\\pQ", 2 },      .{ "\\p{Foo}", 6 },        .{ "[\\p{Foo}]", 7 },      .{ "\\p{gc=Foo}", 9 },
+        .{ "\\p{gc=}", 6 },  .{ "(", 1 },               .{ "a{2,1}", 5 },          .{ "\\x{12", 5 },
+        .{ "\\u12", 4 },     .{ "(?<1a>x)", 3 },        .{ "\\p{", 3 },            .{ "x{2147483648}", 11 },
+    };
+    for (cases) |case| {
+        const e = (try compile(arena.allocator(), case[0], .{})).err;
+        testing.expectEqual(case[1], try std.unicode.utf8CountCodepoints(case[0][0..e.offset])) catch |err| {
+            std.debug.print("pattern {s}: {s}\n", .{ case[0], e.msg });
+            return err;
+        };
+    }
+    try testing.expectEqualStrings("Unknown Unicode property {name=<foo>, value=<Bar>}", (try compile(arena.allocator(), "\\p{Foo=Bar}", .{})).err.msg);
 }
 
 fn nested(a: Allocator, open: []const u8, close: []const u8, n: usize) ![]const u8 {
@@ -2324,6 +2500,29 @@ test "regex: the limits refuse a pattern one step past them" {
     try testing.expect(try compile(a, try nested(a, "(", ")", max_nest), .{}) == .ok);
     try testing.expectEqualStrings("groups nest too deeply", (try compile(a, try nested(a, "(", ")", max_nest + 1), .{})).err.msg);
     try testing.expectEqualStrings("groups nest too deeply", (try compile(a, try nested(a, "[", "]", 300), .{})).err.msg);
+    // A body that compiles to nothing still costs its nodes, every copy.
+    try testing.expect(try compile(a, "(?:(?:){1000}){499}", .{}) == .ok);
+    for ([_][]const u8{ "(?:(?:){1000}){500}", "(?:(?:(?:){1000}){1000}){1000}", "(?:(?:(?:(?:x{0}){1000}){1000}){1000}){1000}" }) |p|
+        try testing.expectEqualStrings("the pattern expands to more than 1000000 nodes", (try compile(a, p, .{})).err.msg);
+    // A class's ranges are stored once however often it is written,
+    // and the distinct ones are limited.
+    const pl = (try compile(a, "\\PL", .{})).ok.ranges.len;
+    var many: std.ArrayList(u8) = .empty;
+    for (0..1000) |_| try many.appendSlice(a, "\\PL");
+    try testing.expectEqual(pl, (try compile(a, many.items, .{})).ok.ranges.len);
+    many.clearRetainingCapacity();
+    for (0..max_ranges / pl + 2) |i| try many.print(a, "[\\PL\\x{{{X}}}]", .{0x4E00 + 2 * i});
+    try testing.expectEqualStrings("the pattern's classes hold more than 65536 ranges", (try compile(a, many.items, .{})).err.msg);
+    // A class's items are united once, not copied per item; the sets
+    // a pattern builds while it compiles are bounded by its size.
+    many.clearRetainingCapacity();
+    try many.append(a, '[');
+    for (0..50_000) |i| try many.print(a, "\\x{{{X}}}", .{0x10000 + 2 * i});
+    try many.append(a, ']');
+    try testing.expectEqual(@as(usize, 50_000), (try compile(a, many.items, .{})).ok.ranges.len);
+    many.clearRetainingCapacity();
+    for (0..5000) |_| try many.appendSlice(a, "[^\\pL]");
+    try testing.expectEqualStrings("the pattern needs too much memory to compile", (try compile(a, many.items, .{})).err.msg);
     // A literal of any length skips the VM and its limits.
     const big = try a.alloc(u8, 1 << 20);
     @memset(big, 'q');
@@ -2349,6 +2548,40 @@ test "regex: a search adds each instruction at most once per position" {
     }
 }
 
+test "regex: \\b and \\B walk back over a run of marks once in a find loop" {
+    const gpa = testing.allocator;
+    const n = 4000;
+    const hay = try gpa.alloc(u8, 1 + 2 * n);
+    defer gpa.free(hay);
+    hay[0] = 'a';
+    for (0..n) |i| @memcpy(hay[1 + 2 * i ..][0..2], "\u{301}");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for ([_]struct { []const u8, usize }{ .{ "\\B", n }, .{ "\\b", 2 } }) |case| {
+        const prog = (try compile(arena.allocator(), case[0], .{})).ok;
+        var vm: Vm = try .init(gpa, &prog, false);
+        defer vm.deinit(gpa);
+        var f: Finder = .{ .vm = &vm, .hay = hay };
+        var found: usize = 0;
+        while (f.find()) found += 1;
+        try testing.expectEqual(case[1], found);
+        try testing.expect(vm.visits <= 8 * hay.len);
+    }
+}
+
+test "regex: a matcher carries the \\b cache from one find to the next" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const pattern = (try make(&heap, testing.allocator, "\\B")).ok;
+    const m = try makeMatcher(&heap, pattern, try string.fromBytes(&heap, "a\u{301}\u{301}\u{301}"));
+    for ([_]usize{ 1, 3, 5 }) |at| {
+        try testing.expect(try matcherFind(testing.allocator, m));
+        try testing.expectEqual(at, matcherGroup(m, 0).?[0]);
+        try testing.expectEqual(@as(u64, 1), matcherBox(m).marks_lo);
+    }
+    try testing.expect(!try matcherFind(testing.allocator, m));
+}
+
 test "regex: prefilters and anchors find what the VM alone finds" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -2356,6 +2589,8 @@ test "regex: prefilters and anchors find what the VM alone finds" {
     try testing.expectEqualStrings("abc", (try compile(a, "abc+", .{})).ok.prefix[0..2] ++ "c");
     try testing.expect((try compile(a, "\\Aab|x", .{})).ok.anchored == false);
     try testing.expect((try compile(a, "^ab", .{})).ok.anchored);
+    for ([_][]const u8{ "^a|^b", "(?:^a|(^b))c", "\\b^a|\\A", "(?:^a)+" }) |p| try testing.expect((try compile(a, p, .{})).ok.anchored);
+    for ([_][]const u8{ "^a|b", "(?:^a)*b", "(?m)^a", "(?:^a)?b" }) |p| try testing.expect(!(try compile(a, p, .{})).ok.anchored);
     try testing.expect((try compile(a, "[xy]z", .{})).ok.first_bytes != null);
     try testing.expect((try compile(a, "a*", .{})).ok.first_bytes == null);
     try expectFinds(&.{
@@ -2363,7 +2598,12 @@ test "regex: prefilters and anchors find what the VM alone finds" {
         .{ "[xy]z", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxzyz", "[[\"xz\"] [\"yz\"]]" },
         .{ "[é😀]z", "aaaaé😀z", "[[\"😀z\"]]" },
         .{ "^ab", "abab", "[[\"ab\"]]" },
+        .{ "^a|^b", "bab", "[[\"b\"]]" },
+        .{ "^a|^b", "xab", "[]" },
+        .{ "(?:^a|(^b))c", "bcac", "[[\"bc\" \"b\"]]" },
         .{ "(?m)^ab", "ab\nab", "[[\"ab\"] [\"ab\"]]" },
+        // Every thread dies at an assertion before the prefilter skips.
+        .{ "(?:\\ba)*\\bc", "ab c ab c", "[[\"c\"] [\"c\"]]" },
     });
 }
 
@@ -2424,6 +2664,20 @@ test "regex: a replacement string reads $n, ${name} and escapes as Java's append
     const quoted = try quoteReplacement(testing.allocator, "a$1\\b");
     defer testing.allocator.free(quoted);
     try testing.expectEqualStrings("a\\$1\\\\b", quoted);
+}
+
+test "regex: make's syntax error outlives the arena it compiled in" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    for ([_][2][]const u8{
+        .{ "*a", "Dangling meta character '*'" },
+        .{ "\\p{Foo}", "Unknown character property name {Foo}" },
+        .{ "(", "Unclosed group" },
+    }) |case| {
+        const e = (try make(&heap, testing.allocator, case[0])).err;
+        defer testing.allocator.free(e.msg);
+        try testing.expectEqualStrings(case[1], e.msg);
+    }
 }
 
 test "regex: a named group is found by name" {
