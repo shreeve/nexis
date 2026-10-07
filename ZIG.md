@@ -16,6 +16,12 @@ five-line probe.
 
 These build cleanly and misbehave at run time.
 
+- **A `defer` never runs past `@call(.always_tail, ...)`.** A function
+  that returns through a tail call leaves its frame before the call,
+  so its `defer` and `errdefer` blocks are skipped, in every build
+  mode, and Zig says nothing. A VM handler that tail-calls the next
+  one (`docs/VM.md` §6) releases what it holds before the call, not
+  in a `defer`.
 - **`init.gpa` is a `SafeAllocator` in debug and safe builds.** In
   Debug it records a stack trace per allocation, which makes
   allocation-heavy code about a hundred times slower. The CLI uses

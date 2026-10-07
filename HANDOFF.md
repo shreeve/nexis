@@ -49,7 +49,7 @@ with no server, readable by any number of processes
 
 ```bash
 git status                        # clean
-zig build install                 # bin/nexis and bin/nexis-golden
+zig build install                 # bin/nexis
 ./bin/nexis --help                # usage and the namespaces available without a file
 zig build test --summary all      # the gate
 ```
@@ -311,12 +311,14 @@ failing test (AGENTS.md).
 
 ### 6.1 Language and runtime
 
-1. **A lazy seq keeps its head** (`docs/LAZY.md` §9): the VM roots
-   every slot until it is reused, so a seq a local or a call's
-   argument holds keeps what it realized. Clearing a call's argument
-   block after it returns, and a local at its last use, would give
-   Clojure's constant-memory streaming; it is a compiler change with a
-   cost on every call, to be measured. **Macros get no `&form` or
+1. **A lazy seq bound to a local keeps its head** (`docs/LAZY.md` §9):
+   a native's call block is cleared when it returns and the
+   sequence natives that consume their argument clear its slot
+   (`docs/GC.md` §11.5), so a pipeline passed straight to `reduce`
+   runs in constant memory; a seq a local or a closure's argument
+   holds stays rooted until the slot is reused. Clearing a local at
+   its last use needs liveness in the compiler (TODO.md, Performance).
+   **Macros get no `&form` or
    `&env`** (§23 #34, §24 #13).
 2. **Regular expressions lack Unicode scripts, blocks and binary
    properties** (`\p{IsLatin}`, `\p{InGreek}`, `\p{IsAlphabetic}`),
@@ -361,8 +363,7 @@ failing test (AGENTS.md).
    harness runs on an x86_64 Linux host (`docs/PERF.md` §3.15).
    Unproven: a store written on one platform and read on the other
    (the page size is pinned, so the files should be byte-compatible).
-   The runtime thread reserves a 1 GiB stack, which a Linux host with
-   strict overcommit (`vm.overcommit_memory=2`) may refuse. The tests
+   The tests
    that open a read-only store file assume a user who is not root:
    root may write any file.
 2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI

@@ -8,7 +8,7 @@
 # binary natively on x86_64 and aarch64 Linux (glibc) and on macOS, and
 # the release job links bin/nexis statically against musl for both
 # architectures; check-targets would add only the musl test binaries,
-# at the cost of compiling all 28 binaries for four targets.
+# at the cost of compiling every binary for four targets.
 #
 # nexis builds against emdb as a path dependency (build.zig.zon
 # `.path = "../emdb"`), so every job checks nexis out into `nexis/` and
