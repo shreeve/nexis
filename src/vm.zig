@@ -160,6 +160,12 @@ pub const Call = enum(u6) {
     /// `call:self A=window B=argc C=dst`: call the frame's own closure
     /// with the arguments in `slot[A..A + argc]` (VM.md §10.2).
     self_ = 4,
+    /// `call:lookup A=dst B=target C=key`: `(key target)`, the key a
+    /// keyword or symbol constant (VM.md §10.2).
+    lookup = 5,
+    /// `call:lookup-or A=dst B=slot C=key`: `(key target default)`,
+    /// the target in `slot[B]` and the default in `slot[B + 1]`.
+    lookup_or = 6,
     _,
 };
 
@@ -524,11 +530,14 @@ pub const Routine = struct {
 
     /// What an operand position holds: nothing read, a destination
     /// slot, a slot read as such (a call block's base, a cell), a value
-    /// read through any operand kind, or a raw count (§4.5).
-    const Role = enum { none, dst, slot, src, raw };
+    /// read through any operand kind, a raw count (§4.5), or a keyword
+    /// or symbol constant.
+    const Role = enum { none, dst, slot, src, raw, key };
     /// What a wide field (§3) indexes.
     const WideRole = enum { pc, constant, var_, capture, try_ };
-    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false };
+    /// `block`: A and B name a call or collection block; `pair`: B
+    /// names two slots.
+    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false };
 
     /// The shape of the opcode at `op`, null for one with no
     /// operands to prove: an unimplemented one traps where it runs.
@@ -555,6 +564,8 @@ pub const Routine = struct {
             },
             .call => switch (@as(Call, @fromBackingInt(v))) {
                 .call, .self_ => .{ .a = .slot, .b = .raw, .c = .dst, .block = true },
+                .lookup => .{ .a = .dst, .b = .src, .c = .key },
+                .lookup_or => .{ .a = .dst, .b = .slot, .c = .key, .pair = true },
                 .@"return" => .{ .a = .src },
                 .return_nil, .tailcall, _ => null,
             },
@@ -623,6 +634,7 @@ pub const Routine = struct {
             // A self-call is this routine's: its count is the fixed arity.
             if (self_call and (self.variadic or inst.b.index != self.fixed_arity)) return VmError.BytecodeCorruption;
         }
+        if (shape.pair and @as(u32, inst.b.index) + 2 > self.slot_count) return VmError.OperandOutOfRange;
     }
 
     fn verifyOperand(self: *const Routine, op: Operand, role: Role) VmError!void {
@@ -631,6 +643,12 @@ pub const Routine = struct {
             .dst, .slot => {
                 if (op.kind != .slot) return VmError.InvalidOperandKind;
                 if (op.index >= self.slot_count) return VmError.OperandOutOfRange;
+            },
+            .key => {
+                if (op.kind != .constant) return VmError.InvalidOperandKind;
+                if (op.index >= self.consts.len) return VmError.OperandOutOfRange;
+                const k = self.consts[op.index].kind();
+                if (k != .keyword and k != .symbol) return VmError.InvalidOperandKind;
             },
             // Another kind traps where it is read, as `resolveOther`
             // says.
@@ -3622,6 +3640,8 @@ pub const VM = struct {
         t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
         t[opcode(.call, Call.call)] = &opCall;
         t[opcode(.call, Call.self_)] = &opCallSelf;
+        t[opcode(.call, Call.lookup)] = &opLookup;
+        t[opcode(.call, Call.lookup_or)] = &opLookup;
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
@@ -3647,6 +3667,8 @@ pub const VM = struct {
         t[opcode(.closure, Closure_.get_cell)] = &fastGetCell;
         t[opcode(.call, Call.call)] = &fastCall;
         t[opcode(.call, Call.self_)] = &fastCallSelf;
+        t[opcode(.call, Call.lookup)] = &fastLookup;
+        t[opcode(.call, Call.lookup_or)] = &fastLookup;
         t[opcode(.call, Call.@"return")] = &fastReturn;
         t[opcode(.call, Call.return_nil)] = &fastReturnNil;
         break :blk t;
@@ -3905,6 +3927,36 @@ pub const VM = struct {
         return self.nextSafe(self.currentFrame());
     }
 
+    /// `call:lookup` and `call:lookup-or` past the in-place cases: the
+    /// key called on the target, with the default, as `call:call` calls
+    /// it (§6), the same function with the same errors.
+    fn opLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
+        const key = try self.resolveIn(frame, inst.c);
+        var args: [2]Value = undefined;
+        var argc: usize = 1;
+        if (inst.variant == @backingInt(Call.lookup_or)) {
+            if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
+            const at = @as(usize, inst.b.index);
+            if (at + 2 > frame.routine.slot_count) return VmError.OperandOutOfRange;
+            args = .{ self.slotAt(frame, at).*, self.slotAt(frame, at + 1).* };
+            argc = 2;
+        } else args[0] = try self.resolveIn(frame, inst.b);
+        // A target read from a Var or a cell is held only here while a
+        // sorted collection's comparator runs. The scope is released
+        // before the chain goes on, not by a `defer`, which would run
+        // only once the tail call returned.
+        const scope = self.rootScope();
+        try scope.push(args[0]);
+        const result = self.callDirect(key, args[0..argc]);
+        scope.release();
+        const value = try result;
+        // A comparator may have grown `frames`.
+        const caller = self.currentFrame();
+        try self.storeIn(caller, inst.a, value);
+        return self.nextSafe(caller);
+    }
+
     fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         frame.pc = @intCast(pc);
         // Read the value while the callee frame is still active;
@@ -4151,6 +4203,27 @@ pub const VM = struct {
         const default = if (argc == 2) self.stack.items[base + 1] else value_mod.nilValue();
         const result = lookupInPlace(callee, self.stack.items[base], default) orelse return self.general(frame, inst, pc);
         self.slotAt(frame, inst.c.index).* = result;
+        return self.nextAt(frame, pc);
+    }
+
+    /// `call:lookup` and `call:lookup-or` of a target read in place: on
+    /// to `lookupPart`, out of line, since a map's search is a call.
+    /// Verification proved the key a keyword or symbol constant and
+    /// `call:lookup-or`'s target a slot.
+    fn fastLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        if (!self.fastOperand(frame, inst.b).ok) return self.general(frame, inst, pc);
+        return @call(out_of_line, lookupPart, .{ self, frame, inst, pc });
+    }
+
+    /// `fastLookup` of a map, a record or nil: the lookup `callLookupIn`
+    /// makes, with no copy and no safe point, since an immediate key
+    /// hashes and compares without the callbacks.
+    fn lookupPart(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        const key = frame.routine.consts[inst.c.index];
+        const target = loadWords(self.fastOperand(frame, inst.b).ptr);
+        const default = if (inst.variant == @backingInt(Call.lookup_or)) self.slotAt(frame, @as(usize, inst.b.index) + 1).* else value_mod.nilValue();
+        const result = lookupInPlace(key, target, default) orelse return self.general(frame, inst, pc);
+        self.verifiedSlot(frame, inst.a).* = result;
         return self.nextAt(frame, pc);
     }
 
@@ -5745,6 +5818,18 @@ pub const asm_ = struct {
     /// with the `argc` arguments at `window`, its result into `dst`.
     pub fn callSelf(window: u12, argc: u12, result_slot: u12) Inst {
         return Inst.primary(.call, Call.self_, Operand.slot(window), Operand.slot(argc), Operand.slot(result_slot));
+    }
+
+    /// call:lookup dst target key  ; slot[dst] := (key target), `key`
+    /// a keyword or symbol constant.
+    pub fn callLookup(dst: u12, target: Operand, key: u12) Inst {
+        return Inst.primary(.call, Call.lookup, Operand.slot(dst), target, Operand.constant(key));
+    }
+
+    /// call:lookup-or dst pair key  ; slot[dst] := (key slot[pair]
+    /// slot[pair + 1]).
+    pub fn callLookupOr(dst: u12, pair: u12, key: u12) Inst {
+        return Inst.primary(.call, Call.lookup_or, Operand.slot(dst), Operand.slot(pair), Operand.constant(key));
     }
 
     pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
@@ -7663,7 +7748,8 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
     const counted_caps = [_]CaptureDescriptor{.{ .routine = &counted, .sources = &.{} }};
     const tries = [_]Try{.{ .catch_pc = 5 }};
     const consts = [_]Value{fx(1)};
-    const Case = struct { name: []const u8, code: []const Inst, slots: u16 = 2, caps: []const CaptureDescriptor = &.{}, err: VmError, where: []const u8 = "t", pc: u32 };
+    const keyed = [_]Value{value_mod.testKeyword(1)};
+    const Case = struct { name: []const u8, code: []const Inst, slots: u16 = 2, caps: []const CaptureDescriptor = &.{}, keyed: bool = false, err: VmError, where: []const u8 = "t", pc: u32 };
     for ([_]Case{
         .{ .name = "no code", .code = &.{}, .err = VmError.BytecodeExhausted, .pc = 0 },
         .{ .name = "the code falls off its end", .code = &.{ asm_.loadNil(0), asm_.loadNil(1) }, .err = VmError.BytecodeExhausted, .pc = 1 },
@@ -7682,6 +7768,10 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a call block past the frame", .code = &.{ asm_.callCall(0, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
         .{ .name = "a self-call's arguments past the frame", .code = &.{ asm_.callSelf(1, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
         .{ .name = "a self-call of a count not the routine's arity", .code = &.{ asm_.callSelf(0, 1, 0), r }, .err = VmError.BytecodeCorruption, .pc = 0 },
+        .{ .name = "a lookup key not a constant", .code = &.{ Inst.primary(.call, Call.lookup, sl(0), sl(0), sl(1)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a lookup key neither keyword nor symbol", .code = &.{ asm_.callLookup(0, sl(0), 0), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a lookup key past the pool", .code = &.{ asm_.callLookup(0, sl(0), 1), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a lookup's target and default past the frame", .code = &.{ asm_.callLookupOr(0, 1, 0), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a collection block past the frame", .code = &.{ asm_.collList(1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
@@ -7689,7 +7779,7 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a routine under it", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &child_caps, .err = VmError.OperandOutOfRange, .where = "child", .pc = 0 },
     }) |case| {
         errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
-        const routine = Routine{ .code = case.code, .consts = &consts, .capture_descs = case.caps, .tries = &tries, .slot_count = case.slots, .name = "t" };
+        const routine = Routine{ .code = case.code, .consts = if (case.keyed) &keyed else &consts, .capture_descs = case.caps, .tries = &tries, .slot_count = case.slots, .name = "t" };
         var failure: VerifyFailure = undefined;
         try testing.expectError(case.err, routine.verify(&failure));
         try testing.expectEqualStrings(case.where, failure.routine.name);
@@ -7879,6 +7969,48 @@ test "VM dispatch: a keyword or symbol called on a map or nil looks up in place,
     try testing.expectEqual(@as(usize, 2), vm.gc_cycles);
     try testing.expectEqual(@as(usize, 4), vector_mod.count(result));
     for ([_]i64{ 1, 9, 2, 7 }, 0..) |want, i| try testing.expectEqual(want, vector_mod.nth(result, i).asFixnum());
+}
+
+test "VM dispatch: call:lookup and call:lookup-or look up in place with no safe point, and go general past it" {
+    // [(:k m) (:other m 9) ('s m) (:k nil 7) (:k [1])] with a cycle due
+    // at every safe point: the loop's entry, the general lookup of the
+    // vector and the vector's construction collect; the four lookups
+    // in place, which allocate nothing, are no safe point (§8, §9).
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    const interner = vm.ensureInterner();
+    const k = try interner.internKeywordValue("k");
+    const other = try interner.internKeywordValue("other");
+    const s = try interner.internSymbolValue("s");
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(1), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    m = try champ_mod.mapAssoc(heap, m, s, fx(2), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    const v = try vector_mod.fromSlice(heap, &.{fx(1)});
+    const code = [_]Inst{
+        asm_.callLookup(5, kn(3), 0), // s5 = (:k m), m read in place
+        asm_.loadConst(1, 3),
+        asm_.loadConst(2, 4),
+        asm_.callLookupOr(6, 1, 1), // s6 = (:other m 9)
+        asm_.callLookup(7, sl(1), 2), // s7 = ('s m)
+        asm_.loadNil(1),
+        asm_.loadConst(2, 5),
+        asm_.callLookupOr(8, 1, 0), // s8 = (:k nil 7)
+        asm_.callLookup(9, kn(6), 0), // s9 = (:k [1]), the general way
+        Inst.primary(.coll, CollOp.vector, sl(5), Operand.slot(5), sl(0)),
+        asm_.returnSlot(0),
+    };
+    const consts = [_]Value{ k, other, s, m, fx(9), fx(7), v };
+    const routine = makeRoutine(&code, &consts, 10, "lookups");
+    try vm.retargetTop(&routine);
+    vm.gc_threshold = 0;
+    vm.gc_growth_percent = 0;
+    vm.gc_next_at = 0;
+    const result = try vm.run();
+    try testing.expectEqual(@as(usize, 3), vm.gc_cycles);
+    try testing.expectEqual(@as(usize, 5), vector_mod.count(result));
+    for ([_]i64{ 1, 9, 2, 7 }, 0..) |want, i| try testing.expectEqual(want, vector_mod.nth(result, i).asFixnum());
+    try testing.expect(vector_mod.nth(result, 4).isNil());
 }
 
 test "Callback: repeated calls have callValue's results, errors and frame bookkeeping" {

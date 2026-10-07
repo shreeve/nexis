@@ -309,6 +309,16 @@ const cases = [_]Case{
     .{ .src = "((fn* f [n] (if (= n 0) 0 ((fn* [] (+ 1 (f (dec n))))))) 5)", .out = "5" },
     .{ .src = "(mapv (fn* [g] (g)) ((fn* f [n] (if (= n 0) [] (conj (f (dec n)) (fn* [] n)))) 3))", .out = "[1 2 3]" },
     .{ .src = "[((fn* f [n] (let* [f inc] (f n))) 4) ((fn* f [n & r] (if (= n 0) r (f (dec n) n))) 3) (try ((fn* f [n] (f n n)) 1) (catch any e e))]", .out = "[5 (1) :arity-mismatch]" },
+    // A keyword or symbol called on any target, with a default or not,
+    // is `get` of it (VM.md §6): in place on a map, a record or nil,
+    // the general way on everything else.
+    .{ .src = "(do (defrecord P [x y]) (let* [m {:a 1 'b 2} p (->P 3 4)] [(:a m) (:c m) (:c m 9) ('b m) ('c m 8) (:x p) (:z p 0) (:a nil) (:a nil 5)]))", .out = "[1 nil 9 2 8 3 0 nil 5]" },
+    .{ .src = "(let* [t (transient {:a 2})] [(:a [1 2]) (:a \"s\" 3) (:a 5) (:a #{:a}) (:b #{:a} 0) (:a (sorted-map :a 1)) (:a t) (:b t 6) (:a (seq [1]))])", .out = "[nil 3 nil :a 0 1 2 6 nil]" },
+    .{ .src = "[(try (:a (sorted-map 1 2)) (catch any e e)) (try (:a (let* [t (transient {:a 1})] (persistent! t) t)) (catch any e e))]", .out = "[:kind-mismatch :transient-used-after-persistent]" },
+    .{ .src = "(do (def m {:k {:j 7}}) (let* [f (fn* [] (:j (:k m))) g (fn* [x] (:j x :none))] [(f) (g {}) (g {:j nil}) (:k {:k 1} (f))]))", .out = "[7 :none nil 1]" },
+    // The general way from a native's callback leaves the native's
+    // roots as it found them.
+    .{ .src = "[(mapv (fn* [p] (:a p)) [[1] [2]]) (mapv (fn* [p] (:a p 0)) [(sorted-map :a 1) \"s\"]) (reduce (fn* [a p] (+ a (:a p 1))) 0 [[1] [2]])]", .out = "[[nil nil] [1 0] 2]" },
     // Recursion through the self-name is lexical: the function a Var
     // held keeps calling itself after the Var is redefined
     // (CLOJURE-REVIEW.md, defn).
@@ -787,6 +797,14 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         // clause's index, then a compare, a branch and the result
         // per clause.
         .{ .src = "(fn* [a] (case a :k0 0 :k1 1 :k2 2 :d))", .len = 15 },
+        // A keyword or symbol called on one argument is one lookup
+        // reading it in place; with a default, the two in a block.
+        .{ .src = "(fn* [a] (:k a))", .len = 2 },
+        .{ .src = "(fn* [a] ('s a))", .len = 2 },
+        .{ .src = "(fn* [a] (:k (:j a)))", .len = 3 },
+        .{ .src = "(fn* [a b] (:k a b))", .len = 4 },
+        // Any other count is a call.
+        .{ .src = "(fn* [a] (:k a a a))", .len = 6 },
     };
     for (shapes) |shape| {
         const len = try fnCodeLen(&program, shape.src);
@@ -898,7 +916,8 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(str \"a\" a \"b\" b)", .len = 7 },
         .{ .form = "{:a (inc a) :b (g b) :c c}", .len = 10 },
         .{ .form = "(pm a)", .len = 4 },
-        .{ .form = "(:x a)", .len = 4 },
+        .{ .form = "(:x a)", .len = 2 },
+        .{ .form = "(:x a 1)", .len = 4 },
         .{ .form = "(nexis.test/is (= 1 (inc (dec a))))", .len = 8 },
         .{ .form = "(nexis.test/is (pos? a))", .len = 8 },
         .{ .form = "(nexis.test/is (thrown? :x (g a)))", .len = 16 },

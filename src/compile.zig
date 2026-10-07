@@ -120,6 +120,12 @@ const Tiny = union(enum) {
     /// A call of the enclosing `fn*`'s self-name with its fixed arity,
     /// from its own body: `call:self` (COMPILER.md §5.5).
     self_call: []const *const Tiny,
+    /// `(k target)` or `(k target default)`, `k` a keyword or symbol
+    /// literal: `call:lookup` or `call:lookup-or` (COMPILER.md §4.3).
+    lookup: struct {
+        key: *const Tiny,
+        args: []const *const Tiny,
+    },
     /// Bound like `let*`; `recur` in the body re-enters it.
     loop_star: Scope,
     /// `(recur args...)`: rebind the nearest `loop*` or `fn*`'s
@@ -1753,6 +1759,10 @@ fn lowerCall(
     for (items[1..], 0..) |item, i| {
         args[i] = try lowerForm(allocator, item, ctx);
     }
+    if (callee.* == .literal and (args.len == 1 or args.len == 2)) switch (callee.literal.kind()) {
+        .keyword, .symbol => return try allocTiny(allocator, .{ .lookup = .{ .key = callee, .args = args } }),
+        else => {},
+    };
     return try allocTiny(allocator, .{ .call = .{ .callee = callee, .args = args } });
 }
 
@@ -2650,6 +2660,7 @@ fn compileExpr(
         }, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
         .self_call => |args| try compileSelfCall(e, args, dst),
+        .lookup => |l| try compileLookup(e, l.key, l.args, dst),
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
         .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst, returns),
         .recur => |r| try compileRecur(e, r.args, recur_target),
@@ -3589,6 +3600,7 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
         .fn_star => |f| try readsName(f.body, name),
         .call => |c| try readsName(c.callee, name) or try any(c.args, name),
         .self_call => |args| any(args, name),
+        .lookup => |l| any(l.args, name),
         .try_ => |x| try readsName(x.body, name) or try readsName(x.handler, name) or (if (x.finally_) |f| try readsName(f, name) else false),
         .throw_ => |v| try readsName(v, name),
         .def => |d| if (d.value) |v| try readsName(v, name) else false,
@@ -3884,6 +3896,23 @@ fn compileSelfCall(e: *Emitter, args: []const *const Tiny, dst: u12) CompileErro
     const base = e.reserveBlock(dst, args.len) orelse return e.limit("local slots");
     try fillBlock(e, base, null, args);
     try e.emit(vm.asm_.callSelf(base, @intCast(args.len), dst));
+}
+
+/// A keyword or symbol called on a target, with a default or not: one
+/// `call:lookup` reading the target in place where it can, as a
+/// `math` instruction reads an operand, or one `call:lookup-or` over
+/// the target and the default in a block. A key past the first 4096
+/// constants is an ordinary call.
+fn compileLookup(e: *Emitter, key: *const Tiny, args: []const *const Tiny, dst: u12) CompileError!void {
+    const k = try e.constOperand(key.literal) orelse return compileCall(e, key, args, dst);
+    if (args.len == 1) {
+        var free_dst = if (e.scratch) |s| s.dst == dst else false;
+        const target = try primOperand(e, args[0], true, dst, &free_dst);
+        return e.emit(vm.asm_.callLookup(dst, target, k.index));
+    }
+    const base = e.reserveBlock(dst, 2) orelse return compileCall(e, key, args, dst);
+    try fillBlock(e, base, null, args);
+    try e.emit(vm.asm_.callLookupOr(dst, base, k.index));
 }
 
 fn compileIf(

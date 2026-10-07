@@ -168,6 +168,14 @@ and a reused subform its own (MACROEXPAND.md §4b).
    may refer to a Var a later form defines.
 8. Otherwise `UnresolvedSymbol`, at the symbol's own span.
 
+**Keyword and symbol calls.** A keyword or symbol literal in operator
+position with one or two arguments, `(:k x)`, `('s x)`, `(:k x d)`,
+lowers to `call:lookup`, which reads `x` in place where a `math`
+instruction would (§4.4), or `call:lookup-or` over a block of `x` and
+`d` (VM.md §6): one instruction that makes the call `call:call` would.
+Any other count, and a key past the routine's first 4096 constants,
+is an ordinary call.
+
 **Binding rules:**
 - Inner bindings shadow outer.
 - `let*` / `loop*` bindings are sequential with strict left-of-self
@@ -275,12 +283,12 @@ constant pool, Var table, capture descriptors, span table,
   enclosing target's bindings and a tail position of the `let*`
   body is a `recur`.
 - **Operands in place.** A `math` or `cmp` instruction,
-  `jump:if-false`, `var:store-var` and `ctrl:throw` read a literal (as
-  a constant), a local held directly in its slot, an upvalue or a Var
-  where it is, instead of copying it into a slot first. Evaluation
-  stays left to right: the left operand of a two-operand instruction
-  reads a Var in place only when the right one is a literal or a
-  symbol, which run no code.
+  `call:lookup`, `jump:if-false`, `var:store-var` and `ctrl:throw`
+  read a literal (as a constant), a local held directly in its slot,
+  an upvalue or a Var where it is, instead of copying it into a slot
+  first. Evaluation stays left to right: the left operand of a
+  two-operand instruction reads a Var in place only when the right one
+  is a literal or a symbol, which run no code.
 - **Literals.** nil, booleans and fixnums use `mov:load-nil` /
   `load-true` / `load-false` or a constant; every other literal
   (string, float, char, bignum, keyword, symbol) is a constant.
@@ -386,7 +394,8 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(g a b c)` | 6 |
 | `(str "a" a "b" b)` | 7 |
 | `{:a (inc a) :b (g b) :c c}` | 10 |
-| `(pm a)`, `(:x a)` | 4 |
+| `(pm a)` | 4 |
+| `(:x a)`, `(:x a 1)` (§4.3) | 2, 4 |
 | `(is (= 1 (inc (dec a))))` | 8 |
 | `(is (pos? a))` | 8 |
 | `(is (thrown? :x (g a)))` | 16 |

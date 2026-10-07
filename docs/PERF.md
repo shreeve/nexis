@@ -1343,6 +1343,32 @@ before, after, before (load 2.2 → 3.1): 25.6, 25.7 ms against 30.3,
 29.9 ms; `loop`, the destructuring loop and the pipeline moved with
 babashka's in the same runs.
 
+### 3.24 The keyword lookup instruction, Apple M5
+
+`(:k x)` and `(:k x d)` with a keyword or symbol literal are one
+`call:lookup` or `call:lookup-or` (`docs/COMPILER.md` §4.3,
+`docs/VM.md` §6) instead of a `mov:load-const` of the keyword, a move
+of each argument and a `call:call`; the target is read in place. The
+lookup itself, `champ`'s search of the map, is unchanged. Before is
+the self-call commit of §3.23, after this one; one ReleaseFast build
+of each. Provenance: §11.
+
+Per unit, `harness.py`, seven interleaved rounds (load 2.6 → 2.9):
+
+| Program | Instructions before | after | Δ | Cycles before | after |
+|---|---:|---:|---:|---:|---:|
+| `kw`, `(recur (inc i) (:b m))` | 310.0 [308.6–310.0] | 259.0 [258.4–259.1] | −16.5% | 37.5 [32.9–41.0] | 31.6 [30.0–33.1] |
+| `count`, `fib` a call, `gcall`, `lc` | 107.0, 236.5, 270.0, 129.0 | 107.0, 236.5, 270.0, 129.0 | 0 | 12.1, 40.9, 32.7, 19.7 | 12.7, 40.4, 32.7, 19.7 |
+
+The `bench/compare` programs, whole process, five interleaved rounds
+(load 2.9 → 3.0), every answer equal: the pipeline, whose filter is
+`(even? (:group row))`, 2,544.0 → 2,490.9 M instructions (−2.1%); the
+other language rows within 0.1%, every resident set the same. The
+phase each program reports, nine interleaved rounds (load 3.9):
+the pipeline 39.4 → 36.8 ms, `fib` 28.7 and 28.8 ms. In `run.clj`'s
+four runs, after, before, after, before (load 4.4 → 4.0), the
+pipeline's phase was 36.1, 37.6 ms after and 38.2, 39.0 ms before.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1416,11 +1442,6 @@ Each lever is a measured change: a before/after from `zig build bench`
   (f)] (g x))` computes `x` into its slot and moves it into `g`'s
   block; computing it into the block directly saves the move for each
   binding used once, as an argument, by the body's call.
-- **A keyword lookup instruction**: `(:k x)` with a constant keyword
-  is `mov:load-const`, `mov:move` and `call:call`, three dispatches
-  for what §3.13's in-place lookup does in one; one instruction
-  naming the keyword constant and the operand would drop two, at the
-  cost of an opcode (an amendment of VM.md §10).
 - **Frameless fast handlers on x86-64**: the comparisons, the
   arithmetic and `call:call` save one to six callee-saved registers there
   (`zig build codegen`), where System V leaves nine scratch registers
@@ -1524,6 +1545,13 @@ Each lever is a measured change: a before/after from `zig build bench`
   closure with no cell read and no callee test. A `fib` call 280.5 →
   236.5 instructions and 47.4 → 40.7 cycles; the `fib` row 777.7 →
   659.4 M instructions, its phase 30 → 26 ms.
+
+- *The keyword lookup instruction* (§3.24, `docs/VM.md` §6): `(:k x)`
+  and `(:k x d)` are one `call:lookup` or `call:lookup-or` reading the
+  target in place, where they were a constant load, a move per
+  argument and a `call:call`. `kw` 310 → 259 instructions an
+  iteration; the pipeline 2,544 → 2,491 M and its phase 39.4 →
+  36.8 ms.
 
 - *Leaf natives with a general body* (§3.22, `docs/VM.md` §6): `get`,
   `count`, `nthnext`, the kind predicates, `conj`, `assoc`, `assoc!`
@@ -1658,6 +1686,7 @@ is one invocation's 30-sample median.
 | §3.21 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `847c5d8`; shared with concurrent sessions | 2026-10-06, speed2-v: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `f51a5d0` (before) and at each change of the section (after), each against the one before it. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), the load at the start and the end in the text. The `bench/compare` programs (prelude and body) under `/usr/bin/time -l`, five interleaved rounds by `harness.py`, the phase each program reports. The counting-loop figures of the assertion: `bin/nexis run bench/micro/count.nx 10000000`, twelve runs of each build. The database rows: `bb bench/compare/run.clj --n 10 --only db --impls nexis --no-build --max-load 16`, four runs alternating the binary in the worktree's `bin/`. Raw output: `.git/revamp/r2/bench/speed2-v/` |
 | §3.22 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 16:50–17:19 MDT, speed2-s: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `f51a5d0` and after each of the eight steps (`95d5497` … `e9ecc12`). Micro programs: `harness.py OUT 5` over all nine builds, `count`, `gcall`, `leaf`, `getnl` and one program per step (`getm`, `cnt`, `seqq`, `nnext`, `conjv`, `assocm`, `assocb`, `strn`, kept with the raw output) at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 9.88 → 7.84. The `bench/compare` programs (prelude and body) by `cmds.py OUT 7` over all nine builds, load 9.50 → 9.08. `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --no-build --max-load 16` four times, after, before, after, before, from a copy of `bench/` (load 8.61 → 7.58). Raw output: `.git/revamp/r2/bench/speed2-s/` |
 | §3.23 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 21:10–21:16 MDT, speed3-c: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `32fd022` (before) and at the self-call commit (after). Micro programs: `harness.py OUT 7` over `fib` at 27 and 30 and `count`, `gcall`, `lc`, `kw` at 5 M and 10 M iterations, under `tools/heavy` (1 core), load 2.08 → 1.99. The `bench/compare` programs (prelude and body) by `cmds.py OUT 5`, load 1.86 → 1.81; `-e nil` by `cmds.py OUT 21`. `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads fib,loop,destructure,pipeline --no-build --max-load 16` four times, after, before, after, before, from a copy of `bench/` (load 2.17 → 3.14). Raw output: `.git/revamp/r2/bench/speed3-c/` |
+| §3.24 | as §3.23 | 2026-10-06 21:18–21:24 MDT, speed3-c: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at the self-call commit (before) and at the keyword lookup commit (after). `harness.py OUT 7` over `kw`, `count`, `gcall`, `lc` at 5 M and 10 M iterations and `fib` at 27 and 30, load 2.62 → 2.89; the `bench/compare` programs by `cmds.py OUT 5` (load 2.89 → 2.95) and their phases by `cmds.py OUT 9` (load 3.92); `run.clj` as §3.23 over `pipeline,fib,loop,destructure` (load 4.35 → 4.01). Raw output: `.git/revamp/r2/bench/speed3-c/` |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
 | §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |
 | §3.18, §6 "The stdlib image" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `847c5d8`; shared with concurrent sessions (load average 3.97 at the start, 3.89 at the end) | 2026-10-06 12:22 MDT, speed-b: `bin/nexis` built by `zig build install -Doptimize=fast` at `b0ba2ae` (before) and `587f87f` (after); `cmds.py OUT 21 'A=… -e nil' 'B=… -e nil'` and the same for `-e '(+ 1 2)'`, under `tools/heavy` (1 core); the load phases from a probe build returning after each phase, five runs each, the median; raw results in the revamp ledger (`bench/speed-b/`) |
