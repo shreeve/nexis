@@ -391,7 +391,13 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   Clojure's is `clojure.lang.LazySeq@` and a hash.
 - **Arguments are checked at the call**: `(take :a xs)` and `(partition
   0 xs)` raise when called; Clojure raises when the seq is realized, or
-  returns an infinite seq of `()` for `(partition 0 xs)`.
+  returns an infinite seq of `()` for `(partition 0 xs)`. A count is
+  any number, as Clojure's: `take`, `drop`, `nthrest`, `nthnext`,
+  `take-last`, `repeatedly`, `split-at` and `dorun` count one down
+  while it is positive, so `(take 2.5 xs)` takes 3 and NaN takes none,
+  and `repeat` truncates it as `(long n)` does, an infinity being
+  `:invalid-argument`. A count past the fixnum range, a bignum or a
+  float, is all.
 - **Holding the head.** The VM roots every slot of its stack
   (`docs/VM.md` §9), so a lazy seq a local or a call's argument holds
   keeps what it realized until the slot is reused: `(reduce + (map inc

@@ -2308,6 +2308,12 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
     try expectOutput("(let [r (range 100)] [(count (mapv inc r)) (count (filterv odd? r)) (count (frequencies r)) (count (group-by odd? r)) (apply + r) (realized? r) (do (doall r) (realized? r))])", "[100 50 100 2 4950 false true]");
 }
 
+test "lazy: a count is any number, a fraction rounding up as Clojure's counts one down; repeat's is truncated" {
+    // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
+    try expectOutput("[(take 2.5 (range 10)) (drop 1.5 (range 5)) (nthrest (range 5) 1.5) (nthrest [1 2 3] 1.5) (nthrest (list 1 2 3) 1.5) (nthrest (list 1 2 3) -0.5) (nthnext [1 2 3] 1.5) (repeat 2.9 :x) (repeat -2.5 :x) (repeat ##NaN :x) (try (repeat ##Inf :x) (catch any e e)) (take ##Inf [1 2]) (take ##NaN [1 2]) (drop ##NaN [1 2]) (drop ##Inf (list 1 2)) (take-last 1.5 [1 2 3]) (repeatedly 1.5 (constantly 0)) (split-at 1.5 [1 2 3]) (into [] (take 2.5) (range 10)) (into [] (drop 1.5) (range 4))]", "[(0 1 2) (2 3 4) (2 3 4) (3) (3) (1 2 3) (3) (:x :x) () () :invalid-argument (1 2) () (1 2) () (2 3) (0 0) [(1 2) (3)] [0 1 2] [2 3]]");
+    try expectOutput("[(try (take :a [1]) (catch any e e)) (try (repeat \"2\" 1) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
+}
+
 test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
     // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
     try expectOutput("(let [n (atom 0)] (first (map (fn [x] (swap! n inc) x) (range 100))) @n)", "32");
