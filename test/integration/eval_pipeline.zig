@@ -2286,6 +2286,10 @@ test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
     try expectOutput("(do (defmacro m [] (lazy-seq (list '+ 1 2))) (m))", "3");
     try expectOutput("(do (defmacro m2 [] (list 'quote (lazy-seq [1 (lazy-seq [2])]))) [(m2) (class (m2)) (class (second (m2)))])", "[(1 (2)) :list :list]");
     try expectOutput("(eval (lazy-seq (list '+ 1 2)))", "3");
+    // A sorted collection holding one is rebuilt in its order.
+    try expectOutput("(do (defmacro m4 [] (sorted-map 1 (map identity '(+ 1 2)))) [(m4) (class (m4))])", "[{1 3} :sorted_map]");
+    try expectOutput("[(eval (sorted-map 1 (list 'quote (map inc [1 2])))) (eval (list 'quote (sorted-map :a (sorted-map :b (map inc [1]))))) (class (eval (sorted-map 2 (list 'quote (map inc [1])) 1 0)))]", "[{1 (2 3)} {:a {:b (2)}} :sorted_map]");
+
     try expectOutput("(let [xs (lazy-seq [1 2])] `(a ~@xs))", "(user/a 1 2)");
     try expectOutput("(let [n (atom 0) xs (lazy-seq (swap! n inc) [1 2])] [`(~@xs ~@xs) @n])", "[(1 2 1 2) 1]");
     try expectOutput("(try (let [xs (lazy-seq (throw :splice))] `(a ~@xs)) (catch any e e))", ":splice");

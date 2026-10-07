@@ -1032,6 +1032,24 @@ fn listify(heap: *heap_mod.Heap, v: Value) ListifyError!Value {
             keepMeta(v, out);
             return out;
         },
+        // Rebuilt from its entries in their order, which a key made a
+        // list keeps (it is `=` to the lazy seq it was): no comparator
+        // runs.
+        .sorted_map, .sorted_set => {
+            const items = try heap.backing.alloc(sorted_mod.Entry, sorted_mod.count(v));
+            defer heap.backing.free(items);
+            var changed = false;
+            var it = sorted_mod.Iter.init(v, true);
+            for (items) |*slot| {
+                const e = it.next().?;
+                slot.* = .{ .key = try listify(heap, e.key), .value = try listify(heap, e.value) };
+                changed = changed or !slot.key.identicalTo(e.key) or !slot.value.identicalTo(e.value);
+            }
+            if (!changed) return v;
+            const out = sorted_mod.fromSortedEntries(heap, v.kind(), sorted_mod.comparatorOf(v), items) catch return error.OutOfMemory;
+            keepMeta(v, out);
+            return out;
+        },
         else => return v,
     }
 }
