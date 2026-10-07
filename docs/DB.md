@@ -561,8 +561,9 @@ and any operation on a closed connection or through a ref of one is
 | `(with-snapshot [snap conn] body…)` | macro | `with-read-tx` under the snapshot names. |
 
 **A callback holds its transaction.** `db/alter!` holds its
-transaction handle while it calls `f`, and `db/reduce-tree` while it
-walks: `db/commit!`, `db/abort-write!`, `db/abort-read!`,
+transaction handle while it calls `f`, `db/reduce-tree` while it
+walks, and `db/put!` and `db/alter!` while they realize a lazy value
+they write (`docs/LAZY.md` §8): `db/commit!`, `db/abort-write!`, `db/abort-read!`,
 `db/release-snapshot!` of a held handle and `db/close` of its
 connection are `:db/busy`, so no callback finishes a transaction a
 native is still using. A throw from the callback ends the hold before

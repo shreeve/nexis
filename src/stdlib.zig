@@ -3623,21 +3623,28 @@ fn fnDbAbortRead(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(db/put! tx ref value)` — write through an active tx.
 fn fnDbPut(vm: *VM, args: []const Value) VmError!Value {
-    const txn = try activeWrite(args[0]);
+    const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
+    if (!h.active) return VmError.TxClosed;
     const r = args[1];
-    const v = args[2];
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
-    try putRealizing(vm, txn, r, v);
+    try putRealizing(vm, h, r, args[2]);
     return value_mod.nilValue();
 }
 
 /// `db.putRef`, realizing `v` and encoding it again when the codec
-/// finds a lazy seq in it that has not run (docs/LAZY.md §8).
-fn putRealizing(vm: *VM, txn: *db_mod.WriteTxn, r: Value, v: Value) VmError!void {
-    db_mod.putRef(txn, r, v) catch |err| {
+/// finds a lazy seq in it that has not run (docs/LAZY.md §8). The
+/// realization runs program code with the transaction held, so a
+/// body that commits, aborts or closes it is `:db/busy` (DB.md §12).
+fn putRealizing(vm: *VM, h: *db_mod.Handle, r: Value, v: Value) VmError!void {
+    db_mod.putRef(&h.txn.write, r, v) catch |err| {
         if (err != error.Unrealized) return dbFailure(vm, err);
+        h.held += 1;
+        defer h.held -= 1;
         try seq_mod.realizeAll(vm, v);
-        db_mod.putRef(txn, r, v) catch |again| return dbFailure(vm, again);
+        // Nothing ends a held handle: not commit or abort, not a close
+        // of its connection, not a collection.
+        std.debug.assert(h.active);
+        db_mod.putRef(&h.txn.write, r, v) catch |again| return dbFailure(vm, again);
     };
 }
 
@@ -4197,7 +4204,7 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(new_value);
-    try putRealizing(vm, &h.txn.write, r, new_value);
+    try putRealizing(vm, h, r, new_value);
     return new_value;
 }
 

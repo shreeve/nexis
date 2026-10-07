@@ -3686,6 +3686,23 @@ test "db: a callback cannot finish the transaction db/alter! or db/reduce-tree i
     , "[:db/busy :db/busy 1 [1 2] [:db/busy 300 nil] [:db/busy true nil false]]");
 }
 
+test "db/put!: the lazy value it realizes cannot finish or close the transaction it writes in" {
+    try expectOutputProgramWithStore("put-held",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k"))
+        \\  (def tx (db/begin-write c))
+        \\  [(try (db/put! tx r (lazy-seq (db/close c) [1])) (catch any e e))
+        \\   (try (db/put! tx r (lazy-seq (db/commit! tx) [2])) (catch any e e))
+        \\   (try (db/put! tx r (lazy-seq (db/abort-write! tx) [3])) (catch any e e))
+        \\   (db/put! tx r (lazy-seq [4]))
+        \\   (db/commit! tx)
+        \\   (db/get-key r)
+        \\   (try (db/put! tx r (lazy-seq [5])) (catch any e e))
+        \\   (db/close c)])
+    , "[:db/busy :db/busy :db/busy nil nil (4) :tx-closed nil]");
+}
+
 test "db/close: a stale ref never reaches a store opened after the close" {
     var a = try SeamStore.init("stale-a");
     defer a.deinit();
