@@ -1416,7 +1416,7 @@ fn nestingCapChecks() !void {
         var diag: Diag = .{};
         const ok = try parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag);
         ok.deinit();
-        // 20,000 levels took seconds to parse when the depth had no cap.
+        // Far past the cap the refusal comes at once, without a parse of every level.
         for (0..20_000) |_| clause = b.lst(&.{ b.sym(head), clause });
         try testing.expectError(error.QuerySyntax, parse(testing.allocator, &interner, b.vec(&.{ b.kw("find"), b.sym("?e"), b.kw("where"), pattern, clause }), &diag));
         try testing.expectEqualStrings("clauses nest more than 1000 deep", diag.message);
