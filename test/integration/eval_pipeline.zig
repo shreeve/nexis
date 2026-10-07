@@ -2244,6 +2244,18 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
 }
 
+test "leaf natives: what a leaf body refuses goes the general way from every call site" {
+    // An instruction, `apply` (callValue) and `mapv` (a Callback) each
+    // call the leaf, and re-issue what it refuses (VM.md §6).
+    try expectOutput("(let [s (sorted-map-by > 1 :a 2 :b) m {[1] :v \"k\" :w} k [1]] [(get s 2) (get m k) (get m \"k\") (get m [2] :d) (get #{\"s\"} \"s\") (apply get [s 1]) (apply get [m k]) (mapv get [s m m {:x 1}] [1 k \"k\" :x])])", "[:b :v :w :d s :a :v [:a :v :w 1]]");
+    try expectOutput("(let [s (map inc [1 2 3])] [(count s) (count (lazy-seq nil)) (apply count [s]) (mapv count [s [1] \"ab\" nil {:a 1}])])", "[3 0 3 [3 1 2 0 1]]");
+    try expectOutput("(let [s (map inc [1 2 3])] [(nthnext s 1) (nthnext [1 2 3] 2) (nthnext [1] 1) (nthnext (list 1 2) 1) (apply nthnext [s 2]) (mapv nthnext [s #{1} \"ab\" {:a 1}] [2 0 1 0])])", "[(3 4) (3) nil (2) (4) [(4) (1) (b) ([:a 1])]]");
+    try expectOutput("[(conj [1] 2) (conj nil 1) (conj (list 1) 0) (conj #{} [1]) (conj {} [:a 1]) (conj (map inc [1]) 0) (apply conj [#{} 1]) (mapv conj [[] #{} {} (sorted-set)] [1 [2] [:k 3] 4]) (reduce conj [] (range 3)) (reduce conj #{} [1 1 2])]", "[[1 2] (1) (0 1) #{[1]} {:a 1} (0 2) #{1} [[1] #{[2]} {:k 3} #{4}] [0 1 2] #{1 2}]");
+    try expectOutput("(do (defrecord P [x]) [(assoc {} :a 1) (assoc nil 1 2 3 4) (assoc [1 2] 2 3) (assoc {} [1] :v \"k\" :w) (:x (assoc (->P 1) :x 2)) (assoc (sorted-map 2 :b) 1 :a) (try (assoc [1] 5 :x) (catch any e e)) (apply assoc [{} [2] 3]) (mapv assoc [{} (sorted-map) [0]] [:a 1 0] [1 2 3])])", "[{:a 1} {1 2, 3 4} [1 2 3] {[1] :v, k :w} 2 {1 :a, 2 :b} :index-out-of-bounds {[2] 3} [{:a 1} {1 2} [3]]]");
+    try expectOutput("(let [t (transient {}) v (transient [])] (assoc! t :a 1 [1] 2) (assoc! v 0 :x) (apply assoc! [t \"k\" 3]) (mapv assoc! [t v] [:b 1] [4 :y]) [(persistent! t) (persistent! v) (try (assoc! (transient #{}) 1 1) (catch any e e)) (try (assoc! t :c 1) (catch any e e))])", "[{:a 1, [1] 2, k 3, :b 4} [:x :y] :kind-mismatch :transient-used-after-persistent]");
+    try expectOutput("(pr-str [(str) (str nil 1 \\c \"s\") (str [1 (map inc [1])] :k 1.5) (apply str [1 :a]) (mapv str [1 nil (list 2) :k])])", "[\"\" \"1cs\" \"[1 (2)]:k1.5\" \"1:a\" [\"1\" \"\" \"(2)\" \":k\"]]");
+}
+
 test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere" {
     try expectOutput("[(get {(lazy-seq [1 2]) :a} [1 2]) (contains? #{[1 2]} (lazy-seq [1 2])) (= {:k (lazy-seq [1])} {:k [1]}) (pr-str [(lazy-seq [1])]) (= (hash (lazy-seq [2 3])) (hash [2 3])) (= (hash [(lazy-seq [2 3])]) (hash [[2 3]])) (str (lazy-seq [1 2]))]", "[:a true true [(1)] true true (1 2)]");
     // A nested body's throw surfaces from the native or opcode that
@@ -2322,6 +2334,52 @@ test "gc: a realized map block lets its source go; an abandoned one keeps it unt
     try testing.expect(held - heap.liveCount() > 3000);
 }
 
+test "gc: a native's call block holds nothing of its arguments once the call returns" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    // The inner `map` and `filter` are each an argument of the call
+    // outside them, which has returned before `reduce` walks: about
+    // 4 MB and 2 MB realized, kept by the blocks while they stand.
+    try harness.expectResult(&program, "", try program.run("(reduce + (map inc (filter even? (map inc (range 200000)))))"), "10000200000");
+    try testing.expect(heap.peak_live_bytes -| start < 3 << 20);
+}
+
+test "gc: a native that consumes its sequence lets the part it walked go" {
+    // Each realizes 300,000 mapped elements, about 6 MB of chunks, that
+    // the argument's slot would keep while the native walks them.
+    for ([_][2][]const u8{
+        .{ "(reduce + (map inc (range 300000)))", "45000150000" },
+        .{ "(reduce + 0 (map inc (range 300000)))", "45000150000" },
+        .{ "(dorun (map inc (range 300000)))", "nil" },
+        .{ "(dorun 300000 (map inc (range 300000)))", "nil" },
+        .{ "(last (map inc (range 300000)))", "300000" },
+        .{ "(some neg? (map inc (range 300000)))", "nil" },
+        .{ "(every? pos? (map inc (range 300000)))", "true" },
+        .{ "(count (frequencies (map #(mod % 10) (range 300000))))", "10" },
+        .{ "(count (group-by odd? (map #(mod % 10) (range 300000))))", "2" },
+    }) |case| {
+        errdefer std.debug.print("consuming case {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[0]), case[1]);
+        // `group-by` keeps every element in its groups: 300,000 values.
+        const bound: usize = if (std.mem.startsWith(u8, case[0], "(count (group-by")) 8 << 20 else 1 << 20;
+        try testing.expect(heap.peak_live_bytes -| start < bound);
+    }
+}
+
 test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
     try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
     try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");
@@ -2389,6 +2447,9 @@ test "integration: get (2-arg + 3-arg default)" {
     try expectOutput("(get [10 20 30] 1)", "20");
     try expectOutput("(get [10 20 30] 99 :oob)", ":oob");
     try expectOutput("(get #{1 2 3} 2)", "2");
+    // A set gives back the element it holds, not the key it was asked
+    // with, wherever the two are equal and differ (babashka agrees).
+    try expectOutput("[(get #{(lazy-seq [1])} [1]) (#{(list 1)} [1]) (get #{} [1] :nf) (get (transient #{(list 1)}) [1]) ((transient #{(list 1)}) [1]) (some #{(list 1)} [[1]]) (get #{(list 1)} [2] :nf)]", "[(1) (1) :nf (1) (1) (1) :nf]");
     try expectOutput("(get nil :anything :fallback)", ":fallback");
 }
 
@@ -2892,7 +2953,6 @@ test "integration: catchable — KindMismatch BYPASSES translation when no handl
     const routine = compiled.toRoutine("catchable-no-handler");
     v.frames.items[0].routine = &routine;
     v.frames.items[0].pc = 0;
-    v.frames.items[0].slot_count = routine.slot_count;
     if (v.stack.items.len < routine.slot_count) {
         try v.stack.appendNTimes(v.allocator, value_mod.nilValue(), routine.slot_count - v.stack.items.len);
     }

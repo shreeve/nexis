@@ -1035,6 +1035,13 @@ pub const NativeFn = struct {
     /// code). A leaf call site re-issues such a call through the
     /// general path, arguments copied and rooted (VM.md §6).
     general: ?*const fn (vm: *VM, args: []const Value) VmError!Value = null,
+    /// The native walks its last argument to the end, or until it is
+    /// done with it, and keeps the walk rooted itself (`SeqIter.cursor`):
+    /// `call:call` clears the argument's slot once it has copied the
+    /// arguments, so the head of a lazy seq passed straight in is not
+    /// held by the caller's block while the walk realizes the rest
+    /// (docs/GC.md §11.5).
+    consumes: bool = false,
 };
 
 /// What realizing a lazy seq takes, which `src/seq.zig` implements
@@ -1158,27 +1165,21 @@ pub fn pathArg(v: Value) VmError![]const u8 {
 pub const Frame = struct {
     routine: *const Routine,
     /// Index into `vm.stack.items` where this frame's slot 0 lives.
-    /// Frame's slot[i] is `vm.stack.items[base_slot + i]`.
+    /// Frame's slot[i] is `vm.stack.items[base_slot + i]`, for `i`
+    /// below `routine.slot_count`.
     base_slot: u32,
     /// `stack.items.len` at the moment this frame was pushed: the
     /// extent the frames beneath it require. Popping this frame,
     /// by return or by unwind, restores the stack to this length.
     entry_stack_len: u32,
-    /// Logical slot count for bounds checks.
-    /// Always equals `routine.slot_count` at frame construction;
-    /// kept on the frame for direct access in hot dispatch paths.
-    slot_count: u16,
-    /// Bytecode offset of the next instruction to execute.
+    /// Bytecode offset of the next instruction to execute. Under a
+    /// frame it called, the caller's return point: `call:return`
+    /// resumes the caller there (VM.md §6).
     pc: u32 = 0,
     /// Where to write this frame's return value into the CALLER's
     /// slot space when `call:return` runs. Top-level frame ignores
     /// this; non-top-level frames receive it from `call:call`.
-    return_dst: u12 = 0,
-    /// PC to resume the caller at after `call:return`. Set by
-    /// `call:call` to the caller's already-incremented PC (i.e.,
-    /// the instruction following the call). Top-level frame
-    /// ignores this. Per VM.md §6.
-    return_pc: u32 = 0,
+    return_dst: u16 = 0,
     /// Upvalue array sourced from the executing closure. Empty
     /// for the top-level frame and for empty-capture closures;
     /// otherwise the array `closure:make` built, installed by
@@ -1196,6 +1197,12 @@ pub const Frame = struct {
     /// WITHOUT writing into a caller slot (callValue's caller
     /// isn't a regular routine — it's host code).
     host_result: ?*HostCallResult = null,
+
+    // A cache line: a call writes one, and a frame's address is its
+    // index shifted.
+    comptime {
+        std.debug.assert(@sizeOf(Frame) == 64);
+    }
 };
 
 /// Result cell for `VM.callValue`.
@@ -1208,7 +1215,8 @@ pub const HostCallResult = struct {
     /// The returned value, once the loop is back at the call's depth:
     /// without a return, a throw went past the call.
     fn get(self: *const HostCallResult) VmError!Value {
-        return if (self.done) self.value else VmError.ControlTransferred;
+        if (!self.done) return VmError.ControlTransferred;
+        return self.value;
     }
 };
 
@@ -1699,7 +1707,7 @@ pub const Callback = struct {
             .function => closure: {
                 const closure = VM.asClosure(self.callee);
                 const routine = closure.routine;
-                if (routine.variadic or self.argc != routine.fixed_arity or closure.upvalues.len != routine.upvalue_count or routine.slot_count < self.argc) break :closure;
+                if (routine.variadic or self.argc != routine.fixed_arity or routine.slot_count < self.argc) break :closure;
                 // Every later call starts at this depth of the native
                 // stack, so the guard's answer holds for them all
                 // (§13.1).
@@ -1710,15 +1718,16 @@ pub const Callback = struct {
                 if (depth >= vm.max_frames) break :closure;
                 vm.frames.ensureUnusedCapacity(vm.allocator, 1) catch return VmError.OutOfMemory;
                 vm.stack.ensureTotalCapacity(vm.allocator, window_end) catch return VmError.OutOfMemory;
-                if (depth + 1 > vm.frame_high_water) vm.frame_high_water = depth + 1;
-                if (window_end > vm.stack_high_water) vm.stack_high_water = window_end;
+                if (VM.track_high_water) {
+                    vm.frame_high_water = @max(vm.frame_high_water, depth + 1);
+                    vm.stack_high_water = @max(vm.stack_high_water, window_end);
+                }
                 self.depth = depth;
                 self.base = base;
                 self.frame = .{
                     .routine = routine,
                     .base_slot = @intCast(base),
                     .entry_stack_len = @intCast(base),
-                    .slot_count = routine.slot_count,
                     .upvalues = closure.upvalues,
                     .closure = self.callee,
                 };
@@ -1942,14 +1951,15 @@ pub const VM = struct {
     /// The `depth` of the innermost `loop` running: the dispatch
     /// chain leaves when the frame chain is back to it (`running`).
     loop_depth: usize = 0,
-    /// High-water marks for the backing stack and frame stack.
-    /// Used by `recur`/`loop*` tests to assert
-    /// that long-running iteration runs in bounded stack space
-    /// (VM.md §11 constant-stack guarantee). Updated on grow
-    /// operations only — comparing pre/post run-loop values gives
-    /// a true maximum, not just the final size (a buggy
-    /// implementation could grow and shrink, leaving final size
-    /// equal but high-water inflated).
+    /// High-water marks for the backing stack and frame stack, kept
+    /// by builds with runtime safety (`track_high_water`): the tests
+    /// read them to assert that long-running iteration runs in bounded
+    /// stack space (VM.md §11 constant-stack guarantee). Updated
+    /// wherever a frame is pushed, so comparing pre/post run-loop
+    /// values gives a true maximum, not just the final size (a buggy
+    /// implementation could grow and shrink, leaving final size equal
+    /// but high-water inflated). A release build leaves them at
+    /// their start and keeps the stores off every call.
     stack_high_water: usize = 0,
     frame_high_water: usize = 0,
     /// The deepest frame chain a program may build. A call that
@@ -1982,6 +1992,7 @@ pub const VM = struct {
     /// `recordErrorTrace`.
     escaped_origin: ?u32 = null,
 
+    pub const track_high_water = std.debug.runtime_safety;
     pub const default_max_frames = 1 << 20;
     pub const default_max_nested_runs = 100_000;
     /// A trace keeps this many innermost frames and
@@ -2010,7 +2021,6 @@ pub const VM = struct {
             .routine = routine,
             .base_slot = 0,
             .entry_stack_len = 0,
-            .slot_count = routine.slot_count,
             .pc = 0,
         });
 
@@ -2232,9 +2242,11 @@ pub const VM = struct {
     /// owns its heap, and the heap has allocated `gc_next_at` bytes
     /// since the last cycle.
     inline fn gcDue(self: *VM) bool {
-        if (!self.gc_enabled or self.borrowed_heap != null or self.gc_hold != 0) return false;
+        // The counter first: below the limit, as at nearly every safe
+        // point, nothing else is read.
         const h = &(self.heap orelse return false);
-        return h.allocated_since_collect >= self.gc_next_at;
+        if (h.allocated_since_collect < self.gc_next_at) return false;
+        return self.gc_enabled and self.borrowed_heap == null and self.gc_hold == 0;
     }
 
     /// Run one collection cycle over this VM's heap from this VM's
@@ -2531,12 +2543,15 @@ pub const VM = struct {
     /// `upvalues` array; the caller fills it before the Value can
     /// reach a slot. `asClosure()` is the matched accessor.
     pub fn allocClosure(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
-        // The dispatch trusts the routine (§8): a closure's comes from
-        // a verified routine's capture descriptor, and a debug build
-        // checks it.
+        // The dispatch trusts the routine (§8), and a call trusts the
+        // closure to carry a cell for each of its upvalues (§6): a
+        // closure's routine comes from a verified routine's capture
+        // descriptor, whose source count is the routine's, and a debug
+        // build checks both.
         if (std.debug.runtime_safety) {
             var failure: VerifyFailure = undefined;
             routine.verify(&failure) catch |err| std.debug.panic("closure over an unverified routine {s}: {t} at {d}", .{ routine.name, err, failure.pc });
+            std.debug.assert(upvalue_count == routine.upvalue_count);
         }
         return self.allocClosureUnverified(routine, upvalue_count);
     }
@@ -2650,20 +2665,38 @@ pub const VM = struct {
     /// A `Callback`'s call of its closure, from the depth and stack
     /// length it was prepared at: the arguments go where the window
     /// begins, the locals start nil, the prepared frame is pushed and
-    /// the loop runs until it returns, as `callValue` does.
+    /// runs until it returns, as `callValue`'s would under `loop`. The
+    /// loop's first pass is entered here at the callee's first
+    /// instruction, after the safe point `loop`'s entry is: the frame
+    /// is the one it would run, so the pass needs no test, and a pass
+    /// that ends without an error has returned. Only an error goes on
+    /// to the loop, which takes it as its own pass would.
     fn callPrepared(self: *VM, cb: *const Callback, args: []const Value) VmError!Value {
         const base = cb.base;
-        const slot_count = cb.frame.slot_count;
-        const window = self.stack.items.ptr[base..][0..slot_count];
+        const routine = cb.frame.routine;
+        const window = self.stack.items.ptr[base..][0..routine.slot_count];
         for (args, window[0..args.len]) |arg, *slot| slot.* = arg;
         nilSlots(window[args.len..]);
-        self.stack.items.len = base + slot_count;
+        self.stack.items.len = base + routine.slot_count;
         var result_cell = HostCallResult{};
         self.frames.items.len = cb.depth + 1;
         const frame = &self.frames.items[cb.depth];
         frame.* = cb.frame;
         frame.host_result = &result_cell;
-        try self.loop(cb.depth);
+        const outer = self.loop_depth;
+        self.loop_depth = cb.depth;
+        self.nested_runs += 1;
+        defer {
+            self.loop_depth = outer;
+            self.nested_runs -= 1;
+        }
+        if (self.gcDue()) self.collectGarbage();
+        const first = routine.code[0];
+        if (counting) opcode_counts[opIndex(first)] += 1;
+        fast_table[opIndex(first)](self, frame, first, 1) catch |err| {
+            try self.settle(err);
+            try self.drive();
+        };
         return result_cell.get();
     }
 
@@ -2709,18 +2742,22 @@ pub const VM = struct {
     /// (SEMANTICS §2.7). The raise consumes the spoils it reports, so an
     /// enclosing native whose callback caught the throw does not raise
     /// it again.
-    pub fn checkDeepData(self: *VM, spoils_before: u64) VmError!void {
-        if (dispatch_mod.spoilCount() != spoils_before) {
-            dispatch_mod.rewindSpoils(spoils_before);
-            if (self.parked_realize) |p| {
-                self.parked_realize = null;
-                return switch (p) {
-                    .thrown => |v| self.throwValue(v),
-                    .err => |e| e,
-                };
-            }
-            return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
+    pub inline fn checkDeepData(self: *VM, spoils_before: u64) VmError!void {
+        // Inline, the common case costs a read of the counter; the raise
+        // saves the registers it needs only when it runs.
+        if (dispatch_mod.spoilCount() != spoils_before) return self.raiseDeepData(spoils_before);
+    }
+
+    noinline fn raiseDeepData(self: *VM, spoils_before: u64) VmError {
+        dispatch_mod.rewindSpoils(spoils_before);
+        if (self.parked_realize) |p| {
+            self.parked_realize = null;
+            return switch (p) {
+                .thrown => |v| self.throwValue(v),
+                .err => |e| e,
+            };
         }
+        return self.fail(VmError.StackOverflow, "a value nests too deeply to compare, hash or print", .{});
     }
 
     // -------------------------------------------------------------------------
@@ -2783,8 +2820,7 @@ pub const VM = struct {
 
     /// Where a closure frame's value goes when it returns.
     const Link = struct {
-        return_dst: u12 = 0,
-        return_pc: u32 = 0,
+        return_dst: u16 = 0,
         host_result: ?*HostCallResult = null,
     };
 
@@ -2803,7 +2839,6 @@ pub const VM = struct {
         if (if (routine.variadic) argc < fixed else argc != fixed) {
             return self.arityError(routine.name, fixed, if (routine.variadic) null else fixed, argc);
         }
-        if (closure.upvalues.len != routine.upvalue_count) return VmError.CaptureCountMismatch;
         // A variadic routine needs a slot for its rest parameter.
         if (routine.slot_count < fixed + @intFromBool(routine.variadic)) return VmError.BytecodeCorruption;
 
@@ -2848,20 +2883,18 @@ pub const VM = struct {
         // `callValue` and ends at the window.
         const extent = @max(entry_stack_len, window_end);
         if (self.stack.items.len > extent) self.stack.shrinkRetainingCapacity(extent);
-        if (self.stack.items.len > self.stack_high_water) self.stack_high_water = self.stack.items.len;
+        if (track_high_water) self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
 
         self.frames.appendAssumeCapacity(.{
             .routine = routine,
             .base_slot = @intCast(base),
             .entry_stack_len = @intCast(entry_stack_len),
-            .slot_count = routine.slot_count,
             .return_dst = link.return_dst,
-            .return_pc = link.return_pc,
             .upvalues = closure.upvalues,
             .closure = callee,
             .host_result = link.host_result,
         });
-        if (self.frames.items.len > self.frame_high_water) self.frame_high_water = self.frames.items.len;
+        if (track_high_water) self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
     }
 
     /// `enterClosure` for the common call, a closure called with its
@@ -2874,28 +2907,26 @@ pub const VM = struct {
     inline fn enterClosureDirect(self: *VM, callee: Value, base: usize, argc: usize, link: Link) ?*Frame {
         const closure = asClosure(callee);
         const routine = closure.routine;
-        if (routine.variadic or argc != routine.fixed_arity or closure.upvalues.len != routine.upvalue_count) return null;
+        if (routine.variadic or argc != routine.fixed_arity) return null;
         const depth = self.frames.items.len;
         if (depth >= self.max_frames or depth == self.frames.capacity) return null;
         const args_end = base + argc;
         const window_end = base + routine.slot_count;
         if (window_end < args_end or window_end > self.stack.capacity) return null;
         const entry_stack_len = self.stack.items.len;
-        if (window_end > entry_stack_len) {
-            self.stack.items.len = window_end;
-            if (window_end > self.stack_high_water) self.stack_high_water = window_end;
-        }
+        if (window_end > entry_stack_len) self.stack.items.len = window_end;
         nilSlots(self.stack.items[args_end..window_end]);
         self.frames.items.len = depth + 1;
-        if (depth + 1 > self.frame_high_water) self.frame_high_water = depth + 1;
+        if (track_high_water) {
+            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
+            self.frame_high_water = @max(self.frame_high_water, depth + 1);
+        }
         const frame = &self.frames.items[depth];
         frame.* = .{
             .routine = routine,
             .base_slot = @intCast(base),
             .entry_stack_len = @intCast(entry_stack_len),
-            .slot_count = routine.slot_count,
             .return_dst = link.return_dst,
-            .return_pc = link.return_pc,
             .upvalues = closure.upvalues,
             .closure = callee,
             .host_result = link.host_result,
@@ -2943,7 +2974,6 @@ pub const VM = struct {
             .routine = routine,
             .base_slot = @intCast(base_slot),
             .entry_stack_len = @intCast(base_slot),
-            .slot_count = routine.slot_count,
             .pc = 0,
             .host_result = &result_cell,
         });
@@ -2973,13 +3003,22 @@ pub const VM = struct {
             self.loop_depth = outer;
             self.nested_runs -= 1;
         }
-        while (self.running()) {
-            opEnter(self, self.currentFrame(), undefined, undefined) catch |err| switch (err) {
-                // A native's throw was caught below it: frames and pc
-                // are already at the handler.
-                VmError.ControlTransferred => {},
-                else => try self.handleRuntimeError(err),
-            };
+        try self.drive();
+    }
+
+    /// `loop`'s passes through the chain, at the depth it set.
+    fn drive(self: *VM) VmError!void {
+        while (self.running()) opEnter(self, self.currentFrame(), undefined, undefined) catch |err| try self.settle(err);
+    }
+
+    /// What ends a pass with `err`: the throw a handler takes it as, or
+    /// the error the loop leaves with.
+    inline fn settle(self: *VM, err: VmError) VmError!void {
+        switch (err) {
+            // A native's throw was caught below it: frames and pc are
+            // already at the handler.
+            VmError.ControlTransferred => {},
+            else => try self.handleRuntimeError(err),
         }
     }
 
@@ -3061,13 +3100,13 @@ pub const VM = struct {
     /// already fetched: the hot handlers resolve every operand
     /// through one frame pointer instead of re-deriving it.
     inline fn slotPtrIn(self: *VM, frame: *const Frame, slot_index: u12) VmError!*Value {
-        if (slot_index >= frame.slot_count) return VmError.OperandOutOfRange;
+        if (slot_index >= frame.routine.slot_count) return VmError.OperandOutOfRange;
         return self.slotAt(frame, slot_index);
     }
 
     /// Slot `slot_index` of `frame`, which the caller has checked
-    /// against `frame.slot_count`.
-    inline fn slotAt(self: *VM, frame: *const Frame, slot_index: u12) *Value {
+    /// against `frame.routine.slot_count`.
+    inline fn slotAt(self: *VM, frame: *const Frame, slot_index: usize) *Value {
         const absolute: usize = @as(usize, frame.base_slot) + slot_index;
         std.debug.assert(absolute < self.stack.items.len);
         return &self.stack.items.ptr[absolute];
@@ -3109,7 +3148,7 @@ pub const VM = struct {
     /// constant, an initialized upvalue or a bound Var; null for every
     /// other operand, which `resolveOther` reads, its trap included.
     inline fn peek(self: *VM, frame: *const Frame, op: Operand) ?*const Value {
-        if (op.kind == .slot and op.index < frame.slot_count) return self.slotAt(frame, op.index);
+        if (op.kind == .slot and op.index < frame.routine.slot_count) return self.slotAt(frame, op.index);
         if (op.kind == .constant and op.index < frame.routine.consts.len) return &frame.routine.consts[op.index];
         if (op.kind == .upvalue and op.index < frame.upvalues.len) {
             const cell = frame.upvalues[op.index];
@@ -3145,8 +3184,17 @@ pub const VM = struct {
 
     /// Slot `op` of `frame`, an operand verification proved a slot
     /// inside the frame (§5).
+    /// A fact verification proved (§5), asserted by debug and safe
+    /// builds and not assumed by a release build: assumed, a bound
+    /// through the frame's routine changes the fast handlers' code, and
+    /// the counting loop ran half as many cycles again (docs/PERF.md
+    /// §3.21).
+    inline fn proved(ok: bool) void {
+        if (std.debug.runtime_safety) std.debug.assert(ok);
+    }
+
     inline fn verifiedSlot(self: *VM, frame: *const Frame, op: Operand) *Value {
-        std.debug.assert(op.kind == .slot and op.index < frame.slot_count);
+        proved(op.kind == .slot and op.index < frame.routine.slot_count);
         return self.slotAt(frame, op.index);
     }
 
@@ -3233,7 +3281,7 @@ pub const VM = struct {
     /// `store` against `frame`, the current frame: a slot in range
     /// inline, every other case out of line.
     inline fn storeIn(self: *VM, frame: *const Frame, op: Operand, v: Value) VmError!void {
-        if (op.kind == .slot and op.index < frame.slot_count) {
+        if (op.kind == .slot and op.index < frame.routine.slot_count) {
             self.slotAt(frame, op.index).* = v;
             return;
         }
@@ -3272,7 +3320,6 @@ pub const VM = struct {
         const top = &self.frames.items[0];
         top.routine = routine;
         top.pc = 0;
-        top.slot_count = routine.slot_count;
         self.halted = false;
         // Only the top frame stands, so every slot is dead: the form
         // starts on nils and keeps nothing an earlier one left alive.
@@ -3961,24 +4008,26 @@ pub const VM = struct {
     fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
-        std.debug.assert(call_base + 1 + argc <= frame.slot_count);
+        proved(call_base + 1 + argc <= frame.routine.slot_count);
         const callee = loadWords(self.verifiedSlot(frame, inst.a));
-        switch (callee.kind()) {
-            .function => {
-                const base: usize = @as(usize, frame.base_slot) + call_base + 1;
-                const callee_frame = self.enterClosureDirect(callee, base, argc, .{
-                    .return_dst = inst.c.index,
-                    .return_pc = @intCast(pc),
-                }) orelse return self.general(frame, inst, pc);
-                // The caller's place, for a trace through the callee
-                // and for its return.
-                frame.pc = @intCast(pc);
-                return self.nextAt(callee_frame, 0);
-            },
+        // A closure, the common callee, is tested first.
+        if (callee.kind() != .function) switch (callee.kind()) {
             .native_fn => return @call(out_of_line, callLeaf, .{ self, frame, inst, pc }),
             .keyword, .symbol => return @call(out_of_line, callLookup, .{ self, frame, inst, pc }),
             else => return self.general(frame, inst, pc),
-        }
+        };
+        const base: usize = @as(usize, frame.base_slot) + call_base + 1;
+        const callee_frame = self.enterClosureDirect(callee, base, argc, .{
+            .return_dst = inst.c.index,
+        }) orelse return self.general(frame, inst, pc);
+        // The caller's place, for a trace through the callee and for
+        // its return.
+        frame.pc = @intCast(pc);
+        // The callee's first instruction, through the routine in hand
+        // rather than the frame just written.
+        const first = asClosure(callee).routine.code[0];
+        if (counting) opcode_counts[opIndex(first)] += 1;
+        return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
     }
 
     /// `fastCall` of a leaf native within its arity, on its arguments
@@ -4012,11 +4061,13 @@ pub const VM = struct {
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         // A whole buffer copies inline where the stack's capacity
-        // covers it.
+        // covers it; the other copy is a call of its own, which the
+        // optimizer cannot fold the inline one into.
         var buf: [max_native_args]Value = undefined;
         if (base + max_native_args <= self.stack.capacity) {
             buf = self.stack.items.ptr[base..][0..max_native_args].*;
-        } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+        } else copySlots(buf[0..argc], self.stack.items[base..][0..argc]);
+        if (native.consumes and argc > 0) self.stack.items[base + argc - 1] = value_mod.nilValue();
         countNative(native);
         const overflows = dispatch_mod.spoilCount();
         const result = native.call(self, buf[0..argc]) catch |err| {
@@ -4027,8 +4078,15 @@ pub const VM = struct {
         // The native may have grown `frames`: the caller is the current
         // frame again, not necessarily at `frame`.
         const caller = self.currentFrame();
+        // The arguments are dead once the call returns (§6); the callee
+        // is a native, which holds no heap value.
+        for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
         self.slotAt(caller, inst.c.index).* = result;
         return self.nextSafe(caller);
+    }
+
+    noinline fn copySlots(dst: []Value, src: []const Value) void {
+        @memcpy(dst, src);
     }
 
     /// `fastCall` of a keyword or symbol, `(:k m)`, `(:k m d)`, `('s m)`,
@@ -4076,14 +4134,15 @@ pub const VM = struct {
             hr.done = true;
             self.stack.items.len = frame.entry_stack_len;
             self.frames.items.len = n - 1;
-            if (!self.running()) return;
-            return self.next(self.currentFrame());
+            // The host runs the loop at the depth it pushed the frame at,
+            // so the frame was the loop's.
+            std.debug.assert(!self.running());
+            return;
         }
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
-        std.debug.assert(dst < caller.slot_count);
-        std.debug.assert(caller.pc == frame.return_pc);
-        const resume_pc = frame.return_pc;
+        proved(dst < caller.routine.slot_count);
+        const resume_pc = caller.pc;
         self.stack.items.len = frame.entry_stack_len;
         self.frames.items.len = n - 1;
         copyWords(self.slotAt(caller, dst), v);
@@ -4112,8 +4171,8 @@ pub const VM = struct {
         const argc: u32 = inst.b.index;
         const result_dst: u12 = inst.c.index;
 
-        if (call_base + 1 + argc > caller.slot_count) return VmError.CallBlockOutOfRange;
-        if (result_dst >= caller.slot_count) return VmError.OperandOutOfRange;
+        if (call_base + 1 + argc > caller.routine.slot_count) return VmError.CallBlockOutOfRange;
+        if (result_dst >= caller.routine.slot_count) return VmError.OperandOutOfRange;
         var callee = (try self.slotPtrIn(caller, @intCast(call_base))).*;
         const args_base: usize = @as(usize, caller.base_slot) + call_base + 1;
         if (args_base + argc > self.stack.items.len) return VmError.BytecodeCorruption;
@@ -4123,11 +4182,9 @@ pub const VM = struct {
         if (callee.kind() == .var_) callee = asVar(callee).current() orelse return VmError.UnboundVar;
 
         if (callee.kind() == .function) {
-            // `caller.pc` is already past this instruction.
-            return self.enterClosure(callee, args_base, argc, self.stack.items.len, .{
-                .return_dst = result_dst,
-                .return_pc = caller.pc,
-            });
+            // `caller.pc` is already past this instruction: the return
+            // point.
+            return self.enterClosure(callee, args_base, argc, self.stack.items.len, .{ .return_dst = result_dst });
         }
         // The arguments are copied off the stack: the callee may
         // re-enter the VM and grow it. The slots keep them rooted.
@@ -4138,7 +4195,12 @@ pub const VM = struct {
             self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
         defer if (argc > buf.len) self.allocator.free(args);
         @memcpy(args, self.stack.items[args_base..][0..argc]);
+        if (callee.kind() == .native_fn and asNativeFn(callee).consumes and argc > 0) self.stack.items[args_base + argc - 1] = value_mod.nilValue();
         const result = try self.callDirect(callee, args);
+        // The block is dead once the call returns (§6): the compiler
+        // never reads a block after its call (`COMPILER.md` §4.4), so
+        // it keeps nothing it held alive until a later call reuses it.
+        nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
         (try self.slotPtr(result_dst)).* = result;
     }
 
@@ -4152,11 +4214,9 @@ pub const VM = struct {
         errdefer self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
         if (self.frames.items.len >= self.max_frames) return VmError.StackOverflow;
         self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
-        if (self.frames.items.len > self.frame_high_water) {
-            self.frame_high_water = self.frames.items.len;
-        }
-        if (self.stack.items.len > self.stack_high_water) {
-            self.stack_high_water = self.stack.items.len;
+        if (track_high_water) {
+            self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
+            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
         }
     }
 
@@ -4173,7 +4233,7 @@ pub const VM = struct {
     /// pushed by `callValue` hands the value to its host result
     /// cell; the top-level frame halts the VM with it; any other
     /// frame is popped and the value lands in the caller's
-    /// `return_dst` slot, where the caller resumes at `return_pc`.
+    /// `return_dst` slot, where the caller resumes at its own `pc`.
     /// Frame metadata is validated before anything is mutated so
     /// a corrupt frame surfaces an error, not a half-popped VM.
     fn returnValue(self: *VM, return_value: Value) VmError!void {
@@ -4191,9 +4251,8 @@ pub const VM = struct {
             return;
         }
         const caller = &self.frames.items[n - 2];
-        if (callee.return_dst >= caller.slot_count) return VmError.OperandOutOfRange;
+        if (callee.return_dst >= caller.routine.slot_count) return VmError.OperandOutOfRange;
         const absolute: usize = @as(usize, caller.base_slot) + callee.return_dst;
-        caller.pc = callee.return_pc;
         self.stack.shrinkRetainingCapacity(callee.entry_stack_len);
         self.frames.items.len = n - 1;
         self.stack.items[absolute] = return_value;
@@ -4529,7 +4588,7 @@ pub const VM = struct {
         if (inst.a.kind != .slot or inst.c.kind != .slot) return VmError.InvalidOperandKind;
         const frame = self.currentFrame();
         const argc: usize = inst.b.index;
-        if (inst.a.index + argc > frame.slot_count) return VmError.OperandOutOfRange;
+        if (inst.a.index + argc > frame.routine.slot_count) return VmError.OperandOutOfRange;
         const start = @as(usize, frame.base_slot) + inst.a.index;
         if (start + argc > self.stack.items.len) return VmError.BytecodeCorruption;
         // Hashing or comparing a lazy seq realizes it in isolation, which
@@ -4812,7 +4871,7 @@ pub const VM = struct {
                 });
 
                 // Store thrown value into the handler's binding_slot.
-                if (matched.binding_slot >= frame.slot_count) {
+                if (matched.binding_slot >= frame.routine.slot_count) {
                     return VmError.InvalidHandlerState;
                 }
                 const ptr = try self.slotPtr(matched.binding_slot);
@@ -4928,12 +4987,8 @@ pub fn lookupIn(vm: ?*VM, coll: Value, key: Value, default: Value) VmError!Value
         // carries (docs/NEXTOMIC.md §6.1); the hook returns only errors
         // of this set.
         .nextomic_entity => nextomic_handle.entityLookup(coll, key, default) catch |err| return @as(VmError, @errorCast(err)),
-        .persistent_set => if (champ_mod.setContains(
-            coll,
-            key,
-            &dispatch_mod.hashValue,
-            &dispatch_mod.equal,
-        )) key else default,
+        // The element the set holds, which may differ from an equal key.
+        .persistent_set => champ_mod.setGet(coll, key, &dispatch_mod.hashValue, &dispatch_mod.equal) orelse default,
         .persistent_vector => blk: {
             if (key.kind() != .fixnum) break :blk default;
             const idx = key.asFixnum();
@@ -4961,7 +5016,7 @@ fn transientFind(t: Value, k: Value) transient_mod.TransientError!?Value {
             .present => |v| v,
             .absent => null,
         },
-        transient_mod.subkind_transient_set => return if (try transient_mod.setContainsBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) k else null,
+        transient_mod.subkind_transient_set => return transient_mod.setGetBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal),
         else => {
             if (k.kind() != .fixnum or k.asFixnum() < 0 or @as(usize, @intCast(k.asFixnum())) >= try transient_mod.vectorCountBang(t)) return null;
             return try transient_mod.vectorNthBang(t, @intCast(k.asFixnum()));
@@ -5720,7 +5775,7 @@ test "VM frames: stack and frames structures initialized correctly" {
     try testing.expectEqual(@as(usize, 5), vm.stack.items.len);
     try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
     try testing.expectEqual(@as(u32, 0), vm.frames.items[0].base_slot);
-    try testing.expectEqual(@as(u16, 5), vm.frames.items[0].slot_count);
+    try testing.expectEqual(@as(u16, 5), vm.frames.items[0].routine.slot_count);
     try testing.expectEqual(@as(u32, 0), vm.frames.items[0].pc);
     // All slots default-initialized to nil.
     for (vm.stack.items) |s| {
@@ -7787,8 +7842,10 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
         try testing.expectEqual(frames, vm.frames.items.len);
         try testing.expectEqual(stack, vm.stack.items.len);
     }
-    try testing.expectEqual(frames + 1, vm.frame_high_water);
-    try testing.expect(vm.stack_high_water >= stack + inc_routine.slot_count);
+    if (VM.track_high_water) {
+        try testing.expectEqual(frames + 1, vm.frame_high_water);
+        try testing.expect(vm.stack_high_water >= stack + inc_routine.slot_count);
+    }
 
     // A closure of another arity, a leaf native given the wrong count
     // and a non-callable fail as callValue fails, detail included.
@@ -7816,6 +7873,48 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
     try testing.expect((try get_k.call(&.{value_mod.nilValue()})).isNil());
     try testing.expect((try get_k.call(&.{fx(5)})).isNil());
     try testing.expectEqual(k, try get_k.call(&.{set}));
+}
+
+test "Callback: an error in the callee is caught where a handler stands, else leaves its frame standing" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] (try (+ x 1) (catch any e e))): the error leaves the
+    // callee's first pass, and the loop runs the catch to the return.
+    const caught_code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.mathAdd(2, sl(0), kn(0)),
+        asm_.tryExit(5),
+        asm_.move(2, 1), // 3: the catch
+        asm_.tryExit(5),
+        asm_.returnSlot(2),
+    };
+    const one = [_]Value{fx(1)};
+    const tries = [_]Try{.{ .catch_pc = 3 }};
+    const caught = Routine{ .code = &caught_code, .consts = &one, .tries = &tries, .slot_count = 3, .fixed_arity = 1, .name = "caught" };
+    var cb = Callback.init(&vm, try vm.allocClosure(&caught, 0), 1);
+    const frames = vm.frames.items.len;
+    try testing.expectEqual(@as(i64, 6), (try cb.call(&.{fx(5)})).asFixnum());
+    const kw = try cb.call(&.{value_mod.nilValue()});
+    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(kw.asKeywordId()));
+    try testing.expectEqual(@as(i64, 8), (try cb.call(&.{fx(7)})).asFixnum());
+    try testing.expectEqual(frames, vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+
+    // (fn [x] (+ x 1)) given nil, with no handler: the error leaves with
+    // the callee's frame standing at the failing instruction, as a run
+    // loop leaves it for the trace.
+    const plain_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const plain = Routine{ .code = &plain_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "plain" };
+    var bad = Callback.init(&vm, try vm.allocClosure(&plain, 0), 1);
+    try testing.expectEqual(@as(i64, 3), (try bad.call(&.{fx(2)})).asFixnum());
+    try testing.expectError(VmError.KindMismatch, bad.call(&.{value_mod.nilValue()}));
+    try testing.expectEqual(frames + 1, vm.frames.items.len);
+    try testing.expectEqual(&plain, vm.frames.items[frames].routine);
+    try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
 }
 
 test "VM dispatch: a native's throw two loops deep reaches the handler below" {
@@ -7876,7 +7975,7 @@ test "VM dispatch: recursion stops at max_frames on the direct call path" {
     vm.max_frames = 50;
     try testing.expectError(VmError.StackOverflow, vm.run());
     try testing.expectEqual(@as(usize, 50), vm.frames.items.len);
-    try testing.expectEqual(@as(usize, 50), vm.frame_high_water);
+    if (VM.track_high_water) try testing.expectEqual(@as(usize, 50), vm.frame_high_water);
 }
 
 test "VM closure call: same closure called twice — both invocations succeed" {

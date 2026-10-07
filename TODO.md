@@ -36,24 +36,20 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    write. The commit protocol is emdb's; nexis changes nothing in emdb
    (`AGENTS.md`), so this is the engine owner's call.
 
-13. **A lazy seq a slot holds keeps what it realized.** The VM
-    roots every slot of its stack, so a lazy seq passed to a native
-    that walks it stays realized, from its head, until the call
-    returns and the slot is reused (`docs/LAZY.md` §9): `(reduce +
-    (map inc (filter even? (map inc (range 3000000)))))` peaks at 201
-    MB, and a prototype that clears a native call's argument block
-    after it returns brought it to 63 MB. In `bench/compare`'s
-    `freq-group` the lazy `map` that `frequencies` counts is live
-    during the phase's one cycle, so it peaks at 60 MB against the
-    eager build's 40 MB (`docs/PERF.md` §3.11). The pipeline row's
-    resident set is not this: no cycle runs in its phase, and the same
-    prototype left it unchanged. Clearing a call's argument slots
-    after it returns, letting a consuming native drop its seq
-    argument's slot once its own cursor holds the walk, and clearing a
-    local's slot after its last use would give Clojure's
-    constant-memory streaming; each changes the rooting rule
-    (`docs/GC.md` §11.5) and is measured with the interpreter-speed
-    work.
+13. **A lazy seq a local holds keeps what it realized.** A native's
+    call block is cleared when it returns, and the natives that walk a
+    sequence to its end (`reduce`, `frequencies`, `group-by`, `some`,
+    `every?`, `last`, `dorun`) consume it (`docs/GC.md` §11.5), so a
+    pipeline passed straight to one runs in constant memory: `(reduce
+    + (map inc (filter even? (map inc (range 3000000)))))` peaks at 21
+    MB (`docs/PERF.md` §3.21). A seq bound to a local, or passed to a
+    closure, whose argument is its own slot, stays held by the slot
+    until it is reused: `(let [s (map inc (range n))] (reduce + s))`
+    and `(defn total [xs] (reduce + xs))` keep everything they walk,
+    where Clojure's locals clearing lets it go. Clearing a local after
+    its last use needs liveness in the compiler and an instruction or
+    a flag per cleared local; `count`, `into`, `vec` and the other
+    natives that walk to the end could consume their argument too.
 ## Store size
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's

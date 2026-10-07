@@ -252,7 +252,9 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
   lookup with an optional default,
   `(:k m)`, `('s m)`, `(m :k)`, `(s x)`, `(v i)` (`VM.lookup`); a
   symbol looks itself up exactly as a keyword does, and a transient
-  map, set or vector as its persistent kind.
+  map, set or vector as its persistent kind. A set, as `get` of one,
+  gives back the element it holds equal to `x`, which may differ from
+  `x` (`(#{'(1)} [1])` is `(1)`), as Clojure's does.
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 
@@ -261,8 +263,12 @@ A closure call checks `argc` against `fixed_arity` / `variadic`
 at the caller's `slot[A + 1]` (`callee_base = caller_base + A + 1`),
 so the callee's slot 0 is its first argument and nothing is copied.
 The backing stack grows to `callee_base + slot_count`; the frame
-records the stack length on entry (`entry_stack_len`), the caller's
-pc and the result slot. For a variadic routine the call machinery
+records the stack length on entry (`entry_stack_len`) and the result
+slot, and the caller's own `pc`, which nothing changes while the
+callee runs, holds its return point. A closure carries one cell for
+each upvalue of its routine (`closure:make` of a verified descriptor
+builds it so, and the stdlib image's loader checks its closures when
+it verifies its routines), so a call does not count them. For a variadic routine the call machinery
 builds a list of the excess arguments at `slot[fixed_arity]`, nil
 when there are none (so `(if more ...)` tests for extra arguments,
 as in Clojure), and resets the slots above it to nil. The frame's
@@ -274,6 +280,24 @@ instruction.
 **Call-clobbered region.** Slots at and above A are overwritten by
 the callee's window; values live across the call sit strictly below
 A (a compiler invariant).
+
+**After the call.** The compiler never reads a block after its call
+(`COMPILER.md` §4.4), so a call of anything but a closure or a leaf
+clears its block before the result lands in `slot[C]`: the arguments
+of a native called in place (§8), whose callee is a native and holds
+no heap value, and the whole block of a call through the general
+entry (a protocol fn, a Var, a lookup, a native past the in-place
+cases). A sequence a native was given is then not kept alive by the
+block until a later call reuses its slots. A leaf's block and an
+in-place keyword lookup's are left as they are: they hold what a
+leaf takes (numbers, a vector to index), and clearing them would
+cost every arithmetic call. A closure's arguments are its own slots
+and stay as its body leaves them; clearing its window's overlap with
+the caller's frame on return cost 5% of a call (`docs/PERF.md` §6).
+A native that consumes its last argument (`NativeFn.consumes`) has
+that argument's slot cleared before the call, once the arguments are
+copied: it roots the argument itself and lets the part of a lazy seq
+it has walked go (`docs/GC.md` §11.5).
 
 `call:tailcall` traps `UnimplementedOpcode` and the compiler never
 emits it; `recur` compiles to a jump (§11). `call:return A` and
@@ -294,7 +318,8 @@ the same way (the loader and `eval`).
 
 **Repeated calls.** A native that calls one callee once per element
 with the same argument count (`map` over one collection, `filter`,
-`remove`, `keep`, `reduce`) calls it through a `vm.Callback`, which
+`remove`, `keep`, `reduce`, `group-by`) calls it through a
+`vm.Callback`, which
 makes at its first call the decisions `callValue` makes at every one
 and cannot change between calls from the same place: the callee's
 kind, its arity against the count, and for a closure the stack guard
@@ -302,9 +327,14 @@ kind, its arity against the count, and for a closure the stack guard
 need, since every call starts from the frame depth and stack length
 the first one found. Each later call of a closure writes the
 arguments and nil locals into the window at that stack length, pushes
-the frame built at the first call and runs the loop to its return; a
-call that finds the depth or the length changed goes through
-`callValue`. A leaf native is called as `callValue` calls it, and a
+the frame built at the first call and runs it as the loop would: the
+loop's depth and nesting are set, the safe point of the loop's entry
+taken, and the chain entered at the callee's first instruction, the
+frame the loop's first pass would run, so the pass needs no test. A
+pass that ends without an error has returned; one that ends with an
+error goes on to the loop, which takes the error as its own pass
+would (§8, §12). A call that finds the depth or the length changed
+goes through `callValue`. A leaf native is called as `callValue` calls it, and a
 keyword or symbol given one argument that is a map, a record or nil
 looks itself up in place (§8); any other callee, and any callee whose
 arity the count does not fit, goes through `callValue` every time, so
@@ -313,22 +343,37 @@ the results, errors, error details, traces and rooting are
 
 **Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
 never re-enters the VM and never compares, hashes or prints nested
-data (arithmetic, numeric predicates, `nth`), so nothing under it can
-collect, grow the stack or move the spoil count (§13.1).
+data (arithmetic, numeric and kind predicates, the lookups below), so
+nothing under it can collect, grow the stack or move the spoil count
+(§13.1).
 `call:call` passes it its arguments in place on the stack, and
 `callValue` and a `Callback` call it without the root scope, the stack
 guard or the overflow check while no cycle is due; once one is, the
 call takes `callValue`'s rooted path and its safe point, so a native
 that calls a leaf per element (`(reduce * xs)`) collects as it goes.
-Its arity is checked, and reported, as any native's.
-A leaf may refuse a receiver it could handle only by running code:
-`nth` of a lazy seq, whose walk realizes it (`docs/LAZY.md` §4). Its
-leaf body returns the internal `VmError.NeedsReentry` before it touches
-anything, and the three leaf call sites (`call:call`'s in-place path,
-`callValue`'s and a `Callback`'s) re-issue the call through the general
-path, arguments copied off the stack and rooted, which runs the
-descriptor's `general` body instead of `call`. The error never escapes
-a call site.
+Its arity is checked, and reported, as any native's. A leaf may
+allocate (`conj` onto a vector): `Heap.alloc` never collects (§9), and
+the call site reaches a safe point after it, `call:call` at the next
+fetch and `callValue` and a `Callback` by taking the rooted path once a
+cycle is due.
+A leaf may refuse a receiver it could handle only by running code or
+walking nested data. Its leaf body returns the internal
+`VmError.NeedsReentry` before it touches anything, and the three leaf
+call sites (`call:call`'s in-place path, `callValue`'s and a
+`Callback`'s) re-issue the call through the general path, arguments
+copied off the stack and rooted, which runs the descriptor's `general`
+body instead of `call`. The error never escapes a call site.
+
+| Leaf | What it refuses |
+|---|---|
+| `nth` | a lazy seq, whose walk realizes it (`docs/LAZY.md` §4) |
+| `get` | a sorted collection (its comparator), a Nextomic entity (the store), and a hash map, set, record or transient searched by a key on the heap (its hash and `=` may realize a lazy seq or walk nested data) |
+| `count` | a lazy seq (realized to its end) and a Nextomic entity |
+| `nthnext` | anything but nil, a list and a vector |
+| `conj` | anything but nil, a list and a vector (a map or set hashes, a lazy seq is realized) |
+| `assoc` | anything but a vector, nil, a hash map and a record, and any of the last three by a key on the heap |
+| `assoc!` | anything but a transient vector and a transient map, and the map by a key on the heap |
+| `str` | anything but nil, a string, a char and a fixnum (printing walks it) |
 
 ---
 
@@ -364,16 +409,17 @@ collector root (§9).
 
 | Field | Contents |
 |---|---|
-| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument |
-| `base_slot`, `slot_count` | The window into the shared backing stack (`vm.stack`); `slot[i]` is `stack[base_slot + i]` |
+| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument. Under a frame it called, the caller's `pc` is its return point |
+| `base_slot` | The window into the shared backing stack (`vm.stack`): `slot[i]` is `stack[base_slot + i]` for `i` below the routine's `slot_count` |
 | `entry_stack_len` | The stack length before the window grew; a return or an unwind restores it |
 | `upvalues` | The closure's cell array (shared, not owned) |
 | `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block and its cells alive for the frame's life |
-| `return_dst`, `return_pc` | Where the caller receives the result and resumes |
+| `return_dst` | Where the caller receives the result |
 | `host_result` | For a frame `callValue`, `runRoutine` or a `Callback` pushed: the cell its return writes instead of a caller's slot (`HostCallResult`) |
 
-A frame is pushed by `call:call` and by `callValue` / `runRoutine`,
-and popped by a return or discarded by a throw that unwinds past it.
+A frame is 64 bytes, one cache line. It is pushed by `call:call` and
+by `callValue` / `runRoutine`, and popped by a return or discarded by
+a throw that unwinds past it.
 `try` handlers are not per-frame: they live on one VM-wide stack
 keyed by frame index (§12).
 
@@ -407,6 +453,10 @@ The fetch checks nothing: verification (§5) proved every pc it can
 reach inside the code and every instruction `primary`, and the fast
 handlers read their operands, jump and fill call blocks without the
 bounds verification proved. The general handlers keep their checks.
+Debug and safe builds assert what verification proved; a release
+build neither checks nor assumes it, since an assumed bound read
+through the frame's routine changes the fast handlers' code for the
+worse (`docs/PERF.md` §3.21).
 A fast handler reads a slot's value as two whole 8-byte words, the
 way a handler stores one, never its kind byte alone or both words in
 one 16-byte load: a load the size of a store in flight takes its data
@@ -452,13 +502,15 @@ instruction.
   one to six registers with `push` and `pop`; no handler there may
   reserve or address stack, and the check lists what each saves.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
-  `callValue` and `runRoutine` until the frame they pushed returns.
-  It enters the chain at the current frame's next instruction, and the
-  chain returns to it only with an error, which it translates to a
-  throw when a handler is in force (§12) or passes on, or once the
-  loop's frame has returned. Only the handlers that can pop or unwind
-  frames or halt (`call:return`, `call:return-nil`, `ctrl:*`) test
-  for that.
+  `callValue` and `runRoutine` until the frame they pushed returns (a
+  `Callback` makes the first pass itself, §6). It enters the chain at
+  the current frame's next instruction, and the chain returns to it
+  only with an error, which it translates to a throw when a handler is
+  in force (§12) or passes on, or once the loop's frame has returned.
+  Only the handlers that can pop or unwind frames or halt
+  (`call:return`, `call:return-nil`, `ctrl:*`) test for that; the
+  return of a frame a host pushed ends the chain without the test,
+  since the host's loop runs at that frame's depth.
 - The handlers of the groups that never push or pop a frame (`mov`,
   `cmp`, `jump`, `var`, `math`, `closure`, `coll`) run against the
   frame the fetch took; `call` and `ctrl` re-derive the current frame,
@@ -740,9 +792,11 @@ is emitted.
 is pushed and the backing stack does not grow. It allocates nothing
 per iteration for bindings no closure captures, and one cell per
 captured binding per iteration. What the body allocates is its own.
-`VM.stack_high_water` and `VM.frame_high_water` move only on growth,
-so a test comparing them around a loop sees the true maximum;
-`src/compile.zig` pins a 10k-iteration loop leaving both unchanged.
+`VM.stack_high_water` and `VM.frame_high_water` move wherever a frame
+is pushed, in builds with runtime safety (a release build keeps the
+stores off its calls and leaves them at their start), so a test
+comparing them around a loop sees the true maximum; `src/compile.zig`
+pins a 10k-iteration loop leaving both unchanged.
 
 ---
 
@@ -880,7 +934,7 @@ run):
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
 | `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10). Where it runs: an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block past the frame's slot count |
-| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: a closure's cell count differs from its routine's |
+| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |
 | `InvalidCellState` | `box-local` on a boxed slot; `init-cell` on an initialized cell |

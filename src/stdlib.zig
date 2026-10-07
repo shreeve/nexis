@@ -68,10 +68,12 @@ const VmError = vm_mod.VmError;
 // once, and `.leaf` after a leaf (`NativeFn.leaf`: arithmetic,
 // predicates and lookups over the arguments alone, none calling back,
 // comparing or hashing nested data; a bignum one makes is a fresh
-// block, and `Heap.alloc` never collects, VM.md §9). `table` turns
-// it into static descriptors (immortal, so a
-// `.native_fn` Value can point at one); a descriptor outside
-// nexis.core is named `ns/name` for traces and printing.
+// block, and `Heap.alloc` never collects, VM.md §9), and after that
+// the full body when the leaf body refuses some receivers with
+// `NeedsReentry` (`NativeFn.general`). `table` turns it into static
+// descriptors (immortal, so a `.native_fn` Value can point at one); a
+// descriptor outside nexis.core is named `ns/name` for traces and
+// printing.
 
 fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]NativeFn {
     var out: [entries.len]NativeFn = undefined;
@@ -81,6 +83,7 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .max_arity = e[2],
         .call = e[3],
         .leaf = if (e.len > 4) e[4] == .leaf else false,
+        .consumes = if (e.len > 4) e[4] == .consumes else false,
         .general = if (e.len > 5) e[5] else null,
     };
     return out;
@@ -214,9 +217,9 @@ const core_natives = table("", .{
     .{ "second", 1, 1, &fnSecond },
     .{ "take", 1, 2, &fnTake },
     .{ "drop", 1, 2, &fnDrop },
-    .{ "some", 2, 2, &fnSome },
-    .{ "every?", 2, 2, &fnEveryQ },
-    .{ "count", 1, 1, &fnCount },
+    .{ "some", 2, 2, &fnSome, .consumes },
+    .{ "every?", 2, 2, &fnEveryQ, .consumes },
+    .{ "count", 1, 1, &fnCountLeaf, .leaf, &fnCount },
     .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
     .{ "empty?", 1, 1, &fnEmptyQ },
     .{ "identity", 1, 1, &fnIdentity, .leaf },
@@ -281,7 +284,7 @@ const core_natives = table("", .{
     // apply + HOFs.
     .{ "apply", 2, null, &fnApply },
     .{ "map", 1, null, &fnMap },
-    .{ "reduce", 2, 3, &fnReduce },
+    .{ "reduce", 2, 3, &fnReduce, .consumes },
     .{ "reduce-kv", 3, 3, &fnReduceKv },
     .{ "filter", 1, 2, &fnFilter },
     .{ "remove", 1, 2, &fnRemove },
@@ -304,10 +307,10 @@ const core_natives = table("", .{
     .{ "take-while", 1, 2, &fnTakeWhile },
     .{ "drop-while", 1, 2, &fnDropWhile },
     .{ "butlast", 1, 1, &fnButlast },
-    .{ "last", 1, 1, &fnLast },
+    .{ "last", 1, 1, &fnLast, .consumes },
     .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
-    .{ "nthnext", 2, 2, &fnNthnext },
+    .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext },
     .{ "take-last", 2, 2, &fnTakeLast },
     .{ "repeat", 1, 2, &fnRepeat },
     .{ "repeatedly", 1, 2, &fnRepeatedly },
@@ -359,26 +362,26 @@ const core_natives = table("", .{
     .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
     .{ "alter-var-root", 2, null, &fnAlterVarRoot },
     .{ "boolean", 1, 1, &fnBoolean },
-    .{ "list?", 1, 1, kindPredicate(isList) },
-    .{ "seq?", 1, 1, kindPredicate(isSeq) },
-    .{ "vector?", 1, 1, kindPredicate(isVector) },
-    .{ "map?", 1, 1, kindPredicate(isMap) },
-    .{ "set?", 1, 1, kindPredicate(isSet) },
-    .{ "keyword?", 1, 1, kindPredicate(isKeyword) },
-    .{ "symbol?", 1, 1, kindPredicate(isSymbol) },
-    .{ "char?", 1, 1, kindPredicate(isChar) },
-    .{ "boolean?", 1, 1, kindPredicate(isBoolean) },
-    .{ "coll?", 1, 1, kindPredicate(isColl) },
-    .{ "sequential?", 1, 1, kindPredicate(isSequential) },
-    .{ "associative?", 1, 1, kindPredicate(isAssociative) },
-    .{ "fn?", 1, 1, kindPredicate(isFn) },
-    .{ "ifn?", 1, 1, kindPredicate(isIfn) },
-    .{ "counted?", 1, 1, kindPredicate(isCounted) },
+    .{ "list?", 1, 1, kindPredicate(isList), .leaf },
+    .{ "seq?", 1, 1, kindPredicate(isSeq), .leaf },
+    .{ "vector?", 1, 1, kindPredicate(isVector), .leaf },
+    .{ "map?", 1, 1, kindPredicate(isMap), .leaf },
+    .{ "set?", 1, 1, kindPredicate(isSet), .leaf },
+    .{ "keyword?", 1, 1, kindPredicate(isKeyword), .leaf },
+    .{ "symbol?", 1, 1, kindPredicate(isSymbol), .leaf },
+    .{ "char?", 1, 1, kindPredicate(isChar), .leaf },
+    .{ "boolean?", 1, 1, kindPredicate(isBoolean), .leaf },
+    .{ "coll?", 1, 1, kindPredicate(isColl), .leaf },
+    .{ "sequential?", 1, 1, kindPredicate(isSequential), .leaf },
+    .{ "associative?", 1, 1, kindPredicate(isAssociative), .leaf },
+    .{ "fn?", 1, 1, kindPredicate(isFn), .leaf },
+    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf },
+    .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf },
     .{ "delay?", 1, 1, &fnDelayQ },
     // Lazy seqs (docs/LAZY.md).
     .{ "realized?", 1, 1, &fnRealizedQ },
     .{ "doall", 1, 2, &fnDoall },
-    .{ "dorun", 1, 2, &fnDorun },
+    .{ "dorun", 1, 2, &fnDorun, .consumes },
     .{ "chunked-seq?", 1, 1, &fnChunkedSeqQ },
     .{ "chunk-first", 1, 1, &fnChunkFirst },
     .{ "chunk-rest", 1, 1, &fnChunkRest },
@@ -389,7 +392,7 @@ const core_natives = table("", .{
     .{ "chunk-cons", 2, 2, &fnChunkCons },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
     .{ "class", 1, 1, &fnClass },
-    .{ "var?", 1, 1, kindPredicate(isVar) },
+    .{ "var?", 1, 1, kindPredicate(isVar), .leaf },
     .{ "find-ns", 1, 1, &fnFindNs },
     .{ "all-ns", 0, 0, &fnAllNs },
     .{ "ns-interns", 1, 1, &fnNsInterns },
@@ -398,7 +401,7 @@ const core_natives = table("", .{
     .{ "ns-resolve", 2, 2, &fnNsResolve },
     .{ "random-uuid", 0, 0, &fnRandomUuid },
     .{ "parse-uuid", 1, 1, &fnParseUuid },
-    .{ "indexed?", 1, 1, kindPredicate(isIndexed) },
+    .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector },
     .{ "vec", 1, 1, &fnVec },
@@ -407,21 +410,21 @@ const core_natives = table("", .{
     .{ "set", 1, 1, &fnSet },
     .{ "subvec", 2, 3, &fnSubvec },
     .{ "identical?", 2, 2, &fnIdenticalQ },
-    .{ "assoc", 3, null, &fnAssoc },
+    .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc },
     .{ "dissoc", 1, null, &fnDissoc },
-    .{ "get", 2, 3, &fnGet },
+    .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet },
     .{ "contains?", 2, 2, &fnContainsQ },
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
-    .{ "conj", 0, null, &fnConj },
-    .{ "frequencies", 1, 1, &fnFrequencies },
-    .{ "group-by", 2, 2, &fnGroupBy },
+    .{ "conj", 0, null, &fnConjLeaf, .leaf, &fnConj },
+    .{ "frequencies", 1, 1, &fnFrequencies, .consumes },
+    .{ "group-by", 2, 2, &fnGroupBy, .consumes },
     // Transients (docs/TRANSIENT.md): each `!` edits the nodes the
     // transient owns in place and returns the transient to use.
     .{ "transient", 1, 1, &fnTransient },
     .{ "persistent!", 1, 1, &fnPersistentBang },
     .{ "conj!", 0, null, &fnConjBang },
-    .{ "assoc!", 3, null, &fnAssocBang },
+    .{ "assoc!", 3, null, &fnAssocBangLeaf, .leaf, &fnAssocBang },
     .{ "dissoc!", 2, null, &fnDissocBang },
     .{ "disj!", 2, null, &fnDisjBang },
     .{ "pop!", 1, 1, &fnPopBang },
@@ -430,15 +433,15 @@ const core_natives = table("", .{
     .{ "sorted-map-by", 1, null, &fnSortedMapBy },
     .{ "sorted-set", 0, null, &fnSortedSet },
     .{ "sorted-set-by", 1, null, &fnSortedSetBy },
-    .{ "sorted?", 1, 1, kindPredicate(sorted_mod.isSortedKind) },
-    .{ "reversible?", 1, 1, kindPredicate(isReversible) },
+    .{ "sorted?", 1, 1, kindPredicate(sorted_mod.isSortedKind), .leaf },
+    .{ "reversible?", 1, 1, kindPredicate(isReversible), .leaf },
     .{ "subseq", 3, 5, &fnSubseq },
     .{ "rsubseq", 3, 5, &fnRsubseq },
     .{ "rseq", 1, 1, &fnRseq },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
     .{ "i64-vector", 1, 1, &fnI64Vector },
     .{ "f64-vector", 1, 1, &fnF64Vector },
-    .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector) },
+    .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector), .leaf },
     .{ "typed-vector-type", 1, 1, &fnTypedVectorType },
     // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
     // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
@@ -458,7 +461,7 @@ const core_natives = table("", .{
     .{ "satisfies?", 2, 2, &fnSatisfiesQ },
     // Core string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STDLIB.md` §2.
-    .{ "str", 0, null, &fnStr },
+    .{ "str", 0, null, &fnStrLeaf, .leaf, &fnStr },
     .{ "string?", 1, 1, &fnStringQ },
     .{ "subs", 2, 3, &fnSubs },
     // Regular expressions (docs/REGEX.md §9); `re-seq` is core.nx's.
@@ -723,9 +726,12 @@ fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
 /// `(some pred coll)` → the first truthy `(pred x)`, else nil;
 /// `(every? pred coll)` → whether `(pred x)` is truthy for every x.
 /// Both stop at the first element that decides. Rooting: each built
-/// element is only the next call's argument (GC.md §11.5, class 2).
+/// element is only the next call's argument (GC.md §11.5, class 2);
+/// both consume `coll` (`consumingSeqIter`).
 fn fnSome(vm: *VM, args: []const Value) VmError!Value {
-    var it = try makeSeqIter(vm, args[1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
         const r = try cb.call(&.{x});
@@ -735,7 +741,9 @@ fn fnSome(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
-    var it = try makeSeqIter(vm, args[1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
         if (!(try cb.call(&.{x})).isTruthy()) return value_mod.fromBool(false);
@@ -779,6 +787,15 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
+}
+
+/// `count` as a leaf (VM.md §6): a lazy seq (realized to its end) and
+/// an entity (read from the store) go the general way.
+fn fnCountLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .lazy_seq, .nextomic_entity => VmError.NeedsReentry,
+        else => fnCount(vm, args),
+    };
 }
 
 /// `(nth coll n)` → element at index `n`. Throws on out-of-
@@ -1558,17 +1575,19 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
 fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
+    // `coll` is consumed: its slot in this scope keeps the walk, or the
+    // pure seq's state (an `iterate`'s function, a `cycle`'s source).
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, coll, scope);
     if (seq_mod.pureOf(coll)) |p| return reducePure(vm, f, if (args.len == 3) args[1] else null, p);
-    var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     var cb = vm_mod.Callback.init(vm, f, 2);
     // The accumulator is the next call's argument, and a lazy `coll`'s
     // next step may collect before that call (GC.md §11.5, class 5):
     // it goes into a root slot before such a step.
-    const scope = vm.rootScope();
-    defer scope.release();
     try scope.push(acc);
-    while (try it.nextChunk(scope.base, acc)) |xs| for (xs) |x| {
+    while (try it.nextChunk(scope.base + 1, acc)) |xs| for (xs) |x| {
         acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
     };
@@ -1875,6 +1894,22 @@ fn fnAssoc(vm: *VM, args: []const Value) VmError!Value {
     return coll;
 }
 
+/// `assoc` as a leaf (VM.md §6): into a vector, and into nil, a hash
+/// map or a record by keys off the heap, which hash without walking
+/// anything; a key on the heap or any other collection goes the
+/// general way.
+fn fnAssocLeaf(vm: *VM, args: []const Value) VmError!Value {
+    switch (args[0].kind()) {
+        .persistent_vector => {},
+        .nil, .persistent_map, .record => {
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) if (args[i].kind().isHeap()) return VmError.NeedsReentry;
+        },
+        else => return VmError.NeedsReentry,
+    }
+    return fnAssoc(vm, args);
+}
+
 fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     const heap = vm.ensureHeap();
     return switch (coll.kind()) {
@@ -1942,6 +1977,19 @@ fn fnGet(vm: *VM, args: []const Value) VmError!Value {
     // (SORTED.md §6).
     if (sorted_mod.isSortedKind(args[0].kind())) return vm_mod.lookupIn(vm, args[0], args[1], default);
     return vm_mod.lookup(args[0], args[1], default) catch |err| if (err == VmError.KindMismatch) default else err;
+}
+
+/// `get` as a leaf (VM.md §6). It refuses what only `fnGet` may run:
+/// a sorted collection (its comparator), an entity (the store), and a
+/// hashed collection searched by a key on the heap, whose hash and `=`
+/// may realize a lazy seq or walk nested data.
+fn fnGetLeaf(vm: *VM, args: []const Value) VmError!Value {
+    switch (args[0].kind()) {
+        .sorted_map, .sorted_set, .nextomic_entity => return VmError.NeedsReentry,
+        .persistent_map, .persistent_set, .record, .transient => if (args[1].kind().isHeap()) return VmError.NeedsReentry,
+        else => {},
+    }
+    return fnGet(vm, args);
 }
 
 /// The element at fixnum index `k` of typed vector `tv`, or null
@@ -2096,6 +2144,17 @@ fn fnConj(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
+/// `conj` as a leaf (VM.md §6): onto nil, a list or a vector, which
+/// only allocates; any other collection hashes or realizes, and goes
+/// the general way.
+fn fnConjLeaf(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len < 2) return fnConj(vm, args);
+    return switch (args[0].kind()) {
+        .nil, .list, .persistent_vector => fnConj(vm, args),
+        else => VmError.NeedsReentry,
+    };
+}
+
 /// A map or record with each `x` conj'd: a `[k v]` entry, every entry
 /// of a map or record, or nothing for nil.
 fn conjMap(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
@@ -2145,11 +2204,12 @@ fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
 fn fnFrequencies(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
-    // A lazy argument's next step may collect (GC.md §11.5, class 5).
+    // A lazy argument's next step may collect (GC.md §11.5, class 5),
+    // and the argument is consumed.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(t);
-    var it = try makeSeqIter(vm, args[0]);
+    var it = try consumingSeqIter(vm, args[0], scope);
     while (try it.next()) |x| {
         const spot = transient_mod.mapLocateBang(t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const n: i64 = if (champ_mod.mapSpotValue(spot)) |c| c.asFixnum() + 1 else 1;
@@ -2173,9 +2233,10 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     defer scope.release();
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
     try scope.push(t);
-    var it = try makeSeqIter(vm, args[1]);
+    var it = try consumingSeqIter(vm, args[1], scope);
+    var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
-        const k = try vm.callValue(f, &.{x});
+        const k = try cb.call(&.{x});
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
             const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;
@@ -2402,9 +2463,14 @@ fn fnLast(vm: *VM, args: []const Value) VmError!Value {
         },
         else => {},
     }
-    var it = try makeSeqIter(vm, c);
+    // `c` is consumed, and the last element seen waits in a root slot
+    // before a step that may collect: the walk's place has left it.
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(value_mod.nilValue());
+    var it = try consumingSeqIter(vm, c, scope);
     var last = value_mod.nilValue();
-    while (try it.next()) |x| last = x;
+    while (try it.nextChunk(scope.base, last)) |xs| last = xs[xs.len - 1];
     return last;
 }
 
@@ -2475,6 +2541,15 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
 /// destructuring rest (`[a b & more]`) costs one block.
 fn fnNthnext(vm: *VM, args: []const Value) VmError!Value {
     return fnSeq(vm, &.{try fnNthrest(vm, args)});
+}
+
+/// `nthnext` as a leaf (VM.md §6): of nil, a list or a vector; any
+/// other seqable goes the general way.
+fn fnNthnextLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return switch (args[0].kind()) {
+        .nil, .list, .persistent_vector => fnNthnext(vm, args),
+        else => VmError.NeedsReentry,
+    };
 }
 
 /// `(take-last n coll)`; of nothing it is nil, as Clojure's.
@@ -3818,8 +3893,30 @@ fn fnDoall(vm: *VM, args: []const Value) VmError!Value {
     return args[args.len - 1];
 }
 
+/// `(dorun coll)` / `(dorun n coll)`: realize, keeping nothing. `coll`
+/// is consumed: the walk's place, or the seq `next` has reached, is
+/// its root.
 fn fnDorun(vm: *VM, args: []const Value) VmError!Value {
-    try realizeArg(vm, args);
+    const scope = vm.rootScope();
+    defer scope.release();
+    const coll = args[args.len - 1];
+    if (args.len == 1) {
+        try scope.push(coll);
+        var it = try SeqIter.realizing(vm, coll);
+        it.cursor = scope.base;
+        while (try it.next()) |_| {}
+        return value_mod.nilValue();
+    }
+    const n = try requireCount(args[0]);
+    try scope.push(coll);
+    var xs = coll;
+    for (0..n) |_| {
+        const s = try seq_mod.seqOf(vm, xs);
+        if (s.isNil()) break;
+        vm.roots.items[scope.base] = s;
+        xs = try seq_mod.next(vm, s);
+        vm.roots.items[scope.base] = xs;
+    }
     return value_mod.nilValue();
 }
 
@@ -4229,6 +4326,22 @@ fn fnAssocBang(vm: *VM, args: []const Value) VmError!Value {
     var i: usize = 1;
     while (i < args.len) : (i += 2) try assocBang(vm, t, args[i], args[i + 1]);
     return t;
+}
+
+/// `assoc!` as a leaf (VM.md §6): into a transient vector, and into a
+/// transient map by keys off the heap; anything else goes the general
+/// way.
+fn fnAssocBangLeaf(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .transient) return VmError.NeedsReentry;
+    switch (args[0].subkind()) {
+        transient_mod.subkind_transient_vector => {},
+        transient_mod.subkind_transient_map => {
+            var i: usize = 1;
+            while (i < args.len) : (i += 2) if (args[i].kind().isHeap()) return VmError.NeedsReentry;
+        },
+        else => return VmError.NeedsReentry,
+    }
+    return fnAssocBang(vm, args);
 }
 
 /// `(dissoc! t k & ks)` on a transient map.
@@ -4652,9 +4765,22 @@ fn writePlainStr(v: Value, out: []u8) []u8 {
 /// length; one string alone is itself, as in Clojure. Anything else
 /// goes through the printer.
 fn fnStr(vm: *VM, args: []const Value) VmError!Value {
+    return (try strPlain(vm, args)) orelse strFormatted(vm, args);
+}
+
+/// `str` as a leaf (VM.md §6): of nil, strings, chars and fixnums,
+/// whose text is written without walking anything; anything else goes
+/// the general way.
+fn fnStrLeaf(vm: *VM, args: []const Value) VmError!Value {
+    return (try strPlain(vm, args)) orelse VmError.NeedsReentry;
+}
+
+/// `str` of `args` when each is nil, a string, a char or a fixnum;
+/// null otherwise.
+fn strPlain(vm: *VM, args: []const Value) VmError!?Value {
     if (args.len == 1 and args[0].kind() == .string) return args[0];
     var len: usize = 0;
-    for (args) |x| len += plainStrLen(x) orelse return strFormatted(vm, args);
+    for (args) |x| len += plainStrLen(x) orelse return null;
     const out = string_mod.allocUninit(vm.ensureHeap(), len) catch return VmError.OutOfMemory;
     var rest = out.bytes;
     for (args) |x| rest = writePlainStr(x, rest);
@@ -5826,6 +5952,16 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return SeqIter.init(vm, coll);
 }
 
+/// `makeSeqIter` over an argument the native consumes
+/// (`NativeFn.consumes`): `coll` is pushed on `scope`, and the slot
+/// keeps the walk's place (`SeqIter.cursor`).
+fn consumingSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
+    try scope.push(coll);
+    var it = try makeSeqIter(vm, coll);
+    it.cursor = vm.roots.items.len - 1;
+    return it;
+}
+
 /// `makeSeqIter` whose built values stay rooted in `scope`.
 fn rootedSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
     return SeqIter.rooted(vm, coll, scope);
@@ -6703,6 +6839,26 @@ test "stdlib: an image holding a routine that does not verify is refused, not lo
     try testing.expect(std.mem.readInt(u32, bytes[at..][0..4], .little) > 0);
     at += 4;
     bytes[at] |= 1; // the instruction's kind, its low four bits
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try installNatives(rt.loader.registry);
+    try testing.expectError(error.UnfitRoutine, image_mod.load(&rt.v, bytes, &embedded));
+}
+
+test "stdlib: an image holding a closure whose cells are not its routine's upvalues is refused" {
+    if (!image_mod.verify_routines) return error.SkipZigTest;
+    // `interpose`'s routine, the last record that names it, made to
+    // take one upvalue more than its closure (the Var's root) carries.
+    const bytes = try testing.allocator.dupe(u8, image);
+    defer testing.allocator.free(bytes);
+    const name = "interpose";
+    var record: [4 + name.len]u8 = undefined;
+    std.mem.writeInt(u32, record[0..4], name.len, .little);
+    @memcpy(record[4..], name);
+    const at = (std.mem.findLast(u8, bytes, &record) orelse return error.TestUnexpectedResult) + record.len + 2 + 2 + 1;
+    const count = std.mem.readInt(u16, bytes[at..][0..2], .little);
+    std.mem.writeInt(u16, bytes[at..][0..2], count + 1, .little);
     var rt: ImageTestRuntime = undefined;
     try rt.init();
     defer rt.deinit();

@@ -65,7 +65,9 @@ VM's roots, in the order it marks them:
 1. **The backing stack, in full** (`vm.stack.items`): every slot of
    every frame's window and the slots above them. A slot above a
    popped frame keeps its stale value until the slot is grown into
-   again, which retains garbage for a while and is sound. Between
+   again, which retains garbage for a while and is sound. A native
+   call's block is cleared when the native returns (`docs/VM.md` §6),
+   so what a native was given is not retained through it. Between
    top-level forms the stack holds nothing: `retargetTop` and
    `resetAfterError` clear every slot, so a form keeps nothing an
    earlier one left alive. A slot holding a `cell_internal` Value
@@ -352,7 +354,21 @@ make sure a root reaches it. What is rooted already:
   slots when reached by `call:call`, through the root stack when
   reached by `callValue`, which pushes a native callee's `args` for the
   call's duration. A closure callee holds its arguments in its own
-  slots.
+  slots. One exception: the last argument of a native that consumes
+  it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
+  `some`, `every?`, `last`, `dorun`), whose slot `call:call` clears
+  once it has copied the arguments, so the head of a lazy seq passed
+  straight in is not kept while the native realizes the rest. Such a
+  native roots the argument itself before anything can collect, in a
+  root-scope slot that keeps its walk's place (`SeqIter.cursor`): the
+  slot holds the collection, and a lazy seq's walk moves it to each
+  block of the chain as it leaves the one before, so it reaches every
+  element still to come and the chunk being handed out. An element
+  the native keeps past the next step that may collect is its own to
+  root (`last` keeps the latest in a slot `nextChunk` writes before
+  such a step); an `iterate`'s function or a `cycle`'s source,
+  reached from the argument, stays rooted through it. Reached by
+  `callValue`, the argument stays on the root stack as any native's.
 - **Everything reachable from a rooted value**, so an element of an
   argument collection needs nothing.
 - **Nothing is lost between callbacks**: `Heap.alloc` never collects,
