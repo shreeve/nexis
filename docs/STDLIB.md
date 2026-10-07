@@ -323,7 +323,7 @@ their elements in the same mode. Who uses which:
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
-| lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...` (`docs/LAZY.md` §8) |
+| lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
 | map | `{k v, k v}`, entries separated by `, `; a sorted map in its order |
 | record | `#ns.Type{:k v, ...}` (the fields in the record's mode), or `#<record type-id=N>` when the interner has no name for the type; `(reduced x)` is the record `#nexis.core.Reduced{:val x}` |
 | typed vector | `#i64[1 2]`, `#f64[1.5]` |

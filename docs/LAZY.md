@@ -331,7 +331,12 @@ over it, `doall`) is a realized chain, walked as any other.
 
 **Printing.** The printer (`src/format.zig`) runs no code: a block
 whose body has not run prints as `...` (`(0 ...)`), which an error
-report shows when the value it names holds one. Everything that prints
+report shows when the value it names holds one. A realized chain that
+is a cycle (`(repeat x)` once walked is one cell whose rest is its own
+block, as is `(def s (lazy-seq (cons 1 s)))`) prints as far as the
+printer finds the cycle (Brent's algorithm: within three times the
+length of the cycle and of the cells before it) and then `...`, so an
+error report naming one ends: `(repeat 1)` prints `(1 ...)`. Everything that prints
 a value a program will see realizes it first, in native context
 (`seq.realizeAll`): `pr`, `prn`, `print`, `println`, `pr-str`, `str`,
 `format`'s `%s`, `nexis.string/join` and `spit`, and the REPL and `-e`
