@@ -1056,7 +1056,6 @@ fn datomsNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     return vector_mod.fromSlice(b.heap, out.items);
 }
 
-/// A transaction as a program names it: its t or its entity id.
 const fnIndexRange = wrap(indexRangeNative);
 
 /// `(index-range db attr start end)`: the AVET datoms of an indexed or

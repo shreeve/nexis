@@ -1443,6 +1443,12 @@ test "corpus: rules" {
     const countdown = try fx.read("[[(cnt [?n] ?out) [(<= ?n 0)] [(ground 0) ?out]] [(cnt [?n] ?out) [(> ?n 0)] [(dec ?n) ?m] (cnt ?m ?o2) [(inc ?o2) ?out]]]");
     try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, "[:find ?o :in $ % ?k :where (cnt ?k ?o)]", &.{ value.nilValue(), countdown, value.fromFixnum(3).? }, &d));
     try testing.expectEqualStrings("?n is a required argument of recursive rule cnt, and a recursive call changes it; a recursive rule can require only an argument every recursive call passes through unchanged", d.message);
+    // Nor one in a component of several rules, though no call changes
+    // it; the refusal names that cause.
+    var dm: query.Diag = .{};
+    const mutual = try fx.read("[[(r1 [?a] ?b) [(inc ?a) ?b]] [(r1 [?a] ?b) (r2 ?a ?b)] [(r2 [?a] ?b) (r1 ?a ?b)]]");
+    try testing.expectError(error.QuerySyntax, runEngineDiag(fx, fx.arena(), dbv, "[:find ?o :in $ % ?k :where (r1 ?k ?o)]", &.{ value.nilValue(), mutual, value.fromFixnum(4).? }, &dm));
+    try testing.expectEqualStrings("?a is a required argument of recursive rule r1, which recurses through another rule; a recursive rule can require an argument only when it recurses through itself alone", dm.message);
 }
 
 /// An `n`-clause chain `[?x0 attr ?x1] [?x1 attr ?x2] ...` with `find`

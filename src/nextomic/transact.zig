@@ -1119,18 +1119,36 @@ const Ctx = struct {
         return attr.value_type;
     }
 
-    /// Commit, then publish the mints and update the schema
-    /// cache, and report. Everything that can fail (the report's tempid
-    /// bindings, the tx-data, room in the ident cache) is prepared
-    /// before the commit; after it only infallible steps remain, so
-    /// `commit` never reports a committed transaction as an error.
+    /// Commit, then publish the mints and update the schema cache, and
+    /// report. Everything that can fail (the report's tempid bindings,
+    /// the tx-data, room in the ident cache) is prepared before the
+    /// commit, so every commit that stands reaches the caches. One
+    /// error comes after a commit stands: `DurabilityUnknown`, a
+    /// published commit whose meta page did not sync, which reaches the
+    /// caches and is then reported; emdb ends its transaction with the
+    /// abort the caller's `errdefer` runs.
     fn commit(self: *Ctx) !Report {
         const db_before = self.conn.at(self.now);
         const tempids = try self.userTempids();
         try self.minter.reserveCache();
-        try self.conn.store.commit(self.txn);
+        self.conn.store.commit(self.txn) catch |err| {
+            if (err == error.DurabilityUnknown) self.published();
+            return err;
+        };
         self.finished = true;
         self.conn.taskDone();
+        self.published();
+        return .{
+            .db_before = db_before,
+            .db_after = self.conn.at(self.t),
+            .t = self.t,
+            .tempids = tempids,
+            .tx_data = self.tx_data,
+        };
+    }
+
+    /// Bring the ident and schema caches up to a commit that stands.
+    fn published(self: *Ctx) void {
         self.minter.commitCache();
         if (self.schema_touched) {
             self.conn.dropSchema();
@@ -1144,13 +1162,6 @@ const Ctx = struct {
                 }
             }
         }
-        return .{
-            .db_before = db_before,
-            .db_after = self.conn.at(self.t),
-            .t = self.t,
-            .tempids = tempids,
-            .tx_data = self.tx_data,
-        };
     }
 
     // ── idents ────────────────────────────────────────────────────
@@ -3575,6 +3586,57 @@ test "durability: a transaction syncs only when it or its connection asks; sync 
     try other.release();
     try testing.expectEqual(before + 2, engineSyncs());
     try testing.expect(!file.unsynced);
+}
+
+/// Makes the meta sync of the next commit fail: once the meta page is
+/// written, the data file's descriptor names a pipe, which cannot sync.
+const MetaSyncFailure = struct {
+    fd: std.c.fd_t,
+    saved: std.c.fd_t = -1,
+    pipe: [2]std.c.fd_t = undefined,
+
+    fn notify(ctx: *anyopaque, step: emdb.CommitStep) void {
+        const self: *MetaSyncFailure = @ptrCast(@alignCast(ctx));
+        if (step != .metaWritten) return;
+        self.saved = std.c.dup(self.fd);
+        _ = std.c.dup2(self.pipe[0], self.fd);
+    }
+
+    fn restore(self: *MetaSyncFailure) void {
+        _ = std.c.dup2(self.saved, self.fd);
+        for ([_]std.c.fd_t{ self.saved, self.pipe[0], self.pipe[1] }) |fd| _ = std.c.close(fd);
+    }
+};
+
+test "durability: a commit whose meta sync fails stands, reaches the caches and reports DurabilityUnknown" {
+    const tc = try TestConn.init("tx_meta_sync");
+    defer tc.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try installSchema(tc, arena);
+    const name = try attrId(tc, "user/name");
+    const add: []const Op = &.{.{ .add = .{ .e = .{ .tempid = .{ .string = "a" } }, .a = .{ .id = name }, .v = .{ .val = .{ .string = "A" } } } }};
+    const before = try tc.conn.db();
+    try testing.expectEqual(@as(u64, 0), (try before.attr(name)).?.count);
+
+    const env = &tc.conn.store.file.env.inner;
+    var failure = MetaSyncFailure{ .fd = env.dataFile.fd };
+    try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
+    env.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
+    const committed = transactOps(tc.conn, arena, add, .{ .sync = .full });
+    env.commitObserver = null;
+    failure.restore();
+    try testing.expectError(error.DurabilityUnknown, committed);
+    try testing.expect(tc.conn.store.file.unsynced);
+
+    // The commit stands, the cached count includes it, and the
+    // connection takes the next transaction.
+    const after = try tc.conn.db();
+    try testing.expectEqual(before.basis + 1, after.basis);
+    try testing.expectEqual(@as(u64, 1), (try after.attr(name)).?.count);
+    _ = try transactOps(tc.conn, arena, add, .{});
+    try testing.expectEqual(@as(u64, 2), (try (try tc.conn.db()).attr(name)).?.count);
 }
 
 test "durability: a connection opened without :sync takes the process's (NEXIS_DURABILITY)" {

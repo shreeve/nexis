@@ -390,7 +390,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
             const clauses = try r.clauses(def.body);
             body.* = .{
                 .plan = plan_mod.planSub(ctx, clauses, input.items, rows, inst.head) catch |err| switch (err) {
-                    error.QuerySyntax => return unpushedRequired(ctx, inst, def.required, input.items, clauses, rows),
+                    error.QuerySyntax => return unpushedRequired(ctx, inst, members.len > 1, def.required, input.items, clauses, rows),
                     else => return err,
                 },
                 .sites = try r.sites.toOwnedSlice(ctx.arena),
@@ -410,10 +410,11 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
 
 /// The refusal for a body of a recursive rule that fails to plan: when
 /// it plans with the rule's required arguments bound, the cause is a
-/// required argument that is not pushed (a recursive call changes it,
-/// or the component has several rules), and the refusal names it;
-/// otherwise the body's own refusal stands.
-fn unpushedRequired(ctx: *Ctx, inst: *const Instance, required: usize, input: []const Var, clauses: []const Clause, rows: u64) Failure {
+/// required argument that is not pushed, because the component has
+/// `several` rules or else a recursive call changes it, and the
+/// refusal names the argument and the cause; otherwise the body's own
+/// refusal stands.
+fn unpushedRequired(ctx: *Ctx, inst: *const Instance, several: bool, required: usize, input: []const Var, clauses: []const Clause, rows: u64) Failure {
     const saved = ctx.diag.*;
     const missing = for (inst.head[0..required]) |h| {
         if (!ir.containsVar(input, h)) break h;
@@ -426,7 +427,10 @@ fn unpushedRequired(ctx: *Ctx, inst: *const Instance, required: usize, input: []
         },
         else => return err,
     };
-    return ctx.syntaxFmt("{s} is a required argument of recursive rule {s}, and a recursive call changes it; a recursive rule can require only an argument every recursive call passes through unchanged", .{ ctx.varName(missing), ctx.interner.symbolName(inst.name) });
+    const arg = ctx.varName(missing);
+    const rule = ctx.interner.symbolName(inst.name);
+    if (several) return ctx.syntaxFmt("{s} is a required argument of recursive rule {s}, which recurses through another rule; a recursive rule can require an argument only when it recurses through itself alone", .{ arg, rule });
+    return ctx.syntaxFmt("{s} is a required argument of recursive rule {s}, and a recursive call changes it; a recursive rule can require only an argument every recursive call passes through unchanged", .{ arg, rule });
 }
 
 /// Copies a rule body into plan variables: head variables map to the

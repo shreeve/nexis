@@ -80,15 +80,17 @@ const Scan = plan_mod.Scan;
 
 /// Calls a user function: `call` by VM symbol, `apply` by the value a
 /// variable in function position holds. `args` are VM values built in
-/// the query's result heap; the result is a VM value. `root` keeps a
-/// value reachable for the query's life: the pipeline passes it every
-/// value it holds in a relation or a group across later calls, a
-/// function's result or a heap value it builds itself; a host whose
-/// calls never collect leaves it null.
+/// the query's result heap; the result is the VM value the function
+/// returned, which a predicate tests and drops. `keep` turns a result
+/// the pipeline binds or aggregates into the value it holds, kept
+/// reachable for the query's life; `root` keeps reachable a heap value
+/// the pipeline builds itself and holds across later calls. A host
+/// whose calls never collect leaves both null.
 pub const CallHook = struct {
     ctx: *anyopaque,
     call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
     apply: *const fn (ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value,
+    keep: ?*const fn (ctx: *anyopaque, v: Value) anyerror!Value = null,
     root: ?*const fn (ctx: *anyopaque, v: Value) anyerror!void = null,
 };
 
@@ -201,6 +203,12 @@ pub const Exec = struct {
     /// life: a user function called later may collect.
     fn kept(self: *Exec, v: Value) !Value {
         if (self.hook) |h| if (h.root) |root| try root(h.ctx, v);
+        return v;
+    }
+
+    /// A function's result as the pipeline holds it (`CallHook.keep`).
+    fn keptResult(self: *Exec, v: Value) !Value {
+        if (self.hook) |h| if (h.keep) |keep| return keep(h.ctx, v);
         return v;
     }
 
@@ -636,8 +644,8 @@ pub const Exec = struct {
                     .fulltext => .{ .tuples = try self.fulltextHits(b.call.args[0].src, cells[1], cells[2]) },
                     .lt, .le, .gt, .ge, .eq, .ne, .missing => .{ .cell = .{ .boolean = try self.builtinPred(bi, b.call.args, cells) } },
                 },
-                .user => |sym| .{ .value = try self.kept(try self.callUser(sym, cells)) },
-                .variable => |f| .{ .value = try self.kept(try self.applyVar(&rel, i, f, cells)) },
+                .user => |sym| .{ .value = try self.keptResult(try self.callUser(sym, cells)) },
+                .variable => |f| .{ .value = try self.keptResult(try self.applyVar(&rel, i, f, cells)) },
             };
             rel.rowInto(i, row[0..rel.cols.len]);
             try self.bindResult(b, result, row, rel.cols.len, &out);
@@ -908,11 +916,17 @@ pub const Exec = struct {
                 .not => |*n| try self.walk(n.sub),
                 .@"or" => |*o| for (o.branches) |br| try self.walk(br),
                 .fix => |*f| {
-                    for (f.args, f.instances[f.target].head) |a, h| try self.links.append(self.arena, .{ a, h });
+                    const first_source = self.sources.items.len;
+                    const first_site = self.sites.items.len;
                     for (f.instances) |inst| for (inst.bodies) |body| {
                         for (body.sites) |site| try self.sites.append(self.arena, .{ .slot = site.slot, .head = f.instances[site.callee].head });
                         try self.walk(body.plan);
                     };
+                    for (f.args, f.instances[f.target].head) |a, h| try self.links.append(self.arena, .{ a, h });
+                    // Settled here, not after the whole plan, so the
+                    // call claims its arguments' sources before any
+                    // later step does.
+                    try self.settle(first_source, first_site);
                 },
                 .source => |*src| try self.sources.append(self.arena, src),
                 .match => {},
@@ -929,9 +943,11 @@ pub const Exec = struct {
         }
 
         /// Carry the roles of rule heads to the arguments that bind
-        /// them, through every recursive call, until nothing changes.
-        fn settle(self: *Roles) !void {
-            for (self.sources.items) |src| for (self.sites.items) |site| {
+        /// them, through every recursive call, until nothing changes;
+        /// the sources and sites from `first_source` and `first_site`
+        /// on are the ones a fix step's walk has just added.
+        fn settle(self: *Roles, first_source: usize, first_site: usize) !void {
+            for (self.sources.items[first_source..]) |src| for (self.sites.items[first_site..]) |site| {
                 if (site.slot != src.slot) continue;
                 for (src.vars, site.head) |a, h| try self.links.append(self.arena, .{ a, h });
             };
@@ -954,7 +970,6 @@ pub const Exec = struct {
     fn resolveInputs(self: *Exec, p: *const Plan, rel: Relation) anyerror!Relation {
         var roles: Roles = .{ .arena = self.arena };
         try roles.walk(p);
-        try roles.settle();
         var cols: std.ArrayList(usize) = .empty;
         for (rel.vars, 0..) |v, i| {
             const r = roles.get(v);
@@ -1137,7 +1152,7 @@ pub const Exec = struct {
                 const vals = try self.arena.alloc(Value, members.len);
                 for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
                 const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
-                return Cell.fromValue(try self.kept(result));
+                return Cell.fromValue(try self.keptResult(result));
             },
             .sum, .avg => {
                 var isum: i128 = 0;

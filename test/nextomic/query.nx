@@ -144,6 +144,17 @@
 (println (rows (d/q '[:find ?n :where [?e :person/age ?a] [(adult? ?a)] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/age ?a] [(even? ?a)] [?e :person/name ?n]] db)))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(string? ?n)]] db)))
+; A predicate's result is tested and dropped, never realized: a lazy
+; seq, empty or infinite, is truthy and its body never runs.
+(def pred-runs (atom 0))
+(defn counted [n] (lazy-seq (swap! pred-runs inc) nil))
+(t/check "a predicate's lazy seq is truthy and stays unrealized"
+       (and (= 6 (count (d/q '[:find ?n :where [?e :person/name ?n] [(user/counted ?n)]] db)))
+            (= 0 @pred-runs)))
+(t/check "a predicate returning an infinite seq ends"
+       (= 6 (count (d/q '[:find ?n :where [?e :person/name ?n] [(repeat ?n)]] db))))
+(t/check "a predicate through a variable is tested the same way"
+       (= 6 (count (d/q '[:find ?n :in $ ?f :where [?e :person/name ?n] [(?f ?n)]] db repeat))))
 (println (rows (d/q '[:find ?n :where [?e :person/name ?n] [(s/lower-case ?n) ?l] [(= ?l "ann")]] db)))
 
 ; --- a variable in function position: bound to a function, a keyword, a map --
@@ -285,6 +296,25 @@
 (println (sort (d/q '[:find [?n ...] :in $ % :where [?b :person/email "cy@x"] (responsible ?b ?e) [?e :person/name ?n]] db rules)))
 (println (rows (d/q '[:find ?b ?n :in $ % :where (responsible ?x ?e) [?x :person/name ?b] [?e :person/name ?n]] db rules)))
 (println (sort (d/q '[:find [?n ...] :in $ $2 % :where [?b :person/email "ann@x"] ($2 responsible ?b ?e) [?e :person/name ?n]] db before rules)))
+; An input resolves in the source of the first step that reads it, a
+; recursive rule's call included: here `$2`, where the lookup ref names
+; an entity that the older `$` does not hold.
+(def kc (d/connect "knows.edb"))
+(def kschema (d/transact! kc [{:db/ident :k/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+                               :db/unique :db.unique/identity}
+                              {:db/ident :k/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                              {:db/ident :k/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]))
+(def kr (d/transact! kc [{:db/id "a" :k/email "a@x"} {:db/id "b" :k/email "b@x" :k/friend ["a"]}
+                         {:db/id "c" :k/email "c@x" :k/friend ["b"]}]))
+(def knows '[[(knows ?x ?y) [?x :k/friend ?y]] [(knows ?x ?y) [?x :k/friend ?m] (knows ?m ?y)]])
+(let [now (d/db kc)
+      old (d/as-of now (:tx kschema))
+      ka (get (:tempids kr) "a")
+      kcc (get (:tempids kr) "c")]
+  (doseq [e [kcc [:k/email "c@x"]]]
+    (println (d/q '[:find ?e :in $ $2 % ?e ?b :where ($2 knows ?e ?b) (not [?e :k/age 99])] old now knows e ka)
+             (d/q '[:find ?e :in $ $2 % ?e ?b :where (not [?e :k/age 99]) ($2 knows ?e ?b)] old now knows e ka))))
+(d/release kc)
 (println (t/caught (d/q '[:find ?n :in $ % :where [?x :person/name ?n] (outranks ?x)] db
                         '[[(outranks ?x) [?x :person/friend ?y] (not (outranks ?y))]])))
 (println (t/caught (d/q '[:find ?n :in $ % :where [?x :person/name ?n] (ra ?x)] db
