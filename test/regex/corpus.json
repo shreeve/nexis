@@ -8998,3 +8998,4 @@
 ["((?x:é+?)|((?iu:ſ)){0,2}?){0,2}?","x11 K\rς",[["",null,null],["",null,null],["",null,null],["",null,null],["",null,null],["",null,null],["",null,null],["",null,null]]]
 ["(?s:(?<n5318>\\u0301|é[\\w&&[^\\d]]))","ſ",[]]
 ["(?iu:é)","",[]]
+["(?:\\ba)*\\bc","ab c ab c",[["c"],["c"]]]

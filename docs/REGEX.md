@@ -321,11 +321,12 @@ Java without `(?U)`.
 
 ### 7. The differential test
 
-`test/regex/corpus.json` holds 9 000 cases, each `[pattern, input,
-result]`: random patterns from a grammar of the supported constructs
-(three seeds, nesting to depth 5) and random inputs over ASCII,
-accented and astral letters, line terminators, a combining mark and
-the case-folding special cases, with Java's every find and its groups
+`test/regex/corpus.json` holds 9 000 random cases and then a few
+hand-written regressions, each `[pattern, input, result]`: random
+patterns from a grammar of the supported constructs (three seeds,
+nesting to depth 5) and random inputs over ASCII, accented and astral
+letters, line terminators, a combining mark and the case-folding
+special cases, with Java's every find and its groups
 (`null` for a group that did not take part), `"ERR"` when Java
 refuses the pattern, or `"TIMEOUT"` when Java runs past a second.
 `test/regex/corpus.clj` generates it through `bb`:

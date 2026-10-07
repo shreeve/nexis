@@ -1550,7 +1550,13 @@ pub const Vm = struct {
         var matched = false;
         while (true) {
             if (!matched and (pos == from or !anchored)) {
-                if (clist.len == 0 and !anchored) pos = vm.skip(hay, pos) orelse break;
+                if (clist.len == 0 and !anchored) {
+                    // Threads that died at `pos` marked the list; at
+                    // another position those marks are stale.
+                    const next = vm.skip(hay, pos) orelse break;
+                    if (next != pos) clist.clear();
+                    pos = next;
+                }
                 @memset(vm.cap, none);
                 vm.add(clist, 0, hay, pos, last_end);
             }
@@ -2366,6 +2372,8 @@ test "regex: prefilters and anchors find what the VM alone finds" {
         .{ "[é😀]z", "aaaaé😀z", "[[\"😀z\"]]" },
         .{ "^ab", "abab", "[[\"ab\"]]" },
         .{ "(?m)^ab", "ab\nab", "[[\"ab\"] [\"ab\"]]" },
+        // Every thread dies at an assertion before the prefilter skips.
+        .{ "(?:\\ba)*\\bc", "ab c ab c", "[[\"c\"] [\"c\"]]" },
     });
 }
 
