@@ -626,6 +626,7 @@ pub const Routine = struct {
     /// and the instruction. Whatever the routine holds, verification
     /// returns an error and never traps.
     pub fn verify(self: *const Routine, failure: *VerifyFailure) VmError!void {
+        failure.* = .{ .routine = self, .pc = 0 };
         stack_guard.check() catch return VmError.StackOverflow;
         try self.verifyAlone(failure);
         for (self.capture_descs) |desc| try desc.routine.verify(failure);
@@ -2736,25 +2737,13 @@ pub const VM = struct {
     /// `upvalue_count` cell pointers in its tail and return the
     /// `.function` Value naming it. The tail is the closure's
     /// `upvalues` array; the caller fills it before the Value can
-    /// reach a slot. `asClosure()` is the matched accessor.
+    /// reach a slot. `asClosure()` is the matched accessor. The
+    /// dispatch trusts `routine` (§8) and a call trusts the closure to
+    /// carry a cell for each of its upvalues (§6), so the caller makes
+    /// sure of both: `closure:make` takes a descriptor of a routine
+    /// verified with every routine under it, and the image loader
+    /// verifies what it made once the image is whole (§5).
     pub fn allocClosure(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
-        // The dispatch trusts the routine (§8), and a call trusts the
-        // closure to carry a cell for each of its upvalues (§6): a
-        // closure's routine comes from a verified routine's capture
-        // descriptor, whose source count is the routine's, and a debug
-        // build checks both.
-        if (std.debug.runtime_safety) {
-            var failure: VerifyFailure = undefined;
-            routine.verify(&failure) catch |err| std.debug.panic("closure over an unverified routine {s}: {t} at {d}", .{ routine.name, err, failure.pc });
-            std.debug.assert(upvalue_count == routine.upvalue_count);
-        }
-        return self.allocClosureUnverified(routine, upvalue_count);
-    }
-
-    /// `allocClosure` without its check, for the image loader, which
-    /// makes closures before the routines they run are complete and
-    /// verifies every routine once the image is (`image.zig`, §5).
-    pub fn allocClosureUnverified(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
         const heap = self.ensureHeap();
         const body_size = @sizeOf(Closure) + upvalue_count * @sizeOf(*UpvalCell);
         const h = try heap.alloc(.function, body_size);
@@ -3768,33 +3757,28 @@ pub const VM = struct {
 
     /// The general handler of every opcode: its group's, which
     /// switches on the variant, or one of its own for the hot
-    /// variants. A group outside the enum is corrupt; the groups with
-    /// no executed variant trap.
+    /// variants. A group outside the enum, or a variant outside its
+    /// group's enum that is not quickened, is corrupt, which is what
+    /// verification refuses (§5, §10); the groups with no executed
+    /// variant trap.
     const op_table: [4096]OpHandler = blk: {
         @setEvalBranchQuota(20_000);
         var t: [4096]OpHandler = @splat(&opCorrupt);
-        // A group's handler takes the variants without one of their
+        // A group's handler takes its variants without one of their
         // own: every variant of `jump`, `cmp`, `mov` and `call` but
-        // the reserved `tailcall` has one, so the rest are corrupt
-        // (§10).
+        // the reserved `tailcall` has one.
         const groups = .{
-            .{ Group.jump, &opCorrupt },
-            .{ Group.cmp, &opCorrupt },
-            .{ Group.math, &opMath },
-            .{ Group.mov, &opCorrupt },
-            .{ Group.call, &opCorrupt },
-            .{ Group.closure, &opClosure },
-            .{ Group.var_, &opVar },
-            .{ Group.coll, &opColl },
-            .{ Group.transient, &opUnimplemented },
-            .{ Group.hash, &opUnimplemented },
-            .{ Group.tx, &opUnimplemented },
-            .{ Group.ctrl, &opCtrl },
-            .{ Group.io, &opUnimplemented },
-            .{ Group.simd, &opUnimplemented },
+            .{ Group.math, Math, &opMath },
+            .{ Group.closure, Closure_, &opClosure },
+            .{ Group.var_, VarOp, &opVar },
+            .{ Group.coll, CollOp, &opColl },
+            .{ Group.ctrl, CtrlOp, &opCtrl },
         };
         for (groups) |g| {
-            for (0..64) |v| t[@as(u12, @backingInt(g[0])) | @as(u12, v) << 6] = g[1];
+            for (std.meta.tags(g[1])) |v| t[opcode(g[0], v)] = g[2];
+        }
+        for ([_]Group{ .transient, .hash, .tx, .io, .simd }) |g| {
+            for (0..64) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = &opUnimplemented;
         }
         t[opcode(.mov, Mov.move)] = &opMove;
         t[opcode(.mov, Mov.load_const)] = &opLoadConst;
@@ -8213,7 +8197,15 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "the code falls off its end", .code = &.{ asm_.loadNil(0), asm_.loadNil(1) }, .err = VmError.BytecodeExhausted, .pc = 1 },
         .{ .name = "a comparison ends the code", .code = &.{asm_.cmpLt(0, kn(0), kn(0))}, .err = VmError.BytecodeExhausted, .pc = 0 },
         .{ .name = "not a primary instruction", .code = &.{ bad_kind, r }, .err = VmError.BytecodeCorruption, .pc = 0 },
-        .{ .name = "a variant outside its group", .code = &.{ r, raw(.mov, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a jump variant outside its group", .code = &.{ r, raw(.jump, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a cmp variant outside its group", .code = &.{ r, raw(.cmp, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a math variant outside its group", .code = &.{ r, raw(.math, 20, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a mov variant outside its group", .code = &.{ r, raw(.mov, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a call variant outside its group", .code = &.{ r, raw(.call, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a closure variant outside its group", .code = &.{ r, raw(.closure, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a var variant outside its group", .code = &.{ r, raw(.var_, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a coll variant outside its group", .code = &.{ r, raw(.coll, 30, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a ctrl variant outside its group", .code = &.{ r, raw(.ctrl, 4, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
         .{ .name = "a jump past the code", .code = &.{ asm_.jumpJmp(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a branch past the code", .code = &.{ asm_.jumpIfTrue(9, kn(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a destination past the frame", .code = &.{ asm_.loadNil(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
@@ -8312,6 +8304,22 @@ test "Routine.verify: any routine at all passes or is refused, never a trap" {
         verified += 1;
     }
     try testing.expect(verified > 0);
+}
+
+test "Routine.verify: past the stack guard a run is refused with StackOverflow, and a closure is still made" {
+    // A routine is verified once, where it runs as a top-level frame
+    // (§5): a closure made over it below the guard checks nothing, and
+    // verification that reaches the guard names the routine it was in.
+    const routine = Routine{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .name = "deep" };
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    stack_guard.arm(0);
+    defer stack_guard.arm(stack_guard.main_thread_budget);
+    try testing.expectEqual(.function, (try vm.allocClosure(&routine, 0)).kind());
+    try testing.expectError(VmError.StackOverflow, vm.run());
+    try testing.expectEqual(@as(usize, 1), vm.error_trace.items.len);
+    try testing.expectEqualStrings("deep", vm.error_trace.items[0].name);
+    try testing.expectEqual(@as(u32, 0), vm.error_trace.items[0].pc);
 }
 
 test "VM dispatch: a trap after fast instructions names its instruction in every frame" {

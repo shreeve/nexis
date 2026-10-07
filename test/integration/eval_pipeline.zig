@@ -923,6 +923,17 @@ test "integration: recursion through a native re-entry ends in a catchable :stac
     try expectOutput("(defn g [n] (if (= n 0) 0 (+ 1 (apply g [(- n 1)])))) (try (g 100000000) (catch any e e)) (g 10)", "10");
 }
 
+test "integration: a closure made just past the stack guard's last check is still a catchable :stack-overflow" {
+    // Each level makes two closures a few native frames below the
+    // re-entry that checked the guard; starting from a dozen depths
+    // puts the guard's limit inside that margin at least once.
+    try expectOutput(
+        \\(defn f4 [n] (if (zero? n) 0 (+ 1 (first (mapv (fn [x] (let [g (fn [] x)] (f4 (g)))) [(dec n)])))))
+        \\(defn pad [k] (if (zero? k) (try (f4 100000000) (catch :stack-overflow e e)) (apply pad [(dec k)])))
+        \\(set (mapv pad (range 12)))
+    , "#{:stack-overflow}");
+}
+
 test "integration: run loops nest at most max_nested_runs deep" {
     var program: Program = undefined;
     try program.init();

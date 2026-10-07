@@ -29,7 +29,9 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
-A failure in step 3 is a bug in an embedded file or the image and
+Memory running out in step 3 is reported as at any other time: the
+CLI prints its out-of-memory report and exits 5 (`TOOLING.md` §1).
+Any other failure there is a bug in an embedded file or the image and
 panics with the loader's diagnostic or the image's error.
 
 **The image.** Evaluating the sources at every start would read,
@@ -78,9 +80,11 @@ reads it, and nothing in it is compatible across versions (PLAN §23
 #25 governs the codec alone). Its header carries a format number and
 a fingerprint of the sources and of the layouts it writes; an image
 whose header differs from this build's is not loaded, and the sources
-boot instead. A struct the image writes field by field (a routine, a
-Var, a capture descriptor) gaining a field fails to compile until
-`image.zig` carries it, and the writer fails the build on a value it
+boot instead. A struct the image writes field by field (a routine and
+its capture descriptors, tries and spans; a Var; a namespace; a
+closure, a cell, an atom and a record; a record type; a protocol and
+its methods) gaining a field fails to compile until `image.zig`
+carries it, and the writer fails the build on a value it
 cannot carry: a kind outside the image's set (strings, bignums,
 regexes, vectors, lists of cons cells, hash maps and sets, closures,
 cells, atoms, records, protocols and their functions), a list view, a
