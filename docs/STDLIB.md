@@ -78,9 +78,11 @@ reads it, and nothing in it is compatible across versions (PLAN §23
 #25 governs the codec alone). Its header carries a format number and
 a fingerprint of the sources and of the layouts it writes; an image
 whose header differs from this build's is not loaded, and the sources
-boot instead. A struct the image writes field by field (a routine, a
-Var, a capture descriptor) gaining a field fails to compile until
-`image.zig` carries it, and the writer fails the build on a value it
+boot instead. A struct the image writes field by field (a routine and
+its capture descriptors, tries and spans; a Var; a namespace; a
+closure, a cell, an atom and a record; a record type; a protocol and
+its methods) gaining a field fails to compile until `image.zig`
+carries it, and the writer fails the build on a value it
 cannot carry: a kind outside the image's set (strings, bignums,
 regexes, vectors, lists of cons cells, hash maps and sets, closures,
 cells, atoms, records, protocols and their functions), a list view, a

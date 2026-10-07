@@ -88,6 +88,11 @@ comptime {
     expectFields(UpvalCell, &.{ "value", "initialized" });
     expectFields(atom_mod.AtomBox, &.{ "value", "validator", "watches", "in_flight", "_pad" });
     expectFields(vm_mod.ProtocolMethod, &.{ "name_id", "name", "impls", "default_impl" });
+    expectFields(vm_mod.ProtocolEntry, &.{ "id", "ns_name", "name", "methods" });
+    expectFields(vm_mod.RecordTypeEntry, &.{ "id", "ns_name", "type_name", "field_names" });
+    expectFields(Namespace, &.{ "name", "parent", "registry", "aliases", "map_allocator", "var_allocator", "vars" });
+    expectFields(vm_mod.Closure, &.{ "routine", "upvalues" });
+    expectFields(record_mod.RecordBody, &.{ "type_id", "_pad", "fields" });
     std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(vm_mod.Inst) == 8);
 }
