@@ -1240,7 +1240,7 @@ const Compiler = struct {
             .literal = null,
             .prefix = try prefixOf(c.arena, insts),
             .first_bytes = try firstBytes(c.arena, insts, c.ranges.items),
-            .anchored = anchoredAt(insts),
+            .anchored = try anchoredAt(c.arena, insts),
         };
     }
 
@@ -1438,13 +1438,27 @@ fn firstBytes(arena: Allocator, insts: []const Inst, ranges: []const Range) Allo
     return if (ascii) null else set;
 }
 
-fn anchoredAt(insts: []const Inst) bool {
-    for (insts[1..]) |in| switch (in.op) {
-        .save, .mark => {},
-        .assert => return in.a == @backingInt(Assert.begin),
-        else => return false,
-    };
-    return false;
+/// Every path from the start passes `\A` or `^` before it consumes a
+/// code point or matches, so a match can start only at offset 0.
+fn anchoredAt(arena: Allocator, insts: []const Inst) Allocator.Error!bool {
+    const seen = try arena.alloc(bool, insts.len);
+    @memset(seen, false);
+    var todo: std.ArrayList(u32) = .empty;
+    try todo.append(arena, 1);
+    while (todo.pop()) |pc| {
+        if (seen[pc]) continue;
+        seen[pc] = true;
+        const in = insts[pc];
+        switch (in.op) {
+            .char, .class, .match => return false,
+            .assert => if (in.a != @backingInt(Assert.begin)) try todo.append(arena, pc + 1),
+            .split => try todo.appendSlice(arena, &.{ in.a, in.b }),
+            .jmp => try todo.append(arena, in.a),
+            .if_empty => try todo.appendSlice(arena, &.{ pc + 1, in.b }),
+            .save, .mark => try todo.append(arena, pc + 1),
+        }
+    }
+    return true;
 }
 
 // =============================================================================
@@ -2364,6 +2378,8 @@ test "regex: prefilters and anchors find what the VM alone finds" {
     try testing.expectEqualStrings("abc", (try compile(a, "abc+", .{})).ok.prefix[0..2] ++ "c");
     try testing.expect((try compile(a, "\\Aab|x", .{})).ok.anchored == false);
     try testing.expect((try compile(a, "^ab", .{})).ok.anchored);
+    for ([_][]const u8{ "^a|^b", "(?:^a|(^b))c", "\\b^a|\\A", "(?:^a)+" }) |p| try testing.expect((try compile(a, p, .{})).ok.anchored);
+    for ([_][]const u8{ "^a|b", "(?:^a)*b", "(?m)^a", "(?:^a)?b" }) |p| try testing.expect(!(try compile(a, p, .{})).ok.anchored);
     try testing.expect((try compile(a, "[xy]z", .{})).ok.first_bytes != null);
     try testing.expect((try compile(a, "a*", .{})).ok.first_bytes == null);
     try expectFinds(&.{
@@ -2371,6 +2387,9 @@ test "regex: prefilters and anchors find what the VM alone finds" {
         .{ "[xy]z", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaxzyz", "[[\"xz\"] [\"yz\"]]" },
         .{ "[é😀]z", "aaaaé😀z", "[[\"😀z\"]]" },
         .{ "^ab", "abab", "[[\"ab\"]]" },
+        .{ "^a|^b", "bab", "[[\"b\"]]" },
+        .{ "^a|^b", "xab", "[]" },
+        .{ "(?:^a|(^b))c", "bcac", "[[\"bc\" \"b\"]]" },
         .{ "(?m)^ab", "ab\nab", "[[\"ab\"] [\"ab\"]]" },
         // Every thread dies at an assertion before the prefilter skips.
         .{ "(?:\\ba)*\\bc", "ab c ab c", "[[\"c\"] [\"c\"]]" },
