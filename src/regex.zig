@@ -34,6 +34,9 @@ const HeapHeader = heap_mod.HeapHeader;
 pub const max_repeat = 1000;
 /// The largest program, counted after every repetition is expanded.
 pub const max_insts = 10_000;
+/// The most AST nodes the compiler visits, after every repetition is
+/// expanded: a body that compiles to nothing still costs its nodes.
+pub const max_nodes = 1_000_000;
 /// The largest program size times capture slots: one thread list's slot words.
 pub const max_slot_words = 1 << 20;
 /// The deepest nesting of groups and character classes.
@@ -141,6 +144,7 @@ pub fn compile(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Er
     const prog = c.program(root, p.ngroups, p.names.items) catch |e| return switch (e) {
         error.TooBig => .{ .err = .{ .msg = "the pattern compiles to more than 10000 instructions", .offset = 0 } },
         error.TooManySlots => .{ .err = .{ .msg = "the pattern has too many groups for its size", .offset = 0 } },
+        error.TooManyNodes => .{ .err = .{ .msg = "the pattern expands to more than 1000000 nodes", .offset = 0 } },
         error.OutOfMemory => error.OutOfMemory,
         error.StackOverflow => error.StackOverflow,
     };
@@ -402,6 +406,10 @@ const Repeat = struct {
     ques: bool,
     /// The hidden slot of a nullable body, shared by every copy.
     hidden: ?u32 = null,
+    /// The body can match empty; it is `deterministic`. Found once,
+    /// when the repetition is parsed, so neither walks a body again.
+    body_nullable: bool,
+    body_deterministic: bool,
 };
 
 fn nullable(n: *const Node) stack.Error!bool {
@@ -417,7 +425,7 @@ fn nullable(n: *const Node) stack.Error!bool {
         .alt => |items| for (items) |i| {
             if (try nullable(i)) break true;
         } else false,
-        .repeat => |r| r.min == 0 or try nullable(r.body),
+        .repeat => |r| r.min == 0 or r.body_nullable,
     };
 }
 
@@ -432,7 +440,7 @@ fn deterministic(n: *const Node) stack.Error!bool {
             if (!try deterministic(i)) break false;
         } else true,
         .alt => false,
-        .repeat => |r| !r.ques and r.min == r.max and try deterministic(r.body),
+        .repeat => |r| !r.ques and r.min == r.max and r.body_deterministic,
     };
 }
 
@@ -863,7 +871,15 @@ const Parser = struct {
             greedy = false;
         } else if (p.peek() == '+') return p.fail(p.pos, "possessive quantifiers are not supported");
         if (min > max_repeat or (max != inf and max > max_repeat)) return p.fail(at, "repetition count exceeds 1000");
-        return p.node(.{ .repeat = .{ .body = atom, .min = min, .max = max, .greedy = greedy, .ques = c == '?' } });
+        return p.node(.{ .repeat = .{
+            .body = atom,
+            .min = min,
+            .max = max,
+            .greedy = greedy,
+            .ques = c == '?',
+            .body_nullable = try nullable(atom),
+            .body_deterministic = try deterministic(atom),
+        } });
     }
 
     fn count(p: *Parser) Fail!u32 {
@@ -1202,8 +1218,9 @@ const Compiler = struct {
     insts: std.ArrayList(Inst) = .empty,
     ranges: std.ArrayList(Range) = .empty,
     nhidden: u32 = 0,
+    nodes: u32 = 0,
 
-    const Fail = error{ TooBig, TooManySlots, OutOfMemory, StackOverflow };
+    const Fail = error{ TooBig, TooManySlots, TooManyNodes, OutOfMemory, StackOverflow };
 
     fn emit(c: *Compiler, inst: Inst) Fail!u32 {
         if (c.insts.items.len >= max_insts) return error.TooBig;
@@ -1248,6 +1265,8 @@ const Compiler = struct {
     /// one unit, where a trailing `\R` takes `\r\n` whenever it can.
     fn node(c: *Compiler, n: *Node, atomic: bool) Fail!void {
         try stack.check();
+        c.nodes += 1;
+        if (c.nodes > max_nodes) return error.TooManyNodes;
         switch (n.*) {
             .empty => {},
             .lit => |l| for (l.cps) |cp| {
@@ -1331,12 +1350,12 @@ const Compiler = struct {
     /// instructions its predecessor did not visit at that position.
     fn repeat(c: *Compiler, r: *Repeat) Fail!void {
         const body = r.body;
-        const atomic = body.* == .line_end or (body.* == .group and !r.ques and try deterministic(body));
+        const atomic = body.* == .line_end or (body.* == .group and !r.ques and r.body_deterministic);
         var exits: std.ArrayList(u32) = .empty;
         if (r.ques) {
             try c.loopSplit(c.here() + 1, r.greedy, &exits);
             try c.node(body, atomic);
-        } else if (try nullable(body) and try deterministic(body)) {
+        } else if (r.body_nullable and r.body_deterministic) {
             for (0..r.min) |_| try c.node(body, atomic);
             // Java tries one more greedy iteration, which cannot move the
             // match: it keeps the captures of groups inside the body and
@@ -1346,7 +1365,7 @@ const Compiler = struct {
                 try c.node(if (body.* == .group) body.group.body else body, atomic);
             }
         } else {
-            const hidden: ?u32 = if (!try nullable(body)) null else r.hidden orelse blk: {
+            const hidden: ?u32 = if (!r.body_nullable) null else r.hidden orelse blk: {
                 r.hidden = c.nhidden;
                 c.nhidden += 1;
                 break :blk r.hidden;
@@ -2370,6 +2389,10 @@ test "regex: the limits refuse a pattern one step past them" {
     try testing.expect(try compile(a, try nested(a, "(", ")", max_nest), .{}) == .ok);
     try testing.expectEqualStrings("groups nest too deeply", (try compile(a, try nested(a, "(", ")", max_nest + 1), .{})).err.msg);
     try testing.expectEqualStrings("groups nest too deeply", (try compile(a, try nested(a, "[", "]", 300), .{})).err.msg);
+    // A body that compiles to nothing still costs its nodes, every copy.
+    try testing.expect(try compile(a, "(?:(?:){1000}){499}", .{}) == .ok);
+    for ([_][]const u8{ "(?:(?:){1000}){500}", "(?:(?:(?:){1000}){1000}){1000}", "(?:(?:(?:(?:x{0}){1000}){1000}){1000}){1000}" }) |p|
+        try testing.expectEqualStrings("the pattern expands to more than 1000000 nodes", (try compile(a, p, .{})).err.msg);
     // A literal of any length skips the VM and its limits.
     const big = try a.alloc(u8, 1 << 20);
     @memset(big, 'q');
