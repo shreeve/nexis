@@ -610,7 +610,9 @@ by the role their variable plays in the plan, rule bodies included: one
 read in an entity position, in the value position under a constant ref
 attribute, or as the entity of `missing?`, `get-else` or `get-some`, may
 be a lookup ref or an ident and becomes its eid; a recursive rule's
-argument plays the roles of the head position it binds. One that names
+argument plays the roles of the head position it binds, at the call's
+own step, so a call that runs before any other reader of the input
+resolves it in the source the rule's bodies read it from. One that names
 nothing stays as it is and matches no datom, so its row stands or falls
 by the clauses around it: no row from a positive pattern, every row
 from `(not [?x :ref ?e])`, the other branches of an `or` (a lookup ref

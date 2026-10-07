@@ -128,6 +128,8 @@ ok explain names a scan's source
 (Di)
 ([Ann Bob] [Ann Cy] [Ann Di] [Cy Di])
 (Bob Cy Di)
+#{[4294967298]} #{[4294967298]}
+#{[4294967298]} #{}
 {:error :nextomic/query-syntax, :message outranks recurses through not; a rule cannot depend on the negation of itself, :clause 1}
 {:error :nextomic/query-syntax, :message ra recurses through not; a rule cannot depend on the negation of itself, :clause 1}
 ok a repeated query and rule set are served from the caches

@@ -908,11 +908,17 @@ pub const Exec = struct {
                 .not => |*n| try self.walk(n.sub),
                 .@"or" => |*o| for (o.branches) |br| try self.walk(br),
                 .fix => |*f| {
-                    for (f.args, f.instances[f.target].head) |a, h| try self.links.append(self.arena, .{ a, h });
+                    const first_source = self.sources.items.len;
+                    const first_site = self.sites.items.len;
                     for (f.instances) |inst| for (inst.bodies) |body| {
                         for (body.sites) |site| try self.sites.append(self.arena, .{ .slot = site.slot, .head = f.instances[site.callee].head });
                         try self.walk(body.plan);
                     };
+                    for (f.args, f.instances[f.target].head) |a, h| try self.links.append(self.arena, .{ a, h });
+                    // Settled here, not after the whole plan, so the
+                    // call claims its arguments' sources before any
+                    // later step does.
+                    try self.settle(first_source, first_site);
                 },
                 .source => |*src| try self.sources.append(self.arena, src),
                 .match => {},
@@ -929,9 +935,11 @@ pub const Exec = struct {
         }
 
         /// Carry the roles of rule heads to the arguments that bind
-        /// them, through every recursive call, until nothing changes.
-        fn settle(self: *Roles) !void {
-            for (self.sources.items) |src| for (self.sites.items) |site| {
+        /// them, through every recursive call, until nothing changes;
+        /// the sources and sites from `first_source` and `first_site`
+        /// on are the ones a fix step's walk has just added.
+        fn settle(self: *Roles, first_source: usize, first_site: usize) !void {
+            for (self.sources.items[first_source..]) |src| for (self.sites.items[first_site..]) |site| {
                 if (site.slot != src.slot) continue;
                 for (src.vars, site.head) |a, h| try self.links.append(self.arena, .{ a, h });
             };
@@ -954,7 +962,6 @@ pub const Exec = struct {
     fn resolveInputs(self: *Exec, p: *const Plan, rel: Relation) anyerror!Relation {
         var roles: Roles = .{ .arena = self.arena };
         try roles.walk(p);
-        try roles.settle();
         var cols: std.ArrayList(usize) = .empty;
         for (rel.vars, 0..) |v, i| {
             const r = roles.get(v);
