@@ -5886,13 +5886,14 @@ fn fnExtendBuiltinImpl(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(#%kwargs x)` → what a map pattern destructures, as Clojure 1.11
+/// `(#%kwargs x)` → what a map pattern destructures, as Clojure 1.12
 /// makes it: a value that is not a seq (a map, a vector, nil) is
-/// itself; a seq of one element is that element (a trailing map), the
-/// empty seq `{}`, and a longer seq alternating keys and values the
-/// map of them, an odd count `:invalid-argument`.
+/// itself; a seq, lazy or not, of one element is that element (a
+/// trailing map), the empty seq `{}`, and a longer seq alternating
+/// keys and values the map of them, an odd count `:invalid-argument`.
+/// A lazy seq's elements stay reachable from it once realized.
 fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .list) return args[0];
+    if (!isSeq(args[0].kind())) return args[0];
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
     if (items.items.len == 1) return items.items[0];

@@ -1249,6 +1249,10 @@ test "destructuring: every map pattern takes a seq as keyword arguments, as Cloj
     try expectOutput("(do (defn g [& opts] (let [{:keys [a]} opts] a)) (g :a 1))", "1");
     try expectOutput("(do (defn h [{:keys [a]}] a) (h '(:a 1)))", "1");
     try expectOutput("(let [{:keys [a] :as m} (list {:a 4})] [a m])", "[4 {:a 4}]");
+    // Any seq, a lazy one included, as Clojure 1.12's destructure takes it.
+    try expectOutput("(let [{:keys [a] :as m} (map identity [:a 1])] [a m])", "[1 {:a 1}]");
+    try expectOutput("[(let [{:keys [a b]} (filter some? [:a nil 1 :b 2])] [a b]) (let [{:keys [a b]} (concat [:a 1] [:b 2])] [a b]) (let [{:keys [a]} (map identity [{:a 3}])] a) (let [{:as m} (filter some? [nil])] m)]", "[[1 2] [1 2] 3 {}]");
+    try expectOutput("(try (let [{:keys [a]} (map identity [:a 1 :b])] a) (catch any e e))", ":invalid-argument");
     // A vector is not a seq: its map pattern looks it up by index.
     try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
 }
