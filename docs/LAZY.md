@@ -415,6 +415,15 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   to a closure, stays held by the slot until it is reused; clearing a
   local at its last use, as Clojure does, needs liveness in the
   compiler.
+- **No collection runs while a body realizes in isolation** (§6): a
+  lazy seq that `=` or `hash` meets nested inside a value (a map's
+  value, a vector's element, a key) realizes under `gc_hold`, so all
+  the garbage its body makes stays until the body returns: `(= {:k
+  (lazy-seq (reduce + (map inc (range 8000000))) [1])} {:k [1]})`
+  peaks at hundreds of megabytes where the same seq compared at the
+  top, in native context, runs in constant memory. Clojure collects
+  while the body runs. A seq realized before it goes into the value
+  (`(doall s)`) realized in native context.
 - **A lazy key of a small map is realized when the map takes it**, as
   a set's or a larger map's is in both (§6); Clojure's array map
   compares keys and hashes none, so `(assoc {} s 1)`, `frequencies`
@@ -475,27 +484,23 @@ f) xs)` is slower than `(map f xs)`.
 
 ---
 
-### 11. What changes for a program written against eager sequences
+### 11. Programs over lazy sequences
 
 - **Nothing runs until something walks the result.** `(map println
-  xs)` at a script's top level prints nothing; use `run!`, `doseq` or
-  `dorun`. `(with-out-str (map print xs))` is `""`, and `(time (map f
-  xs))` times nothing. A `for` used as a loop for its effects is a
-  `doseq`.
+  xs)` at a script's top level prints nothing; `run!`, `doseq` and
+  `dorun` walk for effects. `(with-out-str (map print xs))` is `""`,
+  and `(time (map f xs))` times nothing. A `for` used as a loop for its
+  effects is a `doseq`.
 - **Errors surface where the seq is walked.** `(try (map f xs) (catch
   ...))` does not catch what `f` throws: the throw comes when the result
-  is printed or consumed. Realize it inside the `try` (`doall`, `vec`,
-  `mapv`).
+  is printed or consumed. `doall`, `vec` or `mapv` inside the `try`
+  realizes it there.
 - **Dynamic bindings and transactions are read at realization.** A lazy
   seq built inside `binding`, `with-tx`, `with-read-tx` or
   `with-snapshot` and walked outside sees the outer binding, or raises
-  `:tx-closed`. Realize it inside.
-- **`iterate` takes two arguments**: `(iterate f x n)` is
-  `:arity-mismatch`; write `(take n (iterate f x))`. `(range s e 0)`
-  repeats `s` where it raised `:invalid-argument`.
-- `(list? (map f xs))` is false (`seq?` is true) and `(class (map f
-  xs))` is `:lazy_seq`; code that asked `list?` to find a sequence asks
-  `seq?` or `sequential?`, and `extend-type :list` does not cover a lazy
-  seq: extend `:lazy_seq` too. `counted?` of a lazy seq is false;
-  `count` walks it (O(1) of an unrealized range). `peek` and `pop` of
-  one are `:kind-mismatch`, as of Clojure's `LazySeq`.
+  `:tx-closed`; realizing it inside keeps what it read there.
+- **A lazy seq is a seq, not a list**: `(list? (map f xs))` is false,
+  `seq?` and `sequential?` true, and `(class (map f xs))` is
+  `:lazy_seq`, so `extend-type :list` does not cover one; a protocol
+  extends `:lazy_seq` too. `counted?` of a lazy seq is false and
+  `count` walks it (O(1) of an unrealized range, §7).
