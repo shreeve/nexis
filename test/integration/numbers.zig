@@ -218,10 +218,10 @@ test "nexis.math: floor, ceil and round keep integers and convert floats" {
     try expectOutput("[(nexis.math/floor 7) (nexis.math/ceil 7) (nexis.math/round 7)]", "[7 7 7]");
     try expectOutput("[(nexis.math/floor 2.7) (nexis.math/ceil 2.2) (nexis.math/floor -2.2) (nexis.math/ceil -2.7)]", "[2.0 3.0 -3.0 -2.0]");
     try expectOutput("[(nexis.math/round 2.5) (nexis.math/round 2.4) (nexis.math/round -2.5) (nexis.math/round -2.6)]", "[3 2 -2 -3]");
-    try expectOutput("(nexis.math/round 1.0E20)", "100000000000000000000");
+    // Java's Math/round: past the long range the result clamps, and NaN is 0.
+    try expectOutput("[(nexis.math/round 1.0E20) (nexis.math/round -1.0E20) (nexis.math/round 9.2233720368547758E18) (nexis.math/round ##NaN) (nexis.math/round ##Inf) (nexis.math/round ##-Inf)]", "[9223372036854775807 -9223372036854775808 9223372036854775807 0 9223372036854775807 -9223372036854775808]");
     try expectOutput("(nexis.math/floor 100000000000000000000)", "100000000000000000000");
     try expectOutput("(integer? (nexis.math/round 2.5))", "true");
-    try expectOutput("(try (nexis.math/round ##Inf) (catch any e e))", ":invalid-argument");
 }
 
 test "nexis.math: PI and E" {

@@ -589,6 +589,7 @@ const internal_natives = table("nexis.internal", .{
     // `& {:keys ...}`: the rest seq as a map.
     .{ "#%kwargs", 1, 1, &fnKwargs },
     .{ "#%read-next", 2, 2, &fnReadNext },
+    .{ "#%unbind-root", 1, 1, &fnUnbindRoot },
     // deftest and run-tests: the name of the current namespace.
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
     // delay: the record a delay is (core.nx `delay`, `force`).
@@ -1428,13 +1429,19 @@ fn fnMathCeil(_: *VM, args: []const Value) VmError!Value {
 /// Java's `Math/round`: the floor, plus one when the fraction is at
 /// least a half, computed without `f + 0.5` (which rounds for
 /// values just under a half and past 2^52, where every double is an
-/// integer already). A float that is NaN or infinite has no nearest
-/// integer: `:invalid-argument`, as `long` says.
+/// integer already); NaN is 0, and past the long range the result
+/// clamps to it, the infinities included.
 fn fnMathRound(vm: *VM, args: []const Value) VmError!Value {
     if (vm_mod.isInteger(args[0])) return args[0];
     const f = try asDouble(args[0]);
+    if (std.math.isNan(f)) return value_mod.fromFixnum(0).?;
     const r = @floor(f);
-    return vm_mod.numLong(vm.ensureHeap(), value_mod.fromFloat(if (f - r >= 0.5) r + 1 else r));
+    const n = if (f - r >= 0.5) r + 1 else r;
+    const heap = vm.ensureHeap();
+    // -2^63 is a double; 2^63 is the first one past the range.
+    if (n >= 0x1p63) return bignum_mod.fromI64(heap, std.math.maxInt(i64)) catch VmError.OutOfMemory;
+    if (n <= -0x1p63) return bignum_mod.fromI64(heap, std.math.minInt(i64)) catch VmError.OutOfMemory;
+    return vm_mod.numLong(heap, value_mod.fromFloat(n));
 }
 
 fn fnNot(_: *VM, args: []const Value) VmError!Value {
@@ -3122,7 +3129,7 @@ fn fnResetMeta(vm: *VM, args: []const Value) VmError!Value {
 /// The metadata of a reference, the kinds whose metadata changes in
 /// place (a Var, an atom), as Clojure's `IReference`.
 fn setRefMeta(vm: *VM, r: Value, m: Value) VmError!void {
-    if (!m.isNil() and m.kind() != .persistent_map) return VmError.KindMismatch;
+    if (!m.isNil() and m.kind() != .persistent_map and m.kind() != .sorted_map) return VmError.KindMismatch;
     switch (r.kind()) {
         .var_ => try setVarMeta(vm, VM.asVar(r), m),
         .atom => heap_mod.Heap.asHeapHeader(r).setMeta(if (m.isNil()) null else heap_mod.Heap.asHeapHeader(m)),
@@ -3136,12 +3143,7 @@ fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     v.meta = m;
     if (m.isNil()) return;
     const key = vm.ensureInterner().internKeywordValue("dynamic") catch return VmError.OutOfMemory;
-    switch (champ_mod.mapGet(m, key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-        .present => |flag| if (flag.isTruthy()) {
-            v.dynamic = true;
-        },
-        .absent => {},
-    }
+    if ((try vm_mod.lookupIn(vm, m, key, value_mod.nilValue())).isTruthy()) v.dynamic = true;
 }
 
 /// `(alter-meta! r f & args)` → sets the metadata of the Var or atom
@@ -3220,6 +3222,17 @@ fn fnAlterVarRoot(vm: *VM, args: []const Value) VmError!Value {
     v.root = next;
     v.bound = true;
     return next;
+}
+
+/// `(#%unbind-root v)` → nil, and the Var `v` unbound, its root nil:
+/// what `with-redefs` restores for a Var that had no root, as
+/// Clojure's `bindRoot` of its `Unbound` value does.
+fn fnUnbindRoot(_: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .var_) return VmError.KindMismatch;
+    const v = VM.asVar(args[0]);
+    v.root = value_mod.nilValue();
+    v.bound = false;
+    return value_mod.nilValue();
 }
 
 /// `(thread-bound? v)` → whether a `binding` of `v` is in force.
@@ -4580,7 +4593,7 @@ fn fnAtom(vm: *VM, args: []const Value) VmError!Value {
         if (opts[i].identicalTo(meta_key)) meta = opts[i + 1];
         if (opts[i].identicalTo(validator_key)) validator = opts[i + 1];
     }
-    if (!meta.isNil() and meta.kind() != .persistent_map) return VmError.KindMismatch;
+    if (!meta.isNil() and meta.kind() != .persistent_map and meta.kind() != .sorted_map) return VmError.KindMismatch;
     try validate(vm, validator, args[0]);
     const a = atom_mod.make(vm.ensureHeap(), args[0]) catch return VmError.OutOfMemory;
     atom_mod.body(a).validator = validator;

@@ -1919,6 +1919,8 @@ test "vars: with-redefs sets roots for its body and restores them on every exit"
     try expectOutputProgram("(defn f [] :f) [(try (with-redefs [f (fn [] :r)] (throw :boom)) (catch any e e)) (f)]", "[:boom :f]");
     try expectOutputProgram("(def x 1) [(with-redefs-fn {#'x 5} (fn [] x)) x]", "[5 1]");
     try expectOutput("(with-redefs [rand-int (constantly 4)] (rand-int 100))", "4");
+    // An unbound Var is unbound again afterwards, as Clojure restores its Unbound root.
+    try expectOutputProgram("(declare u) [(with-redefs [u (fn [] :r)] (u)) (bound? #'u) (try (u) (catch any e e)) (try (with-redefs-fn {#'u 1} (fn [] (throw :t))) (catch any e e)) (bound? #'u)]", "[:r false :unbound-var :t false]");
 }
 
 test "vars: *ns* is the current namespace's name symbol where a form is compiled and run; flush is a no-op" {
@@ -3291,6 +3293,8 @@ test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
     // in Clojure; a key with no value is :invalid-argument.
     try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} :invalid-reference-state]");
     try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[:invalid-argument :kind-mismatch]");
+    // Any map, a sorted one included, as with-meta takes.
+    try expectOutput("(let [a (atom 1 :meta (sorted-map :b 2 :a 1))] [(meta a) (sorted? (meta a)) (reset-meta! a (sorted-map :z 1)) (meta a)])", "[{:a 1, :b 2} true {:z 1} {:z 1}]");
 }
 
 test "atom: the values a validator and the watches see stay alive across their calls" {
@@ -4009,10 +4013,10 @@ test "nexis.string: split: empty delim and non-string args" {
 
 test "nexis.string: escape and replace-first, with a literal match" {
     try expectOutput(
-        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {})
+        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {}) (nexis.string/escape "ab" {\a false \b nil})
         \\         (nexis.string/replace-first "a-b-c" "-" "+") (nexis.string/replace-first "abc" \b \x) (nexis.string/replace-first "abc" "z" "y")
         \\         (nexis.string/replace-first "abc" "" "-") (nexis.string/replace-first "héllo" "l" "L")])
-    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
+    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"ab\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
 }
 
 test "nexis.string: split: returns a vector" {

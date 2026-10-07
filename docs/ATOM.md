@@ -192,7 +192,7 @@ callback's result.
 
 #### 4.9 Metadata
 
-An atom's metadata is a hash map or nil, set by the `:meta` option and
+An atom's metadata is a map (a sorted one included, as `with-meta` takes) or nil, set by the `:meta` option and
 changed in place by `reset-meta!` and `alter-meta!`, as a Var's is;
 `meta` reads it. It takes no part in equality, hashing or printing.
 `with-meta` of an atom is `:kind-mismatch`, as in Clojure, where an

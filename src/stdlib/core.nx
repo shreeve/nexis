@@ -245,15 +245,16 @@
 ; write roots.
 
 ; (with-redefs-fn {#'v val ...} f) → calls f with each Var's root set
-; to its value, every root restored on every exit. A root write, not
-; a binding: every caller sees it, and a Var need not be dynamic.
+; to its value, every root restored on every exit, and a Var that was
+; unbound unbound again. A root write, not a binding: every caller sees
+; it, and a Var need not be dynamic.
 (defn with-redefs-fn [binding-map func]
-  (let* [root-bind (fn* [m] (reduce-kv (fn* [_ v x] (alter-var-root v (constantly x))) nil m))
-         old-vals (reduce-kv (fn* [m v _] (assoc m v (alter-var-root v identity))) {} binding-map)]
+  (let* [old-vals (reduce-kv (fn* [m v _] (assoc m v (when (bound? v) [(alter-var-root v identity)]))) {} binding-map)]
     (try
-      (root-bind binding-map)
+      (reduce-kv (fn* [_ v x] (alter-var-root v (constantly x))) nil binding-map)
       (func)
-      (finally (root-bind old-vals)))))
+      (finally
+        (reduce-kv (fn* [_ v old] (if old (alter-var-root v (constantly (old 0))) (nexis.internal/#%unbind-root v))) nil old-vals)))))
 
 ; (with-redefs [name val ...] body...) → body with the roots of the
 ; Vars the names resolve to set to the values, as with-redefs-fn.
