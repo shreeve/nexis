@@ -223,7 +223,10 @@ unrooted nodes. A lazy block they meet is realized through
   `call:call`, the `coll` opcodes, the transient natives). When the
   count moved, it raises the parked failure, a thrown value through
   `throwValue` or an error as itself, and `:stack-overflow` when none
-  is parked (`VM.checkDeepData`).
+  is parked (`VM.checkDeepData`). One that fails for another reason
+  consumes the spoils under it and drops a failure parked since its
+  snapshot (`VM.dropSpoils`), so no later call raises it; a failure
+  parked before the snapshot belongs to an enclosing call and stays.
 
 What a program sees: `(get {(lazy-seq [1 2]) :a} [1 2])` is `:a`, and
 `(try (= [(lazy-seq (throw :x))] [[1]]) (catch any e e))` is `:x`.

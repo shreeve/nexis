@@ -2265,6 +2265,11 @@ test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere
     try expectOutput("(try {[] 1 (lazy-seq (throw :z)) 2} (catch any e e))", ":z");
     try expectOutput("(try (hash [(lazy-seq (throw :a)) (lazy-seq (throw :b))]) (catch any e e))", ":a");
     try expectOutput("[(try (hash [(lazy-seq (throw :a))]) (catch any e e)) (= [(lazy-seq [1])] [[1]]) (contains? #{[1]} (lazy-seq [1]))]", "[:a true true]");
+    // A native that parked a body's throw and then fails for another
+    // reason drops it: nothing later raises it. One that keeps going
+    // keeps it across a failing call it makes, and raises it at its end.
+    try expectOutput("(let [r (try (group-by (fn [x] (cond (= x 3) (throw :other) (= x 2) (lazy-seq (throw :x)) :else [1])) [1 2 3]) (catch any e [:caught e]))] [r (try (= [(lazy-seq [1])] [[1]]) (catch any e [:later e])) (try (hash [(lazy-seq (throw :y))]) (catch any e e))])", "[[:caught :other] true :y]");
+    try expectOutput("(try (group-by (fn [x] (cond (= x 3) (do (try (reduce + [:a]) (catch any e nil)) [3]) (= x 2) (lazy-seq (throw :x)) :else [1])) [1 2 3]) (catch any e [:caught e]))", "[:caught :x]");
     // = walks in step: an infinite seq against a finite one ends.
     try expectOutput("(do (defn nat [n] (lazy-seq (cons n (nat (inc n))))) [(= (nat 0) [0 1]) (= [0 1] (nat 0)) (= [(nat 0)] [[0 1]]) (not= (nat 0) '(0))])", "[false false false true]");
     // An in-place edit of a transient realizes its key first, so the
