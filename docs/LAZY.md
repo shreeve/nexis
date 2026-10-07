@@ -425,7 +425,10 @@ waiting, the source ends, or a step returns a reduced value, and
 hands them out as one chunk; at the end it runs the completion arity
 once, so `partition-all`'s last part comes out. It realizes the source
 as far as the outputs need, as Clojure's `TransformerIterator` pulls
-it. `(sequence xform c1 c2 ...)` runs the transducer over `(map vector
+it. Unlike the other producers' (§7), its walk's position stays out of
+the block, on a root scope while the step calls the transducer: the
+seq it took of a source that is not one (a vector's view, a set's
+elements) is all that reaches what the walk has left. `(sequence xform c1 c2 ...)` runs the transducer over `(map vector
 c1 c2 ...)`, its reducing function called with each tuple's elements.
 A call through the transducer costs a closure call per element where
 the native producers call their function directly, so `(sequence (map

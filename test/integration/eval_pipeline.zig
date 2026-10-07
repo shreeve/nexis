@@ -6483,6 +6483,13 @@ test "gc: a native walking a lazy seq that collects at every step keeps what it 
     try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
 }
 
+test "gc: sequence and eduction keep the seq they took of a source that is not one across the transducer's calls" {
+    try expectOutputUnderGc(churn ++ "(= (range 100) (vec (sequence (map (fn [x] (churn x) x)) (vec (range 100)))))", "true");
+    try expectOutputUnderGc(churn ++ "(= (set (range 40)) (set (sequence (map (fn [x] (churn x) x)) (set (range 40)))))", "true");
+    try expectOutputUnderGc(churn ++ "(count (eduction (map (fn [x] (churn x) x)) (filter even?) (set (range 40))))", "20");
+    try expectOutputUnderGc(churn ++ "(apply str (sequence (map (fn [c] (churn 1) c)) \"abcdef\"))", "abcdef");
+}
+
 test "gc: = and hash realize a lazy key in isolation, with no cycle inside the build" {
     var program: Program = undefined;
     try program.init();

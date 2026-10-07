@@ -162,17 +162,25 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     const empty = vector_mod.empty(heap) catch return VmError.OutOfMemory;
     var acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
     lazy.setScratch(lz, acc);
+    // The walk's position stays out of the block, so a step that throws
+    // runs again from the block's own source position; the seq taken of
+    // a source that is not one (a vector's view, a set's elements) is
+    // the only thing reaching what the walk has left, so it is rooted
+    // across every call of `rf` (docs/GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(a[1]);
     var cur = a[1];
     var done = false;
     var args: [lazy.chunk_size + 1]Value = undefined;
     // Pull inputs until a chunk's worth of outputs waits, the source
-    // ends, or `rf` stops the reduction; the position is a local, so a
-    // step that throws runs again from the block's own state.
+    // ends, or `rf` stops the reduction.
     while (true) {
         if (acc.kind() != .transient) return VmError.KindMismatch;
         const n = transient_mod.vectorCountBang(acc) catch return VmError.KindMismatch;
         if (n >= lazy.chunk_size) break;
         cur = try seqOf(vm, cur);
+        vm.roots.items[scope.base] = cur;
         if (cur.isNil()) {
             done = true;
             break;
