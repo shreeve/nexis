@@ -386,9 +386,14 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   cleared when the native returns (`docs/VM.md` §6), so a seq passed
   to a native and walked by a later one is not kept by the first
   call's block: in `(reduce + (map inc (filter even? (map inc (range
-  n)))))` only the outermost seq stays. Clearing a local at its last
-  use would give Clojure's constant-memory streaming; it needs
-  liveness in the compiler.
+  n)))))` only the outermost seq stays, and not even that: `reduce`,
+  like `frequencies`, `group-by`, `some`, `every?`, `last` and
+  `dorun`, consumes its sequence argument, clearing its slot and
+  keeping only its walk's place (`docs/GC.md` §11.5), so such a
+  pipeline runs in constant memory. A seq bound to a local, or passed
+  to a closure, stays held by the slot until it is reused; clearing a
+  local at its last use, as Clojure does, needs liveness in the
+  compiler.
 - `counted?` of a range is false (Clojure's `LongRange` is counted);
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy

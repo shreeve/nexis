@@ -294,6 +294,10 @@ leaf takes (numbers, a vector to index), and clearing them would
 cost every arithmetic call. A closure's arguments are its own slots
 and stay as its body leaves them; clearing its window's overlap with
 the caller's frame on return cost 5% of a call (`docs/PERF.md` §6).
+A native that consumes its last argument (`NativeFn.consumes`) has
+that argument's slot cleared before the call, once the arguments are
+copied: it roots the argument itself and lets the part of a lazy seq
+it has walked go (`docs/GC.md` §11.5).
 
 `call:tailcall` traps `UnimplementedOpcode` and the compiler never
 emits it; `recur` compiles to a jump (§11). `call:return A` and

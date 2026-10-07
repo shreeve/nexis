@@ -1035,6 +1035,13 @@ pub const NativeFn = struct {
     /// code). A leaf call site re-issues such a call through the
     /// general path, arguments copied and rooted (VM.md §6).
     general: ?*const fn (vm: *VM, args: []const Value) VmError!Value = null,
+    /// The native walks its last argument to the end, or until it is
+    /// done with it, and keeps the walk rooted itself (`SeqIter.cursor`):
+    /// `call:call` clears the argument's slot once it has copied the
+    /// arguments, so the head of a lazy seq passed straight in is not
+    /// held by the caller's block while the walk realizes the rest
+    /// (docs/GC.md §11.5).
+    consumes: bool = false,
 };
 
 /// What realizing a lazy seq takes, which `src/seq.zig` implements
@@ -4054,11 +4061,13 @@ pub const VM = struct {
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         // A whole buffer copies inline where the stack's capacity
-        // covers it.
+        // covers it; the other copy is a call of its own, which the
+        // optimizer cannot fold the inline one into.
         var buf: [max_native_args]Value = undefined;
         if (base + max_native_args <= self.stack.capacity) {
             buf = self.stack.items.ptr[base..][0..max_native_args].*;
-        } else @memcpy(buf[0..argc], self.stack.items[base..][0..argc]);
+        } else copySlots(buf[0..argc], self.stack.items[base..][0..argc]);
+        if (native.consumes and argc > 0) self.stack.items[base + argc - 1] = value_mod.nilValue();
         countNative(native);
         const overflows = dispatch_mod.spoilCount();
         const result = native.call(self, buf[0..argc]) catch |err| {
@@ -4074,6 +4083,10 @@ pub const VM = struct {
         for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
         self.slotAt(caller, inst.c.index).* = result;
         return self.nextSafe(caller);
+    }
+
+    noinline fn copySlots(dst: []Value, src: []const Value) void {
+        @memcpy(dst, src);
     }
 
     /// `fastCall` of a keyword or symbol, `(:k m)`, `(:k m d)`, `('s m)`,
@@ -4182,6 +4195,7 @@ pub const VM = struct {
             self.allocator.alloc(Value, argc) catch return VmError.OutOfMemory;
         defer if (argc > buf.len) self.allocator.free(args);
         @memcpy(args, self.stack.items[args_base..][0..argc]);
+        if (callee.kind() == .native_fn and asNativeFn(callee).consumes and argc > 0) self.stack.items[args_base + argc - 1] = value_mod.nilValue();
         const result = try self.callDirect(callee, args);
         // The block is dead once the call returns (§6): the compiler
         // never reads a block after its call (`COMPILER.md` §4.4), so

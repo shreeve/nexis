@@ -2338,6 +2338,36 @@ test "gc: a native's call block holds nothing of its arguments once the call ret
     try testing.expect(heap.peak_live_bytes -| start < 3 << 20);
 }
 
+test "gc: a native that consumes its sequence lets the part it walked go" {
+    // Each realizes 300,000 mapped elements, about 6 MB of chunks, that
+    // the argument's slot would keep while the native walks them.
+    for ([_][2][]const u8{
+        .{ "(reduce + (map inc (range 300000)))", "45000150000" },
+        .{ "(reduce + 0 (map inc (range 300000)))", "45000150000" },
+        .{ "(dorun (map inc (range 300000)))", "nil" },
+        .{ "(dorun 300000 (map inc (range 300000)))", "nil" },
+        .{ "(last (map inc (range 300000)))", "300000" },
+        .{ "(some neg? (map inc (range 300000)))", "nil" },
+        .{ "(every? pos? (map inc (range 300000)))", "true" },
+        .{ "(count (frequencies (map #(mod % 10) (range 300000))))", "10" },
+        .{ "(count (group-by odd? (map #(mod % 10) (range 300000))))", "2" },
+    }) |case| {
+        errdefer std.debug.print("consuming case {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[0]), case[1]);
+        // `group-by` keeps every element in its groups: 300,000 values.
+        const bound: usize = if (std.mem.startsWith(u8, case[0], "(count (group-by")) 8 << 20 else 1 << 20;
+        try testing.expect(heap.peak_live_bytes -| start < bound);
+    }
+}
+
 test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
     try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
     try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");

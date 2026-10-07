@@ -1227,6 +1227,30 @@ deep-data check above saved. Less marking pays for it in `lazy3`,
 whose inner seqs, 138 MB of them, are garbage once the call that
 took each has returned.
 
+**Natives that consume their sequence** (a memory lever, `docs/GC.md`
+§11.5): `reduce`, `frequencies`, `group-by`, `some`, `every?`, `last`
+and `dorun` have their last argument's slot cleared by `call:call` and
+keep only their walk's place rooted. Load 6.8 → 7.3:
+
+| Program | Instructions before | after | Peak resident set |
+|---|---:|---:|---:|
+| `lazy3` 3 M, whole process | 1,094.7 M | 1,009.4 M (−7.8%) | 61.2 → 21.3 MB |
+| `lazy3`, per element | 366.4 / 96.4 cycles | 326.6 / 70.9 cycles | |
+| `lazy` less `cbbase` | 304.7 | 297.3 | 110.2 → 104.0 MB |
+| `freq-group`, whole process | 1,536.2 M | 1,531.8 M | 58.7 → 41.1 MB |
+| `getnl` | 486.0 | 489.0 | |
+| `destructure` | 4,141.5 M | 4,164.5 M (+0.6%) | 22.3 MB both |
+
+`freq-group` peaks where the eager build of §3.11's lazy-sequence
+comparison did (40 MB): the mapped seq `frequencies` counts is
+garbage behind its walk. The pipeline row stays at 187.7 MB: no
+cycle runs in its phase (§3.14), and its rows are the 1M maps the
+setup built. Every other program within 0.2% instructions and its
+resident set unchanged. A first build lost 61 instructions a non-leaf
+native call: with the clearing after it, the optimizer folded the
+inline copy of the arguments and the copy past the stack's capacity
+into one call of `memcpy`; the second copy is a function of its own.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
