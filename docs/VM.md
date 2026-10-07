@@ -671,9 +671,10 @@ Group and variant numbers are the enums in `src/vm.zig` (`Group`,
 
 A group number outside the enum is `BytecodeCorruption`; an
 undispatched group traps `UnimplementedOpcode`. A variant number
-outside its group's enum is `BytecodeCorruption` in every group; a
-reserved variant inside it (`call:tailcall`, `math:pow`, `ctrl:halt`)
-traps `UnimplementedOpcode`.
+outside its group's enum that is not a quickened variant (§10.10) is
+`BytecodeCorruption` in every group, which verification refuses
+(§5); a reserved variant inside it (`call:tailcall`, `math:pow`,
+`ctrl:halt`) traps `UnimplementedOpcode`.
 
 #### 10.1 `mov`
 

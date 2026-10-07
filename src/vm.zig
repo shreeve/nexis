@@ -3757,33 +3757,28 @@ pub const VM = struct {
 
     /// The general handler of every opcode: its group's, which
     /// switches on the variant, or one of its own for the hot
-    /// variants. A group outside the enum is corrupt; the groups with
-    /// no executed variant trap.
+    /// variants. A group outside the enum, or a variant outside its
+    /// group's enum that is not quickened, is corrupt, which is what
+    /// verification refuses (§5, §10); the groups with no executed
+    /// variant trap.
     const op_table: [4096]OpHandler = blk: {
         @setEvalBranchQuota(20_000);
         var t: [4096]OpHandler = @splat(&opCorrupt);
-        // A group's handler takes the variants without one of their
+        // A group's handler takes its variants without one of their
         // own: every variant of `jump`, `cmp`, `mov` and `call` but
-        // the reserved `tailcall` has one, so the rest are corrupt
-        // (§10).
+        // the reserved `tailcall` has one.
         const groups = .{
-            .{ Group.jump, &opCorrupt },
-            .{ Group.cmp, &opCorrupt },
-            .{ Group.math, &opMath },
-            .{ Group.mov, &opCorrupt },
-            .{ Group.call, &opCorrupt },
-            .{ Group.closure, &opClosure },
-            .{ Group.var_, &opVar },
-            .{ Group.coll, &opColl },
-            .{ Group.transient, &opUnimplemented },
-            .{ Group.hash, &opUnimplemented },
-            .{ Group.tx, &opUnimplemented },
-            .{ Group.ctrl, &opCtrl },
-            .{ Group.io, &opUnimplemented },
-            .{ Group.simd, &opUnimplemented },
+            .{ Group.math, Math, &opMath },
+            .{ Group.closure, Closure_, &opClosure },
+            .{ Group.var_, VarOp, &opVar },
+            .{ Group.coll, CollOp, &opColl },
+            .{ Group.ctrl, CtrlOp, &opCtrl },
         };
         for (groups) |g| {
-            for (0..64) |v| t[@as(u12, @backingInt(g[0])) | @as(u12, v) << 6] = g[1];
+            for (std.meta.tags(g[1])) |v| t[opcode(g[0], v)] = g[2];
+        }
+        for ([_]Group{ .transient, .hash, .tx, .io, .simd }) |g| {
+            for (0..64) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = &opUnimplemented;
         }
         t[opcode(.mov, Mov.move)] = &opMove;
         t[opcode(.mov, Mov.load_const)] = &opLoadConst;
@@ -8202,7 +8197,15 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "the code falls off its end", .code = &.{ asm_.loadNil(0), asm_.loadNil(1) }, .err = VmError.BytecodeExhausted, .pc = 1 },
         .{ .name = "a comparison ends the code", .code = &.{asm_.cmpLt(0, kn(0), kn(0))}, .err = VmError.BytecodeExhausted, .pc = 0 },
         .{ .name = "not a primary instruction", .code = &.{ bad_kind, r }, .err = VmError.BytecodeCorruption, .pc = 0 },
-        .{ .name = "a variant outside its group", .code = &.{ r, raw(.mov, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a jump variant outside its group", .code = &.{ r, raw(.jump, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a cmp variant outside its group", .code = &.{ r, raw(.cmp, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a math variant outside its group", .code = &.{ r, raw(.math, 20, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a mov variant outside its group", .code = &.{ r, raw(.mov, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a call variant outside its group", .code = &.{ r, raw(.call, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a closure variant outside its group", .code = &.{ r, raw(.closure, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a var variant outside its group", .code = &.{ r, raw(.var_, 9, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a coll variant outside its group", .code = &.{ r, raw(.coll, 30, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+        .{ .name = "a ctrl variant outside its group", .code = &.{ r, raw(.ctrl, 4, sl(0), sl(0), sl(0)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
         .{ .name = "a jump past the code", .code = &.{ asm_.jumpJmp(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a branch past the code", .code = &.{ asm_.jumpIfTrue(9, kn(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a destination past the frame", .code = &.{ asm_.loadNil(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
