@@ -2265,6 +2265,10 @@ test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere
     try expectOutput("(try {[] 1 (lazy-seq (throw :z)) 2} (catch any e e))", ":z");
     try expectOutput("(try (hash [(lazy-seq (throw :a)) (lazy-seq (throw :b))]) (catch any e e))", ":a");
     try expectOutput("[(try (hash [(lazy-seq (throw :a))]) (catch any e e)) (= [(lazy-seq [1])] [[1]]) (contains? #{[1]} (lazy-seq [1]))]", "[:a true true]");
+    // A lazy key is realized when a map or set takes it, an array form's
+    // included, and its throw surfaces from the call that inserted it.
+    try expectOutput("(let [a (lazy-seq [1]) b (lazy-seq [2]) c (lazy-seq [3]) d (lazy-seq [4]) e (lazy-seq [5]) f (lazy-seq [6])] (into #{} [a]) (conj #{} b) (assoc {} c 1) (frequencies [d]) (group-by identity [e]) (assoc {:k 1} f 2) (mapv realized? [a b c d e f]))", "[true true true true true true]");
+    try expectOutput("[(try (count (into #{} [(lazy-seq (throw :in))])) (catch any e e)) (try (frequencies [(lazy-seq (throw :fq))]) (catch any e e)) (try (group-by identity [(lazy-seq (throw :gb))]) (catch any e e)) (try (conj #{} (lazy-seq (throw :cj))) (catch any e e)) (try (reduce conj #{} [(lazy-seq (throw :rc))]) (catch any e e)) (try (assoc {} [(lazy-seq (throw :nested))] 1) (catch any e e)) (try (into {} [[(lazy-seq (throw :im)) 1]]) (catch any e e)) (try (zipmap [(lazy-seq (throw :z))] [1]) (catch any e e))]", "[:in :fq :gb :cj :rc :nested :im :z]");
     // A native that parked a body's throw and then fails for another
     // reason drops it: nothing later raises it. One that keeps going
     // keeps it across a failing call it makes, and raises it at its end.

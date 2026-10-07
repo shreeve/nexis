@@ -214,6 +214,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | a lazy seq a local holds | let go as it is walked (locals clearing) | kept, with what it realized, until the slot is reused | `docs/LAZY.md` §9 |
 | `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |
 | `(str (map inc [1]))` | `"clojure.lang.LazySeq@..."` | `"(2)"` | `docs/LAZY.md` §9 |
+| a lazy key of a map of up to eight entries (`assoc`, `frequencies`, `group-by`) | left unrealized: the array map compares and hashes nothing | realized when the map takes it, its throw raised by that call, as a hash set's in both | `docs/LAZY.md` §9 |
 | a `lazy-seq` body that throws | runs again on the next walk (babashka caches an empty seq) | runs again, as JVM Clojure | `docs/LAZY.md` §4 |
 | a `sequence` step that throws, walked again | goes on from the advanced source and transducer, dropping the chunk it was filling: `(3 4)` for a `(comp (map f) (take 4))` over `(range 10)` whose `f` throws once at 2 | runs the step again from its source position with the transducer's advanced state: `(0 1)` | `docs/LAZY.md` §9 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |

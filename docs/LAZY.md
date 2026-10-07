@@ -239,8 +239,12 @@ arguments in native context (§5), and the transient natives (`conj!`,
 given (`seq.realizeAll`) before the in-place edit starts, so no code
 runs in the middle of an edit of a transient the code can reach: `(let
 [t (transient {})] (assoc! t (lazy-seq (assoc! t :x 1) [1]) 2))`
-completes the inner `assoc!` before the outer one begins. A key
-already in a hashed collection was realized when it was hashed.
+completes the inner `assoc!` before the outer one begins. A key in a
+map or set was realized when the collection took it: an array form,
+which indexes nothing by hash, still hashes each key it adds that
+may hold a lazy seq
+(`docs/CHAMP.md` §2.1), so `(frequencies [(lazy-seq (throw :x))])`
+throws `:x` from `frequencies`.
 
 A coll opcode that hashes copies its operands off the stack before it
 builds, and reads its frame again after: running a body can grow the
@@ -397,6 +401,11 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   to a closure, stays held by the slot until it is reused; clearing a
   local at its last use, as Clojure does, needs liveness in the
   compiler.
+- **A lazy key of a small map is realized when the map takes it**, as
+  a set's or a larger map's is in both (§6); Clojure's array map
+  compares keys and hashes none, so `(assoc {} s 1)`, `frequencies`
+  and `group-by` leave a lazy key unrealized there until something
+  hashes or prints the map.
 - `counted?` of a range is false (Clojure's `LongRange` is counted);
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
