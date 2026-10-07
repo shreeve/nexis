@@ -871,8 +871,9 @@ total ∪= new; delta = new } until delta is empty`. A bound argument is
 pushed into the bodies only where the component is one rule and every
 recursive call passes the argument through unchanged; elsewhere it
 filters the result, so a required argument (`[(r [?n] ?out) ...]`) that
-a recursive call changes, and that a body needs bound, is
-`:nextomic/query-syntax` naming it. The fixpoint ends when a round adds
+a body needs bound, and that a recursive call changes or that belongs
+to a component of several rules, is `:nextomic/query-syntax` naming it
+and the cause. The fixpoint ends when a round adds
 no row, which every rule over datoms, inputs and constants reaches; a
 body that binds a function result (`[(inc ?n) ?m]`) can add new values
 every round, and its rule ends only where a predicate bounds them. The
