@@ -1782,13 +1782,15 @@ const PatternBody = struct {
 pub const Made = union(enum) { ok: Value, err: SyntaxError };
 
 /// Compile `source` in a scratch arena on `gpa` and copy the program
-/// and the source into one `regex` block. A syntax error is `.err`.
+/// and the source into one `regex` block. A syntax error is `.err`,
+/// its message allocated on `gpa` and owned by the caller: the
+/// sentence may be formatted in the arena, which dies here.
 pub fn make(heap: *Heap, gpa: Allocator, source: []const u8) (Allocator.Error || stack.Error)!Made {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const p = switch (try compile(arena.allocator(), source, .{})) {
         .ok => |p| p,
-        .err => |e| return .{ .err = e },
+        .err => |e| return .{ .err = .{ .msg = try gpa.dupe(u8, e.msg), .offset = e.offset } },
     };
     const literal = p.literal orelse &.{};
     const size = @sizeOf(PatternBody) + p.insts.len * @sizeOf(Inst) + p.ranges.len * @sizeOf(Range) +
@@ -2424,6 +2426,20 @@ test "regex: a replacement string reads $n, ${name} and escapes as Java's append
     const quoted = try quoteReplacement(testing.allocator, "a$1\\b");
     defer testing.allocator.free(quoted);
     try testing.expectEqualStrings("a\\$1\\\\b", quoted);
+}
+
+test "regex: make's syntax error outlives the arena it compiled in" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    for ([_][2][]const u8{
+        .{ "*a", "Dangling meta character '*'" },
+        .{ "\\p{Foo}", "Unknown character property name {Foo}" },
+        .{ "(", "Unclosed group" },
+    }) |case| {
+        const e = (try make(&heap, testing.allocator, case[0])).err;
+        defer testing.allocator.free(e.msg);
+        try testing.expectEqualStrings(case[1], e.msg);
+    }
 }
 
 test "regex: a named group is found by name" {

@@ -4898,6 +4898,7 @@ fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
     switch (made) {
         .ok => |p| return p,
         .err => |e| {
+            defer vm.allocator.free(e.msg);
             const heap = vm.ensureHeap();
             const interner = vm.ensureInterner();
             const index = std.unicode.utf8CountCodepoints(source[0..e.offset]) catch e.offset;

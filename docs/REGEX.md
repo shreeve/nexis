@@ -351,8 +351,9 @@ Two heap kinds carry regular expressions into the language
 the source in a scratch arena and copies the program into one block:
 the `Program` and the source slice first, then the instructions, the
 ranges, the source text, the group names, the literal and the prefix,
-which the program's slices point at. A block never moves, so the
-pointers into it stay valid for its life. The block holds no Value:
+which the program's slices point at; a syntax error's sentence is
+copied out of the arena onto `gpa`, the caller's to free. A block
+never moves, so the pointers into it stay valid for its life. The block holds no Value:
 the collector treats it as a leaf, and the sweep frees it as it frees
 a string. A pattern is immutable.
 

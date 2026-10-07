@@ -4160,9 +4160,9 @@ test "regex: a replacement Java refuses throws :invalid-replacement with its sen
 
 test "regex: an invalid pattern throws :invalid-regex with the sentence and the index; a wrong kind is :kind-mismatch" {
     try expectOutput(
-        \\(pr-str (for [p ["(" "a{2,1}" "é(" "(?=a)" "a)"]]
+        \\(pr-str (for [p ["(" "a{2,1}" "é(" "(?=a)" "a)" "*a" "\\p{Foo}"]]
         \\          (try (re-pattern p) (catch :invalid-regex e [(:message e) (:index e) (= p (:pattern e))]))))
-    , "([\"Unclosed group\" 1 true] [\"Illegal repetition range\" 5 true] [\"Unclosed group\" 2 true] [\"lookahead and lookbehind are not supported\" 0 true] [\"Unmatched closing ')'\" 1 true])");
+    , "([\"Unclosed group\" 1 true] [\"Illegal repetition range\" 5 true] [\"Unclosed group\" 2 true] [\"lookahead and lookbehind are not supported\" 0 true] [\"Unmatched closing ')'\" 1 true] [\"Dangling meta character '*'\" 1 true] [\"Unknown character property name {Foo}\" 0 true])");
     try expectOutput(
         \\(map #(try (%) (catch any e e))
         \\     [#(re-find "a" "a") #(re-seq "a" "a") #(re-matches "a" "a") #(re-pattern 1) #(re-find (re-pattern "a") 1) #(re-matcher (re-pattern "a") nil) #(re-find 1) #(re-groups (re-pattern "a"))])
