@@ -81,6 +81,7 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .max_arity = e[2],
         .call = e[3],
         .leaf = if (e.len > 4) e[4] == .leaf else false,
+        .consumes = if (e.len > 4) e[4] == .consumes else false,
         .general = if (e.len > 5) e[5] else null,
     };
     return out;
@@ -214,8 +215,8 @@ const core_natives = table("", .{
     .{ "second", 1, 1, &fnSecond },
     .{ "take", 1, 2, &fnTake },
     .{ "drop", 1, 2, &fnDrop },
-    .{ "some", 2, 2, &fnSome },
-    .{ "every?", 2, 2, &fnEveryQ },
+    .{ "some", 2, 2, &fnSome, .consumes },
+    .{ "every?", 2, 2, &fnEveryQ, .consumes },
     .{ "count", 1, 1, &fnCount },
     .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
     .{ "empty?", 1, 1, &fnEmptyQ },
@@ -281,7 +282,7 @@ const core_natives = table("", .{
     // apply + HOFs.
     .{ "apply", 2, null, &fnApply },
     .{ "map", 1, null, &fnMap },
-    .{ "reduce", 2, 3, &fnReduce },
+    .{ "reduce", 2, 3, &fnReduce, .consumes },
     .{ "reduce-kv", 3, 3, &fnReduceKv },
     .{ "filter", 1, 2, &fnFilter },
     .{ "remove", 1, 2, &fnRemove },
@@ -304,7 +305,7 @@ const core_natives = table("", .{
     .{ "take-while", 1, 2, &fnTakeWhile },
     .{ "drop-while", 1, 2, &fnDropWhile },
     .{ "butlast", 1, 1, &fnButlast },
-    .{ "last", 1, 1, &fnLast },
+    .{ "last", 1, 1, &fnLast, .consumes },
     .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "nthnext", 2, 2, &fnNthnext },
@@ -378,7 +379,7 @@ const core_natives = table("", .{
     // Lazy seqs (docs/LAZY.md).
     .{ "realized?", 1, 1, &fnRealizedQ },
     .{ "doall", 1, 2, &fnDoall },
-    .{ "dorun", 1, 2, &fnDorun },
+    .{ "dorun", 1, 2, &fnDorun, .consumes },
     .{ "chunked-seq?", 1, 1, &fnChunkedSeqQ },
     .{ "chunk-first", 1, 1, &fnChunkFirst },
     .{ "chunk-rest", 1, 1, &fnChunkRest },
@@ -414,8 +415,8 @@ const core_natives = table("", .{
     .{ "keys", 1, 1, &fnKeys },
     .{ "vals", 1, 1, &fnVals },
     .{ "conj", 0, null, &fnConj },
-    .{ "frequencies", 1, 1, &fnFrequencies },
-    .{ "group-by", 2, 2, &fnGroupBy },
+    .{ "frequencies", 1, 1, &fnFrequencies, .consumes },
+    .{ "group-by", 2, 2, &fnGroupBy, .consumes },
     // Transients (docs/TRANSIENT.md): each `!` edits the nodes the
     // transient owns in place and returns the transient to use.
     .{ "transient", 1, 1, &fnTransient },
@@ -723,9 +724,12 @@ fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
 /// `(some pred coll)` → the first truthy `(pred x)`, else nil;
 /// `(every? pred coll)` → whether `(pred x)` is truthy for every x.
 /// Both stop at the first element that decides. Rooting: each built
-/// element is only the next call's argument (GC.md §11.5, class 2).
+/// element is only the next call's argument (GC.md §11.5, class 2);
+/// both consume `coll` (`consumingSeqIter`).
 fn fnSome(vm: *VM, args: []const Value) VmError!Value {
-    var it = try makeSeqIter(vm, args[1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
         const r = try cb.call(&.{x});
@@ -735,7 +739,9 @@ fn fnSome(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
-    var it = try makeSeqIter(vm, args[1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
         if (!(try cb.call(&.{x})).isTruthy()) return value_mod.fromBool(false);
@@ -1558,17 +1564,19 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
 fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
+    // `coll` is consumed: its slot in this scope keeps the walk, or the
+    // pure seq's state (an `iterate`'s function, a `cycle`'s source).
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, coll, scope);
     if (seq_mod.pureOf(coll)) |p| return reducePure(vm, f, if (args.len == 3) args[1] else null, p);
-    var it = try makeSeqIter(vm, coll);
     var acc = if (args.len == 3) args[1] else (try it.next()) orelse return try vm.callValue(f, &.{});
     var cb = vm_mod.Callback.init(vm, f, 2);
     // The accumulator is the next call's argument, and a lazy `coll`'s
     // next step may collect before that call (GC.md §11.5, class 5):
     // it goes into a root slot before such a step.
-    const scope = vm.rootScope();
-    defer scope.release();
     try scope.push(acc);
-    while (try it.nextChunk(scope.base, acc)) |xs| for (xs) |x| {
+    while (try it.nextChunk(scope.base + 1, acc)) |xs| for (xs) |x| {
         acc = try cb.call(&.{ acc, x });
         if (isReduced(vm, acc)) return reducedValue(acc);
     };
@@ -2145,11 +2153,12 @@ fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
 fn fnFrequencies(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
-    // A lazy argument's next step may collect (GC.md §11.5, class 5).
+    // A lazy argument's next step may collect (GC.md §11.5, class 5),
+    // and the argument is consumed.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(t);
-    var it = try makeSeqIter(vm, args[0]);
+    var it = try consumingSeqIter(vm, args[0], scope);
     while (try it.next()) |x| {
         const spot = transient_mod.mapLocateBang(t, x, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const n: i64 = if (champ_mod.mapSpotValue(spot)) |c| c.asFixnum() + 1 else 1;
@@ -2173,9 +2182,10 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     defer scope.release();
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
     try scope.push(t);
-    var it = try makeSeqIter(vm, args[1]);
+    var it = try consumingSeqIter(vm, args[1], scope);
+    var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
-        const k = try vm.callValue(f, &.{x});
+        const k = try cb.call(&.{x});
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
             const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;
@@ -2402,9 +2412,14 @@ fn fnLast(vm: *VM, args: []const Value) VmError!Value {
         },
         else => {},
     }
-    var it = try makeSeqIter(vm, c);
+    // `c` is consumed, and the last element seen waits in a root slot
+    // before a step that may collect: the walk's place has left it.
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(value_mod.nilValue());
+    var it = try consumingSeqIter(vm, c, scope);
     var last = value_mod.nilValue();
-    while (try it.next()) |x| last = x;
+    while (try it.nextChunk(scope.base, last)) |xs| last = xs[xs.len - 1];
     return last;
 }
 
@@ -3818,8 +3833,30 @@ fn fnDoall(vm: *VM, args: []const Value) VmError!Value {
     return args[args.len - 1];
 }
 
+/// `(dorun coll)` / `(dorun n coll)`: realize, keeping nothing. `coll`
+/// is consumed: the walk's place, or the seq `next` has reached, is
+/// its root.
 fn fnDorun(vm: *VM, args: []const Value) VmError!Value {
-    try realizeArg(vm, args);
+    const scope = vm.rootScope();
+    defer scope.release();
+    const coll = args[args.len - 1];
+    if (args.len == 1) {
+        try scope.push(coll);
+        var it = try SeqIter.realizing(vm, coll);
+        it.cursor = scope.base;
+        while (try it.next()) |_| {}
+        return value_mod.nilValue();
+    }
+    const n = try requireCount(args[0]);
+    try scope.push(coll);
+    var xs = coll;
+    for (0..n) |_| {
+        const s = try seq_mod.seqOf(vm, xs);
+        if (s.isNil()) break;
+        vm.roots.items[scope.base] = s;
+        xs = try seq_mod.next(vm, s);
+        vm.roots.items[scope.base] = xs;
+    }
     return value_mod.nilValue();
 }
 
@@ -5826,6 +5863,16 @@ fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
     return SeqIter.init(vm, coll);
 }
 
+/// `makeSeqIter` over an argument the native consumes
+/// (`NativeFn.consumes`): `coll` is pushed on `scope`, and the slot
+/// keeps the walk's place (`SeqIter.cursor`).
+fn consumingSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
+    try scope.push(coll);
+    var it = try makeSeqIter(vm, coll);
+    it.cursor = vm.roots.items.len - 1;
+    return it;
+}
+
 /// `makeSeqIter` whose built values stay rooted in `scope`.
 fn rootedSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
     return SeqIter.rooted(vm, coll, scope);
@@ -6703,6 +6750,26 @@ test "stdlib: an image holding a routine that does not verify is refused, not lo
     try testing.expect(std.mem.readInt(u32, bytes[at..][0..4], .little) > 0);
     at += 4;
     bytes[at] |= 1; // the instruction's kind, its low four bits
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try installNatives(rt.loader.registry);
+    try testing.expectError(error.UnfitRoutine, image_mod.load(&rt.v, bytes, &embedded));
+}
+
+test "stdlib: an image holding a closure whose cells are not its routine's upvalues is refused" {
+    if (!image_mod.verify_routines) return error.SkipZigTest;
+    // `interpose`'s routine, the last record that names it, made to
+    // take one upvalue more than its closure (the Var's root) carries.
+    const bytes = try testing.allocator.dupe(u8, image);
+    defer testing.allocator.free(bytes);
+    const name = "interpose";
+    var record: [4 + name.len]u8 = undefined;
+    std.mem.writeInt(u32, record[0..4], name.len, .little);
+    @memcpy(record[4..], name);
+    const at = (std.mem.findLast(u8, bytes, &record) orelse return error.TestUnexpectedResult) + record.len + 2 + 2 + 1;
+    const count = std.mem.readInt(u16, bytes[at..][0..2], .little);
+    std.mem.writeInt(u16, bytes[at..][0..2], count + 1, .little);
     var rt: ImageTestRuntime = undefined;
     try rt.init();
     defer rt.deinit();

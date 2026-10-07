@@ -1109,6 +1109,14 @@ pub const SeqIter = struct {
         string: std.unicode.Utf8Iterator,
     },
     roots: ?vm_mod.RootScope = null,
+    /// The root-stack slot that keeps the walk's place, for a native
+    /// that consumes the collection it walks (`NativeFn.consumes`,
+    /// docs/GC.md §11.5): it holds the collection, and a lazy seq's
+    /// walk moves it to each block of the chain as it leaves the one
+    /// before, so the blocks behind are garbage while the walk goes on.
+    /// The slot reaches every element still to come and the chunk being
+    /// handed out.
+    cursor: ?usize = null,
     /// The element `nextChunk` hands out alone.
     one: [1]Value = undefined,
 
@@ -1209,6 +1217,9 @@ pub const SeqIter = struct {
                 return fixnum(x);
             },
             .lazy => |*c| while (true) {
+                // Entering the block after the chunk handed out last:
+                // the place moves on before the block can be forced.
+                if (self.cursor) |slot| self.vm.roots.items[slot] = c.rest;
                 return c.next() catch {
                     _ = try force(self.vm, c.pending());
                     continue;

@@ -841,8 +841,9 @@ pub const verify_routines = std.debug.runtime_safety;
 /// Nothing in it reaches a safe point, so nothing it builds needs
 /// rooting until the Vars hold it. Its closures are made before the
 /// routines they run are read, so each routine is verified once the
-/// image is whole (`verify_routines`), and one that does not verify
-/// fails the load with `UnfitRoutine`. Returns what the boot
+/// image is whole (`verify_routines`), and one that does not verify,
+/// or a closure whose cells are not one for each upvalue of its
+/// routine, fails the load with `UnfitRoutine`. Returns what the boot
 /// generated, for the caller to advance its counters by.
 pub fn load(vm: *VM, bytes: []const u8, sources: []const Source) LoadError!Counted {
     var scratch: std.heap.ArenaAllocator = .init(vm.allocator);
@@ -897,10 +898,18 @@ const Loader = struct {
         try l.readAliases();
         try l.readImpls();
         if (l.in.pos != l.in.bytes.len) return error.Corrupt;
-        if (verify_routines) for (l.routines) |*r| {
-            var failure: vm_mod.VerifyFailure = undefined;
-            r.verifyAlone(&failure) catch return error.UnfitRoutine;
-        };
+        if (verify_routines) {
+            for (l.routines) |*r| {
+                var failure: vm_mod.VerifyFailure = undefined;
+                r.verifyAlone(&failure) catch return error.UnfitRoutine;
+            }
+            // A call trusts a closure to carry a cell for each upvalue
+            // of its routine (docs/VM.md §6).
+            for (l.objects) |o| if (o.kind() == .function) {
+                const closure = VM.asClosure(o);
+                if (closure.upvalues.len != closure.routine.upvalue_count) return error.UnfitRoutine;
+            };
+        }
         return counted;
     }
 

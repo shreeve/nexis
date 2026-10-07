@@ -244,7 +244,9 @@ are equal, and a keyword or fixnum key never reaches the callback.
 
 `mapGet` returns `MapLookup`, a union of `absent` and `present: Value`,
 not `?Value`: nil is a legal map value, and absence is ordinary flow,
-not a contract violation. `setContains` returns a bool. The stdlib
+not a contract violation. `setContains` returns a bool; `setGet`
+returns the element the set holds equal to the one asked for (which
+may differ from it, a list for a vector), or null. The stdlib
 natives map `absent` to nil or the caller's default.
 
 ---
@@ -287,7 +289,7 @@ Interior and collision nodes cache nothing.
 | `mapFromEntries(heap, entries, eh, ee)` | `setFromElements(heap, elems, eh, ee)` | §8.1 |
 | `mapAssoc(heap, m, k, v, eh, ee)` | `setConj(heap, s, e, eh, ee)` | §8.1 |
 | `mapDissoc(heap, m, k, eh, ee)` | `setDisj(heap, s, e, eh, ee)` | §8.1 |
-| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool` | §6.6 |
+| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool`, `setGet(s, e, eh, ee) ?Value` | §6.6 |
 | `mapFind(m, k, eh, ee) ?Entry` | | The stored entry, its key as the map holds it (`find`) |
 | `mapCount(m)`, `mapIter(m)` → `MapIter` | `setCount(s)`, `setIter(s)` → `SetIter` | `next()` gives `?Entry` / `?Value` in iteration order (§8.1) |
 | `hashMap(h, eh)` | `hashSet(h, eh)` | §7 |
