@@ -1492,6 +1492,10 @@ const List = struct {
     }
 };
 
+/// A run `[lo, hi)` of non-spacing marks whose base character is (or
+/// is not) a letter or digit, for `\b`.
+pub const Marks = struct { lo: usize = 1, hi: usize = 0, base: bool = false };
+
 /// The scratch space of searches with one program, reused across them.
 pub const Vm = struct {
     prog: *const Program,
@@ -1503,10 +1507,12 @@ pub const Vm = struct {
     stack: []Frame,
     /// The slots of the last match.
     best: []usize,
-    /// A run `[lo, hi)` of non-spacing marks whose base character is
-    /// (or is not) a letter or digit, for `\b`.
-    marks: struct { lo: usize = 1, hi: usize = 0, base: bool = false } = .{},
-    /// Closure steps, counted in tests to pin the linear bound.
+    /// The `\b` cache of the input `marks_of`, kept across its
+    /// searches so a find loop walks back over a run of marks once.
+    marks: Marks = .{},
+    marks_of: []const u8 = &.{},
+    /// Closure steps and steps back over marks, counted in tests to
+    /// pin the linear bound.
     visits: u64 = 0,
 
     /// `groups`: record every group, else only the whole match.
@@ -1554,7 +1560,10 @@ pub const Vm = struct {
             vm.best[1] = vm.best[0] + lit.len;
             return true;
         }
-        vm.marks = .{};
+        if (vm.marks_of.ptr != hay.ptr or vm.marks_of.len != hay.len) {
+            vm.marks = .{};
+            vm.marks_of = hay;
+        }
         const k = vm.k;
         var clist = &vm.lists[0];
         var nlist = &vm.lists[1];
@@ -1725,6 +1734,7 @@ pub const Vm = struct {
         var q = at;
         var base = false;
         while (q > 0) {
+            if (builtin.is_test) vm.visits += 1;
             const s = prevStart(hay, q);
             if (m.lo <= s and s < m.hi) {
                 base = m.base;
@@ -1861,8 +1871,13 @@ pub const MatcherBox = extern struct {
     next: u64,
     /// The end of the last match, where `\G` holds.
     last_end: u64,
+    /// The `\b` cache of the input (`Marks`), carried from one
+    /// `re-find` to the next.
+    marks_lo: u64 = 1,
+    marks_hi: u64 = 0,
     state: State,
-    _pad: [7]u8 = @splat(0),
+    marks_base: bool = false,
+    _pad: [6]u8 = @splat(0),
 
     pub const State = enum(u8) { fresh, matched, failed };
 };
@@ -1896,12 +1911,21 @@ pub fn matcherFind(gpa: Allocator, v: Value) Allocator.Error!bool {
     if (b.state == .failed) return false;
     var vm: Vm = try .init(gpa, programOf(b.pattern), true);
     defer vm.deinit(gpa);
-    var f: Finder = .{ .vm = &vm, .hay = string.asBytes(b.input), .next = b.next, .last_end = b.last_end };
-    if (!f.find()) {
+    const hay = string.asBytes(b.input);
+    vm.marks = .{ .lo = b.marks_lo, .hi = b.marks_hi, .base = b.marks_base };
+    vm.marks_of = hay;
+    var f: Finder = .{ .vm = &vm, .hay = hay, .next = b.next, .last_end = b.last_end };
+    const found = f.find();
+    b.marks_lo = vm.marks.lo;
+    b.marks_hi = vm.marks.hi;
+    b.marks_base = vm.marks.base;
+    if (!found) {
         b.state = .failed;
         return false;
     }
-    b.* = .{ .pattern = b.pattern, .input = b.input, .next = f.next, .last_end = f.last_end, .state = .matched };
+    b.next = f.next;
+    b.last_end = f.last_end;
+    b.state = .matched;
     const slots = matcherSlots(v);
     for (0..slots.len / 2) |g| {
         const span = vm.group(g) orelse .{ none, none };
@@ -2369,6 +2393,40 @@ test "regex: a search adds each instruction at most once per position" {
         _ = vm.exec(hay, 0, 0, false);
         try testing.expect(vm.visits <= prog.insts.len * (n + 1));
     }
+}
+
+test "regex: \\b and \\B walk back over a run of marks once in a find loop" {
+    const gpa = testing.allocator;
+    const n = 4000;
+    const hay = try gpa.alloc(u8, 1 + 2 * n);
+    defer gpa.free(hay);
+    hay[0] = 'a';
+    for (0..n) |i| @memcpy(hay[1 + 2 * i ..][0..2], "\u{301}");
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for ([_]struct { []const u8, usize }{ .{ "\\B", n }, .{ "\\b", 2 } }) |case| {
+        const prog = (try compile(arena.allocator(), case[0], .{})).ok;
+        var vm: Vm = try .init(gpa, &prog, false);
+        defer vm.deinit(gpa);
+        var f: Finder = .{ .vm = &vm, .hay = hay };
+        var found: usize = 0;
+        while (f.find()) found += 1;
+        try testing.expectEqual(case[1], found);
+        try testing.expect(vm.visits <= 8 * hay.len);
+    }
+}
+
+test "regex: a matcher carries the \\b cache from one find to the next" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const pattern = (try make(&heap, testing.allocator, "\\B")).ok;
+    const m = try makeMatcher(&heap, pattern, try string.fromBytes(&heap, "a\u{301}\u{301}\u{301}"));
+    for ([_]usize{ 1, 3, 5 }) |at| {
+        try testing.expect(try matcherFind(testing.allocator, m));
+        try testing.expectEqual(at, matcherGroup(m, 0).?[0]);
+        try testing.expectEqual(@as(u64, 1), matcherBox(m).marks_lo);
+    }
+    try testing.expect(!try matcherFind(testing.allocator, m));
 }
 
 test "regex: prefilters and anchors find what the VM alone finds" {

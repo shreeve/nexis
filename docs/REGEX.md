@@ -222,8 +222,10 @@ before the search's start. Line terminators are `\n`, `\r`, `\r\n`
 | `\b`, `\B` | the code points on either side differ (agree) in being word characters: ASCII `[A-Za-z0-9_]`, or a non-spacing mark whose base character is a letter or digit (Java's `Bound`) |
 | `\G` | `pos` is where the previous match ended (the search's start for the first) |
 
-The base of a run of non-spacing marks is found once per run, so
-`\b` stays linear on a long run of marks.
+The base of a run of non-spacing marks is found once per run, and
+the run is kept across the searches of one input (a find loop, and
+a matcher's `re-find` calls), so `\b` stays linear on a long run of
+marks.
 
 #### 3.5 The find loop
 
@@ -359,9 +361,10 @@ the collector treats it as a leaf, and the sweep frees it as it frees
 a string. A pattern is immutable.
 
 **`matcher` (45)**, the search state of `re-matcher`:
-`MatcherBox{pattern, input, next, last_end, state}` followed by two
-slots per group and two for the whole match, the spans of the last
-match (`none` for a group that did not take part). `re-find` on a
+`MatcherBox{pattern, input, next, last_end, marks, state}` followed
+by two slots per group and two for the whole match, the spans of the
+last match (`none` for a group that did not take part); `marks` is
+the `\b` cache of §3.4. `re-find` on a
 matcher runs `Finder.find` from `next` with `\G` at `last_end` and
 writes the result back into the block; `pattern` and `input` never
 change, so the update needs no barrier. A search that fails leaves the
