@@ -583,6 +583,12 @@ const Parser = struct {
         return p.fail(at, try p.arena.print(fmt, args));
     }
 
+    /// The code point before `cursor`: where Java reports most of its
+    /// errors, its index being one less than its cursor.
+    fn before(p: *const Parser, cursor: usize) usize {
+        return if (cursor == 0) 0 else prevStart(p.src, cursor);
+    }
+
     fn node(p: *Parser, n: Node) Fail!*Node {
         const r = try p.arena.create(Node);
         r.* = n;
@@ -689,7 +695,7 @@ const Parser = struct {
 
     fn parse(p: *Parser) Fail!*Node {
         const root = try p.alternation();
-        if (p.peek() != null) return p.fail(p.pos, "Unmatched closing ')'");
+        if (p.peek() != null) return p.fail(p.before(p.pos), "Unmatched closing ')'");
         return root;
     }
 
@@ -729,7 +735,11 @@ const Parser = struct {
                         (if (p.flags.m) .dollar_unix_m else .dollar_unix)
                     else if (p.flags.m) .dollar_m else .dollar });
                 },
-                '*', '+', '?' => return p.failf(p.pos + 1, "Dangling meta character '{c}'", .{@as(u8, @intCast(c))}),
+                '*', '+', '?' => {
+                    p.pos += 1;
+                    p.skipSpace();
+                    return p.failf(p.before(p.pos), "Dangling meta character '{c}'", .{@as(u8, @intCast(c))});
+                },
                 // Java reads an empty atom here, which a valid bound repeats.
                 '{' => try p.node(.empty),
                 else => try p.run(),
@@ -839,7 +849,7 @@ const Parser = struct {
             'x' => return .{ .lit = try p.hex() },
             'u' => return .{ .lit = try p.unicode() },
             'c' => {
-                if (p.pos >= p.src.len) return p.fail(p.pos, "Illegal control escape sequence");
+                if (p.pos >= p.src.len) return p.fail(p.before(p.pos), "Illegal control escape sequence");
                 const d = decode(p.src, p.pos);
                 p.pos += d.len;
                 return .{ .lit = d.c ^ 64 };
@@ -855,7 +865,7 @@ const Parser = struct {
             'H' => try complement(p.arena, &sets.hspace),
             'V' => try complement(p.arena, &sets.vspace),
             else => if (cp.c < 0x80 and std.ascii.isAlphanumeric(@intCast(cp.c)))
-                return p.fail(at, "Illegal/unsupported escape sequence")
+                return p.fail(p.before(p.pos), "Illegal/unsupported escape sequence")
             else
                 return .{ .lit = cp.c },
         };
@@ -891,7 +901,7 @@ const Parser = struct {
         var v: u32 = 0;
         while (p.digit(16)) |d| {
             v = v * 16 + d;
-            if (v > 0x10FFFF) return p.fail(p.pos, "Hexadecimal codepoint is too big");
+            if (v > 0x10FFFF) return p.fail(p.before(p.pos), "Hexadecimal codepoint is too big");
         }
         if (!p.rawIs(p.pos, '}')) return p.fail(p.pos, "Unclosed hexadecimal escape sequence");
         p.pos += 1;
@@ -1045,7 +1055,7 @@ const Parser = struct {
         const name = p.src[start..p.pos];
         if (!p.rawIs(p.pos, '>')) return p.fail(p.pos, "named capturing group is missing trailing '>'");
         p.pos += 1;
-        if (findName(p.names.items, name) != null) return p.failf(p.pos, "Named capturing group <{s}> is already defined", .{name});
+        if (findName(p.names.items, name) != null) return p.failf(p.before(p.pos), "Named capturing group <{s}> is already defined", .{name});
         p.ngroups += 1;
         var head: [8]u8 = undefined;
         std.mem.writeInt(u32, head[0..4], p.ngroups, .little);
@@ -1076,7 +1086,7 @@ const Parser = struct {
             negate = true;
         }
         while (true) {
-            const c = p.peek() orelse return p.fail(at, "Unclosed character class");
+            const c = p.peek() orelse return p.fail(p.before(p.src.len), "Unclosed character class");
             switch (c) {
                 '[' => {
                     p.pos += 1;
@@ -1089,7 +1099,7 @@ const Parser = struct {
                     p.pos += 2;
                     var right: Union = .{};
                     while (true) {
-                        const d = p.peek() orelse return p.fail(at, "Unclosed character class");
+                        const d = p.peek() orelse return p.fail(p.before(p.src.len), "Unclosed character class");
                         if (d == ']' or d == '&') break;
                         const operand = if (d == '[') blk: {
                             p.pos += 1;
@@ -1107,7 +1117,7 @@ const Parser = struct {
                     if (try prev.get(p.arena)) |pv| {
                         prev = .{};
                         try prev.add(p.arena, try intersect(p.arena, pv, curr orelse low));
-                    } else if (right.list != null) prev = right else return p.fail(p.pos, "Bad class syntax");
+                    } else if (right.list != null) prev = right else return p.fail(p.before(p.pos), "Bad class syntax");
                     continue;
                 },
                 ']' => if (prev.list != null or has_bits) {
@@ -1147,10 +1157,10 @@ const Parser = struct {
             if (d == '\\') {
                 switch (try p.escape(true, true)) {
                     .lit => |cp| hi = cp,
-                    else => return p.fail(p.pos, "Illegal character range"),
+                    else => return p.fail(p.before(p.pos), "Illegal character range"),
                 }
             } else p.advance();
-            if (hi < lo) return p.fail(p.pos, "Illegal character range");
+            if (hi < lo) return p.fail(p.before(p.pos), "Illegal character range");
             return .{ .set = try p.foldRange(lo, hi), .bits = false };
         }
         // Java's BitClass takes these unless (?iu) must fold them past Latin-1.
@@ -1216,11 +1226,11 @@ const Parser = struct {
             } else for ([_][]const u8{ "sc", "script", "blk", "block" }) |k| {
                 if (std.ascii.eqlIgnoreCase(key, k)) return p.fail(at, unsupported_property);
             }
-            return p.failf(at, "Unknown Unicode property {{name=<{s}>, value=<{s}>}}", .{ key, value });
+            return p.failf(p.before(p.pos), "Unknown Unicode property {{name=<{s}>, value=<{s}>}}", .{ try std.ascii.allocLowerString(p.arena, key), value });
         }
         if (std.mem.startsWith(u8, name, "In") or std.mem.startsWith(u8, name, "java")) return p.fail(at, unsupported_property);
         if (std.mem.startsWith(u8, name, "Is")) return (try p.categorySet(name[2..])) orelse return p.fail(at, unsupported_property);
-        return (try p.named(name)) orelse return p.failf(at, "Unknown character property name {{{s}}}", .{name});
+        return (try p.named(name)) orelse return p.failf(p.before(p.pos), "Unknown character property name {{{s}}}", .{name});
     }
 
     /// A general category, a POSIX class or `all`, by the names Java's
@@ -2428,7 +2438,7 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
         .{ "\\p{L", "Unclosed character family" },
         .{ "\\pX", "Unknown character property name {X}" },
         .{ "\\p{gc=X}", "Unknown Unicode property {name=<gc>, value=<X>}" },
-        .{ "\\p{foo=L}", "Unknown Unicode property {name=<foo>, value=<L>}" },
+        .{ "\\p{Foo=L}", "Unknown Unicode property {name=<foo>, value=<L>}" },
         .{ "(?<1x>a)", "capturing group name does not start with a Latin letter" },
         .{ "(?<x_y>a)", "named capturing group is missing trailing '>'" },
         .{ "(?<x>a)(?<x>b)", "Named capturing group <x> is already defined" },
@@ -2444,6 +2454,31 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
             return e;
         };
     }
+}
+
+test "regex: a syntax error's offset is the code point Java's index names" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Each index is java.util.regex's, through bb.
+    const cases = [_]struct { []const u8, usize }{
+        .{ "a)", 0 },        .{ "\u{e9})", 0 },         .{ "(?x) a )", 6 },        .{ "*a", 0 },
+        .{ "a**", 2 },       .{ "\u{e9}+?*", 3 },       .{ "(?x) * ", 6 },         .{ "\\c", 1 },
+        .{ "\u{e9}\\c", 2 }, .{ "\\y", 1 },             .{ "[\\y]", 2 },           .{ "\\E", 1 },
+        .{ "[\\A]", 2 },     .{ "\\x{110000}", 8 },     .{ "(?<a>x)(?<a>y)", 11 }, .{ "[^]", 2 },
+        .{ "[a&&", 3 },      .{ "[\u{e9}", 1 },         .{ "[\u{1F600}", 1 },      .{ "[&&]", 2 },
+        .{ "[z-a]", 3 },     .{ "[\u{fc}-\u{e9}]", 3 }, .{ "[z-\\x{61}]", 8 },     .{ "[a-\\d]", 4 },
+        .{ "\\pQ", 2 },      .{ "\\p{Foo}", 6 },        .{ "[\\p{Foo}]", 7 },      .{ "\\p{gc=Foo}", 9 },
+        .{ "\\p{gc=}", 6 },  .{ "(", 1 },               .{ "a{2,1}", 5 },          .{ "\\x{12", 5 },
+        .{ "\\u12", 4 },     .{ "(?<1a>x)", 3 },        .{ "\\p{", 3 },            .{ "x{2147483648}", 11 },
+    };
+    for (cases) |case| {
+        const e = (try compile(arena.allocator(), case[0], .{})).err;
+        testing.expectEqual(case[1], try std.unicode.utf8CountCodepoints(case[0][0..e.offset])) catch |err| {
+            std.debug.print("pattern {s}: {s}\n", .{ case[0], e.msg });
+            return err;
+        };
+    }
+    try testing.expectEqualStrings("Unknown Unicode property {name=<foo>, value=<Bar>}", (try compile(arena.allocator(), "\\p{Foo=Bar}", .{})).err.msg);
 }
 
 fn nested(a: Allocator, open: []const u8, close: []const u8, n: usize) ![]const u8 {

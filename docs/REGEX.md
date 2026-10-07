@@ -407,7 +407,7 @@ fails.
 
 | Name | Arity | Result |
 |---|---|---|
-| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points where the compiler stopped (`catch :invalid-regex` takes it) |
+| `re-pattern` | 1 | The pattern a string compiles to; a pattern is itself. An invalid one throws `{:error :invalid-regex :message M :pattern s :index I}`: the sentence of §2, the string, and the index in code points Java reports for the sentence (Java's is one before its cursor: `a)` and `*a` are 0, `[z-a]` 3, `\p{Foo}` 6), or the start of a construct §2 refuses (`catch :invalid-regex` takes it) |
 | `re-matcher` | 2 | `(re-matcher re s)`: a fresh matcher (§8) |
 | `re-find` | 1–2 | `(re-find m)`: the next match of the matcher, or nil; `(re-find re s)`: the first match of `re` in `s`, or nil |
 | `re-matches` | 2 | The match of the whole of `s` (`Matcher.matches`: `(re-matches #"a\|ab" "ab")` is `"ab"`), or nil |

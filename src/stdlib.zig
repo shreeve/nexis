@@ -4886,8 +4886,8 @@ fn matcherGroup(m: Value, g: usize) ?[2]usize {
 
 /// `(re-pattern s)` → the pattern `s` compiles to, or `s` itself when
 /// it is a pattern. A syntax error throws `{:error :invalid-regex
-/// :message M :pattern s :index I}`, `I` counting code points as
-/// Java's index counts chars.
+/// :message M :pattern s :index I}`, `I` the code-point index Java's
+/// `PatternSyntaxException` reports (docs/REGEX.md §9).
 fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .regex) return args[0];
     const source = try utf8Arg(args[0]);
