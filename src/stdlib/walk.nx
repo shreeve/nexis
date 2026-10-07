@@ -4,14 +4,16 @@
 ; before test.nx, whose `are` substitutes through postwalk-replace.
 
 ; (walk inner outer form) → outer of form with inner applied to each
-; of its elements, rebuilt in form's kind: a list (seqs are lists)
-; keeps its metadata, a record its type, any other collection is
-; poured into (empty form), so a sorted one keeps its comparator and
+; of its elements, rebuilt in form's kind: a list stays a list and any
+; other seq (a lazy seq, a range, a cons) a realized seq, in order and
+; with form's metadata; a record keeps its type; any other collection
+; is poured into (empty form), so a sorted one keeps its comparator and
 ; metadata stays. A map's elements are its [k v] entries. Anything
 ; else, a typed vector included, is a leaf: (outer form).
 (defn walk [inner outer form]
   (cond
     (list? form) (outer (with-meta (apply list (map inner form)) (meta form)))
+    (seq? form) (outer (with-meta (doall (map inner form)) (meta form)))
     (record? form) (outer (reduce (fn [r x] (conj r (inner x))) form form))
     (coll? form) (outer (into (empty form) (map inner form)))
     :else (outer form)))

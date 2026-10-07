@@ -48,7 +48,12 @@ reports, every store file a commit left unsynced is synced once first
 **A closed pipe.** When what reads the command's stdout closes it (`nexis
 -e '(range 100000)' | head`), the value, disassembly, usage text or
 prompt being written goes nowhere and the command ends there, with no
-report and exit 0, as a JVM Clojure program's does.
+report and exit 0, as a JVM Clojure program's does. So does a program
+whose `print`, `println`, `pr`, `prn` or `printf` writes into the
+closed pipe (`nexis -e '(dotimes [i 100000] (println i))' | head -1`):
+it ends at that write, every store a commit left unsynced synced
+first. A JVM program's `System.out` swallows the error and runs on to
+its end; nexis stops, so a program printing an endless seq ends too.
 
 **The runtime's stack.** The runtime runs on a thread with a 1 GiB
 stack reservation, committed only as it is touched (`docs/VM.md`
@@ -388,9 +393,9 @@ pins the layout.
 | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp`, `expm1`, `log`, `log10`, `log1p`, `cbrt`, `hypot` | Java's `Math` method of the name over doubles, a float for any number; NaN and the infinities as IEEE and Java give them, never an error (`(log 0)` is `##-Inf`, `(asin 2)` `##NaN`, `(hypot ##Inf ##NaN)` `##Inf`). The results are the platform library's (Zig's `std.math` and the C library's `sin`, `cos`, `tan`, `exp`, `log`, `log10`), within an ulp of Java's, which leaves the last bit to the implementation too: `(log 3)` is `1.0986122886681098` here and `1.0986122886681096` on the JVM |
 | `signum` | `-1.0`, `1.0`, or a zero or NaN itself, as `Math/signum` |
 | `to-radians`, `to-degrees` | one multiplication by Java's constant, so Java's result to the bit: `(to-degrees PI)` is `180.0` |
-| `floor-div`, `floor-mod` | `Math/floorDiv` and `Math/floorMod` of the arguments as longs (a float truncated, as Clojure casts it): the quotient toward negative infinity and the remainder with the divisor's sign; any integer size; a zero divisor is `:divide-by-zero` |
+| `floor-div`, `floor-mod` | `Math/floorDiv` and `Math/floorMod` of the arguments as longs (a float truncated, as Clojure casts it): the quotient toward negative infinity and the remainder with the divisor's sign; any integer size, a quotient past the long range a bignum (`(floor-div Long/MIN_VALUE -1)` is `9223372036854775808`; SEMANTICS.md §2.2); a zero divisor is `:divide-by-zero` |
 | `floor`, `ceil` | an integer unchanged; a float's floor or ceiling as a float: `(floor 2.7)` is `2.0` |
-| `round` | an integer unchanged; a float's nearest integer, halves up, as a fixnum or bignum, as Java's `Math/round`: `(round 2.5)` is `3`, `(round -2.5)` is `-2`, `(round 0.49999999999999994)` is `0`; NaN and the infinities are `:invalid-argument` |
+| `round` | an integer unchanged; a float's nearest integer, halves up, as a fixnum or bignum, as Java's `Math/round`: `(round 2.5)` is `3`, `(round -2.5)` is `-2`, `(round 0.49999999999999994)` is `0`; NaN is `0`, and a float past the long range, an infinity included, is `Long/MAX_VALUE` or `Long/MIN_VALUE` |
 | `PI`, `E` | the doubles |
 
 `abs` is `nexis.core/abs`. Absent from `clojure.math`: `rint`,

@@ -273,7 +273,7 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     // Every Var knows its name and namespace, and a defn its arglists.
     try expectOutputProgram("(defn plain [x] x) (meta (var plain))", "{:arglists ([x]), :name plain, :ns user}");
     try expectOutputProgram("(def x 1) [(:name (meta #'x)) (:ns (meta #'x))]", "[x user]");
-    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns])", "{:name mm, :ns my.app}");
+    try expectOutputProgram("(ns my.app) (defmacro mm [x] x) (select-keys (meta #'mm) [:name :ns :macro])", "{:name mm, :ns my.app, :macro true}");
     // A name qualified with the current namespace is the name itself.
     try expectOutputProgram("(def user/qq 1) (defn user/ff [] 2) [qq (ff) (:name (meta #'qq))]", "[1 2 qq]");
     // def and defmacro take the same spellings.
@@ -717,6 +717,9 @@ test "try: a class that names a nexis error catches that error alone, as in Cloj
     try expectOutput("(try (case 3 1 :one) (catch IllegalArgumentException e :iae))", ":iae");
     try expectOutput("(try (throw :other) (catch ArithmeticException e :ae) (catch Throwable e [:t e]))", "[:t :other]");
     try expectOutput("(try (try (/ 1 0) (catch ClassCastException e :cce)) (catch any e e))", ":divide-by-zero");
+    // Calling a value that is no function is a ClassCastException in
+    // Clojure; an overflow an ArithmeticException.
+    try expectOutput("[(try (1 2) (catch ClassCastException e :cce)) (try (bit-and 1 10000000000000000000) (catch ArithmeticException e :ae))]", "[:cce :ae]");
 }
 
 test "fn: a :pre/:post condition map checks arguments and the result" {
@@ -1260,6 +1263,10 @@ test "destructuring: every map pattern takes a seq as keyword arguments, as Cloj
     try expectOutput("(do (defn g [& opts] (let [{:keys [a]} opts] a)) (g :a 1))", "1");
     try expectOutput("(do (defn h [{:keys [a]}] a) (h '(:a 1)))", "1");
     try expectOutput("(let [{:keys [a] :as m} (list {:a 4})] [a m])", "[4 {:a 4}]");
+    // Any seq, a lazy one included, as Clojure 1.12's destructure takes it.
+    try expectOutput("(let [{:keys [a] :as m} (map identity [:a 1])] [a m])", "[1 {:a 1}]");
+    try expectOutput("[(let [{:keys [a b]} (filter some? [:a nil 1 :b 2])] [a b]) (let [{:keys [a b]} (concat [:a 1] [:b 2])] [a b]) (let [{:keys [a]} (map identity [{:a 3}])] a) (let [{:as m} (filter some? [nil])] m)]", "[[1 2] [1 2] 3 {}]");
+    try expectOutput("(try (let [{:keys [a]} (map identity [:a 1 :b])] a) (catch any e e))", ":invalid-argument");
     // A vector is not a seq: its map pattern looks it up by index.
     try expectOutput("(let [{a 1} [:x :y]] a)", ":y");
 }
@@ -1409,6 +1416,20 @@ test "ns: a clause it refuses leaves the current namespace as it was" {
     defer program.deinit();
     try testing.expectError(error.MacroExpansionFailure, program.run("(ns elsewhere (:import [java.util Date]))"));
     try testing.expectEqualStrings("user", program.registry.current.name);
+    // A clause's options and specs are checked before the switch too.
+    for ([_][]const u8{
+        "(ns bar (:refer-clojure :only [map]))",
+        "(ns bar (:refer-clojure :exclude [map] :rename {}))",
+        "(ns baz (:require [x :bogus 1]))",
+        "(ns baz (:require [x :refer y]))",
+        "(ns baz (:require [x :refer [1]]))",
+        "(ns baz (:require [x :as]))",
+        "(ns baz (:require \"x\"))",
+        "(ns baz (:require (pre [a.b])))",
+    }) |src| {
+        try testing.expectError(error.MacroExpansionFailure, program.run(src));
+        try testing.expectEqualStrings("user", program.registry.current.name);
+    }
 }
 
 test "integration: defn in a namespace + qualified call" {
@@ -1655,6 +1676,18 @@ test "core: var-get, find-var, load-string" {
     , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
 }
 
+test "core: load-string reads and evaluates a form at a time, and leaves the namespace as it found it" {
+    // As Clojure's Compiler.load binds *ns*: a namespace the text
+    // switches to is left when it returns or throws.
+    try expectLoaded("(load-string \"(ns foo) (def inner 1)\") (def q 1) [(resolve 'foo/inner) (resolve 'user/q) *ns*]", "[#'foo/inner #'user/q user]");
+    try expectLoaded("(try (load-string \"(ns foo2) (throw :x)\") (catch :x e e)) (def q 1) [(resolve 'user/q) *ns*]", "[#'user/q user]");
+    // The forms before a stray delimiter or an unfinished form run.
+    try expectLoaded("[(try (load-string \"(def zz 1)) (def yy 2\") (catch :reader-error e :reader-error)) (resolve 'user/zz) (resolve 'user/yy)]", "[:reader-error #'user/zz nil]");
+    try expectLoaded("[(try (load-string \"(def aa 1) (def bb\") (catch :reader-error e :reader-error)) (resolve 'user/aa)]", "[:reader-error #'user/aa]");
+    // A form sees the definitions and macros of the forms before it.
+    try expectLoaded("(load-string \"(defmacro twice [x] (list '* 2 x)) #_(skipped) (def t (twice 4)) ; done\") t", "8");
+}
+
 test "core: partitionv, partitionv-all, splitv-at" {
     try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
     try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
@@ -1897,6 +1930,8 @@ test "vars: with-redefs sets roots for its body and restores them on every exit"
     try expectOutputProgram("(defn f [] :f) [(try (with-redefs [f (fn [] :r)] (throw :boom)) (catch any e e)) (f)]", "[:boom :f]");
     try expectOutputProgram("(def x 1) [(with-redefs-fn {#'x 5} (fn [] x)) x]", "[5 1]");
     try expectOutput("(with-redefs [rand-int (constantly 4)] (rand-int 100))", "4");
+    // An unbound Var is unbound again afterwards, as Clojure restores its Unbound root.
+    try expectOutputProgram("(declare u) [(with-redefs [u (fn [] :r)] (u)) (bound? #'u) (try (u) (catch any e e)) (try (with-redefs-fn {#'u 1} (fn [] (throw :t))) (catch any e e)) (bound? #'u)]", "[:r false :unbound-var :t false]");
 }
 
 test "vars: *ns* is the current namespace's name symbol where a form is compiled and run; flush is a no-op" {
@@ -3269,6 +3304,8 @@ test "atom: the :meta option, and reset-meta! and alter-meta! on an atom" {
     // in Clojure; a key with no value is :invalid-argument.
     try expectOutput("(let [a (atom 1 :foo 2 :validator odd? :meta {:a 1})] [@a (meta a) (try (swap! a inc) (catch any e e))])", "[1 {:a 1} :invalid-reference-state]");
     try expectOutput("[(try (atom 1 :validator) (catch any e e)) (try (atom 1 :meta 5) (catch any e e))]", "[:invalid-argument :kind-mismatch]");
+    // Any map, a sorted one included, as with-meta takes.
+    try expectOutput("(let [a (atom 1 :meta (sorted-map :b 2 :a 1))] [(meta a) (sorted? (meta a)) (reset-meta! a (sorted-map :z 1)) (meta a)])", "[{:a 1, :b 2} true {:z 1} {:z 1}]");
 }
 
 test "atom: the values a validator and the watches see stay alive across their calls" {
@@ -3697,6 +3734,23 @@ test "db: a callback cannot finish the transaction db/alter! or db/reduce-tree i
     , "[:db/busy :db/busy 1 [1 2] [:db/busy 300 nil] [:db/busy true nil false]]");
 }
 
+test "db/put!: the lazy value it realizes cannot finish or close the transaction it writes in" {
+    try expectOutputProgramWithStore("put-held",
+        \\(do
+        \\  (def c (db/open "@STORE@"))
+        \\  (def r (db/ref c :t "k"))
+        \\  (def tx (db/begin-write c))
+        \\  [(try (db/put! tx r (lazy-seq (db/close c) [1])) (catch any e e))
+        \\   (try (db/put! tx r (lazy-seq (db/commit! tx) [2])) (catch any e e))
+        \\   (try (db/put! tx r (lazy-seq (db/abort-write! tx) [3])) (catch any e e))
+        \\   (db/put! tx r (lazy-seq [4]))
+        \\   (db/commit! tx)
+        \\   (db/get-key r)
+        \\   (try (db/put! tx r (lazy-seq [5])) (catch any e e))
+        \\   (db/close c)])
+    , "[:db/busy :db/busy :db/busy nil nil (4) :tx-closed nil]");
+}
+
 test "db/close: a stale ref never reaches a store opened after the close" {
     var a = try SeamStore.init("stale-a");
     defer a.deinit();
@@ -3970,10 +4024,10 @@ test "nexis.string: split: empty delim and non-string args" {
 
 test "nexis.string: escape and replace-first, with a literal match" {
     try expectOutput(
-        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {})
+        \\(pr-str [(nexis.string/escape "a<b>&" {\< "&lt;" \> "&gt;"}) (nexis.string/escape "abc" {\b 1}) (nexis.string/escape "" {}) (nexis.string/escape "ab" {\a false \b nil})
         \\         (nexis.string/replace-first "a-b-c" "-" "+") (nexis.string/replace-first "abc" \b \x) (nexis.string/replace-first "abc" "z" "y")
         \\         (nexis.string/replace-first "abc" "" "-") (nexis.string/replace-first "héllo" "l" "L")])
-    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
+    , "[\"a&lt;b&gt;&\" \"a1c\" \"\" \"ab\" \"a+b-c\" \"axc\" \"abc\" \"-abc\" \"héLlo\"]");
 }
 
 test "nexis.string: split: returns a vector" {
@@ -4878,6 +4932,26 @@ test "extend-protocol and extend-type: nil and Clojure class names, as Clojure c
         \\[(hi nil) (hi "a") (hi 1) (hi 100000000000000000000) (hi [1]) (hi true) (hi false) (hi :k)]
     , "[:nil [:s a] [:n 1] [:n 100000000000000000000] :v [:b true] [:b false] :obj]");
     try expectOutputProgram("(defprotocol Q (q [x])) (extend-type nil Q (q [_] :none)) (q nil)", ":none");
+    // Every seq is an ISeq, a lazy seq and a range included; an
+    // IPersistentList is a list only, as in Clojure.
+    try expectOutputProgram(
+        \\(defprotocol S (f [x]) (g [x]))
+        \\(extend-protocol S
+        \\  clojure.lang.ISeq (f [_] :seq)
+        \\  IPersistentList (g [_] :list)
+        \\  Object (f [_] :obj) (g [_] :obj))
+        \\[(f (list 1)) (f (map inc [1 2])) (f (range 3)) (f (cons 0 (map inc [1]))) (f [1]) (g (list 1)) (g (map inc [1]))]
+    , "[:seq :seq :seq :seq :obj :list :obj]");
+    // A record the program defines is its name's meaning, though the
+    // name is a class's too.
+    try expectOutputProgram(
+        \\(defprotocol P (f [x]))
+        \\(defrecord Symbol [n])
+        \\(defrecord Var [n])
+        \\(extend-type Symbol P (f [_] :symbol-record))
+        \\(extend-protocol P Var (f [_] :var-record) Keyword (f [_] :keyword))
+        \\[(f (->Symbol 1)) (f (->Var 1)) (f :k) (try (f 'a) (catch any e e)) (try (f #'f) (catch any e e))]
+    , "[:symbol-record :var-record :keyword :no-protocol-impl :no-protocol-impl]");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
     try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
@@ -6568,6 +6642,21 @@ test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
 }
 
+/// A callee whose fn-level `recur` walks off its argument: once its
+/// slot holds the rest, nothing in the callee reaches the head.
+const walk_off = "(defn walk-off [xs] (if (and (seq? xs) (seq xs)) (do (churn 1) (recur (rest xs))) true)) ";
+
+test "gc: what a native passes a callee that recurs over its parameter stays rooted by the native" {
+    // GC.md §11.5: the validator drops `swap!`'s new state from its slot.
+    try expectOutputUnderGc(churn ++ walk_off ++ "(let [a (atom nil)] (set-validator! a walk-off) (swap! a (fn [_] (list (str \"a\") (str \"b\") (str \"c\")))) (churn 2) @a)", "(a b c)");
+    // The first watch drops the old state; the second reads it.
+    try expectOutputUnderGc(churn ++ "(let [a (atom (list (str \"a\") (str \"b\"))) seen (atom nil)] (add-watch a :w1 (fn [k r o n] (if (and (seq? o) (seq o)) (do (churn 1) (recur k r (rest o) n)) nil))) (add-watch a :w2 (fn [k r o n] (churn 3) (reset! seen o))) (reset! a :next) (churn 4) @seen)", "(a b)");
+    try expectOutputUnderGc(churn ++ "(let [a (atom (list (str \"a\") (str \"b\")))] (add-watch a :w (fn [k r o n] (if (and (seq? o) (seq o)) (do (churn 1) (recur k r (rest o) n)) nil))) (let [p (swap-vals! a (constantly :new))] (churn 2) (first p)))", "(a b)");
+    // A map's entries are built by the walk: the native keeps each.
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (filterv (fn [e] (if (vector? e) (do (churn 1) (recur 0)) true)) m)] (churn 2) [(count r) (reduce + (map key r))])", "[40 780]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [g (group-by (fn [e] (if (vector? e) (do (churn 1) (recur 0)) :k)) m)] (churn 2) [(count (:k g)) (reduce + (map key (:k g)))])", "[40 780]");
+}
+
 test "gc: db/reduce-tree and db/alter! survive cycles inside their callbacks" {
     var store = try SeamStore.init("gc-reduce-tree");
     defer store.deinit();
@@ -6900,6 +6989,15 @@ test "ns: (:refer-clojure :exclude [names]) leaves those names to the namespace"
     try expectMacroFailure("", "(ns ex (:refer-clojure :exclude inc))", "ns: :exclude takes a vector of symbols, not a symbol", "inc");
 }
 
+test "ns: a name :exclude leaves to the namespace may be referred from another, as in Clojure" {
+    const lib = [2][]const u8{ "lib.nx", "(ns lib (:refer-clojure :exclude [+ when]))\n(defn + [a b] (str a b))\n(defmacro when [t x] `(if ~t [:lib ~x]))\n" };
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+ when]) (:require [lib :refer [+ when]])) [(+ 1 2) (when true 3) (nexis.core/+ 1 2)]", "[12 [:lib 3] 3]");
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+])) (require '[lib :refer :all]) (+ 1 2)", "12");
+    // A Var the namespace defined is still its own: a referral of the
+    // name is refused.
+    try expectOutputWithFiles(&.{lib}, "(ns app (:refer-clojure :exclude [+])) (defn + [a b] [a b]) (try (eval '(require '[lib :refer [+]])) (catch any e :refused)) (+ 1 2)", "[1 2]");
+}
+
 test "ns and require: :require clauses, :as, :refer, :refer :all, :rename, flags" {
     try expectOutputWithFiles(&.{utilns},
         \\(ns my.app "An app." {:author "me"}
@@ -7114,6 +7212,14 @@ test "walk: nexis.walk is Clojure's clojure.walk; records and sorted collections
     try expectOutput("(let [l (atom [])] (nexis.walk/postwalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[:a 1 [1] [:a [1]] {:a [1]}]");
     try expectOutput("(let [l (atom [])] (nexis.walk/prewalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[{:a [1]} [:a [1]] :a [1] 1]");
     try expectOutput("(nexis.walk/macroexpand-all '(when a (-> b c)))", "(if a (do (c b)) nil)");
+    // A seq that is not a list (a lazy seq, a range, a cons onto one)
+    // keeps its order and its metadata, as Clojure's seq? arm keeps them.
+    try expectOutput(
+        \\[(nexis.walk/postwalk identity (map inc [1 2 3])) (nexis.walk/postwalk identity (range 3))
+        \\ (nexis.walk/postwalk identity (cons 1 (map inc [1 2]))) (nexis.walk/keywordize-keys (map identity [{"a" 1} {"b" 2}]))
+        \\ (nexis.walk/postwalk-replace {:a 1} (map identity [:a :b :c])) (nexis.walk/prewalk (fn [x] (if (= x [:a]) (map identity [1 2 3]) x)) [[:a]])
+        \\ (meta (nexis.walk/postwalk identity (with-meta (map inc [1]) {:m 1}))) (seq? (nexis.walk/postwalk identity (map inc [1])))]
+    , "[(2 3 4) (0 1 2) (1 2 3) ({:a 1} {:b 2}) (1 :b :c) [(1 2 3)] {:m 1} true]");
 }
 
 test "require: the clojure.* library names reach the nexis namespaces" {

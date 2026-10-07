@@ -155,8 +155,10 @@ one per element actually decoded: nested headers that each claim the
 rest of the input cost nothing until the input runs out. A complete
 container is built from its elements in one pass: a vector, and a list
 of four or more as a view of one (`docs/LIST.md` §1), bottom up; a map
-or set by `champ.mapFromEntries`/`setFromElements`, each node
-allocated once; a typed vector straight from its bytes.
+or set past an array form's size (`champ.array_map_max`) by
+`champ.mapFromEntries`/`setFromElements`, each node allocated once,
+and a smaller one by a fold of `assoc`/`conj`, which hashes no key; a
+typed vector straight from its bytes.
 
 #### 2.8 Sorted maps and sets
 

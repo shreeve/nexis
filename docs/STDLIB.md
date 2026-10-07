@@ -162,7 +162,7 @@ string function panics on one.
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity; NaN for `long`) |
+| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |
@@ -264,8 +264,9 @@ are absent.
 
 **`nexis.walk`** is Clojure's `clojure.walk`, written in
 `src/stdlib/walk.nx`. `walk` rebuilds a form in its own kind: a list
-(every seq is a list, SEMANTICS.md §4) as a list with the form's
-metadata, a record by `conj`ing its walked entries onto it, so it
+as a list and any other seq (a lazy seq, a range, a cons) as a
+realized seq, each in order and with the form's metadata, as
+Clojure's `seq?` arm keeps them; a record by `conj`ing its walked entries onto it, so it
 keeps its type, and any other collection by pouring the walked
 elements `into` `(empty form)`, so a sorted collection keeps its
 comparator and every collection its metadata. A map's elements are
@@ -286,9 +287,10 @@ VM's frames, so a form nested past the frame cap is a catchable
 `postwalk-demo` and `prewalk-demo` are absent.
 
 **`nexis.edn`** is Clojure's `clojure.edn`, in `src/stdlib/edn.nx`:
-`(read-string s)` and `(read-string opts s)` are `nexis.core`'s
-`read-string` with `{:eof nil}` unless `opts` give an `:eof`, so a
-string with no form is nil, and nil for a nil `s`. Nothing is
+`(read-string s)` is `nexis.core`'s `read-string` with `{:eof nil}`,
+so a string with no form is nil; `(read-string opts s)` passes `opts`
+as they are, so with no `:eof` in them a string with no form is
+`:reader-error`, as in Clojure; either is nil for a nil `s`. Nothing is
 evaluated (the reader has no `#=`). It reads nexis's syntax, which
 EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
 it stands for, where Clojure's EDN reader refuses it, and the reader
@@ -455,14 +457,14 @@ returns a realized list where Clojure returns a lazy seq.
 | `var?` | 1 | Whether `x` is a Var |
 | `var-get` | 1 | The value of the Var (`deref`); a non-Var is `:kind-mismatch` |
 | `find-var` | 1 | `(find-var 'ns/name)`: the Var the qualified symbol names, nil when the namespace has none; `:no-such-namespace` when there is no such namespace |
-| `load-string`, `load-file` | 1 | Read and evaluate each form of the string (of the file's text) in turn in the current namespace, as a top-level `do` runs them through `eval`; the last form's value, nil for none |
+| `load-string`, `load-file` | 1 | Read and evaluate each form of the string (of the file's text) in turn in the current namespace through `eval`, so a form that does not read (a stray closing delimiter, an unfinished form) raises `:reader-error` after the ones before it ran; the namespace in force when it was called is restored afterwards, whether it returns or throws, as Clojure's `Compiler.load` binds `*ns*`; the last form's value, nil for none. Each form is read as `read-string` reads it, so a syntax-quote in the text is `:reader-error` |
 | `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
 | `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
 | `decimal?`, `inst?` | 1 | false: there are no decimals and no instants (PLAN §4) |
 | `qualified-ident?`, `simple-ident?` | 1 | Whether `x` is a keyword or symbol with a namespace, without one |
 | `bit-and-not`, `bit-flip` | 2+, 2 | `(bit-and x (bit-not y))` over each further argument; `bit-flip` is `bit-set` or `bit-clear` of the bit, as `bit-test` finds it |
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
-| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included. An unbound Var is left bound to nil. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
+| `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
 | `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
 | `find-ns`, `the-ns`, `ns-name` | 1 | A namespace is its name symbol: `find-ns` returns the symbol when a namespace has that name, else nil; `the-ns` and `ns-name` return it, else throw `:no-such-namespace`. A non-symbol is `:kind-mismatch` |

@@ -120,9 +120,8 @@ of an in-flight atom is allowed: it reads and never marks.
 #### 4.5 `(swap-vals! a f & args)`
 
 `swap!` returning the vector `[old new]`, with the same order and
-rollback. The vector is allocated after the watches run, and no
-collection can run between their last call and the allocation
-(`docs/GC.md` §11.5). `reset-vals!` is `swap-vals!` with
+rollback. The vector is allocated after the watches run, from the old
+and new states the mutator keeps rooted across them (§4.8). `reset-vals!` is `swap-vals!` with
 `(constantly v)`.
 
 #### 4.6 `(compare-and-set! a old new)`
@@ -176,8 +175,10 @@ belong to atoms only: on any other value the four natives are
 The collector reaches the validator and the watches map through the
 atom (§7). While the watches run, the mutator roots the map it runs
 through, which a watch that adds or removes one replaces on the atom
-(`docs/GC.md` §11.5, class 3); the new state, and the old one, are
-rooted as the arguments of each call.
+(`docs/GC.md` §11.5, class 3), and the old and new states, which
+each call receives and a validator or watch may `recur` away: the
+old state leaves the atom at the write, and `swap!`'s new state is a
+callback's result.
 
 ```clojure
 (let [a (atom 1) log (atom [])]
@@ -191,7 +192,7 @@ rooted as the arguments of each call.
 
 #### 4.9 Metadata
 
-An atom's metadata is a hash map or nil, set by the `:meta` option and
+An atom's metadata is a map (a sorted one included, as `with-meta` takes) or nil, set by the `:meta` option and
 changed in place by `reset-meta!` and `alter-meta!`, as a Var's is;
 `meta` reads it. It takes no part in equality, hashing or printing.
 `with-meta` of an atom is `:kind-mismatch`, as in Clojure, where an
