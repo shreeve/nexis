@@ -7,7 +7,8 @@ then the language over it: the pattern and matcher values, the
 `re-*` functions, the `#"..."` literal and the patterns
 `nexis.string` takes (§8–§11).
 Patterns are Java's syntax minus every construct that needs
-backtracking; matching is linear in the input.
+backtracking; one search is linear in the input times the size of the
+pattern, and finding every match can be quadratic (§3.5).
 
 ---
 
@@ -234,12 +235,24 @@ previous match ended, `\G` holds there, and after an empty match the
 next search starts one code point later (Java: one UTF-16 unit). So
 `a*` on `baaa` finds `""`, `"aaa"`, `""`.
 
+Each search is linear (§3.2), but the loop is not: after a
+lower-priority thread matches, a search keeps the higher-priority
+threads alive to see whether one matches too, possibly to the end of
+the input, and then reports a short match. So k finds can each scan
+to the end: `split`, `replace` and `re-seq` of `x*y|x` over n `x`s
+cost O(n²). RE2 and Rust's `regex`, leftmost-first Pike VMs too,
+iterate with the same bound.
+
 ---
 
 ### 4. Limits
 
-Java has none of these; they make a hostile pattern an error rather
-than a slow search.
+Java has none of these. They bound what compiling a pattern costs, in
+time and memory, and the constant of a search: a search costs
+O(n·m·k) (§3.2) with m·k at most 2^20 slot words, so it stays linear
+in the input but a pattern near the limits is slow per byte (350
+`(.?)` groups take about 0.25 ms a byte in a debug build). They do
+not turn every slow search into an error.
 
 | Limit | Value | Sentence |
 |---|---|---|
@@ -306,9 +319,9 @@ Java without `(?U)`.
 
 ### 6. Differences from `java.util.regex`
 
-1. **No backtracking constructs** (§2): in exchange no pattern takes
-   more than linear time, and the limits of §4 refuse what Java
-   would accept and run slowly.
+1. **No backtracking constructs** (§2): in exchange one search is
+   linear in the input (§3.2; a find loop can be quadratic, §3.5),
+   and the limits of §4 refuse patterns Java would accept.
 2. **An empty match advances by a code point**, Java's by a UTF-16
    unit: Java finds an extra empty match inside a surrogate pair
    (`""` on `"a😀"` finds four empty matches in Java, three here).

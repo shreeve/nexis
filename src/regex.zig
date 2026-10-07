@@ -1,4 +1,4 @@
-//! regex.zig — regular expressions in Java's syntax, matched in linear time.
+//! regex.zig — regular expressions in Java's syntax, each search in linear time.
 //!
 //! Authoritative spec: `docs/REGEX.md`. `compile` parses a pattern
 //! into an AST in an arena, resolving every character class to a
@@ -10,7 +10,7 @@
 //! Nothing backtracks: a search adds each (instruction, position)
 //! pair at most once, so it costs O(n·m·k) for n input bytes, m
 //! instructions and k slots, and the limits `compile` enforces bound
-//! m and m·k. Constructs that need backtracking are refused when the
+//! m and m·k. A find loop can be quadratic (docs/REGEX.md §3.5). Constructs that need backtracking are refused when the
 //! pattern compiles, with a sentence naming them.
 //!
 //! The Unicode data, the case mappings `(?iu)` folds by and the
