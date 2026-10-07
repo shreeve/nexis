@@ -1053,7 +1053,7 @@ const Loader = struct {
                     .function => blk: {
                         const routine = &l.routines[try l.in.index(l.routines.len)];
                         const n = try l.in.int(u32);
-                        const f = try mem(l.vm.allocClosureUnverified(routine, n));
+                        const f = try mem(l.vm.allocClosure(routine, n));
                         const cells: []*UpvalCell = @constCast(VM.asClosure(f).upvalues);
                         for (cells) |*c| {
                             const cell = l.objects[try check(try l.in.int(u32), i)];

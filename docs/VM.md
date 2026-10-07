@@ -159,16 +159,16 @@ be; a routine that fails runs nothing, and its error leaves `run` or
 stdlib image's loader verifies each routine it loads in debug and safe
 builds, and the image a release build loads is the one the build's
 generator loaded and verified (`docs/STDLIB.md` §1). The dispatch
-trusts what verification proved (§8). `allocClosure` verifies its
-routine again in a debug build, so a closure over a routine nothing
-verified is an assertion there; the image loader alone uses
-`allocClosureUnverified`, since it makes each closure before the
-routine it runs is read, and verifies every routine (`verifyAlone`,
-each once) when the image is whole. Verification never traps: a
-routine longer than a pc can name is `BytecodeCorruption` before any
-of it is read, and capture descriptors that lead back to their own
-routine, which no compiler makes, end in the stack guard's
-`StackOverflow`.
+trusts what verification proved (§8). A routine is verified once,
+not at every closure made over it: `closure:make` builds a closure
+from a descriptor of a routine verified with every routine under it,
+and the image loader, which makes each closure before the routine it
+runs is read, verifies every routine (`verifyAlone`, each once) when
+the image is whole. Verification never traps: a routine longer than a
+pc can name is `BytecodeCorruption` before any of it is read, and
+verification reached past the stack guard, as by capture descriptors
+that lead back to their own routine, which no compiler makes, is the
+guard's `StackOverflow` (§13.1), its trace naming the routine.
 
 ---
 

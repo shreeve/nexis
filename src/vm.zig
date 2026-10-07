@@ -626,6 +626,7 @@ pub const Routine = struct {
     /// and the instruction. Whatever the routine holds, verification
     /// returns an error and never traps.
     pub fn verify(self: *const Routine, failure: *VerifyFailure) VmError!void {
+        failure.* = .{ .routine = self, .pc = 0 };
         stack_guard.check() catch return VmError.StackOverflow;
         try self.verifyAlone(failure);
         for (self.capture_descs) |desc| try desc.routine.verify(failure);
@@ -2736,25 +2737,13 @@ pub const VM = struct {
     /// `upvalue_count` cell pointers in its tail and return the
     /// `.function` Value naming it. The tail is the closure's
     /// `upvalues` array; the caller fills it before the Value can
-    /// reach a slot. `asClosure()` is the matched accessor.
+    /// reach a slot. `asClosure()` is the matched accessor. The
+    /// dispatch trusts `routine` (§8) and a call trusts the closure to
+    /// carry a cell for each of its upvalues (§6), so the caller makes
+    /// sure of both: `closure:make` takes a descriptor of a routine
+    /// verified with every routine under it, and the image loader
+    /// verifies what it made once the image is whole (§5).
     pub fn allocClosure(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
-        // The dispatch trusts the routine (§8), and a call trusts the
-        // closure to carry a cell for each of its upvalues (§6): a
-        // closure's routine comes from a verified routine's capture
-        // descriptor, whose source count is the routine's, and a debug
-        // build checks both.
-        if (std.debug.runtime_safety) {
-            var failure: VerifyFailure = undefined;
-            routine.verify(&failure) catch |err| std.debug.panic("closure over an unverified routine {s}: {t} at {d}", .{ routine.name, err, failure.pc });
-            std.debug.assert(upvalue_count == routine.upvalue_count);
-        }
-        return self.allocClosureUnverified(routine, upvalue_count);
-    }
-
-    /// `allocClosure` without its check, for the image loader, which
-    /// makes closures before the routines they run are complete and
-    /// verifies every routine once the image is (`image.zig`, §5).
-    pub fn allocClosureUnverified(self: *VM, routine: *const Routine, upvalue_count: usize) !Value {
         const heap = self.ensureHeap();
         const body_size = @sizeOf(Closure) + upvalue_count * @sizeOf(*UpvalCell);
         const h = try heap.alloc(.function, body_size);
@@ -8312,6 +8301,22 @@ test "Routine.verify: any routine at all passes or is refused, never a trap" {
         verified += 1;
     }
     try testing.expect(verified > 0);
+}
+
+test "Routine.verify: past the stack guard a run is refused with StackOverflow, and a closure is still made" {
+    // A routine is verified once, where it runs as a top-level frame
+    // (§5): a closure made over it below the guard checks nothing, and
+    // verification that reaches the guard names the routine it was in.
+    const routine = Routine{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .name = "deep" };
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    stack_guard.arm(0);
+    defer stack_guard.arm(stack_guard.main_thread_budget);
+    try testing.expectEqual(.function, (try vm.allocClosure(&routine, 0)).kind());
+    try testing.expectError(VmError.StackOverflow, vm.run());
+    try testing.expectEqual(@as(usize, 1), vm.error_trace.items.len);
+    try testing.expectEqualStrings("deep", vm.error_trace.items[0].name);
+    try testing.expectEqual(@as(u32, 0), vm.error_trace.items[0].pc);
 }
 
 test "VM dispatch: a trap after fast instructions names its instruction in every frame" {
