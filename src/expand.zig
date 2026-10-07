@@ -2621,7 +2621,7 @@ fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_
     const kinds: []const []const u8 = switch (type_form.datum) {
         .nil => &[_][]const u8{"nil"},
         .keyword => |kw| try b.ctx.allocator.dupe([]const u8, &[_][]const u8{kw.name}),
-        .symbol => |sym| (if (sym.ns == null) classKinds(sym.name) else null) orelse
+        .symbol => |sym| (if (sym.ns == null and !try namesRecord(b.ctx, sym.name)) classKinds(sym.name) else null) orelse
             return b.list(.{ "nexis.internal/#%extend-record-impl", protocol, method_key, try recordTypeId(b, type_form), impl }),
         else => return b.ctx.fail(type_form.origin, "expected a record name, a class or a kind keyword, not {s}", .{describeForm(type_form)}),
     };
@@ -2637,6 +2637,19 @@ fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_
 fn extendKind(b: Builder, protocol: *const Form, method_key: *Form, kind: []const u8, impl: *Form) ExpandError!*Form {
     if (std.mem.eql(u8, kind, "any")) return b.list(.{ "nexis.internal/#%extend-default-impl", protocol, method_key, impl });
     return b.list(.{ "nexis.internal/#%extend-builtin-impl", protocol, method_key, try b.kw(kind), impl });
+}
+
+/// Whether `name` resolves to a record's name in the current
+/// namespace, its own or referred: a record the program defines wins
+/// over a class of the same name, which Clojure does not import.
+fn namesRecord(ctx: *ExpandContext, name: []const u8) ExpandError!bool {
+    const ns = ctx.namespace orelse return false;
+    const v = ns.lookup(name) orelse return false;
+    const home = if (v.ns.len == 0 or std.mem.eql(u8, v.ns, ns.name)) ns else blk: {
+        const reg = ctx.registry orelse return false;
+        break :blk reg.lookupNs(v.ns) orelse return false;
+    };
+    return home.lookupLocal(try RecordNames.typeId(ctx.allocator, v.name)) != null;
 }
 
 /// The kinds a Clojure class name stands for, so protocol code
@@ -2669,7 +2682,7 @@ fn classKinds(name: []const u8) ?[]const []const u8 {
         .{ "IPersistentSet", &[_][]const u8{ "set", "sorted_set" } },
         .{ "PersistentHashSet", &[_][]const u8{"set"} },
         .{ "Set", &[_][]const u8{ "set", "sorted_set" } },
-        .{ "ISeq", &[_][]const u8{"list"} },
+        .{ "ISeq", &[_][]const u8{ "list", "lazy_seq" } },
         .{ "IPersistentList", &[_][]const u8{"list"} },
         .{ "PersistentList", &[_][]const u8{"list"} },
         .{ "IFn", &[_][]const u8{ "function", "native_fn" } },

@@ -4888,6 +4888,26 @@ test "extend-protocol and extend-type: nil and Clojure class names, as Clojure c
         \\[(hi nil) (hi "a") (hi 1) (hi 100000000000000000000) (hi [1]) (hi true) (hi false) (hi :k)]
     , "[:nil [:s a] [:n 1] [:n 100000000000000000000] :v [:b true] [:b false] :obj]");
     try expectOutputProgram("(defprotocol Q (q [x])) (extend-type nil Q (q [_] :none)) (q nil)", ":none");
+    // Every seq is an ISeq, a lazy seq and a range included; an
+    // IPersistentList is a list only, as in Clojure.
+    try expectOutputProgram(
+        \\(defprotocol S (f [x]) (g [x]))
+        \\(extend-protocol S
+        \\  clojure.lang.ISeq (f [_] :seq)
+        \\  IPersistentList (g [_] :list)
+        \\  Object (f [_] :obj) (g [_] :obj))
+        \\[(f (list 1)) (f (map inc [1 2])) (f (range 3)) (f (cons 0 (map inc [1]))) (f [1]) (g (list 1)) (g (map inc [1]))]
+    , "[:seq :seq :seq :seq :obj :list :obj]");
+    // A record the program defines is its name's meaning, though the
+    // name is a class's too.
+    try expectOutputProgram(
+        \\(defprotocol P (f [x]))
+        \\(defrecord Symbol [n])
+        \\(defrecord Var [n])
+        \\(extend-type Symbol P (f [_] :symbol-record))
+        \\(extend-protocol P Var (f [_] :var-record) Keyword (f [_] :keyword))
+        \\[(f (->Symbol 1)) (f (->Var 1)) (f :k) (try (f 'a) (catch any e e)) (try (f #'f) (catch any e e))]
+    , "[:symbol-record :var-record :keyword :no-protocol-impl :no-protocol-impl]");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-type java.util.Frob Q (q [_] 1))", "java.util.Frob names no record and no class nexis has; extend a kind keyword such as :string", "java.util.Frob");
     try expectMacroFailure("(defprotocol Q (q [x]))", "(extend-protocol Q (q [_] 1))", "a method needs a type before it", "(q [_] 1)");
     try expectMacroFailure("", "(defrecord P [x] Object (toString [_] \"p\"))", "defrecord: Object methods (toString, equals, hashCode) have no meaning here: nexis has no classes", "Object");
