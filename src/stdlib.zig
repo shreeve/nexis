@@ -1505,9 +1505,11 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // element). Every native below that keeps either across a further
 // callback pushes it on a `RootScope` first, the second kind by
 // iterating with `rootedSeqIter`; one whose only held value is the
-// next call's argument (`reduce`, `reduce-kv`, `swap!`, `db/alter!`,
-// `db/reduce-tree`) needs nothing, because an argument is rooted
-// for the call that could collect.
+// next call's argument and is not used again (`reduce`, `reduce-kv`,
+// `db/alter!`, `db/reduce-tree`) needs nothing, because the callee
+// roots its argument for as long as it uses it. A callee's fn-level
+// `recur` overwrites its argument slots, so a value passed to a call
+// and used after it is the native's own to root.
 //
 // A native that calls one function once per element, with one
 // argument count, calls it through a `vm_mod.Callback` (VM.md §6):
@@ -1751,13 +1753,15 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
 const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 
 /// Add what `mode` keeps of `coll` to `results`, which roots each as
-/// it comes. An element the walk built (a map's entry) is rooted as
-/// the predicate's argument for its call and by `results` once kept;
-/// one dropped is garbage.
-fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results) VmError!void {
+/// it comes. An element the walk built (a map's entry) waits in the
+/// root slot `held` while the predicate runs, since the predicate may
+/// `recur` over its argument, and in `results` once kept; one dropped
+/// is garbage (GC.md §11.5, class 4).
+fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, held: usize) VmError!void {
     var it = try makeSeqIter(vm, coll);
     var cb = vm_mod.Callback.init(vm, pred, 1);
     while (try it.next()) |x| {
+        vm.roots.items[held] = x;
         const r = try cb.call(&.{x});
         const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
@@ -2223,9 +2227,9 @@ fn fnFrequencies(vm: *VM, args: []const Value) VmError!Value {
 /// a root of its own edited under the map's token as it stands at the
 /// edit, so both grow in place (TRANSIENT.md §1, §4). Rooting (GC.md
 /// §11.5, class 4): the transient, which reaches every vector, is on
-/// the root scope across every call of `f`; `x` is the call's argument
-/// and lands in its vector, and `(f x)` in the map, before the next
-/// call.
+/// the root scope across every call of `f`; `x` waits in a root slot
+/// while `f` runs, since `f` may `recur` over its argument, and lands
+/// in its vector, and `(f x)` in the map, before the next call.
 fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const f = args[0];
@@ -2234,8 +2238,11 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     const t = transient_mod.transientFrom(heap, champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory) catch |err| return transientFailure(vm, err);
     try scope.push(t);
     var it = try consumingSeqIter(vm, args[1], scope);
+    const held = vm.roots.items.len;
+    try scope.push(value_mod.nilValue());
     var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
+        vm.roots.items[held] = x;
         const k = try cb.call(&.{x});
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
@@ -2357,9 +2364,12 @@ fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(value_mod.nilValue());
     var results = Results.init(vm);
     defer results.release();
-    try sieveInto(vm, .keep_truthy, args[0], args[1], &results);
+    try sieveInto(vm, .keep_truthy, args[0], args[1], &results, scope.base);
     return results.vector();
 }
 
@@ -4550,8 +4560,9 @@ fn fnAtomQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// Clojure's `ARef.validate`: a falsy answer from the validator is
-/// `:invalid-reference-state`; a throw out of it propagates. `state`
-/// is the call's argument, so rooted while the validator runs.
+/// `:invalid-reference-state`; a throw out of it propagates. A caller
+/// that keeps `state` past the call roots it: the validator may
+/// `recur` over its argument (GC.md §11.5).
 fn validate(vm: *VM, validator: Value, state: Value) VmError!void {
     if (validator.isNil()) return;
     if (!(try vm.callValue(validator, &.{state})).isTruthy()) return vm.throwKeyword("invalid-reference-state");
@@ -4560,8 +4571,8 @@ fn validate(vm: *VM, validator: Value, state: Value) VmError!void {
 /// Clojure's `ARef.notifyWatches`: each watch called with
 /// `(key atom old new)` after the change, in the watches map's order.
 /// The map is rooted here, since a watch that adds or removes one
-/// replaces the atom's map; `old` and `new` are every call's
-/// arguments, and nothing collects between two calls (GC.md §11.5).
+/// replaces the atom's map; the caller roots `old` and `new`, which
+/// every call receives and any may `recur` away (GC.md §11.5, class 3).
 fn notifyWatches(vm: *VM, a: Value, old: Value, new: Value) VmError!void {
     const watches = atom_mod.body(a).watches;
     if (watches.isNil()) return;
@@ -4576,6 +4587,9 @@ fn fnResetBang(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     const new_val = args[1];
     if (a.kind() != .atom) return VmError.KindMismatch;
+    // `new_val` is an argument; `old` leaves the atom at the write.
+    const scope = vm.rootScope();
+    defer scope.release();
     const old = blk: {
         if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
         defer atom_mod.exitCritical(a);
@@ -4584,6 +4598,7 @@ fn fnResetBang(vm: *VM, args: []const Value) VmError!Value {
         atom_mod.setValue(a, new_val);
         break :blk old;
     };
+    try scope.push(old);
     try notifyWatches(vm, a, old, new_val);
     return new_val;
 }
@@ -4594,7 +4609,13 @@ fn fnResetBang(vm: *VM, args: []const Value) VmError!Value {
 fn swapImpl(vm: *VM, args: []const Value, pair: bool) VmError!Value {
     const a = args[0];
     if (a.kind() != .atom) return VmError.KindMismatch;
+    // `old` leaves the atom at the write, and `f`'s result is no
+    // argument: both are kept across the validator and the watches,
+    // which may `recur` over them (GC.md §11.5, class 3).
+    const scope = vm.rootScope();
+    defer scope.release();
     const old = atom_mod.getValue(a);
+    try scope.push(old);
     const new_val = blk: {
         if (!atom_mod.tryEnterCritical(a)) return VmError.AtomReEntry;
         defer atom_mod.exitCritical(a);
@@ -4602,16 +4623,14 @@ fn swapImpl(vm: *VM, args: []const Value, pair: bool) VmError!Value {
         defer vm.allocator.free(call_args);
         call_args[0] = old;
         @memcpy(call_args[1..], args[2..]);
-        // `old` is the atom's value, hence rooted, until the write.
         const new_val = try vm.callValue(args[1], call_args);
+        try scope.push(new_val);
         try validate(vm, atom_mod.body(a).validator, new_val);
         atom_mod.setValue(a, new_val);
         break :blk new_val;
     };
     try notifyWatches(vm, a, old, new_val);
     if (!pair) return new_val;
-    // No safe point between the last call and this allocation (a
-    // cycle runs only between instructions, VM.md §9).
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ old, new_val }) catch VmError.OutOfMemory;
 }
 

@@ -6557,6 +6557,21 @@ test "gc: swap!, alter-meta!, apply and a closure over a loop survive cycles" {
     try expectOutputUnderGc(churn ++ "(let [fs (map (fn [x] (fn [] (churn x) (str x))) (range 20))] (apply str (map (fn [f] (f)) fs)))", "012345678910111213141516171819");
 }
 
+/// A callee whose fn-level `recur` walks off its argument: once its
+/// slot holds the rest, nothing in the callee reaches the head.
+const walk_off = "(defn walk-off [xs] (if (and (seq? xs) (seq xs)) (do (churn 1) (recur (rest xs))) true)) ";
+
+test "gc: what a native passes a callee that recurs over its parameter stays rooted by the native" {
+    // GC.md §11.5: the validator drops `swap!`'s new state from its slot.
+    try expectOutputUnderGc(churn ++ walk_off ++ "(let [a (atom nil)] (set-validator! a walk-off) (swap! a (fn [_] (list (str \"a\") (str \"b\") (str \"c\")))) (churn 2) @a)", "(a b c)");
+    // The first watch drops the old state; the second reads it.
+    try expectOutputUnderGc(churn ++ "(let [a (atom (list (str \"a\") (str \"b\"))) seen (atom nil)] (add-watch a :w1 (fn [k r o n] (if (and (seq? o) (seq o)) (do (churn 1) (recur k r (rest o) n)) nil))) (add-watch a :w2 (fn [k r o n] (churn 3) (reset! seen o))) (reset! a :next) (churn 4) @seen)", "(a b)");
+    try expectOutputUnderGc(churn ++ "(let [a (atom (list (str \"a\") (str \"b\")))] (add-watch a :w (fn [k r o n] (if (and (seq? o) (seq o)) (do (churn 1) (recur k r (rest o) n)) nil))) (let [p (swap-vals! a (constantly :new))] (churn 2) (first p)))", "(a b)");
+    // A map's entries are built by the walk: the native keeps each.
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [r (filterv (fn [e] (if (vector? e) (do (churn 1) (recur 0)) true)) m)] (churn 2) [(count r) (reduce + (map key r))])", "[40 780]");
+    try expectOutputUnderGc(churn ++ zmap ++ "(let [g (group-by (fn [e] (if (vector? e) (do (churn 1) (recur 0)) :k)) m)] (churn 2) [(count (:k g)) (reduce + (map key (:k g)))])", "[40 780]");
+}
+
 test "gc: db/reduce-tree and db/alter! survive cycles inside their callbacks" {
     var store = try SeamStore.init("gc-reduce-tree");
     defer store.deinit();
