@@ -209,7 +209,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | NaN `=` NaN | false | true (canonical bits) | `docs/SEMANTICS.md` |
 | integer overflow | `+` throws, `+'` promotes | every integer operator promotes to a bignum and demotes a result that fits i48; `+'` and its kin are the same functions, and `unchecked-add` and its kin wrap two longs at 64 bits as Clojure's do | `docs/BIGNUM.md`, `docs/SEMANTICS.md` §2.2 |
 | inexact `(/ a b)` of integers | a Ratio | an f64; exact quotients stay integers | §23 #10 |
-| `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN or infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` does not exist | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
+| `(long x)` | throws beyond 64 bits; NaN is 0 | never rejects a size (`(long 1e30)` is a bignum); NaN is 0, as in Clojure, and an infinity is `:invalid-argument`; `int`, `short` and `byte` check Java's ranges and make NaN 0, as Clojure's do; `float` checks the float range and returns the f64 unrounded; `bigint` and `biginteger` are `long`, since an integer of any size is one kind | `docs/SEMANTICS.md` §2.2, `docs/STDLIB.md` §2 |
 | the seq of a map, set, string, or of a list `sort` or `keys` builds | walked one element at a time | a vector's view past three elements, so `map` over it takes 32 at a time | `docs/LAZY.md` §9 |
 | a lazy seq a local holds | let go as it is walked (locals clearing) | kept, with what it realized, until the slot is reused | `docs/LAZY.md` §9 |
 | `(apply f (range))` | can stay lazy | does not end: `apply` realizes its last argument | `docs/LAZY.md` §9 |

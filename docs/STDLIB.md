@@ -158,7 +158,7 @@ string function panics on one.
 | `seq` and the sequence library | — | A string is a seq of its chars (`(seq "hé")` is `(\h \u{E9})`, `(seq "")` nil), so `first`, `map`, `into`, `reverse`, `frequencies` and the rest take one. `(empty "abc")` is nil. A string is not callable (`:not-callable`) | — |
 | `char` | 1 | The char with a code point; a char is itself | `:kind-mismatch` (non-integer), `:invalid-argument` (not a Unicode scalar: negative, past `0x10FFFF`, a surrogate) |
 | `char?` | 1 | Whether the argument is a char | — |
-| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity; NaN for `long`) |
+| `int`, `short`, `byte`, `long` | 1 | Of a char: its code point (`(int \é)` is 233); of a number, its integer part (SEMANTICS.md §2.2). `long` takes any size (`(long 1e30)` is a bignum); `int`, `short` and `byte` only the range of Java's type, checked on the integer part as Clojure's boxed cast checks it (`(byte 127.5)` is 127), and make NaN 0 | `:kind-mismatch`, `:invalid-argument` (out of range; an infinity) |
 | `name` | 1 | The name part of a keyword or symbol; a string is itself | `:kind-mismatch` |
 | `namespace` | 1 | The namespace part of a keyword or symbol, nil when unqualified | `:kind-mismatch` (a string included) |
 | `keyword` | 1–2 | `(keyword x)`: interned from a string, symbol or keyword (`"a/b"` makes the qualified `:a/b`); nil is nil. `(keyword ns name)`: qualified, a nil `ns` leaving it unqualified. The name is not checked against the reader's grammar: `(keyword "a b")` prints `:a b` | `:kind-mismatch`, `:invalid-argument` (empty name) |
@@ -283,9 +283,10 @@ VM's frames, so a form nested past the frame cap is a catchable
 `postwalk-demo` and `prewalk-demo` are absent.
 
 **`nexis.edn`** is Clojure's `clojure.edn`, in `src/stdlib/edn.nx`:
-`(read-string s)` and `(read-string opts s)` are `nexis.core`'s
-`read-string` with `{:eof nil}` unless `opts` give an `:eof`, so a
-string with no form is nil, and nil for a nil `s`. Nothing is
+`(read-string s)` is `nexis.core`'s `read-string` with `{:eof nil}`,
+so a string with no form is nil; `(read-string opts s)` passes `opts`
+as they are, so with no `:eof` in them a string with no form is
+`:reader-error`, as in Clojure; either is nil for a nil `s`. Nothing is
 evaluated (the reader has no `#=`). It reads nexis's syntax, which
 EDN's is a part of: reader sugar (`'x`, `@x`, `#()`) reads as the form
 it stands for, where Clojure's EDN reader refuses it, and the reader

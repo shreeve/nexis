@@ -4,7 +4,8 @@
 
 ; (read-string s), (read-string opts s) → the first value of the
 ; string s as data, never evaluated: nexis.core/read-string with
-; {:eof nil} unless opts give an :eof; nil for a nil s. The reader
+; {:eof nil}, or with opts as they are, so with no :eof in them a
+; string with no form is :reader-error, as in Clojure; nil for a nil s. The reader
 ; has no tagged literals, so :readers and :default find nothing to
 ; read and a tag is a :reader-error.
 (defn read-string
