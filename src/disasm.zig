@@ -41,7 +41,7 @@ const jump_names = [_]?[]const u8{ "jmp", "if-true", "if-false" };
 const cmp_names = [_]?[]const u8{ "lt", "lte", "gt", "gte", "eq-num" };
 const math_names = [_]?[]const u8{ "add", "sub", "mul", "div", "idiv", "mod", "pow", "neg", "abs" };
 const mov_names = [_]?[]const u8{ "move", "load-const", "load-nil", "load-true", "load-false" };
-const call_names = [_]?[]const u8{ "call", "tailcall", "return", "return-nil" };
+const call_names = [_]?[]const u8{ "call", "tailcall", "return", "return-nil", "self" };
 const closure_names = [_]?[]const u8{ "make", "box-local", "new-cell", "init-cell", "get-cell" };
 const var_names = [_]?[]const u8{ "load-var", "store-var", "var-object" };
 const coll_names = [_]?[]const u8{ "list", "concat", "vector", "map", "set" };
@@ -78,7 +78,7 @@ fn variantName(group: vm.Group, variant: u6) ?[]const u8 {
 /// §4.5): an argument count whose kind bits the handler ignores.
 fn immediateB(group: vm.Group, variant: u6) bool {
     return switch (group) {
-        .call => variant == @backingInt(vm.Call.call) or variant == @backingInt(vm.Call.tailcall),
+        .call => variant == @backingInt(vm.Call.call) or variant == @backingInt(vm.Call.tailcall) or variant == @backingInt(vm.Call.self_),
         .coll => true,
         else => false,
     };

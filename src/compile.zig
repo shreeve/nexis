@@ -117,6 +117,9 @@ const Tiny = union(enum) {
         callee: *const Tiny,
         args: []const *const Tiny,
     },
+    /// A call of the enclosing `fn*`'s self-name with its fixed arity,
+    /// from its own body: `call:self` (COMPILER.md §5.5).
+    self_call: []const *const Tiny,
     /// Bound like `let*`; `recur` in the body re-enters it.
     loop_star: Scope,
     /// `(recur args...)`: rebind the nearest `loop*` or `fn*`'s
@@ -1280,6 +1283,10 @@ const Lexical = struct {
     refs: ?*u32,
     /// The `fn*` nesting depth the binding is made at.
     fn_depth: u32,
+    /// For a `fn*` self-name, the fixed arity of a body without a rest
+    /// parameter: a call of the name with that many arguments, directly
+    /// in the body, is a self-call and no capture (COMPILER.md §5.5).
+    self_arity: ?usize = null,
 };
 
 /// Whether `name` is lexically bound here; a binding made outside
@@ -1483,6 +1490,11 @@ fn lowerList(
         const name = items[0].datum.symbol.name;
         // Special forms are reserved: no binding shadows them.
         if (lowerings.get(name)) |lower| return lower(allocator, items[1..], ctx);
+        if (ctx.lexicals.lookup(name)) |hit| if (hit.self_arity == items.len - 1 and hit.fn_depth + 1 == ctx.fn_depth) {
+            const args = try allocator.alloc(*const Tiny, items.len - 1);
+            for (items[1..], args) |item, *arg| arg.* = try lowerForm(allocator, item, ctx);
+            return try allocTiny(allocator, .{ .self_call = args });
+        };
         // -- Inlineable core fns (shadowable) --
         if (inlinedOp(name, items.len - 1)) |in| {
             if (namesCore(ctx, name)) return try lowerPrim(allocator, in, items[1..], ctx);
@@ -1896,7 +1908,14 @@ fn lowerFnStar(
     var self_referenced = false;
     const mark = ctx.lexicals.mark();
     defer ctx.lexicals.restore(mark);
-    if (self_name) |n| try ctx.bind(allocator, n, &self_referenced, null);
+    if (self_name) |n| try ctx.lexicals.bind(allocator, n, .{
+        .captured = &self_referenced,
+        .refs = null,
+        .fn_depth = ctx.fn_depth,
+        // A block past `chunk_items` arguments may need the chunked
+        // call, which needs the callee in a slot.
+        .self_arity = if (parsed.rest_param == null and parsed.params.len <= chunk_items) parsed.params.len else null,
+    });
     const fn_body = try lowerFnBody(allocator, parsed, args[pos + 1 ..], ctx);
     return try allocTiny(allocator, .{ .fn_star = .{
         .name = self_name,
@@ -2630,6 +2649,7 @@ fn compileExpr(
             .self_referenced = f.self_referenced,
         }, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
+        .self_call => |args| try compileSelfCall(e, args, dst),
         .letfn_star => |l| try compileLetFnStar(e, l.bindings, l.body, dst, recur_target),
         .loop_star => |l| try compileLoopStar(e, l.bindings, l.body, dst, returns),
         .recur => |r| try compileRecur(e, r.args, recur_target),
@@ -3568,6 +3588,7 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
         },
         .fn_star => |f| try readsName(f.body, name),
         .call => |c| try readsName(c.callee, name) or try any(c.args, name),
+        .self_call => |args| any(args, name),
         .try_ => |x| try readsName(x.body, name) or try readsName(x.handler, name) or (if (x.finally_) |f| try readsName(f, name) else false),
         .throw_ => |v| try readsName(v, name),
         .def => |d| if (d.value) |v| try readsName(v, name) else false,
@@ -3853,6 +3874,16 @@ fn compileCall(
     const base = e.reserveBlock(dst, 1 + args.len) orelse return compileChunkedCall(e, callee, args, dst);
     try fillBlock(e, base, callee, args);
     try e.emit(vm.asm_.callCall(base, @intCast(args.len), dst));
+}
+
+/// A self-call (COMPILER.md §5.5): the arguments in a block, which
+/// is the callee's window, then `call:self`, which calls the frame's
+/// own closure. With at most `chunk_items` arguments, a block that
+/// does not fit leaves no room for a chunked call either.
+fn compileSelfCall(e: *Emitter, args: []const *const Tiny, dst: u12) CompileError!void {
+    const base = e.reserveBlock(dst, args.len) orelse return e.limit("local slots");
+    try fillBlock(e, base, null, args);
+    try e.emit(vm.asm_.callSelf(base, @intCast(args.len), dst));
 }
 
 fn compileIf(

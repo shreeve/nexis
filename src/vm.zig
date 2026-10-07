@@ -157,6 +157,9 @@ pub const Call = enum(u6) {
     tailcall = 1,
     @"return" = 2,
     return_nil = 3,
+    /// `call:self A=window B=argc C=dst`: call the frame's own closure
+    /// with the arguments in `slot[A..A + argc]` (VM.md §10.2).
+    self_ = 4,
     _,
 };
 
@@ -551,7 +554,7 @@ pub const Routine = struct {
                 _ => null,
             },
             .call => switch (@as(Call, @fromBackingInt(v))) {
-                .call => .{ .a = .slot, .b = .raw, .c = .dst, .block = true },
+                .call, .self_ => .{ .a = .slot, .b = .raw, .c = .dst, .block = true },
                 .@"return" => .{ .a = .src },
                 .return_nil, .tailcall, _ => null,
             },
@@ -610,10 +613,15 @@ pub const Routine = struct {
         }
         try self.verifyOperand(inst.b, shape.b);
         try self.verifyOperand(inst.c, shape.c);
-        // `call:call`'s callee and arguments, a `coll` opcode's elements.
+        // `call:call`'s callee and arguments, `call:self`'s arguments, a
+        // `coll` opcode's elements.
         if (shape.block) {
-            const end = @as(u32, inst.a.index) + inst.b.index + @intFromBool(inst.groupOf() == .call);
-            if (end > self.slot_count) return if (inst.groupOf() == .call) VmError.CallBlockOutOfRange else VmError.OperandOutOfRange;
+            const is_call = inst.groupOf() == .call;
+            const self_call = op == VM.opcode(.call, Call.self_);
+            const end = @as(u32, inst.a.index) + inst.b.index + @intFromBool(is_call and !self_call);
+            if (end > self.slot_count) return if (is_call) VmError.CallBlockOutOfRange else VmError.OperandOutOfRange;
+            // A self-call is this routine's: its count is the fixed arity.
+            if (self_call and (self.variadic or inst.b.index != self.fixed_arity)) return VmError.BytecodeCorruption;
         }
     }
 
@@ -2908,6 +2916,14 @@ pub const VM = struct {
         const closure = asClosure(callee);
         const routine = closure.routine;
         if (routine.variadic or argc != routine.fixed_arity) return null;
+        return self.pushDirect(callee, base, argc, link);
+    }
+
+    /// `enterClosureDirect` past its arity test: `callee` called with
+    /// its fixed arity.
+    inline fn pushDirect(self: *VM, callee: Value, base: usize, argc: usize, link: Link) ?*Frame {
+        const closure = asClosure(callee);
+        const routine = closure.routine;
         const depth = self.frames.items.len;
         if (depth >= self.max_frames or depth == self.frames.capacity) return null;
         const args_end = base + argc;
@@ -3605,6 +3621,7 @@ pub const VM = struct {
         t[opcode(.var_, VarOp.load_var)] = &opLoadVar;
         t[opcode(.closure, Closure_.get_cell)] = &opGetCell;
         t[opcode(.call, Call.call)] = &opCall;
+        t[opcode(.call, Call.self_)] = &opCallSelf;
         t[opcode(.call, Call.@"return")] = &opReturn;
         t[opcode(.call, Call.return_nil)] = &opReturnNil;
         t[opcode(.call, Call.tailcall)] = &opUnimplemented;
@@ -3629,6 +3646,7 @@ pub const VM = struct {
         t[opcode(.var_, VarOp.load_var)] = &fastLoadVar;
         t[opcode(.closure, Closure_.get_cell)] = &fastGetCell;
         t[opcode(.call, Call.call)] = &fastCall;
+        t[opcode(.call, Call.self_)] = &fastCallSelf;
         t[opcode(.call, Call.@"return")] = &fastReturn;
         t[opcode(.call, Call.return_nil)] = &fastReturnNil;
         break :blk t;
@@ -3875,6 +3893,18 @@ pub const VM = struct {
         return self.nextSafe(self.currentFrame());
     }
 
+    /// `call:self` past the fast handler's case, through the closure
+    /// entry of §6 with its traps.
+    fn opCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
+        // Only a closure's frame runs one: a top-level routine's has
+        // no closure to call.
+        if (frame.closure.kind() != .function) return VmError.BytecodeCorruption;
+        const base = @as(usize, frame.base_slot) + inst.a.index;
+        try self.enterClosure(frame.closure, base, inst.b.index, self.stack.items.len, .{ .return_dst = inst.c.index });
+        return self.nextSafe(self.currentFrame());
+    }
+
     fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         frame.pc = @intCast(pc);
         // Read the value while the callee frame is still active;
@@ -4025,6 +4055,26 @@ pub const VM = struct {
         frame.pc = @intCast(pc);
         // The callee's first instruction, through the routine in hand
         // rather than the frame just written.
+        const first = asClosure(callee).routine.code[0];
+        if (counting) opcode_counts[opIndex(first)] += 1;
+        return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
+    }
+
+    /// `call:self` where the frame chain and the stack's capacity have
+    /// room: the callee is the frame's own closure, and verification
+    /// proved the count its routine's fixed arity, so the frame is
+    /// pushed as `fastCall` pushes a closure's with no callee to read
+    /// or test.
+    fn fastCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        const callee = loadWords(&frame.closure);
+        if (callee.kind() != .function) return self.general(frame, inst, pc);
+        const argc: u32 = inst.b.index;
+        proved(!frame.routine.variadic and argc == frame.routine.fixed_arity and inst.a.index + argc <= frame.routine.slot_count);
+        const base: usize = @as(usize, frame.base_slot) + inst.a.index;
+        const callee_frame = self.pushDirect(callee, base, argc, .{
+            .return_dst = inst.c.index,
+        }) orelse return self.general(frame, inst, pc);
+        frame.pc = @intCast(pc);
         const first = asClosure(callee).routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
@@ -5691,6 +5741,12 @@ pub const asm_ = struct {
     /// `call:call A=call_base B=argc C=result_slot` per VM.md §6
     /// range-call ABI. Caller has already
     /// staged closure + args at `slot[A..A+1+argc]`.
+    /// call:self window argc dst  ; the frame's own closure called
+    /// with the `argc` arguments at `window`, its result into `dst`.
+    pub fn callSelf(window: u12, argc: u12, result_slot: u12) Inst {
+        return Inst.primary(.call, Call.self_, Operand.slot(window), Operand.slot(argc), Operand.slot(result_slot));
+    }
+
     pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
         return Inst.primary(
             .call,
@@ -7624,6 +7680,8 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a Var past the table", .code = &.{ asm_.varLoadVar(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "an upvalue the routine has not", .code = &.{ asm_.moveFrom(0, Operand.upvalue(0)), r }, .err = VmError.UpvalueOutOfRange, .pc = 0 },
         .{ .name = "a call block past the frame", .code = &.{ asm_.callCall(0, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
+        .{ .name = "a self-call's arguments past the frame", .code = &.{ asm_.callSelf(1, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
+        .{ .name = "a self-call of a count not the routine's arity", .code = &.{ asm_.callSelf(0, 1, 0), r }, .err = VmError.BytecodeCorruption, .pc = 0 },
         .{ .name = "a collection block past the frame", .code = &.{ asm_.collList(1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
@@ -7976,6 +8034,43 @@ test "VM dispatch: recursion stops at max_frames on the direct call path" {
     try testing.expectError(VmError.StackOverflow, vm.run());
     try testing.expectEqual(@as(usize, 50), vm.frames.items.len);
     if (VM.track_high_water) try testing.expectEqual(@as(usize, 50), vm.frame_high_water);
+}
+
+test "VM dispatch: call:self calls the frame's closure, on the direct path and past it" {
+    // (fn* sum [n] (if (< n 1) n (+ n (sum (- n 1))))), 10000 deep: the
+    // frames and the stack outgrow their capacity, so the general
+    // handler takes the calls that grow them.
+    const child_code = [_]Inst{
+        asm_.cmpLt(1, sl(0), kn(0)),
+        asm_.jumpIfFalse(3, sl(1)),
+        asm_.returnSlot(0),
+        Inst.primary(.math, Math.sub, sl(2), sl(0), kn(0)),
+        asm_.callSelf(2, 1, 2),
+        asm_.mathAdd(1, sl(0), sl(2)),
+        asm_.returnSlot(1),
+    };
+    const child_consts = [_]Value{fx(1)};
+    const child = Routine{ .code = &child_code, .consts = &child_consts, .slot_count = 3, .fixed_arity = 1, .name = "sum" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &child, .sources = &.{} }};
+    const consts = [_]Value{fx(10_000)};
+    const code = [_]Inst{ asm_.closureMake(0, 0), asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) };
+    var routine = makeRoutine(&code, &consts, 3, "top");
+    routine.capture_descs = &caps;
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    try testing.expectEqual(fx(50_005_000), try vm.run());
+    // Runaway, it stops at `max_frames` with every frame standing.
+    vm.max_frames = 50;
+    try vm.retargetTop(&routine);
+    try testing.expectError(VmError.StackOverflow, vm.run());
+    try testing.expectEqual(@as(usize, 50), vm.frames.items.len);
+    try testing.expectEqualStrings("sum", vm.error_trace.items[0].name);
+    try testing.expectEqual(@as(u32, 4), vm.error_trace.items[0].pc);
+    // A top-level frame has no closure to call.
+    const lone = makeRoutine(&.{ asm_.callSelf(0, 0, 0), asm_.returnNil() }, &.{}, 1, "lone");
+    var vm2 = try VM.init(testing.allocator, &lone);
+    defer vm2.deinit();
+    try testing.expectError(VmError.BytecodeCorruption, vm2.run());
 }
 
 test "VM closure call: same closure called twice — both invocations succeed" {
