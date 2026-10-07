@@ -1391,9 +1391,9 @@ in instructions, every resident set the same.
 ### 3.25 Quickening, Apple M5
 
 The compiler quickens each routine it finishes (`docs/VM.md` §10.10,
-`docs/COMPILER.md` §4.5): a `math` or `cmp` instruction of slots, of
-a slot and a fixnum constant or (`math`) of a fixnum constant and a
-slot, a `mov:move` of a slot or an upvalue and a `call:return` of a
+`docs/COMPILER.md` §4.5): a `cmp` instruction or a `math:add`, `sub`,
+`mul`, `idiv` or `mod` of slots, of a slot and a fixnum constant or
+(`math`) of a fixnum constant and a slot, a `mov:move` of a slot or an upvalue and a `call:return` of a
 slot take a variant whose fast handler decodes no operand kind, and a
 comparison followed by its conditional jump says so, so it runs the
 jump without looking for it. The fast handlers of `math:add` and
@@ -1527,8 +1527,8 @@ Each lever is a measured change: a before/after from `zig build bench`
   target does not fit beside two operands, so as an instruction of its
   own it needs PLAN §23 #21 amended (an extension word, or A as a
   relative target). Not built: the opcode histograms
-  (`-Dopcodes=true`) of the ten `bench/compare` language programs
-  after quickening find the pair in two, 1.0 M of `loop`'s 5.0 M
+  (`-Dopcodes=true`) of the ten `bench/compare` language programs,
+  built as §3.25's after, find the pair in two, 1.0 M of `loop`'s 5.0 M
   dispatches (20%) and 1.0 M of the destructuring loop's 43.0 M
   (2.3%), and in none of the other eight, the stdlib's own loops
   included; an encoding change in the verifier, the disassembler and
@@ -1542,8 +1542,7 @@ Each lever is a measured change: a before/after from `zig build bench`
   instructions (−7.1%), the destructuring loop's 3,338.8 → 3,324.1 M
   (−0.4%), five rounds at a load of 7.8. Raw output:
   `.git/revamp/r2/bench/speed4/` (`hist-B/`, `step*`).
-- **Inline caches at call sites**: after quickening (§3.25) a call
-  through a Var is a `var:load-var` and a `call:call`, each reading
+- **Inline caches at call sites**: a call through a Var is a `var:load-var` and a `call:call`, each reading
   its operands with no kind to decode; a cache must still see the
   Var's latest root (PLAN §23 #20).
 - **Comptime specialization** beyond CHAMP's inline immediate hash:

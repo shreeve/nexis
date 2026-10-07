@@ -72,7 +72,8 @@ dispatch by opcode (a comparison that runs its branch is one,
 `docs/VM.md` §8) and every native called through the VM's call paths
 (an instruction, `callValue`, a `Callback`), and writes them to stderr
 as CSV when the process exits, however it exits: `opcode,dispatches`
-then `group:variant,N` rows, then `native,calls` and `name,N` rows,
+then `group:variant,N` rows (a quickened variant named as the
+disassembler names it, `math:add.sc`, §2), then `native,calls` and `name,N` rows,
 each most first. The counts start after the standard library's boot,
 so they are the program's. Without the option the counting is compiled
 out; the gate analyzes the counting build so it cannot rot.
