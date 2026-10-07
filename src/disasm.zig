@@ -199,25 +199,35 @@ fn quickSuffix(q: vm.Quick) []const u8 {
 /// variant prints its number after `?`.
 fn writeOpcode(inst: vm.Inst, writer: *Writer) Writer.Error!void {
     var buf: [32]u8 = undefined;
-    var fixed = Writer.fixed(&buf);
-    if (groupName(inst.group)) |g| {
-        fixed.writeAll(g) catch unreachable;
-    } else {
-        fixed.print("?{d}", .{inst.group}) catch unreachable;
-    }
-    fixed.writeAll(":") catch unreachable;
-    const group: vm.Group = @fromBackingInt(@intCast(inst.group));
-    const quick = quickOf(inst);
-    if (variantName(group, if (quick) |q| q.base else inst.variant)) |v| {
-        fixed.writeAll(v) catch unreachable;
-        if (quick) |q| fixed.writeAll(quickSuffix(q)) catch unreachable;
-    } else {
-        fixed.print("?{d}", .{inst.variant}) catch unreachable;
-    }
-    const text = fixed.buffered();
+    const text = opcodeName(@as(u12, inst.group) | @as(u12, inst.variant) << 6, &buf);
     try writer.writeAll(text);
     var pad: usize = text.len;
     while (pad < 18) : (pad += 1) try writer.writeAll(" ");
+}
+
+/// The name of the opcode at index `op` (group | variant << 6), in
+/// `buf`: `group:variant`, a quickened variant as its base's name and
+/// its suffix (`math:add.sc`), and `?N` for what the tables do not
+/// name. The CLI's `-Dopcodes` histogram names its rows with it.
+pub fn opcodeName(op: u12, buf: []u8) []const u8 {
+    var fixed = Writer.fixed(buf);
+    const group_bits: u6 = @truncate(op);
+    const variant: u6 = @truncate(op >> 6);
+    if (groupName(group_bits)) |g| {
+        fixed.writeAll(g) catch return "?";
+    } else {
+        fixed.print("?{d}", .{group_bits}) catch return "?";
+    }
+    fixed.writeAll(":") catch return "?";
+    const group: vm.Group = @fromBackingInt(group_bits);
+    const quick = vm.Quick.of(op);
+    if (variantName(group, if (quick) |q| q.base else variant)) |v| {
+        fixed.writeAll(v) catch return "?";
+        if (quick) |q| fixed.writeAll(quickSuffix(q)) catch return "?";
+    } else {
+        fixed.print("?{d}", .{variant}) catch return "?";
+    }
+    return fixed.buffered();
 }
 
 /// A wide field: a pc as `jNNNN`, a constant as `cN=value`, a Var
