@@ -420,10 +420,15 @@ so there is no queue; emdb's write lock is the transactor.
    tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
    counters including `"t"`.
 7. **Commit**: `wtxn.commit()`, after which the idents the transaction
-   minted, renamed or read reach the connection's cache; until then
-   they live in the transaction alone, since the write transaction
-   sees its own uncommitted names. On any error `wtxn.abort()`: nothing
-   partial can exist (emdb INV-SUB04), in the file or in the cache.
+   minted, renamed or read reach the connection's cache, and its
+   attribute counts the cached schema; until then they live in the
+   transaction alone, since the write transaction sees its own
+   uncommitted names. On any error `wtxn.abort()`: nothing partial can
+   exist (emdb INV-SUB04), in the file or in the cache. One error comes
+   after the commit stands: a commit that syncs its meta page (`:sync
+   :full`) and whose meta sync fails is published to every reader, so
+   the caches take it as they take any commit, and `transact!` or
+   `excise!` then raises `:db/durability-unknown` (`docs/DB.md` §8).
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`. `:tx` and the
    rows carry the transaction number `t`; the transaction entity is
@@ -610,7 +615,9 @@ by the role their variable plays in the plan, rule bodies included: one
 read in an entity position, in the value position under a constant ref
 attribute, or as the entity of `missing?`, `get-else` or `get-some`, may
 be a lookup ref or an ident and becomes its eid; a recursive rule's
-argument plays the roles of the head position it binds. One that names
+argument plays the roles of the head position it binds, at the call's
+own step, so a call that runs before any other reader of the input
+resolves it in the source the rule's bodies read it from. One that names
 nothing stays as it is and matches no datom, so its row stands or falls
 by the clauses around it: no row from a positive pattern, every row
 from `(not [?x :ref ?e])`, the other branches of an `or` (a lookup ref
@@ -780,7 +787,9 @@ hook roots, for the query's life, every heap value the pipeline keeps
 across a later call: a function result it binds, a custom aggregate's
 result, and the values it builds itself (a `tuple` or `fulltext`
 result bound as one value, an aggregate's vector or set;
-`docs/GC.md` §11.5); a predicate's result is tested and dropped.
+`docs/GC.md` §11.5); a predicate's result is tested as `if` tests it
+and dropped, never realized, so a lazy seq, empty or infinite, is
+true.
 
 **fulltext.** `[(fulltext $ :attr "needle") [[?e ?v]]]` binds, for a
 string attribute carrying `:db/fulltext` at the view's basis, every
@@ -867,8 +876,9 @@ total ∪= new; delta = new } until delta is empty`. A bound argument is
 pushed into the bodies only where the component is one rule and every
 recursive call passes the argument through unchanged; elsewhere it
 filters the result, so a required argument (`[(r [?n] ?out) ...]`) that
-a recursive call changes, and that a body needs bound, is
-`:nextomic/query-syntax` naming it. The fixpoint ends when a round adds
+a body needs bound, and that a recursive call changes or that belongs
+to a component of several rules, is `:nextomic/query-syntax` naming it
+and the cause. The fixpoint ends when a round adds
 no row, which every rule over datoms, inputs and constants reaches; a
 body that binds a function result (`[(inc ?n) ?m]`) can add new values
 every round, and its rule ends only where a predicate bounds them. The
@@ -903,8 +913,9 @@ lazily wherever a list is taken (a datom form and a lookup ref are
 vectors, so a lazy one is not), and no code runs while store state is
 in flight; a body's throw propagates from the native before it
 starts. A
-transaction function's result and a query function's are realized the
-same way before Nextomic reads them. Nextomic returns no lazy seq: `q`,
+transaction function's result, and a function's result a query binds
+or aggregates, are realized the same way before Nextomic reads them; a
+predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 `datoms`, `tx-range` and `history` are realized.
 
 | form | semantics |

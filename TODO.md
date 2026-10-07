@@ -14,6 +14,19 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     map"); Datomic accepts any sequential form, and a lazy seq of forms
     is already converted at the boundary. Accept a list where a vector
     form is accepted (`docs/NEXTOMIC.md` §3).
+15. **`load-string` refuses a syntax-quote.** It reads each form as
+    data and evaluates it, and a syntax-quote has no data form (the
+    reader leaves a marker the macroexpander expands), so text holding
+    one is `:reader-error`; Clojure loads it. Compiling each Form as
+    read, through a hook beside `CompilerHooks` (`src/compile.zig`),
+    would load it as a file does (`docs/STDLIB.md`, `load-string`).
+16. **The image loader trusts an immediate's payload.** A debug or safe
+    build's load of the stdlib image refuses a damaged reference as
+    `Corrupt`, but `Loader.ref`'s immediate arm (`src/image.zig`)
+    accepts a reserved immediate kind and a char or fixnum payload
+    out of range. The build never writes one, and a release build
+    trusts its image by design (`docs/STDLIB.md` §1); checking each
+    immediate's kind and range closes the last gap.
 
 ## Performance
 

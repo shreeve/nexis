@@ -159,16 +159,16 @@ be; a routine that fails runs nothing, and its error leaves `run` or
 stdlib image's loader verifies each routine it loads in debug and safe
 builds, and the image a release build loads is the one the build's
 generator loaded and verified (`docs/STDLIB.md` §1). The dispatch
-trusts what verification proved (§8). `allocClosure` verifies its
-routine again in a debug build, so a closure over a routine nothing
-verified is an assertion there; the image loader alone uses
-`allocClosureUnverified`, since it makes each closure before the
-routine it runs is read, and verifies every routine (`verifyAlone`,
-each once) when the image is whole. Verification never traps: a
-routine longer than a pc can name is `BytecodeCorruption` before any
-of it is read, and capture descriptors that lead back to their own
-routine, which no compiler makes, end in the stack guard's
-`StackOverflow`.
+trusts what verification proved (§8). A routine is verified once,
+not at every closure made over it: `closure:make` builds a closure
+from a descriptor of a routine verified with every routine under it,
+and the image loader, which makes each closure before the routine it
+runs is read, verifies every routine (`verifyAlone`, each once) when
+the image is whole. Verification never traps: a routine longer than a
+pc can name is `BytecodeCorruption` before any of it is read, and
+verification reached past the stack guard, as by capture descriptors
+that lead back to their own routine, which no compiler makes, is the
+guard's `StackOverflow` (§13.1), its trace naming the routine.
 
 ---
 
@@ -671,9 +671,10 @@ Group and variant numbers are the enums in `src/vm.zig` (`Group`,
 
 A group number outside the enum is `BytecodeCorruption`; an
 undispatched group traps `UnimplementedOpcode`. A variant number
-outside its group's enum is `BytecodeCorruption` in every group; a
-reserved variant inside it (`call:tailcall`, `math:pow`, `ctrl:halt`)
-traps `UnimplementedOpcode`.
+outside its group's enum that is not a quickened variant (§10.10) is
+`BytecodeCorruption` in every group, which verification refuses
+(§5); a reserved variant inside it (`call:tailcall`, `math:pow`,
+`ctrl:halt`) traps `UnimplementedOpcode`.
 
 #### 10.1 `mov`
 
@@ -999,9 +1000,9 @@ run):
 |---|---|
 | `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an `i` or `e` operand where a value is read, a store to `u` |
 | `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a `call:lookup-or`'s second slot past the frame; a jump target or a `try`'s pc past the code |
-| `InvalidOperandKind` | Verification: a destination that is not a slot; a lookup key that is not a keyword or symbol constant. Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
+| `InvalidOperandKind` | Verification: an operand read as a slot (a destination, a block's base, a cell) that is not one; a lookup key that is not a keyword or symbol constant; a quickened instruction's operand not of the kind its form promises, a slot, an upvalue or a constant holding a fixnum (§10.10). Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
-| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter. Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter, a comparison quickened with its jump not followed by that jump on its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block, or a `call:self`'s arguments, past the frame's slot count |
 | `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |

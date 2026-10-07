@@ -69,6 +69,11 @@
     (catch java.util.regex.PatternSyntaxException _ "ERR")
     (catch clojure.lang.ExceptionInfo e (if (:timeout (ex-data e)) "TIMEOUT" (throw e)))))
 
+;; Regressions the grammar rarely reaches, run after the random cases.
+(def hand-written
+  [;; Every thread dies at an assertion before the first-byte prefilter skips.
+   ["(?:\\ba)*\\bc" "ab c ab c"]])
+
 (doseq [seed seeds]
   (binding [*rng* (java.util.Random. seed)]
     (loop [n 0]
@@ -79,3 +84,6 @@
           (if (= r :skip)
             (recur n)
             (do (println (json/generate-string [p s r])) (recur (inc n)))))))))
+
+(doseq [[p s] hand-written]
+  (println (json/generate-string [p s (run-java p s)])))

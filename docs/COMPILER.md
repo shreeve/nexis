@@ -356,10 +356,11 @@ constant pool, Var table, capture descriptors, span table,
   there with the instruction named, never run by a dispatch that
   trusts it (VM.md §8).
 - A finished routine's code is quickened (`vm.quicken`, VM.md
-  §10.10): with every jump patched, each `math` and `cmp` instruction
-  of slots or of a slot and a fixnum constant, each `math` of a
-  fixnum constant and a slot, each `mov:move` of a slot or an upvalue
-  and each `call:return` of a slot takes its quickened variant.
+  §10.10): with every jump patched, each `cmp` instruction and each
+  `math:add`, `sub`, `mul`, `idiv` and `mod` of slots or of a slot and
+  a fixnum constant, each of those `math` of a fixnum constant and a
+  slot, each `mov:move` of a slot or an upvalue and each `call:return`
+  of a slot takes its quickened variant.
   The emitter writes and reads back base opcodes only.
 
 #### 4.6 Spans

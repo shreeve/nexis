@@ -19,7 +19,7 @@
 (defn split-lines [s]
   (split (replace s "\r\n" "\n") "\n"))
 
-; (escape s cmap) → s with each character cmap maps replaced by the
-; text of its value (str), the rest kept.
+; (escape s cmap) → s with each character cmap maps to a truthy value
+; replaced by that value's text (str), the rest kept, as Clojure's.
 (defn escape [s cmap]
-  (apply str (map (fn [c] (if-some [r (cmap c)] r c)) s)))
+  (apply str (map (fn [c] (if-let [r (cmap c)] r c)) s)))

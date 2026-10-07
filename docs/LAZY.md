@@ -140,7 +140,9 @@ step, as `LazySeq.cons`; `peek`, `pop` and `contains?` are
 `cons` puts a list cell in front of nil, a list, or the view of a
 vector (`(cons 0 [1 2])` is still a list), and a lazy seq's cons cell in
 front of a lazy seq, which it does not realize. `list*` conses its
-leading arguments onto the seq of its last.
+leading arguments onto its last as `cons` does, so a lazy last
+argument is not realized; with no leading arguments it is the seq of
+its argument.
 
 **`realized?`** is true of a lazy block whose body has run, and of a
 cons or a chunked cons (Clojure's throws for `Cons`: answering is the
@@ -223,7 +225,10 @@ unrooted nodes. A lazy block they meet is realized through
   `call:call`, the `coll` opcodes, the transient natives). When the
   count moved, it raises the parked failure, a thrown value through
   `throwValue` or an error as itself, and `:stack-overflow` when none
-  is parked (`VM.checkDeepData`).
+  is parked (`VM.checkDeepData`). One that fails for another reason
+  consumes the spoils under it and drops a failure parked since its
+  snapshot (`VM.dropSpoils`), so no later call raises it; a failure
+  parked before the snapshot belongs to an enclosing call and stays.
 
 What a program sees: `(get {(lazy-seq [1 2]) :a} [1 2])` is `:a`, and
 `(try (= [(lazy-seq (throw :x))] [[1]]) (catch any e e))` is `:x`.
@@ -236,8 +241,12 @@ arguments in native context (§5), and the transient natives (`conj!`,
 given (`seq.realizeAll`) before the in-place edit starts, so no code
 runs in the middle of an edit of a transient the code can reach: `(let
 [t (transient {})] (assoc! t (lazy-seq (assoc! t :x 1) [1]) 2))`
-completes the inner `assoc!` before the outer one begins. A key
-already in a hashed collection was realized when it was hashed.
+completes the inner `assoc!` before the outer one begins. A key in a
+map or set was realized when the collection took it: an array form,
+which indexes nothing by hash, still hashes each key it adds that
+may hold a lazy seq
+(`docs/CHAMP.md` §2.1), so `(frequencies [(lazy-seq (throw :x))])`
+throws `:x` from `frequencies`.
 
 A coll opcode that hashes copies its operands off the stack before it
 builds, and reads its frame again after: running a body can grow the
@@ -324,7 +333,12 @@ over it, `doall`) is a realized chain, walked as any other.
 
 **Printing.** The printer (`src/format.zig`) runs no code: a block
 whose body has not run prints as `...` (`(0 ...)`), which an error
-report shows when the value it names holds one. Everything that prints
+report shows when the value it names holds one. A realized chain that
+is a cycle (`(repeat x)` once walked is one cell whose rest is its own
+block, as is `(def s (lazy-seq (cons 1 s)))`) prints as far as the
+printer finds the cycle (Brent's algorithm: within three times the
+length of the cycle and of the cells before it) and then `...`, so an
+error report naming one ends: `(repeat 1)` prints `(1 ...)`. Everything that prints
 a value a program will see realizes it first, in native context
 (`seq.realizeAll`): `pr`, `prn`, `print`, `println`, `pr-str`, `str`,
 `format`'s `%s`, `nexis.string/join` and `spit`, and the REPL and `-e`
@@ -350,13 +364,14 @@ Clojure. `doall` or `mapv` inside the block is the remedy.
 
 **Code that walks a value as data.** The expander making a macro's
 result, `eval`'s or `macroexpand`'s argument a form, and the Nextomic
-natives over their arguments and over what a transaction or query
-function returns, take the value through `seq.asLists`: every lazy seq
-in it is realized and replaced by the list of its elements, the
-collections on the way to one copied (keeping their metadata) and
-everything else shared, so the code after it knows lists only and runs
-no code. A sorted collection is shared as it is, since rebuilding one
-could run its comparator. `` `(a ~@xs) `` realizes `xs`'s spine before
+natives over their arguments, over what a transaction function
+returns, and over the results a query binds or aggregates, take the
+value through `seq.asLists`: every lazy seq in it is realized and
+replaced by the list of its elements, the collections on the way to
+one copied (keeping their metadata) and everything else shared, so the
+code after it knows lists only and runs no code. A sorted collection is
+rebuilt from its entries in their order, a key made a list being `=`
+to the seq it was, so no comparator runs. `` `(a ~@xs) `` realizes `xs`'s spine before
 it splices (`coll:concat`, `docs/VM.md` §10.8).
 
 ---
@@ -376,7 +391,13 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   Clojure's is `clojure.lang.LazySeq@` and a hash.
 - **Arguments are checked at the call**: `(take :a xs)` and `(partition
   0 xs)` raise when called; Clojure raises when the seq is realized, or
-  returns an infinite seq of `()` for `(partition 0 xs)`.
+  returns an infinite seq of `()` for `(partition 0 xs)`. A count is
+  any number, as Clojure's: `take`, `drop`, `nthrest`, `nthnext`,
+  `take-last`, `repeatedly`, `split-at` and `dorun` count one down
+  while it is positive, so `(take 2.5 xs)` takes 3 and NaN takes none,
+  and `repeat` truncates it as `(long n)` does, an infinity being
+  `:invalid-argument`. A count past the fixnum range, a bignum or a
+  float, is all.
 - **Holding the head.** The VM roots every slot of its stack
   (`docs/VM.md` §9), so a lazy seq a local or a call's argument holds
   keeps what it realized until the slot is reused: `(reduce + (map inc
@@ -394,10 +415,31 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   to a closure, stays held by the slot until it is reused; clearing a
   local at its last use, as Clojure does, needs liveness in the
   compiler.
+- **No collection runs while a body realizes in isolation** (§6): a
+  lazy seq that `=` or `hash` meets nested inside a value (a map's
+  value, a vector's element, a key) realizes under `gc_hold`, so all
+  the garbage its body makes stays until the body returns: `(= {:k
+  (lazy-seq (reduce + (map inc (range 8000000))) [1])} {:k [1]})`
+  peaks at hundreds of megabytes where the same seq compared at the
+  top, in native context, runs in constant memory. Clojure collects
+  while the body runs. A seq realized before it goes into the value
+  (`(doall s)`) realized in native context.
+- **A lazy key of a small map is realized when the map takes it**, as
+  a set's or a larger map's is in both (§6); Clojure's array map
+  compares keys and hashes none, so `(assoc {} s 1)`, `frequencies`
+  and `group-by` leave a lazy key unrealized there until something
+  hashes or prints the map.
 - `counted?` of a range is false (Clojure's `LongRange` is counted);
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
   one, made a list (§8), is not one; Datomic takes any list.
+- **A `sequence` step that throws** runs again from its block's
+  source position with the transducer's state as the failed step left
+  it: `(sequence (comp (map f) (take 4)) (range 10))` whose `f` throws
+  once at 2 gives `(0 1)` on the next walk, `take` having counted 0
+  and 1 twice. Clojure's iterator goes on from its advanced source and
+  transducer and drops the outputs of the chunk it was filling: `(3 4)`.
+  Both reuse state the failure advanced; neither is a fresh run.
 - **`eduction`** is `sequence` over the composed transducers: a cached
   lazy seq, where Clojure's `Eduction` runs the transform again on
   every reduce. Only side effects in the transform tell them apart.
@@ -423,9 +465,18 @@ transducer applied once to `conj!`, each step runs it over the
 source's elements into a transient vector until 32 outputs or more are
 waiting, the source ends, or a step returns a reduced value, and
 hands them out as one chunk; at the end it runs the completion arity
-once, so `partition-all`'s last part comes out. It realizes the source
+once, so `partition-all`'s last part comes out. As in Clojure's
+`TransformerIterator`, the outputs are what reached the transient:
+what the transducer returns is not an accumulator, and a reduced value
+only ends the walk, so `(sequence (halt-when #{3}) [0 1 2 3 4])` is
+`(0 1 2)`. A step that throws runs again from its block's source
+position (§4), but the transducer's state (a stateful one's volatiles)
+is as the failed step left it (§9). It realizes the source
 as far as the outputs need, as Clojure's `TransformerIterator` pulls
-it. `(sequence xform c1 c2 ...)` runs the transducer over `(map vector
+it. Unlike the other producers' (§7), its walk's position stays out of
+the block, on a root scope while the step calls the transducer: the
+seq it took of a source that is not one (a vector's view, a set's
+elements) is all that reaches what the walk has left. `(sequence xform c1 c2 ...)` runs the transducer over `(map vector
 c1 c2 ...)`, its reducing function called with each tuple's elements.
 A call through the transducer costs a closure call per element where
 the native producers call their function directly, so `(sequence (map
@@ -433,27 +484,23 @@ f) xs)` is slower than `(map f xs)`.
 
 ---
 
-### 11. What changes for a program written against eager sequences
+### 11. Programs over lazy sequences
 
 - **Nothing runs until something walks the result.** `(map println
-  xs)` at a script's top level prints nothing; use `run!`, `doseq` or
-  `dorun`. `(with-out-str (map print xs))` is `""`, and `(time (map f
-  xs))` times nothing. A `for` used as a loop for its effects is a
-  `doseq`.
+  xs)` at a script's top level prints nothing; `run!`, `doseq` and
+  `dorun` walk for effects. `(with-out-str (map print xs))` is `""`,
+  and `(time (map f xs))` times nothing. A `for` used as a loop for its
+  effects is a `doseq`.
 - **Errors surface where the seq is walked.** `(try (map f xs) (catch
   ...))` does not catch what `f` throws: the throw comes when the result
-  is printed or consumed. Realize it inside the `try` (`doall`, `vec`,
-  `mapv`).
+  is printed or consumed. `doall`, `vec` or `mapv` inside the `try`
+  realizes it there.
 - **Dynamic bindings and transactions are read at realization.** A lazy
   seq built inside `binding`, `with-tx`, `with-read-tx` or
   `with-snapshot` and walked outside sees the outer binding, or raises
-  `:tx-closed`. Realize it inside.
-- **`iterate` takes two arguments**: `(iterate f x n)` is
-  `:arity-mismatch`; write `(take n (iterate f x))`. `(range s e 0)`
-  repeats `s` where it raised `:invalid-argument`.
-- `(list? (map f xs))` is false (`seq?` is true) and `(class (map f
-  xs))` is `:lazy_seq`; code that asked `list?` to find a sequence asks
-  `seq?` or `sequential?`, and `extend-type :list` does not cover a lazy
-  seq: extend `:lazy_seq` too. `counted?` of a lazy seq is false;
-  `count` walks it (O(1) of an unrealized range). `peek` and `pop` of
-  one are `:kind-mismatch`, as of Clojure's `LazySeq`.
+  `:tx-closed`; realizing it inside keeps what it read there.
+- **A lazy seq is a seq, not a list**: `(list? (map f xs))` is false,
+  `seq?` and `sequential?` true, and `(class (map f xs))` is
+  `:lazy_seq`, so `extend-type :list` does not cover one; a protocol
+  extends `:lazy_seq` too. `counted?` of a lazy seq is false and
+  `count` walks it (O(1) of an unrealized range, §7).

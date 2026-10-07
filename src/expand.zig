@@ -782,11 +782,11 @@ fn catchTest(b: Builder, g: *Form, tag: *const Form) ExpandError!*Form {
 /// which takes every value.
 fn catchTags(name: []const u8) ?[]const []const u8 {
     const classes = std.StaticStringMap([]const []const u8).initComptime(.{
-        .{ "ArithmeticException", &[_][]const u8{"divide-by-zero"} },
+        .{ "ArithmeticException", &[_][]const u8{ "divide-by-zero", "arithmetic-overflow" } },
         .{ "IndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
         .{ "ArrayIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
         .{ "StringIndexOutOfBoundsException", &[_][]const u8{"index-out-of-bounds"} },
-        .{ "ClassCastException", &[_][]const u8{"kind-mismatch"} },
+        .{ "ClassCastException", &[_][]const u8{ "kind-mismatch", "not-callable" } },
         .{ "IllegalArgumentException", &[_][]const u8{ "invalid-argument", "no-matching-clause", "arity-mismatch" } },
         .{ "ArityException", &[_][]const u8{"arity-mismatch"} },
         .{ "AssertionError", &[_][]const u8{"assertion-failed"} },
@@ -934,25 +934,30 @@ fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) E
     var clauses = items[2..];
     if (clauses.len > 0 and clauses[0].datum == .string) clauses = clauses[1..];
     if (clauses.len > 0 and clauses[0].datum == .map) clauses = clauses[1..];
-    // Every clause is checked before the namespace switches, so a bad
-    // one leaves the program where it was.
+    // Every clause is checked, its options and specs included, before
+    // the namespace switches, so a bad one leaves the program where it
+    // was. A namespace that does not load fails after the switch, as
+    // Clojure's `ns` fails after its `in-ns`.
     for (clauses) |clause| {
         const clause_items: []const *Form = if (clause.datum == .list) clause.datum.list else &.{};
         if (clause_items.len == 0 or clause_items[0].datum != .keyword) return ctx.fail(clause.origin, "ns: expected a clause like (:require ...), not {s}", .{describeForm(clause)});
         const kind = clause_items[0].datum.keyword.name;
-        const known = for ([_][]const u8{ "require", "refer-clojure", "gen-class" }) |k| {
-            if (std.mem.eql(u8, kind, k)) break true;
-        } else false;
-        if (!known) return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
+        if (std.mem.eql(u8, kind, "require")) {
+            for (clause_items[1..]) |spec| try requireSpec(ctx, spec, .check);
+        } else if (std.mem.eql(u8, kind, "refer-clojure")) {
+            try referClojure(ctx, reg, clause_items[1..], .check);
+        } else if (!std.mem.eql(u8, kind, "gen-class")) {
+            return ctx.fail(clause.origin, "ns: (:{s} ...) is not supported", .{kind});
+        }
     }
     reg.switchTo(name_form.datum.symbol.name) catch return ExpandError.OutOfMemory;
     for (clauses) |clause| {
         const clause_items = clause.datum.list;
         const kind = clause_items[0].datum.keyword.name;
         if (std.mem.eql(u8, kind, "require")) {
-            for (clause_items[1..]) |spec| try requireSpec(ctx, spec);
+            for (clause_items[1..]) |spec| try requireSpec(ctx, spec, .apply);
         } else if (std.mem.eql(u8, kind, "refer-clojure")) {
-            try referClojure(ctx, reg, clause_items[1..]);
+            try referClojure(ctx, reg, clause_items[1..], .apply);
         }
     }
     return try makeNil(ctx, origin);
@@ -962,7 +967,7 @@ fn expandNs(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) E
 /// each name the current namespace's own (an unbound Var until the
 /// namespace defines it), so it neither resolves to nor inlines nor
 /// expands as `nexis.core`'s; `nexis.core/name` still reaches it.
-fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []const *Form) ExpandError!void {
+fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []const *Form, step: Step) ExpandError!void {
     if (opts.len % 2 != 0) return ctx.fail(opts[opts.len - 1].origin, "ns: :refer-clojure options come in pairs", .{});
     var i: usize = 0;
     while (i < opts.len) : (i += 2) {
@@ -974,8 +979,8 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
         if (names.datum != .vector) return ctx.fail(names.origin, "ns: :exclude takes a vector of symbols, not {s}", .{describeForm(names)});
         for (names.datum.vector) |name_form| {
             const name = try plainName(ctx, name_form, "ns: an excluded name");
-            if (reg.core.lookupLocal(name) == null and ctx.host_macros.get(name) == null) continue;
-            if (reg.current.lookupLocal(name) != null) continue;
+            if (step == .check) continue;
+            if (!shadowsCore(ctx, reg, name) or reg.current.lookupLocal(name) != null) continue;
             _ = reg.current.intern(name) catch return ExpandError.OutOfMemory;
         }
     }
@@ -999,14 +1004,19 @@ fn referClojure(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, opts: []con
 /// loader's (`loader.zig`).
 fn expandRequire(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     if (items.len < 2) return ctx.fail(list_form.origin, "require: expected a namespace", .{});
-    for (items[1..]) |spec| try requireSpec(ctx, spec);
+    for (items[1..]) |spec| try requireSpec(ctx, spec, .apply);
     return try makeNil(ctx, list_form.origin);
 }
 
-/// Load and refer one `require` spec (see `expandRequire`).
-fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
+/// Whether a `require` spec or an `ns` clause is only checked, its
+/// shape and options, or carried out.
+const Step = enum { check, apply };
+
+/// Load and refer one `require` spec (see `expandRequire`), or only
+/// check it.
+fn requireSpec(ctx: *ExpandContext, quoted: *const Form, step: Step) ExpandError!void {
     const spec = unwrapQuote(quoted);
-    if (prefixList(spec)) |items| return requirePrefixList(ctx, items);
+    if (prefixList(spec)) |items| return requirePrefixList(ctx, items, step);
     const opts: []const *Form = switch (spec.datum) {
         .keyword => return,
         .symbol => &.{},
@@ -1033,6 +1043,9 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
         } else if (std.mem.eql(u8, k, "refer")) {
             const all = val.datum == .keyword and std.mem.eql(u8, val.datum.keyword.name, "all");
             if (val.datum != .vector and !all) return ctx.fail(val.origin, "require: :refer takes a vector of names or :all, not {s}", .{describeForm(val)});
+            if (!all) for (val.datum.vector) |sym| {
+                if (sym.datum != .symbol or sym.datum.symbol.ns != null) return ctx.fail(sym.origin, "require: :refer names symbols, not {s}", .{describeForm(sym)});
+            };
             refer = val;
         } else if (std.mem.eql(u8, k, "rename")) {
             if (val.datum != .map) return ctx.fail(val.origin, "require: :rename takes a map, not {s}", .{describeForm(val)});
@@ -1041,6 +1054,7 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
             return ctx.fail(key.origin, "require: unknown option {s}", .{if (k.len > 0) k else describeForm(key)});
         }
     }
+    if (step == .check) return;
 
     const reg = ctx.registry orelse return ctx.fail(spec.origin, "require: namespaces cannot be loaded here", .{});
     if (load) {
@@ -1068,7 +1082,6 @@ fn requireSpec(ctx: *ExpandContext, quoted: *const Form) ExpandError!void {
         return;
     }
     for (r.datum.vector) |sym| {
-        if (sym.datum != .symbol or sym.datum.symbol.ns != null) return ctx.fail(sym.origin, "require: :refer names symbols, not {s}", .{describeForm(sym)});
         const name = sym.datum.symbol.name;
         const v = target.lookupLocal(name) orelse return ctx.fail(sym.origin, "require: {s}/{s} does not exist", .{ ns_name, name });
         try referVar(ctx, cur, v, renamed(rename, name), sym.origin);
@@ -1090,7 +1103,7 @@ fn prefixList(spec: *const Form) ?[]const *Form {
 /// Require each suffix of a prefix list under its prefix. As in
 /// Clojure, a name under a prefix has no period and a suffix is not
 /// itself a prefix list.
-fn requirePrefixList(ctx: *ExpandContext, items: []const *Form) ExpandError!void {
+fn requirePrefixList(ctx: *ExpandContext, items: []const *Form, step: Step) ExpandError!void {
     const prefix = items[0];
     if (prefix.datum != .symbol or prefix.datum.symbol.ns != null) return ctx.fail(prefix.origin, "require: a prefix must be an unqualified symbol, not {s}", .{describeForm(prefix)});
     for (items[1..]) |suffix| {
@@ -1105,11 +1118,11 @@ fn requirePrefixList(ctx: *ExpandContext, items: []const *Form) ExpandError!void
         if (std.mem.findScalar(u8, name, '.') != null) return ctx.fail(name_form.origin, "require: {s} is under the prefix {s}, so it cannot contain a period", .{ name, prefix.datum.symbol.name });
         const full = try makeSymbol(ctx, try ctx.allocator.print("{s}.{s}", .{ prefix.datum.symbol.name, name }), name_form.origin);
         if (suffix.datum == .symbol) {
-            try requireSpec(ctx, full);
+            try requireSpec(ctx, full, step);
         } else {
             const v = try ctx.allocator.dupe(*Form, suffix.datum.vector);
             v[0] = full;
-            try requireSpec(ctx, try makeVector(ctx, v, suffix.origin));
+            try requireSpec(ctx, try makeVector(ctx, v, suffix.origin), step);
         }
     }
 }
@@ -1125,13 +1138,28 @@ fn renamed(rename: []const *Form, name: []const u8) []const u8 {
     return name;
 }
 
+/// Whether `name` is one `nexis.core` or the host macro table holds:
+/// one `(:refer-clojure :exclude ...)` makes the namespace's own.
+fn shadowsCore(ctx: *ExpandContext, reg: *vm_mod.NamespaceRegistry, name: []const u8) bool {
+    return reg.core.lookupLocal(name) != null or ctx.host_macros.get(name) != null;
+}
+
 /// Map `name` in `ns` to the Var `v` of another namespace. A name
 /// that already maps to a Var of `ns` itself is a conflict, as in
-/// Clojure; one that already refers to `v` stays.
+/// Clojure, unless that Var is what `:exclude` interned for a core
+/// name and nothing has bound it since: Clojure maps an excluded name
+/// to nothing, so its referral is the standard way to replace a core
+/// name. One that already refers to `v` stays.
 fn referVar(ctx: *ExpandContext, ns: *vm_mod.Namespace, v: *vm_mod.Var, name: []const u8, span: SrcSpan) ExpandError!void {
     if (ns.vars.getEntry(name)) |existing| {
         if (existing.value_ptr.* == v) return;
-        if (isOwnVar(existing)) return ctx.fail(span, "require: {s} is already defined in {s}", .{ name, ns.name });
+        if (isOwnVar(existing)) {
+            const own = existing.value_ptr.*;
+            const excluded = !own.bound and !own.macro and if (ctx.registry) |reg| shadowsCore(ctx, reg, name) else false;
+            if (!excluded) return ctx.fail(span, "require: {s} is already defined in {s}", .{ name, ns.name });
+            existing.value_ptr.* = v;
+            return;
+        }
     }
     const owned = try ns.var_allocator.dupe(u8, name);
     try ns.vars.put(ns.map_allocator, owned, v);
@@ -1192,7 +1220,9 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
     const fn_form = try fnStar(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
-    const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, parts.meta), fn_form }));
+    // The Var's metadata says it is a macro, as Clojure's does.
+    const meta = try std.mem.concat(ctx.allocator, *Form, &.{ parts.meta, &.{ try b.kw("macro"), try makeForm(ctx, .{ .bool_ = true }, origin) } });
+    const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, meta), fn_form }));
 
     var why: ?Failure = null;
     const result = ceval.eval(ceval.user_data, expanded, &why) catch |err| {
@@ -2621,7 +2651,7 @@ fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_
     const kinds: []const []const u8 = switch (type_form.datum) {
         .nil => &[_][]const u8{"nil"},
         .keyword => |kw| try b.ctx.allocator.dupe([]const u8, &[_][]const u8{kw.name}),
-        .symbol => |sym| (if (sym.ns == null) classKinds(sym.name) else null) orelse
+        .symbol => |sym| (if (sym.ns == null and !try namesRecord(b.ctx, sym.name)) classKinds(sym.name) else null) orelse
             return b.list(.{ "nexis.internal/#%extend-record-impl", protocol, method_key, try recordTypeId(b, type_form), impl }),
         else => return b.ctx.fail(type_form.origin, "expected a record name, a class or a kind keyword, not {s}", .{describeForm(type_form)}),
     };
@@ -2637,6 +2667,19 @@ fn extendCall(b: Builder, protocol: *const Form, type_form: *const Form, method_
 fn extendKind(b: Builder, protocol: *const Form, method_key: *Form, kind: []const u8, impl: *Form) ExpandError!*Form {
     if (std.mem.eql(u8, kind, "any")) return b.list(.{ "nexis.internal/#%extend-default-impl", protocol, method_key, impl });
     return b.list(.{ "nexis.internal/#%extend-builtin-impl", protocol, method_key, try b.kw(kind), impl });
+}
+
+/// Whether `name` resolves to a record's name in the current
+/// namespace, its own or referred: a record the program defines wins
+/// over a class of the same name, which Clojure does not import.
+fn namesRecord(ctx: *ExpandContext, name: []const u8) ExpandError!bool {
+    const ns = ctx.namespace orelse return false;
+    const v = ns.lookup(name) orelse return false;
+    const home = if (v.ns.len == 0 or std.mem.eql(u8, v.ns, ns.name)) ns else blk: {
+        const reg = ctx.registry orelse return false;
+        break :blk reg.lookupNs(v.ns) orelse return false;
+    };
+    return home.lookupLocal(try RecordNames.typeId(ctx.allocator, v.name)) != null;
 }
 
 /// The kinds a Clojure class name stands for, so protocol code
@@ -2669,7 +2712,7 @@ fn classKinds(name: []const u8) ?[]const []const u8 {
         .{ "IPersistentSet", &[_][]const u8{ "set", "sorted_set" } },
         .{ "PersistentHashSet", &[_][]const u8{"set"} },
         .{ "Set", &[_][]const u8{ "set", "sorted_set" } },
-        .{ "ISeq", &[_][]const u8{"list"} },
+        .{ "ISeq", &[_][]const u8{ "list", "lazy_seq" } },
         .{ "IPersistentList", &[_][]const u8{"list"} },
         .{ "PersistentList", &[_][]const u8{"list"} },
         .{ "IFn", &[_][]const u8{ "function", "native_fn" } },

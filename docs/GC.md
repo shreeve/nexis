@@ -355,7 +355,9 @@ make sure a root reaches it. What is rooted already:
   slots when reached by `call:call`, through the root stack when
   reached by `callValue`, which pushes a native callee's `args` for the
   call's duration. A closure callee holds its arguments in its own
-  slots. One exception: the last argument of a native that consumes
+  slots only until a fn-level `recur` overwrites them, so a value a
+  native passes to a callback is rooted by that call for no longer
+  than the callee uses it. One exception: the last argument of a native that consumes
   it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
   `some`, `every?`, `last`, `dorun`), whose slot `call:call` clears
   once it has copied the arguments, so the head of a lazy seq passed
@@ -380,14 +382,15 @@ The rule each native follows, by what it holds across a further
 `callValue` (natives cite the class number):
 
 1. **An argument, or anything reachable from one**: nothing to do.
-   The string natives, the printers, `buildListFromSlice`, `swap-vals!`
-   (its `[old new]` vector is built after the last callback, with no
-   safe point in between) and every native that never calls back in.
-2. **Only the next callback's argument**: nothing to do, since
-   `callValue` roots it for the call. `reduce`, `reduce-kv`, `swap!`,
-   an atom's validator and its watches (the old and new states are
-   their arguments), `alter-meta!`, `db/alter!` and `db/reduce-tree` (its decoded value
-   is the call's argument and is not kept), `some` and `every?`.
+   The string natives, the printers, `buildListFromSlice`,
+   `compare-and-set!` and every native that never calls back in.
+2. **Only the next callback's argument, not used after the call**:
+   nothing to do, since the callee roots it for as long as it uses
+   it. `reduce`, `reduce-kv`, `alter-meta!`, `alter-var-root`,
+   `db/alter!` and `db/reduce-tree` (its decoded value is the call's
+   argument and is not kept), `some` and `every?`. A value passed to
+   one call and used after it, by the native or by a further call, is
+   class 3 or 4: the callee may have `recur`red it away.
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
    them on every exit path, a `ControlTransferred` unwind included.
@@ -402,14 +405,19 @@ The rule each native follows, by what it holds across a further
    aggregate's vector or set); and the Nextomic transaction-function
    hook (`transact`, `with`) for the db-value each call receives and
    every tx-data a function returns, for the transaction's life; and
-   the atom mutators, for the watches map they run through, which a
-   watch that adds or removes one replaces (`docs/ATOM.md` §4.8).
+   the atom mutators: `swap!` and `swap-vals!` for `f`'s result, which
+   the validator and every watch receive, every mutator for the old
+   state, which leaves the atom at the write and goes to every watch
+   (and into `swap-vals!`'s `[old new]`), and for the watches map they
+   run through, which a watch that adds or removes one replaces
+   (`docs/ATOM.md` §4.8).
 4. **Values a native builds itself and keeps across callbacks**: no
    argument reaches them. The iterator over a map, a record or an
    entity builds each `[k v]` entry, and the one over a typed vector
-   boxes each element. `sieveInto` (`filterv`) passes each element to the predicate,
-   its call's argument, and keeps it in its `Results` before the next
-   call;
+   boxes each element. `sieveInto` (`filterv`) and `group-by` pass
+   each element to the callback and keep it after the call: it waits
+   in a root slot of the native's while the callback runs, then in
+   `Results` or the group's vector;
    `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's

@@ -51,6 +51,9 @@ Cy
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])
+ok a predicate's lazy seq is truthy and stays unrealized
+ok a predicate returning an infinite seq ends
+ok a predicate through a variable is tested the same way
 ([Ann])
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])
@@ -128,6 +131,8 @@ ok explain names a scan's source
 (Di)
 ([Ann Bob] [Ann Cy] [Ann Di] [Cy Di])
 (Bob Cy Di)
+#{[4294967298]} #{[4294967298]}
+#{[4294967298]} #{}
 {:error :nextomic/query-syntax, :message outranks recurses through not; a rule cannot depend on the negation of itself, :clause 1}
 {:error :nextomic/query-syntax, :message ra recurses through not; a rule cannot depend on the negation of itself, :clause 1}
 ok a repeated query and rule set are served from the caches
