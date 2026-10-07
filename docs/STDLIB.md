@@ -260,8 +260,9 @@ are absent.
 
 **`nexis.walk`** is Clojure's `clojure.walk`, written in
 `src/stdlib/walk.nx`. `walk` rebuilds a form in its own kind: a list
-(every seq is a list, SEMANTICS.md §4) as a list with the form's
-metadata, a record by `conj`ing its walked entries onto it, so it
+as a list and any other seq (a lazy seq, a range, a cons) as a
+realized seq, each in order and with the form's metadata, as
+Clojure's `seq?` arm keeps them; a record by `conj`ing its walked entries onto it, so it
 keeps its type, and any other collection by pouring the walked
 elements `into` `(empty form)`, so a sorted collection keeps its
 comparator and every collection its metadata. A map's elements are

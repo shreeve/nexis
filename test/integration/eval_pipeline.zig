@@ -7135,6 +7135,14 @@ test "walk: nexis.walk is Clojure's clojure.walk; records and sorted collections
     try expectOutput("(let [l (atom [])] (nexis.walk/postwalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[:a 1 [1] [:a [1]] {:a [1]}]");
     try expectOutput("(let [l (atom [])] (nexis.walk/prewalk #(do (swap! l conj %) %) {:a [1]}) @l)", "[{:a [1]} [:a [1]] :a [1] 1]");
     try expectOutput("(nexis.walk/macroexpand-all '(when a (-> b c)))", "(if a (do (c b)) nil)");
+    // A seq that is not a list (a lazy seq, a range, a cons onto one)
+    // keeps its order and its metadata, as Clojure's seq? arm keeps them.
+    try expectOutput(
+        \\[(nexis.walk/postwalk identity (map inc [1 2 3])) (nexis.walk/postwalk identity (range 3))
+        \\ (nexis.walk/postwalk identity (cons 1 (map inc [1 2]))) (nexis.walk/keywordize-keys (map identity [{"a" 1} {"b" 2}]))
+        \\ (nexis.walk/postwalk-replace {:a 1} (map identity [:a :b :c])) (nexis.walk/prewalk (fn [x] (if (= x [:a]) (map identity [1 2 3]) x)) [[:a]])
+        \\ (meta (nexis.walk/postwalk identity (with-meta (map inc [1]) {:m 1}))) (seq? (nexis.walk/postwalk identity (map inc [1])))]
+    , "[(2 3 4) (0 1 2) (1 2 3) ({:a 1} {:b 2}) (1 :b :c) [(1 2 3)] {:m 1} true]");
 }
 
 test "require: the clojure.* library names reach the nexis namespaces" {
