@@ -2322,6 +2322,22 @@ test "gc: a realized map block lets its source go; an abandoned one keeps it unt
     try testing.expect(held - heap.liveCount() > 3000);
 }
 
+test "gc: a native's call block holds nothing of its arguments once the call returns" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    // The inner `map` and `filter` are each an argument of the call
+    // outside them, which has returned before `reduce` walks: about
+    // 4 MB and 2 MB realized, kept by the blocks while they stand.
+    try harness.expectResult(&program, "", try program.run("(reduce + (map inc (filter even? (map inc (range 200000)))))"), "10000200000");
+    try testing.expect(heap.peak_live_bytes -| start < 3 << 20);
+}
+
 test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
     try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
     try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");

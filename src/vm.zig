@@ -4069,6 +4069,9 @@ pub const VM = struct {
         // The native may have grown `frames`: the caller is the current
         // frame again, not necessarily at `frame`.
         const caller = self.currentFrame();
+        // The arguments are dead once the call returns (§6); the callee
+        // is a native, which holds no heap value.
+        for (self.stack.items.ptr[base..][0..argc]) |*slot| slot.* = value_mod.nilValue();
         self.slotAt(caller, inst.c.index).* = result;
         return self.nextSafe(caller);
     }
@@ -4180,6 +4183,10 @@ pub const VM = struct {
         defer if (argc > buf.len) self.allocator.free(args);
         @memcpy(args, self.stack.items[args_base..][0..argc]);
         const result = try self.callDirect(callee, args);
+        // The block is dead once the call returns (§6): the compiler
+        // never reads a block after its call (`COMPILER.md` §4.4), so
+        // it keeps nothing it held alive until a later call reuses it.
+        nilSlots(self.stack.items[args_base - 1 ..][0 .. argc + 1]);
         (try self.slotPtr(result_dst)).* = result;
     }
 

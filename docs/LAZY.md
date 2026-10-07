@@ -382,10 +382,13 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   keeps what it realized until the slot is reused: `(reduce + (map inc
   (range 100000000)))` realizes and keeps the mapped seq, where
   Clojure's locals clearing lets it go as it walks; `(reduce + (range
-  100000000))` itself allocates nothing (§7). Clearing a `call:call`
-  argument block after the call and a local at its last use would give
-  Clojure's constant-memory streaming; it is a compiler change with a
-  cost on every call, measured separately.
+  100000000))` itself allocates nothing (§7). A native's call block is
+  cleared when the native returns (`docs/VM.md` §6), so a seq passed
+  to a native and walked by a later one is not kept by the first
+  call's block: in `(reduce + (map inc (filter even? (map inc (range
+  n)))))` only the outermost seq stays. Clearing a local at its last
+  use would give Clojure's constant-memory streaming; it needs
+  liveness in the compiler.
 - `counted?` of a range is false (Clojure's `LongRange` is counted);
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy

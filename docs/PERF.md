@@ -1204,6 +1204,29 @@ programs `destructure` 4,260 → 4,099 M (−3.8%), `map-transient`
 1,127 → 1,103 M, `string-split` 339 → 331 M, `pipeline` 2,542 →
 2,522 M, the rest unchanged; the phases within their ranges.
 
+**A native's call block cleared after the call** (a memory lever,
+`docs/VM.md` §6). Load 5.5 → 5.5 for the kit, 5.5 → 6.0 for the
+programs, whose cycles and phases a busy host spread too wide to
+read:
+
+| Program | Instructions before | after | Peak resident set |
+|---|---:|---:|---:|
+| `lazy3` 3 M, whole process | 1,218 M | 1,095 M (−10%) | 199.2 → 61.2 MB |
+| `lazy3`, per element | 401.4 | 366.4 | |
+| `getnl` | 476.0 | 485.9 (+2.1%) | |
+| `destructure` | 4,099.6 M | 4,141.6 M (+1.0%) | 22.3 MB both |
+| `map-transient` | 2,070.6 M | 2,095.1 M (+1.2%) | 84.8 MB both |
+| `map-build-read` | 3,679.8 M | 3,702.9 M (+0.6%) | 96.3 MB both |
+
+Every other program of the kit and of `bench/compare` retired the same
+instructions within 0.4%, and every other resident set is unchanged:
+in `freq-group`, `pipeline` and `sort` no seq a native was given is
+walked after its call. The clearing costs about ten instructions a
+call of a native that is not a leaf, against the 24 the inline
+deep-data check above saved. Less marking pays for it in `lazy3`,
+whose inner seqs, 138 MB of them, are garbage once the call that
+took each has returned.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1381,6 +1404,15 @@ Each lever is a measured change: a before/after from `zig build bench`
   6,044 → 5,755 M instructions and 246.9 → 229.9 ms.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
+
+- *Clearing a closure's call block on return* (the part of the
+  callee's window in the caller's frame, from the callee slot to the
+  caller's stack extent), beside a native's (§3.21): `fib` 280.3 →
+  296.0 instructions a call (+5.6%), `gcall` 270.0 → 284.0 (+5.2%),
+  cycles unchanged, on the host of §3.21 (`bench/micro/run.clj
+  --rounds 3`, load 4.4). A closure's arguments are its own slots
+  while it runs, so the clearing frees nothing until the caller's
+  next call reuses them; it was not kept.
 
 - *Results through the transient's `conj!`*: `vectorConjBang` for
   every value, the tail's capacity read from its slab each time, cost

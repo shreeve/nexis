@@ -281,6 +281,20 @@ instruction.
 the callee's window; values live across the call sit strictly below
 A (a compiler invariant).
 
+**After the call.** The compiler never reads a block after its call
+(`COMPILER.md` §4.4), so a call of anything but a closure or a leaf
+clears its block before the result lands in `slot[C]`: the arguments
+of a native called in place (§8), whose callee is a native and holds
+no heap value, and the whole block of a call through the general
+entry (a protocol fn, a Var, a lookup, a native past the in-place
+cases). A sequence a native was given is then not kept alive by the
+block until a later call reuses its slots. A leaf's block and an
+in-place keyword lookup's are left as they are: they hold what a
+leaf takes (numbers, a vector to index), and clearing them would
+cost every arithmetic call. A closure's arguments are its own slots
+and stay as its body leaves them; clearing its window's overlap with
+the caller's frame on return cost 5% of a call (`docs/PERF.md` §6).
+
 `call:tailcall` traps `UnimplementedOpcode` and the compiler never
 emits it; `recur` compiles to a jump (§11). `call:return A` and
 `call:return-nil` deliver `slot[A]` or nil: pop the frame, restore

@@ -65,7 +65,9 @@ VM's roots, in the order it marks them:
 1. **The backing stack, in full** (`vm.stack.items`): every slot of
    every frame's window and the slots above them. A slot above a
    popped frame keeps its stale value until the slot is grown into
-   again, which retains garbage for a while and is sound. Between
+   again, which retains garbage for a while and is sound. A native
+   call's block is cleared when the native returns (`docs/VM.md` §6),
+   so what a native was given is not retained through it. Between
    top-level forms the stack holds nothing: `retargetTop` and
    `resetAfterError` clear every slot, so a form keeps nothing an
    earlier one left alive. A slot holding a `cell_internal` Value
