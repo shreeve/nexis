@@ -452,7 +452,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `var?` | 1 | Whether `x` is a Var |
 | `var-get` | 1 | The value of the Var (`deref`); a non-Var is `:kind-mismatch` |
 | `find-var` | 1 | `(find-var 'ns/name)`: the Var the qualified symbol names, nil when the namespace has none; `:no-such-namespace` when there is no such namespace |
-| `load-string`, `load-file` | 1 | Read and evaluate each form of the string (of the file's text) in turn in the current namespace, as a top-level `do` runs them through `eval`; the last form's value, nil for none |
+| `load-string`, `load-file` | 1 | Read and evaluate each form of the string (of the file's text) in turn in the current namespace through `eval`, so a form that does not read (a stray closing delimiter, an unfinished form) raises `:reader-error` after the ones before it ran; the namespace in force when it was called is restored afterwards, whether it returns or throws, as Clojure's `Compiler.load` binds `*ns*`; the last form's value, nil for none. Each form is read as `read-string` reads it, so a syntax-quote in the text is `:reader-error` |
 | `array-map` | 0+ | `(apply hash-map kvs)`: a map of up to eight entries keeps its insertion order (§5), all that Clojure's array map promises; a larger one is a hash map, as Clojure's becomes one past eight |
 | `bigint`, `biginteger` | 1 | `long`: one integer domain (BIGNUM.md), so a number truncated to an integer of any size |
 | `decimal?`, `inst?` | 1 | false: there are no decimals and no instants (PLAN §4) |

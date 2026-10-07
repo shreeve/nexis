@@ -1662,6 +1662,18 @@ test "core: var-get, find-var, load-string" {
     , "[4 #'user/x #'nexis.core/inc nil :no-such-namespace :kind-mismatch 6 2 nil]");
 }
 
+test "core: load-string reads and evaluates a form at a time, and leaves the namespace as it found it" {
+    // As Clojure's Compiler.load binds *ns*: a namespace the text
+    // switches to is left when it returns or throws.
+    try expectLoaded("(load-string \"(ns foo) (def inner 1)\") (def q 1) [(resolve 'foo/inner) (resolve 'user/q) *ns*]", "[#'foo/inner #'user/q user]");
+    try expectLoaded("(try (load-string \"(ns foo2) (throw :x)\") (catch :x e e)) (def q 1) [(resolve 'user/q) *ns*]", "[#'user/q user]");
+    // The forms before a stray delimiter or an unfinished form run.
+    try expectLoaded("[(try (load-string \"(def zz 1)) (def yy 2\") (catch :reader-error e :reader-error)) (resolve 'user/zz) (resolve 'user/yy)]", "[:reader-error #'user/zz nil]");
+    try expectLoaded("[(try (load-string \"(def aa 1) (def bb\") (catch :reader-error e :reader-error)) (resolve 'user/aa)]", "[:reader-error #'user/aa]");
+    // A form sees the definitions and macros of the forms before it.
+    try expectLoaded("(load-string \"(defmacro twice [x] (list '* 2 x)) #_(skipped) (def t (twice 4)) ; done\") t", "8");
+}
+
 test "core: partitionv, partitionv-all, splitv-at" {
     try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
     try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
