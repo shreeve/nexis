@@ -420,10 +420,15 @@ so there is no queue; emdb's write lock is the transactor.
    tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
    counters including `"t"`.
 7. **Commit**: `wtxn.commit()`, after which the idents the transaction
-   minted, renamed or read reach the connection's cache; until then
-   they live in the transaction alone, since the write transaction
-   sees its own uncommitted names. On any error `wtxn.abort()`: nothing
-   partial can exist (emdb INV-SUB04), in the file or in the cache.
+   minted, renamed or read reach the connection's cache, and its
+   attribute counts the cached schema; until then they live in the
+   transaction alone, since the write transaction sees its own
+   uncommitted names. On any error `wtxn.abort()`: nothing partial can
+   exist (emdb INV-SUB04), in the file or in the cache. One error comes
+   after the commit stands: a commit that syncs its meta page (`:sync
+   :full`) and whose meta sync fails is published to every reader, so
+   the caches take it as they take any commit, and `transact!` or
+   `excise!` then raises `:db/durability-unknown` (`docs/DB.md` §8).
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`. `:tx` and the
    rows carry the transaction number `t`; the transaction entity is
