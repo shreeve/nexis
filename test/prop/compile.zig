@@ -319,6 +319,10 @@ const cases = [_]Case{
     // The general way from a native's callback leaves the native's
     // roots as it found them.
     .{ .src = "[(mapv (fn* [p] (:a p)) [[1] [2]]) (mapv (fn* [p] (:a p 0)) [(sorted-map :a 1) \"s\"]) (reduce (fn* [a p] (+ a (:a p 1))) 0 [[1] [2]])]", .out = "[[nil nil] [1 0] 2]" },
+    // Destructuring looks a keyword or symbol key up as the key's call
+    // does and any other key with get, on every kind of source.
+    .{ .src = "(let [{:keys [a b] :syms [c] :strs [d] e :e f 'f g 0 :or {b 2 e 5}} {:a 1 'c 3 \"d\" 4 'f 6 0 7}] [a b c d e f g])", .out = "[1 2 3 4 5 6 7]" },
+    .{ .src = "(let [{:keys [a]} \"str\" {:keys [b] :or {b 9}} 5 {x :x} [1 2] {:keys [k]} (list :k 7) {:keys [s]} (sorted-map :s 8)] [a b x k s])", .out = "[nil 9 nil 7 8]" },
     // Recursion through the self-name is lexical: the function a Var
     // held keeps calling itself after the Var is redefined
     // (CLOJURE-REVIEW.md, defn).
@@ -922,8 +926,8 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(nexis.test/is (pos? a))", .len = 8 },
         .{ .form = "(nexis.test/is (thrown? :x (g a)))", .len = 16 },
         .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
-        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 24 },
-        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 29, .inner = true },
+        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 19 },
+        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 26, .inner = true },
         .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
         .{ .form = "(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))", .len = 9, .inner = true },
         .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },

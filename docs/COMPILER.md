@@ -400,8 +400,8 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(is (pos? a))` | 8 |
 | `(is (thrown? :x (g a)))` | 16 |
 | `(let [[x y & r] xs] (g x y r))` | 20 |
-| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments (MACROEXPAND.md §10) | 24 |
-| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 29 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments, each key a lookup (MACROEXPAND.md §10) | 19 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 26 |
 | `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
 | `(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))`, the closure's routine: two self-calls (§5.5) | 9 |
 | `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |

@@ -1900,13 +1900,13 @@ fn destructureVector(b: Builder, elems: []const *Form, src: *Form, out: *std.Arr
 /// into one):
 ///
 ///   {... :as name}     name src, before the keys
-///   {:keys [a b]}      a (get src :a), b (get src :b)
-///   {:keys [p/a :b]}   a (get src :p/a), b (get src :b)
-///   {:p/keys [a]}      a (get src :p/a)
+///   {:keys [a b]}      a (:a src), b (:b src)
+///   {:keys [p/a :b]}   a (:p/a src), b (:b src)
+///   {:p/keys [a]}      a (:p/a src)
 ///   {:strs [a]}        a (get src "a")
-///   {:syms [a]}        a (get src 'a); {:p/syms [a]} (get src 'p/a)
-///   {a :a-key}         a (get src :a-key)
-///   {... :or {a 10}}   a (get src ... 10), the default when absent
+///   {:syms [a]}        a ('a src); {:p/syms [a]} ('p/a src)
+///   {a :a-key}         a (:a-key src); {a k} (get src k)
+///   {... :or {a 10}}   a (:a src 10), the default when absent
 fn destructureMap(b: Builder, entries: []const *Form, src: *Form, out: *std.ArrayList(*Form)) ExpandError!void {
     const ctx = b.ctx;
     if (entries.len % 2 != 0) return ctx.fail(b.origin, "destructuring: a map pattern needs pairs", .{});
@@ -1975,8 +1975,21 @@ fn destructureKeyEntry(b: Builder, group: KeyGroup, group_ns: ?[]const u8, entry
     try out.appendSlice(b.ctx.allocator, &.{ try makeSymbol(b.ctx, parts.name, b.origin), try getCall(b, src, key, lookupDefault(defaults, parts.name)) });
 }
 
+/// `(key src default?)` for a keyword or quoted symbol key, which is
+/// `get`'s lookup in one instruction (COMPILER.md §4.3), else
 /// `(nexis.core/get src key default?)`.
 fn getCall(b: Builder, src: *Form, key: *const Form, default: ?*const Form) ExpandError!*Form {
+    // `'s` as read, or `(quote s)` as `:syms` builds it.
+    const quoted = switch (key.datum) {
+        .quote => |q| q.datum == .symbol,
+        .list => |l| l.len == 2 and l[0].datum == .symbol and l[0].datum.symbol.ns == null and
+            std.mem.eql(u8, l[0].datum.symbol.name, "quote") and l[1].datum == .symbol,
+        else => false,
+    };
+    if (key.datum == .keyword or quoted) {
+        if (default) |d| return b.list(.{ key, src, d });
+        return b.list(.{ key, src });
+    }
     if (default) |d| return b.list(.{ "nexis.core/get", src, key, d });
     return b.list(.{ "nexis.core/get", src, key });
 }
