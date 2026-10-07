@@ -258,8 +258,8 @@ branching back while it holds (COMPILER.md §5.6, §5.7).
   space within 60 bytes and followed by ` ...` and, for a collection,
   its item count when longer (`c0=[0 1 2 ... 22 ...(5000 items)`); a
   var its namespace-qualified name (`v0=nexis.core/println`). Operand B of `call:call`,
-  `call:tailcall` and every `coll:*` is a raw immediate (VM.md §4.5)
-  and prints as `#n`. The wide field prints as what it names: a jump
+  `call:tailcall`, `call:self` and every `coll:*` is a raw immediate
+  (VM.md §4.5) and prints as `#n`. The wide field prints as what it names: a jump
   or `try-exit` target as its pc (`j0009`), `mov:load-const`'s
   constant and a `var:*` Var as a `c` or `v` operand would,
   `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
