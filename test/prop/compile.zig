@@ -1190,7 +1190,7 @@ fn growthRatios(failed: *bool) void {
     nx.stack.arm(480 << 20);
     for (std.enums.values(Growing)) |shape| {
         var nanos: [2]u64 = undefined;
-        for (&nanos, [_]usize{ 2500, 10_000 }) |*t, n| {
+        for (&nanos, [_]usize{ 1250, 10_000 }) |*t, n| {
             const src = shape.source(std.heap.page_allocator, n) catch return;
             defer std.heap.page_allocator.free(src);
             t.* = bestRunNanos(src) catch |err| {
@@ -1199,11 +1199,12 @@ fn growthRatios(failed: *bool) void {
                 return;
             };
         }
-        // Four times the input takes about four times as long when the
-        // cost is linear, sixteen when it is quadratic.
+        // Eight times the input takes about eight times as long when the
+        // cost is linear, sixty-four when it is quadratic; the bound
+        // between them leaves room for a loaded host's noise.
         const ratio = @as(f64, @floatFromInt(nanos[1])) / @as(f64, @floatFromInt(@max(nanos[0], 1)));
-        if (ratio > 9) {
-            std.debug.print("\n  {t}: {d} ns at 2500, {d} ns at 10000 ({d:.1}x)\n", .{ shape, nanos[0], nanos[1], ratio });
+        if (ratio > 20) {
+            std.debug.print("\n  {t}: {d} ns at 1250, {d} ns at 10000 ({d:.1}x)\n", .{ shape, nanos[0], nanos[1], ratio });
             failed.* = true;
         }
     }
