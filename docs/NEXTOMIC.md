@@ -782,7 +782,9 @@ hook roots, for the query's life, every heap value the pipeline keeps
 across a later call: a function result it binds, a custom aggregate's
 result, and the values it builds itself (a `tuple` or `fulltext`
 result bound as one value, an aggregate's vector or set;
-`docs/GC.md` §11.5); a predicate's result is tested and dropped.
+`docs/GC.md` §11.5); a predicate's result is tested as `if` tests it
+and dropped, never realized, so a lazy seq, empty or infinite, is
+true.
 
 **fulltext.** `[(fulltext $ :attr "needle") [[?e ?v]]]` binds, for a
 string attribute carrying `:db/fulltext` at the view's basis, every
@@ -905,8 +907,9 @@ lazily wherever a list is taken (a datom form and a lookup ref are
 vectors, so a lazy one is not), and no code runs while store state is
 in flight; a body's throw propagates from the native before it
 starts. A
-transaction function's result and a query function's are realized the
-same way before Nextomic reads them. Nextomic returns no lazy seq: `q`,
+transaction function's result, and a function's result a query binds
+or aggregates, are realized the same way before Nextomic reads them; a
+predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 `datoms`, `tx-range` and `history` are realized.
 
 | form | semantics |

@@ -51,6 +51,9 @@ Cy
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann] [Bob] [Di])
 ([Ann] [Bob] [Cy] [Di] [Edward] [Flo])
+ok a predicate's lazy seq is truthy and stays unrealized
+ok a predicate returning an infinite seq ends
+ok a predicate through a variable is tested the same way
 ([Ann])
 ([Ann] [Cy] [Di] [Edward] [Flo])
 ([Ann 31] [Bob 27] [Cy 42] [Di 31] [Edward 56] [Flo 34])

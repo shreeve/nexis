@@ -19,10 +19,10 @@
 //! Rooting: a value the pipeline keeps in a relation cell or a group
 //! (a function's result it binds, a custom aggregate's result, a
 //! `tuple` bound as one value, an aggregate's vector or set) must
-//! survive the next call back into the VM, so `root` pushes it on a
-//! root scope that lives as long as the `q` call (GC.md §11.5). An
-//! immediate needs no root and is not pushed, nor is a predicate's
-//! result, which is tested and dropped.
+//! survive the next call back into the VM, so `keep` and `root` push
+//! it on a root scope that lives as long as the `q` call (GC.md
+//! §11.5). An immediate needs no root and is not pushed, nor is a
+//! predicate's result, which is tested and dropped unrealized.
 //!
 //! Functions: a predicate or function-binding symbol that is not a
 //! built-in resolves through the namespace registry the way the
@@ -103,17 +103,19 @@ const Hook = struct {
     }
 
     fn callHook(self: *Hook) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply, .root = &root };
+        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply, .keep = &keep, .root = &root };
     }
 
     fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
-        return self.listed(try self.vm.callValue(try self.resolve(sym), args));
+        return self.vm.callValue(try self.resolve(sym), args);
     }
 
-    /// A function's result, realized and made lists as the query's
-    /// inputs are (docs/LAZY.md §8), rooted for the query's life.
-    fn listed(self: *Hook, r: Value) anyerror!Value {
+    /// A function's result the query binds or aggregates, realized and
+    /// made lists as the query's inputs are (docs/LAZY.md §8), rooted
+    /// for the query's life.
+    fn keep(ctx: *anyopaque, r: Value) anyerror!Value {
+        const self: *Hook = @ptrCast(@alignCast(ctx));
         if (!r.kind().isHeap()) return r;
         try self.scope.push(r);
         const l = try seq_mod.asLists(self.vm, r);
@@ -132,7 +134,7 @@ const Hook = struct {
     fn apply(ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value {
         const self: *Hook = @ptrCast(@alignCast(ctx));
         if (vm_mod.isLookupCallable(f.kind())) return vm_mod.callLookupIn(self.vm, f, args);
-        return self.listed(try self.vm.callValue(f, args));
+        return self.vm.callValue(f, args);
     }
 
     /// The bound value the symbol names, or a thrown
