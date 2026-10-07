@@ -229,15 +229,15 @@ routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
   0001  mov:load-const      s3  c0=0  ; 5:13
   0002  mov:load-const      s4  c0=0  ; 5:19
-  0003  cmp:lt              s5  s3  c1=10  ; 6:9
+  0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 6:9
   0004  jump:if-false       s5  j0009  ; 6:5
-  0005  math:add            s4  s4  s3  ; 7:22
-  0006  math:add            s3  s3  c2=1  ; 7:14
-  0007  cmp:lt              s5  s3  c1=10  ; 6:9
+  0005  math:add.ss         s4  s4  s3  ; 7:22
+  0006  math:add.sc         s3  s3  c2=1  ; 7:14
+  0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
   0008  jump:if-true        s5  j0005  ; 6:5
-  0009  mov:move            s2  s4  -  ; 8:7
+  0009  mov:move.s          s2  s4  -  ; 8:7
   0010  call:call           s1  #1  s0  ; 4:1
-  0011  call:return         s0  -  -
+  0011  call:return.s       s0  -  -
 ```
 
 The loop is pcs 5-8, four instructions and three dispatches per
@@ -250,7 +250,8 @@ branching back while it holds (COMPILER.md §5.6, §5.7).
   it was lowered from, its slot count, its fixed arity (`+rest` when
   variadic) and its upvalue count.
 - One line per instruction: the pc, `group:variant` as VM.md §10
-  names them, then operands A, B and C, or operand A and the wide
+  names them (a quickened variant as its base's name and its form,
+  `math:add.sc`, VM.md §10.10), then operands A, B and C, or operand A and the wide
   field for an instruction that has one (VM.md §3). An operand prints
   its kind letter and index (VM.md §4: `s` slot, `c` constant, `v`
   var, `u` upvalue, `i` intern, `e` durable), `-` when unused. A

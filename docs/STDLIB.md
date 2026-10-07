@@ -49,8 +49,9 @@ had and in an order that puts every entry back in its slot, so the map
 iterates as after the boot (`ns-interns`, `:refer :all`); each Var's
 root, metadata and flags (natives the sources did not touch are left as
 step 2 installed them); the record types and protocols and their
-implementations; the routines the closures run, with their code,
-constants, Var tables, captures, `try` table and spans into the
+implementations; the routines the closures run, with their code as
+the compiler quickened it (`docs/VM.md` §10.10, so loading one costs
+no rewrite), constants, Var tables, captures, `try` table and spans into the
 embedded text, so an error inside a library function reports the same
 `file:line:col`; the heap values all of these reach, with their
 metadata and sharing (a cell or atom is made empty, and filled once
