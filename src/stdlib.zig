@@ -618,11 +618,16 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
     return list_mod.fromSlice(vm.ensureHeap(), args) catch VmError.OutOfMemory;
 }
 
-/// `(list* a b ... s)` → the leading args consed onto `(seq s)`, the
-/// last arg's seq itself when there are none: nil for an empty `s`,
-/// as Clojure's.
+/// `(list* a b ... s)` → the leading args consed onto `s` as `cons`
+/// conses, so a lazy `s` is not realized; the last arg's seq itself
+/// when there are none: nil for an empty `s`, as Clojure's.
 fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
-    var result = try seq_mod.seqOf(vm, args[args.len - 1]);
+    const s = args[args.len - 1];
+    if (args.len == 1) return seq_mod.seqOf(vm, s);
+    var result = switch (s.kind()) {
+        .nil, .list, .lazy_seq => s,
+        else => try seq_mod.seqOf(vm, s),
+    };
     var i = args.len - 1;
     while (i > 0) {
         i -= 1;

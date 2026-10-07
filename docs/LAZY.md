@@ -140,7 +140,9 @@ step, as `LazySeq.cons`; `peek`, `pop` and `contains?` are
 `cons` puts a list cell in front of nil, a list, or the view of a
 vector (`(cons 0 [1 2])` is still a list), and a lazy seq's cons cell in
 front of a lazy seq, which it does not realize. `list*` conses its
-leading arguments onto the seq of its last.
+leading arguments onto its last as `cons` does, so a lazy last
+argument is not realized; with no leading arguments it is the seq of
+its argument.
 
 **`realized?`** is true of a lazy block whose body has run, and of a
 cons or a chunked cons (Clojure's throws for `Cons`: answering is the

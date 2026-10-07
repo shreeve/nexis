@@ -2452,6 +2452,8 @@ test "lazy: reduce over an unrealized range allocates nothing" {
 
 test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
+    // list* conses onto its last argument as cons does, not realizing it.
+    try expectOutput("(let [n (atom 0) s (list* 1 2 (lazy-seq (swap! n inc) [3]))] [@n (vec s) @n (class s) (list* 1 []) (list* 1 nil) (list* 1 ()) (list* 1 #{2})])", "[0 [1 2 3] 1 :lazy_seq (1) (1) (1) (1 2)]");
     try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");
     try expectOutput("(let [s (with-meta (lazy-seq [1 2]) {:m 1})] [(meta s) s (meta (rest s)) (meta (next s)) (= s [1 2])])", "[{:m 1} (1 2) nil nil true]");
     try expectOutput("(let [n (atom 0) f (fn f [i] (lazy-seq (swap! n inc) (when (< i 5) (cons i (f (inc i)))))) s (f 0)] [(realized? s) (do (dorun 2 s) @n) (identical? s (doall s)) @n (dorun s) (doall 2 [1 2 3])])", "[false 3 true 6 nil [1 2 3]]");
