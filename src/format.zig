@@ -37,7 +37,9 @@
 //!   §F3. Recursion is bounded by the native stack, not by a depth
 //!        cap. Persistent collections can't self-cycle without an
 //!        atom in the way, and atoms format opaquely, so recursion is
-//!        finite. A collection nested past the stack guard prints as
+//!        finite. A realized lazy seq can be a cycle (`(repeat x)`);
+//!        its walk stops with `...` when it meets a cell again, so
+//!        every print ends. A collection nested past the stack guard prints as
 //!        `#<too deep>` and counts an overflow, which the VM raises as
 //!        `:stack-overflow` (SEMANTICS §2.7).
 
@@ -331,7 +333,13 @@ fn formatList(
 
 /// A lazy seq prints as a list of its elements. Up to a block whose
 /// body has not run, which the printer never runs: there it writes
-/// `...` and closes the list.
+/// `...` and closes the list. A realized chain may be a cycle (`(repeat
+/// x)` is one cell whose rest is its own block, as is a seq whose body
+/// returns itself), so the walk also stops with `...` once it comes
+/// back to a cell it passed: Brent's cycle finding, which keeps one
+/// marked cell and moves it at each power of two, so the print ends
+/// within three times the length of the cycle and the cells before it
+/// (§F3).
 fn formatLazy(
     v: Value,
     mode: FormatMode,
@@ -340,6 +348,9 @@ fn formatLazy(
 ) Error!void {
     try writer.writeByte('(');
     var it = lazy_mod.Cursor.init(v);
+    var mark = it.rest;
+    var power: usize = 1;
+    var steps: usize = 0;
     var first = true;
     while (true) : (first = false) {
         const x = it.next() catch {
@@ -349,6 +360,19 @@ fn formatLazy(
         } orelse break;
         if (!first) try writer.writeByte(' ');
         try format(x, mode, writer, interner);
+        // Between cells: past a chunk's elements, and before a list,
+        // which ends.
+        if (it.items.len > 0 or it.list_cursor != null or it.rest.kind() != .lazy_seq) continue;
+        if (it.rest.identicalTo(mark)) {
+            try writer.writeAll(" ...");
+            break;
+        }
+        steps += 1;
+        if (steps == power) {
+            mark = it.rest;
+            power *= 2;
+            steps = 0;
+        }
     }
     try writer.writeByte(')');
 }
@@ -480,7 +504,25 @@ fn formatForTest(v: Value, mode: FormatMode, interner: ?*const intern_mod.Intern
     return try w.toOwnedSlice();
 }
 
-test "a chunked cons prints its offset onward; an unrealized block prints as ..." {
+/// A realized block whose seq is `items`, as cons cells or one chunk,
+/// followed by the block itself: a cycle, as `(repeat x)` makes one.
+fn cycleForTest(heap: *heap_mod.Heap, items: []const Value, chunked: bool) !Value {
+    const head = try lazy_mod.unrealized(heap, 0, &.{value_mod.nilValue()});
+    var s = head;
+    if (chunked) {
+        s = try lazy_mod.chunkedOf(heap, items, head);
+    } else {
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            s = try lazy_mod.cons(heap, items[i], s);
+        }
+    }
+    lazy_mod.setRealized(head, s);
+    return head;
+}
+
+test "a chunked cons prints its offset onward; an unrealized block, or a cell met again, prints as ..." {
     var heap = heap_mod.Heap.init(std.testing.allocator);
     defer heap.deinit();
     const fx = struct {
@@ -496,6 +538,10 @@ test "a chunked cons prints its offset onward; an unrealized block prints as ...
         .{ .v = try lazy_mod.realizedWithMeta(&heap, value_mod.nilValue(), null), .expect = "()" },
         .{ .v = try lazy_mod.cons(&heap, fx(0), pending), .expect = "(0 ...)" },
         .{ .v = pending, .expect = "(...)" },
+        .{ .v = try cycleForTest(&heap, &.{fx(1)}, false), .expect = "(1 ...)" },
+        .{ .v = try cycleForTest(&heap, &.{ fx(1), fx(2) }, false), .expect = "(1 2 1 ...)" },
+        .{ .v = try cycleForTest(&heap, &.{ fx(1), fx(2), fx(3) }, true), .expect = "(1 2 3 ...)" },
+        .{ .v = try lazy_mod.cons(&heap, fx(0), try cycleForTest(&heap, &.{ fx(1), fx(2), fx(3) }, false)), .expect = "(0 1 2 3 1 2 ...)" },
     };
     for (cases) |c| {
         const got = try formatForTest(c.v, .readable, null);

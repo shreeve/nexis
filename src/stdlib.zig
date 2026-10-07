@@ -621,11 +621,16 @@ fn fnList(vm: *VM, args: []const Value) VmError!Value {
     return list_mod.fromSlice(vm.ensureHeap(), args) catch VmError.OutOfMemory;
 }
 
-/// `(list* a b ... s)` → the leading args consed onto `(seq s)`, the
-/// last arg's seq itself when there are none: nil for an empty `s`,
-/// as Clojure's.
+/// `(list* a b ... s)` → the leading args consed onto `s` as `cons`
+/// conses, so a lazy `s` is not realized; the last arg's seq itself
+/// when there are none: nil for an empty `s`, as Clojure's.
 fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
-    var result = try seq_mod.seqOf(vm, args[args.len - 1]);
+    const s = args[args.len - 1];
+    if (args.len == 1) return seq_mod.seqOf(vm, s);
+    var result = switch (s.kind()) {
+        .nil, .list, .lazy_seq => s,
+        else => try seq_mod.seqOf(vm, s),
+    };
     var i = args.len - 1;
     while (i > 0) {
         i -= 1;
@@ -705,10 +710,9 @@ fn fnSecond(vm: *VM, args: []const Value) VmError!Value {
     return nthOfSeq(vm, args[0], 1);
 }
 
-/// A count of `take` or `drop`: any integer, negative ones none; a
-/// bignum is all or none, as Clojure's counts one down.
+/// A count of `take` or `drop` (`requireCount`) as the fixnum the
+/// producer counts down.
 fn lazyCount(v: Value) VmError!Value {
-    if (v.kind() == .bignum) return value_mod.fromFixnum(if (bignum_mod.isNegative(v)) 0 else value_mod.fixnum_max).?;
     return value_mod.fromFixnum(@intCast(try requireCount(v))).?;
 }
 
@@ -2502,10 +2506,36 @@ fn fnReverse(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items);
 }
 
-/// A count argument. Negative counts mean zero everywhere Clojure
-/// takes one (`nthrest`, `split-at`, `take-last`, `repeat`, ...).
+/// A count argument of a sequence function (`take`, `drop`, `nthrest`,
+/// `take-last`, `repeatedly`, `dorun`, ...): any number, as Clojure's
+/// count one down while it is positive, so a fraction rounds up
+/// (`(take 2.5 xs)` takes 3) and NaN or a count at most 0 is none; one
+/// past the fixnum range, a bignum or a float, is all.
 fn requireCount(v: Value) VmError!usize {
-    return @intCast(@max(try requireFixnum(v), 0));
+    if (v.isFixnum()) return @intCast(@max(v.asFixnum(), 0));
+    if (v.isFloat()) return floatCount(@ceil(v.asFloat()));
+    if (v.kind() == .bignum) return if (bignum_mod.isNegative(v)) 0 else count_max;
+    return VmError.KindMismatch;
+}
+
+const count_max: usize = @intCast(value_mod.fixnum_max);
+
+/// A whole float as a count: NaN or at most 0 is none, past the
+/// fixnum range all.
+fn floatCount(f: f64) usize {
+    if (!(f > 0)) return 0;
+    if (f >= @as(f64, @floatFromInt(count_max))) return count_max;
+    return @intFromFloat(f);
+}
+
+/// `repeat`'s count, Clojure's `(long n)` of it: a float truncated, NaN
+/// 0 and an infinity `:invalid-argument`; at most 0 is none, and past
+/// the fixnum range all.
+fn repeatCount(v: Value) VmError!usize {
+    if (!v.isFloat()) return requireCount(v);
+    const f = v.asFloat();
+    if (std.math.isInf(f)) return VmError.InvalidArgument;
+    return floatCount(@trunc(f));
 }
 
 /// `(nthrest coll n)` → coll without its first n elements, as a
@@ -2513,9 +2543,8 @@ fn requireCount(v: Value) VmError!usize {
 /// Clojure's, coll itself when n is not positive, or coll is nil or
 /// an empty collection other than a vector.
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
-    const n = try requireFixnum(args[1]);
-    if (n <= 0 or args[0].isNil()) return args[0];
-    const count: usize = @intCast(n);
+    const count = try requireCount(args[1]);
+    if (count == 0 or args[0].isNil()) return args[0];
     switch (args[0].kind()) {
         .list => return list_mod.drop(args[0], count),
         .persistent_vector => {
@@ -2586,9 +2615,9 @@ fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
 /// (docs/LAZY.md §7).
 fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeat, args[0..1]);
-    const n = try requireCount(args[0]);
+    const n = try repeatCount(args[0]);
     if (n == 0) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
-    return seq_mod.make(vm, seq_mod.op_repeat_n, &.{ value_mod.fromFixnum(@intCast(@min(n, @as(usize, @intCast(value_mod.fixnum_max))))).?, args[1] });
+    return seq_mod.make(vm, seq_mod.op_repeat_n, &.{ value_mod.fromFixnum(@intCast(n)).?, args[1] });
 }
 
 /// `(repeatedly f)` → the infinite lazy seq of `(f)` calls, each made
@@ -2596,7 +2625,7 @@ fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
 fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeatedly, args[0..1]);
     const n = try requireCount(args[0]);
-    return seq_mod.make(vm, seq_mod.op_repeatedly, &.{ args[1], value_mod.fromFixnum(@intCast(@min(n, @as(usize, @intCast(value_mod.fixnum_max))))).? });
+    return seq_mod.make(vm, seq_mod.op_repeatedly, &.{ args[1], value_mod.fromFixnum(@intCast(n)).? });
 }
 
 /// `(iterate f x)` → the infinite lazy seq `x`, `(f x)`, `(f (f x))`

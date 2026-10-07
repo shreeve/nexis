@@ -2311,6 +2311,15 @@ test "lazy: =, hash, a map's key and printing realize a lazy seq nested anywhere
     try expectOutput("(try {[] 1 (lazy-seq (throw :z)) 2} (catch any e e))", ":z");
     try expectOutput("(try (hash [(lazy-seq (throw :a)) (lazy-seq (throw :b))]) (catch any e e))", ":a");
     try expectOutput("[(try (hash [(lazy-seq (throw :a))]) (catch any e e)) (= [(lazy-seq [1])] [[1]]) (contains? #{[1]} (lazy-seq [1]))]", "[:a true true]");
+    // A lazy key is realized when a map or set takes it, an array form's
+    // included, and its throw surfaces from the call that inserted it.
+    try expectOutput("(let [a (lazy-seq [1]) b (lazy-seq [2]) c (lazy-seq [3]) d (lazy-seq [4]) e (lazy-seq [5]) f (lazy-seq [6])] (into #{} [a]) (conj #{} b) (assoc {} c 1) (frequencies [d]) (group-by identity [e]) (assoc {:k 1} f 2) (mapv realized? [a b c d e f]))", "[true true true true true true]");
+    try expectOutput("[(try (count (into #{} [(lazy-seq (throw :in))])) (catch any e e)) (try (frequencies [(lazy-seq (throw :fq))]) (catch any e e)) (try (group-by identity [(lazy-seq (throw :gb))]) (catch any e e)) (try (conj #{} (lazy-seq (throw :cj))) (catch any e e)) (try (reduce conj #{} [(lazy-seq (throw :rc))]) (catch any e e)) (try (assoc {} [(lazy-seq (throw :nested))] 1) (catch any e e)) (try (into {} [[(lazy-seq (throw :im)) 1]]) (catch any e e)) (try (zipmap [(lazy-seq (throw :z))] [1]) (catch any e e))]", "[:in :fq :gb :cj :rc :nested :im :z]");
+    // A native that parked a body's throw and then fails for another
+    // reason drops it: nothing later raises it. One that keeps going
+    // keeps it across a failing call it makes, and raises it at its end.
+    try expectOutput("(let [r (try (group-by (fn [x] (cond (= x 3) (throw :other) (= x 2) (lazy-seq (throw :x)) :else [1])) [1 2 3]) (catch any e [:caught e]))] [r (try (= [(lazy-seq [1])] [[1]]) (catch any e [:later e])) (try (hash [(lazy-seq (throw :y))]) (catch any e e))])", "[[:caught :other] true :y]");
+    try expectOutput("(try (group-by (fn [x] (cond (= x 3) (do (try (reduce + [:a]) (catch any e nil)) [3]) (= x 2) (lazy-seq (throw :x)) :else [1])) [1 2 3]) (catch any e [:caught e]))", "[:caught :x]");
     // = walks in step: an infinite seq against a finite one ends.
     try expectOutput("(do (defn nat [n] (lazy-seq (cons n (nat (inc n))))) [(= (nat 0) [0 1]) (= [0 1] (nat 0)) (= [(nat 0)] [[0 1]]) (not= (nat 0) '(0))])", "[false false false true]");
     // An in-place edit of a transient realizes its key first, so the
@@ -2323,6 +2332,10 @@ test "lazy: a macro's result, eval's form and an unquote-splice may be lazy" {
     try expectOutput("(do (defmacro m [] (lazy-seq (list '+ 1 2))) (m))", "3");
     try expectOutput("(do (defmacro m2 [] (list 'quote (lazy-seq [1 (lazy-seq [2])]))) [(m2) (class (m2)) (class (second (m2)))])", "[(1 (2)) :list :list]");
     try expectOutput("(eval (lazy-seq (list '+ 1 2)))", "3");
+    // A sorted collection holding one is rebuilt in its order.
+    try expectOutput("(do (defmacro m4 [] (sorted-map 1 (map identity '(+ 1 2)))) [(m4) (class (m4))])", "[{1 3} :sorted_map]");
+    try expectOutput("[(eval (sorted-map 1 (list 'quote (map inc [1 2])))) (eval (list 'quote (sorted-map :a (sorted-map :b (map inc [1]))))) (class (eval (sorted-map 2 (list 'quote (map inc [1])) 1 0)))]", "[{1 (2 3)} {:a {:b (2)}} :sorted_map]");
+
     try expectOutput("(let [xs (lazy-seq [1 2])] `(a ~@xs))", "(user/a 1 2)");
     try expectOutput("(let [n (atom 0) xs (lazy-seq (swap! n inc) [1 2])] [`(~@xs ~@xs) @n])", "[(1 2 1 2) 1]");
     try expectOutput("(try (let [xs (lazy-seq (throw :splice))] `(a ~@xs)) (catch any e e))", ":splice");
@@ -2339,6 +2352,12 @@ test "lazy: range is lazy, 32 at a time, infinite without an end, and counts, re
     // A native that walks an unrealized range computes its elements, as
     // Clojure's `LongRange` iterator does; `doall` realizes it.
     try expectOutput("(let [r (range 100)] [(count (mapv inc r)) (count (filterv odd? r)) (count (frequencies r)) (count (group-by odd? r)) (apply + r) (realized? r) (do (doall r) (realized? r))])", "[100 50 100 2 4950 false true]");
+}
+
+test "lazy: a count is any number, a fraction rounding up as Clojure's counts one down; repeat's is truncated" {
+    // Expected values from babashka, which agrees with JVM Clojure 1.12 here.
+    try expectOutput("[(take 2.5 (range 10)) (drop 1.5 (range 5)) (nthrest (range 5) 1.5) (nthrest [1 2 3] 1.5) (nthrest (list 1 2 3) 1.5) (nthrest (list 1 2 3) -0.5) (nthnext [1 2 3] 1.5) (repeat 2.9 :x) (repeat -2.5 :x) (repeat ##NaN :x) (try (repeat ##Inf :x) (catch any e e)) (take ##Inf [1 2]) (take ##NaN [1 2]) (drop ##NaN [1 2]) (drop ##Inf (list 1 2)) (take-last 1.5 [1 2 3]) (repeatedly 1.5 (constantly 0)) (split-at 1.5 [1 2 3]) (into [] (take 2.5) (range 10)) (into [] (drop 1.5) (range 4))]", "[(0 1 2) (2 3 4) (2 3 4) (3) (3) (1 2 3) (3) (:x :x) () () :invalid-argument (1 2) () (1 2) () (2 3) (0 0) [(1 2) (3)] [0 1 2] [2 3]]");
+    try expectOutput("[(try (take :a [1]) (catch any e e)) (try (repeat \"2\" 1) (catch any e e))]", "[:kind-mismatch :kind-mismatch]");
 }
 
 test "lazy: map, filter, remove, keep, map-indexed and keep-indexed are lazy, 32 at a time over a chunked source" {
@@ -2460,6 +2479,12 @@ test "lazy: transducers, transduce, into and sequence with an xform, eduction, c
     try expectOutput("[(transduce (map inc) + [1 2 3]) (transduce (filter odd?) + 10 [1 2 3]) (into [] (comp (map inc) (filter even?)) (range 6)) (= #{2 3} (into #{} (map inc) [1 1 2])) (into '() (map inc) [1 2]) (sequence (map inc) [1 2 3]) (sequence (comp (take 2) (map inc)) (range)) (into [] cat [[1 2] [3]]) (into [] (mapcat reverse) [[1 2] [3 4]])]", "[9 14 [2 4 6] true (3 2) (2 3 4) (1 2) [1 2 3] [2 1 4 3]]");
     try expectOutput("[(into [] (partition-all 2) [1 2 3]) (into [] (partition-by odd?) [1 3 2 4 5]) (into [] (dedupe) [1 1 2 2 1]) (into [] (distinct) [1 2 1 3]) (into [] (interpose :s) [1 2 3]) (into [] (keep #(when (odd? %) (* % %))) [1 2 3]) (into [] (map-indexed vector) [:a :b]) (into [] (keep-indexed #(when (odd? %1) %2)) [:a :b :c :d])]", "[[[1 2] [3]] [[1 3] [2 4] [5]] [1 2 1] [1 2 3] [1 :s 2 :s 3] [1 9] [[0 :a] [1 :b]] [:b :d]]");
     try expectOutput("[(into [] (take-while neg?) [-1 -2 3 -4]) (into [] (drop-while neg?) [-1 -2 3 -4]) (into [] (drop 2) [1 2 3]) (into [] (remove odd?) [1 2 3 4]) (transduce (halt-when #(> % 2)) conj [] [1 2 3 4]) ((completing +) 5) (sequence (map +) [1 2] [10 20 30]) (eduction (map inc) [1 2]) (into [] (map inc) (range 3))]", "[[-1 -2] [3 -4] [3] [2 4] 3 5 (11 22) (2 3) [1 2 3]]");
+    // sequence's outputs are what reached its accumulator: a reduced
+    // value ends the walk and is not one (bb, as JVM Clojure 1.12).
+    try expectOutput("[(sequence (halt-when #{3}) [0 1 2 3 4]) (take 5 (sequence (halt-when #{3}) (range))) (sequence (halt-when #{3} (fn [r x] [:r x])) [0 1 2 3 4]) (sequence (comp (halt-when #{1}) (partition-all 2)) [0 1 2]) (sequence (comp (partition-all 2) (halt-when #(= % [2 3]))) (range 10))]", "[(0 1 2) (0 1 2) (0 1 2) ([0]) ([0 1])]");
+    // A step that throws runs again from its source position, with the
+    // transducer's state as the failure left it (LAZY.md §9).
+    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once (0 1)]");
     // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
     // one input past them), its completion once.
     try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");
@@ -2479,6 +2504,8 @@ test "lazy: reduce over an unrealized range allocates nothing" {
 
 test "lazy: cons, conj, list*, with-meta, empty and doall over a lazy seq" {
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [2 3]) c (cons 1 s)] [@n c @n (class c) (cons 0 [1 2]) (class (cons 0 [1 2])) (cons 1 nil)])", "[0 (1 2 3) 0 :lazy_seq (0 1 2) :list (1)]");
+    // list* conses onto its last argument as cons does, not realizing it.
+    try expectOutput("(let [n (atom 0) s (list* 1 2 (lazy-seq (swap! n inc) [3]))] [@n (vec s) @n (class s) (list* 1 []) (list* 1 nil) (list* 1 ()) (list* 1 #{2})])", "[0 [1 2 3] 1 :lazy_seq (1) (1) (1) (1 2)]");
     try expectOutput("(let [s (lazy-seq [2 3])] [(conj s 1) (conj (lazy-seq nil) 1 2) (list* 0 1 s) (list* s) (list* (lazy-seq nil)) (empty s) (not-empty (lazy-seq nil)) (not-empty s)])", "[(1 2 3) (2 1) (0 1 2 3) (2 3) nil () nil (2 3)]");
     try expectOutput("(let [s (with-meta (lazy-seq [1 2]) {:m 1})] [(meta s) s (meta (rest s)) (meta (next s)) (= s [1 2])])", "[{:m 1} (1 2) nil nil true]");
     try expectOutput("(let [n (atom 0) f (fn f [i] (lazy-seq (swap! n inc) (when (< i 5) (cons i (f (inc i)))))) s (f 0)] [(realized? s) (do (dorun 2 s) @n) (identical? s (doall s)) @n (dorun s) (doall 2 [1 2 3])])", "[false 3 true 6 nil [1 2 3]]");
@@ -6566,6 +6593,13 @@ test "gc: a native walking a lazy seq that collects at every step keeps what it 
     // A body that returns the next block forwards to it: a long run of
     // them costs no native stack, and each block stays reachable.
     try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
+}
+
+test "gc: sequence and eduction keep the seq they took of a source that is not one across the transducer's calls" {
+    try expectOutputUnderGc(churn ++ "(= (range 100) (vec (sequence (map (fn [x] (churn x) x)) (vec (range 100)))))", "true");
+    try expectOutputUnderGc(churn ++ "(= (set (range 40)) (set (sequence (map (fn [x] (churn x) x)) (set (range 40)))))", "true");
+    try expectOutputUnderGc(churn ++ "(count (eduction (map (fn [x] (churn x) x)) (filter even?) (set (range 40))))", "20");
+    try expectOutputUnderGc(churn ++ "(apply str (sequence (map (fn [c] (churn 1) c)) \"abcdef\"))", "abcdef");
 }
 
 test "gc: = and hash realize a lazy key in isolation, with no cycle inside the build" {

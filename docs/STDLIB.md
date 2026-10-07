@@ -329,7 +329,7 @@ their elements in the same mode. Who uses which:
 | string | display: its bytes. readable: double-quoted, `\" \\ \n \t \r` escaped, other ASCII controls and DEL as `\u{HEX}`, every other byte as itself (`"é"`) |
 | keyword, symbol | `:ns/name`, `ns/name`; names are not escaped |
 | list, vector, set | `(a b)`, `[a b]`, `#{a b}`, elements separated by one space; a sorted set in its order |
-| lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...` (`docs/LAZY.md` §8) |
+| lazy seq | as a list, `(a b)`, `()` when empty. The printer runs no code: every caller but an error report realizes the value first, and a block whose body has not run prints as `...`, as does a cell of a realized cycle met again (`docs/LAZY.md` §8) |
 | map | `{k v, k v}`, entries separated by `, `; a sorted map in its order |
 | record | `#ns.Type{:k v, ...}` (the fields in the record's mode), or `#<record type-id=N>` when the interner has no name for the type; `(reduced x)` is the record `#nexis.core.Reduced{:val x}` |
 | typed vector | `#i64[1 2]`, `#f64[1.5]` |
@@ -437,7 +437,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `chunked-seq?`, `chunk-first`, `chunk-rest`, `chunk-next`, `chunk-buffer`, `chunk-append`, `chunk`, `chunk-cons` | 1, 1, 1, 1, 1, 2, 1, 2 | Clojure's chunk functions, for library code (`docs/LAZY.md` §7): `chunked-seq?` is true of a chunked cons and of a vector's view; a chunk is a vector, `chunk-buffer` a transient vector, `chunk-append` `conj!`, `chunk` `persistent!`; `chunk-cons` copies the vector into a chunked cons in front of the rest, or is the rest itself when the chunk is empty |
 | `transduce`, `completing`, `cat`, `halt-when`, `eduction` | 3–4, 1–2, 1, 1–2, 1+ | Clojure 1.12's transducers (`docs/LAZY.md` §10), as are `into`'s 3-arity, `sequence`'s 2-arity and the transducer arities of `map`, `filter`, `remove`, `keep`, `take`, `take-while`, `drop`, `drop-while`, `map-indexed`, `keep-indexed`, `partition-all`, `partition-by`, `mapcat`, `interpose`, `distinct` and `dedupe` |
 | `lazy-cat` | macro | `(lazy-cat coll...)`: `(concat (lazy-seq coll) ...)`, each coll's expression evaluated when the walk reaches it |
-| `iterate`, `repeat`, `repeatedly`, `cycle` | 2, 1–2, 1–2, 1 | Lazy and, without a count, infinite (`docs/LAZY.md` §7): `(take 5 (iterate inc 0))`; `(iterate f x n)` is `:arity-mismatch` |
+| `iterate`, `repeat`, `repeatedly`, `cycle` | 2, 1–2, 1–2, 1 | Lazy and, without a count, infinite (`docs/LAZY.md` §7): `(take 5 (iterate inc 0))`; `(iterate f x n)` is `:arity-mismatch`; `repeat`'s count is truncated, as Clojure's `(long n)`, and every other sequence function's rounds up (`docs/LAZY.md` §9) |
 | `doall`, `dorun` | 1–2 | Walk the seq, realizing it (the first `n` steps with a count, as Clojure's `next` loop); `doall` returns its argument, `dorun` nil |
 | `rand`, `rand-int`, `shuffle` | 0–1, 1, 1 | Clojure's, over one process-wide generator seeded from the I/O's entropy at its first use (as `random-uuid` and `random-sample`): `(rand-int n)` of an integer is `(int (rand n))`, so 0 for 0 and in (n, 0] below it |
 | `in-ns` | 1 | `(in-ns 'name)`: makes the namespace named by the symbol current, creating it with `nexis.core` referred; nil, where Clojure returns the namespace |

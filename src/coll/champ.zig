@@ -169,6 +169,17 @@ inline fn indexHashOf(k: Value, elementHash: ElementHash) u32 {
     return @truncate(elementHash(k));
 }
 
+/// An array form indexes nothing by hash, but hashes a key it adds
+/// that may hold a lazy seq: hashing realizes every lazy seq in it, so
+/// no map or set holds one unrealized (CHAMP.md §2.1, docs/LAZY.md §6).
+/// A set's elements were realized when it took them.
+inline fn hashAdded(k: Value, elementHash: ElementHash) void {
+    switch (k.kind()) {
+        .lazy_seq, .list, .persistent_vector, .persistent_map, .sorted_map, .sorted_set, .record => _ = elementHash(k),
+        else => {},
+    }
+}
+
 inline fn slotOf(hash32: u32, shift: u8) u32 {
     return (hash32 >> @intCast(shift)) & branch_mask;
 }
@@ -409,6 +420,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                     return valueOf(nh, subkind_array_map);
                 }
                 if (ps.len < array_map_max) {
+                    hashAdded(keyOf(p), elementHash);
                     const nh = try allocArray(heap, ps.len + 1);
                     splice(P, arrayPayloads(nh), ps, ps.len, false, p);
                     return valueOf(nh, subkind_array_map);
@@ -655,7 +667,10 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 for (ps, 0..) |p, i| {
                     if (keyEquivalent(keyOf(p), key, elementEq)) return .{ .at = .present, .index = i, .old = p };
                 }
-                if (ps.len < array_map_max) return .{ .at = .array_append };
+                if (ps.len < array_map_max) {
+                    hashAdded(key, elementHash);
+                    return .{ .at = .array_append };
+                }
                 var spot: Spot = .{ .at = .promote, .hash32 = indexHashOf(key, elementHash) };
                 for (ps, 0..) |p, i| spot.hashes[i] = indexHashOf(keyOf(p), elementHash);
                 return spot;

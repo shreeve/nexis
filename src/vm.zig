@@ -2011,9 +2011,13 @@ pub const VM = struct {
     gc_hold: u32 = 0,
     /// The failure of an isolated realization, kept until the native
     /// call or opcode that compared or hashed raises it
-    /// (`checkDeepData`); a root while it is kept. The first failure
+    /// (`checkDeepData`), or drops it when it fails for another reason
+    /// (`dropSpoils`); a root while it is kept. The first failure
     /// wins, and later isolated realizations fail at once.
     parked_realize: ?ParkedRealize = null,
+    /// The spoil count when `parked_realize` was parked: a call whose
+    /// snapshot is at most this parked it.
+    parked_at: u64 = 0,
     /// The collector's gray worklist, kept between cycles so each
     /// cycle reuses the capacity the last one grew (GC.md §4).
     gc_gray: std.ArrayList(*heap_mod.HeapHeader) = .empty,
@@ -2893,7 +2897,7 @@ pub const VM = struct {
         const overflows = dispatch_mod.spoilCount();
         // A call that fails spoils nothing its caller sees, so the
         // overflows under it are consumed with it.
-        errdefer dispatch_mod.rewindSpoils(overflows);
+        errdefer self.dropSpoils(overflows);
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
@@ -2930,6 +2934,17 @@ pub const VM = struct {
         // Inline, the common case costs a read of the counter; the raise
         // saves the registers it needs only when it runs.
         if (dispatch_mod.spoilCount() != spoils_before) return self.raiseDeepData(spoils_before);
+    }
+
+    /// Consume the spoils counted since `spoils_before` for a call that
+    /// fails for another reason, with the failure an isolated
+    /// realization parked under it: left parked, it would make every
+    /// later isolated realization fail and be raised by an unrelated
+    /// call (docs/LAZY.md §6). A failure parked before the snapshot
+    /// belongs to an enclosing call and stays.
+    pub fn dropSpoils(self: *VM, spoils_before: u64) void {
+        dispatch_mod.rewindSpoils(spoils_before);
+        if (self.parked_realize != null and self.parked_at >= spoils_before) self.parked_realize = null;
     }
 
     noinline fn raiseDeepData(self: *VM, spoils_before: u64) VmError {
@@ -2969,19 +2984,19 @@ pub const VM = struct {
             const registry = if (self.home().registry) |*r| r else break :blk null;
             const v = registry.core.lookupLocal("realize-caught") orelse break :blk null;
             break :blk v.current();
-        } orelse {
-            self.parked_realize = .{ .err = VmError.UnboundVar };
-            return null;
-        };
+        } orelse return self.park(.{ .err = VmError.UnboundVar });
         self.gc_hold += 1;
         defer self.gc_hold -= 1;
-        const r = self.callValue(barrier, &.{lz}) catch |err| {
-            self.parked_realize = .{ .err = err };
-            return null;
-        };
+        const r = self.callValue(barrier, &.{lz}) catch |err| return self.park(.{ .err = err });
         // `[true seq]` or `[false thrown]`.
         if (vector_mod.nth(r, 0).isTruthy()) return vector_mod.nth(r, 1);
-        self.parked_realize = .{ .thrown = vector_mod.nth(r, 1) };
+        return self.park(.{ .thrown = vector_mod.nth(r, 1) });
+    }
+
+    /// Park `failure`, which the caller counts as a spoil next.
+    fn park(self: *VM, failure: ParkedRealize) ?Value {
+        self.parked_realize = failure;
+        self.parked_at = dispatch_mod.spoilCount();
         return null;
     }
 
@@ -4425,7 +4440,7 @@ pub const VM = struct {
         countNative(native);
         const overflows = dispatch_mod.spoilCount();
         const result = native.call(self, buf[0..argc]) catch |err| {
-            dispatch_mod.rewindSpoils(overflows);
+            self.dropSpoils(overflows);
             return err;
         };
         try self.checkDeepData(overflows);
@@ -4981,6 +4996,7 @@ pub const VM = struct {
         const hash = &dispatch_mod.hashValue;
         const eql = &dispatch_mod.equal;
         const overflows = dispatch_mod.spoilCount();
+        errdefer self.dropSpoils(overflows);
         const result: Value = switch (variant) {
             .list => list_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,
             .vector => vector_mod.fromSlice(heap, args) catch return VmError.OutOfMemory,

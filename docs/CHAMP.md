@@ -52,7 +52,11 @@ metadata (SEMANTICS §7).
 An array-map or array-set holds up to 8 payloads in association order:
 insertion order, a replaced value keeping its position. The order is a
 representation detail: it shows in iteration, printing and codec
-bytes, never in `=` or `hash`.
+bytes, never in `=` or `hash`. It indexes nothing by hash, but hashes a key it
+adds that may hold a lazy seq (a lazy seq, a list, a vector, a map, a
+sorted collection or a record): hashing realizes every lazy seq in it,
+so no map or set holds one unrealized (`docs/LAZY.md` §6). A set's
+elements were realized when it took them, so a set key is not hashed.
 
 #### 2.2 Trie (subkind 1)
 

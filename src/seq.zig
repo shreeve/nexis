@@ -144,35 +144,43 @@ const steps = [_]Step{
     stepSequence,
 };
 
-/// Whether `v` is a `reduced` value, and the value inside: the record
-/// type the VM registers for it (`VM.reduced_type_id`).
-fn unreduced(vm: *VM, v: Value) ?Value {
-    const id = vm.home().reduced_type_id orelse return null;
-    if (v.kind() != .record or record_mod.typeId(v) != id) return null;
-    var it = champ_mod.mapIter(record_mod.fieldsOf(v));
-    return (it.next() orelse return null).value;
+/// Whether `v` is a `reduced` value: the record type the VM registers
+/// for it (`VM.reduced_type_id`).
+fn isReduced(vm: *VM, v: Value) bool {
+    const id = vm.home().reduced_type_id orelse return false;
+    return v.kind() == .record and record_mod.typeId(v) == id;
 }
 
 /// The transient vector a step accumulates into, rooted in the block's
-/// result field; the outputs a step hands out are its elements.
+/// result field; the outputs a step hands out are its elements. What
+/// `rf` returns is not an accumulator, as for Clojure's
+/// `TransformerIterator`: the outputs are what reached `acc`, and a
+/// reduced value only ends the walk (`halt-when`'s holds a map).
 fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);
     if (a[2].isTruthy()) return value_mod.nilValue();
     const heap = vm.ensureHeap();
     const empty = vector_mod.empty(heap) catch return VmError.OutOfMemory;
-    var acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
+    const acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
     lazy.setScratch(lz, acc);
+    // The walk's position stays out of the block, so a step that throws
+    // runs again from the block's own source position; the seq taken of
+    // a source that is not one (a vector's view, a set's elements) is
+    // the only thing reaching what the walk has left, so it is rooted
+    // across every call of `rf` (docs/GC.md §11.5, class 5).
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(a[1]);
     var cur = a[1];
     var done = false;
     var args: [lazy.chunk_size + 1]Value = undefined;
     // Pull inputs until a chunk's worth of outputs waits, the source
-    // ends, or `rf` stops the reduction; the position is a local, so a
-    // step that throws runs again from the block's own state.
+    // ends, or `rf` stops the reduction.
     while (true) {
-        if (acc.kind() != .transient) return VmError.KindMismatch;
         const n = transient_mod.vectorCountBang(acc) catch return VmError.KindMismatch;
         if (n >= lazy.chunk_size) break;
         cur = try seqOf(vm, cur);
+        vm.roots.items[scope.base] = cur;
         if (cur.isNil()) {
             done = true;
             break;
@@ -189,24 +197,15 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
         } else args[1] = fr.first;
         const r = try vm.callValue(a[0], args[0..argc]);
         cur = fr.rest;
-        if (unreduced(vm, r)) |inner| {
-            acc = inner;
-            lazy.setScratch(lz, acc);
+        if (isReduced(vm, r)) {
             done = true;
             break;
         }
-        acc = r;
-        lazy.setScratch(lz, acc);
     }
     // The completion arity runs once, at the end: `partition-all`'s last
     // part comes out there.
-    if (done) {
-        acc = try vm.callValue(a[0], &.{acc});
-        if (unreduced(vm, acc)) |inner| acc = inner;
-        lazy.setScratch(lz, acc);
-    }
-    if (acc.kind() != .transient) return VmError.KindMismatch;
-    const out = transient_mod.persistentBang(acc) catch return VmError.OutOfMemory;
+    if (done) _ = try vm.callValue(a[0], &.{acc});
+    const out = transient_mod.persistentBang(acc) catch return VmError.KindMismatch;
     // Nothing below runs code, and `Heap.alloc` never collects.
     const following = if (done) value_mod.nilValue() else try make(vm, op_sequence, &.{ a[0], cur, value_mod.fromBool(false), a[3] });
     const n = vector_mod.count(out);
@@ -1030,6 +1029,24 @@ fn listify(heap: *heap_mod.Heap, v: Value) ListifyError!Value {
                 out = champ_mod.setConj(heap, out, y, hash, eql) catch return error.OutOfMemory;
             }
             if (!changed) return v;
+            keepMeta(v, out);
+            return out;
+        },
+        // Rebuilt from its entries in their order, which a key made a
+        // list keeps (it is `=` to the lazy seq it was): no comparator
+        // runs.
+        .sorted_map, .sorted_set => {
+            const items = try heap.backing.alloc(sorted_mod.Entry, sorted_mod.count(v));
+            defer heap.backing.free(items);
+            var changed = false;
+            var it = sorted_mod.Iter.init(v, true);
+            for (items) |*slot| {
+                const e = it.next().?;
+                slot.* = .{ .key = try listify(heap, e.key), .value = try listify(heap, e.value) };
+                changed = changed or !slot.key.identicalTo(e.key) or !slot.value.identicalTo(e.value);
+            }
+            if (!changed) return v;
+            const out = sorted_mod.fromSortedEntries(heap, v.kind(), sorted_mod.comparatorOf(v), items) catch return error.OutOfMemory;
             keepMeta(v, out);
             return out;
         },
