@@ -879,6 +879,9 @@ const Loader = struct {
     vars: []*Var = &.{},
     natives: []Value = &.{},
     objects: []Value = &.{},
+    /// How many of `objects` are made: a reference names one of them,
+    /// so an object refers only to those written before it.
+    built: usize = 0,
     routines: []Routine = &.{},
 
     fn run(l: *Loader) LoadError!Counted {
@@ -976,10 +979,10 @@ const Loader = struct {
             const capacity = try l.in.int(u32);
             const n = try l.in.int(u32);
             const map = &ns.vars;
-            if (capacity < map.capacity() or n > capacity * 4 / 5 or (n > 0) != (capacity > 0)) return error.Corrupt;
+            if (capacity < map.capacity() or n > @as(u64, capacity) * 4 / 5 or (n > 0) != (capacity > 0)) return error.Corrupt;
             map.clearRetainingCapacity();
             // The size whose table has exactly `capacity` slots.
-            if (capacity > map.capacity()) try map.ensureTotalCapacity(ns.map_allocator, (capacity - 1) * 4 / 5);
+            if (capacity > map.capacity()) try map.ensureTotalCapacity(ns.map_allocator, @intCast((@as(u64, capacity) - 1) * 4 / 5));
             if (map.capacity() != capacity) return error.Corrupt;
             for (0..n) |_| {
                 const tag = try l.in.tag(EntryTag);
@@ -1012,6 +1015,7 @@ const Loader = struct {
         var elems: std.ArrayList(Value) = .empty;
         var entries: std.ArrayList(champ_mod.Entry) = .empty;
         for (l.objects, 0..) |*o, i| {
+            l.built = i;
             const tag = try l.in.tag(ObjTag);
             const vtag = try l.in.int(u64);
             if (tag == .cell or tag == .atom) {
@@ -1038,7 +1042,7 @@ const Loader = struct {
                     .empty_list => try mem(list_mod.empty(l.heap)),
                     .cons => blk: {
                         const head = try l.ref();
-                        const tail = l.objects[try check(try l.in.int(u32), i)];
+                        const tail = l.objects[try l.in.index(i)];
                         break :blk try mem(list_mod.cons(l.heap, head, tail));
                     },
                     .map => blk: {
@@ -1056,7 +1060,7 @@ const Loader = struct {
                         const f = try mem(l.vm.allocClosure(routine, n));
                         const cells: []*UpvalCell = @constCast(VM.asClosure(f).upvalues);
                         for (cells) |*c| {
-                            const cell = l.objects[try check(try l.in.int(u32), i)];
+                            const cell = l.objects[try l.in.index(i)];
                             if (cell.kind() != .cell_internal) return error.Corrupt;
                             c.* = VM.asCell(cell) catch unreachable;
                         }
@@ -1077,6 +1081,7 @@ const Loader = struct {
             // its subkind, or the image does not describe this runtime.
             if (o.tag != vtag) return error.Corrupt;
         }
+        l.built = l.objects.len;
         elems.deinit(l.scratch);
         entries.deinit(l.scratch);
     }
@@ -1223,7 +1228,7 @@ const Loader = struct {
             },
             .keyword => try l.keyword(),
             .symbol => try l.symbol(),
-            .object => l.objects[try l.in.index(l.objects.len)],
+            .object => l.objects[try l.in.index(l.built)],
             .native => l.natives[try l.in.index(l.natives.len)],
             .var_ => VM.varToValue(l.vars[try l.in.index(l.vars.len)]),
         };
@@ -1236,8 +1241,7 @@ const Loader = struct {
     }
 };
 
-/// `i` when it is below `len`: an object's reference names one
-/// written before it.
+/// `i` when it is below `len`, the length of the table it indexes.
 fn check(i: u32, len: usize) LoadError!u32 {
     return if (i < len) i else error.Corrupt;
 }
@@ -1483,3 +1487,88 @@ const Verifier = struct {
         for (x.spans, y.spans) |s, t| if (!std.meta.eql(s, t)) return v.fail("routine {s}: spans", .{x.name});
     }
 };
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+/// An image of `namespaces` (each a name and its map's capacity and
+/// entry count, with no entries) and of `objects`, records in the
+/// image's own form, with nothing else in it.
+fn testImage(out: *Out, namespaces: []const struct { []const u8, u32, u32 }, objects: []const []const u8) ![]const u8 {
+    try out.list.appendNTimes(out.gpa, 0, magic.len + 4 + 8 + 16);
+    for (0..@typeInfo(Totals).@"struct".field_names.len - 1) |_| try out.int(u32, 0);
+    try out.count(objects.len);
+    try out.count(0); // keywords
+    try out.count(0); // symbols
+    try out.count(namespaces.len);
+    for (namespaces) |ns| {
+        try out.str(ns[0]);
+        try out.int(u32, no_index);
+    }
+    try out.count(0); // record types
+    try out.int(u32, no_index); // the reduced type
+    try out.count(0); // protocols
+    try out.count(0); // Vars
+    for (namespaces) |ns| {
+        try out.int(u32, ns[1]);
+        try out.int(u32, ns[2]);
+    }
+    try out.count(0); // natives
+    for (objects) |o| try out.list.appendSlice(out.gpa, o);
+    for ([_]u32{ 0, 0 }) |n| try out.int(u32, n); // fills, Var states
+    for (namespaces) |_| try out.count(0); // aliases
+    return out.list.items;
+}
+
+/// The record of an object with no metadata: its tag, the Value tag
+/// `v` carries and `body`.
+fn testObject(gpa: Allocator, tag: ObjTag, v: Value, body: []const u8) ![]u8 {
+    var out: Out = .{ .gpa = gpa };
+    errdefer out.deinit();
+    try out.byte(@backingInt(tag));
+    try out.int(u64, v.tag);
+    try out.byte(@backingInt(RefTag.nil));
+    try out.list.appendSlice(gpa, body);
+    return out.list.toOwnedSlice(gpa);
+}
+
+test "load: an object naming one written after it is Corrupt, never an unmade Value" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa, &VM.idle_routine);
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    // Object 0, a vector holding object 1, a string: well formed but
+    // for the order.
+    var elem: Out = .{ .gpa = gpa };
+    defer elem.deinit();
+    try elem.count(1);
+    try elem.byte(@backingInt(RefTag.object));
+    try elem.int(u32, 1);
+    const vector = try testObject(gpa, .vector, try vector_mod.fromSlice(heap, &.{value_mod.nilValue()}), elem.list.items);
+    defer gpa.free(vector);
+    const string = try testObject(gpa, .string, try string_mod.fromBytes(heap, "s"), &.{ 1, 0, 0, 0, 's' });
+    defer gpa.free(string);
+    var out: Out = .{ .gpa = gpa };
+    defer out.deinit();
+    try std.testing.expectError(error.Corrupt, load(&vm, try testImage(&out, &.{}, &.{ vector, string }), &.{}));
+    // In the other order the image loads.
+    var vm2 = try VM.init(gpa, &VM.idle_routine);
+    defer vm2.deinit();
+    elem.list.items[elem.list.items.len - 4] = 0;
+    const vector_after = try testObject(gpa, .vector, try vector_mod.fromSlice(heap, &.{value_mod.nilValue()}), elem.list.items);
+    defer gpa.free(vector_after);
+    var ordered: Out = .{ .gpa = gpa };
+    defer ordered.deinit();
+    _ = try load(&vm2, try testImage(&ordered, &.{}, &.{ string, vector_after }), &.{});
+}
+
+test "load: a namespace map of any capacity is read or Corrupt, never an overflow" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa, &VM.idle_routine);
+    defer vm.deinit();
+    var out: Out = .{ .gpa = gpa };
+    defer out.deinit();
+    const max = std.math.maxInt(u32);
+    try std.testing.expectError(error.Corrupt, load(&vm, try testImage(&out, &.{.{ "image.test", max, max }}, &.{}), &.{}));
+}
