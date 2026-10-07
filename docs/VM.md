@@ -102,8 +102,8 @@ traps `UnimplementedOpcode` (upvalues are never written, §6).
 The format has no immediate operand kind. Where §10 says
 "immediate", the handler reads the 12-bit `index` as the datum and
 ignores the kind bits; assemblers write the kind as `.slot`. The
-immediates are operand B of `call:call` / `call:tailcall` (argc) and
-of every `coll:*` variant (argc). A pc or table index is not an
+immediates are operand B of `call:call`, `call:tailcall` and
+`call:self` (argc) and of every `coll:*` variant (argc). A pc or table index is not an
 immediate: it is the wide field (§3).
 
 ---
@@ -139,7 +139,11 @@ inside the table it indexes (a slot below `slot_count`, a constant,
 a Var, an upvalue below `upvalue_count`) and a destination a slot;
 every wide field inside its table, a jump target, a `try`'s catch and
 finally pcs and `ctrl:try-exit`'s continuation inside the code; every
-`call:call` and `coll:*` block inside the frame; every capture
+`call:call` and `coll:*` block, every `call:self`'s arguments and
+every `call:lookup-or`'s two slots inside the frame; every
+`call:self`'s count the routine's own fixed arity, in a routine with
+no rest parameter; every `call:lookup` and `call:lookup-or` key a
+keyword or symbol constant; every capture
 descriptor's sources inside the frame and the routine's upvalues, as
 many as the child's `upvalue_count`; and the last instruction one
 that never falls through (`jump:jmp`, `call:return`,
@@ -277,6 +281,26 @@ On return the frame pops, the stack length is restored, the value
 lands in the caller's `slot[C]` and the caller resumes at the next
 instruction.
 
+`call:self A=window B=argc C=result_slot` is that call of the frame's
+own closure, the compiler's lowering of a `fn*` calling its self-name
+(`COMPILER.md` §5.5): the arguments are `slot[A + i]`, the callee's
+window begins at `slot[A]`, and there is no callee to read or test.
+Verification proved `argc` the routine's fixed arity (§5), so the call
+checks only the frame chain and the stack, and traps as a closure call
+does (`StackOverflow` at `VM.max_frames`, `OutOfMemory`). The new
+frame shares the caller's closure and cells. The top-level frame,
+which runs no closure, has none to call: `BytecodeCorruption`.
+
+`call:lookup A=dst B=target C=key` and `call:lookup-or A=dst B=slot
+C=key` are the call of a keyword or symbol constant, `(:k x)` and
+`(:k x default)`, in one instruction (`COMPILER.md` §4.3): the target
+is `resolve(B)`, or `slot[B]` with the default in `slot[B + 1]`, and
+the result is the lookup `call:call` makes of that callee with those
+arguments, with the same errors and error detail. On a map, a record
+or nil it looks itself up in place (§8); on anything else it goes
+through the general entry, the target rooted while a sorted
+collection's comparator runs.
+
 **Call-clobbered region.** Slots at and above A are overwritten by
 the callee's window; values live across the call sit strictly below
 A (a compiler invariant).
@@ -288,8 +312,9 @@ of a native called in place (§8), whose callee is a native and holds
 no heap value, and the whole block of a call through the general
 entry (a protocol fn, a Var, a lookup, a native past the in-place
 cases). A sequence a native was given is then not kept alive by the
-block until a later call reuses its slots. A leaf's block and an
-in-place keyword lookup's are left as they are: they hold what a
+block until a later call reuses its slots. A leaf's block, an
+in-place keyword lookup's and `call:lookup-or`'s two slots are left
+as they are: they hold what a
 leaf takes (numbers, a vector to index), and clearing them would
 cost every arithmetic call. A closure's arguments are its own slots
 and stay as its body leaves them; clearing its window's overlap with
@@ -467,8 +492,9 @@ instruction.
 - `op_table` holds every opcode's **general handler**, which takes
   every case and raises every trap. Every variant of `mov`, `jump` and
   `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
-  `call:return` and `call:return-nil`, has a general handler of its
-  own; every other entry is its group's, which switches on the
+  `call:self`, `call:return` and `call:return-nil`, has a general
+  handler of its own, and `call:lookup` and `call:lookup-or` share
+  one; every other entry is its group's, which switches on the
   variant or, where no variant is left, traps as §10 says for one
   outside the enum. A group outside the enum is `BytecodeCorruption`;
   `transient`, `hash`, `tx`, `io` and `simd` trap
@@ -477,7 +503,8 @@ instruction.
   **fast handler** over each hot opcode: every variant of `mov`,
   `jump` and `cmp`, `math:add`, `math:sub`, `math:mul`, `math:idiv`,
   `math:mod`, `var:load-var`, `closure:get-cell`, `call:call`,
-  `call:return` and `call:return-nil`. A fast handler takes its
+  `call:self`, `call:lookup`, `call:lookup-or`, `call:return` and
+  `call:return-nil`. A fast handler takes its
   instruction's common case, reading its operands in place and storing
   only to a slot of its frame, with no call but its tail call and no
   stack frame; on any other case it tail-calls the general handler
@@ -537,14 +564,16 @@ instruction.
   included, goes through the numeric tower (§10.3). `call:call` of a
   closure with its fixed arity, where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
-  and `callValue` enters a closure the same way; a leaf native within
+  `call:self` the same with the frame's own closure, and `callValue`
+  enters a closure the same way; a leaf native within
   its arity reads its arguments in place (§6), and any other native
   within its arity and `max_native_args` (8) arguments gets them
   copied to a buffer on the native stack; a keyword or symbol
   called with one or two arguments on a map, a record or nil looks
   itself up in place, as `VM.lookup` does, with no copy and no safe
   point (the key is an immediate, so the lookup neither allocates nor
-  walks nested data). `call:return` from any frame but the top-level
+  walks nested data), and so do `call:lookup` and `call:lookup-or`,
+  reading the target in place. `call:return` from any frame but the top-level
   one pops it and continues in the caller, or fills the cell of the
   host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
   ends the chain. Every other call goes through the general entry of
@@ -623,7 +652,7 @@ Group and variant numbers are the enums in `src/vm.zig` (`Group`,
 | 1 | `cmp` | yes | Ordered comparison and numeric equality into a slot |
 | 2 | `math` | yes | Arithmetic over the numeric tower |
 | 3 | `mov` | yes | Moves and constant loads |
-| 4 | `call` | yes | `call`, `return`, `return-nil` (`tailcall` traps) |
+| 4 | `call` | yes | `call`, `return`, `return-nil`, `self`, `lookup`, `lookup-or` (`tailcall` traps) |
 | 5 | `closure` | yes | `make`, `box-local`, `new-cell`, `init-cell`, `get-cell` (§6) |
 | 6 | `var` | yes | Var load, store and Var object |
 | 7 | `coll` | yes | List, concat, vector, map and set construction from a slot block |
@@ -660,6 +689,9 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 1 | `call:tailcall` | | Traps `UnimplementedOpcode` |
 | 2 | `call:return` | A=any | Return `resolve(A)`; halt from the outermost frame |
 | 3 | `call:return-nil` | | Return nil |
+| 4 | `call:self` | A=window slot, B=argc (immediate), C=result slot | Call the frame's own closure with `slot[A..A+argc]` (§6) |
+| 5 | `call:lookup` | A=slot, B=any, C=keyword or symbol constant | `slot[A] := (C resolve(B))` (§6) |
+| 6 | `call:lookup-or` | A=slot, B=slot, C=keyword or symbol constant | `slot[A] := (C slot[B] slot[B+1])` (§6) |
 
 #### 10.3 `math`
 
@@ -929,11 +961,11 @@ run):
 | Error | When |
 |---|---|
 | `UnimplementedOpcode` | A defined but unexecuted group or variant (§10), an `i` or `e` operand where a value is read, a store to `u` |
-| `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a jump target or a `try`'s pc past the code |
-| `InvalidOperandKind` | Verification: a destination that is not a slot. Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
+| `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a `call:lookup-or`'s second slot past the frame; a jump target or a `try`'s pc past the code |
+| `InvalidOperandKind` | Verification: a destination that is not a slot; a lookup key that is not a keyword or symbol constant. Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
-| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10). Where it runs: an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
-| `CallBlockOutOfRange` | Verification: a call block past the frame's slot count |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter. Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `CallBlockOutOfRange` | Verification: a call block, or a `call:self`'s arguments, past the frame's slot count |
 | `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |

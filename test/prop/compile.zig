@@ -302,6 +302,31 @@ const cases = [_]Case{
     .{ .src = "(do (defn f [a b] (if (= b :x) (throw [:thrown a]) [a b])) [(try (f 1 (f 2 (f 3 :x))) (catch any e e)) (try (f (f 4 5) (f 6 :x)) (catch any e e))])", .out = "[[:thrown 3] [:thrown 6]]" },
     .{ .src = "(do (defn f [a b] (+ a b)) (loop* [i 0 acc 0] (if (< i 4) (recur (f i (f 1 0)) (f acc (f i (f acc 1)))) acc)))", .out = "26" },
     .{ .src = "(do (defn f [a b] (+ a b)) (let* [x 10 h (fn* [y] (f x (f y (f x y))))] [(h 1) (h 2) (f (h 3) (f (h 4) x))]))", .out = "[22 24 64]" },
+    // A fn calling its own name: the closure itself, its cells and its
+    // captured parameters' fresh cells, whatever else the name does.
+    .{ .src = "(let* [k 10] ((fn* f [n] (if (= n 0) k (+ 1 (f (dec n))))) 3))", .out = "13" },
+    .{ .src = "(let* [h (fn* f [n] (if (= n 0) f (f (dec n))))] (= h (h 3)))", .out = "true" },
+    .{ .src = "((fn* f [n] (if (= n 0) 0 ((fn* [] (+ 1 (f (dec n))))))) 5)", .out = "5" },
+    .{ .src = "(mapv (fn* [g] (g)) ((fn* f [n] (if (= n 0) [] (conj (f (dec n)) (fn* [] n)))) 3))", .out = "[1 2 3]" },
+    .{ .src = "[((fn* f [n] (let* [f inc] (f n))) 4) ((fn* f [n & r] (if (= n 0) r (f (dec n) n))) 3) (try ((fn* f [n] (f n n)) 1) (catch any e e))]", .out = "[5 (1) :arity-mismatch]" },
+    // A keyword or symbol called on any target, with a default or not,
+    // is `get` of it (VM.md §6): in place on a map, a record or nil,
+    // the general way on everything else.
+    .{ .src = "(do (defrecord P [x y]) (let* [m {:a 1 'b 2} p (->P 3 4)] [(:a m) (:c m) (:c m 9) ('b m) ('c m 8) (:x p) (:z p 0) (:a nil) (:a nil 5)]))", .out = "[1 nil 9 2 8 3 0 nil 5]" },
+    .{ .src = "(let* [t (transient {:a 2})] [(:a [1 2]) (:a \"s\" 3) (:a 5) (:a #{:a}) (:b #{:a} 0) (:a (sorted-map :a 1)) (:a t) (:b t 6) (:a (seq [1]))])", .out = "[nil 3 nil :a 0 1 2 6 nil]" },
+    .{ .src = "[(try (:a (sorted-map 1 2)) (catch any e e)) (try (:a (let* [t (transient {:a 1})] (persistent! t) t)) (catch any e e))]", .out = "[:kind-mismatch :transient-used-after-persistent]" },
+    .{ .src = "(do (def m {:k {:j 7}}) (let* [f (fn* [] (:j (:k m))) g (fn* [x] (:j x :none))] [(f) (g {}) (g {:j nil}) (:k {:k 1} (f))]))", .out = "[7 :none nil 1]" },
+    // The general way from a native's callback leaves the native's
+    // roots as it found them.
+    .{ .src = "[(mapv (fn* [p] (:a p)) [[1] [2]]) (mapv (fn* [p] (:a p 0)) [(sorted-map :a 1) \"s\"]) (reduce (fn* [a p] (+ a (:a p 1))) 0 [[1] [2]])]", .out = "[[nil nil] [1 0] 2]" },
+    // Destructuring looks a keyword or symbol key up as the key's call
+    // does and any other key with get, on every kind of source.
+    .{ .src = "(let [{:keys [a b] :syms [c] :strs [d] e :e f 'f g 0 :or {b 2 e 5}} {:a 1 'c 3 \"d\" 4 'f 6 0 7}] [a b c d e f g])", .out = "[1 2 3 4 5 6 7]" },
+    .{ .src = "(let [{:keys [a]} \"str\" {:keys [b] :or {b 9}} 5 {x :x} [1 2] {:keys [k]} (list :k 7) {:keys [s]} (sorted-map :s 8)] [a b x k s])", .out = "[nil 9 nil 7 8]" },
+    // Recursion through the self-name is lexical: the function a Var
+    // held keeps calling itself after the Var is redefined
+    // (CLOJURE-REVIEW.md, defn).
+    .{ .src = "(do (defn f [n] (if (= n 0) :done (f (dec n)))) (def g f) (defn f [n] :redefined) (g 3))", .out = ":done" },
 };
 
 test "cases: each source evaluates to the printed value" {
@@ -776,6 +801,14 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         // clause's index, then a compare, a branch and the result
         // per clause.
         .{ .src = "(fn* [a] (case a :k0 0 :k1 1 :k2 2 :d))", .len = 15 },
+        // A keyword or symbol called on one argument is one lookup
+        // reading it in place; with a default, the two in a block.
+        .{ .src = "(fn* [a] (:k a))", .len = 2 },
+        .{ .src = "(fn* [a] ('s a))", .len = 2 },
+        .{ .src = "(fn* [a] (:k (:j a)))", .len = 3 },
+        .{ .src = "(fn* [a b] (:k a b))", .len = 4 },
+        // Any other count is a call.
+        .{ .src = "(fn* [a] (:k a a a))", .len = 6 },
     };
     for (shapes) |shape| {
         const len = try fnCodeLen(&program, shape.src);
@@ -783,6 +816,42 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
             std.debug.print("\n  {s}: {d} instructions\n", .{ shape.src, len });
             return err;
         };
+    }
+}
+
+test "codegen: a fn's call of its own name at its fixed arity is call:self, and a name used only so needs no cell (COMPILER.md §5.5)" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const self_op = nx.vm.Inst.primary(.call, nx.vm.Call.self_, nx.vm.Operand.none, nx.vm.Operand.none, nx.vm.Operand.none);
+    // The enclosing routine's instructions (a cell adds new-cell and
+    // init-cell around the closure:make), the fn's upvalues, and
+    // whether its body calls itself with call:self.
+    const Shape = struct { src: []const u8, outer: usize, upvalues: u16, self_calls: bool };
+    const shapes = [_]Shape{
+        .{ .src = "(fn* f [a] (f a))", .outer = 2, .upvalues = 0, .self_calls = true },
+        .{ .src = "(fn* f [] (f))", .outer = 2, .upvalues = 0, .self_calls = true },
+        .{ .src = "(fn* f [a b] (if a (f b a) (loop* [i 0] (f i i))))", .outer = 2, .upvalues = 0, .self_calls = true },
+        // The name as a value as well: the cell stays, the calls skip it.
+        .{ .src = "(fn* f [a] (if a f (f a)))", .outer = 4, .upvalues = 1, .self_calls = true },
+        // From a closure inside the body, at another arity, with a rest
+        // parameter, or shadowed: an ordinary call.
+        .{ .src = "(fn* f [a] (fn* [] (f a)))", .outer = 4, .upvalues = 1, .self_calls = false },
+        .{ .src = "(fn* f [a] (f a a))", .outer = 4, .upvalues = 1, .self_calls = false },
+        .{ .src = "(fn* f [a & r] (f a))", .outer = 4, .upvalues = 1, .self_calls = false },
+        .{ .src = "(fn* f [a] (let* [f a] (f a)))", .outer = 2, .upvalues = 0, .self_calls = false },
+    };
+    for (shapes) |shape| {
+        errdefer std.debug.print("\n  {s}\n", .{shape.src});
+        const compiled = try compileIn(&program, shape.src);
+        try testing.expectEqual(shape.outer, compiled.code.len);
+        const routine = compiled.capture_descs[0].routine;
+        try testing.expectEqual(shape.upvalues, routine.upvalue_count);
+        var self_calls = false;
+        for (routine.code) |inst| {
+            if (inst.group == self_op.group and inst.variant == self_op.variant) self_calls = true;
+        }
+        try testing.expectEqual(shape.self_calls, self_calls);
     }
 }
 
@@ -851,14 +920,16 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(str \"a\" a \"b\" b)", .len = 7 },
         .{ .form = "{:a (inc a) :b (g b) :c c}", .len = 10 },
         .{ .form = "(pm a)", .len = 4 },
-        .{ .form = "(:x a)", .len = 4 },
+        .{ .form = "(:x a)", .len = 2 },
+        .{ .form = "(:x a 1)", .len = 4 },
         .{ .form = "(nexis.test/is (= 1 (inc (dec a))))", .len = 8 },
         .{ .form = "(nexis.test/is (pos? a))", .len = 8 },
         .{ .form = "(nexis.test/is (thrown? :x (g a)))", .len = 16 },
         .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
-        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 24 },
-        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 29, .inner = true },
+        .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 19 },
+        .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 26, .inner = true },
         .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
+        .{ .form = "(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))", .len = 9, .inner = true },
         .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },
         .{ .form = "(case a :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)", .len = 46 },
         .{ .form = "(condp = a 1 :a 2 :b 3 :c :d)", .len = 20 },

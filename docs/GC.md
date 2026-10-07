@@ -259,8 +259,9 @@ and at every fetch after an instruction that could have allocated:
 inline), a `call:call` that ran a native, a protocol fn or a lookup
 other than the in-place keyword lookup of `docs/VM.md` §8, or entered
 a closure through the general entry of `docs/VM.md` §6 (not the
-direct one), and every `closure` instruction but `get-cell`, and
-every `coll` and `ctrl` instruction. After `mov`, `cmp`, `jump`,
+direct one), a `call:self` through that entry, a `call:lookup` or
+`call:lookup-or` past its in-place cases, every `closure` instruction
+but `get-cell`, and every `coll` and `ctrl` instruction. After `mov`, `cmp`, `jump`,
 `var`, `call:return` or `call:return-nil` the counter cannot have
 moved. Between two instructions every
 live value is in one of the roots §3 lists, so a cycle there frees

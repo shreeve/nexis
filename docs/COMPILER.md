@@ -168,6 +168,14 @@ and a reused subform its own (MACROEXPAND.md §4b).
    may refer to a Var a later form defines.
 8. Otherwise `UnresolvedSymbol`, at the symbol's own span.
 
+**Keyword and symbol calls.** A keyword or symbol literal in operator
+position with one or two arguments, `(:k x)`, `('s x)`, `(:k x d)`,
+lowers to `call:lookup`, which reads `x` in place where a `math`
+instruction would (§4.4), or `call:lookup-or` over a block of `x` and
+`d` (VM.md §6): one instruction that makes the call `call:call` would.
+Any other count, and a key past the routine's first 4096 constants,
+is an ordinary call.
+
 **Binding rules:**
 - Inner bindings shadow outer.
 - `let*` / `loop*` bindings are sequential with strict left-of-self
@@ -176,7 +184,8 @@ and a reused subform its own (MACROEXPAND.md §4b).
   `(let* [x e1 x e2] body)` is well-formed, `e2` seeing the first `x`.
 - A `fn*` self-name (`(fn* name [params] body)`) is a lexical local
   bound to the closure itself, so recursion needs no Var (rule 3 wins
-  over rules 5-7).
+  over rules 5-7) and does not see a later redefinition of the Var a
+  `defn` binds (`CLOJURE-REVIEW.md` §4.3).
 - A name repeated in one parameter list, the rest parameter
   included, names its last occurrence, as in Clojure: each takes its
   argument's slot, and the later binding shadows the earlier
@@ -274,12 +283,12 @@ constant pool, Var table, capture descriptors, span table,
   enclosing target's bindings and a tail position of the `let*`
   body is a `recur`.
 - **Operands in place.** A `math` or `cmp` instruction,
-  `jump:if-false`, `var:store-var` and `ctrl:throw` read a literal (as
-  a constant), a local held directly in its slot, an upvalue or a Var
-  where it is, instead of copying it into a slot first. Evaluation
-  stays left to right: the left operand of a two-operand instruction
-  reads a Var in place only when the right one is a literal or a
-  symbol, which run no code.
+  `call:lookup`, `jump:if-false`, `var:store-var` and `ctrl:throw`
+  read a literal (as a constant), a local held directly in its slot,
+  an upvalue or a Var where it is, instead of copying it into a slot
+  first. Evaluation stays left to right: the left operand of a
+  two-operand instruction reads a Var in place only when the right one
+  is a literal or a symbol, which run no code.
 - **Literals.** nil, booleans and fixnums use `mov:load-nil` /
   `load-true` / `load-false` or a constant; every other literal
   (string, float, char, bignum, keyword, symbol) is a constant.
@@ -385,14 +394,16 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(g a b c)` | 6 |
 | `(str "a" a "b" b)` | 7 |
 | `{:a (inc a) :b (g b) :c c}` | 10 |
-| `(pm a)`, `(:x a)` | 4 |
+| `(pm a)` | 4 |
+| `(:x a)`, `(:x a 1)` (§4.3) | 2, 4 |
 | `(is (= 1 (inc (dec a))))` | 8 |
 | `(is (pos? a))` | 8 |
 | `(is (thrown? :x (g a)))` | 16 |
 | `(let [[x y & r] xs] (g x y r))` | 20 |
-| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments (MACROEXPAND.md §10) | 24 |
-| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 29 |
+| `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments, each key a lookup (MACROEXPAND.md §10) | 19 |
+| `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 26 |
 | `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
+| `(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))`, the closure's routine: two self-calls (§5.5) | 9 |
 | `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
 | `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |
 | `(condp = a 1 :a 2 :b 3 :c :d)` | 20 |
@@ -509,22 +520,45 @@ in the tail passes it to its body. `(fn* [a] (if a 1))` is
 `jump:if-false`, `call:return c`, `call:return-nil`. The tail never
 reaches into a `try` (§5.10), so no return leaves a handler behind.
 
-**Self-name.** When the body refers to its self-name, the closure
-does not exist yet at `closure:make`, so the self-reference goes
+**Self-calls.** A call of the self-name with the fixed arity, made in
+the body itself rather than in a `fn*` inside it, by a `fn*` with no
+rest parameter and at most 256 parameters, is a self-call: the
+arguments compute into a block, which becomes the callee's window, and
+`call:self` (VM.md §6) calls the frame's own closure, with no cell to
+read and no callee to test. `fib`'s body is nine instructions, two of
+them `call:self`:
+
+```
+; (defn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))), from nexis disasm
+cmp:lt          s2  s0  c0=2
+jump:if-false   s2  j0003
+call:return     s0  -  -
+math:sub        s2  s0  c1=1
+call:self       s2  #1  s2          ; (fib (- n 1)): the window is s2
+math:sub        s3  s0  c0=2
+call:self       s3  #1  s3
+math:add        s1  s2  s3
+call:return     s1  -  -
+```
+
+**Self-name.** Any other reference to the self-name, as a value, from
+a `fn*` inside the body, or in a call at another arity, reads the
+closure, which does not exist yet at `closure:make`, so it goes
 through a placeholder cell:
 
 ```
-; (def f (fn* fact [n] ... (fact (- n 1)) ...)), from nexis disasm
-closure:new-cell    s2  -  -                        ; an uninitialized cell
-closure:make        s1  #0<routine fact>[s2]        ; captures it
-closure:init-cell   s2  s1  -                       ; the cell holds the closure
+; (def w (fn* walk [x] (if (vector? x) (mapv walk x) (inc x)))), from nexis disasm
+closure:new-cell    s3  -  -                        ; an uninitialized cell
+closure:make        s2  #0<routine walk>[s3]        ; captures it
+closure:init-cell   s3  s2  -                       ; the cell holds the closure
 ```
 
-Inside the body `fact` is `u0`. A body that never names itself gets
-no cell and an empty descriptor. Generated code never runs user code
-between `closure:make` and its `closure:init-cell`, so the
-placeholder's uninitialized state is invisible; hand-written bytecode
-that reads it traps `UninitializedCell` (VM.md §13).
+Inside the body `walk` is `u0`. A body that never names itself, or
+names itself only in self-calls, gets no cell and an empty
+descriptor. Generated code never runs user code between
+`closure:make` and its `closure:init-cell`, so the placeholder's
+uninitialized state is invisible; hand-written bytecode that reads it
+traps `UninitializedCell` (VM.md §13).
 
 #### 5.6 `(recur args...)`
 
