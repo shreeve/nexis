@@ -2414,6 +2414,12 @@ test "lazy: transducers, transduce, into and sequence with an xform, eduction, c
     try expectOutput("[(transduce (map inc) + [1 2 3]) (transduce (filter odd?) + 10 [1 2 3]) (into [] (comp (map inc) (filter even?)) (range 6)) (= #{2 3} (into #{} (map inc) [1 1 2])) (into '() (map inc) [1 2]) (sequence (map inc) [1 2 3]) (sequence (comp (take 2) (map inc)) (range)) (into [] cat [[1 2] [3]]) (into [] (mapcat reverse) [[1 2] [3 4]])]", "[9 14 [2 4 6] true (3 2) (2 3 4) (1 2) [1 2 3] [2 1 4 3]]");
     try expectOutput("[(into [] (partition-all 2) [1 2 3]) (into [] (partition-by odd?) [1 3 2 4 5]) (into [] (dedupe) [1 1 2 2 1]) (into [] (distinct) [1 2 1 3]) (into [] (interpose :s) [1 2 3]) (into [] (keep #(when (odd? %) (* % %))) [1 2 3]) (into [] (map-indexed vector) [:a :b]) (into [] (keep-indexed #(when (odd? %1) %2)) [:a :b :c :d])]", "[[[1 2] [3]] [[1 3] [2 4] [5]] [1 2 1] [1 2 3] [1 :s 2 :s 3] [1 9] [[0 :a] [1 :b]] [:b :d]]");
     try expectOutput("[(into [] (take-while neg?) [-1 -2 3 -4]) (into [] (drop-while neg?) [-1 -2 3 -4]) (into [] (drop 2) [1 2 3]) (into [] (remove odd?) [1 2 3 4]) (transduce (halt-when #(> % 2)) conj [] [1 2 3 4]) ((completing +) 5) (sequence (map +) [1 2] [10 20 30]) (eduction (map inc) [1 2]) (into [] (map inc) (range 3))]", "[[-1 -2] [3 -4] [3] [2 4] 3 5 (11 22) (2 3) [1 2 3]]");
+    // sequence's outputs are what reached its accumulator: a reduced
+    // value ends the walk and is not one (bb, as JVM Clojure 1.12).
+    try expectOutput("[(sequence (halt-when #{3}) [0 1 2 3 4]) (take 5 (sequence (halt-when #{3}) (range))) (sequence (halt-when #{3} (fn [r x] [:r x])) [0 1 2 3 4]) (sequence (comp (halt-when #{1}) (partition-all 2)) [0 1 2]) (sequence (comp (partition-all 2) (halt-when #(= % [2 3]))) (range 10))]", "[(0 1 2) (0 1 2) (0 1 2) ([0]) ([0 1])]");
+    // A step that throws runs again from its source position, with the
+    // transducer's state as the failure left it (LAZY.md §9).
+    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once (0 1)]");
     // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
     // one input past them), its completion once.
     try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");

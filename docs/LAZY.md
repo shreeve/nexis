@@ -398,6 +398,13 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
   one, made a list (§8), is not one; Datomic takes any list.
+- **A `sequence` step that throws** runs again from its block's
+  source position with the transducer's state as the failed step left
+  it: `(sequence (comp (map f) (take 4)) (range 10))` whose `f` throws
+  once at 2 gives `(0 1)` on the next walk, `take` having counted 0
+  and 1 twice. Clojure's iterator goes on from its advanced source and
+  transducer and drops the outputs of the chunk it was filling: `(3 4)`.
+  Both reuse state the failure advanced; neither is a fresh run.
 - **`eduction`** is `sequence` over the composed transducers: a cached
   lazy seq, where Clojure's `Eduction` runs the transform again on
   every reduce. Only side effects in the transform tell them apart.
@@ -423,7 +430,13 @@ transducer applied once to `conj!`, each step runs it over the
 source's elements into a transient vector until 32 outputs or more are
 waiting, the source ends, or a step returns a reduced value, and
 hands them out as one chunk; at the end it runs the completion arity
-once, so `partition-all`'s last part comes out. It realizes the source
+once, so `partition-all`'s last part comes out. As in Clojure's
+`TransformerIterator`, the outputs are what reached the transient:
+what the transducer returns is not an accumulator, and a reduced value
+only ends the walk, so `(sequence (halt-when #{3}) [0 1 2 3 4])` is
+`(0 1 2)`. A step that throws runs again from its block's source
+position (§4), but the transducer's state (a stateful one's volatiles)
+is as the failed step left it (§9). It realizes the source
 as far as the outputs need, as Clojure's `TransformerIterator` pulls
 it. Unlike the other producers' (§7), its walk's position stays out of
 the block, on a root scope while the step calls the transducer: the

@@ -144,23 +144,24 @@ const steps = [_]Step{
     stepSequence,
 };
 
-/// Whether `v` is a `reduced` value, and the value inside: the record
-/// type the VM registers for it (`VM.reduced_type_id`).
-fn unreduced(vm: *VM, v: Value) ?Value {
-    const id = vm.home().reduced_type_id orelse return null;
-    if (v.kind() != .record or record_mod.typeId(v) != id) return null;
-    var it = champ_mod.mapIter(record_mod.fieldsOf(v));
-    return (it.next() orelse return null).value;
+/// Whether `v` is a `reduced` value: the record type the VM registers
+/// for it (`VM.reduced_type_id`).
+fn isReduced(vm: *VM, v: Value) bool {
+    const id = vm.home().reduced_type_id orelse return false;
+    return v.kind() == .record and record_mod.typeId(v) == id;
 }
 
 /// The transient vector a step accumulates into, rooted in the block's
-/// result field; the outputs a step hands out are its elements.
+/// result field; the outputs a step hands out are its elements. What
+/// `rf` returns is not an accumulator, as for Clojure's
+/// `TransformerIterator`: the outputs are what reached `acc`, and a
+/// reduced value only ends the walk (`halt-when`'s holds a map).
 fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     const a = lazy.args(lz);
     if (a[2].isTruthy()) return value_mod.nilValue();
     const heap = vm.ensureHeap();
     const empty = vector_mod.empty(heap) catch return VmError.OutOfMemory;
-    var acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
+    const acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
     lazy.setScratch(lz, acc);
     // The walk's position stays out of the block, so a step that throws
     // runs again from the block's own source position; the seq taken of
@@ -176,7 +177,6 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     // Pull inputs until a chunk's worth of outputs waits, the source
     // ends, or `rf` stops the reduction.
     while (true) {
-        if (acc.kind() != .transient) return VmError.KindMismatch;
         const n = transient_mod.vectorCountBang(acc) catch return VmError.KindMismatch;
         if (n >= lazy.chunk_size) break;
         cur = try seqOf(vm, cur);
@@ -197,24 +197,15 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
         } else args[1] = fr.first;
         const r = try vm.callValue(a[0], args[0..argc]);
         cur = fr.rest;
-        if (unreduced(vm, r)) |inner| {
-            acc = inner;
-            lazy.setScratch(lz, acc);
+        if (isReduced(vm, r)) {
             done = true;
             break;
         }
-        acc = r;
-        lazy.setScratch(lz, acc);
     }
     // The completion arity runs once, at the end: `partition-all`'s last
     // part comes out there.
-    if (done) {
-        acc = try vm.callValue(a[0], &.{acc});
-        if (unreduced(vm, acc)) |inner| acc = inner;
-        lazy.setScratch(lz, acc);
-    }
-    if (acc.kind() != .transient) return VmError.KindMismatch;
-    const out = transient_mod.persistentBang(acc) catch return VmError.OutOfMemory;
+    if (done) _ = try vm.callValue(a[0], &.{acc});
+    const out = transient_mod.persistentBang(acc) catch return VmError.KindMismatch;
     // Nothing below runs code, and `Heap.alloc` never collects.
     const following = if (done) value_mod.nilValue() else try make(vm, op_sequence, &.{ a[0], cur, value_mod.fromBool(false), a[3] });
     const n = vector_mod.count(out);
