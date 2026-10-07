@@ -39,6 +39,13 @@ pub const max_insts = 10_000;
 pub const max_nodes = 1_000_000;
 /// The largest program size times capture slots: one thread list's slot words.
 pub const max_slot_words = 1 << 20;
+/// The most code-point ranges the classes of one program store, each
+/// distinct set once.
+pub const max_ranges = 1 << 16;
+/// The memory compiling a pattern may take: this, plus `budget_per_byte`
+/// for each byte of the pattern, so a literal of any length compiles.
+pub const budget_base = 16 << 20;
+pub const budget_per_byte = 32;
 /// The deepest nesting of groups and character classes.
 pub const max_nest = 250;
 
@@ -121,6 +128,55 @@ pub const Compiled = union(enum) { ok: Program, err: SyntaxError };
 /// Compile `source` with `flags`, allocating in `arena`. A syntax
 /// error or a pattern past a limit is `.err`, never a Zig error.
 pub fn compile(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Error || stack.Error)!Compiled {
+    var budget: Budget = .{ .child = arena, .left = budget_base +| budget_per_byte *| source.len };
+    return compileIn(budget.allocator(), source, flags) catch |e| switch (e) {
+        error.OutOfMemory => if (budget.spent) .{ .err = .{ .msg = "the pattern needs too much memory to compile", .offset = 0 } } else e,
+        else => e,
+    };
+}
+
+/// An allocator that refuses past `left` bytes: what one pattern's
+/// sets and nodes may take while it compiles (docs/REGEX.md §4).
+const Budget = struct {
+    child: Allocator,
+    left: usize,
+    spent: bool = false,
+
+    fn allocator(b: *Budget) Allocator {
+        return .{ .ptr = b, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn take(b: *Budget, n: usize) bool {
+        if (n > b.left) {
+            b.spent = true;
+            return false;
+        }
+        b.left -= n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return if (b.take(len)) b.child.rawAlloc(len, alignment, ret) else null;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return (len <= memory.len or b.take(len - memory.len)) and b.child.rawResize(memory, alignment, len, ret);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        return if (len <= memory.len or b.take(len - memory.len)) b.child.rawRemap(memory, alignment, len, ret) else null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const b: *Budget = @ptrCast(@alignCast(ctx));
+        b.child.rawFree(memory, alignment, ret);
+    }
+};
+
+fn compileIn(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Error || stack.Error)!Compiled {
     if (!std.unicode.utf8ValidateSlice(source)) return .{ .err = .{ .msg = "the pattern is not valid UTF-8", .offset = 0 } };
     var p: Parser = .{ .arena = arena, .src = source, .flags = flags };
     try p.unquote();
@@ -145,6 +201,7 @@ pub fn compile(arena: Allocator, source: []const u8, flags: Flags) (Allocator.Er
         error.TooBig => .{ .err = .{ .msg = "the pattern compiles to more than 10000 instructions", .offset = 0 } },
         error.TooManySlots => .{ .err = .{ .msg = "the pattern has too many groups for its size", .offset = 0 } },
         error.TooManyNodes => .{ .err = .{ .msg = "the pattern expands to more than 1000000 nodes", .offset = 0 } },
+        error.TooManyRanges => .{ .err = .{ .msg = "the pattern's classes hold more than 65536 ranges", .offset = 0 } },
         error.OutOfMemory => error.OutOfMemory,
         error.StackOverflow => error.StackOverflow,
     };
@@ -213,13 +270,32 @@ fn normalize(rs: []Range) []Range {
     return rs[0 .. n + 1];
 }
 
-fn unite(arena: Allocator, x: ?[]const Range, y: []const Range) Allocator.Error![]const Range {
-    const a = x orelse return y;
-    const out = try arena.alloc(Range, a.len + y.len);
-    @memcpy(out[0..a.len], a);
-    @memcpy(out[a.len..], y);
-    return normalize(out);
-}
+/// A union built one operand at a time, null until the first (an
+/// empty union differs from none). Operands are appended and merged
+/// when the list has doubled, so a class of n items costs O(n log n),
+/// not a copy of the union per item.
+const Union = struct {
+    list: ?std.ArrayList(Range) = null,
+    merged: usize = 0,
+
+    fn add(u: *Union, arena: Allocator, set: []const Range) Allocator.Error!void {
+        if (u.list == null) u.list = .empty;
+        const l = &u.list.?;
+        try l.appendSlice(arena, set);
+        if (l.items.len > 2 * u.merged + 64) {
+            l.items = normalize(l.items);
+            u.merged = l.items.len;
+        }
+    }
+
+    /// The union so far, a copy later operands leave alone.
+    fn get(u: *Union, arena: Allocator) Allocator.Error!?[]const Range {
+        const l = if (u.list) |*l| l else return null;
+        l.items = normalize(l.items);
+        u.merged = l.items.len;
+        return try arena.dupe(Range, l.items);
+    }
+};
 
 fn intersect(arena: Allocator, a: []const Range, b: []const Range) Allocator.Error![]const Range {
     var out: std.ArrayList(Range) = .empty;
@@ -385,7 +461,7 @@ const Node = union(enum) {
     /// A run of literal code points: Java's slice when it holds two or
     /// more, which `(?iu)` folds by a different rule than one.
     lit: struct { cps: []const u21, fold: Fold },
-    class: struct { ranges: []const Range, offset: ?u32 = null },
+    class: []const Range,
     assert: Assert,
     /// `\R`.
     line_end,
@@ -668,7 +744,7 @@ const Parser = struct {
     }
 
     fn classNode(p: *Parser, set: []const Range) Fail!*Node {
-        return p.node(.{ .class = .{ .ranges = set } });
+        return p.node(.{ .class = set });
     }
 
     /// A run of literal characters, as Java's `atom` collects one: it
@@ -990,9 +1066,9 @@ const Parser = struct {
         p.depth += 1;
         defer p.depth -= 1;
         if (p.depth > max_nest) return p.fail(at, "groups nest too deeply");
-        var prev: ?[]const Range = null;
+        var prev: Union = .{};
         var curr: ?[]const Range = null;
-        var gathered: []const Range = &.{};
+        var gathered: Union = .{};
         var has_bits = false;
         var negate = false;
         if (bracket and p.rawIs(p.pos, '^')) {
@@ -1006,12 +1082,12 @@ const Parser = struct {
                     p.pos += 1;
                     const inner = try p.class(true);
                     curr = inner;
-                    prev = try unite(p.arena, prev, inner);
+                    try prev.add(p.arena, inner);
                     continue;
                 },
                 '&' => if (p.rawIs(p.pos + 1, '&')) {
                     p.pos += 2;
-                    var right: ?[]const Range = null;
+                    var right: Union = .{};
                     while (true) {
                         const d = p.peek() orelse return p.fail(at, "Unclosed character class");
                         if (d == ']' or d == '&') break;
@@ -1019,36 +1095,36 @@ const Parser = struct {
                             p.pos += 1;
                             break :blk try p.class(true);
                         } else try p.class(false);
-                        right = try unite(p.arena, right, operand);
+                        try right.add(p.arena, operand);
                     }
+                    const low = try gathered.get(p.arena) orelse &.{};
                     if (has_bits) {
-                        if (prev) |pv| prev = try unite(p.arena, pv, gathered) else {
-                            prev = gathered;
-                            curr = gathered;
-                        }
+                        if (prev.list == null) curr = low;
+                        try prev.add(p.arena, low);
                         has_bits = false;
                     }
-                    if (right) |r| curr = r;
-                    if (prev) |pv| {
-                        prev = try intersect(p.arena, pv, curr orelse gathered);
-                    } else prev = right orelse return p.fail(p.pos, "Bad class syntax");
+                    if (try right.get(p.arena)) |r| curr = r;
+                    if (try prev.get(p.arena)) |pv| {
+                        prev = .{};
+                        try prev.add(p.arena, try intersect(p.arena, pv, curr orelse low));
+                    } else if (right.list != null) prev = right else return p.fail(p.pos, "Bad class syntax");
                     continue;
                 },
-                ']' => if (prev != null or has_bits) {
+                ']' => if (prev.list != null or has_bits) {
                     if (bracket) p.pos += 1;
-                    var set = prev orelse gathered;
-                    if (prev != null and has_bits) set = try unite(p.arena, set, gathered);
+                    if (has_bits) try prev.add(p.arena, try gathered.get(p.arena) orelse &.{});
+                    const set = try prev.get(p.arena) orelse &.{};
                     return if (negate) try complement(p.arena, set) else set;
                 },
                 else => {},
             }
             const item = try p.classItem(c);
             if (item.bits) {
-                gathered = try unite(p.arena, gathered, item.set);
+                try gathered.add(p.arena, item.set);
                 has_bits = true;
             } else {
                 curr = item.set;
-                prev = try unite(p.arena, prev, item.set);
+                try prev.add(p.arena, item.set);
             }
         }
     }
@@ -1217,10 +1293,12 @@ const Compiler = struct {
     arena: Allocator,
     insts: std.ArrayList(Inst) = .empty,
     ranges: std.ArrayList(Range) = .empty,
+    /// The offset in `ranges` of each distinct set, keyed by its bytes.
+    sets: std.array_hash_map.String(u32) = .empty,
     nhidden: u32 = 0,
     nodes: u32 = 0,
 
-    const Fail = error{ TooBig, TooManySlots, TooManyNodes, OutOfMemory, StackOverflow };
+    const Fail = error{ TooBig, TooManySlots, TooManyNodes, TooManyRanges, OutOfMemory, StackOverflow };
 
     fn emit(c: *Compiler, inst: Inst) Fail!u32 {
         if (c.insts.items.len >= max_insts) return error.TooBig;
@@ -1275,15 +1353,7 @@ const Compiler = struct {
                     _ = try c.emit(.{ .op = .char, .a = set[0][0] });
                 } else try c.class(set);
             },
-            .class => |*k| {
-                const offset = k.offset orelse blk: {
-                    const at: u32 = @intCast(c.ranges.items.len);
-                    try c.ranges.appendSlice(c.arena, k.ranges);
-                    k.offset = at;
-                    break :blk at;
-                };
-                _ = try c.emit(.{ .op = .class, .a = offset, .b = @intCast(k.ranges.len) });
-            },
+            .class => |set| try c.class(set),
             .assert => |a| _ = try c.emit(.{ .op = .assert, .a = @backingInt(a) }),
             .line_end => try c.lineEnd(atomic),
             .group => |g| {
@@ -1308,10 +1378,16 @@ const Compiler = struct {
         }
     }
 
+    /// A class instruction over `set`, which the range table holds once
+    /// however many instructions test it.
     fn class(c: *Compiler, set: []const Range) Fail!void {
-        const at: u32 = @intCast(c.ranges.items.len);
-        try c.ranges.appendSlice(c.arena, set);
-        _ = try c.emit(.{ .op = .class, .a = at, .b = @intCast(set.len) });
+        const gop = try c.sets.getOrPut(c.arena, std.mem.sliceAsBytes(set));
+        if (!gop.found_existing) {
+            if (c.ranges.items.len + set.len > max_ranges) return error.TooManyRanges;
+            gop.value_ptr.* = @intCast(c.ranges.items.len);
+            try c.ranges.appendSlice(c.arena, set);
+        }
+        _ = try c.emit(.{ .op = .class, .a = gop.value_ptr.*, .b = @intCast(set.len) });
     }
 
     /// `\r\n | [\n\x0B\f\r\x85  ]`; atomic, `\r` alone only
@@ -2393,6 +2469,25 @@ test "regex: the limits refuse a pattern one step past them" {
     try testing.expect(try compile(a, "(?:(?:){1000}){499}", .{}) == .ok);
     for ([_][]const u8{ "(?:(?:){1000}){500}", "(?:(?:(?:){1000}){1000}){1000}", "(?:(?:(?:(?:x{0}){1000}){1000}){1000}){1000}" }) |p|
         try testing.expectEqualStrings("the pattern expands to more than 1000000 nodes", (try compile(a, p, .{})).err.msg);
+    // A class's ranges are stored once however often it is written,
+    // and the distinct ones are limited.
+    const pl = (try compile(a, "\\PL", .{})).ok.ranges.len;
+    var many: std.ArrayList(u8) = .empty;
+    for (0..1000) |_| try many.appendSlice(a, "\\PL");
+    try testing.expectEqual(pl, (try compile(a, many.items, .{})).ok.ranges.len);
+    many.clearRetainingCapacity();
+    for (0..max_ranges / pl + 2) |i| try many.print(a, "[\\PL\\x{{{X}}}]", .{0x4E00 + 2 * i});
+    try testing.expectEqualStrings("the pattern's classes hold more than 65536 ranges", (try compile(a, many.items, .{})).err.msg);
+    // A class's items are united once, not copied per item; the sets
+    // a pattern builds while it compiles are bounded by its size.
+    many.clearRetainingCapacity();
+    try many.append(a, '[');
+    for (0..50_000) |i| try many.print(a, "\\x{{{X}}}", .{0x10000 + 2 * i});
+    try many.append(a, ']');
+    try testing.expectEqual(@as(usize, 50_000), (try compile(a, many.items, .{})).ok.ranges.len);
+    many.clearRetainingCapacity();
+    for (0..5000) |_| try many.appendSlice(a, "[^\\pL]");
+    try testing.expectEqualStrings("the pattern needs too much memory to compile", (try compile(a, many.items, .{})).err.msg);
     // A literal of any length skips the VM and its limits.
     const big = try a.alloc(u8, 1 << 20);
     @memset(big, 'q');

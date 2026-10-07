@@ -247,11 +247,15 @@ than a slow search.
 | program size, after every repetition is expanded | 10 000 instructions | `the pattern compiles to more than 10000 instructions` |
 | program size × slots | 2^20 slot words | `the pattern has too many groups for its size` |
 | AST nodes compiled, after every repetition is expanded (a body that compiles to nothing, such as `(?:)` or `x{0}`, still counts) | 1 000 000 | `the pattern expands to more than 1000000 nodes` |
+| ranges in the classes of one program, each distinct set stored once | 65 536 | `the pattern's classes hold more than 65536 ranges` |
+| memory compiling the pattern takes (its AST, the sets its classes build, the program) | 16 MiB + 32 bytes per byte of the pattern | `the pattern needs too much memory to compile` |
 | nesting of groups and classes | 250 | `groups nest too deeply` |
 
-A literal pattern has no instructions and no limit on its length. The
-parser counts both group and class depth and calls `stack.check()`,
-so a deep pattern is an error, never a fault.
+A literal pattern has no instructions, and its memory limit grows
+with its length, so a literal of any length compiles. A class unites
+its items in a list merged as it doubles, so a class of n items costs
+O(n log n). The parser counts both group and class depth and calls
+`stack.check()`, so a deep pattern is an error, never a fault.
 
 ---
 
