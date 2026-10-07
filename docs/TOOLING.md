@@ -48,7 +48,12 @@ reports, every store file a commit left unsynced is synced once first
 **A closed pipe.** When what reads the command's stdout closes it (`nexis
 -e '(range 100000)' | head`), the value, disassembly, usage text or
 prompt being written goes nowhere and the command ends there, with no
-report and exit 0, as a JVM Clojure program's does.
+report and exit 0, as a JVM Clojure program's does. So does a program
+whose `print`, `println`, `pr`, `prn` or `printf` writes into the
+closed pipe (`nexis -e '(dotimes [i 100000] (println i))' | head -1`):
+it ends at that write, every store a commit left unsynced synced
+first. A JVM program's `System.out` swallows the error and runs on to
+its end; nexis stops, so a program printing an endless seq ends too.
 
 **The runtime's stack.** The runtime runs on a thread with a 1 GiB
 stack reservation, committed only as it is touched (`docs/VM.md`

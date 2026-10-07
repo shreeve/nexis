@@ -5484,10 +5484,19 @@ pub fn discardOutCaptures() void {
     out_stack.clearAndFree(out_allocator);
 }
 
+/// A reader that closed stdout has all it wants: the program ends
+/// there, quietly and successfully, its stores synced, as the CLI's
+/// own output does (TOOLING.md §1).
 fn writeOut(vm: *VM, bytes: []const u8) VmError!void {
     if (out_stack.lastPtr()) |top| return top.appendSlice(out_allocator, bytes) catch VmError.OutOfMemory;
     const io_handle = vm.io orelse return VmError.IoError;
-    std.Io.File.stdout().writeStreamingAll(io_handle, bytes) catch return VmError.IoError;
+    std.Io.File.stdout().writeStreamingAll(io_handle, bytes) catch |err| switch (err) {
+        error.BrokenPipe => {
+            db_mod.StoreFile.syncAll();
+            std.process.exit(0);
+        },
+        else => return VmError.IoError,
+    };
 }
 
 /// `args` formatted in `mode`, separated by spaces, into `w`. The
