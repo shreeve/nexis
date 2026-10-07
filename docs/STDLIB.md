@@ -29,7 +29,9 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
-A failure in step 3 is a bug in an embedded file or the image and
+Memory running out in step 3 is reported as at any other time: the
+CLI prints its out-of-memory report and exits 5 (`TOOLING.md` §1).
+Any other failure there is a bug in an embedded file or the image and
 panics with the loader's diagnostic or the image's error.
 
 **The image.** Evaluating the sources at every start would read,
