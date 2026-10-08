@@ -67,7 +67,9 @@ VM's roots, in the order it marks them:
    popped frame keeps its stale value until the slot is grown into
    again, which retains garbage for a while and is sound. A native
    call's block is cleared when the native returns (`docs/VM.md` §6),
-   so what a native was given is not retained through it. Between
+   so what a native was given is not retained through it, and a
+   local's slot is nil after its last move (`docs/COMPILER.md` §4.9),
+   so a frame keeps no value its code will not read again. Between
    top-level forms the stack holds nothing: `retargetTop` and
    `resetAfterError` clear every slot, so a form keeps nothing an
    earlier one left alive. A slot holding a `cell_internal` Value
@@ -317,8 +319,10 @@ already marked, so the walk stops there.
 - **Transient ownership in the collector.** A transient is an ordinary
   block whose trace walks the wrapped collection; its owner token is
   the kind's business (`src/coll/transient.zig`).
-- **A per-PC liveness map.** The whole backing stack is a root, so a
-  dead slot retains its value until it is overwritten or grown into.
+- **A per-PC liveness map.** The whole backing stack is a root. The
+  compiler clears a local at its last move (`docs/COMPILER.md` §4.9);
+  any other dead slot, one read last in place or above a popped frame,
+  retains its value until it is overwritten or grown into.
 - **Collection in a sub-VM.** Its garbage is the owner's to collect
   after it returns.
 
@@ -357,9 +361,10 @@ make sure a root reaches it. What is rooted already:
   slots when reached by `call:call`, through the root stack when
   reached by `callValue`, which pushes a native callee's `args` for the
   call's duration. A closure callee holds its arguments in its own
-  slots only until a fn-level `recur` overwrites them, so a value a
-  native passes to a callback is rooted by that call for no longer
-  than the callee uses it. One exception: the last argument of a native that consumes
+  slots only until its last use of each, which clears the slot
+  (`docs/COMPILER.md` §4.9), or a fn-level `recur` overwrites them,
+  so a value a native passes to a callback is rooted by that call for
+  no longer than the callee uses it. One exception: the last argument of a native that consumes
   it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
   `some`, `every?`, `last`, `dorun`), whose slot `call:call` clears
   once it has copied the arguments, so the head of a lazy seq passed
@@ -392,7 +397,8 @@ The rule each native follows, by what it holds across a further
    `db/alter!` and `db/reduce-tree` (its decoded value is the call's
    argument and is not kept), `some` and `every?`. A value passed to
    one call and used after it, by the native or by a further call, is
-   class 3 or 4: the callee may have `recur`red it away.
+   class 3 or 4: the callee may have cleared it at its last use or
+   `recur`red it away.
 3. **Callback results kept across further callbacks**: a
    `VM.rootScope()` pushes each one, and its deferred `release` drops
    them on every exit path, a `ControlTransferred` unwind included.

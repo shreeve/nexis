@@ -38,7 +38,9 @@ and `(v i)`), namespaces, Vars and the namespace registry.
 - Object files and tiered compilation. `bin/nexis disasm` prints
   routines (`docs/TOOLING.md` §2); `Routine.verify` checks each one
   before it runs (§5).
-- Per-PC liveness maps: the whole backing stack is a root (§9).
+- Per-PC liveness maps: the whole backing stack is a root (§9); the
+  compiler clears a local's slot at its last move instead
+  (`mov:move-clear`, §10.1; `docs/COMPILER.md` §4.9).
 - Unbounded recursion: the frame chain stops at `VM.max_frames` and
   native re-entry at the stack guard, both with a catchable
   `:stack-overflow` (§13, §13.1).
@@ -157,7 +159,8 @@ from (above); every
 instruction `primary` with an assigned opcode (a defined but
 unexecuted one, §10, passes and traps where it runs); every operand
 inside the table it indexes (a slot below `slot_count`, a constant,
-a Var, an upvalue below `upvalue_count`) and a destination a slot;
+a Var, an upvalue below `upvalue_count`), a destination a slot and
+`mov:move-clear`'s source a slot;
 every wide field inside its table, a jump target, a `try`'s catch and
 finally pcs and `ctrl:try-exit`'s continuation inside the code; every
 `call:call` and `coll:*` block, every `call:self`'s arguments and
@@ -733,6 +736,7 @@ outside its group's enum that is not a quickened variant (§10.10) is
 | 2 | `mov:load-nil` | A=slot | `slot[A] := nil` |
 | 3 | `mov:load-true` | A=slot | `slot[A] := true` |
 | 4 | `mov:load-false` | A=slot | `slot[A] := false` |
+| 5 | `mov:move-clear` | A=slot, B=slot | `v := slot[B]; slot[B] := nil; slot[A] := v`: a move whose source the compiler found dead after it (`COMPILER.md` §4.9), so the slot roots the value no more; A = B is a move. Never traps, allocates or reaches a safe point |
 
 Keywords and symbols are constants; there is no `load-keyword`.
 

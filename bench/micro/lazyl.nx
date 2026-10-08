@@ -1,0 +1,4 @@
+; bench/micro/lazyl.nx N: lazy3's pipeline bound by let, then walked: instructions and peak RSS.
+(let [n (parse-long (first *command-line-args*))
+      s (map inc (filter even? (map inc (range n))))]
+  (println (reduce + s)))

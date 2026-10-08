@@ -631,6 +631,10 @@ const Emitter = struct {
     value_consts: std.AutoHashMapUnmanaged([2]u64, u32) = .empty,
     capture_descs: std.ArrayList(vm.CaptureDescriptor) = .empty,
     tries: std.ArrayList(vm.Try) = .empty,
+    /// Where each of `tries` lies in the code, for `clearDeadMoves`.
+    try_extents: std.ArrayList(TryExtent) = .empty,
+    /// Whether `finish` clears each local at its last move (§4.9).
+    clear_locals: bool = false,
     scope: ScopeTable(BindingRef) = .{},
     /// The next free slot. Slots are a stack: `compileExpr` frees
     /// every slot a node allocated once the node is compiled, so a
@@ -729,6 +733,7 @@ const Emitter = struct {
         self.value_consts.deinit(self.allocator);
         self.capture_descs.deinit(self.allocator);
         self.tries.deinit(self.allocator);
+        self.try_extents.deinit(self.allocator);
         self.scope.deinit(self.allocator);
         self.captures.deinit(self.allocator);
         self.captured_names.deinit(self.allocator);
@@ -1030,7 +1035,8 @@ const Emitter = struct {
     }
 
     /// The routine's code, pools and span table, copied onto `out`,
-    /// the code quickened (VM.md §10.10).
+    /// each local cleared at its last move when `clear_locals` (§4.9)
+    /// and then the code quickened (VM.md §10.10).
     ///
     /// Ownership transfer is errdefer-safe: if
     /// any `toOwnedSlice` fails after a previous one succeeded,
@@ -1041,6 +1047,8 @@ const Emitter = struct {
         errdefer self.out.free(code);
         const consts = try self.out.dupe(Value, self.consts.items);
         errdefer self.out.free(consts);
+        const slot_count: u16 = if (self.slot_count == 0) 1 else self.slot_count;
+        if (self.clear_locals) _ = try clearDeadMoves(self.allocator, code, slot_count, self.capture_descs.items, self.tries.items, self.try_extents.items);
         vm.quicken(code, consts);
         const caps = try self.out.dupe(vm.CaptureDescriptor, self.capture_descs.items);
         errdefer self.out.free(caps);
@@ -1056,7 +1064,7 @@ const Emitter = struct {
             .capture_descs = caps,
             .tries = tries,
             .var_table = vt,
-            .slot_count = if (self.slot_count == 0) 1 else self.slot_count,
+            .slot_count = slot_count,
             .fixed_arity = 0, // top-level only; compileFn sets this for child routines via Routine struct
             .variadic = false, // top-level routine never variadic
             .spans = spans,
@@ -1076,6 +1084,485 @@ fn transfersAway(inst: Inst) bool {
     }.op;
     return is(inst, .jump, vm.Jump.jmp) or is(inst, .call, vm.Call.@"return") or is(inst, .call, vm.Call.return_nil) or
         is(inst, .ctrl, vm.CtrlOp.throw_) or is(inst, .ctrl, vm.CtrlOp.try_exit) or is(inst, .ctrl, vm.CtrlOp.finally_exit);
+}
+
+// =============================================================================
+// Locals clearing (COMPILER.md §4.9)
+// =============================================================================
+
+/// Where a `try` form's code lies, beside its `vm.Try`: the pc of its
+/// `ctrl:try-enter`, and `end`, the pc its exits continue at, past
+/// its handler and its finally.
+const TryExtent = struct { enter: u32, end: u32 };
+
+/// The slots one instruction reads and the one it writes, by the
+/// operand roles `Routine.verify` proves (`effectsOf`).
+const Effects = struct {
+    def: ?u12 = null,
+    uses: [3]u12 = undefined,
+    n_uses: u8 = 0,
+    /// A call or collection block, or a lookup's two slots.
+    block_lo: u32 = 0,
+    block_len: u32 = 0,
+    /// The cells a `closure:make` reads.
+    sources: []const vm.CaptureSource = &.{},
+
+    fn use(fx: *Effects, slot: u12) void {
+        fx.uses[fx.n_uses] = slot;
+        fx.n_uses += 1;
+    }
+
+    /// `live`, the slots live after the instruction, made the slots
+    /// live before it.
+    fn backward(fx: *const Effects, live: []u64) void {
+        if (fx.def) |d| bitClear(live, d);
+        fx.reads(live);
+    }
+
+    /// Add every slot the instruction reads to `set`.
+    fn reads(fx: *const Effects, set: []u64) void {
+        for (fx.uses[0..fx.n_uses]) |u| bitSet(set, u);
+        for (fx.block_lo..fx.block_lo + fx.block_len) |s| bitSet(set, s);
+        for (fx.sources) |s| switch (s) {
+            .local_cell_slot => |c| bitSet(set, c),
+            .inherited_upvalue => {},
+        };
+    }
+
+    /// Whether the instruction reads a slot in `set`.
+    fn readsAny(fx: *const Effects, set: []const u64) bool {
+        for (fx.uses[0..fx.n_uses]) |u| if (bitHas(set, u)) return true;
+        for (fx.block_lo..fx.block_lo + fx.block_len) |s| if (bitHas(set, s)) return true;
+        for (fx.sources) |s| switch (s) {
+            .local_cell_slot => |c| if (bitHas(set, c)) return true,
+            .inherited_upvalue => {},
+        };
+        return false;
+    }
+};
+
+fn bitSet(set: []u64, i: usize) void {
+    set[i >> 6] |= @as(u64, 1) << @as(u6, @truncate(i));
+}
+
+fn bitClear(set: []u64, i: usize) void {
+    set[i >> 6] &= ~(@as(u64, 1) << @as(u6, @truncate(i)));
+}
+
+fn bitHas(set: []const u64, i: usize) bool {
+    return set[i >> 6] & (@as(u64, 1) << @as(u6, @truncate(i))) != 0;
+}
+
+fn bitOr(dst: []u64, src: []const u64) void {
+    for (dst, src) |*d, s| d.* |= s;
+}
+
+/// The slots `inst` reads and writes, or null for an operand the
+/// analysis cannot place inside the frame, which leaves the routine
+/// as it is. A slot read as such is a read, but for the cell
+/// `closure:new-cell` writes, the one `closure:box-local` reads and
+/// writes, and a `try`'s binding slot, which the VM writes only as it
+/// takes a throw (the edge to the handler, `clearDeadMoves`).
+fn effectsOf(inst: Inst, caps: []const vm.CaptureDescriptor, slot_count: u16) ?Effects {
+    var fx: Effects = .{};
+    if (inst.kind != .primary) return null;
+    const shape = Routine.shapeOf(vm.VM.opIndex(inst)) orelse return fx;
+    const group = inst.groupOf();
+    const is = struct {
+        fn op(i: Inst, g: vm.Group, v: anytype) bool {
+            return i.group == @backingInt(g) and i.variant == @backingInt(v);
+        }
+    }.op;
+    const wide = shape.wide != null;
+    const operands = [3]Operand{ inst.a, inst.b, inst.c };
+    const roles = [3]Routine.Role{ shape.a, if (wide) .none else shape.b, if (wide) .none else shape.c };
+    for (operands, roles, 0..) |op, role, i| switch (role) {
+        .dst => {
+            if (op.kind != .slot) return null;
+            fx.def = op.index;
+        },
+        .src => if (op.kind == .slot) fx.use(op.index),
+        .slot => {
+            if (op.kind != .slot) return null;
+            if (shape.block and i == 0) {
+                fx.block_lo = op.index;
+                fx.block_len = @as(u32, inst.b.index) + @intFromBool(is(inst, .call, vm.Call.call));
+            } else if (shape.pair and i == 1) {
+                fx.block_lo = op.index;
+                fx.block_len = 2;
+            } else if (is(inst, .closure, vm.Closure_.new_cell)) {
+                fx.def = op.index;
+            } else if (is(inst, .closure, vm.Closure_.box_local)) {
+                fx.def = op.index;
+                fx.use(op.index);
+            } else if (group != .ctrl) {
+                fx.use(op.index);
+            }
+        },
+        .none, .raw, .key, .fixnum, .upvalue => {},
+    };
+    if (shape.wide == .capture) {
+        const w = inst.wide();
+        if (w >= caps.len) return null;
+        fx.sources = caps[w].sources;
+    }
+    if (fx.def) |d| if (d >= slot_count) return null;
+    for (fx.uses[0..fx.n_uses]) |u| if (u >= slot_count) return null;
+    if (fx.block_lo + fx.block_len > slot_count) return null;
+    for (fx.sources) |s| switch (s) {
+        .local_cell_slot => |c| if (c >= slot_count) return null,
+        .inherited_upvalue => {},
+    };
+    return fx;
+}
+
+/// The most words of sets, the words a set of the routine's slots
+/// takes times its blocks and the blocks' regions, and the most
+/// passes, that `clearDeadMoves` spends on a routine before it leaves
+/// the routine as it is.
+const clear_budget_words = 1 << 20;
+const clear_max_passes = 64;
+
+/// The basic blocks of a routine's code and the edges between them,
+/// normal and exceptional (COMPILER.md §4.9).
+const Flow = struct {
+    /// Each block's first pc, and `code.len` after the last.
+    starts: []u32,
+    /// The block each pc lies in, `code.len` mapping past the last.
+    block_of: []u32,
+    /// Up to two successors a block, `none` for no more.
+    succ: [][2]u32,
+    /// The `try` regions each block lies in: `refs[ref_start[b]..ref_start[b + 1]]`.
+    ref_start: []u32,
+    refs: []Region,
+
+    const none = std.math.maxInt(u32);
+    /// A try's body, whose throws its handler takes, or its handler
+    /// when it has a finally, which then runs on a throw.
+    const Region = struct { t: u32, handler: bool };
+
+    fn blocks(f: *const Flow) usize {
+        return f.starts.len - 1;
+    }
+
+    /// The flow graph, or null for code the analysis does not model or
+    /// whose sets of `words` words would pass the budget.
+    fn build(arena: std.mem.Allocator, code: []const Inst, tries: []const vm.Try, extents: []const TryExtent, words: usize) error{OutOfMemory}!?Flow {
+        const n = code.len;
+        const is = struct {
+            fn op(i: Inst, g: vm.Group, v: anytype) bool {
+                return i.group == @backingInt(g) and i.variant == @backingInt(v);
+            }
+        }.op;
+        const leader = try arena.alloc(bool, n + 1);
+        @memset(leader, false);
+        leader[0] = true;
+        leader[n] = true;
+        for (code, 0..) |inst, pc| {
+            const jumps = inst.groupOf() == .jump or is(inst, .ctrl, vm.CtrlOp.try_exit);
+            if (jumps) {
+                if (inst.wide() >= n) return null;
+                leader[inst.wide()] = true;
+            }
+            if (jumps or transfersAway(inst)) leader[pc + 1] = true;
+        }
+        if (tries.len != extents.len) return null;
+        // The innermost try whose exits continue at each pc.
+        const exit_try = try arena.alloc(u32, n + 1);
+        @memset(exit_try, none);
+        for (tries, extents, 0..) |t, x, i| {
+            const fin = t.finally_pc orelse t.catch_pc;
+            if (!(x.enter < t.catch_pc and t.catch_pc <= fin and fin < x.end and x.end <= n)) return null;
+            if (!is(code[x.enter], .ctrl, vm.CtrlOp.try_enter) or code[x.enter].wide() != i) return null;
+            leader[x.enter + 1] = true;
+            leader[t.catch_pc] = true;
+            leader[fin] = true;
+            leader[x.end] = true;
+            if (exit_try[x.end] == none or extents[exit_try[x.end]].enter < x.enter) exit_try[x.end] = @intCast(i);
+        }
+
+        var count: usize = 0;
+        for (leader[0..n]) |l| count += @intFromBool(l);
+        if (count * words > clear_budget_words) return null;
+        const starts = try arena.alloc(u32, count + 1);
+        const block_of = try arena.alloc(u32, n + 1);
+        var b: u32 = 0;
+        for (0..n) |pc| {
+            if (leader[pc]) {
+                starts[b] = @intCast(pc);
+                b += 1;
+            }
+            block_of[pc] = b - 1;
+        }
+        starts[count] = @intCast(n);
+        block_of[n] = @intCast(count);
+
+        const succ = try arena.alloc([2]u32, count);
+        for (succ, 0..) |*s, blk| {
+            s.* = .{ none, none };
+            const last = starts[blk + 1] - 1;
+            const inst = code[last];
+            const next: u32 = if (last + 1 < n) block_of[last + 1] else none;
+            if (inst.groupOf() == .jump) {
+                s[0] = block_of[inst.wide()];
+                if (!is(inst, .jump, vm.Jump.jmp)) s[1] = next;
+            } else if (is(inst, .ctrl, vm.CtrlOp.try_exit)) {
+                // The exit of the try ending where it jumps, from its
+                // body or its handler.
+                const i = exit_try[inst.wide()];
+                if (i == none or last <= extents[i].enter or last >= (tries[i].finally_pc orelse extents[i].end)) return null;
+                s[0] = block_of[tries[i].finally_pc orelse extents[i].end];
+            } else if (is(inst, .ctrl, vm.CtrlOp.finally_exit)) {
+                // The last instruction of a finally, which goes on
+                // past its try; a throw it resumes is its enclosing
+                // region's.
+                const i = exit_try[last + 1];
+                if (i == none or tries[i].finally_pc == null or next == none) return null;
+                s[0] = next;
+            } else if (!transfersAway(inst)) {
+                if (next == none) return null;
+                s[0] = next;
+            }
+        }
+
+        // Each block's count of regions, from where each region's
+        // blocks start and end; then where each block's refs start.
+        const depth = try arena.alloc(i64, count + 1);
+        @memset(depth, 0);
+        for (tries, extents) |t, x| {
+            depth[block_of[x.enter + 1]] += 1;
+            depth[block_of[t.catch_pc]] -= 1;
+            if (t.finally_pc) |f| {
+                depth[block_of[t.catch_pc]] += 1;
+                depth[block_of[f]] -= 1;
+            }
+        }
+        const ref_start = try arena.alloc(u32, count + 1);
+        ref_start[0] = 0;
+        var d: i64 = 0;
+        var total: usize = 0;
+        for (0..count) |blk| {
+            d += depth[blk];
+            total += @intCast(d);
+            if ((count + total) * words > clear_budget_words) return null;
+            ref_start[blk + 1] = @intCast(total);
+        }
+        const refs = try arena.alloc(Region, ref_start[count]);
+        const fill = try arena.dupe(u32, ref_start[0..count]);
+        for (tries, extents, 0..) |t, x, i| {
+            for (block_of[x.enter + 1]..block_of[t.catch_pc]) |blk| {
+                refs[fill[blk]] = .{ .t = @intCast(i), .handler = false };
+                fill[blk] += 1;
+            }
+            if (t.finally_pc) |f| for (block_of[t.catch_pc]..block_of[f]) |blk| {
+                refs[fill[blk]] = .{ .t = @intCast(i), .handler = true };
+                fill[blk] += 1;
+            };
+        }
+        return .{ .starts = starts, .block_of = block_of, .succ = succ, .ref_start = ref_start, .refs = refs };
+    }
+
+    fn regions(f: *const Flow, b: usize) []const Region {
+        return f.refs[f.ref_start[b]..f.ref_start[b + 1]];
+    }
+};
+
+/// Rewrite each `mov:move` of a slot no instruction reads before the
+/// slot is written again, on any path, into `mov:move-clear`, so the
+/// slot stops rooting what it held (COMPILER.md §4.9). The code is the
+/// Emitter's, every jump patched and nothing quickened; only variants
+/// change. Liveness is over slots, backward to a fixed point, with
+/// every slot a `try`'s handler or finally reads live throughout what
+/// can throw to it. Returns whether the analysis ran: false leaves the
+/// code as it is, for a routine past the budget or one holding what
+/// the analysis does not model.
+fn clearDeadMoves(
+    gpa: std.mem.Allocator,
+    code: []Inst,
+    slot_count: u16,
+    caps: []const vm.CaptureDescriptor,
+    tries: []const vm.Try,
+    extents: []const TryExtent,
+) CompileError!bool {
+    const words = (@as(usize, slot_count) + 63) / 64;
+    if (code.len == 0 or words == 0) return false;
+    // Many routines have no move to clear; most of the rest fit the
+    // stack buffer, the sets of a larger one going to an arena, all
+    // freed together.
+    for (code) |inst| {
+        if (isSlotMove(inst)) break;
+    } else return true;
+    var overflow = std.heap.ArenaAllocator.init(gpa);
+    defer overflow.deinit();
+    var buffer: [8192]u8 align(16) = undefined;
+    var first = std.heap.BufferFirstAllocator.init(&buffer, overflow.allocator());
+    const arena = first.allocator();
+    const effects = try arena.alloc(Effects, code.len);
+    for (code, effects) |inst, *fx| fx.* = effectsOf(inst, caps, slot_count) orelse return false;
+    const flow = (try Flow.build(arena, code, tries, extents, words)) orelse return false;
+    const nb = flow.blocks();
+
+    // Each block's upward-exposed reads and its writes.
+    const use = try arena.alloc(u64, nb * words);
+    const def = try arena.alloc(u64, nb * words);
+    const live_in = try arena.alloc(u64, nb * words);
+    @memset(use, 0);
+    @memset(def, 0);
+    @memset(live_in, 0);
+    for (0..nb) |b| {
+        const u = use[b * words ..][0..words];
+        var pc = flow.starts[b + 1];
+        while (pc > flow.starts[b]) {
+            pc -= 1;
+            effects[pc].backward(u);
+            if (effects[pc].def) |d| bitSet(def[b * words ..][0..words], d);
+        }
+    }
+
+    // What a throw from a try's body, or from its handler when it has
+    // a finally, finds live where it lands: the handler's entry but its
+    // binding slot, which the throw writes, and the finally's entry.
+    const h_body = try arena.alloc(u64, tries.len * words);
+    const h_handler = try arena.alloc(u64, tries.len * words);
+    const out = try arena.alloc(u64, words);
+    const at = struct {
+        fn set(sets: []u64, i: usize, w: usize) []u64 {
+            return sets[i * w ..][0..w];
+        }
+    }.set;
+    var passes: usize = 0;
+    while (true) : (passes += 1) {
+        if (passes == clear_max_passes) return false;
+        for (tries, extents, 0..) |t, x, i| {
+            const hb = at(h_body, i, words);
+            const hh = at(h_handler, i, words);
+            @memcpy(hb, at(live_in, flow.block_of[t.catch_pc], words));
+            bitClear(hb, code[x.enter].a.index);
+            @memset(hh, 0);
+            if (t.finally_pc) |f| {
+                @memcpy(hh, at(live_in, flow.block_of[f], words));
+                bitOr(hb, hh);
+            }
+        }
+        var changed = false;
+        var b = nb;
+        while (b > 0) {
+            b -= 1;
+            @memset(out, 0);
+            for (flow.succ[b]) |s| if (s != Flow.none) bitOr(out, at(live_in, s, words));
+            for (out, at(use, b, words), at(def, b, words)) |*o, u, d| o.* = u | (o.* & ~d);
+            for (flow.regions(b)) |r| bitOr(out, at(if (r.handler) h_handler else h_body, r.t, words));
+            const in = at(live_in, b, words);
+            if (!std.mem.eql(u64, in, out)) {
+                @memcpy(in, out);
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+
+    // A slot is live after an instruction when the walk back from the
+    // block's successors finds it, or the block's regions hold it.
+    const live = try arena.alloc(u64, words);
+    const held = try arena.alloc(u64, words);
+    var cleared = false;
+    for (0..nb) |b| {
+        @memset(live, 0);
+        @memset(held, 0);
+        for (flow.succ[b]) |s| if (s != Flow.none) bitOr(live, at(live_in, s, words));
+        for (flow.regions(b)) |r| bitOr(held, at(if (r.handler) h_handler else h_body, r.t, words));
+        var pc = flow.starts[b + 1];
+        while (pc > flow.starts[b]) {
+            pc -= 1;
+            const inst = &code[pc];
+            if (isSlotMove(inst.*) and !bitHas(live, inst.b.index) and !bitHas(held, inst.b.index)) {
+                inst.variant = @backingInt(vm.Mov.move_clear);
+                cleared = true;
+            }
+            effects[pc].backward(live);
+        }
+    }
+    if (std.debug.runtime_safety and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
+    return true;
+}
+
+/// Whether `inst` is a `mov:move` of one slot to another, which
+/// clears its source where the source is dead after it.
+fn isSlotMove(inst: Inst) bool {
+    return inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move) and
+        inst.b.kind == .slot and inst.a.kind == .slot and inst.b.index != inst.a.index;
+}
+
+/// The check that no instruction reads a slot a `mov:move-clear`
+/// cleared on some path to it with no write since: forward over the
+/// rewritten code, with a throw from a try's body or handler carrying
+/// what it cleared to where the throw lands. A read of one is the
+/// analysis' bug, `InternalCompilerBug` at compile time rather than a
+/// nil read at run time. Debug and safe builds run it on every routine
+/// they clear in.
+fn checkClears(
+    arena: std.mem.Allocator,
+    code: []const Inst,
+    effects: []const Effects,
+    flow: *const Flow,
+    tries: []const vm.Try,
+    extents: []const TryExtent,
+    words: usize,
+) CompileError!void {
+    const nb = flow.blocks();
+    const in = try arena.alloc(u64, nb * words);
+    const seen = try arena.alloc(u64, nb * words);
+    const thrown = try arena.alloc(u64, 2 * tries.len * words);
+    const state = try arena.alloc(u64, words);
+    @memset(in, 0);
+    @memset(seen, 0);
+    const at = struct {
+        fn set(sets: []u64, i: usize, w: usize) []u64 {
+            return sets[i * w ..][0..w];
+        }
+    }.set;
+    var changed = true;
+    while (changed) {
+        changed = false;
+        // What a throw from each try's body (2t) and handler (2t + 1)
+        // carries.
+        @memset(thrown, 0);
+        for (0..nb) |b| for (flow.regions(b)) |r| {
+            bitOr(at(thrown, 2 * r.t + @intFromBool(r.handler), words), at(seen, b, words));
+        };
+        for (tries, extents, 0..) |t, x, i| {
+            const body = at(thrown, 2 * i, words);
+            bitClear(body, code[x.enter].a.index);
+            changed = orChanged(at(in, flow.block_of[t.catch_pc], words), body) or changed;
+            if (t.finally_pc) |f| changed = orChanged(at(in, flow.block_of[f], words), at(thrown, 2 * i + 1, words)) or changed;
+        }
+        for (0..nb) |b| {
+            @memcpy(state, at(in, b, words));
+            const s = at(seen, b, words);
+            changed = orChanged(s, state) or changed;
+            for (flow.starts[b]..flow.starts[b + 1]) |pc| {
+                const fx = &effects[pc];
+                if (fx.readsAny(state)) return CompileError.InternalCompilerBug;
+                const inst = code[pc];
+                if (inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move_clear)) bitSet(state, inst.b.index);
+                if (fx.def) |d| bitClear(state, d);
+                changed = orChanged(s, state) or changed;
+            }
+            for (flow.succ[b]) |succ| if (succ != Flow.none) {
+                changed = orChanged(at(in, succ, words), state) or changed;
+            };
+        }
+    }
+}
+
+/// `dst |= src`, and whether that added anything.
+fn orChanged(dst: []u64, src: []const u64) bool {
+    var added: u64 = 0;
+    for (dst, src) |*d, x| {
+        added |= x & ~d.*;
+        d.* |= x;
+    }
+    return added != 0;
 }
 
 // =============================================================================
@@ -1101,6 +1588,7 @@ const EmitOptions = struct {
     origin: ?reader_mod.SrcSpan = null,
     source: ?*const vm.SourceInfo = null,
     diag: ?*LowerDiag = null,
+    clear_locals: bool = true,
 };
 
 /// The top-level routine for `form`: its value in slot 0, returned.
@@ -1114,6 +1602,7 @@ fn emitRoutine(allocator: std.mem.Allocator, form: *const Tiny, opts: EmitOption
     emitter.current_span = opts.origin;
     emitter.source = opts.source;
     emitter.diag = opts.diag;
+    emitter.clear_locals = opts.clear_locals;
     const dst = try emitter.allocSlot();
     try compileExpr(&emitter, form, dst, null);
     try emitter.emit(vm.asm_.returnSlot(dst));
@@ -2476,6 +2965,11 @@ pub const CompileOptions = struct {
     /// outlive the routines. Without it a runtime error still
     /// carries spans but nothing to resolve them against.
     source: ?*const vm.SourceInfo = null,
+    /// Whether each local is cleared at its last move, so it roots
+    /// nothing past its last use (COMPILER.md §4.9); off, every slot
+    /// holds its value until written again, as a debugger showing
+    /// locals needs.
+    clear_locals: bool = true,
 };
 
 const no_macros: expand_mod.HostMacroTable = .{};
@@ -2603,6 +3097,7 @@ fn compileExpanded(
         .origin = working_form.origin,
         .source = opts.source,
         .diag = &diag,
+        .clear_locals = opts.clear_locals,
     }) catch |err| {
         if (out_span) |s| s.* = diag.span orelse working_form.origin;
         if (opts.out_detail) |d| d.* = diag.detail;
@@ -3247,6 +3742,7 @@ fn compileTry(
     // The try's catch and finally pcs are filled in once placed.
     const t = try tableIndex(e.tries.items.len);
     try e.tries.append(e.allocator, .{ .catch_pc = unpatched });
+    try e.try_extents.append(e.allocator, .{ .enter = try tableIndex(e.code.items.len), .end = unpatched });
     try e.emit(vm.asm_.tryEnter(t, binding_slot));
 
     // A finally's temporary holds nothing anyone reads until the body
@@ -3281,6 +3777,7 @@ fn compileTry(
         try compileEffect(e, fin_body);
         try e.emit(vm.asm_.finallyExit());
     }
+    e.try_extents.items[t].end = try tableIndex(e.code.items.len);
 
     if (body_exit_pc) |pc| try e.patchJumpHere(pc);
     if (catch_exit_pc) |pc| try e.patchJumpHere(pc);
@@ -3754,6 +4251,7 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     // The prelude (parameter boxing) carries the fn form's span.
     child.current_span = parent.current_span;
     child.diag = parent.diag;
+    child.clear_locals = parent.clear_locals;
     child.is_fn = true;
     child.fn_name = f.display_name;
     defer child.deinit();
@@ -4346,6 +4844,64 @@ test "bytecode: recur runs a 10k-iteration loop in constant stack space" {
     try testing.expectEqual(@as(i64, 10000), (try v.run()).asFixnum());
     try testing.expectEqual(stack_before, v.stack_high_water);
     try testing.expectEqual(frames_before, v.frame_high_water);
+}
+
+test "locals clearing: a move clears its source where no path reads it again" {
+    const a = vm.asm_;
+    const move = @backingInt(vm.Mov.move);
+    const clear = @backingInt(vm.Mov.move_clear);
+    // s0 read again by the second move, which reads it last.
+    var straight = [_]Inst{ a.move(1, 0), a.move(2, 0), a.collVector(1, 2, 3), a.returnSlot(3) };
+    try testing.expect(try clearDeadMoves(testing.allocator, &straight, 4, &.{}, &.{}, &.{}));
+    try testing.expectEqual(move, straight[0].variant);
+    try testing.expectEqual(clear, straight[1].variant);
+    // A body's move of s0, which the handler reads, stays; the
+    // handler's own clears.
+    var guarded = [_]Inst{
+        a.tryEnter(0, 3),
+        a.move(1, 0),
+        a.callCall(1, 0, 2),
+        a.tryExit(6),
+        a.move(2, 0),
+        a.tryExit(6),
+        a.returnSlot(2),
+    };
+    const tries = [_]vm.Try{.{ .catch_pc = 4 }};
+    const extents = [_]TryExtent{.{ .enter = 0, .end = 6 }};
+    try testing.expect(try clearDeadMoves(testing.allocator, &guarded, 4, &.{}, &tries, &extents));
+    try testing.expectEqual(move, guarded[1].variant);
+    try testing.expectEqual(clear, guarded[4].variant);
+    // Past the budget, a routine is left as it is.
+    const n = 1 << 15;
+    const big = try testing.allocator.alloc(Inst, n + 2);
+    defer testing.allocator.free(big);
+    for (big[0..n], 0..) |*inst, pc| inst.* = a.jumpIfTrue(@intCast(pc + 1), vm.Operand.slot(0));
+    big[n] = a.move(1, 0);
+    big[n + 1] = a.returnSlot(1);
+    try testing.expect(!try clearDeadMoves(testing.allocator, big, 4096, &.{}, &.{}, &.{}));
+    try testing.expectEqual(move, big[n].variant);
+}
+
+test "locals clearing: the check refuses a read of a slot a move cleared" {
+    const a = vm.asm_;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const tries = [_]vm.Try{.{ .catch_pc = 4 }};
+    const extents = [_]TryExtent{.{ .enter = 0, .end = 6 }};
+    const Case = struct { code: []const Inst, tries: []const vm.Try = &.{}, extents: []const TryExtent = &.{} };
+    for ([_]Case{
+        // Read on the path that follows.
+        .{ .code = &.{ a.moveClear(1, 0), a.move(2, 0), a.returnSlot(2) } },
+        // Read on one arm of a branch.
+        .{ .code = &.{ a.moveClear(1, 0), a.jumpIfTrue(3, vm.Operand.slot(1)), a.returnSlot(0), a.returnSlot(1) } },
+        // Read by the handler of a throw after the clear.
+        .{ .code = &.{ a.tryEnter(0, 3), a.moveClear(1, 0), a.callCall(1, 0, 2), a.tryExit(6), a.move(2, 0), a.tryExit(6), a.returnSlot(2) }, .tries = &tries, .extents = &extents },
+    }) |case| {
+        const effects = try arena.allocator().alloc(Effects, case.code.len);
+        for (case.code, effects) |inst, *fx| fx.* = effectsOf(inst, &.{}, 4).?;
+        const flow = (try Flow.build(arena.allocator(), case.code, case.tries, case.extents, 1)).?;
+        try testing.expectError(CompileError.InternalCompilerBug, checkClears(arena.allocator(), case.code, effects, &flow, case.tries, case.extents, 1));
+    }
 }
 
 test "bytecode: forms compile and run in a bare namespace" {

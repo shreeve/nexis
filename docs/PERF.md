@@ -1622,6 +1622,88 @@ less `count`: 1.9 protocol calls and 7.2 closure calls, so per-arity
 entry points for a multi-arity `fn` would meet the first target and
 come near the second.
 
+### 3.29 Locals clearing, Apple M5
+
+The compiler clears a local's slot at its last move
+(`docs/COMPILER.md` §4.9): `mov:move-clear` (`docs/VM.md` §10.1) is
+`mov:move.s` and one store of a pair of zero words, 22 arm64
+instructions against 21 and 25 x86-64 instructions against 23
+(`zig build codegen`). Before is `97e2d11`, after `22d9391` (the
+compile rows `1d63d19`); one ReleaseFast build of each. Provenance:
+§11.
+
+What a lazy seq a local or a parameter holds keeps, whole process,
+three interleaved runs of each (load 4.8 → 5.3), the peak resident set
+and the median instructions and wall time:
+
+| Program | n | Peak RSS before | after | Instructions before | after | Wall before | after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `lazy3`, the pipeline passed straight to `reduce` | 3 M | 21.4 MB | 21.4 MB | 1,010 M | 1,015 M | 69 ms | 74 ms |
+| | 30 M | 22.0 MB | 21.9 MB | 11,149 M | 11,147 M | 717 ms | 650 ms |
+| `lazyl`, the pipeline bound by `let`, then `(reduce + s)` | 3 M | 61.4 MB | 21.4 MB | 1,108 M | 1,013 M | 92 ms | 69 ms |
+| | 30 M | 588.8 MB | 22.0 MB | 12,569 M | 11,145 M | 1,220 ms | 671 ms |
+| `lazyf`, the pipeline through `(defn total [xs] (reduce + xs))` | 3 M | 61.5 MB | 21.5 MB | 1,109 M | 1,012 M | 88 ms | 71 ms |
+| | 30 M | 588.8 MB | 22.0 MB | 12,596 M | 11,145 M | 1,155 ms | 632 ms |
+
+Bound by a local or passed to a fn, the pipeline costs what it costs
+passed straight in: the collector no longer marks the realized chain
+at every cycle.
+
+The micro kit (`docs/BENCH.md` §13), `bb bench/micro/run.clj
+--rounds 5` (load 5.3 → 5.4), instructions and cycles per unit, the
+median and the range of the paired rounds:
+
+| Program | Instructions before | after | Cycles before | after |
+|---|---:|---:|---:|---:|
+| `count` | 57.9 [56.6–58.0] | 57.9 [56.5–58.0] | 8.4 | 8.1 |
+| `acc` | 95.0 [95.0–95.1] | 95.0 [94.9–95.4] | 12.7 | 11.7 |
+| `fib`, a call | 186.0 [185.7–186.2] | 185.9 [185.5–186.4] | 26.7 | 26.6 |
+| `gcall` | 232.0 [231.8–232.1] | 232.1 [231.8–232.3] | 31.3 | 31.2 |
+| `lc` | 95.0 [94.9–95.1] | 95.2 [95.0–95.4] | 12.6 | 13.0 |
+| `lv` | 101.0 [100.7–101.0] | 101.1 [101.0–101.1] | 13.5 | 13.1 |
+| `mv` | 94.1 [94.0–94.2] | 94.0 [94.0–94.1] | 11.3 | 12.2 |
+| `mvc`, one clear an iteration | 115.0 [114.9–115.3] | 116.0 [115.9–116.2] | 15.8 | 16.4 |
+| `kw` | 225.2 [225.0–225.4] | 225.2 [225.0–225.3] | 31.6 | 30.4 |
+| `leaf`, one clear an iteration | 299.1 [298.8–299.5] | 300.1 [300.0–300.9] | 40.1 | 40.7 |
+| `getnl` | 395.3 [395.1–395.5] | 395.1 [395.1–395.2] | 52.3 | 49.6 |
+| `cbsum` less `cbbase` | 80.5 [77.7–83.8] | 78.8 [75.8–79.1] | 21.8 | 19.5 |
+| `cbred` less `cbbase` | 196.2 [192.5–199.3] | 196.3 [190.2–198.1] | 41.7 | 40.1 |
+| `cb` less `cbbase` | 218.5 [217.2–222.4] | 218.2 [213.8–222.8] | 42.8 | 45.5 |
+| `lazy` less `cbbase` | 296.7 [292.1–304.6] | 296.1 [291.6–300.2] | 69.3 | 64.0 |
+| `lazy3`, an element | 327.1 [324.7–328.5] | 327.2 [326.8–328.1] | 70.8 | 69.1 |
+| `lazyl`, an element | 371.4 [368.8–371.5] | 327.0 [326.6–327.6] | 109.9 | 71.9 |
+| `lazyf`, an element | 371.4 [368.3–373.6] | 327.5 [326.4–328.6] | 110.6 | 72.9 |
+
+A build with `-Dopcodes=true` of each dispatches the same number of
+instructions in every program; only some `mov:move.s` become
+`mov:move-clear`, one an iteration in `mvc` and in `leaf`, whose
+`(max acc i)` moves `acc` into the call at its last read before the
+`recur` writes it, and a few outside the loop elsewhere. A clear costs
+one instruction, the zero store: `mvc` and `leaf` 1.0 more an
+iteration, every other program the same within its range; the
+callback programs' ranges are their collections'. The counting loop's
+step (§3.26) still runs every iteration of `count`, `acc` and `leaf`:
+the pass runs before quickening and rewrites only moves.
+
+The `bench/compare` language programs, whole process, five
+interleaved rounds (load 5.2 → 7.1), the median instructions and the
+peak resident set: every row within its range but `sort`, whose
+input vector is garbage once `sort` has it, 2,603.8 → 2,582.5 M
+instructions and 154.4 → 137.7 MB; the destructuring loop 3,323.4 →
+3,327.1 M [3,321.8–3,335.0], 22.4 → 22.3 MB; the pipeline 2,438.5 →
+2,437.2 M, 187.8 MB in both. Startup (`-e nil`, 21 interleaved runs)
+is 21.95 M instructions before and 22.02 M after, within the range of
+either.
+
+Compiling: `zig build bench -- --filter compiler`, two runs of each
+build interleaved, the medians: `compile_simple`, `(+ 1 2)`, which has
+no move to clear, 394 and 368 ns before, 395 and 361 ns after;
+`eval_simple_loop`, the whole pipeline of a 100-iteration loop whose
+result moves at its last read, 2.02 and 1.96 μs against 2.31 and
+2.06 μs; `closure_create` 806 and 806 ns against 882 and 813 ns. The
+stdlib image's generator, a debug build that also checks every
+routine it clears in, runs 498 → 535 M instructions (58 → 63 ms).
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1834,6 +1916,13 @@ Each lever is a measured change: a before/after from `zig build bench`
   the pipeline 2,544 → 2,491 M and its phase 39.4 → 36.8 ms; the
   destructuring loop 3,854 → 3,462 M and 156.7 → 131.2 ms.
 
+- *Locals clearing* (§3.29, `docs/COMPILER.md` §4.9): each
+  `mov:move` of a slot no path reads again is `mov:move-clear`, which
+  leaves the slot nil, so a lazy seq a local or a parameter holds is
+  let go as it is walked. `(let [s ...] (reduce + s))` over 30 M
+  elements 588.8 → 22.0 MB and 1,220 → 671 ms; one instruction a
+  clear, and no change to a program that moves no dead local.
+
 - *Leaf natives with a general body* (§3.22, `docs/VM.md` §6): `get`,
   `count`, `nthnext`, the kind predicates, `conj`, `assoc`, `assoc!`
   and `str` are called in place and refuse what could run code or
@@ -1988,4 +2077,5 @@ is one invocation's 30-sample median.
 | §3.26, §6 "The counting-loop step" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `dbc5c78`; shared with concurrent sessions | 2026-10-07 18:28–18:31 MDT, spd14: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `0ef07a3` (before) and at the step commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 5.81 → 5.67; the `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.67 → 5.99; `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads loop,destructure,fib,pipeline --no-build --max-load 16` four times, after, before, after, before, the binary swapped into one copy of the tree, load 3.92 → 3.42. The histograms of §6: speed4, 2026-10-06, `-Dopcodes=true` at the quickening commit (`.git/revamp/r2/bench/speed4/hist-B/`). Raw output: `.git/revamp/r3/spd14/` (`micro.*`, `cmp.*`, `runclj-*`) |
 | §3.27, §6 "Trees opened on first use" and its dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); Datalevin 1.1.0; emdb `8e1ed1e` (a source snapshot under both builds); shared with concurrent sessions | 2026-10-07, txperf: `bin/nexis` built by `zig build install -Doptimize=fast` from snapshots of `0ef07a3` (before) and `a787b2f` (after) beside one emdb snapshot. The shapes: `txbench.py OUT 9 A,B plain,entity,upsert,one 2000 10000` over the probe program `tx.nx` (both kept with the raw output), each run in a fresh store under `/usr/bin/time -l`, under `tools/heavy` (1 core), 19:03 MDT, load 9.18 → 7.78; a rerun at load 20.3 → 21.4 gave the same instructions within 0.3%. The dead ends: the same harness, five rounds over four builds, load 6.48 → 9.56. Pages: a build of `0ef07a3` over emdb `dbc5c78` printing emdb's dirty-page count before each commit, the same program at both sizes. `bb bench/compare/run.clj --no-build --n 10 --only db --impls nexis --max-load 16` four times, after, before, after, before, 19:04–19:16 MDT, load 5.61 → 5.02. The Datalevin run: `run.clj --no-build --n 10 --only db --impls nexis,datalevin --max-load 16` with the after build, 19:34–19:38 MDT, load 19.96 → 4.26. The profile: `perf record -e instructions:u --call-graph lbr -F 900` and `perf script --inline` on the host of §3.15 (`taskset -c 0`, nexis at `a787b2f`'s source, emdb `dbc5c78`), `tx.nx STORE 200000 entity`; the before figure from `0ef07a3` over `tx1.nx`, the same shape without the 20,000 loaded first, 300,000 transactions. Raw output: `.git/revamp/r3/txperf/` (`profile/` holds the two `perf script` outputs and `split.py`, which reads the shares from them) |
 | §3.28 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-07, multi: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` on `0ef07a3` with this section's commits, before §3.26's counting-loop step: at the micro-program commit, whose runtime is the multimethods commit's (before), and at the `#%mm-lookup` commit (after); `bb bench/micro/run.clj --rounds 5 --programs count,gcall,pcall,casek,mcall BEFORE AFTER` under `tools/heavy` (1 core), load 7.80 → 7.02; the dispatch and native counts from `-Dopcodes=true` builds of each, `mcall`, `pcall`, `gcall` and `casek` at 100,000 and 200,000 iterations, the difference per iteration; the one-arity figure from a probe program calling the same cache through a one-arity closure, at 1 M and 2 M. Raw output: `.git/revamp/r3/multi/` (`micro-AB.*`) |
+| §3.29, §6 "Locals clearing" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `24027c8`; shared with concurrent sessions | 2026-10-07 21:48–22:10 MDT, locals: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `97e2d11` (before) and `22d9391` (after), and with `-Dopcodes=true` at `97e2d11` and `6da3c15`. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program under `tools/heavy` (1 core), load 5.26 → 5.42. The memory rows: `cmds.py OUT 3` over `lazy3`, `lazyl`, `lazyf` at 3 M and 30 M, load 4.81 → 5.26. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.16 → 7.13; startup by `cmds.py OUT 21` over `-e nil`. `nexis-bench --filter compiler` twice per build, interleaved, after at `1d63d19`; the image generator, each tree's debug `nexis-imagegen`, `cmds.py OUT 7`. Raw output: `.git/revamp/r3/locals/` (`micro-final.*`, `mem.*`, `cmp.*`, `startup.*`, `cbench-*`, `imagegen.*`, `opcodes/`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |

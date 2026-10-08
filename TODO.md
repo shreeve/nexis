@@ -7,6 +7,18 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
+## Gaps
+
+17. **`reduce` over an infinite range roots neither its element nor
+    its accumulator across a step** (`src/stdlib.zig` `reducePure`,
+    `.range_inf`). Past the fixnum range each element is a bignum the
+    next step allocates, so a collection then could free the element
+    the callback has cleared (`docs/COMPILER.md` §4.9) or the result it
+    returned. `(range)` reaches the bignums only after 2^47 elements,
+    which no test reaches; root both in the scope's slots as the
+    `.iterate` branch does, with a test that builds the range near
+    the fixnum limit.
+
 ## Performance
 
 2. **Small transactions are emdb's page work.** A `transact!` of one
@@ -36,20 +48,22 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    write. The commit protocol is emdb's; nexis changes nothing in emdb
    (`AGENTS.md`), so this is the engine owner's call.
 
-13. **A lazy seq a local holds keeps what it realized.** A native's
-    call block is cleared when it returns, and the natives that walk a
-    sequence to its end (`reduce`, `frequencies`, `group-by`, `some`,
-    `every?`, `last`, `dorun`) consume it (`docs/GC.md` §11.5), so a
-    pipeline passed straight to one runs in constant memory: `(reduce
-    + (map inc (filter even? (map inc (range 3000000)))))` peaks at 21
-    MB (`docs/PERF.md` §3.21). A seq bound to a local, or passed to a
-    closure, whose argument is its own slot, stays held by the slot
-    until it is reused: `(let [s (map inc (range n))] (reduce + s))`
-    and `(defn total [xs] (reduce + xs))` keep everything they walk,
-    where Clojure's locals clearing lets it go. Clearing a local after
-    its last use needs liveness in the compiler and an instruction or
-    a flag per cleared local; `count`, `into`, `vec` and the other
-    natives that walk to the end could consume their argument too.
+13. **`count`, `into` and `vec` keep the seq they walk.** The
+    compiler clears a local or a parameter at its last move
+    (`docs/COMPILER.md` §4.9), and the natives that walk a sequence to
+    its end (`reduce`, `frequencies`, `group-by`, `some`, `every?`,
+    `last`, `dorun`) consume it (`docs/GC.md` §11.5), so `(let [s (map
+    inc (range n))] (reduce + s))` and `(defn total [xs] (reduce + xs))`
+    run in constant memory (`docs/PERF.md` §3.29). `(let [s (map inc
+    (range n))] (count s))` still holds what `count` realizes, in the
+    leaf path's rooted copy of its arguments (`docs/VM.md` §6), and so
+    do `into`, `vec` and the other natives that walk to the end
+    without consuming their argument: each needs `NativeFn.consumes`
+    and a consuming walk in its general body. A local a closure
+    captures stays in its cell while the closure runs, so `(delay
+    (reduce + s))` holds `s` where Clojure clears a `^:once` body's
+    fields; clearing a cell needs a cell write `docs/VM.md` §6 rules
+    out, and its own design.
 ## Store size
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's

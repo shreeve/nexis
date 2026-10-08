@@ -362,9 +362,10 @@ after each.
   a long-running peer would do better on the others.
 - *Sequences.* All three are lazy and chunked by 32 (`docs/LAZY.md`):
   `filter`, `map` and `map` realize a chunk at a time as `reduce`
-  walks. nexis's VM keeps the intermediate seqs in its slots until the
-  call returns (no locals clearing), so the pipeline row holds all
-  three realized, as Clojure's would not.
+  walks. nexis lets each intermediate seq go as it is walked, as
+  Clojure's locals clearing does: a native's call block is cleared
+  when it returns, `reduce` consumes its argument, and a local is
+  cleared at its last move (`docs/LAZY.md` §9).
 - *Transients.* All three edit the nodes a transient owns in place
   (`docs/TRANSIENT.md`).
 - *Durability.* The rows are grouped by what a commit guarantees when
@@ -467,9 +468,14 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
   and `lazy` call a native over a vector with a callback, and `cbbase`
   is the setup they share; `lazy3` is a lazy pipeline over a range,
   for its peak RSS.
+  `lazyl` binds the same pipeline with `let` and `lazyf` passes it to
+  a fn, each then walking it with `reduce`, for what locals clearing
+  lets go (`docs/COMPILER.md` §4.9); `mvc` adds one `mov:move-clear`
+  to the counting loop.
 - **Two sizes.** Each program runs at two sizes (5 M and 10 M
   iterations; `fib` 27 and 30, 2,056,916 calls apart; the callback
-  programs 1 M and 2 M), and its cost per unit is `(I(hi) − I(lo)) /
+  programs 1 M and 2 M; the lazy pipelines 1.5 M and 3 M), and its
+  cost per unit is `(I(hi) − I(lo)) /
   units`, so startup, compilation and printing cancel exactly. The
   callback programs also print their cost less `cbbase`'s when it runs
   too.

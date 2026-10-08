@@ -399,22 +399,33 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   `:invalid-argument`. A count past the fixnum range, a bignum or a
   float, is all.
 - **Holding the head.** The VM roots every slot of its stack
-  (`docs/VM.md` §9), so a lazy seq a local or a call's argument holds
-  keeps what it realized until the slot is reused: `(reduce + (map inc
-  (range 100000000)))` realizes and keeps the mapped seq, where
-  Clojure's locals clearing lets it go as it walks; `(reduce + (range
-  100000000))` itself allocates nothing (§7). A native's call block is
-  cleared when the native returns (`docs/VM.md` §6), so a seq passed
-  to a native and walked by a later one is not kept by the first
-  call's block: in `(reduce + (map inc (filter even? (map inc (range
-  n)))))` only the outermost seq stays, and not even that: `reduce`,
-  like `frequencies`, `group-by`, `some`, `every?`, `last` and
-  `dorun`, consumes its sequence argument, clearing its slot and
-  keeping only its walk's place (`docs/GC.md` §11.5), so such a
-  pipeline runs in constant memory. A seq bound to a local, or passed
-  to a closure, stays held by the slot until it is reused; clearing a
-  local at its last use, as Clojure does, needs liveness in the
-  compiler.
+  (`docs/VM.md` §9), so a lazy seq keeps what it realized for as long
+  as a slot holds it. A native's call block is cleared when the native
+  returns (`docs/VM.md` §6); `reduce`, like `frequencies`, `group-by`,
+  `some`, `every?`, `last` and `dorun`, consumes its sequence
+  argument, clearing its slot in the block and keeping only its
+  walk's place (`docs/GC.md` §11.5); and the compiler clears a local
+  or a parameter at its last move, the last time it is passed to a
+  call or moved by a `let` or a `recur` (`docs/COMPILER.md` §4.9). So
+  `(reduce + (map inc (range n)))`, `(let [s (map inc (range n))]
+  (reduce + s))`, `(defn total [xs] (reduce + xs))` and the stdlib
+  functions over such a call (`run!`, `transduce`, `doseq` in a
+  function) run in constant memory, as Clojure's locals clearing lets
+  them. Where the two differ:
+  - A last read that is not a move clears nothing: a branch's test, a
+    keyword lookup's target, an arithmetic operand. Clojure clears a
+    local an `if` test reads last.
+  - A local a closure captures lives in its cell as long as the
+    closure: `(delay (reduce + s))` holds `s` while its body runs,
+    where Clojure clears a `^:once` body's fields (`lazy-seq`,
+    `delay`, `future`).
+  - The natives that walk to the end without consuming their argument
+    keep it in the call's block while they walk: `(let [s (map inc
+    (range n))] (count s))` holds what `count` realizes, and so do
+    `into` and `vec`.
+  - As in Clojure, a local bound outside a loop and read inside it is
+    held for the whole loop, and so is one a `try`'s handler or
+    finally reads, through the try's body.
 - **No collection runs while a body realizes in isolation** (§6): a
   lazy seq that `=` or `hash` meets nested inside a value (a map's
   value, a vector's element, a key) realizes under `gc_hold`, so all

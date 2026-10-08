@@ -244,7 +244,7 @@ routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 7:14
   0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
   0008  jump:if-true        s5  j0005  ; 6:5
-  0009  mov:move.s          s2  s4  -  ; 8:7
+  0009  mov:move-clear      s2  s4  -  ; 8:7
   0010  call:call           s1  #1  s0  ; 4:1
   0011  call:return.s       s0  -  -
 ```
@@ -255,6 +255,8 @@ iteration: the inlined `<` and `+` read their operands in place,
 neither waits in a temporary, and it repeats the loop's test,
 branching back while it holds (COMPILER.md §5.6, §5.7); `(+ i 1)` is
 the step that runs the test and the branch with it (VM.md §10.10).
+Pc 9 moves `acc` into `println`'s block at its last read, so the move
+clears its slot (COMPILER.md §4.9).
 
 - The header: the routine's name, the path and position of the form
   it was lowered from, its slot count, its fixed arity (`+rest` when

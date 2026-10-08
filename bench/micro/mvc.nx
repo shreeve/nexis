@@ -1,0 +1,3 @@
+; bench/micro/mvc.nx N: count plus one mov:move-clear, a let's last read moved by recur.
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (let [j (inc i)] (recur j j)) k))))
