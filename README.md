@@ -50,7 +50,7 @@ small services and batch jobs where a database server would be
 overkill, and exploring data at a REPL against a file. It does not run
 Java libraries, and it is single-threaded.
 
-**Five minutes in:** build it (below), run `./bin/nexis repl` and try
+**Five minutes in:** install it (below), run `./bin/nexis repl` and try
 the lines under [The language](#the-language); run
 `./bin/nexis run examples/nextomic-app.nx` for a fuller database tour
 (a clinic chart with patients, visits, notes and time travel); browse
@@ -65,9 +65,46 @@ collector, all in Zig. Under it sit two sibling projects: **emdb**,
 a memory-mapped MVCC B+ tree storage engine, and **nexus**, the parser
 generator that builds the reader's grammar.
 
-## Build and run
+## Install
 
-Zig 0.17.0 and a sibling checkout of emdb (`../emdb`) are required.
+Each release on GitHub (`https://github.com/shreeve/nexis/releases`)
+carries `bin/nexis` for three targets: `x86_64-linux-musl` (static,
+any x86-64 CPU with SSE4.2 and POPCNT), `aarch64-linux-musl` (static)
+and `aarch64-macos` (Apple silicon, macOS 15 or later). Each archive
+holds one directory, `nexis-VERSION-TARGET/`, with `bin/nexis`, this
+README, `LICENSE` and `BUILD-INFO`, which names the nexis commit, the
+emdb commit and the Zig release it was built from; `SHA256SUMS` lists
+every archive's checksum.
+
+```bash
+v=0.1.0 target=aarch64-macos            # or x86_64-linux-musl, aarch64-linux-musl
+base=https://github.com/shreeve/nexis/releases/download/v$v
+curl -LO $base/nexis-$v-$target.tar.gz -O $base/SHA256SUMS
+shasum -a 256 -c --ignore-missing SHA256SUMS   # or: sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf nexis-$v-$target.tar.gz
+mkdir -p ~/.local/bin && cp nexis-$v-$target/bin/nexis ~/.local/bin/   # a directory on PATH
+nexis --version                         # nexis 0.1.0
+```
+
+On macOS an archive downloaded through a browser is quarantined, and
+so is what it unpacks to; `curl` leaves no mark, and `xattr -d
+com.apple.quarantine` on the binary clears one.
+
+**Versions and stores.** A release is a tag `vX.Y.Z` of this
+repository's source; `nexis --version` names it, and `BUILD-INFO` the
+emdb commit beneath it. A store file carries between
+hosts but not between releases: emdb's file format is not frozen and
+emdb does not migrate a file from one format to another, so a release
+may refuse a store another release wrote. Recreate a store, or
+re-import its data, after upgrading (`docs/DB.md` §1,
+`docs/NEXTOMIC.md` §2).
+
+## Build from source
+
+Building takes Zig 0.17.0 and a sibling checkout of emdb (`../emdb`),
+the storage engine compiled into every binary. emdb's repository is
+private, so only those with access to it can build from source; a
+release's binaries have it compiled in.
 
 ```bash
 zig build install                      # bin/nexis
@@ -79,6 +116,7 @@ echo '(println :hi)' | ./bin/nexis run -  # a program from stdin
 ./bin/nexis test my_tests.nx           # run files, then every deftest they define
 ./bin/nexis disasm examples/sum10.nx   # every routine's bytecode with source positions
 ./bin/nexis --help
+./bin/nexis --version                  # nexis 0.1.0
 ```
 
 `nexis run` prints only what the program prints; the REPL and `-e`
@@ -221,15 +259,17 @@ Measured with provenance in `docs/PERF.md`, by the comparison harness
 - **Start-up**: about 5 ms and a 6 MB resident set on an Apple M5.
 - **Against babashka**: ahead on all eleven language workloads on the
   M5 (§3.11); on an Intel Core Ultra 9 185H under Linux, ahead on
-  seven, level on start-up, behind on vectors, string splitting and
-  the `map`/`filter`/`reduce` pipeline (§3.15).
-- **Against JVM Clojure** (the Linux host): warm HotSpot is 1.5–16×
-  faster on eight of ten programs; counting the JVM's start, nexis
-  finishes first on every one-shot program but the map build, in
-  1.6–22× less memory (§3.15).
+  start-up and eight of the ten programs, level on string splitting
+  and behind on the `map`/`filter`/`reduce` pipeline (§3.15).
+- **Against JVM Clojure** (the Linux host): nexis leads warm HotSpot
+  on the counting loop, `frequencies`/`group-by` and `sort`, and warm
+  HotSpot is 1.2–6.0× faster on the other seven programs; counting the
+  JVM's start, nexis finishes first on every one-shot program, in
+  1.8–27× less memory (§3.15, §3.32).
 - **Nextomic**: ahead of Datalevin, Datomic Local and Datomic Pro on
-  every phase timed cold; a warm Datomic Pro peer is faster at point
-  lookups; its store is the largest, 3.1× Datalevin's (§3.11, §3.15).
+  every phase timed cold but Datalevin's durable commit; a warm
+  Datomic Pro peer is level at point lookups; its store is the
+  largest, 3.1× Datalevin's and 7.6× Datomic Pro's (§3.11, §3.15).
 
 ## Differences from Clojure
 
