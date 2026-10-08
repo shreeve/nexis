@@ -1,0 +1,419 @@
+== refs.edb
+-- tree :kinds
+"bignum" 123456789012345678901234567890
+"bignum-edge" 140737488355328
+"bignum-neg" -98765432109876543210987654321
+"char" \u{3BB}
+"char-astral" \u{1F600}
+"f64-vector" #f64[1.5 -0.0 ##Inf 1.0E300]
+"false" false
+"fixnum" 42
+"fixnum-max" 140737488355327
+"fixnum-min" -140737488355328
+"float" 0.1
+"float-inf" ##Inf
+"float-nan" ##NaN
+"float-neg-inf" ##-Inf
+"float-neg-zero" -0.0
+"float-third" 0.3333333333333333
+"float-tiny" 4.9E-324
+"i64-vector" #i64[0 -1 9007199254740993 -9223372036854775808 9223372036854775807]
+"keyword" :plain
+"keyword-ns" :app/state
+"lazy-seq" (1 2 3 4 5)
+"list" (1 (2 (3)) "x")
+"map" {:a 1, "b" [2 3], :c {:d #{4}}}
+"map-large" {:k17 17, :k12 12, :k2 2, :k3 3, :k6 6, :k4 4, :k7 7, :k0 0, :k13 13, :k11 11, :k1 1, :k16 16, :k18 18, :k10 10, :k8 8, :k9 9, :k15 15, :k5 5, :k19 19, :k14 14}
+"nested" [199 [198 [197 [196 [195 [194 [193 [192 [191 [190 [189 [188 [187 [186 [185 [184 [183 [182 [181 [180 [179 [178 [177 [176 [175 [174 [173 [172 [171 [170 [169 [168 [167 [166 [165 [164 [163 [162 [161 [160 [159 [158 [157 [156 [155 [154 [153 [152 [151 [150 [149 [148 [147 [146 [145 [144 [143 [142 [141 [140 [139 [138 [137 [136 [135 [134 [133 [132 [131 [130 [129 [128 [127 [126 [125 [124 [123 [122 [121 [120 [119 [118 [117 [116 [115 [114 [113 [112 [111 [110 [109 [108 [107 [106 [105 [104 [103 [102 [101 [100 [99 [98 [97 [96 [95 [94 [93 [92 [91 [90 [89 [88 [87 [86 [85 [84 [83 [82 [81 [80 [79 [78 [77 [76 [75 [74 [73 [72 [71 [70 [69 [68 [67 [66 [65 [64 [63 [62 [61 [60 [59 [58 [57 [56 [55 [54 [53 [52 [51 [50 [49 [48 [47 [46 [45 [44 [43 [42 [41 [40 [39 [38 [37 [36 [35 [34 [33 [32 [31 [30 [29 [28 [27 [26 [25 [24 [23 [22 [21 [20 [19 [18 [17 [16 [15 [14 [13 [12 [11 [10 [9 [8 [7 [6 [5 [4 [3 [2 [1 [0 nil]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]
+"nil" nil
+"set" #{1 :two "three" 4.0 [5]}
+"sorted-map" {1 :a, 2 :b, 3 :c}
+"sorted-set" #{"a" "b" "c"}
+"string" "plain"
+"string-empty" ""
+"string-nul" "a\u{0}b"
+"string-utf8" "naïve café 日本語 ΣΟΦΙΑΣ 😀"
+"symbol" my.ns/sym
+"true" true
+"vector" [1 2.5 "x" :y nil true]
+-- tree :keys
+"mmmmmmmm... 4078 bytes" :longest
+"ns/kw" :keyword-key
+"with spaces and / slash" :spaces
+"z" :one-byte
+"ключ-日本" :utf8
+-- tree :app/state
+"counter" 25
+aborted write present? false
+deleted key present? false
+longest key reads back :longest
+-- tree :bulk
+count 4400
+hash 32879449208968
+overwritten 1200
+sum of :i 9601200
+sum of :f 4.928312483131428E11
+["k00001" [1 :over]]
+["k00341" [341 :over]]
+["k00682" {:i 682, :x 17567805, :f 2509686.4285714286, :s "value-69380"}]
+["k01024" {:i 1024, :x 1556898959, :f 2.22414137E8, :s "value-39089"}]
+["k01364" {:i 1364, :x 1045783387, :f 1.493976267142857E8, :s "value-77509"}]
+["k01705" {:i 1705, :x 1301748116, :f 1.8596401657142857E8, :s "value-65278"}]
+["k02046" [2046 :over]]
+["k02387" {:i 2387, :x 1166790250, :f 1.6668432142857143E8, :s "value-95262"}]
+["k02728" {:i 2728, :x 2049725927, :f 2.928179895714286E8, :s "value-10418"}]
+["k03068" {:i 3068, :x 516124723, :f 7.373210328571428E7, :s "value-71172"}]
+["k03410" {:i 3410, :x 2136997973, :f 3.0528542471428573E8, :s "value-90312"}]
+["k03751" [3751 :over]]
+["k04091" [4091 :over]]
+["k04432" {:i 4432, :x 1221170751, :f 1.7445296442857143E8, :s "value-80659"}]
+["k04774" {:i 4774, :x 123770113, :f 1.7681444714285713E7, :s "value-81246"}]
+["k05114" {:i 5114, :x 1868405613, :f 2.6691508757142857E8, :s "value-73778"}]
+["k05455" {:i 5455, :x 1961913950, :f 2.802734214285714E8, :s "value-90530"}]
+["k05796" [5796 :over]]
+a range scan [["k02990" {:i 2990, :x 478863929, :f 6.840913271428572E7, :s "value-7030"}] ["k02991" [2991 :over]] ["k02992" {:i 2992, :x 1861954015, :f 2.659934307142857E8, :s "value-21604"}] ["k02993" {:i 2993, :x 1227683372, :f 1.7538333885714287E8, :s "value-93865"}] ["k02995" {:i 2995, :x 54232714, :f 7747530.571428572, :s "value-37592"}] ["k02996" [2996 :over]] ["k02998" {:i 2998, :x 1481219953, :f 2.1160285042857143E8, :s "value-53270"}] ["k02999" {:i 2999, :x 139690326, :f 1.995576085714286E7, :s "value-2899"}] ["k03001" [3001 :over]] ["k03002" {:i 3002, :x 67617197, :f 9659599.57142857, :s "value-23281"}]]
+reduce-tree count 4400
+-- tree :big
+text [288890 30340342376791 "line 0 ñ日😀\nline 1 ñ日😀\nline 2 ñ日😀\nline 3 " "19997 ñ日😀\nline 19998 ñ日😀\nline 19999 ñ日😀\n"]
+longs [6000 32881172709970 (20211007 1670857676 1435302869) 6491282447032]
+doubles [6000 122777862414281 (6753669.0 5.569692253333334E8 4.784509563333333E8) 2.163860815677337E12]
+deep [16542521671692 2000 1999]
+== nextomic.edb
+basis-t 14
+-- schema
+:addr/city {:db/cardinality :db.cardinality/one, :db/fulltext true, :db/id 38, :db/ident :addr/city, :db/index true, :db/isComponent false, :db/valueType :db.type/string}
+:addr/zip {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 39, :db/ident :addr/zip, :db/index false, :db/isComponent false, :db/valueType :db.type/long}
+:db/cardinality {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 3, :db/ident :db/cardinality, :db/index false, :db/isComponent false, :db/valueType :db.type/keyword}
+:db/doc {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 7, :db/ident :db/doc, :db/index false, :db/isComponent false, :db/valueType :db.type/string}
+:db/fulltext {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 22, :db/ident :db/fulltext, :db/index false, :db/isComponent false, :db/valueType :db.type/boolean}
+:db/ident {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 1, :db/ident :db/ident, :db/index true, :db/isComponent false, :db/unique :db.unique/identity, :db/valueType :db.type/keyword}
+:db/index {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 5, :db/ident :db/index, :db/index false, :db/isComponent false, :db/valueType :db.type/boolean}
+:db/isComponent {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 6, :db/ident :db/isComponent, :db/index false, :db/isComponent false, :db/valueType :db.type/boolean}
+:db/txInstant {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 8, :db/ident :db/txInstant, :db/index true, :db/isComponent false, :db/valueType :db.type/instant}
+:db/unique {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 4, :db/ident :db/unique, :db/index false, :db/isComponent false, :db/valueType :db.type/keyword}
+:db/valueType {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 2, :db/ident :db/valueType, :db/index false, :db/isComponent false, :db/valueType :db.type/keyword}
+:item/n {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 41, :db/ident :item/n, :db/index true, :db/isComponent false, :db/valueType :db.type/long}
+:item/owner {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 43, :db/ident :item/owner, :db/index false, :db/isComponent false, :db/valueType :db.type/ref}
+:item/sku {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 40, :db/ident :item/sku, :db/index false, :db/isComponent false, :db/unique :db.unique/identity, :db/valueType :db.type/string}
+:item/w {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 42, :db/ident :item/w, :db/index false, :db/isComponent false, :db/valueType :db.type/double}
+:person/active {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 34, :db/ident :person/active, :db/index true, :db/isComponent false, :db/valueType :db.type/boolean}
+:person/age {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 25, :db/ident :person/age, :db/index true, :db/isComponent false, :db/valueType :db.type/long}
+:person/alias {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 36, :db/ident :person/alias, :db/index false, :db/isComponent false, :db/valueType :db.type/string}
+:person/balance {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 35, :db/ident :person/balance, :db/index true, :db/isComponent false, :db/valueType :db.type/long}
+:person/bio {:db/cardinality :db.cardinality/one, :db/doc "free text, searched by fulltext", :db/fulltext true, :db/id 33, :db/ident :person/bio, :db/index false, :db/isComponent false, :db/valueType :db.type/string}
+:person/born {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 27, :db/ident :person/born, :db/index true, :db/isComponent false, :db/valueType :db.type/instant}
+:person/email {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 24, :db/ident :person/email, :db/index false, :db/isComponent false, :db/unique :db.unique/value, :db/valueType :db.type/string}
+:person/friends {:db/cardinality :db.cardinality/many, :db/fulltext false, :db/id 31, :db/ident :person/friends, :db/index false, :db/isComponent false, :db/valueType :db.type/ref}
+:person/height {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 26, :db/ident :person/height, :db/index false, :db/isComponent false, :db/valueType :db.type/double}
+:person/home {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 32, :db/ident :person/home, :db/index false, :db/isComponent true, :db/valueType :db.type/ref}
+:person/id {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 28, :db/ident :person/id, :db/index false, :db/isComponent false, :db/unique :db.unique/identity, :db/valueType :db.type/uuid}
+:person/name {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 23, :db/ident :person/name, :db/index false, :db/isComponent false, :db/unique :db.unique/identity, :db/valueType :db.type/string}
+:person/photo {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 29, :db/ident :person/photo, :db/index false, :db/isComponent false, :db/valueType :db.type/bytes}
+:person/secret {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 37, :db/ident :person/secret, :db/index false, :db/isComponent false, :db/valueType :db.type/string}
+:person/tags {:db/cardinality :db.cardinality/many, :db/fulltext false, :db/id 30, :db/ident :person/tags, :db/index false, :db/isComponent false, :db/valueType :db.type/keyword}
+schema as of 12, :addr/city {:db/cardinality :db.cardinality/one, :db/fulltext false, :db/id 38, :db/ident :addr/city, :db/index true, :db/isComponent false, :db/valueType :db.type/string}
+the retired name nil
+the new name [36 :person/alias]
+-- indexes
+current eavt [7486 7485 32881353727033]
+current aevt [7486 7485 32883652223613]
+current avet [4078 4077 32880366935881]
+current vaet [1604 1604 32883479162653]
+history eavt [8882 8881 32879570376885]
+history aevt [8882 8881 32882042842719]
+history avet [4088 4087 32881913647107]
+history vaet [2408 2408 32882043197589]
+-- people's datoms, history
+[4294967296 :person/name "Ann" 3 true]
+[4294967296 :person/email "ann@example.com" 3 true]
+[4294967296 :person/age 41 3 true]
+[4294967296 :person/age 41 8 false]
+[4294967296 :person/age 42 8 true]
+[4294967296 :person/height 1.7 3 true]
+[4294967296 :person/born -315619200000 3 true]
+[4294967296 :person/id "0123abcd-4567-89ef-0123-456789abcdef" 3 true]
+[4294967296 :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ" 3 true]
+[4294967296 :person/tags :staff 3 true]
+[4294967296 :person/tags :admin 3 true]
+[4294967296 :person/tags :admin 8 false]
+[4294967296 :person/tags :founder 8 true]
+[4294967296 :person/home 4294967297 3 true]
+[4294967296 :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. " 3 true]
+[4294967296 :person/active true 3 true]
+[4294967296 :person/balance 9223372036854775807 3 true]
+[4294967296 :person/alias "annie" 3 true]
+[4294967298 :person/name "Bob" 3 true]
+[4294967298 :person/email "bob@example.com" 3 true]
+[4294967298 :person/age 35 3 true]
+[4294967298 :person/age 35 8 false]
+[4294967298 :person/age 36 8 true]
+[4294967298 :person/height 1.82 3 true]
+[4294967298 :person/born 0 3 true]
+[4294967298 :person/id "fedcba98-7654-3210-fedc-ba9876543210" 3 true]
+[4294967298 :person/photo "png" 3 true]
+[4294967298 :person/tags :staff 3 true]
+[4294967298 :person/friends 4294967296 3 true]
+[4294967298 :person/home 4294967299 3 true]
+[4294967298 :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. " 8 true]
+[4294967298 :person/bio "Café owner; ΣΟΦΙΑΣ reader" 3 true]
+[4294967298 :person/bio "Café owner; ΣΟΦΙΑΣ reader" 8 false]
+[4294967298 :person/active false 3 true]
+[4294967298 :person/balance -9223372036854775808 3 true]
+[4294967300 :person/name "Cy" 3 true]
+[4294967300 :person/email "cy@example.com" 3 true]
+[4294967300 :person/age 29 3 true]
+[4294967300 :person/height 0.0 3 true]
+[4294967300 :person/friends 4294967296 3 true]
+[4294967300 :person/friends 4294967298 3 true]
+[4294967300 :person/friends 4294967298 8 false]
+[4294967300 :person/bio "red team lead, blue sky thinker" 3 true]
+[4294967300 :person/balance 140737488355328 3 true]
+[4294967301 :person/name "Dee" 3 true]
+[4294967301 :person/name "Dee" 14 false]
+[4294967301 :person/email "dee@example.com" 3 true]
+[4294967301 :person/email "dee@example.com" 8 false]
+[4294967301 :person/age 52 3 true]
+[4294967301 :person/age 52 14 false]
+[4294967301 :person/friends 4294967300 3 true]
+[4294967301 :person/friends 4294967300 14 false]
+[4294967301 :person/bio "naïve 日本語 notes" 3 true]
+[4294967301 :person/bio "naïve 日本語 notes" 14 false]
+[4294967301 :person/alias "d" 3 true]
+[4294967301 :person/alias "d" 14 false]
+[4294967301 :person/secret "dee's pin is 1234" 10 true]
+[4294967301 :person/secret "dee's pin is 1234" 14 false]
+[4294967302 :person/name "Eve" 3 true]
+[4294967302 :person/email "eve@example.com" 3 true]
+[4294967302 :person/age 23 3 true]
+[4294967302 :person/friends 4294967301 3 true]
+[4294967302 :person/friends 4294967301 14 false]
+-- schema datoms, current
+[1 :db/ident :db/ident 1 true]
+[1 :db/valueType :db.type/keyword 1 true]
+[1 :db/cardinality :db.cardinality/one 1 true]
+[1 :db/unique :db.unique/identity 1 true]
+[1 :db/index true 1 true]
+[2 :db/ident :db/valueType 1 true]
+[2 :db/valueType :db.type/keyword 1 true]
+[2 :db/cardinality :db.cardinality/one 1 true]
+[3 :db/ident :db/cardinality 1 true]
+[3 :db/valueType :db.type/keyword 1 true]
+[3 :db/cardinality :db.cardinality/one 1 true]
+[4 :db/ident :db/unique 1 true]
+[4 :db/valueType :db.type/keyword 1 true]
+[4 :db/cardinality :db.cardinality/one 1 true]
+[5 :db/ident :db/index 1 true]
+[5 :db/valueType :db.type/boolean 1 true]
+[5 :db/cardinality :db.cardinality/one 1 true]
+[6 :db/ident :db/isComponent 1 true]
+[6 :db/valueType :db.type/boolean 1 true]
+[6 :db/cardinality :db.cardinality/one 1 true]
+[7 :db/ident :db/doc 1 true]
+[7 :db/valueType :db.type/string 1 true]
+[7 :db/cardinality :db.cardinality/one 1 true]
+[8 :db/ident :db/txInstant 1 true]
+[8 :db/valueType :db.type/instant 1 true]
+[8 :db/cardinality :db.cardinality/one 1 true]
+[8 :db/index true 1 true]
+[9 :db/ident :db.type/long 1 true]
+[10 :db/ident :db.type/double 1 true]
+[11 :db/ident :db.type/instant 1 true]
+[12 :db/ident :db.type/keyword 1 true]
+[13 :db/ident :db.type/ref 1 true]
+[14 :db/ident :db.type/string 1 true]
+[15 :db/ident :db.type/uuid 1 true]
+[16 :db/ident :db.type/bytes 1 true]
+[17 :db/ident :db.type/boolean 1 true]
+[18 :db/ident :db.cardinality/one 1 true]
+[19 :db/ident :db.cardinality/many 1 true]
+[20 :db/ident :db.unique/identity 1 true]
+[21 :db/ident :db.unique/value 1 true]
+[22 :db/ident :db/fulltext 1 true]
+[22 :db/valueType :db.type/boolean 1 true]
+[22 :db/cardinality :db.cardinality/one 1 true]
+[23 :db/ident :person/name 2 true]
+[23 :db/valueType :db.type/string 2 true]
+[23 :db/cardinality :db.cardinality/one 2 true]
+[23 :db/unique :db.unique/identity 2 true]
+[24 :db/ident :person/email 2 true]
+[24 :db/valueType :db.type/string 2 true]
+[24 :db/cardinality :db.cardinality/one 2 true]
+[24 :db/unique :db.unique/value 2 true]
+[25 :db/ident :person/age 2 true]
+[25 :db/valueType :db.type/long 2 true]
+[25 :db/cardinality :db.cardinality/one 2 true]
+[25 :db/index true 2 true]
+[26 :db/ident :person/height 2 true]
+[26 :db/valueType :db.type/double 2 true]
+[26 :db/cardinality :db.cardinality/one 2 true]
+[27 :db/ident :person/born 2 true]
+[27 :db/valueType :db.type/instant 2 true]
+[27 :db/cardinality :db.cardinality/one 2 true]
+[27 :db/index true 2 true]
+[28 :db/ident :person/id 2 true]
+[28 :db/valueType :db.type/uuid 2 true]
+[28 :db/cardinality :db.cardinality/one 2 true]
+[28 :db/unique :db.unique/identity 2 true]
+[29 :db/ident :person/photo 2 true]
+[29 :db/valueType :db.type/bytes 2 true]
+[29 :db/cardinality :db.cardinality/one 2 true]
+[30 :db/ident :person/tags 2 true]
+[30 :db/valueType :db.type/keyword 2 true]
+[30 :db/cardinality :db.cardinality/many 2 true]
+[31 :db/ident :person/friends 2 true]
+[31 :db/valueType :db.type/ref 2 true]
+[31 :db/cardinality :db.cardinality/many 2 true]
+[32 :db/ident :person/home 2 true]
+[32 :db/valueType :db.type/ref 2 true]
+[32 :db/cardinality :db.cardinality/one 2 true]
+[32 :db/isComponent true 2 true]
+[33 :db/ident :person/bio 2 true]
+[33 :db/valueType :db.type/string 2 true]
+[33 :db/cardinality :db.cardinality/one 2 true]
+[33 :db/doc "free text, searched by fulltext" 2 true]
+[33 :db/fulltext true 2 true]
+[34 :db/ident :person/active 2 true]
+[34 :db/valueType :db.type/boolean 2 true]
+[34 :db/cardinality :db.cardinality/one 2 true]
+[34 :db/index true 2 true]
+[35 :db/ident :person/balance 2 true]
+[35 :db/valueType :db.type/long 2 true]
+[35 :db/cardinality :db.cardinality/one 2 true]
+[35 :db/index true 2 true]
+[36 :db/ident :person/alias 2 true]
+[36 :db/valueType :db.type/string 2 true]
+[36 :db/cardinality :db.cardinality/one 2 true]
+[37 :db/ident :person/secret 2 true]
+[37 :db/valueType :db.type/string 2 true]
+[37 :db/cardinality :db.cardinality/one 2 true]
+[38 :db/ident :addr/city 2 true]
+[38 :db/valueType :db.type/string 2 true]
+[38 :db/cardinality :db.cardinality/one 2 true]
+[38 :db/index true 2 true]
+[38 :db/fulltext true 13 true]
+[39 :db/ident :addr/zip 2 true]
+[39 :db/valueType :db.type/long 2 true]
+[39 :db/cardinality :db.cardinality/one 2 true]
+[40 :db/ident :item/sku 2 true]
+[40 :db/valueType :db.type/string 2 true]
+[40 :db/cardinality :db.cardinality/one 2 true]
+[40 :db/unique :db.unique/identity 2 true]
+[41 :db/ident :item/n 2 true]
+[41 :db/valueType :db.type/long 2 true]
+[41 :db/cardinality :db.cardinality/one 2 true]
+[41 :db/index true 2 true]
+[42 :db/ident :item/w 2 true]
+[42 :db/valueType :db.type/double 2 true]
+[42 :db/cardinality :db.cardinality/one 2 true]
+[43 :db/ident :item/owner 2 true]
+[43 :db/valueType :db.type/ref 2 true]
+[43 :db/cardinality :db.cardinality/one 2 true]
+-- entities
+4294967296 {:db/id 4294967296, :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born -315619200000, :person/email "ann@example.com", :person/height 1.7, :person/home 4294967297, :person/id "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags #{:staff :founder}}
+4294967298 {:db/id 4294967298, :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born 0, :person/email "bob@example.com", :person/friends #{4294967296}, :person/height 1.82, :person/home 4294967299, :person/id "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags #{:staff}}
+4294967300 {:db/id 4294967300, :person/age 29, :person/balance 140737488355328, :person/bio "red team lead, blue sky thinker", :person/email "cy@example.com", :person/friends #{4294967296}, :person/height 0.0, :person/name "Cy"}
+4294967301 nil
+4294967302 {:db/id 4294967302, :person/age 23, :person/email "eve@example.com", :person/name "Eve"}
+-- q
+names ("Ann" "Bob" "Cy" "Eve")
+items per owner (["Ann" 342 176810555 0.125 124.375] ["Bob" 343 176974828 0.0 124.25] ["Cy" 343 179729758 0.25 124.5] ["Eve" 343 172866419 0.25 123.625])
+unweighed items 286
+friends, by a recursive rule (["Bob" "Ann"] ["Cy" "Ann"])
+by uuid "Bob"
+by bytes "Bob"
+by long bio "Ann"
+keys ({:name "Ann", :age 42} {:name "Bob", :age 36} {:name "Cy", :age 29} {:name "Eve", :age 23})
+-- index-range
+ages 30..50 [36 42]
+balances [-9223372036854775808 140737488355328 9223372036854775807]
+born [-315619200000 0]
+items n < 5000 [[4294968416 1060] [4294967810 1570] [4294967330 3138] [4294968444 3672] [4294969115 4827]]
+-- pull
+4294967296 {:db/id 4294967296, :item/_owner [{:db/id 4294967303, :item/sku "SKU-00000"} {:db/id 4294967308, :item/sku "SKU-00005"} {:db/id 4294967313, :item/sku "SKU-00010"}], :person/_friends [{:db/id 4294967298, :person/name "Bob"} {:db/id 4294967300, :person/name "Cy"}], :person/active true, :person/age 42, :person/alias "annie", :person/balance 9223372036854775807, :person/bio "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. ", :person/born -315619200000, :person/email "ann@example.com", :person/height 1.7, :person/home {:db/id 4294967297, :addr/city "Rome", :addr/zip 100}, :person/id "0123abcd-4567-89ef-0123-456789abcdef", :person/name "Ann", :person/photo "\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ\u{1}ÿ", :person/tags [:staff :founder]}
+4294967298 {:db/id 4294967298, :item/_owner [{:db/id 4294967304, :item/sku "SKU-00001"} {:db/id 4294967309, :item/sku "SKU-00006"} {:db/id 4294967314, :item/sku "SKU-00011"}], :person/active false, :person/age 36, :person/balance -9223372036854775808, :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. ", :person/born 0, :person/email "bob@example.com", :person/friends [{:db/id 4294967296, :person/name "Ann"}], :person/height 1.82, :person/home {:db/id 4294967299, :addr/city "Genoa", :addr/zip 16121}, :person/id "fedcba98-7654-3210-fedc-ba9876543210", :person/name "Bob", :person/photo "png", :person/tags [:staff]}
+4294967300 {:db/id 4294967300, :item/_owner [{:db/id 4294967305, :item/sku "SKU-00002"} {:db/id 4294967310, :item/sku "SKU-00007"} {:db/id 4294967315, :item/sku "SKU-00012"}], :person/age 29, :person/balance 140737488355328, :person/bio "red team lead, blue sky thinker", :person/email "cy@example.com", :person/friends [{:db/id 4294967296, :person/name "Ann"}], :person/height 0.0, :person/name "Cy"}
+4294967301 nil
+4294967302 {:db/id 4294967302, :item/_owner [{:db/id 4294967307, :item/sku "SKU-00004"} {:db/id 4294967312, :item/sku "SKU-00009"} {:db/id 4294967317, :item/sku "SKU-00014"}], :person/age 23, :person/email "eve@example.com", :person/name "Eve"}
+pull-many [{:db/id 4294967300, :person/name "Cy", :person/age 29} {:db/id 4294967296, :person/name "Ann", :person/age 42}]
+pull as of 3 {:db/id 4294967296, :person/name "Ann", :person/age 41, :person/alias "annie", :person/tags [:staff :admin]}
+-- as-of, since, history
+as-of 1 [[44 43 32882116816164] nil]
+as-of 2 [[121 120 32881441550159] nil]
+as-of 3 [[171 170 32882101069685] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 7 [[8171 8170 32880205891544] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 8 [[8170 8169 32879565237990] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 10 [[7887 7886 32879428072861] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 11 [[7888 7887 32882691866336] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 12 [[7889 7888 32881034012010] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 13 [[7891 7890 32882849017420] ("Ann" "Bob" "Cy" "Dee" "Eve")]
+as-of 14 [[7486 7485 32881353727033] ("Ann" "Bob" "Cy" "Eve")]
+since 7 [[4294967296 :person/age 42 8 true] [4294967298 :person/age 36 8 true]]
+since 12 [[38 :db/fulltext true 13 true] [70368744177677 :db/txInstant 4102444813000 13 true] [70368744177678 :db/txInstant 4102444814000 14 true]]
+history of Ann's age [[4294967296 :person/age 41 3 true] [4294967296 :person/age 41 8 false] [4294967296 :person/age 42 8 true]]
+history of Bob's bio [[149 8 true] [25 3 true] [25 8 false]]
+history of the secrets [[4294967301 :person/secret "dee's pin is 1234" 10 true] [4294967301 :person/secret "dee's pin is 1234" 14 false]]
+-- fulltext
+ledger ([4294967296 "Ann keeps the archive of the old observatory; she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. she reads every ledger twice. "])
+café ([4294967298 "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. "])
+σοφιας as of 7 ([4294967298 "Café owner; ΣΟΦΙΑΣ reader"])
+naïve as of 13 ([4294967301 "naïve 日本語 notes"])
+blue doors ([4294967298 "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. "])
+blue as of 7 ([4294967300 "red team lead, blue sky thinker"])
+city rome ([4294967297 "Rome"])
+city as of 12 {:error :nextomic/tx-data, :message "attribute is not :db/fulltext", :attr :addr/city}
+-- tx-range
+1 [:clock [44 43 32882233377644] nil]
+2 [2000 [77 77 32881981012836] nil]
+3 [3000 [50 50 32881732152282] nil]
+4 [4000 [1997 1997 32879730101498] [4294967316]]
+5 [5000 [2001 2001 32883700392062] nil]
+6 [6000 [2001 2001 32880117745821] nil]
+7 [7000 [2001 2001 32883079862712] nil]
+8 [8000 [11 11 32881280853521] nil]
+9 [9000 [1 1 32879526503782] nil]
+10 [10000 [288 288 32881077437217] [4294967302]]
+11 [10000 [1 1 32879492249491] [4294967316]]
+12 [10000 [1 1 32880746031873] [4294967302]]
+13 [13000 [2 2 32881321092009] nil]
+14 [14000 [407 407 32879971391638] nil]
+8 [4294967296 :person/age 41 8 false]
+8 [4294967296 :person/age 42 8 true]
+8 [4294967296 :person/tags :admin 8 false]
+8 [4294967296 :person/tags :founder 8 true]
+8 [4294967301 :person/email "dee@example.com" 8 false]
+8 [4294967298 :person/age 35 8 false]
+8 [4294967298 :person/age 36 8 true]
+8 [4294967298 :person/bio "Café owner; ΣΟΦΙΑΣ reader" 8 false]
+8 [4294967298 :person/bio "Bob's café moved north. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. Blue doors, red windows. " 8 true]
+8 [4294967300 :person/friends 4294967298 8 false]
+8 [70368744177672 :db/txInstant 4102444808000 8 true]
+9 [70368744177673 :db/txInstant 4102444809000 9 true]
+10 [4294967301 :person/secret "dee's pin is 1234" 10 true]
+10 [4294967303 :item/w 0.875 10 false]
+10 [4294967310 :item/w 51.75 10 false]
+10 [4294967317 :item/w 93.125 10 false]
+10 [4294967324 :item/w 34.0 10 false]
+10 [4294967331 :item/w 111.375 10 false]
+10 [4294967338 :item/w 39.25 10 false]
+10 [4294967345 :item/w 18.625 10 false]
+10 [4294967352 :item/w 70.5 10 false]
+10 [4294967359 :item/w 80.875 10 false]
+10 [4294967366 :item/w 31.75 10 false]
+10 [4294967373 :item/w 102.125 10 false]
+11 [70368744177675 :db/txInstant 4102444810000 11 true]
+12 [70368744177676 :db/txInstant 4102444810000 12 true]
+13 [38 :db/fulltext true 13 true]
+13 [70368744177677 :db/txInstant 4102444813000 13 true]
+14 [4294967301 :person/name "Dee" 14 false]
+14 [4294967301 :person/age 52 14 false]
+14 [4294967301 :person/friends 4294967300 14 false]
+14 [4294967301 :person/bio "naïve 日本語 notes" 14 false]
+14 [4294967301 :person/alias "d" 14 false]
+14 [4294967301 :person/secret "dee's pin is 1234" 14 false]
+14 [4294967302 :person/friends 4294967301 14 false]
+14 [4294967306 :item/owner 4294967301 14 false]
+14 [4294967311 :item/owner 4294967301 14 false]
+14 [4294967321 :item/owner 4294967301 14 false]
+14 [4294967326 :item/owner 4294967301 14 false]
+14 [4294967331 :item/owner 4294967301 14 false]
+:read-done

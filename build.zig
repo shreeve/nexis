@@ -14,6 +14,8 @@
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
 //!   zig build nextomic-nx             test/nextomic/*.nx through bin/nexis
 //!   zig build examples                every examples/*.nx through bin/nexis
+//!   zig build portable                test/portable: a db/* and a Nextomic store
+//!                                     written, then dumped (test/portable/README.md)
 //!   zig build golden [-Dupdate=true]  reader and CLI goldens (byte-exact)
 //!   zig build nexis                   bin/nexis alone
 //!   zig build bench [-- ARGS]         the benchmark suite, optimized for speed
@@ -237,6 +239,16 @@ pub fn build(b: *std.Build) void {
         scripts.unit(nextomic_nx_step, b.fmt("nextomic-nx-{s}", .{name}), programs.items, &.{"test/nextomic/prelude.nx"}, true);
     }
     test_step.dependOn(nextomic_nx_step);
+
+    // test/portable: write.nx writes a db/* store and a Nextomic store,
+    // read.nx dumps them, from one fresh directory. The dump pins the
+    // format test/portable/README.md compares across hosts.
+    const portable_step = b.step("portable", "Write the test/portable stores and dump them through bin/nexis");
+    scripts.unit(portable_step, "portable", &.{
+        .{ .script = "test/portable/write.nx", .expected = "test/portable/write.out" },
+        .{ .script = "test/portable/read.nx", .expected = "test/portable/read.out" },
+    }, &.{}, true);
+    test_step.dependOn(portable_step);
 
     // examples/*.nx: each example's stdout against
     // test/examples/<name>.out, from a fresh directory (the
