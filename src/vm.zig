@@ -1646,10 +1646,11 @@ pub const Frame = struct {
 /// instead of into a caller's slot.
 pub const HostCallResult = struct {
     done: bool = false,
-    /// The cell of a `Callback` running a batch: its frame's return
-    /// starts the next element (`VM.batchStep`).
-    batched: bool = false,
     value: Value = value_mod.nilValue(),
+    /// For the cell of a `Callback` running a batch, the part its
+    /// frame's return goes on to, which starts the next element
+    /// (`VM.batchNext`).
+    step: ?VM.OpHandler = null,
 
     /// The returned value, once the loop is back at the call's depth:
     /// without a return, a throw went past the call. Read a word at a
@@ -2121,6 +2122,10 @@ pub const Callback = struct {
     nil_count: usize = 0,
     window_end: usize = 0,
     frame: Frame = undefined,
+    /// The callee's first instruction and its handler, where each call
+    /// enters the chain.
+    first: Inst = undefined,
+    first_handler: VM.OpHandler = undefined,
     /// The cell the prepared frame returns into: a callee that
     /// re-enters the native makes a `Callback` and a cell of its own.
     result: HostCallResult = .{},
@@ -2132,7 +2137,7 @@ pub const Callback = struct {
     /// The calls `each`, `fold` or `foldRange` makes in one pass of the
     /// chain, in the callee's frame (VM.md §6, "Batched calls").
     const Batch = struct {
-        kind: enum { each, fold, fold_range },
+        kind: Kind,
         /// The element running, from 0 (once the pass is over, how many
         /// ran), and how many the pass runs.
         i: usize,
@@ -2145,6 +2150,20 @@ pub const Callback = struct {
         /// (0 for a repeat).
         x: Value = undefined,
         step: i64 = 0,
+
+        const Kind = enum { each, fold, fold_range };
+
+        /// What a return does with the value, by kind and, for `each`,
+        /// by where the results go.
+        const Step = enum { each_slots, each_roots, fold, fold_range };
+
+        fn stepFor(b: *const Batch) Step {
+            return switch (b.kind) {
+                .each => if (b.out == .slots) .each_slots else .each_roots,
+                .fold => .fold,
+                .fold_range => .fold_range,
+            };
+        }
     };
 
     /// Where `each` puts its results, the one for element `i` at `i`:
@@ -2201,13 +2220,7 @@ pub const Callback = struct {
         std.debug.assert(n == self.argc);
         const by_value = @TypeOf(args) != []const Value;
         switch (self.mode) {
-            .leaf => if (!self.vm.gcDue()) {
-                const native = asNativeFn(self.callee);
-                if (native.call(self.vm, if (by_value) &args else args)) |r| {
-                    countNative(native);
-                    return r;
-                } else |err| if (err != VmError.NeedsReentry) return err;
-            },
+            .leaf => return self.callLeaf(asNativeFn(self.callee), if (by_value) &args else args),
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
             .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) {
                 // The arguments go where the window begins, past the
@@ -2270,6 +2283,8 @@ pub const Callback = struct {
                 self.locals = base + self.argc;
                 self.nil_count = routine.slot_count - self.argc;
                 self.window_end = window_end;
+                self.first = routine.code[0];
+                self.first_handler = VM.fast_table[VM.opIndex(self.first)];
                 self.frame = .{
                     .routine = routine,
                     .base_slot = @intCast(base),
@@ -2283,6 +2298,18 @@ pub const Callback = struct {
             else => {},
         }
         return self.callWith(args.len, args);
+    }
+
+    /// A leaf native's call, in place while no cycle is due, else (or
+    /// when it asks to re-enter) `callValue`'s.
+    inline fn callLeaf(self: *Callback, native: *const NativeFn, args: []const Value) VmError!Value {
+        if (!self.vm.gcDue()) {
+            if (native.call(self.vm, args)) |r| {
+                countNative(native);
+                return r;
+            } else |err| if (err != VmError.NeedsReentry) return err;
+        }
+        return self.vm.callValue(self.callee, args);
     }
 
     /// Whether a closure's call can take the prepared frame now: the
@@ -2312,7 +2339,12 @@ pub const Callback = struct {
             VM.storeWords(&self.window()[0], items[i]);
             return self.vm.callBatch(self);
         }
-        while (i < items.len) : (i += 1) out.put(self.vm, i, try self.call1(items[i]));
+        // A leaf takes its argument where it lies, with no mode to
+        // test per element.
+        if (self.mode == .leaf) {
+            const native = asNativeFn(self.callee);
+            while (i < items.len) : (i += 1) out.put(self.vm, i, try self.callLeaf(native, items[i..][0..1]));
+        } else while (i < items.len) : (i += 1) out.put(self.vm, i, try self.call1(items[i]));
     }
 
     /// `acc = callee(acc, items[i])` for each element in turn, `argc`
@@ -2335,8 +2367,9 @@ pub const Callback = struct {
             try self.vm.callBatch(self);
             return .{ .acc = VM.loadWords(&self.result.value), .used = i + self.batch.i };
         }
+        const leaf: ?*const NativeFn = if (self.mode == .leaf) asNativeFn(self.callee) else null;
         while (i < items.len) {
-            a = try self.call2(a, items[i]);
+            a = if (leaf) |native| try self.callLeaf(native, &.{ a, items[i] }) else try self.call2(a, items[i]);
             i += 1;
             if (a.kind() == .record) break;
         }
@@ -2375,10 +2408,10 @@ pub const Callback = struct {
         return .{ .acc = a, .used = i };
     }
 
-    /// The element after `x` in a range of step `step`.
+    /// The element after `x` in a range of step `step`: a fixnum's
+    /// payload is its value, and a repeat's step is 0.
     inline fn rangeNext(x: Value, step: i64) Value {
-        if (step == 0) return x;
-        return value_mod.fromFixnum(x.asFixnum() + step).?;
+        return .{ .tag = x.tag, .payload = x.payload +% @as(u64, @bitCast(step)) };
     }
 };
 
@@ -3326,7 +3359,7 @@ pub const VM = struct {
     /// word at a time as the return wrote it.
     fn callPrepared(self: *VM, cb: *Callback) VmError!void {
         const depth = cb.depth;
-        self.nilLocals(cb);
+        nilLocals(self.stack.items.ptr + cb.locals, cb.nil_count);
         self.stack.items.len = cb.window_end;
         self.frames.items.len = depth + 1;
         const frame = &self.frames.items[depth];
@@ -3341,9 +3374,8 @@ pub const VM = struct {
             self.nested_runs -= 1;
         }
         if (self.gcDue()) self.collectGarbage();
-        const first = cb.frame.routine.code[0];
-        if (counting) opcode_counts[opIndex(first)] += 1;
-        fast_table[opIndex(first)](self, frame, first, 1) catch |err| {
+        if (counting) opcode_counts[opIndex(cb.first)] += 1;
+        cb.first_handler(self, frame, cb.first, 1) catch |err| {
             try self.settle(err);
             try self.drive();
         };
@@ -3352,48 +3384,51 @@ pub const VM = struct {
     /// A prepared call's locals, nil: the usual handful in one run,
     /// whatever their count, since a slot past the window is past the
     /// stack's length, dead.
-    inline fn nilLocals(self: *VM, cb: *const Callback) void {
-        const locals = self.stack.items.ptr + cb.locals;
+    inline fn nilLocals(locals: [*]Value, nil_count: usize) void {
         locals[0..Callback.nil_run].* = @splat(value_mod.nilValue());
-        if (cb.nil_count > Callback.nil_run) nilSlots(locals[Callback.nil_run..cb.nil_count]);
+        if (nil_count > Callback.nil_run) nilSlots(locals[Callback.nil_run..nil_count]);
     }
 
     /// `callPrepared` of a batch's first element, its arguments in the
     /// window: every later element runs in the same pass, started by
-    /// the return of the one before (`batchStep`). Without a return of
+    /// the return of the one before (`batchNext`). Without a return of
     /// the last, a throw went past the native.
     fn callBatch(self: *VM, cb: *Callback) VmError!void {
-        cb.result.batched = true;
-        defer cb.result.batched = false;
+        cb.result.step = switch (cb.batch.stepFor()) {
+            inline else => |step| batchNext(step),
+        };
+        defer cb.result.step = null;
         try self.callPrepared(cb);
         if (!cb.result.done) return VmError.ControlTransferred;
     }
 
     /// The return of a batch's element into its cell: its result to its
     /// place (an accumulator stays in the window), then, in the same
-    /// frame, the next element's arguments, the locals nil and the
-    /// frame as the first call pushed it, past the safe point a call's
-    /// entry is. False when the batch is over, after its last element or
-    /// a `fold`'s record, whose value is in the cell. Each element is a
-    /// call of its own, at the depth the first one ran at: its frame's
-    /// pop and the next one's push in one (VM.md §6).
-    inline fn batchStep(self: *VM, frame: *Frame, hr: *HostCallResult) bool {
+    /// frame, the next element's arguments and the locals nil. False
+    /// when the batch is over, after its last element or a `fold`'s
+    /// record, whose value is in the cell. Each element is a call of
+    /// its own, at the depth the first one ran at, in the frame the
+    /// first one pushed, which nothing a call runs changes but its
+    /// `pc`: its pop and the next one's push in one (VM.md §6).
+    inline fn batchStep(self: *VM, frame: *Frame, hr: *HostCallResult, comptime step: Callback.Batch.Step) bool {
         const cb: *Callback = @fieldParentPtr("result", hr);
         const b = &cb.batch;
-        std.debug.assert(self.frames.items.len == cb.depth + 1 and frame == &self.frames.items[cb.depth]);
+        std.debug.assert(b.stepFor() == step and self.frames.items.len == cb.depth + 1 and frame == &self.frames.items[cb.depth]);
+        std.debug.assert(frame.routine == cb.frame.routine and frame.base_slot == cb.frame.base_slot and frame.entry_stack_len == cb.frame.entry_stack_len);
         // The value may sit in the window's slots, which the next
         // element's arguments overwrite.
         const r = loadWords(&hr.value);
         const i = b.i + 1;
         b.i = i;
-        switch (b.kind) {
-            .each => b.out.put(self, i - 1, r),
+        switch (step) {
+            .each_slots => storeWords(&b.out.slots[i - 1], r),
+            .each_roots => self.roots.items[b.out.roots + i - 1] = r,
             .fold, .fold_range => if (r.kind() == .record) return false,
         }
         if (i == b.n) return false;
         const w = self.stack.items.ptr + cb.base;
-        switch (b.kind) {
-            .each => storeWords(&w[0], b.items[i]),
+        switch (step) {
+            .each_slots, .each_roots => storeWords(&w[0], b.items[i]),
             .fold => {
                 storeWords(&w[0], r);
                 storeWords(&w[1], b.items[i]);
@@ -3404,10 +3439,8 @@ pub const VM = struct {
                 storeWords(&w[1], b.x);
             },
         }
-        self.nilLocals(cb);
+        nilLocals(w + @as(usize, if (step == .fold or step == .fold_range) 2 else 1), cb.nil_count);
         self.stack.items.len = cb.window_end;
-        frame.* = cb.frame;
-        if (self.gcDue()) self.collectGarbage();
         return true;
     }
 
@@ -5115,7 +5148,7 @@ pub const VM = struct {
             // loop's frame.
             const hr = frame.host_result orelse return self.general(frame, inst, pc);
             copyWords(&hr.value, v);
-            if (hr.batched) return @call(out_of_line, batchNext, .{ self, frame, inst, pc });
+            if (hr.step) |step| return @call(.always_tail, step, .{ self, frame, inst, pc });
             hr.done = true;
             self.stack.items.len = frame.entry_stack_len;
             self.frames.items.len = n - 1;
@@ -5137,22 +5170,34 @@ pub const VM = struct {
         return self.nextAt(caller, resume_pc);
     }
 
-    /// `returnFast` of a batch's frame, its value in the cell: the
-    /// next element starts at its first instruction in the same frame,
-    /// or the batch is over and the frame pops, ending the chain as a
-    /// host's frame does.
-    fn batchNext(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
-        const hr = frame.host_result.?;
-        if (!self.batchStep(frame, hr)) {
-            hr.done = true;
-            self.stack.items.len = frame.entry_stack_len;
-            self.frames.items.len -= 1;
-            std.debug.assert(!self.running());
-            return;
-        }
-        const first = frame.routine.code[0];
-        if (counting) opcode_counts[opIndex(first)] += 1;
-        return @call(.always_tail, fast_table[opIndex(first)], .{ self, frame, first, 1 });
+    /// `returnFast` of a batch's frame, its value in the cell, for a
+    /// batch of `step`: the next element starts at its first
+    /// instruction in the same frame, past the safe point a call's
+    /// entry is, or the batch is over and the frame pops, ending the
+    /// chain as a host's frame does.
+    fn batchNext(comptime step: Callback.Batch.Step) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
+                const hr = frame.host_result.?;
+                if (!self.batchStep(frame, hr, step)) {
+                    hr.done = true;
+                    self.stack.items.len = frame.entry_stack_len;
+                    self.frames.items.len -= 1;
+                    std.debug.assert(!self.running());
+                    return;
+                }
+                const cb: *Callback = @fieldParentPtr("result", hr);
+                if (counting) opcode_counts[opIndex(cb.first)] += 1;
+                if (self.gcDue()) return @call(out_of_line, collectThen, .{ self, frame, cb.first, 1 });
+                return @call(.always_tail, cb.first_handler, .{ self, frame, cb.first, 1 });
+            }
+        }.run;
+    }
+
+    /// A cycle, then `inst`: a batch's safe point, out of line.
+    fn collectThen(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        self.collectGarbage();
+        return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst, pc });
     }
 
     // -------------------------------------------------------------------------
@@ -5244,9 +5289,19 @@ pub const VM = struct {
         const callee = &self.frames.items[n - 1];
         if (callee.host_result) |hr| {
             storeWords(&hr.value, return_value);
-            // A batch's next element starts in the same frame, whose
-            // `pc`, 0, the caller's fetch goes on from.
-            if (hr.batched and self.batchStep(callee, hr)) return;
+            // A batch's next element starts in the same frame, at the
+            // `pc` the caller's fetch goes on from, past the safe point.
+            if (hr.step != null) {
+                const cb: *Callback = @fieldParentPtr("result", hr);
+                const going = switch (cb.batch.stepFor()) {
+                    inline else => |step| self.batchStep(callee, hr, step),
+                };
+                if (going) {
+                    callee.pc = 0;
+                    if (self.gcDue()) self.collectGarbage();
+                    return;
+                }
+            }
             hr.done = true;
             _ = self.popFrame();
             return;
@@ -9724,7 +9779,7 @@ test "Callback batches: an element's error with no handler leaves its frame, one
         try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
         try testing.expectEqual(@as(usize, 0), vm.loop_depth);
         try testing.expectEqual(@as(usize, 0), vm.nested_runs);
-        try testing.expect(!cb.result.batched);
+        try testing.expect(cb.result.step == null);
     }
     // (try (each-all (fn [x] (+ x 1)) 2 3 nil 4) (catch any e e))
     const caps = [_]CaptureDescriptor{.{ .routine = &plain, .sources = &.{} }};
@@ -9841,11 +9896,11 @@ test "Callback batches: the general return starts the next element in the same f
     const items = [_]Value{ fx(4), fx(5), fx(6) };
     var out: [3]Value = undefined;
     cb.batch = .{ .kind = .each, .i = 0, .n = 3, .items = &items, .out = .{ .slots = &out } };
-    cb.result.batched = true;
+    cb.result.step = VM.batchNext(.each_slots);
     cb.result.done = false;
     // The first element's frame, as `callPrepared` pushes it.
     cb.window()[0] = items[0];
-    vm.nilLocals(&cb);
+    VM.nilLocals(vm.stack.items.ptr + cb.locals, cb.nil_count);
     vm.stack.items.len = cb.window_end;
     vm.frames.appendAssumeCapacity(cb.frame);
     for (0..3) |i| {

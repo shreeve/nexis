@@ -434,10 +434,12 @@ to its place (`each`'s into a block a root reaches, a buffer only
 tested for truth, or a root-stack region by index; `fold`'s
 accumulator into the window's first slot, as the next call's
 argument), the next element's arguments and nil locals go into the
-window, the frame is reset to the one the first call pushed, the safe
-point a call's entry is taken, and the chain goes on at the callee's
-first instruction, so the native is re-entered once per run rather
-than once per element. `fold` and `foldRange` end the pass after a
+window, the frame stays as the first call pushed it (nothing a call
+runs changes a frame but its `pc`), the safe point a call's entry is
+taken, and the chain goes on at the callee's first instruction, which
+the first call looked up, so the native is re-entered once per run
+rather than once per element. A leaf native or a lookup is called in
+a loop of its own, its mode decided once. `fold` and `foldRange` end the pass after a
 result that is a record, which the native tests for `reduced`. Every
 element is still a call of its own, with a frame of its own: the pop
 of one element's and the push of the next one's are fused, at the same
@@ -673,11 +675,12 @@ instruction.
   one pops it and continues in the caller, or fills the cell of the
   host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
   ends the chain; the return of a batch's frame (§6) goes on from the
-  cell to a part out of line, which starts the next element in the
-  same frame or, after the last, pops it and ends the chain, so a
-  return to bytecode pays nothing for batches. The general
-  `call:return` goes on the same way, the reset frame's `pc` 0 where
-  its fetch resumes. Every other call goes through the general entry of
+  cell to the part the cell names, out of line, one for each kind of
+  batch (`each` into slots or into the root stack, `fold`,
+  `foldRange`), which starts the next element in the same frame or,
+  after the last, pops it and ends the chain, so a return to bytecode
+  pays nothing for batches. The general `call:return` goes on the same
+  way, setting the frame's `pc` to 0, where its fetch resumes. Every other call goes through the general entry of
   §6, with the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
