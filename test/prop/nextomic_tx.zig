@@ -10,7 +10,12 @@
 //! equal the model's replay, `since` windows and `history` must match,
 //! long strings must round-trip through the payload, an aborted
 //! transaction must leave every tree's entry count and `t` unchanged,
-//! and a reopened store must continue from the same `t`.
+//! and a reopened store must continue from the same `t`. The sequence
+//! retracts and asserts again the same facts, long strings among them,
+//! writes values that are byte prefixes of one another, and excises
+//! entities, which the model forgets; a speculative `with` of a
+//! transaction must show the state its commit then has; and after
+//! every commit each history tree must hold H1 (NEXTOMIC.md §2).
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -27,7 +32,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
 const prng_seed: u64 = 0x6e78_7478_5f70_0000; // "nxtx_p\0\0"
-const transactions: usize = 60;
+const transactions: usize = 80;
 const reopen_at: usize = 31;
 
 // =============================================================================
@@ -43,6 +48,7 @@ const Attrs = struct {
     home: u32, // ref, component
     city: u32, // string
     bio: u32, // string, often long
+    nick: u32, // string, many: values that prefix one another
 };
 
 fn kw(tc: *db_mod.TestConn, name: []const u8) !u32 {
@@ -70,6 +76,7 @@ fn installSchema(arena: Allocator, tc: *db_mod.TestConn) !Attrs {
     try ops.appendSlice(arena, try attrOps(arena, tc, "home", "user/home", boot.type_ref, false, false, true));
     try ops.appendSlice(arena, try attrOps(arena, tc, "city", "addr/city", boot.type_string, false, false, false));
     try ops.appendSlice(arena, try attrOps(arena, tc, "bio", "user/bio", boot.type_string, false, false, false));
+    try ops.appendSlice(arena, try attrOps(arena, tc, "nick", "user/nick", boot.type_string, true, false, false));
     _ = try transact.transactOps(tc.conn, arena, ops.items, .{});
     const txn = try tc.conn.store.beginRead();
     defer txn.abort();
@@ -82,6 +89,7 @@ fn installSchema(arena: Allocator, tc: *db_mod.TestConn) !Attrs {
         .home = (try tc.conn.idents.idOfName(txn, "user/home")).?,
         .city = (try tc.conn.idents.idOfName(txn, "addr/city")).?,
         .bio = (try tc.conn.idents.idOfName(txn, "user/bio")).?,
+        .nick = (try tc.conn.idents.idOfName(txn, "user/nick")).?,
     };
 }
 
@@ -106,7 +114,46 @@ const Model = struct {
     }
 
     fn many(self: *Model, a: u32) bool {
-        return a == self.attrs.tags or a == self.attrs.friend;
+        return a == self.attrs.tags or a == self.attrs.friend or a == self.attrs.nick;
+    }
+
+    /// An excision: every row of `e`, under `a` when given, leaves the
+    /// log as if never written (NEXTOMIC.md §4 "Excision"). Returns the
+    /// rows it removed.
+    fn excise(self: *Model, e: u64, a: ?u32) !usize {
+        var kept: std.ArrayList(Row) = .empty;
+        for (self.log.items) |r| {
+            if (r.e == e and (a == null or r.a == a.?)) continue;
+            try kept.append(self.arena, r);
+        }
+        const removed = self.log.items.len - kept.items.len;
+        self.log = kept;
+        self.current = .empty;
+        self.emails = .empty;
+        for (self.log.items, 0..) |r, i| {
+            const k = try self.factKey(r.e, r.a, r.vb);
+            if (r.added) {
+                try self.current.put(self.arena, k, i);
+                if (r.a == self.attrs.email) try self.emails.put(self.arena, r.v.string, r.e);
+            } else {
+                _ = self.current.remove(k);
+                if (r.a == self.attrs.email) _ = self.emails.remove(r.v.string);
+            }
+        }
+        self.refreshAlive();
+        return removed;
+    }
+
+    /// Entities with any current fact but a home's city.
+    fn refreshAlive(self: *Model) void {
+        self.alive.clearRetainingCapacity();
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var it = self.current.valueIterator();
+        while (it.next()) |i| {
+            const r = self.log.items[i.*];
+            if (r.a == self.attrs.city) continue;
+            if (!(seen.getOrPut(self.arena, r.e) catch @panic("OOM")).found_existing) self.alive.append(self.arena, r.e) catch @panic("OOM");
+        }
     }
 
     fn isRef(self: *Model, a: u32) bool {
@@ -295,10 +342,10 @@ const Gen = struct {
     }
 
     fn bio(self: *Gen) ![]const u8 {
-        const n: usize = switch (self.rand.uintLessThan(u8, 6)) {
+        const n: usize = switch (self.rand.uintLessThan(u8, 5)) {
             0 => 0,
-            1, 2 => self.rand.uintAtMost(usize, key.inline_max),
-            3, 4 => key.inline_max + 1 + self.rand.uintAtMost(usize, 300),
+            1 => self.rand.uintAtMost(usize, key.inline_max),
+            2, 3 => key.inline_max + 1 + self.rand.uintAtMost(usize, 300),
             else => blk: {
                 self.long_bios += 1;
                 break :blk 20_000 + self.rand.uintAtMost(usize, 30_000);
@@ -307,6 +354,17 @@ const Gen = struct {
         const s = try self.arena.alloc(u8, n);
         for (s, 0..) |*c, i| c.* = if (self.rand.uintLessThan(u8, 16) == 0) 0 else @intCast('a' + (i % 26));
         return s;
+    }
+
+    /// Strings that are byte prefixes of one another, a 64-byte inline
+    /// one and its out-of-line sibling among them (NEXTOMIC.md §2.2):
+    /// the facts whose order a merge of current and history trees
+    /// must keep.
+    const adversarial = [_][]const u8{ "a", "a\x00b", "a\x00", "a\x00\x00", &inline64, &inline64 ++ ", and on past the inline limit of ninety-six bytes, out of line" };
+    const inline64: [key.prefix_len]u8 = @splat('y');
+
+    fn adversarialVal(self: *Gen) Val {
+        return .{ .string = adversarial[self.rand.uintLessThan(usize, adversarial.len)] };
     }
 
     fn tagVal(self: *Gen) Val {
@@ -320,7 +378,7 @@ const Gen = struct {
         const n = 1 + self.rand.uintLessThan(usize, 7);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            switch (self.rand.uintLessThan(u8, 12)) {
+            switch (self.rand.uintLessThan(u8, 14)) {
                 0, 1 => {
                     // New entity by tempid.
                     tx.new_count += 1;
@@ -357,8 +415,10 @@ const Gen = struct {
                         try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.age }, .v = .{ .val = .{ .long = self.age() } } } });
                     } else if (which == 1) {
                         try tx.ops.append(self.arena, .{ .add = .{ .e = self.entityRef(e), .a = .{ .id = a.bio }, .v = .{ .val = .{ .string = try self.bio() } } } });
-                    } else {
+                    } else if (self.rand.boolean()) {
                         try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.name }, .v = .{ .val = .{ .string = try self.arena.print("name{d}", .{self.rand.uintLessThan(u8, 3)}) } } } });
+                    } else {
+                        try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.name }, .v = .{ .val = self.adversarialVal() } } });
                     }
                 },
                 5 => {
@@ -410,6 +470,30 @@ const Gen = struct {
                     try tx.ops.append(self.arena, .{ .retract_entity = self.entityRef(e) });
                     break;
                 },
+                12 => {
+                    // A value of a card-many string, added or retracted:
+                    // the same facts come and go.
+                    const e = self.pickAlive(&tx) orelse continue;
+                    if (tx.touched.contains(e)) continue;
+                    try tx.touched.put(self.arena, e, {});
+                    const v = self.adversarialVal();
+                    if (self.rand.boolean()) {
+                        try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.nick }, .v = .{ .val = v } } });
+                    } else {
+                        try tx.ops.append(self.arena, .{ .retract = .{ .e = .{ .eid = e }, .a = .{ .id = a.nick }, .v = .{ .val = v } } });
+                    }
+                },
+                13 => {
+                    // A bio the entity once had, asserted again.
+                    const e = self.pickAlive(&tx) orelse continue;
+                    if (tx.touched.contains(e)) continue;
+                    const old = for (0..m.log.items.len) |j| {
+                        const r = m.log.items[m.log.items.len - 1 - j];
+                        if (r.e == e and r.a == a.bio and !r.added) break r.v;
+                    } else continue;
+                    try tx.touched.put(self.arena, e, {});
+                    try tx.ops.append(self.arena, .{ .add = .{ .e = .{ .eid = e }, .a = .{ .id = a.bio }, .v = .{ .val = old } } });
+                },
                 else => {
                     // Retract a specific card-one value (present or not).
                     const e = self.pickAlive(&tx) orelse continue;
@@ -446,15 +530,7 @@ const Gen = struct {
         }
         try expectSameKeys(void, "the replayed model", &want, &got);
         try p.commit();
-        // Alive set: entities with any current fact.
-        m.alive.clearRetainingCapacity();
-        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        var it = m.current.valueIterator();
-        while (it.next()) |i| {
-            const r = m.log.items[i.*];
-            if (r.a == m.attrs.city) continue;
-            if (!(try seen.getOrPut(self.arena, r.e)).found_existing) try m.alive.append(m.arena, r.e);
-        }
+        m.refreshAlive();
     }
 
     fn resolve(self: *Gen, e: transact.Entity, report: transact.Report) !u64 {
@@ -590,6 +666,45 @@ fn verifyAllBases(arena_parent: Allocator, model: *Model, tc: *db_mod.TestConn, 
     try expectSameKeys(u32, "the current trees against the fold", &fast, &folded);
 }
 
+/// H1 (NEXTOMIC.md §2): in every history tree, each fact's rows
+/// alternate assertion and retraction in ascending `t`, starting with
+/// an assertion and ending with a retraction, and a fact still current
+/// was retired before its current assertion.
+fn expectH1(arena: Allocator, tc: *db_mod.TestConn) !void {
+    const store = tc.conn.store;
+    const txn = try store.beginRead();
+    defer txn.abort();
+    for (0..4) |ix| {
+        var s = try nextomic.Store.scan(txn, store.trees.history[ix], &.{});
+        var fact: []const u8 = &.{};
+        var last: ?key.Top = null;
+        while (try s.next()) |kv| {
+            const f = kv.key[0 .. kv.key.len - key.top_len];
+            const top = try key.readTop(kv.key[f.len..][0..key.top_len]);
+            if (last != null and std.mem.eql(u8, f, fact)) {
+                try testing.expect(top.added != last.?.added and top.t > last.?.t);
+            } else {
+                if (last) |l| try expectRetired(txn, store.trees.current[ix], fact, l);
+                try testing.expect(top.added);
+                fact = try arena.dupe(u8, f);
+            }
+            last = top;
+        }
+        if (last) |l| try expectRetired(txn, store.trees.current[ix], fact, l);
+    }
+}
+
+fn expectRetired(txn: *nx.emdb.Txn, current: nx.emdb.TreeId, fact: []const u8, last: key.Top) !void {
+    errdefer std.debug.print("H1 broken (seed 0x{x})\n", .{prng_seed});
+    try testing.expect(!last.added);
+    if (try txn.getFromTree(current, fact)) |row| try testing.expect(try key.readT(row[0..key.id_len]) > last.t);
+}
+
+/// The plain view's user facts as `e|a|vb|t`, the model's replay key.
+fn currentSet(arena: Allocator, view: db_mod.DbValue) !std.StringHashMapUnmanaged(u32) {
+    return viewSet(arena, view, .eavt, .{}, false);
+}
+
 // =============================================================================
 // The run
 // =============================================================================
@@ -630,14 +745,41 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
             try testing.expectEqual(last_t, (try tc.conn.db()).basis);
             try verifyAllBases(testing.allocator, &model, tc, rand);
         }
+        if (i % 9 == 4 and model.alive.items.len > 0) {
+            // Excise an entity, or one attribute of it.
+            const e = model.alive.items[rand.uintLessThan(usize, model.alive.items.len)];
+            const pick = rand.uintLessThan(usize, 5);
+            const a: ?u32 = if (pick == 4) null else ([_]u32{ attrs.age, attrs.bio, attrs.nick, attrs.tags })[pick];
+            const name: ?nx.value.Value = if (pick == 4) null else tc.interner.keywordValue(try kw(tc, ([_][]const u8{ "user/age", "user/bio", "user/nick", "user/tags" })[pick]));
+            const x = try transact.excise(tc.conn, arena, nx.value.fromFixnum(@intCast(e)).?, name, .{});
+            try testing.expectEqual(last_t + 1, x.report.t);
+            last_t = x.report.t;
+            try testing.expectEqual(@as(u64, try model.excise(e, a)), x.removed);
+            try expectH1(arena, tc);
+            continue;
+        }
         var tx = try gen.genTx();
         if (tx.ops.items.len == 0) continue;
+        // Now and then the transaction runs speculatively first: its
+        // view must hold what the commit then holds.
+        const speculated: ?std.StringHashMapUnmanaged(u32) = if (i % 5 == 2) blk: {
+            const w = try transact.withOps(tc.conn, arena, tx.ops.items, .{});
+            defer w.finish();
+            break :blk try currentSet(arena, w.db());
+        } else null;
         const report = try transact.transactOps(tc.conn, arena, tx.ops.items, .{});
         try testing.expectEqual(last_t + 1, report.t);
         try testing.expectEqual(last_t, report.db_before.basis);
         try testing.expectEqual(report.t, report.db_after.basis);
         last_t = report.t;
         try gen.expect(&tx, report);
+        try expectH1(arena, tc);
+        if (speculated) |set| {
+            var want_set = try model.replay(arena, null, report.t);
+            var want = try toCounted(arena, &want_set);
+            var got = set;
+            try expectSameKeys(u32, "a speculative with against the model", &want, &got);
+        }
     }
     try testing.expect(gen.long_bios > 0);
     try testing.expect(model.log.items.len > 100);
@@ -678,16 +820,24 @@ test "T1 random transactions vs the model at every basis, reopen, abort" {
     }, .{});
     try testing.expectEqual(last_t + 1, r.t);
 
-    // The txlog replays the same rows the model holds, in order.
+    // The txlog replays the rows the model holds, excisions applied,
+    // and the last transaction's as its report gave them.
     const entries = try db_mod.txRange(tc.conn, arena, 1, null);
     try testing.expectEqual(r.t, entries[entries.len - 1].t);
-    var logged: usize = 0;
-    for (entries) |en| {
-        for (en.datoms) |d| {
-            if (isUser(d.e)) logged += 1;
-        }
-    }
-    try testing.expectEqual(model.log.items.len + 1, logged);
+    var want: std.StringHashMapUnmanaged(u32) = .empty;
+    for (model.log.items) |row| try countKey(arena, &want, try arena.print("{d}|{d}|{x}|{d}|{}", .{ row.e, row.a, row.vb, row.t, row.added }));
+    for (r.tx_data) |d| if (isUser(d.e)) try countKey(arena, &want, try arena.print("{d}|{d}|{x}|{d}|{}", .{ d.e, d.a, try key.valBytes(arena, d.v), d.t, d.added }));
+    var got: std.StringHashMapUnmanaged(u32) = .empty;
+    for (entries) |en| for (en.datoms) |d| {
+        if (isUser(d.e)) try countKey(arena, &got, try arena.print("{d}|{d}|{x}|{d}|{}", .{ d.e, d.a, try key.valBytes(arena, d.v), en.t, d.added }));
+    };
+    try expectSameKeys(u32, "the txlog against the model", &want, &got);
+}
+
+fn countKey(arena: Allocator, set: *std.StringHashMapUnmanaged(u32), k: []const u8) !void {
+    const g = try set.getOrPut(arena, k);
+    if (!g.found_existing) g.value_ptr.* = 0;
+    g.value_ptr.* += 1;
 }
 
 // =============================================================================

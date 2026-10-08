@@ -14,8 +14,9 @@
 //!   - `as-of T` caps the view at `min(basis, T)`; `since T` shows only
 //!     facts asserted after `T`; `history` shows every row unfolded, and
 //!     composes with `as-of`.
-//!   - Out-of-line values are confirmed and materialised from the EAVT
-//!     payload before a datom is returned.
+//!   - Out-of-line values are confirmed and materialised from their
+//!     payload, in the current EAVT row or the EAVT-h assertion row,
+//!     before a datom is returned.
 //!   - Every operation allocates in the caller's arena; the connection's
 //!     allocator holds only the store, the ident cache and the schema.
 
@@ -100,6 +101,9 @@ pub const OpenOptions = struct {
     /// How the connection's commits sync; null takes the process's
     /// durability (`NEXIS_DURABILITY`, NEXTOMIC.md §3).
     sync: ?SyncMode = null,
+    /// Given the format of a store refused as another format's
+    /// (`error.Format`).
+    refused_format: ?*u16 = null,
 };
 
 pub const Conn = struct {
@@ -164,7 +168,7 @@ pub const Conn = struct {
 
     fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
         const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
-        const store = try Store.open(self.gpa, path, .{ .sync = sync_mode });
+        const store = try Store.open(self.gpa, path, .{ .sync = sync_mode, .refused_format = options.refused_format });
         errdefer store.close();
         try refreshFulltext(self.gpa, store, sync_mode);
         const gpa = self.gpa;
@@ -695,8 +699,7 @@ pub const DatomScan = struct {
         if (row.current) {
             return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
-        const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena)) orelse return error.Corrupted;
-        return self.arena.dupe(u8, raw);
+        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena));
     }
 };
 

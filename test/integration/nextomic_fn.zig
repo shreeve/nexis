@@ -17,6 +17,7 @@ const Fault = nextomic.db.Fault;
 const boot = nextomic.boot;
 
 const Fx = @import("nextomic_fx.zig").Fx;
+const harness = @import("harness");
 
 fn loadPeople(fx: *Fx) !u64 {
     _ = try fx.transact(
@@ -245,6 +246,56 @@ test "excision empties the entity for pull and q on every view, and tx-range rep
     try testing.expectEqual(y.report.t, (try fx.db()).basis);
 }
 
+test "excision removes an entity's whole history, current facts and retired ones alike, and marks every entry that held it" {
+    const fx = try Fx.init("fn_excise_rows");
+    defer fx.deinit();
+    const ann = try loadPeople(fx);
+    const a = fx.arena();
+    // Di's facts are all current; Cy's name is retired twice over, so
+    // only history rows hold it; Ann has both.
+    const r_di = try fx.transact("[{:db/id \"di\" :person/name \"Di\" :person/email \"di@x\" :person/age 40}]");
+    const di = r_di.tempids[0].eid;
+    const r_cy = try fx.transact("[{:db/id \"cy\" :person/name \"C1\" :person/email \"cy@x\"}]");
+    const cy = r_cy.tempids[0].eid;
+    const t_c2 = (try fx.transact("[[:db/add [:person/email \"cy@x\"] :person/name \"C2\"] [:db/add [:person/email \"ann@x\"] :person/age 31]]")).t;
+    const t_gone = (try fx.transact("[[:db/retract [:person/email \"cy@x\"] :person/name \"C2\"]]")).t;
+
+    const di_x = try nextomic.transact.excise(fx.conn(), a, try fx.read(try a.print("{d}", .{di})), null, .{});
+    try testing.expectEqual(@as(u64, 3), di_x.removed);
+    const cy_x = try nextomic.transact.excise(fx.conn(), a, try fx.read(try a.print("{d}", .{cy})), try fx.kw("person/name"), .{});
+    try testing.expectEqual(@as(u64, 4), cy_x.removed);
+    // Ann: her name and email, her age 30 asserted and retracted, and
+    // her age 31.
+    const ann_x = try nextomic.transact.excise(fx.conn(), a, try fx.read(try a.print("{d}", .{ann})), null, .{});
+    try testing.expectEqual(@as(u64, 5), ann_x.removed);
+
+    const now = try fx.db();
+    for ([_]nextomic.DbValue{ now, now.asOf(t_c2), now.withHistory(), now.sinceT(0) }) |view| {
+        for ([_][]const u8{ "Ann", "Di", "C1", "C2" }) |name| {
+            try testing.expectEqual(@as(usize, 0), count(try fx.q(view, try a.print("[:find ?e :where [?e :person/name \"{s}\"]]", .{name}))));
+        }
+        try testing.expectEqual(@as(usize, 0), count(try fx.q(view, "[:find ?a :where [?e :person/age ?a]]")));
+    }
+    // Cy keeps her email; every entry that held an excised datom, and
+    // each excising transaction's own, carries its entity.
+    try testing.expectEqual(@as(usize, 1), count(try fx.q(now, "[:find ?e :where [?e :person/email \"cy@x\"]]")));
+    const log = try nextomic.db.txRange(fx.conn(), a, 1, null);
+    for (log) |entry| {
+        var held = false;
+        for (entry.datoms) |d| {
+            try testing.expect(d.e != ann and d.e != di);
+            if (d.v == .string) try testing.expect(!std.mem.eql(u8, d.v.string, "C1") and !std.mem.eql(u8, d.v.string, "C2"));
+        }
+        for (entry.excised) |e| {
+            if (e == cy) held = held or entry.t == r_cy.t or entry.t == t_c2 or entry.t == t_gone or entry.t == cy_x.report.t;
+            if (e == di) held = held or entry.t == r_di.t or entry.t == di_x.report.t;
+            if (e == ann) held = true;
+        }
+        const must = entry.t == r_di.t or entry.t == r_cy.t or entry.t == t_c2 or entry.t == t_gone or entry.t == di_x.report.t or entry.t == cy_x.report.t or entry.t == ann_x.report.t;
+        if (must) try testing.expect(held);
+    }
+}
+
 /// The rows of the tokens tree.
 fn tokenRows(fx: *Fx) !usize {
     const store = fx.conn().store;
@@ -385,4 +436,30 @@ test "full-text folds case across scripts; rows of another folding are searched 
     try testing.expectEqual(@as(usize, 11), try tokenRows(fx));
     try check(fx, &cases);
     try testing.expectEqual(@as(usize, 1), count(try fx.q(try fx.db(), "[:find ?e :where [(fulltext $ :doc/title \"CRÈME BRÛLÉE\") [[?e ?v]]]]")));
+}
+
+test "a store of another format is refused at connect, naming the format it holds" {
+    var hs = try harness.Store.init("fn_format");
+    defer hs.deinit();
+    const path = try testing.allocator.dupeSentinel(u8, hs.path, 0);
+    defer testing.allocator.free(path);
+    (try nextomic.Store.open(testing.allocator, path.ptr, .{})).close();
+    {
+        // A store an earlier build wrote: its format number is 2.
+        const file = try nx.db.StoreFile.acquire(path.ptr, .{ .allocator = testing.allocator });
+        defer file.release();
+        const txn = try file.beginWrite(.{});
+        errdefer txn.abort();
+        try txn.putInTree(try txn.openTree("nx/sys", false), "format", &.{ 0, 2 });
+        try file.commit(txn);
+    }
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const src = try hs.source(
+        \\(let [e (try (nextomic/connect "@STORE@") (catch any e e))]
+        \\  [(:error e) (:format e) (:message e)])
+    );
+    defer testing.allocator.free(src);
+    try harness.expectResult(&program, src, try program.run(src), "[:db/corrupted 2 Nextomic store format 2; this build reads format 3. Recreate the store or re-import its data (docs/NEXTOMIC.md §2)]");
 }

@@ -608,6 +608,38 @@ test "corpus: every pattern agrees with the naive evaluator on current and as-of
     try testing.expect(vector_mod.nth(many, 2).isNil());
 }
 
+test "corpus: over a churned store, every pattern agrees with the naive evaluator in each view" {
+    const fx = try Fx.init("pull_churn");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    _ = try updateCorpus(fx);
+    // Card-one changes; facts retracted and asserted again, a long bio
+    // and a component among them; a whole entity retracted.
+    _ = try fx.transact(
+        \\[[:db/add [:person/email "ann@x"] :person/age 31]
+        \\ [:db/retract [:person/email "bob@x"] :person/tags :blue]
+        \\ [:db/retract [:person/email "cy@x"] :person/friend [:person/email "bob@x"]]
+        \\ [:db/retract [:person/email "ann@x"] :person/level :level/senior]
+        \\ [:db/add [:person/email "di@x"] :person/age 19]
+        \\ [:db/retractEntity [:person/email "flo@x"]]]
+    );
+    const mid = try fx.transact(
+        \\[[:db/add [:person/email "bob@x"] :person/tags :blue]
+        \\ [:db/add [:person/email "ann@x"] :person/age 30]
+        \\ [:db/add [:person/email "ann@x"] :person/level :level/senior]
+        \\ [:db/add [:person/email "di@x"] :person/age 20]]
+    );
+    _ = try fx.transact(
+        \\[[:db/add [:person/email "cy@x"] :person/friend [:person/email "bob@x"]]
+        \\ [:db/retract [:person/email "ed@x"] :person/friend [:person/email "ed@x"]]
+        \\ [:db/add [:person/email "bob@x"] :person/age 26]]
+    );
+    const now = try fx.db();
+    for ([_]DbValue{ now, now.asOf(mid.t), now.asOf(mid.t - 1), now.sinceT(mid.t - 1) }) |view| {
+        for (corpus) |c| try checkCase(fx, view, c, now);
+    }
+}
+
 // =============================================================================
 // with
 // =============================================================================

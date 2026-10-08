@@ -208,7 +208,19 @@ fn check(fx: *Fx, dbv: DbValue, src: []const u8, args: []const Value) !Relation 
     return got_rel;
 }
 
+/// Set while the corpus runs over a churned store's views, whose row
+/// counts the corpus does not know: the engine and the naive
+/// evaluator must still agree, or fail with one error.
+var churned = false;
+
 fn checkCount(fx: *Fx, dbv: DbValue, src: []const u8, args: []const Value, n: usize) !void {
+    if (churned) {
+        _ = check(fx, dbv, src, args) catch |err| {
+            _ = Naive.run(fx, fx.arena(), dbv, src, args) catch |e| if (e == err) return;
+            return err;
+        };
+        return;
+    }
     const rel = try check(fx, dbv, src, args);
     if (rel.rows != n) {
         std.debug.print("\nexpected {d} rows, got {d} for {s}\n", .{ n, rel.rows, src });
@@ -1006,7 +1018,10 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
     const fx = try Fx.init("q_corpus");
     defer fx.deinit();
     try loadCorpus(fx);
-    const dbv = try fx.db();
+    try patternsCorpus(fx, try fx.db());
+}
+
+fn patternsCorpus(fx: *Fx, dbv: DbValue) !void {
     const none: []const Value = &.{value.nilValue()};
 
     // Constants in every position, wildcards, single patterns.
@@ -1065,6 +1080,8 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
         "[:find ?n :where [?e :person/name ?n] [?e :person/active ?x] [(<= ?x 1)]]",
         "[:find ?n :where [?e :person/name ?n] [?e :person/role ?r] [(>= ?r :role/admin)] [(< ?r \"z\")]]",
     }) |src| {
+        // A churned view may hold no row to compare.
+        if (churned) break;
         try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
         try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
     }
@@ -1158,6 +1175,8 @@ test "corpus: patterns, constants, joins, predicates, functions, aggregates, fin
         "[:find (median ?n) (variance ?n) :where [_ :person/name ?n]]",
         "[:find (stddev ?r) :where [_ :person/role ?r]]",
     }) |src| {
+        // A churned view may hold no row to compare.
+        if (churned) break;
         try testing.expectError(error.ValueType, runEngine(fx, fx.arena(), dbv, src, none));
         try testing.expectError(error.ValueType, Naive.run(fx, fx.arena(), dbv, src, none));
     }
@@ -1321,7 +1340,10 @@ test "corpus: not, not-join, or, or-join, and" {
     const fx = try Fx.init("q_notor");
     defer fx.deinit();
     try loadCorpus(fx);
-    const dbv = try fx.db();
+    try notOrCorpus(fx, try fx.db());
+}
+
+fn notOrCorpus(fx: *Fx, dbv: DbValue) !void {
     const none: []const Value = &.{value.nilValue()};
 
     try checkCount(fx, dbv, "[:find ?n :where [?e :person/name ?n] (not [?e :person/tags _])]", none, 2);
@@ -1384,7 +1406,10 @@ test "corpus: rules" {
     const fx = try Fx.init("q_rules");
     defer fx.deinit();
     try loadCorpus(fx);
-    const dbv = try fx.db();
+    try rulesCorpus(fx, try fx.db());
+}
+
+fn rulesCorpus(fx: *Fx, dbv: DbValue) !void {
     const rules = try fx.read(rules_src);
     const args: []const Value = &.{ value.nilValue(), rules };
 
@@ -1533,6 +1558,52 @@ test "corpus: long chains, wide joins, and the variables a relation drops" {
     try query.explain(testing.allocator, fx.interner(), try fx.read(try chainQuery(arena, 12, ":edge/to", every.written(), false)), dbv, none, &diag, .{}, &out.writer);
     try testing.expect(std.mem.find(u8, out.written(), " park ?x0 ?x1 ?x2 ?x3 -> ?row\n") != null);
     try testing.expect(std.mem.find(u8, out.written(), " park ?x4 ?row ?x5 ?x6 -> ?row\n") != null);
+}
+
+/// After the corpus, three transactions of churn: card-one changes,
+/// facts retracted and asserted again (an out-of-line bio, a tag, a
+/// friend), an attribute retracted, an entity retracted whole. The
+/// `t` of the middle one.
+fn churnCorpus(fx: *Fx) !u64 {
+    _ = try fx.transact(try fx.arena().print(
+        \\[[:db/add [:person/email "ann@x"] :person/age 31]
+        \\ [:db/add [:person/email "cy@x"] :person/height 1.66]
+        \\ [:db/add [:person/email "di@x"] :person/active false]
+        \\ [:db/retract [:person/email "bob@x"] :person/tags :blue]
+        \\ [:db/retract [:person/email "ann@x"] :person/bio "{s}"]
+        \\ [:db/retract [:person/email "bob@x"] :person/friend [:person/email "ann@x"]]
+        \\ [:db/retract [:person/email "ed@x"] :person/role]
+        \\ [:db/retractEntity [:order/number 4]]]
+    , .{long_bio_a}));
+    const mid = try fx.transact(try fx.arena().print(
+        \\[[:db/add [:person/email "bob@x"] :person/tags :blue]
+        \\ [:db/add [:person/email "ann@x"] :person/bio "{s}"]
+        \\ [:db/add [:person/email "ann@x"] :person/age 30]
+        \\ [:db/add [:person/email "di@x"] :person/bio "{s}"]
+        \\ [:db/add [:person/email "ed@x"] :person/name "Ed"]]
+    , .{ long_bio_x, long_bio_a }));
+    _ = try fx.transact(try fx.arena().print(
+        \\[[:db/add [:person/email "bob@x"] :person/friend [:person/email "ann@x"]]
+        \\ [:db/add [:person/email "ann@x"] :person/bio "{s}"]
+        \\ [:db/add [:person/email "di@x"] :person/active true]
+        \\ [:db/add [:person/email "cy@x"] :person/tags :blue]]
+    , .{long_bio_a}));
+    return mid.t;
+}
+
+test "corpus: over a churned store, every query agrees with the naive evaluator in four views" {
+    const fx = try Fx.init("q_churn");
+    defer fx.deinit();
+    try loadCorpus(fx);
+    const mid = try churnCorpus(fx);
+    const now = try fx.db();
+    churned = true;
+    defer churned = false;
+    for ([_]DbValue{ now, now.asOf(mid), now.sinceT(mid - 1), now.withHistory() }) |view| {
+        try patternsCorpus(fx, view);
+        try notOrCorpus(fx, view);
+        try rulesCorpus(fx, view);
+    }
 }
 
 test "corpus: as-of, since, history views" {

@@ -1568,8 +1568,7 @@ const Ctx = struct {
     }
 
     /// The value of a current row. An out-of-line payload lives in the
-    /// fact's EAVT-h assertion rows alone, so it is read by the EAVT
-    /// fact.
+    /// fact's current EAVT row alone, so it is read by the EAVT fact.
     fn valFromParts(self: *Ctx, parts: key.Parts) !Val {
         const kv = try key.decodeVal(self.arena, parts.v);
         if (kv == .val) return kv.val;

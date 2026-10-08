@@ -38,14 +38,14 @@ const tree_names = nextomic.store.tree_names;
 const Pin = struct { tree: []const u8, entries: u64, key: u64, value: u64, pages: u64 };
 
 const pinned = [_]Pin{
-    .{ .tree = "nx/eavt", .entries = 11489, .key = 224829, .value = 68934, .pages = 29 },
+    .{ .tree = "nx/eavt", .entries = 11489, .key = 224829, .value = 70134, .pages = 30 },
     .{ .tree = "nx/aevt", .entries = 11489, .key = 224829, .value = 68934, .pages = 33 },
     .{ .tree = "nx/avet", .entries = 4846, .key = 99598, .value = 29076, .pages = 17 },
     .{ .tree = "nx/vaet", .entries = 2200, .key = 35200, .value = 13200, .pages = 6 },
-    .{ .tree = "nx/eavt-h", .entries = 11895, .key = 304357, .value = 2100, .pages = 30 },
-    .{ .tree = "nx/aevt-h", .entries = 11895, .key = 304357, .value = 0, .pages = 37 },
-    .{ .tree = "nx/avet-h", .entries = 5246, .key = 138674, .value = 0, .pages = 20 },
-    .{ .tree = "nx/vaet-h", .entries = 2200, .key = 48400, .value = 0, .pages = 6 },
+    .{ .tree = "nx/eavt-h", .entries = 406, .key = 10594, .value = 900, .pages = 1 },
+    .{ .tree = "nx/aevt-h", .entries = 406, .key = 10594, .value = 0, .pages = 1 },
+    .{ .tree = "nx/avet-h", .entries = 400, .key = 10000, .value = 0, .pages = 1 },
+    .{ .tree = "nx/vaet-h", .entries = 0, .key = 0, .value = 0, .pages = 0 },
     .{ .tree = "nx/txlog", .entries = 407, .key = 2442, .value = 221180, .pages = 15 },
     .{ .tree = "nx/fulltext", .entries = 11, .key = 490, .value = 0, .pages = 1 },
 };
@@ -186,9 +186,9 @@ test "a store of a fixed history holds the pinned bytes in every tree, in few pa
     _ = try fx.commit(ops.items);
 
     const end = try measure(fx.tc.conn.store, fx.arena());
-    // A load of new entities writes each datom once to every index it
-    // belongs to and once more to its history twin.
-    for (0..4) |i| try testing.expectEqual(bulk[i].entries, bulk[4 + i].entries);
+    // A load of new entities retires nothing: the history trees hold
+    // no row.
+    for (4..8) |i| try testing.expectEqual(@as(u64, 0), bulk[i].entries);
 
     var ok = true;
     for (pinned) |p| {

@@ -19,9 +19,11 @@ below is a public function or a committed invariant of emdb as it stands
    `[e a v tx added]`. emdb sees byte keys whose unsigned lexicographic
    order is the index order. No engine-side type awareness.
 2. **Current and history are separate trees.** Four current indexes hold
-   only asserted facts and answer ordinary reads with no per-fact fold.
-   Four history indexes hold every assertion and retraction with the
-   transaction in the key and answer `as-of`, `since` and `history`.
+   only asserted facts, each with the `t` of its latest assertion, and
+   answer ordinary reads with no per-fact fold. Four history indexes
+   hold every other row, the retractions and the assertions they
+   retired, with the transaction in the key; `as-of`, `since` and
+   `history` read both merged.
 3. **Logical transaction numbers.** Nextomic mints its own monotonic `t`
    (stored in the `sys` tree, committed atomically with the datoms). The
    engine's `txnId` never appears in a key or an entity id.
@@ -56,7 +58,7 @@ holds on every platform. A store written on macOS arm64 reads on Linux
 x86_64 and the reverse with every datom, history row, ident, txlog
 entry and fulltext row the same (`test/portable/README.md`). Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
-byte array in EAVT-h or a transaction's txlog entry, is at most just
+byte array in EAVT or EAVT-h or a transaction's txlog entry, is at most just
 under 4 GiB, emdb's longest overflow chain; past that the engine
 refuses the write as `:db/value-too-large` and the transaction aborts.
 
@@ -105,11 +107,11 @@ still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]`, which a format-1 row of an out-of-line value may follow with its payload (§2.3) |
+| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
 | `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
 | `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
 | `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or on an assertion row the full payload of an out-of-line value |
+| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
@@ -120,6 +122,15 @@ still holds no read transaction.
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
 fields, so it is `key[prefix .. len - suffix]` with no length byte.
+
+A fact's latest assertion, while the fact is current, lives in the
+current trees alone; a history tree holds every other row of the fact,
+which a retraction writes: the assertion it retires, at that
+assertion's `t`, and itself. So a fact's history rows alternate
+assertion and retraction in ascending `t` and end with a retraction,
+older than its current row when it has one (H1); a fact never
+retracted has none, and a store that only adds facts keeps its history
+trees empty. A read that finds H1 broken is `:db/corrupted`.
 
 ### 2.1 Identifiers
 
@@ -202,15 +213,14 @@ its test pins the digests, since stores hold them).
 The decoder tells the shapes apart by the bare `0x00`: an inline value
 ends there, an out-of-line one continues with `0x01` and the hash.
 Range predicates compare decoded values, never index keys, so they are
-exact on long strings. The full value is the value of each of the
-fact's assertion rows in `nx/eavt-h` and nowhere else in the index
-trees: a current read seeks the fact's latest EAVT-h row, which is its
-assertion while the fact is current; a history read gets its own row,
-and a retraction row, which holds nothing, the row before it, the
-assertion it retracts. An AVET or AEVT hit on a long value is
-confirmed by an EAVT point read before it is returned. A store format
-1 wrote also holds the payload after `t` in the current EAVT row and
-on its retraction rows, which reads take as they find.
+exact on long strings. The full value is stored once for each of the
+fact's assertions and nowhere else in the index trees: after `t` in the
+current EAVT row while the assertion is current, and as the value of
+its `nx/eavt-h` row once a retraction retires it. A current read takes
+it from the EAVT row; a history read gets its own row's, and a
+retraction row, which holds nothing, the row before it, the assertion
+it retracts. An AVET or AEVT hit on a long value is confirmed by an
+EAVT point read before it is returned.
 Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
@@ -224,7 +234,7 @@ past 256 bytes bypasses the clue (a slower seek, not an error).
 
 | key | value |
 |---|---|
-| `"format"` | u16 Nextomic format number: 1 at bootstrap; 2 once a transaction asserts or retracts an out-of-line value, whose current EAVT row holds `t` alone and whose retraction rows hold nothing (§2.2). A build opens every format up to its own (2) and refuses a newer one as `:db/corrupted`, so no build misreads a current long value; a format-1 store needs no migration and becomes 2 in place. A process reads the number when it opens the file: one that already holds the file open when another build raises it reads on under its own format until it reopens |
+| `"format"` | u16 Nextomic format number, 3: the layout of this section's trees, history holding retired rows alone (§2) and a payload stored once (§2.2). A build opens its own format alone: `connect` refuses any other as `{:error :db/corrupted :message "Nextomic store format 2; this build reads format 3. Recreate the store or re-import its data (docs/NEXTOMIC.md §2)" :format 2}`, naming the format the store holds, since no build reads another's rows. Recreate such a store or re-import its data |
 | `"uuid"` | 16 random bytes minted at bootstrap: the store id, stable across renames |
 | `"t"` | u48 last committed logical transaction number |
 | `"eid"` | u48 next user entity id |
@@ -261,7 +271,9 @@ entity's EAVT rows sort before the transaction entities (partition
 rows at the end of each referenced entity's.
 
 `Store.writeBatch` writes each of the eight trees in turn, a current
-tree before its history twin, each in ascending key order; equal keys
+tree before its history twin, each in ascending key order. Only a
+retraction writes a history tree: its two rows there are adjacent and
+ascending, the retired assertion's `t` below its own. Equal keys
 keep their batch order, so a batch leaves the trees exactly as writing
 its datoms one at a time does. A run of keys into one gap fills its
 leaves to about nine tenths, between existing keys as at a tree's end,
@@ -386,8 +398,9 @@ so there is no queue; emdb's write lock is the transactor.
    - `:db/index true` and `:db/unique` may be added, never retracted
      (`:nextomic/conflict`; an explicit `:db/index false` gives way to
      `true`), and the transaction that adds them backfills AVET from
-     the current AEVT rows and `nx/avet-h` from the attribute's whole
-     AEVT history, retractions included, so `index-range` and `datoms`
+     the current AEVT rows and `nx/avet-h` from the attribute's
+     `nx/aevt-h` rows, each retraction and the assertion it retired,
+     so `index-range` and `datoms`
      over a history or as-of view find a value retracted before the
      index existed (an attribute becoming unique while two entities
      hold one value is `:nextomic/unique`). A unique attribute identifies one
@@ -430,12 +443,17 @@ so there is no queue; emdb's write lock is the transactor.
      otherwise) and may be set false again; `:db/doc` is an ordinary
      card-one attribute.
 6. **Write**: for each assertion, put into the current trees (value
-   `[t]`) and append `[.. top]` with `added = 1` to the history trees,
-   an out-of-line value's payload as its `nx/eavt-h` value; for each
-   retraction, delete from the current trees and append `added = 0` to
-   the history trees. EAVT first, then AEVT, then AVET and VAET, each
-   tree in the order §2.5 gives. Then `nx/txlog[t]`, then `sys`
-   counters including `"t"`.
+   `[t]`, and in `nx/eavt` an out-of-line value's payload after it);
+   the history trees take nothing. For each retraction, read the
+   fact's current EAVT row (the `t` of the assertion it retires, and
+   its payload), delete the fact from the current trees, and put two
+   rows in each history tree: the retired assertion, `[.. top]` with
+   that `t` and `added = 1`, its payload as its `nx/eavt-h` value, and
+   the retraction, `[.. top]` with this `t` and `added = 0`. A
+   retraction whose fact has no current EAVT row is `:db/corrupted`.
+   EAVT first, then AEVT, then AVET and VAET, each tree in the order
+   §2.5 gives. Then `nx/txlog[t]`, then `sys` counters including
+   `"t"`.
 7. **Commit**: `wtxn.commit()`, after which the idents the transaction
    minted, renamed or read reach the connection's cache, and its
    attribute counts the cached schema; until then they live in the
@@ -546,17 +564,19 @@ Every operation on a db-value opens one read transaction, reads
 
 - **current mode**, `now == basis`: current trees, no fold. The common
   case: the program has not transacted since taking the db.
-- **current mode**, `now > basis`: history trees with the as-of fold at
+- **current mode**, `now > basis`: current and history trees merged
+  (`Store.MergedScan`), with the as-of fold at
   `basis`. Correct, slower, and only reachable when the program itself
   transacts between taking a db and using it.
 - `now < basis`: `:nextomic/basis-in-future`. Only possible after an
   engine-level rollback of the file; the db-value is dead.
-- **as-of T**: history trees, fold over `top` with `t ≤ T`.
-- **since T**: history trees, fold over `T < t ≤ basis`, from an empty
-  state: an entity asserted before T and untouched since is invisible;
-  a fact retracted after T shows nothing.
-- **history**: history trees, every datom with `t ≤ basis`, no fold,
-  each with its `added` flag. `history` composes with `as-of` and with
+- **as-of T**: current and history trees merged, fold over `t ≤ T`.
+- **since T**: current and history trees merged, fold over
+  `T < t ≤ basis`, from an empty state: an entity asserted before T
+  and untouched since is invisible; a fact retracted after T shows
+  nothing.
+- **history**: current and history trees merged, every datom with
+  `t ≤ basis`, no fold, each with its `added` flag. `history` composes with `as-of` and with
   `since` (`history ∘ since T`: every datom with `T < t ≤ basis`).
   Repeated bounds narrow: `as-of` keeps the older bound and `since`
   the newer, so `(since (since db 3) 1)` is `(since db 3)`.
@@ -573,8 +593,7 @@ history tree together from `setRange(prefix)` while the keys carry the
 prefix, in the order of their fact bytes `(e a v)`, a history key less
 its `top` (`Store.MergedScan`): the rows of one fact form a group in
 ascending `t`, its history rows first, then its current row, whose `t`
-is its value; a current row the history tree also holds as the group's
-last row is read once. Keep the last `added` among datoms inside the
+is its value. Keep the last `added` among datoms inside the
 window; on group end emit the group's newest kept datom iff its `added`
 is 1. Facts that prefix one another (`"a"` and `"a\x00b"`, an inline
 string and its out-of-line sibling) order alike in both trees, since
@@ -608,7 +627,8 @@ transaction: it takes the next `t`, its only datom is its
 `:db/txInstant`, and everything happens in its one write transaction.
 EAVT and EAVT-h lose the datoms by a prefix delete (AEVT and AEVT-h too
 when the attribute is given), the other trees one key at a time from a
-scan of the entity's history rows; the per-attribute counts drop by the
+scan of the entity's EAVT-h and EAVT rows, which together are every
+assertion and retraction it had; the per-attribute counts drop by the
 current rows removed. Every txlog entry that held one of the datoms is
 rewritten without them and marked `{:excised [e ...]}`, the marker
 accumulating across excisions; an emptied entry keeps its place, its
@@ -720,7 +740,9 @@ index is chained by row hash and sized up front. The joined rows are
 gathered column by column from the two sides, and a side whose every
 row comes through once, in order, lends its columns instead.
 Estimates come from `treeStat` and per-attribute counts kept in
-`Schema`.
+`Schema`; the tree size `explain` shows is the current tree's entries
+in the plain view at the newest basis, and the current and history
+trees' together in any other view, which a fold walks merged.
 
 After ordering, a liveness pass gives each step the variables the
 relation drops after it: every variable no later step reads and the
@@ -974,7 +996,7 @@ predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 | `(d/q query & inputs)` / `(d/q {:query query :args [inputs...]})` | §5, inputs positional to `:in`; the arg-map is the same call; Datomic's `:timeout` and `:io-context` keys are accepted and ignored (a query is one read in the caller's thread, with no timer to arm and no I/O to attribute), and any other key is `:nextomic/query-syntax`. `:find` takes `.`, `[...]`, `[[...]]`, aggregates and pull expressions, with `:keys`/`:strs`/`:syms` and `:with`; `:where` takes patterns, predicates, function bindings, `not`/`not-join`/`or`/`or-join`/`and` and rule calls. A relation query returns a persistent set of vectors, or a vector of maps under `:keys` |
 | `(d/explain query & inputs)` / `(d/explain {:query query :args [...]})` | the plan `q` would run, as an aligned table: one numbered line per step with its description (index, estimate, tree size, source when not `$`, bound variables marked `!`, or `unsatisfiable`), the join the step runs (`nested`, one seek per input row; `hash`, one scan of the constant prefix hash-joined on the shared variables; `fixpoint` for a recursive rule; `none` for an unsatisfiable scan) and the estimated rows after the step; sub-plans indent under their step and end with `rows~` |
 | `(d/as-of db t)` / `(d/since db t)` / `(d/history db)` | new db-values (§4) |
-| `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the count of history rows that went |
+| `(d/excise! conn e)` / `(d/excise! conn e attr)` | §4 "Excision"; returns the recording transaction's report plus `:excised [e]` and `:removed`, the count of history rows that went: every assertion and retraction of the datoms, the current ones included |
 | `(d/tx-range conn)` / `(d/tx-range conn from)` / `(d/tx-range conn from to)` | vector of `{:t t :instant i :data [...]}` for `from ≤ t < to`, oldest first, with `:excised [e ...]` on an entry an excision touched; a bound that is `nil` or not given is open |
 | `(d/schema db)` | map ident → `{:db/id :db/ident :db/valueType :db/cardinality :db/index :db/isComponent :db/fulltext}`, plus `:db/unique` and `:db/doc` when the attribute has them in this view; every flag as the view's basis saw it (§4 "Schema as-of") |
 | `(d/pull db pattern e)` | the pattern's map (§6.2); nil when the entity has no datoms in the view. Defined on current, as-of and since views; one read per call |
@@ -1147,12 +1169,18 @@ and `into` call `natives.entityHas` and `natives.entityMap`.
 Tests: `test/prop/nextomic_key.zig` (encoded order equals value order
 per type, longs over all of i64 and its edges) and
 `test/prop/nextomic_tx.zig` (random transactions against an in-memory
-model, at every basis); the corpora
+model, at every basis, facts retracted and asserted again, values that
+prefix one another, excisions and speculative `with`s among them, H1
+checked after every commit); the corpora
 `test/integration/nextomic_q.zig` and `nextomic_pull.zig` against naive
-evaluators over the shared fixture `nextomic_fx.zig`;
+evaluators over the shared fixture `nextomic_fx.zig`, again over a
+churned store in its current, as-of, since and history views;
 `nextomic_fn.zig` (transaction functions, cas, schema alteration,
-excision, full-text) and `nextomic_entity.zig` (the lazy entity through
-the pipeline and under the collector's stress policy); and the
+excision, full-text, the refusal of another format);
+`nextomic_size.zig` (the bytes every tree of a fixed history holds,
+pinned, and the pages it takes, bounded); `nextomic_entity.zig` (the
+lazy entity through the pipeline and under the collector's stress
+policy); and the
 end-to-end scripts `test/nextomic/*.nx`, each diffed against its
 `.out` by `zig build nextomic-nx`.
 
@@ -1175,11 +1203,11 @@ of a long chain probes one hash index with every row it carries.
 
 A transaction costs the pages it writes. Every tree it touches is
 copied on write along a root-to-leaf path: EAVT and AEVT, AVET and
-VAET where its attributes belong, their history twins, the txlog,
-`sys`, and emdb's main and free trees. A new entity of five
-attributes, one of them unique, dirties about 31 pages of 16 KiB, 27
-without the unique one, and a changed datom 19 (stores of 20,000 to
-30,000 entities). emdb copies each page and checksums it at commit;
+VAET where its attributes belong, the history twins of those it
+retracts from, the txlog, `sys`, and emdb's main and free trees. A new
+entity retracts nothing, so it writes no history tree; a changed
+datom writes the history twins of its indexes (`docs/PERF.md` §3.27
+counts the pages). emdb copies each page and checksums it at commit;
 with its puts that is about four fifths of a small transaction's
 instructions, and Nextomic's own work (normalising, tempids,
 expansion, the txlog entry and the report) the rest (`docs/PERF.md`
@@ -1197,9 +1225,10 @@ The engine's public `Txn.txnId` field is not used for time: Nextomic's
 own `t` is read from `sys` inside the same snapshot. Its one use is
 `StoreFile`'s check that a held snapshot is still the file's newest
 commit (`docs/DB.md` §3.4), against `Env.lastTxnId`. Index trees carry only
-`[t]` in current trees and nothing in history trees but an
-out-of-line payload in EAVT-h, read with `Txn.getFromTree` on its
-exact key or with a cursor seek to the fact's latest row. emdb
+`[t]` in current trees, followed in EAVT by an out-of-line payload, and
+nothing in history trees but a retired assertion's payload in EAVT-h,
+read with `Txn.getFromTree` on its exact key or with a cursor seek to
+the row before a retraction. emdb
 returns a value spanning several pages whole, from a cursor or a get,
 assembled in a buffer of the transaction: a read transaction keeps
 every such value until it ends, a write transaction until its next

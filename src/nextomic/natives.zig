@@ -229,9 +229,11 @@ pub const Detail = struct {
     /// `:expected` and `:actual` of a failed `:db.fn/cas`; nil is a
     /// value here, meaning the attribute has none.
     cas: ?struct { expected: Value, actual: Value } = null,
+    /// `:format` of a store refused as another format's.
+    format: ?u16 = null,
 
     fn empty(self: Detail) bool {
-        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null and self.cas == null;
+        return self.message == null and self.clause == null and self.attr == null and self.value == null and self.e == null and self.cas == null and self.format == null;
     }
 };
 
@@ -279,6 +281,9 @@ fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !
     }
     if (detail.attr) |a| m = try champ.mapAssoc(heap, m, try it.internKeywordValue(attr_key), a, &dispatch.hashValue, &dispatch.equal);
     if (detail.value) |v| m = try champ.mapAssoc(heap, m, try it.internKeywordValue("value"), v, &dispatch.hashValue, &dispatch.equal);
+    if (detail.format) |f| {
+        m = try champ.mapAssoc(heap, m, try it.internKeywordValue("format"), value.fromFixnum(f).?, &dispatch.hashValue, &dispatch.equal);
+    }
     if (detail.cas) |c| {
         m = try champ.mapAssoc(heap, m, try it.internKeywordValue("expected"), c.expected, &dispatch.hashValue, &dispatch.equal);
         m = try champ.mapAssoc(heap, m, try it.internKeywordValue("actual"), c.actual, &dispatch.hashValue, &dispatch.equal);
@@ -375,7 +380,14 @@ fn syncOption(vm: *VM, v: Value) !?SyncMode {
 }
 
 fn fnConnect(vm: *VM, args: []const Value) VmError!Value {
-    return connect(vm, args) catch |err| fail(vm, err);
+    var refused: u16 = 0;
+    return connect(vm, args, &refused) catch |err| {
+        if (err != error.Format) return fail(vm, err);
+        // A store of another format names it (NEXTOMIC.md §2.3).
+        var buf: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "Nextomic store format {d}; this build reads format {d}. Recreate the store or re-import its data (docs/NEXTOMIC.md §2)", .{ refused, store_mod.format_version }) catch unreachable;
+        return failWith(vm, err, .{ .message = message, .format = refused });
+    };
 }
 
 /// `{:durability :commit | :durable}`; nil, or no `:durability`, means
@@ -389,9 +401,9 @@ fn durabilityOption(vm: *VM, v: Value) !?SyncMode {
 
 /// The connection is the owner VM's (`vm.home()`), so one a macro
 /// opens outlives the macro's VM, as `db/open`'s does.
-fn connect(vm: *VM, args: []const Value) !Value {
+fn connect(vm: *VM, args: []const Value, refused_format: *u16) !Value {
     const path = try vm_mod.pathArg(args[0]);
-    var options: db_mod.OpenOptions = .{};
+    var options: db_mod.OpenOptions = .{ .refused_format = refused_format };
     if (args.len == 2) options.sync = (try syncOption(vm, args[1])) orelse try durabilityOption(vm, args[1]);
 
     const host = vm.home();

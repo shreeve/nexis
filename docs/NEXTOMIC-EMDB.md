@@ -144,9 +144,12 @@ behind, the data it describes.
 | Physical replication and one-step undo | `Env.backup(sinceTxnId, out)` incremental by transaction id, `Env.restore`, `Env.rollback()`, `EnvOptions.previousSnapshot` (INV-BK01..04, INV-RB01..03) |
 
 Nextomic encodes a current-index key as `[e:6][a:4][v:type-tagged-sortable]`
-(in each index's order) with the 6-byte `t` as the value, and a history
-key as the same bytes followed by `[(t << 1) | added : 6]` with an empty
-value. emdb sees only bytes; the encoding is Nextomic's concern, and the
+(in each index's order) with the 6-byte `t` of the fact's latest
+assertion as the value, and a history key as the same bytes followed by
+`[(t << 1) | added : 6]` with an empty value. A history tree holds only
+retired rows, a retraction and the assertion it retired, so a store
+that only adds facts leaves it empty, and a time view walks a current
+tree and its history twin merged (NEXTOMIC.md §2, §4). emdb sees only bytes; the encoding is Nextomic's concern, and the
 default byte order is exactly the order Nextomic needs.
 
 ---
@@ -178,8 +181,9 @@ path refuses a longer key with `KeyTooLarge`, and `Env.maxKeySize()`
 reports it. The soft bound is the search clue's 256-byte key buffer
 (`clueMaxKey` in `../emdb/src/txn.zig`): a longer key still works but misses the
 clue on every lookup. A string `v` in an index key should therefore be
-capped (a prefix plus a hash, the full string in the fact's `nx/eavt-h`
-assertion rows, NEXTOMIC.md §2.2), which
+capped (a prefix plus a hash, the full string beside `t` in the fact's
+current `nx/eavt` row or on its retired `nx/eavt-h` assertion row,
+NEXTOMIC.md §2.2), which
 keeps the datom key under the soft bound and far under the hard one.
 
 **Page size is a per-file decision and it is 16K.** `EnvOptions.pageSize`
@@ -194,8 +198,9 @@ for inline values and single-page overflow values; a value spanning
 several overflow pages is copied into a buffer of its own that the
 transaction owns (API-KV01). The pointer is valid until the
 transaction's next mutation or its end (API-KV01, INV-FL05). Index trees
-hold `[t]` or nothing, except the out-of-line payloads on EAVT-h
-assertion rows; those and the txlog entries are the multi-page values.
+hold `[t]` or nothing, except the out-of-line payloads in EAVT values
+and on retired EAVT-h assertion rows; those and the txlog entries are
+the multi-page values.
 
 **Read transactions pin reclamation, not memory.** A read transaction
 holds a reader slot; pages freed after its snapshot are not reused while
