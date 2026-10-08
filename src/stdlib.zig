@@ -7409,11 +7409,7 @@ test "stdlib: the image refuses what it cannot carry" {
 }
 
 test "stdlib: reduce, mapv, filterv and the lazy producers call a closure in batches with one call's results" {
-    // Expected values from babashka, which agrees with JVM Clojure
-    // 1.12.6 here but for the second walk after a throw: a block whose
-    // step threw is left unrealized, and the next walk runs its whole
-    // chunk again (docs/LAZY.md §4), where JVM Clojure 1.12.6 and
-    // babashka end the seq at the chunk before, calling nothing.
+    // Expected values from babashka and JVM Clojure 1.12.6.
     const gpa = testing.allocator;
     var rt: ImageTestRuntime = undefined;
     try rt.init();
@@ -7437,14 +7433,15 @@ test "stdlib: reduce, mapv, filterv and the lazy producers call a closure in bat
             .src = "(let [f (fn [a x] (if (= x 31) (->R 1000) (+ (if (number? a) a (:v a)) x)))] [(reduce f 0 (range 64)) (reduce f 0 (vec (range 64))) (reduce f 0 (map identity (vec (range 64))))])",
             .want = "[2520 2520 2520]",
         },
-        // A throw in a chunk's 9th call, walked twice.
+        // A throw in a chunk's 9th call, walked twice: the second walk
+        // ends at the chunk before (docs/LAZY.md §4).
         .{
             .src =
             \\(vec (for [sieve [map filter remove]]
             \\  (let [n (atom 0) s (sieve (fn [x] (swap! n inc) (if (= x 40) (throw :t) (even? x))) (vec (range 64)))]
             \\    [(try (doall s) (catch any e e)) @n (try (doall s) (catch any e e)) @n])))
             ,
-            .want = "[[:t 41 :t 50] [:t 41 :t 50] [:t 41 :t 50]]",
+            .want = "[[:t 41 (true false true false true false true false true false true false true false true false true false true false true false true false true false true false true false true false) 41] [:t 41 (0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30) 41] [:t 41 (1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31) 41]]",
         },
         .{
             .src = "[(mapv (fn [x] (* 2 x)) (vec (range 70))) (mapv (fn [x] (* 2 x)) (map inc (range 40))) (filterv (fn [x] (odd? x)) (vec (range 70))) (vec (remove (fn [x] (odd? x)) (vec (range 40))))]",

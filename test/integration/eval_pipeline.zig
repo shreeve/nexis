@@ -2644,9 +2644,9 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [1 2])] [(realized? s) (first s) (rest s) @n (realized? s) (seq (lazy-seq nil)) (lazy-seq nil) (= (lazy-seq nil) []) (= (lazy-seq nil) nil) (seq? s) (list? s) (class s)])", "[false 1 (2) 1 true nil () true false true false :lazy_seq]");
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (cons 1 (lazy-seq (swap! n inc) nil)))] [(first s) @n (count s) @n (next s) (rest s) (nth s 0) (nth s 3 :d) (empty? s) (count (lazy-seq nil)) (empty? (lazy-seq nil))])", "[1 1 1 2 nil () 1 :d false 0 true]");
     try expectOutput("[(coll? (lazy-seq nil)) (sequential? (lazy-seq nil)) (counted? (lazy-seq nil)) (seqable? (lazy-seq nil)) (vector? (lazy-seq nil)) (instance? :lazy_seq (lazy-seq nil))]", "[true true false true false true]");
-    // A body that throws stays unrealized and runs again, as JVM
-    // Clojure 1.12's LazySeq does (babashka's does not).
-    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x :x 2 false]");
+    // A body that throws is not run again: the next walk finds the
+    // seq ended there, as babashka's (LAZY.md §4).
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (realized? s) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x false nil 1 true]");
     // A body may refer to its own seq; one that forces it recurses
     // until the stack guard stops it.
     try expectOutput("(do (def s (lazy-seq (cons 1 s))) (take 3 s))", "(1 1 1)");
@@ -2655,6 +2655,21 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     // nth is a leaf; over a lazy seq it is re-issued as a full call.
     try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
     try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+}
+
+test "lazy: a step that throws ends the seq at its block on the next walk" {
+    // Expected values from babashka and JVM Clojure 1.12.6: each
+    // function's step throws once, at its sixth call (the 42nd over a
+    // chunk), and the second walk ends where the first stopped,
+    // calling nothing.
+    try expectOutput(
+        \\(defn walk2 [s c] [(try (vec s) (catch any e :t)) @c (try (vec s) (catch any e :t)) @c])
+        \\(defn once-at [c k] (fn [x] (swap! c inc) (if (and (= x k) (= @c (inc k))) (throw :boom) x)))
+        \\[(let [c (atom 0)] (walk2 (map (once-at c 41) (vec (range 64))) c)) (let [c (atom 0)] (walk2 (map (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (filter (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (take-while (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (take 8 (iterate (fn [x] (swap! c inc) (if (and (= x 5) (= @c 6)) (throw :boom) (inc x))) 0)) c)) (let [c (atom 0)] (walk2 (partition 2 (map (once-at c 5) (apply list (range 8)))) c)) (let [c (atom 0)] (walk2 (concat [:a] (map (once-at c 5) (apply list (range 8)))) c)) (let [c (atom 0)] (walk2 (distinct (map (once-at c 5) (apply list (range 8)))) c))]
+    , "[[:t 42 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31] 42] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4 5] 6] [:t 6 [(0 1) (2 3)] 6] [:t 6 [:a 0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6]]");
+    // A lazy-seq body of the program's own: babashka's, and JVM
+    // Clojure's when the body reads its captured seq first.
+    try expectOutput("(let [c (atom 0) s ((fn step [i] (lazy-seq (when (and (= i 3) (= (swap! c inc) 1)) (throw :boom)) (when (< i 6) (cons i (step (inc i)))))) 0)] [(try (vec s) (catch any e e)) (vec s) @c])", "[:boom [0 1 2] 1]");
 }
 
 test "leaf natives: what a leaf body refuses goes the general way from every call site" {
@@ -2991,9 +3006,8 @@ test "lazy: transducers, transduce, into and sequence with an xform, eduction, c
     // sequence's outputs are what reached its accumulator: a reduced
     // value ends the walk and is not one (bb, as JVM Clojure 1.12).
     try expectOutput("[(sequence (halt-when #{3}) [0 1 2 3 4]) (take 5 (sequence (halt-when #{3}) (range))) (sequence (halt-when #{3} (fn [r x] [:r x])) [0 1 2 3 4]) (sequence (comp (halt-when #{1}) (partition-all 2)) [0 1 2]) (sequence (comp (partition-all 2) (halt-when #(= % [2 3]))) (range 10))]", "[(0 1 2) (0 1 2) (0 1 2) ([0]) ([0 1])]");
-    // A step that throws runs again from its source position, with the
-    // transducer's state as the failure left it (LAZY.md §9).
-    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once (0 1)]");
+    // A step that throws ends the seq at its block (LAZY.md §9).
+    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once ()]");
     // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
     // one input past them), its completion once.
     try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");
