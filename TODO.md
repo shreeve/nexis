@@ -20,13 +20,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     one is `:reader-error`; Clojure loads it. Compiling each Form as
     read, through a hook beside `CompilerHooks` (`src/compile.zig`),
     would load it as a file does (`docs/STDLIB.md`, `load-string`).
-16. **The image loader trusts an immediate's payload.** A debug or safe
-    build's load of the stdlib image refuses a damaged reference as
-    `Corrupt`, but `Loader.ref`'s immediate arm (`src/image.zig`)
-    accepts a reserved immediate kind and a char or fixnum payload
-    out of range. The build never writes one, and a release build
-    trusts its image by design (`docs/STDLIB.md` §1); checking each
-    immediate's kind and range closes the last gap.
 
 ## Performance
 
