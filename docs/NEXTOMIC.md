@@ -565,11 +565,18 @@ A time argument `T` is a transaction number `t` (what a report's `:tx`
 and its rows carry) or a transaction entity id `2^46 | t`; a negative
 `T` is the VM's `:invalid-argument`.
 
-**The fold** (`Store.FoldScan`). Walk from `setRange(prefix)` while the
-key carries the prefix; consecutive keys with equal `(e a v)` form a
-group in ascending `t`; keep the last `added` among datoms inside the
+**The fold** (`Store.FoldScan`). Walk the index's current tree and its
+history tree together from `setRange(prefix)` while the keys carry the
+prefix, in the order of their fact bytes `(e a v)`, a history key less
+its `top` (`Store.MergedScan`): the rows of one fact form a group in
+ascending `t`, its history rows first, then its current row, whose `t`
+is its value; a current row the history tree also holds as the group's
+last row is read once. Keep the last `added` among datoms inside the
 window; on group end emit the group's newest kept datom iff its `added`
-is 1.
+is 1. Facts that prefix one another (`"a"` and `"a\x00b"`, an inline
+string and its out-of-line sibling) order alike in both trees, since
+`top` begins with a zero byte below `t = 2^39` and the longer fact
+continues with an escape or the out-of-line mark (§2.2).
 
 **Schema as-of.** `Schema` is built at the newest basis from the
 history of the attribute partition: every assertion and retraction of

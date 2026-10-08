@@ -851,36 +851,91 @@ pub const Store = struct {
         }
     };
 
-    /// A history row: the key without `top`, `t` and `added`. The fact
-    /// borrows the transaction's snapshot.
+    /// One row of a fact's timeline: the key without `top`, `t` and
+    /// `added`. The fact borrows the transaction's snapshot.
     pub const HistoryRow = struct {
         fact: []const u8,
         t: u64,
         added: bool,
+        /// The fact's current-tree row, its latest assertion, whose `t`
+        /// is the row's value.
+        current: bool = false,
     };
 
-    /// The §4 fold over a history tree: rows in `[start, end)` grouped
-    /// by their fact bytes (everything before `top`); consecutive rows
-    /// of one fact ascend in `t`; the last row inside the window wins
-    /// and is emitted iff it is an assertion. `.all` emits every row in
-    /// the window unfolded.
+    /// The rows of one index in `[start, end)` from its current tree and
+    /// its history twin together: every fact in order, and each fact's
+    /// rows in ascending `t`, its history rows before its current row.
+    /// The trees are compared by fact bytes, a history key less its
+    /// `top`: a current key is a byte prefix of its own history keys,
+    /// so raw keys would put it first. Facts that prefix one another
+    /// (`"a"` and `"a\x00b"`, an inline value and its out-of-line
+    /// sibling) sort alike in both trees: `top` starts with a zero byte
+    /// below `t = 2^39`, and a fact that continues a shorter one has an
+    /// escape (`0xFF`) or the out-of-line mark (`0x01`) there
+    /// (NEXTOMIC.md §2.2). A current row the history tree also holds,
+    /// as its fact's last row, is that row, and is read once.
+    pub const MergedScan = struct {
+        cur: Scan,
+        hist: Scan,
+        cur_row: ?KeyValue = null,
+        hist_row: ?KeyValue = null,
+        /// The last history row read, against which a current row is
+        /// told apart from a history row it repeats.
+        last: ?HistoryRow = null,
+
+        pub fn next(self: *MergedScan) !?HistoryRow {
+            while (true) {
+                if (self.cur_row == null) self.cur_row = try self.cur.next();
+                if (self.hist_row == null) self.hist_row = try self.hist.next();
+                const c = self.cur_row;
+                if (self.hist_row) |h| {
+                    if (h.key.len < key.top_len) return error.Corrupted;
+                    const fact = h.key[0 .. h.key.len - key.top_len];
+                    if (c == null or std.mem.order(u8, fact, c.?.key) != .gt) {
+                        self.hist_row = null;
+                        const top = try key.readTop(h.key[fact.len..][0..key.top_len]);
+                        const r: HistoryRow = .{ .fact = fact, .t = top.t, .added = top.added };
+                        self.last = r;
+                        return r;
+                    }
+                }
+                const row = c orelse return null;
+                self.cur_row = null;
+                if (row.value.len < key.id_len) return error.Corrupted;
+                const r: HistoryRow = .{ .fact = row.key, .t = try key.readT(row.value[0..key.id_len]), .added = true, .current = true };
+                if (self.last) |l| if (l.added and l.t == r.t and std.mem.eql(u8, l.fact, r.fact)) continue;
+                return r;
+            }
+        }
+    };
+
+    /// The merged rows of `index` in `[start, end)` (an absent `end`
+    /// runs to the trees' last keys). The history walk reads keys
+    /// alone: an EAVT-h row's payload is read for the one datom that
+    /// needs it, never assembled for every row the walk passes.
+    pub fn mergedScan(txn: *Txn, trees: Trees, index: Index, start: []const u8, end: ?[]const u8) !MergedScan {
+        var hist = try scanRange(txn, trees.hist(index), start, end);
+        hist.cursor.keysOnly = true;
+        return .{ .cur = try scanRange(txn, trees.cur(index), start, end), .hist = hist };
+    }
+
+    /// The §4 fold over an index's merged rows: rows grouped by their
+    /// fact bytes ascend in `t`; the last row inside the window wins and
+    /// is emitted iff it is an assertion. `.all` emits every row in the
+    /// window unfolded.
     pub const FoldScan = struct {
-        inner: Scan,
+        inner: MergedScan,
         window: Window,
         pending: ?HistoryRow = null,
         exhausted: bool = false,
 
         pub fn next(self: *FoldScan) !?HistoryRow {
             while (!self.exhausted) {
-                const row = (try self.inner.next()) orelse {
+                const r = (try self.inner.next()) orelse {
                     self.exhausted = true;
                     break;
                 };
-                if (row.key.len < key.top_len) continue;
-                const fact_len = row.key.len - key.top_len;
-                const top = try key.readTop(row.key[fact_len..][0..key.top_len]);
-                if (!self.window.contains(top.t)) continue;
-                const r: HistoryRow = .{ .fact = row.key[0..fact_len], .t = top.t, .added = top.added };
+                if (!self.window.contains(r.t)) continue;
                 if (self.window == .all) return r;
                 if (self.pending) |p| {
                     if (std.mem.eql(u8, p.fact, r.fact)) {
@@ -901,13 +956,8 @@ pub const Store = struct {
         }
     };
 
-    /// The fold reads keys alone: an EAVT-h assertion row's payload is
-    /// read for the one datom that needs it (`getHistory`), never
-    /// assembled for every row the walk passes.
-    pub fn foldScan(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
-        var inner = try scanRange(txn, tree, start, end);
-        inner.cursor.keysOnly = true;
-        return .{ .inner = inner, .window = window };
+    pub fn foldScan(txn: *Txn, trees: Trees, index: Index, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
+        return .{ .inner = try mergedScan(txn, trees, index, start, end), .window = window };
     }
 
     /// Number of entries in `tree` at the transaction's snapshot.
@@ -1159,7 +1209,7 @@ test "a page that fails its check ends a scan with an error, never early" {
     defer txn.abort();
     var s = try Store.scan(txn, store.trees.cur(.eavt), &.{});
     try testing.expectError(error.InvalidPage, s.next());
-    var f = try Store.foldScan(txn, store.trees.hist(.eavt), &.{}, null, .{ .as_of = 1 });
+    var f = try Store.foldScan(txn, store.trees, .eavt, &.{}, null, .{ .as_of = 1 });
     try testing.expectError(error.InvalidPage, f.next());
     try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, fact[key.id_len + key.attr_len ..], arena));
 }
@@ -1379,7 +1429,6 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     defer txn.abort();
     const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
     const end = (try key.successor(arena, prefix)).?;
-    const tree = store.trees.hist(.eavt);
 
     const Expect = struct { window: Store.Window, facts: []const u64 };
     const cases = [_]Expect{
@@ -1393,7 +1442,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
     };
     for (cases) |c| {
-        var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
+        var fs = try Store.foldScan(txn, store.trees, .eavt, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
         while (try fs.next()) |r| {
             try testing.expect(r.added);
@@ -1404,7 +1453,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         try testing.expectEqualSlices(u64, c.facts, got.items);
     }
     // History mode sees all five rows in t order with their flags.
-    var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
+    var all = try Store.foldScan(txn, store.trees, .eavt, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
     while (try all.next()) |r| {
@@ -1738,4 +1787,78 @@ test "a copy of a store file is another file: its uuid is shared, its writer is 
     defer ta.abort();
     const tb = try b.beginWrite(.none);
     tb.abort();
+}
+
+test "a merged scan orders facts by their bytes, each fact's history before its current row" {
+    var td = try TestDir.init("store_merged");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Facts that prefix one another: "a", "a\x00", "a\x00b", a 64-byte
+    // inline string and its out-of-line sibling, each with rows in
+    // the current tree, the history tree or both.
+    const e: u64 = 1 << 33;
+    const inline64 = &@as([key.prefix_len]u8, @splat('x'));
+    const long = inline64 ++ "and more, past the inline limit of ninety-six bytes, so out of line";
+    const Row = struct { v: []const u8, t: u64, added: bool, current: bool };
+    const rows = [_]Row{
+        .{ .v = "a", .t = 2, .added = true, .current = false },
+        .{ .v = "a", .t = 3, .added = false, .current = false },
+        .{ .v = "a", .t = 5, .added = true, .current = true },
+        .{ .v = "a\x00", .t = 2, .added = true, .current = false },
+        .{ .v = "a\x00", .t = 6, .added = false, .current = false },
+        .{ .v = "a\x00b", .t = 4, .added = true, .current = true },
+        .{ .v = inline64, .t = 7, .added = true, .current = true },
+        .{ .v = long, .t = 3, .added = true, .current = false },
+        .{ .v = long, .t = 8, .added = false, .current = false },
+        .{ .v = long, .t = 9, .added = true, .current = true },
+        .{ .v = "z", .t = 2, .added = true, .current = false },
+        .{ .v = "z", .t = 2, .added = true, .current = true },
+    };
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        for (rows) |r| {
+            const vb = try key.valBytes(arena, .{ .string = r.v });
+            inline for (.{ Index.eavt, Index.avet }) |ix| {
+                if (r.current) {
+                    var tb: [key.id_len]u8 = undefined;
+                    key.writeId(&tb, r.t);
+                    try txn.putInTree(store.trees.cur(ix), try key.keyBytes(arena, ix, e, 100, vb, null), &tb);
+                } else {
+                    try txn.putInTree(store.trees.hist(ix), try key.keyBytes(arena, ix, e, 100, vb, .{ .t = r.t, .added = r.added }), &.{});
+                }
+            }
+        }
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    inline for (.{ Index.eavt, Index.avet }) |ix| {
+        const prefix = try key.prefixBytes(arena, ix, if (ix == .eavt) .{ .e = e } else .{ .a = 100 });
+        const end = try key.successor(arena, prefix);
+        var m = try Store.mergedScan(txn, store.trees, ix, prefix, end);
+        // Every row but "z"'s current one, which repeats its last
+        // history row, in the order `rows` lists them.
+        for (rows[0 .. rows.len - 1]) |want| {
+            const got = (try m.next()) orelse return error.TestUnexpectedResult;
+            const parts = try key.unpackKey(ix, false, got.fact);
+            try testing.expectEqualSlices(u8, try key.valBytes(arena, .{ .string = want.v }), parts.v);
+            try testing.expectEqual(want.t, got.t);
+            try testing.expectEqual(want.added, got.added);
+            try testing.expectEqual(want.current, got.current);
+        }
+        try testing.expect((try m.next()) == null);
+        // As of 6: "a" (asserted again at 5) and the out-of-line
+        // value (asserted at 3) and "z"; "a\x00" went at 6, and "a\x00b"
+        // came at 4.
+        var f = try Store.foldScan(txn, store.trees, ix, prefix, end, .{ .as_of = 6 });
+        var n: usize = 0;
+        while (try f.next()) |r| : (n += 1) try testing.expect(r.added and r.t <= 6);
+        try testing.expectEqual(@as(usize, 4), n);
+    }
 }

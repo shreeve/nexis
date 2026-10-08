@@ -8,7 +8,8 @@
 //! reads are read-only children of the held write transaction, with
 //! ident and schema caches of its own. Invariants:
 //!   - `now == basis` in current mode reads the current trees with no
-//!     fold; any other view folds the history trees (`Store.FoldScan`).
+//!     fold; any other view folds the current and history trees
+//!     together (`Store.FoldScan` over `Store.MergedScan`).
 //!   - `now < basis` is `error.BasisInFuture`; the db-value is dead.
 //!   - `as-of T` caps the view at `min(basis, T)`; `since T` shows only
 //!     facts asserted after `T`; `history` shows every row unfolded, and
@@ -553,7 +554,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = filter,
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
+            .source = .{ .folded = try Store.foldScan(self.txn, store.trees, index, prefix, end, self.db.window()) },
         };
     }
 
@@ -577,7 +578,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = .{},
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), start, end, self.db.window()) },
+            .source = .{ .folded = try Store.foldScan(self.txn, store.trees, index, start, end, self.db.window()) },
         };
     }
 
@@ -662,39 +663,39 @@ pub const DatomScan = struct {
                     if (!self.filter.passes(self.index, parts)) continue;
                     if (kv.value.len < key.id_len) return error.Corrupted;
                     const t = try key.readT(kv.value[0..key.id_len]);
-                    return try self.materialise(parts, t, true);
+                    return try self.materialise(parts, .{ .fact = kv.key, .t = t, .added = true, .current = true });
                 },
                 .folded => |*s| {
                     const r = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, r.fact);
                     if (!self.filter.passes(self.index, parts)) continue;
-                    return try self.materialise(parts, r.t, r.added);
+                    return try self.materialise(parts, r);
                 },
             }
         }
     }
 
-    fn materialise(self: *DatomScan, parts: key.Parts, t: u64, added: bool) !Datom {
+    fn materialise(self: *DatomScan, parts: key.Parts, row: Store.HistoryRow) !Datom {
         const kv = try key.partsVal(self.arena, self.index, parts);
         const v: Val = switch (kv) {
             .val => |x| x,
-            .string_long => .{ .string = try self.payload(parts, t, added) },
-            .bytes_long => .{ .bytes = try self.payload(parts, t, added) },
+            .string_long => .{ .string = try self.payload(parts, row) },
+            .bytes_long => .{ .bytes = try self.payload(parts, row) },
         };
-        return .{ .e = parts.e, .a = parts.a, .v = v, .t = t, .added = added };
+        return .{ .e = parts.e, .a = parts.a, .v = v, .t = row.t, .added = row.added };
     }
 
-    /// The full out-of-line value from the EAVT-h payload of this exact
-    /// datom (current or history), read with `getFromTree` and copied
-    /// into the arena: a multi-page value is assembled in the
-    /// transaction's own buffer, which dies with the transaction.
-    fn payload(self: *DatomScan, parts: key.Parts, t: u64, added: bool) ![]const u8 {
+    /// The full out-of-line value of this exact datom, current or
+    /// history, copied into the arena: a multi-page value is assembled
+    /// in the transaction's own buffer, which dies with the
+    /// transaction.
+    fn payload(self: *DatomScan, parts: key.Parts, row: Store.HistoryRow) ![]const u8 {
         const store = self.read.db.conn.store;
         const vbytes = if (self.index == .vaet) unreachable else parts.v;
-        if (self.source == .current) {
+        if (row.current) {
             return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
-        const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse return error.Corrupted;
+        const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena)) orelse return error.Corrupted;
         return self.arena.dupe(u8, raw);
     }
 };
