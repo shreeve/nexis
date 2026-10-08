@@ -51,17 +51,18 @@ with no server, readable by any number of processes
 git status                        # clean
 zig build install                 # bin/nexis
 ./bin/nexis --help                # usage and the namespaces available without a file
+./bin/nexis --version             # nexis 0.1.0
 zig build test --summary all      # the gate
 ```
 
 The gate's last line is the count of record:
 
 ```
-Build Summary: 220/220 steps succeeded; 1588/1588 tests passed
+Build Summary: 223/223 steps succeeded; 1588/1588 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 218 steps. Any output besides the
+steps; without it the count is 221 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -84,6 +85,24 @@ emdb is private: the checkout reads it with the repository secret
 permission is read-only Contents on `shreeve/emdb`. Without the secret
 every job fails at that checkout, and pull requests from forks never
 receive it.
+
+The release is `build.zig.zon`'s `.version`, 0.1.0, which `nexis
+--version` prints (`docs/TOOLING.md` §1). `.github/workflows/release.yml`
+publishes one: on a pushed tag `v` and that version, it builds the
+optimized `bin/nexis` for `x86_64-linux-musl` (x86-64-v2),
+`aarch64-linux-musl` and `aarch64-macos` (macOS 15 or later, Zig's
+default), each on a runner of its own architecture, strips it (and
+signs the macOS one again, ad hoc), runs a smoke test, archives each as
+`nexis-VERSION-TARGET.tar.gz` (one directory holding exactly
+`bin/nexis`, `README.md`, `LICENSE` and `BUILD-INFO`, which the job
+checks), writes `SHA256SUMS`, and creates the tag's GitHub
+release with `.github/release-notes/vVERSION.md` and the emdb commit
+as its body. A pull request to `main` that changes the workflow, the
+release notes, `build.zig` or `build.zig.zon` runs the same builds as
+a dry run that publishes nothing: it keeps the archives and
+`SHA256SUMS` as the run's artifact and writes the body to the job
+summary. A release takes a version bump,
+its notes file, the gate, and the tag pushed after the merge.
 
 `zig build check-targets` compiles and links every binary and test
 binary for x86_64 and aarch64 Linux, glibc and musl, from any host;
@@ -395,6 +414,17 @@ failing test (AGENTS.md).
    and `shreeve/nexus` at their default branches, so a change there
    that breaks the build shows as a red nexis run. Pinning each to a
    ref, bumped deliberately, is the owner's call.
+4. **Releases publish built binaries, emdb compiled in; emdb's source
+   stays private**, so building from source takes access to it, and
+   no file of the emdb checkout enters an archive or an artifact.
+   Releases name their emdb commit: the release workflow resolves
+   emdb's default branch once and builds every target from that one
+   commit; each archive's `BUILD-INFO`, the job summary and the
+   release body name it, with the nexis commit and the Zig release.
+   nexus is not part of a release build (`src/parser.zig` is
+   committed). A store's file format is emdb's, which is not frozen,
+   so stores do not carry across releases (`docs/DB.md` §1; TODO.md
+   #21).
 
 ---
 

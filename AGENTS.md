@@ -55,7 +55,7 @@ changes to emdb.
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
 | `zig build portable` | `test/portable/write.nx` writes a `db/*` store and a Nextomic store, then `read.nx` dumps them, from one fresh directory, each stdout diffed against its `.out`; the same dump compares a store carried between hosts (`test/portable/README.md`) |
-| `zig build test --summary all` | the gate, 220 steps (218 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
+| `zig build test --summary all` | the gate, 223 steps (221 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
@@ -93,6 +93,12 @@ changes to emdb.
   variable exported in the shell never reaches a test.
 - `HANDOFF.md` §2 carries the gate's test count of record and what CI
   (`.github/workflows/ci.yml`) runs.
+- `build.zig.zon`'s `.version` is the release `bin/nexis --version`
+  prints. A release bumps it, adds `.github/release-notes/vX.Y.Z.md`,
+  passes the gate and, once merged, pushes the tag `vX.Y.Z`;
+  `.github/workflows/release.yml` builds and publishes it, and a pull
+  request that changes it or the build files runs it as a dry run
+  (HANDOFF §2).
 
 ---
 
@@ -155,6 +161,8 @@ nexis/
 ├── TODO.md                      problems found and not yet fixed
 ├── build.zig, build.zig.zon     emdb is a path dependency (../emdb)
 ├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, codegen, fmt, parser-check, an optimized build
+├── .github/workflows/release.yml a tag vX.Y.Z: the release archives, SHA256SUMS and the GitHub release (HANDOFF §2)
+├── .github/release-notes/       each release's notes, vX.Y.Z.md, the release's body
 ├── nexis.grammar                reader grammar (source of truth for src/parser.zig)
 ├── src/
 │   ├── root.zig                 the `nexis` module: declares every runtime file, bottom-up

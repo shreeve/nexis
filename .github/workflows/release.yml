@@ -1,0 +1,254 @@
+# nexis releases: on a pushed tag `vX.Y.Z`, the optimized bin/nexis for
+# three targets, each in an archive with its build record, a SHA256SUMS
+# file, and the GitHub release of the tag carrying them.
+#
+#   x86_64-linux-musl   static, built for x86-64-v2 as ci.yml's job is
+#   aarch64-linux-musl  static
+#   aarch64-macos       Apple silicon, macOS 15 or later (Zig's default)
+#
+# Each target builds on a runner of its own architecture, so each
+# binary runs its smoke test where it was built, after it is stripped. An archive is
+# `nexis-VERSION-TARGET.tar.gz`, one directory of the same name
+# holding bin/nexis, README.md, LICENSE and BUILD-INFO (the nexis tag
+# and commit, the emdb commit, the Zig version, the target and CPU),
+# and nothing else: emdb is compiled into the binary, and no file of
+# its source, nor any other file, enters an archive or an artifact.
+#
+# The `prepare` job settles what every build uses: the version, from
+# build.zig.zon's `.version` (a tag must be `v` and that version), and
+# the one emdb commit every target checks out, so the three binaries
+# are built from the same engine. emdb is private: the checkout reads
+# it with the repository secret EMDB_TOKEN, as ci.yml's do. nexus is
+# not needed: src/parser.zig is committed.
+#
+# A pull request that changes this file, the release notes or the
+# build files runs everything but the publication, as a dry run: the
+# three archives and SHA256SUMS are kept as the run's artifact, and
+# the release body goes to the job summary. The release body is
+# `.github/release-notes/vX.Y.Z.md` and a line naming the emdb commit.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - .github/release-notes/**
+      - build.zig
+      - build.zig.zon
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  prepare:
+    name: version and emdb commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.settle.outputs.version }}
+      tag: ${{ steps.settle.outputs.tag }}
+      emdb: ${{ steps.settle.outputs.emdb }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          path: emdb
+      - name: version, tag, release notes and emdb commit
+        id: settle
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' nexis/build.zig.zon)
+          test -n "$version" || { echo "::error::build.zig.zon has no .version"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag=$GITHUB_REF_NAME
+            test "$tag" = "v$version" || { echo "::error::tag $tag is not v$version, build.zig.zon's version"; exit 1; }
+          else
+            tag=v$version
+          fi
+          notes=nexis/.github/release-notes/$tag.md
+          test -s "$notes" || { echo "::error::no release notes at ${notes#nexis/}"; exit 1; }
+          emdb=$(git -C emdb rev-parse HEAD)
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "emdb=$emdb"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            cpu: x86_64_v2
+            os: ubuntu-latest
+          - target: aarch64-linux-musl
+            cpu: baseline
+            os: ubuntu-24.04-arm
+          - target: aarch64-macos
+            cpu: baseline
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      EMDB: ${{ needs.prepare.outputs.emdb }}
+      TARGET: ${{ matrix.target }}
+      CPU: ${{ matrix.cpu }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/checkout@v6
+        with:
+          repository: shreeve/emdb
+          token: ${{ secrets.EMDB_TOKEN }}
+          ref: ${{ needs.prepare.outputs.emdb }}
+          path: emdb
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          cache-key: ${{ hashFiles('nexis/build.zig.zon') }}
+      - name: optimized bin/nexis
+        working-directory: nexis
+        run: |
+          stage=nexis-$VERSION-$TARGET
+          echo "STAGE=$stage" >> "$GITHUB_ENV"
+          zig build install -Doptimize=fast -Dtarget="$TARGET" -Dcpu="$CPU" --prefix "$RUNNER_TEMP/$stage"
+          # Without its debug information: 3.6 MB instead of 20 for
+          # x86_64-linux-musl. On macOS stripping voids the linker's
+          # ad hoc signature, which Apple silicon needs to run it.
+          strip "$RUNNER_TEMP/$stage/bin/nexis"
+          if [ "$RUNNER_OS" = macOS ]; then codesign --force --sign - "$RUNNER_TEMP/$stage/bin/nexis"; fi
+      - name: smoke test
+        run: |
+          nexis=$RUNNER_TEMP/$STAGE/bin/nexis
+          file "$nexis"
+          case $TARGET in
+            *-linux-musl) file "$nexis" | grep -q 'statically linked' ;;
+          esac
+          test "$("$nexis" --version)" = "nexis $VERSION"
+          test "$("$nexis" -e '(reduce + (range 101))')" = 5050
+      - name: archive
+        run: |
+          nexis_sha=$(git -C nexis rev-parse HEAD)
+          emdb_sha=$(git -C emdb rev-parse HEAD)
+          test "$emdb_sha" = "$EMDB"
+          cp nexis/README.md nexis/LICENSE "$RUNNER_TEMP/$STAGE/"
+          {
+            echo "nexis $VERSION"
+            echo "nexis tag $TAG"
+            echo "nexis commit $nexis_sha"
+            echo "emdb commit $emdb_sha"
+            echo "zig $(zig version)"
+            echo "target $TARGET"
+            echo "cpu $CPU"
+            echo "optimize fast"
+          } > "$RUNNER_TEMP/$STAGE/BUILD-INFO"
+          mkdir -p dist
+          # COPYFILE_DISABLE: no AppleDouble `._` entries on macOS.
+          COPYFILE_DISABLE=1 tar -C "$RUNNER_TEMP" -czf "dist/$STAGE.tar.gz" "$STAGE"
+          tar -tzvf "dist/$STAGE.tar.gz"
+          # Exactly these entries: the binary, README, LICENSE and
+          # BUILD-INFO, so nothing of the emdb checkout can ride along.
+          printf '%s\n' "$STAGE/" "$STAGE/BUILD-INFO" "$STAGE/LICENSE" "$STAGE/README.md" "$STAGE/bin/" "$STAGE/bin/nexis" > expected
+          tar -tzf "dist/$STAGE.tar.gz" | LC_ALL=C sort > listed
+          diff expected listed
+          {
+            echo "### $STAGE.tar.gz"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/$STAGE/BUILD-INFO"
+            echo
+            cat listed
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.STAGE }}
+          path: dist/${{ env.STAGE }}.tar.gz
+          if-no-files-found: error
+
+  # Collects the archives, writes SHA256SUMS and the release body, and,
+  # on a tag, creates the release. A pull request stops before the
+  # release and keeps the archives and SHA256SUMS as an artifact.
+  release:
+    name: release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      EMDB: ${{ needs.prepare.outputs.emdb }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: nexis
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: nexis-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS and the release body
+        run: |
+          ls dist/*.tar.gz
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 3
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          {
+            cat "nexis/.github/release-notes/$TAG.md"
+            echo
+            echo "Built against emdb commit \`$EMDB\` (shreeve/emdb) with Zig $ZIG_VERSION."
+          } > dist/RELEASE-NOTES.md
+          {
+            echo "## nexis $VERSION ($TAG)"
+            echo
+            echo "emdb commit \`$EMDB\`"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo '### Release body'
+            echo
+            cat dist/RELEASE-NOTES.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: create the release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "nexis $VERSION" \
+            --notes-file dist/RELEASE-NOTES.md
+      # The archives and SHA256SUMS only, what the release would carry.
+      - name: keep the dry run's release
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dry-run
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
