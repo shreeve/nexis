@@ -9,11 +9,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ## Gaps
 
-14. **Nextomic refuses a datom form written as a list.** `[(list
-    :db/add e a v)]` is `:nextomic/tx-data` ("a form is a vector or a
-    map"); Datomic accepts any sequential form, and a lazy seq of forms
-    is already converted at the boundary. Accept a list where a vector
-    form is accepted (`docs/NEXTOMIC.md` §3).
 15. **`load-string` refuses a syntax-quote.** It reads each form as
     data and evaluates it, and a syntax-quote has no data form (the
     reader leaves a marker the macroexpander expands), so text holding

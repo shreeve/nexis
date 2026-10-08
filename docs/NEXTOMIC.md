@@ -267,10 +267,13 @@ so there is no queue; emdb's write lock is the transactor.
    the transaction's `:sync` or else its connection's durability;
    `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]` ops. tx-data is a vector or a
-   list of forms, each a list form or a map form (a hash map or a
-   sorted map, as Datomic takes any map); anything else, or a malformed
-   form, is
-   `:nextomic/tx-data` with a `:message`. Entities may be an eid, a
+   list of forms, each a list form `[op e ...]` (a vector or a list,
+   as Datomic takes any sequential form: `[:db/add e a v]` and `(list
+   :db/add e a v)` are one form, and so are `:db/retract`,
+   `:db/retractEntity`, `:db.fn/cas` and `:db.fn/call`) or a map form
+   (a hash map or a sorted map, as Datomic takes any map); anything
+   else, or a malformed form, is `:nextomic/tx-data` with a
+   `:message`. Entities may be an eid, a
    tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`
    (`[:db/ident :kw]` names the entity that ident names), a keyword
    ident, or `"datomic.tx"` for the transaction entity. An explicit
@@ -925,8 +928,8 @@ A lazy seq is a list to every native (`docs/LAZY.md` §8): each native
 realizes its arguments and walks every lazy seq in them as the list of
 its elements (`seq.asLists`) before it opens a transaction or a read,
 so tx-data, a query, its inputs and a pull pattern may be built
-lazily wherever a list is taken (a datom form and a lookup ref are
-vectors, so a lazy one is not), and no code runs while store state is
+lazily wherever a list is taken (a datom form included; a lookup ref
+is a vector, so a lazy one is not), and no code runs while store state is
 in flight; a body's throw propagates from the native before it
 starts. A
 transaction function's result, and a function's result a query binds

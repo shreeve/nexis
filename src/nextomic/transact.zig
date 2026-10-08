@@ -786,66 +786,76 @@ const Ctx = struct {
     }
 
     fn normaliseForm(self: *Ctx, form: Value) anyerror!void {
-        switch (form.kind()) {
-            .persistent_vector => {
-                const n = vector_mod.count(form);
-                if (n < 2) return self.malformed("a vector form is [op e ...]");
-                const op = vector_mod.nth(form, 0);
-                if (self.kwIs(op, "db.fn/call")) {
-                    try self.normaliseCall(form);
-                } else if (self.kwIs(op, "db.fn/cas")) {
-                    if (n != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
-                    const attr = try self.attrFromVm(vector_mod.nth(form, 2));
-                    if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident");
-                    const e = try self.entityFromVm(vector_mod.nth(form, 1));
-                    const old_v = vector_mod.nth(form, 3);
-                    const op_cas = try self.arena.create(CasOp);
-                    op_cas.* = .{ .e = e, .attr = attr, .old = if (old_v.isNil()) null else try self.valueFromVm(attr, old_v, .match), .written = old_v, .new = try self.valueFromVm(attr, vector_mod.nth(form, 4), .assert) };
-                    try self.ops.append(self.arena, .{ .cas = op_cas });
-                } else if (self.kwIs(op, "db/add")) {
-                    if (n != 4) return self.malformed(":db/add is [:db/add e a v]");
-                    const attr = try self.attrFromVm(vector_mod.nth(form, 2));
-                    const e = try self.entityFromVm(vector_mod.nth(form, 1));
-                    try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, vector_mod.nth(form, 3), .assert) } });
-                } else if (self.kwIs(op, "db/retract")) {
-                    if (n != 3 and n != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]");
-                    const attr = try self.attrFromVm(vector_mod.nth(form, 2));
-                    const e = try self.entityFromVm(vector_mod.nth(form, 1));
-                    if (n == 3) {
-                        try self.ops.append(self.arena, .{ .retract_attr = .{ .e = e, .attr = attr } });
-                    } else {
-                        try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, vector_mod.nth(form, 3), .match) } });
-                    }
-                } else if (self.kwIs(op, "db/retractEntity")) {
-                    if (n != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
-                    try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(vector_mod.nth(form, 1)) });
-                } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
-            },
-            .persistent_map, .sorted_map => _ = try self.normaliseMap(form),
-            else => return self.malformed("a form is a vector or a map"),
+        if (isMapForm(form)) {
+            _ = try self.normaliseMap(form);
+            return;
         }
+        const f = (try self.listForm(form)) orelse return self.malformed("a form is a vector, a list or a map");
+        if (f.len < 2) return self.malformed("a list form is [op e ...]");
+        const op = f[0];
+        if (self.kwIs(op, "db.fn/call")) {
+            try self.normaliseCall(f);
+        } else if (self.kwIs(op, "db.fn/cas")) {
+            if (f.len != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
+            const attr = try self.attrFromVm(f[2]);
+            if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident");
+            const e = try self.entityFromVm(f[1]);
+            const op_cas = try self.arena.create(CasOp);
+            op_cas.* = .{ .e = e, .attr = attr, .old = if (f[3].isNil()) null else try self.valueFromVm(attr, f[3], .match), .written = f[3], .new = try self.valueFromVm(attr, f[4], .assert) };
+            try self.ops.append(self.arena, .{ .cas = op_cas });
+        } else if (self.kwIs(op, "db/add")) {
+            if (f.len != 4) return self.malformed(":db/add is [:db/add e a v]");
+            const attr = try self.attrFromVm(f[2]);
+            const e = try self.entityFromVm(f[1]);
+            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .assert) } });
+        } else if (self.kwIs(op, "db/retract")) {
+            if (f.len != 3 and f.len != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]");
+            const attr = try self.attrFromVm(f[2]);
+            const e = try self.entityFromVm(f[1]);
+            if (f.len == 3) {
+                try self.ops.append(self.arena, .{ .retract_attr = .{ .e = e, .attr = attr } });
+            } else {
+                try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .match) } });
+            }
+        } else if (self.kwIs(op, "db/retractEntity")) {
+            if (f.len != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
+            try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(f[1]) });
+        } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
     }
 
-    /// `[:db.fn/call f arg ...]`: call `f` with `db-before` and the
-    /// arguments, then normalise the tx-data it returns in place of the
-    /// form, where further calls may nest to `max_call_depth`. The
-    /// function value is called, never stored: only the datoms it
-    /// returns reach the trees and the txlog. A nil result is no
-    /// tx-data.
-    fn normaliseCall(self: *Ctx, form: Value) anyerror!void {
+    /// The elements of a list form `[op e ...]`, which, as in Datomic,
+    /// is any sequential form: a vector or a list (a lazy seq arrives
+    /// as a list, §6). A vector's own storage when one chunk holds them
+    /// all, else a copy in the arena; null for any other kind.
+    fn listForm(self: *Ctx, form: Value) !?[]const Value {
+        switch (form.kind()) {
+            .persistent_vector => if (vector_mod.count(form) > 0) {
+                const chunk = vector_mod.chunkFrom(form, 0);
+                if (chunk.len == vector_mod.count(form)) return chunk;
+            },
+            .list => {},
+            else => return null,
+        }
+        return marshal.collection(self.arena, form);
+    }
+
+    /// `[:db.fn/call f arg ...]`, its elements `form`: call `f` with
+    /// `db-before` and the arguments, then normalise the tx-data it
+    /// returns in place of the form, where further calls may nest to
+    /// `max_call_depth`. The function value is called, never stored:
+    /// only the datoms it returns reach the trees and the txlog. A nil
+    /// result is no tx-data.
+    fn normaliseCall(self: *Ctx, form: []const Value) anyerror!void {
         try stack.check();
         const hook = self.hook orelse return self.txFn("transaction functions run inside transact! and with only");
-        const f = vector_mod.nth(form, 1);
+        const f = form[1];
         switch (f.kind()) {
             .function, .native_fn, .symbol => {},
             else => return self.malformed(":db.fn/call takes a function or a symbol naming one"),
         }
         if (self.call_depth >= max_call_depth) return self.txFn(std.fmt.comptimePrint("transaction functions nest past {d} calls", .{max_call_depth}));
-        const n = vector_mod.count(form);
-        const args = try self.arena.alloc(Value, n - 2);
-        for (args, 2..) |*a, i| a.* = vector_mod.nth(form, i);
         const db_before = self.conn.at(self.now);
-        const result = try hook.call(hook.ctx, f, db_before, args);
+        const result = try hook.call(hook.ctx, f, db_before, form[2..]);
         if (result.isNil()) return;
         self.call_depth += 1;
         defer self.call_depth -= 1;
