@@ -564,6 +564,37 @@ pub const CaptureDescriptor = struct {
     sources: []const CaptureSource,
 };
 
+/// The clauses of a multi-arity `fn`, one routine each (VM.md §5):
+/// `fixed[i]` is the clause taking exactly `i` arguments, null where
+/// none does, and `rest` the clause with a rest parameter. Every
+/// member points at the table; a closure names its first clause, and
+/// a call enters the member its argument count picks (§6).
+pub const Arities = struct {
+    fixed: []const ?*const Routine,
+    rest: ?*const Routine = null,
+
+    /// Every member, by arity, the rest clause last.
+    pub fn members(self: *const Arities) Members {
+        return .{ .table = self };
+    }
+
+    pub const Members = struct {
+        table: *const Arities,
+        i: usize = 0,
+
+        pub fn next(it: *Members) ?*const Routine {
+            const fixed = it.table.fixed;
+            while (it.i < fixed.len) {
+                it.i += 1;
+                if (fixed[it.i - 1]) |r| return r;
+            }
+            if (it.i > fixed.len) return null;
+            it.i += 1;
+            return it.table.rest;
+        }
+    };
+};
+
 /// A byte range of a source text: the span the reader gives a Form,
 /// carried by the compiler to the instructions lowered from it.
 pub const SourceSpan = struct {
@@ -629,6 +660,9 @@ pub const Routine = struct {
     /// at call time. `(fn* [a b & r] body)` lowers to
     /// `fixed_arity = 2, variadic = true`.
     variadic: bool = false,
+    /// The arity table of the multi-arity `fn` this routine is a
+    /// clause of; null for a routine with one arity.
+    arities: ?*const Arities = null,
     /// Number of upvalue cells the routine's body expects in
     /// its callee frame. Validated against the constructed
     /// closure's upvalue array length at `call:call` time and
@@ -654,34 +688,46 @@ pub const Routine = struct {
     /// The source the spans index into.
     source: ?*const SourceInfo = null,
 
-    /// Prove the routine, and every routine its capture descriptors
-    /// build, fit to run (VM.md §5): every instruction `primary` with
-    /// an assigned opcode, every operand inside the table it indexes
-    /// and of a kind its position takes, every call or collection
-    /// block inside the frame, every jump, `try` and capture inside
-    /// the routine, and the last instruction one that never falls
-    /// through, so execution cannot run off the code. The dispatch
+    /// Prove the routine, the other members of its arity table, and
+    /// every routine their capture descriptors build, fit to run (VM.md
+    /// §5): every instruction `primary` with an assigned opcode, every
+    /// operand inside the table it indexes and of a kind its position
+    /// takes, every call or collection block inside the frame, every
+    /// jump, `try` and capture inside the routine, the last instruction
+    /// one that never falls through, so execution cannot run off the
+    /// code, and the arity table one a call can pick from. The dispatch
     /// trusts all of it (§8). On an error `failure` names the routine
     /// and the instruction. Whatever the routine holds, verification
     /// returns an error and never traps.
     pub fn verify(self: *const Routine, failure: *VerifyFailure) VmError!void {
         failure.* = .{ .routine = self, .pc = 0 };
         stack_guard.check() catch return VmError.StackOverflow;
+        try self.verifyClause(failure);
+        // A closure over this routine runs whichever member its call
+        // picks; `verifyAlone` proved this one sits in the table.
+        const a = self.arities orelse return;
+        var members = a.members();
+        while (members.next()) |r| if (r != self) try r.verifyClause(failure);
+    }
+
+    /// `verifyAlone`, then `verify` of every routine the capture
+    /// descriptors build.
+    fn verifyClause(self: *const Routine, failure: *VerifyFailure) VmError!void {
         try self.verifyAlone(failure);
         for (self.capture_descs) |desc| try desc.routine.verify(failure);
     }
 
     /// `verify` of this routine without the routines its capture
-    /// descriptors build: for a loader that verifies every routine it
-    /// made, each once (`image.zig`).
+    /// descriptors build or the other members of its table, whose
+    /// shape it does prove: for a loader that verifies every routine
+    /// it made, each once (`image.zig`).
     pub fn verifyAlone(self: *const Routine, failure: *VerifyFailure) VmError!void {
         const code = self.code;
+        failure.* = .{ .routine = self, .pc = 0 };
         // A pc is 32 bits (§3): a longer routine is refused before any
         // of it is read.
-        if (code.len > std.math.maxInt(u32)) {
-            failure.* = .{ .routine = self, .pc = 0 };
-            return VmError.BytecodeCorruption;
-        }
+        if (code.len > std.math.maxInt(u32)) return VmError.BytecodeCorruption;
+        if (self.arities) |a| try self.verifyTable(a);
         // The code's end is reported at its last instruction, as a run
         // that falls off it is (§13).
         failure.* = .{ .routine = self, .pc = @intCast(code.len -| 1) };
@@ -690,6 +736,64 @@ pub const Routine = struct {
             failure.pc = @intCast(i);
             try self.verifyInst(inst, i);
         }
+    }
+
+    /// The arity table `a`, as a member sees it (§5): the member sits
+    /// in it at its own arity, or as its rest clause; every member
+    /// points at it and carries the member's upvalue count; each fixed
+    /// entry takes exactly its index and the last is a clause; the rest
+    /// clause takes at least every fixed count (Clojure's rule); and
+    /// the table has two members at least.
+    fn verifyTable(self: *const Routine, a: *const Arities) VmError!void {
+        const home = if (self.variadic) a.rest else if (self.fixed_arity < a.fixed.len) a.fixed[self.fixed_arity] else null;
+        if (home == null or home.? != self) return VmError.BytecodeCorruption;
+        if (a.fixed.len > 0 and a.fixed[a.fixed.len - 1] == null) return VmError.BytecodeCorruption;
+        var members: usize = 0;
+        for (a.fixed, 0..) |entry, i| {
+            const m = entry orelse continue;
+            if (m.variadic or m.fixed_arity != i) return VmError.BytecodeCorruption;
+            try self.verifySibling(m, a);
+            members += 1;
+        }
+        if (a.rest) |m| {
+            if (!m.variadic or @as(usize, m.fixed_arity) + 1 < a.fixed.len) return VmError.BytecodeCorruption;
+            try self.verifySibling(m, a);
+            members += 1;
+        }
+        if (members < 2) return VmError.BytecodeCorruption;
+    }
+
+    fn verifySibling(self: *const Routine, m: *const Routine, a: *const Arities) VmError!void {
+        if (m.arities != a) return VmError.BytecodeCorruption;
+        // One closure's cells serve every member.
+        if (m.upvalue_count != self.upvalue_count) return VmError.CaptureCountMismatch;
+    }
+
+    /// The fixed-arity routine that takes exactly `argc` arguments:
+    /// this one, as for a routine with one arity, or a member of its
+    /// table; null when none does. The direct call paths (§8) ask only
+    /// this.
+    pub inline fn memberFor(self: *const Routine, argc: usize) ?*const Routine {
+        if (argc == self.fixed_arity and !self.variadic) return self;
+        const a = self.arities orelse return null;
+        return if (argc < a.fixed.len) a.fixed[argc] else null;
+    }
+
+    /// The routine a call of a closure over this one enters with
+    /// `argc` arguments (§6): the fixed-arity member that takes them,
+    /// else the rest clause when `argc` reaches its fixed arity; null
+    /// when none takes `argc`.
+    pub fn entryFor(self: *const Routine, argc: usize) ?*const Routine {
+        if (self.memberFor(argc)) |m| return m;
+        const rest = if (self.arities) |a| a.rest orelse return null else if (self.variadic) self else return null;
+        return if (argc >= rest.fixed_arity) rest else null;
+    }
+
+    /// The argument counts a closure over this routine takes, as an
+    /// arity error names them (§13): `1 argument`, `at least 2
+    /// arguments`, `0 to 2 arguments`, `1, 3 or at least 5 arguments`.
+    pub fn arityPhrase(self: *const Routine) ArityPhrase {
+        return .{ .routine = self };
     }
 
     fn neverFallsThrough(inst: Inst) bool {
@@ -894,6 +998,85 @@ pub const Routine = struct {
         }
         if (lo == 0) return null;
         return self.spans[lo - 1].span;
+    }
+};
+
+/// `Routine.arityPhrase`: the counts a closure over `routine` takes,
+/// for `{f}`.
+pub const ArityPhrase = struct {
+    routine: *const Routine,
+
+    const Item = union(enum) { one: usize, range: [2]usize, at_least: usize };
+
+    /// The phrase's items in order: a run of three or more fixed counts
+    /// as a range, any other fixed count alone, then the rest clause's
+    /// bound, which takes in the fixed counts just below it.
+    const Items = struct {
+        table: ?[]const ?*const Routine,
+        /// The one count of a routine with no table and no rest.
+        only: usize,
+        /// The fixed counts listed are those below `limit`.
+        limit: usize,
+        rest: ?usize,
+        i: usize = 0,
+
+        fn init(r: *const Routine) Items {
+            const a = r.arities orelse return if (r.variadic)
+                .{ .table = null, .only = 0, .limit = 0, .rest = r.fixed_arity }
+            else
+                .{ .table = null, .only = r.fixed_arity, .limit = @as(usize, r.fixed_arity) + 1, .rest = null };
+            var it: Items = .{ .table = a.fixed, .only = 0, .limit = a.fixed.len, .rest = null };
+            if (a.rest) |v| {
+                var n: usize = v.fixed_arity;
+                while (n > 0 and it.has(n - 1)) n -= 1;
+                it.limit = n;
+                it.rest = n;
+            }
+            return it;
+        }
+
+        fn has(it: *const Items, n: usize) bool {
+            return if (it.table) |t| n < t.len and t[n] != null else n == it.only;
+        }
+
+        fn next(it: *Items) ?Item {
+            while (it.i < it.limit and !it.has(it.i)) it.i += 1;
+            if (it.i < it.limit) {
+                const lo = it.i;
+                var hi = lo;
+                while (hi + 1 < it.limit and it.has(hi + 1)) hi += 1;
+                if (hi - lo >= 2) {
+                    it.i = hi + 1;
+                    return .{ .range = .{ lo, hi } };
+                }
+                it.i = lo + 1;
+                return .{ .one = lo };
+            }
+            const n = it.rest orelse return null;
+            it.rest = null;
+            return .{ .at_least = n };
+        }
+    };
+
+    pub fn format(self: ArityPhrase, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var it = Items.init(self.routine);
+        var count: usize = 0;
+        var singular = false;
+        while (it.next()) |item| : (count += 1) singular = switch (item) {
+            .one, .at_least => |n| n == 1,
+            .range => false,
+        };
+        it = Items.init(self.routine);
+        var i: usize = 0;
+        while (it.next()) |item| : (i += 1) {
+            if (i > 0) try w.writeAll(if (i + 1 == count) " or " else ", ");
+            switch (item) {
+                .one => |n| try w.print("{d}", .{n}),
+                .range => |r| try w.print("{d} to {d}", .{ r[0], r[1] }),
+                .at_least => |n| try w.print("at least {d}", .{n}),
+            }
+        }
+        try w.writeAll(if (count == 1 and singular) " argument" else " arguments");
     }
 };
 
@@ -1962,8 +2145,9 @@ pub const Callback = struct {
             },
             .function => closure: {
                 const closure = VM.asClosure(self.callee);
-                const routine = closure.routine;
-                if (routine.variadic or self.argc != routine.fixed_arity or routine.slot_count < self.argc) break :closure;
+                // The member the count picks: every call has the count.
+                const routine = closure.routine.memberFor(self.argc) orelse break :closure;
+                if (routine.slot_count < self.argc) break :closure;
                 // Every later call starts at this depth of the native
                 // stack, so the guard's answer holds for them all
                 // (§13.1).
@@ -2477,6 +2661,12 @@ pub const VM = struct {
         return err;
     }
 
+    /// `ArityMismatch` for a closure over `routine` called with `argc`
+    /// arguments, which no member of its table takes.
+    fn closureArityError(self: *VM, routine: *const Routine, argc: usize) VmError {
+        return self.fail(VmError.ArityMismatch, "{s} takes {f}, got {d}", .{ routine.name, routine.arityPhrase(), argc });
+    }
+
     /// `ArityMismatch` for `name`, which takes `min` to `max`
     /// arguments (`max` null: no upper bound), called with `argc`.
     fn arityError(self: *VM, name: []const u8, min: usize, max: ?usize, argc: usize) VmError {
@@ -2585,14 +2775,23 @@ pub const VM = struct {
         }
     }
 
-    /// The heap constants of `routine` and, recursively, of the
-    /// routines in its pool: string and bignum literals live on the
-    /// heap and a routine is reachable from every frame running it
-    /// and every closure over it. A routine with more than a few
+    /// The heap constants of `routine`, of every member of its arity
+    /// table and, recursively, of the routines in their pools: string
+    /// and bignum literals live on the heap and a routine is reachable
+    /// from every frame running it and every closure over it. A member
+    /// is reached only through its table: a closure names the first
+    /// clause, and a frame running another member roots the closure.
+    fn markRoutineConsts(self: *VM, c: *gc_mod.Collector, routine: *const Routine) void {
+        const a = routine.arities orelse return self.markClauseConsts(c, routine);
+        var members = a.members();
+        while (members.next()) |r| self.markClauseConsts(c, r);
+    }
+
+    /// `markRoutineConsts` of one routine. One with more than a few
     /// constants or nested routines is walked once per cycle, however
     /// many closures reach it; a small one costs less to walk again
     /// than to look up.
-    fn markRoutineConsts(self: *VM, c: *gc_mod.Collector, routine: *const Routine) void {
+    fn markClauseConsts(self: *VM, c: *gc_mod.Collector, routine: *const Routine) void {
         if (routine.consts.len + routine.capture_descs.len > 8) {
             const seen = self.gc_routines.getOrPut(self.allocator, routine) catch null;
             if (seen) |entry| if (entry.found_existing) return;
@@ -3086,19 +3285,17 @@ pub const VM = struct {
 
     /// Enter `callee`, a closure whose `argc` arguments sit in
     /// `stack[base..base + argc]`, the one entry path for `call:call`,
-    /// `callValue`: check the arity and the
-    /// routine's shape, grow the stack over the callee's window, pack
-    /// the arguments past the fixed ones into the rest list (nil when
-    /// there are none, as in Clojure), nil every other slot the window
-    /// and the arguments cover, and push the frame.
+    /// `callValue`: pick the routine the count enters, the closure's own
+    /// or a member of its arity table, else raise the arity error, check
+    /// the routine's shape, grow the stack over the callee's window,
+    /// pack the arguments past the fixed ones into the rest list (nil
+    /// when there are none, as in Clojure), nil every other slot the
+    /// window and the arguments cover, and push the frame.
     /// `entry_stack_len` is the stack length its pop restores.
     fn enterClosure(self: *VM, callee: Value, base: usize, argc: usize, entry_stack_len: usize, link: Link) VmError!void {
         const closure = asClosure(callee);
-        const routine = closure.routine;
+        const routine = closure.routine.entryFor(argc) orelse return self.closureArityError(closure.routine, argc);
         const fixed: usize = routine.fixed_arity;
-        if (if (routine.variadic) argc < fixed else argc != fixed) {
-            return self.arityError(routine.name, fixed, if (routine.variadic) null else fixed, argc);
-        }
         // A variadic routine needs a slot for its rest parameter.
         if (routine.slot_count < fixed + @intFromBool(routine.variadic)) return VmError.BytecodeCorruption;
 
@@ -3157,25 +3354,24 @@ pub const VM = struct {
         if (track_high_water) self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
     }
 
-    /// `enterClosure` for the common call, a closure called with its
-    /// fixed arity where the frame chain and the stack's capacity have
-    /// room: the frame is pushed without allocating or growing
-    /// anything. Returns the new frame, or null, having changed
-    /// nothing, for a call `enterClosure` has to make. The arguments
-    /// sit at `stack[base..base + argc]`, at or past the stack's
-    /// length, and the frame's pop restores the length as it is.
+    /// `enterClosure` for the common call, a closure called with a
+    /// fixed arity of its own or of a member of its arity table, where
+    /// the frame chain and the stack's capacity have room: the frame is
+    /// pushed without allocating or growing anything. Returns the new
+    /// frame, or null, having changed nothing, for a call
+    /// `enterClosure` has to make. The arguments sit at
+    /// `stack[base..base + argc]`, at or past the stack's length, and
+    /// the frame's pop restores the length as it is.
     inline fn enterClosureDirect(self: *VM, callee: Value, base: usize, argc: usize, link: Link) ?*Frame {
-        const closure = asClosure(callee);
-        const routine = closure.routine;
-        if (routine.variadic or argc != routine.fixed_arity) return null;
-        return self.pushDirect(callee, base, argc, link);
+        const routine = asClosure(callee).routine.memberFor(argc) orelse return null;
+        return self.pushDirect(callee, routine, base, argc, link);
     }
 
     /// `enterClosureDirect` past its arity test: `callee` called with
-    /// its fixed arity.
-    inline fn pushDirect(self: *VM, callee: Value, base: usize, argc: usize, link: Link) ?*Frame {
+    /// `argc` arguments, the fixed arity of `routine`, the member of its
+    /// table it enters.
+    inline fn pushDirect(self: *VM, callee: Value, routine: *const Routine, base: usize, argc: usize, link: Link) ?*Frame {
         const closure = asClosure(callee);
-        const routine = closure.routine;
         const depth = self.frames.items.len;
         if (depth >= self.max_frames or depth == self.frames.capacity) return null;
         const args_end = base + argc;
@@ -4462,7 +4658,8 @@ pub const VM = struct {
             else => return self.general(frame, inst, pc),
         };
         const base: usize = @as(usize, frame.base_slot) + call_base + 1;
-        const callee_frame = self.enterClosureDirect(callee, base, argc, .{
+        const routine = asClosure(callee).routine.memberFor(argc) orelse return self.general(frame, inst, pc);
+        const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
         // The caller's place, for a trace through the callee and for
@@ -4470,7 +4667,7 @@ pub const VM = struct {
         frame.pc = @intCast(pc);
         // The callee's first instruction, through the routine in hand
         // rather than the frame just written.
-        const first = asClosure(callee).routine.code[0];
+        const first = routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
     }
@@ -4484,13 +4681,14 @@ pub const VM = struct {
         const callee = loadWords(&frame.closure);
         if (callee.kind() != .function) return self.general(frame, inst, pc);
         const argc: u32 = inst.b.index;
-        proved(!frame.routine.variadic and argc == frame.routine.fixed_arity and inst.a.index + argc <= frame.routine.slot_count);
+        const routine = frame.routine;
+        proved(!routine.variadic and argc == routine.fixed_arity and inst.a.index + argc <= routine.slot_count);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index;
-        const callee_frame = self.pushDirect(callee, base, argc, .{
+        const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
         frame.pc = @intCast(pc);
-        const first = asClosure(callee).routine.code[0];
+        const first = routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
     }
@@ -9030,6 +9228,270 @@ test "VM dispatch: call:self calls the frame's closure, on the direct path and p
     var vm2 = try VM.init(testing.allocator, &lone);
     defer vm2.deinit();
     try testing.expectError(VmError.BytecodeCorruption, vm2.run());
+}
+
+/// Point every member of `table` at it, as the compiler links the
+/// clauses of a multi-arity `fn` (§5).
+fn linkTable(table: *const Arities) void {
+    var members = table.members();
+    while (members.next()) |m| @constCast(m).arities = table;
+}
+
+/// `(fn ([] 100) ([a] 101) ([a b] 102) ([a b c d & m] m))`, its closure
+/// naming the two-argument clause.
+const TestClauses = struct {
+    none: Routine = .{ .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(100)}, .slot_count = 1, .name = "f" },
+    one: Routine = .{ .code = &.{ asm_.loadConst(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(101)}, .slot_count = 2, .fixed_arity = 1, .name = "f" },
+    two: Routine = .{ .code = &.{ asm_.loadConst(2, 0), asm_.returnSlot(2) }, .consts = &.{fx(102)}, .slot_count = 3, .fixed_arity = 2, .name = "f" },
+    rest: Routine = .{ .code = &.{asm_.returnSlot(4)}, .consts = &.{}, .slot_count = 5, .fixed_arity = 4, .variadic = true, .name = "f" },
+    fixed: [3]?*const Routine = undefined,
+    table: Arities = undefined,
+
+    fn link(t: *TestClauses) void {
+        t.fixed = .{ &t.none, &t.one, &t.two };
+        t.table = .{ .fixed = &t.fixed, .rest = &t.rest };
+        linkTable(&t.table);
+    }
+
+    /// What a call with `argc` arguments 0, 1, ... returns.
+    fn expect(argc: usize, got: anyerror!Value) !void {
+        errdefer std.debug.print("a call with {d} arguments\n", .{argc});
+        switch (argc) {
+            0, 1, 2 => try testing.expectEqual(fx(100 + @as(i64, @intCast(argc))), try got),
+            3 => try testing.expectError(VmError.ArityMismatch, got),
+            4 => try testing.expect((try got).isNil()),
+            else => {
+                const m = try got;
+                try testing.expectEqual(argc - 4, list_mod.count(m));
+                try testing.expectEqual(fx(4), list_mod.head(m));
+            },
+        }
+    }
+};
+
+test "VM closure call: a call enters the member of the arity table its count picks, on every path" {
+    var t: TestClauses = .{};
+    t.link();
+    const sentence = "f takes 0 to 2 or at least 4 arguments, got 3";
+    // call:call, twice each: the first grows the stack through the
+    // general entry, the second takes the direct path.
+    const caps = [_]CaptureDescriptor{.{ .routine = &t.two, .sources = &.{} }};
+    const consts = [_]Value{ fx(0), fx(1), fx(2), fx(3), fx(4), fx(5), fx(6) };
+    for (0..8) |argc| {
+        var code: [24]Inst = undefined;
+        var n: usize = 0;
+        code[n] = asm_.closureMake(0, 0);
+        n += 1;
+        for (0..2) |round| {
+            for (0..argc) |i| {
+                code[n] = asm_.loadConst(@intCast(1 + i), @intCast(i));
+                n += 1;
+            }
+            code[n] = asm_.callCall(0, @intCast(argc), @intCast(9 + round));
+            n += 1;
+        }
+        code[n] = asm_.collList(9, 2, 9);
+        code[n + 1] = asm_.returnSlot(9);
+        var top = makeRoutine(code[0 .. n + 2], &consts, 11, "top");
+        top.capture_descs = &caps;
+        var vm = try VM.init(testing.allocator, &top);
+        defer vm.deinit();
+        const both = vm.run();
+        if (argc == 3) {
+            try TestClauses.expect(argc, both);
+            try testing.expectEqualStrings(sentence, vm.error_detail);
+            // Raised in the caller, before a frame is pushed.
+            try testing.expectEqual(@as(usize, 1), vm.error_trace.items.len);
+            try testing.expectEqualStrings("top", vm.error_trace.items[0].name);
+            continue;
+        }
+        const pair = try both;
+        try TestClauses.expect(argc, list_mod.head(pair));
+        try TestClauses.expect(argc, list_mod.head(list_mod.tail(pair)));
+    }
+    // callValue and a Callback, three calls each.
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const f = try vm.allocClosure(&t.two, 0);
+    for (0..8) |argc| {
+        var cb = Callback.init(&vm, f, @intCast(argc));
+        for (0..3) |_| {
+            try TestClauses.expect(argc, vm.callValue(f, consts[0..argc]));
+            try TestClauses.expect(argc, cb.call(consts[0..argc]));
+        }
+        if (argc == 3) try testing.expectEqualStrings(sentence, vm.error_detail);
+        // A fixed member is called through a prepared frame.
+        try testing.expectEqual(argc <= 2, cb.mode == .closure);
+    }
+}
+
+test "VM error detail: an arity sentence names every count a closure takes" {
+    // Members of every arity up to 200, as many tables need.
+    var members: [201]Routine = undefined;
+    for (&members, 0..) |*m, i| m.* = .{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = @intCast(i + 1), .fixed_arity = @intCast(i), .name = "f" };
+    var rests: [8]Routine = undefined;
+    for (&rests, 0..) |*m, i| m.* = .{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = @intCast(i + 1), .fixed_arity = @intCast(i), .variadic = true, .name = "f" };
+    const Case = struct { fixed: []const u8, rest: ?usize = null, want: []const u8 };
+    var fixed: [201]?*const Routine = undefined;
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    for ([_]Case{
+        .{ .fixed = &.{ 1, 2 }, .want = "1 or 2 arguments" },
+        .{ .fixed = &.{ 0, 1, 2 }, .want = "0 to 2 arguments" },
+        .{ .fixed = &.{ 0, 1, 2, 5 }, .want = "0 to 2 or 5 arguments" },
+        .{ .fixed = &.{ 0, 2, 3, 4, 7 }, .want = "0, 2 to 4 or 7 arguments" },
+        .{ .fixed = &.{ 1, 3 }, .rest = 5, .want = "1, 3 or at least 5 arguments" },
+        .{ .fixed = &.{1}, .rest = 2, .want = "at least 1 argument" },
+        .{ .fixed = &.{ 0, 2 }, .rest = 2, .want = "0 or at least 2 arguments" },
+        .{ .fixed = &.{ 1, 2 }, .rest = 2, .want = "at least 1 argument" },
+        .{ .fixed = &.{ 0, 1, 3 }, .rest = 5, .want = "0, 1, 3 or at least 5 arguments" },
+    }) |case| {
+        const len = @as(usize, case.fixed[case.fixed.len - 1]) + 1;
+        @memset(fixed[0..len], null);
+        for (case.fixed) |n| fixed[n] = &members[n];
+        const table: Arities = .{ .fixed = fixed[0..len], .rest = if (case.rest) |n| &rests[n] else null };
+        linkTable(&table);
+        var failure: VerifyFailure = undefined;
+        try members[case.fixed[0]].verify(&failure);
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(case.want, try std.mem.print(&buf, "{f}", .{members[case.fixed[0]].arityPhrase()}));
+    }
+    // A routine with one arity says what `arityError` says.
+    for ([_]struct { Routine, []const u8 }{
+        .{ members[0], "0 arguments" },
+        .{ members[1], "1 argument" },
+        .{ rests[1], "at least 1 argument" },
+        .{ rests[2], "at least 2 arguments" },
+    }) |case| {
+        var r = case[0];
+        r.arities = null;
+        var buf: [64]u8 = undefined;
+        try testing.expectEqualStrings(case[1], try std.mem.print(&buf, "{f}", .{r.arityPhrase()}));
+    }
+    // Every other count up to 200: past the detail's 160 bytes, the
+    // sentence is cut at a character and marked.
+    @memset(&fixed, null);
+    var i: usize = 0;
+    while (i <= 200) : (i += 2) fixed[i] = &members[i];
+    const table: Arities = .{ .fixed = &fixed };
+    linkTable(&table);
+    try testing.expectEqual(VmError.ArityMismatch, vm.closureArityError(&members[0], 1));
+    try testing.expect(std.mem.startsWith(u8, vm.error_detail, "f takes 0, 2, 4, 6, "));
+    try testing.expect(std.mem.endsWith(u8, vm.error_detail, "…"));
+    try testing.expect(vm.error_detail.len <= vm.detail_buf.len);
+}
+
+test "Routine.verify: an arity table a call cannot pick from is refused" {
+    const r = asm_.returnNil();
+    var none = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 1, .name = "none" };
+    var one = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 1, .fixed_arity = 1, .name = "one" };
+    var two = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 2, .fixed_arity = 2, .name = "two" };
+    var rest = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .variadic = true, .name = "rest" };
+    var stray = Routine{ .code = &.{r}, .consts = &.{}, .slot_count = 2, .fixed_arity = 1, .name = "stray" };
+    var fixed = [_]?*const Routine{ &none, &one };
+    var table: Arities = .{ .fixed = &fixed, .rest = &rest };
+    const other: Arities = .{ .fixed = &fixed, .rest = &rest };
+    const Case = struct { name: []const u8, err: VmError, where: []const u8 };
+    var failure: VerifyFailure = undefined;
+    for ([_]Case{
+        .{ .name = "a member at another arity's place", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "a member its table does not hold", .err = VmError.BytecodeCorruption, .where = "stray" },
+        .{ .name = "a member of another table", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "members of unequal upvalue counts", .err = VmError.CaptureCountMismatch, .where = "one" },
+        .{ .name = "a table ending in no clause", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "a rest clause below a fixed arity", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "a rest clause with no rest parameter", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "a table of one", .err = VmError.BytecodeCorruption, .where = "one" },
+        .{ .name = "a member that does not verify", .err = VmError.BytecodeExhausted, .where = "rest" },
+    }, 0..) |case, i| {
+        errdefer std.debug.print("table case \"{s}\" failed\n", .{case.name});
+        var three: [3]?*const Routine = .{ &none, &one, null };
+        table = .{ .fixed = &fixed, .rest = &rest };
+        fixed = .{ &none, &one };
+        linkTable(&table);
+        stray.arities = &table;
+        var checked: *const Routine = &one;
+        switch (i) {
+            0 => fixed = .{ &one, &none },
+            1 => checked = &stray,
+            2 => one.arities = &other,
+            3 => rest.upvalue_count = 1,
+            4 => table.fixed = &three,
+            5 => {
+                three[2] = &two;
+                two.arities = &table;
+                table.fixed = &three;
+                rest.fixed_arity = 1;
+            },
+            6 => {
+                rest.variadic = false;
+                rest.fixed_arity = 3;
+            },
+            7 => {
+                table.fixed = fixed[1..];
+                table.rest = null;
+                one.fixed_arity = 0;
+            },
+            8 => rest.code = &.{asm_.loadNil(0)},
+            else => unreachable,
+        }
+        defer {
+            rest = .{ .code = &.{r}, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .variadic = true, .name = "rest" };
+            one.fixed_arity = 1;
+        }
+        try testing.expectError(case.err, checked.verify(&failure));
+        try testing.expectEqualStrings(case.where, failure.routine.name);
+    }
+    // A sound table verifies from any member, and a member of a
+    // table does from a top-level routine's descriptor.
+    table = .{ .fixed = &fixed, .rest = &rest };
+    fixed = .{ &none, &one };
+    linkTable(&table);
+    try none.verify(&failure);
+    try rest.verify(&failure);
+    const caps = [_]CaptureDescriptor{.{ .routine = &one, .sources = &.{} }};
+    var top = makeRoutine(&.{ asm_.closureMake(0, 0), asm_.returnSlot(0) }, &.{}, 1, "top");
+    top.capture_descs = &caps;
+    try top.verify(&failure);
+    rest.code = &.{asm_.loadNil(0)};
+    try testing.expectError(VmError.BytecodeExhausted, top.verify(&failure));
+    try testing.expectEqualStrings("rest", failure.routine.name);
+}
+
+test "VM dispatch: a member's constants live while the member runs and allocates under collection" {
+    // (fn ([] nil) ([x] (dotimes [_ 1000] (list x)) "keep")): the string
+    // is a constant of the one-argument member alone, which the
+    // closure, naming the other member, reaches only through the table.
+    var keep_consts = [_]Value{ nil_v, fx(0), fx(1000), fx(1) };
+    var keep = Routine{
+        .code = &.{
+            asm_.loadConst(1, 1),
+            asm_.cmpLt(2, sl(1), kn(2)),
+            asm_.jumpIfFalse(6, sl(2)),
+            asm_.collList(0, 1, 3),
+            asm_.mathAdd(1, sl(1), kn(3)),
+            asm_.jumpJmp(1),
+            asm_.loadConst(4, 0),
+            asm_.returnSlot(4),
+        },
+        .consts = &keep_consts,
+        .slot_count = 5,
+        .fixed_arity = 1,
+        .name = "f",
+    };
+    var none = Routine{ .code = &.{asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .name = "f" };
+    const fixed = [_]?*const Routine{ &none, &keep };
+    const table: Arities = .{ .fixed = &fixed };
+    linkTable(&table);
+    const caps = [_]CaptureDescriptor{.{ .routine = &none, .sources = &.{} }};
+    var top = makeRoutine(&.{ asm_.closureMake(0, 0), asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) }, &.{fx(5)}, 3, "top");
+    top.capture_descs = &caps;
+    var vm = try VM.init(testing.allocator, &top);
+    defer vm.deinit();
+    keep_consts[0] = try string_mod.fromBytes(vm.ensureHeap(), "keep");
+    vm.setGcPolicy(.stress);
+    try testing.expectEqualStrings("keep", string_mod.asBytes(try vm.run()));
+    try testing.expect(vm.gc_cycles > 0);
 }
 
 test "VM closure call: same closure called twice — both invocations succeed" {

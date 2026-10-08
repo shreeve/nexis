@@ -73,7 +73,9 @@ VM's roots, in the order it marks them:
    earlier one left alive. A slot holding a `cell_internal` Value
    marks the cell.
 2. **Every frame**: the closure it runs, whose trace reaches its cells
-   and its routine's constants once however many frames run it; or,
+   and its routine's constants, with every member of its arity table
+   (`docs/VM.md` §5), once however many frames run it, so a frame
+   running a member the closure does not name keeps it; or,
    for a frame with no closure (a top-level form, a loader routine),
    the heap constants of its routine, recursively through the
    routines its capture descriptors name (`Routine.capture_descs`).
@@ -174,7 +176,7 @@ The dispatch in `Collector.trace`:
 | `record` | `record.trace` | the field map |
 | `matcher` | `regex.traceMatcher` | the pattern and the string (`docs/REGEX.md` §8) |
 | `nextomic_entity` | `nextomic_handle.traceEntity` | the db-value box and the map of the entity's last full read |
-| `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
+| `function` | `Host.trace` (`VM.gcTrace`) | every upvalue cell (cells are blocks of their own kind, marked through `mark`), then the routine's heap constants, and those of every member of its arity table, which a closure reaches only through the routine it names, the table's head (`docs/VM.md` §5), recursively through nested routines (`docs/VM.md` §6); a routine with more than eight constants and nested routines is walked once per cycle however many closures reach it (`VM.gc_routines`) |
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |
 | anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `error_`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
 
@@ -448,6 +450,6 @@ A new native that calls back into the VM states its class next to its
 **Routine constant pools.** The heap constants of a routine (string,
 bignum and constant-collection literals, allocated on the VM's heap)
 are rooted through every frame running the routine and every closure
-over it, recursively through the routines its capture descriptors
-name (§3), so a literal lives as long as any code that can load it and
-no longer.
+over it, through the members of its arity table, and recursively
+through the routines its capture descriptors name (§3), so a literal
+lives as long as any code that can load it and no longer.

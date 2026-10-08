@@ -107,11 +107,26 @@ fn wideField(group: vm.Group, variant: u6) ?Wide {
 // Printing
 // =============================================================================
 
-/// Disassemble `routine` and, after it, every routine its capture
-/// descriptors build, depth first. `interner` names keywords,
+/// Disassemble `routine`, every member of its arity table by arity
+/// with the rest clause last, and after them every routine their
+/// capture descriptors build, depth first. `interner` names keywords,
 /// symbols and Vars; a null interner prints them by id.
 pub fn disassemble(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
-    try disassembleRoutine(routine, interner, writer);
+    const a = routine.arities orelse {
+        try disassembleRoutine(routine, interner, writer);
+        return disassembleCaptured(routine, interner, writer);
+    };
+    var members = a.members();
+    var first = true;
+    while (members.next()) |m| : (first = false) {
+        if (!first) try writer.writeAll("\n");
+        try disassembleRoutine(m, interner, writer);
+    }
+    members = a.members();
+    while (members.next()) |m| try disassembleCaptured(m, interner, writer);
+}
+
+fn disassembleCaptured(routine: *const vm.Routine, interner: ?*const intern_mod.Interner, writer: *Writer) Writer.Error!void {
     for (routine.capture_descs) |d| {
         try writer.writeAll("\n");
         try disassemble(d.routine, interner, writer);
@@ -258,7 +273,17 @@ fn writeWide(wide: Wide, w: u32, routine: *const vm.Routine, interner: ?*const i
             try writer.print("#{d}", .{w});
             if (w >= routine.capture_descs.len) return;
             const desc = routine.capture_descs[w];
-            try writer.print("<routine {s}>[", .{desc.routine.name});
+            try writer.print("<routine {s}", .{desc.routine.name});
+            if (desc.routine.arities) |a| {
+                try writer.writeAll(" arities ");
+                var members = a.members();
+                var first = true;
+                while (members.next()) |m| : (first = false) {
+                    if (!first) try writer.writeAll(",");
+                    try writer.print("{d}{s}", .{ m.fixed_arity, if (m.variadic) "+rest" else "" });
+                }
+            }
+            try writer.writeAll(">[");
             for (desc.sources, 0..) |source, i| {
                 if (i > 0) try writer.writeAll(" ");
                 switch (source) {
@@ -495,6 +520,41 @@ test "closure:make lists its routine and where each captured cell comes from, th
         \\routine t slots=4 arity=0 upvalues=0
         \\  0000  closure:make        s1  #0<routine f>[]
         \\  0001  closure:make        s2  #1<routine f>[s3 u1]
+        \\
+    , out.written());
+}
+
+test "a multi-arity fn lists every member by arity, the rest clause last, then what they build" {
+    const inner = vm.Routine{ .code = &.{vm.asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .name = "g" };
+    const descs = [_]vm.CaptureDescriptor{.{ .routine = &inner, .sources = &.{} }};
+    var rest = vm.Routine{ .code = &.{vm.asm_.returnSlot(2)}, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .variadic = true, .name = "f" };
+    var one = vm.Routine{ .code = &.{ vm.asm_.closureMake(0, 1), vm.asm_.returnSlot(1) }, .consts = &.{}, .capture_descs = &descs, .slot_count = 2, .fixed_arity = 1, .name = "f" };
+    var none = vm.Routine{ .code = &.{vm.asm_.returnNil()}, .consts = &.{}, .slot_count = 1, .name = "f" };
+    const fixed = [_]?*const vm.Routine{ &none, &one };
+    const table = vm.Arities{ .fixed = &fixed, .rest = &rest };
+    inline for (.{ &rest, &one, &none }) |m| m.arities = &table;
+    const top_descs = [_]vm.CaptureDescriptor{.{ .routine = &one, .sources = &.{} }};
+    const top = vm.Routine{ .code = &.{ vm.asm_.closureMake(0, 0), vm.asm_.returnSlot(0) }, .consts = &.{}, .capture_descs = &top_descs, .slot_count = 1, .name = "<top>" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassemble(&top, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine <top> slots=1 arity=0 upvalues=0
+        \\  0000  closure:make        s0  #0<routine f arities 0,1,2+rest>[]
+        \\  0001  call:return         s0  -  -
+        \\
+        \\routine f slots=1 arity=0 upvalues=0
+        \\  0000  call:return-nil     -  -  -
+        \\
+        \\routine f slots=2 arity=1 upvalues=0
+        \\  0000  closure:make        s1  #0<routine g>[]
+        \\  0001  call:return         s1  -  -
+        \\
+        \\routine f slots=3 arity=2+rest upvalues=0
+        \\  0000  call:return         s2  -  -
+        \\
+        \\routine g slots=1 arity=0 upvalues=0
+        \\  0000  call:return-nil     -  -  -
         \\
     , out.written());
 }

@@ -227,7 +227,10 @@ line, column and frame names of the trace.
 `nexis disasm FILE` compiles FILE the way `run` does and prints every
 routine on stdout instead of running it: each top-level form's
 routine, then every routine its capture descriptors build, depth
-first, a blank line between routines. `test/golden/cli/sum10.disasm`
+first, a blank line between routines. A multi-arity fn lists every
+member of its arity table (VM.md §5) by arity, the rest clause last,
+each with its own header, and then the routines their descriptors
+build. `test/golden/cli/sum10.disasm`
 pins the listing of `examples/sum10.nx`:
 
 ```
@@ -274,7 +277,9 @@ the step that runs the test and the branch with it (VM.md §10.10).
   `try-enter`'s try as `#n<catch j0012 finally j0015>`, and
   `closure:make`'s capture descriptor as `#n<routine NAME>[sources]`,
   `sN` for a cell in this frame's slot N and `uN` for this closure's
-  upvalue N (`#0<routine adder>[s0]`, `[]` for none). An unnamed group or
+  upvalue N (`#0<routine adder>[s0]`, `[]` for none), with a
+  multi-arity fn's arities after its name
+  (`#0<routine f arities 0,1,2+rest>[s3]`). An unnamed group or
   variant prints its number after `?`.
 - `; LINE:COL` is the source position of the form an instruction was
   lowered from, printed where the span table changes (VM.md §5); an
