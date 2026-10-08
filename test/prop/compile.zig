@@ -700,6 +700,12 @@ test "inlining: an operator inlines only when it names nexis.core's Var" {
 /// Compile the one form of `src` the way `program` compiles a form,
 /// without running it.
 fn compileIn(program: *harness.Program, src: []const u8) !nx.compile.Compiled {
+    return compileClearing(program, src, (nx.compile.CompileOptions{}).clear_locals);
+}
+
+/// `compileIn`, each local cleared at its last move or not
+/// (COMPILER.md §4.9).
+fn compileClearing(program: *harness.Program, src: []const u8, clear_locals: bool) !nx.compile.Compiled {
     const reader_mod = nx.reader;
     var parsed = try reader_mod.parser.parseForm(program.arena.allocator(), src);
     defer parsed.parser.deinit();
@@ -712,6 +718,7 @@ fn compileIn(program: *harness.Program, src: []const u8) !nx.compile.Compiled {
         .host_macros = &program.host_macros,
         .persistent_allocator = program.v.runtime_arena.allocator(),
         .registry = program.registry,
+        .clear_locals = clear_locals,
     });
 }
 
@@ -1275,6 +1282,14 @@ const Expr = union(enum) {
     picked: struct { s: *const Expr, a: *const Expr, b: *const Expr, c: *const Expr },
     /// (hv a b c), (apply hv a b [c]) or (apply hv a [b c])
     vararg: struct { how: u8, a: *const Expr, b: *const Expr, c: *const Expr },
+    /// (let* [v value] (hv v body v)): a local moved into a call
+    /// block, read by whatever `body` is, and moved again.
+    share: struct { name: u8, value: *const Expr, body: *const Expr },
+    /// (let* [v value] (try (h0 v (if (< x y) (throw 0) 1) 2)
+    ///                      (catch any e (h1 v body 3)) (finally (h1 v 0 0))?)):
+    /// a local moved in a try's body that its handler, and its
+    /// finally when `fin`, read again.
+    caught: struct { name: u8, value: *const Expr, x: *const Expr, y: *const Expr, body: *const Expr, fin: bool },
 };
 
 /// The Vars the generated programs call.
@@ -1323,7 +1338,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 16)) {
+    e.* = switch (rand.uintLessThan(u8, 18)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -1377,6 +1392,22 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         12 => .{ .vcall = .{ .f = rand.int(u1), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
         13 => .{ .picked = .{ .s = try genExpr(a, rand, names, d), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
         14 => .{ .vararg = .{ .how = rand.uintLessThan(u8, 3), .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d), .c = try genExpr(a, rand, names, d) } },
+        16 => blk: {
+            const n = names.binder(rand);
+            break :blk .{ .share = .{ .name = n, .value = try genExpr(a, rand, names, d), .body = try genExpr(a, rand, names.with(n), d) } };
+        },
+        17 => blk: {
+            const n = names.binder(rand);
+            const inner = names.with(n);
+            break :blk .{ .caught = .{
+                .name = n,
+                .value = try genExpr(a, rand, names, d),
+                .x = try genExpr(a, rand, inner, d),
+                .y = try genExpr(a, rand, inner, d),
+                .body = try genExpr(a, rand, inner, d),
+                .fin = rand.boolean(),
+            } };
+        },
         10 => .{ .may_throw = .{
             .p = @intCast(names.len + 120),
             .q = @intCast(names.len + 150),
@@ -1571,6 +1602,26 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) std.Io.Writer.Error!void {
                 try w.writeAll("])");
             },
         },
+        .share => |x| {
+            try w.print("(let* [v{d} ", .{x.name});
+            try printExpr(x.value, w);
+            try w.print("] (hv v{d} ", .{x.name});
+            try printExpr(x.body, w);
+            try w.print(" v{d}))", .{x.name});
+        },
+        .caught => |x| {
+            try w.print("(let* [v{d} ", .{x.name});
+            try printExpr(x.value, w);
+            try w.print("] (try (h0 v{d} (if (< ", .{x.name});
+            try printExpr(x.x, w);
+            try w.writeAll(" ");
+            try printExpr(x.y, w);
+            try w.print(") (throw 0) 1) 2) (catch any e (h1 v{d} ", .{x.name});
+            try printExpr(x.body, w);
+            try w.writeAll(" 3))");
+            if (x.fin) try w.print(" (finally (h1 v{d} 0 0))", .{x.name});
+            try w.writeAll("))");
+        },
     }
 }
 
@@ -1670,6 +1721,18 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             break :blk helper(f, try evalExpr(a, x.a, env), try evalExpr(a, x.b, env), try evalExpr(a, x.c, env));
         },
         .vararg => |x| try evalExpr(a, x.a, env) - try evalExpr(a, x.b, env) - try evalExpr(a, x.c, env),
+        .share => |x| blk: {
+            const v = try evalExpr(a, x.value, env);
+            break :blk v - try evalExpr(a, x.body, try env.with(a, x.name, v)) - v;
+        },
+        .caught => |x| blk: {
+            const inner = try env.with(a, x.name, try evalExpr(a, x.value, env));
+            const v = inner.lookup(x.name);
+            break :blk if (try evalExpr(a, x.x, inner) < try evalExpr(a, x.y, inner))
+                helper(1, v, try evalExpr(a, x.body, inner), 3)
+            else
+                helper(0, v, 1, 2);
+        },
     };
 }
 
@@ -1738,4 +1801,41 @@ test "prop differential: the same programs agree when their code starts past pc 
         return err;
     };
     try harness.expectResult(&program, shown, got, want.written());
+}
+
+/// Run the one form of `src` in `program`, each local cleared at its
+/// last move or not.
+fn runClearing(program: *harness.Program, src: []const u8, clear_locals: bool) !Value {
+    const compiled = try compileClearing(program, src, clear_locals);
+    const routine = compiled.toRoutine("test-form");
+    try program.v.retargetTop(&routine);
+    return program.v.run();
+}
+
+test "prop differential: the programs agree with their locals cleared and kept (COMPILER.md §4.9)" {
+    // The same random programs, each compiled twice: whatever a
+    // cleared slot held, no path reads it again, so both agree with
+    // the reference. Debug builds check each routine's clears too.
+    var prng = std.Random.DefaultPrng.init(diff_prng_seed ^ 0xC1EA);
+    const rand = prng.random();
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run(helpers);
+    for (0..400) |_| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const e = try genExpr(a, rand, .{}, 5);
+        var src: std.Io.Writer.Allocating = .init(a);
+        try printExpr(e, &src.writer);
+        const want = try a.print("{d}", .{try evalExpr(a, e, .{})});
+        for ([_]bool{ true, false }) |clear| {
+            const got = runClearing(&program, src.written(), clear) catch |err| {
+                std.debug.print("\n  source: {s}\n  clear_locals: {}\n  error:  {s}\n", .{ src.written(), clear, @errorName(err) });
+                return err;
+            };
+            try harness.expectResult(&program, src.written(), got, want);
+        }
+    }
 }

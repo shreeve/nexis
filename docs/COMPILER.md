@@ -439,6 +439,73 @@ local costs nothing (§4.4). A loop whose body starts with its test
 repeats the test at each `recur` (§5.7), so the `loop` row runs 4 of
 its 9 instructions an iteration and the `dotimes` row 6 of its 13.
 
+#### 4.9 Locals clearing
+
+A slot roots what it holds until something writes it again, so a
+local holding the head of a lazy seq keeps every element the walk
+behind it realizes. With `CompileOptions.clear_locals`, which is off
+unless a caller sets it, `finish` rewrites each `mov:move` of a slot
+that no path reads again before writing it into `mov:move-clear`
+(VM.md §10.1), which leaves the slot nil (`clearDeadMoves`). It runs
+on every routine the Emitter finishes, after every jump is patched
+and before quickening (§4.5), and changes only variants: each
+instruction keeps its pc, its span and its operands.
+
+**Liveness** is over slots and over the routine's own bytecode, as
+it runs, not over the Tiny tree: the Emitter writes an inert block
+item after the items that run code (§4.4), orders `recur`'s
+arguments (§5.6), moves a held Var's slot and repeats a loop's test
+(§5.7), so the last read in the source is not always the last read
+that runs. What each instruction reads and writes comes from the
+operand roles `Routine.verify` proves (VM.md §5): a slot read through
+any kind is a read and a destination a write; a call's block is read
+whole, callee and arguments, as are `call:self`'s arguments, a `coll`
+block and `call:lookup-or`'s two slots; `closure:make` reads each
+cell its descriptor sources from a slot; `closure:box-local` reads
+and writes its slot and `closure:new-cell` writes it; any other slot
+read as such is a read, but a `try`'s binding slot, which the VM
+writes as it takes a throw. The routine's basic blocks follow the
+jumps, `ctrl:try-exit` to its try's finally or, without one, to the
+pc after the try, and `ctrl:finally-exit` to that pc; a return or a
+throw has no successor. The sets reach a fixed point backward, the
+blocks visited last to first.
+
+**`try`.** Any instruction of a try's body may throw, a call
+included, since its callee's throw unwinds to this frame. So at every
+point of the body the slots live at the handler's entry, but its
+binding slot, are live, with those live at the finally's entry; and
+at every point of a handler with a finally, those live at the
+finally's entry. A local the body moves and the handler or the
+finally reads again stays in the body and clears at its last move in
+the handler or the finally.
+
+**What clears.** A local's last read is a clear only when it is a
+move: the argument a call gets, since the range-call ABI copies each
+one into the call block (VM.md §6), or the value a `let` or `recur`
+moves. A last read in place (a branch's test, a `call:lookup`
+target, a `math` or `cmp` operand, `ctrl:throw`, `var:store-var`,
+`call:return`) clears nothing. A slot read in a loop's body and
+bound before the loop is live around the back edge and never clears
+there; a loop binding clears at its last move in an iteration, since
+the `recur` writes it next. A captured local is a cell (§6), never a
+move's source, and the closure keeps the cell. A self-call's
+arguments are the callee's parameters, which the callee's own clears
+cover.
+
+**Budget.** A routine whose sets would take more than 2^20 words, a
+set of its slots for each block and each `try` region a block lies
+in, or that has not reached the fixed point in 64 passes, is left as
+it is: clearing is an optimization, and every slot then holds its
+value until written again, as it does with the option off.
+
+**The check.** Debug and safe builds check each routine the pass
+cleared in, forward: no instruction may read a slot a
+`mov:move-clear` cleared on some path to it, a throw from a try's
+body or handler carrying what it cleared to where the throw lands,
+with no write since. A read of one is `InternalCompilerBug` at
+compile time, never a nil read at run time. The differential test
+(§9) compiles every program it generates with the option on and off.
+
 ---
 
 ### 5. Primitive core lowering
@@ -917,7 +984,12 @@ closures, calls of one and two arguments nested in each other's
 arguments, calls of Vars of three arguments, variadic and through
 `apply`, with the callee itself a call, a call whose argument throws,
 and counting `loop*`s read directly and through `let*` aliases,
-against a reference evaluator. `test/integration/eval_pipeline.zig` runs source end to
+against a reference evaluator, and the same programs, with locals
+moved into calls and read again across a `try`'s handler and
+finally, compiled with locals clearing on and off (§4.9). `src/compile.zig`
+pins the pass on hand-built code: what clears, what a handler keeps,
+the budget, and the check refusing a read of a cleared slot.
+`test/integration/eval_pipeline.zig` runs source end to
 end through every host macro and every `try` exit path.
 
 #### 9.4 Guarantees the tests pin
@@ -949,7 +1021,8 @@ end through every host macro and every `try` exit path.
 `host_macros`, `out_span`, `out_detail`, `io` (what a user macro's
 sub-VM prints through), `persistent_allocator` (where `defmacro`
 closures go), `routine_allocator` (§3), `registry` (without it `(ns
-...)` is an error), `load_callback`, `declared` and `source`.
+...)` is an error), `load_callback`, `declared`, `source` and
+`clear_locals` (§4.9).
 
 `DeclaredNames` collects the names a file or REPL line defines before
 any of its forms compiles (§4.3 rule 7). `RuntimeHooks` installs the
