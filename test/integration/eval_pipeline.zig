@@ -1913,6 +1913,84 @@ test "integration: class, type, instance?, var?, special-symbol?" {
     try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
 }
 
+// Hierarchies (STDLIB.md §9.1): Clojure 1.12's multimethods.clj tests,
+// `::x` spelled `:user/x`, sets compared with `=` (print order differs).
+
+/// `family`, `diamond` and `bird-no-more` of multimethods.clj, and its
+/// `assert-valid-hierarchy` as a predicate.
+const hierarchies =
+    \\(def family (reduce #(apply derive (cons %1 %2)) (make-hierarchy)
+    \\  [[:user/parent-1 :user/ancestor-1] [:user/parent-1 :user/ancestor-2] [:user/parent-2 :user/ancestor-2]
+    \\   [:user/child :user/parent-2] [:user/child :user/parent-1]]))
+    \\(def diamond (reduce #(apply derive (cons %1 %2)) (make-hierarchy)
+    \\  [[:user/mammal :user/animal] [:user/bird :user/animal] [:user/griffin :user/mammal] [:user/griffin :user/bird]]))
+    \\(def bird-no-more (underive diamond :user/griffin :user/bird))
+    \\(defn closure [o f]
+    \\  (loop [results #{} more #{o}]
+    \\    (if (seq (remove results more))
+    \\      (recur (into results more) (reduce into #{} (map f (remove results more))))
+    \\      (disj results o))))
+    \\(defn valid? [h]
+    \\  (every? (fn [tag]
+    \\            (and (= (closure tag #(parents h %)) (or (ancestors h tag) #{}))
+    \\                 (= (closure tag #(ancestors h %)) (or (ancestors h tag) #{}))
+    \\                 (= (closure tag #(descendants h %)) (or (descendants h tag) #{}))
+    \\                 (every? #(isa? h tag %) (parents h tag))
+    \\                 (every? #(isa? h tag %) (ancestors h tag))
+    \\                 (every? #(isa? h % tag) (descendants h tag))
+    \\                 (not (contains? (closure tag #(parents h %)) tag))
+    \\                 (not (contains? (descendants h tag) tag))))
+    \\          (set (filter ident? (reduce into #{} (map keys (vals h)))))))
+    \\
+;
+
+test "hierarchies: derive builds the closures, refuses cycles, and keeps an existing edge identical" {
+    try expectOutputProgram(hierarchies ++
+        \\[(valid? family) (= (ancestors family :user/child) #{:user/ancestor-1 :user/ancestor-2 :user/parent-1 :user/parent-2})
+        \\ (= (descendants family :user/ancestor-2) #{:user/parent-1 :user/parent-2 :user/child})
+        \\ (sort (ancestors family :user/parent-1)) (parents family :user/ancestor-1) (ancestors family :user/nope)
+        \\ (try (derive family :user/ancestor-1 :user/child) (catch any e e))
+        \\ (try (derive family :user/child :user/ancestor-1) (catch Exception e (:message e)))
+        \\ (identical? family (derive family :user/child :user/parent-1))]
+    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor} :user/child already has :user/ancestor-1 as ancestor true]");
+    // The assertions, each with the text of Clojure 1.12's form.
+    try expectOutputProgram(hierarchies ++
+        \\(map #(try (%) (catch AssertionError e (pr-str (:message e))))
+        \\  [#(derive family :user/child :user/child) #(derive family "s" :user/p) #(derive family :user/a "p")
+        \\   #(derive :a :user/x) #(derive :user/a :x)])
+    , "(\"Assert failed: (not= tag parent)\" \"Assert failed: (or (class? tag) (instance? clojure.lang.Named tag))\" \"Assert failed: (instance? clojure.lang.Named parent)\" \"Assert failed: (or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))\" \"Assert failed: (namespace parent)\")");
+    try expectOutputProgram("[(try (derive :user/a 1) (catch any e e)) (try (derive :user/a 'b) (catch any e (:error e)))]", "[:kind-mismatch :assertion-failed]");
+}
+
+test "hierarchies: underive rebuilds from the remaining edges; isa? over the diamond and over vectors" {
+    try expectOutputProgram(hierarchies ++
+        \\[(valid? diamond) (valid? bird-no-more)
+        \\ (isa? diamond :user/griffin :user/animal) (isa? diamond :user/griffin :user/bird)
+        \\ (isa? bird-no-more :user/griffin :user/bird) (isa? bird-no-more :user/griffin :user/animal)
+        \\ (= bird-no-more {:parents {:user/mammal #{:user/animal} :user/bird #{:user/animal} :user/griffin #{:user/mammal}}
+        \\                  :ancestors {:user/mammal #{:user/animal} :user/bird #{:user/animal} :user/griffin #{:user/mammal :user/animal}}
+        \\                  :descendants {:user/animal #{:user/mammal :user/bird :user/griffin} :user/mammal #{:user/griffin}}})
+        \\ (identical? diamond (underive diamond :user/griffin :user/nothing))
+        \\ (identical? diamond (derive diamond :user/griffin :user/bird))]
+    , "[true true true true false true true true true]");
+    try expectOutputProgram(hierarchies ++
+        \\[(isa? diamond [:user/griffin :user/bird] [:user/animal :user/animal]) (isa? [] []) (isa? [:a] [:a])
+        \\ (isa? diamond [:user/griffin] [:user/animal :user/animal]) (isa? diamond [:user/griffin :user/bird] [:user/animal :user/mammal])
+        \\ (isa? diamond '(:user/griffin) '(:user/animal)) (isa? {} :a :b) (isa? 1 1)]
+    , "[true true true false false false false true]");
+}
+
+test "hierarchies: the global hierarchy is a private Var that derive and underive change" {
+    try expectOutputProgram(hierarchies ++
+        \\(with-redefs [nexis.core/global-hierarchy (make-hierarchy)]
+        \\  [(derive :user/lion :user/cat) (derive :user/manx :user/cat) (valid? @#'nexis.core/global-hierarchy)
+        \\   (isa? :user/lion :user/cat) (isa? :user/cat :user/lion) (= #{:user/manx :user/lion} (descendants :user/cat))
+        \\   (parents :user/manx) (ancestors :user/manx) (underive :user/manx :user/cat)
+        \\   (descendants :user/cat) (parents :user/manx) (ancestors :user/manx)])
+    , "[nil nil true true false true #{:user/cat} #{:user/cat} nil #{:user/lion} nil nil]");
+    try expectOutputProgram("(with-redefs [nexis.core/global-hierarchy (make-hierarchy)] (derive :user/a :user/b)) [(parents :user/a) (:private (meta #'nexis.core/global-hierarchy))]", "[nil true]");
+}
+
 const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
 
 test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, all-ns, ns-publics, ns-interns" {

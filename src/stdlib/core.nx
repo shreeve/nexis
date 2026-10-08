@@ -1248,6 +1248,98 @@
 (defn prn-str [& xs] (with-out-str (apply prn xs)))
 
 ; ============================================================
+; Hierarchies and multimethods (docs/STDLIB.md §9)
+; ============================================================
+
+; (make-hierarchy) → the empty hierarchy: each tag's direct parents,
+; and the transitive closures of its ancestors and descendants, which
+; derive and underive keep.
+(defn make-hierarchy [] {:parents {} :descendants {} :ancestors {}})
+
+; The hierarchy the arities without one read, and derive and underive
+; change through alter-var-root, as Clojure's.
+(def ^:private global-hierarchy (make-hierarchy))
+
+; (isa? h child parent) → whether child is parent, derives from it,
+; or both are vectors of one count whose elements are isa? pairwise.
+(defn isa?
+  ([child parent] (isa? global-hierarchy child parent))
+  ([h child parent]
+   (or (= child parent)
+       (contains? (get (:ancestors h) child) parent)
+       (and (vector? parent) (vector? child) (= (count parent) (count child))
+            (loop [i 0]
+              (cond (= i (count parent)) true
+                    (isa? h (child i) (parent i)) (recur (inc i))
+                    :else false))))))
+
+(defn parents
+  ([tag] (parents global-hierarchy tag))
+  ([h tag] (not-empty (get (:parents h) tag))))
+
+(defn ancestors
+  ([tag] (ancestors global-hierarchy tag))
+  ([h tag] (not-empty (get (:ancestors h) tag))))
+
+(defn descendants
+  ([tag] (descendants global-hierarchy tag))
+  ([h tag] (not-empty (get (:descendants h) tag))))
+
+; Throws the :assertion-failed of Clojure's assert of the form `text`,
+; for the assertions whose form names a Java class.
+(defn- assert-failed [text]
+  (throw {:error :assertion-failed :message (str "Assert failed: " text)}))
+
+; (derive h tag parent) → h with tag a child of parent: h itself when
+; it is already, else a new hierarchy, the closures updated as
+; Clojure's derive does. (derive tag parent) changes the global one,
+; whose parent must have a namespace, and so must the tag.
+(defn derive
+  ([tag parent]
+   (assert (namespace parent))
+   (when-not (and (ident? tag) (namespace tag))
+     (assert-failed "(or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))"))
+   (alter-var-root #'global-hierarchy derive tag parent)
+   nil)
+  ([h tag parent]
+   (assert (not= tag parent))
+   (when-not (ident? tag) (assert-failed "(or (class? tag) (instance? clojure.lang.Named tag))"))
+   (when-not (ident? parent) (assert-failed "(instance? clojure.lang.Named parent)"))
+   (let [tp (:parents h)
+         td (:descendants h)
+         ta (:ancestors h)
+         tf (fn [m source sources target targets]
+              (reduce (fn [ret k]
+                        (assoc ret k (reduce conj (get targets k #{}) (cons target (get targets target)))))
+                      m (cons source (get sources source))))]
+     (or
+      (when-not (contains? (get tp tag) parent)
+        (when (contains? (get ta tag) parent)
+          (throw {:error :invalid-derivation :message (print-str tag "already has" parent "as ancestor")}))
+        (when (contains? (get ta parent) tag)
+          (throw {:error :invalid-derivation :message (print-str "Cyclic derivation:" parent "has" tag "as ancestor")}))
+        {:parents (assoc tp tag (conj (get tp tag #{}) parent))
+         :ancestors (tf ta tag td parent ta)
+         :descendants (tf td parent ta tag td)})
+      h))))
+
+; (underive h tag parent) → h without the edge, rebuilt by deriving
+; every remaining edge into an empty hierarchy, as Clojure's; h itself
+; when it has no such edge.
+(defn underive
+  ([tag parent] (alter-var-root #'global-hierarchy underive tag parent) nil)
+  ([h tag parent]
+   (let [parent-map (:parents h)
+         childs-parents (if (get parent-map tag) (disj (get parent-map tag) parent) #{})
+         new-parents (if (not-empty childs-parents)
+                       (assoc parent-map tag childs-parents)
+                       (dissoc parent-map tag))
+         deriv-seq (flatten (map #(cons (key %) (interpose (key %) (val %))) (seq new-parents)))]
+     (if (contains? (get parent-map tag) parent)
+       (reduce #(apply derive %1 %2) (make-hierarchy) (partition 2 deriv-seq))
+       h))))
+
+; ============================================================
 ; The command line
 ; ============================================================
 

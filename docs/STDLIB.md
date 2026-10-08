@@ -92,7 +92,7 @@ Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies §9; the macros MACROEXPAND.md §2b |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -475,3 +475,36 @@ returns a realized list where Clojure returns a lazy seq.
 | `parse-uuid` | 1 | The canonical text of the UUID a string spells as 8-4-4-4-12 hex digits of either case, else nil (Java's lenient short groups included); a non-string is `:kind-mismatch` |
 | `uuid?` | 1 | Whether `x` is a string in the canonical form (so `(uuid? (random-uuid))` is true, and an uppercase spelling is not) |
 | `re-pattern`, `re-matcher`, `re-find`, `re-matches`, `re-groups`, `re-seq` | 1, 2, 1–2, 2, 1, 2 | Clojure's regular expressions, over the linear-time engine of `docs/REGEX.md`, which owns their rows (§9 there): `(re-find #"\d+" "ab12")` is `"12"`, `(re-seq #"(\w)=(\d)" "a=1 b=2")` is `(["a=1" "a" "1"] ["b=2" "b" "2"])`, lazy |
+
+---
+
+### 9. Multimethods and hierarchies
+
+Clojure 1.12's hierarchies, in `core.nx` (the "Hierarchies and
+multimethods" section): `core.clj` from `make-hierarchy` through
+`underive`, ported.
+
+#### 9.1 Hierarchies
+
+A hierarchy is the map `{:parents {} :descendants {} :ancestors {}}`:
+each tag's set of direct parents, and the transitive closures of its
+ancestors and of its descendants, which `derive` and `underive` keep.
+It is a plain map, so it compares, prints and serializes as one. The
+global hierarchy is the private Var `nexis.core/global-hierarchy`,
+as Clojure's: the arities without a hierarchy read its root, and
+`derive` and `underive` change it with `alter-var-root`, so
+`(with-redefs [nexis.core/global-hierarchy (make-hierarchy)] ...)`
+and `@#'nexis.core/global-hierarchy` reach it as Clojure's tests do.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `make-hierarchy` | 0 | The empty hierarchy |
+| `isa?` | 2, 3 | `(isa? h child parent)`: true when `(= child parent)`, when `parent` is among `child`'s ancestors in `h`, or when both are vectors of one count whose elements are `isa?` pairwise (`(isa? h [:user/a :user/b] [:user/p :user/q])`; `(isa? [] [])` is true). A non-hierarchy `h` gives false where Clojure's call of `(:ancestors h)` throws |
+| `parents`, `ancestors`, `descendants` | 1, 2 | The tag's set of direct parents, of ancestors, of descendants; nil when it has none |
+| `derive` | 2, 3 | `(derive h tag parent)`: `h` with `tag` a child of `parent`, the closures updated as Clojure's do; `h` itself (`identical?`) when the edge exists. `tag` and `parent` must differ and both be keywords or symbols, else `:assertion-failed` with the text of Clojure's assertion (`"Assert failed: (not= tag parent)"`). An edge whose parent is already an ancestor of the tag is `{:error :invalid-derivation :message "T already has P as ancestor"}`, one that would make a cycle `"Cyclic derivation: P has T as ancestor"`, the tags printed by `print-str`. `(derive tag parent)` changes the global hierarchy and returns nil; there `parent` must have a namespace and so must the tag, else `:assertion-failed`, and `namespace` of a non-ident is `:kind-mismatch`, as Clojure's cast fails |
+| `underive` | 2, 3 | `(underive h tag parent)`: `h` without the edge, rebuilt by deriving every remaining edge into an empty hierarchy, as Clojure's; `h` itself when there is no such edge. The 2-arity changes the global hierarchy and returns nil |
+
+There is no supertype relation between kinds: `isa?`, `parents` and
+`ancestors` follow only the edges `derive` made, where Clojure's also
+walk Java's superclasses and interfaces, and `descendants` of any tag
+reads the hierarchy, where Clojure's throws for a class.
