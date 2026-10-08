@@ -449,10 +449,11 @@ behind it realizes. With `CompileOptions.clear_locals`, on unless a
 caller turns it off (a debugger showing locals would), `finish`
 rewrites each `mov:move` of a slot that no path reads again before
 writing it into `mov:move-clear` (VM.md §10.1), which leaves the slot
-nil (`clearDeadMoves`). It runs
-on every routine the Emitter finishes, after every jump is patched
-and before quickening (§4.5), and changes only variants: each
-instruction keeps its pc, its span and its operands.
+nil (`clearDeadMoves`). It runs on every routine the Emitter
+finishes, after every jump is patched and before quickening (§4.5),
+and changes only variants: each instruction keeps its pc, its span
+and its operands. A routine with no move of one slot to another is
+done at once.
 
 **Liveness** is over slots and over the routine's own bytecode, as
 it runs, not over the Tiny tree: the Emitter writes an inert block
