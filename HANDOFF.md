@@ -449,15 +449,16 @@ after numbers in the commit message.
 1. The Linux gaps (`docs/PERF.md` §3.15, at `97e2d11`): nexis leads
    babashka on startup and eight of the ten programs, is level on string
    splitting and trails on the `map`/`filter`/`reduce` pipeline (1.30).
-   Warm JVM Clojure is faster on eight of ten: `fib` 6.0×, the
+   Warm JVM Clojure is faster on seven of ten: `fib` 6.0×, the
    destructuring loop 5.5×, the pipeline 2.7×, vectors 2.6×, string
-   splitting 2.4×, the map build 2.1×, `sort` 1.3×, the transient map
-   1.2×; nexis leads on the counting loop (0.71) and on
-   `frequencies`/`group-by` (0.92). Nextomic leads every system on every
+   splitting 2.4×, the map build 2.1×, the transient map 1.2×; nexis
+   leads on the counting loop (0.71), on `frequencies`/`group-by`
+   (0.92) and on `sort` (93–96 ms against 147 ms, `docs/PERF.md`
+   §3.32). Nextomic leads every system on every
    phase timed cold but Datalevin's durable commit (1.12), and is level
    with Datomic Pro's warm peer on lookups (0.97). The levers the
    numbers name:
-   - `sort` (`docs/PERF.md` §3.31): the natural order compares
+   - `sort` (`docs/PERF.md` §3.32): the natural order compares
      two fixnum keys in place and reads any other pair's order without
      the `VmError!Order` that Zig 0.17's x86-64 code stored and could
      not forward; the million-int sort runs in 93–96 ms on the Linux

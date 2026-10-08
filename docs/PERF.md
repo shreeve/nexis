@@ -75,7 +75,7 @@ the §3 rows.
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
 §3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5, as are §3.16 onward; §3.15 and §3.31's first tables on an Intel Core Ultra 9 185H under Linux;
+an Apple M5, as are §3.16 onward; §3.15 and §3.32's first tables on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -737,7 +737,8 @@ What the language rows say:
   forward. Built by Zig 0.16 at `95791b0`, the program runs the phase
   in 144 ms; built at `1489ef9`, which moves the tree to Zig 0.17 and
   leaves the sort code as it is, in 181 ms, the process retiring 1.4%
-  fewer instructions in 21% more cycles.
+  fewer instructions in 21% more cycles. §3.32 compares the keys in
+  registers: 93–96 ms on this host.
 
 **Database.** 100 departments and 100,000 people with five attributes.
 The durability of each row (`docs/BENCH.md` §12, traced with `strace`):
@@ -1994,7 +1995,7 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
-- *Sort keys compared in registers* (§3.31): `sort` and `sort-by` in
+- *Sort keys compared in registers* (§3.32): `sort` and `sort-by` in
   the natural order compare two fixnum keys in place and read any
   other pair's `OrderError!Order` from `sorted.naturalOrder` as it is,
   where a conversion to `VmError!Order` makes Zig 0.17's x86-64 code
