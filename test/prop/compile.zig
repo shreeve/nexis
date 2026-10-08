@@ -296,6 +296,12 @@ const cases = [_]Case{
     .{ .src = "(do (defn f [& xs] (into [:old] xs)) (def gen (atom 0)) (defn g [] (let [k (swap! gen inc)] (defn f [& xs] (into [k] xs))) 0) [(f (f (f (g)))) (f (g) (f 1))])", .out = "[[:old [:old [:old 0]]] [1 0 [2 1]]]" },
     .{ .src = "(do (defn f [x] [:old x]) (def n (atom 0)) (f (loop* [] (let* [v (f 1)] (if (< (swap! n inc) 3) (do (defn f [x] [:new x]) (recur)) v)))))", .out = "[:old [:new 1]]" },
     .{ .src = "(do (declare nope) (def log (atom [])) (try (nope (nope (swap! log conj 1))) (catch any e [e @log])))", .out = "[:unbound-var []]" },
+    // A call whose arguments run no code reads its Var at the call, each
+    // time it runs: a redefinition between two runs of one call site, a
+    // binding in force, a with-redefs.
+    .{ .src = "(do (def h even?) (loop [i 0 acc []] (if (< i 4) (do (when (= i 2) (def h odd?)) (recur (inc i) (conj acc (h i)))) acc)))", .out = "[true false false true]" },
+    .{ .src = "(do (defn ^:dynamic dh ([x] [:root x]) ([x y] [:root x y])) (defn use-dh [x y] [(dh x) (dh x y)]) [(use-dh 1 2) (binding [dh (fn ([x] [:bound x]) ([x y] [:bound x y]))] (use-dh 1 2)) (use-dh 3 4)])", .out = "[[[:root 1] [:root 1 2]] [[:bound 1] [:bound 1 2]] [[:root 3] [:root 3 4]]]" },
+    .{ .src = "(do (defn pick [v i] (nth v i)) [(with-redefs [nth (fn [v i] [:redef i])] (pick [1 2] 0)) (pick [1 2] 1)])", .out = "[[:redef 0] 2]" },
     // Varargs, apply, a throw from a nested argument, recur arguments
     // and closures over the locals the calls read.
     .{ .src = "(do (defn v [a & r] (into [a] r)) [(v 1 (v 2 (v 3 4 5) 6) (apply v 7 (v 8 9) [(v 10)])) (apply v (apply v 1 [2]) (v 3) [])])", .out = "[[1 [2 [3 4 5] 6] [7 [8 9] [10]]] [[1 2] [3]]]" },
