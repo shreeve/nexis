@@ -423,6 +423,37 @@ fit, goes through `callValue` every time, so
 the results, errors, error details, traces and rooting are
 `callValue`'s.
 
+**Batched calls.** A native that calls a closure once per element of
+a run it holds calls it through `Callback.each` (`out[i] = (f
+items[i])`), `fold` (`acc = (f acc items[i])`) or `foldRange` (the same
+over an unrealized range or `repeat`, whose elements are computed),
+which make the run's calls in one pass of the chain. The first
+element's is a prepared call as above. The return of each element's
+frame into the callback's cell goes on in that frame: its result goes
+to its place (`each`'s into a block a root reaches, a buffer only
+tested for truth, or a root-stack region by index; `fold`'s
+accumulator into the window's first slot, as the next call's
+argument), the next element's arguments and nil locals go into the
+window, the frame is reset to the one the first call pushed, the safe
+point a call's entry is taken, and the chain goes on at the callee's
+first instruction, so the native is re-entered once per run rather
+than once per element. `fold` and `foldRange` end the pass after a
+result that is a record, which the native tests for `reduced`. Every
+element is still a call of its own, with a frame of its own: the pop
+of one element's and the push of the next one's are fused, at the same
+depth, with the same routine, base, upvalues and closure, so `PLAN.md`
+§23 #19 holds, and a trace, `:stack-overflow` (checked at the first
+call, the depth constant), dynamic bindings and `try` handlers (keyed
+by frame index) are what one call per element gives. An element's
+error goes on to the loop as a prepared call's does: caught inside the
+callee, the callee returns and the pass goes on inside the loop;
+caught below the native, the throw unwinds past the frame and the
+native's call ends with `ControlTransferred`; with no handler, the
+frame stands at the failing instruction. A callee that is not a
+closure the count enters at a fixed arity, or a run that finds the
+depth or the stack length changed, gets one `call` per element, with
+its results, errors and rooting.
+
 **Leaf natives.** A native whose descriptor sets `NativeFn.leaf`
 never re-enters the VM and never compares, hashes or prints nested
 data (arithmetic, numeric and kind predicates, the lookups below), so
@@ -641,7 +672,12 @@ instruction.
   reading the target in place. `call:return` from any frame but the top-level
   one pops it and continues in the caller, or fills the cell of the
   host that pushed it (`callValue`, `runRoutine`, a `Callback`) and
-  ends the chain. Every other call goes through the general entry of
+  ends the chain; the return of a batch's frame (§6) goes on from the
+  cell to a part out of line, which starts the next element in the
+  same frame or, after the last, pops it and ends the chain, so a
+  return to bytecode pays nothing for batches. The general
+  `call:return` goes on the same way, the reset frame's `pc` 0 where
+  its fetch resumes. Every other call goes through the general entry of
   §6, with the same traps.
 - **A comparison and its branch.** When the instruction after a
   `cmp:*` is a `jump:if-false` or `jump:if-true` testing the slot the
