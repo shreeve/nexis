@@ -47,7 +47,7 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     Clojure clears a `^:once` body's fields; clearing a cell needs a
     cell write `docs/VM.md` §6 rules out, and its own design. `sort`
     and `sort-by` do not consume their seq either: they gather every
-    element before they sort (`docs/LAZY.md` §9; TODO #3).
+    element before they sort (`docs/LAZY.md` §9).
 18. **Calls on x86-64 save callee-saved registers.** `fastCall` saves
     six, `fastCallSelf` four and the comparisons three (`zig build
     codegen`; `docs/PERF.md` §6 "Frameless fast handlers on x86-64"),
