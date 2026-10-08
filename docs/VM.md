@@ -162,8 +162,9 @@ every wide field inside its table, a jump target, a `try`'s catch and
 finally pcs and `ctrl:try-exit`'s continuation inside the code; every
 `call:call` and `coll:*` block, every `call:self`'s arguments and
 every `call:lookup-or`'s two slots inside the frame; every
-`call:self`'s count the routine's own fixed arity, in a routine with
-no rest parameter; every `call:lookup` and `call:lookup-or` key a
+`call:self`'s count a fixed arity of the routine's arity table, the
+routine's own when it has no rest parameter or a sibling's
+`fixed[count]`, never a count only a rest clause takes; every `call:lookup` and `call:lookup-or` key a
 keyword or symbol constant; every quickened instruction's operands of
 the kinds its form promises, a fixnum constant holding a fixnum, a
 comparison quickened with its jump followed by that jump on its
@@ -321,9 +322,12 @@ instruction.
 own closure, the compiler's lowering of a `fn*` calling its self-name
 (`COMPILER.md` §5.5): the arguments are `slot[A + i]`, the callee's
 window begins at `slot[A]`, and there is no callee to read or test.
-Verification proved `argc` the routine's fixed arity (§5), so the call
-enters the frame's own routine, checks only the frame chain and the
-stack, and traps as a closure call does (`StackOverflow` at
+Verification proved `argc` a fixed arity of the routine's table (§5),
+so the call enters the frame's own routine when `argc` is its fixed
+arity and it has no rest parameter, else the table's `fixed[argc]`, a
+clause of the same fn calling another, with no further test. It
+checks only the frame chain and the stack, and traps as a closure
+call does (`StackOverflow` at
 `VM.max_frames`, `OutOfMemory`). The new frame shares the caller's
 closure and cells. The top-level frame,
 which runs no closure, has none to call: `BytecodeCorruption`.
@@ -611,7 +615,8 @@ instruction.
   arity table (a test of the routine's own arity, then a bounds check
   and a load from the table, §6), where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
-  `call:self` the same with the frame's own closure, and `callValue`
+  `call:self` the same with the frame's own closure and the member its
+  count names, and `callValue`
   enters a closure the same way; a leaf native within
   its arity reads its arguments in place (§6), and any other native
   within its arity and `max_native_args` (8) arguments gets them
@@ -739,7 +744,7 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 1 | `call:tailcall` | | Traps `UnimplementedOpcode` |
 | 2 | `call:return` | A=any | Return `resolve(A)`; halt from the outermost frame |
 | 3 | `call:return-nil` | | Return nil |
-| 4 | `call:self` | A=window slot, B=argc (immediate), C=result slot | Call the frame's own closure with `slot[A..A+argc]` (§6) |
+| 4 | `call:self` | A=window slot, B=argc (immediate), C=result slot | Call the frame's own closure with `slot[A..A+argc]`, entering the frame's routine or the member of its arity table that takes `argc` (§6) |
 | 5 | `call:lookup` | A=slot, B=any, C=keyword or symbol constant | `slot[A] := (C resolve(B))` (§6) |
 | 6 | `call:lookup-or` | A=slot, B=slot, C=keyword or symbol constant | `slot[A] := (C slot[B] slot[B+1])` (§6) |
 
@@ -1059,7 +1064,7 @@ run):
 | `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a `call:lookup-or`'s second slot past the frame; a jump target or a `try`'s pc past the code |
 | `InvalidOperandKind` | Verification: an operand read as a slot (a destination, a block's base, a cell) that is not one; a lookup key that is not a keyword or symbol constant; a quickened instruction's operand not of the kind its form promises, a slot, an upvalue or a constant holding a fixnum (§10.10). Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
-| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter, an arity table a call cannot pick from (a member not at its place, another table's member, a fixed entry of another arity, a last fixed entry that is null, a rest clause without a rest parameter or below a fixed arity, a table of one, §5), a comparison quickened with its jump not followed by that jump on its slot, a step not followed by the comparison it names reading its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is no fixed arity of its routine's arity table (its own, without a rest parameter, or a sibling's), an arity table a call cannot pick from (a member not at its place, another table's member, a fixed entry of another arity, a last fixed entry that is null, a rest clause without a rest parameter or below a fixed arity, a table of one, §5), a comparison quickened with its jump not followed by that jump on its slot, a step not followed by the comparison it names reading its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block, or a `call:self`'s arguments, past the frame's slot count |
 | `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues; two members of an arity table with different upvalue counts. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |

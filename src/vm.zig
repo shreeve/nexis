@@ -952,8 +952,9 @@ pub const Routine = struct {
             const self_call = op == VM.opcode(.call, Call.self_);
             const end = @as(u32, inst.a.index) + inst.b.index + @intFromBool(is_call and !self_call);
             if (end > self.slot_count) return if (is_call) VmError.CallBlockOutOfRange else VmError.OperandOutOfRange;
-            // A self-call is this routine's: its count is the fixed arity.
-            if (self_call and (self.variadic or inst.b.index != self.fixed_arity)) return VmError.BytecodeCorruption;
+            // A self-call enters a fixed arity of this routine's table,
+            // its own or a sibling's; `verifyTable` proved the table.
+            if (self_call and self.memberFor(inst.b.index) == null) return VmError.BytecodeCorruption;
         }
         if (shape.pair and @as(u32, inst.b.index) + 2 > self.slot_count) return VmError.OperandOutOfRange;
     }
@@ -4384,7 +4385,8 @@ pub const VM = struct {
     }
 
     /// `call:self` past the fast handler's case, through the closure
-    /// entry of §6 with its traps.
+    /// entry of §6 with its traps, which picks the member the count
+    /// names.
     fn opCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
         frame.pc = @intCast(pc);
         // Only a closure's frame runs one: a top-level routine's has
@@ -4674,15 +4676,16 @@ pub const VM = struct {
 
     /// `call:self` where the frame chain and the stack's capacity have
     /// room: the callee is the frame's own closure, and verification
-    /// proved the count its routine's fixed arity, so the frame is
-    /// pushed as `fastCall` pushes a closure's with no callee to read
-    /// or test.
+    /// proved the count the fixed arity of the frame's routine or of a
+    /// member of its table, so the frame is pushed as `fastCall` pushes
+    /// a closure's with no callee to read or test.
     fn fastCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         const callee = loadWords(&frame.closure);
         if (callee.kind() != .function) return self.general(frame, inst, pc);
         const argc: u32 = inst.b.index;
-        const routine = frame.routine;
-        proved(!routine.variadic and argc == routine.fixed_arity and inst.a.index + argc <= routine.slot_count);
+        const own = frame.routine;
+        proved(own.memberFor(argc) != null and inst.a.index + argc <= own.slot_count);
+        const routine = if (argc == own.fixed_arity and !own.variadic) own else own.arities.?.fixed[argc].?;
         const base: usize = @as(usize, frame.base_slot) + inst.a.index;
         const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
@@ -8776,7 +8779,7 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "an upvalue the routine has not", .code = &.{ asm_.moveFrom(0, Operand.upvalue(0)), r }, .err = VmError.UpvalueOutOfRange, .pc = 0 },
         .{ .name = "a call block past the frame", .code = &.{ asm_.callCall(0, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
         .{ .name = "a self-call's arguments past the frame", .code = &.{ asm_.callSelf(1, 2, 0), r }, .err = VmError.CallBlockOutOfRange, .pc = 0 },
-        .{ .name = "a self-call of a count not the routine's arity", .code = &.{ asm_.callSelf(0, 1, 0), r }, .err = VmError.BytecodeCorruption, .pc = 0 },
+        .{ .name = "a self-call of a count no member of the routine's table takes", .code = &.{ asm_.callSelf(0, 1, 0), r }, .err = VmError.BytecodeCorruption, .pc = 0 },
         .{ .name = "a lookup key not a constant", .code = &.{ Inst.primary(.call, Call.lookup, sl(0), sl(0), sl(1)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
         .{ .name = "a lookup key neither keyword nor symbol", .code = &.{ asm_.callLookup(0, sl(0), 0), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
         .{ .name = "a lookup key past the pool", .code = &.{ asm_.callLookup(0, sl(0), 1), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
@@ -9494,6 +9497,77 @@ test "VM dispatch: a member's constants live while the member runs and allocates
     try testing.expect(vm.gc_cycles > 0);
 }
 
+/// `(fn f ([n] (if (< n 1) 0 (+ n (f (- n 1) n)))) ([n _] (f n)) ([n _ & _] (f n)))`:
+/// every call switches arity through `call:self`, the rest clause's to
+/// a fixed sibling.
+const SelfClauses = struct {
+    one: Routine = .{
+        .code = &.{
+            asm_.cmpLt(1, sl(0), kn(0)),
+            asm_.jumpIfFalse(4, sl(1)),
+            asm_.loadConst(1, 1),
+            asm_.returnSlot(1),
+            Inst.primary(.math, Math.sub, sl(2), sl(0), kn(0)),
+            asm_.move(3, 0),
+            asm_.callSelf(2, 2, 2),
+            asm_.mathAdd(1, sl(0), sl(2)),
+            asm_.returnSlot(1),
+        },
+        .consts = &.{ fx(1), fx(0) },
+        .slot_count = 4,
+        .fixed_arity = 1,
+        .name = "f",
+    },
+    two: Routine = .{ .code = &.{ asm_.move(2, 0), asm_.callSelf(2, 1, 2), asm_.returnSlot(2) }, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "f" },
+    rest: Routine = .{ .code = &.{ asm_.move(3, 0), asm_.callSelf(3, 1, 3), asm_.returnSlot(3) }, .consts = &.{}, .slot_count = 4, .fixed_arity = 2, .variadic = true, .name = "f" },
+    fixed: [3]?*const Routine = undefined,
+    table: Arities = undefined,
+
+    fn link(t: *SelfClauses) void {
+        t.fixed = .{ null, &t.one, &t.two };
+        t.table = .{ .fixed = &t.fixed, .rest = &t.rest };
+        linkTable(&t.table);
+    }
+};
+
+test "VM dispatch: call:self enters any fixed member of its routine's table, on the direct path and past it" {
+    var t: SelfClauses = .{};
+    t.link();
+    // 10000 deep, so the frames and the stack outgrow their capacity
+    // and the general handler takes the calls that grow them; entered
+    // at each member.
+    const caps = [_]CaptureDescriptor{.{ .routine = &t.one, .sources = &.{} }};
+    const consts = [_]Value{ fx(10_000), fx(0) };
+    for (1..4) |argc| {
+        var code: [6]Inst = undefined;
+        code[0] = asm_.closureMake(0, 0);
+        for (0..argc) |i| code[1 + i] = asm_.loadConst(@intCast(1 + i), @min(i, 1));
+        code[1 + argc] = asm_.callCall(0, @intCast(argc), 0);
+        code[2 + argc] = asm_.returnSlot(0);
+        var top = makeRoutine(code[0 .. 3 + argc], &consts, 4, "top");
+        top.capture_descs = &caps;
+        var vm = try VM.init(testing.allocator, &top);
+        defer vm.deinit();
+        try testing.expectEqual(fx(50_005_000), try vm.run());
+        // One frame per call, two calls per step down.
+        if (VM.track_high_water) try testing.expectEqual(20_002 + @as(usize, @intFromBool(argc > 1)), vm.frame_high_water);
+    }
+}
+
+test "Routine.verify: call:self names a fixed member of the routine's table, never a count only the rest clause takes" {
+    var t: SelfClauses = .{};
+    t.link();
+    var failure: VerifyFailure = undefined;
+    try t.one.verify(&failure);
+    // A count with no fixed member, and one only the rest clause takes.
+    t.two.slot_count = 6;
+    for ([_]u12{ 0, 3 }) |argc| {
+        t.two.code = &.{ asm_.move(2, 0), asm_.callSelf(2, argc, 2), asm_.returnSlot(2) };
+        try testing.expectError(VmError.BytecodeCorruption, t.one.verify(&failure));
+        try testing.expectEqualStrings("f", failure.routine.name);
+        try testing.expectEqual(@as(u32, 1), failure.pc);
+    }
+}
 test "VM closure call: same closure called twice — both invocations succeed" {
     // Child returns its single arg incremented by 1.
     const child_consts = [_]Value{value_mod.fromFixnum(1).?};
