@@ -107,18 +107,18 @@ still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][a:4][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
-| `nx/aevt` | `[a:4][e:6][v]` | `[t:6]` |
-| `nx/avet` | `[a:4][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
-| `nx/vaet` | `[v:6][a:4][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][a:4][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
-| `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
-| `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
-| `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
+| `nx/eavt` | `[e:6][A(a)][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
+| `nx/aevt` | `[A(a)][e:6][v]` | `[t:6]` |
+| `nx/avet` | `[A(a)][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
+| `nx/vaet` | `[v:6][A(a)][e:6]` | `[t:6]` (ref attrs only) |
+| `nx/eavt-h` | `[e:6][A(a)][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
+| `nx/aevt-h` | `[A(a)][e:6][v][top:6]` | empty |
+| `nx/avet-h` | `[A(a)][v][e:6][top:6]` | empty (indexed and unique attrs only) |
+| `nx/vaet-h` | `[v:6][A(a)][e:6][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | the entry (below): flags, instant, the datoms in write order, and on an entry an excision touched the entities it excised |
 | `nx/idents` | `[0x00][utf8 text]` / `[0x01][id:4]` / `[0x02][utf8 text]` | id / text / id of a name a rename retired |
 | `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"ft"`, `"n"[a:4]` | see §2.3 |
-| `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
+| `nx/fulltext` | `[A(a)][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 A txlog entry (`datom.zig`) is bytes: a flags byte, the instant as a
 zigzag LEB128, the row count as a LEB128, the rows, and when an
@@ -138,8 +138,15 @@ follows, and whether the transaction entity's `:db/txInstant` of the
 header's instant is the last datom, which the header then holds
 alone.
 
-`top` = `(t << 1) | added`. `v` is always followed only by fixed-width
-fields, so it is `key[prefix .. len - suffix]` with no length byte.
+`top` = `(t << 1) | added`. `A(a)` is the attribute id as an ordered
+varint (SQLite4's): one byte up to 240, two up to 2287, three up to
+67823, then a byte giving the length and the id's 3 or 4 bytes; its
+byte order is numeric order, and its first byte gives its length, so no
+encoding is a prefix of another. A key parses forward: every field but
+`v` gives its own length, and `v` runs to the fixed-width field that
+follows it, or to the key's end, with no length byte. The decoder
+refuses an ordered varint longer than it need be, so equal ids have
+equal bytes.
 
 A fact's latest assertion, while the fact is current, lives in the
 current trees alone; a history tree holds every other row of the fact,
@@ -152,15 +159,17 @@ trees empty. A read that finds H1 broken is `:db/corrupted`.
 
 ### 2.1 Identifiers
 
-All ids are stored big-endian in 6 bytes and fit the VM's `fixnum`
-(i48), so the usable range is `0 .. 2^47-1`. An id, a `t` or a `sys`
+Entity ids are stored big-endian in 6 bytes, an attribute or ident id
+in an index key as `A(a)` (§2) and in `sys` and `nx/idents` in 4 bytes;
+every id fits the VM's `fixnum` (i48), so the usable range is
+`0 .. 2^47-1`. An id, a `t` or a `sys`
 counter read back from the file outside its range is `:db/corrupted`,
 never trusted; a partition or `t` that would run past its range is
 `:db/map-full`.
 
 | partition | range | source |
 |---|---|---|
-| attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its 4-byte `a` |
+| attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its `a` |
 | user entities | `2^32 .. 2^46-1` | `sys/"eid"` |
 | transaction entities | `2^46 \| t` | the logical `t` of the transaction |
 
@@ -169,7 +178,7 @@ never trusted; a partition or `t` that would run past its range is
 or an engine-level rollback can never leave `t` ahead of the data.
 
 Keyword *values* (enums) are interned in `nx/idents` exactly like
-attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
+attributes and stored by id, so `:db/ident` refs and enum values
 are the same mechanism. They sort by id, not by text. An ident's text
 is a property of its id, not a datom value; a rename (§3 step 5) moves
 the old text to the retired names, which only keep it from being minted
@@ -190,7 +199,7 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x10` | long | `i64 ^ 0x8000_0000_0000_0000`, big-endian |
 | `0x18` | double | IEEE bits `b`: sign set → `~b`, else `b ^ 0x8000…`; `-0.0` stored as `+0.0`; NaN rejected (`:nextomic/value-type`) |
 | `0x20` | instant | i64 milliseconds, encoded like long |
-| `0x30` | keyword | `[ident-id:4]` |
+| `0x30` | keyword | `A(ident-id)` |
 | `0x40` | ref | `[eid:6]` |
 | `0x50` | string ≤ 96 bytes | UTF-8 with `0x00 → 0x00 0xFF`, terminated by `0x00` |
 | `0x50` | string > 96 bytes | first 64 escaped bytes, `0x00`, `0x01`, then a 128-bit hash of the whole string |
@@ -240,9 +249,9 @@ Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
 
-Worst-case index key: AVET with a 96-byte string, `4 + 1 + 193 + 6 + 6
-= 210` bytes, inside emdb's 256-byte search-clue buffer. An
-`nx/fulltext` key reaches `4 + 255 + 1 + 6 + 16 = 282` bytes; a key
+Worst-case index key: AVET with a 96-byte string, `5 + 1 + 193 + 6 + 6
+= 211` bytes, inside emdb's 256-byte search-clue buffer. An
+`nx/fulltext` key reaches `5 + 255 + 1 + 6 + 16 = 283` bytes; a key
 past 256 bytes bypasses the clue (a slower seek, not an error).
 
 ### 2.3 `sys` tree

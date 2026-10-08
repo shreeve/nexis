@@ -657,7 +657,7 @@ pub const Store = struct {
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
-        for (batch) |p| total += key.id_len + key.attr_len + p.vbytes.len;
+        for (batch) |p| total += key.id_len + key.attr_key_max + p.vbytes.len;
         var keys: std.ArrayList(u8) = .empty;
         try keys.ensureTotalCapacityPrecise(arena, total);
         const offsets = try arena.alloc(u32, batch.len + 1);
@@ -788,10 +788,10 @@ pub const Store = struct {
     pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
         if (vbytes.len > key.max_val_len) return error.Corrupted;
         var buf: [key.max_key_len]u8 = undefined;
-        key.writeId(buf[0..key.id_len], e);
-        key.writeAttr(buf[key.id_len..][0..key.attr_len], a);
-        @memcpy(buf[key.id_len + key.attr_len ..][0..vbytes.len], vbytes);
-        const row = (try txn.getFromTree(self.trees.cur(.eavt), buf[0 .. key.id_len + key.attr_len + vbytes.len])) orelse return null;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
+        try key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, null);
+        const row = (try txn.getFromTree(self.trees.cur(.eavt), k.items)) orelse return null;
         if (row.len <= key.id_len) return error.Corrupted;
         return try arena.dupe(u8, row[key.id_len..]);
     }
@@ -1232,7 +1232,7 @@ test "a page that fails its check ends a scan with an error, never early" {
     try testing.expectError(error.InvalidPage, s.next());
     var f = try Store.foldScan(txn, store.trees, .eavt, &.{}, null, .{ .as_of = 1 });
     try testing.expectError(error.InvalidPage, f.next());
-    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, fact[key.id_len + key.attr_len ..], arena));
+    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, (try key.unpackKey(.eavt, false, fact)).v, arena));
 }
 
 test "open bootstraps once and reopen finds the same ids" {
@@ -1574,12 +1574,12 @@ test "a batch holds what writing its datoms one at a time holds" {
         const index: Index = @fromBackingInt(@intCast(ix));
         // The bootstrap's datoms differ in their instants: compare the
         // keys the batches can hold.
-        var start: [key.id_len]u8 = undefined;
-        if (index == .eavt or index == .vaet) key.writeId(&start, 1 << 33) else key.writeAttr(start[0..key.attr_len], 100);
-        const from = if (index == .eavt or index == .vaet) start[0..] else start[0..key.attr_len];
-        var tx_start: [key.id_len]u8 = undefined;
-        key.writeId(&tx_start, key.tx_partition_bit);
-        const to: ?[]const u8 = if (index == .eavt) &tx_start else null;
+        const from = try key.prefixBytes(arena, index, switch (index) {
+            .eavt => .{ .e = 1 << 33 },
+            .vaet => .{ .v = try key.valBytes(arena, .{ .ref = 1 << 33 }) },
+            else => .{ .a = 100 },
+        });
+        const to: ?[]const u8 = if (index == .eavt) try key.prefixBytes(arena, .eavt, .{ .e = key.tx_partition_bit }) else null;
         var scans: [2]Store.Scan = undefined;
         for (&scans, txns, [_]*Store{ batched, single }) |*sc, txn, store|
             sc.* = try Store.scanRange(txn, if (history) store.trees.hist(index) else store.trees.cur(index), from, to);

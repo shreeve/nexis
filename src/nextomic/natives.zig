@@ -1092,15 +1092,14 @@ fn indexRangeNative(vm: *VM, args: []const Value, detail: *Detail) !Value {
     const start: ?Val = if (args[2].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[2], &fault)) orelse return error.ValueType;
     const end: ?Val = if (args[3].isNil()) null else (try marshal.valOf(&sc.rd, arena, attr.value_type, args[3], &fault)) orelse return error.ValueType;
 
-    var abuf: [key.attr_len]u8 = undefined;
-    key.writeAttr(&abuf, attr.id);
-    const lo: []const u8 = if (start) |v| try std.mem.concat(arena, u8, &.{ &abuf, try rangeBound(arena, v) }) else &abuf;
+    const abuf = try key.prefixBytes(arena, .avet, .{ .a = attr.id });
+    const lo: []const u8 = if (start) |v| try std.mem.concat(arena, u8, &.{ abuf, try rangeBound(arena, v) }) else abuf;
     const hi: ?[]const u8 = if (end) |v| blk: {
         const bound = try rangeBound(arena, v);
-        const class = try std.mem.concat(arena, u8, &.{ &abuf, bound });
+        const class = try std.mem.concat(arena, u8, &.{ abuf, bound });
         // A bound widened to its prefix class admits the whole class.
         break :blk if (bound.len < (try key.valBytes(arena, v)).len) try key.successor(arena, class) else class;
-    } else try key.successor(arena, &abuf);
+    } else try key.successor(arena, abuf);
 
     var hits: std.ArrayList(Datom) = .empty;
     var it = try sc.rd.scanRange(arena, .avet, lo, hi);

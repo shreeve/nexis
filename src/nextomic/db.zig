@@ -922,10 +922,9 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
 
     // AVET of :db/ident is keyed by ident id: [doc, type_double) holds
     // doc, txInstant and type_long.
-    var abuf: [key.attr_len]u8 = undefined;
-    key.writeAttr(&abuf, boot.ident);
-    const lo = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.doc }) });
-    const hi = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.type_double }) });
+    const abuf = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
+    const lo = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.doc }) });
+    const hi = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.type_double }) });
     for ([_]DbValue{ db, db.asOf(1) }) |view| {
         var rd = try view.beginRead();
         defer rd.close();
@@ -936,7 +935,7 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
         try testing.expectEqual(@as(usize, 3), n);
         try testing.expectEqualSlices(u64, &.{ boot.doc, boot.tx_instant, boot.type_long }, &seen);
         // An open end runs to the attribute's last key and past it.
-        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, &abuf)).?);
+        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, abuf)).?);
         var m: usize = 0;
         while (try open.next()) |_| m += 1;
         try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);

@@ -38,16 +38,16 @@ const tree_names = nextomic.store.tree_names;
 const Pin = struct { tree: []const u8, entries: u64, key: u64, value: u64, pages: u64 };
 
 const pinned = [_]Pin{
-    .{ .tree = "nx/eavt", .entries = 11489, .key = 224829, .value = 70134, .pages = 30 },
-    .{ .tree = "nx/aevt", .entries = 11489, .key = 224829, .value = 68934, .pages = 33 },
-    .{ .tree = "nx/avet", .entries = 4846, .key = 99598, .value = 29076, .pages = 17 },
-    .{ .tree = "nx/vaet", .entries = 2200, .key = 35200, .value = 13200, .pages = 6 },
-    .{ .tree = "nx/eavt-h", .entries = 406, .key = 10594, .value = 900, .pages = 1 },
-    .{ .tree = "nx/aevt-h", .entries = 406, .key = 10594, .value = 0, .pages = 1 },
-    .{ .tree = "nx/avet-h", .entries = 400, .key = 10000, .value = 0, .pages = 1 },
+    .{ .tree = "nx/eavt", .entries = 11489, .key = 190170, .value = 70134, .pages = 27 },
+    .{ .tree = "nx/aevt", .entries = 11489, .key = 190170, .value = 68934, .pages = 29 },
+    .{ .tree = "nx/avet", .entries = 4846, .key = 84973, .value = 29076, .pages = 17 },
+    .{ .tree = "nx/vaet", .entries = 2200, .key = 28600, .value = 13200, .pages = 6 },
+    .{ .tree = "nx/eavt-h", .entries = 406, .key = 9376, .value = 900, .pages = 1 },
+    .{ .tree = "nx/aevt-h", .entries = 406, .key = 9376, .value = 0, .pages = 1 },
+    .{ .tree = "nx/avet-h", .entries = 400, .key = 8800, .value = 0, .pages = 1 },
     .{ .tree = "nx/vaet-h", .entries = 0, .key = 0, .value = 0, .pages = 0 },
     .{ .tree = "nx/txlog", .entries = 407, .key = 2442, .value = 95728, .pages = 8 },
-    .{ .tree = "nx/fulltext", .entries = 11, .key = 490, .value = 0, .pages = 1 },
+    .{ .tree = "nx/fulltext", .entries = 11, .key = 457, .value = 0, .pages = 1 },
 };
 
 /// Every transaction's instant: fixed, so the txlog's bytes are too.

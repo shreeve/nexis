@@ -143,13 +143,15 @@ behind, the data it describes.
 | Parallel query workers | Lock-free reader registration and wait-free reads (INV-T13, INV-T14B): R-PAR scales eight readers at 1.32x LMDB in §12.2. Read-only children of a write transaction (INV-T15A, `Txn.beginReadChild`) read uncommitted state from other threads |
 | Physical replication and one-step undo | `Env.backup(sinceTxnId, out)` incremental by transaction id, `Env.restore`, `Env.rollback()`, `EnvOptions.previousSnapshot` (INV-BK01..04, INV-RB01..03) |
 
-Nextomic encodes a current-index key as `[e:6][a:4][v:type-tagged-sortable]`
-(in each index's order) with the 6-byte `t` of the fact's latest
+Nextomic encodes a current-index key as `[e:6][A(a)][v:type-tagged-sortable]`
+(in each index's order; `A(a)` the attribute id as an ordered varint,
+NEXTOMIC.md §2) with the 6-byte `t` of the fact's latest
 assertion as the value, and a history key as the same bytes followed by
 `[(t << 1) | added : 6]` with an empty value. A history tree holds only
 retired rows, a retraction and the assertion it retired, so a store
 that only adds facts leaves it empty, and a time view walks a current
-tree and its history twin merged (NEXTOMIC.md §2, §4). emdb sees only bytes; the encoding is Nextomic's concern, and the
+tree and its history twin merged (NEXTOMIC.md §2, §4). emdb sees only
+bytes; the encoding is Nextomic's concern, and the
 default byte order is exactly the order Nextomic needs.
 
 ---
@@ -169,8 +171,9 @@ Leaf prefix compression was measured on datom keys and declined
 component repeat, so a page-wide prefix saves 14 to 23% of the file and
 front coding 27 to 29%, while a prototype put scans at half to two thirds
 of their rate. Two Nextomic-side levers return more at no engine cost,
-and both are in the design: a 6-byte entity, 4-byte attribute and 6-byte
-`t` with the op folded into it (16 fixed bytes per key), and sorting a
+and both are in the design: short keys (a 6-byte entity, an attribute
+id of one or two bytes as an ordered varint, a 6-byte `t` with the op
+folded into it on history rows alone), and sorting a
 transaction's AVET and VAET inserts before they are written (leaf fill
 0.66 to 0.72 → 0.90). Reopen only for a leaf set larger than RAM, under
 the experiment §6.27 names.

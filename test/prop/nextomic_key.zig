@@ -216,11 +216,55 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     }
     const gpa = arena.reset();
     // The worst case named in §2.2: a 96-byte string of NULs escapes to
-    // 192 bytes and the AVET history key is 210 bytes.
+    // 192 bytes, and the AVET history key takes the longest attribute
+    // and entity besides.
     const worst: [key.inline_max]u8 = @splat(0);
     const wb = try key.valBytes(gpa, .{ .string = &worst });
     const wk = try key.keyBytes(gpa, .avet, key.id_max, std.math.maxInt(u32), wb, .{ .t = 1, .added = true });
-    try testing.expectEqual(@as(usize, 210), wk.len);
+    try testing.expectEqual(@as(usize, 211), wk.len);
+    try testing.expectEqual(key.max_key_len, wk.len);
+}
+
+/// The ordered varint's edges: each length's first and last value.
+const ordered_edges = [_]u64{ 0, 1, 240, 241, 2287, 2288, 67823, 67824, (1 << 24) - 1, 1 << 24, (1 << 32) - 1, 1 << 32, (1 << 40) - 1, 1 << 40, (1 << 46) - 1, 1 << 46, key.id_max, std.math.maxInt(u64) };
+
+fn randOrdered(rand: std.Random) u64 {
+    return switch (rand.uintLessThan(u8, 4)) {
+        0 => ordered_edges[rand.uintLessThan(usize, ordered_edges.len)] +% rand.intRangeAtMost(u64, 0, 2) -% 1,
+        1 => rand.uintAtMost(u64, 70_000),
+        2 => rand.int(u32),
+        else => rand.int(u64) >> rand.uintLessThan(u6, 63),
+    };
+}
+
+test "K7 ordered varints: byte order is numeric order, the first byte gives the length, the shortest form alone decodes" {
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 7, i);
+        const a = randOrdered(rand);
+        const b = randOrdered(rand);
+        var abuf: [key.ordered_max]u8 = undefined;
+        var bbuf: [key.ordered_max]u8 = undefined;
+        const x = key.writeOrdered(&abuf, a);
+        const y = key.writeOrdered(&bbuf, b);
+        try testing.expectEqual(std.math.order(a, b), std.mem.order(u8, x, y));
+        // Prefix-free: one never begins the other unless they are equal.
+        if (a != b) try testing.expect(!std.mem.startsWith(u8, x, y) and !std.mem.startsWith(u8, y, x));
+        try testing.expectEqual(x.len, key.orderedLen(x[0]));
+        const r = try key.readOrdered(x);
+        try testing.expectEqual(a, r.n);
+        try testing.expectEqual(x.len, r.len);
+    }
+    for (ordered_edges) |n| {
+        var buf: [key.ordered_max]u8 = undefined;
+        try testing.expectEqual(n, (try key.readOrdered(key.writeOrdered(&buf, n))).n);
+    }
+    // A value spelled longer than it need be is refused.
+    for ([_][]const u8{ &.{ 250, 0, 0, 5 }, &.{ 250, 1, 8, 239 }, &.{ 251, 0, 255, 255, 255 }, &.{ 255, 0, 0, 0, 0, 0, 0, 0, 1 }, &.{241}, &.{} }) |bad| {
+        try testing.expectError(error.Corrupted, key.readOrdered(bad));
+    }
 }
 
 test "K6 values of different types order by type, whatever their contents" {
