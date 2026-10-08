@@ -29,7 +29,8 @@ one implementation of `get`, `(:k m)`, `('s m)`, `(m :k)`, `(s x)`
 and `(v i)`), namespaces, Vars and the namespace registry.
 
 **Absent:**
-- Operand-specialized opcodes and inline caches.
+- Inline caches. Operand-specialized opcodes are the quickened
+  variants (§10.10).
 - Executed `transient`, `hash`, `tx`, `io` and `simd` opcodes: the
   group numbers exist and an instruction in one traps
   `UnimplementedOpcode`. Transient, hashing, durable-ref, I/O and
