@@ -20,8 +20,8 @@
 //!   - codec: encode / decode for representative Values.
 //!   - db-integrated: emdb put / get round-trip cost (the
 //!     Database-integrated category of docs/BENCH.md §2).
-//!   - nextomic: `q` over a 200k-datom store and `pull` over 20k
-//!     entities (bench/nextomic.zig).
+//!   - nextomic: `q` over a 200k-datom store, `pull` over 20k
+//!     entities, and time views of a churned store (bench/nextomic.zig).
 //!   - nextomic-store: no timings; the size of every tree of four
 //!     store shapes and the file's allocated bytes (bench/nextomic.zig,
 //!     docs/PERF.md §3.11).
@@ -748,6 +748,11 @@ pub fn main(init: std.process.Init) !u8 {
             var store = try TmpStore.init(alloc, "pull");
             defer store.deinit(alloc);
             try nextomic_bench.runPull(&runner, alloc, store.path);
+        }
+        {
+            var store = try TmpStore.init(alloc, "time");
+            defer store.deinit(alloc);
+            try nextomic_bench.runTime(&runner, alloc, store.path);
         }
     }
 
