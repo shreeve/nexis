@@ -220,12 +220,13 @@ pub const Conn = struct {
     }
 
     /// `close`, refused while an operation is in flight, after syncing
-    /// the file when a commit left it unsynced. A failed sync is
-    /// returned once the connection is closed.
+    /// the file when a commit left it unsynced and no sync of it has
+    /// failed (`Store.closingSync`). A sync that fails here is returned
+    /// once the connection is closed.
     pub fn release(self: *Conn) !void {
         if (!self.is_open) return;
         if (self.busy > 0) return error.Busy;
-        const synced = self.store.sync();
+        const synced = self.store.closingSync();
         self.close();
         return synced;
     }

@@ -1126,7 +1126,9 @@ const Ctx = struct {
     /// error comes after a commit stands: `DurabilityUnknown`, a
     /// published commit whose meta page did not sync, which reaches the
     /// caches and is then reported; emdb ends its transaction with the
-    /// abort the caller's `errdefer` runs.
+    /// abort the caller's `errdefer` runs. After it, or any failed sync
+    /// of the file, a commit that would sync is `SyncFailed` and
+    /// publishes nothing (`db.StoreFile.syncFailed`).
     fn commit(self: *Ctx) !Report {
         const db_before = self.conn.at(self.now);
         const tempids = try self.userTempids();
@@ -3608,7 +3610,7 @@ const MetaSyncFailure = struct {
     }
 };
 
-test "durability: a commit whose meta sync fails stands, reaches the caches and reports DurabilityUnknown" {
+test "durability: a commit whose meta sync fails stands and reaches the caches; the file then syncs nothing until it is reopened" {
     const tc = try TestConn.init("tx_meta_sync");
     defer tc.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3635,8 +3637,37 @@ test "durability: a commit whose meta sync fails stands, reaches the caches and 
     const after = try tc.conn.db();
     try testing.expectEqual(before.basis + 1, after.basis);
     try testing.expectEqual(@as(u64, 1), (try after.attr(name)).?.count);
-    _ = try transactOps(tc.conn, arena, add, .{});
+    const r = try transactOps(tc.conn, arena, add, .{});
     try testing.expectEqual(@as(u64, 2), (try (try tc.conn.db()).attr(name)).?.count);
+
+    // No sync is issued again (emdb INV-SYNC-04): `sync` fails, and a
+    // transaction or excision that would sync fails before it writes
+    // anything, the caches untouched, while one that syncs nothing
+    // commits.
+    const syncs = engineSyncs();
+    try testing.expectError(error.SyncFailed, tc.conn.sync());
+    try testing.expectError(error.SyncFailed, transactOps(tc.conn, arena, add, .{ .sync = .full }));
+    try testing.expectError(error.SyncFailed, transactOps(tc.conn, arena, add, .{ .sync = .no_meta }));
+    const e = value.fromFixnum(@intCast(r.tempids[0].eid)).?;
+    try testing.expectError(error.SyncFailed, excise(tc.conn, arena, e, null, .{ .sync = .full }));
+    const kept = try tc.conn.db();
+    try testing.expectEqual(r.t, kept.basis);
+    try testing.expectEqual(@as(u64, 2), (try kept.attr(name)).?.count);
+    const x = try excise(tc.conn, arena, e, null, .{});
+    try testing.expectEqual(r.t + 1, x.report.t);
+    try testing.expectEqual(@as(u64, 1), (try (try tc.conn.db()).attr(name)).?.count);
+
+    // release syncs nothing and raises nothing; reopened, the file
+    // syncs again and holds exactly the commits that published.
+    try tc.conn.release();
+    try testing.expectEqual(syncs, engineSyncs());
+    try tc.reopen();
+    const reopened = try tc.conn.db();
+    try testing.expectEqual(x.report.t, reopened.basis);
+    try testing.expectEqual(@as(u64, 1), (try reopened.attr(name)).?.count);
+    _ = try transactOps(tc.conn, arena, add, .{ .sync = .full });
+    try testing.expect(engineSyncs() > syncs);
+    try tc.conn.sync();
 }
 
 test "durability: a connection opened without :sync takes the process's (NEXIS_DURABILITY)" {

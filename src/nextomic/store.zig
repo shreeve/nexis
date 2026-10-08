@@ -396,9 +396,16 @@ pub const Store = struct {
     }
 
     /// Make every commit so far durable: one full sync, when a commit
-    /// since the last left the file unsynced.
+    /// since the last left the file unsynced; `error.SyncFailed` once a
+    /// sync of the file has failed (`db.StoreFile.sync`).
     pub fn sync(self: *Store) !void {
         try self.file.sync();
+    }
+
+    /// The sync of a `release`: `sync`, but nothing once a sync of the
+    /// file has failed (`db.StoreFile.closingSync`).
+    pub fn closingSync(self: *Store) !void {
+        try self.file.closingSync();
     }
 
     // ── sys ───────────────────────────────────────────────────────

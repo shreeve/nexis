@@ -123,8 +123,10 @@ native holds one of the connection's transactions for a callback, or
 while a Zig-level transaction is open, is refused (`TransactionsOpen`)
 before it ends anything,
 so no emdb transaction outlives its environment and no callback loses
-the transaction its native is using. A sync that fails is reported
-(`:db/sync-failed`) after the connection is closed. `shutdown` ends
+the transaction its native is using. A sync that fails there is
+reported (`:db/sync-failed`) after the connection is closed; once a
+sync of the file has failed, `close` syncs nothing and reports
+nothing (§3.3 "A failed sync is final"). `shutdown` ends
 and frees the connection's handles and closes whatever is open, for
 VM teardown.
 
@@ -275,6 +277,38 @@ without a sync or a close" commits in a child process that then
 disk can lose them. A sync that fails at teardown or exit, where no
 caller can take the error, is reported on stderr.
 
+**A failed sync is final.** Once any sync of a file fails (a
+`:durable` commit's data or meta sync, the `:db/durability-unknown`
+case among them, or a full sync at `db/sync`, `nextomic/sync`, a
+close or teardown), the file's emdb environment syncs nothing more
+until it is opened again (emdb INV-SYNC-04): a failed fsync may have
+dropped the pages it could not write and marked them clean, so a
+later sync that succeeded would prove nothing about them.
+`StoreFile.syncFailed` reads the environment's flag. Until the file
+is reopened:
+
+- `db/sync` and `nextomic/sync` raise `:db/sync-failed`, whatever is
+  unsynced;
+- a commit that would sync (`:durable`, or a Nextomic `:sync :full` or
+  `:no-meta`) raises `:db/sync-failed` before it writes anything, and
+  its transaction is aborted;
+- a commit that syncs nothing (`:commit`, `:sync :none`) commits, and
+  stays unsynced;
+- `db/close`, `nextomic/release`, the end of `with-conn` and teardown
+  sync nothing and raise nothing (`StoreFile.closingSync`): the failure
+  was reported where it happened, and raising it again would replace
+  the error a `finally` or `with-conn` is unwinding with.
+
+The flag is the environment's, never in the file, and the environment
+is the file's in this process (§3.1): every connection and Nextomic
+store of the file shares it, and one opened while another holds the
+file gets the failed environment. The recovery is to close every
+connection and release every Nextomic connection to the file; the
+next open starts a fresh environment, which syncs again and holds
+exactly the commits that were published (the inline test "after a
+commit's meta sync fails, the file syncs nothing until it is
+reopened"). What the failed sync covered stays of unknown durability.
+
 **No batching.** Consecutive `:commit` writes are separate emdb
 transactions. Joining them into one open write transaction, committed
 within a count or a deadline, would hold the file's writer between
@@ -349,7 +383,7 @@ emdb, codec, intern and allocator errors propagate unchanged.
 |---|---|
 | `open(allocator, heap, interner, path, options) !Connection` | §2, §3. |
 | `StoreFile.acquire(path, options) !*StoreFile` / `release(*StoreFile)` / `beginWrite(*StoreFile, options) !*emdb.Txn` | §3.1; the last `release` syncs (§3.3). |
-| `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced; that for every open file (§3.3). |
+| `StoreFile.commit(*StoreFile, txn) !void` / `sync(*StoreFile) !void` / `closingSync(*StoreFile) !void` / `syncFailed(*const StoreFile) bool` / `StoreFile.syncAll() void` | Commit the file's write transaction, noting whether it synced; one full sync when a commit left the file unsynced, `SyncFailed` once a sync of the file has failed; a close's sync, nothing once one has; whether one has; the closing sync of every open file (§3.3). |
 | `Durability.parse(text) ?Durability` / `Durability.process() Durability` | `commit` or `durable`; the process's, from `NEXIS_DURABILITY` (§3.3). |
 | `close(*Connection) !void` / `shutdown(*Connection) void` / `sync(*Connection) !void` | §3, §3.3. |
 | `storeId(*const Connection) u128` | §2. |
@@ -454,10 +488,12 @@ reader slots holds a read; §3.2), `:db/txn-aborted` (a write after a
 caught failure of an earlier one in the same transaction, which only
 abort can end), `:db/read-only`, `:db/sync-failed`, and
 `:db/durability-unknown`: a `:durable` commit whose meta page did not
-sync. That commit is published and every transaction sees it; it is
-durable once a later sync succeeds, and the file counts as unsynced
-(§3.3) until one does. `with-tx` reports it like any failed commit,
-though the commit stands. The emdb errors left are the ones no nexis
+sync. That commit is published and every transaction sees it, but
+whether it is on the disk is unknown, and no later sync can settle
+it: the file syncs nothing more until it is reopened, and every later
+sync and syncing commit raises `:db/sync-failed` (§3.3 "A failed sync
+is final"). `with-tx` reports it like any failed commit, though the
+commit stands. The emdb errors left are the ones no nexis
 call can meet (options it pins or never sets, operations it never
 calls); they would be `:db-error`, and the inline test "failureName"
 holds the table to `emdb.Error`.
@@ -535,8 +571,8 @@ and any operation on a closed connection or through a ref of one is
 | Form | Arity | Result |
 |---|---|---|
 | `(db/open path)` / `(db/open path {:durability d})` | 1–2 | A connection; creates the file and its parent directories. An empty path or one with a NUL byte is `:invalid-path` (§2). A file the process may only read opens read-only. `d` is `:commit` or `:durable` (§3.3), else `:invalid-argument`; nil or no `:durability` takes the process's. |
-| `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3); closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
-| `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3). |
+| `(db/close conn)` | 1 | nil; aborts the connection's open transactions, whose handles then report `:tx-closed` (§3), and syncs the file when a commit left it unsynced (§3.3), nothing once a sync of the file has failed; closing twice is nil; from a callback a native runs over one of its transactions, `:db/busy`. |
+| `(db/sync conn)` | 1 | nil once every commit to the connection's file is durable: one full sync when a commit left it unsynced (§3.3); `:db/sync-failed` once a sync of the file has failed, until it is reopened (§3.3 "A failed sync is final"). |
 | `(db/ref conn tree key)` | 3 | A durable ref (§4); prints `#<durable-ref :tree hex:…>`. |
 | `(db/ref? x)` | 1 | Whether `x` is a durable ref. |
 | `(db/put-key! ref v)` | 2 | nil; one write transaction around one put, committed as the connection's durability says (§3.3), as every commit here is. |

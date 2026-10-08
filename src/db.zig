@@ -219,8 +219,8 @@ pub const StoreFile = struct {
         return self;
     }
 
-    /// Drop one hold; the last syncs what is unsynced, closes the
-    /// environment and frees the file.
+    /// Drop one hold; the last syncs what is unsynced (`closingSync`),
+    /// closes the environment and frees the file.
     pub fn release(self: *StoreFile) void {
         self.refs -= 1;
         if (self.refs > 0) return;
@@ -258,7 +258,7 @@ pub const StoreFile = struct {
     pub fn commit(self: *StoreFile, txn: *emdb.Txn) !void {
         txn.commit() catch |err| {
             // Published and seen by every transaction, but its meta
-            // page did not sync: durable only once a later sync is.
+            // page did not sync, and nothing will (`syncFailed`).
             if (err == error.DurabilityUnknown) self.unsynced = true;
             return err;
         };
@@ -272,15 +272,40 @@ pub const StoreFile = struct {
 
     /// Make every commit so far durable with one full sync of the
     /// file, when a commit since the last sync was left without one.
+    /// `error.SyncFailed` once a sync of the file has failed
+    /// (`syncFailed`), whatever is unsynced.
     pub fn sync(self: *StoreFile) !void {
+        if (self.syncFailed()) return error.SyncFailed;
         if (!self.unsynced) return;
         try self.env.sync();
         self.unsynced = false;
     }
 
-    /// `sync` where no caller can take its error: teardown and exit.
+    /// Whether a sync of the file's environment has failed: a commit's
+    /// data or meta sync (`DurabilityUnknown` among them) or a full
+    /// sync. The environment then syncs nothing more until the file is
+    /// opened again (emdb INV-SYNC-04), since a failed fsync may have
+    /// dropped the pages it could not write and marked them clean: a
+    /// commit that would sync fails with `SyncFailed` before it writes
+    /// anything, one that syncs nothing still commits, and `sync`
+    /// fails (DB.md §3.3).
+    pub fn syncFailed(self: *const StoreFile) bool {
+        return self.env.inner.syncHasFailed();
+    }
+
+    /// The sync of a close: `sync`, but nothing once a sync of the file
+    /// has failed, which was reported where it failed. A close cannot
+    /// make the file durable then, and raising it again would hide the
+    /// error a `finally` or `with-conn` is unwinding with.
+    pub fn closingSync(self: *StoreFile) !void {
+        if (self.syncFailed()) return;
+        try self.sync();
+    }
+
+    /// `closingSync` where no caller can take its error: teardown and
+    /// exit.
     fn syncOrWarn(self: *StoreFile) void {
-        self.sync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
+        self.closingSync() catch |err| std.debug.print("nexis: syncing {s} failed ({s}); its latest commits may be lost if the system crashes\n", .{ self.path, @errorName(err) });
     }
 
     /// Sync every open file that needs it and let every held snapshot
@@ -585,13 +610,13 @@ pub fn open(
 
 /// Close the connection, aborting every transaction the language
 /// holds on it (DB.md §3), and sync the file when a commit left it
-/// unsynced. A closed connection stays a valid struct:
-/// refs and handles that name it read `open_flag` and report it
-/// closed. A second close does nothing. A close while a native holds
-/// one of the connection's transactions for a callback, or while a
-/// Zig-level transaction is open, is refused, so no emdb transaction
-/// outlives its env. A failed sync is returned once the connection is
-/// closed.
+/// unsynced and no sync of it has failed (`StoreFile.closingSync`). A
+/// closed connection stays a valid struct: refs and handles that name
+/// it read `open_flag` and report it closed. A second close does
+/// nothing. A close while a native holds one of the connection's
+/// transactions for a callback, or while a Zig-level transaction is
+/// open, is refused, so no emdb transaction outlives its env. A sync
+/// that fails here is returned once the connection is closed.
 pub fn close(self: *Connection) (DbError || emdb.Error)!void {
     if (!self.open_flag) return;
     // Refused before anything ends: a refusal changes nothing.
@@ -607,7 +632,7 @@ pub fn close(self: *Connection) (DbError || emdb.Error)!void {
     while (it) |h| : (it = h.next) {
         if (h.conn() == self) h.end();
     }
-    const synced = self.file.sync();
+    const synced = self.file.closingSync();
     release(self);
     return synced;
 }
@@ -1717,7 +1742,7 @@ const MetaSyncFailure = struct {
     }
 };
 
-test "durability durable: a commit whose meta sync fails stands, is DurabilityUnknown and leaves the file unsynced" {
+test "durability durable: after a commit's meta sync fails, the file syncs nothing until it is reopened, and keeps the commits that published" {
     const path = try tmpDbPath(testing.allocator, "meta_sync");
     defer testing.allocator.free(path);
     defer cleanupDb(path);
@@ -1729,24 +1754,75 @@ test "durability durable: a commit whose meta sync fails stands, is DurabilityUn
     var conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
     defer shutdown(&conn);
     conn.durability = .durable;
+    // A second holder shares the file's environment, and its failure.
+    var other = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    defer shutdown(&other);
+    other.durability = .commit;
+
     var failure = MetaSyncFailure{ .fd = conn.file.env.inner.dataFile.fd };
     try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
     conn.file.env.inner.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
     var w = try beginWrite(&conn);
-    try put(&w, "t", "k", value.fromFixnum(5).?);
+    try put(&w, "t", "a", value.fromFixnum(5).?);
     const committed = commit(&w);
     conn.file.env.inner.commitObserver = null;
     failure.restore();
     try testing.expectError(error.DurabilityUnknown, committed);
     try testing.expectEqualStrings("db/durability-unknown", failureName(error.DurabilityUnknown));
     try testing.expect(conn.file.unsynced);
+    try testing.expect(conn.file.syncFailed());
+
+    // Nothing syncs again: a sync fails on every connection, and a
+    // commit that would sync fails before it writes anything, while one
+    // that syncs nothing commits.
+    const before = engineSyncs();
+    try testing.expectError(error.SyncFailed, sync(&conn));
+    try testing.expectError(error.SyncFailed, sync(&other));
+    try testing.expectEqualStrings("db/sync-failed", failureName(error.SyncFailed));
+    w = try beginWrite(&conn);
+    try put(&w, "t", "b", value.fromFixnum(6).?);
+    try testing.expectError(error.SyncFailed, commit(&w));
+    try testing.expectEqual(@as(u32, 0), conn.open_txns);
+    w = try beginWrite(&other);
+    try put(&w, "t", "c", value.fromFixnum(7).?);
+    try commit(&w);
     {
         var r = try beginRead(&conn);
         defer abortRead(&r);
-        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
+        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
+        try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
+        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
     }
+
+    // A close syncs nothing and raises nothing. A connection opened
+    // while another holds the file shares its environment, so its
+    // syncs fail too; the last close lets the environment go.
+    try close(&conn);
+    conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    try testing.expectError(error.SyncFailed, sync(&conn));
+    try close(&conn);
+    StoreFile.syncAll();
+    try close(&other);
+    try testing.expectEqual(before, engineSyncs());
+
+    // Reopened, the file syncs again and holds exactly the commits
+    // that published.
+    conn = try open(testing.allocator, &heap, &interner, path.ptr, .{ .allocator = testing.allocator });
+    conn.durability = .durable;
+    try testing.expect(!conn.file.syncFailed());
+    {
+        var r = try beginRead(&conn);
+        defer abortRead(&r);
+        try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
+        try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
+        try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
+    }
+    w = try beginWrite(&conn);
+    try put(&w, "t", "b", value.fromFixnum(6).?);
+    try commit(&w);
+    try testing.expect(engineSyncs() > before);
     try sync(&conn);
-    try testing.expect(!conn.file.unsynced);
+    try close(&conn);
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
