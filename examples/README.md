@@ -39,6 +39,7 @@ files.
 | `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |
 | `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk |
 | `shapes.nx` | Protocols + records in one file: `defprotocol`, `defrecord`, `extend-protocol` over records and built-ins, `satisfies?`, atoms, `str`, `case`/`for` |
+| `multimethods.nx` | `defmulti` and `defmethod`: dispatch on a map's key with a `:default`, on `class` over a record and kinds the global hierarchy derives, through a `derive`d hierarchy of tags, on a vector of two kinds; `prefer-method` settling an ambiguity; a caught `:no-method`; a hierarchy of one's own through `:hierarchy #'h` |
 | `typed-vectors.nx` | `i64-vector` / `f64-vector`, the generic functions over them, the `nexis.simd` kernels (`tv/sum`, `tv/dot`, `tv/scale`, `tv/map`), equality rules and the `:kind-mismatch` / `:index-out-of-bounds` errors |
 | `tests-demo.nx` | `nexis.test`: `deftest`, `is` (`=`, `thrown?`, bare), `testing`, `run-tests`; one test fails, one throws, so the report shows every outcome and the summary map |
 | `shapes-app.nx` + `lib/shapes/{protocol,records,builtins}.nx` | The same program as a multi-file application: a driver and three required modules; prints one report per shape and `total-area atom = 9650` |
