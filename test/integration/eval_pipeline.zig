@@ -6372,6 +6372,18 @@ test "core: sort orders fixnums among every other number, stably, and reports wh
     });
 }
 
+test "core: sort merges in place at every length, stably, by every order and key" {
+    try runCoreCases(&.{
+        // Every split of the merge up to 69 elements, against a sorted set.
+        .{ .src = "(every? (fn [n] (let [xs (map #(mod (* % 7919) 10007) (range n)) want (vec (into (sorted-set) xs))] (= want (sort xs) (sort < xs) (sort compare xs) (sort-by - > xs) (reverse (sort > xs))))) (range 70))", .expected = "true" },
+        // Equal keys keep their input order, ascending and descending,
+        // against the elements filtered key by key.
+        .{ .src = "(every? (fn [n] (let [ms (map (fn [i] {:k (mod (* i 7) 5) :i i}) (range n)) by (fn [ks] (mapcat (fn [k] (filter #(= k (:k %)) ms)) ks))] (and (= (by (range 5)) (sort-by :k ms) (sort-by :k < ms) (sort #(< (:k %1) (:k %2)) ms) (sort-by :i (fn [a b] (< (mod (* a 7) 5) (mod (* b 7) 5))) ms)) (= (by (range 4 -1 -1)) (sort-by :k > ms) (sort #(> (:k %1) (:k %2)) ms))))) (range 70))", .expected = "true" },
+        .{ .src = "(every? (fn [n] (let [xs (map (fn [i] (if (even? i) (mod i 5) (double (mod i 5)))) (range n))] (= (mapcat (fn [k] (filter #(== k %) xs)) (range 5)) (sort xs) (sort-by identity xs)))) (range 70))", .expected = "true" },
+        .{ .src = "[(sort-by :k [{:k 2} {:k 1}]) (vec (sort (range 40 0 -1))) (conj (sort [3 1 2]) 0) (seq? (sort [2 1])) (sort nil)]", .expected = "[({:k 1} {:k 2}) [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40] (0 1 2 3) true ()]" },
+    });
+}
+
 test "core: predicates, names and conversions" {
     try runCoreCases(&.{
         .{ .src = "[(list? '(1)) (list? [1]) (seq? '(1)) (seq? nil)]", .expected = "[true false true false]" },
