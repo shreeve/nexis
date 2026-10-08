@@ -1991,6 +1991,23 @@ test "hierarchies: the global hierarchy is a private Var that derive and underiv
     try expectOutputProgram("(with-redefs [nexis.core/global-hierarchy (make-hierarchy)] (derive :user/a :user/b)) [(parents :user/a) (:private (meta #'nexis.core/global-hierarchy))]", "[nil true]");
 }
 
+test "hierarchies: class? holds of what class returns, which the global hierarchy takes as tags" {
+    try expectOutputProgram(
+        \\(defrecord Circle [r])
+        \\[(every? class? (map class [true \a 1 99999999999999999999 1.5 :k 'x "s" '(1) [1] {:a 1} #{1} (sorted-map) (sorted-set) (lazy-seq nil)
+        \\                            (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc (->Circle 1) (delay 1) #"a"]))
+        \\ (map class? [:frob :persistent_vector :true_ :nil :record :cell_internal :user/vector 'user.Nope 'Circle "vector" nil (class nil)])
+        \\ (class? 'user.Circle) (class? Circle)]
+    , "[true (false false false false false false false false false false false false) true true]");
+    try expectOutputProgram(
+        \\(defrecord Circle [r])
+        \\(with-redefs [nexis.core/global-hierarchy (make-hierarchy)]
+        \\  (derive :vector :user/coll) (derive Circle :user/shape)
+        \\  [(isa? (class [1]) :user/coll) (isa? (class (->Circle 1)) :user/shape) (isa? (class '(1)) :user/coll) (parents Circle)
+        \\   (try (derive :frob :user/x) (catch any e (:error e)))])
+    , "[true true false #{:user/shape} :assertion-failed]");
+}
+
 const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
 
 test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, all-ns, ns-publics, ns-interns" {

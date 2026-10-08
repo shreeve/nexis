@@ -452,6 +452,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `tap>` | 1 | Calls every function `add-tap` added with `x`, ignoring any that throws, and returns true. Clojure calls the taps on another thread; one isolate, one thread calls them before `tap>` returns |
 | `add-tap`, `remove-tap` | 1 | Add or remove a tap function; nil |
 | `class` | 1 | The type of `x`: for a record the symbol it prints with (`user.P`), for anything else the keyword `extend-type` names its kind with (`:vector`, `:map`, `:set`, `:list`, `:fixnum`, `:bignum`, `:float`, `:string`, `:typed_vector`, `:function`, `:native_fn`, `:var_`, ...), except that both booleans are `:boolean`; nil for nil |
+| `class?` | 1 | Whether `x` is a type `class` returns: a kind keyword (`:boolean`, `:vector`, `:map`, `:set`, or a kind name `class` passes through, such as `:fixnum`, `:sorted_map` or `:function`) or the symbol of a registered record type (`user.P`); false of any other keyword (`:persistent_vector`, `:frob`), symbol or value. The global hierarchy takes these as tags without a namespace (§9.1) |
 | `type` | 1 | `(or (:type (meta x)) (class x))`, as Clojure's |
 | `instance?` | 2 | `(instance? t x)`: whether `(class x)` is `t`, a keyword or symbol (`(instance? :vector [])`, `(instance? 'user.P p)`); there is no hierarchy, so `(instance? :map p)` of a record is false. Any other `t` is `:kind-mismatch` |
 | `var?` | 1 | Whether `x` is a Var |
@@ -501,8 +502,18 @@ and `@#'nexis.core/global-hierarchy` reach it as Clojure's tests do.
 | `make-hierarchy` | 0 | The empty hierarchy |
 | `isa?` | 2, 3 | `(isa? h child parent)`: true when `(= child parent)`, when `parent` is among `child`'s ancestors in `h`, or when both are vectors of one count whose elements are `isa?` pairwise (`(isa? h [:user/a :user/b] [:user/p :user/q])`; `(isa? [] [])` is true). A non-hierarchy `h` gives false where Clojure's call of `(:ancestors h)` throws |
 | `parents`, `ancestors`, `descendants` | 1, 2 | The tag's set of direct parents, of ancestors, of descendants; nil when it has none |
-| `derive` | 2, 3 | `(derive h tag parent)`: `h` with `tag` a child of `parent`, the closures updated as Clojure's do; `h` itself (`identical?`) when the edge exists. `tag` and `parent` must differ and both be keywords or symbols, else `:assertion-failed` with the text of Clojure's assertion (`"Assert failed: (not= tag parent)"`). An edge whose parent is already an ancestor of the tag is `{:error :invalid-derivation :message "T already has P as ancestor"}`, one that would make a cycle `"Cyclic derivation: P has T as ancestor"`, the tags printed by `print-str`. `(derive tag parent)` changes the global hierarchy and returns nil; there `parent` must have a namespace and so must the tag, else `:assertion-failed`, and `namespace` of a non-ident is `:kind-mismatch`, as Clojure's cast fails |
+| `derive` | 2, 3 | `(derive h tag parent)`: `h` with `tag` a child of `parent`, the closures updated as Clojure's do; `h` itself (`identical?`) when the edge exists. `tag` and `parent` must differ and both be keywords or symbols, else `:assertion-failed` with the text of Clojure's assertion (`"Assert failed: (not= tag parent)"`). An edge whose parent is already an ancestor of the tag is `{:error :invalid-derivation :message "T already has P as ancestor"}`, one that would make a cycle `"Cyclic derivation: P has T as ancestor"`, the tags printed by `print-str`. `(derive tag parent)` changes the global hierarchy and returns nil; there `parent` must have a namespace and so must the tag unless it is a class (`class?`), else `:assertion-failed`, and `namespace` of a non-ident is `:kind-mismatch`, as Clojure's cast fails |
 | `underive` | 2, 3 | `(underive h tag parent)`: `h` without the edge, rebuilt by deriving every remaining edge into an empty hierarchy, as Clojure's; `h` itself when there is no such edge. The 2-arity changes the global hierarchy and returns nil |
+
+**Classes as tags.** Clojure's global hierarchy takes a Java class as
+a tag without a namespace (`(derive String ::text)`); the nexis
+equivalent of a class is what `class` returns (§8), so `class?` holds
+of those: `(derive :vector :user/coll)` and, after `(defrecord Circle
+[r])`, `(derive Circle :user/shape)` make `(isa? (class x) :user/coll)`
+and `(isa? (class (->Circle 1)) :user/shape)` true, and
+`(defmulti area class)` dispatches through them. A record type is its
+symbol, so a redefined record keeps its derivations, where Clojure's
+redefinition makes a new class.
 
 There is no supertype relation between kinds: `isa?`, `parents` and
 `ancestors` follow only the edges `derive` made, where Clojure's also

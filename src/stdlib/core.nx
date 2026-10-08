@@ -1293,11 +1293,12 @@
 ; (derive h tag parent) → h with tag a child of parent: h itself when
 ; it is already, else a new hierarchy, the closures updated as
 ; Clojure's derive does. (derive tag parent) changes the global one,
-; whose parent must have a namespace, and so must the tag.
+; whose parent must have a namespace, and so must the tag unless it
+; is a class: a kind keyword or a record type, as class returns them.
 (defn derive
   ([tag parent]
    (assert (namespace parent))
-   (when-not (and (ident? tag) (namespace tag))
+   (when-not (or (class? tag) (and (ident? tag) (namespace tag)))
      (assert-failed "(or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))"))
    (alter-var-root #'global-hierarchy derive tag parent)
    nil)

@@ -393,6 +393,7 @@ const core_natives = table("", .{
     .{ "chunk-cons", 2, 2, &fnChunkCons },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
     .{ "class", 1, 1, &fnClass },
+    .{ "class?", 1, 1, &fnClassQ },
     .{ "var?", 1, 1, kindPredicate(isVar), .leaf },
     .{ "find-ns", 1, 1, &fnFindNs },
     .{ "all-ns", 0, 0, &fnAllNs },
@@ -3788,6 +3789,40 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
         else => |k| @tagName(k),
     };
     return interner.internKeywordValue(name) catch VmError.OutOfMemory;
+}
+
+/// `(class? x)` → whether `x` is a type `class` returns, which the
+/// global hierarchy takes as a tag (STDLIB.md §9.1): the keyword of a
+/// kind (`:boolean`, `:vector`, `:map`, `:set` or a `Kind` name that
+/// `fnClass` passes through), or the symbol of a registered record type.
+fn fnClassQ(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const interner = vm.ensureInterner();
+    return value_mod.fromBool(switch (x.kind()) {
+        .keyword => isClassKeyword(interner.keywordName(x.asKeywordId())),
+        .symbol => blk: {
+            const name = interner.symbolName(x.asSymbolId());
+            for (vm.home().record_registry.items) |e| {
+                const dotted = e.ns_name.len > 0;
+                if (name.len != e.ns_name.len + @intFromBool(dotted) + e.type_name.len) continue;
+                if (dotted and !(std.mem.startsWith(u8, name, e.ns_name) and name[e.ns_name.len] == '.')) continue;
+                if (std.mem.endsWith(u8, name, e.type_name)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    });
+}
+
+fn isClassKeyword(name: []const u8) bool {
+    for ([_][]const u8{ "boolean", "vector", "map", "set" }) |alias| if (std.mem.eql(u8, name, alias)) return true;
+    const k = std.meta.stringToEnum(Kind, name) orelse return false;
+    return switch (k) {
+        // nil has no class, `fnClass` renames these, and the rest are
+        // reserved or never escape.
+        .nil, .true_, .false_, .persistent_vector, .persistent_map, .persistent_set, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
+        else => true,
+    };
 }
 
 fn nsOfSymbol(vm: *VM, v: Value) VmError!?*Namespace {
