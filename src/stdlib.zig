@@ -2936,13 +2936,22 @@ fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
 /// user comparator returning a number (negative = less) or a
 /// boolean (true = less).
 const SortOrder = struct {
-    vm: *VM,
+    interner: *const intern_mod.Interner,
     comparator: ?*vm_mod.Callback,
 
     /// `a` and `b` are on `sortImpl`'s root scope (GC.md §11.5,
     /// class 4).
     fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
-        const cmp = self.comparator orelse return (try compareValues(self.vm, a, b)) == .lt;
+        const cmp = self.comparator orelse {
+            // Two fixnums, the common key, compare in registers. Any
+            // other pair reads `sorted`'s `OrderError!Order` as it is:
+            // converted to a `VmError!Order` first, as `compareValues`
+            // returns it, x86-64 code rebuilds the result with two narrow
+            // stores and reloads it as one wider load, which the CPU
+            // cannot forward (PERF.md §3.31).
+            if (a.isFixnum() and b.isFixnum()) return a.asFixnum() < b.asFixnum();
+            return (try sorted_mod.naturalOrder(self.interner, a, b)) == .lt;
+        };
         const r = try cmp.call(&.{ a, b });
         return switch (r.kind()) {
             .true_ => true,
@@ -3011,7 +3020,7 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError
         k.* = .{ .key = v, .val = v };
     }
     var cmp_cb = if (comparator) |c| vm_mod.Callback.init(vm, c, 2) else undefined;
-    try mergeSort(keyed, scratch, .{ .vm = vm, .comparator = if (comparator != null) &cmp_cb else null });
+    try mergeSort(keyed, scratch, .{ .interner = vm.ensureInterner(), .comparator = if (comparator != null) &cmp_cb else null });
     for (keyed, 0..) |e, i| items.items[i] = e.val;
     return try buildListFromSlice(vm, items.items);
 }

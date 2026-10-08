@@ -75,7 +75,7 @@ the §3 rows.
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
 §3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5, as are §3.16 onward; §3.15 on an Intel Core Ultra 9 185H under Linux;
+an Apple M5, as are §3.16 onward; §3.15 and §3.32's first tables on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -737,7 +737,8 @@ What the language rows say:
   forward. Built by Zig 0.16 at `95791b0`, the program runs the phase
   in 144 ms; built at `1489ef9`, which moves the tree to Zig 0.17 and
   leaves the sort code as it is, in 181 ms, the process retiring 1.4%
-  fewer instructions in 21% more cycles.
+  fewer instructions in 21% more cycles. §3.32 compares the keys in
+  registers: 93–96 ms on this host.
 
 **Database.** 100 departments and 100,000 people with five attributes.
 The durability of each row (`docs/BENCH.md` §12, traced with `strace`):
@@ -1834,6 +1835,78 @@ within 0.3% and its peak resident set the same; the largest moves are
 `vector-conj-nth` 905.1 → 902.3 M and `map-build-read` 3,561.7 →
 3,566.1 M [3,559.7–3,581.5].
 
+### 3.32 Sort keys compared in registers, Linux x86-64 and Apple M5
+
+`sort` and `sort-by` in the natural order compare two fixnum keys in
+place, and any other pair through `sorted.naturalOrder` directly,
+reading its `OrderError!Order` as it is (`SortOrder.less` in
+`src/stdlib.zig`). Through `compareValues` the result is converted
+to a `VmError!Order` first, which Zig 0.17's x86-64 code rebuilds on
+the stack as a 16-bit and an 8-bit store and reads back as one 32-bit
+load the store buffer cannot forward (§3.15, the before rows); read
+directly, the error and the order are loads of their own widths, and
+the fixnum path calls nothing. Before is `efff7a7`, after
+`8e6fbf5`; one ReleaseFast build of each on each host. Provenance:
+§11.
+
+The `bench/compare` `sort` program (a million scrambled ints) and the
+same over 300,000 distinct strings, each program's own phase time and
+the whole process's instructions and cycles, the median of interleaved
+runs. A is the fixnum path alone, still through `compareValues`; C is
+the direct call alone, without the fixnum path; after is both.
+
+Linux x86-64, `taskset -c 2`, `perf stat -e
+cpu_core/instructions/u,cpu_core/cycles/u`, five rounds (load 1.1 →
+1.2; C from a second five-round run beside before and after, load 1.2,
+whose before and after agree with these within 1.5%):
+
+| Build | ints: phase | instructions | cycles | strings: phase | instructions | cycles |
+|---|---:|---:|---:|---:|---:|---:|
+| before | 180.4 ms | 2,672.0 M | 862.0 M | 92.9 ms | 1,292.1 M | 508.1 M |
+| A, fixnum path | 94.3 ms | 1,256.8 M | 446.0 M | 93.6 ms | 1,276.2 M | 508.9 M |
+| C, direct call | 132.5 ms | 2,323.2 M | 628.6 M | 77.8 ms | 1,197.2 M | 432.2 M |
+| after | 92.7 ms | 1,194.9 M | 442.2 M | 78.0 ms | 1,210.9 M | 434.7 M |
+
+Apple M5, `/usr/bin/time -l`, seven rounds (load 5.4 → 5.1; C from a
+second seven-round run at load 17, instructions only):
+
+| Build | ints: phase | instructions | cycles | strings: phase | instructions | cycles |
+|---|---:|---:|---:|---:|---:|---:|
+| before | 89.2 ms | 2,568.6 M | 428.2 M | 54.7 ms | 1,258.6 M | 269.0 M |
+| A, fixnum path | 52.3 ms | 1,189.4 M | 280.8 M | 54.4 ms | 1,277.4 M | 272.2 M |
+| C, direct call | | 2,367.4 M | | | 1,205.0 M | |
+| after | 52.9 ms | 1,187.5 M | 280.9 M | 53.4 ms | 1,226.4 M | 261.9 M |
+
+The `sort` row of `bench/compare/run.clj --only lang --impls nexis,bb
+--workloads sort --n 10 --max-load 4 --pin 0-11` on the Linux host,
+two passes, before and after alternating (load 1.8 → 2.1):
+
+| Build | nexis | babashka | ÷ bb | wall: nexis / bb | RSS: nexis / bb |
+|---|---:|---:|---:|---:|---:|
+| before | 198, 186 ms | 424, 369 ms | 0.47, 0.50 | 236, 226 ms / 539, 485 ms | 119 / 116 MB |
+| after | 96.3, 93.8 ms | 391, 372 ms | 0.25, 0.25 | 135, 133 ms / 506, 488 ms | 119 / 116 MB |
+
+What the rows say:
+
+- The fixnum path is the larger part: alone it halves the int sort
+  on both hosts (1,415 M instructions fewer on x86-64: a call to
+  `naturalOrder` and its stack check per comparison), and on x86-64
+  it also takes those comparisons off the stalled load, so cycles
+  fall nearly as far as instructions.
+- The direct call removes the stall itself: alone, in its own run, it
+  takes the int sort on x86-64 from 181.6 to 132.5 ms, below the
+  144 ms of the Zig 0.16 build at `95791b0` (§3.15), and the string
+  sort, where every comparison takes the general path, from 93.5 to
+  77.8 ms and 509.5 to 432.2 M cycles (−15%). On the M5, whose stores
+  forward, it saves instructions only: the string sort −4.3% without
+  the fixnum test, −2.6% with it.
+- The fixnum test costs the string sort 14 M instructions on x86-64
+  and about 20 M on the M5, a few per comparison, within the cycle
+  range on both hosts.
+- The int sort runs in 93–96 ms on the Linux host, below the warm
+  JVM Clojure figure of §3.15 (147 ms) and a quarter of babashka's
+  time; its resident set is unchanged (§6 "`sort`'s buffers").
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1855,14 +1928,6 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers not built.**
 
-- **`sort`'s comparison on x86-64** (§3.15): Zig 0.17's x86-64 code
-  writes the comparator's `VmError!Order` result as two narrow stores
-  and reads it back as one 32-bit load the CPU cannot forward, 72% of
-  `mergeSort`'s cycles on the Linux host; the sort code is unchanged
-  from the Zig 0.16 build that ran the phase in 144 ms against 181 ms.
-  A comparison that returns its order outside an error union on the
-  fixnum path, with the error reported beside it, is the change to
-  measure on that host.
 - **Batched commits** (`docs/DB.md` §3.3 "No batching"): consecutive
   auto-transaction writes joined into one open emdb write transaction
   would save part of a `:commit` transaction's cost, about 18 μs in
@@ -1930,6 +1995,14 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
+- *Sort keys compared in registers* (§3.32): `sort` and `sort-by` in
+  the natural order compare two fixnum keys in place and read any
+  other pair's `OrderError!Order` from `sorted.naturalOrder` as it is,
+  where a conversion to `VmError!Order` makes Zig 0.17's x86-64 code
+  store the result in two narrow writes and reload it in one load the
+  CPU cannot forward (§3.15). On the Linux host the million-int sort
+  180 → 93 ms, 2,672 → 1,195 M instructions, a 300,000-string sort
+  92.9 → 78.0 ms; on the M5 89 → 53 ms and 54.7 → 53.4 ms.
 - *Trees opened on first use* (`docs/NEXTOMIC.md` §2): `Store`'s
   begin calls opened all twelve trees by name in every transaction,
   and `transact!` begins two; emdb opens a tree on the first use of
@@ -2226,4 +2299,5 @@ is one invocation's 30-sample median.
 | §3.29, §6 "Locals clearing" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `24027c8`; shared with concurrent sessions | 2026-10-07 21:48–22:10 MDT, locals: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `97e2d11` (before) and `22d9391` (after), and with `-Dopcodes=true` at `97e2d11` and `6da3c15`. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program under `tools/heavy` (1 core), load 5.26 → 5.42. The memory rows: `cmds.py OUT 3` over `lazy3`, `lazyl`, `lazyf` at 3 M and 30 M, load 4.81 → 5.26. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.16 → 7.13; startup by `cmds.py OUT 21` over `-e nil`. `nexis-bench --filter compiler` twice per build, interleaved, after at `1d63d19`; the image generator, each tree's debug `nexis-imagegen`, `cmds.py OUT 7`. Raw output: `.git/revamp/r3/locals/` (`micro-final.*`, `mem.*`, `cmp.*`, `startup.*`, `cbench-*`, `imagegen.*`, `opcodes/`) |
 | §3.30, §6 "Per-arity entry points" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002`; shared with concurrent sessions | 2026-10-08, arity: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `fb51779` (before) and at the `expand` commit (after), and with `-Dopcodes=true` at each. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program but the lazy pipelines under `tools/heavy` (1 core), load 13.01 → 7.85. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.75 → 5.25; startup by `cmds.py OUT 21` over `-e nil`. Dispatch and native counts: `gcall`, `acall`, `vcall`, `mcall` and `xform` at 100,000 and 200,000, `fib` and `afib` at 20 and 22, the difference per unit. The image figures from each tree's `stdlib.image` header. Raw output: `.git/revamp/r3/arity2/` (`micro-AB.*`, `cmp.*`, `startup.*`, `opcodes/`) |
 | §3.31 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08 01:27–01:42 MDT, consume: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `efff7a7` (before) and `193ad6d` (after, with `set` consuming, which the `set` comparison measures and which no other row runs). The memory rows: `cmds.py OUT 3` over the `count`, `into` and `vec` programs at 3 M and 30 M (`mem.*`, load 5.86 → 6.35) and over the `i64-vector`/`take-last` program (`mem2.*`, load 9.62 → 11.29); the `set` comparison `cmds.py OUT 3` (`mem3.*`, load 14.59 → 11.27); the `into` a hash set comparison `cmds.py OUT 5` against a build whose `into` is `193ad6d`'s (`mem4.*`, load 12.65 → 17.21). Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), load 6.89 → 7.89. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 7.67 → 9.58. Raw output: `.git/revamp/r3/consume/` (`mem*.txt`, `mem*.json`, `mem*.load`, `micro.*`, `cmp.*`) |
+| §3.32, §6 "Sort keys compared in registers" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 01:16–01:43 MDT, sortcmp: `bin/nexis` built by `zig build install -Doptimize=fast` from source snapshots of `efff7a7` (before), of `efff7a7` with the fixnum path alone (A), with the direct call alone (C) and with both (after, `8e6fbf5`'s code). Programs: `bench/compare/prelude.nx` with `lang/sort.clj`, and with the same body over `(mapv (fn [i] (str (mod (* i 7919) 1000003))) (range 300000))` (`sortstr.nx`, kept with the raw output). Linux: `perfpairs.sh`, each run `taskset -c 2 perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u bin/nexis run P`, the builds interleaved, five rounds, holding the host's benchmark lease (load 1.1 → 1.2, and 1.2 for the run with C); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads sort` from each snapshot, before, after, before, after (load 1.8 → 2.1); the merge loop's code from `objdump -d` of each build's `stdlib.mergeSort`. M5: `macpairs.sh`, each run `/usr/bin/time -l bin/nexis run P`, the builds interleaved, seven rounds under `tools/heavy` (1 core), load 5.4 → 5.1, and 17 for the run with C. Raw output: `.git/revamp/r3/sortcmp/` (`pup-perf-*.txt`, `mac-*.txt`, `runclj/`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
