@@ -446,16 +446,37 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. The Linux comparison, rerun: `docs/PERF.md` §3.15's rows (nexis
-   behind babashka on three and behind warm JVM Clojure on eight of
-   ten) were measured before the interpreter levers of §3.16-§3.26:
-   frameless fast handlers, verification once per routine, the loop
-   shape, inlined arithmetic, the stdlib image, leaner calls,
-   self-calls, the keyword lookup, quickening and the counting-loop
-   step. Rerun it on that host and record what remains; em's runtime
-   is the reference for the next lever.
-2. Locals clearing (TODO.md #13): a lazy seq a local or a closure's
-   argument holds keeps what it realized until the slot is reused.
+1. The Linux gaps (`docs/PERF.md` §3.15, at `97e2d11`): nexis leads
+   babashka on startup and eight of the ten programs, is level on string
+   splitting and trails on the `map`/`filter`/`reduce` pipeline (1.30).
+   Warm JVM Clojure is faster on eight of ten: `fib` 6.0×, the
+   destructuring loop 5.5×, the pipeline 2.7×, vectors 2.6×, string
+   splitting 2.4×, the map build 2.1×, `sort` 1.3×, the transient map
+   1.2×; nexis leads on the counting loop (0.71) and on
+   `frequencies`/`group-by` (0.92). Nextomic leads every system on every
+   phase timed cold but Datalevin's durable commit (1.12), and is level
+   with Datomic Pro's warm peer on lookups (0.97). The levers the
+   numbers name:
+   - `sort`: Zig 0.17's x86-64 code reads `mergeSort`'s `VmError!Order`
+     back through a store that cannot be forwarded, three quarters of
+     `mergeSort`'s cycles; Zig 0.16's build of the same sort code runs
+     the phase in 144 ms, Zig 0.17's in 181 ms. A comparison that
+     returns its order outside an error union on the fixnum path is the
+     change to measure.
+   - Calls (`fib`, the destructuring loop): on x86-64 `fastCall` saves
+     six callee-saved registers, `fastCallSelf` four, the comparisons
+     three (`docs/PERF.md` §6 "Frameless fast handlers on x86-64"). em's
+     runtime is the reference: its handlers take six System V argument
+     registers (the instruction, the pc and three operand words a fast
+     handler hands the next), and its jumps fuse the compare and the
+     branch (`ifLt`; `docs/PERF.md` §6 "A compare-and-branch
+     instruction").
+   - The pipeline and vectors: a closure called from a native
+     (`VM.callPrepared`) is the largest share of their processes'
+     cycles.
+2. `count`, `into` and `vec` consuming their argument (TODO.md #13):
+   a local or a parameter is cleared at its last move (`docs/COMPILER.md`
+   §4.9), but these natives keep the seq they walk in the call's block.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
 4. The open design question, an amendment first: `&form`/`&env`
@@ -464,4 +485,5 @@ after numbers in the commit message.
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis
 leads babashka on every row (§3.11), and Nextomic leads Datalevin,
-Datomic Local and Datomic Pro on every phase timed cold (§3.15).
+Datomic Local and Datomic Pro on every phase timed cold but
+Datalevin's durable commit (§3.15).
