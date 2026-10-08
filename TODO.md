@@ -9,14 +9,22 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ## Performance
 
-2. **Small transactions.** 20,000 `transact!` calls of one entity with
-   five attributes measured about 230 μs each on the Apple M5, under a
-   load average of 16, where `docs/PERF.md` §3.11's 1,000 one-datom
-   transactions take about 17 μs each. Remeasure on a quiet host
-   (`bench/compare/db/` shapes, an optimized build), then profile:
-   resolving the unique attribute and the upsert, the ident cache, and
-   the per-transaction work of `src/nextomic/transact.zig` are the
-   first suspects.
+2. **Small transactions are emdb's page work.** A `transact!` of one
+   new entity with five attributes, one unique, takes 244k
+   instructions and about 20 μs on the Apple M5 in an optimized build
+   (`docs/PERF.md` §3.27; the 230 μs first reported here does not
+   reproduce in an optimized build, and a debug build takes about
+   750 μs). It dirties 31 pages of 16 KiB (19
+   for one changed datom): the root-to-leaf path of every index tree
+   it writes, the txlog, `sys` and emdb's own trees. emdb copies each
+   page on its first write and checksums it at commit; 79% of the
+   transaction's instructions are inside emdb (55% in its puts,
+   copy-on-write included, 15% in the commit), 21% in Nextomic, no
+   part of which is over 5%. The commit protocol is emdb's; nexis
+   changes nothing in emdb (`AGENTS.md`), so the page work is the
+   engine owner's call. On the nexis side the levers left are batching
+   (`docs/PERF.md` §6 "Batched commits") and a smaller page, which
+   changes the format's key bound (`docs/NEXTOMIC.md` §2).
 3. **`sort` holds memory outside the heap.** Its resident set is
    157 MB against babashka's 114 MB (`docs/PERF.md` §3.11): about
    80 MB of the buffers it sorts through are allocated outside the

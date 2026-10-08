@@ -63,8 +63,10 @@ refuses the write as `:db/value-too-large` and the transaction aborts.
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
 the connection's life (tree registration is the engine's one call that
-is not thread-safe, and it happens only here). Only a store missing one
-of them takes a write transaction at connect: a new file is
+is not thread-safe, and it happens only here). A transaction then
+opens each tree on its first use of the handle (emdb INV-SUB03), so it
+reads the records of the trees it touches and no others. Only a store
+missing one of them takes a write transaction at connect: a new file is
 bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
 minted (§2.4). One more write can follow the open: when the
 `nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
@@ -1153,6 +1155,18 @@ use, so a chain of n patterns over r rows costs O(n·r), whether its
 100k-entity chain runs in under a second; a 1000-clause query plans in
 a few milliseconds. What a step cannot avoid is its join: every step
 of a long chain probes one hash index with every row it carries.
+
+A transaction costs the pages it writes. Every tree it touches is
+copied on write along a root-to-leaf path: EAVT and AEVT, AVET and
+VAET where its attributes belong, their history twins, the txlog,
+`sys`, and emdb's main and free trees. A new entity of five
+attributes, one of them unique, dirties about 31 pages of 16 KiB, 27
+without the unique one, and a changed datom 19 (stores of 20,000 to
+30,000 entities). emdb copies each page and checksums it at commit;
+with its puts that is about four fifths of a small transaction's
+instructions, and Nextomic's own work (normalising, tempids,
+expansion, the txlog entry and the report) the rest (`docs/PERF.md`
+§3.27). A batch of entities in one transaction shares those pages.
 
 Not in scope: distribution (Datomic's peer/transactor split), a
 cost-based optimizer beyond greedy selectivity, write-heavy OLTP beyond

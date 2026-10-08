@@ -344,50 +344,32 @@ pub const Store = struct {
 
     // ── Transactions ──────────────────────────────────────────────
 
-    /// Begin a read transaction with all twelve trees loaded.
+    // A transaction opens a tree on its first use of the cached handle
+    // (emdb INV-SUB03), so it pays only for the trees it touches: a
+    // transaction of one entity writes eight or ten of the twelve, and
+    // a read touches fewer still. The handles hold for the store's
+    // life: nexis never deletes a tree, and `db/*` refuses an `nx/`
+    // name (`db.zig`), so an open finds the record the handle names
+    // (NEXTOMIC.md §2).
+
+    /// Begin a read transaction.
     pub fn beginRead(self: *Store) !*Txn {
-        const txn = try self.file.env.beginRead();
-        errdefer txn.abort();
-        try self.loadTrees(txn);
-        return txn;
+        return self.file.env.beginRead();
     }
 
     /// Begin a read-only child of the open write transaction `parent`,
-    /// seeing its uncommitted state, with all twelve trees loaded. The
-    /// parent refuses mutations and commit until the child is finished.
+    /// seeing its uncommitted state. The parent refuses mutations and
+    /// commit until the child is finished.
     pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
-        const txn = try parent.beginReadChild();
-        errdefer txn.abort();
-        try self.loadTrees(txn);
-        return txn;
+        _ = self;
+        return parent.beginReadChild();
     }
 
-    /// Begin the write transaction with all twelve trees loaded:
-    /// `error.WriterActive` while any store or `db/*` connection of the
-    /// file holds it (`db.StoreFile.beginWrite`).
+    /// Begin the write transaction: `error.WriterActive` while any store
+    /// or `db/*` connection of the file holds it
+    /// (`db.StoreFile.beginWrite`).
     pub fn beginWrite(self: *Store, sync_mode: SyncMode) !*Txn {
-        const txn = try self.file.beginWrite(.{ .sync = sync_mode.override() });
-        errdefer txn.abort();
-        try self.loadTrees(txn);
-        return txn;
-    }
-
-    /// A `TreeId` is registered once per environment, but each
-    /// transaction loads its own view of a tree on `openTree`; the ids
-    /// never change after the first open.
-    fn loadTrees(self: *Store, txn: *Txn) !void {
-        for (tree_names, 0..) |name, i| {
-            const id = try txn.openTree(name, false);
-            const expected = switch (i) {
-                0...3 => self.trees.current[i],
-                4...7 => self.trees.history[i - 4],
-                8 => self.trees.txlog,
-                9 => self.trees.idents,
-                10 => self.trees.sys,
-                else => self.trees.fulltext,
-            };
-            if (id != expected) return error.Corrupted;
-        }
+        return self.file.beginWrite(.{ .sync = sync_mode.override() });
     }
 
     /// Commit the write transaction `txn` (`db.StoreFile.commit`).

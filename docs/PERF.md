@@ -1512,6 +1512,77 @@ against 5.45, 5.39 ms; the destructuring loop 122, 125 ms against
 124, 124 ms; `fib` 16.1, 16.1 ms against 17.0, 16.7 ms; the pipeline
 32.4, 32.1 ms against 32.5, 32.3 ms, babashka's 43.2–44.7 ms.
 
+### 3.27 Small transactions, Apple M5
+
+What one `transact!` costs, and where it goes. A probe program loads
+20,000 people into a fresh store, then runs N transactions of one
+shape; a transaction's cost is the run of 10,000 less the run of
+2,000, over 8,000. Every figure is an optimized build's: a debug
+build takes about 750 μs a transaction, and an earlier report of
+230 μs does not reproduce in an optimized one. Before is `0ef07a3`,
+after the commit that opens trees on first use (§6), both against
+emdb `8e1ed1e`; nine interleaved rounds (load 9.2 → 7.8), the median
+of the paired differences, the instruction range in brackets.
+Provenance: §11.
+
+| Shape | pages | instructions before | after | Δ | cycles before | after | μs before | after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| new entity, 4 attributes | 27.1 | 217.5k [216.8–217.9] | 204.7k [203.0–205.0] | −5.9% | 65.5k | 60.2k | 18.1 | 16.2 |
+| new entity, 5 attributes, one unique | 31.1 | 257.1k [256.5–257.4] | 243.8k [243.1–244.4] | −5.2% | 80.3k | 73.6k | 22.1 | 20.4 |
+| upsert through the unique email, 5 attributes, 1 changed | 19.1 | 180.9k [180.8–181.2] | 168.1k [166.7–168.4] | −7.1% | 50.1k | 45.7k | 13.3 | 12.5 |
+| one datom through a lookup ref (§3.11's shape) | 19.1 | 170.3k [170.0–172.3] | 157.2k [157.0–157.7] | −7.7% | 46.6k | 44.4k | 12.9 | 11.5 |
+
+The resident set is the same before and after (68–79 MB). *Pages*
+are the pages a transaction dirties, 16 KiB each, counted from emdb's
+dirty-page table before each commit (a build that printed it, not
+committed). The instructions follow them, about 8,000 a page: emdb
+copies each page a transaction first writes and checksums it at
+commit. Where they go, from `perf record -e instructions:u` with LBR
+call stacks on the Linux host of §3.15, the five-attribute shape over
+200,000 transactions after the change:
+
+| Where | share |
+|---|---:|
+| emdb: the index, txlog and `sys` puts (copy-on-write, searches, inserts) | 55.1% |
+| emdb: the commit (writing and sealing pages, tree records, the free list) | 15.2% |
+| emdb: reads (`sys`, the AVET probes, the card-one lookups) | 6.4% |
+| emdb: the rest | 2.6% |
+| Nextomic and the VM | 20.7% |
+
+Nextomic's own part is spread thin: packing and sorting each index's
+keys for the batch (4.9%), the txlog entry (3.1%), the report (3.0%),
+expansion (2.7%), normalising the tx-data (2.5%), the
+`:db/txInstant` datom (1.1%), the rest under 1% each. Before the
+change, opening all twelve trees in the write transaction and again
+in the report's read was 8.0% of the instructions.
+
+`bench/compare`'s database rows (§3.11's harness, Nextomic alone),
+four runs, after, before, after, before (load 5.6 → 5.0), the medians
+of each run:
+
+| Phase | after | before |
+|---|---:|---:|
+| `tx-entity-1k` (new entity, 5 attributes) | 24.7, 25.5 ms | 26.9, 22.5 ms |
+| `tx-upsert-1k` | 13.0, 13.0 ms | 14.5, 13.6 ms |
+| `tx-1k-default` | 13.2, 12.9 ms | 13.7, 15.4 ms |
+| `lookup-10k` | 10.5, 10.9 ms | 11.3, 10.7 ms |
+| `join3-20x` | 9.80, 9.68 ms | 10.1, 10.5 ms |
+| `aggregate` | 18.1, 17.7 ms | 18.0, 19.1 ms |
+| `pull-10k` | 7.53, 7.38 ms | 7.34, 7.55 ms |
+| `open` | 135, 130 μs | 143, 153 μs |
+| `load` | 303, 274 ms | 299, 386 ms |
+
+No read row moved outside the spread of its two runs, and the query
+process's peak RSS is 133–135 MB after against 137–139 MB before. The
+store's 100,000 people put the one-entity transaction at 25 μs, its
+pages deeper than the probe's 20,000.
+Beside Datalevin 1.1.0, one run of ten rounds after the change (load
+19.9 → 4.3), the medians: one-entity transactions 21.6 ms against
+460 ms a thousand, upserts 13.2 ms against 299 ms, one-datom
+transactions 13.3 ms against 241 ms in each system's default commit
+(Datalevin's syncs; Nextomic's does not, §3.11), and 22.6 ms against
+59.2 ms with the flush off in both. Every answer was equal.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1600,6 +1671,12 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
+- *Trees opened on first use* (`docs/NEXTOMIC.md` §2): `Store`'s
+  begin calls opened all twelve trees by name in every transaction,
+  and `transact!` begins two; emdb opens a tree on the first use of
+  its handle (INV-SUB03), so a transaction reads the records of the
+  trees it touches. Small transactions 5.2–7.7% fewer instructions,
+  4.7–8.8% fewer cycles (§3.27).
 - *Quickening* (`docs/VM.md` §10.10): the hot opcodes specialized to
   their operands' kinds when a routine is finished; the counting loop
   106.9 → 73.0 instructions an iteration, a `fib` call 236.4 → 186.0,
@@ -1632,8 +1709,8 @@ Each lever is a measured change: a before/after from `zig build bench`
   default-commit load 1.64 s → 656 ms, `db_put_commit_scalar`
   6.00 ms → 330 ns. The file is synced once at close and exit.
 - *A held read snapshot* (`docs/DB.md` §3.4): a Nextomic read reuses
-  the file's last read transaction, twelve trees loaded, while no
-  commit has passed it. §3.11's lookups 24.6 → 13.5 ms; through
+  the file's last read transaction, with the trees it has opened,
+  while no commit has passed it. §3.11's lookups 24.6 → 13.5 ms; through
   `bin/nexis`, 10,000 `(d/db conn)` 4.63 → 0.77 ms, `d/entity` plus
   one attribute 16.9 → 8.6 ms, `d/entid` by lookup ref 8.5 → 4.3 ms
   (§11). The query and pull rows of §3.7 each run one read and did
@@ -1726,6 +1803,17 @@ Each lever is a measured change: a before/after from `zig build bench`
   `nth` 1,197 → 997 M, string splitting 347 → 303 M.
 
 **Dead ends, measured and reverted** (hosts of §3.7 and §3.8):
+
+- *The transaction entity taken as fresh* in expansion, so the
+  `:db/txInstant` datom skips the two probes of committed state a
+  new entity skips (the entity of `t` has none: `checkEid` refuses a
+  later transaction's), and *insertion sort* for a batch of at most
+  16 datoms in `Store.writeBatch` in place of `std.mem.sort`'s block
+  sort: −0.8 to −2.0% and +0.3 to −0.6% instructions on §3.27's four
+  shapes against the build with trees opened on first use (five
+  interleaved rounds, load 6.5 → 9.6), under the 3% a lever must
+  win. What else Nextomic does per transaction is under 5% a part
+  (§3.27); the page work is emdb's (`TODO.md` #2).
 
 - *Clearing a closure's call block on return* (the part of the
   callee's window in the caller's frame, from the callee slot to the
@@ -1858,5 +1946,6 @@ is one invocation's 30-sample median.
 | §3.23 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 21:10–21:16 MDT, speed3-c: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `32fd022` (before) and at the self-call commit (after). Micro programs: `harness.py OUT 7` over `fib` at 27 and 30 and `count`, `gcall`, `lc`, `kw` at 5 M and 10 M iterations, under `tools/heavy` (1 core), load 2.08 → 1.99. The `bench/compare` programs (prelude and body) by `cmds.py OUT 5`, load 1.86 → 1.81; `-e nil` by `cmds.py OUT 21`. `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads fib,loop,destructure,pipeline --no-build --max-load 16` four times, after, before, after, before, from a copy of `bench/` (load 2.17 → 3.14). Raw output: `.git/revamp/r2/bench/speed3-c/` |
 | §3.24 | as §3.23 | 2026-10-06 21:18–21:24 MDT, speed3-c: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at the self-call commit (before) and at the keyword lookup commit (after). `harness.py OUT 7` over `kw`, `count`, `gcall`, `lc` at 5 M and 10 M iterations and `fib` at 27 and 30, load 2.62 → 2.89; the `bench/compare` programs by `cmds.py OUT 5` (load 2.89 → 2.95) and their phases by `cmds.py OUT 9` (load 3.92); `run.clj` as §3.23 over `pipeline,fib,loop,destructure` (load 4.35 → 4.01). Destructuring through it: the keyword lookup commit (before) against the destructuring commit (after), 21:29–21:31 MDT; `harness.py OUT 7` over `destr` (`(let [n … m {:a 1 :b 2}] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (let [{:keys [a b]} m] (+ a b)))) acc)))`, kept with the raw output), `kw`, `count`, `gcall`, `fib`, load 2.72 → 2.85; `cmds.py OUT 5` and `OUT 9` (load 2.85 → 2.79); `run.clj` over `destructure,pipeline,fib,loop` (load 3.05 → 4.65). Raw output: `.git/revamp/r2/bench/speed3-c/` |
 | §3.25 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 22:18–22:34 MDT, speed4: `bin/nexis` and `nexis-bench` built by `zig build install -Doptimize=fast --prefix DIR` (and `zig build bench`) at `297c146` (before) and at the quickening commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall`, `lc`, `mv`, `lv`, `kw`, `leaf`, `getnl`, `destr` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 3.22 → 3.49; `cbbase`, `cbsum`, `cbred`, `cb`, `lazy` at 1 M and 2 M, five rounds (load 3.54 → 3.58). The `bench/compare` programs (prelude and body) by `cmds.py OUT 5` (load 3.58 → 3.30); startup by `cmds.py OUT 21` over `-e nil` and `-e '(+ 1 2)'`; `run.clj --n 10 --only lang --impls nexis,bb --workloads loop,fib,destructure,pipeline --no-build --max-load 16` four times, after, before, after, before (load 3.30 → 2.89); `nexis-bench --filter vm,compiler` five times per build alternating, `--filter compiler` seven more. Raw output: `.git/revamp/r2/bench/speed4/` (`micro.*`, `q-*`, `vmbench-*`, `cbench-*`) |
+| §3.27, §6 "Trees opened on first use" and its dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); Datalevin 1.1.0; emdb `8e1ed1e` (a source snapshot under both builds); shared with concurrent sessions | 2026-10-07, txperf: `bin/nexis` built by `zig build install -Doptimize=fast` from snapshots of `0ef07a3` (before) and `a787b2f` (after) beside one emdb snapshot. The shapes: `txbench.py OUT 9 A,B plain,entity,upsert,one 2000 10000` over the probe program `tx.nx` (both kept with the raw output), each run in a fresh store under `/usr/bin/time -l`, under `tools/heavy` (1 core), 19:03 MDT, load 9.18 → 7.78; a rerun at load 20.3 → 21.4 gave the same instructions within 0.3%. The dead ends: the same harness, five rounds over four builds, load 6.48 → 9.56. Pages: a build of `0ef07a3` over emdb `dbc5c78` printing emdb's dirty-page count before each commit, the same program at both sizes. `bb bench/compare/run.clj --no-build --n 10 --only db --impls nexis --max-load 16` four times, after, before, after, before, 19:04–19:16 MDT, load 5.61 → 5.02. The Datalevin run: `run.clj --no-build --n 10 --only db --impls nexis,datalevin --max-load 16` with the after build, 19:34–19:38 MDT, load 19.96 → 4.26. The profile: `perf record -e instructions:u --call-graph lbr -F 900` and `perf script --inline` on the host of §3.15 (`taskset -c 0`, nexis at `a787b2f`'s source, emdb `dbc5c78`), `tx.nx STORE 200000 entity`; the before figure from `0ef07a3` over `tx1.nx`, the same shape without the 20,000 loaded first, 300,000 transactions. Raw output: `.git/revamp/r3/txperf/` (`profile/` holds the two `perf script` outputs and `split.py`, which reads the shares from them) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
 | §3.26, §6 "The counting-loop step" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `dbc5c78`; shared with concurrent sessions | 2026-10-07 18:28–18:31 MDT, spd14: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `0ef07a3` (before) and at the step commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 5.81 → 5.67; the `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.67 → 5.99; `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads loop,destructure,fib,pipeline --no-build --max-load 16` four times, after, before, after, before, the binary swapped into one copy of the tree, load 3.92 → 3.42. The histograms of §6: speed4, 2026-10-06, `-Dopcodes=true` at the quickening commit (`.git/revamp/r2/bench/speed4/hist-B/`). Raw output: `.git/revamp/r3/spd14/` (`micro.*`, `cmp.*`, `runclj-*`) |
