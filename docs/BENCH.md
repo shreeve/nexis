@@ -362,9 +362,10 @@ after each.
   a long-running peer would do better on the others.
 - *Sequences.* All three are lazy and chunked by 32 (`docs/LAZY.md`):
   `filter`, `map` and `map` realize a chunk at a time as `reduce`
-  walks. nexis's VM keeps the intermediate seqs in its slots until the
-  call returns (no locals clearing), so the pipeline row holds all
-  three realized, as Clojure's would not.
+  walks. nexis lets each intermediate seq go as it is walked, as
+  Clojure's locals clearing does: a native's call block is cleared
+  when it returns, `reduce` consumes its argument, and a local is
+  cleared at its last move (`docs/LAZY.md` §9).
 - *Transients.* All three edit the nodes a transient owns in place
   (`docs/TRANSIENT.md`).
 - *Durability.* The rows are grouped by what a commit guarantees when

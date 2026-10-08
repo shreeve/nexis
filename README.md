@@ -239,9 +239,10 @@ The semantics port; the platform does not.
   `import`, and no JVM libraries.
 - **No STM, agents or threads**: immutable values, atoms and emdb
   transactions are the concurrency story.
-- **Lazy sequences keep their head**: a lazy seq that a local or a
-  call's argument holds keeps what it realized until its slot is
-  reused; there is no locals clearing (`docs/LAZY.md` §9).
+- **A captured lazy seq keeps its head**: a local or a parameter lets
+  go of a lazy seq at its last use, as Clojure's locals clearing does,
+  but one a closure captures, or one `count`, `into` or `vec` walks,
+  stays held until it is released (`docs/LAZY.md` §9).
 - **Regular expressions** match in linear time: Java's syntax without
   backreferences, lookaround, atomic groups or possessive quantifiers,
   which are `:invalid-regex` (`docs/REGEX.md`).
