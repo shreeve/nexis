@@ -83,6 +83,11 @@ with `db.map_grow_step` (8 MiB). emdb's default page size is the OS page size, a
 size fixes the key bound and overflow threshold for the life of the
 file, so every store carries the same geometry wherever it is
 created. An existing file keeps the page size it was created with.
+A store file moves between hosts as it is, without its `-lock` file:
+one written on macOS arm64 (16 KiB OS pages) reads on Linux x86_64
+(4 KiB OS pages) and the reverse with every key and value the same
+(`test/portable/README.md`; both hosts are little-endian, and a
+big-endian one is untested).
 The map sizes, where emdb's defaults are 256 MiB and 64 MiB, keep a
 store of one key a small file, whichever layer opens it first.
 

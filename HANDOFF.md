@@ -361,9 +361,23 @@ failing test (AGENTS.md).
    check-targets` compiles and links every binary for x86_64 and
    aarch64 Linux, glibc and musl, from any host, and the comparison
    harness runs on an x86_64 Linux host (`docs/PERF.md` §3.15).
-   Unproven: a store written on one platform and read on the other
-   (the page size is pinned, so the files should be byte-compatible).
-   The tests
+   A store carries between macOS arm64 and Linux x86_64 in both
+   directions: `test/portable/write.nx` writes a `db/*` store and a
+   Nextomic store with data in all twelve trees (history, `as-of`
+   views, a rename, excisions, fulltext rows), and `read.nx` dumps
+   them. Written on each host, copied to the other without the
+   `-lock` files and read read-only on both, the four dumps are the
+   bytes of `test/portable/read.out`, and the reads leave the files as
+   they came. The hosts of record are macOS 27.0.1 on an Apple M5 and
+   Ubuntu 26.04.1 (glibc 2.43) on an Intel Core Ultra 9 185H, Zig
+   0.17.0, emdb `8e1ed1e`. emdb's own dump (`emdb -d`) of the stores
+   each host writes lists the same records but for the bootstrap
+   instant and the Nextomic store's uuid, and the two `db/*` files
+   differ only in each meta page's random database and commit ids and
+   its checksum. `zig build portable`, in the gate, pins the dump on
+   the host that builds; the exchange between hosts is the manual
+   procedure of `test/portable/README.md`. Both hosts are
+   little-endian; a big-endian one is untested. The tests
    that open a read-only store file assume a user who is not root:
    root may write any file.
 2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI
@@ -423,10 +437,7 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. A store carried between macOS and Linux (§6.4): write one on each
-   host and read it on the other, with the Linux host of
-   `docs/PERF.md` §3.15.
-2. Interpreter speed: the instructions each bytecode instruction
+1. Interpreter speed: the instructions each bytecode instruction
    costs and the dispatches a loop or a call takes, which keep nexis
    behind babashka on three rows and behind warm JVM Clojure on eight
    of ten on the Linux host (`docs/PERF.md` §3.15). The levers are
@@ -435,9 +446,9 @@ after numbers in the commit message.
    compare-and-jump and loop-step instructions (`docs/VM.md` §8, §10;
    `docs/PERF.md` §6). The owner orders this after the em and emdb
    work, with em's runtime as the reference.
-3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
+2. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
-4. The open design question, an amendment first: `&form`/`&env`
+3. The open design question, an amendment first: `&form`/`&env`
    (§24 #13). The owner orders it after the em and emdb work.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)

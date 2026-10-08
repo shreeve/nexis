@@ -52,7 +52,9 @@ map, and its allocated blocks are the pages written. emdb reads a
 file's page size from its meta and fixes it for the file's life
 (INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
-holds on every platform. Keys never approach it except a keyword's
+holds on every platform. A store written on macOS arm64 reads on Linux
+x86_64 and the reverse with every datom, history row, ident, txlog
+entry and fulltext row the same (`test/portable/README.md`). Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
 byte array in EAVT-h or a transaction's txlog entry, is at most just
 under 4 GiB, emdb's longest overflow chain; past that the engine
