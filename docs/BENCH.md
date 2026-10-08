@@ -467,11 +467,13 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
   `acall` adds a call of a three-clause `defn` at its one-argument
   clause, `vcall` one at a variadic clause with one argument in its
   rest; `fib` counts calls, and `afib` the calls of a two-clause `fib`
-  whose every call enters the other clause; `cbsum`, `cbred`, `cb`
-  and `lazy` call a native over a vector with a callback, `xform`
+  whose every call enters the other clause; `cbsum`, `cbred`, `cb`,
+  `lazy` and `cbfilt` call a native over a vector with a callback
+  (`cbfilt` reduces a lazy `filter` of a closure), `xform`
   transduces `(map inc)` over one, the step fn's clause called per
-  element, and `cbbase` is the setup they share; `lazy3` is a lazy pipeline over a range,
-  for its peak RSS.
+  element, and `cbbase` is the setup they share; `cbrange` reduces an
+  unrealized range with a closure, with no setup to subtract; `lazy3`
+  is a lazy pipeline over a range, for its peak RSS.
   `lazyl` binds the same pipeline with `let` and `lazyf` passes it to
   a fn, each then walking it with `reduce`, for what locals clearing
   lets go (`docs/COMPILER.md` §4.9); `mvc` adds one `mov:move-clear`

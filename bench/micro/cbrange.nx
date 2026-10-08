@@ -1,0 +1,3 @@
+; bench/micro/cbrange.nx N: reduce with a closure as its callback over an unrealized range.
+(let [n (parse-long (first *command-line-args*))]
+  (println (reduce (fn [a x] (+ a x)) 0 (range n))))
