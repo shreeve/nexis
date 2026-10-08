@@ -2297,6 +2297,65 @@ A new entity writes no history tree; a retraction writes two rows to
 each where format 2 wrote one, and still dirties fewer pages, its keys
 shorter and its leaves fuller.
 
+### 3.37 Var calls, Apple M5
+
+What a call of a leaf native or a closure through a Var costs, and
+two levers on it, neither kept (§6 "A Var's load run with its call"
+and "Calls of one or two arguments in place"). Before is the micro
+kit's commit `19eb7cd`; one ReleaseFast build of each lever over it.
+Provenance: §11.
+
+`(nth v i)`, `(count v)` or `(max acc i)` through a Var is a
+`var:load-var` of the callee, a `mov:move` or `mov:load-const` of each
+argument into a block and `call:call`, which goes on to `callLeaf`:
+three or four dispatches. The micro kit (`docs/BENCH.md` §13), five
+rounds, instructions an iteration, the median and the range of the
+paired rounds (load 18.8 → 15.9 for the first column, 14.1 → 12.5 for
+the second, 13.7 → 10.8 for the third, each lever's run with its own
+build of the base, whose figures matched the first column's to 0.4):
+
+| Program | Before | The load run with its call | Calls in place, the load run with `call2` |
+|---|---:|---:|---:|
+| `count` | 58.0 [57.3–58.1] | 58.1 [57.3–58.1] | 57.9 [57.2–57.9] |
+| `gcall`, `(f 7)` of a `defn` | 231.1 [231.0–231.5] | 221.4 [221.0–221.6] | 194.0 [193.9–194.1] |
+| `leaf`, `(max acc i)` into a `recur` | 300.1 [299.8–300.2] | 289.5 [289.3–289.6] | 284.0 [283.9–284.2] |
+| `getnl`, `(get v 3)` | 395.0 [394.6–396.3] | 384.6 [384.6–384.9] | 358.1 [358.0–358.3] |
+| `vnth`, `(nth v j)` | 332.0 [331.9–332.3] | 321.2 [321.1–321.4] | 290.0 [289.9–290.3] |
+| `leaf1`, `(count v)` | 300.2 [299.9–300.7] | 289.4 [289.3–291.0] | 263.1 [262.6–263.3] |
+| `vdestr`, `[x y & more]` of a vector | 1281.6 [1280.6–1287.3] | 1239.0 [1238.3–1239.1] | 1235.9 [1235.4–1236.2] |
+
+Above `count`, the calls in place take `gcall` 21.4% fewer
+instructions, `leaf1` and `vnth` 15%, `getnl` 11%, `leaf` 6.6% and
+`vdestr` 3.7%; the load run with its call takes 3.2–5.7% off each.
+`acc`, `fib`, `lc`, `lv`, `mv`, `mvc`, `kw`, the callback programs
+and `lazy`, `lazyl` and `lazyf` are within their ranges in both, and
+every peak resident set is the same, `lazyl`'s, `lazyf`'s and §3.31's
+`(count s)`, `(count (into #{} s))`, `(count (vec s))` and a `defn`'s
+`(count s)` included: the clearing forms let a dead argument's slot go
+as `mov:move-clear` does. Whole process, three interleaved runs:
+`destructure` 3,326.8 → 3,248.1 M instructions (−2.4%),
+`vector-conj-nth` 779.9 → 774.8 M (−0.7%), `pipeline` 2,147.9 →
+2,150.3 M and `fib` 535.2 → 535.1 M.
+
+A build with `-Dopcodes=true` of each runs the same natives the same
+number of times in every program. The calls in place take dispatches
+an iteration from 6 to 4 in `gcall`, 5 to 3 in `leaf`, 7 to 4 in
+`getnl` and `vnth`, 6 to 4 in `leaf1` and 22 to 18 in `vdestr`, whose
+two `nth` calls take three arguments; the load run with its call
+takes one from each.
+
+What the rows say. A dispatch costs about ten instructions, the
+fetch, the table load and the branch; the rest of what `lv` and `mv`
+add to `count` is the loop's own instructions that the step no
+longer fuses (§3.26). An instruction-by-instruction trace of one
+`leaf1` iteration under `lldb` counts 297 instructions before and 263
+after: the native, `count` of a vector, is 61 of them (`fnCountLeaf`
+and `fnCount`); the call around it 107, of which the in-place call's
+fast handler is 25, its out-of-line part's frame, arity tests and
+second read of the callee 55, and the safe point and the next fetch
+the rest. `callLeaf` behind `call:call` costs about the same; what
+the calls in place remove is the moves, not the call.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2360,9 +2419,19 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
-- **Inline caches at call sites**: a call through a Var is a `var:load-var` and a `call:call`, each reading
-  its operands with no kind to decode; a cache must still see the
-  Var's latest root (PLAN §23 #20).
+- **Inline caches at call sites**: a call through a Var is a
+  `var:load-var` and a `call:call`, each reading its operands with no
+  kind to decode; a cache must still see the Var's latest root (PLAN
+  §23 #20). A version stamp on the Var checked at each call site is
+  rejected: reading the Var is already two flag loads and two word
+  loads, about what a stamp's test costs; the stamp pays only by also
+  caching the callee's kind, leaf flag and arity verdict, 8–12
+  instructions of a leaf call's 107 (§3.37); it needs state per call
+  site that verified, immutable bytecode and the shared stdlib image
+  do not have, so a side table; and every write of a Var must bump
+  it (`var:store-var`, `alter-var-root` and `with-redefs`, a binding's
+  push and pop, `var-set`, `intern`), where one missed write silently
+  breaks #20.
 - **Comptime specialization** beyond CHAMP's inline immediate hash:
   `(reduce + xs)` over fixnums, `equal` by kind pair.
 - **A smaller heap header** for small objects.
@@ -2633,6 +2702,33 @@ Each lever is a measured change: a before/after from `zig build bench`
 - *Comptime monomorphization of `mapAssoc`/`setConj` for keyword
   keys* beyond the inline hash: assoc and conj stayed within noise at
   every N; the remaining cost is path copying and allocation (§3.2).
+- *A Var's load run with its call*: a call whose arguments run no
+  code read its Var callee last, just before the `call:call`, and the
+  `var:load-var` quickened with the call (`var:load-var.s+call`) ran
+  the pair as one dispatch, reading the Var at every execution. One
+  dispatch fewer per eligible call, the native counts the same, took
+  3.6% of `leaf`'s instructions, 4.2% of `gcall`'s, 2.7% of `getnl`'s
+  and 3.3% of `vnth`'s (§3.37), under the 8% it had to win on each:
+  a dispatch is about ten instructions. Not kept.
+- *Calls of one or two arguments in place*: `call:call1 A=dst B=arg
+  C=callee` and `call:call2 A=callee B=arg C=arg`, reading their
+  arguments where they are, a constant, a slot, an upvalue or a Var,
+  with no block staged; clearing forms that left a dead argument's
+  slot nil; quickened forms of slot, constant and Var operands; and a
+  callee's `var:load-var` run with the `call:call2` after it. The
+  closure path opened the callee's window at the stack's length, as
+  `callValue` does; a native that is not a leaf got its arguments
+  written past the stack's length, rooted while it ran; everything
+  else went through `call:call`'s general entry from a block written
+  there. Every call order, redefinition, binding and `with-redefs`
+  case held, and every peak resident set, but the rows fell 6.6–21%
+  above `count` where they had to fall 20–35%, and the destructuring
+  loop 2.4% of its instructions where it had to fall 8% (§3.37): the
+  moves and dispatches went, and an in-place call's out-of-line part
+  costs what `callLeaf` does. What a leaf call through a Var costs
+  past that is the native's own body (`count` of a vector is 61
+  instructions) and the out-of-line part's frame; nothing in the
+  call's encoding reaches either. Not kept.
 
 ---
 
@@ -2719,4 +2815,5 @@ is one invocation's 30-sample median.
 | §3.34, §6 "`sort`'s buffers" and "`vec` of a vector's view" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 15:36–15:57 MDT, sortbuf: `bin/nexis` built by `zig build install -Doptimize=fast` at `fd5ef10` (before) and `45068cc` (after), on the Linux host from source snapshots of each; on the M5 also the after code with `SortOrder.less` not inline, and a trial build whose `vec` returns a list view's vector, one run of each. Programs: `bench/compare/prelude.nx` with `lang/sort.clj`, with its body's `(sort xs)` alone (`sortonly.nx`), `(sort-by - xs)` (`sortby.nx`), `(sort > xs)` (`sortcmpf.nx`), and §3.32's `sortstr.nx`, kept with the raw output. Linux: `perfpairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u bin/nexis run P`, the builds interleaved, five rounds, holding the host's benchmark lease (load 1.5 → 2.3); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads sort` from each snapshot, before, after, before, after (load 1.9 → 1.9; its report names the `zig` on the path, not the one that built). M5: `macpairs.sh`, each run `/usr/bin/time -l bin/nexis run P`, the builds interleaved, seven rounds under `tools/heavy` (1 core), twice (load 22.9 → 22.8 and 22.0 → 20.3; the tables are the second). Raw output: `.git/revamp/r3/sortbuf/` (`pup-perf-1.txt`, `mac-*.txt`, `runclj/`) |
 | §3.35 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08 16:13–16:44 MDT, seqfix: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `ced34dc` (before: `0c7d082` before its rebase onto `e115f57`, which brings §3.34's `sort`) and at the commit that adds §3.35 over the same base (after; the `zipmap` rows with its values consumed as well, `zipmap` alone differing). Programs (`rev`, `butl`, `mapv`, `filtv`, `apply`, `zipm`, `selk`, `join`, `joini`, the vector controls and the loops of small calls) kept with the raw output: `harness.py OUT 3` at 3 M and 30 M (`mem5.*`, load 14.5 → 15.4); `join`, `joini` and `string-split` by `cmds.py OUT 5` (`cmp3.*`, load 30). Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), load 31.5 → 25.9. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 29.4 → 31.1. The `vec` of a view runs: `cmds.py OUT 5`, the build of the consuming commit against the one after it (`vec.*`, load 5.3 → 5.2). Raw output: `.git/revamp/r3/seqfix/` (`mem*.txt`, `mem*.json`, `mem*.load`, `micro.*`, `cmp*.*`, `vec.*`, `programs/`) |
 | §3.36, §3.11's and §3.15's store rows, §6 "Store size" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` (`8e1ed1e` for the v0.1.0 stage, a source snapshot), shared with concurrent sessions (load 6–45); and the Linux host of §3.15, Zig 0.17.0 (`tools/zig-0.17`; `run.clj` reports the host's default `zig`), emdb `b3370fb` (a source snapshot) | 2026-10-08, store. Sizes: `zig build bench -Doptimize=fast -- --filter nextomic-store` at each stage's commit (snapshots of `0d5f691` under both emdbs, `f4b2072`, `4dd916a`, `05ed7a1`). Reads on the M5: `q.nx STORE MODE N` (a probe over the `nexis-load.nx` store, its churn variant after two rounds of 20,000 salary changes) under `tools/heavy /usr/bin/time -l`, N1 and N2 per mode, three interleaved rounds, `78f0f3b` against `b2c4eaa`. Transactions on the M5: `tx.nx STORE N MODE` (§3.27's probe plus a `retract` shape), 2,000 and 10,000, three interleaved rounds, `78f0f3b` against `b2c4eaa`, pages from copies of both printing each commit's dirty-page count. Linux: `perf stat -x, -e instructions:u,cycles:u,branch-misses:u` of the read probe pinned to one core (`taskset -c 2`), three rounds, `fd5ef10`, `b2c4eaa` and `04ccab3`; `run.clj --no-build --only db --impls nexis --n 10 --max-load 4 --pin 0-11` from snapshots of `fd5ef10` and `04ccab3`, base, head, base, head (load 0.5–1.4), and once from `05ed7a1` with `--impls nexis,datalevin`; all under the host's benchmark lease. Raw output: `.git/revamp/r3/store/` |
+| §3.37, §6 "A Var's load run with its call", "Calls of one or two arguments in place", "Inline caches at call sites" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08, varcalls: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `19eb7cd` (before), with the load run with its call over `f277127`, and with the calls in place and the load run with `call2` over `a9a7cec` (five commits, not kept); `-Dopcodes=true` twins of each. Micro kit: `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,lv,mv,mvc,kw,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cbred,cb,lazy,lazyl,lazyf BEFORE AFTER` under `tools/heavy` (1 core), the loads in the text. Whole process: the `bench/compare` programs (prelude and body) under `/usr/bin/time -l`, three interleaved rounds; the §3.31 shapes at 3 M once each. The trace: `lldb` stepping one iteration of `leaf1.nx` from one `fnCountLeaf` entry to the next. Raw output: `.git/revamp/r3/varcalls/` |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |

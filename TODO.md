@@ -60,10 +60,17 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 19. **A leaf native called through a Var pays a whole call.** `(nth v
     i)` or `(even? x)` is `var:load-var`, the argument moves and
     `call:call` into `callLeaf`, about 240 instructions above a
-    counting-loop iteration (the micro kit's `leaf`, `docs/PERF.md`
-    §3.29). A cache of the Var's leaf at its call site must still see
-    the Var's latest root (PLAN §23 #20; `docs/PERF.md` §6 "Inline
-    caches at call sites"), so it needs its own design.
+    counting-loop iteration (the micro kit's `leaf1` and `vnth`,
+    `docs/PERF.md` §3.37 "Var calls"). Fusing the load with its call
+    and calling in place without the moves removed 3–6% and 7–21% of
+    that, short of the bars they had to meet, and were not kept
+    (`docs/PERF.md` §6). An instruction trace of one `leaf1` iteration
+    puts the native's own body (`count` of a vector through
+    `fnCountLeaf` and `fnCount`) at 61 instructions beside the call's
+    107, most of those the out-of-line part's frame, tests and safe
+    point: the levers left are the natives' leaf bodies and that part, and a cache at the call site must still see the Var's
+    latest root (PLAN §23 #20; `docs/PERF.md` §6 "Inline caches at
+    call sites").
 
 ## Store size
 
