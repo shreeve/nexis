@@ -657,7 +657,7 @@ pub const Store = struct {
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
-        for (batch) |p| total += key.id_len + key.attr_key_max + p.vbytes.len;
+        for (batch) |p| total += key.entity_key_max + key.attr_key_max + p.vbytes.len;
         var keys: std.ArrayList(u8) = .empty;
         try keys.ensureTotalCapacityPrecise(arena, total);
         const offsets = try arena.alloc(u32, batch.len + 1);
@@ -1878,8 +1878,12 @@ test "a merged scan orders facts by their bytes, each fact's history before its 
         const prefix = try key.prefixBytes(arena, ix, if (ix == .eavt) .{ .e = e } else .{ .a = 100 });
         const end = try key.successor(arena, prefix);
         var m = try Store.mergedScan(txn, store.trees, ix, prefix, end);
-        // Every row, in the order `rows` lists them.
-        for (rows) |want| {
+        // Every row, in the order `rows` lists them; in AVET, where the
+        // entity follows the value, the out-of-line value's rows come
+        // before its 64-byte inline sibling's (NEXTOMIC.md §2.2).
+        const order: []const usize = if (ix == .eavt) &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 } else &.{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 6, 10 };
+        for (order) |r| {
+            const want = rows[r];
             const got = (try m.next()) orelse return error.TestUnexpectedResult;
             const parts = try key.unpackKey(ix, false, got.fact);
             try testing.expectEqualSlices(u8, try key.valBytes(arena, .{ .string = want.v }), parts.v);

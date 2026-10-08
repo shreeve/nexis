@@ -107,18 +107,18 @@ still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[e:6][A(a)][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
-| `nx/aevt` | `[A(a)][e:6][v]` | `[t:6]` |
-| `nx/avet` | `[A(a)][v][e:6]` | `[t:6]` (indexed and unique attrs only) |
-| `nx/vaet` | `[v:6][A(a)][e:6]` | `[t:6]` (ref attrs only) |
-| `nx/eavt-h` | `[e:6][A(a)][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
-| `nx/aevt-h` | `[A(a)][e:6][v][top:6]` | empty |
-| `nx/avet-h` | `[A(a)][v][e:6][top:6]` | empty (indexed and unique attrs only) |
-| `nx/vaet-h` | `[v:6][A(a)][e:6][top:6]` | empty (ref attrs only) |
+| `nx/eavt` | `[E(e)][A(a)][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
+| `nx/aevt` | `[A(a)][E(e)][v]` | `[t:6]` |
+| `nx/avet` | `[A(a)][v][E(e)]` | `[t:6]` (indexed and unique attrs only) |
+| `nx/vaet` | `[E(v)][A(a)][E(e)]` | `[t:6]` (ref attrs only) |
+| `nx/eavt-h` | `[E(e)][A(a)][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
+| `nx/aevt-h` | `[A(a)][E(e)][v][top:6]` | empty |
+| `nx/avet-h` | `[A(a)][v][E(e)][top:6]` | empty (indexed and unique attrs only) |
+| `nx/vaet-h` | `[E(v)][A(a)][E(e)][top:6]` | empty (ref attrs only) |
 | `nx/txlog` | `[t:6]` | the entry (below): flags, instant, the datoms in write order, and on an entry an excision touched the entities it excised |
 | `nx/idents` | `[0x00][utf8 text]` / `[0x01][id:4]` / `[0x02][utf8 text]` | id / text / id of a name a rename retired |
 | `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"ft"`, `"n"[a:4]` | see §2.3 |
-| `nx/fulltext` | `[A(a)][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
+| `nx/fulltext` | `[A(a)][token][0x00][E(e)][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
 
 A txlog entry (`datom.zig`) is bytes: a flags byte, the instant as a
 zigzag LEB128, the row count as a LEB128, the rows, and when an
@@ -138,15 +138,21 @@ follows, and whether the transaction entity's `:db/txInstant` of the
 header's instant is the last datom, which the header then holds
 alone.
 
-`top` = `(t << 1) | added`. `A(a)` is the attribute id as an ordered
-varint (SQLite4's): one byte up to 240, two up to 2287, three up to
-67823, then a byte giving the length and the id's 3 or 4 bytes; its
-byte order is numeric order, and its first byte gives its length, so no
-encoding is a prefix of another. A key parses forward: every field but
-`v` gives its own length, and `v` runs to the fixed-width field that
-follows it, or to the key's end, with no length byte. The decoder
-refuses an ordered varint longer than it need be, so equal ids have
-equal bytes.
+`top` = `(t << 1) | added`. `E(e)` is an entity id: a header byte
+holding its partition's class (1 attributes, 2 user entities, 3
+transactions) in the high nibble and a count `n` in the low, then the
+id's offset in its partition in `n` big-endian bytes, as few as it
+takes (a user entity below `2^32 + 2^24` takes four bytes in all).
+`A(a)` is the attribute id as an ordered varint (SQLite4's): one byte
+up to 240, two up to 2287, three up to 67823, then a byte giving the
+length and the id's 3 or 4 bytes. Each has byte order equal to numeric
+order, since the classes ascend with the partitions, and gives its
+length in its first byte, so no encoding is a prefix of another. A key
+parses forward: every field but `v` gives its own length; `v` runs to
+the key's end, or to `top`, in EAVT and AEVT, and is parsed by its tag
+in AVET (a string or byte array to its terminator, §2.2). The decoder
+refuses either id longer than it need be, past its partition, or of
+another class, so equal ids have equal bytes.
 
 A fact's latest assertion, while the fact is current, lives in the
 current trees alone; a history tree holds every other row of the fact,
@@ -159,9 +165,9 @@ trees empty. A read that finds H1 broken is `:db/corrupted`.
 
 ### 2.1 Identifiers
 
-Entity ids are stored big-endian in 6 bytes, an attribute or ident id
-in an index key as `A(a)` (§2) and in `sys` and `nx/idents` in 4 bytes;
-every id fits the VM's `fixnum` (i48), so the usable range is
+An entity id in an index key is `E(e)` and an attribute or ident id
+`A(a)` (§2); `sys` and the txlog's keys hold ids and `t`s big-endian in
+6 bytes, and `sys` and `nx/idents` ident ids in 4; every id fits the VM's `fixnum` (i48), so the usable range is
 `0 .. 2^47-1`. An id, a `t` or a `sys`
 counter read back from the file outside its range is `:db/corrupted`,
 never trusted; a partition or `t` that would run past its range is
@@ -200,7 +206,7 @@ One tag byte orders types; within a type, byte order equals value order.
 | `0x18` | double | IEEE bits `b`: sign set → `~b`, else `b ^ 0x8000…`; `-0.0` stored as `+0.0`; NaN rejected (`:nextomic/value-type`) |
 | `0x20` | instant | i64 milliseconds, encoded like long |
 | `0x30` | keyword | `A(ident-id)` |
-| `0x40` | ref | `[eid:6]` |
+| `0x40` | ref | `E(eid)` |
 | `0x50` | string ≤ 96 bytes | UTF-8 with `0x00 → 0x00 0xFF`, terminated by `0x00` |
 | `0x50` | string > 96 bytes | first 64 escaped bytes, `0x00`, `0x01`, then a 128-bit hash of the whole string |
 | `0x60` | uuid | 16 bytes |
@@ -229,9 +235,11 @@ different keys, in line with `(= 1 1.0)` being false.
 index key is an equality key, not an order key. Byte order equals value
 order across the threshold whenever two values differ within their
 first 64 bytes. When two values agree on those 64 bytes, an out-of-line
-one sorts after the inline value that is those bytes alone and before
-any longer inline one (its `0x00 0x01` precedes every content byte),
-and two out-of-line values order by hash (`key.hash128`: two XXH3-64
+one sorts before any longer inline one (its `0x00 0x01` precedes every
+content byte) and after the inline value that is those bytes alone,
+except in AVET, where that value's terminator is followed by its
+entity's `E(e)`, whose header is above `0x01`, and two out-of-line
+values order by hash (`key.hash128`: two XXH3-64
 lanes, seeds 0 and `0x9E3779B97F4A7C15`, through `src/xxhash3.zig`;
 its test pins the digests, since stores hold them).
 The decoder tells the shapes apart by the bare `0x00`: an inline value
@@ -249,9 +257,9 @@ Two distinct values with the same 64-byte prefix and the same 128-bit
 hash under one `(e a)` are treated as one value; the probability is
 2^-128 and the rule is documented rather than defended against.
 
-Worst-case index key: AVET with a 96-byte string, `5 + 1 + 193 + 6 + 6
-= 211` bytes, inside emdb's 256-byte search-clue buffer. An
-`nx/fulltext` key reaches `5 + 255 + 1 + 6 + 16 = 283` bytes; a key
+Worst-case index key: AVET with a 96-byte string, `5 + 1 + 193 + 7 + 6
+= 212` bytes, inside emdb's 256-byte search-clue buffer. An
+`nx/fulltext` key reaches `5 + 255 + 1 + 7 + 16 = 284` bytes; a key
 past 256 bytes bypasses the clue (a slower seek, not an error).
 
 ### 2.3 `sys` tree

@@ -124,16 +124,16 @@ pub const Schema = struct {
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
 
-        var start: [key.id_len]u8 = undefined;
-        var end: [key.id_len]u8 = undefined;
-        key.writeId(&start, 1);
-        key.writeId(&end, key.attr_partition_end);
+        var start_buf: [key.entity_key_max]u8 = undefined;
+        var end_buf: [key.entity_key_max]u8 = undefined;
+        const start = key.writeEntity(&start_buf, 1);
+        const end = key.writeEntity(&end_buf, key.attr_partition_end);
 
         var events: std.ArrayList(Event) = .empty;
         var e: u64 = 0;
         // Every row of the partition up to the basis, its current
         // facts' latest assertions included.
-        var s = try Store.foldScan(txn, store.trees, .eavt, &start, &end, .{ .all = .{ .after = 0, .upto = basis } });
+        var s = try Store.foldScan(txn, store.trees, .eavt, start, end, .{ .all = .{ .after = 0, .upto = basis } });
         while (try s.next()) |row| {
             const parts = try key.unpackKey(.eavt, false, row.fact);
             if (parts.e != e) {

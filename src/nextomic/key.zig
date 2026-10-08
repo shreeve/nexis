@@ -5,12 +5,16 @@
 //!
 //!   - One tag byte orders types; within a type, byte order equals
 //!     value order (`test/prop/nextomic_key.zig` sweeps every type).
-//!   - Ids are unsigned 48-bit big-endian in 6 bytes; an attribute or
-//!     ident id in a key is `A(a)`, an ordered varint (`appendOrdered`):
-//!     1 byte up to 240, 2 up to 2287, 3 up to 67823, then a length
-//!     byte and 3 or 4 bytes, whose byte order is numeric order and
-//!     whose first byte gives its length; `top = (t << 1) | added` in
-//!     6 bytes.
+//!   - An entity id in a key is `E(e)` (`appendEntity`): a header
+//!     byte, its partition's class in the high nibble and a count `n`
+//!     in the low, then `n` bytes of the id's offset in its partition,
+//!     big-endian and minimal. An attribute or ident id in a key is
+//!     `A(a)`, an ordered varint (`appendOrdered`): 1 byte up to 240, 2
+//!     up to 2287, 3 up to 67823, then a length byte and 3 or 4 bytes.
+//!     Each has byte order equal to numeric order, gives its own length
+//!     in its first byte, and decodes only in its shortest form, so
+//!     equal ids have equal bytes. `sys` and `nx/idents` keep ids in 6
+//!     and 4 fixed bytes; `top = (t << 1) | added` is 6 bytes.
 //!   - A key parses forward: every field but `v` gives its own length,
 //!     and `v` runs to the next fixed field or the key's end.
 //!   - Strings and byte arrays carry one tag each. Up to `inline_max`
@@ -32,12 +36,15 @@ const Allocator = std.mem.Allocator;
 // Widths and limits
 // =============================================================================
 
-/// Bytes of an entity or transaction id in a key.
+/// Bytes of an entity id or a `t` in a fixed field: `sys`, the
+/// current trees' values, the txlog's keys.
 pub const id_len = 6;
 /// Bytes of an attribute or ident id in the `sys` and `nx/idents` trees.
 pub const attr_len = 4;
 /// Most bytes of `A(a)`, an attribute or ident id in an index key.
 pub const attr_key_max = 5;
+/// Most bytes of `E(e)`, an entity id in an index key.
+pub const entity_key_max = 7;
 /// Bytes of `top` in a history key.
 pub const top_len = 6;
 /// Largest string or byte array stored inline in a key.
@@ -303,6 +310,57 @@ pub fn appendAttrKey(out: *std.ArrayList(u8), gpa: Allocator, a: u32) !void {
     try appendOrdered(out, gpa, a);
 }
 
+/// `E(e)` in `buf`: the partition's class (1 attributes, 2 users, 3
+/// transactions) in the header's high nibble, the offset's byte count
+/// in its low, then the offset in the partition, big-endian, in as few
+/// bytes as it takes. Entity 0, which no partition holds, is the bare
+/// header `0x10`, which no stored key holds.
+pub fn writeEntity(buf: *[entity_key_max]u8, e: u64) []const u8 {
+    std.debug.assert(e <= id_max);
+    const class: u8, const offset: u64 = if (e < attr_partition_end)
+        .{ 1, e }
+    else if (e < tx_partition_bit)
+        .{ 2, e - user_partition_start }
+    else
+        .{ 3, e - tx_partition_bit };
+    const n: usize = (64 - @clz(offset) + 7) / 8;
+    buf[0] = (class << 4) | @as(u8, @intCast(n));
+    var be: [8]u8 = undefined;
+    std.mem.writeInt(u64, &be, offset, .big);
+    @memcpy(buf[1..][0..n], be[8 - n ..]);
+    return buf[0 .. 1 + n];
+}
+
+pub fn appendEntity(out: *std.ArrayList(u8), gpa: Allocator, e: u64) !void {
+    var buf: [entity_key_max]u8 = undefined;
+    try out.appendSlice(gpa, writeEntity(&buf, e));
+}
+
+/// The bytes the `E(e)` whose header is `first` takes.
+pub fn entityLen(first: u8) usize {
+    return 1 + (first & 0x0F);
+}
+
+/// The `E(e)` at the start of `in` and its length. A class outside the
+/// three, an offset past its partition or spelled longer than it need
+/// be, and entity 0 are `error.Corrupted`.
+pub fn readEntity(in: []const u8) DecodeError!struct { e: u64, len: usize } {
+    if (in.len == 0) return error.Corrupted;
+    const class = in[0] >> 4;
+    const n: usize = in[0] & 0x0F;
+    if (class < 1 or class > 3 or n > 6 or in.len < 1 + n) return error.Corrupted;
+    if (n > 0 and in[1] == 0) return error.Corrupted;
+    var be: [8]u8 = @splat(0);
+    @memcpy(be[8 - n ..], in[1..][0..n]);
+    const offset = std.mem.readInt(u64, &be, .big);
+    const e = switch (class) {
+        1 => if (offset == 0 or offset >= attr_partition_end) return error.Corrupted else offset,
+        2 => if (offset >= user_partition_end - user_partition_start) return error.Corrupted else user_partition_start + offset,
+        else => if (offset >= tx_partition_bit) return error.Corrupted else tx_partition_bit + offset,
+    };
+    return .{ .e = e, .len = 1 + n };
+}
+
 /// The `A(a)` at the start of `in` and its length.
 pub fn readAttrKey(in: []const u8) DecodeError!struct { a: u32, len: usize } {
     const r = try readOrdered(in);
@@ -440,9 +498,7 @@ pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!vo
         },
         .ref => |eid| {
             try out.append(gpa, @backingInt(Tag.ref));
-            var buf: [id_len]u8 = undefined;
-            writeId(&buf, eid);
-            try out.appendSlice(gpa, &buf);
+            try appendEntity(out, gpa, eid);
         },
         .string => |s| try encodeBlob(out, gpa, s, .string),
         .uuid => |u| {
@@ -479,7 +535,7 @@ fn encodeBlob(out: *std.ArrayList(u8), gpa: Allocator, s: []const u8, tag: Tag) 
 /// every one escaped, and its terminator.
 pub const max_val_len = 1 + 2 * inline_max + 1;
 /// The longest key: a history key carrying the longest value.
-pub const max_key_len = id_len + attr_key_max + max_val_len + top_len;
+pub const max_key_len = entity_key_max + attr_key_max + max_val_len + top_len;
 
 /// The owned-slice encoders build in stack scratch and copy out
 /// exactly: nothing they produce exceeds `max_key_len`, and a list
@@ -555,8 +611,9 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
             return .{ .val = .{ .keyword = r.a } };
         },
         .ref => {
-            if (body.len != id_len) return error.Corrupted;
-            return .{ .val = .{ .ref = try readId(body[0..id_len]) } };
+            const r = try readEntity(body);
+            if (r.len != body.len) return error.Corrupted;
+            return .{ .val = .{ .ref = r.e } };
         },
         .string, .bytes => {
             const r = try unescapeFrom(gpa, body);
@@ -579,6 +636,36 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
             return .{ .val = .{ .uuid = body[0..16].* } };
         },
     }
+}
+
+/// The bytes the value encoding at the start of `in` takes: by its
+/// tag for a fixed shape, by its terminator for a string or byte array
+/// (an escaped NUL is `0x00 0xFF`, a bare `0x00` ends an inline value,
+/// and `0x00 0x01` an out-of-line one's prefix before the hash). A key
+/// parses its value this way where a field follows it.
+pub fn valLen(in: []const u8) DecodeError!usize {
+    if (in.len == 0) return error.Corrupted;
+    const tag = tagFromByte(in[0]) orelse return error.Corrupted;
+    const n: usize = switch (tag) {
+        .bool_false, .bool_true => 1,
+        .long, .double, .instant => 9,
+        .uuid => 17,
+        .keyword => if (in.len < 2) return error.Corrupted else 1 + orderedLen(in[1]),
+        .ref => if (in.len < 2) return error.Corrupted else 1 + entityLen(in[1]),
+        .string, .bytes => blk: {
+            var i: usize = 1;
+            while (i < in.len) : (i += 1) {
+                if (in[i] != 0) continue;
+                if (i + 1 < in.len and in[i + 1] == 0xFF) {
+                    i += 1;
+                    continue;
+                }
+                break :blk if (i + 1 < in.len and in[i + 1] == out_of_line_mark) i + 2 + hash_len else i + 1;
+            }
+            return error.Corrupted;
+        },
+    };
+    return if (n > in.len) error.Corrupted else n;
 }
 
 fn tagFromByte(b: u8) ?Tag {
@@ -622,8 +709,7 @@ pub const Index = enum(u8) {
 };
 
 /// Components of a datom key, decoded. `v` is the raw value section:
-/// a tagged encoding for EAVT/AEVT/AVET and a bare 6-byte entity id
-/// for VAET.
+/// a tagged encoding for EAVT/AEVT/AVET and a bare `E(v)` for VAET.
 pub const Parts = struct {
     e: u64,
     a: u32,
@@ -632,40 +718,40 @@ pub const Parts = struct {
     top: ?Top,
 };
 
-/// The VAET value section is the referenced entity id without a tag;
-/// any other value encoding has no place in VAET.
+/// The VAET value section is the referenced entity's `E` without a
+/// tag; any other value encoding has no place in VAET.
 fn vaetValue(vbytes: []const u8) error{ValueType}![]const u8 {
-    if (vbytes.len != 1 + id_len or vbytes[0] != @backingInt(Tag.ref)) return error.ValueType;
+    if (vbytes.len < 2 or vbytes[0] != @backingInt(Tag.ref) or entityLen(vbytes[1]) != vbytes.len - 1) return error.ValueType;
     return vbytes[1..];
 }
 
 /// Append the key of datom `(e a v)` in `index`; a history key when
 /// `top` is given. `vbytes` is the tagged value encoding.
 pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a: u32, vbytes: []const u8, top: ?Top) !void {
-    var ebuf: [id_len]u8 = undefined;
+    var ebuf: [entity_key_max]u8 = undefined;
     var abuf: [ordered_max]u8 = undefined;
-    writeId(&ebuf, e);
+    const eb = writeEntity(&ebuf, e);
     const ab = writeOrdered(&abuf, a);
     switch (index) {
         .eavt => {
-            try out.appendSlice(gpa, &ebuf);
+            try out.appendSlice(gpa, eb);
             try out.appendSlice(gpa, ab);
             try out.appendSlice(gpa, vbytes);
         },
         .aevt => {
             try out.appendSlice(gpa, ab);
-            try out.appendSlice(gpa, &ebuf);
+            try out.appendSlice(gpa, eb);
             try out.appendSlice(gpa, vbytes);
         },
         .avet => {
             try out.appendSlice(gpa, ab);
             try out.appendSlice(gpa, vbytes);
-            try out.appendSlice(gpa, &ebuf);
+            try out.appendSlice(gpa, eb);
         },
         .vaet => {
             try out.appendSlice(gpa, try vaetValue(vbytes));
             try out.appendSlice(gpa, ab);
-            try out.appendSlice(gpa, &ebuf);
+            try out.appendSlice(gpa, eb);
         },
     }
     if (top) |tp| {
@@ -706,14 +792,16 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
         .avet => {
             var at: usize = 0;
             parts.a = try attrAt(body, &at);
-            if (body.len < at + 1 + id_len) return error.Corrupted;
-            parts.v = body[at .. body.len - id_len];
-            parts.e = try readId(body[body.len - id_len ..][0..id_len]);
+            const n = try valLen(body[at..]);
+            parts.v = body[at..][0..n];
+            at += n;
+            parts.e = try idAt(body, &at);
+            if (at != body.len) return error.Corrupted;
         },
         .vaet => {
-            if (body.len < id_len) return error.Corrupted;
-            parts.v = body[0..id_len];
-            var at: usize = id_len;
+            var at: usize = 0;
+            _ = try idAt(body, &at);
+            parts.v = body[0..at];
             parts.a = try attrAt(body, &at);
             parts.e = try idAt(body, &at);
             if (at != body.len) return error.Corrupted;
@@ -722,11 +810,11 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
     return parts;
 }
 
-/// The 6-byte id at `at.*` in `body`, advancing past it.
+/// The `E(e)` at `at.*` in `body`, advancing past it.
 fn idAt(body: []const u8, at: *usize) DecodeError!u64 {
-    if (body.len < at.* + id_len) return error.Corrupted;
-    defer at.* += id_len;
-    return readId(body[at.*..][0..id_len]);
+    const r = try readEntity(body[at.*..]);
+    at.* += r.len;
+    return r.e;
 }
 
 /// The `A(a)` at `at.*` in `body`, advancing past it.
@@ -739,8 +827,9 @@ fn attrAt(body: []const u8, at: *usize) DecodeError!u32 {
 /// The value of decoded key parts as a `KeyVal`.
 pub fn partsVal(gpa: Allocator, index: Index, parts: Parts) DecodeError!KeyVal {
     if (index == .vaet) {
-        if (parts.v.len != id_len) return error.Corrupted;
-        return .{ .val = .{ .ref = try readId(parts.v[0..id_len]) } };
+        const r = try readEntity(parts.v);
+        if (r.len != parts.v.len) return error.Corrupted;
+        return .{ .val = .{ .ref = r.e } };
     }
     return decodeVal(gpa, parts.v);
 }
@@ -758,16 +847,16 @@ pub const Components = struct {
 /// Append the scan prefix for `comps` in `index`. Returns how many
 /// components the prefix covers.
 pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: Components) !u8 {
-    var ebuf: [id_len]u8 = undefined;
+    var ebuf: [entity_key_max]u8 = undefined;
     var abuf: [ordered_max]u8 = undefined;
-    if (comps.e) |e| writeId(&ebuf, e);
+    const eb = if (comps.e) |e| writeEntity(&ebuf, e) else &.{};
     const ab = if (comps.a) |a| writeOrdered(&abuf, a) else &.{};
     var n: u8 = 0;
     for (index.order()) |c| {
         switch (c) {
             .e => {
                 if (comps.e == null) break;
-                try out.appendSlice(gpa, &ebuf);
+                try out.appendSlice(gpa, eb);
             },
             .a => {
                 if (comps.a == null) break;
@@ -947,7 +1036,7 @@ test "prefix covers leading components only" {
     try testing.expectEqual(1 + v.len, out.items.len);
     out.clearRetainingCapacity();
     try testing.expectEqual(@as(u8, 1), try packPrefix(&out, testing.allocator, .eavt, .{ .e = 3, .v = v }));
-    try testing.expectEqual(@as(usize, id_len), out.items.len);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
 }
 
 test "successor increments with carry" {

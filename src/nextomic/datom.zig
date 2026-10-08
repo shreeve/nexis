@@ -8,7 +8,7 @@
 //! the entity less the previous row's (0 before the first), and `v`
 //! typed by the attribute's value type, which never changes: a long or
 //! an instant zigzag LEB, a double its 8 bits big-endian, a boolean one
-//! byte, a keyword its ident id LEB, a ref its eid LEB, a uuid 16
+//! byte, a keyword its ident id LEB, a ref its `E(e)` (key.zig), a uuid 16
 //! bytes, a string or byte array of at most `key.inline_max` bytes its
 //! length LEB and its bytes. A longer one is `key.inline_max + 1`, then
 //! the length LEB and bytes of its index encoding after the tag (the
@@ -133,7 +133,7 @@ fn writeVal(out: *std.ArrayList(u8), arena: Allocator, v: Val) !void {
             try out.appendSlice(arena, &buf);
         },
         .keyword => |id| try writeLeb(out, arena, id),
-        .ref => |eid| try writeLeb(out, arena, eid),
+        .ref => |eid| try key.appendEntity(out, arena, eid),
         .uuid => |u| try out.appendSlice(arena, &u),
         .string, .bytes => |s| {
             if (s.len <= key.inline_max) {
@@ -254,7 +254,8 @@ fn parse(arena: Allocator, bytes: []const u8, types: Source) !Raw {
 fn skipVal(r: *Reader, vt: ValueType) !void {
     switch (vt) {
         .boolean => if (try r.byte() > 1) return error.Corrupted,
-        .long, .instant, .keyword, .ref => _ = try r.leb(),
+        .long, .instant, .keyword => _ = try r.leb(),
+        .ref => _ = try r.take(key.entityLen(try r.byte()) - 1),
         .double => _ = try r.take(8),
         .uuid => _ = try r.take(16),
         .string, .bytes => {
@@ -291,8 +292,8 @@ fn decodeVal(arena: Allocator, row: RawRow, vt: ValueType, t: u64, src: Source) 
         .double => .{ .double = @bitCast(std.mem.readInt(u64, (try r.take(8))[0..8], .big)) },
         .keyword => .{ .keyword = std.math.cast(u32, try r.leb()) orelse return error.Corrupted },
         .ref => blk: {
-            const eid = try r.leb();
-            break :blk if (eid > key.id_max) error.Corrupted else .{ .ref = eid };
+            const x = try key.readEntity(row.v);
+            break :blk if (x.len != row.v.len) error.Corrupted else .{ .ref = x.e };
         },
         .uuid => .{ .uuid = (try r.take(16))[0..16].* },
         .string, .bytes => blk: {

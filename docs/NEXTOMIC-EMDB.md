@@ -143,9 +143,10 @@ behind, the data it describes.
 | Parallel query workers | Lock-free reader registration and wait-free reads (INV-T13, INV-T14B): R-PAR scales eight readers at 1.32x LMDB in §12.2. Read-only children of a write transaction (INV-T15A, `Txn.beginReadChild`) read uncommitted state from other threads |
 | Physical replication and one-step undo | `Env.backup(sinceTxnId, out)` incremental by transaction id, `Env.restore`, `Env.rollback()`, `EnvOptions.previousSnapshot` (INV-BK01..04, INV-RB01..03) |
 
-Nextomic encodes a current-index key as `[e:6][A(a)][v:type-tagged-sortable]`
-(in each index's order; `A(a)` the attribute id as an ordered varint,
-NEXTOMIC.md §2) with the 6-byte `t` of the fact's latest
+Nextomic encodes a current-index key as `[E(e)][A(a)][v:type-tagged-sortable]`
+(in each index's order; `E(e)` the entity id as a class-and-length
+header and its minimal offset, `A(a)` the attribute id as an ordered
+varint, NEXTOMIC.md §2) with the 6-byte `t` of the fact's latest
 assertion as the value, and a history key as the same bytes followed by
 `[(t << 1) | added : 6]` with an empty value. A history tree holds only
 retired rows, a retraction and the assertion it retired, so a store
@@ -171,9 +172,10 @@ Leaf prefix compression was measured on datom keys and declined
 component repeat, so a page-wide prefix saves 14 to 23% of the file and
 front coding 27 to 29%, while a prototype put scans at half to two thirds
 of their rate. Two Nextomic-side levers return more at no engine cost,
-and both are in the design: short keys (a 6-byte entity, an attribute
-id of one or two bytes as an ordered varint, a 6-byte `t` with the op
-folded into it on history rows alone), and sorting a
+and both are in the design: short keys (an entity of two to four bytes
+and an attribute of one or two, each order-preserving and giving its
+own length, a 6-byte `t` with the op folded into it on history rows
+alone), and sorting a
 transaction's AVET and VAET inserts before they are written (leaf fill
 0.66 to 0.72 → 0.90). Reopen only for a leaf set larger than RAM, under
 the experiment §6.27 names.
