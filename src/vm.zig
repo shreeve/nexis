@@ -1467,6 +1467,15 @@ pub const CompilerHooks = struct {
     /// value it returns. A form that does not compile throws. Null
     /// in a macro's sub-VM (§9.1), where `eval` throws `:no-compiler`.
     eval: ?*const fn (*anyopaque, *VM, Value) VmError!Value,
+    /// The first form of `source` compiled as read, as a file's form
+    /// is, so a syntax-quote in it compiles, and run as `eval` runs
+    /// one: its value and the byte its text ends at. Null when
+    /// `source` holds no form; text that does not read throws
+    /// `:reader-error`, a form that does not compile as in `eval`.
+    /// Null where `eval` is.
+    load: ?*const fn (*anyopaque, *VM, []const u8) VmError!?Loaded,
+
+    pub const Loaded = struct { value: Value, end: usize };
 };
 
 /// One entry per `defrecord`.
@@ -2350,15 +2359,16 @@ pub const VM = struct {
 
     /// Make this fresh VM, which runs a macro over `owner`'s heap and
     /// interner, use `owner`'s registries too (§9.1). It gets the
-    /// owner's compiler hooks without `eval`: `macroexpand-1` and
-    /// `read-string` touch nothing that outlives the call, while an
-    /// `eval` would compile into this VM's runtime arena and could
-    /// load a file that runs the owner's collector.
+    /// owner's compiler hooks without `eval` and `load`:
+    /// `macroexpand-1` and `read-string` touch nothing that outlives
+    /// the call, while a compile would go into this VM's runtime arena
+    /// and could load a file that runs the owner's collector.
     pub fn borrowRegistries(self: *VM, owner: *VM) void {
         self.owner = owner.home();
         if (self.owner.?.compiler_hooks) |hooks| {
             self.compiler_hooks = hooks;
             self.compiler_hooks.?.eval = null;
+            self.compiler_hooks.?.load = null;
         }
     }
 

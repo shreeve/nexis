@@ -1688,6 +1688,22 @@ test "core: load-string reads and evaluates a form at a time, and leaves the nam
     try expectLoaded("(load-string \"(defmacro twice [x] (list '* 2 x)) #_(skipped) (def t (twice 4)) ; done\") t", "8");
 }
 
+test "core: load-string compiles each form as read, so a syntax-quote loads as in a file" {
+    try expectLoaded(
+        \\(load-string "(defmacro unless* [c & body] `(if ~c nil (do ~@body))) (def u (unless* false 1 2 3))")
+        \\[u (unless* true 4) (unless* false (let [x# 5] x#))]
+    , "[3 nil 5]");
+    // Each form resolves in the namespace the forms before it left.
+    try expectLoaded("[(load-string \"(ns sq) `(x ~(inc 1) ~@[3 4])\") *ns*]", "[(sq/x 2 3 4) user]");
+    try expectLoaded("(let [[a b] (load-string \"`[a# a#]\")] [(= a b) (simple-symbol? a)])", "[true true]");
+    // A form that does not compile throws as eval's does, after the
+    // forms before it ran.
+    try expectLoaded("[(try (load-string \"(def ok 1) (if)\") (catch any e (:error e))) (resolve 'user/ok)]", "[:compile-error #'user/ok]");
+    // Its `:form` is the form as data, nil for one that has none.
+    try expectLoaded("(try (load-string \"(if 'x 1 2 3)\") (catch any e (:form e)))", "(if (quote x) 1 2 3)");
+    try expectLoaded("(try (load-string \"(if `x 1 2 3)\") (catch any e [(:error e) (:form e)]))", "[:compile-error nil]");
+}
+
 test "core: partitionv, partitionv-all, splitv-at" {
     try expectOutput("[(partitionv 2 [1 2 3 4 5]) (partitionv 2 1 [1 2 3]) (partitionv 3 3 [:p] [1 2 3 4]) (partitionv 2 []) (partitionv 2 nil)]", "[([1 2] [3 4]) ([1 2] [2 3]) ([1 2 3] [4 :p]) () ()]");
     try expectOutput("[(partitionv-all 2 [1 2 3]) (partitionv-all 2 1 [1 2 3]) (partitionv-all 2 nil)]", "[([1 2] [3]) ([1 2] [2 3] [3]) ()]");
@@ -2800,8 +2816,9 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [] (atom 1))", "(m)", "a macro returned an atom, which is not a form", "(m)");
     try expectMacroFailure("(defmacro m [a] a)", "(m (+ 1 `x))", "a syntax-quote is not data a macro can take", "`x");
-    // A macro body has no `eval` (MACROEXPAND.md §1.2).
+    // A macro body has no `eval` or `load-string` (MACROEXPAND.md §1.2).
     try expectMacroFailure("(defmacro m [] (eval '(+ 1 2)))", "(m)", "macro m threw :no-compiler", "(m)");
+    try expectMacroFailure("(defmacro m [] (load-string \"(+ 1 2)\"))", "(m)", "macro m threw :no-compiler", "(m)");
 }
 
 test "defmacro: a macro body runs against the program's record types, namespaces and protocols" {

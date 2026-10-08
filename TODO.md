@@ -7,15 +7,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
-## Gaps
-
-15. **`load-string` refuses a syntax-quote.** It reads each form as
-    data and evaluates it, and a syntax-quote has no data form (the
-    reader leaves a marker the macroexpander expands), so text holding
-    one is `:reader-error`; Clojure loads it. Compiling each Form as
-    read, through a hook beside `CompilerHooks` (`src/compile.zig`),
-    would load it as a file does (`docs/STDLIB.md`, `load-string`).
-
 ## Performance
 
 2. **Small transactions.** 20,000 `transact!` calls of one entity with

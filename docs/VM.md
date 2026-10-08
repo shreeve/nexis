@@ -638,8 +638,9 @@ id or a namespace means the same in every VM that shares a heap, and
 whatever a macro registers, and every value it stores, lives as long
 as the owner. The owner is found through the namespace the macro
 expands in (`NamespaceRegistry.vm`, set by `ensureRegistry`). A sub-VM
-gets the owner's compiler hooks without `eval` (`CompilerHooks.eval`
-is null, and `eval` throws `:no-compiler`): `eval` would compile into
+gets the owner's compiler hooks without `eval` and `load`
+(`CompilerHooks.eval` and `.load` are null, and `eval` and
+`load-string` throw `:no-compiler`): either would compile into
 the sub-VM's runtime arena, which dies with it, and a `require` it ran
 would run the owner's collector over values only the sub-VM holds.
 
