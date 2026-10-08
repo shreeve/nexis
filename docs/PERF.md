@@ -1664,6 +1664,14 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers not built.**
 
+- **`sort`'s comparison on x86-64** (§3.15): Zig 0.17's x86-64 code
+  writes the comparator's `VmError!Order` result as two narrow stores
+  and reads it back as one 32-bit load the CPU cannot forward, 72% of
+  `mergeSort`'s cycles on the Linux host; the sort code is unchanged
+  from the Zig 0.16 build that ran the phase in 144 ms against 181 ms.
+  A comparison that returns its order outside an error union on the
+  fixnum path, with the error reported beside it, is the change to
+  measure on that host.
 - **Batched commits** (`docs/DB.md` §3.3 "No batching"): consecutive
   auto-transaction writes joined into one open emdb write transaction
   would save part of a `:commit` transaction's cost, about 18 μs in

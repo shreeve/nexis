@@ -474,8 +474,9 @@ after numbers in the commit message.
    - The pipeline and vectors: a closure called from a native
      (`VM.callPrepared`) is the largest share of their processes'
      cycles.
-2. Locals clearing (TODO.md #13): a lazy seq a local or a closure's
-   argument holds keeps what it realized until the slot is reused.
+2. `count`, `into` and `vec` consuming their argument (TODO.md #13):
+   a local or a parameter is cleared at its last move (`docs/COMPILER.md`
+   §4.9), but these natives keep the seq they walk in the call's block.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
 4. The open design question, an amendment first: `&form`/`&env`
@@ -484,4 +485,5 @@ after numbers in the commit message.
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
 before and after any performance change; on the Apple host nexis
 leads babashka on every row (§3.11), and Nextomic leads Datalevin,
-Datomic Local and Datomic Pro on every phase timed cold (§3.15).
+Datomic Local and Datomic Pro on every phase timed cold but
+Datalevin's durable commit (§3.15).
