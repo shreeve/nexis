@@ -1647,12 +1647,17 @@ pub const Frame = struct {
 pub const HostCallResult = struct {
     done: bool = false,
     value: Value = value_mod.nilValue(),
+    /// For the cell of a `Callback` running a batch, the part its
+    /// frame's return goes on to, which starts the next element
+    /// (`VM.batchNext`).
+    step: ?VM.OpHandler = null,
 
     /// The returned value, once the loop is back at the call's depth:
-    /// without a return, a throw went past the call.
-    fn get(self: *const HostCallResult) VmError!Value {
+    /// without a return, a throw went past the call. Read a word at a
+    /// time, the width the return stored it (§8).
+    inline fn get(self: *const HostCallResult) VmError!Value {
         if (!self.done) return VmError.ControlTransferred;
-        return self.value;
+        return VM.loadWords(&self.value);
     }
 };
 
@@ -2099,7 +2104,8 @@ pub const DynSave = struct {
 /// arguments from the same place (`map`, `filter`, `reduce`, ...):
 /// `VM.callValue` with what cannot change between those calls decided
 /// at the first one (VM.md §6, "Repeated calls"). Each call has
-/// `callValue`'s effect, errors and rooting.
+/// `callValue`'s effect, errors and rooting. A prepared `Callback`
+/// is not moved: its frame names its own result cell.
 pub const Callback = struct {
     vm: *VM,
     callee: Value,
@@ -2107,12 +2113,87 @@ pub const Callback = struct {
     mode: Mode = .unprepared,
     /// For `.closure`: the frame chain's depth and the stack's length
     /// at the first call, which every later call from the same native
-    /// finds again, and the frame each call pushes.
+    /// finds again; where the callee's locals begin and how many there
+    /// are, which each call nils, and where its window ends; and the
+    /// frame each call pushes.
     depth: usize = 0,
     base: usize = 0,
+    locals: usize = 0,
+    nil_count: usize = 0,
+    window_end: usize = 0,
     frame: Frame = undefined,
+    /// The callee's first instruction and its handler, where each call
+    /// enters the chain.
+    first: Inst = undefined,
+    first_handler: VM.OpHandler = undefined,
+    /// The cell the prepared frame returns into: a callee that
+    /// re-enters the native makes a `Callback` and a cell of its own.
+    result: HostCallResult = .{},
+    /// The pass `each`, `fold` or `foldRange` is running.
+    batch: Batch = undefined,
 
     const Mode = enum { unprepared, general, leaf, lookup, closure };
+
+    /// The calls `each`, `fold` or `foldRange` makes in one pass of the
+    /// chain, in the callee's frame (VM.md §6, "Batched calls").
+    const Batch = struct {
+        kind: Kind,
+        /// The element running, from 0 (once the pass is over, how many
+        /// ran), and how many the pass runs.
+        i: usize,
+        n: usize,
+        /// `each` and `fold`: the elements.
+        items: [*]const Value = undefined,
+        /// `each`: where the results go.
+        out: Out = undefined,
+        /// `fold_range`: the element running, and the step to the next
+        /// (0 for a repeat).
+        x: Value = undefined,
+        step: i64 = 0,
+
+        const Kind = enum { each, fold, fold_range };
+
+        /// What a return does with the value, by kind and, for `each`,
+        /// by where the results go.
+        const Step = enum { each_slots, each_roots, fold, fold_range };
+
+        fn stepFor(b: *const Batch) Step {
+            return switch (b.kind) {
+                .each => if (b.out == .slots) .each_slots else .each_roots,
+                .fold => .fold,
+                .fold_range => .fold_range,
+            };
+        }
+    };
+
+    /// Where `each` puts its results, the one for element `i` at `i`:
+    /// slots of a block a root reaches, or of a buffer whose values
+    /// only their kinds are read from (a cycle may free what they
+    /// point at); or slots of the root stack from an index, never by
+    /// pointer, since a native the callee calls may grow it (GC.md
+    /// §11.5).
+    pub const Out = union(enum) {
+        slots: [*]Value,
+        roots: usize,
+
+        inline fn put(self: Out, vm: *VM, i: usize, v: Value) void {
+            switch (self) {
+                .slots => |p| VM.storeWords(&p[i], v),
+                .roots => |base| vm.roots.items[base + i] = v,
+            }
+        }
+
+        inline fn from(self: Out, i: usize) Out {
+            return switch (self) {
+                .slots => |p| .{ .slots = p + i },
+                .roots => |base| .{ .roots = base + i },
+            };
+        }
+    };
+
+    /// What `fold` and `foldRange` end with: the accumulator, and how
+    /// many elements made it.
+    pub const Folded = struct { acc: Value, used: usize };
 
     pub fn init(vm: *VM, callee: Value, argc: u16) Callback {
         return .{ .vm = vm, .callee = callee, .argc = argc };
@@ -2120,22 +2201,49 @@ pub const Callback = struct {
 
     /// `callee` applied to `args`, of which there are `argc`.
     pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
-        std.debug.assert(args.len == self.argc);
+        return self.callWith(args.len, args);
+    }
+
+    /// `call` of a callback of one argument, which a closure's call
+    /// stores straight from the native's registers into the window.
+    pub inline fn call1(self: *Callback, x: Value) VmError!Value {
+        return self.callWith(1, [1]Value{x});
+    }
+
+    /// `call` of a callback of two arguments.
+    pub inline fn call2(self: *Callback, a: Value, b: Value) VmError!Value {
+        return self.callWith(2, [2]Value{ a, b });
+    }
+
+    /// `args` a slice, or an array of `n` values held in registers.
+    inline fn callWith(self: *Callback, n: usize, args: anytype) VmError!Value {
+        std.debug.assert(n == self.argc);
+        const by_value = @TypeOf(args) != []const Value;
         switch (self.mode) {
-            .leaf => if (!self.vm.gcDue()) {
-                const native = asNativeFn(self.callee);
-                if (native.call(self.vm, args)) |r| {
-                    countNative(native);
-                    return r;
-                } else |err| if (err != VmError.NeedsReentry) return err;
-            },
+            .leaf => return self.callLeaf(asNativeFn(self.callee), if (by_value) &args else args),
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
-            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
-            .unprepared => return self.prepare(args),
+            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) {
+                // The arguments go where the window begins, past the
+                // stack's end, within the capacity the first call made,
+                // a word at a time, as the callee's handlers read them
+                // (§8).
+                const w = self.window();
+                if (by_value) {
+                    inline for (args, 0..) |arg, i| VM.storeWords(&w[i], arg);
+                } else for (args, w[0..args.len]) |*arg, *slot| {
+                    VM.copyWords(slot, arg);
+                }
+                try self.vm.callPrepared(self);
+                return self.result.get();
+            },
+            .unprepared => return self.prepare(if (by_value) &args else args),
             .general => {},
         }
-        return self.vm.callValue(self.callee, args);
+        return self.vm.callValue(self.callee, if (by_value) &args else args);
     }
+
+    /// How many locals `callPrepared` nils in one run.
+    const nil_run = 4;
 
     /// The first call: choose the mode, then make the call.
     fn prepare(self: *Callback, args: []const Value) VmError!Value {
@@ -2163,25 +2271,147 @@ pub const Callback = struct {
                 const window_end = base + routine.slot_count;
                 if (depth >= vm.max_frames) break :closure;
                 vm.frames.ensureUnusedCapacity(vm.allocator, 1) catch return VmError.OutOfMemory;
-                vm.stack.ensureTotalCapacity(vm.allocator, window_end) catch return VmError.OutOfMemory;
+                // Room for the locals `callPrepared` nils four at once.
+                const reach = @max(window_end, base + self.argc + nil_run);
+                vm.stack.ensureTotalCapacity(vm.allocator, reach) catch return VmError.OutOfMemory;
                 if (VM.track_high_water) {
                     vm.frame_high_water = @max(vm.frame_high_water, depth + 1);
                     vm.stack_high_water = @max(vm.stack_high_water, window_end);
                 }
                 self.depth = depth;
                 self.base = base;
+                self.locals = base + self.argc;
+                self.nil_count = routine.slot_count - self.argc;
+                self.window_end = window_end;
+                self.first = routine.code[0];
+                self.first_handler = VM.fast_table[VM.opIndex(self.first)];
                 self.frame = .{
                     .routine = routine,
                     .base_slot = @intCast(base),
                     .entry_stack_len = @intCast(base),
                     .upvalues = closure.upvalues,
                     .closure = self.callee,
+                    .host_result = &self.result,
                 };
                 self.mode = .closure;
             },
             else => {},
         }
-        return self.call(args);
+        return self.callWith(args.len, args);
+    }
+
+    /// A leaf native's call, in place while no cycle is due, else (or
+    /// when it asks to re-enter) `callValue`'s.
+    inline fn callLeaf(self: *Callback, native: *const NativeFn, args: []const Value) VmError!Value {
+        if (!self.vm.gcDue()) {
+            if (native.call(self.vm, args)) |r| {
+                countNative(native);
+                return r;
+            } else |err| if (err != VmError.NeedsReentry) return err;
+        }
+        return self.vm.callValue(self.callee, args);
+    }
+
+    /// Whether a closure's call can take the prepared frame now: the
+    /// native is at the depth and stack length of the first call.
+    inline fn ready(self: *const Callback) bool {
+        return self.mode == .closure and self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base;
+    }
+
+    /// The callee's window, past the stack's end while it is ready.
+    inline fn window(self: *const Callback) [*]Value {
+        return self.vm.stack.items.ptr + self.base;
+    }
+
+    /// `out[i] = callee(items[i])` for each element in turn, `argc` 1:
+    /// a closure's calls in one pass of the chain (VM.md §6, "Batched
+    /// calls"), anything else's as `call1` makes them, with the same
+    /// results, errors and rooting.
+    pub fn each(self: *Callback, items: []const Value, out: Out) VmError!void {
+        std.debug.assert(self.argc == 1);
+        var i: usize = 0;
+        if (self.mode == .unprepared and items.len > 0) {
+            out.put(self.vm, 0, try self.call1(items[0]));
+            i = 1;
+        }
+        if (i < items.len and self.ready()) {
+            self.batch = .{ .kind = .each, .i = 0, .n = items.len - i, .items = items.ptr + i, .out = out.from(i) };
+            VM.storeWords(&self.window()[0], items[i]);
+            return self.vm.callBatch(self);
+        }
+        // A leaf takes its argument where it lies, with no mode to
+        // test per element.
+        if (self.mode == .leaf) {
+            const native = asNativeFn(self.callee);
+            while (i < items.len) : (i += 1) out.put(self.vm, i, try self.callLeaf(native, items[i..][0..1]));
+        } else while (i < items.len) : (i += 1) out.put(self.vm, i, try self.call1(items[i]));
+    }
+
+    /// `acc = callee(acc, items[i])` for each element in turn, `argc`
+    /// 2, as `each` makes the calls, stopping after a result that is a
+    /// record, which may be `reduced`.
+    pub fn fold(self: *Callback, acc: Value, items: []const Value) VmError!Folded {
+        std.debug.assert(self.argc == 2);
+        var a = acc;
+        var i: usize = 0;
+        if (self.mode == .unprepared and items.len > 0) {
+            a = try self.call2(a, items[0]);
+            i = 1;
+            if (a.kind() == .record) return .{ .acc = a, .used = i };
+        }
+        if (i < items.len and self.ready()) {
+            self.batch = .{ .kind = .fold, .i = 0, .n = items.len - i, .items = items.ptr + i };
+            const w = self.window();
+            VM.storeWords(&w[0], a);
+            VM.storeWords(&w[1], items[i]);
+            try self.vm.callBatch(self);
+            return .{ .acc = VM.loadWords(&self.result.value), .used = i + self.batch.i };
+        }
+        const leaf: ?*const NativeFn = if (self.mode == .leaf) asNativeFn(self.callee) else null;
+        while (i < items.len) {
+            a = if (leaf) |native| try self.callLeaf(native, &.{ a, items[i] }) else try self.call2(a, items[i]);
+            i += 1;
+            if (a.kind() == .record) break;
+        }
+        return .{ .acc = a, .used = i };
+    }
+
+    /// `fold` over the `n` fixnums from `x` by `step`, or over `n`
+    /// times `x` when `step` is 0: an unrealized range or repeat,
+    /// whose elements are computed, not read. The caller vouches that
+    /// every element is a fixnum when `step` is not 0.
+    pub fn foldRange(self: *Callback, acc: Value, x: Value, step: i64, n: usize) VmError!Folded {
+        std.debug.assert(self.argc == 2);
+        var a = acc;
+        var e = x;
+        var i: usize = 0;
+        if (self.mode == .unprepared and n > 0) {
+            a = try self.call2(a, e);
+            i = 1;
+            if (a.kind() == .record or i == n) return .{ .acc = a, .used = i };
+            e = rangeNext(e, step);
+        }
+        if (i < n and self.ready()) {
+            self.batch = .{ .kind = .fold_range, .i = 0, .n = n - i, .x = e, .step = step };
+            const w = self.window();
+            VM.storeWords(&w[0], a);
+            VM.storeWords(&w[1], e);
+            try self.vm.callBatch(self);
+            return .{ .acc = VM.loadWords(&self.result.value), .used = i + self.batch.i };
+        }
+        while (i < n) {
+            a = try self.call2(a, e);
+            i += 1;
+            if (a.kind() == .record or i == n) break;
+            e = rangeNext(e, step);
+        }
+        return .{ .acc = a, .used = i };
+    }
+
+    /// The element after `x` in a range of step `step`: a fixnum's
+    /// payload is its value, and a repeat's step is 0.
+    inline fn rangeNext(x: Value, step: i64) Value {
+        return .{ .tag = x.tag, .payload = x.payload +% @as(u64, @bitCast(step)) };
     }
 };
 
@@ -3117,41 +3347,101 @@ pub const VM = struct {
     }
 
     /// A `Callback`'s call of its closure, from the depth and stack
-    /// length it was prepared at: the arguments go where the window
-    /// begins, the locals start nil, the prepared frame is pushed and
-    /// runs until it returns, as `callValue`'s would under `loop`. The
-    /// loop's first pass is entered here at the callee's first
-    /// instruction, after the safe point `loop`'s entry is: the frame
-    /// is the one it would run, so the pass needs no test, and a pass
-    /// that ends without an error has returned. Only an error goes on
-    /// to the loop, which takes it as its own pass would.
-    fn callPrepared(self: *VM, cb: *const Callback, args: []const Value) VmError!Value {
-        const base = cb.base;
-        const routine = cb.frame.routine;
-        const window = self.stack.items.ptr[base..][0..routine.slot_count];
-        for (args, window[0..args.len]) |arg, *slot| slot.* = arg;
-        nilSlots(window[args.len..]);
-        self.stack.items.len = base + routine.slot_count;
-        var result_cell = HostCallResult{};
-        self.frames.items.len = cb.depth + 1;
-        const frame = &self.frames.items[cb.depth];
+    /// length it was prepared at, its arguments already in the window:
+    /// the locals start nil, the prepared frame is pushed and runs
+    /// until it returns into the callback's cell, as `callValue`'s
+    /// would under `loop`. The loop's first pass is entered here at
+    /// the callee's first instruction, after the safe point `loop`'s
+    /// entry is: the frame is the one it would run, so the pass needs
+    /// no test, and a pass that ends without an error has returned.
+    /// Only an error goes on to the loop, which takes it as its own
+    /// pass would. The value is read from the cell by the caller, a
+    /// word at a time as the return wrote it.
+    fn callPrepared(self: *VM, cb: *Callback) VmError!void {
+        const depth = cb.depth;
+        nilLocals(self.stack.items.ptr + cb.locals, cb.nil_count);
+        self.stack.items.len = cb.window_end;
+        self.frames.items.len = depth + 1;
+        const frame = &self.frames.items[depth];
         frame.* = cb.frame;
-        frame.host_result = &result_cell;
+        std.debug.assert(frame.host_result == &cb.result);
+        cb.result.done = false;
         const outer = self.loop_depth;
-        self.loop_depth = cb.depth;
+        self.loop_depth = depth;
         self.nested_runs += 1;
         defer {
             self.loop_depth = outer;
             self.nested_runs -= 1;
         }
         if (self.gcDue()) self.collectGarbage();
-        const first = routine.code[0];
-        if (counting) opcode_counts[opIndex(first)] += 1;
-        fast_table[opIndex(first)](self, frame, first, 1) catch |err| {
+        if (counting) opcode_counts[opIndex(cb.first)] += 1;
+        cb.first_handler(self, frame, cb.first, 1) catch |err| {
             try self.settle(err);
             try self.drive();
         };
-        return result_cell.get();
+    }
+
+    /// A prepared call's locals, nil: the usual handful in one run,
+    /// whatever their count, since a slot past the window is past the
+    /// stack's length, dead.
+    inline fn nilLocals(locals: [*]Value, nil_count: usize) void {
+        locals[0..Callback.nil_run].* = @splat(value_mod.nilValue());
+        if (nil_count > Callback.nil_run) nilSlots(locals[Callback.nil_run..nil_count]);
+    }
+
+    /// `callPrepared` of a batch's first element, its arguments in the
+    /// window: every later element runs in the same pass, started by
+    /// the return of the one before (`batchNext`). Without a return of
+    /// the last, a throw went past the native.
+    fn callBatch(self: *VM, cb: *Callback) VmError!void {
+        cb.result.step = switch (cb.batch.stepFor()) {
+            inline else => |step| batchNext(step),
+        };
+        defer cb.result.step = null;
+        try self.callPrepared(cb);
+        if (!cb.result.done) return VmError.ControlTransferred;
+    }
+
+    /// The return of a batch's element into its cell: its result to its
+    /// place (an accumulator stays in the window), then, in the same
+    /// frame, the next element's arguments and the locals nil. False
+    /// when the batch is over, after its last element or a `fold`'s
+    /// record, whose value is in the cell. Each element is a call of
+    /// its own, at the depth the first one ran at, in the frame the
+    /// first one pushed, which nothing a call runs changes but its
+    /// `pc`: its pop and the next one's push in one (VM.md §6).
+    inline fn batchStep(self: *VM, frame: *Frame, hr: *HostCallResult, comptime step: Callback.Batch.Step) bool {
+        const cb: *Callback = @fieldParentPtr("result", hr);
+        const b = &cb.batch;
+        std.debug.assert(b.stepFor() == step and self.frames.items.len == cb.depth + 1 and frame == &self.frames.items[cb.depth]);
+        std.debug.assert(frame.routine == cb.frame.routine and frame.base_slot == cb.frame.base_slot and frame.entry_stack_len == cb.frame.entry_stack_len);
+        // The value may sit in the window's slots, which the next
+        // element's arguments overwrite.
+        const r = loadWords(&hr.value);
+        const i = b.i + 1;
+        b.i = i;
+        switch (step) {
+            .each_slots => storeWords(&b.out.slots[i - 1], r),
+            .each_roots => self.roots.items[b.out.roots + i - 1] = r,
+            .fold, .fold_range => if (r.kind() == .record) return false,
+        }
+        if (i == b.n) return false;
+        const w = self.stack.items.ptr + cb.base;
+        switch (step) {
+            .each_slots, .each_roots => storeWords(&w[0], b.items[i]),
+            .fold => {
+                storeWords(&w[0], r);
+                storeWords(&w[1], b.items[i]);
+            },
+            .fold_range => {
+                b.x = Callback.rangeNext(b.x, b.step);
+                storeWords(&w[0], r);
+                storeWords(&w[1], b.x);
+            },
+        }
+        nilLocals(w + @as(usize, if (step == .fold or step == .fold_range) 2 else 1), cb.nil_count);
+        self.stack.items.len = cb.window_end;
+        return true;
     }
 
     /// Call `callee`, anything but a closure, with `args`, to
@@ -3643,6 +3933,12 @@ pub const VM = struct {
     /// loadWords make the same point).
     inline fn loadWords(src: *const Value) Value {
         return .{ .tag = @as(*const volatile u64, &src.tag).*, .payload = @as(*const volatile u64, &src.payload).* };
+    }
+
+    /// `dst.* = v` a word at a time (`loadWords`).
+    inline fn storeWords(dst: *Value, v: Value) void {
+        @as(*volatile u64, &dst.tag).* = v.tag;
+        @as(*volatile u64, &dst.payload).* = v.payload;
     }
 
     /// `dst.* = src.*` a word at a time (`loadWords`).
@@ -4852,6 +5148,7 @@ pub const VM = struct {
             // loop's frame.
             const hr = frame.host_result orelse return self.general(frame, inst, pc);
             copyWords(&hr.value, v);
+            if (hr.step) |step| return @call(.always_tail, step, .{ self, frame, inst, pc });
             hr.done = true;
             self.stack.items.len = frame.entry_stack_len;
             self.frames.items.len = n - 1;
@@ -4871,6 +5168,36 @@ pub const VM = struct {
         // running.
         std.debug.assert(self.running());
         return self.nextAt(caller, resume_pc);
+    }
+
+    /// `returnFast` of a batch's frame, its value in the cell, for a
+    /// batch of `step`: the next element starts at its first
+    /// instruction in the same frame, past the safe point a call's
+    /// entry is, or the batch is over and the frame pops, ending the
+    /// chain as a host's frame does.
+    fn batchNext(comptime step: Callback.Batch.Step) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
+                const hr = frame.host_result.?;
+                if (!self.batchStep(frame, hr, step)) {
+                    hr.done = true;
+                    self.stack.items.len = frame.entry_stack_len;
+                    self.frames.items.len -= 1;
+                    std.debug.assert(!self.running());
+                    return;
+                }
+                const cb: *Callback = @fieldParentPtr("result", hr);
+                if (counting) opcode_counts[opIndex(cb.first)] += 1;
+                if (self.gcDue()) return @call(out_of_line, collectThen, .{ self, frame, cb.first, 1 });
+                return @call(.always_tail, cb.first_handler, .{ self, frame, cb.first, 1 });
+            }
+        }.run;
+    }
+
+    /// A cycle, then `inst`: a batch's safe point, out of line.
+    fn collectThen(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        self.collectGarbage();
+        return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst, pc });
     }
 
     // -------------------------------------------------------------------------
@@ -4961,7 +5288,20 @@ pub const VM = struct {
         const n = self.frames.items.len;
         const callee = &self.frames.items[n - 1];
         if (callee.host_result) |hr| {
-            hr.value = return_value;
+            storeWords(&hr.value, return_value);
+            // A batch's next element starts in the same frame, at the
+            // `pc` the caller's fetch goes on from, past the safe point.
+            if (hr.step != null) {
+                const cb: *Callback = @fieldParentPtr("result", hr);
+                const going = switch (cb.batch.stepFor()) {
+                    inline else => |step| self.batchStep(callee, hr, step),
+                };
+                if (going) {
+                    callee.pc = 0;
+                    if (self.gcDue()) self.collectGarbage();
+                    return;
+                }
+            }
             hr.done = true;
             _ = self.popFrame();
             return;
@@ -9129,7 +9469,7 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
     var cb = Callback.init(&vm, inc_fn, 1);
     var i: i64 = 0;
     while (i < 1000) : (i += 1) {
-        try testing.expectEqual(i + 1, (try cb.call(&.{fx(i)})).asFixnum());
+        try testing.expectEqual(i + 1, (try cb.call1(fx(i))).asFixnum());
         try testing.expectEqual(frames, vm.frames.items.len);
         try testing.expectEqual(stack, vm.stack.items.len);
     }
@@ -9152,7 +9492,7 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
 
     // A leaf native, and a keyword over every kind of receiver.
     var sub = Callback.init(&vm, nativeFnValue(&dispatch_test_natives.native_sub), 2);
-    try testing.expectEqual(@as(i64, 42), (try sub.call(&.{ fx(50), fx(8) })).asFixnum());
+    try testing.expectEqual(@as(i64, 42), (try sub.call2(fx(50), fx(8))).asFixnum());
     try testing.expectEqual(@as(i64, -1), (try sub.call(&.{ fx(1), fx(2) })).asFixnum());
     const k = try vm.ensureInterner().internKeywordValue("k");
     var m = try champ_mod.mapEmpty(heap);
@@ -9204,6 +9544,449 @@ test "Callback: an error in the callee is caught where a handler stands, else le
     try testing.expectEqual(frames + 1, vm.frames.items.len);
     try testing.expectEqual(&plain, vm.frames.items[frames].routine);
     try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+}
+
+/// Natives that call a closure through a `Callback`, for the tests
+/// below: `twice` applies its first argument to its second and then to
+/// the result; `pair` applies it to its second and then its third
+/// argument, recording the error the second call ends with.
+const callback_test_natives = struct {
+    var second_error: ?VmError = null;
+    fn twice(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        const once = try cb.call1(args[1]);
+        return cb.call1(once);
+    }
+    fn pair(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        _ = try cb.call1(args[1]);
+        return cb.call1(args[2]) catch |err| {
+            second_error = err;
+            return err;
+        };
+    }
+    /// The sum of `(f x)` for `x` from `n` to `n + 2`, through `each`.
+    fn eachSum(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        const n = args[1].asFixnum();
+        const items = [_]Value{ fx(n), fx(n + 1), fx(n + 2) };
+        var out: [3]Value = undefined;
+        try cb.each(&items, .{ .slots = &out });
+        var sum: i64 = 0;
+        for (out) |v| sum += v.asFixnum();
+        return fx(sum);
+    }
+    /// `each` of its first argument over the rest, recording the error.
+    fn eachAll(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        var out: [8]Value = undefined;
+        cb.each(args[1..], .{ .slots = &out }) catch |err| {
+            second_error = err;
+            return err;
+        };
+        return out[args.len - 2];
+    }
+    fn inc(_: *VM, args: []const Value) VmError!Value {
+        return fx(args[0].asFixnum() + 1);
+    }
+    fn add(_: *VM, args: []const Value) VmError!Value {
+        return fx(args[0].asFixnum() + args[1].asFixnum());
+    }
+    fn first(_: *VM, args: []const Value) VmError!Value {
+        return args[0];
+    }
+    const native_twice = NativeFn{ .name = "twice", .min_arity = 2, .max_arity = 2, .call = &twice };
+    const native_pair = NativeFn{ .name = "pair", .min_arity = 3, .max_arity = 3, .call = &pair };
+    const native_each_sum = NativeFn{ .name = "each-sum", .min_arity = 2, .max_arity = 2, .call = &eachSum };
+    const native_each_all = NativeFn{ .name = "each-all", .min_arity = 2, .max_arity = 9, .call = &eachAll };
+    const native_inc = NativeFn{ .name = "inc", .min_arity = 1, .max_arity = 1, .call = &inc, .leaf = true };
+    const native_add = NativeFn{ .name = "add", .min_arity = 2, .max_arity = 2, .call = &add, .leaf = true };
+    /// Not a leaf: called through `callValue`.
+    const native_first = NativeFn{ .name = "first", .min_arity = 1, .max_arity = 2, .call = &first };
+};
+
+/// What every batch test checks after a pass: the frames, the stack
+/// and the loop's bookkeeping as they were.
+fn expectBatchClean(vm: *const VM, frames: usize, stack: usize) !void {
+    try testing.expectEqual(frames, vm.frames.items.len);
+    try testing.expectEqual(stack, vm.stack.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
+}
+
+test "Callback batches: each, fold and foldRange give call's results in every mode" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    const one = [_]Value{fx(1)};
+    // (fn [x] (+ x 1)) with a local past its argument, and (fn [a x] (+ a x)).
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.move(2, 1), asm_.returnSlot(2) };
+    const inc_routine = Routine{ .code = &inc_code, .consts = &one, .slot_count = 3, .fixed_arity = 1, .name = "inc1" };
+    const add_code = [_]Inst{ asm_.mathAdd(2, sl(0), sl(1)), asm_.returnSlot(2) };
+    const add_routine = Routine{ .code = &add_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "add2" };
+    const inc_fn = try vm.allocClosure(&inc_routine, 0);
+    const add_fn = try vm.allocClosure(&add_routine, 0);
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    var items: [1000]Value = undefined;
+    for (&items, 0..) |*x, i| x.* = fx(@intCast(i));
+    var out: [1000]Value = undefined;
+
+    // `each` of a closure, of a leaf native, of a native that is not a
+    // leaf, and of a closure called from another stack length, which
+    // takes `call`'s path for every element.
+    for ([_]Value{ inc_fn, nativeFnValue(&callback_test_natives.native_inc) }) |f| {
+        var cb = Callback.init(&vm, f, 1);
+        @memset(&out, value_mod.nilValue());
+        try cb.each(&items, .{ .slots = &out });
+        for (out, 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(i + 1)), v.asFixnum());
+        try expectBatchClean(&vm, frames, stack);
+    }
+    var general = Callback.init(&vm, nativeFnValue(&callback_test_natives.native_first), 1);
+    try general.each(&items, .{ .slots = &out });
+    for (out, 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum());
+    try testing.expect(general.mode == .general);
+    var moved = Callback.init(&vm, inc_fn, 1);
+    try moved.each(items[0..1], .{ .slots = &out });
+    vm.stack.appendAssumeCapacity(value_mod.nilValue());
+    try moved.each(items[0..100], .{ .slots = &out });
+    for (out[0..100], 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(i + 1)), v.asFixnum());
+    vm.stack.items.len -= 1;
+    try expectBatchClean(&vm, frames, stack);
+    if (VM.track_high_water) try testing.expectEqual(frames + 1, vm.frame_high_water);
+
+    // Into the root stack, by index.
+    {
+        const scope = vm.rootScope();
+        defer scope.release();
+        for (0..items.len) |_| try scope.push(value_mod.nilValue());
+        var cb = Callback.init(&vm, inc_fn, 1);
+        try cb.each(&items, .{ .roots = scope.base });
+        for (vm.roots.items[scope.base..], 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(i + 1)), v.asFixnum());
+    }
+
+    // A keyword over maps and nil.
+    const k = try vm.ensureInterner().internKeywordValue("k");
+    var m = try champ_mod.mapEmpty(heap);
+    m = try champ_mod.mapAssoc(heap, m, k, fx(7), &dispatch_mod.hashValue, &dispatch_mod.equal);
+    var get_k = Callback.init(&vm, k, 1);
+    try get_k.each(&.{ m, value_mod.nilValue(), m }, .{ .slots = &out });
+    try testing.expectEqual(@as(i64, 7), out[0].asFixnum());
+    try testing.expect(out[1].isNil());
+    try testing.expectEqual(@as(i64, 7), out[2].asFixnum());
+
+    // `fold` and `foldRange` of a closure and of a leaf, in pieces:
+    // the first call prepares, and a later fold carries the
+    // accumulator on.
+    for ([_]Value{ add_fn, nativeFnValue(&callback_test_natives.native_add) }) |f| {
+        var cb = Callback.init(&vm, f, 2);
+        var folded = try cb.fold(fx(0), items[0..1]);
+        try testing.expectEqual(@as(usize, 1), folded.used);
+        folded = try cb.fold(folded.acc, items[1..]);
+        try testing.expectEqual(@as(usize, 999), folded.used);
+        try testing.expectEqual(@as(i64, 499500), folded.acc.asFixnum());
+        var range = Callback.init(&vm, f, 2);
+        folded = try range.foldRange(fx(0), fx(0), 1, 1000);
+        try testing.expectEqual(@as(usize, 1000), folded.used);
+        try testing.expectEqual(@as(i64, 499500), folded.acc.asFixnum());
+        folded = try range.foldRange(fx(5), fx(10), -3, 4);
+        try testing.expectEqual(@as(i64, 5 + 10 + 7 + 4 + 1), folded.acc.asFixnum());
+        folded = try range.foldRange(fx(0), fx(2), 0, 1000);
+        try testing.expectEqual(@as(i64, 2000), folded.acc.asFixnum());
+        folded = try range.foldRange(fx(3), fx(2), 0, 0);
+        try testing.expectEqual(@as(usize, 0), folded.used);
+        try testing.expectEqual(@as(i64, 3), folded.acc.asFixnum());
+        try expectBatchClean(&vm, frames, stack);
+    }
+}
+
+test "Callback batches: a record stops a fold after it, whether reduced or not" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const heap = vm.ensureHeap();
+    // (fn [a x] x)
+    const second_code = [_]Inst{asm_.returnSlot(1)};
+    const second = Routine{ .code = &second_code, .consts = &.{}, .slot_count = 2, .fixed_arity = 2, .name = "second" };
+    const f = try vm.allocClosure(&second, 0);
+    const type_id = try vm.registerRecordType("t", "R", &.{});
+    const rec = try record_mod.make(heap, type_id, try champ_mod.mapEmpty(heap));
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    for ([_]usize{ 0, 31, 32, 33 }) |k| {
+        var items: [64]Value = undefined;
+        for (&items, 0..) |*x, i| x.* = if (i == k) rec else fx(@intCast(i));
+        var cb = Callback.init(&vm, f, 2);
+        var folded = try cb.fold(fx(-1), &items);
+        try testing.expectEqual(k + 1, folded.used);
+        try testing.expectEqual(rec, folded.acc);
+        folded = try cb.fold(folded.acc, items[folded.used..]);
+        try testing.expectEqual(items.len - k - 1, folded.used);
+        try testing.expectEqual(@as(i64, 63), folded.acc.asFixnum());
+        try expectBatchClean(&vm, frames, stack);
+    }
+}
+
+test "Callback batches: an element's error caught inside the callee, the batch goes on" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] (try (+ x 1) (catch any e e)))
+    const caught_code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.mathAdd(2, sl(0), kn(0)),
+        asm_.tryExit(5),
+        asm_.move(2, 1), // 3: the catch
+        asm_.tryExit(5),
+        asm_.returnSlot(2),
+    };
+    const one = [_]Value{fx(1)};
+    const tries = [_]Try{.{ .catch_pc = 3 }};
+    const caught = Routine{ .code = &caught_code, .consts = &one, .tries = &tries, .slot_count = 3, .fixed_arity = 1, .name = "caught" };
+    const f = try vm.allocClosure(&caught, 0);
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    for ([_]usize{ 0, 31, 32, 63 }) |k| {
+        var items: [64]Value = undefined;
+        for (&items, 0..) |*x, i| x.* = if (i == k) value_mod.nilValue() else fx(@intCast(i));
+        var out: [64]Value = undefined;
+        var cb = Callback.init(&vm, f, 1);
+        // Prepared by a call of its own, so element 0 is a batch's too.
+        _ = try cb.call1(fx(0));
+        try cb.each(&items, .{ .slots = &out });
+        for (out, 0..) |v, i| if (i == k) {
+            try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(v.asKeywordId()));
+        } else try testing.expectEqual(@as(i64, @intCast(i + 1)), v.asFixnum());
+        try expectBatchClean(&vm, frames, stack);
+    }
+}
+
+test "Callback batches: an element's error with no handler leaves its frame, one past it ends the native's call" {
+    const plain_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const one = [_]Value{fx(1)};
+    const plain = Routine{ .code = &plain_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "plain" };
+    {
+        var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+        defer vm.deinit();
+        const frames = vm.frames.items.len;
+        var cb = Callback.init(&vm, try vm.allocClosure(&plain, 0), 1);
+        var out: [3]Value = undefined;
+        try testing.expectError(VmError.KindMismatch, cb.each(&.{ fx(1), fx(2), value_mod.nilValue() }, .{ .slots = &out }));
+        try testing.expectEqual(@as(i64, 3), out[1].asFixnum());
+        try testing.expectEqual(frames + 1, vm.frames.items.len);
+        try testing.expectEqual(&plain, vm.frames.items[frames].routine);
+        try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
+        try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+        try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+        try testing.expect(cb.result.step == null);
+    }
+    // (try (each-all (fn [x] (+ x 1)) 2 3 nil 4) (catch any e e))
+    const caps = [_]CaptureDescriptor{.{ .routine = &plain, .sources = &.{} }};
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.loadConst(2, 0),
+        asm_.closureMake(0, 3),
+        asm_.loadConst(4, 1),
+        asm_.loadConst(5, 2),
+        asm_.loadNil(6),
+        asm_.loadConst(7, 1),
+        asm_.callCall(2, 5, 8),
+        asm_.returnSlot(8),
+        asm_.move(0, 1), // 9: the catch
+        asm_.tryExit(11),
+        asm_.returnSlot(0), // 11
+    };
+    const consts = [_]Value{ nativeFnValue(&callback_test_natives.native_each_all), fx(2), fx(3) };
+    var routine = makeRoutine(&code, &consts, 9, "throw-past");
+    routine.capture_descs = &caps;
+    routine.tries = &.{.{ .catch_pc = 9 }};
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    callback_test_natives.second_error = null;
+    const result = try vm.run();
+    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(result.asKeywordId()));
+    try testing.expectEqual(VmError.ControlTransferred, callback_test_natives.second_error.?);
+    try expectBatchClean(&vm, 1, vm.stack.items.len);
+}
+
+test "Callback batches: a callee that runs a batch of its own nests it a frame deeper" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const one = [_]Value{fx(1)};
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const inc_routine = Routine{ .code = &inc_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "inc" };
+    // (fn [x] (each-sum inc x)): 3x + 6.
+    const outer_code = [_]Inst{
+        asm_.loadConst(1, 0),
+        asm_.loadConst(2, 1),
+        asm_.move(3, 0),
+        asm_.callCall(1, 2, 4),
+        asm_.returnSlot(4),
+    };
+    const outer_consts = [_]Value{ nativeFnValue(&callback_test_natives.native_each_sum), try vm.allocClosure(&inc_routine, 0) };
+    const outer = Routine{ .code = &outer_code, .consts = &outer_consts, .slot_count = 5, .fixed_arity = 1, .name = "outer" };
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    var items: [100]Value = undefined;
+    for (&items, 0..) |*x, i| x.* = fx(@intCast(i));
+    var out: [100]Value = undefined;
+    var cb = Callback.init(&vm, try vm.allocClosure(&outer, 0), 1);
+    try cb.each(&items, .{ .slots = &out });
+    for (out, 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(3 * i + 6)), v.asFixnum());
+    try expectBatchClean(&vm, frames, stack);
+    if (VM.track_high_water) try testing.expectEqual(frames + 2, vm.frame_high_water);
+}
+
+test "Callback batches: a cycle at every element frees nothing a batch holds" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] [x x]) and (fn [a x] [a x]): every call allocates.
+    const pair_code = [_]Inst{ asm_.move(1, 0), asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const pair = Routine{ .code = &pair_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 1, .name = "pair" };
+    const nest_code = [_]Inst{ asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const nest = Routine{ .code = &nest_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "nest" };
+    const pair_fn = try vm.allocClosure(&pair, 0);
+    const nest_fn = try vm.allocClosure(&nest, 0);
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(pair_fn);
+    try scope.push(nest_fn);
+    const n = 300;
+    for (0..n) |_| try scope.push(value_mod.nilValue());
+    var items: [n]Value = undefined;
+    for (&items, 0..) |*x, i| x.* = fx(@intCast(i));
+    vm.gc_threshold = 0;
+    vm.gc_growth_percent = 0;
+    vm.gc_next_at = 0;
+    const cycles = vm.gc_cycles;
+    var each = Callback.init(&vm, pair_fn, 1);
+    try each.each(&items, .{ .roots = scope.base + 2 });
+    var fold = Callback.init(&vm, nest_fn, 2);
+    const folded = try fold.fold(value_mod.nilValue(), &items);
+    // A cycle before every element but the first.
+    try testing.expect(vm.gc_cycles - cycles >= 2 * (n - 1));
+    for (vm.roots.items[scope.base + 2 ..], 0..) |v, i| {
+        try testing.expectEqual(@as(i64, @intCast(i)), vector_mod.nth(v, 0).asFixnum());
+        try testing.expectEqual(@as(i64, @intCast(i)), vector_mod.nth(v, 1).asFixnum());
+    }
+    var acc = folded.acc;
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        try testing.expectEqual(@as(i64, @intCast(i)), vector_mod.nth(acc, 1).asFixnum());
+        acc = vector_mod.nth(acc, 0);
+    }
+    try testing.expect(acc.isNil());
+}
+
+test "Callback batches: the general return starts the next element in the same frame" {
+    // The general `call:return`, which the fast one hands an operand it
+    // cannot read in place, through `returnValue`: element by element,
+    // the result to its place and the frame reset to the first call's,
+    // its pc 0, until the last pops it.
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    const one = [_]Value{fx(1)};
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.move(2, 1), asm_.returnSlot(2) };
+    const inc_routine = Routine{ .code = &inc_code, .consts = &one, .slot_count = 3, .fixed_arity = 1, .name = "inc1" };
+    var cb = Callback.init(&vm, try vm.allocClosure(&inc_routine, 0), 1);
+    _ = try cb.call1(fx(0));
+    const frames = vm.frames.items.len;
+    const items = [_]Value{ fx(4), fx(5), fx(6) };
+    var out: [3]Value = undefined;
+    cb.batch = .{ .kind = .each, .i = 0, .n = 3, .items = &items, .out = .{ .slots = &out } };
+    cb.result.step = VM.batchNext(.each_slots);
+    cb.result.done = false;
+    // The first element's frame, as `callPrepared` pushes it.
+    cb.window()[0] = items[0];
+    VM.nilLocals(vm.stack.items.ptr + cb.locals, cb.nil_count);
+    vm.stack.items.len = cb.window_end;
+    vm.frames.appendAssumeCapacity(cb.frame);
+    for (0..3) |i| {
+        vm.frames.items[frames].pc = 2;
+        vm.stack.items[cb.base + 1] = fx(9);
+        try vm.returnValue(fx(@intCast(10 + i)));
+        try testing.expectEqual(@as(i64, @intCast(10 + i)), out[i].asFixnum());
+        if (i < 2) {
+            try testing.expectEqual(frames + 1, vm.frames.items.len);
+            try testing.expectEqual(@as(u32, 0), vm.frames.items[frames].pc);
+            try testing.expectEqual(items[i + 1], vm.stack.items[cb.base]);
+            try testing.expect(vm.stack.items[cb.base + 1].isNil());
+            try testing.expect(!cb.result.done);
+        }
+    }
+    try testing.expect(cb.result.done);
+    try testing.expectEqual(@as(i64, 12), cb.result.value.asFixnum());
+    try testing.expectEqual(frames, vm.frames.items.len);
+    try testing.expectEqual(cb.base, vm.stack.items.len);
+}
+
+test "Callback: a callee that calls a native with a Callback of its own nests a frame deeper" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] (+ x 1)), and (fn [x] (twice inc x)) over it.
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const one = [_]Value{fx(1)};
+    const inc_routine = Routine{ .code = &inc_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "inc" };
+    const inc_fn = try vm.allocClosure(&inc_routine, 0);
+    const outer_code = [_]Inst{
+        asm_.loadConst(1, 0),
+        asm_.loadConst(2, 1),
+        asm_.move(3, 0),
+        asm_.callCall(1, 2, 4),
+        asm_.returnSlot(4),
+    };
+    const outer_consts = [_]Value{ nativeFnValue(&callback_test_natives.native_twice), inc_fn };
+    const outer = Routine{ .code = &outer_code, .consts = &outer_consts, .slot_count = 5, .fixed_arity = 1, .name = "outer" };
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    var cb = Callback.init(&vm, try vm.allocClosure(&outer, 0), 1);
+    var i: i64 = 0;
+    while (i < 1000) : (i += 1) {
+        try testing.expectEqual(i + 2, (try cb.call1(fx(i))).asFixnum());
+        try testing.expectEqual(frames, vm.frames.items.len);
+        try testing.expectEqual(stack, vm.stack.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+        try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+    }
+    try testing.expect(cb.mode == .closure);
+    // The inner callback's frame stood on the outer's.
+    if (VM.track_high_water) try testing.expectEqual(frames + 2, vm.frame_high_water);
+}
+
+test "Callback: a throw past the native ends its call with ControlTransferred and the frames below" {
+    // (try (pair (fn [x] (+ x 1)) 2 nil) (catch any e e)): the first
+    // call returns, the second's error is a throw the handler beneath
+    // the native takes.
+    const plain_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const one = [_]Value{fx(1)};
+    const plain = Routine{ .code = &plain_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "plain" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &plain, .sources = &.{} }};
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.loadConst(2, 0),
+        asm_.closureMake(0, 3),
+        asm_.loadConst(4, 1),
+        asm_.loadNil(5),
+        asm_.callCall(2, 3, 6),
+        asm_.returnSlot(6),
+        asm_.move(0, 1), // 7: the catch
+        asm_.tryExit(9),
+        asm_.returnSlot(0), // 9
+    };
+    const consts = [_]Value{ nativeFnValue(&callback_test_natives.native_pair), fx(2) };
+    var routine = makeRoutine(&code, &consts, 7, "throw-past");
+    routine.capture_descs = &caps;
+    routine.tries = &.{.{ .catch_pc = 7 }};
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    callback_test_natives.second_error = null;
+    const result = try vm.run();
+    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(result.asKeywordId()));
+    try testing.expectEqual(VmError.ControlTransferred, callback_test_natives.second_error.?);
+    try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
     try testing.expectEqual(@as(usize, 0), vm.loop_depth);
     try testing.expectEqual(@as(usize, 0), vm.nested_runs);
 }

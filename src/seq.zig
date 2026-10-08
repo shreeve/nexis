@@ -302,7 +302,7 @@ fn stepDropWhile(vm: *VM, lz: Value) VmError!Value {
         a[1] = try seqOf(vm, a[1]);
         if (a[1].isNil()) return a[1];
         const fr = firstRest(a[1]);
-        if (!(try cb.call(&.{fr.first})).isTruthy()) return a[1];
+        if (!(try cb.call1(fr.first)).isTruthy()) return a[1];
         a[1] = fr.rest;
     }
 }
@@ -519,18 +519,26 @@ fn stepSieve(comptime mode: Sieve) Step {
                         const c = lazy.allocChunked(heap, ch.items.len) catch return VmError.OutOfMemory;
                         lazy.setScratch(lz, c);
                         const out = lazy.chunkItems(c);
-                        for (ch.items, out) |x, *slot| slot.* = (try apply(mode, &cb, &index, x)).?;
+                        // `map`'s calls in batches (VM.md §6).
+                        if (comptime mode == .map) {
+                            try cb.each(ch.items, .{ .slots = out.ptr });
+                        } else for (ch.items, out) |x, *slot| {
+                            slot.* = (try apply(mode, &cb, &index, x)).?;
+                        }
                         const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
                         lazy.finishChunked(c, ch.items.len, following);
                         return c;
                     },
-                    // What is kept is a source element, rooted with the
-                    // source: it waits in a buffer, and the chunk is made
-                    // to its size.
+                    // The predicate's calls in batches (VM.md §6), its
+                    // results only tested for truth. What is kept is a
+                    // source element, rooted with the source: it waits
+                    // in a buffer, and the chunk is made to its size.
                     .filter, .remove => blk: {
+                        var truth: [lazy.chunk_size]Value = undefined;
+                        try cb.each(ch.items, .{ .slots = &truth });
                         var n: usize = 0;
-                        for (ch.items) |x| if (try apply(mode, &cb, &index, x)) |y| {
-                            buf[n] = y;
+                        for (ch.items, truth[0..ch.items.len]) |x, r| if (r.isTruthy() == (mode == .filter)) {
+                            buf[n] = x;
                             n += 1;
                         };
                         break :blk n;
@@ -560,17 +568,19 @@ fn stepSieve(comptime mode: Sieve) Step {
             return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
         }
 
-        fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
+        /// Inline, so the call lands in the chunk loop with its
+        /// argument and its result in registers.
+        inline fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
             switch (m) {
-                .map => return try cb.call(&.{x}),
-                .filter => return if ((try cb.call(&.{x})).isTruthy()) x else null,
-                .remove => return if ((try cb.call(&.{x})).isTruthy()) null else x,
+                .map => return try cb.call1(x),
+                .filter => return if ((try cb.call1(x)).isTruthy()) x else null,
+                .remove => return if ((try cb.call1(x)).isTruthy()) null else x,
                 .keep => {
-                    const r = try cb.call(&.{x});
+                    const r = try cb.call1(x);
                     return if (r.isNil()) null else r;
                 },
                 .map_indexed, .keep_indexed => {
-                    const r = try cb.call(&.{ fixnum(index.*), x });
+                    const r = try cb.call2(fixnum(index.*), x);
                     index.* += 1;
                     return if (m == .keep_indexed and r.isNil()) null else r;
                 },

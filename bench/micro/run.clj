@@ -33,10 +33,10 @@
     (array-map "count" m5 "acc" m5 "fib" [27 30] "gcall" m5 "lc" m5 "lv" m5
                "mv" m5 "mvc" m5 "kw" m5 "leaf" m5 "getnl" m5 "pcall" m5 "casek" m5 "mcall" m5
                "acall" m5 "vcall" m5 "afib" [27 30]
-               "cbbase" cb "cbsum" cb "cbred" cb "cb" cb "lazy" cb "xform" cb
+               "cbbase" cb "cbsum" cb "cbred" cb "cb" cb "lazy" cb "xform" cb "cbfilt" cb "cbrange" cb
                "lazy3" [1500000 3000000] "lazyl" [1500000 3000000] "lazyf" [1500000 3000000])))
 
-(def callback-programs #{"cbsum" "cbred" "cb" "lazy" "xform"})
+(def callback-programs #{"cbsum" "cbred" "cb" "lazy" "xform" "cbfilt"})
 
 (defn fib-calls
   "The calls (fib n) makes, itself included: 2 F(n+1) - 1."

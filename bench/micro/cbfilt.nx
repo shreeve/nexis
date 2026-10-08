@@ -1,0 +1,4 @@
+; bench/micro/cbfilt.nx N: reduce over a lazy filter of a closure; subtract cbbase.
+(let [n (parse-long (first *command-line-args*))
+      v (vec (range n))]
+  (println (reduce + 0 (filter (fn [x] (even? x)) v))))

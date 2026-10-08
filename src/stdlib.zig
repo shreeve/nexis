@@ -746,7 +746,7 @@ fn fnSome(vm: *VM, args: []const Value) VmError!Value {
     var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        const r = try cb.call(&.{x});
+        const r = try cb.call1(x);
         if (r.isTruthy()) return r;
     }
     return value_mod.nilValue();
@@ -758,7 +758,7 @@ fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
     var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        if (!(try cb.call(&.{x})).isTruthy()) return value_mod.fromBool(false);
+        if (!(try cb.call1(x)).isTruthy()) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
 }
@@ -1583,12 +1583,29 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// Add `(f x1 x2 ...)` for every position of the shortest of `colls`
-/// to `results`, which roots each as it comes.
-fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!void {
+/// to `results`, which roots each as it comes. One coll is walked a
+/// run at a time (a vector's leaf, a lazy chunk), each run's calls
+/// made in batches whose results go straight where `results` keeps
+/// them (VM.md §6); `held` is a root slot `nextChunk` may write.
+fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usize) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         var cb = vm_mod.Callback.init(vm, f, 1);
-        while (try it.next()) |x| try results.add(try cb.call(&.{x}));
+        var buf: [results_chunk]Value = undefined;
+        while (try nextRun(&it, &buf, held)) |xs| {
+            // A walk that hands out one element at a time calls as it goes.
+            if (xs.len == 1) {
+                try results.add(try cb.call1(xs[0]));
+                continue;
+            }
+            var rest = xs;
+            while (rest.len > 0) {
+                const room = try results.room(rest.len);
+                try cb.each(rest[0..room.n], room.out);
+                results.fill += room.n;
+                rest = rest[room.n..];
+            }
+        }
         return;
     }
 
@@ -1603,6 +1620,24 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
             call_args[i] = (try it.next()) orelse break :outer;
         }
         try results.add(try cb.call(call_args));
+    }
+}
+
+/// `it.nextChunk` with nothing held, an unrealized fixnum range
+/// computed a run at a time into `buf`, for a batch (VM.md §6).
+fn nextRun(it: *SeqIter, buf: *[results_chunk]Value, slot: usize) VmError!?[]const Value {
+    switch (it.state) {
+        .range => |*r| {
+            if (r.left == 0) return null;
+            const k: usize = @intCast(@min(r.left, buf.len));
+            for (buf[0..k]) |*x| {
+                x.* = value_mod.fromFixnum(r.x).?;
+                r.x += r.step;
+            }
+            r.left -= k;
+            return buf[0..k];
+        },
+        else => return it.nextChunk(slot, value_mod.nilValue()),
     }
 }
 
@@ -1624,10 +1659,22 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     // next step may collect before that call (GC.md §11.5, class 5):
     // it goes into a root slot before such a step.
     try scope.push(acc);
-    while (try it.nextChunk(scope.base + 1, acc)) |xs| for (xs) |x| {
-        acc = try cb.call(&.{ acc, x });
-        if (isReduced(vm, acc)) return reducedValue(acc);
-    };
+    // Each run's calls in batches (VM.md §6), which stop after a record.
+    while (try it.nextChunk(scope.base + 1, acc)) |xs| {
+        // A walk that hands out one element at a time calls as it goes.
+        if (xs.len == 1) {
+            acc = try cb.call2(acc, xs[0]);
+            if (isReduced(vm, acc)) return reducedValue(acc);
+            continue;
+        }
+        var rest = xs;
+        while (rest.len > 0) {
+            const folded = try cb.fold(acc, rest);
+            acc = folded.acc;
+            if (isReduced(vm, acc)) return reducedValue(acc);
+            rest = rest[folded.used..];
+        }
+    }
     return acc;
 }
 
@@ -1651,13 +1698,15 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 break :blk value_mod.fromFixnum(r.start).?;
             };
             var i: u64 = if (init == null) 1 else 0;
-            while (i < n) : ({
-                i += 1;
-                x += r.step;
-            }) {
+            // The calls in batches over the elements left (VM.md §6),
+            // which stop after a record.
+            while (i < n) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, value_mod.fromFixnum(x).? });
+                const folded = try cb.foldRange(acc, value_mod.fromFixnum(x).?, r.step, @intCast(n - i));
+                acc = folded.acc;
                 if (isReduced(vm, acc)) return reducedValue(acc);
+                i += folded.used;
+                x += r.step * @as(i64, @intCast(folded.used));
             }
             return acc;
         },
@@ -1669,7 +1718,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             };
             while (true) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
             }
@@ -1678,17 +1727,19 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             var acc = init orelse x;
             while (true) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
         .repeat_n => |r| {
             var acc = init orelse r.x;
             var i: i64 = if (init == null) 1 else 0;
-            while (i < r.n) : (i += 1) {
+            while (i < r.n) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, r.x });
+                const folded = try cb.foldRange(acc, r.x, 0, @intCast(r.n - i));
+                acc = folded.acc;
                 if (isReduced(vm, acc)) return reducedValue(acc);
+                i += @intCast(folded.used);
             }
             return acc;
         },
@@ -1705,10 +1756,10 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             while (true) {
                 vm.roots.items[scope.base] = acc;
                 vm.roots.items[scope.base + 1] = x;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 vm.roots.items[scope.base] = acc;
-                x = try step.call(&.{x});
+                x = try step.call1(x);
             }
         },
         .cycle => |all| {
@@ -1718,7 +1769,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 while (try it.next()) |x| {
                     if (acc) |a| {
                         vm.roots.items[scope.base] = a;
-                        const r = try cb.call(&.{ a, x });
+                        const r = try cb.call2(a, x);
                         if (isReduced(vm, r)) return reducedValue(r);
                         acc = r;
                     } else acc = x;
@@ -1744,9 +1795,11 @@ fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isReduced(vm, args[0]));
 }
 
+/// The kind first: a fold's accumulator is rarely a record.
 fn isReduced(vm: *VM, v: Value) bool {
+    if (v.kind() != .record) return false;
     const type_id = vm.home().reduced_type_id orelse return false;
-    return v.kind() == .record and record_mod.typeId(v) == type_id;
+    return record_mod.typeId(v) == type_id;
 }
 
 /// The value inside a `reduced` record.
@@ -1795,15 +1848,32 @@ const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, held: usize) VmError!void {
     var it = try makeSeqIter(vm, coll);
     var cb = vm_mod.Callback.init(vm, pred, 1);
-    while (try it.next()) |x| {
-        vm.roots.items[held] = x;
-        const r = try cb.call(&.{x});
-        const kept: ?Value = switch (mode) {
-            .keep_truthy => if (r.isTruthy()) x else null,
-            .keep_falsy => if (r.isTruthy()) null else x,
-            .keep_result => if (r.isNil()) null else r,
-        };
-        if (kept) |v| try results.add(v);
+    var buf: [results_chunk]Value = undefined;
+    while (try nextRun(&it, &buf, held)) |xs| {
+        // A run of the source's own elements, rooted with it: the
+        // predicate's calls in batches (VM.md §6), whose results are
+        // only tested for truth.
+        if (mode != .keep_result and xs.len > 1) {
+            var rest = xs;
+            while (rest.len > 0) {
+                const part = rest[0..@min(rest.len, results_chunk)];
+                var truth: [results_chunk]Value = undefined;
+                try cb.each(part, .{ .slots = &truth });
+                for (part, truth[0..part.len]) |x, r| if (r.isTruthy() == (mode == .keep_truthy)) try results.add(x);
+                rest = rest[part.len..];
+            }
+            continue;
+        }
+        for (xs) |x| {
+            vm.roots.items[held] = x;
+            const r = try cb.call1(x);
+            const kept: ?Value = switch (mode) {
+                .keep_truthy => if (r.isTruthy()) x else null,
+                .keep_falsy => if (r.isTruthy()) null else x,
+                .keep_result => if (r.isNil()) null else r,
+            };
+            if (kept) |v| try results.add(v);
+        }
     }
 }
 
@@ -2291,7 +2361,7 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
         vm.roots.items[held] = x;
-        const k = try cb.call(&.{x});
+        const k = try cb.call1(x);
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
             const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;
@@ -2470,9 +2540,12 @@ fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
             try scope.push(c.*);
         },
     };
+    // A slot the walk may write, below the scope `Results` opens.
+    try scope.push(value_mod.nilValue());
+    const held = vm.roots.items.len - 1;
     var results = Results.init(vm);
     defer results.release();
-    try mapInto(vm, args[0], colls, &results);
+    try mapInto(vm, args[0], colls, &results, held);
     return results.vector();
 }
 
@@ -2770,14 +2843,14 @@ fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
     if (args.len == 2) return args[1];
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     var best = args[1];
-    var best_key = try cb.call(&.{best});
+    var best_key = try cb.call1(best);
     // The best key so far is the one value kept across the next
     // call (GC.md §11.5); it goes on the root stack when it changes.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(best_key);
     for (args[2..]) |x| {
-        const key = try cb.call(&.{x});
+        const key = try cb.call1(x);
         const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
         if (!keep_best) {
             best = x;
@@ -2952,7 +3025,7 @@ const SortOrder = struct {
             if (a.isFixnum() and b.isFixnum()) return a.asFixnum() < b.asFixnum();
             return (try sorted_mod.naturalOrder(self.interner, a, b)) == .lt;
         };
-        const r = try cmp.call(&.{ a, b });
+        const r = try cmp.call2(a, b);
         return switch (r.kind()) {
             .true_ => true,
             .false_, .nil => false,
@@ -3013,7 +3086,7 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError
     if (keyfn) |kf| {
         var cb = vm_mod.Callback.init(vm, kf, 1);
         for (items.items, keyed) |v, *k| {
-            k.* = .{ .key = try cb.call(&.{v}), .val = v };
+            k.* = .{ .key = try cb.call1(v), .val = v };
             try scope.push(k.key);
         }
     } else for (items.items, keyed) |v, *k| {
@@ -6332,6 +6405,19 @@ const Results = struct {
         return self.addOther(v);
     }
 
+    /// Room for up to `k` more values in one place, for a batch of
+    /// `vm.Callback.each` to write (GC.md §11.5): the open tail's
+    /// slots, or slots pushed on the scope, which the batch writes by
+    /// index. The caller adds the count it wrote to `fill`.
+    fn room(self: *Results, k: usize) VmError!struct { n: usize, out: vm_mod.Callback.Out } {
+        if (self.fill == results_chunk) try self.openTail();
+        const n = @min(k, results_chunk - self.fill);
+        if (self.building != null) return .{ .n = n, .out = .{ .slots = self.slots[self.fill..].ptr } };
+        const at = self.vm.roots.items.len;
+        for (0..n) |_| try self.scope.push(value_mod.nilValue());
+        return .{ .n = n, .out = .{ .roots = at } };
+    }
+
     noinline fn addOther(self: *Results, v: Value) VmError!void {
         if (self.fill == results_chunk) try self.openTail();
         if (self.building != null) self.slots[self.fill] = v else try self.scope.push(v);
@@ -6824,7 +6910,7 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
             var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, 0..) |*slot, i| {
                 const x = typed_vector_mod.nth(heap, xs, i) catch return VmError.OutOfMemory;
-                slot.* = try i64Elem(try cb.call(&.{x}));
+                slot.* = try i64Elem(try cb.call1(x));
             }
             return typed_vector_mod.fromI64Slice(heap, out) catch VmError.OutOfMemory;
         },
@@ -6833,7 +6919,7 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
             defer vm.allocator.free(out);
             var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, typed_vector_mod.f64Elems(xs)) |*slot, x| {
-                slot.* = try f64Elem(try cb.call(&.{value_mod.fromFloat(x)}));
+                slot.* = try f64Elem(try cb.call1(value_mod.fromFloat(x)));
             }
             return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
         },
@@ -7175,4 +7261,69 @@ test "stdlib: the image refuses what it cannot carry" {
     var why: []const u8 = "";
     try testing.expectError(error.Unsupported, image_mod.write(gpa, &a.v, &natives, &embedded, .{ .auto_gensyms = 0, .gensyms = 0 }, &why));
     try testing.expectEqualStrings("sorted_map", why);
+}
+
+test "stdlib: reduce, mapv, filterv and the lazy producers call a closure in batches with one call's results" {
+    // Expected values from babashka, which agrees with JVM Clojure
+    // 1.12.6 here but for the second walk after a throw: a block whose
+    // step threw is left unrealized, and the next walk runs its whole
+    // chunk again (docs/LAZY.md §4), where JVM Clojure 1.12.6 and
+    // babashka end the seq at the chunk before, calling nothing.
+    const gpa = testing.allocator;
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try boot(&rt.loader);
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "(defrecord R [v])", .want = "user.R" },
+        // `reduced` at the first element, the last of a run, the first
+        // of the next and one past, over a vector, a lazy seq, an
+        // unrealized range, with and without init, and a repeat.
+        .{
+            .src =
+            \\(vec (for [k [0 31 32 33]]
+            \\  (let [f (fn [a x] (if (= x k) (reduced [a x]) (+ a x)))]
+            \\    [(reduce f 0 (vec (range 64))) (reduce f 0 (map identity (vec (range 64)))) (reduce f 0 (range 64)) (reduce f (range 64)) (reduce f 0 (repeat 64 k))])))
+            ,
+            .want = "[[[0 0] [0 0] [0 0] 2016 [0 0]] [[465 31] [465 31] [465 31] [465 31] [0 31]] [[496 32] [496 32] [496 32] [496 32] [0 32]] [[528 33] [528 33] [528 33] [528 33] [0 33]]]",
+        },
+        // A record that is not `reduced` goes on.
+        .{
+            .src = "(let [f (fn [a x] (if (= x 31) (->R 1000) (+ (if (number? a) a (:v a)) x)))] [(reduce f 0 (range 64)) (reduce f 0 (vec (range 64))) (reduce f 0 (map identity (vec (range 64))))])",
+            .want = "[2520 2520 2520]",
+        },
+        // A throw in a chunk's 9th call, walked twice.
+        .{
+            .src =
+            \\(vec (for [sieve [map filter remove]]
+            \\  (let [n (atom 0) s (sieve (fn [x] (swap! n inc) (if (= x 40) (throw :t) (even? x))) (vec (range 64)))]
+            \\    [(try (doall s) (catch any e e)) @n (try (doall s) (catch any e e)) @n])))
+            ,
+            .want = "[[:t 41 :t 50] [:t 41 :t 50] [:t 41 :t 50]]",
+        },
+        .{
+            .src = "[(mapv (fn [x] (* 2 x)) (vec (range 70))) (mapv (fn [x] (* 2 x)) (map inc (range 40))) (filterv (fn [x] (odd? x)) (vec (range 70))) (vec (remove (fn [x] (odd? x)) (vec (range 40))))]",
+            .want = "[[0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126 128 130 132 134 136 138] [2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64 66 68 70 72 74 76 78 80] [1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41 43 45 47 49 51 53 55 57 59 61 63 65 67 69] [0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38]]",
+        },
+        // An unrealized range, computed a run at a time.
+        .{
+            .src = "[(mapv (fn [x] (* 2 x)) (range 70)) (filterv (fn [x] (odd? x)) (range 3 80 7)) (mapv (fn [x] x) (range 0)) (mapv (fn [x] (- x)) (range 10 0 -3)) (filterv (fn [x] (even? x)) (range 65))]",
+            .want = "[[0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126 128 130 132 134 136 138] [3 17 31 45 59 73] [] [-10 -7 -4 -1] [0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64]]",
+        },
+        // A throw past the native, and one caught inside the callee.
+        .{
+            .src = "[(try (mapv (fn [x] (if (= x 40) (throw :t) x)) (vec (range 64))) (catch any e e)) (try (reduce (fn [a x] (if (= x 33) (throw :t) (+ a x))) 0 (range 64)) (catch any e e)) (mapv (fn [x] (try (if (odd? x) (throw :t) x) (catch any e :c))) (vec (range 8)))]",
+            .want = "[:t :t [0 :c 2 :c 4 :c 6 :c]]",
+        },
+        // A batch inside a batch's callee, and a map's built entries.
+        .{
+            .src = "[(mapv (fn [x] (reduce (fn [a y] (+ a y)) 0 (mapv (fn [y] (* x y)) (vec (range 40))))) (vec (range 5))) (filterv (fn [[k v]] (odd? v)) {:a 1 :b 2 :c 3})]",
+            .want = "[[0 780 1560 2340 3120] [[:a 1] [:c 3]]]",
+        },
+    };
+    for (cases) |c| {
+        const got = try rt.eval("user", c.src);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c.want, got);
+    }
 }

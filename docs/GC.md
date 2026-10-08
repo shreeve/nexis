@@ -279,7 +279,9 @@ either. A leaf native (`docs/VM.md` §6) skips it while no cycle is
 due and takes it once one is, so `(reduce * xs)` collects as it goes;
 a keyword or symbol a `Callback` looks up in a map, a record or nil
 skips it (the lookup does not allocate). A `Callback`'s call of a closure reaches the
-loop's entry, the first safe point, as `callValue`'s does.
+loop's entry, the first safe point, as `callValue`'s does, and so
+does each element of a batch (`docs/VM.md` §6), once the result
+before it is in its place and its own arguments are in the window.
 `Heap.alloc` never collects: the compiler, a native and one instruction
 (a rest list, a closure and its cells) allocate as many blocks as they
 like with no rooting, and what one instruction allocates is in a slot
@@ -457,6 +459,16 @@ The rule each native follows, by what it holds across a further
    result) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
    `partition`'s pad, which walk with `rootedSeqIter`) are not.
+
+A batch (`Callback.each`, `fold`, `foldRange`; `docs/VM.md` §6)
+collects before each element, so it reads its elements from a run a
+root reaches (a vector's leaf, a lazy chunk the walk is on), carries a
+fold's accumulator in the window's first slot, and writes each result
+of `each` into a block a root reaches (a lazy `map`'s chunk, rooted in
+its block; `Results`' open tail), into a buffer whose values are only
+tested for truth (a lazy `filter`'s, which keeps source elements), or
+into a root-stack region written by index, never through a pointer,
+since a native the callee calls may grow the root stack and move it.
 
 A new native that calls back into the VM states its class next to its
 `callValue`.
