@@ -148,6 +148,10 @@ pub const Mov = enum(u6) {
     load_nil = 2,
     load_true = 3,
     load_false = 4,
+    /// `mov:move-clear A=dst B=slot`: `mov:move` of a slot the
+    /// compiler found dead after it, which the move leaves nil
+    /// (VM.md §10.1, COMPILER.md §4.9).
+    move_clear = 5,
     _,
 };
 
@@ -813,21 +817,21 @@ pub const Routine = struct {
     /// slot, a slot read as such (a call block's base, a cell), a value
     /// read through any operand kind, a raw count (§4.5), a keyword or
     /// symbol constant, a constant holding a fixnum, or an upvalue.
-    const Role = enum { none, dst, slot, src, raw, key, fixnum, upvalue };
+    pub const Role = enum { none, dst, slot, src, raw, key, fixnum, upvalue };
     /// What a wide field (§3) indexes.
-    const WideRole = enum { pc, constant, var_, capture, try_ };
+    pub const WideRole = enum { pc, constant, var_, capture, try_ };
     /// `block`: A and B name a call or collection block; `pair`: B
     /// names two slots; `then`: the next instruction is the
     /// conditional jump on A that a quickened comparison runs; `step`:
     /// the next instruction is the quickened comparison at this opcode
     /// index, reading A as its B, that a step runs.
-    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false, then: Quick.Then = .none, step: ?u12 = null };
+    pub const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false, then: Quick.Then = .none, step: ?u12 = null };
 
     /// The shape of the opcode at `op`, null for one with no
     /// operands to prove: an unimplemented one traps where it runs. A
     /// quickened opcode has its base's shape with the kinds its form
     /// promises (§10.10).
-    fn shapeOf(op: u12) ?Shape {
+    pub fn shapeOf(op: u12) ?Shape {
         if (Quick.of(op)) |q| {
             var shape = baseShapeOf(baseOp(op)).?;
             switch (q.form) {
@@ -868,6 +872,7 @@ pub const Routine = struct {
             },
             .mov => switch (@as(Mov, @fromBackingInt(v))) {
                 .move => .{ .a = .dst, .b = .src },
+                .move_clear => .{ .a = .dst, .b = .slot },
                 .load_const => .{ .a = .dst, .wide = .constant },
                 .load_nil, .load_true, .load_false => .{ .a = .dst },
                 _ => null,
@@ -4020,7 +4025,7 @@ pub const VM = struct {
 
     /// An instruction's index into the tables: its group and variant
     /// bits, `group | variant << 6`.
-    inline fn opIndex(inst: Inst) u12 {
+    pub inline fn opIndex(inst: Inst) u12 {
         return @truncate(@as(u64, @bitCast(inst)) >> 4);
     }
 
@@ -4054,6 +4059,7 @@ pub const VM = struct {
             for (0..64) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = &opUnimplemented;
         }
         t[opcode(.mov, Mov.move)] = &opMove;
+        t[opcode(.mov, Mov.move_clear)] = &opMoveClear;
         t[opcode(.mov, Mov.load_const)] = &opLoadConst;
         t[opcode(.mov, Mov.load_nil)] = loadHandler(value_mod.nilValue());
         t[opcode(.mov, Mov.load_true)] = loadHandler(value_mod.fromBool(true));
@@ -4083,6 +4089,7 @@ pub const VM = struct {
         @setEvalBranchQuota(20_000);
         var t = op_table;
         t[opcode(.mov, Mov.move)] = &fastMove;
+        t[opcode(.mov, Mov.move_clear)] = &fastMoveClear;
         t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
         t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
         t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
@@ -4258,6 +4265,18 @@ pub const VM = struct {
         frame.pc = @intCast(pc);
         var tmp: Value = undefined;
         try self.storeIn(frame, inst.a, (try self.operandPtr(frame, inst.b, &tmp)).*);
+        return self.next(frame);
+    }
+
+    /// The value is read before B is cleared, so A = B is a move.
+    fn opMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+        frame.pc = @intCast(pc);
+        if (inst.a.kind != .slot or inst.b.kind != .slot) return VmError.InvalidOperandKind;
+        const dst = try self.slotPtrIn(frame, inst.a.index);
+        const src = try self.slotPtrIn(frame, inst.b.index);
+        const v = src.*;
+        src.* = value_mod.nilValue();
+        dst.* = v;
         return self.next(frame);
     }
 
@@ -4610,6 +4629,19 @@ pub const VM = struct {
 
     fn fastMoveSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
         copyWords(self.verifiedSlot(frame, inst.a), self.verifiedSlot(frame, inst.b));
+        return self.nextAt(frame, pc);
+    }
+
+    /// Nil is the all-zero value, so the clear is two stores of zero.
+    fn fastMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+        const nil = comptime value_mod.nilValue();
+        const src = self.verifiedSlot(frame, inst.b);
+        const v = loadWords(src);
+        @as(*volatile u64, &src.tag).* = nil.tag;
+        @as(*volatile u64, &src.payload).* = nil.payload;
+        const dst = self.verifiedSlot(frame, inst.a);
+        @as(*volatile u64, &dst.tag).* = v.tag;
+        @as(*volatile u64, &dst.payload).* = v.payload;
         return self.nextAt(frame, pc);
     }
 
@@ -6219,6 +6251,10 @@ pub const asm_ = struct {
         return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
     }
 
+    pub fn moveClear(slot_dst: u12, slot_src: u12) Inst {
+        return Inst.primary(.mov, Mov.move_clear, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
+    }
+
     pub fn loadNil(slot_dst: u12) Inst {
         return Inst.primary(.mov, Mov.load_nil, Operand.slot(slot_dst), Operand.none, Operand.none);
     }
@@ -6601,6 +6637,9 @@ test "VM opcodes: mov, return and operand resolution" {
         .{ .name = "load-const", .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(12345)}, .want = .{ .value = fx(12345) } },
         .{ .name = "move copies a slot", .code = &.{ asm_.loadConst(0, 0), asm_.move(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(77)}, .slots = 2, .want = .{ .value = fx(77) } },
         .{ .name = "multi-step round trip through slots", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.move(3, 1), asm_.returnSlot(3) }, .consts = &.{ fx(10), fx(20), fx(30) }, .slots = 4, .want = .{ .value = fx(20) } },
+        .{ .name = "move-clear moves a slot", .code = &.{ asm_.loadConst(0, 0), asm_.moveClear(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(77)}, .slots = 2, .want = .{ .value = fx(77) } },
+        .{ .name = "move-clear leaves nil behind", .code = &.{ asm_.loadConst(0, 0), asm_.moveClear(1, 0), asm_.returnSlot(0) }, .consts = &.{fx(77)}, .slots = 2, .want = .{ .value = nil_v } },
+        .{ .name = "move-clear of a slot onto itself is a move", .code = &.{ asm_.loadConst(0, 0), asm_.moveClear(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(77)}, .want = .{ .value = fx(77) } },
         .{ .name = "return-nil reads no slot", .code = &.{asm_.returnNil()}, .slots = 0, .want = .{ .value = nil_v } },
         .{ .name = "slot out of range", .code = &.{asm_.returnSlot(5)}, .want = .{ .err = VmError.OperandOutOfRange } },
         .{ .name = "constant out of range", .code = &.{ asm_.loadConst(0, 9), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
@@ -8702,6 +8741,36 @@ test "VM dispatch: calls and closures under a collection every few kilobytes" {
     try testing.expect(vm.gc_cycles > 0);
 }
 
+test "VM mov:move-clear: the slot it reads roots the value no more" {
+    const natives = struct {
+        fn live(vm: *VM, _: []const Value) VmError!Value {
+            vm.collectGarbage();
+            return fx(@intCast(vm.ensureHeap().liveCount()));
+        }
+        const native = NativeFn{ .name = "live", .min_arity = 0, .max_arity = 0, .call = &live };
+    };
+    // A vector built in s1 and moved to s2, which then drops it: only
+    // s1 can still hold it when the native collects.
+    var live: [2]i64 = undefined;
+    for ([_]Inst{ asm_.move(2, 1), asm_.moveClear(2, 1) }, &live) |moved, *n| {
+        const code = [_]Inst{
+            asm_.loadConst(0, 1),
+            asm_.collVector(0, 1, 1),
+            moved,
+            asm_.loadNil(2),
+            asm_.loadConst(3, 0),
+            asm_.callCall(3, 0, 4),
+            asm_.returnSlot(4),
+        };
+        const consts = [_]Value{ nativeFnValue(&natives.native), fx(7) };
+        var vm = try VM.init(testing.allocator, &makeRoutine(&code, &consts, 5, "clear"));
+        defer vm.deinit();
+        n.* = (try vm.run()).asFixnum();
+    }
+    try testing.expect(live[0] > 0);
+    try testing.expectEqual(@as(i64, 0), live[1]);
+}
+
 test "GcPolicy.stress: a large live set spaces the next cycle out by its size" {
     // Collecting every 4 KiB re-marks and re-sweeps whatever is live, so
     // a program holding a large set would make the stress run quadratic.
@@ -8772,6 +8841,8 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a branch past the code", .code = &.{ asm_.jumpIfTrue(9, kn(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a destination past the frame", .code = &.{ asm_.loadNil(2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a destination not a slot", .code = &.{ asm_.moveFrom(0, sl(0)), Inst.primary(.mov, Mov.move, kn(0), sl(0), Operand.none), r }, .err = VmError.InvalidOperandKind, .pc = 1 },
+        .{ .name = "a move-clear of a constant", .code = &.{ Inst.primary(.mov, Mov.move_clear, sl(0), kn(0), Operand.none), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a move-clear of a slot past the frame", .code = &.{ asm_.moveClear(0, 2), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a slot read past the frame", .code = &.{ asm_.mathAdd(0, sl(0), sl(2)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a constant past the pool", .code = &.{ asm_.moveFrom(0, kn(1)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a wide constant past the pool", .code = &.{ asm_.loadConst(0, 1), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
