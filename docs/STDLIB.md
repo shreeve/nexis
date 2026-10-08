@@ -103,7 +103,7 @@ Var inside a `binding`.
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6) |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3) |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -485,10 +485,10 @@ returns a realized list where Clojure returns a lazy seq.
 Clojure 1.12's hierarchies and multimethods, in `core.nx` (the
 "Hierarchies and multimethods" section): `core.clj` from `defmulti`
 through `prefers` and from `make-hierarchy` through `underive`, and
-the dispatch of `MultiFn.java`, ported. No Zig sits in the dispatch
-path: the dispatch function and the method are ordinary calls, so a
-recursive multimethod is as deep as a recursive `defn`, and nothing
-needs rooting.
+the dispatch of `MultiFn.java`, ported. The dispatch function and the
+method are ordinary calls, so a recursive multimethod is as deep as a
+recursive `defn`; the one native on the way, `#%mm-lookup`, reads the
+cache and calls nothing back, so nothing needs rooting.
 
 #### 9.1 Hierarchies
 
@@ -560,7 +560,9 @@ and the method for the dispatch value to the same arguments. The
 method is found as `MultiFn.getMethod` finds it:
 
 1. The cache, a map from dispatch value to method, holds the value:
-   its method. The cache starts as the method table itself, so an
+   its method. `nexis.internal/#%mm-lookup` reads it in one call: the
+   cache and the hierarchy reference dereferenced, the hierarchy the
+   cache was built against compared by identity, the value looked up. The cache starts as the method table itself, so an
    exact key always wins, even over a preference for one of its
    ancestors.
 2. Else the best entry: of the table's entries whose key the dispatch

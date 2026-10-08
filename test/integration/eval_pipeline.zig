@@ -2196,6 +2196,17 @@ test "multimethods: the no-method message prints the dispatch value as %s; recur
     , "100000");
 }
 
+test "multimethods: #%mm-lookup reads a cache only while its hierarchy is the one it was built against" {
+    try expectOutputProgram(
+        \\(def h (atom {}))
+        \\(def cache (atom [@h {:a 1 [:v] 2}]))
+        \\(def lookup nexis.internal/#%mm-lookup)
+        \\[(lookup cache h :a) (lookup cache h [:v]) (lookup cache h :b) (do (reset! h {:parents {}}) (lookup cache h :a))
+        \\ (lookup cache #'nexis.core/global-hierarchy :a)
+        \\ (try (lookup {} h :a) (catch any e e)) (try (lookup cache {} :a) (catch any e e))]
+    , "[1 2 nil nil nil :kind-mismatch :kind-mismatch]");
+}
+
 test "multimethods: a multimethod is unserializable as any function" {
     try expectOutputProgramWithStore("multifn",
         \\(defmulti m identity)

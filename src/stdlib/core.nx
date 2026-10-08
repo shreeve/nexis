@@ -1407,13 +1407,12 @@
 
 ; One arity of a multimethod: the dispatch value of the arguments,
 ; its method from the cache when the hierarchy is still the one the
-; cache was built against, else from mm-fn, applied to the arguments.
+; cache was built against (#%mm-lookup), else from mm-fn, applied to
+; the arguments.
 (defmacro ^:private mm-call [dispatch-fn state cache href args more]
   (let [f (gensym "method")]
     `(let [dv# ~(if more `(apply ~dispatch-fn ~@args ~more) `(~dispatch-fn ~@args))
-           c# (deref ~cache)
-           m# (when (identical? (nth c# 0) (deref ~href)) (get (nth c# 1) dv#))
-           ~f (or m# (mm-fn ~state ~cache dv#))]
+           ~f (or (nexis.internal/#%mm-lookup ~cache ~href dv#) (mm-fn ~state ~cache dv#))]
        ~(if more `(apply ~f ~@args ~more) `(~f ~@args)))))
 
 ; (make-multifn name dispatch-fn default href) → a multimethod named
