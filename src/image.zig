@@ -1226,11 +1226,7 @@ const Loader = struct {
     fn ref(l: *Loader) LoadError!Value {
         return switch (try l.in.tag(RefTag)) {
             .nil => value_mod.nilValue(),
-            .immediate => blk: {
-                const v: Value = .{ .tag = try l.in.int(u64), .payload = try l.in.int(u64) };
-                if (!v.kind().isImmediate() or v.kind() == .keyword or v.kind() == .symbol) return error.Corrupt;
-                break :blk v;
-            },
+            .immediate => try immediate(.{ .tag = try l.in.int(u64), .payload = try l.in.int(u64) }),
             .keyword => try l.keyword(),
             .symbol => try l.symbol(),
             .object => l.objects[try l.in.index(l.built)],
@@ -1245,6 +1241,23 @@ const Loader = struct {
         for (0..n) |_| out.appendAssumeCapacity(try l.ref());
     }
 };
+
+/// `v` when it is an immediate the runtime's constructors make: a
+/// boolean, a char, a fixnum or a float, nothing past its kind byte,
+/// its payload in range. A reserved kind, a surrogate or a char past
+/// U+10FFFF, a fixnum outside i48 or a NaN other than the canonical
+/// one is `Corrupt` (VALUE.md §3).
+fn immediate(v: Value) LoadError!Value {
+    const made: ?Value = switch (v.kind()) {
+        .false_, .true_ => value_mod.fromBool(v.kind() == .true_),
+        .char => if (v.payload > std.math.maxInt(u21)) null else value_mod.fromChar(@intCast(v.payload)),
+        .fixnum => value_mod.fromFixnum(@bitCast(v.payload)),
+        .float => value_mod.fromFloat(@bitCast(v.payload)),
+        else => null,
+    };
+    const m = made orelse return error.Corrupt;
+    return if (m.identicalTo(v)) v else error.Corrupt;
+}
 
 /// `i` when it is below `len`, the length of the table it indexes.
 fn check(i: u32, len: usize) LoadError!u32 {
@@ -1576,4 +1589,59 @@ test "load: a namespace map of any capacity is read or Corrupt, never an overflo
     defer out.deinit();
     const max = std.math.maxInt(u32);
     try std.testing.expectError(error.Corrupt, load(&vm, try testImage(&out, &.{.{ "image.test", max, max }}, &.{}), &.{}));
+}
+
+/// Load an image of one vector holding the immediate reference `tag`
+/// and `payload`.
+fn loadImmediate(tag: u64, payload: u64) !void {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa, &VM.idle_routine);
+    defer vm.deinit();
+    var elem: Out = .{ .gpa = gpa };
+    defer elem.deinit();
+    try elem.count(1);
+    try elem.byte(@backingInt(RefTag.immediate));
+    try elem.int(u64, tag);
+    try elem.int(u64, payload);
+    const vector = try testObject(gpa, .vector, try vector_mod.fromSlice(vm.ensureHeap(), &.{value_mod.nilValue()}), elem.list.items);
+    defer gpa.free(vector);
+    var out: Out = .{ .gpa = gpa };
+    defer out.deinit();
+    _ = try load(&vm, try testImage(&out, &.{}, &.{vector}), &.{});
+}
+
+test "load: an immediate of every kind the runtime makes is read" {
+    for ([_]Value{
+        value_mod.fromBool(false),
+        value_mod.fromBool(true),
+        value_mod.fromChar(0x10_FFFF).?,
+        value_mod.fromFixnum(value_mod.fixnum_min).?,
+        value_mod.fromFixnum(value_mod.fixnum_max).?,
+        value_mod.fromFloat(std.math.nan(f64)),
+        value_mod.fromFloat(-0.0),
+    }) |v| try loadImmediate(v.tag, v.payload);
+}
+
+test "load: an immediate of a reserved or non-immediate kind is Corrupt" {
+    for ([_]u64{ @backingInt(Kind.nil), 8, 15, @backingInt(Kind.string), @backingInt(Kind.cell_internal), 0xff }) |tag|
+        try std.testing.expectError(error.Corrupt, loadImmediate(tag, 0));
+    // A known kind with stray bits above its kind byte.
+    try std.testing.expectError(error.Corrupt, loadImmediate(@as(u64, 1) << 16 | @backingInt(Kind.fixnum), 0));
+}
+
+test "load: a char outside Unicode's scalar values is Corrupt" {
+    const char: u64 = @backingInt(Kind.char);
+    for ([_]u64{ 0xD800, 0xDFFF, 0x11_0000, 0x20_0041, 1 << 63 }) |payload|
+        try std.testing.expectError(error.Corrupt, loadImmediate(char, payload));
+}
+
+test "load: a fixnum outside i48 is Corrupt" {
+    const fixnum: u64 = @backingInt(Kind.fixnum);
+    for ([_]i64{ value_mod.fixnum_max + 1, value_mod.fixnum_min - 1, std.math.maxInt(i64), std.math.minInt(i64) }) |n|
+        try std.testing.expectError(error.Corrupt, loadImmediate(fixnum, @bitCast(n)));
+}
+
+test "load: a float whose NaN is not the canonical one, or a boolean with a payload, is Corrupt" {
+    try std.testing.expectError(error.Corrupt, loadImmediate(@backingInt(Kind.float), 0x7FF0_0000_0000_0001));
+    try std.testing.expectError(error.Corrupt, loadImmediate(@backingInt(Kind.true_), 1));
 }

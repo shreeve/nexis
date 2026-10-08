@@ -221,5 +221,23 @@
 (d/transact! c [(sorted-map :srt/n 42)])
 (println :sorted-entity (d/q '[:find ?n . :where [_ :srt/n ?n]] (d/db c)))
 
+; A list form may be any sequential form, as in Datomic: a list, a
+; quoted list, a lazy seq or a cons, in tx-data that is a vector or a
+; list, and in what a transaction function returns.
+(d/transact! c [(list :db/add "l" :person/email "l@example.com")
+                '(:db/add "l" :person/age 1)
+                (map identity [:db/add "l" :person/tags :listed])
+                (cons :db/add ["l" :person/full-name "El"])])
+(def l (d/entid (d/db c) [:person/email "l@example.com"]))
+(println (d/touch (d/entity (d/db c) l)))
+(d/transact! c (list (list :db.fn/cas l :person/age 1 2) (list :db/retract l :person/tags :listed)))
+(d/transact! c [(list :db.fn/call (fn [db e] (list (list :db/retract e :person/full-name "El"))) l)])
+(println (d/touch (d/entity (d/db c) l)))
+(d/transact! c ['(:db/retractEntity [:person/email "l@example.com"])])
+(t/check "a list retractEntity" (nil? (d/entid (d/db c) [:person/email "l@example.com"])))
+(println (t/caught (d/transact! c [(list :db/add "l" :person/age)])))
+(println (t/caught (d/transact! c [()])))
+(println (t/caught (d/transact! c [#{:db/add}])))
+
 (d/release c)
 (println :basics-done)
