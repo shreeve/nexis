@@ -1,0 +1,153 @@
+; test/portable/read.nx — the canonical dump of the two stores
+; write.nx leaves in the working directory. It only reads: a complete
+; store opens without a write (docs/DB.md §3.3, docs/NEXTOMIC.md §2),
+; and both open read-only when the files are. The dump is the same
+; bytes on every host that reads the same stores, wherever they were
+; written (test/portable/README.md).
+
+(require '[nextomic :as d])
+
+(defn show [label x] (println label (pr-str x)))
+
+; ---------------------------------------------------------------- db/*
+
+(def c (db/open "refs.edb"))
+
+(with-read-tx [tx c]
+  (println "== refs.edb")
+  (doseq [tree [:kinds :keys :app/state]]
+    (println "-- tree" tree)
+    (doseq [[k v] (db/scan tx tree)]
+      (println (pr-str (if (> (count k) 64) (str (subs k 0 8) "... " (count k) " bytes") k)) (pr-str v))))
+  (show "aborted write present?" (db/present? (db/ref c :app/state :aborted)))
+  (show "deleted key present?" (db/present? (db/ref c :app/state :gone)))
+  (show "longest key reads back" (db/get tx (db/ref c :keys (apply str (repeat 4078 "m")))))
+
+  (println "-- tree :bulk")
+  (let [rows (db/scan tx :bulk)]
+    (show "count" (count rows))
+    (show "hash" (hash rows))
+    (show "overwritten" (count (filter (fn [[_ v]] (vector? v)) rows)))
+    (show "sum of :i" (reduce + (map (fn [[_ v]] (if (map? v) (:i v) 0)) rows)))
+    (show "sum of :f" (reduce + (map (fn [[_ v]] (if (map? v) (:f v) 0.0)) rows)))
+    (doseq [row (take-nth 250 rows)] (println (pr-str row))))
+  (show "a range scan" (db/scan tx :bulk "k02990" "k03003"))
+  (show "reduce-tree count" (db/reduce-tree tx :bulk (fn [acc _ _] (inc acc)) 0))
+
+  (println "-- tree :big")
+  (let [text (db/get tx (db/ref c :big :text))
+        longs (db/get tx (db/ref c :big :longs))
+        doubles (db/get tx (db/ref c :big :doubles))
+        deep (db/get tx (db/ref c :big :deep))]
+    (show "text" [(count text) (hash text) (subs text 0 40) (subs text (- (count text) 40))])
+    (show "longs" [(count longs) (hash longs) (take 3 longs) (reduce + longs)])
+    (show "doubles" [(count doubles) (hash doubles) (take 3 doubles) (reduce + doubles)])
+    (show "deep" [(hash deep) (loop [m deep n 0] (if m (recur (:next m) (inc n)) n)) (:level deep)])))
+
+(db/close c)
+
+; ------------------------------------------------------------ Nextomic
+
+(def n (d/connect "nextomic.edb"))
+(def db (d/db n))
+(println "== nextomic.edb")
+(show "basis-t" (d/basis-t db))
+
+(defn sorted-schema [db]
+  (into (sorted-map) (map (fn [[k v]] [k (into (sorted-map) v)]) (d/schema db))))
+(println "-- schema")
+(doseq [[k v] (sorted-schema db)] (println (pr-str k) (pr-str v)))
+(show "schema as of 12, :addr/city" (get (sorted-schema (d/as-of db 12)) :addr/city))
+(show "the retired name" (d/entid db :person/nick))
+(show "the new name" [(d/entid db :person/alias) (d/ident db (d/entid db :person/alias))])
+
+; The bootstrap transaction's instant is the writer's clock: digests
+; leave its one datom out.
+(def boot-tx (+ 70368744177664 1))
+(defn digest [ds]
+  (let [kept (vec (remove #(= boot-tx (first %)) ds))]
+    [(count ds) (count kept) (hash kept)]))
+
+; Every index, current and history, as counts and a hash, then the
+; datoms of everything but the items in full.
+(println "-- indexes")
+(doseq [view [:current :history] index [:eavt :aevt :avet :vaet]]
+  (show (str (name view) " " (name index))
+        (digest (d/datoms (if (= view :history) (d/history db) db) index))))
+(def people (sort (d/q '[:find [?e ...] :where [?e :person/email _]] (d/history db))))
+(println "-- people's datoms, history")
+(doseq [e people
+        datom (d/datoms (d/history db) :eavt e)]
+  (println (pr-str datom)))
+(println "-- schema datoms, current")
+(doseq [datom (d/datoms db :eavt)
+        :when (< (first datom) 4294967296)]
+  (println (pr-str datom)))
+
+(println "-- entities")
+(doseq [e people]
+  (show e (some->> (d/entity db e) d/touch (into (sorted-map)))))
+
+(println "-- q")
+(show "names" (sort (d/q '[:find [?n ...] :where [_ :person/name ?n]] db)))
+(show "items per owner"
+      (sort (d/q '[:find ?o (count ?i) (sum ?n) (min ?w) (max ?w)
+                   :where [?i :item/owner ?p] [?p :person/name ?o] [?i :item/n ?n] [?i :item/w ?w]] db)))
+(show "unweighed items" (d/q '[:find (count ?i) . :where [?i :item/sku _] (not [?i :item/w _])] db))
+(show "friends, by a recursive rule"
+      (sort (d/q '[:find ?a ?b :in $ % :where (reach ?x ?y) [?x :person/name ?a] [?y :person/name ?b]]
+                 db '[[(reach ?x ?y) [?x :person/friends ?y]]
+                      [(reach ?x ?y) [?x :person/friends ?z] (reach ?z ?y)]])))
+(show "by uuid" (d/q '[:find ?n . :in $ ?u :where [?e :person/id ?u] [?e :person/name ?n]]
+                     db "fedcba98-7654-3210-fedc-ba9876543210"))
+(show "by bytes" (d/q '[:find ?n . :where [?e :person/photo "png"] [?e :person/name ?n]] db))
+(show "by long bio" (d/q '[:find ?n . :in $ ?b :where [?e :person/bio ?b] [?e :person/name ?n]]
+                         db (:person/bio (d/entity db [:person/name "Ann"]))))
+(show "keys" (sort-by :name (d/q '[:find ?n ?a :keys name age :where [?e :person/name ?n] [?e :person/age ?a]] db)))
+
+(println "-- index-range")
+(show "ages 30..50" (mapv #(nth % 2) (d/index-range db :person/age 30 50)))
+(show "balances" (mapv #(nth % 2) (d/index-range db :person/balance nil nil)))
+(show "born" (mapv #(nth % 2) (d/index-range db :person/born nil nil)))
+(show "items n < 5000" (mapv (fn [[e _ v]] [e v]) (d/index-range db :item/n nil 5000)))
+
+(println "-- pull")
+(def pattern '[* {:person/home [*]} {:person/friends [:person/name {:person/friends ...}]}
+               {:person/_friends [:person/name]} {(:item/_owner :limit 3) [:item/sku]}])
+(doseq [e people] (show e (some->> (d/pull db pattern e) (into (sorted-map)))))
+(show "pull-many" (d/pull-many db [:person/name :person/age] [[:person/name "Cy"] [:person/name "Ann"]]))
+(show "pull as of 3" (d/pull (d/as-of db 3) '[:person/name :person/age :person/alias :person/tags] [:person/name "Ann"]))
+
+(println "-- as-of, since, history")
+(doseq [t [1 2 3 7 8 10 11 12 13 14]]
+  (let [v (d/as-of db t)]
+    (show (str "as-of " t) [(digest (d/datoms v :eavt))
+                             (when (>= t 3) (sort (d/q '[:find [?n ...] :where [_ :person/name ?n]] v)))])))
+(show "since 7" (d/datoms (d/since db 7) :aevt :person/age))
+(show "since 12" (d/datoms (d/since db 12) :eavt))
+(show "history of Ann's age" (d/datoms (d/history db) :eavt [:person/name "Ann"] :person/age))
+(show "history of Bob's bio"
+      (mapv (fn [[_ _ v t added]] [(count v) t added]) (d/datoms (d/history db) :eavt [:person/name "Bob"] :person/bio)))
+(show "history of the secrets" (d/datoms (d/history db) :aevt :person/secret))
+
+(println "-- fulltext")
+(defn search [db attr needle]
+  (sort (d/q '[:find ?e ?v :in $ ?a ?s :where [(fulltext $ ?a ?s) [[?e ?v]]]] db attr needle)))
+(show "ledger" (search db :person/bio "LEDGER twice"))
+(show "café" (search db :person/bio "CAFÉ"))
+(show "σοφιας as of 7" (search (d/as-of db 7) :person/bio "σοφιας"))
+(show "naïve as of 13" (search (d/as-of db 13) :person/bio "NAÏVE 日本語"))
+(show "blue doors" (search db :person/bio "blue doors"))
+(show "blue as of 7" (search (d/as-of db 7) :person/bio "blue"))
+(show "city rome" (search db :addr/city "ROME"))
+(show "city as of 12" (try (search (d/as-of db 12) :addr/city "rome") (catch any e e)))
+
+(println "-- tx-range")
+(doseq [{:keys [t instant data excised]} (d/tx-range n)]
+  (show t [(if (= t 1) :clock (- instant 4102444800000)) (digest data) excised]))
+(doseq [{:keys [t data]} (d/tx-range n 8 15)
+        datom (take 12 data)]
+  (println t (pr-str datom)))
+
+(d/release n)
+(println :read-done)

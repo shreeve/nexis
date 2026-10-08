@@ -1,0 +1,187 @@
+; test/portable/write.nx — writes the two stores read.nx dumps, from
+; the working directory: refs.edb, a db/* store (docs/DB.md), and
+; nextomic.edb, a Nextomic store (docs/NEXTOMIC.md §2) with data in
+; every one of its twelve trees. Everything it writes is a function of
+; this file alone, except what no dump prints: each store's emdb
+; bookkeeping, the Nextomic store's uuid and the instant of its
+; bootstrap transaction. test/portable/README.md carries the stores
+; between hosts.
+
+(require '[nextomic :as d])
+
+; A linear congruential sequence, so the bulk data is the same on
+; every host.
+(defn lcg [x] (mod (+ (* x 1103515245) 12345) 2147483648))
+(def seeds (vec (take 6000 (iterate lcg 20261007))))
+
+; ---------------------------------------------------------------- db/*
+
+(def c (db/open "refs.edb"))
+
+; One value of every serializable kind (docs/CODEC.md §3), and the
+; edges of the numeric ones.
+(def kinds
+  [["nil" nil] ["false" false] ["true" true]
+   ["char" \λ] ["char-astral" (first (str (char 128512)))]
+   ["fixnum" 42] ["fixnum-min" -140737488355328] ["fixnum-max" 140737488355327]
+   ["float" 0.1] ["float-third" (/ 1.0 3)] ["float-neg-zero" -0.0]
+   ["float-inf" ##Inf] ["float-neg-inf" ##-Inf] ["float-nan" ##NaN] ["float-tiny" 4.9E-324]
+   ["keyword" :plain] ["keyword-ns" :app/state] ["symbol" 'my.ns/sym]
+   ["string" "plain"] ["string-utf8" "naïve café 日本語 ΣΟΦΙΑΣ 😀"] ["string-empty" ""]
+   ["string-nul" (str "a" (char 0) "b")]
+   ["bignum" 123456789012345678901234567890] ["bignum-neg" -98765432109876543210987654321]
+   ["bignum-edge" 140737488355328]
+   ["map" {:a 1 "b" [2 3] :c {:d #{4}}}]
+   ["map-large" (zipmap (map #(keyword (str "k" %)) (range 20)) (range 20))]
+   ["set" #{1 :two "three" 4.0 [5]}]
+   ["vector" [1 2.5 "x" :y nil true]] ["list" '(1 (2 (3)) "x")]
+   ["i64-vector" (i64-vector [0 -1 9007199254740993 -9223372036854775808 9223372036854775807])]
+   ["f64-vector" (f64-vector [1.5 -0.0 ##Inf 1.0E300])]
+   ["sorted-map" (sorted-map 3 :c 1 :a 2 :b)] ["sorted-set" (sorted-set "b" "a" "c")]
+   ["lazy-seq" (map inc (range 5))]
+   ["nested" (reduce (fn [acc i] [i acc]) nil (range 200))]])
+
+(with-tx [tx c]
+  (doseq [[k v] kinds] (db/put! tx (db/ref c :kinds k) v)))
+
+; Keys: multi-byte, with spaces, one byte, and the longest a 16 KiB
+; page takes (4078 bytes, docs/DB.md §8).
+(with-tx [tx c]
+  (db/put! tx (db/ref c :keys "ключ-日本") :utf8)
+  (db/put! tx (db/ref c :keys "with spaces and / slash") :spaces)
+  (db/put! tx (db/ref c :keys "z") :one-byte)
+  (db/put! tx (db/ref c :keys (apply str (repeat 4078 "m"))) :longest)
+  (db/put! tx (db/ref c :keys :ns/kw) :keyword-key))
+
+(db/put-key! (db/ref c :app/state :counter) 0)
+(dotimes [_ 25] (with-tx [tx c] (db/alter! tx (db/ref c :app/state :counter) inc)))
+(db/put-key! (db/ref c :app/state :gone) :soon)
+(db/delete-key! (db/ref c :app/state :gone))
+; An aborted transaction leaves nothing.
+(try (with-tx [tx c]
+       (db/put! tx (db/ref c :app/state :aborted) :never)
+       (throw :abort))
+     (catch any _ nil))
+
+; Bulk: 6000 keys over six transactions, enough for a tree of several
+; levels; then a third deleted and a fifth overwritten, so pages free
+; and merge.
+(doseq [part (partition 1000 (map-indexed vector seeds))]
+  (with-tx [tx c]
+    (doseq [[i x] part]
+      (db/put! tx (db/ref c :bulk (format "k%05d" i))
+               {:i i :x x :f (/ x 7.0) :s (str "value-" (mod x 99991))}))))
+(with-tx [tx c]
+  (doseq [i (range 0 6000 3)] (db/delete! tx (db/ref c :bulk (format "k%05d" i)))))
+(with-tx [tx c]
+  (doseq [i (range 1 6000 5)] (db/put! tx (db/ref c :bulk (format "k%05d" i)) [i :over])))
+
+; Values that span overflow pages.
+(with-tx [tx c]
+  (db/put! tx (db/ref c :big :text)
+           (apply str (map #(str "line " % " ñ日😀\n") (range 20000))))
+  (db/put! tx (db/ref c :big :longs) (vec (map #(- % 50000) seeds)))
+  (db/put! tx (db/ref c :big :doubles) (f64-vector (map #(/ % 3.0) seeds)))
+  (db/put! tx (db/ref c :big :deep) (reduce (fn [acc i] {:level i :next acc}) nil (range 2000))))
+
+(db/close c)
+(println :refs-written)
+
+; ------------------------------------------------------------ Nextomic
+
+; Explicit instants, past the clock: each transaction's is fixed, and an
+; excision, which takes the clock, takes the instant before it
+; (docs/NEXTOMIC.md §3 step 4).
+(def t0 4102444800000)
+(defn at [n] [:db/add "datomic.tx" :db/txInstant (+ t0 (* n 1000))])
+
+(def n (d/connect "nextomic.edb"))
+
+; t=2: the schema.
+(d/transact! n
+  [{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :person/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/value}
+   {:db/ident :person/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :person/height :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+   {:db/ident :person/born :db/valueType :db.type/instant :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :person/id :db/valueType :db.type/uuid :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :person/photo :db/valueType :db.type/bytes :db/cardinality :db.cardinality/one}
+   {:db/ident :person/tags :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
+   {:db/ident :person/friends :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   {:db/ident :person/home :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/isComponent true}
+   {:db/ident :person/bio :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true
+    :db/doc "free text, searched by fulltext"}
+   {:db/ident :person/active :db/valueType :db.type/boolean :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :person/balance :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :person/nick :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :person/secret :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :addr/city :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :addr/zip :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :item/sku :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+   {:db/ident :item/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :item/w :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
+   {:db/ident :item/owner :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
+   (at 2)])
+
+; t=3: five people, with every value type, out-of-line strings and
+; bytes (over 96 bytes, docs/NEXTOMIC.md §2.2) and longs past the
+; fixnum range.
+(def long-bio (apply str "Ann keeps the archive of the old observatory; " (repeat 6 "she reads every ledger twice. ")))
+(d/transact! n
+  [{:db/id "ann" :person/name "Ann" :person/email "ann@example.com" :person/age 41 :person/height 1.7
+    :person/born -315619200000 :person/id "0123abcd-4567-89ef-0123-456789abcdef"
+    :person/photo (apply str (repeat 40 "\u0001ÿ")) :person/tags [:staff :admin]
+    :person/home {:addr/city "Rome" :addr/zip 100}
+    :person/bio long-bio :person/active true :person/balance 9223372036854775807 :person/nick "annie"}
+   {:db/id "bob" :person/name "Bob" :person/email "bob@example.com" :person/age 35 :person/height 1.82
+    :person/born 0 :person/id "fedcba98-7654-3210-fedc-ba9876543210" :person/photo "png"
+    :person/tags [:staff] :person/friends ["ann"] :person/home {:addr/city "Genoa" :addr/zip 16121}
+    :person/bio "Café owner; ΣΟΦΙΑΣ reader" :person/active false :person/balance -9223372036854775808}
+   {:db/id "cy" :person/name "Cy" :person/email "cy@example.com" :person/age 29 :person/height -0.0
+    :person/friends ["ann" "bob"] :person/bio "red team lead, blue sky thinker" :person/balance 140737488355328}
+   {:db/id "dee" :person/name "Dee" :person/email "dee@example.com" :person/age 52
+    :person/friends ["cy"] :person/bio "naïve 日本語 notes" :person/nick "d"}
+   {:db/id "eve" :person/name "Eve" :person/email "eve@example.com" :person/age 23 :person/friends ["dee"]}
+   (at 3)])
+
+; t=4..7: 2000 items, owned round-robin.
+(def owners ["Ann" "Bob" "Cy" "Dee" "Eve"])
+(doseq [[k part] (map-indexed vector (partition 500 (map-indexed vector (take 2000 seeds))))]
+  (d/transact! n (conj (mapv (fn [[i x]]
+                               {:item/sku (format "SKU-%05d" i) :item/n (mod x 1000000) :item/w (/ (mod x 1000) 8.0)
+                                :item/owner [:person/name (nth owners (mod i 5))]})
+                             part)
+                       (at (+ 4 k)))))
+
+; t=8: card-one overwrites, card-many changes, a retraction, a cas and
+; a new out-of-line bio, so every history tree holds retractions.
+(d/transact! n [[:db/add [:person/name "Ann"] :person/age 42]
+                [:db/retract [:person/name "Ann"] :person/tags :admin]
+                [:db/add [:person/name "Ann"] :person/tags :founder]
+                [:db/retract [:person/name "Dee"] :person/email "dee@example.com"]
+                [:db.fn/cas [:person/name "Bob"] :person/age 35 36]
+                [:db/add [:person/name "Bob"] :person/bio (apply str "Bob's café moved north. " (repeat 5 "Blue doors, red windows. "))]
+                [:db/retract [:person/name "Cy"] :person/friends [:person/name "Bob"]]
+                (at 8)])
+
+; t=9: a rename, which retires the old name in nx/idents.
+(d/transact! n [[:db/add :person/nick :db/ident :person/alias] (at 9)])
+
+; t=10: secrets, and every seventh item's weight retracted.
+(d/transact! n (conj (into [[:db/add [:person/name "Eve"] :person/secret "eve's pin is 0000"]
+                            [:db/add [:person/name "Dee"] :person/secret "dee's pin is 1234"]]
+                           (map (fn [i] [:db/retract [:item/sku (format "SKU-%05d" i)] :item/w]) (range 0 2000 7)))
+                     (at 10)))
+
+; t=11, t=12: excise one item whole, and one attribute of Eve.
+(d/excise! n [:item/sku "SKU-00013"])
+(d/excise! n [:person/name "Eve"] :person/secret)
+
+; t=13: :db/fulltext added to a populated attribute, which backfills
+; nx/fulltext; a component retracted with its owner.
+(d/transact! n [[:db/add :addr/city :db/fulltext true] (at 13)])
+(d/transact! n [[:db/retractEntity [:person/name "Dee"]] (at 14)])
+
+(println (d/basis-t (d/db n)))
+(d/release n)
+(println :nextomic-written)
