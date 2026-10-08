@@ -46,7 +46,7 @@ const pinned = [_]Pin{
     .{ .tree = "nx/aevt-h", .entries = 406, .key = 10594, .value = 0, .pages = 1 },
     .{ .tree = "nx/avet-h", .entries = 400, .key = 10000, .value = 0, .pages = 1 },
     .{ .tree = "nx/vaet-h", .entries = 0, .key = 0, .value = 0, .pages = 0 },
-    .{ .tree = "nx/txlog", .entries = 407, .key = 2442, .value = 221180, .pages = 15 },
+    .{ .tree = "nx/txlog", .entries = 407, .key = 2442, .value = 95728, .pages = 8 },
     .{ .tree = "nx/fulltext", .entries = 11, .key = 490, .value = 0, .pages = 1 },
 };
 

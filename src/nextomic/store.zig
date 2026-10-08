@@ -215,6 +215,8 @@ pub const boot = struct {
     pub const attrs_without_fulltext = attrs[0 .. attrs.len - 1];
 
     comptime {
+        // The txlog codec rebuilds a transaction's instant datom.
+        std.debug.assert(tx_instant == datom_mod.tx_instant_attr);
         // `idents[i]` carries id `i + 1`, so the enumerations slice by id.
         for (idents, 1..) |id, i| std.debug.assert(id.id == i);
         std.debug.assert(fulltext_attr.id == fulltext);
@@ -1109,26 +1111,12 @@ pub const Store = struct {
         var it = counts.iterator();
         while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, (try self.attrCount(txn, e.key_ptr.*)) + e.value_ptr.*);
 
-        var names = IdentNames{ .store = self, .txn = txn };
-        const entry = try datom_mod.encodeTxlog(arena, now, datoms, &.{}, .{ .ctx = @ptrCast(&names), .identName = &IdentNames.identName });
-        try self.putTxlog(txn, t, entry);
+        try self.putTxlog(txn, t, try datom_mod.encodeTxlog(arena, t, now, datoms, &.{}));
         try self.writeT(txn, t);
         try self.bumpSchemaGen(txn);
         // No attribute is full-text yet: the empty tree is current.
         try self.writeFulltextStamp(txn, t);
     }
-
-    /// Ident names for the txlog encoder, from `nx/idents` through the
-    /// transaction that is writing.
-    const IdentNames = struct {
-        store: *Store,
-        txn: *Txn,
-
-        fn identName(ctx: *anyopaque, id: u32) anyerror!?[]const u8 {
-            const self: *IdentNames = @ptrCast(@alignCast(ctx));
-            return self.store.identNameById(self.txn, id);
-        }
-    };
 
     /// A store whose idents lack `:db/fulltext` receives the attribute
     /// as a transaction of its own at the store's next ident id.

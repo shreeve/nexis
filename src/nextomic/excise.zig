@@ -10,9 +10,9 @@
 //!     rest one key at a time from a scan of the EAVT-h and EAVT rows,
 //!     which together name every datom the entity ever had;
 //!   - every txlog entry holding one of those datoms is rewritten
-//!     without them and marked `{:excised [e ...]}`; an entry that ends
-//!     up empty stays, with its instant and its marker, so `tx-range`
-//!     replays the same transactions with the datoms gone;
+//!     without their rows and marked with the entity; an entry that
+//!     ends up empty stays, with its instant and its marker, so
+//!     `tx-range` replays the same transactions with the datoms gone;
 //!   - the per-attribute current counts drop by the current rows
 //!     removed, and the tokens tree loses the rows of every current
 //!     string value of a `:db/fulltext` attribute.
@@ -114,23 +114,13 @@ fn delete(store: *Store, txn: *Txn, arena: Allocator, index: Index, history: boo
 }
 
 /// Rewrite the txlog entry of each `t` in `ts` without the datoms of
-/// `e` (under `a` when given), marking it with `e` in `{:excised
-/// [...]}`; a marker already there keeps its other entities. The
-/// entry's instant stands.
-pub fn rewriteTxlog(store: *Store, txn: *Txn, arena: Allocator, ts: []const u64, e: u64, a: ?u32, ids: datom_mod.IdSource, names: datom_mod.NameSource) !void {
+/// `e` (under `a` when given), marking it with `e` (datom.zig
+/// `exciseTxlog`); the entry's instant and its other rows stand as
+/// stored.
+pub fn rewriteTxlog(store: *Store, txn: *Txn, arena: Allocator, ts: []const u64, e: u64, a: ?u32, types: datom_mod.Source) !void {
     for (ts) |t| {
         const bytes = (try store.getTxlog(txn, t)) orelse return error.Corrupted;
-        const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
-        var kept: std.ArrayList(datom_mod.Datom) = .empty;
-        for (entry.datoms) |d| {
-            const gone = d.e == e and (a == null or d.a == a.?);
-            if (!gone) try kept.append(arena, d);
-        }
-        var marked: std.ArrayList(u64) = .empty;
-        try marked.appendSlice(arena, entry.excised);
-        if (std.mem.findScalar(u64, marked.items, e) == null) try marked.append(arena, e);
-        const rewritten = try datom_mod.encodeTxlog(arena, entry.instant, kept.items, marked.items, names);
-        try store.putTxlog(txn, t, rewritten);
+        try store.putTxlog(txn, t, try datom_mod.exciseTxlog(arena, bytes, e, a, types));
     }
 }
 

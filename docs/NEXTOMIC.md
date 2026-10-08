@@ -115,10 +115,28 @@ still holds no read transaction.
 | `nx/aevt-h` | `[a:4][e:6][v][top:6]` | empty |
 | `nx/avet-h` | `[a:4][v][e:6][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[v:6][a:4][e:6][top:6]` | empty (ref attrs only) |
-| `nx/txlog` | `[t:6]` | codec vector `[instant [e a v added] ...]`, with a trailing map `{:excised [e ...]}` on an entry an excision touched |
+| `nx/txlog` | `[t:6]` | the entry (below): flags, instant, the datoms in write order, and on an entry an excision touched the entities it excised |
 | `nx/idents` | `[0x00][utf8 text]` / `[0x01][id:4]` / `[0x02][utf8 text]` | id / text / id of a name a rename retired |
 | `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"ft"`, `"n"[a:4]` | see §2.3 |
 | `nx/fulltext` | `[a:4][token][0x00][e:6][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
+
+A txlog entry (`datom.zig`) is bytes: a flags byte, the instant as a
+zigzag LEB128, the row count as a LEB128, the rows, and when an
+excision touched the entry the count and the entities it excised. A
+row is the entity less the previous row's (zigzag LEB), `a << 1 |
+added` (LEB), and `v` in the attribute's value type, which never
+changes: a long or an instant zigzag LEB, a double its 8 bytes, a
+boolean one byte, a keyword its ident id and a ref its eid (LEB), a
+uuid 16 bytes, a string or byte array of at most 96 bytes its length
+and bytes. A longer one is the mark 97 and its index encoding after
+the tag (prefix and hash, §2.2): its payload is read from the fact's
+EAVT or EAVT-h row when the entry is decoded, so the log never repeats
+it, and a damaged index page fails `tx-range` too. The flags say
+whether a row's entity is in the attribute partition (the schema
+cache reads this alone, §2.3 `"sg"`), whether the excision list
+follows, and whether the transaction entity's `:db/txInstant` of the
+header's instant is the last datom, which the header then holds
+alone.
 
 `top` = `(t << 1) | added`. `v` is always followed only by fixed-width
 fields, so it is `key[prefix .. len - suffix]` with no length byte.
@@ -154,9 +172,9 @@ Keyword *values* (enums) are interned in `nx/idents` exactly like
 attributes and stored as 4-byte ids, so `:db/ident` refs and enum values
 are the same mechanism. They sort by id, not by text. An ident's text
 is a property of its id, not a datom value; a rename (§3 step 5) moves
-the old text to the retired names, which only the txlog decoder reads
-(an entry spells keywords by the names they had when it was written,
-or last rewritten by an excision, §4).
+the old text to the retired names, which only keep it from being minted
+again (a txlog entry holds keyword values by id, so `tx-range` spells
+them by their current names, §4).
 Since the text is an `nx/idents` key after its prefix byte, a keyword
 the store holds, as an ident or a value, is at most 4077 bytes
 (`idents.max_name_len`); a transaction that would mint a longer one is
@@ -191,11 +209,8 @@ goes in, and a read returns the language's integer for the stored
 value, a bignum past `±2^47`. An integer outside i64 is
 `:nextomic/value-type`, in tx-data, a lookup ref, a `datoms` component
 or an `index-range` bound. A key holds every long in the same 8
-bytes, and the txlog spells one past the fixnum range as the codec's
-bignum; neither changes the format number, and a reader that takes
-fixnum-range longs only refuses a wider one (`:nextomic/value-type`
-from an index, `:db/corrupted` from the txlog) rather than misreading
-it. String order is UTF-8 byte order,
+bytes, and the txlog every long as a zigzag LEB of up to ten. String
+order is UTF-8 byte order,
 which is code point order, not UTF-16 order; no Unicode normalization
 is applied.
 Type tags never compare equal across types, so `1` and `1.0` are
@@ -621,7 +636,11 @@ pulls the component whole, in a view before that.
 
 The txlog is the change feed: `(d/tx-range conn from to)` scans
 `nx/txlog` over `from ≤ t < to`; a bound that is `nil` or not given is
-open.
+open. Each entry's keyword values are ident ids, spelled by their
+current names, and each out-of-line value is read from its datom's
+index row: the current EAVT row while that assertion is current, else
+its EAVT-h row, a retraction's being the assertion before it. An entry
+whose datom's row is gone is `:db/corrupted`.
 
 **Excision.** `(d/excise! conn e)` removes every datom whose entity is
 `e`, current and history, from all eight index trees;
@@ -633,8 +652,9 @@ when the attribute is given), the other trees one key at a time from a
 scan of the entity's EAVT-h and EAVT rows, which together are every
 assertion and retraction it had; the per-attribute counts drop by the
 current rows removed. Every txlog entry that held one of the datoms is
-rewritten without them and marked `{:excised [e ...]}`, the marker
-accumulating across excisions; an emptied entry keeps its place, its
+rewritten without their rows, its others kept as stored, and marked
+with `e` (`:excised [e ...]` in `tx-range`), the marker accumulating
+across excisions; an emptied entry keeps its place, its
 instant and its marker, and the excising transaction's own entry
 carries the marker too, so `tx-range` replays the same transactions
 with the datoms gone. Every view is affected alike, a db-value taken

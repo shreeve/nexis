@@ -341,16 +341,13 @@ pub const Conn = struct {
     /// attribute-partition entity. Each entry is read once per
     /// connection: the cache then serves `upto`.
     fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
         var start: [key.id_len]u8 = undefined;
         key.writeId(&start, after + 1);
         var end: [key.id_len]u8 = undefined;
         key.writeId(&end, upto + 1);
         var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
         while (try s.next()) |kv| {
-            defer _ = arena_state.reset(.retain_capacity);
-            if (try datom_mod.touchesAttrPartition(arena_state.allocator(), kv.value)) return true;
+            if (try datom_mod.touchesAttrPartition(kv.value)) return true;
         }
         return false;
     }
@@ -731,8 +728,8 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     const now = try conn.store.readT(txn);
     const schema = try conn.schemaAt(txn, now, now);
 
-    var ctx = TxCtx{ .conn = conn, .txn = txn, .schema = schema };
-    const ids: datom_mod.IdSource = .{ .ctx = @ptrCast(&ctx), .identId = &TxCtx.identId, .attrType = &TxCtx.attrType };
+    var ctx = TxCtx{ .conn = conn, .txn = txn, .schema = schema, .arena = arena };
+    const src: datom_mod.Source = .{ .ctx = @ptrCast(&ctx), .attrType = &TxCtx.attrType, .payload = &TxCtx.payload };
 
     var start: [key.id_len]u8 = undefined;
     key.writeId(&start, @max(from, 1));
@@ -747,7 +744,7 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     while (try s.next()) |kv| {
         if (kv.key.len != key.id_len) return error.Corrupted;
         const t = try key.readT(kv.key[0..key.id_len]);
-        const entry = try datom_mod.decodeTxlog(arena, kv.value, t, ids);
+        const entry = try datom_mod.decodeTxlog(arena, kv.value, t, src);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
     return out.toOwnedSlice(arena);
@@ -757,19 +754,29 @@ const TxCtx = struct {
     conn: *Conn,
     txn: *Txn,
     schema: *Schema,
-
-    /// An entry spells a keyword by the name it had when written; a
-    /// name retired by a rename still decodes to its id.
-    fn identId(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
-        const self: *TxCtx = @ptrCast(@alignCast(ctx));
-        if (try self.conn.idents.idOfName(self.txn, name)) |id| return id;
-        return self.conn.store.retiredIdentId(self.txn, name);
-    }
+    arena: Allocator,
 
     fn attrType(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
         const self: *TxCtx = @ptrCast(@alignCast(ctx));
         const attr = self.schema.attr(a) orelse return null;
         return attr.value_type;
+    }
+
+    /// An out-of-line value's payload from its datom's row: the current
+    /// EAVT row when it is the assertion at `t`, else the EAVT-h row
+    /// (NEXTOMIC.md §2.2). A datom of the log whose row is gone is
+    /// `error.Corrupted`.
+    fn payload(ctx: *anyopaque, e: u64, a: u32, vbytes: []const u8, t: u64, added: bool) anyerror![]const u8 {
+        const self: *TxCtx = @ptrCast(@alignCast(ctx));
+        const store = self.conn.store;
+        if (added) {
+            const k = try key.keyBytes(self.arena, .eavt, e, a, vbytes, null);
+            if (try self.txn.getFromTree(store.trees.cur(.eavt), k)) |row| {
+                if (row.len <= key.id_len) return error.Corrupted;
+                if (try key.readT(row[0..key.id_len]) == t) return row[key.id_len..];
+            }
+        }
+        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added }, self.arena);
     }
 };
 
