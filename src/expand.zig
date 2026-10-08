@@ -495,20 +495,32 @@ fn bindParams(scope: *Scope, params: []const *Form) ExpandError!void {
     }
 }
 
-/// `(fn* name? [params] body...)`: the body expands with the name
-/// and the parameters in scope; the parameter vector does not expand
-/// and loses its hints.
+/// `(fn* name? [params] body...)` or `(fn* name? ([params] body...)+)`:
+/// each body expands with the name and its clause's parameters in
+/// scope; a parameter vector does not expand and loses its hints.
 fn expandFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const name: []const *Form = if (items.len > 1 and items[1].datum == .symbol) items[1..2] else &.{};
     const rest = items[1 + name.len ..];
     if (rest.len == 0) return ctx.fail(list_form.origin, "fn*: expected a parameter vector", .{});
-    const params = try stripParams(ctx, rest[0]);
+    const b = Builder{ .ctx = ctx, .origin = list_form.origin };
+    if (rest[0].datum != .list) return makeList(ctx, try b.items(.{ items[0], name, try fnStarClause(ctx, name, rest) }), list_form.origin);
+    const clauses = try ctx.allocator.alloc(*Form, rest.len);
+    for (rest, clauses) |clause, *out| {
+        if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "fn*: expected a clause ([params] body...), not {s}", .{describeForm(clause)});
+        out.* = try makeList(ctx, try fnStarClause(ctx, name, clause.datum.list), clause.origin);
+    }
+    return makeList(ctx, try b.items(.{ items[0], name, clauses }), list_form.origin);
+}
+
+/// `[params] body...` of a `fn*` with `body` expanded.
+fn fnStarClause(ctx: *ExpandContext, name: []const *Form, forms: []const *Form) ExpandError![]*Form {
+    const params = try stripParams(ctx, forms[0]);
     if (params.datum != .vector) return ctx.fail(params.origin, "fn*: expected a parameter vector, not {s}", .{describeForm(params)});
     var scope: Scope = .{ .ctx = ctx };
     defer scope.close();
     try bindParams(&scope, name);
     try bindParams(&scope, params.datum.vector);
-    return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{ items[0], name, params, try expandAll(ctx, rest[1..]) }), list_form.origin);
+    return (Builder{ .ctx = ctx, .origin = forms[0].origin }).items(.{ params, try expandAll(ctx, forms[1..]) });
 }
 
 /// `(letfn* [(name params-or-clauses body...) ...] body...)`: every

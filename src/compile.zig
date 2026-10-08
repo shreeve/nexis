@@ -96,19 +96,15 @@ const Tiny = union(enum) {
     let_star: Scope,
     /// `(do e...)`: the value of the last, nil when empty.
     do_: []const *const Tiny,
-    /// `(fn* name? [params... & rest?] body)`.
+    /// `(fn* name? [params... & rest?] body)`, or `(fn* name?
+    /// ([params...] body)+)` with a clause per arity.
     fn_star: struct {
-        /// The self-name the body may refer to (COMPILER.md §5.5).
+        /// The self-name the bodies may refer to (COMPILER.md §5.5).
         name: ?[]const u8 = null,
-        params: []const []const u8,
-        /// Bound at slot `params.len`, to the list of the arguments
-        /// past the fixed ones (VM.md §6).
-        rest_param: ?[]const u8 = null,
-        body: *const Tiny,
-        /// Per parameter (the rest parameter last): whether a
-        /// closure in the body captures it, so it is boxed on entry.
-        captured: []const bool = &.{},
-        /// Whether the body refers to `name`, which then needs a
+        /// In source order; more than one compile to a routine each
+        /// over one arity table (VM.md §5).
+        clauses: []const Clause,
+        /// Whether a body refers to `name`, which then needs a
         /// placeholder cell (COMPILER.md §5.5).
         self_referenced: bool = false,
     },
@@ -117,8 +113,9 @@ const Tiny = union(enum) {
         callee: *const Tiny,
         args: []const *const Tiny,
     },
-    /// A call of the enclosing `fn*`'s self-name with its fixed arity,
-    /// from its own body: `call:self` (COMPILER.md §5.5).
+    /// A call of the enclosing `fn*`'s self-name with a fixed arity of
+    /// one of its clauses, from a body of its own: `call:self`
+    /// (COMPILER.md §5.5).
     self_call: []const *const Tiny,
     /// `(k target)` or `(k target default)`, `k` a keyword or symbol
     /// literal: `call:lookup` or `call:lookup-or` (COMPILER.md §4.3).
@@ -145,8 +142,9 @@ const Tiny = union(enum) {
         ns: ?[]const u8 = null,
         name: []const u8,
     },
-    /// `(letfn* [(name [params] body...) ...] body)`: every name is
-    /// visible to every function and the body (COMPILER.md §5.6b).
+    /// `(letfn* [(name [params] body...) ...] body)`, an entry with a
+    /// clause per arity as `fn*` takes them: every name is visible to
+    /// every function and the body (COMPILER.md §5.6b).
     letfn_star: struct {
         bindings: []const FnBinding,
         body: *const Tiny,
@@ -213,16 +211,23 @@ const inlined_ops = [_]Inlined{
     .{ .name = "dec", .argc = 1, .op = .sub, .one = true },
 };
 
+/// One arity of a `fn*` or a `letfn*` binding.
+const Clause = struct {
+    params: []const []const u8,
+    /// Bound at slot `params.len`, to the list of the arguments past
+    /// the fixed ones (VM.md §6).
+    rest_param: ?[]const u8 = null,
+    body: *const Tiny,
+    /// Per parameter (the rest parameter last): whether a closure in
+    /// the body captures it, so it is boxed on entry.
+    captured: []const bool = &.{},
+};
+
 /// One binding in a `letfn*` form. Each is a function
 /// definition (mutually visible across the binding group).
 const FnBinding = struct {
     name: []const u8,
-    params: []const []const u8,
-    /// `& rest` binding name, when the fn is variadic.
-    rest_param: ?[]const u8 = null,
-    body: *const Tiny,
-    /// As `Tiny.fn_star.captured`.
-    captured: []const bool = &.{},
+    clauses: []const Clause,
 };
 
 /// The sequential bindings and body of a `let*` or `loop*`.
@@ -1780,10 +1785,11 @@ const Lexical = struct {
     refs: ?*u32,
     /// The `fn*` nesting depth the binding is made at.
     fn_depth: u32,
-    /// For a `fn*` self-name, the fixed arity of a body without a rest
-    /// parameter: a call of the name with that many arguments, directly
-    /// in the body, is a self-call and no capture (COMPILER.md §5.5).
-    self_arity: ?usize = null,
+    /// For a `fn*` self-name, the fixed arity of each clause without a
+    /// rest parameter: a call of the name with that many arguments,
+    /// directly in a body of the fn, is a self-call and no capture
+    /// (COMPILER.md §5.5).
+    self_arities: []const usize = &.{},
 };
 
 /// Whether `name` is lexically bound here; a binding made outside
@@ -1987,7 +1993,7 @@ fn lowerList(
         const name = items[0].datum.symbol.name;
         // Special forms are reserved: no binding shadows them.
         if (lowerings.get(name)) |lower| return lower(allocator, items[1..], ctx);
-        if (ctx.lexicals.lookup(name)) |hit| if (hit.self_arity == items.len - 1 and hit.fn_depth + 1 == ctx.fn_depth) {
+        if (ctx.lexicals.lookup(name)) |hit| if (std.mem.findScalar(usize, hit.self_arities, items.len - 1) != null and hit.fn_depth + 1 == ctx.fn_depth) {
             const args = try allocator.alloc(*const Tiny, items.len - 1);
             for (items[1..], args) |item, *arg| arg.* = try lowerForm(allocator, item, ctx);
             return try allocTiny(allocator, .{ .self_call = args });
@@ -2384,9 +2390,10 @@ fn lowerRecur(
     return try allocTiny(allocator, .{ .recur = .{ .args = recur_args } });
 }
 
-/// `(fn* name? [params... & rest?] body...)`. Optional self-name
-/// detected by checking whether the FIRST arg after `fn*` is a
-/// symbol (vs the param vector).
+/// `(fn* name? [params... & rest?] body...)` or `(fn* name? ([params...
+/// & rest?] body...)+)`. Optional self-name detected by checking
+/// whether the FIRST arg after `fn*` is a symbol (vs the parameter
+/// vector or the first clause).
 fn lowerFnStar(
     allocator: std.mem.Allocator,
     args: []const *reader_mod.Form,
@@ -2401,10 +2408,9 @@ fn lowerFnStar(
         self_name = try expectUnqualifiedSymbol(args[0]);
         pos = 1;
     }
-    const param_vec = try expectVector(args[pos]);
-    const parsed = try parseParams(allocator, param_vec);
+    const parsed = try parseClauses(allocator, args[pos..]);
 
-    // The self-name belongs to the enclosing scope, so the body's
+    // The self-name belongs to the enclosing scope, so the bodies'
     // references to it are captures of a placeholder cell.
     var self_referenced = false;
     const mark = ctx.lexicals.mark();
@@ -2413,19 +2419,77 @@ fn lowerFnStar(
         .captured = &self_referenced,
         .refs = null,
         .fn_depth = ctx.fn_depth,
-        // A block past `chunk_items` arguments may need the chunked
-        // call, which needs the callee in a slot.
-        .self_arity = if (parsed.rest_param == null and parsed.params.len <= chunk_items) parsed.params.len else null,
+        .self_arities = try selfArities(allocator, parsed),
     });
-    const fn_body = try lowerFnBody(allocator, parsed, args[pos + 1 ..], ctx);
     return try allocTiny(allocator, .{ .fn_star = .{
         .name = self_name,
-        .params = parsed.params,
-        .rest_param = parsed.rest_param,
-        .body = fn_body.body,
-        .captured = fn_body.captured,
+        .clauses = try lowerClauses(allocator, parsed, ctx),
         .self_referenced = self_referenced,
     } });
+}
+
+/// One arity of a `fn*` as read: its parameters and its body forms.
+const ParsedClause = struct {
+    params: ParsedParams,
+    body: []const *reader_mod.Form,
+};
+
+/// What follows a `fn*`'s name, or a `letfn*` entry's: a parameter
+/// vector and a body, or one or more clauses `([params...] body...)`.
+/// The clauses keep Clojure's rules (COMPILER.md §5.5): no two take
+/// the same fixed count, at most one has a rest parameter, and its
+/// fixed count is at least every other clause's.
+fn parseClauses(allocator: std.mem.Allocator, forms: []const *reader_mod.Form) CompileError![]const ParsedClause {
+    if (forms.len == 0) return CompileError.ExpectedVector;
+    if (forms[0].datum != .list) {
+        const one = try allocator.alloc(ParsedClause, 1);
+        one[0] = .{ .params = try parseParams(allocator, try expectVector(forms[0])), .body = forms[1..] };
+        return one;
+    }
+    const clauses = try allocator.alloc(ParsedClause, forms.len);
+    var rest_fixed: ?usize = null;
+    for (forms, clauses, 0..) |form, *c, i| {
+        const items = switch (form.datum) {
+            .list => |items| items,
+            else => return CompileError.MalformedForm,
+        };
+        if (items.len == 0) return CompileError.MalformedForm;
+        c.* = .{ .params = try parseParams(allocator, try expectVector(items[0])), .body = items[1..] };
+        const fixed = c.params.params.len;
+        if (c.params.rest_param != null) {
+            if (rest_fixed != null) return CompileError.MalformedForm;
+            rest_fixed = fixed;
+        }
+        for (clauses[0..i]) |before| {
+            if (before.params.rest_param == null and c.params.rest_param == null and before.params.params.len == fixed) return CompileError.MalformedForm;
+        }
+    }
+    if (rest_fixed) |r| for (clauses) |c| {
+        if (c.params.rest_param == null and c.params.params.len > r) return CompileError.MalformedForm;
+    };
+    return clauses;
+}
+
+/// The fixed arities a self-call may name (COMPILER.md §5.5): every
+/// clause's without a rest parameter, at most `chunk_items`, since a
+/// longer block may need the chunked call, which needs the callee in
+/// a slot.
+fn selfArities(allocator: std.mem.Allocator, clauses: []const ParsedClause) CompileError![]const usize {
+    var arities: std.ArrayList(usize) = .empty;
+    for (clauses) |c| {
+        if (c.params.rest_param == null and c.params.params.len <= chunk_items) try arities.append(allocator, c.params.params.len);
+    }
+    return arities.items;
+}
+
+/// Each clause's body over its parameters.
+fn lowerClauses(allocator: std.mem.Allocator, parsed: []const ParsedClause, ctx: LowerCtx) CompileError![]const Clause {
+    const clauses = try allocator.alloc(Clause, parsed.len);
+    for (parsed, clauses) |p, *c| {
+        const fn_body = try lowerFnBody(allocator, p.params, p.body, ctx);
+        c.* = .{ .params = p.params.params, .rest_param = p.params.rest_param, .body = fn_body.body, .captured = fn_body.captured };
+    }
+    return clauses;
 }
 
 /// A `fn*` body over `params`, and which parameters closures in it
@@ -2448,7 +2512,8 @@ fn lowerFnBody(
 }
 
 /// `(letfn* [(name [params] body...) ...] body...)`. Each
-/// binding entry is itself a list of (name param-vector body...).
+/// binding entry is itself a list of (name param-vector body...), or
+/// of (name clause...) with clauses as `fn*` takes them.
 /// All binding names are mutually visible across all fn bodies
 /// AND across the letfn body.
 fn lowerLetFnStar(
@@ -2465,7 +2530,7 @@ fn lowerLetFnStar(
     var names_captured = false;
     const mark = ctx.lexicals.mark();
     defer ctx.lexicals.restore(mark);
-    const parsed = try allocator.alloc(ParsedParams, binding_vec.len);
+    const parsed = try allocator.alloc([]const ParsedClause, binding_vec.len);
     for (binding_vec, 0..) |entry, i| {
         const entry_items = switch (entry.datum) {
             .list => |items| items,
@@ -2473,15 +2538,11 @@ fn lowerLetFnStar(
         };
         if (entry_items.len < 2) return CompileError.MalformedForm;
         const name = try expectUnqualifiedSymbol(entry_items[0]);
-        parsed[i] = try parseParams(allocator, try expectVector(entry_items[1]));
+        parsed[i] = try parseClauses(allocator, entry_items[1..]);
         try ctx.bind(allocator, name, &names_captured, null);
-        bindings[i] = .{ .name = name, .params = parsed[i].params, .rest_param = parsed[i].rest_param, .body = undefined };
+        bindings[i] = .{ .name = name, .clauses = &.{} };
     }
-    for (binding_vec, bindings, parsed) |entry, *b, params| {
-        const fn_body = try lowerFnBody(allocator, params, entry.datum.list[2..], ctx);
-        b.body = fn_body.body;
-        b.captured = fn_body.captured;
-    }
+    for (bindings, parsed) |*b, clauses| b.clauses = try lowerClauses(allocator, clauses, ctx);
     const body = try lowerBody(allocator, args[1..], ctx);
     return try allocTiny(allocator, .{ .letfn_star = .{ .bindings = bindings, .body = body } });
 }
@@ -3180,10 +3241,7 @@ fn compileExpr(
         .fn_star => |f| try compileFn(e, .{
             .self_name = f.name,
             .display_name = f.name,
-            .params = f.params,
-            .rest_param = f.rest_param,
-            .body = f.body,
-            .captured = f.captured,
+            .clauses = f.clauses,
             .self_referenced = f.self_referenced,
         }, dst),
         .call => |c| try compileCall(e, c.callee, c.args, dst),
@@ -4124,10 +4182,13 @@ fn readsName(t: *const Tiny, name: []const u8) CompileError!bool {
             break :blk try readsName(l.body, name);
         },
         .letfn_star => |l| blk: {
-            for (l.bindings) |b| if (try readsName(b.body, name)) break :blk true;
+            for (l.bindings) |b| for (b.clauses) |c| if (try readsName(c.body, name)) break :blk true;
             break :blk try readsName(l.body, name);
         },
-        .fn_star => |f| try readsName(f.body, name),
+        .fn_star => |f| blk: {
+            for (f.clauses) |c| if (try readsName(c.body, name)) break :blk true;
+            break :blk false;
+        },
         .call => |c| try readsName(c.callee, name) or try any(c.args, name),
         .self_call => |args| any(args, name),
         .lookup => |l| any(l.args, name),
@@ -4208,38 +4269,88 @@ fn compileEffect(e: *Emitter, t: *const Tiny) CompileError!void {
 /// What `compileFn` builds a routine from: a `fn*`, or a `letfn*`
 /// binding, which has no self-name (its name's cell is in scope).
 const FnSpec = struct {
-    /// The self-name the body may refer to.
+    /// The self-name the bodies may refer to.
     self_name: ?[]const u8 = null,
     /// What traces and the disassembler call the routine.
     display_name: ?[]const u8 = null,
-    params: []const []const u8,
-    rest_param: ?[]const u8,
-    body: *const Tiny,
-    /// Per parameter, the rest parameter last: captured by a
-    /// closure in the body.
-    captured: []const bool,
+    clauses: []const Clause,
     self_referenced: bool = false,
 };
 
-/// Lower a `fn*` (COMPILER.md §5.5): compile the body as a child
-/// routine whose free names resolve through this Emitter as
-/// captures, register it and its capture descriptor here, and emit
-/// `closure:make`. A body that refers to its self-name gets a
-/// placeholder cell, allocated before the child is compiled so the
-/// child can capture it, and filled with the closure after
-/// `closure:make`.
+/// Lower a `fn*` (COMPILER.md §5.5): compile each clause's body as a
+/// child routine whose free names resolve through this Emitter as
+/// captures, register the first and its capture descriptor here, and
+/// emit `closure:make`. Two clauses or more share one arity table
+/// (VM.md §5), and every clause's child starts from the captures the
+/// clauses before it made, so a name keeps its upvalue in every
+/// clause and one closure's cells serve them all. A body that refers
+/// to its self-name gets a placeholder cell, allocated before the
+/// children are compiled so they can capture it, and filled with the
+/// closure after `closure:make`.
 fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
-    const count = f.params.len + @intFromBool(f.rest_param != null);
-    const names = try parent.allocator.alloc([]const u8, count);
-    defer parent.allocator.free(names);
-    @memcpy(names[0..f.params.len], f.params);
-    if (f.rest_param) |rp| names[count - 1] = rp;
-
     var self_cell_slot: u12 = 0;
     if (f.self_referenced) {
         self_cell_slot = try parent.allocSlot();
         try parent.emit(vm.asm_.closureNewCell(self_cell_slot));
     }
+
+    var shared: Captures = .{};
+    defer shared.deinit(parent.allocator);
+    // The self-name is upvalue 0, sourced from the placeholder cell.
+    if (f.self_referenced) {
+        try shared.sources.append(parent.allocator, .{ .local_cell_slot = self_cell_slot });
+        try shared.names.append(parent.allocator, .{ .name = f.self_name.?, .upvalue = 0 });
+    }
+    const routines = try parent.out.alloc(vm.Routine, f.clauses.len);
+    for (f.clauses, routines) |clause, *r| r.* = try compileClause(parent, f, clause, &shared);
+
+    const upvalue_count: u16 = @intCast(shared.sources.items.len);
+    for (routines) |*r| r.upvalue_count = upvalue_count;
+    if (routines.len > 1) {
+        // `parseClauses` kept Clojure's rules, so the table is one
+        // `verify` takes: each fixed clause at its count, the rest
+        // clause at or past every one.
+        var len: usize = 0;
+        for (routines) |r| if (!r.variadic) {
+            len = @max(len, @as(usize, r.fixed_arity) + 1);
+        };
+        const fixed = try parent.out.alloc(?*const vm.Routine, len);
+        @memset(fixed, null);
+        const table = try parent.out.create(vm.Arities);
+        table.* = .{ .fixed = fixed };
+        for (routines) |*r| {
+            if (r.variadic) table.rest = r else fixed[r.fixed_arity] = r;
+            r.arities = table;
+        }
+    }
+    const sources = try parent.out.dupe(vm.CaptureSource, shared.sources.items);
+    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .routine = &routines[0], .sources = sources });
+    try parent.emit(vm.asm_.closureMake(cap_desc_idx, dst));
+    if (f.self_referenced) {
+        try parent.emit(vm.asm_.closureInitCell(self_cell_slot, vm.Operand.slot(dst)));
+    }
+}
+
+/// The captures every clause of one `fn*` shares, in upvalue order.
+const Captures = struct {
+    sources: std.ArrayList(vm.CaptureSource) = .empty,
+    names: std.ArrayList(CapturedName) = .empty,
+
+    fn deinit(self: *Captures, allocator: std.mem.Allocator) void {
+        self.sources.deinit(allocator);
+        self.names.deinit(allocator);
+    }
+};
+
+/// One clause of `f` as a routine of its own, its upvalue count left
+/// for `compileFn`: a child Emitter that starts from `shared` and
+/// leaves there every capture it adds.
+fn compileClause(parent: *Emitter, f: FnSpec, clause: Clause, shared: *Captures) CompileError!vm.Routine {
+    const count = clause.params.len + @intFromBool(clause.rest_param != null);
+    const names = try parent.allocator.alloc([]const u8, count);
+    defer parent.allocator.free(names);
+    @memcpy(names[0..clause.params.len], clause.params);
+    if (clause.rest_param) |rp| names[count - 1] = rp;
 
     // `defer`, not `errdefer`: `finish` hands the code and pools
     // over, but the scope and capture lists keep their capacity.
@@ -4255,12 +4366,8 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     child.is_fn = true;
     child.fn_name = f.display_name;
     defer child.deinit();
-
-    // The self-name is upvalue 0, sourced from the placeholder cell.
-    if (f.self_referenced) {
-        try child.captures.append(child.allocator, .{ .local_cell_slot = self_cell_slot });
-        try child.captured_names.append(child.allocator, .{ .name = f.self_name.?, .upvalue = 0 });
-    }
+    try child.captures.appendSlice(child.allocator, shared.sources.items);
+    try child.captured_names.appendSlice(child.allocator, shared.names.items);
 
     // Parameters take slots 0.., the rest parameter last, where the
     // VM puts the arguments; a captured one is boxed on entry.
@@ -4269,7 +4376,7 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     const slots = try parent.allocator.alloc(u12, count);
     defer parent.allocator.free(slots);
     for (names, 0..) |p, i| {
-        captured[i] = i < f.captured.len and f.captured[i];
+        captured[i] = i < clause.captured.len and clause.captured[i];
         slots[i] = try child.allocSlot();
         try child.bindLocal(p, slots[i], captured[i]);
     }
@@ -4286,35 +4393,30 @@ fn compileFn(parent: *Emitter, f: FnSpec, dst: u12) CompileError!void {
     };
     // The body returns on every path that does not recur or throw.
     const result_slot = try child.allocSlot();
-    try compileExpr(&child, f.body, result_slot, &fn_target);
+    try compileExpr(&child, clause.body, result_slot, &fn_target);
 
-    const sources = try parent.out.dupe(vm.CaptureSource, child.captures.items);
-    const upvalue_count: u16 = @intCast(child.captures.items.len);
+    shared.sources.clearRetainingCapacity();
+    try shared.sources.appendSlice(parent.allocator, child.captures.items);
+    shared.names.clearRetainingCapacity();
+    try shared.names.appendSlice(parent.allocator, child.captured_names.items);
     const child_compiled = try child.finish();
     // The routine lives on the compile allocator with the tree it
     // belongs to; its name is copied because it borrows from source
     // text that need not outlive the routine.
-    const child_routine = try parent.out.create(vm.Routine);
-    child_routine.* = .{
+    return .{
         .code = child_compiled.code,
         .consts = child_compiled.consts,
         .capture_descs = child_compiled.capture_descs,
         .tries = child_compiled.tries,
         .var_table = child_compiled.var_table,
         .slot_count = child_compiled.slot_count,
-        .fixed_arity = @intCast(f.params.len),
-        .variadic = f.rest_param != null,
-        .upvalue_count = upvalue_count,
+        .fixed_arity = @intCast(clause.params.len),
+        .variadic = clause.rest_param != null,
         .name = if (f.display_name) |n| try parent.out.dupe(u8, n) else "fn",
         .spans = child_compiled.spans,
         .origin = if (parent.current_span) |sp| toSourceSpan(sp) else null,
         .source = parent.source,
     };
-    const cap_desc_idx = try parent.addCaptureDescriptor(.{ .routine = child_routine, .sources = sources });
-    try parent.emit(vm.asm_.closureMake(cap_desc_idx, dst));
-    if (f.self_referenced) {
-        try parent.emit(vm.asm_.closureInitCell(self_cell_slot, vm.Operand.slot(dst)));
-    }
 }
 
 /// Lower `letfn*` per COMPILER.md §5.6b: mutually-recursive
@@ -4383,13 +4485,7 @@ fn compileLetFnStar(
         // is already in scope (so the fn body's references
         // resolve via parent-chain capture); using the
         // self-name machinery here would double-allocate.
-        try compileFn(e, .{
-            .display_name = b.name,
-            .params = b.params,
-            .rest_param = b.rest_param,
-            .body = b.body,
-            .captured = b.captured,
-        }, cs);
+        try compileFn(e, .{ .display_name = b.name, .clauses = b.clauses }, cs);
     }
 
     // 3. Init each cell with its closure.

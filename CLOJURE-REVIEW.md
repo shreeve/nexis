@@ -40,8 +40,12 @@ differ, PLAN wins.
 
 Clojure's compiler knows a small set of special forms; `let`, `fn`,
 `loop`, `letfn` and `defn` are macros over `let*`, `fn*`, `loop*` and
-`letfn*`, and all destructuring, arity dispatch and docstrings live in
-the macros. nexis keeps the split (§23 #31). The difference is where
+`letfn*`, and destructuring and docstrings live in the macros, while
+`fn*` itself takes a clause per arity, `(fn* name? ([params] body)+)`,
+which the compiler makes one method each. nexis keeps the split (§23
+#31) and the clauses: a `fn*` with several compiles to a routine per
+clause over one arity table, and a call enters the clause its count
+picks (`docs/COMPILER.md` §5.5, `docs/VM.md` §5). The difference is where
 the macros live: `let`, `fn`, `loop`, `defn`, `cond`, `->` and the
 other surface forms are host macros written in Zig in the expander,
 complete from the start; `core.clj`'s two-stage bootstrap (a trivial
