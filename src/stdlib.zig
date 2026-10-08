@@ -3013,8 +3013,10 @@ const SortOrder = struct {
     comparator: ?*vm_mod.Callback,
 
     /// `a` and `b` are on `sortImpl`'s root scope (GC.md §11.5,
-    /// class 4).
-    fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
+    /// class 4). Inline in each of `mergeSort`'s two instances, so
+    /// the fixnum test stays in the merge loop: called, it adds half
+    /// again to the million-int sort's instructions (PERF.md §3.34).
+    inline fn less(self: SortOrder, a: Value, b: Value) VmError!bool {
         const cmp = self.comparator orelse {
             // Two fixnums, the common key, compare in registers. Any
             // other pair reads `sorted`'s `OrderError!Order` as it is:
@@ -3038,63 +3040,79 @@ const SortOrder = struct {
 /// is what the result contains.
 const Keyed = struct { key: Value, val: Value };
 
+/// What the order compares of a sorted element: a `Value` itself, a
+/// `Keyed`'s key.
+inline fn sortKey(e: anytype) Value {
+    return if (@TypeOf(e) == Value) e else e.key;
+}
+
 /// Stable merge sort whose comparator may fail (it re-enters the
-/// VM for user comparators).
-fn mergeSort(items: []Keyed, scratch: []Keyed, order: SortOrder) VmError!void {
+/// VM for user comparators). Each merge copies its left half into
+/// `scratch`, which so needs `items.len / 2` slots, and merges into
+/// `items` from the front: the slot it writes is always before the
+/// right half's next unread one.
+fn mergeSort(comptime T: type, items: []T, scratch: []T, order: SortOrder) VmError!void {
     if (items.len < 2) return;
     const mid = items.len / 2;
-    try mergeSort(items[0..mid], scratch[0..mid], order);
-    try mergeSort(items[mid..], scratch[mid..], order);
-    @memcpy(scratch[0..items.len], items);
+    try mergeSort(T, items[0..mid], scratch, order);
+    try mergeSort(T, items[mid..], scratch, order);
+    const left = scratch[0..mid];
+    @memcpy(left, items[0..mid]);
     var i: usize = 0;
     var j: usize = mid;
     var k: usize = 0;
     while (i < mid and j < items.len) : (k += 1) {
-        if (try order.less(scratch[j].key, scratch[i].key)) {
-            items[k] = scratch[j];
+        if (try order.less(sortKey(items[j]), sortKey(left[i]))) {
+            items[k] = items[j];
             j += 1;
         } else {
-            items[k] = scratch[i];
+            items[k] = left[i];
             i += 1;
         }
     }
-    while (i < mid) : ({
-        i += 1;
-        k += 1;
-    }) items[k] = scratch[i];
-    while (j < items.len) : ({
-        j += 1;
-        k += 1;
-    }) items[k] = scratch[j];
+    // What is left of the right half is in place; the rest of the left
+    // fills the gap before it.
+    @memcpy(items[k..j], left[i..]);
 }
 
+/// Sort `items` in place through a scratch array of half its length.
+fn sortSlice(comptime T: type, vm: *VM, items: []T, order: SortOrder) VmError!void {
+    const scratch = vm.allocator.alloc(T, items.len / 2) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(scratch);
+    try mergeSort(T, items, scratch, order);
+}
+
+/// Sort `items` in place by `keyfn`'s key for each: the keys go on
+/// `scope` as they are made, since the next call may collect (GC.md
+/// §11.5, class 3).
+fn sortByKey(vm: *VM, keyfn: Value, items: []Value, scope: vm_mod.RootScope, order: SortOrder) VmError!void {
+    const keyed = vm.allocator.alloc(Keyed, items.len) catch return VmError.OutOfMemory;
+    defer vm.allocator.free(keyed);
+    var cb = vm_mod.Callback.init(vm, keyfn, 1);
+    for (items, keyed) |v, *k| {
+        k.* = .{ .key = try cb.call1(v), .val = v };
+        try scope.push(k.key);
+    }
+    try sortSlice(Keyed, vm, keyed, order);
+    for (keyed, items) |e, *v| v.* = e.val;
+}
+
+/// The elements are sorted where they were gathered, alone when there
+/// is no key function, and the result built from them (PERF.md §3.34).
 fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError!Value {
     // `compare` is the natural order, without a call per comparison,
     // as sorted collections take it (`comparatorArg`).
     const comparator: ?Value = if (comparator_arg) |c| (if (c.kind() == .native_fn and comparatorArg(c).isNil()) null else c) else null;
     var items = try collectSeq(vm, coll);
     defer items.deinit(vm.allocator);
-    const keyed = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(keyed);
-    const scratch = vm.allocator.alloc(Keyed, items.items.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(scratch);
     const scope = vm.rootScope();
     defer scope.release();
     // A map's entries were built by the walk and are reachable from
     // nothing else while the key function or comparator runs.
     if (keyfn != null or comparator != null) try scope.pushAll(items.items);
-    if (keyfn) |kf| {
-        var cb = vm_mod.Callback.init(vm, kf, 1);
-        for (items.items, keyed) |v, *k| {
-            k.* = .{ .key = try cb.call1(v), .val = v };
-            try scope.push(k.key);
-        }
-    } else for (items.items, keyed) |v, *k| {
-        k.* = .{ .key = v, .val = v };
-    }
     var cmp_cb = if (comparator) |c| vm_mod.Callback.init(vm, c, 2) else undefined;
-    try mergeSort(keyed, scratch, .{ .interner = vm.ensureInterner(), .comparator = if (comparator != null) &cmp_cb else null });
-    for (keyed, 0..) |e, i| items.items[i] = e.val;
+    const order: SortOrder = .{ .interner = vm.ensureInterner(), .comparator = if (comparator != null) &cmp_cb else null };
+    if (keyfn) |kf| try sortByKey(vm, kf, items.items, scope, order) else try sortSlice(Value, vm, items.items, order);
     return try buildListFromSlice(vm, items.items);
 }
 

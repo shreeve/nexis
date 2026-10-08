@@ -75,7 +75,7 @@ the §3 rows.
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
 §3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5, as are §3.16 onward; §3.15 and §3.32's first tables on an Intel Core Ultra 9 185H under Linux;
+an Apple M5, as are §3.16 onward; §3.15 and the Linux tables of §3.32, §3.33 and §3.34 on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -397,8 +397,9 @@ What the rows say:
   - Startup retires 48.4 M instructions against 37.6 M (6.7 against
     5.9 ms): the embedded library is 66 KB against 44 KB, at about
     0.5 M instructions a KB.
-- Its resident set is below babashka's on every row but `sort`, which
-  sorts through about 80 MB of buffers outside the heap (§6).
+- Its resident set is below babashka's on every row but `sort`, whose
+  buffers outside the heap take about 80 MB in this build; §3.34 takes
+  them to 24 MB and the program's peak to 80 MB.
 - Nextomic is ahead of Datalevin on every phase: creating, opening,
   loading, lookups, joins, aggregates, pull and small transactions.
 - The default-commit rows compare different guarantees. A default
@@ -651,9 +652,8 @@ Every answer matched in every run. The time of every row is the same
 before and after within the runs' spread; every row's resident set
 falls by 35–43 MB, the root stack's and the worklist's retained
 capacity and the malloc'd buffers no longer there, and the pipeline's
-is under babashka's. `sort` still holds more: it gathers its elements
-into a malloc'd list and merge-sorts them through two more of pairs,
-80 MB beside its input for a million (§6, "`sort`'s buffers").
+is under babashka's. `sort` holds more in these builds: 80 MB of
+buffers beside its input for a million, which §3.34 takes to 24 MB.
 
 The trigger (`docs/GC.md` §7), set by hand on the after build, five
 runs each of the pipeline program, cycles and the phase's time:
@@ -738,7 +738,8 @@ What the language rows say:
   in 144 ms; built at `1489ef9`, which moves the tree to Zig 0.17 and
   leaves the sort code as it is, in 181 ms, the process retiring 1.4%
   fewer instructions in 21% more cycles. §3.32 compares the keys in
-  registers: 93–96 ms on this host.
+  registers: 93–96 ms on this host; §3.34 sorts the values alone,
+  through a scratch array of half of them: 54–56 ms.
 
 **Database.** 100 departments and 100,000 people with five attributes.
 The durability of each row (`docs/BENCH.md` §12, traced with `strace`):
@@ -1905,7 +1906,7 @@ What the rows say:
   range on both hosts.
 - The int sort runs in 93–96 ms on the Linux host, below the warm
   JVM Clojure figure of §3.15 (147 ms) and a quarter of babashka's
-  time; its resident set is unchanged (§6 "`sort`'s buffers").
+  time; its resident set is unchanged (its buffers are §3.34's).
 
 ### 3.33 Closures called from natives, Linux x86-64 and Apple M5
 
@@ -2017,6 +2018,95 @@ What the rows say:
   leaf native called through a Var (`(nth v i)`, `(even? x)`; §6
   "Inline caches at call sites").
 
+### 3.34 Sort's buffers, Linux x86-64 and Apple M5
+
+`sortImpl` (`src/stdlib.zig`) sorts the elements in the list it
+gathers them into: the values alone when there is no key function,
+and `{key, val}` pairs, whose values it writes back, when there is
+one. Each merge copies its left half into a scratch array and merges
+into place from the front, so the scratch array holds half the
+elements, and it is freed before the result is built. The before
+build's merge made the same comparisons in the same order, over pairs
+whatever the order, through a scratch array of pairs as long as the
+list, both halves copied into it. Outside the heap, for a million
+elements:
+
+| Call | before | after |
+|---|---:|---:|
+| `(sort v)` | 80 MB: the list 16, pairs 32, scratch 32 | 24 MB: the list 16, scratch 8 |
+| `(sort cmp v)` | 80 MB, the root stack 16 | 24 MB, the root stack 16 |
+| `(sort-by f v)` | 80 MB, the root stack 32 | 64 MB: the list 16, pairs 32, scratch 16; the root stack 32 |
+
+`SortOrder.less` is inline: `mergeSort` has an instance for values
+and one for pairs, and called from both, the fixnum test of §3.32
+leaves the merge loop, the million-int sort retiring 1,174 M
+instructions on the M5 against 778 M inline (the first a single run,
+the second the median of seven). Before
+is `fd5ef10`, after `45068cc`; one ReleaseFast build of each on each
+host. Provenance: §11.
+
+The programs: `bench/compare`'s `sort` (`prelude.nx` and
+`lang/sort.clj`: a million scrambled ints sorted, then `(vec
+sorted)`), the same `(sort v)` without the `vec`, `(sort-by - v)`,
+`(sort > v)`, and §3.32's 300,000 strings; each program's own phase
+time, the whole process's instructions, cycles and maximum resident
+set, the median of interleaved runs.
+
+Linux x86-64, `taskset -c 2`, `perf stat -e
+cpu_core/instructions/u,cpu_core/cycles/u` under GNU `time`, five
+rounds (load 1.5 → 2.3):
+
+| Program | phase | instructions | cycles | resident set |
+|---|---:|---:|---:|---:|
+| `sort`, the `bench/compare` row | 91.5 → 54.5 ms | 1,027.9 → 929.2 M | 372.2 → 258.0 M | 119.5 → 55.9 MB |
+| `(sort v)` | 83.1 → 46.1 ms | 943.2 → 844.6 M | 339.2 → 232.4 M | 119.3 → 55.4 MB |
+| `(sort-by - v)` | 106.6 → 93.5 ms | 1,074.9 → 1,129.9 M | 414.9 → 381.4 M | 151.4 → 118.6 MB |
+| `(sort > v)` | 218.8 → 179.1 ms | 3,238.3 → 2,969.1 M | 971.9 → 850.3 M | 135.4 → 71.4 MB |
+| 300,000 strings | 77.5 → 67.4 ms | 1,158.7 → 1,123.4 M | 409.9 → 382.5 M | 49.9 → 31.0 MB |
+
+Apple M5, `/usr/bin/time -l`, seven rounds under `tools/heavy` (the
+machine shared, load 22.0 → 20.3; a first seven-round run agrees
+within 1% on instructions and resident sets):
+
+| Program | phase | instructions | cycles | resident set |
+|---|---:|---:|---:|---:|
+| `sort`, the `bench/compare` row | 89.5 → 53.7 ms | 1,053.3 → 857.9 M | 292.9 → 216.8 M | 136.5 → 80.5 MB |
+| `(sort v)` | 71.3 → 43.7 ms | 964.6 → 772.6 M | 269.8 → 187.1 M | 120.1 → 64.1 MB |
+| `(sort-by - v)` | 77.8 → 70.6 ms | 1,088.8 → 1,040.3 M | 296.9 → 268.8 M | 152.1 → 112.1 MB |
+| `(sort > v)` | 188.1 → 159.8 ms | 2,891.4 → 2,563.4 M | 642.8 → 546.8 M | 136.1 → 80.1 MB |
+| 300,000 strings | 78.5 → 75.7 ms | 1,185.3 → 1,131.2 M | 299.6 → 281.9 M | 55.5 → 36.3 MB |
+
+The `sort` row of `bench/compare/run.clj --only lang --impls nexis,bb
+--workloads sort --n 10 --max-load 4 --pin 0-11` on the Linux host,
+two passes, before and after alternating (load 1.9 → 1.9):
+
+| Build | nexis | babashka | ÷ bb | wall: nexis / bb | RSS: nexis / bb |
+|---|---:|---:|---:|---:|---:|
+| before | 92.6, 92.1 ms | 330, 332 ms | 0.28, 0.28 | 118, 119 ms / 444, 448 ms | 119 / 116 MB |
+| after | 54.5, 55.6 ms | 331, 328 ms | 0.16, 0.17 | 82, 83 ms / 443, 443 ms | 56 / 116 MB |
+
+What the rows say:
+
+- Every program's resident set falls by what its buffers were: 56–64
+  MB for a million ints sorted by value, 33–40 MB by `sort-by`, 19 MB
+  for 300,000 strings. The `bench/compare` row peaks at 56 MB on the
+  Linux host, under babashka's 116 MB.
+- The time falls with it, most on x86-64: a merge step moves a 16-byte
+  value where it moved a 32-byte pair, a merge copies half its
+  elements where it copied all, and a million elements' buffers take
+  24 MB of cache where they took 80. The int sort 91.5 → 54.5 ms on
+  the Linux host, 0.16 of babashka's time, `(sort > v)` −18%, the
+  strings −13%.
+- `sort-by` retires 5% more instructions on x86-64 (4.5% fewer on the
+  M5), in the pairs' instance of the merge, and runs 12% faster.
+- On the M5 the `bench/compare` program peaks at `(vec sorted)`, 16 MB
+  above `(sort v)` alone: `vec` gathers a list's elements into a
+  malloc'd list and builds a new vector from it, where the list `sort`
+  returns is a view of a fresh vector (`docs/LIST.md` §1). A trial
+  build whose `vec` returns a view's vector as it is peaks at 64 MB
+  there, 788 M instructions against 864 M (one run, not in the tree;
+  §6 "`vec` of a vector's view").
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2068,13 +2158,15 @@ Each lever is a measured change: a before/after from `zig build bench`
   changes neither (§3.14's trigger table); the remaining measurement
   is a program whose live set stays flat while it allocates.
 
-- **`sort`'s buffers.** `sortImpl` gathers the elements into a
-  malloc'd list (16 bytes each) and sorts `{key, val}` pairs through a
-  scratch array of the same size (32 bytes each, twice), 80 MB for
-  §3.11's million ints, all resident at the peak; `(vec sorted)` then
-  gathers the result again. Sorting the values alone when there is no
-  key function, and building the result in place (`Results`), would
-  halve it; the measurement is §3.11's `sort` row with its RSS.
+- **`vec` of a vector's view.** `(vec s)` of a list gathers its
+  elements into a malloc'd list and builds a new vector from it. A
+  list that is a view of a vector from its first element
+  (`list.build`: what `sort` and the other natives that build a list
+  return, and `seq` of a vector) could give the vector itself, without
+  its metadata as `vec` of a vector does; `list.zig` keeps a view's
+  vector to itself. A trial build takes §3.34's `bench/compare` `sort`
+  program on the M5 from 80 to 64 MB, the peak of `(sort v)` alone,
+  and 864 to 788 M instructions.
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
 - **Inline caches at call sites**: a call through a Var is a `var:load-var` and a `call:call`, each reading
@@ -2105,6 +2197,13 @@ Each lever is a measured change: a before/after from `zig build bench`
 
 **Levers pulled.**
 
+- *`sort`'s buffers* (§3.34): `sort` and `sort-by` sort the elements
+  in the list they gather them into, the values alone without a key
+  function, each merge through a scratch array of half the elements;
+  outside the heap 80 → 24 MB for a million ints (64 MB for
+  `sort-by`). On the Linux host the `bench/compare` row 119 → 56 MB,
+  under babashka's 116 MB, and 92 → 55 ms; on the M5 136 → 80 MB and
+  90 → 54 ms.
 - *Closures called from natives* (§3.33, `docs/VM.md` §6): a
   `Callback`'s arguments and result move as words, in registers and
   in a cell of its own, and `reduce`, `mapv`, `filterv` and the lazy
@@ -2420,4 +2519,5 @@ is one invocation's 30-sample median.
 | §3.31 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08 01:27–01:42 MDT, consume: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `efff7a7` (before) and `193ad6d` (after, with `set` consuming, which the `set` comparison measures and which no other row runs). The memory rows: `cmds.py OUT 3` over the `count`, `into` and `vec` programs at 3 M and 30 M (`mem.*`, load 5.86 → 6.35) and over the `i64-vector`/`take-last` program (`mem2.*`, load 9.62 → 11.29); the `set` comparison `cmds.py OUT 3` (`mem3.*`, load 14.59 → 11.27); the `into` a hash set comparison `cmds.py OUT 5` against a build whose `into` is `193ad6d`'s (`mem4.*`, load 12.65 → 17.21). Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), load 6.89 → 7.89. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 7.67 → 9.58. Raw output: `.git/revamp/r3/consume/` (`mem*.txt`, `mem*.json`, `mem*.load`, `micro.*`, `cmp.*`) |
 | §3.32, §6 "Sort keys compared in registers" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 01:16–01:43 MDT, sortcmp: `bin/nexis` built by `zig build install -Doptimize=fast` from source snapshots of `efff7a7` (before), of `efff7a7` with the fixnum path alone (A), with the direct call alone (C) and with both (after, `8e6fbf5`'s code). Programs: `bench/compare/prelude.nx` with `lang/sort.clj`, and with the same body over `(mapv (fn [i] (str (mod (* i 7919) 1000003))) (range 300000))` (`sortstr.nx`, kept with the raw output). Linux: `perfpairs.sh`, each run `taskset -c 2 perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u bin/nexis run P`, the builds interleaved, five rounds, holding the host's benchmark lease (load 1.1 → 1.2, and 1.2 for the run with C); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads sort` from each snapshot, before, after, before, after (load 1.8 → 2.1); the merge loop's code from `objdump -d` of each build's `stdlib.mergeSort`. M5: `macpairs.sh`, each run `/usr/bin/time -l bin/nexis run P`, the builds interleaved, seven rounds under `tools/heavy` (1 core), load 5.4 → 5.1, and 17 for the run with C. Raw output: `.git/revamp/r3/sortcmp/` (`pup-perf-*.txt`, `mac-*.txt`, `runclj/`) |
 | §3.33, §6 "Closures called from natives" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 13:06–13:08 MDT, callback: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` from `0a420b8` (before), `ac1fd7c` (A1), `8645b10` (A2) and `37dad1e` (B), and with `-Dopcodes=true` at `0a420b8` and `37dad1e`; on the Linux host from source snapshots of `0a420b8`, `8645b10` and `37dad1e`. Micro kit: `bb bench/micro/run.clj --rounds 5` over the four builds under `tools/heavy` (1 core), load 11.3 → 14.8; each lever's own A/B run against the build before it is in its commit. The language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 14.7 → 17.4. Linux: `perfpairs.sh`, each run `taskset -c 2 perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P`, the builds interleaved, five rounds, holding the host's benchmark lease (load 1.1 → 1.2); `perf record -c 1009 -e cpu_core/ld_blocks.store_forward/u` and `-c 20011 -e cpu_core/cycles/u` of each row, and `perf annotate vm.VM.callPrepared`; `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads pipeline,vector-conj-nth` from each snapshot, before, after, before, after (load 1.3 → 1.4). Dispatch counts: every micro program at 100,000 (`fib` 20), both rows and a probe program, each build's CSV compared. Raw output: `.git/revamp/r3/callback/` (`micro-*.txt`, `micro-*.json`, `cmp.*`, `pup-*.txt`, `opcodes/`) |
+| §3.34, §6 "`sort`'s buffers" and "`vec` of a vector's view" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 15:36–15:57 MDT, sortbuf: `bin/nexis` built by `zig build install -Doptimize=fast` at `fd5ef10` (before) and `45068cc` (after), on the Linux host from source snapshots of each; on the M5 also the after code with `SortOrder.less` not inline, and a trial build whose `vec` returns a list view's vector, one run of each. Programs: `bench/compare/prelude.nx` with `lang/sort.clj`, with its body's `(sort xs)` alone (`sortonly.nx`), `(sort-by - xs)` (`sortby.nx`), `(sort > xs)` (`sortcmpf.nx`), and §3.32's `sortstr.nx`, kept with the raw output. Linux: `perfpairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u bin/nexis run P`, the builds interleaved, five rounds, holding the host's benchmark lease (load 1.5 → 2.3); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads sort` from each snapshot, before, after, before, after (load 1.9 → 1.9; its report names the `zig` on the path, not the one that built). M5: `macpairs.sh`, each run `/usr/bin/time -l bin/nexis run P`, the builds interleaved, seven rounds under `tools/heavy` (1 core), twice (load 22.9 → 22.8 and 22.0 → 20.3; the tables are the second). Raw output: `.git/revamp/r3/sortbuf/` (`pup-perf-1.txt`, `mac-*.txt`, `runclj/`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
