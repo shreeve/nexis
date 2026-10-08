@@ -399,14 +399,22 @@ for a closure the stack guard
 (§13.1), the frame cap and the room the frame chain and the stack
 need, since every call starts from the frame depth and stack length
 the first one found. Each later call of a closure writes the
-arguments and nil locals into the window at that stack length, pushes
+arguments and nil locals into the window at that stack length (one or
+two arguments, `call1` and `call2`, are stored straight from the
+native's registers; the locals are nil'd four at once, past the window
+when it is shorter, where the slots are dead), pushes
 the frame built at the first call and runs it as the loop would: the
 loop's depth and nesting are set, the safe point of the loop's entry
 taken, and the chain entered at the callee's first instruction, the
 frame the loop's first pass would run, so the pass needs no test. A
 pass that ends without an error has returned; one that ends with an
 error goes on to the loop, which takes the error as its own pass
-would (§8, §12). A call that finds the depth or the length changed
+would (§8, §12). The frame built at the first call returns into a
+result cell of the `Callback`'s own, so a call sets one flag in it
+rather than making a cell, and the native reads the value back a word
+at a time, the width the return stored it (§8); a callee that
+re-enters the native makes a `Callback`, and a cell, of its own. A
+call that finds the depth or the length changed
 goes through `callValue`. A leaf native is called as `callValue` calls it, and a
 keyword or symbol given one argument that is a map, a record or nil
 looks itself up in place (§8); any other callee, a closure the count

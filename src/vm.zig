@@ -1649,10 +1649,11 @@ pub const HostCallResult = struct {
     value: Value = value_mod.nilValue(),
 
     /// The returned value, once the loop is back at the call's depth:
-    /// without a return, a throw went past the call.
-    fn get(self: *const HostCallResult) VmError!Value {
+    /// without a return, a throw went past the call. Read a word at a
+    /// time, the width the return stored it (§8).
+    inline fn get(self: *const HostCallResult) VmError!Value {
         if (!self.done) return VmError.ControlTransferred;
-        return self.value;
+        return VM.loadWords(&self.value);
     }
 };
 
@@ -2099,7 +2100,8 @@ pub const DynSave = struct {
 /// arguments from the same place (`map`, `filter`, `reduce`, ...):
 /// `VM.callValue` with what cannot change between those calls decided
 /// at the first one (VM.md §6, "Repeated calls"). Each call has
-/// `callValue`'s effect, errors and rooting.
+/// `callValue`'s effect, errors and rooting. A prepared `Callback`
+/// is not moved: its frame names its own result cell.
 pub const Callback = struct {
     vm: *VM,
     callee: Value,
@@ -2107,10 +2109,18 @@ pub const Callback = struct {
     mode: Mode = .unprepared,
     /// For `.closure`: the frame chain's depth and the stack's length
     /// at the first call, which every later call from the same native
-    /// finds again, and the frame each call pushes.
+    /// finds again; where the callee's locals begin and how many there
+    /// are, which each call nils, and where its window ends; and the
+    /// frame each call pushes.
     depth: usize = 0,
     base: usize = 0,
+    locals: usize = 0,
+    nil_count: usize = 0,
+    window_end: usize = 0,
     frame: Frame = undefined,
+    /// The cell the prepared frame returns into: a callee that
+    /// re-enters the native makes a `Callback` and a cell of its own.
+    result: HostCallResult = .{},
 
     const Mode = enum { unprepared, general, leaf, lookup, closure };
 
@@ -2120,22 +2130,55 @@ pub const Callback = struct {
 
     /// `callee` applied to `args`, of which there are `argc`.
     pub inline fn call(self: *Callback, args: []const Value) VmError!Value {
-        std.debug.assert(args.len == self.argc);
+        return self.callWith(args.len, args);
+    }
+
+    /// `call` of a callback of one argument, which a closure's call
+    /// stores straight from the native's registers into the window.
+    pub inline fn call1(self: *Callback, x: Value) VmError!Value {
+        return self.callWith(1, [1]Value{x});
+    }
+
+    /// `call` of a callback of two arguments.
+    pub inline fn call2(self: *Callback, a: Value, b: Value) VmError!Value {
+        return self.callWith(2, [2]Value{ a, b });
+    }
+
+    /// `args` a slice, or an array of `n` values held in registers.
+    inline fn callWith(self: *Callback, n: usize, args: anytype) VmError!Value {
+        std.debug.assert(n == self.argc);
+        const by_value = @TypeOf(args) != []const Value;
         switch (self.mode) {
             .leaf => if (!self.vm.gcDue()) {
                 const native = asNativeFn(self.callee);
-                if (native.call(self.vm, args)) |r| {
+                if (native.call(self.vm, if (by_value) &args else args)) |r| {
                     countNative(native);
                     return r;
                 } else |err| if (err != VmError.NeedsReentry) return err;
             },
             .lookup => if (lookupInPlace(self.callee, args[0], value_mod.nilValue())) |v| return v,
-            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) return self.vm.callPrepared(self, args),
-            .unprepared => return self.prepare(args),
+            .closure => if (self.vm.frames.items.len == self.depth and self.vm.stack.items.len == self.base) {
+                // The arguments go where the window begins, past the
+                // stack's end, within the capacity the first call made,
+                // a word at a time, as the callee's handlers read them
+                // (§8).
+                const window = self.vm.stack.items.ptr + self.base;
+                if (by_value) {
+                    inline for (args, 0..) |arg, i| VM.storeWords(&window[i], arg);
+                } else for (args, window[0..args.len]) |*arg, *slot| {
+                    VM.copyWords(slot, arg);
+                }
+                try self.vm.callPrepared(self);
+                return self.result.get();
+            },
+            .unprepared => return self.prepare(if (by_value) &args else args),
             .general => {},
         }
-        return self.vm.callValue(self.callee, args);
+        return self.vm.callValue(self.callee, if (by_value) &args else args);
     }
+
+    /// How many locals `callPrepared` nils in one run.
+    const nil_run = 4;
 
     /// The first call: choose the mode, then make the call.
     fn prepare(self: *Callback, args: []const Value) VmError!Value {
@@ -2163,25 +2206,31 @@ pub const Callback = struct {
                 const window_end = base + routine.slot_count;
                 if (depth >= vm.max_frames) break :closure;
                 vm.frames.ensureUnusedCapacity(vm.allocator, 1) catch return VmError.OutOfMemory;
-                vm.stack.ensureTotalCapacity(vm.allocator, window_end) catch return VmError.OutOfMemory;
+                // Room for the locals `callPrepared` nils four at once.
+                const reach = @max(window_end, base + self.argc + nil_run);
+                vm.stack.ensureTotalCapacity(vm.allocator, reach) catch return VmError.OutOfMemory;
                 if (VM.track_high_water) {
                     vm.frame_high_water = @max(vm.frame_high_water, depth + 1);
                     vm.stack_high_water = @max(vm.stack_high_water, window_end);
                 }
                 self.depth = depth;
                 self.base = base;
+                self.locals = base + self.argc;
+                self.nil_count = routine.slot_count - self.argc;
+                self.window_end = window_end;
                 self.frame = .{
                     .routine = routine,
                     .base_slot = @intCast(base),
                     .entry_stack_len = @intCast(base),
                     .upvalues = closure.upvalues,
                     .closure = self.callee,
+                    .host_result = &self.result,
                 };
                 self.mode = .closure;
             },
             else => {},
         }
-        return self.call(args);
+        return self.callWith(args.len, args);
     }
 };
 
@@ -3117,41 +3166,43 @@ pub const VM = struct {
     }
 
     /// A `Callback`'s call of its closure, from the depth and stack
-    /// length it was prepared at: the arguments go where the window
-    /// begins, the locals start nil, the prepared frame is pushed and
-    /// runs until it returns, as `callValue`'s would under `loop`. The
-    /// loop's first pass is entered here at the callee's first
-    /// instruction, after the safe point `loop`'s entry is: the frame
-    /// is the one it would run, so the pass needs no test, and a pass
-    /// that ends without an error has returned. Only an error goes on
-    /// to the loop, which takes it as its own pass would.
-    fn callPrepared(self: *VM, cb: *const Callback, args: []const Value) VmError!Value {
-        const base = cb.base;
-        const routine = cb.frame.routine;
-        const window = self.stack.items.ptr[base..][0..routine.slot_count];
-        for (args, window[0..args.len]) |arg, *slot| slot.* = arg;
-        nilSlots(window[args.len..]);
-        self.stack.items.len = base + routine.slot_count;
-        var result_cell = HostCallResult{};
-        self.frames.items.len = cb.depth + 1;
-        const frame = &self.frames.items[cb.depth];
+    /// length it was prepared at, its arguments already in the window:
+    /// the locals start nil, the prepared frame is pushed and runs
+    /// until it returns into the callback's cell, as `callValue`'s
+    /// would under `loop`. The loop's first pass is entered here at
+    /// the callee's first instruction, after the safe point `loop`'s
+    /// entry is: the frame is the one it would run, so the pass needs
+    /// no test, and a pass that ends without an error has returned.
+    /// Only an error goes on to the loop, which takes it as its own
+    /// pass would. The value is read from the cell by the caller, a
+    /// word at a time as the return wrote it.
+    fn callPrepared(self: *VM, cb: *Callback) VmError!void {
+        const depth = cb.depth;
+        // The usual handful of locals in one run, whatever their count:
+        // a slot past the window is past the stack's length, dead.
+        const locals = self.stack.items.ptr + cb.locals;
+        locals[0..Callback.nil_run].* = @splat(value_mod.nilValue());
+        if (cb.nil_count > Callback.nil_run) nilSlots(locals[Callback.nil_run..cb.nil_count]);
+        self.stack.items.len = cb.window_end;
+        self.frames.items.len = depth + 1;
+        const frame = &self.frames.items[depth];
         frame.* = cb.frame;
-        frame.host_result = &result_cell;
+        std.debug.assert(frame.host_result == &cb.result);
+        cb.result.done = false;
         const outer = self.loop_depth;
-        self.loop_depth = cb.depth;
+        self.loop_depth = depth;
         self.nested_runs += 1;
         defer {
             self.loop_depth = outer;
             self.nested_runs -= 1;
         }
         if (self.gcDue()) self.collectGarbage();
-        const first = routine.code[0];
+        const first = cb.frame.routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         fast_table[opIndex(first)](self, frame, first, 1) catch |err| {
             try self.settle(err);
             try self.drive();
         };
-        return result_cell.get();
     }
 
     /// Call `callee`, anything but a closure, with `args`, to
@@ -3643,6 +3694,12 @@ pub const VM = struct {
     /// loadWords make the same point).
     inline fn loadWords(src: *const Value) Value {
         return .{ .tag = @as(*const volatile u64, &src.tag).*, .payload = @as(*const volatile u64, &src.payload).* };
+    }
+
+    /// `dst.* = v` a word at a time (`loadWords`).
+    inline fn storeWords(dst: *Value, v: Value) void {
+        @as(*volatile u64, &dst.tag).* = v.tag;
+        @as(*volatile u64, &dst.payload).* = v.payload;
     }
 
     /// `dst.* = src.*` a word at a time (`loadWords`).
@@ -9129,7 +9186,7 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
     var cb = Callback.init(&vm, inc_fn, 1);
     var i: i64 = 0;
     while (i < 1000) : (i += 1) {
-        try testing.expectEqual(i + 1, (try cb.call(&.{fx(i)})).asFixnum());
+        try testing.expectEqual(i + 1, (try cb.call1(fx(i))).asFixnum());
         try testing.expectEqual(frames, vm.frames.items.len);
         try testing.expectEqual(stack, vm.stack.items.len);
     }
@@ -9152,7 +9209,7 @@ test "Callback: repeated calls have callValue's results, errors and frame bookke
 
     // A leaf native, and a keyword over every kind of receiver.
     var sub = Callback.init(&vm, nativeFnValue(&dispatch_test_natives.native_sub), 2);
-    try testing.expectEqual(@as(i64, 42), (try sub.call(&.{ fx(50), fx(8) })).asFixnum());
+    try testing.expectEqual(@as(i64, 42), (try sub.call2(fx(50), fx(8))).asFixnum());
     try testing.expectEqual(@as(i64, -1), (try sub.call(&.{ fx(1), fx(2) })).asFixnum());
     const k = try vm.ensureInterner().internKeywordValue("k");
     var m = try champ_mod.mapEmpty(heap);
@@ -9204,6 +9261,98 @@ test "Callback: an error in the callee is caught where a handler stands, else le
     try testing.expectEqual(frames + 1, vm.frames.items.len);
     try testing.expectEqual(&plain, vm.frames.items[frames].routine);
     try testing.expectEqual(@as(u32, 1), vm.frames.items[frames].pc);
+    try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+    try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+}
+
+/// Natives that call a closure through a `Callback`, for the tests
+/// below: `twice` applies its first argument to its second and then to
+/// the result; `pair` applies it to its second and then its third
+/// argument, recording the error the second call ends with.
+const callback_test_natives = struct {
+    var second_error: ?VmError = null;
+    fn twice(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        const once = try cb.call1(args[1]);
+        return cb.call1(once);
+    }
+    fn pair(vm: *VM, args: []const Value) VmError!Value {
+        var cb = Callback.init(vm, args[0], 1);
+        _ = try cb.call1(args[1]);
+        return cb.call1(args[2]) catch |err| {
+            second_error = err;
+            return err;
+        };
+    }
+    const native_twice = NativeFn{ .name = "twice", .min_arity = 2, .max_arity = 2, .call = &twice };
+    const native_pair = NativeFn{ .name = "pair", .min_arity = 3, .max_arity = 3, .call = &pair };
+};
+
+test "Callback: a callee that calls a native with a Callback of its own nests a frame deeper" {
+    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
+    defer vm.deinit();
+    // (fn [x] (+ x 1)), and (fn [x] (twice inc x)) over it.
+    const inc_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const one = [_]Value{fx(1)};
+    const inc_routine = Routine{ .code = &inc_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "inc" };
+    const inc_fn = try vm.allocClosure(&inc_routine, 0);
+    const outer_code = [_]Inst{
+        asm_.loadConst(1, 0),
+        asm_.loadConst(2, 1),
+        asm_.move(3, 0),
+        asm_.callCall(1, 2, 4),
+        asm_.returnSlot(4),
+    };
+    const outer_consts = [_]Value{ nativeFnValue(&callback_test_natives.native_twice), inc_fn };
+    const outer = Routine{ .code = &outer_code, .consts = &outer_consts, .slot_count = 5, .fixed_arity = 1, .name = "outer" };
+    const frames = vm.frames.items.len;
+    const stack = vm.stack.items.len;
+    var cb = Callback.init(&vm, try vm.allocClosure(&outer, 0), 1);
+    var i: i64 = 0;
+    while (i < 1000) : (i += 1) {
+        try testing.expectEqual(i + 2, (try cb.call1(fx(i))).asFixnum());
+        try testing.expectEqual(frames, vm.frames.items.len);
+        try testing.expectEqual(stack, vm.stack.items.len);
+        try testing.expectEqual(@as(usize, 0), vm.loop_depth);
+        try testing.expectEqual(@as(usize, 0), vm.nested_runs);
+    }
+    try testing.expect(cb.mode == .closure);
+    // The inner callback's frame stood on the outer's.
+    if (VM.track_high_water) try testing.expectEqual(frames + 2, vm.frame_high_water);
+}
+
+test "Callback: a throw past the native ends its call with ControlTransferred and the frames below" {
+    // (try (pair (fn [x] (+ x 1)) 2 nil) (catch any e e)): the first
+    // call returns, the second's error is a throw the handler beneath
+    // the native takes.
+    const plain_code = [_]Inst{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) };
+    const one = [_]Value{fx(1)};
+    const plain = Routine{ .code = &plain_code, .consts = &one, .slot_count = 2, .fixed_arity = 1, .name = "plain" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &plain, .sources = &.{} }};
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.loadConst(2, 0),
+        asm_.closureMake(0, 3),
+        asm_.loadConst(4, 1),
+        asm_.loadNil(5),
+        asm_.callCall(2, 3, 6),
+        asm_.returnSlot(6),
+        asm_.move(0, 1), // 7: the catch
+        asm_.tryExit(9),
+        asm_.returnSlot(0), // 9
+    };
+    const consts = [_]Value{ nativeFnValue(&callback_test_natives.native_pair), fx(2) };
+    var routine = makeRoutine(&code, &consts, 7, "throw-past");
+    routine.capture_descs = &caps;
+    routine.tries = &.{.{ .catch_pc = 7 }};
+    var vm = try VM.init(testing.allocator, &routine);
+    defer vm.deinit();
+    callback_test_natives.second_error = null;
+    const result = try vm.run();
+    try testing.expectEqualStrings("kind-mismatch", vm.ensureInterner().keywordName(result.asKeywordId()));
+    try testing.expectEqual(VmError.ControlTransferred, callback_test_natives.second_error.?);
+    try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
     try testing.expectEqual(@as(usize, 0), vm.loop_depth);
     try testing.expectEqual(@as(usize, 0), vm.nested_runs);
 }

@@ -746,7 +746,7 @@ fn fnSome(vm: *VM, args: []const Value) VmError!Value {
     var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        const r = try cb.call(&.{x});
+        const r = try cb.call1(x);
         if (r.isTruthy()) return r;
     }
     return value_mod.nilValue();
@@ -758,7 +758,7 @@ fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
     var it = try consumingSeqIter(vm, args[1], scope);
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     while (try it.next()) |x| {
-        if (!(try cb.call(&.{x})).isTruthy()) return value_mod.fromBool(false);
+        if (!(try cb.call1(x)).isTruthy()) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
 }
@@ -1588,7 +1588,7 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results) VmError!v
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
         var cb = vm_mod.Callback.init(vm, f, 1);
-        while (try it.next()) |x| try results.add(try cb.call(&.{x}));
+        while (try it.next()) |x| try results.add(try cb.call1(x));
         return;
     }
 
@@ -1625,7 +1625,7 @@ fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     // it goes into a root slot before such a step.
     try scope.push(acc);
     while (try it.nextChunk(scope.base + 1, acc)) |xs| for (xs) |x| {
-        acc = try cb.call(&.{ acc, x });
+        acc = try cb.call2(acc, x);
         if (isReduced(vm, acc)) return reducedValue(acc);
     };
     return acc;
@@ -1656,7 +1656,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 x += r.step;
             }) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, value_mod.fromFixnum(x).? });
+                acc = try cb.call2(acc, value_mod.fromFixnum(x).?);
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
             return acc;
@@ -1669,7 +1669,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             };
             while (true) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
             }
@@ -1678,7 +1678,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             var acc = init orelse x;
             while (true) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
         },
@@ -1687,7 +1687,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             var i: i64 = if (init == null) 1 else 0;
             while (i < r.n) : (i += 1) {
                 vm.roots.items[scope.base] = acc;
-                acc = try cb.call(&.{ acc, r.x });
+                acc = try cb.call2(acc, r.x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
             }
             return acc;
@@ -1705,10 +1705,10 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             while (true) {
                 vm.roots.items[scope.base] = acc;
                 vm.roots.items[scope.base + 1] = x;
-                acc = try cb.call(&.{ acc, x });
+                acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 vm.roots.items[scope.base] = acc;
-                x = try step.call(&.{x});
+                x = try step.call1(x);
             }
         },
         .cycle => |all| {
@@ -1718,7 +1718,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
                 while (try it.next()) |x| {
                     if (acc) |a| {
                         vm.roots.items[scope.base] = a;
-                        const r = try cb.call(&.{ a, x });
+                        const r = try cb.call2(a, x);
                         if (isReduced(vm, r)) return reducedValue(r);
                         acc = r;
                     } else acc = x;
@@ -1799,7 +1799,7 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, 
     var cb = vm_mod.Callback.init(vm, pred, 1);
     while (try it.next()) |x| {
         vm.roots.items[held] = x;
-        const r = try cb.call(&.{x});
+        const r = try cb.call1(x);
         const kept: ?Value = switch (mode) {
             .keep_truthy => if (r.isTruthy()) x else null,
             .keep_falsy => if (r.isTruthy()) null else x,
@@ -2293,7 +2293,7 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
     var cb = vm_mod.Callback.init(vm, f, 1);
     while (try it.next()) |x| {
         vm.roots.items[held] = x;
-        const k = try cb.call(&.{x});
+        const k = try cb.call1(x);
         const spot = transient_mod.mapLocateBang(t, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return transientFailure(vm, err);
         const bucket = champ_mod.mapSpotValue(spot) orelse blk: {
             const fresh = vector_mod.empty(heap) catch return VmError.OutOfMemory;
@@ -2772,14 +2772,14 @@ fn keyExtremum(vm: *VM, want_max: bool, args: []const Value) VmError!Value {
     if (args.len == 2) return args[1];
     var cb = vm_mod.Callback.init(vm, args[0], 1);
     var best = args[1];
-    var best_key = try cb.call(&.{best});
+    var best_key = try cb.call1(best);
     // The best key so far is the one value kept across the next
     // call (GC.md §11.5); it goes on the root stack when it changes.
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(best_key);
     for (args[2..]) |x| {
-        const key = try cb.call(&.{x});
+        const key = try cb.call1(x);
         const keep_best = try vm_mod.numCompare(if (want_max) .gt else .lt, best_key, key);
         if (!keep_best) {
             best = x;
@@ -2954,7 +2954,7 @@ const SortOrder = struct {
             if (a.isFixnum() and b.isFixnum()) return a.asFixnum() < b.asFixnum();
             return (try sorted_mod.naturalOrder(self.interner, a, b)) == .lt;
         };
-        const r = try cmp.call(&.{ a, b });
+        const r = try cmp.call2(a, b);
         return switch (r.kind()) {
             .true_ => true,
             .false_, .nil => false,
@@ -3015,7 +3015,7 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError
     if (keyfn) |kf| {
         var cb = vm_mod.Callback.init(vm, kf, 1);
         for (items.items, keyed) |v, *k| {
-            k.* = .{ .key = try cb.call(&.{v}), .val = v };
+            k.* = .{ .key = try cb.call1(v), .val = v };
             try scope.push(k.key);
         }
     } else for (items.items, keyed) |v, *k| {
@@ -6826,7 +6826,7 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
             var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, 0..) |*slot, i| {
                 const x = typed_vector_mod.nth(heap, xs, i) catch return VmError.OutOfMemory;
-                slot.* = try i64Elem(try cb.call(&.{x}));
+                slot.* = try i64Elem(try cb.call1(x));
             }
             return typed_vector_mod.fromI64Slice(heap, out) catch VmError.OutOfMemory;
         },
@@ -6835,7 +6835,7 @@ fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
             defer vm.allocator.free(out);
             var cb = vm_mod.Callback.init(vm, f, 1);
             for (out, typed_vector_mod.f64Elems(xs)) |*slot, x| {
-                slot.* = try f64Elem(try cb.call(&.{value_mod.fromFloat(x)}));
+                slot.* = try f64Elem(try cb.call1(value_mod.fromFloat(x)));
             }
             return typed_vector_mod.fromF64Slice(heap, out) catch VmError.OutOfMemory;
         },

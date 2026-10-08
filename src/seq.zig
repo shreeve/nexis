@@ -302,7 +302,7 @@ fn stepDropWhile(vm: *VM, lz: Value) VmError!Value {
         a[1] = try seqOf(vm, a[1]);
         if (a[1].isNil()) return a[1];
         const fr = firstRest(a[1]);
-        if (!(try cb.call(&.{fr.first})).isTruthy()) return a[1];
+        if (!(try cb.call1(fr.first)).isTruthy()) return a[1];
         a[1] = fr.rest;
     }
 }
@@ -564,15 +564,15 @@ fn stepSieve(comptime mode: Sieve) Step {
         /// argument and its result in registers.
         inline fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
             switch (m) {
-                .map => return try cb.call(&.{x}),
-                .filter => return if ((try cb.call(&.{x})).isTruthy()) x else null,
-                .remove => return if ((try cb.call(&.{x})).isTruthy()) null else x,
+                .map => return try cb.call1(x),
+                .filter => return if ((try cb.call1(x)).isTruthy()) x else null,
+                .remove => return if ((try cb.call1(x)).isTruthy()) null else x,
                 .keep => {
-                    const r = try cb.call(&.{x});
+                    const r = try cb.call1(x);
                     return if (r.isNil()) null else r;
                 },
                 .map_indexed, .keep_indexed => {
-                    const r = try cb.call(&.{ fixnum(index.*), x });
+                    const r = try cb.call2(fixnum(index.*), x);
                     index.* += 1;
                     return if (m == .keep_indexed and r.isNil()) null else r;
                 },
