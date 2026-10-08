@@ -413,38 +413,51 @@ What the rows say:
   one sync at the end in both systems.
 - The store is 3.1× Datalevin's. Half of it is the four history
   indexes and the txlog, which Datalevin does not keep. The per-tree
-  table below measures the load under an emdb that split every leaf
-  between existing keys in half, before (plain key order) and after a
-  two-pass order that refilled them; under emdb's run rule
-  (`docs/NEXTOMIC.md` §2.5) plain key order fills its leaves as the
-  "after" column does, and the whole store is 144 MB.
+  table below measures it, `zig build bench -Doptimize=fast --
+  --filter nextomic-store` at `0d5f691`, under the emdb the rows above
+  ran on (`8e1ed1e`) and under emdb `b3370fb`, whose leaves keep an
+  insert hint (emdb `SPEC.md` INV-S14) that splits an ascending run
+  nine tenths even when its puts come in separate transactions or
+  interleave with puts elsewhere.
 
-Where the store's bytes go after the load (both commit modes give the
-same trees): entries, key and value bytes, leaf pages, the share of
-the leaves the entries fill, and the tree's pages in MB.
+Where the store's bytes go after the load: entries, key and value
+bytes, leaf pages, the share of the leaves the entries fill (counting
+emdb's 10 bytes a node), and the tree's pages in MB.
 
-| tree | entries | key B | value B | leaves before → after | fill before → after | MB before → after |
+| tree | entries | key B | value B | leaves `8e1ed1e` → `b3370fb` | fill | MB |
 |---|---:|---:|---:|---:|---:|---:|
-| `nx/eavt` | 500,267 | 10.1 M | 3.0 M | 2,252 → 1,317 | 0.50 → 0.85 | 37.0 → 21.6 |
-| `nx/aevt` | 500,267 | 10.1 M | 3.0 M | 2,053 → 1,577 | 0.55 → 0.71 | 33.7 → 25.9 |
-| `nx/avet` | 200,231 | 4.3 M | 1.2 M | 898 → 757 | 0.52 → 0.61 | 14.8 → 12.5 |
-| `nx/vaet` | 100,000 | 1.6 M | 0.6 M | 324 → 329 | 0.60 → 0.59 | 5.3 → 5.4 |
-| `nx/eavt-h` | 500,267 | 13.1 M | 0 | 2,252 → 1,317 | 0.50 → 0.85 | 37.0 → 21.6 |
-| `nx/aevt-h` | 500,267 | 13.1 M | 0 | 2,053 → 1,577 | 0.55 → 0.71 | 33.7 → 25.9 |
-| `nx/avet-h` | 200,231 | 5.5 M | 0 | 898 → 757 | 0.52 → 0.61 | 14.8 → 12.5 |
-| `nx/vaet-h` | 100,000 | 2.2 M | 0 | 324 → 329 | 0.60 → 0.59 | 5.3 → 5.4 |
-| `nx/txlog` | 103 | 618 | 9.3 M | 600 overflow pages | — | 9.9 → 9.9 |
-| all trees | | | | | | 191.4 → 140.7 |
+| `nx/eavt` | 500,267 | 10.1 M | 3.0 M | 1,252 → 1,252 | 0.88 → 0.88 | 20.6 → 20.6 |
+| `nx/aevt` | 500,267 | 10.1 M | 3.0 M | 1,265 → 1,233 | 0.87 → 0.90 | 20.8 → 20.3 |
+| `nx/avet` | 200,231 | 4.3 M | 1.2 M | 747 → 681 | 0.61 → 0.67 | 12.3 → 11.2 |
+| `nx/vaet` | 100,000 | 1.6 M | 0.6 M | 387 → 300 | 0.51 → 0.65 | 6.4 → 4.9 |
+| `nx/eavt-h` | 500,267 | 13.1 M | 0 | 1,252 → 1,252 | 0.88 → 0.88 | 20.6 → 20.6 |
+| `nx/aevt-h` | 500,267 | 13.1 M | 0 | 1,265 → 1,233 | 0.87 → 0.90 | 20.8 → 20.3 |
+| `nx/avet-h` | 200,231 | 5.5 M | 0 | 747 → 681 | 0.61 → 0.67 | 12.3 → 11.2 |
+| `nx/vaet-h` | 100,000 | 2.2 M | 0 | 387 → 300 | 0.51 → 0.65 | 6.4 → 4.9 |
+| `nx/txlog` | 103 | 618 | 9.3 M | 600 overflow pages | — | 9.8 → 9.8 |
+| all trees | | | | | | 129.9 → 123.8 |
+| file (allocated) | | | | | | 143.7 → 135.3 |
 
 Keys are already compact (6-byte `e` and `t`, 4-byte `a`); emdb adds
-10 bytes per entry. EAVT fills best because each transaction writes
-5,000 of its keys into one gap; AEVT's five gaps take 1,000 each and
-fill less; AVET's and VAET's keys scatter over many small gaps, which
-fill as random inserts do. A store of 20,000 entities with a 282-byte
-string each (an out-of-line value, `docs/NEXTOMIC.md` §2.2) went from
-56.0 MB of trees to 29.6 MB, the payload leaving the current EAVT row
-(18.6 MB → 3.6 MB), and to 70.3 MB from 92.4 MB after every string was
-replaced once.
+10 bytes per entry. EAVT fills to nine tenths under either emdb, each
+transaction writing 5,000 of its keys into one gap. Under `8e1ed1e`
+the runs of AVET and VAET, many small gaps a transaction writes a few
+keys into each, split their leaves in half; the insert hint fills
+every run (each person's age, each department's referrers) to nine
+tenths, and AVET's email strings, which land at random, stay near two
+thirds. The other shapes of the category gain more, because each of
+their gaps takes fewer keys a transaction:
+
+| shape | file `8e1ed1e` | `b3370fb` | Δ |
+|---|---:|---:|---:|
+| bulk (above) | 143.7 MB | 135.3 MB | −5.8% |
+| small transactions: 20,000 one-entity transactions, 2,000 upserts (AEVT fill 0.53 → 0.87) | 43.0 MB | 34.6 MB | −19.5% |
+| churn: 10,000 people, every card-one attribute changed five times (AEVT-h fill 0.48 → 0.62) | 101.7 MB | 84.9 MB | −16.5% |
+| text: 20,000 strings of 282 bytes, each replaced once | 84.9 MB | 76.5 MB | −9.9% |
+
+A string past 96 bytes (an out-of-line value, `docs/NEXTOMIC.md` §2.2)
+keeps its payload on its EAVT-h assertion rows: the text store's
+EAVT-h holds 11.3 MB of payload in 38.6 MB of leaves filled to 0.48.
 
 **Sequences and strings.** Three of the rows above rerun on the tree
 with eager sequences built as vector views, direct leaf callbacks,
@@ -2207,12 +2220,9 @@ Each lever is a measured change: a before/after from `zig build bench`
   only facts no longer current, with `as-of` and `history` merging it
   with the current index, would drop half the index pages of an
   append-mostly store; the readers are `nextomic/db.zig` and
-  `query/plan.zig`. A transaction that writes less than a leaf's worth
-  of keys into a gap (every one-datom transaction, and VAET's and
-  AVET's scattered keys) still leaves a half-full leaf behind: emdb
-  keeps an ascending run's position within one write transaction
-  (`docs/NEXTOMIC.md` §2.5), so a gap that a stream of small
-  transactions writes one key at a time splits in half each time. Shorter integers
+  `query/plan.zig`. A gap that small transactions fill a few keys at
+  a time, and VAET's and AVET's runs, fill to nine tenths under emdb's
+  insert hint (§3.11's store shapes). Shorter integers
   (a variable-width `t` in current values and in `top`) would save
   about 5 % and change every key and value reader. The txlog repeats
   an out-of-line value's payload for its assertion and its
@@ -2560,7 +2570,7 @@ is one invocation's 30-sample median.
 | §3.11 language and database rows | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224, Datalevin 1.1.0; emdb `ee61850`; shared with concurrent sessions (load average 3.8 at the start and the end) | 2026-09-28 00:52 MDT: `bb bench/compare/run.clj --n 10 --max-load 5` at `7b50fa4`; ten rounds after a discarded warm-up (startup thirty), the implementations alternating, each workload started below a load average of 5 and repeated if the load rose past it; every answer equal; raw results kept with the run (`results.json`) |
 | §3.11 sequences and strings | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds | revamp, 2026-09-26, ws-strseq: `bb bench/compare/run.clj --n 10 --workloads string-split,pipeline,destructure`, before at `cc935cc` (`--max-load 12`, load 27 falling to 8), after at `c0d6043` (`--max-load 6`); the instruction counts from `/usr/bin/time -l bin/nexis run` of each workload's program, five or seven runs per build, minus a run of its setup alone |
 | §3.11 lazy sequences against the eager build | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast; shared with concurrent builds (load average 3.4–5.6) | 2026-10-06, perf-regress: the `bench/compare` bodies of `pipeline`, `sort` and `freq-group` after `prelude.nx`, and `-e nil`, run by `bin/nexis` built with `zig build install -Doptimize=fast` at `3f1f9c6`, `240c2b4` and `c20942f`, 7 interleaved rounds under `/usr/bin/time -l`; a phase's instructions and cycles are its program's minus the same program without the timed part, its time the program's own `nano-time` figure, the resident set the process's maximum; medians |
-| §3.11 per-tree table | Apple M5, macOS 27.0, Zig 0.16.0, ReleaseFast, shared with concurrent builds | 2026-09-26: `nexis-load.nx STORE nosync` and `durable` built by `cc935cc` (before) and the ws-storesize head (after), read by a read-only program over emdb's `treeStat` and a cursor walk of each tree; fill counts 10 bytes of pointer and node header per entry over 16,352 usable bytes a leaf. The out-of-line rows: 20,000 `:doc/body` strings of 282 bytes, 1,000 per transaction with `:sync :none`, then each replaced once |
+| §3.11 per-tree table and store shapes | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions (load average 20–45) | 2026-10-08, store: `zig build bench -Doptimize=fast -- --filter nextomic-store` at `0d5f691`, against emdb `8e1ed1e` (a source snapshot beside a snapshot of the tree) and emdb `b3370fb`; the trees from emdb's `treeStat` and a cursor walk of each (`Store.treeSize`), the file's allocated bytes from `stat`. Sizes do not depend on load |
 | §3.12 | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–9) | revamp, 2026-09-26, ws-dispatch: `nexis-bench` and `bin/nexis` built at `968aa77` (before) and at `5f724d7` (after); `nexis-bench --filter vm,compiler` five times per build, alternating; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads fib,loop,destructure,sort,map-build-read,pipeline` four times, the builds alternating, each run's report naming the tree's head since the binary was swapped in |
 | §3.13, §6 "Calls from natives" | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–18) | 2026-09-27, ws-pipeline-calls: `bin/nexis` and `nexis-bench` built at `a712a24` (before) and at the branch head (after); `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,fib,loop,destructure` four times, after, before, after, before, the binary swapped into one worktree, so each report names the branch head; `zig build bench -Doptimize=ReleaseFast -- --filter vm` five times per build, alternating; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline's program cut after each stage, median of five, the setup's own run subtracted; the per-step figures of §6 from each commit's build against the one before it, the phase timed with `nano-time` inside `bin/nexis run` of the pipeline program, ten runs each, alternating |
 | §3.14, §6 "Marking in place", "Results built in place", "A built sequence walked as its vector" and their dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0, Zig 0.16.0, ReleaseFast; babashka v1.13.224; shared with concurrent builds (load average 3–16) | 2026-09-27/28, ws-pipeline-heap: `bin/nexis` built at `a712a24`, at `8afd353` (main with ws-pipeline-calls) and at the branch head; the cycle and heap figures from a build of `a712a24` with a trace printed at each cycle and at exit; `bb bench/compare/run.clj --n 10 --max-load 6 --no-build --workloads pipeline,map-build-read,map-transient,vector-conj-nth,sort,freq-group` once with `a712a24`, then four times, branch head and `8afd353` alternating, the binary swapped into the branch's worktree, so each report names the branch head; the instruction counts from `/usr/bin/time -l bin/nexis run` of the pipeline program and of its setup alone, five runs each, the median; the trigger table from a build reading the growth and floor from the environment, not committed; the step figures of §6 against the build before each step |

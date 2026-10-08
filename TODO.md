@@ -74,23 +74,11 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     on the Linux host (§3.15). Half is the four history trees and the
     txlog, which Datalevin does not keep; Datomic Local's EAVT holds
     about 8 bytes a datom, Nextomic's 26 bytes of key and value plus
-    emdb's 10, and again in its history twin. #5 and #6 are two of its
-    parts; `docs/PERF.md` §6 "Store size" lists the levers.
-
-5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's
-   table of entries, bytes, leaves and fill per tree came from a
-   program over emdb's `treeStat` and a cursor walk that is not in the
-   repository, and it measures the two-pass write order that
-   `docs/NEXTOMIC.md` §2.5 no longer uses. Commit the tool (a `bench`
-   category or a `zig build` step), then remeasure the table.
-6. **Small transactions leave half-full leaves.** emdb fills a leaf to
-   nine tenths only while one write transaction continues an ascending
-   run (emdb `SPEC.md` INV-SP03); a stream of one-key transactions into
-   the same gap (a new entity's EAVT rows before the transaction
-   entities, the end of an attribute's AEVT run) splits each leaf in
-   half. A per-page record of the last insert position, kept across
-   transactions as InnoDB keeps one, would fill them. It is an engine
-   question for emdb's owner, not a nexis change.
+    emdb's 10, and again in its history twin. `zig build bench --
+    --filter nextomic-store` measures it tree by tree, and emdb's
+    insert hint fills the leaves small transactions leave behind
+    (`docs/PERF.md` §3.11); `docs/PERF.md` §6 "Store size" lists the
+    levers.
 
 ## Build and environment
 

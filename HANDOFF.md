@@ -524,7 +524,10 @@ after numbers in the commit message.
    (`docs/GC.md` §11.5; `docs/PERF.md` §3.31, §3.35), and `zipmap` and
    `set` keep their bulk build by measurement (`docs/LAZY.md` §9).
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
-   (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
+   (`docs/PERF.md` §3.11, §3.15, §6 "Store size"). The store work is
+   gated and measured against emdb `b3370fb`, whose leaves' insert
+   hint takes 143.7 MB of the bulk load to 135.3 MB and a store of
+   small transactions 43.0 MB to 34.6 MB (`docs/PERF.md` §3.11).
 4. The open design question, an amendment first: `&form`/`&env`
    (§24 #13). The owner orders it after the em and emdb work.
 

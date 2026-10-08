@@ -251,8 +251,10 @@ one the store reports (`Store.fulltext_aid`), not 22.
 
 emdb splits a full leaf in half when the new key lands inside it, and
 keeps nine tenths on the left when the key sorts after every key on
-the leaf or continues an ascending run of puts at the position the
-previous put left, anywhere in the tree (emdb `SPEC.md` INV-SP03).
+the leaf or continues an ascending run, anywhere in the tree: a run of
+the transaction's own puts (emdb `SPEC.md` INV-SP03), or one the
+leaf's insert hint records, whose puts came in earlier transactions
+or between puts elsewhere (INV-S14).
 Most of a transaction's datoms land between existing keys: a new
 entity's EAVT rows sort before the transaction entities (partition
 `2^46`), its AEVT rows at the end of each attribute's run, its VAET
@@ -261,11 +263,12 @@ rows at the end of each referenced entity's.
 `Store.writeBatch` writes each of the eight trees in turn, a current
 tree before its history twin, each in ascending key order; equal keys
 keep their batch order, so a batch leaves the trees exactly as writing
-its datoms one at a time does. Each run of keys a transaction writes
-into one gap fills its leaves to about nine tenths, between existing
-keys as at a tree's end. A transaction that writes less than a leaf's
-worth into a gap splits the leaf it lands in half (`docs/PERF.md`
-§3.11 has the measured fill). The order changes no byte of the format.
+its datoms one at a time does. A run of keys into one gap fills its
+leaves to about nine tenths, between existing keys as at a tree's end,
+whether one transaction writes it or many each write a few of its
+keys; keys that land at random, as unique strings do in AVET, fill
+about two thirds (`docs/PERF.md` §3.11 has the measured fill). The
+order changes no byte of the format.
 
 ---
 
