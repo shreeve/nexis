@@ -30,7 +30,7 @@
   "Each program and its two sizes."
   (let [m5 [5000000 10000000] cb [1000000 2000000]]
     (array-map "count" m5 "acc" m5 "fib" [27 30] "gcall" m5 "lc" m5 "lv" m5
-               "mv" m5 "kw" m5 "leaf" m5 "getnl" m5
+               "mv" m5 "kw" m5 "leaf" m5 "getnl" m5 "pcall" m5 "casek" m5 "mcall" m5
                "cbbase" cb "cbsum" cb "cbred" cb "cb" cb "lazy" cb
                "lazy3" [1500000 3000000])))
 
