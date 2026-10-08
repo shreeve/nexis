@@ -61,8 +61,10 @@ refuses the write as `:db/value-too-large` and the transaction aborts.
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
 the connection's life (tree registration is the engine's one call that
-is not thread-safe, and it happens only here). Only a store missing one
-of them takes a write transaction at connect: a new file is
+is not thread-safe, and it happens only here). A transaction then
+opens each tree on its first use of the handle (emdb INV-SUB03), so it
+reads the records of the trees it touches and no others. Only a store
+missing one of them takes a write transaction at connect: a new file is
 bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
 minted (§2.4). One more write can follow the open: when the
 `nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
