@@ -104,6 +104,24 @@
 (dotimes [i 1000]
   (d/transact conn {:tx-data [[:db/add [:person/email (email i)] :person/salary (+ 3 i)]]}))
 
+; The entity batches of nexis-query.nx: 1,000 new people, then 1,000
+; upserts through the unique email.
+(def dept-eids (let [db (d/db conn)] (mapv (fn [k] (entid db [:dept/name (str "d" k)])) (range 100))))
+(defn person [i salary]
+  {:person/email (email i) :person/name (str "name-" i) :person/age (+ 18 (mod (* i 7) 60))
+   :person/dept (nth dept-eids (mod i 100)) :person/salary salary})
+(def upserted (mapv email (range 1000 2000)))
+
+(let [t0 (System/nanoTime)]
+  (dotimes [i 1000]
+    (d/transact conn {:tx-data [(person (+ 100000 i) (+ 30000 i))]}))
+  (report "tx-entity-1k" (- (System/nanoTime) t0) (ffirst (d/q '[:find (count ?e) :where [?e :person/email]] (d/db conn)))))
+
+(let [t0 (System/nanoTime)]
+  (dotimes [i 1000]
+    (d/transact conn {:tx-data [(person (+ 1000 i) (+ 4 i))]}))
+  (report "tx-upsert-1k" (- (System/nanoTime) t0) (ffirst (d/q salary-sum-q (d/db conn) upserted))))
+
 (let [t0 (System/nanoTime)
       db (d/db conn)
       before (salary-sum (d/as-of db t-before))

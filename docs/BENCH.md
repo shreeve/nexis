@@ -254,11 +254,13 @@ unique; name; age; department, a ref; salary):
 | `tx-1k-default` | 1,000 transactions of one datom each, in each system's default commit |
 | `tx-1k-durable` | 1,000 more, each commit on the device before it returns |
 | `tx-1k-nosync` | 1,000 more with the commit's flush off and one sync at the end |
+| `tx-entity-1k` | 1,000 transactions of one new person with all five attributes, in each system's default commit |
+| `tx-upsert-1k` | 1,000 transactions of one existing person with all five attributes, upserted through the unique email, the salary alone changed, in each system's default commit |
 | `as-of+history` | the salary total as of the basis before the writes, and a `history` count |
 | `create-durable`, `load-durable` | Nextomic only: `create` and `load` through a durable connection |
 | `create-nosync`, `load-nosync` | `create` and `load` with the flush off and one sync at the end |
 
-Every twin runs all three write batches, the same datoms, so the
+Every twin runs all five write batches, the same datoms, so the
 answers and the history agree; a batch a system has no mode for runs
 untimed and its row is n/a. Datalevin has no time views:
 `datalevin.core`'s public vars (listed by `(ns-publics
