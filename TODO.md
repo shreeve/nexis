@@ -48,18 +48,18 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    write. The commit protocol is emdb's; nexis changes nothing in emdb
    (`AGENTS.md`), so this is the engine owner's call.
 
-13. **`count`, `into` and `vec` keep the seq they walk.** The
-    compiler clears a local or a parameter at its last move
-    (`docs/COMPILER.md` §4.9), and the natives that walk a sequence to
-    its end (`reduce`, `frequencies`, `group-by`, `some`, `every?`,
-    `last`, `dorun`) consume it (`docs/GC.md` §11.5), so `(let [s (map
-    inc (range n))] (reduce + s))` and `(defn total [xs] (reduce + xs))`
-    run in constant memory (`docs/PERF.md` §3.29). `(let [s (map inc
-    (range n))] (count s))` still holds what `count` realizes, in the
-    leaf path's rooted copy of its arguments (`docs/VM.md` §6), and so
-    do `into`, `vec` and the other natives that walk to the end
-    without consuming their argument: each needs `NativeFn.consumes`
-    and a consuming walk in its general body. A local a closure
+13. **A captured local, and the natives that walk without consuming,
+    keep the seq.** The compiler clears a local or a parameter at its
+    last move (`docs/COMPILER.md` §4.9), and the natives that walk a
+    sequence to its end (`reduce`, `count`, `into`, `vec`, `set`,
+    `frequencies`, ...) consume it (`docs/GC.md` §11.5), so `(let [s
+    (map inc (range n))] (count s))` and `(defn total [xs] (reduce +
+    xs))` run in constant memory (`docs/PERF.md` §3.29, §3.31).
+    `sort`, `sort-by`, `reverse`, `butlast`, `mapv`, `filterv`,
+    `apply`, `zipmap`, `select-keys` and `nexis.string/join` still hold
+    their argument while they walk it (`docs/LAZY.md` §9): each needs
+    `NativeFn.consumes` and a walk that roots what it keeps of the
+    elements behind its place. A local a closure
     captures stays in its cell while the closure runs, so `(delay
     (reduce + s))` holds `s` where Clojure clears a `^:once` body's
     fields; clearing a cell needs a cell write `docs/VM.md` §6 rules

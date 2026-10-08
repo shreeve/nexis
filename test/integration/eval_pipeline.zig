@@ -2812,6 +2812,54 @@ test "gc: a native that consumes its sequence lets the part it walked go" {
     }
 }
 
+test "gc: count, into, vec, set, take-last and the typed vectors consume the seq they walk" {
+    // Each walks 300,000 mapped elements, about 6 MB of chunks, that the
+    // local's slot, moved into the call's block, would keep through the
+    // walk. A vector of every element is about 5 MB of its own.
+    for ([_][3][]const u8{
+        .{ "(let [s (map inc (range 300000))] (count s))", "300000", "1" },
+        .{ "(count (map inc (range 300000)))", "300000", "1" },
+        .{ "(defn n [xs] (count xs)) (n (map inc (range 300000)))", "300000", "1" },
+        .{ "(let [s (map #(mod % 10) (range 300000))] (count (into #{} s)))", "10", "1" },
+        .{ "(let [s (map #(mod % 10) (range 300000))] (count (into {} (map (fn [x] [x x])) s)))", "10", "1" },
+        .{ "(let [s (map #(mod % 10) (range 300000))] (count (into (sorted-set) s)))", "10", "1" },
+        .{ "(let [s (map inc (range 300000))] (count (into #{} (map #(mod % 10)) s)))", "10", "1" },
+        .{ "(let [s (map #(mod % 10) (range 300000))] (count (set s)))", "10", "1" },
+        .{ "(let [s (map inc (range 300000))] (count (vec s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (into [] s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (into [0] s)))", "300001", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (into [] (map inc) s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (take-last 2 s))", "(299999 300000)", "1" },
+        .{ "(let [s (map inc (range 300000))] (count (i64-vector s)))", "300000", "3" },
+        .{ "(let [s (map inc (range 300000))] (count (f64-vector s)))", "300000", "3" },
+    }) |case| {
+        errdefer std.debug.print("consuming case {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[0]), case[1]);
+        const mb = try std.fmt.parseInt(usize, case[2], 10);
+        errdefer std.debug.print("peak {d} bytes\n", .{heap.peak_live_bytes -| start});
+        try testing.expect(heap.peak_live_bytes -| start < mb << 20);
+    }
+}
+
+test "count, into, vec, set, take-last and the typed vectors give what they gave before consuming their seq" {
+    // Expected values from babashka, a set printed in nexis's order.
+    try expectOutput("(let [s (map inc (range 5)) t s] [(count s) (vec s) (into [] s) (set s) (into () t) (reduce + t) (first s)])", "[5 [1 2 3 4 5] [1 2 3 4 5] #{1 2 3 4 5} (5 4 3 2 1) 15 1]");
+    try expectOutput("(let [s (map inc (range 3))] [(count s) (count s) (vec s) (into [0] s) (into [] (map inc) s) s])", "[3 3 [1 2 3] [0 1 2 3] [2 3 4] (1 2 3)]");
+    try expectOutput("(let [v (with-meta [9] {:m 1}) e (with-meta [] {:m 2})] [(into v (map inc (range 3))) (meta (into v (map inc (range 3)))) (meta (into e (map inc (range 3)))) (meta (into e (map inc) (range 3)))])", "[[9 1 2 3] {:m 1} {:m 2} {:m 2}]");
+    try expectOutput("[(into nil (map inc (range 3))) (into () (map inc (range 3))) (into {:a 1} (map vector [:b :c] (range 2))) (into (sorted-map) (map vector [:b :a] (range 2))) (into (sorted-set-by >) (map inc (range 4))) (into #{} (map inc (range 3))) (seq (into (lazy-seq [9]) (map inc (range 2))))]", "[(3 2 1) (3 2 1) {:a 1, :b 0, :c 1} {:a 1, :b 0} #{4 3 2 1} #{1 2 3} (2 1 9)]");
+    try expectOutput("[(vec (map inc ())) (into [] (map inc ())) (count (map inc ())) (set (map inc ())) (into [] (take 3) (iterate inc 0)) (vec (take 4 (iterate inc 0))) (count (take 5 (cycle [1 2])))]", "[[] [] 0 #{} [0 1 2] [0 1 2 3] 5]");
+    try expectOutput("[(take-last 2 (map inc (range 5))) (take-last 0 (map inc (range 5))) (take-last 10 (map inc (range 3))) (take-last 3 (map inc ())) (take-last 3 (map inc (range 7))) (take-last 2.5 (map inc (range 7)))]", "[(4 5) nil (1 2 3) nil (5 6 7) (5 6 7)]");
+    try expectOutput("[(vec (i64-vector (map inc (range 3)))) (vec (f64-vector (map inc (range 3)))) (try (i64-vector (map identity [1 :a])) (catch :kind-mismatch e :km))]", "[[1 2 3] [1.0 2.0 3.0] :km]");
+}
+
 test "gc: a seq a local or a parameter holds is let go at its last move (COMPILER.md §4.9)" {
     // Each walks 300,000 mapped elements, about 6 MB of chunks, that
     // the local's or the parameter's slot would keep through the walk.
@@ -6991,6 +7039,17 @@ test "gc: a native walking a lazy seq that collects at every step keeps what it 
     // A body that returns the next block forwards to it: a long run of
     // them costs no native stack, and each block stays reachable.
     try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
+}
+
+test "gc: count, into, vec, set and take-last keep what they built from a seq that collects at every step" {
+    // The elements are strings the steps made, which nothing but the
+    // walked chain reaches once the native has consumed it.
+    try expectOutputUnderGc(churn ++ chain ++ "[(count (chain 30)) (vec (chain 4)) (into [:x] (chain 3)) (into () (chain 3)) (into nil (chain 3)) (count (into #{} (chain 40))) (into {} (map (fn [s] [s (str s s)])) (chain 3))]", "[30 [4 3 2 1] [:x 3 2 1] (1 2 3) (1 2 3) 40 {3 33, 2 22, 1 11}]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(into (sorted-set-by (fn [a b] (churn 1) (compare a b))) (chain 4)) (into [] (map (fn [s] (churn 2) (str s \"!\"))) (chain 3)) (= (set (chain 40)) (set (map str (range 1 41)))) (let [s (chain 3) t s] [(count s) (vec s) (into [] t) (first t)])]", "[#{1 2 3 4} [3! 2! 1!] true [3 [3 2 1] [3 2 1] 3]]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(take-last 3 (chain 40)) (count (take-last 50 (chain 40))) (vec (i64-vector (ints 5)))]", "[(3 2 1) 40 [5 4 3 2 1]]");
+    // A lazy target realized while a map source's entries, built by
+    // the walk, wait to be conj'd onto it.
+    try expectOutputUnderGc(churn ++ "(let [m (zipmap (map str (range 40)) (range 40))] (= (set (into (map (fn [x] (churn x) x) [1]) m)) (conj (set m) 1)))", "true");
 }
 
 test "gc: sequence and eduction keep the seq they took of a source that is not one across the transducer's calls" {

@@ -366,9 +366,12 @@ make sure a root reaches it. What is rooted already:
   so a value a native passes to a callback is rooted by that call for
   no longer than the callee uses it. One exception: the last argument of a native that consumes
   it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
-  `some`, `every?`, `last`, `dorun`), whose slot `call:call` clears
-  once it has copied the arguments, so the head of a lazy seq passed
-  straight in is not kept while the native realizes the rest. Such a
+  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`, `set`,
+  `take-last`, `i64-vector`, `f64-vector`), whose slot `call:call`
+  clears once it has copied the arguments, so the head of a lazy seq
+  passed straight in is not kept while the native realizes the rest;
+  `count` is a leaf, and only its general path, which a lazy seq
+  takes, clears the slot (`docs/VM.md` §6). Such a
   native roots the argument itself before anything can collect, in a
   root-scope slot that keeps its walk's place (`SeqIter.cursor`): the
   slot holds the collection, and a lazy seq's walk moves it to each
@@ -376,8 +379,13 @@ make sure a root reaches it. What is rooted already:
   element still to come and the chunk being handed out. An element
   the native keeps past the next step that may collect is its own to
   root (`last` keeps the latest in a slot `nextChunk` writes before
-  such a step); an `iterate`'s function or a `cycle`'s source,
-  reached from the argument, stays rooted through it. Reached by
+  such a step; `vec` and `into` an empty vector put each in a
+  `Results`, `into` anything else conj's it at once onto a result
+  kept in a slot, `take-last` keeps the last n in slots used as a
+  ring); an `iterate`'s function or a `cycle`'s source,
+  reached from the argument, stays rooted through it. `into` with a
+  transducer passes its argument to a closure, whose parameter holds
+  it until its last move (`docs/COMPILER.md` §4.9). Reached by
   `callValue`, the argument stays on the root stack as any native's.
 - **Everything reachable from a rooted value**, so an element of an
   argument collection needs nothing.

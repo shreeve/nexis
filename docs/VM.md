@@ -366,7 +366,9 @@ the caller's frame on return cost 5% of a call (`docs/PERF.md` §6).
 A native that consumes its last argument (`NativeFn.consumes`) has
 that argument's slot cleared before the call, once the arguments are
 copied: it roots the argument itself and lets the part of a lazy seq
-it has walked go (`docs/GC.md` §11.5).
+it has walked go (`docs/GC.md` §11.5). A leaf that consumes (`count`)
+is called in place, clearing nothing, unless its leaf body refuses
+the receiver: a lazy seq goes the general way, which clears the slot.
 
 `call:tailcall` traps `UnimplementedOpcode` and the compiler never
 emits it; `recur` compiles to a jump (§11). `call:return A` and

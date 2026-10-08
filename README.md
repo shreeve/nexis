@@ -241,7 +241,7 @@ The semantics port; the platform does not.
   transactions are the concurrency story.
 - **A captured lazy seq keeps its head**: a local or a parameter lets
   go of a lazy seq at its last use, as Clojure's locals clearing does,
-  but one a closure captures, or one `count`, `into` or `vec` walks,
+  but one a closure captures, or one `sort`, `reverse` or `mapv` walks,
   stays held until it is released (`docs/LAZY.md` §9).
 - **Regular expressions** match in linear time: Java's syntax without
   backreferences, lookaround, atomic groups or possessive quantifiers,
