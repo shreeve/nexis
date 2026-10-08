@@ -1,0 +1,11 @@
+; A count no clause of a multi-arity fn takes is an arity error raised
+; in the caller, its sentence naming every count the fn takes.
+
+(defn area
+  ([side] (* side side))
+  ([w h] (* w h)))
+
+(defn report []
+  (area 2 3 4))
+
+(report)

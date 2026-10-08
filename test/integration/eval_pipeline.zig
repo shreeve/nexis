@@ -1002,6 +1002,12 @@ test "integration: an uncaught runtime error names what went wrong in VM.error_d
         .{ .src = "(doall (filter (fn [] true) [1]))", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 arguments, got 1" },
         .{ .src = "(reduce inc [1 2])", .err = vm.VmError.ArityMismatch, .detail = "inc takes 1 argument, got 2" },
         .{ .src = "(reduce (fn h [a] a) 0 [1])", .err = vm.VmError.ArityMismatch, .detail = "h takes 1 argument, got 2" },
+        // A multi-arity fn names every count its clauses take.
+        .{ .src = "(defn f ([x] x) ([x y] y)) (f 1 2 3)", .err = vm.VmError.ArityMismatch, .detail = "f takes 1 or 2 arguments, got 3" },
+        .{ .src = "(defn f ([] 0) ([x] x) ([x y] y)) (f 1 2 3)", .err = vm.VmError.ArityMismatch, .detail = "f takes 0 to 2 arguments, got 3" },
+        .{ .src = "(defn f ([x] x) ([x y z & r] r)) (f)", .err = vm.VmError.ArityMismatch, .detail = "f takes 1 or at least 3 arguments, got 0" },
+        .{ .src = "(defn f ([x] x) ([x y & r] r)) (f)", .err = vm.VmError.ArityMismatch, .detail = "f takes at least 1 argument, got 0" },
+        .{ .src = "(doall (map (fn ([] 0) ([a b] a)) [1]))", .err = vm.VmError.ArityMismatch, .detail = "fn takes 0 or 2 arguments, got 1" },
         .{ .src = "(doall (filter 5 [1]))", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
         .{ .src = "(reduce + [1 \"a\"])", .err = vm.VmError.KindMismatch, .detail = "" },
         .{ .src = "(5 1)", .err = vm.VmError.NotCallable, .detail = "an integer is not callable" },
@@ -1131,10 +1137,53 @@ test "multi-arity fn: anonymous, named and letfn clauses dispatch by argc" {
     try expectProgramError("(fn ([x y] 1) ([x & r] 2))", compile.CompileError.MacroExpansionFailure);
 }
 
+test "multi-arity fn: each clause is called at its count through every path" {
+    // call:call, apply, swap!, a Callback (map, filter, reduce), a
+    // protocol method of a record, letfn and a macro.
+    try expectOutput(
+        \\(let [f (fn ([] :0) ([a] :1) ([a b] :2) ([a b c d & m] [:v m]))]
+        \\  [(f) (f 1) (f 1 2) (f 1 2 3 4) (f 1 2 3 4 5 6 7)
+        \\   (apply f []) (apply f 1 [2]) (apply f 1 [2 3 4 5]) (apply #'nexis.core/vector [1 2])
+        \\   (try (f 1 2 3) (catch any e e)) (try (apply f [1 2 3]) (catch any e e))
+        \\   (mapv f [1 2]) (mapv f [1] [2]) (filterv f [1]) (reduce f [1 2 3])
+        \\   (let [a (atom 0)] (swap! a f 1 2 3 4) @a)])
+    , "[:0 :1 :2 [:v nil] [:v (5 6 7)] :0 :2 [:v (5)] [1 2] :arity-mismatch :arity-mismatch [:1 :1] [:2] [1] :2 [:v (4)]]");
+    try expectOutput(
+        \\(do (defprotocol Sz (sz [x] [x n]))
+        \\    (defrecord Box [v] Sz (sz [_] v) (sz [_ n] (* v n)))
+        \\    (let [b (->Box 3)] [(sz b) (sz b 2) (mapv sz [b b])]))
+    , "[3 6 [3 3]]");
+    try expectOutput("(letfn [(f ([] (f 1)) ([n] (* n 10)) ([n & r] (count r)))] [(f) (f 2) (f 1 2 3)])", "[10 20 2]");
+    try expectOutput("(do (defmacro m ([a] a) ([a b] `(+ ~a ~b))) [(m 1) (m 1 2)])", "[1 3]");
+    // apply into the rest clause with 10,000 arguments, a lazy seq,
+    // and through a Var.
+    try expectOutput("(do (defn f ([] 0) ([x & r] (+ x (count r)))) [(apply f (range 10000)) (apply f (map inc (range 3))) (apply #'f 5 [6])])", "[9999 3 6]");
+    // A transducer's step fn, called once per element.
+    try expectOutput("[(transduce (map inc) + (range 100000)) (into [] (comp (filter odd?) (map inc)) (range 6))]", "[5000050000 [2 4 6]]");
+}
+
+test "multi-arity fn: an error in a clause names the fn, and a call between clauses is a frame" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const src =
+        \\(defn f
+        \\  ([x] (f x 0))
+        \\  ([x y] (quot x y)))
+        \\(f 1)
+    ;
+    try testing.expectError(vm.VmError.DivideByZero, program.run(src));
+    const trace = program.v.error_trace.items;
+    try testing.expectEqual(@as(usize, 3), trace.len);
+    try testing.expectEqualStrings("f", trace[0].name);
+    try testing.expectEqualStrings("(quot x y)", src[trace[0].span.?.pos..][0..trace[0].span.?.len]);
+    try testing.expectEqualStrings("f", trace[1].name);
+    try testing.expectEqualStrings("(f x 0)", src[trace[1].span.?.pos..][0..trace[1].span.?.len]);
+}
+
 test "multi-arity fn: recur re-enters the clause with the clause's own arity" {
-    // Each clause binds its params through `loop`, so `recur` in
-    // a clause's tail rebinds that clause's params and never sees
-    // the dispatcher's `[& args]` (MACROEXPAND.md §10, `fn`).
+    // Each clause is a routine of its own, so `recur` in a clause's
+    // tail rebinds that clause's params (COMPILER.md §5.5, §5.6).
     try expectOutput(
         \\(do (defn fact ([n] (fact n 1)) ([n acc] (if (< n 2) acc (recur (dec n) (* n acc)))))
         \\    (fact 20))
@@ -3141,7 +3190,8 @@ test "defmacro: a failing macro call names the macro and the cause, at the call"
     try expectMacroFailure("", "(when-let [a 1 b 2] [a b])", "macro when-let threw when-let requires exactly 2 forms in binding vector", "(when-let [a 1 b 2] [a b])");
     try expectMacroFailure("", "(if-some [a 1] a 2 3)", "macro if-some threw if-some requires 1 or 2 forms after binding vector", "(if-some [a 1] a 2 3)");
     try expectMacroFailure("(defmacro m [a] a)", "(do (m))", "macro m takes 1 argument, got 0", "(m)");
-    try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes 2 or more arguments, got 1", "(m 1)");
+    try expectMacroFailure("(defmacro m [a b & c] a)", "(m 1)", "macro m takes at least 2 arguments, got 1", "(m 1)");
+    try expectMacroFailure("(defmacro m ([a] a) ([a b c & d] a))", "(m 1 2)", "macro m takes 1 or at least 3 arguments, got 2", "(m 1 2)");
     try expectMacroFailure("(defmacro m [] (first 1))", "(m)", "macro m failed: KindMismatch", "(m)");
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (g))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
     try expectMacroFailure("(defmacro m [] (fn [] 1))", "(m)", "a macro returned a function, which is not a form", "(m)");

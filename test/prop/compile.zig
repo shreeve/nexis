@@ -820,8 +820,9 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 3 },
         // assert builds its message and data at expansion.
         .{ .src = "(fn* [a] (assert a \"m\"))", .len = 7 },
-        // Overload dispatch compares the count inline.
-        .{ .src = "(fn ([x] x) ([x y] y))", .len = 20 },
+        // An overload clause is a routine of its own, the call's pick:
+        // the first returns its parameter in place.
+        .{ .src = "(fn ([x] x) ([x y] y))", .len = 1 },
         // A case of three or more constants: one lookup of the
         // clause's index, then a compare, a branch and the result
         // per clause.
@@ -1041,7 +1042,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
     _ = try program.run("(defn g [& _] 1) (defn h [& _] 1) (defprotocol P (pm [x]))");
     // Each the whole body of `(fn* [a b c m xs] ...)`, or of the
     // closure it makes when `inner`.
-    const Row = struct { form: []const u8, len: usize, inner: bool = false };
+    const Row = struct { form: []const u8, len: usize, inner: bool = false, second: ?usize = null };
     const rows = [_]Row{
         .{ .form = "(g (h a) (h b) (h c))", .len = 12 },
         .{ .form = "(g a b c)", .len = 6 },
@@ -1056,7 +1057,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
         .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 19 },
         .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 26, .inner = true },
-        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
+        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 4, .inner = true, .second = 5 },
         .{ .form = "(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))", .len = 9, .inner = true },
         .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },
         .{ .form = "(case a :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)", .len = 46 },
@@ -1082,6 +1083,14 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         if (routine.code.len != row.len) {
             std.debug.print("\n  {s}: {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, routine.code.len, row.len });
             failed = true;
+        }
+        // The other clause of a two-clause fn, its own routine.
+        if (row.second) |len| {
+            const other = routine.arities.?.fixed[routine.fixed_arity + 1].?;
+            if (other.code.len != len) {
+                std.debug.print("\n  {s}: its second clause is {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, other.code.len, len });
+                failed = true;
+            }
         }
     }
     try testing.expect(!failed);

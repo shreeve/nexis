@@ -230,7 +230,7 @@ routine, then every routine its capture descriptors build, depth
 first, a blank line between routines. A multi-arity fn lists every
 member of its arity table (VM.md §5) by arity, the rest clause last,
 each with its own header, and then the routines their descriptors
-build. `test/golden/cli/sum10.disasm`
+build; `test/golden/cli/multi-arity.disasm` pins one. `test/golden/cli/sum10.disasm`
 pins the listing of `examples/sum10.nx`:
 
 ```
