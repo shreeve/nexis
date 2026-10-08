@@ -1384,11 +1384,19 @@ fn clearDeadMoves(
     tries: []const vm.Try,
     extents: []const TryExtent,
 ) CompileError!bool {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
     const words = (@as(usize, slot_count) + 63) / 64;
     if (code.len == 0 or words == 0) return false;
+    // Many routines have no move to clear; most of the rest fit the
+    // stack buffer, the sets of a larger one going to an arena, all
+    // freed together.
+    for (code) |inst| {
+        if (isSlotMove(inst)) break;
+    } else return true;
+    var overflow = std.heap.ArenaAllocator.init(gpa);
+    defer overflow.deinit();
+    var buffer: [8192]u8 align(16) = undefined;
+    var first = std.heap.BufferFirstAllocator.init(&buffer, overflow.allocator());
+    const arena = first.allocator();
     const effects = try arena.alloc(Effects, code.len);
     for (code, effects) |inst, *fx| fx.* = effectsOf(inst, caps, slot_count) orelse return false;
     const flow = (try Flow.build(arena, code, tries, extents, words)) orelse return false;
@@ -1467,10 +1475,7 @@ fn clearDeadMoves(
         while (pc > flow.starts[b]) {
             pc -= 1;
             const inst = &code[pc];
-            if (inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move) and
-                inst.b.kind == .slot and inst.b.index != inst.a.index and
-                !bitHas(live, inst.b.index) and !bitHas(held, inst.b.index))
-            {
+            if (isSlotMove(inst.*) and !bitHas(live, inst.b.index) and !bitHas(held, inst.b.index)) {
                 inst.variant = @backingInt(vm.Mov.move_clear);
                 cleared = true;
             }
@@ -1479,6 +1484,13 @@ fn clearDeadMoves(
     }
     if (std.debug.runtime_safety and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
     return true;
+}
+
+/// Whether `inst` is a `mov:move` of one slot to another, which
+/// clears its source where the source is dead after it.
+fn isSlotMove(inst: Inst) bool {
+    return inst.group == @backingInt(vm.Group.mov) and inst.variant == @backingInt(vm.Mov.move) and
+        inst.b.kind == .slot and inst.a.kind == .slot and inst.b.index != inst.a.index;
 }
 
 /// The check that no instruction reads a slot a `mov:move-clear`
