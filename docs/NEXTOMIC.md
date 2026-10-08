@@ -429,6 +429,9 @@ so there is no queue; emdb's write lock is the transactor.
    :full`) and whose meta sync fails is published to every reader, so
    the caches take it as they take any commit, and `transact!` or
    `excise!` then raises `:db/durability-unknown` (`docs/DB.md` §8).
+   After it, or any failed sync of the file, a commit that would sync
+   raises `:db/sync-failed` before it writes anything, and the caches
+   stay as they were (§3 "Durability").
 8. Return `{:db-before db :db-after db :tx t :tempids {..} :tx-data
    [[e a v t added] ...]}` with `db-after.basis = t`. `:tx` and the
    rows carry the transaction number `t`; the transaction entity is
@@ -482,6 +485,19 @@ a sorted one, as a map form is. Any other `:sync` or `:durability`
 value is the VM's `:invalid-argument`. Consecutive
 transactions are never joined into one emdb transaction (`docs/DB.md`
 §3.3 "No batching").
+
+Once a sync of the file fails (a commit's, `:db/durability-unknown`
+among them, or `d/sync`'s or `release`'s own), the file syncs nothing
+more until it is reopened (emdb INV-SYNC-04, `docs/DB.md` §3.3 "A
+failed sync is final"): `d/sync`, and a `transact!` or `excise!` whose
+commit would sync (`:sync :full` or `:no-meta`), raise
+`:db/sync-failed`, the transaction publishing nothing; one that syncs
+nothing (`:sync :none`) commits; `release` and the end of `with-conn`
+sync nothing and raise nothing. Every connection to the file in the
+process shares its environment, so the recovery is to release every
+connection to the file (and close every `db/open` one); the next
+`connect` opens it afresh, syncing again over exactly the commits
+that were published.
 
 ---
 
@@ -921,7 +937,7 @@ predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 | form | semantics |
 |---|---|
 | `(d/connect path)` / `(d/connect path {:durability ... :sync ...})` | open or create, making the parent directories, bootstrap on first open (an empty path or one with a NUL byte is `:invalid-path`, as for `db/open`, DB.md §2), cache idents and schema; returns a connection whose commits sync as §3 "Durability" says. A complete store opens without writing, read-only when the file is (§2); `:db/map-full` only when the file cannot grow |
-| `(d/release conn)` | sync the file when a commit left it unsynced (§3 "Durability"), then close; idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4); a failed sync is `:db/sync-failed`, and the connection is closed |
+| `(d/release conn)` | sync the file when a commit left it unsynced (§3 "Durability"), then close; idempotent; `:nextomic/busy` while an operation on the connection is in flight (§4); a sync that fails here is `:db/sync-failed`, and the connection is closed; once a sync of the file has failed, it syncs nothing and raises nothing |
 | `(d/db conn)` | db-value at the current basis |
 | `(d/basis-t db)` | the basis |
 | `(d/transact! conn tx-data)` / `(d/transact! conn tx-data {:sync ...})` | §3; returns the report. tx-data forms: `[:db/add e a v]`, `[:db/retract e a v?]`, `[:db/retractEntity e]`, `[:db.fn/call f arg ...]`, `[:db.fn/cas e a old new]` and map forms |
@@ -940,7 +956,7 @@ predicate's is only tested (§5). Nextomic returns no lazy seq: `q`,
 | `(d/pull db pattern e)` | the pattern's map (§6.2); nil when the entity has no datoms in the view. Defined on current, as-of and since views; one read per call |
 | `(d/pull-many db pattern es)` | one result per entity of the vector or list `es`, in its order, in the same read |
 | `(d/with conn tx-data f)` | speculative transaction: tx-data applied in a held write transaction, `f` called with `db-after` (a db-value over the uncommitted state: `q`, `entity`, `pull`, `datoms`, `schema` and the time views read it) and the report `transact!` would have returned, then aborted. Returns `f`'s value; a throw inside `f` propagates after the abort; the committed basis is unchanged and the next `transact!` takes the same `t`. `transact!`, `with` and `excise!` inside the scope are `:nextomic/nested`; `db-after` after the scope is `:nextomic/closed` |
-| `(d/sync conn)` | nil once every commit to the file is durable: one full sync (`Env.sync`) when a commit left it unsynced, nothing otherwise |
+| `(d/sync conn)` | nil once every commit to the file is durable: one full sync (`Env.sync`) when a commit left it unsynced, nothing otherwise; `:db/sync-failed` once a sync of the file has failed, until it is reopened (§3 "Durability") |
 | `(d/with-conn [c path opts?] body...)` | macro: connect for the extent of body; released on every exit, a throw keeps propagating |
 
 A connection prints as `#nextomic/conn "path"`, the path a string
