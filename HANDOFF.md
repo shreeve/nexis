@@ -447,11 +447,13 @@ after numbers in the commit message.
 ## 8. Order of work
 
 1. The Linux gaps (`docs/PERF.md` §3.15, at `97e2d11`): nexis leads
-   babashka on startup and eight of the ten programs, is level on string
-   splitting and trails on the `map`/`filter`/`reduce` pipeline (1.30).
+   babashka on startup and nine of the ten programs, the
+   `map`/`filter`/`reduce` pipeline among them since the batched
+   callbacks of `docs/PERF.md` §3.33 (0.94, from 1.30), and is level on
+   string splitting.
    Warm JVM Clojure is faster on seven of ten: `fib` 6.0×, the
-   destructuring loop 5.5×, the pipeline 2.7×, vectors 2.6×, string
-   splitting 2.4×, the map build 2.1×, the transient map 1.2×; nexis
+   destructuring loop 5.5×, string splitting 2.4×, the map build 2.1×,
+   the pipeline and vectors 2.1× (§3.33), the transient map 1.2×; nexis
    leads on the counting loop (0.71), on `frequencies`/`group-by`
    (0.92) and on `sort` (93–96 ms against 147 ms, `docs/PERF.md`
    §3.32). Nextomic leads every system on every
@@ -473,9 +475,16 @@ after numbers in the commit message.
      handler hands the next), and its jumps fuse the compare and the
      branch (`ifLt`; `docs/PERF.md` §6 "A compare-and-branch
      instruction").
-   - The pipeline and vectors: a closure called from a native
-     (`VM.callPrepared`) is the largest share of their processes'
-     cycles.
+   - The pipeline and vectors (`docs/PERF.md` §3.33): a closure
+     called from a native takes its arguments and gives its result as
+     words, and `reduce`, `mapv`, `filterv` and the lazy `map`,
+     `filter` and `remove` make a run's calls in one pass of the chain
+     (`docs/VM.md` §6, "Batched calls"); on the Linux host the
+     pipeline 60 → 47 ms and vectors 75 → 61 ms. What remains is the
+     callee bodies' dispatches, the largest a leaf native called
+     through a Var (`(nth v i)`, `(even? x)`), which a call-site cache
+     must still see the Var's latest root for (`docs/PERF.md` §6
+     "Inline caches at call sites").
 2. TODO.md #13: `sort`, `reverse`, `mapv` and the other natives that
    walk to the end without consuming their argument (`docs/LAZY.md`
    §9) hold the seq they walk, and a local a closure captures holds it
