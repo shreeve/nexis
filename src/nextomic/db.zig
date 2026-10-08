@@ -558,7 +558,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = filter,
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees, index, prefix, end, self.db.window()) },
+            .source = .{ .folded = try foldIn(arena, try Store.foldScan(self.txn, store.trees, index, prefix, end, self.db.window())) },
         };
     }
 
@@ -582,7 +582,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = .{},
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees, index, start, end, self.db.window()) },
+            .source = .{ .folded = try foldIn(arena, try Store.foldScan(self.txn, store.trees, index, start, end, self.db.window())) },
         };
     }
 
@@ -615,6 +615,12 @@ pub const Read = struct {
     }
 };
 
+fn foldIn(arena: Allocator, scan: Store.FoldScan) !*Store.FoldScan {
+    const p = try arena.create(Store.FoldScan);
+    p.* = scan;
+    return p;
+}
+
 /// A folded datom stream over one index.
 pub const DatomScan = struct {
     read: *Read,
@@ -623,7 +629,10 @@ pub const DatomScan = struct {
     filter: Filter,
     source: union(enum) {
         current: Store.Scan,
-        folded: Store.FoldScan,
+        /// In the arena: a fold walks two trees, and a scan the
+        /// planner opens once a row, in the plain view, stays one
+        /// cursor wide.
+        folded: *Store.FoldScan,
     },
 
     /// Components the prefix does not pin exactly: those after a gap,
@@ -669,7 +678,7 @@ pub const DatomScan = struct {
                     const t = try key.readT(kv.value[0..key.id_len]);
                     return try self.materialise(parts, .{ .fact = kv.key, .t = t, .added = true, .current = true });
                 },
-                .folded => |*s| {
+                .folded => |s| {
                     const r = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, r.fact);
                     if (!self.filter.passes(self.index, parts)) continue;
