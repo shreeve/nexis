@@ -1710,7 +1710,12 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             }
             return acc;
         },
+        // Past the fixnum range each element is a bignum the step before
+        // allocated, which only the call it goes to holds, and only
+        // until its last use there (COMPILER.md §4.9): it waits in a
+        // second root slot, as `.iterate`'s does.
         .range_inf => |start| {
+            try scope.push(start);
             var x = start;
             var acc = init orelse blk: {
                 x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
@@ -1718,6 +1723,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
             };
             while (true) {
                 vm.roots.items[scope.base] = acc;
+                vm.roots.items[scope.base + 1] = x;
                 acc = try cb.call2(acc, x);
                 if (isReduced(vm, acc)) return reducedValue(acc);
                 x = try vm_mod.numAdd(heap, x, value_mod.fromFixnum(1).?);
@@ -7343,5 +7349,42 @@ test "stdlib: reduce, mapv, filterv and the lazy producers call a closure in bat
         const got = try rt.eval("user", c.src);
         defer gpa.free(got);
         try testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "stdlib: reduce over an infinite range past the fixnum range keeps its element and accumulator rooted" {
+    // `(range)` reaches the bignums only after 2^47 elements, so the
+    // ranges here start where they are: just below the fixnum limit,
+    // and at 2^131072, whose every element is a block past
+    // `max_small_block` that the heap hands back to its allocator when
+    // it is freed. The callback clears its element at its last use and
+    // then allocates past a collection's trigger.
+    var rt: ImageTestRuntime = undefined;
+    try rt.init();
+    defer rt.deinit();
+    try boot(&rt.loader);
+    const defs = try rt.eval("user",
+        \\(do (def big (nth (iterate (fn [x] (* x x)) 2) 17))
+        \\    (defn step [k] (fn [acc x] (let [d (k x)] (vec (range 20000)) (if (= 6 (count acc)) (reduced (conj acc d)) (conj acc d)))))
+        \\    (def near (step str))
+        \\    (def far (step (fn [x] (- x big)))))
+    );
+    defer testing.allocator.free(defs);
+    const vm = &rt.v;
+    vm.setGcPolicy(vm_mod.GcPolicy.stress);
+    for ([_]struct { f: []const u8, start: []const u8, want: []const u8 }{
+        .{ .f = "near", .start = "140737488355325", .want = "[\"140737488355325\" \"140737488355326\" \"140737488355327\" \"140737488355328\" \"140737488355329\" \"140737488355330\" \"140737488355331\"]" },
+        .{ .f = "far", .start = "big", .want = "[0 1 2 3 4 5 6]" },
+    }) |case| {
+        const f = try rt.loader.evalSource(&.{ .path = "<test>", .text = case.f }, .{ .allocator = vm.runtime_arena.allocator() });
+        const start = try rt.loader.evalSource(&.{ .path = "<test>", .text = case.start }, .{ .allocator = vm.runtime_arena.allocator() });
+        const s = try seq_mod.make(vm, seq_mod.op_range_inf, &.{start});
+        const cycles = vm.gc_cycles;
+        const got = try fnReduce(vm, &.{ f, try vector_mod.empty(vm.ensureHeap()), s });
+        try testing.expect(vm.gc_cycles >= cycles + 7);
+        var w = std.Io.Writer.Allocating.init(testing.allocator);
+        defer w.deinit();
+        try format_mod.format(got, .readable, &w.writer, vm.ensureInterner());
+        try testing.expectEqualStrings(case.want, w.written());
     }
 }

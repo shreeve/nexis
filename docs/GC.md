@@ -436,6 +436,10 @@ The rule each native follows, by what it holds across a further
    each element to the callback and keep it after the call: it waits
    in a root slot of the native's while the callback runs, then in
    `Results` or the group's vector;
+   `reduce` over `(range)` past the fixnum range, whose element is a
+   bignum it computed, and over an `iterate` pass the element to the
+   function and step from it after the call: it waits in a second
+   root slot (`reducePure`);
    `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
    `rootedSeqIter`, which pushes each built value on the native's

@@ -7,18 +7,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ---
 
-## Gaps
-
-17. **`reduce` over an infinite range roots neither its element nor
-    its accumulator across a step** (`src/stdlib.zig` `reducePure`,
-    `.range_inf`). Past the fixnum range each element is a bignum the
-    next step allocates, so a collection then could free the element
-    the callback has cleared (`docs/COMPILER.md` §4.9) or the result it
-    returned. `(range)` reaches the bignums only after 2^47 elements,
-    which no test reaches; root both in the scope's slots as the
-    `.iterate` branch does, with a test that builds the range near
-    the fixnum limit.
-
 ## Performance
 
 2. **Small transactions are emdb's page work.** A `transact!` of one
