@@ -323,6 +323,8 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304" },
             .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
+            .{ .args = &.{ "disasm", cli ++ "multi-arity.nx" }, .stdout = "multi-arity.disasm" },
+            .{ .args = &.{ "run", cli ++ "arity-multi.nx" }, .stderr = "arity-multi.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
             .{ .args = &.{ "run", cli ++ "deep-recursion.nx" }, .stdout = "deep-recursion.out" },
             .{ .args = &.{ "run", cli ++ "deep-nesting.nx" }, .stdout = "deep-nesting.out" },

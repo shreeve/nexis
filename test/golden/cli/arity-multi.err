@@ -1,0 +1,5 @@
+nexis: test/golden/cli/arity-multi.nx:9:3: runtime error: ArityMismatch: area takes 1 or 2 arguments, got 3
+      (area 2 3 4))
+      ^^^^^^^^^^^^
+  at report (test/golden/cli/arity-multi.nx:9:3)
+  at <top> (test/golden/cli/arity-multi.nx:11:1)

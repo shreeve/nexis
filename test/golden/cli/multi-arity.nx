@@ -1,0 +1,9 @@
+; A multi-arity fn: a routine per clause, the closure naming the
+; first, and a clause's call of another clause's arity a call:self.
+
+(defn total
+  ([n] (total n 0))
+  ([n acc] (if (< n 1) acc (total (dec n) (+ acc n))))
+  ([n acc & more] (total n (apply + acc more))))
+
+(println (total 10) (total 3 1 2))

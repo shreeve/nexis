@@ -495,20 +495,32 @@ fn bindParams(scope: *Scope, params: []const *Form) ExpandError!void {
     }
 }
 
-/// `(fn* name? [params] body...)`: the body expands with the name
-/// and the parameters in scope; the parameter vector does not expand
-/// and loses its hints.
+/// `(fn* name? [params] body...)` or `(fn* name? ([params] body...)+)`:
+/// each body expands with the name and its clause's parameters in
+/// scope; a parameter vector does not expand and loses its hints.
 fn expandFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *Form) ExpandError!*Form {
     const name: []const *Form = if (items.len > 1 and items[1].datum == .symbol) items[1..2] else &.{};
     const rest = items[1 + name.len ..];
     if (rest.len == 0) return ctx.fail(list_form.origin, "fn*: expected a parameter vector", .{});
-    const params = try stripParams(ctx, rest[0]);
+    const b = Builder{ .ctx = ctx, .origin = list_form.origin };
+    if (rest[0].datum != .list) return makeList(ctx, try b.items(.{ items[0], name, try fnStarClause(ctx, name, rest) }), list_form.origin);
+    const clauses = try ctx.allocator.alloc(*Form, rest.len);
+    for (rest, clauses) |clause, *out| {
+        if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "fn*: expected a clause ([params] body...), not {s}", .{describeForm(clause)});
+        out.* = try makeList(ctx, try fnStarClause(ctx, name, clause.datum.list), clause.origin);
+    }
+    return makeList(ctx, try b.items(.{ items[0], name, clauses }), list_form.origin);
+}
+
+/// `[params] body...` of a `fn*` with `body` expanded.
+fn fnStarClause(ctx: *ExpandContext, name: []const *Form, forms: []const *Form) ExpandError![]*Form {
+    const params = try stripParams(ctx, forms[0]);
     if (params.datum != .vector) return ctx.fail(params.origin, "fn*: expected a parameter vector, not {s}", .{describeForm(params)});
     var scope: Scope = .{ .ctx = ctx };
     defer scope.close();
     try bindParams(&scope, name);
     try bindParams(&scope, params.datum.vector);
-    return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{ items[0], name, params, try expandAll(ctx, rest[1..]) }), list_form.origin);
+    return (Builder{ .ctx = ctx, .origin = forms[0].origin }).items(.{ params, try expandAll(ctx, forms[1..]) });
 }
 
 /// `(letfn* [(name params-or-clauses body...) ...] body...)`: every
@@ -530,7 +542,7 @@ fn expandLetFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *
         // The entry as `(fn* name [params] body...)`, expanded with
         // every name in scope, is `(name [params] body...)` behind its
         // head.
-        const fn_form = try expandFnStar(ctx, entry, (try fnStar(ctx, entry, entry.datum.list)).datum.list);
+        const fn_form = try expandFnStar(ctx, entry, (try expandFnRename(ctx, entry, entry.datum.list)).datum.list);
         out.* = try makeList(ctx, fn_form.datum.list[1..], entry.origin);
     }
     return makeList(ctx, try (Builder{ .ctx = ctx, .origin = list_form.origin }).items(.{
@@ -538,18 +550,6 @@ fn expandLetFnStar(ctx: *ExpandContext, list_form: *const Form, items: []const *
         try makeVector(ctx, new_entries, items[1].origin),
         try expandAll(ctx, items[2..]),
     }), list_form.origin);
-}
-
-/// `(fn args...)` lowered to its `(fn* ...)` form, destructuring and
-/// overload clauses included, without expanding the body.
-fn fnStar(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
-    var fn_form = try expandFnRename(ctx, call_form, args);
-    // Overload clauses come back as `(fn name? [& args] body)`; one
-    // more pass renames that to `fn*`.
-    if (std.mem.eql(u8, fn_form.datum.list[0].datum.symbol.name, "fn")) {
-        fn_form = try expandFnRename(ctx, call_form, fn_form.datum.list[1..]);
-    }
-    return fn_form;
 }
 
 /// What kind of form `form` is, with its article, for a failure
@@ -1220,7 +1220,7 @@ fn expandDefmacro(ctx: *ExpandContext, list_form: *const Form, items: []const *F
     const name = parts.name.datum.symbol.name;
     const ceval = ctx.compile_eval orelse return ctx.fail(origin, "defmacro {s}: macros cannot be defined here", .{name});
     const b = Builder{ .ctx = ctx, .origin = origin };
-    const fn_form = try fnStar(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
+    const fn_form = try expandFnRename(ctx, list_form, try b.items(.{ parts.name, parts.fn_tail }));
     // The Var's metadata says it is a macro, as Clojure's does.
     const meta = try std.mem.concat(ctx.allocator, *Form, &.{ parts.meta, &.{ try b.kw("macro"), try makeForm(ctx, .{ .bool_ = true }, origin) } });
     const expanded = try expandForm(ctx, try b.list(.{ "def", try withMetaMap(b, parts.name, meta), fn_form }));
@@ -1252,16 +1252,7 @@ fn callUserMacro(
     // The closure's routine, or a member of its arity table, takes
     // the count (docs/VM.md §6).
     const routine = vm_mod.VM.asClosure(macro_var.root).routine;
-    if (routine.entryFor(args.len) == null) {
-        if (routine.arities != null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
-        return ctx.fail(span, "macro {s} takes {d}{s} argument{s}, got {d}", .{
-            name,
-            routine.fixed_arity,
-            if (routine.variadic) " or more" else "",
-            if (routine.fixed_arity == 1 and !routine.variadic) "" else "s",
-            args.len,
-        });
-    }
+    if (routine.entryFor(args.len) == null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
 
     // Each argument as data, unevaluated.
     const arg_values = try ctx.allocator.alloc(value_mod.Value, args.len);
@@ -1698,11 +1689,11 @@ fn expandLetRename(ctx: *ExpandContext, call_form: *const Form, args: []const *F
     return b.list(.{ "let*", try makeVector(ctx, out.items, args[0].origin), args[1..] });
 }
 
-/// `(fn name? [params] body...)` → `(fn* name? [params'] body...)`:
-/// a pattern parameter becomes a gensym that `(let [pattern gensym
-/// ...] body...)` destructures, so a map pattern after `&` takes
-/// keyword arguments. Overload clauses `(fn name? ([p] b) ...)` go
-/// through `multiArityFn`.
+/// `(fn name? [params] body...)` → `(fn* name? [params'] body...)`,
+/// and overload clauses `(fn name? ([p] b) ...)` → `(fn* name? ([p']
+/// b') ...)` (`multiArityFn`): a pattern parameter becomes a gensym
+/// that `(let [pattern gensym ...] body...)` destructures, so a map
+/// pattern after `&` takes keyword arguments.
 fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Form) ExpandError!*Form {
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const named = args.len > 0 and args[0].datum == .symbol;
@@ -1712,7 +1703,14 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
     const params_form = try stripParams(ctx, tail[0]);
     if (params_form.datum == .list) return multiArityFn(b, name, tail);
     if (params_form.datum != .vector) return ctx.fail(params_form.origin, "fn: expected a parameter vector, got {s}", .{describeForm(params_form)});
+    return b.list(.{ "fn*", name, try fnClause(b, params_form, tail[1..]) });
+}
 
+/// `[params'] body'` for the parameter vector `params_form` and the
+/// forms of `body`: the pattern parameters made gensyms that a `let`
+/// around the body destructures, the body conditioned.
+fn fnClause(b: Builder, params_form: *const Form, forms: []const *Form) ExpandError![]*Form {
+    const ctx = b.ctx;
     const params = try ctx.allocator.dupe(*Form, params_form.datum.vector);
     var patterns: std.ArrayList(*Form) = .empty;
     for (params) |*p| {
@@ -1723,9 +1721,9 @@ fn expandFnRename(ctx: *ExpandContext, call_form: *const Form, args: []const *Fo
         }
     }
     const new_params = try makeVector(ctx, params, params_form.origin);
-    const body = try conditionedBody(b, tail[1..]);
-    if (patterns.items.len == 0) return b.list(.{ "fn*", name, new_params, body });
-    return b.list(.{ "fn*", name, new_params, try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), body }) });
+    const body = try conditionedBody(b, forms);
+    if (patterns.items.len == 0) return b.items(.{ new_params, body });
+    return b.items(.{ new_params, try b.list(.{ "nexis.core/let", try b.vec(.{patterns.items}), body }) });
 }
 
 /// A fn body whose first form is a condition map `{:pre [c...]
@@ -1802,32 +1800,25 @@ fn renameHead(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, 
 }
 
 /// Overload clauses `([params] body...)+` of `fn`, `defn` or a
-/// `letfn` binding lowered to one variadic function dispatching on
-/// argument count:
+/// `letfn` binding lowered to `fn*`'s own clauses, each through
+/// `fnClause`:
 ///
-///   (fn name? [& args#]
-///     (let* [n# (count args#)]
-///       (if (== n# 1) (loop [p1 (first args#)] b1)
-///       (if (== n# 2) (loop [p1 (first args#) p2 (nth args# 1)] b2)
-///       (if (>= n# k) (loop [... r (next ... args#)] bv)
-///       (throw :arity-mismatch))))))
+///   (fn* name? ([p1'] b1') ([p1' p2'] b2') ([p1' & r'] bv'))
 ///
-/// `n#` is a count, so the tests are the inlined fixnum compares, and
-/// every `nth` is in range once its clause's test has passed.
-/// Fixed arities are tested in source order and the variadic clause
-/// last, so an exact arity wins over the variadic one. At most one
-/// clause is variadic, its fixed count is not below any fixed
-/// arity, and no fixed arity repeats (Clojure's rules). Each clause
-/// binds through `loop`, so its params destructure and a `recur` in
-/// the clause's tail re-enters that clause with the clause's own
-/// arity (a variadic clause's rest parameter receives one seq); a
-/// `recur` inside a nested `loop` targets that loop.
+/// The compiler makes each clause a routine of its own over one arity
+/// table, and a call enters the clause its count picks
+/// (COMPILER.md §5.5), so a `recur` in a clause re-enters that clause
+/// with its own arity (a variadic clause's rest parameter receives one
+/// seq) and a pattern parameter destructures again after it. At most
+/// one clause is variadic, its fixed count is not below any fixed
+/// arity, and no fixed arity repeats (Clojure's rules); the check here
+/// names the clause at fault.
 fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandError!*Form {
     const ctx = b.ctx;
-    const Arity = struct { fixed: usize, variadic: bool, params: []const *Form, body: []const *Form };
-    var fixed_arities: std.ArrayList(Arity) = .empty;
-    var variadic: ?Arity = null;
-    for (clauses) |clause| {
+    var fixed_arities: std.ArrayList(usize) = .empty;
+    var variadic: ?usize = null;
+    const out = try ctx.allocator.alloc(*Form, clauses.len);
+    for (clauses, out) |clause, *o| {
         if (clause.datum != .list or clause.datum.list.len == 0) return ctx.fail(clause.origin, "fn: expected an overload clause ([params] body...), not {s}", .{describeForm(clause)});
         const params_form = try stripParams(ctx, clause.datum.list[0]);
         if (params_form.datum != .vector) return ctx.fail(params_form.origin, "fn: expected a parameter vector, got {s}", .{describeForm(params_form)});
@@ -1835,45 +1826,20 @@ fn multiArityFn(b: Builder, name: []const *Form, clauses: []const *Form) ExpandE
         const fixed = for (params, 0..) |p, i| {
             if (isAmpersand(p)) break i;
         } else params.len;
-        const arity: Arity = .{ .fixed = fixed, .variadic = fixed < params.len, .params = params, .body = clause.datum.list[1..] };
-        if (arity.variadic) {
+        if (fixed < params.len) {
             if (variadic != null) return ctx.fail(clause.origin, "fn: at most one overload clause may be variadic", .{});
             if (fixed + 2 != params.len) return ctx.fail(params_form.origin, "fn: & takes exactly one parameter after it", .{});
-            variadic = arity;
+            variadic = fixed;
         } else {
-            for (fixed_arities.items) |a| if (a.fixed == fixed) return ctx.fail(clause.origin, "fn: two overload clauses take {d} arguments", .{fixed});
-            try fixed_arities.append(ctx.allocator, arity);
+            for (fixed_arities.items) |a| if (a == fixed) return ctx.fail(clause.origin, "fn: two overload clauses take {d} arguments", .{fixed});
+            try fixed_arities.append(ctx.allocator, fixed);
         }
+        o.* = try makeList(ctx, try fnClause(b, params_form, clause.datum.list[1..]), clause.origin);
     }
     if (variadic) |v| for (fixed_arities.items) |a| {
-        if (a.fixed > v.fixed) return ctx.fail(b.origin, "fn: a fixed arity of {d} is above the variadic clause's {d}", .{ a.fixed, v.fixed });
+        if (a > v) return ctx.fail(b.origin, "fn: a fixed arity of {d} is above the variadic clause's {d}", .{ a, v });
     };
-
-    const args = try b.gensym("nx");
-    const n = try b.gensym("nx");
-    var chain = try b.list(.{ "throw", ":arity-mismatch" });
-    var i = fixed_arities.items.len + @intFromBool(variadic != null);
-    while (i > 0) {
-        i -= 1;
-        const a = if (i == fixed_arities.items.len) variadic.? else fixed_arities.items[i];
-        var bindings: std.ArrayList(*Form) = .empty;
-        for (a.params[0..a.fixed], 0..) |p, k| {
-            const arg = if (k == 0) try b.list(.{ "nexis.core/first", args }) else try b.list(.{ "nexis.core/nth", args, k });
-            try bindings.appendSlice(ctx.allocator, &.{ p, arg });
-        }
-        if (a.variadic) {
-            // `nthnext`: an empty rest is nil, as the VM binds a
-            // single-arity fn's (VM.md §6).
-            const rest = if (a.fixed == 0) args else try b.list(.{ "nexis.core/nthnext", args, a.fixed });
-            const pattern = a.params[a.fixed + 1];
-            try bindings.appendSlice(ctx.allocator, &.{ pattern, rest });
-        }
-        const test_form = try b.list(.{ if (a.variadic) "nexis.core/>=" else "nexis.core/==", n, a.fixed });
-        // `loop`, not `loop*`, so a pattern parameter destructures
-        // on entry and after every `recur`.
-        chain = try b.list(.{ "if", test_form, try b.list(.{ "nexis.core/loop", try b.vec(.{bindings.items}), try conditionedBody(b, a.body) }), chain });
-    }
-    return b.list(.{ "nexis.core/fn", name, try b.vec(.{ "&", args }), try b.list(.{ "let*", try b.vec(.{ n, try b.list(.{ "nexis.core/count", args }) }), chain }) });
+    return b.list(.{ "fn*", name, out });
 }
 
 /// Append the plain bindings that destructure `pattern` over `expr`

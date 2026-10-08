@@ -1,0 +1,48 @@
+routine <top> (test/golden/cli/multi-arity.nx:4:1) slots=6 arity=0 upvalues=0
+  0000  closure:make        s2  #0<routine total arities 1,2,2+rest>[]  ; 4:1
+  0001  var:store-var       s2  v0=user/total
+  0002  var:var-object      s1  v0=user/total
+  0003  var:load-var        s3  v1=nexis.core/reset-meta!
+  0004  mov:move.s          s4  s1  -
+  0005  mov:load-const      s5  c0={:arglists ([n] [n acc] [n acc & more]), :name total, :ns ...(3 items)
+  0006  call:call           s3  #2  s2
+  0007  mov:move-clear      s0  s1  -
+  0008  call:return.s       s0  -  -
+
+routine total (test/golden/cli/multi-arity.nx:4:1) slots=4 arity=1 upvalues=0
+  0000  mov:move-clear      s2  s0  -  ; 5:15
+  0001  mov:load-const      s3  c0=0  ; 5:17
+  0002  call:self           s2  #2  s1  ; 5:8
+  0003  call:return.s       s1  -  -
+
+routine total (test/golden/cli/multi-arity.nx:4:1) slots=5 arity=2 upvalues=0
+  0000  cmp:lt.sc+if-false  s3  s0  c0=1  ; 6:16
+  0001  jump:if-false       s3  j0003  ; 6:12
+  0002  call:return.s       s1  -  -  ; 6:24
+  0003  math:sub.sc         s3  s0  c0=1  ; 6:35
+  0004  math:add.ss         s4  s1  s0  ; 6:43
+  0005  call:self           s3  #2  s2  ; 6:28
+  0006  call:return.s       s2  -  -
+
+routine total (test/golden/cli/multi-arity.nx:4:1) slots=8 arity=2+rest upvalues=0
+  0000  var:load-var        s4  v0=nexis.core/apply  ; 7:29
+  0001  var:load-var        s5  v1=nexis.core/+  ; 7:35
+  0002  mov:move-clear      s6  s1  -  ; 7:37
+  0003  mov:move-clear      s7  s2  -  ; 7:41
+  0004  call:call           s4  #3  s5  ; 7:28
+  0005  mov:move-clear      s4  s0  -  ; 7:26
+  0006  call:self           s4  #2  s3  ; 7:19
+  0007  call:return.s       s3  -  -
+
+routine <top> (test/golden/cli/multi-arity.nx:9:1) slots=7 arity=0 upvalues=0
+  0000  var:load-var        s1  v0=nexis.core/println  ; 9:2
+  0001  var:load-var        s2  v1=user/total  ; 9:11
+  0002  mov:load-const      s3  c0=10  ; 9:17
+  0003  call:call           s2  #1  s2  ; 9:10
+  0004  var:load-var        s3  v1=user/total  ; 9:22
+  0005  mov:load-const      s4  c1=3  ; 9:28
+  0006  mov:load-const      s5  c2=1  ; 9:30
+  0007  mov:load-const      s6  c3=2  ; 9:32
+  0008  call:call           s3  #3  s3  ; 9:21
+  0009  call:call           s1  #2  s0  ; 9:1
+  0010  call:return.s       s0  -  -

@@ -413,7 +413,7 @@ protocol method. `test/prop/compile.zig` pins every row.
 | `(let [[x y & r] xs] (g x y r))` | 20 |
 | `(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))`, a seq taken as keyword arguments, each key a lookup (MACROEXPAND.md §10) | 19 |
 | `(fn [[x y] {:keys [p]}] (g x y p))`, the closure's routine | 26 |
-| `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's routine | 27 |
+| `(fn ([x] (g x)) ([x y] (g x y)))`, the closure's two routines, a clause each (§5.5) | 4, 5 |
 | `(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))`, the closure's routine: two self-calls (§5.5) | 9 |
 | `(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)` | 13 |
 | `(case a :k0 0 :k1 1 ... :k9 9)`, ten keywords or ints | 46 |
@@ -579,7 +579,7 @@ a captured binding is boxed with `closure:box-local` immediately
 (§6.1), except that a binding to a local shares that local's slot
 when §4.4 allows it. The body compiles as `do`.
 
-#### 5.5 `(fn* name? [params... & rest?] body...)`
+#### 5.5 `(fn* name? [params... & rest?] body...)`, `(fn* name? ([params...] body...)+)`
 
 - The body compiles into a child routine, named by a capture
   descriptor of the current routine (the wide field of
@@ -592,8 +592,22 @@ when §4.4 allows it. The body compiles as `do`.
 - The routine records `fixed_arity` and `variadic`; the rest parameter
   is slot `params.len`, filled by the VM at call time (VM.md §6). A
   captured parameter, rest included, is boxed at function entry.
-- `fn*` takes one parameter vector; multi-arity `fn` and `defn` are
-  the expander's (MACROEXPAND.md §10).
+- `fn*` takes one parameter vector and its body, or one or more
+  clauses `([params...] body...)`, as Clojure's `fn*` does. The clauses
+  keep Clojure's rules, else `MalformedForm`: no two take the same
+  fixed count, at most one has a rest parameter, and its fixed count
+  is at least every other clause's.
+
+**Clauses.** Each clause compiles into a routine of its own, in a
+child Emitter of its own, so a clause is an ordinary `fn*` body for
+every rule here, `recur` (§5.6) and locals clearing (§4.9) included.
+With two or more, the routines share one arity table (VM.md §5): the
+closure is made over the first clause's routine, its head, and a call
+enters the clause its argument count picks (VM.md §6). Every clause's
+child starts from the captures the clauses before it made, so a name
+keeps its upvalue in every clause; the descriptor's sources are the
+captures of them all, and every routine carries their count. One
+clause is an ordinary `fn*`, with no table.
 
 **Returns in the tail.** The body's tail positions (§4.4) return the
 value themselves: a literal, a local or a Var with `call:return` of
@@ -604,12 +618,15 @@ in the tail passes it to its body. `(fn* [a] (if a 1))` is
 `jump:if-false`, `call:return c`, `call:return-nil`. The tail never
 reaches into a `try` (§5.10), so no return leaves a handler behind.
 
-**Self-calls.** A call of the self-name with the fixed arity, made in
-the body itself rather than in a `fn*` inside it, by a `fn*` with no
-rest parameter and at most 256 parameters, is a self-call: the
-arguments compute into a block, which becomes the callee's window, and
-`call:self` (VM.md §6) calls the frame's own closure, with no cell to
-read and no callee to test. `fib`'s body is nine instructions, two of
+**Self-calls.** A call of the self-name with the fixed arity of a
+clause without a rest parameter and with at most 256 parameters, made
+in a body of the `fn*` itself rather than in a `fn*` inside it, is a
+self-call: the arguments compute into a block, which becomes the
+callee's window, and `call:self` (VM.md §6) calls the frame's own
+closure, entering that clause, with no cell to read and no callee to
+test. A clause may self-call another, the rest clause a fixed one; a
+count only the rest clause takes is an ordinary call through the
+cell. `fib`'s body is nine instructions, two of
 them `call:self`:
 
 ```
@@ -626,7 +643,8 @@ call:return     s1  -  -
 ```
 
 **Self-name.** Any other reference to the self-name, as a value, from
-a `fn*` inside the body, or in a call at another arity, reads the
+a `fn*` inside the body, or in a call at a count no fixed clause
+takes, reads the
 closure, which does not exist yet at `closure:make`, so it goes
 through a placeholder cell:
 
@@ -712,17 +730,19 @@ captured-parameter boxing prelude, so the rebind and jump re-enter the
 body without a call. The bindings are the fixed parameters followed,
 for a variadic `fn*`, by the rest slot: `(recur a b s)` into `(fn* [a
 b & r] ...)` puts `s` in `r` as it is (Clojure's rule), and omitting
-it is `RecurArityMismatch`. Overload clauses bind their parameters
-through `loop`, so a `recur` in a clause re-enters that clause
-(MACROEXPAND.md §10, `fn`).
+it is `RecurArityMismatch`. Each clause of a `fn*` with several is
+its own target, so a `recur` in a clause rebinds that clause's
+parameters, its rest included, and re-enters it.
 
 #### 5.6b `(letfn* [(name1 [params] body...) ...] body...)`
 
-Every name is visible to every function and to the body, so the
-functions can call each other:
+An entry may instead hold clauses, `(name ([params...] body...)+)`, as
+`fn*` takes them (§5.5). Every name is visible to every function and
+to the body, so the functions can call each other:
 
 1. `closure:new-cell` a placeholder cell for each name.
-2. Compile each function (a rest parameter is allowed); its
+2. Compile each function (a rest parameter is allowed, and a function
+   with clauses compiles as a `fn*` with them does); its
    descriptor lists every `letfn*` name it references, itself
    included, as a `local_cell_slot` source.
 3. `closure:make` each closure (each captures cells the others fill).

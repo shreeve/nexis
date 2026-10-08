@@ -9,7 +9,8 @@
 ;;
 ;; Every program runs at two sizes; its cost per unit is
 ;; (I(hi) - I(lo)) / units, so startup, compilation and the printing
-;; cancel. A unit is an iteration or an element, a call for fib.nx.
+;; cancel. A unit is an iteration or an element, a call for fib.nx and
+;; afib.nx.
 ;; Rounds interleave: each round runs every (binary, program, size)
 ;; once, the order rotated by one each round, and the cost is the
 ;; median over the rounds of each round's pair, with the range. The
@@ -31,10 +32,11 @@
   (let [m5 [5000000 10000000] cb [1000000 2000000]]
     (array-map "count" m5 "acc" m5 "fib" [27 30] "gcall" m5 "lc" m5 "lv" m5
                "mv" m5 "mvc" m5 "kw" m5 "leaf" m5 "getnl" m5 "pcall" m5 "casek" m5 "mcall" m5
-               "cbbase" cb "cbsum" cb "cbred" cb "cb" cb "lazy" cb
+               "acall" m5 "vcall" m5 "afib" [27 30]
+               "cbbase" cb "cbsum" cb "cbred" cb "cb" cb "lazy" cb "xform" cb
                "lazy3" [1500000 3000000] "lazyl" [1500000 3000000] "lazyf" [1500000 3000000])))
 
-(def callback-programs #{"cbsum" "cbred" "cb" "lazy"})
+(def callback-programs #{"cbsum" "cbred" "cb" "lazy" "xform"})
 
 (defn fib-calls
   "The calls (fib n) makes, itself included: 2 F(n+1) - 1."
@@ -42,7 +44,11 @@
   (loop [i 0 a 0 b 1] (if (> i n) (dec (* 2 a)) (recur (inc i) b (+ a b)))))
 
 (defn units [prog lo hi]
-  (if (= prog "fib") (- (fib-calls hi) (fib-calls lo)) (- hi lo)))
+  (case prog
+    "fib" (- (fib-calls hi) (fib-calls lo))
+    ;; Every step is two calls, one into each clause.
+    "afib" (* 2 (- (fib-calls hi) (fib-calls lo)))
+    (- hi lo)))
 
 (defn parse-args [args]
   (loop [o {:rounds 5 :programs (keys programs) :bins []} [a & more] args]

@@ -1,0 +1,4 @@
+; bench/micro/vcall.nx N: count plus a call of a two-clause defn at its variadic clause, one argument in its rest.
+(defn f ([x] x) ([x y & m] m))
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (f 1 2 3)) k))))

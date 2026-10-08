@@ -327,6 +327,17 @@ const cases = [_]Case{
     // held keeps calling itself after the Var is redefined
     // (CLOJURE-REVIEW.md, defn).
     .{ .src = "(do (defn f [n] (if (= n 0) :done (f (dec n)))) (def g f) (defn f [n] :redefined) (g 3))", .out = ":done" },
+    // A fn* with a clause per arity: the exact clause wins over the
+    // variadic one, whose rest is nil at its own count; each clause
+    // recurs to itself, captures are shared, and a clause calls
+    // another through the self-name, 200,000 calls deep.
+    .{ .src = "(let* [f (fn* ([] :0) ([a] :1) ([a b] :2) ([a b c d & m] [:v m]))] [(f) (f 1) (f 1 2) (f 1 2 3 4) (f 1 2 3 4 5 6)])", .out = "[:0 :1 :2 [:v nil] [:v (5 6)]]" },
+    .{ .src = "(let* [f (fn* ([x] [:one x]) ([x & r] [:rest x r]))] [(f 1) (f 1 2) (apply f 1 [2 3])])", .out = "[[:one 1] [:rest 1 (2)] [:rest 1 (2 3)]]" },
+    .{ .src = "(let* [f (fn* ([] :none) ([& r] r))] [(f) (f 1) (apply f [])])", .out = "[:none (1) :none]" },
+    .{ .src = "(let* [f (fn* ([n] (if (< n 3) (recur (inc n)) n)) ([n acc] (if (< n 1) acc (recur (dec n) (+ acc n)))) ([x y & r] (if r (recur (+ x (first r)) y (next r)) (+ x y))))] [(f 0) (f 5 0) (f 1 2 3 4)])", .out = "[3 15 10]" },
+    .{ .src = "(let* [x 10 y 20] (let* [f (fn* ([] x) ([a] (+ a y)) ([a b] (+ a b x y)))] [(f) (f 1) (f 1 2) (map f [1 2]) (reduce f [1 2 3])]))", .out = "[10 21 33 (21 22) 66]" },
+    .{ .src = "((fn* f ([n] (if (< n 1) 0 (+ n (f (dec n) 0)))) ([n _] (f n))) 100000)", .out = "5000050000" },
+    .{ .src = "((fn* f ([n] (f n 0 :x)) ([n a & r] [n a r])) 1)", .out = "[1 0 (:x)]" },
 };
 
 test "cases: each source evaluates to the printed value" {
@@ -362,6 +373,11 @@ const failures = [_]Failure{
     .{ .src = "(fn* [x &] x)", .err = error.MalformedForm },
     .{ .src = "(fn* [x & r y] x)", .err = error.MalformedForm },
     .{ .src = "(fn* (x) x)", .err = error.MacroExpansionFailure },
+    // A fn*'s clauses keep Clojure's rules.
+    .{ .src = "(fn* ([x] 1) ([y] 2))", .err = error.MalformedForm },
+    .{ .src = "(fn* ([& a] 1) ([& b] 2))", .err = error.MalformedForm },
+    .{ .src = "(fn* ([a b c] 1) ([a & r] 2))", .err = error.MalformedForm },
+    .{ .src = "(fn* ([a] 1) [b] 2)", .err = error.MacroExpansionFailure },
     .{ .src = "(def 42 5)", .err = error.MacroExpansionFailure },
     .{ .src = "(var)", .err = error.MalformedForm },
     .{ .src = "(letfn* [(f [] 1) (f [] 2)] (f))", .err = error.DuplicateBinding },
@@ -384,6 +400,8 @@ const failures = [_]Failure{
     // Run-time failures of compiled code.
     .{ .src = "((fn* [x y] x) 1)", .err = error.ArityMismatch },
     .{ .src = "((fn* [a b & r] a) 1)", .err = error.ArityMismatch },
+    .{ .src = "((fn* ([] 0) ([a b] 2)) 1)", .err = error.ArityMismatch },
+    .{ .src = "((fn* ([] 0) ([a b & r] 2)) 1)", .err = error.ArityMismatch },
     .{ .src = "(var nope/x)", .err = error.UnresolvedSymbol },
     .{ .src = "(var nexis.core/no-such-var)", .err = error.UnresolvedSymbol },
     .{ .src = "never-bound", .err = error.UnboundVar },
@@ -802,8 +820,9 @@ test "codegen: what common shapes cost (COMPILER.md §4.4, §4.8)" {
         .{ .src = "(fn* [a] (cond a 1 :else 2))", .len = 3 },
         // assert builds its message and data at expansion.
         .{ .src = "(fn* [a] (assert a \"m\"))", .len = 7 },
-        // Overload dispatch compares the count inline.
-        .{ .src = "(fn ([x] x) ([x y] y))", .len = 20 },
+        // An overload clause is a routine of its own, the call's pick:
+        // the first returns its parameter in place.
+        .{ .src = "(fn ([x] x) ([x y] y))", .len = 1 },
         // A case of three or more constants: one lookup of the
         // clause's index, then a compare, a branch and the result
         // per clause.
@@ -857,6 +876,50 @@ test "codegen: a fn's call of its own name at its fixed arity is call:self, and 
         var self_calls = false;
         for (routine.code) |inst| {
             if (inst.group == self_op.group and inst.variant == self_op.variant) self_calls = true;
+        }
+        try testing.expectEqual(shape.self_calls, self_calls);
+    }
+}
+
+test "codegen: a fn* with a clause per arity is a routine per clause, a self-call of any fixed clause call:self (COMPILER.md §5.5)" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const self_op = nx.vm.Inst.primary(.call, nx.vm.Call.self_, nx.vm.Operand.none, nx.vm.Operand.none, nx.vm.Operand.none);
+    // The enclosing routine's instructions, the members' upvalues, the
+    // table's fixed length (0 for none), whether it has a rest clause,
+    // and whether any member calls itself with call:self.
+    const Shape = struct { src: []const u8, outer: usize, upvalues: u16, fixed: usize, rest: bool, self_calls: bool };
+    const shapes = [_]Shape{
+        .{ .src = "(fn* f ([n] (f n 0)) ([n a] (+ n a)))", .outer = 2, .upvalues = 0, .fixed = 3, .rest = false, .self_calls = true },
+        .{ .src = "(fn* f ([n] n) ([n a & r] (f n)))", .outer = 2, .upvalues = 0, .fixed = 2, .rest = true, .self_calls = true },
+        // A count only the rest clause takes goes through the cell.
+        .{ .src = "(fn* f ([n] (f n 0 1)) ([n a & r] n))", .outer = 4, .upvalues = 1, .fixed = 2, .rest = true, .self_calls = false },
+        // One clause is an ordinary fn.
+        .{ .src = "(fn* f ([n] (f n)))", .outer = 2, .upvalues = 0, .fixed = 0, .rest = false, .self_calls = true },
+        // Every member carries the captures of all of them.
+        .{ .src = "(let* [x 1 y 2] (fn* ([] x) ([a] y)))", .outer = 6, .upvalues = 2, .fixed = 2, .rest = false, .self_calls = false },
+    };
+    for (shapes) |shape| {
+        errdefer std.debug.print("\n  {s}\n", .{shape.src});
+        const compiled = try compileIn(&program, shape.src);
+        try testing.expectEqual(shape.outer, compiled.code.len);
+        const head = compiled.capture_descs[0].routine;
+        var failure: nx.vm.VerifyFailure = undefined;
+        try head.verify(&failure);
+        var self_calls = false;
+        if (head.arities) |table| {
+            try testing.expectEqual(shape.fixed, table.fixed.len);
+            try testing.expectEqual(shape.rest, table.rest != null);
+            var members = table.members();
+            while (members.next()) |m| {
+                try testing.expectEqual(shape.upvalues, m.upvalue_count);
+                for (m.code) |inst| self_calls = self_calls or (inst.group == self_op.group and inst.variant == self_op.variant);
+            }
+        } else {
+            try testing.expectEqual(@as(usize, 0), shape.fixed);
+            try testing.expectEqual(shape.upvalues, head.upvalue_count);
+            for (head.code) |inst| self_calls = self_calls or (inst.group == self_op.group and inst.variant == self_op.variant);
         }
         try testing.expectEqual(shape.self_calls, self_calls);
     }
@@ -979,7 +1042,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
     _ = try program.run("(defn g [& _] 1) (defn h [& _] 1) (defprotocol P (pm [x]))");
     // Each the whole body of `(fn* [a b c m xs] ...)`, or of the
     // closure it makes when `inner`.
-    const Row = struct { form: []const u8, len: usize, inner: bool = false };
+    const Row = struct { form: []const u8, len: usize, inner: bool = false, second: ?usize = null };
     const rows = [_]Row{
         .{ .form = "(g (h a) (h b) (h c))", .len = 12 },
         .{ .form = "(g a b c)", .len = 6 },
@@ -994,7 +1057,7 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         .{ .form = "(let [[x y & r] xs] (g x y r))", .len = 20 },
         .{ .form = "(let [{:keys [p q] :or {q 1} :as all} m] (g p q all))", .len = 19 },
         .{ .form = "(fn [[x y] {:keys [p]}] (g x y p))", .len = 26, .inner = true },
-        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 27, .inner = true },
+        .{ .form = "(fn ([x] (g x)) ([x y] (g x y)))", .len = 4, .inner = true, .second = 5 },
         .{ .form = "(fn fib [n] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))", .len = 9, .inner = true },
         .{ .form = "(cond (< a 1) :a (< a 2) :b (< a 3) :c (< a 4) :d :else :e)", .len = 13 },
         .{ .form = "(case a :k0 0 :k1 1 :k2 2 :k3 3 :k4 4 :k5 5 :k6 6 :k7 7 :k8 8 :k9 9)", .len = 46 },
@@ -1020,6 +1083,14 @@ test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
         if (routine.code.len != row.len) {
             std.debug.print("\n  {s}: {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, routine.code.len, row.len });
             failed = true;
+        }
+        // The other clause of a two-clause fn, its own routine.
+        if (row.second) |len| {
+            const other = routine.arities.?.fixed[routine.fixed_arity + 1].?;
+            if (other.code.len != len) {
+                std.debug.print("\n  {s}: its second clause is {d} instructions, COMPILER.md §4.8 says {d}\n", .{ row.form, other.code.len, len });
+                failed = true;
+            }
         }
     }
     try testing.expect(!failed);
@@ -1361,6 +1432,11 @@ const Expr = union(enum) {
     /// a local moved in a try's body that its handler, and its
     /// finally when `fin`, read again.
     caught: struct { name: u8, value: *const Expr, x: *const Expr, y: *const Expr, body: *const Expr, fin: bool },
+    /// (let* [f (fn* g ([p] (+ (g p 1)? b1)) ([p q] b2) ([p q & r] (+ (count r) b3-or-(g p))))]
+    ///   (+ (f a) (+ (f a b) (f a b c d)))):
+    /// a multi-arity fn called at each clause, a clause self-calling
+    /// another when `self1` or `self3`.
+    multi: struct { f: u8, g: u8, p: u8, q: u8, r: u8, b1: *const Expr, b2: *const Expr, b3: *const Expr, a: *const Expr, b: *const Expr, c: *const Expr, d: *const Expr, self1: bool, self3: bool },
 };
 
 /// The Vars the generated programs call.
@@ -1409,7 +1485,7 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
         return e;
     }
     const d = depth - 1;
-    e.* = switch (rand.uintLessThan(u8, 18)) {
+    e.* = switch (rand.uintLessThan(u8, 19)) {
         0, 1 => .{ .arith = .{ .op = "+-*"[rand.uintLessThan(usize, 3)], .a = try genExpr(a, rand, names, d), .b = try genExpr(a, rand, names, d) } },
         2 => .{ .inc = try genExpr(a, rand, names, d) },
         3 => .{ .if_lt = .{
@@ -1477,6 +1553,29 @@ fn genExpr(a: std.mem.Allocator, rand: std.Random, names: Names, depth: u32) !*c
                 .y = try genExpr(a, rand, inner, d),
                 .body = try genExpr(a, rand, inner, d),
                 .fin = rand.boolean(),
+            } };
+        },
+        18 => blk: {
+            // `f`, `g` and `r` are past every name in scope and
+            // distinct at each depth.
+            const p = names.binder(rand);
+            const q: u8 = @intCast(names.with(p).len + 30);
+            const both = names.with(p).with(q);
+            break :blk .{ .multi = .{
+                .f = @intCast(160 + d),
+                .g = @intCast(170 + d),
+                .p = p,
+                .q = q,
+                .r = @intCast(180 + d),
+                .b1 = try genExpr(a, rand, names.with(p), d),
+                .b2 = try genExpr(a, rand, both, d),
+                .b3 = try genExpr(a, rand, both, d),
+                .a = try genExpr(a, rand, names, d),
+                .b = try genExpr(a, rand, names, d),
+                .c = try genExpr(a, rand, names, d),
+                .d = try genExpr(a, rand, names, d),
+                .self1 = rand.boolean(),
+                .self3 = rand.boolean(),
             } };
         },
         10 => .{ .may_throw = .{
@@ -1693,6 +1792,23 @@ fn printExpr(e: *const Expr, w: *std.Io.Writer) std.Io.Writer.Error!void {
             if (x.fin) try w.print(" (finally (h1 v{d} 0 0))", .{x.name});
             try w.writeAll("))");
         },
+        .multi => |x| {
+            try w.print("(let* [v{d} (fn* v{d} ([v{d}] ", .{ x.f, x.g, x.p });
+            if (x.self1) try w.print("(+ (v{d} v{d} 1) ", .{ x.g, x.p });
+            try printExpr(x.b1, w);
+            if (x.self1) try w.writeAll(")");
+            try w.print(") ([v{d} v{d}] ", .{ x.p, x.q });
+            try printExpr(x.b2, w);
+            try w.print(") ([v{d} v{d} & v{d}] (+ (count v{d}) ", .{ x.p, x.q, x.r, x.r });
+            if (x.self3) try w.print("(v{d} v{d})", .{ x.g, x.p }) else try printExpr(x.b3, w);
+            try w.print(")))] (+ (v{d} ", .{x.f});
+            try printExpr(x.a, w);
+            try w.print(") (+ (v{d} ", .{x.f});
+            try printArgs(&.{ x.a, x.b }, w);
+            try w.print(") (v{d} ", .{x.f});
+            try printArgs(&.{ x.a, x.b, x.c, x.d }, w);
+            try w.writeAll("))))");
+        },
     }
 }
 
@@ -1729,7 +1845,7 @@ const RefEnv = struct {
     }
 };
 
-fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
+fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) error{OutOfMemory}!i128 {
     return switch (e.*) {
         .lit => |n| n,
         .ref => |n| env.lookup(n),
@@ -1804,7 +1920,24 @@ fn evalExpr(a: std.mem.Allocator, e: *const Expr, env: RefEnv) !i128 {
             else
                 helper(0, v, 1, 2);
         },
+        .multi => |x| blk: {
+            const va = try evalExpr(a, x.a, env);
+            const vb = try evalExpr(a, x.b, env);
+            _ = try evalExpr(a, x.c, env);
+            _ = try evalExpr(a, x.d, env);
+            const one = try multiOne(a, x, env, va);
+            const two = try evalExpr(a, x.b2, try (try env.with(a, x.p, va)).with(a, x.q, vb));
+            const three = 2 + if (x.self3) try multiOne(a, x, env, va) else try evalExpr(a, x.b3, try (try env.with(a, x.p, va)).with(a, x.q, vb));
+            break :blk one + two + three;
+        },
     };
+}
+
+/// The one-argument clause of a `multi`, over `x`.
+fn multiOne(a: std.mem.Allocator, m: anytype, env: RefEnv, x: i128) error{OutOfMemory}!i128 {
+    const own = try evalExpr(a, m.b1, try env.with(a, m.p, x));
+    if (!m.self1) return own;
+    return own + try evalExpr(a, m.b2, try (try env.with(a, m.p, x)).with(a, m.q, 1));
 }
 
 /// What `helpers`' h0 and h1 compute.

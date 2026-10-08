@@ -464,16 +464,21 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
   `acc` adds `(+ acc i)`; `pcall`, `casek` and `mcall` add one
   three-way dispatch on a value, by a protocol method on a record, a
   `case` over a map's `:shape` and a multimethod on `:shape`;
-  `fib` counts calls; `cbsum`, `cbred`, `cb`
-  and `lazy` call a native over a vector with a callback, and `cbbase`
-  is the setup they share; `lazy3` is a lazy pipeline over a range,
+  `acall` adds a call of a three-clause `defn` at its one-argument
+  clause, `vcall` one at a variadic clause with one argument in its
+  rest; `fib` counts calls, and `afib` the calls of a two-clause `fib`
+  whose every call enters the other clause; `cbsum`, `cbred`, `cb`
+  and `lazy` call a native over a vector with a callback, `xform`
+  transduces `(map inc)` over one, the step fn's clause called per
+  element, and `cbbase` is the setup they share; `lazy3` is a lazy pipeline over a range,
   for its peak RSS.
   `lazyl` binds the same pipeline with `let` and `lazyf` passes it to
   a fn, each then walking it with `reduce`, for what locals clearing
   lets go (`docs/COMPILER.md` §4.9); `mvc` adds one `mov:move-clear`
   to the counting loop.
 - **Two sizes.** Each program runs at two sizes (5 M and 10 M
-  iterations; `fib` 27 and 30, 2,056,916 calls apart; the callback
+  iterations; `fib` 27 and 30, 2,056,916 calls apart, `afib` twice
+  that; the callback
   programs 1 M and 2 M; the lazy pipelines 1.5 M and 3 M), and its
   cost per unit is `(I(hi) − I(lo)) /
   units`, so startup, compilation and printing cancel exactly. The
