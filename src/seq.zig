@@ -519,18 +519,26 @@ fn stepSieve(comptime mode: Sieve) Step {
                         const c = lazy.allocChunked(heap, ch.items.len) catch return VmError.OutOfMemory;
                         lazy.setScratch(lz, c);
                         const out = lazy.chunkItems(c);
-                        for (ch.items, out) |x, *slot| slot.* = (try apply(mode, &cb, &index, x)).?;
+                        // `map`'s calls in batches (VM.md §6).
+                        if (comptime mode == .map) {
+                            try cb.each(ch.items, .{ .slots = out.ptr });
+                        } else for (ch.items, out) |x, *slot| {
+                            slot.* = (try apply(mode, &cb, &index, x)).?;
+                        }
                         const following = try make(vm, mode.op(), &nextArgs(mode, a[0], ch.after, index));
                         lazy.finishChunked(c, ch.items.len, following);
                         return c;
                     },
-                    // What is kept is a source element, rooted with the
-                    // source: it waits in a buffer, and the chunk is made
-                    // to its size.
+                    // The predicate's calls in batches (VM.md §6), its
+                    // results only tested for truth. What is kept is a
+                    // source element, rooted with the source: it waits
+                    // in a buffer, and the chunk is made to its size.
                     .filter, .remove => blk: {
+                        var truth: [lazy.chunk_size]Value = undefined;
+                        try cb.each(ch.items, .{ .slots = &truth });
                         var n: usize = 0;
-                        for (ch.items) |x| if (try apply(mode, &cb, &index, x)) |y| {
-                            buf[n] = y;
+                        for (ch.items, truth[0..ch.items.len]) |x, r| if (r.isTruthy() == (mode == .filter)) {
+                            buf[n] = x;
                             n += 1;
                         };
                         break :blk n;
