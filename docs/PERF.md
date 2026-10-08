@@ -75,7 +75,7 @@ the §3 rows.
 
 Hosts: §3.1, §3.4's table and §3.6 on an Apple M1; §3.2, §3.3, §3.5,
 §3.6's second column, §3.7, §3.8, §3.11, §3.12, §3.13 and §3.14 on
-an Apple M5, as are §3.16 through §3.19; §3.15 on an Intel Core Ultra 9 185H under Linux;
+an Apple M5, as are §3.16 onward; §3.15 on an Intel Core Ultra 9 185H under Linux;
 §3.9 through `bin/nexis`. Every row is ReleaseFast.
 Numbers from different machines are not comparable (BENCH.md §4). The
 harness's own rows report the 30-sample median (BENCH.md §3) unless a
@@ -1461,6 +1461,57 @@ each alternating (load 4.6 → 7.9, bimodal): `vm_loop_10k` 41.4 →
 27.4 μs, `vm_global_call_10k` 116.7 → 92.7 μs; `compile_simple`,
 which quickens what it compiles, 0.437 and 0.436 μs in seven more.
 
+### 3.26 The counting-loop step, Apple M5
+
+A counting loop's `(inc i)` just before its repeated test is a step
+(`docs/VM.md` §10.10): one dispatch runs the add, the comparison and
+its branch back, where the add and the quickened pair were two. The
+step's fast handlers are 61 arm64 instructions with a fixnum limit
+and 70 with a slot (66 and 72 on x86-64, the slot form saving one
+register), against 36 to 50 for each of the two it replaces
+(`zig build codegen`). Before is `0ef07a3`, after the step commit; one
+ReleaseFast build of each. Provenance: §11.
+
+Per unit, `harness.py` at two sizes (5 M and 10 M iterations; `fib`
+27 and 30), seven interleaved rounds (load 5.8 → 5.7), the median of
+the paired differences, the range in brackets:
+
+| Program | Instructions before | after | Δ | Cycles before | after |
+|---|---:|---:|---:|---:|---:|
+| `count` | 73.0 [72.9–73.0] | 58.0 [57.9–58.0] | −20.5% | 9.8 [9.1–10.4] | 8.3 [8.1–8.6] |
+| `acc` | 110.0 [110.0–110.0] | 95.0 [95.0–95.0] | −13.6% | 12.5 [10.7–13.5] | 11.3 [9.7–13.4] |
+| `fib`, a call | 186.0 [185.9–186.0] | 186.0 [185.9–186.0] | 0 | 26.2 [25.3–27.2] | 25.7 [25.0–27.4] |
+| `gcall` | 232.0 [232.0–232.0] | 232.0 [231.9–232.0] | 0 | 30.0 [28.3–31.0] | 31.2 [27.5–33.1] |
+
+`count` ran fewer cycles in every pair. `gcall` calls between its
+`(inc i)` and its test, so it keeps its two dispatches; its cycles
+rose in five pairs of seven and fell in two.
+
+The `bench/compare` programs, whole process, five interleaved rounds
+(load 5.7 → 6.0), every answer equal and every resident set the same
+within 0.1 MB:
+
+| Row | Instructions | Δ | Cycles |
+|---|---:|---:|---:|
+| `loop` | 212.6 → 197.8 M | −6.9% | 29.5 → 27.1 M |
+| destructuring loop | 3,332.6 → 3,317.6 M | −0.45% | 527.6 → 531.9 M |
+| `fib` | 523.5 → 523.5 M | 0 | 78.3 → 73.8 M |
+| pipeline | 2,413.2 → 2,413.1 M | 0 | 479.8 → 480.9 M |
+| `frequencies`/`group-by` | 1,470.7 → 1,470.6 M | 0 | 346.5 → 342.3 M |
+| map build and read | 3,553.3 → 3,553.2 M | 0 | 2,184.3 → 2,171.1 M |
+| map through transients | 1,955.0 → 1,954.6 M | 0 | 1,099.8 → 1,120.7 M |
+| `sort` | 2,585.1 → 2,585.0 M | 0 | 438.7 → 444.2 M |
+| string build and split | 293.2 → 293.1 M | 0 | 50.3 → 49.6 M |
+| vector `conj` and `nth` | 902.5 → 902.5 M | 0 | 152.1 → 148.0 M |
+
+Only `loop` and the destructuring loop count with a step; no row's
+cycles rose in every pair (the transient map and `sort` in three of
+five). `run.clj`'s phases in four runs, after, before, after, before
+(load 3.9 → 3.4), babashka in the same runs: `loop` 4.88, 4.88 ms
+against 5.45, 5.39 ms; the destructuring loop 122, 125 ms against
+124, 124 ms; `fib` 16.1, 16.1 ms against 17.0, 16.7 ms; the pipeline
+32.4, 32.1 ms against 32.5, 32.3 ms, babashka's 43.2–44.7 ms.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1521,27 +1572,6 @@ Each lever is a measured change: a before/after from `zig build bench`
   halve it; the measurement is §3.11's `sort` row with its RSS.
 - **Generational collection**: a nursery and write barriers, so
   short-lived path copies cost O(survivors) (`docs/GC.md` §1).
-- **A counting-loop step instruction** (em's `jump.forStep1`): the
-  bottom of a counting loop, `math:add.sc i i 1` and the quickened
-  `cmp:lt.ss+if-true` with its jump (§3.25), as one dispatch. Its
-  target does not fit beside two operands, so as an instruction of its
-  own it needs PLAN §23 #21 amended (an extension word, or A as a
-  relative target). Not built: the opcode histograms
-  (`-Dopcodes=true`) of the ten `bench/compare` language programs,
-  built as §3.25's after, find the pair in two, 1.0 M of `loop`'s 5.0 M
-  dispatches (20%) and 1.0 M of the destructuring loop's 43.0 M
-  (2.3%), and in none of the other eight, the stdlib's own loops
-  included; an encoding change in the verifier, the disassembler and
-  every jump-patching site buys one row. The same dispatch needs no
-  amendment as a quickened variant of the `math:add` whose next
-  instruction is its loop's bottom test, read in place as the
-  comparison reads its jump (`docs/VM.md` §10.10); a prototype of it,
-  never through the gate, measured `count` 72.9 → 58.0 instructions
-  an iteration and 10.0 → 8.4 cycles, `acc` 110.1 → 95.0, `fib`
-  unchanged (five rounds), and `loop`'s whole process 212.9 → 197.8 M
-  instructions (−7.1%), the destructuring loop's 3,338.8 → 3,324.1 M
-  (−0.4%), five rounds at a load of 7.8. Raw output:
-  `.git/revamp/r2/bench/speed4/` (`hist-B/`, `step*`).
 - **Inline caches at call sites**: a call through a Var is a `var:load-var` and a `call:call`, each reading
   its operands with no kind to decode; a cache must still see the
   Var's latest root (PLAN §23 #20).
@@ -1575,6 +1605,22 @@ Each lever is a measured change: a before/after from `zig build bench`
   106.9 → 73.0 instructions an iteration, a `fib` call 236.4 → 186.0,
   the `bench/compare` language rows 1.3–25% fewer instructions
   (§3.25).
+
+- *The counting-loop step* (`docs/VM.md` §10.10, §3.26), em's
+  `jump.forStep1`: the `math:add.sc` before a loop's repeated test
+  (`docs/COMPILER.md` §5.7) is quickened with the comparison and jump
+  after it and runs the three as one dispatch, reading the two in
+  place as a quickened comparison reads its jump. As an instruction of
+  its own it would need PLAN §23 #21 amended (its target does not fit
+  beside two operands); as a quickened variant it changes no encoding,
+  verifier rule for jumps or jump-patching site. The opcode histograms
+  (`-Dopcodes=true`) of the ten `bench/compare` language programs find
+  the pair in two: 1.0 M of `loop`'s 5.0 M dispatches and 1.0 M of the
+  destructuring loop's 43.0 M, and in none of the other eight, the
+  stdlib's own loops included. `count` 73.0 → 58.0 instructions an
+  iteration and 9.8 → 8.3 cycles, `acc` 110.0 → 95.0; the `loop` row
+  212.6 → 197.8 M instructions and its phase 5.4 → 4.9 ms, the
+  destructuring loop −0.45%, `fib` and the other rows unchanged.
 
 - *The stdlib image* (`docs/STDLIB.md` §1): the build boots the
   embedded sources once and every binary loads what they left;
@@ -1813,4 +1859,4 @@ is one invocation's 30-sample median.
 | §3.24 | as §3.23 | 2026-10-06 21:18–21:24 MDT, speed3-c: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at the self-call commit (before) and at the keyword lookup commit (after). `harness.py OUT 7` over `kw`, `count`, `gcall`, `lc` at 5 M and 10 M iterations and `fib` at 27 and 30, load 2.62 → 2.89; the `bench/compare` programs by `cmds.py OUT 5` (load 2.89 → 2.95) and their phases by `cmds.py OUT 9` (load 3.92); `run.clj` as §3.23 over `pipeline,fib,loop,destructure` (load 4.35 → 4.01). Destructuring through it: the keyword lookup commit (before) against the destructuring commit (after), 21:29–21:31 MDT; `harness.py OUT 7` over `destr` (`(let [n … m {:a 1 :b 2}] (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (let [{:keys [a b]} m] (+ a b)))) acc)))`, kept with the raw output), `kw`, `count`, `gcall`, `fib`, load 2.72 → 2.85; `cmds.py OUT 5` and `OUT 9` (load 2.85 → 2.79); `run.clj` over `destructure,pipeline,fib,loop` (load 3.05 → 4.65). Raw output: `.git/revamp/r2/bench/speed3-c/` |
 | §3.25 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 22:18–22:34 MDT, speed4: `bin/nexis` and `nexis-bench` built by `zig build install -Doptimize=fast --prefix DIR` (and `zig build bench`) at `297c146` (before) and at the quickening commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall`, `lc`, `mv`, `lv`, `kw`, `leaf`, `getnl`, `destr` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 3.22 → 3.49; `cbbase`, `cbsum`, `cbred`, `cb`, `lazy` at 1 M and 2 M, five rounds (load 3.54 → 3.58). The `bench/compare` programs (prelude and body) by `cmds.py OUT 5` (load 3.58 → 3.30); startup by `cmds.py OUT 21` over `-e nil` and `-e '(+ 1 2)'`; `run.clj --n 10 --only lang --impls nexis,bb --workloads loop,fib,destructure,pipeline --no-build --max-load 16` four times, after, before, after, before (load 3.30 → 2.89); `nexis-bench --filter vm,compiler` five times per build alternating, `--filter compiler` seven more. Raw output: `.git/revamp/r2/bench/speed4/` (`micro.*`, `q-*`, `vmbench-*`, `cbench-*`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
-| §6 "A counting-loop step instruction" | as §3.25 | 2026-10-06 22:35–22:39 MDT, speed4: opcode histograms of the `bench/compare` language programs (prelude and body) by `bin/nexis` built with `-Doptimize=fast -Dopcodes=true` at the quickening commit; the prototype, a working-tree change on that commit never committed, against the commit's binary: `harness.py OUT 5` over `count`, `acc` at 5 M and 10 M and `fib` at 27 and 30 (load 7.75 → 7.77), `cmds.py OUT 5` over `loop` and the destructuring loop. Raw output: `.git/revamp/r2/bench/speed4/` (`hist-B/`, `step*`) |
+| §3.26, §6 "The counting-loop step" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `dbc5c78`; shared with concurrent sessions | 2026-10-07 18:28–18:31 MDT, spd14: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `0ef07a3` (before) and at the step commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 5.81 → 5.67; the `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.67 → 5.99; `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads loop,destructure,fib,pipeline --no-build --max-load 16` four times, after, before, after, before, the binary swapped into one copy of the tree, load 3.92 → 3.42. The histograms of §6: speed4, 2026-10-06, `-Dopcodes=true` at the quickening commit (`.git/revamp/r2/bench/speed4/hist-B/`). Raw output: `.git/revamp/r3/spd14/` (`micro.*`, `cmp.*`, `runclj-*`) |

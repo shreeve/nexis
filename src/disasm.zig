@@ -175,8 +175,14 @@ fn quickOf(inst: vm.Inst) ?vm.Quick {
 
 /// What a quickened variant's name adds to its base's: the operand
 /// kinds it proves (`s` a slot, `c` a fixnum constant, `u` an
-/// upvalue) and the jump a comparison runs with it.
-fn quickSuffix(q: vm.Quick) []const u8 {
+/// upvalue), and the comparison a step runs with it and the jump a
+/// comparison runs (`math:add.sc+lt.ss+if-true`).
+fn writeQuickSuffix(q: vm.Quick, writer: *Writer) Writer.Error!void {
+    const c = vm.Quick.stepCmp(q) orelse return writer.writeAll(formSuffix(q));
+    try writer.print("{s}+{s}{s}", .{ formSuffix(.{ .base = q.base, .form = q.form }), variantName(.cmp, c.base).?, formSuffix(c) });
+}
+
+fn formSuffix(q: vm.Quick) []const u8 {
     return switch (q.form) {
         .slot => ".s",
         .upvalue => ".u",
@@ -223,7 +229,7 @@ pub fn opcodeName(op: u12, buf: []u8) []const u8 {
     const quick = vm.Quick.of(op);
     if (variantName(group, if (quick) |q| q.base else variant)) |v| {
         fixed.writeAll(v) catch return "?";
-        if (quick) |q| fixed.writeAll(quickSuffix(q)) catch return "?";
+        if (quick) |q| writeQuickSuffix(q, &fixed) catch return "?";
     } else {
         fixed.print("?{d}", .{variant}) catch return "?";
     }
@@ -447,6 +453,35 @@ test "a quickened instruction shows its base's name, its form and its operands" 
     , out.written());
 }
 
+test "a counting loop's step shows the comparison and the jump it runs" {
+    const consts = [_]value_mod.Value{ value_mod.fromFixnum(1).?, value_mod.fromFixnum(10).? };
+    var code = [_]vm.Inst{
+        vm.asm_.mathAdd(0, vm.Operand.slot(0), vm.Operand.constant(0)),
+        vm.Inst.primary(.cmp, vm.Cmp.gte, vm.Operand.slot(1), vm.Operand.slot(0), vm.Operand.constant(1)),
+        vm.asm_.jumpIfFalse(0, vm.Operand.slot(1)),
+        vm.asm_.mathAdd(0, vm.Operand.slot(0), vm.Operand.constant(0)),
+        vm.asm_.cmpLt(1, vm.Operand.slot(0), vm.Operand.slot(2)),
+        vm.asm_.jumpIfTrue(3, vm.Operand.slot(1)),
+        vm.asm_.returnSlot(0),
+    };
+    vm.quicken(&code, &consts);
+    const routine = vm.Routine{ .code = &code, .consts = &consts, .slot_count = 3, .name = "t" };
+    var out: Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try disassemble(&routine, null, &out.writer);
+    try testing.expectEqualStrings(
+        \\routine t slots=3 arity=0 upvalues=0
+        \\  0000  math:add.sc+gte.sc+if-false  s0  s0  c0=1
+        \\  0001  cmp:gte.sc+if-false  s1  s0  c1=10
+        \\  0002  jump:if-false       s1  j0000
+        \\  0003  math:add.sc+lt.ss+if-true  s0  s0  c0=1
+        \\  0004  cmp:lt.ss+if-true   s1  s0  s2
+        \\  0005  jump:if-true        s1  j0003
+        \\  0006  call:return.s       s0  -  -
+        \\
+    , out.written());
+}
+
 test "closure:make lists its routine and where each captured cell comes from, then the routine" {
     const inner = vm.Routine{ .code = &.{vm.asm_.returnSlot(0)}, .consts = &.{}, .slot_count = 1, .name = "f", .upvalue_count = 2 };
     const sources = [_]vm.CaptureSource{ .{ .local_cell_slot = 3 }, .{ .inherited_upvalue = 1 } };
@@ -503,13 +538,13 @@ test "a large constant prints as its first 60 bytes and its item count" {
 
 test "an unnamed variant or group prints its number" {
     const code = [_]vm.Inst{
-        .{ .kind = .primary, .group = @backingInt(vm.Group.math), .variant = 20, .a = vm.Operand.slot(0), .b = vm.Operand.none, .c = vm.Operand.none },
+        .{ .kind = .primary, .group = @backingInt(vm.Group.math), .variant = 63, .a = vm.Operand.slot(0), .b = vm.Operand.none, .c = vm.Operand.none },
         .{ .kind = .primary, .group = 40, .variant = 1, .a = vm.Operand.none, .b = vm.Operand.none, .c = vm.Operand.none },
     };
     const routine = vm.Routine{ .code = &code, .consts = &.{}, .slot_count = 1, .name = "t" };
     var out: Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try disassemble(&routine, null, &out.writer);
-    try testing.expect(std.mem.find(u8, out.written(), "math:?20") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "math:?63") != null);
     try testing.expect(std.mem.find(u8, out.written(), "?40:?1") != null);
 }
