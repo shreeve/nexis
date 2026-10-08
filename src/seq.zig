@@ -560,7 +560,9 @@ fn stepSieve(comptime mode: Sieve) Step {
             return lazy.cons(heap, y, following) catch VmError.OutOfMemory;
         }
 
-        fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
+        /// Inline, so the call lands in the chunk loop with its
+        /// argument and its result in registers.
+        inline fn apply(comptime m: Sieve, cb: *vm_mod.Callback, index: *i64, x: Value) VmError!?Value {
             switch (m) {
                 .map => return try cb.call(&.{x}),
                 .filter => return if ((try cb.call(&.{x})).isTruthy()) x else null,

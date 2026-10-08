@@ -1744,9 +1744,11 @@ fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isReduced(vm, args[0]));
 }
 
+/// The kind first: a fold's accumulator is rarely a record.
 fn isReduced(vm: *VM, v: Value) bool {
+    if (v.kind() != .record) return false;
     const type_id = vm.home().reduced_type_id orelse return false;
-    return v.kind() == .record and record_mod.typeId(v) == type_id;
+    return record_mod.typeId(v) == type_id;
 }
 
 /// The value inside a `reduced` record.
