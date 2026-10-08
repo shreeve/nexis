@@ -36,6 +36,8 @@
 //! with the nexus at ../nexus/bin/nexus or `-Dnexus=PATH`.
 
 const std = @import("std");
+/// The version, from build.zig.zon: what `nexis --version` prints.
+const version = @import("build.zig.zon").version;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -172,6 +174,7 @@ pub fn build(b: *std.Build) void {
     const counted = cliModule(b, target, optimize);
     const counted_options = b.addOptions();
     counted_options.addOption(bool, "opcodes", true);
+    counted_options.addOption([]const u8, "version", version);
     counted.addOptions("build_options", counted_options);
     counted.addAnonymousImport("stdlib_image", .{ .root_source_file = image });
     test_step.dependOn(&b.addExecutable(.{ .name = "nexis-counted", .root_module = counted, .use_llvm = useLlvm(target) }).step);
@@ -338,6 +341,9 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "-e", "1" }, .stderr = "boot-out-of-memory.err", .exit_code = 5, .max_alloc = "4096" },
             .{ .args = &.{cli ++ "script"}, .stdout = "script.out" },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
+            .{ .args = &.{"--version"}, .stdout = "version.out" },
+            .{ .args = &.{"-V"}, .stdout = "version.out" },
+            .{ .args = &.{ "--version", "x" }, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{ "repl", "x" }, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"frobnicate"}, .stderr = "unknown-command.err", .exit_code = 1 },
@@ -712,12 +718,14 @@ var runtime_options: ?*std.Build.Step.Options = null;
 
 /// The runtime's `build_options`, made once for every module that
 /// compiles src/vm.zig: `opcodes`, whether every dispatch and native
-/// call is counted and the CLI prints the counts at exit
-/// (docs/TOOLING.md §1).
+/// call is counted and the CLI prints the counts at exit, and
+/// `version`, the version `nexis --version` prints (docs/TOOLING.md
+/// §1).
 fn runtimeOptions(b: *std.Build) *std.Build.Step.Options {
     if (runtime_options) |o| return o;
     const o = b.addOptions();
     o.addOption(bool, "opcodes", b.option(bool, "opcodes", "count every dispatch by opcode and every native call; bin/nexis prints the counts at exit") orelse false);
+    o.addOption([]const u8, "version", version);
     runtime_options = o;
     return o;
 }
