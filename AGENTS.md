@@ -54,14 +54,15 @@ changes to emdb.
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
 | `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
 | `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
-| `zig build test --summary all` | the gate, 212 steps (210 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
+| `zig build portable` | `test/portable/write.nx` writes a `db/*` store and a Nextomic store, then `read.nx` dumps them, from one fresh directory, each stdout diffed against its `.out`; the same dump compares a store carried between hosts (`test/portable/README.md`) |
+| `zig build test --summary all` | the gate, 216 steps (214 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
 | `zig build bench [-- --filter nextomic]` | the benchmark harness, optimized for speed (`bench/`, `docs/BENCH.md`); `--filter` takes the categories `bench/main.zig` lists |
 | `zig build parser` | regenerates `src/parser.zig` from `nexis.grammar` with `../nexus/bin/nexus` (`-Dnexus=PATH` names another) |
 | `zig build parser-check` | diffs `src/parser.zig` against a fresh generation into the cache; part of `test` whenever nexus is there, a skip message otherwise |
 | `zig build check-targets` | compiles and links every binary and test binary for x86_64 and aarch64 Linux, glibc and musl (the static binary), from any host; runs nothing |
 | `zig build codegen` | disassembles the fast dispatch handlers of the arm64 and x86-64 Linux release builds (`test/codegen.sh`) and fails when one keeps a stack frame or calls anything (`docs/VM.md` §8); needs an LLVM objdump (Xcode's on macOS), and says so and passes without one |
 
-- `-Dupdate=true` on `test`, `golden`, `examples` or `nextomic-nx`
+- `-Dupdate=true` on `test`, `golden`, `examples`, `nextomic-nx` or `portable`
   rewrites every expected-output file the step compares; read the diff
   before committing it.
 - `-Doptimize=fast` applies to any step (`debug`, `safe`, `fast`,
@@ -182,6 +183,7 @@ nexis/
 │   ├── codegen.sh               the codegen check of the fast dispatch handlers
 │   ├── nextomic/                end-to-end .nx scripts and their .out
 │   ├── regex/                   the engine against java.util.regex: corpus.json, its bb generators, the suite
+│   ├── portable/                a db/* and a Nextomic store written and dumped, carried between hosts
 │   └── examples/                the pinned output of every examples/*.nx
 ├── examples/                    working .nx programs (examples/README.md)
 ├── bench/                       main.zig (the harness), nextomic.zig (its Nextomic scenarios),

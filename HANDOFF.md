@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 212/212 steps succeeded; 1532/1532 tests passed
+Build Summary: 216/216 steps succeeded; 1543/1543 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 210 steps. Any output besides the
+steps; without it the count is 214 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -287,6 +287,10 @@ shape its keys, and what must not be asked of emdb.
   `NEXIS_GC_STRESS=1`, stdout diffed against `.out`; `persist-1` and
   `persist-2` share one store across two processes. Every
   `examples/*.nx` is pinned the same way, the store-backed ones twice.
+- **Portability.** `test/portable/` writes a `db/*` store and a
+  Nextomic store with data in every named tree and dumps them; the
+  dump of a store written on macOS arm64 and read on Linux x86_64, and
+  the reverse, is byte-identical to its `read.out` (§6.4 #1).
 - **Goldens.** `test/golden/` pins the reader's Form output
   byte-for-byte, eighteen reader-error cases, and under `cli/` what
   `bin/nexis` prints for runtime, reader and macro errors, a
@@ -361,9 +365,23 @@ failing test (AGENTS.md).
    check-targets` compiles and links every binary for x86_64 and
    aarch64 Linux, glibc and musl, from any host, and the comparison
    harness runs on an x86_64 Linux host (`docs/PERF.md` §3.15).
-   Unproven: a store written on one platform and read on the other
-   (the page size is pinned, so the files should be byte-compatible).
-   The tests
+   A store carries between macOS arm64 and Linux x86_64 in both
+   directions: `test/portable/write.nx` writes a `db/*` store and a
+   Nextomic store with data in all twelve trees (history, `as-of`
+   views, a rename, excisions, fulltext rows), and `read.nx` dumps
+   them. Written on each host, copied to the other without the
+   `-lock` files and read read-only on both, the four dumps are the
+   bytes of `test/portable/read.out`, and the reads leave the files as
+   they came. The hosts of record are macOS 27.0.1 on an Apple M5 and
+   Ubuntu 26.04.1 (glibc 2.43) on an Intel Core Ultra 9 185H, Zig
+   0.17.0, emdb `8e1ed1e`. emdb's own dump (`emdb -d`) of the stores
+   each host writes lists the same records but for the bootstrap
+   instant and the Nextomic store's uuid, and the two `db/*` files
+   differ only in each meta page's random database and commit ids and
+   its checksum. `zig build portable`, in the gate, pins the dump on
+   the host that builds; the exchange between hosts is the manual
+   procedure of `test/portable/README.md`. Both hosts are
+   little-endian; a big-endian one is untested. The tests
    that open a read-only store file assume a user who is not root:
    root may write any file.
 2. `zig fmt --check` fails only on the generated `src/parser.zig`; CI
@@ -423,18 +441,16 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. A store carried between macOS and Linux (§6.4): write one on each
-   host and read it on the other, with the Linux host of
-   `docs/PERF.md` §3.15.
-2. Interpreter speed: the instructions each bytecode instruction
-   costs and the dispatches a loop or a call takes, which keep nexis
-   behind babashka on three rows and behind warm JVM Clojure on eight
-   of ten on the Linux host (`docs/PERF.md` §3.15). The levers are
-   frameless fast handlers with a general fallback, operands proven in
-   range once per routine, in-place `recur`, self-calls, and fused
-   compare-and-jump and loop-step instructions (`docs/VM.md` §8, §10;
-   `docs/PERF.md` §6). The owner orders this after the em and emdb
-   work, with em's runtime as the reference.
+1. The Linux comparison, rerun: `docs/PERF.md` §3.15's rows (nexis
+   behind babashka on three and behind warm JVM Clojure on eight of
+   ten) were measured before the interpreter levers of §3.16-§3.26:
+   frameless fast handlers, verification once per routine, the loop
+   shape, inlined arithmetic, the stdlib image, leaner calls,
+   self-calls, the keyword lookup, quickening and the counting-loop
+   step. Rerun it on that host and record what remains; em's runtime
+   is the reference for the next lever.
+2. Locals clearing (TODO.md #13): a lazy seq a local or a closure's
+   argument holds keeps what it realized until the slot is reused.
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
 4. The open design question, an amendment first: `&form`/`&env`

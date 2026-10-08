@@ -2199,9 +2199,10 @@ fn compileEvalCallback(user_data: *anyopaque, form: *const reader_mod.Form, fail
     return sub.run();
 }
 
-/// The compiler as `macroexpand-1`, `read-string` and `eval` reach
-/// it at run time (`vm.CompilerHooks`). The runtime that boots a VM
-/// owns one of these for as long as the VM lives and calls `install`.
+/// The compiler as `macroexpand-1`, `read-string`, `eval` and
+/// `load-string` reach it at run time (`vm.CompilerHooks`). The
+/// runtime that boots a VM owns one of these for as long as the VM
+/// lives and calls `install`.
 pub const RuntimeHooks = struct {
     host_macros: *const expand_mod.HostMacroTable,
     registry: *vm.NamespaceRegistry,
@@ -2214,6 +2215,7 @@ pub const RuntimeHooks = struct {
             .expand_once = &expandOnceHook,
             .read_string = &readStringHook,
             .eval = &evalHook,
+            .load = &loadHook,
         };
     }
 
@@ -2254,26 +2256,42 @@ pub const RuntimeHooks = struct {
         var arena = std.heap.ArenaAllocator.init(v.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const form = readFirstForm(a, source) catch |err| switch (err) {
-            error.NoForm => return null,
-            else => return failure(v, err, "reader-error"),
-        };
+        const first = (try readFirst(v, a, source)) orelse return null;
         var ctx = self.context(a, v);
-        return expand_mod.formToValue(&ctx, form) catch |err|
+        return expand_mod.formToValue(&ctx, first.form) catch |err|
             return failure(v, err, "reader-error");
     }
 
-    /// The first form of `source`. Only the text up to its end is
-    /// scanned and read (`reader.firstFormEnd`), so whatever follows
-    /// it is ignored, as in Clojure, even text that does not read,
-    /// and the cost is the first form's.
-    fn readFirstForm(a: std.mem.Allocator, source: []const u8) !*reader_mod.Form {
+    /// `(load-string s)`'s step: the first form of `source` compiled
+    /// as read and run, never made a value first, since a syntax-quote
+    /// has no value form (the reader leaves a marker the expander
+    /// expands).
+    fn loadHook(user_data: *anyopaque, v: *vm.VM, source: []const u8) vm.VmError!?vm.CompilerHooks.Loaded {
+        const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
+        var scratch = std.heap.ArenaAllocator.init(v.allocator);
+        defer scratch.deinit();
+        const first = (try readFirst(v, scratch.allocator(), source)) orelse return null;
+        return .{ .value = try self.run(v, &scratch, first.form, null), .end = first.end };
+    }
+
+    const First = struct { form: *reader_mod.Form, end: usize };
+
+    /// The first form of `source` and the byte its text ends at; null
+    /// when `source` holds none, `:reader-error` when it does not
+    /// read. Only the text up to the form's end is scanned and read
+    /// (`reader.firstFormEnd`), so whatever follows it is ignored, as
+    /// in Clojure, even text that does not read, and the cost is the
+    /// first form's.
+    fn readFirst(v: *vm.VM, a: std.mem.Allocator, source: []const u8) vm.VmError!?First {
         const text = source[0..@min(source.len, reader_mod.max_source_len)];
-        const end = reader_mod.firstFormEnd(text) orelse
-            return if (try holdsNoForm(a, text)) error.NoForm else error.ReaderFailure;
-        const p = try reader_mod.parser.parseForm(a, text[0..end]);
+        const end = reader_mod.firstFormEnd(text) orelse {
+            const none = holdsNoForm(a, text) catch return vm.VmError.OutOfMemory;
+            return if (none) null else v.throwKeyword("reader-error");
+        };
+        const p = reader_mod.parser.parseForm(a, text[0..end]) catch |err| return failure(v, err, "reader-error");
         var reader = reader_mod.Reader.init(a, text[0..end]);
-        return reader.readOneForm(p.sexp);
+        const form = reader.readOneForm(p.sexp) catch |err| return failure(v, err, "reader-error");
+        return .{ .form = form, .end = end };
     }
 
     /// Whether `text`, which has no first form, holds no form at all:
@@ -2300,7 +2318,6 @@ pub const RuntimeHooks = struct {
     /// `compileFailure` builds.
     fn evalHook(user_data: *anyopaque, v: *vm.VM, form_value: value_mod.Value) vm.VmError!value_mod.Value {
         const self: *RuntimeHooks = @ptrCast(@alignCast(user_data));
-        const persistent = v.runtime_arena.allocator();
         // The Form and Tiny trees are garbage once the routine is
         // compiled; only the routine outlives the call.
         var scratch = std.heap.ArenaAllocator.init(v.allocator);
@@ -2310,6 +2327,14 @@ pub const RuntimeHooks = struct {
         // A form is data: its lazy seqs are realized and made lists.
         const form = expand_mod.valueToForm(&ctx, try seq_mod.asLists(v, form_value), origin) catch |err|
             return compileFailure(v, err, "UnsupportedForm", form_value, null);
+        return self.run(v, &scratch, form, form_value);
+    }
+
+    /// `form` compiled and run as `eval` runs it, its trees on
+    /// `scratch`; `form_value` is the form a failure names, null for
+    /// one `load` read, made a value only when it fails.
+    fn run(self: *RuntimeHooks, v: *vm.VM, scratch: *std.heap.ArenaAllocator, form: *const reader_mod.Form, form_value: ?value_mod.Value) vm.VmError!value_mod.Value {
+        const persistent = v.runtime_arena.allocator();
         var declared = DeclaredNames.init(v.allocator);
         defer declared.deinit();
         // A `do` runs its forms one at a time, as a loaded file's
@@ -2332,7 +2357,7 @@ pub const RuntimeHooks = struct {
                 .load_callback = self.load_callback,
                 .declared = &declared,
             };
-            const top = expandTopLevel(scratch.allocator(), next, opts) catch |err| return evalFailure(v, err, form_value, detail);
+            const top = expandTopLevel(scratch.allocator(), next, opts) catch |err| return self.evalFailure(v, scratch, err, form, form_value, detail);
             if (doForms(top)) |body| {
                 last = value_mod.nilValue();
                 var i = body.len;
@@ -2342,7 +2367,7 @@ pub const RuntimeHooks = struct {
                 }
                 continue;
             }
-            const compiled = compileFormWith(scratch.allocator(), top, opts) catch |err| return evalFailure(v, err, form_value, detail);
+            const compiled = compileFormWith(scratch.allocator(), top, opts) catch |err| return self.evalFailure(v, scratch, err, form, form_value, detail);
             const routine = persistent.create(vm.Routine) catch return vm.VmError.OutOfMemory;
             routine.* = compiled.toRoutine("<eval>");
             last = try v.runRoutine(routine);
@@ -2350,8 +2375,10 @@ pub const RuntimeHooks = struct {
         return last;
     }
 
-    /// What `eval` does when `err` stops it compiling `form`.
-    fn evalFailure(v: *vm.VM, err: CompileError, form: value_mod.Value, detail: ?[]const u8) vm.VmError {
+    /// What `eval` does when `err` stops it compiling `form`, which
+    /// the failure names as `form_value` or, for a form `load` read,
+    /// as its value, nil when it has none (a syntax-quote).
+    fn evalFailure(self: *RuntimeHooks, v: *vm.VM, scratch: *std.heap.ArenaAllocator, err: CompileError, form: *const reader_mod.Form, form_value: ?value_mod.Value, detail: ?[]const u8) vm.VmError {
         return switch (err) {
             // A required file's throw that the caller's handler took:
             // the VM is already at the handler.
@@ -2360,7 +2387,11 @@ pub const RuntimeHooks = struct {
             // its frames are still in place above this call, so the
             // error leaves through the run loop with the full chain.
             error.RequiredFileFailed => v.traced_error orelse vm.VmError.UncaughtThrow,
-            else => compileFailure(v, err, @errorName(err), form, detail),
+            else => compileFailure(v, err, @errorName(err), form_value orelse blk: {
+                var ctx = self.context(scratch.allocator(), v);
+                break :blk expand_mod.formToValue(&ctx, form) catch |e|
+                    if (e == error.OutOfMemory) return vm.VmError.OutOfMemory else value_mod.nilValue();
+            }, detail),
         };
     }
 

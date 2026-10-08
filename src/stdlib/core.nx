@@ -1158,17 +1158,17 @@
 (defn var-get [v] (if (var? v) (deref v) (throw :kind-mismatch)))
 (defn find-var [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
 
-; (load-string s) → the value of the last form of s, each read and
-; evaluated in turn in the current namespace, so a form that does not
-; read raises after the ones before it ran; the namespace in force is
-; restored afterwards, as Clojure's Compiler.load binds *ns*.
-; (load-file path) of the file's text.
+; (load-string s) → the value of the last form of s, each read,
+; compiled as a file's form is and run in turn in the current
+; namespace, so a form that does not read raises after the ones before
+; it ran; the namespace in force is restored afterwards, as Clojure's
+; Compiler.load binds *ns*. (load-file path) of the file's text.
 (defn load-string [s]
   (let [ns *ns*]
     (try
       (loop [i 0 v nil]
-        (if-let [[form j] (nexis.internal/#%read-next s i)]
-          (recur j (eval form))
+        (if-let [[v j] (nexis.internal/#%load-next s i)]
+          (recur j v)
           v))
       (finally (in-ns ns)))))
 (defn load-file [path] (load-string (slurp path)))

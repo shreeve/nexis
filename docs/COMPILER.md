@@ -360,7 +360,10 @@ constant pool, Var table, capture descriptors, span table,
   `math:add`, `sub`, `mul`, `idiv` and `mod` of slots or of a slot and
   a fixnum constant, each of those `math` of a fixnum constant and a
   slot, each `mov:move` of a slot or an upvalue and each `call:return`
-  of a slot takes its quickened variant.
+  of a slot takes its quickened variant; then each such `math:add` of
+  a slot and a fixnum constant followed by a quickened ordered
+  comparison of its sum with its jump, the step of a counting loop
+  and its bottom test (§5.7), takes the step that runs the three.
   The emitter writes and reads back base opcodes only.
 
 #### 4.6 Spans
@@ -673,8 +676,10 @@ back to the start of the `recur`'s own arm when the test sends
 control there (`jump:if-true` from the then arm, the test's own jump
 from the else arm), and a `jump:jmp` to the other arm otherwise,
 which a `recur` last in the then arm leaves out, falling through to
-the else arm. The entry test runs once, for the first iteration. A
-counting loop is two dispatches an iteration and this one three:
+the else arm. The entry test runs once, for the first iteration.
+Quickened (§4.5), an `(inc i)` just before the repeated test is a
+step that runs the test and its jump with it (VM.md §10.10), so a
+counting loop is one dispatch an iteration and this one two:
 
 ```
 ; (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc i)) acc)), n in s1
@@ -683,7 +688,7 @@ mov:load-const  s5  c0=0
 cmp:lt          s6  s4  s1          ; the entry test
 jump:if-false   s6  j0008
 math:add        s5  s5  s4          ; (+ acc i), which reads i, first
-math:add        s4  s4  c1=1        ; (inc i), which cannot fail
+math:add        s4  s4  c1=1        ; (inc i), which cannot fail; quickened, the step
 cmp:lt          s6  s4  s1          ; the test again
 jump:if-true    s6  j0004           ; back to the then arm
 mov:move        s3  s5              ; the else arm

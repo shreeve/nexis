@@ -52,7 +52,9 @@ map, and its allocated blocks are the pages written. emdb reads a
 file's page size from its meta and fixes it for the file's life
 (INV-M05), so
 a store is never opened another way and the 4078-byte hard key bound
-holds on every platform. Keys never approach it except a keyword's
+holds on every platform. A store written on macOS arm64 reads on Linux
+x86_64 and the reverse with every datom, history row, ident, txlog
+entry and fulltext row the same (`test/portable/README.md`). Keys never approach it except a keyword's
 text (§2.1 below). A stored value, whether a datom's full string or
 byte array in EAVT-h or a transaction's txlog entry, is at most just
 under 4 GiB, emdb's longest overflow chain; past that the engine
@@ -61,8 +63,10 @@ refuses the write as `:db/value-too-large` and the transaction aborts.
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
 the connection's life (tree registration is the engine's one call that
-is not thread-safe, and it happens only here). Only a store missing one
-of them takes a write transaction at connect: a new file is
+is not thread-safe, and it happens only here). A transaction then
+opens each tree on its first use of the handle (emdb INV-SUB03), so it
+reads the records of the trees it touches and no others. Only a store
+missing one of them takes a write transaction at connect: a new file is
 bootstrapped, a tree the file lacks is created, and `:db/fulltext` is
 minted (§2.4). One more write can follow the open: when the
 `nx/fulltext` rows are stale (§2.3 `"ft"`) and some attribute is
@@ -267,10 +271,13 @@ so there is no queue; emdb's write lock is the transactor.
    the transaction's `:sync` or else its connection's durability;
    `t = sys["t"] + 1`.
 2. **Normalise** tx-data to `[op e a v]` ops. tx-data is a vector or a
-   list of forms, each a list form or a map form (a hash map or a
-   sorted map, as Datomic takes any map); anything else, or a malformed
-   form, is
-   `:nextomic/tx-data` with a `:message`. Entities may be an eid, a
+   list of forms, each a list form `[op e ...]` (a vector or a list,
+   as Datomic takes any sequential form: `[:db/add e a v]` and `(list
+   :db/add e a v)` are one form, and so are `:db/retract`,
+   `:db/retractEntity`, `:db.fn/cas` and `:db.fn/call`) or a map form
+   (a hash map or a sorted map, as Datomic takes any map); anything
+   else, or a malformed form, is `:nextomic/tx-data` with a
+   `:message`. Entities may be an eid, a
    tempid (string, or a negative fixnum), a lookup ref `[:unique/attr v]`
    (`[:db/ident :kw]` names the entity that ident names), a keyword
    ident, or `"datomic.tx"` for the transaction entity. An explicit
@@ -925,8 +932,8 @@ A lazy seq is a list to every native (`docs/LAZY.md` §8): each native
 realizes its arguments and walks every lazy seq in them as the list of
 its elements (`seq.asLists`) before it opens a transaction or a read,
 so tx-data, a query, its inputs and a pull pattern may be built
-lazily wherever a list is taken (a datom form and a lookup ref are
-vectors, so a lazy one is not), and no code runs while store state is
+lazily wherever a list is taken (a datom form included; a lookup ref
+is a vector, so a lazy one is not), and no code runs while store state is
 in flight; a body's throw propagates from the native before it
 starts. A
 transaction function's result, and a function's result a query binds
@@ -1148,6 +1155,18 @@ use, so a chain of n patterns over r rows costs O(n·r), whether its
 100k-entity chain runs in under a second; a 1000-clause query plans in
 a few milliseconds. What a step cannot avoid is its join: every step
 of a long chain probes one hash index with every row it carries.
+
+A transaction costs the pages it writes. Every tree it touches is
+copied on write along a root-to-leaf path: EAVT and AEVT, AVET and
+VAET where its attributes belong, their history twins, the txlog,
+`sys`, and emdb's main and free trees. A new entity of five
+attributes, one of them unique, dirties about 31 pages of 16 KiB, 27
+without the unique one, and a changed datom 19 (stores of 20,000 to
+30,000 entities). emdb copies each page and checksums it at commit;
+with its puts that is about four fifths of a small transaction's
+instructions, and Nextomic's own work (normalising, tempids,
+expansion, the txlog entry and the report) the rest (`docs/PERF.md`
+§3.27). A batch of entities in one transaction shares those pages.
 
 Not in scope: distribution (Datomic's peer/transactor split), a
 cost-based optimizer beyond greedy selectivity, write-heavy OLTP beyond

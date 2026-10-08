@@ -100,5 +100,23 @@
   (set-env-flags kv #{:nosync} false)
   (report "tx-1k-nosync" (- (system-time) t0) (q salary-sum-q (db conn) first-1000)))
 
+; The entity batches of nexis-query.nx, in Datalevin's default commit:
+; 1,000 new people, then 1,000 upserts through the unique email.
+(def dept-eids (let [d (db conn)] (mapv (fn [k] (entid d [:dept/name (str "d" k)])) (range 100))))
+(defn person [i salary]
+  {:person/email (email i) :person/name (str "name-" i) :person/age (+ 18 (mod (* i 7) 60))
+   :person/dept (nth dept-eids (mod i 100)) :person/salary salary})
+(def upserted (mapv email (range 1000 2000)))
+
+(let [t0 (system-time)]
+  (dotimes [i 1000]
+    (transact! conn [(person (+ 100000 i) (+ 30000 i))]))
+  (report "tx-entity-1k" (- (system-time) t0) (q (quote [:find (count ?e) . :where [?e :person/email]]) (db conn))))
+
+(let [t0 (system-time)]
+  (dotimes [i 1000]
+    (transact! conn [(person (+ 1000 i) (+ 4 i))]))
+  (report "tx-upsert-1k" (- (system-time) t0) (q salary-sum-q (db conn) upserted)))
+
 (close conn)
 @out

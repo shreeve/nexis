@@ -73,8 +73,8 @@ any value but `1` stops the command with `nexis: NEXIS_GC_STRESS is
 not 1`, exit 1.
 
 **Dispatch counts.** A binary built with `-Dopcodes=true` counts every
-dispatch by opcode (a comparison that runs its branch is one,
-`docs/VM.md` §8) and every native called through the VM's call paths
+dispatch by opcode (a comparison that runs its branch is one, and a
+step that runs its comparison and branch, `docs/VM.md` §8, §10.10) and every native called through the VM's call paths
 (an instruction, `callValue`, a `Callback`), and writes them to stderr
 as CSV when the process exits, however it exits: `opcode,dispatches`
 then `group:variant,N` rows (a quickened variant named as the
@@ -238,7 +238,7 @@ routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0003  cmp:lt.sc+if-false  s5  s3  c1=10  ; 6:9
   0004  jump:if-false       s5  j0009  ; 6:5
   0005  math:add.ss         s4  s4  s3  ; 7:22
-  0006  math:add.sc         s3  s3  c2=1  ; 7:14
+  0006  math:add.sc+lt.sc+if-true  s3  s3  c2=1  ; 7:14
   0007  cmp:lt.sc+if-true   s5  s3  c1=10  ; 6:9
   0008  jump:if-true        s5  j0005  ; 6:5
   0009  mov:move.s          s2  s4  -  ; 8:7
@@ -246,18 +246,20 @@ routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0011  call:return.s       s0  -  -
 ```
 
-The loop is pcs 5-8, four instructions and three dispatches per
+The loop is pcs 5-8, four instructions and two dispatches per
 iteration: the inlined `<` and `+` read their operands in place,
 `recur` computes `(+ acc i)` before `(+ i 1)`, which cannot fail, so
 neither waits in a temporary, and it repeats the loop's test,
-branching back while it holds (COMPILER.md §5.6, §5.7).
+branching back while it holds (COMPILER.md §5.6, §5.7); `(+ i 1)` is
+the step that runs the test and the branch with it (VM.md §10.10).
 
 - The header: the routine's name, the path and position of the form
   it was lowered from, its slot count, its fixed arity (`+rest` when
   variadic) and its upvalue count.
 - One line per instruction: the pc, `group:variant` as VM.md §10
   names them (a quickened variant as its base's name and its form,
-  `math:add.sc`, VM.md §10.10), then operands A, B and C, or operand A and the wide
+  `math:add.sc`, and a step with the comparison it runs,
+  `math:add.sc+lt.sc+if-true`, VM.md §10.10), then operands A, B and C, or operand A and the wide
   field for an instruction that has one (VM.md §3). An operand prints
   its kind letter and index (VM.md §4: `s` slot, `c` constant, `v`
   var, `u` upvalue, `i` intern, `e` durable), `-` when unused. A

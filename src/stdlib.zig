@@ -588,7 +588,7 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%catch-matches?", 2, 2, &fnCatchMatches },
     // `& {:keys ...}`: the rest seq as a map.
     .{ "#%kwargs", 1, 1, &fnKwargs },
-    .{ "#%read-next", 2, 2, &fnReadNext },
+    .{ "#%load-next", 2, 2, &fnLoadNext },
     .{ "#%unbind-root", 1, 1, &fnUnbindRoot },
     // deftest and run-tests: the name of the current namespace.
     .{ "#%current-ns", 0, 0, &fnCurrentNs },
@@ -3056,28 +3056,23 @@ fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
     return vm.throwKeyword("reader-error");
 }
 
-/// `(#%read-next s i)` → `[form j]`: the first form of `s` from byte
-/// `i` on, as `read-string` reads it, and the byte `j` it ends at; nil
-/// when only whitespace, comments and discards follow `i`. Text that
-/// does not read there, a stray closing delimiter or an unfinished
-/// form included, is `:reader-error`. `load-string` reads with it a
-/// form at a time.
-fn fnReadNext(vm: *VM, args: []const Value) VmError!Value {
+/// `(#%load-next s i)` → `[v j]`: the first form of `s` from byte `i`
+/// on, compiled as read and run (`CompilerHooks.load`), its value `v`
+/// and the byte `j` its text ends at; nil when only whitespace,
+/// comments and discards follow `i`. Text that does not read there, a
+/// stray closing delimiter or an unfinished form included, is
+/// `:reader-error`. `load-string` loads with it a form at a time.
+fn fnLoadNext(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const src = string_mod.asBytes(args[0]);
     if (args[1].kind() != .fixnum) return VmError.KindMismatch;
     if (args[1].asFixnum() < 0 or args[1].asFixnum() > src.len) return VmError.IndexOutOfBounds;
     const i: usize = @intCast(args[1].asFixnum());
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
-    const text = src[i..];
-    // With no first form, the hook tells no form from a failure.
-    const end = reader_mod.firstFormEnd(text) orelse {
-        if (try hooks.read_string(hooks.user_data, vm, text) == null) return value_mod.nilValue();
-        return vm.throwKeyword("reader-error");
-    };
-    const form = (try hooks.read_string(hooks.user_data, vm, text[0..end])) orelse return vm.throwKeyword("reader-error");
-    // `Heap.alloc` never collects: `form` needs no root.
-    return vector_mod.fromSlice(vm.ensureHeap(), &.{ form, value_mod.fromFixnum(@intCast(i + end)).? }) catch VmError.OutOfMemory;
+    const load = hooks.load orelse return vm.throwKeyword("no-compiler");
+    const loaded = (try load(hooks.user_data, vm, src[i..])) orelse return value_mod.nilValue();
+    // `Heap.alloc` never collects: the value needs no root.
+    return vector_mod.fromSlice(vm.ensureHeap(), &.{ loaded.value, value_mod.fromFixnum(@intCast(i + loaded.end)).? }) catch VmError.OutOfMemory;
 }
 
 /// `(eval form)` → the value of `form` compiled in the current

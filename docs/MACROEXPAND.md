@@ -164,7 +164,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
    the runtime that boots the VM) and build their values on the VM
    heap; a VM without hooks throws `:no-compiler`. A macro's sub-VM
    has `macroexpand-1`, `macroexpand` and `read-string` but not
-   `eval`, which throws `:no-compiler` there (`docs/VM.md` §9.1).
+   `eval` or `load-string`, which throw `:no-compiler` there
+   (`docs/VM.md` §9.1).
    - `(macroexpand-1 form)` is one macro step (`expandOnce`: a user
      or host macro at the head, never a special form or `#%`
      primitive; the raw output, nothing inside it expanded, no
