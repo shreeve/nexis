@@ -294,9 +294,8 @@ pub fn readOrdered(in: []const u8) DecodeError!struct { n: u64, len: usize } {
         2 => 240 + 256 * @as(u64, in[0] - 241) + in[1],
         3 => 2288 + @as(u64, std.mem.readInt(u16, in[1..3], .big)),
         else => blk: {
-            var be: [8]u8 = @splat(0);
-            @memcpy(be[8 - (len - 1) ..], in[1..len]);
-            const n = std.mem.readInt(u64, &be, .big);
+            var n: u64 = 0;
+            for (in[1..len]) |b| n = (n << 8) | b;
             // The shortest form: past three bytes' worth, a leading byte.
             if (n <= 67823 or (len > 4 and in[1] == 0)) return error.Corrupted;
             break :blk n;
@@ -350,9 +349,8 @@ pub fn readEntity(in: []const u8) DecodeError!struct { e: u64, len: usize } {
     const n: usize = in[0] & 0x0F;
     if (class < 1 or class > 3 or n > 6 or in.len < 1 + n) return error.Corrupted;
     if (n > 0 and in[1] == 0) return error.Corrupted;
-    var be: [8]u8 = @splat(0);
-    @memcpy(be[8 - n ..], in[1..][0..n]);
-    const offset = std.mem.readInt(u64, &be, .big);
+    var offset: u64 = 0;
+    for (in[1..][0..n]) |b| offset = (offset << 8) | b;
     const e = switch (class) {
         1 => if (offset == 0 or offset >= attr_partition_end) return error.Corrupted else offset,
         2 => if (offset >= user_partition_end - user_partition_start) return error.Corrupted else user_partition_start + offset,
