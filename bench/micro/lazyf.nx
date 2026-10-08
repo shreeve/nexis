@@ -1,0 +1,4 @@
+; bench/micro/lazyf.nx N: lazy3's pipeline passed to a fn that walks its parameter: instructions and peak RSS.
+(defn total [xs] (reduce + xs))
+(let [n (parse-long (first *command-line-args*))]
+  (println (total (map inc (filter even? (map inc (range n)))))))
