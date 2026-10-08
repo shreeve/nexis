@@ -92,7 +92,7 @@ Var inside a `binding`.
 
 | Namespace | Natives (`src/stdlib.zig`) | nexis source | Contract |
 |---|---|---|---|
-| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies §9; the macros MACROEXPAND.md §2b |
+| `nexis.core` | `core_natives` | `core.nx` | text §2, printing §5, I/O §6, the rest of Clojure's core §8; `=` and `hash` SEMANTICS.md; `compare`, sorted collections, `subseq` and `rseq` SORTED.md; atoms ATOM.md; transients TRANSIENT.md; typed vectors TYPED_VECTOR.md §7.1; records and protocols PROTOCOLS.md; hierarchies and multimethods §9; the macros MACROEXPAND.md §2b |
 | `db` | `db_natives` | (`with-tx`, `with-read-tx`, `with-snapshot` in `core.nx`) | DB.md §12 |
 | `nextomic` | `src/nextomic/natives.zig` | `nextomic.nx` (`with-conn`) | NEXTOMIC.md |
 | `nexis.string` | `string_natives` | `string.nx` | §3 |
@@ -454,6 +454,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `class` | 1 | The type of `x`: for a record the symbol it prints with (`user.P`), for anything else the keyword `extend-type` names its kind with (`:vector`, `:map`, `:set`, `:list`, `:fixnum`, `:bignum`, `:float`, `:string`, `:typed_vector`, `:function`, `:native_fn`, `:var_`, ...), except that both booleans are `:boolean`; nil for nil |
 | `class?` | 1 | Whether `x` is a type `class` returns: a kind keyword (`:boolean`, `:vector`, `:map`, `:set`, or a kind name `class` passes through, such as `:fixnum`, `:sorted_map` or `:function`) or the symbol of a registered record type (`user.P`); false of any other keyword (`:persistent_vector`, `:frob`), symbol or value. The global hierarchy takes these as tags without a namespace (§9.1) |
 | `type` | 1 | `(or (:type (meta x)) (class x))`, as Clojure's |
+| `make-multifn`, `multifn?`, `add-method` | 4, 1, 3 | The multimethod constructor, predicate and method setter `defmulti` and `defmethod` expand to: nexis's names for Clojure's `new MultiFn`, `instance? MultiFn` and `.addMethod` (§9.2) |
 | `instance?` | 2 | `(instance? t x)`: whether `(class x)` is `t`, a keyword or symbol (`(instance? :vector [])`, `(instance? 'user.P p)`); there is no hierarchy, so `(instance? :map p)` of a record is false. Any other `t` is `:kind-mismatch` |
 | `var?` | 1 | Whether `x` is a Var |
 | `var-get` | 1 | The value of the Var (`deref`); a non-Var is `:kind-mismatch` |
@@ -481,9 +482,13 @@ returns a realized list where Clojure returns a lazy seq.
 
 ### 9. Multimethods and hierarchies
 
-Clojure 1.12's hierarchies, in `core.nx` (the "Hierarchies and
-multimethods" section): `core.clj` from `make-hierarchy` through
-`underive`, ported.
+Clojure 1.12's hierarchies and multimethods, in `core.nx` (the
+"Hierarchies and multimethods" section): `core.clj` from `defmulti`
+through `prefers` and from `make-hierarchy` through `underive`, and
+the dispatch of `MultiFn.java`, ported. No Zig sits in the dispatch
+path: the dispatch function and the method are ordinary calls, so a
+recursive multimethod is as deep as a recursive `defn`, and nothing
+needs rooting.
 
 #### 9.1 Hierarchies
 
@@ -519,3 +524,93 @@ There is no supertype relation between kinds: `isa?`, `parents` and
 `ancestors` follow only the edges `derive` made, where Clojure's also
 walk Java's superclasses and interfaces, and `descendants` of any tag
 reads the hierarchy, where Clojure's throws for a class.
+
+#### 9.2 Multimethods
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `defmulti` | macro | `(defmulti name docstring? attr-map? dispatch-fn & options)`. The options are `:default`, the dispatch value of the fallback method (`:default`), and `:hierarchy`, a Var or atom the hierarchy is read through (`#'nexis.core/global-hierarchy`; anything else is `:kind-mismatch`). Expands to `(let [v (def name)] (when-not (and (bound? v) (multifn? @v)) (def name (make-multifn "name" dispatch-fn default hierarchy))))`, then merges the docstring and attr-map into the Var's metadata: the Var the first time, nil when `name` already holds a multimethod, which is left as it is, dispatch function, options and methods. `(def name nil)` first makes `defmulti` define it again. One option without its value fails the expansion with "The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)", an option other than the two with "Only these options are valid: :default, :hierarchy" |
+| `defmethod` | macro | `(defmethod mf dispatch-val & fn-tail)` → `(add-method mf dispatch-val (fn fn-tail...))`, so a named or multi-arity method works; returns `mf` |
+| `make-multifn` | 4 | `(make-multifn name dispatch-fn default href)`: a multimethod named by the string `name` |
+| `multifn?` | 1 | Whether `x` is a multimethod |
+| `add-method` | 3 | Sets the method for a dispatch value; returns the multimethod |
+| `remove-method` | 2 | Removes the method for a dispatch value; returns the multimethod |
+| `remove-all-methods` | 1 | Empties the method table and the prefer table; returns the multimethod |
+| `prefer-method` | 3 | `(prefer-method mf x y)`: where `x` and `y` both match, `x` wins. Returns the multimethod; `{:error :preference-conflict :message "Preference conflict in multimethod 'f': Y is already preferred to X"}` when `y` is already preferred to `x`, directly or through the parents of either |
+| `methods` | 1 | The method table, dispatch value to method, `:default`'s included |
+| `prefers` | 1 | The prefer table, `{x #{y ...}}` |
+| `get-method` | 2 | The method a call with that dispatch value would run, nil when none would; an ambiguity throws as the call would |
+
+`methods`, `get-method` and the rest of a non-multimethod are
+`:kind-mismatch`.
+
+A multimethod is a closure (`fn?` and `ifn?` are true, `class` is
+`:function`, it prints `#<fn>`), which a private registry in `core.nx`
+maps by identity to its state: its name, default dispatch value,
+hierarchy reference, method table and prefer table, and its cache. A
+function's `=` and `hash` are its identity, the collector never moves
+it, and so the closure is its own key. `=`, `hash`, its use as a map
+key, `meta` (nil) and `with-meta` (`:kind-mismatch`) agree with
+Clojure's `MultiFn`; it is unserializable, as any function is.
+
+#### 9.3 Dispatch and the cache
+
+A call applies the dispatch function to the arguments, of any number,
+and the method for the dispatch value to the same arguments. The
+method is found as `MultiFn.getMethod` finds it:
+
+1. The cache, a map from dispatch value to method, holds the value:
+   its method. The cache starts as the method table itself, so an
+   exact key always wins, even over a preference for one of its
+   ancestors.
+2. Else the best entry: of the table's entries whose key the dispatch
+   value `isa?` in the hierarchy, the one that dominates every other.
+   `x` dominates `y` when `x` is preferred to `y` (through the prefer
+   table, directly or through the parents of either) or `(isa? x y)`.
+   Two matches neither of which dominates the other are ambiguous.
+3. Else the method under the default dispatch value; with
+   `:default :user/dflt`, a method under `:default` is an ordinary
+   entry, not the fallback.
+4. Else there is none.
+
+A method found by the search is cached under the dispatch value when
+the method table, the prefer table and the hierarchy are each still
+the values the search read; otherwise the cache is reset and the
+search runs again, as `MultiFn` re-checks its basis. Every
+`add-method`, `remove-method`, `prefer-method` and
+`remove-all-methods` resets the cache to the table, and a call whose
+hierarchy is no longer the identical value the cache was built
+against resets it first: every `derive` or `underive` that changes a
+hierarchy makes a new map, so the next call sees it, and one that
+changes nothing returns the same map and invalidates nothing. The
+cache grows by one entry per distinct dispatch value that resolves,
+as Clojure's does. `isa?` and `parents` are called through their
+Vars, as `MultiFn` calls `clojure.core/isa?`.
+
+#### 9.4 Errors, the registry and the image
+
+| Situation | Thrown value | `catch` class |
+|---|---|---|
+| No method | `{:error :no-method :message "No method in multimethod 'f' for dispatch value: X" :value dv}` | `IllegalArgumentException` |
+| An ambiguity | `{:error :ambiguous-method :message "Multiple methods in multimethod 'f' match dispatch value: X -> K and B, and neither is preferred" :value dv}` | `IllegalArgumentException` |
+| A preference conflict | `{:error :preference-conflict :message ...}` | `IllegalStateException` |
+| A cycle, or an edge to an ancestor (§9.1) | `{:error :invalid-derivation :message ...}` | any |
+| A `derive` assertion (§9.1) | `{:error :assertion-failed :message "Assert failed: ..."}` | `AssertionError` |
+
+Each value is printed into its message by `format`'s `%s`: a string
+bare, a keyword or vector as `pr-str` prints it, nil as `nil` where
+Clojure prints `null`. In the ambiguity message `K` is the later
+entry in the method table's order and `B` the best before it; the
+table iterates in insertion order up to eight entries and in CHAMP
+order past them, where Clojure's iterates in its hash order, so the
+two can be named the other way round.
+
+The registry keeps every multimethod for the VM's life, as the record
+type and protocol registries keep theirs; re-evaluating a file keeps
+each multimethod (`defmulti` defines once) and replaces its methods,
+Clojure's reload story. The stdlib image carries the registry, an
+empty map, and the global hierarchy. The stdlib defines no
+multimethod: the registry's keys hash by address, so past eight
+entries the image's rebuilt map would iterate in another order and
+`image.verify` would fail the build.
+

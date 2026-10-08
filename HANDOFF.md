@@ -339,6 +339,11 @@ failing test (AGENTS.md).
    (`deep-calls.nx`), `(+ (g) (+ (g) …))` holds each `(g)`. So only
    a function with thousands of simultaneously live values (bindings,
    or such pending operands nested past 4000 levels) reaches a cap.
+4. **`ns-unmap` is absent.** A `defmulti` of a Var that holds a
+   multimethod changes nothing (`docs/STDLIB.md` §9.2), so changing a
+   multimethod's dispatch function takes `(def f nil)` before the
+   `defmulti`, where Clojure code calls `(ns-unmap *ns* 'f)`. The next
+   step is `ns-unmap` over the namespace's map of names.
 
 ### 6.2 Nextomic
 
