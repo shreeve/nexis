@@ -57,11 +57,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 216/216 steps succeeded; 1543/1543 tests passed
+Build Summary: 218/218 steps succeeded; 1556/1556 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 214 steps. Any output besides the
+steps; without it the count is 216 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -339,6 +339,11 @@ failing test (AGENTS.md).
    (`deep-calls.nx`), `(+ (g) (+ (g) …))` holds each `(g)`. So only
    a function with thousands of simultaneously live values (bindings,
    or such pending operands nested past 4000 levels) reaches a cap.
+4. **`ns-unmap` is absent.** A `defmulti` of a Var that holds a
+   multimethod changes nothing (`docs/STDLIB.md` §9.2), so changing a
+   multimethod's dispatch function takes `(def f nil)` before the
+   `defmulti`, where Clojure code calls `(ns-unmap *ns* 'f)`. The next
+   step is `ns-unmap` over the namespace's map of names.
 
 ### 6.2 Nextomic
 

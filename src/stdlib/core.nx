@@ -1248,6 +1248,245 @@
 (defn prn-str [& xs] (with-out-str (apply prn xs)))
 
 ; ============================================================
+; Hierarchies and multimethods (docs/STDLIB.md §9)
+; ============================================================
+
+; (make-hierarchy) → the empty hierarchy: each tag's direct parents,
+; and the transitive closures of its ancestors and descendants, which
+; derive and underive keep.
+(defn make-hierarchy [] {:parents {} :descendants {} :ancestors {}})
+
+; The hierarchy the arities without one read, and derive and underive
+; change through alter-var-root, as Clojure's.
+(def ^:private global-hierarchy (make-hierarchy))
+
+; (isa? h child parent) → whether child is parent, derives from it,
+; or both are vectors of one count whose elements are isa? pairwise.
+(defn isa?
+  ([child parent] (isa? global-hierarchy child parent))
+  ([h child parent]
+   (or (= child parent)
+       (contains? (get (:ancestors h) child) parent)
+       (and (vector? parent) (vector? child) (= (count parent) (count child))
+            (loop [i 0]
+              (cond (= i (count parent)) true
+                    (isa? h (child i) (parent i)) (recur (inc i))
+                    :else false))))))
+
+(defn parents
+  ([tag] (parents global-hierarchy tag))
+  ([h tag] (not-empty (get (:parents h) tag))))
+
+(defn ancestors
+  ([tag] (ancestors global-hierarchy tag))
+  ([h tag] (not-empty (get (:ancestors h) tag))))
+
+(defn descendants
+  ([tag] (descendants global-hierarchy tag))
+  ([h tag] (not-empty (get (:descendants h) tag))))
+
+; Throws the :assertion-failed of Clojure's assert of the form `text`,
+; for the assertions whose form names a Java class.
+(defn- assert-failed [text]
+  (throw {:error :assertion-failed :message (str "Assert failed: " text)}))
+
+; (derive h tag parent) → h with tag a child of parent: h itself when
+; it is already, else a new hierarchy, the closures updated as
+; Clojure's derive does. (derive tag parent) changes the global one,
+; whose parent must have a namespace, and so must the tag unless it
+; is a class: a kind keyword or a record type, as class returns them.
+(defn derive
+  ([tag parent]
+   (assert (namespace parent))
+   (when-not (or (class? tag) (and (ident? tag) (namespace tag)))
+     (assert-failed "(or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))"))
+   (alter-var-root #'global-hierarchy derive tag parent)
+   nil)
+  ([h tag parent]
+   (assert (not= tag parent))
+   (when-not (ident? tag) (assert-failed "(or (class? tag) (instance? clojure.lang.Named tag))"))
+   (when-not (ident? parent) (assert-failed "(instance? clojure.lang.Named parent)"))
+   (let [tp (:parents h)
+         td (:descendants h)
+         ta (:ancestors h)
+         tf (fn [m source sources target targets]
+              (reduce (fn [ret k]
+                        (assoc ret k (reduce conj (get targets k #{}) (cons target (get targets target)))))
+                      m (cons source (get sources source))))]
+     (or
+      (when-not (contains? (get tp tag) parent)
+        (when (contains? (get ta tag) parent)
+          (throw {:error :invalid-derivation :message (print-str tag "already has" parent "as ancestor")}))
+        (when (contains? (get ta parent) tag)
+          (throw {:error :invalid-derivation :message (print-str "Cyclic derivation:" parent "has" tag "as ancestor")}))
+        {:parents (assoc tp tag (conj (get tp tag #{}) parent))
+         :ancestors (tf ta tag td parent ta)
+         :descendants (tf td parent ta tag td)})
+      h))))
+
+; (underive h tag parent) → h without the edge, rebuilt by deriving
+; every remaining edge into an empty hierarchy, as Clojure's; h itself
+; when it has no such edge.
+(defn underive
+  ([tag parent] (alter-var-root #'global-hierarchy underive tag parent) nil)
+  ([h tag parent]
+   (let [parent-map (:parents h)
+         childs-parents (if (get parent-map tag) (disj (get parent-map tag) parent) #{})
+         new-parents (if (not-empty childs-parents)
+                       (assoc parent-map tag childs-parents)
+                       (dissoc parent-map tag))
+         deriv-seq (flatten (map #(cons (key %) (interpose (key %) (val %))) (seq new-parents)))]
+     (if (contains? (get parent-map tag) parent)
+       (reduce #(apply derive %1 %2) (make-hierarchy) (partition 2 deriv-seq))
+       h))))
+
+; Every multimethod made, by identity (a function's = and hash are its
+; own), to its state: {:state s :cache c}, where the atom s holds
+; {:name :default :href :table :prefers} and the atom c the pair
+; [hierarchy method-cache] the cache was built against. Nothing
+; unregisters, as with record types and protocols. The stdlib itself
+; defines no multimethod: past eight, the keys' pointer hashes would
+; order the image's copy of this map differently and fail its
+; verification (STDLIB.md §9.4).
+(def ^:private multifns (atom {}))
+
+(defn multifn? [x] (contains? @multifns x))
+
+(defn- multifn-entry [mf] (or (get @multifns mf) (throw :kind-mismatch)))
+
+; MultiFn.resetCache: the cache is the method table, so an exact key
+; is found before any isa? search.
+(defn- mm-reset! [state cache]
+  (let [s @state] (reset! cache [@(:href s) (:table s)])))
+
+; Whether x is preferred to y in the prefer table pt, directly or
+; through the parents of either in h (MultiFn.prefers).
+(defn- mm-prefers? [h pt x y]
+  (or (contains? (get pt x) y)
+      (boolean (some #(mm-prefers? h pt x %) (parents h y)))
+      (boolean (some #(mm-prefers? h pt % y) (parents h x)))))
+
+(defn- mm-dominates? [h pt x y] (or (mm-prefers? h pt x y) (isa? h x y)))
+
+; MultiFn.findAndCacheBestMethod: the entry whose key dv isa? and that
+; dominates every other such entry, else the default's method, else
+; nil. The result is cached when nothing it read changed meanwhile.
+(defn- mm-find [state cache dv]
+  (let [s @state
+        ch (nth @cache 0)
+        pt (:prefers s)
+        best (reduce-kv
+              (fn [best k m]
+                (if (isa? ch dv k)
+                  (let [best (if (or (nil? best) (mm-dominates? ch pt k (nth best 0))) [k m] best)]
+                    (when-not (mm-dominates? ch pt (nth best 0) k)
+                      (throw {:error :ambiguous-method :value dv
+                              :message (format "Multiple methods in multimethod '%s' match dispatch value: %s -> %s and %s, and neither is preferred"
+                                               (:name s) dv k (nth best 0))}))
+                    best)
+                  best))
+              nil (:table s))
+        method (if best (nth best 1) (get (:table s) (:default s)))]
+    (when method
+      (if (and (identical? s @state) (identical? ch (nth @cache 0)) (identical? ch @(:href s)))
+        (do (swap! cache (fn [[h c]] [h (assoc c dv method)]))
+            method)
+        (do (mm-reset! state cache)
+            (recur state cache dv))))))
+
+; MultiFn.getMethod: the cached method for dv, the cache first reset
+; when the hierarchy is no longer the one it was built against.
+(defn- mm-method [state cache dv]
+  (when-not (identical? (nth @cache 0) @(:href @state)) (mm-reset! state cache))
+  (or (get (nth @cache 1) dv) (mm-find state cache dv)))
+
+(defn- mm-fn [state cache dv]
+  (or (mm-method state cache dv)
+      (throw {:error :no-method :value dv
+              :message (format "No method in multimethod '%s' for dispatch value: %s" (:name @state) dv)})))
+
+; One arity of a multimethod: the dispatch value of the arguments,
+; its method from the cache when the hierarchy is still the one the
+; cache was built against (#%mm-lookup), else from mm-fn, applied to
+; the arguments.
+(defmacro ^:private mm-call [dispatch-fn state cache href args more]
+  (let [f (gensym "method")]
+    `(let [dv# ~(if more `(apply ~dispatch-fn ~@args ~more) `(~dispatch-fn ~@args))
+           ~f (or (nexis.internal/#%mm-lookup ~cache ~href dv#) (mm-fn ~state ~cache dv#))]
+       ~(if more `(apply ~f ~@args ~more) `(~f ~@args)))))
+
+; (make-multifn name dispatch-fn default href) → a multimethod named
+; name (Clojure's new MultiFn), href the Var or atom its hierarchy is
+; read through.
+(defn make-multifn [mname dispatch-fn default href]
+  (when-not (or (var? href) (atom? href)) (throw :kind-mismatch))
+  (let [state (atom {:name mname :default default :href href :table {} :prefers {}})
+        cache (atom [@href {}])
+        mf (fn
+             ([] (mm-call dispatch-fn state cache href [] nil))
+             ([a] (mm-call dispatch-fn state cache href [a] nil))
+             ([a b] (mm-call dispatch-fn state cache href [a b] nil))
+             ([a b c] (mm-call dispatch-fn state cache href [a b c] nil))
+             ([a b c d] (mm-call dispatch-fn state cache href [a b c d] nil))
+             ([a b c d & more] (mm-call dispatch-fn state cache href [a b c d] more)))]
+    (swap! multifns assoc mf {:state state :cache cache})
+    mf))
+
+; Applies f to mf's state, resets its cache, and returns mf.
+(defn- mm-update! [mf f & args]
+  (let [{:keys [state cache]} (multifn-entry mf)]
+    (apply swap! state f args)
+    (mm-reset! state cache)
+    mf))
+
+(defn add-method [mf dispatch-val method] (mm-update! mf assoc-in [:table dispatch-val] method))
+(defn remove-method [mf dispatch-val] (mm-update! mf update :table dissoc dispatch-val))
+(defn remove-all-methods [mf] (mm-update! mf assoc :table {} :prefers {}))
+
+(defn prefer-method [mf x y]
+  (let [s @(:state (multifn-entry mf))]
+    (when (mm-prefers? @(:href s) (:prefers s) y x)
+      (throw {:error :preference-conflict
+              :message (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)}))
+    (mm-update! mf update-in [:prefers x] (fnil conj #{}) y)))
+
+(defn methods [mf] (:table @(:state (multifn-entry mf))))
+(defn prefers [mf] (:prefers @(:state (multifn-entry mf))))
+(defn get-method [mf dispatch-val]
+  (let [{:keys [state cache]} (multifn-entry mf)] (mm-method state cache dispatch-val)))
+
+; (defmulti name docstring? attr-map? dispatch-fn & options) → defines
+; name as a multimethod unless it holds one already; the Var the first
+; time, nil after. The options are :default (the dispatch value of
+; the fallback method, :default) and :hierarchy (a Var or atom,
+; #'global-hierarchy).
+(defmacro defmulti [mm-name & options]
+  (let [docstring (when (string? (first options)) (first options))
+        options (if docstring (next options) options)
+        m (if (map? (first options)) (first options) {})
+        options (if (map? (first options)) (next options) options)
+        dispatch-fn (first options)
+        options (next options)
+        m (if docstring (assoc m :doc docstring) m)]
+    (when (= (count options) 1)
+      (throw (ex-info "The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)" {})))
+    (let [opts (apply hash-map options)
+          v (gensym "v")]
+      (when (seq (remove #{:default :hierarchy} (keys opts)))
+        (throw (ex-info "Only these options are valid: :default, :hierarchy" {})))
+      `(let [~v (def ~mm-name)
+             r# (when-not (and (bound? ~v) (multifn? (deref ~v)))
+                  (def ~mm-name (make-multifn ~(name mm-name) ~dispatch-fn ~(get opts :default :default)
+                                              ~(get opts :hierarchy `(var global-hierarchy)))))]
+         ~@(when (seq m) [`(alter-meta! ~v merge ~m)])
+         r#))))
+
+; (defmethod mf dispatch-val & fn-tail) → mf, with (fn fn-tail...) its
+; method for dispatch-val.
+(defmacro defmethod [mf dispatch-val & fn-tail]
+  `(add-method ~mf ~dispatch-val (fn ~@fn-tail)))
+
+; ============================================================
 ; The command line
 ; ============================================================
 

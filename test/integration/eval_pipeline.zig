@@ -1913,6 +1913,308 @@ test "integration: class, type, instance?, var?, special-symbol?" {
     try expectOutput("[(special-symbol? \"if\") (special-symbol? :if)]", "[false false]");
 }
 
+// Hierarchies (STDLIB.md §9.1): Clojure 1.12's multimethods.clj tests,
+// `::x` spelled `:user/x`, sets compared with `=` (print order differs).
+
+/// `family`, `diamond` and `bird-no-more` of multimethods.clj, and its
+/// `assert-valid-hierarchy` as a predicate.
+const hierarchies =
+    \\(def family (reduce #(apply derive (cons %1 %2)) (make-hierarchy)
+    \\  [[:user/parent-1 :user/ancestor-1] [:user/parent-1 :user/ancestor-2] [:user/parent-2 :user/ancestor-2]
+    \\   [:user/child :user/parent-2] [:user/child :user/parent-1]]))
+    \\(def diamond (reduce #(apply derive (cons %1 %2)) (make-hierarchy)
+    \\  [[:user/mammal :user/animal] [:user/bird :user/animal] [:user/griffin :user/mammal] [:user/griffin :user/bird]]))
+    \\(def bird-no-more (underive diamond :user/griffin :user/bird))
+    \\(defn closure [o f]
+    \\  (loop [results #{} more #{o}]
+    \\    (if (seq (remove results more))
+    \\      (recur (into results more) (reduce into #{} (map f (remove results more))))
+    \\      (disj results o))))
+    \\(defn valid? [h]
+    \\  (every? (fn [tag]
+    \\            (and (= (closure tag #(parents h %)) (or (ancestors h tag) #{}))
+    \\                 (= (closure tag #(ancestors h %)) (or (ancestors h tag) #{}))
+    \\                 (= (closure tag #(descendants h %)) (or (descendants h tag) #{}))
+    \\                 (every? #(isa? h tag %) (parents h tag))
+    \\                 (every? #(isa? h tag %) (ancestors h tag))
+    \\                 (every? #(isa? h % tag) (descendants h tag))
+    \\                 (not (contains? (closure tag #(parents h %)) tag))
+    \\                 (not (contains? (descendants h tag) tag))))
+    \\          (set (filter ident? (reduce into #{} (map keys (vals h)))))))
+    \\
+;
+
+test "hierarchies: derive builds the closures, refuses cycles, and keeps an existing edge identical" {
+    try expectOutputProgram(hierarchies ++
+        \\[(valid? family) (= (ancestors family :user/child) #{:user/ancestor-1 :user/ancestor-2 :user/parent-1 :user/parent-2})
+        \\ (= (descendants family :user/ancestor-2) #{:user/parent-1 :user/parent-2 :user/child})
+        \\ (sort (ancestors family :user/parent-1)) (parents family :user/ancestor-1) (ancestors family :user/nope)
+        \\ (try (derive family :user/ancestor-1 :user/child) (catch any e e))
+        \\ (try (derive family :user/child :user/ancestor-1) (catch Exception e (:message e)))
+        \\ (identical? family (derive family :user/child :user/parent-1))]
+    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor} :user/child already has :user/ancestor-1 as ancestor true]");
+    // The assertions, each with the text of Clojure 1.12's form.
+    try expectOutputProgram(hierarchies ++
+        \\(map #(try (%) (catch AssertionError e (pr-str (:message e))))
+        \\  [#(derive family :user/child :user/child) #(derive family "s" :user/p) #(derive family :user/a "p")
+        \\   #(derive :a :user/x) #(derive :user/a :x)])
+    , "(\"Assert failed: (not= tag parent)\" \"Assert failed: (or (class? tag) (instance? clojure.lang.Named tag))\" \"Assert failed: (instance? clojure.lang.Named parent)\" \"Assert failed: (or (class? tag) (and (instance? clojure.lang.Named tag) (namespace tag)))\" \"Assert failed: (namespace parent)\")");
+    try expectOutputProgram("[(try (derive :user/a 1) (catch any e e)) (try (derive :user/a 'b) (catch any e (:error e)))]", "[:kind-mismatch :assertion-failed]");
+}
+
+test "hierarchies: underive rebuilds from the remaining edges; isa? over the diamond and over vectors" {
+    try expectOutputProgram(hierarchies ++
+        \\[(valid? diamond) (valid? bird-no-more)
+        \\ (isa? diamond :user/griffin :user/animal) (isa? diamond :user/griffin :user/bird)
+        \\ (isa? bird-no-more :user/griffin :user/bird) (isa? bird-no-more :user/griffin :user/animal)
+        \\ (= bird-no-more {:parents {:user/mammal #{:user/animal} :user/bird #{:user/animal} :user/griffin #{:user/mammal}}
+        \\                  :ancestors {:user/mammal #{:user/animal} :user/bird #{:user/animal} :user/griffin #{:user/mammal :user/animal}}
+        \\                  :descendants {:user/animal #{:user/mammal :user/bird :user/griffin} :user/mammal #{:user/griffin}}})
+        \\ (identical? diamond (underive diamond :user/griffin :user/nothing))
+        \\ (identical? diamond (derive diamond :user/griffin :user/bird))]
+    , "[true true true true false true true true true]");
+    try expectOutputProgram(hierarchies ++
+        \\[(isa? diamond [:user/griffin :user/bird] [:user/animal :user/animal]) (isa? [] []) (isa? [:a] [:a])
+        \\ (isa? diamond [:user/griffin] [:user/animal :user/animal]) (isa? diamond [:user/griffin :user/bird] [:user/animal :user/mammal])
+        \\ (isa? diamond '(:user/griffin) '(:user/animal)) (isa? {} :a :b) (isa? 1 1)]
+    , "[true true true false false false false true]");
+}
+
+test "hierarchies: the global hierarchy is a private Var that derive and underive change" {
+    try expectOutputProgram(hierarchies ++
+        \\(with-redefs [nexis.core/global-hierarchy (make-hierarchy)]
+        \\  [(derive :user/lion :user/cat) (derive :user/manx :user/cat) (valid? @#'nexis.core/global-hierarchy)
+        \\   (isa? :user/lion :user/cat) (isa? :user/cat :user/lion) (= #{:user/manx :user/lion} (descendants :user/cat))
+        \\   (parents :user/manx) (ancestors :user/manx) (underive :user/manx :user/cat)
+        \\   (descendants :user/cat) (parents :user/manx) (ancestors :user/manx)])
+    , "[nil nil true true false true #{:user/cat} #{:user/cat} nil #{:user/lion} nil nil]");
+    try expectOutputProgram("(with-redefs [nexis.core/global-hierarchy (make-hierarchy)] (derive :user/a :user/b)) [(parents :user/a) (:private (meta #'nexis.core/global-hierarchy))]", "[nil true]");
+}
+
+test "hierarchies: class? holds of what class returns, which the global hierarchy takes as tags" {
+    try expectOutputProgram(
+        \\(defrecord Circle [r])
+        \\[(every? class? (map class [true \a 1 99999999999999999999 1.5 :k 'x "s" '(1) [1] {:a 1} #{1} (sorted-map) (sorted-set) (lazy-seq nil)
+        \\                            (i64-vector [1]) (fn [] 1) first (atom 1) (transient []) #'inc (->Circle 1) (delay 1) #"a"]))
+        \\ (map class? [:frob :persistent_vector :true_ :nil :record :cell_internal :user/vector 'user.Nope 'Circle "vector" nil (class nil)])
+        \\ (class? 'user.Circle) (class? Circle)]
+    , "[true (false false false false false false false false false false false false) true true]");
+    try expectOutputProgram(
+        \\(defrecord Circle [r])
+        \\(with-redefs [nexis.core/global-hierarchy (make-hierarchy)]
+        \\  (derive :vector :user/coll) (derive Circle :user/shape)
+        \\  [(isa? (class [1]) :user/coll) (isa? (class (->Circle 1)) :user/shape) (isa? (class '(1)) :user/coll) (parents Circle)
+        \\   (try (derive :frob :user/x) (catch any e (:error e)))])
+    , "[true true false #{:user/shape} :assertion-failed]");
+}
+
+// Multimethods (STDLIB.md §9.2–§9.4): Clojure 1.12's multimethods.clj
+// tests and further cases, each expected value checked with bb.
+
+test "multimethods: dispatch, :default, remove-method and a method added later" {
+    try expectOutputProgram(
+        \\(defmulti too-simple identity)
+        \\(defmethod too-simple :a [x] :a)
+        \\(defmethod too-simple :b [x] :b)
+        \\(defmethod too-simple :default [x] :default)
+        \\[(too-simple :a) (too-simple :b) (too-simple :c) (do (remove-method too-simple :a) (too-simple :a))
+        \\ (do (defmethod too-simple :d [x] :d) (too-simple :d))]
+    , "[:a :b :default :default :d]");
+    // isA-multimethod-test, with kinds for Java's classes.
+    try expectOutputProgram(
+        \\(derive :vector :user/collection)
+        \\(derive :map :user/collection)
+        \\(defmulti foo class)
+        \\(defmethod foo :user/collection [c] :a-collection)
+        \\(defmethod foo :string [s] :a-string)
+        \\[(foo []) (foo {}) (foo "bar") (try (foo 1) (catch any e (:error e)))]
+    , "[:a-collection :a-collection :a-string :no-method]");
+    // A record type dispatched on with no hierarchy, and a nil dispatch value.
+    try expectOutputProgram(
+        \\(defrecord Circle [r])
+        \\(defmulti area class)
+        \\(defmethod area Circle [c] (* 3 (:r c) (:r c)))
+        \\(defmulti nn identity)
+        \\(defmethod nn nil [_] :nil)
+        \\[(area (->Circle 2)) (nn nil)]
+    , "[12 :nil]");
+    // Every arity: dispatch on six arguments, and on none.
+    try expectOutputProgram(
+        \\(defmulti six (fn [a b c d e f] (+ a b c d e f)))
+        \\(defmethod six 21 [a b c d e f] f)
+        \\(defmulti zero (fn [] :z))
+        \\(defmethod zero :z [] :zero)
+        \\(defmulti arities (fn [& xs] (count xs)))
+        \\(defmethod arities :default [& xs] (vec xs))
+        \\[(six 1 2 3 4 5 6) (zero) (map #(apply arities (range %)) (range 7))]
+    , "[6 :zero ([] [0] [0 1] [0 1 2] [0 1 2 3] [0 1 2 3 4] [0 1 2 3 4 5])]");
+}
+
+test "multimethods: preferences resolve an ambiguity, directly or through ancestors" {
+    try expectOutputProgram(
+        \\(derive :user/rect :user/shape)
+        \\(defmulti bar (fn [x y] [x y]))
+        \\(defmethod bar [:user/rect :user/shape] [x y] :rect-shape)
+        \\(defmethod bar [:user/shape :user/rect] [x y] :shape-rect)
+        \\[(try (bar :user/rect :user/rect) (catch IllegalArgumentException e (:message e))) (prefers bar)
+        \\ (do (prefer-method bar [:user/rect :user/shape] [:user/shape :user/rect]) (bar :user/rect :user/rect)) (prefers bar)
+        \\ (try (prefer-method bar [:user/shape :user/rect] [:user/rect :user/shape]) (catch IllegalStateException e e))]
+    , "[Multiple methods in multimethod 'bar' match dispatch value: [:user/rect :user/rect] -> [:user/shape :user/rect] and [:user/rect :user/shape], and neither is preferred {} :rect-shape {[:user/rect :user/shape] #{[:user/shape :user/rect]}} {:error :preference-conflict, :message Preference conflict in multimethod 'bar': [:user/rect :user/shape] is already preferred to [:user/shape :user/rect]}]");
+    // indirect-preferences-mulitmethod-test, against the global hierarchy and #'local-h.
+    try expectOutputProgram(
+        \\(derive :user/parent-1 :user/grandparent-1)
+        \\(derive :user/parent-2 :user/grandparent-2)
+        \\(derive :user/child :user/parent-1)
+        \\(derive :user/child :user/parent-2)
+        \\(defmulti indirect-1 keyword)
+        \\(prefer-method indirect-1 :user/parent-1 :user/grandparent-2)
+        \\(defmethod indirect-1 :user/parent-1 [_] :user/parent-1)
+        \\(defmethod indirect-1 :user/parent-2 [_] :user/parent-2)
+        \\(defmulti indirect-2 keyword)
+        \\(prefer-method indirect-2 :user/grandparent-1 :user/parent-2)
+        \\(defmethod indirect-2 :user/parent-1 [_] :user/parent-1)
+        \\(defmethod indirect-2 :user/parent-2 [_] :user/parent-2)
+        \\(def local-h (-> (make-hierarchy) (derive :parent-1 :grandparent-1) (derive :parent-2 :grandparent-2)
+        \\                 (derive :child :parent-1) (derive :child :parent-2)))
+        \\(defmulti indirect-3 keyword :hierarchy #'local-h)
+        \\(prefer-method indirect-3 :parent-1 :grandparent-2)
+        \\(defmethod indirect-3 :parent-1 [_] :parent-1)
+        \\(defmethod indirect-3 :parent-2 [_] :parent-2)
+        \\(defmulti indirect-4 keyword :hierarchy #'local-h)
+        \\(prefer-method indirect-4 :grandparent-1 :parent-2)
+        \\(defmethod indirect-4 :parent-1 [_] :parent-1)
+        \\(defmethod indirect-4 :parent-2 [_] :parent-2)
+        \\[(indirect-1 :user/child) (indirect-2 :user/child) (indirect-3 :child) (indirect-4 :child)]
+    , "[:user/parent-1 :user/parent-1 :parent-1 :parent-1]");
+    // An exact match wins over a preference for one of its ancestors.
+    try expectOutputProgram(
+        \\(derive :user/x :user/y)
+        \\(defmulti e identity)
+        \\(defmethod e :user/x [_] :x)
+        \\(defmethod e :user/y [_] :y)
+        \\(prefer-method e :user/y :user/x)
+        \\(e :user/x)
+    , ":x");
+}
+
+test "multimethods: methods, get-method, prefers, remove-all-methods and what each returns" {
+    try expectOutputProgram(
+        \\(defmulti simple1 identity)
+        \\(defmethod simple1 :a [x] :a)
+        \\(defmethod simple1 :b [x] :b)
+        \\(defmulti simple2 identity)
+        \\(defmethod simple2 :a [x] :a)
+        \\(defmethod simple2 :b [x] :b)
+        \\(defmulti simple3 identity)
+        \\(defmethod simple3 :a [x] :a)
+        \\(defmethod simple3 :b [x] :b)
+        \\[(methods (remove-all-methods simple1)) (prefers simple1)
+        \\ (= #{:a :b} (into #{} (keys (methods simple2)))) ((:a (methods simple2)) 1)
+        \\ (do (defmethod simple2 :c [x] :c) (= #{:a :b :c} (into #{} (keys (methods simple2)))))
+        \\ (do (remove-method simple2 :a) (= #{:b :c} (into #{} (keys (methods simple2)))))
+        \\ (fn? (get-method simple3 :a)) ((get-method simple3 :a) 1) ((get-method simple3 :b) 1) (get-method simple3 :c)]
+    , "[{} {} true :a true true true :a :b nil]");
+    try expectOutputProgram(
+        \\(defmulti rv identity)
+        \\[(= rv (defmethod rv :a [_] :a)) (= rv (prefer-method rv :a :b)) (prefers rv) (= rv (remove-method rv :a))
+        \\ (do (defmethod rv :c [_] :c) (= rv (remove-all-methods rv))) (methods rv) (prefers rv)
+        \\ (multifn? rv) (multifn? inc) (fn? rv) (ifn? rv) (= rv rv) (get {rv 1} rv) (meta rv)
+        \\ (try (with-meta rv {:a 1}) (catch any e e)) (try (methods {}) (catch ClassCastException e e))
+        \\ (try (defmethod {} :a [] 1) (catch any e e))]
+    , "[true true {:a #{:b}} true true {} {} true false true true true 1 nil :kind-mismatch :kind-mismatch :kind-mismatch]");
+    // get-method: an ambiguity throws as a call does; no match and no default is nil.
+    try expectOutputProgram(
+        \\(derive :user/a :user/c) (derive :user/b :user/c) (derive :user/ab :user/a) (derive :user/ab :user/b)
+        \\(defmulti amb identity)
+        \\(defmethod amb :user/a [_] :a)
+        \\(defmethod amb :user/b [_] :b)
+        \\[(try (get-method amb :user/ab) (catch IllegalArgumentException e e)) (get-method amb :user/zzz) ((get-method amb :user/a) 0)]
+    , "[{:error :ambiguous-method, :value :user/ab, :message Multiple methods in multimethod 'amb' match dispatch value: :user/ab -> :user/b and :user/a, and neither is preferred} nil :a]");
+}
+
+test "multimethods: :default and :hierarchy options; the cache follows the hierarchy" {
+    // With :default :user/dflt, a method under :default is an ordinary entry.
+    try expectOutputProgram(
+        \\(defmulti dd identity :default :user/dflt)
+        \\(defmethod dd :default [_] :plain-default)
+        \\[(try (dd 1) (catch IllegalArgumentException e (:message e))) (dd :default) (do (defmethod dd :user/dflt [_] :dflt) (dd 1))]
+    , "[No method in multimethod 'dd' for dispatch value: 1 :plain-default :dflt]");
+    // A derive and an underive each make a new hierarchy, which resets the cache.
+    try expectOutputProgram(
+        \\(def ch (atom (make-hierarchy)))
+        \\(defmulti c identity :hierarchy ch)
+        \\(defmethod c :default [_] :dflt)
+        \\(defmethod c :user/animal [_] :animal)
+        \\[(c :user/dog) (do (swap! ch derive :user/dog :user/animal) (c :user/dog)) (do (swap! ch underive :user/dog :user/animal) (c :user/dog))]
+    , "[:dflt :animal :dflt]");
+    try expectOutputProgram(
+        \\(defmulti g identity)
+        \\(defmethod g :default [_] :dflt)
+        \\(defmethod g :user/animal [_] :animal)
+        \\[(g :user/dog) (do (derive :user/dog :user/animal) (g :user/dog)) (do (underive :user/dog :user/animal) (g :user/dog))
+        \\ (with-redefs [nexis.core/global-hierarchy (derive (make-hierarchy) :user/cat :user/animal)] (g :user/cat)) (g :user/cat)]
+    , "[:dflt :animal :dflt :animal :dflt]");
+    try expectOutputProgram(
+        \\(def ah (atom (make-hierarchy)))
+        \\(defmulti p identity :hierarchy ah)
+        \\(defmethod p :user/parent [_] :p)
+        \\(swap! ah derive :user/kid :user/parent)
+        \\[(p :user/kid) (try (defmulti bad identity :hierarchy {}) (catch ClassCastException e e))]
+    , "[:p :kind-mismatch]");
+}
+
+test "multimethods: defmulti defines once; its docstring and attr-map reach the Var" {
+    try expectOutputProgram(
+        \\(def first-def (defmulti r identity))
+        \\(defmethod r 1 [_] :one)
+        \\(def second-def (defmulti r (fn [x] 2)))
+        \\(def kept (r 1))
+        \\(def r nil)
+        \\(defmulti r identity)
+        \\(defmulti doc-m "the doc" {:extra 1} identity)
+        \\[first-def second-def kept (methods r) ((juxt :doc :extra :name) (meta #'doc-m))]
+    , "[#'user/r nil :one {} [the doc 1 doc-m]]");
+    try expectOutputProgram(
+        \\[(try (eval '(defmulti s1 identity :default)) (catch any e ((juxt :error :detail) e)))
+        \\ (try (eval '(defmulti s2 identity :frob 1)) (catch any e ((juxt :error :detail) e)))]
+    , "[[:compile-error macro defmulti threw The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)] [:compile-error macro defmulti threw Only these options are valid: :default, :hierarchy]]");
+}
+
+test "multimethods: the no-method message prints the dispatch value as %s; recursion is as deep as a defn's" {
+    try expectOutputProgram(
+        \\(defmulti area :shape)
+        \\(map #(try (area %) (catch IllegalArgumentException e (pr-str e))) [{:shape :tri} {:shape "tri"} {:shape [:a "b"]} {}])
+    ,
+        \\({:error :no-method, :value :tri, :message "No method in multimethod 'area' for dispatch value: :tri"} {:error :no-method, :value "tri", :message "No method in multimethod 'area' for dispatch value: tri"} {:error :no-method, :value [:a "b"], :message "No method in multimethod 'area' for dispatch value: [:a \"b\"]"} {:error :no-method, :value nil, :message "No method in multimethod 'area' for dispatch value: nil"})
+    );
+    // The dispatch function and the method are ordinary calls, so no native stack nests.
+    try expectOutputProgram(
+        \\(defmulti deep (fn [n] (if (zero? n) :done :more)))
+        \\(defmethod deep :done [n] 0)
+        \\(defmethod deep :more [n] (inc (deep (dec n))))
+        \\(deep 100000)
+    , "100000");
+}
+
+test "multimethods: #%mm-lookup reads a cache only while its hierarchy is the one it was built against" {
+    try expectOutputProgram(
+        \\(def h (atom {}))
+        \\(def cache (atom [@h {:a 1 [:v] 2}]))
+        \\(def lookup nexis.internal/#%mm-lookup)
+        \\[(lookup cache h :a) (lookup cache h [:v]) (lookup cache h :b) (do (reset! h {:parents {}}) (lookup cache h :a))
+        \\ (lookup cache #'nexis.core/global-hierarchy :a)
+        \\ (try (lookup {} h :a) (catch any e e)) (try (lookup cache {} :a) (catch any e e))]
+    , "[1 2 nil nil nil :kind-mismatch :kind-mismatch]");
+}
+
+test "multimethods: a multimethod is unserializable as any function" {
+    try expectOutputProgramWithStore("multifn",
+        \\(defmulti m identity)
+        \\(def c (db/open "@STORE@"))
+        \\(try (db/put-key! (db/ref c :t "m") m) (catch :unserializable e e))
+    , ":unserializable");
+}
+
 const apputil = [2][]const u8{ "app/util.nx", "(ns app.util)\n(def x 1)\n(defn- y [] 2)\n" };
 
 test "integration: namespaces as their name symbols: the-ns, find-ns, ns-name, all-ns, ns-publics, ns-interns" {

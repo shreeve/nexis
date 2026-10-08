@@ -1583,6 +1583,45 @@ transactions 13.3 ms against 241 ms in each system's default commit
 (Datalevin's syncs; Nextomic's does not, §3.11), and 22.6 ms against
 59.2 ms with the flush off in both. Every answer was equal.
 
+### 3.28 Multimethod dispatch, Apple M5
+
+A multimethod call (`docs/STDLIB.md` §9.3) against a protocol call, a
+closure call and a `case`, each a three-way dispatch on one value per
+iteration of the micro kit (`docs/BENCH.md` §13): `mcall` calls a
+multimethod dispatching on `:shape`, every call a cache hit; `pcall` a
+protocol method on a record; `casek` a `case` over `(:shape m)`.
+Before is the multimethods commit, whose fast path is two `deref`s,
+two `nth`s, an `identical?` and a `get`; after, the `#%mm-lookup`
+commit, where one leaf native does all six. One ReleaseFast build of
+each, both before §3.26's counting-loop step, so `count` is 72.9 here.
+Provenance: §11.
+
+Per unit, `bench/micro/run.clj`, five interleaved rounds (load 7.8 →
+7.0), the median with the range in brackets:
+
+| Program | Instructions before | after | after less `count` | Cycles before | after |
+|---|---:|---:|---:|---:|---:|
+| `count` | 72.9 [72.2–73.1] | 72.9 [71.9–73.3] | — | 12.7 | 10.1 |
+| `gcall` | 232.1 [232.0–232.6] | 232.1 [231.9–232.6] | 159.2 | 33.5 | 34.3 |
+| `pcall` | 674.2 [673.8–674.6] | 674.5 [674.4–675.1] | 601.6 | 96.8 | 91.0 |
+| `casek` | 724.4 [724.0–724.7] | 724.3 [724.0–724.7] | 651.4 | 110.6 | 102.6 |
+| `mcall` | 3,044.2 [3,043.9–3,044.9] | 2,162.0 [2,161.3–2,164.0] | 2,089.1 | 526.2 | 422.7 |
+
+`#%mm-lookup` cuts `mcall`'s instructions by 29.0%. A multimethod
+call costs 3.5 protocol calls and 13.1 closure calls, against the
+design target of 2 and 6: the target is missed. The `-Dopcodes=true`
+counts say where it goes: an `mcall` iteration is 29 dispatches and
+three native calls (`#%mm-lookup`, `count`, `first`) where `pcall`'s
+is 6 and none. The multimethod is a multi-arity `fn`, which the
+expander lowers to one variadic routine that counts its rest list and
+picks the arity (`docs/MACROEXPAND.md` §10), so every call allocates
+the rest list (`mcall`'s peak resident set is 22.4 MB at 10 M calls,
+`pcall`'s 4.5 MB) and calls `count` and `first` before its body runs.
+The same fast path as a one-arity closure costs 1,153 instructions
+less `count`: 1.9 protocol calls and 7.2 closure calls, so per-arity
+entry points for a multi-arity `fn` would meet the first target and
+come near the second.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -1948,4 +1987,5 @@ is one invocation's 30-sample median.
 | §3.25 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `847c5d8`; shared with concurrent sessions | 2026-10-06 22:18–22:34 MDT, speed4: `bin/nexis` and `nexis-bench` built by `zig build install -Doptimize=fast --prefix DIR` (and `zig build bench`) at `297c146` (before) and at the quickening commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall`, `lc`, `mv`, `lv`, `kw`, `leaf`, `getnl`, `destr` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 3.22 → 3.49; `cbbase`, `cbsum`, `cbred`, `cb`, `lazy` at 1 M and 2 M, five rounds (load 3.54 → 3.58). The `bench/compare` programs (prelude and body) by `cmds.py OUT 5` (load 3.58 → 3.30); startup by `cmds.py OUT 21` over `-e nil` and `-e '(+ 1 2)'`; `run.clj --n 10 --only lang --impls nexis,bb --workloads loop,fib,destructure,pipeline --no-build --max-load 16` four times, after, before, after, before (load 3.30 → 2.89); `nexis-bench --filter vm,compiler` five times per build alternating, `--filter compiler` seven more. Raw output: `.git/revamp/r2/bench/speed4/` (`micro.*`, `q-*`, `vmbench-*`, `cbench-*`) |
 | §3.26, §6 "The counting-loop step" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); babashka v1.13.224; emdb `dbc5c78`; shared with concurrent sessions | 2026-10-07 18:28–18:31 MDT, spd14: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `0ef07a3` (before) and at the step commit (after). Micro programs: `harness.py OUT 7` over `count`, `acc`, `gcall` at 5 M and 10 M iterations and `fib` at 27 and 30, under `tools/heavy` (1 core), load 5.81 → 5.67; the `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.67 → 5.99; `bb bench/compare/run.clj --n 10 --only lang --impls nexis,bb --workloads loop,destructure,fib,pipeline --no-build --max-load 16` four times, after, before, after, before, the binary swapped into one copy of the tree, load 3.92 → 3.42. The histograms of §6: speed4, 2026-10-06, `-Dopcodes=true` at the quickening commit (`.git/revamp/r2/bench/speed4/hist-B/`). Raw output: `.git/revamp/r3/spd14/` (`micro.*`, `cmp.*`, `runclj-*`) |
 | §3.27, §6 "Trees opened on first use" and its dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); Datalevin 1.1.0; emdb `8e1ed1e` (a source snapshot under both builds); shared with concurrent sessions | 2026-10-07, txperf: `bin/nexis` built by `zig build install -Doptimize=fast` from snapshots of `0ef07a3` (before) and `a787b2f` (after) beside one emdb snapshot. The shapes: `txbench.py OUT 9 A,B plain,entity,upsert,one 2000 10000` over the probe program `tx.nx` (both kept with the raw output), each run in a fresh store under `/usr/bin/time -l`, under `tools/heavy` (1 core), 19:03 MDT, load 9.18 → 7.78; a rerun at load 20.3 → 21.4 gave the same instructions within 0.3%. The dead ends: the same harness, five rounds over four builds, load 6.48 → 9.56. Pages: a build of `0ef07a3` over emdb `dbc5c78` printing emdb's dirty-page count before each commit, the same program at both sizes. `bb bench/compare/run.clj --no-build --n 10 --only db --impls nexis --max-load 16` four times, after, before, after, before, 19:04–19:16 MDT, load 5.61 → 5.02. The Datalevin run: `run.clj --no-build --n 10 --only db --impls nexis,datalevin --max-load 16` with the after build, 19:34–19:38 MDT, load 19.96 → 4.26. The profile: `perf record -e instructions:u --call-graph lbr -F 900` and `perf script --inline` on the host of §3.15 (`taskset -c 0`, nexis at `a787b2f`'s source, emdb `dbc5c78`), `tx.nx STORE 200000 entity`; the before figure from `0ef07a3` over `tx1.nx`, the same shape without the 20,000 loaded first, 300,000 transactions. Raw output: `.git/revamp/r3/txperf/` (`profile/` holds the two `perf script` outputs and `split.py`, which reads the shares from them) |
+| §3.28 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-07, multi: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` on `0ef07a3` with this section's commits, before §3.26's counting-loop step: at the micro-program commit, whose runtime is the multimethods commit's (before), and at the `#%mm-lookup` commit (after); `bb bench/micro/run.clj --rounds 5 --programs count,gcall,pcall,casek,mcall BEFORE AFTER` under `tools/heavy` (1 core), load 7.80 → 7.02; the dispatch and native counts from `-Dopcodes=true` builds of each, `mcall`, `pcall`, `gcall` and `casek` at 100,000 and 200,000 iterations, the difference per iteration; the one-arity figure from a probe program calling the same cache through a one-arity closure, at 1 M and 2 M. Raw output: `.git/revamp/r3/multi/` (`micro-AB.*`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |

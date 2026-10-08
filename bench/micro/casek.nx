@@ -1,0 +1,4 @@
+; bench/micro/casek.nx N: count plus a case over a map's :shape, three ways: the floor for mcall.
+(let [n (parse-long (first *command-line-args*))
+      m {:shape :sq}]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (case (:shape m) :tri 0 :circ 2 :sq 1)) k))))

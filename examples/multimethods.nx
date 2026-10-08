@@ -1,0 +1,80 @@
+; examples/multimethods.nx — multimethods and hierarchies (docs/STDLIB.md §9)
+;
+;   - defmulti dispatches on any function of the arguments: a key of a
+;     map, the class of a value, a vector of two values
+;   - derive builds a hierarchy of tags, and dispatch follows it
+;     through isa?, element-wise over vectors
+;   - prefer-method settles a call two methods match equally
+;   - a dispatch value with no method throws the catchable :no-method
+;   - :hierarchy takes a hierarchy of one's own, through a Var
+
+; Shapes keyed by :shape, with a :default for the rest.
+(defmulti area :shape)
+(defmethod area :square [{:keys [side]}] (* side side))
+(defmethod area :rect [{:keys [w h]}] (* w h))
+(defmethod area :default [s] (str "no area for " (:shape s)))
+
+(println (map area [{:shape :square :side 3} {:shape :rect :w 2 :h 5} {:shape :blob}]))
+
+; Dispatch on class: a record type, a kind keyword, and a tag the
+; global hierarchy makes the kinds :vector and :list both children of.
+(defrecord Circle [r])
+(derive :vector :user/sequential)
+(derive :list :user/sequential)
+
+(defmulti describe class)
+(defmethod describe Circle [c] (str "a circle of radius " (:r c)))
+(defmethod describe :string [s] (str "the string " (pr-str s)))
+(defmethod describe :user/sequential [xs] (str "a sequence of " (count xs)))
+
+(println (describe (->Circle 2)))
+(println (describe "hi"))
+(println (describe [1 2 3]) "/" (describe '(1 2)))
+
+; A hierarchy of shapes: a square is a rect, and every rect a shape.
+(derive :user/square :user/rect)
+(derive :user/rect :user/shape)
+(println (isa? :user/square :user/shape) (parents :user/square) (sort (ancestors :user/square)))
+
+(defmulti corners :kind)
+(defmethod corners :user/rect [_] 4)
+(defmethod corners :user/shape [_] :unknown)
+(println (corners {:kind :user/square}) (corners {:kind :user/shape}))
+
+; Vector dispatch: collide on the kinds of two things.
+(derive :user/asteroid :user/rock)
+(defmulti collide (fn [a b] [(:kind a) (:kind b)]))
+(defmethod collide [:user/ship :user/rock] [_ _] :ship-destroyed)
+(defmethod collide [:user/rock :user/ship] [_ _] :rock-shattered)
+(defmethod collide [:user/rock :user/rock] [_ _] :rocks-bounce)
+(defmethod collide :default [_ _] :pass)
+
+(def ship {:kind :user/ship})
+(def asteroid {:kind :user/asteroid})
+(println (collide ship asteroid) (collide asteroid ship) (collide asteroid asteroid) (collide ship ship))
+
+; Two methods match a square equally: prefer-method settles it.
+(derive :user/square :user/polygon)
+(defmulti label identity)
+(defmethod label :user/polygon [_] "a polygon")
+(defmethod label :user/rect [_] "a rect")
+(println (try (label :user/square) (catch IllegalArgumentException e (:message e))))
+(prefer-method label :user/rect :user/polygon)
+(println (label :user/square) (prefers label))
+
+; No method and no default: a catchable :no-method.
+(defmulti speak :animal)
+(defmethod speak :dog [_] "woof")
+(println (speak {:animal :dog}))
+(println (try (speak {:animal :cat}) (catch :no-method e (:message e))))
+
+; A hierarchy of one's own, read through the Var #'h: the dispatch
+; follows its redefinition, since each derive makes a new map.
+(def h (-> (make-hierarchy) (derive :mammal :animal) (derive :dog :mammal)))
+(defmulti kingdom identity :hierarchy #'h)
+(defmethod kingdom :animal [x] (str (name x) " is an animal"))
+(defmethod kingdom :default [x] (str (name x) " is unknown"))
+(println (kingdom :dog) "/" (kingdom :fern))
+(def h (derive h :fern :plant))
+(defmethod kingdom :plant [x] (str (name x) " is a plant"))
+(println (kingdom :fern) (sort (keys (methods kingdom))))

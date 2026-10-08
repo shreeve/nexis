@@ -460,7 +460,10 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
   the counting loop; `lc`, `lv`, `mv`, `kw`, `leaf`, `getnl` and
   `gcall` add one `mov:load-const`, `var:load-var`, `mov:move`, keyword
   lookup, leaf native call, other native call or closure call to it;
-  `acc` adds `(+ acc i)`; `fib` counts calls; `cbsum`, `cbred`, `cb`
+  `acc` adds `(+ acc i)`; `pcall`, `casek` and `mcall` add one
+  three-way dispatch on a value, by a protocol method on a record, a
+  `case` over a map's `:shape` and a multimethod on `:shape`;
+  `fib` counts calls; `cbsum`, `cbred`, `cb`
   and `lazy` call a native over a vector with a callback, and `cbbase`
   is the setup they share; `lazy3` is a lazy pipeline over a range,
   for its peak RSS.

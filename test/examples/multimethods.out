@@ -1,0 +1,13 @@
+(9 10 no area for :blob)
+a circle of radius 2
+the string "hi"
+a sequence of 3 / a sequence of 2
+true #{:user/rect} (:user/rect :user/shape)
+4 :unknown
+:ship-destroyed :rock-shattered :rocks-bounce :pass
+Multiple methods in multimethod 'label' match dispatch value: :user/square -> :user/rect and :user/polygon, and neither is preferred
+a rect {:user/rect #{:user/polygon}}
+woof
+No method in multimethod 'speak' for dispatch value: :cat
+dog is an animal / fern is unknown
+fern is a plant (:animal :default :plant)

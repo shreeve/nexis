@@ -147,7 +147,6 @@ oversight; widening this list or removing a row takes an amendment.
 
 | Feature | Rationale |
 |---|---|
-| Multimethods | Protocols (§23 #8) cover type-based polymorphism. |
 | Software transactional memory | emdb transactions are the language's transaction story; a second concurrency model is a trap. |
 | Agents, `core.async` | One thread (§23 #5); a scheduling model is a large semantic sink. |
 | Reader conditionals `#?(...)` | One compile target. |
@@ -211,12 +210,15 @@ Each item is a commitment; changing one takes an Amendment Log entry
 6. **Explicit lexical transactions.** No ambient transaction, no STM.
 7. **Durable refs are identities**, not cached values; their equality
    and hash come from the identity alone.
-8. **Protocols and records, no multimethods.** `defprotocol`,
+8. **Protocols, records and multimethods.** `defprotocol`,
    `defrecord`, `extend-type` and `extend-protocol` build per-VM
    registries with run-time dispatch (Amendment 2026-05-19;
-   `docs/PROTOCOLS.md`); like any Var, a record or protocol may be
-   redefined, as in Clojure.
-9. **No multimethods, agents, `core.async` or reader conditionals.**
+   `docs/PROTOCOLS.md`); `defmulti` makes a multimethod, an ordinary
+   function dispatching through its method table and a hierarchy
+   (Amendment 2026-10-07; `docs/STDLIB.md` §9). Like any Var, a record
+   or protocol may be redefined, as in Clojure; a `defmulti` of a Var
+   that holds a multimethod changes nothing.
+9. **No agents, `core.async` or reader conditionals.**
 10. **Integers are fixnum + bignum. Floats are f64.** No rationals, no
     decimals.
 11. **`(= 1 1.0)` is `false`.** Cross-type numeric equality is `==`.
@@ -923,3 +925,25 @@ entry stating the decision and its rationale.
   `docs/SEMANTICS.md` §2.6, §3.3, §6.1, §6.2 and §7, `docs/CODEC.md`
   §3, `docs/GC.md` §5, `docs/STDLIB.md` §3, §5 and §8, `docs/VM.md`
   §13 and `CLOJURE-REVIEW.md` carry it.
+
+- **2026-10-07 — Multimethods and hierarchies (§4, §23 #8, #9).**
+  Supersedes the §4 "Multimethods" row and the "no multimethods"
+  clauses of §23 #8 and #9. nexis has Clojure 1.12's multimethods and
+  hierarchies: `defmulti` (`:default`, `:hierarchy`), `defmethod`,
+  `remove-method`, `remove-all-methods`, `prefer-method`, `methods`,
+  `get-method`, `prefers`, `make-hierarchy`, `derive`, `underive`,
+  `isa?`, `parents`, `ancestors` and `descendants`, with `MultiFn`'s
+  dispatch: an `isa?` search over the method table, element-wise over
+  vectors, preferences, the `:default` fallback, a per-multimethod
+  cache seeded with the table and reset by every method or preference
+  change and whenever the hierarchy is no longer the identical value
+  it was built against. A multimethod is a closure `core.nx` makes; no
+  value kind is added and §23 #25 is unchanged: a multimethod is
+  unserializable as any function, a hierarchy is a map and
+  serializes. `class?` holds of the kind keywords and record type
+  symbols `class` returns, which the global hierarchy takes as tags as
+  Clojure's takes classes; there is no implicit supertype relation
+  between kinds. Reason: Clojure programs dispatch on computed values
+  and on ad-hoc hierarchies, which protocols cannot express, and the
+  owner's goal is Clojure semantics. `docs/STDLIB.md` §9 is the
+  authority; `CLOJURE-REVIEW.md` and `docs/MACROEXPAND.md` carry it.

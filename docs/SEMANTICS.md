@@ -482,13 +482,14 @@ map or `nil`; it never throws.
 | `lazy-seq` | a new realized lazy block carrying the map whose seq is the argument's, realizing one step (`LazySeq.withMeta`), so no `rest` carries it (`docs/LAZY.md` §4) | the map or `nil` |
 | `var` | `:kind-mismatch`. A Var's metadata changes in place with `reset-meta!` / `alter-meta!`; `def`, `defn` and `defmacro` set it from `^meta` on the name, a docstring (`:doc`) and an attribute map, `defn` and `defmacro` adding `:arglists`; `:dynamic true` makes the Var dynamic | the map or `nil` |
 | the scalars: `nil`, booleans, `char`, numbers, `string`, `keyword`, `symbol` | `:no-metadata-on-immediate` | `nil` |
-| every other kind: `function`, `native-fn`, `atom`, `transient`, `durable-ref`, `regex`, `matcher`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
+| `atom` | `:kind-mismatch`, as in Clojure: an atom is a reference, not a value carrying metadata. Its metadata is set by `atom`'s `:meta` option and changed in place with `reset-meta!` / `alter-meta!` (`docs/ATOM.md` §4.9) | the map or `nil` |
+| every other kind: `function`, `native-fn`, `transient`, `durable-ref`, `regex`, `matcher`, protocols, the db and Nextomic handles | `:kind-mismatch` | `nil` |
 
 - The metadata argument is a map, hash or sorted, or `nil` (which
   clears it); anything else is `:kind-mismatch`, checked before the
   target's kind.
-- `reset-meta!` and `alter-meta!` take a Var; any other target is
-  `:kind-mismatch`.
+- `reset-meta!` and `alter-meta!` take a Var or an atom; any other
+  target is `:kind-mismatch`.
 - Reader metadata on a collection literal attaches: `(meta ^:foo [1])`
   is `{:foo true}`.
 - **Updates keep it**, as in Clojure. `conj`, `assoc`, `dissoc`,

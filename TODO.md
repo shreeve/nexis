@@ -82,11 +82,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
 
-10. **Multimethods.** `defmulti`, `defmethod`, `remove-method`,
-    `methods`, `prefer-method` with `:default`, and hierarchies
-    (`derive`, `isa?`, `parents`, `ancestors`, `descendants`,
-    `make-hierarchy`). Deferred by the owner to the next revamp
-    (PLAN §4 lists them as absent).
 11. **`&form` and `&env` in macros** (PLAN §23 #34, §24 #13). A macro
     receives the call's Form (its span and metadata) and the map of
     locals in scope. Deferred by the owner to the next revamp.

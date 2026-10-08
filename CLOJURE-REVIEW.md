@@ -26,7 +26,7 @@ differ, PLAN wins.
 | Numbers | long, BigInt, Ratio, BigDecimal, double | fixnum + bignum, f64; no ratio or decimal (§23 #10) |
 | Sequences | lazy, chunked by 32 | lazy, chunked where Clojure's are, no locals clearing (§23 #14, `docs/LAZY.md`) |
 | Identity | Vars, atoms, refs (STM), agents | Vars, atoms, durable refs over emdb; no STM or agents (§23 #5, #6) |
-| Polymorphism | protocols, records, multimethods | protocols and records; no multimethods (§23 #8, #9) |
+| Polymorphism | protocols, records, multimethods | protocols, records, multimethods (§23 #8) |
 | Transactions | STM `dosync` | emdb read and write transactions, lexically scoped |
 | History | none built in | `db/snapshot`; Nextomic `as-of`, `since`, `history` (§23 #22) |
 | Macros | `&form`, `&env`, full `core.clj` | arguments only (§23 #34); host macros in Zig plus `core.nx` |
@@ -144,8 +144,8 @@ flag test, and `set!` writes the binding in force, never the root
   meaningless; nexis uses a per-transient token.
 - **3.6** JVM bytecode: nexis compiles to its own 64-bit instructions
   for its own slot VM.
-- **3.7** Multimethods, STM, agents, `core.async`, reader conditionals
-  and tagged literals (PLAN §4).
+- **3.7** STM, agents, `core.async`, reader conditionals and tagged
+  literals (PLAN §4).
 
 ---
 
@@ -220,7 +220,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | a `sequence` step that throws, walked again | goes on from the advanced source and transducer, dropping the chunk it was filling: `(3 4)` for a `(comp (map f) (take 4))` over `(range 10)` whose `f` throws once at 2 | runs the step again from its source position with the transducer's advanced state: `(0 1)` | `docs/LAZY.md` §9 |
 | `(empty record)` | throws | `{}`: a record is a map to collection functions | `docs/PROTOCOLS.md` |
 | `extend-type`, `extend-protocol` | a class | a kind keyword (`:fixnum`, `:string`, `:vector`, `:any`), `nil`, a record name, or a common Clojure class name standing for its kinds (`String`, `Long`, `Object` as `:any`) | `docs/PROTOCOLS.md` |
-| `(catch Exception e ...)` | by class | a class that names a nexis error takes that error's tag (`ArithmeticException` `:divide-by-zero` and `:arithmetic-overflow`, `IndexOutOfBoundsException` `:index-out-of-bounds`, `ClassCastException` `:kind-mismatch` and `:not-callable`, `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause` and `:arity-mismatch`, `AssertionError` `:assertion-failed`, `StackOverflowError` `:stack-overflow`); any other class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
+| `(catch Exception e ...)` | by class | a class that names a nexis error takes that error's tag (`ArithmeticException` `:divide-by-zero` and `:arithmetic-overflow`, `IndexOutOfBoundsException` `:index-out-of-bounds`, `ClassCastException` `:kind-mismatch` and `:not-callable`, `IllegalArgumentException` `:invalid-argument`, `:no-matching-clause`, `:arity-mismatch`, `:no-method` and `:ambiguous-method`, `IllegalStateException` `:preference-conflict`, `AssertionError` `:assertion-failed`, `StackOverflowError` `:stack-overflow`); any other class-name symbol, `:default` and `any` take every value; `(catch :tag e ...)` takes `:tag`, a map whose `:error` is `:tag`, or an `ex-info` whose data's `:error` is `:tag` | `docs/MACROEXPAND.md` |
 | `(ex-info msg data)` | an `ExceptionInfo` | the map `{:message msg :data data}` (`:cause` with a third argument); as Clojure's, `msg` is a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch` | `docs/MACROEXPAND.md` |
 | `(case x ...)` with no match | `IllegalArgumentException` | throws `{:error :no-matching-clause :message "No matching clause: x" :value x}`; `condp` the same | `docs/MACROEXPAND.md` |
 | `(reduced x)` | an opaque box | a `nexis.core/Reduced` record with field `:val`; `reduce`, `reductions` and `reduce-kv` honour it | `src/stdlib/core.nx` |
@@ -238,7 +238,12 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
 | `/` by a float zero | `ArithmeticException` when both operands are boxed (a function's arguments, `apply`); IEEE `##Inf`/`##NaN` when the compiler sees a primitive double operand (a float literal, a double local): `(/ 1.0 0)` at the REPL is `##Inf` | `:divide-by-zero` always, the boxed rule: nexis has no primitive operand types; a NaN operand is the result, as in Clojure | `docs/SEMANTICS.md` §2.2 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |
-| `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; `defrecord` binds `P` to that symbol, so `(instance? P x)` reads as in Clojure | `docs/STDLIB.md` §8 |
+| `class`, `type`, `instance?` | JVM classes; `(instance? Number x)` walks the hierarchy | a kind keyword (`:vector`, `:fixnum`) or a record's symbol (`user.P`), which `instance?` compares for equality; `defrecord` binds `P` to that symbol, so `(instance? P x)` reads as in Clojure; `class?` holds of these, and the global hierarchy takes them as tags (`docs/STDLIB.md` §9.1) | `docs/STDLIB.md` §8 |
+| `isa?`, `parents`, `ancestors`, `descendants` | walk Java's superclasses and interfaces as well as the hierarchy (`(isa? java.util.HashMap java.util.Map)`); `descendants` of a class throws; `(isa? h c p)` of a non-hierarchy `h` throws | only the edges `derive` made: there is no supertype relation between kinds; `descendants` reads the hierarchy for any tag; a non-hierarchy `h` gives false. The tags `class?` holds of, kind keywords and record symbols, stand for classes: `(derive :vector :user/coll)`, `(derive Circle :user/shape)`; a redefined record is the same symbol and keeps its derivations, where Clojure's is a new class | `docs/STDLIB.md` §9.1 |
+| a multimethod | a `MultiFn`: `(fn? mf)` false, `class` `clojure.lang.MultiFn`, printed `#object[clojure.lang.MultiFn ...]` | a closure: `(fn? mf)` true, `class` `:function`, printed `#<fn>`; `ifn?`, `=`, `hash`, `meta` and `with-meta` agree with Clojure | `docs/STDLIB.md` §9.2 |
+| `(defmulti ^:private f ...)`, `(defmulti ^{:doc "d"} f ...)` | the metadata on the name lands on the Var | dropped: a `core.nx` macro never sees `^meta` on a symbol; the docstring and attr-map arguments do land on the Var | `docs/STDLIB.md` §9.2 |
+| the no-method and preference messages | `"... dispatch value: null"` | `"... dispatch value: nil"`, as `format`'s `%s` prints nil | `docs/STDLIB.md` §9.4 |
+| the ambiguity message's pair | `PersistentHashMap` order | the method table's: insertion order to eight entries, CHAMP order past them, so the two keys named can be in the other order | `docs/STDLIB.md` §9.4 |
 | namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` and `*ns*` in `user` are `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil; a `binding` of `*ns*` does not change where `eval` compiles | `docs/STDLIB.md` §8 |
 | `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
@@ -250,7 +255,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 
 ### 4.4 Absences
 
-The deliberate ones are PLAN §4's non-goals: multimethods, STM,
+The deliberate ones are PLAN §4's non-goals: STM,
 agents, `core.async`, reader conditionals,
 tagged literals, rationals and decimals, full hygiene, other compile
 targets, Java interop. Library functions that do not exist are known gaps, not decisions

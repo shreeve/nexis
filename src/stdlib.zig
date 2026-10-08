@@ -393,6 +393,7 @@ const core_natives = table("", .{
     .{ "chunk-cons", 2, 2, &fnChunkCons },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
     .{ "class", 1, 1, &fnClass },
+    .{ "class?", 1, 1, &fnClassQ },
     .{ "var?", 1, 1, kindPredicate(isVar), .leaf },
     .{ "find-ns", 1, 1, &fnFindNs },
     .{ "all-ns", 0, 0, &fnAllNs },
@@ -603,6 +604,8 @@ const internal_natives = table("nexis.internal", .{
     // with-out-str: capture what the print functions write.
     .{ "#%push-out", 0, 0, &fnPushOut },
     .{ "#%pop-out", 0, 0, &fnPopOut },
+    // A multimethod's cached method (core.nx `mm-call`, STDLIB.md §9.3).
+    .{ "#%mm-lookup", 3, 3, &fnMmLookupLeaf, .leaf, &fnMmLookup },
 });
 
 const simd_natives = table("nexis.simd", .{
@@ -3788,6 +3791,66 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
         else => |k| @tagName(k),
     };
     return interner.internKeywordValue(name) catch VmError.OutOfMemory;
+}
+
+/// `(#%mm-lookup cache href dv)` → the method a multimethod's cache
+/// holds for `dv` (core.nx `mm-call`, STDLIB.md §9.3): `cache` is the
+/// atom of the pair `[hierarchy methods]`, `href` the Var or atom the
+/// hierarchy is read through, and the answer `(get methods dv)` while
+/// the hierarchy is still the identical value, else nil. One call for
+/// the two derefs, the identity check and the lookup of the fast path.
+fn fnMmLookup(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .atom) return VmError.KindMismatch;
+    const h = switch (args[1].kind()) {
+        .var_ => vm_mod.VM.asVar(args[1]).current() orelse return VmError.UnboundVar,
+        .atom => atom_mod.getValue(args[1]),
+        else => return VmError.KindMismatch,
+    };
+    const pair = atom_mod.getValue(args[0]);
+    const cached = try fnNth(vm, &.{ pair, value_mod.fromFixnum(0).? });
+    if (cached.tag != h.tag or cached.payload != h.payload) return value_mod.nilValue();
+    return fnGet(vm, &.{ try fnNth(vm, &.{ pair, value_mod.fromFixnum(1).? }), args[2] });
+}
+
+/// `#%mm-lookup` as a leaf: it refuses a dispatch value on the heap,
+/// whose hash and `=` may walk nested data, as `fnGetLeaf` does.
+fn fnMmLookupLeaf(vm: *VM, args: []const Value) VmError!Value {
+    if (args[2].kind().isHeap()) return VmError.NeedsReentry;
+    return fnMmLookup(vm, args);
+}
+
+/// `(class? x)` → whether `x` is a type `class` returns, which the
+/// global hierarchy takes as a tag (STDLIB.md §9.1): the keyword of a
+/// kind (`:boolean`, `:vector`, `:map`, `:set` or a `Kind` name that
+/// `fnClass` passes through), or the symbol of a registered record type.
+fn fnClassQ(vm: *VM, args: []const Value) VmError!Value {
+    const x = args[0];
+    const interner = vm.ensureInterner();
+    return value_mod.fromBool(switch (x.kind()) {
+        .keyword => isClassKeyword(interner.keywordName(x.asKeywordId())),
+        .symbol => blk: {
+            const name = interner.symbolName(x.asSymbolId());
+            for (vm.home().record_registry.items) |e| {
+                const dotted = e.ns_name.len > 0;
+                if (name.len != e.ns_name.len + @intFromBool(dotted) + e.type_name.len) continue;
+                if (dotted and !(std.mem.startsWith(u8, name, e.ns_name) and name[e.ns_name.len] == '.')) continue;
+                if (std.mem.endsWith(u8, name, e.type_name)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    });
+}
+
+fn isClassKeyword(name: []const u8) bool {
+    for ([_][]const u8{ "boolean", "vector", "map", "set" }) |alias| if (std.mem.eql(u8, name, alias)) return true;
+    const k = std.meta.stringToEnum(Kind, name) orelse return false;
+    return switch (k) {
+        // nil has no class, `fnClass` renames these, and the rest are
+        // reserved or never escape.
+        .nil, .true_, .false_, .persistent_vector, .persistent_map, .persistent_set, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
+        else => true,
+    };
 }
 
 fn nsOfSymbol(vm: *VM, v: Value) VmError!?*Namespace {

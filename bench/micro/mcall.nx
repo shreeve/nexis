@@ -1,0 +1,8 @@
+; bench/micro/mcall.nx N: count plus a call of a multimethod dispatching on :shape, three ways, a cache hit.
+(defmulti area :shape)
+(defmethod area :tri [m] 0)
+(defmethod area :circ [m] 2)
+(defmethod area :sq [m] 1)
+(let [n (parse-long (first *command-line-args*))
+      m {:shape :sq}]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (area m)) k))))
