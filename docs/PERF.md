@@ -1781,6 +1781,59 @@ tables, is 229,441 →
 221,190 bytes: 389 → 463 routines, 7,666 → 6,575 instructions, 756 →
 598 constants.
 
+### 3.31 Consuming natives, Apple M5
+
+`count`, `into`, `vec`, `take-last`, `i64-vector` and `f64-vector`
+consume their sequence argument (`docs/GC.md` §11.5), as `reduce`
+does, so a lazy seq a local holds is let go as they walk it. Before is
+`efff7a7`, after `193ad6d`; one ReleaseFast build of each. Provenance:
+§11.
+
+Each program binds the pipeline `(map inc (filter even? (map inc
+(range n))))` (`lazyi` maps `#(mod % 10)` last) by `let` and hands it
+to the native; whole process, three interleaved runs of each (load 5.9
+→ 6.4), the peak resident set and the median instructions and wall
+time:
+
+| Program | n | Peak RSS before | after | Instructions before | after | Wall before | after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `(count s)` | 3 M | 61.5 MB | 21.6 MB | 1,002 M | 910 M | 88 ms | 75 ms |
+| | 30 M | 587.4 MB | 21.6 MB | 10,220 M | 8,827 M | 1,082 ms | 578 ms |
+| `(count (into #{} s))`, ten distinct | 3 M | 111.2 MB | 21.7 MB | 1,705 M | 1,531 M | 128 ms | 97 ms |
+| | 30 M | 1,069.2 MB | 21.6 MB | 17,196 M | 15,028 M | 1,422 ms | 897 ms |
+| `(count (into #{} (map #(mod % 10)) s))` | 3 M | 71.1 MB | 22.3 MB | 4,482 M | 4,297 M | 301 ms | 265 ms |
+| | 30 M | 655.1 MB | 22.3 MB | 44,988 M | 42,728 M | 3,297 ms | 2,300 ms |
+| `(count (vec s))` | 3 M | 112.4 MB | 48.2 MB | 1,119 M | 1,045 M | 103 ms | 74 ms |
+| | 30 M | 967.7 MB | 435.7 MB | 11,347 M | 10,622 M | 1,127 ms | 734 ms |
+| `(count (i64-vector s))` and `(take-last 2 ...)` of the pipeline | 3 M | 136.7 MB | 47.9 MB | 2,155 M | 1,882 M | 218 ms | 134 ms |
+| | 30 M | 1,333.7 MB | 367.8 MB | 21,964 M | 18,599 M | 2,492 ms | 1,318 ms |
+
+What `count` and `into` a set keep is their walk's place; `vec` keeps
+the vector it builds, 16 bytes an element. The collector does not mark
+the realized chain at every cycle, which is the instructions the rows
+lose.
+
+`into` a hash set of 1.5 M (3 M) and 15 M (30 M) distinct elements
+conj's each on a transient as the walk hands it out, where it
+collected every element before conj'ing them on the same transient:
+five interleaved runs (load 12.7 → 17.2), 2,288 → 2,272 M and 22,729
+→ 22,510 M instructions, 1,323 → 1,451 M and 19,345 → 21,213 M
+cycles, 209.7 → 97.0 MB and 1,825.4 → 815.5 MB. `set` is left as it
+is: it builds its set from every element at once, each node
+allocated once, and conj'ing each on a transient instead ran 960 →
+1,392 M cycles at 3 M and 10,893 → 20,785 M at 30 M (three
+interleaved runs, load 14.6 → 11.3), the same instructions.
+
+The micro kit (`docs/BENCH.md` §13), `bb bench/micro/run.clj
+--rounds 5` (load 6.9 → 7.9): every program's instructions an
+iteration, an element or a call within its range, `count` 57.9 and
+57.9, `fib` 190.0 and 189.9, `lazyl` 326.7 and 326.9, `cbred` less
+`cbbase` 196.3 and 196.0. The `bench/compare` language programs, five
+interleaved rounds (load 7.7 → 9.6): every row's median instructions
+within 0.3% and its peak resident set the same; the largest moves are
+`vector-conj-nth` 905.1 → 902.3 M and `map-build-read` 3,561.7 →
+3,566.1 M [3,559.7–3,581.5].
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2172,4 +2225,5 @@ is one invocation's 30-sample median.
 | §3.28 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-07, multi: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` on `0ef07a3` with this section's commits, before §3.26's counting-loop step: at the micro-program commit, whose runtime is the multimethods commit's (before), and at the `#%mm-lookup` commit (after); `bb bench/micro/run.clj --rounds 5 --programs count,gcall,pcall,casek,mcall BEFORE AFTER` under `tools/heavy` (1 core), load 7.80 → 7.02; the dispatch and native counts from `-Dopcodes=true` builds of each, `mcall`, `pcall`, `gcall` and `casek` at 100,000 and 200,000 iterations, the difference per iteration; the one-arity figure from a probe program calling the same cache through a one-arity closure, at 1 M and 2 M. Raw output: `.git/revamp/r3/multi/` (`micro-AB.*`) |
 | §3.29, §6 "Locals clearing" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `24027c8`; shared with concurrent sessions | 2026-10-07 21:48–22:10 MDT, locals: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `97e2d11` (before) and `22d9391` (after), and with `-Dopcodes=true` at `97e2d11` and `6da3c15`. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program under `tools/heavy` (1 core), load 5.26 → 5.42. The memory rows: `cmds.py OUT 3` over `lazy3`, `lazyl`, `lazyf` at 3 M and 30 M, load 4.81 → 5.26. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.16 → 7.13; startup by `cmds.py OUT 21` over `-e nil`. `nexis-bench --filter compiler` twice per build, interleaved, after at `1d63d19`; the image generator, each tree's debug `nexis-imagegen`, `cmds.py OUT 7`. Raw output: `.git/revamp/r3/locals/` (`micro-final.*`, `mem.*`, `cmp.*`, `startup.*`, `cbench-*`, `imagegen.*`, `opcodes/`) |
 | §3.30, §6 "Per-arity entry points" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002`; shared with concurrent sessions | 2026-10-08, arity: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `fb51779` (before) and at the `expand` commit (after), and with `-Dopcodes=true` at each. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program but the lazy pipelines under `tools/heavy` (1 core), load 13.01 → 7.85. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.75 → 5.25; startup by `cmds.py OUT 21` over `-e nil`. Dispatch and native counts: `gcall`, `acall`, `vcall`, `mcall` and `xform` at 100,000 and 200,000, `fib` and `afib` at 20 and 22, the difference per unit. The image figures from each tree's `stdlib.image` header. Raw output: `.git/revamp/r3/arity2/` (`micro-AB.*`, `cmp.*`, `startup.*`, `opcodes/`) |
+| §3.31 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08 01:27–01:42 MDT, consume: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `efff7a7` (before) and `193ad6d` (after, with `set` consuming, which the `set` comparison measures and which no other row runs). The memory rows: `cmds.py OUT 3` over the `count`, `into` and `vec` programs at 3 M and 30 M (`mem.*`, load 5.86 → 6.35) and over the `i64-vector`/`take-last` program (`mem2.*`, load 9.62 → 11.29); the `set` comparison `cmds.py OUT 3` (`mem3.*`, load 14.59 → 11.27); the `into` a hash set comparison `cmds.py OUT 5` against a build whose `into` is `193ad6d`'s (`mem4.*`, load 12.65 → 17.21). Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` under `tools/heavy` (1 core), load 6.89 → 7.89. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 7.67 → 9.58. Raw output: `.git/revamp/r3/consume/` (`mem*.txt`, `mem*.json`, `mem*.load`, `micro.*`, `cmp.*`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |

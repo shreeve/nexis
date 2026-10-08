@@ -402,16 +402,17 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   (`docs/VM.md` §9), so a lazy seq keeps what it realized for as long
   as a slot holds it. A native's call block is cleared when the native
   returns (`docs/VM.md` §6); `reduce`, like `frequencies`, `group-by`,
-  `some`, `every?`, `last` and `dorun`, consumes its sequence
+  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
+  `take-last`, `i64-vector` and `f64-vector`, consumes its sequence
   argument, clearing its slot in the block and keeping only its
   walk's place (`docs/GC.md` §11.5); and the compiler clears a local
   or a parameter at its last move, the last time it is passed to a
   call or moved by a `let` or a `recur` (`docs/COMPILER.md` §4.9). So
   `(reduce + (map inc (range n)))`, `(let [s (map inc (range n))]
-  (reduce + s))`, `(defn total [xs] (reduce + xs))` and the stdlib
-  functions over such a call (`run!`, `transduce`, `doseq` in a
-  function) run in constant memory, as Clojure's locals clearing lets
-  them. Where the two differ:
+  (reduce + s))`, `(let [s (map inc (range n))] (count s))`, `(defn
+  total [xs] (reduce + xs))` and the stdlib functions over such a call
+  (`run!`, `transduce`, `doseq` in a function) run in constant memory,
+  as Clojure's locals clearing lets them. Where the two differ:
   - A last read that is not a move clears nothing: a branch's test, a
     keyword lookup's target, an arithmetic operand. Clojure clears a
     local an `if` test reads last.
@@ -420,9 +421,15 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
     where Clojure clears a `^:once` body's fields (`lazy-seq`,
     `delay`, `future`).
   - The natives that walk to the end without consuming their argument
-    keep it in the call's block while they walk: `(let [s (map inc
-    (range n))] (count s))` holds what `count` realizes, and so do
-    `into` and `vec`.
+    keep it in the call's block while they walk, most building a
+    result as long as the seq: `butlast`, `reverse`, `sort`,
+    `sort-by`, `mapv`, `filterv`, `apply`, `zipmap`'s values,
+    `select-keys`'s keys and `nexis.string/join`. `set` builds its set
+    from every element at once, half the cycles of conj'ing each on a
+    transient at a million elements (`docs/PERF.md` §3.31); `(into #{}
+    s)` consumes `s`. `nth`, `nthrest` and `nthnext` walk their first
+    argument, and a native consumes only its last; `doall` returns the
+    head it realized.
   - As in Clojure, a local bound outside a loop and read inside it is
     held for the whole loop, and so is one a `try`'s handler or
     finally reads, through the try's body.

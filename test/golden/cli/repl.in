@@ -2,9 +2,9 @@
 (+ x 2)
 (/ 1 0)
 *e
-(count (vec (repeat 100000000 0)))
+(count (i64-vector (repeat 100000000 0)))
 *e
-(with-out-str (print "y") (count (vec (repeat 100000000 0))))
+(with-out-str (print "y") (count (i64-vector (repeat 100000000 0))))
 (println "after")
 (+ 1 2)
 (def a 1) (def b 2) (+ a b)

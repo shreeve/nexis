@@ -1,10 +1,11 @@
 ; An allocation the runtime cannot have is a runtime error: the report
 ; locates the form that asked for it (exit 5). The golden runs with
-; NEXIS_MAX_ALLOC=16777216, so the vector below, 16 bytes an element,
-; fails as it passes 16 MiB instead of exhausting the machine.
+; NEXIS_MAX_ALLOC=16777216, which refuses any one block past 16 MiB, so
+; the typed vector below, one block of 8 bytes an element, fails as its
+; elements pass 16 MiB instead of exhausting the machine.
 
 (defn fill [n]
-  (count (vec (repeat n 0))))
+  (count (i64-vector (repeat n 0))))
 
 (println "before")
 (fill 100000000)

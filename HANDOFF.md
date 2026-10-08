@@ -57,7 +57,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 220/220 steps succeeded; 1575/1575 tests passed
+Build Summary: 220/220 steps succeeded; 1578/1578 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -474,9 +474,12 @@ after numbers in the commit message.
    - The pipeline and vectors: a closure called from a native
      (`VM.callPrepared`) is the largest share of their processes'
      cycles.
-2. `count`, `into` and `vec` consuming their argument (TODO.md #13):
-   a local or a parameter is cleared at its last move (`docs/COMPILER.md`
-   §4.9), but these natives keep the seq they walk in the call's block.
+2. TODO.md #13: `sort`, `reverse`, `mapv` and the other natives that
+   walk to the end without consuming their argument (`docs/LAZY.md`
+   §9) hold the seq they walk, and a local a closure captures holds it
+   while the closure runs; `count`, `into`, `vec` and the other
+   consuming natives of `docs/GC.md` §11.5 let it go as they walk
+   (`docs/PERF.md` §3.31).
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
 4. The open design question, an amendment first: `&form`/`&env`

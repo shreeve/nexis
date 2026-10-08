@@ -71,10 +71,12 @@ const VmError = vm_mod.VmError;
 // comparing or hashing nested data; a bignum one makes is a fresh
 // block, and `Heap.alloc` never collects, VM.md §9), and after that
 // the full body when the leaf body refuses some receivers with
-// `NeedsReentry` (`NativeFn.general`). `table` turns it into static
-// descriptors (immortal, so a `.native_fn` Value can point at one); a
-// descriptor outside nexis.core is named `ns/name` for traces and
-// printing.
+// `NeedsReentry` (`NativeFn.general`); `.consumes` after a native that
+// consumes its last argument (`NativeFn.consumes`), and
+// `.consuming_leaf` after a leaf whose full body does. `table` turns
+// it into static descriptors (immortal, so a `.native_fn` Value can
+// point at one); a descriptor outside nexis.core is named `ns/name`
+// for traces and printing.
 
 fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]NativeFn {
     var out: [entries.len]NativeFn = undefined;
@@ -83,8 +85,8 @@ fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]Native
         .min_arity = e[1],
         .max_arity = e[2],
         .call = e[3],
-        .leaf = if (e.len > 4) e[4] == .leaf else false,
-        .consumes = if (e.len > 4) e[4] == .consumes else false,
+        .leaf = if (e.len > 4) e[4] == .leaf or e[4] == .consuming_leaf else false,
+        .consumes = if (e.len > 4) e[4] == .consumes or e[4] == .consuming_leaf else false,
         .general = if (e.len > 5) e[5] else null,
     };
     return out;
@@ -220,7 +222,7 @@ const core_natives = table("", .{
     .{ "drop", 1, 2, &fnDrop },
     .{ "some", 2, 2, &fnSome, .consumes },
     .{ "every?", 2, 2, &fnEveryQ, .consumes },
-    .{ "count", 1, 1, &fnCountLeaf, .leaf, &fnCount },
+    .{ "count", 1, 1, &fnCountLeaf, .consuming_leaf, &fnCount },
     .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
     .{ "empty?", 1, 1, &fnEmptyQ },
     .{ "identity", 1, 1, &fnIdentity, .leaf },
@@ -295,7 +297,7 @@ const core_natives = table("", .{
     .{ "range", 0, 3, &fnRange },
     .{ "concat", 0, null, &fnConcat },
     .{ "mapcat", 1, null, &fnMapcat },
-    .{ "into", 0, 3, &fnInto },
+    .{ "into", 0, 3, &fnInto, .consumes },
     .{ "mapv", 2, null, &fnMapv },
     .{ "filterv", 2, 2, &fnFilterv },
     .{ "map-indexed", 1, 2, &fnMapIndexed },
@@ -312,7 +314,7 @@ const core_natives = table("", .{
     .{ "reverse", 1, 1, &fnReverse },
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext },
-    .{ "take-last", 2, 2, &fnTakeLast },
+    .{ "take-last", 2, 2, &fnTakeLast, .consumes },
     .{ "repeat", 1, 2, &fnRepeat },
     .{ "repeatedly", 1, 2, &fnRepeatedly },
     .{ "iterate", 2, 2, &fnIterate },
@@ -406,7 +408,7 @@ const core_natives = table("", .{
     .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf },
     // Collection construction + access.
     .{ "vector", 0, null, &fnVector },
-    .{ "vec", 1, 1, &fnVec },
+    .{ "vec", 1, 1, &fnVec, .consumes },
     .{ "hash-map", 0, null, &fnHashMap },
     .{ "hash-set", 0, null, &fnHashSet },
     .{ "set", 1, 1, &fnSet },
@@ -441,8 +443,8 @@ const core_natives = table("", .{
     .{ "rsubseq", 3, 5, &fnRsubseq },
     .{ "rseq", 1, 1, &fnRseq },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
-    .{ "i64-vector", 1, 1, &fnI64Vector },
-    .{ "f64-vector", 1, 1, &fnF64Vector },
+    .{ "i64-vector", 1, 1, &fnI64Vector, .consumes },
+    .{ "f64-vector", 1, 1, &fnF64Vector, .consumes },
     .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector), .leaf },
     .{ "typed-vector-type", 1, 1, &fnTypedVectorType },
     // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
@@ -793,14 +795,31 @@ fn fnCount(vm: *VM, args: []const Value) VmError!Value {
         .sorted_map, .sorted_set => @intCast(sorted_mod.count(c)),
         .string => @intCast(string_mod.codepointCount(c) catch return VmError.Utf8Error),
         .transient => @intCast(try transientCount(vm, c)),
-        .lazy_seq => @intCast(try seq_mod.countOf(vm, c)),
+        .lazy_seq => @intCast(try countConsumed(vm, c)),
         else => return VmError.KindMismatch,
     };
     return value_mod.fromFixnum(n) orelse VmError.ArithmeticOverflow;
 }
 
+/// How many elements a lazy seq `count` consumes has: an unrealized
+/// range or `repeat` of a count is computed (`seq.countOf`); any other
+/// seq is walked, keeping only the walk's place.
+fn countConsumed(vm: *VM, s: Value) VmError!usize {
+    if (seq_mod.pureOf(s)) |p| switch (p) {
+        .range, .repeat_n => return seq_mod.countOf(vm, s),
+        else => {},
+    };
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, s, scope);
+    var n: usize = 0;
+    while (try it.next()) |_| n += 1;
+    return n;
+}
+
 /// `count` as a leaf (VM.md §6): a lazy seq (realized to its end) and
-/// an entity (read from the store) go the general way.
+/// an entity (read from the store) go the general way, which consumes
+/// the argument.
 fn fnCountLeaf(vm: *VM, args: []const Value) VmError!Value {
     return switch (args[0].kind()) {
         .lazy_seq, .nextomic_entity => VmError.NeedsReentry,
@@ -1834,8 +1853,12 @@ fn fnVector(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(heap, args) catch VmError.OutOfMemory;
 }
 
+/// `(vec coll)` → the elements of any seqable as a vector. A lazy
+/// seq's walk may run code, and `vec` consumes it: the elements go
+/// straight into the vector as it is built (`vecConsumed`).
 fn fnVec(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
+    if (walksLazily(s)) return vecConsumed(vm, s);
     return switch (s.kind()) {
         .nil => {
             const heap = vm.ensureHeap();
@@ -1866,7 +1889,10 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(set coll)` → the elements of any seqable as a hash set; a set
-/// itself without its metadata, as Clojure's.
+/// itself without its metadata, as Clojure's. Built from every element
+/// at once, each node allocated once, which costs half the cycles of
+/// conj'ing each on a transient at a million elements, so a lazy seq
+/// is not consumed: `(into #{} s)` consumes it (`docs/PERF.md` §3.31).
 fn fnSet(vm: *VM, args: []const Value) VmError!Value {
     if (isSet(args[0].kind())) {
         if (heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null) return args[0];
@@ -2196,6 +2222,16 @@ fn conjMap(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
     return result;
 }
 
+/// `x` conj'd in place onto `t`, a transient over a collection of
+/// `kind`: a vector, a hash set or a hash map.
+inline fn conjBang(vm: *VM, kind: Kind, t: Value, x: Value) VmError!void {
+    switch (kind) {
+        .persistent_vector => _ = transient_mod.vectorConjBang(vm.ensureHeap(), t, x) catch |err| return transientFailure(vm, err),
+        .persistent_set => try conjBangSet(vm, t, x),
+        else => try conjBangMap(vm, t, x),
+    }
+}
+
 /// From this many elements on, `conj` onto a vector, hash map or hash
 /// set (and so `into`) builds through a transient: one root copy, and
 /// then each element lands in place (TRANSIENT.md §1).
@@ -2207,11 +2243,7 @@ const conj_in_place_min = 4;
 fn conjInPlace(vm: *VM, coll: Value, xs: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const t = transient_mod.transientFrom(heap, coll) catch |err| return transientFailure(vm, err);
-    for (xs) |x| switch (coll.kind()) {
-        .persistent_vector => _ = transient_mod.vectorConjBang(heap, t, x) catch |err| return transientFailure(vm, err),
-        .persistent_set => try conjBangSet(vm, t, x),
-        else => try conjBangMap(vm, t, x),
-    };
+    for (xs) |x| try conjBang(vm, coll.kind(), t, x);
     const result = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
     heap_mod.Heap.asHeapHeader(result).setMeta(heap_mod.Heap.asHeapHeader(coll).getMeta());
     return result;
@@ -2332,28 +2364,93 @@ fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(into to from)` → `to` with every element of `from` conj'd;
 /// `(into)` is `[]` and `(into to)` is `to`; `(into to xform from)`
-/// through a transducer (docs/LAZY.md §10).
+/// through a transducer (docs/LAZY.md §10), whose `from` parameter the
+/// compiler clears at its last move. `from` is consumed: a lazy seq is
+/// walked by `intoConsumed`.
 fn fnInto(vm: *VM, args: []const Value) VmError!Value {
     if (args.len < 2) return fnConj(vm, args);
     if (args.len == 3) return callCore(vm, "into-xform", args);
+    // An empty vector with no metadata takes every element at once.
+    const fresh = args[0].kind() == .persistent_vector and vector_mod.isEmpty(args[0]) and heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null;
+    if (walksLazily(args[1])) return if (fresh) vecConsumed(vm, args[1]) else intoConsumed(vm, args[0], args[1]);
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     if (items.items.len == 0) return args[0];
-    // An empty vector with no metadata takes every element at once.
-    if (args[0].kind() == .persistent_vector and vector_mod.isEmpty(args[0]) and heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null) {
+    if (fresh) {
         return vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
     }
-    // A sorted target's comparator can collect while `conj` runs; a
-    // map source's entries were built by the walk and reach from
-    // nothing else (GC.md §11.5, class 4).
+    // A sorted target's comparator, or the realizing of a lazy target,
+    // can collect while `conj` runs; a map source's entries were built
+    // by the walk and reach from nothing else, and `from` is consumed
+    // (GC.md §11.5, class 4).
     const scope = vm.rootScope();
     defer scope.release();
-    if (sorted_mod.isSortedKind(args[0].kind())) try scope.pushAll(items.items);
+    if (sorted_mod.isSortedKind(args[0].kind()) or args[0].kind() == .lazy_seq) try scope.pushAll(items.items);
     const conj_args = vm.allocator.alloc(Value, items.items.len + 1) catch return VmError.OutOfMemory;
     defer vm.allocator.free(conj_args);
     conj_args[0] = args[0];
     @memcpy(conj_args[1..], items.items);
     return fnConj(vm, conj_args);
+}
+
+/// Whether walking `coll` may run code, and so collect: a lazy seq, but
+/// for an unrealized range, whose elements are computed (LAZY.md §7).
+/// A native that consumes such a seq walks it with `consumingSeqIter`.
+fn walksLazily(coll: Value) bool {
+    if (coll.kind() != .lazy_seq) return false;
+    const p = seq_mod.pureOf(coll) orelse return true;
+    return p != .range;
+}
+
+/// `(vec s)` of a lazy seq `vec` or `into` consumes: its elements go
+/// into a `Results` as the walk hands them out, so the realized seq
+/// behind the walk is garbage while the vector grows.
+fn vecConsumed(vm: *VM, s: Value) VmError!Value {
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, s, scope);
+    var results = Results.init(vm);
+    defer results.release();
+    while (try it.next()) |x| try results.add(x);
+    return results.vector();
+}
+
+/// `(into to s)` of a lazy seq `into` consumes, conj'ing each
+/// element as the walk hands it out (Clojure's `reduce conj`): in place
+/// on a transient over a vector, hash map or hash set, as
+/// `conjInPlace`, and one `conj` at a time onto anything else. `to`
+/// itself when `s` is empty. The element in hand is reachable from the
+/// walk's place while it is conj'd; `to` and the result so far wait in
+/// root slots, since the walk's steps, a sorted target's comparator or
+/// a lazy target's realizing may collect.
+fn intoConsumed(vm: *VM, to: Value, s: Value) VmError!Value {
+    const scope = vm.rootScope();
+    defer scope.release();
+    try scope.push(to);
+    var it = try consumingSeqIter(vm, s, scope);
+    switch (to.kind()) {
+        .persistent_vector, .persistent_map, .persistent_set => {
+            var x = (try it.next()) orelse return to;
+            const t = transient_mod.transientFrom(vm.ensureHeap(), to) catch |err| return transientFailure(vm, err);
+            try scope.push(t);
+            while (true) {
+                try conjBang(vm, to.kind(), t, x);
+                x = (try it.next()) orelse break;
+            }
+            const result = transient_mod.persistentBang(t) catch |err| return transientFailure(vm, err);
+            heap_mod.Heap.asHeapHeader(result).setMeta(heap_mod.Heap.asHeapHeader(to).getMeta());
+            return result;
+        },
+        // The slot `to` waits in holds the result so far.
+        else => {
+            var acc = to;
+            while (try it.next()) |x| {
+                acc = try fnConj(vm, &.{ acc, x });
+                vm.roots.items[scope.base] = acc;
+            }
+            return acc;
+        },
+    }
 }
 
 /// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
@@ -2603,9 +2700,28 @@ fn fnNthnextLeaf(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(take-last n coll)`; of nothing it is nil, as Clojure's.
+/// `(take-last n coll)`; of nothing it is nil, as Clojure's. A lazy
+/// seq is consumed: the last `n` elements the walk handed out wait in
+/// root slots used as a ring, so the walk keeps no more than they.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[0]);
+    if (walksLazily(args[1])) {
+        const scope = vm.rootScope();
+        defer scope.release();
+        var it = try consumingSeqIter(vm, args[1], scope);
+        const ring = vm.roots.items.len;
+        var seen: usize = 0;
+        while (try it.next()) |x| : (seen += 1) {
+            if (seen < n) try scope.push(x) else if (n > 0) vm.roots.items[ring + seen % n] = x;
+        }
+        const keep = @min(n, seen);
+        if (keep == 0) return value_mod.nilValue();
+        const items = vm.allocator.alloc(Value, keep) catch return VmError.OutOfMemory;
+        defer vm.allocator.free(items);
+        const oldest = if (seen > n) seen % n else 0;
+        for (items, 0..) |*slot, i| slot.* = vm.roots.items[ring + (oldest + i) % keep];
+        return try buildListFromSlice(vm, items);
+    }
     var items = try collectSeq(vm, args[1]);
     defer items.deinit(vm.allocator);
     const keep = @min(n, items.items.len);
@@ -6525,23 +6641,30 @@ fn f64Elem(v: Value) VmError!f64 {
 /// `(i64-vector coll)`: an `i64` typed vector of the integers in
 /// `coll`, any seqable.
 fn fnI64Vector(vm: *VM, args: []const Value) VmError!Value {
-    var items = try collectSeq(vm, args[0]);
-    defer items.deinit(vm.allocator);
-    const elems = vm.allocator.alloc(i64, items.items.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(elems);
-    for (elems, items.items) |*slot, v| slot.* = try i64Elem(v);
-    return typed_vector_mod.fromI64Slice(vm.ensureHeap(), elems) catch VmError.OutOfMemory;
+    var elems = try typedElems(i64, vm, args[0], i64Elem);
+    defer elems.deinit(vm.allocator);
+    return typed_vector_mod.fromI64Slice(vm.ensureHeap(), elems.items) catch VmError.OutOfMemory;
 }
 
 /// `(f64-vector coll)`: an `f64` typed vector of the numbers in
 /// `coll`, any seqable; integers widen.
 fn fnF64Vector(vm: *VM, args: []const Value) VmError!Value {
-    var items = try collectSeq(vm, args[0]);
-    defer items.deinit(vm.allocator);
-    const elems = vm.allocator.alloc(f64, items.items.len) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(elems);
-    for (elems, items.items) |*slot, v| slot.* = try f64Elem(v);
-    return typed_vector_mod.fromF64Slice(vm.ensureHeap(), elems) catch VmError.OutOfMemory;
+    var elems = try typedElems(f64, vm, args[0], f64Elem);
+    defer elems.deinit(vm.allocator);
+    return typed_vector_mod.fromF64Slice(vm.ensureHeap(), elems.items) catch VmError.OutOfMemory;
+}
+
+/// The elements of `coll`, any seqable, made `T`s as the walk hands
+/// them out. `i64-vector` and `f64-vector` consume `coll`: an element is
+/// a number, held by nothing once it is made a `T`.
+fn typedElems(comptime T: type, vm: *VM, coll: Value, comptime elem: fn (Value) VmError!T) VmError!std.ArrayList(T) {
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, coll, scope);
+    var out: std.ArrayList(T) = .empty;
+    errdefer out.deinit(vm.allocator);
+    while (try it.next()) |v| out.append(vm.allocator, try elem(v)) catch return VmError.OutOfMemory;
+    return out;
 }
 
 /// `(typed-vector-type tv)` → `:i64` or `:f64`.
