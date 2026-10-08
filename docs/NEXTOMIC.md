@@ -272,8 +272,11 @@ rows at the end of each referenced entity's.
 
 `Store.writeBatch` writes each of the eight trees in turn, a current
 tree before its history twin, each in ascending key order. Only a
-retraction writes a history tree: its two rows there are adjacent and
-ascending, the retired assertion's `t` below its own. Equal keys
+retraction writes a history tree, two adjacent rows, the retired
+assertion's `t` below its own: in key order past the tree's last key,
+where they continue the run, and the retraction first among existing
+keys, where two puts in a row would split a full leaf at the pair
+rather than in half (`docs/PERF.md` §3.11). Equal keys
 keep their batch order, so a batch leaves the trees exactly as writing
 its datoms one at a time does. A run of keys into one gap fills its
 leaves to about nine tenths, between existing keys as at a tree's end,

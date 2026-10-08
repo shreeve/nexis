@@ -716,11 +716,28 @@ pub const Store = struct {
     /// ascending run of puts without a descent wherever it lands in the
     /// tree and splits a leaf the run fills right-biased, so the run
     /// leaves its leaves about nine tenths full, between existing keys
-    /// as at the tree's end. A retraction's two history rows are
-    /// adjacent and ascending, so they continue the run.
+    /// as at the tree's end.
+    ///
+    /// A retraction's two history rows are adjacent. Past the history
+    /// tree's last key they go in key order and continue the run. Among
+    /// existing keys the retraction goes first: two puts in a row there
+    /// are a run of two, which splits a full leaf at the run and leaves
+    /// the keys before it alone on a page, often a sliver of one, where
+    /// a pair that is no run splits the leaf in half (`docs/PERF.md`
+    /// §3.11's churn shape: EAVT-h fill 0.47 one way, 0.61 the other).
     fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool, arena: Allocator) !void {
         var buf: [key.max_key_len]u8 = undefined;
         var value: std.ArrayList(u8) = .empty;
+        // The history tree's last key before the batch.
+        const tail: ?[]const u8 = if (history) blk: {
+            var c = try txn.openCursorForTree(self.trees.hist(w.index));
+            c.keysOnly = true;
+            const kv = c.last() orelse {
+                try ended(&c);
+                break :blk null;
+            };
+            break :blk try arena.dupe(u8, kv.key);
+        } else null;
         for (w.sorted) |i| {
             const p = w.batch[i];
             const k = w.keys.at(i);
@@ -730,9 +747,13 @@ pub const Store = struct {
                 @memcpy(buf[0..k.len], k);
                 const hk = buf[0 .. k.len + key.top_len];
                 key.writeTop(hk[k.len..][0..key.top_len], prior.t, true);
-                try txn.putInTree(self.trees.hist(w.index), hk, if (w.index == .eavt) prior.payload else &.{});
+                const appended = if (tail) |last| std.mem.order(u8, hk, last) == .gt else true;
+                if (appended) try txn.putInTree(self.trees.hist(w.index), hk, if (w.index == .eavt) prior.payload else &.{});
                 key.writeTop(hk[k.len..][0..key.top_len], w.t, false);
                 try txn.putInTree(self.trees.hist(w.index), hk, &.{});
+                if (appended) continue;
+                key.writeTop(hk[k.len..][0..key.top_len], prior.t, true);
+                try txn.putInTree(self.trees.hist(w.index), hk, if (w.index == .eavt) prior.payload else &.{});
                 continue;
             }
             if (!p.added) {
