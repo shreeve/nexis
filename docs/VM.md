@@ -34,9 +34,9 @@ and `(v i)`), namespaces, Vars and the namespace registry.
   group numbers exist and an instruction in one traps
   `UnimplementedOpcode`. Transient, hashing, durable-ref, I/O and
   typed-vector operations are natives.
-- A bytecode verifier, object files, tiered compilation.
-  `bin/nexis disasm` prints routines (`docs/TOOLING.md` §2); nothing
-  checks them before they run.
+- Object files and tiered compilation. `bin/nexis disasm` prints
+  routines (`docs/TOOLING.md` §2); `Routine.verify` checks each one
+  before it runs (§5).
 - Per-PC liveness maps: the whole backing stack is a root (§9).
 - Unbounded recursion: the frame chain stops at `VM.max_frames` and
   native re-entry at the stack guard, both with a catchable

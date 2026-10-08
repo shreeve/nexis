@@ -287,6 +287,10 @@ shape its keys, and what must not be asked of emdb.
   `NEXIS_GC_STRESS=1`, stdout diffed against `.out`; `persist-1` and
   `persist-2` share one store across two processes. Every
   `examples/*.nx` is pinned the same way, the store-backed ones twice.
+- **Portability.** `test/portable/` writes a `db/*` store and a
+  Nextomic store with data in every named tree and dumps them; the
+  dump of a store written on macOS arm64 and read on Linux x86_64, and
+  the reverse, is byte-identical to its `read.out` (§6.4 #1).
 - **Goldens.** `test/golden/` pins the reader's Form output
   byte-for-byte, eighteen reader-error cases, and under `cli/` what
   `bin/nexis` prints for runtime, reader and macro errors, a
@@ -437,18 +441,19 @@ after numbers in the commit message.
 
 ## 8. Order of work
 
-1. Interpreter speed: the instructions each bytecode instruction
-   costs and the dispatches a loop or a call takes, which keep nexis
-   behind babashka on three rows and behind warm JVM Clojure on eight
-   of ten on the Linux host (`docs/PERF.md` §3.15). The levers are
-   frameless fast handlers with a general fallback, operands proven in
-   range once per routine, in-place `recur`, self-calls, and fused
-   compare-and-jump and loop-step instructions (`docs/VM.md` §8, §10;
-   `docs/PERF.md` §6). The owner orders this after the em and emdb
-   work, with em's runtime as the reference.
-2. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
+1. The Linux comparison, rerun: `docs/PERF.md` §3.15's rows (nexis
+   behind babashka on three and behind warm JVM Clojure on eight of
+   ten) were measured before the interpreter levers of §3.16-§3.26:
+   frameless fast handlers, verification once per routine, the loop
+   shape, inlined arithmetic, the stdlib image, leaner calls,
+   self-calls, the keyword lookup, quickening and the counting-loop
+   step. Rerun it on that host and record what remains; em's runtime
+   is the reference for the next lever.
+2. Locals clearing (TODO.md #13): a lazy seq a local or a closure's
+   argument holds keeps what it realized until the slot is reused.
+3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
-3. The open design question, an amendment first: `&form`/`&env`
+4. The open design question, an amendment first: `&form`/`&env`
    (§24 #13). The owner orders it after the em and emdb work.
 
 Rerun `bb bench/compare/run.clj --out DIR` (`docs/BENCH.md` §12)
