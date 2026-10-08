@@ -6357,6 +6357,21 @@ test "core: sorting and comparison" {
     });
 }
 
+test "core: sort orders fixnums among every other number, stably, and reports what it cannot order" {
+    try runCoreCases(&.{
+        .{ .src = "(sort [5 99999999999999999999 -3 2.5 nil 0 -99999999999999999999 -1])", .expected = "(nil -99999999999999999999 -3 -1 0 2.5 5 99999999999999999999)" },
+        .{ .src = "(sort [140737488355327 -1 -140737488355328 0 1 140737488355326])", .expected = "(-140737488355328 -1 0 1 140737488355326 140737488355327)" },
+        // Equal numbers keep their input order, whatever their kinds.
+        .{ .src = "[(sort [1 1.0 0]) (sort [1.0 1 0])]", .expected = "[(0 1 1.0) (0 1.0 1)]" },
+        .{ .src = "(map :i (sort-by :k (map (fn [i] {:k (mod i 3) :i i}) (range 9))))", .expected = "(0 3 6 1 4 7 2 5 8)" },
+        .{ .src = "(map :i (sort-by :k compare (map (fn [i] {:k (- (mod i 3)) :i i}) (range 9))))", .expected = "(2 5 8 1 4 7 0 3 6)" },
+        .{ .src = "(sort compare (range 10 0 -1))", .expected = "(1 2 3 4 5 6 7 8 9 10)" },
+        .{ .src = "(try (sort (concat (range 50 0 -1) [\"x\"] (range 50))) (catch :kind-mismatch e :km))", .expected = ":km" },
+        .{ .src = "(try (sort-by (fn [i] (if (= i 7) :k i)) (range 20)) (catch :kind-mismatch e :km))", .expected = ":km" },
+        .{ .src = "(try (sort (fn [a b] (throw :boom)) [2 1]) (catch :boom e :caught))", .expected = ":caught" },
+    });
+}
+
 test "core: predicates, names and conversions" {
     try runCoreCases(&.{
         .{ .src = "[(list? '(1)) (list? [1]) (seq? '(1)) (seq? nil)]", .expected = "[true false true false]" },
