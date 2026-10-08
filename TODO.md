@@ -37,10 +37,6 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    engine owner's call. On the nexis side the levers left are batching
    (`docs/PERF.md` §6 "Batched commits") and a smaller page, which
    changes the format's key bound (`docs/NEXTOMIC.md` §2).
-3. **`sort` holds memory outside the heap.** Its resident set is
-   157 MB against babashka's 114 MB (`docs/PERF.md` §3.11): about
-   80 MB of the buffers it sorts through are allocated outside the
-   collected heap (`docs/PERF.md` §6, "`sort`'s buffers").
 4. **Durable commits cost two device flushes.** A `:durable` commit
    is 2.24 ms against Datalevin's 2.02 ms on the Linux host
    (`docs/PERF.md` §3.15): emdb syncs data, then meta, with two

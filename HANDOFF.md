@@ -485,18 +485,21 @@ after numbers in the commit message.
    destructuring loop 5.5×, string splitting 2.4×, the map build 2.1×,
    the pipeline and vectors 2.1× (§3.33), the transient map 1.2×; nexis
    leads on the counting loop (0.71), on `frequencies`/`group-by`
-   (0.92) and on `sort` (93–96 ms against 147 ms, `docs/PERF.md`
-   §3.32). Nextomic leads every system on every
+   (0.92) and on `sort` (54–56 ms against 147 ms, `docs/PERF.md`
+   §3.34). Nextomic leads every system on every
    phase timed cold but Datalevin's durable commit (1.12), and is level
    with Datomic Pro's warm peer on lookups (0.97). The levers the
    numbers name:
-   - `sort` (`docs/PERF.md` §3.32): the natural order compares
+   - `sort` (`docs/PERF.md` §3.32, §3.34): the natural order compares
      two fixnum keys in place and reads any other pair's order without
      the `VmError!Order` that Zig 0.17's x86-64 code stored and could
-     not forward; the million-int sort runs in 93–96 ms on the Linux
-     host (181 ms before, 144 ms for Zig 0.16's build), 0.25 of
-     babashka's time and below warm JVM Clojure's 147 ms. Its buffers
-     (`docs/PERF.md` §6 "`sort`'s buffers") are the lever left.
+     not forward, and the values are sorted where they are gathered,
+     through a scratch array of half of them; the million-int sort
+     runs in 54–56 ms on the Linux host (181 ms with neither, 93 ms
+     with the comparison alone), 0.16 of babashka's time and 0.37 of
+     warm JVM Clojure's 147 ms, and peaks at 56 MB against babashka's
+     116 MB. `(vec sorted)` gathering the list again (`docs/PERF.md`
+     §6 "`vec` of a vector's view") is the lever left.
    - Calls (`fib`, the destructuring loop): on x86-64 `fastCall` saves
      six callee-saved registers, `fastCallSelf` four, the comparisons
      three (`docs/PERF.md` §6 "Frameless fast handlers on x86-64"). em's
