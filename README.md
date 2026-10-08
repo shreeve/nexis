@@ -273,4 +273,4 @@ so the page size never follows a platform's engine default.
 
 ## License
 
-Not yet chosen.
+MIT; see `LICENSE`.

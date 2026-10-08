@@ -151,7 +151,7 @@ value kinds; each is a frozen commitment. Amend first.
 
 ```
 nexis/
-├── AGENTS.md HANDOFF.md README.md PLAN.md CLOJURE-REVIEW.md ZIG.md
+├── AGENTS.md HANDOFF.md README.md PLAN.md CLOJURE-REVIEW.md ZIG.md LICENSE
 ├── TODO.md                      problems found and not yet fixed
 ├── build.zig, build.zig.zon     emdb is a path dependency (../emdb)
 ├── .github/workflows/ci.yml     CI: the gate on macOS and Linux, codegen, fmt, parser-check, an optimized build

@@ -20,6 +20,7 @@
         "examples",
         "nexis.grammar",
         "README.md",
+        "LICENSE",
         "PLAN.md",
         "CLOJURE-REVIEW.md",
         "AGENTS.md",
