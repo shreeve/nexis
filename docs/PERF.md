@@ -1839,12 +1839,12 @@ within 0.3% and its peak resident set the same; the largest moves are
 `sort` and `sort-by` in the natural order compare two fixnum keys in
 place, and any other pair through `sorted.naturalOrder` directly,
 reading its `OrderError!Order` as it is (`SortOrder.less` in
-`src/stdlib.zig`). Through `compareValues` the result was converted
-to a `VmError!Order` first, which Zig 0.17's x86-64 code rebuilt on
-the stack as a 16-bit and an 8-bit store and read back as one 32-bit
-load the store buffer cannot forward (§3.15); after the change the
-general path reads the error and the order with loads of their own
-widths, and the fixnum path calls nothing. Before is `efff7a7`, after
+`src/stdlib.zig`). Through `compareValues` the result is converted
+to a `VmError!Order` first, which Zig 0.17's x86-64 code rebuilds on
+the stack as a 16-bit and an 8-bit store and reads back as one 32-bit
+load the store buffer cannot forward (§3.15, the before rows); read
+directly, the error and the order are loads of their own widths, and
+the fixnum path calls nothing. Before is `efff7a7`, after
 `8e6fbf5`; one ReleaseFast build of each on each host. Provenance:
 §11.
 
@@ -1857,7 +1857,7 @@ the direct call alone, without the fixnum path; after is both.
 Linux x86-64, `taskset -c 2`, `perf stat -e
 cpu_core/instructions/u,cpu_core/cycles/u`, five rounds (load 1.1 →
 1.2; C from a second five-round run beside before and after, load 1.2,
-whose before and after agree with these within 1%):
+whose before and after agree with these within 1.5%):
 
 | Build | ints: phase | instructions | cycles | strings: phase | instructions | cycles |
 |---|---:|---:|---:|---:|---:|---:|
@@ -1997,7 +1997,7 @@ Each lever is a measured change: a before/after from `zig build bench`
 - *Sort keys compared in registers* (§3.31): `sort` and `sort-by` in
   the natural order compare two fixnum keys in place and read any
   other pair's `OrderError!Order` from `sorted.naturalOrder` as it is,
-  where a conversion to `VmError!Order` made Zig 0.17's x86-64 code
+  where a conversion to `VmError!Order` makes Zig 0.17's x86-64 code
   store the result in two narrow writes and reload it in one load the
   CPU cannot forward (§3.15). On the Linux host the million-int sort
   180 → 93 ms, 2,672 → 1,195 M instructions, a 300,000-string sort
