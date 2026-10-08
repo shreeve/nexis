@@ -457,12 +457,13 @@ after numbers in the commit message.
    phase timed cold but Datalevin's durable commit (1.12), and is level
    with Datomic Pro's warm peer on lookups (0.97). The levers the
    numbers name:
-   - `sort`: Zig 0.17's x86-64 code reads `mergeSort`'s `VmError!Order`
-     back through a store that cannot be forwarded, three quarters of
-     `mergeSort`'s cycles; Zig 0.16's build of the same sort code runs
-     the phase in 144 ms, Zig 0.17's in 181 ms. A comparison that
-     returns its order outside an error union on the fixnum path is the
-     change to measure.
+   - `sort` (`docs/PERF.md` §3.31): the natural order compares
+     two fixnum keys in place and reads any other pair's order without
+     the `VmError!Order` that Zig 0.17's x86-64 code stored and could
+     not forward; the million-int sort runs in 93–96 ms on the Linux
+     host (181 ms before, 144 ms for Zig 0.16's build), 0.25 of
+     babashka's time and below warm JVM Clojure's 147 ms. Its buffers
+     (`docs/PERF.md` §6 "`sort`'s buffers") are the lever left.
    - Calls (`fib`, the destructuring loop): on x86-64 `fastCall` saves
      six callee-saved registers, `fastCallSelf` four, the comparisons
      three (`docs/PERF.md` §6 "Frameless fast handlers on x86-64"). em's
