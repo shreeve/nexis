@@ -355,7 +355,8 @@ constant pool, Var table, capture descriptors, span table,
   operand past its table, code that can fall off its end) is refused
   there with the instruction named, never run by a dispatch that
   trusts it (VM.md §8).
-- A finished routine's code is quickened (`vm.quicken`, VM.md
+- A finished routine's locals are cleared at their last moves
+  (§4.9), and then its code is quickened (`vm.quicken`, VM.md
   §10.10): with every jump patched, each `cmp` instruction and each
   `math:add`, `sub`, `mul`, `idiv` and `mod` of slots or of a slot and
   a fixnum constant, each of those `math` of a fixnum constant and a
@@ -430,7 +431,8 @@ protocol method. `test/prop/compile.zig` pins every row.
 
 A call's arguments compute straight into its block; an argument that
 is already in a slot (a parameter, a `let` binding) is one `mov:move`
-into it, a constant one `mov:load-const`, the callee one
+into it (`mov:move-clear` at its last read, §4.9), a constant one
+`mov:load-const`, the callee one
 `var:load-var` (or a `mov:move` from the slot where an enclosing
 level read the same Var, §4.4), as the range-call ABI (VM.md §6)
 needs every one of them in the block; the ones that run no code are
@@ -443,10 +445,11 @@ its 9 instructions an iteration and the `dotimes` row 6 of its 13.
 
 A slot roots what it holds until something writes it again, so a
 local holding the head of a lazy seq keeps every element the walk
-behind it realizes. With `CompileOptions.clear_locals`, which is off
-unless a caller sets it, `finish` rewrites each `mov:move` of a slot
-that no path reads again before writing it into `mov:move-clear`
-(VM.md §10.1), which leaves the slot nil (`clearDeadMoves`). It runs
+behind it realizes. With `CompileOptions.clear_locals`, on unless a
+caller turns it off (a debugger showing locals would), `finish`
+rewrites each `mov:move` of a slot that no path reads again before
+writing it into `mov:move-clear` (VM.md §10.1), which leaves the slot
+nil (`clearDeadMoves`). It runs
 on every routine the Emitter finishes, after every jump is patched
 and before quickening (§4.5), and changes only variants: each
 instruction keeps its pc, its span and its operands.
@@ -503,8 +506,11 @@ cleared in, forward: no instruction may read a slot a
 `mov:move-clear` cleared on some path to it, a throw from a try's
 body or handler carrying what it cleared to where the throw lands,
 with no write since. A read of one is `InternalCompilerBug` at
-compile time, never a nil read at run time. The differential test
-(§9) compiles every program it generates with the option on and off.
+compile time, never a nil read at run time. The gate builds the
+stdlib image's generator and every test in debug, so the check runs
+on every routine of the image and of every test program, and the
+differential test (§9) compiles every program it generates with the
+option on and off.
 
 ---
 
@@ -758,7 +764,7 @@ math:add        s5  s5  s4          ; (+ acc i), which reads i, first
 math:add        s4  s4  c1=1        ; (inc i), which cannot fail; quickened, the step
 cmp:lt          s6  s4  s1          ; the test again
 jump:if-true    s6  j0004           ; back to the then arm
-mov:move        s3  s5              ; the else arm
+mov:move-clear  s3  s5              ; the else arm, acc's last read (§4.9)
 ```
 
 #### 5.8 `(def name expr?)`

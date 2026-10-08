@@ -2763,6 +2763,35 @@ test "gc: a native that consumes its sequence lets the part it walked go" {
     }
 }
 
+test "gc: a seq a local or a parameter holds is let go at its last move (COMPILER.md §4.9)" {
+    // Each walks 300,000 mapped elements, about 6 MB of chunks, that
+    // the local's or the parameter's slot would keep through the walk.
+    for ([_][3][]const u8{
+        .{ "", "(let [s (map inc (range 300000))] (reduce + s))", "45000150000" },
+        .{ "(defn total [xs] (reduce + xs))", "(total (map inc (range 300000)))", "45000150000" },
+        .{ "", "(let [[x & r] (map inc (range 300000))] (reduce + x r))", "45000150000" },
+        .{ "", "(run! (fn [_] nil) (map inc (range 300000)))", "nil" },
+        .{ "", "(transduce (map inc) + (map inc (range 300000)))", "45000450000" },
+        .{ "(defn p [xs] (doseq [x xs] nil))", "(p (map inc (range 300000)))", "nil" },
+        .{ "", "(let [s (map inc (range 300000))] (if (seq s) (reduce + s) 0))", "45000150000" },
+        .{ "", "(let [s (map inc (range 300000))] (first s) (reduce + s))", "45000150000" },
+        .{ "", "(loop [i 0 acc 0] (if (< i 2) (recur (inc i) (+ acc (let [s (map inc (range 300000))] (reduce + s)))) acc))", "90000300000" },
+    }) |case| {
+        errdefer std.debug.print("clearing case {s}\n", .{case[1]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        if (case[0].len > 0) _ = try program.run(case[0]);
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[1]), case[2]);
+        try testing.expect(heap.peak_live_bytes -| start < 1 << 20);
+    }
+}
+
 test "lazy: iterate, repeat, repeatedly and cycle are lazy and may be infinite" {
     try expectOutput("[(take 3 (iterate inc 0)) (take 3 (repeat 1)) (take 2 (repeatedly (constantly :r))) (take 5 (cycle [1 2])) (cycle []) (try (iterate inc 0 5) (catch any e e))]", "[(0 1 2) (1 1 1) (:r :r) (1 2 1 2 1) () :arity-mismatch]");
     try expectOutput("(let [n (atom 0) s (iterate (fn [x] (swap! n inc) (inc x)) 0)] (second s) @n)", "1");
@@ -7008,6 +7037,21 @@ test "gc: what a native passes a callee that recurs over its parameter stays roo
     // A map's entries are built by the walk: the native keeps each.
     try expectOutputUnderGc(churn ++ zmap ++ "(let [r (filterv (fn [e] (if (vector? e) (do (churn 1) (recur 0)) true)) m)] (churn 2) [(count r) (reduce + (map key r))])", "[40 780]");
     try expectOutputUnderGc(churn ++ zmap ++ "(let [g (group-by (fn [e] (if (vector? e) (do (churn 1) (recur 0)) :k)) m)] (churn 2) [(count (:k g)) (reduce + (map key (:k g)))])", "[40 780]");
+}
+
+test "gc: a local read again after a move keeps its value through cycles (COMPILER.md §4.9)" {
+    // An outer local read every iteration of a loop.
+    try expectOutputUnderGc(churn ++ "(let [v (vec (map str (range 30)))] (loop [i 0 acc []] (if (< i 30) (recur (inc i) (conj acc (do (churn i) (nth v i)))) (count (apply str acc)))))", "50");
+    // A local the body moves and the handler or the finally reads.
+    try expectOutputUnderGc(churn ++ "(let [s (list (str \"a\") (str \"b\"))] (try (churn (count s)) (throw :x) (catch any e (churn 1) (apply str s))))", "ab");
+    try expectOutputUnderGc(churn ++ "(let [s (list (str \"a\") (str \"b\")) out (atom nil)] (try (churn (count s)) (finally (churn 1) (reset! out (apply str s)))) @out)", "ab");
+    // A captured local, moved again in its frame.
+    try expectOutputUnderGc(churn ++ "(let [s (list (str \"a\") (str \"b\")) f (fn [] (apply str s))] (churn (count s)) (churn 2) (f))", "ab");
+    // A parameter moved into an inner call's block, then the outer's.
+    try expectOutputUnderGc(churn ++ "(defn h [f g s] (f s (g s))) (h (fn [a b] (churn 1) (str (apply str a) b)) (fn [a] (churn 2) (count a)) (list (str \"a\") (str \"b\")))", "ab2");
+    // A recur whose handler reads the binding the recur rebinds
+    // (COMPILER.md §5.6).
+    try expectOutputUnderGc(churn ++ "(loop [i 0 a (list (str \"x\"))] (if (< i 3) (recur (inc i) (try (churn i) (throw :boom) (catch any e (cons (str i) a)))) (apply str a)))", "210x");
 }
 
 test "gc: db/reduce-tree and db/alter! survive cycles inside their callbacks" {

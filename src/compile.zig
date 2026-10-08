@@ -1576,7 +1576,7 @@ const EmitOptions = struct {
     origin: ?reader_mod.SrcSpan = null,
     source: ?*const vm.SourceInfo = null,
     diag: ?*LowerDiag = null,
-    clear_locals: bool = false,
+    clear_locals: bool = true,
 };
 
 /// The top-level routine for `form`: its value in slot 0, returned.
@@ -2957,7 +2957,7 @@ pub const CompileOptions = struct {
     /// nothing past its last use (COMPILER.md §4.9); off, every slot
     /// holds its value until written again, as a debugger showing
     /// locals needs.
-    clear_locals: bool = false,
+    clear_locals: bool = true,
 };
 
 const no_macros: expand_mod.HostMacroTable = .{};

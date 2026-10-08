@@ -913,6 +913,65 @@ test "codegen: a loop's iteration is its body and its test, the recur's argument
     }
 }
 
+/// Whether each move of a slot in `routine`, in pc order, clears its
+/// source (`mov:move-clear`) or keeps it.
+fn moveClears(routine: *const nx.vm.Routine, out: []bool) []bool {
+    var n: usize = 0;
+    for (routine.code) |inst| {
+        if (inst.groupOf() != .mov) continue;
+        const clears = inst.variant == @backingInt(nx.vm.Mov.move_clear);
+        const q = nx.vm.Quick.of(nx.vm.VM.opIndex(inst));
+        const moves = if (q) |k| k.base == @backingInt(nx.vm.Mov.move) and k.form == .slot else inst.variant == @backingInt(nx.vm.Mov.move) and inst.b.kind == .slot;
+        if (!clears and !moves) continue;
+        out[n] = clears;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "codegen: a local's last move clears its slot, and no other move does (COMPILER.md §4.9)" {
+    var program: harness.Program = undefined;
+    try program.init();
+    defer program.deinit();
+    // Each fn's moves of a slot, in pc order: true where it clears.
+    const Shape = struct { src: []const u8, clears: []const bool };
+    const shapes = [_]Shape{
+        // A parameter's one move into a call.
+        .{ .src = "(fn* [xs] (reduce + xs))", .clears = &.{true} },
+        // Only the second of two.
+        .{ .src = "(fn* [s] (first s) (reduce + s))", .clears = &.{ false, true } },
+        // The test's move stays; each arm's clears.
+        .{ .src = "(fn* [s] (if (seq s) (reduce + s) (count s)))", .clears = &.{ false, true, true } },
+        // The block item that waits for the call before it reads `s`
+        // last; `g` and `f` once each.
+        .{ .src = "(fn* [f g s] (f s (g s)))", .clears = &.{ true, false, true, true } },
+        // The loop's binding from the parameter, then the recur's
+        // argument: the binding is written next.
+        .{ .src = "(fn* [xs] (loop* [s xs] (if (seq s) (recur (next s)) s)))", .clears = &.{ true, false, true } },
+        // A local bound outside the loop it is read in.
+        .{ .src = "(fn* [n xs] (loop* [i 0] (if (< i n) (do (count xs) (recur (inc i))) i)))", .clears = &.{false} },
+        // A local the handler or the finally reads stays in the body.
+        .{ .src = "(fn* [xs] (try (reduce + xs) (catch any e (count xs))))", .clears = &.{ false, true } },
+        .{ .src = "(fn* [xs] (try (reduce + xs) (finally (count xs))))", .clears = &.{ false, true, true } },
+        // A captured local is a cell no move reads; `f` clears.
+        .{ .src = "(fn* [xs] (let* [f (fn* [] xs)] (f) (count xs)))", .clears = &.{true} },
+        // An alias reads its local's slot.
+        .{ .src = "(fn* [a] (let* [x a] (first x) (count a)))", .clears = &.{ false, true } },
+    };
+    var buf: [16]bool = undefined;
+    for (shapes) |shape| {
+        const compiled = try compileIn(&program, shape.src);
+        const got = moveClears(compiled.capture_descs[0].routine, &buf);
+        testing.expectEqualSlices(bool, shape.clears, got) catch |err| {
+            std.debug.print("\n  {s}\n", .{shape.src});
+            return err;
+        };
+        // Off, nothing clears.
+        const kept = try compileClearing(&program, shape.src, false);
+        for (moveClears(kept.capture_descs[0].routine, &buf)) |c| try testing.expect(!c);
+    }
+}
+
 test "codegen: the forms COMPILER.md §4.8 lists cost what it says" {
     var program: harness.Program = undefined;
     try program.init();
@@ -1144,6 +1203,9 @@ const Growing = enum {
     and_shape,
     /// Each `case` constant against every other, for a duplicate.
     case_constants,
+    /// Locals clearing's fixed point, a pass for each loop around a
+    /// loop, which its budget bounds (COMPILER.md §4.9).
+    loop_nest,
 
     fn source(shape: Growing, allocator: std.mem.Allocator, n: usize) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
@@ -1172,6 +1234,15 @@ const Growing = enum {
                 try out.appendSlice(allocator, "(case 5");
                 for (0..n) |i| try out.print(allocator, " :k{d} {d}", .{ i, i });
                 try out.appendSlice(allocator, " 0)");
+            },
+            .loop_nest => {
+                // Loops that never recur, each inside the last, with a
+                // name for the outer local at each level.
+                try out.appendSlice(allocator, "(let* [x 0] ");
+                for (0..n) |i| try out.print(allocator, "(loop* [] (let* [y{d} x] (if (< y{d} 0) (recur) ", .{ i, i });
+                try out.appendSlice(allocator, "x");
+                for (0..n) |_| try out.appendSlice(allocator, ")))");
+                try out.appendSlice(allocator, ")");
             },
         }
         return out.toOwnedSlice(allocator);
