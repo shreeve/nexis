@@ -93,6 +93,8 @@ pub fn failureName(err: anyerror) []const u8 {
         error.NotFound => "db/not-found",
         error.Corrupted, error.InvalidPage, error.FormatVersionMismatch => "db/corrupted",
         error.DatabaseFull => "db/map-full",
+        error.DiskFull => "db/disk-full",
+        error.QuotaExceeded => "db/quota-exceeded",
         error.MmapFailed => "db/mmap-failed",
         error.OpenFailed, error.LockFileMismatch => "db/open-failed",
         error.WriterActive, error.EnvBusy, error.TransactionsOpen => "db/busy",

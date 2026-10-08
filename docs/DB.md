@@ -486,7 +486,12 @@ named trees, Nextomic's twelve among them when it shares the file),
 `:db/not-found`,
 `:db/corrupted` (also a file that is not a store, a format-version
 mismatch, and a page that fails its check during a read or a walk),
-`:db/map-full`, `:db/mmap-failed`, `:db/open-failed` (also a lock file
+`:db/map-full`, `:db/disk-full` and `:db/quota-exceeded` (a put or
+commit that needs a page the disk or the user's quota cannot hold:
+nothing is published and the transaction is broken, emdb's growth
+rule, never a crash; on macOS a store into the mapping meets a full
+disk at write-back, and that surfaces as `:db/sync-failed`),
+`:db/mmap-failed`, `:db/open-failed` (also a lock file
 another emdb version holds), `:db/busy` (a writer already active, the
 environment busy), `:db/readers-full` (every one of the file's 4,096
 reader slots holds a read; §3.2), `:db/txn-aborted` (a write after a
