@@ -1283,6 +1283,8 @@ test "every nextomic error maps to its §7 keyword; engine errors to the db set"
         .{ .err = error.Corrupted, .name = "db/corrupted" },
         .{ .err = error.KeyTooLarge, .name = "db/key-too-large" },
         .{ .err = error.DatabaseFull, .name = "db/map-full" },
+        .{ .err = error.DiskFull, .name = "db/disk-full" },
+        .{ .err = error.QuotaExceeded, .name = "db/quota-exceeded" },
         .{ .err = error.SyncFailed, .name = "db/sync-failed" },
         .{ .err = error.DurabilityUnknown, .name = "db/durability-unknown" },
         .{ .err = error.SomethingElse, .name = "db-error" },
