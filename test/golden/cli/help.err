@@ -21,6 +21,7 @@ usage:
                            source line:col each run of
                            instructions comes from.
                            `--disasm FILE` is the same.
+  nexis --version, -V      Prints `nexis` and its version.
 
 Exit status: 0 success, 1 usage or test failure, 2 unreadable
 file, 3 parse or reader error, 4 compile error, 5 runtime

@@ -1,7 +1,7 @@
 .{
     .name = .nexis,
     .fingerprint = 0xcb09f0806daea9ef,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // emdb, nexis's sibling project: the persistent B+-tree storage
@@ -20,6 +20,7 @@
         "examples",
         "nexis.grammar",
         "README.md",
+        "LICENSE",
         "PLAN.md",
         "CLOJURE-REVIEW.md",
         "AGENTS.md",

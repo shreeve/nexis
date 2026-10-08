@@ -60,6 +60,13 @@ byte array in EAVT-h or a transaction's txlog entry, is at most just
 under 4 GiB, emdb's longest overflow chain; past that the engine
 refuses the write as `:db/value-too-large` and the transaction aborts.
 
+A store carries between hosts, not between releases: emdb's file
+format is not frozen and emdb does not migrate a file between formats,
+so a nexis release may refuse a store another release wrote
+(`docs/DB.md` §1). After upgrading, recreate the store or re-import its
+data. The `sys` format number (§2.3) orders Nextomic's own layouts
+within one emdb format.
+
 Connect opens all twelve trees, reads the `sys` header and finds
 `:db/fulltext` in one read transaction, and caches the `TreeId`s for
 the connection's life (tree registration is the engine's one call that

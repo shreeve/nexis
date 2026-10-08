@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
 const compile = @import("compile.zig");
@@ -51,6 +52,7 @@ const Usage =
     \\                           source line:col each run of
     \\                           instructions comes from.
     \\                           `--disasm FILE` is the same.
+    \\  nexis --version, -V      Prints `nexis` and its version.
     \\
     \\Exit status: 0 success, 1 usage or test failure, 2 unreadable
     \\file, 3 parse or reader error, 4 compile error, 5 runtime
@@ -165,6 +167,9 @@ fn runCommand(init: std.process.Init) !void {
     } else if (eql(cmd, "--help") or eql(cmd, "-h")) {
         if (args.len > 2) usageExit(io);
         try writeStdout(io, Usage);
+    } else if (eql(cmd, "--version") or eql(cmd, "-V")) {
+        if (args.len > 2) usageExit(io);
+        try writeStdout(io, "nexis " ++ build_options.version ++ "\n");
     } else if (std.mem.endsWith(u8, cmd, ".nx") or eql(cmd, "-") or isFile(io, cmd)) {
         try runFile(io, allocator, cmd, args[2..]);
     } else {

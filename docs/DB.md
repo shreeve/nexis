@@ -23,6 +23,15 @@ tree walks `db/scan` and `db/reduce-tree`.
 Multi-process concurrent writes are emdb's single-writer discipline;
 the nexis surface is single-isolate (PLAN §23 #5).
 
+**Store files across releases.** A store file holds emdb's file
+format, which is not frozen, and emdb does not migrate a file from one
+format to another. A nexis release reads the stores of the emdb
+format it was built against (its `BUILD-INFO` names the emdb commit)
+and may refuse another release's, as `:db/corrupted` or
+`:db/open-failed` (§8). After upgrading, recreate a store or re-import
+its data. Hosts are another matter: one release's store carries
+between macOS and Linux (`test/portable/README.md`).
+
 ---
 
 ### 2. `store_id` derivation
