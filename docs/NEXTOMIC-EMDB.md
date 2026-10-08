@@ -146,8 +146,8 @@ behind, the data it describes.
 Nextomic encodes a current-index key as `[E(e)][A(a)][v:type-tagged-sortable]`
 (in each index's order; `E(e)` the entity id as a class-and-length
 header and its minimal offset, `A(a)` the attribute id as an ordered
-varint, NEXTOMIC.md §2) with the 6-byte `t` of the fact's latest
-assertion as the value, and a history key as the same bytes followed by
+varint, NEXTOMIC.md §2) with the `t` of the fact's latest assertion, a
+LEB128, as the value, and a history key as the same bytes followed by
 `[(t << 1) | added : 6]` with an empty value. A history tree holds only
 retired rows, a retraction and the assertion it retired, so a store
 that only adds facts leaves it empty, and a time view walks a current

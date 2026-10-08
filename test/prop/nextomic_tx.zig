@@ -697,7 +697,7 @@ fn expectH1(arena: Allocator, tc: *db_mod.TestConn) !void {
 fn expectRetired(txn: *nx.emdb.Txn, current: nx.emdb.TreeId, fact: []const u8, last: key.Top) !void {
     errdefer std.debug.print("H1 broken (seed 0x{x})\n", .{prng_seed});
     try testing.expect(!last.added);
-    if (try txn.getFromTree(current, fact)) |row| try testing.expect(try key.readT(row[0..key.id_len]) > last.t);
+    if (try txn.getFromTree(current, fact)) |row| try testing.expect((try key.readCurrent(row)).t > last.t);
 }
 
 /// The plain view's user facts as `e|a|vb|t`, the model's replay key.

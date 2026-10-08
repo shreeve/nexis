@@ -76,9 +76,8 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
         var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
         while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, false, kv.key);
-            if (kv.value.len < key.id_len) return error.Corrupted;
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = null });
-            try ts.put(arena, try key.readT(kv.value[0..key.id_len]), {});
+            try ts.put(arena, (try key.readCurrent(kv.value)).t, {});
             const g = try counts.getOrPut(arena, parts.a);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += 1;

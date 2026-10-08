@@ -341,11 +341,9 @@ pub const Conn = struct {
     /// attribute-partition entity. Each entry is read once per
     /// connection: the cache then serves `upto`.
     fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
-        var start: [key.id_len]u8 = undefined;
-        key.writeId(&start, after + 1);
-        var end: [key.id_len]u8 = undefined;
-        key.writeId(&end, upto + 1);
-        var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
+        var start: [key.ordered_max]u8 = undefined;
+        var end: [key.ordered_max]u8 = undefined;
+        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeTxlogKey(&start, after + 1), key.writeTxlogKey(&end, upto + 1));
         while (try s.next()) |kv| {
             if (try datom_mod.touchesAttrPartition(kv.value)) return true;
         }
@@ -671,8 +669,7 @@ pub const DatomScan = struct {
                     const kv = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
-                    if (kv.value.len < key.id_len) return error.Corrupted;
-                    const t = try key.readT(kv.value[0..key.id_len]);
+                    const t = (try key.readCurrent(kv.value)).t;
                     return try self.materialise(parts, .{ .fact = kv.key, .t = t, .added = true, .current = true });
                 },
                 .folded => |s| {
@@ -731,19 +728,15 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     var ctx = TxCtx{ .conn = conn, .txn = txn, .schema = schema, .arena = arena };
     const src: datom_mod.Source = .{ .ctx = @ptrCast(&ctx), .attrType = &TxCtx.attrType, .payload = &TxCtx.payload };
 
-    var start: [key.id_len]u8 = undefined;
-    key.writeId(&start, @max(from, 1));
-    var end_buf: [key.id_len]u8 = undefined;
-    const end: ?[]const u8 = if (to) |t| blk: {
-        key.writeId(&end_buf, t);
-        break :blk &end_buf;
-    } else null;
+    var start_buf: [key.ordered_max]u8 = undefined;
+    const start = key.writeTxlogKey(&start_buf, @max(from, 1));
+    var end_buf: [key.ordered_max]u8 = undefined;
+    const end: ?[]const u8 = if (to) |t| key.writeTxlogKey(&end_buf, t) else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
-    var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
+    var s = try Store.scanRange(txn, conn.store.trees.txlog, start, end);
     while (try s.next()) |kv| {
-        if (kv.key.len != key.id_len) return error.Corrupted;
-        const t = try key.readT(kv.key[0..key.id_len]);
+        const t = try key.readTxlogKey(kv.key);
         const entry = try datom_mod.decodeTxlog(arena, kv.value, t, src);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
@@ -772,8 +765,8 @@ const TxCtx = struct {
         if (added) {
             const k = try key.keyBytes(self.arena, .eavt, e, a, vbytes, null);
             if (try self.txn.getFromTree(store.trees.cur(.eavt), k)) |row| {
-                if (row.len <= key.id_len) return error.Corrupted;
-                if (try key.readT(row[0..key.id_len]) == t) return row[key.id_len..];
+                const cur = try key.readCurrent(row);
+                if (cur.t == t) return if (cur.rest.len == 0) error.Corrupted else cur.rest;
             }
         }
         return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added }, self.arena);
@@ -974,17 +967,16 @@ test "a t out of its range in a current row or a txlog key is Corrupted" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const store = tc.conn.store;
-    // A current EAVT row of :db/doc whose `[t:6]` is 2^46 | 1, and a
-    // txlog key 2^46 | 2: both pass the id range, neither is a `t`.
+    // A current EAVT row of :db/doc whose `t` is 2^46 | 1, and a txlog
+    // key 2^46 | 2: both pass the id range, neither is a `t`.
     {
         const txn = try store.beginWrite(.none);
         errdefer txn.abort();
         const k = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
-        var tb: [key.id_len]u8 = undefined;
-        key.writeId(&tb, key.tx_partition_bit | 1);
-        try txn.putInTree(store.trees.cur(.eavt), k, &tb);
-        key.writeId(&tb, key.tx_partition_bit | 2);
-        try txn.putInTree(store.trees.txlog, &tb, (try store.getTxlog(txn, 1)).?);
+        // 2^46 | 1 as a LEB128: seven groups of seven bits.
+        try txn.putInTree(store.trees.cur(.eavt), k, &.{ 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10 });
+        var kb: [key.ordered_max]u8 = undefined;
+        try txn.putInTree(store.trees.txlog, key.writeOrdered(&kb, key.tx_partition_bit | 2), (try store.getTxlog(txn, 1)).?);
         try store.commit(txn);
     }
     const db = try tc.conn.db();

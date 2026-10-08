@@ -361,6 +361,59 @@ pub fn readEntity(in: []const u8) DecodeError!struct { e: u64, len: usize } {
     return .{ .e = e, .len = 1 + n };
 }
 
+// =============================================================================
+// Current-tree values and txlog keys
+// =============================================================================
+
+/// Most bytes of a current-tree value's `t`.
+pub const t_value_max = 7;
+
+/// A current-tree value's `t`, the fact's latest assertion's, as an
+/// unsigned LEB128; in `nx/eavt` an out-of-line value's payload follows.
+pub fn writeCurrentT(buf: *[t_value_max]u8, t: u64) []const u8 {
+    std.debug.assert(t < tx_partition_bit);
+    var x = t;
+    var n: usize = 0;
+    while (x >= 0x80) : (x >>= 7) {
+        buf[n] = @as(u8, @truncate(x)) | 0x80;
+        n += 1;
+    }
+    buf[n] = @truncate(x);
+    return buf[0 .. n + 1];
+}
+
+/// A current-tree value: its `t` and what follows it.
+pub const Current = struct { t: u64, rest: []const u8 };
+
+/// Read a current-tree value. A `t` spelled longer than it need be, or
+/// one at the transaction partition or past it, is `error.Corrupted`.
+pub fn readCurrent(value: []const u8) DecodeError!Current {
+    var t: u64 = 0;
+    for (value, 0..) |b, i| {
+        if (i == t_value_max) break;
+        t |= @as(u64, b & 0x7F) << @intCast(7 * i);
+        if (b & 0x80 != 0) continue;
+        if (b == 0 and i > 0) return error.Corrupted;
+        if (t >= tx_partition_bit) return error.Corrupted;
+        return .{ .t = t, .rest = value[i + 1 ..] };
+    }
+    return error.Corrupted;
+}
+
+/// The `nx/txlog` key of transaction `t`: its ordered varint, so the log
+/// sorts by `t`.
+pub fn writeTxlogKey(buf: *[ordered_max]u8, t: u64) []const u8 {
+    return writeOrdered(buf, t);
+}
+
+/// The `t` an `nx/txlog` key names; anything but one ordered varint of a
+/// `t` below the transaction partition is `error.Corrupted`.
+pub fn readTxlogKey(k: []const u8) DecodeError!u64 {
+    const r = try readOrdered(k);
+    if (r.len != k.len or r.n >= tx_partition_bit) return error.Corrupted;
+    return r.n;
+}
+
 /// The `A(a)` at the start of `in` and its length.
 pub fn readAttrKey(in: []const u8) DecodeError!struct { a: u32, len: usize } {
     const r = try readOrdered(in);
@@ -1044,6 +1097,26 @@ test "successor increments with carry" {
     defer testing.allocator.free(s);
     try testing.expectEqualSlices(u8, &.{2}, s);
     try testing.expect((try successor(testing.allocator, &.{ 0xFF, 0xFF })) == null);
+}
+
+test "a current value's t is a LEB128 in its shortest form, below the transaction partition" {
+    var buf: [t_value_max]u8 = undefined;
+    for ([_]u64{ 0, 1, 127, 128, 16383, 16384, tx_partition_bit - 1 }) |t| {
+        const b = writeCurrentT(&buf, t);
+        const v = try std.mem.concat(testing.allocator, u8, &.{ b, "payload" });
+        defer testing.allocator.free(v);
+        const cur = try readCurrent(v);
+        try testing.expectEqual(t, cur.t);
+        try testing.expectEqualStrings("payload", cur.rest);
+    }
+    try testing.expectEqual(@as(usize, 1), writeCurrentT(&buf, 127).len);
+    try testing.expectEqual(@as(usize, 7), writeCurrentT(&buf, tx_partition_bit - 1).len);
+    for ([_][]const u8{ &.{}, &.{0x80}, &.{ 0x81, 0x00 }, &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x40 }, &.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 } }) |bad| {
+        try testing.expectError(error.Corrupted, readCurrent(bad));
+    }
+    var kb: [ordered_max]u8 = undefined;
+    try testing.expectEqual(@as(u64, 300), try readTxlogKey(writeTxlogKey(&kb, 300)));
+    try testing.expectError(error.Corrupted, readTxlogKey(writeOrdered(&kb, tx_partition_bit)));
 }
 
 test "top packs t and added" {

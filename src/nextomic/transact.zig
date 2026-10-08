@@ -1856,13 +1856,12 @@ const Ctx = struct {
         var live = try self.liveRows(.aevt, .{ .a = attr.id });
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (try live.next()) |r| {
-            if (r.kv.value.len < key.id_len) return error.Corrupted;
             if (r.pending) |p| if (!p.added) continue;
             const vb = try self.arena.dupe(u8, r.parts.v);
             if (becomes_unique) {
                 if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
             }
-            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = try key.readT(r.kv.value[0..key.id_len]) });
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = (try key.readCurrent(r.kv.value)).t });
         }
         if (becomes_unique) {
             for (self.overlay.items) |p| {
@@ -1872,9 +1871,8 @@ const Ctx = struct {
         }
         for (rows.items) |r| {
             const ck = try key.keyBytes(self.arena, .avet, r.e, attr.id, r.vbytes, null);
-            var tb: [key.id_len]u8 = undefined;
-            key.writeId(&tb, r.t);
-            try self.txn.putInTree(store.trees.cur(.avet), ck, &tb);
+            var tb: [key.t_value_max]u8 = undefined;
+            try self.txn.putInTree(store.trees.cur(.avet), ck, key.writeCurrentT(&tb, r.t));
         }
         // Collected before the puts: no cursor stays open across a write.
         var history: std.ArrayList([]const u8) = .empty;

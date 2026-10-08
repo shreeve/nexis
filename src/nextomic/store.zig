@@ -606,21 +606,15 @@ pub const Store = struct {
 
     // ── txlog ─────────────────────────────────────────────────────
 
-    fn txlogKey(t: u64) [key.id_len]u8 {
-        var k: [key.id_len]u8 = undefined;
-        key.writeId(&k, t);
-        return k;
-    }
-
     pub fn putTxlog(self: *Store, txn: *Txn, t: u64, bytes: []const u8) !void {
-        const k = txlogKey(t);
-        try txn.putInTree(self.trees.txlog, &k, bytes);
+        var buf: [key.ordered_max]u8 = undefined;
+        try txn.putInTree(self.trees.txlog, key.writeTxlogKey(&buf, t), bytes);
     }
 
     /// The full entry (multi-page values are assembled).
     pub fn getTxlog(self: *Store, txn: *Txn, t: u64) !?[]const u8 {
-        const k = txlogKey(t);
-        return txn.getFromTree(self.trees.txlog, &k);
+        var buf: [key.ordered_max]u8 = undefined;
+        return txn.getFromTree(self.trees.txlog, key.writeTxlogKey(&buf, t));
     }
 
     // ── datoms ────────────────────────────────────────────────────
@@ -763,9 +757,8 @@ pub const Store = struct {
                     // A value spanning pages lives in the transaction's
                     // buffer until its next mutation: the payload is
                     // copied before the delete.
-                    const row = (try txn.getFromTree(self.trees.cur(.eavt), k)) orelse return error.Corrupted;
-                    if (row.len < key.id_len) return error.Corrupted;
-                    w.priors[i] = .{ .t = try key.readT(row[0..key.id_len]), .payload = try arena.dupe(u8, row[key.id_len..]) };
+                    const row = try key.readCurrent((try txn.getFromTree(self.trees.cur(.eavt), k)) orelse return error.Corrupted);
+                    w.priors[i] = .{ .t = row.t, .payload = try arena.dupe(u8, row.rest) };
                     if (w.priors[i].t >= w.t) return error.Corrupted;
                 }
                 // An index the attribute joins in this transaction was
@@ -774,9 +767,9 @@ pub const Store = struct {
                 continue;
             }
             value.clearRetainingCapacity();
-            try value.ensureTotalCapacity(arena, key.id_len + if (w.index == .eavt) (if (p.payload) |x| x.len else 0) else 0);
-            value.appendNTimesAssumeCapacity(0, key.id_len);
-            key.writeId(value.items[0..key.id_len], w.t);
+            try value.ensureTotalCapacity(arena, key.t_value_max + if (w.index == .eavt) (if (p.payload) |x| x.len else 0) else 0);
+            var tb: [key.t_value_max]u8 = undefined;
+            value.appendSliceAssumeCapacity(key.writeCurrentT(&tb, w.t));
             if (w.index == .eavt) if (p.payload) |x| value.appendSliceAssumeCapacity(x);
             try txn.putInTree(self.trees.cur(w.index), k, value.items);
         }
@@ -792,8 +785,9 @@ pub const Store = struct {
         var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
         try key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, null);
         const row = (try txn.getFromTree(self.trees.cur(.eavt), k.items)) orelse return null;
-        if (row.len <= key.id_len) return error.Corrupted;
-        return try arena.dupe(u8, row[key.id_len..]);
+        const cur = try key.readCurrent(row);
+        if (cur.rest.len == 0) return error.Corrupted;
+        return try arena.dupe(u8, cur.rest);
     }
 
     /// The out-of-line payload of the retired history row `(e a v top)`:
@@ -935,8 +929,7 @@ pub const Store = struct {
             }
             const row = c orelse return null;
             self.cur_row = null;
-            if (row.value.len < key.id_len) return error.Corrupted;
-            const r: HistoryRow = .{ .fact = row.key, .t = try key.readT(row.value[0..key.id_len]), .added = true, .current = true };
+            const r: HistoryRow = .{ .fact = row.key, .t = (try key.readCurrent(row.value)).t, .added = true, .current = true };
             if (self.last) |l| if ((l.added or l.t >= r.t) and std.mem.eql(u8, l.fact, r.fact)) return error.Corrupted;
             return r;
         }
@@ -1369,8 +1362,9 @@ test "bootstrap datoms are in every index they belong to" {
     var s = try Store.scan(txn, store.trees.cur(.eavt), p);
     var n: usize = 0;
     while (try s.next()) |kv| : (n += 1) {
-        try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
-        try testing.expectEqual(@as(u64, 1), try key.readId(kv.value[0..key.id_len]));
+        const cur = try key.readCurrent(kv.value);
+        try testing.expectEqual(@as(u64, 1), cur.t);
+        try testing.expectEqual(@as(usize, 0), cur.rest.len);
     }
     try testing.expectEqual(@as(usize, 5), n);
 
@@ -1616,7 +1610,7 @@ test "an out-of-line value is stored once in the index trees, beside its current
         // history trees hold nothing.
         const txn = try store.beginRead();
         defer txn.abort();
-        try testing.expectEqual(key.id_len + long.len, (try txn.getFromTree(store.trees.cur(.eavt), cur_key)).?.len);
+        try testing.expectEqualStrings(long, (try key.readCurrent((try txn.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
         try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, store.trees.hist(.eavt)));
         try testing.expectEqualStrings(long, (try store.currentPayload(txn, e, 101, v, arena)).?);
     }
@@ -1646,7 +1640,7 @@ test "an out-of-line value is stored once in the index trees, beside its current
     }
     const again = try store.beginRead();
     defer again.abort();
-    try testing.expectEqualStrings(long, (try again.getFromTree(store.trees.cur(.eavt), cur_key)).?[key.id_len..]);
+    try testing.expectEqualStrings(long, (try key.readCurrent((try again.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
     try testing.expectEqual(@as(u64, 2), try Store.treeEntries(again, store.trees.hist(.eavt)));
 }
 
@@ -1862,9 +1856,8 @@ test "a merged scan orders facts by their bytes, each fact's history before its 
             const vb = try key.valBytes(arena, .{ .string = r.v });
             inline for (.{ Index.eavt, Index.avet }) |ix| {
                 if (r.current) {
-                    var tb: [key.id_len]u8 = undefined;
-                    key.writeId(&tb, r.t);
-                    try txn.putInTree(store.trees.cur(ix), try key.keyBytes(arena, ix, e, 100, vb, null), &tb);
+                    var tb: [key.t_value_max]u8 = undefined;
+                    try txn.putInTree(store.trees.cur(ix), try key.keyBytes(arena, ix, e, 100, vb, null), key.writeCurrentT(&tb, r.t));
                 } else {
                     try txn.putInTree(store.trees.hist(ix), try key.keyBytes(arena, ix, e, 100, vb, .{ .t = r.t, .added = r.added }), &.{});
                 }
@@ -1917,9 +1910,8 @@ test "a current row after a history row that is not an older retraction breaks H
     for ([_]key.Top{ .{ .t = 3, .added = true }, .{ .t = 6, .added = false } }) |top| {
         const txn = try store.beginWrite(.none);
         defer txn.abort();
-        var tb: [key.id_len]u8 = undefined;
-        key.writeId(&tb, 5);
-        try txn.putInTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, null), &tb);
+        var tb: [key.t_value_max]u8 = undefined;
+        try txn.putInTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, null), key.writeCurrentT(&tb, 5));
         try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
         const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
         var m = try Store.mergedScan(txn, store.trees, .eavt, prefix, try key.successor(arena, prefix));

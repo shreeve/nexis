@@ -38,15 +38,15 @@ const tree_names = nextomic.store.tree_names;
 const Pin = struct { tree: []const u8, entries: u64, key: u64, value: u64, pages: u64 };
 
 const pinned = [_]Pin{
-    .{ .tree = "nx/eavt", .entries = 11489, .key = 145115, .value = 70134, .pages = 25 },
-    .{ .tree = "nx/aevt", .entries = 11489, .key = 145115, .value = 68934, .pages = 26 },
-    .{ .tree = "nx/avet", .entries = 4846, .key = 69648, .value = 29076, .pages = 20 },
-    .{ .tree = "nx/vaet", .entries = 2200, .key = 12734, .value = 13200, .pages = 4 },
+    .{ .tree = "nx/eavt", .entries = 11489, .key = 145115, .value = 13556, .pages = 20 },
+    .{ .tree = "nx/aevt", .entries = 11489, .key = 145115, .value = 12356, .pages = 23 },
+    .{ .tree = "nx/avet", .entries = 4846, .key = 69648, .value = 5475, .pages = 16 },
+    .{ .tree = "nx/vaet", .entries = 2200, .key = 12734, .value = 2278, .pages = 5 },
     .{ .tree = "nx/eavt-h", .entries = 406, .key = 8106, .value = 900, .pages = 1 },
     .{ .tree = "nx/aevt-h", .entries = 406, .key = 8106, .value = 0, .pages = 1 },
     .{ .tree = "nx/avet-h", .entries = 400, .key = 7554, .value = 0, .pages = 1 },
     .{ .tree = "nx/vaet-h", .entries = 0, .key = 0, .value = 0, .pages = 0 },
-    .{ .tree = "nx/txlog", .entries = 407, .key = 2442, .value = 88908, .pages = 8 },
+    .{ .tree = "nx/txlog", .entries = 407, .key = 574, .value = 88908, .pages = 8 },
     .{ .tree = "nx/fulltext", .entries = 11, .key = 413, .value = 0, .pages = 1 },
 };
 
@@ -205,4 +205,8 @@ test "a store of a fixed history holds the pinned bytes in every tree, in few pa
         }
     }
     try testing.expect(ok);
+    // EAVT holds every current datom in at most 17 bytes of key and
+    // value (NEXTOMIC.md §2), emdb's node header aside.
+    const eavt = end[index("nx/eavt")];
+    try testing.expect(eavt.key + eavt.value <= 17 * eavt.entries);
 }

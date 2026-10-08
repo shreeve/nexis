@@ -107,15 +107,15 @@ still holds no read transaction.
 
 | tree | key | value |
 |---|---|---|
-| `nx/eavt` | `[E(e)][A(a)][v]` | `[t:6]`, the `t` of the fact's latest assertion, then an out-of-line value's payload (§2.2) |
-| `nx/aevt` | `[A(a)][E(e)][v]` | `[t:6]` |
-| `nx/avet` | `[A(a)][v][E(e)]` | `[t:6]` (indexed and unique attrs only) |
-| `nx/vaet` | `[E(v)][A(a)][E(e)]` | `[t:6]` (ref attrs only) |
+| `nx/eavt` | `[E(e)][A(a)][v]` | `[t]`, the `t` of the fact's latest assertion as a LEB128, then an out-of-line value's payload (§2.2) |
+| `nx/aevt` | `[A(a)][E(e)][v]` | `[t]` |
+| `nx/avet` | `[A(a)][v][E(e)]` | `[t]` (indexed and unique attrs only) |
+| `nx/vaet` | `[E(v)][A(a)][E(e)]` | `[t]` (ref attrs only) |
 | `nx/eavt-h` | `[E(e)][A(a)][v][top:6]` | empty, or on an assertion row the payload of an out-of-line value |
 | `nx/aevt-h` | `[A(a)][E(e)][v][top:6]` | empty |
 | `nx/avet-h` | `[A(a)][v][E(e)][top:6]` | empty (indexed and unique attrs only) |
 | `nx/vaet-h` | `[E(v)][A(a)][E(e)][top:6]` | empty (ref attrs only) |
-| `nx/txlog` | `[t:6]` | the entry (below): flags, instant, the datoms in write order, and on an entry an excision touched the entities it excised |
+| `nx/txlog` | `[t]`, an ordered varint | the entry (below): flags, instant, the datoms in write order, and on an entry an excision touched the entities it excised |
 | `nx/idents` | `[0x00][utf8 text]` / `[0x01][id:4]` / `[0x02][utf8 text]` | id / text / id of a name a rename retired |
 | `nx/sys` | `"format"`, `"uuid"`, `"t"`, `"eid"`, `"aid"`, `"ig"`, `"sg"`, `"ft"`, `"n"[a:4]` | see §2.3 |
 | `nx/fulltext` | `[A(a)][token][0x00][E(e)][hash128(v):16]` | empty; one row per token of each current string value of a `:db/fulltext` attribute (§5 "fulltext") |
@@ -152,7 +152,11 @@ parses forward: every field but `v` gives its own length; `v` runs to
 the key's end, or to `top`, in EAVT and AEVT, and is parsed by its tag
 in AVET (a string or byte array to its terminator, §2.2). The decoder
 refuses either id longer than it need be, past its partition, or of
-another class, so equal ids have equal bytes.
+another class, so equal ids have equal bytes. A current tree's value
+begins with `t` as an unsigned LEB128 in its shortest form (one byte up
+to 127, three up to 2^21), whose order no reader needs; a txlog key is
+`t`'s ordered varint, so the log sorts by `t`. History keys keep `top`
+in 6 fixed bytes, which the fold reads off their end.
 
 A fact's latest assertion, while the fact is current, lives in the
 current trees alone; a history tree holds every other row of the fact,
@@ -166,8 +170,9 @@ trees empty. A read that finds H1 broken is `:db/corrupted`.
 ### 2.1 Identifiers
 
 An entity id in an index key is `E(e)` and an attribute or ident id
-`A(a)` (§2); `sys` and the txlog's keys hold ids and `t`s big-endian in
-6 bytes, and `sys` and `nx/idents` ident ids in 4; every id fits the VM's `fixnum` (i48), so the usable range is
+`A(a)` (§2); a current tree's value holds `t` as a LEB128 and a txlog
+key as an ordered varint; `sys` holds ids and `t`s big-endian in 6
+bytes, and `sys` and `nx/idents` ident ids in 4; every id fits the VM's `fixnum` (i48), so the usable range is
 `0 .. 2^47-1`. An id, a `t` or a `sys`
 counter read back from the file outside its range is `:db/corrupted`,
 never trusted; a partition or `t` that would run past its range is
