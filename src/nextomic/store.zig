@@ -915,6 +915,51 @@ pub const Store = struct {
         return (try txn.treeStat(tree)).entries;
     }
 
+    /// What a tree holds and the pages it takes: its entries' key and
+    /// value bytes from a walk, its pages from `treeStat`
+    /// (`docs/PERF.md` §3.11's per-tree table).
+    pub const TreeSize = struct {
+        entries: u64 = 0,
+        key_bytes: u64 = 0,
+        value_bytes: u64 = 0,
+        leaf_pages: u64 = 0,
+        branch_pages: u64 = 0,
+        overflow_pages: u64 = 0,
+
+        /// The share of the leaves the entries fill, counting emdb's 10
+        /// bytes of pointer and node header per entry.
+        pub fn fill(self: TreeSize) f64 {
+            if (self.leaf_pages == 0) return 0;
+            const used = self.key_bytes + self.value_bytes + 10 * self.entries;
+            return @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(self.leaf_pages * leaf_usable));
+        }
+
+        pub fn pages(self: TreeSize) u64 {
+            return self.leaf_pages + self.branch_pages + self.overflow_pages;
+        }
+
+        /// A leaf's room for nodes: the page less its header.
+        const leaf_usable = db_layer.page_size - 32;
+    };
+
+    /// The size of `tree` at the transaction's snapshot. Each value is
+    /// read into one buffer in `gpa`, so the walk holds none of them.
+    pub fn treeSize(txn: *Txn, tree: TreeId, gpa: Allocator) !TreeSize {
+        const stat = try txn.treeStat(tree);
+        var out: TreeSize = .{ .entries = stat.entries, .leaf_pages = stat.leafPages, .branch_pages = stat.branchPages, .overflow_pages = stat.overflowPages };
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        var c = try txn.openCursorForTree(tree);
+        c.keysOnly = true;
+        var kv = c.first();
+        while (kv) |e| : (kv = c.next()) {
+            out.key_bytes += e.key.len;
+            out.value_bytes += ((try c.readValueInto(gpa, &buf)) orelse return error.Corrupted).len;
+        }
+        try ended(&c);
+        return out;
+    }
+
     // ── bootstrap (§2.4) ──────────────────────────────────────────
 
     fn bootstrap(self: *Store, txn: *Txn, with_fulltext: bool) !void {
@@ -1375,17 +1420,6 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     try testing.expect((try cur.next()) == null);
 }
 
-/// Share of `tree`'s leaf pages its entries fill, counting emdb's 10
-/// bytes of pointer and node header per entry.
-fn leafFill(txn: *Txn, tree: TreeId) !f64 {
-    const stat = try txn.treeStat(tree);
-    var bytes: u64 = 0;
-    var c = try txn.openCursorForTree(tree);
-    var kv = c.first();
-    while (kv) |e| : (kv = c.next()) bytes += 10 + e.key.len + e.value.len;
-    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(stat.leafPages * db_layer.page_size));
-}
-
 test "batches written between existing keys fill their leaves" {
     var td = try TestDir.init("store_fill");
     defer td.deinit();
@@ -1416,7 +1450,7 @@ test "batches written between existing keys fill their leaves" {
     const txn = try store.beginRead();
     defer txn.abort();
     for ([_]TreeId{ store.trees.cur(.eavt), store.trees.hist(.eavt), store.trees.cur(.aevt), store.trees.hist(.aevt) }) |tree| {
-        try testing.expect(try leafFill(txn, tree) > 0.75);
+        try testing.expect((try Store.treeSize(txn, tree, testing.allocator)).fill() > 0.75);
     }
 }
 
