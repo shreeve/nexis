@@ -1956,12 +1956,22 @@ fn fnVec(vm: *VM, args: []const Value) VmError!Value {
         // A fresh vector carries no metadata (SEMANTICS §7), as
         // Clojure's `vec` clears it.
         .persistent_vector => if (heap_mod.Heap.asHeapHeader(s).getMeta() == null) s else fnWithMeta(vm, &.{ s, value_mod.nilValue() }),
-        else => blk: {
-            var items = try collectSeq(vm, s);
-            defer items.deinit(vm.allocator);
-            break :blk vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
+        .list => {
+            // A list that views a whole vector (`sort`'s, `reverse`'s, a
+            // vector's seq) has that vector's elements: the vector
+            // itself, without its metadata.
+            if (list_mod.viewCursor(s)) |c| if (c.index == 0) return fnVec(vm, &.{vector_mod.valueFromVectorHeader(c.root)});
+            return vecOfSeq(vm, s);
         },
+        else => vecOfSeq(vm, s),
     };
+}
+
+/// `(vec s)` of a seqable whose walk runs no code, in one gathering.
+fn vecOfSeq(vm: *VM, s: Value) VmError!Value {
+    var items = try collectSeq(vm, s);
+    defer items.deinit(vm.allocator);
+    return vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
 }
 
 /// `(hash-map k v ...)`, `(hash-set x ...)`: built at once, each node

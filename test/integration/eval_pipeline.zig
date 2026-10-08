@@ -2893,6 +2893,25 @@ test "count, into, vec, take-last and the typed vectors give what they gave befo
     try expectOutput("[(vec (i64-vector (map inc (range 3)))) (vec (f64-vector (map inc (range 3)))) (try (i64-vector (map identity [1 :a])) (catch :kind-mismatch e :km))]", "[[1 2 3] [1.0 2.0 3.0] :km]");
 }
 
+test "vec of a list that views a whole vector is that vector" {
+    // `sort`, `reverse` and the seq of a vector make such a list; its
+    // `vec` builds nothing.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def s (reverse (range 300000)))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    try harness.expectResult(&program, "", try program.run("(let [v (vec s)] [(count v) (v 0) (v 299999)])"), "[300000 299999 0]");
+    errdefer std.debug.print("peak {d} bytes\n", .{heap.peak_live_bytes -| start});
+    try testing.expect(heap.peak_live_bytes -| start < 64 << 10);
+    // Expected values from babashka, which carries no metadata through
+    // `seq` of a vector: neither does `vec`.
+    try expectOutput("(let [v (with-meta [5 6 7 8] {:m 1})] [(vec (seq v)) (meta (vec (seq v))) (vec (rest (seq v))) (vec (sort [3 1 2 5 4])) (vec (reverse [1 2 3 4 5])) (meta (vec (with-meta (seq [1 2 3 4]) {:k 2}))) (vec (seq [1 2])) (= (vec (sort (range 100 0 -1))) (range 1 101))])", "[[5 6 7 8] nil [6 7 8] [1 2 3 4 5] [5 4 3 2 1] nil [1 2] true]");
+}
+
 test "reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join give what they gave before consuming their seq" {
     // Expected values from babashka (clojure.string/join), but for the
     // text of a lazy seq (LAZY.md §9).
