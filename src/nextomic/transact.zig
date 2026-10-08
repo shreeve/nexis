@@ -4,9 +4,10 @@
 //! the transactor. The pipeline, named as the banners below name it:
 //!
 //!   - begin: the write transaction, `t = sys["t"] + 1`;
-//!   - normalise: tx-data to ops (vector forms, map forms with nested
-//!     entities and card-many collections), resolving attributes through
-//!     the schema at `now` and converting values by the attribute's type;
+//!   - normalise: tx-data to ops (list forms, written as vectors or
+//!     lists, and map forms with nested entities and card-many
+//!     collections), resolving attributes through the schema at `now`
+//!     and converting values by the attribute's type;
 //!   - tempids: `:db/ident` binds to the ident's id (minting it),
 //!     unique-identity assertions upsert through an AVET probe (a
 //!     tempid- or lookup-ref-valued claim once its value is known),
