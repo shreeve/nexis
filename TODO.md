@@ -65,7 +65,34 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     holds `s` where Clojure clears a `^:once` body's fields; clearing
     a cell needs a cell write `docs/VM.md` §6 rules out, and its own
     design.
+18. **Calls on x86-64 save callee-saved registers.** `fastCall` saves
+    six, `fastCallSelf` four and the comparisons three (`zig build
+    codegen`; `docs/PERF.md` §6 "Frameless fast handlers on x86-64"),
+    and `fib` runs 6.0× behind warm JVM Clojure on the Linux host
+    (`docs/PERF.md` §3.15; `HANDOFF.md` §8 item 1). The `preserve_none`
+    calling convention for every handler, or handlers that take their
+    operands in System V's argument registers as em's runtime does,
+    would remove the saves; either needs the x86-64 host to run the
+    gate and to measure.
+19. **A leaf native called through a Var pays a whole call.** `(nth v
+    i)` or `(even? x)` is `var:load-var`, the argument moves and
+    `call:call` into `callLeaf`, about 240 instructions above a
+    counting-loop iteration (the micro kit's `leaf`, `docs/PERF.md`
+    §3.29). A cache of the Var's leaf at its call site must still see
+    the Var's latest root (PLAN §23 #20; `docs/PERF.md` §6 "Inline
+    caches at call sites"), so it needs its own design.
+
 ## Store size
+
+20. **The store is 3.1× Datalevin's and 7.6× Datomic Pro's.** 100,000
+    entities of five attributes take 144 MB against Datalevin's 46 MB
+    on the Apple M5 (`docs/PERF.md` §3.11), and 137 MB against
+    Datalevin's 42 MB, Datomic Local's 25 MB and Datomic Pro's 18 MB
+    on the Linux host (§3.15). Half is the four history trees and the
+    txlog, which Datalevin does not keep; Datomic Local's EAVT holds
+    about 8 bytes a datom, Nextomic's 26 bytes of key and value plus
+    emdb's 10, and again in its history twin. #5 and #6 are two of its
+    parts; `docs/PERF.md` §6 "Store size" lists the levers.
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's
    table of entries, bytes, leaves and fill per tree came from a
@@ -86,12 +113,21 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 7. **CI builds against unpinned siblings** (`HANDOFF.md` §6.4 #3):
    `shreeve/emdb` and `shreeve/nexus` at their default branches. The
-   owner decides whether to pin each to a ref.
+   owner decides whether to pin each to a ref. A release builds every
+   target from one emdb commit, which it records (`HANDOFF.md` §6.4).
 8. **The Linux comparison host's toolchain.** The host of
    `docs/PERF.md` §3.15 keeps its tools under `~/nexis-bench`, whose
    Zig is older than `build.zig.zon`'s `minimum_zig_version`; install
    the matching Zig there before rerunning `bench/compare/run.clj`
    (each download is the owner's to approve).
+21. **No store-format compatibility across releases.** emdb's file
+    format is not frozen and emdb does not migrate a file between
+    formats, so a release may refuse a store another release wrote
+    (`docs/DB.md` §1, `docs/NEXTOMIC.md` §2), and users recreate or
+    re-import their stores after upgrading. Once emdb freezes its
+    format, set the policy: which releases read which stores, and
+    whether nexis carries a tool that exports a store and imports it
+    into a new one.
 
 ## Deferred design
 
