@@ -32,7 +32,9 @@
 //!   natives      the Var each native was installed in, and its name
 //!   objects      heap blocks, each after the blocks it reaches; a
 //!                cell or atom first as an empty shell (`fills`)
-//!   routines     code, constants, Var table, captures, tries, spans
+//!   routines     code, constants, Var table, captures, tries, spans,
+//!                arity table
+//!   arities      each arity table: its fixed members and rest clause
 //!   fills        each shell's contents
 //!   states       each Var's root, metadata and flags
 //!   aliases      per namespace
@@ -74,15 +76,16 @@ const UpvalCell = vm_mod.UpvalCell;
 pub const Source = struct { ns: []const u8, info: vm_mod.SourceInfo };
 
 const magic = "nexisimg";
-const version: u32 = 1;
+const version: u32 = 2;
 
 // The structs the image carries field by field. A field added to one
 // of them must be carried (or deliberately left at its default) here
 // before the tree compiles again, so no image ever drops one.
 comptime {
-    expectFields(Routine, &.{ "code", "consts", "capture_descs", "tries", "slot_count", "fixed_arity", "variadic", "upvalue_count", "var_table", "name", "spans", "origin", "source" });
+    expectFields(Routine, &.{ "code", "consts", "capture_descs", "tries", "slot_count", "fixed_arity", "variadic", "arities", "upvalue_count", "var_table", "name", "spans", "origin", "source" });
     expectFields(Var, &.{ "name", "ns", "root", "bound", "macro", "meta", "dynamic", "thread_value", "thread_bound" });
     expectFields(vm_mod.CaptureDescriptor, &.{ "routine", "sources" });
+    expectFields(vm_mod.Arities, &.{ "fixed", "rest" });
     expectFields(vm_mod.Try, &.{ "catch_pc", "finally_pc" });
     expectFields(vm_mod.SpanEntry, &.{ "pc", "span" });
     expectFields(UpvalCell, &.{ "value", "initialized" });
@@ -132,6 +135,8 @@ const Totals = struct {
     capture_sources: u32 = 0,
     tries: u32 = 0,
     spans: u32 = 0,
+    arities: u32 = 0,
+    arity_slots: u32 = 0,
     objects: u32 = 0,
 };
 
@@ -307,6 +312,7 @@ const Writer = struct {
     vars: Indexed(*Var) = .{},
     native_refs: Indexed(*const NativeFn) = .{},
     routines: Indexed(*const Routine) = .{},
+    arities: Indexed(*const vm_mod.Arities) = .{},
     /// Heap blocks by address, each with the tag of the Values that
     /// name it.
     objects: std.AutoHashMapUnmanaged(usize, struct { id: u32, tag: u64 }) = .empty,
@@ -355,6 +361,7 @@ const Writer = struct {
         w.vars.deinit(w.gpa);
         w.native_refs.deinit(w.gpa);
         w.routines.deinit(w.gpa);
+        w.arities.deinit(w.gpa);
         w.objects.deinit(w.gpa);
         w.shells.deinit(w.gpa);
     }
@@ -456,6 +463,18 @@ const Writer = struct {
             } else break;
         }
         w.totals.routines = @intCast(w.routines.items.items.len);
+        w.totals.arities = @intCast(w.arities.items.items.len);
+
+        // Each arity table, its members by index: every one was
+        // enqueued, and so written, with the first.
+        var arity_out: Out = .{ .gpa = gpa };
+        defer arity_out.deinit();
+        for (w.arities.items.items) |a| {
+            try arity_out.count(a.fixed.len);
+            for (a.fixed) |m| try arity_out.int(u32, if (m) |r| w.routines.ids.get(r).? else no_index);
+            try arity_out.int(u32, if (a.rest) |r| w.routines.ids.get(r).? else no_index);
+            w.totals.arity_slots += @intCast(a.fixed.len);
+        }
 
         // The last names and Vars, before the tables that list them.
         var method_names: std.ArrayList(u32) = .empty;
@@ -516,6 +535,7 @@ const Writer = struct {
         }
         try out.list.appendSlice(gpa, w.object_out.list.items);
         try out.list.appendSlice(gpa, w.routine_out.list.items);
+        try out.list.appendSlice(gpa, arity_out.list.items);
         try out.count(fills);
         try out.list.appendSlice(gpa, w.fill_out.list.items);
         try out.count(states);
@@ -804,6 +824,16 @@ const Writer = struct {
             try out.int(u32, s.span.pos);
             try out.int(u32, s.span.len);
         }
+        // A closure names one member of a table; the table names the
+        // rest, each written once.
+        if (r.arities) |a| {
+            const known = w.arities.ids.contains(a);
+            try out.int(u32, try w.arities.of(w.gpa, a));
+            if (!known) {
+                var members = a.members();
+                while (members.next()) |m| _ = try w.routines.of(w.gpa, m);
+            }
+        } else try out.int(u32, no_index);
         w.totals.code += @intCast(r.code.len);
         w.totals.consts += @intCast(r.consts.len);
         w.totals.var_refs += @intCast(r.var_table.len);
@@ -888,6 +918,9 @@ const Loader = struct {
     /// so an object refers only to those written before it.
     built: usize = 0,
     routines: []Routine = &.{},
+    /// The arity table each routine names, by index, until
+    /// `readArities` makes them.
+    routine_arities: []u32 = &.{},
 
     fn run(l: *Loader) LoadError!Counted {
         const counted: Counted = .{ .auto_gensyms = try l.in.int(u64), .gensyms = try l.in.int(u64) };
@@ -901,6 +934,7 @@ const Loader = struct {
         try l.readNatives();
         try l.readObjects(totals);
         try l.readRoutines(totals);
+        try l.readArities(totals);
         try l.readFills();
         try l.readStates();
         try l.readAliases();
@@ -1107,7 +1141,8 @@ const Loader = struct {
         var capture_sources = try l.arena.alloc(vm_mod.CaptureSource, totals.capture_sources);
         var tries = try l.arena.alloc(vm_mod.Try, totals.tries);
         var spans = try l.arena.alloc(vm_mod.SpanEntry, totals.spans);
-        for (l.routines) |*r| {
+        l.routine_arities = try l.scratch.alloc(u32, l.routines.len);
+        for (l.routines, l.routine_arities) |*r, *table| {
             r.* = .{ .code = &.{}, .consts = &.{}, .slot_count = 0 };
             r.name = try l.in.str();
             r.slot_count = try l.in.int(u16);
@@ -1161,7 +1196,31 @@ const Loader = struct {
             if (n_spans > spans.len) return error.Corrupt;
             for (spans[0..n_spans]) |*s| s.* = .{ .pc = try l.in.int(u32), .span = .{ .pos = try l.in.int(u32), .len = try l.in.int(u32) } };
             r.spans = take(vm_mod.SpanEntry, &spans, n_spans);
+
+            table.* = try l.in.int(u32);
         }
+    }
+
+    /// The arity tables, once every routine they name exists, and the
+    /// table of each routine that names one. Whether each is one a call
+    /// can pick from is the routines' verification.
+    fn readArities(l: *Loader, totals: Totals) LoadError!void {
+        const tables = try l.arena.alloc(vm_mod.Arities, totals.arities);
+        var slots = try l.arena.alloc(?*const Routine, totals.arity_slots);
+        for (tables) |*a| {
+            const n = try l.in.int(u32);
+            if (n > slots.len) return error.Corrupt;
+            for (slots[0..n]) |*m| m.* = try l.member();
+            a.* = .{ .fixed = take(?*const Routine, &slots, n), .rest = try l.member() };
+        }
+        for (l.routines, l.routine_arities) |*r, i| {
+            if (i != no_index) r.arities = &tables[try check(i, tables.len)];
+        }
+    }
+
+    fn member(l: *Loader) LoadError!?*const Routine {
+        const i = try l.in.int(u32);
+        return if (i == no_index) null else &l.routines[try check(i, l.routines.len)];
     }
 
     fn readFills(l: *Loader) LoadError!void {
@@ -1488,6 +1547,7 @@ const Verifier = struct {
         if (try v.seen(@intFromPtr(x), @intFromPtr(y))) return;
         if (!std.mem.eql(u8, x.name, y.name) or x.slot_count != y.slot_count or x.fixed_arity != y.fixed_arity or
             x.variadic != y.variadic or x.upvalue_count != y.upvalue_count or (x.source == null) != (y.source == null) or
+            (x.arities == null) != (y.arities == null) or
             (x.source != null and x.source.?.text.ptr != y.source.?.text.ptr) or
             !std.meta.eql(x.origin, y.origin) or
             !std.mem.eql(u8, std.mem.sliceAsBytes(x.code), std.mem.sliceAsBytes(y.code)) or
@@ -1503,6 +1563,17 @@ const Verifier = struct {
         }
         for (x.tries, y.tries) |s, t| if (!std.meta.eql(s, t)) return v.fail("routine {s}: tries", .{x.name});
         for (x.spans, y.spans) |s, t| if (!std.meta.eql(s, t)) return v.fail("routine {s}: spans", .{x.name});
+        if (x.arities) |a| {
+            const b = y.arities.?;
+            if (a.fixed.len != b.fixed.len) return v.fail("routine {s}: arities", .{x.name});
+            for (a.fixed, b.fixed) |m, n| try v.member(x, m, n);
+            try v.member(x, a.rest, b.rest);
+        }
+    }
+
+    fn member(v: *Verifier, of: *const Routine, x: ?*const Routine, y: ?*const Routine) Error!void {
+        if ((x == null) != (y == null)) return v.fail("routine {s}: arities", .{of.name});
+        if (x) |m| try v.routine(m, y.?);
     }
 };
 
@@ -1644,4 +1715,96 @@ test "load: a fixnum outside i48 is Corrupt" {
 test "load: a float whose NaN is not the canonical one, or a boolean with a payload, is Corrupt" {
     try std.testing.expectError(error.Corrupt, loadImmediate(@backingInt(Kind.float), 0x7FF0_0000_0000_0001));
     try std.testing.expectError(error.Corrupt, loadImmediate(@backingInt(Kind.true_), 1));
+}
+
+/// A multi-arity fn as a table of three members: no argument (a
+/// string constant), one (itself), and at least three (the rest list).
+/// The closure names the one-argument member, so the others are
+/// reached only through the table.
+const TestArities = struct {
+    none: Routine,
+    one: Routine,
+    rest: Routine,
+    consts: [1]Value = undefined,
+    fixed: [2]?*const Routine = undefined,
+    table: vm_mod.Arities = undefined,
+
+    fn init(t: *TestArities, constant: Value) void {
+        t.consts = .{constant};
+        t.none = .{ .code = &none_code, .consts = &t.consts, .slot_count = 1, .name = "f" };
+        t.one = .{ .code = &one_code, .consts = &.{}, .slot_count = 1, .fixed_arity = 1, .name = "f" };
+        t.rest = .{ .code = &rest_code, .consts = &.{}, .slot_count = 4, .fixed_arity = 3, .variadic = true, .name = "f" };
+        t.fixed = .{ &t.none, &t.one };
+        t.table = .{ .fixed = &t.fixed, .rest = &t.rest };
+        inline for (.{ &t.none, &t.one, &t.rest }) |m| m.arities = &t.table;
+    }
+
+    const none_code = [_]vm_mod.Inst{ vm_mod.asm_.loadConst(0, 0), vm_mod.asm_.returnSlot(0) };
+    const one_code = [_]vm_mod.Inst{vm_mod.asm_.returnSlot(0)};
+    const rest_code = [_]vm_mod.Inst{vm_mod.asm_.returnSlot(3)};
+};
+
+/// Make `nexis.core/image-test-f` of `a` a closure over `t`'s
+/// one-argument member.
+fn defineTestArities(a: *VM, t: *TestArities) !void {
+    t.init(try string_mod.fromBytes(a.ensureHeap(), "zero"));
+    const f = try (try a.ensureRegistry()).core.intern("image-test-f");
+    f.root = try a.allocClosure(&t.one, 0);
+    f.bound = true;
+}
+
+/// The image of what `a`, which booted no sources, holds.
+fn testWrite(gpa: Allocator, a: *VM) ![]u8 {
+    var natives = try NativeIndex.scan(gpa, try a.ensureRegistry());
+    defer natives.deinit(gpa);
+    var why: []const u8 = "";
+    return write(gpa, a, &natives, &.{}, .{ .auto_gensyms = 0, .gensyms = 0 }, &why);
+}
+
+test "load: an arity table comes back whole, every member written and run" {
+    const gpa = std.testing.allocator;
+    var a = try VM.init(gpa, &VM.idle_routine);
+    defer a.deinit();
+    var t: TestArities = undefined;
+    try defineTestArities(&a, &t);
+    const bytes = try testWrite(gpa, &a);
+    defer gpa.free(bytes);
+    var b = try VM.init(gpa, &VM.idle_routine);
+    defer b.deinit();
+    _ = try load(&b, bytes, &.{});
+    var why: []const u8 = "";
+    verify(gpa, &a, &b, &why) catch |err| {
+        std.debug.print("image differs: {s}\n", .{why});
+        gpa.free(why);
+        return err;
+    };
+    const f = (try b.ensureRegistry()).core.lookupLocal("image-test-f").?.root;
+    const loaded = VM.asClosure(f).routine;
+    try std.testing.expect(loaded.arities != null and loaded.arities.?.rest.?.arities == loaded.arities);
+    try std.testing.expectEqualStrings("zero", string_mod.asBytes(try b.callValue(f, &.{})));
+    const seven = value_mod.fromFixnum(7).?;
+    try std.testing.expectEqual(seven, try b.callValue(f, &.{seven}));
+    const rest = try b.callValue(f, &.{ seven, seven, seven, seven });
+    try std.testing.expectEqual(@as(usize, 1), list_mod.count(rest));
+    try std.testing.expectError(error.ArityMismatch, b.callValue(f, &.{ seven, seven }));
+    try std.testing.expectEqualStrings("f takes 0, 1 or at least 3 arguments, got 2", b.error_detail);
+}
+
+test "load: an arity table a call cannot pick from is refused, not loaded" {
+    if (!verify_routines) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    // A member at another arity's place, and a rest clause below a
+    // fixed arity.
+    for (0..2) |case| {
+        var a = try VM.init(gpa, &VM.idle_routine);
+        defer a.deinit();
+        var t: TestArities = undefined;
+        try defineTestArities(&a, &t);
+        if (case == 0) t.fixed = .{ &t.one, &t.none } else t.rest.fixed_arity = 0;
+        const bytes = try testWrite(gpa, &a);
+        defer gpa.free(bytes);
+        var b = try VM.init(gpa, &VM.idle_routine);
+        defer b.deinit();
+        try std.testing.expectError(error.UnfitRoutine, load(&b, bytes, &.{}));
+    }
 }

@@ -55,7 +55,10 @@ implementations; the routines the closures run, with their code as
 the compiler quickened it (`docs/VM.md` §10.10, so loading one costs
 no rewrite), constants, Var tables, captures, `try` table and spans into the
 embedded text, so an error inside a library function reports the same
-`file:line:col`; the heap values all of these reach, with their
+`file:line:col`; every arity table (`docs/VM.md` §5), written after
+the routines as each member's index, with every member of a table
+written once the first is (a closure names only the head), and set on
+each member once all of them are made; the heap values all of these reach, with their
 metadata and sharing (a cell or atom is made empty, and filled once
 everything it can reach exists); and how many names the boot
 generated, so `gensym` and the expander's auto-gensyms count on from
@@ -66,7 +69,8 @@ Var step 2 installed them in.
 
 The loader makes each closure before the routine it runs is read, so
 it verifies the routines (`Routine.verifyAlone`, `docs/VM.md` §5)
-once the image is whole: in debug and safe builds every routine, and
+once the image is whole: in debug and safe builds every routine, each
+member of an arity table proving the table's shape, and
 one that does not verify fails the load with `UnfitRoutine` instead
 of reaching the dispatch, which trusts verified code (VM.md §8). A
 release build trusts them: the only image it loads is the one it
@@ -81,8 +85,9 @@ reads it, and nothing in it is compatible across versions (PLAN §23
 a fingerprint of the sources and of the layouts it writes; an image
 whose header differs from this build's is not loaded, and the sources
 boot instead. A struct the image writes field by field (a routine and
-its capture descriptors, tries and spans; a Var; a namespace; a
-closure, a cell, an atom and a record; a record type; a protocol and
+its capture descriptors, tries, spans and arity table; a Var; a
+namespace; a closure, a cell, an atom and a record; a record type; a
+protocol and
 its methods) gaining a field fails to compile until `image.zig`
 carries it, and the writer fails the build on a value it
 cannot carry: a kind outside the image's set (strings, bignums,

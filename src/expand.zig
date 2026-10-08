@@ -1249,8 +1249,11 @@ fn callUserMacro(
     const name = macro_var.name;
     const span = call_form.origin;
     if (macro_var.root.kind() != .function) return ctx.fail(span, "macro {s} is not a function", .{name});
+    // The closure's routine, or a member of its arity table, takes
+    // the count (docs/VM.md §6).
     const routine = vm_mod.VM.asClosure(macro_var.root).routine;
-    if (if (routine.variadic) args.len < routine.fixed_arity else args.len != routine.fixed_arity) {
+    if (routine.entryFor(args.len) == null) {
+        if (routine.arities != null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
         return ctx.fail(span, "macro {s} takes {d}{s} argument{s}, got {d}", .{
             name,
             routine.fixed_arity,

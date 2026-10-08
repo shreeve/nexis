@@ -111,9 +111,10 @@ immediate: it is the wide field (§3).
 
 ### 5. Routine
 
-A routine is the compiled code of one `fn*` or top-level form: a
-plain Zig struct, not a heap Value, reachable by users only through
-the closures that wrap it (§6).
+A routine is the compiled code of one `fn*` or top-level form, or of
+one clause of a multi-arity `fn*`: a plain Zig struct, not a heap
+Value, reachable by users only through the closures that wrap it
+(§6).
 
 | Field | Contents |
 |---|---|
@@ -124,7 +125,8 @@ the closures that wrap it (§6).
 | `tries` | One `Try{catch_pc, finally_pc?}` per `try` form, named by `ctrl:try-enter` (§12): a handler needs two pcs and an instruction carries one wide field, so they live here, as the capture sources of a `closure:make` do |
 | `upvalue_count` | The number of cells a closure over this routine carries; `u` operands index them |
 | `slot_count` | The frame window size |
-| `fixed_arity`, `variadic` | `call:call` requires `argc == fixed_arity`, or `argc >= fixed_arity` when variadic; a variadic routine with `slot_count < fixed_arity + 1` is `BytecodeCorruption` |
+| `fixed_arity`, `variadic` | The routine takes `argc == fixed_arity` arguments, or `argc >= fixed_arity` when variadic; a variadic routine with `slot_count < fixed_arity + 1` is `BytecodeCorruption` |
+| `arities` | For a clause of a multi-arity `fn*`, the arity table every clause shares, `Arities{fixed, rest}`: `fixed[i]` the clause taking exactly `i` arguments (null where none does), `rest` the clause with a rest parameter (null when none has one); null for a routine with one arity. A call picks the member by its count (§6) |
 | `name` | For reports: `<anonymous>` by default; the compiler names a named `fn` (so a `defn`) after its name and an anonymous one `fn`; the loader names a top-level form `<top>`, `eval` its form `<eval>` |
 | `spans`, `origin`, `source` | The span table: `SpanEntry{pc, span}` ascending by pc, one per change of source span, so `spanAt(pc)` (a binary search) gives the `SourceSpan{pos, len}` of the form the instruction was lowered from; `origin` is the routine's own form, `source` the `SourceInfo{path, text}` the spans index (null when unknown). The compiler fills them (`COMPILER.md` §8); a hand-built routine has none. Execution never reads them; the error path (§13) and the disassembler do |
 
@@ -132,8 +134,26 @@ Routines carry no metadata map. Two routines compiled from the same
 source are not required to be identical; `=` on two closures
 compares identity.
 
-**Verified before it runs.** `Routine.verify` proves a routine, and
-every routine its capture descriptors build, fit to run: every
+**Arity tables.** Each clause of a multi-arity `fn*` is an ordinary
+routine with its own code, constants, Var table, captures, tries and
+spans, and the clauses share one table. The closure names the first
+clause in source order, the head; the others are reached only through
+the table. Every member carries the same `upvalue_count`, so one
+closure's cells serve them all, and the same name and source, so a
+trace through any of them names the function. A one-clause `fn*` has
+no table. A member proves the table's shape when it is verified: it
+sits in the table at `fixed[fixed_arity]`, or at `rest` when variadic;
+every member points at the same table and has its `upvalue_count`;
+each `fixed[i]` is null or a routine without a rest parameter whose
+`fixed_arity` is `i`, and the last is not null; `rest` has a rest
+parameter and a `fixed_arity` at least every fixed member's (Clojure's
+rule); and the table has two members at least. The table is what the
+call path trusts to pick a member (§6, §8).
+
+**Verified before it runs.** `Routine.verify` proves a routine, the
+other members of its arity table, and every routine their capture
+descriptors build, fit to run: its arity table one a call can pick
+from (above); every
 instruction `primary` with an assigned opcode (a defined but
 unexecuted one, §10, passes and traps where it runs); every operand
 inside the table it indexes (a slot below `slot_count`, a constant,
@@ -142,8 +162,9 @@ every wide field inside its table, a jump target, a `try`'s catch and
 finally pcs and `ctrl:try-exit`'s continuation inside the code; every
 `call:call` and `coll:*` block, every `call:self`'s arguments and
 every `call:lookup-or`'s two slots inside the frame; every
-`call:self`'s count the routine's own fixed arity, in a routine with
-no rest parameter; every `call:lookup` and `call:lookup-or` key a
+`call:self`'s count a fixed arity of the routine's arity table, the
+routine's own when it has no rest parameter or a sibling's
+`fixed[count]`, never a count only a rest clause takes; every `call:lookup` and `call:lookup-or` key a
 keyword or symbol constant; every quickened instruction's operands of
 the kinds its form promises, a fixnum constant holding a fixnum, a
 comparison quickened with its jump followed by that jump on its
@@ -163,10 +184,11 @@ builds, and the image a release build loads is the one the build's
 generator loaded and verified (`docs/STDLIB.md` §1). The dispatch
 trusts what verification proved (§8). A routine is verified once,
 not at every closure made over it: `closure:make` builds a closure
-from a descriptor of a routine verified with every routine under it,
-and the image loader, which makes each closure before the routine it
-runs is read, verifies every routine (`verifyAlone`, each once) when
-the image is whole. Verification never traps: a routine longer than a
+from a descriptor of a routine verified with every routine under it
+and every member of its table, and the image loader, which makes each
+closure before the routine it runs is read, verifies every routine,
+each member of a table among them (`verifyAlone`, each once, the
+table's shape with it), when the image is whole. Verification never traps: a routine longer than a
 pc can name is `BytecodeCorruption` before any of it is read, and
 verification reached past the stack guard, as by capture descriptors
 that lead back to their own routine, which no compiler makes, is the
@@ -183,8 +205,10 @@ kind 24, §2): the body is `Closure{routine, upvalues}` and the
 block's tail holds the cell pointers `upvalues` points at, so one
 allocation carries the whole closure and the slice stays valid
 because the collector never moves a block. `VM.asClosure` reads the
-body. The collector traces a closure through its cells and the heap
-constants of its routine (§9).
+body. A multi-arity `fn*`'s closure names the head of its arity table
+(§5) and runs whichever member a call picks. The collector traces a
+closure through its cells and the heap constants of its routine and
+every member of its table (§9).
 
 **Upvalue cells.** An `UpvalCell{value, initialized}` is a heap block
 of kind `cell_internal`; the `.cell_internal` Value a slot holds and
@@ -267,8 +291,14 @@ and `slot[A + 1 + i]` argument `i`. A and C must be slot operands
 - `function` (a closure): the frame transfer below.
 - Anything else: `:not-callable`.
 
-A closure call checks `argc` against `fixed_arity` / `variadic`
-(`:arity-mismatch`), then pushes a callee frame whose window begins
+A closure call first picks the routine it enters: the closure's own
+when its fixed arity is `argc` and it has no rest parameter, else the
+member `fixed[argc]` of its arity table, else the rest clause (the
+closure's own routine when it has no table) when `argc` reaches its
+`fixed_arity`. A count nothing takes is `:arity-mismatch`, raised in
+the caller before any frame is pushed, its detail naming every count
+the closure takes (§13). The call then pushes a callee frame running
+that routine, whose window begins
 at the caller's `slot[A + 1]` (`callee_base = caller_base + A + 1`),
 so the callee's slot 0 is its first argument and nothing is copied.
 The backing stack grows to `callee_base + slot_count`; the frame
@@ -277,7 +307,9 @@ slot, and the caller's own `pc`, which nothing changes while the
 callee runs, holds its return point. A closure carries one cell for
 each upvalue of its routine (`closure:make` of a verified descriptor
 builds it so, and the stdlib image's loader checks its closures when
-it verifies its routines), so a call does not count them. For a variadic routine the call machinery
+it verifies its routines), so a call does not count them; every
+member of a table carries the same count (§5). For a routine with a
+rest parameter the call machinery
 builds a list of the excess arguments at `slot[fixed_arity]`, nil
 when there are none (so `(if more ...)` tests for extra arguments,
 as in Clojure), and resets the slots above it to nil. The frame's
@@ -290,10 +322,14 @@ instruction.
 own closure, the compiler's lowering of a `fn*` calling its self-name
 (`COMPILER.md` §5.5): the arguments are `slot[A + i]`, the callee's
 window begins at `slot[A]`, and there is no callee to read or test.
-Verification proved `argc` the routine's fixed arity (§5), so the call
-checks only the frame chain and the stack, and traps as a closure call
-does (`StackOverflow` at `VM.max_frames`, `OutOfMemory`). The new
-frame shares the caller's closure and cells. The top-level frame,
+Verification proved `argc` a fixed arity of the routine's table (§5),
+so the call enters the frame's own routine when `argc` is its fixed
+arity and it has no rest parameter, else the table's `fixed[argc]`, a
+clause of the same fn calling another, with no further test. It
+checks only the frame chain and the stack, and traps as a closure
+call does (`StackOverflow` at
+`VM.max_frames`, `OutOfMemory`). The new frame shares the caller's
+closure and cells. The top-level frame,
 which runs no closure, has none to call: `BytecodeCorruption`.
 
 `call:lookup A=dst B=target C=key` and `call:lookup-or A=dst B=slot
@@ -352,7 +388,9 @@ with the same argument count (`map` over one collection, `filter`,
 `vm.Callback`, which
 makes at its first call the decisions `callValue` makes at every one
 and cannot change between calls from the same place: the callee's
-kind, its arity against the count, and for a closure the stack guard
+kind, its arity against the count (for a closure, the routine with a
+fixed arity, its own or a member of its table, the count enters), and
+for a closure the stack guard
 (§13.1), the frame cap and the room the frame chain and the stack
 need, since every call starts from the frame depth and stack length
 the first one found. Each later call of a closure writes the
@@ -366,8 +404,9 @@ error goes on to the loop, which takes the error as its own pass
 would (§8, §12). A call that finds the depth or the length changed
 goes through `callValue`. A leaf native is called as `callValue` calls it, and a
 keyword or symbol given one argument that is a map, a record or nil
-looks itself up in place (§8); any other callee, and any callee whose
-arity the count does not fit, goes through `callValue` every time, so
+looks itself up in place (§8); any other callee, a closure the count
+enters at a rest clause, and any callee whose arity the count does not
+fit, goes through `callValue` every time, so
 the results, errors, error details, traces and rooting are
 `callValue`'s.
 
@@ -439,11 +478,11 @@ collector root (§9).
 
 | Field | Contents |
 |---|---|
-| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument. Under a frame it called, the caller's `pc` is its return point |
+| `routine`, `pc` | The routine and the index of the next instruction, written when a handler calls out, pushes a frame, raises or ends the dispatch chain (§8); between those the pc is a handler argument. Under a frame it called, the caller's `pc` is its return point. A frame running a closure runs the member of its arity table the call picked (§6), which may differ from the closure's routine, the head |
 | `base_slot` | The window into the shared backing stack (`vm.stack`): `slot[i]` is `stack[base_slot + i]` for `i` below the routine's `slot_count` |
 | `entry_stack_len` | The stack length before the window grew; a return or an unwind restores it |
 | `upvalues` | The closure's cell array (shared, not owned) |
-| `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block and its cells alive for the frame's life |
+| `closure` | The `.function` Value the frame runs, nil for the top-level frame; a root that keeps the closure block, its cells and every member of its routine's table alive for the frame's life |
 | `return_dst` | Where the caller receives the result |
 | `host_result` | For a frame `callValue`, `runRoutine` or a `Callback` pushed: the cell its return writes instead of a caller's slot (`HostCallResult`) |
 
@@ -572,9 +611,12 @@ instruction.
   compare, add, subtract, multiply, `quot` and `mod` there when the
   result is a fixnum; anything else, a promotion or a zero divisor
   included, goes through the numeric tower (§10.3). `call:call` of a
-  closure with its fixed arity, where the frame chain and the stack's
+  closure with a fixed arity of its routine or of a member of its
+  arity table (a test of the routine's own arity, then a bounds check
+  and a load from the table, §6), where the frame chain and the stack's
   capacity have room, pushes the callee's frame without allocating,
-  `call:self` the same with the frame's own closure, and `callValue`
+  `call:self` the same with the frame's own closure and the member its
+  count names, and `callValue`
   enters a closure the same way; a leaf native within
   its arity reads its arguments in place (§6), and any other native
   within its arity and `max_native_args` (8) arguments gets them
@@ -609,7 +651,8 @@ the heap block by block and the arena wholesale.
 
 **The VM hosts the collector.** `VM.gcRoots` marks the roots
 `docs/GC.md` §3 lists, and `VM.gcTrace` traces a closure (cells, then
-routine constants) and a cell (its value). When a cycle is due and
+the constants of its routine and every member of its arity table) and
+a cell (its value). When a cycle is due and
 the safe points that run one (instruction fetches after an
 instruction that could allocate, and `callValue` of anything but a
 closure) are `docs/GC.md` §7. `Heap.alloc` never collects, so what
@@ -701,7 +744,7 @@ Keywords and symbols are constants; there is no `load-keyword`.
 | 1 | `call:tailcall` | | Traps `UnimplementedOpcode` |
 | 2 | `call:return` | A=any | Return `resolve(A)`; halt from the outermost frame |
 | 3 | `call:return-nil` | | Return nil |
-| 4 | `call:self` | A=window slot, B=argc (immediate), C=result slot | Call the frame's own closure with `slot[A..A+argc]` (§6) |
+| 4 | `call:self` | A=window slot, B=argc (immediate), C=result slot | Call the frame's own closure with `slot[A..A+argc]`, entering the frame's routine or the member of its arity table that takes `argc` (§6) |
 | 5 | `call:lookup` | A=slot, B=any, C=keyword or symbol constant | `slot[A] := (C resolve(B))` (§6) |
 | 6 | `call:lookup-or` | A=slot, B=slot, C=keyword or symbol constant | `slot[A] := (C slot[B] slot[B+1])` (§6) |
 
@@ -985,7 +1028,7 @@ keyword form of the catchable subset (`vmErrorToKeywordName`).
 | Error | Keyword | When |
 |---|---|---|
 | `KindMismatch` | `:kind-mismatch` | An operand of the wrong kind: a non-number to `math:*` / `cmp:*`, a non-seqable to `coll:concat`, a wrong kind to a native |
-| `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept |
+| `ArityMismatch` | `:arity-mismatch` | A call passes an argument count the callee does not accept, a multi-arity closure's included: no member of its table takes it |
 | `NotCallable` | `:not-callable` | A call on a value that is not a closure, native, protocol fn, Var, keyword, symbol, map or set (hash or sorted), vector or transient |
 | `UnboundVar` | `:unbound-var` | A `v` operand or `var:load-var` on a Var never bound |
 | `NotDynamic` | `:not-dynamic` | `binding` or `set!` on a Var not marked `^:dynamic` (§6.5) |
@@ -1021,9 +1064,9 @@ run):
 | `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a `call:lookup-or`'s second slot past the frame; a jump target or a `try`'s pc past the code |
 | `InvalidOperandKind` | Verification: an operand read as a slot (a destination, a block's base, a cell) that is not one; a lookup key that is not a keyword or symbol constant; a quickened instruction's operand not of the kind its form promises, a slot, an upvalue or a constant holding a fixnum (§10.10). Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
-| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter, a comparison quickened with its jump not followed by that jump on its slot, a step not followed by the comparison it names reading its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is no fixed arity of its routine's arity table (its own, without a rest parameter, or a sibling's), an arity table a call cannot pick from (a member not at its place, another table's member, a fixed entry of another arity, a last fixed entry that is null, a rest clause without a rest parameter or below a fixed arity, a table of one, §5), a comparison quickened with its jump not followed by that jump on its slot, a step not followed by the comparison it names reading its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block, or a `call:self`'s arguments, past the frame's slot count |
-| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
+| `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues; two members of an arity table with different upvalue counts. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |
 | `ExpectedCell` | `get-cell`, `init-cell` or a `local_cell_slot` source found no cell |
 | `InvalidCellState` | `box-local` on a boxed slot; `init-cell` on an initialized cell |
@@ -1043,7 +1086,11 @@ stack; `VM.max_frames` bounds its depth.
 **Error detail.** Where the VM can describe an error it writes one
 sentence to `VM.error_detail` for the host's report: `f takes 1
 argument, got 0`, `g takes at least 2 arguments, got 1` (closures,
-natives and protocol methods alike), `an integer is not callable`,
+natives and protocol methods alike), and for a multi-arity closure
+every count it takes, a run of three or more as a range and the rest
+clause last, taking in the fixed counts just below it: `f takes 1 or
+2 arguments, got 3`, `f takes 0 to 2 arguments, got 3`, `f takes 1, 3
+or at least 5 arguments, got 4`; `an integer is not callable`,
 `+ expects numbers, got a string`, `no impl of area for a vector`,
 `a value nests too deeply to compare, hash or print`. A value's kind
 is named as the language presents it (`kindPhrase`: `nil`, `a
