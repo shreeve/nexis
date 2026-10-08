@@ -144,8 +144,9 @@ every `call:lookup-or`'s two slots inside the frame; every
 `call:self`'s count the routine's own fixed arity, in a routine with
 no rest parameter; every `call:lookup` and `call:lookup-or` key a
 keyword or symbol constant; every quickened instruction's operands of
-the kinds its form promises, a fixnum constant holding a fixnum, and
-a comparison quickened with its jump followed by that jump on its
+the kinds its form promises, a fixnum constant holding a fixnum, a
+comparison quickened with its jump followed by that jump on its
+slot, and a step followed by the comparison it names reading its
 slot (§10.10); every capture
 descriptor's sources inside the frame and the routine's upvalues, as
 many as the child's `upvalue_count`; and the last instruction one
@@ -515,7 +516,9 @@ instruction.
   only to a slot of its frame, with no call but its tail call and no
   stack frame; on any other case it tail-calls the general handler
   through `op_table` before it has changed anything, so every trap,
-  every safe point and every allocation is the general handler's. The
+  every safe point and every allocation is the general handler's (a
+  step, §10.10, whose comparison leaves its case has run its add and
+  fetches the comparison). The
   table indexed at run time is what keeps the optimizer from inlining
   the general handler, and the stack frame it needs, back into the
   fast one. A case that calls out, a leaf native or a keyword
@@ -828,17 +831,31 @@ opcode's general handler, with every trap and safe point.
 | `math` | 32 + base | `add`, `sub`, `mul`, `idiv`, `mod` | B and C slots |
 | `math` | 40 + base | the same | B a constant holding a fixnum, C a slot |
 | `math` | 48 + base | the same | B a slot, C a constant holding a fixnum |
+| `math` | 16 + 4k + c | `add` | a step: B a slot, C a constant holding a fixnum, followed by the quickened comparison `c` (`lt`, `lte`, `gt`, `gte`) with its jump, reading A as its B; k = 2t + f: f 0 for the comparison's B and C slots, 1 for its C a fixnum constant; t 0 for its jump a `jump:if-true`, 1 a `jump:if-false` |
 | `cmp` | 16 + 8k + base | every variant | k = 2t + f: f 0 for B and C slots, 1 for B a slot and C a fixnum constant; t 0 alone, 1 followed by a `jump:if-true` testing A, 2 by a `jump:if-false` testing A |
 | `mov` | 32, 33 | `move` | B a slot; B an upvalue |
 | `call` | 32 | `return` | A a slot |
 
 A comparison quickened with its jump runs the pair as one dispatch
 (§8) without looking for the jump: verification proved it is there.
+A step is a counting loop's `(+ i k)` and its bottom test (`COMPILER.md`
+§5.7): it runs the add, the comparison after it and that
+comparison's jump as one dispatch, reading the two in place as a
+comparison reads its jump. Verification proved the comparison is
+there, in the form the step names and reading A, and the
+comparison's own form proved its jump. A sum that is not a fixnum
+(B not one, or the sum past i48) goes to `math:add`'s general
+handler, and the comparison then runs as its own instruction; a
+comparison whose C slot does not hold a fixnum runs as its own
+instruction after the step has stored the sum. Either way each
+instruction's trap, safe point, pc and trace are its own, as running
+the three in turn gives.
 The disassembler names a quickened variant after its base, with its
-operand kinds (`s` a slot, `c` a fixnum constant, `u` an upvalue) and
-the jump it runs: `math:add.sc`, `math:mul.cs`, `cmp:lt.ss+if-true`,
-`mov:move.s`, `mov:move.u`, `call:return.s` (`TOOLING.md` §2). Every other number in these
-ranges is unassigned.
+operand kinds (`s` a slot, `c` a fixnum constant, `u` an upvalue), the
+comparison a step runs and the jump a comparison runs: `math:add.sc`,
+`math:mul.cs`, `cmp:lt.ss+if-true`, `mov:move.s`, `mov:move.u`,
+`call:return.s`, `math:add.sc+lt.ss+if-true` (`TOOLING.md` §2). Every
+other number in these ranges is unassigned.
 
 ---
 
@@ -1002,7 +1019,7 @@ run):
 | `OperandOutOfRange` | Verification: an operand or wide-field index past the routine's slots, constants, Var table, tries or capture descriptors; a `call:lookup-or`'s second slot past the frame; a jump target or a `try`'s pc past the code |
 | `InvalidOperandKind` | Verification: an operand read as a slot (a destination, a block's base, a cell) that is not one; a lookup key that is not a keyword or symbol constant; a quickened instruction's operand not of the kind its form promises, a slot, an upvalue or a constant holding a fixnum (§10.10). Where it runs: an operand kind the position does not accept, `resolve` of unused, `store` to a constant |
 | `BytecodeExhausted` | Verification: code empty, or ending in an instruction that falls through |
-| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter, a comparison quickened with its jump not followed by that jump on its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
+| `BytecodeCorruption` | Verification: an instruction kind other than `primary`, an unrecognized group or variant (§10), a `call:self` whose count is not its routine's fixed arity or in a routine with a rest parameter, a comparison quickened with its jump not followed by that jump on its slot, a step not followed by the comparison it names reading its slot (§10.10). Where it runs: `call:self` in the top-level frame; an unrecognized operand-kind bit pattern; a variadic routine with `slot_count < fixed_arity + 1`; an odd `coll:map` count |
 | `CallBlockOutOfRange` | Verification: a call block, or a `call:self`'s arguments, past the frame's slot count |
 | `CaptureCountMismatch` | Verification: a capture descriptor's source count differs from the child's `upvalue_count`; a top-level routine with upvalues. Where it runs: `closure:make` of such a descriptor in a routine nothing verified. A call never finds a closure's cell count other than its routine's (§6) |
 | `UpvalueOutOfRange` | Verification: a `u` index or `inherited_upvalue` source past the routine's upvalue count |

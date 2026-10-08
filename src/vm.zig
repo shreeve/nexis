@@ -319,6 +319,11 @@ pub const Quick = struct {
     base: u6,
     form: Form,
     then: Then = .none,
+    /// A counting loop's step: the quickened comparison after a
+    /// `math:add` of a slot and a fixnum constant, reading the sum as
+    /// its B, which the add runs with the comparison's jump (`then`)
+    /// as one dispatch.
+    step: ?Step = null,
 
     pub const Form = enum(u3) {
         /// `mov:move` and `call:return`: the value read is a slot.
@@ -337,17 +342,29 @@ pub const Quick = struct {
     /// comparison's slot: the pair it runs as one dispatch (§8).
     pub const Then = enum(u2) { none, if_true, if_false };
 
+    /// The comparison a step runs: an ordered one, of slots or of a
+    /// slot and a fixnum constant.
+    pub const Step = struct { cmp: NumCmp, form: Form };
+
     /// The `math` variants with quickened forms: those with a fast
     /// handler.
     const math_bases = [_]Math{ .add, .sub, .mul, .idiv, .mod };
 
     /// The variant `q` takes in `group`, or null when `group` has no
-    /// such quickened variant. `math`, `mov` and `call` keep their
-    /// quickened variants at 32-63 and `cmp` at 16-63, so each group's
-    /// base variants keep the numbers below.
+    /// such quickened variant. `math` keeps its steps at 16-31, `math`,
+    /// `mov` and `call` their other quickened variants at 32-63 and
+    /// `cmp` at 16-63, so each group's base variants keep the numbers
+    /// below.
     pub fn variant(group: Group, q: Quick) ?u6 {
+        if (q.step != null and group != .math) return null;
         switch (group) {
             .math => {
+                if (q.step) |s| {
+                    if (q.base != @backingInt(Math.add) or q.form != .slot_fixnum or q.then == .none or
+                        @backingInt(s.cmp) > @backingInt(NumCmp.gte) or (s.form != .slot_slot and s.form != .slot_fixnum)) return null;
+                    const k: u6 = (@as(u6, @backingInt(q.then)) - 1) * 2 + @intFromBool(s.form == .slot_fixnum);
+                    return 16 + 4 * k + @backingInt(s.cmp);
+                }
                 if (q.then != .none or std.mem.findScalar(Math, &math_bases, @fromBackingInt(q.base)) == null) return null;
                 return switch (q.form) {
                     .slot_slot => 32 + q.base,
@@ -381,8 +398,18 @@ pub const Quick = struct {
                 if (variant(g, q)) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = q;
             };
         }
+        for ([_]Then{ .if_true, .if_false }) |then| for ([_]Form{ .slot_slot, .slot_fixnum }) |form| for (std.meta.tags(NumCmp)) |c| {
+            const q = Quick{ .base = @backingInt(Math.add), .form = .slot_fixnum, .then = then, .step = .{ .cmp = c, .form = form } };
+            if (variant(.math, q)) |v| t[@as(u12, @backingInt(Group.math)) | @as(u12, v) << 6] = q;
+        };
         break :blk t;
     };
+
+    /// The quickened comparison a step runs, with its jump.
+    pub fn stepCmp(q: Quick) ?Quick {
+        const s = q.step orelse return null;
+        return .{ .base = @backingInt(s.cmp), .form = s.form, .then = q.then };
+    }
 
     /// The quickened variant at opcode index `op`, or null for any
     /// other opcode.
@@ -397,7 +424,10 @@ pub const Quick = struct {
 /// `consts` (a comparison followed by a conditional jump on its slot
 /// says so too), a `math` instruction of a fixnum constant and a
 /// slot, a `mov:move` reading a slot or an upvalue, and a
-/// `call:return` reading a slot.
+/// `call:return` reading a slot; then each `math:add` of a slot and a
+/// fixnum constant followed by a quickened ordered comparison of its
+/// sum with its jump, a counting loop's step and bottom test, into the
+/// step that runs the three.
 /// Only the variant changes: an instruction keeps its operands, so
 /// its pc, span and trace are the ones it had.
 pub fn quicken(code: []Inst, consts: []const Value) void {
@@ -437,6 +467,15 @@ pub fn quicken(code: []Inst, consts: []const Value) void {
             else => continue,
         }
         inst.variant = Quick.variant(group, q) orelse continue;
+    }
+    if (code.len < 2) return;
+    for (code[0 .. code.len - 1], code[1..]) |*inst, next| {
+        const q = Quick.of(VM.opIndex(inst.*)) orelse continue;
+        const c = Quick.of(VM.opIndex(next)) orelse continue;
+        if (inst.groupOf() != .math or next.groupOf() != .cmp or c.then == .none) continue;
+        if (@as(u16, @bitCast(next.b)) != @as(u16, @bitCast(inst.a))) continue;
+        const step = Quick{ .base = q.base, .form = q.form, .then = c.then, .step = .{ .cmp = @fromBackingInt(c.base), .form = c.form } };
+        inst.variant = Quick.variant(.math, step) orelse continue;
     }
 }
 
@@ -675,8 +714,10 @@ pub const Routine = struct {
     const WideRole = enum { pc, constant, var_, capture, try_ };
     /// `block`: A and B name a call or collection block; `pair`: B
     /// names two slots; `then`: the next instruction is the
-    /// conditional jump on A that a quickened comparison runs.
-    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false, then: Quick.Then = .none };
+    /// conditional jump on A that a quickened comparison runs; `step`:
+    /// the next instruction is the quickened comparison at this opcode
+    /// index, reading A as its B, that a step runs.
+    const Shape = struct { a: Role = .none, b: Role = .none, c: Role = .none, wide: ?WideRole = null, block: bool = false, pair: bool = false, then: Quick.Then = .none, step: ?u12 = null };
 
     /// The shape of the opcode at `op`, null for one with no
     /// operands to prove: an unimplemented one traps where it runs. A
@@ -697,6 +738,10 @@ pub const Routine = struct {
                 .fixnum_slot => shape = .{ .a = .dst, .b = .fixnum, .c = .slot },
             }
             shape.then = q.then;
+            if (Quick.stepCmp(q)) |c| {
+                shape.then = .none;
+                shape.step = @as(u12, @backingInt(Group.cmp)) | @as(u12, Quick.variant(.cmp, c).?) << 6;
+            }
             return shape;
         }
         return baseShapeOf(op);
@@ -763,6 +808,12 @@ pub const Routine = struct {
             const variant: Jump = if (shape.then == .if_true) .if_true else .if_false;
             if (pc + 1 >= self.code.len) return VmError.BytecodeExhausted;
             if (@as(u32, @truncate(@as(u64, @bitCast(self.code[pc + 1])))) != VM.condJumpKey(variant, inst.a)) return VmError.BytecodeCorruption;
+        }
+        // The comparison's own form proves its operands and its jump.
+        if (shape.step) |cmp| {
+            if (pc + 1 >= self.code.len) return VmError.BytecodeExhausted;
+            const next = self.code[pc + 1];
+            if (VM.opIndex(next) != cmp or @as(u16, @bitCast(next.b)) != @as(u16, @bitCast(inst.a))) return VmError.BytecodeCorruption;
         }
         if (shape.wide) |w| {
             const i = inst.wide();
@@ -3845,7 +3896,16 @@ pub const VM = struct {
         for (0..4096) |op| {
             const q = Quick.of(op) orelse continue;
             t[op] = switch (@as(Group, @fromBackingInt(@as(u6, @truncate(op))))) {
-                .math => switch (q.form) {
+                .math => if (q.step) |s| switch (s.form) {
+                    inline .slot_slot, .slot_fixnum => |form| switch (q.then) {
+                        inline .if_true, .if_false => |then| switch (s.cmp) {
+                            inline .lt, .lte, .gt, .gte => |c| fastStep(c, form, then),
+                            .eq => unreachable,
+                        },
+                        .none => unreachable,
+                    },
+                    else => unreachable,
+                } else switch (q.form) {
                     inline .slot_slot, .slot_fixnum, .fixnum_slot => |form| switch (@as(Math, @fromBackingInt(q.base))) {
                         inline .add, .sub, .mul, .idiv, .mod => |m| fastMathQuick(m, form),
                         else => unreachable,
@@ -4310,6 +4370,32 @@ pub const VM = struct {
                 };
                 dst.* = value_mod.fromBool(holds_);
                 return self.nextAt(frame, after);
+            }
+        }.run;
+    }
+
+    /// A counting loop's step (§10.10): the `math:add` of a slot and a
+    /// fixnum constant, then the comparison `c` after it, of the sum
+    /// and the comparison's C in `form`, then its jump, `then`, as one
+    /// dispatch. A sum that is not a fixnum goes to the add's general
+    /// handler; a C slot not holding a fixnum leaves the sum stored and
+    /// the comparison to run as its own instruction, as the two would
+    /// run in turn.
+    fn fastStep(comptime c: NumCmp, comptime form: Quick.Form, comptime then: Quick.Then) OpHandler {
+        return &struct {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+                const dst = self.verifiedSlot(frame, inst.a);
+                const l = self.quickFixnum(frame, inst.b, false) orelse return self.general(frame, inst, pc);
+                const k = self.quickFixnum(frame, inst.c, true) orelse return self.general(frame, inst, pc);
+                const sum = l + k;
+                dst.* = value_mod.fromFixnum(sum) orelse return self.general(frame, inst, pc);
+                const code = frame.routine.code;
+                const cmp = code[pc];
+                proved(@as(u16, @bitCast(cmp.b)) == @as(u16, @bitCast(inst.a)));
+                const r = self.quickFixnum(frame, cmp.c, form == .slot_fixnum) orelse return self.nextAt(frame, pc);
+                const holds_ = ordered(i64, c, sum, r);
+                self.verifiedSlot(frame, cmp.a).* = value_mod.fromBool(holds_);
+                return self.nextAt(frame, if (holds_ == (then == .if_true)) code[pc + 1].wide() else pc + 2);
             }
         }.run;
     }
@@ -6560,9 +6646,10 @@ test "Quick: every quickened opcode decodes to its form and back" {
         try testing.expect(VM.op_table[op] == &VM.opQuickened);
         n += 1;
     }
-    // math: five operators in three forms; cmp: five in six; mov:move
-    // in two and call:return in one.
-    try testing.expectEqual(@as(usize, 5 * 3 + 5 * 6 + 3), n);
+    // math: five operators in three forms and the steps, four
+    // comparisons in two forms with two jumps; cmp: five in six;
+    // mov:move in two and call:return in one.
+    try testing.expectEqual(@as(usize, 5 * 3 + 4 * 2 * 2 + 5 * 6 + 3), n);
 }
 
 test "VM dispatch: a quickened instruction runs as its base, every case and trap" {
@@ -6684,6 +6771,254 @@ test "Routine.verify: a quickened instruction proves what its form promises" {
         if (case.err) |err| {
             try testing.expectError(err, routine.verify(&failure));
             try testing.expectEqual(@as(u32, 0), failure.pc);
+        } else try routine.verify(&failure);
+    }
+}
+
+test "quicken: a counting loop's step, and the adds it leaves" {
+    const consts = [_]Value{ fx(1), fx(10), fl(1.5) };
+    const step = struct {
+        fn of(c: NumCmp, form: Quick.Form, then: Quick.Then) Quick {
+            return .{ .base = @backingInt(Math.add), .form = .slot_fixnum, .then = then, .step = .{ .cmp = c, .form = form } };
+        }
+    }.of;
+    const cmp = struct {
+        fn of(c: Cmp, b: Operand, limit: Operand) Inst {
+            return Inst.primary(.cmp, c, sl(1), b, limit);
+        }
+    }.of;
+    const add = asm_.mathAdd(0, sl(0), kn(0));
+    const if_true = asm_.jumpIfTrue(0, sl(1));
+    const if_false = asm_.jumpIfFalse(0, sl(1));
+    const Case = struct { [3]Inst, ?Quick };
+    for ([_]Case{
+        .{ .{ add, cmp(.lt, sl(0), sl(2)), if_true }, step(.lt, .slot_slot, .if_true) },
+        .{ .{ add, cmp(.gte, sl(0), kn(1)), if_false }, step(.gte, .slot_fixnum, .if_false) },
+        .{ .{ asm_.mathAdd(0, sl(2), kn(0)), cmp(.lte, sl(0), kn(1)), if_true }, step(.lte, .slot_fixnum, .if_true) },
+        .{ .{ add, cmp(.gt, sl(0), sl(0)), if_false }, step(.gt, .slot_slot, .if_false) },
+        // Left an add of its own form: a comparison with no jump, of
+        // another slot, of a constant not a fixnum, or `==`.
+        .{ .{ add, cmp(.lt, sl(0), sl(2)), asm_.returnSlot(1) }, null },
+        .{ .{ add, cmp(.lt, sl(2), sl(0)), if_true }, null },
+        .{ .{ add, cmp(.lt, sl(0), kn(2)), if_true }, null },
+        .{ .{ add, cmp(.eq_num, sl(0), sl(2)), if_true }, null },
+        .{ .{ add, asm_.loadNil(1), if_true }, null },
+        // Another operator, or an add of other kinds.
+        .{ .{ Inst.primary(.math, Math.sub, sl(0), sl(0), kn(0)), cmp(.lt, sl(0), sl(2)), if_true }, null },
+        .{ .{ asm_.mathAdd(0, sl(0), sl(2)), cmp(.lt, sl(0), sl(2)), if_true }, null },
+        .{ .{ asm_.mathAdd(0, kn(0), sl(2)), cmp(.lt, sl(0), sl(2)), if_true }, null },
+    }) |case| {
+        var code = case[0] ++ [_]Inst{asm_.returnNil()};
+        quicken(&code, &consts);
+        var alone = case[0][1..3].* ++ [_]Inst{asm_.returnNil()};
+        quicken(&alone, &consts);
+        // Only the add's variant changes: the comparison and its jump
+        // are quickened as they are alone, and the add keeps its
+        // operands.
+        try testing.expectEqualSlices(Inst, &alone, code[1..]);
+        try testing.expectEqual(@as(u64, @bitCast(case[0][0])) >> 16, @as(u64, @bitCast(code[0])) >> 16);
+        const q = Quick.of(VM.opIndex(code[0]));
+        if (case[1]) |want| {
+            try testing.expectEqual(want, q.?);
+            try testing.expectEqual(VM.opcode(.math, Math.add), Routine.baseOp(VM.opIndex(code[0])));
+        } else if (q) |got| try testing.expect(got.step == null);
+        // Quickening twice changes nothing more.
+        const once = code;
+        quicken(&code, &consts);
+        try testing.expectEqualSlices(Inst, &once, &code);
+    }
+}
+
+test "VM dispatch: a counting loop's step runs as the add, the comparison and the jump" {
+    // A step from each value by each constant, compared with each
+    // limit by each operator, through either jump: run as written and
+    // quickened, the result, or the error, its detail and the
+    // instruction it names, are the same. The jump goes to pc 7, which
+    // returns the sum; not taken, pc 5 returns the boolean.
+    const fixnum_max = value_mod.fixnum_max;
+    const values = [_]Value{ fx(0), fx(1), fx(-7), fx(fixnum_max), fx(value_mod.fixnum_min), fl(2.5), true_v, nil_v };
+    const limits = [_]Value{ fx(0), fx(1), fx(2), fx(fixnum_max), fl(1.5), true_v };
+    var steps: usize = 0;
+    for (values) |x| for ([_]i64{ 1, -1, 2 }) |k| for (limits) |y| for ([_]bool{ false, true }) |constant| {
+        if (constant and !y.isFixnum()) continue;
+        const consts = [_]Value{ x, fx(k), y };
+        const limit = if (constant) kn(2) else sl(2);
+        for (std.meta.tags(Cmp)) |c| for ([_]Jump{ .if_true, .if_false }) |j| {
+            var code = [_]Inst{
+                asm_.loadConst(0, 0),
+                asm_.loadConst(2, 2),
+                asm_.mathAdd(0, sl(0), kn(1)),
+                Inst.primary(.cmp, c, sl(1), sl(0), limit),
+                Inst.primaryWide(.jump, j, sl(1), 7),
+                asm_.returnSlot(1),
+                asm_.returnNil(),
+                asm_.returnSlot(0),
+            };
+            const plain = try StepOutcome.of(&code, &consts);
+            quicken(&code, &consts);
+            if (c != .eq_num) {
+                try testing.expect(Quick.of(VM.opIndex(code[2])).?.step != null);
+                steps += 1;
+            }
+            errdefer std.debug.print("step {any} from {any} by {d} against {any}\n", .{ Quick.of(VM.opIndex(code[2])), x, k, y });
+            try StepOutcome.expectSame(plain, try StepOutcome.of(&code, &consts));
+        };
+    };
+    try testing.expect(steps > 1000);
+}
+
+/// What a run of a hand-built routine came to, compared across its
+/// code as written and quickened.
+const StepOutcome = struct {
+    value: ?Value = null,
+    err: ?VmError = null,
+    detail: [96]u8 = undefined,
+    detail_len: usize = 0,
+    pc: u32 = 0,
+    span: ?SourceSpan = null,
+
+    fn of(code: []const Inst, consts: []const Value) !StepOutcome {
+        return ofRoutine(makeRoutine(code, consts, 3, "q"));
+    }
+
+    fn ofRoutine(routine: Routine) !StepOutcome {
+        var vm = try VM.init(testing.allocator, &routine);
+        defer vm.deinit();
+        var out: StepOutcome = .{};
+        const v = vm.run() catch |err| {
+            out.err = err;
+            out.detail_len = @min(vm.error_detail.len, out.detail.len);
+            @memcpy(out.detail[0..out.detail_len], vm.error_detail[0..out.detail_len]);
+            out.pc = vm.error_trace.items[0].pc;
+            out.span = vm.error_trace.items[0].span;
+            return out;
+        };
+        // A bignum lives on the VM's heap: compare it as text.
+        out.value = if (v.isFixnum() or v.isFloat() or v.isBool()) v else blk: {
+            var w = std.Io.Writer.fixed(&out.detail);
+            try bignum_mod.formatDecimal(v, &w);
+            out.detail_len = w.buffered().len;
+            break :blk nil_v;
+        };
+        return out;
+    }
+
+    fn expectSame(a: StepOutcome, b: StepOutcome) !void {
+        try testing.expectEqual(a.err, b.err);
+        try testing.expectEqual(a.pc, b.pc);
+        try testing.expectEqual(a.span, b.span);
+        try testing.expectEqualStrings(a.detail[0..a.detail_len], b.detail[0..b.detail_len]);
+        if (a.value) |v| try testing.expect(dispatch_mod.equal(v, b.value.?)) else try testing.expect(b.value == null);
+    }
+};
+
+test "VM dispatch: a counting loop runs through its step to each boundary" {
+    // (loop [i x] (if (< i limit) (recur (+ i k)) i)), its test at the
+    // bottom: past i48, against a limit not a fixnum (a float, and a
+    // bignum the routine makes, i48's top plus 3), by steps of 1, 2 and
+    // -1, as written and quickened.
+    const max = value_mod.fixnum_max;
+    const Case = struct { x: i64, k: i64, c: Cmp, limit: Value, past: i64 = 0, want: []const u8 };
+    for ([_]Case{
+        .{ .x = 0, .k = 1, .c = .lt, .limit = fx(1000), .want = "1000" },
+        .{ .x = 0, .k = 2, .c = .lte, .limit = fx(999), .want = "1000" },
+        .{ .x = 1000, .k = -1, .c = .gt, .limit = fx(0), .want = "0" },
+        .{ .x = max - 3, .k = 1, .c = .lt, .limit = fx(max), .past = 3, .want = "140737488355330" },
+        .{ .x = 0, .k = 1, .c = .lt, .limit = fl(9.5), .want = "10" },
+    }) |case| {
+        const consts = [_]Value{ fx(case.x), fx(case.k), case.limit, fx(case.past) };
+        var code = [_]Inst{
+            asm_.loadConst(0, 0),
+            asm_.loadConst(2, 2),
+            asm_.mathAdd(2, sl(2), kn(3)),
+            asm_.mathAdd(0, sl(0), kn(1)),
+            Inst.primary(.cmp, case.c, sl(1), sl(0), sl(2)),
+            asm_.jumpIfTrue(3, sl(1)),
+            asm_.returnSlot(0),
+        };
+        const plain = try StepOutcome.of(&code, &consts);
+        quicken(&code, &consts);
+        try testing.expect(Quick.of(VM.opIndex(code[3])).?.step != null);
+        const quick = try StepOutcome.of(&code, &consts);
+        try StepOutcome.expectSame(plain, quick);
+        var buf: [24]u8 = undefined;
+        const got = if (quick.value.?.isFixnum()) try std.fmt.bufPrint(&buf, "{d}", .{quick.value.?.asFixnum()}) else quick.detail[0..quick.detail_len];
+        try testing.expectEqualStrings(case.want, got);
+    }
+}
+
+test "VM dispatch: an error through a counting loop's step names its own instruction" {
+    // (loop [i 0 n 3] (if (< i n) (recur (inc i) (if (== i 2) true n)) i)),
+    // the limit or the counter a boolean on the third pass: the trace
+    // names the comparison (pc 6) or the add (pc 5) and its span.
+    const spans = [_]SpanEntry{
+        .{ .pc = 0, .span = .{ .pos = 0, .len = 40 } },
+        .{ .pc = 5, .span = .{ .pos = 20, .len = 7 } },
+        .{ .pc = 6, .span = .{ .pos = 10, .len = 7 } },
+        .{ .pc = 8, .span = .{ .pos = 0, .len = 40 } },
+    };
+    const consts = [_]Value{ fx(0), fx(3), fx(2), fx(1) };
+    for ([_]struct { u12, u32, SourceSpan }{ .{ 2, 6, spans[2].span }, .{ 0, 5, spans[1].span } }) |case| {
+        var code = [_]Inst{
+            asm_.loadConst(0, 0),
+            asm_.loadConst(2, 1),
+            Inst.primary(.cmp, Cmp.eq_num, sl(1), sl(0), kn(2)),
+            asm_.jumpIfFalse(5, sl(1)),
+            asm_.loadTrue(case[0]),
+            asm_.mathAdd(0, sl(0), kn(3)),
+            asm_.cmpLt(1, sl(0), sl(2)),
+            asm_.jumpIfTrue(2, sl(1)),
+            asm_.returnSlot(0),
+        };
+        var routine = makeRoutine(&code, &consts, 3, "loop");
+        routine.spans = &spans;
+        const plain = try StepOutcome.ofRoutine(routine);
+        quicken(&code, &consts);
+        try testing.expect(Quick.of(VM.opIndex(code[5])).?.step != null);
+        const quick = try StepOutcome.ofRoutine(routine);
+        try StepOutcome.expectSame(plain, quick);
+        try testing.expectEqual(VmError.KindMismatch, quick.err.?);
+        try testing.expectEqual(case[1], quick.pc);
+        try testing.expectEqual(case[2], quick.span.?);
+    }
+}
+
+test "Routine.verify: a step proves the comparison it runs" {
+    const r = asm_.returnNil();
+    const consts = [_]Value{ fx(1), fl(1.5) };
+    const quick = struct {
+        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
+            return raw(g, Quick.variant(g, q).?, a, b, c);
+        }
+    }.of;
+    const step: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum, .then = .if_true, .step = .{ .cmp = .lt, .form = .slot_slot } };
+    const lt_ss: Quick = Quick.stepCmp(step).?;
+    const gt: Quick = .{ .base = @backingInt(Cmp.gt), .form = .slot_slot, .then = .if_true };
+    const lt_sc: Quick = .{ .base = @backingInt(Cmp.lt), .form = .slot_fixnum, .then = .if_true };
+    const lt_else: Quick = .{ .base = @backingInt(Cmp.lt), .form = .slot_slot, .then = .if_false };
+    const add = quick(.math, step, sl(0), sl(0), kn(0));
+    const jump = asm_.jumpIfTrue(0, sl(1));
+    const Case = struct { name: []const u8, code: []const Inst, err: ?VmError, pc: u32 = 0 };
+    for ([_]Case{
+        .{ .name = "an add, its comparison and its jump", .code = &.{ add, quick(.cmp, lt_ss, sl(1), sl(0), sl(2)), jump, r }, .err = null },
+        .{ .name = "no comparison after it", .code = &.{ add, asm_.loadNil(1), jump, r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "the comparison not quickened", .code = &.{ add, asm_.cmpLt(1, sl(0), sl(2)), jump, r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "another comparison", .code = &.{ add, quick(.cmp, gt, sl(1), sl(0), sl(2)), jump, r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "the comparison in another form", .code = &.{ add, quick(.cmp, lt_sc, sl(1), sl(0), kn(0)), jump, r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "the comparison with the other jump", .code = &.{ add, quick(.cmp, lt_else, sl(1), sl(0), sl(2)), asm_.jumpIfFalse(0, sl(1)), r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "a comparison of another slot", .code = &.{ add, quick(.cmp, lt_ss, sl(1), sl(2), sl(0)), jump, r }, .err = VmError.BytecodeCorruption },
+        .{ .name = "a slot where the step's fixnum constant is promised", .code = &.{ quick(.math, step, sl(0), sl(0), sl(1)), quick(.cmp, lt_ss, sl(1), sl(0), sl(2)), jump, r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a step's constant not a fixnum", .code = &.{ quick(.math, step, sl(0), sl(0), kn(1)), quick(.cmp, lt_ss, sl(1), sl(0), sl(2)), jump, r }, .err = VmError.InvalidOperandKind },
+        .{ .name = "a step ending the code", .code = &.{add}, .err = VmError.BytecodeExhausted },
+        // The comparison's own form proves its jump.
+        .{ .name = "the comparison with no jump", .code = &.{ add, quick(.cmp, lt_ss, sl(1), sl(0), sl(2)), r }, .err = VmError.BytecodeCorruption, .pc = 1 },
+    }) |case| {
+        errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
+        const routine = Routine{ .code = case.code, .consts = &consts, .slot_count = 3, .name = "t" };
+        var failure: VerifyFailure = undefined;
+        if (case.err) |err| {
+            try testing.expectError(err, routine.verify(&failure));
+            try testing.expectEqual(case.pc, failure.pc);
         } else try routine.verify(&failure);
     }
 }
