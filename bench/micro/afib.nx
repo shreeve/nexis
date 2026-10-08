@@ -1,0 +1,3 @@
+; bench/micro/afib.nx N: fib through two clauses, each call the other's: the unit is one call.
+(defn fib ([n] (fib n 0)) ([n _] (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))))
+(println (fib (parse-long (first *command-line-args*))))

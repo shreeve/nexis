@@ -1641,7 +1641,7 @@ the rest list (`mcall`'s peak resident set is 22.4 MB at 10 M calls,
 The same fast path as a one-arity closure costs 1,153 instructions
 less `count`: 1.9 protocol calls and 7.2 closure calls, so per-arity
 entry points for a multi-arity `fn` would meet the first target and
-come near the second.
+come near the second; §3.30 measures them.
 
 ### 3.29 Locals clearing, Apple M5
 
@@ -1724,6 +1724,62 @@ result moves at its last read, 2.02 and 1.96 μs against 2.31 and
 2.06 μs; `closure_create` 806 and 806 ns against 882 and 813 ns. The
 stdlib image's generator, a debug build that also checks every
 routine it clears in, runs 498 → 535 M instructions (58 → 63 ms).
+
+### 3.30 Per-arity entry points, Apple M5
+
+A multi-arity `fn` compiles to a routine per clause over one arity
+table, and a call enters the clause its argument count picks
+(`docs/VM.md` §5, §6; `docs/COMPILER.md` §5.5), where it was one
+variadic routine that built a rest list, counted it and bound each
+clause's parameters with `first` and `nth` (`docs/MACROEXPAND.md`
+§10). Before is `fb51779`, after the `expand` commit of this lane;
+one ReleaseFast build of each. Provenance: §11.
+
+The micro kit (`docs/BENCH.md` §13), `bb bench/micro/run.clj
+--rounds 5` (load 13.0 → 7.9), instructions and cycles per unit, the
+median and the range of the paired rounds, and the peak resident set
+at the larger size:
+
+| Program | Instructions before | after | Cycles before | after | Peak RSS before | after |
+|---|---:|---:|---:|---:|---:|---:|
+| `gcall`, a one-arity call | 231.0 [231.0–231.0] | 231.0 [231.0–231.0] | 29.1 | 29.7 | 4.3 MB | 4.3 MB |
+| `acall`, a three-clause fn at its one-argument clause | 1,170.8 [1,170.7–1,171.3] | 237.0 [236.9–237.0] | 164.8 | 30.1 | 22.1 MB | 4.3 MB |
+| `vcall`, its variadic clause, one argument in its rest | 2,024.1 [2,023.6–2,024.3] | 713.8 [713.5–713.9] | 309.4 | 93.3 | 22.1 MB | 22.0 MB |
+| `fib`, a call | 190.0 [189.8–190.1] | 190.0 [189.9–190.1] | 25.2 | 25.2 | 4.3 MB | 4.2 MB |
+| `afib`, a call, each into the other clause | 1,314.4 [1,314.2–1,314.8] | 169.5 [169.5–169.5] | 208.2 | 25.2 | 22.1 MB | 4.2 MB |
+| `pcall`, a protocol method | 674.0 [674.0–674.2] | 674.0 [674.0–674.1] | 88.5 | 88.5 | 4.5 MB | 4.4 MB |
+| `mcall`, a multimethod | 2,169.0 [2,168.6–2,170.2] | 1,233.0 [1,230.7–1,233.1] | 396.5 | 187.3 | 22.3 MB | 4.6 MB |
+| `xform` less `cbbase`, a transducer step an element | 1,924.3 [1,922.6–1,925.7] | 460.8 [460.1–461.5] | 300.9 | 69.4 | 105.6 MB | 70.1 MB |
+
+A call of a clause costs a one-arity call and 6 instructions, the
+table's test, bounds check and load (`zig build codegen`: `fastCall`
+92 → 99 arm64 instructions, 134 → 142 on x86-64, the same 6 registers
+saved). On `-Dopcodes=true` builds an `acall` iteration dispatches 6
+instructions and calls no native, as `gcall`'s does, where it
+dispatched 14 and called `count` and `first`; an `afib` call 4.25
+dispatches, `fib`'s 4.5, against 14.75 and 2.5 natives; an `mcall`
+iteration 21 and one native (`#%mm-lookup`), against 29 and three. A
+call that allocates nothing never fills the collector's window, so the
+peak resident set falls to a one-arity program's; `vcall` still builds
+its rest list. Less `count`, as §3.28 counts them, the multimethod
+costs 1.91 protocol calls and 6.8 closure calls (1,175.1 against
+616.1 and 173.1), inside §3.28's target of 2 protocol calls and near
+its 6 closure calls. Every other program of the kit is within its range:
+`count` 58.0 → 57.9, `acc`, `lc`, `lv`, `mv`, `mvc`, `kw`, `leaf` and
+`getnl` the same to 0.1, the callback programs' within their
+collections' ranges (`cb` less `cbbase` 219.3 → 217.7 [216.8–220.1]).
+
+The `bench/compare` language programs, whole process, five
+interleaved rounds, the median instructions: every row within its
+range and 0.1% (`fib` 534.8 → 534.7 M, the destructuring loop
+3,320.9 → 3,321.7 M, the pipeline 2,433.4 → 2,433.4 M, `sort`
+2,581.8 → 2,580.4 M), the same peak resident sets; none calls a
+multi-arity fn in its loop. Startup (`-e nil`, 21 interleaved runs)
+is 22.30 M instructions before and 22.28 M after. The stdlib image,
+whose multi-arity `defn`s, transducer step fns and overloads carry 42
+tables, is 229,441 →
+221,190 bytes: 389 → 463 routines, 7,666 → 6,575 instructions, 756 →
+598 constants.
 
 ## 6. Levers and dead ends
 
@@ -1945,6 +2001,14 @@ Each lever is a measured change: a before/after from `zig build bench`
   the pipeline 2,544 → 2,491 M and its phase 39.4 → 36.8 ms; the
   destructuring loop 3,854 → 3,462 M and 156.7 → 131.2 ms.
 
+- *Per-arity entry points* (§3.30, `docs/VM.md` §5): a multi-arity
+  `fn` is a routine per clause over one arity table, entered at the
+  clause the count picks, with no rest list, `count`, `first` or
+  `nth`. A call of a three-clause fn 1,170.8 → 237.0 instructions
+  (a one-arity call is 231.0) and 22.1 → 4.3 MB at 10 M calls; a
+  multimethod call 2,169 → 1,233; a transducer step 1,924 → 461 an
+  element; every one-arity program unchanged.
+
 - *Locals clearing* (§3.29, `docs/COMPILER.md` §4.9): each
   `mov:move` of a slot no path reads again is `mov:move-clear`, which
   leaves the slot nil, so a lazy seq a local or a parameter holds is
@@ -2107,4 +2171,5 @@ is one invocation's 30-sample median.
 | §3.27, §6 "Trees opened on first use" and its dead ends | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); Datalevin 1.1.0; emdb `8e1ed1e` (a source snapshot under both builds); shared with concurrent sessions | 2026-10-07, txperf: `bin/nexis` built by `zig build install -Doptimize=fast` from snapshots of `0ef07a3` (before) and `a787b2f` (after) beside one emdb snapshot. The shapes: `txbench.py OUT 9 A,B plain,entity,upsert,one 2000 10000` over the probe program `tx.nx` (both kept with the raw output), each run in a fresh store under `/usr/bin/time -l`, under `tools/heavy` (1 core), 19:03 MDT, load 9.18 → 7.78; a rerun at load 20.3 → 21.4 gave the same instructions within 0.3%. The dead ends: the same harness, five rounds over four builds, load 6.48 → 9.56. Pages: a build of `0ef07a3` over emdb `dbc5c78` printing emdb's dirty-page count before each commit, the same program at both sizes. `bb bench/compare/run.clj --no-build --n 10 --only db --impls nexis --max-load 16` four times, after, before, after, before, 19:04–19:16 MDT, load 5.61 → 5.02. The Datalevin run: `run.clj --no-build --n 10 --only db --impls nexis,datalevin --max-load 16` with the after build, 19:34–19:38 MDT, load 19.96 → 4.26. The profile: `perf record -e instructions:u --call-graph lbr -F 900` and `perf script --inline` on the host of §3.15 (`taskset -c 0`, nexis at `a787b2f`'s source, emdb `dbc5c78`), `tx.nx STORE 200000 entity`; the before figure from `0ef07a3` over `tx1.nx`, the same shape without the 20,000 loaded first, 300,000 transactions. Raw output: `.git/revamp/r3/txperf/` (`profile/` holds the two `perf script` outputs and `split.py`, which reads the shares from them) |
 | §3.28 | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-07, multi: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` on `0ef07a3` with this section's commits, before §3.26's counting-loop step: at the micro-program commit, whose runtime is the multimethods commit's (before), and at the `#%mm-lookup` commit (after); `bb bench/micro/run.clj --rounds 5 --programs count,gcall,pcall,casek,mcall BEFORE AFTER` under `tools/heavy` (1 core), load 7.80 → 7.02; the dispatch and native counts from `-Dopcodes=true` builds of each, `mcall`, `pcall`, `gcall` and `casek` at 100,000 and 200,000 iterations, the difference per iteration; the one-arity figure from a probe program calling the same cache through a one-arity closure, at 1 M and 2 M. Raw output: `.git/revamp/r3/multi/` (`micro-AB.*`) |
 | §3.29, §6 "Locals clearing" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `24027c8`; shared with concurrent sessions | 2026-10-07 21:48–22:10 MDT, locals: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `97e2d11` (before) and `22d9391` (after), and with `-Dopcodes=true` at `97e2d11` and `6da3c15`. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program under `tools/heavy` (1 core), load 5.26 → 5.42. The memory rows: `cmds.py OUT 3` over `lazy3`, `lazyl`, `lazyf` at 3 M and 30 M, load 4.81 → 5.26. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.16 → 7.13; startup by `cmds.py OUT 21` over `-e nil`. `nexis-bench --filter compiler` twice per build, interleaved, after at `1d63d19`; the image generator, each tree's debug `nexis-imagegen`, `cmds.py OUT 7`. Raw output: `.git/revamp/r3/locals/` (`micro-final.*`, `mem.*`, `cmp.*`, `startup.*`, `cbench-*`, `imagegen.*`, `opcodes/`) |
+| §3.30, §6 "Per-arity entry points" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `19d9002`; shared with concurrent sessions | 2026-10-08, arity: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `fb51779` (before) and at the `expand` commit (after), and with `-Dopcodes=true` at each. Micro kit: `bb bench/micro/run.clj --rounds 5 BEFORE AFTER` over every program but the lazy pipelines under `tools/heavy` (1 core), load 13.01 → 7.85. The `bench/compare` language programs (`prelude.nx` and body) by `cmds.py OUT 5`, load 5.75 → 5.25; startup by `cmds.py OUT 21` over `-e nil`. Dispatch and native counts: `gcall`, `acall`, `vcall`, `mcall` and `xform` at 100,000 and 200,000, `fib` and `afib` at 20 and 22, the difference per unit. The image figures from each tree's `stdlib.image` header. Raw output: `.git/revamp/r3/arity2/` (`micro-AB.*`, `cmp.*`, `startup.*`, `opcodes/`) |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |

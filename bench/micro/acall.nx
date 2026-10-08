@@ -1,0 +1,4 @@
+; bench/micro/acall.nx N: count plus a call of a three-clause defn at its one-argument clause.
+(defn f ([] 0) ([x] x) ([x y] y))
+(let [n (parse-long (first *command-line-args*))]
+  (println (loop [i 0 k 0] (if (< i n) (recur (inc i) (f 7)) k))))
