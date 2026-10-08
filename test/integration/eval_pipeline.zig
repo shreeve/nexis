@@ -2812,7 +2812,7 @@ test "gc: a native that consumes its sequence lets the part it walked go" {
     }
 }
 
-test "gc: count, into, vec, set, take-last and the typed vectors consume the seq they walk" {
+test "gc: count, into, vec, take-last and the typed vectors consume the seq they walk" {
     // Each walks 300,000 mapped elements, about 6 MB of chunks, that the
     // local's slot, moved into the call's block, would keep through the
     // walk. A vector of every element is about 5 MB of its own.
@@ -2824,7 +2824,6 @@ test "gc: count, into, vec, set, take-last and the typed vectors consume the seq
         .{ "(let [s (map #(mod % 10) (range 300000))] (count (into {} (map (fn [x] [x x])) s)))", "10", "1" },
         .{ "(let [s (map #(mod % 10) (range 300000))] (count (into (sorted-set) s)))", "10", "1" },
         .{ "(let [s (map inc (range 300000))] (count (into #{} (map #(mod % 10)) s)))", "10", "1" },
-        .{ "(let [s (map #(mod % 10) (range 300000))] (count (set s)))", "10", "1" },
         .{ "(let [s (map inc (range 300000))] (count (vec s)))", "300000", "6" },
         .{ "(let [s (map inc (range 300000))] (count (into [] s)))", "300000", "6" },
         .{ "(let [s (map inc (range 300000))] (count (into [0] s)))", "300001", "6" },
@@ -2849,7 +2848,7 @@ test "gc: count, into, vec, set, take-last and the typed vectors consume the seq
     }
 }
 
-test "count, into, vec, set, take-last and the typed vectors give what they gave before consuming their seq" {
+test "count, into, vec, take-last and the typed vectors give what they gave before consuming their seq" {
     // Expected values from babashka, a set printed in nexis's order.
     try expectOutput("(let [s (map inc (range 5)) t s] [(count s) (vec s) (into [] s) (set s) (into () t) (reduce + t) (first s)])", "[5 [1 2 3 4 5] [1 2 3 4 5] #{1 2 3 4 5} (5 4 3 2 1) 15 1]");
     try expectOutput("(let [s (map inc (range 3))] [(count s) (count s) (vec s) (into [0] s) (into [] (map inc) s) s])", "[3 3 [1 2 3] [0 1 2 3] [2 3 4] (1 2 3)]");
@@ -7041,7 +7040,7 @@ test "gc: a native walking a lazy seq that collects at every step keeps what it 
     try expectOutputUnderGc("(defn skip [n] (lazy-seq (str (range 30)) (if (pos? n) (skip (dec n)) [:end]))) (first (skip 3000))", ":end");
 }
 
-test "gc: count, into, vec, set and take-last keep what they built from a seq that collects at every step" {
+test "gc: count, into, vec and take-last keep what they built from a seq that collects at every step" {
     // The elements are strings the steps made, which nothing but the
     // walked chain reaches once the native has consumed it.
     try expectOutputUnderGc(churn ++ chain ++ "[(count (chain 30)) (vec (chain 4)) (into [:x] (chain 3)) (into () (chain 3)) (into nil (chain 3)) (count (into #{} (chain 40))) (into {} (map (fn [s] [s (str s s)])) (chain 3))]", "[30 [4 3 2 1] [:x 3 2 1] (1 2 3) (1 2 3) 40 {3 33, 2 22, 1 11}]");

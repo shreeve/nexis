@@ -411,7 +411,7 @@ const core_natives = table("", .{
     .{ "vec", 1, 1, &fnVec, .consumes },
     .{ "hash-map", 0, null, &fnHashMap },
     .{ "hash-set", 0, null, &fnHashSet },
-    .{ "set", 1, 1, &fnSet, .consumes },
+    .{ "set", 1, 1, &fnSet },
     .{ "subvec", 2, 3, &fnSubvec },
     .{ "identical?", 2, 2, &fnIdenticalQ },
     .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc },
@@ -1889,14 +1889,15 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(set coll)` → the elements of any seqable as a hash set; a set
-/// itself without its metadata, as Clojure's. A lazy seq is consumed,
-/// as `into` consumes it.
+/// itself without its metadata, as Clojure's. Built from every element
+/// at once, each node allocated once, which costs half the cycles of
+/// conj'ing each on a transient at a million elements, so a lazy seq
+/// is not consumed: `(into #{} s)` consumes it (`docs/PERF.md` §3.31).
 fn fnSet(vm: *VM, args: []const Value) VmError!Value {
     if (isSet(args[0].kind())) {
         if (heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null) return args[0];
         return fnWithMeta(vm, &.{ args[0], value_mod.nilValue() });
     }
-    if (walksLazily(args[0])) return intoConsumed(vm, champ_mod.setEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory, args[0]);
     var items = try collectSeq(vm, args[0]);
     defer items.deinit(vm.allocator);
     return fnHashSet(vm, items.items);
@@ -2414,7 +2415,7 @@ fn vecConsumed(vm: *VM, s: Value) VmError!Value {
     return results.vector();
 }
 
-/// `(into to s)` of a lazy seq `into` or `set` consumes, conj'ing each
+/// `(into to s)` of a lazy seq `into` consumes, conj'ing each
 /// element as the walk hands it out (Clojure's `reduce conj`): in place
 /// on a transient over a vector, hash map or hash set, as
 /// `conjInPlace`, and one `conj` at a time onto anything else. `to`

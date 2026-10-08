@@ -51,19 +51,20 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 13. **A captured local, and the natives that walk without consuming,
     keep the seq.** The compiler clears a local or a parameter at its
     last move (`docs/COMPILER.md` §4.9), and the natives that walk a
-    sequence to its end (`reduce`, `count`, `into`, `vec`, `set`,
+    sequence to its end (`reduce`, `count`, `into`, `vec`,
     `frequencies`, ...) consume it (`docs/GC.md` §11.5), so `(let [s
     (map inc (range n))] (count s))` and `(defn total [xs] (reduce +
     xs))` run in constant memory (`docs/PERF.md` §3.29, §3.31).
-    `sort`, `sort-by`, `reverse`, `butlast`, `mapv`, `filterv`,
+    `sort`, `sort-by`, `set`, `reverse`, `butlast`, `mapv`, `filterv`,
     `apply`, `zipmap`, `select-keys` and `nexis.string/join` still hold
     their argument while they walk it (`docs/LAZY.md` §9): each needs
     `NativeFn.consumes` and a walk that roots what it keeps of the
-    elements behind its place. A local a closure
-    captures stays in its cell while the closure runs, so `(delay
-    (reduce + s))` holds `s` where Clojure clears a `^:once` body's
-    fields; clearing a cell needs a cell write `docs/VM.md` §6 rules
-    out, and its own design.
+    elements behind its place (`set` also a build as fast as its bulk
+    one, which a transient is not). A local a closure captures stays
+    in its cell while the closure runs, so `(delay (reduce + s))`
+    holds `s` where Clojure clears a `^:once` body's fields; clearing
+    a cell needs a cell write `docs/VM.md` §6 rules out, and its own
+    design.
 ## Store size
 
 5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's

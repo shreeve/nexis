@@ -402,7 +402,7 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   (`docs/VM.md` §9), so a lazy seq keeps what it realized for as long
   as a slot holds it. A native's call block is cleared when the native
   returns (`docs/VM.md` §6); `reduce`, like `frequencies`, `group-by`,
-  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`, `set`,
+  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
   `take-last`, `i64-vector` and `f64-vector`, consumes its sequence
   argument, clearing its slot in the block and keeping only its
   walk's place (`docs/GC.md` §11.5); and the compiler clears a local
@@ -424,9 +424,12 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
     keep it in the call's block while they walk, most building a
     result as long as the seq: `butlast`, `reverse`, `sort`,
     `sort-by`, `mapv`, `filterv`, `apply`, `zipmap`'s values,
-    `select-keys`'s keys and `nexis.string/join`. `nth`, `nthrest` and
-    `nthnext` walk their first argument, and a native consumes only
-    its last; `doall` returns the head it realized.
+    `select-keys`'s keys and `nexis.string/join`. `set` builds its set
+    from every element at once, half the cycles of conj'ing each on a
+    transient at a million elements (`docs/PERF.md` §3.31); `(into #{}
+    s)` consumes `s`. `nth`, `nthrest` and `nthnext` walk their first
+    argument, and a native consumes only its last; `doall` returns the
+    head it realized.
   - As in Clojure, a local bound outside a loop and read inside it is
     held for the whole loop, and so is one a `try`'s handler or
     finally reads, through the try's body.

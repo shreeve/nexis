@@ -366,7 +366,7 @@ make sure a root reaches it. What is rooted already:
   so a value a native passes to a callback is rooted by that call for
   no longer than the callee uses it. One exception: the last argument of a native that consumes
   it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
-  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`, `set`,
+  `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
   `take-last`, `i64-vector`, `f64-vector`), whose slot `call:call`
   clears once it has copied the arguments, so the head of a lazy seq
   passed straight in is not kept while the native realizes the rest;
