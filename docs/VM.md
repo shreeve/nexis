@@ -38,7 +38,9 @@ and `(v i)`), namespaces, Vars and the namespace registry.
 - Object files and tiered compilation. `bin/nexis disasm` prints
   routines (`docs/TOOLING.md` §2); `Routine.verify` checks each one
   before it runs (§5).
-- Per-PC liveness maps: the whole backing stack is a root (§9).
+- Per-PC liveness maps: the whole backing stack is a root (§9); the
+  compiler clears a local's slot at its last move instead
+  (`mov:move-clear`, §10.1; `docs/COMPILER.md` §4.9).
 - Unbounded recursion: the frame chain stops at `VM.max_frames` and
   native re-entry at the stack guard, both with a catchable
   `:stack-overflow` (§13, §13.1).

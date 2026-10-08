@@ -319,8 +319,10 @@ already marked, so the walk stops there.
 - **Transient ownership in the collector.** A transient is an ordinary
   block whose trace walks the wrapped collection; its owner token is
   the kind's business (`src/coll/transient.zig`).
-- **A per-PC liveness map.** The whole backing stack is a root, so a
-  dead slot retains its value until it is overwritten or grown into.
+- **A per-PC liveness map.** The whole backing stack is a root. The
+  compiler clears a local at its last move (`docs/COMPILER.md` §4.9);
+  any other dead slot, one read last in place or above a popped frame,
+  retains its value until it is overwritten or grown into.
 - **Collection in a sub-VM.** Its garbage is the owner's to collect
   after it returns.
 
