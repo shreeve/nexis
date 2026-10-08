@@ -322,12 +322,14 @@ pub fn writeEntity(buf: *[entity_key_max]u8, e: u64) []const u8 {
         .{ 2, e - user_partition_start }
     else
         .{ 3, e - tx_partition_bit };
-    const n: usize = (64 - @clz(offset) + 7) / 8;
-    buf[0] = (class << 4) | @as(u8, @intCast(n));
+    // The header and the offset's bytes left-aligned in one word, so
+    // every length takes one store and no branch.
+    const n: u6 = @intCast((64 - @clz(offset) + 7) / 8);
+    const word = (@as(u64, (class << 4) | n) << 56) | (offset << (8 * (7 - n)));
     var be: [8]u8 = undefined;
-    std.mem.writeInt(u64, &be, offset, .big);
-    @memcpy(buf[1..][0..n], be[8 - n ..]);
-    return buf[0 .. 1 + n];
+    std.mem.writeInt(u64, &be, word, .big);
+    buf.* = be[0..entity_key_max].*;
+    return buf[0 .. 1 + @as(usize, n)];
 }
 
 pub fn appendEntity(out: *std.ArrayList(u8), gpa: Allocator, e: u64) !void {
@@ -349,8 +351,15 @@ pub fn readEntity(in: []const u8) DecodeError!struct { e: u64, len: usize } {
     const n: usize = in[0] & 0x0F;
     if (class < 1 or class > 3 or n > 6 or in.len < 1 + n) return error.Corrupted;
     if (n > 0 and in[1] == 0) return error.Corrupted;
-    var offset: u64 = 0;
-    for (in[1..][0..n]) |b| offset = (offset << 8) | b;
+    // In a key long enough, one load and a shift right by the bytes the
+    // offset does not take; a header alone shifts to zero.
+    const offset: u64 = if (in.len >= 8)
+        (std.mem.readInt(u64, in[0..8], .big) & 0x00FF_FFFF_FFFF_FFFF) >> @intCast(8 * (7 - n))
+    else blk: {
+        var x: u64 = 0;
+        for (in[1..][0..n]) |b| x = (x << 8) | b;
+        break :blk x;
+    };
     const e = switch (class) {
         1 => if (offset == 0 or offset >= attr_partition_end) return error.Corrupted else offset,
         2 => if (offset >= user_partition_end - user_partition_start) return error.Corrupted else user_partition_start + offset,
