@@ -42,7 +42,12 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    (`docs/PERF.md` §3.15): emdb syncs data, then meta, with two
    `fdatasync`, where Datalevin issues one and an `O_DSYNC` meta
    write. The commit protocol is emdb's; nexis changes nothing in emdb
-   (`AGENTS.md`), so this is the engine owner's call.
+   (`AGENTS.md`), so this is the engine owner's call. emdb needs the
+   two ordered barriers, data before the meta page (its INV-T07A and
+   INV-M02; it keeps no write-ahead log); a cheaper second barrier, an
+   `fdatasync` of the data then a `pwrite` of the meta page through an
+   `O_DSYNC` descriptor, keeps that order, and is an emdb candidate
+   with this measurement as its reason, not yet scheduled.
 
 13. **A captured local, and the natives that walk without consuming,
     keep the seq.** The compiler clears a local or a parameter at its
@@ -120,10 +125,13 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     format is not frozen and emdb does not migrate a file between
     formats, so a release may refuse a store another release wrote
     (`docs/DB.md` §1, `docs/NEXTOMIC.md` §2), and users recreate or
-    re-import their stores after upgrading. Once emdb freezes its
-    format, set the policy: which releases read which stores, and
-    whether nexis carries a tool that exports a store and imports it
-    into a new one.
+    re-import their stores after upgrading. emdb keeps one current
+    format, changed when a measured gain justifies it, with no freeze
+    planned; it names both versions when it refuses a file, and its
+    own dump and load (`emdb -d`, `emdb -l`) carry a store across a
+    format change. If emdb freezes its format, set the policy: which
+    releases read which stores, and whether nexis carries a tool that
+    exports a store and imports it into a new one.
 
 ## Deferred design
 
