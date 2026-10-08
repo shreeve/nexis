@@ -369,7 +369,9 @@ make sure a root reaches it. What is rooted already:
   no longer than the callee uses it. One exception: the last argument of a native that consumes
   it (`NativeFn.consumes`: `reduce`, `frequencies`, `group-by`,
   `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
-  `take-last`, `i64-vector`, `f64-vector`), whose slot `call:call`
+  `take-last`, `i64-vector`, `f64-vector`, `reverse`, `butlast`,
+  `mapv`, `filterv`, `apply`, `select-keys`, `nexis.string/join`),
+  whose slot `call:call`
   clears once it has copied the arguments, so the head of a lazy seq
   passed straight in is not kept while the native realizes the rest;
   `count` is a leaf, and only its general path, which a lazy seq
@@ -384,7 +386,11 @@ make sure a root reaches it. What is rooted already:
   such a step; `vec` and `into` an empty vector put each in a
   `Results`, `into` anything else conj's it at once onto a result
   kept in a slot, `take-last` keeps the last n in slots used as a
-  ring); an `iterate`'s function or a `cycle`'s source,
+  ring; `reverse`, `butlast` and `apply` put each in a `Results` too,
+  `mapv` and `filterv` each result or kept element, `select-keys`
+  conj's what it finds onto a result kept in a slot, and
+  `nexis.string/join` writes each element's text before the next
+  step); an `iterate`'s function or a `cycle`'s source,
   reached from the argument, stays rooted through it. `into` with a
   transducer passes its argument to a closure, whose parameter holds
   it until its last move (`docs/COMPILER.md` §4.9). Reached by

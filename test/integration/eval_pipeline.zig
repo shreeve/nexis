@@ -2848,6 +2848,40 @@ test "gc: count, into, vec, take-last and the typed vectors consume the seq they
     }
 }
 
+test "gc: reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join consume the seq they walk" {
+    // Each walks 300,000 mapped elements, about 6 MB of chunks (and
+    // 300,000 strings beside them for `join`), that the local's slot,
+    // moved into the call's block, would keep through the walk. A
+    // vector or a list of every element is about 5 MB of its own, and
+    // so is what `apply` keeps of the elements to pass on.
+    for ([_][3][]const u8{
+        .{ "(let [s (map inc (range 300000))] (first (reverse s)))", "300000", "6" },
+        .{ "(defn r [xs] (reverse xs)) (first (r (map inc (range 300000))))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (butlast s)))", "299999", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (mapv inc s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (mapv + (range 300000) s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (filterv even? s)))", "150000", "3" },
+        .{ "(let [s (map inc (range 300000))] (apply max s))", "300000", "5" },
+        .{ "(let [s (map inc (range 300000))] (select-keys {1 :a 300000 :b} s))", "{1 :a, 300000 :b}", "1" },
+        .{ "(let [s (map str (range 300000))] (count (nexis.string/join \",\" s)))", "1988889", "3" },
+        .{ "(let [s (map inc (range 300000))] (count (nexis.string/join s)))", "1688895", "3" },
+    }) |case| {
+        errdefer std.debug.print("consuming case {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[0]), case[1]);
+        const mb = try std.fmt.parseInt(usize, case[2], 10);
+        errdefer std.debug.print("peak {d} bytes\n", .{heap.peak_live_bytes -| start});
+        try testing.expect(heap.peak_live_bytes -| start < mb << 20);
+    }
+}
+
 test "count, into, vec, take-last and the typed vectors give what they gave before consuming their seq" {
     // Expected values from babashka, a set printed in nexis's order.
     try expectOutput("(let [s (map inc (range 5)) t s] [(count s) (vec s) (into [] s) (set s) (into () t) (reduce + t) (first s)])", "[5 [1 2 3 4 5] [1 2 3 4 5] #{1 2 3 4 5} (5 4 3 2 1) 15 1]");
@@ -2857,6 +2891,19 @@ test "count, into, vec, take-last and the typed vectors give what they gave befo
     try expectOutput("[(vec (map inc ())) (into [] (map inc ())) (count (map inc ())) (set (map inc ())) (into [] (take 3) (iterate inc 0)) (vec (take 4 (iterate inc 0))) (count (take 5 (cycle [1 2])))]", "[[] [] 0 #{} [0 1 2] [0 1 2 3] 5]");
     try expectOutput("[(take-last 2 (map inc (range 5))) (take-last 0 (map inc (range 5))) (take-last 10 (map inc (range 3))) (take-last 3 (map inc ())) (take-last 3 (map inc (range 7))) (take-last 2.5 (map inc (range 7)))]", "[(4 5) nil (1 2 3) nil (5 6 7) (5 6 7)]");
     try expectOutput("[(vec (i64-vector (map inc (range 3)))) (vec (f64-vector (map inc (range 3)))) (try (i64-vector (map identity [1 :a])) (catch :kind-mismatch e :km))]", "[[1 2 3] [1.0 2.0 3.0] :km]");
+}
+
+test "reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join give what they gave before consuming their seq" {
+    // Expected values from babashka (clojure.string/join), but for the
+    // text of a lazy seq (LAZY.md §9).
+    try expectOutput("(let [s (map inc (range 5)) t s] [(reverse s) (butlast s) (mapv inc s) (filterv odd? s) (select-keys {1 :a 3 :b 9 :c} s) (nexis.string/join \",\" s) (reduce + t) (first s) (vec t)])", "[(5 4 3 2 1) (1 2 3 4) [2 3 4 5 6] [1 3 5] {1 :a, 3 :b} 1,2,3,4,5 15 1 [1 2 3 4 5]]");
+    try expectOutput("[(reverse (map inc ())) (butlast (map inc ())) (butlast (map inc (range 1))) (butlast (map inc (range 2))) (mapv + (map inc (range 3)) (map inc (range 5))) (filterv odd? (map inc ())) (select-keys {} (map inc (range 3))) (nexis.string/join (map inc ())) (nexis.string/join \"-\" (map identity [nil \"a\" \\b 1 :k [1] (map inc [1 2])]))]", "[() nil nil (1) [2 4 6] [] {}  -a-b-1-:k-[1]-(2 3)]");
+    // Either side of a vector leaf's 32, an even and an odd count.
+    try expectOutput("(vec (for [n [32 33 34 64 65 70]] (let [s (map inc (range n))] [(= (reverse s) (range n 0 -1)) (= (butlast s) (range 1 n)) (= (mapv inc s) (range 2 (+ n 2))) (= (filterv even? s) (range 2 (inc n) 2))])))", "[[true true true true] [true true true true] [true true true true] [true true true true] [true true true true] [true true true true]]");
+    try expectOutput("[(reverse [1 2 3]) (reverse (range 40 0 -1)) (butlast (range 5)) (reverse \"abc\") (butlast \"abcd\") (reverse {:a 1}) (butlast {:a 1 :b 2}) (reverse nil) (butlast nil) (reverse (sorted-set 3 1 2)) (mapv vector {:a 1} (map inc (range 3))) (select-keys [:a :b :c] (map inc (range 3))) (select-keys (sorted-map 1 2 3 4) (map identity [3 5])) (nexis.string/join \",\" (range 3)) (nexis.string/join \",\" [1 2]) (nexis.string/join \", \" (map str (range 3)))]", "[(3 2 1) (1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40) (0 1 2 3) (c b a) (a b c) ([:a 1]) ([:a 1]) () nil (3 2 1) [[[:a 1] 1]] {1 :b, 2 :c} {3 4} 0,1,2 1,2 0, 1, 2]");
+    try expectOutput("(let [s (map inc (range 5)) t s] [(apply + 10 s) (apply vector :a s) (zipmap [:a :b :c] s) (zipmap (map inc (range 3)) s) (vec t)])", "[25 [:a 1 2 3 4 5] {:a 1, :b 2, :c 3} {1 1, 2 2, 3 3} [1 2 3 4 5]]");
+    try expectOutput("[(apply + (map inc ())) (apply list (map inc (range 3))) (zipmap [:a :b] (range)) (zipmap [:a :b] (repeat 7)) (zipmap {:x 1 :y 2} (map inc (range 5))) (zipmap (map inc (range 3)) {:x 1}) (zipmap [] (range)) (zipmap (sorted-map 1 2) \"ab\") (apply str (map inc (range 40)))]", "[0 (1 2 3) {:a 0, :b 1} {:a 7, :b 7} {[:x 1] 1, [:y 2] 2} {1 [:x 1]} {} {[1 2] a} 12345678910111213141516171819202122232425262728293031323334353637383940]");
+    try expectOutput("(let [s (map inc (range 70))] [(= (apply vector s) (vec (range 1 71))) (= (zipmap (range 70) s) (zipmap (range 70) (range 1 71)))])", "[true true]");
 }
 
 test "gc: a seq a local or a parameter holds is let go at its last move (COMPILER.md §4.9)" {
@@ -7076,6 +7123,14 @@ test "gc: count, into, vec and take-last keep what they built from a seq that co
     // A lazy target realized while a map source's entries, built by
     // the walk, wait to be conj'd onto it.
     try expectOutputUnderGc(churn ++ "(let [m (zipmap (map str (range 40)) (range 40))] (= (set (into (map (fn [x] (churn x) x) [1]) m)) (conj (set m) 1)))", "true");
+}
+
+test "gc: reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join keep what they built from a seq that collects at every step" {
+    // The elements are strings the steps made, which nothing but the
+    // walked chain reaches once the native has consumed it.
+    try expectOutputUnderGc(churn ++ chain ++ "[(reverse (chain 40)) (butlast (chain 40)) (count (butlast (chain 3))) (mapv (fn [s] (churn 1) (str s \"!\")) (chain 3)) (filterv (fn [s] (churn 2) (odd? (count s))) (chain 12)) (nexis.string/join \",\" (chain 5)) (nexis.string/join (map (fn [x] (churn x) (map inc [x x])) (range 3)))]", "[(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40) (40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2) 2 [3! 2! 1!] [9 8 7 6 5 4 3 2 1] 5,4,3,2,1 (1 1)(2 2)(3 3)]");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [z (zipmap (map str (range 40)) (range 40))] [(= (select-keys z (chain 40)) (dissoc z \"0\")) (select-keys (sorted-map-by (fn [a b] (churn 1) (compare a b)) \"1\" 1 \"2\" 2) (chain 3)) (mapv (fn [a b] (churn 3) (str a b)) (chain 3) (chain 3))])", "[true {2 2, 1 1} [33 22 11]]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(apply str (chain 12)) (apply (fn [& xs] (churn 1) (count xs)) (chain 30)) (let [z (zipmap (range 40) (chain 40))] [(count z) (z 0) (z 39)]) (zipmap (chain 3) (chain 3)) (zipmap {:a 1 :b 2} (chain 2))]", "[121110987654321 30 [40 40 1] {3 3, 2 2, 1 1} {[:a 1] 2, [:b 2] 1}]");
 }
 
 test "gc: sequence and eduction keep the seq they took of a source that is not one across the transducer's calls" {

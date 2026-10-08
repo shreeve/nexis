@@ -285,7 +285,7 @@ const core_natives = table("", .{
     .{ "odd?", 1, 1, &fnOddQ, .leaf },
     .{ "even?", 1, 1, &fnEvenQ, .leaf },
     // apply + HOFs.
-    .{ "apply", 2, null, &fnApply },
+    .{ "apply", 2, null, &fnApply, .consumes },
     .{ "map", 1, null, &fnMap },
     .{ "reduce", 2, 3, &fnReduce, .consumes },
     .{ "reduce-kv", 3, 3, &fnReduceKv },
@@ -298,8 +298,8 @@ const core_natives = table("", .{
     .{ "concat", 0, null, &fnConcat },
     .{ "mapcat", 1, null, &fnMapcat },
     .{ "into", 0, 3, &fnInto, .consumes },
-    .{ "mapv", 2, null, &fnMapv },
-    .{ "filterv", 2, 2, &fnFilterv },
+    .{ "mapv", 2, null, &fnMapv, .consumes },
+    .{ "filterv", 2, 2, &fnFilterv, .consumes },
     .{ "map-indexed", 1, 2, &fnMapIndexed },
     .{ "keep-indexed", 1, 2, &fnKeepIndexed },
     .{ "distinct", 0, 1, &fnDistinct },
@@ -309,9 +309,9 @@ const core_natives = table("", .{
     .{ "zipmap", 2, 2, &fnZipmap },
     .{ "take-while", 1, 2, &fnTakeWhile },
     .{ "drop-while", 1, 2, &fnDropWhile },
-    .{ "butlast", 1, 1, &fnButlast },
+    .{ "butlast", 1, 1, &fnButlast, .consumes },
     .{ "last", 1, 1, &fnLast, .consumes },
-    .{ "reverse", 1, 1, &fnReverse },
+    .{ "reverse", 1, 1, &fnReverse, .consumes },
     .{ "nthrest", 2, 2, &fnNthrest },
     .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext },
     .{ "take-last", 2, 2, &fnTakeLast, .consumes },
@@ -321,7 +321,7 @@ const core_natives = table("", .{
     .{ "cycle", 1, 1, &fnCycle },
     .{ "max-key", 2, null, &fnMaxKey },
     .{ "min-key", 2, null, &fnMinKey },
-    .{ "select-keys", 2, 2, &fnSelectKeys },
+    .{ "select-keys", 2, 2, &fnSelectKeys, .consumes },
     .{ "find", 2, 2, &fnFind },
     .{ "key", 1, 1, &fnKey },
     .{ "val", 1, 1, &fnVal },
@@ -536,7 +536,7 @@ const string_natives = table("nexis.string", .{
     .{ "includes?", 2, 2, &fnStringIncludesQ },
     .{ "index-of", 2, 3, &fnStringIndexOf },
     .{ "last-index-of", 2, 3, &fnStringLastIndexOf },
-    .{ "join", 1, 2, &fnStringJoin },
+    .{ "join", 1, 2, &fnStringJoin, .consumes },
     .{ "replace", 3, 3, &fnStringReplace },
     .{ "replace-first", 3, 3, &fnStringReplaceFirst },
     .{ "re-quote-replacement", 1, 1, &fnStringReQuoteReplacement },
@@ -1552,22 +1552,29 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // between the calls decided at the first.
 
 /// `(apply f x1 x2 ... xs)` calls `f` with the elements of
-/// the last arg seq spliced in after the leading args.
+/// the last arg seq spliced in after the leading args. `xs` is
+/// consumed: a lazy seq's elements wait in a `Results` as the walk
+/// hands them out, so the realized seq behind the walk is garbage
+/// while it goes on.
 fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const last = args[args.len - 1];
-
-    // Materialize the final arg list.
     var combined: std.ArrayList(Value) = .empty;
     defer combined.deinit(vm.allocator);
-    // Leading args (between f and the seq).
-    var i: usize = 1;
-    while (i < args.len - 1) : (i += 1) {
-        combined.append(vm.allocator, args[i]) catch return VmError.OutOfMemory;
+    combined.appendSlice(vm.allocator, args[1 .. args.len - 1]) catch return VmError.OutOfMemory;
+    // The built elements are the call's arguments (GC.md §11.5, class 2);
+    // a walk that runs no code cannot collect before the call.
+    if (!walksLazily(last)) {
+        try appendSeqValues(vm, last, &combined);
+        return try vm.callValue(f, combined.items);
     }
-    // Walk `last` as a seq.
-    try appendSeqValues(vm, last, &combined);
-    // The built elements are the call's arguments (GC.md §11.5, class 2).
+    const scope = vm.rootScope();
+    defer scope.release();
+    var results = try consumedInto(vm, last, scope);
+    defer results.release();
+    var c = vector_mod.Cursor.init(try results.vector());
+    combined.ensureUnusedCapacity(vm.allocator, c.count) catch return VmError.OutOfMemory;
+    while (c.next()) |x| combined.appendAssumeCapacity(x);
     return try vm.callValue(f, combined.items);
 }
 
@@ -1586,10 +1593,13 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 /// to `results`, which roots each as it comes. One coll is walked a
 /// run at a time (a vector's leaf, a lazy chunk), each run's calls
 /// made in batches whose results go straight where `results` keeps
-/// them (VM.md §6); `held` is a root slot `nextChunk` may write.
-fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usize) VmError!void {
+/// them (VM.md §6); `held` is a root slot `nextChunk` may write, and
+/// `cursor` the root slot that holds the last coll, which `mapv`
+/// consumes: its walk keeps its place there (`SeqIter.cursor`).
+fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usize, cursor: usize) VmError!void {
     if (colls.len == 1) {
         var it = try makeSeqIter(vm, colls[0]);
+        it.cursor = cursor;
         var cb = vm_mod.Callback.init(vm, f, 1);
         var buf: [results_chunk]Value = undefined;
         while (try nextRun(&it, &buf, held)) |xs| {
@@ -1612,6 +1622,7 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usi
     const iters = vm.allocator.alloc(SeqIter, colls.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(iters);
     for (colls, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
+    iters[colls.len - 1].cursor = cursor;
     const call_args = vm.allocator.alloc(Value, colls.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
     var cb = vm_mod.Callback.init(vm, f, @intCast(colls.len));
@@ -1850,9 +1861,11 @@ const Sieve = enum { keep_truthy, keep_falsy, keep_result };
 /// it comes. An element the walk built (a map's entry) waits in the
 /// root slot `held` while the predicate runs, since the predicate may
 /// `recur` over its argument, and in `results` once kept; one dropped
-/// is garbage (GC.md §11.5, class 4).
-fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, held: usize) VmError!void {
+/// is garbage (GC.md §11.5, class 4). `coll` is consumed: the root slot
+/// `cursor` holds it, and its walk keeps its place there.
+fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, held: usize, cursor: usize) VmError!void {
     var it = try makeSeqIter(vm, coll);
+    it.cursor = cursor;
     var cb = vm_mod.Callback.init(vm, pred, 1);
     var buf: [results_chunk]Value = undefined;
     while (try nextRun(&it, &buf, held)) |xs| {
@@ -2546,12 +2559,14 @@ fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
             try scope.push(c.*);
         },
     };
-    // A slot the walk may write, below the scope `Results` opens.
+    // A slot the walk may write and the last coll, which is consumed,
+    // below the scope `Results` opens.
     try scope.push(value_mod.nilValue());
     const held = vm.roots.items.len - 1;
+    try scope.push(colls[colls.len - 1]);
     var results = Results.init(vm);
     defer results.release();
-    try mapInto(vm, args[0], colls, &results, held);
+    try mapInto(vm, args[0], colls, &results, held, held + 1);
     return results.vector();
 }
 
@@ -2559,9 +2574,10 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
     try scope.push(value_mod.nilValue());
+    try scope.push(args[1]);
     var results = Results.init(vm);
     defer results.release();
-    try sieveInto(vm, .keep_truthy, args[0], args[1], &results, scope.base);
+    try sieveInto(vm, .keep_truthy, args[0], args[1], &results, scope.base, scope.base + 1);
     return results.vector();
 }
 
@@ -2645,12 +2661,13 @@ fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(butlast coll)` → all but the last element, nil when fewer
-/// than two.
+/// than two. `coll` is consumed (`consumedInto`).
 fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
-    var items = try collectSeq(vm, args[0]);
-    defer items.deinit(vm.allocator);
-    if (items.items.len < 2) return value_mod.nilValue();
-    return try buildListFromSlice(vm, items.items[0 .. items.items.len - 1]);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var results = try consumedInto(vm, args[0], scope);
+    defer results.release();
+    return results.butlastList();
 }
 
 /// `(last coll)` → the last element, nil when there is none: an O(1)
@@ -2677,12 +2694,28 @@ fn fnLast(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(reverse coll)` → a list of the elements in reverse order, `()`
-/// when there are none.
+/// when there are none. `coll` is consumed (`consumedInto`).
 fn fnReverse(vm: *VM, args: []const Value) VmError!Value {
-    var items = try collectSeq(vm, args[0]);
-    defer items.deinit(vm.allocator);
-    std.mem.reverse(Value, items.items);
-    return try buildListFromSlice(vm, items.items);
+    const scope = vm.rootScope();
+    defer scope.release();
+    var results = try consumedInto(vm, args[0], scope);
+    defer results.release();
+    return results.reversedList();
+}
+
+/// Every element of `coll`, which the caller consumes, in a `Results`
+/// as the walk hands them out, so the realized seq behind the walk is
+/// garbage while the result grows. `scope` takes the walk's place and
+/// the slot `nextRun` may write; the caller releases the `Results`
+/// before it.
+fn consumedInto(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!Results {
+    try scope.push(value_mod.nilValue());
+    var it = try consumingSeqIter(vm, coll, scope);
+    var results = Results.init(vm);
+    errdefer results.release();
+    var buf: [results_chunk]Value = undefined;
+    while (try nextRun(&it, &buf, scope.base)) |xs| try results.addAll(xs);
+    return results;
 }
 
 /// A count argument of a sequence function (`take`, `drop`, `nthrest`,
@@ -2877,7 +2910,7 @@ fn fnMinKey(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(select-keys m ks)` → map of the entries of m whose keys are
 /// in ks; a vector's entries are its `[index element]` pairs, as
-/// for `find`.
+/// for `find`. `ks` is consumed.
 fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
@@ -2888,17 +2921,19 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     }
     // A sorted source's comparator can collect inside `find`, and a
     // lazy key seq's next step can (GC.md §11.5, classes 4 and 5): the
-    // result so far and the keys the walk built are kept rooted.
+    // result so far waits in a root slot, the walk keeps its place in
+    // the next, and the keys it built (a map's entries) are pushed
+    // after them. The key in hand is reachable from the walk's place.
     const scope = vm.rootScope();
     defer scope.release();
-    const collects = (src.kind() == .sorted_map and !sorted_mod.comparatorOf(src).isNil()) or args[1].kind() == .lazy_seq;
-    if (collects) try scope.push(out);
-    var ks = if (collects) try rootedSeqIter(vm, args[1], scope) else try makeSeqIter(vm, args[1]);
+    try scope.push(out);
+    var ks = try consumingSeqIter(vm, args[1], scope);
+    ks.roots = scope;
     while (try ks.next()) |k| {
         const entry = try fnFind(vm, &.{ src, k });
         if (entry.isNil()) continue;
         out = try mapPut(heap, out, k, vector_mod.nth(entry, 1));
-        if (collects) try scope.push(out);
+        vm.roots.items[scope.base] = out;
     }
     return out;
 }
@@ -5675,22 +5710,30 @@ fn fnStringReplaceFirst(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` → the
 /// elements of any seqable as `str` makes them text (nil is empty),
-/// separated by `sep`.
+/// separated by `sep`. `coll` is consumed: a lazy seq is walked once,
+/// its text written as the walk hands out each element, so the
+/// realized seq behind the walk is garbage while the text grows.
 fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     const sep: []const u8 = if (args.len == 2) blk: {
         if (args[0].kind() != .string) return VmError.KindMismatch;
         break :blk string_mod.asBytes(args[0]);
     } else "";
     const coll = args[args.len - 1];
-    if (try joinPlain(vm, sep, coll)) |joined| return joined;
+    if (!walksLazily(coll)) if (try joinPlain(vm, sep, coll)) |joined| return joined;
     var w = std.Io.Writer.Allocating.init(vm.allocator);
     defer w.deinit();
-    var it = try makeSeqIter(vm, coll);
+    // Making an element text may run code (a lazy seq's printing
+    // realizes it), which may collect.
+    const scope = vm.rootScope();
+    defer scope.release();
+    var it = try consumingSeqIter(vm, coll, scope);
     var first = true;
     while (try it.next()) |x| {
         if (!first) w.writer.writeAll(sep) catch return VmError.OutOfMemory;
         first = false;
-        try appendStrValue(vm, &w, x);
+        if (x.kind() == .string) {
+            w.writer.writeAll(string_mod.asBytes(x)) catch return VmError.OutOfMemory;
+        } else try appendStrValue(vm, &w, x);
     }
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch VmError.OutOfMemory;
 }
@@ -5698,7 +5741,8 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
 /// `join` of a collection whose elements are all nil, strings, chars
 /// or fixnums: measured in one walk, written in a second into a
 /// string of that length. Null at the first element that is not, for
-/// the printer's path.
+/// the printer's path. `coll` is no lazy seq whose walk runs code
+/// (`walksLazily`), so nothing collects.
 fn joinPlain(vm: *VM, sep: []const u8, coll: Value) VmError!?Value {
     var len: usize = 0;
     var n: usize = 0;
@@ -6442,6 +6486,23 @@ const Results = struct {
         return .{ .n = n, .out = .{ .roots = at } };
     }
 
+    /// Every value of `xs`, a tail's worth at a time once the scope's
+    /// first 32 have moved into the vector.
+    fn addAll(self: *Results, xs: []const Value) VmError!void {
+        var rest = xs;
+        while (rest.len > 0) {
+            if (self.building == null or self.fill == results_chunk) {
+                try self.addOther(rest[0]);
+                rest = rest[1..];
+                continue;
+            }
+            const k = @min(rest.len, results_chunk - self.fill);
+            @memcpy(self.slots[self.fill..][0..k], rest[0..k]);
+            self.fill += k;
+            rest = rest[k..];
+        }
+    }
+
     noinline fn addOther(self: *Results, v: Value) VmError!void {
         if (self.fill == results_chunk) try self.openTail();
         if (self.building != null) self.slots[self.fill] = v else try self.scope.push(v);
@@ -6471,6 +6532,35 @@ const Results = struct {
         return transient_mod.persistentBang(t) catch VmError.OutOfMemory;
     }
 
+    /// The result as a list without its last value, nil when it holds
+    /// fewer than two (`butlast`). A long one drops it from the
+    /// transient in place.
+    fn butlastList(self: *Results) VmError!Value {
+        const t = self.building orelse {
+            const items = scopeItems(self.scope);
+            if (items.len < 2) return value_mod.nilValue();
+            return buildListFromSlice(self.vm, items[0 .. items.len - 1]);
+        };
+        transient_mod.vectorCloseTailBang(t, @intCast(self.fill)) catch return VmError.OutOfMemory;
+        _ = transient_mod.vectorPopBang(self.heap, t) catch return VmError.OutOfMemory;
+        const v = transient_mod.persistentBang(t) catch return VmError.OutOfMemory;
+        return list_mod.ofVector(self.heap, v, 0) catch VmError.OutOfMemory;
+    }
+
+    /// The result as a list, its values in the reverse of the order
+    /// they came (`reverse`): reversed where they wait, on the scope,
+    /// or in the vector the transient made, which nothing else has
+    /// reached (`reverseFresh`).
+    fn reversedList(self: *Results) VmError!Value {
+        const t = self.building orelse {
+            std.mem.reverse(Value, self.vm.roots.items[self.scope.base..]);
+            return buildListFromSlice(self.vm, scopeItems(self.scope));
+        };
+        const v = try self.finish(t);
+        reverseFresh(v);
+        return list_mod.ofVector(self.heap, v, 0) catch VmError.OutOfMemory;
+    }
+
     /// The result as a list (`buildListFromSlice`'s shape).
     fn list(self: *Results) VmError!Value {
         const t = self.building orelse return buildListFromSlice(self.vm, scopeItems(self.scope));
@@ -6483,6 +6573,27 @@ const Results = struct {
         return self.finish(t);
     }
 };
+
+/// Reverse `v` in its own storage, a leaf at a time from both ends.
+/// Only for a vector the caller has just built, whose nodes nothing
+/// else has reached and whose hash is not yet cached: the one place a
+/// persistent vector's elements change.
+fn reverseFresh(v: Value) void {
+    const mask = vector_mod.branch_factor - 1;
+    const n = vector_mod.count(v);
+    if (n < 2) return;
+    var i: usize = 0;
+    var j: usize = n - 1;
+    while (i < j) {
+        const left = @constCast(vector_mod.chunkFrom(v, i));
+        const base = j & ~@as(usize, mask);
+        const right = @constCast(vector_mod.chunkFrom(v, base));
+        const k = @min(left.len, j - base + 1, (j - i + 1) / 2);
+        for (0..k) |d| std.mem.swap(Value, &left[d], &right[j - base - d]);
+        i += k;
+        j -= k;
+    }
+}
 
 /// How many values `Results` keeps waiting on the root stack, and
 /// writes into each open tail: one vector leaf's worth.

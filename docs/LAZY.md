@@ -403,8 +403,9 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   as a slot holds it. A native's call block is cleared when the native
   returns (`docs/VM.md` §6); `reduce`, like `frequencies`, `group-by`,
   `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
-  `take-last`, `i64-vector` and `f64-vector`, consumes its sequence
-  argument, clearing its slot in the block and keeping only its
+  `take-last`, `i64-vector`, `f64-vector`, `reverse`, `butlast`,
+  `mapv`, `filterv`, `apply`, `select-keys` and `nexis.string/join`,
+  consumes its sequence argument, clearing its slot in the block and keeping only its
   walk's place (`docs/GC.md` §11.5); and the compiler clears a local
   or a parameter at its last move, the last time it is passed to a
   call or moved by a `let` or a `recur` (`docs/COMPILER.md` §4.9). So
@@ -420,16 +421,18 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
     closure: `(delay (reduce + s))` holds `s` while its body runs,
     where Clojure clears a `^:once` body's fields (`lazy-seq`,
     `delay`, `future`).
-  - The natives that walk to the end without consuming their argument
-    keep it in the call's block while they walk, most building a
-    result as long as the seq: `butlast`, `reverse`, `sort`,
-    `sort-by`, `mapv`, `filterv`, `apply`, `zipmap`'s values,
-    `select-keys`'s keys and `nexis.string/join`. `set` builds its set
-    from every element at once, half the cycles of conj'ing each on a
+  - Four natives walk to the end without consuming their argument and
+    keep it in the call's block while they walk. `sort` and `sort-by`
+    gather every element before they sort. `set` builds its set from
+    every element at once, half the cycles of conj'ing each on a
     transient at a million elements (`docs/PERF.md` §3.31); `(into #{}
-    s)` consumes `s`. `nth`, `nthrest` and `nthnext` walk their first
-    argument, and a native consumes only its last; `doall` returns the
-    head it realized.
+    s)` consumes `s`. `zipmap` keeps every value with its key until it
+    builds the map, and its keys argument, which it does not consume,
+    holds a chain of its own: rooting the values as the walk passed
+    them saved 5–9% of the peak and cost 2% more instructions
+    (`docs/PERF.md`, "Consuming natives, the rest"). `nth`, `nthrest`
+    and `nthnext` walk their first argument, and a native consumes
+    only its last; `doall` returns the head it realized.
   - As in Clojure, a local bound outside a loop and read inside it is
     held for the whole loop, and so is one a `try`'s handler or
     finally reads, through the try's body.
