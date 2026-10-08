@@ -4632,14 +4632,16 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    /// Nil is the all-zero value, so the clear is two stores of zero.
+    /// Both slots are found before anything is stored, or the stores
+    /// would make the optimizer read the frame and the stack again.
+    /// Nil is the all-zero value, so the clear is one store of a pair
+    /// of zero words: nothing reads the slot before it is written
+    /// again, so no load waits on it (`loadWords`).
     fn fastMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
-        const nil = comptime value_mod.nilValue();
+        const dst = self.verifiedSlot(frame, inst.a);
         const src = self.verifiedSlot(frame, inst.b);
         const v = loadWords(src);
-        @as(*volatile u64, &src.tag).* = nil.tag;
-        @as(*volatile u64, &src.payload).* = nil.payload;
-        const dst = self.verifiedSlot(frame, inst.a);
+        src.* = comptime value_mod.nilValue();
         @as(*volatile u64, &dst.tag).* = v.tag;
         @as(*volatile u64, &dst.payload).* = v.payload;
         return self.nextAt(frame, pc);
