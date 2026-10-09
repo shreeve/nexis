@@ -556,7 +556,11 @@ that instruction's handler (`@call(.always_tail, ...)`), so an
 instruction costs one indirect branch and the native stack does not
 grow with the instructions run. A handler is called with the VM, the
 frame, the instruction and `pc`, the index of the instruction after
-it, which stays in a register from handler to handler.
+it, which stays in a register from handler to handler, and returns a
+status word, an `enum(u16)`: `ok` when the chain ends with no error,
+else the number of the `VmError` it ends with, which the loop turns
+back into the error. An error union cannot be the return type of a
+calling convention but Zig's `.auto`.
 
 ```
 fetch at pc (every handler's last step):
