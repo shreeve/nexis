@@ -574,9 +574,6 @@ fn noteRows(ctx: *Ctx, rows_after: *std.ArrayList(u64), steps: usize, rows: u64)
 const Pending = struct {
     clause: Clause,
     done: bool = false,
-    /// Every variable the clause mentions: binding one of them is what
-    /// can change its estimate.
-    vars: []const Var,
     /// The estimate given the variables bound when it was taken.
     cost: Cost = .stale,
     /// The join variables of a `not` or `or`, once asked.
@@ -595,10 +592,19 @@ const Cost = union(enum) {
 
 fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.ArrayList(Step), rows_after: *std.ArrayList(u64), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
-    for (clauses, pending) |c, *p| {
-        var vs: ir.VarSet = .{};
+    // The clauses each variable is mentioned by: binding it is what can
+    // change their estimates.
+    var mentions: Mentions = .empty;
+    var vs: ir.VarSet = .{};
+    for (clauses, pending, 0..) |c, *p, i| {
+        p.* = .{ .clause = c };
+        vs.clear();
         try ir.collectVars(ctx.arena, .all, &.{c}, &vs);
-        p.* = .{ .clause = c, .vars = vs.items() };
+        for (vs.items()) |v| {
+            const gop = try mentions.getOrPut(ctx.arena, v);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(ctx.arena, @intCast(i));
+        }
     }
 
     // Variables that some clause at this level binds: `not` joins on its
@@ -609,7 +615,7 @@ fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.Ar
     var remaining = clauses.len;
     while (remaining > 0) {
         const mark = bound.items().len;
-        defer invalidate(pending, bound, mark);
+        defer invalidate(pending, &mentions, bound, mark);
         // Cost-free steps first.
         var progress = false;
         for (pending, 0..) |*p, idx| {
@@ -747,16 +753,13 @@ fn estimate(ctx: *Ctx, c: Clause, bound: *const Bound) Failure!Cost {
     return if (rows) |n| .{ .rows = n } else .blocked;
 }
 
+const Mentions = std.AutoHashMapUnmanaged(Var, std.ArrayList(u32));
+
 /// Mark stale the estimates of the pending clauses that mention a
 /// variable bound since the `mark`-th binding.
-fn invalidate(pending: []Pending, bound: *const Bound, mark: usize) void {
-    if (bound.items().len == mark) return;
-    for (pending) |*p| {
-        if (p.done or p.cost == .stale) continue;
-        for (p.vars) |v| if ((bound.indexOf(v) orelse continue) >= mark) {
-            p.cost = .stale;
-            break;
-        };
+fn invalidate(pending: []Pending, mentions: *const Mentions, bound: *const Bound, mark: usize) void {
+    for (bound.items()[mark..]) |v| {
+        for ((mentions.get(v) orelse continue).items) |i| pending[i].cost = .stale;
     }
 }
 

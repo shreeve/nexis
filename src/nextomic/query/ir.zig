@@ -375,8 +375,7 @@ pub const no_rules: RuleSet = .{
 /// planning, in the order they were added.
 pub const VarSet = struct {
     list: std.ArrayList(Var) = .empty,
-    /// Per member, its index in `list`.
-    at: std.AutoHashMapUnmanaged(Var, u32) = .empty,
+    members: std.AutoHashMapUnmanaged(Var, void) = .empty,
 
     pub const empty: VarSet = .{};
 
@@ -391,18 +390,16 @@ pub const VarSet = struct {
     }
 
     pub fn has(self: *const VarSet, v: Var) bool {
-        return self.at.contains(v);
+        return self.members.contains(v);
     }
 
-    /// The position `v` was added at, or null.
-    pub fn indexOf(self: *const VarSet, v: Var) ?u32 {
-        return self.at.get(v);
+    pub fn clear(self: *VarSet) void {
+        self.list.clearRetainingCapacity();
+        self.members.clearRetainingCapacity();
     }
 
     pub fn add(self: *VarSet, arena: Allocator, v: Var) !void {
-        const gop = try self.at.getOrPut(arena, v);
-        if (gop.found_existing) return;
-        gop.value_ptr.* = @intCast(self.list.items.len);
+        if ((try self.members.getOrPut(arena, v)).found_existing) return;
         try self.list.append(arena, v);
     }
 };
@@ -473,7 +470,6 @@ test "binding vars and var collection" {
     var all: VarSet = .{};
     try collectVars(arena, .all, &clauses, &all);
     try std.testing.expectEqualSlices(Var, &.{ 0, 1, 7 }, all.items());
-    try std.testing.expectEqual(@as(?u32, 2), all.indexOf(7));
     try std.testing.expectEqual(Builtin.ne, Builtin.fromName("!=").?);
     try std.testing.expectEqual(AggOp.count_distinct, AggOp.fromName("count-distinct").?);
 }
