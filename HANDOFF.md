@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 223/223 steps succeeded; 1590/1590 tests passed
+Build Summary: 223/223 steps succeeded; 1596/1596 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -518,12 +518,11 @@ after numbers in the commit message.
      through a Var (`(nth v i)`, `(even? x)`), which a call-site cache
      must still see the Var's latest root for (`docs/PERF.md` §6
      "Inline caches at call sites").
-2. TODO.md #13: `sort`, `reverse`, `mapv` and the other natives that
-   walk to the end without consuming their argument (`docs/LAZY.md`
-   §9) hold the seq they walk, and a local a closure captures holds it
-   while the closure runs; `count`, `into`, `vec` and the other
-   consuming natives of `docs/GC.md` §11.5 let it go as they walk
-   (`docs/PERF.md` §3.31).
+2. TODO.md #13: `sort` and `sort-by` hold the seq they walk, and a
+   local a closure captures holds it while the closure runs; every
+   other native that walks a sequence to its end consumes it
+   (`docs/GC.md` §11.5; `docs/PERF.md` §3.31, §3.35), and `zipmap` and
+   `set` keep their bulk build by measurement (`docs/LAZY.md` §9).
 3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
    (`docs/PERF.md` §3.11, §3.15, §6 "Store size").
 4. The open design question, an amendment first: `&form`/`&env`

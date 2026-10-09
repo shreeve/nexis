@@ -2644,9 +2644,9 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) [1 2])] [(realized? s) (first s) (rest s) @n (realized? s) (seq (lazy-seq nil)) (lazy-seq nil) (= (lazy-seq nil) []) (= (lazy-seq nil) nil) (seq? s) (list? s) (class s)])", "[false 1 (2) 1 true nil () true false true false :lazy_seq]");
     try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (cons 1 (lazy-seq (swap! n inc) nil)))] [(first s) @n (count s) @n (next s) (rest s) (nth s 0) (nth s 3 :d) (empty? s) (count (lazy-seq nil)) (empty? (lazy-seq nil))])", "[1 1 1 2 nil () 1 :d false 0 true]");
     try expectOutput("[(coll? (lazy-seq nil)) (sequential? (lazy-seq nil)) (counted? (lazy-seq nil)) (seqable? (lazy-seq nil)) (vector? (lazy-seq nil)) (instance? :lazy_seq (lazy-seq nil))]", "[true true false true false true]");
-    // A body that throws stays unrealized and runs again, as JVM
-    // Clojure 1.12's LazySeq does (babashka's does not).
-    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x :x 2 false]");
+    // A body that throws is not run again: the next walk finds the
+    // seq ended there, as babashka's (LAZY.md §4).
+    try expectOutput("(let [n (atom 0) s (lazy-seq (swap! n inc) (throw :x))] [(try (seq s) (catch any e e)) (realized? s) (try (seq s) (catch any e e)) @n (realized? s)])", "[:x false nil 1 true]");
     // A body may refer to its own seq; one that forces it recurses
     // until the stack guard stops it.
     try expectOutput("(do (def s (lazy-seq (cons 1 s))) (take 3 s))", "(1 1 1)");
@@ -2655,6 +2655,21 @@ test "lazy: lazy-seq runs its body once, when first walked, and caches what it r
     // nth is a leaf; over a lazy seq it is re-issued as a full call.
     try expectOutput("(let [[a b & r] (lazy-seq [1 2 3 4])] [a b r])", "[1 2 (3 4)]");
     try expectOutput("(let [s (lazy-seq [:a :b])] [(nth s 1) (try (nth s 2) (catch any e e)) (nth s -1 :d) (map (fn [i] (nth s i :z)) [0 1 2])])", "[:b :index-out-of-bounds :d (:a :b :z)]");
+}
+
+test "lazy: a step that throws ends the seq at its block on the next walk" {
+    // Expected values from babashka and JVM Clojure 1.12.6: each
+    // function's step throws once, at its sixth call (the 42nd over a
+    // chunk), and the second walk ends where the first stopped,
+    // calling nothing.
+    try expectOutput(
+        \\(defn walk2 [s c] [(try (vec s) (catch any e :t)) @c (try (vec s) (catch any e :t)) @c])
+        \\(defn once-at [c k] (fn [x] (swap! c inc) (if (and (= x k) (= @c (inc k))) (throw :boom) x)))
+        \\[(let [c (atom 0)] (walk2 (map (once-at c 41) (vec (range 64))) c)) (let [c (atom 0)] (walk2 (map (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (filter (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (take-while (once-at c 5) (apply list (range 8))) c)) (let [c (atom 0)] (walk2 (take 8 (iterate (fn [x] (swap! c inc) (if (and (= x 5) (= @c 6)) (throw :boom) (inc x))) 0)) c)) (let [c (atom 0)] (walk2 (partition 2 (map (once-at c 5) (apply list (range 8)))) c)) (let [c (atom 0)] (walk2 (concat [:a] (map (once-at c 5) (apply list (range 8)))) c)) (let [c (atom 0)] (walk2 (distinct (map (once-at c 5) (apply list (range 8)))) c))]
+    , "[[:t 42 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31] 42] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6] [:t 6 [0 1 2 3 4 5] 6] [:t 6 [(0 1) (2 3)] 6] [:t 6 [:a 0 1 2 3 4] 6] [:t 6 [0 1 2 3 4] 6]]");
+    // A lazy-seq body of the program's own: babashka's, and JVM
+    // Clojure's when the body reads its captured seq first.
+    try expectOutput("(let [c (atom 0) s ((fn step [i] (lazy-seq (when (and (= i 3) (= (swap! c inc) 1)) (throw :boom)) (when (< i 6) (cons i (step (inc i)))))) 0)] [(try (vec s) (catch any e e)) (vec s) @c])", "[:boom [0 1 2] 1]");
 }
 
 test "leaf natives: what a leaf body refuses goes the general way from every call site" {
@@ -2848,6 +2863,40 @@ test "gc: count, into, vec, take-last and the typed vectors consume the seq they
     }
 }
 
+test "gc: reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join consume the seq they walk" {
+    // Each walks 300,000 mapped elements, about 6 MB of chunks (and
+    // 300,000 strings beside them for `join`), that the local's slot,
+    // moved into the call's block, would keep through the walk. A
+    // vector or a list of every element is about 5 MB of its own, and
+    // so is what `apply` keeps of the elements to pass on.
+    for ([_][3][]const u8{
+        .{ "(let [s (map inc (range 300000))] (first (reverse s)))", "300000", "6" },
+        .{ "(defn r [xs] (reverse xs)) (first (r (map inc (range 300000))))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (butlast s)))", "299999", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (mapv inc s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (mapv + (range 300000) s)))", "300000", "6" },
+        .{ "(let [s (map inc (range 300000))] (count (filterv even? s)))", "150000", "3" },
+        .{ "(let [s (map inc (range 300000))] (apply max s))", "300000", "5" },
+        .{ "(let [s (map inc (range 300000))] (select-keys {1 :a 300000 :b} s))", "{1 :a, 300000 :b}", "1" },
+        .{ "(let [s (map str (range 300000))] (count (nexis.string/join \",\" s)))", "1988889", "3" },
+        .{ "(let [s (map inc (range 300000))] (count (nexis.string/join s)))", "1688895", "3" },
+    }) |case| {
+        errdefer std.debug.print("consuming case {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        program.v.setGcPolicy(.{ .threshold = 1 << 16, .growth_percent = 0 });
+        program.v.collectGarbage();
+        const heap = &program.v.heap.?;
+        heap.peak_live_bytes = heap.live_bytes;
+        const start = heap.live_bytes;
+        try harness.expectResult(&program, "", try program.run(case[0]), case[1]);
+        const mb = try std.fmt.parseInt(usize, case[2], 10);
+        errdefer std.debug.print("peak {d} bytes\n", .{heap.peak_live_bytes -| start});
+        try testing.expect(heap.peak_live_bytes -| start < mb << 20);
+    }
+}
+
 test "count, into, vec, take-last and the typed vectors give what they gave before consuming their seq" {
     // Expected values from babashka, a set printed in nexis's order.
     try expectOutput("(let [s (map inc (range 5)) t s] [(count s) (vec s) (into [] s) (set s) (into () t) (reduce + t) (first s)])", "[5 [1 2 3 4 5] [1 2 3 4 5] #{1 2 3 4 5} (5 4 3 2 1) 15 1]");
@@ -2857,6 +2906,38 @@ test "count, into, vec, take-last and the typed vectors give what they gave befo
     try expectOutput("[(vec (map inc ())) (into [] (map inc ())) (count (map inc ())) (set (map inc ())) (into [] (take 3) (iterate inc 0)) (vec (take 4 (iterate inc 0))) (count (take 5 (cycle [1 2])))]", "[[] [] 0 #{} [0 1 2] [0 1 2 3] 5]");
     try expectOutput("[(take-last 2 (map inc (range 5))) (take-last 0 (map inc (range 5))) (take-last 10 (map inc (range 3))) (take-last 3 (map inc ())) (take-last 3 (map inc (range 7))) (take-last 2.5 (map inc (range 7)))]", "[(4 5) nil (1 2 3) nil (5 6 7) (5 6 7)]");
     try expectOutput("[(vec (i64-vector (map inc (range 3)))) (vec (f64-vector (map inc (range 3)))) (try (i64-vector (map identity [1 :a])) (catch :kind-mismatch e :km))]", "[[1 2 3] [1.0 2.0 3.0] :km]");
+}
+
+test "vec of a list that views a whole vector is that vector" {
+    // `sort`, `reverse` and the seq of a vector make such a list; its
+    // `vec` builds nothing.
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    _ = try program.run("(def s (reverse (range 300000)))");
+    program.v.collectGarbage();
+    const heap = &program.v.heap.?;
+    heap.peak_live_bytes = heap.live_bytes;
+    const start = heap.live_bytes;
+    try harness.expectResult(&program, "", try program.run("(let [v (vec s)] [(count v) (v 0) (v 299999)])"), "[300000 299999 0]");
+    errdefer std.debug.print("peak {d} bytes\n", .{heap.peak_live_bytes -| start});
+    try testing.expect(heap.peak_live_bytes -| start < 64 << 10);
+    // Expected values from babashka, which carries no metadata through
+    // `seq` of a vector: neither does `vec`.
+    try expectOutput("(let [v (with-meta [5 6 7 8] {:m 1})] [(vec (seq v)) (meta (vec (seq v))) (vec (rest (seq v))) (vec (sort [3 1 2 5 4])) (vec (reverse [1 2 3 4 5])) (meta (vec (with-meta (seq [1 2 3 4]) {:k 2}))) (vec (seq [1 2])) (= (vec (sort (range 100 0 -1))) (range 1 101))])", "[[5 6 7 8] nil [6 7 8] [1 2 3 4 5] [5 4 3 2 1] nil [1 2] true]");
+}
+
+test "reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join give what they gave before consuming their seq" {
+    // Expected values from babashka (clojure.string/join), but for the
+    // text of a lazy seq (LAZY.md §9).
+    try expectOutput("(let [s (map inc (range 5)) t s] [(reverse s) (butlast s) (mapv inc s) (filterv odd? s) (select-keys {1 :a 3 :b 9 :c} s) (nexis.string/join \",\" s) (reduce + t) (first s) (vec t)])", "[(5 4 3 2 1) (1 2 3 4) [2 3 4 5 6] [1 3 5] {1 :a, 3 :b} 1,2,3,4,5 15 1 [1 2 3 4 5]]");
+    try expectOutput("[(reverse (map inc ())) (butlast (map inc ())) (butlast (map inc (range 1))) (butlast (map inc (range 2))) (mapv + (map inc (range 3)) (map inc (range 5))) (filterv odd? (map inc ())) (select-keys {} (map inc (range 3))) (nexis.string/join (map inc ())) (nexis.string/join \"-\" (map identity [nil \"a\" \\b 1 :k [1] (map inc [1 2])]))]", "[() nil nil (1) [2 4 6] [] {}  -a-b-1-:k-[1]-(2 3)]");
+    // Either side of a vector leaf's 32, an even and an odd count.
+    try expectOutput("(vec (for [n [32 33 34 64 65 70]] (let [s (map inc (range n))] [(= (reverse s) (range n 0 -1)) (= (butlast s) (range 1 n)) (= (mapv inc s) (range 2 (+ n 2))) (= (filterv even? s) (range 2 (inc n) 2))])))", "[[true true true true] [true true true true] [true true true true] [true true true true] [true true true true] [true true true true]]");
+    try expectOutput("[(reverse [1 2 3]) (reverse (range 40 0 -1)) (butlast (range 5)) (reverse \"abc\") (butlast \"abcd\") (reverse {:a 1}) (butlast {:a 1 :b 2}) (reverse nil) (butlast nil) (reverse (sorted-set 3 1 2)) (mapv vector {:a 1} (map inc (range 3))) (select-keys [:a :b :c] (map inc (range 3))) (select-keys (sorted-map 1 2 3 4) (map identity [3 5])) (nexis.string/join \",\" (range 3)) (nexis.string/join \",\" [1 2]) (nexis.string/join \", \" (map str (range 3)))]", "[(3 2 1) (1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40) (0 1 2 3) (c b a) (a b c) ([:a 1]) ([:a 1]) () nil (3 2 1) [[[:a 1] 1]] {1 :b, 2 :c} {3 4} 0,1,2 1,2 0, 1, 2]");
+    try expectOutput("(let [s (map inc (range 5)) t s] [(apply + 10 s) (apply vector :a s) (zipmap [:a :b :c] s) (zipmap (map inc (range 3)) s) (vec t)])", "[25 [:a 1 2 3 4 5] {:a 1, :b 2, :c 3} {1 1, 2 2, 3 3} [1 2 3 4 5]]");
+    try expectOutput("[(apply + (map inc ())) (apply list (map inc (range 3))) (zipmap [:a :b] (range)) (zipmap [:a :b] (repeat 7)) (zipmap {:x 1 :y 2} (map inc (range 5))) (zipmap (map inc (range 3)) {:x 1}) (zipmap [] (range)) (zipmap (sorted-map 1 2) \"ab\") (apply str (map inc (range 40)))]", "[0 (1 2 3) {:a 0, :b 1} {:a 7, :b 7} {[:x 1] 1, [:y 2] 2} {1 [:x 1]} {} {[1 2] a} 12345678910111213141516171819202122232425262728293031323334353637383940]");
+    try expectOutput("(let [s (map inc (range 70))] [(= (apply vector s) (vec (range 1 71))) (= (zipmap (range 70) s) (zipmap (range 70) (range 1 71)))])", "[true true]");
 }
 
 test "gc: a seq a local or a parameter holds is let go at its last move (COMPILER.md §4.9)" {
@@ -2925,9 +3006,8 @@ test "lazy: transducers, transduce, into and sequence with an xform, eduction, c
     // sequence's outputs are what reached its accumulator: a reduced
     // value ends the walk and is not one (bb, as JVM Clojure 1.12).
     try expectOutput("[(sequence (halt-when #{3}) [0 1 2 3 4]) (take 5 (sequence (halt-when #{3}) (range))) (sequence (halt-when #{3} (fn [r x] [:r x])) [0 1 2 3 4]) (sequence (comp (halt-when #{1}) (partition-all 2)) [0 1 2]) (sequence (comp (partition-all 2) (halt-when #(= % [2 3]))) (range 10))]", "[(0 1 2) (0 1 2) (0 1 2) ([0]) ([0 1])]");
-    // A step that throws runs again from its source position, with the
-    // transducer's state as the failure left it (LAZY.md §9).
-    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once (0 1)]");
+    // A step that throws ends the seq at its block (LAZY.md §9).
+    try expectOutput("(let [n (atom 0) s (sequence (comp (map (fn [x] (when (and (= x 2) (< (swap! n inc) 2)) (throw :once)) x)) (take 4)) (range 10))] [(try (doall s) (catch any e e)) (doall s)])", "[:once ()]");
     // sequence is lazy: 32 outputs at a time (Clojure's iterator pulls
     // one input past them), its completion once.
     try expectOutput("(let [n (atom 0) s (sequence (map (fn [x] (swap! n inc) x)) (range 100))] [(realized? s) (first s) (<= 32 @n 33) (count s) @n (sequence (partition-all 3) (range 7))])", "[false 0 true 100 100 ([0 1 2] [3 4 5] [6])]");
@@ -7076,6 +7156,14 @@ test "gc: count, into, vec and take-last keep what they built from a seq that co
     // A lazy target realized while a map source's entries, built by
     // the walk, wait to be conj'd onto it.
     try expectOutputUnderGc(churn ++ "(let [m (zipmap (map str (range 40)) (range 40))] (= (set (into (map (fn [x] (churn x) x) [1]) m)) (conj (set m) 1)))", "true");
+}
+
+test "gc: reverse, butlast, mapv, filterv, apply, select-keys and nexis.string/join keep what they built from a seq that collects at every step" {
+    // The elements are strings the steps made, which nothing but the
+    // walked chain reaches once the native has consumed it.
+    try expectOutputUnderGc(churn ++ chain ++ "[(reverse (chain 40)) (butlast (chain 40)) (count (butlast (chain 3))) (mapv (fn [s] (churn 1) (str s \"!\")) (chain 3)) (filterv (fn [s] (churn 2) (odd? (count s))) (chain 12)) (nexis.string/join \",\" (chain 5)) (nexis.string/join (map (fn [x] (churn x) (map inc [x x])) (range 3)))]", "[(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40) (40 39 38 37 36 35 34 33 32 31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2) 2 [3! 2! 1!] [9 8 7 6 5 4 3 2 1] 5,4,3,2,1 (1 1)(2 2)(3 3)]");
+    try expectOutputUnderGc(churn ++ chain ++ "(let [z (zipmap (map str (range 40)) (range 40))] [(= (select-keys z (chain 40)) (dissoc z \"0\")) (select-keys (sorted-map-by (fn [a b] (churn 1) (compare a b)) \"1\" 1 \"2\" 2) (chain 3)) (mapv (fn [a b] (churn 3) (str a b)) (chain 3) (chain 3))])", "[true {2 2, 1 1} [33 22 11]]");
+    try expectOutputUnderGc(churn ++ chain ++ "[(apply str (chain 12)) (apply (fn [& xs] (churn 1) (count xs)) (chain 30)) (let [z (zipmap (range 40) (chain 40))] [(count z) (z 0) (z 39)]) (zipmap (chain 3) (chain 3)) (zipmap {:a 1 :b 2} (chain 2))]", "[121110987654321 30 [40 40 1] {3 3, 2 2, 1 1} {[:a 1] 2, [:b 2] 1}]");
 }
 
 test "gc: sequence and eduction keep the seq they took of a source that is not one across the transducer's calls" {

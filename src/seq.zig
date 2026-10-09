@@ -103,8 +103,7 @@ pub const op_drop_while: u16 = 21;
 /// pad, coll, mode}`, mode 0 `partition`, 1 with a pad, 2
 /// `partition-all`.
 pub const op_partition: u16 = 22;
-/// `(distinct coll)`: `{coll, seen}`, `seen` a persistent set, which a
-/// step that throws and runs again finds as it was.
+/// `(distinct coll)`: `{coll, seen}`, `seen` a persistent set.
 pub const op_distinct: u16 = 23;
 /// `(dedupe coll)`: `{coll, last, seen-one}`, 32 elements of output at
 /// a time, as Clojure's `sequence` over its transducer.
@@ -163,8 +162,7 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     const empty = vector_mod.empty(heap) catch return VmError.OutOfMemory;
     const acc = transient_mod.transientFrom(heap, empty) catch return VmError.OutOfMemory;
     lazy.setScratch(lz, acc);
-    // The walk's position stays out of the block, so a step that throws
-    // runs again from the block's own source position; the seq taken of
+    // The walk's position stays out of the block; the seq taken of
     // a source that is not one (a vector's view, a set's elements) is
     // the only thing reaching what the walk has left, so it is rooted
     // across every call of `rf` (docs/GC.md §11.5, class 5).
@@ -364,8 +362,8 @@ fn stepDedupe(vm: *VM, lz: Value) VmError!Value {
     const c = lazy.allocChunked(heap, lazy.chunk_size) catch return VmError.OutOfMemory;
     lazy.setScratch(lz, c);
     const out = lazy.chunkItems(c);
-    // The walk's position and the last element are locals: a step that
-    // throws runs again from the block's own state. Both reach from it.
+    // The walk's position and the last element are locals, which reach
+    // from the block.
     var cur = a[0];
     var last = a[1];
     var seen_one = a[2].isTruthy();
@@ -757,15 +755,18 @@ pub fn make(vm: *VM, op: u16, args: []const Value) VmError!Value {
 /// form; a body that returns another lazy block forwards to it, so a
 /// run of blocks that each return the next (a `filter` skipping, a
 /// `lazy-seq` returning a `lazy-seq`) costs no native stack. A body
-/// that throws leaves its block unrealized, and the next force runs it
-/// again (`LazySeq.java` 1.12.0).
+/// that throws ends the seq at its block on the next walk
+/// (`endAfterThrow`).
 pub fn force(vm: *VM, lz: Value) VmError!Value {
     if (lazy.state(lz) == .realized) return lazy.result(lz);
     stack_guard.check() catch return VmError.StackOverflow;
     var cur = forwardEnd(lz);
     const raw: Value = while (true) {
         if (lazy.state(cur) == .realized) break lazy.result(cur);
-        const r = try steps[lazy.op(cur)](vm, cur);
+        const r = steps[lazy.op(cur)](vm, cur) catch |err| {
+            endAfterThrow(vm, cur);
+            return err;
+        };
         if (r.kind() != .lazy_seq or lazy.shapeOf(r) != .lazy) break r;
         if (lazy.state(r) == .realized) break lazy.result(r);
         // A body that returns its own block, or one before it in the
@@ -785,6 +786,16 @@ pub fn force(vm: *VM, lz: Value) VmError!Value {
         b = after;
     }
     return s;
+}
+
+/// `lz`, whose step threw, ends the seq there on the next walk: it
+/// forwards to an empty block, its own state dropped, and stays
+/// unrealized until that walk, as Clojure's `LazySeq` stays (LAZY.md
+/// §4). A re-entrant force may have realized it meanwhile.
+fn endAfterThrow(vm: *VM, lz: Value) void {
+    if (lazy.state(lz) != .unrealized) return;
+    const nil = value_mod.nilValue();
+    if (make(vm, op_concat, &.{ nil, nil })) |end| lazy.setForwarding(lz, end) else |_| lazy.setRealized(lz, nil);
 }
 
 /// The block a forwarding chain from `lz` ends at.

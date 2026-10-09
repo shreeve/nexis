@@ -104,11 +104,25 @@ in hand, where running code may collect and errors are ordinary
 6. Every block of the forwarding chain gets that seq as its `result`
    and becomes realized, its arguments cleared.
 
-**Exactly once.** A step that returns is never run again. A step that
-throws leaves its block unrealized, and the next walk runs it again
-from the start, as `LazySeq.force` re-invokes its `fn`
-(`LazySeq.java` 1.12.0; babashka differs, caching an empty seq).
-Blocks earlier in a forwarding chain keep their completed steps.
+**Exactly once.** A step runs at most once. A step that returns is
+never run again; one that throws ends the seq at its block: the block
+forwards to an empty one, its arguments cleared, so `realized?` is
+false until the next walk, which finds the seq ended there and calls
+nothing (`seq.endAfterThrow`). Blocks earlier in the chain keep what
+they realized: `(map f (vec (range 64)))` whose `f` throws once, at
+element 41, is `(0 ... 31)` on the second walk. This is what
+babashka and JVM Clojure 1.12.6 give for every core sequence function
+and for a `lazy-seq` body that reads its captured seq first (the
+`(when-let [s (seq coll)] ...)` shape). JVM Clojure gets there
+another way: `LazySeq.force` keeps its `fn` when it throws and calls
+it again on the next walk (`LazySeq.java` 1.12.6), but the body of a
+`lazy-seq` is a `^:once` fn, whose captured locals are cleared at
+their last use, so the second call finds `coll` nil and ends. A body
+that reads no captured local runs again whole on the JVM, and one
+that uses a cleared local other than as a seq fails anew (a
+`NullPointerException`); nexis keeps no such clearing and ends the
+seq at the block in every case, as babashka does
+(`CLOJURE-REVIEW.md`).
 
 **Re-entrance.** A body that forces its own block before it returns
 (`(def t (lazy-seq (seq t)))`) runs again inside itself until the stack
@@ -289,7 +303,7 @@ inside a call marks everything (`docs/GC.md`
 | `take`, `take-while` | lazy | no | |
 | `drop`, `drop-while` | lazy | the source's own cells, after the walk | the walk runs at realization; `drop` of a view or of an unrealized range or repeat jumps at once |
 | `partition`, `partition-all` | lazy | no | each part a realized lazy seq over a list of its elements (Clojure's `(doall (take n s))`), so `list?` of one is false |
-| `distinct` | lazy | no | the elements seen in a persistent set in the block, which a step that throws and runs again finds as it was |
+| `distinct` | lazy | no | the elements seen in a persistent set in the block |
 | `dedupe` | lazy | 32 outputs at a time, as Clojure's `sequence` over its transducer | |
 | `interleave`, `interpose`, `take-nth`, `partition-by`, `tree-seq`, `flatten`, `reductions`, `drop-last`, `split-at`, `split-with`, `replace` of a seq, `random-sample`, `partitionv`, `partitionv-all`, `sequence` | lazy | as Clojure's (none but through the functions they are built on) | Clojure 1.12's definitions, in `src/stdlib/core.nx` with `lazy-seq`: bytecode and two blocks per element, where a native producer has none; none is in a benchmark |
 
@@ -403,8 +417,9 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   as a slot holds it. A native's call block is cleared when the native
   returns (`docs/VM.md` §6); `reduce`, like `frequencies`, `group-by`,
   `some`, `every?`, `last`, `dorun`, `count`, `into`, `vec`,
-  `take-last`, `i64-vector` and `f64-vector`, consumes its sequence
-  argument, clearing its slot in the block and keeping only its
+  `take-last`, `i64-vector`, `f64-vector`, `reverse`, `butlast`,
+  `mapv`, `filterv`, `apply`, `select-keys` and `nexis.string/join`,
+  consumes its sequence argument, clearing its slot in the block and keeping only its
   walk's place (`docs/GC.md` §11.5); and the compiler clears a local
   or a parameter at its last move, the last time it is passed to a
   call or moved by a `let` or a `recur` (`docs/COMPILER.md` §4.9). So
@@ -420,16 +435,18 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
     closure: `(delay (reduce + s))` holds `s` while its body runs,
     where Clojure clears a `^:once` body's fields (`lazy-seq`,
     `delay`, `future`).
-  - The natives that walk to the end without consuming their argument
-    keep it in the call's block while they walk, most building a
-    result as long as the seq: `butlast`, `reverse`, `sort`,
-    `sort-by`, `mapv`, `filterv`, `apply`, `zipmap`'s values,
-    `select-keys`'s keys and `nexis.string/join`. `set` builds its set
-    from every element at once, half the cycles of conj'ing each on a
+  - Four natives walk to the end without consuming their argument and
+    keep it in the call's block while they walk. `sort` and `sort-by`
+    gather every element before they sort. `set` builds its set from
+    every element at once, half the cycles of conj'ing each on a
     transient at a million elements (`docs/PERF.md` §3.31); `(into #{}
-    s)` consumes `s`. `nth`, `nthrest` and `nthnext` walk their first
-    argument, and a native consumes only its last; `doall` returns the
-    head it realized.
+    s)` consumes `s`. `zipmap` keeps every value with its key until it
+    builds the map, and its keys argument, which it does not consume,
+    holds a chain of its own: rooting the values as the walk passed
+    them saved 5–9% of the peak and cost 2% more instructions
+    (`docs/PERF.md`, "Consuming natives, the rest"). `nth`, `nthrest`
+    and `nthnext` walk their first argument, and a native consumes
+    only its last; `doall` returns the head it realized.
   - As in Clojure, a local bound outside a loop and read inside it is
     held for the whole loop, and so is one a `try`'s handler or
     finally reads, through the try's body.
@@ -451,13 +468,11 @@ it splices (`coll:concat`, `docs/VM.md` §10.8).
   `realized?` of a cons or a chunked cons is true (Clojure's throws).
 - **A datom form and a lookup ref are vectors** to Nextomic, so a lazy
   one, made a list (§8), is not one; Datomic takes any list.
-- **A `sequence` step that throws** runs again from its block's
-  source position with the transducer's state as the failed step left
-  it: `(sequence (comp (map f) (take 4)) (range 10))` whose `f` throws
-  once at 2 gives `(0 1)` on the next walk, `take` having counted 0
-  and 1 twice. Clojure's iterator goes on from its advanced source and
-  transducer and drops the outputs of the chunk it was filling: `(3 4)`.
-  Both reuse state the failure advanced; neither is a fresh run.
+- **A `sequence` step that throws** ends the seq at its block (§4):
+  `(sequence (comp (map f) (take 4)) (range 10))` whose `f` throws
+  once at 2 gives `()` on the next walk. Clojure's iterator goes on
+  from its advanced source and transducer and drops the outputs of the
+  chunk it was filling: `(3 4)`.
 - **`eduction`** is `sequence` over the composed transducers: a cached
   lazy seq, where Clojure's `Eduction` runs the transform again on
   every reduce. Only side effects in the transform tell them apart.
@@ -487,9 +502,8 @@ once, so `partition-all`'s last part comes out. As in Clojure's
 `TransformerIterator`, the outputs are what reached the transient:
 what the transducer returns is not an accumulator, and a reduced value
 only ends the walk, so `(sequence (halt-when #{3}) [0 1 2 3 4])` is
-`(0 1 2)`. A step that throws runs again from its block's source
-position (§4), but the transducer's state (a stateful one's volatiles)
-is as the failed step left it (§9). It realizes the source
+`(0 1 2)`. A step that throws ends the seq at its block (§4, §9). It
+realizes the source
 as far as the outputs need, as Clojure's `TransformerIterator` pulls
 it. Unlike the other producers' (§7), its walk's position stays out of
 the block, on a root scope while the step calls the transducer: the
