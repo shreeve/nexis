@@ -219,13 +219,11 @@ const bad: u21 = 0x1FFFFF;
 
 /// The code point at `s[i]`. A malformed byte decodes as `bad`, one
 /// byte long, so a search over invalid input ends without faulting.
+/// Inlined, as the search calls it for every code point.
 fn decode(s: []const u8, i: usize) Cp {
-    const b = s[i];
-    if (b < 0x80) return .{ .c = b, .len = 1 };
-    const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .c = bad, .len = 1 };
-    if (i + n > s.len) return .{ .c = bad, .len = 1 };
-    const c = std.unicode.utf8Decode(s[i..][0..n]) catch return .{ .c = bad, .len = 1 };
-    return .{ .c = c, .len = n };
+    if (s[i] < 0x80) return .{ .c = s[i], .len = 1 };
+    const d = @call(.always_inline, string.decodeAt, .{ s, i }) catch return .{ .c = bad, .len = 1 };
+    return .{ .c = d.scalar, .len = d.len };
 }
 
 /// The start of the code point that ends at `i` (`i > 0`).
