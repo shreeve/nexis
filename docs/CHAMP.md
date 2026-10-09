@@ -322,8 +322,9 @@ constants are public. Every constructor can fail only with
   `mapAssoc`/`setConj` from empty returns (same subkind, same trie,
   same iteration order) and never fail on duplicates: a later entry's
   value wins, the first key object and its position stay. The payloads
-  are sorted by slot path, equal keys merged, and each node allocated
-  once.
+  are sorted by slot path, on one 64-bit key each (the bit-reversed
+  indexing hash above the input position), equal keys merged, and each
+  node allocated once.
 - **Iteration order.** An array form iterates in association order. A
   trie iterates depth first from the root: each node's payloads in
   ascending slot order, then its children in their stored, descending
