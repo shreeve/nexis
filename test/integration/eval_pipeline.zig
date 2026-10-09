@@ -8672,3 +8672,10 @@ test "a user macro named like a core macro is the namespace's own" {
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
 }
+
+test "nexis.string: reverse and escape take a string, as every function there does" {
+    try expectOutput(
+        \\(mapv (fn [f] (try (f) (catch :kind-mismatch e (ex-message e))))
+        \\      [#(nexis.string/reverse [1 2]) #(nexis.string/reverse nil) #(nexis.string/escape [1 2] {})])
+    , "[reverse takes a string, got a vector reverse takes a string, got nil escape takes a string, got a vector]");
+}
