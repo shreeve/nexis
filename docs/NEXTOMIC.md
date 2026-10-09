@@ -1163,7 +1163,7 @@ gives the place and the trace.
 | `:nextomic/basis-in-future` | a db-value newer than its file (§4) | none |
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | none |
 | `:nextomic/busy` | `release` while an operation is in flight | none |
-| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault |
+| `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault; `:value`, the form, op, entity reference or tempid as the program wrote it, when one is refused |
 | `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | none |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |

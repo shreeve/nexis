@@ -7,16 +7,16 @@
 {:error :nextomic/conflict, :message two claims of one transaction disagree about :user/age of entity 4294967296, :e 4294967296, :a :user/age}
 {:error :nextomic/no-entity, :message the lookup ref [:user/email "nobody@x"] names no entity, :attr :user/email, :value nobody@x}
 {:error :nextomic/no-entity, :message 0 names no entity, :value 0}
-{:error :nextomic/tx-data, :message :db/add is [:db/add e a v]}
-{:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas}
+{:error :nextomic/tx-data, :message :db/add is [:db/add e a v], :value [:db/add 4294967296 :user/age]}
+{:error :nextomic/tx-data, :message unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas, :value :db/nope}
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
 {:error :nextomic/cas, :expected 2, :actual 1, :message :user/age holds 1, not the 2 the cas expected, :attr :user/age}
-{:error :nextomic/tx-data, :message :db.fn/cas is [:db.fn/cas e a old new]}
+{:error :nextomic/tx-data, :message :db.fn/cas is [:db.fn/cas e a old new], :value [:db.fn/cas 4294967296 :user/boss]}
 :inside
 {:error :nextomic/nested, :message the store's write transaction is held: a with scope, a transaction function or another connection is writing}
 {:error :nextomic/tx-data, :message tx-data is a vector or a list of forms}
-{:error :nextomic/tx-data, :message :db.fn/call takes a function or a symbol naming one}
+{:error :nextomic/tx-data, :message :db.fn/call takes a function or a symbol naming one, :value :not-a-function}
 {:error :nextomic/tx-fn, :message unknown function: no-such-fn}
 3
 {:error :nextomic/tx-fn, :message transaction functions nest past 1000 calls}
@@ -44,15 +44,15 @@ ok a rename inside a query leaves the old name unknown
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 {:error :nextomic/schema, :message an ident is never retracted; assert a new :db/ident to rename it, :attr :role/admin}
 ok a refused ident retraction leaves every name resolving
-{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
-{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
-{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
-{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :x/half}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
+{:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
 {:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
-{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute}
+{:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
 {:error :nextomic/value-type, :message :user/boss takes a :db.type/ref, not nil, :attr :user/boss, :value nil}
 {:error :nextomic/no-entity, :message 70368744177664 names no entity, :value 70368744177664}
-{:error :nextomic/tx-data, :message :db.fn/cas never renames; assert the new :db/ident}
+{:error :nextomic/tx-data, :message :db.fn/cas never renames; assert the new :db/ident, :attr :db/ident}
 {:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/_secret}
 {:error :nextomic/schema, :message an attribute name never starts with _, which marks a reverse ref, :attr :x/a}
 ok an enum ident may start with _

@@ -240,7 +240,7 @@ pub fn excise(conn: *Conn, arena: Allocator, e: Value, a: ?Value, options: Optio
     var ctx = try Ctx.begin(conn, arena, options);
     errdefer ctx.abort();
     const ent = try ctx.entityFromVm(e);
-    if (ent == .tempid) return ctx.malformed("excision takes an existing entity");
+    if (ent == .tempid) return ctx.malformed("excision takes an existing entity", .{ .given = e });
     const attr: ?*const Attr = if (a) |x| try ctx.attrFromVm(x) else null;
     ctx.excision = .{ .e = ent, .a = attr };
     try ctx.apply();
@@ -555,9 +555,13 @@ const Ctx = struct {
         return error.NoEntity;
     }
 
-    /// `TxData` with the reason.
-    fn malformed(self: *Ctx, message: []const u8) error{TxData} {
-        if (self.fault) |f| f.* = .{ .message = message };
+    /// What a refusal names besides its reason: the attribute at fault,
+    /// and the form, reference or value as the program wrote it.
+    const At = struct { attr: ?u32 = null, given: ?Value = null };
+
+    /// `TxData` with the reason and what it names.
+    fn malformed(self: *Ctx, message: []const u8, at: At) error{TxData} {
+        if (self.fault) |f| f.* = .{ .message = message, .attr = if (at.attr) |a| self.attrValue(a) else null, .given = at.given };
         return error.TxData;
     }
 
@@ -590,8 +594,8 @@ const Ctx = struct {
     /// A name the minter refuses is malformed tx-data.
     fn identRefused(self: *Ctx, err: anytype) (@TypeOf(err) || error{TxData}) {
         return switch (err) {
-            error.RetiredIdent => self.malformed("a retired ident name is never reused"),
-            error.IdentTooLong => self.malformed(ident_too_long),
+            error.RetiredIdent => self.malformed("a retired ident name is never reused", .{}),
+            error.IdentTooLong => self.malformed(ident_too_long, .{}),
             else => err,
         };
     }
@@ -745,7 +749,7 @@ const Ctx = struct {
     }
 
     fn lookupAttr(self: *Ctx, attr: *const Attr, v: Val) !*const Attr {
-        if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute");
+        if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute", .{ .attr = attr.id });
         if (v.valueType() != attr.value_type) return error.ValueType;
         return attr;
     }
@@ -807,7 +811,7 @@ const Ctx = struct {
                 var it = list_mod.Cursor.init(tx_data);
                 while (it.next()) |form| try self.normaliseForm(form);
             },
-            else => return self.malformed("tx-data is a vector or a list of forms"),
+            else => return self.malformed("tx-data is a vector or a list of forms", .{}),
         }
     }
 
@@ -816,26 +820,26 @@ const Ctx = struct {
             _ = try self.normaliseMap(form);
             return;
         }
-        const f = (try self.listForm(form)) orelse return self.malformed("a form is a vector, a list or a map");
-        if (f.len < 2) return self.malformed("a list form is [op e ...]");
+        const f = (try self.listForm(form)) orelse return self.malformed("a form is a vector, a list or a map", .{ .given = form });
+        if (f.len < 2) return self.malformed("a list form is [op e ...]", .{ .given = form });
         const op = f[0];
         if (self.kwIs(op, "db.fn/call")) {
             try self.normaliseCall(f);
         } else if (self.kwIs(op, "db.fn/cas")) {
-            if (f.len != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]");
+            if (f.len != 5) return self.malformed(":db.fn/cas is [:db.fn/cas e a old new]", .{ .given = form });
             const attr = try self.attrFromVm(f[2]);
-            if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident");
+            if (attr.id == boot.ident) return self.malformed(":db.fn/cas never renames; assert the new :db/ident", .{ .attr = attr.id });
             const e = try self.entityFromVm(f[1]);
             const op_cas = try self.arena.create(CasOp);
             op_cas.* = .{ .e = e, .attr = attr, .old = if (f[3].isNil()) null else try self.valueFromVm(attr, f[3], .match), .written = f[3], .new = try self.valueFromVm(attr, f[4], .assert) };
             try self.ops.append(self.arena, .{ .cas = op_cas });
         } else if (self.kwIs(op, "db/add")) {
-            if (f.len != 4) return self.malformed(":db/add is [:db/add e a v]");
+            if (f.len != 4) return self.malformed(":db/add is [:db/add e a v]", .{ .given = form });
             const attr = try self.attrFromVm(f[2]);
             const e = try self.entityFromVm(f[1]);
             try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .assert) } });
         } else if (self.kwIs(op, "db/retract")) {
-            if (f.len != 3 and f.len != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]");
+            if (f.len != 3 and f.len != 4) return self.malformed(":db/retract is [:db/retract e a] or [:db/retract e a v]", .{ .given = form });
             const attr = try self.attrFromVm(f[2]);
             const e = try self.entityFromVm(f[1]);
             if (f.len == 3) {
@@ -844,9 +848,9 @@ const Ctx = struct {
                 try self.ops.append(self.arena, .{ .retract = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, f[3], .match) } });
             }
         } else if (self.kwIs(op, "db/retractEntity")) {
-            if (f.len != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]");
+            if (f.len != 2) return self.malformed(":db/retractEntity is [:db/retractEntity e]", .{ .given = form });
             try self.ops.append(self.arena, .{ .retract_entity = try self.entityFromVm(f[1]) });
-        } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas");
+        } else return self.malformed("unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas", .{ .given = op });
     }
 
     /// The elements of a list form `[op e ...]`, which, as in Datomic,
@@ -877,7 +881,7 @@ const Ctx = struct {
         const f = form[1];
         switch (f.kind()) {
             .function, .native_fn, .symbol => {},
-            else => return self.malformed(":db.fn/call takes a function or a symbol naming one"),
+            else => return self.malformed(":db.fn/call takes a function or a symbol naming one", .{ .given = f }),
         }
         if (self.call_depth >= max_call_depth) return self.txFn(std.fmt.comptimePrint("transaction functions nest past {d} calls", .{max_call_depth}));
         const db_before = self.conn.at(self.now);
@@ -888,10 +892,14 @@ const Ctx = struct {
         try self.normaliseValue(result);
     }
 
+    /// A map form's entity, and whether the map names it: by `:db/id`
+    /// or a unique attribute.
+    const MapEnt = struct { ent: Ent, identified: bool };
+
     /// Expand a map form into adds; returns the entity. A key
     /// `:ns/_attr` is a reverse ref: its value names the entities that
     /// refer to this one through `:ns/attr`.
-    fn normaliseMap(self: *Ctx, m: Value) Failure!Ent {
+    fn normaliseMap(self: *Ctx, m: Value) Failure!MapEnt {
         // Nested map forms recurse here, one frame per level.
         try stack.check();
         var ent: ?Ent = null;
@@ -903,6 +911,7 @@ const Ctx = struct {
             }
         }
         const e: Ent = ent orelse .{ .tempid = try self.internalTempid() };
+        var identified = ent != null;
 
         var it2 = MapEntries.of(m);
         while (it2.next()) |entry| {
@@ -915,13 +924,14 @@ const Ctx = struct {
                 continue;
             }
             const attr = try self.attrFromVm(entry.key);
+            if (attr.unique != .none) identified = true;
             if (attr.many()) if (try self.elementsOf(v, attr.value_type == .ref)) |els| {
                 for (els) |el| try self.addFromVm(e, attr, el);
                 continue;
             };
             try self.addFromVm(e, attr, v);
         }
-        return e;
+        return .{ .ent = e, .identified = identified };
     }
 
     /// The values the collection `v` stands for, or null when `v` is one
@@ -942,7 +952,7 @@ const Ctx = struct {
         const forward = try std.mem.concat(self.arena, u8, &.{ name[0 .. slash + 1], name[slash + 2 ..] });
         const id = (try self.minter.lookupName(forward)) orelse return self.unknownAttr(k);
         const attr = (try self.attrCopy(id)) orelse return self.unknownAttr(k);
-        if (attr.value_type != .ref) return self.malformed("a reverse ref needs a ref attribute");
+        if (attr.value_type != .ref) return self.malformed("a reverse ref needs a ref attribute", .{ .attr = attr.id });
         return attr;
     }
 
@@ -962,7 +972,7 @@ const Ctx = struct {
     /// `[referrer attr e]` for one value under a reverse ref: an entity,
     /// or a map form of one.
     fn addReverse(self: *Ctx, e: Ent, attr: *const Attr, referrer: Value) Failure!void {
-        const from = if (isMapForm(referrer)) try self.normaliseMap(referrer) else try self.entityFromVm(referrer);
+        const from = if (isMapForm(referrer)) (try self.normaliseMap(referrer)).ent else try self.entityFromVm(referrer);
         try self.ops.append(self.arena, .{ .add = .{ .e = from, .attr = attr, .v = pvalOf(e) } });
     }
 
@@ -972,19 +982,6 @@ const Ctx = struct {
             .tempid => |i| .{ .tempid = i },
             .lookup => |l| .{ .lookup = l },
         };
-    }
-
-    /// Does a map form name its entity: a `:db/id`, or a unique
-    /// attribute?
-    fn carriesIdentity(self: *Ctx, m: Value) !bool {
-        var it = MapEntries.of(m);
-        while (it.next()) |entry| {
-            if (self.kwIs(entry.key, "db/id")) return true;
-            if (entry.key.kind() != .keyword) continue;
-            const attr = self.attrFromVm(entry.key) catch continue;
-            if (attr.unique != .none) return true;
-        }
-        return false;
     }
 
     /// Under a ref attribute a two-element vector whose first element is
@@ -1003,9 +1000,9 @@ const Ctx = struct {
     /// identity, or nothing could ever reach it.
     fn addFromVm(self: *Ctx, e: Ent, attr: *const Attr, v: Value) Failure!void {
         if (isMapForm(v) and attr.value_type == .ref) {
-            if (!attr.component and !try self.carriesIdentity(v)) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute");
             const nested = try self.normaliseMap(v);
-            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested) } });
+            if (!attr.component and !nested.identified) return self.malformed("a nested map under a non-component ref needs :db/id or a unique attribute", .{ .attr = attr.id });
+            try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = pvalOf(nested.ent) } });
             return;
         }
         try self.ops.append(self.arena, .{ .add = .{ .e = e, .attr = attr, .v = try self.valueFromVm(attr, v, .assert) } });
@@ -1019,7 +1016,7 @@ const Ctx = struct {
                 if (n <= 0 or n > std.math.maxInt(u32)) return self.unknownAttr(v);
                 break :blk self.attrById(@intCast(n));
             },
-            else => self.malformed("an attribute is a keyword or an id"),
+            else => self.malformed("an attribute is a keyword or an id", .{ .given = v }),
         };
     }
 
@@ -1046,14 +1043,14 @@ const Ctx = struct {
             },
             .keyword => return .{ .eid = (try self.minter.lookup(v.asKeywordId())) orelse return error.NoEntity },
             .persistent_vector => {
-                if (vector_mod.count(v) != 2) return self.malformed("a lookup ref is [attr value]");
+                if (vector_mod.count(v) != 2) return self.malformed("a lookup ref is [attr value]", .{ .given = v });
                 const attr = try self.attrFromVm(vector_mod.nth(v, 0));
-                if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute");
+                if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute", .{ .attr = attr.id });
                 const lv = try self.valueFromVm(attr, vector_mod.nth(v, 1), .match);
-                if (lv != .val) return self.malformed("a lookup ref value is a plain value");
+                if (lv != .val) return self.malformed("a lookup ref value is a plain value", .{ .attr = attr.id, .given = vector_mod.nth(v, 1) });
                 return .{ .lookup = try self.lookupRef(attr, lv.val) };
             },
-            else => return self.malformed("an entity is an id, a tempid, a lookup ref, an ident or \"datomic.tx\""),
+            else => return self.malformed("an entity is an id, a tempid, a lookup ref, an ident or \"datomic.tx\"", .{ .given = v }),
         }
     }
 
@@ -1132,7 +1129,7 @@ const Ctx = struct {
         if (self.excision) |x| {
             // Resolved before the write, which marks the entry with it.
             const e = try self.resolveEnt(x.e);
-            if (e < key.user_partition_start or e >= key.user_partition_end) return self.malformed("excision takes a user entity");
+            if (e < key.user_partition_start or e >= key.user_partition_end) return self.malformed("excision takes a user entity", .{});
             self.excised = try self.arena.dupe(u64, &.{e});
         }
         try self.write();
@@ -1345,7 +1342,7 @@ const Ctx = struct {
         for (self.bindings.items, named) |*b, n| {
             if (b.alias != null) continue;
             if (b.eid != null) continue;
-            if (!n) return self.malformed("a tempid no assertion stands on names no entity");
+            if (!n) return self.malformed("a tempid no assertion stands on names no entity", .{});
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
             self.next_eid += 1;
@@ -1510,7 +1507,7 @@ const Ctx = struct {
     /// what this transaction retracted, must be `old` (absent when `old`
     /// is null); then `new` is asserted as an ordinary add.
     fn expandCas(self: *Ctx, e: u64, attr: *const Attr, old: ?Val, written: Value, new: Val) !void {
-        if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute");
+        if (attr.many()) return self.malformed(":db.fn/cas takes a cardinality-one attribute", .{ .attr = attr.id });
         const current = try self.currentOne(e, attr.id);
         const actual: ?Val = if (current) |c| c.val else null;
         const matches = if (old) |o| (if (actual) |a| a.eql(o) else false) else actual == null;
@@ -1679,7 +1676,7 @@ const Ctx = struct {
     /// Queue a datom; `fact_key` is its EAVT key when the caller has it.
     fn push(self: *Ctx, e: u64, attr: *const Attr, v: Val, vbytes: []const u8, added: bool, fact_key: ?[]const u8) !void {
         // The txlog entry carries the instant too: it never changes.
-        if (attr.id == boot.tx_instant and (!added or e != key.txEntity(self.t))) return self.malformed(":db/txInstant is asserted on the transaction's own entity only, and never retracted");
+        if (attr.id == boot.tx_instant and (!added or e != key.txEntity(self.t))) return self.malformed(":db/txInstant is asserted on the transaction's own entity only, and never retracted", .{});
         // Keyword values and the attribute of every datom are stored by
         // the ident's id, so a name only moves, by a rename.
         if (attr.id == boot.ident and !added) return self.schemaRefused(@intCast(e), null, "an ident is never retracted; assert a new :db/ident to rename it");
@@ -1704,7 +1701,7 @@ const Ctx = struct {
         const tx = key.txEntity(self.t);
         for (self.overlay.items) |p| {
             if (p.e == tx and p.attr.id == boot.tx_instant and p.added) {
-                if (p.v.instant < last) return self.malformed("a transaction's :db/txInstant is never earlier than the one before");
+                if (p.v.instant < last) return self.malformed("a transaction's :db/txInstant is never earlier than the one before", .{});
                 self.now_ms = p.v.instant;
                 return;
             }
@@ -1796,7 +1793,7 @@ const Ctx = struct {
             const vt: key.ValueType, const many: bool = if (c.existing) |ex| .{ ex.value_type, if (c.has_card) c.many else ex.many() } else blk: {
                 const flagged = c.unique or c.avet or c.fulltext or c.component;
                 if (c.value_type == null and !c.has_card and !flagged) continue;
-                if (c.value_type == null or !c.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality");
+                if (c.value_type == null or !c.has_card) return self.malformed("a new attribute needs :db/valueType and :db/cardinality", .{ .attr = c.a });
                 if (try self.minter.keywordOf(c.a)) |k| try self.checkAttrName(c.a, k);
                 break :blk .{ c.value_type.?, c.many };
             };
@@ -1806,7 +1803,7 @@ const Ctx = struct {
             };
             // A unique attribute identifies one entity by one value, so
             // it is card-one.
-            if (c.unique and many) return self.malformed("a unique attribute is cardinality one");
+            if (c.unique and many) return self.malformed("a unique attribute is cardinality one", .{ .attr = c.a });
             if (c.fulltext and vt != .string) return self.schemaRefused(c.a, null, ":db/fulltext takes a string attribute");
             if (c.component and vt != .ref) return self.schemaRefused(c.a, null, ":db/isComponent takes a ref attribute");
         }

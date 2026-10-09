@@ -1,0 +1,27 @@
+; test/nextomic/refusals.nx — what a refused transaction names: the
+; attribute at fault, and the form, reference or value as written
+; (docs/NEXTOMIC.md §3, §7).
+
+(require '[nextomic :as d])
+(require '[prelude :as t])
+
+(def c (d/connect "refusals.edb"))
+(d/transact! c [{:db/ident :u/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                {:db/ident :u/age :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                {:db/ident :u/tags :db/valueType :db.type/string :db/cardinality :db.cardinality/many}
+                {:db/ident :u/friend :db/valueType :db.type/ref :db/cardinality :db.cardinality/many}])
+(def x (get (:tempids (d/transact! c [{:db/id "x" :u/email "x" :u/age 1}])) "x"))
+
+; Malformed tx-data names the attribute at fault, or what it refuses.
+(prn (t/caught (d/transact! c [{:db/ident :x/z :db/unique :db.unique/identity}])))
+(prn (t/caught (d/transact! c [{:db/ident :x/w :db/valueType :db.type/long :db/cardinality :db.cardinality/many :db/unique :db.unique/identity}])))
+(prn (t/caught (d/transact! c [[:db/add [:u/age 1] :u/age 2]])))
+(prn (t/caught (d/transact! c [[:db.fn/cas x :u/tags nil "a"]])))
+(prn (t/caught (d/transact! c [{:db/id x :u/_age 5}])))
+(prn (t/caught (d/transact! c [{:db/id "n" :u/age 1 :u/friend {:u/age 2}}])))
+(prn (t/caught (d/transact! c [[:db/add nil :u/age 5]])))
+(prn (t/caught (d/transact! c [[:db/add "only" :u/age 5] [:db/retract "lonely" :u/age 5]])))
+(prn (t/caught (d/transact! c [[:db/frob x :u/age 5]])))
+(prn (t/caught (d/transact! c [[:db/add x :u/friend [:u/email [:u/email "x"]]]])))
+(prn (t/caught (d/transact! c [[:db/add x "u/age" 5]])))
+(prn (t/caught (d/transact! c [:not-a-form])))
