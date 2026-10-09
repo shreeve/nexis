@@ -24,12 +24,13 @@
 //! §11.5). An immediate needs no root and is not pushed, nor is a
 //! predicate's result, which is tested and dropped unrealized.
 //!
-//! Functions: a predicate or function-binding symbol that is not a
-//! built-in resolves through the namespace registry the way the
-//! compiler resolves a symbol (an alias-qualified `ns/name` to that
-//! namespace's own var; a bare name in the current namespace, then its
-//! auto-referred parents) and is called through `VM.callValue` with
-//! the clause's arguments as values. A `?variable` in function
+//! Functions: a predicate, function-binding or custom aggregate symbol
+//! that is not a built-in resolves through the namespace registry the
+//! way the compiler resolves a symbol (an alias-qualified `ns/name` to
+//! that namespace's own var; a bare name in the current namespace, then
+//! its auto-referred parents), once per query before any row runs, and
+//! is called through `VM.callValue` with the clause's arguments as
+//! values. A `?variable` in function
 //! position applies the value it holds: a function through
 //! `VM.callValue`, a keyword or collection as the language applies
 //! them, anything else `:not-callable`. Whatever that call raises
@@ -103,12 +104,7 @@ const Hook = struct {
     }
 
     fn callHook(self: *Hook) query.CallHook {
-        return .{ .ctx = @ptrCast(self), .call = &call, .apply = &apply, .keep = &keep, .root = &root };
-    }
-
-    fn call(ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value {
-        const self: *Hook = @ptrCast(@alignCast(ctx));
-        return self.vm.callValue(try self.resolve(sym), args);
+        return .{ .ctx = @ptrCast(self), .resolve = &resolve, .apply = &apply, .keep = &keep, .root = &root };
     }
 
     /// A function's result the query binds or aggregates, realized and
@@ -137,11 +133,16 @@ const Hook = struct {
         return self.vm.callValue(f, args);
     }
 
-    /// The bound value the symbol names, or a thrown
+    /// The bound value the symbol names, rooted for the query's life
+    /// (a later call may rebind the Var), or a thrown
     /// `:nextomic/query-syntax` naming what is missing.
-    fn resolve(self: *Hook, sym: u32) anyerror!Value {
+    fn resolve(ctx: *anyopaque, sym: u32) anyerror!Value {
+        const self: *Hook = @ptrCast(@alignCast(ctx));
         const vm = self.vm;
-        if (try lookup(vm, sym)) |v| return v;
+        if (try lookup(vm, sym)) |v| {
+            try root(ctx, v);
+            return v;
+        }
         const message = try vm.allocator.print("unknown function: {s}", .{vm.ensureInterner().symbolName(sym)});
         defer vm.allocator.free(message);
         return natives.throwSyntax(vm, "nextomic/query-syntax", message, null);

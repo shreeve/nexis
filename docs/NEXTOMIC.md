@@ -883,8 +883,10 @@ binding form, and a nil element drops its element under `[?x ...]` or
 symbol resolves through the namespace registry as the compiler resolves
 it (an alias-qualified `ns/name` to that namespace's own var, a bare
 name in the current namespace and then its auto-referred parents) and
-is called with `vm.callValue`; an unbound name throws
-`:nextomic/query-syntax` naming it. A throw inside the function unwinds
+is called with `vm.callValue`. Every function symbol of the plan and
+every custom aggregate resolves once, before any row runs, so an
+unbound name throws `:nextomic/query-syntax` naming it whether or not
+a row would reach its clause. A throw inside the function unwinds
 through the native, the read transaction closes, and the thrown value
 reaches the caller's `try`; `ControlTransferred` propagates unchanged.
 Function position also takes a variable, `[(?pred ?x)]` or `[(?f ?x)
@@ -1168,7 +1170,7 @@ gives the place and the trace.
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |
 | `:nextomic/tx-fn` | a transaction function that cannot run | the message names the unbound symbol, or the depth limit and its value |
 | `:nextomic/cas` | a `:db.fn/cas` whose expectation failed | `:attr`, `:expected` and `:actual`, the last two nil for an absent value |
-| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:clause`, the index into `:where`, when inside a clause. The message names what is at fault: the symbol, section, source or binding it does not take, the variable bound twice, the rule a call names with its arity and the count the call passes. A scoping refusal names the variable at fault: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
+| `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name | `:clause`, the index into `:where`, when inside a clause. The message names what is at fault: the symbol, section, source or binding it does not take, the variable bound twice, the rule a call names with its arity and the count the call passes. A scoping refusal names the variable at fault: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec; the message names the element, option or attribute at fault |
 | `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
 | `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | as every runtime error's |

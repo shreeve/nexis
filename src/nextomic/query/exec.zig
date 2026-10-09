@@ -80,17 +80,19 @@ const Plan = plan_mod.Plan;
 const Step = plan_mod.Step;
 const Scan = plan_mod.Scan;
 
-/// Calls a user function: `call` by VM symbol, `apply` by the value a
-/// variable in function position holds. `args` are VM values built in
-/// the query's result heap; the result is the VM value the function
-/// returned, which a predicate tests and drops. `keep` turns a result
-/// the pipeline binds or aggregates into the value it holds, kept
-/// reachable for the query's life; `root` keeps reachable a heap value
-/// the pipeline builds itself and holds across later calls. A host
-/// whose calls never collect leaves both null.
+/// Calls user functions: `resolve` turns a function symbol into the
+/// value it names, once per query and before any row runs, raising
+/// what an unbound name raises; `apply` calls a function value, one a
+/// symbol named or one a variable in function position holds. `args`
+/// are VM values built in the query's result heap; the result is the
+/// VM value the function returned, which a predicate tests and drops.
+/// `keep` turns a result the pipeline binds or aggregates into the
+/// value it holds, kept reachable for the query's life; `root` keeps
+/// reachable a heap value the pipeline builds itself and holds across
+/// later calls. A host whose calls never collect leaves both null.
 pub const CallHook = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, sym: u32, args: []const Value) anyerror!Value,
+    resolve: *const fn (ctx: *anyopaque, sym: u32) anyerror!Value,
     apply: *const fn (ctx: *anyopaque, f: Value, args: []const Value) anyerror!Value,
     keep: ?*const fn (ctx: *anyopaque, v: Value) anyerror!Value = null,
     root: ?*const fn (ctx: *anyopaque, v: Value) anyerror!void = null,
@@ -125,6 +127,8 @@ pub const Exec = struct {
     /// The pull find elements' resolved patterns, by find position
     /// (`preparePulls`).
     pulls: ?[]?pull_mod.Prepared = null,
+    /// The value each function symbol names (`resolveFns`).
+    fns: std.AutoHashMapUnmanaged(u32, Value) = .empty,
 
     /// Run `p` from `input`, which binds at least `p.input`. A parked
     /// relation (`plan.Park`) keeps the columns it set aside, and its
@@ -456,7 +460,45 @@ pub const Exec = struct {
 
     fn callUser(self: *Exec, sym: u32, cells: []const Cell) anyerror!Value {
         const hook = self.hook orelse return error.NoHook;
-        return hook.call(hook.ctx, sym, try self.argValues(cells));
+        return hook.apply(hook.ctx, try self.fnOf(sym), try self.argValues(cells));
+    }
+
+    /// The value the function symbol `sym` names, resolved once.
+    fn fnOf(self: *Exec, sym: u32) anyerror!Value {
+        const hook = self.hook orelse return error.NoHook;
+        const gop = try self.fns.getOrPut(self.arena, sym);
+        if (!gop.found_existing) gop.value_ptr.* = hook.resolve(hook.ctx, sym) catch |err| {
+            self.fns.removeByPtr(gop.key_ptr);
+            return err;
+        };
+        return gop.value_ptr.*;
+    }
+
+    /// Resolve every function symbol `p` calls, its sub-plans' and rule
+    /// bodies' included, and every custom aggregate of `query`, before
+    /// any row runs: an unbound name throws whether or not a row
+    /// reaches its clause (NEXTOMIC.md §5).
+    pub fn resolveFns(self: *Exec, query: *const Ir, p: *const Plan) anyerror!void {
+        for (query.find) |f| if (f == .agg and f.agg.op == .custom) {
+            _ = try self.fnOf(f.agg.sym);
+        };
+        try self.resolvePlan(p);
+    }
+
+    fn resolvePlan(self: *Exec, p: *const Plan) anyerror!void {
+        try stack.check();
+        for (p.steps) |*s| switch (s.*) {
+            .pred => |pr| if (pr.call.f == .user) {
+                _ = try self.fnOf(pr.call.f.user);
+            },
+            .bind => |b| if (b.call.f == .user) {
+                _ = try self.fnOf(b.call.f.user);
+            },
+            .not => |n| try self.resolvePlan(n.sub),
+            .@"or" => |o| for (o.branches) |br| try self.resolvePlan(br),
+            .fix => |f| for (f.instances) |inst| for (inst.bodies) |body| try self.resolvePlan(body.plan),
+            .scan, .match, .source => {},
+        };
     }
 
     /// Apply the value in `f`'s column of `row`, a function bound
@@ -1235,7 +1277,7 @@ pub const Exec = struct {
                 const hook = self.hook orelse return error.NoHook;
                 const vals = try self.arena.alloc(Value, members.len);
                 for (members, vals) |m, *v| v.* = try self.cellValue(basis.cell(m, col));
-                const result = try hook.call(hook.ctx, agg.sym, &.{try vector_mod.fromSlice(self.heap, vals)});
+                const result = try hook.apply(hook.ctx, try self.fnOf(agg.sym), &.{try vector_mod.fromSlice(self.heap, vals)});
                 return Cell.fromValue(try self.keptResult(result));
             },
             .sum, .avg => {

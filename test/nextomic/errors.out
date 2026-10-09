@@ -81,6 +81,8 @@ ok a cas mints no ident for its old value
 {:error :nextomic/pull-syntax, :message foo in a pull pattern is no attribute; a symbol there is *, :clause 0}
 {:error :nextomic/pull-syntax, :message :xform is no attribute option; one of :as, :limit and :default, :clause 0}
 {:error :nextomic/pull-syntax, :message :user/age takes no sub-pattern: it is no ref attribute, :clause 0}
+{:error :nextomic/query-syntax, :message unknown function: no-such-fn}
+{:error :nextomic/query-syntax, :message unknown function: no-such-agg}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
 {:error :nextomic/closed, :message the connection is released, or the with scope of this db-value has ended}
