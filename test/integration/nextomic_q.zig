@@ -166,8 +166,38 @@ fn sortedRelation(arena: Allocator, rows: []const Row, width: usize) !Relation {
     for (vars, 0..) |*v, i| v.* = @intCast(i);
     var rel = try Relation.init(arena, vars);
     for (rows) |r| try rel.append(r);
-    try rel.sort();
+    try sortRows(&rel);
     return rel;
+}
+
+/// Sort the rows of `rel` in place, by `Cell.order` over the columns
+/// in order: two relations with one row set then compare row by row.
+fn sortRows(rel: *Relation) !void {
+    const perm = try rel.arena.alloc(usize, rel.rows);
+    for (perm, 0..) |*p, i| p.* = i;
+    std.mem.sort(usize, perm, rel, rowLess);
+    for (rel.cols) |*c| switch (c.*) {
+        inline else => |*x| {
+            const copy = try rel.arena.dupe(@TypeOf(x.items[0]), x.items);
+            for (perm, x.items) |p, *o| o.* = copy[p];
+        },
+    };
+}
+
+fn rowLess(rel: *const Relation, a: usize, b: usize) bool {
+    for (rel.cols) |*c| switch (c.get(a).order(c.get(b))) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    };
+    return false;
+}
+
+/// Do two relations of one width hold the same rows in the same order?
+fn eqlRows(a: *const Relation, b: *const Relation) bool {
+    if (a.rows != b.rows or a.cols.len != b.cols.len) return false;
+    for (0..a.rows) |i| if (!a.rowsEql(i, b, i)) return false;
+    return true;
 }
 
 fn printRows(fx: *Fx, label: []const u8, rel: *const Relation) void {
@@ -199,7 +229,7 @@ fn check(fx: *Fx, dbv: DbValue, src: []const u8, args: []const Value) !Relation 
     const width = if (got.len > 0) got[0].len else if (want.len > 0) want[0].len else 0;
     const got_rel = try sortedRelation(arena, got, width);
     const want_rel = try sortedRelation(arena, want, width);
-    if (!got_rel.eqlRows(&want_rel)) {
+    if (!eqlRows(&got_rel, &want_rel)) {
         std.debug.print("\nMISMATCH for {s}\n", .{src});
         printRows(fx, "engine", &got_rel);
         printRows(fx, "naive", &want_rel);
