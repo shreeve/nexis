@@ -46,7 +46,7 @@ pub const Shape = enum(u2) { lazy = 0, cons = 1, chunked = 2 };
 const shape_shift = 1;
 const shape_mask: u8 = 0b11 << shape_shift;
 
-pub fn shapeOfHeader(h: *const HeapHeader) Shape {
+fn shapeOfHeader(h: *const HeapHeader) Shape {
     return @fromBackingInt(@intCast((h.flags & shape_mask) >> shape_shift));
 }
 
@@ -69,6 +69,9 @@ pub const State = enum(u8) {
     /// `result` is nil or a non-empty seq: a non-empty list, a cons or
     /// a chunked cons.
     realized = 2,
+    /// The body is running: a `force` that reaches the block raises
+    /// `:stack-overflow` instead of running it again.
+    running = 3,
 };
 
 const LazyBody = extern struct {
@@ -228,7 +231,7 @@ pub fn isMore(v: Value) bool {
 
 /// Whether `s` may be a realized block's result: nil or a non-empty
 /// seq (LAZY.md §4, the normal form).
-pub fn isSeqResult(s: Value) bool {
+fn isSeqResult(s: Value) bool {
     return switch (s.kind()) {
         .nil => true,
         .list => !list.isEmpty(s),
@@ -254,12 +257,19 @@ pub fn args(lz: Value) []Value {
     return lazyBody(lz).args();
 }
 
-/// Root `v` in the result field of `lz`, a block whose body has not
-/// run: what a producer fills while it runs, so a collection inside a
-/// call marks it (a step that throws leaves it there, garbage the next
-/// run replaces).
+/// Mark the unrealized block `lz` running while its body runs, or
+/// unrealized again once the body has returned.
+pub fn setRunning(lz: Value, running: bool) void {
+    const body = lazyBody(lz);
+    std.debug.assert(body.state == if (running) State.unrealized else State.running);
+    body.state = if (running) .running else .unrealized;
+}
+
+/// Root `v` in the result field of `lz`, a block whose body is
+/// running: what a producer fills while it runs, so a collection
+/// inside a call marks it.
 pub fn setScratch(lz: Value, v: Value) void {
-    std.debug.assert(state(lz) == .unrealized);
+    std.debug.assert(state(lz) == .running);
     lazyBody(lz).result = v;
 }
 
@@ -389,7 +399,7 @@ pub const Cursor = struct {
             },
             .lazy_seq => switch (shapeOf(self.rest)) {
                 .lazy => switch (state(self.rest)) {
-                    .unrealized => return error.Unrealized,
+                    .unrealized, .running => return error.Unrealized,
                     .forwarding, .realized => self.rest = result(self.rest),
                 },
                 .cons => {

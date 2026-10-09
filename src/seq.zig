@@ -762,11 +762,18 @@ pub fn force(vm: *VM, lz: Value) VmError!Value {
     stack_guard.check() catch return VmError.StackOverflow;
     var cur = forwardEnd(lz);
     const raw: Value = while (true) {
-        if (lazy.state(cur) == .realized) break lazy.result(cur);
+        switch (lazy.state(cur)) {
+            .realized => break lazy.result(cur),
+            // Its own body, or one it runs, forces it (§4, re-entrance).
+            .running => return VmError.StackOverflow,
+            else => {},
+        }
+        lazy.setRunning(cur, true);
         const r = steps[lazy.op(cur)](vm, cur) catch |err| {
             endAfterThrow(vm, cur);
             return err;
         };
+        lazy.setRunning(cur, false);
         if (r.kind() != .lazy_seq or lazy.shapeOf(r) != .lazy) break r;
         if (lazy.state(r) == .realized) break lazy.result(r);
         // A body that returns its own block, or one before it in the
@@ -791,9 +798,9 @@ pub fn force(vm: *VM, lz: Value) VmError!Value {
 /// `lz`, whose step threw, ends the seq there on the next walk: it
 /// forwards to an empty block, its own state dropped, and stays
 /// unrealized until that walk, as Clojure's `LazySeq` stays (LAZY.md
-/// §4). A re-entrant force may have realized it meanwhile.
+/// §4).
 fn endAfterThrow(vm: *VM, lz: Value) void {
-    if (lazy.state(lz) != .unrealized) return;
+    lazy.setRunning(lz, false);
     const nil = value_mod.nilValue();
     if (make(vm, op_concat, &.{ nil, nil })) |end| lazy.setForwarding(lz, end) else |_| lazy.setRealized(lz, nil);
 }

@@ -8672,3 +8672,25 @@ test "a user macro named like a core macro is the namespace's own" {
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
 }
+
+// =============================================================================
+// A lazy body that forces its own block (LAZY.md §4, re-entrance)
+// =============================================================================
+
+test "a lazy body that forces its own block raises :stack-overflow and ends the seq there" {
+    try expectOutputProgram(
+        \\(def flag (atom true))
+        \\(declare s)
+        \\(def s (map (fn [x]
+        \\              (when @flag (reset! flag false) (dorun 20 s))
+        \\              (dotimes [_ 50] (vec (range 20)))
+        \\              (str "v" x))
+        \\            (vec (range 64))))
+        \\[(try (first s) (catch :stack-overflow e (:error e))) (seq s)]
+    , "[:stack-overflow nil]");
+    try expectOutputProgram(
+        \\(declare t)
+        \\(def t (filter (fn [x] (try (first t) (catch :stack-overflow e nil)) (even? x)) (vec (range 40))))
+        \\[(take 3 t) (count t)]
+    , "[(0 2 4) 20]");
+}
