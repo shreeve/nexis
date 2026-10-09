@@ -5058,6 +5058,151 @@ test "time: Nextomic's instants are epoch milliseconds, which every time functio
     , "[2026-10-09T12:30:15.123Z true true]");
 }
 
+test "json: read-str reads every JSON value" {
+    try expectOutput(
+        \\(pr-str (nexis.json/read-str "{\"a\": [1, 2.5, -3e2, true, false, null, \"x\"], \"b\": {}, \"c\": []}"))
+    , "{\"a\" [1 2.5 -300.0 true false nil \"x\"], \"b\" {}, \"c\" []}");
+    try expectOutput("(nexis.json/read-str \" \\t\\r\\n 42 \\n\")", "42");
+    try expectOutput("(pr-str (nexis.json/read-str \"[0, -0, -0.0, 1E2, 1e-2, 0.5e+1]\"))", "[0 0 -0.0 100.0 0.01 5.0]");
+    // An integer past a fixnum is a bignum; a float past a double is
+    // infinite, as Java's parse makes it.
+    try expectOutput("(nexis.json/read-str \"[123456789012345678901234567890, -140737488355329, 1e400]\")", "[123456789012345678901234567890 -140737488355329 ##Inf]");
+    try expectOutput("(= (nexis.json/read-str \"1234567890123456789000000000000\") (* 1234567890123456789 1000000000000))", "true");
+    // A later duplicate key wins; a small object keeps the document's order.
+    try expectOutput("(pr-str (nexis.json/read-str \"{\\\"z\\\": 1, \\\"a\\\": 2, \\\"z\\\": 3}\"))", "{\"z\" 3, \"a\" 2}");
+}
+
+test "json: read-str decodes every escape and keeps UTF-8 as it is" {
+    try expectOutput("(mapv int (nexis.json/read-str \"\\\"\\\\\\\"\\\\\\\\\\\\/\\\\b\\\\f\\\\n\\\\r\\\\t\\\"\"))", "[34 92 47 8 12 10 13 9]");
+    try expectOutput("(nexis.json/read-str \"\\\"h\\\\u00e9llo \\\\uD83D\\\\uDE00 \\u65e5\\\"\")", "h\u{e9}llo \u{1F600} \u{65e5}");
+    try expectOutput("(nexis.json/read-str \"\\\"\\\\u0000\\\"\")", "\x00");
+}
+
+test "json: read-str takes :key-fn and :value-fn as clojure.data.json does" {
+    try expectOutput("(pr-str (nexis.json/read-str \"{\\\"a\\\": 1, \\\"b/c\\\": {\\\"d\\\": 2}}\" :key-fn keyword))", "{:a 1, :b/c {:d 2}}");
+    try expectOutput("(pr-str (nexis.json/read-str \"{\\\"a\\\": 1}\" :key-fn nexis.string/upper-case))", "{\"A\" 1}");
+    try expectOutput("(pr-str (nexis.json/read-str \"{\\\"a\\\": 1}\" {:key-fn keyword}))", "{:a 1}");
+    // value-fn sees each member's key after key-fn, inner objects first;
+    // returning value-fn itself drops the member.
+    try expectOutput(
+        \\(defn vf [k v] (cond (= k :drop) vf (number? v) (* v 10) :else v))
+        \\(pr-str (nexis.json/read-str "{\"a\": 1, \"drop\": 2, \"o\": {\"x\": 3, \"drop\": 4}, \"v\": [5]}" :key-fn keyword :value-fn vf))
+    , "{:a 10, :o {:x 30}, :v [5]}");
+    try expectOutput("(try (nexis.json/read-str \"{\\\"\\\": 1}\" :key-fn keyword) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.json/read-str \"1\" :keywordize true) (catch any e e))", ":invalid-argument");
+    try expectOutput("(try (nexis.json/read-str 1) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.json/read-str \"{\\\"a\\\": 1}\" :key-fn (fn [k] (throw :mine))) (catch any e e))", ":mine");
+}
+
+test "json: malformed text is :json-error, with its line and column" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "", "[1 1 \"JSON: the text ends before its value at line 1, column 1\"]" },
+        .{ "  ", "[1 3 \"JSON: the text ends before its value at line 1, column 3\"]" },
+        .{ "1 2", "[1 3 \"JSON: text follows the value at line 1, column 3\"]" },
+        .{ "[1,]", "[1 4 \"JSON: unexpected ']' at line 1, column 4\"]" },
+        .{ "{\\\"a\\\":1,}", "[1 8 \"JSON: expected a string key at line 1, column 8\"]" },
+        .{ "{\\\"a\\\" 1}", "[1 6 \"JSON: expected ':' after a key at line 1, column 6\"]" },
+        .{ "[1 2]", "[1 4 \"JSON: expected ',' or ']' at line 1, column 4\"]" },
+        .{ "{\\\"a\\\":1 \\\"b\\\":2}", "[1 8 \"JSON: expected ',' or '}' at line 1, column 8\"]" },
+        .{ "{\\n  \\\"\\u00e9\\\": x}", "[2 8 \"JSON: unexpected 'x' at line 2, column 8\"]" },
+        .{ "tru", "[1 1 \"JSON: unexpected 't' at line 1, column 1\"]" },
+        .{ "nulls", "[1 5 \"JSON: text follows the value at line 1, column 5\"]" },
+        .{ "-", "[1 1 \"JSON: a malformed number at line 1, column 1\"]" },
+        .{ "1.", "[1 1 \"JSON: a malformed number at line 1, column 1\"]" },
+        .{ "1e+", "[1 1 \"JSON: a malformed number at line 1, column 1\"]" },
+        .{ "01", "[1 2 \"JSON: text follows the value at line 1, column 2\"]" },
+        .{ "\\\"abc", "[1 5 \"JSON: the text ends inside a string at line 1, column 5\"]" },
+        .{ "\\\"a\\nb\\\"", "[1 3 \"JSON: a control character in a string at line 1, column 3\"]" },
+        .{ "\\\"\\\\x\\\"", "[1 2 \"JSON: an unknown escape at line 1, column 2\"]" },
+        .{ "\\\"\\\\u12g4\\\"", "[1 2 \"JSON: an unknown escape at line 1, column 2\"]" },
+        .{ "\\\"\\\\ud800\\\"", "[1 2 \"JSON: a lone surrogate at line 1, column 2\"]" },
+        .{ "\\\"\\\\udc00\\\\ud800\\\"", "[1 2 \"JSON: a lone surrogate at line 1, column 2\"]" },
+        .{ "[[[", "[1 4 \"JSON: the text ends before its value at line 1, column 4\"]" },
+    };
+    for (cases) |case| {
+        const src = try std.fmt.allocPrint(testing.allocator, "(pr-str (try (nexis.json/read-str \"{s}\") (catch :json-error e [(:line e) (:column e) (ex-message e)])))", .{case[0]});
+        defer testing.allocator.free(src);
+        try expectOutput(src, case[1]);
+    }
+}
+
+test "json: nesting deeper than the native stack reads, and writes as :stack-overflow" {
+    try expectOutput(
+        \\(def deep (nexis.json/read-str (str (apply str (repeat 200000 "[")) (apply str (repeat 200000 "]")))))
+        \\[(loop [x deep n 0] (if (seq x) (recur (first x) (inc n)) n)) (try (nexis.json/write-str deep) (catch any e e))]
+    , "[199999 :stack-overflow]");
+}
+
+test "json: write-str writes every value nexis.json reads, and more" {
+    try expectOutput("(nexis.json/write-str {:a 1 :b [1 2.5 nil true false] :c \"x\"})", "{\"a\":1,\"b\":[1,2.5,null,true,false],\"c\":\"x\"}");
+    try expectOutput("(nexis.json/write-str [#{1} '(2) (range 3) (map inc [1]) (sorted-set 3) (i64-vector [4])])", "[[1],[2],[0,1,2],[2],[3],[4]]");
+    try expectOutput("(nexis.json/write-str [\\a 'b :c/d 'e/f (sorted-map :b 2 :a 1)])", "[\"a\",\"b\",\"c/d\",\"e/f\",{\"a\":1,\"b\":2}]");
+    try expectOutput("(nexis.json/write-str [123456789012345678901234567890 1.0E10 -0.0 0.1 1e-5])", "[123456789012345678901234567890,1.0E10,-0.0,0.1,1.0E-5]");
+    try expectOutput("(nexis.json/write-str {1 :a :n/k :b \"s\" :c})", "{\"1\":\"a\",\"n/k\":\"b\",\"s\":\"c\"}");
+    try expectOutput("(nexis.json/write-str (nexis.time/parse \"2026-10-09T12:30:15.123Z\"))", "\"2026-10-09T12:30:15.123Z\"");
+    try expectOutput("(defrecord P [x]) (nexis.json/write-str (->P 1))", "{\"x\":1}");
+    try expectOutput("(nexis.json/write-str \"q\\\"\\\\\\n\\t\\u0001\\u007f/\u{e9}\u{1F600}\")", "\"q\\\"\\\\\\n\\t\\u0001\x7f/\u{e9}\u{1F600}\"");
+    try expectOutput("(nexis.json/write-str \"/\u{e9}\u{1F600}\" :escape-unicode true :escape-slash true)", "\"\\/\\u00e9\\ud83d\\ude00\"");
+    try expectOutput("(nexis.json/write-str (mapv char [8 12 13]))", "[\"\\b\",\"\\f\",\"\\r\"]");
+}
+
+test "json: write-str takes :key-fn, :value-fn and :indent" {
+    try expectOutput("(nexis.json/write-str {:n/a 1} :key-fn name)", "{\"a\":1}");
+    try expectOutput(
+        \\(defn vf [k v] (if (= k :drop) vf (inc v)))
+        \\(nexis.json/write-str {:a 1 :drop 2 :b 3} :value-fn vf)
+    , "{\"a\":2,\"b\":4}");
+    try expectOutput("(nexis.json/write-str {:a 1} :value-fn (fn [k v] (range v)))", "{\"a\":[0]}");
+    try expectOutput("(nexis.json/write-str {:a [1 {:b 2}] :c {} :d []} :indent true)",
+        \\{
+        \\  "a": [
+        \\    1,
+        \\    {
+        \\      "b": 2
+        \\    }
+        \\  ],
+        \\  "c": {},
+        \\  "d": []
+        \\}
+    );
+    try expectOutput("(nexis.json/write-str 1 :indent true)", "1");
+}
+
+test "json: what JSON cannot hold is :json-error" {
+    try expectOutput("(try (nexis.json/write-str ##NaN) (catch :json-error e (ex-message e)))", "JSON: cannot write NaN");
+    try expectOutput("(try (nexis.json/write-str [##Inf]) (catch :json-error e (ex-message e)))", "JSON: cannot write Infinity");
+    try expectOutput("(try (nexis.json/write-str {nil 1}) (catch :json-error e (ex-message e)))", "JSON: cannot write a nil key");
+    try expectOutput("(try (nexis.json/write-str {[1] 1}) (catch :json-error e (ex-message e)))", "JSON: cannot write a key of class vector");
+    try expectOutput("(try (nexis.json/write-str {:a 1} :key-fn (fn [k] 1)) (catch :json-error e (ex-message e)))", "JSON: :key-fn returned a value of class fixnum, not a string");
+    try expectOutput("(try (nexis.json/write-str inc) (catch :json-error e (ex-message e)))", "JSON: cannot write a value of class native_fn");
+    try expectOutput("(try (nexis.json/write-str (atom 1)) (catch :json-error e (ex-message e)))", "JSON: cannot write a value of class atom");
+    try expectOutput("(try (nexis.json/write-str 1 :pretty true) (catch any e e))", ":invalid-argument");
+}
+
+test "json: a value written and read back is equal" {
+    try expectOutput(
+        \\(def x {"s" "h\u00e9 \"q\" \\ /" "n" [0 -1 140737488355328 2.5 -0.0 1.0E300] "m" {"a" {"b" [nil true false []]}} "e" {}})
+        \\[(= x (nexis.json/read-str (nexis.json/write-str x)))
+        \\ (= x (nexis.json/read-str (nexis.json/write-str x :indent true :escape-unicode true :escape-slash true)))]
+    , "[true true]");
+}
+
+test "json: read and write go through a file" {
+    try expectOutputProgramWithStore("json-file",
+        \\[(nexis.json/write {:a [1 2] :b "\u00e9"} "@STORE@" :indent true)
+        \\ (slurp "@STORE@")
+        \\ (nexis.json/read "@STORE@" :key-fn keyword)]
+    ,
+        \\[nil {
+        \\  "a": [
+        \\    1,
+        \\    2
+        \\  ],
+        \\  "b": "é"
+        \\} {:a [1 2], :b é}]
+    );
+}
+
 // =============================================================================
 // case / condp / for macros
 // =============================================================================

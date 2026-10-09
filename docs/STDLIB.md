@@ -27,7 +27,7 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
    the sources themselves are evaluated, each with its namespace
    current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
    `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`,
-   `shell.nx`, `time.nx`.
+   `shell.nx`, `time.nx`, `json.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -110,10 +110,11 @@ Var inside a `binding`.
 | `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
 | `nexis.shell` | (`#%sh` in `internal_natives`) | `shell.nx` | §11 |
 | `nexis.time` | (`#%now-ms`, `#%format-instant`, `#%parse-instant` in `internal_natives`) | `time.nx` | §12 |
+| `nexis.json` | (`#%json-read`, `#%json-write` in `internal_natives`) | `json.nx` | §13 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11 and §12 call |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11–§13 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -733,7 +734,7 @@ Clojure's `#inst` and of Nextomic's `:db.type/instant`. A record needs
 no new value kind (PLAN §23): it is `=` and hashes by its `:ms`,
 `(:ms i)` reads it, and it prints as `#nexis.time.Instant{:ms
 1791549015123}`. It is not `compare`-able, as records are not
-(`docs/SORTED.md` §6): sort instants with `(sort-by inst-ms xs)`.
+(`docs/SORTED.md` §6): sort instants with `(sort-by t/inst-ms xs)`.
 `nexis.core`'s `inst?` is false of everything (§8) and there is no
 `#inst` literal (PLAN §4; `TODO.md` has the design note). The range is
 the fixnum's, ±2^47 ms: -2490-03-17 to 6429-10-17.
@@ -764,3 +765,84 @@ arithmetic (a month later); a program that needs them builds them on
 instant's text reads back as the same instant;
 `test/integration/eval_pipeline.zig` pins each row and a Nextomic
 round trip.
+
+---
+
+### 13. JSON: `nexis.json`
+
+`src/stdlib/json.nx` is JSON in the shape of `clojure.data.json`
+(`read-str`, `write-str`, `read`, `write` and their options), each a
+docstring'd `defn` over a native in `internal_natives`. Options are
+keyword arguments or a trailing map (`(read-str s :key-fn keyword)`,
+`(read-str s {:key-fn keyword})`); a key other than the ones a
+function takes is `:invalid-argument`, where `clojure.data.json`
+ignores it.
+
+**Reading.** The text is RFC 8259 JSON, exactly: an object is a map,
+a later duplicate key winning and one of up to eight members keeping
+the text's order (§5); an array a vector; a string a string, every
+escape decoded, a surrogate pair to its character; an integer a
+fixnum, or a bignum past one, with no limit on its digits; a number
+with a fraction or an exponent a double (`1e400` is `##Inf`, as Java
+reads it); `true`, `false` and `null` themselves. Whitespace is space,
+tab, CR and LF. Nothing else is JSON: a trailing comma, a comment,
+`NaN`, a leading zero (`01` is `0` and text after it), a control
+character unescaped in a string, a lone surrogate, text after the
+value. The reader is a loop, not a recursion: each value waits on the
+VM's root stack until the array or object it is in closes and is then
+built into it, so the text nests as deep as memory allows, and every
+value is rooted across the options' calls (GC.md §11.5).
+
+**Writing.** A hash map, sorted map, record or Nextomic entity is an
+object; a vector, list, seq (realized first), set or typed vector an
+array; a string a string; a character a one-character string; a
+keyword or symbol its whole name without the colon (`:person/name` is
+`"person/name"`, where `clojure.data.json` writes `"name"`: a
+Nextomic attribute keeps its namespace; `:key-fn name` gives
+`clojure.data.json`'s keys); a `nexis.time.Instant` its ISO-8601 text
+(§12); an integer its digits; a double Java's `Double.toString`
+(`1.0E10`), a valid JSON number; `true`, `false` and nil `null`. A map
+key is a string as it is, a keyword or symbol by its whole name, an
+integer by its digits. A string is written as UTF-8 with `"`, `\` and
+the control characters escaped (`\b`, `\f`, `\n`, `\r`, `\t`, else
+`\u00XX`); `clojure.data.json` escapes every non-ASCII character and
+`/` by default, this writer only when asked. The walk recurses on the
+data's depth under the stack guard, so data nested past the native
+stack is a catchable `:stack-overflow`.
+
+| Name | Arity | Semantics |
+|---|---|---|
+| `read-str` | 1+ | `(read-str s & opts)`: the value of the JSON text `s`. `:key-fn`: a function of each key's string, its result the map key (`keyword` gives keyword keys, interned without a call: an empty key, which names no keyword, is `:invalid-argument`). `:value-fn`: a function of each object member's key (after `:key-fn`) and value, inner objects first, whose result replaces the value, or drops the member when it is `:value-fn` itself |
+| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/` |
+| `read` | 1+ | `(read path & opts)`: `read-str` of the file's text (`slurp`); stdin is `(read "/dev/stdin")` |
+| `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
+
+**Errors.** Malformed text throws the map `{:error :json-error
+:message "JSON: <what> at line L, column C" :line L :column C}` (as
+the multimethod errors are maps, §9.4), the column counted in
+characters, so `(catch :json-error e (ex-message e))` takes it; the
+`<what>`s are `the text ends before its value`, `the text ends inside
+a string` (an `object`, an `array`), `text follows the value`,
+`unexpected 'c'`, `expected a string key`, `expected ':' after a
+key`, `expected ',' or '}'` (`']'`), `a malformed number`, `a control
+character in a string`, `an unknown escape`, `a lone surrogate`.
+Writing what JSON cannot hold throws `{:error :json-error :message
+...}` without a position: `NaN` or an infinity, a nil key, a key of
+another class, a `:key-fn` result that is not a string, a value of any
+other class (a function, an atom). A text that is not a string, or an
+options map that is not a map, is `:kind-mismatch`; a string that is
+not UTF-8 `:utf8-error`; a throw from an option's function passes
+through.
+
+**Speed.** An optimized build (`-Doptimize=fast`, the Apple M5, one
+core under the machine's queue) reads a 10.5 MB document of 42,000
+records (nested objects, arrays, strings with escapes and non-ASCII
+text, doubles, integers to 10^12) in 41–56 ms, 30–43 ms with keyword
+keys, and writes it back in 42–47 ms (5 runs in one process); the
+process peaks at 203 MB. Babashka's cheshire takes 121–175 ms and
+60–161 ms on the same document.
+
+`test/integration/eval_pipeline.zig` pins every value kind both ways,
+the options, each error and its position, a round trip of every kind
+JSON holds, files, and a text 200,000 arrays deep, which reads, and
+writes as `:stack-overflow`.
