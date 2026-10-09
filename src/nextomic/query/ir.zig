@@ -373,61 +373,79 @@ pub const no_rules: RuleSet = .{
 // Variable collection
 // =============================================================================
 
-/// Variables bound by evaluating `clauses` (patterns, function outputs,
-/// `or` join variables, rule arguments); not `not` bodies.
-pub fn boundVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
-    try stack.check();
-    for (clauses) |c| switch (c) {
-        .pattern => |p| for (p.terms()) |t| {
-            if (t.asVar()) |v| try addVar(arena, out, v);
-        },
-        .pred => {},
-        .bind => |b| for (try b.out.vars(arena)) |v| try addVar(arena, out, v),
-        .not => {},
-        .@"or" => |o| {
-            if (o.join) |js| {
-                for (js) |v| try addVar(arena, out, v);
-            } else for (o.branches) |br| try boundVars(arena, br, out);
-        },
-        .rule => |r| for (r.args) |a| {
-            if (a == .variable) try addVar(arena, out, a.variable);
-        },
-        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
-    };
-}
+/// An ordered set of variables with constant-time membership: what a
+/// walk of clauses collects, or the variables bound at a point of
+/// planning, in the order they were added.
+pub const VarSet = struct {
+    list: std.ArrayList(Var) = .empty,
+    /// Per member, its index in `list`.
+    at: std.AutoHashMapUnmanaged(Var, u32) = .empty,
 
-/// Every variable mentioned anywhere in `clauses`, including predicate
-/// arguments and `not` bodies.
-pub fn allVars(arena: Allocator, clauses: []const Clause, out: *std.ArrayList(Var)) !void {
+    pub const empty: VarSet = .{};
+
+    pub fn init(arena: Allocator, vars: []const Var) !VarSet {
+        var out: VarSet = .{};
+        for (vars) |v| try out.add(arena, v);
+        return out;
+    }
+
+    pub fn items(self: *const VarSet) []const Var {
+        return self.list.items;
+    }
+
+    pub fn has(self: *const VarSet, v: Var) bool {
+        return self.at.contains(v);
+    }
+
+    /// The position `v` was added at, or null.
+    pub fn indexOf(self: *const VarSet, v: Var) ?u32 {
+        return self.at.get(v);
+    }
+
+    pub fn add(self: *VarSet, arena: Allocator, v: Var) !void {
+        const gop = try self.at.getOrPut(arena, v);
+        if (gop.found_existing) return;
+        gop.value_ptr.* = @intCast(self.list.items.len);
+        try self.list.append(arena, v);
+    }
+};
+
+/// What `collectVars` takes: `bound`, the variables evaluating the
+/// clauses binds (patterns, function outputs, `or` join variables,
+/// rule arguments; not predicate arguments or `not` bodies), or `all`,
+/// every variable the clauses mention.
+pub const Walk = enum { bound, all };
+
+pub fn collectVars(arena: Allocator, comptime walk: Walk, clauses: []const Clause, out: *VarSet) !void {
     try stack.check();
     for (clauses) |c| switch (c) {
         .pattern => |p| for (p.terms()) |t| {
-            if (t.asVar()) |v| try addVar(arena, out, v);
+            if (t.asVar()) |v| try out.add(arena, v);
         },
-        .pred => |call| try callVars(arena, call, out),
+        .pred => |call| if (walk == .all) try callVars(arena, call, out),
         .bind => |b| {
-            try callVars(arena, b.call, out);
-            for (try b.out.vars(arena)) |v| try addVar(arena, out, v);
+            if (walk == .all) try callVars(arena, b.call, out);
+            for (try b.out.vars(arena)) |v| try out.add(arena, v);
         },
-        .not => |n| {
-            if (n.join) |js| for (js) |v| try addVar(arena, out, v);
-            try allVars(arena, n.body, out);
+        .not => |n| if (walk == .all) {
+            if (n.join) |js| for (js) |v| try out.add(arena, v);
+            try collectVars(arena, walk, n.body, out);
         },
         .@"or" => |o| {
-            if (o.join) |js| for (js) |v| try addVar(arena, out, v);
-            for (o.branches) |br| try allVars(arena, br, out);
+            if (o.join) |js| for (js) |v| try out.add(arena, v);
+            if (walk == .all or o.join == null) for (o.branches) |br| try collectVars(arena, walk, br, out);
         },
         .rule => |r| for (r.args) |a| {
-            if (a == .variable) try addVar(arena, out, a.variable);
+            if (a == .variable) try out.add(arena, a.variable);
         },
-        .source => |s| for (s.vars) |v| try addVar(arena, out, v),
+        .source => |s| for (s.vars) |v| try out.add(arena, v),
     };
 }
 
-fn callVars(arena: Allocator, call: Call, out: *std.ArrayList(Var)) !void {
-    if (call.f == .variable) try addVar(arena, out, call.f.variable);
+fn callVars(arena: Allocator, call: Call, out: *VarSet) !void {
+    if (call.f == .variable) try out.add(arena, call.f.variable);
     for (call.args) |a| {
-        if (a == .variable) try addVar(arena, out, a.variable);
+        if (a == .variable) try out.add(arena, a.variable);
     }
 }
 
@@ -452,12 +470,13 @@ test "binding vars and var collection" {
         .{ .pred = .{ .f = .{ .builtin = .lt }, .args = &.{ .{ .variable = 1 }, .{ .constant = .{ .int = 3 } } } } },
         .{ .not = .{ .join = null, .body = &.{.{ .pattern = .{ .e = .{ .variable = 0 }, .a = .blank, .v = .{ .variable = 7 } } }} } },
     };
-    var bound: std.ArrayList(Var) = .empty;
-    try boundVars(arena, &clauses, &bound);
-    try std.testing.expectEqualSlices(Var, &.{ 0, 1 }, bound.items);
-    var all: std.ArrayList(Var) = .empty;
-    try allVars(arena, &clauses, &all);
-    try std.testing.expectEqualSlices(Var, &.{ 0, 1, 7 }, all.items);
+    var bound: VarSet = .{};
+    try collectVars(arena, .bound, &clauses, &bound);
+    try std.testing.expectEqualSlices(Var, &.{ 0, 1 }, bound.items());
+    var all: VarSet = .{};
+    try collectVars(arena, .all, &clauses, &all);
+    try std.testing.expectEqualSlices(Var, &.{ 0, 1, 7 }, all.items());
+    try std.testing.expectEqual(@as(?u32, 2), all.indexOf(7));
     try std.testing.expectEqual(Builtin.ne, Builtin.fromName("!=").?);
     try std.testing.expectEqual(AggOp.count_distinct, AggOp.fromName("count-distinct").?);
 }

@@ -577,17 +577,17 @@ const Naive = struct {
                 if (sub.items.len == 0) try self.solve(rest, env, out, src);
             },
             .@"or" => |o| {
-                var join: std.ArrayList(Var) = .empty;
+                var join: ir.VarSet = .{};
                 if (o.join) |js| {
-                    try join.appendSlice(self.arena, js);
-                } else try ir.allVars(self.arena, o.branches[0], &join);
+                    for (js) |v| try join.add(self.arena, v);
+                } else try ir.collectVars(self.arena, .all, o.branches[0], &join);
                 var seen: std.ArrayList(Env) = .empty;
                 for (o.branches) |br| {
                     var sub: std.ArrayList(Env) = .empty;
                     try self.solve(br, env, &sub, src);
                     for (sub.items) |s| {
                         const e2 = try self.copy(env);
-                        for (join.items) |v| e2[v] = s[v];
+                        for (join.items()) |v| e2[v] = s[v];
                         var dup = false;
                         for (seen.items) |x| if (envEql(x, e2)) {
                             dup = true;

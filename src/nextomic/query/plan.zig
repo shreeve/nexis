@@ -284,6 +284,8 @@ pub const Ctx = struct {
     /// Nesting of `planSub` calls; 1 while placing the query's own
     /// clauses, whose index a refusal then reports.
     depth: usize = 0,
+    /// `liveness`'s table, by variable, all `.{}` between its calls.
+    uses: std.ArrayList(Use) = .empty,
     clause_index: ?usize = null,
     /// Where a syntax or attribute error leaves its reason.
     diag: *Diag,
@@ -400,41 +402,9 @@ pub const Ctx = struct {
 };
 
 /// The variables bound at a point of planning, in the order they were
-/// bound, with constant-time membership.
-pub const Bound = struct {
-    list: std.ArrayList(Var) = .empty,
-    /// Per variable, its index in `list`, or `unbound`.
-    at: std.ArrayList(u32) = .empty,
-
-    const unbound = std.math.maxInt(u32);
-    pub const none: Bound = .{};
-
-    pub fn init(arena: Allocator, vars: []const Var) !Bound {
-        var b: Bound = .{};
-        for (vars) |v| try b.add(arena, v);
-        return b;
-    }
-
-    pub fn items(self: *const Bound) []const Var {
-        return self.list.items;
-    }
-
-    pub fn has(self: *const Bound, v: Var) bool {
-        return v < self.at.items.len and self.at.items[v] != unbound;
-    }
-
-    /// Was `v` bound at or after the `mark`-th binding?
-    fn since(self: *const Bound, v: Var, mark: usize) bool {
-        return self.has(v) and self.at.items[v] >= mark;
-    }
-
-    pub fn add(self: *Bound, arena: Allocator, v: Var) !void {
-        if (self.has(v)) return;
-        if (v >= self.at.items.len) try self.at.appendNTimes(arena, unbound, v + 1 - self.at.items.len);
-        self.at.items[v] = @intCast(self.list.items.len);
-        try self.list.append(arena, v);
-    }
-};
+/// bound, with constant-time membership: a set costs its own members,
+/// not the plan's whole variable table.
+pub const Bound = ir.VarSet;
 
 /// The rows a scan of `index` reads in this view: the current tree's
 /// entries in the plain view at the newest basis, otherwise the
@@ -481,24 +451,34 @@ pub fn planSub(ctx: *Ctx, clauses: []const Clause, input: []const Var, rows_in: 
     return out;
 }
 
+/// Per variable while `liveness` runs: one past the index of the last
+/// step that reads it, and whether the plan's caller asks for it.
+const Use = struct { last_read: usize = 0, asked: bool = false };
+
 /// Fill `p.drop` and `p.park`: after each step the relation drops the
 /// variables no later step reads and `output` does not name, and parks
 /// the ones only `output` names once there are `park_min` of them and
-/// two steps still to run.
+/// two steps still to run. Every plan shares one table of `Use`s, set
+/// for the plan's own variables and reset on the way out: a sub-plan's
+/// liveness has run before its parent's starts, so planning costs the
+/// variables of each plan, not the whole table once per sub-plan.
 fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
     const arena = ctx.arena;
-    const n_vars = ctx.vars.items.len;
-    // Per variable, one past the index of the last step that reads it.
-    const last_read = try arena.alloc(usize, n_vars);
-    @memset(last_read, 0);
+    try ctx.uses.appendNTimes(arena, .{}, ctx.vars.items.len -| ctx.uses.items.len);
+    const uses = ctx.uses.items;
+    var touched: std.ArrayList(Var) = .empty;
+    defer for (touched.items) |v| {
+        uses[v] = .{};
+    };
     var scratch: std.ArrayList(Var) = .empty;
     for (p.steps, 1..) |*s, n| {
         scratch.clearRetainingCapacity();
         _ = try stepVars(arena, s, &scratch);
-        for (scratch.items) |v| last_read[v] = n;
+        for (scratch.items) |v| uses[v].last_read = n;
+        try touched.appendSlice(arena, scratch.items);
     }
-    var asked = try std.bit_set.Dynamic.initEmpty(arena, n_vars);
-    for (output) |v| asked.set(v);
+    for (output) |v| uses[v].asked = true;
+    try touched.appendSlice(arena, output);
 
     const drop = try arena.alloc([]const Var, p.steps.len);
     const park = try arena.alloc(?Park, p.steps.len);
@@ -513,9 +493,9 @@ fn liveness(ctx: *Ctx, p: *Plan, output: []const Var) !void {
         var payload: std.ArrayList(Var) = .empty;
         var kept: usize = 0;
         for (held.items) |v| {
-            const later = v != row and last_read[v] > n;
-            if (v == row or (!later and asked.isSet(v))) try payload.append(arena, v);
-            if (v == row or later or asked.isSet(v)) {
+            const later = v != row and uses[v].last_read > n;
+            if (v == row or (!later and uses[v].asked)) try payload.append(arena, v);
+            if (v == row or later or uses[v].asked) {
                 held.items[kept] = v;
                 kept += 1;
             } else try gone.append(arena, v);
@@ -616,17 +596,15 @@ const Cost = union(enum) {
 fn planClauses(ctx: *Ctx, clauses: []const Clause, bound: *Bound, steps: *std.ArrayList(Step), rows_after: *std.ArrayList(u64), rows: *u64) Failure!void {
     const pending = try ctx.arena.alloc(Pending, clauses.len);
     for (clauses, pending) |c, *p| {
-        var vs: std.ArrayList(Var) = .empty;
-        try ir.allVars(ctx.arena, &.{c}, &vs);
-        p.* = .{ .clause = c, .vars = vs.items };
+        var vs: ir.VarSet = .{};
+        try ir.collectVars(ctx.arena, .all, &.{c}, &vs);
+        p.* = .{ .clause = c, .vars = vs.items() };
     }
 
     // Variables that some clause at this level binds: `not` joins on its
     // body's variables that are in scope here.
-    var scope_list: std.ArrayList(Var) = .empty;
-    try scope_list.appendSlice(ctx.arena, bound.items());
-    try ir.boundVars(ctx.arena, clauses, &scope_list);
-    const scope = try Bound.init(ctx.arena, scope_list.items);
+    var scope = try Bound.init(ctx.arena, bound.items());
+    try ir.collectVars(ctx.arena, .bound, clauses, &scope);
 
     var remaining = clauses.len;
     while (remaining > 0) {
@@ -775,7 +753,7 @@ fn invalidate(pending: []Pending, bound: *const Bound, mark: usize) void {
     if (bound.items().len == mark) return;
     for (pending) |*p| {
         if (p.done or p.cost == .stale) continue;
-        for (p.vars) |v| if (bound.since(v, mark)) {
+        for (p.vars) |v| if ((bound.indexOf(v) orelse continue) >= mark) {
             p.cost = .stale;
             break;
         };
@@ -879,15 +857,15 @@ pub fn newVars(arena: Allocator, vars: []const Var, bound: *const Bound) ![]Var 
 /// its listed variables. At least one must join.
 fn notJoin(ctx: *Ctx, n: anytype, scope: *const Bound) ![]const Var {
     if (n.join) |js| return js;
-    var body_vars: std.ArrayList(Var) = .empty;
-    try ir.allVars(ctx.arena, n.body, &body_vars);
+    var body_vars: ir.VarSet = .{};
+    try ir.collectVars(ctx.arena, .all, n.body, &body_vars);
     var join: std.ArrayList(Var) = .empty;
-    for (body_vars.items) |v| {
+    for (body_vars.items()) |v| {
         if (scope.has(v)) try join.append(ctx.arena, v);
     }
     if (join.items.len == 0) {
-        std.debug.assert(body_vars.items.len > 0);
-        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items[0])});
+        std.debug.assert(body_vars.items().len > 0);
+        return ctx.syntaxFmt("not shares no variable with the clauses around it: {s} is bound nowhere outside; not joins on a variable bound outside it", .{ctx.varName(body_vars.items()[0])});
     }
     return join.toOwnedSlice(ctx.arena);
 }
@@ -895,9 +873,9 @@ fn notJoin(ctx: *Ctx, n: anytype, scope: *const Bound) ![]const Var {
 /// `or` joins on every variable of its branches; `or-join` on its list.
 fn orJoin(ctx: *Ctx, o: anytype) ![]const Var {
     if (o.join) |js| return js;
-    var vs: std.ArrayList(Var) = .empty;
-    try ir.allVars(ctx.arena, o.branches[0], &vs);
-    return vs.toOwnedSlice(ctx.arena);
+    var vs: ir.VarSet = .{};
+    try ir.collectVars(ctx.arena, .all, o.branches[0], &vs);
+    return vs.items();
 }
 
 /// Plan an `or`: every branch starts from the join variables already
@@ -911,10 +889,9 @@ pub fn planOr(ctx: *Ctx, branches: []const ir.Branch, join: []const Var, bound: 
     const plans = try ctx.arena.alloc(*Plan, branches.len);
     for (branches, plans, 1..) |br, *p, n| {
         p.* = try planSub(ctx, br, bound_join.items, rows, join);
-        var ends: std.ArrayList(Var) = .empty;
-        try ends.appendSlice(ctx.arena, bound_join.items);
-        try ir.boundVars(ctx.arena, br, &ends);
-        for (join) |v| if (!ir.containsVar(ends.items, v)) {
+        var ends = try Bound.init(ctx.arena, bound_join.items);
+        try ir.collectVars(ctx.arena, .bound, br, &ends);
+        for (join) |v| if (!ends.has(v)) {
             if (rule) |name| return ctx.syntaxFmt("rule {s} body {d} leaves {s} unbound; every body binds every head variable", .{ ctx.interner.symbolName(name), n, ctx.varName(v) });
             return ctx.syntaxFmt("or-join branch {d} leaves {s} unbound; every branch binds every join variable", .{ n, ctx.varName(v) });
         };
@@ -1074,7 +1051,7 @@ fn varSlot(ctx: *Ctx, v: Var, bound: *const Bound, fresh: *std.ArrayList(Var)) !
 fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
     try ctx.select(p.src);
     const choice = try choose(ctx, p, bound);
-    const hash_choice: ?Choice = choose(ctx, p, &Bound.none) catch |err| switch (err) {
+    const hash_choice: ?Choice = choose(ctx, p, &Bound.empty) catch |err| switch (err) {
         error.UnboundPattern => null,
         else => return err,
     };

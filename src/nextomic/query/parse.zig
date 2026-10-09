@@ -474,20 +474,20 @@ const Parser = struct {
 
     /// Every `find` and `with` variable must be bound by `in` or `where`.
     fn checkBound(self: *Parser, out: *Ir) Error!void {
-        var bound: std.ArrayList(Var) = .empty;
+        var bound: ir.VarSet = .{};
         for (out.in) |b| switch (b) {
-            .scalar, .collection => |v| try ir.addVar(self.arena, &bound, v),
+            .scalar, .collection => |v| try bound.add(self.arena, v),
             .tuple, .relation => |ts| for (ts) |t| {
-                if (t) |v| try ir.addVar(self.arena, &bound, v);
+                if (t) |v| try bound.add(self.arena, v);
             },
             .src, .rules => {},
         };
-        out.in_vars = try self.arena.dupe(Var, bound.items);
-        try ir.boundVars(self.arena, out.where, &bound);
+        out.in_vars = try self.arena.dupe(Var, bound.items());
+        try ir.collectVars(self.arena, .bound, out.where, &bound);
         self.clause_index = null;
         for (self.pull_srcs.items) |ps| self.find_elems[ps.find].pull.src = try self.srcOf(ps.sym);
         for (out.find) |f| {
-            if (!ir.containsVar(bound.items, f.variable_of())) return self.failFmt(":find variable {s} is not bound by :in or :where", .{self.varName(f.variable_of())});
+            if (!bound.has(f.variable_of())) return self.failFmt(":find variable {s} is not bound by :in or :where", .{self.varName(f.variable_of())});
             if (f != .pull) continue;
             if (self.sources.items.len == 0) return self.fail("pull reads a data source, and :in names none");
             switch (f.pull.pattern) {
@@ -496,7 +496,7 @@ const Parser = struct {
             }
         }
         for (out.with) |w| {
-            if (!ir.containsVar(bound.items, w)) return self.failFmt(":with variable {s} is not bound by :in or :where", .{self.varName(w)});
+            if (!bound.has(w)) return self.failFmt(":with variable {s} is not bound by :in or :where", .{self.varName(w)});
         }
     }
 
@@ -539,9 +539,9 @@ const Parser = struct {
                     for (parts[1..]) |c| try self.parseClauseInto(c, out);
                 } else if (std.mem.eql(u8, head, "not")) {
                     const body = try self.parseBody(parts[1..]);
-                    var vs: std.ArrayList(Var) = .empty;
-                    try ir.allVars(self.arena, body, &vs);
-                    if (vs.items.len == 0) return self.fail("not clause has no variables");
+                    var vs: ir.VarSet = .{};
+                    try ir.collectVars(self.arena, .all, body, &vs);
+                    if (vs.items().len == 0) return self.fail("not clause has no variables");
                     try out.append(self.arena, .{ .not = .{ .join = null, .body = body } });
                 } else if (std.mem.eql(u8, head, "not-join")) {
                     if (parts.len < 3) return self.fail("not-join takes a variable vector and clauses");
@@ -587,13 +587,13 @@ const Parser = struct {
     /// Every `or` branch mentions the same variables; the message names
     /// the first variable one branch has and another lacks.
     fn checkOrBranches(self: *Parser, branches: []const ir.Branch) Error!void {
-        var first: std.ArrayList(Var) = .empty;
-        try ir.allVars(self.arena, branches[0], &first);
+        var first: ir.VarSet = .{};
+        try ir.collectVars(self.arena, .all, branches[0], &first);
         for (branches[1..], 2..) |b, n| {
-            var vs: std.ArrayList(Var) = .empty;
-            try ir.allVars(self.arena, b, &vs);
-            for (first.items) |v| if (!ir.containsVar(vs.items, v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
-            for (vs.items) |v| if (!ir.containsVar(first.items, v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
+            var vs: ir.VarSet = .{};
+            try ir.collectVars(self.arena, .all, b, &vs);
+            for (first.items()) |v| if (!vs.has(v)) return self.failFmt("or branch {d} does not mention {s}, which branch 1 does; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
+            for (vs.items()) |v| if (!first.has(v)) return self.failFmt("or branch {d} mentions {s}, which branch 1 does not; every or branch uses the same variables (or-join names the join variables)", .{ n, self.varName(v) });
         }
     }
 

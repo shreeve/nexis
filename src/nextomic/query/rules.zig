@@ -444,7 +444,8 @@ fn unpushedRequired(ctx: *Ctx, inst: *const Instance, several: bool, required: u
 /// clause that names no source reads the call's.
 const Renamer = struct {
     ctx: *Ctx,
-    map: []?Var,
+    /// Rule variable to plan variable, for the variables met so far.
+    map: std.AutoHashMapUnmanaged(Var, Var) = .empty,
     scc: ?Scc,
     /// The call's data source; the body's default.
     src: ?ir.Src,
@@ -456,17 +457,15 @@ const Renamer = struct {
     };
 
     fn init(ctx: *Ctx, call_args: []const Var, def: ir.Rule, scc: ?Scc, src: ?ir.Src) !Renamer {
-        const map = try ctx.arena.alloc(?Var, ctx.rules.vars.len);
-        @memset(map, null);
-        for (def.head, call_args) |h, a| map[h] = a;
-        return .{ .ctx = ctx, .map = map, .scc = scc, .src = src };
+        var out: Renamer = .{ .ctx = ctx, .scc = scc, .src = src };
+        for (def.head, call_args) |h, a| try out.map.put(ctx.arena, h, a);
+        return out;
     }
 
     fn v(self: *Renamer, rv: Var) !Var {
-        if (self.map[rv]) |pv| return pv;
-        const pv = try self.ctx.freshVar(self.ctx.rules.vars[rv].sym);
-        self.map[rv] = pv;
-        return pv;
+        const gop = try self.map.getOrPut(self.ctx.arena, rv);
+        if (!gop.found_existing) gop.value_ptr.* = try self.ctx.freshVar(self.ctx.rules.vars[rv].sym);
+        return gop.value_ptr.*;
     }
 
     fn optVar(self: *Renamer, rv: ?Var) !?Var {
