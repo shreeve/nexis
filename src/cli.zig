@@ -22,6 +22,8 @@ const format_mod = @import("format.zig");
 const disasm_mod = @import("disasm.zig");
 const string_mod = @import("string.zig");
 const vector_mod = @import("coll/vector.zig");
+const champ_mod = @import("coll/champ.zig");
+const dispatch_mod = @import("dispatch.zig");
 const reader_mod = @import("reader.zig");
 const stack_guard = @import("stack.zig");
 const db = @import("db.zig");
@@ -497,10 +499,8 @@ const Runtime = struct {
         try label.writer.print("runtime error: {s}", .{@errorName(err)});
         if (rt.v.error_detail.len > 0) try label.writer.print(": {s}", .{rt.v.error_detail});
         if (err == vm.VmError.UncaughtThrow) if (rt.v.unhandled_throw) |payload| {
-            // An error map a handler rethrew carries the place the
-            // caret and the trace show.
             try label.writer.writeAll(" ");
-            format_mod.format(rt.v.withoutPlace(payload), .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
+            format_mod.format(rt.shownThrow(payload), .readable, &label.writer, rt.v.ensureInterner()) catch try label.writer.writeAll("#<unprintable>");
         };
 
         const trace = rt.v.error_trace.items;
@@ -527,6 +527,45 @@ const Runtime = struct {
             } else try w.print("  at {s}\n", .{frame.name});
         }
         try w.flush();
+    }
+
+    /// The uncaught `payload` as the report prints it: without the
+    /// place keys of an error map (VM.md §13) when they name the place
+    /// the trace shows it raised at, which the header and the trace
+    /// then show; whole otherwise, so a map built or changed after its
+    /// raise loses nothing.
+    fn shownThrow(rt: *Runtime, payload: Value) Value {
+        const trace = rt.v.error_trace.items;
+        if (payload.kind() != .persistent_map or trace.len == 0) return payload;
+        // The frame `VM.raiseSite` places an error at: the innermost
+        // running the program's code, else the innermost.
+        const frame = for (trace) |f| {
+            if (f.elided == 0 and (f.source == null or !f.source.?.library)) break f;
+        } else trace[0];
+        const at: ?Place = if (frame.source != null and frame.span != null) Place.of(frame.source.?, frame.span.?.pos) else null;
+        const Want = union(enum) { none, text: []const u8, int: usize };
+        const place = [_]struct { []const u8, Want }{
+            .{ "fn", .{ .text = frame.name } },
+            .{ "file", if (frame.source) |s| .{ .text = s.path } else .none },
+            .{ "line", if (at) |p| .{ .int = p.line } else .none },
+            .{ "column", if (at) |p| .{ .int = p.col } else .none },
+        };
+        var shown = payload;
+        for (place) |entry| {
+            const k = rt.v.ensureInterner().internKeywordValue(entry[0]) catch return payload;
+            const got = switch (champ_mod.mapGet(payload, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+                .absent => null,
+                .present => |x| x,
+            };
+            const named = switch (entry[1]) {
+                .none => got == null,
+                .text => |t| got != null and got.?.kind() == .string and eql(string_mod.asBytes(got.?), t),
+                .int => |n| got != null and got.?.isFixnum() and got.?.asFixnum() == n,
+            };
+            if (!named) return payload;
+            if (got != null) shown = champ_mod.mapDissoc(rt.v.ensureHeap(), shown, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return payload;
+        }
+        return shown;
     }
 
     /// `v` as `pr` prints it, then a newline, on stdout. Every lazy seq
@@ -917,6 +956,33 @@ test "cli: docSymbol: NAME is one symbol as the reader reads it, or nothing" {
     for (cases) |case| {
         const got = try docSymbol(testing.allocator, case[0]);
         if (case[1]) |want| try testing.expectEqualStrings(want, got.?) else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
+
+test "cli: an uncaught error map loses its place keys only where they name the reported place" {
+    const rt = try Runtime.create(std.testing.io, testing.allocator, &.{"."});
+    defer rt.destroy();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const f = "(defn f [] (/ 1 0)) ";
+    const cases = [_]struct { []const u8, []const u8 }{
+        // Rethrown as caught: reported where it was raised.
+        .{ f ++ "(try (f) (catch any e (throw e)))", "{:error :divide-by-zero, :message \"divide by zero\"}" },
+        // Changed in the handler: reported at the rethrow, so the
+        // raise site stays in the map.
+        .{ f ++ "(try (f) (catch any e (throw (assoc e :extra 1))))", "{:error :divide-by-zero, :message \"divide by zero\", :fn \"f\", :file \"<t>\", :line 1, :column 12, :extra 1}" },
+        .{ f ++ "(try (f) (catch any e (throw (assoc e :line 99))))", "{:error :divide-by-zero, :message \"divide by zero\", :fn \"f\", :file \"<t>\", :line 99, :column 12}" },
+        // The program's own map.
+        .{ "(throw {:error :x :line 5 :file \"a\" :fn \"f\" :column 3})", "{:error :x, :line 5, :file \"a\", :fn \"f\", :column 3}" },
+    };
+    for (cases) |case| {
+        const info = vm.SourceInfo{ .path = "<t>", .text = case[0] };
+        try testing.expectError(error.RunFailed, rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }));
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        try format_mod.format(rt.shownThrow(rt.v.unhandled_throw.?), .readable, &out.writer, rt.v.ensureInterner());
+        try testing.expectEqualStrings(case[1], out.written());
+        rt.v.resetAfterError();
     }
 }
 
