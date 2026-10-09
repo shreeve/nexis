@@ -678,6 +678,20 @@ pub fn openDelimiter(allocator: std.mem.Allocator, text: []const u8, pos: u32) e
     return open.pop();
 }
 
+/// The literal a `"` or `#"` at `pos` opens that no quote closes,
+/// which a parse error at `pos` reports as unterminated (more input
+/// may close it); null for any other text at `pos`.
+pub fn unterminatedLiteral(text: []const u8, pos: u32) ?enum { string, regex } {
+    var lexer = nexis.Lexer.init(text);
+    lexer.base.pos = pos;
+    const t = lexer.next();
+    if (t.cat != .err or t.pos != pos) return null;
+    const token = text[t.pos..][0..t.len];
+    if (std.mem.eql(u8, token, "\"")) return .string;
+    if (std.mem.eql(u8, token, "#\"")) return .regex;
+    return null;
+}
+
 /// Where the first form of `text` ends, by the scanner's tokens: past
 /// its last token, with the `#_` discards and `^meta` before it; null
 /// when the text ends first or holds a token the scanner rejects.

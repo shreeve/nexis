@@ -346,7 +346,7 @@ pub const Loader = struct {
             if (open) |o| return self.diagnose(.{ .source = info, .span = o, .label = "", .reading = true, .incomplete = true }, "parse error: unclosed `{s}`", .{text[o.pos..][0..o.len]});
             return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unexpected end of input", .{});
         }
-        if (unterminatedString(text[pos..])) return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated string", .{});
+        if (reader_mod.unterminatedLiteral(text, pos)) |lit| return self.diagnose(.{ .source = info, .span = .{ .pos = pos, .len = if (lit == .regex) 2 else 1 }, .label = "", .reading = true, .incomplete = true }, "parse error: unterminated {t}", .{lit});
         const token = text[pos..@min(text.len, pos + @max(end -| start, 1))];
         const at: Diagnostic = .{ .source = info, .span = .{ .pos = pos, .len = @intCast(token.len) }, .label = "", .reading = true };
         const closer = token.len == 1 and std.mem.findScalar(u8, ")]}", token[0]) != null;
@@ -356,20 +356,6 @@ pub const Loader = struct {
         };
         if (reader_mod.taggedLiteralHint(token)) |hint| return self.diagnose(at, "parse error: unexpected `{s}`; {s}", .{ token, hint });
         return self.diagnose(at, "parse error: unexpected `{s}`", .{token});
-    }
-
-    /// Whether `rest` opens a string literal that no unescaped `"`
-    /// closes: the parser stops at the opening quote, and more input
-    /// may complete it.
-    fn unterminatedString(rest: []const u8) bool {
-        if (rest.len == 0 or rest[0] != '"') return false;
-        var i: usize = 1;
-        while (i < rest.len) : (i += 1) switch (rest[i]) {
-            '\\' => i += 1,
-            '"' => return false,
-            else => {},
-        };
-        return true;
     }
 
     /// A failure of an `on_value` or `on_routine` callback (the REPL

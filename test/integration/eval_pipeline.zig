@@ -8694,3 +8694,14 @@ test "clojure.core is a permanent name for nexis.core" {
 test "defmacro: a lazy result whose realization fails says why, as a failing call does" {
     try expectMacroFailure("(defn g [x] x) (defmacro m [] (lazy-seq [(g)]))", "(m)", "macro m failed: ArityMismatch: g takes 1 argument, got 0", "(m)");
 }
+
+test "loader: an unterminated string or regex is reported as one, and as incomplete" {
+    try expectLoadFailure("(println \"abc)", "parse error: unterminated string", "\"");
+    try expectLoadFailure("(println #\"abc)", "parse error: unterminated regex", "#\"");
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "<test>", .text = "(re-find #\"a" };
+    try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
+    try testing.expect(program.loader.diagnostic.?.incomplete);
+}

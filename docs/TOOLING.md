@@ -136,7 +136,8 @@ of another kind (``unexpected `)`; the `[` at 1:10 is open``);
 ``parse error: unclosed `(` `` at the innermost delimiter the text
 leaves open, or `parse error: unexpected end of input` at the end when
 none is; or `parse error: unterminated string` at the `"` of a string
-literal no quote closes;
+literal no quote closes (`unterminated regex` at the `#"` of a regex
+literal);
 `reader error:
 :KIND DETAIL` at the form the reader rejected (`:duplicate-literal-key
 (keyword :a_b)`, FORMS.md §3); `compile error: SENTENCE` at the span
