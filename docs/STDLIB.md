@@ -673,7 +673,8 @@ carries a docstring, and every one holding a function its arglists
 (`test/integration/eval_pipeline.zig` walks them all); a native's
 arglists agree with the arities its row declares (an inline test in
 `src/stdlib.zig`). A docstring says what nexis does where that differs
-from Clojure. `nexis doc NAME` prints `(doc NAME)` from the command
+from Clojure; `docs/GUIDE.md` is the user's account of the
+differences. `nexis doc NAME` prints `(doc NAME)` from the command
 line (`TOOLING.md` §1).
 
 Clojure's `source` has no counterpart: a Var does not record the

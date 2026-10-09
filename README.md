@@ -51,10 +51,13 @@ overkill, and exploring data at a REPL against a file. It does not run
 Java libraries, and it is single-threaded.
 
 **Five minutes in:** install it (below), run `./bin/nexis repl` and try
-the lines under [The language](#the-language); run
+the lines under [The language](#the-language); read
+[`docs/GUIDE.md`](docs/GUIDE.md), nexis for Clojure programmers; run
 `./bin/nexis run examples/nextomic-app.nx` for a fuller database tour
 (a clinic chart with patients, visits, notes and time travel); browse
-`examples/README.md` for the other programs.
+`examples/README.md` for the other programs. Every library function
+documents itself: `(doc map)`, `(dir nexis.string)`, `(apropos
+"split")` at the REPL, or `nexis doc map` from the shell.
 
 ## How it is built
 
@@ -114,6 +117,7 @@ zig build install                      # bin/nexis
 echo '(println :hi)' | ./bin/nexis run -  # a program from stdin
 ./bin/nexis repl                       # read-eval-print loop; :quit or Ctrl-D exits
 ./bin/nexis test my_tests.nx           # run files, then every deftest they define
+./bin/nexis doc map                    # a function's documentation
 ./bin/nexis disasm examples/hello.nx   # every routine's bytecode with source positions
 ./bin/nexis --help
 ./bin/nexis --version                  # nexis 0.1.0
@@ -292,13 +296,16 @@ The semantics port; the platform does not.
 - **Exceptions are values**: `(catch :tag e ...)` matches a keyword or
   an `{:error :tag}` map; `(catch Exception e ...)` takes everything.
 
-`CLOJURE-REVIEW.md` has the full tables of reader and semantic
-differences, and `HANDOFF.md` the known gaps.
+[`docs/GUIDE.md`](docs/GUIDE.md) walks through what is the same, what
+differs and why, for someone who knows Clojure; `CLOJURE-REVIEW.md`
+has the full tables of reader and semantic differences, and
+`HANDOFF.md` the known gaps.
 
 ## Where things are
 
 | Path | What |
 |---|---|
+| `docs/GUIDE.md` | nexis for Clojure programmers: start here to use it |
 | `AGENTS.md` | Reading order, build steps, rules, layout: start here to contribute |
 | `HANDOFF.md` | The state of the tree: how to verify it, the architecture map, what is proven, the known gaps |
 | `PLAN.md` | The design decisions (§23), the canonical Form schema (§28) and the Amendment Log |
