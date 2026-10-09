@@ -19,7 +19,7 @@ samples are the committed goldens under `test/golden/cli/`, which
 | `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that cannot be a symbol (empty, starting with a digit or `:`, or holding whitespace, a bracket, a quote or a reader macro character) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
 | `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm`, `--help` or `--version` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
-| `nexis --version`, `nexis -V` | `nexis 0.1.0`: `nexis` and its version, on stdout, exit 0. The version is `build.zig.zon`'s `.version`, which the build passes to the CLI as the `version` build option. |
+| `nexis --version`, `nexis -V` | `nexis 0.2.0`: `nexis` and its version, on stdout, exit 0. The version is `build.zig.zon`'s `.version`, which the build passes to the CLI as the `version` build option. |
 
 Every command evaluates through `Loader.evalSource`: parse and read
 every top-level form, then compile and run each before compiling the
