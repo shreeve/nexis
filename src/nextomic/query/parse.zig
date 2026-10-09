@@ -930,9 +930,9 @@ fn CacheOf(comptime T: type, comptime parseFn: anytype) type {
 /// `=` over query values with lists and vectors told apart at every
 /// depth, and floats by their bits: `[?e :a (:b 1)]` and `[?e :a [:b
 /// 1]]` are equal as data but parse to different clauses, as do `0.0`
-/// and `-0.0`. A set element or a map key that is itself a collection
-/// or a float is matched against the other value's own elements and
-/// keys the same way. Anything else compares by `=`.
+/// and `-0.0`. A set element or a map key is matched against the
+/// other value's element or key `=` to it the same way. Anything else
+/// compares by `=`.
 fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
     try stack.check();
     if (a.kind() != b.kind()) return false;
@@ -965,18 +965,12 @@ fn sameShape(a: Value, b: Value) error{StackOverflow}!bool {
         },
         .persistent_set => {
             if (champ.setCount(a) != champ.setCount(b)) return false;
+            // A set holds no two `=` elements: the one `b` holds that
+            // is `=` to `x` is the only candidate.
             var it = champ.setIter(a);
-            elems: while (it.next()) |x| {
-                switch (x.kind()) {
-                    .float, .persistent_vector, .list, .persistent_map, .persistent_set => {},
-                    else => {
-                        if (!champ.setContains(b, x, &dispatch.hashValue, &dispatch.equal)) return false;
-                        continue;
-                    },
-                }
-                var jt = champ.setIter(b);
-                while (jt.next()) |y| if (try sameShape(x, y)) continue :elems;
-                return false;
+            while (it.next()) |x| {
+                const y = champ.setGet(b, x, &dispatch.hashValue, &dispatch.equal) orelse return false;
+                if (!try sameShape(x, y)) return false;
             }
             return true;
         },
