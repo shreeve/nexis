@@ -313,13 +313,13 @@ retraction writes a history tree, two adjacent rows, the retired
 assertion's `t` below its own: in key order past the tree's last key,
 where they continue the run, and the retraction first among existing
 keys, where two puts in a row would split a full leaf at the pair
-rather than in half (`docs/PERF.md` §3.11). Equal keys
+rather than in half (`docs/PERF.md` §3.36). Equal keys
 keep their batch order, so a batch leaves the trees exactly as writing
 its datoms one at a time does. A run of keys into one gap fills its
 leaves to about nine tenths, between existing keys as at a tree's end,
 whether one transaction writes it or many each write a few of its
 keys; keys that land at random, as unique strings do in AVET, fill
-about two thirds (`docs/PERF.md` §3.11 has the measured fill). The
+about two thirds (`docs/PERF.md` §3.36 has the measured fill). The
 order changes no byte of the format.
 
 ---
@@ -1250,9 +1250,11 @@ A transaction costs the pages it writes. Every tree it touches is
 copied on write along a root-to-leaf path: EAVT and AEVT, AVET and
 VAET where its attributes belong, the history twins of those it
 retracts from, the txlog, `sys`, and emdb's main and free trees. A new
-entity retracts nothing, so it writes no history tree; a changed
-datom writes the history twins of its indexes (`docs/PERF.md` §3.27
-counts the pages). emdb copies each page and checksums it at commit;
+entity retracts nothing, so it writes no history tree: one of five
+attributes, one of them unique, dirties about 17 pages of 16 KiB, 15
+without the unique one, and a changed datom 15, the history twins of
+its indexes among them (a store of 20,000 entities, `docs/PERF.md`
+§3.36). emdb copies each page and checksums it at commit;
 with its puts that is about four fifths of a small transaction's
 instructions, and Nextomic's own work (normalising, tempids,
 expansion, the txlog entry and the report) the rest (`docs/PERF.md`

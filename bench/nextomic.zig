@@ -14,7 +14,7 @@
 //!
 //! Category `nextomic-store` times nothing: it builds four store
 //! shapes (a bulk load, small transactions, churn, long strings) and
-//! prints where each one's bytes go, tree by tree (docs/PERF.md §3.11).
+//! prints where each one's bytes go, tree by tree (docs/PERF.md §3.36).
 
 const std = @import("std");
 const nx = @import("nexis");
@@ -409,7 +409,7 @@ pub fn runPull(runner: *bench.Runner, gpa: Allocator, path: [:0]const u8) !void 
 }
 
 // =============================================================================
-// nextomic-store: where a store's bytes go (docs/PERF.md §3.11)
+// nextomic-store: where a store's bytes go (docs/PERF.md §3.36)
 // =============================================================================
 
 /// The store shapes the size table measures.

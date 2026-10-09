@@ -24,7 +24,7 @@
 //!     entities, and time views of a churned store (bench/nextomic.zig).
 //!   - nextomic-store: no timings; the size of every tree of four
 //!     store shapes and the file's allocated bytes (bench/nextomic.zig,
-//!     docs/PERF.md §3.11).
+//!     docs/PERF.md §3.36).
 //!
 //! Every benchmark function here is a tiny wrapper over a
 //! `Runner.bench` call; the harness lives in `src/bench.zig`.
@@ -756,7 +756,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
-    // ---- Nextomic store size (docs/PERF.md §3.11): printed, not timed ----
+    // ---- Nextomic store size (docs/PERF.md §3.36): printed, not timed ----
     if (include(filter, "nextomic-store")) {
         var store = try TmpStore.init(alloc, "size");
         defer store.deinit(alloc);

@@ -720,7 +720,7 @@ pub const Store = struct {
     /// are a run of two, which splits a full leaf at the run and leaves
     /// the keys before it alone on a page, often a sliver of one, where
     /// a pair that is no run splits the leaf in half (`docs/PERF.md`
-    /// §3.11's churn shape: EAVT-h fill 0.47 one way, 0.61 the other).
+    /// §3.36's churn shape: EAVT-h fill 0.47 one way, 0.61 the other).
     fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool, arena: Allocator) !void {
         var buf: [key.max_key_len]u8 = undefined;
         var value: std.ArrayList(u8) = .empty;
@@ -995,7 +995,7 @@ pub const Store = struct {
 
     /// What a tree holds and the pages it takes: its entries' key and
     /// value bytes from a walk, its pages from `treeStat`
-    /// (`docs/PERF.md` §3.11's per-tree table).
+    /// (`docs/PERF.md` §3.36's per-tree table).
     pub const TreeSize = struct {
         entries: u64 = 0,
         key_bytes: u64 = 0,

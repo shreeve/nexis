@@ -1,5 +1,5 @@
 //! test/integration/nextomic_size.zig — what a store of a fixed history
-//! takes, tree by tree (NEXTOMIC.md §2, docs/PERF.md §3.11).
+//! takes, tree by tree (NEXTOMIC.md §2, docs/PERF.md §3.36).
 //!
 //! One deterministic fixture: 2,000 people of five attributes in
 //! transactions of 1,000, 200 one-entity transactions, 200 card-one

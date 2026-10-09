@@ -523,11 +523,13 @@ after numbers in the commit message.
    other native that walks a sequence to its end consumes it
    (`docs/GC.md` §11.5; `docs/PERF.md` §3.31, §3.35), and `zipmap` and
    `set` keep their bulk build by measurement (`docs/LAZY.md` §9).
-3. Store size: 3.1× Datalevin's and 7.6× Datomic Pro's
-   (`docs/PERF.md` §3.11, §3.15, §6 "Store size"). The store work is
-   gated and measured against emdb `b3370fb`, whose leaves' insert
-   hint takes 143.7 MB of the bulk load to 135.3 MB and a store of
-   small transactions 43.0 MB to 34.6 MB (`docs/PERF.md` §3.11).
+3. Store size: done to the design's bar. The §3.11 load is 51 MB on
+   the M5 (144 MB at v0.1.0) and 52 MB on Linux (136 MB), 1.24×
+   Datalevin's and 2.9× Datomic Pro's, through emdb `b3370fb`'s
+   insert hint, history trees of retired rows alone, a binary txlog
+   and short ids (`docs/PERF.md` §3.36; store format 3, which refuses
+   every other). A pull of 10k entities is 4% slower cold on Linux for
+   the variable-length entity; §6 "Store size" lists what is left.
 4. The open design question, an amendment first: `&form`/`&env`
    (§24 #13). The owner orders it after the em and emdb work.
 
