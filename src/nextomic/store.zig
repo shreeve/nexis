@@ -885,16 +885,17 @@ pub const Store = struct {
     /// sibling) sort alike in both trees: `top` starts with a zero byte
     /// below `t = 2^39`, and a fact that continues a shorter one has an
     /// escape (`0xFF`) or the out-of-line mark (`0x01`) there
-    /// (NEXTOMIC.md §2.2). A current row whose fact's history rows do
-    /// not end with a retraction older than it breaks H1 and is
-    /// `error.Corrupted`.
+    /// (NEXTOMIC.md §2.2). A fact's rows that break H1 are
+    /// `error.Corrupted`: history that starts with a retraction, does
+    /// not alternate in ascending `t`, or ends in an assertion, and a
+    /// current row not newer than its fact's last retraction.
     pub const MergedScan = struct {
         cur: Scan,
         hist: Scan,
         cur_row: ?KeyValue = null,
         hist_row: ?KeyValue = null,
-        /// The last history row read, against which a current row is
-        /// checked.
+        /// The last history row read while its fact is open, which the
+        /// fact's next row, or its end, is checked against.
         last: ?HistoryRow = null,
 
         pub fn next(self: *MergedScan) !?HistoryRow {
@@ -908,15 +909,34 @@ pub const Store = struct {
                     self.hist_row = null;
                     const top = try key.readTop(h.key[fact.len..][0..key.top_len]);
                     const r: HistoryRow = .{ .fact = fact, .t = top.t, .added = top.added };
+                    try self.follow(r);
                     self.last = r;
                     return r;
                 }
             }
-            const row = c orelse return null;
+            const row = c orelse {
+                if (self.last) |l| if (l.added) return error.Corrupted;
+                self.last = null;
+                return null;
+            };
             self.cur_row = null;
             const r: HistoryRow = .{ .fact = row.key, .t = (try key.readCurrent(row.value)).t, .added = true, .current = true };
-            if (self.last) |l| if ((l.added or l.t >= r.t) and std.mem.eql(u8, l.fact, r.fact)) return error.Corrupted;
+            try self.follow(r);
+            // The current row closes its fact.
+            self.last = null;
             return r;
+        }
+
+        /// Check that `r` continues the open fact's timeline, or opens a
+        /// new fact once the last one ended on a retraction.
+        fn follow(self: *const MergedScan, r: HistoryRow) !void {
+            const l = self.last orelse {
+                if (!r.added) return error.Corrupted;
+                return;
+            };
+            if (std.mem.eql(u8, l.fact, r.fact)) {
+                if (l.added == r.added or l.t >= r.t) return error.Corrupted;
+            } else if (l.added or !r.added) return error.Corrupted;
         }
     };
 
@@ -1815,15 +1835,56 @@ test "a current row after a history row that is not an older retraction breaks H
     const vb = try key.valBytes(arena, .{ .long = 1 });
     // The current assertion at 5 after a retained assertion at 3, and
     // after a retraction at 6.
-    for ([_]key.Top{ .{ .t = 3, .added = true }, .{ .t = 6, .added = false } }) |top| {
+    const histories = [_][]const key.Top{ &.{.{ .t = 3, .added = true }}, &.{ .{ .t = 2, .added = true }, .{ .t = 6, .added = false } } };
+    for (histories) |rows| {
         const txn = try store.beginWrite(.none);
         defer txn.abort();
         var tb: [key.t_value_max]u8 = undefined;
         try txn.putInTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, null), key.writeCurrentT(&tb, 5));
-        try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
+        for (rows) |top| try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
         const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
         var m = try Store.mergedScan(txn, store.trees, .eavt, prefix, try key.successor(arena, prefix));
-        _ = try m.next();
+        for (rows) |_| _ = try m.next();
         try testing.expectError(error.Corrupted, m.next());
+    }
+}
+
+test "a fact's history that starts with a retraction, repeats a flag or ends in an assertion with no current row breaks H1" {
+    var td = try TestDir.init("store_h1_history");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const e: u64 = 1 << 33;
+    const Case = struct { rows: []const key.Top, other: bool = false };
+    const cases = [_]Case{
+        // A retraction with no assertion before it.
+        .{ .rows = &.{.{ .t = 3, .added = false }} },
+        // Two assertions in a row.
+        .{ .rows = &.{ .{ .t = 2, .added = true }, .{ .t = 3, .added = true }, .{ .t = 4, .added = false } } },
+        // An assertion last, the fact not current: the scan ends there.
+        .{ .rows = &.{.{ .t = 2, .added = true }} },
+        // The same, followed by another fact's rows.
+        .{ .rows = &.{ .{ .t = 2, .added = true }, .{ .t = 3, .added = false }, .{ .t = 4, .added = true } }, .other = true },
+    };
+    for (cases) |c| {
+        const txn = try store.beginWrite(.none);
+        defer txn.abort();
+        const vb = try key.valBytes(arena, .{ .long = 1 });
+        for (c.rows) |top| try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
+        if (c.other) {
+            const ob = try key.valBytes(arena, .{ .long = 2 });
+            try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, ob, .{ .t = 2, .added = true }), &.{});
+            try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, ob, .{ .t = 5, .added = false }), &.{});
+        }
+        const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
+        var m = try Store.mergedScan(txn, store.trees, .eavt, prefix, try key.successor(arena, prefix));
+        const failed = while (true) {
+            const r = m.next() catch |err| break err;
+            if (r == null) break error.TestUnexpectedResult;
+        };
+        try testing.expect(failed == error.Corrupted);
     }
 }
