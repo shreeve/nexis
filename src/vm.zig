@@ -4324,8 +4324,14 @@ pub const VM = struct {
 
     const OpHandler = *const fn (*VM, *Frame, Inst, usize) callconv(handler_cc) Status;
 
-    /// Every handler's calling convention (§8).
-    const handler_cc: std.lang.CallingConvention = .auto;
+    /// Every handler's calling convention (§8). On x86-64,
+    /// `preserve_none`, under which no general register but the stack
+    /// and frame pointers is the callee's to save: a handler keeps
+    /// what it needs past System V's nine scratch registers without
+    /// saving the caller's first, and a part out of line keeps its own
+    /// across a native's call in the registers the native saves. On
+    /// arm64 every handler fits AAPCS64's scratch registers.
+    const handler_cc: std.lang.CallingConvention = if (builtin.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
 
     /// What a handler returns: `ok` when the chain ends with no error,
     /// else the error it ends with, by its number. Its own type rather

@@ -3,10 +3,10 @@
 # No fast dispatch handler (`vm.VM.fast*`) in BINARY, a release build,
 # may call anything, and on arm64 none may keep a stack frame: no
 # instruction of it may name the stack pointer. On x86-64, whose
-# System V convention leaves a handler nine scratch registers, four of
-# them its arguments, a handler may save registers it needs past those
-# with push and pop, which the table counts, but may reserve no stack
-# and address none. It prints each handler's size in instructions
+# handlers take the preserve_none convention, under which rbp alone
+# stays the callee's to save, a handler may save rbp with push and
+# pop, which the table counts, but no other register, and may reserve
+# no stack and address none. It prints each handler's size in instructions
 # (without the padding after it) and fails, listing the offending
 # instructions, when one breaks the rule or when the handlers cannot be
 # found. It then lists, for information only, what the out-of-line
@@ -54,6 +54,11 @@ for s in $syms; do
   n=$(size "$code")
   pushes=$(printf '%s\n' "$code" | grep -cE '^[[:space:]]*push' || true)
   bad=$(printf '%s\n' "$code" | grep -E "$rule" || true)
+  case $triple in
+    x86_64*) saves=$(printf '%s\n' "$code" | grep -E '^[[:space:]]*(push|pop)' |
+      grep -vE '^[[:space:]]*(pushq|popq)[[:space:]]+%rbp[[:space:]]*$' || true)
+      bad=$(printf '%s\n%s\n' "$bad" "$saves" | grep . || true) ;;
+  esac
   name=${s#_}
   if [ -n "$bad" ]; then
     failed=1
