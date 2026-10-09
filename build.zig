@@ -6,7 +6,8 @@
 //!                                     Nextomic corpora, goldens, test/nextomic
 //!                                     scripts, examples; analyzes the bench
 //!   zig build test -Dgc-stress        the gate with a collection every few kilobytes
-//!   zig build test -Ddurability=durable  the gate with every store commit synced
+//!   zig build test -Ddurability=durable  the gate with every store commit synced,
+//!                                     the runtime's default; the gate's own is commit
 //!   zig build install -Dopcodes=true  bin/nexis printing its dispatch and native
 //!                                     call counts at exit (docs/TOOLING.md §1)
 //!   zig build quick                   the inner loop: unit tests, the compile and
@@ -45,7 +46,7 @@ pub fn build(b: *std.Build) void {
     const update = b.option(bool, "update", "rewrite the expected-output files the gate compares, instead of comparing") orelse false;
     const env: RunEnv = .{
         .gc_stress = b.option(bool, "gc-stress", "run every test and program with a collection every few kilobytes (NEXIS_GC_STRESS)") orelse false,
-        .durability = b.option(RunEnv.Durability, "durability", "the durability of every store commit the tests and programs make (NEXIS_DURABILITY)"),
+        .durability = b.option(RunEnv.Durability, "durability", "the durability of every store commit the tests and programs make (NEXIS_DURABILITY; commit unless durable)") orelse .commit,
     };
 
     const image = stdlibImage(b);
@@ -466,18 +467,20 @@ const Scripts = struct {
 const RunEnv = struct {
     /// `NEXIS_GC_STRESS`: a collection every few kilobytes (docs/GC.md §7).
     gc_stress: bool,
-    /// `NEXIS_DURABILITY` (docs/DB.md §3.3); unset leaves the runtime's
-    /// default.
-    durability: ?Durability,
+    /// `NEXIS_DURABILITY` (docs/DB.md §3.3), set on every run. The
+    /// runtime's default syncs every commit; the gate's tests and
+    /// programs commit thousands of transactions, so they commit with
+    /// `commit` unless `-Ddurability=durable` asks for the default.
+    durability: Durability,
 
     const Durability = enum { commit, durable };
 
-    /// Give `run` an empty environment, then the variables,
-    /// `NEXIS_GC_STRESS` when `stress`.
+    /// Give `run` an empty environment, then the variables:
+    /// `NEXIS_DURABILITY`, and `NEXIS_GC_STRESS` when `stress`.
     fn apply(env: RunEnv, run: *std.Build.Step.Run, stress: bool) void {
         run.clearEnvironment();
         if (stress) run.setEnvironmentVariable("NEXIS_GC_STRESS", "1");
-        if (env.durability) |d| run.setEnvironmentVariable("NEXIS_DURABILITY", @tagName(d));
+        run.setEnvironmentVariable("NEXIS_DURABILITY", @tagName(env.durability));
     }
 };
 

@@ -187,8 +187,8 @@ decoding builds them, which is the only row the slabs move.
 
 | Row | Apple M1 | Apple M5 | Measures |
 |---|---:|---:|---|
-| `db_put_commit_scalar` | — | 330 ns | one put and a commit in the default durability, `:commit`: no sync (`docs/DB.md` §3.3) |
-| `db_put_commit_scalar`, `NEXIS_DURABILITY=durable` | 6.15 ms | 6.00 ms | one put and a durable commit: two `F_FULLFSYNC`, per commit, not per put |
+| `db_put_commit_scalar`, `NEXIS_DURABILITY=commit` | — | 330 ns | one put and a commit that syncs nothing (`docs/DB.md` §3.3) |
+| `db_put_commit_scalar` | 6.15 ms | 6.00 ms | one put and a commit in the default durability, `:durable`: two `F_FULLFSYNC`, per commit, not per put |
 | `db_get_hit_scalar` | 1.04 μs | 60 ns | read transaction, B+ tree lookup, decode of a fixnum, abort |
 
 The two `db_get_hit_scalar` figures differ by 17×; the difference is
@@ -402,12 +402,12 @@ What the rows say:
   them to 24 MB and the program's peak to 80 MB.
 - Nextomic is ahead of Datalevin on every phase: creating, opening,
   loading, lookups, joins, aggregates, pull and small transactions.
-- The default-commit rows compare different guarantees. A default
-  Nextomic commit (`:commit`, `docs/DB.md` §3.3) syncs nothing: it is
-  atomic and survives a crash of the process, and the file is synced
-  once at `release` and at the end of the program, outside the timed
-  phase. Datalevin's calls `fsync`, which on macOS does not empty the
-  drive's cache (`docs/BENCH.md` §12). A Nextomic connection opened
+- The default-commit rows compare different guarantees. Nextomic's
+  connect `{:durability :commit}` (`docs/DB.md` §3.3), which syncs
+  nothing: a commit is atomic and survives a crash of the process, and
+  the file is synced once at `release` and at the end of the program,
+  outside the timed phase. Datalevin's calls `fsync`, which on macOS
+  does not empty the drive's cache (`docs/BENCH.md` §12). A Nextomic connection opened
   `{:durability :durable}` syncs each commit, two `F_FULLFSYNC`, and
   pays 3.42 s for the 1,000 transactions. The no-flush rows include
   one sync at the end in both systems.
@@ -714,8 +714,9 @@ What the language rows say:
 
 **Database.** 100 departments and 100,000 people with five attributes.
 The durability of each row (`docs/BENCH.md` §12, traced with `strace`):
-Nextomic's default commit syncs nothing and survives a crash of the
-process; its durable connection issues two `fdatasync` per commit.
+Nextomic's default-commit rows connect `{:durability :commit}`, which
+syncs nothing and survives a crash of the process; its durable
+connection, nexis's default, issues two `fdatasync` per commit.
 Datalevin's default commit is durable (one `fdatasync` and an
 `O_DSYNC` meta write). Datomic Local's one mode is durable (two
 `fdatasync`). Datomic Pro's dev transactor acknowledges without a sync
@@ -2573,9 +2574,10 @@ and the four durable rounds in the fast state; the M5: two runs).
 | §3.15's load | 382 ms | 1.02–1.09 s | 318–336 ms | 1.33–2.18 s |
 
 A program of a few transactions pays a few milliseconds for durable
-commits; one of many small transactions pays a device flush for
-each, 2 ms here and 6–7 ms on the M5, which batching them into fewer
-transactions, or `:commit`, avoids.
+commits, nexis's default; one of many small transactions pays a
+device flush for each, 2 ms here and 6–7 ms on the M5, which
+batching them into fewer transactions, or `:commit`, avoids
+(`docs/DB.md` §3.3 "Why durable is the default").
 
 ## 6. Levers and dead ends
 
@@ -2770,10 +2772,11 @@ Each lever is a measured change: a before/after from `zig build bench`
   startup 48.5 → 21.4 M instructions, 5.9 → 4.1 ms, 6.0 → 3.6 MB
   (§3.18).
 
-- *Commit without a sync by default* (`docs/DB.md` §3.3): §3.11's
-  1,000 default-commit transactions 3.42 s → 17.7 ms, the
-  default-commit load 1.64 s → 656 ms, `db_put_commit_scalar`
-  6.00 ms → 330 ns. The file is synced once at close and exit.
+- *Commit without a sync* (`:commit`, `docs/DB.md` §3.3), the
+  explicit fast mode: §3.11's 1,000 default-commit transactions
+  3.42 s → 17.7 ms, the default-commit load 1.64 s → 656 ms,
+  `db_put_commit_scalar` 6.00 ms → 330 ns. The file is synced once at
+  close and exit.
 - *A held read snapshot* (`docs/DB.md` §3.4): a Nextomic read reuses
   the file's last read transaction, with the trees it has opened,
   while no commit has passed it. §3.11's lookups 24.6 → 13.5 ms; through

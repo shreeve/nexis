@@ -15,8 +15,10 @@
 
 (defn email [i] (str "p" i "@x.org"))
 
+; The connection commits with `:commit` (no sync, docs/DB.md §3.3);
+; the durable batch below opens a second one.
 (def t-open (nano-time))
-(def conn (d/connect path))
+(def conn (d/connect path {:durability :commit}))
 (def db0 (d/db conn))
 (report "open" (- (nano-time) t-open) (some? (d/entid db0 [:dept/name "d0"])))
 
@@ -84,10 +86,10 @@
 (def first-1000 (mapv email (range 1000)))
 
 ; Three batches of 1,000 transactions of one datom each, the same
-; writes in every twin: in the default commit (`:commit`: atomic, no
-; sync; docs/DB.md §3.3), through a second connection opened
-; `{:durability :durable}` (each commit syncs data, then meta), and
-; with `:sync :none` and one sync at the end.
+; writes in every twin: with `:commit` (atomic, no sync; docs/DB.md
+; §3.3), through a second connection opened `{:durability :durable}`,
+; nexis's default (each commit syncs data, then meta), and with
+; `:sync :none` and one sync at the end.
 (def t-before (d/basis-t (d/db conn)))
 (let [t0 (nano-time)]
   (dotimes [i 1000]
@@ -107,8 +109,8 @@
   (d/sync conn)
   (report "tx-1k-nosync" (- (nano-time) t0) (d/q salary-sum-q (d/db conn) first-1000)))
 
-; One entity of five attributes per transaction, in the default
-; commit: 1,000 new people, then 1,000 upserts of existing ones through
+; One entity of five attributes per transaction, with `:commit`:
+; 1,000 new people, then 1,000 upserts of existing ones through
 ; the unique email, each changing the salary alone.
 (def dept-eids (let [db (d/db conn)] (mapv (fn [k] (d/entid db [:dept/name (str "d" k)])) (range 100))))
 (defn person [i salary]

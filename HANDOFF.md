@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 244/244 steps succeeded; 1612/1612 tests passed
+Build Summary: 244/244 steps succeeded; 1613/1613 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
@@ -202,9 +202,9 @@ Nextomic connection of the file, so any spelling or symlink of the
 path is one store (a file with a second hard link is refused), and a
 second writer on it is `:db/busy` (`:nextomic/nested` in Nextomic),
 never a deadlock (`docs/DB.md` §3.1). It pins `pageSize = 16384`,
-`maxNamedTrees = 128` and 4,096 reader slots; commits without a sync
-unless the connection is `:durable`, syncing each written file once at
-close, `sync` and the end of the process (`NEXIS_DURABILITY`,
+`maxNamedTrees = 128` and 4,096 reader slots; syncs every commit
+unless the connection is `:commit`, which syncs each written file once
+at close, `sync` and the end of the process (`NEXIS_DURABILITY`,
 `docs/DB.md` §3.3); keeps one Nextomic read transaction between
 operations while no commit passes it (§3.4); resolves tree ids once per connection, reads
 values whole off cursors, lets a walk see its tree as it began

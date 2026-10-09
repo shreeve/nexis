@@ -85,9 +85,10 @@ changes to emdb.
   (`docs/TOOLING.md` §1); the out-of-memory and REPL goldens set it
   on their runs, which otherwise start from an empty environment.
   `NEXIS_DURABILITY=commit|durable` chooses whether a store commit
-  syncs (`docs/DB.md` §3.3; `commit`, no sync, when unset);
-  `zig build test -Ddurability=durable` runs the gate with every
-  commit synced. The build never reads its own environment: these
+  syncs (`docs/DB.md` §3.3; `durable`, every commit synced, when
+  unset); the gate runs every test and program with `commit`, and
+  `zig build test -Ddurability=durable` runs it with every commit
+  synced. The build never reads its own environment: these
   options set the variables on each run, as part of its cache key,
   and every cached run starts from an empty environment, so a
   variable exported in the shell never reaches a test.

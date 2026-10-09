@@ -552,19 +552,26 @@ pub const Durability = enum {
     /// the process ends. A crash of the process loses nothing; a crash
     /// of the system can lose the commits since the last sync.
     commit,
-    /// Every commit syncs data and meta.
+    /// Every commit syncs data and meta: it is on the disk when it
+    /// returns. The default.
     durable,
 
     pub fn parse(text: []const u8) ?Durability {
         return std.meta.stringToEnum(Durability, text);
     }
 
-    /// `NEXIS_DURABILITY`, or `commit` when it is unset. `bin/nexis`
-    /// refuses any other value at start, so an unknown one reaches
-    /// here only from an embedding, and reads as unset.
+    /// The durability `NEXIS_DURABILITY`'s text names, `durable` when
+    /// it is unset. `bin/nexis` refuses any other value at start, so an
+    /// unknown one reaches here only from an embedding, and reads as
+    /// unset.
+    pub fn fromEnv(text: ?[]const u8) Durability {
+        return parse(text orelse return .durable) orelse .durable;
+    }
+
+    /// The process's: `NEXIS_DURABILITY` (`fromEnv`).
     pub fn process() Durability {
-        const text = std.c.getenv("NEXIS_DURABILITY") orelse return .commit;
-        return parse(std.mem.span(text)) orelse .commit;
+        const text = std.c.getenv("NEXIS_DURABILITY") orelse return fromEnv(null);
+        return fromEnv(std.mem.span(text));
     }
 
     pub fn syncOverride(self: Durability) emdb.SyncOverride {
@@ -1648,6 +1655,13 @@ test "Durability: parses its two names and nothing else" {
     for ([_][]const u8{ "", "batch", "batched", "Durable", "commit " }) |text| {
         try testing.expect(Durability.parse(text) == null);
     }
+}
+
+test "Durability: a process that names none syncs every commit" {
+    try testing.expectEqual(Durability.durable, Durability.fromEnv(null));
+    try testing.expectEqual(Durability.durable, Durability.fromEnv("batch"));
+    try testing.expectEqual(Durability.commit, Durability.fromEnv("commit"));
+    try testing.expectEqual(Durability.durable, Durability.fromEnv("durable"));
 }
 
 test "durability commit: a commit is seen at once and syncs nothing; close syncs the file once" {
