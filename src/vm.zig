@@ -6092,15 +6092,9 @@ pub const VM = struct {
     /// to take it; the bare keyword when none is, which the host's
     /// report names.
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
-        return self.throwError(name, "");
-    }
-
-    /// `throwKeyword` whose map says `message` (the name in words
-    /// when empty).
-    pub fn throwError(self: *VM, name: []const u8, message: []const u8) VmError {
         const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
         if (self.findThrowTarget() == null) return self.throwValue(kw);
-        return self.throwValue(self.errorValue(kw, message, self.raiseSite()));
+        return self.throwValue(self.errorValue(kw, "", self.raiseSite()));
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow`,
