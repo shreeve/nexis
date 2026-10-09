@@ -4452,12 +4452,13 @@ pub const VM = struct {
             for (0..64) |v| t[@as(u12, @backingInt(g)) | @as(u12, v) << 6] = &opUnimplemented;
         }
         t[opcode(.mov, Mov.move)] = &opMove;
-        t[opcode(.mov, Mov.move_clear)] = &opMoveClear;
-        t[opcode(.mov, Mov.load_const)] = &opLoadConst;
-        t[opcode(.mov, Mov.load_nil)] = loadHandler(value_mod.nilValue());
-        t[opcode(.mov, Mov.load_true)] = loadHandler(value_mod.fromBool(true));
-        t[opcode(.mov, Mov.load_false)] = loadHandler(value_mod.fromBool(false));
-        t[opcode(.jump, Jump.jmp)] = &opJmp;
+        // Verification leaves these no case but their fast handler's.
+        t[opcode(.mov, Mov.move_clear)] = &fastMoveClear;
+        t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
+        t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
+        t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
+        t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
+        t[opcode(.jump, Jump.jmp)] = &fastJmp;
         t[opcode(.jump, Jump.if_false)] = &opIfFalse;
         t[opcode(.jump, Jump.if_true)] = &opIfTrue;
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = cmpHandler(c);
@@ -4482,12 +4483,6 @@ pub const VM = struct {
         @setEvalBranchQuota(20_000);
         var t = op_table;
         t[opcode(.mov, Mov.move)] = &fastMove;
-        t[opcode(.mov, Mov.move_clear)] = &fastMoveClear;
-        t[opcode(.mov, Mov.load_const)] = &fastLoadConst;
-        t[opcode(.mov, Mov.load_nil)] = fastLoad(value_mod.nilValue());
-        t[opcode(.mov, Mov.load_true)] = fastLoad(value_mod.fromBool(true));
-        t[opcode(.mov, Mov.load_false)] = fastLoad(value_mod.fromBool(false));
-        t[opcode(.jump, Jump.jmp)] = &fastJmp;
         t[opcode(.jump, Jump.if_false)] = fastBranch(false);
         t[opcode(.jump, Jump.if_true)] = fastBranch(true);
         for (std.meta.tags(NumCmp)) |c| t[opcode(.cmp, c)] = fastCmp(c);
@@ -4659,44 +4654,6 @@ pub const VM = struct {
         var tmp: Value = undefined;
         const src = self.operandPtr(frame, inst.b, &tmp) catch |e| return .of(e);
         self.storeIn(frame, inst.a, src.*) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    /// The value is read before B is cleared, so A = B is a move.
-    fn opMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        if (inst.a.kind != .slot or inst.b.kind != .slot) return .of(VmError.InvalidOperandKind);
-        const dst = self.slotPtrIn(frame, inst.a.index) catch |e| return .of(e);
-        const src = self.slotPtrIn(frame, inst.b.index) catch |e| return .of(e);
-        const v = src.*;
-        src.* = value_mod.nilValue();
-        dst.* = v;
-        return self.next(frame);
-    }
-
-    /// `mov:load-nil`, `mov:load-true`, `mov:load-false`.
-    fn loadHandler(comptime v: Value) OpHandler {
-        return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-                frame.pc = @intCast(pc);
-                self.storeIn(frame, inst.a, v) catch |e| return .of(e);
-                return self.next(frame);
-            }
-        }.run;
-    }
-
-    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        const consts = frame.routine.consts;
-        const i = inst.wide();
-        if (i >= consts.len) return .of(VmError.OperandOutOfRange);
-        self.storeIn(frame, inst.a, consts[i]) catch |e| return .of(e);
-        return self.next(frame);
-    }
-
-    fn opJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
-        frame.pc = @intCast(pc);
-        applyJump(frame, inst.wide()) catch |e| return .of(e);
         return self.next(frame);
     }
 

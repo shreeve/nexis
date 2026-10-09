@@ -613,14 +613,16 @@ runs whole. On both, `max` and `min` read their winner a word at a
 time (`docs/PERF.md` "A width-consistent native boundary").
 
 - `op_table` holds every opcode's **general handler**, which takes
-  every case and raises every trap. Every variant of `mov`, `jump` and
-  `cmp`, and `closure:get-cell`, `var:load-var`, `call:call`,
-  `call:self`, `call:return` and `call:return-nil`, has a general
-  handler of its own, and `call:lookup` and `call:lookup-or` share
-  one; a quickened variant's (§10.10) runs the instruction as its base
-  opcode, through the base's; every other entry is its group's, which switches on the
-  variant or, where no variant is left, traps as §10 says for one
-  outside the enum. A group outside the enum is `BytecodeCorruption`;
+  every case and raises every trap. `mov:move`, the conditional jumps,
+  every variant of `cmp`, and `closure:get-cell`, `var:load-var`,
+  `call:call`, `call:self`, `call:return` and `call:return-nil` each
+  have a general handler of their own, and `call:lookup` and `call:lookup-or`
+  share one; `mov:move-clear`, the `mov` loads and `jump:jmp` have
+  their fast handler there too, since verification leaves them no
+  other case; a quickened variant's (§10.10) runs the instruction as
+  its base opcode, through the base's; every other entry is its
+  group's, which switches on the variant or, where no variant is left,
+  traps as §10 says for one outside the enum. A group outside the enum is `BytecodeCorruption`;
   `transient`, `hash`, `tx`, `io` and `simd` trap
   `UnimplementedOpcode` for every variant.
 - `fast_table`, the table the fetch reads, is `op_table` with a
