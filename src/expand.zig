@@ -1556,11 +1556,10 @@ pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan
         .list, .persistent_vector, .persistent_map, .persistent_set => datum != .with_meta,
         else => false,
     };
-    if (carries_meta) if (heap_mod.Heap.asHeapHeader(v).getMeta()) |m| {
-        const meta_v = if (m.kind == @backingInt(value_mod.Kind.sorted_map)) heap_mod.Heap.valueFromHeader(.sorted_map, m) else champ_mod.valueFromMapHeader(m);
-        const meta = try valueToForm(ctx, meta_v, origin);
-        return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = meta } }, origin);
-    };
+    if (carries_meta) {
+        const meta_v = dispatch.metaOf(heap_mod.Heap.asHeapHeader(v));
+        if (!meta_v.isNil()) return makeForm(ctx, .{ .with_meta = .{ .target = form, .meta = try valueToForm(ctx, meta_v, origin) } }, origin);
+    }
     return form;
 }
 

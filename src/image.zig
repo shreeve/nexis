@@ -714,7 +714,7 @@ const Writer = struct {
         const h = header(v);
         var meta: Out = .{ .gpa = w.gpa };
         defer meta.deinit();
-        if (tag != .atom and tag != .cell) try w.ref(&meta, metaOf(h));
+        if (tag != .atom and tag != .cell) try w.ref(&meta, dispatch_mod.metaOf(h));
         const id = w.totals.objects;
         w.totals.objects += 1;
         try w.objects.put(w.gpa, @intFromPtr(h), .{ .id = id, .tag = v.tag });
@@ -776,7 +776,7 @@ const Writer = struct {
         }
         const a = atom_mod.body(shell);
         if (a.in_flight != 0) return w.unsupported("an atom in the middle of a swap");
-        try w.ref(&w.fill_out, metaOf(h));
+        try w.ref(&w.fill_out, dispatch_mod.metaOf(h));
         try w.ref(&w.fill_out, a.value);
         try w.ref(&w.fill_out, a.validator);
         try w.ref(&w.fill_out, a.watches);
@@ -851,11 +851,6 @@ const Writer = struct {
 /// The block of `v`, a heap value or a cell.
 fn header(v: Value) *HeapHeader {
     return @ptrFromInt(v.payload);
-}
-
-fn metaOf(h: *HeapHeader) Value {
-    const m = h.getMeta() orelse return value_mod.nilValue();
-    return champ_mod.valueFromMapHeader(m);
 }
 
 // =============================================================================
@@ -1475,7 +1470,7 @@ const Verifier = struct {
         const hx = Heap.asHeapHeader(x);
         const hy = Heap.asHeapHeader(y);
         if (try v.seen(@intFromPtr(hx), @intFromPtr(hy))) return;
-        try v.value(metaOf(hx), metaOf(hy));
+        try v.value(dispatch_mod.metaOf(hx), dispatch_mod.metaOf(hy));
         switch (x.kind()) {
             .string, .bignum, .regex => if (!std.mem.eql(u8, Heap.bodyBytes(hx), Heap.bodyBytes(hy)) and !(x.kind() == .regex and std.mem.eql(u8, regex_mod.sourceOf(x), regex_mod.sourceOf(y)))) return v.fail("{t} differs", .{x.kind()}),
             .persistent_vector => {
@@ -1494,7 +1489,7 @@ const Verifier = struct {
                     const tx = Heap.asHeapHeader(cx);
                     const ty = Heap.asHeapHeader(cy);
                     if (try v.seen(@intFromPtr(tx), @intFromPtr(ty))) return;
-                    try v.value(metaOf(tx), metaOf(ty));
+                    try v.value(dispatch_mod.metaOf(tx), dispatch_mod.metaOf(ty));
                 }
             },
             .persistent_map => {

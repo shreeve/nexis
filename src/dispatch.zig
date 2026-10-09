@@ -1,4 +1,5 @@
-//! dispatch.zig — `=` and `hash` over any Value (SEMANTICS §2, §3).
+//! dispatch.zig — `=` and `hash` over any Value (SEMANTICS §2, §3),
+//! and the metadata a heap block carries as a Value.
 //!
 //! Immediates go to `Value.equalImmediate` / `Value.hashImmediate`;
 //! heap kinds to their own modules. The collection modules take the
@@ -397,6 +398,14 @@ fn lazyHash(v: Value) u64 {
     const truncated: u32 = @truncate(hash_mod.finalizeOrdered(acc, n));
     if (cacheable and truncated != 0) h.setCachedHash(truncated);
     return truncated;
+}
+
+/// The metadata block `h` carries, as a value: a hash map or, when
+/// `with-meta` was given one, a sorted map; nil when it carries none.
+pub fn metaOf(h: *const heap_mod.HeapHeader) Value {
+    const m = h.getMeta() orelse return value.nilValue();
+    if (m.kind == @backingInt(Kind.sorted_map)) return Heap.valueFromHeader(.sorted_map, m);
+    return champ.valueFromMapHeader(m);
 }
 
 // =============================================================================
