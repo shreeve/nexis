@@ -2385,7 +2385,7 @@ fn noMatchThrow(b: Builder, g: *Form) ExpandError!*Form {
 //   → (do
 //       (def Counter-type-id (nexis.internal/#%register-record-type "<ns>/Counter" [:n]))
 //       (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id {:n n}))
-//       (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m))
+//       (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m [:n]))
 //       (defn Counter? [x] (and (nexis.internal/#%record? x)
 //                               (= Counter-type-id (nexis.internal/#%record-type-id x))))
 //       (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id (fn [this y] ...))
@@ -2464,7 +2464,7 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
         try b.item("do"),
         try b.list(.{ "def", type_id, try b.list(.{ "nexis.internal/#%register-record-type", try qualifiedNameString(b, rec_name), try b.vec(.{keys}) }) }),
         try b.list(.{ "nexis.core/defn", names.ctor, try b.vec(.{fields}), try b.list(.{ "nexis.internal/#%make-record", type_id, field_map }) }),
-        try b.list(.{ "nexis.core/defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m" }) }),
+        try b.list(.{ "nexis.core/defn", names.map_ctor, try b.vec(.{"m"}), try b.list(.{ "nexis.internal/#%make-record", type_id, "m", try b.vec(.{keys}) }) }),
         try b.list(.{ "nexis.core/defn", names.pred, try b.vec(.{"x"}), try b.list(.{
             "nexis.core/and",
             try b.list(.{ "nexis.internal/#%record?", "x" }),

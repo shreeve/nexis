@@ -206,7 +206,7 @@ by the argument count or raises `:arity-mismatch` (§4.2).
 ;; =>
 (do (def Counter-type-id (nexis.internal/#%register-record-type "user/Counter" [:n]))
     (defn ->Counter [n] (nexis.internal/#%make-record Counter-type-id {:n n}))
-    (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m))
+    (defn map->Counter [m] (nexis.internal/#%make-record Counter-type-id m [:n]))
     (defn Counter? [x] (and (nexis.internal/#%record? x)
                             (nexis.core/= Counter-type-id (nexis.internal/#%record-type-id x))))
     (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
@@ -230,7 +230,9 @@ by the argument count or raises `:arity-mismatch` (§4.2).
   record is what the method sees; a field whose name appears anywhere
   in the method's parameters is not bound, so the parameter shadows
   it.
-- `map->Counter` passes its map through unchanged (§2.1).
+- `map->Counter` keeps every entry of its map and maps each declared
+  field the map lacks to nil, as Clojure's `create` does:
+  `(map->Counter {})` is `#user.Counter{:n nil}` (§2.1).
 - The compiler's declared-name table knows `Counter`,
   `Counter-type-id`, `->Counter`, `map->Counter` and `Counter?`
   (`expand.RecordNames`), so a form may refer to `->Counter` before
@@ -366,7 +368,7 @@ expansion error at compile time (`docs/MACROEXPAND.md`).
 | Native | Arity | Returns |
 |---|---|---|
 | `#%register-record-type "ns/Name" [:f ...]` | 2 | fixnum type id |
-| `#%make-record type-id m` | 2 | record whose fields are the entries of `m`: a hash or sorted map, a record (its fields) or nil (none), so `map->Counter` takes any map, as Clojure's does |
+| `#%make-record type-id m fields?` | 2–3 | record whose fields are the entries of `m`: a hash or sorted map, a record (its fields) or nil (none), so `map->Counter` takes any map, as Clojure's does; each keyword of the vector `fields` that `m` lacks maps to nil |
 | `#%record? x` | 1 | boolean |
 | `#%record-type-id rec` | 1 | fixnum |
 | `#%register-protocol "ns/IFoo" [:m ...]` | 2 | protocol |

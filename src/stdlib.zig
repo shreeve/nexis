@@ -404,7 +404,7 @@ const core_rows = .{
     .{ "push-thread-bindings", 1, 1, &fnPushThreadBindings, "[bindings]", "Opens a binding frame that rebinds each Var key of the map bindings\n  to its value. Every Var must be dynamic, else :not-dynamic and\n  nothing is rebound. Use binding, which pairs it with\n  pop-thread-bindings." },
     .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings, "[]", "Closes the innermost frame push-thread-bindings opened, restoring\n  the bindings it replaced." },
     .{ "var-set", 2, 2, &fnVarSet, "[x val]", "Sets the binding in force of the dynamic Var x to val and returns\n  val; set! expands to it. :not-dynamic for a Var that is not dynamic,\n  :no-thread-binding when no binding of it is in force." },
-    .{ "thread-bound?", 1, 1, &fnThreadBoundQ, "[v]", "Returns true if a binding of the Var v is in force. Unlike Clojure's,\n  it takes one Var." },
+    .{ "thread-bound?", 0, null, &fnThreadBoundQ, "[& vars]", "Returns true if a binding of each of the vars is in force; true when\n  given none." },
     .{ "alter-var-root", 2, null, &fnAlterVarRoot, "[v f & args]", "Sets the root of the Var v to (apply f root args) and returns it; a\n  binding in force is left alone. An unbound Var's root is nil to f." },
     .{ "boolean", 1, 1, &fnBoolean, "[x]", "Returns false for nil and false, true for anything else." },
     .{ "list?", 1, 1, kindPredicate(isList), .leaf, "[x]", "Returns true if x is a list. Unlike Clojure, a seq realized as a\n  list, such as (seq [1 2]) or (keys m), is one; a lazy seq is not." },
@@ -623,7 +623,7 @@ const math_docs = docs(math_rows);
 const internal_rows = .{
     // Records.
     .{ "#%register-record-type", 2, 2, &fnRegisterRecordType },
-    .{ "#%make-record", 2, 2, &fnMakeRecord },
+    .{ "#%make-record", 2, 3, &fnMakeRecord },
     .{ "#%record?", 1, 1, &fnRecordQ },
     .{ "#%record-type-id", 1, 1, &fnRecordTypeId },
     // A sorted collection a macro returned, as a form (MACROEXPAND.md §5).
@@ -1118,10 +1118,9 @@ fn fnMod(vm: *VM, args: []const Value) VmError!Value {
 }
 
 /// Chained comparison: true iff every adjacent pair satisfies
-/// `cmp`. Fewer than two arguments is vacuously true; a lone
-/// argument must still be a number.
+/// `cmp`. A lone argument is true whatever it is, as Clojure's
+/// `([x] true)`.
 fn chainCompare(cmp: vm_mod.NumCmp, args: []const Value) VmError!Value {
-    if (args.len == 1) _ = try requireNumber(args[0]);
     var i: usize = 0;
     while (i + 1 < args.len) : (i += 1) {
         if (!try vm_mod.numCompare(cmp, args[i], args[i + 1])) return value_mod.fromBool(false);
@@ -3917,10 +3916,12 @@ fn fnUnbindRoot(_: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(thread-bound? v)` → whether a `binding` of `v` is in force.
+/// `(thread-bound? & vars)` → whether a `binding` of every Var is in
+/// force; true of none, as Clojure's `every?` over its arguments.
 fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
-    if (args[0].kind() != .var_) return VmError.KindMismatch;
-    return value_mod.fromBool(VM.asVar(args[0]).thread_bound);
+    for (args) |v| if (v.kind() != .var_) return VmError.KindMismatch;
+    for (args) |v| if (!VM.asVar(v).thread_bound) return value_mod.fromBool(false);
+    return value_mod.fromBool(true);
 }
 
 /// `(gensym)` / `(gensym prefix)` → a fresh symbol `prefixN`
@@ -7501,7 +7502,9 @@ fn recordTypeArg(vm: *VM, v: Value) VmError!u32 {
 
 /// `(#%make-record type-id m)` → a record of the type with the
 /// entries of the map `m` (any map, a record's fields, or nil for
-/// none) as its fields.
+/// none) as its fields; `(#%make-record type-id m fields)`, `map->R`'s
+/// call, also maps each keyword of the vector `fields` that `m` lacks
+/// to nil, as Clojure's `create` fills its base fields.
 fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
     const id = try recordTypeArg(vm, args[0]);
     const heap = vm.ensureHeap();
@@ -7519,6 +7522,17 @@ fn fnMakeRecord(vm: *VM, args: []const Value) VmError!Value {
         },
         else => return VmError.KindMismatch,
     };
+    if (args.len == 3) {
+        if (args[2].kind() != .persistent_vector) return VmError.KindMismatch;
+        // `Heap.alloc` never collects (GC.md §11.5): the map being
+        // built needs no root.
+        var filled = fields;
+        for (0..vector_mod.count(args[2])) |i| {
+            const k = vector_mod.nth(args[2], i);
+            if (!mapHas(filled, k)) filled = try mapPut(heap, filled, k, value_mod.nilValue());
+        }
+        return record_mod.make(heap, id, filled) catch return VmError.OutOfMemory;
+    }
     return record_mod.make(heap, id, fields) catch return VmError.OutOfMemory;
 }
 
