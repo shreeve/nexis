@@ -1,0 +1,5 @@
+; bench/micro/vnth.nx N: count plus (+ acc (nth v j)), a leaf native of two locals called through a Var.
+(let [n (parse-long (first *command-line-args*))
+      v [1 2 3 4]
+      j 3]
+  (println (loop [i 0 acc 0] (if (< i n) (recur (inc i) (+ acc (nth v j))) acc))))

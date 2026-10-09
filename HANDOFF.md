@@ -514,10 +514,15 @@ after numbers in the commit message.
      `filter` and `remove` make a run's calls in one pass of the chain
      (`docs/VM.md` §6, "Batched calls"); on the Linux host the
      pipeline 60 → 47 ms and vectors 75 → 61 ms. What remains is the
-     callee bodies' dispatches, the largest a leaf native called
-     through a Var (`(nth v i)`, `(even? x)`), which a call-site cache
-     must still see the Var's latest root for (`docs/PERF.md` §6
-     "Inline caches at call sites").
+     callee bodies' work, the largest a leaf native called through a
+     Var (`(nth v i)`, `(even? x)`). Running a Var's load with its call
+     and calling with one or two arguments in place were built and
+     measured, and neither paid what it had to (`docs/PERF.md` §3.37
+     "Var calls"; §6 "A Var's load run with its call", "Calls of one or
+     two arguments in place"): a dispatch is about ten instructions,
+     and a leaf call's cost is the native's body and the out-of-line
+     part's frame. A call-site cache stays rejected (§6 "Inline caches
+     at call sites").
 2. TODO.md #13: `sort` and `sort-by` hold the seq they walk, and a
    local a closure captures holds it while the closure runs; every
    other native that walks a sequence to its end consumes it

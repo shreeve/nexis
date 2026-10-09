@@ -458,10 +458,14 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
 
 - **Programs.** `bench/micro/*.nx`, each taking its size as its one
   argument; the first line of each says what it measures. `count` is
-  the counting loop; `lc`, `lv`, `mv`, `kw`, `leaf`, `getnl` and
-  `gcall` add one `mov:load-const`, `var:load-var`, `mov:move`, keyword
-  lookup, leaf native call, other native call or closure call to it;
-  `acc` adds `(+ acc i)`; `pcall`, `casek` and `mcall` add one
+  the counting loop; `lc`, `lv`, `mv`, `kw`, `leaf` and `gcall` add
+  one `mov:load-const`, `var:load-var`, `mov:move`, keyword lookup,
+  leaf native call or closure call to it;
+  `acc` adds `(+ acc i)`; `getnl`, `leaf1` and `vnth` add a leaf
+  called through a Var on a local and a constant (`(get v 3)`), on one
+  local (`(count v)`) and on two (`(nth v j)`), and `vdestr` the
+  destructuring `[x y & more]` of a vector, two `nth`, an `nthnext`
+  and a `count`; `pcall`, `casek` and `mcall` add one
   three-way dispatch on a value, by a protocol method on a record, a
   `case` over a map's `:shape` and a multimethod on `:shape`;
   `acall` adds a call of a three-clause `defn` at its one-argument
