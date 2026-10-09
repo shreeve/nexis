@@ -542,7 +542,7 @@ keyed by frame index (§12).
 **Storage discipline.** Frames window one backing stack and a
 callee's window overlaps the top of its caller's, so no slice into
 `vm.stack.items` may be held across an operation that can grow it,
-and no `*Frame` across `vm.frames.append()`; `slotPtr` and
+and no `*Frame` across `vm.frames.append()`; `slotPtrIn` and
 `currentFrame` are one-shot. Frame indices stay valid because frames
 pop only from the top.
 
@@ -1340,12 +1340,15 @@ callback that catches it returns normally through `mapv`, `reduce`,
 ### 15. Tests
 
 `src/vm.zig` holds the opcode tests: hand-assembled routines
-covering every dispatched opcode and every trap it can raise, mostly
-as `RunCase{code, consts, slots, want}` tables run by `expectRuns`,
-which also asserts that a run that returns leaves no handler,
-pending finally or frame behind; the closure, cell, var and ctrl
-tests that inspect VM state are individual. `src/compile.zig` pins
-the 10k-iteration `recur` loop (§11).
+covering every dispatched opcode and every trap it can raise, as
+`RunCase` rows run by `expectRuns` (code, constants, tries, capture
+descriptors, a Var table, and the value, kind, Var, error or uncaught
+throw wanted), which also asserts that a run that returns leaves no
+handler, pending finally or frame behind; what verification refuses is
+the rows of `Routine.verify`'s own table, each run through `run` too.
+The tests that inspect VM state, batches and the numeric tower are
+individual. `src/compile.zig` pins the 10k-iteration `recur` loop
+(§11).
 `test/integration/eval_pipeline.zig`, `runtime_polish.zig` and
 `numbers.zig` run source through the compiler and VM (captured loop
 bindings, `letfn*`, variadic calls, every catchable error and its

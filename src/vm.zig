@@ -6572,58 +6572,16 @@ test "Operand helpers build the right bits" {
     try testing.expectEqual(@as(u12, 42), c.index);
 }
 
-test "VM frames: stack and frames structures initialized correctly" {
-    // Pins the backing-stack model invariants: after VM.init,
-    // `stack.items.len == routine.slot_count`, `frames.items.len == 1`,
-    // and frame[0].base_slot == 0.
-    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 5, "init-shape");
-
+test "VM frames: a VM starts on one frame over its routine's slots, nil" {
+    const routine = makeRoutine(&.{asm_.returnNil()}, &.{}, 5, "init-shape");
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
-
     try testing.expectEqual(@as(usize, 5), vm.stack.items.len);
     try testing.expectEqual(@as(usize, 1), vm.frames.items.len);
     try testing.expectEqual(@as(u32, 0), vm.frames.items[0].base_slot);
-    try testing.expectEqual(@as(u16, 5), vm.frames.items[0].routine.slot_count);
-    try testing.expectEqual(@as(u32, 0), vm.frames.items[0].pc);
-    // All slots default-initialized to nil.
-    for (vm.stack.items) |s| {
-        try testing.expect(s.kind() == .nil);
-    }
-}
-
-test "VM frames: slotPtr through backing stack with base_slot indirection" {
-    // Verify that slot access goes through base_slot, not a
-    // per-frame slice. With base_slot = 0 this is functionally
-    // equivalent to direct slice access; the test exists to
-    // pin the indirection so an "optimization" that stores a
-    // slice can't bypass it silently.
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // s0 = 42
-        asm_.returnSlot(0),
-    };
-    const routine = makeRoutine(&code, &consts, 1, "slotptr");
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-
-    // Manually verify slotPtr returns a pointer into vm.stack.items.
-    const ptr = try vm.slotPtrIn(vm.currentFrame(), 0);
-    try testing.expectEqual(&vm.stack.items[0], ptr);
-
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-    // After run, the slot still holds the value (via the same indirection).
-    try testing.expectEqual(@as(i64, 42), vm.stack.items[0].asFixnum());
-}
-
-test "VM frames: slotPtr out-of-range surfaces OperandOutOfRange" {
-    const routine = makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 3, "slotptr-oob");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 3));
-    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 4095));
+    for (vm.stack.items) |v| try testing.expect(v.isNil());
+    try testing.expectEqual(&vm.stack.items[4], try vm.slotPtrIn(vm.currentFrame(), 4));
+    try testing.expectError(VmError.OperandOutOfRange, vm.slotPtrIn(vm.currentFrame(), 5));
 }
 
 /// One hand-assembled routine and what running it on a fresh VM
@@ -6633,6 +6591,10 @@ const RunCase = struct {
     code: []const Inst,
     consts: []const Value = &.{},
     tries: []const Try = &.{},
+    caps: []const CaptureDescriptor = &.{},
+    /// The Var table: a fresh Var each, with a root and a binding in
+    /// force where given.
+    vars: []const struct { root: ?Value = null, binding: ?Value = null } = &.{},
     slots: u16 = 1,
     want: union(enum) {
         /// The result, by `dispatch.equal`.
@@ -6641,7 +6603,13 @@ const RunCase = struct {
         decimal: []const u8,
         /// A list of these fixnums.
         list: []const i64,
+        /// A value of this kind: a closure, a cell.
+        kind: value_mod.Kind,
+        /// The Var at this index of the table.
+        var_at: usize,
         err: VmError,
+        /// An uncaught throw of this value.
+        thrown: Value,
     },
 };
 
@@ -6650,15 +6618,36 @@ fn expectRuns(cases: []const RunCase) !void {
         errdefer std.debug.print("run case \"{s}\" failed\n", .{case.name});
         var routine = makeRoutine(case.code, case.consts, case.slots, case.name);
         routine.tries = case.tries;
+        routine.capture_descs = case.caps;
         var vm = try VM.init(testing.allocator, &routine);
         defer vm.deinit();
+        var vars: [4]*Var = undefined;
+        for (case.vars, vars[0..case.vars.len], 0..) |init, *v, i| {
+            v.* = try vm.ensureNamespace().intern(&.{'a' + @as(u8, @intCast(i))});
+            if (init.root) |root| {
+                v.*.root = root;
+                v.*.bound = true;
+            }
+            if (init.binding) |b| {
+                v.*.thread_value = b;
+                v.*.thread_bound = true;
+            }
+        }
+        routine.var_table = vars[0..case.vars.len];
         switch (case.want) {
             .err => |e| {
                 try testing.expectError(e, vm.run());
                 continue;
             },
+            .thrown => |v| {
+                try testing.expectError(VmError.UncaughtThrow, vm.run());
+                try testing.expect(dispatch_mod.equal(v, vm.unhandled_throw.?));
+                continue;
+            },
             .value => |v| try testing.expect(dispatch_mod.equal(v, try vm.run())),
             .decimal => |d| try expectDecimal(d, try vm.run()),
+            .kind => |k| try testing.expectEqual(k, (try vm.run()).kind()),
+            .var_at => |i| try testing.expectEqual(vars[i], VM.asVar(try vm.run())),
             .list => |xs| {
                 var cur = try vm.run();
                 for (xs) |x| {
@@ -6685,6 +6674,11 @@ const kn = Operand.constant;
 
 fn raw(g: Group, variant: u6, a: Operand, b: Operand, c: Operand) Inst {
     return .{ .kind = .primary, .group = @backingInt(g), .variant = variant, .a = a, .b = b, .c = c };
+}
+
+/// The instruction of quickened variant `q` of group `g`.
+fn quickInst(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
+    return raw(g, Quick.variant(g, q).?, a, b, c);
 }
 
 test "SourceInfo.lineCol: columns count code points, past a byte-order mark" {
@@ -6993,42 +6987,6 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
     // non-number), run as written and quickened: the result, or the
     // error, its detail and the instruction it names, are the same.
     const values = [_]Value{ fx(0), fx(1), fx(-7), fx(7), fx(value_mod.fixnum_max), fx(value_mod.fixnum_min), fl(2.5), true_v, nil_v };
-    const Outcome = struct {
-        value: ?Value = null,
-        err: ?VmError = null,
-        detail: [96]u8 = undefined,
-        detail_len: usize = 0,
-        pc: u32 = 0,
-
-        fn of(code: []const Inst, consts: []const Value) !@This() {
-            const routine = makeRoutine(code, consts, 3, "q");
-            var vm = try VM.init(testing.allocator, &routine);
-            defer vm.deinit();
-            var out: @This() = .{};
-            const v = vm.run() catch |err| {
-                out.err = err;
-                out.detail_len = @min(vm.error_detail.len, out.detail.len);
-                @memcpy(out.detail[0..out.detail_len], vm.error_detail[0..out.detail_len]);
-                out.pc = vm.error_trace.items[0].pc;
-                return out;
-            };
-            // A bignum lives on the VM's heap: compare it as text.
-            out.value = if (v.isFixnum() or v.isFloat() or v.isBool()) v else blk: {
-                var w = std.Io.Writer.fixed(&out.detail);
-                try bignum_mod.formatDecimal(v, &w);
-                out.detail_len = w.buffered().len;
-                break :blk nil_v;
-            };
-            return out;
-        }
-
-        fn expectSame(a: @This(), b: @This()) !void {
-            try testing.expectEqual(a.err, b.err);
-            try testing.expectEqual(a.pc, b.pc);
-            try testing.expectEqualStrings(a.detail[0..a.detail_len], b.detail[0..b.detail_len]);
-            if (a.value) |v| try testing.expect(dispatch_mod.equal(v, b.value.?)) else try testing.expect(b.value == null);
-        }
-    };
     var quickened: usize = 0;
     // B and C slots, C a fixnum constant, B a fixnum constant.
     for (values) |x| for (values) |y| for ([_]u2{ 0, 1, 2 }) |layout| {
@@ -7053,12 +7011,12 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
         };
         for (ops[0..k]) |body| {
             var code = [_]Inst{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), body[0], body[1], body[2], asm_.loadConst(2, 2), asm_.returnSlot(2) };
-            const plain = try Outcome.of(&code, &consts);
+            const plain = try StepOutcome.of(&code, &consts);
             quicken(&code, &consts);
             try testing.expect(Quick.of(VM.opIndex(code[2])) != null);
             quickened += 1;
             errdefer std.debug.print("quickened {any} of {any} and {any}\n", .{ Quick.of(VM.opIndex(code[2])), x, y });
-            try Outcome.expectSame(plain, try Outcome.of(&code, &consts));
+            try StepOutcome.expectSame(plain, try StepOutcome.of(&code, &consts));
         }
     };
     try testing.expect(quickened > 1000);
@@ -7067,11 +7025,7 @@ test "VM dispatch: a quickened instruction runs as its base, every case and trap
 test "Routine.verify: a quickened instruction proves what its form promises" {
     const r = asm_.returnNil();
     const consts = [_]Value{ fx(1), fl(1.5) };
-    const quick = struct {
-        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
-            return raw(g, Quick.variant(g, q).?, a, b, c);
-        }
-    }.of;
+    const quick = quickInst;
     const add_ss: Quick = .{ .base = @backingInt(Math.add), .form = .slot_slot };
     const add_sc: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum };
     const lt_then: Quick = .{ .base = @backingInt(Cmp.lt), .form = .slot_slot, .then = .if_false };
@@ -7321,11 +7275,7 @@ test "VM dispatch: an error through a counting loop's step names its own instruc
 test "Routine.verify: a step proves the comparison it runs" {
     const r = asm_.returnNil();
     const consts = [_]Value{ fx(1), fl(1.5) };
-    const quick = struct {
-        fn of(g: Group, q: Quick, a: Operand, b: Operand, c: Operand) Inst {
-            return raw(g, Quick.variant(g, q).?, a, b, c);
-        }
-    }.of;
+    const quick = quickInst;
     const step: Quick = .{ .base = @backingInt(Math.add), .form = .slot_fixnum, .then = .if_true, .step = .{ .cmp = .lt, .form = .slot_slot } };
     const lt_ss: Quick = Quick.stepCmp(step).?;
     const gt: Quick = .{ .base = @backingInt(Cmp.gt), .form = .slot_slot, .then = .if_true };
@@ -7376,122 +7326,6 @@ test "VM jump: targets and constants past the 16-bit range" {
     var vm = try VM.init(testing.allocator, &routine);
     defer vm.deinit();
     try testing.expectEqual(@as(i64, 69_000), (try vm.run()).asFixnum());
-}
-
-// ---- ctrl group tests ---------------------------
-
-test "VM ctrl: try-enter pushes handler, try-exit pops it" {
-    // (try 42 (catch any _ 99)) — body returns 42, catch unused.
-    // Layout: slot 0 = result; slot 1 = catch binding (unused).
-    // Body returns 42 via mov; try-exit jumps past catch; catch
-    // would set 99 if reached.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=4), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: body: load 42 into slot 0
-        // (We can't loadConst w/o consts; use loadNil and then
-        // a constant via consts pool.)
-        asm_.loadConst(0, 0),
-        // PC 2: try-exit -> jump to post at PC 6
-        asm_.tryExit(6),
-        // PC 3: jump (just padding; never reached)
-        asm_.jumpJmp(6),
-        // PC 4: catch entry — set slot 0 to constant index 1 (99)
-        asm_.loadConst(0, 1),
-        // PC 5: try-exit -> post at PC 6
-        asm_.tryExit(6),
-        // PC 6: return slot 0
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(42).?,
-        value_mod.fromFixnum(99).?,
-    };
-    var routine = makeRoutine(&code, &consts, 2, "try-normal");
-    routine.tries = &.{.{ .catch_pc = 4 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expectEqual(@as(i64, 42), r.asFixnum());
-    // Handler stack empty after normal exit.
-    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
-}
-
-test "VM ctrl: throw caught by current frame's try handler" {
-    // (try (throw 7) (catch any e e)) — should return 7.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=2), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: throw constant 0 (= 7)
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        // PC 2: catch entry — slot 1 was filled by throw with 7;
-        // move it to slot 0 (result), then try-exit to PC 4.
-        asm_.move(0, 1),
-        // PC 3: try-exit -> post at PC 4
-        asm_.tryExit(4),
-        // PC 4: return slot 0
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(7).?,
-    };
-    var routine = makeRoutine(&code, &consts, 2, "try-catch");
-    routine.tries = &.{.{ .catch_pc = 2 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const r = try vm.run();
-    try testing.expectEqual(@as(i64, 7), r.asFixnum());
-    try testing.expectEqual(@as(usize, 0), vm.handlers.items.len);
-}
-
-test "VM ctrl: throw with no handler raises UncaughtThrow" {
-    // (throw 13) at top level — uncaught.
-    var code = [_]Inst{
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        asm_.returnSlot(0), // unreached
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(13).?,
-    };
-    const routine = makeRoutine(&code, &consts, 1, "uncaught");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.UncaughtThrow, vm.run());
-    // Payload stored for diagnostics.
-    try testing.expect(vm.unhandled_throw != null);
-    try testing.expectEqual(@as(i64, 13), vm.unhandled_throw.?.asFixnum());
-}
-
-test "VM ctrl: throw inside catch body NOT re-caught by same handler" {
-    // (try (throw :a) (catch any e (throw :b)))
-    // The inner throw must NOT be caught by the same handler;
-    // it should propagate as UncaughtThrow (no outer try here).
-    // This is the "classic trap": the throw-handler replaces
-    // the try with cleanup so the catch body's own throw
-    // bypasses the same handler.
-    var code = [_]Inst{
-        // PC 0: try-enter try 0 (catch=2), binding=1
-        asm_.tryEnter(0, 1),
-        // PC 1: throw const 0 = :a (fixnum 1 for simplicity)
-        asm_.throwOp(Operand{ .kind = .constant, .index = 0 }),
-        // PC 2: catch entry — throw const 1 = :b
-        asm_.throwOp(Operand{ .kind = .constant, .index = 1 }),
-        // PC 3: try-exit (unreached if inner throw escapes)
-        asm_.tryExit(4),
-        // PC 4: return
-        asm_.returnSlot(0),
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(1).?, // "a"
-        value_mod.fromFixnum(2).?, // "b"
-    };
-    var routine = makeRoutine(&code, &consts, 2, "catch-rethrow");
-    routine.tries = &.{.{ .catch_pc = 2 }};
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    try testing.expectError(VmError.UncaughtThrow, vm.run());
-    // Should be the SECOND throw (value 2), not the first.
-    try testing.expectEqual(@as(i64, 2), vm.unhandled_throw.?.asFixnum());
 }
 
 test "VM error detail: a sentence longer than the buffer is cut with an ellipsis, not dropped" {
@@ -7590,6 +7424,12 @@ test "VM ctrl: a try's finally body runs after its catch; try-enter names a try 
             .want = .{ .list = &.{ 7, 7, 1 } },
         },
         .{ .name = "try index past the table", .code = &.{ asm_.tryEnter(1, 0), asm_.returnNil() }, .tries = &.{.{ .catch_pc = 1 }}, .want = .{ .err = VmError.OperandOutOfRange } },
+        // (try 42 (catch any _ 99)), (try (throw 7) (catch any e e)).
+        .{ .name = "try-exit with nothing thrown", .code = &.{ asm_.tryEnter(0, 1), asm_.loadConst(0, 0), asm_.tryExit(5), asm_.loadConst(0, 1), asm_.tryExit(5), asm_.returnSlot(0) }, .consts = &.{ fx(42), fx(99) }, .tries = &.{.{ .catch_pc = 3 }}, .slots = 2, .want = .{ .value = fx(42) } },
+        .{ .name = "a throw caught", .code = &.{ asm_.tryEnter(0, 1), asm_.throwOp(kn(0)), asm_.move(0, 1), asm_.tryExit(4), asm_.returnSlot(0) }, .consts = &.{fx(7)}, .tries = &.{.{ .catch_pc = 2 }}, .slots = 2, .want = .{ .value = fx(7) } },
+        .{ .name = "a throw with no handler", .code = &.{ asm_.throwOp(kn(0)), asm_.returnNil() }, .consts = &.{fx(13)}, .want = .{ .thrown = fx(13) } },
+        // The catch body's throw passes the handler that caught the first.
+        .{ .name = "a throw from the catch body", .code = &.{ asm_.tryEnter(0, 1), asm_.throwOp(kn(0)), asm_.throwOp(kn(1)), asm_.tryExit(4), asm_.returnNil() }, .consts = &.{ fx(1), fx(2) }, .tries = &.{.{ .catch_pc = 2 }}, .slots = 2, .want = .{ .thrown = fx(2) } },
     });
 }
 
@@ -7825,298 +7665,53 @@ test "callValue: keywords, maps, sets and vectors are invocable as lookups" {
     try testing.expectError(VmError.NotCallable, vm.callValue(fx(1), &.{fx(2)}));
 }
 
-test "VM math/cmp opcodes cover every wired variant" {
-    const consts = [_]Value{
-        fx(7),
-        fx(2),
-        fl(0.5),
-    };
-    var code = [_]Inst{
-        Inst.primary(.math, Math.sub, Operand.slot(0), Operand.constant(0), Operand.constant(1)), // 5
-        Inst.primary(.math, Math.mul, Operand.slot(1), Operand.slot(0), Operand.constant(1)), // 10
-        Inst.primary(.math, Math.div, Operand.slot(2), Operand.slot(1), Operand.constant(1)), // 5
-        Inst.primary(.math, Math.idiv, Operand.slot(3), Operand.constant(0), Operand.constant(1)), // 3
-        Inst.primary(.math, Math.mod, Operand.slot(4), Operand.constant(0), Operand.constant(1)), // 1
-        Inst.primary(.math, Math.neg, Operand.slot(5), Operand.slot(4), Operand.none), // -1
-        Inst.primary(.math, Math.abs, Operand.slot(6), Operand.slot(5), Operand.none), // 1
-        Inst.primary(.cmp, Cmp.lte, Operand.slot(7), Operand.slot(6), Operand.constant(1)), // true
-        Inst.primary(.cmp, Cmp.gt, Operand.slot(8), Operand.slot(6), Operand.constant(2)), // true
-        Inst.primary(.cmp, Cmp.gte, Operand.slot(9), Operand.constant(2), Operand.slot(6)), // false
-        Inst.primary(.cmp, Cmp.eq_num, Operand.slot(10), Operand.slot(2), Operand.slot(0)), // true
-        asm_.returnSlot(10),
-    };
-    const routine = makeRoutine(&code, &consts, 11, "math-cmp");
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.asBool());
-    try testing.expectEqual(@as(i64, 5), vm.stack.items[0].asFixnum());
-    try testing.expectEqual(@as(i64, 10), vm.stack.items[1].asFixnum());
-    try testing.expectEqual(@as(i64, 5), vm.stack.items[2].asFixnum());
-    try testing.expectEqual(@as(i64, 3), vm.stack.items[3].asFixnum());
-    try testing.expectEqual(@as(i64, 1), vm.stack.items[4].asFixnum());
-    try testing.expectEqual(@as(i64, -1), vm.stack.items[5].asFixnum());
-    try testing.expectEqual(@as(i64, 1), vm.stack.items[6].asFixnum());
-    try testing.expect(vm.stack.items[7].asBool());
-    try testing.expect(vm.stack.items[8].asBool());
-    try testing.expect(!vm.stack.items[9].asBool());
+test "VM opcodes: every math and cmp variant" {
+    const op = struct {
+        fn of(g: Group, variant: anytype, b: Operand, c: Operand) []const Inst {
+            return &.{ Inst.primary(g, variant, sl(0), b, c), asm_.returnSlot(0) };
+        }
+    }.of;
+    const none = Operand.none;
+    try expectRuns(comptime &[_]RunCase{
+        .{ .name = "sub", .code = op(.math, Math.sub, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(5) } },
+        .{ .name = "mul", .code = op(.math, Math.mul, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(14) } },
+        .{ .name = "div", .code = op(.math, Math.div, kn(0), kn(1)), .consts = &.{ fx(10), fx(2) }, .want = .{ .value = fx(5) } },
+        .{ .name = "idiv", .code = op(.math, Math.idiv, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(3) } },
+        .{ .name = "mod", .code = op(.math, Math.mod, kn(0), kn(1)), .consts = &.{ fx(7), fx(2) }, .want = .{ .value = fx(1) } },
+        .{ .name = "neg", .code = op(.math, Math.neg, kn(0), none), .consts = &.{fx(1)}, .want = .{ .value = fx(-1) } },
+        .{ .name = "abs", .code = op(.math, Math.abs, kn(0), none), .consts = &.{fx(-1)}, .want = .{ .value = fx(1) } },
+        .{ .name = "lte", .code = op(.cmp, Cmp.lte, kn(0), kn(1)), .consts = &.{ fx(1), fx(2) }, .want = .{ .value = true_v } },
+        .{ .name = "gt", .code = op(.cmp, Cmp.gt, kn(0), kn(1)), .consts = &.{ fx(1), fl(0.5) }, .want = .{ .value = true_v } },
+        .{ .name = "gte", .code = op(.cmp, Cmp.gte, kn(0), kn(1)), .consts = &.{ fl(0.5), fx(1) }, .want = .{ .value = false_v } },
+        .{ .name = "eq-num", .code = op(.cmp, Cmp.eq_num, kn(0), kn(1)), .consts = &.{ fx(5), fl(5.0) }, .want = .{ .value = true_v } },
+    });
 }
 
-// ---- Var + Namespace + var:load-var tests ----
-
-test "VM var: Namespace.intern creates an unbound Var, lookup returns it" {
-    var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "init"));
-    defer vm.deinit();
-    const ns = vm.ensureNamespace();
-    const v1 = try ns.intern("x");
-    try testing.expect(!v1.bound);
-    try testing.expect(v1.root.isNil());
-    // Re-intern returns the SAME Var (identity stable).
-    const v2 = try ns.intern("x");
-    try testing.expectEqual(v1, v2);
-    // Lookup of unknown returns null.
-    try testing.expect(ns.lookup("y") == null);
-}
-
-test "VM var: var:load-var returns var.root for bound var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    // Intern + bind x = 42 in the VM's namespace.
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("x");
-    x.root = value_mod.fromFixnum(42).?;
-    x.bound = true;
-
-    // Build a routine that references x via var_table[0] and
-    // patch the VM's top frame to use it. Direct manipulation —
-    // tests-only API; the compiler sets this up through
-    // `Routine.var_table`.
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const result = try vm.run();
-    try testing.expect(result.isFixnum());
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM var: var:load-var on unbound Var traps :unbound-var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("undefined-yet"); // never bound
-
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.UnboundVar, res);
-}
-
-test "VM var: a v operand reads the binding in force, else the root, else traps" {
+test "Namespace.intern makes an unbound Var once" {
     var vm = try VM.init(testing.allocator, &VM.idle_routine);
     defer vm.deinit();
     const ns = vm.ensureNamespace();
-    const rooted = try ns.intern("rooted");
-    rooted.root = fx(40);
-    rooted.bound = true;
-    const rebound = try ns.intern("rebound");
-    rebound.root = fx(1);
-    rebound.bound = true;
-    rebound.thread_value = fx(2);
-    rebound.thread_bound = true;
-    const unbound = try ns.intern("unbound");
-    const var_table = [_]*Var{ rooted, rebound, unbound };
-    // (+ rooted rebound), then the same through the general mov:move.
-    var code = [_]Inst{
-        asm_.mathAdd(0, Operand.varRef(0), Operand.varRef(1)),
-        asm_.returnSlot(0),
-    };
-    var routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1, .var_table = &var_table };
-    try vm.retargetTop(&routine);
-    try testing.expectEqual(@as(i64, 42), (try vm.run()).asFixnum());
-    code[0] = asm_.moveFrom(0, Operand.varRef(2));
-    try vm.retargetTop(&routine);
-    try testing.expectError(VmError.UnboundVar, vm.run());
-    vm.resetAfterError();
-    code[0] = asm_.moveFrom(0, Operand.varRef(3));
-    try vm.retargetTop(&routine);
-    try testing.expectError(VmError.OperandOutOfRange, vm.run());
-}
-
-test "VM var: var:load-var operand index out of range traps :operand-out-of-range" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    // Empty var_table, but instruction references index 5.
-    var code = [_]Inst{
-        asm_.varLoadVar(0, 5),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        // var_table = default empty
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-test "VM var: var:load-var into a non-slot destination traps :invalid-operand-kind" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const x = try vm.ensureNamespace().intern("x");
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        Inst.primaryWide(.var_, VarOp.load_var, Operand.constant(0), 0),
-        asm_.returnNil(),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-// ---- var:store-var + var:var-object tests ----
-
-test "VM var store: var:store-var sets root and marks bound; var-object reads the Var" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
     const x = try ns.intern("x");
-    try testing.expect(!x.bound);
-
-    const var_table = [_]*Var{x};
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.varStoreVar(0, Operand.constant(0)), // x = 42
-        asm_.varVarObject(0, 0), //                 slot[0] = #'x
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    // Var state is now bound to 42.
-    try testing.expect(x.bound);
-    try testing.expectEqual(@as(i64, 42), x.root.asFixnum());
+    try testing.expect(!x.bound and x.current() == null);
+    try testing.expectEqual(x, try ns.intern("x"));
+    try testing.expect(ns.lookup("y") == null);
 }
 
-test "VM var store: var:store-var twice preserves Var identity (rebind in place)" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("x");
-
-    const var_table = [_]*Var{x};
-    const consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-        value_mod.fromFixnum(10).?,
-    };
-    // Bind x=5, then x=10, then return the result of the second
-    // store-var. Same Var; root updated.
-    var code = [_]Inst{
-        asm_.varStoreVar(0, Operand.constant(0)), // x = 5
-        asm_.varStoreVar(0, Operand.constant(1)), // x = 10
-        asm_.varVarObject(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    try testing.expectEqual(@as(i64, 10), x.root.asFixnum());
-}
-
-test "VM var store: var:var-object returns the Var WITHOUT trapping on unbound" {
-    var vm = try VM.init(
-        testing.allocator,
-        &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "stub"),
-    );
-    defer vm.deinit();
-
-    const ns = vm.ensureNamespace();
-    const x = try ns.intern("never-bound");
-    try testing.expect(!x.bound);
-
-    const var_table = [_]*Var{x};
-    var code = [_]Inst{
-        asm_.varVarObject(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &.{},
-        .slot_count = 1,
-        .var_table = &var_table,
-    };
-    try vm.retargetTop(&routine);
-
-    const result = try vm.run();
-    try testing.expect(result.kind() == .var_);
-    try testing.expectEqual(x, VM.asVar(result));
-    try testing.expect(!x.bound); // var-object did NOT bind it
+test "VM opcodes: var" {
+    const v = Operand.varRef;
+    try expectRuns(&[_]RunCase{
+        .{ .name = "load-var of a bound Var", .code = &.{ asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{ .root = fx(42) }}, .want = .{ .value = fx(42) } },
+        .{ .name = "load-var of an unbound Var", .code = &.{ asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+        .{ .name = "v operands read the binding in force, else the root", .code = &.{ asm_.mathAdd(0, v(0), v(1)), asm_.returnSlot(0) }, .vars = &.{ .{ .root = fx(40) }, .{ .root = fx(1), .binding = fx(2) } }, .want = .{ .value = fx(42) } },
+        .{ .name = "a v operand of an unbound Var", .code = &.{ asm_.moveFrom(0, v(0)), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+        .{ .name = "store-var binds the root", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .vars = &.{.{}}, .want = .{ .value = fx(42) } },
+        // A Var's identity holds across stores; `def` is store-var
+        // then var-object.
+        .{ .name = "store-var twice", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varStoreVar(0, kn(1)), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .consts = &.{ fx(5), fx(10) }, .vars = &.{.{}}, .want = .{ .value = fx(10) } },
+        .{ .name = "var-object after store-var", .code = &.{ asm_.varStoreVar(0, kn(0)), asm_.varVarObject(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .vars = &.{.{}}, .want = .{ .var_at = 0 } },
+        .{ .name = "var-object of an unbound Var", .code = &.{ asm_.varVarObject(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .var_at = 0 } },
+        .{ .name = "var-object binds nothing", .code = &.{ asm_.varVarObject(0, 0), asm_.varLoadVar(0, 0), asm_.returnSlot(0) }, .vars = &.{.{}}, .want = .{ .err = VmError.UnboundVar } },
+    });
 }
 
 test "VM jump: setWide back-patches a target and keeps the test operand" {
@@ -8127,737 +7722,59 @@ test "VM jump: setWide back-patches a target and keeps the test operand" {
     try testing.expectEqual(Group.jump, inst.groupOf());
 }
 
-// ---- closure + call tests ----
-
-test "VM closure call: closure:make produces a function-kind Value" {
-    // Hand-assemble: child routine returns nil. Parent routine
-    // makes a closure for it, returns the closure.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .capture_descs = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-        .name = "child",
-    };
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure of capture descriptor 0 (empty)
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-        .name = "parent",
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .function);
-    const c = VM.asClosure(result);
-    try testing.expectEqual(&child_routine, c.routine);
-    try testing.expectEqual(@as(usize, 0), c.upvalues.len);
+test "VM opcodes: closures, cells and calls" {
+    const ret42 = Routine{ .code = &.{ asm_.loadConst(0, 0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .slot_count = 1, .name = "ret42" };
+    const add1 = Routine{ .code = &.{ asm_.mathAdd(1, sl(0), kn(0)), asm_.returnSlot(1) }, .consts = &.{fx(1)}, .slot_count = 2, .fixed_arity = 1, .name = "add1" };
+    const add2 = Routine{ .code = &.{ asm_.mathAdd(2, sl(0), sl(1)), asm_.returnSlot(2) }, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "add2" };
+    // Returns a local it never wrote.
+    const local = Routine{ .code = &.{asm_.returnSlot(2)}, .consts = &.{}, .slot_count = 3, .fixed_arity = 1, .name = "local" };
+    // Returns its one upvalue's contents.
+    const upval = Routine{ .code = &.{ asm_.moveFrom(0, Operand.upvalue(0)), asm_.returnSlot(0) }, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "upval" };
+    const cell_of_s0 = [_]CaptureSource{.{ .local_cell_slot = 0 }};
+    const make = asm_.closureMake(0, 0);
+    try expectRuns(&[_]RunCase{
+        .{ .name = "closure:make", .code = &.{ make, asm_.returnSlot(0) }, .caps = &.{.{ .routine = &ret42, .sources = &.{} }}, .want = .{ .kind = .function } },
+        .{ .name = "a call of none", .code = &.{ make, asm_.callCall(0, 0, 0), asm_.returnSlot(0) }, .caps = &.{.{ .routine = &ret42, .sources = &.{} }}, .want = .{ .value = fx(42) } },
+        .{ .name = "a call of one", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) }, .consts = &.{fx(5)}, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 3, .want = .{ .value = fx(6) } },
+        .{ .name = "a call of two", .code = &.{ make, asm_.loadConst(1, 0), asm_.loadConst(2, 1), asm_.callCall(0, 2, 3), asm_.returnSlot(3) }, .consts = &.{ fx(3), fx(4) }, .caps = &.{.{ .routine = &add2, .sources = &.{} }}, .slots = 4, .want = .{ .value = fx(7) } },
+        .{ .name = "one closure called twice", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 4), asm_.loadConst(1, 1), asm_.callCall(0, 1, 5), asm_.mathAdd(6, sl(4), sl(5)), asm_.returnSlot(6) }, .consts = &.{ fx(5), fx(10) }, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 7, .want = .{ .value = fx(17) } },
+        .{ .name = "too few arguments", .code = &.{ make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 2), asm_.returnSlot(2) }, .consts = &.{fx(1)}, .caps = &.{.{ .routine = &add2, .sources = &.{} }}, .slots = 3, .want = .{ .err = VmError.ArityMismatch } },
+        .{ .name = "too many arguments", .code = &.{ make, asm_.loadConst(1, 0), asm_.loadConst(2, 0), asm_.callCall(0, 2, 3), asm_.returnSlot(3) }, .consts = &.{fx(1)}, .caps = &.{.{ .routine = &add1, .sources = &.{} }}, .slots = 4, .want = .{ .err = VmError.ArityMismatch } },
+        // The callee's window overlaps the caller's slots 2 and 3.
+        .{ .name = "a callee's locals start nil", .code = &.{ asm_.loadConst(2, 0), asm_.loadConst(3, 0), make, asm_.loadConst(1, 0), asm_.callCall(0, 1, 4), asm_.returnSlot(4) }, .consts = &.{fx(99)}, .caps = &.{.{ .routine = &local, .sources = &.{} }}, .slots = 5, .want = .{ .value = nil_v } },
+        .{ .name = "box-local", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.returnSlot(0) }, .consts = &.{fx(42)}, .want = .{ .kind = .cell_internal } },
+        .{ .name = "box-local of a boxed slot", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureBoxLocal(0), asm_.returnSlot(0) }, .consts = &.{fx(7)}, .want = .{ .err = VmError.InvalidCellState } },
+        .{ .name = "get-cell", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .value = fx(99) } },
+        .{ .name = "get-cell of a value", .code = &.{ asm_.loadConst(0, 0), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(5)}, .slots = 2, .want = .{ .err = VmError.ExpectedCell } },
+        // A `u` operand reads a cell's contents, never the cell.
+        .{ .name = "a captured cell read through u", .code = &.{ asm_.loadConst(0, 0), asm_.closureBoxLocal(0), asm_.closureMake(0, 1), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, .consts = &.{fx(123)}, .caps = &.{.{ .routine = &upval, .sources = &cell_of_s0 }}, .slots = 3, .want = .{ .value = fx(123) } },
+        .{ .name = "new-cell", .code = &.{ asm_.closureNewCell(0), asm_.returnSlot(0) }, .want = .{ .kind = .cell_internal } },
+        .{ .name = "init-cell, then get-cell", .code = &.{ asm_.closureNewCell(0), asm_.closureInitCell(0, kn(0)), asm_.closureGetCell(1, 0), asm_.returnSlot(1) }, .consts = &.{fx(42)}, .slots = 2, .want = .{ .value = fx(42) } },
+        .{ .name = "init-cell of a filled cell", .code = &.{ asm_.closureNewCell(0), asm_.closureInitCell(0, kn(0)), asm_.closureInitCell(0, kn(0)), asm_.returnNil() }, .consts = &.{fx(1)}, .want = .{ .err = VmError.InvalidCellState } },
+        .{ .name = "init-cell of a value", .code = &.{ asm_.loadConst(0, 0), asm_.closureInitCell(0, kn(0)), asm_.returnNil() }, .consts = &.{fx(7)}, .want = .{ .err = VmError.ExpectedCell } },
+        // `(fn* f [] f)`: the closure captures the placeholder cell it
+        // fills, and calling it returns it.
+        .{ .name = "a closure over its own cell", .code = &.{ asm_.closureNewCell(0), asm_.closureMake(0, 1), asm_.closureInitCell(0, sl(1)), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, .caps = &.{.{ .routine = &upval, .sources = &cell_of_s0 }}, .slots = 3, .want = .{ .kind = .function } },
+    });
 }
 
-test "VM closure call: ((fn* [] 42)) — no-arg closure call returns its body value" {
-    // Child: load 42 into s0, return.
-    const child_consts = [_]Value{value_mod.fromFixnum(42).?};
-    var child_code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 1,
-    };
-    // Parent: closure:make → s0; call:call s0,0,s0; call:return s0.
-    // call_base = 0 (the closure slot); argc = 0; result_slot = 0.
-    // Note dst slot reuses s0 — the closure value is consumed by
-    // the call, then overwritten by the result. Legal per VM.md §6.
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.callCall(0, 0, 0),
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM closure call: ((fn* [x] (+ x 1)) 5) = 6 — single arg" {
-    // Child: math:add s1, s0, c0 (s0 = param x); return s1.
-    const child_consts = [_]Value{value_mod.fromFixnum(1).?};
-    var child_code = [_]Inst{
-        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
-        asm_.returnSlot(1),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 2,
-        .fixed_arity = 1,
-    };
-    // Parent: load fn into s0, load 5 into s1, call_base=s0 argc=1
-    // result=s2; return s2. slot_count = 3.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 5 (the arg)
-        asm_.callCall(0, 1, 2), //       s2 = (closure 5)
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 6), result.asFixnum());
-}
-
-test "VM closure call: ((fn* [x y] (+ x y)) 3 4) = 7 — two-arg call" {
-    // Child: math:add s2, s0, s1; return s2. slot_count=3, arity=2.
-    var child_code = [_]Inst{
-        asm_.mathAdd(2, Operand.slot(0), Operand.slot(1)),
-        asm_.returnSlot(2),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 3,
-        .fixed_arity = 2,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(3).?,
-        value_mod.fromFixnum(4).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 3
-        asm_.loadConst(2, 1), //         s2 = 4
-        asm_.callCall(0, 2, 3), //       s3 = (closure 3 4)
-        asm_.returnSlot(3),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 4,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 7), result.asFixnum());
-}
-
-test "VM closure call: arity mismatch — too few args traps :arity-mismatch" {
-    // Child expects 2 args; we pass 1.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 2,
-        .fixed_arity = 2,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.loadConst(1, 0),
-        asm_.callCall(0, 1, 2), // argc=1 but child expects 2
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ArityMismatch, res);
-}
-
-test "VM closure call: arity mismatch — too many args traps :arity-mismatch" {
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 1,
-    };
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(1).?,
-        value_mod.fromFixnum(2).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.loadConst(1, 0),
-        asm_.loadConst(2, 1),
-        asm_.callCall(0, 2, 3), // argc=2 but child expects 1
-        asm_.returnSlot(3),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 4,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ArityMismatch, res);
-}
-
-test "VM closure call: closure:make capture descriptor source-count mismatch traps" {
-    // Child expects 1 upvalue; descriptor has 0 sources.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1, // mismatch with descriptor below
-    };
-    const parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }}; // 0 sources
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.returnSlot(0),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.CaptureCountMismatch, res);
-}
-
-test "VM closure call: callee local slots are nil-initialized even when stack overlaps caller high slots" {
-    // Child has slot_count=3 (slot 0 = arg, slots 1-2 are locals).
-    // Body returns slot 2 without writing it — should be nil.
-    var child_code = [_]Inst{asm_.returnSlot(2)};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 3,
-        .fixed_arity = 1,
-    };
-    // Parent: stuff non-nil into all of its high slots first to
-    // create the "overlap with caller's stale data" scenario.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(7).?,
-        value_mod.fromFixnum(99).?, // poison value to detect leak
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        // Pre-poison high slots that will OVERLAP with callee locals.
-        asm_.loadConst(2, 1), // s2 = 99
-        asm_.loadConst(3, 1), // s3 = 99
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 7 (the arg)
-        asm_.callCall(0, 1, 4), //       call_base=0, argc=1, result→s4
-        asm_.returnSlot(4),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 5,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // If the callee's slot 2 had leaked the parent's poisoned 99,
-    // we'd get a fixnum back. Nil-init means we get nil.
-    try testing.expect(result.kind() == .nil);
-}
-
-test "VM closure call: call:call with constant operand as A traps :invalid-operand-kind" {
-    // call:call requires A=slot (the call_base). A=constant is
-    // invalid.
-    const consts = [_]Value{};
-    const bad_call: Inst = .{
-        .kind = .primary,
-        .group = @backingInt(Group.call),
-        .variant = @backingInt(Call.call),
-        .a = Operand.constant(0), // illegal: must be slot
-        .b = Operand.slot(0),
-        .c = Operand.slot(0),
-    };
-    var code = [_]Inst{ bad_call, asm_.returnNil() };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM closure call: call:call with constant operand as C traps :invalid-operand-kind" {
-    // call:call requires C=slot (the result). C=constant is invalid.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-    };
-    const consts = [_]Value{};
-    const caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    const bad_call: Inst = .{
-        .kind = .primary,
-        .group = @backingInt(Group.call),
-        .variant = @backingInt(Call.call),
-        .a = Operand.slot(0),
-        .b = Operand.slot(0),
-        .c = Operand.constant(0), // illegal: must be slot
-    };
-    var code = [_]Inst{
-        asm_.closureMake(0, 0),
-        bad_call,
-        asm_.returnNil(),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &caps,
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM closure call: closure:make with capture descriptor index out of range traps OperandOutOfRange" {
-    const consts = [_]Value{};
-    // No capture descriptors at all — index 0 is OOR.
-    var code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &.{}, // empty
-        .slot_count = 1,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.OperandOutOfRange, res);
-}
-
-// ---- cell operations + U-operand tests ----
-
-test "VM capture: closure:box-local wraps slot value into an UpvalCell" {
-    // Load 42 into s0, box it, then verify s0 holds a cell and
-    // the cell's value is 42.
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0),
-        asm_.returnSlot(0), // return the cell value (we'll inspect via VM state, not result)
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // After box-local, the slot (now returned as result) is a cell-internal Value.
-    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
-    const cell = try VM.asCell(result);
-    try testing.expect(cell.initialized);
-    try testing.expectEqual(@as(i64, 42), cell.value.asFixnum());
-}
-
-test "VM capture: closure:box-local on already-boxed slot traps :invalid-cell-state" {
-    const consts = [_]Value{value_mod.fromFixnum(7).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0), // first box
-        asm_.closureBoxLocal(0), // second box — must trap
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidCellState, res);
-}
-
-test "VM capture: closure:get-cell reads cell contents back" {
-    const consts = [_]Value{value_mod.fromFixnum(99).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0),
-        asm_.closureBoxLocal(0),
-        asm_.closureGetCell(1, 0), // s1 = *cell at s0
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 99), result.asFixnum());
-}
-
-test "VM capture: closure:get-cell on non-cell traps :expected-cell" {
-    const consts = [_]Value{value_mod.fromFixnum(5).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), // s0 = fixnum 5 (NOT a cell)
-        asm_.closureGetCell(1, 0),
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ExpectedCell, res);
-}
-
-test "VM capture: mov:move with U-operand source resolves cell contents (no opcode needed)" {
-    // There is no dedicated closure:read-upval —
-    // resolve(u:N) deref's the cell. Test it via a hand-assembled
-    // single-frame routine where we manually populate frame.upvalues.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 (deref)
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-
-    // Set up VM with a top-level routine that calls the child.
-    // We need closure:make to provide an upvalue, which means
-    // we need to first box a local. Use box + make + call.
-    var parent_consts_storage = [_]Value{
-        value_mod.fromFixnum(123).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.loadConst(0, 0), //                 s0 = 123
-        asm_.closureBoxLocal(0), //              s0 = *cell{123}
-        asm_.closureMake(0, 1), //            s1 = closure capturing cell at s0
-        asm_.callCall(1, 0, 2), //               s2 = (child) — child returns 123 via U deref
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts_storage,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 123), result.asFixnum());
-}
-
-test "VM capture: U-operand out of range traps :upvalue-out-of-range" {
-    // Child routine has upvalue_count=0 but tries to read u:0.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 0,
-    };
-
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0),
-        asm_.callCall(0, 0, 1),
-        asm_.returnSlot(1),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 2,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.UpvalueOutOfRange, res);
-}
-
-test "VM capture: closure:make with local_cell_slot source populates closure.upvalues" {
-    // Standalone test of closure:make's descriptor execution
-    // (the closure-call tests all use empty descriptors).
-    // Box a slot, then closure:make with one
-    // local_cell_slot source. Verify closure.upvalues has the
-    // right cell.
-    var child_code = [_]Inst{asm_.returnNil()};
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    const consts = [_]Value{
-        value_mod.fromFixnum(42).?,
-    };
-    const caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //         s0 = 42
-        asm_.closureBoxLocal(0), //      s0 = *cell{42}
-        asm_.closureMake(0, 1), //    s1 = closure with upvalue[0] = cell
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{
-        .code = &code,
-        .consts = &consts,
-        .capture_descs = &caps,
-        .slot_count = 2,
-    };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == .function);
-    const closure = VM.asClosure(result);
-    try testing.expectEqual(@as(usize, 1), closure.upvalues.len);
-    try testing.expectEqual(@as(i64, 42), closure.upvalues[0].value.asFixnum());
-    try testing.expect(closure.upvalues[0].initialized);
-}
-
-// ---- placeholder cell tests ----
-
-test "VM cells: closure:new-cell creates uninitialized cell" {
-    var code = [_]Inst{
-        asm_.closureNewCell(0),
-        asm_.returnSlot(0),
-    };
-    const routine = Routine{ .code = &code, .consts = &.{}, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expect(result.kind() == value_mod.Kind.cell_internal);
-    const cell = try VM.asCell(result);
-    try testing.expect(!cell.initialized);
-}
-
-test "VM cells: U-operand resolve on uninitialized cell traps :uninitialized-cell" {
-    // Construct a closure with a single upvalue pointing to an
-    // uninitialized cell. Inner fn body tries to read it via
-    // u:0, which deref's the cell — should trap.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)),
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.closureNewCell(0), //         s0 = uninit cell
-        asm_.closureMake(0, 1), //      s1 = closure capturing s0
-        asm_.callCall(1, 0, 2), //         call closure → child traps
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
+test "VM cells: a u operand of a placeholder cell traps, quickened or not" {
+    var upval_code = [_]Inst{ asm_.moveFrom(0, Operand.upvalue(0)), asm_.returnSlot(0) };
+    const upval = Routine{ .code = &upval_code, .consts = &.{}, .slot_count = 1, .upvalue_count = 1, .name = "upval" };
+    const caps = [_]CaptureDescriptor{.{ .routine = &upval, .sources = &.{.{ .local_cell_slot = 0 }} }};
+    var routine = makeRoutine(&.{ asm_.closureNewCell(0), asm_.closureMake(0, 1), asm_.callCall(1, 0, 2), asm_.returnSlot(2) }, &.{}, 3, "top");
+    routine.capture_descs = &caps;
     // As written, then with the read quickened (`mov:move.u`, §10.10).
     for (0..2) |pass| {
         if (pass == 1) {
-            quicken(&child_code, &.{});
-            try testing.expect(Quick.of(VM.opIndex(child_code[0])).?.form == .upvalue);
+            quicken(&upval_code, &.{});
+            try testing.expect(Quick.of(VM.opIndex(upval_code[0])).?.form == .upvalue);
         }
-        var vm = try VM.init(testing.allocator, &parent_routine);
+        var vm = try VM.init(testing.allocator, &routine);
         defer vm.deinit();
         try testing.expectError(VmError.UninitializedCell, vm.run());
         try testing.expectEqual(@as(u32, 0), vm.error_trace.items[0].pc);
     }
-}
-
-test "VM cells: closure:init-cell flips initialized=true and stores value" {
-    const consts = [_]Value{value_mod.fromFixnum(42).?};
-    var code = [_]Inst{
-        asm_.closureNewCell(0), //                     s0 = uninit cell
-        asm_.closureInitCell(0, Operand.constant(0)), // init s0 with 42
-        asm_.closureGetCell(1, 0), //                  s1 = *s0 = 42
-        asm_.returnSlot(1),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 2 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 42), result.asFixnum());
-}
-
-test "VM cells: closure:init-cell on already-initialized cell traps :invalid-cell-state" {
-    const consts = [_]Value{value_mod.fromFixnum(1).?};
-    var code = [_]Inst{
-        asm_.closureNewCell(0),
-        asm_.closureInitCell(0, Operand.constant(0)), // first init OK
-        asm_.closureInitCell(0, Operand.constant(0)), // second init traps
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidCellState, res);
-}
-
-test "VM cells: closure:init-cell with non-slot A traps :invalid-operand-kind" {
-    // Validate destination operand kind before any reads or
-    // writes.
-    const consts = [_]Value{value_mod.fromFixnum(1).?};
-    var code = [_]Inst{
-        Inst.primary(
-            .closure,
-            Closure_.init_cell,
-            Operand.constant(0), // A=constant — invalid for init-cell dst
-            Operand.constant(0),
-            Operand.none,
-        ),
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.InvalidOperandKind, res);
-}
-
-test "VM cells: closure:init-cell on non-cell traps :expected-cell" {
-    const consts = [_]Value{value_mod.fromFixnum(7).?};
-    var code = [_]Inst{
-        asm_.loadConst(0, 0), //                       s0 = 7 (fixnum, not a cell)
-        asm_.closureInitCell(0, Operand.constant(0)),
-        asm_.returnNil(),
-    };
-    const routine = Routine{ .code = &code, .consts = &consts, .slot_count = 1 };
-
-    var vm = try VM.init(testing.allocator, &routine);
-    defer vm.deinit();
-    const res = vm.run();
-    try testing.expectError(VmError.ExpectedCell, res);
-}
-
-test "VM cells: placeholder pattern — new-cell + make + init enables self-recursion" {
-    // End-to-end: build a closure that captures itself via the
-    // placeholder pattern. Closure body just returns its
-    // upvalue (the closure itself). Calling the closure
-    // returns ... the closure itself.
-    //
-    // (fn* foo [] foo) — when called, returns foo.
-    var child_code = [_]Inst{
-        asm_.moveFrom(0, Operand.upvalue(0)), // s0 = u:0 = closure
-        asm_.returnSlot(0),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &.{},
-        .slot_count = 1,
-        .fixed_arity = 0,
-        .upvalue_count = 1,
-    };
-    var parent_consts = [_]Value{};
-    const parent_caps = [_]CaptureDescriptor{
-        .{ .routine = &child_routine, .sources = &[_]CaptureSource{.{ .local_cell_slot = 0 }} },
-    };
-    var parent_code = [_]Inst{
-        asm_.closureNewCell(0), //                       s0 = uninit cell
-        asm_.closureMake(0, 1), //                    s1 = closure capturing s0
-        asm_.closureInitCell(0, Operand.slot(1)), //     s0's cell = s1 (the closure)
-        asm_.callCall(1, 0, 2), //                       s2 = (closure) → returns closure
-        asm_.returnSlot(2),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 3,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    // Result should be a closure (kind .function).
-    try testing.expect(result.kind() == .function);
-    // Specifically, it should be the SAME closure we constructed
-    // (same routine pointer).
-    const c = VM.asClosure(result);
-    try testing.expectEqual(&child_routine, c.routine);
 }
 
 test "VM dispatch: calls and closures under a collection every few kilobytes" {
@@ -9011,6 +7928,11 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
         .{ .name = "a capture count that is not the routine's", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &counted_caps, .err = VmError.CaptureCountMismatch, .pc = 0 },
+        .{ .name = "a capture descriptor past the table", .code = &.{ asm_.closureMake(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a call block's base not a slot", .code = &.{ Inst.primary(.call, Call.call, kn(0), sl(0), sl(0)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a call's result not a slot", .code = &.{ Inst.primary(.call, Call.call, sl(0), sl(0), kn(0)), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a cell not a slot", .code = &.{ Inst.primary(.closure, Closure_.init_cell, kn(0), kn(0), Operand.none), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
+        .{ .name = "a v operand past the table", .code = &.{ asm_.moveFrom(0, Operand.varRef(0)), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a routine under it", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &child_caps, .err = VmError.OperandOutOfRange, .where = "child", .pc = 0 },
     }) |case| {
         errdefer std.debug.print("verify case \"{s}\" failed\n", .{case.name});
@@ -10250,51 +9172,6 @@ test "Routine.verify: call:self names a fixed member of the routine's table, nev
         try testing.expectEqual(@as(u32, 1), failure.pc);
     }
 }
-test "VM closure call: same closure called twice — both invocations succeed" {
-    // Child returns its single arg incremented by 1.
-    const child_consts = [_]Value{value_mod.fromFixnum(1).?};
-    var child_code = [_]Inst{
-        asm_.mathAdd(1, Operand.slot(0), Operand.constant(0)),
-        asm_.returnSlot(1),
-    };
-    const child_routine = Routine{
-        .code = &child_code,
-        .consts = &child_consts,
-        .slot_count = 2,
-        .fixed_arity = 1,
-    };
-    // Parent: make closure, call with 5 → s4. Reuse closure, call
-    // with 10 → s5. Add s4 + s5 → result.
-    const parent_consts = [_]Value{
-        value_mod.fromFixnum(5).?,
-        value_mod.fromFixnum(10).?,
-    };
-    const parent_caps = [_]CaptureDescriptor{.{ .routine = &child_routine, .sources = &.{} }};
-    var parent_code = [_]Inst{
-        asm_.closureMake(0, 0), // s0 = closure
-        asm_.loadConst(1, 0), //         s1 = 5
-        asm_.callCall(0, 1, 4), //       s4 = closure(5) = 6
-
-        // Reuse closure (s0 still holds it). Stage second call.
-        asm_.loadConst(1, 1), //         s1 = 10
-        asm_.callCall(0, 1, 5), //       s5 = closure(10) = 11
-
-        asm_.mathAdd(6, Operand.slot(4), Operand.slot(5)), // s6 = 6 + 11 = 17
-        asm_.returnSlot(6),
-    };
-    const parent_routine = Routine{
-        .code = &parent_code,
-        .consts = &parent_consts,
-        .capture_descs = &parent_caps,
-        .slot_count = 7,
-    };
-
-    var vm = try VM.init(testing.allocator, &parent_routine);
-    defer vm.deinit();
-    const result = try vm.run();
-    try testing.expectEqual(@as(i64, 17), result.asFixnum());
-}
-
 test "registerRecordType and registerProtocol free exactly what they took when an allocation fails" {
     try testing.checkAllAllocationFailures(testing.allocator, registerTypeAndProtocol, .{});
 }
