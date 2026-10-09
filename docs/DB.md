@@ -577,6 +577,7 @@ outside its transaction), and it reads back as a list
 
 ### 10. Tests
 
+`test/integration/db_layer.zig` (the layer against real store files),
 `test/prop/db.zig` (round trips of random values through stores) and
 the inline tests of `src/db.zig` cover the Zig layer;
 `test/integration/eval_pipeline.zig`, `test/integration/runtime_polish.zig`
