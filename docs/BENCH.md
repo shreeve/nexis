@@ -497,9 +497,16 @@ bb bench/micro/run.clj --rounds 5 --programs count,acc,fib A/bin/nexis B/bin/nex
   layout, and some builds' cycles are bimodal, which a report states
   rather than averages away. The runner prints the load average at the
   start and the end and says when two runs' answers differ.
-- **Counters** come from `/usr/bin/time -l`, so the kit runs on macOS.
+- **Counters** come from `/usr/bin/time -l` on macOS (`--counter
+  time`, the default), or on Linux from `perf stat` with GNU `time`
+  for the peak RSS (`--counter perf`). There `--events` names the
+  events to count, by default a hybrid Intel core's P-core
+  instructions, cycles, indirect-branch mispredicts and store-forward
+  blocks (`cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/br_misp_retired.indirect/u,cpu_core/ld_blocks.store_forward/u`),
+  and each event past the instructions and cycles is printed per unit
+  too; `--pin CPU` runs every process on one CPU with `taskset`.
   Each run is one process; `--out FILE.json` keeps every run's
-  instructions, cycles, peak RSS, wall time and output.
+  instructions, cycles, other events, peak RSS, wall time and output.
 - **Dispatch counts.** A build with `-Dopcodes=true` prints how many
   times each opcode was dispatched and each native called
   (`docs/TOOLING.md` §1), which says how many dispatches an iteration
