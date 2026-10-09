@@ -50,17 +50,17 @@ up. Every fix starts with its failing test (`AGENTS.md`).
     cell write `docs/VM.md` §6 rules out, and its own design. `sort`
     and `sort-by` do not consume their seq either: they gather every
     element before they sort (`docs/LAZY.md` §9).
-18. **A leaf call on x86-64 waits on a load it cannot forward.**
-    `callLeaf` reads the native's `VmError!Value` with one 16-byte load
-    of what the native stored in narrower writes, about 12 of the 75
-    cycles of an iteration of the micro kit's `leaf` on the Linux
-    host, and the destructuring loop's blocked loads, 15 M in its 1 M
-    iterations, are what keep its cycles from falling with its
-    instructions (`docs/PERF.md` §3.38).
-    Reading the result as words alone moves the stall into
-    `numExtremum` (`docs/PERF.md` §6 "A width-consistent native
-    boundary on x86-64"): the copies along the whole boundary must
-    agree, which needs its own trial on the x86-64 host.
+18. **A native's result waits on a load it cannot forward on x86-64.**
+    A native whose returns merge assembles its `VmError!Value` in a
+    temporary of narrow stores and copies it to its caller with wider
+    loads, which wait for the cache: `fnCount` (one blocked load an
+    iteration of the micro kit's `leaf1`), `fnNth`, `fnNthrest` and
+    `fnForce`, about 2 of the destructuring loop's 5.4 blocked loads an
+    iteration on the Linux host; `champ.mapFromEntries` reads its
+    hashed-entry array 8 bytes at a time where it wrote 4-byte fields,
+    about 2 more (`docs/PERF.md` §3.40, §6 "A native's result
+    assembled in a temporary"). The call boundary itself agrees
+    (`docs/VM.md` §8); what is left is in the natives' bodies.
 19. **A leaf native called through a Var pays a whole call.** `(nth v
     i)` or `(even? x)` is `var:load-var`, the argument moves and
     `call:call` into `callLeaf`, about 240 instructions above a

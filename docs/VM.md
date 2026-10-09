@@ -576,12 +576,29 @@ Debug and safe builds assert what verification proved; a release
 build neither checks nor assumes it, since an assumed bound read
 through the frame's routine changes the fast handlers' code for the
 worse (`docs/PERF.md` §3.21).
-A fast handler reads a slot's value as two whole 8-byte words, the
-way a handler stores one, never its kind byte alone or both words in
-one 16-byte load: a load the size of a store in flight takes its data
-from the store, and any other waits for the store to reach the cache,
-which a loop carrying a value from slot to slot would pay at every
-instruction.
+A fast handler reads a slot's value as two whole 8-byte words, never
+its kind byte alone or both words in one 16-byte load: a load inside
+one store in flight takes its data from the store, and any other, a
+16-byte load of two 8-byte stores among them, waits for them to reach
+the cache, which a loop carrying a value from slot to slot would pay
+at every instruction. A native's compiled code reads a whole value, an
+argument among them, with one 16-byte load. So on x86-64 a value a
+native may read whole is stored whole, as one 16-byte store: the moves,
+constant, cell and upvalue loads that fill a call's block, and a call's
+result (`VM.storeWide`). A value whose next reader is a handler on the
+dispatch's chain is stored as two 8-byte words, which its 8-byte loads
+take a cycle sooner than from a 16-byte store: a Var's value (a
+callee), a return, a callback's window and its results. The rest of
+the native boundary keeps the same widths on x86-64: a native's
+result, returned through memory, is read a word at a time where the
+call stores it (`call:call`, the buffered and the general call,
+`call:lookup`, `coll:*`; `VM.storeResult`); the arguments a buffered
+or general call and a collection's construction copy off the stack are
+copied a value at a time, a map's key and value as one 32-byte entry,
+the width its constructor reads (`VM.copyRun`, `VM.copyEntries`).
+arm64 stores every value as two words and copies results and argument
+runs whole. On both, `max` and `min` read their winner a word at a
+time (`docs/PERF.md` "A width-consistent native boundary").
 
 - `op_table` holds every opcode's **general handler**, which takes
   every case and raises every trap. Every variant of `mov`, `jump` and
