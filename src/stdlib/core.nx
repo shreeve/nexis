@@ -199,13 +199,8 @@
   afterwards, whether or not body throws. Returns body's value."
   [binding & body]
   `(let* [~(first binding) (db/begin-read ~(first (rest binding)))]
-     (try
-       (let* [r# (do ~@body)]
-         (db/abort-read! ~(first binding))
-         r#)
-       (catch any e#
-         (db/abort-read! ~(first binding))
-         (throw e#)))))
+     (try (do ~@body)
+          (finally (db/abort-read! ~(first binding))))))
 
 ; A snapshot is an emdb read transaction pinned to the commit
 ; generation that was current when it began (docs/DB.md §12).
@@ -217,13 +212,8 @@
   held snapshot keeps emdb from reclaiming the pages it sees."
   [binding & body]
   `(let* [~(first binding) (db/snapshot ~(first (rest binding)))]
-     (try
-       (let* [r# (do ~@body)]
-         (db/release-snapshot! ~(first binding))
-         r#)
-       (catch any e#
-         (db/release-snapshot! ~(first binding))
-         (throw e#)))))
+     (try (do ~@body)
+          (finally (db/release-snapshot! ~(first binding))))))
 
 ; ============================================================
 ; Dynamic bindings (docs/VM.md §6.5)
