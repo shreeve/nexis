@@ -182,11 +182,14 @@ qualified by the current namespace (`"<ns>/Name"`).
 ;; =>
 (do (def IFoo (nexis.internal/#%register-protocol "user/IFoo" [:bar :baz]))
     (def bar (nexis.internal/#%protocol-fn IFoo :bar))
-    (def baz (nexis.internal/#%protocol-fn IFoo :baz)))
+    (def baz (nexis.internal/#%protocol-fn IFoo :baz))
+    'IFoo)
 ```
 
-A docstring and `:option value` pairs before the methods are accepted
-and ignored. Each method spec must be a non-empty list headed by an
+The form's value is the protocol's name, the symbol `IFoo`, as
+Clojure's `defprotocol` returns it. A docstring before the methods
+becomes the protocol Var's `:doc` (`(def ^{:doc "..."} IFoo ...)`);
+`:option value` pairs there are accepted and ignored. Each method spec must be a non-empty list headed by an
 unqualified symbol; its parameter vectors become the method Var's
 `:arglists` and a docstring among them its `:doc`, as in Clojure,
 and dispatch ignores them. A method's arities are its impl's own: the registry

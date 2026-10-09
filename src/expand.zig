@@ -2520,9 +2520,16 @@ fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const 
     if (args.len < 1) return ctx.fail(call_form.origin, "defprotocol: expected a name", .{});
     const b = Builder{ .ctx = ctx, .origin = call_form.origin };
     const proto_name = try plainName(ctx, args[0], "defprotocol: the name");
-    // A docstring and `:option value` pairs may precede the methods.
+    // A docstring, which lands on the protocol's Var, and `:option
+    // value` pairs may precede the methods.
     var specs = args[1..];
-    if (specs.len > 0 and specs[0].datum == .string) specs = specs[1..];
+    var doc_meta: [2]*Form = undefined;
+    var doc: []const *Form = &.{};
+    if (specs.len > 0 and specs[0].datum == .string) {
+        doc_meta = .{ try b.kw("doc"), mutCast(specs[0]) };
+        doc = &doc_meta;
+        specs = specs[1..];
+    }
     while (specs.len >= 2 and specs[0].datum == .keyword) specs = specs[2..];
     const method_keys = try ctx.allocator.alloc(*Form, specs.len);
     const defs = try ctx.allocator.alloc(*Form, specs.len);
@@ -2542,10 +2549,12 @@ fn expandDefprotocol(ctx: *ExpandContext, call_form: *const Form, args: []const 
         try meta.appendSlice(ctx.allocator, &.{ try b.kw("arglists"), try b.list(.{ "quote", try makeList(ctx, lists.items, b.origin) }) });
         def.* = try b.list(.{ "def", try withMetaMap(b, spec.datum.list[0], meta.items), try b.list(.{ "nexis.internal/#%protocol-fn", proto_name, key.* }) });
     }
+    // The form's value is the protocol's name, as Clojure's.
     return b.list(.{
         "do",
-        try b.list(.{ "def", proto_name, try b.list(.{ "nexis.internal/#%register-protocol", try qualifiedNameString(b, proto_name), try b.vec(.{method_keys}) }) }),
+        try b.list(.{ "def", try withMetaMap(b, args[0], doc), try b.list(.{ "nexis.internal/#%register-protocol", try qualifiedNameString(b, proto_name), try b.vec(.{method_keys}) }) }),
         defs,
+        try b.list(.{ "quote", args[0] }),
     });
 }
 

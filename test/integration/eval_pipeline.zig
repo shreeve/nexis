@@ -5600,6 +5600,10 @@ test "defprotocol: a docstring and options before the methods" {
         \\(extend-type :string Named (nm [s] (str "s:" s)))
         \\(nm "a")
     , "s:a");
+    // The protocol's docstring lands on its Var, and the form's value
+    // is the protocol's name, as Clojure's defprotocol returns it.
+    try expectOutputProgram("(defprotocol Named \"Things with names.\" (nm [x]))", "Named");
+    try expectOutputProgram("(defprotocol Named \"Things with names.\" (nm [x])) [(:doc (meta #'Named)) (:doc (meta #'nm)) (symbol? (defprotocol Q (q [x])))]", "[Things with names. nil true]");
     // A method's arities and docstring land on its Var.
     try expectOutputProgram("(defprotocol Sh (ar [s] [s x] \"Area.\")) (select-keys (meta #'ar) [:doc :arglists :name])", "{:doc Area., :arglists ([s] [s x]), :name ar}");
 }
