@@ -8694,3 +8694,7 @@ test "a lazy body that forces its own block raises :stack-overflow and ends the 
         \\[(take 3 t) (count t)]
     , "[(0 2 4) 20]");
 }
+
+test "sequence with a transducer takes any number of colls" {
+    try expectOutput("[(count (first (apply sequence (map vector) (repeat 40 [1])))) (apply sequence (map +) (repeat 34 [1 2]))]", "[40 (34 68)]");
+}

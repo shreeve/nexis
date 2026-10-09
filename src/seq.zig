@@ -171,7 +171,11 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
     try scope.push(a[1]);
     var cur = a[1];
     var done = false;
-    var args: [lazy.chunk_size + 1]Value = undefined;
+    // `rf`'s arguments: the accumulator and an input, or the elements
+    // of an input tuple, as many as there are colls.
+    var inline_args: [8]Value = undefined;
+    var args: []Value = &inline_args;
+    defer if (args.len > inline_args.len) vm.allocator.free(args);
     // Pull inputs until a chunk's worth of outputs waits, the source
     // ends, or `rf` stops the reduction.
     while (true) {
@@ -184,15 +188,19 @@ fn stepSequence(vm: *VM, lz: Value) VmError!Value {
             break;
         }
         const fr = firstRest(cur);
-        args[0] = acc;
         var argc: usize = 2;
         if (a[3].isTruthy()) {
             const tuple = fr.first;
             const k = vector_mod.count(tuple);
-            if (k + 1 > args.len) return VmError.ArityMismatch;
+            if (k + 1 > args.len) {
+                const grown = vm.allocator.alloc(Value, k + 1) catch return VmError.OutOfMemory;
+                if (args.len > inline_args.len) vm.allocator.free(args);
+                args = grown;
+            }
             for (0..k) |i| args[1 + i] = vector_mod.nth(tuple, i);
             argc = k + 1;
         } else args[1] = fr.first;
+        args[0] = acc;
         const r = try vm.callValue(a[0], args[0..argc]);
         cur = fr.rest;
         if (isReduced(vm, r)) {
