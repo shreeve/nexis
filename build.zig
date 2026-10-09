@@ -439,9 +439,16 @@ const Scripts = struct {
     fn pin(self: Scripts, step: *std.Build.Step, r: *std.Build.Step.Run, path: []const u8, stream: enum { stdout, stderr }) void {
         const b = self.b;
         if (self.update) {
+            // A run with side effects keeps its output in a directory
+            // named by a hash its file arguments are not part of, so
+            // the two runs of one unit, or one script run twice, would
+            // capture into one file; the expected file's path, which
+            // the hash takes, keeps each capture the run's own.
+            const name = b.allocator.dupe(u8, path) catch @panic("OOM");
+            std.mem.replaceScalar(u8, name, '/', '_');
             const captured = switch (stream) {
-                .stdout => r.captureStdOut(.{}),
-                .stderr => r.captureStdErr(.{}),
+                .stdout => r.captureStdOut(.{ .basename = name }),
+                .stderr => r.captureStdErr(.{ .basename = name }),
             };
             const usf = b.addUpdateSourceFiles();
             usf.addCopyFileToSource(captured, path);
