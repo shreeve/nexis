@@ -1317,18 +1317,12 @@ inline fn cellHeader(cell: *UpvalCell) *heap_mod.HeapHeader {
     return @ptrFromInt(@intFromPtr(cell) - @sizeOf(heap_mod.HeapHeader));
 }
 
-/// Static descriptor for a host-Zig function exposed as a
-/// first-class Value.
-/// Descriptors live in STATIC storage (one `const NativeFn`
-/// per fn); the Value just packs a pointer to the descriptor.
-/// No heap allocation, no GC concern, immortal lifetime.
-///
-/// Arity semantics:
-///   - `min_arity`: minimum acceptable argc.
-///   - `max_arity`: null = unbounded (variadic); else max argc.
+/// A Zig function as a value: a `.native_fn` Value is a pointer to its
+/// static descriptor, which nothing frees or collects.
 pub const NativeFn = struct {
     name: []const u8,
     min_arity: u16,
+    /// Null for no upper bound.
     max_arity: ?u16,
     call: *const fn (vm: *VM, args: []const Value) VmError!Value,
     /// A leaf never re-enters the VM and never compares, hashes or
@@ -1351,6 +1345,11 @@ pub const NativeFn = struct {
     /// held by the caller's block while the walk realizes the rest
     /// (docs/GC.md §11.5).
     consumes: bool = false,
+
+    /// Whether the native takes `argc` arguments.
+    pub inline fn takes(self: *const NativeFn, argc: usize) bool {
+        return argc >= self.min_arity and argc <= (self.max_arity orelse argc);
+    }
 };
 
 /// What realizing a lazy seq takes, which `src/seq.zig` implements
@@ -2134,7 +2133,7 @@ pub const Callback = struct {
         switch (self.callee.kind()) {
             .native_fn => {
                 const native = asNativeFn(self.callee);
-                if (native.leaf and self.argc >= native.min_arity and self.argc <= (native.max_arity orelse self.argc)) self.mode = .leaf;
+                if (native.leaf and native.takes(self.argc)) self.mode = .leaf;
             },
             .keyword, .symbol => if (self.argc == 1) {
                 self.mode = .lookup;
@@ -2156,10 +2155,7 @@ pub const Callback = struct {
                 // Room for the locals `callPrepared` nils four at once.
                 const reach = @max(window_end, base + self.argc + nil_run);
                 vm.stack.ensureTotalCapacity(vm.allocator, reach) catch return VmError.OutOfMemory;
-                if (VM.track_high_water) {
-                    vm.frame_high_water = @max(vm.frame_high_water, depth + 1);
-                    vm.stack_high_water = @max(vm.stack_high_water, window_end);
-                }
+                vm.noteHighWater(depth + 1, window_end);
                 self.depth = depth;
                 self.base = base;
                 self.locals = base + self.argc;
@@ -3174,7 +3170,7 @@ pub const VM = struct {
             // A leaf allocates and cannot collect, so a native calling
             // one per element takes the rooted path below whenever a
             // cycle is due.
-            if (native.leaf and args.len >= native.min_arity and args.len <= (native.max_arity orelse args.len) and !self.gcDue()) {
+            if (native.leaf and native.takes(args.len) and !self.gcDue()) {
                 if (native.call(self, args)) |r| {
                     countNative(native);
                     return r;
@@ -3336,10 +3332,7 @@ pub const VM = struct {
         const result = switch (callee.kind()) {
             .native_fn => blk: {
                 const native = asNativeFn(callee);
-                const max: ?usize = if (native.max_arity) |m| m else null;
-                if (args.len < native.min_arity or args.len > (max orelse args.len)) {
-                    return self.arityError(native.name, native.min_arity, max, args.len);
-                }
+                if (!native.takes(args.len)) return self.arityError(native.name, native.min_arity, if (native.max_arity) |m| m else null, args.len);
                 countNative(native);
                 break :blk try (native.general orelse native.call)(self, args);
             },
@@ -3520,18 +3513,30 @@ pub const VM = struct {
         // `callValue` and ends at the window.
         const extent = @max(entry_stack_len, window_end);
         if (self.stack.items.len > extent) self.stack.shrinkRetainingCapacity(extent);
-        if (track_high_water) self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
+        self.frames.appendAssumeCapacity(calleeFrame(callee, routine, base, entry_stack_len, link));
+        self.noteHighWater(self.frames.items.len, self.stack.items.len);
+    }
 
-        self.frames.appendAssumeCapacity(.{
+    /// The frame of a call of the closure `callee` entering `routine`
+    /// with its window at `base`.
+    inline fn calleeFrame(callee: Value, routine: *const Routine, base: usize, entry_stack_len: usize, link: Link) Frame {
+        return .{
             .routine = routine,
             .base_slot = @intCast(base),
             .entry_stack_len = @intCast(entry_stack_len),
             .return_dst = link.return_dst,
-            .upvalues = closure.upvalues,
+            .upvalues = asClosure(callee).upvalues,
             .closure = callee,
             .host_result = link.host_result,
-        });
-        if (track_high_water) self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
+        };
+    }
+
+    /// The high-water marks (§11) past a push to `frames` frames and a
+    /// stack `stack` long, in builds that keep them.
+    inline fn noteHighWater(self: *VM, frames: usize, stack: usize) void {
+        if (!track_high_water) return;
+        self.frame_high_water = @max(self.frame_high_water, frames);
+        self.stack_high_water = @max(self.stack_high_water, stack);
     }
 
     /// `enterClosure` for the common call, a closure called with a
@@ -3551,7 +3556,6 @@ pub const VM = struct {
     /// `argc` arguments, the fixed arity of `routine`, the member of its
     /// table it enters.
     inline fn pushDirect(self: *VM, callee: Value, routine: *const Routine, base: usize, argc: usize, link: Link) ?*Frame {
-        const closure = asClosure(callee);
         const depth = self.frames.items.len;
         if (depth >= self.max_frames or depth == self.frames.capacity) return null;
         const args_end = base + argc;
@@ -3561,20 +3565,9 @@ pub const VM = struct {
         if (window_end > entry_stack_len) self.stack.items.len = window_end;
         nilSlots(self.stack.items[args_end..window_end]);
         self.frames.items.len = depth + 1;
-        if (track_high_water) {
-            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
-            self.frame_high_water = @max(self.frame_high_water, depth + 1);
-        }
+        self.noteHighWater(depth + 1, self.stack.items.len);
         const frame = &self.frames.items[depth];
-        frame.* = .{
-            .routine = routine,
-            .base_slot = @intCast(base),
-            .entry_stack_len = @intCast(entry_stack_len),
-            .return_dst = link.return_dst,
-            .upvalues = closure.upvalues,
-            .closure = callee,
-            .host_result = link.host_result,
-        };
+        frame.* = calleeFrame(callee, routine, base, entry_stack_len, link);
         return frame;
     }
 
@@ -4990,11 +4983,15 @@ pub const VM = struct {
         const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
-        // The caller's place, for a trace through the callee and for
-        // its return.
+        return self.enterFirst(frame, pc, callee_frame, routine);
+    }
+
+    /// The fast call's way into the frame it pushed: the caller's `pc`
+    /// set, for a trace through the callee and for its return, and the
+    /// callee's first instruction fetched through the routine in hand
+    /// rather than the frame just written.
+    inline fn enterFirst(self: *VM, frame: *Frame, pc: usize, callee_frame: *Frame, routine: *const Routine) Status {
         frame.pc = @intCast(pc);
-        // The callee's first instruction, through the routine in hand
-        // rather than the frame just written.
         const first = routine.code[0];
         if (counting) opcode_counts[opIndex(first)] += 1;
         return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
@@ -5016,10 +5013,7 @@ pub const VM = struct {
         const callee_frame = self.pushDirect(callee, routine, base, argc, .{
             .return_dst = inst.c.index,
         }) orelse return self.general(frame, inst, pc);
-        frame.pc = @intCast(pc);
-        const first = routine.code[0];
-        if (counting) opcode_counts[opIndex(first)] += 1;
-        return @call(.always_tail, fast_table[opIndex(first)], .{ self, callee_frame, first, 1 });
+        return self.enterFirst(frame, pc, callee_frame, routine);
     }
 
     /// `fastCall` of a leaf native within its arity, on its arguments
@@ -5029,7 +5023,7 @@ pub const VM = struct {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
         if (!native.leaf) return @call(out_of_line, callBuffered, .{ self, frame, inst, pc });
         const argc: u32 = inst.b.index;
-        if (argc < native.min_arity or argc > (native.max_arity orelse argc)) return self.general(frame, inst, pc);
+        if (!native.takes(argc)) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
@@ -5050,8 +5044,7 @@ pub const VM = struct {
         // Only a leaf has a general body (`NativeFn.general`).
         std.debug.assert(native.general == null);
         const argc: u32 = inst.b.index;
-        const max: usize = native.max_arity orelse max_native_args;
-        if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
+        if (!native.takes(argc) or argc > max_native_args) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
         // On arm64 a whole buffer copies inline where the stack's
@@ -5256,10 +5249,7 @@ pub const VM = struct {
         errdefer self.stack.shrinkRetainingCapacity(frame.entry_stack_len);
         if (self.frames.items.len >= self.max_frames) return VmError.StackOverflow;
         self.frames.append(self.allocator, frame) catch return VmError.OutOfMemory;
-        if (track_high_water) {
-            self.frame_high_water = @max(self.frame_high_water, self.frames.items.len);
-            self.stack_high_water = @max(self.stack_high_water, self.stack.items.len);
-        }
+        self.noteHighWater(self.frames.items.len, self.stack.items.len);
     }
 
     /// Pop the top frame and restore the stack to the length it
