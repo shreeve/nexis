@@ -8705,3 +8705,8 @@ test "loader: an unterminated string or regex is reported as one, and as incompl
     try testing.expectError(error.Diagnosed, program.loader.evalSource(&info, .{ .allocator = program.arena.allocator() }));
     try testing.expect(program.loader.diagnostic.?.incomplete);
 }
+
+test "reader: #! is a comment to the end of its line anywhere, as in Clojure" {
+    try expectOutputProgram("#!/usr/bin/env nexis\n(+ 1 #! two\n 2)", "3");
+    try expectOutputProgram("(read-string \"#!x\\n:k\")", ":k");
+}

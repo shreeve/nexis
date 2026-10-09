@@ -1605,9 +1605,10 @@ test "##Inf, ##-Inf and ##NaN are the symbolic floats" {
 test "an unsupported construct is one err token, so the parse error names it" {
     const allocator = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "#\"a.*", "#\"" },  .{ "##Infinity", "##Infinity" }, .{ "#!/usr/bin/env nexis", "#!/usr/bin/env" },
-        .{ "::k", "::k" },     .{ "#?(:clj 1)", "#?" },         .{ "# x", "#" },
-        .{ "##inf", "##inf" }, .{ "(##NaN1)", "##NaN1" },
+        .{ "#\"a.*", "#\"" },      .{ "##Infinity", "##Infinity" },
+        .{ "::k", "::k" },         .{ "#?(:clj 1)", "#?" },
+        .{ "# x", "#" },           .{ "##inf", "##inf" },
+        .{ "(##NaN1)", "##NaN1" },
     };
     for (cases) |c| {
         var p = parser.Parser.init(allocator, c[0]);

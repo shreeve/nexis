@@ -197,7 +197,6 @@ are the map for someone who knows Clojure.
 | `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
 | `#"re"` | a `Pattern` | a pattern, compiled when the source is read; a construct that needs backtracking is `:invalid-regex` | a linear-time engine (`docs/REGEX.md`) |
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
-| `#!` | a comment to end of line | the CLI treats a first line starting `#!` as a comment; elsewhere a parse error | executable scripts only |
 
 The `#` dispatch set is `#{}`, `#(...)`, `#_`, `#'` (`#'foo` is
 `(var foo)`) and `#"..."`. Clojure's reader

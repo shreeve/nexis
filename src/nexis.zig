@@ -39,9 +39,10 @@ pub const Lexer = struct {
     pub fn next(self: *Lexer) Token {
         const src = self.base.source;
 
-        // Skip whitespace (spaces, tabs, CR, LF, commas) and line
-        // comments, and a UTF-8 byte-order mark that starts the source,
-        // which some editors write.
+        // Skip whitespace (spaces, tabs, CR, LF, commas), line
+        // comments (`;` or `#!` to the end of the line, as Clojure's
+        // reader takes both), and a UTF-8 byte-order mark that starts
+        // the source, which some editors write.
         const ws_start: u32 = self.base.pos;
         if (self.base.pos == 0 and std.mem.startsWith(u8, src, "\xEF\xBB\xBF")) self.base.pos = 3;
         while (true) {
@@ -51,7 +52,7 @@ pub const Lexer = struct {
                     else => break,
                 }
             }
-            if (self.base.pos < src.len and src[self.base.pos] == ';') {
+            if (self.base.pos < src.len and (src[self.base.pos] == ';' or std.mem.startsWith(u8, src[self.base.pos..], "#!"))) {
                 while (self.base.pos < src.len and src[self.base.pos] != '\n') : (self.base.pos += 1) {}
                 continue;
             }
