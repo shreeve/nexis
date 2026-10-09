@@ -160,14 +160,24 @@ The semantics match Clojure's `Numbers` for BigInt:
   (`:divide-by-zero`); the functions assert it away.
 - `neg` and `abs` of `fixnum_min` promote: 2⁴⁷ is a bignum.
 - `parseDecimal` accepts exactly `-?[0-9]+` and returns null for
-  anything else. `formatDecimal` writes decimal digits with a leading
-  `-` for a negative value and no suffix. Past 32 limbs it divides and
-  conquers: it splits the value at 10^(9·2^i), the power whose square
-  first exceeds it, and writes the quotient and the zero-padded
-  remainder the same way, so the whole conversion costs about one
-  division of the value by its square root instead of one pass per
-  nine digits; a million digits print in about a second
-  (`-Doptimize=fast`).
+  anything else. Up to 18 digits it reads an `i64`, and up to 4 000
+  `std`'s conversion, one multiply-add over the whole number per 19
+  digits. Past that it divides and conquers, so text from outside
+  (JSON, `read-string`) of any length costs subquadratic time: the
+  digits are `hi · 10^k + lo`, `lo` the last half of them, each half
+  read the same way, `10^k` the product of its own halves (cached by
+  `k`, two per level), and each product, of two numbers of one size,
+  `std`'s Karatsuba multiply. Its time grows as about the 1.6th power
+  of the digits: 400 000 digits read in about a tenth of a second
+  (`-Doptimize=fast`), where `std`'s conversion alone takes over half
+  a second, and a million in under a second.
+- `formatDecimal` writes decimal digits with a leading `-` for a
+  negative value and no suffix. Past 32 limbs it divides and conquers:
+  it splits the value at 10^(9·2^i), the power whose square first
+  exceeds it, and writes the quotient and the zero-padded remainder the
+  same way, so the whole conversion costs about one division of the
+  value by its square root instead of one pass per nine digits; a
+  million digits print in about a second (`-Doptimize=fast`).
 
 The VM's tower (`src/vm.zig` `numAdd` through `numCompare`) keeps the
 fixnum-by-fixnum fast path in `i64` and calls this module only when a
@@ -198,7 +208,10 @@ under the kind domain; A1 and A2 `add`, `sub`, `compare` and `mul` agree with `i
 A3 `quot`, `rem` and `mod` agree with `@divTrunc`, `@rem` and `@mod`
 on every sign combination; A4 the fixnum boundary crossed both ways;
 A5 algebraic identities on multi-limb values; A6 decimal text and
-doubles round-trip. `src/bignum.zig` carries unit tests for the
-canonicalizer, the accessors, conversion and printing;
-`test/integration/numbers.zig` runs the tower end to end through
+doubles round-trip; A7 `quotientF64` rounds correctly at every scale;
+A8 long text reads as `std`'s conversion reads it around every
+split size; A9 eight times the digits take well under 64 times as
+long to read (release builds only: a debug build times `std`'s
+checks). `src/bignum.zig` carries unit tests for the canonicalizer,
+the accessors, conversion and printing; `test/integration/numbers.zig` runs the tower end to end through
 every operator and predicate.

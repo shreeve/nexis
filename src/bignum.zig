@@ -552,19 +552,74 @@ fn writeSmallDecimal(x: bigint.Const, width: usize, writer: *std.Io.Writer) std.
 /// Parse `-?[0-9]+` into canonical form; `null` when `text` is not
 /// that shape.
 pub fn parseDecimal(heap: *Heap, text: []const u8) !?Value {
-    const digits = if (text.len > 0 and text[0] == '-') text[1..] else text;
+    const negative = text.len > 0 and text[0] == '-';
+    const digits = text[@intFromBool(negative)..];
     if (digits.len == 0) return null;
     for (digits) |c| if (c < '0' or c > '9') return null;
     if (digits.len <= 18) return try fromI64(heap, std.fmt.parseInt(i64, text, 10) catch unreachable);
-    var stack: [scratch_limbs]Limb = undefined;
-    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
-    const alloc = bfa.allocator();
-    const buf = try alloc.alloc(Limb, bigint.calcSetStringLimbCount(10, digits.len));
-    defer alloc.free(buf);
-    var m = mutable(buf);
-    m.setString(10, text) catch unreachable;
-    return try fromMutable(heap, m);
+    if (digits.len <= split_digits) {
+        var stack: [scratch_limbs]Limb = undefined;
+        var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&stack), heap.backing);
+        const alloc = bfa.allocator();
+        const buf = try alloc.alloc(Limb, bigint.calcSetStringLimbCount(10, digits.len));
+        defer alloc.free(buf);
+        var m = mutable(buf);
+        m.setString(10, text) catch unreachable;
+        return try fromMutable(heap, m);
+    }
+    // The halves, products and powers of ten of the split all live
+    // until the sum is built; they total O(n log n) limbs.
+    var arena = std.heap.ArenaAllocator.init(heap.backing);
+    defer arena.deinit();
+    var split: DecimalSplit = .{ .arena = arena.allocator() };
+    const magnitude = try split.read(digits);
+    return try canonicalizeToValue(heap, negative, @ptrCast(magnitude.limbs));
 }
+
+/// At or under this many digits, `std`'s conversion (one multiply-add
+/// over the whole number per 19 digits) is the faster one.
+const split_digits = 4000;
+
+/// Divide and conquer (BIGNUM.md §8): `digits` as `hi · 10^k + lo`,
+/// `lo` the last `k`, half the digits, each half read the same way and
+/// the product of two halves of one size taken by `std`'s Karatsuba
+/// multiply. Where `std`'s conversion is quadratic in the digits, this
+/// costs a few multiplies of the number's halves: a million digits
+/// read in about a second.
+const DecimalSplit = struct {
+    arena: std.mem.Allocator,
+    /// 10^k for each `k` a split has needed; a level needs at most two.
+    powers: std.ArrayList(struct { k: usize, p: bigint.Const }) = .empty,
+
+    fn read(d: *DecimalSplit, digits: []const u8) std.mem.Allocator.Error!bigint.Const {
+        if (digits.len <= split_digits) {
+            var m = mutable(try d.arena.alloc(Limb, bigint.calcSetStringLimbCount(10, digits.len)));
+            m.setString(10, digits) catch unreachable;
+            return m.toConst();
+        }
+        const k = digits.len / 2;
+        const hi = try d.read(digits[0 .. digits.len - k]);
+        const lo = try d.read(digits[digits.len - k ..]);
+        var r = try d.product(hi, try d.power(k));
+        r.add(r.toConst(), lo);
+        return r.toConst();
+    }
+
+    /// 10^k, as the product of its halves.
+    fn power(d: *DecimalSplit, k: usize) std.mem.Allocator.Error!bigint.Const {
+        for (d.powers.items) |e| if (e.k == k) return e.p;
+        const p = if (k <= 19) bigint.Const{ .limbs = try d.arena.dupe(Limb, &.{std.math.pow(Limb, 10, k)}), .positive = true } else (try d.product(try d.power(k / 2), try d.power(k - k / 2))).toConst();
+        try d.powers.append(d.arena, .{ .k = k, .p = p });
+        return p;
+    }
+
+    /// `a · b`, with a limb to spare for the sum `read` adds to it.
+    fn product(d: *DecimalSplit, a: bigint.Const, b: bigint.Const) std.mem.Allocator.Error!bigint.Mutable {
+        var r = mutable(try d.arena.alloc(Limb, a.limbs.len + b.limbs.len + 1));
+        r.mulNoAlias(a, b, d.arena);
+        return r;
+    }
+};
 
 // =============================================================================
 // Private helpers
