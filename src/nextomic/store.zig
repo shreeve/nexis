@@ -228,8 +228,7 @@ pub const boot = struct {
 // =============================================================================
 
 /// The case folding `nx/fulltext` rows are written under (fulltext.zig
-/// `fold`); 1, folding ASCII only, is what a store without a stamp
-/// holds.
+/// `fold`), part of the format (NEXTOMIC.md §2.3 `"ft"`).
 pub const fulltext_fold: u8 = 3;
 
 pub const FulltextStamp = struct { fold: u8, t: u64 };
@@ -543,8 +542,7 @@ pub const Store = struct {
     }
 
     /// The `nx/fulltext` stamp: the folding its rows were written under
-    /// and the `t` they are current at; null when absent (rows that
-    /// fold ASCII only).
+    /// and the `t` they are current at; null when absent.
     pub fn readFulltextStamp(self: *Store, txn: *Txn) !?FulltextStamp {
         const raw = (try self.sysGet(txn, "ft")) orelse return null;
         if (raw.len != 1 + key.id_len) return error.Corrupted;

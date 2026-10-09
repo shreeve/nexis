@@ -1250,8 +1250,13 @@ checked after every commit); the corpora
 `test/integration/nextomic_q.zig` and `nextomic_pull.zig` against naive
 evaluators over the shared fixture `nextomic_fx.zig`, again over a
 churned store in its current, as-of, since and history views;
+`nextomic_store.zig` (the store, db-values and the transaction
+protocol against store files: bootstrap, batches, the merged and folded
+scans, every view, tempids, upserts, the unique and schema rules,
+`with`, excision, durability, the caches);
 `nextomic_fn.zig` (transaction functions, cas, schema alteration,
-excision, full-text, the refusal of another format);
+excision, full-text, the refusal of another format, lookup-ref upserts,
+the native stack and `t` bounds);
 `nextomic_size.zig` (the bytes every tree of a fixed history holds,
 pinned, and the pages it takes, bounded); `nextomic_entity.zig` (the
 lazy entity through the pipeline and under the collector's stress
@@ -1263,9 +1268,9 @@ end-to-end scripts `test/nextomic/*.nx`, each diffed against its
 
 ## 10. Where Nextomic wins, and where it does not
 
-Wins, by construction: reads straight off the mapping with no
-deserialization; empty-value index leaves; history as a range filter;
-one file, one process, backup by transaction number. The measured
+Wins, by construction: index scans compare key bytes in place in the
+mapping, decoding only the datoms they return; empty-value index leaves; history in trees of its
+own, merged with the current ones; one file, one process. The measured
 numbers are `docs/PERF.md` §3.7.
 
 Queries scale with their clauses (§5): ordering n clauses takes O(n)

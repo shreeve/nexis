@@ -65,9 +65,9 @@ right sort order. Each Datomic index is one named tree in a single emdb
 file. A transaction writes to all the index trees plus a log tree, and
 emdb publishes them together in one atomic step. A query opens one emdb
 read transaction and reads Nextomic's own transaction number inside it;
-that number is the basis point in time. Time travel is a range filter on
-the transaction part of each key, so no special engine support is
-needed.
+that number is the basis point in time. Time travel merges each current
+tree with its history twin, whose keys carry the transaction, and folds
+by `t`, so no special engine support is needed.
 
 **Where it can be better than Datomic.**
 
@@ -104,15 +104,15 @@ implications only.
 
 Nextomic's database-as-value ("db-value") carries a **basis-tx**, the
 transaction number at which the value was captured, used to drive
-`as-of`, `since` and `history` through tx-in-key range scans.
+`as-of`, `since` and `history` through the history trees, whose keys
+carry the transaction, merged with the current ones and folded by `t`.
 
 The basis is Nextomic's own logical transaction number `t`, minted by
 Nextomic and stored in its `sys` tree in the same emdb write transaction
-as the datoms it stamps. A db-value reads `t` inside a pooled read
-transaction and closes it; every later operation on that db-value opens
-its own read transaction and reads `t` again inside the same snapshot it
-queries, so the basis and the data never disagree. The db-value pins no
-reader slot.
+as the datoms it stamps. Every operation on a db-value begins its read
+in the file's held snapshot or a fresh one (`docs/DB.md` §3.4) and
+reads `t` again inside the snapshot it queries, so the basis and the
+data never disagree. The db-value itself holds no read transaction.
 
 The engine's `Txn.txnId` is not used in any key or entity id, on
 purpose: it advances for every commit to the file (including writes to
@@ -128,20 +128,18 @@ behind, the data it describes.
 
 | Nextomic need | In emdb, by name |
 |---|---|
-| Twelve named trees (four current indexes EAVT, AEVT, AVET, VAET; four history indexes with the transaction in the key; txlog, idents, sys; a full-text tokens tree), all created by the bootstrap commit | Named sub-databases: INV-SUB01..06; `Txn.openTree(name, create)`, `getFromTree`, `putInTree`, `delFromTree`, `openCursorForTree`, `openWriteCursorForTree`, `treeStat`, `dropTree`. `EnvOptions.maxNamedTrees` defaults to 128; a `TreeId` survives across transactions (INV-SUB03) |
+| Twelve named trees (four current indexes EAVT, AEVT, AVET, VAET; four history indexes with the transaction in the key; txlog, idents, sys; a full-text tokens tree), all created by the bootstrap commit | Named sub-databases: INV-SUB01..06; `Txn.openTree(name, create)`, `getFromTree`, `putInTree`, `delFromTree`, `openCursorForTree`, `treeStat`. `EnvOptions.maxNamedTrees` defaults to 128; a `TreeId` survives across transactions (INV-SUB03) |
 | Binary-sortable composite keys | Unsigned lexicographic byte order, API-K03, `emdb.defaultKeyCmp` over `simd.compare` |
-| Snapshot isolation for one query across all indexes | INV-T02, INV-T03: one read transaction is one consistent snapshot over every tree |
+| Snapshot isolation for one query across all indexes | INV-T02, INV-T03: one read transaction is one consistent snapshot over every tree; a `with` view reads its held write transaction's uncommitted state through read-only children (INV-T15A, `Txn.beginReadChild`) |
 | Atomic multi-index commit | INV-SUB04 (named-tree roots and the main-tree `TreeStat` entries commit together), INV-T07A, INV-M02, INV-M03: one meta-page publish; every image a power loss can leave is enumerated by `test/crash.zig` (SPEC §10.3) |
 | A cheap db-value per query | Retained transaction pool: `Env.txnPool` keeps finished transactions with their arenas, 8 to 64 by `maxReaders` (PERFORMANCE §6.18, R-TXN 11.3M begin/get/abort per second in §12.2). A read transaction is a pooled object, safe to begin and finish from any thread |
-| `as-of` / `since` / `history` by tx-in-key filtering | `Cursor.set`, `setRange`, `first`, `last`, `next`, `prev` (API-C01, API-C02). A seek from a positioned cursor resolves on its leaf or the right sibling without a descent (§6.22), so skip-scans between `[e][a]` groups are cheap |
+| `as-of` / `since` / `history` over the history trees, merged with the current ones | `Cursor.set`, `setRange`, `first`, `last`, `next`, `prev` (API-C01, API-C02). A seek from a positioned cursor resolves on its leaf or the right sibling without a descent (§6.22), so skip-scans between `[e][a]` groups are cheap |
 | Point lookups in key order (pull, sorted lookup-ref probes) | Per-tree search clue with position hint, INV-CL01..CL05 in `../emdb/src/txn.zig` (§6.13): an ascending run of `get` calls costs one comparison each |
 | Full index scans | Inlined cursor step with lookahead prefetch (§6.14): SCAN-FWD 311M and M-ORDER 247M entries per second in §12.2 |
-| Entity excision, attribute retirement, index rebuild | `Txn.delPrefix` / `delPrefixFromTree` drop covered leaves as pages (§6.23, M-KILL 171M deletes per second); `dropTree(dbi, false)` empties an index for a rebuild. The key shapes make every entity, attribute and ref-target range a prefix |
+| Entity excision | `Txn.delPrefixFromTree` drops covered leaves as pages (§6.23, M-KILL 171M deletes per second). The key shapes make every entity, attribute and ref-target range a prefix |
 | Bulk import in large transactions | No mid-transaction write-back (INV-WM05, §6.21): a 1M-put transaction runs at the 10K-put rate. Append-biased splits (§6.16) and populate-ahead (§6.15) for ascending EAVT and txlog keys; the seal runs on `EnvOptions.sealThreads` threads for the random-order AVET and VAET writes (§6.26) |
-| Durability choices per transaction | `Env.beginWriteWith(.{ .sync = .none / .noMeta / .full })` (API-TX06, INV-SYNC-03) and `Env.sync()` (API-E10) to end a `.none` load; `Txn.prepare()` for two-phase commit (INV-T07B) |
+| Durability choices per transaction | `Env.beginWriteWith(.{ .sync = .none / .noMeta / .full })` (API-TX06, INV-SYNC-03) and `Env.sync()` (API-E10) to end a `.none` load |
 | Integrity without a Nextomic checksum layer | Every page carries a transaction stamp and a CRC-32C over its live bytes (INV-S12, INV-S13, format version 3), verified on first touch, `EnvOptions.verifyChecksums`, `Env.lastCorruption()` |
-| Parallel query workers | Lock-free reader registration and wait-free reads (INV-T13, INV-T14B): R-PAR scales eight readers at 1.32x LMDB in §12.2. Read-only children of a write transaction (INV-T15A, `Txn.beginReadChild`) read uncommitted state from other threads |
-| Physical replication and one-step undo | `Env.backup(sinceTxnId, out)` incremental by transaction id, `Env.restore`, `Env.rollback()`, `EnvOptions.previousSnapshot` (INV-BK01..04, INV-RB01..03) |
 
 Nextomic encodes a current-index key as `[E(e)][A(a)][v:type-tagged-sortable]`
 (in each index's order; `E(e)` the entity id as a class-and-length
@@ -247,8 +245,8 @@ types into the key bytes so lex order is value order.
 Pages freed by old transactions are reclaimed once no live reader pins
 them (INV-T11, INV-FL02); that is the storage model. `previousSnapshot`
 and `rollback()` reach exactly one commit back (INV-RB03) for operational
-recovery and are not a history facility. Nextomic routes history through
-tx-in-key filtering, which needs no page retention.
+recovery and are not a history facility. Nextomic keeps history in its
+own trees, which needs no page retention.
 
 ### 6.3 Do not add record, tuple or datom awareness to storage
 

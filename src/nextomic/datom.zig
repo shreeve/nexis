@@ -482,7 +482,7 @@ test "txlog entry round trips every value type" {
     // The instant's datom is the header's; no row repeats the long
     // string's payload.
     try testing.expect(bytes[0] & flag_instant_row != 0 and bytes[0] & flag_attr_partition == 0);
-    try testing.expect(std.mem.indexOf(u8, bytes, long[64..]) == null);
+    try testing.expect(std.mem.find(u8, bytes, long[64..]) == null);
     try testing.expect(!try touchesAttrPartition(bytes));
     const out = try decodeTxlog(arena, bytes, t, ts.source());
     try testing.expectEqual(@as(i64, 1234), out.instant);
