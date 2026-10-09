@@ -1497,13 +1497,10 @@ pub const Frame = struct {
     /// a root that keeps the closure block (and with it the
     /// `upvalues` array in its tail) alive for the frame's life.
     closure: Value = value_mod.nilValue(),
-    /// When non-null, this frame
-    /// was pushed by `VM.callValue` (a host-Zig fn re-entering
-    /// the VM). When `call:return` fires for this frame, it
-    /// writes the return value into `host_result.value`, sets
-    /// `host_result.done = true`, pops the frame, and returns
-    /// WITHOUT writing into a caller slot (callValue's caller
-    /// isn't a regular routine — it's host code).
+    /// For a frame `callValue`, `runRoutine` or a `Callback` pushed:
+    /// the cell its return writes instead of a caller's slot. The
+    /// return pops the frame, but for a batch's, which starts the next
+    /// element in it (VM.md §6).
     host_result: ?*HostCallResult = null,
 
     // A cache line: a call writes one, and a frame's address is its
@@ -1798,9 +1795,8 @@ pub const VmError = error{
     /// tx op attempted on a transaction that was
     /// already committed or aborted. Mapped to `:tx-closed`.
     TxClosed,
-    /// `(db/deref x)` / `@x` invoked on a Value
-    /// whose kind isn't a durable_ref or Var. Mapped to
-    /// `:not-derefable`.
+    /// `deref` of a value that is not a durable ref, Var, atom, delay
+    /// or `reduced` (`:not-derefable`).
     NotDerefable,
     /// INTERNAL control-flow
     /// signal. NOT user-visible, NOT catchable. Raised when a
@@ -2511,6 +2507,8 @@ pub const VM = struct {
     /// The origin of the throw that left `run` uncaught, for
     /// `recordErrorTrace`.
     escaped_origin: ?u32 = null,
+    /// `ErrorKey`s as keywords, interned on first use (`errorKey`).
+    error_keys: [6]?Value = @splat(null),
     /// The uncaught error map `recordErrorTrace` reported at its own
     /// origin when the VM placed it there (`withoutPlace`).
     placed_report: ?Value = null,
@@ -3198,8 +3196,9 @@ pub const VM = struct {
     /// would under `loop`. The loop's first pass is entered here at
     /// the callee's first instruction, after the safe point `loop`'s
     /// entry is: the frame is the one it would run, so the pass needs
-    /// no test, and a pass that ends without an error has returned.
-    /// Only an error goes on to the loop, which takes it as its own
+    /// no test. A pass that ends without an error has returned, or a
+    /// throw went past the frame, which leaves the cell's `done` unset;
+    /// only an error goes on to the loop, which takes it as its own
     /// pass would. The value is read from the cell by the caller, a
     /// word at a time as the return wrote it.
     fn callPrepared(self: *VM, cb: *Callback) VmError!void {
@@ -3814,8 +3813,9 @@ pub const VM = struct {
         @memcpy(dst, src);
     }
 
-    /// `copyRun` of key, value pairs, each stored as one 32-byte entry
-    /// on x86-64, the width a map's constructor reads it.
+    /// `copyRun` of key, value pairs, each stored as one 32-byte vector
+    /// on x86-64, the width a map's constructor reads it (two 16-byte
+    /// stores on a target without AVX, the release's `x86_64_v2`).
     fn copyEntries(dst: []Value, src: []const Value) void {
         if (!wide_stores) return copyRun(dst, src);
         var i: usize = 0;
@@ -3828,8 +3828,6 @@ pub const VM = struct {
         if (i < dst.len) copyWide(&dst[i], &src[i]);
     }
 
-    /// Slot `op` of `frame`, an operand verification proved a slot
-    /// inside the frame (§5).
     /// A fact verification proved (§5), asserted by debug and safe
     /// builds and not assumed by a release build: assumed, a bound
     /// through the frame's routine changes the fast handlers' code, and
@@ -3839,6 +3837,8 @@ pub const VM = struct {
         if (comptime builtin.optimize.runtimeSafety()) std.debug.assert(ok);
     }
 
+    /// Slot `op` of `frame`, an operand verification proved a slot
+    /// inside the frame (§5).
     inline fn verifiedSlot(self: *VM, frame: *const Frame, op: Operand) *Value {
         proved(op.kind == .slot and op.index < frame.routine.slot_count);
         return self.slotAt(frame, op.index);
@@ -4164,7 +4164,7 @@ pub const VM = struct {
     }
 
     fn buildErrorMap(self: *VM, tag: Value, detail: []const u8, at: ?TraceFrame) !Value {
-        var m = try self.putKey(try champ_mod.mapEmpty(self.ensureHeap()), "error", tag);
+        var m = try self.putKey(try champ_mod.mapEmpty(self.ensureHeap()), .@"error", tag);
         var words: [96]u8 = undefined;
         const message = if (detail.len > 0) detail else blk: {
             const name = self.ensureInterner().keywordName(tag.asKeywordId());
@@ -4177,7 +4177,7 @@ pub const VM = struct {
             for (name[0..n], words[0..n]) |c, *w| w.* = if (c == '-' or c == '/') ' ' else c;
             break :blk words[0..n];
         };
-        m = try self.putKey(m, "message", try string_mod.fromBytes(self.ensureHeap(), message));
+        m = try self.putKey(m, .message, try string_mod.fromBytes(self.ensureHeap(), message));
         return self.addPlace(m, at);
     }
 
@@ -4186,13 +4186,13 @@ pub const VM = struct {
     fn addPlace(self: *VM, map: Value, at: ?TraceFrame) !Value {
         const frame = at orelse return map;
         const heap = self.ensureHeap();
-        var m = try self.putKey(map, "fn", try string_mod.fromBytes(heap, frame.name));
+        var m = try self.putKey(map, .@"fn", try string_mod.fromBytes(heap, frame.name));
         const source = frame.source orelse return m;
-        m = try self.putKey(m, "file", try string_mod.fromBytes(heap, source.path));
+        m = try self.putKey(m, .file, try string_mod.fromBytes(heap, source.path));
         const span = frame.span orelse return m;
         const place = self.placeOf(source, span.pos);
-        m = try self.putKey(m, "line", value_mod.fromFixnum(place.line).?);
-        return self.putKey(m, "column", value_mod.fromFixnum(place.col).?);
+        m = try self.putKey(m, .line, value_mod.fromFixnum(place.line).?);
+        return self.putKey(m, .column, value_mod.fromFixnum(place.col).?);
     }
 
     /// `v` without the place keys `addPlace` gave it, for a report
@@ -4205,17 +4205,28 @@ pub const VM = struct {
         const placed = self.placed_report orelse return v;
         if (!placed.identicalTo(v)) return v;
         var m = v;
-        for ([_][]const u8{ "fn", "file", "line", "column" }) |key| {
-            const k = self.ensureInterner().internKeywordValue(key) catch return v;
+        for ([_]ErrorKey{ .@"fn", .file, .line, .column }) |key| {
+            const k = self.errorKey(key) catch return v;
             m = champ_mod.mapDissoc(self.ensureHeap(), m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return v;
         }
         return m;
     }
 
-    /// `m` with the keyword named `key` mapped to `v`.
-    fn putKey(self: *VM, m: Value, key: []const u8, v: Value) !Value {
-        const k = try self.ensureInterner().internKeywordValue(key);
-        return champ_mod.mapAssoc(self.ensureHeap(), m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal);
+    /// The keys of an error map (§13).
+    pub const ErrorKey = enum { @"error", message, @"fn", file, line, column };
+
+    /// The keyword `key` names, interned once: a handler taking errors
+    /// in a loop builds a map at each.
+    fn errorKey(self: *VM, key: ErrorKey) !Value {
+        const slot = &self.error_keys[@backingInt(key)];
+        if (slot.* == null) slot.* = try self.ensureInterner().internKeywordValue(@tagName(key));
+        return slot.*.?;
+    }
+
+    /// `m` with the error-map key `key` mapped to `v`: what a native
+    /// building an error map of its own (`throwErrorMap`) adds with.
+    pub fn putKey(self: *VM, m: Value, key: ErrorKey, v: Value) !Value {
+        return champ_mod.mapAssoc(self.ensureHeap(), m, try self.errorKey(key), v, &dispatch_mod.hashValue, &dispatch_mod.equal);
     }
 
     /// `throwValue` of an error map a native built (`{:error tag
@@ -4478,18 +4489,18 @@ pub const VM = struct {
         return self.next(self.currentFrame());
     }
 
-    /// How a fast handler hands its instruction to a part of its own
-    /// kept out of line, one that calls out and so needs a stack frame
-    /// (em `src/runtime.zig` `outOfLine`): a call in return position
-    /// never inlined, which a release build makes a tail call; inlined,
-    /// the part's frame would be the fast handler's. A debug build
-    /// makes a tail call only when told to.
     /// The fast handlers' section and alignment: together, apart from
     /// the rest of the code, each on a cache line of its own, so code
     /// growing elsewhere does not move them against each other.
     const hot_section = if (builtin.target.os.tag.isDarwin()) "__TEXT,__text_hot,regular,pure_instructions" else ".text.hot";
     const hot_align = 64;
 
+    /// How a fast handler hands its instruction to a part of its own
+    /// kept out of line, one that calls out and so needs a stack frame
+    /// (em `src/runtime.zig` `outOfLine`): a call in return position
+    /// never inlined, which a release build makes a tail call; inlined,
+    /// the part's frame would be the fast handler's. A debug build
+    /// makes a tail call only when told to.
     const out_of_line: std.lang.CallModifier = if (builtin.optimize == .debug) .always_tail else .never_inline;
 
     /// A fast handler's way out: `inst`'s general handler, which takes

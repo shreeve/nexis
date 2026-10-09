@@ -407,9 +407,10 @@ the frame built at the first call and runs it as the loop would: the
 loop's depth and nesting are set, the safe point of the loop's entry
 taken, and the chain entered at the callee's first instruction, the
 frame the loop's first pass would run, so the pass needs no test. A
-pass that ends without an error has returned; one that ends with an
-error goes on to the loop, which takes the error as its own pass
-would (§8, §12). The frame built at the first call returns into a
+pass that ends without an error has returned, or a throw went past the
+frame, which leaves the result cell unfilled (`ControlTransferred` to
+the native, §12); one that ends with an error goes on to the loop,
+which takes the error as its own pass would (§8, §12). The frame built at the first call returns into a
 result cell of the `Callback`'s own, so a call sets one flag in it
 rather than making a cell, and the native reads the value back a word
 at a time, the width the return stored it (§8); a callee that
@@ -596,7 +597,9 @@ call stores it (`call:call`, the buffered and the general call,
 `call:lookup`, `coll:*`; `VM.storeResult`); the arguments a buffered
 or general call and a collection's construction copy off the stack are
 copied a value at a time, a map's key and value as one 32-byte entry,
-the width its constructor reads (`VM.copyRun`, `VM.copyEntries`).
+the width its constructor reads, which a target without AVX (the
+release's `x86_64_v2`) stores as two 16-byte halves (`VM.copyRun`,
+`VM.copyEntries`).
 A native returns its result through memory by a `return` of a value
 it holds, or of an error, which stores it in place: a result merged
 from an `if`, a `switch`, an `orelse` or a labeled block, or returned
