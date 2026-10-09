@@ -26,7 +26,7 @@
   [x]
   (cond (instance? Instant x) (:ms x)
         (integer? x) x
-        :else (throw :kind-mismatch)))
+        :else (nexis.internal/#%raise :kind-mismatch "inst-ms takes an Instant or an integer, got" x)))
 
 (defn parse
   "The Instant the ISO-8601 text s names: 2026-10-09, 2026-10-09T12:30Z,
@@ -42,7 +42,7 @@
   (cond (instance? Instant x) x
         (integer? x) (->Instant x)
         (string? x) (parse x)
-        :else (throw :kind-mismatch)))
+        :else (nexis.internal/#%raise :kind-mismatch "instant takes an Instant, an integer or ISO-8601 text, got" x)))
 
 (defn now
   "The wall clock as an Instant, to the millisecond."

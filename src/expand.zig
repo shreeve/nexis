@@ -3050,9 +3050,7 @@ fn classMemberHint(allocator: Allocator, ns: []const u8, name: []const u8) Alloc
 pub fn namespaceHint(name: []const u8) ?[]const u8 {
     for ([_][2][]const u8{
         .{ "clojure.java.io", "nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin" },
-        .{ "clojure.java.shell", "nexis has no clojure.java.shell: nexis.shell/sh runs a command" },
         .{ "clojure.core.async", "nexis runs one thread and has no core.async: call functions in order" },
-        .{ "clojure.data.json", "nexis has no clojure.data.json: nexis.json reads and writes JSON" },
     }) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
     if (std.mem.startsWith(u8, name, "java.") or std.mem.startsWith(u8, name, "javax.")) return "nexis has no Java interop";
     return null;

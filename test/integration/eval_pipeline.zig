@@ -5035,7 +5035,7 @@ test "time: format writes an instant as Java's Instant.toString does" {
     try expectOutput("(nexis.time/format -62167219200000)", "0000-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format -62198755200000)", "-0001-01-01T00:00:00Z");
     try expectOutput("(nexis.time/format 1791549015120)", "2026-10-09T12:30:15.120Z");
-    try expectOutput("(try (nexis.time/format \"2026\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/format \"2026\") (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "time: parse reads ISO-8601 instants, a missing offset UTC" {
@@ -5075,8 +5075,8 @@ test "time: instants, the clock, durations and order" {
     try expectOutput("(< 1767225600000 (nexis.time/inst-ms (nexis.time/now)))", "true");
     try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
     try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
-    try expectOutput("(try (nexis.time/instant :x) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an Instant, an integer or ISO-8601 text, got a keyword");
+    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "inst-ms takes an Instant or an integer, got a string");
     try expectOutput(
         \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
     , "2026-10-10T01:30:15.007Z");
