@@ -68,7 +68,9 @@ const Usage =
     \\(deftest, is, testing, run-tests), nexis.pprint (pprint),
     \\nexis.math (sqrt, pow, floor, ceil, round, PI, E), nexis.walk
     \\(postwalk, prewalk, keywordize-keys, ...), nexis.edn
-    \\(read-string), nexis.simd (typed-vector kernels),
+    \\(read-string), nexis.sys (getenv, cwd), nexis.shell (sh),
+    \\nexis.time (now, parse, format, durations), nexis.json
+    \\(read-str, write-str), nexis.simd (typed-vector kernels),
     \\nexis.internal. See README.md, docs/TOOLING.md and
     \\docs/NEXTOMIC.md.
     \\
