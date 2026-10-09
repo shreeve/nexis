@@ -3,23 +3,29 @@
 ; Embedded via @embedFile and bootstrapped with nexis.string as the
 ; current namespace.
 
-; (capitalize s) → s with its first character upper-case and the
-; rest lower-case (ASCII, as upper-case and lower-case are).
-(defn capitalize [s]
+(defn capitalize
+  "Returns s with its first character upper-case and the rest
+  lower-case. Only ASCII letters change case."
+  [s]
   (if (< (count s) 2)
     (upper-case s)
     (str (upper-case (subs s 0 1)) (lower-case (subs s 1)))))
 
-; (reverse s) → s with its characters in reverse order.
-(defn reverse [s]
+(defn reverse
+  "Returns s with its code points in reverse order (not grapheme
+  clusters)."
+  [s]
   (apply str (nexis.core/reverse s)))
 
-; (split-lines s) → the lines of s, split at \n or \r\n; trailing
-; empty lines dropped, as split drops them.
-(defn split-lines [s]
+(defn split-lines
+  "Returns a vector of the lines of s, split at \\n or \\r\\n, with
+  trailing empty lines dropped."
+  [s]
   (split (replace s "\r\n" "\n") "\n"))
 
-; (escape s cmap) → s with each character cmap maps to a truthy value
-; replaced by that value's text (str), the rest kept, as Clojure's.
-(defn escape [s cmap]
+(defn escape
+  "Returns s with each character that cmap maps to a truthy value
+  replaced by that value's text (str), the others kept:
+  (escape \"a<b\" {\\< \"&lt;\"}) is \"a&lt;b\"."
+  [s cmap]
   (apply str (map (fn [c] (if-let [r (cmap c)] r c)) s)))

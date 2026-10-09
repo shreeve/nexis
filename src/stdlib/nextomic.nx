@@ -5,12 +5,11 @@
 ; substantive is a native in src/nextomic/natives.zig; this
 ; file holds only forms that read better as macros.
 
-; `(with-conn [c "path"] body...)` and
-; `(with-conn [c "path" {:sync :none}] body...)` open a connection
-; for the extent of body and release it on every exit, including a
-; throw, which continues to propagate. Returns body's value.
-
-(defmacro with-conn [binding & body]
+(defmacro with-conn
+  "Evaluates body with c bound to (connect path) or (connect path opts),
+  binding being [c path] or [c path opts], and releases the connection
+  on every exit; a throw keeps propagating. Returns body's value."
+  [binding & body]
   `(let* [~(first binding) (nextomic/connect ~@(rest binding))]
      (try
        (let* [r# (do ~@body)]

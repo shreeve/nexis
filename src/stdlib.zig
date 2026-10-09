@@ -209,6 +209,7 @@ fn bootSources(loader: *loader_mod.Loader) !void {
         registry.current = try registry.getOrCreate(e.ns, registry.core);
         _ = try loader.evalSource(&e.info, .{ .allocator = loader.persistent_allocator, .declare = false });
     }
+    try packDocs(loader.vm);
 }
 
 fn markLoaded(loader: *loader_mod.Loader) !void {
@@ -243,280 +244,280 @@ pub const embedded = [_]image_mod.Source{
 
 const core_rows = .{
     // Sequence primitives.
-    .{ "list", 0, null, &fnList },
-    .{ "list*", 1, null, &fnListStar },
-    .{ "cons", 2, 2, &fnCons },
-    .{ "first", 1, 1, &fnFirst, "[coll]", "The first item of coll, through seq; nil when coll is nil or empty." },
-    .{ "rest", 1, 1, &fnRest },
-    .{ "second", 1, 1, &fnSecond },
-    .{ "take", 1, 2, &fnTake },
-    .{ "drop", 1, 2, &fnDrop },
-    .{ "some", 2, 2, &fnSome, .consumes },
-    .{ "every?", 2, 2, &fnEveryQ, .consumes },
-    .{ "count", 1, 1, &fnCountLeaf, .consuming_leaf, &fnCount },
-    .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral },
-    .{ "empty?", 1, 1, &fnEmptyQ },
-    .{ "identity", 1, 1, &fnIdentity, .leaf },
-    .{ "nil?", 1, 1, &fnNilQ, .leaf },
-    .{ "some?", 1, 1, &fnSomeQ, .leaf },
+    .{ "list", 0, null, &fnList, "[& items]", "Returns a new list of the items; (list) is ()." },
+    .{ "list*", 1, null, &fnListStar, "[args] [a args] [a b args] [a b c args] [a b c d & more]", "Returns a seq of the leading items consed onto the seq of the last\n  argument, which is not realized; (list* nil) is nil." },
+    .{ "cons", 2, 2, &fnCons, "[x seq]", "Returns a seq of x followed by the items of seq, any seqable; a lazy\n  seq is not realized." },
+    .{ "first", 1, 1, &fnFirst, "[coll]", "Returns the first item of coll, through seq; nil when coll is nil or\n  empty." },
+    .{ "rest", 1, 1, &fnRest, "[coll]", "Returns a possibly empty seq of the items after the first; () when\n  coll is nil or empty. A vector's rest is an O(1) view." },
+    .{ "second", 1, 1, &fnSecond, "[coll]", "Returns the second item of coll, nil when it has fewer than two." },
+    .{ "take", 1, 2, &fnTake, "[n] [n coll]", "Returns a lazy seq of the first n items of coll, all of them when it\n  has fewer. A fractional n rounds up. With no coll, returns a\n  transducer." },
+    .{ "drop", 1, 2, &fnDrop, "[n] [n coll]", "Returns a lazy seq of all but the first n items of coll. With no\n  coll, returns a transducer." },
+    .{ "some", 2, 2, &fnSome, .consumes, "[pred coll]", "Returns the first truthy (pred x) for x in coll, else nil; stops at\n  the first one." },
+    .{ "every?", 2, 2, &fnEveryQ, .consumes, "[pred coll]", "Returns true if (pred x) is truthy for every x in coll, true for an\n  empty coll; stops at the first falsy one." },
+    .{ "count", 1, 1, &fnCountLeaf, .consuming_leaf, &fnCount, "[coll]", "Returns the number of items in coll; 0 for nil. A string counts code\n  points, not bytes; a lazy seq is realized to its end." },
+    .{ "nth", 2, 3, &fnNth, .leaf, &fnNthGeneral, "[coll index] [coll index not-found]", "Returns the item at index of coll, a string's char by code point. Out\n  of range, returns not-found, or without one is\n  :index-out-of-bounds; nil coll gives not-found (nil). A lazy seq is\n  realized as far as index." },
+    .{ "empty?", 1, 1, &fnEmptyQ, "[coll]", "Returns true if coll has no items; true for nil." },
+    .{ "identity", 1, 1, &fnIdentity, .leaf, "[x]", "Returns x." },
+    .{ "nil?", 1, 1, &fnNilQ, .leaf, "[x]", "Returns true if x is nil, false otherwise." },
+    .{ "some?", 1, 1, &fnSomeQ, .leaf, "[x]", "Returns true if x is not nil, false otherwise." },
     // First-class arithmetic + comparison Vars.
     // Required so `(reduce + 0 xs)` resolves `+` as a Var.
     // `(+ x y)` at the call head is still inlined by the
     // compiler; the Var is only reached through non-head uses.
-    .{ "+", 0, null, &fnAdd, .leaf },
-    .{ "-", 1, null, &fnSub, .leaf },
-    .{ "*", 0, null, &fnMul, .leaf },
-    .{ "/", 1, null, &fnDiv },
-    .{ "quot", 2, 2, &fnQuot },
-    .{ "rem", 2, 2, &fnRem },
-    .{ "mod", 2, 2, &fnMod },
-    .{ "<", 0, null, &fnLt, .leaf },
-    .{ "<=", 0, null, &fnLte, .leaf },
-    .{ ">", 0, null, &fnGt, .leaf },
-    .{ ">=", 0, null, &fnGte, .leaf },
-    .{ "==", 0, null, &fnNumEq, .leaf },
-    .{ "=", 0, null, &fnEq },
-    .{ "not=", 1, null, &fnNotEq },
-    .{ "inc", 1, 1, &fnInc, .leaf },
-    .{ "dec", 1, 1, &fnDec, .leaf },
-    .{ "long", 1, 1, &fnLong },
-    .{ "int", 1, 1, castTo(i32) },
-    .{ "short", 1, 1, castTo(i16) },
-    .{ "byte", 1, 1, castTo(i8) },
-    .{ "float", 1, 1, &fnFloat },
-    .{ "char", 1, 1, &fnChar },
-    .{ "parse-long", 1, 1, &fnParseLong },
-    .{ "parse-double", 1, 1, &fnParseDouble },
-    .{ "bit-and", 2, null, &fnBitAnd },
-    .{ "bit-or", 2, null, &fnBitOr },
-    .{ "bit-xor", 2, null, &fnBitXor },
-    .{ "bit-not", 1, 1, &fnBitNot },
-    .{ "bit-shift-left", 2, 2, &fnBitShiftLeft },
-    .{ "bit-shift-right", 2, 2, &fnBitShiftRight },
-    .{ "unsigned-bit-shift-right", 2, 2, &fnUnsignedBitShiftRight },
-    .{ "bit-test", 2, 2, &fnBitTest },
-    .{ "bit-set", 2, 2, &fnBitSet },
-    .{ "bit-clear", 2, 2, &fnBitClear },
-    .{ "rand", 0, 1, &fnRand },
-    .{ "rand-int", 1, 1, &fnRandInt },
-    .{ "format", 1, null, &fnFormat },
-    .{ "double", 1, 1, &fnDouble },
-    .{ "max", 1, null, &fnMax, .leaf },
-    .{ "min", 1, null, &fnMin, .leaf },
-    .{ "abs", 1, 1, &fnAbs },
-    .{ "number?", 1, 1, &fnNumberQ },
-    .{ "integer?", 1, 1, &fnIntegerQ },
-    .{ "float?", 1, 1, &fnFloatQ },
-    .{ "NaN?", 1, 1, &fnNanQ },
-    .{ "infinite?", 1, 1, &fnInfiniteQ },
-    .{ "not", 1, 1, &fnNot, .leaf },
-    .{ "zero?", 1, 1, &fnZeroQ, .leaf },
-    .{ "pos?", 1, 1, &fnPosQ, .leaf },
-    .{ "neg?", 1, 1, &fnNegQ, .leaf },
-    .{ "odd?", 1, 1, &fnOddQ, .leaf },
-    .{ "even?", 1, 1, &fnEvenQ, .leaf },
+    .{ "+", 0, null, &fnAdd, .leaf, "[] [x] [x y] [x y & more]", "Returns the sum of the nums; (+) is 0. An integer result past the\n  fixnum range is a bignum, never an overflow; a float operand makes\n  the result a float." },
+    .{ "-", 1, null, &fnSub, .leaf, "[x] [x y] [x y & more]", "With one arg, returns its negation; otherwise x minus each later\n  arg in turn. Integers promote to bignums, as + does." },
+    .{ "*", 0, null, &fnMul, .leaf, "[] [x] [x y] [x y & more]", "Returns the product of the nums; (*) is 1. Integers promote to\n  bignums, as + does." },
+    .{ "/", 1, null, &fnDiv, "[x] [x y] [x y & more]", "With one arg, returns its reciprocal; otherwise x divided by each\n  later arg in turn. There are no ratios: integers that do not divide\n  give the nearest double, (/ 7 2) is 3.5. A zero divisor of any kind\n  is :divide-by-zero." },
+    .{ "quot", 2, 2, &fnQuot, "[num div]", "Returns the quotient of num by div, truncated toward zero. A zero\n  div is :divide-by-zero." },
+    .{ "rem", 2, 2, &fnRem, "[num div]", "Returns the remainder of num by div under truncated division; it\n  has num's sign. A zero div is :divide-by-zero." },
+    .{ "mod", 2, 2, &fnMod, "[num div]", "Returns the modulus of num by div under floored division; it has\n  div's sign. A zero div is :divide-by-zero." },
+    .{ "<", 0, null, &fnLt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ "<=", 0, null, &fnLte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ ">", 0, null, &fnGt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ ">=", 0, null, &fnGte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nonincreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ "==", 0, null, &fnNumEq, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are numerically equal, across integers and\n  floats: (== 1 1.0) is true. NaN is == to nothing." },
+    .{ "=", 0, null, &fnEq, "[] [x] [x y] [x y & more]", "Returns true if the args are equal by value. Different kinds are\n  never equal, except a list and a vector, or hash and sorted maps or\n  sets: (= 1 1.0) is false. Unlike Clojure, NaN is = to NaN." },
+    .{ "not=", 1, null, &fnNotEq, "[x] [x y] [x y & more]", "Returns (not (= x y & more))." },
+    .{ "inc", 1, 1, &fnInc, .leaf, "[x]", "Returns x plus one, a bignum past the fixnum range." },
+    .{ "dec", 1, 1, &fnDec, .leaf, "[x]", "Returns x minus one, a bignum past the fixnum range." },
+    .{ "long", 1, 1, &fnLong, "[x]", "Returns x as an integer of any size: a float's integer part (NaN is\n  0, an infinity :invalid-argument), a char's code point." },
+    .{ "int", 1, 1, castTo(i32), "[x]", "Returns x as long does, within the range of Java's int, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "short", 1, 1, castTo(i16), "[x]", "Returns x as long does, within the range of Java's short, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "byte", 1, 1, castTo(i8), "[x]", "Returns x as long does, within the range of Java's byte, else\n  :invalid-argument; NaN is 0, a char its code point." },
+    .{ "float", 1, 1, &fnFloat, "[x]", "Returns x as a double, within Java's float range, else\n  :invalid-argument. The one float type is 64-bit, so nothing is\n  rounded to single precision." },
+    .{ "char", 1, 1, &fnChar, "[x]", "Returns the char with the code point x; a char is itself. A value\n  that is not a Unicode scalar is :invalid-argument." },
+    .{ "parse-long", 1, 1, &fnParseLong, "[s]", "Returns the integer s spells in full, an optional sign and ASCII\n  digits within 64 bits, else nil. A non-string is :kind-mismatch." },
+    .{ "parse-double", 1, 1, &fnParseDouble, "[s]", "Returns the double s spells as Java's Double/valueOf reads it, else\n  nil. A non-string is :kind-mismatch." },
+    .{ "bit-and", 2, null, &fnBitAnd, "[x y] [x y & more]", "Returns the bitwise and of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-or", 2, null, &fnBitOr, "[x y] [x y & more]", "Returns the bitwise or of the integers, as 64-bit two's complement;\n  an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-xor", 2, null, &fnBitXor, "[x y] [x y & more]", "Returns the bitwise exclusive or of the integers, as 64-bit two's\n  complement; an integer past 64 bits is :arithmetic-overflow." },
+    .{ "bit-not", 1, 1, &fnBitNot, "[x]", "Returns the bitwise complement of x, as 64-bit two's complement." },
+    .{ "bit-shift-left", 2, 2, &fnBitShiftLeft, "[x n]", "Returns x shifted left n bits within 64 bits; n uses its low six\n  bits." },
+    .{ "bit-shift-right", 2, 2, &fnBitShiftRight, "[x n]", "Returns x shifted right n bits, keeping its sign; n uses its low six\n  bits." },
+    .{ "unsigned-bit-shift-right", 2, 2, &fnUnsignedBitShiftRight, "[x n]", "Returns x, as 64 unsigned bits, shifted right n bits with zeros\n  shifted in; n uses its low six bits." },
+    .{ "bit-test", 2, 2, &fnBitTest, "[x n]", "Returns true if bit n of x is set." },
+    .{ "bit-set", 2, 2, &fnBitSet, "[x n]", "Returns x with bit n set." },
+    .{ "bit-clear", 2, 2, &fnBitClear, "[x n]", "Returns x with bit n cleared." },
+    .{ "rand", 0, 1, &fnRand, "[] [n]", "Returns a random double in [0, n), n defaulting to 1." },
+    .{ "rand-int", 1, 1, &fnRandInt, "[n]", "Returns a random integer in [0, n), in (n, 0] for a negative n, 0\n  for 0." },
+    .{ "format", 1, null, &fnFormat, "[fmt & args]", "Returns fmt with each % conversion replaced by the next arg, a subset\n  of Java's Formatter: %s, %d, %f, %x, %X, %c, %n and %%, with the -\n  and 0 flags, a width, and a precision for %s and %f. Anything else\n  is :invalid-argument; an arg of the wrong kind :kind-mismatch." },
+    .{ "double", 1, 1, &fnDouble, "[x]", "Returns the double nearest the number x." },
+    .{ "max", 1, null, &fnMax, .leaf, "[x] [x y] [x y & more]", "Returns the greatest of the nums; NaN if any is NaN." },
+    .{ "min", 1, null, &fnMin, .leaf, "[x] [x y] [x y & more]", "Returns the least of the nums; NaN if any is NaN." },
+    .{ "abs", 1, 1, &fnAbs, "[a]", "Returns the absolute value of a, a bignum past the fixnum range." },
+    .{ "number?", 1, 1, &fnNumberQ, "[x]", "Returns true if x is a number: an integer or a float." },
+    .{ "integer?", 1, 1, &fnIntegerQ, "[n]", "Returns true if n is an integer, a fixnum or a bignum." },
+    .{ "float?", 1, 1, &fnFloatQ, "[n]", "Returns true if n is a float." },
+    .{ "NaN?", 1, 1, &fnNanQ, "[num]", "Returns true if num is NaN. A non-number is :kind-mismatch." },
+    .{ "infinite?", 1, 1, &fnInfiniteQ, "[num]", "Returns true if num is positive or negative infinity. A non-number\n  is :kind-mismatch." },
+    .{ "not", 1, 1, &fnNot, .leaf, "[x]", "Returns true if x is nil or false, false otherwise." },
+    .{ "zero?", 1, 1, &fnZeroQ, .leaf, "[num]", "Returns true if num is zero (-0.0 included); false for NaN." },
+    .{ "pos?", 1, 1, &fnPosQ, .leaf, "[num]", "Returns true if num is greater than zero; false for NaN." },
+    .{ "neg?", 1, 1, &fnNegQ, .leaf, "[num]", "Returns true if num is less than zero; false for NaN." },
+    .{ "odd?", 1, 1, &fnOddQ, .leaf, "[n]", "Returns true if the integer n is odd. A float is :kind-mismatch." },
+    .{ "even?", 1, 1, &fnEvenQ, .leaf, "[n]", "Returns true if the integer n is even. A float is :kind-mismatch." },
     // apply + HOFs.
-    .{ "apply", 2, null, &fnApply, .consumes },
-    .{ "map", 1, null, &fnMap },
-    .{ "reduce", 2, 3, &fnReduce, .consumes },
-    .{ "reduce-kv", 3, 3, &fnReduceKv },
-    .{ "filter", 1, 2, &fnFilter },
-    .{ "remove", 1, 2, &fnRemove },
-    .{ "keep", 1, 2, &fnKeep },
-    .{ "seq", 1, 1, &fnSeq },
-    .{ "next", 1, 1, &fnNext },
-    .{ "range", 0, 3, &fnRange },
-    .{ "concat", 0, null, &fnConcat },
-    .{ "mapcat", 1, null, &fnMapcat },
-    .{ "into", 0, 3, &fnInto, .consumes },
-    .{ "mapv", 2, null, &fnMapv, .consumes },
-    .{ "filterv", 2, 2, &fnFilterv, .consumes },
-    .{ "map-indexed", 1, 2, &fnMapIndexed },
-    .{ "keep-indexed", 1, 2, &fnKeepIndexed },
-    .{ "distinct", 0, 1, &fnDistinct },
-    .{ "dedupe", 0, 1, &fnDedupe },
-    .{ "partition", 2, 4, &fnPartition },
-    .{ "partition-all", 1, 3, &fnPartitionAll },
-    .{ "zipmap", 2, 2, &fnZipmap },
-    .{ "take-while", 1, 2, &fnTakeWhile },
-    .{ "drop-while", 1, 2, &fnDropWhile },
-    .{ "butlast", 1, 1, &fnButlast, .consumes },
-    .{ "last", 1, 1, &fnLast, .consumes },
-    .{ "reverse", 1, 1, &fnReverse, .consumes },
-    .{ "nthrest", 2, 2, &fnNthrest },
-    .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext },
-    .{ "take-last", 2, 2, &fnTakeLast, .consumes },
-    .{ "repeat", 1, 2, &fnRepeat },
-    .{ "repeatedly", 1, 2, &fnRepeatedly },
-    .{ "iterate", 2, 2, &fnIterate },
-    .{ "cycle", 1, 1, &fnCycle },
-    .{ "max-key", 2, null, &fnMaxKey },
-    .{ "min-key", 2, null, &fnMinKey },
-    .{ "select-keys", 2, 2, &fnSelectKeys, .consumes },
-    .{ "find", 2, 2, &fnFind },
-    .{ "key", 1, 1, &fnKey },
-    .{ "val", 1, 1, &fnVal },
-    .{ "peek", 1, 1, &fnPeek },
-    .{ "pop", 1, 1, &fnPop },
-    .{ "empty", 1, 1, &fnEmpty },
-    .{ "not-empty", 1, 1, &fnNotEmpty },
-    .{ "disj", 1, null, &fnDisj },
-    .{ "compare", 2, 2, &fnCompare },
-    .{ "sort", 1, 2, &fnSort },
-    .{ "sort-by", 2, 3, &fnSortBy },
-    .{ "hash", 1, 1, &fnHash },
-    .{ "name", 1, 1, &fnName },
-    .{ "namespace", 1, 1, &fnNamespace },
-    .{ "keyword", 1, 2, &fnKeyword },
-    .{ "symbol", 1, 2, &fnSymbol },
-    .{ "gensym", 0, 1, &fnGensym },
-    .{ "in-ns", 1, 1, &fnInNs },
+    .{ "apply", 2, null, &fnApply, .consumes, "[f args] [f x args] [f x y args] [f x y z args] [f a b c d & args]", "Calls f with the leading args followed by the items of the last.\n  Unlike Clojure, the last arg is realized in full, so an infinite seq\n  never returns." },
+    .{ "map", 1, null, &fnMap, "[f] [f coll] [f c1 c2] [f c1 c2 c3] [f c1 c2 c3 & colls]", "Returns a lazy seq of f applied to the first items of the colls,\n  then the second, ..., ending at the shortest coll; chunked, 32 at a\n  time, over one chunked coll. With no coll, returns a transducer." },
+    .{ "reduce", 2, 3, &fnReduce, .consumes, "[f coll] [f val coll]", "Returns the left fold of f over coll, from val or else the first\n  item; (f) for an empty coll without val, val with one. A reduced\n  value stops the fold." },
+    .{ "reduce-kv", 3, 3, &fnReduceKv, "[f init coll]", "Returns the fold of (f acc k v) from init over a map's entries or a\n  vector's indices and items; init for nil. A reduced value stops it." },
+    .{ "filter", 1, 2, &fnFilter, "[pred] [pred coll]", "Returns a lazy seq of the items of coll for which (pred item) is\n  truthy; chunked when coll is. With no coll, returns a transducer." },
+    .{ "remove", 1, 2, &fnRemove, "[pred] [pred coll]", "Returns a lazy seq of the items of coll for which (pred item) is\n  falsy; chunked when coll is. With no coll, returns a transducer." },
+    .{ "keep", 1, 2, &fnKeep, "[f] [f coll]", "Returns a lazy seq of the non-nil results of (f item) over coll;\n  false is kept. With no coll, returns a transducer." },
+    .{ "seq", 1, 1, &fnSeq, "[coll]", "Returns a seq on coll, nil when coll is nil or empty. A map gives its\n  [k v] entries, a string its chars." },
+    .{ "next", 1, 1, &fnNext, "[coll]", "Returns a seq of the items after the first, nil when there are none." },
+    .{ "range", 0, 3, &fnRange, "[] [end] [start end] [start end step]", "Returns a lazy seq of nums from start (0) by step (1) up to, not\n  including, end; infinite without end. Any number works, the items\n  following the tower's contagion. Finite ranges are chunked." },
+    .{ "concat", 0, null, &fnConcat, "[] [x] [x y] [x y & zs]", "Returns a lazy seq of the items of each coll in turn." },
+    .{ "mapcat", 1, null, &fnMapcat, "[f] [f & colls]", "Returns the lazy concatenation of (map f colls ...); an infinite\n  outer seq works. With no colls, returns a transducer." },
+    .{ "into", 0, 3, &fnInto, .consumes, "[] [to] [to from] [to xform from]", "Returns to with every item of from conj'd onto it, through the\n  transducer xform when given; (into) is []." },
+    .{ "mapv", 2, null, &fnMapv, .consumes, "[f coll] [f c1 c2] [f c1 c2 c3] [f c1 c2 c3 & colls]", "Returns a vector of what (map f colls ...) gives, made eagerly." },
+    .{ "filterv", 2, 2, &fnFilterv, .consumes, "[pred coll]", "Returns a vector of the items of coll for which (pred item) is\n  truthy, made eagerly." },
+    .{ "map-indexed", 1, 2, &fnMapIndexed, "[f] [f coll]", "Returns a lazy seq of (f index item) over coll, index from 0. With\n  no coll, returns a transducer." },
+    .{ "keep-indexed", 1, 2, &fnKeepIndexed, "[f] [f coll]", "Returns a lazy seq of the non-nil results of (f index item) over\n  coll, index from 0. With no coll, returns a transducer." },
+    .{ "distinct", 0, 1, &fnDistinct, "[] [coll]", "Returns a lazy seq of the items of coll without duplicates, each at\n  its first occurrence. With no coll, returns a transducer." },
+    .{ "dedupe", 0, 1, &fnDedupe, "[] [coll]", "Returns a lazy seq of the items of coll without consecutive\n  duplicates. With no coll, returns a transducer." },
+    .{ "partition", 2, 4, &fnPartition, "[n coll] [n step coll] [n step pad coll]", "Returns a lazy seq of seqs of n items each, at offsets step apart\n  (n by default). A short final part is dropped, unless pad is given\n  to fill it, as far as pad goes. n and step must be positive." },
+    .{ "partition-all", 1, 3, &fnPartitionAll, "[n] [n coll] [n step coll]", "Returns a lazy seq of seqs of n items each, at offsets step apart\n  (n by default), the last ones possibly short. With no coll,\n  returns a transducer." },
+    .{ "zipmap", 2, 2, &fnZipmap, "[keys vals]", "Returns a map of each key to the val at its position, stopping at\n  the shorter of keys and vals." },
+    .{ "take-while", 1, 2, &fnTakeWhile, "[pred] [pred coll]", "Returns a lazy seq of the items of coll as long as (pred item) is\n  truthy. With no coll, returns a transducer." },
+    .{ "drop-while", 1, 2, &fnDropWhile, "[pred] [pred coll]", "Returns a lazy seq of the items of coll from the first for which\n  (pred item) is falsy. With no coll, returns a transducer." },
+    .{ "butlast", 1, 1, &fnButlast, .consumes, "[coll]", "Returns a seq of all but the last item of coll, nil when it has\n  fewer than two." },
+    .{ "last", 1, 1, &fnLast, .consumes, "[coll]", "Returns the last item of coll, nil when it is empty. O(1) for a\n  vector, a walk of anything else." },
+    .{ "reverse", 1, 1, &fnReverse, .consumes, "[coll]", "Returns a seq of the items of coll in reverse order; () when there\n  are none." },
+    .{ "nthrest", 2, 2, &fnNthrest, "[coll n]", "Returns coll without its first n items; coll itself when n is not\n  positive." },
+    .{ "nthnext", 2, 2, &fnNthnextLeaf, .leaf, &fnNthnext, "[coll n]", "Returns (seq (nthrest coll n)): the items after the first n, nil\n  when there are none." },
+    .{ "take-last", 2, 2, &fnTakeLast, .consumes, "[n coll]", "Returns a seq of the last n items of coll, nil when there are none." },
+    .{ "repeat", 1, 2, &fnRepeat, "[x] [n x]", "Returns a lazy seq of x, infinite, or n times; () when n is at most\n  0. n is truncated as long does." },
+    .{ "repeatedly", 1, 2, &fnRepeatedly, "[f] [n f]", "Returns a lazy seq of calls to the no-argument f, infinite, or n of\n  them; each call made when its item is first needed." },
+    .{ "iterate", 2, 2, &fnIterate, "[f x]", "Returns the infinite lazy seq of x, (f x), (f (f x)), ...; f must be\n  free of side effects, since a reduce over the unrealized seq calls\n  it again." },
+    .{ "cycle", 1, 1, &fnCycle, "[coll]", "Returns the infinite lazy seq of the items of coll over and over; ()\n  when coll is empty." },
+    .{ "max-key", 2, null, &fnMaxKey, "[k x] [k x y] [k x y & more]", "Returns the x for which (k x), a number, is greatest; a tie goes to\n  the later x. A lone x is returned without calling k." },
+    .{ "min-key", 2, null, &fnMinKey, "[k x] [k x y] [k x y & more]", "Returns the x for which (k x), a number, is least; a tie goes to the\n  later x. A lone x is returned without calling k." },
+    .{ "select-keys", 2, 2, &fnSelectKeys, .consumes, "[map keyseq]", "Returns a map of the entries of map whose keys are in keyseq. Of a\n  vector, the keys are indices." },
+    .{ "find", 2, 2, &fnFind, "[map key]", "Returns the [k v] entry of map for key, nil when absent; k is the key\n  as map holds it. Of a vector, key is an index." },
+    .{ "key", 1, 1, &fnKey, "[e]", "Returns the key of the map entry e, a [k v] vector." },
+    .{ "val", 1, 1, &fnVal, "[e]", "Returns the val of the map entry e, a [k v] vector." },
+    .{ "peek", 1, 1, &fnPeek, "[coll]", "Returns the last item of a vector or the first of a list; nil when\n  coll is nil or empty." },
+    .{ "pop", 1, 1, &fnPop, "[coll]", "Returns a vector without its last item or a list without its first;\n  nil for nil. An empty coll is :index-out-of-bounds." },
+    .{ "empty", 1, 1, &fnEmpty, "[coll]", "Returns an empty collection of coll's kind with coll's metadata; {}\n  for a record, nil for anything that is not a collection, a string\n  included." },
+    .{ "not-empty", 1, 1, &fnNotEmpty, "[coll]", "Returns coll, or nil when it has no items." },
+    .{ "disj", 1, null, &fnDisj, "[set] [set key] [set key & ks]", "Returns set without the keys; nil for nil." },
+    .{ "compare", 2, 2, &fnCompare, "[x y]", "Returns -1, 0 or 1 as x is less than, equal to or greater than y.\n  nil sorts first; numbers compare across kinds, then booleans,\n  strings, keywords, symbols, chars and vectors (shorter first) each\n  among their own. Anything else is :kind-mismatch." },
+    .{ "sort", 1, 2, &fnSort, "[coll] [comp coll]", "Returns a seq of the items of coll in order, a stable sort by comp\n  (compare by default), which returns a number (negative for less) or\n  a boolean (true for less)." },
+    .{ "sort-by", 2, 3, &fnSortBy, "[keyfn coll] [keyfn comp coll]", "Returns a seq of the items of coll ordered by (keyfn item), a stable\n  sort by comp (compare by default), as sort takes it." },
+    .{ "hash", 1, 1, &fnHash, "[x]", "Returns the hash of x, a non-negative fixnum consistent with =.\n  Stable within a process only; it differs from Clojure's." },
+    .{ "name", 1, 1, &fnName, "[x]", "Returns the name of a keyword or symbol, without its namespace; a\n  string is its own name." },
+    .{ "namespace", 1, 1, &fnNamespace, "[x]", "Returns the namespace of a keyword or symbol, nil when it has none." },
+    .{ "keyword", 1, 2, &fnKeyword, "[name] [ns name]", "Returns a keyword from a string, symbol or keyword (\"a/b\" gives\n  :a/b), nil for nil; with ns, qualified by it, a nil ns leaving it\n  unqualified." },
+    .{ "symbol", 1, 2, &fnSymbol, "[name] [ns name]", "Returns a symbol from a string, keyword or symbol; with ns, qualified\n  by it, a nil ns leaving it unqualified." },
+    .{ "gensym", 0, 1, &fnGensym, "[] [prefix-string]", "Returns a fresh symbol, prefix-string (G__ by default) followed by a\n  number that counts up for the process." },
+    .{ "in-ns", 1, 1, &fnInNs, "[name]", "Makes the namespace the symbol name names current, creating it with\n  nexis.core referred when absent; returns nil, where Clojure returns\n  the namespace." },
     // Exceptions as maps (PLAN Amendment Log, exceptions are values).
-    .{ "ex-info", 2, 3, &fnExInfo },
-    .{ "ex-data", 1, 1, &fnExData },
-    .{ "ex-message", 1, 1, &fnExMessage },
+    .{ "ex-info", 2, 3, &fnExInfo, "[msg map] [msg map cause]", "Returns the exception map {:message msg :data map}, with :cause when\n  given, for throw: exceptions are values, and catch receives the map.\n  msg is a string or nil; map is a map, nil meaning {}." },
+    .{ "ex-data", 1, 1, &fnExData, "[ex]", "Returns the :data of the exception map ex, nil for anything that is\n  not a map." },
+    .{ "ex-message", 1, 1, &fnExMessage, "[ex]", "Returns the :message of the exception map ex, nil for anything that\n  is not a map." },
     // Early exit from a fold.
-    .{ "reduced", 1, 1, &fnReduced },
-    .{ "reduced?", 1, 1, &fnReducedQ },
+    .{ "reduced", 1, 1, &fnReduced, "[x]", "Wraps x so that reduce, and the reductions built on it, stop and\n  return x; deref reads x back." },
+    .{ "reduced?", 1, 1, &fnReducedQ, "[x]", "Returns true if x is the result of a call to reduced." },
     // The compiler at run time.
-    .{ "macroexpand-1", 1, 1, &fnMacroexpand1 },
-    .{ "macroexpand", 1, 1, &fnMacroexpand },
-    .{ "read-string", 1, 2, &fnReadString },
-    .{ "eval", 1, 1, &fnEval },
+    .{ "macroexpand-1", 1, 1, &fnMacroexpand1, "[form]", "Returns form after one macro expansion step when it is a macro call,\n  else form itself. Nothing inside the result is expanded." },
+    .{ "macroexpand", 1, 1, &fnMacroexpand, "[form]", "Repeats macroexpand-1 on form until its head is not a macro and\n  returns it. Subforms are left alone." },
+    .{ "read-string", 1, 2, &fnReadString, "[s] [opts s]", "Returns the first form of the string s as data; the text after it is\n  ignored. When s holds no form, returns the :eof value of the map\n  opts, else :reader-error, as is text that does not read." },
+    .{ "eval", 1, 1, &fnEval, "[form]", "Compiles form in the current namespace, runs it and returns its\n  value. A form that does not compile throws\n  {:error :compile-error :message ... :form form}." },
     // Metadata (SEMANTICS.md §7).
-    .{ "meta", 1, 1, &fnMeta },
-    .{ "with-meta", 2, 2, &fnWithMeta },
-    .{ "reset-meta!", 2, 2, &fnResetMeta },
-    .{ "alter-meta!", 2, null, &fnAlterMeta },
+    .{ "meta", 1, 1, &fnMeta, "[obj]", "Returns the metadata map of obj, a list, vector, map, set, record,\n  atom or Var; nil when it has none or cannot have any." },
+    .{ "with-meta", 2, 2, &fnWithMeta, "[obj m]", "Returns a value equal to obj with the map m (or nil) as its metadata.\n  A scalar is :no-metadata-on-immediate; a Var or atom takes metadata\n  in place, through reset-meta! or alter-meta!." },
+    .{ "reset-meta!", 2, 2, &fnResetMeta, "[iref metadata-map]", "Sets the metadata of the Var or atom iref to metadata-map in place\n  and returns it." },
+    .{ "alter-meta!", 2, null, &fnAlterMeta, "[iref f & args]", "Sets the metadata of the Var or atom iref to\n  (apply f (meta iref) args) in place and returns it." },
     // Dynamic bindings (VM.md §6.5); `binding` and `set!` in
     // core.nx expand to these.
-    .{ "push-thread-bindings", 1, 1, &fnPushThreadBindings },
-    .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings },
-    .{ "var-set", 2, 2, &fnVarSet },
-    .{ "thread-bound?", 1, 1, &fnThreadBoundQ },
-    .{ "alter-var-root", 2, null, &fnAlterVarRoot },
-    .{ "boolean", 1, 1, &fnBoolean },
-    .{ "list?", 1, 1, kindPredicate(isList), .leaf },
-    .{ "seq?", 1, 1, kindPredicate(isSeq), .leaf },
-    .{ "vector?", 1, 1, kindPredicate(isVector), .leaf },
-    .{ "map?", 1, 1, kindPredicate(isMap), .leaf },
-    .{ "set?", 1, 1, kindPredicate(isSet), .leaf },
-    .{ "keyword?", 1, 1, kindPredicate(isKeyword), .leaf },
-    .{ "symbol?", 1, 1, kindPredicate(isSymbol), .leaf },
-    .{ "char?", 1, 1, kindPredicate(isChar), .leaf },
-    .{ "boolean?", 1, 1, kindPredicate(isBoolean), .leaf },
-    .{ "coll?", 1, 1, kindPredicate(isColl), .leaf },
-    .{ "sequential?", 1, 1, kindPredicate(isSequential), .leaf },
-    .{ "associative?", 1, 1, kindPredicate(isAssociative), .leaf },
-    .{ "fn?", 1, 1, kindPredicate(isFn), .leaf },
-    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf },
-    .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf },
-    .{ "delay?", 1, 1, &fnDelayQ },
+    .{ "push-thread-bindings", 1, 1, &fnPushThreadBindings, "[bindings]", "Opens a binding frame that rebinds each Var key of the map bindings\n  to its value. Every Var must be dynamic, else :not-dynamic and\n  nothing is rebound. Use binding, which pairs it with\n  pop-thread-bindings." },
+    .{ "pop-thread-bindings", 0, 0, &fnPopThreadBindings, "[]", "Closes the innermost frame push-thread-bindings opened, restoring\n  the bindings it replaced." },
+    .{ "var-set", 2, 2, &fnVarSet, "[x val]", "Sets the binding in force of the dynamic Var x to val and returns\n  val; set! expands to it. :not-dynamic for a Var that is not dynamic,\n  :no-thread-binding when no binding of it is in force." },
+    .{ "thread-bound?", 1, 1, &fnThreadBoundQ, "[v]", "Returns true if a binding of the Var v is in force. Unlike Clojure's,\n  it takes one Var." },
+    .{ "alter-var-root", 2, null, &fnAlterVarRoot, "[v f & args]", "Sets the root of the Var v to (apply f root args) and returns it; a\n  binding in force is left alone. An unbound Var's root is nil to f." },
+    .{ "boolean", 1, 1, &fnBoolean, "[x]", "Returns false for nil and false, true for anything else." },
+    .{ "list?", 1, 1, kindPredicate(isList), .leaf, "[x]", "Returns true if x is a list. Unlike Clojure, a seq realized as a\n  list, such as (seq [1 2]) or (keys m), is one; a lazy seq is not." },
+    .{ "seq?", 1, 1, kindPredicate(isSeq), .leaf, "[x]", "Returns true if x is a seq: a list or a lazy seq. A vector, map,\n  set or string is not, though seq of one is." },
+    .{ "vector?", 1, 1, kindPredicate(isVector), .leaf, "[x]", "Returns true if x is a persistent vector, a map entry included; a\n  typed vector or a transient is not." },
+    .{ "map?", 1, 1, kindPredicate(isMap), .leaf, "[x]", "Returns true if x is a map: a hash map, a sorted map or a record." },
+    .{ "set?", 1, 1, kindPredicate(isSet), .leaf, "[x]", "Returns true if x is a set: a hash set or a sorted set." },
+    .{ "keyword?", 1, 1, kindPredicate(isKeyword), .leaf, "[x]", "Returns true if x is a keyword." },
+    .{ "symbol?", 1, 1, kindPredicate(isSymbol), .leaf, "[x]", "Returns true if x is a symbol." },
+    .{ "char?", 1, 1, kindPredicate(isChar), .leaf, "[x]", "Returns true if x is a char." },
+    .{ "boolean?", 1, 1, kindPredicate(isBoolean), .leaf, "[x]", "Returns true if x is true or false." },
+    .{ "coll?", 1, 1, kindPredicate(isColl), .leaf, "[x]", "Returns true if x is a persistent collection: a list, lazy seq,\n  vector, map, set (hash or sorted) or record. False of nil, a\n  string, a typed vector and a transient." },
+    .{ "sequential?", 1, 1, kindPredicate(isSequential), .leaf, "[x]", "Returns true if x is a list, a lazy seq or a vector; false of a\n  typed vector." },
+    .{ "associative?", 1, 1, kindPredicate(isAssociative), .leaf, "[x]", "Returns true if x is a vector, a hash or sorted map, or a record." },
+    .{ "fn?", 1, 1, kindPredicate(isFn), .leaf, "[x]", "Returns true if x is a function: a fn, a native function or a\n  protocol method. A callable keyword or collection is not (ifn?)." },
+    .{ "ifn?", 1, 1, kindPredicate(isIfn), .leaf, "[x]", "Returns true if x can be called as a function: a function, a\n  keyword, a symbol, a vector, a map or set (hash or sorted), or a\n  transient." },
+    .{ "counted?", 1, 1, kindPredicate(isCounted), .leaf, "[x]", "Returns true if x is a list, vector, map, set, record, typed vector\n  or transient; false of nil, a string and a lazy seq." },
+    .{ "delay?", 1, 1, &fnDelayQ, "[x]", "Returns true if x is a delay." },
     // Lazy seqs (docs/LAZY.md).
-    .{ "realized?", 1, 1, &fnRealizedQ },
-    .{ "doall", 1, 2, &fnDoall },
-    .{ "dorun", 1, 2, &fnDorun, .consumes },
-    .{ "chunked-seq?", 1, 1, &fnChunkedSeqQ },
-    .{ "chunk-first", 1, 1, &fnChunkFirst },
-    .{ "chunk-rest", 1, 1, &fnChunkRest },
-    .{ "chunk-next", 1, 1, &fnChunkNext },
-    .{ "chunk-buffer", 1, 1, &fnChunkBuffer },
-    .{ "chunk-append", 2, 2, &fnChunkAppend },
-    .{ "chunk", 1, 1, &fnChunk },
-    .{ "chunk-cons", 2, 2, &fnChunkCons },
+    .{ "realized?", 1, 1, &fnRealizedQ, "[x]", "Returns true if x, a lazy seq, has run its body, or x, a delay,\n  has been forced; anything else is :kind-mismatch." },
+    .{ "doall", 1, 2, &fnDoall, "[coll] [n coll]", "Walks coll, realizing a lazy seq (only its first n steps with n),\n  and returns coll itself." },
+    .{ "dorun", 1, 2, &fnDorun, .consumes, "[coll] [n coll]", "Walks coll as doall does, for its side effects, keeping nothing of\n  it; returns nil." },
+    .{ "chunked-seq?", 1, 1, &fnChunkedSeqQ, "[s]", "Returns true if s is a seq that hands out chunks: a chunked cons\n  or a seq over a vector." },
+    .{ "chunk-first", 1, 1, &fnChunkFirst, "[s]", "Returns the first chunk of the chunked seq s, as a vector." },
+    .{ "chunk-rest", 1, 1, &fnChunkRest, "[s]", "Returns what follows the first chunk of the chunked seq s, () when\n  nothing does." },
+    .{ "chunk-next", 1, 1, &fnChunkNext, "[s]", "Returns the seq after the first chunk of the chunked seq s, nil\n  when nothing follows." },
+    .{ "chunk-buffer", 1, 1, &fnChunkBuffer, "[capacity]", "Returns an empty chunk buffer, a transient vector; capacity must be\n  an integer and is otherwise ignored." },
+    .{ "chunk-append", 2, 2, &fnChunkAppend, "[b x]", "Appends x to the chunk buffer b, as conj! does; returns b." },
+    .{ "chunk", 1, 1, &fnChunk, "[b]", "Returns the elements of the chunk buffer b as a chunk, a vector,\n  freezing b as persistent! does." },
+    .{ "chunk-cons", 2, 2, &fnChunkCons, "[chunk rest]", "Returns a chunked seq of the elements of chunk (a vector) followed\n  by rest; rest itself when chunk is empty." },
     // Introspection: kinds, namespaces, UUIDs (STDLIB.md §8).
-    .{ "class", 1, 1, &fnClass },
-    .{ "class?", 1, 1, &fnClassQ },
-    .{ "var?", 1, 1, kindPredicate(isVar), .leaf },
-    .{ "find-ns", 1, 1, &fnFindNs },
-    .{ "all-ns", 0, 0, &fnAllNs },
-    .{ "ns-interns", 1, 1, &fnNsInterns },
-    .{ "ns-publics", 1, 1, &fnNsPublics },
-    .{ "resolve", 1, 1, &fnResolve },
-    .{ "ns-resolve", 2, 2, &fnNsResolve },
-    .{ "random-uuid", 0, 0, &fnRandomUuid },
-    .{ "parse-uuid", 1, 1, &fnParseUuid },
-    .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf },
+    .{ "class", 1, 1, &fnClass, "[x]", "Returns the type of x: the keyword of its kind (:vector, :map,\n  :fixnum, :string, :sorted_map, ...; :boolean for both booleans), the\n  symbol a record prints with (user.P), or nil for nil. There are no\n  Java classes." },
+    .{ "class?", 1, 1, &fnClassQ, "[x]", "Returns true if x is a type class returns: a kind keyword such as\n  :vector or :fixnum, or the symbol of a record type." },
+    .{ "var?", 1, 1, kindPredicate(isVar), .leaf, "[v]", "Returns true if v is a Var." },
+    .{ "find-ns", 1, 1, &fnFindNs, "[sym]", "Returns sym when a namespace has that name, else nil. A namespace\n  is its name symbol; there is no namespace object." },
+    .{ "all-ns", 0, 0, &fnAllNs, "[]", "Returns the name symbol of every namespace, sorted." },
+    .{ "ns-interns", 1, 1, &fnNsInterns, "[ns]", "Returns a map from name symbol to Var of every Var interned in the\n  namespace the symbol ns names, not those it refers to;\n  :no-such-namespace when there is none." },
+    .{ "ns-publics", 1, 1, &fnNsPublics, "[ns]", "Returns ns-interns of the namespace the symbol ns names without the\n  Vars marked :private." },
+    .{ "resolve", 1, 1, &fnResolve, "[sym]", "Returns the Var sym names in the current namespace, resolved as the\n  compiler resolves a global, else nil. A host macro such as when has\n  no Var, so it resolves to nil." },
+    .{ "ns-resolve", 2, 2, &fnNsResolve, "[ns sym]", "Returns the Var sym names in the namespace the symbol ns names, as\n  resolve does, else nil; :no-such-namespace when ns names none." },
+    .{ "random-uuid", 0, 0, &fnRandomUuid, "[]", "Returns a random version-4 UUID as its canonical lowercase text: a\n  UUID is a string, and there is no #uuid literal." },
+    .{ "parse-uuid", 1, 1, &fnParseUuid, "[s]", "Returns the canonical lowercase text of the UUID the string s spells\n  in 8-4-4-4-12 hex digits of either case, else nil." },
+    .{ "indexed?", 1, 1, kindPredicate(isIndexed), .leaf, "[coll]", "Returns true if coll is a vector or a typed vector, whose nth takes\n  constant time." },
     // Collection construction + access.
-    .{ "vector", 0, null, &fnVector },
-    .{ "vec", 1, 1, &fnVec, .consumes },
-    .{ "hash-map", 0, null, &fnHashMap },
-    .{ "hash-set", 0, null, &fnHashSet },
-    .{ "set", 1, 1, &fnSet },
-    .{ "subvec", 2, 3, &fnSubvec },
-    .{ "identical?", 2, 2, &fnIdenticalQ },
-    .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc },
-    .{ "dissoc", 1, null, &fnDissoc },
-    .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet },
-    .{ "contains?", 2, 2, &fnContainsQ },
-    .{ "keys", 1, 1, &fnKeys },
-    .{ "vals", 1, 1, &fnVals },
-    .{ "conj", 0, null, &fnConjLeaf, .leaf, &fnConj },
-    .{ "frequencies", 1, 1, &fnFrequencies, .consumes },
-    .{ "group-by", 2, 2, &fnGroupBy, .consumes },
+    .{ "vector", 0, null, &fnVector, "[& args]", "Returns a vector of the args." },
+    .{ "vec", 1, 1, &fnVec, .consumes, "[coll]", "Returns a vector of the elements of coll, any seqable; nil gives []." },
+    .{ "hash-map", 0, null, &fnHashMap, "[& keyvals]", "Returns a hash map of the key-value pairs; a later duplicate key's\n  value wins. An odd number of args is :arity-mismatch." },
+    .{ "hash-set", 0, null, &fnHashSet, "[& keys]", "Returns a hash set of the keys." },
+    .{ "set", 1, 1, &fnSet, "[coll]", "Returns a hash set of the elements of coll, any seqable; a set\n  comes back itself, without its metadata." },
+    .{ "subvec", 2, 3, &fnSubvec, "[v start] [v start end]", "Returns a vector of the elements of v from start (inclusive) to end\n  (exclusive, the count by default); bounds outside 0..count, or\n  start past end, are :index-out-of-bounds." },
+    .{ "identical?", 2, 2, &fnIdenticalQ, "[x y]", "Returns true if x and y are the same value bit for bit: the same\n  immediate (a fixnum, float, char, keyword, ...) or the same heap\n  object." },
+    .{ "assoc", 3, null, &fnAssocLeaf, .leaf, &fnAssoc, "[map key val] [map key val & kvs]", "Returns map with each key mapped to its val. Of a vector, key is an\n  index up to the count (the count appends); nil makes a map." },
+    .{ "dissoc", 1, null, &fnDissoc, "[map] [map key] [map key & ks]", "Returns map, a map or record, without the keys; nil gives nil." },
+    .{ "get", 2, 3, &fnGetLeaf, .leaf, &fnGet, "[map key] [map key not-found]", "Returns the value mapped to key in map, else not-found (nil). A\n  vector or string takes an index; a value that is no collection has\n  no entries, so get never throws for the kind of map." },
+    .{ "contains?", 2, 2, &fnContainsQ, "[coll key]", "Returns true if key is present in coll: a key of a map or record, a\n  member of a set, an index of a vector or string. It does not search\n  values; a list is :kind-mismatch." },
+    .{ "keys", 1, 1, &fnKeys, "[map]", "Returns the keys of map (a map or record) as a list, nil when it\n  has none." },
+    .{ "vals", 1, 1, &fnVals, "[map]", "Returns the values of map (a map or record) as a list, nil when it\n  has none." },
+    .{ "conj", 0, null, &fnConjLeaf, .leaf, &fnConj, "[] [coll] [coll x] [coll x & xs]", "Returns coll with the xs added where its kind adds: a list at the\n  front, a vector at the end, a map [k v] vectors or maps, a set\n  members. nil makes a list; (conj) is []." },
+    .{ "frequencies", 1, 1, &fnFrequencies, .consumes, "[coll]", "Returns a map from each distinct element of coll to the number of\n  times it occurs." },
+    .{ "group-by", 2, 2, &fnGroupBy, .consumes, "[f coll]", "Returns a map from each (f x) to the vector of the elements x of\n  coll that gave it, in their order." },
     // Transients (docs/TRANSIENT.md): each `!` edits the nodes the
     // transient owns in place and returns the transient to use.
-    .{ "transient", 1, 1, &fnTransient },
-    .{ "persistent!", 1, 1, &fnPersistentBang },
-    .{ "conj!", 0, null, &fnConjBang },
-    .{ "assoc!", 3, null, &fnAssocBangLeaf, .leaf, &fnAssocBang },
-    .{ "dissoc!", 2, null, &fnDissocBang },
-    .{ "disj!", 2, null, &fnDisjBang },
-    .{ "pop!", 1, 1, &fnPopBang },
+    .{ "transient", 1, 1, &fnTransient, "[coll]", "Returns a transient of the hash map, hash set or vector coll, which\n  the ! functions edit in place; coll is unchanged. A sorted\n  collection has no transient (:kind-mismatch)." },
+    .{ "persistent!", 1, 1, &fnPersistentBang, "[coll]", "Returns the persistent collection of the transient coll and freezes\n  coll: any later use is :transient-used-after-persistent." },
+    .{ "conj!", 0, null, &fnConjBang, "[] [coll] [coll x] [coll x & xs]", "Adds the xs to the transient coll in place, as conj adds them, and\n  returns coll. (conj!) is a new transient vector." },
+    .{ "assoc!", 3, null, &fnAssocBangLeaf, .leaf, &fnAssocBang, "[coll key val] [coll key val & kvs]", "Puts each key and val into the transient map or vector coll in\n  place (a vector index may be the count, which appends); returns\n  coll." },
+    .{ "dissoc!", 2, null, &fnDissocBang, "[map key] [map key & ks]", "Removes the keys from the transient map in place; returns map." },
+    .{ "disj!", 2, null, &fnDisjBang, "[set key] [set key & ks]", "Removes the keys from the transient set in place; returns set." },
+    .{ "pop!", 1, 1, &fnPopBang, "[coll]", "Removes the last element of the transient vector coll in place and\n  returns coll; an empty one is :index-out-of-bounds." },
     // Sorted collections (docs/SORTED.md).
-    .{ "sorted-map", 0, null, &fnSortedMap },
-    .{ "sorted-map-by", 1, null, &fnSortedMapBy },
-    .{ "sorted-set", 0, null, &fnSortedSet },
-    .{ "sorted-set-by", 1, null, &fnSortedSetBy },
-    .{ "sorted?", 1, 1, kindPredicate(sorted_mod.isSortedKind), .leaf },
-    .{ "reversible?", 1, 1, kindPredicate(isReversible), .leaf },
-    .{ "subseq", 3, 5, &fnSubseq },
-    .{ "rsubseq", 3, 5, &fnRsubseq },
-    .{ "rseq", 1, 1, &fnRseq },
+    .{ "sorted-map", 0, null, &fnSortedMap, "[& keyvals]", "Returns a sorted map of the key-value pairs, ordered by compare. A\n  later equal key replaces the value and keeps the first key." },
+    .{ "sorted-map-by", 1, null, &fnSortedMapBy, "[comparator & keyvals]", "Returns a sorted map of the key-value pairs ordered by comparator,\n  as sorted-set-by orders its keys." },
+    .{ "sorted-set", 0, null, &fnSortedSet, "[& keys]", "Returns a sorted set of the keys, ordered by compare." },
+    .{ "sorted-set-by", 1, null, &fnSortedSetBy, "[comparator & keys]", "Returns a sorted set of the keys ordered by comparator: a function\n  returning a negative, zero or positive number, or a predicate such\n  as <. Keys it calls equal are one key." },
+    .{ "sorted?", 1, 1, kindPredicate(sorted_mod.isSortedKind), .leaf, "[coll]", "Returns true if coll is a sorted map or a sorted set." },
+    .{ "reversible?", 1, 1, kindPredicate(isReversible), .leaf, "[coll]", "Returns true if rseq takes coll: a vector, sorted map or sorted set." },
+    .{ "subseq", 3, 5, &fnSubseq, "[sc test key] [sc start-test start-key end-test end-key]", "Returns the entries of the sorted collection sc whose keys pass the\n  tests (< <= > or >=, against key), ascending, as a list, nil when\n  none. A sorted map's entries are [k v] vectors." },
+    .{ "rsubseq", 3, 5, &fnRsubseq, "[sc test key] [sc start-test start-key end-test end-key]", "Returns the entries of the sorted collection sc whose keys pass the\n  tests (< <= > or >=, against key), descending, as a list, nil when\n  none. A sorted map's entries are [k v] vectors." },
+    .{ "rseq", 1, 1, &fnRseq, "[rev]", "Returns the elements of the vector or sorted collection rev, last\n  first, nil when it is empty; anything else is :kind-mismatch." },
     // Typed vectors (docs/TYPED_VECTOR.md §7.1).
-    .{ "i64-vector", 1, 1, &fnI64Vector, .consumes },
-    .{ "f64-vector", 1, 1, &fnF64Vector, .consumes },
-    .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector), .leaf },
-    .{ "typed-vector-type", 1, 1, &fnTypedVectorType },
+    .{ "i64-vector", 1, 1, &fnI64Vector, .consumes, "[coll]", "Returns an i64 typed vector of the integers in coll, any seqable; a\n  non-integer, or one beyond 64 bits, is :kind-mismatch." },
+    .{ "f64-vector", 1, 1, &fnF64Vector, .consumes, "[coll]", "Returns an f64 typed vector of the numbers in coll, any seqable;\n  an integer widens to the nearest double." },
+    .{ "typed-vector?", 1, 1, kindPredicate(isTypedVector), .leaf, "[x]", "Returns true if x is a typed vector, i64 or f64. A typed vector is\n  not vector?, coll? or sequential?, and is not callable." },
+    .{ "typed-vector-type", 1, 1, &fnTypedVectorType, "[tv]", "Returns :i64 or :f64, the element type of the typed vector tv." },
     // Atoms: identity-valued in-memory mutable cells (docs/ATOM.md).
     // `deref` is `fnDbDeref`, which takes a var, atom, durable ref
     // or reduced; `db_natives` installs it again as `db/deref`.
-    .{ "deref", 1, 1, &fnDbDeref },
-    .{ "atom", 1, null, &fnAtom },
-    .{ "atom?", 1, 1, &fnAtomQ },
-    .{ "reset!", 2, 2, &fnResetBang },
-    .{ "swap!", 2, null, &fnSwapBang },
-    .{ "swap-vals!", 2, null, &fnSwapValsBang },
-    .{ "compare-and-set!", 3, 3, &fnCompareAndSetBang },
-    .{ "set-validator!", 2, 2, &fnSetValidator },
-    .{ "get-validator", 1, 1, &fnGetValidator },
-    .{ "add-watch", 3, 3, &fnAddWatch },
-    .{ "remove-watch", 2, 2, &fnRemoveWatch },
+    .{ "deref", 1, 1, &fnDbDeref, "[ref]", "Returns the value of ref: an atom's, a Var's, a delay's (forcing\n  it), a reduced's, or a durable ref's stored value (nil when absent).\n  Anything else is :not-derefable. @x reads as (deref x)." },
+    .{ "atom", 1, null, &fnAtom, "[x] [x & options]", "Returns an atom holding x. The options are :meta m, its metadata,\n  and :validator f, which every new value, x included, must satisfy\n  (else :invalid-reference-state)." },
+    .{ "atom?", 1, 1, &fnAtomQ, "[x]", "Returns true if x is an atom." },
+    .{ "reset!", 2, 2, &fnResetBang, "[atom newval]", "Sets the value of atom to newval once the validator accepts it,\n  runs the watches and returns newval." },
+    .{ "swap!", 2, null, &fnSwapBang, "[atom f] [atom f x] [atom f x y] [atom f x y & args]", "Sets the value of atom to (apply f old-value args) and returns it.\n  f runs once, with no retry: changing atom from inside f is\n  :atom-re-entry, and a throw leaves atom unchanged." },
+    .{ "swap-vals!", 2, null, &fnSwapValsBang, "[atom f] [atom f x] [atom f x y] [atom f x y & args]", "Swaps as swap! does and returns [old new]." },
+    .{ "compare-and-set!", 3, 3, &fnCompareAndSetBang, "[atom oldval newval]", "Sets atom to newval and returns true if its value is identical? to\n  oldval (not merely =); else returns false." },
+    .{ "set-validator!", 2, 2, &fnSetValidator, "[iref validator-fn]", "Sets the validator of the atom iref once its current value passes\n  (else :invalid-reference-state); nil removes it. Returns nil." },
+    .{ "get-validator", 1, 1, &fnGetValidator, "[iref]", "Returns the validator of the atom iref, or nil." },
+    .{ "add-watch", 3, 3, &fnAddWatch, "[reference key fn]", "Adds fn as a watch of the atom reference under key, replacing one\n  under an = key; (fn key reference old new) runs after every write.\n  Returns reference." },
+    .{ "remove-watch", 2, 2, &fnRemoveWatch, "[reference key]", "Removes the watch under key from the atom reference; returns\n  reference." },
     // satisfies? predicate.
-    .{ "satisfies?", 2, 2, &fnSatisfiesQ },
+    .{ "satisfies?", 2, 2, &fnSatisfiesQ, "[protocol x]", "Returns true if a method of protocol is extended to the type of x\n  or has a default; a protocol of no methods satisfies nothing." },
     // Core string ops. Indexing semantics are by Unicode scalar
     // (codepoint), NOT byte; see `docs/STDLIB.md` §2.
-    .{ "str", 0, null, &fnStrLeaf, .leaf, &fnStr },
-    .{ "string?", 1, 1, &fnStringQ },
-    .{ "subs", 2, 3, &fnSubs },
+    .{ "str", 0, null, &fnStrLeaf, .leaf, &fnStr, "[] [x] [x & ys]", "Returns the text of the args concatenated: nil is empty, a string\n  or char is itself, anything else as pr-str prints it, so a string\n  inside a collection keeps its quotes." },
+    .{ "string?", 1, 1, &fnStringQ, "[x]", "Returns true if x is a string." },
+    .{ "subs", 2, 3, &fnSubs, "[s start] [s start end]", "Returns the substring of s from start (inclusive) to end (exclusive,\n  the count by default), indexed by code point; bounds outside the\n  string, or start past end, are :index-out-of-bounds." },
     // Regular expressions (docs/REGEX.md §9); `re-seq` is core.nx's.
-    .{ "re-pattern", 1, 1, &fnRePattern },
-    .{ "re-matcher", 2, 2, &fnReMatcher },
-    .{ "re-find", 1, 2, &fnReFind },
-    .{ "re-matches", 2, 2, &fnReMatches },
-    .{ "re-groups", 1, 1, &fnReGroups },
+    .{ "re-pattern", 1, 1, &fnRePattern, "[s]", "Returns the pattern the string s compiles to; a pattern is itself.\n  Java's syntax without backreferences or lookaround, matched in\n  linear time; an invalid one throws :invalid-regex." },
+    .{ "re-matcher", 2, 2, &fnReMatcher, "[re s]", "Returns a fresh matcher of the pattern re over the string s, for\n  re-find and re-groups." },
+    .{ "re-find", 1, 2, &fnReFind, "[m] [re s]", "Returns the next match of the matcher m, or the first match of re\n  in s; nil when there is none. A match is the matched string, or\n  [whole g1 g2 ...] when the pattern has groups." },
+    .{ "re-matches", 2, 2, &fnReMatches, "[re s]", "Returns the match of re against the whole of s, or nil. A match is\n  the string, or [whole g1 g2 ...] when re has groups." },
+    .{ "re-groups", 1, 1, &fnReGroups, "[m]", "Returns the last match of the matcher m; :invalid-argument when its\n  last search failed or it has not searched." },
     // Printing + I/O.
-    .{ "print", 0, null, &fnPrint },
-    .{ "println", 0, null, &fnPrintln },
-    .{ "pr", 0, null, &fnPr },
-    .{ "prn", 0, null, &fnPrn },
-    .{ "pr-str", 0, null, &fnPrStr },
-    .{ "bound?", 1, null, &fnBoundQ },
-    .{ "nano-time", 0, 0, &fnNanoTime },
-    .{ "slurp", 1, 1, &fnSlurp },
-    .{ "spit", 2, null, &fnSpit },
-    .{ "read-line", 0, 0, &fnReadLine },
-    .{ "exit", 0, 1, &fnExit },
+    .{ "print", 0, null, &fnPrint, "[& more]", "Prints the args separated by spaces, for people: a string or char\n  as its text. Returns nil." },
+    .{ "println", 0, null, &fnPrintln, "[& more]", "Prints as print does, then a newline. Returns nil." },
+    .{ "pr", 0, null, &fnPr, "[] [x] [x & more]", "Prints the args separated by spaces, readably: strings quoted, chars\n  as literals. Returns nil." },
+    .{ "prn", 0, null, &fnPrn, "[& more]", "Prints as pr does, then a newline. Returns nil." },
+    .{ "pr-str", 0, null, &fnPrStr, "[& xs]", "Returns the text pr prints of the xs, as a string." },
+    .{ "bound?", 1, null, &fnBoundQ, "[v & vars]", "Returns true if every Var given has a root value; a binding in\n  force does not count." },
+    .{ "nano-time", 0, 0, &fnNanoTime, "[]", "Returns a monotonic clock reading in nanoseconds, for measuring\n  intervals; it is no time of day." },
+    .{ "slurp", 1, 1, &fnSlurp, "[f]", "Returns the whole text of the file at the path f, which must be\n  UTF-8; a missing file is :file-not-found." },
+    .{ "spit", 2, null, &fnSpit, "[f content & options]", "Writes (str content) to the file at the path f, replacing it, or\n  after its end with :append true; returns nil. Parent directories\n  are not created." },
+    .{ "read-line", 0, 0, &fnReadLine, "[]", "Returns the next line of stdin without its line ending, nil at end\n  of input." },
+    .{ "exit", 0, 1, &fnExit, "[] [status]", "Closes every open store and Nextomic connection, syncing what a\n  commit left unsynced, and ends the process with status (0 by\n  default; its low eight bits). Nothing after it runs, finally blocks\n  included." },
     // The durable-ref natives are `db_natives`, in the `db`
     // namespace, so they are called as `(db/open ...)`.
 };
@@ -525,86 +526,86 @@ const core_docs = docs(core_rows);
 
 const db_rows = .{
     // Connection + ref + auto-ephemeral primitives.
-    .{ "open", 1, 2, &fnDbOpen },
-    .{ "close", 1, 1, &fnDbClose },
-    .{ "sync", 1, 1, &fnDbSync },
-    .{ "ref", 3, 3, &fnDbRef },
-    .{ "ref?", 1, 1, &fnDbRefQ },
-    .{ "put-key!", 2, 2, &fnDbPutKey },
-    .{ "get-key", 1, 2, &fnDbGetKey },
-    .{ "delete-key!", 1, 1, &fnDbDeleteKey },
-    .{ "present?", 1, 1, &fnDbPresentQ },
+    .{ "open", 1, 2, &fnDbOpen, "[path] [path opts]", "Returns a connection to the emdb store at path, creating the file and\n  its parent directories; a file the process may only read opens\n  read-only. opts takes :durability, :commit or :durable. An empty\n  path or one with a NUL byte is :invalid-path." },
+    .{ "close", 1, 1, &fnDbClose, "[conn]", "Closes conn: aborts its open transactions and syncs the file when a\n  commit left it unsynced. Returns nil; closing twice is nil. Any later\n  use of conn or of a ref through it is :db-closed." },
+    .{ "sync", 1, 1, &fnDbSync, "[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened." },
+    .{ "ref", 3, 3, &fnDbRef, "[conn tree key]", "Returns the durable ref naming key in tree of conn's store. tree is a\n  keyword, :a/b naming the tree a/b; key is a keyword, symbol or\n  string, equal by name, so :k, 'k and \"k\" name one key." },
+    .{ "ref?", 1, 1, &fnDbRefQ, "[x]", "Returns true if x is a durable ref." },
+    .{ "put-key!", 2, 2, &fnDbPutKey, "[ref v]", "Stores v at ref in one write transaction, committed as the\n  connection's durability says; returns nil." },
+    .{ "get-key", 1, 2, &fnDbGetKey, "[ref] [ref default]", "Returns the value stored at ref, or default (nil) when there is none,\n  in one read transaction." },
+    .{ "delete-key!", 1, 1, &fnDbDeleteKey, "[ref]", "Deletes ref's key in one write transaction; returns true if it\n  existed." },
+    .{ "present?", 1, 1, &fnDbPresentQ, "[ref]", "Returns true if ref's key exists. The value is not read, so one whose\n  bytes do not decode is present." },
     // Explicit-tx primitives.
-    .{ "begin-write", 1, 1, &fnDbBeginWrite },
-    .{ "begin-read", 1, 1, &fnDbBeginRead },
-    .{ "commit!", 1, 1, &fnDbCommit },
-    .{ "abort-write!", 1, 1, &fnDbAbortWrite },
-    .{ "abort-read!", 1, 1, &fnDbAbortRead },
-    .{ "put!", 3, 3, &fnDbPut },
-    .{ "get", 2, 3, &fnDbGet },
-    .{ "delete!", 2, 2, &fnDbDelete },
+    .{ "begin-write", 1, 1, &fnDbBeginWrite, "[conn]", "Begins and returns a write transaction on conn; finish it with\n  commit! or abort-write!, or use with-tx. :db/busy while any\n  connection or Nextomic store of the same file holds one." },
+    .{ "begin-read", 1, 1, &fnDbBeginRead, "[conn]", "Begins and returns a read transaction on conn, which sees the store\n  as it is now and nothing committed after; finish it with abort-read!,\n  or use with-read-tx. :db/readers-full when every reader slot is taken." },
+    .{ "commit!", 1, 1, &fnDbCommit, "[tx]", "Commits the write transaction tx; returns nil. tx is over even when\n  the commit fails, and any later use of it is :tx-closed." },
+    .{ "abort-write!", 1, 1, &fnDbAbortWrite, "[tx]", "Aborts the write transaction tx, discarding its writes; returns nil,\n  for a finished tx too." },
+    .{ "abort-read!", 1, 1, &fnDbAbortRead, "[tx]", "Ends the read transaction tx; returns nil, for a finished tx too." },
+    .{ "put!", 3, 3, &fnDbPut, "[tx ref v]", "Stores v at ref within the write transaction tx; returns nil. A read\n  transaction is :kind-mismatch." },
+    .{ "get", 2, 3, &fnDbGet, "[tx ref] [tx ref default]", "Returns the value at ref as the transaction tx sees it, its own\n  writes included, or default (nil) when there is none." },
+    .{ "delete!", 2, 2, &fnDbDelete, "[tx ref]", "Deletes ref's key within the write transaction tx; returns true if\n  it existed." },
     // Deref + alter.
-    .{ "deref", 1, 1, &fnDbDeref },
-    .{ "alter!", 3, null, &fnDbAlter },
+    .{ "deref", 1, 1, &fnDbDeref, "[ref]", "Returns the value of ref: a durable ref's stored value or nil, read\n  in one read transaction, or what deref returns for a Var, atom,\n  delay or reduced. Another kind is :not-derefable." },
+    .{ "alter!", 3, null, &fnDbAlter, "[tx ref f & args]", "Stores and returns (apply f current args) at ref within the write\n  transaction tx, current being the stored value or nil. When f\n  throws, nothing is written." },
     // Tree traversal.
-    .{ "scan", 2, 4, &fnDbScan },
-    .{ "reduce-tree", 4, 4, &fnDbReduceTree },
+    .{ "scan", 2, 4, &fnDbScan, "[tx tree] [tx tree start] [tx tree start end]", "Returns a vector of [key value] for the entries of tree in key-byte\n  order, each key a string of its bytes, which ref takes back. start\n  is inclusive and end exclusive, each a keyword, symbol or string as\n  a ref's key is. An absent tree is []." },
+    .{ "reduce-tree", 4, 4, &fnDbReduceTree, "[tx tree f init]", "Returns the reduction of (f acc key value) over the entries of tree\n  in key order from init, each key a string as scan gives it, the tree\n  as it was when the walk began; init for an absent tree." },
     // Snapshot aliases (DB.md §12).
-    .{ "snapshot", 1, 1, &fnDbBeginRead },
-    .{ "release-snapshot!", 1, 1, &fnDbAbortRead },
-    .{ "snapshot?", 1, 1, &fnDbSnapshotQ },
+    .{ "snapshot", 1, 1, &fnDbBeginRead, "[conn]", "Begins and returns a read transaction on conn, as begin-read does.\n  It keeps the pages it sees from being reclaimed, so release it with\n  release-snapshot!, or use with-snapshot." },
+    .{ "release-snapshot!", 1, 1, &fnDbAbortRead, "[snap]", "Releases the snapshot snap, as abort-read! does; returns nil." },
+    .{ "snapshot?", 1, 1, &fnDbSnapshotQ, "[x]", "Returns true if x is a read transaction not yet released." },
 };
 const db_natives = table("db", db_rows);
 const db_docs = docs(db_rows);
 
 const string_rows = .{
-    .{ "lower-case", 1, 1, &fnStringLowerCase },
-    .{ "upper-case", 1, 1, &fnStringUpperCase },
-    .{ "trim", 1, 1, &fnStringTrim },
-    .{ "split", 2, 3, &fnStringSplit },
-    .{ "triml", 1, 1, &fnStringTriml },
-    .{ "trimr", 1, 1, &fnStringTrimr },
-    .{ "trim-newline", 1, 1, &fnStringTrimNewline },
-    .{ "blank?", 1, 1, &fnStringBlankQ },
-    .{ "starts-with?", 2, 2, &fnStringStartsWithQ },
-    .{ "ends-with?", 2, 2, &fnStringEndsWithQ },
-    .{ "includes?", 2, 2, &fnStringIncludesQ },
-    .{ "index-of", 2, 3, &fnStringIndexOf },
-    .{ "last-index-of", 2, 3, &fnStringLastIndexOf },
-    .{ "join", 1, 2, &fnStringJoin, .consumes },
-    .{ "replace", 3, 3, &fnStringReplace },
-    .{ "replace-first", 3, 3, &fnStringReplaceFirst },
-    .{ "re-quote-replacement", 1, 1, &fnStringReQuoteReplacement },
+    .{ "lower-case", 1, 1, &fnStringLowerCase, "[s]", "Returns s with its ASCII letters lower-case; every other character,\n  a multibyte one included, is unchanged." },
+    .{ "upper-case", 1, 1, &fnStringUpperCase, "[s]", "Returns s with its ASCII letters upper-case; every other character,\n  a multibyte one included, is unchanged: (upper-case \"héllo\") is\n  \"HéLLO\"." },
+    .{ "trim", 1, 1, &fnStringTrim, "[s]", "Returns s without whitespace at either end, whitespace as Java's\n  Character/isWhitespace reads it (U+00A0, the no-break space, stays)." },
+    .{ "split", 2, 3, &fnStringSplit, "[s re] [s re limit]", "Returns a vector of the pieces of s between the matches of re, a\n  pattern or a literal string, with trailing empty pieces dropped. A\n  positive limit splits at most limit - 1 times; a negative one keeps\n  the trailing empty pieces." },
+    .{ "triml", 1, 1, &fnStringTriml, "[s]", "Returns s without whitespace at its start, whitespace as trim reads\n  it." },
+    .{ "trimr", 1, 1, &fnStringTrimr, "[s]", "Returns s without whitespace at its end, whitespace as trim reads it." },
+    .{ "trim-newline", 1, 1, &fnStringTrimNewline, "[s]", "Returns s without every \\n and \\r at its end." },
+    .{ "blank?", 1, 1, &fnStringBlankQ, "[s]", "Returns true if s is nil, empty, or only whitespace as trim reads it." },
+    .{ "starts-with?", 2, 2, &fnStringStartsWithQ, "[s substr]", "Returns true if s starts with substr." },
+    .{ "ends-with?", 2, 2, &fnStringEndsWithQ, "[s substr]", "Returns true if s ends with substr." },
+    .{ "includes?", 2, 2, &fnStringIncludesQ, "[s substr]", "Returns true if s contains substr." },
+    .{ "index-of", 2, 3, &fnStringIndexOf, "[s value] [s value from-index]", "Returns the code-point index of the first occurrence of value, a\n  string or char, in s at or after from-index (clamped to the string),\n  or nil when there is none." },
+    .{ "last-index-of", 2, 3, &fnStringLastIndexOf, "[s value] [s value from-index]", "Returns the code-point index of the last occurrence of value, a\n  string or char, in s starting at or before from-index (default the\n  count), or nil when there is none." },
+    .{ "join", 1, 2, &fnStringJoin, .consumes, "[coll] [separator coll]", "Returns a string of the elements of coll, each as str makes it (nil\n  as \"\"), separated by separator when given: (join \", \" [\"a\" nil 1])\n  is \"a, , 1\"." },
+    .{ "replace", 3, 3, &fnStringReplace, "[s match replacement]", "Returns s with every non-overlapping match replaced, left to right.\n  match and replacement are both strings or both chars, taken\n  literally; or match is a pattern and replacement a string, in which\n  $1 and ${name} name groups, or a function of each match returning a\n  string." },
+    .{ "replace-first", 3, 3, &fnStringReplaceFirst, "[s match replacement]", "Returns s with the first match replaced, or s itself when there is\n  none. A pattern match takes what replace takes; a string or char\n  match is found as it is, and replacement is a string or char." },
+    .{ "re-quote-replacement", 1, 1, &fnStringReQuoteReplacement, "[replacement]", "Returns replacement with a backslash before each \\ and $, so a\n  pattern replace inserts it literally." },
 };
 const string_natives = table("nexis.string", string_rows);
 const string_docs = docs(string_rows);
 
 const math_rows = .{
-    .{ "sqrt", 1, 1, &fnMathSqrt },
-    .{ "pow", 2, 2, &fnMathPow },
-    .{ "floor", 1, 1, &fnMathFloor },
-    .{ "ceil", 1, 1, &fnMathCeil },
-    .{ "round", 1, 1, &fnMathRound },
-    .{ "sin", 1, 1, mathOf1(builtinSin) },
-    .{ "cos", 1, 1, mathOf1(builtinCos) },
-    .{ "tan", 1, 1, mathOf1(builtinTan) },
-    .{ "asin", 1, 1, mathOf1(std.math.asin) },
-    .{ "acos", 1, 1, mathOf1(std.math.acos) },
-    .{ "atan", 1, 1, mathOf1(std.math.atan) },
-    .{ "atan2", 2, 2, mathOf2(std.math.atan2) },
-    .{ "sinh", 1, 1, mathOf1(std.math.sinh) },
-    .{ "cosh", 1, 1, mathOf1(std.math.cosh) },
-    .{ "tanh", 1, 1, mathOf1(std.math.tanh) },
-    .{ "exp", 1, 1, mathOf1(builtinExp) },
-    .{ "expm1", 1, 1, mathOf1(std.math.expm1) },
-    .{ "log", 1, 1, mathOf1(builtinLog) },
-    .{ "log10", 1, 1, mathOf1(builtinLog10) },
-    .{ "log1p", 1, 1, mathOf1(std.math.log1p) },
-    .{ "cbrt", 1, 1, mathOf1(std.math.cbrt) },
-    .{ "hypot", 2, 2, mathOf2(std.math.hypot) },
-    .{ "signum", 1, 1, mathOf1(signum) },
-    .{ "to-radians", 1, 1, mathOf1(toRadians) },
-    .{ "to-degrees", 1, 1, mathOf1(toDegrees) },
+    .{ "sqrt", 1, 1, &fnMathSqrt, "[a]", "Returns the positive square root of a as a double: (sqrt 16) is 4.0;\n  NaN for a negative a." },
+    .{ "pow", 2, 2, &fnMathPow, "[a b]", "Returns a raised to the power b as a double, as Java's Math/pow:\n  (pow 2 10) is 1024.0." },
+    .{ "floor", 1, 1, &fnMathFloor, "[a]", "Returns the largest integer value not above a: an integer unchanged,\n  a float's floor as a float, (floor 2.7) being 2.0." },
+    .{ "ceil", 1, 1, &fnMathCeil, "[a]", "Returns the smallest integer value not below a: an integer unchanged,\n  a float's ceiling as a float, (ceil 2.1) being 3.0." },
+    .{ "round", 1, 1, &fnMathRound, "[a]", "Returns the integer closest to a, halves rounding up, as Java's\n  Math/round: an integer unchanged, (round -2.5) being -2. NaN is 0; a\n  float past the long range is the long range's nearest end." },
+    .{ "sin", 1, 1, mathOf1(builtinSin), "[a]", "Returns the sine of the angle a, in radians, as a double." },
+    .{ "cos", 1, 1, mathOf1(builtinCos), "[a]", "Returns the cosine of the angle a, in radians, as a double." },
+    .{ "tan", 1, 1, mathOf1(builtinTan), "[a]", "Returns the tangent of the angle a, in radians, as a double." },
+    .{ "asin", 1, 1, mathOf1(std.math.asin), "[a]", "Returns the arc sine of a, in radians from -pi/2 to pi/2, as a\n  double; NaN when a is outside [-1, 1]." },
+    .{ "acos", 1, 1, mathOf1(std.math.acos), "[a]", "Returns the arc cosine of a, in radians from 0 to pi, as a double;\n  NaN when a is outside [-1, 1]." },
+    .{ "atan", 1, 1, mathOf1(std.math.atan), "[a]", "Returns the arc tangent of a, in radians from -pi/2 to pi/2, as a\n  double." },
+    .{ "atan2", 2, 2, mathOf2(std.math.atan2), "[y x]", "Returns the angle, in radians from -pi to pi, of the point (x, y)\n  from the positive x axis, as a double." },
+    .{ "sinh", 1, 1, mathOf1(std.math.sinh), "[x]", "Returns the hyperbolic sine of x as a double." },
+    .{ "cosh", 1, 1, mathOf1(std.math.cosh), "[x]", "Returns the hyperbolic cosine of x as a double." },
+    .{ "tanh", 1, 1, mathOf1(std.math.tanh), "[x]", "Returns the hyperbolic tangent of x as a double." },
+    .{ "exp", 1, 1, mathOf1(builtinExp), "[a]", "Returns e raised to the power a, as a double." },
+    .{ "expm1", 1, 1, mathOf1(std.math.expm1), "[x]", "Returns e raised to the power x, minus 1, as a double, accurate for\n  x near zero." },
+    .{ "log", 1, 1, mathOf1(builtinLog), "[a]", "Returns the natural logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
+    .{ "log10", 1, 1, mathOf1(builtinLog10), "[a]", "Returns the base-10 logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
+    .{ "log1p", 1, 1, mathOf1(std.math.log1p), "[x]", "Returns the natural logarithm of 1 + x as a double, accurate for x\n  near zero." },
+    .{ "cbrt", 1, 1, mathOf1(std.math.cbrt), "[a]", "Returns the cube root of a as a double." },
+    .{ "hypot", 2, 2, mathOf2(std.math.hypot), "[x y]", "Returns the square root of x squared plus y squared as a double,\n  without intermediate overflow or underflow; ##Inf when either is\n  infinite, even if the other is NaN." },
+    .{ "signum", 1, 1, mathOf1(signum), "[d]", "Returns -1.0 or 1.0 by the sign of d, or d itself as a double when\n  it is a zero or NaN." },
+    .{ "to-radians", 1, 1, mathOf1(toRadians), "[deg]", "Returns the angle deg, in degrees, in radians, as a double." },
+    .{ "to-degrees", 1, 1, mathOf1(toDegrees), "[r]", "Returns the angle r, in radians, in degrees, as a double:\n  (to-degrees PI) is 180.0." },
 };
 const math_natives = table("nexis.math", math_rows);
 const math_docs = docs(math_rows);
@@ -655,10 +656,10 @@ const internal_rows = .{
 const internal_natives = table("nexis.internal", internal_rows);
 
 const simd_rows = .{
-    .{ "sum", 1, 1, &fnSimdSum },
-    .{ "dot", 2, 2, &fnSimdDot },
-    .{ "scale", 2, 2, &fnSimdScale },
-    .{ "map", 2, 2, &fnSimdMap },
+    .{ "sum", 1, 1, &fnSimdSum, "[xs]", "Returns the sum of the typed vector xs: for an i64 vector the exact\n  integer, a bignum past the fixnum range; for an f64 vector a float,\n  whose low bits can differ from (reduce + xs). 0 or 0.0 when empty." },
+    .{ "dot", 2, 2, &fnSimdDot, "[xs ys]", "Returns the dot product of the typed vectors xs and ys, of the result\n  kind sum gives, exact at any size for i64. Element types that differ\n  are :kind-mismatch; lengths that differ, :invalid-argument." },
+    .{ "scale", 2, 2, &fnSimdScale, "[xs k]", "Returns a typed vector of xs's element type with every element\n  multiplied by k. For i64, k must be an integer within i64 and a\n  product outside i64 is :arithmetic-overflow; for f64, k is any number." },
+    .{ "map", 2, 2, &fnSimdMap, "[f xs]", "Returns a typed vector of xs's element type whose elements are (f x)\n  of each element x of xs; a result that does not fit the element type\n  is :kind-mismatch." },
 };
 const simd_natives = table("nexis.simd", simd_rows);
 const simd_docs = docs(simd_rows);
@@ -3423,7 +3424,11 @@ fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .var_) {
         const v = VM.asVar(x);
-        if (v.meta.isNil()) v.meta = try nativeVarMeta(vm, v);
+        if (v.meta.isNil()) {
+            v.meta = try nativeVarMeta(vm, v);
+        } else if (v.meta.kind() == .persistent_map and isLibraryNs(v.ns)) {
+            v.meta = try withPackedDoc(vm, v);
+        }
         return v.meta;
     }
     if (!carriesHeaderMeta(x.kind()) and x.kind() != .atom) return value_mod.nilValue();
@@ -3511,11 +3516,12 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
 // =============================================================================
 //
 // `doc`, `find-doc`, `apropos` and `dir` (core.nx) read a Var's
-// `:doc` and `:arglists`. A `defn` or `defmacro` in the embedded
-// sources carries them in the image; a native's live in its table row
-// (`Doc`) and reach its Var's metadata when `meta` first asks
-// (`nativeVarMeta`), so they cost the image and the boot nothing. The
-// special forms, the host macros and the namespaces have no Var
+// `:doc` and `:arglists`. A native's live in its table row (`Doc`) and
+// reach its Var's metadata when `meta` first asks (`nativeVarMeta`), so
+// they cost the image and the boot nothing. The embedded sources'
+// docstrings travel in the image packed into one string (`packDocs`)
+// and go back into a Var's metadata the same way (`withPackedDoc`).
+// The special forms, the host macros and the namespaces have no Var
 // metadata to carry them: `special_docs` and `namespace_docs` hold
 // theirs.
 
@@ -3562,6 +3568,69 @@ fn nativeVarMeta(vm: *VM, v: *vm_mod.Var) VmError!Value {
         .{ "name", vm.ensureInterner().internSymbolValue(v.name) catch return VmError.OutOfMemory },
         .{ "ns", vm.ensureInterner().internSymbolValue(v.ns) catch return VmError.OutOfMemory },
     });
+}
+
+/// Move the docstring of every Var the embedded sources defined out of
+/// its metadata into one string, the root of `nexis.internal/#%docs`,
+/// once they have booted: `ns/name`, a NUL, the docstring, a NUL, for
+/// each. The image then loads one string where it would load a string
+/// and a map entry per Var, and `meta` puts a Var's docstring back the
+/// first time it asks (`withPackedDoc`).
+fn packDocs(vm: *VM) !void {
+    const gpa = vm.allocator;
+    const registry = try vm.ensureRegistry();
+    const heap = vm.ensureHeap();
+    const doc_key = try vm.ensureInterner().internKeywordValue("doc");
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    for (&embedded) |*e| {
+        const ns = registry.lookupNs(e.ns) orelse continue;
+        var it = ns.vars.iterator();
+        while (it.next()) |entry| {
+            const v = entry.value_ptr.*;
+            if (entry.key_ptr.*.ptr != v.name.ptr or v.meta.kind() != .persistent_map) continue;
+            const doc = switch (champ_mod.mapGet(v.meta, doc_key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+                .present => |d| d,
+                .absent => continue,
+            };
+            if (doc.kind() != .string) continue;
+            try text.print(gpa, "{s}/{s}\x00{s}\x00", .{ v.ns, v.name, string_mod.asBytes(doc) });
+            v.meta = try champ_mod.mapDissoc(heap, v.meta, doc_key, &dispatch_mod.hashValue, &dispatch_mod.equal);
+        }
+    }
+    const docs_var = try (registry.lookupNs("nexis.internal") orelse return error.MissingNamespace).intern("#%docs");
+    docs_var.root = try string_mod.fromBytes(heap, text.items);
+    docs_var.bound = true;
+}
+
+/// Whether `name` is one of the namespaces the embedded sources define
+/// into, whose Vars' docstrings `packDocs` packs.
+fn isLibraryNs(name: []const u8) bool {
+    for (&embedded) |*e| if (std.mem.eql(u8, e.ns, name)) return true;
+    return false;
+}
+
+/// `v`'s metadata map with the docstring `packDocs` packed for it, when
+/// it has none and one was packed; the map itself otherwise.
+fn withPackedDoc(vm: *VM, v: *vm_mod.Var) VmError!Value {
+    const doc_key = vm.ensureInterner().internKeywordValue("doc") catch return VmError.OutOfMemory;
+    if (champ_mod.mapGet(v.meta, doc_key, &dispatch_mod.hashValue, &dispatch_mod.equal) == .present) return v.meta;
+    const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
+    const internal = registry.lookupNs("nexis.internal") orelse return v.meta;
+    const docs_var = internal.lookupLocal("#%docs") orelse return v.meta;
+    if (docs_var.root.kind() != .string) return v.meta;
+    const blob = string_mod.asBytes(docs_var.root);
+    var i: usize = 0;
+    while (std.mem.findScalarPos(u8, blob, i, 0)) |key_end| {
+        const doc_end = std.mem.findScalarPos(u8, blob, key_end + 1, 0) orelse break;
+        const key = blob[i..key_end];
+        if (key.len == v.ns.len + 1 + v.name.len and std.mem.startsWith(u8, key, v.ns) and key[v.ns.len] == '/' and std.mem.endsWith(u8, key, v.name)) {
+            const doc = string_mod.fromBytes(vm.ensureHeap(), blob[key_end + 1 .. doc_end]) catch return VmError.OutOfMemory;
+            return mapPut(vm.ensureHeap(), v.meta, doc_key, doc);
+        }
+        i = doc_end + 1;
+    }
+    return v.meta;
 }
 
 /// The form `text` reads as; the text is the binary's own, so it reads.
@@ -3691,7 +3760,30 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
 
 /// The docs of Nextomic's natives (NEXTOMIC.md), by descriptor name.
 const nextomic_docs = std.StaticStringMap(Doc).initComptime(.{
-    .{ "nextomic/connect", nextomicDoc("[path] [path opts]", "TODO") },
+    .{ "nextomic/as-of", nextomicDoc("[db t]", "Returns the view of db as of the transaction t, a t or a transaction\n  entity id: what the transactions up to t asserted and did not\n  retract. Of repeated bounds the older holds. A negative t is\n  :invalid-argument.") },
+    .{ "nextomic/basis-t", nextomicDoc("[db]", "Returns the basis of the db-value db: the number t of the last\n  transaction it reads.") },
+    .{ "nextomic/connect", nextomicDoc("[path] [path opts]", "Opens the Nextomic store at path, creating it and its parent\n  directories, and returns a connection. opts takes :durability\n  (:commit or :durable) and :sync (:full, :no-meta or :none for every\n  transaction). Release it with release, or use with-conn.") },
+    .{ "nextomic/datoms", nextomicDoc("[db index] [db index c1] [db index c1 c2] [db index c1 c2 c3] [db index c1 c2 c3 tx] [db index c1 c2 c3 tx added]", "Returns a vector of the datoms [e a v t added] of db in the order of\n  index, :eavt, :aevt, :avet or :vaet, matching the components given\n  in that index's order, then tx and added; nil matches anything.\n  Another index is :invalid-argument.") },
+    .{ "nextomic/db", nextomicDoc("[conn]", "Returns the db-value of conn at its current basis, a view that later\n  transactions do not change.") },
+    .{ "nextomic/entid", nextomicDoc("[db x]", "Returns the eid x names in db: x itself for an eid, an ident's or a\n  lookup ref [attr v]'s entity, or nil when it names nothing.") },
+    .{ "nextomic/entity", nextomicDoc("[db e]", "Returns a lazy entity of e, an eid, ident or lookup ref, in db: (:attr\n  ent), get, contains? and keys read its attributes, a card-many value\n  as a set and a ref as an entity. nil when e has no datoms in db; a\n  history db is :nextomic/history-view.") },
+    .{ "nextomic/entity-db", nextomicDoc("[ent]", "Returns the db-value the entity ent reads through.") },
+    .{ "nextomic/excise!", nextomicDoc("[conn e] [conn e attr]", "Removes every datom of the entity e, or of e under attr, current and\n  history, from every view, in a transaction of its own. Returns its\n  report plus :excised [e] and :removed, the count of rows removed.") },
+    .{ "nextomic/explain", nextomicDoc("[query & inputs]", "Returns, as a string, the plan q would run for query and inputs: one\n  numbered line per step with its index, estimate and join (nested,\n  hash, fixpoint or none) and the rows estimated after it.") },
+    .{ "nextomic/history", nextomicDoc("[db]", "Returns the history view of db: every assertion and retraction up to\n  its basis, each datom with its added flag. q and datoms read it;\n  entity and pull are :nextomic/history-view.") },
+    .{ "nextomic/ident", nextomicDoc("[db x]", "Returns the ident keyword of the entity x, an eid or ident, in db, or\n  nil when it has none.") },
+    .{ "nextomic/index-range", nextomicDoc("[db attr start end]", "Returns a vector of the AVET datoms of the indexed or unique attribute\n  attr whose value v has start <= v < end, in value order; a nil bound\n  is open. Another attribute is :nextomic/tx-data.") },
+    .{ "nextomic/pull", nextomicDoc("[db pattern e]", "Returns the map pattern selects of the entity e in db, nil when e has\n  no datoms there: attributes, :ns/_name reverse refs, *, {attr\n  sub-pattern} and (attr :limit n :default v :as k), :db/id always.\n  A bad pattern is :nextomic/pull-syntax.") },
+    .{ "nextomic/pull-many", nextomicDoc("[db pattern es]", "Returns a vector of the pull of pattern for each entity of es, a\n  vector or list, in its order, in one read.") },
+    .{ "nextomic/q", nextomicDoc("[query & inputs]", "Runs the Datalog query over inputs, positional to its :in ($ when\n  absent), and returns a set of tuple vectors, or what :find asks for\n  (., [?x ...], [[...]], :keys). (q {:query query :args [inputs]}) is\n  the same call. A query refused is :nextomic/query-syntax.") },
+    .{ "nextomic/release", nextomicDoc("[conn]", "Syncs conn's file when a commit left it unsynced, then closes conn;\n  returns nil, for a released conn too. Any other later use of conn is\n  :nextomic/closed; :nextomic/busy while an operation on it is in flight.") },
+    .{ "nextomic/schema", nextomicDoc("[db]", "Returns a map of each attribute's ident to its definition as db's\n  basis saw it: :db/id, :db/ident, :db/valueType, :db/cardinality,\n  :db/index, :db/isComponent and :db/fulltext, with :db/unique and\n  :db/doc when the attribute has them.") },
+    .{ "nextomic/since", nextomicDoc("[db t]", "Returns the view of db holding only what the transactions after t, a\n  t or a transaction entity id, asserted and did not retract: an entity\n  untouched since t is invisible. Of repeated bounds the newer holds.") },
+    .{ "nextomic/sync", nextomicDoc("[conn]", "Makes every commit to conn's file durable, with one full sync when a\n  commit left it unsynced; returns nil. :db/sync-failed once a sync of\n  the file has failed, until it is reopened.") },
+    .{ "nextomic/touch", nextomicDoc("[ent]", "Returns the map {:db/id e :attr v ...} of every attribute of the\n  entity ent, read in one pass: card-many values as sets, refs as eids.") },
+    .{ "nextomic/transact!", nextomicDoc("[conn tx-data] [conn tx-data opts]", "Commits tx-data as one transaction and returns the report {:db-before\n  :db-after :tx :tempids :tx-data}. tx-data holds entity maps and\n  [:db/add e a v], [:db/retract e a v?], [:db/retractEntity e],\n  [:db.fn/call f & args] and [:db.fn/cas e a old new]. opts takes :sync.") },
+    .{ "nextomic/tx-range", nextomicDoc("[conn] [conn from] [conn from to]", "Returns a vector of the log's entries {:t t :instant ms :data [datoms]}\n  for from <= t < to, oldest first; a nil or missing bound is open. An\n  entry an excision touched carries :excised [e ...].") },
+    .{ "nextomic/with", nextomicDoc("[conn tx-data f]", "Applies tx-data without committing it: calls (f db-after report)\n  inside the held write transaction, then aborts it, and returns f's\n  value. db-after is :nextomic/closed once f returns. Unlike Datomic's,\n  it takes a connection and a function.") },
 });
 
 fn nextomicDoc(comptime arglists: []const u8, comptime doc: []const u8) Doc {
@@ -7340,6 +7432,53 @@ test "stdlib: every core native is bound in nexis.core" {
         try testing.expectEqual(Kind.native_fn, v.root.kind());
         try testing.expect(!v.macro);
     }
+}
+
+test "stdlib: a native's arglists agree with the arities its row declares" {
+    // STDLIB.md §10: each `[...]` of the text is one arity; params
+    // before `&` are fixed, a nested vector or map one param.
+    inline for (documented) |t| for (t[0], t[1]) |d, doc| {
+        try testing.expect(doc.doc.len > 0);
+        var min: ?usize = null;
+        var max: ?usize = 0;
+        var depth: usize = 0;
+        var fixed: usize = 0;
+        var variadic = false;
+        var in_token = false;
+        for (doc.arglists[1 .. doc.arglists.len - 1], 0..) |c, i| {
+            const at_param = depth == 1 and !std.ascii.isWhitespace(c) and !in_token;
+            switch (c) {
+                '[', '{' => {
+                    if (at_param and !variadic) fixed += 1;
+                    depth += 1;
+                    in_token = false;
+                },
+                ']', '}' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        min = @min(min orelse fixed, fixed);
+                        if (variadic) max = null else if (max) |m| {
+                            max = @max(m, fixed);
+                        }
+                        fixed = 0;
+                        variadic = false;
+                    }
+                    in_token = false;
+                },
+                else => if (std.ascii.isWhitespace(c)) {
+                    in_token = false;
+                } else if (at_param) {
+                    in_token = true;
+                    if (c == '&' and (i + 1 == doc.arglists.len - 2 or std.ascii.isWhitespace(doc.arglists[i + 2]))) {
+                        variadic = true;
+                    } else if (!variadic) fixed += 1;
+                },
+            }
+        }
+        errdefer std.debug.print("{s}: {s}\n", .{ d.name, doc.arglists });
+        try testing.expectEqual(@as(?usize, d.min_arity), min);
+        try testing.expectEqual(if (d.max_arity) |m| @as(?usize, m) else null, max);
+    };
 }
 
 test "stdlib: a string that is not UTF-8 seqs as :utf8-error" {

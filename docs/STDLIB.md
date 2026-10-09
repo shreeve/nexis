@@ -634,8 +634,14 @@ documentation from four places:
 
 - **A Var's metadata.** `defn`, `defmacro` and `def` put a docstring
   in `:doc` and the parameter vectors in `:arglists`
-  (MACROEXPAND.md §10). The library's own functions and macros carry
-  theirs this way, in the stdlib image.
+  (MACROEXPAND.md §10). The library's own functions and macros are
+  written this way, but once the embedded sources have booted their
+  docstrings move out of the metadata into one string, the root of
+  `nexis.internal/#%docs` (`ns/name`, a NUL, the docstring, a NUL, for
+  each), which the stdlib image carries: loading one string costs the
+  boot less than a string and a map entry per Var. When `meta` reads a
+  Var of a library namespace whose map has no `:doc`, it finds the
+  Var's docstring there, adds it under `:doc` and keeps it.
 - **A native's table row** (`src/stdlib.zig`). Each row ends with two
   strings, the arglists as `doc` prints them (`"[coll] [n coll]"`)
   and the docstring; Nextomic's natives, whose descriptors live in
@@ -661,6 +667,13 @@ documentation from four places:
 | `apropos` | 1 | `(apropos str-or-pattern)` → the sorted qualified symbols of every public Var outside `nexis.internal`, and of every host macro as `nexis.core/name`, whose name contains the string or has a match for the regex |
 | `dir-fn` | 1 | `(dir-fn ns)` → the sorted symbols naming the public Vars of the namespace the symbol `ns` names, or that an alias of the current namespace names; for `nexis.core` the host macros as well. `:no-such-namespace` when it names none |
 | `dir` | macro | `(dir ns)` prints `(dir-fn 'ns)` one name per line; nil |
+
+Every public Var of the library namespaces but `nexis.internal`
+carries a docstring, and every one holding a function its arglists
+(`test/integration/eval_pipeline.zig` walks them all); a native's
+arglists agree with the arities its row declares (an inline test in
+`src/stdlib.zig`). A docstring says what nexis does where that differs
+from Clojure.
 
 Clojure's `source` has no counterpart: a Var does not record the
 file and line it came from.

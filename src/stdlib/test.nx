@@ -5,17 +5,26 @@
 ; namespace, after core.nx and walk.nx.
 ; The helpers the macros call (register!, check=, check-truthy,
 ; check-thrown, pass!, fail!) are public, since an expansion names
-; them from the caller's namespace; the rest are private.
+; them from the caller's namespace, and so is the state they keep
+; (tests, counts, contexts, ...).
 
 ; ---- registry ----
 
-; namespace name → vector of [test-name fn] in definition order;
-; ns-order lists the namespaces in the order they first registered.
-(def tests (atom {}))
-(def ns-order (atom []))
+(def tests
+  "An atom of the test registry: namespace name to a vector of
+  [test-name fn] in definition order. deftest adds to it."
+  (atom {}))
 
-; Register or replace the test `test-name` of `ns-name`.
-(defn register! [ns-name test-name f]
+(def ns-order
+  "An atom of the vector of namespace names in the order they first
+  registered a test; run-all-tests runs them in this order."
+  (atom []))
+
+(defn register!
+  "Registers f as the test test-name of the namespace named ns-name,
+  replacing in place a test of that name; returns nil. Used by the
+  expansion of deftest."
+  [ns-name test-name f]
   (let* [entries (get @tests ns-name [])
          present (some (fn* [e] (= (first e) test-name)) entries)]
     (when (nil? (get @tests ns-name))
@@ -26,25 +35,36 @@
              (conj entries [test-name f])))
     nil))
 
-; (deftest name body...) → defines `name` as a no-argument function
-; and registers it under the current namespace; the Var.
-(defmacro deftest [name & body]
+(defmacro deftest
+  "Defines name as a function of no arguments running body and
+  registers it as a test of the current namespace, replacing one of
+  the same name. Returns the Var."
+  [name & body]
   `(do (def ~name (fn* [] ~@body))
        (nexis.test/register! (nexis.internal/#%current-ns) '~name ~name)
        (var ~name)))
 
 ; ---- the state of one run ----
 
-; Every report line goes through the function in `out`; a program
-; that wants the lines instead of the printing replaces it.
-(def out (atom println))
-; {:test n :pass n :fail n :error n} while a run is on, nil outside
-; one, where an assertion reports and returns but counts nothing.
-(def counts (atom nil))
-; {:ns name :name name} of the running test, nil outside a run.
-(def current (atom nil))
-; The `testing` descriptions in force, outermost first.
-(def contexts (atom []))
+(def out
+  "An atom of the function every report line is passed to, println
+  unless replaced; reset it to collect the lines instead."
+  (atom println))
+
+(def counts
+  "An atom of {:test n :pass n :fail n :error n} while a run is on,
+  nil outside one, where an assertion reports but counts nothing."
+  (atom nil))
+
+(def current
+  "An atom of {:ns name :name name} naming the running test, nil
+  outside a run; report lines name it."
+  (atom nil))
+
+(def contexts
+  "An atom of the vector of testing descriptions in force, outermost
+  first; report lines name them."
+  (atom []))
 
 (defn- emit! [line] (@out line))
 (defn- bump! [k] (when @counts (swap! counts update k inc)))
@@ -58,9 +78,16 @@
 
 ; The three outcomes of an assertion or a test. `pass!` is true and
 ; `fail!` false so `is` yields what it asserted.
-(defn pass! [] (bump! :pass) true)
+(defn pass!
+  "Counts a passed assertion in a run; returns true. Used by the
+  expansion of is."
+  [] (bump! :pass) true)
 
-(defn fail! [form expected actual msg]
+(defn fail!
+  "Counts a failed assertion and reports form, the expected and actual
+  values and msg when given; returns false. Used by the expansion of
+  is."
+  [form expected actual msg]
   (bump! :fail)
   (emit! (str "FAIL" (where) ": " (pr-str form)
               " expected: " (pr-str expected)
@@ -78,26 +105,36 @@
 ; judging and the reporting are here once, not in every assertion.
 ; Each returns whether the assertion passed; a pass is counted here
 ; rather than through `pass!`, one closure call fewer per assertion.
-(defn check= [form expected actual msg]
+(defn check=
+  "Judges (is (= expected actual) msg): counts a pass and returns true
+  when expected equals actual, else reports form and both values and
+  returns false. Used by the expansion of is."
+  [form expected actual msg]
   (if (= expected actual) (do (bump! :pass) true) (fail! form expected actual msg)))
 
-(defn check-truthy [form v msg]
+(defn check-truthy
+  "Judges (is form msg) whose value is v: counts a pass and returns
+  true when v is truthy, else reports form and v and returns false.
+  Used by the expansion of is."
+  [form v msg]
   (if v (do (bump! :pass) true) (fail! form true v msg)))
 
-; The handler of a `thrown?` with a keyword tag: a throw the tag does
-; not take goes on (a throw of the value the catch holds keeps its
-; origin, VM.md §12).
-(defn check-thrown [e tag]
+; A throw of the value the catch holds keeps its origin (VM.md §12).
+(defn check-thrown
+  "Judges the thrown value e of (is (thrown? tag expr)): counts a pass
+  and returns true when (catch tag ...) would take e, else throws e
+  on. Used by the expansion of is."
+  [e tag]
   (if (nexis.internal/#%catch-matches? e tag) (do (bump! :pass) true) (throw e)))
 
-; (is (= expected actual) msg?) → reports the two values on failure.
-; (is (thrown? MATCHER expr) msg?) → passes when expr throws a value
-;   `(catch MATCHER ...)` would take: a keyword tag or `any`; a value
-;   the matcher does not take propagates and counts as an error.
-; (is expr msg?) → passes when expr is truthy.
-; Each returns whether it passed. The message is evaluated after the
-; values, once.
-(defmacro is [form & more]
+(defmacro is
+  "Asserts form and returns whether it passed. (is (= expected actual))
+  reports both values on failure. (is (thrown? matcher expr)) passes
+  when expr throws a value (catch matcher ...) would take, a keyword
+  tag or any, and fails when it returns; another throw propagates.
+  (is expr) passes when expr is truthy. msg is evaluated once, after
+  the values."
+  [form & more]
   (let* [msg (first more)
          head (if (seq? form) (name (first form)) nil)]
     (cond
@@ -114,10 +151,12 @@
       true
       `(nexis.test/check-truthy '~form ~form ~msg))))
 
-; (are [x y] (= x y) 1 1 2 2) → (do (is (= 1 1)) (is (= 2 2))): the
-; assertion once per group of values, each substituted for the names
-; of argv, as Clojure's are through clojure.template/do-template.
-(defmacro are [argv expr & args]
+(defmacro are
+  "Asserts expr with is once per group of args, each group's values
+  substituted for the names of argv: (are [x y] (= x y) 1 1 2 2) is
+  (do (is (= 1 1)) (is (= 2 2))). A count of args that is not a
+  multiple of argv's fails the expansion."
+  [argv expr & args]
   (cond
     (empty? args) (if (empty? argv) nil (throw (ex-info "The number of args doesn't match are's argv." {})))
     (or (empty? argv) (not (zero? (mod (count args) (count argv)))))
@@ -126,32 +165,39 @@
     `(do ~@(map (fn [vals] `(is ~(nexis.walk/postwalk-replace (zipmap argv vals) expr)))
                 (partition (count argv) args)))))
 
-; (testing "description" body...) → runs body with the description
-; on the context stack, popped on every exit.
-(defmacro testing [desc & body]
+(defmacro testing
+  "Evaluates body with desc added to the descriptions report lines
+  name, removed on every exit; descriptions nest."
+  [desc & body]
   `(do (swap! nexis.test/contexts conj ~desc)
        (try (do ~@body)
             (finally (swap! nexis.test/contexts pop)))))
 
 ; ---- fixtures ----
 
-; namespace name → {:once f :each f}, each the composition of the
-; fixtures use-fixtures gave for that kind.
-(def fixtures (atom {}))
+(def fixtures
+  "An atom of namespace name to {:once f :each f}, each the
+  composition of the fixtures use-fixtures gave for that kind."
+  (atom {}))
 
-; (compose-fixtures f1 f2) → the fixture that runs f2 inside f1;
-; (join-fixtures fs) → all of fs, the first outermost.
-(defn compose-fixtures [f1 f2]
+(defn compose-fixtures
+  "Returns the fixture that runs f2 inside f1."
+  [f1 f2]
   (fn [g] (f1 (fn [] (f2 g)))))
 
-(defn join-fixtures [fs]
+(defn join-fixtures
+  "Returns the fixture that runs every fixture of fs, the first
+  outermost."
+  [fs]
   (reduce compose-fixtures (fn [g] (g)) fs))
 
-; (use-fixtures :once f...) wraps every run of the current namespace's
-; tests; (use-fixtures :each f...) wraps each of its tests. A fixture
-; is a function of the function it wraps, which it calls; a later
-; call for the same kind replaces the earlier.
-(defn use-fixtures [kind & fs]
+(defn use-fixtures
+  "Sets the current namespace's fixtures of kind: :once ones wrap the
+  run of its tests, :each ones each test, the first outermost. A
+  fixture is a function of the function it wraps, which it calls. A
+  later call replaces the kind's fixtures; another kind is
+  :invalid-argument."
+  [kind & fs]
   (when-not (contains? #{:once :each} kind) (throw :invalid-argument))
   (swap! fixtures assoc-in [(nexis.internal/#%current-ns) kind] (join-fixtures fs))
   nil)
@@ -188,17 +234,22 @@
       (reset! current nil)
       (reset! contexts []))))
 
-; (run-tests) → the current namespace's tests; (run-tests 'my.ns) →
-; that namespace's.
 (defn run-tests
+  "Runs the tests of the current namespace, or of the namespace ns
+  names, in definition order, and reports. Returns {:test n :pass n
+  :fail n :error n}: tests run, assertions passed and failed, and tests
+  that threw."
   ([] (run-namespaces [(nexis.internal/#%current-ns)]))
   ([ns] (run-namespaces [(name ns)])))
 
-; (successful? summary) → whether a run's summary has no failure and
-; no error.
-(defn successful? [summary]
+(defn successful?
+  "Returns true if the run summary has no failure and no error."
+  [summary]
   (and (zero? (get summary :fail 0)) (zero? (get summary :error 0))))
 
-; (run-all-tests) → every namespace that registered a test.
-(defn run-all-tests []
+(defn run-all-tests
+  "Runs the tests of every namespace that registered one, in the order
+  they first registered, and reports; returns the summary run-tests
+  does."
+  []
   (run-namespaces @ns-order))

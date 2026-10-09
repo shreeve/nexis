@@ -7,9 +7,10 @@
   (let [m (apply max-key k coll)]
     (cons m (remove (fn [x] (identical? m x)) coll))))
 
-; (union & sets) → every element of any of the sets, poured into the
-; largest, so its kind and metadata stay.
 (defn union
+  "Returns a set of every element of any of the sets, poured into the
+  largest, which keeps its kind and metadata: a sorted set stays
+  sorted. (union) is #{}; one argument is returned as it is."
   ([] #{})
   ([s1] s1)
   ([s1 s2]
@@ -18,9 +19,10 @@
    (let [bubbled (bubble-max-key count (conj sets s2 s1))]
      (reduce into (first bubbled) (rest bubbled)))))
 
-; (intersection s & sets) → the elements of s in every other set,
-; removed from the smallest.
 (defn intersection
+  "Returns the elements of s1 present in every other set, removed
+  (disj) from the smallest, which keeps its kind. One argument is
+  returned as it is."
   ([s1] s1)
   ([s1 s2]
    (if (< (count s2) (count s1))
@@ -31,28 +33,38 @@
    (let [bubbled (bubble-max-key (fn [s] (- (count s))) (conj sets s2 s1))]
      (reduce intersection (first bubbled) (rest bubbled)))))
 
-; (difference s & sets) → the elements of s in none of the others.
-(defn difference [s & sets]
+(defn difference
+  "Returns the set s without the elements of any of the sets. s must
+  be a set, else :kind-mismatch."
+  [s & sets]
   (reduce (fn [acc t] (reduce disj acc t)) s sets))
 
-; (subset? a b) → whether every element of a is in b;
-; (superset? a b) → whether every element of b is in a.
-(defn subset? [a b]
+(defn subset?
+  "Returns true if every element of a is in b."
+  [a b]
   (and (<= (count a) (count b)) (every? (fn [x] (contains? b x)) a)))
 
-(defn superset? [a b]
+(defn superset?
+  "Returns true if every element of b is in a."
+  [a b]
   (subset? b a))
 
-; (select pred s) → s without the elements for which pred is falsy.
-(defn select [pred s]
+(defn select
+  "Returns the set s without the elements for which pred is falsy,
+  of s's kind."
+  [pred s]
   (reduce (fn [acc k] (if (pred k) acc (disj acc k))) s s))
 
-; (map-invert m) → m with its keys and values swapped.
-(defn map-invert [m]
+(defn map-invert
+  "Returns m with its keys and values swapped; of keys sharing a
+  value, the one iterated last wins."
+  [m]
   (reduce-kv (fn [acc k v] (assoc acc v k)) {} m))
 
-; (rename-keys m kmap) → m with each key of kmap renamed to its value.
-(defn rename-keys [m kmap]
+(defn rename-keys
+  "Returns m with each key of kmap present in m renamed to the value
+  kmap maps it to."
+  [m kmap]
   (reduce-kv (fn [acc old new]
                (if (contains? m old)
                  (assoc acc new (get m old))

@@ -325,6 +325,23 @@ test "doc, find-doc, apropos and dir read the documentation of Vars, natives, sp
     try expectOutputProgram("(defn zq \"Zorbles quietly.\" []) (with-out-str (find-doc \"Zorbles\"))", "-------------------------\nuser/zq\n([])\n  Zorbles quietly.\n");
 }
 
+test "every public Var of the library namespaces has a docstring, and every function its arglists" {
+    // STDLIB.md §10: a native through its row, the rest through
+    // core.nx and the other embedded sources. Lists what lacks one.
+    try expectOutput(
+        \\(->> (all-ns)
+        \\     (remove #{'user 'nexis.internal})
+        \\     (mapcat (fn [ns] (map (fn [[s v]] [(symbol (str ns) (str s)) v]) (ns-publics ns))))
+        \\     (remove (fn [[_ v]]
+        \\               (let [m (meta v)]
+        \\                 (and (string? (:doc m))
+        \\                      (or (:arglists m) (not (and (bound? v) (fn? @v))))))))
+        \\     (map first)
+        \\     sort
+        \\     vec)
+    , "[]");
+}
+
 test "meta / with-meta / vary-meta on collections never touch equality, hash or printing" {
     try expectOutput("(meta [1 2])", "nil");
     try expectOutput("(meta (with-meta [1 2] {:a 1}))", "{:a 1}");
