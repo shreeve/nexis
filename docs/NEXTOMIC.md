@@ -371,8 +371,9 @@ so there is no queue; emdb's write lock is the transactor.
    the committed AVET tree. A unique-identity claim whose value is a
    tempid or a lookup ref upserts once the value is known: a tempid
    bound by its own identity, a lookup ref found in the tree or naming
-   an identity asserted anywhere in the same transaction; claims on an
-   entity the transaction creates unify their tempids. Remaining tempids
+   a unique `(a v)` asserted anywhere in the same transaction, on an
+   eid or on a tempid however it is bound; claims on an entity the
+   transaction creates unify their tempids. Remaining tempids
    take eids from `sys/"eid"`, read once and bumped once; each must be
    the entity of some assertion (`:db/add`, a map form's attribute, a
    cas), since a tempid only in value positions or retractions (or a
@@ -382,7 +383,9 @@ so there is no queue; emdb's write lock is the transactor.
    attribute. A lookup ref names the committed holder of its `(a v)`,
    else the entity a unique assertion of the same tx-data puts `(a v)`
    on, wherever that assertion stands; otherwise it is
-   `:nextomic/no-entity`.
+   `:nextomic/no-entity`. The one exception is the entity of a
+   `:db/ident` assertion, settled before the transaction's unique
+   assertions: a lookup ref there names the committed holder alone.
 4. **Expand**: a card-one assertion whose current value differs writes
    the retraction of the old value and the assertion of the new one in
    this `t`; asserting an already-current datom writes nothing; two

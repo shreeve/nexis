@@ -444,3 +444,38 @@ test "a lookup ref nested past the native stack is StackOverflow in tx-data and 
     var fault: Fault = .{};
     try testing.expectError(error.StackOverflow, nextomic.marshal.entity(&rd, fx.arena(), v, &fault));
 }
+
+fn tempidOf(r: nextomic.Report, name: []const u8) !u64 {
+    for (r.tempids) |b| if (b.key == .string and std.mem.eql(u8, b.key.string, name)) return b.eid;
+    return error.TestUnexpectedResult;
+}
+
+test "a lookup ref value upserts through any unique assertion of the transaction" {
+    const fx = try Fx.init("fn_lookup_upsert");
+    defer fx.deinit();
+    const a = fx.arena();
+    _ = try fx.transact(
+        \\[{:db/ident :u/email :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/alt :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/code :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/value}
+        \\ {:db/ident :u/key :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :u/n :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+    );
+    const r = try fx.transact("[{:db/id \"x\" :u/email \"x\"} {:db/id \"y\" :u/key \"x\" :u/n 1}]");
+    const x = try tempidOf(r, "x");
+    const y = try tempidOf(r, "y");
+    // The identity the lookup ref names is asserted on an explicit eid.
+    const ra = try fx.transact(try a.print("[[:db/add {d} :u/alt \"alt\"] {{:db/id \"t\" :u/key [:u/alt \"alt\"] :u/n 2}}]", .{x}));
+    try testing.expectEqual(y, try tempidOf(ra, "t"));
+    // A unique value on a tempid that upserts through another identity.
+    const rb = try fx.transact("[{:db/id \"w\" :u/email \"x\" :u/code \"cx\"} {:db/id \"t\" :u/key [:u/code \"cx\"] :u/n 4}]");
+    try testing.expectEqual(x, try tempidOf(rb, "w"));
+    try testing.expectEqual(y, try tempidOf(rb, "t"));
+    // A unique value on a new entity: the claim on it is new too.
+    const rc = try fx.transact("[{:db/id \"z\" :u/code \"c1\" :u/email \"z\"} {:db/id \"t\" :u/key [:u/code \"c1\"] :u/n 3}]");
+    const z = try tempidOf(rc, "z");
+    const t = try tempidOf(rc, "t");
+    try testing.expect(z != x and z != y and t != x and t != y and t != z);
+    const n = try fx.q(try fx.db(), "[:find ?n :where [?e :u/n ?n]]");
+    try testing.expectEqual(@as(usize, 2), count(n));
+}

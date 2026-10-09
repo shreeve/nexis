@@ -8,12 +8,12 @@
 //!     lists, and map forms with nested entities and card-many
 //!     collections), resolving attributes through the schema at `now`
 //!     and converting values by the attribute's type;
-//!   - tempids: `:db/ident` binds to the ident's id (minting it),
-//!     unique-identity assertions upsert through an AVET probe (a
-//!     tempid- or lookup-ref-valued claim once its value is known),
-//!     two tempids naming one identity unify, the rest take fresh eids;
-//!     then every unique assertion is claimed, so a lookup ref resolves
-//!     alike wherever it stands;
+//!   - tempids: `:db/ident` binds to the ident's id (minting it); one
+//!     fixpoint over the unique assertions upserts identities through
+//!     an AVET probe, unifies the tempids naming one identity, and
+//!     resolves a lookup ref against the committed state and every
+//!     unique assertion of the transaction alike; the rest take fresh
+//!     eids;
 //!   - expand: ops against the committed trees plus the transaction's
 //!     own overlay: card-one implicit retracts, no-op re-assertions,
 //!     conflicts, retract-attribute, retract-entity with VAET cleanup
@@ -382,8 +382,13 @@ const PVal = union(enum) {
 /// form wrote it, for the refusal to name one the store cannot spell.
 const CasOp = struct { e: Ent, attr: *const Attr, old: ?PVal, written: Value, new: PVal };
 
+/// An entity a unique assertion names while tempids are bound.
+const Named = union(enum) { eid: u64, tempid: u32 };
+
+const Add = struct { e: Ent, attr: *const Attr, v: PVal };
+
 const ROp = union(enum) {
-    add: struct { e: Ent, attr: *const Attr, v: PVal },
+    add: Add,
     retract: struct { e: Ent, attr: *const Attr, v: PVal },
     retract_attr: struct { e: Ent, attr: *const Attr },
     retract_entity: Ent,
@@ -450,7 +455,7 @@ const Ctx = struct {
     /// `[a][v]` -> e for every unique assertion of the tx-data, whatever
     /// its place: what a lookup ref names when the committed state holds
     /// nothing under `(a v)`.
-    av_claims: std.StringHashMapUnmanaged(u64) = .empty,
+    av_claims: std.StringHashMapUnmanaged(Named) = .empty,
 
     next_eid: u64,
     /// The first user id this transaction mints: an entity at or past
@@ -1141,7 +1146,6 @@ const Ctx = struct {
     fn apply(self: *Ctx) !void {
         try self.bindIdents();
         try self.bindTempids();
-        try self.claimAll();
         try self.expandAll();
         try self.txInstant();
         try self.checkUnique();
@@ -1245,113 +1249,125 @@ const Ctx = struct {
     /// `:db/ident` is refused as it is read.
     fn bindIdents(self: *Ctx) !void {
         for (self.ops.items) |*op| {
-            if (op.* != .add) continue;
+            if (op.* != .add or op.add.attr.id != boot.ident) continue;
             const slot = &op.add.v;
-            if (slot.* != .ident) continue;
-            const k = slot.ident;
-            const existing = try self.minter.lookup(k);
-            const e: ?u64 = switch (op.add.e) {
-                .eid => |id| id,
-                .tempid => null,
-                .lookup => |l| blk: {
-                    const vb = try key.valBytes(self.arena, l.v);
-                    break :blk (try self.probeAvet(l.attr.id, vb)) orelse return self.noLookup(l);
-                },
-            };
-            const id: u32 = blk: {
-                const eid = e orelse break :blk existing orelse try self.mintKeyword(k);
-                if (existing) |x| {
-                    if (x != eid) return self.conflict(eid, boot.ident);
-                    break :blk x;
-                }
-                if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
-                // The store and every build know the bootstrap idents by
-                // their ids and names alike (§2.4).
-                if (eid < boot.next_aid) return self.schemaRefused(@intCast(eid), null, "a bootstrap ident is never renamed");
-                // Two renames of one entity are two card-one values of
-                // its `:db/ident`; the first would retire a name no
-                // commit ever showed.
-                if (self.minter.renamed.contains(@intCast(eid))) return self.conflict(eid, boot.ident);
-                if (self.schema.attr(@intCast(eid)) != null) try self.checkAttrName(@intCast(eid), k);
-                self.minter.rename(@intCast(eid), k) catch |err| return self.identRefused(err);
-                break :blk @intCast(eid);
-            };
-            slot.* = .{ .val = .{ .keyword = id } };
+            if (slot.* == .ident) {
+                const id = try self.identId(op.add.e, slot.ident);
+                slot.* = .{ .val = .{ .keyword = id } };
+            }
+            // The ident names the entity: a tempid's id is the ident's.
+            if (op.add.e == .tempid) try self.bind(op.add.e.tempid, slot.val.keyword, boot.ident);
         }
+    }
+
+    /// The id keyword `k` names as the `:db/ident` of entity `ent`:
+    /// minted for a tempid when new, renaming an attribute or ident
+    /// entity the keyword does not name yet.
+    fn identId(self: *Ctx, ent: Ent, k: u32) !u32 {
+        const existing = try self.minter.lookup(k);
+        const eid: u64 = switch (ent) {
+            .eid => |id| id,
+            .tempid => return existing orelse try self.mintKeyword(k),
+            // Against the committed state alone: idents settle before
+            // the transaction's unique assertions.
+            .lookup => |l| (try self.probeAvet(l.attr.id, try key.valBytes(self.arena, l.v))) orelse return self.noLookup(l),
+        };
+        if (existing) |x| return if (x == eid) x else self.conflict(eid, boot.ident);
+        if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
+        // The store and every build know the bootstrap idents by their
+        // ids and names alike (§2.4).
+        if (eid < boot.next_aid) return self.schemaRefused(@intCast(eid), null, "a bootstrap ident is never renamed");
+        // Two renames of one entity are two card-one values of its
+        // `:db/ident`; the first would retire a name no commit ever
+        // showed.
+        if (self.minter.renamed.contains(@intCast(eid))) return self.conflict(eid, boot.ident);
+        if (self.schema.attr(@intCast(eid)) != null) try self.checkAttrName(@intCast(eid), k);
+        self.minter.rename(@intCast(eid), k) catch |err| return self.identRefused(err);
+        return @intCast(eid);
     }
 
     // ── tempids ───────────────────────────────────────────────────
 
+    /// Tempids (NEXTOMIC.md §3 step 3), in one fixpoint over the unique
+    /// assertions. Each settles once its entity and value are known:
+    /// `(a v)` then names its entity, for a lookup ref anywhere in the
+    /// transaction, and a unique identity a tempid claims upserts to
+    /// the committed holder of `(a v)` and unifies the tempids claiming
+    /// it. Each round settles what the last one bound. Then claims on
+    /// entities the transaction creates unify by their value, the
+    /// remaining tempids take fresh eids, and every unique assertion
+    /// settles.
     fn bindTempids(self: *Ctx) !void {
-        // `:db/ident` names the entity: its id is the ident's id.
-        for (self.ops.items) |op| {
-            if (op != .add or op.add.e != .tempid or op.add.attr.id != boot.ident) continue;
-            if (op.add.v != .val) return error.ValueType;
-            try self.bind(op.add.e.tempid, op.add.v.val.keyword, boot.ident);
+        var pending: std.ArrayList(usize) = .empty;
+        for (self.ops.items, 0..) |op, i| {
+            if (op == .add and op.add.attr.unique != .none and op.add.attr.id != boot.ident) try pending.append(self.arena, i);
         }
-        // Unique-identity assertions upsert; equal identities unify. A
-        // claim whose value is a tempid or a lookup ref waits until the
-        // value is known: a tempid bound by its own identity, a lookup
-        // ref found in the tree or among the claims of this
-        // transaction. Each round settles what the last one bound.
-        var claims: std.StringHashMapUnmanaged(u32) = .empty;
-        var deferred: std.ArrayList(struct { op: usize, e: u32, attr: *const Attr, v: PVal }) = .empty;
-        for (self.ops.items, 0..) |op, idx| {
-            if (op != .add or op.add.e != .tempid) continue;
-            const attr = op.add.attr;
-            if (attr.unique != .identity or attr.id == boot.ident) continue;
-            switch (op.add.v) {
-                .val => |v| try self.claimIdentity(&claims, op.add.e.tempid, attr, v),
-                else => try deferred.append(self.arena, .{ .op = idx, .e = op.add.e.tempid, .attr = attr, .v = op.add.v }),
-            }
+        var identities: std.StringHashMapUnmanaged(u32) = .empty;
+        try self.settleAll(&pending, &identities);
+        var by_target: std.AutoHashMapUnmanaged(struct { a: u32, root: u32 }, u32) = .empty;
+        for (pending.items) |i| {
+            const op = self.ops.items[i].add;
+            if (op.attr.unique != .identity or op.e != .tempid or op.v != .tempid) continue;
+            const g = try by_target.getOrPut(self.arena, .{ .a = op.attr.id, .root = self.root(op.v.tempid) });
+            if (g.found_existing) try self.unify(op.e.tempid, g.value_ptr.*, op.attr.id) else g.value_ptr.* = op.e.tempid;
         }
+        try self.freshEids();
+        try self.settleAll(&pending, &identities);
+    }
+
+    /// Settle the `pending` unique assertions, round by round until a
+    /// round settles none.
+    fn settleAll(self: *Ctx, pending: *std.ArrayList(usize), identities: *std.StringHashMapUnmanaged(u32)) !void {
         var progress = true;
-        while (progress and deferred.items.len > 0) {
+        while (progress) {
             progress = false;
             var i: usize = 0;
-            while (i < deferred.items.len) {
-                const d = deferred.items[i];
-                var eid: ?u64 = null;
-                var target: ?u32 = null;
-                switch (d.v) {
-                    .tempid => |t| target = t,
-                    .lookup => |l| {
-                        const vb = try key.valBytes(self.arena, l.v);
-                        eid = try self.probeAvet(l.attr.id, vb);
-                        if (eid == null) target = claims.get(try self.avKey(l.attr.id, vb));
-                        // A lookup ref naming a tempid's identity is that
-                        // tempid, wherever the identity is asserted.
-                        if (target) |t| self.ops.items[d.op].add.v = .{ .tempid = t };
-                    },
-                    .val, .ident => unreachable,
-                }
-                if (eid == null) if (target) |t| {
-                    eid = self.bindings.items[self.root(t)].eid;
-                };
-                if (eid) |id| {
-                    try self.claimIdentity(&claims, d.e, d.attr, .{ .ref = id });
-                } else if (target != null) {
-                    // Waits for its target's binding.
-                    i += 1;
-                    continue;
-                }
-                // Resolved, or naming nothing this transaction knows:
-                // expansion resolves or refuses such a lookup ref.
-                progress = true;
-                _ = deferred.swapRemove(i);
+            while (i < pending.items.len) {
+                if (try self.settle(&self.ops.items[pending.items[i]].add, identities)) {
+                    _ = pending.swapRemove(i);
+                    progress = true;
+                } else i += 1;
             }
         }
-        // Claims on entities this transaction creates: equal claims are
-        // one entity, and the tree cannot hold them yet.
-        var by_target: std.AutoHashMapUnmanaged(struct { a: u32, root: u32 }, u32) = .empty;
-        for (deferred.items) |d| {
-            const t: u32 = self.ops.items[d.op].add.v.tempid;
-            const g = try by_target.getOrPut(self.arena, .{ .a = d.attr.id, .root = self.root(t) });
-            if (g.found_existing) try self.unify(d.e, g.value_ptr.*, d.attr.id) else g.value_ptr.* = d.e;
+    }
+
+    /// Settle one unique assertion once its entity and value are known;
+    /// false while either waits for a binding or names nothing yet. A
+    /// lookup ref among them becomes the entity it names.
+    fn settle(self: *Ctx, op: *Add, identities: *std.StringHashMapUnmanaged(u32)) !bool {
+        if (op.e == .lookup) {
+            const named = (try self.lookupNamed(op.e.lookup)) orelse return false;
+            op.e = entOf(named);
         }
-        // Fresh eids for the rest, each the entity of an assertion: a
-        // tempid only in value positions or retractions would name an
-        // entity with no datoms.
+        if (op.v == .lookup) {
+            const named = (try self.lookupNamed(op.v.lookup)) orelse return false;
+            op.v = pvalOf(entOf(named));
+        }
+        const v: Val = switch (op.v) {
+            .val => |x| x,
+            .tempid => |t| .{ .ref = self.bindings.items[self.root(t)].eid orelse return false },
+            .lookup, .ident => unreachable,
+        };
+        const vb = try key.valBytes(self.arena, v);
+        const av = try self.avKey(op.attr.id, vb);
+        if (op.attr.unique == .identity and op.e == .tempid) {
+            const g = try identities.getOrPut(self.arena, av);
+            if (g.found_existing) try self.unify(op.e.tempid, g.value_ptr.*, op.attr.id) else g.value_ptr.* = op.e.tempid;
+            if (try self.probeAvet(op.attr.id, vb)) |eid| try self.bind(op.e.tempid, eid, op.attr.id);
+        }
+        const g = try self.av_claims.getOrPut(self.arena, av);
+        if (!g.found_existing) g.value_ptr.* = switch (op.e) {
+            .eid => |id| .{ .eid = id },
+            .tempid => |t| .{ .tempid = t },
+            .lookup => unreachable,
+        };
+        return true;
+    }
+
+    /// Fresh eids for the tempids no identity bound, each the entity of
+    /// an assertion: a tempid only in value positions or retractions
+    /// would name an entity with no datoms.
+    fn freshEids(self: *Ctx) !void {
         const named = try self.arena.alloc(bool, self.bindings.items.len);
         @memset(named, false);
         for (self.ops.items) |op| {
@@ -1363,8 +1379,7 @@ const Ctx = struct {
             if (e == .tempid) named[self.root(e.tempid)] = true;
         }
         for (self.bindings.items, named) |*b, n| {
-            if (b.alias != null) continue;
-            if (b.eid != null) continue;
+            if (b.alias != null or b.eid != null) continue;
             if (!n) return self.malformed("a tempid no assertion stands on names no entity", .{});
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
@@ -1373,18 +1388,20 @@ const Ctx = struct {
         }
     }
 
-    /// One identity claim `(e a v)` with `v` known: equal claims unify,
-    /// and the entity holding `(a v)` in the tree binds the tempid.
-    fn claimIdentity(self: *Ctx, claims: *std.StringHashMapUnmanaged(u32), e: u32, attr: *const Attr, v: Val) !void {
-        const vb = try key.valBytes(self.arena, v);
-        const av = try self.avKey(attr.id, vb);
-        const g = try claims.getOrPut(self.arena, av);
-        if (g.found_existing) {
-            try self.unify(e, g.value_ptr.*, attr.id);
-        } else {
-            g.value_ptr.* = e;
-        }
-        if (try self.probeAvet(attr.id, vb)) |eid| try self.bind(e, eid, attr.id);
+    /// The entity a lookup ref names so far: the committed holder of
+    /// its `(a v)`, else the entity a settled unique assertion of this
+    /// transaction puts `(a v)` on; null when neither exists yet.
+    fn lookupNamed(self: *Ctx, l: *const Lookup) !?Named {
+        const vb = try key.valBytes(self.arena, l.v);
+        if (try self.probeAvet(l.attr.id, vb)) |e| return .{ .eid = e };
+        return self.av_claims.get(try self.avKey(l.attr.id, vb));
+    }
+
+    fn entOf(n: Named) Ent {
+        return switch (n) {
+            .eid => |id| .{ .eid = id },
+            .tempid => |t| .{ .tempid = t },
+        };
     }
 
     fn avKey(self: *Ctx, a: u32, vbytes: []const u8) ![]u8 {
@@ -1416,13 +1433,12 @@ const Ctx = struct {
         return if (try self.retracts(e, a, vbytes)) null else e;
     }
 
-    /// The entity a lookup ref names: the committed holder of `(a v)`,
-    /// else the entity the tx-data asserts it on, wherever that
-    /// assertion stands; null when neither exists.
+    /// The entity a lookup ref names once every tempid is bound.
     fn lookupEid(self: *Ctx, l: *const Lookup) !?u64 {
-        const vb = try key.valBytes(self.arena, l.v);
-        if (try self.probeAvet(l.attr.id, vb)) |e| return e;
-        return self.av_claims.get(try self.avKey(l.attr.id, vb));
+        return switch ((try self.lookupNamed(l)) orelse return null) {
+            .eid => |id| id,
+            .tempid => |t| self.eidOfTempid(t),
+        };
     }
 
     fn resolveEnt(self: *Ctx, e: Ent) !u64 {
@@ -1440,47 +1456,6 @@ const Ctx = struct {
             .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return self.noLookup(l) },
             .ident => unreachable,
         };
-    }
-
-    /// Record every unique assertion's `(a v) -> e` before expansion,
-    /// so a lookup ref resolves the same wherever it stands. An
-    /// assertion whose entity or value is itself a lookup ref waits for
-    /// the claims it names.
-    fn claimAll(self: *Ctx) !void {
-        var waiting: std.ArrayList(usize) = .empty;
-        for (self.ops.items, 0..) |op, i| {
-            if (op != .add or op.add.attr.unique == .none) continue;
-            if (!try self.claim(op.add.e, op.add.attr, op.add.v)) try waiting.append(self.arena, i);
-        }
-        var progress = true;
-        while (progress) {
-            progress = false;
-            var i: usize = 0;
-            while (i < waiting.items.len) {
-                const op = self.ops.items[waiting.items[i]].add;
-                if (try self.claim(op.e, op.attr, op.v)) {
-                    _ = waiting.swapRemove(i);
-                    progress = true;
-                } else i += 1;
-            }
-        }
-    }
-
-    /// Claim `(a v) -> e` when both sides resolve; false when a lookup
-    /// ref among them names nothing yet.
-    fn claim(self: *Ctx, e: Ent, attr: *const Attr, v: PVal) !bool {
-        const eid = switch (e) {
-            .lookup => |l| (try self.lookupEid(l)) orelse return false,
-            else => try self.resolveEnt(e),
-        };
-        const val: Val = switch (v) {
-            .lookup => |l| .{ .ref = (try self.lookupEid(l)) orelse return false },
-            else => try self.resolveVal(v),
-        };
-        const av = try self.avKey(attr.id, try key.valBytes(self.arena, val));
-        const g = try self.av_claims.getOrPut(self.arena, av);
-        if (!g.found_existing) g.value_ptr.* = eid;
-        return true;
     }
 
     /// Unique attributes (NEXTOMIC.md §3 step 4) over the whole
