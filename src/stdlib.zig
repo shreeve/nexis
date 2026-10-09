@@ -4340,12 +4340,8 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 fn fnClass(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     const interner = vm.ensureInterner();
-    const name: []const u8 = switch (x.kind()) {
+    switch (x.kind()) {
         .nil => return value_mod.nilValue(),
-        .true_, .false_ => "boolean",
-        .persistent_vector => "vector",
-        .persistent_map => "map",
-        .persistent_set => "set",
         .record => {
             const e = vm.recordType(record_mod.typeId(x)) orelse return VmError.InvalidArgument;
             var buf: std.ArrayList(u8) = .empty;
@@ -4354,9 +4350,19 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
             buf.appendSlice(vm.allocator, e.type_name) catch return VmError.OutOfMemory;
             return interner.internSymbolValue(buf.items) catch VmError.OutOfMemory;
         },
-        else => |k| @tagName(k),
+        else => |k| return interner.internKeywordValue(className(k)) catch VmError.OutOfMemory,
+    }
+}
+
+/// The class name `class` gives a value of kind `k`, a record but.
+fn className(k: Kind) []const u8 {
+    return switch (k) {
+        .true_, .false_ => "boolean",
+        .persistent_vector => "vector",
+        .persistent_map => "map",
+        .persistent_set => "set",
+        else => @tagName(k),
     };
-    return interner.internKeywordValue(name) catch VmError.OutOfMemory;
 }
 
 /// `(#%mm-lookup cache href dv)` → the method a multimethod's cache
@@ -4409,13 +4415,12 @@ fn fnClassQ(vm: *VM, args: []const Value) VmError!Value {
 }
 
 fn isClassKeyword(name: []const u8) bool {
-    for ([_][]const u8{ "boolean", "vector", "map", "set" }) |alias| if (std.mem.eql(u8, name, alias)) return true;
-    const k = std.meta.stringToEnum(Kind, name) orelse return false;
-    return switch (k) {
-        // nil has no class, `fnClass` renames these, and the rest are
+    const kinds = typeNameToKinds(name) orelse return false;
+    return switch (kinds[0]) {
+        // nil has no class, a record's is a symbol, and the rest are
         // reserved or never escape.
-        .nil, .true_, .false_, .persistent_vector, .persistent_map, .persistent_set, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
-        else => true,
+        .nil, .record, .byte_vector, .error_, .meta_symbol, .cell_internal => false,
+        else => |k| std.mem.eql(u8, className(k), name),
     };
 }
 
@@ -7001,17 +7006,6 @@ fn fnJsonRead(vm: *VM, args: []const Value) VmError!Value {
     defer r.scope.release();
     defer r.deinit();
     return r.read();
-}
-
-/// The class name `class` gives a value of kind `k`, for messages.
-fn className(k: Kind) []const u8 {
-    return switch (k) {
-        .true_, .false_ => "boolean",
-        .persistent_vector => "vector",
-        .persistent_map => "map",
-        .persistent_set => "set",
-        else => @tagName(k),
-    };
 }
 
 /// Values written as JSON text into `w`. The walk recurses on the
