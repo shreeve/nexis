@@ -619,6 +619,10 @@ pub const Store = struct {
     /// reads what the history passes write. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
+        // Only a retraction writes a history tree.
+        const retracts = for (batch) |p| {
+            if (!p.added) break true;
+        } else false;
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
@@ -650,7 +654,7 @@ pub const Store = struct {
             }
             const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n], .priors = priors };
             try self.writeTree(txn, w, false, arena);
-            try self.writeTree(txn, w, true, arena);
+            if (retracts) try self.writeTree(txn, w, true, arena);
         }
     }
 
