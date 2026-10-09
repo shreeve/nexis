@@ -52,6 +52,7 @@
 (t/check "ident round trips" (= :person/tags (d/ident (d/db c) (d/entid (d/db c) :person/tags))))
 (t/check "ident of an unknown eid is nil" (nil? (d/ident (d/db c) 12345)))
 (t/check "entid of an unknown ident is nil" (nil? (d/entid (d/db c) :person/nope)))
+(t/check "entid of an eid is the eid, allocated or not" (= [23 12345] [(d/entid (d/db c) 23) (d/entid (d/db c) 12345)]))
 
 ; Map forms with tempids, card-many vectors, nested component maps, and
 ; vector forms that refer to the same tempids.
