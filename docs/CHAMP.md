@@ -23,8 +23,8 @@ points (§8). Costs:
 | `assoc`/`conj`, `dissoc`/`disj` | O(log₃₂ n) path copy, one new node per level; an array form copies its ≤ 8 payloads |
 | `mapFromEntries`, `setFromElements` | O(n log n): a sort by slot path, then one allocation per node |
 | `count` | O(1) |
-| `=` | O(n) lookups (§6.3) |
-| `hash` | O(n) the first time; cached in the root header (§7.5) |
+| `=` | O(n) lookups (§6.1) |
+| `hash` | O(n) the first time; cached in the root header (§7.3) |
 
 The language surface lives in `src/stdlib.zig`: `hash-map`, `hash-set`,
 `set`, `assoc`, `dissoc`, `disj`, `get` (nil or the default when
@@ -69,7 +69,7 @@ the same order, whatever their build history, except inside a
 collision node (§2.3). `canonicalTrie` checks this layout.
 
 The layout is a representation property, not an equality mechanism:
-`=` and `hash` are semantic (§6.3, §7) and compare an array form with a
+`=` and `hash` are semantic (§6.1, §7) and compare an array form with a
 trie freely, since a trie that shrinks below 9 keys stays a trie
 (§5.4).
 
@@ -198,7 +198,7 @@ trie of the nine keys.
 
 A trie that shrinks below 9 keys stays subkind 1, as Clojure's
 `PersistentHashMap.without` does: demotion would churn at the 8/9
-boundary. Equal maps can therefore differ in subkind, which §6.3 and §7
+boundary. Equal maps can therefore differ in subkind, which §6.1 and §7
 handle. A trie left with one key is a root interior holding that one
 payload.
 
@@ -226,16 +226,16 @@ The category rule (a map is never `=` to a set, a record or a
 sequential) is dispatch's (SEMANTICS §3.3); this section is the
 same-kind comparison `equalMap`/`equalSet`.
 
-#### 6.3 Same-kind equality
+#### 6.1 Same-kind equality
 
 One strategy serves every subkind pair (array/array, trie/trie,
 array/trie): the same header is equal; different counts are unequal;
 otherwise every entry `(k, v)` of `a` must be found in `b` by `mapGet`
 with an `=` value (for a set, every element found by `setContains`).
 Collision nodes need no special case. A map value may be nil, so the
-lookup must tell an absent key from a nil value (§6.6).
+lookup must tell an absent key from a nil value (§6.3).
 
-#### 6.5 Key comparison
+#### 6.2 Key comparison
 
 Key comparison inside the module (`keyEquivalent`) tries two shortcuts
 before `elementEq`: bit identity (same tag and payload), and, when
@@ -244,7 +244,7 @@ immediate is `=` only to an immediate of its own kind (SEMANTICS
 §3.3). Both are exact: two keywords are `=` exactly when their ids
 are equal, and a keyword or fixnum key never reaches the callback.
 
-#### 6.6 `MapLookup`
+#### 6.3 `MapLookup`
 
 `mapGet` returns `MapLookup`, a union of `absent` and `present: Value`,
 not `?Value`: nil is a legal map value, and absence is ordinary flow,
@@ -273,7 +273,7 @@ payload through the same fold, so the result is independent of subkind
 and layout, and `dispatch.hashValue` mixes the kind's domain byte in on
 top.
 
-#### 7.5 Caching
+#### 7.3 Caching
 
 `hashMap` and `hashSet` return the aggregate truncated to `u32` and
 cache it in the root header when nonzero (the HEAP.md cache rule).
@@ -293,11 +293,11 @@ Interior and collision nodes cache nothing.
 | `mapFromEntries(heap, entries, eh, ee)` | `setFromElements(heap, elems, eh, ee)` | §8.1 |
 | `mapAssoc(heap, m, k, v, eh, ee)` | `setConj(heap, s, e, eh, ee)` | §8.1 |
 | `mapDissoc(heap, m, k, eh, ee)` | `setDisj(heap, s, e, eh, ee)` | §8.1 |
-| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool`, `setGet(s, e, eh, ee) ?Value` | §6.6 |
+| `mapGet(m, k, eh, ee) MapLookup` | `setContains(s, e, eh, ee) bool`, `setGet(s, e, eh, ee) ?Value` | §6.3 |
 | `mapFind(m, k, eh, ee) ?Entry` | | The stored entry, its key as the map holds it (`find`) |
 | `mapCount(m)`, `mapIter(m)` → `MapIter` | `setCount(s)`, `setIter(s)` → `SetIter` | `next()` gives `?Entry` / `?Value` in iteration order (§8.1) |
 | `hashMap(h, eh)` | `hashSet(h, eh)` | §7 |
-| `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.3; header arguments |
+| `equalMap(a, b, eh, ee)` | `equalSet(a, b, eh, ee)` | §6.1; header arguments |
 | `traceMap(h, visitor)` | `traceSet(h, visitor)` | GC trace: every key and value, every internal node through `markInternal` |
 | `valueFromMapHeader(h)` | `valueFromSetHeader(h)` | the Value for a root header (`docs/TRANSIENT.md` §8) |
 | `mapCollisionCount(m, hash32) ?u32` | `setCollisionCount(s, hash32) ?u32` | tests: the collision node's count along `hash32`, or null (§12.3) |

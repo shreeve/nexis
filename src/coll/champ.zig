@@ -86,7 +86,7 @@ pub const Entry = extern struct {
 };
 
 /// Nil-safe lookup result. `?Value` would conflate "absent" with
-/// "present with nil value" (CHAMP.md §6.6).
+/// "present with nil value" (CHAMP.md §6.3).
 pub const MapLookup = union(enum) {
     absent,
     present: Value,
@@ -149,7 +149,7 @@ inline fn afterHeader(h: *HeapHeader) [*]u8 {
 // =============================================================================
 
 /// Key equality with two shortcuts ahead of `elementEq` (CHAMP.md
-/// §6.5): bit identity, and an immediate on either side compared
+/// §6.2): bit identity, and an immediate on either side compared
 /// inline, since an immediate is `=` only to an immediate of its kind.
 inline fn keyEquivalent(a: Value, b: Value, elementEq: ElementEq) bool {
     if (a.tag == b.tag and a.payload == b.payload) return true;
@@ -1069,7 +1069,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         /// The pre-domain-mix hash (CHAMP.md §7): an unordered combine
         /// of payload hashes, cached in the root header at u32
-        /// precision (§7.5).
+        /// precision (§7.3).
         fn hashOf(h: *HeapHeader, elementHash: ElementHash) u64 {
             if (h.cachedHash()) |cached| return cached;
             var acc: u64 = hash_mod.unordered_init;
@@ -1083,7 +1083,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             return truncated;
         }
 
-        /// Semantic equality (CHAMP.md §6.3): equal counts, and every
+        /// Semantic equality (CHAMP.md §6.1): equal counts, and every
         /// payload of `a` found in `b` (for a map, with an equal value).
         fn equal(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
             if (a == b) return true;
