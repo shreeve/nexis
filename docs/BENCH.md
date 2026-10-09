@@ -136,8 +136,9 @@ everywhere is not published.
 ### 10. The harness: `zig build bench`
 
 `src/bench.zig` is the harness: `Runner` (the adaptive inner loop,
-warm-up and sampling), `Stats` (the order statistics), `writeTable`
-and `writeJson`. `bench/main.zig` is the suite and its driver;
+warm-up and sampling), `BenchResult` (a row and its order
+statistics), `writeTable` and `writeJson`, which writes through
+`std.json`. `bench/main.zig` is the suite and its driver;
 `bench/nextomic.zig` holds the Nextomic rows. The step builds
 `bin/nexis-bench` and runs it with the arguments after `--`. The
 runner and the runtime it drives are compiled `fast` when

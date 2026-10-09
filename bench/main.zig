@@ -541,7 +541,7 @@ pub fn main(init: std.process.Init) !u8 {
     const heap_backing = init.gpa;
 
     // ---- Runner ----
-    var runner = try Runner.init(alloc, .{});
+    var runner: Runner = .{ .allocator = alloc, .io = io };
     defer runner.deinit();
 
     // ---- Shared interner + heap for non-DB benches ----
