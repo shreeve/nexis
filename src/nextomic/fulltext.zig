@@ -2,7 +2,7 @@
 //! (NEXTOMIC.md §2, §5).
 //!
 //! Invariants:
-//!   - A row `[a:4][token][0x00][e:6][hash:16]` with an empty value is in
+//!   - A row `[A(a)][token][0x00][E(e)][hash:16]` with an empty value is in
 //!     the tree iff attribute `a` carries `:db/fulltext true` and `e`
 //!     currently holds under `a` a string value whose 128-bit content
 //!     hash (`key.hash128`) is `hash` and whose tokens include `token`.

@@ -123,10 +123,11 @@ excision touched the entry the count and the entities it excised. A
 row is the entity less the previous row's (zigzag LEB), `a << 1 |
 added` (LEB), and `v` in the attribute's value type, which never
 changes: a long or an instant zigzag LEB, a double its 8 bytes, a
-boolean one byte, a keyword its ident id and a ref its eid (LEB), a
+boolean one byte, a keyword its ident id (LEB), a ref its `E(e)`, a
 uuid 16 bytes, a string or byte array of at most 96 bytes its length
-and bytes. A longer one is the mark 97 and its index encoding after
-the tag (prefix and hash, §2.2): its payload is read from the fact's
+(LEB) and bytes. A longer one is the mark 97, then the length (LEB)
+and bytes of its index encoding after the tag (prefix and hash,
+§2.2): its payload is read from the fact's
 EAVT or EAVT-h row when the entry is decoded, so the log never repeats
 it, and a damaged index page fails `tx-range` too. The flags say
 whether a row's entity is in the attribute partition (the schema

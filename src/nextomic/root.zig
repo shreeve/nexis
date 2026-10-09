@@ -20,36 +20,18 @@ pub const natives = @import("natives.zig");
 pub const marshal = @import("marshal.zig");
 
 pub const Val = key.Val;
-pub const ValueType = key.ValueType;
 pub const Index = key.Index;
 pub const Datom = datom.Datom;
 pub const Store = store.Store;
 pub const boot = store.boot;
-pub const Idents = idents.Idents;
-pub const Schema = schema.Schema;
 pub const Attr = schema.Attr;
 pub const Conn = db.Conn;
 pub const DbValue = db.DbValue;
-pub const Error = db.Error;
 pub const Report = transact.Report;
-pub const With = transact.With;
 pub const Op = transact.Op;
 pub const Relation = relation.Relation;
 pub const Cell = relation.Cell;
 
 test {
-    _ = key;
-    _ = datom;
-    _ = store;
-    _ = idents;
-    _ = schema;
-    _ = db;
-    _ = transact;
-    _ = excise;
-    _ = fulltext;
-    _ = relation;
-    _ = query;
-    _ = pull;
-    _ = natives;
-    _ = marshal;
+    @import("std").testing.refAllDecls(@This());
 }
