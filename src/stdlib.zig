@@ -1823,11 +1823,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
 /// `reduced?` is a type test and `@` reads the value back.
 fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
     const type_id = vm.ensureReducedType() catch return VmError.OutOfMemory;
-    const heap = vm.ensureHeap();
-    const key = vm.ensureInterner().internKeywordValue("val") catch return VmError.OutOfMemory;
-    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const fields = try mapPut(heap, empty, key, args[0]);
-    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+    return record_mod.make(vm.ensureHeap(), type_id, try keywordMap(vm, &.{.{ "val", args[0] }})) catch VmError.OutOfMemory;
 }
 
 fn fnReducedQ(vm: *VM, args: []const Value) VmError!Value {
@@ -3280,20 +3276,11 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
 /// anything else is `:kind-mismatch`. Keys are interned at the call,
 /// not at boot.
 fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
-    const heap = vm.ensureHeap();
-    const interner = vm.ensureInterner();
     if (!args[0].isNil() and args[0].kind() != .string) return VmError.KindMismatch;
     if (!args[1].isNil() and !isMap(args[1].kind())) return VmError.KindMismatch;
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    var fields: [3]Value = undefined;
-    @memcpy(fields[0..args.len], args);
-    if (args[1].isNil()) fields[1] = m;
-    const names = [_][]const u8{ "message", "data", "cause" };
-    for (fields[0..args.len], 0..) |v, i| {
-        const key = interner.internKeywordValue(names[i]) catch return VmError.OutOfMemory;
-        m = try mapPut(heap, m, key, v);
-    }
-    return m;
+    const data = if (args[1].isNil()) champ_mod.mapEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory else args[1];
+    const fields = [_]KeywordField{ .{ "message", args[0] }, .{ "data", data }, .{ "cause", if (args.len == 3) args[2] else undefined } };
+    return keywordMap(vm, fields[0..args.len]);
 }
 
 /// `(ex-data e)` → the `:data` of an `ex-info` map; an error map,
@@ -3348,13 +3335,7 @@ fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
     if (s.kind() != .string or (args.len == 2 and opts.kind() != .persistent_map)) return VmError.KindMismatch;
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     if (try hooks.read_string(hooks.user_data, vm, string_mod.asBytes(s))) |form| return form;
-    if (args.len == 2) {
-        const eof = vm.ensureInterner().internKeywordValue("eof") catch return VmError.OutOfMemory;
-        switch (champ_mod.mapGet(opts, eof, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-            .present => |v| return v,
-            .absent => {},
-        }
-    }
+    if (args.len == 2) if (try keywordGet(vm, opts, "eof")) |v| return v;
     return vm.throwKeyword("reader-error");
 }
 
@@ -3607,8 +3588,7 @@ fn isLibraryNs(name: []const u8) bool {
 /// `v`'s metadata map with the docstring `packDocs` packed for it, when
 /// it has none and one was packed; the map itself otherwise.
 fn withPackedDoc(vm: *VM, v: *vm_mod.Var) VmError!Value {
-    const doc_key = vm.ensureInterner().internKeywordValue("doc") catch return VmError.OutOfMemory;
-    if (champ_mod.mapGet(v.meta, doc_key, &dispatch_mod.hashValue, &dispatch_mod.equal) == .present) return v.meta;
+    if (try keywordGet(vm, v.meta, "doc") != null) return v.meta;
     const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
     const internal = registry.lookupNs("nexis.internal") orelse return v.meta;
     const docs_var = internal.lookupLocal("#%docs") orelse return v.meta;
@@ -3620,7 +3600,7 @@ fn withPackedDoc(vm: *VM, v: *vm_mod.Var) VmError!Value {
         const key = blob[i..key_end];
         if (key.len == v.ns.len + 1 + v.name.len and std.mem.startsWith(u8, key, v.ns) and key[v.ns.len] == '/' and std.mem.endsWith(u8, key, v.name)) {
             const doc = string_mod.fromBytes(vm.ensureHeap(), blob[key_end + 1 .. doc_end]) catch return VmError.OutOfMemory;
-            return mapPut(vm.ensureHeap(), v.meta, doc_key, doc);
+            return keywordAssoc(vm, v.meta, &.{.{ "doc", doc }});
         }
         i = doc_end + 1;
     }
@@ -3647,6 +3627,26 @@ fn keywordAssoc(vm: *VM, m: Value, fields: []const KeywordField) VmError!Value {
     var out = m;
     for (fields) |f| out = try mapPut(vm.ensureHeap(), out, vm.ensureInterner().internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
     return out;
+}
+
+/// The value of the keyword `name` in the hash map `m`, null when it
+/// has none.
+fn keywordGet(vm: *VM, m: Value, name: []const u8) VmError!?Value {
+    const k = vm.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
+    return switch (champ_mod.mapGet(m, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
+        .present => |v| v,
+        .absent => null,
+    };
+}
+
+/// `m` with `k` mapped to `v`, under the runtime's `hash` and `=`.
+fn mapPut(heap: *heap_mod.Heap, m: Value, k: Value, v: Value) VmError!Value {
+    return champ_mod.mapAssoc(heap, m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
+}
+
+/// Whether the hash map `m` has the key `k`.
+fn mapHas(m: Value, k: Value) bool {
+    return champ_mod.mapGet(m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .present;
 }
 
 /// A special form's or host macro's documentation: `forms`, the text
@@ -3906,16 +3906,6 @@ fn kindPredicate(comptime pred: fn (Kind) bool) *const fn (*VM, []const Value) V
 fn isSeq(k: Kind) bool {
     return k == .list or k == .lazy_seq;
 }
-/// `m` with `k` mapped to `v`, under the runtime's `hash` and `=`.
-fn mapPut(heap: *heap_mod.Heap, m: Value, k: Value, v: Value) VmError!Value {
-    return champ_mod.mapAssoc(heap, m, k, v, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
-}
-
-/// Whether the hash map `m` has the key `k`.
-fn mapHas(m: Value, k: Value) bool {
-    return champ_mod.mapGet(m, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .present;
-}
-
 fn isMap(k: Kind) bool {
     return k == .persistent_map or k == .record or k == .sorted_map;
 }
@@ -4031,11 +4021,7 @@ fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
 fn durabilityOption(vm: *VM, opts: Value) VmError!?db_mod.Durability {
     if (opts.isNil()) return null;
     if (opts.kind() != .persistent_map) return VmError.KindMismatch;
-    const k = vm.ensureInterner().internKeywordValue("durability") catch return VmError.OutOfMemory;
-    const found = switch (champ_mod.mapGet(opts, k, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-        .absent => return null,
-        .present => |x| x,
-    };
+    const found = (try keywordGet(vm, opts, "durability")) orelse return null;
     if (found.kind() != .keyword) return VmError.InvalidArgument;
     return db_mod.Durability.parse(vm.ensureInterner().keywordName(found.asKeywordId())) orelse VmError.InvalidArgument;
 }
@@ -4476,16 +4462,12 @@ fn nsVars(vm: *VM, args: []const Value, comptime publics: bool) VmError!Value {
     const ns = try theNs(vm, args[0]);
     const interner = vm.ensureInterner();
     const heap = vm.ensureHeap();
-    const private_key = interner.internKeywordValue("private") catch return VmError.OutOfMemory;
     var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
     var it = ns.vars.iterator();
     while (it.next()) |entry| {
         const v = entry.value_ptr.*;
         if (entry.key_ptr.*.ptr != v.name.ptr) continue;
-        if (publics and v.meta.kind() == .persistent_map) switch (champ_mod.mapGet(v.meta, private_key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-            .present => |flag| if (flag.isTruthy()) continue,
-            .absent => {},
-        };
+        if (publics and v.meta.kind() == .persistent_map) if (try keywordGet(vm, v.meta, "private")) |flag| if (flag.isTruthy()) continue;
         const sym = interner.internSymbolValue(v.name) catch return VmError.OutOfMemory;
         m = try mapPut(heap, m, sym, VM.varToValue(v));
     }
@@ -4570,16 +4552,12 @@ fn isDelay(vm: *VM, v: Value) bool {
 fn fnDelay(vm: *VM, args: []const Value) VmError!Value {
     const type_id = try delayType(vm);
     const heap = vm.ensureHeap();
-    const interner = vm.ensureInterner();
-    const pending = interner.internKeywordValue("pending") catch return VmError.OutOfMemory;
-    const key = interner.internKeywordValue("state") catch return VmError.OutOfMemory;
+    const pending = vm.ensureInterner().internKeywordValue("pending") catch return VmError.OutOfMemory;
     // `Heap.alloc` never collects (GC.md §11.5): the pieces need no
     // roots on their way into the record.
     const thunk = vector_mod.fromSlice(heap, &.{ pending, args[0] }) catch return VmError.OutOfMemory;
     const state = atom_mod.make(heap, thunk) catch return VmError.OutOfMemory;
-    const empty = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const fields = try mapPut(heap, empty, key, state);
-    return record_mod.make(heap, type_id, fields) catch VmError.OutOfMemory;
+    return record_mod.make(heap, type_id, try keywordMap(vm, &.{.{ "state", state }})) catch VmError.OutOfMemory;
 }
 
 fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
@@ -7107,11 +7085,7 @@ const JsonWriter = struct {
     fn instantMs(jw: *JsonWriter, v: Value) ?i64 {
         const t = jw.vm.recordType(record_mod.typeId(v)) orelse return null;
         if (!std.mem.eql(u8, t.ns_name, "nexis.time") or !std.mem.eql(u8, t.type_name, "Instant")) return null;
-        const ms_key = jw.vm.ensureInterner().internKeywordValue("ms") catch return null;
-        const ms = switch (champ_mod.mapGet(record_mod.fieldsOf(v), ms_key, &dispatch_mod.hashValue, &dispatch_mod.equal)) {
-            .present => |x| x,
-            .absent => return null,
-        };
+        const ms = (keywordGet(jw.vm, record_mod.fieldsOf(v), "ms") catch return null) orelse return null;
         return if (ms.kind() == .fixnum) ms.asFixnum() else null;
     }
 
