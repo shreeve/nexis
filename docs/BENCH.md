@@ -243,7 +243,7 @@ unique; name; age; department, a ref; salary):
 | Phase | Work |
 |---|---|
 | `create` | create the store, install the schema, transact the departments |
-| `load` | 100 transactions of 1,000 people each, map forms, in the default commit |
+| `load` | 100 transactions of 1,000 people each, map forms, in the default commit (Nextomic: `:commit`, below) |
 | `index` | Datomic Pro only: `request-index` and `sync-index` after the load, so the store's size and the queries see indexed data |
 | `open` | reopen the loaded store in a new process (Datomic Pro: a new peer connects) |
 | `lookup-10k` | 10,000 entities by lookup ref on the unique email, one attribute read each |
@@ -251,11 +251,11 @@ unique; name; age; department, a ref; salary):
 | `aggregate` | `(sum ?s)` of salaries per department `:with` the person, over every person |
 | `pull-10k` | a pull of 10,000 people with a nested ref pattern |
 | `lookup-10k-warm`, `pull-10k-warm` | the same two over other people, nine passes in the same process, the median pass |
-| `tx-1k-default` | 1,000 transactions of one datom each, in each system's default commit |
+| `tx-1k-default` | 1,000 transactions of one datom each, in the default commit |
 | `tx-1k-durable` | 1,000 more, each commit on the device before it returns |
 | `tx-1k-nosync` | 1,000 more with the commit's flush off and one sync at the end |
-| `tx-entity-1k` | 1,000 transactions of one new person with all five attributes, in each system's default commit |
-| `tx-upsert-1k` | 1,000 transactions of one existing person with all five attributes, upserted through the unique email, the salary alone changed, in each system's default commit |
+| `tx-entity-1k` | 1,000 transactions of one new person with all five attributes, in the default commit |
+| `tx-upsert-1k` | 1,000 transactions of one existing person with all five attributes, upserted through the unique email, the salary alone changed, in the default commit |
 | `as-of+history` | the salary total as of the basis before the writes, and a `history` count |
 | `create-durable`, `load-durable` | Nextomic only: `create` and `load` through a durable connection |
 | `create-nosync`, `load-nosync` | `create` and `load` with the flush off and one sync at the end |
@@ -371,13 +371,15 @@ after each.
 - *Durability.* The rows are grouped by what a commit guarantees when
   it returns, and what each system does was traced with `strace -f`
   over 200 one-datom transactions (Linux, `docs/PERF.md` §3.15):
-  - Nextomic's default commit (`:commit`, `docs/DB.md` §3.3) syncs
-    nothing: it is atomic and survives a crash of the process, and the
+  - Nextomic's default commit rows open the connection
+    `{:durability :commit}` (`docs/DB.md` §3.3), which syncs nothing:
+    a commit is atomic and survives a crash of the process, and the
     file is synced once when the connection is released, outside the
-    timed phase (one `fdatasync` in the trace). A connection opened
-    `{:durability :durable}` syncs data and meta on every commit: two
-    `fdatasync` on Linux, two `fcntl(F_FULLFSYNC)` on macOS, which
-    ask the drive to empty its write cache.
+    timed phase (one `fdatasync` in the trace). Its `durable` rows
+    take nexis's default, `{:durability :durable}`, which syncs data
+    and meta on every commit: two `fdatasync` on Linux, two
+    `fcntl(F_FULLFSYNC)` on macOS, which ask the drive to empty its
+    write cache.
   - Datalevin 1.1.0's datalog store opens with the LMDB flags
     `#{:nordahead :notls}` (`get-env-flags`) and its write-ahead log off
     (`opts` gives `:wal? false`), so a commit syncs as LMDB does: one
@@ -402,11 +404,12 @@ after each.
     (PostgreSQL, DynamoDB, Cassandra) commits as that storage does and
     is not measured here.
 
-  The `default` rows therefore compare different guarantees, each
-  system's default, and the `durable` rows the same one. The `nosync`
-  rows compare the transaction machinery alone: Nextomic's `{:sync
-  :none}` per transaction and `d/sync` at the end; Datalevin's
-  `:nosync` environment flag and `sync` at the end.
+  The `default` rows therefore compare different guarantees, Nextomic's
+  `:commit` beside each other system's default, and the `durable` rows
+  the same one, each system's default. The `nosync` rows compare the
+  transaction machinery alone: Nextomic's `{:sync :none}` per
+  transaction and `d/sync` at the end; Datalevin's `:nosync`
+  environment flag and `sync` at the end.
 - *What a write stores.* Nextomic writes every datom to EAVT and AEVT,
   AVET for unique and indexed attributes, VAET for refs, the four
   history twins of those, and a txlog entry per transaction

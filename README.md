@@ -44,6 +44,10 @@ throw away.
   (:person/age (d/entity before [:person/name "Ada"]))       ;; => 36: the past is still there
   ```
 
+  Every commit, Nextomic's and `db/*`'s, is on the disk when it
+  returns; a program of many small transactions can trade that for
+  speed with `{:durability :commit}` (`docs/DB.md` §3.3).
+
 It suits local-first tools and command-line programs that need real
 history (audit trails, "what did this look like last Tuesday", undo),
 small services and batch jobs where a database server would be

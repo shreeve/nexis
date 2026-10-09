@@ -323,11 +323,11 @@ reads back equal.
   in the same process is `:db/busy`.
 - `db/scan` and `db/reduce-tree` walk a tree in key order; keys come
   back as strings, which `db/ref` takes back.
-- Whether a commit waits for the disk is the connection's durability:
-  `(db/open path {:durability :durable})` syncs every commit, and
-  `docs/DB.md` §3.3 says what each setting keeps through a crash and
-  which one a connection gets by default. `db/sync` and `db/close`
-  make every earlier commit durable.
+- Every commit waits for the disk unless the connection says
+  otherwise: `(db/open path {:durability :commit})` skips the sync
+  for speed, and `db/sync` and `db/close` then make every earlier
+  commit durable. `docs/DB.md` §3.3 says what each setting keeps
+  through a crash.
 - A store file carries between machines but not between nexis
   releases (README "Versions and stores").
 

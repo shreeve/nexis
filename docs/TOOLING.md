@@ -65,9 +65,9 @@ and below that the main thread's own stack; the stack guard is armed
 for whichever runs, so only the depth a program can reach shrinks.
 
 **Environment.** `NEXIS_DURABILITY` is the durability of every store
-connection that names none: `commit` (the default: a commit syncs
-nothing, and the file is synced at close, `sync` and the end of the
-program) or `durable` (every commit syncs); `docs/DB.md` §3.3. Any
+connection that names none: `durable` (the default: every commit
+syncs) or `commit` (a commit syncs nothing, and the file is synced at
+close, `sync` and the end of the program); `docs/DB.md` §3.3. Any
 other value stops the command before it runs with `nexis:
 NEXIS_DURABILITY is not commit or durable`, exit 1.
 `NEXIS_MAX_ALLOC` is below; `NEXIS_GC_STRESS` is `docs/GC.md` §7, and

@@ -44,9 +44,9 @@ every file under `examples/lib/`, `test/golden/cli/lib/`) and its
 environment. Every test binary and program runs with an environment
 of its own, empty but for `NEXIS_GC_STRESS` (always set for
 `test/nextomic/`, elsewhere under `-Dgc-stress`) and
-`NEXIS_DURABILITY` (under `-Ddurability`); nothing exported in the
-shell reaches it. A change to any of them re-runs it, a program in a
-directory emptied that build. The two runs that share a store
+`NEXIS_DURABILITY` (`commit`, `durable` under `-Ddurability=durable`);
+nothing exported in the shell reaches it. A change to any of them
+re-runs it, a program in a directory emptied that build. The two runs that share a store
 (`persist-1`/`persist-2`, an example with a `.2.out`) both run on
 every build.
 

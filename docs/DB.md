@@ -245,8 +245,8 @@ returns is the connection's durability, `db.Durability`:
 
 | Durability | A commit | Lost if the process crashes | Lost if the system crashes |
 |---|---|---|---|
-| `:commit` (default) | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync, where the storage writes in order; where it may reorder writes, possibly the whole store |
-| `:durable` | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing, unless a `:commit` commit to the file followed it with no sync since |
+| `:durable` (default) | syncs data, then meta: two `fcntl(F_FULLFSYNC)` on macOS, two `fdatasync` on Linux | nothing | nothing, unless a `:commit` commit to the file followed it with no sync since |
+| `:commit` | syncs nothing (emdb `.sync = .none`) | nothing | the commits since the file's last sync, where the storage writes in order; where it may reorder writes, possibly the whole store |
 
 The `:commit` row is emdb's MODE-NOSYNC. A commit that synced nothing
 gives up, until the file's next sync, what every commit before it
@@ -260,10 +260,34 @@ of writes only the last unsynced commits are lost.
 
 `(db/open path {:durability d})` sets it for one connection. Without
 it a connection takes the process's: the environment variable
-`NEXIS_DURABILITY`, `commit` or `durable`, and `commit` when it is
+`NEXIS_DURABILITY`, `commit` or `durable`, and `durable` when it is
 unset (`bin/nexis` refuses any other value at start, `docs/TOOLING.md`
 §1). Nextomic's `connect` takes the same option, and `transact!` a
-per-transaction `:sync` (`docs/NEXTOMIC.md` §3).
+per-transaction `:sync` (`docs/NEXTOMIC.md` §3). The build sets
+`NEXIS_DURABILITY=commit` on every test and program the gate runs,
+and `-Ddurability=durable` the default (`AGENTS.md`).
+
+**Why durable is the default.** A store holds a program's durable
+identities, and a database that returns from a commit should have
+kept it: SQLite (`synchronous=FULL`), LMDB, Datalevin and Datomic
+Local all sync a commit before it returns unless asked not to. `:commit` can
+lose more than its own commits, the whole store where the storage
+reorders writes (the table above), which no program should get
+without asking. A durable commit costs the device's flush, twice, and
+the writing of its pages: on the Linux host of `docs/PERF.md` §3.15
+(ext4 on NVMe) 2.2 ms for a small Nextomic transaction against 13 μs
+with `:commit`, and 6–7 ms on an Apple M5 (APFS, `F_FULLFSYNC`). A
+program of a few transactions pays a few milliseconds: a schema and
+one transaction in a fresh store take 17–23 ms durable against
+10–12 ms with `:commit` on the Linux host, whose `:commit` run syncs
+once at its end. A program of many small transactions pays the flush
+for each: a thousand take 2.1 s durable against 17–22 ms there, and
+6–7 s against 17–23 ms on the M5. Such a program asks for speed: it
+batches its writes into fewer transactions (a transaction of a
+thousand entities commits with one pair of flushes), opens its
+connection `{:durability :commit}`, or commits with `{:sync :none}`
+and calls `sync` where it must not lose what it wrote (`docs/PERF.md`
+§3 "Durable commits").
 
 Creating a file syncs its first state before `db/open` returns (emdb
 writes and syncs a new file's meta pages), so a new store is on the

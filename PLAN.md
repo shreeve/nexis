@@ -966,3 +966,21 @@ entry stating the decision and its rationale.
   padded every key; the §3.11 load goes from 144 MB to 51 MB with
   identical query results (`docs/PERF.md` §3.36). `docs/NEXTOMIC.md`
   §1–§2 are the authority.
+
+- **2026-10-09 — Commits are durable by default.** A connection
+  that names no durability, `db/open`'s and Nextomic's `connect`'s
+  alike, takes `:durable`: every commit syncs data and meta before it
+  returns, and `NEXIS_DURABILITY` unset means `durable`. `:commit`,
+  which syncs nothing and leaves the file to be synced at close,
+  `sync` and exit, stays the explicit fast mode, chosen per
+  connection, per process or per transaction (`{:sync :none}`).
+  Reason: durable identity is the project's premise, and a commit that
+  has not reached the disk can lose, on a crash of the system, every
+  commit since the last sync and, where writes reach the disk out of
+  order, the whole store; SQLite, LMDB, Datalevin and Datomic Local
+  all sync a commit by default. The price is the device's flush per
+  commit, 2.2 ms on the Linux host and 6–7 ms on the Apple one, which
+  a program of many small transactions avoids by batching or by
+  asking for `:commit`. The gate runs its tests and programs with
+  `commit`, and `-Ddurability=durable` with the default.
+  `docs/DB.md` §3.3 is the authority.

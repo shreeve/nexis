@@ -550,7 +550,16 @@ when `transact!` returns, what a crash can lose, and when the file is
 synced (`(d/sync conn)`, `release`, the end of the program) are the
 connection's durability, `docs/DB.md` §3.3, which
 `(d/connect path {:durability d})` sets for one connection; without it
-the connection takes the process's, `NEXIS_DURABILITY`.
+the connection takes the process's, `NEXIS_DURABILITY`, and
+`:durable` when that is unset: `transact!` returns once its
+transaction is on the disk, as Datomic's `transact` does. `:commit`
+returns once the transaction is atomic and seen by every connection
+and process, survives a crash of the process, and leaves the file to
+be synced at `d/sync`, `release` and the end of the program, so a
+crash of the system can lose the commits since the last sync; a
+program of many small transactions chooses it, or `:sync :none` on
+the transactions of a load, for speed (`docs/DB.md` §3.3 "Why durable
+is the default").
 
 A transaction's own `{:sync s}` overrides its connection's for its
 commit: `:full` syncs data and meta, `:no-meta` data alone, `:none`
@@ -1287,16 +1296,6 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 ---
 
 ## 12. Differences from Datomic
-
-- **A transaction returns committed, not synced.** Datomic's
-  `transact` returns once the transaction is durable in storage.
-  Nextomic's default durability, `:commit`, returns once it is atomic
-  and visible to every connection and process: it survives a crash of
-  the process, and the file is synced at `sync`, `release` and the
-  end of the program, so a crash of the system can lose the commits
-  since the last sync. `{:durability :durable}` on the connection, or
-  `{:sync :full}` on one transaction, gives Datomic's contract at two
-  device flushes a commit (§3 "Durability").
 
 - **An ident rename retires the old keyword in every view** (§3 step
   5): after `[:db/add :person/name :db/ident :person/full-name]` every
