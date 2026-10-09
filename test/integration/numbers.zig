@@ -256,4 +256,6 @@ test "nexis.math: signum, to-radians, to-degrees, floor-div and floor-mod" {
     try expectOutput("[(nexis.math/floor-div 7 2) (nexis.math/floor-div -7 2) (nexis.math/floor-div 7 -2) (nexis.math/floor-div -7 -2) (nexis.math/floor-div 7.9 2)]", "[3 -4 -4 3 3]");
     try expectOutput("[(nexis.math/floor-mod -7 2) (nexis.math/floor-mod 7 -2) (nexis.math/floor-mod 7 2) (nexis.math/floor-div 100000000000000000001 -2)]", "[1 -1 1 -50000000000000000001]");
     try expectOutput("[(try (nexis.math/floor-div 1 0) (catch any e e)) (try (nexis.math/floor-mod 1 0) (catch any e e))]", "[{:error :divide-by-zero, :message divide by zero, :fn test-form} {:error :divide-by-zero, :message divide by zero, :fn test-form}]");
+    // Java's Long/MIN_VALUE by -1 wraps there; every integer operator promotes here.
+    try expectOutput("(nexis.math/floor-div -9223372036854775808 -1)", "9223372036854775808");
 }
