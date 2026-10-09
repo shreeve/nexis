@@ -2796,12 +2796,22 @@ pub const RuntimeHooks = struct {
         const origin = reader_mod.SrcSpan{ .pos = 0, .len = 0 };
         // A form is data: its lazy seqs are realized and made lists.
         const form = expand_mod.valueToForm(&ctx, try seq_mod.asLists(v, form_value), origin) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
         const expanded = expand_mod.expandOnce(&ctx, form) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
         const out = expanded orelse return null;
         return expand_mod.formToValue(&ctx, out) catch |err|
-            return failure(v, err, "macro-expansion-failure");
+            return expansionFailure(v, &ctx, err);
+    }
+
+    /// Out of memory stays an error; any other failure of `macroexpand-1`
+    /// throws `:macro-expansion-failure`, its message the expander's
+    /// sentence (what the macro threw, or why the form is malformed)
+    /// when there is one, placed as a runtime error is (VM.md §13).
+    fn expansionFailure(v: *vm.VM, ctx: *const expand_mod.ExpandContext, err: anyerror) vm.VmError {
+        if (err == error.OutOfMemory) return vm.VmError.OutOfMemory;
+        const tag = v.ensureInterner().internKeywordValue("macro-expansion-failure") catch return vm.VmError.OutOfMemory;
+        return v.throwErrorMap(v.errorValue(tag, if (ctx.failure) |f| f.message else "", null));
     }
 
     /// The first form of `source`, as data; null when it holds none.

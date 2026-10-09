@@ -2014,7 +2014,7 @@ test "integration: with-open closes each binding in reverse order, through Close
         \\ (try (with-open [c (->R 3)] (throw :boom)) (catch any e e)) @log (with-open [] 7)]
     , "[:result [:body 2 1] :boom [:body 2 1 3] 7]");
     try expectOutput("(try (with-open [a 1] 2) (catch any e e))", "{:error :no-protocol-impl, :message no impl of close for an integer, :fn test-form}");
-    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", "{:error :macro-expansion-failure, :message macro expansion failure, :fn test-form}");
+    try expectOutput("(try (macroexpand '(with-open [a] 1)) (catch any e e))", "{:error :macro-expansion-failure, :message macro with-open threw with-open takes a vector of symbol and value pairs, :fn test-form}");
     try expectOutputProgramWithStore("with-open-conns",
         \\(def c (with-open [c (db/open "@STORE@")] c))
         \\(def n (with-open [n (nextomic/connect "@STORE@.nextomic")] n))
@@ -8714,4 +8714,9 @@ test "reader: #! is a comment to the end of its line anywhere, as in Clojure" {
 test "a failed :pre or :post carries the place keys of the condition, as a runtime error does" {
     try expectLoaded("(try ((fn [x] {:pre [(pos? x)]} x) -1) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (pos? x) 1 22]");
     try expectLoaded("(try ((fn [x]\n {:post [(> % 10)]} x) 3) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (> % 10) 2 10]");
+}
+
+test "macroexpand-1 says why a macro failed" {
+    try expectOutputProgram("(defmacro m [] (throw (ex-info \"bad input\" {}))) (try (macroexpand-1 '(m)) (catch :macro-expansion-failure e (:message e)))", "macro m threw bad input");
+    try expectOutput("(try (macroexpand-1 '(when)) (catch any e [(:error e) (:message e)]))", "[:macro-expansion-failure when: expected a test]");
 }

@@ -170,8 +170,10 @@ otherwise it is an ordinary call. User macros shadow host macros.
      or host macro at the head, never a special form or `#%`
      primitive; the raw output, nothing inside it expanded, no
      lexical environment), or the form itself. `macroexpand` repeats
-     it until the head is not a macro. A failure throws
-     `:macro-expansion-failure`.
+     it until the head is not a macro. A failure throws the error map
+     of `:macro-expansion-failure` (`docs/VM.md` §13), its `:message`
+     the expander's sentence (§8): what the macro threw, or why the
+     form is malformed.
    - `(read-string s)` reads the first form of `s` as data; a reader
      error throws `:reader-error`. Only the text up to the end of the
      first form is scanned and read (`reader.firstFormEnd`), so what
