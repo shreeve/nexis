@@ -1778,9 +1778,9 @@ fn fnClause(b: Builder, params_form: *const Form, forms: []const *Form) ExpandEr
 /// A fn body whose first form is a condition map `{:pre [c...]
 /// :post [c...]}` followed by more forms, as the checks around the
 /// rest: each `:pre` condition before it, each `:post` condition
-/// after it with `%` bound to its value. A failed check throws
-/// `{:error :assertion-failed :message "Assert failed: <c>"}`. Any
-/// other body is itself.
+/// after it with `%` bound to its value. A failed check raises
+/// `:assertion-failed`, "Assert failed: <c>", placed at the condition
+/// as a runtime error is. Any other body is itself.
 fn conditionedBody(b: Builder, body: []const *Form) ExpandError![]const *Form {
     if (body.len < 2 or body[0].datum != .map) return body;
     const pre = conditions(body[0], "pre");
@@ -1810,11 +1810,12 @@ fn conditions(map: *const Form, key: []const u8) ?[]const *Form {
     return null;
 }
 
-/// `(if c nil (throw {:error :assertion-failed :message ...}))`.
+/// `(if c nil (nexis.internal/#%raise :assertion-failed message))`.
 fn assertion(b: Builder, c: *const Form) ExpandError!*Form {
-    const prefix = try makeForm(b.ctx, .{ .string = "Assert failed: " }, b.origin);
-    const message = try b.list(.{ "nexis.core/str", prefix, try b.list(.{ "quote", c }) });
-    return b.list(.{ "if", c, null, try b.list(.{ "throw", try b.map(.{ ":error", ":assertion-failed", ":message", message }) }) });
+    const at = Builder{ .ctx = b.ctx, .origin = c.origin };
+    const prefix = try makeForm(b.ctx, .{ .string = "Assert failed: " }, c.origin);
+    const message = try at.list(.{ "nexis.core/str", prefix, try at.list(.{ "quote", c }) });
+    return at.list(.{ "if", c, null, try at.list(.{ "nexis.internal/#%raise", ":assertion-failed", message }) });
 }
 
 fn isAmpersand(form: *const Form) bool {

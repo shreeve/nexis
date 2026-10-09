@@ -1715,7 +1715,7 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
     // The shape :pre and :post throw: {:error :assertion-failed :message ...}.
     try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\")}]");
-    try expectOutput("(= (try (assert (pos? -1)) (catch any e e)) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc e :message \"Assert failed: (pos? -1)\"))))", "true");
+    try expectOutput("(= (try (assert (pos? -1)) (catch any e (dissoc e :fn :file :line :column))) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc (dissoc e :fn :file :line :column) :message \"Assert failed: (pos? -1)\"))))", "true");
     try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
 }
@@ -8709,4 +8709,9 @@ test "loader: an unterminated string or regex is reported as one, and as incompl
 test "reader: #! is a comment to the end of its line anywhere, as in Clojure" {
     try expectOutputProgram("#!/usr/bin/env nexis\n(+ 1 #! two\n 2)", "3");
     try expectOutputProgram("(read-string \"#!x\\n:k\")", ":k");
+}
+
+test "a failed :pre or :post carries the place keys of the condition, as a runtime error does" {
+    try expectLoaded("(try ((fn [x] {:pre [(pos? x)]} x) -1) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (pos? x) 1 22]");
+    try expectLoaded("(try ((fn [x]\n {:post [(> % 10)]} x) 3) (catch :assertion-failed e [(:message e) (:line e) (:column e)]))", "[Assert failed: (> % 10) 2 10]");
 }
