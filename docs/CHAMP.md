@@ -321,10 +321,11 @@ constants are public. Every constructor can fail only with
 - `mapFromEntries`/`setFromElements` return what a left fold of
   `mapAssoc`/`setConj` from empty returns (same subkind, same trie,
   same iteration order) and never fail on duplicates: a later entry's
-  value wins, the first key object and its position stay. The payloads
-  are sorted by slot path, on one 64-bit key each (the bit-reversed
-  indexing hash above the input position), equal keys merged, and each
-  node allocated once.
+  value wins, the first key object and its position stay. Up to eight
+  payloads make the array form as the fold makes it, each compared with
+  those kept and none hashed to index (§2.1). More are sorted by slot
+  path, on one 64-bit key each (the bit-reversed indexing hash above the
+  input position), equal keys merged, and each node allocated once.
 - **Iteration order.** An array form iterates in association order. A
   trie iterates depth first from the root: each node's payloads in
   ascending slot order, then its children in their stored, descending

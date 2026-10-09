@@ -1008,7 +1008,25 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// the value, keeping the first key), built bottom-up with one
         /// allocation per node.
         fn fromSlice(heap: *Heap, ps: []const P, elementHash: ElementHash, elementEq: ElementEq) !Value {
-            // A literal's handful of payloads sorts on the stack.
+            // A literal's handful of payloads is an array form, built as
+            // the fold builds it: no hash to index by, no sort.
+            if (ps.len <= array_map_max) {
+                var kept: [array_map_max]P = undefined;
+                var n: usize = 0;
+                next: for (ps) |p| {
+                    for (kept[0..n]) |*k| if (keyEquivalent(keyOf(k.*), keyOf(p), elementEq)) {
+                        k.* = replaced(k.*, p);
+                        continue :next;
+                    };
+                    hashAdded(keyOf(p), elementHash);
+                    kept[n] = p;
+                    n += 1;
+                }
+                const h = try allocArray(heap, n);
+                @memcpy(arrayPayloads(h), kept[0..n]);
+                return valueOf(h, subkind_array_map);
+            }
+            // A few more payloads sort on the stack.
             var small: [16]Item = undefined;
             const items = if (ps.len <= small.len) small[0..ps.len] else try heap.backing.alloc(Item, ps.len);
             defer if (ps.len > small.len) heap.backing.free(items);
