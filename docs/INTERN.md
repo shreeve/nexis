@@ -64,6 +64,8 @@ split (§3) and the map/list lockstep (§4) over random names.
 | `keywordCount()`, `symbolCount()` | The table sizes |
 | `nameRecordType(type_id, ns, name) !void` | Names a record type `ns.name`, the printer's source for `#ns.Type{...}` (`docs/PROTOCOLS.md` §2.1); naming an id again renames it |
 | `recordTypeName(type_id) ?[]const u8` | That name, or null for a type never named |
+| `nameProtocol(protocol_id, ns, name) !void` | Names a protocol `ns/name` (`name` alone for an empty `ns`), the printer's source for a protocol and its fns (`protocol.nameOf`, `docs/PROTOCOLS.md` §2.2); naming an id again renames it |
+| `protocolName(protocol_id) ?[]const u8` | That name, or null for a protocol never named |
 
 The intern calls fail with `error.OutOfMemory`, `error.EmptyName` or
 `error.InternTableFull` (`InternError`); the stdlib maps `EmptyName`

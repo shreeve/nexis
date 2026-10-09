@@ -112,14 +112,39 @@ fn nameFrom(table: *const Table, id: u32) []const u8 {
 // Interner — public API
 // =============================================================================
 
+/// Names by a dense per-VM id; an empty slice for an id not yet named.
+const IdNames = struct {
+    names: std.ArrayList([]const u8) = .empty,
+
+    fn deinit(self: *IdNames, gpa: Allocator) void {
+        for (self.names.items) |name| gpa.free(name);
+        self.names.deinit(gpa);
+    }
+
+    /// Name `id` `ns`, `sep` and `name`, or `name` alone when `ns` is
+    /// empty; naming an id again renames it.
+    fn set(self: *IdNames, gpa: Allocator, id: u32, ns: []const u8, sep: u8, name: []const u8) Allocator.Error!void {
+        const full = if (ns.len == 0) try gpa.dupe(u8, name) else try gpa.print("{s}{c}{s}", .{ ns, sep, name });
+        errdefer gpa.free(full);
+        while (self.names.items.len <= id) try self.names.append(gpa, &.{});
+        gpa.free(self.names.items[id]);
+        self.names.items[id] = full;
+    }
+
+    fn get(self: *const IdNames, id: u32) ?[]const u8 {
+        if (id >= self.names.items.len or self.names.items[id].len == 0) return null;
+        return self.names.items[id];
+    }
+};
+
 pub const Interner = struct {
     gpa: Allocator,
     keyword: Table = .{},
     symbol: Table = .{},
-    /// `ns.Type` of each record type, by its dense per-VM type id; an
-    /// empty slice for an id not yet named. The printer's source for
-    /// `#ns.Type{...}` (INTERN.md §2).
-    record_types: std.ArrayList([]const u8) = .empty,
+    /// `ns.Type` of each record type and `ns/Name` of each protocol, by
+    /// its dense per-VM id: what the printer writes (INTERN.md §2).
+    record_types: IdNames = .{},
+    protocols: IdNames = .{},
 
     pub fn init(gpa: Allocator) Interner {
         return .{ .gpa = gpa };
@@ -128,29 +153,34 @@ pub const Interner = struct {
     pub fn deinit(self: *Interner) void {
         self.keyword.deinit(self.gpa);
         self.symbol.deinit(self.gpa);
-        for (self.record_types.items) |name| self.gpa.free(name);
         self.record_types.deinit(self.gpa);
+        self.protocols.deinit(self.gpa);
         self.* = undefined;
     }
 
-    // ---- Record type names ----
+    // ---- Record type and protocol names ----
 
-    /// Name record type `type_id` as `ns.name`, the way Clojure
-    /// prints a record's class.
+    /// Name record type `type_id` `ns.name`, as Clojure prints a
+    /// record's class.
     pub fn nameRecordType(self: *Interner, type_id: u32, ns: []const u8, name: []const u8) Allocator.Error!void {
-        const full = try self.gpa.print("{s}.{s}", .{ ns, name });
-        errdefer self.gpa.free(full);
-        while (self.record_types.items.len <= type_id) try self.record_types.append(self.gpa, &.{});
-        self.gpa.free(self.record_types.items[type_id]);
-        self.record_types.items[type_id] = full;
+        return self.record_types.set(self.gpa, type_id, ns, '.', name);
     }
 
     /// The `ns.Type` name of record type `type_id`, or null when the
     /// type was never named.
     pub fn recordTypeName(self: *const Interner, type_id: u32) ?[]const u8 {
-        if (type_id >= self.record_types.items.len) return null;
-        const name = self.record_types.items[type_id];
-        return if (name.len == 0) null else name;
+        return self.record_types.get(type_id);
+    }
+
+    /// Name protocol `protocol_id` `ns/Name`, as its Var is named.
+    pub fn nameProtocol(self: *Interner, protocol_id: u32, ns: []const u8, name: []const u8) Allocator.Error!void {
+        return self.protocols.set(self.gpa, protocol_id, ns, '/', name);
+    }
+
+    /// The `ns/Name` of protocol `protocol_id`, or null when it was
+    /// never named.
+    pub fn protocolName(self: *const Interner, protocol_id: u32) ?[]const u8 {
+        return self.protocols.get(protocol_id);
     }
 
     // ---- Raw intern: name -> id ----
@@ -366,7 +396,7 @@ test "compareNames: unqualified first, then namespace, then name" {
     };
 }
 
-test "record type names: named ids print as ns.Type, others are null" {
+test "record type and protocol names: named ids give ns.Type and ns/Name, others null" {
     var it = Interner.init(testing.allocator);
     defer it.deinit();
     try testing.expect(it.recordTypeName(0) == null);
@@ -376,6 +406,11 @@ test "record type names: named ids print as ns.Type, others are null" {
     try testing.expect(it.recordTypeName(3) == null);
     try it.nameRecordType(2, "user", "P");
     try testing.expectEqualStrings("user.P", it.recordTypeName(2).?);
+    try it.nameProtocol(1, "user", "Shape");
+    try testing.expectEqualStrings("user/Shape", it.protocolName(1).?);
+    try testing.expect(it.protocolName(0) == null and it.protocolName(2) == null);
+    try it.nameProtocol(0, "", "Bare");
+    try testing.expectEqualStrings("Bare", it.protocolName(0).?);
 }
 
 test "by_name lookups survive names reallocation" {

@@ -21,6 +21,7 @@
 const std = @import("std");
 const value_mod = @import("value.zig");
 const heap_mod = @import("heap.zig");
+const intern_mod = @import("intern.zig");
 
 const Value = value_mod.Value;
 const Kind = value_mod.Kind;
@@ -88,6 +89,17 @@ pub inline fn protocolFnMethodNameId(v: Value) u32 {
     return Heap.bodyOf(ProtocolFnBody, Heap.asHeapHeader(v)).method_name_id;
 }
 
+/// The `ns/Name` of protocol `v`, or of the protocol a protocol fn `v`
+/// dispatches for; null when the interner never named it
+/// (`Interner.nameProtocol`).
+pub fn nameOf(v: Value, interner: *const intern_mod.Interner) ?[]const u8 {
+    return interner.protocolName(switch (v.kind()) {
+        .protocol => protocolId(v),
+        .protocol_fn => protocolFnProtocolId(v),
+        else => unreachable,
+    });
+}
+
 // =============================================================================
 // Inline tests
 // =============================================================================
@@ -103,6 +115,19 @@ test "makeProtocol / protocolId: round-trip" {
     const p = try makeProtocol(&heap, 42);
     try testing.expect(p.kind() == .protocol);
     try testing.expectEqual(@as(u32, 42), protocolId(p));
+}
+
+test "nameOf: a protocol and its fns by the name the interner holds" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    var it = intern_mod.Interner.init(testing.allocator);
+    defer it.deinit();
+    const p = try makeProtocol(&heap, 3);
+    const f = try makeProtocolFn(&heap, 3, 0);
+    try testing.expect(nameOf(p, &it) == null);
+    try it.nameProtocol(3, "user", "Shape");
+    try testing.expectEqualStrings("user/Shape", nameOf(p, &it).?);
+    try testing.expectEqualStrings("user/Shape", nameOf(f, &it).?);
 }
 
 test "makeProtocolFn / accessors" {
