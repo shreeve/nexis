@@ -720,14 +720,10 @@ const simd_docs = docs(simd_rows);
 // Implementations
 // =============================================================================
 
-/// `(list & xs)` → a fresh list of the args; `(list)` is `()`.
 fn fnList(vm: *VM, args: []const Value) VmError!Value {
     return list_mod.fromSlice(vm.ensureHeap(), args) catch VmError.OutOfMemory;
 }
 
-/// `(list* a b ... s)` → the leading args consed onto `s` as `cons`
-/// conses, so a lazy `s` is not realized; the last arg's seq itself
-/// when there are none: nil for an empty `s`, as Clojure's.
 fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
     const s = args[args.len - 1];
     if (args.len == 1) return seq_mod.seqOf(vm, s);
@@ -743,9 +739,6 @@ fn fnListStar(vm: *VM, args: []const Value) VmError!Value {
     return result;
 }
 
-/// `(cons x s)` → `x` in front of the seq of `s`, any seqable: a list
-/// cell onto nil, a list or a vector's view; a lazy seq's cons cell
-/// onto a lazy seq, which is not realized (LAZY.md §4).
 fn fnCons(vm: *VM, args: []const Value) VmError!Value {
     const s = args[1];
     return switch (s.kind()) {
@@ -764,7 +757,6 @@ fn consOnto(vm: *VM, x: Value, s: Value) VmError!Value {
     } catch VmError.OutOfMemory;
 }
 
-/// `(first s)` → head of the seq, or nil if empty/nil.
 fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     return switch (s.kind()) {
@@ -779,9 +771,7 @@ fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(rest s)` → seq of everything after the first element.
-/// Always returns a list (empty if input is empty/nil); of a vector,
-/// an O(1) view (LIST.md §1).
+/// A vector's rest is an O(1) view (LIST.md §1).
 fn fnRest(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     if (s.kind() == .persistent_vector) return list_mod.ofVector(vm.ensureHeap(), s, @min(1, vector_mod.count(s))) catch VmError.OutOfMemory;
@@ -806,25 +796,18 @@ fn lazyCount(v: Value) VmError!Value {
     return value_mod.fromFixnum(@intCast(try requireCount(v))).?;
 }
 
-/// `(take n coll)` → the lazy seq of the first `n` elements, one at a
-/// time (docs/LAZY.md §7).
 fn fnTake(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-take", args);
     return seq_mod.make(vm, seq_mod.op_take, &.{ try lazyCount(args[0]), args[1] });
 }
 
-/// `(drop n coll)` → the lazy seq of `coll` without its first `n`
-/// elements, walked when it is realized.
 fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-drop", args);
     return seq_mod.make(vm, seq_mod.op_drop, &.{ try lazyCount(args[0]), args[1] });
 }
 
-/// `(some pred coll)` → the first truthy `(pred x)`, else nil;
-/// `(every? pred coll)` → whether `(pred x)` is truthy for every x.
-/// Both stop at the first element that decides. Rooting: each built
-/// element is only the next call's argument (GC.md §11.5, class 2);
-/// both consume `coll` (`consumingSeqIter`).
+/// `some` and `every?`: each built element is only the next call's
+/// argument (GC.md §11.5, class 2); both consume `coll`.
 fn fnSome(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
@@ -848,17 +831,13 @@ fn fnEveryQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(true);
 }
 
-/// `(next s)` → `(seq (rest s))`: nil when nothing follows.
 fn fnNext(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .lazy_seq) return seq_mod.next(vm, args[0]);
     const r = try fnRest(vm, args);
     return if (list_mod.isEmpty(r)) value_mod.nilValue() else r;
 }
 
-/// `(seq coll)` → nil for nil or an empty collection, otherwise a
-/// list of the collection's elements (a non-empty list is
-/// returned as is; a vector gives an O(1) view, LIST.md §1). Maps
-/// yield `[k v]` entries, strings chars.
+/// A vector's seq is an O(1) view (LIST.md §1).
 fn fnSeq(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.seqOf(vm, args[0]);
 }
@@ -917,27 +896,14 @@ fn countConsumed(vm: *VM, s: Value) VmError!usize {
     return n;
 }
 
-/// `(nth coll n)` → element at index `n`. Throws on out-of-
-/// bounds. Negative indices rejected as `IndexOutOfBounds`.
-///
-/// `(nth coll n default)` → element at index `n`, or `default`
-/// if out-of-bounds. nil coll always returns default (nil without
-/// one, as in Clojure). Required
-/// by destructuring: `[a b c]` against a 2-element source binds
-/// c to nil, not throw.
 fn fnNth(vm: *VM, args: []const Value) VmError!Value {
     const coll = args[0];
     const idx_v = args[1];
     const has_default = args.len > 2;
     const default = if (has_default) args[2] else value_mod.nilValue();
     if (idx_v.kind() != .fixnum) return VmError.KindMismatch;
-    // Kind-check the receiver BEFORE consulting `idx < 0` /
-    // `has_default`. Otherwise the negative-index path would
-    // return `default` even when `coll` is non-indexable (e.g.
-    // `(nth 123 -1 :d) → :d`), a type-soundness violation —
-    // `:kind-mismatch` must fire on
-    // non-indexable receivers regardless of index sign or
-    // default arity.
+    // The receiver's kind is checked before the index's sign and the
+    // default: `(nth 123 -1 :d)` is `:kind-mismatch`.
     switch (coll.kind()) {
         .nil, .list, .persistent_vector, .typed_vector, .string => {},
         .transient => if (coll.subkind() != transient_mod.subkind_transient_vector) return VmError.KindMismatch,
@@ -997,10 +963,6 @@ fn fnNthGeneral(vm: *VM, args: []const Value) VmError!Value {
     return found orelse if (has_default) args[2] else VmError.IndexOutOfBounds;
 }
 
-/// `(empty? coll)` → true if coll has zero elements. nil →
-/// true (matches Clojure). Strings: byte-length test (O(1)) —
-/// empty UTF-8 ↔ zero codepoints, so no codepoint walk needed. A
-/// transient is counted, as Clojure 1.12's `empty?` counts one.
 fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     return value_mod.fromBool(switch (c.kind()) {
@@ -1014,12 +976,10 @@ fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
     });
 }
 
-/// `(identity x)` → x.
 fn fnIdentity(_: *VM, args: []const Value) VmError!Value {
     return args[0];
 }
 
-/// `(some? x)` → true iff x is NOT nil.
 fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].kind() != .nil);
 }
@@ -1159,9 +1119,6 @@ fn fnDec(vm: *VM, args: []const Value) VmError!Value {
     return vm_mod.numSub(vm.ensureHeap(), args[0], value_mod.fromFixnum(1).?);
 }
 
-/// `(long x)`: a number as an integer of any size, a float by its
-/// integer part (NaN is 0, as Java's cast makes it), a char as its
-/// code point (SEMANTICS.md §2.2).
 fn fnLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .char) return value_mod.fromFixnum(args[0].asChar()).?;
     if (args[0].isFloat() and std.math.isNan(args[0].asFloat())) return value_mod.fromFixnum(0).?;
@@ -1190,9 +1147,6 @@ fn castTo(comptime T: type) *const fn (*VM, []const Value) VmError!Value {
     }.call;
 }
 
-/// `(float x)`: as `double`, within Java's `float` range, else
-/// `:invalid-argument`, as Clojure's cast checks. The one float type
-/// is f64, so the value is not rounded to single precision.
 fn fnFloat(_: *VM, args: []const Value) VmError!Value {
     const d = try vm_mod.numDouble(args[0]);
     const f = d.asFloat();
@@ -1200,8 +1154,6 @@ fn fnFloat(_: *VM, args: []const Value) VmError!Value {
     return d;
 }
 
-/// `(char n)`: the char with code point `n`; a char is itself. A
-/// value that is no Unicode scalar is `:invalid-argument`.
 fn fnChar(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .char) return args[0];
     const n = try requireFixnum(args[0]);
@@ -1209,9 +1161,7 @@ fn fnChar(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromChar(@intCast(n)) orelse VmError.InvalidArgument;
 }
 
-/// `(parse-long s)` / `(parse-double s)`: the number `s` spells in
-/// full as Java's `Long/valueOf` / `Double/valueOf` read it, else nil;
-/// a non-string is `:kind-mismatch`, as in Clojure (STDLIB.md §2).
+/// `parse-long` and `parse-double` (STDLIB.md §2).
 fn fnParseLong(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const text = string_mod.asBytes(args[0]);
@@ -1345,15 +1295,12 @@ fn random(vm: *VM) std.Random {
     return prng.?.random();
 }
 
-/// `(rand)` → a double in [0, 1); `(rand n)` → in [0, n).
 fn fnRand(vm: *VM, args: []const Value) VmError!Value {
     const r = random(vm).float(f64);
     if (args.len == 0) return value_mod.fromFloat(r);
     return value_mod.fromFloat(r * try asDouble(args[0]));
 }
 
-/// `(rand-int n)` → `(int (rand n))`, as Clojure's: an integer in
-/// [0, n), in (n, 0] for a negative `n`, 0 for 0.
 fn fnRandInt(vm: *VM, args: []const Value) VmError!Value {
     const n = try intArg(args[0]);
     if (n == 0) return value_mod.fromFixnum(0).?;
@@ -1361,7 +1308,6 @@ fn fnRandInt(vm: *VM, args: []const Value) VmError!Value {
     return integerValue(vm, if (n > 0) m else -m);
 }
 
-/// `(double x)`: a number as an f64.
 fn fnDouble(_: *VM, args: []const Value) VmError!Value {
     return vm_mod.numDouble(args[0]);
 }
@@ -1483,7 +1429,6 @@ fn signIs(_: *VM, args: []const Value, comptime sign: std.math.Order) VmError!Va
     return value_mod.fromBool((try vm_mod.numSign(args[0])) == sign);
 }
 
-/// `even?` / `odd?` are integer-only, as in Clojure.
 fn fnOddQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(!try vm_mod.numEven(args[0]));
 }
@@ -1539,11 +1484,8 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // `callValue`'s effect, errors and rooting, with what cannot change
 // between the calls decided at the first.
 
-/// `(apply f x1 x2 ... xs)` calls `f` with the elements of
-/// the last arg seq spliced in after the leading args. `xs` is
-/// consumed: a lazy seq's elements wait in a `Results` as the walk
-/// hands them out, so the realized seq behind the walk is garbage
-/// while it goes on.
+/// `xs` is consumed: a lazy seq's elements wait in a `Results` as the
+/// walk hands them out, so the realized seq behind the walk is garbage.
 fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const last = args[args.len - 1];
@@ -1566,9 +1508,8 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
     return try vm.callValue(f, combined.items);
 }
 
-/// `(map f coll & colls)` → the lazy seq of `(f x1 x2 ...)`, ending
-/// at the shortest collection (docs/LAZY.md §7): a chunk of 32 at a
-/// time over one chunked collection, one element at a time otherwise.
+/// A chunk of 32 at a time over one chunked collection, one element
+/// at a time otherwise (docs/LAZY.md §7).
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-map", args);
     if (args.len == 2) return seq_mod.make(vm, seq_mod.op_map, args[0..2]);
@@ -1640,9 +1581,6 @@ fn nextRun(it: *SeqIter, buf: *[results_chunk]Value, slot: usize) VmError!?[]con
     }
 }
 
-/// `(reduce f coll)` / `(reduce f init coll)` → left fold. With
-/// no init the first element seeds the fold and an empty
-/// collection yields `(f)`.
 fn fnReduce(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const coll = args[args.len - 1];
@@ -1786,9 +1724,8 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
     }
 }
 
-/// `(reduced x)` → a value `reduce` returns at once, unwrapped;
-/// a one-field record of the type `nexis.core/Reduced`, so
-/// `reduced?` is a type test and `@` reads the value back.
+/// A one-field record of the type `nexis.core/Reduced`, so `reduced?`
+/// is a type test and `@` reads the value back.
 fn fnReduced(vm: *VM, args: []const Value) VmError!Value {
     const type_id = vm.ensureReducedType() catch return VmError.OutOfMemory;
     return record_mod.make(vm.ensureHeap(), type_id, try keywordMap(vm, &.{.{ "val", args[0] }})) catch VmError.OutOfMemory;
@@ -1812,8 +1749,6 @@ fn reducedValue(r: Value) Value {
     return entry.value;
 }
 
-/// `(reduce-kv f init m)` → `(f acc k v)` over a map's entries or
-/// a vector's index/element pairs.
 fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
     var cb = vm_mod.Callback.init(vm, args[0], 3);
     var acc = args[1];
@@ -1873,9 +1808,6 @@ fn sieveInto(vm: *VM, pred: Value, coll: Value, results: *Results, held: usize, 
     }
 }
 
-/// `(filter pred coll)` → the lazy seq of x where `(pred x)` is
-/// truthy; `(remove pred coll)` where it is falsy; `(keep f coll)` the
-/// non-nil `(f x)` (docs/LAZY.md §7).
 fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-filter", args);
     return seq_mod.make(vm, seq_mod.op_filter, args[0..2]);
@@ -1895,22 +1827,6 @@ fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
 // Collection utilities
 // =============================================================================
 //
-// Persistent collection construction + access:
-//
-//   vector       (& xs)     persistent vector from args
-//   vec          (s)        persistent vector from any seqable
-//   hash-map     (& kvs)    persistent map from k/v pairs
-//   hash-set     (& xs)     persistent set from args
-//   assoc        (m k v)    persistent put (map, record or vector)
-//   dissoc       (m k)      persistent remove (map or record)
-//   get          (m k)      lookup (map/set/vector); nil if missing
-//   get          (m k def)  lookup with default
-//   contains?    (m k)      key/element presence check
-//   keys         (m)        seq of map keys
-//   vals         (m)        seq of map values
-//   conj         (coll & xs) persistent add (list: cons; vector: push;
-//                            map: assoc with [k v] pair; set: include)
-//
 // A hash map or set iterates in its trie's order, the same for equal
 // collections (STDLIB.md §5).
 
@@ -1919,9 +1835,8 @@ fn fnVector(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(heap, args) catch VmError.OutOfMemory;
 }
 
-/// `(vec coll)` → the elements of any seqable as a vector. A lazy
-/// seq's walk may run code, and `vec` consumes it: the elements go
-/// straight into the vector as it is built (`vecConsumed`).
+/// A lazy seq is consumed: its elements go straight into the vector
+/// as it is built (`vecConsumed`).
 fn fnVec(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     if (walksLazily(s)) return vecConsumed(vm, s);
@@ -1951,8 +1866,8 @@ fn vecOfSeq(vm: *VM, s: Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), items.items) catch VmError.OutOfMemory;
 }
 
-/// `(hash-map k v ...)`, `(hash-set x ...)`: built at once, each node
-/// allocated once (CHAMP.md §8.1); a later duplicate key's value wins.
+/// `hash-map` and `hash-set` build at once, each node allocated once
+/// (CHAMP.md §8.1).
 fn fnHashMap(vm: *VM, args: []const Value) VmError!Value {
     if (args.len % 2 != 0) return VmError.ArityMismatch;
     // Flat key, value pairs are `Entry`s laid end to end.
@@ -1964,11 +1879,10 @@ fn fnHashSet(vm: *VM, args: []const Value) VmError!Value {
     return champ_mod.setFromElements(vm.ensureHeap(), args, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
-/// `(set coll)` → the elements of any seqable as a hash set; a set
-/// itself without its metadata, as Clojure's. Built from every element
-/// at once, each node allocated once, which costs half the cycles of
-/// conj'ing each on a transient at a million elements, so a lazy seq
-/// is not consumed: `(into #{} s)` consumes it (`docs/PERF.md` §3.31).
+/// Built from every element at once, each node allocated once, half
+/// the cycles of conj'ing each on a transient at a million elements,
+/// so a lazy seq is not consumed: `(into #{} s)` consumes it
+/// (`docs/PERF.md` §3.31).
 fn fnSet(vm: *VM, args: []const Value) VmError!Value {
     if (isSet(args[0].kind())) {
         if (heap_mod.Heap.asHeapHeader(args[0]).getMeta() == null) return args[0];
@@ -1979,9 +1893,6 @@ fn fnSet(vm: *VM, args: []const Value) VmError!Value {
     return fnHashSet(vm, items.items);
 }
 
-/// `(subvec v start)` / `(subvec v start end)` → the elements
-/// `start..end` of a vector as a new vector; bounds outside
-/// `0..count` are `:index-out-of-bounds`.
 fn fnSubvec(vm: *VM, args: []const Value) VmError!Value {
     const v = args[0];
     if (v.kind() != .persistent_vector) return VmError.KindMismatch;
@@ -1995,8 +1906,6 @@ fn fnSubvec(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), items) catch VmError.OutOfMemory;
 }
 
-/// `(identical? a b)` → whether the two Values are the same bits:
-/// the same immediate, or the same heap object.
 fn fnIdenticalQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(args[0].tag == args[1].tag and args[0].payload == args[1].payload);
 }
@@ -2054,8 +1963,6 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     };
 }
 
-/// `(dissoc m k & ks)` → persistent remove from a map or record; a
-/// record without one of its declared fields is a map.
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .sorted_map) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
@@ -2092,7 +1999,6 @@ fn isDeclaredField(vm: *VM, rec: Value, k: Value) bool {
     return false;
 }
 
-/// `(disj s x & xs)` → set without the elements.
 fn fnDisj(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .sorted_set) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
@@ -2203,14 +2109,6 @@ fn mapPart(vm: *VM, args: []const Value, comptime part: enum { key, value }) VmE
     return try buildListFromSlice(vm, collected.items);
 }
 
-/// `(conj coll & xs)` — persistent add. Kind-specific:
-///   list   → cons each x onto front (so order reverses for
-///            multi-arg conj; matches Clojure)
-///   vector → push each x to the end (left-to-right)
-///   map    → each x must be a 2-element vector [k v]; assoc
-///   set    → include each x
-///   nil    → builds a list (Clojure makes (conj nil 1 2) => (2 1))
-/// `(conj)` is `[]` and `(conj coll)` is `coll`, nil included.
 fn fnConj(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return vector_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
     if (args.len == 1) return args[0];
@@ -2402,14 +2300,8 @@ fn fnGroupBy(vm: *VM, args: []const Value) VmError!Value {
 // Lazy producers are seq.zig ops made with `seq.make` (LAZY.md); eager
 // consumers walk any seqable with a `SeqIter`.
 
-/// `(range)` / `(range end)` / `(range start end)` / `(range start
-/// end step)` → the lazy seq start, start+step, ... up to but not
-/// including end (docs/LAZY.md §7): `(range)` counts from 0 for ever,
-/// one element at a time; a finite range realizes 32 at a time, and
-/// is `()` when empty. Any number works; the elements follow the
-/// tower's contagion (`(range 0 1 0.25)` is `(0 0.25 0.5 0.75)`,
-/// `(range 3.0)` is `(0 1 2)`). A zero step repeats `start` for ever,
-/// `()` when `start` is `end`, as Clojure's.
+/// `(range)` hands out one element at a time; a finite range realizes
+/// 32 at a time (docs/LAZY.md §7).
 fn fnRange(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return seq_mod.make(vm, seq_mod.op_range_inf, &.{value_mod.fromFixnum(0).?});
     for (args) |a| if (a.kind() != .fixnum) return rangeNumbers(vm, args);
@@ -2433,8 +2325,7 @@ fn rangeNumbers(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_range_num, &.{ start, end, step });
 }
 
-/// `(concat & colls)` → the lazy seq of every element in order,
-/// passing a chunked coll's chunks through (docs/LAZY.md §7).
+/// A chunked coll's chunks pass through (docs/LAZY.md §7).
 fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     if (args.len == 0) return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), value_mod.nilValue() });
@@ -2444,19 +2335,16 @@ fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_concat, &.{ args[0], rest });
 }
 
-/// `(mapcat f & colls)` → the concatenation of `(map f & colls)`, a
-/// producer over the lazy seq of colls, so an infinite one works.
+/// A producer over the lazy seq of colls, so an infinite one works.
 fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-mapcat", args);
     const mapped = try fnMap(vm, args);
     return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), mapped });
 }
 
-/// `(into to from)` → `to` with every element of `from` conj'd;
-/// `(into)` is `[]` and `(into to)` is `to`; `(into to xform from)`
-/// through a transducer (docs/LAZY.md §10), whose `from` parameter the
-/// compiler clears at its last move. `from` is consumed: a lazy seq is
-/// walked by `intoConsumed`.
+/// `(into to xform from)` goes through a transducer (docs/LAZY.md
+/// §10), whose `from` parameter the compiler clears at its last move.
+/// `from` is consumed: a lazy seq is walked by `intoConsumed`.
 fn fnInto(vm: *VM, args: []const Value) VmError!Value {
     if (args.len < 2) return fnConj(vm, args);
     if (args.len == 3) return callCore(vm, "into-xform", args);
@@ -2543,7 +2431,6 @@ fn intoConsumed(vm: *VM, to: Value, s: Value) VmError!Value {
     }
 }
 
-/// `(mapv f & colls)` / `(filterv pred coll)` — vector results.
 fn fnMapv(vm: *VM, args: []const Value) VmError!Value {
     // Over several colls, one's lazy step may collect while another's
     // element waits for the call: a coll whose walk would build its
@@ -2582,8 +2469,6 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
     return results.vector();
 }
 
-/// `(map-indexed f coll)` → the lazy seq of `(f i x)`;
-/// `(keep-indexed f coll)` the non-nil ones (docs/LAZY.md §7).
 fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-map-indexed", args);
     return seq_mod.make(vm, seq_mod.op_map_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
@@ -2594,16 +2479,13 @@ fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_keep_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
-/// `(distinct coll)` → the lazy seq of first occurrences, in order,
-/// one at a time.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return callCore(vm, "xf-distinct", args);
     const seen = champ_mod.setEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
     return seq_mod.make(vm, seq_mod.op_distinct, &.{ args[0], seen });
 }
 
-/// `(dedupe coll)` → the lazy seq of `coll` without consecutive
-/// duplicates, 32 at a time.
+/// 32 at a time.
 fn fnDedupe(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 0) return callCore(vm, "xf-dedupe", args);
     return seq_mod.make(vm, seq_mod.op_dedupe, &.{ args[0], value_mod.nilValue(), value_mod.fromBool(false) });
@@ -2628,7 +2510,6 @@ fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
     return partitionImpl(vm, args, true);
 }
 
-/// `(zipmap keys vals)` → map pairing keys with vals positionally.
 fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     var entries: std.ArrayList(champ_mod.Entry) = .empty;
     defer entries.deinit(vm.allocator);
@@ -2645,8 +2526,6 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     return champ_mod.mapFromEntries(vm.ensureHeap(), entries.items, &dispatch_mod.hashValue, &dispatch_mod.equal) catch VmError.OutOfMemory;
 }
 
-/// `(take-while pred coll)` / `(drop-while pred coll)` → lazy seqs
-/// (docs/LAZY.md §7).
 fn fnTakeWhile(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return callCore(vm, "xf-take-while", args);
     return seq_mod.make(vm, seq_mod.op_take_while, args[0..2]);
@@ -2657,8 +2536,7 @@ fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_drop_while, args[0..2]);
 }
 
-/// `(butlast coll)` → all but the last element, nil when fewer
-/// than two. `coll` is consumed (`consumedInto`).
+/// `coll` is consumed (`consumedInto`).
 fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
@@ -2667,8 +2545,7 @@ fn fnButlast(vm: *VM, args: []const Value) VmError!Value {
     return results.butlastList();
 }
 
-/// `(last coll)` → the last element, nil when there is none: an O(1)
-/// read of a vector or a view, a walk of anything else.
+/// An O(1) read of a vector or a view, a walk of anything else.
 fn fnLast(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     switch (c.kind()) {
@@ -2690,8 +2567,7 @@ fn fnLast(vm: *VM, args: []const Value) VmError!Value {
     return last;
 }
 
-/// `(reverse coll)` → a list of the elements in reverse order, `()`
-/// when there are none. `coll` is consumed (`consumedInto`).
+/// `coll` is consumed (`consumedInto`).
 fn fnReverse(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
@@ -2747,10 +2623,7 @@ fn repeatCount(v: Value) VmError!usize {
     return floatCount(@trunc(f));
 }
 
-/// `(nthrest coll n)` → coll without its first n elements, as a
-/// list; O(1) past a vector's elements (a view, LIST.md §1). As
-/// Clojure's, coll itself when n is not positive, or coll is nil or
-/// an empty collection other than a vector.
+/// O(1) past a vector's elements (a view, LIST.md §1).
 fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
     const count = try requireCount(args[1]);
     if (count == 0 or args[0].isNil()) return args[0];
@@ -2832,9 +2705,8 @@ fn nthnextNative(comptime leaf: bool) *const fn (*VM, []const Value) VmError!Val
     }.call;
 }
 
-/// `(take-last n coll)`; of nothing it is nil, as Clojure's. A lazy
-/// seq is consumed: the last `n` elements the walk handed out wait in
-/// root slots used as a ring, so the walk keeps no more than they.
+/// A lazy seq is consumed: the last `n` elements the walk handed out
+/// wait in root slots used as a ring, so the walk keeps no more.
 fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     const n = try requireCount(args[0]);
     if (walksLazily(args[1])) {
@@ -2861,9 +2733,7 @@ fn fnTakeLast(vm: *VM, args: []const Value) VmError!Value {
     return try buildListFromSlice(vm, items.items[items.items.len - keep ..]);
 }
 
-/// `(repeat x)` → the infinite lazy seq of `x`, one cell whose rest is
-/// itself; `(repeat n x)` → `n` of them, `()` for `n` at most 0
-/// (docs/LAZY.md §7).
+/// `(repeat x)` is one cell whose rest is itself.
 fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeat, args[0..1]);
     const n = try repeatCount(args[0]);
@@ -2871,23 +2741,16 @@ fn fnRepeat(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_repeat_n, &.{ value_mod.fromFixnum(@intCast(n)).?, args[1] });
 }
 
-/// `(repeatedly f)` → the infinite lazy seq of `(f)` calls, each made
-/// when its element is first needed; `(repeatedly n f)` → `n` of them.
 fn fnRepeatedly(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return seq_mod.make(vm, seq_mod.op_repeatedly, args[0..1]);
     const n = try requireCount(args[0]);
     return seq_mod.make(vm, seq_mod.op_repeatedly, &.{ args[1], value_mod.fromFixnum(@intCast(n)).? });
 }
 
-/// `(iterate f x)` → the infinite lazy seq `x`, `(f x)`, `(f (f x))`
-/// ..., each call made when its element is first needed.
 fn fnIterate(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.make(vm, seq_mod.op_iterate, args[0..2]);
 }
 
-/// `(cycle coll)` → the infinite lazy seq of `coll`'s elements over and
-/// over, `()` when it has none; `coll`'s seq is taken at the call, as
-/// Clojure's.
 fn fnCycle(vm: *VM, args: []const Value) VmError!Value {
     const s = try seq_mod.seqOf(vm, args[0]);
     if (s.isNil()) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
@@ -2920,9 +2783,7 @@ fn keyExtremum(vm: *VM, args: []const Value, comptime want_max: bool) VmError!Va
     return best;
 }
 
-/// `(select-keys m ks)` → map of the entries of m whose keys are
-/// in ks; a vector's entries are its `[index element]` pairs, as
-/// for `find`. `ks` is consumed.
+/// `ks` is consumed.
 fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     var out = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
@@ -2950,8 +2811,6 @@ fn fnSelectKeys(vm: *VM, args: []const Value) VmError!Value {
     return out;
 }
 
-/// `(find m k)` → the `[k v]` entry or nil; `k` is the key as the map
-/// holds it, which may be another `=` value than the argument.
 fn fnFind(vm: *VM, args: []const Value) VmError!Value {
     const m = args[0];
     const map_v: Value = switch (m.kind()) {
@@ -2982,8 +2841,6 @@ fn entryPart(_: *VM, args: []const Value, comptime idx: usize) VmError!Value {
     return vector_mod.nth(e, idx);
 }
 
-/// `(peek coll)` → last of a vector, first of a list.
-/// `(pop coll)` → vector without its last, list without its first.
 fn fnPeek(_: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     return switch (c.kind()) {
@@ -3004,10 +2861,6 @@ fn fnPop(vm: *VM, args: []const Value) VmError!Value {
     };
 }
 
-/// `(empty coll)` → an empty collection of the same kind carrying
-/// `coll`'s metadata; a record, being a map, gives `{}`; anything
-/// that is not a collection (a string included) gives nil, as in
-/// Clojure.
 fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     const e = switch (args[0].kind()) {
@@ -3028,7 +2881,6 @@ fn fnEmpty(vm: *VM, args: []const Value) VmError!Value {
     return e;
 }
 
-/// `(not-empty coll)` → coll, or nil when it has no elements.
 fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
     const e = try fnEmptyQ(vm, args);
     return if (e.asBool()) value_mod.nilValue() else args[0];
@@ -3063,7 +2915,7 @@ const SortOrder = struct {
             // converted to a `VmError!Order` first, as `naturalOrder`
             // returns it, x86-64 code rebuilds the result with two narrow
             // stores and reloads it as one wider load, which the CPU
-            // cannot forward (PERF.md §3.31).
+            // cannot forward (PERF.md §3.32).
             if (a.isFixnum() and b.isFixnum()) return a.asFixnum() < b.asFixnum();
             return (try sorted_mod.naturalOrder(self.interner, a, b)) == .lt;
         };
@@ -3156,13 +3008,11 @@ fn sortImpl(vm: *VM, keyfn: ?Value, comparator_arg: ?Value, coll: Value) VmError
     return try buildListFromSlice(vm, items.items);
 }
 
-/// `(sort coll)` / `(sort cmp coll)`.
 fn fnSort(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) return sortImpl(vm, null, null, args[0]);
     return sortImpl(vm, null, args[0], args[1]);
 }
 
-/// `(sort-by keyfn coll)` / `(sort-by keyfn cmp coll)`.
 fn fnSortBy(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 2) return sortImpl(vm, args[0], null, args[1]);
     return sortImpl(vm, args[0], args[1], args[2]);
@@ -3170,7 +3020,6 @@ fn fnSortBy(vm: *VM, args: []const Value) VmError!Value {
 
 // ---- names, hashes and kind predicates ----
 
-/// `(hash x)` → the runtime's semantic hash as a fixnum.
 fn fnHash(_: *VM, args: []const Value) VmError!Value {
     const h = dispatch_mod.hashValue(args[0]);
     return value_mod.fromFixnum(@intCast(h & @as(u64, @intCast(value_mod.fixnum_max)))).?;
@@ -3185,16 +3034,12 @@ fn internedName(vm: *VM, v: Value) VmError![]const u8 {
     };
 }
 
-/// `(name x)` → the name part of a keyword or symbol; a string is
-/// its own name.
 fn fnName(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .string) return args[0];
     const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
     return string_mod.fromBytes(vm.ensureHeap(), parts.name) catch VmError.OutOfMemory;
 }
 
-/// `(namespace x)` → the namespace part of a keyword or symbol, or
-/// nil when it has none.
 fn fnNamespace(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .keyword and args[0].kind() != .symbol) return VmError.KindMismatch;
     const parts = intern_mod.Interner.splitQualified(try internedName(vm, args[0]));
@@ -3211,9 +3056,6 @@ fn internFailure(err: intern_mod.InternError) VmError {
     };
 }
 
-/// `(keyword x)` / `(symbol x)` → interned from a string, keyword
-/// or symbol. `(keyword ns name)` / `(symbol ns name)` → the
-/// qualified name; a nil `ns` leaves it unqualified.
 fn fnKeyword(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 2) {
         const ns = if (args[0].isNil()) null else try internedName(vm, args[0]);
@@ -3236,12 +3078,6 @@ fn fnSymbol(vm: *VM, args: []const Value) VmError!Value {
 // Exceptions as maps
 // =============================================================================
 
-/// `(ex-info msg data)` / `(ex-info msg data cause)` → the map
-/// `{:message msg :data data}` (+ `:cause`) for `throw`; `catch`
-/// takes it by `any` or by the `:error` of its data. As Clojure's,
-/// `msg` is a string or nil and `data` a map, nil meaning `{}`;
-/// anything else is `:kind-mismatch`. Keys are interned at the call,
-/// not at boot.
 fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
     if (!args[0].isNil() and args[0].kind() != .string) return VmError.KindMismatch;
     if (!args[1].isNil() and !isMap(args[1].kind())) return VmError.KindMismatch;
@@ -3250,9 +3086,6 @@ fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
     return keywordMap(vm, fields[0..args.len]);
 }
 
-/// `(ex-data e)` → the `:data` of an `ex-info` map; an error map,
-/// one with an `:error` entry and no `:data` (a caught runtime error,
-/// a Nextomic error), is its own data; nil for anything else.
 fn fnExData(vm: *VM, args: []const Value) VmError!Value {
     const data = try exEntry(vm, args[0], "data");
     if (!data.isNil() or args[0].kind() != .persistent_map) return data;
@@ -3260,8 +3093,6 @@ fn fnExData(vm: *VM, args: []const Value) VmError!Value {
     return if (tag.isNil()) data else args[0];
 }
 
-/// `(ex-message e)` → the `:message` of a map (an `ex-info` map, an
-/// error map), nil for anything else.
 fn fnExMessage(vm: *VM, args: []const Value) VmError!Value {
     return exEntry(vm, args[0], "message");
 }
@@ -3276,15 +3107,11 @@ fn exEntry(vm: *VM, e: Value, name: []const u8) VmError!Value {
 // The compiler at run time (vm.CompilerHooks)
 // =============================================================================
 
-/// `(macroexpand-1 form)` → the form after one macro step; a form
-/// that is not a macro call comes back as it is.
 fn fnMacroexpand1(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     return (try hooks.expand_once(hooks.user_data, vm, args[0])) orelse args[0];
 }
 
-/// `(macroexpand form)` → `macroexpand-1` repeated until the head
-/// is no longer a macro; subforms are left alone, as in Clojure.
 fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     var form = args[0];
@@ -3292,10 +3119,6 @@ fn fnMacroexpand(vm: *VM, args: []const Value) VmError!Value {
     return form;
 }
 
-/// `(read-string s)`, `(read-string opts s)` → the first form of `s`
-/// as data. A string that holds no form is the value of `:eof` in the
-/// map `opts` when it has the key, else `:reader-error`, as is text
-/// that does not read (STDLIB.md §2).
 fn fnReadString(vm: *VM, args: []const Value) VmError!Value {
     const s = args[args.len - 1];
     const opts = if (args.len == 2) args[0] else value_mod.nilValue();
@@ -3325,9 +3148,6 @@ fn fnLoadNext(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ loaded.value, value_mod.fromFixnum(@intCast(i + loaded.end)).? }) catch VmError.OutOfMemory;
 }
 
-/// `(eval form)` → the value of `form` compiled in the current
-/// namespace and run on this VM; a form that does not compile throws
-/// `{:error :compile-error :message sentence :form form :kind name}`.
 fn fnEval(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     const eval = hooks.eval orelse return vm.throwKeyword("no-compiler");
@@ -3349,10 +3169,8 @@ fn carriesHeaderMeta(k: Kind) bool {
     };
 }
 
-/// `(meta x)` → the metadata map of a list, vector, map, set, record, fn,
-/// atom or Var; nil for anything else or when none is attached. The
-/// Var a native was installed in takes the native's documentation as
-/// its metadata the first time it is asked for (`nativeVarMeta`).
+/// The Var a native was installed in takes the native's documentation
+/// as its metadata the first time it is asked for (`nativeVarMeta`).
 fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .var_) {
@@ -3372,13 +3190,8 @@ fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
     return champ_mod.valueFromMapHeader(m);
 }
 
-/// `(with-meta x m)` → a value equal to `x` carrying `m` (a map or
-/// nil) as its metadata. The root object is copied, so `x` keeps its
-/// own; the copy shares every node below the root. A scalar (nil, a
-/// boolean, char, number, string, keyword or symbol) is
-/// `:no-metadata-on-immediate`; any other kind that cannot carry
-/// metadata is `:kind-mismatch`, a Var included: its metadata changes
-/// in place through `reset-meta!` / `alter-meta!` (SEMANTICS §7).
+/// The root object is copied, so `x` keeps its own metadata; the copy
+/// shares every node below the root (SEMANTICS.md §7).
 fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     const m = args[1];
     if (!m.isNil() and m.kind() != .persistent_map and m.kind() != .sorted_map) return VmError.KindMismatch;
@@ -3412,8 +3225,6 @@ fn fnWithMeta(vm: *VM, args: []const Value) VmError!Value {
     return .{ .tag = x.tag, .payload = @intFromPtr(copy) };
 }
 
-/// `(reset-meta! r m)` → sets the metadata of the Var or atom `r`
-/// to `m` (a map or nil) in place and returns it.
 fn fnResetMeta(vm: *VM, args: []const Value) VmError!Value {
     try setRefMeta(vm, args[0], args[1]);
     return args[1];
@@ -3439,8 +3250,6 @@ fn setVarMeta(vm: *VM, v: *vm_mod.Var, m: Value) VmError!void {
     if ((try vm_mod.lookupIn(vm, m, key, value_mod.nilValue())).isTruthy()) v.dynamic = true;
 }
 
-/// `(alter-meta! r f & args)` → sets the metadata of the Var or atom
-/// `r` to `(apply f (meta r) args)` and returns it.
 fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_ and args[0].kind() != .atom) return VmError.KindMismatch;
     const call_args = vm.allocator.alloc(Value, args.len - 1) catch return VmError.OutOfMemory;
@@ -3766,11 +3575,6 @@ fn nextomicDoc(comptime arglists: []const u8, comptime doc: []const u8) Doc {
 // Dynamic bindings (VM.md §6.5)
 // =============================================================================
 
-/// `(push-thread-bindings {#'a 1 #'b 2})` → opens a binding frame
-/// rebinding each Var to its value; `binding` pairs it with
-/// `pop-thread-bindings` in a `finally`. A key that is not a Var is
-/// `:kind-mismatch`; a Var that is not dynamic is `:not-dynamic`
-/// and nothing is rebound.
 fn fnPushThreadBindings(vm: *VM, args: []const Value) VmError!Value {
     const m = args[0];
     if (m.kind() != .persistent_map) return VmError.KindMismatch;
@@ -3790,16 +3594,11 @@ fn fnPushThreadBindings(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(pop-thread-bindings)` → closes the innermost binding frame.
 fn fnPopThreadBindings(vm: *VM, _: []const Value) VmError!Value {
     vm.popBindings();
     return value_mod.nilValue();
 }
 
-/// `(var-set v x)` → rebinds the innermost binding of the dynamic
-/// Var `v` to `x` and returns `x`; `set!` expands to it. A Var that
-/// is not dynamic is `:not-dynamic`; one with no binding in force
-/// is `:no-thread-binding`.
 fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_) return VmError.KindMismatch;
     const v = VM.asVar(args[0]);
@@ -3809,9 +3608,6 @@ fn fnVarSet(_: *VM, args: []const Value) VmError!Value {
     return args[1];
 }
 
-/// `(alter-var-root v f & args)` → sets the root of the Var `v` to
-/// `(apply f root args)` and returns it; a `binding` in force is left
-/// as it is. An unbound Var's root is nil to `f`, and bound after.
 fn fnAlterVarRoot(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .var_) return VmError.KindMismatch;
     const v = VM.asVar(args[0]);
@@ -3837,8 +3633,6 @@ fn fnUnbindRoot(_: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(thread-bound? & vars)` → whether a `binding` of every Var is in
-/// force; true of none, as Clojure's `every?` over its arguments.
 fn fnThreadBoundQ(_: *VM, args: []const Value) VmError!Value {
     for (args) |v| if (v.kind() != .var_) return VmError.KindMismatch;
     for (args) |v| if (!VM.asVar(v).thread_bound) return value_mod.fromBool(false);
@@ -3916,27 +3710,8 @@ fn isIfn(k: Kind) bool {
 // db primitives
 // =============================================================================
 //
-// `(db/open path)` opens a connection; `db/close` closes it.
-// `(db/ref conn tree-keyword key)` constructs a durable ref Value.
-// `db/put-key!` / `db/get-key` / `db/delete-key!` / `db/present?`
-// each run inside a transaction of their own; the explicit
-// transaction primitives below thread one through several
-// operations.
-//
-// Errors land as catchable keyword payloads:
-//   :db/<reason>         a named emdb / db-layer failure, see
-//                        `db.failureName` (:db/key-too-large,
-//                        :db/max-trees, :db/corrupted, ...)
-//   :db-error            any other storage failure
-//   :db-closed           op on already-closed connection
-//   :invalid-durable-ref arg was not a durable_ref Value
-//   :unserializable      a value of a kind with no serialized form
-//   :codec-failed        stored bytes that do not decode
-//   :tx-closed           op on a finished transaction
-//
-// Storage failures are thrown through `VM.throwKeyword`, so outside
-// any `try` they surface as `UncaughtThrow` with the keyword in
-// `vm.unhandled_throw`, exactly like `(throw :db/key-too-large)`.
+// A storage failure is thrown by its keyword (`db.failureName`,
+// DB.md) through `VM.throwKeyword`.
 //
 // Connection lifetime: each `db/open` allocates a Connection on the
 // allocator of the VM that owns the registries (`VM.home`: a macro's
@@ -3959,10 +3734,8 @@ fn ioOf(vm: *VM) std.Io {
     return vm.io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-/// `(db/open path)` / `(db/open path {:durability d})`: the store at
-/// `path`, created with its parent directories when absent (emdb
-/// creates only the file). `d` is `:commit` or `:durable`; without it
-/// the connection takes the process's (`NEXIS_DURABILITY`, DB.md §3.3).
+/// The parent directories are created here: emdb creates only the
+/// file.
 fn fnDbOpen(vm: *VM, args: []const Value) VmError!Value {
     const path = try vm_mod.pathArg(args[0]);
     const durability = if (args.len > 1) try durabilityOption(vm, args[1]) else null;
@@ -4003,11 +3776,6 @@ fn dbCloseCallback(opaque_ptr: *anyopaque) void {
     conn.allocator.destroy(conn);
 }
 
-/// `(db/close conn)` → nil. Aborts the connection's open
-/// transactions, whose handles then report `:tx-closed`; refs of a
-/// closed connection report `:db-closed`; closing twice is nil;
-/// closing from a callback a native runs over one of its
-/// transactions is `:db/busy` (DB.md §3).
 fn fnDbClose(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .db_connection) return VmError.KindMismatch;
     const conn: *db_mod.Connection = @ptrFromInt(args[0].payload);
@@ -4057,7 +3825,6 @@ fn liveConnOf(vm: *VM, r: Value) VmError!*db_mod.Connection {
     return conn;
 }
 
-/// `(db/put-key! ref value)` — one write transaction around one put.
 fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const v = args[1];
@@ -4074,8 +3841,6 @@ fn fnDbPutKey(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(db/get-key ref)` or `(db/get-key ref default)` — one read
-/// transaction around one get.
 fn fnDbGetKey(vm: *VM, args: []const Value) VmError!Value {
     const r = args[0];
     const default = if (args.len > 1) args[1] else value_mod.nilValue();
@@ -4110,11 +3875,6 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 // db explicit-transaction primitives
 // =============================================================================
 //
-// Transactions are threaded explicitly. The `with-tx` /
-// `with-read-tx` macros (in core.nx) generate
-// `(let [tx (db/begin-write conn)] (try ...body... (catch any e (db/abort-write! tx) (throw e))))`
-// with commit at the end of the body.
-//
 // A handle (`db.Handle`) is open until commit or abort, the close
 // of its connection, or a collection that finds it unreachable;
 // afterwards every operation on it but abort is `:tx-closed`.
@@ -4124,10 +3884,6 @@ fn fnDbPresentQ(vm: *VM, args: []const Value) VmError!Value {
 // the handle for the call, and commit or abort of a held handle is
 // `:db/busy`, so no callback finishes a transaction under the native
 // using it (DB.md §12).
-//
-// Connection mismatch: `db/put!` etc. validate that the supplied
-// ref belongs to the same connection the tx is open against.
-// db.zig's putRef/getRef/delRef do this via `assertRefMatchesConn`.
 
 fn writeTxnHandle(v: Value) ?*db_mod.Handle {
     if (v.kind() != .db_write_txn) return null;
@@ -4220,7 +3976,6 @@ fn abortTxn(vm: *VM, args: []const Value, comptime write: bool) VmError!Value {
     return value_mod.nilValue();
 }
 
-/// `(db/put! tx ref value)` — write through an active tx.
 fn fnDbPut(vm: *VM, args: []const Value) VmError!Value {
     const h = writeTxnHandle(args[0]) orelse return VmError.KindMismatch;
     if (!h.active) return VmError.TxClosed;
@@ -4247,9 +4002,6 @@ fn putRealizing(vm: *VM, h: *db_mod.Handle, r: Value, v: Value) VmError!void {
     };
 }
 
-/// `(db/get tx ref)` or `(db/get tx ref default)` — read through
-/// either a write or read tx. Returns `default` (nil if omitted)
-/// for missing keys.
 fn fnDbGet(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const r = args[1];
@@ -4269,14 +4021,8 @@ fn fnDbDelete(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(existed);
 }
 
-/// `(deref x)` (also installed as `db/deref`) — universal deref:
-///   durable_ref → ephemeral read tx, return decoded value (nil
-///                 if absent)
-///   var         → Var.root (raises :unbound-var if unbound)
-///   atom        → current contained value (deref does NOT
-///                 touch in_flight and is allowed inside a swap!
-///                 critical section)
-///   other       → :not-derefable (catchable)
+/// `deref` and `db/deref`: an atom's read does not touch its
+/// in-flight mark, so it is allowed inside a `swap!`.
 fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     return switch (x.kind()) {
@@ -4303,7 +4049,6 @@ fn fnDbDeref(vm: *VM, args: []const Value) VmError!Value {
 // record, the symbol it prints with (`user.P`). A namespace is its
 // name symbol: the registry holds namespaces, not values.
 
-/// `(class x)` → the type of `x` (nil for nil, as Clojure's).
 fn fnClass(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     const interner = vm.ensureInterner();
@@ -4358,10 +4103,6 @@ fn fnMmLookupLeaf(vm: *VM, args: []const Value) VmError!Value {
     return fnMmLookup(vm, args);
 }
 
-/// `(class? x)` → whether `x` is a type `class` returns, which the
-/// global hierarchy takes as a tag (STDLIB.md §9.1): the keyword of a
-/// kind (`:boolean`, `:vector`, `:map`, `:set` or a `Kind` name that
-/// `fnClass` passes through), or the symbol of a registered record type.
 fn fnClassQ(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     const interner = vm.ensureInterner();
@@ -4403,12 +4144,10 @@ fn theNs(vm: *VM, v: Value) VmError!*Namespace {
     return (try nsOfSymbol(vm, v)) orelse vm.throwKeyword("no-such-namespace");
 }
 
-/// `(find-ns sym)` → `sym` when a namespace has that name, else nil.
 fn fnFindNs(vm: *VM, args: []const Value) VmError!Value {
     return if (try nsOfSymbol(vm, args[0])) |_| args[0] else value_mod.nilValue();
 }
 
-/// `(all-ns)` → the name of every namespace, sorted.
 fn fnAllNs(vm: *VM, _: []const Value) VmError!Value {
     const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
     var names: std.ArrayList([]const u8) = .empty;
@@ -4464,19 +4203,14 @@ fn resolveIn(vm: *VM, ns: *Namespace, sym: Value) VmError!Value {
     return if (v) |found| VM.varToValue(found) else value_mod.nilValue();
 }
 
-/// `(resolve sym)` → the Var `sym` names in the current namespace.
 fn fnResolve(vm: *VM, args: []const Value) VmError!Value {
     return resolveIn(vm, vm.ensureNamespace(), args[0]);
 }
 
-/// `(ns-resolve ns sym)` → the Var `sym` names in `ns`.
 fn fnNsResolve(vm: *VM, args: []const Value) VmError!Value {
     return resolveIn(vm, try theNs(vm, args[0]), args[1]);
 }
 
-/// `(random-uuid)` → a random (version 4) UUID, as its canonical
-/// lowercase text: a UUID is a string, as Nextomic's `:db.type/uuid`
-/// values are.
 fn fnRandomUuid(vm: *VM, _: []const Value) VmError!Value {
     var u: [16]u8 = undefined;
     random(vm).bytes(&u);
@@ -4487,8 +4221,6 @@ fn fnRandomUuid(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), &text) catch VmError.OutOfMemory;
 }
 
-/// `(parse-uuid s)` → the canonical lowercase text of the UUID `s`
-/// spells in 8-4-4-4-12 hex digits of either case, else nil.
 fn fnParseUuid(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const u = nextomic_mod.datom.uuidFromText(string_mod.asBytes(args[0])) orelse return value_mod.nilValue();
@@ -4536,9 +4268,6 @@ fn fnDelayQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(isDelay(vm, args[0]));
 }
 
-/// `(realized? x)` → whether a lazy block's body has run (a cons or a
-/// chunked cons is realized), or whether a delay has been forced;
-/// `:kind-mismatch` for anything else.
 fn fnRealizedQ(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
     if (x.kind() == .lazy_seq) {
@@ -4551,16 +4280,13 @@ fn fnRealizedQ(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(!vector_mod.nth(state, 0).identicalTo(pending));
 }
 
-/// `(doall coll)` / `(doall n coll)` → coll, its first n elements (all
-/// of them) realized; `(dorun ...)` the same walk, returning nil.
 fn fnDoall(vm: *VM, args: []const Value) VmError!Value {
     try realizeArg(vm, args);
     return args[args.len - 1];
 }
 
-/// `(dorun coll)` / `(dorun n coll)`: realize, keeping nothing. `coll`
-/// is consumed: the walk's place, or the seq `next` has reached, is
-/// its root.
+/// `coll` is consumed: the walk's place, or the seq `next` has
+/// reached, is its root.
 fn fnDorun(vm: *VM, args: []const Value) VmError!Value {
     const scope = vm.rootScope();
     defer scope.release();
@@ -4594,8 +4320,6 @@ fn realizeArg(vm: *VM, args: []const Value) VmError!void {
 // (docs/LAZY.md §7): a chunk is a vector here, and a chunk buffer a
 // transient vector; `chunk-cons` copies the vector into a chunk block.
 
-/// `(chunked-seq? s)` → whether `s` is a seq that hands out chunks: a
-/// chunked cons or a vector's view.
 fn fnChunkedSeqQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(seq_mod.chunkOf(args[0]) != null);
 }
@@ -4604,31 +4328,25 @@ fn chunkArg(s: Value) VmError!seq_mod.Chunk {
     return seq_mod.chunkOf(s) orelse VmError.KindMismatch;
 }
 
-/// `(chunk-first s)` → the elements of `s`'s first chunk, a vector.
 fn fnChunkFirst(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), (try chunkArg(args[0])).items) catch VmError.OutOfMemory;
 }
 
-/// `(chunk-rest s)` → what follows the first chunk, `()` when nothing.
 fn fnChunkRest(vm: *VM, args: []const Value) VmError!Value {
     const after = (try chunkArg(args[0])).after;
     if (after.isNil()) return list_mod.empty(vm.ensureHeap()) catch VmError.OutOfMemory;
     return after;
 }
 
-/// `(chunk-next s)` → the seq after the first chunk, nil when nothing.
 fn fnChunkNext(vm: *VM, args: []const Value) VmError!Value {
     return seq_mod.seqOf(vm, (try chunkArg(args[0])).after);
 }
 
-/// `(chunk-buffer n)` → an empty transient vector to append to.
 fn fnChunkBuffer(vm: *VM, args: []const Value) VmError!Value {
     _ = try requireFixnum(args[0]);
     return fnTransient(vm, &.{vector_mod.empty(vm.ensureHeap()) catch return VmError.OutOfMemory});
 }
 
-/// `(chunk-cons c rest)` → the elements of `c` (a vector) in front of
-/// `rest`, or `rest` itself when `c` is empty, as Clojure's.
 fn fnChunkCons(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     if (c.kind() != .persistent_vector) return VmError.KindMismatch;
@@ -4753,9 +4471,6 @@ fn fnDbScan(vm: *VM, args: []const Value) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), entries.items) catch VmError.OutOfMemory;
 }
 
-/// Predicate for snapshot Values. True if `x` is a
-/// read-tx handle that has not been released. Released
-/// snapshots return false (mirrors Var.bound semantics).
 fn fnDbSnapshotQ(_: *VM, args: []const Value) VmError!Value {
     const v = args[0];
     if (v.kind() != .db_read_txn) return value_mod.fromBool(false);
@@ -4763,9 +4478,8 @@ fn fnDbSnapshotQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(h.active);
 }
 
-/// `(db/reduce-tree tx tree f init)`: `(f acc key value)` over the
-/// tree as it was when the walk began, whatever `f` writes to it
-/// (DB.md §12). Rooting class 2 (GC.md §11.5).
+/// Rooting class 2 (GC.md §11.5): each decoded value is only the
+/// call's argument.
 fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const tree_v = args[1];
@@ -4792,14 +4506,7 @@ fn fnDbReduceTree(vm: *VM, args: []const Value) VmError!Value {
     return acc;
 }
 
-/// `(db/alter! tx ref f & args)` — read-modify-write inside an
-/// active write tx. Reads current via getRef, computes
-/// `(apply f current args)` via vm.callValue, writes via putRef.
-/// Returns the new value.
-///
-/// If `f` throws or control transfers, do NOT write.
-/// Connection mismatch on `ref` surfaces as
-/// :db/store-mismatch via db.zig's assertRefMatchesConn.
+/// Nothing is written when `f` throws or control transfers.
 fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     const tx_v = args[0];
     const r = args[1];
@@ -4810,25 +4517,21 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
     if (!h.active) return VmError.TxClosed;
     if (r.kind() != .durable_ref) return VmError.InvalidDurableRef;
 
-    // 1. Read current.
     const current_opt = db_mod.getRef(&h.txn.write, r, &dispatch_mod.hashValue, &dispatch_mod.equal) catch |err| return dbFailure(vm, err);
     const current = current_opt orelse value_mod.nilValue();
 
-    // 2. Build (f current extra...) arg list. f is the FIRST
-    //    arg to callValue; current + extra follow.
     const call_args = vm.allocator.alloc(Value, 1 + extra.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
     call_args[0] = current;
     for (extra, 0..) |a, i| call_args[1 + i] = a;
 
-    // 3. Invoke, the transaction held. Throws / control transfers
-    //    propagate UNCHANGED so the with-tx's catch can abort. NO
-    //    write on error.
+    // The transaction is held for the call; a throw passes through, so
+    // with-tx's catch aborts it.
     h.held += 1;
     defer h.held -= 1;
     const new_value = try vm.callValue(f, call_args);
 
-    // 4. Write; a lazy result is realized with the transaction still
+    // A lazy result is realized with the transaction still
     //    held, and rooted while it is.
     const scope = vm.rootScope();
     defer scope.release();
@@ -4841,9 +4544,8 @@ fn fnDbAlter(vm: *VM, args: []const Value) VmError!Value {
 // Transients (docs/TRANSIENT.md)
 // =============================================================================
 //
-// The Clojure surface over `coll/transient.zig`: each `!` returns the
-// transient to use from then on, which a vector `assoc!` or `pop!`
-// replaces (the old one is frozen, as `persistent!` leaves it).
+// The Clojure surface over `coll/transient.zig`: each `!` edits the
+// transient in place and returns it.
 
 fn transientFailure(vm: *VM, err: anyerror) VmError {
     return switch (err) {
@@ -4867,12 +4569,10 @@ fn transientCount(vm: *VM, t: Value) VmError!usize {
     } catch |err| transientFailure(vm, err);
 }
 
-/// `(transient coll)` → a transient of a vector, map or set.
 fn fnTransient(vm: *VM, args: []const Value) VmError!Value {
     return transient_mod.transientFrom(vm.ensureHeap(), args[0]) catch |err| transientFailure(vm, err);
 }
 
-/// `(persistent! t)` → the collection, the transient frozen.
 fn fnPersistentBang(vm: *VM, args: []const Value) VmError!Value {
     _ = try requireTransient(args[0]);
     return transient_mod.persistentBang(args[0]) catch |err| transientFailure(vm, err);
@@ -4900,7 +4600,6 @@ fn conjBangSet(vm: *VM, t: Value, x: Value) VmError!void {
     try vm.checkDeepData(before);
 }
 
-/// `(conj! t x & xs)`; `(conj!)` is a transient vector, `(conj! t)` t.
 fn fnConjBang(vm: *VM, args: []const Value) VmError!Value {
     const heap = vm.ensureHeap();
     if (args.len == 0) return fnTransient(vm, &.{vector_mod.empty(heap) catch return VmError.OutOfMemory});
@@ -4986,7 +4685,6 @@ fn fnAssocBangLeaf(vm: *VM, args: []const Value) VmError!Value {
     return fnAssocBang(vm, args);
 }
 
-/// `(dissoc! t k & ks)` on a transient map.
 fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
     const t = args[0];
     if (try requireTransient(t) != transient_mod.subkind_transient_map) return VmError.KindMismatch;
@@ -4999,7 +4697,6 @@ fn fnDissocBang(vm: *VM, args: []const Value) VmError!Value {
     return t;
 }
 
-/// `(disj! t x & xs)` on a transient set.
 fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
     const t = args[0];
     if (try requireTransient(t) != transient_mod.subkind_transient_set) return VmError.KindMismatch;
@@ -5012,7 +4709,6 @@ fn fnDisjBang(vm: *VM, args: []const Value) VmError!Value {
     return t;
 }
 
-/// `(pop! t)` on a transient vector: without its last element.
 fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
     if (try requireTransient(args[0]) != transient_mod.subkind_transient_vector) return VmError.KindMismatch;
     return transient_mod.vectorPopBang(vm.ensureHeap(), args[0]) catch |err| transientFailure(vm, err);
@@ -5022,15 +4718,6 @@ fn fnPopBang(vm: *VM, args: []const Value) VmError!Value {
 // format (a subset of Java's Formatter, as Clojure's format uses)
 // =============================================================================
 
-/// `(format fmt & args)` → `fmt` with each `%` conversion replaced by
-/// the next argument: `%s` (as `str` makes it text, nil as `nil`),
-/// `%d` (an integer), `%f` (any number; 6 decimals unless `.N`),
-/// `%x` / `%X` (an integer in hex, two's complement when negative),
-/// `%c` (a char), `%n` and `%%`. A width pads to that many code
-/// points on the left, or the right with `-`; `0` pads a number with
-/// zeros; `.N` keeps N characters of a `%s`. A missing argument or
-/// unknown conversion is `:invalid-argument`, an argument of the
-/// wrong kind `:kind-mismatch` (STDLIB.md §2).
 fn fnFormat(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
     const fmt = string_mod.asBytes(args[0]);
@@ -5163,9 +4850,6 @@ fn formatFixed(vm: *VM, w: *std.Io.Writer, x: f64, precision: usize) VmError!voi
 // (ATOM.md §4). A throw or control transfer before the write leaves
 // the atom unchanged.
 
-/// `(atom init & {:keys [meta validator]})`: a key it does not take
-/// is ignored and a key with no value is `:invalid-argument`, as in
-/// Clojure. The initial value must satisfy the validator.
 fn fnAtom(vm: *VM, args: []const Value) VmError!Value {
     const opts = args[1..];
     if (opts.len % 2 != 0) return VmError.InvalidArgument;
@@ -5262,9 +4946,6 @@ fn swapImpl(vm: *VM, args: []const Value, comptime pair: bool) VmError!Value {
     return vector_mod.fromSlice(vm.ensureHeap(), &.{ old, new_val }) catch VmError.OutOfMemory;
 }
 
-/// `identical?` semantics, not structural `=`: bit identity for an
-/// immediate, the same block for a heap value (ATOM.md §4.6). The
-/// new value is validated before the comparison, as in Clojure.
 fn fnCompareAndSetBang(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     const old = args[1];
@@ -5281,9 +4962,6 @@ fn fnCompareAndSetBang(vm: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(true);
 }
 
-/// `(set-validator! a f)` → nil once the current value satisfies `f`
-/// (nil removes the validator); a value that does not leaves the old
-/// validator in place.
 fn fnSetValidator(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     if (a.kind() != .atom) return VmError.KindMismatch;
@@ -5297,8 +4975,6 @@ fn fnGetValidator(_: *VM, args: []const Value) VmError!Value {
     return atom_mod.body(args[0]).validator;
 }
 
-/// `(add-watch a key f)` → `a`, with `f` its watch under `key` (an
-/// `=` key replaces the watch it names).
 fn fnAddWatch(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     if (a.kind() != .atom) return VmError.KindMismatch;
@@ -5309,7 +4985,6 @@ fn fnAddWatch(vm: *VM, args: []const Value) VmError!Value {
     return a;
 }
 
-/// `(remove-watch a key)` → `a`, without the watch under `key`.
 fn fnRemoveWatch(vm: *VM, args: []const Value) VmError!Value {
     const a = args[0];
     if (a.kind() != .atom) return VmError.KindMismatch;
@@ -5433,10 +5108,8 @@ fn strFormatted(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch return VmError.OutOfMemory;
 }
 
-/// `(subs s start)` / `(subs s start end)` — substring by CODEPOINT
-/// indices. Allocates a fresh heap string; there is no zero-copy
-/// slice (subkind 2 is reserved for emdb-mmap, NOT for in-heap
-/// slicing).
+/// A fresh string: there is no zero-copy slice (subkind 2 is reserved
+/// for emdb-mmap, STRING.md §1).
 fn fnSubs(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     if (s.kind() != .string) return VmError.KindMismatch;
@@ -5519,10 +5192,6 @@ fn matcherGroup(m: Value, g: usize) ?[2]usize {
     return regex_mod.matcherGroup(m, g);
 }
 
-/// `(re-pattern s)` → the pattern `s` compiles to, or `s` itself when
-/// it is a pattern. A syntax error throws `{:error :invalid-regex
-/// :message M :pattern s :index I}`, `I` the code-point index Java's
-/// `PatternSyntaxException` reports (docs/REGEX.md §9).
 fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .regex) return args[0];
     const source = try utf8Arg(args[0]);
@@ -5543,15 +5212,12 @@ fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
     }
 }
 
-/// `(re-matcher re s)` → a fresh matcher of `re` over `s`.
 fn fnReMatcher(vm: *VM, args: []const Value) VmError!Value {
     const p = try patternArg(args[0]);
     _ = try utf8Arg(args[1]);
     return regex_mod.makeMatcher(vm.ensureHeap(), p, args[1]) catch VmError.OutOfMemory;
 }
 
-/// `(re-find m)` → the next match of the matcher `m`, or nil;
-/// `(re-find re s)` → the first match of `re` in `s`, or nil.
 fn fnReFind(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) {
         const m = args[0];
@@ -5573,8 +5239,6 @@ fn searchOnce(vm: *VM, args: []const Value, comptime whole: bool) VmError!Value 
     return matchValue(vm, hay, prog.ngroups, &rvm, vmGroup);
 }
 
-/// `(re-groups m)` → the last match of the matcher `m`;
-/// `:invalid-argument` when it has none.
 fn fnReGroups(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .matcher) return VmError.KindMismatch;
     return reGroups(vm, args[0]);
@@ -5719,8 +5383,6 @@ fn stringArg(v: Value) VmError![]const u8 {
     return string_mod.asBytes(v);
 }
 
-/// `(blank? s)` → whether `s` is nil, empty or only whitespace (Java's,
-/// as `trim` reads it).
 fn fnStringBlankQ(_: *VM, args: []const Value) VmError!Value {
     if (args[0].isNil()) return value_mod.fromBool(true);
     const src = try stringArg(args[0]);
@@ -5777,14 +5439,6 @@ fn stringSearch(_: *VM, args: []const Value, comptime last: bool) VmError!Value 
     return value_mod.fromFixnum(@intCast(std.unicode.utf8CountCodepoints(src[0..b]) catch return VmError.Utf8Error)).?;
 }
 
-/// `(nexis.string/split s sep)` / `(nexis.string/split s sep limit)`
-/// → a vector of the pieces of `s` between occurrences of the literal
-/// `sep`, as Clojure's `split` with a regex that matches only `sep`:
-/// trailing empty pieces are dropped; a positive `limit` splits at
-/// most `limit - 1` times and keeps the rest whole; a negative one
-/// keeps trailing empties. An empty `sep` splits between code points,
-/// as `#""` does.
-///   - Invalid UTF-8 in either string → :utf8-error
 fn fnStringSplit(vm: *VM, args: []const Value) VmError!Value {
     const limit: i64 = if (args.len == 3) try requireFixnum(args[2]) else 0;
     // A pattern that is a literal of a byte or more splits as that
@@ -5914,18 +5568,12 @@ fn throwInvalidReplacement(vm: *VM, message: []const u8) VmError {
     return raise(vm, "invalid-replacement", message, &.{});
 }
 
-/// `(nexis.string/re-quote-replacement s)` → `s` with `\` and `$`
-/// escaped, so `replace` reads it literally (`Matcher.quoteReplacement`).
 fn fnStringReQuoteReplacement(vm: *VM, args: []const Value) VmError!Value {
     const quoted = regex_mod.quoteReplacement(vm.allocator, try stringArg(args[0])) catch return VmError.OutOfMemory;
     defer vm.allocator.free(quoted);
     return string_mod.fromBytes(vm.ensureHeap(), quoted) catch VmError.OutOfMemory;
 }
 
-/// `(nexis.string/replace-first s match replacement)` → `s` with its
-/// first match replaced, else `s` itself: a pattern as `replace` takes
-/// one, or a string or char `match` and a string or char replacement,
-/// an empty `match` found at the start.
 fn fnStringReplaceFirst(vm: *VM, args: []const Value) VmError!Value {
     if (args[1].kind() == .regex) return replacePattern(vm, args[0], args[1], args[2], false);
     const src = try utf8Arg(args[0]);
@@ -5942,11 +5590,9 @@ fn fnStringReplaceFirst(vm: *VM, args: []const Value) VmError!Value {
     return out.value;
 }
 
-/// `(nexis.string/join coll)` / `(nexis.string/join sep coll)` → the
-/// elements of any seqable as `str` makes them text (nil is empty),
-/// separated by `sep`. `coll` is consumed: a lazy seq is walked once,
-/// its text written as the walk hands out each element, so the
-/// realized seq behind the walk is garbage while the text grows.
+/// `coll` is consumed: a lazy seq is walked once, its text written as
+/// the walk hands out each element, so the realized seq behind the
+/// walk is garbage while the text grows.
 fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
     const sep: []const u8 = if (args.len == 2) blk: {
         if (args[0].kind() != .string) return VmError.KindMismatch;
@@ -6003,13 +5649,6 @@ fn joinPlain(vm: *VM, sep: []const u8, coll: Value) VmError!?Value {
     return out.value;
 }
 
-/// `(nexis.string/replace s match replacement)` — literal,
-/// all-non-overlapping, left-to-right; `match` and `replacement` are
-/// both strings or both chars. An empty `match` matches before every
-/// code point and at the end, as Java's `String.replace`.
-///   - Invalid UTF-8 in any arg → :utf8-error
-/// After each match, cursor advances by `match.len` so
-/// `(replace "aaa" "aa" "x") → "xa"`.
 fn fnStringReplace(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
     const match = args[1];
@@ -6153,8 +5792,6 @@ fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
 }
 
-/// `(bound? & vs)` → whether every Var has a value, its root or a
-/// binding in force, as Clojure's `Var.isBound`.
 fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
     for (args) |v| {
         if (v.kind() != .var_) return VmError.KindMismatch;
@@ -6163,17 +5800,11 @@ fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
     return value_mod.fromBool(true);
 }
 
-/// `(nano-time)` → a monotonic clock in nanoseconds, for measuring
-/// intervals (Java's `System/nanoTime`): a 64-bit count, a bignum past
-/// the fixnum range (about 39 hours of the host's awake time), so an
-/// interval never spans a wrap.
+/// A bignum past the fixnum range, so an interval never spans a wrap.
 fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
     return integerValue(vm, @truncate(std.Io.Clock.awake.now(ioOf(vm)).nanoseconds));
 }
 
-/// `(slurp path)` → the file's text. `:file-not-found` for a missing
-/// file, `:utf8-error` for text that is not UTF-8, `:io-error` for
-/// any other failure.
 fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
     const path = try vm_mod.pathArg(args[0]);
     const slice = std.Io.Dir.cwd().readFileAlloc(ioOf(vm), path, vm.allocator, .unlimited) catch |err| switch (err) {
@@ -6186,10 +5817,6 @@ fn fnSlurp(vm: *VM, args: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), slice) catch return VmError.OutOfMemory;
 }
 
-/// `(spit path content)` / `(spit path content :append true)` →
-/// writes `(str content)` to the file, replacing it, or after its
-/// end with `:append`; nil. Parent directories are not created
-/// (`:file-not-found`).
 fn fnSpit(vm: *VM, args: []const Value) VmError!Value {
     const path = try vm_mod.pathArg(args[0]);
     if (args.len % 2 != 0) return VmError.ArityMismatch;
@@ -6259,8 +5886,6 @@ fn readLine(r: *std.Io.Reader, overflow: *std.ArrayList(u8), gpa: std.mem.Alloca
     return std.mem.trimEnd(u8, line, "\r");
 }
 
-/// `(read-line)` → the next line of stdin as a string, nil at end
-/// of input.
 fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
     // A wait on stdin is a wait like the REPL's: no read snapshot is
     // held across it (DB.md §3.4).
@@ -6272,11 +5897,6 @@ fn fnReadLine(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), line) catch VmError.OutOfMemory;
 }
 
-/// `(exit)` / `(exit status)` → ends the process with `status` (0 by
-/// default) after closing every store the program opened, through
-/// `db/open` or `nextomic/connect`, and syncing every file a commit
-/// left unsynced; nothing after it runs, `finally` blocks included, as
-/// with Java's `System/exit`.
 fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     const status: u8 = if (args.len == 0) 0 else @truncate(@as(u64, @bitCast(try requireFixnum(args[0]))));
     const host = vm.home();
@@ -7253,12 +6873,6 @@ fn fnJsonWrite(vm: *VM, args: []const Value) VmError!Value {
 // don't touch these directly; they're macro-emit-only
 // scaffolding.
 
-/// `(#%register-record-type "ns/name" [:field1 :field2 ...])`
-///   → fixnum type_id
-///
-/// Looks up the receiver VM's namespace registry to derive the
-/// effective ns prefix (the current namespace), then calls
-/// `vm.registerRecordType`; redefining a type registers a new one.
 /// The `"ns/name"` a record or protocol registers under, split at the
 /// last `/`; the namespace is "" when there is none.
 fn splitNsName(full: []const u8) struct { ns: []const u8, name: []const u8 } {
@@ -7266,6 +6880,9 @@ fn splitNsName(full: []const u8) struct { ns: []const u8, name: []const u8 } {
     return .{ .ns = full[0..i], .name = full[i + 1 ..] };
 }
 
+/// `(#%register-record-type "ns/name" [:field1 :field2 ...])` → the
+/// fixnum type id from `vm.registerRecordType`; redefining a type
+/// registers a new one.
 fn fnRegisterRecordType(vm: *VM, args: []const Value) VmError!Value {
     const full_name_v = args[0];
     const fields_vec = args[1];
@@ -7343,9 +6960,6 @@ fn fnCurrentNs(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), vm.ensureNamespace().name) catch VmError.OutOfMemory;
 }
 
-/// `(in-ns 'name)` → makes `name` the current namespace, creating
-/// it (with nexis.core referred) when absent, so the forms after it
-/// compile there; nil.
 fn fnInNs(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .symbol) return VmError.KindMismatch;
     const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
@@ -8020,9 +7634,6 @@ fn entriesList(vm: *VM, is_map: bool, entries: []const sorted_mod.Entry) VmError
     return buildListFromSlice(vm, items);
 }
 
-/// `(rseq rev)` → the elements of a vector or sorted collection last
-/// first, nil when it is empty; anything else is `:kind-mismatch`, as
-/// Clojure's `Reversible` requires.
 fn fnRseq(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
     switch (c.kind()) {
@@ -8065,16 +7676,12 @@ fn f64Elem(v: Value) VmError!f64 {
     return typed_vector_mod.f64FromValue(v) orelse VmError.KindMismatch;
 }
 
-/// `(i64-vector coll)`: an `i64` typed vector of the integers in
-/// `coll`, any seqable.
 fn fnI64Vector(vm: *VM, args: []const Value) VmError!Value {
     var elems = try typedElems(i64, vm, args[0], i64Elem);
     defer elems.deinit(vm.allocator);
     return typed_vector_mod.fromI64Slice(vm.ensureHeap(), elems.items) catch VmError.OutOfMemory;
 }
 
-/// `(f64-vector coll)`: an `f64` typed vector of the numbers in
-/// `coll`, any seqable; integers widen.
 fn fnF64Vector(vm: *VM, args: []const Value) VmError!Value {
     var elems = try typedElems(f64, vm, args[0], f64Elem);
     defer elems.deinit(vm.allocator);
@@ -8094,7 +7701,6 @@ fn typedElems(comptime T: type, vm: *VM, coll: Value, comptime elem: fn (Value) 
     return out;
 }
 
-/// `(typed-vector-type tv)` → `:i64` or `:f64`.
 fn fnTypedVectorType(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .typed_vector) return VmError.KindMismatch;
     const name = typed_vector_mod.elemType(args[0]).name();
@@ -8136,10 +7742,8 @@ fn dotF64(xs: []const f64, ys: []const f64) f64 {
     return total;
 }
 
-/// `(tv/sum xs)`: the exact integer sum for `i64`, a bignum when it
-/// is beyond the fixnum range, as `(reduce + xs)` yields; a float
-/// for `f64`. Fewer than 2^64 elements of `i64` sum to a magnitude
-/// under 2^127, so the `i128` accumulator never overflows.
+/// Fewer than 2^64 elements of `i64` sum to a magnitude under 2^127,
+/// so the `i128` accumulator never overflows.
 fn fnSimdSum(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     switch (typed_vector_mod.elemType(args[0])) {
@@ -8162,11 +7766,9 @@ fn spillI128(heap: *heap_mod.Heap, acc: ?Value, n: i128) VmError!Value {
     return bignum_mod.add(heap, a, v) catch VmError.OutOfMemory;
 }
 
-/// `(tv/dot xs ys)`: same element type (`:kind-mismatch`) and length
-/// (`:invalid-argument`); result kind as `sum`, exact at any size. A
-/// product of two `i64` fits `i128`; when the running total of
-/// products leaves `i128` it spills into a bignum and the `i128`
-/// accumulation restarts from the product that overflowed it.
+/// A product of two `i64` fits `i128`; when the running total leaves
+/// `i128` it spills into a bignum and the `i128` accumulation restarts
+/// from the product that overflowed it.
 fn fnSimdDot(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     try requireTypedVector(args[1]);
@@ -8191,10 +7793,8 @@ fn fnSimdDot(vm: *VM, args: []const Value) VmError!Value {
     }
 }
 
-/// `(tv/scale xs k)`: every element times `k`, same element type.
-/// The result is an element-typed vector, so an `i64` product
-/// outside `i64` has no representation and is `:arithmetic-overflow`
-/// (TYPED_VECTOR.md §7.2), the one arithmetic that raises it.
+/// The result is element-typed, so an `i64` product outside `i64` is
+/// `:arithmetic-overflow` (TYPED_VECTOR.md §7.2).
 fn fnSimdScale(vm: *VM, args: []const Value) VmError!Value {
     try requireTypedVector(args[0]);
     const heap = vm.ensureHeap();
@@ -8224,11 +7824,9 @@ fn fnSimdScale(vm: *VM, args: []const Value) VmError!Value {
     }
 }
 
-/// `(tv/map f xs)`: `(f x)` over every element, collected into a
-/// typed vector of the same element type under the constructor rule.
 /// `xs` stays reachable through the caller's argument slot across
-/// every `callValue`; the results live in a Zig slice until the
-/// result vector is allocated.
+/// every `callValue`; the results live in a Zig slice until the result
+/// vector is allocated.
 fn fnSimdMap(vm: *VM, args: []const Value) VmError!Value {
     const f = args[0];
     const xs = args[1];
