@@ -427,8 +427,8 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 }
                 // Promotion (CHAMP.md §5.3): build the trie of the nine.
                 var items: [array_map_max + 1]Item = undefined;
-                for (ps, 0..) |old, i| items[i] = .{ .p = old, .hash = indexHashOf(keyOf(old), elementHash), .order = @intCast(i) };
-                items[array_map_max] = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = array_map_max };
+                for (ps, 0..) |old, i| items[i] = .of(old, indexHashOf(keyOf(old), elementHash), i);
+                items[array_map_max] = .of(p, indexHashOf(keyOf(p), elementHash), array_map_max);
                 std.mem.sortUnstable(Item, &items, {}, Item.lessThan);
                 return newRoot(heap, items.len, try build(heap, &items, 0, 0));
             }
@@ -772,8 +772,8 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 },
                 .promote => {
                     var items: [array_map_max + 1]Item = undefined;
-                    for (arrayPayloads(root), 0..) |old, i| items[i] = .{ .p = old, .hash = spot.hashes[i], .order = @intCast(i) };
-                    items[array_map_max] = .{ .p = p, .hash = spot.hash32, .order = array_map_max };
+                    for (arrayPayloads(root), 0..) |old, i| items[i] = .of(old, spot.hashes[i], i);
+                    items[array_map_max] = .of(p, spot.hash32, array_map_max);
                     std.mem.sortUnstable(Item, &items, {}, Item.lessThan);
                     return Heap.asHeapHeader(try newRoot(heap, items.len, try build(heap, &items, 0, edit)));
                 },
@@ -970,18 +970,30 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
 
         const Item = struct {
             p: P,
-            hash: u32,
-            /// Input position: equal hashes keep it (a collision node
-            /// is in association order).
-            order: u32,
+            /// The hash bit-reversed above the input position. Ordered by
+            /// it, the hash's slot on level 0 comes first, then level 1's,
+            /// and so on, so every subtree's keys are contiguous, and
+            /// equal hashes keep input order (a collision node is in
+            /// association order). One word, stored and compared whole:
+            /// on x86-64 an 8-byte load of two 4-byte stores waits for
+            /// them to reach the cache (docs/PERF.md "Natives that return
+            /// in place").
+            key: u64,
 
-            /// Orders by the hash's slot on level 0, then level 1, and
-            /// so on, so every subtree's keys are contiguous; equal
-            /// hashes keep input order.
+            fn of(p: P, h: u32, at: usize) Item {
+                return .{ .p = p, .key = @as(u64, @bitReverse(h)) << 32 | @as(u32, @intCast(at)) };
+            }
+
+            fn hash(item: Item) u32 {
+                return @bitReverse(@as(u32, @intCast(item.key >> 32)));
+            }
+
+            fn order(item: Item) u32 {
+                return @truncate(item.key);
+            }
+
             fn lessThan(_: void, a: Item, b: Item) bool {
-                const ra = @bitReverse(a.hash);
-                const rb = @bitReverse(b.hash);
-                return ra < rb or (ra == rb and a.order < b.order);
+                return a.key < b.key;
             }
         };
 
@@ -991,7 +1003,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         /// One allocation per node.
         fn build(heap: *Heap, items: []const Item, shift: u8, edit: u32) !*HeapHeader {
             if (shift > MAX_TRIE_SHIFT) {
-                const h = try allocCollision(heap, items[0].hash, items.len, edit);
+                const h = try allocCollision(heap, items[0].hash(), items.len, edit);
                 for (collisionPayloads(h), items) |*dst, item| dst.* = item.p;
                 return h;
             }
@@ -999,7 +1011,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             var nodes: u32 = 0;
             var i: usize = 0;
             while (i < items.len) {
-                const slot = slotOf(items[i].hash, shift);
+                const slot = slotOf(items[i].hash(), shift);
                 const j = runEnd(items, i, shift);
                 if (j - i == 1) data |= bitOf(slot) else nodes |= bitOf(slot);
                 i = j;
@@ -1007,7 +1019,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             const h = try allocInterior(heap, data, nodes, edit, 0);
             i = 0;
             while (i < items.len) {
-                const slot = slotOf(items[i].hash, shift);
+                const slot = slotOf(items[i].hash(), shift);
                 const j = runEnd(items, i, shift);
                 if (j - i == 1) {
                     payloads(h)[dataIndex(data, slot)] = items[i].p;
@@ -1020,9 +1032,9 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
         }
 
         fn runEnd(items: []const Item, start: usize, shift: u8) usize {
-            const slot = slotOf(items[start].hash, shift);
+            const slot = slotOf(items[start].hash(), shift);
             var j = start + 1;
-            while (j < items.len and slotOf(items[j].hash, shift) == slot) j += 1;
+            while (j < items.len and slotOf(items[j].hash(), shift) == slot) j += 1;
             return j;
         }
 
@@ -1035,7 +1047,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             var small: [16]Item = undefined;
             const items = if (ps.len <= small.len) small[0..ps.len] else try heap.backing.alloc(Item, ps.len);
             defer if (ps.len > small.len) heap.backing.free(items);
-            for (ps, items, 0..) |p, *item, i| item.* = .{ .p = p, .hash = indexHashOf(keyOf(p), elementHash), .order = @intCast(i) };
+            for (ps, items, 0..) |p, *item, i| item.* = .of(p, indexHashOf(keyOf(p), elementHash), i);
             std.mem.sortUnstable(Item, items, {}, Item.lessThan);
             // Merge equal keys; they share a hash, so they are adjacent.
             var n: usize = 0;
@@ -1043,7 +1055,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             while (i < items.len) {
                 const run = n;
                 var j = i;
-                while (j < items.len and items[j].hash == items[i].hash) : (j += 1) {
+                while (j < items.len and items[j].hash() == items[i].hash()) : (j += 1) {
                     const item = items[j];
                     for (items[run..n]) |*kept| {
                         if (keyEquivalent(keyOf(kept.p), keyOf(item.p), elementEq)) {
@@ -1060,7 +1072,7 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             if (n <= array_map_max) {
                 std.mem.sortUnstable(Item, items[0..n], {}, struct {
                     fn byOrder(_: void, a: Item, b: Item) bool {
-                        return a.order < b.order;
+                        return a.order() < b.order();
                     }
                 }.byOrder);
                 const h = try allocArray(heap, n);
