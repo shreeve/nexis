@@ -257,9 +257,10 @@ pub const Conn = struct {
     }
 
     /// End the read: a reader is kept for the next read while it is the
-    /// latest commit (NEXTOMIC.md §2), a child is aborted.
+    /// latest commit (NEXTOMIC.md §2); a `with` view's, a child of the
+    /// held write transaction, is aborted.
     pub fn endReadTxn(self: *Conn, txn: *Txn) void {
-        if (self.overlay == null) self.store.file.keep(txn) else txn.abort();
+        if (self.owns_store) self.store.file.keep(txn) else txn.abort();
         self.taskDone();
     }
 
