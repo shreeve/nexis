@@ -67,6 +67,11 @@ pub const user_partition_start: u64 = 1 << 32;
 pub const user_partition_end: u64 = 1 << 46;
 /// Transaction entities are `tx_partition_bit | t`, `t < 2^46`.
 pub const tx_partition_bit: u64 = 1 << 46;
+/// Every `t` a transaction takes stays below 2^39, so a history key's
+/// `top` starts with a zero byte, which the merged order of an inline
+/// value and the out-of-line value it prefixes needs
+/// (`Store.MergedScan`, NEXTOMIC.md §2.1).
+pub const t_limit: u64 = 1 << 39;
 
 /// Entity id of the transaction with logical number `t`.
 pub inline fn txEntity(t: u64) u64 {

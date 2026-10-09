@@ -585,7 +585,7 @@ const Ctx = struct {
             conn.taskDone();
         }
         const now = try conn.store.readT(txn);
-        if (now + 1 >= key.tx_partition_bit) return error.DatabaseFull;
+        if (now + 1 >= key.t_limit) return error.DatabaseFull;
         const schema = try conn.schemaAt(txn, now, now);
         const next_eid = try conn.store.readNextEid(txn);
         return .{

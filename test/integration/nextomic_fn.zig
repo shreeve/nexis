@@ -479,3 +479,16 @@ test "a lookup ref value upserts through any unique assertion of the transaction
     const n = try fx.q(try fx.db(), "[:find ?n :where [?e :u/n ?n]]");
     try testing.expectEqual(@as(usize, 2), count(n));
 }
+
+test "a transaction past the last t the merged order allows is map-full" {
+    const fx = try Fx.init("fn_t_limit");
+    defer fx.deinit();
+    const store = fx.conn().store;
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        try store.writeT(txn, nextomic.key.t_limit - 1);
+        try txn.commit();
+    }
+    try testing.expectError(error.DatabaseFull, fx.transact("[{:db/doc \"one too many\"}]"));
+}

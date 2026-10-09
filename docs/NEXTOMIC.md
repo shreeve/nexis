@@ -182,7 +182,10 @@ never trusted; a partition or `t` that would run past its range is
 | user entities | `2^32 .. 2^46-1` | `sys/"eid"` |
 | transaction entities | `2^46 \| t` | the logical `t` of the transaction |
 
-`t` starts at 1 and increases by one per committed `transact!`. Because
+`t` starts at 1 and increases by one per committed `transact!`, and
+stays below 2^39: past it a transaction is `:db/map-full`, since a
+history key's `top` must start with a zero byte for the merged order of
+an inline value and the out-of-line value it prefixes (§2.2). Because
 `t` lives in the same file as the datoms and commits with them, a crash
 or an engine-level rollback can never leave `t` ahead of the data.
 
