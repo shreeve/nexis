@@ -70,6 +70,9 @@ true.
   as Clojure's `Numbers.max` and `min` do: `(max 2 1.0)` is `2`,
   `(max 1 2.0)` is `2.0`, a tie is the second argument (`(max 1
   1.0)` is `1.0`), and a NaN argument is the result.
+- `=`, `==`, `<`, `<=`, `>` and `>=` take one argument or more, as
+  Clojure's do; none is `:arity-mismatch`. `+` and `*` take none:
+  `(+)` is `0`, `(*)` is `1`.
 - `/` on two integers yields an integer when the division is exact
   and otherwise the f64 nearest the true quotient (ties to even),
   whatever the operands' size: `(/ 6 3)` is `2`, `(/ 7 2)` is `3.5`,

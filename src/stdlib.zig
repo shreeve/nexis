@@ -281,12 +281,12 @@ const core_rows = .{
     .{ "quot", 2, 2, &fnQuot, "[num div]", "Returns the quotient of num by div, truncated toward zero. A zero\n  div is :divide-by-zero." },
     .{ "rem", 2, 2, &fnRem, "[num div]", "Returns the remainder of num by div under truncated division; it\n  has num's sign. A zero div is :divide-by-zero." },
     .{ "mod", 2, 2, &fnMod, "[num div]", "Returns the modulus of num by div under floored division; it has\n  div's sign. A zero div is :divide-by-zero." },
-    .{ "<", 0, null, &fnLt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
-    .{ "<=", 0, null, &fnLte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
-    .{ ">", 0, null, &fnGt, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
-    .{ ">=", 0, null, &fnGte, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are in nonincreasing order. Exact across\n  integers of any size; false against NaN." },
-    .{ "==", 0, null, &fnNumEq, .leaf, "[] [x] [x y] [x y & more]", "Returns true if the nums are numerically equal, across integers and\n  floats: (== 1 1.0) is true. NaN is == to nothing." },
-    .{ "=", 0, null, &fnEq, "[] [x] [x y] [x y & more]", "Returns true if the args are equal by value. Different kinds are\n  never equal, except a list and a vector, or hash and sorted maps or\n  sets: (= 1 1.0) is false. Unlike Clojure, NaN is = to NaN." },
+    .{ "<", 1, null, &fnLt, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly increasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ "<=", 1, null, &fnLte, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in nondecreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ ">", 1, null, &fnGt, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in strictly decreasing order. Exact\n  across integers of any size; false against NaN." },
+    .{ ">=", 1, null, &fnGte, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are in nonincreasing order. Exact across\n  integers of any size; false against NaN." },
+    .{ "==", 1, null, &fnNumEq, .leaf, "[x] [x y] [x y & more]", "Returns true if the nums are numerically equal, across integers and\n  floats: (== 1 1.0) is true. NaN is == to nothing." },
+    .{ "=", 1, null, &fnEq, "[x] [x y] [x y & more]", "Returns true if the args are equal by value. Different kinds are\n  never equal, except a list and a vector, or hash and sorted maps or\n  sets: (= 1 1.0) is false. Unlike Clojure, NaN is = to NaN." },
     .{ "not=", 1, null, &fnNotEq, "[x] [x y] [x y & more]", "Returns (not (= x y & more))." },
     .{ "inc", 1, 1, &fnInc, .leaf, "[x]", "Returns x plus one, a bignum past the fixnum range." },
     .{ "dec", 1, 1, &fnDec, .leaf, "[x]", "Returns x minus one, a bignum past the fixnum range." },
@@ -1043,7 +1043,7 @@ fn fnSomeQ(_: *VM, args: []const Value) VmError!Value {
 //   (+)        => 0            (*)        => 1
 //   (+ x)      => x            (- x)      => negation
 //   (+ x y...) => left fold    (/ x)      => reciprocal
-//   (<)        => true         (< x y z)  => chained
+//   (< x)      => true         (< x y z)  => chained
 //
 // `=` is value equality (dispatch.equal, cross-type false);
 // `==` is numeric equality with contagion (`(== 1 1.0)` is true).

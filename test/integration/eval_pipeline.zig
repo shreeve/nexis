@@ -3168,13 +3168,13 @@ test "integration: variadic native + / * / - / <" {
     try expectOutput("(* 2 3 4)", "24");
     try expectOutput("(- 10 3)", "7");
     try expectOutput("(- 7)", "-7");
-    try expectOutput("(<)", "true");
+    try expectOutput("[(try (<) (catch :arity-mismatch _ :arity)) (try (<=) (catch :arity-mismatch _ :arity)) (try (==) (catch :arity-mismatch _ :arity))]", "[:arity :arity :arity]");
     try expectOutput("(< 1 2 3)", "true");
     try expectOutput("(< 1 3 2)", "false");
 }
 
 test "integration: value equality `=` (variadic, structural)" {
-    try expectOutput("(=)", "true");
+    try expectOutput("(try (=) (catch :arity-mismatch _ :arity))", ":arity");
     try expectOutput("(= 1)", "true");
     try expectOutput("(= 1 1 1)", "true");
     try expectOutput("(= 1 1 2)", "false");
@@ -6430,7 +6430,7 @@ test "numbers: comparison across kinds" {
     try expectOutput("(> 3 2 1)", "true");
     try expectOutput("(> 3 1 2)", "false");
     try expectOutput("(<= 1 1 2)", "true");
-    try expectOutput("(>)", "true");
+    try expectOutput("[(try (>) (catch :arity-mismatch _ :arity)) (try (>=) (catch :arity-mismatch _ :arity))]", "[:arity :arity]");
     try expectOutput("(>= 5)", "true");
     try expectOutput("(= 1 1.0)", "false");
     try expectOutput("(== 1 1.0)", "true");
