@@ -1,0 +1,17 @@
+version 42, :ready [1 "two"]
+"Ada scored 42 (87.5%)"
+"[   ab|cd   |00042]"
+4 "afé" "caf" "é"
+"red, green, blue"
+["2026" "10" "09"]
+["a" "b" "" "c"]
+["first line" "second line"]
+"padded" "SHOUT" "quiet"
+"Nexis is a lisp"
+true true true true
+"a+b+c"
+"09/10/2026"
+"hellO wOrld"
+"66"
+("66" "7")
+["ada@example.org" "ada" "example"]

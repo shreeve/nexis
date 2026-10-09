@@ -1,44 +1,24 @@
-; examples/lib/shapes/records.nx
-;
-; Concrete record types implementing `lib.shapes.protocol/Shape`.
-;
-; Part 2 of 4 of the shapes-app demo: records with inline protocol
-; impls + `extend-type` over a record defined elsewhere.
-; Cross-namespace protocol reference via the `p` alias.
+; examples/lib/shapes/records.nx — records implementing the Shape
+; protocol from another namespace, named through its alias.
 
-(ns lib.shapes.records)
-
-(require '[lib.shapes.protocol :as p])
-
-; ---- inline impls ----
+(ns lib.shapes.records
+  (:require [lib.shapes.protocol :as p]))
 
 (defrecord Circle [radius]
   p/Shape
-  (area [c]
-    ; Integer areas in centi-pi units (radius² × 314) keep the
-    ; output exact; what we're demonstrating is protocol dispatch.
-    (let* [r (get c :radius)]
-      (* 314 r r)))
-  (describe [c]
-    (str "Circle r=" (get c :radius))))
+  (area [_] (* 3.14159 radius radius))
+  (describe [_] (str "Circle of radius " radius)))
 
-(defrecord Rectangle [width height]
+(defrecord Rect [width height]
   p/Shape
-  (area [r] (* (get r :width) (get r :height)))
-  (describe [r]
-    (str "Rectangle " (get r :width) "x" (get r :height))))
+  (area [_] (* width height))
+  (describe [_] (str "Rect " width "x" height)))
 
-; ---- separate extend-type over a record ----
-;
-; Triangle is declared without an inline impl, then extended
-; via `extend-type` — same target (`p/Shape`), different
-; mechanism. Verifies both shapes converge in the protocol
-; registry.
-
+; A record can also be extended after it is defined. Outside defrecord
+; the fields are not locals, so the methods destructure them.
 (defrecord Triangle [base height])
 
 (extend-type Triangle
   p/Shape
-  (area [t] (* (get t :base) (get t :height)))
-  (describe [t]
-    (str "Triangle b=" (get t :base) " h=" (get t :height))))
+  (area [{:keys [base height]}] (/ (* base height) 2))
+  (describe [{:keys [base]}] (str "Triangle with base " base)))

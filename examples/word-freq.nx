@@ -1,0 +1,32 @@
+; examples/word-freq.nx — a small program: the most frequent words of a
+; paragraph, as one pipeline of sequence functions.
+;
+;   bin/nexis run examples/word-freq.nx
+
+(require '[clojure.string :as str])
+
+(def text
+  "A river is water in motion. The river carries the rain from the hills
+to the sea, and the sea gives the rain back to the hills. The water in a
+river is never the same water twice: a river is a shape the water takes
+for a while. Watch a river long enough and you learn that a shape can
+outlast every drop it is made of.")
+
+; A set is a function of membership, so remove can use it directly.
+(def common-words
+  #{"a" "and" "back" "can" "every" "for" "from" "in" "is" "it" "never"
+    "of" "that" "the" "to" "you"})
+
+(defn top-words
+  "The n most frequent words of s outside common-words, most frequent
+  first, ties in alphabetical order."
+  [n s]
+  (->> (str/lower-case s)
+       (re-seq #"[a-z']+")
+       (remove common-words)
+       frequencies
+       (sort-by (fn [[word count]] [(- count) word]))
+       (take n)))
+
+(doseq [[word count] (top-words 6 text)]
+  (println (format "%-7s %d %s" word count (apply str (repeat count "#")))))

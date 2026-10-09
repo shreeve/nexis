@@ -1,4 +1,5 @@
-; examples/cond.nx — classification via cond + when.
+; test/examples/pins/cond.nx — classification via cond + when.
+; A pin, not a teaching example: cond over and, with an :else clause.
 ; Showcases the host macros cond, when, and, or, ->, plus the
 ; user-facing `let`/`fn`/`loop` names.
 

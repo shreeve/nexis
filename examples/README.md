@@ -1,56 +1,55 @@
 # examples
 
-`.nx` programs that run through the `nexis` CLI.
+Small nexis programs, each a lesson in the language. nexis is Clojure
+on its own runtime, so most of what they show reads as Clojure does;
+where nexis differs, the comments say so.
 
 ```bash
-zig build install                       # bin/nexis
-./bin/nexis run examples/hello.nx
-zig build examples                      # every example through bin/nexis
+zig build install                       # builds bin/nexis
+./bin/nexis run examples/hello.nx       # run one
+./bin/nexis repl                        # try a line at a time
 ```
 
-`zig build examples` (part of `zig build test`) runs every file below
-from a fresh working directory and compares what it prints with
-`test/examples/<name>.out`. `durable-refs`, `todo-app` and
-`nextomic-app` then run a second time over the store the first run
-left, compared with `test/examples/<name>.2.out`. `durable-refs`
-prints the same both times; `todo-app` starts its second run from the
-first run's state, and `nextomic-app` shows the facts both runs
-added. `zig build examples -Dupdate=true` rewrites the expected
-files.
+Each file starts with a comment saying what it shows. Read them in
+this order:
 
-| File | What it shows |
+| File | What it teaches |
 |---|---|
-| `hello.nx` | `defn` + call |
-| `sum10.nx` | `loop`/`recur` constant-stack iteration |
-| `forward-ref.nx` | `defn` forward references through the namespace Var (f calls g before g is defined) |
-| `cond.nx` | `cond` + `and` + `:else` |
-| `threading.nx` | `->` thread-first through `+` |
-| `macros.nx` | `when-not` / `loop` / `or` host macros |
-| `quoted-list.nx` | `(quote (...))` builds a runtime list |
-| `syntax-quote.nx` | `` ` `` / `~` / `~@` with splicing |
-| `macro-author.nx` | Synthesizing a `(let* [x 99] x)` form with a vector syntax-quote |
-| `try-catch.nx` | `try` / `catch` / `throw` across frames; catch by keyword tag; `finally` alone |
-| `regex.nx` | `#"..."` patterns: `re-find`, `re-matches`, a lazy `re-seq`, a matcher with `re-groups`, named groups, `split` / `replace` / `replace-first` with patterns, `$n` and `${name}` replacements and a function replacement, the `(?i)` and `(?iu)` flags and `\p{Lu}`, `:invalid-regex` and `:invalid-replacement`, and a pattern that stalls a backtracking engine finishing in linear time |
-| `metadata.nx` | `defn` docstrings and attribute maps, `(doc f)`, `^:private`, `with-meta` / `vary-meta` on collections |
-| `binding.nx` | `^:dynamic` Vars and `binding`: nested extents, a function called inside one seeing the binding in force, restoration on throw, `set!` on the innermost binding, `:not-dynamic` |
-| `maps-sets.nx` | `{...}` and `#{...}` literals |
-| `defmacro.nx` | User macros: a fresh sub-VM per compile-time invocation |
-| `eval.nx` | `eval` with `read-string`: a form as data compiled and run on the calling VM; a `def` and a `defmacro` inside it visible afterwards, a returned closure, the catchable `:compile-error` map, a throw from inside the form |
-| `stdlib-primitives.nx` | Native fns (`list`/`cons`/`first`/`rest`/`empty?`/...) and a recursive procedural `my-cond` macro |
-| `require-demo.nx` + `lib/geom.nx` | `(require '[lib.geom :as g])` loads a library from disk |
-| `shapes.nx` | Protocols + records in one file: `defprotocol`, `defrecord`, `extend-protocol` over records and built-ins, `satisfies?`, atoms, `str`, `case`/`for` |
-| `multimethods.nx` | `defmulti` and `defmethod`: dispatch on a map's key with a `:default`, on `class` over a record and kinds the global hierarchy derives, through a `derive`d hierarchy of tags, on a vector of two kinds; `prefer-method` settling an ambiguity; a caught `:no-method`; a hierarchy of one's own through `:hierarchy #'h` |
-| `typed-vectors.nx` | `i64-vector` / `f64-vector`, the generic functions over them, the `nexis.simd` kernels (`tv/sum`, `tv/dot`, `tv/scale`, `tv/map`), equality rules and the `:kind-mismatch` / `:index-out-of-bounds` errors |
-| `tests-demo.nx` | `nexis.test`: `deftest`, `is` (`=`, `thrown?`, bare), `testing`, `run-tests`; one test fails, one throws, so the report shows every outcome and the summary map |
-| `shapes-app.nx` + `lib/shapes/{protocol,records,builtins}.nx` | The same program as a multi-file application: a driver and three required modules; prints one report per shape and `total-area atom = 9650` |
-| `durable-refs.nx` | Durable identity backed by emdb: `db/open`/`db/ref`/`db/put-key!`/`db/get-key`/`db/delete-key!`; values persist across processes |
-| `todo-app.nx` | Persistent to-do tracker over the whole `db/*` surface (`with-tx`, `db/alter!`, `db/scan`, `db/reduce-tree`, `@deref`, rollback on exception). Its report ends `:final-stats {:total 3, :completed 1}` on every run |
-| `nextomic-app.nx` | A clinic chart on Nextomic (`docs/NEXTOMIC.md`): schema as data, upserts by unique identity, component notes, Datalog queries with `d/q` (joins, `:in`, a predicate, an aggregate), `d/pull` patterns (nested, reverse, component), `as-of`/`history`/`tx-range` reads, a speculative `d/with`, a caught `:nextomic/unique`. Patients and visits upsert by unique identity, so a second run still counts two patients and one visit; its notes are added again and its history shows both runs |
+| `hello.nx` | A function, a string, `println` and `*command-line-args*` |
+| `basics.nx` | `let`, `fn` and `#(...)`, multi-arity `defn`, destructuring of vectors and maps, `if`/`when`/`cond`/`case`, `if-let`/`when-let`, `loop`/`recur`, `->` and `->>`, a closure |
+| `collections.nx` | Vectors, maps and sets as values: `assoc`/`update`/`assoc-in`/`update-in`, `merge-with`, `into`, `group-by`, `frequencies`, `sort-by`, `reduce`, `for`, ending in a report built from nested data |
+| `sequences.nx` | Lazy sequences: `map`/`filter`/`take`, infinite `range`/`iterate`/`cycle`, `partition`, a `lazy-seq` Fibonacci, `reductions`, transducers with `into` and `transduce` |
+| `strings.nx` | `str`, `format`, `subs`, counting characters not bytes, and `clojure.string`: `join`, `split`, `trim`, `replace`, with `re-find` and `re-seq` |
+| `word-freq.nx` | A small program: the most frequent words of a paragraph, as one `->>` pipeline |
+| `errors.nx` | `throw` of any value, `ex-info`/`ex-message`/`ex-data`, `catch` by tag or class name, `finally`, rethrowing with a cause |
+| `shapes.nx` | Protocols and records: `defprotocol`, `defrecord`, `extend-protocol` over strings, numbers and `nil`, `satisfies?`, a record as a map |
+| `shapes-app.nx` | The same as a program in several namespaces under `lib/shapes/`, loaded with `ns` and `:require` |
+| `require-demo.nx` | `require` of a library file (`lib/geom.nx`), with `:as`, `:refer` and `:rename` |
+| `macros.nx` | `defmacro`, syntax-quote, `~` and `~@`, auto-gensyms, `macroexpand-1`; an `unless`, a `with-retries` and a `when-valid` |
+| `multimethods.nx` | `defmulti`/`defmethod` dispatching on a key, on a type and on a vector, `derive` hierarchies, `prefer-method` |
+| `binding.nx` | `^:dynamic` Vars and `binding` |
+| `metadata.nx` | Docstrings and attribute maps on `defn`, `(doc f)`, `with-meta` and `vary-meta` |
+| `eval.nx` | Code as data: `read-string` and `eval` |
+| `regex.nx` | `#"..."` patterns in depth: groups, named groups, matchers, flags, replacement functions |
+| `typed-vectors.nx` | `i64-vector` and `f64-vector`, and the `nexis.simd` kernels over them |
+| `tests-demo.nx` | Unit tests with `nexis.test` (`clojure.test`): `deftest`, `is`, `testing`, `run-tests` |
+| `durable-refs.nx` | Durable refs: values in a store file that outlive the process; `with-tx` and rollback |
+| `todo-app.nx` | A to-do list kept in a store: `db/alter!`, `db/scan`, `db/reduce-tree` |
+| `nextomic-app.nx` | A clinic chart on Nextomic, the built-in database: schema as data, Datalog `q`, `pull`, `as-of` and `history`, a speculative `with` |
 
-The store-backed examples write under `tmp/` relative to the working
-directory; delete it to start from an empty store.
+The last three keep their data in `tmp/` under the working directory
+and are meant to be run twice: `durable-refs` counts its runs,
+`todo-app` starts its second run from the state the first left, and
+`nextomic-app` shows in its history the facts both runs added. Delete
+`tmp/` to start over.
 
-The macro examples cover both styles: host macros (Zig-implemented,
-registered in the default table) and user macros (`defmacro`,
-compile-time VM eval). Lexical bindings shadow both; user macros
-shadow host macros.
+`zig build examples`, part of the gate, runs every program here from
+a fresh directory and compares its output with
+`test/examples/<name>.out` (and the second run of the store-backed
+ones with `<name>.2.out`); `-Dupdate=true` rewrites those files.
+
+`test/examples/pins/` holds programs that pin low-level behaviour of
+the compiler and runtime rather than teach; they run in the same step.
+For the language as a whole, `docs/GUIDE.md` is nexis for Clojure
+programmers, and the REPL describes itself: `(doc name)`,
+`(dir nexis.string)` and `(apropos "split")`.

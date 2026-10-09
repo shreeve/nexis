@@ -1,72 +1,48 @@
-; examples/durable-refs.nx — durable identity demo
+; examples/durable-refs.nx — durable refs: a ref names a key in a store
+; file, and its value outlives the process. Run it twice: the second run
+; finds what the first one wrote. The store is tmp/refs.edb under the
+; working directory; delete tmp/ to start over.
 ;
-; Durable identities are first-class language values, not a library
-; bolted on top. Backed by emdb (LMDB-class B+ tree, MVCC, zero-copy
-; reads).
-;
-; This example uses both APIs:
-;   - auto-ephemeral: db/put-key! / db/get-key
-;   - explicit-tx: with-tx + db/put! / db/get
+;   bin/nexis run examples/durable-refs.nx
 
-; Open (or create) a connection to a database file. db/open accepts
-; a string path (the canonical shape) or a keyword/symbol. `tmp/` is
-; gitignored, so running this from the repo root keeps data files
-; out of the way.
-(def conn (db/open "tmp/app.edb"))
+; db/open opens the file, creating it and its directories.
+(def conn (db/open "tmp/refs.edb"))
 
-; Construct a durable ref. Its identity is the triple
-; {store-id, tree-name, key-bytes}. Two refs with the same
-; triple compare equal, regardless of stored content.
-(def alice (db/ref conn :users :alice))
+; A ref is a tree name and a key in that file. Refs are values: two made
+; the same way are equal.
+(def runs (db/ref conn :app :runs))
+(prn (= runs (db/ref conn :app "runs")))
 
-; Write + read via auto-ephemeral transactions.
-(db/put-key! alice {:name :alice :age 30 :tags #{:admin :early-user}})
-(db/get-key alice)               ; => {:name :alice, :age 30, ...}
+; db/get-key reads (with a default), db/put-key! writes, and @ reads too.
+; Each is its own small transaction.
+(db/put-key! runs (inc (db/get-key runs 0)))
+(println "run number" @runs)
 
-; Presence check (no decode cost).
-(db/present? alice)              ; => true
+; Any nexis value can be stored: maps, sets, vectors, nested.
+(def ada (db/ref conn :users :ada))
+(db/put-key! ada {:name "Ada" :langs #{"nexis"} :scores [90 95]})
+(prn @ada (db/present? ada) (db/present? (db/ref conn :users :nobody)))
 
-; Default value for missing keys.
-(db/get-key (db/ref conn :users :nobody) :not-found)   ; => :not-found
-
-; Persistent values round-trip through the codec — maps, sets,
-; vectors, nested structures all work.
-(def history-key (db/ref conn :events :session-1))
-(db/put-key! history-key
-  [:event-log
-   {:t 0 :kind :login}
-   {:t 1 :kind :click :target :button}
-   {:t 2 :kind :logout}])
-
-(db/get-key history-key)
-
-; Explicit transactions via `with-tx` / `with-read-tx`.
-; Multi-write atomicity: the body either fully commits OR fully
-; aborts. An exception inside the body aborts; the read after
-; sees the pre-tx state.
-(def bob (db/ref conn :users :bob))
+; with-tx groups writes into one transaction: all of them commit, or
+; none do. db/alter! applies a function to the stored value.
+(def grace (db/ref conn :users :grace))
 (with-tx [tx conn]
-  (db/put! tx alice {:age 31 :note :updated-via-with-tx})
-  (db/put! tx bob {:age 25}))
+  (db/put! tx grace {:name "Grace" :langs #{"COBOL"} :scores [88]})
+  (db/alter! tx ada update :scores conj 99))
 
-(with-read-tx [t conn]
-  [:alice (db/get t alice)
-   :bob (db/get t bob)])
+; with-read-tx reads several refs as of one moment.
+(with-read-tx [tx conn]
+  (prn (:scores (db/get tx ada)) (:name (db/get tx grace))))
 
-; Throwing inside `with-tx` rolls back.
-(def rolled-back
-  (try
-    (with-tx [tx conn]
-      (db/put! tx alice {:age 999 :note :should-not-persist})
-      (throw :oops))
-    (catch any e [:caught e])))
+; A throw inside with-tx rolls every write back.
+(prn (try
+       (with-tx [tx conn]
+         (db/put! tx ada {:name "overwritten"})
+         (throw :changed-my-mind))
+       (catch :changed-my-mind _ :rolled-back)))
+(prn (:name @ada))
 
-; alice still has the {:age 31 ...} from the successful tx.
-(def after-rollback (db/get-key alice))
-
-; Delete + close.
-(db/delete-key! alice)
-(db/delete-key! bob)
+; Remove the users, keep the run counter, and close the file.
+(db/delete-key! ada)
+(db/delete-key! grace)
 (db/close conn)
-
-(println [:rolled-back rolled-back :after-rollback after-rollback])

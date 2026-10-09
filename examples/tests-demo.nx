@@ -1,7 +1,9 @@
-; examples/tests-demo.nx — nexis.test: deftest, is, testing and
-; run-tests, with one failing test and one that throws, so the
-; report shows every outcome. `nexis test examples/tests-demo.nx`
-; would also exit 1 for the failures.
+; examples/tests-demo.nx — unit tests with nexis.test (clojure.test is
+; accepted as its name): deftest, is, testing and run-tests. Two tests
+; fail and one throws, so the report shows every outcome.
+;
+;   bin/nexis run examples/tests-demo.nx    prints the report
+;   bin/nexis test examples/tests-demo.nx   also exits 1 on a failure
 
 (require '[nexis.test :as t])
 
@@ -23,8 +25,14 @@
   (t/is (t/thrown? :boom (throw {:error :boom :n 1})))
   (t/is (t/thrown? any (throw "anything"))))
 
+; A throw that no thrown? expects is an error, not a failure.
+(defn parse-age [s]
+  (or (parse-long s)
+      (throw (ex-info "not a number" {:error :bad-age :input s}))))
+
 (t/deftest erroring-test
-  (t/is (= 1 (/ 1 0))))
+  (t/is (= 30 (parse-age "30")))
+  (t/is (= 1 (parse-age "one"))))
 
 (t/deftest bare-test
   (t/is (pos? (area 3 3)))

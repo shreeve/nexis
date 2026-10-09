@@ -1,0 +1,47 @@
+; examples/strings.nx — text: building strings with str and format,
+; slicing with subs, and the string library. Strings are UTF-8, and
+; count, subs and nth count characters (code points), not bytes.
+;
+;   bin/nexis run examples/strings.nx
+
+; nexis.string is the string library; clojure.string is accepted as
+; its name, so code written for Clojure requires it unchanged.
+(require '[clojure.string :as str])
+
+; str concatenates the text of anything: nil is empty, and a string
+; inside a collection keeps its quotes. prn prints a string in quotes,
+; println as its text.
+(println (str "version " 42 \, " " :ready nil " " [1 "two"]))
+
+; format takes printf-style directives.
+(prn (format "%s scored %d (%.1f%%)" "Ada" 42 87.456))
+(prn (format "[%5s|%-5s|%05d]" "ab" "cd" 42))
+
+; subs slices by index, and count and subs see "é" as one character.
+(def word "café")
+(prn (count word) (subs word 1) (subs word 0 3) (subs word 3 4))
+
+; join, split and split-lines.
+(prn (str/join ", " ["red" "green" "blue"]))
+(prn (str/split "2026-10-09" #"-"))
+(prn (str/split "a,b,,c" ","))
+(prn (str/split-lines "first line\nsecond line"))
+
+; Trimming and case.
+(prn (str/trim "   padded   ") (str/upper-case "shout") (str/lower-case "QUIET"))
+(prn (str/capitalize "nexis is a lisp"))
+
+; Questions about a string.
+(prn (str/includes? "functional" "fun") (str/starts-with? "nexis" "nex")
+     (str/ends-with? "nexis" "is") (str/blank? "  "))
+
+; replace takes a string or a regular expression; $1 names a group.
+(prn (str/replace "a-b-c" "-" "+"))
+(prn (str/replace "2026-10-09" #"(\d+)-(\d+)-(\d+)" "$3/$2/$1"))
+(prn (str/replace "hello world" #"o" (fn [m] (str/upper-case m))))
+
+; re-find returns the first match; re-seq every match, lazily.
+; A pattern with groups gives a vector: the whole match, then each group.
+(prn (re-find #"\d+" "order 66, aisle 7"))
+(prn (re-seq #"\d+" "order 66, aisle 7"))
+(prn (re-find #"(\w+)@(\w+)\.org" "write to ada@example.org"))

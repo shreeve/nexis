@@ -1,0 +1,98 @@
+; examples/basics.nx — a tour of the core language: bindings, functions,
+; destructuring, conditionals, loops and threading. Each line prints a
+; label and a value, so the output reads beside the code.
+;
+;   bin/nexis run examples/basics.nx
+
+; let binds names to values for the body; later bindings see earlier ones.
+(let [width 3
+      height 4
+      area (* width height)]
+  (println "area:" area))
+
+; fn makes a function; #(...) is the short form, with % for its argument.
+(def square (fn [x] (* x x)))
+(println "square:" (square 7) (map #(* % %) [1 2 3]))
+
+; A defn can have several arities, and a docstring.
+(defn greet
+  "Greets someone, formally when given a title."
+  ([name] (greet "" name))
+  ([title name] (str "Hello, " title (when (seq title) " ") name)))
+(println (greet "Ada") "/" (greet "Dr." "Grace"))
+
+; Variadic arguments arrive as a seq after &.
+(defn total [& xs] (apply + xs))
+(println "total:" (total) (total 1 2 3))
+
+; Destructuring a vector: positions, the rest after &, the whole with :as.
+(let [[first-name second-name & others :as everyone] ["Ada" "Grace" "Alan" "Edsger"]]
+  (println first-name second-name others (count everyone)))
+
+; Destructuring a map: :keys names the keys, :or gives defaults.
+(let [{:keys [host port] :or {port 80} :as config} {:host "example.org"}]
+  (println host port (count config)))
+
+; The same destructuring works in a function's parameters.
+(defn describe [{:keys [name langs]}]
+  (str name " knows " (count langs) " languages"))
+(println (describe {:name "Ada" :langs ["nexis" "Clojure"]}))
+
+(defn midpoint [[x1 y1] [x2 y2]]
+  [(/ (+ x1 x2) 2) (/ (+ y1 y2) 2)])
+(println "midpoint:" (midpoint [0 0] [4 6]))
+
+; if takes one branch; when runs a body only when the test holds.
+; Only nil and false are falsey: 0, "" and () are true.
+(println (if 0 "0 is true" "0 is false") (when false "never"))
+
+; cond tries tests in order; :else is just a value that is always true.
+(defn classify [n]
+  (cond
+    (neg? n) :negative
+    (zero? n) :zero
+    (< n 10) :small
+    :else :large))
+(println (map classify [-5 0 7 42]))
+
+; case picks a branch by a literal value, with a default at the end.
+(defn plural [word]
+  (case word
+    "mouse" "mice"
+    "child" "children"
+    (str word "s")))
+(println (map plural ["cat" "mouse" "child"]))
+
+; if-let and when-let bind a value and branch on it in one step.
+(def users {1 "Ada" 2 "Grace"})
+(defn user-name [id]
+  (if-let [name (get users id)]
+    (str "user " name)
+    "no such user"))
+(println (user-name 1) "/" (user-name 9))
+(when-let [name (get users 2)]
+  (println "found" name))
+
+; loop and recur: iteration in constant stack space.
+(defn factorial [n]
+  (loop [i n
+         acc 1]
+    (if (zero? i)
+      acc
+      (recur (dec i) (* acc i)))))
+; Integers never overflow: they grow into bignums as needed.
+(println "20! =" (factorial 20) "and 25! =" (factorial 25))
+
+; -> threads a value through forms as the first argument,
+; ->> as the last. prn prints data as code, strings in quotes.
+(prn (-> {:name "Ada"} (assoc :born 1815) (update :name str " Lovelace")))
+(println (->> (range 10) (filter odd?) (map square) (reduce +)))
+
+; A closure keeps the bindings in force where it was made.
+(defn make-counter []
+  (let [n (atom 0)]
+    (fn [] (swap! n inc))))
+(def next-id (make-counter))
+(next-id)
+(next-id)
+(println "third id:" (next-id))

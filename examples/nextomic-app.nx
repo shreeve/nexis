@@ -1,124 +1,170 @@
-; examples/nextomic-app.nx — a small clinic chart on Nextomic
-; (docs/NEXTOMIC.md). The store under tmp/ keeps every fact it ever
-; learned, the queries ask the chart questions as Datalog, pull shapes
-; an answer, the time views show how the chart looked at each
-; transaction, and a speculative transaction trials a change without
-; filing it. Patients upsert by medical record number and visits by
-; their own id, so a second run over the same store still counts two
-; patients and one visit; the notes have no identity and are added
-; again, and the time views show both runs.
+; examples/nextomic-app.nx — a small clinic chart on Nextomic, the
+; database built into nexis: schema as data, transactions, Datalog
+; queries, pull, and reads of the chart as it was at any earlier point.
+; Patients and visits are keyed by unique ids, so a second run over the
+; same store still finds two patients and one visit; the visit notes
+; have no id and are added again, and the history shows both runs.
+; The store is tmp/clinic.edb; docs/NEXTOMIC.md is the reference.
 ;
-;   ./bin/nexis run examples/nextomic-app.nx
+;   bin/nexis run examples/nextomic-app.nx
 
-(require '[nextomic :as d])
+(require '[nextomic :as d]
+         '[clojure.walk :as walk])
+
+; The schema is data: each attribute is an entity with a type and a
+; cardinality. (attr :patient/name :string :one) is the map
+;   {:db/ident :patient/name :db/valueType :db.type/string
+;    :db/cardinality :db.cardinality/one}
+; and a :db.unique/identity attribute makes its value a key.
+(defn attr [ident type cardinality & {:as more}]
+  (merge {:db/ident ident
+          :db/valueType (keyword "db.type" (name type))
+          :db/cardinality (keyword "db.cardinality" (name cardinality))}
+         more))
 
 (def schema
-  [{:db/ident :patient/mrn :db/valueType :db.type/string :db/cardinality :db.cardinality/one
-    :db/unique :db.unique/identity :db/doc "Medical record number"}
-   {:db/ident :patient/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-   {:db/ident :patient/born :db/valueType :db.type/instant :db/cardinality :db.cardinality/one}
-   {:db/ident :patient/allergies :db/valueType :db.type/keyword :db/cardinality :db.cardinality/many}
-   {:db/ident :patient/primary :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}
-   {:db/ident :clinician/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one
-    :db/unique :db.unique/identity}
-   {:db/ident :visit/id :db/valueType :db.type/string :db/cardinality :db.cardinality/one
-    :db/unique :db.unique/identity}
-   {:db/ident :visit/patient :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/index true}
-   {:db/ident :visit/reason :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
-   {:db/ident :visit/weight-kg :db/valueType :db.type/double :db/cardinality :db.cardinality/one}
-   {:db/ident :visit/notes :db/valueType :db.type/ref :db/cardinality :db.cardinality/many
-    :db/isComponent true}
-   {:db/ident :note/text :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+  [(attr :patient/mrn :string :one
+         :db/unique :db.unique/identity :db/doc "Medical record number")
+   (attr :patient/name :string :one)
+   (attr :patient/born :instant :one)
+   (attr :patient/allergies :keyword :many)
+   (attr :patient/primary :ref :one)
+   (attr :clinician/name :string :one :db/unique :db.unique/identity)
+   (attr :visit/id :string :one :db/unique :db.unique/identity)
+   (attr :visit/patient :ref :one :db/index true)
+   (attr :visit/reason :string :one)
+   (attr :visit/weight-kg :double :one)
+   (attr :visit/notes :ref :many :db/isComponent true)
+   (attr :note/text :string :one)])
 
-(defn patient [db mrn] (d/entity db [:patient/mrn mrn]))
+(def conn (d/connect "tmp/clinic.edb"))
+(d/transact! conn schema)
 
-(defn visits-of [db mrn]
-  ; VAET answers "which entities point at this patient?"; the visit
-  ; attribute narrows it to visits.
-  (mapv (fn [[visit-eid a v t added]] (d/entity db visit-eid))
-        (d/datoms db :vaet (d/entid db [:patient/mrn mrn]) :visit/patient)))
+; Transactions are data too. A string :db/id is a temporary id that
+; links entities within one transaction; "datomic.tx" is the
+; transaction itself, here given a note.
+(def intake
+  (d/transact! conn
+    [{:db/id "dr" :clinician/name "Dr. Okafor"}
+     {:patient/mrn "MRN-1001" :patient/name "Mara Quist" :patient/born 631152000000
+      :patient/allergies [:penicillin] :patient/primary "dr"}
+     {:patient/mrn "MRN-1002" :patient/name "Teo Lund" :patient/born 946684800000
+      :patient/primary "dr"}
+     [:db/add "datomic.tx" :db/doc "intake"]]))
 
-(d/with-conn [c "tmp/clinic.edb"]
-  (d/transact! c schema)
-  (let [; Intake: the clinician and two patients. Tempids are strings;
-        ; "datomic.tx" annotates the transaction itself.
-        intake (d/transact! c [{:db/id "dr" :clinician/name "Dr. Okafor"}
-                               {:patient/mrn "MRN-1001" :patient/name "Mara Quist" :patient/born 631152000000
-                                :patient/allergies [:penicillin] :patient/primary "dr"}
-                               {:patient/mrn "MRN-1002" :patient/name "Teo Lund" :patient/born 946684800000
-                                :patient/primary "dr"}
-                               [:db/add "datomic.tx" :db/doc "intake"]])
-        ; A visit with component notes; weight recorded as a double.
-        first-visit (d/transact! c [{:visit/id "V-1" :visit/patient [:patient/mrn "MRN-1001"]
-                                     :visit/reason "annual" :visit/weight-kg 62.5
-                                     :visit/notes [{:note/text "BP normal"} {:note/text "advised flu shot"}]}])
-        ; Corrections are ordinary assertions: card-one replaces,
-        ; card-many accumulates, a retraction removes exactly one fact.
-        correction (d/transact! c [[:db/add [:visit/id "V-1"] :visit/weight-kg 63.0]
-                                   [:db/add [:patient/mrn "MRN-1001"] :patient/allergies :latex]
-                                   [:db/retract [:patient/mrn "MRN-1001"] :patient/allergies :penicillin]])
-        db (d/db c)]
-    (println "intake at t =" (:tx intake) ", basis now" (d/basis-t db))
-    ; An entity reads its attributes on access; `touch` is the whole map.
-    (println "Mara today:" (dissoc (d/touch (patient db "MRN-1001")) :db/id :patient/primary))
-    (println "Mara's visits:" (mapv :visit/reason (visits-of db "MRN-1001")))
-    ; A ref reads as another entity, so access navigates the graph.
-    (println "V-1 notes:" (mapv :note/text (:visit/notes (d/entity db [:visit/id "V-1"]))))
+; A lookup ref [attr value] names an entity by a unique attribute. The
+; notes are components: they belong to the visit.
+(d/transact! conn
+  [{:visit/id "V-1" :visit/patient [:patient/mrn "MRN-1001"]
+    :visit/reason "annual" :visit/weight-kg 62.5
+    :visit/notes [{:note/text "BP normal"} {:note/text "advised flu shot"}]}])
 
-    ; The same questions as Datalog. A query is data: patterns join on
-    ; shared variables, `:in` binds inputs after the db, predicates and
-    ; aggregates run inside the query, and the result is an ordinary set.
-    (println "latex allergies:"
-             (d/q '[:find [?name ...] :where [?p :patient/allergies :latex] [?p :patient/name ?name]] db))
-    (println "visits per patient:"
-             (sort (d/q '[:find ?name (count ?v) :where [?v :visit/patient ?p] [?p :patient/name ?name]] db)))
-    (println "visits over 60 kg:"
-             (d/q '[:find ?id ?kg :in $ ?min :where [?v :visit/weight-kg ?kg] [(> ?kg ?min)] [?v :visit/id ?id]] db 60.0))
-    (println "Dr. Okafor's patients:"
-             (sort (d/q '[:find [?name ...] :where [?dr :clinician/name "Dr. Okafor"] [?p :patient/primary ?dr]
-                          [?p :patient/name ?name]] db)))
+; A correction is more facts: a card-one value replaces the old one, a
+; card-many value adds to the set, a retraction removes one fact.
+(def correction
+  (d/transact! conn
+    [[:db/add [:visit/id "V-1"] :visit/weight-kg 63.0]
+     [:db/add [:patient/mrn "MRN-1001"] :patient/allergies :latex]
+     [:db/retract [:patient/mrn "MRN-1001"] :patient/allergies :penicillin]]))
 
-    ; Pull: a pattern is the shape of the answer. Nested patterns
-    ; follow refs, a reverse attribute walks a ref the other way, and
-    ; a component (the notes) comes along in full by default.
-    (println "Mara's chart:"
-             (d/pull db '[:patient/name :patient/allergies {:patient/primary [:clinician/name]}
-                          {:visit/_patient [:visit/reason :visit/weight-kg :visit/notes]}]
-                     [:patient/mrn "MRN-1001"]))
-    (println "both names:"
-             (mapv :patient/name (d/pull-many db '[:patient/name] [[:patient/mrn "MRN-1001"] [:patient/mrn "MRN-1002"]])))
+(def db (d/db conn))
 
-    ; Time travel: the chart as it stood right after intake, and the
-    ; full history of one attribute.
-    (println "Mara at intake:" (:patient/allergies (patient (d/as-of db (:tx intake)) "MRN-1001")))
-    (println "weight history:"
-             (mapv (fn [[e a v t added]] [v t added])
-                   (d/datoms (d/history db) :eavt [:visit/id "V-1"] :visit/weight-kg)))
-    (println "what changed in the correction:"
-             (mapv (fn [[e a v t added]] [(d/ident db a) v added])
-                   (filterv (fn [[e a v t added]] (not= a :db/txInstant))
-                            (:data (first (d/tx-range c (:tx correction) (inc (:tx correction))))))))
+; show prints a label and a value as data, strings in quotes.
+(defn show [label x]
+  (println label (pr-str x)))
 
-    ; Speculation: `with` applies tx-data in a transaction that is
-    ; never committed, so a follow-up visit can be trialled against the
-    ; chart, queried like any other db, and dropped. The basis is
-    ; unchanged afterwards.
-    (d/with c [{:visit/id "V-2" :visit/patient [:patient/mrn "MRN-1001"] :visit/reason "follow-up" :visit/weight-kg 61.0}]
-      (fn [db-after report]
-        (println "if V-2 were filed:"
-                 (sort (d/q '[:find ?name (count ?v) :where [?v :visit/patient ?p] [?p :patient/name ?name]] db-after))
-                 "at t =" (:tx report))))
-    (println "on file:" (count (d/datoms (d/db c) :aevt :visit/id)) "visit(s), basis" (d/basis-t (d/db c)))
+(println (format "intake at t = %d, basis now %d" (:tx intake) (d/basis-t db)))
 
-    ; A unique identity is a promise: the same MRN with another name is
-    ; an update of the same patient, and a second entity claiming a
-    ; taken visit id is refused.
-    (d/transact! c [{:patient/mrn "MRN-1002" :patient/name "Teodor Lund"}])
-    (println "Teo renamed:" (:patient/name (patient (d/db c) "MRN-1002")))
-    (println "conflict:"
-             (try (d/transact! c [[:db/add [:patient/mrn "MRN-1002"] :visit/id "V-1"]])
-                  (catch any e e)))
+; An entity reads attributes on demand; a ref attribute reads as
+; another entity, so keyword lookups walk the graph.
+(def mara (d/entity db [:patient/mrn "MRN-1001"]))
+; touch reads every attribute into a map: refs as ids, and the entity's
+; own :db/id, which this line leaves out with the doctor.
+(show "Mara today:" (dissoc (d/touch mara) :db/id :patient/primary))
+(show "Mara's doctor:" (:clinician/name (:patient/primary mara)))
+(show "V-1 notes:" (mapv :note/text (:visit/notes (d/entity db [:visit/id "V-1"]))))
 
-    (println "patients:" (count (d/datoms (d/db c) :aevt :patient/mrn))
-             "visits:" (count (d/datoms (d/db c) :aevt :visit/id))
-             "basis:" (d/basis-t (d/db c)))))
+; Datalog: patterns join on shared variables, :in binds inputs after
+; the db, and predicates and aggregates run inside the query.
+(show "latex allergies:"
+         (d/q '[:find [?name ...]
+                :where [?p :patient/allergies :latex] [?p :patient/name ?name]]
+              db))
+
+(def visits-per-patient
+  '[:find ?name (count ?v)
+    :where [?v :visit/patient ?p] [?p :patient/name ?name]])
+(show "visits per patient:" (sort (d/q visits-per-patient db)))
+
+(show "visits over 60 kg:"
+         (d/q '[:find ?id ?kg
+                :in $ ?min
+                :where [?v :visit/weight-kg ?kg] [(> ?kg ?min)] [?v :visit/id ?id]]
+              db 60.0))
+
+(show "Dr. Okafor's patients:"
+         (sort (d/q '[:find [?name ...]
+                      :where [?dr :clinician/name "Dr. Okafor"]
+                             [?p :patient/primary ?dr]
+                             [?p :patient/name ?name]]
+                    db)))
+
+; Pull: the pattern is the shape of the answer. A nested map follows a
+; ref, :visit/_patient walks the ref backwards (the visits that point at
+; Mara), and components come along whole. Pull includes each entity's
+; :db/id; the chart leaves them out.
+(defn without-ids [x]
+  (walk/postwalk #(if (map? %) (dissoc % :db/id) %) x))
+
+(show "Mara's chart:"
+         (without-ids
+           (d/pull db '[:patient/name :patient/allergies
+                        {:patient/primary [:clinician/name]}
+                        {:visit/_patient [:visit/reason :visit/weight-kg :visit/notes]}]
+                   [:patient/mrn "MRN-1001"])))
+(show "both names:"
+         (mapv :patient/name
+               (d/pull-many db '[:patient/name]
+                            [[:patient/mrn "MRN-1001"] [:patient/mrn "MRN-1002"]])))
+
+; Time: as-of is the db as it stood at a transaction, and history holds
+; every assertion and retraction, each with its t.
+(show "Mara at intake:"
+         (-> (d/as-of db (:tx intake))
+             (d/entity [:patient/mrn "MRN-1001"])
+             :patient/allergies))
+(show "weight history:"
+         (mapv (fn [[_e _a v t added?]] [v t added?])
+               (d/datoms (d/history db) :eavt [:visit/id "V-1"] :visit/weight-kg)))
+(show "what changed in the correction:"
+         (->> (d/tx-range conn (:tx correction) (inc (:tx correction)))
+              first
+              :data
+              (map (fn [[_e a v _t added?]] [(d/ident db a) v added?]))
+              (remove #(= :db/txInstant (first %)))
+              vec))
+
+; d/with runs a transaction that is never committed: the db it hands
+; the function can be queried like any other, then it is gone.
+(d/with conn [{:visit/id "V-2" :visit/patient [:patient/mrn "MRN-1001"]
+               :visit/reason "follow-up" :visit/weight-kg 61.0}]
+  (fn [db-after report]
+    (println "if V-2 were filed:" (pr-str (sort (d/q visits-per-patient db-after)))
+             "at t =" (:tx report))))
+(let [db (d/db conn)]
+  (println "on file:" (count (d/datoms db :aevt :visit/id)) "visit(s), basis" (d/basis-t db)))
+
+; A unique identity is a key: the same MRN with a new name updates that
+; patient, and a second entity claiming a taken visit id is refused.
+(d/transact! conn [{:patient/mrn "MRN-1002" :patient/name "Teodor Lund"}])
+(show "Teo renamed:" (:patient/name (d/entity (d/db conn) [:patient/mrn "MRN-1002"])))
+(show "conflict:"
+         (try (d/transact! conn [[:db/add [:patient/mrn "MRN-1002"] :visit/id "V-1"]])
+              (catch :nextomic/unique e [(:attr e) (:value e)])))
+
+(let [db (d/db conn)]
+  (println "patients:" (count (d/datoms db :aevt :patient/mrn))
+           "visits:" (count (d/datoms db :aevt :visit/id))
+           "basis:" (d/basis-t db)))
+
+(d/release conn)

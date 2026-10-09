@@ -1,105 +1,26 @@
-; examples/shapes-app.nx
+; examples/shapes-app.nx — a program split into namespaces: the Shape
+; protocol, the records and the built-in extensions each live in a file
+; under examples/lib/shapes/, and require loads them by name
+; (lib.shapes.records is lib/shapes/records.nx beside this file).
 ;
-; ============================================================
-; MULTI-FILE DEMO — a Clojure-style application.
-; ============================================================
-;
-; A multi-file project using atoms, protocols, records, `require`
-; and the core library, written as it would be in Clojure apart from
-; namespace names.
-;
-; Run:
-;     $ ./bin/nexis run examples/shapes-app.nx
-;
-; This driver requires three modules:
-;
-;     lib.shapes.protocol  — defprotocol Shape (area, describe)
-;     lib.shapes.records   — Circle / Rectangle / Triangle records
-;                            with inline + extend-type impls
-;     lib.shapes.builtins  — extend-protocol over :fixnum /
-;                            :string / :any
-;
-; Then exercises the surface end-to-end:
-;
-;     atoms         (total-area atom + swap!)
-;     strings + I/O (str + println)
-;     records       (Circle/Rectangle/Triangle)
-;     protocols     (Shape dispatch)
-;     inline impls  (Circle/Rectangle have inline Shape clauses)
-;     extend-type   (Triangle), extend-protocol over built-ins,
-;                   :any default, satisfies?
-;     for loop      (iterate shapes vector)
-;     core library  (every?, frequencies)
+;   bin/nexis run examples/shapes-app.nx
 
-(require '[lib.shapes.protocol :as p])
-(require '[lib.shapes.records :as r])
-(require '[lib.shapes.builtins])  ; side-effect: register impls
-
-; -------------------------------------------------------------
-; Stateful aggregate (atom)
-; -------------------------------------------------------------
-
-(def total-area (atom 0))
-
-(defn report [shape]
-  (swap! total-area + (p/area shape))
-  (str (p/describe shape)
-       " => area=" (p/area shape)
-       " satisfies?=" (satisfies? p/Shape shape)))
-
-; -------------------------------------------------------------
-; The fleet of shapes — records from `lib.shapes.records` plus
-; built-in receivers covered by `lib.shapes.builtins`.
-; -------------------------------------------------------------
+(ns shapes-app
+  (:require [clojure.string :as str]
+            [lib.shapes.protocol :as shape]
+            [lib.shapes.records :as r]
+            [lib.shapes.builtins]))
 
 (def shapes
-  [(r/->Circle 5)
-   (r/->Rectangle 3 4)
-   (r/->Triangle 6 4)
-   42                   ; treated as square (the :fixnum impl)
-   "hello"              ; treated as label (the :string impl)
-   :unknown-shape])     ; caught by :any default
+  [(r/->Circle 1) (r/->Circle 2) (r/->Rect 3 4) (r/->Triangle 6 4) 5 2 "door"])
 
-(println "=== multi-file shapes demo ===")
-(println "")
-
-(println "Per-shape reports (cross-namespace dispatch):")
 (doseq [s shapes]
-  (println "  " (report s)))
+  (println (format "%-22s %6.2f" (shape/describe s) (double (shape/area s)))))
 
-(println "")
-(println "Aggregate state:")
-(println "  total-area atom =" (deref total-area))
+(println (format "%-22s %6.2f" "total" (double (reduce + (map shape/area shapes)))))
 
-(println "")
-(println "satisfies? probes (cross-namespace protocol ref):")
-(println "  p/Shape ⊇ Circle   ?" (satisfies? p/Shape (r/->Circle 5)))
-(println "  p/Shape ⊇ Triangle ?" (satisfies? p/Shape (r/->Triangle 6 4)))
-(println "  p/Shape ⊇ :fixnum  ?" (satisfies? p/Shape 42))
-(println "  p/Shape ⊇ :string  ?" (satisfies? p/Shape "hi"))
-(println "  p/Shape ⊇ :keyword ? (caught by :any) =>"
-         (satisfies? p/Shape :anything))
+; Count the shapes by kind: the first word of each description.
+(prn (frequencies (map #(first (str/split (shape/describe %) #" ")) shapes)))
 
-; -------------------------------------------------------------
-; stdlib cross-check: every? + frequencies
-; -------------------------------------------------------------
-
-(println "")
-(println "stdlib over the protocol dispatch:")
-(println "  every? satisfies? p/Shape: "
-         (every? (fn* [s] (satisfies? p/Shape s)) shapes))
-(println "  frequencies of describe-prefixes:")
-(let* [first-words (for [s shapes]
-                     (let* [d (p/describe s)]
-                       ; isolate the first space-delimited word
-                       (let* [i (loop* [k 0]
-                                  (if (< k (count d))
-                                    (if (= " " (subs d k (inc k)))
-                                      k
-                                      (recur (inc k)))
-                                    (count d)))]
-                         (subs d 0 i))))]
-  (println "   " (frequencies first-words)))
-
-(println "")
-(println "=== demo complete ===")
+(prn (every? #(satisfies? shape/Shape %) shapes)
+     (satisfies? shape/Shape :keyword))

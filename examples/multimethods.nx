@@ -1,4 +1,7 @@
-; examples/multimethods.nx — multimethods and hierarchies (docs/STDLIB.md §9)
+; examples/multimethods.nx — multimethods and hierarchies: open dispatch
+; on any function of the arguments. docs/STDLIB.md covers them in full.
+;
+;   bin/nexis run examples/multimethods.nx
 ;
 ;   - defmulti dispatches on any function of the arguments: a key of a
 ;     map, the class of a value, a vector of two values

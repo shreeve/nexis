@@ -1,1 +1,6 @@
-55
+:ran nil
+(if (empty? xs) nil (do (println "work") :done))
+:finally-worked 3
+[:gave-up-with :not-yet]
+84
+{:invalid -3, :failed [pos? even?]}

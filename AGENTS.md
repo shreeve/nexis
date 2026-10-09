@@ -52,7 +52,7 @@ changes to emdb.
 | `zig build quick` | the inner loop: the `unit` binary (every inline test in `src/`), the compile and Nextomic property tests, the `eval_pipeline`, `runtime_polish` and `numbers` integration tests |
 | `zig build nextomic-test` | the Nextomic unit tests, `test/prop/nextomic_{key,tx}.zig`, the Nextomic integration corpora |
 | `zig build nextomic-nx` | every `test/nextomic/*.nx` through `bin/nexis` from a fresh directory, stdout diffed against its `.out` |
-| `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice |
+| `zig build examples` | every `examples/*.nx` through `bin/nexis`, stdout diffed against `test/examples/<name>.out`; those with a `.2.out` run twice; the same for `test/examples/pins/*.nx`, the programs that pin low-level behaviour, against the `.out` beside each |
 | `zig build golden` | the reader goldens (`test/golden`: each `.nx` against its `.sexp`, each `errors/*.nx` against its `.err`) and the CLI goldens (`test/golden/cli`: error reports, a disassembly, script output, a REPL session, a byte-order-mark source, `--help` and the usage errors, each stream and exit code) |
 | `zig build portable` | `test/portable/write.nx` writes a `db/*` store and a Nextomic store, then `read.nx` dumps them, from one fresh directory, each stdout diffed against its `.out`; the same dump compares a store carried between hosts (`test/portable/README.md`) |
 | `zig build test --summary all` | the gate, 225 steps (223 without `../nexus`), about a minute from a warm cache: all of the above, every property test, the layering check, a compile check of `bench/` and of the `-Dopcodes=true` CLI, and `parser-check` when nexus is there |
@@ -192,7 +192,7 @@ nexis/
 │   ├── nextomic/                end-to-end .nx scripts and their .out
 │   ├── regex/                   the engine against java.util.regex: corpus.json, its bb generators, the suite
 │   ├── portable/                a db/* and a Nextomic store written and dumped, carried between hosts
-│   └── examples/                the pinned output of every examples/*.nx
+│   └── examples/                the pinned output of every examples/*.nx; pins/, the behaviour-pinning programs
 ├── examples/                    working .nx programs (examples/README.md)
 ├── bench/                       main.zig (the harness), nextomic.zig (its Nextomic scenarios),
 │                                compare/ (nexis against babashka and JVM Clojure, Nextomic

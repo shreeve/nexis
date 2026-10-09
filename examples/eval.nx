@@ -1,10 +1,9 @@
-; examples/eval.nx — `eval`: a form as data, compiled in the current
-; namespace and run on the calling VM.
+; examples/eval.nx — code is data: read-string turns text into a form,
+; and eval runs a form in the current namespace, as the REPL runs a
+; line. A def inside it defines a Var later code sees, a defmacro serves
+; a later eval, and a function it returns can be called afterwards.
 ;
-; `read-string` turns text into a form; `eval` macroexpands, compiles
-; and runs it exactly as the REPL compiles a line, so a `def` inside
-; it binds a Var that later forms see, a `defmacro` inside it serves
-; a later `eval`, and a closure it returns is callable afterwards.
+;   bin/nexis run examples/eval.nx
 
 (def source "(defn square [x] (* x x))")
 (eval (read-string source))
@@ -22,13 +21,12 @@
 (eval '(defmacro unless [test & body] (list 'if test nil (cons 'do body))))
 (println "macro from eval:" (eval '(unless false :ran)))
 
-; A form that does not compile throws a map the caller can catch.
-(println "compile error:"
+; A form that does not compile throws a :compile-error map, which
+; carries the form.
+(println "compile error in"
   (try (eval '(no-such-fn 1))
-       (catch :compile-error e [(:message e) (:form e)])))
+       (catch :compile-error e (:form e))))
 
 ; A throw inside the evaluated form is an ordinary throw.
 (try (eval '(throw :boom))
      (catch :boom e (println "caught" e)))
-
-(eval '(+ answer 1))

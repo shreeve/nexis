@@ -114,7 +114,7 @@ zig build install                      # bin/nexis
 echo '(println :hi)' | ./bin/nexis run -  # a program from stdin
 ./bin/nexis repl                       # read-eval-print loop; :quit or Ctrl-D exits
 ./bin/nexis test my_tests.nx           # run files, then every deftest they define
-./bin/nexis disasm examples/sum10.nx   # every routine's bytecode with source positions
+./bin/nexis disasm examples/hello.nx   # every routine's bytecode with source positions
 ./bin/nexis --help
 ./bin/nexis --version                  # nexis 0.1.0
 ```
@@ -200,8 +200,9 @@ The namespaces that come with the binary are `nexis.core`
 `nexis.pprint`, `nexis.math` and `nexis.simd` (typed-vector kernels);
 `clojure.string`, `clojure.set`, `clojure.walk`, `clojure.edn`,
 `clojure.math`, `clojure.test` and `clojure.pprint` are accepted as
-their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 25 programs that run
-under `zig build examples` (`examples/README.md`).
+their names in `require` (`docs/STDLIB.md` §1). `examples/` holds 21 programs that run
+under `zig build examples`, in a suggested reading order in
+`examples/README.md`.
 
 ## Nextomic
 

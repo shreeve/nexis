@@ -1,26 +1,10 @@
-=== multi-file shapes demo ===
-
-Per-shape reports (cross-namespace dispatch):
-   Circle r=5 => area=7850 satisfies?=true
-   Rectangle 3x4 => area=12 satisfies?=true
-   Triangle b=6 h=4 => area=24 satisfies?=true
-   Square of side 42 => area=1764 satisfies?=true
-   Label: hello => area=0 satisfies?=true
-   Unknown: :unknown-shape => area=0 satisfies?=true
-
-Aggregate state:
-  total-area atom = 9650
-
-satisfies? probes (cross-namespace protocol ref):
-  p/Shape ⊇ Circle   ? true
-  p/Shape ⊇ Triangle ? true
-  p/Shape ⊇ :fixnum  ? true
-  p/Shape ⊇ :string  ? true
-  p/Shape ⊇ :keyword ? (caught by :any) => true
-
-stdlib over the protocol dispatch:
-  every? satisfies? p/Shape:  true
-  frequencies of describe-prefixes:
-    {Circle 1, Rectangle 1, Triangle 1, Square 1, Label: 1, Unknown: 1}
-
-=== demo complete ===
+Circle of radius 1       3.14
+Circle of radius 2      12.57
+Rect 3x4                12.00
+Triangle with base 6    12.00
+Square of side 5        25.00
+Square of side 2         4.00
+Label "door"             0.00
+total                   68.71
+{"Circle" 2, "Rect" 1, "Triangle" 1, "Square" 2, "Label" 1}
+true false

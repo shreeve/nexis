@@ -1,1 +1,7 @@
-[:initial-stats {:total 3, :completed 1} :initial-count 3 :rollback-caught [:caught :simulated-failure] :rollback-present? false :buy-milk-after {:title :buy-milk, :done true} :final-stats {:total 3, :completed 1}]
+at start: 3 to-dos, 1 done
+  [x] Buy milk
+  [ ] Ship the release
+  [ ] Write the tests
+rollback: cancelled / saved? false
+{:title "Buy milk", :done true}
+{:total 3, :done 1}

@@ -1,114 +1,68 @@
-; examples/todo-app.nx
+; examples/todo-app.nx — a to-do list kept in a store file, so it lasts
+; between runs. The first run adds three to-dos and finishes one; a later
+; run finds them as the first run left them. The store is tmp/todos.edb
+; under the working directory; delete tmp/ to start over.
 ;
-; ============================================================
-; DEMO: persistent to-do tracker.
-; ============================================================
-;
-; A small application with persistent state, end-to-end.
-;
-; Run it twice:
-;   $ ./bin/nexis run examples/todo-app.nx
-;   $ ./bin/nexis run examples/todo-app.nx   # starts from the first run's state
-;
-; Demonstrates the durable-state surface:
-;   - db/open + db/close (Connection lifecycle)
-;   - db/ref + qualified namespace addressing
-;   - (with-tx [tx conn] ...) atomic multi-write
-;   - (with-read-tx [t conn] ...) consistent snapshot reads
-;   - db/put! / db/get / db/delete! inside tx
-;   - db/alter! read-modify-write inside tx
-;   - db/scan ordered range iteration
-;   - db/reduce-tree reduction over a whole tree
-;   - @deref ephemeral read
-;   - exception-driven rollback (try / throw inside with-tx)
-;
-; Keys: db/ref accepts keyword, symbol or string keys. This demo
-; uses a fixed set of keyword keys for clarity; apps with dynamic
-; ids use string keys (or `(keyword s)`).
+;   bin/nexis run examples/todo-app.nx
 
-; tmp/ is gitignored; running this demo from the repo root
-; lands data files out of the way.
 (def conn (db/open "tmp/todos.edb"))
 
-(defn todo-ref [k]
-  (db/ref conn :todos k))
+; Every to-do lives in the :todos tree under a key of its own.
+(defn todo-ref [id]
+  (db/ref conn :todos id))
 
-; ---- Operations ----
-
-(defn add-todo [k title]
-  ; Atomic insert with title + done=false flag.
+(defn add-todo! [id title]
   (with-tx [tx conn]
-    (db/put! tx (todo-ref k) {:title title :done false})))
+    (db/put! tx (todo-ref id) {:title title :done false})))
 
-(defn complete-todo [k]
-  ; Read-modify-write via db/alter! — flips :done to true.
+; db/alter! reads, applies a function and writes, in one transaction.
+(defn complete! [id]
   (with-tx [tx conn]
-    (db/alter! tx (todo-ref k)
-      (fn* [todo] (assoc todo :done true)))))
+    (db/alter! tx (todo-ref id) assoc :done true)))
 
-(defn delete-todo [k]
-  (with-tx [tx conn]
-    (db/delete! tx (todo-ref k))))
-
+; db/scan returns [key value] pairs in key order, each key a string.
 (defn all-todos []
-  (with-read-tx [t conn]
-    (db/scan t :todos)))
+  (with-read-tx [tx conn]
+    (db/scan tx :todos)))
 
+; db/reduce-tree folds over the tree without building the whole list.
 (defn stats []
-  ; One reduction over the tree: walk every todo, accumulate counts.
-  (with-read-tx [t conn]
-    (db/reduce-tree t :todos
-      (fn* [acc k v]
-        (let [done       (get v :done)
-              total      (get acc :total)
-              completed  (get acc :completed)]
-          (assoc (assoc acc :total (inc total))
-                 :completed (if done (inc completed) completed))))
-      {:total 0 :completed 0})))
+  (with-read-tx [tx conn]
+    (db/reduce-tree tx :todos
+                    (fn [acc _id {:keys [done]}]
+                      (cond-> (update acc :total inc)
+                        done (update :done inc)))
+                    {:total 0 :done 0})))
 
-; ---- Drive it ----
+(defn print-todos []
+  (doseq [[_id {:keys [title done]}] (all-todos)]
+    (println (if done "  [x]" "  [ ]") title)))
 
-(defn ensure-todo [k title]
-  ; Only seed if absent. Re-runs preserve prior state.
-  (if (db/present? (todo-ref k))
-    nil
-    (add-todo k title)))
+; Add the to-dos only when they are not there yet, so a second run keeps
+; what the first one did.
+(doseq [[id title] [[:buy-milk "Buy milk"]
+                    [:write-tests "Write the tests"]
+                    [:ship "Ship the release"]]]
+  (when-not (db/present? (todo-ref id))
+    (add-todo! id title)))
 
-; Seed three todos on first run; idempotent re-runs preserve
-; whatever state the previous run left behind.
-(ensure-todo :buy-milk     :buy-milk)
-(ensure-todo :write-tests  :write-tests)
-(ensure-todo :ship-phase-4 :ship-phase-4)
+(let [{:keys [total done]} (stats)]
+  (println (format "at start: %d to-dos, %d done" total done)))
 
-(def initial-stats (stats))
-(def initial-list  (all-todos))
+(complete! :buy-milk)
+(print-todos)
 
-; Complete :buy-milk.
-(complete-todo :buy-milk)
+; A transaction that throws writes nothing: the to-do it added is gone.
+(println "rollback:"
+         (try
+           (with-tx [tx conn]
+             (db/put! tx (todo-ref :never) {:title "Never saved" :done false})
+             (throw :cancelled))
+           (catch :cancelled _ "cancelled"))
+         "/ saved?" (db/present? (todo-ref :never)))
 
-; Demonstrate rollback: a transaction that throws does NOT
-; persist its writes.
-(def rollback-result
-  (try
-    (with-tx [tx conn]
-      (db/put! tx (todo-ref :rolled-back) {:title :should-not-persist :done false})
-      (throw :simulated-failure))
-    (catch any e [:caught e])))
-
-; Verify rollback: :rolled-back should NOT be present.
-(def rolled-back-present? (db/present? (todo-ref :rolled-back)))
-
-; Ephemeral @-deref of a single todo.
-(def buy-milk-after @(todo-ref :buy-milk))
-
-; Final stats.
-(def final-stats (stats))
+; @ reads one ref in a transaction of its own.
+(prn @(todo-ref :buy-milk))
+(prn (stats))
 
 (db/close conn)
-
-(println [:initial-stats     initial-stats
- :initial-count     (count initial-list)
- :rollback-caught   rollback-result
- :rollback-present? rolled-back-present?
- :buy-milk-after    buy-milk-after
- :final-stats       final-stats])

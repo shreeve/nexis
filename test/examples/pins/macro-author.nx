@@ -1,5 +1,6 @@
-; examples/macro-author.nx — syntax-quote as the macro author's
-; tool, without the `defmacro` sugar (see defmacro.nx for that).
+; test/examples/pins/macro-author.nx — syntax-quote as the macro author's
+; tool, without the `defmacro` sugar (see defmacro.nx beside it).
+; A pin, not a teaching example: syntax-quote building a let* form.
 ;
 ; Syntax-quote covers vectors as well as lists, so the
 ; macroexpander can synthesize the full Lisp shape library:

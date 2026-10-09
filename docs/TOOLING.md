@@ -233,10 +233,10 @@ first, a blank line between routines. A multi-arity fn lists every
 member of its arity table (VM.md §5) by arity, the rest clause last,
 each with its own header, and then the routines their descriptors
 build; `test/golden/cli/multi-arity.disasm` pins one. `test/golden/cli/sum10.disasm`
-pins the listing of `examples/sum10.nx`:
+pins the listing of `test/examples/pins/sum10.nx`:
 
 ```
-routine <top> (examples/sum10.nx:4:1) slots=6 arity=0 upvalues=0
+routine <top> (test/examples/pins/sum10.nx:4:1) slots=6 arity=0 upvalues=0
   0000  var:load-var        s1  v0=nexis.core/println  ; 4:2
   0001  mov:load-const      s3  c0=0  ; 5:13
   0002  mov:load-const      s4  c0=0  ; 5:19
