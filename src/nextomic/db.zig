@@ -325,7 +325,7 @@ pub const Conn = struct {
     fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
         var start: [key.ordered_max]u8 = undefined;
         var end: [key.ordered_max]u8 = undefined;
-        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeTxlogKey(&start, after + 1), key.writeTxlogKey(&end, upto + 1));
+        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeOrdered(&start, after + 1), key.writeOrdered(&end, upto + 1));
         while (try s.next()) |kv| {
             if (try datom_mod.touchesAttrPartition(kv.value)) return true;
         }
@@ -711,9 +711,9 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     const src: datom_mod.Source = .{ .ctx = @ptrCast(&ctx), .attrType = &TxCtx.attrType, .payload = &TxCtx.payload };
 
     var start_buf: [key.ordered_max]u8 = undefined;
-    const start = key.writeTxlogKey(&start_buf, @max(from, 1));
+    const start = key.writeOrdered(&start_buf, @max(from, 1));
     var end_buf: [key.ordered_max]u8 = undefined;
-    const end: ?[]const u8 = if (to) |t| key.writeTxlogKey(&end_buf, t) else null;
+    const end: ?[]const u8 = if (to) |t| key.writeOrdered(&end_buf, t) else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
     var s = try Store.scanRange(txn, conn.store.trees.txlog, start, end);

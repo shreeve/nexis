@@ -350,7 +350,7 @@ pub fn tokenPrefix(arena: Allocator, a: u32, token: []const u8) ![]const u8 {
 
 /// `[A(a)][token][0x00]`: a token holds no `0x00`, so the byte ends it.
 fn appendTokenPrefix(out: *std.ArrayList(u8), arena: Allocator, a: u32, token: []const u8) !void {
-    try key.appendAttrKey(out, arena, a);
+    try key.appendOrdered(out, arena, a);
     try out.appendSlice(arena, token);
     try out.append(arena, 0);
 }

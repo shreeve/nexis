@@ -115,15 +115,7 @@ pub const ValueType = enum(u8) {
 
     pub fn identName(self: ValueType) []const u8 {
         return switch (self) {
-            .boolean => "db.type/boolean",
-            .long => "db.type/long",
-            .double => "db.type/double",
-            .instant => "db.type/instant",
-            .keyword => "db.type/keyword",
-            .ref => "db.type/ref",
-            .string => "db.type/string",
-            .uuid => "db.type/uuid",
-            .bytes => "db.type/bytes",
+            inline else => |t| "db.type/" ++ @tagName(t),
         };
     }
 };
@@ -162,18 +154,7 @@ pub const Val = union(ValueType) {
 
     /// Value equality within one type; different types are never equal.
     pub fn eql(a: Val, b: Val) bool {
-        if (a.valueType() != b.valueType()) return false;
-        return switch (a) {
-            .boolean => |x| x == b.boolean,
-            .long => |x| x == b.long,
-            .double => |x| normalizeDouble(x) == normalizeDouble(b.double),
-            .instant => |x| x == b.instant,
-            .keyword => |x| x == b.keyword,
-            .ref => |x| x == b.ref,
-            .string => |x| std.mem.eql(u8, x, b.string),
-            .uuid => |x| std.mem.eql(u8, &x, &b.uuid),
-            .bytes => |x| std.mem.eql(u8, x, b.bytes),
-        };
+        return a.valueType() == b.valueType() and a.order(b) == .eq;
     }
 
     /// Total order matching the encoded byte order within one type.
@@ -303,11 +284,6 @@ pub fn readOrdered(in: []const u8) DecodeError!struct { n: u64, len: usize } {
     return .{ .n = n, .len = len };
 }
 
-/// `A(a)`, an attribute or ident id in an index key, appended.
-pub fn appendAttrKey(out: *std.ArrayList(u8), gpa: Allocator, a: u32) !void {
-    try appendOrdered(out, gpa, a);
-}
-
 /// `E(e)` in `buf`: the partition's class (1 attributes, 2 users, 3
 /// transactions) in the header's high nibble, the offset's byte count
 /// in its low, then the offset in the partition, big-endian, in as few
@@ -406,13 +382,8 @@ pub fn readCurrent(value: []const u8) DecodeError!Current {
     return error.Corrupted;
 }
 
-/// The `nx/txlog` key of transaction `t`: its ordered varint, so the log
-/// sorts by `t`.
-pub fn writeTxlogKey(buf: *[ordered_max]u8, t: u64) []const u8 {
-    return writeOrdered(buf, t);
-}
-
-/// The `t` an `nx/txlog` key names; anything but one ordered varint of a
+/// The `t` an `nx/txlog` key names, `t`'s ordered varint (`writeOrdered`)
+/// so the log sorts by `t`; anything but one ordered varint of a
 /// `t` below the transaction partition is `error.Corrupted`.
 pub fn readTxlogKey(k: []const u8) DecodeError!u64 {
     const r = try readOrdered(k);
@@ -553,7 +524,7 @@ pub fn encodeVal(out: *std.ArrayList(u8), gpa: Allocator, v: Val) EncodeError!vo
         },
         .keyword => |id| {
             try out.append(gpa, @backingInt(Tag.keyword));
-            try appendAttrKey(out, gpa, id);
+            try appendOrdered(out, gpa, id);
         },
         .ref => |eid| {
             try out.append(gpa, @backingInt(Tag.ref));
@@ -606,13 +577,19 @@ comptime {
     std.debug.assert(std.ArrayList(u8).growCapacity(max_key_len) + std.ArrayList(u8).growCapacity(0) <= scratch_len);
 }
 
-/// The sortable encoding of `v` as an owned slice.
-pub fn valBytes(gpa: Allocator, v: Val) EncodeError![]u8 {
+/// What `pack` appends given `args`, built in stack scratch and copied
+/// into `gpa` exactly.
+fn ownedBytes(gpa: Allocator, comptime pack: anytype, args: anytype) ![]u8 {
     var scratch: [scratch_len]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     var out: std.ArrayList(u8) = .empty;
-    try encodeVal(&out, fba.allocator(), v);
+    _ = try @call(.auto, pack, .{ &out, fba.allocator() } ++ args);
     return gpa.dupe(u8, out.items);
+}
+
+/// The sortable encoding of `v` as an owned slice.
+pub fn valBytes(gpa: Allocator, v: Val) EncodeError![]u8 {
+    return ownedBytes(gpa, encodeVal, .{v});
 }
 
 /// An out-of-line equality key: the escaped 64-byte prefix and the
@@ -649,7 +626,7 @@ pub const DecodeError = error{ Corrupted, OutOfMemory };
 /// `error.Corrupted`, so a decoded encoding is at most `max_val_len`.
 pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
     if (bytes.len == 0) return error.Corrupted;
-    const tag = tagFromByte(bytes[0]) orelse return error.Corrupted;
+    const tag = std.enums.fromInt(Tag, bytes[0]) orelse return error.Corrupted;
     const body = bytes[1..];
     switch (tag) {
         .bool_false => return if (body.len == 0) .{ .val = .{ .boolean = false } } else error.Corrupted,
@@ -709,7 +686,7 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
 /// parses its value this way where a field follows it.
 pub fn valLen(in: []const u8) DecodeError!usize {
     if (in.len == 0) return error.Corrupted;
-    const tag = tagFromByte(in[0]) orelse return error.Corrupted;
+    const tag = std.enums.fromInt(Tag, in[0]) orelse return error.Corrupted;
     const n: usize = switch (tag) {
         .bool_false, .bool_true => 1,
         .long, .double, .instant => 9,
@@ -730,13 +707,6 @@ pub fn valLen(in: []const u8) DecodeError!usize {
         },
     };
     return if (n > in.len) error.Corrupted else n;
-}
-
-fn tagFromByte(b: u8) ?Tag {
-    inline for (@typeInfo(Tag).@"enum".field_values) |value| {
-        if (value == b) return @fromBackingInt(@intCast(b));
-    }
-    return null;
 }
 
 // =============================================================================
@@ -763,12 +733,7 @@ pub const Index = enum(u8) {
     }
 
     pub fn name(self: Index) []const u8 {
-        return switch (self) {
-            .eavt => "eavt",
-            .aevt => "aevt",
-            .avet => "avet",
-            .vaet => "vaet",
-        };
+        return @tagName(self);
     }
 };
 
@@ -826,11 +791,7 @@ pub fn packKey(out: *std.ArrayList(u8), gpa: Allocator, index: Index, e: u64, a:
 }
 
 pub fn keyBytes(gpa: Allocator, index: Index, e: u64, a: u32, vbytes: []const u8, top: ?Top) ![]u8 {
-    var scratch: [scratch_len]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    var out: std.ArrayList(u8) = .empty;
-    try packKey(&out, fba.allocator(), index, e, a, vbytes, top);
-    return gpa.dupe(u8, out.items);
+    return ownedBytes(gpa, packKey, .{ index, e, a, vbytes, top });
 }
 
 /// Decode a key of `index`. `history` selects the trailing `top`. A
@@ -941,11 +902,7 @@ pub fn packPrefix(out: *std.ArrayList(u8), gpa: Allocator, index: Index, comps: 
 }
 
 pub fn prefixBytes(gpa: Allocator, index: Index, comps: Components) ![]u8 {
-    var scratch: [scratch_len]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    var out: std.ArrayList(u8) = .empty;
-    _ = try packPrefix(&out, fba.allocator(), index, comps);
-    return gpa.dupe(u8, out.items);
+    return ownedBytes(gpa, packPrefix, .{ index, comps });
 }
 
 /// The least key greater than every key that starts with `prefix`,
@@ -1130,7 +1087,7 @@ test "a current value's t is a LEB128 in its shortest form, below the transactio
         try testing.expectError(error.Corrupted, readCurrent(bad));
     }
     var kb: [ordered_max]u8 = undefined;
-    try testing.expectEqual(@as(u64, 300), try readTxlogKey(writeTxlogKey(&kb, 300)));
+    try testing.expectEqual(@as(u64, 300), try readTxlogKey(writeOrdered(&kb, 300)));
     try testing.expectError(error.Corrupted, readTxlogKey(writeOrdered(&kb, tx_partition_bit)));
 }
 

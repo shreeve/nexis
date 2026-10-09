@@ -579,13 +579,13 @@ pub const Store = struct {
 
     pub fn putTxlog(self: *Store, txn: *Txn, t: u64, bytes: []const u8) !void {
         var buf: [key.ordered_max]u8 = undefined;
-        try txn.putInTree(self.trees.txlog, key.writeTxlogKey(&buf, t), bytes);
+        try txn.putInTree(self.trees.txlog, key.writeOrdered(&buf, t), bytes);
     }
 
     /// The full entry (multi-page values are assembled).
     pub fn getTxlog(self: *Store, txn: *Txn, t: u64) !?[]const u8 {
         var buf: [key.ordered_max]u8 = undefined;
-        return txn.getFromTree(self.trees.txlog, key.writeTxlogKey(&buf, t));
+        return txn.getFromTree(self.trees.txlog, key.writeOrdered(&buf, t));
     }
 
     // ── datoms ────────────────────────────────────────────────────
