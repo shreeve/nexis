@@ -522,7 +522,7 @@ const core_rows = .{
     .{ "pr", 0, null, &fnPr, "[] [x] [x & more]", "Prints the args separated by spaces, readably: strings quoted, chars\n  as literals. Returns nil." },
     .{ "prn", 0, null, &fnPrn, "[& more]", "Prints as pr does, then a newline. Returns nil." },
     .{ "pr-str", 0, null, &fnPrStr, "[& xs]", "Returns the text pr prints of the xs, as a string." },
-    .{ "bound?", 1, null, &fnBoundQ, "[v & vars]", "Returns true if every Var given has a root value; a binding in\n  force does not count." },
+    .{ "bound?", 0, null, &fnBoundQ, "[& vars]", "Returns true if every Var given has a value, its root or a binding\n  in force." },
     .{ "nano-time", 0, 0, &fnNanoTime, "[]", "Returns a monotonic clock reading in nanoseconds, for measuring\n  intervals; it is no time of day." },
     .{ "slurp", 1, 1, &fnSlurp, "[f]", "Returns the whole text of the file at the path f, which must be\n  UTF-8; a missing file is :file-not-found." },
     .{ "spit", 2, null, &fnSpit, "[f content & options]", "Writes (str content) to the file at the path f, replacing it, or\n  after its end with :append true; returns nil. Parent directories\n  are not created." },
@@ -6308,11 +6308,12 @@ fn fnPopOut(vm: *VM, _: []const Value) VmError!Value {
     return string_mod.fromBytes(vm.ensureHeap(), buf.items) catch VmError.OutOfMemory;
 }
 
-/// `(bound? v & vs)` → whether every Var has a root value.
+/// `(bound? & vs)` → whether every Var has a value, its root or a
+/// binding in force, as Clojure's `Var.isBound`.
 fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
     for (args) |v| {
         if (v.kind() != .var_) return VmError.KindMismatch;
-        if (!VM.asVar(v).bound) return value_mod.fromBool(false);
+        if (VM.asVar(v).current() == null) return value_mod.fromBool(false);
     }
     return value_mod.fromBool(true);
 }

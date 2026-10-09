@@ -7692,6 +7692,8 @@ test "binding: nesting, restoration, and a closure seeing the binding in force a
     try expectOutputProgram("(def ^:dynamic *x* 1) (let [f (fn [] *x*)] [(f) (binding [*x* 5] (f)) (f)])", "[1 5 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* (+ *x* 10)] (binding [*x* (+ *x* 100)] *x*))", "111");
     try expectOutputProgram("(def ^:dynamic *x* 1) [(thread-bound? (var *x*)) (binding [*x* 0] (thread-bound? (var *x*)))]", "[false true]");
+    // bound? counts a binding in force, as Clojure's Var.isBound; with no Vars it is true.
+    try expectOutputProgram("(def ^:dynamic *u*) [(bound? #'*u*) (binding [*u* 1] (bound? #'*u*)) (binding [*u* 1] (bound? #'*u* #'inc)) (bound?)]", "[false true true true]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) (binding [*x* *y* *y* *x*] [*x* *y*])", "[2 1]");
 }
 
