@@ -5153,8 +5153,9 @@ pub const VM = struct {
         if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
         const base: usize = @as(usize, frame.base_slot) + inst.a.index + 1;
         frame.pc = @intCast(pc);
-        // A whole buffer copies inline where the stack's capacity
-        // covers it, but on x86-64, where each value goes as one store.
+        // On arm64 a whole buffer copies inline where the stack's
+        // capacity covers it, and the other copy is a call of its own
+        // (`copySlots`); on x86-64 each value goes as one store.
         var buf: [max_native_args]Value = undefined;
         if (!wide_stores and base + max_native_args <= self.stack.capacity) {
             buf = self.stack.items.ptr[base..][0..max_native_args].*;
