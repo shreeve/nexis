@@ -275,7 +275,7 @@ fn printCounts() callconv(.c) void {
     for (order) |i| {
         if (vm.opcode_counts[i] == 0) break;
         var name: [64]u8 = undefined;
-        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ opcodeName(i, &name), vm.opcode_counts[i] }) catch continue);
+        writeStderr(std.fmt.bufPrint(&line, "{s},{d}\n", .{ disasm_mod.opcodeName(i, &name), vm.opcode_counts[i] }) catch continue);
     }
     var natives = vm.native_counts;
     std.mem.sort(vm.NativeCount, &natives, {}, Order.natives);
@@ -288,12 +288,6 @@ fn printCounts() callconv(.c) void {
 
 fn writeStderr(bytes: []const u8) void {
     _ = std.c.write(2, bytes.ptr, bytes.len);
-}
-
-/// `group:variant` for an opcode index (VM.md §8), from the variant
-/// enums' tag names with `-` for `_`, as the disassembler spells them.
-fn opcodeName(index: u12, buf: []u8) []const u8 {
-    return disasm_mod.opcodeName(index, buf);
 }
 
 fn usageExit(io: std.Io) noreturn {
@@ -367,31 +361,23 @@ const Runtime = struct {
     registry: *vm.NamespaceRegistry,
     /// What `macroexpand-1`, `read-string` and `eval` call into.
     hooks: compile.RuntimeHooks,
+    /// The Form trees and routines of the command's own text, released
+    /// with the runtime.
+    arena: std.heap.ArenaAllocator,
 
-    /// A booted runtime on the heap. On the thread's stack the VM's
-    /// fields, which every instruction reads, sit at a fixed distance
-    /// from the frames of the natives under a callback, and a native's
-    /// store a multiple of 4 KiB from a field makes the next handler's
-    /// load of the field wait for it (docs/PERF.md §3.16).
-    /// `load_paths` must outlive it.
+    /// A booted runtime on the heap, which it keeps pointers into. On
+    /// the thread's stack the VM's fields, which every instruction
+    /// reads, sit at a fixed distance from the frames of the natives
+    /// under a callback, and a native's store a multiple of 4 KiB from
+    /// a field makes the next handler's load of the field wait for it
+    /// (docs/PERF.md §3 "Fast dispatch, Apple M5"). `load_paths` must
+    /// outlive it.
     fn create(io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !*Runtime {
         const rt = try allocator.create(Runtime);
         errdefer allocator.destroy(rt);
-        try rt.init(io, allocator, load_paths);
-        return rt;
-    }
-
-    fn destroy(rt: *Runtime) void {
-        const allocator = rt.allocator;
-        rt.deinit();
-        allocator.destroy(rt);
-    }
-
-    /// Boot in place: the runtime keeps pointers into itself.
-    /// `load_paths` must outlive it.
-    fn init(rt: *Runtime, io: std.Io, allocator: std.mem.Allocator, load_paths: []const []const u8) !void {
         rt.allocator = allocator;
         rt.io = io;
+        rt.arena = .init(allocator);
         rt.v = try vm.VM.init(allocator, &vm.VM.idle_routine);
         errdefer rt.v.deinit();
         rt.v.io = io;
@@ -419,16 +405,26 @@ const Runtime = struct {
         rt.hooks = .{ .host_macros = &rt.host_macros, .registry = registry, .interner = interner, .load_callback = rt.loader.callback() };
         rt.hooks.install(&rt.v);
         if (vm.counting) vm.resetCounts();
+        return rt;
     }
 
-    fn deinit(rt: *Runtime) void {
+    fn destroy(rt: *Runtime) void {
         rt.loader.deinit();
         rt.host_macros.deinit(rt.allocator);
         rt.v.deinit();
+        rt.arena.deinit();
+        rt.allocator.destroy(rt);
     }
 
-    fn persistent(rt: *Runtime) std.mem.Allocator {
-        return rt.v.runtime_arena.allocator();
+    /// `info`'s forms through `Loader.evalSource`, their routines in
+    /// the runtime's arena, with the callbacks of `each`; a failure is
+    /// reported and ends the command with its status.
+    fn eval(rt: *Runtime, info: *const vm.SourceInfo, each: struct {
+        on_value: @FieldType(loader_mod.EvalOptions, "on_value") = null,
+        on_routine: @FieldType(loader_mod.EvalOptions, "on_routine") = null,
+    }) !Value {
+        const options: loader_mod.EvalOptions = .{ .allocator = rt.arena.allocator(), .on_value = each.on_value, .on_routine = each.on_routine };
+        return rt.loader.evalSource(info, options) catch |err| exitSynced(try rt.report(err));
     }
 
     /// Bind `nexis.core/<name>` to `value`.
@@ -585,21 +581,18 @@ const Runtime = struct {
 };
 
 /// The text of FILE, or of stdin for `-`; exit 2 when it cannot be
-/// read. A leading UTF-8 byte-order mark is dropped, so positions and
-/// carets count from the first character after it. A `#!` first line
-/// is a comment, so a script can be executable.
+/// read. A `#!` first line, after a byte-order mark if one opens the
+/// text (which the reader and the reports skip), is a comment, so a
+/// script can be executable.
 fn readProgram(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []u8 {
-    var text = if (eql(path, "-")) blk: {
+    const text = if (eql(path, "-")) blk: {
         var buf: [4096]u8 = undefined;
         var r = std.Io.File.stdin().readerStreaming(io, &buf);
         break :blk r.interface.allocRemaining(allocator, .unlimited) catch |err| failRead(io, path, err);
     } else std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited) catch |err| failRead(io, path, err);
     const bom = loader_mod.byte_order_mark;
-    if (std.mem.startsWith(u8, text, bom)) {
-        std.mem.copyForwards(u8, text, text[bom.len..]);
-        text = allocator.realloc(text, text.len - bom.len) catch |err| failRead(io, path, err);
-    }
-    if (std.mem.startsWith(u8, text, "#!")) @memcpy(text[0..2], ";;");
+    const start = if (std.mem.startsWith(u8, text, bom)) bom.len else 0;
+    if (std.mem.startsWith(u8, text[start..], "#!")) @memcpy(text[start..][0..2], ";;");
     return text;
 }
 
@@ -627,12 +620,8 @@ fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, args: []c
     const rt = try Runtime.create(io, allocator, &load_paths);
     defer rt.destroy();
     try rt.setArgs(args);
-    // One arena for the file's Form trees and routines, released
-    // together at the end.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     const info = vm.SourceInfo{ .path = if (eql(path, "-")) "<stdin>" else path, .text = text };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
+    _ = try rt.eval(&info, .{});
 }
 
 /// `nexis -e EXPR`: EXPR's forms, each non-nil value printed.
@@ -641,15 +630,13 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
     const rt = try Runtime.create(io, allocator, &load_paths);
     defer rt.destroy();
     try rt.setArgs(args);
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     const info = vm.SourceInfo{ .path = "<-e>", .text = expr };
     const Print = struct {
         fn call(ctx: *anyopaque, v: Value) anyerror!void {
             if (!v.isNil()) try @as(*Runtime, @ptrCast(@alignCast(ctx))).printReadably(v);
         }
     };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
+    _ = try rt.eval(&info, .{ .on_value = .{ .ctx = rt, .call = &Print.call } });
 }
 
 /// `nexis doc NAME`: what `(doc NAME)` prints, on stdout. A NAME that
@@ -663,9 +650,8 @@ fn printDoc(io: std.Io, allocator: std.mem.Allocator, text: []const u8) !void {
     const load_paths = [_][]const u8{"."};
     const rt = try Runtime.create(io, allocator, &load_paths);
     defer rt.destroy();
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const expr = try std.fmt.allocPrint(arena.allocator(), "(nexis.core/with-out-str (nexis.core/doc {s}))", .{name});
+    const arena = rt.arena.allocator();
+    const expr = try std.fmt.allocPrint(arena, "(nexis.core/with-out-str (nexis.core/doc {s}))", .{name});
     const info = vm.SourceInfo{ .path = "<doc>", .text = expr };
     const Capture = struct {
         arena: std.mem.Allocator,
@@ -675,10 +661,10 @@ fn printDoc(io: std.Io, allocator: std.mem.Allocator, text: []const u8) !void {
             self.text = try self.arena.dupe(u8, string_mod.asBytes(v));
         }
     };
-    var capture: Capture = .{ .arena = arena.allocator() };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &capture, .call = &Capture.call } }) catch |err| exitSynced(try rt.report(err));
+    var capture: Capture = .{ .arena = arena };
+    _ = try rt.eval(&info, .{ .on_value = .{ .ctx = &capture, .call = &Capture.call } });
     if (capture.text.len == 0) {
-        try std.Io.File.stderr().writeStreamingAll(io, try std.fmt.allocPrint(arena.allocator(), "nexis: no documentation for {s}\n", .{name}));
+        try std.Io.File.stderr().writeStreamingAll(io, try std.fmt.allocPrint(arena, "nexis: no documentation for {s}\n", .{name}));
         exitSynced(1);
     }
     try writeStdout(io, capture.text);
@@ -719,13 +705,13 @@ fn runTests(io: std.Io, allocator: std.mem.Allocator, paths: []const []const u8)
     defer rt.destroy();
     for (infos) |*info| {
         const saved = rt.registry.current;
-        _ = rt.loader.evalSource(info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
+        _ = try rt.eval(info, .{});
         rt.registry.current = saved;
     }
     // Every name qualified: a test file may define its own `get` or `+`
     // in the namespace this runs in.
     const info = vm.SourceInfo{ .path = "<test>", .text = "(nexis.core/let [r (nexis.test/run-all-tests)] (nexis.core/+ (nexis.core/get r :fail) (nexis.core/get r :error)))" };
-    const bad = rt.loader.evalSource(&info, .{ .allocator = arena.allocator() }) catch |err| exitSynced(try rt.report(err));
+    const bad = try rt.eval(&info, .{});
     if (!bad.isFixnum() or bad.asFixnum() != 0) exitSynced(1);
 }
 
@@ -740,8 +726,6 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     const load_paths = loadPathsFor(path);
     const rt = try Runtime.create(io, allocator, &load_paths);
     defer rt.destroy();
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const Disasm = struct {
@@ -757,7 +741,7 @@ fn disasmFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void 
     };
     var each = Disasm{ .rt = rt, .out = &out.writer };
     const info = vm.SourceInfo{ .path = path, .text = text };
-    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_routine = .{ .ctx = &each, .call = &Disasm.call } }) catch |err| exitSynced(try rt.report(err));
+    _ = try rt.eval(&info, .{ .on_routine = .{ .ctx = &each, .call = &Disasm.call } });
     try writeStdout(io, out.written());
 }
 
@@ -833,10 +817,18 @@ fn runRepl(io: std.Io, allocator: std.mem.Allocator) !void {
         // Closures made here are called from later inputs, so the
         // text, its SourceInfo and its routines live as long as the
         // session.
-        const info = try rt.persistent().create(vm.SourceInfo);
-        info.* = .{ .path = "<repl>", .text = try rt.persistent().dupe(u8, std.mem.trimEnd(u8, pending.items, "\n")) };
-        _ = rt.loader.evalSource(info, .{ .allocator = rt.persistent(), .on_value = .{ .ctx = &results, .call = &Results.call } }) catch |err| {
-            if (err == error.Diagnosed and rt.loader.diagnostic.?.incomplete) continue;
+        const session = rt.v.runtime_arena.allocator();
+        const info = try session.create(vm.SourceInfo);
+        info.* = .{ .path = "<repl>", .text = try session.dupe(u8, std.mem.trimEnd(u8, pending.items, "\n")) };
+        _ = rt.loader.evalSource(info, .{ .allocator = session, .on_value = .{ .ctx = &results, .call = &Results.call } }) catch |err| {
+            if (err == error.Diagnosed and rt.loader.diagnostic.?.incomplete) {
+                // Read again with the next line: the copy, the arena's
+                // last allocation, goes back to it, so a form of n such
+                // lines does not keep n copies.
+                session.free(info.text);
+                session.destroy(info);
+                continue;
+            }
             const e = if (err == error.RunFailed) rt.v.unhandled_throw orelse errorValue(rt) else nil;
             _ = try rt.report(err);
             // The frames, handlers and bindings an aborted run left
@@ -910,22 +902,22 @@ fn errorValue(rt: *Runtime) Value {
 
 const testing = std.testing;
 
-test "cli: opcodeName: the disassembler's spelling of every opcode index" {
+test "cli: disasm.opcodeName: the disassembler's spelling of every opcode index" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("cmp:lt", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.lt)) << 6, &buf));
-    try std.testing.expectEqualStrings("cmp:eq-num", opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.eq_num)) << 6, &buf));
-    try std.testing.expectEqualStrings("mov:load-const", opcodeName(@as(u12, @backingInt(vm.Group.mov)) | @as(u12, @backingInt(vm.Mov.load_const)) << 6, &buf));
-    try std.testing.expectEqualStrings("var:load-var", opcodeName(@as(u12, @backingInt(vm.Group.var_)) | @as(u12, @backingInt(vm.VarOp.load_var)) << 6, &buf));
-    try std.testing.expectEqualStrings("call:return", opcodeName(@as(u12, @backingInt(vm.Group.call)) | @as(u12, @backingInt(vm.Call.@"return")) << 6, &buf));
-    try std.testing.expectEqualStrings("ctrl:throw", opcodeName(@as(u12, @backingInt(vm.Group.ctrl)) | @as(u12, @backingInt(vm.CtrlOp.throw_)) << 6, &buf));
-    try std.testing.expectEqualStrings("math:?63", opcodeName(@as(u12, @backingInt(vm.Group.math)) | @as(u12, 63) << 6, &buf));
-    try std.testing.expectEqualStrings("simd:?0", opcodeName(@backingInt(vm.Group.simd), &buf));
+    try std.testing.expectEqualStrings("cmp:lt", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.lt)) << 6, &buf));
+    try std.testing.expectEqualStrings("cmp:eq-num", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.cmp)) | @as(u12, @backingInt(vm.Cmp.eq_num)) << 6, &buf));
+    try std.testing.expectEqualStrings("mov:load-const", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.mov)) | @as(u12, @backingInt(vm.Mov.load_const)) << 6, &buf));
+    try std.testing.expectEqualStrings("var:load-var", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.var_)) | @as(u12, @backingInt(vm.VarOp.load_var)) << 6, &buf));
+    try std.testing.expectEqualStrings("call:return", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.call)) | @as(u12, @backingInt(vm.Call.@"return")) << 6, &buf));
+    try std.testing.expectEqualStrings("ctrl:throw", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.ctrl)) | @as(u12, @backingInt(vm.CtrlOp.throw_)) << 6, &buf));
+    try std.testing.expectEqualStrings("math:?63", disasm_mod.opcodeName(@as(u12, @backingInt(vm.Group.math)) | @as(u12, 63) << 6, &buf));
+    try std.testing.expectEqualStrings("simd:?0", disasm_mod.opcodeName(@backingInt(vm.Group.simd), &buf));
     // A quickened variant is named as the disassembler names it: its
     // base and the operand kinds it proves (`math:add.sc`).
     var quickened: usize = 0;
     for (0..4096) |i| if (vm.Quick.of(@intCast(i)) != null) {
         quickened += 1;
-        const name = opcodeName(@intCast(i), &buf);
+        const name = disasm_mod.opcodeName(@intCast(i), &buf);
         try std.testing.expect(std.mem.indexOfScalar(u8, name, '?') == null);
         try std.testing.expect(std.mem.indexOfScalar(u8, name, '.') != null);
     };

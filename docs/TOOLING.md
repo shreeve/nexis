@@ -26,7 +26,8 @@ every top-level form, then compile and run each before compiling the
 next, on one VM (MACROEXPAND.md §2b, the loader). `require` searches
 the working directory, then the directory of the file being run.
 `*command-line-args*` holds the ARGs (`run` and `-e`); a first line
-that begins `#!` is a comment, so a script can be made executable. A
+that begins `#!`, after a byte-order mark if one opens the file, is a
+comment, so a script can be made executable. A
 file (run, tested, disassembled or required) that opens with a UTF-8
 byte-order mark is read without it, so its line-1 columns and carets
 count from the character after the mark (`test/golden/cli/bom.nx`;
