@@ -73,10 +73,12 @@ const body_cost: u64 = 16;
 // =============================================================================
 
 pub const Info = struct {
-    /// Distinct rule names.
+    /// Distinct rule names, ascending: the runs of the sorted rule set.
     names: []const u32,
     /// Component id per name index.
     scc_of: []const usize,
+    /// Per component: the name indexes it holds.
+    members_of: []const []const usize,
     /// Per component: does it contain a cycle?
     recursive: []const bool,
     /// Per component: does one of its rules call another of its rules
@@ -84,8 +86,11 @@ pub const Info = struct {
     negated: []const bool,
 
     pub fn nameIndex(self: *const Info, name: u32) ?usize {
-        for (self.names, 0..) |n, i| if (n == name) return i;
-        return null;
+        return std.sort.binarySearch(u32, self.names, name, orderU32);
+    }
+
+    fn orderU32(a: u32, b: u32) std.math.Order {
+        return std.math.order(a, b);
     }
 
     pub fn isRecursive(self: *const Info, name: u32) bool {
@@ -94,11 +99,8 @@ pub const Info = struct {
     }
 
     /// Name indexes in the component of `name`.
-    pub fn members(self: *const Info, arena: Allocator, name: u32) ![]usize {
-        const i = self.nameIndex(name).?;
-        var out: std.ArrayList(usize) = .empty;
-        for (self.scc_of, 0..) |s, j| if (s == self.scc_of[i]) try out.append(arena, j);
-        return out.toOwnedSlice(arena);
+    pub fn members(self: *const Info, name: u32) []const usize {
+        return self.members_of[self.scc_of[self.nameIndex(name).?]];
     }
 };
 
@@ -106,28 +108,23 @@ pub const Info = struct {
 pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     var names: std.ArrayList(u32) = .empty;
     for (set.rules) |r| {
-        var seen = false;
-        for (names.items) |n| if (n == r.name) {
-            seen = true;
-        };
-        if (!seen) try names.append(arena, r.name);
+        if (names.items.len == 0 or names.getLast() != r.name) try names.append(arena, r.name);
     }
     const n = names.items.len;
     const edges = try arena.alloc([]usize, n);
     const negative = try arena.alloc([]usize, n);
-    for (names.items, 0..) |name, i| {
+    for (names.items, edges, negative) |name, *e, *neg_edges| {
         var calls: std.ArrayList(Call) = .empty;
         for (set.byName(name).?) |r| try collectCalls(arena, r.body, false, &calls);
         var out: std.ArrayList(usize) = .empty;
         var neg: std.ArrayList(usize) = .empty;
         for (calls.items) |c| {
-            for (names.items, 0..) |m, j| if (m == c.name) {
-                try out.append(arena, j);
-                if (c.negated) try neg.append(arena, j);
-            };
+            const j = std.sort.binarySearch(u32, names.items, c.name, Info.orderU32) orelse continue;
+            try out.append(arena, j);
+            if (c.negated) try neg.append(arena, j);
         }
-        edges[i] = try out.toOwnedSlice(arena);
-        negative[i] = try neg.toOwnedSlice(arena);
+        e.* = try out.toOwnedSlice(arena);
+        neg_edges.* = try neg.toOwnedSlice(arena);
     }
 
     var t = Tarjan{
@@ -142,24 +139,29 @@ pub fn analyze(arena: Allocator, set: *const RuleSet) !Info {
     @memset(t.on_stack, false);
     for (0..n) |i| if (t.index[i] == null) try t.visit(i);
 
-    const recursive = try arena.alloc(bool, t.scc_count);
-    @memset(recursive, false);
-    for (0..n) |i| {
-        var members: usize = 0;
-        for (t.scc_of) |s| if (s == t.scc_of[i]) {
-            members += 1;
-        };
-        if (members > 1) recursive[t.scc_of[i]] = true;
-        for (edges[i]) |j| if (j == i) {
-            recursive[t.scc_of[i]] = true;
-        };
+    // Each component's members, in one pass over the names.
+    const counts = try arena.alloc(usize, t.scc_count);
+    @memset(counts, 0);
+    for (t.scc_of) |s| counts[s] += 1;
+    const members_of = try arena.alloc([]usize, t.scc_count);
+    for (members_of, counts) |*m, c| m.* = try arena.alloc(usize, c);
+    @memset(counts, 0);
+    for (t.scc_of, 0..) |s, i| {
+        members_of[s][counts[s]] = i;
+        counts[s] += 1;
     }
+
+    const recursive = try arena.alloc(bool, t.scc_count);
+    for (recursive, members_of) |*r, m| r.* = m.len > 1;
+    for (edges, 0..) |js, i| for (js) |j| {
+        if (j == i) recursive[t.scc_of[i]] = true;
+    };
     const negated = try arena.alloc(bool, t.scc_count);
     @memset(negated, false);
     for (negative, 0..) |js, i| for (js) |j| {
         if (t.scc_of[i] == t.scc_of[j]) negated[t.scc_of[i]] = true;
     };
-    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .recursive = recursive, .negated = negated };
+    return .{ .names = try names.toOwnedSlice(arena), .scc_of = t.scc_of, .members_of = members_of, .recursive = recursive, .negated = negated };
 }
 
 const Tarjan = struct {
@@ -361,7 +363,7 @@ fn planFix(ctx: *Ctx, name: u32, arg_vars: []const Var, src: ?ir.Src, bound: *co
     // alone: a rule that depends on its own negation has no answer it
     // could reach.
     if (info.negated[info.scc_of[info.nameIndex(name).?]]) return ctx.syntaxFmt("{s} recurses through not; a rule cannot depend on the negation of itself", .{ctx.interner.symbolName(name)});
-    const members = try info.members(ctx.arena, name);
+    const members = info.members(name);
 
     var pushed: std.ArrayList(usize) = .empty;
     if (members.len == 1) {
@@ -716,7 +718,7 @@ test "call graph: self loop, mutual recursion, acyclic" {
     try testing.expectEqual(info.scc_of[info.nameIndex(2).?], info.scc_of[info.nameIndex(3).?]);
     try testing.expect(!info.isRecursive(4));
     try testing.expect(!info.isRecursive(5));
-    try testing.expectEqual(@as(usize, 2), (try info.members(arena, 2)).len);
+    try testing.expectEqual(@as(usize, 2), info.members(2).len);
     // 3 calls 2 under `not` and 2 calls 3: not stratified; 1 is.
     try testing.expect(info.negated[info.scc_of[info.nameIndex(2).?]]);
     try testing.expect(!info.negated[info.scc_of[info.nameIndex(1).?]]);

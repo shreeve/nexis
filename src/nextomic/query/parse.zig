@@ -765,6 +765,8 @@ const Parser = struct {
         if (!isSeq(rules)) return self.fail("rules must be a vector of rule forms");
         const items = try self.elems(rules);
         var out: std.ArrayList(ir.Rule) = .empty;
+        // The arity of each name, from its first rule.
+        var arities: Arities = .empty;
         for (items, 0..) |x, i| {
             self.clause_index = i;
             if (x.kind() != .persistent_vector) return self.fail("rule form is [(name args...) clauses...]");
@@ -791,35 +793,38 @@ const Parser = struct {
             for (vars.items, 0..) |v, j| {
                 if (ir.containsVar(vars.items[j + 1 ..], v)) return self.failFmt("{s} appears twice in the head of rule {s}", .{ self.varName(v), self.interner.symbolName(name) });
             }
-            for (out.items) |prev| {
-                if (prev.name == name and (prev.head.len != vars.items.len or prev.required != required)) return self.failFmt("rule {s} takes {d} argument{s}, {d} of them required, and here {d}, {d} required; rules with one name share an arity", .{ self.interner.symbolName(name), prev.head.len, plural(prev.head.len), prev.required, vars.items.len, required });
-            }
+            const first = try arities.getOrPut(self.arena, name);
+            if (!first.found_existing) first.value_ptr.* = .{ .head = vars.items.len, .required = required };
+            const prev = first.value_ptr.*;
+            if (prev.head != vars.items.len or prev.required != required) return self.failFmt("rule {s} takes {d} argument{s}, {d} of them required, and here {d}, {d} required; rules with one name share an arity", .{ self.interner.symbolName(name), prev.head, plural(prev.head), prev.required, vars.items.len, required });
             self.rule_body = true;
             const body = try self.parseClauses(parts[1..], false);
             try out.append(self.arena, .{ .name = name, .required = required, .head = try vars.toOwnedSlice(self.arena), .body = body });
         }
         for (out.items, 0..) |r, i| {
             self.clause_index = i;
-            try self.checkCalls(out.items, r.body);
+            try self.checkCalls(&arities, r.body);
         }
-        // Group the bodies of one rule: `RuleSet.byName` is one slice.
-        // The sort is stable, so bodies keep their source order.
+        // Sort by name: the rules of one name are one run, which
+        // `RuleSet.byName` finds by binary search. The sort is stable,
+        // so bodies keep their source order.
         std.mem.sort(ir.Rule, out.items, {}, ruleNameLess);
         return out.toOwnedSlice(self.arena);
     }
 
+    const Arities = std.AutoHashMapUnmanaged(u32, struct { head: usize, required: usize });
+
     /// Every call in `body` to a rule of the set passes as many
     /// arguments as its head has.
-    fn checkCalls(self: *Parser, rules: []const ir.Rule, body: []const Clause) Error!void {
+    fn checkCalls(self: *Parser, arities: *const Arities, body: []const Clause) Error!void {
         try stack.check();
         for (body) |c| switch (c) {
-            .rule => |call| for (rules) |def| {
-                if (def.name != call.name) continue;
-                if (def.head.len != call.args.len) return self.failFmt("rule {s} takes {d} argument{s}, and a call passes {d}", .{ self.interner.symbolName(def.name), def.head.len, plural(def.head.len), call.args.len });
-                break;
+            .rule => |call| {
+                const n = (arities.get(call.name) orelse continue).head;
+                if (n != call.args.len) return self.failFmt("rule {s} takes {d} argument{s}, and a call passes {d}", .{ self.interner.symbolName(call.name), n, plural(n), call.args.len });
             },
-            .not => |n| try self.checkCalls(rules, n.body),
-            .@"or" => |o| for (o.branches) |br| try self.checkCalls(rules, br),
+            .not => |n| try self.checkCalls(arities, n.body),
+            .@"or" => |o| for (o.branches) |br| try self.checkCalls(arities, br),
             else => {},
         };
     }

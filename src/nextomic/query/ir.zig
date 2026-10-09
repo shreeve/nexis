@@ -329,8 +329,9 @@ pub const Rule = struct {
 
 /// A parsed `%` input. Rules have their own variable table; a call
 /// site renames them into the plan's. Invariants:
-///   - Rules with one name are contiguous in `rules`, in source order
-///     (`parse.zig` groups them), so `byName` is one slice.
+///   - `rules` is sorted by name, the rules of one name in source order
+///     (`parse.zig` sorts them stably), so `byName` is a binary search
+///     and the distinct names are the runs.
 ///   - A set with `arena_state` owns its rules and is freed by
 ///     `deinit`; one without (`no_rules`, or a set a test builds over
 ///     static rules) is not, and `deinit` is a no-op.
@@ -349,16 +350,12 @@ pub const RuleSet = struct {
 
     /// Every rule named `name`, or null.
     pub fn byName(self: *const RuleSet, name: u32) ?[]const Rule {
-        var lo: ?usize = null;
-        var hi: usize = 0;
-        for (self.rules, 0..) |r, i| {
-            if (r.name != name) continue;
-            std.debug.assert(lo == null or hi == i);
-            if (lo == null) lo = i;
-            hi = i + 1;
-        }
-        const start = lo orelse return null;
-        return self.rules[start..hi];
+        const lo, const hi = std.sort.equalRange(Rule, self.rules, name, orderName);
+        return if (lo == hi) null else self.rules[lo..hi];
+    }
+
+    fn orderName(name: u32, r: Rule) std.math.Order {
+        return std.math.order(name, r.name);
     }
 };
 
