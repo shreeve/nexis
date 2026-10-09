@@ -449,7 +449,7 @@ The rule each native follows, by what it holds across a further
    root slot (`reducePure`);
    `whileSplit` (`take-while`, `drop-while`) and
    `reductions` keep what the iterator yields and walk with
-   `rootedSeqIter`, which pushes each built value on the native's
+   `SeqIter.rooted`, which pushes each built value on the native's
    root scope; `sortImpl` (`sort`, `sort-by`) collects the elements and
    pushes them all (`pushAll`) before any key fn or comparator runs;
    `group-by` builds its map on a transient it pushes, which reaches
@@ -472,7 +472,7 @@ The rule each native follows, by what it holds across a further
    key realizes before its edit, and the entries `into` gathers from a
    map) and a value another iterator built (the entries of a map
    walked beside a lazy seq by `concat`, `interleave`, `zipmap`,
-   `partition`'s pad, which walk with `rootedSeqIter`) are not.
+   `partition`'s pad, which walk with `SeqIter.rooted`) are not.
 
 A batch (`Callback.each`, `fold`, `foldRange`; `docs/VM.md` §6)
 collects before each element, so it reads its elements from a run a

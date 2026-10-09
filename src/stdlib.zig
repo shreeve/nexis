@@ -11,7 +11,7 @@
 //
 // Every native declares its arity in its descriptor and the VM
 // enforces it; a native never indexes `args` past its declared
-// minimum. Any seqable receiver goes through `makeSeqIter`, so
+// minimum. Any seqable receiver goes through `SeqIter`, so
 // nil, lists, vectors, typed vectors, maps, records, Nextomic
 // entities, sets (hash or sorted) and strings behave the same way in
 // every sequence function. Arithmetic delegates to the VM's numeric
@@ -772,7 +772,7 @@ fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
         .persistent_vector => if (vector_mod.isEmpty(s)) value_mod.nilValue() else vector_mod.nth(s, 0),
         .lazy_seq => seq_mod.first(vm, s),
         else => blk: {
-            var it = try makeSeqIter(vm, s);
+            var it = try SeqIter.init(vm, s);
             break :blk (try it.next()) orelse value_mod.nilValue();
         },
     };
@@ -804,7 +804,7 @@ fn fnRest(vm: *VM, args: []const Value) VmError!Value {
 /// The element at position `i` of any seqable, nil past its end;
 /// walks only as far as `i`.
 fn nthOfSeq(vm: *VM, coll: Value, i: usize) VmError!Value {
-    var it = try makeSeqIter(vm, coll);
+    var it = try SeqIter.init(vm, coll);
     for (0..i) |_| _ = (try it.next()) orelse return value_mod.nilValue();
     return (try it.next()) orelse value_mod.nilValue();
 }
@@ -822,14 +822,14 @@ fn lazyCount(v: Value) VmError!Value {
 /// `(take n coll)` → the lazy seq of the first `n` elements, one at a
 /// time (docs/LAZY.md §7).
 fn fnTake(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-take", args);
+    if (args.len == 1) return callCore(vm, "xf-take", args);
     return seq_mod.make(vm, seq_mod.op_take, &.{ try lazyCount(args[0]), args[1] });
 }
 
 /// `(drop n coll)` → the lazy seq of `coll` without its first `n`
 /// elements, walked when it is realized.
 fn fnDrop(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-drop", args);
+    if (args.len == 1) return callCore(vm, "xf-drop", args);
     return seq_mod.make(vm, seq_mod.op_drop, &.{ try lazyCount(args[0]), args[1] });
 }
 
@@ -1152,8 +1152,8 @@ fn fnEq(vm: *VM, args: []const Value) VmError!Value {
 fn equalTop(vm: *VM, a: Value, b: Value) VmError!bool {
     const lazy_pair = (a.kind() == .lazy_seq or b.kind() == .lazy_seq) and isSequential(a.kind()) and isSequential(b.kind());
     if (!lazy_pair or a.identicalTo(b)) return dispatch_mod.equal(a, b);
-    var ia = try makeSeqIter(vm, a);
-    var ib = try makeSeqIter(vm, b);
+    var ia = try SeqIter.init(vm, a);
+    var ib = try SeqIter.init(vm, b);
     while (true) {
         const x = (try ia.next()) orelse return (try ib.next()) == null;
         const y = (try ib.next()) orelse return false;
@@ -1559,7 +1559,7 @@ fn fnInfiniteQ(_: *VM, args: []const Value) VmError!Value {
 // iterator built (a map's `[k v]` entry, a boxed typed-vector
 // element). Every native below that keeps either across a further
 // callback pushes it on a `RootScope` first, the second kind by
-// iterating with `rootedSeqIter`; one whose only held value is the
+// iterating with `SeqIter.rooted`; one whose only held value is the
 // next call's argument and is not used again (`reduce`, `reduce-kv`,
 // `db/alter!`, `db/reduce-tree`) needs nothing, because the callee
 // roots its argument for as long as it uses it. A callee's fn-level
@@ -1602,7 +1602,7 @@ fn fnApply(vm: *VM, args: []const Value) VmError!Value {
 /// at the shortest collection (docs/LAZY.md §7): a chunk of 32 at a
 /// time over one chunked collection, one element at a time otherwise.
 fn fnMap(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-map", args);
+    if (args.len == 1) return callCore(vm, "xf-map", args);
     if (args.len == 2) return seq_mod.make(vm, seq_mod.op_map, args[0..2]);
     if (args.len - 1 <= seq_mod.map_n_inline) return seq_mod.make(vm, seq_mod.op_map_n, args);
     const colls = vector_mod.fromSlice(vm.ensureHeap(), args[1..]) catch return VmError.OutOfMemory;
@@ -1618,7 +1618,7 @@ fn fnMap(vm: *VM, args: []const Value) VmError!Value {
 /// consumes: its walk keeps its place there (`SeqIter.cursor`).
 fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usize, cursor: usize) VmError!void {
     if (colls.len == 1) {
-        var it = try makeSeqIter(vm, colls[0]);
+        var it = try SeqIter.init(vm, colls[0]);
         it.cursor = cursor;
         var cb = vm_mod.Callback.init(vm, f, 1);
         var buf: [results_chunk]Value = undefined;
@@ -1641,7 +1641,7 @@ fn mapInto(vm: *VM, f: Value, colls: []const Value, results: *Results, held: usi
 
     const iters = vm.allocator.alloc(SeqIter, colls.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(iters);
-    for (colls, 0..) |c, i| iters[i] = try makeSeqIter(vm, c);
+    for (colls, 0..) |c, i| iters[i] = try SeqIter.init(vm, c);
     iters[colls.len - 1].cursor = cursor;
     const call_args = vm.allocator.alloc(Value, colls.len) catch return VmError.OutOfMemory;
     defer vm.allocator.free(call_args);
@@ -1802,7 +1802,7 @@ fn reducePure(vm: *VM, f: Value, init: ?Value, p: seq_mod.Pure) VmError!Value {
         .cycle => |all| {
             var acc: ?Value = init;
             while (true) {
-                var it = try makeSeqIter(vm, all);
+                var it = try SeqIter.init(vm, all);
                 // The walk's first pass realizes the source, which runs
                 // code: the accumulator waits in the root slot.
                 while (try it.next()) |x| {
@@ -1876,17 +1876,14 @@ fn fnReduceKv(vm: *VM, args: []const Value) VmError!Value {
     return acc;
 }
 
-/// What `filterv` keeps.
-const Sieve = enum { keep_truthy, keep_falsy, keep_result };
-
-/// Add what `mode` keeps of `coll` to `results`, which roots each as
-/// it comes. An element the walk built (a map's entry) waits in the
+/// Add each element of `coll` that `pred` holds of to `results`,
+/// which roots each as it comes (`filterv`). An element the walk built (a map's entry) waits in the
 /// root slot `held` while the predicate runs, since the predicate may
 /// `recur` over its argument, and in `results` once kept; one dropped
 /// is garbage (GC.md §11.5, class 4). `coll` is consumed: the root slot
 /// `cursor` holds it, and its walk keeps its place there.
-fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, held: usize, cursor: usize) VmError!void {
-    var it = try makeSeqIter(vm, coll);
+fn sieveInto(vm: *VM, pred: Value, coll: Value, results: *Results, held: usize, cursor: usize) VmError!void {
+    var it = try SeqIter.init(vm, coll);
     it.cursor = cursor;
     var cb = vm_mod.Callback.init(vm, pred, 1);
     var buf: [results_chunk]Value = undefined;
@@ -1894,26 +1891,20 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, 
         // A run of the source's own elements, rooted with it: the
         // predicate's calls in batches (VM.md §6), whose results are
         // only tested for truth.
-        if (mode != .keep_result and xs.len > 1) {
+        if (xs.len > 1) {
             var rest = xs;
             while (rest.len > 0) {
                 const part = rest[0..@min(rest.len, results_chunk)];
                 var truth: [results_chunk]Value = undefined;
                 try cb.each(part, .{ .slots = &truth });
-                for (part, truth[0..part.len]) |x, r| if (r.isTruthy() == (mode == .keep_truthy)) try results.add(x);
+                for (part, truth[0..part.len]) |x, r| if (r.isTruthy()) try results.add(x);
                 rest = rest[part.len..];
             }
             continue;
         }
         for (xs) |x| {
             vm.roots.items[held] = x;
-            const r = try cb.call1(x);
-            const kept: ?Value = switch (mode) {
-                .keep_truthy => if (r.isTruthy()) x else null,
-                .keep_falsy => if (r.isTruthy()) null else x,
-                .keep_result => if (r.isNil()) null else r,
-            };
-            if (kept) |v| try results.add(v);
+            if ((try cb.call1(x)).isTruthy()) try results.add(x);
         }
     }
 }
@@ -1922,17 +1913,17 @@ fn sieveInto(vm: *VM, mode: Sieve, pred: Value, coll: Value, results: *Results, 
 /// truthy; `(remove pred coll)` where it is falsy; `(keep f coll)` the
 /// non-nil `(f x)` (docs/LAZY.md §7).
 fn fnFilter(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-filter", args);
+    if (args.len == 1) return callCore(vm, "xf-filter", args);
     return seq_mod.make(vm, seq_mod.op_filter, args[0..2]);
 }
 
 fn fnRemove(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-remove", args);
+    if (args.len == 1) return callCore(vm, "xf-remove", args);
     return seq_mod.make(vm, seq_mod.op_remove, args[0..2]);
 }
 
 fn fnKeep(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-keep", args);
+    if (args.len == 1) return callCore(vm, "xf-keep", args);
     return seq_mod.make(vm, seq_mod.op_keep, args[0..2]);
 }
 
@@ -2492,7 +2483,7 @@ fn fnConcat(vm: *VM, args: []const Value) VmError!Value {
 /// `(mapcat f & colls)` → the concatenation of `(map f & colls)`, a
 /// producer over the lazy seq of colls, so an infinite one works.
 fn fnMapcat(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-mapcat", args);
+    if (args.len == 1) return callCore(vm, "xf-mapcat", args);
     const mapped = try fnMap(vm, args);
     return seq_mod.make(vm, seq_mod.op_concat, &.{ value_mod.nilValue(), mapped });
 }
@@ -2623,26 +2614,26 @@ fn fnFilterv(vm: *VM, args: []const Value) VmError!Value {
     try scope.push(args[1]);
     var results = Results.init(vm);
     defer results.release();
-    try sieveInto(vm, .keep_truthy, args[0], args[1], &results, scope.base, scope.base + 1);
+    try sieveInto(vm, args[0], args[1], &results, scope.base, scope.base + 1);
     return results.vector();
 }
 
 /// `(map-indexed f coll)` → the lazy seq of `(f i x)`;
 /// `(keep-indexed f coll)` the non-nil ones (docs/LAZY.md §7).
 fn fnMapIndexed(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-map-indexed", args);
+    if (args.len == 1) return callCore(vm, "xf-map-indexed", args);
     return seq_mod.make(vm, seq_mod.op_map_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 fn fnKeepIndexed(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-keep-indexed", args);
+    if (args.len == 1) return callCore(vm, "xf-keep-indexed", args);
     return seq_mod.make(vm, seq_mod.op_keep_indexed, &.{ args[0], args[1], value_mod.fromFixnum(0).? });
 }
 
 /// `(distinct coll)` → the lazy seq of first occurrences, in order,
 /// one at a time.
 fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 0) return transducer(vm, "xf-distinct", args);
+    if (args.len == 0) return callCore(vm, "xf-distinct", args);
     const seen = champ_mod.setEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
     return seq_mod.make(vm, seq_mod.op_distinct, &.{ args[0], seen });
 }
@@ -2650,7 +2641,7 @@ fn fnDistinct(vm: *VM, args: []const Value) VmError!Value {
 /// `(dedupe coll)` → the lazy seq of `coll` without consecutive
 /// duplicates, 32 at a time.
 fn fnDedupe(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 0) return transducer(vm, "xf-dedupe", args);
+    if (args.len == 0) return callCore(vm, "xf-dedupe", args);
     return seq_mod.make(vm, seq_mod.op_dedupe, &.{ args[0], value_mod.nilValue(), value_mod.fromBool(false) });
 }
 
@@ -2669,7 +2660,7 @@ fn partitionImpl(vm: *VM, args: []const Value, comptime all: bool) VmError!Value
 }
 
 fn fnPartitionAll(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-partition-all", args);
+    if (args.len == 1) return callCore(vm, "xf-partition-all", args);
     return partitionImpl(vm, args, true);
 }
 
@@ -2681,8 +2672,8 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
     // lazy steps may collect (GC.md §11.5, class 5).
     const scope = vm.rootScope();
     defer scope.release();
-    var ks = try rootedSeqIter(vm, args[0], scope);
-    var vs = try rootedSeqIter(vm, args[1], scope);
+    var ks = try SeqIter.rooted(vm, args[0], scope);
+    var vs = try SeqIter.rooted(vm, args[1], scope);
     while (try ks.next()) |k| {
         const v = (try vs.next()) orelse break;
         entries.append(vm.allocator, .{ .key = k, .value = v }) catch return VmError.OutOfMemory;
@@ -2693,12 +2684,12 @@ fn fnZipmap(vm: *VM, args: []const Value) VmError!Value {
 /// `(take-while pred coll)` / `(drop-while pred coll)` → lazy seqs
 /// (docs/LAZY.md §7).
 fn fnTakeWhile(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-take-while", args);
+    if (args.len == 1) return callCore(vm, "xf-take-while", args);
     return seq_mod.make(vm, seq_mod.op_take_while, args[0..2]);
 }
 
 fn fnDropWhile(vm: *VM, args: []const Value) VmError!Value {
-    if (args.len == 1) return transducer(vm, "xf-drop-while", args);
+    if (args.len == 1) return callCore(vm, "xf-drop-while", args);
     return seq_mod.make(vm, seq_mod.op_drop_while, args[0..2]);
 }
 
@@ -3082,14 +3073,8 @@ fn fnNotEmpty(vm: *VM, args: []const Value) VmError!Value {
 
 // ---- ordering ----
 
-/// Total order used by `compare` and `sort`: Clojure's `compare`,
-/// which sorted collections share (SORTED.md §6).
-fn compareValues(vm: *VM, a: Value, b: Value) VmError!std.math.Order {
-    return vm_mod.naturalOrder(vm, a, b);
-}
-
 fn fnCompare(vm: *VM, args: []const Value) VmError!Value {
-    const o = try compareValues(vm, args[0], args[1]);
+    const o = try vm_mod.naturalOrder(vm, args[0], args[1]);
     return value_mod.fromFixnum(switch (o) {
         .lt => -1,
         .eq => 0,
@@ -3112,7 +3097,7 @@ const SortOrder = struct {
         const cmp = self.comparator orelse {
             // Two fixnums, the common key, compare in registers. Any
             // other pair reads `sorted`'s `OrderError!Order` as it is:
-            // converted to a `VmError!Order` first, as `compareValues`
+            // converted to a `VmError!Order` first, as `naturalOrder`
             // returns it, x86-64 code rebuilds the result with two narrow
             // stores and reloads it as one wider load, which the CPU
             // cannot forward (PERF.md §3.31).
@@ -4699,14 +4684,10 @@ fn fnChunkCons(vm: *VM, args: []const Value) VmError!Value {
     return chunked;
 }
 
-/// The transducer arity of a sequence native: the `xf-` function of its
-/// name in core.nx, called with the arguments (docs/LAZY.md §10).
-fn transducer(vm: *VM, comptime name: []const u8, args: []const Value) VmError!Value {
-    return callCore(vm, name, args);
-}
-
 /// The function `name` of nexis.core, private ones included, called
-/// with `args`, the native's own arguments (GC.md §11.5, class 2).
+/// with `args`, the native's own arguments (GC.md §11.5, class 2): a
+/// sequence native's transducer arity calls its `xf-` function
+/// (docs/LAZY.md §10).
 fn callCore(vm: *VM, name: []const u8, args: []const Value) VmError!Value {
     const registry = if (vm.home().registry) |*r| r else return VmError.UnboundVar;
     const v = registry.core.lookupLocal(name) orelse return VmError.UnboundVar;
@@ -5998,12 +5979,12 @@ fn fnStringJoin(vm: *VM, args: []const Value) VmError!Value {
 fn joinPlain(vm: *VM, sep: []const u8, coll: Value) VmError!?Value {
     var len: usize = 0;
     var n: usize = 0;
-    var it = try makeSeqIter(vm, coll);
+    var it = try SeqIter.init(vm, coll);
     while (try it.next()) |x| : (n += 1) len += plainStrLen(x) orelse return null;
     if (n > 1) len += sep.len * (n - 1);
     const out = string_mod.allocUninit(vm.ensureHeap(), len) catch return VmError.OutOfMemory;
     var rest = out.bytes;
-    it = try makeSeqIter(vm, coll);
+    it = try SeqIter.init(vm, coll);
     var first = true;
     while (try it.next()) |x| {
         if (!first) {
@@ -7125,7 +7106,7 @@ const JsonWriter = struct {
     }
 
     fn array(jw: *JsonWriter, v: Value) VmError!void {
-        var it = try makeSeqIter(jw.vm, v);
+        var it = try SeqIter.init(jw.vm, v);
         try jw.put("[");
         jw.depth += 1;
         var first = true;
@@ -7639,23 +7620,14 @@ fn typeNameToKinds(name: []const u8) ?[]const Kind {
 /// Every seqable receiver (`seq.SeqIter`, LAZY.md §5).
 const SeqIter = seq_mod.SeqIter;
 
-fn makeSeqIter(vm: *VM, coll: Value) VmError!SeqIter {
-    return SeqIter.init(vm, coll);
-}
-
-/// `makeSeqIter` over an argument the native consumes
+/// `SeqIter.init` over an argument the native consumes
 /// (`NativeFn.consumes`): `coll` is pushed on `scope`, and the slot
 /// keeps the walk's place (`SeqIter.cursor`).
 fn consumingSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
     try scope.push(coll);
-    var it = try makeSeqIter(vm, coll);
+    var it = try SeqIter.init(vm, coll);
     it.cursor = vm.roots.items.len - 1;
     return it;
-}
-
-/// `makeSeqIter` whose built values stay rooted in `scope`.
-fn rootedSeqIter(vm: *VM, coll: Value, scope: vm_mod.RootScope) VmError!SeqIter {
-    return SeqIter.rooted(vm, coll, scope);
 }
 
 /// Materialize a seqable into an owned list of Values. The
@@ -7683,7 +7655,7 @@ fn appendSeqValues(vm: *VM, seq: Value, out: *std.ArrayList(Value)) VmError!void
         }
         return;
     };
-    var it = try makeSeqIter(vm, seq);
+    var it = try SeqIter.init(vm, seq);
     while (try it.next()) |e| {
         out.append(vm.allocator, e) catch return VmError.OutOfMemory;
     }
@@ -7821,12 +7793,6 @@ const Results = struct {
         const v = try self.finish(t);
         reverseFresh(v);
         return list_mod.ofVector(self.heap, v, 0) catch VmError.OutOfMemory;
-    }
-
-    /// The result as a list (`buildListFromSlice`'s shape).
-    fn list(self: *Results) VmError!Value {
-        const t = self.building orelse return buildListFromSlice(self.vm, scopeItems(self.scope));
-        return list_mod.ofVector(self.heap, try self.finish(t), 0) catch VmError.OutOfMemory;
     }
 
     /// The result as a vector.
@@ -8090,7 +8056,7 @@ fn fnRseq(vm: *VM, args: []const Value) VmError!Value {
 // `i64-vector` / `f64-vector` / `typed-vector?` / `typed-vector-type`
 // are `nexis.core` natives; `sum` / `dot` / `scale` / `map` are the
 // `nexis.simd` kernels. A typed vector is a seqable receiver through
-// `makeSeqIter`, so every generic sequence native works on it.
+// `SeqIter`, so every generic sequence native works on it.
 // =============================================================================
 
 /// An `i64` element from a Value: a fixnum, or a bignum within
