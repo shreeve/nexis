@@ -1315,6 +1315,11 @@ damaged page is `:db/corrupted` (§7), never a short scan.
 - **`:db/index true` and `:db/unique` are never retracted** (§3 step
   5), and `:db/unique` does not switch between identity and value.
   Datomic can drop an index or a uniqueness constraint.
+- **`pull` always includes `:db/id`** (§6.2): every entity it pulls,
+  a nested one included, carries its eid whether or not the pattern
+  names it, so `(d/pull db [:person/name] e)` is `{:db/id e
+  :person/name "Ann"}`. Datomic's includes `:db/id` only where the
+  pattern names it or holds `*`, and in a ref with no sub-pattern.
 - **`with` takes a connection and a function.** `(d/with conn tx-data
   f)` calls `f` with `db-after` and the report inside a held write
   transaction that is aborted when `f` returns, and returns `f`'s
