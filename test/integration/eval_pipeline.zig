@@ -8744,3 +8744,13 @@ test "defonce returns nil when the Var is bound; merge is Clojure's" {
         \\ (merge) (merge nil false) (merge {:a 1} nil {:a 2 :b 3})]
     , "[#'user/a nil 1 {:a 1} true {:a 1} nil nil {:a 2, :b 3}]");
 }
+
+test "juxt and every-pred take a function, if-not two or three forms, find-var a qualified symbol" {
+    try expectOutput(
+        \\(let [err (fn [f] (try (f) (catch any e (:error e))))]
+        \\  [(err #(juxt)) (err #(every-pred)) ((juxt inc dec) 1) ((every-pred odd? pos?) 1 3)
+        \\   (err #(eval '(if-not true 1 2 3))) (if-not false 1) (if-not true 1 2)
+        \\   (try (find-var 'foo) (catch :invalid-argument e (ex-message e))) (find-var 'nexis.core/inc)
+        \\   (get-in {:a {:b 1}} [:a :b]) (get-in nil [:a]) (get-in {:a 1} nil) (get-in 5 [:a])])
+    , "[:arity-mismatch :arity-mismatch [2 0] true :compile-error 1 2 find-var takes a qualified symbol, got foo #'nexis.core/inc 1 nil {:a 1} nil]");
+}

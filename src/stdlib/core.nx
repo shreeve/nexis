@@ -512,9 +512,10 @@
 (defn juxt
   "Returns a function that calls each of fs on its arguments and
   returns the vector of results: ((juxt a b) x) is [(a x) (b x)]."
-  [& fs]
-  (fn* [& args]
-    (mapv (fn* [f] (apply f args)) fs)))
+  [f & fs]
+  (let* [fs (cons f fs)]
+    (fn* [& args]
+      (mapv (fn* [f] (apply f args)) fs))))
 
 (defn vary-meta
   "Returns obj with metadata (apply f (meta obj) args)."
@@ -565,8 +566,8 @@
 (defmacro if-not
   "Evaluates then when test is falsy, else evaluates else (nil when
   absent)."
-  [test then & else]
-  `(if ~test ~(first else) ~then))
+  ([test then] `(if ~test nil ~then))
+  ([test then else] `(if ~test ~else ~then)))
 
 (defmacro while
   "Evaluates body repeatedly while test is truthy. Returns nil."
@@ -777,8 +778,9 @@
 (defn every-pred
   "Returns a function that returns true when every predicate in ps is
   truthy of every one of its arguments, else false."
-  [& ps]
-  (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
+  [p & ps]
+  (let [ps (cons p ps)]
+    (fn [& xs] (every? (fn [p] (every? p xs)) ps))))
 
 (defn memoize
   "Returns a memoized version of f: a function that caches the result
@@ -1315,8 +1317,11 @@
 (defn find-var
   "Returns the Var the qualified symbol sym names, nil when its
   namespace has none; :no-such-namespace when the namespace does not
-  exist."
-  [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
+  exist, :invalid-argument for an unqualified symbol."
+  [sym]
+  (if-let [ns (namespace sym)]
+    (ns-resolve (the-ns (symbol ns)) sym)
+    (nexis.internal/#%raise :invalid-argument (str "find-var takes a qualified symbol, got " sym))))
 
 ; Each form is compiled as read, as a file's form is, and the namespace
 ; in force is restored afterwards, as Clojure's Compiler.load binds *ns*.
