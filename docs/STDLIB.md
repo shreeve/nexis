@@ -3,7 +3,9 @@
 The contract for the parts of the standard library that no kind doc
 owns: the namespaces and how they boot, the core text natives,
 `nexis.string`, `nexis.set`, printing (`src/format.zig`), the I/O
-natives and the documentation `doc` reads (§10). The natives are in
+natives, the documentation `doc` reads (§10), the process and its
+programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
+§12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
 Errors are catchable keywords; a wrong argument count is
@@ -694,9 +696,9 @@ file and line it came from.
 
 `src/stdlib/sys.nx` holds the process's environment and working
 directory, `src/stdlib/shell.nx` Clojure's `clojure.java.shell`, each
-function a docstring'd `defn` over a native in `internal_natives`. `exit` and `*command-line-args*` are
-`nexis.core`'s (§6): `nexis run` and `nexis -e` both bind the
-arguments after the program. Text the operating system hands over is
+function a docstring'd `defn` over a native in `internal_natives`.
+`exit` and `*command-line-args*` are `nexis.core`'s (§6): `nexis run`
+and `nexis -e` both bind the arguments after the program. Text the operating system hands over is
 any bytes; each byte that starts no well-formed UTF-8 sequence reads
 as U+FFFD, as Java decodes it.
 

@@ -105,9 +105,11 @@ as unresolved symbols. Each has a nexis spelling:
 | `(.toUpperCase s)`, `(.contains s "x")` | `(str/upper-case s)`, `(str/includes? s "x")` |
 | `(throw (Exception. "boom"))` | `(throw (ex-info "boom" {}))`, or throw any value (§3.3) |
 | `(instance? String x)`, `(instance? Long x)` | `(string? x)`, `(int? x)`; `(class x)` is a keyword such as `:string` |
-| `(System/currentTimeMillis)`, `(System/nanoTime)` | `(nano-time)`, a monotonic clock in nanoseconds |
+| `(System/currentTimeMillis)`, `(System/nanoTime)` | `(inst-ms (nexis.time/now))`; `(nano-time)`, a monotonic clock in nanoseconds |
 | `(System/exit 1)` | `(exit 1)` |
-| `#inst`, `#uuid`, `java.util.UUID` | no tagged literals; `(random-uuid)` and `(parse-uuid s)` work on the UUID's string |
+| `(System/getenv "HOME")`, `(System/getenv)` | `(nexis.sys/getenv "HOME")`, `(nexis.sys/getenv)` |
+| `java.time.Instant`, `java.util.Date` | `nexis.time`: `(now)`, `(parse "2026-10-09T12:30Z")`, `(format inst)`, durations in milliseconds; `inst?` and `inst-ms` take its Instant |
+| `#inst`, `#uuid`, `java.util.UUID` | no tagged literals: `(nexis.time/parse s)` for an instant; `(random-uuid)` and `(parse-uuid s)` work on the UUID's string |
 | `(long-array n)`, `aget`, `aset` | immutable typed vectors: `(i64-vector xs)`, `(f64-vector xs)` |
 
 `class` and `type` return a kind keyword (`:vector`, `:fixnum`,
@@ -212,7 +214,8 @@ recursive call that should follow redefinition.
 String functions live in `nexis.string`, which is Clojure's
 `clojure.string`: requiring `clojure.string` gives the same Vars under
 that name, and so do `clojure.set`, `clojure.walk`, `clojure.edn`,
-`clojure.math`, `clojure.test` and `clojure.pprint`. Any library
+`clojure.math`, `clojure.test`, `clojure.pprint`, `clojure.java.shell`
+and `clojure.data.json`. Any library
 namespace can be called qualified without a `require`
 (`(nexis.string/join ", " xs)`); the `clojure.*` names exist once
 required.
@@ -275,6 +278,10 @@ without a file; call them qualified, or `require` them for an alias.
 | `nexis.math` | `clojure.math` | `sqrt`, `pow`, `sin`, `log`, `floor`, `ceil`, `round`, `PI`, `E`, ... |
 | `nexis.test` | `clojure.test` | `deftest`, `is`, `are`, `testing`, `run-tests`, fixtures |
 | `nexis.pprint` | `clojure.pprint` | `pprint`, `pprint-str` |
+| `nexis.json` | `clojure.data.json` | `read-str`, `write-str`, `read`, `write`; keywords keep their namespace when written |
+| `nexis.shell` | `clojure.java.shell` | `sh`, which returns `{:exit :out :err}`, `with-sh-dir`, `with-sh-env` |
+| `nexis.sys` | | `getenv`, `cwd`; `exit` and `*command-line-args*` are core's |
+| `nexis.time` | | instants: `now`, `instant`, `parse`, `format`, `plus`, `minus`, `between`, durations in milliseconds |
 | `nexis.simd` | | kernels over typed vectors: `sum`, `dot`, `scale`, `map` |
 | `db` | | durable refs (§5) |
 | `nextomic` | | the database (§6); required as `[nextomic :as d]` by convention |

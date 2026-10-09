@@ -194,7 +194,7 @@ are the map for someone who knows Clojure.
 | String escapes | `\b \f`, octal, `\uHHHH` | `\n \t \r \\ \" \uHHHH \u{HEX}` | a narrow set; `\u{HEX}` names any scalar in one escape (§23 #26) |
 | `#:ns{:a 1}`, `::k` | namespaced map, auto-resolved keyword | parse error | no current namespace at read time |
 | `#?(...)` | reader conditional | parse error | one target (PLAN §4) |
-| `#inst`, `#uuid` | tagged literals | parse error | PLAN §4, §24 #3 |
+| `#inst`, `#uuid` | tagged literals | parse error; `nexis.time/parse` reads an instant's text | PLAN §4, §24 #3 |
 | `#"re"` | a `Pattern` | a pattern, compiled when the source is read; a construct that needs backtracking is `:invalid-regex` | a linear-time engine (`docs/REGEX.md`) |
 | `#=(...)`, `#<...>`, `#^{...}` | read-eval, unreadable, old metadata | parse error | no read-time evaluation; one `^` spelling |
 | `#!` | a comment to end of line | the CLI treats a first line starting `#!` as a comment; elsewhere a parse error | executable scripts only |
@@ -250,6 +250,10 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | the ambiguity message's pair | `PersistentHashMap` order | the method table's: insertion order to eight entries, CHAMP order past them, so the two keys named can be in the other order | `docs/STDLIB.md` §9.4 |
 | namespaces | `Namespace` objects | their name symbols: `(the-ns 'user)` and `*ns*` in `user` are `user`; `ns-publics` and `resolve` return Vars as Clojure's do, and a host macro resolves to nil; a `binding` of `*ns*` does not change where `eval` compiles | `docs/STDLIB.md` §8 |
 | `(random-uuid)`, `(parse-uuid s)` | a `java.util.UUID`, printed `#uuid "..."` | the canonical lowercase string; `uuid?` is true of a string in that form | `docs/STDLIB.md` §8 |
+| `(System/getenv)`, `(System/getenv name)` | static methods | `nexis.sys/getenv`; bytes that are not UTF-8 read as U+FFFD | `docs/STDLIB.md` §11 |
+| `clojure.java.shell/sh` | `:in` a string, bytes, a stream, a reader or a file; `:in-enc`, `:out-enc` (`:bytes`) | `nexis.shell/sh`, also required as `clojure.java.shell`: `:in` a string, no encodings (`:invalid-argument`); a signal's `:exit` is 128 plus its number, as Java's | `docs/STDLIB.md` §11 |
+| instants | `java.util.Date` and `java.time.Instant` extend `Inst`, printed `#inst "..."` | `nexis.time.Instant`, a record of epoch milliseconds that extends `Inst`, printed `#nexis.time.Instant{:ms n}`; `nexis.time` parses and formats ISO-8601 in UTC; an Instant is not `compare`-able | `docs/STDLIB.md` §8, §12 |
+| `clojure.data.json` | keys and keyword values written by `name`; non-ASCII and `/` escaped by default; unknown options ignored | `nexis.json`, also required as `clojure.data.json`: a keyword written whole (`"person/name"`); nothing escaped past JSON's need unless `:escape-unicode` or `:escape-slash`; an unknown option is `:invalid-argument`; an Instant written as its ISO-8601 text; malformed text is `{:error :json-error :message :line :column}` | `docs/STDLIB.md` §13 |
 | `(map-entry? [:a 1])` | false: a map entry is a `MapEntry` | true: a map's entries are two-element vectors | `docs/STDLIB.md` §8 |
 | `(float x)` | a 32-bit float | the f64 itself, after Java's range check | `docs/SEMANTICS.md` §2.2 |
 | `tap>` | taps run on another thread | taps run before `tap>` returns | `docs/STDLIB.md` §8 |
