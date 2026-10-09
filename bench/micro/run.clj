@@ -5,7 +5,8 @@
 ;; bin/nexis side by side.
 ;;
 ;;   bb bench/micro/run.clj [--rounds 5] [--programs count,fib,...]
-;;                          [--out FILE.json] BIN [BIN...]
+;;                          [--counter time|perf] [--events E,...]
+;;                          [--pin CPU] [--out FILE.json] BIN [BIN...]
 ;;
 ;; Every program runs at two sizes; its cost per unit is
 ;; (I(hi) - I(lo)) / units, so startup, compilation and the printing
@@ -16,9 +17,13 @@
 ;; median over the rounds of each round's pair, with the range. The
 ;; callback programs also print their cost less cbbase's, the setup
 ;; they share, when cbbase runs too. Counters come from `/usr/bin/time
-;; -l` (macOS only). Run it under the machine's core queue and keep the
-;; load average beside the numbers: it prints the load at the start and
-;; the end. --out writes every run's counters as JSON.
+;; -l` on macOS (--counter time, the default) or from `perf stat` on
+;; Linux (--counter perf), whose --events, comma-separated, are counted
+;; too and printed per unit after the instructions and cycles; --pin
+;; runs each process on one CPU with taskset (Linux). Run it under the machine's
+;; core queue and keep the load average beside the numbers: it prints
+;; the load at the start and the end. --out writes every run's counters
+;; as JSON.
 
 (require '[babashka.fs :as fs]
          '[babashka.process :as p]
@@ -50,40 +55,89 @@
     "afib" (* 2 (- (fib-calls hi) (fib-calls lo)))
     (- hi lo)))
 
+(def perf-events
+  "perf's events by default: those of a hybrid Intel core's P-cores."
+  "cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/br_misp_retired.indirect/u,cpu_core/ld_blocks.store_forward/u")
+
 (defn parse-args [args]
-  (loop [o {:rounds 5 :programs (keys programs) :bins []} [a & more] args]
+  (loop [o {:rounds 5 :programs (keys programs) :bins [] :counter "time" :events perf-events} [a & more] args]
     (case a
       nil o
       "--rounds" (recur (assoc o :rounds (parse-long (first more))) (rest more))
       "--programs" (recur (assoc o :programs (str/split (first more) #",")) (rest more))
+      "--counter" (recur (assoc o :counter (first more)) (rest more))
+      "--events" (recur (assoc o :events (first more)) (rest more))
+      "--pin" (recur (assoc o :pin (first more)) (rest more))
       "--out" (recur (assoc o :out (first more)) (rest more))
       (recur (update o :bins conj a) more))))
 
 (def opts (parse-args *command-line-args*))
-(when (or (empty? (:bins opts)) (not= "Mac OS X" (System/getProperty "os.name")))
+(def os (case (System/getProperty "os.name") "Mac OS X" "time" "Linux" "perf" nil))
+(when (or (empty? (:bins opts)) (not= os (:counter opts)))
   (binding [*out* *err*]
-    (println "usage: bb bench/micro/run.clj [--rounds N] [--programs a,b] [--out FILE.json] BIN [BIN...]  (macOS)"))
+    (println "usage: bb bench/micro/run.clj [--rounds N] [--programs a,b] [--counter time|perf] [--events E,...] [--pin CPU] [--out FILE.json] BIN [BIN...]")
+    (println "  --counter time (the default) runs on macOS, --counter perf on Linux"))
   (System/exit 2))
 (when-let [bad (seq (remove programs (:programs opts)))]
   (binding [*out* *err*] (println "unknown programs:" (str/join "," bad) "; known:" (str/join "," (keys programs))))
   (System/exit 2))
 
-(defn load-avg [] (str/trim (:out (p/sh "sysctl" "-n" "vm.loadavg"))))
+(defn load-avg []
+  (str/trim (if (= os "time")
+              (:out (p/sh "sysctl" "-n" "vm.loadavg"))
+              ;; slurp reads nothing from /proc.
+              (str/join " " (take 3 (str/split (:out (p/sh "cat" "/proc/loadavg")) #" "))))))
 
 (defn counter [err label]
   (some-> (re-find (re-pattern (str "(\\d+)\\s+" label)) err) second parse-long))
 
+(def events (when (= "perf" (:counter opts)) (str/split (:events opts) #",")))
+
+(defn event-name
+  "An event's column name: without its PMU and modifiers."
+  [e]
+  (-> e (str/replace #"^[a-z_]+/" "") (str/replace #"[/:][a-z]*$" "")))
+
+(def extra-events
+  "The events printed after the instructions and cycles."
+  (remove #{"instructions" "cycles"} (map event-name events)))
+
+(defn read-perf
+  "perf stat -x, output: each event's count by its column name."
+  [text]
+  (into {} (for [line (str/split-lines text)
+                 :let [[v _ e] (str/split line #",")]
+                 :when (and e (not (str/starts-with? line "#")))]
+             [(event-name e) (parse-long v)])))
+
+(def tmp (str (fs/create-temp-dir {:prefix "micro-"})))
+
+(defn command [bin prog size]
+  (let [run [bin "run" (str here "/" prog ".nx") (str size)]
+        pin (if-let [cpu (:pin opts)] ["taskset" "-c" cpu] [])]
+    (if (= os "time")
+      (concat pin ["/usr/bin/time" "-l"] run)
+      (concat ["/usr/bin/time" "-f" "%M" "-o" (str tmp "/rss")] pin
+              ["perf" "stat" "-x," "-e" (:events opts) "-o" (str tmp "/perf")] run))))
+
 (defn run-one [bin prog size]
   (let [t0 (System/nanoTime)
-        r (p/sh "/usr/bin/time" "-l" bin "run" (str here "/" prog ".nx") (str size))
+        r (apply p/sh (command bin prog size))
         wall (- (System/nanoTime) t0)]
     (when-not (zero? (:exit r))
       (throw (ex-info (str bin " " prog " " size " exited " (:exit r) ": " (:err r)) {})))
-    {:ins (counter (:err r) "instructions retired")
-     :cyc (counter (:err r) "cycles elapsed")
-     :rss (counter (:err r) "maximum resident set size")
-     :wall wall
-     :out (str/trim (:out r))}))
+    (merge
+     {:wall wall :out (str/trim (:out r))}
+     (if (= os "time")
+       {:ins (counter (:err r) "instructions retired")
+        :cyc (counter (:err r) "cycles elapsed")
+        :rss (counter (:err r) "maximum resident set size")}
+       (let [c (read-perf (slurp (str tmp "/perf")))]
+         {:ins (c "instructions")
+          :cyc (c "cycles")
+          ;; GNU time's %M is in KiB.
+          :rss (* 1024 (parse-long (str/trim (last (str/split-lines (slurp (str tmp "/rss")))))))
+          :events (select-keys c extra-events)})))))
 
 (defn median [xs] (let [s (vec (sort xs)) n (count s)]
                     (if (odd? n) (s (quot n 2)) (/ (+ (s (dec (quot n 2))) (s (quot n 2))) 2.0))))
@@ -117,20 +171,27 @@
         :when (not= 1 (count answers))]
   (println (str "answers differ: " prog " " size " " (pr-str answers))))
 (println (str "rounds " (:rounds opts) "; load at start " load-start ", at end " load-end))
-(println "| binary | program | units | instructions / unit | cycles / unit | wall at hi (median) | max RSS at hi |")
-(println "|---|---|---:|---:|---:|---:|---:|")
+(defn fmt-small [xs] (format "%.3f [%.3f-%.3f]" (double (median xs)) (double (apply min xs)) (double (apply max xs))))
+
+(println (str "| binary | program | units | instructions / unit | cycles / unit | "
+              (str/join (map #(str % " / unit | ") extra-events))
+              "wall at hi (median) | max RSS at hi |"))
+(println (str "|---|---|---:|---:|---:|" (str/join (repeat (count extra-events) "---:|")) "---:|---:|"))
 (doseq [b (:bins opts) prog (:programs opts)]
   (let [[lo hi] (programs prog)
         his (results [b prog hi])
-        row (fn [name ins cyc]
-              (println (format "| %s | %s | %d | %s | %s | %.2f ms | %.1f MB |" (label b) name (units prog lo hi)
+        metrics (concat [:ins :cyc] (map (fn [e] #(get-in % [:events e])) extra-events))
+        row (fn [name [ins cyc & more]]
+              (println (format "| %s | %s | %d | %s | %s | %s%.2f ms | %.1f MB |" (label b) name (units prog lo hi)
                                (fmt-range ins) (fmt-range cyc)
+                               (str/join (map #(str (fmt-small %) " | ") more))
                                (/ (median (map :wall his)) 1e6) (/ (apply max (map :rss his)) 1e6))))]
-    (row prog (per-unit b prog :ins) (per-unit b prog :cyc))
+    (row prog (map #(per-unit b prog %) metrics))
     (when (and (callback-programs prog) (some #{"cbbase"} (:programs opts)))
       (row (str prog " - cbbase")
-           (mapv - (per-unit b prog :ins) (per-unit b "cbbase" :ins))
-           (mapv - (per-unit b prog :cyc) (per-unit b "cbbase" :cyc))))))
+           (map #(mapv - (per-unit b prog %) (per-unit b "cbbase" %)) metrics)))))
+
+(fs/delete-tree tmp)
 
 (when-let [out (:out opts)]
   (spit out (json/generate-string

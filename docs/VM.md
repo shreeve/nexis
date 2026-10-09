@@ -556,7 +556,11 @@ that instruction's handler (`@call(.always_tail, ...)`), so an
 instruction costs one indirect branch and the native stack does not
 grow with the instructions run. A handler is called with the VM, the
 frame, the instruction and `pc`, the index of the instruction after
-it, which stays in a register from handler to handler.
+it, which stays in a register from handler to handler, and returns a
+status word, an `enum(u16)`: `ok` when the chain ends with no error,
+else the number of the `VmError` it ends with, which the loop turns
+back into the error. An error union cannot be the return type of a
+calling convention but Zig's `.auto`.
 
 ```
 fetch at pc (every handler's last step):
@@ -618,11 +622,23 @@ instruction.
   `zig build codegen` holds the rule: it disassembles the arm64 and
   x86-64 release builds and fails when a fast handler (`vm.VM.fast*`)
   calls anything or, on arm64, names the stack pointer
-  (`test/codegen.sh`, with an LLVM objdump). On x86-64, whose System
-  V convention leaves a handler nine scratch registers, four of them
-  its arguments, the comparisons, the arithmetic and `call:call` save
-  one to six registers with `push` and `pop`; no handler there may
-  reserve or address stack, and the check lists what each saves.
+  (`test/codegen.sh`, with an LLVM objdump). On x86-64 every handler
+  and out-of-line part takes the `preserve_none` calling convention
+  (`x86_64_preserve_none`), under which every general register but
+  rsp and rbp is the caller's to save: System V's would leave a
+  handler nine scratch registers, four of them its arguments, and
+  make `call:call`, the comparisons and the arithmetic save up to six
+  with `push` and `pop`. A handler keeps what it needs without saving
+  its caller's, and a part out of line keeps its own across a
+  native's call in the registers System V has the native save. The
+  check fails on any `push` or `pop` there but rbp's, which only a
+  handler using all fifteen registers would save, and on any
+  reservation or address of stack, and lists what each saves. On
+  arm64, whose AAPCS64 leaves eighteen scratch registers, the
+  handlers take Zig's `.auto`. The chain's entries, `loop`'s passes
+  and a `Callback`'s call, are ordinary calls, which save what they
+  keep across the chain once a pass. The check also lists, for
+  information, what the out-of-line parts save.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns (a
   `Callback` makes the first pass itself, §6). It enters the chain at

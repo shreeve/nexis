@@ -3375,10 +3375,11 @@ pub const VM = struct {
         }
         if (self.gcDue()) self.collectGarbage();
         if (counting) opcode_counts[opIndex(cb.first)] += 1;
-        cb.first_handler(self, frame, cb.first, 1) catch |err| {
-            try self.settle(err);
+        const status = cb.first_handler(self, frame, cb.first, 1);
+        if (status != .ok) {
+            try self.settle(status.err());
             try self.drive();
-        };
+        }
     }
 
     /// A prepared call's locals, nil: the usual handful in one run,
@@ -3768,7 +3769,10 @@ pub const VM = struct {
 
     /// `loop`'s passes through the chain, at the depth it set.
     fn drive(self: *VM) VmError!void {
-        while (self.running()) opEnter(self, self.currentFrame(), undefined, undefined) catch |err| try self.settle(err);
+        while (self.running()) {
+            const status = opEnter(self, self.currentFrame(), undefined, undefined);
+            if (status != .ok) try self.settle(status.err());
+        }
     }
 
     /// What ends a pass with `err`: the throw a handler takes it as, or
@@ -4304,7 +4308,8 @@ pub const VM = struct {
     // leave the chain: with an error, which `loop` translates or
     // passes on, or once `running` says the loop's frame has returned.
     // Every handler has the one signature `@call(.always_tail, ...)`
-    // requires of caller and callee.
+    // requires of caller and callee, and returns a `Status`, the
+    // error it leaves with as a word, not an error union.
     //
     // Two tables. `op_table` holds every opcode's general handler,
     // which takes every case and raises every trap. `fast_table` is
@@ -4317,7 +4322,37 @@ pub const VM = struct {
     // back into the fast one.
     // -------------------------------------------------------------------------
 
-    const OpHandler = *const fn (*VM, *Frame, Inst, usize) VmError!void;
+    const OpHandler = *const fn (*VM, *Frame, Inst, usize) callconv(handler_cc) Status;
+
+    /// Every handler's calling convention (§8). On x86-64,
+    /// `preserve_none`, under which no general register but the stack
+    /// and frame pointers is the callee's to save: a handler keeps
+    /// what it needs past System V's nine scratch registers without
+    /// saving the caller's first, and a part out of line keeps its own
+    /// across a native's call in the registers the native saves. On
+    /// arm64 every handler fits AAPCS64's scratch registers.
+    const handler_cc: std.lang.CallingConvention = if (builtin.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
+
+    /// What a handler returns: `ok` when the chain ends with no error,
+    /// else the error it ends with, by its number. Its own type rather
+    /// than `VmError!void`, which a calling convention but `.auto` does
+    /// not allow; it comes back in the register an error union's error
+    /// would.
+    const Status = enum(@Int(.unsigned, @bitSizeOf(anyerror))) {
+        ok = 0,
+        _,
+
+        /// The chain ends with `e`.
+        inline fn of(e: VmError) Status {
+            return @fromBackingInt(@intFromError(e));
+        }
+
+        /// The error a chain that did not end `ok` ended with.
+        fn err(status: Status) VmError {
+            std.debug.assert(status != .ok);
+            return @errorCast(@errorFromInt(@backingInt(status)));
+        }
+    };
 
     /// An instruction's index into the tables: its group and variant
     /// bits, `group | variant << 6`.
@@ -4440,14 +4475,14 @@ pub const VM = struct {
 
     /// Fetch the instruction at `frame.pc` and tail-call its handler:
     /// the fetch of a handler that worked on `frame.pc` (§8).
-    inline fn next(self: *VM, frame: *Frame) VmError!void {
+    inline fn next(self: *VM, frame: *Frame) Status {
         return self.nextAt(frame, frame.pc);
     }
 
     /// Fetch the instruction at `pc` and tail-call its handler with
     /// the pc after it. The frame's `pc` is written only on the way out
     /// with an error, so the trace names the instruction as §13 says.
-    inline fn nextAt(self: *VM, frame: *Frame, pc: usize) VmError!void {
+    inline fn nextAt(self: *VM, frame: *Frame, pc: usize) Status {
         const inst = frame.routine.code[pc];
         std.debug.assert(inst.kind == .primary);
         if (counting) opcode_counts[opIndex(inst)] += 1;
@@ -4456,19 +4491,19 @@ pub const VM = struct {
 
     /// `next` after an instruction that could allocate: the safe
     /// point (§9).
-    inline fn nextSafe(self: *VM, frame: *Frame) VmError!void {
+    inline fn nextSafe(self: *VM, frame: *Frame) Status {
         return self.nextSafeAt(frame, frame.pc);
     }
 
-    inline fn nextSafeAt(self: *VM, frame: *Frame, pc: usize) VmError!void {
+    inline fn nextSafeAt(self: *VM, frame: *Frame, pc: usize) Status {
         if (self.gcDue()) self.collectGarbage();
         return self.nextAt(frame, pc);
     }
 
     /// `next` after an instruction that could pop or unwind frames or
     /// halt: the chain ends when the loop's frame has returned.
-    inline fn nextFrame(self: *VM) VmError!void {
-        if (!self.running()) return;
+    inline fn nextFrame(self: *VM) Status {
+        if (!self.running()) return .ok;
         if (self.gcDue()) self.collectGarbage();
         return self.next(self.currentFrame());
     }
@@ -4489,32 +4524,32 @@ pub const VM = struct {
 
     /// A fast handler's way out: `inst`'s general handler, which takes
     /// the case from the start.
-    inline fn general(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    inline fn general(self: *VM, frame: *Frame, inst: Inst, pc: usize) Status {
         return @call(.always_tail, op_table[opIndex(inst)], .{ self, frame, inst, pc });
     }
 
     /// Where `loop` enters the chain: a safe point, then the current
     /// frame's next instruction.
-    fn opEnter(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
+    fn opEnter(self: *VM, frame: *Frame, _: Inst, _: usize) callconv(handler_cc) Status {
         return self.nextSafe(frame);
     }
 
     /// A quickened instruction past its fast handler's case: its base
     /// opcode's general handler, which reads the same operands (§10.10).
-    fn opQuickened(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opQuickened(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         var base = inst;
         base.variant = @truncate(Routine.baseOp(opIndex(inst)) >> 6);
         return @call(.always_tail, op_table[opIndex(base)], .{ self, frame, base, pc });
     }
 
-    fn opCorrupt(_: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+    fn opCorrupt(_: *VM, frame: *Frame, _: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        return VmError.BytecodeCorruption;
+        return .of(VmError.BytecodeCorruption);
     }
 
-    fn opUnimplemented(_: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+    fn opUnimplemented(_: *VM, frame: *Frame, _: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        return VmError.UnimplementedOpcode;
+        return .of(VmError.UnimplementedOpcode);
     }
 
     // The group handlers. `mov`, `cmp`, `jump` and `var` neither
@@ -4523,53 +4558,54 @@ pub const VM = struct {
     // and `coll` allocate on the heap only; `call` and `ctrl` may
     // change the frame chain.
 
-    fn opVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execVar(frame, inst);
+        self.execVar(frame, inst) catch |e| return .of(e);
         return self.next(frame);
     }
 
-    fn opMath(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opMath(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execMath(frame, inst);
+        self.execMath(frame, inst) catch |e| return .of(e);
         return self.nextSafe(frame);
     }
 
-    fn opClosure(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opClosure(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execClosure(inst);
+        self.execClosure(inst) catch |e| return .of(e);
         return self.nextSafe(frame);
     }
 
-    fn opColl(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opColl(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execColl(inst);
+        self.execColl(inst) catch |e| return .of(e);
         // Hashing a lazy key realizes it, which may grow the frames.
         return self.nextSafe(self.currentFrame());
     }
 
-    fn opCtrl(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opCtrl(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execCtrl(inst);
+        self.execCtrl(inst) catch |e| return .of(e);
         return self.nextFrame();
     }
 
     // The general handlers of the hot variants: the same effect and
     // traps as their group's, without its switch.
 
-    fn opMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
         var tmp: Value = undefined;
-        try self.storeIn(frame, inst.a, (try self.operandPtr(frame, inst.b, &tmp)).*);
+        const src = self.operandPtr(frame, inst.b, &tmp) catch |e| return .of(e);
+        self.storeIn(frame, inst.a, src.*) catch |e| return .of(e);
         return self.next(frame);
     }
 
     /// The value is read before B is cleared, so A = B is a move.
-    fn opMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        if (inst.a.kind != .slot or inst.b.kind != .slot) return VmError.InvalidOperandKind;
-        const dst = try self.slotPtrIn(frame, inst.a.index);
-        const src = try self.slotPtrIn(frame, inst.b.index);
+        if (inst.a.kind != .slot or inst.b.kind != .slot) return .of(VmError.InvalidOperandKind);
+        const dst = self.slotPtrIn(frame, inst.a.index) catch |e| return .of(e);
+        const src = self.slotPtrIn(frame, inst.b.index) catch |e| return .of(e);
         const v = src.*;
         src.* = value_mod.nilValue();
         dst.* = v;
@@ -4579,52 +4615,54 @@ pub const VM = struct {
     /// `mov:load-nil`, `mov:load-true`, `mov:load-false`.
     fn loadHandler(comptime v: Value) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
                 frame.pc = @intCast(pc);
-                try self.storeIn(frame, inst.a, v);
+                self.storeIn(frame, inst.a, v) catch |e| return .of(e);
                 return self.next(frame);
             }
         }.run;
     }
 
-    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
         const consts = frame.routine.consts;
         const i = inst.wide();
-        if (i >= consts.len) return VmError.OperandOutOfRange;
-        try self.storeIn(frame, inst.a, consts[i]);
+        if (i >= consts.len) return .of(VmError.OperandOutOfRange);
+        self.storeIn(frame, inst.a, consts[i]) catch |e| return .of(e);
         return self.next(frame);
     }
 
-    fn opJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try applyJump(frame, inst.wide());
+        applyJump(frame, inst.wide()) catch |e| return .of(e);
         return self.next(frame);
     }
 
-    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
-        frame.pc = @intCast(pc);
-        var tmp: Value = undefined;
-        if ((try self.operandPtr(frame, inst.a, &tmp)).isFalsy()) try applyJump(frame, inst.wide());
-        return self.next(frame);
-    }
-
-    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opIfFalse(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
         var tmp: Value = undefined;
-        if ((try self.operandPtr(frame, inst.a, &tmp)).isTruthy()) try applyJump(frame, inst.wide());
+        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
+        if (v.isFalsy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
         return self.next(frame);
     }
 
-    fn opGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opIfTrue(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execClosureGetCell(frame, inst);
+        var tmp: Value = undefined;
+        const v = self.operandPtr(frame, inst.a, &tmp) catch |e| return .of(e);
+        if (v.isTruthy()) applyJump(frame, inst.wide()) catch |e| return .of(e);
         return self.next(frame);
     }
 
-    fn opLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execVarLoadVar(frame, inst);
+        self.execClosureGetCell(frame, inst) catch |e| return .of(e);
+        return self.next(frame);
+    }
+
+    fn opLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
+        frame.pc = @intCast(pc);
+        self.execVarLoadVar(frame, inst) catch |e| return .of(e);
         return self.next(frame);
     }
 
@@ -4663,14 +4701,14 @@ pub const VM = struct {
     /// running the two in turn leaves.
     fn cmpHandler(comptime c: NumCmp) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
                 frame.pc = @intCast(pc);
                 var lhs_tmp: Value = undefined;
                 var rhs_tmp: Value = undefined;
-                const lhs = try self.operandPtr(frame, inst.b, &lhs_tmp);
-                const rhs = try self.operandPtr(frame, inst.c, &rhs_tmp);
-                const holds_ = try self.compareNumbers(c, lhs.*, rhs.*);
-                try self.storeIn(frame, inst.a, value_mod.fromBool(holds_));
+                const lhs = self.operandPtr(frame, inst.b, &lhs_tmp) catch |e| return .of(e);
+                const rhs = self.operandPtr(frame, inst.c, &rhs_tmp) catch |e| return .of(e);
+                const holds_ = self.compareNumbers(c, lhs.*, rhs.*) catch |e| return .of(e);
+                self.storeIn(frame, inst.a, value_mod.fromBool(holds_)) catch |e| return .of(e);
                 const code = frame.routine.code;
                 if (frame.pc < code.len) {
                     const j = code[frame.pc];
@@ -4682,7 +4720,7 @@ pub const VM = struct {
                     else
                         return self.next(frame);
                     frame.pc += 1;
-                    if (taken) try applyJump(frame, j.wide());
+                    if (taken) applyJump(frame, j.wide()) catch |e| return .of(e);
                 }
                 return self.next(frame);
             }
@@ -4691,9 +4729,9 @@ pub const VM = struct {
 
     /// `call:call` past the fast handler's cases, through the general
     /// entry of §6 with its traps.
-    fn opCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.execCallCall(frame, inst);
+        self.execCallCall(frame, inst) catch |e| return .of(e);
         // A call pushes a frame or runs a callee to completion, so the
         // loop's frame is still running.
         return self.nextSafe(self.currentFrame());
@@ -4702,59 +4740,60 @@ pub const VM = struct {
     /// `call:self` past the fast handler's case, through the closure
     /// entry of §6 with its traps, which picks the member the count
     /// names.
-    fn opCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
         // Only a closure's frame runs one: a top-level routine's has
         // no closure to call.
-        if (frame.closure.kind() != .function) return VmError.BytecodeCorruption;
+        if (frame.closure.kind() != .function) return .of(VmError.BytecodeCorruption);
         const base = @as(usize, frame.base_slot) + inst.a.index;
-        try self.enterClosure(frame.closure, base, inst.b.index, self.stack.items.len, .{ .return_dst = inst.c.index });
+        self.enterClosure(frame.closure, base, inst.b.index, self.stack.items.len, .{ .return_dst = inst.c.index }) catch |e| return .of(e);
         return self.nextSafe(self.currentFrame());
     }
 
     /// `call:lookup` and `call:lookup-or` past the in-place cases: the
     /// key called on the target, with the default, as `call:call` calls
     /// it (§6), the same function with the same errors.
-    fn opLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        const key = try self.resolveIn(frame, inst.c);
+        const key = self.resolveIn(frame, inst.c) catch |e| return .of(e);
         var args: [2]Value = undefined;
         var argc: usize = 1;
         if (inst.variant == @backingInt(Call.lookup_or)) {
-            if (inst.b.kind != .slot) return VmError.InvalidOperandKind;
+            if (inst.b.kind != .slot) return .of(VmError.InvalidOperandKind);
             const at = @as(usize, inst.b.index);
-            if (at + 2 > frame.routine.slot_count) return VmError.OperandOutOfRange;
+            if (at + 2 > frame.routine.slot_count) return .of(VmError.OperandOutOfRange);
             args = .{ self.slotAt(frame, at).*, self.slotAt(frame, at + 1).* };
             argc = 2;
-        } else args[0] = try self.resolveIn(frame, inst.b);
+        } else args[0] = self.resolveIn(frame, inst.b) catch |e| return .of(e);
         // A target read from a Var or a cell is held only here while a
         // sorted collection's comparator runs. The scope is released
         // before the chain goes on, not by a `defer`, which would run
         // only once the tail call returned.
         const scope = self.rootScope();
-        try scope.push(args[0]);
+        scope.push(args[0]) catch |e| return .of(e);
         const result = self.callDirect(key, args[0..argc]);
         scope.release();
-        const value = try result;
+        const value = result catch |e| return .of(e);
         // A comparator may have grown `frames`.
         const caller = self.currentFrame();
-        try self.storeIn(caller, inst.a, value);
+        self.storeIn(caller, inst.a, value) catch |e| return .of(e);
         return self.nextSafe(caller);
     }
 
-    fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn opReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
         // Read the value while the callee frame is still active;
         // popping first would invalidate the slot.
-        try self.returnValue(try self.resolveIn(frame, inst.a));
-        if (!self.running()) return;
+        const v = self.resolveIn(frame, inst.a) catch |e| return .of(e);
+        self.returnValue(v) catch |e| return .of(e);
+        if (!self.running()) return .ok;
         return self.next(self.currentFrame());
     }
 
-    fn opReturnNil(self: *VM, frame: *Frame, _: Inst, pc: usize) VmError!void {
+    fn opReturnNil(self: *VM, frame: *Frame, _: Inst, pc: usize) callconv(handler_cc) Status {
         frame.pc = @intCast(pc);
-        try self.returnValue(value_mod.nilValue());
-        if (!self.running()) return;
+        self.returnValue(value_mod.nilValue()) catch |e| return .of(e);
+        if (!self.running()) return .ok;
         return self.next(self.currentFrame());
     }
 
@@ -4767,7 +4806,7 @@ pub const VM = struct {
     // pushed or a native called, where a return or an error trace
     // reads it.
 
-    fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastMove(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const dst = self.verifiedSlot(frame, inst.a);
         const v = self.fastOperand(frame, inst.b);
         if (!v.ok) return self.general(frame, inst, pc);
@@ -4775,21 +4814,21 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastLoadConst(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         copyWords(self.verifiedSlot(frame, inst.a), &frame.routine.consts[inst.wide()]);
         return self.nextAt(frame, pc);
     }
 
     fn fastLoad(comptime v: Value) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 self.verifiedSlot(frame, inst.a).* = v;
                 return self.nextAt(frame, pc);
             }
         }.run;
     }
 
-    fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastJmp(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         _ = pc;
         return self.nextAt(frame, inst.wide());
     }
@@ -4797,7 +4836,7 @@ pub const VM = struct {
     /// `jump:if-true` (`when`) and `jump:if-false`.
     fn fastBranch(comptime when: bool) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const v = self.fastOperand(frame, inst.a);
                 if (!v.ok) return self.general(frame, inst, pc);
                 return self.nextAt(frame, if (loadWords(v.ptr).isTruthy() == when) inst.wide() else pc);
@@ -4809,7 +4848,7 @@ pub const VM = struct {
     /// it.
     fn fastCmp(comptime c: NumCmp) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const dst = self.verifiedSlot(frame, inst.a);
                 const lhs = self.fastOperand(frame, inst.b);
                 if (!lhs.ok) return self.general(frame, inst, pc);
@@ -4834,7 +4873,7 @@ pub const VM = struct {
     /// `math:<op>` of two fixnums whose result is a fixnum.
     fn fastMath(comptime op: Math) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const dst = self.verifiedSlot(frame, inst.a);
                 const lhs = self.fastOperand(frame, inst.b);
                 if (!lhs.ok) return self.general(frame, inst, pc);
@@ -4866,7 +4905,7 @@ pub const VM = struct {
     /// with no kind to decode.
     fn fastMathQuick(comptime op: Math, comptime form: Quick.Form) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const dst = self.verifiedSlot(frame, inst.a);
                 const l = self.quickFixnum(frame, inst.b, form == .fixnum_slot) orelse return self.general(frame, inst, pc);
                 const r = self.quickFixnum(frame, inst.c, form == .slot_fixnum) orelse return self.general(frame, inst, pc);
@@ -4881,7 +4920,7 @@ pub const VM = struct {
     /// looking for it.
     fn fastCmpQuick(comptime c: NumCmp, comptime form: Quick.Form, comptime then: Quick.Then) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const dst = self.verifiedSlot(frame, inst.a);
                 const l = self.quickFixnum(frame, inst.b, false) orelse return self.general(frame, inst, pc);
                 const r = self.quickFixnum(frame, inst.c, form == .slot_fixnum) orelse return self.general(frame, inst, pc);
@@ -4906,7 +4945,7 @@ pub const VM = struct {
     /// run in turn.
     fn fastStep(comptime c: NumCmp, comptime form: Quick.Form, comptime then: Quick.Then) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+            fn run(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
                 const dst = self.verifiedSlot(frame, inst.a);
                 const l = self.quickFixnum(frame, inst.b, false) orelse return self.general(frame, inst, pc);
                 const k = self.quickFixnum(frame, inst.c, true) orelse return self.general(frame, inst, pc);
@@ -4923,7 +4962,7 @@ pub const VM = struct {
         }.run;
     }
 
-    fn fastMoveSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastMoveSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         copyWords(self.verifiedSlot(frame, inst.a), self.verifiedSlot(frame, inst.b));
         return self.nextAt(frame, pc);
     }
@@ -4933,7 +4972,7 @@ pub const VM = struct {
     /// Nil is the all-zero value, so the clear is one store of a pair
     /// of zero words: nothing reads the slot before it is written
     /// again, so no load waits on it (`loadWords`).
-    fn fastMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastMoveClear(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const dst = self.verifiedSlot(frame, inst.a);
         const src = self.verifiedSlot(frame, inst.b);
         const v = loadWords(src);
@@ -4943,7 +4982,7 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastMoveUpvalue(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastMoveUpvalue(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         proved(inst.b.kind == .upvalue and inst.b.index < frame.upvalues.len);
         const cell = frame.upvalues[inst.b.index];
         if (!cell.initialized) return self.general(frame, inst, pc);
@@ -4951,11 +4990,11 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastReturnSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastReturnSlot(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         return self.returnFast(frame, inst, pc, self.verifiedSlot(frame, inst.a));
     }
 
-    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastLoadVar(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const v = frame.routine.var_table[inst.wide()];
         // Through a pointer: a choice between two values is copied
         // through the stack.
@@ -4964,7 +5003,7 @@ pub const VM = struct {
         return self.nextAt(frame, pc);
     }
 
-    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastGetCell(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const cell_v = loadWords(self.verifiedSlot(frame, inst.b));
         if (cell_v.kind() != .cell_internal) return self.general(frame, inst, pc);
         const cell = heap_mod.Heap.bodyOf(UpvalCell, @ptrFromInt(cell_v.payload));
@@ -4978,7 +5017,7 @@ pub const VM = struct {
     /// without allocating, so its callee starts without a safe point.
     /// A native and a keyword or symbol go on to handlers of their own,
     /// out of line: each calls out, and a call needs a stack frame.
-    fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastCall(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const call_base: u32 = inst.a.index;
         const argc: u32 = inst.b.index;
         proved(call_base + 1 + argc <= frame.routine.slot_count);
@@ -5009,7 +5048,7 @@ pub const VM = struct {
     /// proved the count the fixed arity of the frame's routine or of a
     /// member of its table, so the frame is pushed as `fastCall` pushes
     /// a closure's with no callee to read or test.
-    fn fastCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastCallSelf(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const callee = loadWords(&frame.closure);
         if (callee.kind() != .function) return self.general(frame, inst, pc);
         const argc: u32 = inst.b.index;
@@ -5029,7 +5068,7 @@ pub const VM = struct {
     /// `fastCall` of a leaf native within its arity, on its arguments
     /// in place: nothing can grow the stack under a leaf. Any other
     /// native goes on to `callBuffered`.
-    fn callLeaf(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn callLeaf(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
         if (!native.leaf) return @call(out_of_line, callBuffered, .{ self, frame, inst, pc });
         const argc: u32 = inst.b.index;
@@ -5038,7 +5077,7 @@ pub const VM = struct {
         frame.pc = @intCast(pc);
         const result = native.call(self, self.stack.items[base..][0..argc]) catch |err| switch (err) {
             VmError.NeedsReentry => return self.general(frame, inst, pc),
-            else => return err,
+            else => return .of(err),
         };
         countNative(native);
         self.verifiedSlot(frame, inst.c).* = result;
@@ -5049,7 +5088,7 @@ pub const VM = struct {
     /// `max_native_args` arguments, on a copy of them in a buffer on
     /// the native stack: it may re-enter the VM and grow the stack,
     /// whose slots keep them rooted.
-    fn callBuffered(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn callBuffered(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
         const argc: u32 = inst.b.index;
         const max: usize = native.max_arity orelse max_native_args;
@@ -5068,9 +5107,9 @@ pub const VM = struct {
         const overflows = dispatch_mod.spoilCount();
         const result = native.call(self, buf[0..argc]) catch |err| {
             self.dropSpoils(overflows);
-            return err;
+            return .of(err);
         };
-        try self.checkDeepData(overflows);
+        self.checkDeepData(overflows) catch |e| return .of(e);
         // The native may have grown `frames`: the caller is the current
         // frame again, not necessarily at `frame`.
         const caller = self.currentFrame();
@@ -5089,7 +5128,7 @@ pub const VM = struct {
     /// on a map, a record or nil: the lookup `callLookupIn` makes. An
     /// immediate key hashes and compares without the callbacks, so
     /// nothing is allocated and no data is walked.
-    fn callLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn callLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const argc: u32 = inst.b.index;
         if (argc != 1 and argc != 2) return self.general(frame, inst, pc);
         const callee = self.slotAt(frame, inst.a.index).*;
@@ -5104,7 +5143,7 @@ pub const VM = struct {
     /// to `lookupPart`, out of line, since a map's search is a call.
     /// Verification proved the key a keyword or symbol constant and
     /// `call:lookup-or`'s target a slot.
-    fn fastLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastLookup(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         if (!self.fastOperand(frame, inst.b).ok) return self.general(frame, inst, pc);
         return @call(out_of_line, lookupPart, .{ self, frame, inst, pc });
     }
@@ -5112,7 +5151,7 @@ pub const VM = struct {
     /// `fastLookup` of a map, a record or nil: the lookup `callLookupIn`
     /// makes, with no copy and no safe point, since an immediate key
     /// hashes and compares without the callbacks.
-    fn lookupPart(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn lookupPart(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const key = frame.routine.consts[inst.c.index];
         const target = loadWords(self.fastOperand(frame, inst.b).ptr);
         const default = if (inst.variant == @backingInt(Call.lookup_or)) self.slotAt(frame, @as(usize, inst.b.index) + 1).* else value_mod.nilValue();
@@ -5124,13 +5163,13 @@ pub const VM = struct {
     /// `call:return` from any frame but the top-level one: pop it, and
     /// write the caller's slot and continue in the caller, whose `pc`
     /// the call left at its return point, or fill the host's cell.
-    fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastReturn(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         const v = self.fastOperand(frame, inst.a);
         if (!v.ok) return self.general(frame, inst, pc);
         return self.returnFast(frame, inst, pc, v.ptr);
     }
 
-    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) VmError!void {
+    fn fastReturnNil(self: *VM, frame: *Frame, inst: Inst, pc: usize) align(hot_align) linksection(hot_section) callconv(handler_cc) Status {
         return self.returnFast(frame, inst, pc, &nil_value);
     }
 
@@ -5139,7 +5178,7 @@ pub const VM = struct {
     /// The returned value by pointer: the slot it is read from stays
     /// in place while the frame pops, and a value passed by copy goes
     /// through the stack.
-    inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, pc: usize, v: *const Value) VmError!void {
+    inline fn returnFast(self: *VM, frame: *Frame, inst: Inst, pc: usize, v: *const Value) Status {
         const n = self.frames.items.len;
         if (frame.host_result != null or n < 2) {
             @branchHint(.unlikely);
@@ -5155,7 +5194,7 @@ pub const VM = struct {
             // The host runs the loop at the depth it pushed the frame at,
             // so the frame was the loop's.
             std.debug.assert(!self.running());
-            return;
+            return .ok;
         }
         const caller = &self.frames.items[n - 2];
         const dst = frame.return_dst;
@@ -5177,14 +5216,14 @@ pub const VM = struct {
     /// chain as a host's frame does.
     fn batchNext(comptime step: Callback.Batch.Step) OpHandler {
         return &struct {
-            fn run(self: *VM, frame: *Frame, _: Inst, _: usize) VmError!void {
+            fn run(self: *VM, frame: *Frame, _: Inst, _: usize) callconv(handler_cc) Status {
                 const hr = frame.host_result.?;
                 if (!self.batchStep(frame, hr, step)) {
                     hr.done = true;
                     self.stack.items.len = frame.entry_stack_len;
                     self.frames.items.len -= 1;
                     std.debug.assert(!self.running());
-                    return;
+                    return .ok;
                 }
                 const cb: *Callback = @fieldParentPtr("result", hr);
                 if (counting) opcode_counts[opIndex(cb.first)] += 1;
@@ -5195,7 +5234,7 @@ pub const VM = struct {
     }
 
     /// A cycle, then `inst`: a batch's safe point, out of line.
-    fn collectThen(self: *VM, frame: *Frame, inst: Inst, pc: usize) VmError!void {
+    fn collectThen(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         self.collectGarbage();
         return @call(.always_tail, fast_table[opIndex(inst)], .{ self, frame, inst, pc });
     }
@@ -7181,6 +7220,15 @@ test "VM dispatch: fixnum arithmetic that leaves i48 promotes" {
         .{ .name = "a zero divisor", .code = &.{ mod(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
         .{ .name = "a zero quotient divisor", .code = &.{ quot(0, kn(0), kn(1)), asm_.returnSlot(0) }, .consts = &.{ fx(7), fx(0) }, .want = .{ .err = VmError.DivideByZero } },
     });
+}
+
+test "VM dispatch: a handler's status carries every VmError and back" {
+    inline for (@typeInfo(VmError).error_set.error_names.?) |name| {
+        const err = @field(VmError, name);
+        const status = VM.Status.of(err);
+        try testing.expect(status != .ok);
+        try testing.expectEqual(err, status.err());
+    }
 }
 
 test "quicken: the instructions it specializes, and those it leaves" {
