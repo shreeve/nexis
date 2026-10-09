@@ -614,15 +614,13 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
 }
 
 /// `nexis doc NAME`: what `(doc NAME)` prints, on stdout. A NAME that
-/// is not a symbol is a usage error; one that names nothing is
-/// reported on stderr, exit 1.
-fn printDoc(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !void {
-    const not_symbol = name.len == 0 or std.ascii.isDigit(name[0]) or name[0] == ':' or
-        std.mem.findAny(u8, name, " \t\r\n()[]{}\";'`~^@,\\#") != null;
-    if (not_symbol) {
+/// does not read as one symbol is a usage error; one that names
+/// nothing is reported on stderr, exit 1.
+fn printDoc(io: std.Io, allocator: std.mem.Allocator, text: []const u8) !void {
+    const name = try docSymbol(allocator, text) orelse {
         try std.Io.File.stderr().writeStreamingAll(io, "nexis: doc takes a symbol (try `nexis --help`)\n");
         std.process.exit(1);
-    }
+    };
     const load_paths = [_][]const u8{"."};
     const rt = try Runtime.create(io, allocator, &load_paths);
     defer rt.destroy();
@@ -645,6 +643,20 @@ fn printDoc(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !void {
         exitSynced(1);
     }
     try writeStdout(io, capture.text);
+}
+
+/// The text of the one symbol `text` reads as; null when it reads as
+/// anything else, as nothing, as more than one form or not at all.
+fn docSymbol(allocator: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]const u8 {
+    var parser = reader_mod.parser.Parser.init(allocator, text);
+    defer parser.deinit();
+    const tree = parser.parseProgram() catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    var reader = reader_mod.Reader.init(allocator, text);
+    defer reader.deinit();
+    const forms = reader.readProgram(tree) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    if (forms.len != 1 or forms[0].datum != .symbol) return null;
+    const span = forms[0].origin;
+    return text[span.pos..][0..span.len];
 }
 
 /// `nexis test FILE...`: read every file, then run each and
@@ -879,6 +891,33 @@ test "cli: opcodeName: the disassembler's spelling of every opcode index" {
         try std.testing.expect(std.mem.indexOfScalar(u8, name, '.') != null);
     };
     try std.testing.expect(quickened > 0);
+}
+
+test "cli: docSymbol: NAME is one symbol as the reader reads it, or nothing" {
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "map", "map" },
+        .{ "nexis.string/split", "nexis.string/split" },
+        .{ "if", "if" },
+        .{ "+", "+" },
+        .{ " when-let ", "when-let" },
+        .{ "map ; a comment", "map" },
+        .{ "", null },
+        .{ "-1", null },
+        .{ "+1", null },
+        .{ "nil", null },
+        .{ "true", null },
+        .{ ":k", null },
+        .{ "a/b/c", null },
+        .{ "nexis.core/", null },
+        .{ "(exit 7)", null },
+        .{ "a b", null },
+        .{ "\"s\"", null },
+        .{ "'map", null },
+    };
+    for (cases) |case| {
+        const got = try docSymbol(testing.allocator, case[0]);
+        if (case[1]) |want| try testing.expectEqualStrings(want, got.?) else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
 }
 
 test "cli: Balance: brackets count outside strings, comments and character literals" {
