@@ -26,7 +26,7 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 3. The image of the embedded sources is loaded (below). Without one,
    the sources themselves are evaluated, each with its namespace
    current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
-   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`.
+   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -106,10 +106,11 @@ Var inside a `binding`.
 | `nexis.walk` | — | `walk.nx` | §4 |
 | `nexis.edn` | — | `edn.nx` | §4 |
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
+| `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
-| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3) |
+| `nexis.internal` | `internal_natives` | — | the `#%` helpers macros emit: records and protocols (PROTOCOLS.md §7), `#%catch-matches?` (`try`), `#%kwargs` (`& {:keys ...}`), `#%current-ns` (TOOLING.md §3), `#%delay` (`delay`, §8), `#%sorted-map` / `#%sorted-set` (a sorted collection a macro returns, MACROEXPAND.md §5), `#%push-out` / `#%pop-out` (`with-out-str`, §6), `#%mm-lookup` (a multimethod's call, §9.3), and the natives the namespaces of §11 call |
 
 **Resolution.** Every other namespace has `nexis.core` as its parent,
 so an unqualified symbol a namespace does not define resolves in
@@ -679,3 +680,23 @@ line (`TOOLING.md` §1).
 
 Clojure's `source` has no counterpart: a Var does not record the
 file and line it came from.
+
+---
+
+### 11. The process: `nexis.sys`
+
+`src/stdlib/sys.nx` holds the process's environment and working
+directory, each function a docstring'd `defn` over a native in
+`internal_natives`. `exit` and `*command-line-args*` are
+`nexis.core`'s (§6): `nexis run` and `nexis -e` both bind the
+arguments after the program. Text the operating system hands over is
+any bytes; each byte that starts no well-formed UTF-8 sequence reads
+as U+FFFD, as Java decodes it.
+
+| Name | Arity | Semantics | Errors |
+|---|---|---|---|
+| `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
+| `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
+
+`test/integration/eval_pipeline.zig` pins both, a variable holding
+bytes that are not UTF-8 included.

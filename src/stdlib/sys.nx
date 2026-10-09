@@ -1,0 +1,17 @@
+; src/stdlib/sys.nx — the `nexis.sys` namespace: the process's
+; environment and working directory (docs/STDLIB.md §10), over the
+; natives in src/stdlib.zig internal_natives. `exit` and
+; `*command-line-args*` are nexis.core's (§6). Embedded via
+; @embedFile and bootstrapped with nexis.sys as the current namespace.
+
+(defn getenv
+  "With a name, the value of that environment variable as a string, nil
+  when it is not set; with none, every variable as a map of name to
+  value. Bytes that are not UTF-8 read as U+FFFD."
+  ([] (nexis.internal/#%getenv))
+  ([name] (nexis.internal/#%getenv name)))
+
+(defn cwd
+  "The absolute path of the process's working directory."
+  []
+  (nexis.internal/#%cwd))

@@ -4916,6 +4916,32 @@ test "io: slurp / spit: empty path is :invalid-path" {
 }
 
 // =============================================================================
+// nexis.sys, nexis.shell, nexis.time, nexis.json (docs/STDLIB.md §10–§12)
+// =============================================================================
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+test "sys: getenv reads one variable, or every one as a map" {
+    try testing.expectEqual(@as(c_int, 0), setenv("NEXIS_SYS_TEST", "h\xc3\xa9llo=1", 1));
+    try testing.expectEqual(@as(c_int, 0), setenv("NEXIS_SYS_BYTES", "a\xffb", 1));
+    try expectOutput("(nexis.sys/getenv \"NEXIS_SYS_TEST\")", "h\xc3\xa9llo=1");
+    try expectOutput("(nexis.sys/getenv \"NEXIS_NO_SUCH_VARIABLE\")", "nil");
+    try expectOutput("(nexis.sys/getenv \"\")", "nil");
+    try expectOutput("(nexis.sys/getenv \"A\\u0000B\")", "nil");
+    try expectOutput("(get (nexis.sys/getenv) \"NEXIS_SYS_TEST\")", "h\xc3\xa9llo=1");
+    try expectOutput("(every? string? (mapcat identity (nexis.sys/getenv)))", "true");
+    // Bytes that are not UTF-8 read as U+FFFD, as Java decodes them.
+    try expectOutput("(nexis.sys/getenv \"NEXIS_SYS_BYTES\")", "a\u{FFFD}b");
+    try expectOutput("(try (nexis.sys/getenv :path) (catch any e e))", ":kind-mismatch");
+}
+
+test "sys: cwd is the working directory's absolute path" {
+    const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    try expectOutput("(nexis.sys/cwd)", cwd);
+}
+
+// =============================================================================
 // case / condp / for macros
 // =============================================================================
 //

@@ -240,6 +240,8 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.string", .info = .{ .path = "string.nx", .text = @embedFile("stdlib/string.nx") } },
     // Set algebra (Clojure's clojure.set).
     .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
+    // The environment and the working directory.
+    .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx") } },
 };
 
 const core_rows = .{
@@ -652,6 +654,9 @@ const internal_rows = .{
     .{ "#%special-docs", 0, 0, &fnSpecialDocs },
     .{ "#%namespace-doc", 1, 1, &fnNamespaceDoc },
     .{ "#%the-ns-name", 1, 1, &fnTheNsName },
+    // The natives under nexis.sys (sys.nx, STDLIB.md §11).
+    .{ "#%getenv", 0, 1, &fnGetenv },
+    .{ "#%cwd", 0, 0, &fnCwd },
 };
 const internal_natives = table("nexis.internal", internal_rows);
 
@@ -3754,6 +3759,7 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.math", "Clojure's clojure.math, which names it: sqrt, pow, the trigonometric\n  and exponential functions, floor, ceil, round, PI and E." },
     .{ "nexis.test", "Clojure's clojure.test, which names it: deftest, is, are, testing,\n  fixtures and run-tests. `nexis test FILE` runs a file's tests." },
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
+    .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
 });
@@ -6396,6 +6402,61 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
     if (host.nextomic_close_callback) |close| for (host.nextomic_connections.items) |conn| close(conn);
     db_mod.StoreFile.syncAll();
     std.process.exit(status);
+}
+
+// =============================================================================
+// The process's environment (nexis.sys, STDLIB.md §10)
+// =============================================================================
+//
+// Every native here reads its arguments, allocates its result last and
+// never calls back into the VM (GC.md §11.5, class 1).
+
+/// `bytes` as a string, each byte that starts no well-formed UTF-8
+/// sequence read as U+FFFD, as Java decodes text it did not make: an
+/// environment variable or a process's output is any bytes.
+fn lossyString(vm: *VM, bytes: []const u8) VmError!Value {
+    const heap = vm.ensureHeap();
+    if (std.unicode.utf8ValidateSlice(bytes)) return string_mod.fromBytes(heap, bytes) catch VmError.OutOfMemory;
+    var w = std.Io.Writer.Allocating.init(vm.allocator);
+    defer w.deinit();
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
+        const ok = n > 0 and i + n <= bytes.len and if (std.unicode.utf8Decode(bytes[i..][0..n])) |_| true else |_| false;
+        w.writer.writeAll(if (ok) bytes[i..][0..n] else "\u{FFFD}") catch return VmError.OutOfMemory;
+        i += if (ok) n else 1;
+    }
+    return string_mod.fromBytes(heap, w.written()) catch VmError.OutOfMemory;
+}
+
+/// `(#%getenv)` → every variable of the process's environment as a map
+/// of name to value; `(#%getenv name)` → the value of one, nil when it
+/// is not set. libc's environment, which the runtime never changes.
+fn fnGetenv(vm: *VM, args: []const Value) VmError!Value {
+    if (args.len == 1) {
+        if (args[0].kind() != .string) return VmError.KindMismatch;
+        const name = string_mod.asBytes(args[0]);
+        if (name.len == 0 or std.mem.findScalar(u8, name, 0) != null) return value_mod.nilValue();
+        const name_z = vm.allocator.dupeSentinel(u8, name, 0) catch return VmError.OutOfMemory;
+        defer vm.allocator.free(name_z);
+        const v = std.c.getenv(name_z.ptr) orelse return value_mod.nilValue();
+        return lossyString(vm, std.mem.span(v));
+    }
+    var m = champ_mod.mapEmpty(vm.ensureHeap()) catch return VmError.OutOfMemory;
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const text = std.mem.span(entry);
+        const eq = std.mem.findScalar(u8, text, '=') orelse continue;
+        m = try mapPut(vm.ensureHeap(), m, try lossyString(vm, text[0..eq]), try lossyString(vm, text[eq + 1 ..]));
+    }
+    return m;
+}
+
+/// `(#%cwd)` → the absolute path of the working directory.
+fn fnCwd(vm: *VM, _: []const Value) VmError!Value {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.process.currentPath(ioOf(vm), &buf) catch return VmError.IoError;
+    return lossyString(vm, buf[0..n]);
 }
 
 // =============================================================================
