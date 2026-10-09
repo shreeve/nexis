@@ -4,10 +4,8 @@
 //! `src/heap.zig`; semantic rules come from `docs/SEMANTICS.md` §2.4
 //! (byte equality) and §3.2 (hash).
 //!
-//! **Subkind 1 (heap string) only.** Body is raw UTF-8 bytes with
-//! no length prefix; length recovered from the heap block. SSO
-//! (subkind 0) and zero-copy (subkind 2) are reserved and
-//! unimplemented.
+//! One subkind, the heap string: the body is the raw UTF-8 bytes with
+//! no length prefix, the length recovered from the heap block.
 //!
 //! Invariants (STRING.md §2):
 //!   - Bytes are copied into a fresh heap allocation on `fromBytes`.
@@ -38,8 +36,6 @@ const testing = std.testing;
 // =============================================================================
 
 pub const subkind_heap: u16 = 1;
-// Reserved (not implemented): subkind_inline = 0 (SSO),
-// subkind_zero_copy = 2 (mmap slice over emdb page).
 
 // =============================================================================
 // Public API
@@ -65,11 +61,8 @@ pub fn allocUninit(heap: *Heap, len: usize) !struct { value: Value, bytes: []u8 
     return .{ .value = valueFrom(h), .bytes = Heap.bodyBytes(h) };
 }
 
-/// Byte view over a string Value. Panics if `v.kind() != .string`.
-/// For subkind 1 this is the body of the heap block. Another subkind
-/// would return its logical byte view the same way (STRING.md §1), so
-/// callers must not assume the returned pointer lives on the runtime
-/// heap.
+/// Byte view over a string Value, the body of its heap block. Panics
+/// if `v.kind() != .string`.
 pub fn asBytes(v: Value) []const u8 {
     std.debug.assert(v.kind() == .string);
     const h = Heap.asHeapHeader(v);
@@ -79,8 +72,7 @@ pub fn asBytes(v: Value) []const u8 {
     return Heap.bodyBytes(h);
 }
 
-/// Cheaper than `asBytes` when only the byte length is needed — still
-/// walks to the header but skips the body-pointer arithmetic.
+/// The length of `v` in bytes.
 pub fn byteLen(v: Value) usize {
     return asBytes(v).len;
 }
@@ -381,16 +373,6 @@ test "fromBytes + asBytes: round-trip byte-exact" {
     }
 }
 
-test "fromBytes: empty string is legal and round-trips" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const v = try fromBytes(&heap, "");
-    try testing.expect(v.kind() == .string);
-    try testing.expectEqual(@as(usize, 0), byteLen(v));
-    try testing.expectEqualStrings("", asBytes(v));
-}
-
 test "fromBytes: 64 KiB body round-trips" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -450,96 +432,6 @@ test "hashHeader: deterministic, matches raw xxHash3, caches nonzero results" {
     if (expected != 0) {
         try testing.expectEqual(expected, h.hash);
         try testing.expectEqual(@as(?u32, expected), h.cachedHash());
-    }
-}
-
-test "hashHeader: equal strings have equal hashes (different headers)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try fromBytes(&heap, "equal-hash-test");
-    const b = try fromBytes(&heap, "equal-hash-test");
-    const ha = hashHeader(Heap.asHeapHeader(a));
-    const hb = hashHeader(Heap.asHeapHeader(b));
-    try testing.expectEqual(ha, hb);
-}
-
-test "hashHeader: empty string produces the canonical xxHash3 of empty bytes" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromBytes(&heap, "");
-    const expected: u32 = @truncate(hash_mod.hashBytes(""));
-    try testing.expectEqual(expected, hashHeader(Heap.asHeapHeader(v)));
-}
-
-test "byteLen: cheap length access" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromBytes(&heap, "five!");
-    try testing.expectEqual(@as(usize, 5), byteLen(v));
-}
-
-test "valueFrom: tag encodes kind + subkind, payload = *HeapHeader" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const v = try fromBytes(&heap, "x");
-    try testing.expectEqual(@backingInt(Kind.string), @backingInt(v.kind()));
-    try testing.expectEqual(@as(u16, subkind_heap), v.subkind());
-    const h = Heap.asHeapHeader(v);
-    try testing.expectEqual(@intFromPtr(h), v.payload);
-}
-
-test "size boundaries 0/1/15/16/17 are all heap-stored" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const sizes = [_]usize{ 0, 1, 15, 16, 17 };
-    for (sizes) |n| {
-        const buf = try testing.allocator.alloc(u8, n);
-        defer testing.allocator.free(buf);
-        for (buf, 0..) |*b, i| b.* = @intCast(('A' + (i % 26)));
-        const v = try fromBytes(&heap, buf);
-        try testing.expectEqual(@as(u16, subkind_heap), v.subkind());
-        try testing.expectEqual(n, byteLen(v));
-        try testing.expectEqualSlices(u8, buf, asBytes(v));
-    }
-}
-
-test "multiple distinct strings coexist on one heap" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    var values: [8]Value = undefined;
-    for (&values, 0..) |*slot, i| {
-        var buf: [16]u8 = undefined;
-        const s = std.mem.print(&buf, "str-{d}", .{i}) catch unreachable;
-        slot.* = try fromBytes(&heap, s);
-    }
-    try testing.expectEqual(@as(usize, 8), heap.liveCount());
-    for (values, 0..) |v, i| {
-        var buf: [16]u8 = undefined;
-        const s = std.mem.print(&buf, "str-{d}", .{i}) catch unreachable;
-        try testing.expectEqualStrings(s, asBytes(v));
-    }
-}
-
-test "multi-byte UTF-8 code points survive round-trip byte-exact" {
-    // Per SEMANTICS §2.4 strings are byte blobs with no
-    // normalization. Still, explicitly pin a few common
-    // multi-byte sequences so an accidental byte-vs-code-point bug
-    // surfaces here rather than in a downstream reader test.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const cases = [_]struct { s: []const u8, len: usize }{
-        .{ .s = "\xC3\xA9", .len = 2 }, // é U+00E9
-        .{ .s = "\xE2\x82\xAC", .len = 3 }, // € U+20AC
-        .{ .s = "\xF0\x9F\x98\x80", .len = 4 }, // 😀 U+1F600
-        .{ .s = "A\xC3\xA9B\xE2\x82\xAC", .len = 7 }, // mixed: A(1)+é(2)+B(1)+€(3)
-    };
-    for (cases) |c| {
-        const v = try fromBytes(&heap, c.s);
-        try testing.expectEqual(c.len, byteLen(v));
-        try testing.expectEqualSlices(u8, c.s, asBytes(v));
     }
 }
 

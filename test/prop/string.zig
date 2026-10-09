@@ -5,7 +5,7 @@
 //!
 //! Properties:
 //!   S1. `dispatch.equal(a, b)` is reflexive, symmetric, transitive
-//!       over random strings.
+//!       over random short strings, most of which have equal twins.
 //!   S2. `dispatch.equal ⇒ dispatch.hashValue equal` — the bedrock
 //!       invariant, exercised on distinct-allocation equal strings.
 //!   S3. Cross-kind: a string Value is never `equal` to a keyword /
@@ -65,13 +65,16 @@ test "S1: dispatch.equal is reflexive, symmetric, transitive (pairwise)" {
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
     const r = prng.random();
 
-    var buf: [16]u8 = undefined;
+    // Strings of up to three bytes over a two-letter alphabet, so
+    // most have equal twins and transitivity is exercised.
+    var buf: [3]u8 = undefined;
     const N: usize = 64;
     const vs = try gpa.alloc(Value, N);
     defer gpa.free(vs);
     for (vs) |*slot| {
-        const bytes = randBytes(r, &buf, 0, 16);
-        slot.* = try string.fromBytes(&heap, bytes);
+        const n = r.uintAtMost(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = "ab"[r.uintLessThan(usize, 2)];
+        slot.* = try string.fromBytes(&heap, buf[0..n]);
     }
 
     for (vs) |a| {
