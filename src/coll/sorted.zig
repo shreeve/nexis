@@ -113,10 +113,6 @@ inline fn size(t: ?*HeapHeader) u64 {
     return if (t) |h| node(h).size else 0;
 }
 
-inline fn same(a: ?*HeapHeader, b: ?*HeapHeader) bool {
-    return a == b;
-}
-
 fn entryOf(h: *HeapHeader, is_map: bool) Entry {
     const n = node(h);
     return .{ .key = n.key, .value = if (is_map) n.val else value.nilValue() };
@@ -231,11 +227,11 @@ const Builder = struct {
         switch (try cmp.order(key, n.key)) {
             .lt => {
                 const l = try b.insert(Cmp, cmp, n.left, key, val);
-                return if (same(l, n.left)) h else b.balance(n.key, b.valOf(h), l, n.right);
+                return if (l == n.left) h else b.balance(n.key, b.valOf(h), l, n.right);
             },
             .gt => {
                 const r = try b.insert(Cmp, cmp, n.right, key, val);
-                return if (same(r, n.right)) h else b.balance(n.key, b.valOf(h), n.left, r);
+                return if (r == n.right) h else b.balance(n.key, b.valOf(h), n.left, r);
             },
             .eq => return if (!b.is_map or n.val.identicalTo(val)) h else b.mk(n.key, val, n.left, n.right),
         }
@@ -248,11 +244,11 @@ const Builder = struct {
         switch (try cmp.order(key, n.key)) {
             .lt => {
                 const l = try b.remove(Cmp, cmp, n.left, key);
-                return if (same(l, n.left)) h else try b.balance(n.key, b.valOf(h), l, n.right);
+                return if (l == n.left) h else try b.balance(n.key, b.valOf(h), l, n.right);
             },
             .gt => {
                 const r = try b.remove(Cmp, cmp, n.right, key);
-                return if (same(r, n.right)) h else try b.balance(n.key, b.valOf(h), n.left, r);
+                return if (r == n.right) h else try b.balance(n.key, b.valOf(h), n.left, r);
             },
             .eq => return b.glue(n.left, n.right),
         }
@@ -305,7 +301,7 @@ pub fn assoc(heap: *Heap, m: Value, key: Value, val: Value, cmp: anytype) !Value
     std.debug.assert(m.kind() == .sorted_map);
     const old = rootOf(m).tree;
     const t = try builder(heap, .sorted_map).insert(@TypeOf(cmp), cmp, old, key, val);
-    return if (same(t, old)) m else withTree(heap, m, t);
+    return if (t == old) m else withTree(heap, m, t);
 }
 
 /// Set `s` with `key`; `s` itself when an equal key is there.
@@ -313,14 +309,14 @@ pub fn conj(heap: *Heap, s: Value, key: Value, cmp: anytype) !Value {
     std.debug.assert(s.kind() == .sorted_set);
     const old = rootOf(s).tree;
     const t = try builder(heap, .sorted_set).insert(@TypeOf(cmp), cmp, old, key, value.nilValue());
-    return if (same(t, old)) s else withTree(heap, s, t);
+    return if (t == old) s else withTree(heap, s, t);
 }
 
 /// `v` (a map or a set) without `key`; `v` itself when it is absent.
 pub fn without(heap: *Heap, v: Value, key: Value, cmp: anytype) !Value {
     const old = rootOf(v).tree;
     const t = try builder(heap, v.kind()).remove(@TypeOf(cmp), cmp, old, key);
-    return if (same(t, old)) v else withTree(heap, v, t);
+    return if (t == old) v else withTree(heap, v, t);
 }
 
 /// The entry whose key the comparator finds equal to `key`, with the

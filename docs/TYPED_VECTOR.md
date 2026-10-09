@@ -18,7 +18,8 @@ one way, `vec` the other).
 ### 1. Scope
 
 The module provides construction from a Zig slice (`fromI64Slice`,
-`fromF64Slice`, both copying their argument), `count`, `elemType`, the
+`fromF64Slice`, both copying their argument) and from the codec's
+little-endian payload (`fromLeBytes`), `count`, `elemType`, the
 element slices for kernels (`i64Elems`, `f64Elems`), `nth` (the element
 as a Value), the element conversions `i64FromValue` / `f64FromValue`
 the constructors use, `hashHeader`, `equalHeaders` and `format`. The language surface is §7.
@@ -92,7 +93,7 @@ domain in on top.
 
 A typed vector is serializable; its encoding is the `typed_vector`
 row of CODEC.md §2. Encode writes each `f64` element's canonical bits
-and decode passes the elements through `fromF64Slice`, which
+and decode builds the vector from the payload with `fromLeBytes`, which
 re-canonicalizes NaN. Every element is fixed-width in a fixed order,
 so re-encoding a decoded typed vector is byte-equal (CODEC.md §4).
 `db/put!`, `db/get`, `db/put-key!`, `db/get-key` and `@ref` carry typed
