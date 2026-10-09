@@ -8672,3 +8672,29 @@ test "a user macro named like a core macro is the namespace's own" {
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
 }
+
+test "db: a collection frees the closed connections nothing names" {
+    var store = try SeamStore.init("closed-conns");
+    defer store.deinit();
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const base = nx.db.connectionCount();
+    const steps = [_][]const u8{
+        \\(do (def kept (db/open "@STORE@"))
+        \\    (def r (db/ref kept :t "k"))
+        \\    (db/close kept)
+        \\    (dotimes [i 2000] (db/close (db/open "@STORE@"))))
+        ,
+        \\[(try (db/get-key r) (catch any e (:error e))) (db/close kept)]
+    };
+    var last = value_mod.nilValue();
+    for (steps) |step| {
+        const src = try store.source(step);
+        defer testing.allocator.free(src);
+        last = try program.run(src);
+        program.v.collectGarbage();
+        try testing.expect(nx.db.connectionCount() < base + 8);
+    }
+    try harness.expectResult(&program, steps[1], last, "[:db-closed nil]");
+}

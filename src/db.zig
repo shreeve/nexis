@@ -427,7 +427,7 @@ fn canonicalPath(allocator: std.mem.Allocator, path: [*:0]const u8) ![:0]u8 {
 // =============================================================================
 
 pub const Connection = struct {
-    /// Non-owning: caller guarantees lifetime ≥ Connection's.
+    /// What the connection is allocated on; it outlives the connection.
     allocator: std.mem.Allocator,
     heap: *Heap,
     interner: *Interner,
@@ -464,6 +464,15 @@ pub const Connection = struct {
     /// How this connection's commits sync; `open` sets the process's
     /// (`Durability.process`).
     durability: Durability,
+
+    /// Set by the collector's mark phase when it reaches a Value of the
+    /// connection, and by the sweep for a durable ref or a handle that
+    /// names it; cleared by the sweep.
+    reached: bool = false,
+    next: ?*Connection,
+
+    /// Every connection of the process, as `Handle.all`.
+    var all: ?*Connection = null;
 
     pub fn storeId(self: *const Connection) u128 {
         return (@as(u128, self.store_id_hi) << 64) | @as(u128, self.store_id_lo);
@@ -529,10 +538,14 @@ pub const Durability = enum {
 };
 
 /// Open (or create) the store at `path` (DB.md §3); a file already
-/// open in this process is shared as it is (`StoreFile`). `allocator`,
-/// `heap` and `interner` outlive the connection.
-pub fn open(allocator: std.mem.Allocator, heap: *Heap, interner: *Interner, path: [*:0]const u8) !Connection {
+/// open in this process is shared as it is (`StoreFile`). The
+/// connection lives on `allocator`, which with `heap` and `interner`
+/// outlives it, until the first collection on `heap` that finds it
+/// closed and unreached (`sweepHandles`) or `shutdown`.
+pub fn open(allocator: std.mem.Allocator, heap: *Heap, interner: *Interner, path: [*:0]const u8) !*Connection {
     const file = try StoreFile.acquire(path, allocator);
+    errdefer file.release();
+    const self = try allocator.create(Connection);
 
     // store_id = two xxHash3-64 halves over the canonical path, the
     // second salted so the halves are independent.
@@ -542,7 +555,7 @@ pub fn open(allocator: std.mem.Allocator, heap: *Heap, interner: *Interner, path
     hasher.update(file.path);
     const hash_hi = hasher.final();
 
-    return Connection{
+    self.* = .{
         .allocator = allocator,
         .heap = heap,
         .interner = interner,
@@ -552,14 +565,21 @@ pub fn open(allocator: std.mem.Allocator, heap: *Heap, interner: *Interner, path
         .open_flag = true,
         .tree_ids = .empty,
         .durability = Durability.process(),
+        .next = Connection.all,
     };
+    Connection.all = self;
+    // Neither the struct nor the file's environment is on the heap, so
+    // a loop of opens and closes would never bring the collection that
+    // frees them: each open counts as a page of heap allocation.
+    heap.allocated_since_collect += page_size;
+    return self;
 }
 
 /// Close the connection, aborting every transaction the language
 /// holds on it (DB.md §3), and sync the file when a commit left it
 /// unsynced and no sync of it has failed (`StoreFile.closingSync`). A
-/// closed connection stays a valid struct: refs and handles that name
-/// it read `open_flag` and report it closed. A second close does
+/// closed connection stays a valid struct while anything names it:
+/// refs and handles that do read `open_flag` and report it closed. A second close does
 /// nothing. A close while a native holds one of the connection's
 /// transactions for a callback, or while a Zig-level transaction is
 /// open, is refused, so no emdb transaction outlives its env. A sync
@@ -590,9 +610,35 @@ pub fn sync(self: *Connection) !void {
     try self.file.sync();
 }
 
-/// Teardown of the whole VM, when nothing can use the connection
-/// again: end and free its handles and close it whatever is open.
+/// Teardown, when nothing can use the connection again: end and free
+/// its handles, close it whatever is open, and free it.
 pub fn shutdown(self: *Connection) void {
+    var link = &Connection.all;
+    while (link.*) |c| : (link = &c.next) {
+        if (c == self) {
+            link.* = self.next;
+            break;
+        }
+    }
+    destroy(self);
+}
+
+/// `shutdown` of every connection on `heap`: the VM's teardown and
+/// `exit`.
+pub fn shutdownHeap(heap: *Heap) void {
+    var link = &Connection.all;
+    while (link.*) |c| {
+        if (c.heap != heap) {
+            link = &c.next;
+            continue;
+        }
+        link.* = c.next;
+        destroy(c);
+    }
+}
+
+/// `shutdown` of a connection already off `Connection.all`.
+fn destroy(self: *Connection) void {
     var link = &Handle.all;
     while (link.*) |h| {
         if (h.conn() != self) {
@@ -604,6 +650,7 @@ pub fn shutdown(self: *Connection) void {
         self.allocator.destroy(h);
     }
     release(self);
+    self.allocator.destroy(self);
 }
 
 fn release(self: *Connection) void {
@@ -742,23 +789,33 @@ pub fn handleOf(v: Value) *Handle {
     return @ptrFromInt(v.payload);
 }
 
-/// The collector reached a Value of the handle (GC.md §5).
-pub fn markHandle(v: Value) void {
-    handleOf(v).reached = true;
+/// The collector reached `v`, a Value of no heap block (GC.md §5): a
+/// transaction handle or a connection is flagged for the sweep.
+pub fn mark(v: Value) void {
+    switch (v.kind()) {
+        .db_write_txn, .db_read_txn => handleOf(v).reached = true,
+        .db_connection => @as(*Connection, @ptrFromInt(v.payload)).reached = true,
+        else => {},
+    }
 }
 
 /// After a mark phase over `heap`: end and free every handle of a
 /// connection on `heap` that no Value reached, unless a native holds
-/// it, and let every held snapshot go (DB.md §3.4). `complete` is false
-/// when the marks are incomplete, which only clears them. Ending a
-/// transaction allocates nothing on the heap.
+/// it; free every closed connection on `heap` that no Value, marked
+/// durable ref or remaining handle names; and let every held snapshot
+/// go (DB.md §3.2, §3.4). `complete` is false when the marks are
+/// incomplete, which only clears them. Nothing here allocates on the
+/// heap.
 pub fn sweepHandles(heap: *Heap, complete: bool) void {
     StoreFile.dropAllHeld();
     var link = &Handle.all;
     while (link.*) |h| {
         const c = h.conn();
         if (c.heap != heap or !complete or h.reached or h.held != 0) {
-            if (c.heap == heap) h.reached = false;
+            if (c.heap == heap) {
+                h.reached = false;
+                c.reached = true;
+            }
             link = &h.next;
             continue;
         }
@@ -766,6 +823,36 @@ pub fn sweepHandles(heap: *Heap, complete: bool) void {
         link.* = h.next;
         c.allocator.destroy(h);
     }
+    if (complete and unreachedClosed(heap)) {
+        // A durable ref is a leaf the collector does not trace, so the
+        // marked ones are looked through for the connections they name.
+        const Refs = struct {
+            pub fn visit(_: @This(), b: *HeapHeader) void {
+                if (b.kind != @backingInt(Kind.durable_ref) or !b.isMarked()) return;
+                if (bodyOf(b).conn) |c| c.reached = true;
+            }
+        };
+        heap.forEachLive(Refs{});
+    }
+    var conns = &Connection.all;
+    while (conns.*) |c| {
+        if (c.heap == heap and complete and !c.open_flag and !c.reached) {
+            conns.* = c.next;
+            c.allocator.destroy(c);
+            continue;
+        }
+        if (c.heap == heap) c.reached = false;
+        conns = &c.next;
+    }
+}
+
+/// Whether a closed connection on `heap` is so far unreached.
+fn unreachedClosed(heap: *Heap) bool {
+    var it = Connection.all;
+    while (it) |c| : (it = c.next) {
+        if (c.heap == heap and !c.open_flag and !c.reached) return true;
+    }
+    return false;
 }
 
 /// Whether a handle a collection on `conn`'s heap could end holds a
@@ -778,6 +865,14 @@ pub fn collectableHandles(conn: *const Connection) bool {
         if (h.active and h.held == 0 and c.heap == conn.heap and c.file == conn.file) return true;
     }
     return false;
+}
+
+/// Connections alive in the process, closed or not.
+pub fn connectionCount() usize {
+    var n: usize = 0;
+    var it = Connection.all;
+    while (it) |c| : (it = c.next) n += 1;
+    return n;
 }
 
 /// Handles alive in the process, ended or not.
@@ -1226,7 +1321,8 @@ fn cleanupDb(path: [:0]const u8) void {
 }
 
 /// A store path in a fresh directory, and the heap and interner its
-/// connections decode into; `deinit` removes the directory.
+/// connections decode into; `deinit` shuts down every connection on
+/// the heap and removes the directory.
 const Fixture = struct {
     path: [:0]u8,
     heap: Heap,
@@ -1237,17 +1333,18 @@ const Fixture = struct {
     }
 
     fn deinit(f: *Fixture) void {
+        shutdownHeap(&f.heap);
         f.interner.deinit();
         f.heap.deinit();
         cleanupDb(f.path);
         testing.allocator.free(f.path);
     }
 
-    fn connect(f: *Fixture) !Connection {
+    fn connect(f: *Fixture) !*Connection {
         return f.connectAt(f.path);
     }
 
-    fn connectAt(f: *Fixture, path: [*:0]const u8) !Connection {
+    fn connectAt(f: *Fixture, path: [*:0]const u8) !*Connection {
         return open(testing.allocator, &f.heap, &f.interner, path);
     }
 };
@@ -1288,8 +1385,7 @@ test "open / close: round-trip with a tiny file" {
     var fx = try Fixture.init("open_close");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     try testing.expect(conn.open_flag);
     const sid = conn.storeId();
@@ -1300,14 +1396,13 @@ test "open: store_id comes from the canonical path, however the path is spelled"
     var fx = try Fixture.init("canon");
     defer fx.deinit();
 
-    var a = try fx.connect();
+    const a = try fx.connect();
     const sid = a.storeId();
     try testing.expect(std.Io.Dir.path.isAbsolute(a.file.path));
-    try close(&a);
+    try close(a);
     const dotted = try testing.allocator.printSentinel("./{s}", .{fx.path}, 0);
     defer testing.allocator.free(dotted);
-    var b = try fx.connectAt(dotted.ptr);
-    defer shutdown(&b);
+    const b = try fx.connectAt(dotted.ptr);
     try testing.expectEqual(sid, b.storeId());
 }
 
@@ -1315,20 +1410,16 @@ test "open: every spelling of one file shares its environment; a second writer i
     var fx = try Fixture.init("shared");
     defer fx.deinit();
 
-    var a = try fx.connect();
-    defer shutdown(&a);
+    const a = try fx.connect();
     const dotted = try testing.allocator.printSentinel("./{s}", .{fx.path}, 0);
     defer testing.allocator.free(dotted);
     const link = try testing.allocator.printSentinel("{s}/link.emdb", .{std.Io.Dir.path.dirname(fx.path).?}, 0);
     defer testing.allocator.free(link);
     try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(fx.path), link, .{});
 
-    var same = try fx.connect();
-    defer shutdown(&same);
-    var b = try fx.connectAt(dotted.ptr);
-    defer shutdown(&b);
-    var c = try fx.connectAt(link.ptr);
-    defer shutdown(&c);
+    const same = try fx.connect();
+    const b = try fx.connectAt(dotted.ptr);
+    const c = try fx.connectAt(link.ptr);
     // Checked before any second write begins: on separate environments
     // it would wait on this thread's own lock.
     try testing.expect(same.file == a.file and b.file == a.file and c.file == a.file);
@@ -1339,20 +1430,20 @@ test "open: every spelling of one file shares its environment; a second writer i
     defer testing.allocator.free(link_lock);
     try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
 
-    var w = try beginWrite(&a);
-    try testing.expectError(error.WriterActive, beginWrite(&same));
-    try testing.expectError(error.WriterActive, beginWrite(&c));
+    var w = try beginWrite(a);
+    try testing.expectError(error.WriterActive, beginWrite(same));
+    try testing.expectError(error.WriterActive, beginWrite(c));
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
 
     // The file stays open while any connection holds it.
-    try close(&a);
-    try close(&same);
-    var r = try beginRead(&c);
+    try close(a);
+    try close(same);
+    var r = try beginRead(c);
     const got = try get(&r, "t", "k", synthHash, synthEq);
     abortRead(&r);
     try testing.expectEqual(@as(i64, 1), got.?.asFixnum());
-    var w2 = try beginWrite(&b);
+    var w2 = try beginWrite(b);
     try commit(&w2);
 }
 
@@ -1360,28 +1451,26 @@ test "open: a copy of a store is another file, written beside the original" {
     var fx = try Fixture.init("original");
     defer fx.deinit();
 
-    var a = try fx.connect();
-    defer shutdown(&a);
-    var w = try beginWrite(&a);
+    const a = try fx.connect();
+    var w = try beginWrite(a);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
     const copy = try testing.allocator.printSentinel("{s}/copy.emdb", .{std.Io.Dir.path.dirname(fx.path).?}, 0);
     defer testing.allocator.free(copy);
     try std.Io.Dir.cwd().copyFile(fx.path, std.Io.Dir.cwd(), copy, testing.io, .{});
 
-    var b = try fx.connectAt(copy.ptr);
-    defer shutdown(&b);
+    const b = try fx.connectAt(copy.ptr);
     try testing.expect(a.file != b.file);
     try testing.expect(a.storeId() != b.storeId());
-    var wa = try beginWrite(&a);
-    var wb = try beginWrite(&b);
+    var wa = try beginWrite(a);
+    var wb = try beginWrite(b);
     try put(&wa, "t", "k", value.fromFixnum(2).?);
     try put(&wb, "t", "k", value.fromFixnum(3).?);
     try commit(&wa);
     try commit(&wb);
-    var ra = try beginRead(&a);
+    var ra = try beginRead(a);
     defer abortRead(&ra);
-    var rb = try beginRead(&b);
+    var rb = try beginRead(b);
     defer abortRead(&rb);
     try testing.expectEqual(@as(i64, 2), (try get(&ra, "t", "k", synthHash, synthEq)).?.asFixnum());
     try testing.expectEqual(@as(i64, 3), (try get(&rb, "t", "k", synthHash, synthEq)).?.asFixnum());
@@ -1391,14 +1480,13 @@ test "open: a store file with a second hard link is refused under either name" {
     var fx = try Fixture.init("linked");
     defer fx.deinit();
 
-    var a = try fx.connect();
-    defer shutdown(&a);
+    const a = try fx.connect();
     const other = try testing.allocator.printSentinel("{s}/other.emdb", .{std.Io.Dir.path.dirname(fx.path).?}, 0);
     defer testing.allocator.free(other);
     try testing.expectEqual(@as(c_int, 0), std.c.link(fx.path.ptr, other.ptr));
     // Already open here, and not yet open anywhere: both refused.
     try testing.expectError(error.HardLinked, fx.connect());
-    try close(&a);
+    try close(a);
     try testing.expectError(error.HardLinked, fx.connectAt(other.ptr));
     try testing.expectError(error.HardLinked, fx.connect());
     try testing.expectEqualStrings("db/hard-linked", failureName(error.HardLinked));
@@ -1408,8 +1496,7 @@ test "open: a store file with a second hard link is refused under either name" {
     try testing.expectError(error.OpenFailed, fx.connectAt(dir.ptr));
     // One name again: the file opens.
     try testing.expectEqual(@as(c_int, 0), std.c.unlink(other.ptr));
-    var b = try fx.connect();
-    defer shutdown(&b);
+    _ = try fx.connect();
 }
 
 test "open: a symlink to no file creates the file it names, and the lock file is named after that file" {
@@ -1419,17 +1506,16 @@ test "open: a symlink to no file creates the file it names, and the lock file is
     defer testing.allocator.free(link);
     try std.Io.Dir.cwd().symLink(testing.io, std.Io.Dir.path.basename(fx.path), link, .{});
 
-    var a = try fx.connectAt(link.ptr);
+    const a = try fx.connectAt(link.ptr);
     const sid = a.storeId();
-    var w = try beginWrite(&a);
+    var w = try beginWrite(a);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
-    try close(&a);
+    try close(a);
     const link_lock = try testing.allocator.printSentinel("{s}-lock", .{link}, 0);
     defer testing.allocator.free(link_lock);
     try testing.expect(std.c.access(link_lock.ptr, std.c.F_OK) != 0);
-    var b = try fx.connect();
-    defer shutdown(&b);
+    const b = try fx.connect();
     try testing.expectEqual(sid, b.storeId());
 }
 
@@ -1457,50 +1543,74 @@ test "open: a file this process may only read opens read-only; a write is TxnRea
     var fx = try Fixture.init("readonly");
     defer fx.deinit();
     {
-        var a = try fx.connect();
-        defer shutdown(&a);
-        var w = try beginWrite(&a);
+        const a = try fx.connect();
+        defer shutdown(a);
+        var w = try beginWrite(a);
         try put(&w, "t", "k", value.fromFixnum(7).?);
         try commit(&w);
     }
     try testing.expectEqual(@as(c_int, 0), std.c.chmod(fx.path.ptr, 0o444));
     defer _ = std.c.chmod(fx.path.ptr, 0o644);
-    var conn = try fx.connect();
-    defer shutdown(&conn);
-    var r = try beginRead(&conn);
+    const conn = try fx.connect();
+    var r = try beginRead(conn);
     defer abortRead(&r);
     try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
-    try testing.expectError(error.TxnReadOnly, beginWrite(&conn));
+    try testing.expectError(error.TxnReadOnly, beginWrite(conn));
 }
 
 test "close: a refusal ends none of the language's transactions" {
     var fx = try Fixture.init("close_refused");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
-    const h = try Handle.create(.{ .read = try beginRead(&conn) });
-    var zig_level = try beginRead(&conn);
-    try testing.expectError(DbError.TransactionsOpen, close(&conn));
+    const conn = try fx.connect();
+    const h = try Handle.create(.{ .read = try beginRead(conn) });
+    var zig_level = try beginRead(conn);
+    try testing.expectError(DbError.TransactionsOpen, close(conn));
     try testing.expect(h.active);
     abortRead(&zig_level);
-    try close(&conn);
+    try close(conn);
     try testing.expect(!h.active);
+}
+
+test "sweepHandles: a closed connection is freed once no Value, marked durable ref or handle names it" {
+    var fx = try Fixture.init("swept");
+    defer fx.deinit();
+    const base = connectionCount();
+    _ = try fx.connect();
+    const named = try fx.connect();
+    const reffed = try fx.connect();
+    const handled = try fx.connect();
+    const dropped = try fx.connect();
+    const r = try ref(&fx.heap, reffed, "t", "k");
+    const h = try Handle.create(.{ .read = try beginRead(handled) });
+    for ([_]*Connection{ named, reffed, handled, dropped }) |c| try close(c);
+    try testing.expectEqual(base + 5, connectionCount());
+    // Marks that may be incomplete free nothing.
+    sweepHandles(&fx.heap, false);
+    try testing.expectEqual(base + 5, connectionCount());
+    mark(.{ .tag = @backingInt(Kind.db_connection), .payload = @intFromPtr(named) });
+    mark(.{ .tag = @backingInt(Kind.db_read_txn), .payload = @intFromPtr(h) });
+    Heap.asHeapHeader(r).setMarked();
+    sweepHandles(&fx.heap, true);
+    try testing.expectEqual(base + 4, connectionCount());
+    // Nothing reached: the handle goes, then every closed connection.
+    Heap.asHeapHeader(r).clearMarked();
+    sweepHandles(&fx.heap, true);
+    try testing.expectEqual(base + 1, connectionCount());
 }
 
 test "has: whether a key is present, its value never read" {
     var fx = try Fixture.init("has");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
     {
         // Bytes no decoder takes.
         const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
         try txn.putInTree(try txn.openTree("t", true), "k", "\xff\xff");
         try txn.commit();
     }
-    var r = try beginRead(&conn);
+    var r = try beginRead(conn);
     defer abortRead(&r);
     try testing.expect(try has(&r, "t", "k"));
     try testing.expect(!try has(&r, "t", "j"));
@@ -1512,15 +1622,14 @@ test "close: refused while a transaction is open; the connection stays a closed 
     var fx = try Fixture.init("close_busy");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
-    var rtxn = try beginRead(&conn);
-    try testing.expectError(DbError.TransactionsOpen, close(&conn));
+    const conn = try fx.connect();
+    var rtxn = try beginRead(conn);
+    try testing.expectError(DbError.TransactionsOpen, close(conn));
     abortRead(&rtxn);
-    try close(&conn);
-    try close(&conn);
+    try close(conn);
+    try close(conn);
     try testing.expect(!conn.open_flag);
-    try testing.expectError(DbError.ConnectionUnavailable, beginRead(&conn));
+    try testing.expectError(DbError.ConnectionUnavailable, beginRead(conn));
 }
 
 /// Syncs the engine has issued in this process (data and meta alike),
@@ -1541,30 +1650,28 @@ test "durability commit: a commit is seen at once and syncs nothing; close syncs
     var fx = try Fixture.init("commit_mode");
     defer fx.deinit();
 
-    var a = try fx.connect();
-    defer shutdown(&a);
+    const a = try fx.connect();
     a.durability = .commit;
-    var b = try fx.connect();
-    defer shutdown(&b);
+    const b = try fx.connect();
 
     const before = engineSyncs();
-    var w = try beginWrite(&a);
+    var w = try beginWrite(a);
     try put(&w, "t", "k", value.fromFixnum(7).?);
     try commit(&w);
     try testing.expectEqual(before, engineSyncs());
     try testing.expect(a.file.unsynced);
     {
-        var r = try beginRead(&b);
+        var r = try beginRead(b);
         defer abortRead(&r);
         try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
     }
     // An abort writes nothing, so it leaves nothing more to sync.
-    var aborted = try beginWrite(&a);
+    var aborted = try beginWrite(a);
     abortWrite(&aborted);
-    try close(&a);
+    try close(a);
     try testing.expectEqual(before + 1, engineSyncs());
     try testing.expect(!b.file.unsynced);
-    try close(&b);
+    try close(b);
     try testing.expectEqual(before + 1, engineSyncs());
 }
 
@@ -1572,31 +1679,29 @@ test "durability durable: every commit syncs, which leaves nothing for close; a 
     var fx = try Fixture.init("durable_mode");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
     conn.durability = .commit;
-    var w = try beginWrite(&conn);
+    var w = try beginWrite(conn);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
     try testing.expect(conn.file.unsynced);
     // A durable commit makes every commit before it durable too.
     conn.durability = .durable;
     const before = engineSyncs();
-    w = try beginWrite(&conn);
+    w = try beginWrite(conn);
     try put(&w, "t", "k", value.fromFixnum(2).?);
     try commit(&w);
     try testing.expect(engineSyncs() > before);
     try testing.expect(!conn.file.unsynced);
     const after_commit = engineSyncs();
-    try close(&conn);
+    try close(conn);
     try testing.expectEqual(after_commit, engineSyncs());
 
-    var reader = try fx.connect();
-    defer shutdown(&reader);
-    var r = try beginRead(&reader);
+    const reader = try fx.connect();
+    var r = try beginRead(reader);
     try testing.expectEqual(@as(i64, 2), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
     abortRead(&r);
-    try close(&reader);
+    try close(reader);
     try testing.expectEqual(after_commit, engineSyncs());
 }
 
@@ -1626,17 +1731,15 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     defer fx.deinit();
 
     var conn = try fx.connect();
-    defer shutdown(&conn);
     conn.durability = .durable;
     // A second holder shares the file's environment, and its failure.
-    var other = try fx.connect();
-    defer shutdown(&other);
+    const other = try fx.connect();
     other.durability = .commit;
 
     var failure = MetaSyncFailure{ .fd = conn.file.env.inner.dataFile.fd };
     try testing.expectEqual(@as(c_int, 0), std.c.pipe(&failure.pipe));
     conn.file.env.inner.commitObserver = .{ .ctx = &failure, .notify = MetaSyncFailure.notify };
-    var w = try beginWrite(&conn);
+    var w = try beginWrite(conn);
     try put(&w, "t", "a", value.fromFixnum(5).?);
     const committed = commit(&w);
     conn.file.env.inner.commitObserver = null;
@@ -1650,18 +1753,18 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     // commit that would sync fails before it writes anything, while one
     // that syncs nothing commits.
     const before = engineSyncs();
-    try testing.expectError(error.SyncFailed, sync(&conn));
-    try testing.expectError(error.SyncFailed, sync(&other));
+    try testing.expectError(error.SyncFailed, sync(conn));
+    try testing.expectError(error.SyncFailed, sync(other));
     try testing.expectEqualStrings("db/sync-failed", failureName(error.SyncFailed));
-    w = try beginWrite(&conn);
+    w = try beginWrite(conn);
     try put(&w, "t", "b", value.fromFixnum(6).?);
     try testing.expectError(error.SyncFailed, commit(&w));
     try testing.expectEqual(@as(u32, 0), conn.open_txns);
-    w = try beginWrite(&other);
+    w = try beginWrite(other);
     try put(&w, "t", "c", value.fromFixnum(7).?);
     try commit(&w);
     {
-        var r = try beginRead(&conn);
+        var r = try beginRead(conn);
         defer abortRead(&r);
         try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
         try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
@@ -1671,12 +1774,12 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     // A close syncs nothing and raises nothing. A connection opened
     // while another holds the file shares its environment, so its
     // syncs fail too; the last close lets the environment go.
-    try close(&conn);
+    try close(conn);
     conn = try fx.connect();
-    try testing.expectError(error.SyncFailed, sync(&conn));
-    try close(&conn);
+    try testing.expectError(error.SyncFailed, sync(conn));
+    try close(conn);
     StoreFile.syncAll();
-    try close(&other);
+    try close(other);
     try testing.expectEqual(before, engineSyncs());
 
     // Reopened, the file syncs again and holds exactly the commits
@@ -1685,18 +1788,18 @@ test "durability durable: after a commit's meta sync fails, the file syncs nothi
     conn.durability = .durable;
     try testing.expect(!conn.file.syncFailed());
     {
-        var r = try beginRead(&conn);
+        var r = try beginRead(conn);
         defer abortRead(&r);
         try testing.expectEqual(@as(i64, 5), (try get(&r, "t", "a", synthHash, synthEq)).?.asFixnum());
         try testing.expect((try get(&r, "t", "b", synthHash, synthEq)) == null);
         try testing.expectEqual(@as(i64, 7), (try get(&r, "t", "c", synthHash, synthEq)).?.asFixnum());
     }
-    w = try beginWrite(&conn);
+    w = try beginWrite(conn);
     try put(&w, "t", "b", value.fromFixnum(6).?);
     try commit(&w);
     try testing.expect(engineSyncs() > before);
-    try sync(&conn);
-    try close(&conn);
+    try sync(conn);
+    try close(conn);
 }
 
 test "syncAll: one sync for each file written without one; shutdown syncs a file it releases last" {
@@ -1705,18 +1808,18 @@ test "syncAll: one sync for each file written without one; shutdown syncs a file
     var interner = Interner.init(testing.allocator);
     defer interner.deinit();
     var paths: [3][:0]u8 = undefined;
-    var conns: [3]Connection = undefined;
+    var conns: [3]*Connection = undefined;
     for (&paths, &conns, 0..) |*p, *c, i| {
         p.* = try tmpDbPath(testing.allocator, &.{'a' + @as(u8, @intCast(i))});
         c.* = try open(testing.allocator, &heap, &interner, p.*.ptr);
-        c.durability = .commit;
+        c.*.durability = .commit;
     }
-    defer for (&paths, &conns) |p, *c| {
-        shutdown(c);
+    defer for (paths) |p| {
         cleanupDb(p);
         testing.allocator.free(p);
     };
-    for (conns[0..2]) |*c| {
+    defer for (conns[0..2]) |c| shutdown(c);
+    for (conns[0..2]) |c| {
         var w = try beginWrite(c);
         try put(&w, "t", "k", value.fromFixnum(1).?);
         try commit(&w);
@@ -1727,10 +1830,10 @@ test "syncAll: one sync for each file written without one; shutdown syncs a file
     StoreFile.syncAll();
     try testing.expectEqual(before + 2, engineSyncs());
 
-    var w = try beginWrite(&conns[2]);
+    var w = try beginWrite(conns[2]);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
-    shutdown(&conns[2]);
+    shutdown(conns[2]);
     try testing.expectEqual(before + 3, engineSyncs());
 }
 
@@ -1738,8 +1841,7 @@ test "held snapshot: kept while it is the latest commit; a commit passing it, a 
     var fx = try Fixture.init("held");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
     const file = conn.file;
     try testing.expect(file.takeHeld() == null);
 
@@ -1764,7 +1866,7 @@ test "held snapshot: kept while it is the latest commit; a commit passing it, a 
 
     // A read that a commit passed while it ran is not kept.
     const stale = try file.env.beginRead();
-    var w = try beginWrite(&conn);
+    var w = try beginWrite(conn);
     try put(&w, "t", "k", value.fromFixnum(1).?);
     try commit(&w);
     file.keep(stale);
@@ -1773,7 +1875,7 @@ test "held snapshot: kept while it is the latest commit; a commit passing it, a 
     // This process's own write lets it go before it begins.
     file.keep(try file.env.beginRead());
     try testing.expect(file.held != null);
-    w = try beginWrite(&conn);
+    w = try beginWrite(conn);
     try testing.expect(file.held == null);
     abortWrite(&w);
 
@@ -1797,9 +1899,9 @@ test "durability commit: a commit survives its process ending without a sync or 
     const pid = std.c.fork();
     try testing.expect(pid >= 0);
     if (pid == 0) {
-        var conn = fx.connect() catch std.c._exit(1);
+        const conn = fx.connect() catch std.c._exit(1);
         conn.durability = .commit;
-        var w = beginWrite(&conn) catch std.c._exit(2);
+        var w = beginWrite(conn) catch std.c._exit(2);
         put(&w, "t", "k", value.fromFixnum(42).?) catch std.c._exit(3);
         const before = engineSyncs();
         commit(&w) catch std.c._exit(4);
@@ -1809,9 +1911,8 @@ test "durability commit: a commit survives its process ending without a sync or 
     try testing.expectEqual(pid, std.c.waitpid(pid, &status, 0));
     try testing.expectEqual(@as(c_int, 0), status);
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
-    var r = try beginRead(&conn);
+    const conn = try fx.connect();
+    var r = try beginRead(conn);
     defer abortRead(&r);
     try testing.expectEqual(@as(i64, 42), (try get(&r, "t", "k", synthHash, synthEq)).?.asFixnum());
 }
@@ -1820,8 +1921,7 @@ test "open: a new store has 16 KiB pages and the pinned tree capacity" {
     var fx = try Fixture.init("pagesize");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     try testing.expectEqual(page_size, conn.file.env.info().pageSize);
     try testing.expectEqual(page_size, conn.file.env.options.pageSize);
@@ -1835,11 +1935,10 @@ test "open: the reader table has reader_slots slots, so more than emdb's default
     var fx = try Fixture.init("readers");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
     try testing.expectEqual(reader_slots, conn.file.env.info().maxReaders);
     var reads: [200]ReadTxn = undefined;
-    for (&reads) |*r| r.* = try beginRead(&conn);
+    for (&reads) |*r| r.* = try beginRead(conn);
     for (&reads) |*r| abortRead(r);
 }
 
@@ -1873,8 +1972,7 @@ test "open: a file that is not an emdb store is refused without leaking" {
     }
 
     if (fx.connect()) |conn| {
-        var opened = conn;
-        shutdown(&opened);
+        shutdown(conn);
         return error.TestUnexpectedResult;
     } else |_| {}
 }
@@ -1883,14 +1981,13 @@ test "put / get / del: single-tree round-trip of a scalar" {
     var fx = try Fixture.init("putget");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     try put(&wtxn, "users", "alice", value.fromFixnum(42).?);
     try commit(&wtxn);
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
     const got = try get(&rtxn, "users", "alice", &synthHash, &synthEq);
     try testing.expect(got != null);
@@ -1906,16 +2003,15 @@ test "put / get: multiple named trees are independent" {
     var fx = try Fixture.init("multitree");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     try put(&wtxn, "treeA", "k0", value.fromFixnum(1).?);
     try put(&wtxn, "treeB", "k0", value.fromFixnum(2).?);
     try put(&wtxn, "treeC", "k0", value.fromFixnum(3).?);
     try commit(&wtxn);
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
     try testing.expectEqual(@as(i64, 1), (try get(&rtxn, "treeA", "k0", &synthHash, &synthEq)).?.asFixnum());
     try testing.expectEqual(@as(i64, 2), (try get(&rtxn, "treeB", "k0", &synthHash, &synthEq)).?.asFixnum());
@@ -1926,19 +2022,18 @@ test "del: removes the key, subsequent get returns null" {
     var fx = try Fixture.init("del");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     try put(&wtxn, "t", "k", value.fromFixnum(99).?);
     try commit(&wtxn);
 
-    var wtxn2 = try beginWrite(&conn);
+    var wtxn2 = try beginWrite(conn);
     const removed = try del(&wtxn2, "t", "k");
     try testing.expect(removed);
     try commit(&wtxn2);
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
     try testing.expect((try get(&rtxn, "t", "k", &synthHash, &synthEq)) == null);
 }
@@ -1947,12 +2042,11 @@ test "treeId: one handle per name, remembered across transactions, loaded once p
     var fx = try Fixture.init("treeids");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     // Unknown tree, no create: nothing resolved, nothing cached.
     {
-        var rtxn = try beginRead(&conn);
+        var rtxn = try beginRead(conn);
         defer abortRead(&rtxn);
         try testing.expect((try treeId(&rtxn, "users", false)) == null);
         try testing.expectEqual(@as(usize, 0), conn.tree_ids.count());
@@ -1960,7 +2054,7 @@ test "treeId: one handle per name, remembered across transactions, loaded once p
 
     var first_id: emdb.TreeId = undefined;
     {
-        var wtxn = try beginWrite(&conn);
+        var wtxn = try beginWrite(conn);
         first_id = (try treeId(&wtxn, "users", true)).?;
         try testing.expect(wtxn.opened.isSet(first_id));
         try testing.expectEqual(first_id, (try treeId(&wtxn, "users", true)).?);
@@ -1973,7 +2067,7 @@ test "treeId: one handle per name, remembered across transactions, loaded once p
     // A later transaction starts with nothing loaded and resolves
     // the same handle.
     {
-        var rtxn = try beginRead(&conn);
+        var rtxn = try beginRead(conn);
         defer abortRead(&rtxn);
         try testing.expect(!rtxn.opened.isSet(first_id));
         try testing.expectEqual(first_id, (try treeId(&rtxn, "users", false)).?);
@@ -1987,21 +2081,20 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
     var fx = try Fixture.init("treeabort");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     {
-        var wtxn = try beginWrite(&conn);
+        var wtxn = try beginWrite(conn);
         try put(&wtxn, "scratch", "k", value.fromFixnum(7).?);
         abortWrite(&wtxn);
     }
     {
-        var rtxn = try beginRead(&conn);
+        var rtxn = try beginRead(conn);
         defer abortRead(&rtxn);
         try testing.expect((try get(&rtxn, "scratch", "k", &synthHash, &synthEq)) == null);
     }
     {
-        var wtxn = try beginWrite(&conn);
+        var wtxn = try beginWrite(conn);
         defer abortWrite(&wtxn);
         try testing.expect(!(try del(&wtxn, "scratch", "k")));
     }
@@ -2013,8 +2106,8 @@ test "treeId: a tree created by an aborted transaction reads as empty afterwards
 /// page fails its check.
 fn walkStore(fx: *Fixture, big: usize, damage: bool) !void {
     {
-        var conn = try fx.connect();
-        defer shutdown(&conn);
+        const conn = try fx.connect();
+        defer shutdown(conn);
         const txn = try conn.file.env.beginWriteWith(.{ .sync = .none });
         errdefer txn.abort();
         const t = try txn.openTree("t", true);
@@ -2041,10 +2134,9 @@ test "Walk: a page that fails its check ends the walk with its error, never as a
     var fx = try Fixture.init("walk_damaged");
     defer fx.deinit();
     try walkStore(&fx, 1 << 20, true);
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var r = try beginRead(&conn);
+    var r = try beginRead(conn);
     defer abortRead(&r);
     var walk: Walk = undefined;
     try testing.expect(try walk.begin(&r, "t"));
@@ -2053,7 +2145,7 @@ test "Walk: a page that fails its check ends the walk with its error, never as a
     try testing.expectError(error.InvalidPage, walk.next());
 
     // A write under a walk copies the rest of it, and meets the same page.
-    var w = try beginWrite(&conn);
+    var w = try beginWrite(conn);
     defer abortWrite(&w);
     var over: Walk = undefined;
     try testing.expect(try over.begin(&w, "t"));
@@ -2066,10 +2158,9 @@ test "Walk: a write to any tree of the transaction copies the rest first; values
     var fx = try Fixture.init("walk_copy");
     defer fx.deinit();
     try walkStore(&fx, 3 * page_size, false);
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var w = try beginWrite(&conn);
+    var w = try beginWrite(conn);
     defer abortWrite(&w);
     var walk: Walk = undefined;
     try testing.expect(try walk.begin(&w, "t"));
@@ -2096,8 +2187,7 @@ test "put / get: container values (list, map, set) codec round-trip" {
     var fx = try Fixture.init("containers");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     // List
     const lst = try list_mod.fromSlice(&fx.heap, &.{
@@ -2115,13 +2205,13 @@ test "put / get: container values (list, map, set) codec round-trip" {
     s = try champ.setConj(&fx.heap, s, value.fromFixnum(10).?, &synthHash, &synthEq);
     s = try champ.setConj(&fx.heap, s, value.fromFixnum(20).?, &synthHash, &synthEq);
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     try put(&wtxn, "objects", "list", lst);
     try put(&wtxn, "objects", "map", m);
     try put(&wtxn, "objects", "set", s);
     try commit(&wtxn);
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
 
     const got_lst = try get(&rtxn, "objects", "list", &synthHash, &synthEq);
@@ -2143,10 +2233,10 @@ test "reopen-connection readback: values survive conn close/reopen" {
 
     // Session 1: write.
     {
-        var conn = try fx.connect();
-        defer shutdown(&conn);
+        const conn = try fx.connect();
+        defer shutdown(conn);
 
-        var wtxn = try beginWrite(&conn);
+        var wtxn = try beginWrite(conn);
         try put(&wtxn, "persistent", "answer", value.fromFixnum(42).?);
         try put(&wtxn, "persistent", "pi", value.fromFloat(3.14));
         try commit(&wtxn);
@@ -2154,10 +2244,10 @@ test "reopen-connection readback: values survive conn close/reopen" {
 
     // Session 2: reopen + read.
     {
-        var conn = try fx.connect();
-        defer shutdown(&conn);
+        const conn = try fx.connect();
+        defer shutdown(conn);
 
-        var rtxn = try beginRead(&conn);
+        var rtxn = try beginRead(conn);
         defer abortRead(&rtxn);
         const ans = try get(&rtxn, "persistent", "answer", &synthHash, &synthEq);
         try testing.expect(ans != null and ans.?.kind() == .fixnum);
@@ -2175,15 +2265,14 @@ test "ref: identity triple populated; conn pointer attached" {
     var fx = try Fixture.init("refinit");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    const r = try ref(&fx.heap, &conn, "users", "alice");
+    const r = try ref(&fx.heap, conn, "users", "alice");
     try testing.expect(r.kind() == .durable_ref);
     try testing.expectEqual(conn.storeId(), refStoreId(r));
     try testing.expectEqualStrings("users", refTreeName(r));
     try testing.expectEqualStrings("alice", refKeyBytes(r));
-    try testing.expectEqual(@as(?*Connection, &conn), refConn(r));
+    try testing.expectEqual(@as(?*Connection, conn), refConn(r));
 }
 
 test "refFromBytes: conn is null; identity triple preserved" {
@@ -2230,24 +2319,23 @@ test "putRef / getRef / delRef: round-trip via ref" {
     var fx = try Fixture.init("refio");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    const r = try ref(&fx.heap, &conn, "users", "alice");
+    const r = try ref(&fx.heap, conn, "users", "alice");
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     try putRef(&wtxn, r, value.fromFixnum(123).?);
     try commit(&wtxn);
 
     {
-        var rtxn = try beginRead(&conn);
+        var rtxn = try beginRead(conn);
         defer abortRead(&rtxn);
         const got = try getRef(&rtxn, r, &synthHash, &synthEq);
         try testing.expect(got != null and got.?.kind() == .fixnum);
         try testing.expectEqual(@as(i64, 123), got.?.asFixnum());
     }
 
-    var wtxn2 = try beginWrite(&conn);
+    var wtxn2 = try beginWrite(conn);
     const removed = try delRef(&wtxn2, r);
     try testing.expect(removed);
     try commit(&wtxn2);
@@ -2257,13 +2345,12 @@ test "getRef: nullconn ref → ConnectionUnavailable" {
     var fx = try Fixture.init("nullconn");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
     // Ref constructed from bytes (no conn).
     const r = try refFromBytes(&fx.heap, 999, "t", "k");
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
     try testing.expectError(DbError.ConnectionUnavailable, getRef(&rtxn, r, &synthHash, &synthEq));
 }
@@ -2272,19 +2359,14 @@ test "getRef: cross-store ref → StoreMismatch" {
     var fx = try Fixture.init("xstore");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    // Ref tagged with a DIFFERENT store_id than conn's, and a
-    // different (fake) Connection pointer. `assertRefMatchesConn`
-    // should detect the store_id mismatch.
-    var fake_conn = conn; // same struct, so same storeId and conn-pointer match
-    fake_conn.store_id_lo = 0xBAD_BAD_BAD_BAD_0000;
-    // Construct a ref referencing the fake_conn (different
-    // store_id + different pointer identity).
-    const r = try ref(&fx.heap, &fake_conn, "t", "k");
+    // A ref made on a connection to another store.
+    var other = conn.*;
+    other.store_id_lo = 0xBAD_BAD_BAD_BAD_0000;
+    const r = try ref(&fx.heap, &other, "t", "k");
 
-    var rtxn = try beginRead(&conn);
+    var rtxn = try beginRead(conn);
     defer abortRead(&rtxn);
     try testing.expectError(DbError.StoreMismatch, getRef(&rtxn, r, &synthHash, &synthEq));
 }
@@ -2293,10 +2375,9 @@ test "invalid tree name / key: surfaces InvalidTreeName / InvalidKey" {
     var fx = try Fixture.init("invalid");
     defer fx.deinit();
 
-    var conn = try fx.connect();
-    defer shutdown(&conn);
+    const conn = try fx.connect();
 
-    var wtxn = try beginWrite(&conn);
+    var wtxn = try beginWrite(conn);
     defer abortWrite(&wtxn);
     try testing.expectError(DbError.InvalidTreeName, put(&wtxn, "", "k", value.nilValue()));
     try testing.expectError(DbError.InvalidKey, put(&wtxn, "t", "", value.nilValue()));

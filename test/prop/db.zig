@@ -114,8 +114,8 @@ test "D1: 10000 random Values across 5 trees read back equal after commit" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
-    defer db.shutdown(&conn);
+    const conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
+    defer db.shutdown(conn);
 
     var prng = std.Random.DefaultPrng.init(prng_seed +% 1);
     var gen = harness.Gen{ .heap = &ctx.heap, .interner = &ctx.interner, .allocator = std.testing.allocator, .r = prng.random(), .shape = gen_shape };
@@ -137,7 +137,7 @@ test "D1: 10000 random Values across 5 trees read back equal after commit" {
     var trial: usize = 0;
     const batch: usize = 500;
     while (trial < trials) {
-        var wtxn = try db.beginWrite(&conn);
+        var wtxn = try db.beginWrite(conn);
         const end = @min(trial + batch, trials);
         while (trial < end) : (trial += 1) {
             const depth = gen.r.intRangeAtMost(u8, 0, 3);
@@ -159,7 +159,7 @@ test "D1: 10000 random Values across 5 trees read back equal after commit" {
     }
 
     // Read everything back in a single read transaction.
-    var rtxn = try db.beginRead(&conn);
+    var rtxn = try db.beginRead(conn);
     defer db.abortRead(&rtxn);
 
     for (records, 0..) |rec, i| {
@@ -213,13 +213,13 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
         var ctx = TestCtx.init();
         defer ctx.deinit();
 
-        var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
-        defer db.shutdown(&conn);
+        const conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
+        defer db.shutdown(conn);
 
         var prng = std.Random.DefaultPrng.init(prng_seed +% 0x42);
         var gen = harness.Gen{ .heap = &ctx.heap, .interner = &ctx.interner, .allocator = std.testing.allocator, .r = prng.random(), .shape = gen_shape };
 
-        var wtxn = try db.beginWrite(&conn);
+        var wtxn = try db.beginWrite(conn);
 
         var i: usize = 0;
         while (i < N) : (i += 1) {
@@ -261,10 +261,10 @@ test "D2: reopen-connection readback (2000 Values, close+reopen between)" {
         var ctx = TestCtx.init();
         defer ctx.deinit();
 
-        var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
-        defer db.shutdown(&conn);
+        const conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
+        defer db.shutdown(conn);
 
-        var rtxn = try db.beginRead(&conn);
+        var rtxn = try db.beginRead(conn);
         defer db.abortRead(&rtxn);
 
         for (records, 0..) |rec, i| {
@@ -355,17 +355,17 @@ test "D4: same key in every tree returns its own value (no cross-contamination)"
     var ctx = TestCtx.init();
     defer ctx.deinit();
 
-    var conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
-    defer db.shutdown(&conn);
+    const conn = try db.open(std.testing.allocator, &ctx.heap, &ctx.interner, path.ptr);
+    defer db.shutdown(conn);
 
-    var wtxn = try db.beginWrite(&conn);
+    var wtxn = try db.beginWrite(conn);
     for (tree_names, 0..) |tn, i| {
         const v = value.fromFixnum(@intCast(1000 + i)).?;
         try db.put(&wtxn, tn, "shared-key", v);
     }
     try db.commit(&wtxn);
 
-    var rtxn = try db.beginRead(&conn);
+    var rtxn = try db.beginRead(conn);
     defer db.abortRead(&rtxn);
     for (tree_names, 0..) |tn, i| {
         const got = try db.get(&rtxn, tn, "shared-key", &dispatch.hashValue, &dispatch.equal);

@@ -116,7 +116,7 @@ reachable from wherever the program keeps it.
 | `markValue(v)` | Ignores immediates and the pointer kinds with no block (`native_fn`, `var_`, the db connection), flags a db transaction handle reached (§5), and marks any other Value's header |
 | `mark(h)` | Sets the mark bit once and, unless `h` is a leaf (string, bignum, typed vector, durable ref, protocol, protocol fn, Nextomic connection or db) with no metadata, which has nothing to trace, traces `h` in place when the trace that reached it may (below), else pushes it on the gray worklist; outside a drain it drains before returning, so a direct call marks the transitive closure |
 | `markInternal(h) bool` | Sets the mark bit of a collection-internal node and returns whether this call set it; walks neither the node's `meta` nor its kind: the caller walks the payload |
-| `collect(roots) usize` | Marks the roots and the host's roots, each root's transitive closure before the next root, sweeps the db transaction handles of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
+| `collect(roots) usize` | Marks the roots and the host's roots, each root's transitive closure before the next root, sweeps the db transaction handles and closed connections of the heap (`db.sweepHandles`, §5) and then the blocks (`Heap.sweepUnmarked`), resets the heap's allocation counter, and returns the number of blocks freed |
 
 `mark` and `markInternal` share one primitive (`markHeaderOnce`), so
 the mark bit has one owner. Nothing in the API can fail: sweeping only
@@ -182,17 +182,21 @@ The dispatch in `Collector.trace`:
 | `cell_internal` | `Host.trace` (`VM.gcTrace`) | the cell's value |
 | anything else (`var_`, whose payload is an arena `*Var`; `byte_vector`, `error_`, `meta_symbol`, reserved and never allocated; an immediate) | panic | |
 
-**Transaction handles.** A `db_write_txn` or `db_read_txn` Value
-points at a `db.Handle`, which is not a block but holds an emdb
-transaction: the file's writer, or one of its reader slots. `markValue`
-sets the handle's reached flag. After the drain, `db.sweepHandles`
-walks the process's handles whose connection is on this heap: a
-flagged or held one (a native is running a callback over it) has its
-flag cleared and survives; any other has its transaction ended (a
-write aborted, a read ended) and is freed. Ending one frees emdb's
-transaction and releases its lock or slot, touching nothing on the
-heap. A cycle whose worklist could not grow ends nothing and only
-clears the flags. `docs/DB.md` §3.2 is the db side.
+**Transaction handles and connections.** A `db_write_txn` or
+`db_read_txn` Value points at a `db.Handle`, which is not a block but
+holds an emdb transaction: the file's writer, or one of its reader
+slots; a `db_connection` Value points at a `db.Connection`. `markValue`
+sets the handle's or connection's reached flag (`db.mark`). After the
+drain, `db.sweepHandles` walks the process's handles whose connection
+is on this heap: a flagged or held one (a native is running a callback
+over it) has its flag cleared and survives, and keeps its connection;
+any other has its transaction ended (a write aborted, a read ended)
+and is freed. Ending one frees emdb's transaction and releases its
+lock or slot, touching nothing on the heap. Then every closed
+connection on the heap that nothing flagged and no marked durable ref
+names is freed. A cycle whose worklist could not grow ends and frees
+nothing and only clears the flags. `docs/DB.md` §3 and §3.2 are the db
+side.
 
 A `function` or `cell_internal` block reaching a collector with no
 host panics, as does any immediate or sentinel kind byte on a header.
@@ -226,7 +230,7 @@ collect(roots):
                                         // block trace marks is traced
                                         // in place, four levels deep
     empty gray, keeping its capacity
-    db.sweepHandles(heap, !overflowed)  // ends unreached transactions
+    db.sweepHandles(heap, !overflowed)  // ends unreached transactions, frees closed connections
     freed = heap.sweepUnmarked()        // frees unmarked blocks;
                                         // clears the mark on survivors
                                         // (or, if gray could not grow:
