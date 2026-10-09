@@ -16,6 +16,7 @@ samples are the committed goldens under `test/golden/cli/`, which
 | `nexis -e EXPR [ARG...]` | Evaluates EXPR's forms (reported as `<-e>`) and prints each value that is not nil, as `prn` does. |
 | `nexis repl` | The read-eval-print loop below. |
 | `nexis test FILE...` | Reads every file (one that cannot be read stops it before any runs, exit 2), runs each (restoring the current namespace after each), then `(nexis.test/run-all-tests)` (§3); exit 1 when an assertion failed or a test threw. A file's own definitions cannot change the exit status. `require` searches the working directory, then each file's directory. |
+| `nexis doc NAME` | Prints what `(doc NAME)` prints (STDLIB.md §10) on stdout: the documentation of a function, macro, special form or namespace. A NAME that names nothing is `nexis: no documentation for NAME` on stderr, exit 1; one that cannot be a symbol (empty, starting with a digit or `:`, or holding whitespace, a bracket, a quote or a reader macro character) is ``nexis: doc takes a symbol (try `nexis --help`)``, exit 1. |
 | `nexis disasm FILE`, `nexis --disasm FILE` | §2. |
 | `nexis --help`, `nexis -h` | The usage text, on stdout, exit 0. With no arguments, a command missing its FILE, or an argument `repl`, `disasm`, `--help` or `--version` takes no more of, the same text on stderr and exit 1; an unknown command is ``nexis: unknown command 'X' (try `nexis --help`)``, exit 1. |
 | `nexis --version`, `nexis -V` | `nexis 0.1.0`: `nexis` and its version, on stdout, exit 0. The version is `build.zig.zon`'s `.version`, which the build passes to the CLI as the `version` build option. |
@@ -35,7 +36,7 @@ count from the character after the mark (`test/golden/cli/bom.nx`;
 | Exit status | Meaning |
 |---|---|
 | 0 | success |
-| 1 | usage error; `nexis test` with a failure or an error |
+| 1 | usage error; `nexis test` with a failure or an error; `nexis doc` of a name that names nothing |
 | 2 | the file could not be read (`nexis: failed to read 'PATH': ErrorName`) |
 | 3 | parse or reader error |
 | 4 | compile error |

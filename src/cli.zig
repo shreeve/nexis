@@ -1,5 +1,5 @@
-//! nexis CLI: `run`, `repl`, `test`, `disasm` and `-e` over one
-//! `Runtime` (docs/TOOLING.md §1).
+//! nexis CLI: `run`, `repl`, `test`, `doc`, `disasm` and `-e` over
+//! one `Runtime` (docs/TOOLING.md §1).
 //!
 //! A Runtime is a VM with the standard library booted
 //! (`stdlib.boot`) and a `Loader` for `require`. Every command
@@ -46,6 +46,9 @@ const Usage =
     \\  nexis test FILE...       Runs each file, then every deftest
     \\                           they defined; exits 1 on a failure
     \\                           or an error.
+    \\  nexis doc NAME           Prints the documentation of NAME, a
+    \\                           function, macro, special form or
+    \\                           namespace, as (doc NAME) does.
     \\  nexis disasm FILE        Compiles FILE without running it and
     \\                           prints every routine's bytecode: pc,
     \\                           opcode, operands, constants and the
@@ -158,6 +161,9 @@ fn runCommand(init: std.process.Init) !void {
     } else if (eql(cmd, "test")) {
         if (args.len < 3) usageExit(io);
         try runTests(io, allocator, args[2..]);
+    } else if (eql(cmd, "doc")) {
+        if (args.len != 3) usageExit(io);
+        try printDoc(io, allocator, args[2]);
     } else if (eql(cmd, "disasm") or eql(cmd, "--disasm")) {
         if (args.len != 3) usageExit(io);
         try disasmFile(io, allocator, args[2]);
@@ -601,6 +607,40 @@ fn evalExpr(io: std.Io, allocator: std.mem.Allocator, expr: []const u8, args: []
         }
     };
     _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = rt, .call = &Print.call } }) catch |err| exitSynced(try rt.report(err));
+}
+
+/// `nexis doc NAME`: what `(doc NAME)` prints, on stdout. A NAME that
+/// is not a symbol is a usage error; one that names nothing is
+/// reported on stderr, exit 1.
+fn printDoc(io: std.Io, allocator: std.mem.Allocator, name: []const u8) !void {
+    const not_symbol = name.len == 0 or std.ascii.isDigit(name[0]) or name[0] == ':' or
+        std.mem.findAny(u8, name, " \t\r\n()[]{}\";'`~^@,\\#") != null;
+    if (not_symbol) {
+        try std.Io.File.stderr().writeStreamingAll(io, "nexis: doc takes a symbol (try `nexis --help`)\n");
+        std.process.exit(1);
+    }
+    const load_paths = [_][]const u8{"."};
+    const rt = try Runtime.create(io, allocator, &load_paths);
+    defer rt.destroy();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const expr = try std.fmt.allocPrint(arena.allocator(), "(nexis.core/with-out-str (nexis.core/doc {s}))", .{name});
+    const info = vm.SourceInfo{ .path = "<doc>", .text = expr };
+    const Capture = struct {
+        arena: std.mem.Allocator,
+        text: []const u8 = "",
+        fn call(ctx: *anyopaque, v: Value) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.text = try self.arena.dupe(u8, string_mod.asBytes(v));
+        }
+    };
+    var capture: Capture = .{ .arena = arena.allocator() };
+    _ = rt.loader.evalSource(&info, .{ .allocator = arena.allocator(), .on_value = .{ .ctx = &capture, .call = &Capture.call } }) catch |err| exitSynced(try rt.report(err));
+    if (capture.text.len == 0) {
+        try std.Io.File.stderr().writeStreamingAll(io, try std.fmt.allocPrint(arena.allocator(), "nexis: no documentation for {s}\n", .{name}));
+        exitSynced(1);
+    }
+    try writeStdout(io, capture.text);
 }
 
 /// `nexis test FILE...`: read every file, then run each and

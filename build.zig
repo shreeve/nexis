@@ -293,9 +293,9 @@ pub fn build(b: *std.Build) void {
     // runtime error's stderr (exit 5), a reader error's stderr (exit
     // 3), a compile error's (exit 4), a disassembly, scripts' stdout
     // (with arguments, from stdin, an explicit exit status), `nexis
-    // test`, a REPL session and the usage errors. Each runs from the
-    // build root, so the paths in the output are the relative ones
-    // committed.
+    // test`, a REPL session, `nexis doc` and the usage errors. Each
+    // runs from the build root, so the paths in the output are the
+    // relative ones committed.
     {
         const CliGolden = struct {
             args: []const []const u8,
@@ -340,6 +340,13 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
             .{ .args = &.{ "-e", "1" }, .stderr = "boot-out-of-memory.err", .exit_code = 5, .max_alloc = "4096" },
             .{ .args = &.{cli ++ "script"}, .stdout = "script.out" },
+            .{ .args = &.{ "doc", "map" }, .stdout = "doc-map.out" },
+            .{ .args = &.{ "doc", "nexis.string/split" }, .stdout = "doc-split.out" },
+            .{ .args = &.{ "doc", "when-let" }, .stdout = "doc-when-let.out" },
+            .{ .args = &.{ "doc", "if" }, .stdout = "doc-if.out" },
+            .{ .args = &.{ "doc", "no-such-name" }, .stderr = "doc-missing.err", .exit_code = 1 },
+            .{ .args = &.{ "doc", "(exit 7)" }, .stderr = "doc-not-symbol.err", .exit_code = 1 },
+            .{ .args = &.{"doc"}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
             .{ .args = &.{"--version"}, .stdout = "version.out" },
             .{ .args = &.{"-V"}, .stdout = "version.out" },

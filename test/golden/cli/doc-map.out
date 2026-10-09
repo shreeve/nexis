@@ -1,0 +1,6 @@
+-------------------------
+nexis.core/map
+([f] [f coll] [f c1 c2] [f c1 c2 c3] [f c1 c2 c3 & colls])
+  Returns a lazy seq of f applied to the first items of the colls,
+  then the second, ..., ending at the shortest coll; chunked, 32 at a
+  time, over one chunked coll. With no coll, returns a transducer.

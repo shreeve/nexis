@@ -1,0 +1,6 @@
+-------------------------
+nexis.core/when-let
+([binding & body])
+Macro
+  binding is [form test]. When test is truthy, evaluates body with form
+  bound to its value and returns the last value, else nil.
