@@ -252,28 +252,19 @@ pub const DbSource = struct {
     aevt_entries: ?u64 = null,
 };
 
-/// Everything planning needs about the query: the `Read` of every
-/// source (`read` is the selected one), the variable table (shared by
-/// every sub-plan) and the rule set.
+/// Everything planning needs about the query: every source (`selected`
+/// is the one the resolvers read), the variable table (shared by every
+/// sub-plan) and the rule set.
 pub const Ctx = struct {
     arena: Allocator,
-    /// The selected source's `Read`, null while a collection is
-    /// selected (`coll`); `select` switches it and `db` reads it.
-    read: ?*Read,
-    /// The selected source's tuples when it is a collection.
-    coll: ?[]const []const Cell = null,
     interner: *Interner,
     vars: std.ArrayList(ir.VarInfo),
     rules: *const RuleSet,
     rule_info: ?*rules_mod.Info = null,
-    /// The selected source's resolved attributes.
-    attr_cache: std.AutoHashMapUnmanaged(u32, ?Attr) = .empty,
     /// The query's `Ir` table size; variables at or past it are renames.
     ir_vars: usize,
     /// Run-time relation slots, by `Clause.source.id`.
     sources: std.ArrayList(*SourceSlot) = .empty,
-    /// The selected source's AEVT entries, once asked.
-    aevt_entries: ?u64 = null,
     /// The data sources by `Src`; `$` first.
     dbs: []DbSource,
     /// VM symbol ids of the sources, for `explain`.
@@ -300,28 +291,24 @@ pub const Ctx = struct {
             .db => |r| .{ .read = r },
             .coll => |rows| .{ .read = null, .coll = rows },
         };
-        var ctx: Ctx = .{ .arena = arena, .read = null, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
-        if (dbs.len > 0) ctx.enter(0);
-        return ctx;
+        return .{ .arena = arena, .interner = interner, .vars = vars, .rules = rules, .ir_vars = query.vars.len, .dbs = dbs, .source_names = query.sources, .diag = diag };
     }
 
     /// Make `src` (null: `$`) the source the resolvers read; a query
     /// whose `:in` names no source has none to read.
     pub fn select(self: *Ctx, src: ?ir.Src) error{QuerySyntax}!void {
         if (self.dbs.len == 0) return self.syntax("this clause reads a data source, and :in names none");
-        const next = src orelse 0;
-        if (next == self.selected) return;
-        self.dbs[self.selected].attr_cache = self.attr_cache;
-        self.dbs[self.selected].aevt_entries = self.aevt_entries;
-        self.enter(next);
+        self.selected = src orelse 0;
     }
 
-    fn enter(self: *Ctx, next: ir.Src) void {
-        self.selected = next;
-        self.read = self.dbs[next].read;
-        self.coll = self.dbs[next].coll;
-        self.attr_cache = self.dbs[next].attr_cache;
-        self.aevt_entries = self.dbs[next].aevt_entries;
+    /// The selected source.
+    fn source(self: *Ctx) *DbSource {
+        return &self.dbs[self.selected];
+    }
+
+    /// The selected source's tuples when it is a collection.
+    fn coll(self: *Ctx) ?[]const []const Cell {
+        return self.source().coll;
     }
 
     /// `select` for a clause that reads a db value: `missing?`,
@@ -334,7 +321,7 @@ pub const Ctx = struct {
     /// The selected source's `Read`; `QuerySyntax` when it is a
     /// collection.
     pub fn db(self: *Ctx) error{QuerySyntax}!*Read {
-        return self.read orelse self.syntax("this clause reads a db value, and its source is a collection");
+        return self.source().read orelse self.syntax("this clause reads a db value, and its source is a collection");
     }
 
     /// `QuerySyntax` with its reason and the top-level clause it was
@@ -368,20 +355,22 @@ pub const Ctx = struct {
 
     /// The attribute named by VM keyword `kw` as this view sees it.
     pub fn attrByKeyword(self: *Ctx, kw: u32) !?Attr {
-        if (self.attr_cache.get(kw)) |a| return a;
+        const cache = &self.source().attr_cache;
+        if (cache.get(kw)) |a| return a;
         const read = try self.db();
         const id = try read.db.conn.idents.idOf(read.txn, kw);
         const attr: ?Attr = if (id) |a| try read.attr(a) else null;
-        try self.attr_cache.put(self.arena, kw, attr);
+        try cache.put(self.arena, kw, attr);
         return attr;
     }
 
     /// Entries of AEVT this view reads: the cost of a scan over every
     /// datom.
     pub fn aevtEntries(self: *Ctx) !u64 {
-        if (self.aevt_entries) |n| return n;
+        const src = self.source();
+        if (src.aevt_entries) |n| return n;
         const n = try viewEntries(try self.db(), .aevt);
-        self.aevt_entries = n;
+        src.aevt_entries = n;
         return n;
     }
 
@@ -1019,7 +1008,7 @@ fn choose(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) !Choice {
 /// body's patterns read the source of the call.
 fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound, src: ?ir.Src) !u64 {
     try ctx.select(p.src orelse src);
-    if (ctx.coll) |rows| return @max(1, rows.len);
+    if (ctx.coll()) |rows| return @max(1, rows.len);
     return (try choose(ctx, p, bound)).estimate;
 }
 
@@ -1027,7 +1016,7 @@ fn patternEstimate(ctx: *Ctx, p: ir.Pattern, bound: *const Bound, src: ?ir.Src) 
 /// a collection.
 fn planPattern(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Step {
     try ctx.select(p.src);
-    const rows = ctx.coll orelse return .{ .scan = try planScan(ctx, p, bound) };
+    const rows = ctx.coll() orelse return .{ .scan = try planScan(ctx, p, bound) };
     var fresh: std.ArrayList(Var) = .empty;
     var slots: [5]Slot = undefined;
     for (p.terms(), &slots) |t, *slot| slot.* = switch (t) {
