@@ -3540,7 +3540,10 @@ pub const VM = struct {
     /// cycle runs while the body does, and its throw is caught by the
     /// barrier `nexis.core/realize-caught`, a closure, and parked with
     /// any error the barrier cannot catch. Null on a failure, at once
-    /// while one is parked.
+    /// while one is parked. The barrier's answer is checked, not
+    /// trusted, since a program can rebind its Var: `[false thrown]`
+    /// parks the throw, else the seq is the block's own once it is
+    /// realized, and anything else is `KindMismatch`.
     fn realizeIsolated(ctx: *anyopaque, lz: Value) ?Value {
         const self: *VM = @ptrCast(@alignCast(ctx));
         if (self.parked_realize != null) return null;
@@ -3552,9 +3555,11 @@ pub const VM = struct {
         self.gc_hold += 1;
         defer self.gc_hold -= 1;
         const r = self.callValue(barrier, &.{lz}) catch |err| return self.park(.{ .err = err });
-        // `[true seq]` or `[false thrown]`.
-        if (vector_mod.nth(r, 0).isTruthy()) return vector_mod.nth(r, 1);
-        return self.park(.{ .thrown = vector_mod.nth(r, 1) });
+        if (r.kind() == .persistent_vector and vector_mod.count(r) == 2 and vector_mod.nth(r, 0).isFalsy()) {
+            return self.park(.{ .thrown = vector_mod.nth(r, 1) });
+        }
+        if (lazy_mod.state(lz) == .realized) return lazy_mod.result(lz);
+        return self.park(.{ .err = VmError.KindMismatch });
     }
 
     /// Park `failure`, which the caller counts as a spoil next.
