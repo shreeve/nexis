@@ -486,8 +486,10 @@ with a transducer (`(into to xform from)`) and `sequence` with one are
 Clojure 1.12's (`src/stdlib/core.nx`), and so are the transducer
 arities: `(map f)`, `(filter p)`, `(remove p)`, `(keep f)`, `(take n)`,
 `(take-while p)`, `(drop n)`, `(drop-while p)`, `(map-indexed f)`,
-`(keep-indexed f)`, `(partition-all n)`, `(partition-by f)`, `(mapcat
-f)`, `(interpose sep)`, `(distinct)` and `(dedupe)`. The ones whose
+`(keep-indexed f)`, `(partition-all n)`, `(partitionv-all n)`,
+`(partition-by f)`, `(mapcat f)`, `(interpose sep)`, `(take-nth n)`,
+`(replace smap)`, `(random-sample prob)`, `(distinct)` and `(dedupe)`.
+The ones whose
 other arities are natives reach the `xf-` function of their name in
 `core.nx`; a stateful one keeps its state in volatiles, one per
 application of the transducer to a reducing function. A reduction

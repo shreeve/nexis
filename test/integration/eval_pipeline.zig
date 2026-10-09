@@ -8679,3 +8679,11 @@ test "nexis.string: reverse and escape take a string, as every function there do
         \\      [#(nexis.string/reverse [1 2]) #(nexis.string/reverse nil) #(nexis.string/escape [1 2] {})])
     , "[reverse takes a string, got a vector reverse takes a string, got nil escape takes a string, got a vector]");
 }
+
+test "take-nth, replace, random-sample and partitionv-all have Clojure 1.12's transducer arities" {
+    try expectOutput(
+        \\[(into [] (take-nth 2) (range 10)) (into [] (take-nth 3) [1]) (into [] (replace {1 :a}) [1 2 1])
+        \\ (into [] (replace [:x :y]) [0 1 5]) (into [] (random-sample 1.0) [1 2]) (into [] (random-sample 0.0) [1 2])
+        \\ (into [] (partitionv-all 2) [1 2 3]) (transduce (take-nth 2) + (range 7))]
+    , "[[0 2 4 6 8] [1] [:a 2 :a] [:x :y 5] [1 2] [] [[1 2] [3]] 12]");
+}

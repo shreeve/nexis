@@ -434,11 +434,18 @@
 
 (defn take-nth
   "Returns a lazy seq of every nth element of coll, starting with the
-  first."
-  [n coll]
-  (lazy-seq
-    (when-let [s (seq coll)]
-      (cons (first s) (take-nth n (drop n s))))))
+  first. Returns a transducer when no coll is given."
+  ([n]
+   (fn* [rf]
+     (let [iv (atom -1)]
+       (fn ([] (rf))
+           ([result] (rf result))
+           ([result input]
+            (if (zero? (rem (swap! iv inc) n)) (rf result input) result))))))
+  ([n coll]
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (cons (first s) (take-nth n (drop n s)))))))
 
 (defn partition-by
   "Returns a lazy seq of the runs of coll, split each time (f x)
@@ -842,13 +849,17 @@
   (= (inc (count xs)) (count (set (cons x xs)))))
 
 
+(defn- replacer [smap] (fn [x] (let [e (find smap x)] (if e (val e) x))))
+
 (defn replace
   "Returns coll with each element that is a key of smap (a map, or a
   vector by index) replaced by its value: a vector, keeping its
-  metadata, when coll is one, else a lazy seq."
-  [smap coll]
-  (let [f (fn [x] (let [e (find smap x)] (if e (val e) x)))]
-    (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll))))
+  metadata, when coll is one, else a lazy seq. Returns a transducer
+  when no coll is given."
+  ([smap] (map (replacer smap)))
+  ([smap coll]
+   (let [f (replacer smap)]
+     (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll)))))
 
 (defn bounded-count
   "Returns (count coll) when coll is counted?, else the count of at
@@ -861,9 +872,9 @@
 
 (defn random-sample
   "Returns a lazy seq of the elements of coll, each kept with
-  probability prob."
-  [prob coll]
-  (filter (fn [_] (< (rand) prob)) coll))
+  probability prob. Returns a transducer when no coll is given."
+  ([prob] (filter (fn [_] (< (rand) prob))))
+  ([prob coll] (filter (fn [_] (< (rand) prob)) coll)))
 
 (defn partitionv
   "As partition, with each part a vector."
@@ -871,7 +882,9 @@
   ([n step coll] (map vec (partition n step coll)))
   ([n step pad coll] (map vec (partition n step pad coll))))
 (defn partitionv-all
-  "As partition-all, with each part a vector."
+  "As partition-all, with each part a vector. Returns a transducer
+  when no coll is given."
+  ([n] (partition-all n))
   ([n coll] (map vec (partition-all n coll)))
   ([n step coll] (map vec (partition-all n step coll))))
 (defn splitv-at
