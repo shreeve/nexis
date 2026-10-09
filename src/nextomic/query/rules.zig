@@ -680,8 +680,7 @@ pub fn explainFixBodies(f: *const Fix, ctx: *const Ctx, lines: anytype, depth: u
     for (f.instances) |inst| {
         for (inst.bodies) |body| {
             var out: std.Io.Writer.Allocating = .init(ctx.arena);
-            var i: usize = 0;
-            while (i < depth) : (i += 1) try out.writer.writeAll("  ");
+            try plan_mod.indent(&out.writer, depth);
             try out.writer.print("{s} body {s}", .{ ctx.interner.symbolName(inst.name), if (body.sites.len == 0) "base" else "recursive" });
             try lines.append(ctx.arena, .{ .text = out.written() });
             try plan_mod.explainSub(body.plan, ctx, lines, depth + 1);

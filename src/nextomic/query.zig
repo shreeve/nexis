@@ -28,13 +28,11 @@ const Value = value.Value;
 const Heap = heap_mod.Heap;
 const Interner = intern_mod.Interner;
 const DbValue = db_mod.DbValue;
+const Ir = ir.Ir;
 
-pub const Ir = ir.Ir;
-pub const RuleSet = ir.RuleSet;
 pub const Diag = parse.Diag;
 pub const Cache = parse.Cache;
 pub const RulesCache = parse.RulesCache;
-pub const Plan = plan.Plan;
 pub const CallHook = exec.CallHook;
 pub const Exec = exec.Exec;
 pub const Source = exec.Source;
@@ -54,7 +52,7 @@ pub const Options = struct {
 /// the caches when given (released by `deinit`), else owned here.
 const Parsed = struct {
     query: *Ir,
-    rules: *const RuleSet = &ir.no_rules,
+    rules: *const ir.RuleSet = &ir.no_rules,
     options: Options,
 
     fn deinit(self: *Parsed) void {

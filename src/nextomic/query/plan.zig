@@ -1241,7 +1241,7 @@ const Line = struct {
     park: ?Park = null,
 };
 
-fn indent(w: *std.Io.Writer, depth: usize) !void {
+pub fn indent(w: *std.Io.Writer, depth: usize) !void {
     var i: usize = 0;
     while (i < depth) : (i += 1) try w.writeAll("  ");
 }
@@ -1296,52 +1296,32 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                     if (s.dedup) try w.writeAll(" dedup");
                 }
                 line.join = joinKind(&s, p.rowsBefore(i));
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .pred => |pr| {
                 try w.writeAll("pred ");
                 try explainCall(pr.call, ctx, w);
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .bind => |b| {
                 try w.writeAll("bind ");
                 try explainCall(b.call, ctx, w);
                 try w.writeAll(" -> ");
                 try explainBinding(b, ctx, w);
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .not => |n| {
                 try w.writeAll("not-join [");
                 try explainVars(n.join, ctx, w);
                 try w.writeAll("]");
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                try explainSub(n.sub, ctx, lines, depth + 1);
             },
             .@"or" => |o| {
                 try w.writeAll("or-join [");
                 try explainVars(o.join, ctx, w);
                 try w.print("] branches={d}", .{o.branches.len});
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                for (o.branches) |br| {
-                    var bw: std.Io.Writer.Allocating = .init(ctx.arena);
-                    try indent(&bw.writer, depth + 1);
-                    try bw.writer.writeAll("branch");
-                    try lines.append(ctx.arena, .{ .text = bw.written() });
-                    try explainSub(br, ctx, lines, depth + 2);
-                }
             },
             .source => |s| {
                 try w.writeAll("source [");
                 try explainVars(s.vars, ctx, w);
                 try w.writeAll("]");
                 line.join = "hash";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .match => |m| {
                 try w.print("match [{s}", .{ctx.interner.symbolName(ctx.source_names[m.src])});
@@ -1351,16 +1331,26 @@ pub fn explainSub(p: *const Plan, ctx: *const Ctx, lines: *std.ArrayList(Line), 
                 }
                 try w.print("] tuples={d}", .{m.rows.len});
                 line.join = "hash";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
             },
             .fix => |f| {
                 try rules_mod.explainFix(&f, ctx, w);
                 line.join = "fixpoint";
-                line.text = out.written();
-                try lines.append(ctx.arena, line);
-                try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1);
             },
+        }
+        line.text = out.written();
+        try lines.append(ctx.arena, line);
+        // A sub-plan's lines follow its step's, indented.
+        switch (step) {
+            .not => |n| try explainSub(n.sub, ctx, lines, depth + 1),
+            .@"or" => |o| for (o.branches) |br| {
+                var bw: std.Io.Writer.Allocating = .init(ctx.arena);
+                try indent(&bw.writer, depth + 1);
+                try bw.writer.writeAll("branch");
+                try lines.append(ctx.arena, .{ .text = bw.written() });
+                try explainSub(br, ctx, lines, depth + 2);
+            },
+            .fix => |f| try rules_mod.explainFixBodies(&f, ctx, lines, depth + 1),
+            else => {},
         }
     }
     var tail: std.Io.Writer.Allocating = .init(ctx.arena);
@@ -1412,7 +1402,15 @@ pub fn explainCell(c: Cell, ctx: *const Ctx, w: *std.Io.Writer) !void {
         .double => |d| try w.print("{d}", .{d}),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
         .keyword => |k| try w.print(":{s}", .{ctx.interner.keywordName(k)}),
-        .str => |s| try w.print("\"{s}\"", .{s}),
+        .str => |s| {
+            // As the reader takes it back: `"` and `\` escaped.
+            try w.writeByte('"');
+            for (s) |b| {
+                if (b == '"' or b == '\\') try w.writeByte('\\');
+                try w.writeByte(b);
+            }
+            try w.writeByte('"');
+        },
         .vm => try w.writeAll("#value"),
     }
 }

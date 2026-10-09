@@ -546,7 +546,7 @@ const Parser = struct {
                 } else if (std.mem.eql(u8, head, "not-join")) {
                     if (parts.len < 3) return self.fail("not-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .not = .{ .join = join, .body = try self.parseBody(parts[2..]) } });
+                    try out.append(self.arena, .{ .not = .{ .join = join.vars, .body = try self.parseBody(parts[2..]) } });
                 } else if (std.mem.eql(u8, head, "or")) {
                     const branches = try self.parseBranches(parts[1..]);
                     try self.checkOrBranches(branches);
@@ -554,7 +554,7 @@ const Parser = struct {
                 } else if (std.mem.eql(u8, head, "or-join")) {
                     if (parts.len < 3) return self.fail("or-join takes a variable vector and clauses");
                     const join = try self.joinVars(parts[1]);
-                    try out.append(self.arena, .{ .@"or" = .{ .join = join, .branches = try self.parseBranches(parts[2..]), .required = try self.requiredVars(parts[1]) } });
+                    try out.append(self.arena, .{ .@"or" = .{ .join = join.vars, .branches = try self.parseBranches(parts[2..]), .required = join.required } });
                 } else if (parts[0].isSymbol() and self.isSrcSym(parts[0])) {
                     if (parts.len < 2 or self.symName(parts[1]) == null) return self.fail("a source prefix is followed by a rule name");
                     const src = try self.srcOf(parts[0]);
@@ -597,34 +597,24 @@ const Parser = struct {
         }
     }
 
-    /// The variables of the leading `[?a ...]` group of a join vector:
-    /// the ones an `or-join` needs bound before it runs.
-    fn requiredVars(self: *Parser, v: Value) Error![]const Var {
-        const items = try self.elems(v);
-        if (items.len == 0 or items[0].kind() != .persistent_vector) return &.{};
-        const group = try self.elems(items[0]);
-        const out = try self.arena.alloc(Var, group.len);
-        for (group, out) |x, *o| o.* = try self.varOf(x.asSymbolId());
-        return out;
-    }
-
-    /// `[?a ?b]` or `[[?a] ?b]` (a required-bound group, flattened).
-    fn joinVars(self: *Parser, v: Value) Error![]Var {
+    /// `[?a ?b]` or `[[?a] ?b]`: every variable, a group flattened, and
+    /// those of a leading group, which an `or-join` needs bound before
+    /// it runs.
+    fn joinVars(self: *Parser, v: Value) Error!struct { vars: []Var, required: []const Var } {
         if (v.kind() != .persistent_vector) return self.fail("expected a vector of variables");
         var out: std.ArrayList(Var) = .empty;
-        for (try self.elems(v)) |x| {
-            if (x.kind() == .persistent_vector) {
-                for (try self.elems(x)) |y| {
-                    if (!self.isVarSym(y)) return self.failFmt("a join vector takes variables, not {f}", .{self.shown(y)});
-                    try ir.addVar(self.arena, &out, try self.varOf(y.asSymbolId()));
-                }
-            } else {
-                if (!self.isVarSym(x)) return self.failFmt("a join vector takes variables, not {f}", .{self.shown(x)});
-                try ir.addVar(self.arena, &out, try self.varOf(x.asSymbolId()));
+        var required: []const Var = &.{};
+        for (try self.elems(v), 0..) |x, i| {
+            const group = x.kind() == .persistent_vector;
+            const start = out.items.len;
+            for (if (group) try self.elems(x) else &.{x}) |y| {
+                if (!self.isVarSym(y)) return self.failFmt("a join vector takes variables, not {f}", .{self.shown(y)});
+                try ir.addVar(self.arena, &out, try self.varOf(y.asSymbolId()));
             }
+            if (group and i == 0) required = try self.arena.dupe(Var, out.items[start..]);
         }
         if (out.items.len == 0) return self.fail("join variable vector is empty");
-        return out.toOwnedSlice(self.arena);
+        return .{ .vars = try out.toOwnedSlice(self.arena), .required = required };
     }
 
     fn parsePattern(self: *Parser, parts_in: []Value) Error!ir.Pattern {
