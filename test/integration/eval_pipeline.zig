@@ -1714,8 +1714,9 @@ test "integration: core.nx comment, doto, defonce, assert and time" {
     try expectOutput("[(assert (= 1 1)) (try (assert (= 1 2)) (catch :assertion-failed e (ex-message e)))]", "[nil Assert failed: (= 1 2)]");
     try expectOutput("(try (assert false \"nope\") (catch any e (ex-message e)))", "Assert failed: nope\nfalse");
     // The shape :pre and :post throw: {:error :assertion-failed :message ...}.
-    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\")}]");
-    try expectOutput("(= (try (assert (pos? -1)) (catch any e e)) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (assoc e :message \"Assert failed: (pos? -1)\"))))", "true");
+    try expectOutput("(try (assert (= 1 \"a\") (str \"n\" 1)) (catch any e [(ex-message e) (:error e) (ex-data e)]))", "[Assert failed: n1\n(= 1 \"a\") :assertion-failed {:error :assertion-failed, :message Assert failed: n1\n(= 1 \"a\"), :fn test-form}]");
+    // The same map but for the place keys, each its own raise site's.
+    try expectOutput("(let [bare #(dissoc % :fn :file :line :column)] (= (try (assert (pos? -1)) (catch any e (bare e))) (try ((fn [x] {:pre [(pos? x)]} x) -1) (catch any e (bare (assoc e :message \"Assert failed: (pos? -1)\"))))))", "true");
     try expectOutput("(let [f (fn [] (try (assert false) (catch any e e)))] (identical? (f) (f)))", "false");
     try expectOutput("(let [r (atom nil) s (with-out-str (reset! r (time (+ 1 2))))] [@r (subs s 0 15) (subs s (- (count s) 8))])", "[3 \"Elapsed time:   msecs\"\n]");
 }
@@ -2080,7 +2081,7 @@ test "hierarchies: derive builds the closures, refuses cycles, and keeps an exis
         \\ (try (derive family :user/ancestor-1 :user/child) (catch any e e))
         \\ (try (derive family :user/child :user/ancestor-1) (catch Exception e (:message e)))
         \\ (identical? family (derive family :user/child :user/parent-1))]
-    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor} :user/child already has :user/ancestor-1 as ancestor true]");
+    , "[true true true (:user/ancestor-1 :user/ancestor-2) nil nil {:error :invalid-derivation, :message Cyclic derivation: :user/child has :user/ancestor-1 as ancestor, :fn test-form} :user/child already has :user/ancestor-1 as ancestor true]");
     // The assertions, each with the text of Clojure 1.12's form.
     try expectOutputProgram(hierarchies ++
         \\(map #(try (%) (catch AssertionError e (pr-str (:message e))))
@@ -2187,7 +2188,7 @@ test "multimethods: preferences resolve an ambiguity, directly or through ancest
         \\[(try (bar :user/rect :user/rect) (catch IllegalArgumentException e (:message e))) (prefers bar)
         \\ (do (prefer-method bar [:user/rect :user/shape] [:user/shape :user/rect]) (bar :user/rect :user/rect)) (prefers bar)
         \\ (try (prefer-method bar [:user/shape :user/rect] [:user/rect :user/shape]) (catch IllegalStateException e e))]
-    , "[Multiple methods in multimethod 'bar' match dispatch value: [:user/rect :user/rect] -> [:user/shape :user/rect] and [:user/rect :user/shape], and neither is preferred {} :rect-shape {[:user/rect :user/shape] #{[:user/shape :user/rect]}} {:error :preference-conflict, :message Preference conflict in multimethod 'bar': [:user/rect :user/shape] is already preferred to [:user/shape :user/rect]}]");
+    , "[Multiple methods in multimethod 'bar' match dispatch value: [:user/rect :user/rect] -> [:user/shape :user/rect] and [:user/rect :user/shape], and neither is preferred {} :rect-shape {[:user/rect :user/shape] #{[:user/shape :user/rect]}} {:error :preference-conflict, :message Preference conflict in multimethod 'bar': [:user/rect :user/shape] is already preferred to [:user/shape :user/rect], :fn test-form}]");
     // indirect-preferences-mulitmethod-test, against the global hierarchy and #'local-h.
     try expectOutputProgram(
         \\(derive :user/parent-1 :user/grandparent-1)
@@ -2257,7 +2258,7 @@ test "multimethods: methods, get-method, prefers, remove-all-methods and what ea
         \\(defmethod amb :user/a [_] :a)
         \\(defmethod amb :user/b [_] :b)
         \\[(try (get-method amb :user/ab) (catch IllegalArgumentException e e)) (get-method amb :user/zzz) ((get-method amb :user/a) 0)]
-    , "[{:error :ambiguous-method, :value :user/ab, :message Multiple methods in multimethod 'amb' match dispatch value: :user/ab -> :user/b and :user/a, and neither is preferred} nil :a]");
+    , "[{:error :ambiguous-method, :message Multiple methods in multimethod 'amb' match dispatch value: :user/ab -> :user/b and :user/a, and neither is preferred, :fn test-form, :value :user/ab} nil :a]");
 }
 
 test "multimethods: :default and :hierarchy options; the cache follows the hierarchy" {
@@ -2313,7 +2314,7 @@ test "multimethods: the no-method message prints the dispatch value as %s; recur
         \\(defmulti area :shape)
         \\(map #(try (area %) (catch IllegalArgumentException e (pr-str e))) [{:shape :tri} {:shape "tri"} {:shape [:a "b"]} {}])
     ,
-        \\({:error :no-method, :value :tri, :message "No method in multimethod 'area' for dispatch value: :tri"} {:error :no-method, :value "tri", :message "No method in multimethod 'area' for dispatch value: tri"} {:error :no-method, :value [:a "b"], :message "No method in multimethod 'area' for dispatch value: [:a \"b\"]"} {:error :no-method, :value nil, :message "No method in multimethod 'area' for dispatch value: nil"})
+        \\({:error :no-method, :message "No method in multimethod 'area' for dispatch value: :tri", :fn "fn", :value :tri} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: tri", :fn "fn", :value "tri"} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: [:a \"b\"]", :fn "fn", :value [:a "b"]} {:error :no-method, :message "No method in multimethod 'area' for dispatch value: nil", :fn "fn", :value nil})
     );
     // The dispatch function and the method are ordinary calls, so no native stack nests.
     try expectOutputProgram(

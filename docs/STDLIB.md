@@ -8,8 +8,10 @@ programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
 §12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
-An error a native raises is caught as its error map, `{:error :tag
-:message m ...}` with the place it was raised (`docs/VM.md` §13); a
+An error a native or a library function raises is caught as its error
+map, `{:error :tag :message m ...}` with the place of the program's
+call it was raised under (`docs/VM.md` §13): the `.nx` sources raise
+theirs through `nexis.internal/#%raise`; a
 wrong argument count is `:arity-mismatch` for every native (the VM
 checks the declared arity).
 
@@ -609,13 +611,16 @@ Vars, as `MultiFn` calls `clojure.core/isa?`.
 
 #### 9.4 Errors, the registry and the image
 
-| Situation | Thrown value | `catch` class |
+| Situation | Error map | `catch` class |
 |---|---|---|
 | No method | `{:error :no-method :message "No method in multimethod 'f' for dispatch value: X" :value dv}` | `IllegalArgumentException` |
 | An ambiguity | `{:error :ambiguous-method :message "Multiple methods in multimethod 'f' match dispatch value: X -> K and B, and neither is preferred" :value dv}` | `IllegalArgumentException` |
 | A preference conflict | `{:error :preference-conflict :message ...}` | `IllegalStateException` |
 | A cycle, or an edge to an ancestor (§9.1) | `{:error :invalid-derivation :message ...}` | any |
 | A `derive` assertion (§9.1) | `{:error :assertion-failed :message "Assert failed: ..."}` | `AssertionError` |
+
+Each is raised through `#%raise`, so a caught one carries the place
+keys of the program's call, as a runtime error does (`docs/VM.md` §13).
 
 Each value is printed into its message by `format`'s `%s`: a string
 bare, a keyword or vector as `pr-str` prints it, nil as `nil` where

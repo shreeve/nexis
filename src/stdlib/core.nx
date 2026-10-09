@@ -131,19 +131,21 @@
      (when-not (bound? v#) (def ~name ~expr))))
 
 ; The printed form is built when the macro expands, so the check costs
-; its test and the failure one call of two constants, a conj that makes
-; a fresh map each time.
+; its test and the failure one call.
 (defmacro assert
-  "Returns nil when x is truthy, else throws {:error :assertion-failed
-  :message \"Assert failed: ...\"} holding message, when given, and the
-  form x: the value a failed :pre or :post condition throws."
+  "Returns nil when x is truthy, else raises :assertion-failed, the
+  error map {:error :assertion-failed :message \"Assert failed: ...\"}
+  holding message, when given, and the form x, with the place of the
+  call as a runtime error's: the error a failed :pre or :post condition
+  raises."
   [x & message]
   `(when-not ~x
-     (throw (conj {:error :assertion-failed}
-                  [:message ~(cond
-                               (empty? message) (str "Assert failed: " (pr-str x))
-                               (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
-                               true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))]))))
+     (nexis.internal/#%raise
+       :assertion-failed
+       ~(cond
+          (empty? message) (str "Assert failed: " (pr-str x))
+          (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
+          true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x)))))))
 
 (defmacro time
   "Evaluates expr, prints the time it took as \"Elapsed time: N msecs\"
@@ -1496,10 +1498,10 @@
   ([tag] (descendants global-hierarchy tag))
   ([h tag] (not-empty (get (:descendants h) tag))))
 
-; Throws the :assertion-failed of Clojure's assert of the form `text`,
+; Raises the :assertion-failed of Clojure's assert of the form `text`,
 ; for the assertions whose form names a Java class.
 (defn- assert-failed [text]
-  (throw {:error :assertion-failed :message (str "Assert failed: " text)}))
+  (nexis.internal/#%raise :assertion-failed (str "Assert failed: " text)))
 
 (defn derive
   "Returns hierarchy h with tag a child of parent (h itself when it is
@@ -1526,9 +1528,9 @@
      (or
       (when-not (contains? (get tp tag) parent)
         (when (contains? (get ta tag) parent)
-          (throw {:error :invalid-derivation :message (print-str tag "already has" parent "as ancestor")}))
+          (nexis.internal/#%raise :invalid-derivation (print-str tag "already has" parent "as ancestor")))
         (when (contains? (get ta parent) tag)
-          (throw {:error :invalid-derivation :message (print-str "Cyclic derivation:" parent "has" tag "as ancestor")}))
+          (nexis.internal/#%raise :invalid-derivation (print-str "Cyclic derivation:" parent "has" tag "as ancestor")))
         {:parents (assoc tp tag (conj (get tp tag #{}) parent))
          :ancestors (tf ta tag td parent ta)
          :descendants (tf td parent ta tag td)})
@@ -1574,6 +1576,12 @@
 (defn- mm-reset! [state cache]
   (let [s @state] (reset! cache [@(:href s) (:table s)])))
 
+; Raises tag as #%raise does, the error map holding the dispatch value
+; dv under :value.
+(defn- raise-value [tag message dv]
+  (try (nexis.internal/#%raise tag message)
+       (catch any e (throw (if (map? e) (assoc e :value dv) e)))))
+
 ; Whether x is preferred to y in the prefer table pt, directly or
 ; through the parents of either in h (MultiFn.prefers).
 (defn- mm-prefers? [h pt x y]
@@ -1595,9 +1603,10 @@
                 (if (isa? ch dv k)
                   (let [best (if (or (nil? best) (mm-dominates? ch pt k (nth best 0))) [k m] best)]
                     (when-not (mm-dominates? ch pt (nth best 0) k)
-                      (throw {:error :ambiguous-method :value dv
-                              :message (format "Multiple methods in multimethod '%s' match dispatch value: %s -> %s and %s, and neither is preferred"
-                                               (:name s) dv k (nth best 0))}))
+                      (raise-value :ambiguous-method
+                                   (format "Multiple methods in multimethod '%s' match dispatch value: %s -> %s and %s, and neither is preferred"
+                                           (:name s) dv k (nth best 0))
+                                   dv))
                     best)
                   best))
               nil (:table s))
@@ -1617,8 +1626,7 @@
 
 (defn- mm-fn [state cache dv]
   (or (mm-method state cache dv)
-      (throw {:error :no-method :value dv
-              :message (format "No method in multimethod '%s' for dispatch value: %s" (:name @state) dv)})))
+      (raise-value :no-method (format "No method in multimethod '%s' for dispatch value: %s" (:name @state) dv) dv)))
 
 ; One arity of a multimethod: the dispatch value of the arguments,
 ; its method from the cache when the hierarchy is still the one the
@@ -1676,8 +1684,8 @@
   [mf x y]
   (let [s @(:state (multifn-entry mf))]
     (when (mm-prefers? @(:href s) (:prefers s) y x)
-      (throw {:error :preference-conflict
-              :message (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)}))
+      (nexis.internal/#%raise :preference-conflict
+                              (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)))
     (mm-update! mf update-in [:prefers x] (fnil conj #{}) y)))
 
 (defn methods
