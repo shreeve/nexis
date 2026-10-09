@@ -57,8 +57,8 @@ set or vector never do. Those nodes cache no hash either: their `hash`
 holds, in its high 26 bits, the edit token of the transient that owns
 them, or 0 (`docs/TRANSIENT.md` §4), and six bits of the collection's
 own below it, a vector tail's claimed length (`docs/VECTOR.md` §2);
-`editTokenOf`, `ownedBy`, `stampEdit`, `nodeAux` and `setNodeAux` read
-and write the two.
+`ownedBy`, `stampEdit`, `nodeAux` and `setNodeAux` read and write the
+two.
 
 ---
 
@@ -133,7 +133,7 @@ at the db layer.
 | `edit_clock` | The last edit token a transient on the heap took (`docs/TRANSIENT.md` §4) |
 | `isBlockKind(kind) bool` | Whether a Value of `kind` carries a `*HeapHeader`: every heap kind except `native_fn`, `var_` and the three db handles, plus `cell_internal`. The collector marks only these |
 | `bodyOf(Body, h) *Body`, `bodyBytes(h) []u8`, `bodySize(h)` | The body, typed (alignment ≤ 16, checked at compile time) or as bytes, as long as `alloc` or the last `resizeInPlace` made it |
-| `bodyCapacity(h)`, `resizeInPlace(h, n) bool` | The longest body the block can take where it stands (its class's size less the header, or a large block's allocation), and a new body size up to it: bytes a longer body gains are zero; false, changing nothing, past the capacity. The transient operations grow and shrink the nodes they own through it (`docs/TRANSIENT.md` §1) |
+| `resizeInPlace(h, n) bool` | A new body size up to the longest the block can take where it stands (its class's size less the header, or a large block's allocation): bytes a longer body gains are zero; false, changing nothing, past that. The transient operations grow and shrink the nodes they own through it (`docs/TRANSIENT.md` §1) |
 | `valueFromHeader(kind, h) Value`, `asHeapHeader(v) *HeapHeader` | Pack a header into a Value with subkind 0, and back. A kind that sets a subkind or view offset packs its own tag (VALUE.md §3) |
 | `liveCount() usize`, `forEachLive(visitor)` | O(n) enumeration: `clearMarks`, the retiring of transient edit tokens (`docs/TRANSIENT.md` §4), tests and diagnostics; the visitor may change header bits but must not allocate or sweep |
 

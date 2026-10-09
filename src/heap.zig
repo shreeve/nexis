@@ -1,23 +1,10 @@
-//! heap.zig — runtime heap allocator + `HeapHeader` storage.
+//! heap.zig — the heap: `HeapHeader`, size-class slabs, large blocks,
+//! the byte counters and the sweep (`docs/HEAP.md`).
 //!
-//! Authoritative contract: `docs/HEAP.md` (§1 the header, §2 the
-//! size-class slabs and large blocks, §3 the API).
-//!
-//! Every heap-kind Value sits on a `*HeapHeader` returned from
-//! `Heap.alloc`. A block of up to `max_small_block` bytes, header
-//! included, is a slot in a slab of its size class; a larger one is a
-//! large block from the backing allocator. The collector in
-//! `src/gc.zig` marks from roots and sweeps through `sweepUnmarked`;
-//! this file owns allocation, enumeration, the byte counters the
-//! trigger policy reads and the sweep primitive.
-//!
-//! Frozen invariants (HEAP.md §1):
-//!   - Returned `*HeapHeader` is 16-byte aligned.
-//!   - `HeapHeader` size is 16; field order matches HEAP.md §1 exactly.
-//!   - Fresh allocations are zero-initialized except `kind`.
-//!   - `HeapHeader.hash == 0` means "not yet computed".
-//!   - A freed block's kind is poisoned; a second free panics in
-//!     safe builds.
+//! A block of up to `max_small_block` bytes, header included, is a slot
+//! in a slab of its size class; a larger one is a large block from the
+//! backing allocator. The collector (`src/gc.zig`) marks; this file
+//! allocates, enumerates and sweeps.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,29 +27,23 @@ comptime {
 // =============================================================================
 
 pub const HeapHeader = extern struct {
-    /// Finer-grained than `Value.tag.kind`. Mirrors the same `Kind` enum
-    /// for the "what is this?" dimension; the extra width leaves
-    /// room for sub-kind packing without another indirection.
+    /// The block's `Kind` (VALUE.md §2), or a freed slot's poison.
     kind: u16 align(16),
-    /// GC bits. See `mark_bit_*` constants.
+    /// The `mark_bit_*` bits.
     mark: u8,
-    /// Heap-object flags. See `flag_*` constants.
+    /// The `flag_*` bits.
     flags: u8,
-    /// Cached hash; 0 = "not yet computed". HEAP.md §1 explicitly
-    /// accepts the (rare) recompute cost when a real hash value is 0.
+    /// The cached hash, 0 when not computed; an internal collection
+    /// node's edit token and aux bits instead (below).
     hash: u32,
-    /// Optional metadata map (always a persistent-map heap object when
-    /// non-null). When null, `flag_has_meta` must also be 0.
+    /// The metadata map, or null; `flag_has_meta` agrees (`setMeta`).
     meta: ?*HeapHeader,
 
     comptime {
         std.debug.assert(@sizeOf(HeapHeader) == 16);
-        // 16-byte *type*-level alignment keeps casts between
-        // `*HeapHeader` and `[*]align(16) u8` lossless — no `@alignCast`
-        // noise at every call site. Runtime alignment is guaranteed by
-        // the allocator via `.@"16"` at alloc time (HEAP.md §1 invariant 1).
+        // The type's alignment makes casts to `[*]align(16) u8` need no
+        // `@alignCast`; `alloc` gives every block that alignment.
         std.debug.assert(@alignOf(HeapHeader) == 16);
-        // Field offsets pinned to match HEAP.md §1 exactly.
         std.debug.assert(@offsetOf(HeapHeader, "kind") == 0);
         std.debug.assert(@offsetOf(HeapHeader, "mark") == 2);
         std.debug.assert(@offsetOf(HeapHeader, "flags") == 3);
@@ -138,10 +119,6 @@ pub const HeapHeader = extern struct {
 // =============================================================================
 
 pub const edit_token_max: u32 = (1 << 26) - 1;
-
-pub inline fn editTokenOf(h: *const HeapHeader) u32 {
-    return h.hash >> 6;
-}
 
 /// Whether the transient with token `edit` (nonzero) owns `h`.
 pub inline fn ownedBy(h: *const HeapHeader, edit: u32) bool {
@@ -570,7 +547,7 @@ pub const Heap = struct {
     }
 
     /// The longest body `resizeInPlace` can give the block.
-    pub fn bodyCapacity(h: *HeapHeader) usize {
+    fn bodyCapacity(h: *HeapHeader) usize {
         if (isLarge(h)) return Large.of(h).len - @sizeOf(Large) - @sizeOf(HeapHeader);
         return Slab.of(h).info().size - @sizeOf(HeapHeader);
     }
@@ -730,19 +707,10 @@ pub const Heap = struct {
 };
 
 // =============================================================================
-// Tests — storage-layout, alloc/free, enumeration, sweep smoke test.
+// Tests. The randomized alloc, mark and sweep laws are test/prop/heap.zig's.
 // =============================================================================
 
 const testing = std.testing;
-
-test "HeapHeader layout is exactly HEAP.md §1" {
-    try testing.expectEqual(@as(usize, 16), @sizeOf(HeapHeader));
-    try testing.expectEqual(@as(usize, 0), @offsetOf(HeapHeader, "kind"));
-    try testing.expectEqual(@as(usize, 2), @offsetOf(HeapHeader, "mark"));
-    try testing.expectEqual(@as(usize, 3), @offsetOf(HeapHeader, "flags"));
-    try testing.expectEqual(@as(usize, 4), @offsetOf(HeapHeader, "hash"));
-    try testing.expectEqual(@as(usize, 8), @offsetOf(HeapHeader, "meta"));
-}
 
 test "size classes: 16-byte steps to a vector leaf, every block fits its class, slots fit their slab" {
     try testing.expectEqual(@as(u32, 16), class_sizes[0]);
@@ -762,12 +730,6 @@ test "size classes: 16-byte steps to a vector leaf, every block fits its class, 
             try testing.expectEqual(i, @as(usize, @intCast((off * info.recip) >> 32)));
         }
     }
-}
-
-test "Heap.init/deinit on empty heap" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
 }
 
 test "alloc: returns 16-byte-aligned *HeapHeader; header zero-init except kind" {
@@ -802,20 +764,6 @@ test "alloc: body is zero-initialized and the right size" {
     try testing.expectEqual(@as(usize, 0), @intFromPtr(body.ptr) % 16);
 }
 
-test "bodyOf: typed pointer with compile-time alignment" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const Payload = extern struct { a: u32, b: u32 };
-    const h = try heap.alloc(.byte_vector, @sizeOf(Payload));
-    const p = Heap.bodyOf(Payload, h);
-    p.* = .{ .a = 0xCAFE, .b = 0xBABE };
-
-    const p2 = Heap.bodyOf(Payload, h);
-    try testing.expectEqual(@as(u32, 0xCAFE), p2.a);
-    try testing.expectEqual(@as(u32, 0xBABE), p2.b);
-}
-
 test "Value ↔ *HeapHeader pointer round-trip" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -828,36 +776,6 @@ test "Value ↔ *HeapHeader pointer round-trip" {
     try testing.expectEqual(h, back);
 }
 
-test "mark helpers round-trip" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const h = try heap.alloc(.string, 0);
-
-    try testing.expect(!h.isMarked());
-    h.setMarked();
-    try testing.expect(h.isMarked());
-    h.clearMarked();
-    try testing.expect(!h.isMarked());
-}
-
-test "meta helpers update has_meta flag in lockstep" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try heap.alloc(.persistent_map, 0);
-    const b = try heap.alloc(.string, 0);
-
-    try testing.expectEqual(@as(?*HeapHeader, null), a.getMeta());
-    try testing.expect((a.flags & flag_has_meta) == 0);
-
-    a.setMeta(b);
-    try testing.expectEqual(@as(?*HeapHeader, b), a.getMeta());
-    try testing.expect((a.flags & flag_has_meta) != 0);
-
-    a.setMeta(null);
-    try testing.expectEqual(@as(?*HeapHeader, null), a.getMeta());
-    try testing.expect((a.flags & flag_has_meta) == 0);
-}
-
 test "cachedHash: 0 means uncomputed; round-trip otherwise" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -868,85 +786,6 @@ test "cachedHash: 0 means uncomputed; round-trip otherwise" {
     try testing.expect(h.cachedHash() == null);
     h.setCachedHash(0xDEADBEEF);
     try testing.expectEqual(@as(?u32, 0xDEADBEEF), h.cachedHash());
-}
-
-test "sweepUnmarked: unmarked freed, marked survive and are reset" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try heap.alloc(.string, 8);
-    _ = try heap.alloc(.bignum, 8); // unmarked -> will be freed
-    const c = try heap.alloc(.list, 8);
-
-    a.setMarked();
-    c.setMarked();
-
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 1), freed);
-    try testing.expectEqual(@as(usize, 2), heap.liveCount());
-
-    // Survivors had their marked bit cleared.
-    try testing.expect(!a.isMarked());
-    try testing.expect(!c.isMarked());
-}
-
-test "sweepUnmarked: all unmarked -> fully drained heap" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    _ = try heap.alloc(.string, 0);
-    _ = try heap.alloc(.string, 0);
-    _ = try heap.alloc(.string, 0);
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 3), freed);
-    try testing.expectEqual(@as(usize, 0), heap.liveCount());
-}
-
-test "forEachLive visits every live block exactly once" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const a = try heap.alloc(.string, 0);
-    const b = try heap.alloc(.bignum, 0);
-    const c = try heap.alloc(.list, 0);
-
-    const Counter = struct {
-        seen_a: bool = false,
-        seen_b: bool = false,
-        seen_c: bool = false,
-        count: usize = 0,
-        target_a: *HeapHeader,
-        target_b: *HeapHeader,
-        target_c: *HeapHeader,
-
-        pub fn visit(self: *@This(), h: *HeapHeader) void {
-            self.count += 1;
-            if (h == self.target_a) self.seen_a = true;
-            if (h == self.target_b) self.seen_b = true;
-            if (h == self.target_c) self.seen_c = true;
-        }
-    };
-
-    var counter: Counter = .{ .target_a = a, .target_b = b, .target_c = c };
-    heap.forEachLive(&counter);
-    try testing.expectEqual(@as(usize, 3), counter.count);
-    try testing.expect(counter.seen_a and counter.seen_b and counter.seen_c);
-}
-
-test "deinit frees every remaining live block (no leak via testing allocator)" {
-    var heap = Heap.init(testing.allocator);
-    _ = try heap.alloc(.string, 64);
-    _ = try heap.alloc(.bignum, 128);
-    _ = try heap.alloc(.list, 16);
-    heap.deinit();
-    // testing.allocator would trip a leak assertion at test teardown
-    // if deinit missed anything.
-}
-
-test "alloc: body_size = 0 is legal" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const h = try heap.alloc(.list, 0);
-    try testing.expectEqual(@as(usize, 0), Heap.bodyBytes(h).len);
 }
 
 test "alloc: overflow in total_size rejects with error.Overflow" {
@@ -982,93 +821,6 @@ test "hasMeta: stays coherent with flag_has_meta through setMeta" {
     a.setMeta(null);
     try testing.expect(!a.hasMeta());
     try testing.expectEqual(@as(?*HeapHeader, null), a.getMeta());
-}
-
-test "sweepUnmarked: the blocks after the survivor in a slab are freed together" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    // Three neighbouring slots of the 16-byte class.
-    const a = try heap.alloc(.string, 0);
-    _ = try heap.alloc(.bignum, 0);
-    _ = try heap.alloc(.list, 0);
-
-    // Mark only `a`; its two neighbours sweep.
-    a.setMarked();
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 2), freed);
-    try testing.expectEqual(@as(usize, 1), heap.liveCount());
-    try testing.expect(!a.isMarked()); // mark cleared on survivor
-}
-
-test "sweepUnmarked: alternating survive / free / survive / free" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    var hs: [4]*HeapHeader = undefined;
-    for (&hs) |*slot| {
-        slot.* = try heap.alloc(.string, 0);
-    }
-    // Alternate: mark even indices; odd get swept.
-    hs[0].setMarked();
-    hs[2].setMarked();
-
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 2), freed);
-    try testing.expectEqual(@as(usize, 2), heap.liveCount());
-    try testing.expect(!hs[0].isMarked());
-    try testing.expect(!hs[2].isMarked());
-}
-
-test "forEachLive: read-only traversal is callable through *const Heap" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    _ = try heap.alloc(.string, 0);
-    _ = try heap.alloc(.bignum, 0);
-    _ = try heap.alloc(.list, 0);
-
-    // Read-only visitor: counts observed blocks and sums their kind
-    // bytes. No heap mutation.
-    const ReadOnlyCounter = struct {
-        count: usize = 0,
-        sum_kind: u32 = 0,
-        pub fn visit(self: *@This(), h: *HeapHeader) void {
-            self.count += 1;
-            self.sum_kind += h.kind;
-        }
-    };
-
-    // Intentionally pass via *const to prove the receiver is truly
-    // read-only at the type level.
-    const heap_ref: *const Heap = &heap;
-    var counter: ReadOnlyCounter = .{};
-    heap_ref.forEachLive(&counter);
-    try testing.expectEqual(@as(usize, 3), counter.count);
-    try testing.expect(counter.sum_kind > 0);
-}
-
-test "alloc stress: 256 allocations, sweep half, deinit the rest" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    var headers: [256]*HeapHeader = undefined;
-    for (&headers, 0..) |*slot, i| {
-        slot.* = try heap.alloc(.string, @intCast(i % 32));
-    }
-    try testing.expectEqual(@as(usize, 256), heap.liveCount());
-
-    // Mark every other one.
-    for (headers, 0..) |h, i| {
-        if (i % 2 == 0) h.setMarked();
-    }
-    const freed = heap.sweepUnmarked();
-    try testing.expectEqual(@as(usize, 128), freed);
-    try testing.expectEqual(@as(usize, 128), heap.liveCount());
-    // Remaining are unmarked (cleared by sweep).
-    for (headers, 0..) |h, i| {
-        if (i % 2 == 0) try testing.expect(!h.isMarked());
-    }
 }
 
 test "byte counters: alloc adds, the sweep subtracts, peak holds, the window resets" {
@@ -1217,7 +969,7 @@ test "slabs: a heap that ends leaves its slabs to the next heap, up to the pool'
     for (Heap.bodyBytes(h)) |byte| try testing.expectEqual(@as(u8, 0), byte);
 }
 
-test "slabs: a sweep keeps pinned and marked slots and every class stays consistent" {
+test "slabs: a sweep keeps the marked slots and every class stays consistent" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     var hs: std.ArrayList(*HeapHeader) = .empty;
