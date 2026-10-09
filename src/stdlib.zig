@@ -6495,10 +6495,9 @@ fn lossyString(vm: *VM, bytes: []const u8) VmError!Value {
     defer w.deinit();
     var i: usize = 0;
     while (i < bytes.len) {
-        const n: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch 0;
-        const ok = n > 0 and i + n <= bytes.len and if (std.unicode.utf8Decode(bytes[i..][0..n])) |_| true else |_| false;
-        w.writer.writeAll(if (ok) bytes[i..][0..n] else "\u{FFFD}") catch return VmError.OutOfMemory;
-        i += if (ok) n else 1;
+        const n: usize = if (string_mod.decodeAt(bytes, i)) |d| d.len else |_| 0;
+        w.writer.writeAll(if (n > 0) bytes[i..][0..n] else "\u{FFFD}") catch return VmError.OutOfMemory;
+        i += @max(n, 1);
     }
     return string_mod.fromBytes(heap, w.written()) catch VmError.OutOfMemory;
 }
@@ -6547,7 +6546,6 @@ fn fnSh(vm: *VM, args: []const Value) VmError!Value {
     var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const interner = vm.ensureInterner();
 
     if (args[0].kind() != .persistent_vector) return VmError.KindMismatch;
     const argc = vector_mod.count(args[0]);
@@ -6560,27 +6558,16 @@ fn fnSh(vm: *VM, args: []const Value) VmError!Value {
         if (std.mem.findScalar(u8, a.*, 0) != null) return vm.fail(VmError.InvalidArgument, "sh: an argument holds a NUL byte", .{});
     }
 
-    var input: ?[]const u8 = null;
-    var cwd: std.process.Child.Cwd = .inherit;
-    var env: ?std.process.Environ.Map = null;
-    if (!args[1].isNil()) {
-        if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
-        var it = champ_mod.mapIter(args[1]);
-        while (it.next()) |e| {
-            const name = if (e.key.kind() == .keyword) interner.keywordName(e.key.asKeywordId()) else "";
-            if (std.mem.eql(u8, name, "in")) {
-                if (e.value.isNil()) continue;
-                if (e.value.kind() != .string) return VmError.KindMismatch;
-                input = string_mod.asBytes(e.value);
-            } else if (std.mem.eql(u8, name, "dir")) {
-                if (!e.value.isNil()) cwd = .{ .path = try vm_mod.pathArg(e.value) };
-            } else if (std.mem.eql(u8, name, "env")) {
-                if (e.value.isNil()) continue;
-                if (!isMap(e.value.kind())) return VmError.KindMismatch;
-                env = try shEnviron(vm, arena, e.value);
-            } else return vm.fail(VmError.InvalidArgument, "sh: no option {s}", .{name});
+    // nil for an option is the process's own.
+    const opts = try keywordOptions(vm, args[1], "sh", &.{ "in", "dir", "env" });
+    const given = struct {
+        fn of(v: ?Value) ?Value {
+            return if (v != null and !v.?.isNil()) v else null;
         }
-    }
+    }.of;
+    const input: ?[]const u8 = if (given(opts[0])) |v| (if (v.kind() == .string) string_mod.asBytes(v) else return VmError.KindMismatch) else null;
+    const cwd: std.process.Child.Cwd = if (given(opts[1])) |v| .{ .path = try vm_mod.pathArg(v) } else .inherit;
+    var env: ?std.process.Environ.Map = if (given(opts[2])) |v| (if (isMap(v.kind())) try shEnviron(vm, arena, v) else return VmError.KindMismatch) else null;
 
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -6591,7 +6578,11 @@ fn fnSh(vm: *VM, args: []const Value) VmError!Value {
         .stderr = .pipe,
     }) catch |err| return switch (err) {
         error.OutOfMemory => VmError.OutOfMemory,
-        error.FileNotFound => vm.fail(VmError.FileNotFound, "sh: cannot run {s}", .{argv[0]}),
+        // A missing :dir fails the spawn as a missing program does.
+        error.FileNotFound => switch (cwd) {
+            .path => |dir| vm.fail(VmError.FileNotFound, "sh: cannot run {s} in {s}", .{ argv[0], dir }),
+            else => vm.fail(VmError.FileNotFound, "sh: cannot run {s}", .{argv[0]}),
+        },
         else => vm.fail(VmError.IoError, "sh: cannot run {s}: {t}", .{ argv[0], err }),
     };
     defer child.kill(io);
@@ -6606,15 +6597,11 @@ fn fnSh(vm: *VM, args: []const Value) VmError!Value {
         .unknown => |code| code,
     };
 
-    const heap = vm.ensureHeap();
-    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
-    const fields = [_]struct { []const u8, Value }{
+    return keywordMap(vm, &.{
         .{ "exit", value_mod.fromFixnum(status) orelse return VmError.ArithmeticOverflow },
         .{ "out", try lossyString(vm, out[0].items) },
         .{ "err", try lossyString(vm, out[1].items) },
-    };
-    for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
-    return m;
+    });
 }
 
 /// The environment `:env` gives a command: each key's name (a string
@@ -6627,7 +6614,8 @@ fn shEnviron(vm: *VM, arena: std.mem.Allocator, map: Value) VmError!std.process.
     var it = MapEntries.of(map).?;
     while (it.next()) |entry| {
         const key = entry.key;
-        const name = if (key.kind() == .string) string_mod.asBytes(key) else intern_mod.Interner.splitQualified(try internedName(vm, key)).name;
+        const name = if (key.kind() == .string) string_mod.asBytes(key) else intern_mod.Interner.splitQualified(internedName(vm, key) catch
+            return vm.fail(VmError.KindMismatch, "sh: an :env name is a string, keyword or symbol, got {s}", .{vm_mod.kindPhrase(key.kind())})).name;
         var w = std.Io.Writer.Allocating.init(arena);
         try appendStrValue(vm, &w, entry.value);
         if (!std.process.Environ.Map.validateKeyForPut(name) or std.mem.findScalar(u8, w.written(), 0) != null)
@@ -6862,11 +6850,11 @@ fn fnParseInstant(vm: *VM, args: []const Value) VmError!Value {
 // JSON (nexis.json, STDLIB.md §13)
 // =============================================================================
 
-/// The options map of a JSON native: the value of each keyword of
-/// `names` (nil when absent; a nil map is no options). Any other key
-/// is `:invalid-argument`.
-fn jsonOptions(vm: *VM, opts: Value, comptime names: []const []const u8) VmError![names.len]Value {
-    var out: [names.len]Value = @splat(value_mod.nilValue());
+/// The options map of the native `who` (nil is none): the value of
+/// each keyword of `names`, null when absent. Any other key is
+/// `:invalid-argument`.
+fn keywordOptions(vm: *VM, opts: Value, comptime who: []const u8, comptime names: []const []const u8) VmError![names.len]?Value {
+    var out: [names.len]?Value = @splat(null);
     if (opts.isNil()) return out;
     if (opts.kind() != .persistent_map) return VmError.KindMismatch;
     const interner = vm.ensureInterner();
@@ -6884,7 +6872,7 @@ fn jsonOptions(vm: *VM, opts: Value, comptime names: []const []const u8) VmError
             for (names, 0..) |n, i| text = text ++ (if (i > 0) ", :" else ":") ++ n;
             break :blk text;
         };
-        return vm.fail(VmError.InvalidArgument, "JSON: an option other than " ++ accepted, .{});
+        return vm.fail(VmError.InvalidArgument, who ++ ": an option other than " ++ accepted, .{});
     }
     return out;
 }
@@ -7216,10 +7204,10 @@ const JsonReader = struct {
 /// it is `:value-fn` itself (clojure.data.json's options).
 fn fnJsonRead(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() != .string) return VmError.KindMismatch;
-    const opts = try jsonOptions(vm, args[1], &.{ "key-fn", "value-fn" });
+    const opts = try keywordOptions(vm, args[1], "JSON", &.{ "key-fn", "value-fn" });
     const text = string_mod.asBytes(args[0]);
     if (!std.unicode.utf8ValidateSlice(text)) return VmError.Utf8Error;
-    var r: JsonReader = .{ .vm = vm, .heap = vm.ensureHeap(), .s = text, .scope = vm.rootScope(), .key_fn = opts[0], .value_fn = opts[1] };
+    var r: JsonReader = .{ .vm = vm, .heap = vm.ensureHeap(), .s = text, .scope = vm.rootScope(), .key_fn = opts[0] orelse value_mod.nilValue(), .value_fn = opts[1] orelse value_mod.nilValue() };
     defer r.scope.release();
     defer r.deinit();
     return r.read();
@@ -7248,6 +7236,8 @@ const JsonWriter = struct {
     indent: bool,
     escape_unicode: bool,
     escape_slash: bool,
+    /// U+2028 and U+2029, line terminators to JavaScript before ES2019.
+    escape_js: bool,
     depth: usize = 0,
 
     fn put(jw: *JsonWriter, bytes: []const u8) VmError!void {
@@ -7381,9 +7371,9 @@ const JsonWriter = struct {
     }
 
     /// `bytes` as a JSON string: `"` and `\` escaped, a control
-    /// character by its short escape or `\u00XX`, `/` and every
-    /// character past ASCII (`\uXXXX`, a pair past the BMP) when the
-    /// options ask.
+    /// character by its short escape or `\u00XX`, `/`, U+2028 and
+    /// U+2029, and every character past ASCII (`\uXXXX`, a pair past
+    /// the BMP) when the options ask.
     fn string(jw: *JsonWriter, bytes: []const u8) VmError!void {
         if (!std.unicode.utf8ValidateSlice(bytes)) return VmError.Utf8Error;
         try jw.put("\"");
@@ -7391,7 +7381,8 @@ const JsonWriter = struct {
         var plain: usize = 0;
         while (i < bytes.len) {
             const c = bytes[i];
-            const needs = c < 0x20 or c == '"' or c == '\\' or (c == '/' and jw.escape_slash) or (c >= 0x80 and jw.escape_unicode);
+            const needs = c < 0x20 or c == '"' or c == '\\' or (c == '/' and jw.escape_slash) or (c >= 0x80 and jw.escape_unicode) or
+                (c == 0xE2 and jw.escape_js and i + 2 < bytes.len and bytes[i + 1] == 0x80 and bytes[i + 2] & 0xFE == 0xA8);
             if (!needs) {
                 i += 1;
                 continue;
@@ -7409,8 +7400,9 @@ const JsonWriter = struct {
                 12 => try jw.put("\\f"),
                 0...7, 11, 14...0x1f => jw.w.print("\\u{x:0>4}", .{c}) catch return VmError.OutOfMemory,
                 else => {
-                    len = std.unicode.utf8ByteSequenceLength(c) catch unreachable;
-                    const cp = std.unicode.utf8Decode(bytes[i..][0..len]) catch unreachable;
+                    const d = string_mod.decodeAt(bytes, i) catch unreachable;
+                    len = d.len;
+                    const cp = d.scalar;
                     if (cp < 0x10000) {
                         jw.w.print("\\u{x:0>4}", .{cp}) catch return VmError.OutOfMemory;
                     } else {
@@ -7435,7 +7427,12 @@ const JsonWriter = struct {
 /// `:key-fn`, `:value-fn`, `:indent`, `:escape-unicode` and
 /// `:escape-slash` (STDLIB.md §13).
 fn fnJsonWrite(vm: *VM, args: []const Value) VmError!Value {
-    const opts = try jsonOptions(vm, args[1], &.{ "key-fn", "value-fn", "indent", "escape-unicode", "escape-slash" });
+    const opts = try keywordOptions(vm, args[1], "JSON", &.{ "key-fn", "value-fn", "indent", "escape-unicode", "escape-slash", "escape-js-separators" });
+    const flag = struct {
+        fn of(v: ?Value, absent: bool) bool {
+            return if (v) |x| x.isTruthy() else absent;
+        }
+    }.of;
     // Every lazy seq in `x` is realized first, so the walk calls back
     // into the VM only for the options' functions.
     try seq_mod.realizeAll(vm, args[0]);
@@ -7445,11 +7442,12 @@ fn fnJsonWrite(vm: *VM, args: []const Value) VmError!Value {
         .vm = vm,
         .w = &out.writer,
         .scope = vm.rootScope(),
-        .key_fn = opts[0],
-        .value_fn = opts[1],
-        .indent = opts[2].isTruthy(),
-        .escape_unicode = opts[3].isTruthy(),
-        .escape_slash = opts[4].isTruthy(),
+        .key_fn = opts[0] orelse value_mod.nilValue(),
+        .value_fn = opts[1] orelse value_mod.nilValue(),
+        .indent = flag(opts[2], false),
+        .escape_unicode = flag(opts[3], false),
+        .escape_slash = flag(opts[4], false),
+        .escape_js = flag(opts[5], true),
     };
     defer jw.scope.release();
     try jw.value(args[0]);

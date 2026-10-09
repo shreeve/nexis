@@ -708,7 +708,7 @@ as U+FFFD, as Java decodes it.
 |---|---|---|---|
 | `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
 | `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
-| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`), `:io-error` (any other failure to run it; a VM with no `io`) |
+| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`, an `:env` name that is not a string, keyword or symbol), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`; with a `:dir` the message names both, `sh: cannot run ls in /x`), `:io-error` (any other failure to run it; a VM with no `io`) |
 | `*sh-dir*`, `*sh-env*` | Var | Dynamic, nil at the root: the `:dir` and `:env` of a `sh` that gives none | — |
 | `with-sh-dir`, `with-sh-env` | macro | `(with-sh-dir dir body...)`: the body with `*sh-dir*` bound to `dir`; `with-sh-env` the same for `*sh-env*` | — |
 
@@ -813,15 +813,19 @@ Nextomic attribute keeps its namespace; `:key-fn name` gives
 key is a string as it is, a keyword or symbol by its whole name, an
 integer by its digits. A string is written as UTF-8 with `"`, `\` and
 the control characters escaped (`\b`, `\f`, `\n`, `\r`, `\t`, else
-`\u00XX`); `clojure.data.json` escapes every non-ASCII character and
-`/` by default, this writer only when asked. The walk recurses on the
+`\u00XX`), and U+2028 and U+2029 as `\u2028` and `\u2029`, which
+JavaScript before ES2019 reads as line terminators, so the text stays
+one token inside a `<script>`, as `clojure.data.json`'s
+`:escape-js-separators` does by default; `clojure.data.json` also
+escapes every other non-ASCII character and `/` by default, this
+writer only when asked. The walk recurses on the
 data's depth under the stack guard, so data nested past the native
 stack is a catchable `:stack-overflow`.
 
 | Name | Arity | Semantics |
 |---|---|---|
 | `read-str` | 1+ | `(read-str s & opts)`: the value of the JSON text `s`. `:key-fn`: a function of each key's string, its result the map key (`keyword` gives keyword keys, interned without a call: an empty key, which names no keyword, is `:invalid-argument`). `:value-fn`: a function of each object member's key (after `:key-fn`) and value, inner objects first, whose result replaces the value, or drops the member when it is `:value-fn` itself |
-| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/` |
+| `write-str` | 1+ | `(write-str x & opts)`: the JSON text of `x`, as above. `:key-fn`: a function of each map key to the string written; `:value-fn`: a function of each map entry's key and value whose result is written, the entry left out when it is `:value-fn` itself; `:indent true`: a newline before each member and element, two spaces a level, `": "` after a key, an empty collection kept as `{}` or `[]` (`clojure.data.json` 2.5's `:indent`); `:escape-unicode true`: every character past ASCII as `\uXXXX`, a pair past the BMP; `:escape-slash true`: `/` as `\/`; `:escape-js-separators` false or nil: U+2028 and U+2029 written as they are |
 | `read` | 1+ | `(read path & opts)`: `read-str` of the file's text (`slurp`); stdin is `(read "/dev/stdin")` |
 | `write` | 2+ | `(write x path & opts)`: `write-str` of `x` into the file, replacing it (`spit`); nil |
 

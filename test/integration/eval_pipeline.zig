@@ -8753,3 +8753,16 @@ test "#%raise of a map throws it with the place of the program's call" {
     try expectOutput("(try (nexis.internal/#%raise :kind-mismatch \"f takes a number, got\" \"s\") (catch any e [(:fn e) (:message e)]))", "[test-form f takes a number, got a string]");
     try expectOutput("(try (nexis.internal/#%raise [1]) (catch any e (:error e)))", ":kind-mismatch");
 }
+
+test "json: write-str escapes U+2028 and U+2029 unless :escape-js-separators is false" {
+    try expectOutput("(nexis.json/write-str (str \"a\" (char 0x2028) (char 0x2029) \"b\" (char 0x2027)))", "\"a\\u2028\\u2029b\u{2027}\"");
+    try expectOutput("(= (nexis.json/write-str (str (char 0x2028)) :escape-js-separators false) (str \\\" (char 0x2028) \\\"))", "true");
+    try expectOutput("(nexis.json/write-str (str (char 0x2029)) :escape-js-separators nil)", "\"\u{2029}\"");
+    try expectOutput("(nexis.json/write-str (str (char 0x2029)) :escape-unicode true :escape-js-separators false)", "\"\\u2029\"");
+}
+
+test "shell: sh names a missing :dir, an :env name of another kind and an unknown option" {
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir \"/nexis-no-such-dir\") (catch any e [(:error e) (:message e)]))", "[:file-not-found sh: cannot run ls in /nexis-no-such-dir]");
+    try expectOutputWithIo("(try (nexis.shell/sh \"env\" :env {1 \"x\"}) (catch any e [(:error e) (:message e)]))", "[:kind-mismatch sh: an :env name is a string, keyword or symbol, got an integer]");
+    try expectOutputWithIo("(try (nexis.shell/sh \"true\" :out-enc \"UTF-8\") (catch any e [(:error e) (:message e)]))", "[:invalid-argument sh: an option other than :in, :dir, :env]");
+}
