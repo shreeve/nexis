@@ -71,7 +71,8 @@ true.
   `(max 1 2.0)` is `2.0`, a tie is the second argument (`(max 1
   1.0)` is `1.0`), and a NaN argument is the result.
 - `=`, `==`, `<`, `<=`, `>` and `>=` take one argument or more, as
-  Clojure's do; none is `:arity-mismatch`. `+` and `*` take none:
+  Clojure's do; none is `:arity-mismatch`, and one is true whatever
+  it is: `(< :a)` is `true`, as Clojure's `([x] true)`. `+` and `*` take none:
   `(+)` is `0`, `(*)` is `1`.
 - `/` on two integers yields an integer when the division is exact
   and otherwise the f64 nearest the true quotient (ties to even),

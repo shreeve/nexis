@@ -3171,6 +3171,8 @@ test "integration: variadic native + / * / - / <" {
     try expectOutput("(- 10 3)", "7");
     try expectOutput("(- 7)", "-7");
     try expectOutput("[(try (<) (catch :arity-mismatch _ :arity)) (try (<=) (catch :arity-mismatch _ :arity)) (try (==) (catch :arity-mismatch _ :arity))]", "[:arity :arity :arity]");
+    // One argument is true whatever it is, as Clojure's ([x] true).
+    try expectOutput("[(< :a) (<= \"s\") (> nil) (>= []) (== :a) (= :a) (< 1) (== ##NaN)]", "[true true true true true true true true]");
     try expectOutput("(< 1 2 3)", "true");
     try expectOutput("(< 1 3 2)", "false");
 }
@@ -5933,13 +5935,14 @@ test "record internals: a type id no defrecord registered is :invalid-argument" 
     , "[{:error :invalid-argument, :message invalid argument, :fn test-form} {:error :invalid-argument, :message invalid argument, :fn test-form}]");
 }
 
-test "defrecord: map->R takes any map, as Clojure's does" {
+test "defrecord: map->R takes any map and fills an absent field with nil, as Clojure's does" {
     try expectOutputProgram(
         \\(defrecord P [x z])
         \\(defrecord Q [x])
         \\[(map->P (sorted-map :z 2 :x 1)) (map->P nil) (map->P (->Q 5)) (P? (map->P (->Q 5)))
         \\ (try (map->P [1 2]) (catch any e e))]
-    , "[#user.P{:x 1, :z 2} #user.P{} #user.P{:x 5} true {:error :kind-mismatch, :message kind mismatch, :fn map->P}]");
+    , "[#user.P{:x 1, :z 2} #user.P{:x nil, :z nil} #user.P{:x 5, :z nil} true {:error :kind-mismatch, :message kind mismatch, :fn map->P}]");
+    try expectOutputProgram("(defrecord P [x z]) (let [p (map->P {:z 1 :w 2})] [(count p) (contains? p :x) (:x p) (= p (->P nil 1)) (= p (assoc (->P nil 1) :w 2))])", "[3 true nil false true]");
 }
 
 // =============================================================================
@@ -6455,7 +6458,7 @@ test "numbers: comparison across kinds" {
     try expectOutput("(not= :a :a :a)", "false");
     try expectOutput("(try (< 1 :a) (catch any e e))", "{:error :kind-mismatch, :message < expects numbers, got a keyword, :fn test-form}");
     try expectOutput("(try (> \"a\" 1) (catch any e e))", "{:error :kind-mismatch, :message > expects numbers, got a string, :fn test-form}");
-    try expectOutput("(try (>= nil) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(>= nil)", "true");
 }
 
 test "numbers: predicates over the tower" {
@@ -7707,6 +7710,8 @@ test "binding: nesting, restoration, and a closure seeing the binding in force a
     try expectOutputProgram("(def ^:dynamic *x* 1) (let [f (fn [] *x*)] [(f) (binding [*x* 5] (f)) (f)])", "[1 5 1]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (binding [*x* (+ *x* 10)] (binding [*x* (+ *x* 100)] *x*))", "111");
     try expectOutputProgram("(def ^:dynamic *x* 1) [(thread-bound? (var *x*)) (binding [*x* 0] (thread-bound? (var *x*)))]", "[false true]");
+    // thread-bound? takes any number of Vars, all of which must be bound; with none it is true.
+    try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) [(binding [*x* 0] (thread-bound? #'*x* #'*y*)) (binding [*x* 0 *y* 0] (thread-bound? #'*x* #'*y*)) (thread-bound?)]", "[false true true]");
     // bound? counts a binding in force, as Clojure's Var.isBound; with no Vars it is true.
     try expectOutputProgram("(def ^:dynamic *u*) [(bound? #'*u*) (binding [*u* 1] (bound? #'*u*)) (binding [*u* 1] (bound? #'*u* #'inc)) (bound?)]", "[false true true true]");
     try expectOutputProgram("(def ^:dynamic *x* 1) (def ^:dynamic *y* 2) (binding [*x* *y* *y* *x*] [*x* *y*])", "[2 1]");
