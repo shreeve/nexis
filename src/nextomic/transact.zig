@@ -1113,15 +1113,13 @@ const Ctx = struct {
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* -= @intCast(entry.value_ptr.*);
         }
-        const ids: datom_mod.IdSource = .{ .ctx = @ptrCast(self), .identId = &identIdOf, .attrType = &attrTypeOf };
-        const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        try excise_mod.rewriteTxlog(store, self.txn, self.arena, out.ts, e, a, ids, names);
+        try excise_mod.rewriteTxlog(store, self.txn, self.arena, out.ts, e, a, .{ .ctx = @ptrCast(self), .attrType = &attrTypeOf, .payload = &noPayload });
     }
 
-    fn identIdOf(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
-        const self: *Ctx = @ptrCast(@alignCast(ctx));
-        if (try self.minter.lookupName(name)) |id| return id;
-        return self.conn.store.retiredIdentId(self.txn, name);
+    /// A rewrite keeps an out-of-line value's digest and reads no
+    /// payload.
+    fn noPayload(_: *anyopaque, _: u64, _: u32, _: []const u8, _: u64, _: bool) anyerror![]const u8 {
+        return error.Corrupted;
     }
 
     fn attrTypeOf(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
@@ -1568,8 +1566,7 @@ const Ctx = struct {
     }
 
     /// The value of a current row. An out-of-line payload lives in the
-    /// fact's EAVT-h assertion rows alone, so it is read by the EAVT
-    /// fact.
+    /// fact's current EAVT row alone, so it is read by the EAVT fact.
     fn valFromParts(self: *Ctx, parts: key.Parts) !Val {
         const kv = try key.decodeVal(self.arena, parts.v);
         if (kv == .val) return kv.val;
@@ -1859,13 +1856,12 @@ const Ctx = struct {
         var live = try self.liveRows(.aevt, .{ .a = attr.id });
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (try live.next()) |r| {
-            if (r.kv.value.len < key.id_len) return error.Corrupted;
             if (r.pending) |p| if (!p.added) continue;
             const vb = try self.arena.dupe(u8, r.parts.v);
             if (becomes_unique) {
                 if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
             }
-            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = try key.readT(r.kv.value[0..key.id_len]) });
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = (try key.readCurrent(r.kv.value)).t });
         }
         if (becomes_unique) {
             for (self.overlay.items) |p| {
@@ -1875,9 +1871,8 @@ const Ctx = struct {
         }
         for (rows.items) |r| {
             const ck = try key.keyBytes(self.arena, .avet, r.e, attr.id, r.vbytes, null);
-            var tb: [key.id_len]u8 = undefined;
-            key.writeId(&tb, r.t);
-            try self.txn.putInTree(store.trees.cur(.avet), ck, &tb);
+            var tb: [key.t_value_max]u8 = undefined;
+            try self.txn.putInTree(store.trees.cur(.avet), ck, key.writeCurrentT(&tb, r.t));
         }
         // Collected before the puts: no cursor stays open across a write.
         var history: std.ArrayList([]const u8) = .empty;
@@ -1927,24 +1922,13 @@ const Ctx = struct {
         }
 
         self.tx_data = try self.txData();
-        // The txlog entry is built through a VM heap of its own; the
-        // store copies the bytes, so that scratch is freed here.
-        var scratch = std.heap.ArenaAllocator.init(self.conn.gpa);
-        defer scratch.deinit();
-        const names: datom_mod.NameSource = .{ .ctx = @ptrCast(self), .identName = &identName };
-        const entry = try datom_mod.encodeTxlog(scratch.allocator(), self.now_ms, self.tx_data, self.excised, names);
-        try store.putTxlog(self.txn, self.t, entry);
+        try store.putTxlog(self.txn, self.t, try datom_mod.encodeTxlog(self.arena, self.t, self.now_ms, self.tx_data, self.excised));
 
         try store.writeT(self.txn, self.t);
         try store.writeFulltextStamp(self.txn, self.t);
         if (self.schema_touched) try store.bumpSchemaGen(self.txn);
         if (self.eid_bumped) try store.writeNextEid(self.txn, self.next_eid);
         try self.minter.finish();
-    }
-
-    fn identName(ctx: *anyopaque, id: u32) anyerror!?[]const u8 {
-        const self: *Ctx = @ptrCast(@alignCast(ctx));
-        return self.conn.store.identNameById(self.txn, id);
     }
 
     fn txData(self: *Ctx) ![]Datom {

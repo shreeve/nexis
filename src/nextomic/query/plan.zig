@@ -374,14 +374,11 @@ pub const Ctx = struct {
         return attr;
     }
 
-    /// Entries of the AEVT tree this view reads: the cost of a scan
-    /// over every datom.
+    /// Entries of AEVT this view reads: the cost of a scan over every
+    /// datom.
     pub fn aevtEntries(self: *Ctx) !u64 {
         if (self.aevt_entries) |n| return n;
-        const read = try self.db();
-        const store = read.db.conn.store;
-        const tree = if (read.fast()) store.trees.cur(.aevt) else store.trees.hist(.aevt);
-        const n = try store_mod.Store.treeEntries(read.txn, tree);
+        const n = try viewEntries(try self.db(), .aevt);
         self.aevt_entries = n;
         return n;
     }
@@ -438,6 +435,17 @@ pub const Bound = struct {
         try self.list.append(arena, v);
     }
 };
+
+/// The rows a scan of `index` reads in this view: the current tree's
+/// entries in the plain view at the newest basis, otherwise the
+/// current and history trees' together, which a fold walks merged
+/// (NEXTOMIC.md §4).
+fn viewEntries(read: *Read, index: key.Index) !u64 {
+    const store = read.db.conn.store;
+    const current = try store_mod.Store.treeEntries(read.txn, store.trees.cur(index));
+    if (read.fast()) return current;
+    return current + try store_mod.Store.treeEntries(read.txn, store.trees.hist(index));
+}
 
 /// Plan `query` for `read`. The returned plan starts from the relation
 /// over the `:in` variables and ends with the `:find` and `:with` ones.
@@ -1092,9 +1100,7 @@ fn planScan(ctx: *Ctx, p: ir.Pattern, bound: *const Bound) Failure!Scan {
     const history = read.db.history;
     const dedup = slots[0] == .blank or slots[1] == .blank or slots[2] == .blank or
         (history and (slots[3] == .blank or slots[4] == .blank));
-    const store = read.db.conn.store;
-    const tree = if (read.fast()) store.trees.cur(choice.index) else store.trees.hist(choice.index);
-    const entries = try store_mod.Store.treeEntries(read.txn, tree);
+    const entries = try viewEntries(read, choice.index);
 
     return .{
         .src = ctx.selected,

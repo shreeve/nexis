@@ -216,11 +216,55 @@ test "K4 every AVET key of an inline value is under 256 bytes" {
     }
     const gpa = arena.reset();
     // The worst case named in §2.2: a 96-byte string of NULs escapes to
-    // 192 bytes and the AVET history key is 210 bytes.
+    // 192 bytes, and the AVET history key takes the longest attribute
+    // and entity besides.
     const worst: [key.inline_max]u8 = @splat(0);
     const wb = try key.valBytes(gpa, .{ .string = &worst });
     const wk = try key.keyBytes(gpa, .avet, key.id_max, std.math.maxInt(u32), wb, .{ .t = 1, .added = true });
-    try testing.expectEqual(@as(usize, 210), wk.len);
+    try testing.expectEqual(@as(usize, 212), wk.len);
+    try testing.expectEqual(key.max_key_len, wk.len);
+}
+
+/// The ordered varint's edges: each length's first and last value.
+const ordered_edges = [_]u64{ 0, 1, 240, 241, 2287, 2288, 67823, 67824, (1 << 24) - 1, 1 << 24, (1 << 32) - 1, 1 << 32, (1 << 40) - 1, 1 << 40, (1 << 46) - 1, 1 << 46, key.id_max, std.math.maxInt(u64) };
+
+fn randOrdered(rand: std.Random) u64 {
+    return switch (rand.uintLessThan(u8, 4)) {
+        0 => ordered_edges[rand.uintLessThan(usize, ordered_edges.len)] +% rand.intRangeAtMost(u64, 0, 2) -% 1,
+        1 => rand.uintAtMost(u64, 70_000),
+        2 => rand.int(u32),
+        else => rand.int(u64) >> rand.uintLessThan(u6, 63),
+    };
+}
+
+test "K7 ordered varints: byte order is numeric order, the first byte gives the length, the shortest form alone decodes" {
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 7);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 7, i);
+        const a = randOrdered(rand);
+        const b = randOrdered(rand);
+        var abuf: [key.ordered_max]u8 = undefined;
+        var bbuf: [key.ordered_max]u8 = undefined;
+        const x = key.writeOrdered(&abuf, a);
+        const y = key.writeOrdered(&bbuf, b);
+        try testing.expectEqual(std.math.order(a, b), std.mem.order(u8, x, y));
+        // Prefix-free: one never begins the other unless they are equal.
+        if (a != b) try testing.expect(!std.mem.startsWith(u8, x, y) and !std.mem.startsWith(u8, y, x));
+        try testing.expectEqual(x.len, key.orderedLen(x[0]));
+        const r = try key.readOrdered(x);
+        try testing.expectEqual(a, r.n);
+        try testing.expectEqual(x.len, r.len);
+    }
+    for (ordered_edges) |n| {
+        var buf: [key.ordered_max]u8 = undefined;
+        try testing.expectEqual(n, (try key.readOrdered(key.writeOrdered(&buf, n))).n);
+    }
+    // A value spelled longer than it need be is refused.
+    for ([_][]const u8{ &.{ 250, 0, 0, 5 }, &.{ 250, 1, 8, 239 }, &.{ 251, 0, 255, 255, 255 }, &.{ 255, 0, 0, 0, 0, 0, 0, 0, 1 }, &.{241}, &.{} }) |bad| {
+        try testing.expectError(error.Corrupted, key.readOrdered(bad));
+    }
 }
 
 test "K6 values of different types order by type, whatever their contents" {
@@ -310,5 +354,66 @@ test "K5 strings across the inline threshold: one tag, order holds on the 64-byt
         const db = try key.decodeVal(gpa, eb);
         try testing.expect(db != .val);
         try testing.expectEqual(key.hash128(sb), if (as_string) db.string_long.hash else db.bytes_long.hash);
+    }
+}
+
+/// The entity id's edges: each partition's ends and each offset
+/// length's.
+const entity_edges = [_]u64{ 1, 2, 255, 256, 65535, 65536, (1 << 24) - 1, 1 << 24, (1 << 32) - 1, 1 << 32, (1 << 32) + 1, (1 << 32) + 255, (1 << 32) + 256, (1 << 46) - 1, 1 << 46, (1 << 46) | 1, key.id_max };
+
+fn randEntity(rand: std.Random) u64 {
+    return switch (rand.uintLessThan(u8, 4)) {
+        0 => entity_edges[rand.uintLessThan(usize, entity_edges.len)],
+        1 => rand.intRangeAtMost(u64, 1, (1 << 32) - 1),
+        2 => (1 << 32) + (rand.int(u64) >> rand.uintLessThan(u6, 63)) % ((1 << 46) - (1 << 32)),
+        else => rand.intRangeAtMost(u64, 1, key.id_max),
+    };
+}
+
+test "K8 entity ids: byte order is numeric order, the header gives the length, the shortest form alone decodes" {
+    var prng = std.Random.DefaultPrng.init(prng_seed +% 8);
+    const rand = prng.random();
+    var arena = Arena.init();
+    defer arena.deinit();
+    var i: usize = 0;
+    while (i < pairs_per_type) : (i += 1) {
+        errdefer trial(prng_seed +% 8, i);
+        const gpa = arena.reset();
+        const a = randEntity(rand);
+        const b = randEntity(rand);
+        var abuf: [key.entity_key_max]u8 = undefined;
+        var bbuf: [key.entity_key_max]u8 = undefined;
+        const x = key.writeEntity(&abuf, a);
+        const y = key.writeEntity(&bbuf, b);
+        try testing.expectEqual(std.math.order(a, b), std.mem.order(u8, x, y));
+        if (a != b) try testing.expect(!std.mem.startsWith(u8, x, y) and !std.mem.startsWith(u8, y, x));
+        try testing.expectEqual(x.len, key.entityLen(x[0]));
+        const r = try key.readEntity(x);
+        try testing.expectEqual(a, r.e);
+        try testing.expectEqual(x.len, r.len);
+        // As ref values, and in AVET and VAET keys, refs order as their ids.
+        const va = try key.valBytes(gpa, .{ .ref = a });
+        const vb = try key.valBytes(gpa, .{ .ref = b });
+        try testing.expectEqual(std.math.order(a, b), std.mem.order(u8, va, vb));
+        const attr = rand.int(u32);
+        const e = randEntity(rand);
+        inline for (.{ key.Index.avet, key.Index.vaet }) |ix| {
+            const ka = try key.keyBytes(gpa, ix, e, attr, va, null);
+            const kb = try key.keyBytes(gpa, ix, e, attr, vb, null);
+            try testing.expectEqual(std.math.order(a, b), std.mem.order(u8, ka, kb));
+            const p = try key.unpackKey(ix, false, ka);
+            try testing.expectEqual(e, p.e);
+            try testing.expectEqual(attr, p.a);
+            try testing.expectEqual(a, (try key.partsVal(gpa, ix, p)).val.ref);
+        }
+    }
+    for (entity_edges) |n| {
+        var buf: [key.entity_key_max]u8 = undefined;
+        try testing.expectEqual(n, (try key.readEntity(key.writeEntity(&buf, n))).e);
+    }
+    // An offset spelled longer than it need be, past its partition, a
+    // class outside the three, or entity 0 is refused.
+    for ([_][]const u8{ &.{ 0x12, 0, 5 }, &.{0x10}, &.{ 0x15, 1, 0, 0, 0, 0 }, &.{ 0x26, 0x40, 0, 0, 0, 0, 0 }, &.{ 0x41, 1 }, &.{ 0x02, 1, 1 }, &.{0x21}, &.{} }) |bad| {
+        try testing.expectError(error.Corrupted, key.readEntity(bad));
     }
 }

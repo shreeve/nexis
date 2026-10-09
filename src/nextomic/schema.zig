@@ -7,9 +7,10 @@
 //!   - Every assertion and retraction of `:db/valueType`,
 //!     `:db/cardinality`, `:db/unique`, `:db/index`, `:db/isComponent`
 //!     or `:db/fulltext` on an attribute is one event of its timeline,
-//!     read once from EAVT-h. `attr(a)` is the timeline replayed to the
-//!     schema's basis; `attrAt(a, b)` replays it to `b`, so every flag
-//!     and the cardinality read as basis `b` saw them.
+//!     read once from EAVT and EAVT-h together (`Store.FoldScan`).
+//!     `attr(a)` is the timeline replayed to the schema's basis;
+//!     `attrAt(a, b)` replays it to `b`, so every flag and the
+//!     cardinality read as basis `b` saw them.
 //!   - `:db/fulltext` is the one bootstrap attribute whose id differs
 //!     between stores (`Store.fulltext_aid`); the store supplies it.
 //!   - `count` is the number of current AEVT entries of the attribute at
@@ -123,26 +124,25 @@ pub const Schema = struct {
         errdefer self.arena.deinit();
         const arena = self.arena.allocator();
 
-        var start: [key.id_len]u8 = undefined;
-        var end: [key.id_len]u8 = undefined;
-        key.writeId(&start, 1);
-        key.writeId(&end, key.attr_partition_end);
+        var start_buf: [key.entity_key_max]u8 = undefined;
+        var end_buf: [key.entity_key_max]u8 = undefined;
+        const start = key.writeEntity(&start_buf, 1);
+        const end = key.writeEntity(&end_buf, key.attr_partition_end);
 
         var events: std.ArrayList(Event) = .empty;
         var e: u64 = 0;
-        var s = try Store.scanRange(txn, store.trees.hist(.eavt), &start, &end);
-        s.cursor.keysOnly = true;
-        while (try s.next()) |kv| {
-            const parts = try key.unpackKey(.eavt, true, kv.key);
+        // Every row of the partition up to the basis, its current
+        // facts' latest assertions included.
+        var s = try Store.foldScan(txn, store.trees, .eavt, start, end, .{ .all = .{ .after = 0, .upto = basis } });
+        while (try s.next()) |row| {
+            const parts = try key.unpackKey(.eavt, false, row.fact);
             if (parts.e != e) {
                 try self.add(arena, e, events.items);
                 events = .empty;
                 e = parts.e;
             }
-            const top = parts.top.?;
-            if (top.t > basis) continue;
             const ev = (try eventOf(parts.a, parts.v, store.fulltext_aid)) orelse continue;
-            try events.append(arena, .{ .t = top.t, .field = ev.field, .value = ev.value, .added = top.added });
+            try events.append(arena, .{ .t = row.t, .field = ev.field, .value = ev.value, .added = row.added });
         }
         try self.add(arena, e, events.items);
 

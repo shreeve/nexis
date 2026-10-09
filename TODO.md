@@ -67,30 +67,13 @@ up. Every fix starts with its failing test (`AGENTS.md`).
 
 ## Store size
 
-20. **The store is 3.1× Datalevin's and 7.6× Datomic Pro's.** 100,000
-    entities of five attributes take 144 MB against Datalevin's 46 MB
-    on the Apple M5 (`docs/PERF.md` §3.11), and 137 MB against
-    Datalevin's 42 MB, Datomic Local's 25 MB and Datomic Pro's 18 MB
-    on the Linux host (§3.15). Half is the four history trees and the
-    txlog, which Datalevin does not keep; Datomic Local's EAVT holds
-    about 8 bytes a datom, Nextomic's 26 bytes of key and value plus
-    emdb's 10, and again in its history twin. #5 and #6 are two of its
-    parts; `docs/PERF.md` §6 "Store size" lists the levers.
-
-5. **The per-tree table cannot be refreshed.** `docs/PERF.md` §3.11's
-   table of entries, bytes, leaves and fill per tree came from a
-   program over emdb's `treeStat` and a cursor walk that is not in the
-   repository, and it measures the two-pass write order that
-   `docs/NEXTOMIC.md` §2.5 no longer uses. Commit the tool (a `bench`
-   category or a `zig build` step), then remeasure the table.
-6. **Small transactions leave half-full leaves.** emdb fills a leaf to
-   nine tenths only while one write transaction continues an ascending
-   run (emdb `SPEC.md` INV-SP03); a stream of one-key transactions into
-   the same gap (a new entity's EAVT rows before the transaction
-   entities, the end of an attribute's AEVT run) splits each leaf in
-   half. A per-page record of the last insert position, kept across
-   transactions as InnoDB keeps one, would fill them. It is an engine
-   question for emdb's owner, not a nexis change.
+20. **The store is 1.24× Datalevin's and 2.9× Datomic Pro's.**
+    100,000 entities of five attributes take 51 MB on the Apple M5 and
+    52 MB on the Linux host, against Datalevin's 42 MB without history,
+    Datomic Local's 25 MB and Datomic Pro's 18 MB (`docs/PERF.md`
+    §3.36). The remaining gap to Datomic is its block-compressed
+    segments, which byte keys in index order refuse; `docs/PERF.md` §6
+    "Store size" lists what is left and what was declined.
 
 ## Build and environment
 

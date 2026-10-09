@@ -22,10 +22,15 @@
 //!     store whose idents lack `:db/fulltext` receives it at open, minted
 //!     at the store's next ident id in a transaction of its own, and the
 //!     id it took is `fulltext_aid`.
-//!   - Current-tree values are `[t:6]` (a format-1 store's `nx/eavt`
-//!     rows may follow it with their payload); history-tree values are
-//!     empty, except an out-of-line value's payload on each `nx/eavt-h`
-//!     assertion row of its fact.
+//!   - A current fact's latest assertion lives in the current trees
+//!     alone, whose values are `[t:6]`, `nx/eavt`'s followed by an
+//!     out-of-line value's payload. The history trees hold every other
+//!     row (H1: a fact's history rows alternate assertion and
+//!     retraction, and end with a retraction); their values are empty
+//!     but on an `nx/eavt-h` assertion row of an out-of-line value,
+//!     which holds its payload. A payload is stored once.
+//!   - A store of any format but `format_version` is refused
+//!     (`error.Format`), naming the format it holds.
 //!   - A value spanning several pages, from a cursor or `getFromTree`,
 //!     is assembled in the transaction's buffer and valid until the
 //!     transaction's next mutation or its end (emdb API-KV01); callers
@@ -47,12 +52,9 @@ const TreeId = emdb.TreeId;
 const Index = key.Index;
 const Datom = datom_mod.Datom;
 
-/// The newest store format this build reads and writes (NEXTOMIC.md
-/// §2.3). A new store is format 1; the first transaction that writes
-/// an out-of-line value makes it 2, whose current EAVT rows hold `t`
-/// alone.
-pub const format_version: u16 = 2;
-const format_payload_once: u16 = 2;
+/// The store format this build reads and writes, and the only one it
+/// opens (NEXTOMIC.md §2.3).
+pub const format_version: u16 = 3;
 
 // =============================================================================
 // Trees
@@ -113,6 +115,9 @@ pub const Options = struct {
     /// as one written without the attribute, for the test of its mint
     /// at open.
     fulltext_attr: bool = true,
+    /// Given the format of a store refused as another format's
+    /// (`error.Format`).
+    refused_format: ?*u16 = null,
 };
 
 // =============================================================================
@@ -210,6 +215,8 @@ pub const boot = struct {
     pub const attrs_without_fulltext = attrs[0 .. attrs.len - 1];
 
     comptime {
+        // The txlog codec rebuilds a transaction's instant datom.
+        std.debug.assert(tx_instant == datom_mod.tx_instant_attr);
         // `idents[i]` carries id `i + 1`, so the enumerations slice by id.
         for (idents, 1..) |id, i| std.debug.assert(id.id == i);
         std.debug.assert(fulltext_attr.id == fulltext);
@@ -272,12 +279,12 @@ pub const Store = struct {
         };
         errdefer self.file.release();
 
-        if (!try self.openComplete()) {
+        if (!try self.openComplete(options.refused_format)) {
             const txn = try self.file.beginWrite(.{ .sync = options.sync.override() });
             errdefer txn.abort();
             try self.openTrees(txn);
             if (try self.sysGet(txn, "format")) |_| {
-                try self.readHeader(txn);
+                try self.readHeader(txn, options.refused_format);
                 try self.ensureFulltextAttr(txn);
             } else {
                 try self.bootstrap(txn, options.fulltext_attr);
@@ -296,7 +303,7 @@ pub const Store = struct {
 
     /// Open the trees, header and `:db/fulltext` id of a complete store
     /// in a read transaction; false when anything is missing.
-    fn openComplete(self: *Store) !bool {
+    fn openComplete(self: *Store, refused_format: ?*u16) !bool {
         const txn = try self.file.env.beginRead();
         defer txn.abort();
         var ids: [tree_names.len]TreeId = undefined;
@@ -308,7 +315,7 @@ pub const Store = struct {
         }
         self.setTrees(ids);
         if ((try self.sysGet(txn, "format")) == null) return false;
-        try self.readHeader(txn);
+        try self.readHeader(txn, refused_format);
         self.fulltext_aid = (try self.identIdByName(txn, "db/fulltext")) orelse return false;
         return true;
     }
@@ -332,11 +339,14 @@ pub const Store = struct {
         };
     }
 
-    fn readHeader(self: *Store, txn: *Txn) !void {
+    fn readHeader(self: *Store, txn: *Txn, refused_format: ?*u16) !void {
         const fmt = (try self.sysGet(txn, "format")) orelse return error.Corrupted;
         if (fmt.len != 2) return error.Corrupted;
         const version = std.mem.readInt(u16, fmt[0..2], .big);
-        if (version == 0 or version > format_version) return error.Format;
+        if (version != format_version) {
+            if (refused_format) |out| out.* = version;
+            return error.Format;
+        }
         const uuid = (try self.sysGet(txn, "uuid")) orelse return error.Corrupted;
         if (uuid.len != 16) return error.Corrupted;
         self.uuid = uuid[0..16].*;
@@ -596,27 +606,23 @@ pub const Store = struct {
 
     // ── txlog ─────────────────────────────────────────────────────
 
-    fn txlogKey(t: u64) [key.id_len]u8 {
-        var k: [key.id_len]u8 = undefined;
-        key.writeId(&k, t);
-        return k;
-    }
-
     pub fn putTxlog(self: *Store, txn: *Txn, t: u64, bytes: []const u8) !void {
-        const k = txlogKey(t);
-        try txn.putInTree(self.trees.txlog, &k, bytes);
+        var buf: [key.ordered_max]u8 = undefined;
+        try txn.putInTree(self.trees.txlog, key.writeTxlogKey(&buf, t), bytes);
     }
 
     /// The full entry (multi-page values are assembled).
     pub fn getTxlog(self: *Store, txn: *Txn, t: u64) !?[]const u8 {
-        const k = txlogKey(t);
-        return txn.getFromTree(self.trees.txlog, &k);
+        var buf: [key.ordered_max]u8 = undefined;
+        return txn.getFromTree(self.trees.txlog, key.writeTxlogKey(&buf, t));
     }
 
     // ── datoms ────────────────────────────────────────────────────
 
     /// One datom ready to write: encoded value, optional out-of-line
-    /// payload, and which optional indexes it belongs in.
+    /// payload, and which optional indexes it belongs in. A retraction
+    /// names a current fact; the transaction never asserts a current
+    /// fact again or retracts one that is not current.
     pub const Prepared = struct {
         e: u64,
         a: u32,
@@ -627,29 +633,32 @@ pub const Store = struct {
         vaet: bool,
     };
 
+    /// What a retraction found in the current EAVT row it removes: the
+    /// `t` of the assertion it retires and that assertion's payload.
+    const Prior = struct { t: u64 = 0, payload: []const u8 = &.{} };
+
     /// Write a batch of datoms of transaction `t` to the eight index
     /// trees: EAVT, then AEVT, then AVET and VAET, each current tree
     /// before its history twin, each tree in the order `writeTree`
-    /// gives. Scratch lives in `arena`.
+    /// gives. An assertion goes to the current trees alone, its
+    /// out-of-line payload after `t` in its EAVT value. A retraction
+    /// takes its fact's current rows away and puts two rows in each
+    /// history tree: the assertion it retires, at that assertion's `t`
+    /// and with its payload in EAVT-h, and itself. The current EAVT pass
+    /// reads what the history passes write. Scratch lives in `arena`.
     pub fn writeBatch(self: *Store, txn: *Txn, t: u64, batch: []const Prepared, arena: Allocator) !void {
         if (batch.len == 0) return;
-        for (batch) |p| {
-            if (p.payload != null) {
-                // A reader of format 1 alone would take a current or
-                // retraction row's missing payload for an empty value.
-                if (try self.sysGetInt(txn, "format", 2) < format_payload_once) try self.sysPutInt(txn, "format", 2, format_payload_once);
-                break;
-            }
-        }
         // The keys of one index, packed end to end and reused for the
         // next; an index a datom is absent from gets an empty key.
         var total: usize = 0;
-        for (batch) |p| total += key.id_len + key.attr_len + p.vbytes.len;
+        for (batch) |p| total += key.entity_key_max + key.attr_key_max + p.vbytes.len;
         var keys: std.ArrayList(u8) = .empty;
         try keys.ensureTotalCapacityPrecise(arena, total);
         const offsets = try arena.alloc(u32, batch.len + 1);
         const order = try arena.alloc(usize, batch.len);
         const sorted = try arena.alloc(usize, batch.len);
+        const priors = try arena.alloc(Prior, batch.len);
+        @memset(priors, .{});
         for (order, 0..) |*o, i| o.* = i;
         inline for (.{ Index.eavt, Index.aevt, Index.avet, Index.vaet }) |index| {
             keys.clearRetainingCapacity();
@@ -668,9 +677,9 @@ pub const Store = struct {
                 sorted[n] = i;
                 n += 1;
             }
-            const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n] };
-            try self.writeTree(txn, w, false);
-            try self.writeTree(txn, w, true);
+            const w: TreeWrite = .{ .index = index, .t = t, .batch = batch, .keys = packed_keys, .sorted = sorted[0..n], .priors = priors };
+            try self.writeTree(txn, w, false, arena);
+            try self.writeTree(txn, w, true, arena);
         }
     }
 
@@ -687,25 +696,15 @@ pub const Store = struct {
         }
     };
 
-    /// One index's share of a batch: its current keys and their
-    /// ascending order.
+    /// One index's share of a batch: its current keys, their ascending
+    /// order, and what each retraction found, by batch position.
     const TreeWrite = struct {
         index: Index,
         t: u64,
         batch: []const Prepared,
         keys: PackedKeys,
         sorted: []const usize,
-
-        /// The key of the `r`th datom in key order, in the current or
-        /// the history tree's form.
-        fn keyAt(self: TreeWrite, buf: *[key.max_key_len]u8, r: usize, history: bool) []const u8 {
-            const i = self.sorted[r];
-            const k = self.keys.at(i);
-            if (!history) return k;
-            @memcpy(buf[0..k.len], k);
-            key.writeTop(buf[k.len..][0..key.top_len], self.t, self.batch[i].added);
-            return buf[0 .. k.len + key.top_len];
-        }
+        priors: []Prior,
     };
 
     /// Write one index's share of a batch to its current or history
@@ -714,74 +713,103 @@ pub const Store = struct {
     /// tree and splits a leaf the run fills right-biased, so the run
     /// leaves its leaves about nine tenths full, between existing keys
     /// as at the tree's end.
-    fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool) !void {
+    ///
+    /// A retraction's two history rows are adjacent. Past the history
+    /// tree's last key they go in key order and continue the run. Among
+    /// existing keys the retraction goes first: two puts in a row there
+    /// are a run of two, which splits a full leaf at the run and leaves
+    /// the keys before it alone on a page, often a sliver of one, where
+    /// a pair that is no run splits the leaf in half (`docs/PERF.md`
+    /// §3.36's churn shape: EAVT-h fill 0.47 one way, 0.61 the other).
+    fn writeTree(self: *Store, txn: *Txn, w: TreeWrite, comptime history: bool, arena: Allocator) !void {
         var buf: [key.max_key_len]u8 = undefined;
-        for (0..w.sorted.len) |r| try self.writeOne(txn, w, r, history, &buf);
-    }
-
-    fn writeOne(self: *Store, txn: *Txn, w: TreeWrite, r: usize, comptime history: bool, buf: *[key.max_key_len]u8) !void {
-        const p = w.batch[w.sorted[r]];
-        const k = w.keyAt(buf, r, history);
-        if (history) {
-            const payload: []const u8 = if (w.index == .eavt and p.added) (p.payload orelse &.{}) else &.{};
-            return txn.putInTree(self.trees.hist(w.index), k, payload);
+        var value: std.ArrayList(u8) = .empty;
+        // The history tree's last key before the batch.
+        const tail: ?[]const u8 = if (history) blk: {
+            var c = try txn.openCursorForTree(self.trees.hist(w.index));
+            c.keysOnly = true;
+            const kv = c.last() orelse {
+                try ended(&c);
+                break :blk null;
+            };
+            break :blk try arena.dupe(u8, kv.key);
+        } else null;
+        for (w.sorted) |i| {
+            const p = w.batch[i];
+            const k = w.keys.at(i);
+            if (history) {
+                if (p.added) continue;
+                const prior = w.priors[i];
+                @memcpy(buf[0..k.len], k);
+                const hk = buf[0 .. k.len + key.top_len];
+                key.writeTop(hk[k.len..][0..key.top_len], prior.t, true);
+                const appended = if (tail) |last| std.mem.order(u8, hk, last) == .gt else true;
+                if (appended) try txn.putInTree(self.trees.hist(w.index), hk, if (w.index == .eavt) prior.payload else &.{});
+                key.writeTop(hk[k.len..][0..key.top_len], w.t, false);
+                try txn.putInTree(self.trees.hist(w.index), hk, &.{});
+                if (appended) continue;
+                key.writeTop(hk[k.len..][0..key.top_len], prior.t, true);
+                try txn.putInTree(self.trees.hist(w.index), hk, if (w.index == .eavt) prior.payload else &.{});
+                continue;
+            }
+            if (!p.added) {
+                if (w.index == .eavt) {
+                    // A value spanning pages lives in the transaction's
+                    // buffer until its next mutation: the payload is
+                    // copied before the delete.
+                    const row = try key.readCurrent((try txn.getFromTree(self.trees.cur(.eavt), k)) orelse return error.Corrupted);
+                    w.priors[i] = .{ .t = row.t, .payload = try arena.dupe(u8, row.rest) };
+                    if (w.priors[i].t >= w.t) return error.Corrupted;
+                }
+                // An index the attribute joins in this transaction was
+                // backfilled without the facts it retracts.
+                _ = try txn.delFromTree(self.trees.cur(w.index), k);
+                continue;
+            }
+            value.clearRetainingCapacity();
+            try value.ensureTotalCapacity(arena, key.t_value_max + if (w.index == .eavt) (if (p.payload) |x| x.len else 0) else 0);
+            var tb: [key.t_value_max]u8 = undefined;
+            value.appendSliceAssumeCapacity(key.writeCurrentT(&tb, w.t));
+            if (w.index == .eavt) if (p.payload) |x| value.appendSliceAssumeCapacity(x);
+            try txn.putInTree(self.trees.cur(w.index), k, value.items);
         }
-        if (!p.added) {
-            _ = try txn.delFromTree(self.trees.cur(w.index), k);
-            return;
-        }
-        var tb: [key.id_len]u8 = undefined;
-        key.writeId(&tb, w.t);
-        try txn.putInTree(self.trees.cur(w.index), k, &tb);
     }
 
     /// The out-of-line payload of the current datom `(e a v)`, copied
-    /// into `arena`: the EAVT-h value of the fact's latest row when that
-    /// row is an assertion (every EAVT-h assertion row of an out-of-line
-    /// value holds its payload, in every format), null when the fact is
-    /// not current. One seek, the cost of the current row's own read.
+    /// into `arena`: its current EAVT value after `t`; null when the
+    /// fact is not current.
     pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
         if (vbytes.len > key.max_val_len) return error.Corrupted;
         var buf: [key.max_key_len]u8 = undefined;
-        const fact_len = key.id_len + key.attr_len + vbytes.len;
-        key.writeId(buf[0..key.id_len], e);
-        key.writeAttr(buf[key.id_len..][0..key.attr_len], a);
-        @memcpy(buf[key.id_len + key.attr_len ..][0..vbytes.len], vbytes);
-        const fact = buf[0..fact_len];
-        // Past every `top` of the fact (whose first byte is below 0x80)
-        // and before any longer fact it prefixes.
-        buf[fact_len] = 0x80;
-        const probe = buf[0 .. fact_len + 1];
-        var c = try txn.openCursorForTree(self.trees.hist(.eavt));
-        const row = (if (c.setRange(probe) != null) c.prev() else c.last()) orelse {
-            try ended(&c);
-            return null;
-        };
-        if (row.key.len != fact.len + key.top_len or !std.mem.startsWith(u8, row.key, fact)) return null;
-        const top = try key.readTop(row.key[fact.len..][0..key.top_len]);
-        return if (top.added) try arena.dupe(u8, row.value) else null;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
+        try key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, null);
+        const row = (try txn.getFromTree(self.trees.cur(.eavt), k.items)) orelse return null;
+        const cur = try key.readCurrent(row);
+        if (cur.rest.len == 0) return error.Corrupted;
+        return try arena.dupe(u8, cur.rest);
     }
 
-    /// The history-tree value of `(e a v top)` in `index`, or null. An
-    /// EAVT-h retraction row holds no payload (a format-1 one may): its
-    /// value is that of the row before it, the assertion it retracts.
-    pub fn getHistory(self: *Store, txn: *Txn, index: Index, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) !?[]const u8 {
-        const k = try key.keyBytes(arena, index, e, a, vbytes, top);
-        if (index != .eavt or top.added) return txn.getFromTree(self.trees.hist(index), k);
-        var c = try txn.openCursorForTree(self.trees.hist(index));
-        const row = c.set(k) orelse {
+    /// The out-of-line payload of the retired history row `(e a v top)`:
+    /// an assertion's EAVT-h value, or, for a retraction, which holds
+    /// nothing, the value of the row before it, the assertion it
+    /// retracts. Borrows the transaction's snapshot.
+    pub fn historyPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) ![]const u8 {
+        const k = try key.keyBytes(arena, .eavt, e, a, vbytes, top);
+        var c = try txn.openCursorForTree(self.trees.hist(.eavt));
+        _ = c.set(k) orelse {
             try ended(&c);
-            return null;
+            return error.Corrupted;
         };
-        if (row.value.len > 0) return row.value;
-        const before = c.prev() orelse {
+        const row = if (top.added) c.current() else c.prev();
+        const found = row orelse {
             try ended(&c);
             return error.Corrupted;
         };
         const fact_len = k.len - key.top_len;
-        if (before.key.len != k.len or !std.mem.eql(u8, before.key[0..fact_len], k[0..fact_len])) return error.Corrupted;
-        if (!(try key.readTop(before.key[fact_len..][0..key.top_len])).added) return error.Corrupted;
-        return before.value;
+        if (found.key.len != k.len or !std.mem.eql(u8, found.key[0..fact_len], k[0..fact_len])) return error.Corrupted;
+        if (!(try key.readTop(found.key[fact_len..][0..key.top_len])).added or found.value.len == 0) return error.Corrupted;
+        return found.value;
     }
 
     // ── scans ─────────────────────────────────────────────────────
@@ -851,36 +879,91 @@ pub const Store = struct {
         }
     };
 
-    /// A history row: the key without `top`, `t` and `added`. The fact
-    /// borrows the transaction's snapshot.
+    /// One row of a fact's timeline: the key without `top`, `t` and
+    /// `added`. The fact borrows the transaction's snapshot.
     pub const HistoryRow = struct {
         fact: []const u8,
         t: u64,
         added: bool,
+        /// The fact's current-tree row, its latest assertion, whose `t`
+        /// is the row's value.
+        current: bool = false,
     };
 
-    /// The §4 fold over a history tree: rows in `[start, end)` grouped
-    /// by their fact bytes (everything before `top`); consecutive rows
-    /// of one fact ascend in `t`; the last row inside the window wins
-    /// and is emitted iff it is an assertion. `.all` emits every row in
-    /// the window unfolded.
+    /// The rows of one index in `[start, end)` from its current tree and
+    /// its history twin together: every fact in order, and each fact's
+    /// rows in ascending `t`, its history rows before its current row.
+    /// The trees are compared by fact bytes, a history key less its
+    /// `top`: a current key is a byte prefix of its own history keys,
+    /// so raw keys would put it first. Facts that prefix one another
+    /// (`"a"` and `"a\x00b"`, an inline value and its out-of-line
+    /// sibling) sort alike in both trees: `top` starts with a zero byte
+    /// below `t = 2^39`, and a fact that continues a shorter one has an
+    /// escape (`0xFF`) or the out-of-line mark (`0x01`) there
+    /// (NEXTOMIC.md §2.2). A current row whose fact's history rows do
+    /// not end with a retraction older than it breaks H1 and is
+    /// `error.Corrupted`.
+    pub const MergedScan = struct {
+        cur: Scan,
+        hist: Scan,
+        cur_row: ?KeyValue = null,
+        hist_row: ?KeyValue = null,
+        /// The last history row read, against which a current row is
+        /// checked.
+        last: ?HistoryRow = null,
+
+        pub fn next(self: *MergedScan) !?HistoryRow {
+            if (self.cur_row == null) self.cur_row = try self.cur.next();
+            if (self.hist_row == null) self.hist_row = try self.hist.next();
+            const c = self.cur_row;
+            if (self.hist_row) |h| {
+                if (h.key.len < key.top_len) return error.Corrupted;
+                const fact = h.key[0 .. h.key.len - key.top_len];
+                if (c == null or std.mem.order(u8, fact, c.?.key) != .gt) {
+                    self.hist_row = null;
+                    const top = try key.readTop(h.key[fact.len..][0..key.top_len]);
+                    const r: HistoryRow = .{ .fact = fact, .t = top.t, .added = top.added };
+                    self.last = r;
+                    return r;
+                }
+            }
+            const row = c orelse return null;
+            self.cur_row = null;
+            const r: HistoryRow = .{ .fact = row.key, .t = (try key.readCurrent(row.value)).t, .added = true, .current = true };
+            if (self.last) |l| if ((l.added or l.t >= r.t) and std.mem.eql(u8, l.fact, r.fact)) return error.Corrupted;
+            return r;
+        }
+    };
+
+    /// The merged rows of `index` in `[start, end)` (an absent `end`
+    /// runs to the trees' last keys). The history walk reads keys
+    /// alone: an EAVT-h row's payload is read for the one datom that
+    /// needs it, never assembled for every row the walk passes. An
+    /// empty history tree, an append-only store's, is never walked.
+    pub fn mergedScan(txn: *Txn, trees: Trees, index: Index, start: []const u8, end: ?[]const u8) !MergedScan {
+        var hist = try scanRange(txn, trees.hist(index), start, end);
+        hist.cursor.keysOnly = true;
+        hist.done = try Store.treeEntries(txn, trees.hist(index)) == 0;
+        return .{ .cur = try scanRange(txn, trees.cur(index), start, end), .hist = hist };
+    }
+
+    /// The §4 fold over an index's merged rows: rows grouped by their
+    /// fact bytes ascend in `t`; the last row inside the window wins and
+    /// is emitted iff it is an assertion. `.all` emits every row in the
+    /// window unfolded.
     pub const FoldScan = struct {
-        inner: Scan,
+        inner: MergedScan,
         window: Window,
         pending: ?HistoryRow = null,
         exhausted: bool = false,
 
         pub fn next(self: *FoldScan) !?HistoryRow {
             while (!self.exhausted) {
-                const row = (try self.inner.next()) orelse {
+                const r = (try self.inner.next()) orelse {
                     self.exhausted = true;
                     break;
                 };
-                if (row.key.len < key.top_len) continue;
-                const fact_len = row.key.len - key.top_len;
-                const top = try key.readTop(row.key[fact_len..][0..key.top_len]);
-                if (!self.window.contains(top.t)) continue;
-                const r: HistoryRow = .{ .fact = row.key[0..fact_len], .t = top.t, .added = top.added };
+                if (!self.window.contains(r.t)) continue;
                 if (self.window == .all) return r;
                 if (self.pending) |p| {
                     if (std.mem.eql(u8, p.fact, r.fact)) {
@@ -901,18 +984,58 @@ pub const Store = struct {
         }
     };
 
-    /// The fold reads keys alone: an EAVT-h assertion row's payload is
-    /// read for the one datom that needs it (`getHistory`), never
-    /// assembled for every row the walk passes.
-    pub fn foldScan(txn: *Txn, tree: TreeId, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
-        var inner = try scanRange(txn, tree, start, end);
-        inner.cursor.keysOnly = true;
-        return .{ .inner = inner, .window = window };
+    pub fn foldScan(txn: *Txn, trees: Trees, index: Index, start: []const u8, end: ?[]const u8, window: Window) !FoldScan {
+        return .{ .inner = try mergedScan(txn, trees, index, start, end), .window = window };
     }
 
     /// Number of entries in `tree` at the transaction's snapshot.
     pub fn treeEntries(txn: *Txn, tree: TreeId) !u64 {
         return (try txn.treeStat(tree)).entries;
+    }
+
+    /// What a tree holds and the pages it takes: its entries' key and
+    /// value bytes from a walk, its pages from `treeStat`
+    /// (`docs/PERF.md` §3.36's per-tree table).
+    pub const TreeSize = struct {
+        entries: u64 = 0,
+        key_bytes: u64 = 0,
+        value_bytes: u64 = 0,
+        leaf_pages: u64 = 0,
+        branch_pages: u64 = 0,
+        overflow_pages: u64 = 0,
+
+        /// The share of the leaves the entries fill, counting emdb's 10
+        /// bytes of pointer and node header per entry.
+        pub fn fill(self: TreeSize) f64 {
+            if (self.leaf_pages == 0) return 0;
+            const used = self.key_bytes + self.value_bytes + 10 * self.entries;
+            return @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(self.leaf_pages * leaf_usable));
+        }
+
+        pub fn pages(self: TreeSize) u64 {
+            return self.leaf_pages + self.branch_pages + self.overflow_pages;
+        }
+
+        /// A leaf's room for nodes: the page less its header.
+        const leaf_usable = db_layer.page_size - 32;
+    };
+
+    /// The size of `tree` at the transaction's snapshot. Each value is
+    /// read into one buffer in `gpa`, so the walk holds none of them.
+    pub fn treeSize(txn: *Txn, tree: TreeId, gpa: Allocator) !TreeSize {
+        const stat = try txn.treeStat(tree);
+        var out: TreeSize = .{ .entries = stat.entries, .leaf_pages = stat.leafPages, .branch_pages = stat.branchPages, .overflow_pages = stat.overflowPages };
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        var c = try txn.openCursorForTree(tree);
+        c.keysOnly = true;
+        var kv = c.first();
+        while (kv) |e| : (kv = c.next()) {
+            out.key_bytes += e.key.len;
+            out.value_bytes += ((try c.readValueInto(gpa, &buf)) orelse return error.Corrupted).len;
+        }
+        try ended(&c);
+        return out;
     }
 
     // ── bootstrap (§2.4) ──────────────────────────────────────────
@@ -922,7 +1045,7 @@ pub const Store = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        try self.sysPutInt(txn, "format", 2, 1);
+        try self.sysPutInt(txn, "format", 2, format_version);
         std.Io.Threaded.global_single_threaded.io().random(&self.uuid);
         try self.sysPut(txn, "uuid", &self.uuid);
 
@@ -981,26 +1104,12 @@ pub const Store = struct {
         var it = counts.iterator();
         while (it.next()) |e| try self.writeAttrCount(txn, e.key_ptr.*, (try self.attrCount(txn, e.key_ptr.*)) + e.value_ptr.*);
 
-        var names = IdentNames{ .store = self, .txn = txn };
-        const entry = try datom_mod.encodeTxlog(arena, now, datoms, &.{}, .{ .ctx = @ptrCast(&names), .identName = &IdentNames.identName });
-        try self.putTxlog(txn, t, entry);
+        try self.putTxlog(txn, t, try datom_mod.encodeTxlog(arena, t, now, datoms, &.{}));
         try self.writeT(txn, t);
         try self.bumpSchemaGen(txn);
         // No attribute is full-text yet: the empty tree is current.
         try self.writeFulltextStamp(txn, t);
     }
-
-    /// Ident names for the txlog encoder, from `nx/idents` through the
-    /// transaction that is writing.
-    const IdentNames = struct {
-        store: *Store,
-        txn: *Txn,
-
-        fn identName(ctx: *anyopaque, id: u32) anyerror!?[]const u8 {
-            const self: *IdentNames = @ptrCast(@alignCast(ctx));
-            return self.store.identNameById(self.txn, id);
-        }
-    };
 
     /// A store whose idents lack `:db/fulltext` receives the attribute
     /// as a transaction of its own at the store's next ident id.
@@ -1095,8 +1204,8 @@ test "a page that fails its check ends a scan with an error, never early" {
     const arena = arena_state.allocator();
     const fact = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
     (try Store.open(testing.allocator, td.path.ptr, .{})).close();
-    // One byte flipped in every page holding :db/doc's ident row: the
-    // leaves of nx/eavt and nx/eavt-h fail their checksum.
+    // One byte flipped in the page holding :db/doc's ident row: the
+    // nx/eavt leaf fails its checksum.
     const io = testing.io;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, td.path, arena, .unlimited);
     var at: usize = 0;
@@ -1105,7 +1214,7 @@ test "a page that fails its check ends a scan with an error, never early" {
         bytes[i + fact.len - 1] ^= 0xFF;
         damaged += 1;
     }
-    try testing.expect(damaged >= 2);
+    try testing.expect(damaged >= 1);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = td.path, .data = bytes });
 
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
@@ -1114,9 +1223,9 @@ test "a page that fails its check ends a scan with an error, never early" {
     defer txn.abort();
     var s = try Store.scan(txn, store.trees.cur(.eavt), &.{});
     try testing.expectError(error.InvalidPage, s.next());
-    var f = try Store.foldScan(txn, store.trees.hist(.eavt), &.{}, null, .{ .as_of = 1 });
+    var f = try Store.foldScan(txn, store.trees, .eavt, &.{}, null, .{ .as_of = 1 });
     try testing.expectError(error.InvalidPage, f.next());
-    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, fact[key.id_len + key.attr_len ..], arena));
+    try testing.expectError(error.InvalidPage, store.currentPayload(txn, boot.doc, boot.ident, (try key.unpackKey(.eavt, false, fact)).v, arena));
 }
 
 test "open bootstraps once and reopen finds the same ids" {
@@ -1253,8 +1362,9 @@ test "bootstrap datoms are in every index they belong to" {
     var s = try Store.scan(txn, store.trees.cur(.eavt), p);
     var n: usize = 0;
     while (try s.next()) |kv| : (n += 1) {
-        try testing.expectEqual(@as(usize, key.id_len), kv.value.len);
-        try testing.expectEqual(@as(u64, 1), try key.readId(kv.value[0..key.id_len]));
+        const cur = try key.readCurrent(kv.value);
+        try testing.expectEqual(@as(u64, 1), cur.t);
+        try testing.expectEqual(@as(usize, 0), cur.rest.len);
     }
     try testing.expectEqual(@as(usize, 5), n);
 
@@ -1268,17 +1378,8 @@ test "bootstrap datoms are in every index they belong to" {
     var sv = try Store.scan(txn, store.trees.cur(.avet), pv);
     try testing.expect((try sv.next()) == null);
 
-    // History mirrors current with top = (1 << 1) | 1.
-    const ph = try key.prefixBytes(arena, .eavt, .{ .e = boot.ident });
-    var sh = try Store.scan(txn, store.trees.hist(.eavt), ph);
-    n = 0;
-    while (try sh.next()) |kv| : (n += 1) {
-        const parts = try key.unpackKey(.eavt, true, kv.key);
-        try testing.expectEqual(@as(u64, 1), parts.top.?.t);
-        try testing.expect(parts.top.?.added);
-        try testing.expectEqual(@as(usize, 0), kv.value.len);
-    }
-    try testing.expectEqual(@as(usize, 5), n);
+    // Nothing is retired yet: the history trees are empty.
+    for (store.trees.history) |tree| try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, tree));
 
     // Empty prefix walks the whole tree.
     var all = try Store.scan(txn, store.trees.cur(.aevt), &.{});
@@ -1334,7 +1435,6 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     defer txn.abort();
     const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
     const end = (try key.successor(arena, prefix)).?;
-    const tree = store.trees.hist(.eavt);
 
     const Expect = struct { window: Store.Window, facts: []const u64 };
     const cases = [_]Expect{
@@ -1348,7 +1448,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         .{ .window = .{ .since = .{ .after = 4, .upto = 5 } }, .facts = &.{} },
     };
     for (cases) |c| {
-        var fs = try Store.foldScan(txn, tree, prefix, end, c.window);
+        var fs = try Store.foldScan(txn, store.trees, .eavt, prefix, end, c.window);
         var got: std.ArrayList(u64) = .empty;
         while (try fs.next()) |r| {
             try testing.expect(r.added);
@@ -1359,7 +1459,7 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
         try testing.expectEqualSlices(u64, c.facts, got.items);
     }
     // History mode sees all five rows in t order with their flags.
-    var all = try Store.foldScan(txn, tree, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
+    var all = try Store.foldScan(txn, store.trees, .eavt, prefix, end, .{ .all = .{ .after = 0, .upto = 5 } });
     var n: usize = 0;
     var adds: usize = 0;
     while (try all.next()) |r| {
@@ -1373,17 +1473,6 @@ test "fold keeps the newest in-window row per fact and drops retractions" {
     const only = (try cur.next()).?;
     try testing.expectEqual(@as(u32, 101), (try key.unpackKey(.eavt, false, only.key)).a);
     try testing.expect((try cur.next()) == null);
-}
-
-/// Share of `tree`'s leaf pages its entries fill, counting emdb's 10
-/// bytes of pointer and node header per entry.
-fn leafFill(txn: *Txn, tree: TreeId) !f64 {
-    const stat = try txn.treeStat(tree);
-    var bytes: u64 = 0;
-    var c = try txn.openCursorForTree(tree);
-    var kv = c.first();
-    while (kv) |e| : (kv = c.next()) bytes += 10 + e.key.len + e.value.len;
-    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(stat.leafPages * db_layer.page_size));
 }
 
 test "batches written between existing keys fill their leaves" {
@@ -1415,8 +1504,10 @@ test "batches written between existing keys fill their leaves" {
     }
     const txn = try store.beginRead();
     defer txn.abort();
-    for ([_]TreeId{ store.trees.cur(.eavt), store.trees.hist(.eavt), store.trees.cur(.aevt), store.trees.hist(.aevt) }) |tree| {
-        try testing.expect(try leafFill(txn, tree) > 0.75);
+    for ([_]Index{ .eavt, .aevt }) |index| {
+        try testing.expect((try Store.treeSize(txn, store.trees.cur(index), testing.allocator)).fill() > 0.75);
+        // New facts retire nothing.
+        try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, store.trees.hist(index)));
     }
 }
 
@@ -1434,24 +1525,34 @@ test "a batch holds what writing its datoms one at a time holds" {
     const rand = prng.random();
 
     // Batches of up to 4000 datoms over a few thousand facts, most of
-    // them assertions, with retractions of held and absent facts and
-    // the same fact more than once in a batch.
+    // them assertions of facts not current, the rest retractions of
+    // current ones, each fact at most once a batch, as a transaction
+    // writes them.
+    var current: std.AutoHashMapUnmanaged(u64, void) = .empty;
     for (0..30) |i| {
         const t = i + 2;
-        const batch = try arena.alloc(Store.Prepared, rand.intRangeAtMost(usize, 1, 4000));
-        for (batch) |*p| {
+        var in_batch: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var list: std.ArrayList(Store.Prepared) = .empty;
+        for (0..rand.intRangeAtMost(usize, 1, 4000)) |_| {
             const a = rand.intRangeAtMost(u32, 100, 102);
             const x = rand.uintLessThan(u64, 3000);
+            const e_off = rand.uintLessThan(u64, 3000);
+            const id = (e_off * 4 + (a - 100)) * 4096 + (if (a == 102) x else x % 50);
+            if ((try in_batch.getOrPut(arena, id)).found_existing) continue;
+            const held = current.contains(id);
+            if (held and rand.uintLessThan(u8, 4) != 0) continue;
+            if (held) _ = current.remove(id) else try current.put(arena, id, {});
             const v: key.Val = if (a == 102) .{ .ref = (1 << 33) + x } else .{ .long = @intCast(x % 50) };
-            p.* = .{
-                .e = (1 << 33) + rand.uintLessThan(u64, 3000),
+            try list.append(arena, .{
+                .e = (1 << 33) + e_off,
                 .a = a,
                 .vbytes = try key.valBytes(arena, v),
-                .added = rand.uintLessThan(u8, 5) != 0,
+                .added = !held,
                 .avet = a == 101,
                 .vaet = a == 102,
-            };
+            });
         }
+        const batch = list.items;
         for ([_]*Store{ batched, single }) |store| {
             const txn = try store.beginWrite(.none);
             errdefer txn.abort();
@@ -1467,12 +1568,12 @@ test "a batch holds what writing its datoms one at a time holds" {
         const index: Index = @fromBackingInt(@intCast(ix));
         // The bootstrap's datoms differ in their instants: compare the
         // keys the batches can hold.
-        var start: [key.id_len]u8 = undefined;
-        if (index == .eavt or index == .vaet) key.writeId(&start, 1 << 33) else key.writeAttr(start[0..key.attr_len], 100);
-        const from = if (index == .eavt or index == .vaet) start[0..] else start[0..key.attr_len];
-        var tx_start: [key.id_len]u8 = undefined;
-        key.writeId(&tx_start, key.tx_partition_bit);
-        const to: ?[]const u8 = if (index == .eavt) &tx_start else null;
+        const from = try key.prefixBytes(arena, index, switch (index) {
+            .eavt => .{ .e = 1 << 33 },
+            .vaet => .{ .v = try key.valBytes(arena, .{ .ref = 1 << 33 }) },
+            else => .{ .a = 100 },
+        });
+        const to: ?[]const u8 = if (index == .eavt) try key.prefixBytes(arena, .eavt, .{ .e = key.tx_partition_bit }) else null;
         var scans: [2]Store.Scan = undefined;
         for (&scans, txns, [_]*Store{ batched, single }) |*sc, txn, store|
             sc.* = try Store.scanRange(txn, if (history) store.trees.hist(index) else store.trees.cur(index), from, to);
@@ -1485,12 +1586,7 @@ test "a batch holds what writing its datoms one at a time holds" {
     };
 }
 
-fn formatOf(store: *Store, txn: *Txn) !u16 {
-    const raw = (try store.sysGet(txn, "format")).?;
-    return std.mem.readInt(u16, raw[0..2], .big);
-}
-
-test "an out-of-line value is stored once in the index trees, on its assertion's history row" {
+test "an out-of-line value is stored once in the index trees, beside its current row or on its retired assertion" {
     var td = try TestDir.init("store_payload");
     defer td.deinit();
     const store = try Store.open(testing.allocator, td.path.ptr, .{});
@@ -1502,41 +1598,39 @@ test "an out-of-line value is stored once in the index trees, on its assertion's
     const e: u64 = 1 << 33;
     const long = repeat("a string long enough to leave its index keys for a payload of its own, ", 3);
     const v = try key.valBytes(arena, .{ .string = long });
-    const short = try key.valBytes(arena, .{ .long = 7 });
+    const cur_key = try key.keyBytes(arena, .eavt, e, 101, v, null);
     {
         const txn = try store.beginWrite(.none);
         errdefer txn.abort();
-        try store.writeBatch(txn, 2, &.{.{ .e = e, .a = 100, .vbytes = short, .added = true, .avet = false, .vaet = false }}, arena);
-        // A store no out-of-line value was written to keeps format 1.
-        try testing.expectEqual(1, try formatOf(store, txn));
         try store.writeBatch(txn, 3, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = true, .avet = false, .vaet = false }}, arena);
         try txn.commit();
     }
     {
+        // Current: the payload follows `t` in the EAVT value, and the
+        // history trees hold nothing.
         const txn = try store.beginRead();
         defer txn.abort();
-        try testing.expectEqual(2, try formatOf(store, txn));
-        try testing.expectEqual(key.id_len, (try txn.getFromTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, null))).?.len);
-        try testing.expectEqualStrings(long, (try store.getHistory(txn, .eavt, e, 101, v, .{ .t = 3, .added = true }, arena)).?);
+        try testing.expectEqualStrings(long, (try key.readCurrent((try txn.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
+        try testing.expectEqual(@as(u64, 0), try Store.treeEntries(txn, store.trees.hist(.eavt)));
         try testing.expectEqualStrings(long, (try store.currentPayload(txn, e, 101, v, arena)).?);
     }
     {
-        // The retraction's history row holds nothing; its payload is
-        // its assertion's. A retraction alone moves format 1 to 2.
         const txn = try store.beginWrite(.none);
         errdefer txn.abort();
-        try store.sysPutInt(txn, "format", 2, 1);
         try store.writeBatch(txn, 4, &.{.{ .e = e, .a = 101, .vbytes = v, .payload = long, .added = false, .avet = false, .vaet = false }}, arena);
         try txn.commit();
     }
     {
+        // Retracted: the assertion moves to EAVT-h with its payload, and
+        // the retraction's row beside it holds nothing.
         const txn = try store.beginRead();
         defer txn.abort();
-        try testing.expectEqual(2, try formatOf(store, txn));
         try testing.expect((try store.currentPayload(txn, e, 101, v, arena)) == null);
-        const k = try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 4, .added = false });
-        try testing.expectEqual(0, (try txn.getFromTree(store.trees.hist(.eavt), k)).?.len);
-        try testing.expectEqualStrings(long, (try store.getHistory(txn, .eavt, e, 101, v, .{ .t = 4, .added = false }, arena)).?);
+        try testing.expectEqual(@as(u64, 2), try Store.treeEntries(txn, store.trees.hist(.eavt)));
+        try testing.expectEqualStrings(long, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 3, .added = true }))).?);
+        try testing.expectEqual(0, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 4, .added = false }))).?.len);
+        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 3, .added = true }, arena));
+        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 4, .added = false }, arena));
     }
     {
         const w = try store.beginWrite(.none);
@@ -1546,27 +1640,47 @@ test "an out-of-line value is stored once in the index trees, on its assertion's
     }
     const again = try store.beginRead();
     defer again.abort();
-    try testing.expectEqualStrings(long, (try store.currentPayload(again, e, 101, v, arena)).?);
+    try testing.expectEqualStrings(long, (try key.readCurrent((try again.getFromTree(store.trees.cur(.eavt), cur_key)).?)).rest);
+    try testing.expectEqual(@as(u64, 2), try Store.treeEntries(again, store.trees.hist(.eavt)));
 }
 
-test "a store opens at every format up to this build's and refuses a newer one" {
+test "a retraction of a fact that is not current is Corrupted" {
+    var td = try TestDir.init("store_retract_absent");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const txn = try store.beginWrite(.none);
+    defer txn.abort();
+    try testing.expectError(error.Corrupted, store.writeBatch(txn, 2, &.{.{ .e = 1 << 33, .a = 100, .vbytes = try key.valBytes(arena, .{ .long = 1 }), .added = false, .avet = false, .vaet = false }}, arena));
+}
+
+test "a store opens at this build's format alone and names any other" {
     var td = try TestDir.init("store_format");
     defer td.deinit();
-    for ([_]u16{ 1, 2, 3 }) |f| {
+    (try Store.open(testing.allocator, td.path.ptr, .{})).close();
+    for ([_]u16{ 1, 2, 4, format_version }) |f| {
         {
-            const store = try Store.open(testing.allocator, td.path.ptr, .{});
-            defer store.close();
-            const txn = try store.beginWrite(.none);
+            const file = try db_layer.StoreFile.acquire(td.path.ptr, .{ .allocator = testing.allocator });
+            defer file.release();
+            const txn = try file.beginWrite(.{});
             errdefer txn.abort();
             var buf: [2]u8 = undefined;
             std.mem.writeInt(u16, &buf, f, .big);
-            try store.sysPut(txn, "format", &buf);
-            try txn.commit();
+            try txn.putInTree(try txn.openTree("nx/sys", false), "format", &buf);
+            try file.commit(txn);
         }
-        if (f <= format_version) {
-            const store = try Store.open(testing.allocator, td.path.ptr, .{});
+        var found: u16 = 0;
+        if (f == format_version) {
+            const store = try Store.open(testing.allocator, td.path.ptr, .{ .refused_format = &found });
             store.close();
-        } else try testing.expectError(error.Format, Store.open(testing.allocator, td.path.ptr, .{}));
+            try testing.expectEqual(0, found);
+        } else {
+            try testing.expectError(error.Format, Store.open(testing.allocator, td.path.ptr, .{ .refused_format = &found }));
+            try testing.expectEqual(f, found);
+        }
     }
 }
 
@@ -1704,4 +1818,104 @@ test "a copy of a store file is another file: its uuid is shared, its writer is 
     defer ta.abort();
     const tb = try b.beginWrite(.none);
     tb.abort();
+}
+
+test "a merged scan orders facts by their bytes, each fact's history before its current row" {
+    var td = try TestDir.init("store_merged");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Facts that prefix one another: "a", "a\x00", "a\x00b", a 64-byte
+    // inline string and its out-of-line sibling, each with rows in
+    // the current tree, the history tree or both.
+    const e: u64 = 1 << 33;
+    const inline64 = &@as([key.prefix_len]u8, @splat('x'));
+    const long = inline64 ++ "and more, past the inline limit of ninety-six bytes, so out of line";
+    const Row = struct { v: []const u8, t: u64, added: bool, current: bool };
+    const rows = [_]Row{
+        .{ .v = "a", .t = 2, .added = true, .current = false },
+        .{ .v = "a", .t = 3, .added = false, .current = false },
+        .{ .v = "a", .t = 5, .added = true, .current = true },
+        .{ .v = "a\x00", .t = 2, .added = true, .current = false },
+        .{ .v = "a\x00", .t = 6, .added = false, .current = false },
+        .{ .v = "a\x00b", .t = 4, .added = true, .current = true },
+        .{ .v = inline64, .t = 7, .added = true, .current = true },
+        .{ .v = long, .t = 3, .added = true, .current = false },
+        .{ .v = long, .t = 8, .added = false, .current = false },
+        .{ .v = long, .t = 9, .added = true, .current = true },
+        .{ .v = "z", .t = 2, .added = true, .current = true },
+    };
+    {
+        const txn = try store.beginWrite(.none);
+        errdefer txn.abort();
+        for (rows) |r| {
+            const vb = try key.valBytes(arena, .{ .string = r.v });
+            inline for (.{ Index.eavt, Index.avet }) |ix| {
+                if (r.current) {
+                    var tb: [key.t_value_max]u8 = undefined;
+                    try txn.putInTree(store.trees.cur(ix), try key.keyBytes(arena, ix, e, 100, vb, null), key.writeCurrentT(&tb, r.t));
+                } else {
+                    try txn.putInTree(store.trees.hist(ix), try key.keyBytes(arena, ix, e, 100, vb, .{ .t = r.t, .added = r.added }), &.{});
+                }
+            }
+        }
+        try txn.commit();
+    }
+    const txn = try store.beginRead();
+    defer txn.abort();
+    inline for (.{ Index.eavt, Index.avet }) |ix| {
+        const prefix = try key.prefixBytes(arena, ix, if (ix == .eavt) .{ .e = e } else .{ .a = 100 });
+        const end = try key.successor(arena, prefix);
+        var m = try Store.mergedScan(txn, store.trees, ix, prefix, end);
+        // Every row, in the order `rows` lists them; in AVET, where the
+        // entity follows the value, the out-of-line value's rows come
+        // before its 64-byte inline sibling's (NEXTOMIC.md §2.2).
+        const order: []const usize = if (ix == .eavt) &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 } else &.{ 0, 1, 2, 3, 4, 5, 7, 8, 9, 6, 10 };
+        for (order) |r| {
+            const want = rows[r];
+            const got = (try m.next()) orelse return error.TestUnexpectedResult;
+            const parts = try key.unpackKey(ix, false, got.fact);
+            try testing.expectEqualSlices(u8, try key.valBytes(arena, .{ .string = want.v }), parts.v);
+            try testing.expectEqual(want.t, got.t);
+            try testing.expectEqual(want.added, got.added);
+            try testing.expectEqual(want.current, got.current);
+        }
+        try testing.expect((try m.next()) == null);
+        // As of 6: "a" (asserted again at 5) and the out-of-line
+        // value (asserted at 3) and "z"; "a\x00" went at 6, and "a\x00b"
+        // came at 4.
+        var f = try Store.foldScan(txn, store.trees, ix, prefix, end, .{ .as_of = 6 });
+        var n: usize = 0;
+        while (try f.next()) |r| : (n += 1) try testing.expect(r.added and r.t <= 6);
+        try testing.expectEqual(@as(usize, 4), n);
+    }
+}
+
+test "a current row after a history row that is not an older retraction breaks H1" {
+    var td = try TestDir.init("store_h1");
+    defer td.deinit();
+    const store = try Store.open(testing.allocator, td.path.ptr, .{});
+    defer store.close();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const e: u64 = 1 << 33;
+    const vb = try key.valBytes(arena, .{ .long = 1 });
+    // The current assertion at 5 after a retained assertion at 3, and
+    // after a retraction at 6.
+    for ([_]key.Top{ .{ .t = 3, .added = true }, .{ .t = 6, .added = false } }) |top| {
+        const txn = try store.beginWrite(.none);
+        defer txn.abort();
+        var tb: [key.t_value_max]u8 = undefined;
+        try txn.putInTree(store.trees.cur(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, null), key.writeCurrentT(&tb, 5));
+        try txn.putInTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 100, vb, top), &.{});
+        const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e });
+        var m = try Store.mergedScan(txn, store.trees, .eavt, prefix, try key.successor(arena, prefix));
+        _ = try m.next();
+        try testing.expectError(error.Corrupted, m.next());
+    }
 }

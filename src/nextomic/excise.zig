@@ -7,12 +7,12 @@
 //!   - every current and history datom `[e a? ...]` leaves the eight
 //!     index trees: EAVT and EAVT-h by one prefix delete each, AEVT and
 //!     AEVT-h by a prefix delete when the attribute is given, and the
-//!     rest one key at a time from a scan of the history rows, which
-//!     name every datom the entity ever had;
+//!     rest one key at a time from a scan of the EAVT-h and EAVT rows,
+//!     which together name every datom the entity ever had;
 //!   - every txlog entry holding one of those datoms is rewritten
-//!     without them and marked `{:excised [e ...]}`; an entry that ends
-//!     up empty stays, with its instant and its marker, so `tx-range`
-//!     replays the same transactions with the datoms gone;
+//!     without their rows and marked with the entity; an entry that
+//!     ends up empty stays, with its instant and its marker, so
+//!     `tx-range` replays the same transactions with the datoms gone;
 //!   - the per-attribute current counts drop by the current rows
 //!     removed, and the tokens tree loses the rows of every current
 //!     string value of a `:db/fulltext` attribute.
@@ -39,7 +39,9 @@ const Index = key.Index;
 pub const Outcome = struct {
     /// Every `t` whose txlog entry was rewritten, ascending.
     ts: []const u64,
-    /// History rows removed across the eight trees' EAVT-h view.
+    /// Rows of the entity's history removed: its retired EAVT-h rows
+    /// and its current EAVT rows, every assertion and retraction it
+    /// ever had.
     removed: u64,
     /// Attribute id → current rows removed.
     counts: std.AutoHashMapUnmanaged(u32, u64),
@@ -57,8 +59,9 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
     var counts: std.AutoHashMapUnmanaged(u32, u64) = .empty;
     const prefix = try key.prefixBytes(arena, .eavt, .{ .e = e, .a = a });
 
-    // The history rows name every datom the entity ever had; the
-    // current rows are those still asserted. Both are collected before
+    // The history rows and the current rows together name every datom
+    // the entity ever had; the current rows are those still asserted,
+    // each the latest assertion of its fact. Both are collected before
     // anything is deleted, so no cursor walks a tree being changed.
     {
         var s = try Store.scan(txn, store.trees.hist(.eavt), prefix);
@@ -69,13 +72,12 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
             try ts.put(arena, parts.top.?.t, {});
         }
     }
-    const history_rows = rows.items.len;
     {
         var s = try Store.scan(txn, store.trees.cur(.eavt), prefix);
-        s.cursor.keysOnly = true;
         while (try s.next()) |kv| {
             const parts = try key.unpackKey(.eavt, false, kv.key);
             try rows.append(arena, .{ .a = parts.a, .vbytes = try arena.dupe(u8, parts.v), .top = null });
+            try ts.put(arena, (try key.readCurrent(kv.value)).t, {});
             const g = try counts.getOrPut(arena, parts.a);
             if (!g.found_existing) g.value_ptr.* = 0;
             g.value_ptr.* += 1;
@@ -101,7 +103,7 @@ pub fn removeDatoms(store: *Store, txn: *Txn, arena: Allocator, schema: *const S
 
     const sorted = try arena.dupe(u64, ts.keys());
     std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
-    return .{ .ts = sorted, .removed = history_rows, .counts = counts };
+    return .{ .ts = sorted, .removed = rows.items.len, .counts = counts };
 }
 
 fn delete(store: *Store, txn: *Txn, arena: Allocator, index: Index, history: bool, e: u64, r: Row) !void {
@@ -111,23 +113,13 @@ fn delete(store: *Store, txn: *Txn, arena: Allocator, index: Index, history: boo
 }
 
 /// Rewrite the txlog entry of each `t` in `ts` without the datoms of
-/// `e` (under `a` when given), marking it with `e` in `{:excised
-/// [...]}`; a marker already there keeps its other entities. The
-/// entry's instant stands.
-pub fn rewriteTxlog(store: *Store, txn: *Txn, arena: Allocator, ts: []const u64, e: u64, a: ?u32, ids: datom_mod.IdSource, names: datom_mod.NameSource) !void {
+/// `e` (under `a` when given), marking it with `e` (datom.zig
+/// `exciseTxlog`); the entry's instant and its other rows stand as
+/// stored.
+pub fn rewriteTxlog(store: *Store, txn: *Txn, arena: Allocator, ts: []const u64, e: u64, a: ?u32, types: datom_mod.Source) !void {
     for (ts) |t| {
         const bytes = (try store.getTxlog(txn, t)) orelse return error.Corrupted;
-        const entry = try datom_mod.decodeTxlog(arena, bytes, t, ids);
-        var kept: std.ArrayList(datom_mod.Datom) = .empty;
-        for (entry.datoms) |d| {
-            const gone = d.e == e and (a == null or d.a == a.?);
-            if (!gone) try kept.append(arena, d);
-        }
-        var marked: std.ArrayList(u64) = .empty;
-        try marked.appendSlice(arena, entry.excised);
-        if (std.mem.findScalar(u64, marked.items, e) == null) try marked.append(arena, e);
-        const rewritten = try datom_mod.encodeTxlog(arena, entry.instant, kept.items, marked.items, names);
-        try store.putTxlog(txn, t, rewritten);
+        try store.putTxlog(txn, t, try datom_mod.exciseTxlog(arena, bytes, e, a, types));
     }
 }
 

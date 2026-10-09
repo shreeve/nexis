@@ -8,13 +8,15 @@
 //! reads are read-only children of the held write transaction, with
 //! ident and schema caches of its own. Invariants:
 //!   - `now == basis` in current mode reads the current trees with no
-//!     fold; any other view folds the history trees (`Store.FoldScan`).
+//!     fold; any other view folds the current and history trees
+//!     together (`Store.FoldScan` over `Store.MergedScan`).
 //!   - `now < basis` is `error.BasisInFuture`; the db-value is dead.
 //!   - `as-of T` caps the view at `min(basis, T)`; `since T` shows only
 //!     facts asserted after `T`; `history` shows every row unfolded, and
 //!     composes with `as-of`.
-//!   - Out-of-line values are confirmed and materialised from the EAVT
-//!     payload before a datom is returned.
+//!   - Out-of-line values are confirmed and materialised from their
+//!     payload, in the current EAVT row or the EAVT-h assertion row,
+//!     before a datom is returned.
 //!   - Every operation allocates in the caller's arena; the connection's
 //!     allocator holds only the store, the ident cache and the schema.
 
@@ -99,6 +101,9 @@ pub const OpenOptions = struct {
     /// How the connection's commits sync; null takes the process's
     /// durability (`NEXIS_DURABILITY`, NEXTOMIC.md §3).
     sync: ?SyncMode = null,
+    /// Given the format of a store refused as another format's
+    /// (`error.Format`).
+    refused_format: ?*u16 = null,
 };
 
 pub const Conn = struct {
@@ -163,7 +168,7 @@ pub const Conn = struct {
 
     fn openIn(self: *Conn, path: [*:0]const u8, options: OpenOptions, gen: u64) !void {
         const sync_mode = options.sync orelse SyncMode.of(store_mod.db_layer.Durability.process());
-        const store = try Store.open(self.gpa, path, .{ .sync = sync_mode });
+        const store = try Store.open(self.gpa, path, .{ .sync = sync_mode, .refused_format = options.refused_format });
         errdefer store.close();
         try refreshFulltext(self.gpa, store, sync_mode);
         const gpa = self.gpa;
@@ -336,16 +341,11 @@ pub const Conn = struct {
     /// attribute-partition entity. Each entry is read once per
     /// connection: the cache then serves `upto`.
     fn schemaWritten(self: *Conn, txn: *Txn, after: u64, upto: u64) !bool {
-        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena_state.deinit();
-        var start: [key.id_len]u8 = undefined;
-        key.writeId(&start, after + 1);
-        var end: [key.id_len]u8 = undefined;
-        key.writeId(&end, upto + 1);
-        var s = try Store.scanRange(txn, self.store.trees.txlog, &start, &end);
+        var start: [key.ordered_max]u8 = undefined;
+        var end: [key.ordered_max]u8 = undefined;
+        var s = try Store.scanRange(txn, self.store.trees.txlog, key.writeTxlogKey(&start, after + 1), key.writeTxlogKey(&end, upto + 1));
         while (try s.next()) |kv| {
-            defer _ = arena_state.reset(.retain_capacity);
-            if (try datom_mod.touchesAttrPartition(arena_state.allocator(), kv.value)) return true;
+            if (try datom_mod.touchesAttrPartition(kv.value)) return true;
         }
         return false;
     }
@@ -553,7 +553,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = filter,
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), prefix, end, self.db.window()) },
+            .source = .{ .folded = try foldIn(arena, try Store.foldScan(self.txn, store.trees, index, prefix, end, self.db.window())) },
         };
     }
 
@@ -577,7 +577,7 @@ pub const Read = struct {
             .arena = arena,
             .index = index,
             .filter = .{},
-            .source = .{ .folded = try Store.foldScan(self.txn, store.trees.hist(index), start, end, self.db.window()) },
+            .source = .{ .folded = try foldIn(arena, try Store.foldScan(self.txn, store.trees, index, start, end, self.db.window())) },
         };
     }
 
@@ -610,6 +610,12 @@ pub const Read = struct {
     }
 };
 
+fn foldIn(arena: Allocator, scan: Store.FoldScan) !*Store.FoldScan {
+    const p = try arena.create(Store.FoldScan);
+    p.* = scan;
+    return p;
+}
+
 /// A folded datom stream over one index.
 pub const DatomScan = struct {
     read: *Read,
@@ -618,7 +624,10 @@ pub const DatomScan = struct {
     filter: Filter,
     source: union(enum) {
         current: Store.Scan,
-        folded: Store.FoldScan,
+        /// In the arena: a fold walks two trees, and a scan the
+        /// planner opens once a row, in the plain view, stays one
+        /// cursor wide.
+        folded: *Store.FoldScan,
     },
 
     /// Components the prefix does not pin exactly: those after a gap,
@@ -660,42 +669,40 @@ pub const DatomScan = struct {
                     const kv = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, kv.key);
                     if (!self.filter.passes(self.index, parts)) continue;
-                    if (kv.value.len < key.id_len) return error.Corrupted;
-                    const t = try key.readT(kv.value[0..key.id_len]);
-                    return try self.materialise(parts, t, true);
+                    const t = (try key.readCurrent(kv.value)).t;
+                    return try self.materialise(parts, .{ .fact = kv.key, .t = t, .added = true, .current = true });
                 },
-                .folded => |*s| {
+                .folded => |s| {
                     const r = (try s.next()) orelse return null;
                     const parts = try key.unpackKey(self.index, false, r.fact);
                     if (!self.filter.passes(self.index, parts)) continue;
-                    return try self.materialise(parts, r.t, r.added);
+                    return try self.materialise(parts, r);
                 },
             }
         }
     }
 
-    fn materialise(self: *DatomScan, parts: key.Parts, t: u64, added: bool) !Datom {
+    fn materialise(self: *DatomScan, parts: key.Parts, row: Store.HistoryRow) !Datom {
         const kv = try key.partsVal(self.arena, self.index, parts);
         const v: Val = switch (kv) {
             .val => |x| x,
-            .string_long => .{ .string = try self.payload(parts, t, added) },
-            .bytes_long => .{ .bytes = try self.payload(parts, t, added) },
+            .string_long => .{ .string = try self.payload(parts, row) },
+            .bytes_long => .{ .bytes = try self.payload(parts, row) },
         };
-        return .{ .e = parts.e, .a = parts.a, .v = v, .t = t, .added = added };
+        return .{ .e = parts.e, .a = parts.a, .v = v, .t = row.t, .added = row.added };
     }
 
-    /// The full out-of-line value from the EAVT-h payload of this exact
-    /// datom (current or history), read with `getFromTree` and copied
-    /// into the arena: a multi-page value is assembled in the
-    /// transaction's own buffer, which dies with the transaction.
-    fn payload(self: *DatomScan, parts: key.Parts, t: u64, added: bool) ![]const u8 {
+    /// The full out-of-line value of this exact datom, current or
+    /// history, copied into the arena: a multi-page value is assembled
+    /// in the transaction's own buffer, which dies with the
+    /// transaction.
+    fn payload(self: *DatomScan, parts: key.Parts, row: Store.HistoryRow) ![]const u8 {
         const store = self.read.db.conn.store;
         const vbytes = if (self.index == .vaet) unreachable else parts.v;
-        if (self.source == .current) {
+        if (row.current) {
             return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
-        const raw = (try store.getHistory(self.read.txn, .eavt, parts.e, parts.a, vbytes, .{ .t = t, .added = added }, self.arena)) orelse return error.Corrupted;
-        return self.arena.dupe(u8, raw);
+        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena));
     }
 };
 
@@ -718,23 +725,19 @@ pub fn txRange(conn: *Conn, arena: Allocator, from: u64, to: ?u64) ![]TxEntry {
     const now = try conn.store.readT(txn);
     const schema = try conn.schemaAt(txn, now, now);
 
-    var ctx = TxCtx{ .conn = conn, .txn = txn, .schema = schema };
-    const ids: datom_mod.IdSource = .{ .ctx = @ptrCast(&ctx), .identId = &TxCtx.identId, .attrType = &TxCtx.attrType };
+    var ctx = TxCtx{ .conn = conn, .txn = txn, .schema = schema, .arena = arena };
+    const src: datom_mod.Source = .{ .ctx = @ptrCast(&ctx), .attrType = &TxCtx.attrType, .payload = &TxCtx.payload };
 
-    var start: [key.id_len]u8 = undefined;
-    key.writeId(&start, @max(from, 1));
-    var end_buf: [key.id_len]u8 = undefined;
-    const end: ?[]const u8 = if (to) |t| blk: {
-        key.writeId(&end_buf, t);
-        break :blk &end_buf;
-    } else null;
+    var start_buf: [key.ordered_max]u8 = undefined;
+    const start = key.writeTxlogKey(&start_buf, @max(from, 1));
+    var end_buf: [key.ordered_max]u8 = undefined;
+    const end: ?[]const u8 = if (to) |t| key.writeTxlogKey(&end_buf, t) else null;
 
     var out: std.ArrayList(TxEntry) = .empty;
-    var s = try Store.scanRange(txn, conn.store.trees.txlog, &start, end);
+    var s = try Store.scanRange(txn, conn.store.trees.txlog, start, end);
     while (try s.next()) |kv| {
-        if (kv.key.len != key.id_len) return error.Corrupted;
-        const t = try key.readT(kv.key[0..key.id_len]);
-        const entry = try datom_mod.decodeTxlog(arena, kv.value, t, ids);
+        const t = try key.readTxlogKey(kv.key);
+        const entry = try datom_mod.decodeTxlog(arena, kv.value, t, src);
         try out.append(arena, .{ .t = t, .instant = entry.instant, .datoms = entry.datoms, .excised = entry.excised });
     }
     return out.toOwnedSlice(arena);
@@ -744,19 +747,29 @@ const TxCtx = struct {
     conn: *Conn,
     txn: *Txn,
     schema: *Schema,
-
-    /// An entry spells a keyword by the name it had when written; a
-    /// name retired by a rename still decodes to its id.
-    fn identId(ctx: *anyopaque, name: []const u8) anyerror!?u32 {
-        const self: *TxCtx = @ptrCast(@alignCast(ctx));
-        if (try self.conn.idents.idOfName(self.txn, name)) |id| return id;
-        return self.conn.store.retiredIdentId(self.txn, name);
-    }
+    arena: Allocator,
 
     fn attrType(ctx: *anyopaque, a: u32) anyerror!?key.ValueType {
         const self: *TxCtx = @ptrCast(@alignCast(ctx));
         const attr = self.schema.attr(a) orelse return null;
         return attr.value_type;
+    }
+
+    /// An out-of-line value's payload from its datom's row: the current
+    /// EAVT row when it is the assertion at `t`, else the EAVT-h row
+    /// (NEXTOMIC.md §2.2). A datom of the log whose row is gone is
+    /// `error.Corrupted`.
+    fn payload(ctx: *anyopaque, e: u64, a: u32, vbytes: []const u8, t: u64, added: bool) anyerror![]const u8 {
+        const self: *TxCtx = @ptrCast(@alignCast(ctx));
+        const store = self.conn.store;
+        if (added) {
+            const k = try key.keyBytes(self.arena, .eavt, e, a, vbytes, null);
+            if (try self.txn.getFromTree(store.trees.cur(.eavt), k)) |row| {
+                const cur = try key.readCurrent(row);
+                if (cur.t == t) return if (cur.rest.len == 0) error.Corrupted else cur.rest;
+            }
+        }
+        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added }, self.arena);
     }
 };
 
@@ -902,10 +915,9 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
 
     // AVET of :db/ident is keyed by ident id: [doc, type_double) holds
     // doc, txInstant and type_long.
-    var abuf: [key.attr_len]u8 = undefined;
-    key.writeAttr(&abuf, boot.ident);
-    const lo = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.doc }) });
-    const hi = try std.mem.concat(arena, u8, &.{ &abuf, try key.valBytes(arena, .{ .keyword = boot.type_double }) });
+    const abuf = try key.prefixBytes(arena, .avet, .{ .a = boot.ident });
+    const lo = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.doc }) });
+    const hi = try key.prefixBytes(arena, .avet, .{ .a = boot.ident, .v = try key.valBytes(arena, .{ .keyword = boot.type_double }) });
     for ([_]DbValue{ db, db.asOf(1) }) |view| {
         var rd = try view.beginRead();
         defer rd.close();
@@ -916,7 +928,7 @@ test "a bounded scan seeks to its start and stops at its end, on every view" {
         try testing.expectEqual(@as(usize, 3), n);
         try testing.expectEqualSlices(u64, &.{ boot.doc, boot.tx_instant, boot.type_long }, &seen);
         // An open end runs to the attribute's last key and past it.
-        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, &abuf)).?);
+        var open = try rd.scanRange(arena, .avet, lo, (try key.successor(arena, abuf)).?);
         var m: usize = 0;
         while (try open.next()) |_| m += 1;
         try testing.expectEqual(@as(usize, boot.idents.len - boot.doc + 1), m);
@@ -955,17 +967,16 @@ test "a t out of its range in a current row or a txlog key is Corrupted" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const store = tc.conn.store;
-    // A current EAVT row of :db/doc whose `[t:6]` is 2^46 | 1, and a
-    // txlog key 2^46 | 2: both pass the id range, neither is a `t`.
+    // A current EAVT row of :db/doc whose `t` is 2^46 | 1, and a txlog
+    // key 2^46 | 2: both pass the id range, neither is a `t`.
     {
         const txn = try store.beginWrite(.none);
         errdefer txn.abort();
         const k = try key.keyBytes(arena, .eavt, boot.doc, boot.ident, try key.valBytes(arena, .{ .keyword = boot.doc }), null);
-        var tb: [key.id_len]u8 = undefined;
-        key.writeId(&tb, key.tx_partition_bit | 1);
-        try txn.putInTree(store.trees.cur(.eavt), k, &tb);
-        key.writeId(&tb, key.tx_partition_bit | 2);
-        try txn.putInTree(store.trees.txlog, &tb, (try store.getTxlog(txn, 1)).?);
+        // 2^46 | 1 as a LEB128: seven groups of seven bits.
+        try txn.putInTree(store.trees.cur(.eavt), k, &.{ 0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10 });
+        var kb: [key.ordered_max]u8 = undefined;
+        try txn.putInTree(store.trees.txlog, key.writeOrdered(&kb, key.tx_partition_bit | 2), (try store.getTxlog(txn, 1)).?);
         try store.commit(txn);
     }
     const db = try tc.conn.db();

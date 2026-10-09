@@ -333,22 +333,29 @@ pub fn matches(arena: Allocator, text: []const u8, needle: []const []const u8) !
 /// The row key of `token` under `a` for the value of `e` hashing to
 /// `hash`.
 pub fn rowKey(arena: Allocator, a: u32, token: []const u8, e: u64, hash: u128) ![]const u8 {
-    const out = try arena.alloc(u8, key.attr_len + token.len + 1 + key.id_len + key.hash_len);
-    key.writeAttr(out[0..key.attr_len], a);
-    @memcpy(out[key.attr_len..][0..token.len], token);
-    out[key.attr_len + token.len] = 0;
-    key.writeId(out[key.attr_len + token.len + 1 ..][0..key.id_len], e);
-    std.mem.writeInt(u128, out[key.attr_len + token.len + 1 + key.id_len ..][0..key.hash_len], hash, .big);
-    return out;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacityPrecise(arena, key.attr_key_max + token.len + 1 + key.entity_key_max + key.hash_len);
+    try appendTokenPrefix(&out, arena, a, token);
+    var ebuf: [key.entity_key_max]u8 = undefined;
+    out.appendSliceAssumeCapacity(key.writeEntity(&ebuf, e));
+    var hbuf: [key.hash_len]u8 = undefined;
+    std.mem.writeInt(u128, &hbuf, hash, .big);
+    out.appendSliceAssumeCapacity(&hbuf);
+    return out.items;
 }
 
 /// The prefix of every row of `token` under `a`.
 pub fn tokenPrefix(arena: Allocator, a: u32, token: []const u8) ![]const u8 {
-    const out = try arena.alloc(u8, key.attr_len + token.len + 1);
-    key.writeAttr(out[0..key.attr_len], a);
-    @memcpy(out[key.attr_len..][0..token.len], token);
-    out[key.attr_len + token.len] = 0;
-    return out;
+    var out: std.ArrayList(u8) = .empty;
+    try appendTokenPrefix(&out, arena, a, token);
+    return out.items;
+}
+
+/// `[A(a)][token][0x00]`: a token holds no `0x00`, so the byte ends it.
+fn appendTokenPrefix(out: *std.ArrayList(u8), arena: Allocator, a: u32, token: []const u8) !void {
+    try key.appendAttrKey(out, arena, a);
+    try out.appendSlice(arena, token);
+    try out.append(arena, 0);
 }
 
 /// Put (`added`) or delete the rows of the string value `text` that
@@ -443,14 +450,14 @@ pub fn search(store: *Store, txn: *Txn, arena: Allocator, a: u32, needle: []cons
     return out;
 }
 
-/// The entity and hash a row key ends with.
+/// The entity and hash a row key ends with: past `A(a)` and the
+/// token's `0x00`, `E(e)` and the 16-byte hash.
 fn hitOf(k: []const u8) !Hit {
-    const tail = key.id_len + key.hash_len;
-    if (k.len < key.attr_len + 1 + tail) return error.Corrupted;
-    return .{
-        .e = try key.readId(k[k.len - tail ..][0..key.id_len]),
-        .hash = std.mem.readInt(u128, k[k.len - key.hash_len ..][0..key.hash_len], .big),
-    };
+    const a = try key.readAttrKey(k);
+    const end = std.mem.findScalarPos(u8, k, a.len, 0) orelse return error.Corrupted;
+    const e = try key.readEntity(k[end + 1 ..]);
+    if (k.len != end + 1 + e.len + key.hash_len) return error.Corrupted;
+    return .{ .e = e.e, .hash = std.mem.readInt(u128, k[k.len - key.hash_len ..][0..key.hash_len], .big) };
 }
 
 // =============================================================================

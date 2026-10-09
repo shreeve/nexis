@@ -20,8 +20,11 @@
 //!   - codec: encode / decode for representative Values.
 //!   - db-integrated: emdb put / get round-trip cost (the
 //!     Database-integrated category of docs/BENCH.md §2).
-//!   - nextomic: `q` over a 200k-datom store and `pull` over 20k
-//!     entities (bench/nextomic.zig).
+//!   - nextomic: `q` over a 200k-datom store, `pull` over 20k
+//!     entities, and time views of a churned store (bench/nextomic.zig).
+//!   - nextomic-store: no timings; the size of every tree of four
+//!     store shapes and the file's allocated bytes (bench/nextomic.zig,
+//!     docs/PERF.md §3.36).
 //!
 //! Every benchmark function here is a tiny wrapper over a
 //! `Runner.bench` call; the harness lives in `src/bench.zig`.
@@ -491,6 +494,7 @@ const categories = [_][]const u8{
     "codec",
     "db-integrated",
     "nextomic",
+    "nextomic-store",
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -745,6 +749,18 @@ pub fn main(init: std.process.Init) !u8 {
             defer store.deinit(alloc);
             try nextomic_bench.runPull(&runner, alloc, store.path);
         }
+        {
+            var store = try TmpStore.init(alloc, "time");
+            defer store.deinit(alloc);
+            try nextomic_bench.runTime(&runner, alloc, store.path);
+        }
+    }
+
+    // ---- Nextomic store size (docs/PERF.md §3.36): printed, not timed ----
+    if (include(filter, "nextomic-store")) {
+        var store = try TmpStore.init(alloc, "size");
+        defer store.deinit(alloc);
+        try nextomic_bench.runStore(alloc, io, store.path);
     }
 
     // ---- Output: the table to stdout, JSON to --out ----
