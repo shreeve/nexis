@@ -232,8 +232,8 @@ the result and write it once; a `replace` that finds nothing returns
 
 | Name | Arity | Semantics |
 |---|---|---|
-| `lower-case`, `upper-case` | 1 | ASCII letters mapped; every other byte, every byte of a multibyte scalar included, unchanged: `(upper-case "héllo")` is `"HéLLO"` |
-| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same ASCII rule |
+| `lower-case`, `upper-case` | 1 | Every character mapped as Java's `Character/toLowerCase` and `Character/toUpperCase` map it (`src/regex_tables.zig`, generated from Java's `Character`): `(upper-case "héllo")` is `"HÉLLO"`. The maps are one character to one, where Clojure's `String.toUpperCase` also expands (`"ß"` to `"SS"`) and lower-cases a final `Σ` to `ς`; a byte that is not UTF-8 is kept |
+| `capitalize` | 1 | The first character upper-case and the rest lower-case, by the same maps |
 | `reverse` | 1 | The code points in reverse order (not grapheme clusters) |
 | `trim`, `triml`, `trimr` | 1 | Without whitespace at both ends, the start, the end. Whitespace is Java's `Character/isWhitespace`, as Clojure's: tab through CR, FS through US, space, and the Unicode space, line and paragraph separators except the no-break ones (U+2003 and U+3000 are trimmed, U+00A0 stays). A byte that is not part of a well-formed UTF-8 sequence is not whitespace: it stops the trim and stays |
 | `trim-newline` | 1 | Without every `\n` and `\r` at the end |
@@ -254,8 +254,9 @@ string argument as UTF-8 before scanning and throw `:utf8-error` on a
 malformed one, so a separator can never cut a scalar in two; the
 code-point functions throw `:utf8-error` as §2 says.
 
-Full Unicode case mapping, normalization and grapheme segmentation
-are absent (STRING.md §6).
+The case maps are Java's simple ones; the full ones that change a
+string's length or read context, normalization and grapheme
+segmentation are absent.
 
 ---
 

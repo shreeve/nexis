@@ -44,6 +44,7 @@ const dispatch_mod = @import("dispatch.zig");
 const atom_mod = @import("atom.zig");
 const string_mod = @import("string.zig");
 const regex_mod = @import("regex.zig");
+const regex_tables = @import("regex_tables.zig");
 const format_mod = @import("format.zig");
 const record_mod = @import("record.zig");
 const protocol_mod = @import("protocol.zig");
@@ -597,8 +598,8 @@ const db_natives = table("db", db_rows);
 const db_docs = docs(db_rows);
 
 const string_rows = .{
-    .{ "lower-case", 1, 1, &fnStringLowerCase, "[s]", "Returns s with its ASCII letters lower-case; every other character,\n  a multibyte one included, is unchanged." },
-    .{ "upper-case", 1, 1, &fnStringUpperCase, "[s]", "Returns s with its ASCII letters upper-case; every other character,\n  a multibyte one included, is unchanged: (upper-case \"héllo\") is\n  \"HéLLO\"." },
+    .{ "lower-case", 1, 1, bind(caseMap, false), "[s]", "Returns s with every character lower-case, as Java's\n  Character/toLowerCase maps it: one character to one, so a final\n  sigma is not told apart." },
+    .{ "upper-case", 1, 1, bind(caseMap, true), "[s]", "Returns s with every character upper-case, as Java's\n  Character/toUpperCase maps it: one character to one, so\n  (upper-case \"straße\") is \"STRAßE\", where Clojure's is \"STRASSE\"." },
     .{ "trim", 1, 1, bind(trimString, .both), "[s]", "Returns s without whitespace at either end, whitespace as Java's\n  Character/isWhitespace reads it (U+00A0, the no-break space, stays)." },
     .{ "split", 2, 3, &fnStringSplit, "[s re] [s re limit]", "Returns a vector of the pieces of s between the matches of re, a\n  pattern or a literal string, with trailing empty pieces dropped. A\n  positive limit splits at most limit - 1 times; a negative one keeps\n  the trailing empty pieces." },
     .{ "triml", 1, 1, bind(trimString, .start), "[s]", "Returns s without whitespace at its start, whitespace as trim reads\n  it." },
@@ -5610,21 +5611,68 @@ fn reGroups(vm: *VM, m: Value) VmError!Value {
 // in a Zig buffer and pass the match as the call's argument, so no
 // heap value is held across the call (docs/GC.md §11.5).
 
-/// `s` with its ASCII letters in one case; other bytes, every byte
-/// of a multibyte scalar included, pass through.
-fn mapAsciiCase(vm: *VM, s: Value, upper: bool) VmError!Value {
-    const src = try stringArg(s);
-    const out = string_mod.allocUninit(vm.ensureHeap(), src.len) catch return VmError.OutOfMemory;
-    for (src, out.bytes) |b, *o| o.* = if (upper) std.ascii.toUpper(b) else std.ascii.toLower(b);
-    return out.value;
+/// `upper-case` (`up`) and `lower-case`: each character mapped by
+/// Java's `Character.toUpperCase` or `Character.toLowerCase`, the
+/// simple one-to-one maps (no `ß` to `SS`, no final sigma). A byte
+/// that is not UTF-8 passes through, as `trim` leaves it.
+fn caseMap(vm: *VM, args: []const Value, comptime up: bool) VmError!Value {
+    const src = try stringArg(args[0]);
+    var w = std.Io.Writer.Allocating.initCapacity(vm.allocator, src.len) catch return VmError.OutOfMemory;
+    defer w.deinit();
+    var i: usize = 0;
+    while (i < src.len) {
+        if (src[i] < 0x80) {
+            w.writer.writeByte(if (up) std.ascii.toUpper(src[i]) else std.ascii.toLower(src[i])) catch return VmError.OutOfMemory;
+            i += 1;
+            continue;
+        }
+        const d = string_mod.decodeAt(src, i) catch {
+            w.writer.writeByte(src[i]) catch return VmError.OutOfMemory;
+            i += 1;
+            continue;
+        };
+        const c = if (up) caseRun(&regex_tables.upper, d.scalar) else lowerCase(d.scalar);
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(c, &buf) catch unreachable;
+        w.writer.writeAll(buf[0..n]) catch return VmError.OutOfMemory;
+        i += d.len;
+    }
+    return string_mod.fromBytes(vm.ensureHeap(), w.written()) catch VmError.OutOfMemory;
 }
 
-fn fnStringLowerCase(vm: *VM, args: []const Value) VmError!Value {
-    return mapAsciiCase(vm, args[0], false);
+/// `Character.toLowerCase`: the tables hold `toUpperCase` and the
+/// fold `toLowerCase(toUpperCase(c))`, which is `toLowerCase(c)` but
+/// for a lower-case letter whose upper case differs (`ſ`, `ς`, `ı`
+/// stay themselves); a titlecase letter (`ǅ`) folds.
+fn lowerCase(c: u21) u21 {
+    if (caseRun(&regex_tables.upper, c) != c and categoryOf(c) != 3) return c;
+    return caseRun(&regex_tables.fold, c);
 }
 
-fn fnStringUpperCase(vm: *VM, args: []const Value) VmError!Value {
-    return mapAsciiCase(vm, args[0], true);
+/// `c` mapped by the runs of `runs` (`regex_tables.Run`).
+fn caseRun(runs: []const regex_tables.Run, c: u21) u21 {
+    var lo: usize = 0;
+    var hi = runs.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (runs[mid][0] <= c) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return c;
+    const r = runs[lo - 1];
+    if (c > r[1] or (c - r[0]) % r[2] != 0) return c;
+    return @intCast(@as(i32, c) + r[3]);
+}
+
+/// `Character.getType` of `c` (3 is `Lt`, titlecase).
+fn categoryOf(c: u21) u5 {
+    const t = &regex_tables.categories;
+    var lo: usize = 0;
+    var hi = t.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (t[mid] >> 5 <= c) lo = mid + 1 else hi = mid;
+    }
+    return @truncate(t[lo - 1]);
 }
 
 /// Java's `Character.isWhitespace`, which Clojure's `blank?` and `trim`
@@ -8338,6 +8386,9 @@ test "stdlib: malformed UTF-8 never panics a string native or format" {
     try testing.expectEqualStrings("\xe2\x82 \x82", string_mod.asBytes(t));
     const nl = try bind(trimString, .newline)(&vm, &.{pool[7]});
     try testing.expectEqualStrings("\xe2\x82", string_mod.asBytes(nl));
+    // A byte that is not UTF-8 passes through a case map.
+    const up = try bind(caseMap, true)(&vm, &.{try string_mod.fromBytes(heap, "a\xe2\x82\xff\xc3\xa9")});
+    try testing.expectEqualStrings("A\xe2\x82\xff\xc3\x89", string_mod.asBytes(up));
 }
 
 test "stdlib: subseq knows the four relations by their rows' functions" {

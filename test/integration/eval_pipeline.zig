@@ -4609,15 +4609,12 @@ test "nexis.string: lower-case + upper-case: ASCII baseline" {
     try expectOutput("(nexis.string/upper-case \"\")", "");
 }
 
-test "nexis.string: lower-case + upper-case: non-ASCII passes through unchanged" {
-    // ASCII letters map; non-ASCII bytes are preserved verbatim
-    // (STDLIB.md §3). UTF-8 validity is preserved by
-    // construction because bytes ≥ 0x80 are never modified.
-    try expectOutput("(nexis.string/lower-case \"HéLLO\")", "héllo");
-    try expectOutput("(nexis.string/upper-case \"abç\")", "ABç");
-    try expectOutput("(nexis.string/lower-case \"🦀A\")", "🦀a");
-    // Round-trip identity: codepoint count survives transform.
-    try expectOutput("(count (nexis.string/lower-case \"HéLLO\"))", "5");
+test "nexis.string: lower-case + upper-case map every character as Java's Character does" {
+    try expectOutput("(nexis.string/lower-case \"H\u{c9}LLO \u{1c5} \u{130} \u{1e9e} \u{3a3}\u{391}\")", "h\u{e9}llo \u{1c6} i \u{df} \u{3c3}\u{3b1}");
+    try expectOutput("(nexis.string/upper-case \"h\u{e9}llo \u{1c5} \u{131} \u{17f} \u{3c2} \u{2c65}\")", "H\u{c9}LLO \u{1c4} I S \u{3a3} \u{23a}");
+    // The simple one-to-one maps: no expansion, no final sigma.
+    try expectOutput("[(nexis.string/upper-case \"\u{df}\") (nexis.string/lower-case \"\u{3a3}\")]", "[\u{df} \u{3c3}]");
+    try expectOutput("[(nexis.string/lower-case \"\u{1f980}A\") (count (nexis.string/upper-case \"\u{2c65}\u{2c65}\"))]", "[\u{1f980}a 2]");
 }
 
 test "nexis.string: trim: whitespace on both sides" {
