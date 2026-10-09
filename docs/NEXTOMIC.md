@@ -177,7 +177,7 @@ never trusted; a partition or `t` that would run past its range is
 
 | partition | range | source |
 |---|---|---|
-| attributes and idents | `1 .. 2^32-1` | `sys/"aid"`; an attribute entity's eid **is** its `a` |
+| attributes and idents | `1 .. 2^32-2` | `sys/"aid"`, a u32 that names the next id; an attribute entity's eid **is** its `a` |
 | user entities | `2^32 .. 2^46-1` | `sys/"eid"` |
 | transaction entities | `2^46 \| t` | the logical `t` of the transaction |
 

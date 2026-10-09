@@ -162,7 +162,8 @@ pub const Report = struct {
     t: u64,
     /// User tempids only, in first-seen order.
     tempids: []TempidBinding,
-    /// Every datom of the transaction in write order, `:db/txInstant` last.
+    /// Every datom of the transaction in write order; the clock's
+    /// `:db/txInstant`, when the tx-data asserts none, last.
     tx_data: []Datom,
 };
 
@@ -1423,14 +1424,6 @@ const Ctx = struct {
         return null;
     }
 
-    /// The entity holding `(a v)` once the transaction's datoms are
-    /// written, or null.
-    fn findByAv(self: *Ctx, a: u32, vbytes: []const u8) !?u64 {
-        if (self.av_adds.get(try self.avKey(a, vbytes))) |e| return e;
-        const e = (try self.probeAvet(a, vbytes)) orelse return null;
-        return if (try self.retracts(e, a, vbytes)) null else e;
-    }
-
     /// The entity a lookup ref names once every tempid is bound.
     fn lookupEid(self: *Ctx, l: *const Lookup) !?u64 {
         return switch ((try self.lookupNamed(l)) orelse return null) {
@@ -1589,6 +1582,15 @@ const Ctx = struct {
             const pending: ?Pending = if (self.ctx.facts.get(fk)) |i| self.ctx.overlay.items[i] else null;
             return .{ .parts = parts, .kv = kv, .pending = pending, .kept = self.ctx.kept.contains(fk) };
         }
+
+        /// The next row this transaction does not retract.
+        fn nextCurrent(self: *LiveScan) !?LiveRow {
+            while (try self.next()) |r| {
+                if (r.pending) |p| if (!p.added) continue;
+                return r;
+            }
+            return null;
+        }
     };
 
     fn liveRows(self: *Ctx, index: key.Index, comps: key.Components) !LiveScan {
@@ -1600,11 +1602,8 @@ const Ctx = struct {
     /// retracted in this transaction.
     fn currentOne(self: *Ctx, e: u64, a: u32) !?Current {
         var rows = try self.liveRows(.eavt, .{ .e = e, .a = a });
-        while (try rows.next()) |r| {
-            if (r.pending) |p| if (!p.added) continue;
-            return .{ .val = try self.valFromParts(r.parts), .vbytes = try self.arena.dupe(u8, r.parts.v) };
-        }
-        return null;
+        const r = (try rows.nextCurrent()) orelse return null;
+        return .{ .val = try self.valFromParts(r.parts), .vbytes = try self.arena.dupe(u8, r.parts.v) };
     }
 
     /// The value of a current row. An out-of-line payload lives in the
@@ -1812,11 +1811,8 @@ const Ctx = struct {
         for (changes.items) |c| {
             const ex = c.existing orelse continue;
             if (c.avet) {
-                if (!ex.inAvet()) {
-                    try self.backfillAvet(ex);
-                } else if (c.unique) {
-                    try self.checkUniqueAvet(ex);
-                }
+                if (c.unique) try self.checkUniqueValues(ex, if (ex.inAvet()) .avet else .aevt);
+                if (!ex.inAvet()) try self.backfillAvet(ex);
             }
             if (c.fulltext and !ex.fulltext) {
                 try self.backfillFulltext(ex);
@@ -1833,8 +1829,7 @@ const Ctx = struct {
     fn backfillFulltext(self: *Ctx, attr: *const Attr) !void {
         const store = self.conn.store;
         var live = try self.liveRows(.aevt, .{ .a = attr.id });
-        while (try live.next()) |r| {
-            if (r.pending) |p| if (!p.added) continue;
+        while (try live.nextCurrent()) |r| {
             const v = try self.valFromParts(r.parts);
             try fulltext.index(store, self.txn, self.arena, attr.id, r.parts.e, v.string, true);
         }
@@ -1846,8 +1841,7 @@ const Ctx = struct {
     fn checkSingleValued(self: *Ctx, attr: *const Attr) !void {
         var rows = try self.liveRows(.aevt, .{ .a = attr.id });
         var prev: ?u64 = null;
-        while (try rows.next()) |r| {
-            if (r.pending) |p| if (!p.added) continue;
+        while (try rows.nextCurrent()) |r| {
             if (prev) |e| if (e == r.parts.e) return self.schemaRefused(attr.id, e, "an entity holds two values; cardinality stays many");
             prev = r.parts.e;
         }
@@ -1863,51 +1857,36 @@ const Ctx = struct {
         }
     }
 
-    /// An indexed attribute becoming unique: no value may be held by two
-    /// entities, in the tree or in this transaction.
-    fn checkUniqueAvet(self: *Ctx, attr: *const Attr) !void {
-        var rows = try self.liveRows(.avet, .{ .a = attr.id });
-        var prev: ?[]const u8 = null;
-        while (try rows.next()) |r| {
-            if (r.pending) |p| if (!p.added) continue;
-            if (prev) |pv| if (std.mem.eql(u8, pv, r.parts.v)) return self.unique(attr, try self.valFromParts(r.parts));
-            prev = try self.arena.dupe(u8, r.parts.v);
+    /// An attribute becoming unique: no value may be held by two
+    /// entities, in the tree less this transaction's retractions or
+    /// counting its assertions. `index` holds its current values: AVET
+    /// once the attribute is indexed, AEVT before the backfill.
+    fn checkUniqueValues(self: *Ctx, attr: *const Attr, index: key.Index) !void {
+        var holders: std.StringHashMapUnmanaged(u64) = .empty;
+        var rows = try self.liveRows(index, .{ .a = attr.id });
+        while (try rows.nextCurrent()) |r| {
+            const g = try holders.getOrPut(self.arena, try self.arena.dupe(u8, r.parts.v));
+            if (g.found_existing) return self.unique(attr, try self.valFromParts(r.parts));
+            g.value_ptr.* = r.parts.e;
         }
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (self.overlay.items) |p| {
             if (p.attr.id != attr.id or !p.added) continue;
-            if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return self.unique(attr, p.v);
-            if (try self.findByAv(attr.id, p.vbytes)) |other| if (other != p.e) return self.unique(attr, p.v);
+            const g = try holders.getOrPut(self.arena, p.vbytes);
+            if (g.found_existing and g.value_ptr.* != p.e) return self.unique(attr, p.v);
+            g.value_ptr.* = p.e;
         }
     }
 
     /// Copy every current `(e v t)` of the attribute from AEVT into AVET
     /// with its original `t`, and every row of its AEVT history into
     /// AVET-h, retractions and values retracted long before included,
-    /// so a history or as-of view of the index reads what EAVT holds;
-    /// refuse duplicate values when the attribute becomes unique.
+    /// so a history or as-of view of the index reads what EAVT holds.
     fn backfillAvet(self: *Ctx, attr: *const Attr) !void {
-        var becomes_unique = false;
-        for (self.overlay.items) |p| {
-            if (p.e == attr.id and p.attr.id == boot.unique and p.added) becomes_unique = true;
-        }
         const store = self.conn.store;
         var rows: std.ArrayList(struct { e: u64, vbytes: []const u8, t: u64 }) = .empty;
         var live = try self.liveRows(.aevt, .{ .a = attr.id });
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        while (try live.next()) |r| {
-            if (r.pending) |p| if (!p.added) continue;
-            const vb = try self.arena.dupe(u8, r.parts.v);
-            if (becomes_unique) {
-                if ((try seen.getOrPut(self.arena, vb)).found_existing) return self.unique(attr, try self.valFromParts(r.parts));
-            }
-            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = vb, .t = (try key.readCurrent(r.kv.value)).t });
-        }
-        if (becomes_unique) {
-            for (self.overlay.items) |p| {
-                if (p.attr.id != attr.id or !p.added) continue;
-                if ((try seen.getOrPut(self.arena, p.vbytes)).found_existing) return self.unique(attr, p.v);
-            }
+        while (try live.nextCurrent()) |r| {
+            try rows.append(self.arena, .{ .e = r.parts.e, .vbytes = try self.arena.dupe(u8, r.parts.v), .t = (try key.readCurrent(r.kv.value)).t });
         }
         for (rows.items) |r| {
             const ck = try key.keyBytes(self.arena, .avet, r.e, attr.id, r.vbytes, null);

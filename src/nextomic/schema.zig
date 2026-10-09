@@ -90,18 +90,18 @@ pub const Attr = struct {
                 .unique => if (ev.added or @backingInt(out.unique) == ev.value) {
                     out.unique = @fromBackingInt(@intCast(v));
                 },
-                .index => if (ev.added or @intFromBool(out.indexed) == ev.value) {
-                    out.indexed = v == 1;
-                },
-                .component => if (ev.added or @intFromBool(out.component) == ev.value) {
-                    out.component = v == 1;
-                },
-                .fulltext => if (ev.added or @intFromBool(out.fulltext) == ev.value) {
-                    out.fulltext = v == 1;
-                },
+                .index => flag(&out.indexed, ev),
+                .component => flag(&out.component, ev),
+                .fulltext => flag(&out.fulltext, ev),
             }
         }
         return if (typed) out else null;
+    }
+
+    /// A flag's event: an assertion sets the flag, a retraction clears
+    /// the value in force.
+    fn flag(f: *bool, ev: Event) void {
+        if (ev.added or @intFromBool(f.*) == ev.value) f.* = ev.added and ev.value == 1;
     }
 };
 
@@ -199,7 +199,6 @@ pub const Schema = struct {
 
     pub fn deinit(self: *Schema) void {
         const gpa = self.arena.child_allocator;
-        self.attrs.deinit(self.arena.allocator());
         self.arena.deinit();
         gpa.destroy(self);
     }
