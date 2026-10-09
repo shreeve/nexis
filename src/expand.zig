@@ -2815,7 +2815,7 @@ fn thread(ctx: *ExpandContext, call_form: *const Form, args: []const *Form, comp
 /// One syntax-quote's auto-gensyms: every `x#` in it names the same
 /// fresh `x__N__auto__`, and another syntax-quote gets another.
 pub const GensymScope = struct {
-    mappings: std.StringHashMapUnmanaged([]const u8) = .{},
+    mappings: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     pub fn deinit(self: *GensymScope, allocator: Allocator) void {
         self.mappings.deinit(allocator);
@@ -2968,7 +2968,7 @@ fn syntaxQuoteColl(b: Builder, scope: *GensymScope, items: []const *Form, compti
 /// (`CompileOptions.host_macros`). The caller owns the table and
 /// calls `table.deinit(allocator)`.
 pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
-    var table: HostMacroTable = .{};
+    var table: HostMacroTable = .empty;
     errdefer table.deinit(allocator);
     try table.put(allocator, "let", expandLetRename);
     try table.put(allocator, "fn", expandFnRename);
@@ -3178,7 +3178,7 @@ test "failure: a macro that fails without a message is named at its call" {
             return ExpandError.MalformedMacroCall;
         }
     };
-    var table: HostMacroTable = .{};
+    var table: HostMacroTable = .empty;
     try table.put(arena_state.allocator(), "refuse", Wrap.refuse);
     try expectFailure("(do 1 (+ 2 (refuse 3)))", &table, ExpandError.MalformedMacroCall, "malformed (refuse ...)", "(refuse 3)");
 }
@@ -3201,7 +3201,7 @@ test "set!: expands to var-set on the Var; a lexical target is refused at expans
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const empty: HostMacroTable = .{};
+    const empty: HostMacroTable = .empty;
     const items = (try (try expandForTest(arena, "(set! *x* (+ 1 2))", &empty)).form).datum.list;
     try testing.expectEqual(@as(usize, 3), items.len);
     try testing.expectEqualStrings("nexis.core", items[0].datum.symbol.ns.?);
@@ -3219,7 +3219,7 @@ test "macroexpand: with no macros a form comes back as it was read" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const empty: HostMacroTable = .{};
+    const empty: HostMacroTable = .empty;
     for ([_][]const u8{
         "42",                                             "true",                       "nil",                ":kw",                "x",
         "(+ 1 2)",                                        "(if (< x 10) :small :big)",  "(do (def y 1) y)",   "(let* [a 1] a)",     "(loop* [i 0] (if (< i 10) (recur (+ i 1)) i))",
@@ -3241,7 +3241,7 @@ test "macroexpand: a macro that expands to itself stops at the depth limit" {
             return mutCast(call_form);
         }
     };
-    var table: HostMacroTable = .{};
+    var table: HostMacroTable = .empty;
     try table.put(arena, "boom", Wrap.loopForever);
     try testing.expectError(ExpandError.ExpansionDepthExceeded, (try expandForTest(arena, "(boom)", &table)).form);
 }
@@ -3264,7 +3264,7 @@ test "macroexpand: nesting past the stack budget is ExpansionDepthExceeded, not 
         form = outer;
     }
     var interner = intern_mod.Interner.init(arena);
-    const empty: HostMacroTable = .{};
+    const empty: HostMacroTable = .empty;
     var ctx = ExpandContext{ .allocator = arena, .interner = &interner, .host_macros = &empty };
     try testing.expectError(ExpandError.ExpansionDepthExceeded, expandForm(&ctx, form));
 }
@@ -3278,7 +3278,7 @@ test "macroexpand: a macro fires unless a lexical binding shadows its name or a 
             return (Builder{ .ctx = ctx, .origin = call_form.origin }).kw("fired");
         }
     };
-    var table: HostMacroTable = .{};
+    var table: HostMacroTable = .empty;
     try table.put(arena, "my-macro", Wrap.fireIt);
     const fired = try (try expandForTest(arena, "(my-macro)", &table)).form;
     try testing.expectEqualStrings("fired", fired.datum.keyword.name);

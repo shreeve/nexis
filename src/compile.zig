@@ -1487,7 +1487,7 @@ fn clearDeadMoves(
             effects[pc].backward(live);
         }
     }
-    if (std.debug.runtime_safety and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
+    if (@import("builtin").optimize.runtimeSafety() and cleared) try checkClears(arena, code, effects, &flow, tries, extents, words);
     return true;
 }
 
@@ -3055,7 +3055,7 @@ pub const CompileOptions = struct {
     clear_locals: bool = true,
 };
 
-const no_macros: expand_mod.HostMacroTable = .{};
+const no_macros: expand_mod.HostMacroTable = .empty;
 
 /// The heap of `namespace`'s registry, where constants and macro
 /// values live; null without one.
@@ -4835,7 +4835,7 @@ test "compile errors: a macro that never stops expanding is MacroDepthExceeded" 
             return @constCast(call_form);
         }
     };
-    var host_macros: expand_mod.HostMacroTable = .{};
+    var host_macros: expand_mod.HostMacroTable = .empty;
     defer host_macros.deinit(arena.allocator());
     try host_macros.put(arena.allocator(), "boom", Wrap.loopForever);
     var span: ?reader_mod.SrcSpan = null;

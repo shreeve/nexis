@@ -96,7 +96,7 @@ comptime {
     expectFields(Namespace, &.{ "name", "parent", "registry", "aliases", "map_allocator", "var_allocator", "vars" });
     expectFields(vm_mod.Closure, &.{ "routine", "upvalues" });
     expectFields(record_mod.RecordBody, &.{ "type_id", "_pad", "fields" });
-    std.debug.assert(@import("builtin").cpu.arch.endian() == .little);
+    std.debug.assert(@import("builtin").target.cpu.arch.endian() == .little);
     std.debug.assert(@sizeOf(vm_mod.Inst) == 8);
 }
 
@@ -326,7 +326,7 @@ const Writer = struct {
     impl_out: Out = undefined,
 
     const Names = struct {
-        ids: std.AutoHashMapUnmanaged(u32, u32) = .{},
+        ids: std.AutoHashMapUnmanaged(u32, u32) = .empty,
         texts: std.ArrayList([]const u8) = .empty,
     };
 
@@ -863,7 +863,7 @@ fn header(v: Value) *HeapHeader {
 /// release build loads only those bytes (`matches` refuses any other
 /// image) and trusts them; verifying costs it 0.35 M instructions, 1.6%
 /// of a start (docs/PERF.md §3.18).
-pub const verify_routines = std.debug.runtime_safety;
+pub const verify_routines = @import("builtin").optimize.runtimeSafety();
 
 /// Load the image `bytes`, which `matches` accepted for `sources`,
 /// into `vm`, whose natives are installed and which has run nothing:
@@ -1372,7 +1372,7 @@ const Verifier = struct {
     const Error = error{ Mismatch, OutOfMemory };
 
     fn fail(v: *Verifier, comptime fmt: []const u8, args: anytype) Error {
-        v.why = std.fmt.bufPrint(&v.buf, fmt, args) catch fmt;
+        v.why = std.mem.print(&v.buf, fmt, args) catch fmt;
         return error.Mismatch;
     }
 
@@ -1429,7 +1429,7 @@ const Verifier = struct {
             var inner: [256]u8 = undefined;
             const was = inner[0..v.why.len];
             @memcpy(was, v.why);
-            v.why = std.fmt.bufPrint(&v.buf, "{s}/{s} {s}: {s}", .{ ns, name, what, was }) catch v.why;
+            v.why = std.mem.print(&v.buf, "{s}/{s} {s}: {s}", .{ ns, name, what, was }) catch v.why;
         }
         return err;
     }

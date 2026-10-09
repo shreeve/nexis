@@ -550,7 +550,7 @@ test "loader: memory that runs out while reading or compiling is OutOfMemory, ne
     const registry = try v.ensureRegistry();
     // What a `def` sets its Var's metadata through, when it runs.
     _ = try registry.core.intern("reset-meta!");
-    const no_macros: expand_mod.HostMacroTable = .{};
+    const no_macros: expand_mod.HostMacroTable = .empty;
     const info = vm_mod.SourceInfo{ .path = "<test>", .text = "(do 1 [1 2 3 4 5 6 7 8 9] {:a [2 3] :b #{1 2}} '(a b))" };
     var failed_somewhere = false;
     for (0..400) |n| {
