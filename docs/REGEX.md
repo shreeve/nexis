@@ -340,15 +340,19 @@ Java without `(?U)`.
 
 ### 7. The differential test
 
-`test/regex/corpus.json` holds 9 000 random cases and then a few
-hand-written regressions, each `[pattern, input, result]`: random
+`test/regex/corpus.json` holds 9 000 random cases and then about 150
+hand-written ones, each `[pattern, input, result]`: random
 patterns from a grammar of the supported constructs (three seeds,
 nesting to depth 5) and random inputs over ASCII, accented and astral
 letters, line terminators, a combining mark and the case-folding
 special cases, with Java's every find and its groups
 (`null` for a group that did not take part), `"ERR"` when Java
 refuses the pattern, or `"TIMEOUT"` when Java runs past a second.
-`test/regex/corpus.clj` generates it through `bb`:
+The hand-written cases cover what the grammar does not generate
+(escapes, nested and intersected classes, POSIX classes and
+properties, every flag, line terminators, the prefilters) and its
+regressions; Java computes their results as it does the random
+ones'. `test/regex/corpus.clj` generates the file through `bb`:
 
 ```
 bb test/regex/corpus.clj > test/regex/corpus.json
