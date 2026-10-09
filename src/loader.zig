@@ -487,6 +487,8 @@ const clojure_names = [_][2][]const u8{
     .{ "clojure.walk", "nexis.walk" },
     .{ "clojure.edn", "nexis.edn" },
     .{ "clojure.math", "nexis.math" },
+    .{ "clojure.java.shell", "nexis.shell" },
+    .{ "clojure.data.json", "nexis.json" },
 };
 
 /// `my.app-core.foo` → `my/app_core/foo.nx`. Caller owns the slice.

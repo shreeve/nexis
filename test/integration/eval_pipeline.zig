@@ -8207,6 +8207,8 @@ test "require: the clojure.* library names reach the nexis namespaces" {
     defer files.deinit();
     const r = try program.run("(eval '(require '[clojure.string :as s] 'clojure.test '[clojure.walk :as w] '[clojure.edn :as edn] '[clojure.math :as m])) [(eval '(s/join \",\" (clojure.string/split \"a-b\" \"-\"))) (eval '(fn? clojure.test/run-tests)) (eval '(w/postwalk-replace {1 2} [1])) (eval '(edn/read-string \"[:e]\")) (eval '(m/signum -3))]");
     try harness.expectResult(&program, "clojure.string", r, "[a,b true [2] [:e] -1.0]");
+    const r2 = try program.run("(eval '(require '[clojure.java.shell :as sh :refer [with-sh-dir]] '[clojure.data.json :as json])) [(eval '(fn? sh/sh)) (eval '(json/write-str {:a [1]})) (eval '(identical? sh/sh nexis.shell/sh))]");
+    try harness.expectResult(&program, "clojure.java.shell", r2, "[true {\"a\":[1]} true]");
 }
 
 test "require: a required file that fails while a form is compiled is a runtime failure with its trace, not a compile error" {

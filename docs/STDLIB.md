@@ -126,11 +126,12 @@ are defined in `core.nx` as the atom operations: one isolate, one
 thread.
 
 **Clojure's names.** The loader (`clojure_names` in
-`src/loader.zig`) accepts seven Clojure library namespaces:
+`src/loader.zig`) accepts nine Clojure library namespaces:
 `clojure.string` → `nexis.string`, `clojure.set` → `nexis.set`,
 `clojure.test` → `nexis.test`, `clojure.pprint` → `nexis.pprint`,
 `clojure.walk` → `nexis.walk`, `clojure.edn` → `nexis.edn`,
-`clojure.math` → `nexis.math`.
+`clojure.math` → `nexis.math`, `clojure.java.shell` → `nexis.shell`
+(§11) and `clojure.data.json` → `nexis.json` (§13).
 Requiring one creates a namespace of that name holding the nexis
 namespace's Vars (the same Var objects), so `(require
 '[clojure.string :as str])` and, after it, `clojure.string/join`
