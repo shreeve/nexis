@@ -30,8 +30,6 @@ const Value = value_mod.Value;
 const Heap = heap_mod.Heap;
 const HeapHeader = heap_mod.HeapHeader;
 
-/// The largest bound a counted repetition may name.
-pub const max_repeat = 1000;
 /// The largest program, counted after every repetition is expanded.
 pub const max_insts = 10_000;
 /// The most AST nodes the compiler visits, after every repetition is
@@ -956,7 +954,6 @@ const Parser = struct {
             p.pos += 1;
             greedy = false;
         } else if (p.peek() == '+') return p.fail(p.pos, "possessive quantifiers are not supported");
-        if (min > max_repeat or (max != inf and max > max_repeat)) return p.fail(at, "repetition count exceeds 1000");
         return p.node(.{ .repeat = .{
             .body = atom,
             .min = min,
@@ -2401,8 +2398,6 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
         .{ "\\X", "\\X (grapheme clusters) is not supported" },
         .{ "\\N{LATIN SMALL LETTER A}", "\\N{...} (named characters) is not supported" },
         .{ "\\b{g}", "\\b{g} (grapheme boundaries) is not supported" },
-        .{ "a{1001}", "repetition count exceeds 1000" },
-        .{ "a{0,1001}", "repetition count exceeds 1000" },
         .{ "a{99999999999}", "Illegal repetition range" },
         .{ "(", "Unclosed group" },
         .{ ")", "Unmatched closing ')'" },
@@ -2492,8 +2487,9 @@ test "regex: the limits refuse a pattern one step past them" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expect(try compile(a, "a{1000}", .{}) == .ok);
-    try testing.expectEqualStrings("the pattern compiles to more than 10000 instructions", (try compile(a, "(?:a{1000}){10}", .{})).err.msg);
+    try testing.expect(try compile(a, "a{1,2000}", .{}) == .ok);
+    for ([_][]const u8{ "(?:a{1000}){10}", "a{0,2147483647}", "a{2147483647,}" }) |p|
+        try testing.expectEqualStrings("the pattern compiles to more than 10000 instructions", (try compile(a, p, .{})).err.msg);
     const groups = try a.alloc(u8, 3 * 600);
     for (0..600) |i| @memcpy(groups[3 * i ..][0..3], "(a)");
     try testing.expectEqualStrings("the pattern has too many groups for its size", (try compile(a, groups, .{})).err.msg);
@@ -2502,7 +2498,7 @@ test "regex: the limits refuse a pattern one step past them" {
     try testing.expectEqualStrings("groups nest too deeply", (try compile(a, try nested(a, "[", "]", 300), .{})).err.msg);
     // A body that compiles to nothing still costs its nodes, every copy.
     try testing.expect(try compile(a, "(?:(?:){1000}){499}", .{}) == .ok);
-    for ([_][]const u8{ "(?:(?:){1000}){500}", "(?:(?:(?:){1000}){1000}){1000}", "(?:(?:(?:(?:x{0}){1000}){1000}){1000}){1000}" }) |p|
+    for ([_][]const u8{ "(?:(?:){1000}){500}", "(?:){2147483647}", "(?:(?:(?:){1000}){1000}){1000}", "(?:(?:(?:(?:x{0}){1000}){1000}){1000}){1000}" }) |p|
         try testing.expectEqualStrings("the pattern expands to more than 1000000 nodes", (try compile(a, p, .{})).err.msg);
     // A class's ranges are stored once however often it is written,
     // and the distinct ones are limited.

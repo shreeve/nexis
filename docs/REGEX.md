@@ -256,7 +256,6 @@ not turn every slow search into an error.
 
 | Limit | Value | Sentence |
 |---|---|---|
-| a repetition bound | 1000 | `repetition count exceeds 1000` |
 | program size, after every repetition is expanded | 10 000 instructions | `the pattern compiles to more than 10000 instructions` |
 | program size × slots | 2^20 slot words | `the pattern has too many groups for its size` |
 | AST nodes compiled, after every repetition is expanded (a body that compiles to nothing, such as `(?:)` or `x{0}`, still counts) | 1 000 000 | `the pattern expands to more than 1000000 nodes` |
