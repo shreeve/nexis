@@ -1082,7 +1082,8 @@ is thrown. When a throw that carries an origin leaves the run,
 detail and `error_trace` its chain, so the report is the one the error
 would have without the `try` around it. An origin no live record names
 is dropped before the next one is pushed; `resetAfterError` clears
-them all.
+them all. An origin is for the report only: a throw with no memory to
+record one goes on without it, reported where it leaves the run.
 
 **`ctrl:finally-exit`** pops the top `FinallyContinuation`
 (`InvalidHandlerState` if there is none or it belongs to another
@@ -1183,7 +1184,9 @@ native's keyword as the bare keyword, which the host reports with its
 trace; the REPL's `*e` holds the map a catch would have taken. Building
 the map can fail only for memory; then the value is the bare keyword,
 which every `catch` that takes the map also takes, so a handler still
-runs when the heap is exhausted. The line of a place costs a scan of
+runs when the heap is exhausted: nothing else a throw does allocates,
+since `ctrl:try-enter` reserves the room for a finally's continuation
+and the throw's origin is dropped when it cannot be recorded (§12). The line of a place costs a scan of
 the source before it; the VM keeps the last place it computed, so a
 handler taking an error in a loop scans once.
 

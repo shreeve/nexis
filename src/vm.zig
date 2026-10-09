@@ -4260,12 +4260,13 @@ pub const VM = struct {
     /// force to take it (with none, it leaves `run` with its frames
     /// standing and `recordErrorTrace` sees them). `err` is the runtime
     /// error the value was translated from, if any; its detail is
-    /// `error_detail`.
-    fn originFor(self: *VM, value: Value, err: ?VmError) VmError!?u32 {
+    /// `error_detail`. The origin is for the report only: with no
+    /// memory to record it the throw goes on without one.
+    fn originFor(self: *VM, value: Value, err: ?VmError) ?u32 {
         if (err == null) if (self.rethrownOrigin(value)) |o| return o;
         if (self.findThrowTarget() == null) return null;
         self.dropUnreferencedOrigins();
-        const o = self.origins.addOne(self.allocator) catch return VmError.OutOfMemory;
+        const o = self.origins.addOne(self.allocator) catch return null;
         o.* = .{ .value = value, .err = err };
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
@@ -4360,7 +4361,7 @@ pub const VM = struct {
         if (self.findThrowTarget() == null) return err;
         const tag = self.ensureInterner().internKeywordValue(kw_name) catch return err;
         const payload = self.errorValue(tag, self.error_detail, self.raiseSite());
-        const origin = try self.originFor(payload, err);
+        const origin = self.originFor(payload, err);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
     }
@@ -5979,6 +5980,10 @@ pub const VM = struct {
         const tries = self.frames.items[frame_index].routine.tries;
         const i = inst.wide();
         if (i >= tries.len) return VmError.OperandOutOfRange;
+        // A continuation is pushed only as a handler pops, so this is
+        // room for every one a throw may need: a throw allocates
+        // nothing a handler cannot do without (§12, §13).
+        try self.finally_stack.ensureTotalCapacity(self.allocator, self.handlers.items.len + 1 + self.finally_stack.items.len);
         try self.handlers.append(self.allocator, .{
             .kind = .try_,
             .frame_index = frame_index,
@@ -6052,7 +6057,7 @@ pub const VM = struct {
     /// `VmError.UncaughtThrow`.
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
         const value = try self.resolve(inst.a);
-        try self.unwindThrow(value, try self.originFor(value, null));
+        try self.unwindThrow(value, self.originFor(value, null));
     }
 
     /// Walk the handler stack top-down looking for the topmost
@@ -6086,8 +6091,7 @@ pub const VM = struct {
     /// result is `UncaughtThrow` and `unhandled_throw` holds the
     /// value.
     pub fn throwValue(self: *VM, value: Value) VmError {
-        const origin = self.originFor(value, null) catch |err| return err;
-        self.unwindThrow(value, origin) catch |err| return err;
+        self.unwindThrow(value, self.originFor(value, null)) catch |err| return err;
         return VmError.ControlTransferred;
     }
 
@@ -8014,6 +8018,47 @@ test "VM error value: a map of tag, message and place; the bare keyword when mem
     try testing.expectEqualStrings("index-out-of-bounds", try caughtTag(&vm, m));
     const message = try lookup(m, try vm.ensureInterner().internKeywordValue("message"), value_mod.nilValue());
     try testing.expectEqualStrings("index out of bounds", string_mod.asBytes(message));
+}
+
+test "VM error value: a handler takes a runtime error when memory is exhausted, through a finally too" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const a = failing.allocator();
+    var vm = try VM.init(a, &VM.idle_routine);
+    defer vm.deinit();
+    const it = vm.ensureInterner();
+    const k = try it.internKeywordValue("k");
+    _ = try it.internKeywordValue("kind-mismatch");
+    try vm.handlers.ensureTotalCapacity(a, 4);
+    // Two trys with a finally entered and left standing grow what
+    // a throw through them needs; none is thrown through yet.
+    const enter = [_]Inst{ asm_.tryEnter(0, 0), asm_.tryEnter(0, 0), asm_.returnNil() };
+    var warm = makeRoutine(&enter, &.{}, 1, "warm");
+    warm.tries = &.{.{ .catch_pc = 2, .finally_pc = 2 }};
+    try vm.retargetTop(&warm);
+    _ = try vm.run();
+    vm.resetAfterError();
+    // (try (try (+ :k 1) (catch any e (throw e)) (finally)) (catch any e e)),
+    // every allocation failing from the run on: the error map is the
+    // bare keyword, the throw has no origin to record, and the finally
+    // resumes it into the outer catch.
+    const code = [_]Inst{
+        asm_.tryEnter(0, 1),
+        asm_.tryEnter(1, 2),
+        asm_.mathAdd(3, kn(0), kn(1)),
+        asm_.tryExit(9),
+        asm_.throwOp(sl(2)), // 4: inner catch
+        asm_.finallyExit(), //  5: inner finally
+        asm_.move(3, 1), //     6: outer catch
+        asm_.tryExit(9),
+        asm_.returnNil(),
+        asm_.returnSlot(3), //  9
+    };
+    var routine = makeRoutine(&code, &.{ k, fx(1) }, 4, "oom");
+    routine.tries = &.{ .{ .catch_pc = 6 }, .{ .catch_pc = 4, .finally_pc = 5 } };
+    try vm.retargetTop(&routine);
+    failing.fail_index = failing.alloc_index;
+    defer failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, try vm.run()));
 }
 
 test "VM error value: a report drops the place a rethrown error map carries, and nothing else" {
