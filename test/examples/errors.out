@@ -1,0 +1,12 @@
+[:caught :negative-age]
+["no user 7" 7]
+"limit is 10"
+"caught: a plain string"
+2.5 :undefined
+  cleanup ran
+:done
+  cleanup ran
+:failed-but-cleaned-up
+{:port 80, :workers 4}
+"cannot read \"oops\""
+["config failed" "bad line" "x"]

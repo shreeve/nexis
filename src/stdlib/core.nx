@@ -10,28 +10,31 @@
 ; Simple predicates + accessors
 ; ============================================================
 
-(defn true?  [x] (= x true))
-(defn false? [x] (= x false))
+(defn true?  "Returns true if x is the value true." [x] (= x true))
+(defn false? "Returns true if x is the value false." [x] (= x false))
 
 ; second, take, some and every? are natives that walk no
 ; further than they must.
-(defn ffirst [x] (first (first x)))
-(defn nfirst [x] (next (first x)))
-(defn fnext [x] (second x))
-(defn nnext [x] (next (next x)))
+(defn ffirst "Returns (first (first x))." [x] (first (first x)))
+(defn nfirst "Returns (next (first x))." [x] (next (first x)))
+(defn fnext "Returns (first (next x)), the second element." [x] (second x))
+(defn nnext "Returns (next (next x))." [x] (next (next x)))
 
 ; ============================================================
 ; Sequence transforms
 ; ============================================================
 
-; (lazy-seq body...) → a lazy seq whose body runs once, when the seq is
-; first walked, and whose result is cached (docs/LAZY.md §4).
-(defmacro lazy-seq [& body]
+(defmacro lazy-seq
+  "Returns a lazy seq whose body runs once, when the seq is first
+  walked, its result (a seq, a collection or nil) cached. A body that
+  throws ends the seq there on the next walk."
+  [& body]
   `(nexis.internal/#%lazy-seq (fn* [] ~@body)))
 
-; (lazy-cat coll...) → the concatenation of the colls, each expression
-; evaluated only when the walk reaches it.
-(defmacro lazy-cat [& colls]
+(defmacro lazy-cat
+  "Returns the lazy concatenation of the colls, each coll expression
+  evaluated only when the walk reaches it."
+  [& colls]
   `(concat ~@(map (fn* [c] `(lazy-seq ~c)) colls)))
 
 ; The barrier through which = and hash realize a lazy block they meet
@@ -54,72 +57,87 @@
   (when (next else)
     (throw (ex-info (str macro " requires 1 or 2 forms after binding vector") {}))))
 
-; (if-let [binding test] then else?) → then with binding bound to
-; test's value when it is truthy, else. The binding may destructure;
-; any other shape fails to expand, as in Clojure.
-(defmacro if-let [binding then & else]
+(defmacro if-let
+  "binding is [form test]. When test is truthy, evaluates then with form
+  bound to its value, else evaluates else (nil when absent). form may
+  destructure; a binding of any other shape fails to expand."
+  [binding then & else]
   (check-binding "if-let" binding else)
   `(let [temp# ~(second binding)]
      (if temp#
        (let [~(first binding) temp#] ~then)
        ~(first else))))
 
-; (when-let [binding test] body...) → body when test is truthy.
-(defmacro when-let [binding & body]
+(defmacro when-let
+  "binding is [form test]. When test is truthy, evaluates body with form
+  bound to its value and returns the last value, else nil."
+  [binding & body]
   (check-binding "when-let" binding nil)
   `(let [temp# ~(second binding)]
      (when temp#
        (let [~(first binding) temp#] ~@body))))
 
-; (if-some [binding test] then else?) / (when-some [binding test]
-; body...) → as if-let / when-let, but only nil fails: false binds.
-(defmacro if-some [binding then & else]
+(defmacro if-some
+  "binding is [form test]. As if-let, but only a nil test takes the
+  else branch: false is bound."
+  [binding then & else]
   (check-binding "if-some" binding else)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        ~(first else)
        (let [~(first binding) temp#] ~then))))
 
-(defmacro when-some [binding & body]
+(defmacro when-some
+  "binding is [form test]. As when-let, but only a nil test skips the
+  body: false is bound."
+  [binding & body]
   (check-binding "when-some" binding nil)
   `(let [temp# ~(second binding)]
      (if (nil? temp#)
        nil
        (let [~(first binding) temp#] ~@body))))
 
-; (when-first [x coll] body...) → body with x bound to the first
-; element, when coll has one.
-(defmacro when-first [binding & body]
+(defmacro when-first
+  "binding is [x coll]. When (seq coll) is non-nil, evaluates body with
+  x bound to its first element, else returns nil."
+  [binding & body]
   (check-binding "when-first" binding nil)
   `(let [s# (seq ~(second binding))]
      (when s#
        (let [~(first binding) (first s#)] ~@body))))
 
-; (comment ...) → nil; the body is never evaluated or compiled, so
-; it may hold anything that reads (PLAN §23 #27).
-(defmacro comment [& _] nil)
+; The body is never compiled (PLAN §23 #27).
+(defmacro comment
+  "Ignores the body and returns nil. The body is never evaluated or
+  compiled, so it may hold anything that reads."
+  [& _] nil)
 
-; (doto x (f a) g ...) → x, after (f x a), (g x), ... in order.
-(defmacro doto [x & forms]
+(defmacro doto
+  "Evaluates x, then calls each form with that value inserted as its
+  first argument, in order: (doto x (f a) g) calls (f x a), then (g x).
+  Returns x."
+  [x & forms]
   (let [g (gensym "doto")]
     `(let [~g ~x]
        ~@(map (fn [f] (if (seq? f) `(~(first f) ~g ~@(rest f)) `(~f ~g))) forms)
        ~g)))
 
-; (defonce name expr) → defines name as expr's value unless it
-; already has one; expr is not evaluated then.
-(defmacro defonce [name expr]
+(defmacro defonce
+  "Defines name as the value of expr unless the Var is already bound,
+  in which case expr is not evaluated. Returns the Var."
+  [name expr]
   `(let [v# (def ~name)]
      (when-not (bound? v#) (def ~name ~expr))
      v#))
 
-; (assert x) / (assert x message) → nil when x is truthy, else throws
-; {:error :assertion-failed :message "Assert failed: <message or the
-; form>"}, the shape :pre, :post, case and condp throw. The printed
-; form is built when the macro expands, so the check costs its test
-; and the failure one call of two constants, a conj that makes a
-; fresh map each time.
-(defmacro assert [x & message]
+; The printed form is built when the macro expands, so the check costs
+; its test and the failure one call of two constants, a conj that makes
+; a fresh map each time.
+(defmacro assert
+  "Returns nil when x is truthy, else throws {:error :assertion-failed
+  :message \"Assert failed: ...\"} holding message, when given, and the
+  form x: the value a failed :pre or :post condition throws."
+  [x & message]
   `(when-not ~x
      (throw (conj {:error :assertion-failed}
                   [:message ~(cond
@@ -127,26 +145,29 @@
                                (string? (first message)) (str "Assert failed: " (first message) "\n" (pr-str x))
                                true `(str "Assert failed: " ~(first message) ~(str "\n" (pr-str x))))]))))
 
-; (time expr) → expr's value, after printing how long it took, as
-; Clojure's does.
-(defmacro time [expr]
+(defmacro time
+  "Evaluates expr, prints the time it took as \"Elapsed time: N msecs\"
+  (with prn), and returns its value."
+  [expr]
   `(let [start# (nano-time)
          ret# ~expr]
      (prn (str "Elapsed time: " (/ (double (- (nano-time) start#)) 1000000.0) " msecs"))
      ret#))
 
-; (with-out-str body...) → what body printed, as a string; nothing
-; reaches stdout. Captures nest.
-(defmacro with-out-str [& body]
+(defmacro with-out-str
+  "Evaluates body and returns what it printed, as a string; nothing
+  reaches stdout. Captures nest."
+  [& body]
   `(do (nexis.internal/#%push-out)
        (try (do ~@body)
             (catch any e# (nexis.internal/#%pop-out) (throw e#)))
        (nexis.internal/#%pop-out)))
 
-; (dotimes [name n-expr] body...)
-;   runs body n times with name bound to 0..n-1, n truncated to an
-;   integer as Clojure's `long` does. Returns nil.
-(defmacro dotimes [binding & body]
+(defmacro dotimes
+  "binding is [name n]. Evaluates body n times, with name bound to the
+  integers 0 through n-1; n is truncated to an integer as long does.
+  Returns nil."
+  [binding & body]
   `(let* [limit# (long ~(first (rest binding)))]
      (loop* [~(first binding) 0]
        (if (< ~(first binding) limit#)
@@ -155,18 +176,14 @@
          nil))))
 
 ; ============================================================
-; Durable transaction macros
+; Durable transaction macros (docs/DB.md §12)
 ; ============================================================
-;
-; `(with-tx [tx conn] body...)` opens a write transaction,
-; runs body, commits on normal exit, aborts on exception
-; (rethrows the exception). Returns body's result.
-;
-; `(with-read-tx [tx conn] body...)` opens a read snapshot,
-; runs body, aborts on exit (reads never commit). Returns
-; body's result.
 
-(defmacro with-tx [binding & body]
+(defmacro with-tx
+  "binding is [tx conn]. Begins a write transaction on the db
+  connection conn, evaluates body with tx bound to it, commits and
+  returns body's value; when body throws, aborts and rethrows."
+  [binding & body]
   `(let* [~(first binding) (db/begin-write ~(first (rest binding)))]
      (try
        (let* [r# (do ~@body)]
@@ -176,7 +193,11 @@
          (db/abort-write! ~(first binding))
          (throw e#)))))
 
-(defmacro with-read-tx [binding & body]
+(defmacro with-read-tx
+  "binding is [tx conn]. Begins a read transaction on the db connection
+  conn, evaluates body with tx bound to it, and aborts the transaction
+  afterwards, whether or not body throws. Returns body's value."
+  [binding & body]
   `(let* [~(first binding) (db/begin-read ~(first (rest binding)))]
      (try
        (let* [r# (do ~@body)]
@@ -186,28 +207,15 @@
          (db/abort-read! ~(first binding))
          (throw e#)))))
 
-; Snapshot vocabulary (docs/DB.md §12).
-;
 ; A snapshot is an emdb read transaction pinned to the commit
-; generation that was current when it began. As long as the
-; snapshot is alive, all reads through it see EXACTLY that
-; state regardless of subsequent writes.
-;
-; `(with-snapshot [snap conn] body...)` opens a snapshot,
-; runs body, releases on exit. Identical semantics to
-; `with-read-tx`; different name matches the user-facing
-; "I'm pinning to a point in time" mental model.
-;
-; To pin a snapshot past block scope: call `(db/snapshot conn)`
-; directly and `(db/release-snapshot! snap)` when done. The
-; snapshot is an ordinary Value — pass it to functions, store
-; it, compare it for identity.
-;
-; Caveat (docs/DB.md §12): long-held snapshots prevent emdb
-; from reclaiming pages they reference. Don't pin snapshots
-; you don't intend to release.
+; generation that was current when it began (docs/DB.md §12).
 
-(defmacro with-snapshot [binding & body]
+(defmacro with-snapshot
+  "binding is [snap conn]. with-read-tx under the snapshot names: body
+  sees the store as of the snapshot, which is released afterwards. To
+  hold one past a block, call db/snapshot and db/release-snapshot!; a
+  held snapshot keeps emdb from reclaiming the pages it sees."
+  [binding & body]
   `(let* [~(first binding) (db/snapshot ~(first (rest binding)))]
      (try
        (let* [r# (do ~@body)]
@@ -221,15 +229,15 @@
 ; Dynamic bindings (docs/VM.md §6.5)
 ; ============================================================
 ;
-; (binding [*a* 1 *b* 2] body...) evaluates every value first, in
-; the bindings outside the form, then pushes one binding frame
-; for the dynamic Vars named and runs the body; the frame pops in
-; a finally, so a throw restores the previous bindings on its way
-; out. A closure called inside the body sees the bindings in
-; force at the call, wherever it was made. A Var not marked
-; ^:dynamic throws :not-dynamic before anything is rebound.
+; One binding frame for the Vars named, pushed after every value is
+; evaluated and popped in a finally.
 
-(defmacro binding [bindings & body]
+(defmacro binding
+  "bindings is [var-name val ...]. Evaluates every val, then binds each
+  dynamic Var to its value while body runs, restoring the previous
+  bindings on every exit, a throw included. A function called inside
+  sees them wherever it was made. A Var not ^:dynamic is :not-dynamic."
+  [bindings & body]
   `(do (push-thread-bindings
          (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
                              (partition 2 bindings))))
@@ -244,11 +252,12 @@
 ; time. The root binding never changes here; def and alter-var-root
 ; write roots.
 
-; (with-redefs-fn {#'v val ...} f) → calls f with each Var's root set
-; to its value, every root restored on every exit, and a Var that was
-; unbound unbound again. A root write, not a binding: every caller sees
-; it, and a Var need not be dynamic.
-(defn with-redefs-fn [binding-map func]
+(defn with-redefs-fn
+  "binding-map is {#'v val ...}. Calls func with each Var's root set to
+  its value, restoring every root on every exit (a Var that was unbound
+  is unbound again). A root write, not a binding: every caller sees it,
+  and a Var need not be dynamic. Returns func's value."
+  [binding-map func]
   (let* [old-vals (reduce-kv (fn* [m v _] (assoc m v (when (bound? v) [(alter-var-root v identity)]))) {} binding-map)]
     (try
       (reduce-kv (fn* [_ v x] (alter-var-root v (constantly x))) nil binding-map)
@@ -256,18 +265,23 @@
       (finally
         (reduce-kv (fn* [_ v old] (if old (alter-var-root v (constantly (old 0))) (nexis.internal/#%unbind-root v))) nil old-vals)))))
 
-; (with-redefs [name val ...] body...) → body with the roots of the
-; Vars the names resolve to set to the values, as with-redefs-fn.
-(defmacro with-redefs [bindings & body]
+(defmacro with-redefs
+  "bindings is [name val ...]. Evaluates body with the root of each Var
+  a name resolves to set to its val, as with-redefs-fn does, and every
+  root restored afterwards. A call the compiler inlines (arithmetic,
+  comparison) does not go through the Var."
+  [bindings & body]
   `(with-redefs-fn
      (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
                          (partition 2 bindings)))
      (fn [] ~@body)))
 
-; The namespace a form is compiled in, as its name symbol: the
-; compiler sets the root before it expands each top-level form, and
-; in-ns when it switches (STDLIB.md §8).
-(def ^:dynamic *ns* 'nexis.core)
+; The compiler sets the root before it expands each top-level form,
+; and in-ns when it switches (STDLIB.md §8).
+(def ^:dynamic *ns*
+  "The namespace a form is compiled in, as its name symbol. A binding
+  of it does not change where forms compile."
+  'nexis.core)
 
 ; ============================================================
 ; Function combinators and collection helpers
@@ -278,33 +292,41 @@
 ; Clojure's does; the others iterate with `loop*` and an explicit
 ; exit.
 
-; (unreduced x) → the value inside a reduced, else x.
-(defn unreduced [x]
+(defn unreduced
+  "Returns the value inside x when x is reduced, else x."
+  [x]
   (if (reduced? x) @x x))
 
-; (ensure-reduced x) → x if already reduced, else (reduced x).
-(defn ensure-reduced [x]
+(defn ensure-reduced
+  "Returns x when it is already reduced, else (reduced x)."
+  [x]
   (if (reduced? x) x (reduced x)))
 
 ; ---- function composition helpers ----
 
-; (constantly x) → fn taking any args, always returns x.
-(defn constantly [x]
+(defn constantly
+  "Returns a function that takes any number of arguments and returns
+  x."
+  [x]
   (fn* [& _] x))
 
-; (complement f) → fn returning the logical-not of f.
-(defn complement [f]
+(defn complement
+  "Returns a function that takes the same arguments as f and returns
+  the opposite truth value."
+  [f]
   (fn* [& args] (not (apply f args))))
 
-; (partial f & args) → fn taking more args, prepending the
-; closed-over `args`.
-(defn partial [f & bound]
+(defn partial
+  "Returns a function that calls f with bound followed by its own
+  arguments."
+  [f & bound]
   (fn* [& more] (apply f (concat bound more))))
 
-; (comp & fns) → fn that applies the rightmost fn to args,
-; then walks left passing single results. (comp) → identity.
-; (comp f) → f. Matches Clojure's right-to-left composition.
-(defn comp [& fns]
+(defn comp
+  "Returns the composition of fns: a function that applies the
+  rightmost to its arguments, then each fn to its left to the result.
+  (comp) is identity."
+  [& fns]
   (if (empty? fns)
     identity
     (let* [reversed (reverse fns)
@@ -317,36 +339,39 @@
 
 ; ---- short-circuiting predicates over sequences ----
 
-; (not-every? pred coll) → true iff pred is falsy for at
-; least one elt. (Inverse of every?.)
-(defn not-every? [pred coll]
+(defn not-every?
+  "Returns false if (pred x) is truthy for every x in coll, else true."
+  [pred coll]
   (not (every? pred coll)))
 
-; (not-any? pred coll) → true iff pred is falsy for all elts.
-(defn not-any? [pred coll]
+(defn not-any?
+  "Returns false if (pred x) is truthy for any x in coll, else true."
+  [pred coll]
   (if (some pred coll) false true))
 
 ; ---- collection extras ----
 
-; (merge & maps) → left-to-right map merge. Later keys win.
-; (merge) → nil, and so does a merge of nils only; the first
-; non-nil map decides the result's kind, so a record stays one.
-(defn merge [& maps]
+(defn merge
+  "Returns a map of the maps conj'd left to right, a later key's value
+  winning. nil when no map is non-nil; the first non-nil map decides
+  the result's kind, so a record stays one."
+  [& maps]
   (when (some some? maps)
     (reduce conj (remove nil? maps))))
 
-; (update m k f & args) → assoc m with k → (apply f (get m k) args).
 ; The short arities call f directly, with no argument list to build.
 (defn update
+  "Returns m with the value at k replaced by (f (get m k)), any further
+  arguments passed to f after the old value."
   ([m k f] (assoc m k (f (get m k))))
   ([m k f x] (assoc m k (f (get m k) x)))
   ([m k f x y] (assoc m k (f (get m k) x y)))
   ([m k f x y & more] (assoc m k (apply f (get m k) x y more))))
 
-; (get-in m [k1 k2 ...]) → nested lookup. nil if any step
-; misses. (get-in m ks default) → default when any key along
-; the path is absent (a present nil value is still nil).
 (defn get-in
+  "Returns the value in nested associative m at the path of keys ks:
+  nil, or default when given, if a key along the path is absent. A
+  present nil value is nil."
   ([m ks]
    (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
            m
@@ -362,18 +387,21 @@
              default
              (recur v (next s)))))))))
 
-; (assoc-in m [k1 k2 ...] v) → m with the nested path set to v.
-(defn assoc-in [m ks v]
+(defn assoc-in
+  "Returns m with v at the nested path of keys ks, creating maps for
+  levels that do not exist."
+  [m ks v]
   (if (empty? (rest ks))
     (assoc m (first ks) v)
     (assoc m
            (first ks)
            (assoc-in (get m (first ks)) (rest ks) v))))
 
-; (update-in m [k1 k2 ...] f & args) → m with the value at the path
-; replaced by (apply f value args), walking the path once; an empty
-; path is the one key nil, as Clojure's.
-(defn update-in [m ks f & args]
+(defn update-in
+  "Returns m with the value at the nested path of keys ks replaced by
+  (apply f old-value args), creating maps for levels that do not
+  exist. An empty path is the one key nil."
+  [m ks f & args]
   (let* [k (first ks)
          more (next ks)]
     (assoc m k (if more
@@ -382,9 +410,9 @@
 
 ; ---- lazy sequence functions (docs/LAZY.md §7), Clojure 1.12's ----
 
-; (interleave c1 c2 ...) → the first of each coll, then the second of
-; each, ..., ending with the shortest.
 (defn interleave
+  "Returns a lazy seq of the first item of each coll, then the second
+  of each, and so on, ending when the shortest coll does."
   ([] ())
   ([c1] (lazy-seq c1))
   ([c1 c2]
@@ -398,20 +426,23 @@
        (when (every? identity ss)
          (concat (map first ss) (apply interleave (map rest ss))))))))
 
-; (interpose sep coll) → coll with sep between each pair of adjacent
-; elements.
 (defn interpose
+  "Returns a lazy seq of the elements of coll with sep between each
+  adjacent pair. Returns a transducer when no coll is given."
   ([sep] (xf-interpose sep))
   ([sep coll] (drop 1 (interleave (repeat sep) coll))))
 
-; (take-nth n coll) → every nth element, starting with the first.
-(defn take-nth [n coll]
+(defn take-nth
+  "Returns a lazy seq of every nth element of coll, starting with the
+  first."
+  [n coll]
   (lazy-seq
     (when-let [s (seq coll)]
       (cons (first s) (take-nth n (drop n s))))))
 
-; (partition-by f coll) → coll split each time (f x) changes.
 (defn partition-by
+  "Returns a lazy seq of the runs of coll, split each time (f x)
+  returns a new value. Returns a transducer when no coll is given."
   ([f] (xf-partition-by f))
   ([f coll]
   (lazy-seq
@@ -421,12 +452,13 @@
             run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
         (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
 
-; (tree-seq branch? children root) → the lazy seq of the nodes of the
-; tree under root, depth first, each before its children. Realizing a
-; node calls branch? and children on it, as Clojure's does; the seqs of
-; children still to visit wait on an explicit stack, so the depth of the
-; tree costs no native stack.
-(defn tree-seq [branch? children root]
+; The seqs of children still to visit wait on an explicit stack, so the
+; depth of the tree costs no native stack.
+(defn tree-seq
+  "Returns a lazy seq of the nodes of the tree under root, depth first,
+  each before its children. (children node) gives the children of a
+  node for which (branch? node) is truthy. A tree of any depth walks."
+  [branch? children root]
   (let [walk (fn walk [node stack]
                (lazy-seq
                  (cons node
@@ -439,15 +471,17 @@
                                  (recur (rest stack))))))))))]
     (walk root ())))
 
-; (flatten coll) → every non-sequential leaf of a list or vector, depth
-; first; nil leaves are kept. Anything that is not sequential, nil
-; included, flattens to ().
-(defn flatten [x]
+(defn flatten
+  "Returns a lazy seq of the non-sequential leaves of nested lists and
+  vectors in x, depth first; nil leaves are kept. (flatten x) of an x
+  that is not sequential, nil included, is ()."
+  [x]
   (filter (complement sequential?) (rest (tree-seq sequential? seq x))))
 
-; (reductions f coll) / (reductions f init coll) → every intermediate
-; accumulator of the fold, stopping at a reduced one.
 (defn reductions
+  "Returns a lazy seq of the intermediate values of (reduce f init
+  coll), init first, ending at a reduced value. Without init, starts
+  from the first element, or (f) when coll is empty."
   ([f coll]
    (lazy-seq
      (if-let [s (seq coll)]
@@ -461,32 +495,37 @@
              (when-let [s (seq coll)]
                (reductions f (f init (first s)) (rest s))))))))
 
-; (drop-last coll) / (drop-last n coll) → coll without its last n
-; elements, one by default.
 (defn drop-last
+  "Returns a lazy seq of all but the last n elements of coll, n 1 by
+  default."
   ([coll] (drop-last 1 coll))
   ([n coll] (map (fn [x _] x) coll (drop n coll))))
 
-; (split-at n coll) → [(take n coll) (drop n coll)].
-(defn split-at [n coll]
+(defn split-at
+  "Returns [(take n coll) (drop n coll)]."
+  [n coll]
   [(take n coll) (drop n coll)])
 
 ; ============================================================
 ; Function combinators
 ; ============================================================
 
-; (juxt f g ...) → fn returning [(f args) (g args) ...].
-(defn juxt [& fs]
+(defn juxt
+  "Returns a function that calls each of fs on its arguments and
+  returns the vector of results: ((juxt a b) x) is [(a x) (b x)]."
+  [& fs]
   (fn* [& args]
     (mapv (fn* [f] (apply f args)) fs)))
 
-; (vary-meta obj f & args) → obj carrying (apply f (meta obj) args).
-(defn vary-meta [obj f & args]
+(defn vary-meta
+  "Returns obj with metadata (apply f (meta obj) args)."
+  [obj f & args]
   (with-meta obj (apply f (meta obj) args)))
 
-; (fnil f d1 d2? d3?) → f, with nil leading arguments replaced
-; by the defaults, one per position.
 (defn fnil
+  "Returns a function that calls f with a nil first argument replaced
+  by d1, a nil second by d2 and a nil third by d3, as many as are
+  given; further arguments pass through."
   ([f d1]
    (fn* [x & more]
      (apply f (if (nil? x) d1 x) more)))
@@ -497,9 +536,11 @@
    (fn* [x y z & more]
      (apply f (if (nil? x) d1 x) (if (nil? y) d2 y) (if (nil? z) d3 z) more))))
 
-; (merge-with f & maps) → merge where a key present on both
-; sides keeps (f left right).
-(defn merge-with [f & maps]
+(defn merge-with
+  "Returns a map of the maps merged left to right; a key present in
+  more than one keeps (f val-in-result val-in-latter). nil maps are
+  skipped."
+  [f & maps]
   (reduce (fn* [acc m]
             (if (nil? m)
               acc
@@ -516,51 +557,45 @@
 ; Control-flow macros
 ; ============================================================
 
-; (doc name) → prints the Var's :arglists and :doc, the way a
-; REPL shows them; nil. A defn carries them once it is given a
-; docstring or attribute map.
-(defmacro doc [name]
-  `(let* [m# (meta (var ~name))
-          arglists# (:arglists m#)
-          docstring# (:doc m#)]
-     (println "-------------------------")
-     (println '~name)
-     (when arglists# (println arglists#))
-     (when docstring# (println " " docstring#))
-     nil))
-
-; (declare a b ...) → interns each name as an unbound Var so a
-; later definition can be referred to before it appears, even
-; when a macro will produce that definition.
-(defmacro declare [& names]
+(defmacro declare
+  "Interns each of names as an unbound Var, so code can refer to it
+  before its definition appears. Returns nil."
+  [& names]
   `(do ~@(map (fn* [n] (list 'def n)) names) nil))
 
-; (if-not test then else?) → (if test else then).
-(defmacro if-not [test then & else]
+(defmacro if-not
+  "Evaluates then when test is falsy, else evaluates else (nil when
+  absent)."
+  [test then & else]
   `(if ~test ~(first else) ~then))
 
-; (while test body...) → loops until test is falsy; nil.
-(defmacro while [test & body]
+(defmacro while
+  "Evaluates body repeatedly while test is truthy. Returns nil."
+  [test & body]
   `(loop* []
      (if ~test
        (do ~@body (recur))
        nil)))
 
-; (letfn [(f [x] ...) (g [y] ...)] body...) — mutually
-; recursive local functions; the primitive takes the same shape.
-(defmacro letfn [bindings & body]
+; The primitive letfn* takes the same shape.
+(defmacro letfn
+  "bindings is [(name [params] body...) ...]. Evaluates body with each
+  name bound to its function; the functions may call each other, and
+  themselves, in any order."
+  [bindings & body]
   `(letfn* ~bindings ~@body))
 
-; (doseq [x xs modifiers... y ys ...] body...) → runs body for
-; each x in xs and, nested inside, each y in ys; nil. A binding
-; form may destructure, and each pair may be followed by
-; `:let [b]`, `:when t` (skip the element) and `:while t` (end
-; that loop), as in `for`. One loop per pair:
+; One loop per pair:
 ;   (loop* [s (seq xs)]
 ;     (if s (let [x (first s)] <modifiers around
 ;                               (do (doseq [rest...] body...) (recur (next s)))>)
 ;           nil))
-(defmacro doseq [bindings & body]
+(defmacro doseq
+  "bindings is [x xs modifiers... y ys ...]. Evaluates body for each x
+  in xs and, nested inside, each y in ys, for effect. A binding may
+  destructure, and :let [b], :when t and :while t modifiers work as in
+  for. Returns nil."
+  [bindings & body]
   (if (empty? bindings)
     `(do ~@body nil)
     (let* [pat (first bindings)
@@ -583,15 +618,17 @@
                  (let [~pat (first ~s)] ~inner)
                  nil))))))))
 
-; (for [binding coll modifiers... binding coll ...] body) → the lazy
-; seq of body for each binding, the last varying fastest, as Clojure
-; 1.12's for (docs/LAZY.md §7): one iterator per binding, each a
-; lazy-seq over the seq of its coll; the innermost walks a chunk at a
-; time where its coll is chunked, applying :let [b], :when t (skip the
-; element) and :while t (end that binding's walk) inside the chunk; an
-; outer one concatenates the inner seq onto the walk of its rest. One
-; binding and no modifiers is (map (fn [binding] body) coll).
-(defmacro for [seq-exprs body-expr]
+; Clojure 1.12's for (docs/LAZY.md §7): one iterator per binding, each
+; a lazy-seq over the seq of its coll; the innermost walks a chunk at a
+; time where its coll is chunked, applying the modifiers inside the
+; chunk; an outer one concatenates the inner seq onto the walk of its
+; rest. One binding and no modifiers is (map (fn [binding] body) coll).
+(defmacro for
+  "seq-exprs is [binding coll modifiers... binding coll ...]. Returns
+  the lazy seq of body-expr for each combination of bindings, the last
+  varying fastest. Modifiers: :let [b], :when t (skip the element) and
+  :while t (end that binding's walk)."
+  [seq-exprs body-expr]
   (when (or (not (vector? seq-exprs)) (zero? (count seq-exprs)) (odd? (count seq-exprs)))
     (throw (ex-info "for requires an even number of forms in the binding vector" {})))
   (when (keyword? (first seq-exprs))
@@ -676,45 +713,58 @@
   `(let [~g ~init ~@(interleave (repeat (count steps) g) (butlast steps))]
      ~(if (empty? steps) g (last steps))))
 
-; (cond-> x test step ...) → threads x through each step whose
-; test is truthy. The tests are ordinary expressions; they are
-; not threaded, exactly as in Clojure.
-(defmacro cond-> [expr & clauses]
+(defmacro cond->
+  "clauses are test step pairs. Threads expr through each step whose
+  test is truthy, as -> does (as its first argument). The tests are
+  not threaded."
+  [expr & clauses]
   (assert (even? (count clauses)))
   (let [g (gensym)]
     (step-chain g expr (map (fn [[test step]] `(if ~test (-> ~g ~step) ~g)) (partition 2 clauses)))))
 
-(defmacro cond->> [expr & clauses]
+(defmacro cond->>
+  "clauses are test step pairs. Threads expr through each step whose
+  test is truthy, as ->> does (as its last argument). The tests are
+  not threaded."
+  [expr & clauses]
   (assert (even? (count clauses)))
   (let [g (gensym)]
     (step-chain g expr (map (fn [[test step]] `(if ~test (->> ~g ~step) ~g)) (partition 2 clauses)))))
 
-; (some-> x f g ...) → threads while the value is non-nil.
-(defmacro some-> [expr & forms]
+(defmacro some->
+  "Threads expr through forms as -> does, stopping with nil at the
+  first nil value."
+  [expr & forms]
   (let [g (gensym)]
     (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (-> ~g ~step))) forms))))
 
-(defmacro some->> [expr & forms]
+(defmacro some->>
+  "Threads expr through forms as ->> does, stopping with nil at the
+  first nil value."
+  [expr & forms]
   (let [g (gensym)]
     (step-chain g expr (map (fn [step] `(if (nil? ~g) nil (->> ~g ~step))) forms))))
 
-; (as-> x name form ...) → binds name to x, then to each form
-; in turn.
-(defmacro as-> [expr name & forms]
+(defmacro as->
+  "Binds name to expr, then to the value of each form in turn, and
+  returns the last; name may appear anywhere in a form."
+  [expr name & forms]
   (step-chain name expr forms))
 
 ; ============================================================
 ; More sequence and function helpers
 ; ============================================================
 
-; (some-fn p & ps) → a fn returning the first truthy result of a
-; predicate on an argument, in Clojure's order: each predicate over the
-; first three arguments, then each further argument against every
-; predicate (every predicate against those arguments past three
-; predicates). A miss is the last result for up to three predicates
-; and three arguments, else nil. (every-pred p & ps) → a fn true when
-; every predicate is truthy of every argument.
-(defn some-fn [p & ps]
+; The search runs in Clojure's order: each predicate over the first
+; three arguments, then each further argument against every predicate
+; (every predicate against those arguments past three predicates). A
+; miss is the last result for up to three predicates and three
+; arguments, else nil.
+(defn some-fn
+  "Returns a function that returns the first truthy value of any of
+  the predicates p and ps applied to any of its arguments, else a
+  falsy value."
+  [p & ps]
   (let [ps (cons p ps)
         many (> (count ps) 3)
         hit (fn [f coll]
@@ -730,11 +780,16 @@
               many nil
               true r)))))
 
-(defn every-pred [& ps]
+(defn every-pred
+  "Returns a function that returns true when every predicate in ps is
+  truthy of every one of its arguments, else false."
+  [& ps]
   (fn [& xs] (every? (fn [p] (every? p xs)) ps)))
 
-; (memoize f) → f, caching each result by its arguments.
-(defn memoize [f]
+(defn memoize
+  "Returns a memoized version of f: a function that caches the result
+  of f for each list of arguments, calling f on the first call only."
+  [f]
   (let [cache (atom {})]
     (fn [& args]
       (let [hit (find @cache args)]
@@ -744,144 +799,188 @@
             (swap! cache assoc args r)
             r))))))
 
-; (trampoline f & args) → calls f, then each fn it returns, until a
-; value that is not a fn comes back; mutual recursion without stack.
-(defn trampoline [f & args]
+(defn trampoline
+  "Calls (apply f args), then calls each function it returns with no
+  arguments, until a value that is not a function comes back, and
+  returns it: mutual recursion without growing the stack."
+  [f & args]
   (loop [r (apply f args)]
     (if (fn? r) (recur (r)) r)))
 
-; (comparator pred) → a comparator of two arguments from a "less
-; than" predicate.
-(defn comparator [pred]
+(defn comparator
+  "Returns a comparator (-1, 0 or 1) of two arguments from pred, a
+  less-than predicate."
+  [pred]
   (fn [a b] (cond (pred a b) -1 (pred b a) 1 true 0)))
 
-; (run! f coll) → calls f on each element for its effect; nil.
-(defn run! [f coll]
+(defn run!
+  "Calls f on each element of coll, for effect. Returns nil."
+  [f coll]
   (reduce (fn [_ x] (f x) nil) nil coll))
 
 
-; (split-with pred coll) → [(take-while pred coll) (drop-while pred coll)].
-(defn split-with [pred coll]
+(defn split-with
+  "Returns [(take-while pred coll) (drop-while pred coll)]."
+  [pred coll]
   [(take-while pred coll) (drop-while pred coll)])
 
-; (sequence coll) → coll when it is a seq, else its seq, () when
-; empty; (sequence xform coll) → the lazy seq of coll through the
-; transducer, 32 outputs at a time (docs/LAZY.md §10).
+; With a transducer, a producer that hands out 32 outputs at a time
+; (docs/LAZY.md §10).
 (defn sequence
+  "Returns coll when it is a seq, else (seq coll), () when empty. With
+  xform, returns the lazy seq of coll's elements through the
+  transducer; with several colls, xform gets an element of each."
   ([coll] (if (seq? coll) coll (or (seq coll) ())))
   ([xform coll] (nexis.internal/#%sequence xform coll))
   ([xform coll & colls] (nexis.internal/#%sequence xform (apply map vector coll colls) true)))
 
-; (distinct? x & xs) → whether no two arguments are equal.
-(defn distinct? [x & xs]
+(defn distinct?
+  "Returns true if no two of the arguments are =."
+  [x & xs]
   (= (inc (count xs)) (count (set (cons x xs)))))
 
 
-; (replace smap coll) → coll with each element that is a key of smap
-; (a map, or a vector by index) replaced by its value: a vector of a
-; vector, keeping its metadata, else a seq.
-(defn replace [smap coll]
+(defn replace
+  "Returns coll with each element that is a key of smap (a map, or a
+  vector by index) replaced by its value: a vector, keeping its
+  metadata, when coll is one, else a lazy seq."
+  [smap coll]
   (let [f (fn [x] (let [e (find smap x)] (if e (val e) x)))]
     (if (vector? coll) (with-meta (mapv f coll) (meta coll)) (map f coll))))
 
-; (bounded-count n coll) → the count of a counted coll, else the count
-; of at most its first n elements.
-(defn bounded-count [n coll]
+(defn bounded-count
+  "Returns (count coll) when coll is counted?, else the count of at
+  most its first n elements: (bounded-count 2 \"abcd\") is 2."
+  [n coll]
   (if (counted? coll)
     (count coll)
     (loop [i 0 s (seq coll)]
       (if (and s (< i n)) (recur (inc i) (next s)) i))))
 
-; (random-sample prob coll) → the elements of coll each kept with
-; probability prob.
-(defn random-sample [prob coll]
+(defn random-sample
+  "Returns a lazy seq of the elements of coll, each kept with
+  probability prob."
+  [prob coll]
   (filter (fn [_] (< (rand) prob)) coll))
 
-; partition and partition-all with each part a vector, and split-at
-; with the first part a vector (Clojure 1.12).
 (defn partitionv
+  "As partition, with each part a vector."
   ([n coll] (map vec (partition n coll)))
   ([n step coll] (map vec (partition n step coll)))
   ([n step pad coll] (map vec (partition n step pad coll))))
 (defn partitionv-all
+  "As partition-all, with each part a vector."
   ([n coll] (map vec (partition-all n coll)))
   ([n step coll] (map vec (partition-all n step coll))))
-(defn splitv-at [n coll]
+(defn splitv-at
+  "Returns [(vec (take n coll)) (drop n coll)]."
+  [n coll]
   [(vec (take n coll)) (drop n coll)])
 
-; (map-entry? x) → whether x is a map entry: a two-element vector, the
-; shape a map's seq yields.
-(defn map-entry? [x] (and (vector? x) (= 2 (count x))))
+(defn map-entry?
+  "Returns true if x is a two-element vector, the shape of a map's
+  entries. Unlike Clojure, (map-entry? [1 2]) is true."
+  [x] (and (vector? x) (= 2 (count x))))
 
 
-; (rand-nth coll) → a random element; (shuffle coll) → a vector of
-; coll's elements in random order.
-(defn rand-nth [coll]
+(defn rand-nth
+  "Returns a random element of coll, found by nth."
+  [coll]
   (nth coll (rand-int (count coll))))
 
-(defn shuffle [coll]
+(defn shuffle
+  "Returns a vector of the elements of coll in random order."
+  [coll]
   (loop [v (vec coll) i (dec (count v))]
     (if (pos? i)
       (let [j (rand-int (inc i)) vi (nth v i)]
         (recur (assoc v i (nth v j) j vi) (dec i)))
       v)))
 
-; (update-vals m f) / (update-keys m f) → a map of m's entries with f
-; applied to every value / key, keeping m's metadata.
-(defn update-vals [m f]
+(defn update-vals
+  "Returns a map of m's keys, each with (f value), keeping m's
+  metadata."
+  [m f]
   (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc k (f v))) (transient {}) m)) (meta m)))
 
-(defn update-keys [m f]
+(defn update-keys
+  "Returns a map of m's values, each under (f key), keeping m's
+  metadata. Keys f maps to one key keep one of their values."
+  [m f]
   (with-meta (persistent! (reduce-kv (fn [acc k v] (assoc! acc (f k) v)) (transient {}) m)) (meta m)))
 
-; (reset-vals! a v) → [old new] after setting a to v.
-(defn reset-vals! [a v]
+(defn reset-vals!
+  "Sets the value of atom a to v. Returns [old new]."
+  [a v]
   (swap-vals! a (constantly v)))
 
-; Volatiles are atoms: one isolate, one thread.
-(defn volatile! [x] (atom x))
-(defn volatile? [x] (atom? x))
-(defn vreset! [v x] (reset! v x))
-(defmacro vswap! [v f & args]
+; Volatiles are atoms: one isolate, one thread (docs/ATOM.md §4.7).
+(defn volatile!
+  "Returns a volatile holding x. A volatile is an atom (atom? is true):
+  with one thread there is nothing to give up."
+  [x] (atom x))
+(defn volatile?
+  "Returns true if x is a volatile, which is any atom."
+  [x] (atom? x))
+(defn vreset!
+  "Sets the value of volatile v to x, as reset!. Returns x."
+  [v x] (reset! v x))
+(defmacro vswap!
+  "Sets the value of volatile v to (apply f current args), as swap!.
+  Returns the new value."
+  [v f & args]
   `(swap! ~v ~f ~@args))
 
-; (re-seq re s) → the matches of re in s, left to right, as a lazy seq
-; that finds one match per element; nil when there is none
-; (docs/REGEX.md §9). Clojure's definition, with re-find's result in
-; place of a second re-groups.
-(defn re-seq [re s]
+; Clojure's definition, with re-find's result in place of a second
+; re-groups (docs/REGEX.md §9).
+(defn re-seq
+  "Returns a lazy seq of the successive matches of re in s, each as
+  re-find returns it, finding one match per element; nil when there
+  is none."
+  [re s]
   (let [m (re-matcher re s)]
     ((fn step []
        (when-some [g (re-find m)]
          (cons g (lazy-seq (step))))))))
 
 ; ---- predicates ----
-(defn any? [_] true)
-(defn ident? [x] (or (keyword? x) (symbol? x)))
-(defn qualified-keyword? [x] (boolean (and (keyword? x) (namespace x))))
-(defn simple-keyword? [x] (and (keyword? x) (nil? (namespace x))))
-(defn qualified-symbol? [x] (boolean (and (symbol? x) (namespace x))))
-(defn simple-symbol? [x] (and (symbol? x) (nil? (namespace x))))
-(defn qualified-ident? [x] (boolean (and (ident? x) (namespace x))))
-(defn simple-ident? [x] (and (ident? x) (nil? (namespace x))))
+(defn any? "Returns true for any argument." [_] true)
+(defn ident? "Returns true if x is a keyword or a symbol." [x] (or (keyword? x) (symbol? x)))
+(defn qualified-keyword? "Returns true if x is a keyword with a namespace." [x] (boolean (and (keyword? x) (namespace x))))
+(defn simple-keyword? "Returns true if x is a keyword without a namespace." [x] (and (keyword? x) (nil? (namespace x))))
+(defn qualified-symbol? "Returns true if x is a symbol with a namespace." [x] (boolean (and (symbol? x) (namespace x))))
+(defn simple-symbol? "Returns true if x is a symbol without a namespace." [x] (and (symbol? x) (nil? (namespace x))))
+(defn qualified-ident? "Returns true if x is a keyword or symbol with a namespace." [x] (boolean (and (ident? x) (namespace x))))
+(defn simple-ident? "Returns true if x is a keyword or symbol without a namespace." [x] (and (ident? x) (nil? (namespace x))))
 ; int? and its kin: an integer in Java's long range, as Clojure's are
 ; true of a Long and not a BigInt.
-(defn int? [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
-(defn pos-int? [x] (and (int? x) (pos? x)))
-(defn nat-int? [x] (and (int? x) (not (neg? x))))
-(defn neg-int? [x] (and (int? x) (neg? x)))
-(defn double? [x] (float? x))
-(defn seqable? [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
-(defn record? [x] (nexis.internal/#%record? x))
+(defn int?
+  "Returns true if x is an integer in the 64-bit signed range; a larger
+  integer (a bignum) is not one."
+  [x] (and (integer? x) (<= -9223372036854775808 x 9223372036854775807)))
+(defn pos-int? "Returns true if x is a positive int?." [x] (and (int? x) (pos? x)))
+(defn nat-int? "Returns true if x is a non-negative int?." [x] (and (int? x) (not (neg? x))))
+(defn neg-int? "Returns true if x is a negative int?." [x] (and (int? x) (neg? x)))
+(defn double? "Returns true if x is a float; every float is a double." [x] (float? x))
+(defn seqable?
+  "Returns true if seq works on x: nil, a collection, a string or a
+  typed vector."
+  [x] (or (nil? x) (coll? x) (string? x) (typed-vector? x)))
+(defn record? "Returns true if x is a record." [x] (nexis.internal/#%record? x))
 
 ; ---- the numeric names Clojure spells apart ----
 ; Every integer operator promotes to a bignum (docs/BIGNUM.md), so the
 ; promoting forms are the same functions.
-(def +' +)
-(def -' -)
-(def *' *)
-(def inc' inc)
-(def dec' dec)
+(def ^{:arglists '([] [x] [x y] [x y & more])} +'
+  "The same function as +: every integer operator promotes to a bignum." +)
+(def ^{:arglists '([x] [x y] [x y & more])} -'
+  "The same function as -: every integer operator promotes to a bignum." -)
+(def ^{:arglists '([] [x] [x y] [x y & more])} *'
+  "The same function as *: every integer operator promotes to a bignum." *)
+(def ^{:arglists '([x])} inc'
+  "The same function as inc: every integer operator promotes to a bignum." inc)
+(def ^{:arglists '([x])} dec'
+  "The same function as dec: every integer operator promotes to a bignum." dec)
 
 ; The unchecked operators wrap two longs at 64 bits, as Java's long
 ; arithmetic does; with a float or an integer beyond 64 bits they
@@ -891,39 +990,76 @@
     (let [m (mod r 18446744073709551616)]
       (if (< m 9223372036854775808) m (- m 18446744073709551616)))
     r))
-(defn unchecked-add [x y] (wrap64 (+ x y) x y))
-(defn unchecked-subtract [x y] (wrap64 (- x y) x y))
-(defn unchecked-multiply [x y] (wrap64 (* x y) x y))
-(defn unchecked-inc [x] (wrap64 (inc x) x 0))
-(defn unchecked-dec [x] (wrap64 (dec x) x 0))
-(defn unchecked-negate [x] (wrap64 (- x) x 0))
+(defn unchecked-add
+  "Returns x + y, wrapped to 64 bits when both are integers in the long
+  range (as Java's long arithmetic); otherwise as +."
+  [x y] (wrap64 (+ x y) x y))
+(defn unchecked-subtract
+  "Returns x - y, wrapped to 64 bits when both are integers in the long
+  range (as Java's long arithmetic); otherwise as -."
+  [x y] (wrap64 (- x y) x y))
+(defn unchecked-multiply
+  "Returns x * y, wrapped to 64 bits when both are integers in the long
+  range (as Java's long arithmetic); otherwise as *."
+  [x y] (wrap64 (* x y) x y))
+(defn unchecked-inc
+  "Returns x + 1, wrapped to 64 bits when x is an integer in the long
+  range; otherwise as inc."
+  [x] (wrap64 (inc x) x 0))
+(defn unchecked-dec
+  "Returns x - 1, wrapped to 64 bits when x is an integer in the long
+  range; otherwise as dec."
+  [x] (wrap64 (dec x) x 0))
+(defn unchecked-negate
+  "Returns -x, wrapped to 64 bits when x is an integer in the long
+  range; otherwise as -."
+  [x] (wrap64 (- x) x 0))
 
-; (num x) → x, a number or nil; there are no boxed kinds to convert.
-(defn num [x] (if (or (nil? x) (number? x)) x (throw :kind-mismatch)))
+(defn num
+  "Returns x, a number or nil; there are no boxed kinds to convert.
+  Anything else is :kind-mismatch."
+  [x] (if (or (nil? x) (number? x)) x (throw :kind-mismatch)))
 ; No rationals (PLAN §23 #10): the rationals are the integers.
-(defn ratio? [_] false)
-(defn rational? [x] (integer? x))
+(defn ratio? "Returns false: there are no ratios." [_] false)
+(defn rational?
+  "Returns true if x is an integer: with no ratios, the rationals are
+  the integers."
+  [x] (integer? x))
 ; No decimals and no instants either (PLAN §4).
-(defn decimal? [_] false)
-(defn inst? [_] false)
+(defn decimal? "Returns false: there are no decimals." [_] false)
+(defn inst? "Returns false: there are no instants." [_] false)
 ; One integer domain: a BigInt is an integer, so these truncate as long.
-(defn bigint [x] (long x))
-(defn biginteger [x] (long x))
+(defn bigint
+  "Returns (long x): one integer kind holds integers of any size."
+  [x] (long x))
+(defn biginteger
+  "Returns (long x): one integer kind holds integers of any size."
+  [x] (long x))
 ; Java's bit operations not among the natives.
-(defn bit-and-not [x y & more] (reduce (fn [a b] (bit-and a (bit-not b))) x (cons y more)))
-(defn bit-flip [x n] (if (bit-test x n) (bit-clear x n) (bit-set x n)))
+(defn bit-and-not
+  "Returns x with the bits of y, and of each of more, cleared."
+  [x y & more] (reduce (fn [a b] (bit-and a (bit-not b))) x (cons y more)))
+(defn bit-flip "Returns x with bit n flipped." [x n] (if (bit-test x n) (bit-clear x n) (bit-set x n)))
 ; A map small enough to keep its insertion order prints in it
 ; (docs/CHAMP.md §2), which is what array-map promises.
-(defn array-map [& kvs] (apply hash-map kvs))
-(defn parse-boolean [s]
+(defn array-map
+  "Returns (apply hash-map kvs). A map of up to eight entries keeps its
+  insertion order, all an array map promises."
+  [& kvs] (apply hash-map kvs))
+(defn parse-boolean
+  "Returns true for \"true\", false for \"false\", nil for any other
+  string. A non-string is :kind-mismatch."
+  [s]
   (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 
-; (ex-cause e) → the cause an ex-info carries, nil for anything else.
-(defn ex-cause [e]
+(defn ex-cause
+  "Returns the cause an ex-info value e carries, nil for anything else."
+  [e]
   (when (map? e) (:cause e)))
 
-; (printf fmt & args) → prints (format fmt args...); nil.
-(defn printf [fmt & args]
+(defn printf
+  "Prints (apply format fmt args). Returns nil."
+  [fmt & args]
   (print (apply format fmt args)))
 
 ; ============================================================
@@ -1078,8 +1214,10 @@
 (defn- preserving-reduced [rf]
   (fn* [a b] (let [ret (rf a b)] (if (reduced? ret) (reduced ret) ret))))
 
-; (cat rf) → a transducer that concatenates each input, a collection.
-(defn cat [rf]
+(defn cat
+  "A transducer that concatenates the contents of each input, a
+  collection, into the reduction."
+  [rf]
   (let [rrf (preserving-reduced rf)]
     (fn ([] (rf))
          ([result] (rf result))
@@ -1087,18 +1225,19 @@
 
 (defn- xf-mapcat [f] (comp (xf-map f) cat))
 
-; (completing f) / (completing f cf) → f with a completion arity, cf
-; (identity by default).
 (defn completing
+  "Returns a reducing function that calls f for its 0- and 2-argument
+  arities and cf (identity by default) for its 1-argument completion."
   ([f] (completing f identity))
   ([f cf]
    (fn ([] (f))
         ([x] (cf x))
         ([x y] (f x y)))))
 
-; (transduce xform f coll) / (transduce xform f init coll) → reduce
-; with (xform f), then its completion.
 (defn transduce
+  "Reduces coll with (xform f), starting from init ((f) when absent),
+  then calls the completion arity of (xform f) on the result and
+  returns it. f must have a 1-argument arity; see completing."
   ([xform f coll] (transduce xform f (f) coll))
   ([xform f init coll]
    (let [f (xform f)
@@ -1111,15 +1250,17 @@
     (with-meta (persistent! (transduce xform conj! (transient to) from)) (meta to))
     (transduce xform conj to from)))
 
-; (eduction xform* coll) → the seq of coll through the composed
-; transducers, as sequence makes it.
-(defn eduction [& xforms]
+(defn eduction
+  "(eduction xform* coll). Returns the lazy seq of coll through the
+  composed transducers, as sequence makes it: cached, where Clojure's
+  eduction runs the transform again on each reduce."
+  [& xforms]
   (sequence (apply comp (butlast xforms)) (last xforms)))
 
-; (halt-when pred) / (halt-when pred retf) → a transducer that ends the
-; reduction at the first input pred holds of, with that input, or
-; (retf result input).
 (defn halt-when
+  "Returns a transducer that ends the reduction at the first input
+  pred is truthy of, its result that input or, with retf,
+  (retf completed-result input). Unaffected when pred never holds."
   ([pred] (halt-when pred nil))
   ([pred retf]
    (fn* [rf]
@@ -1137,33 +1278,49 @@
 ; Types, namespaces, UUIDs (docs/STDLIB.md §8)
 ; ============================================================
 
-; (type x) → the :type in x's metadata, else (class x), as Clojure's.
-(defn type [x] (or (get (meta x) :type) (class x)))
+(defn type
+  "Returns the :type in x's metadata, else (class x)."
+  [x] (or (get (meta x) :type) (class x)))
 
-; (instance? t x) → whether x's class is the type t: a kind keyword
-; such as :vector, or a record's symbol, as class returns them.
-(defn instance? [t x]
+(defn instance?
+  "Returns true if (class x) is t: a kind keyword such as :vector, or a
+  record's symbol. There is no hierarchy of kinds. A t that is not a
+  keyword or symbol is :kind-mismatch."
+  [t x]
   (if (or (keyword? t) (symbol? t)) (= t (class x)) (throw :kind-mismatch)))
 
-; The names the compiler takes as special forms.
-(defn special-symbol? [s]
+(defn special-symbol?
+  "Returns true if s names a special form of the compiler."
+  [s]
   (contains? '#{def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &} s))
 
 ; A namespace is its name symbol.
-(defn the-ns [x] (or (find-ns x) (throw :no-such-namespace)))
-(defn ns-name [x] (the-ns x))
+(defn the-ns
+  "Returns x, a namespace's name symbol, when that namespace exists,
+  else throws :no-such-namespace. A namespace is its name symbol."
+  [x] (or (find-ns x) (throw :no-such-namespace)))
+(defn ns-name
+  "Returns the name symbol of the namespace x names, which is x itself;
+  :no-such-namespace when there is none."
+  [x] (the-ns x))
 
-; (var-get v) → the value of the Var v; (find-var 'ns/name) → the Var
-; the qualified symbol names, nil when the namespace has none.
-(defn var-get [v] (if (var? v) (deref v) (throw :kind-mismatch)))
-(defn find-var [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
+(defn var-get
+  "Returns the value of the Var v. A non-Var is :kind-mismatch."
+  [v] (if (var? v) (deref v) (throw :kind-mismatch)))
+(defn find-var
+  "Returns the Var the qualified symbol sym names, nil when its
+  namespace has none; :no-such-namespace when the namespace does not
+  exist."
+  [sym] (ns-resolve (the-ns (symbol (namespace sym))) sym))
 
-; (load-string s) → the value of the last form of s, each read,
-; compiled as a file's form is and run in turn in the current
-; namespace, so a form that does not read raises after the ones before
-; it ran; the namespace in force is restored afterwards, as Clojure's
-; Compiler.load binds *ns*. (load-file path) of the file's text.
-(defn load-string [s]
+; Each form is compiled as read, as a file's form is, and the namespace
+; in force is restored afterwards, as Clojure's Compiler.load binds *ns*.
+(defn load-string
+  "Reads, compiles and runs each form of the string s in turn in the
+  current namespace, and returns the last form's value (nil for none).
+  A form that does not read raises :reader-error after the ones before
+  it ran. The namespace in force is restored afterwards."
+  [s]
   (let [ns *ns*]
     (try
       (loop [i 0 v nil]
@@ -1171,24 +1328,32 @@
           (recur j v)
           v))
       (finally (in-ns ns)))))
-(defn load-file [path] (load-string (slurp path)))
+(defn load-file
+  "Loads the file at path as load-string loads a string, and returns
+  the last form's value."
+  [path] (load-string (slurp path)))
 
-; (uuid? x) → whether x is a UUID's canonical text, as random-uuid
-; and parse-uuid make it.
-(defn uuid? [x] (and (string? x) (= x (parse-uuid x))))
+(defn uuid?
+  "Returns true if x is a string holding a UUID's canonical lowercase
+  text, as random-uuid and parse-uuid make it: a UUID is that string."
+  [x] (and (string? x) (= x (parse-uuid x))))
 
 ; ============================================================
 ; Delays, closing, taps
 ; ============================================================
 
-; (delay body...) → a delay: body runs the first time the delay is
-; forced (force or deref), and every later force returns its value,
-; or rethrows what it threw. A delay is the record nexis.core/Delay,
-; whose :state atom holds [:pending thunk], [:ready v] or [:failed e].
-(defmacro delay [& body]
+; A delay is the record nexis.core/Delay, whose :state atom holds
+; [:pending thunk], [:ready v] or [:failed e].
+(defmacro delay
+  "Returns a delay: body runs the first time the delay is forced (force
+  or deref), and every later force returns its value, or rethrows what
+  it threw; the body runs once either way."
+  [& body]
   `(nexis.internal/#%delay (fn* [] ~@body)))
 
-(defn force [x]
+(defn force
+  "Returns the value of x when it is a delay, forcing it; else x."
+  [x]
   (if (delay? x)
     (let [state (:state x)
           s @state]
@@ -1204,18 +1369,24 @@
             (throw e)))))
     x))
 
-; What with-open closes: a db connection, a Nextomic connection, and
-; any type extended to it (Java's Closeable).
+; Java's Closeable. defprotocol keeps no docstring (MACROEXPAND.md
+; §10), so the Var takes its own below.
 (defprotocol Closeable
-  (close [this]))
+  (close [this]
+    "Closes this: db/close of a db connection, nextomic/release of a
+  Nextomic connection."))
 (extend-protocol Closeable
   :db_connection (close [c] (db/close c))
   :nextomic_conn (close [c] (nextomic/release c)))
+(alter-meta! #'Closeable assoc :doc
+  "What with-open closes: a db connection, a Nextomic connection, and
+  any record or kind extended to it.")
 
-; (with-open [name init ...] body...) → body with each name bound,
-; closing each through Closeable in reverse order on every exit, a
-; throw included.
-(defmacro with-open [bindings & body]
+(defmacro with-open
+  "bindings is [name init ...]. Evaluates body with each name bound,
+  then calls close on each in reverse order on every exit, a throw
+  included. Returns body's value."
+  [bindings & body]
   (when (or (not (vector? bindings)) (odd? (count bindings)) (not (every? symbol? (take-nth 2 bindings))))
     (throw (ex-info "with-open takes a vector of symbol and value pairs" {})))
   (if (empty? bindings)
@@ -1225,13 +1396,19 @@
          (with-open ~(vec (drop 2 bindings)) ~@body)
          (finally (nexis.core/close ~(first bindings)))))))
 
-; (tap> x) → true, after calling every function add-tap added with x;
-; a tap that throws is ignored. Clojure runs taps on another thread;
-; here, one isolate and one thread, they run before tap> returns.
 (def ^:private taps (atom #{}))
-(defn add-tap [f] (swap! taps conj f) nil)
-(defn remove-tap [f] (swap! taps disj f) nil)
-(defn tap> [x]
+(defn add-tap
+  "Adds f, a function of one argument, to the taps tap> calls. Returns
+  nil."
+  [f] (swap! taps conj f) nil)
+(defn remove-tap
+  "Removes f from the taps tap> calls. Returns nil."
+  [f] (swap! taps disj f) nil)
+(defn tap>
+  "Calls every function add-tap added with x, ignoring any that throws,
+  and returns true. Unlike Clojure's, the taps run before tap> returns,
+  on the one thread."
+  [x]
   (doseq [f @taps]
     (try (f x) (catch any _ nil)))
   true)
@@ -1240,29 +1417,35 @@
 ; Printing to a string
 ; ============================================================
 
-(defn newline [] (print "\n"))
+(defn newline "Prints a newline. Returns nil." [] (print "\n"))
 ; Every print writes through at once (STDLIB.md §6): nothing to flush.
-(defn flush [] nil)
-(defn print-str [& xs] (with-out-str (apply print xs)))
-(defn println-str [& xs] (with-out-str (apply println xs)))
-(defn prn-str [& xs] (with-out-str (apply prn xs)))
+(defn flush
+  "Returns nil: every print writes through at once, so there is
+  nothing to flush."
+  [] nil)
+(defn print-str "Returns what (print xs...) would print, as a string." [& xs] (with-out-str (apply print xs)))
+(defn println-str "Returns what (println xs...) would print, as a string." [& xs] (with-out-str (apply println xs)))
+(defn prn-str "Returns what (prn xs...) would print, as a string." [& xs] (with-out-str (apply prn xs)))
 
 ; ============================================================
 ; Hierarchies and multimethods (docs/STDLIB.md §9)
 ; ============================================================
 
-; (make-hierarchy) → the empty hierarchy: each tag's direct parents,
-; and the transitive closures of its ancestors and descendants, which
-; derive and underive keep.
-(defn make-hierarchy [] {:parents {} :descendants {} :ancestors {}})
+(defn make-hierarchy
+  "Returns an empty hierarchy, the plain map {:parents {} :descendants
+  {} :ancestors {}}: each tag's direct parents, and the closures of its
+  ancestors and descendants, which derive and underive keep."
+  [] {:parents {} :descendants {} :ancestors {}})
 
 ; The hierarchy the arities without one read, and derive and underive
 ; change through alter-var-root, as Clojure's.
 (def ^:private global-hierarchy (make-hierarchy))
 
-; (isa? h child parent) → whether child is parent, derives from it,
-; or both are vectors of one count whose elements are isa? pairwise.
 (defn isa?
+  "Returns true if child is = to parent, has parent among its ancestors
+  in hierarchy h (the global one by default), or both are vectors of
+  one count whose elements are isa? pairwise. Only the edges derive
+  made count: kinds have no supertypes."
   ([child parent] (isa? global-hierarchy child parent))
   ([h child parent]
    (or (= child parent)
@@ -1274,14 +1457,20 @@
                     :else false))))))
 
 (defn parents
+  "Returns the set of tag's direct parents in hierarchy h (the global
+  one by default), nil when it has none."
   ([tag] (parents global-hierarchy tag))
   ([h tag] (not-empty (get (:parents h) tag))))
 
 (defn ancestors
+  "Returns the set of tag's ancestors in hierarchy h (the global one by
+  default), nil when it has none."
   ([tag] (ancestors global-hierarchy tag))
   ([h tag] (not-empty (get (:ancestors h) tag))))
 
 (defn descendants
+  "Returns the set of tag's descendants in hierarchy h (the global one
+  by default), nil when it has none."
   ([tag] (descendants global-hierarchy tag))
   ([h tag] (not-empty (get (:descendants h) tag))))
 
@@ -1290,12 +1479,11 @@
 (defn- assert-failed [text]
   (throw {:error :assertion-failed :message (str "Assert failed: " text)}))
 
-; (derive h tag parent) → h with tag a child of parent: h itself when
-; it is already, else a new hierarchy, the closures updated as
-; Clojure's derive does. (derive tag parent) changes the global one,
-; whose parent must have a namespace, and so must the tag unless it
-; is a class: a kind keyword or a record type, as class returns them.
 (defn derive
+  "Returns hierarchy h with tag a child of parent (h itself when it is
+  already); both are keywords or symbols. Without h, changes the
+  global hierarchy and returns nil; parent then needs a namespace, and
+  so does tag unless class? holds of it. A cycle is :invalid-derivation."
   ([tag parent]
    (assert (namespace parent))
    (when-not (or (class? tag) (and (ident? tag) (namespace tag)))
@@ -1324,10 +1512,12 @@
          :descendants (tf td parent ta tag td)})
       h))))
 
-; (underive h tag parent) → h without the edge, rebuilt by deriving
-; every remaining edge into an empty hierarchy, as Clojure's; h itself
-; when it has no such edge.
+; The result is rebuilt by deriving every remaining edge into an empty
+; hierarchy, as Clojure's.
 (defn underive
+  "Returns hierarchy h without the edge from tag to parent (h itself
+  when there is none). Without h, changes the global hierarchy and
+  returns nil."
   ([tag parent] (alter-var-root #'global-hierarchy underive tag parent) nil)
   ([h tag parent]
    (let [parent-map (:parents h)
@@ -1350,7 +1540,9 @@
 ; verification (STDLIB.md §9.4).
 (def ^:private multifns (atom {}))
 
-(defn multifn? [x] (contains? @multifns x))
+(defn multifn?
+  "Returns true if x is a multimethod."
+  [x] (contains? @multifns x))
 
 (defn- multifn-entry [mf] (or (get @multifns mf) (throw :kind-mismatch)))
 
@@ -1415,10 +1607,12 @@
            ~f (or (nexis.internal/#%mm-lookup ~cache ~href dv#) (mm-fn ~state ~cache dv#))]
        ~(if more `(apply ~f ~@args ~more) `(~f ~@args)))))
 
-; (make-multifn name dispatch-fn default href) → a multimethod named
-; name (Clojure's new MultiFn), href the Var or atom its hierarchy is
-; read through.
-(defn make-multifn [mname dispatch-fn default href]
+(defn make-multifn
+  "Returns a multimethod named by the string mname, with no methods,
+  dispatching on dispatch-fn, default the fallback dispatch value and
+  href the Var or atom its hierarchy is read through. What defmulti
+  expands to, nexis's name for Clojure's new MultiFn."
+  [mname dispatch-fn default href]
   (when-not (or (var? href) (atom? href)) (throw :kind-mismatch))
   (let [state (atom {:name mname :default default :href href :table {} :prefers {}})
         cache (atom [@href {}])
@@ -1439,28 +1633,48 @@
     (mm-reset! state cache)
     mf))
 
-(defn add-method [mf dispatch-val method] (mm-update! mf assoc-in [:table dispatch-val] method))
-(defn remove-method [mf dispatch-val] (mm-update! mf update :table dissoc dispatch-val))
-(defn remove-all-methods [mf] (mm-update! mf assoc :table {} :prefers {}))
+(defn add-method
+  "Sets method as the multimethod mf's method for dispatch-val. Returns
+  mf."
+  [mf dispatch-val method] (mm-update! mf assoc-in [:table dispatch-val] method))
+(defn remove-method
+  "Removes the multimethod mf's method for dispatch-val. Returns mf."
+  [mf dispatch-val] (mm-update! mf update :table dissoc dispatch-val))
+(defn remove-all-methods
+  "Empties the multimethod mf's method table and prefer table. Returns
+  mf."
+  [mf] (mm-update! mf assoc :table {} :prefers {}))
 
-(defn prefer-method [mf x y]
+(defn prefer-method
+  "Makes the multimethod mf prefer dispatch value x to y where both
+  match. Returns mf; :preference-conflict when y is already preferred
+  to x."
+  [mf x y]
   (let [s @(:state (multifn-entry mf))]
     (when (mm-prefers? @(:href s) (:prefers s) y x)
       (throw {:error :preference-conflict
               :message (format "Preference conflict in multimethod '%s': %s is already preferred to %s" (:name s) y x)}))
     (mm-update! mf update-in [:prefers x] (fnil conj #{}) y)))
 
-(defn methods [mf] (:table @(:state (multifn-entry mf))))
-(defn prefers [mf] (:prefers @(:state (multifn-entry mf))))
-(defn get-method [mf dispatch-val]
+(defn methods
+  "Returns the multimethod mf's method table, a map of dispatch value
+  to method."
+  [mf] (:table @(:state (multifn-entry mf))))
+(defn prefers
+  "Returns the multimethod mf's prefer table, {x #{y ...}}."
+  [mf] (:prefers @(:state (multifn-entry mf))))
+(defn get-method
+  "Returns the method a call of the multimethod mf with dispatch-val
+  would run, nil when none would."
+  [mf dispatch-val]
   (let [{:keys [state cache]} (multifn-entry mf)] (mm-method state cache dispatch-val)))
 
-; (defmulti name docstring? attr-map? dispatch-fn & options) → defines
-; name as a multimethod unless it holds one already; the Var the first
-; time, nil after. The options are :default (the dispatch value of
-; the fallback method, :default) and :hierarchy (a Var or atom,
-; #'global-hierarchy).
-(defmacro defmulti [mm-name & options]
+(defmacro defmulti
+  "(defmulti name docstring? attr-map? dispatch-fn & options)
+  Defines name as a multimethod unless it holds one already; returns
+  the Var the first time, nil after. Options: :default, the fallback
+  dispatch value (:default), and :hierarchy, a Var or atom."
+  [mm-name & options]
   (let [docstring (when (string? (first options)) (first options))
         options (if docstring (next options) options)
         m (if (map? (first options)) (first options) {})
@@ -1481,15 +1695,104 @@
          ~@(when (seq m) [`(alter-meta! ~v merge ~m)])
          r#))))
 
-; (defmethod mf dispatch-val & fn-tail) → mf, with (fn fn-tail...) its
-; method for dispatch-val.
-(defmacro defmethod [mf dispatch-val & fn-tail]
+(defmacro defmethod
+  "Sets (fn fn-tail...) as the multimethod mf's method for
+  dispatch-val, so a named or multi-arity method works. Returns mf."
+  [mf dispatch-val & fn-tail]
   `(add-method ~mf ~dispatch-val (fn ~@fn-tail)))
 
 ; ============================================================
 ; The command line
 ; ============================================================
 
-; The arguments after the program on the command line, as a vector
-; of strings; nil when there are none. `nexis run` binds it.
-(def *command-line-args* nil)
+(def *command-line-args*
+  "The arguments after the program on the command line (nexis run FILE
+  or nexis -e EXPR), as a vector of strings; nil when there are none."
+  nil)
+
+; ============================================================
+; Documentation (STDLIB.md §10)
+; ============================================================
+
+; The doc map of a special form or host macro, from the runtime's
+; table; `&`, `catch` and `finally` are documented with fn and try.
+(defn- special-doc [sym]
+  (let [sym (get '{& fn catch try finally try} sym sym)
+        sym (if (= (namespace sym) "nexis.core") (symbol (name sym)) sym)]
+    (some (fn [m] (when (= (:name m) sym) m)) (nexis.internal/#%special-docs))))
+
+(defn- namespace-doc [ns-sym]
+  (when-let [d (nexis.internal/#%namespace-doc ns-sym)]
+    {:name ns-sym :doc d}))
+
+; What `doc` prints of a doc map, in Clojure's layout.
+(defn- print-doc [m]
+  (println "-------------------------")
+  (println (str (when-let [n (:ns m)] (str n "/")) (:name m)))
+  (doseq [f (:forms m)] (print "  ") (prn f))
+  (when-let [a (:arglists m)] (prn a))
+  (cond (:special-form m) (println "Special Form")
+        (:macro m) (println "Macro"))
+  (when-let [d (:doc m)] (println " " d)))
+
+; The doc map of what sym names: a special form or host macro, a
+; library namespace, else the Var it resolves to; nil for none.
+(defn- doc-of [sym]
+  (or (special-doc sym)
+      (when (find-ns sym) (or (namespace-doc sym) {:name sym}))
+      (when-let [v (resolve sym)] (or (meta v) {:name sym}))))
+
+(defmacro doc
+  "Prints the documentation of the Var, special form, macro or namespace
+  that name names: its qualified name, its arglists, whether it is a
+  macro or special form, and its docstring. Prints nothing when name
+  names nothing. nil."
+  [name]
+  `(when-let [m# (#'nexis.core/doc-of '~name)] (#'nexis.core/print-doc m#)))
+
+(defn find-doc
+  "Prints the documentation of every Var, special form, macro and
+  namespace whose docstring or name has a match for re-string-or-pattern,
+  a string or a regex. nil."
+  [re-string-or-pattern]
+  (let [re (re-pattern re-string-or-pattern)
+        ms (concat (mapcat (fn [ns] (sort-by :name (keep meta (vals (ns-interns ns))))) (all-ns))
+                   (keep namespace-doc (all-ns))
+                   (nexis.internal/#%special-docs))]
+    (doseq [m ms
+            :when (and (:doc m) (or (re-find re (:doc m)) (re-find re (str (:name m)))))]
+      (print-doc m))))
+
+(defn apropos
+  "Given a regex or a string, a sorted seq of the qualified symbols of
+  every public Var, and of every host macro, whose name has a match for
+  the regex or contains the string. nexis.internal is left out."
+  [str-or-pattern]
+  (let [match? (if (= :regex (class str-or-pattern))
+                 (fn [s] (re-find str-or-pattern s))
+                 (fn [s] (nexis.string/includes? s (str str-or-pattern))))]
+    (sort (concat (mapcat (fn [ns]
+                            (when-not (= ns 'nexis.internal)
+                              (keep (fn [s] (when (match? (str s)) (symbol (str ns) (str s))))
+                                    (keys (ns-publics ns)))))
+                          (all-ns))
+                  (keep (fn [m] (when (and (:macro m) (match? (str (:name m))))
+                                  (symbol "nexis.core" (str (:name m)))))
+                        (nexis.internal/#%special-docs))))))
+
+(defn dir-fn
+  "A sorted seq of the symbols naming the public Vars of the namespace
+  ns names, or that an alias in the current namespace names; for
+  nexis.core, its host macros (defn, let, cond, ...) as well.
+  :no-such-namespace when it names none."
+  [ns]
+  (let [n (or (nexis.internal/#%the-ns-name ns) (the-ns ns))]
+    (sort (concat (keys (ns-publics n))
+                  (when (= n 'nexis.core)
+                    (keep (fn [m] (when (:macro m) (:name m))) (nexis.internal/#%special-docs)))))))
+
+(defmacro dir
+  "Prints a sorted directory of the public Vars of the namespace, or
+  namespace alias, nsname names, one per line. nil."
+  [nsname]
+  `(doseq [v# (dir-fn '~nsname)] (println v#)))

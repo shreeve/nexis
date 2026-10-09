@@ -1,5 +1,5 @@
 -------------------------
-area
+user/area
 ([w h])
   The area of a w by h rectangle.
 :cm2

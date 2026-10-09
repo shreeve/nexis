@@ -1,4 +1,8 @@
-; examples/regex.nx — regular expressions (docs/REGEX.md)
+; examples/regex.nx — regular expressions: Java's pattern syntax, with
+; every search running in time linear in its input. docs/REGEX.md has
+; the details.
+;
+;   bin/nexis run examples/regex.nx
 ;
 ;   - #"..." is a pattern literal; re-find, re-matches, re-seq and a
 ;     matcher with re-find / re-groups, as in Clojure

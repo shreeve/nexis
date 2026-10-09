@@ -1,4 +1,5 @@
-; examples/stdlib-primitives.nx — stdlib primitives
+; test/examples/pins/stdlib-primitives.nx — stdlib primitives
+; A pin, not a teaching example: natives a macro calls at compile time.
 ;
 ; Ten native fns for macro authoring + basic collection
 ; inspection: list, cons, first, rest, count, nth, empty?,

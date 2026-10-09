@@ -1,18 +1,18 @@
-; examples/require-demo.nx — require + aliases demo
+; examples/require-demo.nx — loading a library from a file. require
+; looks for a namespace's file beside the running script and in the
+; working directory; the dots of the name are directories, so lib.geom
+; is lib/geom.nx.
 ;
-; Run with: ./bin/nexis run examples/require-demo.nx
-;
-; The loader searches the CWD and the directory of the source
-; file for `.nx` files. `lib.geom` resolves to `lib/geom.nx`.
-; (Dots in namespace names become slashes in the file path.)
-;
-; Two require shapes:
-;   (require 'my.ns)              — load my.ns; no alias
-;   (require '[my.ns :as alias])  — load + alias `alias → my.ns`
-; `:as-alias`, `:refer` and `:rename` work as in Clojure
-; (docs/MACROEXPAND.md, the `require` row); prefix lists do not.
+;   bin/nexis run examples/require-demo.nx
 
+; :as gives the namespace a short alias.
 (require '[lib.geom :as g])
+(println (g/area-of-square 5) (g/area-of-rectangle 2 3))
 
-; Qualified call via alias.
-(println (g/area-of-square 5))
+; :refer brings names in unqualified; :rename renames one it refers.
+(require '[lib.geom :refer [perimeter-of-square point] :rename {point pt}])
+(println (perimeter-of-square 5) (pt 1 2))
+
+; In a file of its own, the same goes in the ns form:
+;   (ns my.app
+;     (:require [lib.geom :as g :refer [point]]))

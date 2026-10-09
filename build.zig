@@ -13,7 +13,7 @@
 //!                                     Nextomic property tests, the eval corpora
 //!   zig build nextomic-test           Nextomic unit, property and corpus tests
 //!   zig build nextomic-nx             test/nextomic/*.nx through bin/nexis
-//!   zig build examples                every examples/*.nx through bin/nexis
+//!   zig build examples                every examples/*.nx and test/examples/pins/*.nx through bin/nexis
 //!   zig build portable                test/portable: a db/* and a Nextomic store
 //!                                     written, then dumped (test/portable/README.md)
 //!   zig build golden [-Dupdate=true]  reader and CLI goldens (byte-exact)
@@ -257,18 +257,22 @@ pub fn build(b: *std.Build) void {
     // test/examples/<name>.out, from a fresh directory (the
     // store-backed ones write under tmp/ in it). An example with a
     // `<name>.2.out` runs again in the same directory, over the
-    // store the first run left.
-    const examples_step = b.step("examples", "Run every examples/*.nx through bin/nexis");
+    // store the first run left. test/examples/pins/*.nx, programs
+    // that pin low-level behaviour rather than teach, run the same
+    // way against the `.out` beside each.
+    const examples_step = b.step("examples", "Run every examples/*.nx and test/examples/pins/*.nx through bin/nexis");
     const example_libs = listFiles(b, "examples/lib", true);
-    for (listStems(b, "examples", ".nx")) |name| {
-        const script = b.fmt("examples/{s}.nx", .{name});
-        const second = b.fmt("test/examples/{s}.2.out", .{name});
-        const programs = [_]Program{
-            .{ .script = script, .expected = b.fmt("test/examples/{s}.out", .{name}) },
-            .{ .script = script, .expected = second },
-        };
-        const count: usize = if (exists(b, second)) 2 else 1;
-        scripts.unit(examples_step, b.fmt("examples-{s}", .{name}), programs[0..count], example_libs, env.gc_stress);
+    for ([_][2][]const u8{ .{ "examples", "test/examples" }, .{ "test/examples/pins", "test/examples/pins" } }) |dirs| {
+        for (listStems(b, dirs[0], ".nx")) |name| {
+            const script = b.fmt("{s}/{s}.nx", .{ dirs[0], name });
+            const second = b.fmt("{s}/{s}.2.out", .{ dirs[1], name });
+            const programs = [_]Program{
+                .{ .script = script, .expected = b.fmt("{s}/{s}.out", .{ dirs[1], name }) },
+                .{ .script = script, .expected = second },
+            };
+            const count: usize = if (exists(b, second)) 2 else 1;
+            scripts.unit(examples_step, b.fmt("examples-{s}", .{name}), programs[0..count], example_libs, env.gc_stress);
+        }
     }
     test_step.dependOn(examples_step);
 
@@ -293,9 +297,9 @@ pub fn build(b: *std.Build) void {
     // runtime error's stderr (exit 5), a reader error's stderr (exit
     // 3), a compile error's (exit 4), a disassembly, scripts' stdout
     // (with arguments, from stdin, an explicit exit status), `nexis
-    // test`, a REPL session and the usage errors. Each runs from the
-    // build root, so the paths in the output are the relative ones
-    // committed.
+    // test`, a REPL session, `nexis doc` and the usage errors. Each
+    // runs from the build root, so the paths in the output are the
+    // relative ones committed.
     {
         const CliGolden = struct {
             args: []const []const u8,
@@ -325,7 +329,7 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{ "run", cli ++ "deep-trace.nx" }, .stderr = "deep-trace.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "out-of-memory.nx" }, .stdout = "out-of-memory.out", .stderr = "out-of-memory.err", .exit_code = 5, .max_alloc = "16777216" },
             .{ .args = &.{ "run", cli ++ "long-sequences.nx" }, .stdout = "long-sequences.out", .max_alloc = "4194304" },
-            .{ .args = &.{ "disasm", "examples/sum10.nx" }, .stdout = "sum10.disasm" },
+            .{ .args = &.{ "disasm", "test/examples/pins/sum10.nx" }, .stdout = "sum10.disasm" },
             .{ .args = &.{ "disasm", cli ++ "multi-arity.nx" }, .stdout = "multi-arity.disasm" },
             .{ .args = &.{ "run", cli ++ "arity-multi.nx" }, .stderr = "arity-multi.err", .exit_code = 5 },
             .{ .args = &.{ "run", cli ++ "pprint.nx" }, .stdout = "pprint.out" },
@@ -340,6 +344,13 @@ pub fn build(b: *std.Build) void {
             .{ .args = &.{"repl"}, .stdin = "repl.in", .stdout = "repl.out", .stderr = "repl.err", .max_alloc = "16777216" },
             .{ .args = &.{ "-e", "1" }, .stderr = "boot-out-of-memory.err", .exit_code = 5, .max_alloc = "4096" },
             .{ .args = &.{cli ++ "script"}, .stdout = "script.out" },
+            .{ .args = &.{ "doc", "map" }, .stdout = "doc-map.out" },
+            .{ .args = &.{ "doc", "nexis.string/split" }, .stdout = "doc-split.out" },
+            .{ .args = &.{ "doc", "when-let" }, .stdout = "doc-when-let.out" },
+            .{ .args = &.{ "doc", "if" }, .stdout = "doc-if.out" },
+            .{ .args = &.{ "doc", "no-such-name" }, .stderr = "doc-missing.err", .exit_code = 1 },
+            .{ .args = &.{ "doc", "(exit 7)" }, .stderr = "doc-not-symbol.err", .exit_code = 1 },
+            .{ .args = &.{"doc"}, .stderr = "help.err", .exit_code = 1 },
             .{ .args = &.{"--help"}, .stdout = "help.out" },
             .{ .args = &.{"--version"}, .stdout = "version.out" },
             .{ .args = &.{"-V"}, .stdout = "version.out" },

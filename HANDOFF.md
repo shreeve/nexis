@@ -58,11 +58,11 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 225/225 steps succeeded; 1609/1609 tests passed
+Build Summary: 244/244 steps succeeded; 1612/1612 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
-steps; without it the count is 223 steps. Any output besides the
+steps; without it the count is 242 steps. Any output besides the
 summary tree is a failure. The largest binaries are `unit` (every
 inline test in `src/`) and `eval_pipeline` (the language corpus);
 `cli-unit` runs `src/cli.zig`'s own tests.
@@ -114,7 +114,7 @@ The fastest end-to-end checks:
 ```bash
 ./bin/nexis run examples/nextomic-app.nx   # clinic chart on Nextomic; a second run adds to its store
 ./bin/nexis run examples/todo-app.nx       # durable refs over the whole db/* surface, rollback included
-./bin/nexis run examples/shapes-app.nx     # multi-file protocols, records, atoms: total-area atom = 9650
+./bin/nexis run examples/shapes-app.nx     # protocols and records across namespaces: total 68.71
 ./bin/nexis -e '(reduce + (range 101))'    # 5050
 ./bin/nexis repl                           # :quit or Ctrl-D exits
 ```

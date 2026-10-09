@@ -5,6 +5,8 @@
 ; function called there, sees the binding; the root value is back
 ; when the form exits, by return or by throw. `set!` changes the
 ; innermost binding in force.
+;
+;   bin/nexis run examples/binding.nx
 
 (def ^:dynamic *indent* 0)
 (def ^:dynamic *out-prefix* "> ")
@@ -42,4 +44,4 @@
 
 ; Only a dynamic Var can be bound.
 (def plain 1)
-(println (try (binding [plain 2] plain) (catch :not-dynamic e e)))
+(println (try (binding [plain 2] plain) (catch :not-dynamic _ :not-dynamic)))

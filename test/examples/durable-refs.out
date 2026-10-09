@@ -1,1 +1,6 @@
-[:rolled-back [:caught :oops] :after-rollback {:age 31, :note :updated-via-with-tx}]
+true
+run number 1
+{:name "Ada", :langs #{"nexis"}, :scores [90 95]} true false
+[90 95 99] "Grace"
+:rolled-back
+"Ada"

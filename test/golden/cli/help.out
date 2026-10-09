@@ -15,6 +15,9 @@ usage:
   nexis test FILE...       Runs each file, then every deftest
                            they defined; exits 1 on a failure
                            or an error.
+  nexis doc NAME           Prints the documentation of NAME, a
+                           function, macro, special form or
+                           namespace, as (doc NAME) does.
   nexis disasm FILE        Compiles FILE without running it and
                            prints every routine's bytecode: pc,
                            opcode, operands, constants and the

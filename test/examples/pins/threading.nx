@@ -1,4 +1,5 @@
-; examples/threading.nx — the threading macros (-> and ->>).
+; test/examples/pins/threading.nx — the threading macros (-> and ->>).
+; A pin, not a teaching example: -> threading through +.
 ;
 ;   (-> 1 (+ 2) (+ 3))  is  (+ (+ 1 2) 3)  =>  6
 ;   (-> x f)            is  (f x)

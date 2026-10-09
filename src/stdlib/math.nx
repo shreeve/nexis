@@ -5,15 +5,19 @@
 ; Embedded via @embedFile and bootstrapped at VM startup with
 ; nexis.math as the current namespace.
 
-(def PI 3.141592653589793)
-(def E 2.718281828459045)
+(def PI "The double closest to pi." 3.141592653589793)
+(def E "The double closest to e, the base of natural logarithms." 2.718281828459045)
 
-; (floor-div x y), (floor-mod x y) → Java's Math/floorDiv and
-; Math/floorMod of x and y as longs (a float truncated, as Clojure
-; casts it): the quotient rounded toward negative infinity, and the
-; remainder with y's sign. A zero y is :divide-by-zero.
-(defn floor-mod [x y] (mod (long x) (long y)))
+(defn floor-mod
+  "Returns the remainder of x by y with y's sign, as Java's
+  Math/floorMod; a float is truncated first. A zero y is
+  :divide-by-zero."
+  [x y] (mod (long x) (long y)))
 
-(defn floor-div [x y]
+(defn floor-div
+  "Returns the quotient of x by y rounded toward negative infinity, as
+  Java's Math/floorDiv; a float is truncated first, and a quotient
+  past the long range is a bignum. A zero y is :divide-by-zero."
+  [x y]
   (let [x (long x) y (long y)]
     (quot (- x (mod x y)) y)))

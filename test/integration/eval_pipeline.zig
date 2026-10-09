@@ -293,6 +293,55 @@ test "defn: docstring, attribute map and ^meta land on the Var with :arglists" {
     try expectOutputProgram("(defn f [x] x) (reset-meta! (var f) {:z 1}) (alter-meta! (var f) assoc :y 2) (meta (var f))", "{:z 1, :y 2}");
 }
 
+test "doc, find-doc, apropos and dir read the documentation of Vars, natives, special forms and namespaces" {
+    // STDLIB.md §10: Clojure's layout, a defn's docstring as written.
+    try expectOutputProgram("(defn f \"Doubles x.\n  Twice.\" [x] (* 2 x)) (with-out-str (doc f))", "-------------------------\nuser/f\n([x])\n  Doubles x.\n  Twice.\n");
+    try expectOutputProgram("(defmacro m \"A macro.\" [x] x) (with-out-str (doc m))", "-------------------------\nuser/m\n([x])\nMacro\n  A macro.\n");
+    // A native's Var takes its row's docs as metadata when asked, as a
+    // defn's; another Var holding the native does not.
+    try expectOutput("(select-keys (meta #'first) [:arglists :name :ns])", "{:arglists ([coll]), :name first, :ns nexis.core}");
+    try expectOutput("(string? (:doc (meta #'first)))", "true");
+    try expectOutputProgram("(def my-first first) (meta #'my-first)", "{:name my-first, :ns user}");
+    try expectOutput("(subs (with-out-str (doc first)) 0 53)", "-------------------------\nnexis.core/first\n([coll])\n ");
+    try expectOutput("(do (reset-meta! #'first {:doc \"mine\"}) (meta #'first))", "{:doc mine}");
+    // Special forms and host macros have no Var: doc reads their table.
+    try expectOutput("(with-out-str (doc if))", "-------------------------\nif\n  (if test then else?)\nSpecial Form\n  Evaluates test. If it is neither nil nor false, evaluates and yields\n  then, otherwise else, nil when there is none.\n");
+    try expectOutput("(subs (with-out-str (doc catch)) 0 32)", "-------------------------\ntry\n  ");
+    try expectOutput("(subs (with-out-str (doc ->)) 0 54)", "-------------------------\nnexis.core/->\n([x & forms])\n");
+    try expectOutput("(re-find #\"Macro\" (with-out-str (doc nexis.core/defn)))", "Macro");
+    try expectOutput("(subs (with-out-str (doc nexis.string)) 0 40)", "-------------------------\nnexis.string\n ");
+    // What names nothing prints nothing, as in Clojure.
+    try expectOutput("[(doc no-such-thing) (with-out-str (doc no-such-thing))]", "[nil ]");
+    // apropos: sorted qualified symbols, host macros included.
+    try expectOutput("(apropos \"cond-\")", "(nexis.core/cond-> nexis.core/cond->>)");
+    try expectOutput("(apropos #\"^->\")", "(nexis.core/-> nexis.core/->>)");
+    try expectOutput("(some #{'nexis.string/split-lines} (apropos \"split\"))", "nexis.string/split-lines");
+    // dir: a namespace or an alias; nexis.core with its host macros.
+    try expectOutput("(dir-fn 'nexis.set)", "(difference intersection map-invert rename-keys select subset? superset? union)");
+    try expectOutputWithFiles(&.{}, "(require '[nexis.walk :as w]) (with-out-str (dir w))", "keywordize-keys\nmacroexpand-all\npostwalk\npostwalk-replace\nprewalk\nprewalk-replace\nstringify-keys\nwalk\n");
+    try expectOutput("(boolean (some #{'defn} (dir-fn 'nexis.core)))", "true");
+    try expectOutput("(try (dir-fn 'no.such) (catch :no-such-namespace e :none))", ":none");
+    // find-doc: every doc whose text or name matches.
+    try expectOutputProgram("(defn zq \"Zorbles quietly.\" []) (with-out-str (find-doc \"Zorbles\"))", "-------------------------\nuser/zq\n([])\n  Zorbles quietly.\n");
+}
+
+test "every public Var of the library namespaces has a docstring, and every function its arglists" {
+    // STDLIB.md §10: a native through its row, the rest through
+    // core.nx and the other embedded sources. Lists what lacks one.
+    try expectOutput(
+        \\(->> (all-ns)
+        \\     (remove #{'user 'nexis.internal})
+        \\     (mapcat (fn [ns] (map (fn [[s v]] [(symbol (str ns) (str s)) v]) (ns-publics ns))))
+        \\     (remove (fn [[_ v]]
+        \\               (let [m (meta v)]
+        \\                 (and (string? (:doc m))
+        \\                      (or (:arglists m) (not (and (bound? v) (fn? @v))))))))
+        \\     (map first)
+        \\     sort
+        \\     vec)
+    , "[]");
+}
+
 test "meta / with-meta / vary-meta on collections never touch equality, hash or printing" {
     try expectOutput("(meta [1 2])", "nil");
     try expectOutput("(meta (with-meta [1 2] {:a 1}))", "{:a 1}");

@@ -1,0 +1,7 @@
+-------------------------
+nexis.string/split
+([s re] [s re limit])
+  Returns a vector of the pieces of s between the matches of re, a
+  pattern or a literal string, with trailing empty pieces dropped. A
+  positive limit splits at most limit - 1 times; a negative one keeps
+  the trailing empty pieces.

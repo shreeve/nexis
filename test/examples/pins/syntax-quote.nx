@@ -1,4 +1,5 @@
-; examples/syntax-quote.nx — syntax-quote, unquote, splicing, gensym.
+; test/examples/pins/syntax-quote.nx — syntax-quote, unquote, splicing, gensym.
+; A pin, not a teaching example: qualifying and splicing.
 ;
 ; Demonstrates the macro author's primary tool. The runtime
 ; constructs lists, splices in computed lists, and auto-gensyms

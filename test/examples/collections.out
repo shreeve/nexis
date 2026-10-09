@@ -1,0 +1,22 @@
+["Clojure" "nexis"] ["Clojure" "nexis" "Zig"] "Zig" 3
+"Ada" :unknown 1815
+{:name "Ada", :born 1815, :langs #{"Analytical Engine"}, :died 1852}
+{:name "Ada", :born 1815}
+{:name "Ada", :born 1915, :langs #{"Analytical Engine"}}
+5432 {:db {:host "db.internal", :port 5432}, :debug false} {:db {:host "localhost", :port 5433}, :debug false}
+{:a 1, :b 20, :c 30}
+{:apples 5, :pears 1, :plums 4}
+{:name "Ada", :born 1815}
+#{:fast :small} true nil
+[1 2 3] #{1 2} {:a 1, :b 2}
+{:math 2, :navy 1, :cs 1}
+{:math ["Ada" "Alan"], :navy ["Grace"], :cs ["Edsger"]}
+("Ada" "Alan" "Edsger" "Grace")
+("Grace" "Edsger" "Alan" "Ada")
+234
+{1 :a, 2 :b}
+("Ada" "Alan")
+([1 :a] [1 :b] [2 :a] [2 :b] [3 :a] [3 :b])
+("ada@example.org" "grace@example.org")
+Grace    40
+Ada      38

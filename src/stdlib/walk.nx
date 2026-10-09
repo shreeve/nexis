@@ -3,14 +3,14 @@
 ; Embedded via @embedFile and bootstrapped with nexis.walk current,
 ; before test.nx, whose `are` substitutes through postwalk-replace.
 
-; (walk inner outer form) → outer of form with inner applied to each
-; of its elements, rebuilt in form's kind: a list stays a list and any
-; other seq (a lazy seq, a range, a cons) a realized seq, in order and
-; with form's metadata; a record keeps its type; any other collection
-; is poured into (empty form), so a sorted one keeps its comparator and
-; metadata stays. A map's elements are its [k v] entries. Anything
-; else, a typed vector included, is a leaf: (outer form).
-(defn walk [inner outer form]
+(defn walk
+  "Returns (outer form) of form rebuilt from (inner x) of each element
+  x, in form's kind: a list stays a list and any other seq becomes a
+  realized seq, with form's metadata; a record keeps its type; another
+  collection is poured into (empty form), so a sorted one keeps its
+  comparator. A map's elements are its [k v] entries. Anything else, a
+  typed vector included, is a leaf: (outer form)."
+  [inner outer form]
   (cond
     (list? form) (outer (with-meta (apply list (map inner form)) (meta form)))
     (seq? form) (outer (with-meta (doall (map inner form)) (meta form)))
@@ -18,35 +18,46 @@
     (coll? form) (outer (into (empty form) (map inner form)))
     :else (outer form)))
 
-; (postwalk f form) → f applied to every subform, children before
-; their parent, each parent rebuilt from the children f returned.
-(defn postwalk [f form]
+(defn postwalk
+  "Returns form with f applied to every subform, children before their
+  parent, each parent rebuilt from what f returned for its children."
+  [f form]
   (walk (partial postwalk f) f form))
 
-; (prewalk f form) → f applied to every subform, a parent before its
-; children, walking into what f returned.
-(defn prewalk [f form]
+(defn prewalk
+  "Returns form with f applied to every subform, a parent before its
+  children, walking into what f returned."
+  [f form]
   (walk (partial prewalk f) identity (f form)))
 
-; (keywordize-keys m) → every string key of every map in m a keyword.
-(defn keywordize-keys [m]
+(defn keywordize-keys
+  "Returns m with every string key of every map in it a keyword. A
+  record or sorted map in m becomes a hash map."
+  [m]
   (let [f (fn [[k v]] (if (string? k) [(keyword k) v] [k v]))]
     (postwalk (fn [x] (if (map? x) (into {} (map f x)) x)) m)))
 
-; (stringify-keys m) → every keyword key of every map in m its name.
-(defn stringify-keys [m]
+(defn stringify-keys
+  "Returns m with every keyword key of every map in it its name. A
+  record or sorted map in m becomes a hash map."
+  [m]
   (let [f (fn [[k v]] (if (keyword? k) [(name k) v] [k v]))]
     (postwalk (fn [x] (if (map? x) (into {} (map f x)) x)) m)))
 
-; (prewalk-replace smap form), (postwalk-replace smap form) → form
-; with every subform that is a key of smap replaced by its value.
-(defn prewalk-replace [smap form]
+(defn prewalk-replace
+  "Returns form with every subform that is a key of smap replaced by
+  its value, walking parents first (prewalk)."
+  [smap form]
   (prewalk (fn [x] (if (contains? smap x) (smap x) x)) form))
 
-(defn postwalk-replace [smap form]
+(defn postwalk-replace
+  "Returns form with every subform that is a key of smap replaced by
+  its value, walking children first (postwalk)."
+  [smap form]
   (postwalk (fn [x] (if (contains? smap x) (smap x) x)) form))
 
-; (macroexpand-all form) → form with every macro call in it expanded,
-; outermost first, as the compiler would expand it.
-(defn macroexpand-all [form]
+(defn macroexpand-all
+  "Returns form with every macro call in it expanded, outermost first,
+  each seq through macroexpand."
+  [form]
   (prewalk (fn [x] (if (seq? x) (macroexpand x) x)) form))

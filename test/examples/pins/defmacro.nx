@@ -1,4 +1,5 @@
-; examples/defmacro.nx — user-defined macros via defmacro.
+; test/examples/pins/defmacro.nx — user-defined macros via defmacro.
+; A pin, not a teaching example: compile-time user macros, auto-gensyms.
 ;
 ; A user macro is a fn that runs at COMPILE TIME, takes
 ; unevaluated arg Forms as data, and returns a Form that

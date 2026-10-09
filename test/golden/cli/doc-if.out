@@ -1,0 +1,6 @@
+-------------------------
+if
+  (if test then else?)
+Special Form
+  Evaluates test. If it is neither nil nor false, evaluates and yields
+  then, otherwise else, nil when there is none.
