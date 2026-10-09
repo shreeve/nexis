@@ -391,14 +391,14 @@ the same way (the loader and `eval`).
 with the same argument count (`map` over one collection, `filter`,
 `remove`, `keep`, `reduce`, `group-by`) calls it through a
 `vm.Callback`, which
-makes at its first call the decisions `callValue` makes at every one
-and cannot change between calls from the same place: the callee's
+makes before its first call the decisions `callValue` makes at every
+one and cannot change between calls from the same place: the callee's
 kind, its arity against the count (for a closure, the routine with a
 fixed arity, its own or a member of its table, the count enters), and
 for a closure the stack guard
 (§13.1), the frame cap and the room the frame chain and the stack
 need, since every call starts from the frame depth and stack length
-the first one found. Each later call of a closure writes the
+the first one finds. Each call of a closure writes the
 arguments and nil locals into the window at that stack length (one or
 two arguments, `call1` and `call2`, are stored straight from the
 native's registers; the locals are nil'd four at once, past the window
@@ -415,7 +415,8 @@ rather than making a cell, and the native reads the value back a word
 at a time, the width the return stored it (§8); a callee that
 re-enters the native makes a `Callback`, and a cell, of its own. A
 call that finds the depth or the length changed
-goes through `callValue`. A leaf native is called as `callValue` calls it, and a
+goes through `callValue`. A leaf native is called as `callValue` calls it,
+past the leaf call once its leaf body refuses the receiver, and a
 keyword or symbol given one argument that is a map, a record or nil
 looks itself up in place (§8); any other callee, a closure the count
 enters at a rest clause, and any callee whose arity the count does not
@@ -427,8 +428,8 @@ the results, errors, error details, traces and rooting are
 a run it holds calls it through `Callback.each` (`out[i] = (f
 items[i])`), `fold` (`acc = (f acc items[i])`) or `foldRange` (the same
 over an unrealized range or `repeat`, whose elements are computed),
-which make the run's calls in one pass of the chain. The first
-element's is a prepared call as above. The return of each element's
+which make the run's calls in one pass of the chain, starting with the
+first element's prepared call as above. The return of each element's
 frame into the callback's cell goes on in that frame: its result goes
 to its place (`each`'s into a block a root reaches, a buffer only
 tested for truth, or a root-stack region by index; `fold`'s
@@ -438,8 +439,7 @@ window, the frame stays as the first call pushed it (nothing a call
 runs changes a frame but its `pc`), the safe point a call's entry is
 taken, and the chain goes on at the callee's first instruction, which
 the first call looked up, so the native is re-entered once per run
-rather than once per element. A leaf native or a lookup is called in
-a loop of its own, its mode decided once. `fold` and `foldRange` end the pass after a
+rather than once per element. `fold` and `foldRange` end the pass after a
 result that is a record, which the native tests for `reduced`. Every
 element is still a call of its own, with a frame of its own: the pop
 of one element's and the push of the next one's are fused, at the same
