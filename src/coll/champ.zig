@@ -906,10 +906,8 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
                 k -= 1;
                 const hdr = headerOf(InteriorHeader, spot.path[k]);
                 if (k > 0 and hdr.data_bitmap == 0 and @popCount(hdr.node_bitmap) == 1) continue;
-                try ownPath(heap, root, &spot, k + 1, edit);
-                const node = spot.path[k];
-                const replaced_node = try withSlotInPlace(heap, node, slotOf(spot.hash32, @intCast(5 * k)), .{ .data = lone }, edit);
-                if (replaced_node != node) relink(root, &spot, k, replaced_node);
+                try ownPath(heap, root, &spot, k, edit);
+                relink(root, &spot, k, try withSlot(heap, spot.path[k], slotOf(spot.hash32, @intCast(5 * k)), .{ .data = lone }, edit));
                 single = null;
             }
             rb.count -= 1;
@@ -931,39 +929,6 @@ fn Trie(comptime P: type, comptime kind: Kind) type {
             @memmove((old_children - @sizeOf(P))[0..child_bytes], old_children[0..child_bytes]);
             hdr.data_bitmap &= ~bitOf(slot);
             _ = Heap.resizeInPlace(node, interiorSize(hdr.data_bitmap, hdr.node_bitmap));
-        }
-
-        /// Owned interior `node` with `slot` holding `new`, rewritten
-        /// in place when its block has room, else an owned copy.
-        fn withSlotInPlace(heap: *Heap, node: *HeapHeader, slot: u32, new: Slot, edit: u32) !*HeapHeader {
-            const hdr = headerOf(InteriorHeader, node).*;
-            var ps_buf: [branch_factor]P = undefined;
-            var cs_buf: [branch_factor]*HeapHeader = undefined;
-            const ps = ps_buf[0..@popCount(hdr.data_bitmap)];
-            const cs = cs_buf[0..@popCount(hdr.node_bitmap)];
-            @memcpy(ps, payloads(node));
-            @memcpy(cs, children(node));
-            const bit = bitOf(slot);
-            var data = hdr.data_bitmap & ~bit;
-            var nodes = hdr.node_bitmap & ~bit;
-            switch (new) {
-                .empty => {},
-                .data => data |= bit,
-                .child => nodes |= bit,
-            }
-            const target = if (Heap.resizeInPlace(node, interiorSize(data, nodes))) node else try allocInterior(heap, data, nodes, edit, edit_slack);
-            headerOf(InteriorHeader, target).* = .{ .data_bitmap = data, .node_bitmap = nodes };
-            const put_data: ?P = switch (new) {
-                .data => |p| p,
-                else => null,
-            };
-            const put_child: ?*HeapHeader = switch (new) {
-                .child => |c| c,
-                else => null,
-            };
-            splice(P, payloads(target), ps, dataIndex(hdr.data_bitmap, slot), hdr.data_bitmap & bit != 0, put_data);
-            splice(*HeapHeader, children(target), cs, childIndex(hdr.node_bitmap, slot), hdr.node_bitmap & bit != 0, put_child);
-            return target;
         }
 
         // ---- bulk construction ----

@@ -406,10 +406,9 @@ or a child. An in-place edit (§8.3) copies a node on its path that it
 does not own whole (`ownPath`), then rewrites the owned interior where
 it stands: a payload into an empty slot when its block has room
 (`insertData`, else a copy through `withSlot`), a payload into a child
-(`dataToChild`), a payload out (`removeData`), or a lone payload pulled
-up into a child's slot (`withSlotInPlace`). The three specialized
-rewrites are each a pair of moves, which a general rewrite in their
-place does not match.
+(`dataToChild`) or a payload out (`removeData`), each a pair of moves,
+which a general rewrite in their place does not match. A lone payload
+pulled up into a child's slot (§5.5) is a copy through `withSlot`.
 Lookup is an iterative descent; insert and remove recurse at most
 eight levels.
 
