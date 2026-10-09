@@ -619,14 +619,14 @@ const string_natives = table("nexis.string", string_rows);
 const string_docs = docs(string_rows);
 
 const math_rows = .{
-    .{ "sqrt", 1, 1, &fnMathSqrt, "[a]", "Returns the positive square root of a as a double: (sqrt 16) is 4.0;\n  NaN for a negative a." },
+    .{ "sqrt", 1, 1, mathOf1(builtin(.sqrt)), "[a]", "Returns the positive square root of a as a double: (sqrt 16) is 4.0;\n  NaN for a negative a." },
     .{ "pow", 2, 2, &fnMathPow, "[a b]", "Returns a raised to the power b as a double, as Java's Math/pow:\n  (pow 2 10) is 1024.0." },
     .{ "floor", 1, 1, &fnMathFloor, "[a]", "Returns the largest integer value not above a: an integer unchanged,\n  a float's floor as a float, (floor 2.7) being 2.0." },
     .{ "ceil", 1, 1, &fnMathCeil, "[a]", "Returns the smallest integer value not below a: an integer unchanged,\n  a float's ceiling as a float, (ceil 2.1) being 3.0." },
     .{ "round", 1, 1, &fnMathRound, "[a]", "Returns the integer closest to a, halves rounding up, as Java's\n  Math/round: an integer unchanged, (round -2.5) being -2. NaN is 0; a\n  float past the long range is the long range's nearest end." },
-    .{ "sin", 1, 1, mathOf1(builtinSin), "[a]", "Returns the sine of the angle a, in radians, as a double." },
-    .{ "cos", 1, 1, mathOf1(builtinCos), "[a]", "Returns the cosine of the angle a, in radians, as a double." },
-    .{ "tan", 1, 1, mathOf1(builtinTan), "[a]", "Returns the tangent of the angle a, in radians, as a double." },
+    .{ "sin", 1, 1, mathOf1(builtin(.sin)), "[a]", "Returns the sine of the angle a, in radians, as a double." },
+    .{ "cos", 1, 1, mathOf1(builtin(.cos)), "[a]", "Returns the cosine of the angle a, in radians, as a double." },
+    .{ "tan", 1, 1, mathOf1(builtin(.tan)), "[a]", "Returns the tangent of the angle a, in radians, as a double." },
     .{ "asin", 1, 1, mathOf1(std.math.asin), "[a]", "Returns the arc sine of a, in radians from -pi/2 to pi/2, as a\n  double; NaN when a is outside [-1, 1]." },
     .{ "acos", 1, 1, mathOf1(std.math.acos), "[a]", "Returns the arc cosine of a, in radians from 0 to pi, as a double;\n  NaN when a is outside [-1, 1]." },
     .{ "atan", 1, 1, mathOf1(std.math.atan), "[a]", "Returns the arc tangent of a, in radians from -pi/2 to pi/2, as a\n  double." },
@@ -634,10 +634,10 @@ const math_rows = .{
     .{ "sinh", 1, 1, mathOf1(std.math.sinh), "[x]", "Returns the hyperbolic sine of x as a double." },
     .{ "cosh", 1, 1, mathOf1(std.math.cosh), "[x]", "Returns the hyperbolic cosine of x as a double." },
     .{ "tanh", 1, 1, mathOf1(std.math.tanh), "[x]", "Returns the hyperbolic tangent of x as a double." },
-    .{ "exp", 1, 1, mathOf1(builtinExp), "[a]", "Returns e raised to the power a, as a double." },
+    .{ "exp", 1, 1, mathOf1(builtin(.exp)), "[a]", "Returns e raised to the power a, as a double." },
     .{ "expm1", 1, 1, mathOf1(std.math.expm1), "[x]", "Returns e raised to the power x, minus 1, as a double, accurate for\n  x near zero." },
-    .{ "log", 1, 1, mathOf1(builtinLog), "[a]", "Returns the natural logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
-    .{ "log10", 1, 1, mathOf1(builtinLog10), "[a]", "Returns the base-10 logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
+    .{ "log", 1, 1, mathOf1(builtin(.log)), "[a]", "Returns the natural logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
+    .{ "log10", 1, 1, mathOf1(builtin(.log10)), "[a]", "Returns the base-10 logarithm of a as a double: ##-Inf for zero, NaN\n  for a negative a." },
     .{ "log1p", 1, 1, mathOf1(std.math.log1p), "[x]", "Returns the natural logarithm of 1 + x as a double, accurate for x\n  near zero." },
     .{ "cbrt", 1, 1, mathOf1(std.math.cbrt), "[a]", "Returns the cube root of a as a double." },
     .{ "hypot", 2, 2, mathOf2(std.math.hypot), "[x y]", "Returns the square root of x squared plus y squared as a double,\n  without intermediate overflow or underflow; ##Inf when either is\n  infinite, even if the other is NaN." },
@@ -783,22 +783,8 @@ fn fnFirst(vm: *VM, args: []const Value) VmError!Value {
 /// an O(1) view (LIST.md §1).
 fn fnRest(vm: *VM, args: []const Value) VmError!Value {
     const s = args[0];
-    const heap = vm.ensureHeap();
-    return switch (s.kind()) {
-        .nil => list_mod.empty(heap) catch VmError.OutOfMemory,
-        .list => if (list_mod.isEmpty(s))
-            list_mod.empty(heap) catch VmError.OutOfMemory
-        else
-            list_mod.tail(s),
-        .persistent_vector => list_mod.ofVector(heap, s, @min(1, vector_mod.count(s))) catch VmError.OutOfMemory,
-        .lazy_seq => seq_mod.rest(vm, s),
-        else => blk: {
-            var items = try collectSeq(vm, s);
-            defer items.deinit(vm.allocator);
-            if (items.items.len <= 1) break :blk list_mod.empty(heap) catch VmError.OutOfMemory;
-            break :blk try buildListFromSlice(vm, items.items[1..]);
-        },
-    };
+    if (s.kind() == .persistent_vector) return list_mod.ofVector(vm.ensureHeap(), s, @min(1, vector_mod.count(s))) catch VmError.OutOfMemory;
+    return seq_mod.rest(vm, s);
 }
 
 /// The element at position `i` of any seqable, nil past its end;
@@ -1016,23 +1002,15 @@ fn fnNthGeneral(vm: *VM, args: []const Value) VmError!Value {
 /// transient is counted, as Clojure 1.12's `empty?` counts one.
 fn fnEmptyQ(vm: *VM, args: []const Value) VmError!Value {
     const c = args[0];
-    const is_empty = switch (c.kind()) {
-        .nil => true,
+    return value_mod.fromBool(switch (c.kind()) {
         .list => list_mod.isEmpty(c),
-        .persistent_vector => vector_mod.isEmpty(c),
-        .typed_vector => typed_vector_mod.count(c) == 0,
-        .persistent_map => champ_mod.mapCount(c) == 0,
-        .record => champ_mod.mapCount(record_mod.fieldsOf(c)) == 0,
         // An entity always has its :db/id.
         .nextomic_entity => false,
-        .persistent_set => champ_mod.setCount(c) == 0,
-        .sorted_map, .sorted_set => sorted_mod.count(c) == 0,
         .string => string_mod.byteLen(c) == 0,
-        .transient => try transientCount(vm, c) == 0,
         .lazy_seq => (try seq_mod.seqOf(vm, c)).isNil(),
-        else => return VmError.KindMismatch,
-    };
-    return value_mod.fromBool(is_empty);
+        // Every other count takes constant time.
+        else => (try countNative(true)(vm, args)).asFixnum() == 0,
+    });
 }
 
 /// `(identity x)` → x.
@@ -1429,28 +1407,21 @@ fn mathOf2(comptime f: anytype) *const fn (*VM, []const Value) VmError!Value {
     }.call;
 }
 
-fn builtinSin(x: f64) f64 {
-    return @sin(x);
-}
-
-fn builtinCos(x: f64) f64 {
-    return @cos(x);
-}
-
-fn builtinTan(x: f64) f64 {
-    return @tan(x);
-}
-
-fn builtinExp(x: f64) f64 {
-    return @exp(x);
-}
-
-fn builtinLog(x: f64) f64 {
-    return @log(x);
-}
-
-fn builtinLog10(x: f64) f64 {
-    return @log10(x);
+/// The float builtin `op` as a function, for `mathOf1`.
+fn builtin(comptime op: enum { sin, cos, tan, exp, log, log10, sqrt }) fn (f64) f64 {
+    return struct {
+        fn f(x: f64) f64 {
+            return switch (op) {
+                .sin => @sin(x),
+                .cos => @cos(x),
+                .tan => @tan(x),
+                .exp => @exp(x),
+                .log => @log(x),
+                .log10 => @log10(x),
+                .sqrt => @sqrt(x),
+            };
+        }
+    }.f;
 }
 
 /// Java's `Math/signum`: a zero (either sign) and NaN are themselves,
@@ -1467,10 +1438,6 @@ fn toRadians(x: f64) f64 {
 
 fn toDegrees(x: f64) f64 {
     return x * 57.29577951308232;
-}
-
-fn fnMathSqrt(_: *VM, args: []const Value) VmError!Value {
-    return value_mod.fromFloat(@sqrt(try asDouble(args[0])));
 }
 
 fn fnMathPow(_: *VM, args: []const Value) VmError!Value {
@@ -2819,10 +2786,9 @@ fn fnNthrest(vm: *VM, args: []const Value) VmError!Value {
         },
         else => {},
     }
-    var items = try collectSeq(vm, args[0]);
-    defer items.deinit(vm.allocator);
-    if (items.items.len == 0) return args[0];
-    return try buildListFromSlice(vm, items.items[@min(count, items.items.len)..]);
+    // A map, set, string or the like: its seq is a fresh list.
+    const q = try seq_mod.seqOf(vm, args[0]);
+    return if (q.isNil()) args[0] else list_mod.drop(q, count);
 }
 
 /// `(nthnext coll n)` → `(seq (nthrest coll n))`: the elements after
@@ -4354,7 +4320,7 @@ fn fnClass(vm: *VM, args: []const Value) VmError!Value {
     }
 }
 
-/// The class name `class` gives a value of kind `k`, a record but.
+/// The class name `class` gives a value of kind `k` other than a record.
 fn className(k: Kind) []const u8 {
     return switch (k) {
         .true_, .false_ => "boolean",
