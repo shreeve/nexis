@@ -6797,263 +6797,117 @@ fn extremumIsFirst(want_max: bool, a: value_mod.Value, b: value_mod.Value) VmErr
     return try integerOrder(a, b) == (if (want_max) std.math.Order.gt else std.math.Order.lt);
 }
 // =============================================================================
-// Convenience helpers for hand-assembling bytecode in tests.
+// Hand-assembled bytecode: one encoder per instruction the compiler
+// emits (VM.md §10), for the compiler and the tests.
 // =============================================================================
 
-pub fn makeRoutine(
-    code: []const Inst,
-    consts: []const Value,
-    slot_count: u16,
-    name: []const u8,
-) Routine {
-    return .{
-        .code = code,
-        .consts = consts,
-        .slot_count = slot_count,
-        .name = name,
-    };
+pub fn makeRoutine(code: []const Inst, consts: []const Value, slot_count: u16, name: []const u8) Routine {
+    return .{ .code = code, .consts = consts, .slot_count = slot_count, .name = name };
 }
 
-/// Encoding helpers. Every opcode the compiler emits has a
-/// corresponding helper. Keeps hand-assembly readable.
 pub const asm_ = struct {
-    /// mov:load-const dst W   ; slot[dst] := consts[W]
-    pub fn loadConst(slot_dst: u12, const_src: u32) Inst {
-        return Inst.primaryWide(.mov, Mov.load_const, Operand.slot(slot_dst), const_src);
-    }
+    const s = Operand.slot;
+    const none = Operand.none;
 
-    pub fn move(slot_dst: u12, slot_src: u12) Inst {
-        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
+    pub fn loadConst(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.mov, Mov.load_const, s(dst), w);
     }
-
-    pub fn moveClear(slot_dst: u12, slot_src: u12) Inst {
-        return Inst.primary(.mov, Mov.move_clear, Operand.slot(slot_dst), Operand.slot(slot_src), Operand.none);
+    pub fn move(dst: u12, src: u12) Inst {
+        return Inst.primary(.mov, Mov.move, s(dst), s(src), none);
     }
-
-    pub fn loadNil(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_nil, Operand.slot(slot_dst), Operand.none, Operand.none);
+    /// `mov:move` from any operand kind `resolve` reads.
+    pub fn moveFrom(dst: u12, src: Operand) Inst {
+        return Inst.primary(.mov, Mov.move, s(dst), src, none);
     }
-
-    pub fn loadTrue(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_true, Operand.slot(slot_dst), Operand.none, Operand.none);
+    pub fn moveClear(dst: u12, src: u12) Inst {
+        return Inst.primary(.mov, Mov.move_clear, s(dst), s(src), none);
     }
-
-    pub fn loadFalse(slot_dst: u12) Inst {
-        return Inst.primary(.mov, Mov.load_false, Operand.slot(slot_dst), Operand.none, Operand.none);
+    pub fn loadNil(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_nil, s(dst), none, none);
     }
-
-    pub fn returnSlot(slot_src: u12) Inst {
-        return Inst.primary(.call, Call.@"return", Operand.slot(slot_src), Operand.none, Operand.none);
+    pub fn loadTrue(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_true, s(dst), none, none);
     }
-
+    pub fn loadFalse(dst: u12) Inst {
+        return Inst.primary(.mov, Mov.load_false, s(dst), none, none);
+    }
+    pub fn returnSlot(src: u12) Inst {
+        return Inst.primary(.call, Call.@"return", s(src), none, none);
+    }
     pub fn returnNil() Inst {
-        return Inst.primary(.call, Call.return_nil, Operand.none, Operand.none, Operand.none);
+        return Inst.primary(.call, Call.return_nil, none, none, none);
     }
-
-    /// math:add a b c   ;  slot[a] = resolve(b) + resolve(c)
-    /// `b` and `c` may be any kind that `resolve` accepts.
-    pub fn mathAdd(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(.math, Math.add, Operand.slot(slot_dst), lhs, rhs);
+    pub fn mathAdd(dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(.math, Math.add, s(dst), lhs, rhs);
     }
-
-    /// cmp:lt dst lhs rhs   ; slot[dst] := bool(resolve(lhs) < resolve(rhs))
-    /// Non-numeric operands trap :kind-mismatch.
-    pub fn cmpLt(slot_dst: u12, lhs: Operand, rhs: Operand) Inst {
-        return Inst.primary(.cmp, Cmp.lt, Operand.slot(slot_dst), lhs, rhs);
+    pub fn cmpLt(dst: u12, lhs: Operand, rhs: Operand) Inst {
+        return Inst.primary(.cmp, Cmp.lt, s(dst), lhs, rhs);
     }
-
-    /// var:load-var dst W  ; slot[dst] := var_table[W]'s value
-    /// in force; traps :unbound-var when it has none.
-    pub fn varLoadVar(slot_dst: u12, var_idx: u32) Inst {
-        return Inst.primaryWide(.var_, VarOp.load_var, Operand.slot(slot_dst), var_idx);
+    pub fn varLoadVar(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.var_, VarOp.load_var, s(dst), w);
     }
-
-    /// var:store-var value W   ; var_table[W].root := resolve(value),
-    /// marked bound.
-    pub fn varStoreVar(var_idx: u32, value: Operand) Inst {
-        return Inst.primaryWide(.var_, VarOp.store_var, value, var_idx);
+    pub fn varStoreVar(w: u32, value: Operand) Inst {
+        return Inst.primaryWide(.var_, VarOp.store_var, value, w);
     }
-
-    /// var:var-object dst W  ; slot[dst] := the Var object (an
-    /// unbound Var does not trap). `(var x)` / `#'x` lowers to this.
-    pub fn varVarObject(slot_dst: u12, var_idx: u32) Inst {
-        return Inst.primaryWide(.var_, VarOp.var_object, Operand.slot(slot_dst), var_idx);
+    pub fn varVarObject(dst: u12, w: u32) Inst {
+        return Inst.primaryWide(.var_, VarOp.var_object, s(dst), w);
     }
-
-    /// coll:list arg_base argc dst  ; slot[dst] := list from
-    /// argc consecutive slots starting at arg_base.
-    pub fn collList(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.list,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    /// `coll:<op>` of the `argc` slots from `base`, the count an
+    /// immediate (VM.md §4.5).
+    pub fn coll(op: CollOp, base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.coll, op, s(base), s(argc), s(dst));
     }
-
-    /// coll:concat arg_base argc dst  ; slot[dst] := concat of
-    /// argc list values starting at arg_base.
-    pub fn collConcat(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.concat,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    /// `coll(.vector, ...)`, as `compile.zig`'s tests spell it.
+    pub fn collVector(base: u12, argc: u12, dst: u12) Inst {
+        return coll(.vector, base, argc, dst);
     }
-
-    /// ctrl:try-enter binding_slot W   ; push a handler for the
-    /// routine's try W.
-    pub fn tryEnter(try_index: u32, binding_slot: u12) Inst {
-        return Inst.primaryWide(.ctrl, CtrlOp.try_enter, Operand.slot(binding_slot), try_index);
+    pub fn tryEnter(w: u32, binding: u12) Inst {
+        return Inst.primaryWide(.ctrl, CtrlOp.try_enter, s(binding), w);
     }
-
-    /// ctrl:try-exit W   ; pop handler, jump to post_pc W; if the
-    /// popped handler has finally, push `.normal(post_pc)`
-    /// continuation + jump to finally.
     pub fn tryExit(post_pc: u32) Inst {
-        return Inst.primaryWide(.ctrl, CtrlOp.try_exit, Operand.none, post_pc);
+        return Inst.primaryWide(.ctrl, CtrlOp.try_exit, none, post_pc);
     }
-
-    /// ctrl:finally-exit _ _ _   ; pop FinallyContinuation +
-    /// dispatch (.normal jumps post_pc, .throwing continues
-    /// unwind).
     pub fn finallyExit() Inst {
-        return Inst.primary(.ctrl, CtrlOp.finally_exit, Operand.none, Operand.none, Operand.none);
+        return Inst.primary(.ctrl, CtrlOp.finally_exit, none, none, none);
     }
-
-    /// ctrl:throw value_operand _ _   ; throw the resolved value.
-    /// Operand kind may be slot, constant, or var.
     pub fn throwOp(value: Operand) Inst {
-        return Inst.primary(.ctrl, CtrlOp.throw_, value, Operand.none, Operand.none);
+        return Inst.primary(.ctrl, CtrlOp.throw_, value, none, none);
     }
-
-    /// coll:vector arg_base argc dst  ; slot[dst] := vector
-    /// built from argc consecutive slot values.
-    pub fn collVector(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.vector,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpJmp(target: u32) Inst {
+        return Inst.primaryWide(.jump, Jump.jmp, none, target);
     }
-
-    /// coll:map arg_base argc dst  ; slot[dst] := persistent map
-    /// from argc/2 k,v pairs (argc MUST be even).
-    pub fn collMap(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.map,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpIfTrue(target: u32, test_op: Operand) Inst {
+        return Inst.primaryWide(.jump, Jump.if_true, test_op, target);
     }
-
-    /// coll:set arg_base argc dst  ; slot[dst] := persistent set
-    /// from argc slot values (duplicates collapse).
-    pub fn collSet(arg_base: u12, argc: u12, dst: u12) Inst {
-        return Inst.primary(
-            .coll,
-            CollOp.set,
-            Operand.slot(arg_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(dst),
-        );
+    pub fn jumpIfFalse(target: u32, test_op: Operand) Inst {
+        return Inst.primaryWide(.jump, Jump.if_false, test_op, target);
     }
-
-    /// jump:jmp W   ; pc := W, an absolute pc in the routine.
-    pub fn jumpJmp(target_pc: u32) Inst {
-        return Inst.primaryWide(.jump, Jump.jmp, Operand.none, target_pc);
+    pub fn closureMake(w: u32, dst: u12) Inst {
+        return Inst.primaryWide(.closure, Closure_.make, s(dst), w);
     }
-
-    /// jump:if-true test W   ; if truthy(resolve(test)) pc := W
-    pub fn jumpIfTrue(target_pc: u32, test_op: Operand) Inst {
-        return Inst.primaryWide(.jump, Jump.if_true, test_op, target_pc);
+    pub fn closureBoxLocal(slot: u12) Inst {
+        return Inst.primary(.closure, Closure_.box_local, s(slot), none, none);
     }
-
-    /// jump:if-false test W  ; if falsy(resolve(test)) pc := W
-    pub fn jumpIfFalse(target_pc: u32, test_op: Operand) Inst {
-        return Inst.primaryWide(.jump, Jump.if_false, test_op, target_pc);
+    pub fn closureGetCell(dst: u12, cell: u12) Inst {
+        return Inst.primary(.closure, Closure_.get_cell, s(dst), s(cell), none);
     }
-
-    /// `closure:make dst W` per VM.md §6: a closure built from
-    /// capture descriptor W into slot `dst`.
-    pub fn closureMake(cap_desc_index: u32, dst: u12) Inst {
-        return Inst.primaryWide(.closure, Closure_.make, Operand.slot(dst), cap_desc_index);
+    pub fn closureNewCell(slot: u12) Inst {
+        return Inst.primary(.closure, Closure_.new_cell, s(slot), none, none);
     }
-
-    /// `call:call A=call_base B=argc C=result_slot` per VM.md §6
-    /// range-call ABI. Caller has already
-    /// staged closure + args at `slot[A..A+1+argc]`.
-    /// call:self window argc dst  ; the frame's own closure called
-    /// with the `argc` arguments at `window`, its result into `dst`.
-    pub fn callSelf(window: u12, argc: u12, result_slot: u12) Inst {
-        return Inst.primary(.call, Call.self_, Operand.slot(window), Operand.slot(argc), Operand.slot(result_slot));
+    pub fn closureInitCell(cell: u12, value: Operand) Inst {
+        return Inst.primary(.closure, Closure_.init_cell, s(cell), value, none);
     }
-
-    /// call:lookup dst target key  ; slot[dst] := (key target), `key`
-    /// a keyword or symbol constant.
+    pub fn callCall(base: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.call, Call.call, s(base), s(argc), s(dst));
+    }
+    pub fn callSelf(window: u12, argc: u12, dst: u12) Inst {
+        return Inst.primary(.call, Call.self_, s(window), s(argc), s(dst));
+    }
     pub fn callLookup(dst: u12, target: Operand, key: u12) Inst {
-        return Inst.primary(.call, Call.lookup, Operand.slot(dst), target, Operand.constant(key));
+        return Inst.primary(.call, Call.lookup, s(dst), target, Operand.constant(key));
     }
-
-    /// call:lookup-or dst pair key  ; slot[dst] := (key slot[pair]
-    /// slot[pair + 1]).
     pub fn callLookupOr(dst: u12, pair: u12, key: u12) Inst {
-        return Inst.primary(.call, Call.lookup_or, Operand.slot(dst), Operand.slot(pair), Operand.constant(key));
-    }
-
-    pub fn callCall(call_base: u12, argc: u12, result_slot: u12) Inst {
-        return Inst.primary(
-            .call,
-            Call.call,
-            Operand.slot(call_base),
-            Operand.slot(argc), // raw-index immediate per §4.5
-            Operand.slot(result_slot),
-        );
-    }
-
-    /// General `mov:move dst, src` where `src` may be any operand
-    /// kind that `resolve` accepts (slot / constant / upvalue).
-    /// Used by `compileSymbol` for upvalue reads:
-    /// `moveFrom(dst, Operand.upvalue(u))` lowers a captured-
-    /// binding read; `move(dst, slot_src)` is the slot-to-slot
-    /// case.
-    pub fn moveFrom(slot_dst: u12, src: Operand) Inst {
-        return Inst.primary(.mov, Mov.move, Operand.slot(slot_dst), src, Operand.none);
-    }
-
-    /// `closure:box-local A=slot` — wrap slot[A]'s current value
-    /// into a fresh `UpvalCell`, replacing slot[A] with the cell
-    /// pointer. Emission timing per COMPILER.md §6.1.
-    pub fn closureBoxLocal(slot_idx: u12) Inst {
-        return Inst.primary(.closure, Closure_.box_local, Operand.slot(slot_idx), Operand.none, Operand.none);
-    }
-
-    /// `closure:get-cell A=dst_slot B=cell_slot` — read the
-    /// contents of an `UpvalCell` whose pointer lives in slot[B];
-    /// write to slot[A]. Same-frame read of a boxed local.
-    pub fn closureGetCell(dst: u12, cell_slot: u12) Inst {
-        return Inst.primary(.closure, Closure_.get_cell, Operand.slot(dst), Operand.slot(cell_slot), Operand.none);
-    }
-
-    /// `closure:new-cell A=slot` — allocate an uninitialized
-    /// UpvalCell, store cell pointer at slot[A]. Placeholder
-    /// cell for letfn* / named fn*.
-    pub fn closureNewCell(slot_idx: u12) Inst {
-        return Inst.primary(.closure, Closure_.new_cell, Operand.slot(slot_idx), Operand.none, Operand.none);
-    }
-
-    /// `closure:init-cell A=cell_slot B=value_op` — fill
-    /// uninitialized cell at slot[A] with resolve(B); set
-    /// initialized=true. letfn* / named fn* finalize.
-    pub fn closureInitCell(cell_slot: u12, value: Operand) Inst {
-        return Inst.primary(.closure, Closure_.init_cell, Operand.slot(cell_slot), value, Operand.none);
+        return Inst.primary(.call, Call.lookup_or, s(dst), s(pair), Operand.constant(key));
     }
 };
 
@@ -7231,14 +7085,14 @@ test "VM opcodes: mov, return and operand resolution" {
 
 test "VM opcodes: coll" {
     try expectRuns(comptime &[_]RunCase{
-        .{ .name = "empty list", .code = &.{ asm_.collList(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
-        .{ .name = "list of three", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 3, 3), asm_.returnSlot(3) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 4, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "empty concat", .code = &.{ asm_.collConcat(0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
-        .{ .name = "concat (1 2) (3)", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collList(2, 1, 4), asm_.collConcat(3, 2, 5), asm_.returnSlot(5) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 6, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "concat (1 2) [3] nil", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.collList(0, 2, 3), asm_.collVector(2, 1, 4), asm_.loadNil(5), asm_.collConcat(3, 3, 6), asm_.returnSlot(6) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 7, .want = .{ .list = &.{ 1, 2, 3 } } },
-        .{ .name = "concat of a non-seqable", .code = &.{ asm_.loadConst(0, 0), asm_.collConcat(0, 1, 1), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .err = VmError.KindMismatch } },
-        .{ .name = "odd map argc", .code = &.{ asm_.collMap(0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
-        .{ .name = "args past the frame", .code = &.{ asm_.collVector(0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
+        .{ .name = "empty list", .code = &.{ asm_.coll(.list, 0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "list of three", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 3, 3), asm_.returnSlot(3) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 4, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "empty concat", .code = &.{ asm_.coll(.concat, 0, 0, 0), asm_.returnSlot(0) }, .want = .{ .list = &.{} } },
+        .{ .name = "concat (1 2) (3)", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 2, 3), asm_.coll(.list, 2, 1, 4), asm_.coll(.concat, 3, 2, 5), asm_.returnSlot(5) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 6, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat (1 2) [3] nil", .code = &.{ asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2), asm_.coll(.list, 0, 2, 3), asm_.coll(.vector, 2, 1, 4), asm_.loadNil(5), asm_.coll(.concat, 3, 3, 6), asm_.returnSlot(6) }, .consts = &.{ fx(1), fx(2), fx(3) }, .slots = 7, .want = .{ .list = &.{ 1, 2, 3 } } },
+        .{ .name = "concat of a non-seqable", .code = &.{ asm_.loadConst(0, 0), asm_.coll(.concat, 0, 1, 1), asm_.returnSlot(1) }, .consts = &.{fx(99)}, .slots = 2, .want = .{ .err = VmError.KindMismatch } },
+        .{ .name = "odd map argc", .code = &.{ asm_.coll(.map, 0, 1, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.BytecodeCorruption } },
+        .{ .name = "args past the frame", .code = &.{ asm_.coll(.vector, 0, 2, 0), asm_.returnSlot(0) }, .want = .{ .err = VmError.OperandOutOfRange } },
     });
 }
 
@@ -7253,9 +7107,9 @@ test "VM opcodes: coll:map and coll:set keep the first key and the last value" {
     const c = try kw.internKeywordValue("c");
     const consts = [_]Value{ fx(1), a, fx(2), b, c, fx(3) };
     const code = [_]Inst{
-        asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2),  asm_.loadConst(3, 3),
-        asm_.loadConst(4, 0), asm_.loadConst(5, 4), asm_.collMap(0, 6, 6), asm_.loadConst(0, 5),
-        asm_.loadConst(1, 0), asm_.loadConst(2, 5), asm_.collSet(0, 3, 7), asm_.collVector(6, 2, 0),
+        asm_.loadConst(0, 0), asm_.loadConst(1, 1), asm_.loadConst(2, 2),     asm_.loadConst(3, 3),
+        asm_.loadConst(4, 0), asm_.loadConst(5, 4), asm_.coll(.map, 0, 6, 6), asm_.loadConst(0, 5),
+        asm_.loadConst(1, 0), asm_.loadConst(2, 5), asm_.coll(.set, 0, 3, 7), asm_.coll(.vector, 6, 2, 0),
         asm_.returnSlot(0),
     };
     const routine = makeRoutine(&code, &consts, 8, "coll-dupes");
@@ -8089,7 +7943,7 @@ test "VM ctrl: a try's finally body runs after its catch; try-enter names a try 
                 asm_.returnNil(), //      5: unreached
                 asm_.loadConst(2, 1), //  6: finally
                 asm_.finallyExit(), //    7
-                asm_.collList(0, 3, 3), // 8
+                asm_.coll(.list, 0, 3, 3), // 8
                 asm_.returnSlot(3),
             },
             .consts = &.{ fx(7), fx(1) },
@@ -9415,7 +9269,7 @@ test "VM mov:move-clear: the slot it reads roots the value no more" {
     for ([_]Inst{ asm_.move(2, 1), asm_.moveClear(2, 1) }, &live) |moved, *n| {
         const code = [_]Inst{
             asm_.loadConst(0, 1),
-            asm_.collVector(0, 1, 1),
+            asm_.coll(.vector, 0, 1, 1),
             moved,
             asm_.loadNil(2),
             asm_.loadConst(3, 0),
@@ -9515,7 +9369,7 @@ test "Routine.verify: the routines it refuses, each at its instruction" {
         .{ .name = "a lookup key neither keyword nor symbol", .code = &.{ asm_.callLookup(0, sl(0), 0), r }, .err = VmError.InvalidOperandKind, .pc = 0 },
         .{ .name = "a lookup key past the pool", .code = &.{ asm_.callLookup(0, sl(0), 1), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a lookup's target and default past the frame", .code = &.{ asm_.callLookupOr(0, 1, 0), r }, .keyed = true, .err = VmError.OperandOutOfRange, .pc = 0 },
-        .{ .name = "a collection block past the frame", .code = &.{ asm_.collList(1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
+        .{ .name = "a collection block past the frame", .code = &.{ asm_.coll(.list, 1, 2, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a try past the table", .code = &.{ asm_.tryEnter(1, 0), r }, .err = VmError.OperandOutOfRange, .pc = 0 },
         .{ .name = "a catch past the code", .code = &.{ r, asm_.tryEnter(0, 0), r }, .err = VmError.OperandOutOfRange, .pc = 1 },
         .{ .name = "a capture count that is not the routine's", .code = &.{ asm_.closureMake(0, 0), r }, .caps = &counted_caps, .err = VmError.CaptureCountMismatch, .pc = 0 },
@@ -10176,9 +10030,9 @@ test "Callback batches: a cycle at every element frees nothing a batch holds" {
     var vm = try VM.init(testing.allocator, &makeRoutine(&[_]Inst{asm_.returnNil()}, &.{}, 1, "idle"));
     defer vm.deinit();
     // (fn [x] [x x]) and (fn [a x] [a x]): every call allocates.
-    const pair_code = [_]Inst{ asm_.move(1, 0), asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const pair_code = [_]Inst{ asm_.move(1, 0), asm_.coll(.vector, 0, 2, 2), asm_.returnSlot(2) };
     const pair = Routine{ .code = &pair_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 1, .name = "pair" };
-    const nest_code = [_]Inst{ asm_.collVector(0, 2, 2), asm_.returnSlot(2) };
+    const nest_code = [_]Inst{ asm_.coll(.vector, 0, 2, 2), asm_.returnSlot(2) };
     const nest = Routine{ .code = &nest_code, .consts = &.{}, .slot_count = 3, .fixed_arity = 2, .name = "nest" };
     const pair_fn = try vm.allocClosure(&pair, 0);
     const nest_fn = try vm.allocClosure(&nest, 0);
@@ -10483,7 +10337,7 @@ test "VM closure call: a call enters the member of the arity table its count pic
             code[n] = asm_.callCall(0, @intCast(argc), @intCast(9 + round));
             n += 1;
         }
-        code[n] = asm_.collList(9, 2, 9);
+        code[n] = asm_.coll(.list, 9, 2, 9);
         code[n + 1] = asm_.returnSlot(9);
         var top = makeRoutine(code[0 .. n + 2], &consts, 11, "top");
         top.capture_descs = &caps;
@@ -10661,7 +10515,7 @@ test "VM dispatch: a member's constants live while the member runs and allocates
             asm_.loadConst(1, 1),
             asm_.cmpLt(2, sl(1), kn(2)),
             asm_.jumpIfFalse(6, sl(2)),
-            asm_.collList(0, 1, 3),
+            asm_.coll(.list, 0, 1, 3),
             asm_.mathAdd(1, sl(1), kn(3)),
             asm_.jumpJmp(1),
             asm_.loadConst(4, 0),
