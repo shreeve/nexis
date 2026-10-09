@@ -622,7 +622,8 @@ instruction.
   V convention leaves a handler nine scratch registers, four of them
   its arguments, the comparisons, the arithmetic and `call:call` save
   one to six registers with `push` and `pop`; no handler there may
-  reserve or address stack, and the check lists what each saves.
+  reserve or address stack, and the check lists what each saves. It
+  also lists, for information, what the out-of-line parts save.
 - `VM.loop` is the one run loop: `run` drives it until the VM halts,
   `callValue` and `runRoutine` until the frame they pushed returns (a
   `Callback` makes the first pass itself, §6). It enters the chain at
