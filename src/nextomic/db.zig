@@ -2,8 +2,9 @@
 //!
 //! A `Conn` owns the store, the ident cache and the schema cache. A
 //! `DbValue` is a plain value `{conn, basis, as_of, since, history}`
-//! with no open read transaction: every operation opens one, reads
-//! `sys["t"]` as `now`, and closes it. A speculative `with`
+//! with no open read transaction: every operation begins its read in
+//! the file's held snapshot or a fresh one (`docs/DB.md` §3.4), reads
+//! `sys["t"]` as `now`, and ends by keeping it. A speculative `with`
 //! (transact.zig) makes a second `Conn` over the same store whose
 //! reads are read-only children of the held write transaction, with
 //! ident and schema caches of its own. Invariants:
@@ -13,7 +14,7 @@
 //!   - `now < basis` is `error.BasisInFuture`; the db-value is dead.
 //!   - `as-of T` caps the view at `min(basis, T)`; `since T` shows only
 //!     facts asserted after `T`; `history` shows every row unfolded, and
-//!     composes with `as-of`.
+//!     composes with `as-of` and `since`.
 //!   - Out-of-line values are confirmed and materialised from their
 //!     payload, in the current EAVT row or the EAVT-h assertion row,
 //!     before a datom is returned.
@@ -240,7 +241,7 @@ pub const Conn = struct {
     /// write transaction. Ends with `endReadTxn`.
     pub fn beginReadTxn(self: *Conn) !*Txn {
         if (!self.is_open) return error.Closed;
-        const txn = if (self.overlay) |w| try self.store.beginReadChild(w) else self.store.file.takeHeld() orelse try self.store.beginRead();
+        const txn = if (self.overlay) |w| try w.beginReadChild() else self.store.file.takeHeld() orelse try self.store.beginRead();
         errdefer txn.abort();
         try self.idents.refresh(txn);
         self.busy += 1;
@@ -683,7 +684,7 @@ pub const DatomScan = struct {
         if (row.current) {
             return (try store.currentPayload(self.read.txn, parts.e, parts.a, vbytes, self.arena)) orelse error.Corrupted;
         }
-        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }, self.arena));
+        return self.arena.dupe(u8, try store.historyPayload(self.read.txn, parts.e, parts.a, vbytes, .{ .t = row.t, .added = row.added }));
     }
 };
 
@@ -750,7 +751,7 @@ const TxCtx = struct {
                 if (cur.t == t) return if (cur.rest.len == 0) error.Corrupted else cur.rest;
             }
         }
-        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added }, self.arena);
+        return store.historyPayload(self.txn, e, a, vbytes, .{ .t = t, .added = added });
     }
 };
 

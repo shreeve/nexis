@@ -21,8 +21,8 @@
 //!   - Bootstrap ids are fixed (`boot`): every store has `:db/ident` at
 //!     1, `:db.unique/value` at 21 and `:db/fulltext` at 22.
 //!   - A current fact's latest assertion lives in the current trees
-//!     alone, whose values are `[t:6]`, `nx/eavt`'s followed by an
-//!     out-of-line value's payload. The history trees hold every other
+//!     alone, whose values are its `t` as a LEB128, `nx/eavt`'s
+//!     followed by an out-of-line value's payload. The history trees hold every other
 //!     row (H1: a fact's history rows alternate assertion and
 //!     retraction, and end with a retraction); their values are empty
 //!     but on an `nx/eavt-h` assertion row of an out-of-line value,
@@ -352,14 +352,6 @@ pub const Store = struct {
         return self.file.env.beginRead();
     }
 
-    /// Begin a read-only child of the open write transaction `parent`,
-    /// seeing its uncommitted state. The parent refuses mutations and
-    /// commit until the child is finished.
-    pub fn beginReadChild(self: *Store, parent: *Txn) !*Txn {
-        _ = self;
-        return parent.beginReadChild();
-    }
-
     /// Begin the write transaction: `error.WriterActive` while any store
     /// or `db/*` connection of the file holds it
     /// (`db.StoreFile.beginWrite`).
@@ -395,8 +387,11 @@ pub const Store = struct {
         try txn.putInTree(self.trees.sys, name, bytes);
     }
 
-    fn sysGetInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize) !u64 {
-        const raw = (try self.sysGet(txn, name)) orelse return error.Corrupted;
+    /// The big-endian integer `sys` holds under `name` in `width`
+    /// bytes, or `absent` when it holds none; absent with no default,
+    /// or of another width, it is `error.Corrupted`.
+    fn sysGetInt(self: *Store, txn: *Txn, name: []const u8, comptime width: usize, absent: ?u64) !u64 {
+        const raw = (try self.sysGet(txn, name)) orelse return absent orelse error.Corrupted;
         if (raw.len != width) return error.Corrupted;
         return std.mem.readInt(@Int(.unsigned, width * 8), raw[0..width], .big);
     }
@@ -409,7 +404,7 @@ pub const Store = struct {
 
     /// Last committed logical transaction number.
     pub fn readT(self: *Store, txn: *Txn) !u64 {
-        const t = try self.sysGetInt(txn, "t", 6);
+        const t = try self.sysGetInt(txn, "t", 6, null);
         return if (t >= key.tx_partition_bit) error.Corrupted else t;
     }
 
@@ -419,7 +414,7 @@ pub const Store = struct {
 
     /// Next user entity id.
     pub fn readNextEid(self: *Store, txn: *Txn) !u64 {
-        const eid = try self.sysGetInt(txn, "eid", 6);
+        const eid = try self.sysGetInt(txn, "eid", 6, null);
         return if (eid < key.user_partition_start or eid > key.user_partition_end) error.Corrupted else eid;
     }
 
@@ -427,10 +422,11 @@ pub const Store = struct {
         try self.sysPutInt(txn, "eid", 6, eid);
     }
 
-    /// Next attribute / ident id.
+    /// Next attribute / ident id: past the bootstrap's, which an id
+    /// minted again would collide with.
     pub fn readNextAid(self: *Store, txn: *Txn) !u32 {
-        const aid = try self.sysGetInt(txn, "aid", 4);
-        return if (aid == 0) error.Corrupted else @intCast(aid);
+        const aid = try self.sysGetInt(txn, "aid", 4, null);
+        return if (aid < boot.next_aid) error.Corrupted else @intCast(aid);
     }
 
     pub fn writeNextAid(self: *Store, txn: *Txn, aid: u32) !void {
@@ -446,19 +442,13 @@ pub const Store = struct {
 
     /// Number of current datoms of attribute `a` (AEVT entries).
     pub fn attrCount(self: *Store, txn: *Txn, a: u32) !u64 {
-        const k = countKey(a);
-        const raw = (try self.sysGet(txn, &k)) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
+        const n = try self.sysGetInt(txn, &countKey(a), 8, 0);
         // No attribute holds more current datoms than there are ids.
-        const n = std.mem.readInt(u64, raw[0..8], .big);
         return if (n > key.id_max) error.Corrupted else n;
     }
 
     pub fn writeAttrCount(self: *Store, txn: *Txn, a: u32, n: u64) !void {
-        const k = countKey(a);
-        var buf: [8]u8 = undefined;
-        std.mem.writeInt(u64, &buf, n, .big);
-        try self.sysPut(txn, &k, &buf);
+        try self.sysPutInt(txn, &countKey(a), 8, n);
     }
 
     // ── idents ────────────────────────────────────────────────────
@@ -486,7 +476,7 @@ pub const Store = struct {
 
     pub fn identNameById(self: *Store, txn: *Txn, id: u32) !?[]const u8 {
         var k: [1 + key.attr_len]u8 = undefined;
-        k[0] = 0x01;
+        k[0] = ident_by_id;
         key.writeAttr(k[1..], id);
         return txn.getFromTree(self.trees.idents, &k);
     }
@@ -545,9 +535,7 @@ pub const Store = struct {
     /// may have moved. Absent in a store with no renames, which reads
     /// as 0.
     pub fn readIdentGen(self: *Store, txn: *Txn) !u64 {
-        const raw = (try self.sysGet(txn, "ig")) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
-        return std.mem.readInt(u64, raw[0..8], .big);
+        return self.sysGetInt(txn, "ig", 8, 0);
     }
 
     fn writeIdentGen(self: *Store, txn: *Txn, gen: u64) !void {
@@ -580,9 +568,7 @@ pub const Store = struct {
     /// Schema generation: bumped by every transaction that writes a
     /// datom on an attribute-partition entity; absent reads as 0.
     pub fn readSchemaGen(self: *Store, txn: *Txn) !u64 {
-        const raw = (try self.sysGet(txn, "sg")) orelse return 0;
-        if (raw.len != 8) return error.Corrupted;
-        return std.mem.readInt(u64, raw[0..8], .big);
+        return self.sysGetInt(txn, "sg", 8, 0);
     }
 
     pub fn bumpSchemaGen(self: *Store, txn: *Txn) !void {
@@ -764,12 +750,8 @@ pub const Store = struct {
     /// into `arena`: its current EAVT value after `t`; null when the
     /// fact is not current.
     pub fn currentPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, arena: Allocator) !?[]const u8 {
-        if (vbytes.len > key.max_val_len) return error.Corrupted;
         var buf: [key.max_key_len]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
-        try key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, null);
-        const row = (try txn.getFromTree(self.trees.cur(.eavt), k.items)) orelse return null;
+        const row = (try txn.getFromTree(self.trees.cur(.eavt), try eavtKey(&buf, e, a, vbytes, null))) orelse return null;
         const cur = try key.readCurrent(row);
         if (cur.rest.len == 0) return error.Corrupted;
         return try arena.dupe(u8, cur.rest);
@@ -779,15 +761,15 @@ pub const Store = struct {
     /// an assertion's EAVT-h value, or, for a retraction, which holds
     /// nothing, the value of the row before it, the assertion it
     /// retracts. Borrows the transaction's snapshot.
-    pub fn historyPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, top: key.Top, arena: Allocator) ![]const u8 {
-        const k = try key.keyBytes(arena, .eavt, e, a, vbytes, top);
+    pub fn historyPayload(self: *Store, txn: *Txn, e: u64, a: u32, vbytes: []const u8, top: key.Top) ![]const u8 {
+        var buf: [key.max_key_len]u8 = undefined;
+        const k = try eavtKey(&buf, e, a, vbytes, top);
         var c = try txn.openCursorForTree(self.trees.hist(.eavt));
-        _ = c.set(k) orelse {
+        const at = c.set(k) orelse {
             try ended(&c);
             return error.Corrupted;
         };
-        const row = if (top.added) c.current() else c.prev();
-        const found = row orelse {
+        const found = (if (top.added) at else c.prev()) orelse {
             try ended(&c);
             return error.Corrupted;
         };
@@ -795,6 +777,19 @@ pub const Store = struct {
         if (found.key.len != k.len or !std.mem.eql(u8, found.key[0..fact_len], k[0..fact_len])) return error.Corrupted;
         if (!(try key.readTop(found.key[fact_len..][0..key.top_len])).added or found.value.len == 0) return error.Corrupted;
         return found.value;
+    }
+
+    /// The EAVT key of `(e a v)`, a history key when `top` is given, in
+    /// `buf`. A value section past `key.max_val_len`, which only damaged
+    /// bytes give, is `error.Corrupted`.
+    fn eavtKey(buf: *[key.max_key_len]u8, e: u64, a: u32, vbytes: []const u8, top: ?key.Top) ![]const u8 {
+        var fba = std.heap.FixedBufferAllocator.init(buf);
+        var k: std.ArrayList(u8) = try .initCapacity(fba.allocator(), buf.len);
+        key.packKey(&k, fba.allocator(), .eavt, e, a, vbytes, top) catch |err| return switch (err) {
+            error.OutOfMemory => error.Corrupted,
+            else => err,
+        };
+        return k.items;
     }
 
     // ── scans ─────────────────────────────────────────────────────
@@ -1536,8 +1531,8 @@ test "an out-of-line value is stored once in the index trees, beside its current
         try testing.expectEqual(@as(u64, 2), try Store.treeEntries(txn, store.trees.hist(.eavt)));
         try testing.expectEqualStrings(long, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 3, .added = true }))).?);
         try testing.expectEqual(0, (try txn.getFromTree(store.trees.hist(.eavt), try key.keyBytes(arena, .eavt, e, 101, v, .{ .t = 4, .added = false }))).?.len);
-        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 3, .added = true }, arena));
-        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 4, .added = false }, arena));
+        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 3, .added = true }));
+        try testing.expectEqualStrings(long, try store.historyPayload(txn, e, 101, v, .{ .t = 4, .added = false }));
     }
     {
         const w = try store.beginWrite(.none);
@@ -1665,6 +1660,9 @@ test "sys counters outside their partitions are corrupt" {
     try store.sysPutInt(txn, "eid", 6, 5);
     try testing.expectError(error.Corrupted, store.readNextEid(txn));
     try store.sysPutInt(txn, "aid", 4, 0);
+    try testing.expectError(error.Corrupted, store.readNextAid(txn));
+    // Below the bootstrap's: the next mint would reuse a bootstrap id.
+    try store.sysPutInt(txn, "aid", 4, boot.fulltext);
     try testing.expectError(error.Corrupted, store.readNextAid(txn));
 }
 

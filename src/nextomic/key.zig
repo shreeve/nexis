@@ -36,8 +36,7 @@ const Allocator = std.mem.Allocator;
 // Widths and limits
 // =============================================================================
 
-/// Bytes of an entity id or a `t` in a fixed field: `sys`, the
-/// current trees' values, the txlog's keys.
+/// Bytes of an entity id or a `t` in a fixed field of `sys`.
 pub const id_len = 6;
 /// Bytes of an attribute or ident id in the `sys` and `nx/idents` trees.
 pub const attr_len = 4;
@@ -645,7 +644,9 @@ pub const DecodeError = error{ Corrupted, OutOfMemory };
 /// Decode one value encoding. `bytes` must hold exactly one encoding
 /// (the caller slices `v` out of the key by the fixed suffix). Strings
 /// and byte arrays are copied, unescaped, into `gpa`; digests borrow
-/// their prefix from `bytes`.
+/// their prefix from `bytes`. An inline value past `inline_max` bytes,
+/// or an out-of-line prefix of any length but `prefix_len`, is
+/// `error.Corrupted`, so a decoded encoding is at most `max_val_len`.
 pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
     if (bytes.len == 0) return error.Corrupted;
     const tag = tagFromByte(bytes[0]) orelse return error.Corrupted;
@@ -678,13 +679,16 @@ pub fn decodeVal(gpa: Allocator, bytes: []const u8) DecodeError!KeyVal {
         .string, .bytes => {
             const r = try unescapeFrom(gpa, body);
             if (r.consumed == body.len) {
+                if (r.bytes.len > inline_max) return error.Corrupted;
                 return if (tag == .string) .{ .val = .{ .string = r.bytes } } else .{ .val = .{ .bytes = r.bytes } };
             }
-            // Out of line: the bare 0x00 ends the escaped prefix, then the
-            // marker and the hash fill the rest exactly.
+            // Out of line: the bare 0x00 ends the escaped prefix of
+            // exactly `prefix_len` bytes, then the marker and the hash
+            // fill the rest exactly.
+            const prefix = r.bytes.len;
             gpa.free(r.bytes);
             const sep = r.consumed - 1;
-            if (body.len != sep + 2 + hash_len or body[sep + 1] != out_of_line_mark) return error.Corrupted;
+            if (prefix != prefix_len or body.len != sep + 2 + hash_len or body[sep + 1] != out_of_line_mark) return error.Corrupted;
             const d: Digest = .{
                 .prefix = body[0..sep],
                 .hash = std.mem.readInt(u128, body[sep + 2 ..][0..hash_len], .big),
@@ -829,7 +833,10 @@ pub fn keyBytes(gpa: Allocator, index: Index, e: u64, a: u32, vbytes: []const u8
     return gpa.dupe(u8, out.items);
 }
 
-/// Decode a key of `index`. `history` selects the trailing `top`.
+/// Decode a key of `index`. `history` selects the trailing `top`. A
+/// value section longer than any encoding (`max_val_len`) is
+/// `error.Corrupted`, so a key rebuilt from the parts fits
+/// `max_key_len`.
 pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts {
     const suffix_top: usize = if (history) top_len else 0;
     if (key.len < suffix_top) return error.Corrupted;
@@ -867,6 +874,7 @@ pub fn unpackKey(index: Index, history: bool, key: []const u8) DecodeError!Parts
             if (at != body.len) return error.Corrupted;
         },
     }
+    if (parts.v.len > max_val_len) return error.Corrupted;
     return parts;
 }
 
@@ -1147,4 +1155,28 @@ test "ids and tops read from bytes are range-checked" {
     k[id_len] = 1;
     k[id_len + 1] = @backingInt(Tag.bool_true);
     try testing.expectError(error.Corrupted, unpackKey(.eavt, false, &k));
+}
+
+test "a value encoding or a key value section longer than its shape allows is Corrupted" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tag = @backingInt(Tag.string);
+    // An inline string one byte past `inline_max`.
+    const long = [_]u8{tag} ++ @as([inline_max + 1]u8, @splat('a')) ++ [_]u8{0};
+    try testing.expectError(error.Corrupted, decodeVal(arena, &long));
+    // Out-of-line prefixes one byte short of `prefix_len`, and far past it.
+    const hash = [_]u8{ 0, out_of_line_mark } ++ @as([hash_len]u8, @splat(7));
+    const short = [_]u8{tag} ++ @as([prefix_len - 1]u8, @splat('a')) ++ hash;
+    try testing.expectError(error.Corrupted, decodeVal(arena, &short));
+    const huge = [_]u8{tag} ++ @as([1100]u8, @splat('a')) ++ hash;
+    try testing.expectError(error.Corrupted, decodeVal(arena, &huge));
+    // An EAVT key whose value section passes `max_val_len`.
+    var k: std.ArrayList(u8) = .empty;
+    try appendEntity(&k, arena, 1 << 33);
+    try appendOrdered(&k, arena, 100);
+    try k.append(arena, tag);
+    try k.appendNTimes(arena, 'a', max_val_len);
+    try k.append(arena, 0);
+    try testing.expectError(error.Corrupted, unpackKey(.eavt, false, k.items));
 }
