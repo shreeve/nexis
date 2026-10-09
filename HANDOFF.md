@@ -247,8 +247,9 @@ index order; current and history trees are separate; `t` is
 Nextomic's own counter in `nx/sys`, never the engine's `txnId`; a
 db-value is a plain `{store, basis, mode}` holding no read
 transaction; every operation allocates in its own arena and copies
-only results into the VM heap; a Nextomic error is a map
-`{:error :nextomic/... ...}` or a bare keyword.
+only results into the VM heap; a Nextomic error is always a map,
+`{:error :nextomic/... :message m ...}`, naming the attribute, value,
+entity or variable at fault (`docs/NEXTOMIC.md` §7).
 
 ### 3.6 Namespaces
 
@@ -374,15 +375,14 @@ failing test (AGENTS.md).
 
 ### 6.3 Storage
 
-1. **Engine bounds surface as bare keywords**: a `db/*` key past
-   4078 bytes, a stored value past just under 1 GiB and a file's 129th
-   named tree are `:db/key-too-large`, `:db/value-too-large` and
-   `:db/max-trees`, which name the bound but not its value or the
-   size that crossed it (`docs/DB.md` §8 gives the values). They are
-   emdb's, fixed by the pinned 16 KiB page. Next, an owner's call:
-   throw `{:error :db/key-too-large :limit 4078 :size n}` maps (a
-   `catch` on the keyword still takes them; `=` against the keyword
-   no longer does, so the `.out` files and DB.md §8 change with it).
+1. **Engine bounds name no size**: a `db/*` key past 4078 bytes, a
+   stored value past just under 1 GiB and a file's 129th named tree
+   are caught as `{:error :db/key-too-large :message "db key too
+   large" ...}`, `:db/value-too-large` and `:db/max-trees`, which name
+   the bound but not its value or the size that crossed it
+   (`docs/DB.md` §8 gives the values). They are emdb's, fixed by the
+   pinned 16 KiB page. Next: add `:limit 4078 :size n` to the map
+   and a sentence that names them.
 
 ### 6.4 Build and platform
 
