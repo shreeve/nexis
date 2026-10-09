@@ -2484,7 +2484,7 @@ fn expandDefrecord(ctx: *ExpandContext, call_form: *const Form, args: []const *F
 
 /// One arity `([this p...] body...)` of an inline `defrecord` method
 /// with the record's fields in scope, as in Clojure: `([g p...]
-/// (let* [f (nexis.core/get g :f) ...] (let [this g] body...)))`. A
+/// (let* [f (:f g) ...] (let [this g] body...)))`. A
 /// field named anywhere in the parameters is left out, so a
 /// parameter shadows it; a field assoc'd onto the record is what the
 /// method sees.
@@ -2496,7 +2496,7 @@ fn recordArity(b: Builder, fields: []const *Form, arity: *const Form) ExpandErro
     var bindings: std.ArrayList(*Form) = .empty;
     for (fields) |field| {
         if (try namesSymbol(items[0], field.datum.symbol.name)) continue;
-        try bindings.appendSlice(b.ctx.allocator, &.{ field, try b.list(.{ "nexis.core/get", g, try b.kw(field.datum.symbol.name) }) });
+        try bindings.appendSlice(b.ctx.allocator, &.{ field, try getCall(b, g, try b.kw(field.datum.symbol.name), null) });
     }
     const body = try b.list(.{ "nexis.core/let", try b.vec(.{ params[0], g }), items[1..] });
     return b.list(.{ try b.vec(.{ g, params[1..] }), try b.list(.{ "let*", try b.vec(.{bindings.items}), body }) });

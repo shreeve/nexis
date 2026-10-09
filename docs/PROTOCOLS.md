@@ -210,7 +210,7 @@ by the argument count or raises `:arity-mismatch` (§4.2).
     (defn Counter? [x] (and (nexis.internal/#%record? x)
                             (nexis.core/= Counter-type-id (nexis.internal/#%record-type-id x))))
     (nexis.internal/#%extend-record-impl IFoo :bar Counter-type-id
-      (fn [g x] (let* [n (nexis.core/get g :n)] (let [this g] (+ x n))))))
+      (fn [g x] (let* [n (:n g)] (let [this g] (+ x n))))))
 ```
 
 - The name and each field must be unqualified symbols.
@@ -226,7 +226,7 @@ by the argument count or raises `:arity-mismatch` (§4.2).
   a variadic arity included; two arities with the same count fail as
   `fn`'s overloads do.
 - Inside an inline method each field is a local bound to
-  `(get this :field)`, as in Clojure, so a field assoc'd onto the
+  `(:field this)`, `get`'s lookup in one instruction, as in Clojure, so a field assoc'd onto the
   record is what the method sees; a field whose name appears anywhere
   in the method's parameters is not bound, so the parameter shadows
   it.
