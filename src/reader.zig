@@ -17,7 +17,7 @@
 //!   - Tag `(syntax-quote x)` only: auto-qualification, auto-gensym and
 //!     unquote expansion live in the macroexpander (MACROEXPAND.md).
 //!
-//! `readForm` calls `stack.check` on entry, so input nested past the stack's
+//! `readOneForm` calls `stack.check` on entry, so input nested past the stack's
 //! budget is `:nesting-too-deep`, and each Form's span comes from its
 //! tokens in O(1). An integer literal beyond i64, in any radix, is a
 //! `bigint` carrying canonical decimal text, so the compiler lifts it into
@@ -210,13 +210,7 @@ pub const Reader = struct {
     /// Normalize a top-level `(program forms...)` sexp into a slice of
     /// Forms.
     pub fn readProgram(self: *Reader, tree: Sexp) ReaderError![]const *Form {
-        if (!tree.isKind(.program)) return self.fail(.unknown_reader_construct, sexpSpan(tree), null);
         return try self.readFormsList(tree.items()[1..]);
-    }
-
-    /// Normalize a single `form` sexp into one `*Form`.
-    pub fn readOneForm(self: *Reader, tree: Sexp) ReaderError!*Form {
-        return try self.readForm(tree);
     }
 
     // -------------------------------------------------------------------------
@@ -227,7 +221,7 @@ pub const Reader = struct {
     /// forms: an atom holds its one token, a compound its children
     /// between its delimiter tokens, a prefix form its token and its
     /// target (`nexis.grammar`).
-    fn readForm(self: *Reader, s: Sexp) ReaderError!*Form {
+    pub fn readOneForm(self: *Reader, s: Sexp) ReaderError!*Form {
         stack.check() catch return self.fail(.nesting_too_deep, sexpSpan(s), null);
         const items = s.items();
         if (items.len < 2 or items[0] != .tag or items[1] != .src)
@@ -269,7 +263,7 @@ pub const Reader = struct {
 
     fn readFormsList(self: *Reader, items: []const Sexp) ReaderError![]const *Form {
         const out = try self.allocator().alloc(*Form, items.len);
-        for (items, out) |item, *f| f.* = try self.readForm(item);
+        for (items, out) |item, *f| f.* = try self.readOneForm(item);
         return out;
     }
 
@@ -320,13 +314,9 @@ pub const Reader = struct {
         return try self.makeForm(.{ .real = value }, span);
     }
 
+    /// The scanner's string token runs from its `"` to its closing one.
     fn readString(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
-            return self.fail(.invalid_string_escape, span, raw);
-        }
-        const body = raw[1 .. raw.len - 1];
-        const decoded = try self.decodeStringEscapes(body, span);
+        const decoded = try self.decodeStringEscapes(text[1 .. text.len - 1], span);
         return try self.makeForm(.{ .string = decoded }, span);
     }
 
@@ -353,26 +343,18 @@ pub const Reader = struct {
         }
     }
 
+    /// The scanner's char token is `\` and at least one byte.
     fn readChar(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != '\\') {
-            return self.fail(.invalid_char_literal, span, raw);
-        }
-        const body = raw[1..];
-        const scalar = parseCharLiteral(body) orelse
-            return self.fail(.invalid_char_literal, span, raw);
+        const scalar = parseCharLiteral(text[1..]) orelse
+            return self.fail(.invalid_char_literal, span, text);
         return try self.makeForm(.{ .char = scalar }, span);
     }
 
+    /// The scanner's keyword token is `:` and at least one byte.
     fn readKeyword(self: *Reader, text: []const u8, span: SrcSpan) ReaderError!*Form {
-        const raw = text;
-        if (raw.len < 2 or raw[0] != ':') {
-            return self.fail(.invalid_keyword, span, raw);
-        }
-        if (!std.unicode.utf8ValidateSlice(raw)) return self.fail(.invalid_utf8, span, null);
-        const body = raw[1..];
-        const name = splitNamespace(body) orelse
-            return self.fail(.invalid_keyword, span, raw);
+        if (!std.unicode.utf8ValidateSlice(text)) return self.fail(.invalid_utf8, span, null);
+        const name = splitNamespace(text[1..]) orelse
+            return self.fail(.invalid_keyword, span, text);
         return try self.makeForm(.{ .keyword = name }, span);
     }
 
@@ -449,7 +431,7 @@ pub const Reader = struct {
             .unquote, .@"unquote-splicing" => self.syntax_quote_depth += 1,
             else => {},
         };
-        const inner = try self.readForm(items[2]);
+        const inner = try self.readOneForm(items[2]);
         const datum: Datum = switch (tag) {
             .quote => .{ .quote = inner },
             .deref => .{ .deref = inner },
@@ -467,7 +449,7 @@ pub const Reader = struct {
     fn readVarQuote(self: *Reader, s: Sexp) ReaderError!*Form {
         const items = s.items();
         const head = try self.makeForm(.{ .symbol = .{ .ns = null, .name = "var" } }, tokenSpan(items[1].src));
-        const inner = try self.readForm(items[2]);
+        const inner = try self.readOneForm(items[2]);
         const list = try self.allocator().dupe(*Form, &.{ head, inner });
         return try self.makeForm(.{ .list = list }, spanTo(items[1].src.pos, inner.origin));
     }
@@ -494,7 +476,7 @@ pub const Reader = struct {
             try metas.append(self.allocator(), items[3]);
             current = items[2];
         }
-        const target = try self.readForm(current);
+        const target = try self.readOneForm(current);
         const span = spanTo(s.items()[1].src.pos, target.origin);
         const merged = try self.mergeMetaChain(metas.items, span);
         return try self.makeForm(.{ .with_meta = .{ .target = target, .meta = merged } }, span);
@@ -511,7 +493,7 @@ pub const Reader = struct {
         var i = raw_metas.len;
         while (i > 0) {
             i -= 1;
-            const m = try self.readForm(raw_metas[i]);
+            const m = try self.readOneForm(raw_metas[i]);
             try self.appendMetaEntries(&entries, m, span);
         }
         // Walk the pairs from the end, keeping each literal key's last
