@@ -774,8 +774,12 @@ What the database rows say:
 - Durable against durable, Nextomic's commit (two `fdatasync`,
   2.25 ms) is 12% slower than Datalevin's (one `fdatasync` and an
   `O_DSYNC` write, 2.01 ms) and 2.4× faster than Datomic Local's
-  (5.45 ms). A durable load of 100,000 entities takes 1.33 s, against
-  3.63 s and 9.79 s.
+  (5.45 ms). The flushes are not the difference: the smallest emdb
+  commit nexis makes takes 1.82 ms, level with LMDB's. A one-datom
+  Nextomic transaction writes 14 pages of 16 KiB, half of them the
+  transaction entity and the history Datalevin does not keep, where
+  Datalevin's writes 13 of 4 KiB (§3 "Durable commits"). A durable
+  load of 100,000 entities takes 1.33 s, against 3.63 s and 9.79 s.
 - `create` is a new file: emdb syncs the file's first pages and its
   directory when it creates the file (two `fdatasync` and an `fsync`
   of the directory, `strace -T`), most of the phase's 6 ms.
@@ -2479,6 +2483,100 @@ What the rows say:
   convention: the gate, its `deep-calls` and `deep-recursion` CLI
   goldens among it, passes on the Linux host.
 
+### 3.39 Durable commits, Linux x86-64 and Apple M5
+
+What a durable commit costs and where its time goes, on the Linux host
+of §3.15 (ext4 on NVMe), against Datalevin 1.1's commit, which syncs.
+A probe program commits 300 transactions of one shape through a
+connection opened `{:durability :durable}` and times each; its
+Datalevin twin commits the same transactions in Datalevin's default
+mode; a `db/*` probe puts one value under one key per commit, the
+smallest commit nexis makes. Both databases hold §3.15's load of
+100,000 people. The device's flush on this host moves, over tens of
+seconds and from activity outside the run, between about 0.9 ms and
+2 ms or more; the table takes the rounds, from five runs, in which
+the device stayed in its fast state for every run compared (seven for
+`db/*`, six for the datom and the entity, five for the upsert), the
+probes alternating within each round: the median, the range in
+brackets, and the median of the rounds' ratios. The `:commit`
+column is the same transactions with `{:durability :commit}`, a
+thousand of each. One ReleaseFast build of `bd2cf5c`. Provenance:
+§11.
+
+| Commit | pages | `:commit` | durable | Datalevin | ÷ Datalevin |
+|---|---:|---:|---:|---:|---:|
+| `db/*`, 8 bytes | 3 | 1.4 μs | 1.82 ms [1.81–1.89] | | |
+| `db/*`, 64 KiB | 8 | 10 μs | 1.96 ms [1.93–1.99] | | |
+| one datom by lookup ref, a salary replaced | 14 | 13 μs | 2.22 ms [2.15–2.32] | 1.98 ms [1.97–2.03] | 1.12 [1.06–1.18] |
+| one new entity, five attributes | 20 | 18 μs | 2.33 ms [2.27–2.43] | 2.02 ms [2.00–2.17] | 1.16 [1.05–1.21] |
+| upsert by the unique email, one of five changed | 14 | 13 μs | 2.23 ms [2.19–2.29] | 2.01 ms [1.99–2.08] | 1.10 [1.08–1.15] |
+
+*Pages* are the 16 KiB pages a commit writes, counted from emdb's
+dirty-page table as the commit seals them (a build that printed it,
+not committed). The one-datom transaction's fourteen:
+
+| Tree | pages | What |
+|---|---:|---|
+| EAVT | 4 | the person's leaf and the transaction entity's, and their branches |
+| AEVT | 3 | the salary's leaf and `:db/txInstant`'s, and their branch |
+| AVET | 2 | `:db/txInstant`, which Datomic indexes too |
+| EAVT-h, AEVT-h | 2 | the retired salary and its retraction |
+| `nx/sys` | 1 | `t`, the attribute counts, the full-text stamp |
+| `nx/txlog` | 1 | the transaction's entry |
+| emdb's main tree and free list | 1 | the records of the trees that changed |
+
+What the rows say:
+
+- nexis does nothing at a durable commit beyond emdb's minimum. Under
+  `strace -f` a Nextomic commit is emdb's two `fdatasync` and no other
+  system call: no further sync or write transaction. Its one read
+  transaction, the report's, which resolves the tx-data's idents and
+  is kept as the held snapshot (`docs/DB.md` §3.4), is about 3% of a
+  transaction's instructions (§3.27) and calls nothing in the kernel.
+  emdb's durable commit is level with LMDB's (515 against 521 commits
+  a second on ext4, the engine owner's run; the second flush costs
+  about 886 μs in any form), and the smallest one through nexis,
+  three pages, takes 1.82 ms here.
+- The gap is the pages. Each 16 KiB page past the smallest commit
+  costs about 25 μs written contiguously (the 64 KiB value's five
+  overflow pages) and about 35 μs spread over the trees (the datom's
+  eleven): the kernel writes it back, the device takes it before the
+  flush, and the next commit's first write to each of its four 4 KiB
+  pages faults, the flush having cleaned them. A durable datom
+  commit takes 52 page faults and 172 μs on the CPU (`perf stat`),
+  the smallest commit 7 faults and 80 μs. Datalevin writes 13 pages
+  of 4 KiB with `pwrite` and `writev`, 54 KB, then its flush and its
+  meta page through an `O_DSYNC` descriptor: a quarter of Nextomic's
+  224 KiB.
+- Six or seven of the datom's fourteen pages hold what Datalevin
+  does not write: the transaction entity's `:db/txInstant` datom in
+  EAVT, AEVT and AVET (4 to 5 pages; Datalevin, as DataScript,
+  records no transaction entity) and the history rows of the replaced
+  salary (2). At 35 μs a page they are the 0.24 ms between the two
+  systems.
+  The levers are the format's, measured and not built (§6 "Fewer
+  pages per durable commit").
+
+**What each default costs a program.** The whole process's work,
+start to `release`, of a program that creates a store, transacts a
+two-attribute schema and N one-entity transactions; `:commit` syncs
+once, at `release`. The Linux figures are the fast state's (five runs
+each); the M5's are APFS with `F_FULLFSYNC`, shared with concurrent
+sessions (three runs each). §3.15's load (100 transactions of 1,000
+people) is the `bench/compare` phase (Linux: the median of ten rounds,
+and the four durable rounds in the fast state; the M5: two runs).
+
+| Program | Linux `:commit` | Linux durable | M5 `:commit` | M5 durable |
+|---|---:|---:|---:|---:|
+| one transaction | 9.7–11.9 ms | 16.9–23.0 ms | 10.4–13.3 ms | 30.6–32.9 ms |
+| 1,000 transactions | 16.7–21.6 ms | 2.13–2.16 s | 16.5–22.9 ms | 5.96–7.42 s |
+| §3.15's load | 382 ms | 1.02–1.09 s | 318–336 ms | 1.33–2.18 s |
+
+A program of a few transactions pays a few milliseconds for durable
+commits; one of many small transactions pays a device flush for
+each, 2 ms here and 6–7 ms on the M5, which batching them into fewer
+transactions, or `:commit`, avoids.
+
 ## 6. Levers and dead ends
 
 Each lever is a measured change: a before/after from `zig build bench`
@@ -2505,6 +2603,21 @@ Each lever is a measured change: a before/after from `zig build bench`
   would save part of a `:commit` transaction's cost, about 18 μs in
   all (§3.11), at the price of holding the writer between natives. A `:durable` commit's two device flushes are the other
   cost left; group commit under one flush would divide it.
+- **Fewer pages per durable commit** (§3 "Durable commits"): a
+  durable commit pays about 35 μs for each 16 KiB page it writes past
+  emdb's smallest, and a one-datom transaction writes 14. Every lever
+  left changes the store's format (`docs/NEXTOMIC.md` §2):
+  - The transaction entity's `:db/txInstant` datom takes 4 to 5 of
+    the 14 pages, in EAVT, AEVT and AVET, as Datomic keeps it. Read
+    from the txlog and merged into scans of those indexes instead, it
+    would cost every query and pull that touches transaction
+    entities a second source; about 0.15 ms a durable commit.
+  - The history rows of a retraction take 2, the price of the time
+    views.
+  - A 4 KiB page would write a quarter of the bytes for the pages a
+    transaction dirties, with deeper trees and a quarter of the key
+    bound (`docs/NEXTOMIC.md` §2); the page size is fixed for a
+    file's life (`docs/DB.md` §3).
 - **Store size** (§3.36: 51 MB on the M5, 52 MB on Linux; 1.24×
   Datalevin, which keeps no history, 2.1× Datomic Local and 2.9×
   Datomic Pro). Four levers are pulled: emdb's insert hint, history
@@ -2954,4 +3067,5 @@ is one invocation's 30-sample median.
 | §3.36, §3.11's and §3.15's store rows, §6 "Store size" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1, Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` (`8e1ed1e` for the v0.1.0 stage, a source snapshot), shared with concurrent sessions (load 6–45); and the Linux host of §3.15, Zig 0.17.0 (`tools/zig-0.17`; `run.clj` reports the host's default `zig`), emdb `b3370fb` (a source snapshot) | 2026-10-08, store. Sizes: `zig build bench -Doptimize=fast -- --filter nextomic-store` at each stage's commit (snapshots of `0d5f691` under both emdbs, `f4b2072`, `4dd916a`, `05ed7a1`). Reads on the M5: `q.nx STORE MODE N` (a probe over the `nexis-load.nx` store, its churn variant after two rounds of 20,000 salary changes) under `tools/heavy /usr/bin/time -l`, N1 and N2 per mode, three interleaved rounds, `78f0f3b` against `b2c4eaa`. Transactions on the M5: `tx.nx STORE N MODE` (§3.27's probe plus a `retract` shape), 2,000 and 10,000, three interleaved rounds, `78f0f3b` against `b2c4eaa`, pages from copies of both printing each commit's dirty-page count. Linux: `perf stat -x, -e instructions:u,cycles:u,branch-misses:u` of the read probe pinned to one core (`taskset -c 2`), three rounds, `fd5ef10`, `b2c4eaa` and `04ccab3`; `run.clj --no-build --only db --impls nexis --n 10 --max-load 4 --pin 0-11` from snapshots of `fd5ef10` and `04ccab3`, base, head, base, head (load 0.5–1.4), and once from `05ed7a1` with `--impls nexis,datalevin`; all under the host's benchmark lease. Raw output: `.git/revamp/r3/store/` |
 | §3.37, §6 "A Var's load run with its call", "Calls of one or two arguments in place", "Inline caches at call sites" | Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434), Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); shared with concurrent sessions | 2026-10-08, varcalls: `bin/nexis` built by `zig build install -Doptimize=fast --prefix DIR` at `19eb7cd` (before), with the load run with its call over `f277127`, and with the calls in place and the load run with `call2` over `a9a7cec` (five commits, not kept); `-Dopcodes=true` twins of each. Micro kit: `bb bench/micro/run.clj --rounds 5 --programs count,acc,fib,gcall,lc,lv,mv,mvc,kw,leaf,getnl,vnth,leaf1,vdestr,cbbase,cbsum,cbred,cb,lazy,lazyl,lazyf BEFORE AFTER` under `tools/heavy` (1 core), the loads in the text. Whole process: the `bench/compare` programs (prelude and body) under `/usr/bin/time -l`, three interleaved rounds; the §3.31 shapes at 3 M once each. The trace: `lldb` stepping one iteration of `leaf1.nx` from one `fnCountLeaf` entry to the next. Raw output: `.git/revamp/r3/varcalls/` |
 | §3.38, §6 "x86-64 handlers without register saves" and "A width-consistent native boundary on x86-64" | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, governor `powersave`, as §3.15; babashka v1.13.224; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1 (26A434); Zig 0.17.0, ReleaseFast (`-Doptimize=fast`); emdb `b3370fb` (a source snapshot on the Linux host); both hosts shared with other sessions | 2026-10-08 19:24–22:52 MDT, x86: `bin/nexis` built by `zig build install -Doptimize=fast` from source snapshots of `8cd7499` (before, `e115f57`'s source) and of `3065544` (after) on the Linux host, and with `--prefix DIR` at `8cd7499`, `13df08b` (the status word alone) and `3065544` on the M5, whose `13df08b` and `3065544` builds disassemble to the same instructions. Static sizes from `zig build codegen` at `8cd7499`, `13df08b` and `3065544`. Linux: `micro.sh`, `bb bench/micro/run.clj --counter perf --pin 2 --rounds 10 --programs count,fib,gcall,leaf,getnl,cbbase,cbsum,cb,lazy BEFORE AFTER`, twice, each in its own exclusive hold of the host's benchmark lease (load 0.9 → 1.2); `perfpairs.sh`, each run `taskset -c 2 /usr/bin/time -f %M perf stat -x, -e cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/br_misp_retired.indirect/u,cpu_core/ld_blocks.store_forward/u bin/nexis run P` over `prelude.nx` with each body, the builds interleaved, ten rounds (load 1.1 → 1.4); `run.clj --n 10 --max-load 4 --pin 0-11 --no-build --only lang --impls nexis,bb --workloads fib,destructure,vector-conj-nth,pipeline` from each snapshot, after, before, after, before (load 0.9 → 1.6; its report names the `zig` on the path, not the one that built). The `callLeaf` stall and the one-line trial of §6 from the Stage 0 profile at `fd5ef10` (`perf record -e cpu_core/cycles/upp` and `cpu_core/ld_blocks.store_forward/u`, five rounds). M5: `bb bench/micro/run.clj --rounds 5` over every program but those of other trees, and `--rounds 9` over the callback programs, under `tools/heavy` (1 core). Raw output: `.git/revamp/r3/x86/` (`pup-micro-*.txt`/`.json`, `pup-pairs-1.txt`, `runclj/`, `m5-micro-*`, `codegen-*.log`) and `.git/revamp/r3/x86spike.md` |
+| §3 "Durable commits", §6 "Fewer pages per durable commit", §3.15's durable note | Intel Core Ultra 9 185H, 30 GiB, Ubuntu 26.04.1 LTS, Linux 7.0.0-34-generic, ext4 on NVMe, governor `powersave`, as §3.15; Datalevin 1.1.0; and Apple M5, 10 cores, 32 GiB, macOS 27.0.1, APFS; Zig 0.17.0, ReleaseFast (`-Doptimize=fast`), emdb `b3370fb` | 2026-10-08 23:56 – 2026-10-09 00:25 MDT, durable: `bin/nexis` of `bd2cf5c`; on Linux under the `pup-bench` lease, processes pinned to CPUs 0–11, a probe of 300 durable commits per shape (`.nx` for Nextomic and `db/*`, a `dtlv exec` twin) over a copy of the `bench/compare` load, five runs of rounds with the shapes and systems alternating, the rounds whose `db/*` commit ran under 1.9 ms kept; `strace -f -c`, `strace -f -T` and `perf stat -e task-clock,page-faults` over 100 and 400 commits outside the lease; pages from a ReleaseFast build printing emdb's dirty-page count, not committed; Datalevin's writes from `strace -e pwrite64,writev,fdatasync` over 200 commits; the program table's Linux load from `bb bench/compare/run.clj --only db --impls nexis,datalevin --n 10 --max-load 4 --pin 0-11 --no-build`, its M5 rows from runs on one core at load 8–69 |
 | §6 "Levers pulled", the `cc935cc` figures of §3.11 | as §3.11 language and database rows, shared with concurrent builds (1-minute load average 5–15) | 2026-09-26: `bb bench/compare/run.clj --only db --n 10 --max-load 6 --no-build` over ReleaseFast binaries of the ws-durability branch (after) and of `cc935cc` (before), run one after the other; each run's third attempt, the first two having seen the load pass 6; ten rounds after a warm-up. The `bin/nexis` read figures: a probe program timing 10,000 of each operation over 10,000 entities with `nano-time`, three runs of each binary, alternating. `db_put_commit_scalar`: `zig build bench -Doptimize=ReleaseFast -- --filter db-integrated,nextomic`, three invocations at the branch head and two at `cc935cc`, alternating, the best median; §3.6's durable M5 figure is the `cc935cc` run's, and the branch head measured 7.2–8.9 ms under `NEXIS_DURABILITY=durable` at load 7 |
