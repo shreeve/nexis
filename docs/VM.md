@@ -1083,7 +1083,10 @@ detail and `error_trace` its chain, so the report is the one the error
 would have without the `try` around it. An origin no live record names
 is dropped before the next one is pushed; `resetAfterError` clears
 them all. An origin is for the report only: a throw with no memory to
-record one goes on without it, reported where it leaves the run.
+record one goes on without it, reported where it leaves the run. An
+origin also says whether the VM placed its value, an error map it gave
+the place keys of this throw (§13): reported at that origin, the map is
+printed without them (`VM.withoutPlace`, `docs/TOOLING.md` §1).
 
 **`ctrl:finally-exit`** pops the top `FinallyContinuation`
 (`InvalidHandlerState` if there is none or it belongs to another

@@ -1688,6 +1688,9 @@ pub const TraceFrame = struct {
 pub const ThrowOrigin = struct {
     value: Value,
     err: ?VmError,
+    /// `value` is an error map the VM placed (`errorValue`,
+    /// `throwErrorMap`): its place keys name this origin.
+    placed: bool,
     detail_buf: [160]u8 = undefined,
     detail_len: usize = 0,
     trace: [VM.trace_capacity]TraceFrame = undefined,
@@ -2678,6 +2681,9 @@ pub const VM = struct {
     /// The origin of the throw that left `run` uncaught, for
     /// `recordErrorTrace`.
     escaped_origin: ?u32 = null,
+    /// The uncaught error map `recordErrorTrace` reported at its own
+    /// origin when the VM placed it there (`withoutPlace`).
+    placed_report: ?Value = null,
 
     pub const track_high_water = std.debug.runtime_safety;
     pub const default_max_frames = 1 << 20;
@@ -4215,10 +4221,12 @@ pub const VM = struct {
     fn recordErrorTrace(self: *VM, err: VmError) void {
         self.error_trace.clearRetainingCapacity();
         self.traced_error = err;
+        self.placed_report = null;
         if (err == VmError.UncaughtThrow) if (self.escapedOrigin()) |o| {
             // The throw began below the frames still standing: report
             // the error, detail and chain it was raised with.
             if (o.err) |raised| self.traced_error = raised;
+            if (o.placed) self.placed_report = o.value;
             @memcpy(self.detail_buf[0..o.detail_len], o.detail_buf[0..o.detail_len]);
             self.error_detail = self.detail_buf[0..o.detail_len];
             self.error_trace.appendSlice(self.allocator, o.trace[0..o.trace_len]) catch return;
@@ -4260,14 +4268,15 @@ pub const VM = struct {
     /// force to take it (with none, it leaves `run` with its frames
     /// standing and `recordErrorTrace` sees them). `err` is the runtime
     /// error the value was translated from, if any; its detail is
-    /// `error_detail`. The origin is for the report only: with no
-    /// memory to record it the throw goes on without one.
-    fn originFor(self: *VM, value: Value, err: ?VmError) ?u32 {
+    /// `error_detail`; `placed`, whether the VM placed `value` here.
+    /// The origin is for the report only: with no memory to record it
+    /// the throw goes on without one.
+    fn originFor(self: *VM, value: Value, err: ?VmError, placed: bool) ?u32 {
         if (err == null) if (self.rethrownOrigin(value)) |o| return o;
         if (self.findThrowTarget() == null) return null;
         self.dropUnreferencedOrigins();
         const o = self.origins.addOne(self.allocator) catch return null;
-        o.* = .{ .value = value, .err = err };
+        o.* = .{ .value = value, .err = err, .placed = placed };
         const detail = self.error_detail[0..@min(self.error_detail.len, o.detail_buf.len)];
         @memcpy(o.detail_buf[0..detail.len], detail);
         o.detail_len = detail.len;
@@ -4325,6 +4334,7 @@ pub const VM = struct {
         self.finally_stack.clearRetainingCapacity();
         self.origins.clearRetainingCapacity();
         self.escaped_origin = null;
+        self.placed_report = null;
         while (self.dyn_frames.items.len > 0) self.popBindings();
         self.unhandled_throw = null;
         self.traced_error = null;
@@ -4361,7 +4371,7 @@ pub const VM = struct {
         if (self.findThrowTarget() == null) return err;
         const tag = self.ensureInterner().internKeywordValue(kw_name) catch return err;
         const payload = self.errorValue(tag, self.error_detail, self.raiseSite());
-        const origin = self.originFor(payload, err);
+        const origin = self.originFor(payload, err, payload.kind() == .persistent_map);
         self.error_detail = "";
         try self.unwindThrow(payload, origin);
     }
@@ -4410,16 +4420,15 @@ pub const VM = struct {
         return self.putKey(m, "column", value_mod.fromFixnum(place.col).?);
     }
 
-    /// `v` without the place keys `addPlace` gives an error map, for
-    /// a report that shows the place itself; `v` as it is when it is
-    /// not such a map (one with `:error`, `:fn` and `:file`) or memory
-    /// is exhausted.
+    /// `v` without the place keys `addPlace` gave it, for a report
+    /// that shows the place itself: when `v` is the uncaught error map
+    /// the VM placed and the report is at its origin (`placed_report`).
+    /// Any other value, a map the program built or derived, or one
+    /// thrown again from elsewhere, is `v` as it is, as it is when
+    /// memory is exhausted.
     pub fn withoutPlace(self: *VM, v: Value) Value {
-        if (v.kind() != .persistent_map) return v;
-        for ([_][]const u8{ "error", "fn", "file" }) |key| {
-            const k = self.ensureInterner().internKeywordValue(key) catch return v;
-            if (champ_mod.mapGet(v, k, &dispatch_mod.hashValue, &dispatch_mod.equal) == .absent) return v;
-        }
+        const placed = self.placed_report orelse return v;
+        if (!placed.identicalTo(v)) return v;
         var m = v;
         for ([_][]const u8{ "fn", "file", "line", "column" }) |key| {
             const k = self.ensureInterner().internKeywordValue(key) catch return v;
@@ -4440,7 +4449,8 @@ pub const VM = struct {
     /// memory is exhausted.
     pub fn throwErrorMap(self: *VM, map: Value) VmError {
         if (self.findThrowTarget() == null) return self.throwValue(map);
-        return self.throwValue(self.addPlace(map, self.raiseSite()) catch map);
+        const placed = self.addPlace(map, self.raiseSite()) catch return self.throwValue(map);
+        return self.throwFrom(placed, true);
     }
 
     /// Where an error value says a runtime error was raised: the
@@ -6057,7 +6067,7 @@ pub const VM = struct {
     /// `VmError.UncaughtThrow`.
     fn execCtrlThrow(self: *VM, inst: Inst) VmError!void {
         const value = try self.resolve(inst.a);
-        try self.unwindThrow(value, self.originFor(value, null));
+        try self.unwindThrow(value, self.originFor(value, null, false));
     }
 
     /// Walk the handler stack top-down looking for the topmost
@@ -6091,7 +6101,13 @@ pub const VM = struct {
     /// result is `UncaughtThrow` and `unhandled_throw` holds the
     /// value.
     pub fn throwValue(self: *VM, value: Value) VmError {
-        self.unwindThrow(value, self.originFor(value, null)) catch |err| return err;
+        return self.throwFrom(value, false);
+    }
+
+    /// `throwValue` of `value`, which the VM `placed` when it gave it
+    /// the place keys of this throw.
+    fn throwFrom(self: *VM, value: Value, placed: bool) VmError {
+        self.unwindThrow(value, self.originFor(value, null, placed)) catch |err| return err;
         return VmError.ControlTransferred;
     }
 
@@ -6103,7 +6119,8 @@ pub const VM = struct {
     pub fn throwKeyword(self: *VM, name: []const u8) VmError {
         const kw = self.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory;
         if (self.findThrowTarget() == null) return self.throwValue(kw);
-        return self.throwValue(self.errorValue(kw, "", self.raiseSite()));
+        const payload = self.errorValue(kw, "", self.raiseSite());
+        return self.throwFrom(payload, payload.kind() == .persistent_map);
     }
 
     /// Common throw-unwind logic. Used by `execCtrlThrow`,
@@ -8059,24 +8076,6 @@ test "VM error value: a handler takes a runtime error when memory is exhausted, 
     failing.fail_index = failing.alloc_index;
     defer failing.fail_index = std.math.maxInt(usize);
     try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, try vm.run()));
-}
-
-test "VM error value: a report drops the place a rethrown error map carries, and nothing else" {
-    var vm = try VM.init(testing.allocator, &VM.idle_routine);
-    defer vm.deinit();
-    const info = SourceInfo{ .path = "t.nx", .text = "(f)" };
-    const routine = Routine{ .code = &.{}, .consts = &.{}, .slot_count = 1, .name = "f", .source = &info, .spans = &.{.{ .pc = 0, .span = .{ .pos = 0, .len = 3 } }} };
-    const tag = try vm.ensureInterner().internKeywordValue("kind-mismatch");
-    const placed = vm.errorValue(tag, "", .{ .name = "f", .pc = 0, .span = routine.spanAt(0), .source = &info });
-    try testing.expectEqual(@as(usize, 6), champ_mod.mapCount(placed));
-    const bare = vm.withoutPlace(placed);
-    try testing.expectEqual(@as(usize, 2), champ_mod.mapCount(bare));
-    try testing.expectEqualStrings("kind-mismatch", try caughtTag(&vm, bare));
-    // A map of the program's own with a :line of its own keeps it.
-    const line_key = try vm.ensureInterner().internKeywordValue("line");
-    const own = try vm.putKey(try vm.putKey(try champ_mod.mapEmpty(vm.ensureHeap()), "error", tag), "line", fx(3));
-    try testing.expect(vm.withoutPlace(own).identicalTo(own));
-    try testing.expectEqual(@as(i64, 3), (try lookup(own, line_key, value_mod.nilValue())).asFixnum());
 }
 
 test "VM ctrl: a try's finally body runs after its catch; try-enter names a try of the routine" {

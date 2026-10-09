@@ -8700,3 +8700,32 @@ test "a rebound realize-caught is refused, not trusted, by = and hash" {
         \\(try (count {(map inc [1]) 1}) (catch any e e))
     , ":boom");
 }
+
+// =============================================================================
+// The place keys an uncaught error map's report drops (docs/TOOLING.md §1)
+// =============================================================================
+
+test "an uncaught error map loses its place keys only where the VM placed them" {
+    const Case = struct { []const u8, bool };
+    for ([_]Case{
+        // Rethrown as it was caught, the map is reported at its
+        // origin, whose place the header and the trace show.
+        .{ "(try (/ 1 0) (catch any e (throw e)))", false },
+        .{ "(try (/ 1 0) (catch :kind-mismatch e :no))", false },
+        // A map the program built, one derived from a caught error,
+        // and an error map thrown again outside its try keep every key.
+        .{ "(throw {:error :x :line 5 :file \"a\" :fn \"f\" :column 3})", true },
+        .{ "(try (/ 1 0) (catch any e (throw (assoc e :extra 1))))", true },
+        .{ "(def e (try (/ 1 0) (catch any e e))) (throw e)", true },
+    }) |case| {
+        errdefer std.debug.print("source: {s}\n", .{case[0]});
+        var program: Program = undefined;
+        try program.init();
+        defer program.deinit();
+        try testing.expectError(vm.VmError.UncaughtThrow, program.run(case[0]));
+        // A program run here has no source: the place is the `:fn`.
+        const reported = program.v.withoutPlace(program.v.unhandled_throw.?);
+        const k = try program.interner.internKeywordValue("fn");
+        try testing.expectEqual(case[1], !(try vm.lookup(reported, k, value_mod.nilValue())).isNil());
+    }
+}
