@@ -296,8 +296,9 @@ fn formatChar(scalar: u21, mode: FormatMode, writer: *std.Io.Writer) Error!void 
         return;
     }
     // Readable: named tokens for common whitespace + backslash;
-    // printable ASCII as `\x`; everything else hex-escape. STDLIB.md
-    // §5 pins the exact set.
+    // printable ASCII and every non-ASCII scalar as `\x`, as Clojure
+    // prints them; the other ASCII controls and DEL hex-escaped, as in
+    // a string. STDLIB.md §5 pins the exact set.
     switch (scalar) {
         ' ' => try writer.writeAll("\\space"),
         '\n' => try writer.writeAll("\\newline"),
@@ -309,8 +310,16 @@ fn formatChar(scalar: u21, mode: FormatMode, writer: *std.Io.Writer) Error!void 
         // Printable ASCII (excluding the whitespace + backslash
         // handled above): bare `\x`.
         0x21...0x5B, 0x5D...0x7E => try writer.print("\\{c}", .{@as(u8, @intCast(scalar))}),
-        // NUL, other ASCII controls, and all non-ASCII: hex-escape.
-        else => try writer.print("\\u{{{X}}}", .{scalar}),
+        // NUL, the other ASCII controls and DEL: hex-escape.
+        0x00...0x07, 0x0B, 0x0E...0x1F, 0x7F => try writer.print("\\u{{{X}}}", .{scalar}),
+        // Past ASCII: the scalar's UTF-8, which the reader takes back
+        // after `\` (FORMS.md §2).
+        else => {
+            var utf8_buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(scalar, &utf8_buf) catch return error.Utf8Error;
+            try writer.writeByte('\\');
+            try writer.writeAll(utf8_buf[0..n]);
+        },
     }
 }
 
@@ -687,9 +696,18 @@ test "display: char as UTF-8 bytes; readable: named token or \\x or hex" {
     defer testing.allocator.free(e_d);
     try testing.expectEqualStrings("é", e_d);
 
+    // Past ASCII a char prints as itself, as Clojure's `\é`.
     const e_r = try formatForTest(value_mod.fromChar(0xE9).?, .readable, null);
     defer testing.allocator.free(e_r);
-    try testing.expectEqualStrings("\\u{E9}", e_r);
+    try testing.expectEqualStrings("\\é", e_r);
+
+    const crab_r = try formatForTest(value_mod.fromChar(0x1F980).?, .readable, null);
+    defer testing.allocator.free(crab_r);
+    try testing.expectEqualStrings("\\\u{1F980}", crab_r);
+
+    const del_r = try formatForTest(value_mod.fromChar(0x7F).?, .readable, null);
+    defer testing.allocator.free(del_r);
+    try testing.expectEqualStrings("\\u{7F}", del_r);
 }
 
 test "collections: list / vector display + readable round-trip" {

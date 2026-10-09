@@ -240,6 +240,7 @@ keyword (`:duplicate-literal-key`, `:map-odd-count`, `:invalid-symbol`,
 | `volatile!`, `vswap!`, `vreset!` | a volatile box | an atom (`atom?` is true) | `docs/ATOM.md` |
 | `(exit n)` | `System/exit` | the same: closes open stores and ends the process; no `finally` runs | `src/stdlib.zig` |
 | string indexes | UTF-16 code units | code points: `count`, `subs`, `nth` and `nexis.string/index-of` count them | `docs/STDLIB.md` §2 |
+| `(pr-str (char 0))`, an ASCII control without a name, DEL | `\` and the raw byte | `\u{0}`, `\u{7F}`: escaped, as in a string; any other char prints as Clojure's (`\é`) | `docs/SEMANTICS.md` §6.4 |
 | `(format "%s" nil)` | `"null"` | `"nil"` | `docs/STDLIB.md` §2 |
 | `/` by a float zero | `ArithmeticException` when both operands are boxed (a function's arguments, `apply`); IEEE `##Inf`/`##NaN` when the compiler sees a primitive double operand (a float literal, a double local): `(/ 1.0 0)` at the REPL is `##Inf` | `:divide-by-zero` always, the boxed rule: nexis has no primitive operand types; a NaN operand is the result, as in Clojure | `docs/SEMANTICS.md` §2.2 |
 | `long-array`, `aget`, `aset` | mutable Java arrays | immutable typed vectors `(i64-vector xs)`, `(f64-vector xs)`, never `=` to a vector; kernels in `nexis.simd` | `docs/TYPED_VECTOR.md` |

@@ -3,8 +3,8 @@
 "bignum" 123456789012345678901234567890
 "bignum-edge" 140737488355328
 "bignum-neg" -98765432109876543210987654321
-"char" \u{3BB}
-"char-astral" \u{1F600}
+"char" \λ
+"char-astral" \😀
 "f64-vector" #f64[1.5 -0.0 ##Inf 1.0E300]
 "false" false
 "fixnum" 42

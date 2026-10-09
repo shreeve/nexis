@@ -463,10 +463,12 @@ the db and Nextomic handles print as markers for debugging (`#<fn>`,
 #### 6.4 Character print rules
 
 Named: `\newline`, `\space`, `\tab`, `\return`, `\formfeed`,
-`\backspace`, and `\\` for the backslash. Other printable ASCII
-prints as `\a`; everything else as `\u{HEX}`, uppercase, no leading
-zeros (`\u{E9}`, `\u{0}`). The reader accepts the same set, and
-Clojure's `\uXXXX` (PLAN §23 #26).
+`\backspace`, and `\\` for the backslash. The other ASCII controls
+and DEL print as `\u{HEX}`, uppercase, no leading zeros (`\u{0}`,
+`\u{7F}`), as a string escapes them; every other char prints as `\`
+and the char itself, as Clojure prints it (`\a`, `\é`, `\☃`). The
+reader accepts the same set, `\u{HEX}` for any scalar, and Clojure's
+`\uXXXX` (PLAN §23 #26).
 
 #### 6.5 String print rules
 

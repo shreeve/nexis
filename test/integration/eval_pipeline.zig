@@ -6367,6 +6367,11 @@ test "numbers: the promoting and unchecked operators, num, float, ratio? and rat
     try expectOutput("[(ratio? 1) (ratio? 0.5) (ratio? nil) (rational? 1) (rational? 99999999999999999999) (rational? 1.0) (rational? nil)]", "[false false false true true false false]");
 }
 
+test "printing: a char past ASCII prints as itself, as Clojure's, and reads back" {
+    try expectOutput("(pr-str [\\é \\u{1F980} \\☃ \\a \\u{7F} \\u{0}])", "[\\é \\🦀 \\☃ \\a \\u{7F} \\u{0}]");
+    try expectOutput("(let [cs (map char [233 0x80 0xA0 0x2028 0xFEFF 0x10FFFF])] (= cs (read-string (pr-str cs))))", "true");
+}
+
 test "numbers: ##Inf, ##-Inf and ##NaN read, print readable and round-trip" {
     try expectOutput("[(= ##Inf (* 2 1e308)) (= ##-Inf (* -2 1e308)) (NaN? ##NaN) (float? ##Inf) (infinite? ##-Inf)]", "[true true true true true]");
     try expectOutput("(pr-str ##Inf ##-Inf ##NaN [1.5 ##Inf] (f64-vector [##-Inf]))", "##Inf ##-Inf ##NaN [1.5 ##Inf] #f64[##-Inf]");
