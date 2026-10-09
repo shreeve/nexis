@@ -696,7 +696,7 @@ pub const Exec = struct {
             },
             .relation => |ts| for (try self.elements(result)) |x| {
                 const cells = switch (x) {
-                    .cell => |y| try self.cellCells(y),
+                    .cell => |y| if (y == .nil) continue else try self.cellCells(y),
                     .tuple => |t| t,
                 };
                 if (try fillTuple(out, ts, cells, row, base, false)) try out.append(row);

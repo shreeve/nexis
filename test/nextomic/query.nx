@@ -423,6 +423,12 @@
 (println (t/caught (d/transact! c [[:db/retract :person/bio :db/fulltext true]])))
 (t/check ":db/fulltext is a bootstrap attribute" (= 22 (d/entid ft :db/fulltext)))
 
+; A nil element of a relation binding drops that element; a nil
+; inside a tuple drops its tuple (NEXTOMIC.md §5).
+(println (rows (d/q '[:find ?a ?b :where [(ground [[1 2] nil [3 nil] [4 5]]) [[?a ?b]]]] db)))
+(defn pairs-and-nil [x] [nil [x 2]])
+(println (rows (d/q '[:find ?a ?b :where [(ground 7) ?x] [(user/pairs-and-nil ?x) [[?a ?b]]]] db)))
+
 (d/release c)
 (println (t/caught (d/q ages db)))
 (println :query-done)
