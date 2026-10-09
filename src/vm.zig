@@ -1469,11 +1469,12 @@ pub const NativeFn = struct {
     /// place, unrooted, and skips the stack guard and the overflow
     /// check (VM.md §6).
     leaf: bool = false,
-    /// What a call that is not a leaf call runs instead of `call`: the
-    /// full body of a leaf whose leaf body refuses some receivers with
-    /// `VmError.NeedsReentry` (`nth` of a lazy seq, which may run
-    /// code). A leaf call site re-issues such a call through the
-    /// general path, arguments copied and rooted (VM.md §6).
+    /// A leaf's full body, which a call that is not a leaf call runs
+    /// instead of `call`, when its leaf body refuses some receivers
+    /// with `VmError.NeedsReentry` (`nth` of a lazy seq, which may run
+    /// code): a leaf call site re-issues such a call through the
+    /// general path, arguments copied and rooted (VM.md §6). Null on a
+    /// native that is not a leaf.
     general: ?*const fn (vm: *VM, args: []const Value) VmError!Value = null,
     /// The native walks its last argument to the end, or until it is
     /// done with it, and keeps the walk rooted itself (`SeqIter.cursor`):
@@ -2685,7 +2686,7 @@ pub const VM = struct {
     /// origin when the VM placed it there (`withoutPlace`).
     placed_report: ?Value = null,
 
-    pub const track_high_water = std.debug.runtime_safety;
+    pub const track_high_water = builtin.optimize.runtimeSafety();
     pub const default_max_frames = 1 << 20;
     pub const default_max_nested_runs = 100_000;
     /// A trace keeps this many innermost frames and
@@ -2824,6 +2825,10 @@ pub const VM = struct {
                 self.allocator,
                 self.runtime_arena.allocator(),
             );
+            errdefer {
+                self.registry.?.deinit();
+                self.registry = null;
+            }
             // Populate AFTER storage so back-pointers are stable.
             try self.registry.?.setupDefaults();
             // Make the VM heap reachable from the registry so
@@ -3976,7 +3981,7 @@ pub const VM = struct {
     /// later from the 16-byte one, so a value whose reader is a handler
     /// on the dispatch's chain (a callee, a return) is stored a word at
     /// a time (§8).
-    const wide_stores = builtin.cpu.arch == .x86_64;
+    const wide_stores = builtin.target.cpu.arch == .x86_64;
 
     /// `storeWords`, as one 16-byte store on x86-64 (`wide_stores`).
     inline fn storeWide(dst: *Value, v: Value) void {
@@ -4037,7 +4042,7 @@ pub const VM = struct {
     /// the counting loop ran half as many cycles again (docs/PERF.md
     /// §3.21).
     inline fn proved(ok: bool) void {
-        if (std.debug.runtime_safety) std.debug.assert(ok);
+        if (comptime builtin.optimize.runtimeSafety()) std.debug.assert(ok);
     }
 
     inline fn verifiedSlot(self: *VM, frame: *const Frame, op: Operand) *Value {
@@ -4520,7 +4525,7 @@ pub const VM = struct {
     /// saving the caller's first, and a part out of line keeps its own
     /// across a native's call in the registers the native saves. On
     /// arm64 every handler fits AAPCS64's scratch registers.
-    const handler_cc: std.lang.CallingConvention = if (builtin.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
+    const handler_cc: std.lang.CallingConvention = if (builtin.target.cpu.arch == .x86_64) .{ .x86_64_preserve_none = .{} } else .auto;
 
     /// What a handler returns: `ok` when the chain ends with no error,
     /// else the error it ends with, by its number. Its own type rather
@@ -5278,6 +5283,8 @@ pub const VM = struct {
     /// whose slots keep them rooted.
     fn callBuffered(self: *VM, frame: *Frame, inst: Inst, pc: usize) callconv(handler_cc) Status {
         const native = asNativeFn(self.verifiedSlot(frame, inst.a).*);
+        // Only a leaf has a general body (`NativeFn.general`).
+        std.debug.assert(native.general == null);
         const argc: u32 = inst.b.index;
         const max: usize = native.max_arity orelse max_native_args;
         if (argc < native.min_arity or argc > max or argc > max_native_args) return self.general(frame, inst, pc);
@@ -5459,7 +5466,7 @@ pub const VM = struct {
         }
         // The arguments are copied off the stack: the callee may
         // re-enter the VM and grow it. The slots keep them rooted.
-        var buf: [8]Value = undefined;
+        var buf: [max_native_args]Value = undefined;
         const args: []Value = if (argc <= buf.len)
             buf[0..argc]
         else
@@ -7789,7 +7796,7 @@ test "VM dispatch: a counting loop runs through its step to each boundary" {
         const quick = try StepOutcome.of(&code, &consts);
         try StepOutcome.expectSame(plain, quick);
         var buf: [24]u8 = undefined;
-        const got = if (quick.value.?.isFixnum()) try std.fmt.bufPrint(&buf, "{d}", .{quick.value.?.asFixnum()}) else quick.detail[0..quick.detail_len];
+        const got = if (quick.value.?.isFixnum()) try std.mem.print(&buf, "{d}", .{quick.value.?.asFixnum()}) else quick.detail[0..quick.detail_len];
         try testing.expectEqualStrings(case.want, got);
     }
 }
