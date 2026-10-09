@@ -84,13 +84,13 @@ emdb commit and the Zig release it was built from; `SHA256SUMS` lists
 every archive's checksum.
 
 ```bash
-v=0.1.0 target=aarch64-macos            # or x86_64-linux-musl, aarch64-linux-musl
+v=0.2.0 target=aarch64-macos            # or x86_64-linux-musl, aarch64-linux-musl
 base=https://github.com/shreeve/nexis/releases/download/v$v
 curl -LO $base/nexis-$v-$target.tar.gz -O $base/SHA256SUMS
 shasum -a 256 -c --ignore-missing SHA256SUMS   # or: sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf nexis-$v-$target.tar.gz
 mkdir -p ~/.local/bin && cp nexis-$v-$target/bin/nexis ~/.local/bin/   # a directory on PATH
-nexis --version                         # nexis 0.1.0
+nexis --version                         # nexis 0.2.0
 ```
 
 On macOS an archive downloaded through a browser is quarantined, and
@@ -124,7 +124,7 @@ echo '(println :hi)' | ./bin/nexis run -  # a program from stdin
 ./bin/nexis doc map                    # a function's documentation
 ./bin/nexis disasm examples/hello.nx   # every routine's bytecode with source positions
 ./bin/nexis --help
-./bin/nexis --version                  # nexis 0.1.0
+./bin/nexis --version                  # nexis 0.2.0
 ```
 
 `nexis run` prints only what the program prints; the REPL and `-e`
