@@ -5,7 +5,7 @@
 {:error :nextomic/tx-data, :message "a reverse ref needs a ref attribute", :attr :u/age}
 {:error :nextomic/tx-data, :message "a nested map under a non-component ref needs :db/id or a unique attribute", :attr :u/friend}
 {:error :nextomic/tx-data, :message "an entity is an id, a tempid, a lookup ref, an ident or \"datomic.tx\"", :value nil}
-{:error :nextomic/tx-data, :message "a tempid no assertion stands on names no entity"}
+{:error :nextomic/tx-data, :message "a tempid no assertion stands on names no entity", :value "lonely"}
 {:error :nextomic/tx-data, :message "unknown op; one of :db/add, :db/retract, :db/retractEntity, :db.fn/call, :db.fn/cas", :value :db/frob}
 {:error :nextomic/value-type, :message ":u/email takes a :db.type/string, not [:u/email \"x\"]", :attr :u/email, :value [:u/email "x"]}
 {:error :nextomic/tx-data, :message "an attribute is a keyword or an id", :value "u/age"}

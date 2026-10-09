@@ -24,7 +24,7 @@
 {:error :nextomic/tx-data, :message a keyword the store holds is at most 4077 bytes long}
 nil
 {:error :db/open-failed, :message db open failed}
-{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity, :value ghost}
 {:error :nextomic/tx-data, :message :db/txInstant is asserted on the transaction's own entity only, and never retracted}
 {:error :nextomic/tx-data, :message a transaction's :db/txInstant is never earlier than the one before}
 ok a failed transaction leaves the basis alone
@@ -48,7 +48,7 @@ ok a refused ident retraction leaves every name resolving
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
 {:error :nextomic/tx-data, :message a new attribute needs :db/valueType and :db/cardinality, :attr :role/admin}
-{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity}
+{:error :nextomic/tx-data, :message a tempid no assertion stands on names no entity, :value zz}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/age}
 {:error :nextomic/value-type, :message :user/boss takes a :db.type/ref, not nil, :attr :user/boss, :value nil}
 {:error :nextomic/no-entity, :message 70368744177664 names no entity, :value 70368744177664}

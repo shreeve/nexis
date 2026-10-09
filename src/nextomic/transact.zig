@@ -464,10 +464,29 @@ const ROp = union(enum) {
 };
 
 const Binding = struct {
-    key: ?TempidKey,
+    /// The tempid as the program wrote it, a string or a negative
+    /// fixnum; null for a map form's own entity.
+    written: ?Value,
     eid: ?u64 = null,
     /// Unified with another binding.
     alias: ?u32 = null,
+};
+
+/// Tempids by their key: a string's bytes, a fixnum's value.
+const TempidContext = struct {
+    pub fn hash(_: TempidContext, k: TempidKey) u64 {
+        return switch (k) {
+            .string => |b| std.hash.Wyhash.hash(0, b),
+            .fixnum => |n| std.hash.Wyhash.hash(1, std.mem.asBytes(&n)),
+        };
+    }
+
+    pub fn eql(_: TempidContext, a: TempidKey, b: TempidKey) bool {
+        return switch (a) {
+            .string => |x| b == .string and std.mem.eql(u8, x, b.string),
+            .fixnum => |n| b == .fixnum and b.fixnum == n,
+        };
+    }
 };
 
 /// One datom the transaction will write.
@@ -504,8 +523,9 @@ const Ctx = struct {
     call_depth: u32 = 0,
 
     bindings: std.ArrayList(Binding) = .empty,
-    str_tempids: std.StringHashMapUnmanaged(u32) = .empty,
-    num_tempids: std.AutoHashMapUnmanaged(i64, u32) = .empty,
+    /// The bindings of the tempids the program wrote, by key; a string
+    /// key borrows the rooted tx-data.
+    tempids: std.HashMapUnmanaged(TempidKey, u32, TempidContext, std.hash_map.default_max_load_percentage) = .empty,
     ops: std.ArrayList(ROp) = .empty,
 
     overlay: std.ArrayList(Pending) = .empty,
@@ -758,29 +778,19 @@ const Ctx = struct {
 
     // ── tempids ───────────────────────────────────────────────────
 
-    fn tempid(self: *Ctx, k: TempidKey) !u32 {
-        switch (k) {
-            .string => |s| {
-                if (self.str_tempids.get(s)) |i| return i;
-                const owned = try self.arena.dupe(u8, s);
-                const i: u32 = @intCast(self.bindings.items.len);
-                try self.bindings.append(self.arena, .{ .key = .{ .string = owned } });
-                try self.str_tempids.put(self.arena, owned, i);
-                return i;
-            },
-            .fixnum => |n| {
-                if (self.num_tempids.get(n)) |i| return i;
-                const i: u32 = @intCast(self.bindings.items.len);
-                try self.bindings.append(self.arena, .{ .key = .{ .fixnum = n } });
-                try self.num_tempids.put(self.arena, n, i);
-                return i;
-            },
+    /// The binding of tempid `written`, whose key is `k`.
+    fn tempid(self: *Ctx, written: Value, k: TempidKey) !u32 {
+        const g = try self.tempids.getOrPut(self.arena, k);
+        if (!g.found_existing) {
+            g.value_ptr.* = @intCast(self.bindings.items.len);
+            try self.bindings.append(self.arena, .{ .written = written });
         }
+        return g.value_ptr.*;
     }
 
     fn internalTempid(self: *Ctx) !u32 {
         const i: u32 = @intCast(self.bindings.items.len);
-        try self.bindings.append(self.arena, .{ .key = null });
+        try self.bindings.append(self.arena, .{ .written = null });
         return i;
     }
 
@@ -1064,13 +1074,13 @@ const Ctx = struct {
         switch (v.kind()) {
             .fixnum => {
                 const n = v.asFixnum();
-                if (n < 0) return .{ .tempid = try self.tempid(.{ .fixnum = n }) };
+                if (n < 0) return .{ .tempid = try self.tempid(v, .{ .fixnum = n }) };
                 return .{ .eid = try self.checkEid(@intCast(n)) };
             },
             .string => {
                 const s = string_mod.asBytes(v);
                 if (std.mem.eql(u8, s, "datomic.tx")) return .{ .eid = key.txEntity(self.t) };
-                return .{ .tempid = try self.tempid(.{ .string = s }) };
+                return .{ .tempid = try self.tempid(v, .{ .string = s }) };
             },
             .keyword => return .{ .eid = (try self.minter.lookup(v.asKeywordId())) orelse return error.NoEntity },
             .persistent_vector => {
@@ -1384,7 +1394,7 @@ const Ctx = struct {
         }
         for (self.bindings.items, named) |*b, n| {
             if (b.alias != null or b.eid != null) continue;
-            if (!n) return self.malformed("a tempid no assertion stands on names no entity", .{});
+            if (!n) return self.malformed("a tempid no assertion stands on names no entity", .{ .given = b.written });
             if (self.next_eid >= key.user_partition_end) return error.DatabaseFull;
             b.eid = self.next_eid;
             self.next_eid += 1;
@@ -1988,7 +1998,9 @@ const Ctx = struct {
     fn userTempids(self: *Ctx) ![]TempidBinding {
         var out: std.ArrayList(TempidBinding) = .empty;
         for (self.bindings.items, 0..) |b, i| {
-            const k = b.key orelse continue;
+            const w = b.written orelse continue;
+            // The report outlives the tx-data.
+            const k: TempidKey = if (w.kind() == .string) .{ .string = try self.arena.dupe(u8, string_mod.asBytes(w)) } else .{ .fixnum = w.asFixnum() };
             try out.append(self.arena, .{ .key = k, .eid = self.eidOfTempid(@intCast(i)) });
         }
         return out.toOwnedSlice(self.arena);
