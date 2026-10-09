@@ -10,3 +10,21 @@
 {:error :nextomic/value-type, :message ":u/email takes a :db.type/string, not [:u/email \"x\"]", :attr :u/email, :value [:u/email "x"]}
 {:error :nextomic/tx-data, :message "an attribute is a keyword or an id", :value "u/age"}
 {:error :nextomic/tx-data, :message "a form is a vector, a list or a map", :value :not-a-form}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.cardinality/one", :attr :db/valueType, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.cardinality/one", :attr :db/valueType, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/cardinality does not take :db.type/long", :attr :db/cardinality, :value :db.type/long}
+{:error :nextomic/value-type, :message ":db/unique does not take :db.cardinality/one", :attr :db/unique, :value :db.cardinality/one}
+{:error :nextomic/value-type, :message ":db/valueType does not take :db.type/strin", :attr :db/valueType, :value :db.type/strin}
+ok a refused enum keyword is never minted
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/unique}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/valueType}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/index}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/isComponent}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/fulltext}
+{:error :nextomic/tx-data, :message "a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", :attr :db/index}
+ok no user entity carries a schema attribute
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db/fulltext}
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db.type/string}
+{:error :nextomic/schema, :message "a bootstrap ident is never renamed", :attr :db/ident}
+ok asserting a bootstrap ident's own name is a no-op
+ok the bootstrap idents keep their names

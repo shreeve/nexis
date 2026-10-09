@@ -25,3 +25,34 @@
 (prn (t/caught (d/transact! c [[:db/add x :u/friend [:u/email [:u/email "x"]]]])))
 (prn (t/caught (d/transact! c [[:db/add x "u/age" 5]])))
 (prn (t/caught (d/transact! c [:not-a-form])))
+; A nested map is refused for what it is, never for a key it holds that
+; resolves no attribute.
+(prn (t/caught (d/transact! c [{:db/id "p" :u/friend {:u/_friend "q" :u/email "e"}} {:db/id "q" :u/age 3}
+                               {:db/ident :x/y :db/valueType :db.cardinality/one :db/cardinality :db.cardinality/one}])))
+
+; :db/valueType, :db/cardinality and :db/unique take their own
+; enumeration's idents, naming the attribute and the keyword; a typo
+; mints nothing.
+(prn (t/caught (d/transact! c [{:db/ident :x/y :db/valueType :db.cardinality/one :db/cardinality :db.cardinality/one}])))
+(prn (t/caught (d/transact! c [{:db/ident :x/y :db/valueType :db.type/long :db/cardinality :db.type/long}])))
+(prn (t/caught (d/transact! c [{:db/ident :x/y :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/unique :db.cardinality/one}])))
+(prn (t/caught (d/transact! c [{:db/ident :x/y :db/valueType :db.type/strin :db/cardinality :db.cardinality/one}])))
+(t/check "a refused enum keyword is never minted" (nil? (d/entid (d/db c) :db.type/strin)))
+
+; A schema attribute on an entity that is no attribute (a map without
+; :db/ident, the transaction entity) installs nothing and is refused.
+(prn (t/caught (d/transact! c [{:db/id "u" :db/unique :db.unique/identity :u/age 1}])))
+(prn (t/caught (d/transact! c [{:db/id "v" :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])))
+(prn (t/caught (d/transact! c [{:db/id "w" :db/index true :u/age 3}])))
+(prn (t/caught (d/transact! c [{:db/id "w" :db/isComponent true :u/age 3}])))
+(prn (t/caught (d/transact! c [{:db/id "w" :db/fulltext true :u/age 3}])))
+(prn (t/caught (d/transact! c [[:db/add "datomic.tx" :db/index true]])))
+(t/check "no user entity carries a schema attribute" (= 13 (count (d/schema (d/db c)))))
+
+; The bootstrap idents keep their names: renaming one is refused, and
+; asserting its own name stays a no-op.
+(prn (t/caught (d/transact! c [[:db/add :db/fulltext :db/ident :my/ft]])))
+(prn (t/caught (d/transact! c [[:db/add :db.type/string :db/ident :my/text]])))
+(prn (t/caught (d/transact! c [[:db/add :db/ident :db/ident :my/ident]])))
+(t/check "asserting a bootstrap ident's own name is a no-op" (map? (d/transact! c [[:db/add :db/doc :db/ident :db/doc]])))
+(t/check "the bootstrap idents keep their names" (= 22 (d/entid (d/db c) :db/fulltext)))

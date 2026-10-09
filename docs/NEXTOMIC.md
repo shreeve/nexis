@@ -429,7 +429,15 @@ so there is no queue; emdb's write lock is the transactor.
    gains `:db/unique`, `:db/index true`, `:db/fulltext true` or
    `:db/isComponent true`: on an entity that is not an attribute and
    does not become one (an enum ident, a half-written attribute map)
-   each is `:nextomic/tx-data`. What may change afterwards:
+   each is `:nextomic/tx-data`. The six schema attributes
+   (`:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
+   `:db/isComponent`, `:db/fulltext`) describe attributes: asserted on
+   a user or transaction entity (a map form without `:db/ident`) any
+   of them is `:nextomic/tx-data` naming it. `:db/valueType`,
+   `:db/cardinality` and `:db/unique` take their enumeration's idents
+   (`:db.type/*`, `:db.cardinality/*`, `:db.unique/*`); any other
+   keyword is `:nextomic/value-type` naming the attribute and the
+   keyword, and mints nothing. What may change afterwards:
    - `:db/valueType` never (`:nextomic/conflict`).
    - `:db/cardinality`: one → many always; many → one while no entity
      holds two values, in the tree or in the transaction, otherwise
@@ -468,7 +476,10 @@ so there is no queue; emdb's write lock is the transactor.
      no datom; the transaction's entry holds only its `:db/txInstant`.
      An ident on a user-partition entity is `:nextomic/conflict`, and
      so are two renames of one entity in one transaction (two values
-     of its card-one `:db/ident`), which retire neither name. An
+     of its card-one `:db/ident`), which retire neither name. The
+     bootstrap idents (ids 1 to 22, §2.4) are never renamed:
+     `:nextomic/schema`, since every build knows them by id and name
+     alike. An
      attribute's name never has a name part starting with `_`
      (`:ns/_name`), which a map form and a pull pattern read as the
      reverse of `:ns/name`: a new attribute or a rename to one is
@@ -1164,7 +1175,7 @@ gives the place and the trace.
 | `:nextomic/closed` | an operation through a released connection or an ended `with` scope | none |
 | `:nextomic/busy` | `release` while an operation is in flight | none |
 | `:nextomic/tx-data` | malformed tx-data, a lookup ref on a non-unique attribute (as an entity or a ref value), a nested map nothing could reach, a tempid no assertion stands on, a unique card-many attribute, `fulltext` or `index-range` on an attribute without the flag | `:attr` when an attribute is at fault; `:value`, the form, op, entity reference or tempid as the program wrote it, when one is refused |
-| `:nextomic/schema` | a schema change the attribute's data or type refuses, or the retraction of an ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
+| `:nextomic/schema` | a schema change the attribute's data or type refuses, the retraction of an ident, or the rename of a bootstrap ident | `:attr`; `:e`, the entity holding two values, when many → one is refused |
 | `:nextomic/history-view` | `entity` or `pull` on a history db | none |
 | `:nextomic/nested` | `transact!`, `with` or `excise!` while the file's write transaction is held (a `with` scope, a transaction function, another connection to the same file) | none |
 | `:nextomic/tx-fn` | a transaction function that cannot run | the message names the unbound symbol, or the depth limit and its value |

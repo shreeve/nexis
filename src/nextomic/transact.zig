@@ -540,6 +540,13 @@ const Ctx = struct {
         return error.ValueType;
     }
 
+    /// `ValueType`: keyword `k`, as the program wrote it, is not of
+    /// the enumeration `attr` takes.
+    fn notEnum(self: *Ctx, attr: *const Attr, k: Value) error{ValueType} {
+        if (self.fault) |f| f.* = .{ .attr = self.attrValue(attr.id), .given = k };
+        return error.ValueType;
+    }
+
     /// `NoEntity`: `v`, as the program wrote it, names no entity.
     fn noEntity(self: *Ctx, v: Value) error{NoEntity} {
         if (self.fault) |f| if (f.given == null) {
@@ -608,6 +615,21 @@ const Ctx = struct {
         if (use == .match) return .{ .val = .{ .keyword = (try self.minter.lookup(k)) orelse no_keyword } };
         if (attr.id == boot.ident) return .{ .ident = k };
         return .{ .val = .{ .keyword = try self.mintKeyword(k) } };
+    }
+
+    /// Whether keyword `k` may be asserted under attribute `a`: any
+    /// keyword, but `:db/valueType`, `:db/cardinality` and `:db/unique`
+    /// take their enumeration's bootstrap idents alone, so a typo mints
+    /// nothing.
+    fn enumAllows(self: *Ctx, a: u32, k: u32) !bool {
+        const first: u32, const last: u32 = switch (a) {
+            boot.value_type => .{ boot.type_long, boot.type_boolean },
+            boot.cardinality => .{ boot.card_one, boot.card_many },
+            boot.unique => .{ boot.unique_identity, boot.unique_value },
+            else => return true,
+        };
+        const id = (try self.minter.lookup(k)) orelse return false;
+        return id >= first and id <= last;
     }
 
     /// The attribute as a program names it: its ident, else its id.
@@ -1078,6 +1100,7 @@ const Ctx = struct {
             .instant => return .{ .val = .{ .instant = datom_mod.longOf(v) orelse return error.ValueType } },
             .keyword => {
                 if (v.kind() != .keyword) return error.ValueType;
+                if (use == .assert and !try self.enumAllows(attr.id, v.asKeywordId())) return self.notEnum(attr, v);
                 return self.keywordValue(attr, v.asKeywordId(), use);
             },
             .ref => {
@@ -1245,6 +1268,9 @@ const Ctx = struct {
                     break :blk x;
                 }
                 if (!key.isAttrPartition(eid)) return self.conflict(eid, boot.ident);
+                // The store and every build know the bootstrap idents by
+                // their ids and names alike (§2.4).
+                if (eid < boot.next_aid) return self.schemaRefused(@intCast(eid), null, "a bootstrap ident is never renamed");
                 // Two renames of one entity are two card-one values of
                 // its `:db/ident`; the first would retire a name no
                 // commit ever showed.
@@ -1520,6 +1546,9 @@ const Ctx = struct {
 
     fn checkAttrValue(self: *Ctx, e: u64, attr: *const Attr, v: Val) !void {
         if (attr.value_type == .ref and !key.isAttrPartition(v.ref) and v.ref < key.user_partition_start) return error.NoEntity;
+        // A schema attribute describes an attribute: on a user or
+        // transaction entity it would install nothing.
+        if (isSchemaAttr(attr.id) and !key.isAttrPartition(e)) return self.malformed("a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", .{ .attr = attr.id });
         switch (attr.id) {
             boot.value_type => if (boot.valueTypeOf(v.keyword) == null) return error.ValueType,
             boot.cardinality => if (v.keyword != boot.card_one and v.keyword != boot.card_many) return error.ValueType,
@@ -1527,6 +1556,15 @@ const Ctx = struct {
             boot.ident => if (e != v.keyword) return self.conflict(e, attr.id),
             else => {},
         }
+    }
+
+    /// `:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
+    /// `:db/isComponent` and `:db/fulltext`.
+    fn isSchemaAttr(a: u32) bool {
+        return switch (a) {
+            boot.value_type, boot.cardinality, boot.unique, boot.index, boot.is_component, boot.fulltext => true,
+            else => false,
+        };
     }
 
     fn expandAdd(self: *Ctx, e: u64, attr: *const Attr, v: Val) !void {
