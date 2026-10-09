@@ -655,7 +655,7 @@ fn bestParseNanos(heap: *Heap, text: []const u8) !u64 {
 test "A9: reading a decimal integer grows subquadratically in its digits" {
     // An unoptimized build times the checks of `std`'s limb loops, not
     // the algorithm: the ratio is measured in release builds only.
-    if (@import("builtin").mode == .debug) return error.SkipZigTest;
+    if (@import("builtin").optimize == .debug) return error.SkipZigTest;
     var heap = Heap.init(std.testing.allocator);
     defer heap.deinit();
     var prng = std.Random.DefaultPrng.init(prng_seed +% 19);
