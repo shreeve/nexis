@@ -25,17 +25,19 @@ up. Every fix starts with its failing test (`AGENTS.md`).
    engine owner's call. On the nexis side the levers left are batching
    (`docs/PERF.md` §6 "Batched commits") and a smaller page, which
    changes the format's key bound (`docs/NEXTOMIC.md` §2).
-4. **Durable commits cost two device flushes.** A `:durable` commit
-   is 2.24 ms against Datalevin's 2.02 ms on the Linux host
-   (`docs/PERF.md` §3.15): emdb syncs data, then meta, with two
-   `fdatasync`, where Datalevin issues one and an `O_DSYNC` meta
-   write. The commit protocol is emdb's; nexis changes nothing in emdb
-   (`AGENTS.md`), so this is the engine owner's call. emdb needs the
-   two ordered barriers, data before the meta page (its INV-T07A and
-   INV-M02; it keeps no write-ahead log); a cheaper second barrier, an
-   `fdatasync` of the data then a `pwrite` of the meta page through an
-   `O_DSYNC` descriptor, keeps that order, and is an emdb candidate
-   with this measurement as its reason, not yet scheduled.
+4. **A durable commit writes more pages than Datalevin's.** A
+   `:durable` Nextomic commit of one datom is 2.22 ms against
+   Datalevin's 1.98 ms on the Linux host, 1.12× (`docs/PERF.md` §3
+   "Durable commits"). The flushes are not the difference: emdb's
+   durable commit runs level with LMDB's (515 against 521 commits a
+   second on ext4), its second flush costs the same in any form, and
+   nexis adds no sync or write of its own (two `fdatasync` and no
+   other system call a commit). The gap is the pages: the transaction
+   writes 14 of 16 KiB where Datalevin writes 13 of 4 KiB, at about
+   35 μs a page, and 6 or 7 of the 14 are the transaction entity's
+   `:db/txInstant` datom and the history Datalevin does not keep.
+   Every lever left changes the store's format (`docs/PERF.md` §6
+   "Fewer pages per durable commit"); none is scheduled.
 
 13. **A captured local, and `sort`, keep the seq.** The compiler clears a local
     or a parameter at its last move (`docs/COMPILER.md` §4.9), and the
