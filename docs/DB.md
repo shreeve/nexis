@@ -509,7 +509,7 @@ None: a ref has no heap children. `conn` points at a non-heap
 | A write on a file opened read-only | `TxnReadOnly` | `:db/read-only` |
 | A second `close` | none | none (nil) |
 | Encode of a kind with no serialized form (CODEC.md §3) | `UnserializableKind` | `:unserializable` |
-| Stored bytes that do not decode | any other `CodecError`, `Overflow`, `InvalidListTail`, `EmptyName` | `:codec-failed` |
+| Stored bytes that do not decode | `TruncatedInput`, `MalformedPayload`, `Overflow`, `EmptyName` | `:codec-failed` |
 
 emdb errors map by `failureName`: `:db/key-too-large` (a key past
 4078 bytes, emdb's bound for the pinned 16 KiB page),
