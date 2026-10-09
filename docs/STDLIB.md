@@ -2,9 +2,10 @@
 
 The contract for the parts of the standard library that no kind doc
 owns: the namespaces and how they boot, the core text natives,
-`nexis.string`, `nexis.set`, printing (`src/format.zig`) and the I/O
-natives. The natives are in `src/stdlib.zig`, one table per
-namespace; the rest of the library is nexis in `src/stdlib/*.nx`.
+`nexis.string`, `nexis.set`, printing (`src/format.zig`), the I/O
+natives and the documentation `doc` reads (§10). The natives are in
+`src/stdlib.zig`, one table per namespace; the rest of the library is
+nexis in `src/stdlib/*.nx`.
 Errors are catchable keywords; a wrong argument count is
 `:arity-mismatch` for every native (the VM checks the declared
 arity).
@@ -621,3 +622,45 @@ multimethod: the registry's keys hash by address, so past eight
 entries the image's rebuilt map would iterate in another order and
 `image.verify` would fail the build.
 
+
+---
+
+### 10. Documentation
+
+`doc`, `find-doc`, `apropos`, `dir` and `dir-fn` are Clojure's
+`clojure.repl` functions, in `nexis.core` (`core.nx`), so a program
+and the REPL both have them with no `require`. They read
+documentation from four places:
+
+- **A Var's metadata.** `defn`, `defmacro` and `def` put a docstring
+  in `:doc` and the parameter vectors in `:arglists`
+  (MACROEXPAND.md §10). The library's own functions and macros carry
+  theirs this way, in the stdlib image.
+- **A native's table row** (`src/stdlib.zig`). Each row ends with two
+  strings, the arglists as `doc` prints them (`"[coll] [n coll]"`)
+  and the docstring; Nextomic's natives, whose descriptors live in
+  `src/nextomic/`, have theirs in `nextomic_docs`, keyed by the
+  descriptor's name. The text is in the binary, not the image: the
+  Var a native was installed in takes `{:arglists (...) :doc "..."
+  :name name :ns ns}` as its metadata the first time `meta` reads a
+  Var with none, the arglists read by the reader, and keeps it. Another
+  Var holding the native, `(def f first)`, takes nothing.
+- **The special forms and host macros**, which have no Var
+  (MACROEXPAND.md §2b, §10): `(nexis.internal/#%special-docs)` builds
+  a doc map for each from `special_docs`: `{:name if :forms [(if test
+  then else?)] :doc "..." :special-form true}`, or for a host macro
+  `{:ns nexis.core :name defn :arglists (...) :doc "..." :macro true}`.
+- **The library namespaces**, whose `ns` docstrings are not kept:
+  `(nexis.internal/#%namespace-doc 'nexis.string)` is the text from
+  `namespace_docs`, nil for another namespace.
+
+| Name | Arity | Behaviour |
+|---|---|---|
+| `doc` | macro | `(doc name)` prints the documentation of what `name` names, looked up in this order: a special form or host macro (`&` is `fn`'s, `catch` and `finally` are `try`'s; `nexis.core/defn` is `defn`), a namespace, then the Var `resolve` finds. Clojure's layout: a line of 25 dashes, the qualified name, each of a special form's forms after two spaces, the arglists as `prn` prints them, `Special Form` or `Macro`, then two spaces and the docstring as written (its own lines indented by its author, two spaces by convention). Prints nothing for a name that names nothing; nil |
+| `find-doc` | 1 | `(find-doc re-string-or-pattern)` prints, as `doc` does, every Var of every namespace (`ns-interns`, sorted by name within each), then every library namespace, then every special form and host macro, whose docstring or name `re-find` matches; nil |
+| `apropos` | 1 | `(apropos str-or-pattern)` → the sorted qualified symbols of every public Var outside `nexis.internal`, and of every host macro as `nexis.core/name`, whose name contains the string or has a match for the regex |
+| `dir-fn` | 1 | `(dir-fn ns)` → the sorted symbols naming the public Vars of the namespace the symbol `ns` names, or that an alias of the current namespace names; for `nexis.core` the host macros as well. `:no-such-namespace` when it names none |
+| `dir` | macro | `(dir ns)` prints `(dir-fn 'ns)` one name per line; nil |
+
+Clojure's `source` has no counterpart: a Var does not record the
+file and line it came from.

@@ -561,8 +561,8 @@ with `defmacro` (`STDLIB.md` §1):
   iterator per binding, the innermost walking a chunk at a time where
   its coll is chunked, `:let`, `:when` and `:while` inside the chunk;
   one binding and no modifiers is `map`, `docs/LAZY.md` §7), `doseq`
-  (`for`'s modifiers, for effect, yielding nil), `letfn`, `declare`, `doc` (prints a Var's
-  `:arglists` and `:doc`), `cond->`, `cond->>`, `some->`, `some->>`,
+  (`for`'s modifiers, for effect, yielding nil), `letfn`, `declare`, `doc` and `dir`
+  (`STDLIB.md` §10), `cond->`, `cond->>`, `some->`, `some->>`,
   `as->`, `vswap!`, `binding` (`(do (push-thread-bindings ...) (try
   body (finally (pop-thread-bindings))))`, `VM.md` §6.5),
   `with-tx`, `with-read-tx`, `with-snapshot` (`DB.md`), `defmulti`

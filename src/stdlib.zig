@@ -73,22 +73,53 @@ const VmError = vm_mod.VmError;
 // the full body when the leaf body refuses some receivers with
 // `NeedsReentry` (`NativeFn.general`); `.consumes` after a native that
 // consumes its last argument (`NativeFn.consumes`), and
-// `.consuming_leaf` after a leaf whose full body does. `table` turns
-// it into static descriptors (immortal, so a `.native_fn` Value can
-// point at one); a descriptor outside nexis.core is named `ns/name`
-// for traces and printing.
+// `.consuming_leaf` after a leaf whose full body does. The row ends
+// with two strings, the native's arglists as `doc` prints them and its
+// docstring (`Doc`, STDLIB.md §10). `table` turns it into static
+// descriptors (immortal, so a `.native_fn` Value can point at one); a
+// descriptor outside nexis.core is named `ns/name` for traces and
+// printing. `docs` turns it into the parallel array of `Doc`s.
 
 fn table(comptime ns: []const u8, comptime entries: anytype) [entries.len]NativeFn {
     var out: [entries.len]NativeFn = undefined;
-    inline for (entries, 0..) |e, i| out[i] = .{
-        .name = if (ns.len == 0) e[0] else ns ++ "/" ++ e[0],
-        .min_arity = e[1],
-        .max_arity = e[2],
-        .call = e[3],
-        .leaf = if (e.len > 4) e[4] == .leaf or e[4] == .consuming_leaf else false,
-        .consumes = if (e.len > 4) e[4] == .consumes or e[4] == .consuming_leaf else false,
-        .general = if (e.len > 5) e[5] else null,
-    };
+    inline for (entries, 0..) |e, i| {
+        out[i] = .{
+            .name = if (ns.len == 0) e[0] else ns ++ "/" ++ e[0],
+            .min_arity = e[1],
+            .max_arity = e[2],
+            .call = e[3],
+        };
+        inline for (4..e.len) |j| switch (@TypeOf(e[j])) {
+            @TypeOf(.enum_literal) => {
+                out[i].leaf = e[j] == .leaf or e[j] == .consuming_leaf;
+                out[i].consumes = e[j] == .consumes or e[j] == .consuming_leaf;
+            },
+            *const fn (*VM, []const Value) VmError!Value => out[i].general = e[j],
+            else => {},
+        };
+    }
+    return out;
+}
+
+/// What `doc` prints of a native beside its name: `arglists`, the
+/// text of its `:arglists` list (`([coll] [n coll])`), and `doc`, its
+/// docstring. They live in the binary, not the stdlib image, and a
+/// native's Var gets its metadata from them the first time `meta`
+/// asks for it (`nativeVarMeta`).
+pub const Doc = struct { arglists: []const u8 = "", doc: []const u8 = "" };
+
+fn docs(comptime entries: anytype) [entries.len]Doc {
+    @setEvalBranchQuota(100 * entries.len + 1000);
+    var out: [entries.len]Doc = undefined;
+    inline for (entries, 0..) |e, i| {
+        var strings: [2][]const u8 = .{ "", "" };
+        var n: usize = 0;
+        inline for (4..e.len) |j| if (@typeInfo(@TypeOf(e[j])) == .pointer and @typeInfo(@typeInfo(@TypeOf(e[j])).pointer.child) == .array) {
+            strings[n] = e[j];
+            n += 1;
+        };
+        out[i] = .{ .arglists = if (n == 2) "(" ++ strings[0] ++ ")" else "", .doc = strings[1] };
+    }
     return out;
 }
 
@@ -210,12 +241,12 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
 };
 
-const core_natives = table("", .{
+const core_rows = .{
     // Sequence primitives.
     .{ "list", 0, null, &fnList },
     .{ "list*", 1, null, &fnListStar },
     .{ "cons", 2, 2, &fnCons },
-    .{ "first", 1, 1, &fnFirst },
+    .{ "first", 1, 1, &fnFirst, "[coll]", "The first item of coll, through seq; nil when coll is nil or empty." },
     .{ "rest", 1, 1, &fnRest },
     .{ "second", 1, 1, &fnSecond },
     .{ "take", 1, 2, &fnTake },
@@ -488,9 +519,11 @@ const core_natives = table("", .{
     .{ "exit", 0, 1, &fnExit },
     // The durable-ref natives are `db_natives`, in the `db`
     // namespace, so they are called as `(db/open ...)`.
-});
+};
+const core_natives = table("", core_rows);
+const core_docs = docs(core_rows);
 
-const db_natives = table("db", .{
+const db_rows = .{
     // Connection + ref + auto-ephemeral primitives.
     .{ "open", 1, 2, &fnDbOpen },
     .{ "close", 1, 1, &fnDbClose },
@@ -520,9 +553,11 @@ const db_natives = table("db", .{
     .{ "snapshot", 1, 1, &fnDbBeginRead },
     .{ "release-snapshot!", 1, 1, &fnDbAbortRead },
     .{ "snapshot?", 1, 1, &fnDbSnapshotQ },
-});
+};
+const db_natives = table("db", db_rows);
+const db_docs = docs(db_rows);
 
-const string_natives = table("nexis.string", .{
+const string_rows = .{
     .{ "lower-case", 1, 1, &fnStringLowerCase },
     .{ "upper-case", 1, 1, &fnStringUpperCase },
     .{ "trim", 1, 1, &fnStringTrim },
@@ -540,9 +575,11 @@ const string_natives = table("nexis.string", .{
     .{ "replace", 3, 3, &fnStringReplace },
     .{ "replace-first", 3, 3, &fnStringReplaceFirst },
     .{ "re-quote-replacement", 1, 1, &fnStringReQuoteReplacement },
-});
+};
+const string_natives = table("nexis.string", string_rows);
+const string_docs = docs(string_rows);
 
-const math_natives = table("nexis.math", .{
+const math_rows = .{
     .{ "sqrt", 1, 1, &fnMathSqrt },
     .{ "pow", 2, 2, &fnMathPow },
     .{ "floor", 1, 1, &fnMathFloor },
@@ -568,9 +605,11 @@ const math_natives = table("nexis.math", .{
     .{ "signum", 1, 1, mathOf1(signum) },
     .{ "to-radians", 1, 1, mathOf1(toRadians) },
     .{ "to-degrees", 1, 1, mathOf1(toDegrees) },
-});
+};
+const math_natives = table("nexis.math", math_rows);
+const math_docs = docs(math_rows);
 
-const internal_natives = table("nexis.internal", .{
+const internal_rows = .{
     // Records.
     .{ "#%register-record-type", 2, 2, &fnRegisterRecordType },
     .{ "#%make-record", 2, 2, &fnMakeRecord },
@@ -608,14 +647,21 @@ const internal_natives = table("nexis.internal", .{
     .{ "#%pop-out", 0, 0, &fnPopOut },
     // A multimethod's cached method (core.nx `mm-call`, STDLIB.md §9.3).
     .{ "#%mm-lookup", 3, 3, &fnMmLookupLeaf, .leaf, &fnMmLookup },
-});
+    // doc, find-doc, apropos and dir (core.nx, STDLIB.md §10).
+    .{ "#%special-docs", 0, 0, &fnSpecialDocs },
+    .{ "#%namespace-doc", 1, 1, &fnNamespaceDoc },
+    .{ "#%the-ns-name", 1, 1, &fnTheNsName },
+};
+const internal_natives = table("nexis.internal", internal_rows);
 
-const simd_natives = table("nexis.simd", .{
+const simd_rows = .{
     .{ "sum", 1, 1, &fnSimdSum },
     .{ "dot", 2, 2, &fnSimdDot },
     .{ "scale", 2, 2, &fnSimdScale },
     .{ "map", 2, 2, &fnSimdMap },
-});
+};
+const simd_natives = table("nexis.simd", simd_rows);
+const simd_docs = docs(simd_rows);
 
 // =============================================================================
 // Implementations
@@ -3370,10 +3416,16 @@ fn carriesHeaderMeta(k: Kind) bool {
 }
 
 /// `(meta x)` → the metadata map of a list, vector, map, set, record,
-/// atom or Var; nil for anything else or when none is attached.
-fn fnMeta(_: *VM, args: []const Value) VmError!Value {
+/// atom or Var; nil for anything else or when none is attached. The
+/// Var a native was installed in takes the native's documentation as
+/// its metadata the first time it is asked for (`nativeVarMeta`).
+fn fnMeta(vm: *VM, args: []const Value) VmError!Value {
     const x = args[0];
-    if (x.kind() == .var_) return VM.asVar(x).meta;
+    if (x.kind() == .var_) {
+        const v = VM.asVar(x);
+        if (v.meta.isNil()) v.meta = try nativeVarMeta(vm, v);
+        return v.meta;
+    }
     if (!carriesHeaderMeta(x.kind()) and x.kind() != .atom) return value_mod.nilValue();
     const m = heap_mod.Heap.asHeapHeader(x).getMeta() orelse return value_mod.nilValue();
     // The metadata is a hash map or, when with-meta was given one, a
@@ -3452,6 +3504,198 @@ fn fnAlterMeta(vm: *VM, args: []const Value) VmError!Value {
     const next = try vm.callValue(args[1], call_args);
     try setRefMeta(vm, args[0], next);
     return next;
+}
+
+// =============================================================================
+// Documentation (STDLIB.md §10)
+// =============================================================================
+//
+// `doc`, `find-doc`, `apropos` and `dir` (core.nx) read a Var's
+// `:doc` and `:arglists`. A `defn` or `defmacro` in the embedded
+// sources carries them in the image; a native's live in its table row
+// (`Doc`) and reach its Var's metadata when `meta` first asks
+// (`nativeVarMeta`), so they cost the image and the boot nothing. The
+// special forms, the host macros and the namespaces have no Var
+// metadata to carry them: `special_docs` and `namespace_docs` hold
+// theirs.
+
+/// The tables whose natives have docs, each with its `Doc`s.
+const documented = .{
+    .{ &core_natives, &core_docs },
+    .{ &db_natives, &db_docs },
+    .{ &string_natives, &string_docs },
+    .{ &math_natives, &math_docs },
+    .{ &simd_natives, &simd_docs },
+};
+
+/// The `Doc` of the native `d`: from its table row, or from
+/// `nextomic_docs` for one of Nextomic's, which keep their descriptors
+/// in src/nextomic.
+pub fn nativeDoc(d: *const NativeFn) ?Doc {
+    inline for (documented) |t| {
+        const first = @intFromPtr(&t[0][0]);
+        const at = @intFromPtr(d);
+        if (at >= first and at < first + t[0].len * @sizeOf(NativeFn)) {
+            const doc = t[1][(at - first) / @sizeOf(NativeFn)];
+            return if (doc.doc.len == 0) null else doc;
+        }
+    }
+    return nextomic_docs.get(d.name);
+}
+
+/// The metadata of `v` when it is the Var a native was installed in
+/// (not another Var holding it, `(def f first)`) and the native has a
+/// `Doc`: `{:arglists (...) :doc "..." :name name :ns ns}`, as a
+/// `defn`'s; nil otherwise.
+fn nativeVarMeta(vm: *VM, v: *vm_mod.Var) VmError!Value {
+    if (!v.bound or v.root.kind() != .native_fn) return value_mod.nilValue();
+    const d = vm_mod.asNativeFn(v.root);
+    const home = if (std.mem.eql(u8, v.ns, "nexis.core"))
+        std.mem.eql(u8, d.name, v.name)
+    else
+        d.name.len == v.ns.len + 1 + v.name.len and std.mem.startsWith(u8, d.name, v.ns) and d.name[v.ns.len] == '/' and std.mem.endsWith(u8, d.name, v.name);
+    if (!home) return value_mod.nilValue();
+    const doc = nativeDoc(d) orelse return value_mod.nilValue();
+    return docMap(vm, &.{
+        .{ "arglists", try readDocForm(vm, doc.arglists) },
+        .{ "doc", string_mod.fromBytes(vm.ensureHeap(), doc.doc) catch return VmError.OutOfMemory },
+        .{ "name", vm.ensureInterner().internSymbolValue(v.name) catch return VmError.OutOfMemory },
+        .{ "ns", vm.ensureInterner().internSymbolValue(v.ns) catch return VmError.OutOfMemory },
+    });
+}
+
+/// The form `text` reads as; the text is the binary's own, so it reads.
+fn readDocForm(vm: *VM, text: []const u8) VmError!Value {
+    const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
+    return (try hooks.read_string(hooks.user_data, vm, text)) orelse value_mod.nilValue();
+}
+
+/// A map of keyword keys to values. `Heap.alloc` never collects, so
+/// the values need no root while it is built.
+fn docMap(vm: *VM, fields: []const struct { []const u8, Value }) VmError!Value {
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    for (fields) |f| m = try mapPut(heap, m, vm.ensureInterner().internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
+    return m;
+}
+
+/// A special form's or host macro's documentation: `forms`, the text
+/// of its `:forms` vector for a special form or of its `:arglists`
+/// list for a host macro, and `doc`.
+const SpecialDoc = struct { name: []const u8, forms: []const u8, doc: []const u8, macro: bool = false };
+
+/// `(#%special-docs)` → a vector of the doc maps of the special forms
+/// and the host macros (MACROEXPAND.md §2b, §10): `{:name sym :forms
+/// [...] :doc "..." :special-form true}` for a special form,
+/// `{:ns nexis.core :name sym :arglists (...) :doc "..." :macro true}`
+/// for a host macro, as `doc` prints them.
+fn fnSpecialDocs(vm: *VM, _: []const Value) VmError!Value {
+    const scope = vm.rootScope();
+    defer scope.release();
+    const interner = vm.ensureInterner();
+    const yes = value_mod.fromBool(true);
+    for (special_docs) |s| {
+        // Reading runs no code, but the maps already made stay rooted.
+        const forms = try readDocForm(vm, s.forms);
+        const name = interner.internSymbolValue(s.name) catch return VmError.OutOfMemory;
+        const doc = string_mod.fromBytes(vm.ensureHeap(), s.doc) catch return VmError.OutOfMemory;
+        try scope.push(if (s.macro) try docMap(vm, &.{
+            .{ "ns", interner.internSymbolValue("nexis.core") catch return VmError.OutOfMemory },
+            .{ "name", name },
+            .{ "arglists", forms },
+            .{ "doc", doc },
+            .{ "macro", yes },
+        }) else try docMap(vm, &.{
+            .{ "name", name },
+            .{ "forms", forms },
+            .{ "doc", doc },
+            .{ "special-form", yes },
+        }));
+    }
+    return vector_mod.fromSlice(vm.ensureHeap(), vm.roots.items[scope.base..]) catch VmError.OutOfMemory;
+}
+
+/// `(#%namespace-doc sym)` → the docstring of the library namespace
+/// `sym` names, nil for any other.
+fn fnNamespaceDoc(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .symbol) return VmError.KindMismatch;
+    const doc = namespace_docs.get(vm.ensureInterner().symbolName(args[0].asSymbolId())) orelse return value_mod.nilValue();
+    return string_mod.fromBytes(vm.ensureHeap(), doc) catch VmError.OutOfMemory;
+}
+
+/// `(#%the-ns-name sym)` → the name of the namespace `sym` names in the
+/// current namespace, an alias or a namespace's own name, as a symbol;
+/// nil when it names none. `dir` takes either.
+fn fnTheNsName(vm: *VM, args: []const Value) VmError!Value {
+    if (args[0].kind() != .symbol) return VmError.KindMismatch;
+    const text = vm.ensureInterner().symbolName(args[0].asSymbolId());
+    const registry = vm.ensureRegistry() catch return VmError.OutOfMemory;
+    const name = vm.ensureNamespace().lookupAlias(text) orelse text;
+    const ns = registry.lookupNs(name) orelse return value_mod.nilValue();
+    return vm.ensureInterner().internSymbolValue(ns.name) catch VmError.OutOfMemory;
+}
+
+/// The special forms (MACROEXPAND.md §2b) and the host macros (§10).
+const special_docs = [_]SpecialDoc{
+    .{ .name = "quote", .forms = "[(quote form)]", .doc = "Yields the unevaluated form. 'form reads as (quote form)." },
+    .{ .name = "var", .forms = "[(var symbol)]", .doc = "The Var, not its value, that symbol names. #'x reads as (var x).\n  A Var is callable, and deref yields its value." },
+    .{ .name = "if", .forms = "[(if test then else?)]", .doc = "Evaluates test. If it is neither nil nor false, evaluates and yields\n  then, otherwise else, nil when there is none." },
+    .{ .name = "do", .forms = "[(do exprs*)]", .doc = "Evaluates the exprs in order and yields the value of the last, nil\n  when there are none." },
+    .{ .name = "recur", .forms = "[(recur exprs*)]", .doc = "Rebinds the bindings of the closest enclosing loop, or the params of\n  the enclosing fn clause, to the values of the exprs and jumps back to\n  it in constant stack. Must be in tail position, with one value per\n  binding." },
+    .{ .name = "throw", .forms = "[(throw expr)]", .doc = "Throws the value of expr, which may be any value: a keyword (:oops),\n  a map, an ex-info map. try's catch clauses match it by tag." },
+    .{ .name = "let*", .forms = "[(let* [bindings*] exprs*)]", .doc = "The primitive under let: binds each symbol to the value of its init in\n  order, without destructuring. Programs use let." },
+    .{ .name = "loop*", .forms = "[(loop* [bindings*] exprs*)]", .doc = "The primitive under loop: let* that is also a recur target. Programs\n  use loop." },
+    .{ .name = "fn*", .forms = "[(fn* name? [params*] exprs*) (fn* name? ([params*] exprs*) +)]", .doc = "The primitive under fn, a clause per arity, without destructuring.\n  Programs use fn." },
+    .{ .name = "letfn*", .forms = "[(letfn* [fnspecs*] exprs*)]", .doc = "The primitive under letfn: mutually recursive local functions.\n  Programs use letfn." },
+    .{ .name = "def", .forms = "[(def symbol doc-string? init?)]", .doc = "Interns a Var named symbol in the current namespace and, given init,\n  sets its root to init's value. ^meta on the symbol and the doc-string\n  go into the Var's metadata with :name and :ns. Yields the Var." },
+    .{ .name = "set!", .forms = "[(set! var-symbol expr)]", .doc = "Sets the binding in force of a ^:dynamic Var that binding has bound:\n  :no-thread-binding outside a binding, :not-dynamic for a Var that is\n  not dynamic. A local cannot be set!." },
+    .{ .name = "try", .forms = "[(try expr* catch-clause* finally-clause?)]", .doc = "Evaluates the exprs. A value thrown from them is tried against each\n  catch clause in order; the first that matches binds name to it and\n  yields its exprs, and a value none matches is thrown on. A matcher is\n  any or :default, which match every value; a keyword :tag, which\n  matches :tag itself, a map or record whose :error is :tag, and an\n  ex-info map whose data's :error is :tag, so (catch :divide-by-zero e\n  ...) catches the runtime's error of that tag; or a Java class name:\n  ArithmeticException, ClassCastException and the others that name a\n  nexis error match its tags, and any other (Exception, Throwable)\n  matches every value. The finally exprs run for effect however the\n  try ends." },
+    .{ .name = "defmacro", .forms = "[(defmacro name doc-string? attr-map? [params*] body) (defmacro name doc-string? attr-map? ([params*] body) +)]", .doc = "Defines name as a macro: a function called at compile time with the\n  unevaluated argument forms, whose result is compiled in place of the\n  call. Spelled as defn; &form and &env are not available." },
+    .{ .name = "ns", .forms = "[(ns name doc-string? attr-map? references*)]", .doc = "Makes name the current namespace, creating it with nexis.core\n  referred. A reference is (:require spec*), as require takes;\n  (:refer-clojure :exclude [names]), which makes those names the\n  namespace's own; or (:gen-class), which is accepted and does nothing.\n  The doc-string and attr-map are accepted and not kept." },
+    .{ .name = "require", .forms = "[(require spec*)]", .doc = "Loads each namespace at compile time, once. A spec is ns-name or\n  [ns-name option*], quoted or not; the options are :as alias,\n  :as-alias alias, :refer [names] or :refer :all, and :rename {from to}.\n  my.app-core loads my/app_core.nx from the working directory or the\n  running file's. The library namespaces need no require to be called\n  qualified; requiring clojure.string, clojure.set, clojure.test,\n  clojure.pprint, clojure.walk, clojure.edn or clojure.math names their\n  nexis.* counterpart." },
+    .{ .name = "let", .macro = true, .forms = "([bindings*] exprs*)", .doc = "binding => binding-form init-expr\n  Evaluates the exprs with each binding-form bound to its init-expr's\n  value, in order. A binding-form is a symbol, a vector pattern\n  ([a b & more :as all]) or a map pattern ({:keys [a b] :or {b 0} :as\n  m}, :strs, :syms, {x :k}); patterns nest." },
+    .{ .name = "fn", .macro = true, .forms = "([name? [params*] exprs*] [name? ([params*] exprs*) +])", .doc = "A function. Params destructure as let's bindings; & rest takes the\n  remaining arguments. Several clauses make one function of several\n  arities. A first body form that is a map with :pre and :post vectors\n  holds conditions checked before and after, % the result. A named fn\n  can call itself by its name." },
+    .{ .name = "defn", .macro = true, .forms = "([name doc-string? attr-map? [params*] prepost-map? body] [name doc-string? attr-map? ([params*] prepost-map? body) +])", .doc = "(def name (fn name [params*] body)) with the doc-string, the\n  attr-map and the :arglists in the Var's metadata. The function calls\n  itself through its own name, so redefining name later does not change\n  the calls an earlier function makes to itself; (#'name ...) calls\n  through the Var." },
+    .{ .name = "defn-", .macro = true, .forms = "([name & decls])", .doc = "defn with :private true in the Var's metadata, which ns-publics and\n  (require '[ns :refer :all]) skip." },
+    .{ .name = "loop", .macro = true, .forms = "([bindings*] exprs*)", .doc = "let whose bindings recur rebinds: (recur v ...) in tail position\n  jumps back to the top of the loop with one new value per binding, in\n  constant stack. The binding-forms destructure again on each pass." },
+    .{ .name = "when", .macro = true, .forms = "([test & body])", .doc = "Evaluates test. If it is neither nil nor false, evaluates body in an\n  implicit do and yields the last value; nil otherwise." },
+    .{ .name = "when-not", .macro = true, .forms = "([test & body])", .doc = "Evaluates test. If it is nil or false, evaluates body in an implicit\n  do and yields the last value; nil otherwise." },
+    .{ .name = "and", .macro = true, .forms = "([] [x] [x & next])", .doc = "Evaluates the exprs one at a time, left to right. Yields the first\n  value that is nil or false without evaluating the rest, else the last\n  value; (and) is true." },
+    .{ .name = "or", .macro = true, .forms = "([] [x] [x & next])", .doc = "Evaluates the exprs one at a time, left to right. Yields the first\n  value that is neither nil nor false without evaluating the rest, else\n  the last value; (or) is nil." },
+    .{ .name = "cond", .macro = true, .forms = "([& clauses])", .doc = "Takes test/expr pairs and evaluates each test in turn; for the first\n  that is neither nil nor false, yields its expr's value. nil when none\n  holds; :else as the last test always holds." },
+    .{ .name = "->", .macro = true, .forms = "([x & forms])", .doc = "Threads x through the forms: inserts it as the second item of the\n  first form (making a list of a form that is not one), then that\n  result into the second form, and so on." },
+    .{ .name = "->>", .macro = true, .forms = "([x & forms])", .doc = "Threads x through the forms: inserts it as the last item of the first\n  form (making a list of a form that is not one), then that result into\n  the second form, and so on." },
+    .{ .name = "case", .macro = true, .forms = "([expr & clauses])", .doc = "Evaluates expr and yields the result of the clause whose constant is =\n  to it: clauses are constant result-expr pairs, a list of constants\n  (k1 k2) groups alternatives, and a lone last expr is the default. The\n  constants are not evaluated. With no match and no default, throws\n  {:error :no-matching-clause :message \"No matching clause: v\" :value v}." },
+    .{ .name = "condp", .macro = true, .forms = "([pred expr & clauses])", .doc = "Yields the result of the first clause for which (pred test-expr expr)\n  holds; clauses are test-expr result-expr pairs, test-expr :>> f calls\n  f on pred's result, and a lone last expr is the default. With no\n  match and no default, throws :no-matching-clause as case does." },
+    .{ .name = "defrecord", .macro = true, .forms = "([name [fields*] & specs])", .doc = "Defines a record type: a map with the fields as keys that is\n  (instance? name x), with the constructors ->name and map->name, the\n  predicate name?, and the protocol methods the specs implement, each\n  (method [this args*] body) after its protocol's name, the fields in\n  scope as locals. name is bound to the record's type symbol, ns.name." },
+    .{ .name = "defprotocol", .macro = true, .forms = "([name doc-string? & sigs])", .doc = "Defines a protocol: each sig, (method [this args*]+ doc-string?),\n  becomes a function that calls the implementation for its first\n  argument's type, which defrecord, extend-type and extend-protocol\n  install. :no-protocol-impl when there is none." },
+    .{ .name = "extend-type", .macro = true, .forms = "([type & specs])", .doc = "Implements protocols for type: a kind keyword (:string, :vector,\n  :fixnum, :any), nil, a record name, or a Clojure class name standing\n  for its kinds (String, Long, Object for any). specs are a protocol\n  name followed by its methods, (method [this args*] body)." },
+    .{ .name = "extend-protocol", .macro = true, .forms = "([protocol & specs])", .doc = "Implements protocol for several types at once: each type, spelled as\n  extend-type takes it, is followed by its methods, (method [this\n  args*] body)." },
+};
+
+/// The library's namespaces (STDLIB.md §1).
+const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "nexis.core", "The core library, referred into every namespace: Clojure's clojure.core\n  without the JVM (no interop, threads, STM or agents), with durable\n  refs and the Nextomic database beside it." },
+    .{ "db", "Durable refs: values kept in emdb stores and read and written in\n  transactions: open, ref, get-key, put-key!, alter!, scan, with\n  nexis.core's with-tx, with-read-tx and with-snapshot around them." },
+    .{ "nextomic", "Nextomic, a Datomic-class database in the same process: datoms,\n  transact!, Datalog q, pull, entity, as-of, since, history and with.\n  Required as [nextomic :as d] by convention." },
+    .{ "nexis.string", "Clojure's clojure.string, which names it: join, split, replace,\n  trim, upper-case and the rest. Strings index by code point." },
+    .{ "nexis.set", "Clojure's clojure.set, which names it: union, intersection,\n  difference, select, subset?, superset?, rename-keys and map-invert." },
+    .{ "nexis.walk", "Clojure's clojure.walk, which names it: walk, postwalk, prewalk,\n  keywordize-keys, stringify-keys and the replace functions." },
+    .{ "nexis.edn", "Clojure's clojure.edn, which names it: read-string over the nexis\n  reader, evaluating nothing." },
+    .{ "nexis.math", "Clojure's clojure.math, which names it: sqrt, pow, the trigonometric\n  and exponential functions, floor, ceil, round, PI and E." },
+    .{ "nexis.test", "Clojure's clojure.test, which names it: deftest, is, are, testing,\n  fixtures and run-tests. `nexis test FILE` runs a file's tests." },
+    .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
+    .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
+    .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
+});
+
+/// The docs of Nextomic's natives (NEXTOMIC.md), by descriptor name.
+const nextomic_docs = std.StaticStringMap(Doc).initComptime(.{
+    .{ "nextomic/connect", nextomicDoc("[path] [path opts]", "TODO") },
+});
+
+fn nextomicDoc(comptime arglists: []const u8, comptime doc: []const u8) Doc {
+    return .{ .arglists = "(" ++ arglists ++ ")", .doc = doc };
 }
 
 // =============================================================================

@@ -516,19 +516,6 @@
 ; Control-flow macros
 ; ============================================================
 
-; (doc name) → prints the Var's :arglists and :doc, the way a
-; REPL shows them; nil. A defn carries them once it is given a
-; docstring or attribute map.
-(defmacro doc [name]
-  `(let* [m# (meta (var ~name))
-          arglists# (:arglists m#)
-          docstring# (:doc m#)]
-     (println "-------------------------")
-     (println '~name)
-     (when arglists# (println arglists#))
-     (when docstring# (println " " docstring#))
-     nil))
-
 ; (declare a b ...) → interns each name as an unbound Var so a
 ; later definition can be referred to before it appears, even
 ; when a macro will produce that definition.
@@ -1493,3 +1480,90 @@
 ; The arguments after the program on the command line, as a vector
 ; of strings; nil when there are none. `nexis run` binds it.
 (def *command-line-args* nil)
+
+; ============================================================
+; Documentation (STDLIB.md §10)
+; ============================================================
+
+; The doc map of a special form or host macro, from the runtime's
+; table; `&`, `catch` and `finally` are documented with fn and try.
+(defn- special-doc [sym]
+  (let [sym (get '{& fn catch try finally try} sym sym)
+        sym (if (= (namespace sym) "nexis.core") (symbol (name sym)) sym)]
+    (some (fn [m] (when (= (:name m) sym) m)) (nexis.internal/#%special-docs))))
+
+(defn- namespace-doc [ns-sym]
+  (when-let [d (nexis.internal/#%namespace-doc ns-sym)]
+    {:name ns-sym :doc d}))
+
+; What `doc` prints of a doc map, in Clojure's layout.
+(defn- print-doc [m]
+  (println "-------------------------")
+  (println (str (when-let [n (:ns m)] (str n "/")) (:name m)))
+  (doseq [f (:forms m)] (print "  ") (prn f))
+  (when-let [a (:arglists m)] (prn a))
+  (cond (:special-form m) (println "Special Form")
+        (:macro m) (println "Macro"))
+  (when-let [d (:doc m)] (println " " d)))
+
+; The doc map of what sym names: a special form or host macro, a
+; library namespace, else the Var it resolves to; nil for none.
+(defn- doc-of [sym]
+  (or (special-doc sym)
+      (when (find-ns sym) (or (namespace-doc sym) {:name sym}))
+      (when-let [v (resolve sym)] (or (meta v) {:name sym}))))
+
+(defmacro doc
+  "Prints the documentation of the Var, special form, macro or namespace
+  that name names: its qualified name, its arglists, whether it is a
+  macro or special form, and its docstring. Prints nothing when name
+  names nothing. nil."
+  [name]
+  `(when-let [m# (#'nexis.core/doc-of '~name)] (#'nexis.core/print-doc m#)))
+
+(defn find-doc
+  "Prints the documentation of every Var, special form, macro and
+  namespace whose docstring or name has a match for re-string-or-pattern,
+  a string or a regex. nil."
+  [re-string-or-pattern]
+  (let [re (re-pattern re-string-or-pattern)
+        ms (concat (mapcat (fn [ns] (sort-by :name (keep meta (vals (ns-interns ns))))) (all-ns))
+                   (keep namespace-doc (all-ns))
+                   (nexis.internal/#%special-docs))]
+    (doseq [m ms
+            :when (and (:doc m) (or (re-find re (:doc m)) (re-find re (str (:name m)))))]
+      (print-doc m))))
+
+(defn apropos
+  "Given a regex or a string, a sorted seq of the qualified symbols of
+  every public Var, and of every host macro, whose name has a match for
+  the regex or contains the string. nexis.internal is left out."
+  [str-or-pattern]
+  (let [match? (if (= :regex (class str-or-pattern))
+                 (fn [s] (re-find str-or-pattern s))
+                 (fn [s] (nexis.string/includes? s (str str-or-pattern))))]
+    (sort (concat (mapcat (fn [ns]
+                            (when-not (= ns 'nexis.internal)
+                              (keep (fn [s] (when (match? (str s)) (symbol (str ns) (str s))))
+                                    (keys (ns-publics ns)))))
+                          (all-ns))
+                  (keep (fn [m] (when (and (:macro m) (match? (str (:name m))))
+                                  (symbol "nexis.core" (str (:name m)))))
+                        (nexis.internal/#%special-docs))))))
+
+(defn dir-fn
+  "A sorted seq of the symbols naming the public Vars of the namespace
+  ns names, or that an alias in the current namespace names; for
+  nexis.core, its host macros (defn, let, cond, ...) as well.
+  :no-such-namespace when it names none."
+  [ns]
+  (let [n (or (nexis.internal/#%the-ns-name ns) (the-ns ns))]
+    (sort (concat (keys (ns-publics n))
+                  (when (= n 'nexis.core)
+                    (keep (fn [m] (when (:macro m) (:name m))) (nexis.internal/#%special-docs)))))))
+
+(defmacro dir
+  "Prints a sorted directory of the public Vars of the namespace, or
+  namespace alias, nsname names, one per line. nil."
+  [nsname]
+  `(doseq [v# (dir-fn '~nsname)] (println v#)))
