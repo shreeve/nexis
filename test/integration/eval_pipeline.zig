@@ -8714,3 +8714,11 @@ test "nexis.test: run-tests takes any number of namespaces" {
         \\[(nexis.test/run-tests 'user 'user) (nexis.test/run-tests)]
     , "[{:test 2, :pass 2, :fail 0, :error 0} {:test 1, :pass 1, :fail 0, :error 0}]");
 }
+
+test "nexis.set/difference walks the smaller set and keeps the first's kind" {
+    try expectOutput(
+        \\(let [big (set (range 100000))]
+        \\  [(nexis.set/difference #{1 -2} big) (nexis.set/difference #{1 2 3} #{2 9 8 7 6}) (nexis.set/difference #{1 2 3 4 5} #{2})
+        \\   (nexis.set/difference (sorted-set 3 1 2) #{1 7 8 9} #{3}) (sorted? (nexis.set/difference (sorted-set 3 1 2) big)) (nexis.set/difference #{1})])
+    , "[#{-2} #{1 3} #{1 3 4 5} #{2} true #{1}]");
+}

@@ -268,7 +268,7 @@ are absent (STRING.md §6).
 |---|---|---|
 | `union` | 0+ | Every element of any argument, poured `into` the largest, which keeps its kind and metadata: `(union (sorted-set 3 1) #{2})` is a sorted set; `(union)` is `#{}`, one argument is itself (`(union nil)` is nil) |
 | `intersection` | 1+ | The elements of the first set present in every other one, `disj`ed from the smallest, which keeps its kind; with one argument, that argument unchanged |
-| `difference` | 1+ | The first set without the elements of the others; the first must be a set (`disj`), else `:kind-mismatch` |
+| `difference` | 1+ | The first set without the elements of the others, as Clojure's: of each pair the smaller set is walked, the first's elements tested against the second's when it has fewer; the first must be a set (`disj`), else `:kind-mismatch` |
 | `subset?`, `superset?` | 2 | Whether every element of the first is in the second (`subset?`), or the reverse |
 | `select` | 2 | `(select pred s)`: `s` without the elements for which `pred` is falsy (`disj`), so of `s`'s kind |
 | `map-invert` | 1 | The map with keys and values swapped; of duplicate values, the key iterated last wins |
