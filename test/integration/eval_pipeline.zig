@@ -5528,14 +5528,16 @@ test "defrecord: map-like get / assoc / dissoc / contains?" {
         \\        c2 (assoc c :n 99)]
         \\    [(Counter? c2) (get c2 :n)]))
     , "[true 99]");
-    // `dissoc` likewise preserves record type.
+    // `dissoc` of a declared field leaves a plain map with the record's
+    // metadata, as Clojure's record `without`; of any other key, a record.
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])
-        \\  (let [c (->Counter 5)
-        \\        c2 (dissoc c :n)]
-        \\    [(Counter? c2) (get c2 :n)]))
-    , "[true nil]");
+        \\  (let [c (with-meta (->Counter 5) {:m 1})
+        \\        c2 (dissoc c :n)
+        \\        c3 (dissoc (assoc c :x 1) :x)]
+        \\    [(Counter? c2) (record? c2) c2 (meta c2) (Counter? c3) c3 (record? (dissoc c :x :n)) (Counter? (dissoc c :x)) (Counter? (dissoc c :user/n))]))
+    , "[false false {} {:m 1} true #user.Counter{:n 5} false true true]");
     try expectOutputProgram(
         \\(do
         \\  (defrecord Counter [n])

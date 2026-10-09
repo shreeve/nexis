@@ -2147,7 +2147,8 @@ fn assocOne(vm: *VM, coll: Value, k: Value, v: Value) VmError!Value {
     };
 }
 
-/// `(dissoc m k & ks)` → persistent remove from a map or record.
+/// `(dissoc m k & ks)` → persistent remove from a map or record; a
+/// record without one of its declared fields is a map.
 fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
     if (args[0].kind() == .sorted_map) return sortedRemoveAll(vm, args[0], args[1..]);
     const heap = vm.ensureHeap();
@@ -2158,12 +2159,30 @@ fn fnDissoc(vm: *VM, args: []const Value) VmError!Value {
             .nil => coll,
             .record => blk: {
                 const new_fields = champ_mod.mapDissoc(heap, record_mod.fieldsOf(coll), k, &dispatch_mod.hashValue, &dispatch_mod.equal) catch return VmError.OutOfMemory;
+                // Without a declared field it is no longer the type: a
+                // plain map keeping the metadata, as Clojure's record
+                // `without` makes it (PROTOCOLS.md §0).
+                if (isDeclaredField(vm, coll, k)) {
+                    if (heap_mod.Heap.asHeapHeader(coll).getMeta() == null) break :blk new_fields;
+                    break :blk try fnWithMeta(vm, &.{ new_fields, try fnMeta(vm, &.{coll}) });
+                }
                 break :blk record_mod.withFields(heap, coll, new_fields) catch return VmError.OutOfMemory;
             },
             else => return VmError.KindMismatch,
         };
     }
     return coll;
+}
+
+/// Whether `k` is a field the record `rec`'s `defrecord` declared.
+fn isDeclaredField(vm: *VM, rec: Value, k: Value) bool {
+    if (k.kind() != .keyword) return false;
+    const entry = vm.recordType(record_mod.typeId(rec)) orelse return false;
+    const name = vm.ensureInterner().keywordName(k.asKeywordId());
+    for (entry.field_names) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
 }
 
 /// `(disj s x & xs)` → set without the elements.

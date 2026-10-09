@@ -31,8 +31,10 @@ natives and `satisfies?`).
 
 Records are map-like for `get`, `(:k rec)`, `assoc`, `dissoc`,
 `contains?`, `keys`, `vals`, `count`, `empty?`, `find` and `seq`.
-`assoc` and `dissoc` return a record of the same type (a `dissoc` of
-a declared field included); `empty` returns `{}`.
+`assoc` returns a record of the same type, and so does `dissoc` of
+any key but a declared field; `dissoc` of a declared field returns a
+plain map of the other entries, with the record's metadata, as
+Clojure's record `without` does. `empty` returns `{}`.
 
 `defrecord` binds the type name to the record's type, as Clojure binds
 its class: `Counter` is the symbol `user.Counter` (namespace, `.`,
@@ -87,7 +89,8 @@ cached in the header. Records work as map keys and set members.
 
 **Metadata** (`docs/SEMANTICS.md` §7): a record carries it in its
 header like a map, through `with-meta`, and keeps it through `assoc`
-and `dissoc` (`record.withFields`). It never takes part in `=`, hash
+and `dissoc` (`record.withFields`, or the map a `dissoc` of a declared
+field makes). It never takes part in `=`, hash
 or printing.
 
 **Print**: `#ns.Type{:field value, ...}` in both modes, as Clojure
