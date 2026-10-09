@@ -667,7 +667,7 @@ const internal_rows = .{
     .{ "#%extend-default-impl", 3, 3, &fnExtendDefaultImpl },
     // try: the keyword-matcher test the expander emits.
     .{ "#%catch-matches?", 2, 2, &fnCatchMatches },
-    .{ "#%raise", 1, 3, &fnRaise },
+    .{ "#%raise", 1, 4, &fnRaise },
     // `& {:keys ...}`: the rest seq as a map.
     .{ "#%kwargs", 1, 1, &fnKwargs },
     .{ "#%load-next", 2, 2, &fnLoadNext },
@@ -6167,10 +6167,11 @@ fn fnBoundQ(_: *VM, args: []const Value) VmError!Value {
 }
 
 /// `(nano-time)` → a monotonic clock in nanoseconds, for measuring
-/// intervals (Java's `System/nanoTime`).
+/// intervals (Java's `System/nanoTime`): a 64-bit count, a bignum past
+/// the fixnum range (about 39 hours of the host's awake time), so an
+/// interval never spans a wrap.
 fn fnNanoTime(vm: *VM, _: []const Value) VmError!Value {
-    const now = std.Io.Clock.awake.now(ioOf(vm));
-    return value_mod.fromFixnum(@intCast(@mod(now.nanoseconds, value_mod.fixnum_max))) orelse VmError.ArithmeticOverflow;
+    return integerValue(vm, @truncate(std.Io.Clock.awake.now(ioOf(vm)).nanoseconds));
 }
 
 /// `(slurp path)` → the file's text. `:file-not-found` for a missing
@@ -7526,23 +7527,30 @@ fn fnKwargs(vm: *VM, args: []const Value) VmError!Value {
     return m;
 }
 
-/// `(#%raise tag message x?)` → throws the library's own error `tag`
-/// as the runtime throws one of its own (docs/VM.md §13): the map
+/// `(#%raise tag message x? data?)` → throws the library's own error
+/// `tag` as the runtime throws one of its own (docs/VM.md §13): the map
 /// `{:error tag :message m}`, `m` being `message` followed by the kind
 /// of `x` when given ("num takes a number or nil, got a string"), with
-/// the place of the program's call when a handler is in force.
-/// `(#%raise m)` throws the error map `m`, placed the same way.
+/// the entries of the map `data` added, and the place of the program's
+/// call when a handler is in force. `(#%raise m)` throws the error map
+/// `m`, placed the same way.
 fn fnRaise(vm: *VM, args: []const Value) VmError!Value {
     if (args.len == 1) {
         if (args[0].kind() != .persistent_map) return VmError.KindMismatch;
         return vm.throwErrorMap(args[0]);
     }
     if (args[0].kind() != .keyword or args[1].kind() != .string) return VmError.KindMismatch;
+    if (args.len == 4 and args[3].kind() != .persistent_map) return VmError.KindMismatch;
     const text = string_mod.asBytes(args[1]);
-    if (args.len == 2) return raiseTagged(vm, args[0], text, &.{});
-    const message = vm.allocator.print("{s} {s}", .{ text, vm_mod.kindPhrase(args[2].kind()) }) catch return VmError.OutOfMemory;
-    defer vm.allocator.free(message);
-    return raiseTagged(vm, args[0], message, &.{});
+    const message = if (args.len == 2) text else vm.allocator.print("{s} {s}", .{ text, vm_mod.kindPhrase(args[2].kind()) }) catch return VmError.OutOfMemory;
+    defer if (args.len > 2) vm.allocator.free(message);
+    var m = vm.errorValue(args[0], message, null);
+    if (m.kind() != .persistent_map) return vm.throwValue(m);
+    if (args.len == 4) {
+        var it = champ_mod.mapIter(args[3]);
+        while (it.next()) |e| m = try mapPut(vm.ensureHeap(), m, e.key, e.value);
+    }
+    return vm.throwErrorMap(m);
 }
 
 /// Throw the library's error `{:error :tag :message message}` with the
@@ -7551,11 +7559,7 @@ fn fnRaise(vm: *VM, args: []const Value) VmError!Value {
 /// bare keyword when memory is exhausted.
 fn raise(vm: *VM, comptime tag: []const u8, message: []const u8, fields: []const KeywordField) VmError {
     const kw = vm.ensureInterner().internKeywordValue(tag) catch return VmError.OutOfMemory;
-    return raiseTagged(vm, kw, message, fields);
-}
-
-fn raiseTagged(vm: *VM, tag: Value, message: []const u8, fields: []const KeywordField) VmError {
-    var m = vm.errorValue(tag, message, null);
+    var m = vm.errorValue(kw, message, null);
     if (m.kind() != .persistent_map) return vm.throwValue(m);
     m = try keywordAssoc(vm, m, fields);
     return vm.throwErrorMap(m);

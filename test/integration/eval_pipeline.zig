@@ -8752,6 +8752,8 @@ test "#%raise of a map throws it with the place of the program's call" {
     try expectOutput("(try (nexis.internal/#%raise {:error :no-method :value 1 :message \"m\"}) (catch :no-method e [(:fn e) (:value e) (:message e)]))", "[test-form 1 m]");
     try expectOutput("(try (nexis.internal/#%raise :kind-mismatch \"f takes a number, got\" \"s\") (catch any e [(:fn e) (:message e)]))", "[test-form f takes a number, got a string]");
     try expectOutput("(try (nexis.internal/#%raise [1]) (catch any e (:error e)))", ":kind-mismatch");
+    try expectOutput("(try (nexis.internal/#%raise :no-method \"f has no method for\" 1 {:value 1}) (catch :no-method e [(:fn e) (:value e) (:message e)]))", "[test-form 1 f has no method for an integer]");
+    try expectOutput("(try (nexis.internal/#%raise :no-method \"m\" 1 [1]) (catch any e (:error e)))", ":kind-mismatch");
 }
 
 test "json: write-str escapes U+2028 and U+2029 unless :escape-js-separators is false" {
@@ -8780,4 +8782,8 @@ test "with-meta of a fn is a fn carrying the map, calling as the original" {
 
 test "gc: a fn's metadata and captures survive the cycles after with-meta" {
     try expectOutputUnderGc(churn ++ "(let [x (str \"cap\" 1) f (with-meta (fn [] x) {:k (str \"m\" 2)})] (dotimes [i 20] (churn i)) [(f) (:k (meta f))])", "[cap1 m2]");
+}
+
+test "nano-time is an integer that never runs backwards" {
+    try expectOutput("(let [a (nano-time) b (nano-time)] [(integer? a) (<= a b) (>= (- b a) 0)])", "[true true true]");
 }
