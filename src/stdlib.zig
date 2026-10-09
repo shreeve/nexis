@@ -242,6 +242,8 @@ pub const embedded = [_]image_mod.Source{
     .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
     // The environment and the working directory.
     .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx") } },
+    // Clojure's clojure.java.shell.
+    .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx") } },
 };
 
 const core_rows = .{
@@ -657,6 +659,8 @@ const internal_rows = .{
     // The natives under nexis.sys (sys.nx, STDLIB.md §11).
     .{ "#%getenv", 0, 1, &fnGetenv },
     .{ "#%cwd", 0, 0, &fnCwd },
+    // nexis.shell/sh (shell.nx, STDLIB.md §11).
+    .{ "#%sh", 2, 2, &fnSh },
 };
 const internal_natives = table("nexis.internal", internal_rows);
 
@@ -3760,6 +3764,7 @@ const namespace_docs = std.StaticStringMap([]const u8).initComptime(.{
     .{ "nexis.test", "Clojure's clojure.test, which names it: deftest, is, are, testing,\n  fixtures and run-tests. `nexis test FILE` runs a file's tests." },
     .{ "nexis.pprint", "Clojure's clojure.pprint, which names it: pprint and pprint-str." },
     .{ "nexis.sys", "The process's environment and working directory: getenv and cwd.\n  exit and *command-line-args* are nexis.core's." },
+    .{ "nexis.shell", "Clojure's clojure.java.shell: sh runs a program and returns\n  {:exit :out :err}; with-sh-dir and with-sh-env set its defaults." },
     .{ "nexis.simd", "Kernels over typed vectors (i64-vector, f64-vector): sum, dot,\n  scale and map." },
     .{ "nexis.internal", "The helpers macro expansions call. Not for programs." },
 });
@@ -6405,7 +6410,7 @@ fn fnExit(vm: *VM, args: []const Value) VmError!Value {
 }
 
 // =============================================================================
-// The process's environment (nexis.sys, STDLIB.md §10)
+// The process's environment (nexis.sys, STDLIB.md §11)
 // =============================================================================
 //
 // Every native here reads its arguments, allocates its result last and
@@ -6457,6 +6462,170 @@ fn fnCwd(vm: *VM, _: []const Value) VmError!Value {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.process.currentPath(ioOf(vm), &buf) catch return VmError.IoError;
     return lossyString(vm, buf[0..n]);
+}
+
+/// `(#%sh argv opts)` → `{:exit status :out text :err text}`: runs the
+/// program `argv` names (its first string, found on the PATH as the
+/// shell finds it) with the rest as its arguments, and waits for it.
+/// `opts` maps `:in` to the text written to its stdin (nil: none, the
+/// child reads end of input at once), `:dir` to its working directory
+/// and `:env` to the whole of its environment, each nil for the
+/// process's own. One thread feeds stdin and drains stdout and stderr
+/// together, so neither side waits on a full pipe. A VM with no `io`
+/// spawns nothing (`:io-error`).
+fn fnSh(vm: *VM, args: []const Value) VmError!Value {
+    const io = vm.io orelse return VmError.IoError;
+    var arena_state = std.heap.ArenaAllocator.init(vm.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const interner = vm.ensureInterner();
+
+    if (args[0].kind() != .persistent_vector) return VmError.KindMismatch;
+    const argc = vector_mod.count(args[0]);
+    if (argc == 0) return vm.fail(VmError.InvalidArgument, "sh: no command to run", .{});
+    const argv = arena.alloc([]const u8, argc) catch return VmError.OutOfMemory;
+    for (argv, 0..) |*a, i| {
+        const s = vector_mod.nth(args[0], i);
+        if (s.kind() != .string) return VmError.KindMismatch;
+        a.* = string_mod.asBytes(s);
+        if (std.mem.findScalar(u8, a.*, 0) != null) return vm.fail(VmError.InvalidArgument, "sh: an argument holds a NUL byte", .{});
+    }
+
+    var input: ?[]const u8 = null;
+    var cwd: std.process.Child.Cwd = .inherit;
+    var env: ?std.process.Environ.Map = null;
+    if (!args[1].isNil()) {
+        if (args[1].kind() != .persistent_map) return VmError.KindMismatch;
+        var it = champ_mod.mapIter(args[1]);
+        while (it.next()) |e| {
+            const name = if (e.key.kind() == .keyword) interner.keywordName(e.key.asKeywordId()) else "";
+            if (std.mem.eql(u8, name, "in")) {
+                if (e.value.isNil()) continue;
+                if (e.value.kind() != .string) return VmError.KindMismatch;
+                input = string_mod.asBytes(e.value);
+            } else if (std.mem.eql(u8, name, "dir")) {
+                if (!e.value.isNil()) cwd = .{ .path = try vm_mod.pathArg(e.value) };
+            } else if (std.mem.eql(u8, name, "env")) {
+                if (e.value.isNil()) continue;
+                if (!isMap(e.value.kind())) return VmError.KindMismatch;
+                env = try shEnviron(vm, arena, e.value);
+            } else return vm.fail(VmError.InvalidArgument, "sh: no option {s}", .{name});
+        }
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd,
+        .environ_map = if (env) |*m| m else null,
+        .stdin = if (input != null) .pipe else .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch |err| return switch (err) {
+        error.OutOfMemory => VmError.OutOfMemory,
+        error.FileNotFound => vm.fail(VmError.FileNotFound, "sh: cannot run {s}", .{argv[0]}),
+        else => vm.fail(VmError.IoError, "sh: cannot run {s}: {t}", .{ argv[0], err }),
+    };
+    defer child.kill(io);
+
+    var out: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&out) |*o| o.deinit(vm.allocator);
+    try shExchange(vm, io, &child, input orelse "", &out);
+    const term = child.wait(io) catch return VmError.IoError;
+    const status: i64 = switch (term) {
+        .exited => |code| code,
+        .signal, .stopped => |sig| 128 + @as(i64, @backingInt(sig)),
+        .unknown => |code| code,
+    };
+
+    const heap = vm.ensureHeap();
+    var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
+    const fields = [_]struct { []const u8, Value }{
+        .{ "exit", value_mod.fromFixnum(status) orelse return VmError.ArithmeticOverflow },
+        .{ "out", try lossyString(vm, out[0].items) },
+        .{ "err", try lossyString(vm, out[1].items) },
+    };
+    for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
+    return m;
+}
+
+/// The environment `:env` gives a command: each key's name (a string
+/// as it is, a keyword or symbol by `name`) bound to its value's
+/// `str`, as Clojure's `as-env-strings` makes it.
+fn shEnviron(vm: *VM, arena: std.mem.Allocator, map: Value) VmError!std.process.Environ.Map {
+    var env = std.process.Environ.Map.init(arena);
+    // Each entry lies in the map, reachable from it across the call
+    // back into the VM that realizing a value can make.
+    var it = MapEntries.of(map).?;
+    while (it.next()) |entry| {
+        const key = entry.key;
+        const name = if (key.kind() == .string) string_mod.asBytes(key) else intern_mod.Interner.splitQualified(try internedName(vm, key)).name;
+        var w = std.Io.Writer.Allocating.init(arena);
+        try appendStrValue(vm, &w, entry.value);
+        if (!std.process.Environ.Map.validateKeyForPut(name) or std.mem.findScalar(u8, w.written(), 0) != null)
+            return vm.fail(VmError.InvalidArgument, "sh: no environment variable can be named {s}", .{name});
+        env.put(name, w.written()) catch return VmError.OutOfMemory;
+    }
+    return env;
+}
+
+/// Write `input` to the child's stdin while reading its stdout and
+/// stderr into `out`, until both reach their end. A write never
+/// exceeds the 512 bytes POSIX guarantees a pipe that polls writable
+/// takes at once, so it never blocks; a child that closes its stdin
+/// early leaves the rest of `input` unwritten.
+fn shExchange(vm: *VM, io: std.Io, child: *std.process.Child, input: []const u8, out: *[2]std.ArrayList(u8)) VmError!void {
+    var storage: [3]std.Io.Operation.Storage = undefined;
+    var batch = std.Io.Batch.init(&storage);
+    defer batch.cancel(io);
+    var bufs: [2][16 * 1024]u8 = undefined;
+    var read_vecs: [2][1][]u8 = .{ .{&bufs[0]}, .{&bufs[1]} };
+    const files = [2]std.Io.File{ child.stdout.?, child.stderr.? };
+    for (0..2) |i| batch.addAt(@intCast(i), .{ .file_read_streaming = .{ .file = files[i], .data = &read_vecs[i] } });
+    var rest = input;
+    var write_vec: [1][]const u8 = undefined;
+    var open: usize = 2;
+    if (child.stdin) |stdin| {
+        if (rest.len == 0) {
+            stdin.close(io);
+            child.stdin = null;
+        } else {
+            write_vec[0] = rest[0..@min(rest.len, 512)];
+            batch.addAt(2, .{ .file_write_streaming = .{ .file = stdin, .data = &write_vec } });
+            open += 1;
+        }
+    }
+    while (open > 0) {
+        batch.awaitConcurrent(io, .none) catch return VmError.IoError;
+        while (batch.next()) |done| switch (done.index) {
+            0, 1 => {
+                const i = done.index;
+                const n = done.result.file_read_streaming catch |err| switch (err) {
+                    error.EndOfStream => {
+                        open -= 1;
+                        continue;
+                    },
+                    else => return VmError.IoError,
+                };
+                out[i].appendSlice(vm.allocator, bufs[i][0..n]) catch return VmError.OutOfMemory;
+                batch.addAt(i, .{ .file_read_streaming = .{ .file = files[i], .data = &read_vecs[i] } });
+            },
+            else => {
+                const n = done.result.file_write_streaming catch |err| switch (err) {
+                    error.BrokenPipe => rest.len,
+                    else => return VmError.IoError,
+                };
+                rest = rest[n..];
+                if (rest.len == 0) {
+                    child.stdin.?.close(io);
+                    child.stdin = null;
+                    open -= 1;
+                    continue;
+                }
+                write_vec[0] = rest[0..@min(rest.len, 512)];
+                batch.addAt(2, .{ .file_write_streaming = .{ .file = child.stdin.?, .data = &write_vec } });
+            },
+        };
+    }
 }
 
 // =============================================================================

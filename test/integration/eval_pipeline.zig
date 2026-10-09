@@ -4941,6 +4941,64 @@ test "sys: cwd is the working directory's absolute path" {
     try expectOutput("(nexis.sys/cwd)", cwd);
 }
 
+/// `expectOutput` with the VM given the test's `std.Io`, as `bin/nexis`
+/// gives it the CLI's: `sh` spawns through it.
+fn expectOutputWithIo(src: []const u8, expected: []const u8) !void {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    program.v.io = testing.io;
+    try harness.expectResult(&program, src, try program.run(src), expected);
+}
+
+test "shell: sh returns the exit status and the output of both streams" {
+    try expectOutputWithIo(
+        \\(nexis.shell/sh "sh" "-c" "printf out; printf err >&2; exit 3")
+    , "{:exit 3, :out out, :err err}");
+    try expectOutputWithIo("(nexis.shell/sh \"true\")", "{:exit 0, :out , :err }");
+    // A signal's status is 128 plus its number, as Java reports it.
+    try expectOutputWithIo("(:exit (nexis.shell/sh \"sh\" \"-c\" \"kill -9 $$\"))", "137");
+    // Output that is not UTF-8 reads as U+FFFD.
+    try expectOutputWithIo("(:out (nexis.shell/sh \"printf\" \"a\\\\377b\"))", "a\u{FFFD}b");
+}
+
+test "shell: sh feeds :in to the command, past any pipe's buffer" {
+    try expectOutputWithIo("(:out (nexis.shell/sh \"cat\" :in \"h\u{e9}llo\"))", "h\u{e9}llo");
+    try expectOutputWithIo("(:out (nexis.shell/sh \"cat\" :in nil))", "");
+    // Both directions at once: the command writes as it reads.
+    try expectOutputWithIo("(count (:out (nexis.shell/sh \"cat\" :in (apply str (repeat 200000 \"0123456789\")))))", "2000000");
+    // A command that stops reading early leaves the rest unwritten.
+    try expectOutputWithIo("(nexis.shell/sh \"head\" \"-c\" \"3\" :in (apply str (repeat 200000 \"0123456789\")))", "{:exit 0, :out 012, :err }");
+}
+
+test "shell: sh runs in :dir and with :env, or *sh-dir* and *sh-env*" {
+    try expectOutputWithIo("(:out (nexis.shell/sh \"pwd\" :dir \"/\"))", "/\n");
+    try expectOutputWithIo("(:out (nexis.shell/with-sh-dir \"/\" (nexis.shell/sh \"pwd\")))", "/\n");
+    try expectOutputWithIo(
+        \\(:out (nexis.shell/sh "sh" "-c" "echo $A-$B" :env {"A" "x" :B 2}))
+    , "x-2\n");
+    try expectOutputWithIo(
+        \\(nexis.shell/with-sh-env {"A" "y"} (:out (nexis.shell/sh "sh" "-c" "echo $A")))
+    , "y\n");
+    // An explicit option wins over the binding.
+    try expectOutputWithIo(
+        \\(nexis.shell/with-sh-env {"A" "y"} (:out (nexis.shell/sh "sh" "-c" "echo $A" :env {"A" "z"})))
+    , "z\n");
+}
+
+test "shell: sh refuses what it cannot run" {
+    try expectOutputWithIo("(try (nexis.shell/sh \"nexis-no-such-program\") (catch any e e))", ":file-not-found");
+    try expectOutputWithIo("(try (nexis.shell/sh \"pwd\" :dir \"/nexis-no-such-dir\") (catch any e e))", ":file-not-found");
+    try expectOutputWithIo("(try (nexis.shell/sh) (catch any e e))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :out-enc :bytes) (catch any e e))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :in 5) (catch any e e))", ":kind-mismatch");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :env {\"A=B\" 1}) (catch any e e))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"echo\" \"a\\u0000b\") (catch any e e))", ":invalid-argument");
+    try expectOutputWithIo("(try (nexis.shell/sh \"ls\" :dir) (catch any e e))", ":arity-mismatch");
+    // A VM with no I/O spawns nothing.
+    try expectOutput("(try (nexis.shell/sh \"true\") (catch any e e))", ":io-error");
+}
+
 // =============================================================================
 // case / condp / for macros
 // =============================================================================

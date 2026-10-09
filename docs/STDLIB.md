@@ -26,7 +26,8 @@ registry; the CLI (`cli.zig` `Runtime.init`) and the test harness
 3. The image of the embedded sources is loaded (below). Without one,
    the sources themselves are evaluated, each with its namespace
    current: `core.nx`, `nextomic.nx`, `walk.nx`, `edn.nx`, `test.nx`,
-   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`.
+   `pprint.nx`, `math.nx`, `string.nx`, `set.nx`, `sys.nx`,
+   `shell.nx`.
 4. Every namespace in the registry is marked loaded, so a `require`
    of one only makes the alias.
 
@@ -107,6 +108,7 @@ Var inside a `binding`.
 | `nexis.edn` | — | `edn.nx` | §4 |
 | `nexis.math` | `math_natives` | `math.nx` (`PI`, `E`, `floor-div`, `floor-mod`) | TOOLING.md §4 |
 | `nexis.sys` | (`#%getenv`, `#%cwd` in `internal_natives`) | `sys.nx` | §11 |
+| `nexis.shell` | (`#%sh` in `internal_natives`) | `shell.nx` | §11 |
 | `nexis.test` | — | `test.nx` | TOOLING.md §3 |
 | `nexis.pprint` | — | `pprint.nx` | TOOLING.md §4 |
 | `nexis.simd` | `simd_natives` | — | TYPED_VECTOR.md §7.2 |
@@ -683,11 +685,11 @@ file and line it came from.
 
 ---
 
-### 11. The process: `nexis.sys`
+### 11. The process: `nexis.sys` and `nexis.shell`
 
 `src/stdlib/sys.nx` holds the process's environment and working
-directory, each function a docstring'd `defn` over a native in
-`internal_natives`. `exit` and `*command-line-args*` are
+directory, `src/stdlib/shell.nx` Clojure's `clojure.java.shell`, each
+function a docstring'd `defn` over a native in `internal_natives`. `exit` and `*command-line-args*` are
 `nexis.core`'s (§6): `nexis run` and `nexis -e` both bind the
 arguments after the program. Text the operating system hands over is
 any bytes; each byte that starts no well-formed UTF-8 sequence reads
@@ -697,6 +699,19 @@ as U+FFFD, as Java decodes it.
 |---|---|---|---|
 | `getenv` | 0–1 | `(getenv name)`: the value of the environment variable as a string, nil when it is not set (an empty name, or one holding a NUL byte, is never set); `(getenv)`: every variable as a map of name to value, Clojure's `(System/getenv)`. libc's environment, which nexis never changes | `:kind-mismatch` (a name that is not a string) |
 | `cwd` | 0 | The absolute path of the working directory, Java's `(System/getProperty "user.dir")` | `:io-error` |
+| `sh` | 1+ | `(sh "ls" "-l" :dir "/tmp")`: runs a program and waits for it, returning `{:exit status :out text :err text}`. The leading strings are the program, found on the PATH (`/usr/local/bin:/bin:/usr/bin` when the process has none), and its arguments; keyword options follow. `:in` is text written to the program's stdin, which otherwise reads end of input at once; `:dir` its working directory, else `*sh-dir*`; `:env` a map that is the whole of its environment, each name by `name` and value by `str`, else `*sh-env*`; nil for any of them is the process's own. A signal's status is 128 plus its number, as Java reports it; output that is not UTF-8 reads as U+FFFD | `:invalid-argument` (no program; an option other than these, among them Clojure's `:in-enc` and `:out-enc`; a NUL byte in an argument; a name no variable can have), `:kind-mismatch` (a non-string `:in`, a non-map `:env`), `:arity-mismatch` (an option without its value), `:file-not-found` (no such program, or no such `:dir`), `:io-error` (any other failure to run it; a VM with no `io`) |
+| `*sh-dir*`, `*sh-env*` | Var | Dynamic, nil at the root: the `:dir` and `:env` of a `sh` that gives none | — |
+| `with-sh-dir`, `with-sh-env` | macro | `(with-sh-dir dir body...)`: the body with `*sh-dir*` bound to `dir`; `with-sh-env` the same for `*sh-env*` | — |
 
-`test/integration/eval_pipeline.zig` pins both, a variable holding
-bytes that are not UTF-8 included.
+One thread runs a program's three streams together: it writes `:in`
+to the stdin pipe and drains stdout and stderr through one `std.Io`
+batch (`std.Io.Batch.awaitConcurrent`, a `poll` on POSIX), each
+write at most the 512 bytes POSIX lets a pipe that polls writable take
+at once, so neither side waits on a full pipe whatever the sizes. A
+program that closes its stdin early leaves the rest of `:in`
+unwritten, as Java's does. The program inherits nothing else: no
+terminal, no open file but the three pipes.
+
+`test/integration/eval_pipeline.zig` pins every row, a variable and
+output holding bytes that are not UTF-8 and a `:in` past any pipe's
+buffer included; `sh` runs there with the test's `std.Io`.
