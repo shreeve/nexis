@@ -5087,7 +5087,7 @@ test "time: instants, the clock, durations and order" {
     try expectOutput("(nexis.time/instant 5)", "#nexis.time.Instant{:ms 5}");
     try expectOutput("(let [i (nexis.time/instant 5)] (identical? i (nexis.time/instant i)))", "true");
     try expectOutput("(try (nexis.time/instant :x) (catch any e (ex-message e)))", "instant takes an Instant, an integer or ISO-8601 text, got a keyword");
-    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "inst-ms takes an Instant or an integer, got a string");
+    try expectOutput("(try (nexis.time/inst-ms \"x\") (catch any e (ex-message e)))", "an instant is an Instant or an integer, got a string");
     try expectOutput(
         \\(nexis.time/format (nexis.time/plus (nexis.time/parse "2026-10-09") (nexis.time/days 1) (nexis.time/hours 1) (nexis.time/minutes 30) (nexis.time/seconds 15) 7))
     , "2026-10-10T01:30:15.007Z");
