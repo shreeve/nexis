@@ -8687,3 +8687,22 @@ test "take-nth, replace, random-sample and partitionv-all have Clojure 1.12's tr
         \\ (into [] (partitionv-all 2) [1 2 3]) (transduce (take-nth 2) + (range 7))]
     , "[[0 2 4 6 8] [1] [:a 2 :a] [:x :y 5] [1 2] [] [[1 2] [3]] 12]");
 }
+
+test "nexis.test: thrown-with-msg? passes when the matcher takes the throw and the pattern finds its message" {
+    try expectOutputProgram(
+        \\(def log (atom []))
+        \\(reset! nexis.test/out (fn [line] (swap! log conj line)))
+        \\(nexis.test/deftest msgs
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"a+b" (throw {:error :x :message "caab"})))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? any #"divide" (/ 1 0)))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"zz" (throw {:error :x :message "caab"})) "m")
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :x #"a" (throw :x)))
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? any #"a" 1)))
+        \\(nexis.test/deftest other-tag
+        \\  (nexis.test/is (nexis.test/thrown-with-msg? :y #"a" (throw {:error :x :message "a"}))))
+        \\(def r (nexis.test/run-tests))
+        \\[(:pass r) (:fail r) (:error r) @log]
+    ,
+        \\[2 3 1 [FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"zz" (throw {:error :x, :message "caab"})) expected: #"zz" actual: "caab" ; m FAIL in user/msgs: (nexis.test/thrown-with-msg? :x #"a" (throw :x)) expected: #"a" actual: nil FAIL in user/msgs: (nexis.test/thrown-with-msg? any #"a" 1) expected: any actual: 1 ERROR in user/other-tag: :x a Ran 2 tests containing 5 assertions. 3 failures, 1 errors.]]
+    );
+}

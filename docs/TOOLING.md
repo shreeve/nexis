@@ -345,12 +345,15 @@ the private helpers.
   `(catch MATCHER ...)` would take (a keyword tag, MACROEXPAND.md §2b,
   or `any`) and fails when `expr` returns, reporting the value; a
   throw the matcher does not take propagates and counts as an error.
+  `(is (thrown-with-msg? MATCHER re expr) msg?)` passes when, besides,
+  `re` finds a match in the thrown value's message (`ex-message`), and
+  fails reporting the pattern and the message when it does not.
   `(is expr msg?)` passes when `expr` is truthy. Every `is` returns
   whether it passed. The head is matched by name, so `t/thrown?` and
   `thrown?` are the same. `msg` is evaluated once, after the values,
   whether the assertion passes or fails, as in Clojure. An assertion
   is one call of a helper (`check=`, `check-truthy`; a
-  `thrown?` with a keyword tag is a `try` whose handler calls
+  `thrown?` or `thrown-with-msg?` is a `try` whose handler calls
   `check-thrown`) with the quoted form, the values and the message,
   so the judging and the reporting are compiled once, in
   `nexis.test`: `(is (= a 1))` as a function's body is seven
