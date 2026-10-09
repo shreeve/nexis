@@ -414,7 +414,8 @@ lines; `zig build examples` runs the demo.
 
 **`nexis.pprint`** (`src/stdlib/pprint.nx`): `(pprint x)` prints `x`
 and a newline, `(pprint-str x)` returns the text. A collection whose
-`pr-str` fits within 72 columns from its indent prints on one line,
+`pr-str` fits within `*print-right-margin*` columns (dynamic, 72 at
+the root, as Clojure's) from its indent prints on one line,
 as `pr-str` prints it. A longer one breaks: a map one `key value`
 pair per line, separated by `,`, each value laid out from the column
 after its key; a vector, list or set of scalars filled line by line

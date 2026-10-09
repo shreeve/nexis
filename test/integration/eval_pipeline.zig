@@ -8754,3 +8754,9 @@ test "juxt and every-pred take a function, if-not two or three forms, find-var a
         \\   (get-in {:a {:b 1}} [:a :b]) (get-in nil [:a]) (get-in {:a 1} nil) (get-in 5 [:a])])
     , "[:arity-mismatch :arity-mismatch [2 0] true :compile-error 1 2 find-var takes a qualified symbol, got foo #'nexis.core/inc 1 nil {:a 1} nil]");
 }
+
+test "nexis.pprint lays out within the dynamic *print-right-margin*" {
+    try expectOutput(
+        \\(binding [nexis.pprint/*print-right-margin* 10] (nexis.pprint/pprint-str [1 2 3 4 5 6 7 8]))
+    , "[1 2 3 4 5\n 6 7 8]");
+}
