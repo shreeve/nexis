@@ -360,8 +360,9 @@ so there is no queue; emdb's write lock is the transactor.
    tempid; under any other ref attribute it must name its entity with
    `:db/id` or a unique attribute, since nothing could reach it
    otherwise (`:nextomic/tx-data`). Map forms nest as deep as the
-   native stack allows (`stack.check`); past it the transaction aborts
-   with the VM's `:stack-overflow`. A reverse key `:ns/_attr` in a map
+   native stack allows (`stack.check`), and so does a lookup ref whose
+   value is a lookup ref; past it the transaction aborts with the VM's
+   `:stack-overflow`. A reverse key `:ns/_attr` in a map
    form asserts `[x :ns/attr e]` for each `x` under it: `{:db/id e
    :user/_friends x}` makes `x`, an entity or a map form of one, point
    at `e`, and a vector of them is one referrer each; the attribute must
@@ -1171,7 +1172,7 @@ gives the place and the trace.
 | `:nextomic/query-syntax` | a query the parser or planner refuses, or an unbound function name at run time | `:clause`, the index into `:where`, when inside a clause. A scoping refusal names the variable at fault in the message: a `:find` or `:with` variable nothing binds, the one an `or` branch mentions and another does not, the join variable an `or-join` branch or a rule body leaves unbound, the one a `not` body has that nothing outside binds, the argument, function-position, `not-join` or required `or-join` variable no clause ever binds |
 | `:nextomic/pull-syntax` | a bad pull pattern (from `pull`, `pull-many` or a find element) | `:clause`, the index of the spec |
 | `:kind-mismatch`, `:invalid-argument`, `:arity-mismatch` | the VM's own errors for an argument of the wrong kind (a db-value where a connection belongs), an unknown index, `:sync` or `:durability` option or a negative `t`, or a wrong argument count | as every runtime error's (`docs/VM.md` §13) |
-| `:stack-overflow` | tx-data, a query or a pull pattern nested past the native stack guard | as every runtime error's |
+| `:stack-overflow` | tx-data, a lookup ref (one whose value is a lookup ref, in tx-data or any read), a query or a pull pattern nested past the native stack guard | as every runtime error's |
 | `:db/*` | an engine failure, through `db.failureName` (`:db/key-too-large`, `:db/map-full`, `:db/read-only`, `:db/open-failed`, ...); a store whose bytes do not decode, or name an ident it lacks, or a page that fails the engine's check, is `:db/corrupted` | none; a store of another format names both formats in the message and its own as `:format` |
 
 ---

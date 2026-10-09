@@ -12,7 +12,8 @@
 //!     `TxData`, with a value of the wrong type `ValueType`; a vector
 //!     of any other shape is `TxData`; any other kind is
 //!     `KindMismatch`. `fault` names the attribute or carries the
-//!     reason.
+//!     reason. A lookup ref nested past the native stack guard is
+//!     `StackOverflow`.
 //!   - `valOf`: a VM value under an attribute's type; null when a
 //!     keyword or entity reference names nothing (no datom can match
 //!     it), `ValueType` on a kind mismatch. A long or an instant is
@@ -38,6 +39,7 @@ const db_mod = @import("db.zig");
 const schema_mod = @import("schema.zig");
 const relation = @import("relation.zig");
 const idents_mod = @import("idents.zig");
+const stack = @import("../stack.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = value.Value;
@@ -49,7 +51,7 @@ const Cell = relation.Cell;
 
 /// Everything a conversion can fail with: the contract's own errors,
 /// the store's, and allocation.
-pub const Error = error{ NoEntity, UnknownAttribute, TxData, ValueType, KindMismatch, Corrupted } || key.EncodeError || key.DecodeError || Allocator.Error || db_mod.ErrorsOf(Read.entid) || db_mod.ErrorsOf(Read.attr) || db_mod.ErrorsOf(idents_mod.Idents.idOf);
+pub const Error = error{ NoEntity, UnknownAttribute, TxData, ValueType, KindMismatch, Corrupted } || stack.Error || key.EncodeError || key.DecodeError || Allocator.Error || db_mod.ErrorsOf(Read.entid) || db_mod.ErrorsOf(Read.attr) || db_mod.ErrorsOf(idents_mod.Idents.idOf);
 
 // =============================================================================
 // Sequences
@@ -108,6 +110,8 @@ pub fn attrOf(rd: *Read, v: Value, fault: *Fault) !Attr {
 
 /// The entity `v` refers to (see the module contract).
 pub fn entity(rd: *Read, arena: Allocator, v: Value, fault: *Fault) Error!?u64 {
+    // A lookup ref's value may be a lookup ref: one frame per level.
+    try stack.check();
     switch (v.kind()) {
         .fixnum => {
             const n = v.asFixnum();

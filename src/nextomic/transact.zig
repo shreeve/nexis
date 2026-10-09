@@ -1031,6 +1031,8 @@ const Ctx = struct {
     }
 
     fn convertEntity(self: *Ctx, v: Value) Failure!Ent {
+        // A lookup ref's value may be a lookup ref: one frame per level.
+        try stack.check();
         switch (v.kind()) {
             .fixnum => {
                 const n = v.asFixnum();

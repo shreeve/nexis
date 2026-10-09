@@ -463,3 +463,25 @@ test "a store of another format is refused at connect, naming the format it hold
     defer testing.allocator.free(src);
     try harness.expectResult(&program, src, try program.run(src), "[:db/corrupted 2 Nextomic store format 2; this build reads format 3. Recreate the store or re-import its data (docs/NEXTOMIC.md §2)]");
 }
+
+test "a lookup ref nested past the native stack is StackOverflow in tx-data and in every read" {
+    const fx = try Fx.init("fn_deep_lookup");
+    defer fx.deinit();
+    _ = try fx.transact(
+        \\[{:db/ident :n/parent :db/valueType :db.type/ref :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+        \\ {:db/ident :n/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}]
+    );
+    // [:n/parent [:n/parent ... [:n/name "x"]]], a lookup ref whose value
+    // is a lookup ref, 5000 deep.
+    var v = try fx.read("[:n/name \"x\"]");
+    const parent = try fx.kw("n/parent");
+    for (0..5000) |_| v = try nx.vector.fromSlice(&fx.heap, &.{ parent, v });
+    nx.stack.arm(64 * 1024);
+    defer nx.stack.arm(nx.stack.main_thread_budget);
+    const tx = try nx.vector.fromSlice(&fx.heap, &.{try nx.vector.fromSlice(&fx.heap, &.{ try fx.kw("db/add"), try fx.str("a"), parent, v })});
+    try testing.expectError(error.StackOverflow, nextomic.transact.transact(fx.conn(), fx.arena(), tx, .{}));
+    var rd = try (try fx.db()).beginRead();
+    defer rd.close();
+    var fault: Fault = .{};
+    try testing.expectError(error.StackOverflow, nextomic.marshal.entity(&rd, fx.arena(), v, &fault));
+}
