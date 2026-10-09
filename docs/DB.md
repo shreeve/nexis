@@ -246,8 +246,8 @@ connection, or by a collection:
 256 KiB `<path>-lock`), where emdb's default is 126. Every process
 sharing the file draws on the one table, and a table in use keeps the
 size its first opener gave it until every process has closed the file
-(emdb INV-T14E), so a process that opens a file an older build holds
-open gets the older size.
+(emdb INV-T14E): a process that opens a file another holds open gets
+the size that other gave the table.
 
 #### 3.3 Durability
 

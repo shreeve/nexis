@@ -169,7 +169,8 @@ gate.
 | `vm` | Warm microbenchmark | `vm_loop_10k`, `vm_global_call_10k`, `vm_keyword_get_10k`: a routine compiled once, rerun on one VM |
 | `codec` | Warm microbenchmark | `codec_encode_fixnum`, `codec_decode_fixnum`, `codec_encode_map_n64`, `codec_decode_map_n64` |
 | `db-integrated` | Database-integrated | `db_put_commit_scalar`, `db_get_hit_scalar` on a fresh store under `$TMPDIR` |
-| `nextomic` | Database-integrated | six `q_*` rows over a 200k-datom store and three `pull_*` rows over 20k entities (`docs/PERF.md` §3.7); each row runs once and must return the rows the corpus implies before it is timed |
+| `nextomic` | Database-integrated | nine `q_*` rows over a 200k-datom store, three `pull_*` rows over 20k entities, and two `q_*` rows and `datoms_history_churn_108k` over a churned store's time views (`bench/nextomic.zig`); each row runs once and must return the rows the corpus implies before it is timed |
+| `nextomic-store` | none: sizes, not timings | the size of every tree of four store shapes and the file's allocated bytes (`docs/PERF.md` §3.36) |
 
 **Method.** A pilot doubles its repetitions until one timing spans a
 millisecond, then sets `inner_reps` so one sample lasts at least 50 ms
@@ -179,8 +180,9 @@ over `inner_reps`, kept as a fraction of a nanosecond. Setup stays
 outside the timed body unless the row measures it (the `compiler`
 pipeline rows), and a body that allocates keeps memory bounded: the
 construction rows free their heap per invocation, the decode rows drop
-their scratch heap every 16 MiB. The heaps sit on the process
-allocator, as the runtime's do.
+their scratch heap every 16 MiB. The heaps' slabs come from the page
+allocator and their large blocks from the process allocator, as the
+runtime's do (`docs/HEAP.md` §2).
 
 **Output.** The table has one line per row: benchmark, category,
 parameter (N, or `-`), median, p5, p95 and ops/sec from the median.
@@ -362,7 +364,7 @@ after each.
   that costs (JIT and the peer's segment cache both warm by then), and
   a long-running peer would do better on the others.
 - *Sequences.* All three are lazy and chunked by 32 (`docs/LAZY.md`):
-  `filter`, `map` and `map` realize a chunk at a time as `reduce`
+  `filter`, `map :score` and `map inc` realize a chunk at a time as `reduce`
   walks. nexis lets each intermediate seq go as it is walked, as
   Clojure's locals clearing does: a native's call block is cleared
   when it returns, `reduce` consumes its argument, and a local is
