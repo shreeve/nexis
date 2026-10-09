@@ -58,7 +58,7 @@ zig build test --summary all      # the gate
 The gate's last line is the count of record:
 
 ```
-Build Summary: 244/244 steps succeeded; 1614/1614 tests passed
+Build Summary: 244/244 steps succeeded; 1637/1637 tests passed
 ```
 
 With `../nexus` checked out the gate includes `parser-check`'s two
