@@ -6,9 +6,10 @@ the one table of which kinds serialize (§3). Derivative from PLAN §23
 `docs/SEMANTICS.md` (numeric canonical form, hash invariants) and
 `docs/VALUE.md` §2 (kind numbers). Those win on conflict.
 
-Codec bytes are the value half of every `db/*` entry and of the
-Nextomic transaction log: bytes one process writes, another reads, so
-the format is frozen (§9).
+Codec bytes are the value half of every `db/*` entry: bytes one
+process writes, another reads, so the format is frozen (§9). Nextomic
+does not use the codec: its trees and its transaction log have formats
+of their own (`docs/NEXTOMIC.md` §2).
 
 ---
 
@@ -247,10 +248,9 @@ Neither function mutates its input or any existing value.
 
 ### 6. Callers
 
-`src/db.zig` (`put` / `get`), `src/stdlib.zig` (`db/scan`,
-`db/reduce-tree`) and `src/nextomic/datom.zig` (the transaction log)
-call `encode` and `decode`; the codec imports only the value layer and
-the collection modules it walks.
+`src/db.zig` (`put` / `get`) and `src/stdlib.zig` (`db/scan`,
+`db/reduce-tree`) call `encode` and `decode`; the codec imports only
+the value layer and the collection modules it walks.
 
 ---
 
@@ -282,8 +282,8 @@ T1 is the typed-vector round trip.
 
 ### 9. Stability
 
-The format is the on-disk form of every durable value and the
-Nextomic transaction log, so it is frozen: a build reads what an
+The format is the on-disk form of every durable value, so it is
+frozen: a build reads what an
 earlier build wrote. The kind bytes are the `Kind` numbers of
 `docs/VALUE.md` §2, which are never renumbered; a retired kind leaves
 a reserved gap. Any byte-level change bumps the major or minor version
