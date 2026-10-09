@@ -425,88 +425,12 @@ test "empty: each call yields a distinct *HeapHeader (no singleton)" {
     try testing.expect(!a.identicalTo(b));
 }
 
-test "cons: basic head/tail round-trip" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const e = try empty(&heap);
-    const one = value.fromFixnum(1).?;
-    const two = value.fromFixnum(2).?;
-    const three = value.fromFixnum(3).?;
-
-    const list3 = try cons(&heap, one, try cons(&heap, two, try cons(&heap, three, e)));
-    try testing.expectEqual(@as(usize, 3), count(list3));
-    try testing.expect(head(list3).asFixnum() == 1);
-    try testing.expect(head(tail(list3)).asFixnum() == 2);
-    try testing.expect(head(tail(tail(list3))).asFixnum() == 3);
-    try testing.expect(isEmpty(tail(tail(tail(list3)))));
-}
-
 test "cons: rejects non-list tail with error.InvalidListTail" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const bad_tail = value.fromFixnum(42).?; // fixnum, not a list
     const result = cons(&heap, value.fromFixnum(1).?, bad_tail);
     try testing.expectError(error.InvalidListTail, result);
-}
-
-test "fromSlice: builds list in natural order" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const elems = [_]Value{
-        value.fromFixnum(10).?,
-        value.fromFixnum(20).?,
-        value.fromFixnum(30).?,
-        value.fromFixnum(40).?,
-    };
-    const lst = try fromSlice(&heap, &elems);
-    try testing.expectEqual(@as(usize, 4), count(lst));
-
-    var cur = lst;
-    for (elems) |expected| {
-        try testing.expectEqual(expected.asFixnum(), head(cur).asFixnum());
-        cur = tail(cur);
-    }
-    try testing.expect(isEmpty(cur));
-}
-
-test "fromSlice: empty slice yields an empty list" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const lst = try fromSlice(&heap, &.{});
-    try testing.expect(isEmpty(lst));
-    try testing.expectEqual(@as(usize, 0), count(lst));
-}
-
-test "cons body: head / tail are the same Value bits we stored" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const e = try empty(&heap);
-    const kw = value.testKeyword(7);
-    const lst = try cons(&heap, kw, e);
-
-    const h_value = head(lst);
-    try testing.expect(h_value.identicalTo(kw));
-
-    const t_value = tail(lst);
-    try testing.expect(t_value.identicalTo(e));
-}
-
-test "nested lists: a list element is itself a list" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-
-    const inner = try fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-    });
-    const outer = try fromSlice(&heap, &.{ inner, value.fromFixnum(99).? });
-    try testing.expectEqual(@as(usize, 2), count(outer));
-
-    const first = head(outer);
-    try testing.expect(first.kind() == .list);
-    try testing.expectEqual(@as(usize, 2), count(first));
 }
 
 // ---- hashSeq / equalSeq with synthetic callbacks ----
@@ -589,81 +513,6 @@ test "hashSeq: a view hashes as the list of its elements; at offset 0 through it
     try testing.expectEqual(@as(?u32, @intCast(hashSeq(view, &callbackHashImmediateOnly))), Heap.asHeapHeader(vec).cachedHash());
 }
 
-test "hashSeq: equal lists produce equal base hashes (different allocations)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{
-        value.fromFixnum(7).?,
-        value.testKeyword(3),
-    });
-    const b = try fromSlice(&heap, &.{
-        value.fromFixnum(7).?,
-        value.testKeyword(3),
-    });
-    const ha = hashSeq(a, &callbackHashImmediateOnly);
-    const hb = hashSeq(b, &callbackHashImmediateOnly);
-    try testing.expectEqual(ha, hb);
-}
-
-test "hashSeq: different-length lists produce different hashes" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const one = value.fromFixnum(1).?;
-    const lst1 = try fromSlice(&heap, &.{one});
-    const lst2 = try fromSlice(&heap, &.{ one, one });
-    const h1 = hashSeq(lst1, &callbackHashImmediateOnly);
-    const h2 = hashSeq(lst2, &callbackHashImmediateOnly);
-    try testing.expect(h1 != h2);
-}
-
-test "equalSeq: structural equality across distinct allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    const b = try fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    try testing.expect(equalSeq(a, b, &callbackEqImmediateOnly));
-}
-
-test "equalSeq: length mismatch returns false" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
-    const b = try fromSlice(&heap, &.{value.fromFixnum(1).?});
-    try testing.expect(!equalSeq(a, b, &callbackEqImmediateOnly));
-    try testing.expect(!equalSeq(b, a, &callbackEqImmediateOnly));
-}
-
-test "equalSeq: element-level inequality propagates up" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
-    const b = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(99).? });
-    try testing.expect(!equalSeq(a, b, &callbackEqImmediateOnly));
-}
-
-test "equalSeq: two empty lists compare equal" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try empty(&heap);
-    const b = try empty(&heap);
-    try testing.expect(equalSeq(a, b, &callbackEqImmediateOnly));
-}
-
-test "equalSeq: identity short-circuit on same *HeapHeader" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{value.fromFixnum(42).?});
-    try testing.expect(equalSeq(a, a, &callbackEqImmediateOnly));
-}
-
 test "Cursor: streaming iteration yields head-to-tail, null on empty" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -730,13 +579,4 @@ test "view: a cons in front of a view walks into it" {
     try testing.expect(equalSeq(l, try fromSlice(&heap, &.{ value.fromFixnum(0).?, value.fromFixnum(2).?, value.fromFixnum(3).? }), &callbackEqImmediateOnly));
     try testing.expect(!equalSeq(l, try ofVector(&heap, vec, 0), &callbackEqImmediateOnly));
     try testing.expect(equalSeq(try ofVector(&heap, vec, 3), try empty(&heap), &callbackEqImmediateOnly));
-}
-
-test "count: flat list with 100 elements" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var elems: [100]Value = undefined;
-    for (&elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
-    const lst = try fromSlice(&heap, &elems);
-    try testing.expectEqual(@as(usize, 100), count(lst));
 }

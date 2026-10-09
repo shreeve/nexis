@@ -993,6 +993,24 @@ fn expectSameValues(a: []const Value, b: []const Value) !void {
     try testing.expect(std.mem.eql(u8, std.mem.sliceAsBytes(a), std.mem.sliceAsBytes(b)));
 }
 
+/// A heap whose allocator checks for leaks but records no stack trace
+/// per allocation: the tests that use it make tens of thousands of
+/// nodes.
+const BigHeap = struct {
+    debug: std.heap.SafeAllocator,
+    heap: Heap,
+
+    fn init(self: *BigHeap) void {
+        self.debug = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        self.heap = Heap.init(self.debug.allocator());
+    }
+
+    fn deinit(self: *BigHeap) void {
+        self.heap.deinit();
+        _ = self.debug.deinit();
+    }
+};
+
 /// Test helper: the vector `[0 1 … n-1]`.
 fn rangeVector(heap: *Heap, n: usize) !Value {
     const elems = try testing.allocator.alloc(Value, n);
@@ -1002,93 +1020,43 @@ fn rangeVector(heap: *Heap, n: usize) !Value {
 }
 
 test "pop: the result has the shape fromSlice builds, at every trie boundary" {
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
     const sizes = [_]usize{ 1, 2, 32, 33, 34, 64, 65, 1056, 1057, 1058, 1088, 1089, 32768, 32769, 32800, 32801, 32802 };
     for (sizes) |n| {
-        const v = try rangeVector(&heap, n);
-        const p = try pop(&heap, v);
-        try expectSameShape(try rangeVector(&heap, n - 1), p);
+        const v = try rangeVector(heap, n);
+        const p = try pop(heap, v);
+        try expectSameShape(try rangeVector(heap, n - 1), p);
         try testing.expectEqual(n, count(v)); // the source is untouched
         try testing.expectEqual(@as(i64, @intCast(n - 1)), nth(v, n - 1).asFixnum());
     }
 }
 
 test "pop: from 1057 down to empty, one element at a time" {
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
-    var v = try rangeVector(&heap, 1057);
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
+    var v = try rangeVector(heap, 1057);
     var n: usize = 1057;
     while (n > 0) : (n -= 1) {
-        v = try pop(&heap, v);
-        try expectSameShape(try rangeVector(&heap, n - 1), v);
+        v = try pop(heap, v);
+        try expectSameShape(try rangeVector(heap, n - 1), v);
     }
     try testing.expect(isEmpty(v));
 }
 
 test "pop then conj: the trie regrows to the same shape" {
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
     for ([_]usize{ 33, 1057, 32801 }) |n| {
-        const v = try rangeVector(&heap, n);
-        const again = try conj(&heap, try pop(&heap, v), value.fromFixnum(@intCast(n - 1)).?);
+        const v = try rangeVector(heap, n);
+        const again = try conj(heap, try pop(heap, v), value.fromFixnum(@intCast(n - 1)).?);
         try expectSameShape(v, again);
-    }
-}
-
-test "conj of a single element: count 1, stored in tail" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const e = try empty(&heap);
-    const one = try conj(&heap, e, value.fromFixnum(42).?);
-    try testing.expectEqual(@as(usize, 1), count(one));
-    try testing.expect(!isEmpty(one));
-    try testing.expectEqual(@as(i64, 42), nth(one, 0).asFixnum());
-}
-
-test "fromSlice + nth: round-trip at sizes 0, 1, 31, 32, 33" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const sizes = [_]usize{ 0, 1, 31, 32, 33 };
-    for (sizes) |n| {
-        const elems = try testing.allocator.alloc(Value, n);
-        defer testing.allocator.free(elems);
-        for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
-        const v = try fromSlice(&heap, elems);
-        try testing.expectEqual(n, count(v));
-        for (0..n) |i| {
-            try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
-        }
-    }
-}
-
-test "fromSlice + nth: round-trip across trie depth boundaries (1024, 1025)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const sizes = [_]usize{ 1024, 1025 };
-    for (sizes) |n| {
-        const elems = try testing.allocator.alloc(Value, n);
-        defer testing.allocator.free(elems);
-        for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
-        const v = try fromSlice(&heap, elems);
-        try testing.expectEqual(n, count(v));
-        // Spot-check a dense set of indices plus boundary sites.
-        const probe = [_]usize{ 0, 1, 31, 32, 33, 1022, 1023, 1024 };
-        for (probe) |i| if (i < n) {
-            try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
-        };
     }
 }
 
@@ -1110,44 +1078,6 @@ test "assoc: replaces one element in the tail or the trie and leaves the source 
             try testing.expectEqual(@as(i64, @intCast(j)), nth(v, j).asFixnum());
         }
     }
-}
-
-test "fromSlice + nth: round-trip at large size 32768 (trie depth 2 full) and 32769" {
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
-    const sizes = [_]usize{ 32768, 32769 };
-    for (sizes) |n| {
-        const elems = try testing.allocator.alloc(Value, n);
-        defer testing.allocator.free(elems);
-        for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
-        const v = try fromSlice(&heap, elems);
-        try testing.expectEqual(n, count(v));
-        // Dense spot-check across the full range.
-        const probe = [_]usize{ 0, 31, 32, 1023, 1024, 32767, 32768 };
-        for (probe) |i| if (i < n) {
-            try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
-        };
-    }
-}
-
-test "conj at 32→33 boundary: old tail promoted to leaf, shift becomes 5" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var v = try empty(&heap);
-    for (0..33) |i| {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
-    }
-    try testing.expectEqual(@as(usize, 33), count(v));
-    const body = rootBody(rootHeader(v));
-    try testing.expectEqual(@as(u32, branch_bits), body.shift);
-    try testing.expect(body.root_node != null);
-    try testing.expectEqual(@as(u32, 1), body.tail_len);
-    // Full round-trip via nth.
-    for (0..33) |i| try testing.expectEqual(@as(i64, @intCast(i)), nth(v, i).asFixnum());
 }
 
 test "conj claims the tail slot past its source's elements, and a second conj from that source copies" {
@@ -1172,22 +1102,6 @@ test "conj claims the tail slot past its source's elements, and a second conj fr
     try testing.expectEqual(before + 1 + 64 + 6 + 1 + 1, heap.liveCount());
 }
 
-test "immutability: conj on a vector does not mutate the source" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{
-        value.fromFixnum(1).?,
-        value.fromFixnum(2).?,
-        value.fromFixnum(3).?,
-    });
-    _ = try conj(&heap, a, value.fromFixnum(99).?);
-    // Original still has count 3 and values intact.
-    try testing.expectEqual(@as(usize, 3), count(a));
-    try testing.expectEqual(@as(i64, 1), nth(a, 0).asFixnum());
-    try testing.expectEqual(@as(i64, 2), nth(a, 1).asFixnum());
-    try testing.expectEqual(@as(i64, 3), nth(a, 2).asFixnum());
-}
-
 test "a vector at its largest count refuses another element as out of memory, unchanged" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -1202,48 +1116,6 @@ test "a vector at its largest count refuses another element as out of memory, un
     rootBody(root).tail_len = branch_factor;
     try testing.expectError(error.OutOfMemory, openTailInPlace(&heap, root, 1));
     try testing.expectEqual(max_count - 31, rootBody(root).count);
-}
-
-test "equalSeq: reflexive and symmetric across distinct allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(10).?,
-        value.fromFixnum(20).?,
-        value.fromFixnum(30).?,
-    };
-    const a = try fromSlice(&heap, &elems);
-    const b = try fromSlice(&heap, &elems);
-    const ah = rootHeader(a);
-    const bh = rootHeader(b);
-    try testing.expect(ah != bh);
-    const SynthEq = struct {
-        fn f(x: Value, y: Value) bool {
-            if (x.tag == y.tag and x.payload == y.payload) return true;
-            if (x.kind() != y.kind()) return false;
-            return switch (x.kind()) {
-                .fixnum => x.asFixnum() == y.asFixnum(),
-                else => false,
-            };
-        }
-    };
-    try testing.expect(equalSeq(ah, bh, &SynthEq.f));
-    try testing.expect(equalSeq(bh, ah, &SynthEq.f));
-    try testing.expect(equalSeq(ah, ah, &SynthEq.f));
-}
-
-test "equalSeq: length mismatch breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try fromSlice(&heap, &.{ value.fromFixnum(1).?, value.fromFixnum(2).? });
-    const b = try fromSlice(&heap, &.{value.fromFixnum(1).?});
-    const SynthEq = struct {
-        fn f(x: Value, y: Value) bool {
-            if (x.kind() != y.kind()) return false;
-            return x.asFixnum() == y.asFixnum();
-        }
-    };
-    try testing.expect(!equalSeq(rootHeader(a), rootHeader(b), &SynthEq.f));
 }
 
 test "hashSeq: matches manual ordered-combine for small vector" {
@@ -1268,24 +1140,6 @@ test "hashSeq: matches manual ordered-combine for small vector" {
         }
     };
     try testing.expectEqual(expected, hashSeq(rootHeader(v), &SynthHash.f));
-}
-
-test "hashSeq: equal vectors share pre-mix hash across allocations" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const elems = [_]Value{
-        value.fromFixnum(7).?,
-        value.testKeyword(3),
-        value.fromChar('z').?,
-    };
-    const a = try fromSlice(&heap, &elems);
-    const b = try fromSlice(&heap, &elems);
-    const SynthHash = struct {
-        fn f(x: Value) u64 {
-            return x.hashImmediate();
-        }
-    };
-    try testing.expectEqual(hashSeq(rootHeader(a), &SynthHash.f), hashSeq(rootHeader(b), &SynthHash.f));
 }
 
 test "hashSeq: empty vector matches empty ordered-combine with count 0" {
@@ -1347,63 +1201,20 @@ test "capacityAtShift: trie capacity grows by 32 per shift level" {
     try testing.expectEqual(@as(usize, 1024 * 1024), capacityAtShift(15));
 }
 
-test "conj just past shift-5 leaf capacity (1024 + 1): still shift 5, tail=1" {
-    // A trie at shift 5 holds 32 leaves × 32 elements = 1024 elements
-    // plus a 32-element tail = 1056 total before overflowing. At count
-    // 1025 the trie holds 992 (31 full leaves) + the new leaf (from
-    // the tail-at-1023 promotion) = 1024, and the tail has 1 element.
-    // No shift growth yet.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var v = try empty(&heap);
-    var i: usize = 0;
-    while (i < 1025) : (i += 1) {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
-    }
-    const body = rootBody(rootHeader(v));
-    try testing.expectEqual(@as(u32, 1025), body.count);
-    try testing.expectEqual(@as(u32, branch_bits), body.shift); // still 5
-    try testing.expectEqual(@as(u32, 1), body.tail_len);
-}
-
-test "conj at the actual shift-5 → shift-10 overflow (1056 + 1 = 1057)" {
-    // The shift-growth boundary is at count 1057 (capacityAtShift(5)
-    // = 1024 trie elements + 32 tail = 1056 max before forcing a new
-    // level). At count 1057 the trie root must grow to shift 10.
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var v = try empty(&heap);
-    var i: usize = 0;
-    while (i < 1057) : (i += 1) {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(i)).?);
-    }
-    const body = rootBody(rootHeader(v));
-    try testing.expectEqual(@as(u32, 1057), body.count);
-    try testing.expectEqual(@as(u32, 2 * branch_bits), body.shift); // 10
-    try testing.expectEqual(@as(u32, 1), body.tail_len);
-    // Verify element integrity across the shift boundary.
-    const probe = [_]usize{ 0, 31, 32, 1023, 1024, 1055, 1056 };
-    for (probe) |idx| {
-        try testing.expectEqual(@as(i64, @intCast(idx)), nth(v, idx).asFixnum());
-    }
-}
-
 test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
     // A shift-10 trie holds capacityAtShift(10) = 32768 elements plus
     // a 32-element tail: 32800 in all. Count 32769 fills the trie
     // exactly; count 32801 grows the shift to 15 through `newPath`.
     // Each conj from 32766 on must land on the shape fromSlice builds.
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
-    var v = try rangeVector(&heap, 32766);
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
+    var v = try rangeVector(heap, 32766);
     var n: usize = 32766;
     while (n < 32802) : (n += 1) {
-        v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
-        try expectSameShape(try rangeVector(&heap, n + 1), v);
+        v = try conj(heap, v, value.fromFixnum(@intCast(n)).?);
+        try expectSameShape(try rangeVector(heap, n + 1), v);
         const body = rootBody(rootHeader(v));
         try testing.expectEqual(@as(u32, if (n + 1 > 32800) 3 * branch_bits else 2 * branch_bits), body.shift);
     }
@@ -1415,43 +1226,41 @@ test "conj across the shift-10 → shift-15 boundary (32768 … 32802)" {
 }
 
 test "fromSlice builds the shape a conj fold builds, at every size up to 1100" {
-    // Tens of thousands of nodes: a leak still fails the test, but
-    // no stack trace is captured per allocation.
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
-    var v = try empty(&heap);
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
+    var v = try empty(heap);
     var n: usize = 0;
     while (n < 1100) : (n += 1) {
-        try expectSameShape(try rangeVector(&heap, n), v);
-        v = try conj(&heap, v, value.fromFixnum(@intCast(n)).?);
+        try expectSameShape(try rangeVector(heap, n), v);
+        v = try conj(heap, v, value.fromFixnum(@intCast(n)).?);
     }
 }
 
 test "openTailInPlace builds the shape fromSlice builds, across the shift boundaries" {
-    var debug: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
-    defer _ = debug.deinit();
-    var heap = Heap.init(debug.allocator());
-    defer heap.deinit();
-    // Past shift 5 (1056), shift 10 (33,824) and into shift 15.
+    var big: BigHeap = undefined;
+    big.init();
+    defer big.deinit();
+    const heap = &big.heap;
+    // Past shift 5 (1056), shift 10 (32,800) and into shift 15.
     const n: usize = 34_000;
     const elems = try testing.allocator.alloc(Value, n);
     defer testing.allocator.free(elems);
     for (elems, 0..) |*slot, i| slot.* = value.fromFixnum(@intCast(i)).?;
     const edit: u32 = 7;
-    const root = try copyRoot(&heap, rootHeader(try fromSlice(&heap, elems[0..branch_factor])));
+    const root = try copyRoot(heap, rootHeader(try fromSlice(heap, elems[0..branch_factor])));
     var len: usize = branch_factor;
     while (len + branch_factor <= n) : (len += branch_factor) {
-        const slots = try openTailInPlace(&heap, root, edit);
+        const slots = try openTailInPlace(heap, root, edit);
         @memcpy(slots, elems[len..][0..branch_factor]);
-        if (len % 1024 == 0 or len == 1024 + 32 or len > 33_700) try expectSameShape(try fromSlice(&heap, elems[0 .. len + branch_factor]), valueFromRoot(root));
+        if (len % 1024 == 0 or len == 1024 + 32 or len > 33_700) try expectSameShape(try fromSlice(heap, elems[0 .. len + branch_factor]), valueFromRoot(root));
     }
     // 34,000 is 1,062 leaves and 16 elements: the last tail closes at 16.
-    const slots = try openTailInPlace(&heap, root, edit);
+    const slots = try openTailInPlace(heap, root, edit);
     @memcpy(slots[0 .. n - len], elems[len..]);
     closeTailInPlace(root, @intCast(n - len));
-    try expectSameShape(try fromSlice(&heap, elems), valueFromRoot(root));
-    try conjInPlace(&heap, root, value.fromFixnum(n).?, edit);
+    try expectSameShape(try fromSlice(heap, elems), valueFromRoot(root));
+    try conjInPlace(heap, root, value.fromFixnum(n).?, edit);
     try testing.expectEqual(@as(i64, n), nth(valueFromRoot(root), n).asFixnum());
 }

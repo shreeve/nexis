@@ -1513,23 +1513,9 @@ fn synthEq(a: Value, b: Value) bool {
     };
 }
 
-/// Hash-colliding synthetic for collision-node tests: the low 32
-/// bits are pinned to `0xDEAD_BEEF` for every key, the high 32 bits
-/// are the key's own content hash.
-///
-/// The keys are heap strings from `collidingKey`, never immediates:
-/// `indexHashOf` (§5.1) hashes an immediate key inline and consults
-/// `elementHash` for heap keys only, so a keyword or fixnum key would
-/// never see this function and the trie would partition the keys
-/// cleanly instead of colliding them. Each collision test asserts
-/// through `mapCollisionCount` / `setCollisionCount` that its keys
-/// did reach the collision node.
-///
-/// Why the low 32 bits are the pinned half: `indexHashOf` truncates
-/// to them. Pinning the high half instead would not collide. The high
-/// half stays input-dependent because the same callback hashes the
-/// map's own entries when a colliding-keyed map is itself hashed,
-/// and distinct entries must keep distinct hashes there.
+/// A hash that collides every heap key: the low 32 bits, the indexing
+/// hash (§5.1), are pinned; the high 32 are the key's own, so the
+/// entries of a colliding map still hash apart.
 fn collidingHash(x: Value) u64 {
     return (@as(u64, string_mod.hashHeader(Heap.asHeapHeader(x))) << 32) | 0xDEAD_BEEF;
 }
@@ -1560,13 +1546,12 @@ test "RootBody layout: 16 bytes total" {
 
 // ---- mapEmpty / mapCount ----
 
-test "mapEmpty: subkind 0, count 0, isEmpty true" {
+test "mapEmpty: subkind 0, count 0" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
     const m = try mapEmpty(&heap);
     try testing.expectEqual(Kind.persistent_map, m.kind());
     try testing.expectEqual(subkind_array_map, m.subkind());
-    try testing.expectEqual(@as(usize, 0), mapCount(m));
     try testing.expectEqual(@as(usize, 0), mapCount(m));
 }
 
@@ -1576,102 +1561,6 @@ test "mapEmpty: each call allocates a fresh header (not a shared singleton)" {
     const a = try mapEmpty(&heap);
     const b = try mapEmpty(&heap);
     try testing.expect(Heap.asHeapHeader(a) != Heap.asHeapHeader(b));
-}
-
-// ---- Array-map assoc / get / dissoc ----
-
-test "array-map assoc + get: single key round-trip" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const key = value.testKeyword(1);
-    const val = value.fromFixnum(42).?;
-    const m1 = try mapAssoc(&heap, m0, key, val, &synthHash, &synthEq);
-    try testing.expectEqual(subkind_array_map, m1.subkind());
-    try testing.expectEqual(@as(usize, 1), mapCount(m1));
-    const lookup = mapGet(m1, key, &synthHash, &synthEq);
-    switch (lookup) {
-        .present => |v| try testing.expectEqual(@as(i64, 42), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
-    // Absence round-trip.
-    const miss = mapGet(m1, value.testKeyword(999), &synthHash, &synthEq);
-    try testing.expect(miss == .absent);
-}
-
-test "array-map: mapCount correctly tracks 0..8" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var m = try mapEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        const k = value.testKeyword(i);
-        const v = value.fromFixnum(@intCast(i)).?;
-        m = try mapAssoc(&heap, m, k, v, &synthHash, &synthEq);
-        try testing.expectEqual(@as(usize, i + 1), mapCount(m));
-        try testing.expectEqual(subkind_array_map, m.subkind());
-    }
-}
-
-test "array-map: same-value assoc returns same pointer (short-circuit)" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const k = value.testKeyword(1);
-    const v = value.fromFixnum(42).?;
-    const m1 = try mapAssoc(&heap, m0, k, v, &synthHash, &synthEq);
-    const m2 = try mapAssoc(&heap, m1, k, v, &synthHash, &synthEq);
-    try testing.expect(Heap.asHeapHeader(m1) == Heap.asHeapHeader(m2));
-}
-
-test "array-map: different-value assoc replaces value, count unchanged" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const k = value.testKeyword(1);
-    const v1 = value.fromFixnum(1).?;
-    const v2 = value.fromFixnum(2).?;
-    const m1 = try mapAssoc(&heap, m0, k, v1, &synthHash, &synthEq);
-    const m2 = try mapAssoc(&heap, m1, k, v2, &synthHash, &synthEq);
-    try testing.expect(Heap.asHeapHeader(m1) != Heap.asHeapHeader(m2));
-    try testing.expectEqual(@as(usize, 1), mapCount(m2));
-    switch (mapGet(m2, k, &synthHash, &synthEq)) {
-        .present => |v| try testing.expectEqual(@as(i64, 2), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
-    // Original still has v1.
-    switch (mapGet(m1, k, &synthHash, &synthEq)) {
-        .present => |v| try testing.expectEqual(@as(i64, 1), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
-}
-
-test "array-map dissoc: absent key returns same pointer" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const k = value.testKeyword(1);
-    const v = value.fromFixnum(42).?;
-    const m1 = try mapAssoc(&heap, m0, k, v, &synthHash, &synthEq);
-    const m2 = try mapDissoc(&heap, m1, value.testKeyword(999), &synthHash, &synthEq);
-    try testing.expect(Heap.asHeapHeader(m1) == Heap.asHeapHeader(m2));
-}
-
-test "array-map dissoc: present key shrinks count by 1" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var m = try mapEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) {
-        m = try mapAssoc(&heap, m, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
-    }
-    m = try mapDissoc(&heap, m, value.testKeyword(2), &synthHash, &synthEq);
-    try testing.expectEqual(@as(usize, 4), mapCount(m));
-    try testing.expect(mapGet(m, value.testKeyword(2), &synthHash, &synthEq) == .absent);
-    switch (mapGet(m, value.testKeyword(0), &synthHash, &synthEq)) {
-        .present => |v| try testing.expectEqual(@as(i64, 0), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
 }
 
 // ---- Nil key / nil value legality ----
@@ -1797,34 +1686,6 @@ test "dissoc: last CHAMP entry removed returns fresh subkind-0 empty map" {
     try testing.expectEqual(subkind_array_map, m.subkind());
 }
 
-// ---- Persistent immutability ----
-
-test "persistent: assoc does not mutate source" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const m1 = try mapAssoc(&heap, m0, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
-    _ = try mapAssoc(&heap, m1, value.testKeyword(2), value.fromFixnum(2).?, &synthHash, &synthEq);
-    // m1 must still have just one entry.
-    try testing.expectEqual(@as(usize, 1), mapCount(m1));
-    try testing.expect(mapGet(m1, value.testKeyword(2), &synthHash, &synthEq) == .absent);
-}
-
-test "persistent: dissoc does not mutate source" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const m1 = try mapAssoc(&heap, m0, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
-    const m2 = try mapAssoc(&heap, m1, value.testKeyword(2), value.fromFixnum(2).?, &synthHash, &synthEq);
-    _ = try mapDissoc(&heap, m2, value.testKeyword(1), &synthHash, &synthEq);
-    // m2 must still have both keys.
-    try testing.expectEqual(@as(usize, 2), mapCount(m2));
-    switch (mapGet(m2, value.testKeyword(1), &synthHash, &synthEq)) {
-        .present => |v| try testing.expectEqual(@as(i64, 1), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
-}
-
 // ---- Duplicate-key canonicalization in mapFromEntries ----
 
 test "mapFromEntries: later wins on duplicate keys; count reflects unique" {
@@ -1933,151 +1794,12 @@ test "mapFromEntries and setFromElements build what a fold of assoc and conj bui
     }
 }
 
-// ---- Hash consistency ----
-
-test "hashMap: equal maps hash equally regardless of insertion order" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const kvs = [_]Entry{
-        .{ .key = value.testKeyword(1), .value = value.fromFixnum(10).? },
-        .{ .key = value.testKeyword(2), .value = value.fromFixnum(20).? },
-        .{ .key = value.testKeyword(3), .value = value.fromFixnum(30).? },
-    };
-    var m_abc = try mapEmpty(&heap);
-    for (kvs) |e| m_abc = try mapAssoc(&heap, m_abc, e.key, e.value, &synthHash, &synthEq);
-    var m_cba = try mapEmpty(&heap);
-    var i: usize = kvs.len;
-    while (i > 0) {
-        i -= 1;
-        m_cba = try mapAssoc(&heap, m_cba, kvs[i].key, kvs[i].value, &synthHash, &synthEq);
-    }
-    const h_abc = hashMap(Heap.asHeapHeader(m_abc), &synthHash);
-    const h_cba = hashMap(Heap.asHeapHeader(m_cba), &synthHash);
-    try testing.expectEqual(h_abc, h_cba);
-}
-
-test "hashMap: empty map hash is deterministic and distinct from one-entry map" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const m0 = try mapEmpty(&heap);
-    const m1 = try mapAssoc(&heap, m0, value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
-    const h0 = hashMap(Heap.asHeapHeader(m0), &synthHash);
-    const h1 = hashMap(Heap.asHeapHeader(m1), &synthHash);
-    try testing.expect(h0 != h1);
-    // Recompute to verify cache stability.
-    try testing.expectEqual(h0, hashMap(Heap.asHeapHeader(m0), &synthHash));
-    try testing.expectEqual(h1, hashMap(Heap.asHeapHeader(m1), &synthHash));
-}
-
-// ---- Equality ----
-
-test "equalMap: reflexive, symmetric, transitive" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const kvs = [_]Entry{
-        .{ .key = value.testKeyword(1), .value = value.fromFixnum(10).? },
-        .{ .key = value.testKeyword(2), .value = value.fromFixnum(20).? },
-    };
-    var a = try mapEmpty(&heap);
-    var b = try mapEmpty(&heap);
-    var c = try mapEmpty(&heap);
-    for (kvs) |e| {
-        a = try mapAssoc(&heap, a, e.key, e.value, &synthHash, &synthEq);
-        b = try mapAssoc(&heap, b, e.key, e.value, &synthHash, &synthEq);
-        c = try mapAssoc(&heap, c, e.key, e.value, &synthHash, &synthEq);
-    }
-    const ah = Heap.asHeapHeader(a);
-    const bh = Heap.asHeapHeader(b);
-    const ch = Heap.asHeapHeader(c);
-    try testing.expect(equalMap(ah, ah, &synthHash, &synthEq));
-    try testing.expect(equalMap(ah, bh, &synthHash, &synthEq));
-    try testing.expect(equalMap(bh, ah, &synthHash, &synthEq));
-    try testing.expect(equalMap(ah, ch, &synthHash, &synthEq) and equalMap(bh, ch, &synthHash, &synthEq));
-}
-
-test "equalMap: different count breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const a = try mapAssoc(&heap, try mapEmpty(&heap), value.testKeyword(1), value.fromFixnum(1).?, &synthHash, &synthEq);
-    const b = try mapAssoc(&heap, a, value.testKeyword(2), value.fromFixnum(2).?, &synthHash, &synthEq);
-    try testing.expect(!equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &synthHash, &synthEq));
-}
-
-test "equalMap: different value breaks equality" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const k = value.testKeyword(1);
-    const a = try mapAssoc(&heap, try mapEmpty(&heap), k, value.fromFixnum(1).?, &synthHash, &synthEq);
-    const b = try mapAssoc(&heap, try mapEmpty(&heap), k, value.fromFixnum(2).?, &synthHash, &synthEq);
-    try testing.expect(!equalMap(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &synthHash, &synthEq));
-}
-
-// ---- Cross-subkind equality (§6.3) ----
-
-test "cross-subkind: array-map and CHAMP holding same entries compare equal" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Build an 8-entry array-map.
-    var am = try mapEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        am = try mapAssoc(&heap, am, value.testKeyword(i), value.fromFixnum(@intCast(i)).?, &synthHash, &synthEq);
-    }
-    try testing.expectEqual(subkind_array_map, am.subkind());
-    // Build a CHAMP that has the same 8 entries: grow to 9 then dissoc one.
-    var ch = am;
-    ch = try mapAssoc(&heap, ch, value.testKeyword(100), value.fromFixnum(100).?, &synthHash, &synthEq);
-    try testing.expectEqual(subkind_champ_root, ch.subkind());
-    ch = try mapDissoc(&heap, ch, value.testKeyword(100), &synthHash, &synthEq);
-    try testing.expectEqual(subkind_champ_root, ch.subkind()); // no demote
-    // am (array-map) and ch (CHAMP) hold the same 8 entries.
-    try testing.expectEqual(mapCount(am), mapCount(ch));
-    try testing.expect(equalMap(Heap.asHeapHeader(am), Heap.asHeapHeader(ch), &synthHash, &synthEq));
-    // Hash must agree too.
-    try testing.expectEqual(
-        hashMap(Heap.asHeapHeader(am), &synthHash),
-        hashMap(Heap.asHeapHeader(ch), &synthHash),
-    );
-}
-
-// ---- Collision-node stress via colliding synthetic hash ----
-
-test "collision nodes: many keys with the same indexing hash survive the trie" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var m = try mapEmpty(&heap);
-    // Insert 10 distinct string keys: with `collidingHash` the low 32
-    // bits are always `0xDEAD_BEEF`, so every key descends the same
-    // path and lands in one collision node at MAX_TRIE_SHIFT.
-    var i: u32 = 0;
-    while (i < 10) : (i += 1) {
-        m = try mapAssoc(&heap, m, try collidingKey(&heap, i), value.fromFixnum(@intCast(i)).?, &collidingHash, &synthEq);
-    }
-    try testing.expectEqual(@as(usize, 10), mapCount(m));
-    try testing.expectEqual(@as(?u32, 10), mapCollisionCount(m, 0xDEAD_BEEF));
-    // Every key must still look up correctly.
-    i = 0;
-    while (i < 10) : (i += 1) {
-        switch (mapGet(m, try collidingKey(&heap, i), &collidingHash, &synthEq)) {
-            .present => |v| try testing.expectEqual(@as(i64, @intCast(i)), v.asFixnum()),
-            .absent => try testing.expect(false),
-        }
-    }
-    // Dissoc from the collision bucket works end-to-end.
-    m = try mapDissoc(&heap, m, try collidingKey(&heap, 5), &collidingHash, &synthEq);
-    try testing.expectEqual(@as(usize, 9), mapCount(m));
-    try testing.expectEqual(@as(?u32, 9), mapCollisionCount(m, 0xDEAD_BEEF));
-    try testing.expect(mapGet(m, try collidingKey(&heap, 5), &collidingHash, &synthEq) == .absent);
-    // Other keys still present.
-    switch (mapGet(m, try collidingKey(&heap, 3), &collidingHash, &synthEq)) {
-        .present => |v| try testing.expectEqual(@as(i64, 3), v.asFixnum()),
-        .absent => try testing.expect(false),
-    }
-}
+// ---- Collision nodes ----
 
 test "collision nodes: an immediate key hashes inline and never reaches the callback" {
-    // The counterpart of the stress test: keyword keys under the same
-    // `collidingHash`-shaped callback partition cleanly, because
+    // The counterpart of the collision stress tests (test/prop/champ.zig
+    // M10, S9): keyword keys under a callback that pins every hash
+    // partition cleanly, because
     // `indexHashOf` hashes an immediate through `hashImmediate` and
     // consults `elementHash` for heap keys only (§5.1). A collision
     // fixture keyed by immediates would exercise no collision node.
@@ -2265,50 +1987,6 @@ test "dissoc from a collision node passes the survivor up to the root" {
 // live in test/prop/champ.zig (S1..S9).
 // =============================================================================
 
-test "setEmpty: subkind 0, count 0, isEmpty true" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s = try setEmpty(&heap);
-    try testing.expectEqual(Kind.persistent_set, s.kind());
-    try testing.expectEqual(subkind_array_map, s.subkind());
-    try testing.expectEqual(@as(usize, 0), setCount(s));
-    try testing.expectEqual(@as(usize, 0), setCount(s));
-}
-
-test "set: conj + contains single element round-trip" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s0 = try setEmpty(&heap);
-    const e = value.testKeyword(1);
-    const s1 = try setConj(&heap, s0, e, &synthHash, &synthEq);
-    try testing.expectEqual(subkind_array_map, s1.subkind());
-    try testing.expectEqual(@as(usize, 1), setCount(s1));
-    try testing.expect(setContains(s1, e, &synthHash, &synthEq));
-    try testing.expect(!setContains(s1, value.testKeyword(999), &synthHash, &synthEq));
-}
-
-test "set: conj of existing element returns same pointer" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s0 = try setEmpty(&heap);
-    const e = value.testKeyword(1);
-    const s1 = try setConj(&heap, s0, e, &synthHash, &synthEq);
-    const s2 = try setConj(&heap, s1, e, &synthHash, &synthEq);
-    try testing.expect(Heap.asHeapHeader(s1) == Heap.asHeapHeader(s2));
-}
-
-test "set: array-set count 0..8 without promotion" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var s = try setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        s = try setConj(&heap, s, value.testKeyword(i), &synthHash, &synthEq);
-        try testing.expectEqual(@as(usize, i + 1), setCount(s));
-        try testing.expectEqual(subkind_array_map, s.subkind());
-    }
-}
-
 test "set: promotion at count 8→9 → CHAMP, no demotion on disj back to 8" {
     var heap = Heap.init(testing.allocator);
     defer heap.deinit();
@@ -2331,133 +2009,4 @@ test "set: promotion at count 8→9 → CHAMP, no demotion on disj back to 8" {
     s = try setDisj(&heap, s, value.testKeyword(100), &synthHash, &synthEq);
     try testing.expectEqual(@as(usize, 8), setCount(s));
     try testing.expectEqual(subkind_champ_root, s.subkind());
-}
-
-test "set: disj of absent element returns same pointer" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s0 = try setEmpty(&heap);
-    const s1 = try setConj(&heap, s0, value.testKeyword(1), &synthHash, &synthEq);
-    const s2 = try setDisj(&heap, s1, value.testKeyword(999), &synthHash, &synthEq);
-    try testing.expect(Heap.asHeapHeader(s1) == Heap.asHeapHeader(s2));
-}
-
-test "set: disj all elements from CHAMP returns fresh subkind-0 empty set" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var s = try setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 9) : (i += 1) {
-        s = try setConj(&heap, s, value.testKeyword(i), &synthHash, &synthEq);
-    }
-    i = 0;
-    while (i < 9) : (i += 1) {
-        s = try setDisj(&heap, s, value.testKeyword(i), &synthHash, &synthEq);
-    }
-    try testing.expectEqual(@as(usize, 0), setCount(s));
-    try testing.expectEqual(subkind_array_map, s.subkind());
-}
-
-test "set: nil is a legal element" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s = try setConj(&heap, try setEmpty(&heap), value.nilValue(), &synthHash, &synthEq);
-    try testing.expect(setContains(s, value.nilValue(), &synthHash, &synthEq));
-    try testing.expect(!setContains(s, value.fromFixnum(0).?, &synthHash, &synthEq));
-}
-
-test "set: persistent immutability on conj" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const s0 = try setEmpty(&heap);
-    const s1 = try setConj(&heap, s0, value.testKeyword(1), &synthHash, &synthEq);
-    _ = try setConj(&heap, s1, value.testKeyword(2), &synthHash, &synthEq);
-    try testing.expectEqual(@as(usize, 1), setCount(s1));
-    try testing.expect(!setContains(s1, value.testKeyword(2), &synthHash, &synthEq));
-}
-
-test "set: setFromElements deduplicates naturally" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const elems = [_]Value{
-        value.testKeyword(1),
-        value.testKeyword(2),
-        value.testKeyword(1),
-        value.testKeyword(2),
-        value.testKeyword(3),
-    };
-    const s = try setFromElements(&heap, &elems, &synthHash, &synthEq);
-    try testing.expectEqual(@as(usize, 3), setCount(s));
-    try testing.expect(setContains(s, value.testKeyword(1), &synthHash, &synthEq));
-    try testing.expect(setContains(s, value.testKeyword(2), &synthHash, &synthEq));
-    try testing.expect(setContains(s, value.testKeyword(3), &synthHash, &synthEq));
-}
-
-test "hashSet: insertion-order-independent" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    const elems = [_]Value{
-        value.testKeyword(1),
-        value.testKeyword(2),
-        value.testKeyword(3),
-    };
-    var s_abc = try setEmpty(&heap);
-    for (elems) |e| s_abc = try setConj(&heap, s_abc, e, &synthHash, &synthEq);
-    var s_cba = try setEmpty(&heap);
-    var i: usize = elems.len;
-    while (i > 0) {
-        i -= 1;
-        s_cba = try setConj(&heap, s_cba, elems[i], &synthHash, &synthEq);
-    }
-    try testing.expectEqual(
-        hashSet(Heap.asHeapHeader(s_abc), &synthHash),
-        hashSet(Heap.asHeapHeader(s_cba), &synthHash),
-    );
-}
-
-test "equalSet: reflexive, cross-subkind equivalence" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    // Build an 8-element array-set and a CHAMP set holding the same
-    // 8 elements (via grow-to-9-then-disj). Equality must recognize
-    // them as equal despite different subkinds.
-    var a = try setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 8) : (i += 1) {
-        a = try setConj(&heap, a, value.testKeyword(i), &synthHash, &synthEq);
-    }
-    try testing.expectEqual(subkind_array_map, a.subkind());
-    var b = a;
-    b = try setConj(&heap, b, value.testKeyword(100), &synthHash, &synthEq);
-    b = try setDisj(&heap, b, value.testKeyword(100), &synthHash, &synthEq);
-    try testing.expectEqual(subkind_champ_root, b.subkind());
-    try testing.expect(equalSet(Heap.asHeapHeader(a), Heap.asHeapHeader(b), &synthHash, &synthEq));
-    try testing.expectEqual(
-        hashSet(Heap.asHeapHeader(a), &synthHash),
-        hashSet(Heap.asHeapHeader(b), &synthHash),
-    );
-}
-
-test "set: collision-node stress with colliding fixture" {
-    var heap = Heap.init(testing.allocator);
-    defer heap.deinit();
-    var s = try setEmpty(&heap);
-    var i: u32 = 0;
-    while (i < 10) : (i += 1) {
-        s = try setConj(&heap, s, try collidingKey(&heap, i), &collidingHash, &synthEq);
-    }
-    try testing.expectEqual(@as(usize, 10), setCount(s));
-    try testing.expectEqual(@as(?u32, 10), setCollisionCount(s, 0xDEAD_BEEF));
-    i = 0;
-    while (i < 10) : (i += 1) {
-        try testing.expect(setContains(s, try collidingKey(&heap, i), &collidingHash, &synthEq));
-    }
-    // Disj alternating elements.
-    s = try setDisj(&heap, s, try collidingKey(&heap, 0), &collidingHash, &synthEq);
-    s = try setDisj(&heap, s, try collidingKey(&heap, 5), &collidingHash, &synthEq);
-    try testing.expectEqual(@as(usize, 8), setCount(s));
-    try testing.expectEqual(@as(?u32, 8), setCollisionCount(s, 0xDEAD_BEEF));
-    try testing.expect(!setContains(s, try collidingKey(&heap, 0), &collidingHash, &synthEq));
-    try testing.expect(!setContains(s, try collidingKey(&heap, 5), &collidingHash, &synthEq));
-    try testing.expect(setContains(s, try collidingKey(&heap, 3), &collidingHash, &synthEq));
 }

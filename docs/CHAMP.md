@@ -419,14 +419,13 @@ eight levels.
 
 #### 12.1 Unit tests
 
-Inline tests in `champ.zig` cover the body layouts, the array form
-through 0..8 entries, promotion at 9 (and none on a duplicate key at
-8), no demotion, the root dissoc, the same-pointer short-circuits, the
-kept key object, nil keys, values and elements, the builders against
-`assoc`/`conj` folds, insertion-order-independent hashing, cross-subkind
-equality, the keyword and immediate shortcuts, the bitmap ranks, lone-key pull-up
-through every level and out of a collision node, and an immediate key
-bypassing the hash callback.
+Inline tests in `champ.zig` cover what the properties do not reach:
+the body layouts, nil keys and values, promotion at 9 (and none on a
+duplicate key at 8), no demotion, the largest count, the root dissoc,
+the kept key object, the builders against `assoc`/`conj` folds and a
+literal's allocations, the keyword and immediate shortcuts, the bitmap
+ranks, lone-key pull-up through every level and out of a collision
+node, and an immediate key bypassing the hash callback.
 
 #### 12.2 Set properties
 
