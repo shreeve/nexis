@@ -400,8 +400,8 @@ whether a store over an equal key changes anything (a set's never
 does; a map's does unless the value is bit-identical), and how it
 hashes (§7.1 or the element hash). Layouts, bitmap rules, promotion,
 dissoc, the builder, the iterator and the trace are shared, and the
-public `map*`/`set*` functions are thin wrappers over the two
-instances. Every persistent path copy goes through one primitive,
+public `map*`/`set*` names are the two instances' operations, most of
+them declared as the operation itself. Every persistent path copy goes through one primitive,
 `withSlot`: a copy of an interior with one slot made empty, a payload
 or a child. An in-place edit (§8.3) copies a node on its path that it
 does not own whole (`ownPath`), then rewrites the owned interior where

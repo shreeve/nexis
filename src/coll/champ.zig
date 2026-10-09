@@ -8,8 +8,8 @@
 //!
 //! One trie implementation, `Trie(P, kind)`, serves both kinds: a map's
 //! payload is an `Entry` (key + value, 32 bytes), a set's a bare key
-//! `Value` (16 bytes). The public `map*` / `set*` functions are thin
-//! wrappers over `MapTrie` and `SetTrie`.
+//! `Value` (16 bytes). The public `map*` / `set*` names are the
+//! operations of `MapTrie` and `SetTrie`.
 //!
 //! ## Representation (CHAMP.md §3-§4)
 //!
@@ -1249,19 +1249,13 @@ pub inline fn entryHash(e: Entry, elementHash: ElementHash) u64 {
 // =============================================================================
 
 /// A fresh empty map: a zero-entry array-map, not a shared singleton.
-pub fn mapEmpty(heap: *Heap) !Value {
-    return MapTrie.empty(heap);
-}
+pub const mapEmpty = MapTrie.empty;
 
 /// The map of `entries`; a later entry with an equal key wins
 /// (CHAMP.md §8.1). Built bottom-up: one allocation per node.
-pub fn mapFromEntries(heap: *Heap, entries: []const Entry, elementHash: ElementHash, elementEq: ElementEq) !Value {
-    return MapTrie.fromSlice(heap, entries, elementHash, elementEq);
-}
+pub const mapFromEntries = MapTrie.fromSlice;
 
-pub fn mapCount(m: Value) usize {
-    return MapTrie.count(m);
-}
+pub const mapCount = MapTrie.count;
 
 pub fn mapGet(m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) MapLookup {
     const e = MapTrie.find(m, key, elementHash, elementEq) orelse return .absent;
@@ -1283,21 +1277,15 @@ pub fn mapAssoc(heap: *Heap, m: Value, key: Value, val: Value, elementHash: Elem
 
 /// `m` without `key`; `m` itself when the key is absent (CHAMP.md
 /// §5.4-§5.6, §8.1).
-pub fn mapDissoc(heap: *Heap, m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
-    return MapTrie.remove(heap, m, key, elementHash, elementEq);
-}
+pub const mapDissoc = MapTrie.remove;
 
 pub const MapIter = MapTrie.Iter;
 
-pub fn mapIter(m: Value) MapIter {
-    return MapIter.init(m);
-}
+pub const mapIter = MapIter.init;
 
 /// A user-facing map Value for a root header (TRANSIENT.md §8), its
 /// subkind read off the body size.
-pub fn valueFromMapHeader(h: *HeapHeader) Value {
-    return MapTrie.fromHeader(h);
-}
+pub const valueFromMapHeader = MapTrie.fromHeader;
 
 // =============================================================================
 // In-place edits for transients (TRANSIENT.md §1)
@@ -1316,9 +1304,7 @@ pub const MapSpot = MapTrie.Spot;
 
 /// Where `key` is or would go in `m`: every hash and comparison an
 /// edit makes, and no change.
-pub fn mapLocate(m: Value, key: Value, elementHash: ElementHash, elementEq: ElementEq) MapSpot {
-    return MapTrie.locate(m, key, elementHash, elementEq);
-}
+pub const mapLocate = MapTrie.locate;
 
 pub fn mapSpotPresent(spot: MapSpot) bool {
     return spot.at == .present;
@@ -1337,45 +1323,31 @@ pub fn mapPut(heap: *Heap, root: *HeapHeader, spot: MapSpot, key: Value, val: Va
 
 /// Remove the key `spot` found present, as `mapDissoc` would; the root
 /// afterwards.
-pub fn mapDrop(heap: *Heap, root: *HeapHeader, spot: MapSpot, edit: u32) !*HeapHeader {
-    return MapTrie.drop(heap, root, spot, edit);
-}
+pub const mapDrop = MapTrie.drop;
 
 pub const SetSpot = SetTrie.Spot;
 
-pub fn setLocate(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) SetSpot {
-    return SetTrie.locate(s, elem, elementHash, elementEq);
-}
+pub const setLocate = SetTrie.locate;
 
 pub fn setSpotPresent(spot: SetSpot) bool {
     return spot.at == .present;
 }
 
-pub fn setPut(heap: *Heap, root: *HeapHeader, spot: SetSpot, elem: Value, edit: u32) !*HeapHeader {
-    return SetTrie.put(heap, root, spot, elem, edit);
-}
+pub const setPut = SetTrie.put;
 
-pub fn setDrop(heap: *Heap, root: *HeapHeader, spot: SetSpot, edit: u32) !*HeapHeader {
-    return SetTrie.drop(heap, root, spot, edit);
-}
+pub const setDrop = SetTrie.drop;
 
 // =============================================================================
 // Public API — set
 // =============================================================================
 
 /// A fresh empty set: a zero-element array-set.
-pub fn setEmpty(heap: *Heap) !Value {
-    return SetTrie.empty(heap);
-}
+pub const setEmpty = SetTrie.empty;
 
 /// The set of `elems`, duplicates merged. Built bottom-up.
-pub fn setFromElements(heap: *Heap, elems: []const Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
-    return SetTrie.fromSlice(heap, elems, elementHash, elementEq);
-}
+pub const setFromElements = SetTrie.fromSlice;
 
-pub fn setCount(s: Value) usize {
-    return SetTrie.count(s);
-}
+pub const setCount = SetTrie.count;
 
 pub fn setContains(s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) bool {
     return setGet(s, elem, elementHash, elementEq) != null;
@@ -1389,24 +1361,16 @@ pub fn setGet(s: Value, elem: Value, elementHash: ElementHash, elementEq: Elemen
 }
 
 /// `s` with `elem`; `s` itself when `elem` is already present.
-pub fn setConj(heap: *Heap, s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
-    return SetTrie.insert(heap, s, elem, elementHash, elementEq);
-}
+pub const setConj = SetTrie.insert;
 
 /// `s` without `elem`; `s` itself when `elem` is absent.
-pub fn setDisj(heap: *Heap, s: Value, elem: Value, elementHash: ElementHash, elementEq: ElementEq) !Value {
-    return SetTrie.remove(heap, s, elem, elementHash, elementEq);
-}
+pub const setDisj = SetTrie.remove;
 
 pub const SetIter = SetTrie.Iter;
 
-pub fn setIter(s: Value) SetIter {
-    return SetIter.init(s);
-}
+pub const setIter = SetIter.init;
 
-pub fn valueFromSetHeader(h: *HeapHeader) Value {
-    return SetTrie.fromHeader(h);
-}
+pub const valueFromSetHeader = SetTrie.fromHeader;
 
 // =============================================================================
 // Dispatch and GC entry points (CHAMP.md §9, GC.md §5)
@@ -1414,30 +1378,18 @@ pub fn valueFromSetHeader(h: *HeapHeader) Value {
 
 /// Pre-domain-mix hash of a map root; `dispatch.hashValue` mixes in
 /// the map's domain, its kind number 18.
-pub fn hashMap(h: *HeapHeader, elementHash: ElementHash) u64 {
-    return MapTrie.hashOf(h, elementHash);
-}
+pub const hashMap = MapTrie.hashOf;
 
 /// Pre-domain-mix hash of a set root (domain: kind number 19).
-pub fn hashSet(h: *HeapHeader, elementHash: ElementHash) u64 {
-    return SetTrie.hashOf(h, elementHash);
-}
+pub const hashSet = SetTrie.hashOf;
 
-pub fn equalMap(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
-    return MapTrie.equal(a, b, elementHash, elementEq);
-}
+pub const equalMap = MapTrie.equal;
 
-pub fn equalSet(a: *HeapHeader, b: *HeapHeader, elementHash: ElementHash, elementEq: ElementEq) bool {
-    return SetTrie.equal(a, b, elementHash, elementEq);
-}
+pub const equalSet = SetTrie.equal;
 
-pub fn traceMap(h: *HeapHeader, visitor: anytype) void {
-    MapTrie.trace(h, visitor);
-}
+pub const traceMap = MapTrie.trace;
 
-pub fn traceSet(h: *HeapHeader, visitor: anytype) void {
-    SetTrie.trace(h, visitor);
-}
+pub const traceSet = SetTrie.trace;
 
 // =============================================================================
 // Trie introspection for tests (CHAMP.md §4.3, §12.3)
@@ -1448,13 +1400,9 @@ pub fn traceSet(h: *HeapHeader, visitor: anytype) void {
 /// (an array-map, or a descent that ends above the collision layer).
 /// A collision fixture asserts through this that its keys reached the
 /// collision node.
-pub fn mapCollisionCount(m: Value, hash32: u32) ?u32 {
-    return MapTrie.collisionCount(m, hash32);
-}
+pub const mapCollisionCount = MapTrie.collisionCount;
 
-pub fn setCollisionCount(s: Value, hash32: u32) ?u32 {
-    return SetTrie.collisionCount(s, hash32);
-}
+pub const setCollisionCount = SetTrie.collisionCount;
 
 /// Whether the trie of map or set `v` has the canonical layout
 /// (CHAMP.md §4.3): bitmaps disjoint, every key at the slot its
