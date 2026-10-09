@@ -266,6 +266,17 @@ test "S6: hashHeader populates the cache (when nonzero) on first call" {
 // S7. Codepoint indexing against a reference decode
 // -----------------------------------------------------------------------------
 
+/// The scalar of one whole UTF-8 sequence, null when it is malformed.
+fn referenceDecode(seq: []const u8) ?u21 {
+    return switch (seq.len) {
+        1 => seq[0],
+        2 => std.unicode.utf8Decode2(seq[0..2].*) catch null,
+        3 => std.unicode.utf8Decode3(seq[0..3].*) catch null,
+        4 => std.unicode.utf8Decode4(seq[0..4].*) catch null,
+        else => unreachable,
+    };
+}
+
 /// Byte offset of each codepoint, plus the end; null on malformed UTF-8.
 fn referenceOffsets(bytes: []const u8, out: []usize) ?[]usize {
     var n: usize = 0;
@@ -273,7 +284,7 @@ fn referenceOffsets(bytes: []const u8, out: []usize) ?[]usize {
     while (i < bytes.len) {
         const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return null;
         if (i + len > bytes.len) return null;
-        _ = std.unicode.utf8Decode(bytes[i..][0..len]) catch return null;
+        _ = referenceDecode(bytes[i..][0..len]) orelse return null;
         out[n] = i;
         n += 1;
         i += len;
@@ -319,7 +330,7 @@ test "S7: codepoint count, index and range agree with a reference decode" {
         const count = ref.len - 1;
         try std.testing.expectEqual(count, try string.codepointCount(v));
         for (0..count) |i| {
-            const want = try std.unicode.utf8Decode(bytes[ref[i]..ref[i + 1]]);
+            const want = referenceDecode(bytes[ref[i]..ref[i + 1]]).?;
             try std.testing.expectEqual(want, try string.codepointAt(v, i));
         }
         try std.testing.expectError(error.OutOfBounds, string.codepointAt(v, count));
