@@ -5092,6 +5092,13 @@ test "json: read-str takes :key-fn and :value-fn as clojure.data.json does" {
     try expectOutput("(try (nexis.json/read-str \"1\" :keywordize true) (catch any e e))", ":invalid-argument");
     try expectOutput("(try (nexis.json/read-str 1) (catch any e e))", ":kind-mismatch");
     try expectOutput("(try (nexis.json/read-str \"{\\\"a\\\": 1}\" :key-fn (fn [k] (throw :mine))) (catch any e e))", ":mine");
+    // A function that grows the root stack past its capacity, which
+    // moves it, still has its result kept.
+    try expectOutput(
+        \\(def deep (str (apply str (repeat 50000 "[")) (apply str (repeat 50000 "]"))))
+        \\(defn grow [k] (nexis.json/read-str deep) (keyword k))
+        \\(pr-str (nexis.json/read-str "{\"a\": {\"b\": 1}}" :key-fn grow :value-fn (fn [k v] (nexis.json/read-str deep) v)))
+    , "{:a {:b 1}}");
 }
 
 test "json: malformed text is :json-error, with its line and column" {

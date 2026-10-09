@@ -7017,7 +7017,12 @@ const JsonReader = struct {
             try r.push(r.vm.ensureInterner().internKeywordValue(name) catch return VmError.OutOfMemory);
         } else {
             try r.push(string_mod.fromBytes(r.heap, try r.string()) catch return VmError.OutOfMemory);
-            if (!r.key_fn.isNil()) r.top().* = try r.vm.callValue(r.key_fn, &.{r.top().*});
+            if (!r.key_fn.isNil()) {
+                // The call may move the root stack: its slot is found
+                // again after it.
+                const k = try r.vm.callValue(r.key_fn, &.{r.top().*});
+                r.top().* = k;
+            }
         }
         r.skipSpace();
         if (!r.peek(':')) return r.fail(r.i, "expected ':' after a key", .{});
