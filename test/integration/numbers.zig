@@ -87,7 +87,7 @@ test "contagion: a float operand makes a bignum operation a float" {
     try expectOutput("(quot (* 2 " ++ fm ++ ") 2.0)", "1.40737488355327E14");
     try expectOutput("(mod (* 2 " ++ fm ++ ") 3.0)", "2.0");
     try expectOutput("(mod (- (* 2 " ++ fm ++ ")) 3.0)", "1.0");
-    try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0.0) (catch any e e))", ":divide-by-zero");
+    try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0.0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
     try expectOutput("(float? (* (* " ++ fm ++ " " ++ fm ++ ") 1e300))", "true");
 }
 
@@ -103,7 +103,7 @@ test "predicates: NaN is neither zero, positive nor negative; negative zero is z
     try expectOutput("(let [n ##NaN] [(zero? n) (pos? n) (neg? n) (NaN? n)])", "[false false false true]");
     try expectOutput("[(zero? -0.0) (pos? -0.0) (neg? -0.0) (zero? 0.0) (pos? 1e-300) (neg? -1e-300)]", "[true false false true true true]");
     try expectOutput("(let [i ##Inf] [(pos? i) (neg? (- i)) (zero? i)])", "[true true false]");
-    try expectOutput("(try (zero? nil) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (zero? nil) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "conversions: long truncates a float toward zero at any size, double widens" {
@@ -115,19 +115,19 @@ test "conversions: long truncates a float toward zero at any size, double widens
     try expectOutput("[(double 3) (double 1.5) (double 18446744073709551616) (double -140737488355328)]", "[3.0 1.5 1.8446744073709552E19 -1.40737488355328E14]");
     try expectOutput("(float? (double 18446744073709551616))", "true");
     try expectOutput("(long ##NaN)", "0");
-    try expectOutput("(try (long ##Inf) (catch any e e))", ":invalid-argument");
-    try expectOutput("(try (long \"7\") (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (double nil) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (long ##Inf) (catch any e e))", "{:error :invalid-argument, :message invalid argument, :fn test-form}");
+    try expectOutput("(try (long \"7\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
+    try expectOutput("(try (double nil) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "errors: division by zero and kind mismatch are the catchable keywords" {
-    try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (quot (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (rem (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (mod (+ " ++ fm ++ " 1) 0) (catch any e e))", ":divide-by-zero");
-    try expectOutput("(try (+ (+ " ++ fm ++ " 1) :a) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (< (+ " ++ fm ++ " 1) nil) (catch any e e))", ":kind-mismatch");
-    try expectOutput("(try (even? 2.0) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (/ (+ " ++ fm ++ " 1) 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (quot (+ " ++ fm ++ " 1) 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (rem (+ " ++ fm ++ " 1) 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (mod (+ " ++ fm ++ " 1) 0) (catch any e e))", "{:error :divide-by-zero, :message divide by zero, :fn test-form}");
+    try expectOutput("(try (+ (+ " ++ fm ++ " 1) :a) (catch any e e))", "{:error :kind-mismatch, :message + expects numbers, got a keyword, :fn test-form}");
+    try expectOutput("(try (< (+ " ++ fm ++ " 1) nil) (catch any e e))", "{:error :kind-mismatch, :message < expects numbers, got nil, :fn test-form}");
+    try expectOutput("(try (even? 2.0) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
     try expectProgramError("(* (+ " ++ fm ++ " 1) \"x\")", vm.VmError.KindMismatch);
 }
 
@@ -211,7 +211,7 @@ test "nexis.math: sqrt and pow are over doubles for every number" {
     try expectOutput("(nexis.math/pow 2.0 0.5)", "1.4142135623730951");
     try expectOutput("(nexis.math/pow 10 -1)", "0.1");
     try expectOutput("(NaN? (nexis.math/sqrt -1))", "true");
-    try expectOutput("(try (nexis.math/sqrt :x) (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.math/sqrt :x) (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "nexis.math: floor, ceil and round keep integers and convert floats" {
@@ -246,7 +246,7 @@ test "nexis.math: the trigonometric, hyperbolic, exponential and logarithmic fun
         \\[(nexis.math/log 0) (nexis.math/log -1) (nexis.math/asin 2) (nexis.math/sin ##Inf) (nexis.math/exp 1000)
         \\ (nexis.math/hypot ##Inf ##NaN) (nexis.math/sinh 1000) (nexis.math/log10 0)]
     , "[##-Inf ##NaN ##NaN ##NaN ##Inf ##Inf ##Inf ##-Inf]");
-    try expectOutput("(try (nexis.math/sin \"a\") (catch any e e))", ":kind-mismatch");
+    try expectOutput("(try (nexis.math/sin \"a\") (catch any e e))", "{:error :kind-mismatch, :message kind mismatch, :fn test-form}");
 }
 
 test "nexis.math: signum, to-radians, to-degrees, floor-div and floor-mod" {
@@ -255,5 +255,5 @@ test "nexis.math: signum, to-radians, to-degrees, floor-div and floor-mod" {
     // Of longs, as Java's Math/floorDiv: a float is truncated first.
     try expectOutput("[(nexis.math/floor-div 7 2) (nexis.math/floor-div -7 2) (nexis.math/floor-div 7 -2) (nexis.math/floor-div -7 -2) (nexis.math/floor-div 7.9 2)]", "[3 -4 -4 3 3]");
     try expectOutput("[(nexis.math/floor-mod -7 2) (nexis.math/floor-mod 7 -2) (nexis.math/floor-mod 7 2) (nexis.math/floor-div 100000000000000000001 -2)]", "[1 -1 1 -50000000000000000001]");
-    try expectOutput("[(try (nexis.math/floor-div 1 0) (catch any e e)) (try (nexis.math/floor-mod 1 0) (catch any e e))]", "[:divide-by-zero :divide-by-zero]");
+    try expectOutput("[(try (nexis.math/floor-div 1 0) (catch any e e)) (try (nexis.math/floor-mod 1 0) (catch any e e))]", "[{:error :divide-by-zero, :message divide by zero, :fn test-form} {:error :divide-by-zero, :message divide by zero, :fn test-form}]");
 }

@@ -984,3 +984,27 @@ entry stating the decision and its rationale.
   asking for `:commit`. The gate runs its tests and programs with
   `commit`, and `-Ddurability=durable` with the default.
   `docs/DB.md` §3.3 is the authority.
+- **2026-10-09 — A caught runtime error carries its context
+  (§6.4, §13.5; extends the 2026-09-18 "Exceptions are values"
+  entry).** A catchable `VmError` raised while a handler is in force,
+  and an error a native throws by name, is the map `{:error :tag
+  :message m :fn name :file path :line l :column c}`: `:message` is
+  the raise site's sentence ("+ expects numbers, got a string"), or
+  the tag in words when it has none; the place keys name the
+  innermost frame running the program's own code, so an error inside
+  a standard-library function is placed at the program's call of it.
+  Nextomic's and `re-pattern`'s error maps carry the same place keys.
+  `catch` is unchanged: `(catch :kind-mismatch e ...)`, a class name
+  and `any` take the map. `ex-message` reads `:message`, and `ex-data`
+  of an error map (an `:error` and no `:data`) is the map itself, so
+  `(:error (ex-data e))` is the tag of a runtime error and of an
+  `ex-info` alike. Code that compared the caught value to the keyword,
+  `(= e :kind-mismatch)`, reads `(:error e)` instead. With no handler
+  in force nothing is built: the error leaves the run and the host
+  reports it with its trace; the REPL's `*e` is the map.
+  Building the map can fail only for memory, and then the value is
+  the bare keyword, which every clause that takes the map takes, so a
+  handler runs when the heap is exhausted. A value a program throws
+  itself is never changed. Reason: a handler, an agent's above all,
+  could not log what went wrong; the uncaught report knew and the
+  caught keyword did not. `docs/VM.md` §13 is the authority.

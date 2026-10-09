@@ -13,7 +13,7 @@
     (d/basis-t (d/db c))))
 (t/check "with-conn returns the body's value" (= 2 result))
 (t/check "the connection is released on normal exit"
-       (= :nextomic/closed (try (d/db @escaped) (catch any e e))))
+       (= :nextomic/closed (try (d/db @escaped) (catch any e (:error e)))))
 (println @escaped)
 
 (def thrown
@@ -25,7 +25,7 @@
     (catch any e e)))
 (t/check "the throw propagates" (= :boom thrown))
 (t/check "the connection is released on throw"
-       (= :nextomic/closed (try (d/db @escaped) (catch any e e))))
+       (= :nextomic/closed (try (d/db @escaped) (catch any e (:error e)))))
 
 (d/with-conn [c "with-conn.edb" {:sync :none}]
   (t/check "the transaction committed before the throw persisted"
@@ -40,8 +40,8 @@
 (def old-db (d/db old))
 (d/release old)
 (d/with-conn [c "with-conn.edb"]
-  (t/check "the old handle stays closed" (= :nextomic/closed (t/caught (d/db old))))
-  (t/check "and its db-value" (= :nextomic/closed (t/caught (d/datoms old-db :aevt :note/text))))
+  (t/check "the old handle stays closed" (= :nextomic/closed (t/caught-tag (d/db old))))
+  (t/check "and its db-value" (= :nextomic/closed (t/caught-tag (d/datoms old-db :aevt :note/text))))
   (d/release old)
   (t/check "releasing the old handle leaves the new connection open"
          (= 1 (count (d/datoms (d/db c) :aevt :note/text)))))

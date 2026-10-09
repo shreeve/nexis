@@ -1295,18 +1295,26 @@ fn callUserMacro(
 }
 
 /// A thrown value in a failure message: a string as itself, a
-/// keyword as `:name`, a map by its `:message` string or `:error`
-/// keyword, anything else by its kind.
+/// keyword as `:name`, an error map as its `:error` keyword and its
+/// `:message` string (`:kind-mismatch: + expects numbers, got nil`),
+/// either alone when it has only one, anything else by its kind.
 fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]const u8 {
     switch (thrown.kind()) {
         .string => return string_mod.asBytes(thrown),
         .keyword => return ctx.allocator.print(":{s}", .{ctx.interner.keywordName(thrown.asKeywordId())}),
-        .persistent_map => for ([_][]const u8{ "message", "error" }) |key_name| {
-            const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
-            switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
-                .present => |v| if (v.kind() == .string or v.kind() == .keyword) return describeThrown(ctx, v),
-                .absent => {},
+        .persistent_map => {
+            var parts: [2]?[]const u8 = .{ null, null };
+            for ([_][]const u8{ "error", "message" }, &parts) |key_name, *part| {
+                const key = ctx.interner.internKeywordValue(key_name) catch return ExpandError.OutOfMemory;
+                switch (champ_mod.mapGet(thrown, key, &dispatch.hashValue, &dispatch.equal)) {
+                    .present => |v| if (v.kind() == .string or v.kind() == .keyword) {
+                        part.* = try describeThrown(ctx, v);
+                    },
+                    .absent => {},
+                }
             }
+            if (parts[0] != null and parts[1] != null) return ctx.allocator.print("{s}: {s}", .{ parts[0].?, parts[1].? });
+            if (parts[0] orelse parts[1]) |one| return one;
         },
         else => {},
     }

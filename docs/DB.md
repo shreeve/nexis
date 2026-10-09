@@ -543,8 +543,10 @@ holds the table to `emdb.Error`.
 Nextomic shares these `:db/*` names through the same function.
 
 The natives throw them with `vm.throwKeyword`, so `(catch any e …)`
-binds the keyword and, outside any `try`, the throw is uncaught like
-every recoverable error. Equality and hash are unaffected by any
+binds the error map `{:error :db/key-too-large :message ...}` and
+`(catch :db/key-too-large e …)` takes it (`docs/VM.md` §13); outside
+any `try` the keyword is thrown uncaught like every recoverable
+error. Equality and hash are unaffected by any
 failure: the triple is fixed at construction.
 
 **Two connections to one file.** A ref made on one connection is

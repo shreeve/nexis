@@ -1139,10 +1139,15 @@ as `:clause`.
 
 ## 7. Errors
 
-Every error is catchable. An error that can say more travels as a map,
-`{:error keyword ...}`, whose other keys name what went wrong; one that
-cannot is the bare keyword. The map is what `catch` receives; `(:error
-m)` is the keyword. A key is present only when its value is known.
+Every error is catchable, and a handler takes it as a map, `{:error
+keyword :message m ...}`, whose other keys name what went wrong and,
+as every runtime error's do, the place the failing call was made
+(`:fn`, `:file`, `:line`, `:column`; `docs/VM.md` §13); `(:error m)`
+is the keyword and `(catch :nextomic/unique e ...)` takes it. A key is
+present only when its value is known. With no handler in force an
+error is thrown as it is built, without the place, and the report
+gives the trace; one that names nothing beyond its tag is then the
+bare keyword.
 
 | error | when | payload |
 |---|---|---|

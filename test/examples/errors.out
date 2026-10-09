@@ -3,6 +3,7 @@
 "limit is 10"
 "caught: a plain string"
 2.5 :undefined
+[:kind-mismatch "+ expects numbers, got a string" "total" 45]
   cleanup ran
 :done
   cleanup ran

@@ -8,9 +8,10 @@ programs (`nexis.sys`, `nexis.shell`, §11), instants (`nexis.time`,
 §12) and JSON (`nexis.json`, §13). The natives are in
 `src/stdlib.zig`, one table per namespace; the rest of the library is
 nexis in `src/stdlib/*.nx`.
-Errors are catchable keywords; a wrong argument count is
-`:arity-mismatch` for every native (the VM checks the declared
-arity).
+An error a native raises is caught as its error map, `{:error :tag
+:message m ...}` with the place it was raised (`docs/VM.md` §13); a
+wrong argument count is `:arity-mismatch` for every native (the VM
+checks the declared arity).
 
 ---
 
@@ -484,6 +485,7 @@ returns a realized list where Clojure returns a lazy seq.
 | `alter-var-root` | 2+ | `(alter-var-root v f & args)`: sets the root of the Var `v` to `(apply f root args)` and returns it; a `binding` in force is left as it is. An unbound Var's root is nil to `f` and bound after (Clojure passes its `Unbound` object). A non-Var is `:kind-mismatch` |
 | `with-redefs-fn`, `with-redefs` | 2, macro | `(with-redefs-fn {#'v val ...} f)` calls `f` with each Var's root set to its value; `(with-redefs [name val ...] body...)` does it for the body, the names resolved as `var` resolves them. Root writes, not bindings, so every caller sees them and a Var need not be dynamic; each root is restored on every exit, a throw included, and a Var that was unbound is unbound again (`nexis.internal/#%unbind-root`), as Clojure restores its `Unbound` root. A call the compiler inlines (the arithmetic and comparison functions, COMPILER.md) does not go through the Var |
 | `*ns*` | Var | The namespace a form is compiled in, as its name symbol: the compiler sets the root before it expands each top-level form, and `in-ns` when it switches, so `(ns-name *ns*)` in a file or a macro names the file's namespace. Dynamic, but a `binding` of it does not change where forms compile |
+| `ex-info`, `ex-data`, `ex-message`, `ex-cause` | 2–3, 1, 1, 1 | `(ex-info msg data cause?)` is the map `{:message msg :data data}` (`:cause` with a third argument), `msg` a string or nil and `data` a map, nil meaning `{}`, else `:kind-mismatch`. `ex-message` is a map's `:message`; `ex-data` an `ex-info` map's `:data`, and an error map (one with an `:error` and no `:data`: a caught runtime error, a Nextomic error) is its own data, so `(:error (ex-data e))` is the tag of either; `ex-cause` a map's `:cause`; each nil for anything else (`docs/VM.md` §13) |
 | `special-symbol?` | 1 | Whether `s` is a name the compiler takes as a special form: `def if do let* fn* loop* letfn* quote var recur try catch finally throw set! &` |
 | `find-ns`, `the-ns`, `ns-name` | 1 | A namespace is its name symbol: `find-ns` returns the symbol when a namespace has that name, else nil; `the-ns` and `ns-name` return it, else throw `:no-such-namespace`. A non-symbol is `:kind-mismatch` |
 | `all-ns` | 0 | Every namespace's name, sorted |

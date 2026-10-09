@@ -253,14 +253,14 @@ pub fn failWith(vm: *VM, err: anyerror, detail: Detail) VmError {
     // A conflict names its datom as `:e` and `:a`.
     const attr_key: []const u8 = if (err == error.Conflict) "a" else "attr";
     const payload = payloadMap(vm, name, detail, attr_key) catch return VmError.OutOfMemory;
-    return vm.throwValue(payload);
+    return vm.throwErrorMap(payload);
 }
 
 /// Throw the map a syntax error travels as: `{:error name :message
 /// message :clause clause}`, `:clause` present when given.
 pub fn throwSyntax(vm: *VM, name: []const u8, message: []const u8, clause: ?usize) VmError {
     const payload = payloadMap(vm, name, .{ .message = message, .clause = clause }, "attr") catch return VmError.OutOfMemory;
-    return vm.throwValue(payload);
+    return vm.throwErrorMap(payload);
 }
 
 fn payloadMap(vm: *VM, name: []const u8, detail: Detail, attr_key: []const u8) !Value {

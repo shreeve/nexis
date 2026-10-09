@@ -14,8 +14,11 @@
   (println (if ok "ok" "FAIL") label)
   (when-not ok (throw :check-failed)))
 
+; The value body throws, or :no-error; an error map without the
+; place it was raised at, which names this run's path to the script.
 (defmacro caught [& body]
-  `(try (do ~@body :no-error) (catch any e# e#)))
+  `(try (do ~@body :no-error)
+        (catch any e# (if (map? e#) (dissoc e# :fn :file :line :column) e#))))
 
 ; Results are persistent sets; sorting makes the output stable.
 (defn rows [res] (sort res))

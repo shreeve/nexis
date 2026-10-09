@@ -3,7 +3,7 @@ Type `:quit` or hit Ctrl-D to exit.
 
 user=> #'user/x
 user=> 42
-user=> user=> :divide-by-zero
+user=> user=> {:error :divide-by-zero, :message "divide by zero", :fn "<top>", :file "<repl>", :line 1, :column 1}
 user=> user=> :out-of-memory
 user=> user=> after
 nil

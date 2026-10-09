@@ -18,7 +18,7 @@ ok entid of an unknown ident is nil
 {:db/id 34, :db/ident :person/photo, :db/valueType :db.type/bytes, :db/cardinality :db.cardinality/one, :db/index false, :db/isComponent false, :db/fulltext false, :db/doc a portrait}
 ok schema and the attribute entity agree on the doc
 ok the doc is absent from the view before it
-:nextomic/value-type
+{:error :nextomic/value-type, :message nextomic value type}
 ok an upper-case uuid matches nothing
 #nextomic/entity {:db/id 4294967296}
 {:person/born 1000000, :person/photo raw bytes, :person/name Ann, :person/home 4294967297, :person/tags #{:staff :admin}, :person/email ann@example.com, :person/age 41, :person/active true, :person/uuid 0123abcd-4567-89ef-0123-456789abcdef, :person/height 1.7, :db/id 4294967296}

@@ -103,9 +103,10 @@ whatever its size, realizing a lazy seq in it first (`docs/LAZY.md`
 the evaluation would be, and so it is for `nexis -e`. `*1`, `*2` and
 `*3` hold the last three values. A runtime error is reported on stderr, the frames, handlers and
 bindings the aborted run left are discarded (`VM.resetAfterError`),
-and `*e` is the thrown value, or for a VM error the keyword `catch`
-sees (`vm.vmErrorToKeywordName`: `DivideByZero` is `:divide-by-zero`;
-out of memory, which no `catch` sees, `:out-of-memory`); a parse, reader or compile
+and `*e` is the thrown value, or for a VM error the error map `catch`
+would have taken (`VM.errorValue`, `docs/VM.md` §13: `DivideByZero`
+is `{:error :divide-by-zero :message "divide by zero" ...}`; out of
+memory, which no `catch` sees, the keyword `:out-of-memory`); a parse, reader or compile
 error is reported and leaves `*e` as it was. `:quit` or `:q` alone
 on a line at the start of a form, or end of input, exits. Every
 input's text is kept for the session, so a function defined in one
@@ -366,14 +367,17 @@ the private helpers.
   `nexis.test/out`, `println` unless replaced (a harness without
   stdout collects the lines instead). One line per failure names the
   test, the descriptions in force, the form, the expected and actual
-  values (`pr-str`) and the message when given. `examples/tests-demo.nx`
-  shows every outcome:
+  values (`pr-str`) and the message when given. A test's error names
+  an error map by its tag, its message and the file name, line and
+  column it was raised at (`ERROR in user/t: :divide-by-zero divide
+  by zero at app.nx:12:5`), any other thrown value as `pr-str` prints
+  it. `examples/tests-demo.nx` shows every outcome:
 
   ```
   FAIL in user/failing-test (a wrong expectation): (= 5 (area 2 2)) expected: 5 actual: 4 ; areas multiply
-  ERROR in user/erroring-test: :divide-by-zero
+  ERROR in user/erroring-test: {:message "not a number", :data {:error :bad-age, :input "one"}}
   FAIL in user/bare-test: (empty? [1]) expected: true actual: false ; a bare assertion that fails
-  Ran 5 tests containing 9 assertions.
+  Ran 5 tests containing 10 assertions.
   2 failures, 1 errors.
   ```
 

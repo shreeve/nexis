@@ -149,6 +149,11 @@ Anything can be thrown, and `catch` matches by tag, not by class:
 
 (try (nth [1 2] 5)
      (catch any e :out-of-range))                     ;=> :out-of-range
+
+(defn total [a b] (+ a b))
+(try (total 1 "2")
+     (catch :kind-mismatch e [(ex-message e) (:fn e) (:line e)]))
+;=> ["+ expects numbers, got a string" "total" 1]
 ```
 
 A catch clause's matcher is one of:
@@ -167,10 +172,18 @@ A catch clause's matcher is one of:
 The runtime's own errors are thrown under such tags (`:kind-mismatch`,
 `:arity-mismatch`, `:index-out-of-bounds`, `:divide-by-zero`,
 `:stack-overflow`, `:no-matching-clause`), and the library's under
-namespaced ones (`:db/busy`, `:nextomic/unique`). `ex-info` builds a
-plain map, `{:message msg :data data}`, so it prints and compares as
-data. An uncaught error ends `nexis run` with exit status 5 and a
-report naming the source position and the call stack.
+namespaced ones (`:db/busy`, `:nextomic/unique`). What a `catch` takes
+for one is a map: the tag under `:error`, a sentence under `:message`,
+the function, file, line and column it was raised at (`:fn`, `:file`,
+`:line`, `:column`; inside a library function, the program's call of
+it), and what else the error names (a Nextomic error's `:attr` and
+`:value`). `ex-message` reads the sentence, and `ex-data` of such a map
+is the map itself, so `(:error (ex-data e))` is the tag of a runtime
+error and of an `ex-info` alike. Compare the tag, not the caught
+value: `(= :kind-mismatch (:error e))`. `ex-info` builds a plain map,
+`{:message msg :data data}`, so it prints and compares as data. An
+uncaught error ends `nexis run` with exit status 5 and a report naming
+the source position and the call stack.
 
 ### 3.4 Numbers
 

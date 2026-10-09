@@ -16,11 +16,11 @@ Ann
 ([Ann] [Bob])
 ([Ann 1] [Bob 2])
 #{}
-:nextomic/value-type
+{:error :nextomic/value-type, :message nextomic value type}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
 ([Bob])
-:nextomic/value-type
-:nextomic/value-type
+{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/value-type, :message nextomic value type}
 {:error :nextomic/unknown-attribute, :attr :user/nope}
 {:error :nextomic/query-syntax, :message ?a is never bound; a predicate, function or rule argument needs a pattern, an input or an earlier clause to bind it, :clause 1}
 {:error :nextomic/query-syntax, :message missing? is (missing? $ ?e :attr), :clause 1}
@@ -29,12 +29,12 @@ Ann
 {:error :nextomic/unknown-attribute, :attr :user/nope}
 {:error :nextomic/tx-data, :message a nested map under a non-component ref needs :db/id or a unique attribute}
 {:error :nextomic/unknown-attribute, :attr :user/nope}
-:kind-mismatch
+{:error :kind-mismatch, :message kind mismatch}
 {:error :nextomic/tx-data, :message a lookup ref is [attr value]}
 {:error :nextomic/tx-data, :message a lookup ref needs a unique attribute, :attr :user/name}
-:nextomic/value-type
-:nextomic/no-entity
-:nextomic/no-entity
+{:error :nextomic/value-type, :message nextomic value type}
+{:error :nextomic/no-entity, :message nextomic no entity}
+{:error :nextomic/no-entity, :message nextomic no entity}
 {:error :nextomic/tx-data, :message a unique attribute is cardinality one}
 {:error :nextomic/tx-data, :message a unique attribute is cardinality one}
 ok failed transactions leave the basis alone
@@ -51,8 +51,8 @@ ok entities of one view are equal
 ok an entity of a view that differs is not
 ok entity-db is the view
 ok the entity reads its own view; a later transaction shows through a newer db
-:nextomic/history-view
-:nextomic/history-view
+{:error :nextomic/history-view, :message nextomic history view}
+{:error :nextomic/history-view, :message nextomic history view}
 ([30 true])
 ok the transaction entity is not the t
 26

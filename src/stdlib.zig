@@ -224,32 +224,32 @@ fn markLoaded(loader: *loader_mod.Loader) !void {
 /// natives and the files before it.
 pub const embedded = [_]image_mod.Source{
     // nexis.core's macros and functions over the natives.
-    .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx") } },
+    .{ .ns = "nexis.core", .info = .{ .path = "core.nx", .text = @embedFile("stdlib/core.nx"), .library = true } },
     // Sugar over the Nextomic natives (`with-conn`).
-    .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx") } },
+    .{ .ns = "nextomic", .info = .{ .path = "nextomic.nx", .text = @embedFile("stdlib/nextomic.nx"), .library = true } },
     // Clojure's clojure.walk; before test.nx, whose `are` uses it.
-    .{ .ns = "nexis.walk", .info = .{ .path = "walk.nx", .text = @embedFile("stdlib/walk.nx") } },
+    .{ .ns = "nexis.walk", .info = .{ .path = "walk.nx", .text = @embedFile("stdlib/walk.nx"), .library = true } },
     // Clojure's clojure.edn.
-    .{ .ns = "nexis.edn", .info = .{ .path = "edn.nx", .text = @embedFile("stdlib/edn.nx") } },
+    .{ .ns = "nexis.edn", .info = .{ .path = "edn.nx", .text = @embedFile("stdlib/edn.nx"), .library = true } },
     // deftest, is, testing, run-tests (docs/TOOLING.md §3).
-    .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx") } },
+    .{ .ns = "nexis.test", .info = .{ .path = "test.nx", .text = @embedFile("stdlib/test.nx"), .library = true } },
     // pprint, pprint-str (docs/TOOLING.md §4).
-    .{ .ns = "nexis.pprint", .info = .{ .path = "pprint.nx", .text = @embedFile("stdlib/pprint.nx") } },
+    .{ .ns = "nexis.pprint", .info = .{ .path = "pprint.nx", .text = @embedFile("stdlib/pprint.nx"), .library = true } },
     // The constants of nexis.math.
-    .{ .ns = "nexis.math", .info = .{ .path = "math.nx", .text = @embedFile("stdlib/math.nx") } },
+    .{ .ns = "nexis.math", .info = .{ .path = "math.nx", .text = @embedFile("stdlib/math.nx"), .library = true } },
     // The nexis.string functions written over its natives.
-    .{ .ns = "nexis.string", .info = .{ .path = "string.nx", .text = @embedFile("stdlib/string.nx") } },
+    .{ .ns = "nexis.string", .info = .{ .path = "string.nx", .text = @embedFile("stdlib/string.nx"), .library = true } },
     // Set algebra (Clojure's clojure.set).
-    .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx") } },
+    .{ .ns = "nexis.set", .info = .{ .path = "set.nx", .text = @embedFile("stdlib/set.nx"), .library = true } },
     // The environment and the working directory.
-    .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx") } },
+    .{ .ns = "nexis.sys", .info = .{ .path = "sys.nx", .text = @embedFile("stdlib/sys.nx"), .library = true } },
     // Clojure's clojure.java.shell.
-    .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx") } },
+    .{ .ns = "nexis.shell", .info = .{ .path = "shell.nx", .text = @embedFile("stdlib/shell.nx"), .library = true } },
     // Instants, ISO-8601 text and durations.
-    .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx") } },
+    .{ .ns = "nexis.time", .info = .{ .path = "time.nx", .text = @embedFile("stdlib/time.nx"), .library = true } },
     // JSON, in clojure.data.json's shape; after time.nx, whose
     // instants it writes.
-    .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx") } },
+    .{ .ns = "nexis.json", .info = .{ .path = "json.nx", .text = @embedFile("stdlib/json.nx"), .library = true } },
 };
 
 const core_rows = .{
@@ -384,8 +384,8 @@ const core_rows = .{
     .{ "in-ns", 1, 1, &fnInNs, "[name]", "Makes the namespace the symbol name names current, creating it with\n  nexis.core referred when absent; returns nil, where Clojure returns\n  the namespace." },
     // Exceptions as maps (PLAN Amendment Log, exceptions are values).
     .{ "ex-info", 2, 3, &fnExInfo, "[msg map] [msg map cause]", "Returns the exception map {:message msg :data map}, with :cause when\n  given, for throw: exceptions are values, and catch receives the map.\n  msg is a string or nil; map is a map, nil meaning {}." },
-    .{ "ex-data", 1, 1, &fnExData, "[ex]", "Returns the :data of the exception map ex, nil for anything that is\n  not a map." },
-    .{ "ex-message", 1, 1, &fnExMessage, "[ex]", "Returns the :message of the exception map ex, nil for anything that\n  is not a map." },
+    .{ "ex-data", 1, 1, &fnExData, "[ex]", "Returns the :data of the ex-info map ex. An error map, one with an\n  :error and no :data (a caught runtime error, a Nextomic error), is\n  its own data, so (:error (ex-data e)) is the tag of either; nil for\n  anything else." },
+    .{ "ex-message", 1, 1, &fnExMessage, "[ex]", "Returns the :message of the map ex: an ex-info map's message, or a\n  caught runtime error's sentence (\"+ expects numbers, got a string\").\n  nil for anything that is not a map." },
     // Early exit from a fold.
     .{ "reduced", 1, 1, &fnReduced, "[x]", "Wraps x so that reduce, and the reductions built on it, stop and\n  return x; deref reads x back." },
     .{ "reduced?", 1, 1, &fnReducedQ, "[x]", "Returns true if x is the result of a call to reduced." },
@@ -3339,12 +3339,18 @@ fn fnExInfo(vm: *VM, args: []const Value) VmError!Value {
     return m;
 }
 
-/// `(ex-data e)` → the `:data` of a map, nil for anything else.
+/// `(ex-data e)` → the `:data` of an `ex-info` map; an error map,
+/// one with an `:error` entry and no `:data` (a caught runtime error,
+/// a Nextomic error), is its own data; nil for anything else.
 fn fnExData(vm: *VM, args: []const Value) VmError!Value {
-    return exEntry(vm, args[0], "data");
+    const data = try exEntry(vm, args[0], "data");
+    if (!data.isNil() or args[0].kind() != .persistent_map) return data;
+    const tag = try exEntry(vm, args[0], "error");
+    return if (tag.isNil()) data else args[0];
 }
 
-/// `(ex-message e)` → the `:message` of a map, nil for anything else.
+/// `(ex-message e)` → the `:message` of a map (an `ex-info` map, an
+/// error map), nil for anything else.
 fn fnExMessage(vm: *VM, args: []const Value) VmError!Value {
     return exEntry(vm, args[0], "message");
 }
@@ -3740,7 +3746,7 @@ const special_docs = [_]SpecialDoc{
     .{ .name = "letfn*", .forms = "[(letfn* [fnspecs*] exprs*)]", .doc = "The primitive under letfn: mutually recursive local functions.\n  Programs use letfn." },
     .{ .name = "def", .forms = "[(def symbol doc-string? init?)]", .doc = "Interns a Var named symbol in the current namespace and, given init,\n  sets its root to init's value. ^meta on the symbol and the doc-string\n  go into the Var's metadata with :name and :ns. Yields the Var." },
     .{ .name = "set!", .forms = "[(set! var-symbol expr)]", .doc = "Sets the binding in force of a ^:dynamic Var that binding has bound:\n  :no-thread-binding outside a binding, :not-dynamic for a Var that is\n  not dynamic. A local cannot be set!." },
-    .{ .name = "try", .forms = "[(try expr* catch-clause* finally-clause?)]", .doc = "Evaluates the exprs. A value thrown from them is tried against each\n  catch clause in order; the first that matches binds name to it and\n  yields its exprs, and a value none matches is thrown on. A matcher is\n  any or :default, which match every value; a keyword :tag, which\n  matches :tag itself, a map or record whose :error is :tag, and an\n  ex-info map whose data's :error is :tag, so (catch :divide-by-zero e\n  ...) catches the runtime's error of that tag; or a Java class name:\n  ArithmeticException, ClassCastException and the others that name a\n  nexis error match its tags, and any other (Exception, Throwable)\n  matches every value. The finally exprs run for effect however the\n  try ends." },
+    .{ .name = "try", .forms = "[(try expr* catch-clause* finally-clause?)]", .doc = "Evaluates the exprs. A value thrown from them is tried against each\n  catch clause in order; the first that matches binds name to it and\n  yields its exprs, and a value none matches is thrown on. A matcher is\n  any or :default, which match every value; a keyword :tag, which\n  matches :tag itself, a map or record whose :error is :tag, and an\n  ex-info map whose data's :error is :tag, so (catch :divide-by-zero e\n  ...) catches the runtime's error of that tag, the map {:error\n  :divide-by-zero :message m :fn f :file p :line l :column c}; or a Java\n  class name:\n  ArithmeticException, ClassCastException and the others that name a\n  nexis error match its tags, and any other (Exception, Throwable)\n  matches every value. The finally exprs run for effect however the\n  try ends." },
     .{ .name = "defmacro", .forms = "[(defmacro name doc-string? attr-map? [params*] body) (defmacro name doc-string? attr-map? ([params*] body) +)]", .doc = "Defines name as a macro: a function called at compile time with the\n  unevaluated argument forms, whose result is compiled in place of the\n  call. Spelled as defn; &form and &env are not available." },
     .{ .name = "ns", .forms = "[(ns name doc-string? attr-map? references*)]", .doc = "Makes name the current namespace, creating it with nexis.core\n  referred. A reference is (:require spec*), as require takes;\n  (:refer-clojure :exclude [names]), which makes those names the\n  namespace's own; or (:gen-class), which is accepted and does nothing.\n  The doc-string and attr-map are accepted and not kept." },
     .{ .name = "require", .forms = "[(require spec*)]", .doc = "Loads each namespace at compile time, once. A spec is ns-name or\n  [ns-name option*], quoted or not; the options are :as alias,\n  :as-alias alias, :refer [names] or :refer :all, and :rename {from to}.\n  my.app-core loads my/app_core.nx from the working directory or the\n  running file's. The library namespaces need no require to be called\n  qualified; requiring clojure.string, clojure.set, clojure.test,\n  clojure.pprint, clojure.walk, clojure.edn or clojure.math names their\n  nexis.* counterpart." },
@@ -5691,7 +5697,7 @@ fn fnRePattern(vm: *VM, args: []const Value) VmError!Value {
             };
             var m = champ_mod.mapEmpty(heap) catch return VmError.OutOfMemory;
             for (fields) |f| m = try mapPut(heap, m, interner.internKeywordValue(f[0]) catch return VmError.OutOfMemory, f[1]);
-            return vm.throwValue(m);
+            return vm.throwErrorMap(m);
         },
     }
 }
@@ -6049,7 +6055,7 @@ fn throwInvalidReplacement(vm: *VM, message: []const u8) VmError {
     const kind = interner.internKeywordValue("invalid-replacement") catch return VmError.OutOfMemory;
     m = try mapPut(heap, m, interner.internKeywordValue("error") catch return VmError.OutOfMemory, kind);
     m = try mapPut(heap, m, interner.internKeywordValue("message") catch return VmError.OutOfMemory, string_mod.fromBytes(heap, message) catch return VmError.OutOfMemory);
-    return vm.throwValue(m);
+    return vm.throwErrorMap(m);
 }
 
 /// `(nexis.string/re-quote-replacement s)` → `s` with `\` and `$`

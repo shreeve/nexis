@@ -7,9 +7,9 @@ ok added false is empty on a current view
 ([:item/name Nut false])
 ([500 true])
 ([501 true])
-:kind-mismatch
-:kind-mismatch
-:invalid-argument
+{:error :kind-mismatch, :message kind mismatch}
+{:error :kind-mismatch, :message kind mismatch}
+{:error :invalid-argument, :message invalid argument}
 [20 75]
 [75 501]
 [20]
@@ -18,7 +18,7 @@ ok added false is empty on a current view
 [500]
 ok an empty range
 {:error :nextomic/tx-data, :message index-range reads an indexed or unique attribute, :attr :item/name}
-:nextomic/value-type
+{:error :nextomic/value-type, :message nextomic value type}
 {:error :nextomic/unknown-attribute, :attr :item/nope}
 [60 95]
 [95 97 65]

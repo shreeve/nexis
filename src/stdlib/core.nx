@@ -1052,7 +1052,8 @@
   (cond (= s "true") true (= s "false") false (string? s) nil true (throw :kind-mismatch)))
 
 (defn ex-cause
-  "Returns the cause an ex-info value e carries, nil for anything else."
+  "Returns the cause an ex-info value e carries, nil for anything else,
+  a caught runtime error included."
   [e]
   (when (map? e) (:cause e)))
 
