@@ -121,6 +121,31 @@ Each needs a PLAN amendment before code (`AGENTS.md`, authority order).
     `docs/FILEMAN-NEXTOMIC.md` has the mapping from `^DD`, the three
     ways to combine them (a temporal mirror first) and a first
     demonstration. The capture hook belongs to em's repository.
+22. **`#inst` literals** (PLAN §4, §24 #3). Instants are the record
+    `nexis.time.Instant` (`docs/STDLIB.md` §11), which prints as
+    `#nexis.time.Instant{:ms n}` and has no literal. Doing `#inst`
+    cleanly is more than the reader: (a) amend PLAN §4 to drop the
+    `#inst` row and §28 to say what `#inst "..."` reads as; reading it
+    as the form `(nexis.time/parse "...")`, as `#()` reads as the form
+    it stands for, needs no new Form variant, but `nexis.edn/read-string`
+    would then return a list, not an instant, so data does not round
+    trip; (b) so the reader, the printer (`#inst "2026-..."` for an
+    Instant, `src/format.zig`) and `nexis.edn` change together, with
+    a golden for each; (c) `nexis.core`'s `inst?` and `inst-ms` become
+    Clojure's `Inst` protocol in `core.nx`, which `time.nx`'s record
+    extends, so `inst?` stops being false of everything (`docs/STDLIB.md`
+    §8); (d) `compare` of two Instants (`docs/SORTED.md` §6), so they
+    sort; (e) Nextomic's marshal takes an Instant where it takes an
+    instant's long. Each touches files the `nexis.time` lane did not
+    own; (c) and (e) are worth doing without the literal.
+23. **UUIDs are strings.** `random-uuid` returns the canonical text,
+    as Nextomic's `:db.type/uuid` takes and returns it (`docs/STDLIB.md`
+    §8, `docs/NEXTOMIC.md` §2). A UUID value would be a new value kind
+    (PLAN §23: the Form, the value layer, the codec's wire tags, `=`
+    and `hash`, the printer's `#uuid`), and it would break `uuid?` and
+    every program and store that holds the text. If a distinct type is
+    wanted, a record `nexis.uuid.UUID`, as `nexis.time.Instant` is, needs
+    no amendment; it waits on a use that the string cannot serve.
 
 ## Divergences by design, not bugs
 
