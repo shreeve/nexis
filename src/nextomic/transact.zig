@@ -40,6 +40,7 @@ const string_mod = @import("../string.zig");
 const list_mod = @import("../coll/list.zig");
 const vector_mod = @import("../coll/vector.zig");
 const champ = @import("../coll/champ.zig");
+const Heap = @import("../heap.zig").Heap;
 const sorted = @import("../coll/sorted.zig");
 const emdb = @import("emdb");
 const key = @import("key.zig");
@@ -165,6 +166,9 @@ pub const Report = struct {
     tx_data: []Datom,
 };
 
+// The tx-data shape the tests and the bench write in Zig: each op is
+// lowered to the VM's tx-data (`lowerOps`) and normalised as any other.
+
 /// An entity position in a Zig-level op.
 pub const Entity = union(enum) {
     eid: u64,
@@ -216,11 +220,76 @@ pub fn transact(conn: *Conn, arena: Allocator, tx_data: Value, options: Options)
 
 /// Transact Zig-level ops.
 pub fn transactOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options) !Report {
-    var ctx = try Ctx.begin(conn, arena, options);
-    errdefer ctx.abort();
-    try ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
-    for (ops) |op| try ctx.normaliseOp(op);
-    return ctx.run();
+    var heap = Heap.init(conn.gpa);
+    defer heap.deinit();
+    // A refused value as written lives in the heap that goes here.
+    errdefer if (options.fault) |f| {
+        f.given = null;
+    };
+    return transact(conn, arena, try lowerOps(conn, &heap, ops), options);
+}
+
+/// The VM tx-data `ops` stand for, built in `heap`. A typed value
+/// becomes the VM value it reads back as (`Conn.valToValue`).
+fn lowerOps(conn: *Conn, heap: *Heap, ops: []const Op) !Value {
+    const txn = try conn.beginReadTxn();
+    defer conn.endReadTxn(txn);
+    const L = struct {
+        conn: *Conn,
+        heap: *Heap,
+        txn: *Txn,
+
+        fn kw(l: @This(), name: []const u8) !Value {
+            return l.conn.interner.internKeywordValue(name);
+        }
+
+        fn id(n: u64) !Value {
+            return value.fromFixnum(@intCast(n)) orelse error.NoEntity;
+        }
+
+        fn attr(l: @This(), a: AttrRef) !Value {
+            return switch (a) {
+                .id => |n| id(n),
+                .ident => |k| l.conn.interner.keywordValue(k),
+            };
+        }
+
+        fn entity(l: @This(), e: Entity) !Value {
+            return switch (e) {
+                .eid => |n| id(n),
+                .tempid => |t| switch (t) {
+                    .string => |str| string_mod.fromBytes(l.heap, str),
+                    .fixnum => |n| value.fromFixnum(n) orelse error.NoEntity,
+                },
+                .lookup => |r| vector_mod.fromSlice(l.heap, &.{ try l.attr(r.a), try l.conn.valToValue(l.txn, l.heap, r.v) }),
+                .ident => |k| l.conn.interner.keywordValue(k),
+                .tx => string_mod.fromBytes(l.heap, "datomic.tx"),
+            };
+        }
+
+        fn val(l: @This(), v: ValRef) !Value {
+            return switch (v) {
+                .val => |x| l.conn.valToValue(l.txn, l.heap, x),
+                .entity => |e| l.entity(e),
+                .keyword => |k| l.conn.interner.keywordValue(k),
+                .vm => |x| x,
+            };
+        }
+
+        fn form(l: @This(), op: Op) !Value {
+            return switch (op) {
+                .add => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/add"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
+                .retract => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retract"), try l.entity(o.e), try l.attr(o.a), try l.val(o.v) }),
+                .retract_attr => |o| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retract"), try l.entity(o.e), try l.attr(o.a) }),
+                .retract_entity => |e| vector_mod.fromSlice(l.heap, &.{ try l.kw("db/retractEntity"), try l.entity(e) }),
+            };
+        }
+    };
+    const l: L = .{ .conn = conn, .heap = heap, .txn = txn };
+    const forms = try conn.gpa.alloc(Value, ops.len);
+    defer conn.gpa.free(forms);
+    for (ops, forms) |op, *f| f.* = try l.form(op);
+    return vector_mod.fromSlice(heap, forms);
 }
 
 pub const ExciseReport = struct {
@@ -341,13 +410,12 @@ pub fn with(conn: *Conn, arena: Allocator, tx_data: Value, options: Options) !*W
 
 /// Apply Zig-level ops speculatively.
 pub fn withOps(conn: *Conn, arena: Allocator, ops: []const Op, options: Options) !*With {
-    const self = try arena.create(With);
-    self.ctx = try Ctx.begin(conn, arena, options);
-    errdefer self.ctx.abort();
-    try self.ctx.ops.ensureTotalCapacityPrecise(arena, ops.len);
-    for (ops) |op| try self.ctx.normaliseOp(op);
-    try self.speculate();
-    return self;
+    var heap = Heap.init(conn.gpa);
+    defer heap.deinit();
+    errdefer if (options.fault) |f| {
+        f.given = null;
+    };
+    return with(conn, arena, try lowerOps(conn, &heap, ops), options);
 }
 
 // =============================================================================
@@ -673,13 +741,6 @@ const Ctx = struct {
         return (try self.attrCopy(id)) orelse self.unknownAttr(self.conn.interner.keywordValue(intern_id));
     }
 
-    fn attrOf(self: *Ctx, ref: AttrRef) !*const Attr {
-        return switch (ref) {
-            .id => |id| self.attrById(id),
-            .ident => |k| self.attrByIntern(k),
-        };
-    }
-
     // ── entity ids ────────────────────────────────────────────────
 
     /// An explicit entity id, as an entity or a ref value, must have been
@@ -757,67 +818,10 @@ const Ctx = struct {
         return self.bindings.items[self.root(i)].eid.?;
     }
 
-    // ── normalisation from Zig ops ────────────────────────────────
-
-    fn entityOf(self: *Ctx, e: Entity) !Ent {
-        return switch (e) {
-            .eid => |id| .{ .eid = try self.checkEid(id) },
-            .tempid => |k| .{ .tempid = try self.tempid(k) },
-            .lookup => |l| .{ .lookup = try self.lookupRef(try self.lookupAttr(try self.attrOf(l.a), l.v), l.v) },
-            .ident => |k| .{ .eid = (try self.minter.lookup(k)) orelse return error.NoEntity },
-            .tx => .{ .eid = key.txEntity(self.t) },
-        };
-    }
-
     fn lookupRef(self: *Ctx, attr: *const Attr, v: Val) !*const Lookup {
         const l = try self.arena.create(Lookup);
         l.* = .{ .attr = attr, .v = v };
         return l;
-    }
-
-    fn lookupAttr(self: *Ctx, attr: *const Attr, v: Val) !*const Attr {
-        if (attr.unique == .none) return self.malformed("a lookup ref needs a unique attribute", .{ .attr = attr.id });
-        if (v.valueType() != attr.value_type) return error.ValueType;
-        return attr;
-    }
-
-    /// A value position of a Zig op: asserted when `use` is `.assert`,
-    /// otherwise only matched against what the store holds.
-    fn valueOf(self: *Ctx, attr: *const Attr, v: ValRef, use: Use) !PVal {
-        switch (v) {
-            .val => |x| {
-                if (x.valueType() != attr.value_type) return error.ValueType;
-                if (x == .double and std.math.isNan(x.double)) return error.ValueType;
-                if (x == .ref) _ = try self.checkEid(x.ref);
-                return .{ .val = try x.dupe(self.arena) };
-            },
-            .entity => |e| {
-                if (attr.value_type != .ref) return error.ValueType;
-                return pvalOf(try self.entityOf(e));
-            },
-            .keyword => |k| {
-                if (attr.value_type != .keyword) return error.ValueType;
-                return self.keywordValue(attr, k, use);
-            },
-            .vm => |x| return self.valueFromVm(attr, x, use),
-        }
-    }
-
-    fn normaliseOp(self: *Ctx, op: Op) !void {
-        switch (op) {
-            .add => |o| {
-                const attr = try self.attrOf(o.a);
-                try self.ops.append(self.arena, .{ .add = .{ .e = try self.entityOf(o.e), .attr = attr, .v = try self.valueOf(attr, o.v, .assert) } });
-            },
-            .retract => |o| {
-                const attr = try self.attrOf(o.a);
-                try self.ops.append(self.arena, .{ .retract = .{ .e = try self.entityOf(o.e), .attr = attr, .v = try self.valueOf(attr, o.v, .match) } });
-            },
-            .retract_attr => |o| {
-                try self.ops.append(self.arena, .{ .retract_attr = .{ .e = try self.entityOf(o.e), .attr = try self.attrOf(o.a) } });
-            },
-            .retract_entity => |e| try self.ops.append(self.arena, .{ .retract_entity = try self.entityOf(e) }),
-        }
     }
 
     // ── normalisation from VM values ──────────────────────────────
@@ -1516,18 +1520,14 @@ const Ctx = struct {
         try self.expandAdd(e, attr, new);
     }
 
+    /// What an attribute asks of an assertion beyond its value's type
+    /// (`convertValue`): a schema attribute describes an attribute, and
+    /// an ident names its own entity.
     fn checkAttrValue(self: *Ctx, e: u64, attr: *const Attr, v: Val) !void {
-        if (attr.value_type == .ref and !key.isAttrPartition(v.ref) and v.ref < key.user_partition_start) return error.NoEntity;
-        // A schema attribute describes an attribute: on a user or
-        // transaction entity it would install nothing.
+        // On a user or transaction entity a schema attribute would
+        // install nothing.
         if (isSchemaAttr(attr.id) and !key.isAttrPartition(e)) return self.malformed("a schema attribute is asserted on an attribute only; an attribute map needs :db/ident", .{ .attr = attr.id });
-        switch (attr.id) {
-            boot.value_type => if (boot.valueTypeOf(v.keyword) == null) return error.ValueType,
-            boot.cardinality => if (v.keyword != boot.card_one and v.keyword != boot.card_many) return error.ValueType,
-            boot.unique => if (v.keyword != boot.unique_identity and v.keyword != boot.unique_value) return error.ValueType,
-            boot.ident => if (e != v.keyword) return self.conflict(e, attr.id),
-            else => {},
-        }
+        if (attr.id == boot.ident and e != v.keyword) return self.conflict(e, attr.id);
     }
 
     /// `:db/valueType`, `:db/cardinality`, `:db/unique`, `:db/index`,
