@@ -1867,10 +1867,15 @@ fn lowerForm(
 fn unresolved(allocator: std.mem.Allocator, diag: ?*LowerDiag, span: ?reader_mod.SrcSpan, ns: ?[]const u8, name: []const u8) CompileError {
     const d = diag orelse return CompileError.UnresolvedSymbol;
     if (span) |sp| d.span = sp;
-    if (d.detail == null) d.detail = (if (ns) |n|
-        allocator.print("unable to resolve symbol: {s}/{s}", .{ n, name })
-    else
-        allocator.print("unable to resolve symbol: {s}", .{name})) catch return CompileError.OutOfMemory;
+    if (d.detail == null) {
+        // A Clojure name nexis lacks says what to use instead.
+        const hint = expand_mod.idiomHint(allocator, ns, name) catch return CompileError.OutOfMemory;
+        const sep: []const u8 = if (hint != null) "; " else "";
+        d.detail = (if (ns) |n|
+            allocator.print("unable to resolve symbol: {s}/{s}{s}{s}", .{ n, name, sep, hint orelse "" })
+        else
+            allocator.print("unable to resolve symbol: {s}{s}{s}", .{ name, sep, hint orelse "" })) catch return CompileError.OutOfMemory;
+    }
     return CompileError.UnresolvedSymbol;
 }
 

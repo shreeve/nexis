@@ -1492,6 +1492,34 @@ test "loader: a defmacro whose function does not compile is reported where and w
     try expectLoaded("(defmacro m [] (helper)) (defn helper [] 5) (m)", "5");
 }
 
+test "loader: a Clojure idiom nexis lacks is reported with what to use instead" {
+    // Java interop: constructors, methods, static members.
+    try expectLoadFailure("(throw (Exception. \"boom\"))", "compile error: unable to resolve symbol: Exception.; nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value", "Exception.");
+    try expectLoadFailure("(RuntimeException. \"boom\")", "compile error: unable to resolve symbol: RuntimeException.; nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value", "RuntimeException.");
+    try expectLoadFailure("(java.util.Date.)", "compile error: unable to resolve symbol: java.util.Date.; nexis has no Java interop, so no constructors: functions build values", "java.util.Date.");
+    try expectLoadFailure("(.toUpperCase \"x\")", "compile error: unable to resolve symbol: .toUpperCase; nexis has no Java interop, so no .method calls: use nexis.string/upper-case", ".toUpperCase");
+    try expectLoadFailure("(.frob \"x\")", "compile error: unable to resolve symbol: .frob; nexis has no Java interop, so no .method calls: call a function (nexis.string has the string ones)", ".frob");
+    try expectLoadFailure("(Math/sqrt 2)", "compile error: unable to resolve symbol: Math/sqrt; nexis has no Java interop: use nexis.math/sqrt (clojure.math/sqrt)", "Math/sqrt");
+    try expectLoadFailure("(Math/floorDiv 7 2)", "compile error: unable to resolve symbol: Math/floorDiv; nexis has no Java interop: use nexis.math/floor-div (clojure.math/floor-div)", "Math/floorDiv");
+    try expectLoadFailure("(Math/abs -1)", "compile error: unable to resolve symbol: Math/abs; nexis has no Java interop: use abs", "Math/abs");
+    try expectLoadFailure("(System/getenv \"HOME\")", "compile error: unable to resolve symbol: System/getenv; nexis has no Java interop: use nexis.sys/getenv", "System/getenv");
+    try expectLoadFailure("(Thread/sleep 10)", "compile error: unable to resolve symbol: Thread/sleep; nexis has no Java interop: Thread is a Java class", "Thread/sleep");
+    // One thread: no future, pmap, agent or thread.
+    try expectLoadFailure("(future (+ 1 2))", "compile error: unable to resolve symbol: future; nexis runs one thread, so no future: call the function and use its value", "future");
+    try expectLoadFailure("(pmap inc [1 2])", "compile error: unable to resolve symbol: pmap; nexis runs one thread, so no pmap: use map", "pmap");
+    try expectLoadFailure("(agent 0)", "compile error: unable to resolve symbol: agent; nexis has no agents: an atom holds state that changes", "agent");
+    try expectLoadFailure("(thread (println 1))", "compile error: unable to resolve symbol: thread; nexis runs one thread, so no thread: call the function", "thread");
+    // A name the program defines is its own, a Clojure name or not.
+    try expectLoaded("(defn thread [f] (f)) (thread (fn [] 7))", "7");
+    // Libraries: clojure.java.io.
+    try expectLoadFailure("(clojure.java.io/file \"x\")", "compile error: unable to resolve symbol: clojure.java.io/file; nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin", "clojure.java.io/file");
+    // Literals: a ratio, a BigDecimal, #inst and #uuid.
+    try expectLoadFailure("(+ 1/3 1)", "reader error: :bad-number-literal 1/3; nexis has no ratios: (/ 1 3) divides, to a double when inexact", "1/3");
+    try expectLoadFailure("1.5M", "reader error: :bad-number-literal 1.5M; nexis has no BigDecimal: 1.5 is a double", "1.5M");
+    try expectLoadFailure("#inst \"2026-10-09\"", "parse error: unexpected `#inst`; nexis has no #inst literal: (nexis.time/parse \"2026-10-09T12:00:00Z\") is an instant", "#inst");
+    try expectLoadFailure("#uuid \"x\"", "parse error: unexpected `#uuid`; nexis has no #uuid literal: a UUID is its canonical string", "#uuid");
+}
+
 test "loader: a parse error names the delimiter left open" {
     try expectLoadFailure("(println [1 2 3)", "parse error: unexpected `)`; the `[` at 1:10 is open", ")");
     try expectLoadFailure("(def x 1)\n(defn f [x]\n  (+ x", "parse error: unclosed `(`", "(");
@@ -8221,6 +8249,8 @@ test "require: a file that cannot be loaded is diagnosed where it failed, in the
         .{ .src = "(require 'unresolved)", .label = "compile error: unable to resolve symbol: nope", .file = "unresolved.nx", .line = 2 },
         .{ .src = "(require 'cyca)", .label = "require: cyclic require of cyca", .file = "cycb.nx", .line = 2 },
         .{ .src = "(require 'nope)", .label = "require: no file nope.nx on the load path" },
+        // A Clojure library nexis lacks says what to use instead.
+        .{ .src = "(require '[clojure.java.io :as io])", .label = "require: no file clojure/java/io.nx on the load path; nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin" },
     };
     for (cases) |c| {
         if (files.compileOne(&program, c.src)) |_| return error.TestUnexpectedResult else |_| {}

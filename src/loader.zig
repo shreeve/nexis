@@ -214,10 +214,15 @@ pub const Loader = struct {
             @memcpy(kind, @tagName(e.kind));
             std.mem.replaceScalar(u8, kind, '_', '-');
             const base: Diagnostic = .{ .source = info, .span = e.span, .label = "", .reading = true };
-            if (e.detail) |detail|
-                try self.diagnose(base, "reader error: :{s} {s}", .{ kind, detail })
-            else
-                try self.diagnose(base, "reader error: :{s}", .{kind});
+            if (e.detail) |detail| {
+                // A Clojure number literal says what to write instead.
+                const hint = if (e.kind == .bad_number_literal) try reader_mod.numberLiteralHint(self.allocator, detail) else null;
+                defer if (hint) |h| self.allocator.free(h);
+                if (hint) |h|
+                    try self.diagnose(base, "reader error: :{s} {s}; {s}", .{ kind, detail, h })
+                else
+                    try self.diagnose(base, "reader error: :{s} {s}", .{ kind, detail });
+            } else try self.diagnose(base, "reader error: :{s}", .{kind});
             return error.Diagnosed;
         };
 
@@ -349,6 +354,7 @@ pub const Loader = struct {
             const where = info.lineCol(o.pos);
             return self.diagnose(at, "parse error: unexpected `{s}`; the `{s}` at {d}:{d} is open", .{ token, text[o.pos..][0..o.len], where.line, where.col });
         };
+        if (reader_mod.taggedLiteralHint(token)) |hint| return self.diagnose(at, "parse error: unexpected `{s}`; {s}", .{ token, hint });
         return self.diagnose(at, "parse error: unexpected `{s}`", .{token});
     }
 
@@ -428,7 +434,9 @@ pub const Loader = struct {
         const rel_path = try nsNameToRelPath(self.allocator, ns_name);
         defer self.allocator.free(rel_path);
         const path = (try searchLoadPaths(self.allocator, self.io, self.load_paths, rel_path)) orelse {
-            try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path", .{rel_path});
+            if (expand_mod.namespaceHint(ns_name)) |hint| {
+                try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path; {s}", .{ rel_path, hint });
+            } else try self.diagnose(.{ .label = "" }, "require: no file {s} on the load path", .{rel_path});
             return LoadError.LoadFailed;
         };
         defer self.allocator.free(path);

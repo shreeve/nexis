@@ -162,6 +162,25 @@ form: `require: no file my/app.nx on the load path`, `require: cyclic
 require of my.app`, `require: PATH does not begin with (ns my.app)`
 (metadata on the name, `(ns ^:no-doc my.app)`, is allowed).
 
+A Clojure idiom nexis lacks adds, after `; `, one clause on what to
+write instead, so a program written from Clojure finds the nexis
+spelling at the error: an unresolved Java constructor, method or
+class member (`Exception.`: ``throw (ex-info "message" {:key
+value})``; `.toUpperCase`: `nexis.string/upper-case`; `Math/sqrt`:
+`nexis.math/sqrt`; `System/getenv`: `nexis.sys/getenv`), a name of
+Clojure's threads, agents or STM (`future`, `pmap`, `agent`,
+`thread`, `dosync`), a ratio or BigDecimal literal (`1/3`, `1.5M`), a
+tagged literal (`#inst`, `#uuid`) and a library with no counterpart
+(`clojure.java.io`). The tables are `expand.idiomHint` and
+`namespaceHint` and `reader.numberLiteralHint` and
+`taggedLiteralHint`; a name the program defines itself is its own, so
+`(defn thread ...)` resolves as any other.
+
+```
+nexis: <-e>:1:2: compile error: unable to resolve symbol: Exception.; nexis has no Java classes: throw (ex-info "message" {:key value}), or any value
+nexis: <-e>:1:1: reader error: :bad-number-literal 1/3; nexis has no ratios: (/ 1 3) divides, to a double when inexact
+```
+
 **A runtime error** that no `try` catches ends the program with exit
 5 and this report on stderr:
 

@@ -2989,6 +2989,131 @@ pub fn defaultMacros(allocator: Allocator) ExpandError!HostMacroTable {
 }
 
 // =============================================================================
+// Clojure idioms nexis lacks (TOOLING.md §1)
+// =============================================================================
+
+/// What to write instead of a Clojure name nexis lacks, for the report
+/// of a symbol that resolves to nothing: Java interop (`Exception.`,
+/// `.toUpperCase`, `Math/sqrt`, `System/getenv`) and the JVM's
+/// threads (`future`, `pmap`, `agent`); null for any other name. One
+/// clause, in `allocator`.
+pub fn idiomHint(allocator: Allocator, ns: ?[]const u8, name: []const u8) Allocator.Error!?[]const u8 {
+    if (ns) |n| return classMemberHint(allocator, n, name);
+    if (name.len > 1 and name[name.len - 1] == '.' and !std.mem.eql(u8, name, "..")) {
+        const class = name[(if (std.mem.findScalarLast(u8, name[0 .. name.len - 1], '.')) |i| i + 1 else 0) .. name.len - 1];
+        if (std.mem.endsWith(u8, class, "Exception") or std.mem.endsWith(u8, class, "Error") or std.mem.eql(u8, class, "Throwable"))
+            return "nexis has no Java classes: throw (ex-info \"message\" {:key value}), or any value";
+        return "nexis has no Java interop, so no constructors: functions build values";
+    }
+    if (name.len > 1 and name[0] == '.' and name[1] != '.') {
+        const method = name[1..];
+        for (method_hints) |pair| if (std.mem.eql(u8, method, pair[0]))
+            return try allocator.print("nexis has no Java interop, so no .method calls: use {s}", .{pair[1]});
+        return "nexis has no Java interop, so no .method calls: call a function (nexis.string has the string ones)";
+    }
+    if (std.mem.eql(u8, name, "new")) return "nexis has no Java interop, so no constructors: functions build values";
+    for (thread_hints) |pair| for (pair[0]) |n| if (std.mem.eql(u8, name, n)) return pair[1];
+    return null;
+}
+
+/// `ns/name` where `ns` is a Java class (`Math/sqrt`, `System/getenv`,
+/// `java.util.UUID/randomUUID`): the nexis function, or what it is.
+fn classMemberHint(allocator: Allocator, ns: []const u8, name: []const u8) Allocator.Error!?[]const u8 {
+    if (std.mem.eql(u8, ns, "Math") or std.mem.eql(u8, ns, "StrictMath")) {
+        for ([_][2][]const u8{ .{ "abs", "abs" }, .{ "max", "max" }, .{ "min", "min" }, .{ "random", "rand" } }) |pair| {
+            if (std.mem.eql(u8, name, pair[0])) return try allocator.print("nexis has no Java interop: use {s}", .{pair[1]});
+        }
+        // Java's camelCase is clojure.math's kebab-case: `toRadians`
+        // is `to-radians`.
+        const camel = name.len > 0 and std.ascii.isLower(name[0]);
+        var kebab: std.ArrayList(u8) = .empty;
+        for (name) |c| {
+            if (camel and std.ascii.isUpper(c)) {
+                try kebab.appendSlice(allocator, &.{ '-', std.ascii.toLower(c) });
+            } else try kebab.append(allocator, c);
+        }
+        for (math_names) |m| if (std.mem.eql(u8, kebab.items, m))
+            return try allocator.print("nexis has no Java interop: use nexis.math/{s} (clojure.math/{s})", .{ m, m });
+        return "nexis has no Java interop: nexis.math (clojure.math) has the math functions";
+    }
+    for (member_hints) |h| if (std.mem.eql(u8, ns, h[0]) and std.mem.eql(u8, name, h[1]))
+        return try allocator.print("nexis has no Java interop: use {s}", .{h[2]});
+    if (std.mem.eql(u8, ns, "clojure.java.io")) return namespaceHint("clojure.java.io");
+    const java_package = std.mem.startsWith(u8, ns, "java.") or std.mem.startsWith(u8, ns, "javax.");
+    const class_name = std.ascii.isUpper(ns[(if (std.mem.findScalarLast(u8, ns, '.')) |i| i + 1 else 0)..][0]);
+    if (java_package or class_name) return try allocator.print("nexis has no Java interop: {s} is a Java class", .{ns});
+    return null;
+}
+
+/// What to require instead of a library namespace nexis lacks, for
+/// the report of a `require` that finds no file; null for any other.
+pub fn namespaceHint(name: []const u8) ?[]const u8 {
+    for ([_][2][]const u8{
+        .{ "clojure.java.io", "nexis has no clojure.java.io: slurp and spit read and write a file, read-line reads stdin" },
+        .{ "clojure.java.shell", "nexis has no clojure.java.shell: nexis.shell/sh runs a command" },
+        .{ "clojure.core.async", "nexis runs one thread and has no core.async: call functions in order" },
+        .{ "clojure.data.json", "nexis has no clojure.data.json: nexis.json reads and writes JSON" },
+    }) |pair| if (std.mem.eql(u8, name, pair[0])) return pair[1];
+    if (std.mem.startsWith(u8, name, "java.") or std.mem.startsWith(u8, name, "javax.")) return "nexis has no Java interop";
+    return null;
+}
+
+/// A Java method and the nexis function that does its work.
+const method_hints = [_][2][]const u8{
+    .{ "toUpperCase", "nexis.string/upper-case" },
+    .{ "toLowerCase", "nexis.string/lower-case" },
+    .{ "trim", "nexis.string/trim" },
+    .{ "length", "count" },
+    .{ "size", "count" },
+    .{ "substring", "subs" },
+    .{ "startsWith", "nexis.string/starts-with?" },
+    .{ "endsWith", "nexis.string/ends-with?" },
+    .{ "contains", "nexis.string/includes? for a string, contains? for a collection" },
+    .{ "indexOf", "nexis.string/index-of" },
+    .{ "split", "nexis.string/split" },
+    .{ "replace", "nexis.string/replace" },
+    .{ "isEmpty", "empty?" },
+    .{ "charAt", "nth" },
+    .{ "equals", "=" },
+    .{ "toString", "str" },
+    .{ "getMessage", "ex-message" },
+    .{ "getData", "ex-data" },
+    .{ "getCause", "ex-cause" },
+};
+
+/// A static member of a Java class and the nexis function for it.
+const member_hints = [_][3][]const u8{
+    .{ "System", "getenv", "nexis.sys/getenv" },
+    .{ "System", "exit", "exit" },
+    .{ "System", "nanoTime", "nano-time" },
+    .{ "System", "currentTimeMillis", "(nexis.time/inst-ms (nexis.time/now))" },
+    .{ "Integer", "parseInt", "parse-long" },
+    .{ "Long", "parseLong", "parse-long" },
+    .{ "Double", "parseDouble", "parse-double" },
+    .{ "Boolean", "parseBoolean", "parse-boolean" },
+    .{ "String", "valueOf", "str" },
+    .{ "String", "join", "nexis.string/join" },
+    .{ "UUID", "randomUUID", "random-uuid" },
+    .{ "java.util.UUID", "randomUUID", "random-uuid" },
+};
+
+/// `nexis.math`'s names (clojure.math's).
+const math_names = [_][]const u8{ "PI", "E", "sqrt", "cbrt", "pow", "exp", "expm1", "log", "log10", "log1p", "floor", "ceil", "round", "signum", "hypot", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sinh", "cosh", "tanh", "to-radians", "to-degrees", "floor-div", "floor-mod" };
+
+/// Clojure's concurrency names, which a nexis of one isolate and one
+/// thread has none of.
+const thread_hints = [_]struct { []const []const u8, []const u8 }{
+    .{ &.{ "future", "future-call" }, "nexis runs one thread, so no future: call the function and use its value" },
+    .{ &.{"pmap"}, "nexis runs one thread, so no pmap: use map" },
+    .{ &.{ "pcalls", "pvalues" }, "nexis runs one thread: call the functions in order" },
+    .{ &.{ "agent", "send", "send-off", "await" }, "nexis has no agents: an atom holds state that changes" },
+    .{ &.{ "promise", "deliver" }, "nexis runs one thread, so no promise: use the value, or an atom" },
+    .{ &.{"thread"}, "nexis runs one thread, so no thread: call the function" },
+    .{ &.{"locking"}, "nexis runs one thread, so nothing to lock: run the body" },
+    .{ &.{ "dosync", "ref", "ref-set", "alter", "commute" }, "nexis has no STM: an atom holds shared state, db/ref a durable one" },
+};
+
+// =============================================================================
 // Inline tests
 // =============================================================================
 

@@ -115,6 +115,41 @@ pub const ReaderError = error{
     OutOfMemory,
 };
 
+/// What to write instead of a Clojure number literal nexis does not
+/// read, for the report of a `bad_number_literal` whose text is
+/// `text`: a ratio (`1/3`) or a BigDecimal (`1.5M`); null for any
+/// other text. In `allocator`.
+pub fn numberLiteralHint(allocator: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error!?[]const u8 {
+    const digits = struct {
+        fn all(t: []const u8) bool {
+            if (t.len == 0) return false;
+            for (t) |c| if (!std.ascii.isDigit(c)) return false;
+            return true;
+        }
+    }.all;
+    const sign: usize = @intFromBool(text.len > 0 and (text[0] == '-' or text[0] == '+'));
+    if (std.mem.findScalar(u8, text, '/')) |slash| {
+        if (digits(text[sign..slash]) and digits(text[slash + 1 ..]))
+            return try allocator.print("nexis has no ratios: (/ {s} {s}) divides, to a double when inexact", .{ text[0..slash], text[slash + 1 ..] });
+    }
+    if (text.len > 1 and text[text.len - 1] == 'M') {
+        if (std.fmt.parseFloat(f64, text[0 .. text.len - 1])) |_| {
+            return try allocator.print("nexis has no BigDecimal: {s} is a double", .{text[0 .. text.len - 1]});
+        } else |_| {}
+    }
+    return null;
+}
+
+/// What to write instead of a Clojure tagged literal nexis does not
+/// read, for the report of a parse error at `token` (`#inst`, `#uuid`,
+/// any `#tag`); null for any other token.
+pub fn taggedLiteralHint(token: []const u8) ?[]const u8 {
+    if (token.len < 2 or token[0] != '#' or !std.ascii.isAlphabetic(token[1])) return null;
+    if (std.mem.eql(u8, token, "#inst")) return "nexis has no #inst literal: (nexis.time/parse \"2026-10-09T12:00:00Z\") is an instant";
+    if (std.mem.eql(u8, token, "#uuid")) return "nexis has no #uuid literal: a UUID is its canonical string";
+    return "nexis reads no tagged literals";
+}
+
 pub const ErrorKind = enum {
     duplicate_literal_key,
     duplicate_literal_element,
@@ -1575,6 +1610,20 @@ test "a regex literal keeps its text as written and must compile" {
     try expectReaderError("#\"é{2,1}\"", .invalid_regex, "Illegal repetition range at index 5");
     try expectReaderError("#\"(?=a)\"", .invalid_regex, "lookahead and lookbehind are not supported at index 0");
     try expectReaderError("#\"a\xff\"", .invalid_utf8, null);
+}
+
+test "a Clojure literal nexis does not read is reported with what to write instead" {
+    const a = std.testing.allocator;
+    const ratio = (try numberLiteralHint(a, "-1/3")).?;
+    defer a.free(ratio);
+    try std.testing.expectEqualStrings("nexis has no ratios: (/ -1 3) divides, to a double when inexact", ratio);
+    const decimal = (try numberLiteralHint(a, "1.5M")).?;
+    defer a.free(decimal);
+    try std.testing.expectEqualStrings("nexis has no BigDecimal: 1.5 is a double", decimal);
+    for ([_][]const u8{ "1abc", "1/", "/2", "1/2/3", "1.5x", "M", "1.5N" }) |text| try std.testing.expect((try numberLiteralHint(a, text)) == null);
+    try std.testing.expectEqualStrings("nexis has no #uuid literal: a UUID is its canonical string", taggedLiteralHint("#uuid").?);
+    try std.testing.expectEqualStrings("nexis reads no tagged literals", taggedLiteralHint("#js").?);
+    for ([_][]const u8{ "#", "#(", "#{", "#_", ")", "inst" }) |token| try std.testing.expect(taggedLiteralHint(token) == null);
 }
 
 test "symbols and keywords take any UTF-8 character" {

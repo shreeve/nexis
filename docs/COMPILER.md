@@ -942,10 +942,12 @@ symbol's own for `UnresolvedSymbol` (`LowerDiag`). An expansion error
 carries the span of the innermost form the expander failed at
 (`ExpandContext.failure`), and its reason goes to
 `CompileOptions.out_detail`; so does what `LowerDiag.detail` says of
-an unresolved symbol (`unable to resolve symbol: foo`) or a limit
-(`fn many: more than 4096 local slots`). Forms a macro produced carry
-the call's span, so an error inside an expansion is reported at the
-call. There
+an unresolved symbol (`unable to resolve symbol: foo`, with what to
+write instead of a Clojure name nexis lacks, `TOOLING.md` §1) or a
+limit (`fn many: more than 4096 local slots`). Forms a macro produced
+carry the call's span, so an error inside an expansion is reported at
+the call, except the forms a user macro was given, which keep their
+own (`MACROEXPAND.md` §4b). There
 is no secondary span and no expansion-provenance chain. The CLI's
 rendering of a compile error, and its exit status, are `TOOLING.md`
 §1.
