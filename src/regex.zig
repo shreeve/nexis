@@ -833,9 +833,9 @@ const Parser = struct {
             },
             'R' => return .{ .node = try p.node(.line_end) },
             'X' => return p.fail(at, "\\X (grapheme clusters) is not supported"),
-            'N' => return p.fail(at, "\\N{...} (named characters) is not supported"),
             else => {},
         };
+        if (cp.c == 'N') return p.fail(at, "\\N{...} (named characters) is not supported");
         const set: []const Range = switch (cp.c) {
             '0' => return .{ .lit = try p.octal() },
             'a' => return .{ .lit = 0x07 },
@@ -2241,6 +2241,7 @@ test "regex: refused constructs and syntax errors are errors with a sentence" {
         .{ "(?c)a", "the c flag (CANON_EQ) is not supported" },
         .{ "\\X", "\\X (grapheme clusters) is not supported" },
         .{ "\\N{LATIN SMALL LETTER A}", "\\N{...} (named characters) is not supported" },
+        .{ "[\\N{LATIN SMALL LETTER A}]", "\\N{...} (named characters) is not supported" },
         .{ "\\b{g}", "\\b{g} (grapheme boundaries) is not supported" },
         .{ "a{99999999999}", "Illegal repetition range" },
         .{ "(", "Unclosed group" },
