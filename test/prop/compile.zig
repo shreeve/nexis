@@ -262,7 +262,7 @@ const cases = [_]Case{
     .{ .src = "[(= \"a)\" (read-string \"\\\"a)\\\" (\")) (= \\) (read-string \"\\\\) (\")) (= '{:a [1]} (read-string \"{:a [1]}}\"))]", .out = "[true true true]" },
     .{ .src = "[(try (read-string \"\") (catch any e e)) (try (read-string \")\") (catch any e e)) (try (read-string \"{:a 1 :a 2} x\") (catch any e e))]", .out = "[{:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form} {:error :reader-error, :message reader error, :fn test-form}]" },
     // eval's compile failure carries the expander's message.
-    .{ .src = "(try (eval '(let [x] x)) (catch :compile-error e [(:message e) (string? (:detail e))]))", .out = "[MacroExpansionFailure true]" },
+    .{ .src = "(try (eval '(let [x] x)) (catch :compile-error e [(:kind e) (string? (:message e)) (contains? e :detail)]))", .out = "[MacroExpansionFailure true false]" },
     // Host macros the compiler relies on.
     .{ .src = "[(let [x 1 y 2] (+ x y)) ((fn [x] (+ x 1)) 41) (loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc))]", .out = "[3 42 10]" },
     .{ .src = "[(when true 42) (when false 42) (when true 1 2 3) (when-not false 99) (when-not true 99)]", .out = "[42 nil 3 99 nil]" },

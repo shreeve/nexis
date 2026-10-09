@@ -2301,8 +2301,8 @@ test "multimethods: defmulti defines once; its docstring and attr-map reach the 
         \\[first-def second-def kept (methods r) ((juxt :doc :extra :name) (meta #'doc-m))]
     , "[#'user/r nil :one {} [the doc 1 doc-m]]");
     try expectOutputProgram(
-        \\[(try (eval '(defmulti s1 identity :default)) (catch any e ((juxt :error :detail) e)))
-        \\ (try (eval '(defmulti s2 identity :frob 1)) (catch any e ((juxt :error :detail) e)))]
+        \\[(try (eval '(defmulti s1 identity :default)) (catch any e ((juxt :error :message) e)))
+        \\ (try (eval '(defmulti s2 identity :frob 1)) (catch any e ((juxt :error :message) e)))]
     , "[[:compile-error macro defmulti threw The syntax for defmulti has changed. Example: (defmulti name dispatch-fn :default dispatch-value)] [:compile-error macro defmulti threw Only these options are valid: :default, :hierarchy]]");
 }
 
@@ -7214,7 +7214,7 @@ test "eval: a form as data compiles in the current namespace and runs on the cal
     try expectOutput("(let [f (eval '(fn [x] (* x 10)))] (f 4))", "40");
     try expectOutput("(map eval ['(+ 1 1) '(str \"a\" \"b\")])", "(2 ab)");
     // A lexical name is not in scope for the evaluated form.
-    try expectOutput("(let [x 1] (try (eval 'x) (catch :compile-error e (:message e))))", "UnresolvedSymbol");
+    try expectOutput("(let [x 1] (try (eval 'x) (catch :compile-error e (:message e))))", "unable to resolve symbol: x");
 }
 
 test "eval: def binds in the current namespace; a macro it defines serves a later eval" {
@@ -7235,12 +7235,15 @@ test "eval: def binds in the current namespace; a macro it defines serves a late
 }
 
 test "eval: a compile error is a catchable map; a throw inside the form is an ordinary throw" {
-    try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e)]))", "[:compile-error UnresolvedSymbol (nope 1)]");
-    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e (:message e)))", "RecurOutsideTail");
-    try expectOutput("(try (eval '(quote)) (catch :compile-error e (:message e)))", "MalformedForm");
-    try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e (:message e)))", "MacroExpansionFailure");
-    try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e (:message e)))", "UnsupportedForm");
-    try expectOutput("(ex-message (try (eval '(nope)) (catch :compile-error e e)))", "UnresolvedSymbol");
+    // The message is the compiler's sentence, the CompileError's name
+    // in words when it has none; :kind is the name.
+    try expectOutput("(try (eval '(nope 1)) (catch :compile-error e [(:error e) (:message e) (:form e) (:kind e)]))", "[:compile-error unable to resolve symbol: nope (nope 1) UnresolvedSymbol]");
+    try expectOutput("(try (eval '(recur 1)) (catch :compile-error e [(:kind e) (:message e)]))", "[RecurOutsideTail recur outside tail]");
+    try expectOutput("(try (eval '(quote)) (catch :compile-error e [(:kind e) (:message e)]))", "[MalformedForm malformed form]");
+    try expectOutput("(try (eval '(let* [x] x)) (catch :compile-error e [(:kind e) (:message e)]))", "[MacroExpansionFailure let*: the binding vector needs an even number of forms]");
+    try expectOutput("(try (eval (list 'a (fn [] 1))) (catch :compile-error e [(:kind e) (:message e)]))", "[UnsupportedForm unsupported form]");
+    try expectOutput("(ex-message (try (eval '(nope)) (catch :compile-error e e)))", "unable to resolve symbol: nope");
+    try expectOutput("(ex-message (try (eval '(Math/sqrt 2)) (catch :compile-error e e)))", "unable to resolve symbol: Math/sqrt; nexis has no Java interop: use nexis.math/sqrt (clojure.math/sqrt)");
     try expectOutput("(try (eval '(throw :x)) (catch :x e [:caught e]))", "[:caught :x]");
     try expectOutput("(try (eval '(/ 1 0)) (catch :divide-by-zero e e))", "{:error :divide-by-zero, :message divide by zero, :fn <eval>}");
     try expectOutput("(eval '(try (throw :in) (catch :in e :handled)))", ":handled");

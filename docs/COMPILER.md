@@ -953,9 +953,10 @@ rendering of a compile error, and its exit status, are `TOOLING.md`
 §1.
 
 **Inside `eval`**, a compile error is not reported by the CLI: the
-hook throws `{:error :compile-error :message "<variant name>" :form
-<the form>}`, plus `:detail` with the expander's reason for a macro
-failure, on the calling VM, a catchable value like any other throw
+hook throws `{:error :compile-error :message <the sentence> :form
+<the form> :kind "<variant name>"}`, the sentence being what the CLI
+would report after `compile error: ` (the variant in words when there
+is none), on the calling VM, a catchable value like any other throw
 (MACROEXPAND.md §1.2 item 9). Uncaught, it reaches the CLI as
 `UncaughtThrow` with the map as its value.
 

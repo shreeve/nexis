@@ -393,7 +393,7 @@ const core_rows = .{
     .{ "macroexpand-1", 1, 1, &fnMacroexpand1, "[form]", "Returns form after one macro expansion step when it is a macro call,\n  else form itself. Nothing inside the result is expanded." },
     .{ "macroexpand", 1, 1, &fnMacroexpand, "[form]", "Repeats macroexpand-1 on form until its head is not a macro and\n  returns it. Subforms are left alone." },
     .{ "read-string", 1, 2, &fnReadString, "[s] [opts s]", "Returns the first form of the string s as data; the text after it is\n  ignored. When s holds no form, returns the :eof value of the map\n  opts, else :reader-error, as is text that does not read." },
-    .{ "eval", 1, 1, &fnEval, "[form]", "Compiles form in the current namespace, runs it and returns its\n  value. A form that does not compile throws\n  {:error :compile-error :message ... :form form}." },
+    .{ "eval", 1, 1, &fnEval, "[form]", "Compiles form in the current namespace, runs it and returns its\n  value. A form that does not compile throws\n  {:error :compile-error :message m :form form :kind name}, m the\n  compiler's sentence." },
     // Metadata (SEMANTICS.md §7).
     .{ "meta", 1, 1, &fnMeta, "[obj]", "Returns the metadata map of obj, a list, vector, map, set, record,\n  atom or Var; nil when it has none or cannot have any." },
     .{ "with-meta", 2, 2, &fnWithMeta, "[obj m]", "Returns a value equal to obj with the map m (or nil) as its metadata.\n  A scalar is :no-metadata-on-immediate; a Var or atom takes metadata\n  in place, through reset-meta! or alter-meta!." },
@@ -3423,7 +3423,7 @@ fn fnLoadNext(vm: *VM, args: []const Value) VmError!Value {
 
 /// `(eval form)` → the value of `form` compiled in the current
 /// namespace and run on this VM; a form that does not compile throws
-/// `{:error :compile-error :message "<CompileError>" :form form}`.
+/// `{:error :compile-error :message sentence :form form :kind name}`.
 fn fnEval(vm: *VM, args: []const Value) VmError!Value {
     const hooks = vm.compiler_hooks orelse return vm.throwKeyword("no-compiler");
     const eval = hooks.eval orelse return vm.throwKeyword("no-compiler");

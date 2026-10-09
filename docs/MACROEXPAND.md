@@ -195,11 +195,14 @@ otherwise it is an ordinary call. User macros shadow host macros.
      the routine, its constants and every closure prototype live in
      the VM's runtime arena. A value that is not a form (a list
      holding a function) and a form that does not compile throw
-     `{:error :compile-error :message "<CompileError name>" :form
-     form}`, plus `:detail` with the expander's reason when it gave
-     one, so `(catch :compile-error e ...)` takes it and
-     `ex-message` reads the name (`"UnsupportedForm"` for a
-     non-form). A throw inside the evaluated form propagates as an
+     `{:error :compile-error :message m :form form :kind name}`, `m`
+     the compiler's sentence (`"unable to resolve symbol: nope"`, the
+     expander's reason) or, with none, the `CompileError` name in
+     words (`"unsupported form"` for a non-form), and `name` that
+     name (`"UnsupportedForm"`), with the place of the `eval` call
+     when a handler is in force (`docs/VM.md` §13); so
+     `(catch :compile-error e ...)` takes it and `ex-message` reads
+     the sentence. A throw inside the evaluated form propagates as an
      ordinary throw.
    - Syntax-quote is not data at run time: a quoted form holding one
      is `UnsupportedFeature` at compile and `read-string` rejects
