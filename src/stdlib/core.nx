@@ -224,15 +224,19 @@
 ; One binding frame for the Vars named, pushed after every value is
 ; evaluated and popped in a finally.
 
+; The form of the map {(var name) val ...} of a binding vector, for
+; binding and with-redefs.
+(defn- var-map [bindings]
+  `(hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
+                       (partition 2 bindings))))
+
 (defmacro binding
   "bindings is [var-name val ...]. Evaluates every val, then binds each
   dynamic Var to its value while body runs, restoring the previous
   bindings on every exit, a throw included. A function called inside
   sees them wherever it was made. A Var not ^:dynamic is :not-dynamic."
   [bindings & body]
-  `(do (push-thread-bindings
-         (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
-                             (partition 2 bindings))))
+  `(do (push-thread-bindings ~(var-map bindings))
        (try
          (do ~@body)
          (finally (pop-thread-bindings)))))
@@ -263,10 +267,7 @@
   root restored afterwards. A call the compiler inlines (arithmetic,
   comparison) does not go through the Var."
   [bindings & body]
-  `(with-redefs-fn
-     (hash-map ~@(mapcat (fn [pair] [`(var ~(first pair)) (second pair)])
-                         (partition 2 bindings)))
-     (fn [] ~@body)))
+  `(with-redefs-fn ~(var-map bindings) (fn [] ~@body)))
 
 ; The compiler sets the root before it expands each top-level form,
 ; and in-ns when it switches (STDLIB.md §8).
@@ -364,10 +365,7 @@
   "Returns the value in nested associative m at the path of keys ks:
   nil, or default when given, if a key along the path is absent. A
   present nil value is nil."
-  ([m ks]
-   (reduce (fn* [acc k] (if (nil? acc) nil (get acc k)))
-           m
-           ks))
+  ([m ks] (reduce get m ks))
   ([m ks default]
    ; A fresh atom is identical to no value a map holds.
    (let* [missing (atom nil)]
@@ -444,12 +442,12 @@
   returns a new value. Returns a transducer when no coll is given."
   ([f] (xf-partition-by f))
   ([f coll]
-  (lazy-seq
-    (when-let [s (seq coll)]
-      (let [fst (first s)
-            fv (f fst)
-            run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
-        (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
+   (lazy-seq
+     (when-let [s (seq coll)]
+       (let [fst (first s)
+             fv (f fst)
+             run (cons fst (take-while (fn [x] (= fv (f x))) (next s)))]
+         (cons run (partition-by f (lazy-seq (drop (count run) s)))))))))
 
 ; The seqs of children still to visit wait on an explicit stack, so the
 ; depth of the tree costs no native stack.
@@ -1393,11 +1391,10 @@
 ; Clojure's Inst: what inst? and inst-ms take as an instant. nexis.time's
 ; Instant extends it (docs/STDLIB.md §12).
 (defprotocol Inst
+  "An instant: a value with epoch milliseconds, which inst-ms* returns.
+  nexis.time's Instant extends it, and so may any record."
   (inst-ms* [inst]
     "Returns the epoch milliseconds of the instant inst."))
-(alter-meta! #'Inst assoc :doc
-  "An instant: a value with epoch milliseconds, which inst-ms* returns.
-  nexis.time's Instant extends it, and so may any record.")
 
 (defn inst?
   "Returns true if x is an instant: of a type extended to Inst, as
@@ -1598,7 +1595,10 @@
 
 ; MultiFn.findAndCacheBestMethod: the entry whose key dv isa? and that
 ; dominates every other such entry, else the default's method, else
-; nil. The result is cached when nothing it read changed meanwhile.
+; nil. The result is cached when nothing it read changed meanwhile,
+; else the cache is reset and the search runs again; with one thread
+; only an isa? that realizes a lazy dispatch value whose body changes
+; the hierarchy or the table can change them.
 (defn- mm-find [state cache dv]
   (let [s @state
         ch (nth @cache 0)
