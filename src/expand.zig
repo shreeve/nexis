@@ -3049,7 +3049,8 @@ fn classMemberHint(allocator: Allocator, ns: []const u8, name: []const u8) Alloc
         return try allocator.print("nexis has no Java interop: use {s}", .{h[2]});
     if (std.mem.eql(u8, ns, "clojure.java.io")) return namespaceHint("clojure.java.io");
     const java_package = std.mem.startsWith(u8, ns, "java.") or std.mem.startsWith(u8, ns, "javax.");
-    const class_name = std.ascii.isUpper(ns[(if (std.mem.findScalarLast(u8, ns, '.')) |i| i + 1 else 0)..][0]);
+    const class = ns[(if (std.mem.findScalarLast(u8, ns, '.')) |i| i + 1 else 0)..];
+    const class_name = class.len > 0 and std.ascii.isUpper(class[0]);
     if (java_package or class_name) return try allocator.print("nexis has no Java interop: {s} is a Java class", .{ns});
     return null;
 }

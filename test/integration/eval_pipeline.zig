@@ -8672,3 +8672,8 @@ test "a user macro named like a core macro is the namespace's own" {
         \\[(when-let [x 1] x) (nexis.core/when-let [x 1] x)]
     , "[:mine 1]");
 }
+
+test "loader: an unresolved symbol whose namespace ends in a period is reported, with no hint" {
+    try expectLoadFailure("a./b", "compile error: unable to resolve symbol: a./b", "a./b");
+    try expectLoadFailure("(./x 1)", "compile error: unable to resolve symbol: ./x", "./x");
+}
