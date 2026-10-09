@@ -7792,6 +7792,18 @@ test "runtime errors: a caught error is a map of its tag, its message and where 
     );
 }
 
+test "runtime errors: a form a user macro was given keeps its own place in the expansion" {
+    var program: Program = undefined;
+    try program.init();
+    defer program.deinit();
+    const info = vm.SourceInfo{ .path = "t.nx", .text = "(doseq [x [1]]\n  (inc x)\n  (/ 1 0))" };
+    try testing.expectError(vm.VmError.DivideByZero, runLocated(&program, &info));
+    try expectFrame(&program, &info, 0, "<top>", 3, 3, "(/ 1 0)");
+    try expectLocatedOutput("(defmacro twice [& body] `(do ~@body ~@body))\n(defn f [x]\n  (twice\n    [(+ x \"a\")]))\n(try (f 1) (catch any e [(:line e) (:column e)]))",
+        \\[4 6]
+    );
+}
+
 test "runtime errors: an error inside a library function is placed at the program's call" {
     try expectLocatedOutput("(defn g [m]\n  (update m :a inc))\n(try (g {:a \"x\"}) (catch any e [(:fn e) (:file e) (:line e) (:column e)]))",
         \\["g" "t.nx" 2 3]

@@ -133,6 +133,12 @@ pub const ExpandContext = struct {
     /// many enclosing binding forms bind it (`Scope`); empty at the
     /// top of a form.
     lexical: std.StringHashMapUnmanaged(u32) = .empty,
+    /// While a user macro's call converts its arguments to data and
+    /// its result back (`callUserMacro`): the span of each argument
+    /// collection by its heap address, so a form of the result that is
+    /// one of them keeps its own place and an error in it is reported
+    /// there, not at the macro call.
+    arg_spans: ?*std.AutoHashMapUnmanaged(u64, SrcSpan) = null,
 
     /// Whether `name` is bound by a binding form around the walk.
     fn isLexical(self: *const ExpandContext, name: []const u8) bool {
@@ -1254,7 +1260,13 @@ fn callUserMacro(
     const routine = vm_mod.VM.asClosure(macro_var.root).routine;
     if (routine.entryFor(args.len) == null) return ctx.fail(span, "macro {s} takes {f}, got {d}", .{ name, routine.arityPhrase(), args.len });
 
-    // Each argument as data, unevaluated.
+    // Each argument as data, unevaluated, its collections' places
+    // kept for the result.
+    var spans: std.AutoHashMapUnmanaged(u64, SrcSpan) = .empty;
+    defer spans.deinit(ctx.allocator);
+    const outer_spans = ctx.arg_spans;
+    ctx.arg_spans = &spans;
+    defer ctx.arg_spans = outer_spans;
     const arg_values = try ctx.allocator.alloc(value_mod.Value, args.len);
     defer ctx.allocator.free(arg_values);
     for (args, 0..) |a, i| arg_values[i] = try formToValue(ctx, a);
@@ -1331,6 +1343,27 @@ fn describeThrown(ctx: *ExpandContext, thrown: value_mod.Value) ExpandError![]co
 /// marker list a sorted collection travels as (`valueToForm`) the
 /// collection itself. A syntax-quote or an unquote is not data.
 pub fn formToValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
+    const v = try formValue(ctx, form);
+    if (ctx.arg_spans) |spans| if (spanKey(v)) |k| {
+        spans.put(ctx.allocator, k, form.origin) catch return ExpandError.OutOfMemory;
+    };
+    return v;
+}
+
+/// What `arg_spans` knows a value by: the address of a non-empty
+/// list, vector, map or set, which no other value shares while the
+/// expansion runs (its heap does not collect).
+fn spanKey(v: value_mod.Value) ?u64 {
+    return switch (v.kind()) {
+        .list => if (list_mod.isEmpty(v)) null else v.payload,
+        .persistent_vector => if (vector_mod.count(v) == 0) null else v.payload,
+        .persistent_map => if (champ_mod.mapCount(v) == 0) null else v.payload,
+        .persistent_set => if (champ_mod.setCount(v) == 0) null else v.payload,
+        else => null,
+    };
+}
+
+fn formValue(ctx: *ExpandContext, form: *const Form) ExpandError!value_mod.Value {
     try checkStack();
     const heap = try ctx.heapForArgs();
     const oom = ExpandError.OutOfMemory;
@@ -1439,14 +1472,17 @@ fn mapOf(heap: *heap_mod.Heap, kvs: []const value_mod.Value) !value_mod.Value {
     return m;
 }
 
-/// A macro's result as a form, every form at `origin` (the call's
-/// span) in `ctx.allocator`: the inverse of `formToValue`, a bignum
+/// A macro's result as a form in `ctx.allocator`, each one the macro
+/// was given at its own place (`arg_spans`) and every other at
+/// `call_origin`: the inverse of `formToValue`, a bignum
 /// within i64 an `int` and beyond it a `bigint`. The list
 /// `(nexis.internal/#%meta x m)` becomes `^m x`, and so does a list,
 /// vector, map or set carrying the metadata `m` (§5). A function, a
 /// Var or any other kind is not a form.
-pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, origin: SrcSpan) ExpandError!*Form {
+pub fn valueToForm(ctx: *ExpandContext, v: value_mod.Value, call_origin: SrcSpan) ExpandError!*Form {
     try checkStack();
+    // A form the macro was given, at its own place, and its parts.
+    const origin = if (ctx.arg_spans) |spans| (if (spanKey(v)) |k| spans.get(k) orelse call_origin else call_origin) else call_origin;
     const datum: Datum = switch (v.kind()) {
         .nil => .nil,
         .true_, .false_ => .{ .bool_ = v.kind() == .true_ },

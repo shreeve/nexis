@@ -6,14 +6,14 @@ nexis: <repl>:1:8: runtime error: OutOfMemory
     (count (i64-vector (repeat 100000000 0)))
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   at <top> (<repl>:1:8)
-nexis: <repl>:1:1: runtime error: OutOfMemory
+nexis: <repl>:1:34: runtime error: OutOfMemory
     (with-out-str (print "y") (count (i64-vector (repeat 100000000 0))))
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  at <top> (<repl>:1:1)
-nexis: <repl>:1:1: runtime error: UncaughtThrow :boom
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  at <top> (<repl>:1:34)
+nexis: <repl>:1:11: runtime error: UncaughtThrow :boom
     (lazy-seq (throw :boom))
-    ^^^^^^^^^^^^^^^^^^^^^^^^
-  at fn (<repl>:1:1)
+              ^^^^^^^^^^^^^
+  at fn (<repl>:1:11)
 nexis: <repl>:1:1: runtime error: UncaughtThrow (...)
     (throw (lazy-seq (println "ran") [1]))
     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

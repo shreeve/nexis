@@ -111,8 +111,8 @@ otherwise it is an ordinary call. User macros shadow host macros.
    in a macro body see and change the program's namespaces, record
    types, protocols and stores. Its
    result, every lazy seq in it realized on the sub-VM and made a list
-   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form at the call's
-   span (`valueToForm`), or its
+   (`seq.asLists`, `docs/LAZY.md` §8), becomes a Form (`valueToForm`)
+   placed as §4b says, or its
    throw or VM error becomes the failure message (§8). The sub-VM is
    released and the result is expanded again in the call's place.
 4. **A fresh sub-VM per call**: no handler, finally or halted state
@@ -327,12 +327,18 @@ Host macros that need a fresh name (`and`, `or`, `case`, `condp`,
 - An input sub-form reused in the output keeps its own `origin`.
 - A form a macro synthesizes takes the macro call's `origin`, so the
   `if` that `(when ...)` produces points at the `when`.
-- A user macro's result, converted by `valueToForm`, is entirely at
-  the call's span.
+- A user macro's result, converted by `valueToForm`, keeps the place
+  of each list, vector, map or set it took from the macro's arguments
+  (`ExpandContext.arg_spans`, the arguments' non-empty collections by
+  heap address, which the sub-VM's heap never collects or reuses
+  during the call), so the body a `doseq` or `with-open` was given
+  is reported where it is written; every other form of the result,
+  and a symbol or scalar, which is not known by address, is at the
+  call's span.
 
-There is no separate "generated" origin: an error inside macro
-output is reported at the macro call. The `Builder` (§10b) carries
-the call's span to every form it makes.
+There is no separate "generated" origin: an error inside a form a
+macro made is reported at the macro call. The `Builder` (§10b)
+carries the call's span to every form it makes.
 
 ---
 
