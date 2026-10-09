@@ -814,9 +814,11 @@
   (fn [a b] (cond (pred a b) -1 (pred b a) 1 true 0)))
 
 (defn run!
-  "Calls f on each element of coll, for effect. Returns nil."
+  "Calls f on each element of coll, for effect, through reduce: a
+  reduced value from f ends the walk. Returns nil."
   [f coll]
-  (reduce (fn [_ x] (f x) nil) nil coll))
+  (reduce (fn [_ x] (f x)) nil coll)
+  nil)
 
 
 (defn split-with

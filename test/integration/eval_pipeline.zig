@@ -1739,6 +1739,8 @@ test "integration: core.nx higher-order functions: some-fn, every-pred, memoize,
     try expectOutputProgram("(defn down [n] (if (zero? n) :done #(down (dec n)))) (trampoline down 100000)", ":done");
     try expectOutput("(sort (comparator >) [1 3 2])", "(3 2 1)");
     try expectOutput("(let [a (atom 0)] [(run! #(swap! a + %) [1 2 3]) @a])", "[nil 6]");
+    // A reduced from f ends the walk, as Clojure's reduce-based run!.
+    try expectOutput("(let [a (atom [])] [(run! #(if (= % 3) (reduced :stop) (swap! a conj %)) (range 10)) @a])", "[nil [0 1 2]]");
 }
 
 test "integration: core.nx sequence functions: partition-by, dedupe, take-nth, split-with, distinct?, doall, dorun, rseq, nthnext" {
